@@ -1,0 +1,26 @@
+[workspace]
+members = [
+  "crates/ego-core",
+  "crates/ego-p2p",
+  "crates/ego-consensus",
+  "crates/ego-ffi",
+  "bins/ego-node",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Ego-Blockchain Team"]
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tokio = { version = "1.47.1", features = ["full"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+bytes = "1.10.1"
+yamux = "0.13"
