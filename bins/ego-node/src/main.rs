@@ -1,5 +1,5 @@
 use clap::{Arg, Command};
-use ego_node::{Node, NodeRole};
+use ego_node::{NetworkType, Node, NodeRole};
 use libp2p::{Multiaddr, futures::StreamExt};
 use std::io::{self, Write};
 use std::time::Duration;
@@ -22,6 +22,14 @@ struct NodeConfig {
     pub slice_id: Option<String>,
     pub enable_metrics: bool,
     pub enable_interactive: bool,
+
+    pub enable_bandwidth_sharing: bool,
+    pub sharing_bandwidth_mbps: u64,
+    pub sharing_daily_limit_mb: u64,
+    pub enable_data_compression: bool,
+    pub enable_auto_network_switching: bool,
+    pub cost_threshold_usd: f64,
+    pub data_threshold_gb: f64,
 }
 
 impl Default for NodeConfig {
@@ -40,6 +48,14 @@ impl Default for NodeConfig {
             slice_id: None,
             enable_metrics: false,
             enable_interactive: false,
+
+            enable_bandwidth_sharing: false,
+            sharing_bandwidth_mbps: 50,
+            sharing_daily_limit_mb: 1000,
+            enable_data_compression: true,
+            enable_auto_network_switching: true,
+            cost_threshold_usd: 100.0,
+            data_threshold_gb: 40.0,
         }
     }
 }
@@ -50,20 +66,44 @@ async fn main() -> anyhow::Result<()> {
 
     let config = parse_cli_args();
 
-    info!("🚀 Starting Ego Blockchain Node");
+    info!("🚀 Starting Ego Blockchain Node with 5G Cost Optimization");
     info!("Configuration: {:?}", config);
 
-    let mut node = create_node_from_config(&config).await?;
+    let mut node = match create_node_from_config(&config).await {
+        Ok(node) => {
+            info!("✅ Node created successfully");
+            node
+        }
+        Err(e) => {
+            error!("❌ Failed to create node: {}", e);
+            return Err(e);
+        }
+    };
 
-    setup_networking(&mut node, &config).await?;
+    if let Err(e) = setup_networking(&mut node, &config).await {
+        error!("❌ Failed to setup networking: {}", e);
+        return Err(e);
+    }
+    info!("🌐 Networking setup completed");
 
-    info!("✅ Node created successfully: {}", node.get_summary());
+    if let Err(e) = setup_optimization_features(&mut node, &config).await {
+        error!("❌ Failed to setup optimization features: {}", e);
+        return Err(e);
+    }
+    info!("⚡ Optimization features setup completed");
+
+    info!("✅ Node initialization completed");
+    info!("📊 Node summary: {}", node.get_summary());
     info!("🔧 Node capabilities: {:?}", node.get_capabilities());
     info!("🌐 5G Ready: {}", node.is_5g_ready());
+    info!("💰 Bandwidth Sharing: {}", config.enable_bandwidth_sharing);
+    info!("🗜️  Data Compression: {}", config.enable_data_compression);
 
     if config.enable_interactive {
+        info!("🖥️  Starting interactive mode");
         run_interactive_mode(node, config).await?;
     } else {
+        info!("🔄 Starting daemon mode");
         run_daemon_mode(node, config).await?;
     }
 
@@ -74,7 +114,7 @@ fn parse_cli_args() -> NodeConfig {
     let matches = Command::new("ego-node")
         .version("1.0.0")
         .author("Ego Blockchain Team")
-        .about("Ego Blockchain Node - 5G-enabled decentralized network")
+        .about("Ego Blockchain Node - 5G-enabled decentralized network with cost optimization")
         .arg(
             Arg::new("type")
                 .long("type")
@@ -150,6 +190,52 @@ fn parse_cli_args() -> NodeConfig {
                 .help("Enable metrics collection")
                 .action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("enable-sharing")
+                .long("enable-sharing")
+                .help("Enable bandwidth sharing to earn EGOC")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("sharing-bandwidth")
+                .long("sharing-bandwidth")
+                .help("Max bandwidth to share in Mbps")
+                .default_value("50")
+                .value_name("MBPS"),
+        )
+        .arg(
+            Arg::new("sharing-limit")
+                .long("sharing-limit")
+                .help("Daily data sharing limit in MB")
+                .default_value("1000")
+                .value_name("MB"),
+        )
+        .arg(
+            Arg::new("disable-compression")
+                .long("disable-compression")
+                .help("Disable data compression")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("disable-auto-switch")
+                .long("disable-auto-switch")
+                .help("Disable automatic network switching")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("cost-threshold")
+                .long("cost-threshold")
+                .help("Monthly cost threshold in USD")
+                .default_value("100")
+                .value_name("USD"),
+        )
+        .arg(
+            Arg::new("data-threshold")
+                .long("data-threshold")
+                .help("Monthly data threshold in GB")
+                .default_value("40")
+                .value_name("GB"),
+        )
         .get_matches();
 
     let node_type = matches.get_one::<String>("type").unwrap().clone();
@@ -194,6 +280,30 @@ fn parse_cli_args() -> NodeConfig {
 
     let roles = determine_roles(&node_type);
 
+    let enable_bandwidth_sharing = matches.get_flag("enable-sharing");
+    let sharing_bandwidth_mbps = matches
+        .get_one::<String>("sharing-bandwidth")
+        .unwrap()
+        .parse()
+        .unwrap_or(50);
+    let sharing_daily_limit_mb = matches
+        .get_one::<String>("sharing-limit")
+        .unwrap()
+        .parse()
+        .unwrap_or(1000);
+    let enable_data_compression = !matches.get_flag("disable-compression");
+    let enable_auto_network_switching = !matches.get_flag("disable-auto-switch");
+    let cost_threshold_usd = matches
+        .get_one::<String>("cost-threshold")
+        .unwrap()
+        .parse()
+        .unwrap_or(100.0);
+    let data_threshold_gb = matches
+        .get_one::<String>("data-threshold")
+        .unwrap()
+        .parse()
+        .unwrap_or(40.0);
+
     NodeConfig {
         node_type,
         roles,
@@ -208,12 +318,19 @@ fn parse_cli_args() -> NodeConfig {
         slice_id,
         enable_metrics: matches.get_flag("metrics"),
         enable_interactive: matches.get_flag("interactive"),
+        enable_bandwidth_sharing,
+        sharing_bandwidth_mbps,
+        sharing_daily_limit_mb,
+        enable_data_compression,
+        enable_auto_network_switching,
+        cost_threshold_usd,
+        data_threshold_gb,
     }
 }
 
 fn determine_roles(node_type: &str) -> Vec<NodeRole> {
     match node_type {
-        "validator" => vec![NodeRole::Validator],
+        "validator" => vec![NodeRole::Validator, NodeRole::Relay],
         "storage" => vec![NodeRole::Storage, NodeRole::Witness],
         "gateway" => vec![NodeRole::Gateway, NodeRole::Witness, NodeRole::Relay],
         "seed" => vec![NodeRole::Seed, NodeRole::Relay],
@@ -232,8 +349,16 @@ fn determine_roles(node_type: &str) -> Vec<NodeRole> {
 }
 
 async fn create_node_from_config(config: &NodeConfig) -> anyhow::Result<Node> {
+    info!(
+        "Creating {} node with roles: {:?}",
+        config.node_type, config.roles
+    );
+
     let mut node = match config.node_type.as_str() {
-        "validator" => Node::new_validator(config.shard_ids.clone()).await?,
+        "validator" => {
+            info!("Creating validator node for shards: {:?}", config.shard_ids);
+            Node::new_validator(config.shard_ids.clone()).await?
+        }
         "storage" => {
             let capacity_bytes = config.storage_capacity_gb.unwrap_or(100.0) * 1_000_000_000.0;
             let geohash = config
@@ -241,6 +366,11 @@ async fn create_node_from_config(config: &NodeConfig) -> anyhow::Result<Node> {
                 .zip(config.longitude)
                 .map(|(lat, lon)| format!("geo_{}_{}_p{}", lat, lon, config.geohash_precision))
                 .unwrap_or_else(|| "default_geohash".to_string());
+            info!(
+                "Creating storage node with capacity: {} GB, geohash: {}",
+                capacity_bytes / 1_000_000_000.0,
+                geohash
+            );
             Node::new_storage_miner(capacity_bytes as u64, geohash).await?
         }
         "gateway" => {
@@ -250,6 +380,10 @@ async fn create_node_from_config(config: &NodeConfig) -> anyhow::Result<Node> {
                 &config.slice_id,
                 config.bandwidth_mbps,
             ) {
+                info!(
+                    "Creating 5G edge gateway at ({}, {}) with slice: {}",
+                    lat, lon, slice_id
+                );
                 Node::new_5g_edge_gateway(slice_id.clone(), lat, lon, bandwidth * 1_000_000).await?
             } else {
                 warn!("Gateway node requires latitude, longitude, slice-id, and bandwidth");
@@ -258,37 +392,59 @@ async fn create_node_from_config(config: &NodeConfig) -> anyhow::Result<Node> {
         }
         "full" | _ => {
             let capacity_bytes = config.storage_capacity_gb.unwrap_or(100.0) * 1_000_000_000.0;
+            info!(
+                "Creating full node with {} GB storage",
+                capacity_bytes / 1_000_000_000.0
+            );
             Node::new_full_node(config.shard_ids.clone(), capacity_bytes as u64).await?
         }
     };
 
     if let (Some(lat), Some(lon)) = (config.latitude, config.longitude) {
         node.set_geolocation(lat, lon, config.geohash_precision);
+        info!("Node geolocation set to: ({}, {})", lat, lon);
     }
 
     if let Some(bandwidth_mbps) = config.bandwidth_mbps {
         node.set_bandwidth_capacity(bandwidth_mbps * 1_000_000);
+        info!("Node bandwidth capacity set to: {} Mbps", bandwidth_mbps);
     }
 
     if let Some(storage_gb) = config.storage_capacity_gb {
         node.set_storage_capacity((storage_gb * 1_000_000_000.0) as u64);
+        info!("Node storage capacity set to: {} GB", storage_gb);
     }
 
     if let Some(slice_id) = &config.slice_id {
         node.set_slice_configuration(slice_id.clone());
+        info!("Node configured for 5G slice: {}", slice_id);
     }
 
     Ok(node)
 }
 
 async fn setup_networking(node: &mut Node, config: &NodeConfig) -> anyhow::Result<()> {
-    node.start_listening(config.listen_port).await?;
+    info!("Setting up networking on port {}", config.listen_port);
+
+    if let Err(e) = node.start_listening(config.listen_port).await {
+        error!(
+            "Failed to start listening on port {}: {}",
+            config.listen_port, e
+        );
+        return Err(e);
+    }
     info!("🎧 Node listening on port {}", config.listen_port);
 
     for bootstrap_addr in &config.bootstrap_peers {
         if let Ok(addr) = bootstrap_addr.parse::<Multiaddr>() {
-            node.add_bootstrap_peer(addr);
+            node.add_bootstrap_peer(addr.clone());
             info!("🔗 Added bootstrap peer: {}", bootstrap_addr);
+
+            if let Err(e) = node.swarm.dial(addr.clone()) {
+                warn!("Failed to dial bootstrap peer {}: {}", bootstrap_addr, e);
+            } else {
+                info!("📞 Dialing bootstrap peer: {}", bootstrap_addr);
+            }
         } else {
             warn!("Invalid bootstrap peer address: {}", bootstrap_addr);
         }
@@ -298,25 +454,76 @@ async fn setup_networking(node: &mut Node, config: &NodeConfig) -> anyhow::Resul
         "seed" => (1000, 50),
         "gateway" => (500, 30),
         "full" => (200, 25),
+        "validator" => (150, 20),
+        "storage" => (100, 15),
         _ => (100, 20),
     };
     node.configure_resource_limits(max_peers, max_topics);
+    info!(
+        "Resource limits configured: {} peers, {} topics",
+        max_peers, max_topics
+    );
+
+    Ok(())
+}
+
+async fn setup_optimization_features(node: &mut Node, config: &NodeConfig) -> anyhow::Result<()> {
+    info!("Setting up optimization features");
+
+    if config.enable_bandwidth_sharing {
+        if let Err(e) = node
+            .enable_bandwidth_sharing(config.sharing_bandwidth_mbps, config.sharing_daily_limit_mb)
+        {
+            error!("Failed to enable bandwidth sharing: {}", e);
+            return Err(e);
+        }
+        info!(
+            "💰 Bandwidth sharing enabled: {} Mbps, {} MB daily limit",
+            config.sharing_bandwidth_mbps, config.sharing_daily_limit_mb
+        );
+    }
+
+    if config.enable_data_compression {
+        info!("🗜️  Data compression enabled");
+    }
+
+    if config.enable_auto_network_switching {
+        info!("🔄 Auto network switching enabled");
+    }
+
+    node.network_manager.cost_threshold_usd = config.cost_threshold_usd;
+    node.network_manager.data_threshold_gb = config.data_threshold_gb;
+
+    info!(
+        "💰 Cost optimization: ${:.0} monthly threshold, {:.0}GB data threshold",
+        config.cost_threshold_usd, config.data_threshold_gb
+    );
 
     Ok(())
 }
 
 async fn run_daemon_mode(mut node: Node, config: NodeConfig) -> anyhow::Result<()> {
     info!("🔄 Running in daemon mode. Press Ctrl+C to stop.");
+    info!(
+        "📊 Node Type: {} | Roles: {:?} | Port: {}",
+        config.node_type, config.roles, config.listen_port
+    );
 
     let mut status_interval = interval(Duration::from_secs(30));
     let mut metrics_interval = interval(Duration::from_secs(60));
-    let mut proof_interval = interval(Duration::from_secs(300)); // 5 minutes
+    let mut proof_interval = interval(Duration::from_secs(300));
+    let mut optimization_interval = interval(Duration::from_secs(10));
+    let mut daily_reset_interval = interval(Duration::from_secs(86400));
+
+    print_status(&node);
 
     loop {
         tokio::select! {
             event = node.swarm.select_next_some() => {
                 debug!("Network event: {:?}", event);
-                handle_network_event(&mut node, event).await?;
+                if let Err(e) = handle_network_event(&mut node, event).await {
+                    warn!("Error handling network event: {}", e);
+                }
             },
             _ = status_interval.tick() => {
                 print_status(&node);
@@ -324,10 +531,23 @@ async fn run_daemon_mode(mut node: Node, config: NodeConfig) -> anyhow::Result<(
             _ = metrics_interval.tick() => {
                 if config.enable_metrics {
                     print_metrics(&node);
+                    print_optimization_metrics(&node);
                 }
             },
             _ = proof_interval.tick() => {
-                generate_proofs(&mut node).await?;
+                if let Err(e) = generate_proofs(&mut node).await {
+                    warn!("Error generating proofs: {}", e);
+                }
+            },
+            _ = optimization_interval.tick() => {
+                if let Err(e) = node.process_optimization_events().await {
+                    warn!("Error processing optimization events: {}", e);
+                }
+            },
+            _ = daily_reset_interval.tick() => {
+                node.network_manager.reset_monthly_stats();
+                node.bandwidth_sharing.reset_daily_stats();
+                info!("🔄 Daily stats reset completed");
             },
             _ = tokio::signal::ctrl_c() => {
                 info!("🛑 Received shutdown signal");
@@ -344,6 +564,7 @@ async fn run_interactive_mode(mut node: Node, _config: NodeConfig) -> anyhow::Re
     info!("🖥️  Running in interactive mode. Type 'help' for commands.");
 
     let mut status_interval = interval(Duration::from_secs(10));
+    let mut optimization_interval = interval(Duration::from_secs(5));
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
@@ -370,9 +591,16 @@ async fn run_interactive_mode(mut node: Node, _config: NodeConfig) -> anyhow::Re
         tokio::select! {
             event = node.swarm.select_next_some() => {
                 debug!("Network event: {:?}", event);
-                handle_network_event(&mut node, event).await?;
+                if let Err(e) = handle_network_event(&mut node, event).await {
+                    warn!("Error handling network event: {}", e);
+                }
             },
             _ = status_interval.tick() => {
+            },
+            _ = optimization_interval.tick() => {
+                if let Err(e) = node.process_optimization_events().await {
+                    warn!("Error processing optimization events: {}", e);
+                }
             },
             Some(command) = rx.recv() => {
                 let command = command.to_lowercase();
@@ -416,6 +644,15 @@ async fn handle_network_event(
                 peer_id, cause
             );
         }
+        libp2p::swarm::SwarmEvent::IncomingConnection { .. } => {
+            debug!("Incoming connection");
+        }
+        libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+            warn!("Outgoing connection error to {:?}: {}", peer_id, error);
+        }
+        libp2p::swarm::SwarmEvent::IncomingConnectionError { error, .. } => {
+            warn!("Incoming connection error: {}", error);
+        }
         _ => {}
     }
     Ok(())
@@ -430,10 +667,15 @@ async fn handle_interactive_command(node: &mut Node, command: &str) -> anyhow::R
             print_detailed_status(node);
         }
         "peers" => {
-            println!(
-                "Connected peers: {:?}",
-                node.swarm.connected_peers().collect::<Vec<_>>()
-            );
+            let peers: Vec<_> = node.swarm.connected_peers().collect();
+            println!("Connected peers: {:?}", peers);
+            if peers.is_empty() {
+                println!("No peers connected. Try checking:");
+                println!("  - Network connectivity");
+                println!("  - Bootstrap peer addresses");
+                println!("  - Firewall settings");
+                println!("  - Port availability");
+            }
         }
         "roles" => {
             println!("Current roles: {:?}", node.get_roles());
@@ -455,10 +697,80 @@ async fn handle_interactive_command(node: &mut Node, command: &str) -> anyhow::R
         }
         "metrics" => {
             print_metrics(node);
+            print_optimization_metrics(node);
+        }
+        "network" => {
+            println!(
+                "Current network: {:?}",
+                node.network_manager.current_interface
+            );
+            println!("{}", node.get_data_usage_summary());
+            println!(
+                "Off-peak hours: {}",
+                node.network_manager.is_off_peak_hours()
+            );
+        }
+        "sharing" => {
+            let stats = node.get_bandwidth_sharing_stats();
+            println!("Bandwidth Sharing Stats:");
+            println!("  Enabled: {}", stats.enabled);
+            println!("  Active connections: {}", stats.active_connections);
+            println!(
+                "  Daily shared: {:.1} MB / {} MB",
+                stats.daily_shared_mb, stats.daily_limit_mb
+            );
+            println!("  Total earned: {:.4} EGOC", stats.total_earned_egoc);
+            println!(
+                "  Available bandwidth: {} Mbps",
+                stats.available_bandwidth_mbps
+            );
+        }
+        "compression" => {
+            let stats = node.get_optimization_stats();
+            println!("Data Optimization Stats:");
+            println!(
+                "  Operations compressed: {}",
+                stats.compression_stats.operations_compressed
+            );
+            println!(
+                "  Compression ratio: {:.2}",
+                stats.compression_stats.compression_ratio
+            );
+            println!(
+                "  Bandwidth saved: {:.1} MB",
+                stats.total_bandwidth_saved_mb
+            );
+            println!("  Pending operations: {}", stats.pending_operations);
+        }
+        "enable-sharing" => {
+            if let Err(e) = node.enable_bandwidth_sharing(50, 1000) {
+                println!("❌ Failed to enable bandwidth sharing: {}", e);
+            } else {
+                println!("✅ Bandwidth sharing enabled");
+            }
+        }
+        "disable-sharing" => {
+            if let Err(e) = node.disable_bandwidth_sharing() {
+                println!("❌ Failed to disable bandwidth sharing: {}", e);
+            } else {
+                println!("✅ Bandwidth sharing disabled");
+            }
+        }
+        "switch-wifi" => {
+            node.update_network_interface_status(NetworkType::WiFi, true, Some(80));
+            println!("✅ Switched to WiFi (simulated)");
+        }
+        "switch-5g" => {
+            node.update_network_interface_status(NetworkType::FiveG, true, Some(90));
+            println!("✅ Switched to 5G (simulated)");
         }
         "test-poc" => {
             if let Some(geohash) = &node.geohash {
-                node.emit_poc_proof(geohash.clone(), vec![1, 2, 3, 4])?;
+                if let Err(e) = node.emit_poc_proof(geohash.clone(), vec![1, 2, 3, 4]) {
+                    println!("❌ Failed to emit PoC proof: {}", e);
+                } else {
+                    println!("✅ PoC proof emitted");
+                }
             } else {
                 println!("❌ No geohash set for PoC proof");
             }
@@ -466,9 +778,33 @@ async fn handle_interactive_command(node: &mut Node, command: &str) -> anyhow::R
         "test-post" => {
             if !node.shard_ids.is_empty() {
                 let shard_id = node.shard_ids[0];
-                node.emit_post_proof(shard_id, 12345, vec![5, 6, 7, 8])?;
+                if let Err(e) = node.emit_post_proof(shard_id, 12345, vec![5, 6, 7, 8]) {
+                    println!("❌ Failed to emit PoST proof: {}", e);
+                } else {
+                    println!("✅ PoST proof emitted for shard {}", shard_id);
+                }
             } else {
                 println!("❌ No shards configured for PoST proof");
+            }
+        }
+        "connect" => {
+            println!("Attempting to connect to bootstrap peers...");
+            for addr in &node.bootstrap_peers {
+                if let Err(e) = node.swarm.dial(addr.clone()) {
+                    println!("❌ Failed to dial {}: {}", addr, e);
+                } else {
+                    println!("📞 Dialing {}", addr);
+                }
+            }
+        }
+        "addresses" => {
+            println!("Listen addresses:");
+            for addr in &node.listen_addresses {
+                println!("  {}", addr);
+            }
+            println!("Bootstrap peers:");
+            for addr in &node.bootstrap_peers {
+                println!("  {}", addr);
             }
         }
         "quit" | "exit" | "q" => {
@@ -487,21 +823,35 @@ async fn handle_interactive_command(node: &mut Node, command: &str) -> anyhow::R
 
 fn print_commands() {
     println!("\n📋 Available Commands:");
-    println!("  help        - Show this help message");
-    println!("  status      - Show detailed node status");
-    println!("  peers       - List connected peers");
-    println!("  roles       - Show current node roles");
-    println!("  capabilities - Show node capabilities");
-    println!("  proofs      - Show recent proof events");
-    println!("  5g          - Show 5G configuration status");
-    println!("  metrics     - Show performance metrics");
-    println!("  test-poc    - Generate test Proof of Coverage");
-    println!("  test-post   - Generate test Proof of Spacetime");
-    println!("  quit/exit   - Shutdown the node");
+    println!("  help           - Show this help message");
+    println!("  status         - Show detailed node status");
+    println!("  peers          - List connected peers");
+    println!("  roles          - Show current node roles");
+    println!("  capabilities   - Show node capabilities");
+    println!("  proofs         - Show recent proof events");
+    println!("  5g             - Show 5G configuration status");
+    println!("  metrics        - Show performance metrics");
+    println!("  network        - Show network status and usage");
+    println!("  sharing        - Show bandwidth sharing stats");
+    println!("  compression    - Show data compression stats");
+    println!("  enable-sharing - Enable bandwidth sharing");
+    println!("  disable-sharing- Disable bandwidth sharing");
+    println!("  switch-wifi    - Switch to WiFi (simulated)");
+    println!("  switch-5g      - Switch to 5G (simulated)");
+    println!("  test-poc       - Generate test Proof of Coverage");
+    println!("  test-post      - Generate test Proof of Spacetime");
+    println!("  connect        - Attempt to connect to bootstrap peers");
+    println!("  addresses      - Show listen and bootstrap addresses");
+    println!("  quit/exit      - Shutdown the node");
 }
 
 fn print_status(node: &Node) {
     info!("📊 Node Status: {}", node.get_summary());
+    info!("🌐 Listening addresses: {:?}", node.listen_addresses);
+    info!(
+        "👥 Connected peers: {}",
+        node.swarm.connected_peers().count()
+    );
 }
 
 fn print_detailed_status(node: &Node) {
@@ -525,6 +875,23 @@ fn print_detailed_status(node: &Node) {
     println!("Placements: {}", node.placements.len());
     println!("Connected Peers: {}", node.swarm.connected_peers().count());
     println!("Listen Addresses: {:?}", node.listen_addresses);
+    println!("Bootstrap Peers: {:?}", node.bootstrap_peers);
+
+    println!("\n🔧 Optimization Features");
+    println!(
+        "Current Network: {:?}",
+        node.network_manager.current_interface
+    );
+    println!("{}", node.get_data_usage_summary());
+
+    let sharing_stats = node.get_bandwidth_sharing_stats();
+    println!(
+        "Bandwidth Sharing: {} (active: {})",
+        sharing_stats.enabled, sharing_stats.active_connections
+    );
+
+    let opt_stats = node.get_optimization_stats();
+    println!("Data Saved: {:.1} MB", opt_stats.total_bandwidth_saved_mb);
 }
 
 fn print_metrics(node: &Node) {
@@ -555,6 +922,60 @@ fn print_metrics(node: &Node) {
     }
 }
 
+fn print_optimization_metrics(node: &Node) {
+    println!("\n💰 Optimization Metrics");
+    println!("═══════════════════════");
+
+    let sharing_stats = node.get_bandwidth_sharing_stats();
+    println!("Bandwidth Sharing:");
+    println!(
+        "  Status: {}",
+        if sharing_stats.enabled {
+            "Enabled"
+        } else {
+            "Disabled"
+        }
+    );
+    println!("  Active Connections: {}", sharing_stats.active_connections);
+    println!(
+        "  Daily Shared: {:.1}/{} MB",
+        sharing_stats.daily_shared_mb, sharing_stats.daily_limit_mb
+    );
+    println!(
+        "  Total Earned: {:.4} EGOC",
+        sharing_stats.total_earned_egoc
+    );
+    println!(
+        "  Available: {} Mbps",
+        sharing_stats.available_bandwidth_mbps
+    );
+
+    let opt_stats = node.get_optimization_stats();
+    println!("\nData Optimization:");
+    println!(
+        "  Operations Compressed: {}",
+        opt_stats.compression_stats.operations_compressed
+    );
+    println!(
+        "  Compression Ratio: {:.2}",
+        opt_stats.compression_stats.compression_ratio
+    );
+    println!(
+        "  Bandwidth Saved: {:.1} MB",
+        opt_stats.total_bandwidth_saved_mb
+    );
+    println!("  Pending Operations: {}", opt_stats.pending_operations);
+    println!("  Pending Batches: {}", opt_stats.pending_batches);
+
+    println!("\nNetwork Usage:");
+    println!("  {}", node.get_data_usage_summary());
+    println!(
+        "  Current Interface: {:?}",
+        node.network_manager.current_interface
+    );
+    println!("  Off-Peak Hours: {}", node.is_cost_effective_time());
+}
+
 async fn generate_proofs(node: &mut Node) -> anyhow::Result<()> {
     if node.has_role(NodeRole::Storage) && !node.shard_ids.is_empty() {
         let shard_id = node.shard_ids[0];
@@ -565,7 +986,7 @@ async fn generate_proofs(node: &mut Node) -> anyhow::Result<()> {
 
         let evidence = format!("post_proof_{}", piece_id).into_bytes();
         node.emit_post_proof(shard_id, piece_id, evidence)?;
-        debug!("Generated PoST proof for shard {}", shard_id);
+        debug!("Generated optimized PoST proof for shard {}", shard_id);
     }
 
     if node.has_role(NodeRole::Witness) {
@@ -579,7 +1000,7 @@ async fn generate_proofs(node: &mut Node) -> anyhow::Result<()> {
             .into_bytes();
 
             node.emit_poc_proof(geohash.clone(), evidence)?;
-            debug!("Generated PoC proof for geohash {}", geohash);
+            debug!("Generated optimized PoC proof for geohash {}", geohash);
         }
     }
 
