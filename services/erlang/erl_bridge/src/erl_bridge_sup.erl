@@ -1,14 +1,7 @@
-%%%-------------------------------------------------------------------
-%% @doc erl_bridge top level supervisor.
-%% @end
-%%%-------------------------------------------------------------------
-
 -module(erl_bridge_sup).
-
 -behaviour(supervisor).
 
 -export([start_link/0]).
-
 -export([init/1]).
 
 -define(SERVER, ?MODULE).
@@ -16,22 +9,36 @@
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
-%% sup_flags() = #{strategy => strategy(),         % optional
-%%                 intensity => non_neg_integer(), % optional
-%%                 period => pos_integer()}        % optional
-%% child_spec() = #{id => child_id(),       % mandatory
-%%                  start => mfargs(),      % mandatory
-%%                  restart => restart(),   % optional
-%%                  shutdown => shutdown(), % optional
-%%                  type => worker(),       % optional
-%%                  modules => modules()}   % optional
 init([]) ->
     SupFlags = #{
-        strategy => one_for_all,
-        intensity => 0,
-        period => 1
+        strategy => one_for_one,
+        intensity => 10,
+        period => 60
     },
-    ChildSpecs = [],
+    ChildSpecs = [
+        #{
+            id => sbft_consensus_manager,
+            start => {sbft_consensus_manager, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [sbft_consensus_manager]
+        },
+        #{
+            id => sbft_cross_shard,
+            start => {sbft_cross_shard, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [sbft_cross_shard]
+        },
+        #{
+            id => sbft_validator_manager,
+            start => {sbft_validator_manager, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [sbft_validator_manager]
+        }
+    ],
     {ok, {SupFlags, ChildSpecs}}.
-
-%% internal functions
