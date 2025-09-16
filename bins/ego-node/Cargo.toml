@@ -6,6 +6,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+ego-core = { path = "../../crates/ego-core" }
+
 anyhow.workspace = true
 chrono = { version = "0.4.41", features = ["serde"] }
 flate2 = "1.1.2"
@@ -15,6 +17,7 @@ rand = "0.9.2"
 clap = "4.5.47"
 libp2p = { version = "0.56.0", features = ["tcp", "mdns", "noise", "yamux", "gossipsub", "kad", "identify", "ping", "macros", "tokio", "autonat",
                                            "dcutr", "relay"] }
+bincode = "2.0.1"
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -23,3 +26,24 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 tempfile = "3.21.0"
 env_logger = "0.11.8"
+
+[[bin]]
+name = "ego-node"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[features]
+default = ["full-node"]
+full-node = []
+validator-only = []
+storage-only = []
+gateway-only = []
