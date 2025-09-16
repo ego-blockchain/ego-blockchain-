@@ -1,12 +1,18 @@
-use crate::{BandwidthSharingEvent, NetworkEvent, NetworkType, OptimizerEvent};
-use crate::{BandwidthSharingManager, DataOptimizer, NetworkManager};
+use crate::{BandwidthSharingEvent, NetworkEvent, OptimizerEvent};
+use crate::{BandwidthSharingManager, DataOptimizer, NetworkManager, NetworkType};
 use crate::{NodeBehaviour, NodeRole, Placement, ProofEvent, SecureKeystore, ShardConfig};
+
+use ego_core::{
+    Account, AccountType, Address, Balance, Block, BlockHeight, DeviceCapabilities, EgoResult,
+    Hash, SliceId, StateManager, Timestamp, Transaction, TransactionResult,
+};
+
 use libp2p::{
     Multiaddr, PeerId, Swarm, Transport, autonat, core::upgrade::Version, gossipsub, identify, kad,
     mdns, noise, ping, tcp, yamux,
 };
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -27,6 +33,8 @@ pub struct Node {
     pub max_peers_per_shard: u32,
     pub max_topics_per_role: u32,
     pub recent_proofs: Vec<ProofEvent>,
+
+    pub state_manager: StateManager,
 
     pub network_manager: NetworkManager,
     pub bandwidth_sharing: BandwidthSharingManager,
@@ -91,13 +99,27 @@ pub enum OptimizationCommand {
 }
 
 impl Node {
+    pub fn get_public_key(&self) -> ego_core::PublicKey {
+        self.keystore.public_key()
+    }
+
+    pub fn get_keypair(&self) -> &ego_core::KeyPair {
+        self.keystore.keypair()
+    }
+
+    pub fn get_address(&self) -> Address {
+        Address::from_public_key(&self.keystore.public_key())
+    }
+}
+
+impl Node {
     pub async fn new(roles: Vec<NodeRole>, shard_ids: Vec<u32>) -> anyhow::Result<Self> {
         let keystore = SecureKeystore::new();
-        let peer_id = PeerId::from(keystore.keypair().public());
+        let peer_id = keystore.peer_id();
 
         let transport = tcp::tokio::Transport::default()
             .upgrade(Version::V1)
-            .authenticate(noise::Config::new(keystore.keypair())?)
+            .authenticate(noise::Config::new(&keystore.libp2p_keypair())?)
             .multiplex(yamux::Config::default())
             .timeout(Duration::from_secs(30))
             .boxed();
@@ -118,7 +140,7 @@ impl Node {
             .map_err(|e| anyhow::anyhow!("Gossipsub config error: {}", e))?;
 
         let gossipsub = gossipsub::Behaviour::new(
-            gossipsub::MessageAuthenticity::Signed(keystore.keypair().clone()),
+            gossipsub::MessageAuthenticity::Signed(keystore.libp2p_keypair()),
             gossipsub_config,
         )
         .map_err(|e| anyhow::anyhow!("Gossipsub creation error: {}", e))?;
@@ -131,7 +153,7 @@ impl Node {
         let kademlia = kad::Behaviour::with_config(peer_id, store, kademlia_config);
 
         let identify = identify::Behaviour::new(
-            identify::Config::new("/ego/1.0.0".to_string(), keystore.keypair().public())
+            identify::Config::new("/ego/1.0.0".to_string(), keystore.libp2p_keypair().public())
                 .with_interval(Duration::from_secs(30)),
         );
 
@@ -175,6 +197,7 @@ impl Node {
         let network_manager = NetworkManager::new();
         let bandwidth_sharing = BandwidthSharingManager::new(Default::default());
         let data_optimizer = DataOptimizer::new();
+        let state_manager = StateManager::new();
 
         let (optimization_events, optimization_receiver) = mpsc::unbounded_channel();
 
@@ -200,6 +223,7 @@ impl Node {
             max_peers_per_shard: 100,
             max_topics_per_role: 20,
             recent_proofs: Vec::new(),
+            state_manager,
             network_manager,
             bandwidth_sharing,
             data_optimizer,
@@ -224,6 +248,15 @@ impl Node {
 
         let _ = node.enable_bandwidth_sharing(25, 500);
 
+        let validator_address = Address::from_public_key(&node.keystore.public_key());
+        let validator_account = Account::new_validator(
+            validator_address,
+            node.keystore.public_key(),
+            500,
+            Balance::from_egoc(1000),
+        )?;
+        node.state_manager.set_account(validator_account);
+
         info!("✅ Validator node created with enhanced consensus capabilities");
         Ok(node)
     }
@@ -232,11 +265,29 @@ impl Node {
         let mut node = Self::new(vec![NodeRole::Storage, NodeRole::Witness], vec![]).await?;
         node.node_type = "storage".to_string();
         node.set_storage_capacity(capacity_bytes);
-        node.geohash = Some(geohash);
+        node.geohash = Some(geohash.clone());
         node.max_peers_per_shard = 100;
         node.max_topics_per_role = 15;
 
         let _ = node.enable_bandwidth_sharing(50, 1000);
+
+        let device_address = Address::from_public_key(&node.keystore.public_key());
+        let capabilities = DeviceCapabilities {
+            bandwidth_capacity: node.bandwidth_capacity_bps,
+            storage_capacity: capacity_bytes,
+            supported_slices: vec![],
+            coverage_area: Some(geohash),
+            hardware_specs: HashMap::new(),
+            last_poc: None,
+            post_stats: Default::default(),
+        };
+
+        let device_account = Account::new_device(
+            device_address,
+            format!("storage-{}", node.peer_id),
+            capabilities,
+        );
+        node.state_manager.set_account(device_account);
 
         info!(
             "✅ Storage miner created with {} GB capacity",
@@ -258,7 +309,7 @@ impl Node {
         .await?;
 
         node.node_type = "gateway".to_string();
-        node.set_slice_configuration(slice_id);
+        node.set_slice_configuration(slice_id.clone());
         node.set_geolocation(lat, lon, 7);
         node.set_bandwidth_capacity(bandwidth_bps);
         node.max_peers_per_shard = 500;
@@ -267,6 +318,27 @@ impl Node {
         let bandwidth_mbps = bandwidth_bps / 1_000_000;
         let sharing_bandwidth = (bandwidth_mbps / 2).max(100);
         let _ = node.enable_bandwidth_sharing(sharing_bandwidth, 3000);
+
+        let gateway_address = Address::from_public_key(&node.keystore.public_key());
+        let capabilities = DeviceCapabilities {
+            bandwidth_capacity: bandwidth_bps,
+            storage_capacity: 10_000_000_000,
+            supported_slices: vec![SliceId::new(slice_id.clone())],
+            coverage_area: Some(format!("geo_{}_{}_p7", lat, lon)),
+            hardware_specs: HashMap::from([
+                ("type".to_string(), "5g_gateway".to_string()),
+                ("slice".to_string(), slice_id.clone()),
+            ]),
+            last_poc: None,
+            post_stats: Default::default(),
+        };
+
+        let gateway_account = Account::new_device(
+            gateway_address,
+            format!("gateway-{}-{}", slice_id, node.peer_id),
+            capabilities,
+        );
+        node.state_manager.set_account(gateway_account);
 
         info!(
             "✅ 5G Edge Gateway created with {} Mbps capacity",
@@ -294,6 +366,12 @@ impl Node {
 
         let _ = node.enable_bandwidth_sharing(75, 1500);
 
+        let node_address = Address::from_public_key(&node.keystore.public_key());
+        let mut full_account = Account::new_user(node_address);
+        full_account.storage_quota = storage_capacity;
+        full_account.credit(Balance::from_egoc(1000));
+        node.state_manager.set_account(full_account);
+
         info!("✅ Full node created with comprehensive capabilities");
         Ok(node)
     }
@@ -306,6 +384,12 @@ impl Node {
         node.max_topics_per_role = 50;
 
         let _ = node.enable_bandwidth_sharing(200, 5000);
+
+        let seed_address = Address::from_public_key(&node.keystore.public_key());
+        let mut seed_account = Account::new_user(seed_address);
+        seed_account.storage_quota = 50_000_000_000;
+        seed_account.credit(Balance::from_egoc(10000));
+        node.state_manager.set_account(seed_account);
 
         info!("✅ Seed node created for network bootstrapping");
         Ok(node)
@@ -323,8 +407,62 @@ impl Node {
 
         let _ = node.enable_bandwidth_sharing(40, 800);
 
+        let indexer_address = Address::from_public_key(&node.keystore.public_key());
+        let mut indexer_account = Account::new_user(indexer_address);
+        indexer_account.storage_quota = storage_capacity;
+        indexer_account.credit(Balance::from_egoc(500));
+        node.state_manager.set_account(indexer_account);
+
         info!("✅ Indexer node created with cross-shard indexing capabilities");
         Ok(node)
+    }
+
+    pub async fn execute_transaction(&mut self, tx: &Transaction) -> EgoResult<TransactionResult> {
+        self.state_manager.execute_transaction(tx)
+    }
+
+    pub async fn create_block(
+        &mut self,
+        transactions: Vec<Transaction>,
+        previous_hash: Hash,
+        height: BlockHeight,
+    ) -> EgoResult<Block> {
+        let shard_id = if !self.shard_ids.is_empty() {
+            ego_core::ShardId::new(self.shard_ids[0])?
+        } else {
+            ego_core::ShardId::new(0)?
+        };
+
+        let proposer_address = Address::from_public_key(&self.keystore.public_key());
+
+        let block = Block::new(
+            height,
+            previous_hash,
+            shard_id,
+            ego_core::EpochNumber::new(height.as_u64() / 1000),
+            proposer_address,
+            transactions,
+            vec![],
+        );
+
+        Ok(block)
+    }
+
+    pub async fn validate_block(&self, block: &Block) -> EgoResult<bool> {
+        block.validate_structure()?;
+
+        if let Some(account) = self.state_manager.get_account(&block.header.proposer) {
+            match &account.account_type {
+                AccountType::Validator {
+                    validator_pubkey, ..
+                } => {
+                    return block.verify_signature(validator_pubkey);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(true)
     }
 
     pub async fn start_listening(&mut self, port: u16) -> anyhow::Result<()> {
@@ -392,302 +530,85 @@ impl Node {
         Ok(())
     }
 
-    pub fn emit_poc_proof_optimized(
+    pub fn emit_poc_proof(
         &mut self,
         h3_cell: String,
         evidence_digest: Vec<u8>,
     ) -> anyhow::Result<()> {
-        let optimized_evidence = self.send_optimized_data("poc_proof", evidence_digest, 6)?;
+        let event = ego_core::ProofEvent {
+            proof_type: "poc".to_string(),
+            prover: Address::from_public_key(&self.keystore.public_key()),
+            challenge_hash: Hash::new(rand::random()),
+            proof_data: evidence_digest,
+            location_id: h3_cell.clone(),
+            slice_id: self.slice_id.clone(),
+            timestamp: Timestamp::now(),
+            verified: false,
+        };
 
-        if !optimized_evidence.is_empty() {
-            let event = ProofEvent {
-                event_type: "poc".to_string(),
-                shard_id: None,
-                piece_id: None,
-                group_id: None,
-                evidence_digest: optimized_evidence,
-                timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-                peer_id: self.peer_id.to_string(),
-            };
+        let node_proof = ProofEvent {
+            event_type: "poc".to_string(),
+            shard_id: None,
+            piece_id: None,
+            group_id: None,
+            evidence_digest: event.proof_data.clone(),
+            timestamp: event.timestamp.as_millis(),
+            peer_id: self.peer_id.to_string(),
+        };
 
-            self.emit_proof_event(&event);
-            self.performance_metrics.proof_events_generated += 1;
+        self.recent_proofs.push(node_proof);
+        self.performance_metrics.proof_events_generated += 1;
 
-            let topic = gossipsub::IdentTopic::new(format!("ego/poc/h3/{}", h3_cell));
-            let message = format!("{:?}", event).into_bytes();
-            let _ = self.swarm.behaviour_mut().gossipsub.publish(topic, message);
+        let topic = gossipsub::IdentTopic::new(format!("ego/poc/h3/{}", h3_cell));
+        let message = serde_json::to_string(&event)
+            .unwrap_or_default()
+            .into_bytes();
+        let _ = self.swarm.behaviour_mut().gossipsub.publish(topic, message);
 
-            info!("✅ PoC proof emitted for H3 cell: {}", h3_cell);
-        }
-
+        info!("✅ PoC proof emitted for H3 cell: {}", h3_cell);
         Ok(())
     }
 
-    pub fn emit_post_proof_optimized(
+    pub fn emit_post_proof(
         &mut self,
         shard_id: u32,
         piece_id: u32,
         evidence_digest: Vec<u8>,
     ) -> anyhow::Result<()> {
-        let optimized_evidence = self.send_optimized_data("post_proof", evidence_digest, 7)?;
+        let event = ego_core::ProofEvent {
+            proof_type: "post".to_string(),
+            prover: Address::from_public_key(&self.keystore.public_key()),
+            challenge_hash: Hash::new(rand::random()),
+            proof_data: evidence_digest,
+            location_id: format!("shard-{}-piece-{}", shard_id, piece_id),
+            slice_id: self.slice_id.clone(),
+            timestamp: Timestamp::now(),
+            verified: false,
+        };
 
-        if !optimized_evidence.is_empty() {
-            let event = ProofEvent {
-                event_type: "post".to_string(),
-                shard_id: Some(shard_id),
-                piece_id: Some(piece_id),
-                group_id: None,
-                evidence_digest: optimized_evidence,
-                timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-                peer_id: self.peer_id.to_string(),
-            };
+        let node_proof = ProofEvent {
+            event_type: "post".to_string(),
+            shard_id: Some(shard_id),
+            piece_id: Some(piece_id),
+            group_id: None,
+            evidence_digest: event.proof_data.clone(),
+            timestamp: event.timestamp.as_millis(),
+            peer_id: self.peer_id.to_string(),
+        };
 
-            self.emit_proof_event(&event);
-            self.performance_metrics.proof_events_generated += 1;
+        self.recent_proofs.push(node_proof);
+        self.performance_metrics.proof_events_generated += 1;
 
-            let topic = gossipsub::IdentTopic::new(format!("ego/shard/{}/proofs", shard_id));
-            let message = format!("{:?}", event).into_bytes();
-            let _ = self.swarm.behaviour_mut().gossipsub.publish(topic, message);
+        let topic = gossipsub::IdentTopic::new(format!("ego/shard/{}/proofs", shard_id));
+        let message = serde_json::to_string(&event)
+            .unwrap_or_default()
+            .into_bytes();
+        let _ = self.swarm.behaviour_mut().gossipsub.publish(topic, message);
 
-            info!(
-                "✅ PoST proof emitted for shard {} piece {}",
-                shard_id, piece_id
-            );
-        }
-
-        Ok(())
-    }
-
-    pub fn send_optimized_data(
-        &mut self,
-        operation_type: &str,
-        data: Vec<u8>,
-        priority: u8,
-    ) -> anyhow::Result<Vec<u8>> {
-        let data_size_gb = data.len() as f64 / 1_000_000_000.0;
-        let recommended_network = self.get_network_recommendation(operation_type, data_size_gb);
-
-        if recommended_network != self.network_manager.current_interface {
-            info!(
-                "🔄 Switching to {:?} for operation: {}",
-                recommended_network, operation_type
-            );
-            self.performance_metrics.network_switches += 1;
-            let _ = self
-                .optimization_events
-                .send(OptimizationCommand::SwitchNetwork(recommended_network));
-        }
-
-        let operation_id = format!(
-            "{}_{}",
-            operation_type,
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
+        info!(
+            "✅ PoST proof emitted for shard {} piece {}",
+            shard_id, piece_id
         );
-
-        let optimized_data = self
-            .data_optimizer
-            .optimize_data(
-                operation_id.clone(),
-                operation_type.to_string(),
-                data.clone(),
-                priority,
-            )
-            .map_err(|e| anyhow::anyhow!("Data optimization failed: {}", e))?;
-
-        if optimized_data.len() < data.len() {
-            let saved_bytes = data.len() - optimized_data.len();
-            self.performance_metrics.data_compressed_bytes += saved_bytes as u64;
-        }
-
-        self.network_manager
-            .record_data_usage(optimized_data.len() as u64);
-        self.performance_metrics.bytes_sent += optimized_data.len() as u64;
-
-        if optimized_data.is_empty() {
-            debug!(
-                "📦 Data {} was batched/scheduled for later processing",
-                operation_id
-            );
-        }
-
-        Ok(optimized_data)
-    }
-
-    pub async fn process_optimization_events(&mut self) -> anyhow::Result<()> {
-        while let Ok(event) = self.network_manager.event_receiver.try_recv() {
-            match event {
-                NetworkEvent::InterfaceChanged(new_type) => {
-                    info!("🌐 Network interface changed to: {:?}", new_type);
-                    self.performance_metrics.network_switches += 1;
-                }
-                NetworkEvent::DataThresholdReached(usage_gb) => {
-                    warn!("⚠️ Data threshold reached: {:.2} GB", usage_gb);
-                    if self
-                        .network_manager
-                        .interfaces
-                        .get(&NetworkType::WiFi)
-                        .map_or(false, |i| i.is_available)
-                    {
-                        let _ = self
-                            .optimization_events
-                            .send(OptimizationCommand::SwitchNetwork(NetworkType::WiFi));
-                    }
-                }
-                NetworkEvent::CostThresholdReached(cost) => {
-                    warn!("💰 Cost threshold reached: ${:.2}", cost);
-                }
-                _ => {}
-            }
-        }
-
-        while let Ok(event) = self.bandwidth_sharing.event_receiver.try_recv() {
-            match event {
-                BandwidthSharingEvent::DeviceConnected(device_id) => {
-                    info!("📱 Device connected for bandwidth sharing: {}", device_id);
-                }
-                BandwidthSharingEvent::EgocEarned(amount) => {
-                    debug!("💰 Earned {:.4} EGOC from bandwidth sharing", amount);
-                    self.performance_metrics.cost_savings_usd += amount as f64 * 0.1;
-                }
-                _ => {}
-            }
-        }
-
-        while let Ok(event) = self.data_optimizer.event_receiver.try_recv() {
-            match event {
-                OptimizerEvent::BatchReady(batch_id) => {
-                    info!("📦 Batch ready for processing: {}", batch_id);
-                    let _ = self
-                        .optimization_events
-                        .send(OptimizationCommand::ProcessBatches);
-                }
-                OptimizerEvent::CompressionCompleted(op_id, ratio) => {
-                    debug!("🗜️ Compression completed for {}: ratio {:.2}", op_id, ratio);
-                }
-                _ => {}
-            }
-        }
-
-        while let Ok(command) = self.optimization_receiver.try_recv() {
-            match command {
-                OptimizationCommand::ProcessBatches => {
-                    self.process_ready_batches().await?;
-                }
-                OptimizationCommand::ProcessScheduledOps => {
-                    self.process_scheduled_operations().await?;
-                }
-                OptimizationCommand::SwitchNetwork(network_type) => {
-                    self.network_manager.current_interface = network_type.clone();
-                    info!("🔄 Switched to network: {:?}", network_type);
-                }
-                OptimizationCommand::ConnectToPeer(addr) => {
-                    if let Err(e) = self.swarm.dial(addr.clone()) {
-                        warn!("❌ Failed to connect to peer {}: {}", addr, e);
-                    } else {
-                        info!("📞 Connecting to peer: {}", addr);
-                    }
-                }
-                OptimizationCommand::UpdateMetrics(metric_name, value) => {
-                    debug!("📊 Updating metric {}: {}", metric_name, value);
-                }
-                _ => {}
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn process_ready_batches(&mut self) -> anyhow::Result<()> {
-        let ready_batches = self.data_optimizer.get_ready_batches();
-
-        for batch in ready_batches {
-            info!(
-                "📦 Processing batch {} with {} operations",
-                batch.batch_id,
-                batch.operations.len()
-            );
-
-            for operation in batch.operations {
-                self.process_batched_operation(operation).await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn process_scheduled_operations(&mut self) -> anyhow::Result<()> {
-        let ready_operations = self.data_optimizer.get_scheduled_operations();
-
-        for operation in ready_operations {
-            info!(
-                "⏰ Processing scheduled operation: {}",
-                operation.operation_id
-            );
-            self.process_batched_operation(operation).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn process_batched_operation(
-        &mut self,
-        operation: crate::data_optimizer::PendingOperation,
-    ) -> anyhow::Result<()> {
-        match operation.operation_type.as_str() {
-            "post_proof" => {
-                if let Some(&shard_id) = self.shard_ids.first() {
-                    let piece_id = operation.created_at as u32;
-                    let event = ProofEvent {
-                        event_type: "post".to_string(),
-                        shard_id: Some(shard_id),
-                        piece_id: Some(piece_id),
-                        group_id: None,
-                        evidence_digest: operation.data,
-                        timestamp: operation.created_at,
-                        peer_id: self.peer_id.to_string(),
-                    };
-
-                    self.emit_proof_event(&event);
-                    self.performance_metrics.proof_events_generated += 1;
-
-                    let topic =
-                        gossipsub::IdentTopic::new(format!("ego/shard/{}/proofs", shard_id));
-                    let message = format!("{:?}", event).into_bytes();
-                    let _ = self.swarm.behaviour_mut().gossipsub.publish(topic, message);
-                }
-            }
-            "poc_proof" => {
-                let geohash_clone = self.geohash.clone();
-                if let Some(geohash) = geohash_clone {
-                    let event = ProofEvent {
-                        event_type: "poc".to_string(),
-                        shard_id: None,
-                        piece_id: None,
-                        group_id: None,
-                        evidence_digest: operation.data,
-                        timestamp: operation.created_at,
-                        peer_id: self.peer_id.to_string(),
-                    };
-
-                    self.emit_proof_event(&event);
-                    self.performance_metrics.proof_events_generated += 1;
-
-                    let topic = gossipsub::IdentTopic::new(format!("ego/poc/h3/{}", geohash));
-                    let message = format!("{:?}", event).into_bytes();
-                    let _ = self.swarm.behaviour_mut().gossipsub.publish(topic, message);
-                }
-            }
-            "shard_sync" => {
-                debug!("🔄 Processing batched shard sync operation");
-            }
-            _ => {
-                debug!(
-                    "❓ Processing unknown batched operation type: {}",
-                    operation.operation_type
-                );
-            }
-        }
-
         Ok(())
     }
 
@@ -843,69 +764,82 @@ impl Node {
         Ok(())
     }
 
-    pub fn get_network_recommendation(
-        &self,
-        operation_type: &str,
-        data_size_gb: f64,
-    ) -> NetworkType {
-        self.network_manager
-            .get_recommended_interface_for_operation(operation_type, data_size_gb)
-    }
-
-    pub fn is_cost_effective_time(&self) -> bool {
-        self.network_manager.is_off_peak_hours()
-    }
-
-    pub fn get_data_usage_summary(&self) -> String {
-        self.network_manager.get_data_usage_summary()
-    }
-
-    pub fn get_bandwidth_sharing_stats(&self) -> crate::bandwidth_sharing::BandwidthSharingStats {
-        self.bandwidth_sharing.get_sharing_stats()
-    }
-
-    pub fn get_optimization_stats(&self) -> crate::data_optimizer::OptimizationStats {
-        self.data_optimizer.get_optimization_stats()
-    }
-
-    pub fn get_performance_metrics(&self) -> &PerformanceMetrics {
-        &self.performance_metrics
-    }
-
-    pub fn update_uptime(&mut self) {
-        self.performance_metrics.uptime_seconds += 1;
-    }
-
-    pub fn record_peer_connection(&mut self) {
-        self.performance_metrics.peer_connections_established += 1;
-    }
-
-    pub fn record_peer_disconnection(&mut self) {
-        self.performance_metrics.peer_connections_lost += 1;
-    }
-
-    pub fn record_message_sent(&mut self, bytes: usize) {
-        self.performance_metrics.messages_sent += 1;
-        self.performance_metrics.bytes_sent += bytes as u64;
-    }
-
-    pub fn record_message_received(&mut self, bytes: usize) {
-        self.performance_metrics.messages_received += 1;
-        self.performance_metrics.bytes_received += bytes as u64;
-    }
-
-    pub fn add_role(&mut self, role: NodeRole) -> anyhow::Result<()> {
-        if self.roles.insert(role) {
-            info!("➕ Added role: {:?}", role);
-            self.subscribe_to_topics()?;
+    pub async fn process_optimization_events(&mut self) -> anyhow::Result<()> {
+        while let Ok(event) = self.network_manager.event_receiver.try_recv() {
+            match event {
+                NetworkEvent::InterfaceChanged(new_type) => {
+                    info!("🌐 Network interface changed to: {:?}", new_type);
+                    self.performance_metrics.network_switches += 1;
+                }
+                NetworkEvent::DataThresholdReached(usage_gb) => {
+                    warn!("⚠️ Data threshold reached: {:.2} GB", usage_gb);
+                    if self
+                        .network_manager
+                        .interfaces
+                        .get(&NetworkType::WiFi)
+                        .map_or(false, |i| i.is_available)
+                    {
+                        let _ = self
+                            .optimization_events
+                            .send(OptimizationCommand::SwitchNetwork(NetworkType::WiFi));
+                    }
+                }
+                NetworkEvent::CostThresholdReached(cost) => {
+                    warn!("💰 Cost threshold reached: ${:.2}", cost);
+                }
+                _ => {}
+            }
         }
+
+        while let Ok(event) = self.bandwidth_sharing.event_receiver.try_recv() {
+            match event {
+                BandwidthSharingEvent::DeviceConnected(device_id) => {
+                    info!("📱 Device connected for bandwidth sharing: {}", device_id);
+                }
+                BandwidthSharingEvent::EgocEarned(amount) => {
+                    debug!("💰 Earned {:.4} EGOC from bandwidth sharing", amount);
+                    self.performance_metrics.cost_savings_usd += amount as f64 * 0.1;
+                }
+                _ => {}
+            }
+        }
+
+        while let Ok(event) = self.data_optimizer.event_receiver.try_recv() {
+            match event {
+                OptimizerEvent::BatchReady(batch_id) => {
+                    info!("📦 Batch ready for processing: {}", batch_id);
+                    let _ = self
+                        .optimization_events
+                        .send(OptimizationCommand::ProcessBatches);
+                }
+                OptimizerEvent::CompressionCompleted(op_id, ratio) => {
+                    debug!("🗜️ Compression completed for {}: ratio {:.2}", op_id, ratio);
+                }
+                _ => {}
+            }
+        }
+
+        while let Ok(command) = self.optimization_receiver.try_recv() {
+            match command {
+                OptimizationCommand::SwitchNetwork(network_type) => {
+                    self.network_manager.current_interface = network_type.clone();
+                    info!("🔄 Switched to network: {:?}", network_type);
+                }
+                OptimizationCommand::ConnectToPeer(addr) => {
+                    if let Err(e) = self.swarm.dial(addr.clone()) {
+                        warn!("❌ Failed to connect to peer {}: {}", addr, e);
+                    } else {
+                        info!("📞 Connecting to peer: {}", addr);
+                    }
+                }
+                OptimizationCommand::UpdateMetrics(metric_name, value) => {
+                    debug!("📊 Updating metric {}: {}", metric_name, value);
+                }
+                _ => {}
+            }
+        }
+
         Ok(())
-    }
-
-    pub fn remove_role(&mut self, role: NodeRole) {
-        if self.roles.remove(&role) {
-            info!("➖ Removed role: {:?}", role);
-        }
     }
 
     pub fn has_role(&self, role: NodeRole) -> bool {
@@ -914,22 +848,6 @@ impl Node {
 
     pub fn get_roles(&self) -> &HashSet<NodeRole> {
         &self.roles
-    }
-
-    pub fn add_shard(&mut self, shard_id: u32, config: ShardConfig) -> anyhow::Result<()> {
-        if !self.shard_ids.contains(&shard_id) {
-            self.shard_ids.push(shard_id);
-            self.shard_configs.insert(shard_id, config);
-            info!("➕ Added shard: {}", shard_id);
-            self.subscribe_to_topics()?;
-        }
-        Ok(())
-    }
-
-    pub fn remove_shard(&mut self, shard_id: u32) {
-        self.shard_ids.retain(|&id| id != shard_id);
-        self.shard_configs.remove(&shard_id);
-        info!("➖ Removed shard: {}", shard_id);
     }
 
     pub fn set_geolocation(&mut self, lat: f64, lon: f64, precision: usize) {
@@ -1045,14 +963,16 @@ impl Node {
         let opt_stats = self.get_optimization_stats();
         let network_summary = self.get_data_usage_summary();
         let connected_peers = self.swarm.connected_peers().count();
+        let state_stats = self.state_manager.get_stats();
 
         format!(
-            "Node {} [{}] - Roles: {:?}, Shards: {:?}, Peers: {}, Network: {:?}, Sharing: {} active, Data saved: {:.1}MB, Proofs: {}, {}",
+            "Node {} [{}] - Roles: {:?}, Shards: {:?}, Peers: {}, Accounts: {}, Network: {:?}, Sharing: {} active, Data saved: {:.1}MB, Proofs: {}, {}",
             self.peer_id,
             self.node_type,
             self.roles,
             self.shard_ids,
             connected_peers,
+            state_stats.total_accounts,
             self.network_manager.current_interface,
             sharing_stats.active_connections,
             opt_stats.total_bandwidth_saved_mb,
@@ -1061,50 +981,32 @@ impl Node {
         )
     }
 
-    pub fn emit_proof_event(&mut self, event: &ProofEvent) {
-        debug!("📋 Emitting proof event: {:?}", event.event_type);
-        self.recent_proofs.push(event.clone());
-        if self.recent_proofs.len() > 100 {
-            self.recent_proofs.remove(0);
-        }
-        self.last_proof_time = SystemTime::now();
+    pub fn get_bandwidth_sharing_stats(&self) -> crate::bandwidth_sharing::BandwidthSharingStats {
+        self.bandwidth_sharing.get_sharing_stats()
     }
 
-    pub fn emit_poc_proof(
-        &mut self,
-        h3_cell: String,
-        evidence_digest: Vec<u8>,
-    ) -> anyhow::Result<()> {
-        self.emit_poc_proof_optimized(h3_cell, evidence_digest)
+    pub fn get_optimization_stats(&self) -> crate::data_optimizer::OptimizationStats {
+        self.data_optimizer.get_optimization_stats()
     }
 
-    pub fn emit_post_proof(
-        &mut self,
-        shard_id: u32,
-        piece_id: u32,
-        evidence_digest: Vec<u8>,
-    ) -> anyhow::Result<()> {
-        self.emit_post_proof_optimized(shard_id, piece_id, evidence_digest)
+    pub fn get_data_usage_summary(&self) -> String {
+        self.network_manager.get_data_usage_summary()
     }
 
-    pub fn connect_bandwidth_sharing_device(
-        &mut self,
-        device_id: String,
-        device_name: Option<String>,
-        tier: &str,
-    ) -> Result<(), String> {
-        self.bandwidth_sharing
-            .connect_device(device_id, device_name, tier)
+    pub fn get_performance_metrics(&self) -> &PerformanceMetrics {
+        &self.performance_metrics
     }
 
-    pub fn record_shared_bandwidth_usage(
-        &mut self,
-        device_id: &str,
-        bytes: u64,
-    ) -> Result<f64, String> {
-        let earnings = self.bandwidth_sharing.record_data_usage(device_id, bytes)?;
-        self.performance_metrics.bandwidth_shared_bytes += bytes;
-        Ok(earnings)
+    pub fn update_uptime(&mut self) {
+        self.performance_metrics.uptime_seconds += 1;
+    }
+
+    pub fn record_peer_connection(&mut self) {
+        self.performance_metrics.peer_connections_established += 1;
+    }
+
+    pub fn record_peer_disconnection(&mut self) {
+        self.performance_metrics.peer_connections_lost += 1;
     }
 
     pub fn update_network_interface_status(
@@ -1117,106 +1019,26 @@ impl Node {
             .update_interface_status(interface_type, available, signal_strength);
     }
 
-    pub fn dht_put_record(
-        &mut self,
-        key: Vec<u8>,
-        value: Vec<u8>,
-        shard_id: Option<u32>,
-    ) -> anyhow::Result<()> {
-        let namespaced_key = match shard_id {
-            Some(id) => {
-                let mut namespaced = format!("shard-{}/", id).into_bytes();
-                namespaced.extend(key);
-                namespaced
-            }
-            None => key,
-        };
-        let record = kad::Record::new(namespaced_key, value);
-        self.swarm
-            .behaviour_mut()
-            .kademlia
-            .put_record(record, kad::Quorum::One)?;
-        Ok(())
+    pub fn is_cost_effective_time(&self) -> bool {
+        self.network_manager.is_off_peak_hours()
     }
 
-    pub fn dht_get_record(&mut self, key: Vec<u8>, shard_id: Option<u32>) -> anyhow::Result<()> {
-        let namespaced_key = match shard_id {
-            Some(id) => {
-                let mut namespaced = format!("shard-{}/", id).into_bytes();
-                namespaced.extend(key);
-                namespaced
-            }
-            None => key,
-        };
-        self.swarm
-            .behaviour_mut()
-            .kademlia
-            .get_record(kad::RecordKey::new(&namespaced_key));
-        Ok(())
+    pub fn get_account(&self, address: &Address) -> Option<Account> {
+        self.state_manager.get_account(address)
     }
 
-    pub fn add_placement(&mut self, placement: Placement) {
-        info!(
-            "📦 Added placement for piece {} in group {:?} as {:?}",
-            placement.piece_id, placement.group_id, placement.role
-        );
-        self.placements.push(placement);
+    pub fn get_balance(&self, address: &Address) -> Balance {
+        self.state_manager
+            .get_account(address)
+            .map(|acc| acc.balance)
+            .unwrap_or(Balance::ZERO)
     }
 
-    pub fn promote_replica(
-        &mut self,
-        group_id: [u8; 16],
-        new_primary: String,
-    ) -> anyhow::Result<()> {
-        for placement in &mut self.placements {
-            if placement.group_id == group_id {
-                let proof_event = ProofEvent {
-                    event_type: "promotion".to_string(),
-                    shard_id: None,
-                    piece_id: Some(placement.piece_id),
-                    group_id: Some(group_id),
-                    evidence_digest: vec![],
-                    timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-                    peer_id: new_primary.clone(),
-                };
-                self.emit_proof_event(&proof_event);
-                info!("⬆️ Promoted replica for group {:?}", group_id);
-                break;
-            }
-        }
-        Ok(())
+    pub fn get_state_root(&self) -> Hash {
+        self.state_manager.compute_state_root()
     }
 
-    pub fn schedule_repair(&mut self, group_id: [u8; 16]) -> anyhow::Result<()> {
-        let proof_event = ProofEvent {
-            event_type: "repair".to_string(),
-            shard_id: None,
-            piece_id: None,
-            group_id: Some(group_id),
-            evidence_digest: vec![],
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-            peer_id: self.peer_id.to_string(),
-        };
-        self.emit_proof_event(&proof_event);
-        info!("🔧 Scheduled repair for group {:?}", group_id);
-        Ok(())
-    }
-
-    pub fn bind_on_chain_identity(&mut self, account_pubkey: Vec<u8>, signature: Vec<u8>) {
-        self.keystore
-            .bind_on_chain_account_simple(account_pubkey, signature);
-        info!("🔗 Bound on-chain identity to peer {}", self.peer_id);
-    }
-
-    pub fn keypair(&self) -> &libp2p::identity::Keypair {
-        self.keystore.keypair()
-    }
-
-    pub fn public_key(&self) -> libp2p::identity::PublicKey {
-        self.keystore.public_key()
-    }
-
-    pub fn peer_id(&self) -> libp2p::PeerId {
-        self.keystore.peer_id()
+    pub fn get_block_height(&self) -> BlockHeight {
+        self.state_manager.get_block_height()
     }
 }

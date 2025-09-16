@@ -1,11 +1,10 @@
-use chrono::Timelike;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{debug, info, warn};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 pub enum NetworkType {
     WiFi,
     FiveG,
@@ -17,21 +16,28 @@ pub enum NetworkType {
 pub struct NetworkInterface {
     pub interface_type: NetworkType,
     pub is_available: bool,
-    pub signal_strength: Option<u8>,
-    pub bandwidth_mbps: Option<u64>,
-    pub cost_per_gb: Option<f64>,
-    pub latency_ms: Option<u32>,
-    pub data_usage_gb: f64,
-    pub monthly_limit_gb: Option<f64>,
+    pub signal_strength: u8,
+    pub cost_per_gb_usd: f64,
+    pub data_limit_gb: Option<f64>,
+    pub data_used_gb: f64,
+    pub last_updated: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DataUsageStats {
-    pub total_usage_gb: f64,
-    pub monthly_usage_gb: f64,
-    pub daily_usage_gb: f64,
-    pub last_reset: u64,
-    pub cost_this_month: f64,
+impl Default for NetworkInterface {
+    fn default() -> Self {
+        Self {
+            interface_type: NetworkType::WiFi,
+            is_available: false,
+            signal_strength: 0,
+            cost_per_gb_usd: 0.0,
+            data_limit_gb: None,
+            data_used_gb: 0.0,
+            last_updated: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -39,20 +45,20 @@ pub enum NetworkEvent {
     InterfaceChanged(NetworkType),
     DataThresholdReached(f64),
     CostThresholdReached(f64),
-    OffPeakHoursStarted,
-    OffPeakHoursEnded,
+    SignalStrengthChanged(NetworkType, u8),
+    InterfaceAvailabilityChanged(NetworkType, bool),
 }
 
 pub struct NetworkManager {
-    pub interfaces: HashMap<NetworkType, NetworkInterface>,
     pub current_interface: NetworkType,
-    pub data_usage: DataUsageStats,
-    pub event_sender: mpsc::UnboundedSender<NetworkEvent>,
-    pub event_receiver: mpsc::UnboundedReceiver<NetworkEvent>,
-    pub auto_switch_enabled: bool,
+    pub interfaces: HashMap<NetworkType, NetworkInterface>,
     pub cost_threshold_usd: f64,
     pub data_threshold_gb: f64,
-    pub off_peak_hours: (u8, u8),
+    pub monthly_cost_usd: f64,
+    pub monthly_data_gb: f64,
+    pub optimization_enabled: bool,
+    pub event_sender: mpsc::UnboundedSender<NetworkEvent>,
+    pub event_receiver: mpsc::UnboundedReceiver<NetworkEvent>,
 }
 
 impl NetworkManager {
@@ -66,12 +72,14 @@ impl NetworkManager {
             NetworkInterface {
                 interface_type: NetworkType::WiFi,
                 is_available: true,
-                signal_strength: Some(80),
-                bandwidth_mbps: Some(100),
-                cost_per_gb: Some(0.0),
-                latency_ms: Some(20),
-                data_usage_gb: 0.0,
-                monthly_limit_gb: None,
+                signal_strength: 80,
+                cost_per_gb_usd: 0.0,
+                data_limit_gb: None,
+                data_used_gb: 0.0,
+                last_updated: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
             },
         );
 
@@ -80,239 +88,263 @@ impl NetworkManager {
             NetworkInterface {
                 interface_type: NetworkType::FiveG,
                 is_available: false,
-                signal_strength: None,
-                bandwidth_mbps: Some(1000),
-                cost_per_gb: Some(10.0),
-                latency_ms: Some(5),
-                data_usage_gb: 0.0,
-                monthly_limit_gb: Some(50.0),
+                signal_strength: 0,
+                cost_per_gb_usd: 5.0,
+                data_limit_gb: Some(50.0),
+                data_used_gb: 0.0,
+                last_updated: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            },
+        );
+
+        interfaces.insert(
+            NetworkType::Ethernet,
+            NetworkInterface {
+                interface_type: NetworkType::Ethernet,
+                is_available: false,
+                signal_strength: 100,
+                cost_per_gb_usd: 0.0,
+                data_limit_gb: None,
+                data_used_gb: 0.0,
+                last_updated: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            },
+        );
+
+        interfaces.insert(
+            NetworkType::Cellular4G,
+            NetworkInterface {
+                interface_type: NetworkType::Cellular4G,
+                is_available: true,
+                signal_strength: 60,
+                cost_per_gb_usd: 2.0,
+                data_limit_gb: Some(20.0),
+                data_used_gb: 0.0,
+                last_updated: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
             },
         );
 
         Self {
-            interfaces,
             current_interface: NetworkType::WiFi,
-            data_usage: DataUsageStats {
-                total_usage_gb: 0.0,
-                monthly_usage_gb: 0.0,
-                daily_usage_gb: 0.0,
-                last_reset: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                cost_this_month: 0.0,
-            },
-            event_sender,
-            event_receiver,
-            auto_switch_enabled: true,
+            interfaces,
             cost_threshold_usd: 100.0,
             data_threshold_gb: 40.0,
-            off_peak_hours: (23, 6),
+            monthly_cost_usd: 0.0,
+            monthly_data_gb: 0.0,
+            optimization_enabled: true,
+            event_sender,
+            event_receiver,
         }
     }
 
     pub fn update_interface_status(
         &mut self,
         interface_type: NetworkType,
-        is_available: bool,
+        available: bool,
         signal_strength: Option<u8>,
     ) {
         if let Some(interface) = self.interfaces.get_mut(&interface_type) {
-            interface.is_available = is_available;
-            interface.signal_strength = signal_strength;
-
-            if self.auto_switch_enabled {
-                self.evaluate_best_interface();
+            let previous_availability = interface.is_available;
+            interface.is_available = available;
+            if let Some(strength) = signal_strength {
+                interface.signal_strength = strength;
             }
+            interface.last_updated = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            if previous_availability != available {
+                let _ = self
+                    .event_sender
+                    .send(NetworkEvent::InterfaceAvailabilityChanged(
+                        interface_type.clone(),
+                        available,
+                    ));
+            }
+
+            if let Some(strength) = signal_strength {
+                let _ = self.event_sender.send(NetworkEvent::SignalStrengthChanged(
+                    interface_type.clone(),
+                    strength,
+                ));
+            }
+
+            debug!(
+                "Updated interface {:?}: available={}, signal={}",
+                interface_type, available, interface.signal_strength
+            );
         }
     }
 
-    pub fn evaluate_best_interface(&mut self) -> NetworkType {
-        let mut best_interface = self.current_interface.clone();
-        let mut best_score = 0.0;
+    pub fn switch_to_best_interface(&mut self) -> Option<NetworkType> {
+        if !self.optimization_enabled {
+            return None;
+        }
 
-        for (interface_type, interface) in &self.interfaces {
-            if !interface.is_available {
-                continue;
+        let best_interface = self.find_best_interface();
+        if let Some(new_interface) = best_interface {
+            if new_interface != self.current_interface {
+                let previous = self.current_interface.clone();
+                self.current_interface = new_interface.clone();
+
+                let _ = self
+                    .event_sender
+                    .send(NetworkEvent::InterfaceChanged(new_interface.clone()));
+
+                info!(
+                    "Switched network interface from {:?} to {:?}",
+                    previous, new_interface
+                );
+                return Some(new_interface);
             }
+        }
+        None
+    }
 
-            let mut score = 0.0;
+    pub fn find_best_interface(&self) -> Option<NetworkType> {
+        let available_interfaces: Vec<_> = self
+            .interfaces
+            .values()
+            .filter(|interface| interface.is_available)
+            .collect();
 
-            match interface_type {
-                NetworkType::WiFi | NetworkType::Ethernet => score += 100.0,
-                NetworkType::FiveG => {
-                    if self.is_mobility_required() || self.is_low_latency_required() {
-                        score += 80.0;
-                    } else {
-                        score += 20.0;
-                    }
+        if available_interfaces.is_empty() {
+            return None;
+        }
+
+        let mut best: Option<&NetworkInterface> = None;
+        for interface in available_interfaces {
+            if let Some(current_best) = best {
+                let interface_score = self.calculate_interface_score(interface);
+                let best_score = self.calculate_interface_score(current_best);
+
+                if interface_score > best_score {
+                    best = Some(interface);
                 }
-                NetworkType::Cellular4G => score += 40.0,
-            }
-
-            if let Some(strength) = interface.signal_strength {
-                score += strength as f64 * 0.5;
-            }
-
-            if let Some(cost) = interface.cost_per_gb {
-                if cost == 0.0 {
-                    score += 50.0;
-                } else {
-                    score += 50.0 / cost.max(1.0);
-                }
-            }
-
-            if let Some(limit) = interface.monthly_limit_gb {
-                let usage_ratio = interface.data_usage_gb / limit;
-                if usage_ratio > 0.8 {
-                    score *= 0.5;
-                }
-            }
-
-            if score > best_score {
-                best_score = score;
-                best_interface = interface_type.clone();
+            } else {
+                best = Some(interface);
             }
         }
 
-        if best_interface != self.current_interface {
-            info!(
-                "Switching network interface from {:?} to {:?}",
-                self.current_interface, best_interface
-            );
-            self.current_interface = best_interface.clone();
-            let _ = self
-                .event_sender
-                .send(NetworkEvent::InterfaceChanged(best_interface.clone()));
+        best.map(|interface| interface.interface_type.clone())
+    }
+
+    fn calculate_interface_score(&self, interface: &NetworkInterface) -> f64 {
+        let mut score = 0.0;
+
+        if interface.cost_per_gb_usd == 0.0 {
+            score += 100.0;
+        } else {
+            score += (10.0 / interface.cost_per_gb_usd).min(50.0);
         }
 
-        best_interface
+        score += interface.signal_strength as f64 * 0.5;
+
+        if let Some(limit) = interface.data_limit_gb {
+            let usage_ratio = interface.data_used_gb / limit;
+            if usage_ratio > 0.8 {
+                score *= 0.5;
+            } else if usage_ratio > 0.6 {
+                score *= 0.8;
+            }
+        }
+
+        match interface.interface_type {
+            NetworkType::Ethernet => score += 20.0,
+            NetworkType::WiFi => score += 15.0,
+            NetworkType::FiveG => score += 10.0,
+            NetworkType::Cellular4G => score += 5.0,
+        }
+
+        score
     }
 
     pub fn record_data_usage(&mut self, bytes: u64) {
         let gb = bytes as f64 / 1_000_000_000.0;
-
-        self.data_usage.total_usage_gb += gb;
-        self.data_usage.monthly_usage_gb += gb;
-        self.data_usage.daily_usage_gb += gb;
+        self.monthly_data_gb += gb;
 
         if let Some(interface) = self.interfaces.get_mut(&self.current_interface) {
-            interface.data_usage_gb += gb;
+            interface.data_used_gb += gb;
+            self.monthly_cost_usd += gb * interface.cost_per_gb_usd;
 
-            if let Some(cost_per_gb) = interface.cost_per_gb {
-                let cost = gb * cost_per_gb;
-                self.data_usage.cost_this_month += cost;
+            if self.monthly_data_gb > self.data_threshold_gb {
+                let _ = self
+                    .event_sender
+                    .send(NetworkEvent::DataThresholdReached(self.monthly_data_gb));
+            }
 
-                if self.data_usage.cost_this_month > self.cost_threshold_usd {
-                    let _ = self.event_sender.send(NetworkEvent::CostThresholdReached(
-                        self.data_usage.cost_this_month,
-                    ));
-                }
+            if self.monthly_cost_usd > self.cost_threshold_usd {
+                let _ = self
+                    .event_sender
+                    .send(NetworkEvent::CostThresholdReached(self.monthly_cost_usd));
             }
         }
+    }
 
-        if self.data_usage.monthly_usage_gb > self.data_threshold_gb {
-            let _ = self.event_sender.send(NetworkEvent::DataThresholdReached(
-                self.data_usage.monthly_usage_gb,
-            ));
-        }
+    pub fn is_cost_effective_time(&self) -> bool {
+        self.is_off_peak_hours()
     }
 
     pub fn is_off_peak_hours(&self) -> bool {
-        let now = chrono::Utc::now();
-        let hour = now.hour() as u8;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
 
-        if self.off_peak_hours.0 > self.off_peak_hours.1 {
-            hour >= self.off_peak_hours.0 || hour < self.off_peak_hours.1
-        } else {
-            hour >= self.off_peak_hours.0 && hour < self.off_peak_hours.1
-        }
+        let seconds_in_day = now % 86400;
+        let off_peak_start = 23 * 3600;
+        let off_peak_end = 6 * 3600;
+
+        seconds_in_day >= off_peak_start || seconds_in_day < off_peak_end
     }
 
-    pub fn should_use_5g(&self) -> bool {
-        if !self
-            .interfaces
-            .get(&NetworkType::FiveG)
-            .map_or(false, |i| i.is_available)
-        {
-            return false;
-        }
-
-        if let Some(wifi) = self.interfaces.get(&NetworkType::WiFi) {
-            if wifi.is_available && wifi.signal_strength.unwrap_or(0) > 50 {
-                return false;
-            }
-        }
-
-        self.is_mobility_required() || self.is_low_latency_required()
-    }
-
-    pub fn get_recommended_interface_for_operation(
-        &self,
-        operation_type: &str,
-        data_size_gb: f64,
-    ) -> NetworkType {
-        match operation_type {
-            "shard_download" | "post_upload" => {
-                if self
-                    .interfaces
-                    .get(&NetworkType::WiFi)
-                    .map_or(false, |i| i.is_available)
-                {
-                    NetworkType::WiFi
-                } else if self
-                    .interfaces
-                    .get(&NetworkType::Ethernet)
-                    .map_or(false, |i| i.is_available)
-                {
-                    NetworkType::Ethernet
-                } else if self.is_off_peak_hours() && data_size_gb < 1.0 {
-                    NetworkType::FiveG
-                } else {
-                    self.current_interface.clone()
-                }
-            }
-            "consensus" | "validation" => {
-                if self.should_use_5g() {
-                    NetworkType::FiveG
-                } else {
-                    self.current_interface.clone()
-                }
-            }
-            _ => self.current_interface.clone(),
-        }
+    pub fn get_current_interface(&self) -> &NetworkInterface {
+        self.interfaces
+            .get(&self.current_interface)
+            .unwrap_or_else(|| self.interfaces.values().next().unwrap())
     }
 
     pub fn get_data_usage_summary(&self) -> String {
         format!(
-            "Data Usage - Total: {:.2} GB, Monthly: {:.2} GB, Daily: {:.2} GB, Cost: ${:.2}",
-            self.data_usage.total_usage_gb,
-            self.data_usage.monthly_usage_gb,
-            self.data_usage.daily_usage_gb,
-            self.data_usage.cost_this_month
+            "Data: {:.2}GB/${:.2} (threshold: {:.0}GB/${:.0})",
+            self.monthly_data_gb,
+            self.monthly_cost_usd,
+            self.data_threshold_gb,
+            self.cost_threshold_usd
         )
     }
 
     pub fn reset_monthly_stats(&mut self) {
-        self.data_usage.monthly_usage_gb = 0.0;
-        self.data_usage.cost_this_month = 0.0;
-        self.data_usage.last_reset = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
+        self.monthly_cost_usd = 0.0;
+        self.monthly_data_gb = 0.0;
         for interface in self.interfaces.values_mut() {
-            interface.data_usage_gb = 0.0;
+            interface.data_used_gb = 0.0;
         }
-
-        info!("Monthly data usage stats reset");
+        info!("Monthly network statistics reset");
     }
 
-    fn is_mobility_required(&self) -> bool {
-        false
+    pub fn set_optimization_enabled(&mut self, enabled: bool) {
+        self.optimization_enabled = enabled;
+        info!("Network optimization enabled: {}", enabled);
     }
 
-    fn is_low_latency_required(&self) -> bool {
-        false
+    pub fn get_interface_stats(&self) -> HashMap<NetworkType, (f64, f64, bool)> {
+        self.interfaces
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    (v.data_used_gb, v.cost_per_gb_usd, v.is_available),
+                )
+            })
+            .collect()
     }
 }

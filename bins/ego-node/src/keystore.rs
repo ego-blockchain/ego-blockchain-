@@ -1,4 +1,4 @@
-use libp2p::identity::{Keypair, PublicKey};
+use ego_core::{EgoError, KeyPair, PublicKey, verify_signature};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -23,6 +23,10 @@ pub enum KeystoreError {
     SerializationError(#[from] serde_json::Error),
     #[error("Binding verification failed: {0}")]
     BindingVerificationFailed(String),
+    #[error("Core error: {0}")]
+    CoreError(#[from] EgoError),
+    #[error("Libp2p key decoding error: {0}")]
+    LibP2PDecodingError(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -54,8 +58,15 @@ impl AccountBinding {
 
     pub fn verify_binding(&self, libp2p_pubkey: &PublicKey) -> Result<bool, KeystoreError> {
         let message = self.create_binding_message();
+        let signature = ego_core::Signature::new({
+            let mut sig_bytes = [0u8; 64];
+            if self.binding_signature.len() == 64 {
+                sig_bytes.copy_from_slice(&self.binding_signature);
+            }
+            sig_bytes
+        });
 
-        let is_valid = libp2p_pubkey.verify(&message, &self.binding_signature);
+        let is_valid = verify_signature(libp2p_pubkey, &message, &signature)?;
         Ok(is_valid)
     }
 
@@ -102,8 +113,8 @@ impl DerivationPath {
 }
 
 pub struct SecureKeystore {
-    primary_keypair: Keypair,
-    derived_keypairs: HashMap<String, Keypair>,
+    primary_keypair: KeyPair,
+    derived_keypairs: HashMap<String, KeyPair>,
     account_bindings: HashMap<String, AccountBinding>,
     master_seed: Option<[u8; 32]>,
     encryption_key: Option<[u8; 32]>,
@@ -138,7 +149,7 @@ impl Default for KeystoreMetadata {
 
 impl SecureKeystore {
     pub fn new() -> Self {
-        let primary_keypair = Keypair::generate_ed25519();
+        let primary_keypair = KeyPair::generate();
         let mut master_seed = [0u8; 32];
         rand::rng().fill_bytes(&mut master_seed);
 
@@ -153,7 +164,7 @@ impl SecureKeystore {
     }
 
     pub fn from_seed(seed: [u8; 32]) -> Result<Self, KeystoreError> {
-        let primary_keypair = Keypair::generate_ed25519();
+        let primary_keypair = KeyPair::from_bytes(&seed)?;
 
         let mut keystore = Self {
             primary_keypair,
@@ -183,28 +194,44 @@ impl SecureKeystore {
         Self::from_seed(seed)
     }
 
-    pub fn keypair(&self) -> &Keypair {
+    pub fn keypair(&self) -> &KeyPair {
         &self.primary_keypair
     }
 
     pub fn public_key(&self) -> PublicKey {
-        self.primary_keypair.public()
+        self.primary_keypair.public_key()
     }
 
     pub fn peer_id(&self) -> libp2p::PeerId {
-        self.primary_keypair.public().to_peer_id()
+        let libp2p_keypair = self.libp2p_keypair();
+        libp2p_keypair.public().to_peer_id()
+    }
+
+    pub fn libp2p_keypair(&self) -> libp2p::identity::Keypair {
+        if let Some(seed) = self.master_seed {
+            let mut libp2p_seed = [0u8; 32];
+            libp2p_seed.copy_from_slice(&seed);
+
+            match libp2p::identity::ed25519::Keypair::try_from_bytes(&mut libp2p_seed) {
+                Ok(_) => libp2p::identity::Keypair::ed25519_from_bytes(libp2p_seed)
+                    .expect("Valid Ed25519 keypair from seed"),
+                Err(_) => libp2p::identity::Keypair::generate_ed25519(),
+            }
+        } else {
+            libp2p::identity::Keypair::generate_ed25519()
+        }
     }
 
     pub fn derive_keypair(
         &mut self,
         purpose: &str,
         _path: Option<DerivationPath>,
-    ) -> Result<&Keypair, KeystoreError> {
+    ) -> Result<&KeyPair, KeystoreError> {
         if self.derived_keypairs.contains_key(purpose) {
             return Ok(self.derived_keypairs.get(purpose).unwrap());
         }
 
-        let derived_keypair = Keypair::generate_ed25519();
+        let derived_keypair = KeyPair::generate();
         self.derived_keypairs
             .insert(purpose.to_string(), derived_keypair);
         self.metadata.key_count += 1;
@@ -212,33 +239,31 @@ impl SecureKeystore {
         Ok(self.derived_keypairs.get(purpose).unwrap())
     }
 
-    pub fn get_derived_keypair(&self, purpose: &str) -> Option<&Keypair> {
+    pub fn get_derived_keypair(&self, purpose: &str) -> Option<&KeyPair> {
         self.derived_keypairs.get(purpose)
     }
 
-    pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, KeystoreError> {
-        self.primary_keypair
-            .sign(message)
-            .map_err(|e| KeystoreError::InvalidSignature(e.to_string()))
+    pub fn sign(&self, message: &[u8]) -> Result<ego_core::Signature, KeystoreError> {
+        let signature = self.primary_keypair.sign(message);
+        Ok(signature)
     }
 
     pub fn sign_with_derived(
         &self,
         purpose: &str,
         message: &[u8],
-    ) -> Result<Vec<u8>, KeystoreError> {
+    ) -> Result<ego_core::Signature, KeystoreError> {
         let keypair = self
             .derived_keypairs
             .get(purpose)
             .ok_or_else(|| KeystoreError::KeyNotFound(purpose.to_string()))?;
 
-        keypair
-            .sign(message)
-            .map_err(|e| KeystoreError::InvalidSignature(e.to_string()))
+        let signature = keypair.sign(message);
+        Ok(signature)
     }
 
-    pub fn verify(&self, message: &[u8], signature: &[u8]) -> bool {
-        self.primary_keypair.public().verify(message, signature)
+    pub fn verify(&self, message: &[u8], signature: &ego_core::Signature) -> bool {
+        verify_signature(&self.public_key(), message, signature).unwrap_or(false)
     }
 
     pub fn bind_on_chain_account(
@@ -269,7 +294,7 @@ impl SecureKeystore {
         &self,
         account_pubkey: &[u8],
         chain_id: Option<&str>,
-    ) -> Result<Vec<u8>, KeystoreError> {
+    ) -> Result<ego_core::Signature, KeystoreError> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -393,15 +418,7 @@ impl SecureKeystore {
             key.fill(0);
         }
     }
-}
 
-impl Drop for SecureKeystore {
-    fn drop(&mut self) {
-        self.secure_clear();
-    }
-}
-
-impl SecureKeystore {
     pub fn bind_on_chain_account_simple(&mut self, account_pubkey: Vec<u8>, signature: Vec<u8>) {
         let binding = AccountBinding {
             account_pubkey,
@@ -425,5 +442,11 @@ impl SecureKeystore {
                 binding.binding_signature.as_slice(),
             )
         })
+    }
+}
+
+impl Drop for SecureKeystore {
+    fn drop(&mut self) {
+        self.secure_clear();
     }
 }

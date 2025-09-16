@@ -1,4 +1,5 @@
 use clap::{Arg, Command};
+use ego_core::{Address, Balance, Transaction, TransactionPayload};
 use ego_node::{NetworkType, Node, NodeRole};
 use libp2p::{Multiaddr, futures::StreamExt};
 use std::io::{self, Write};
@@ -785,6 +786,72 @@ async fn handle_interactive_command(
                 println!("  ✓ {}", capability);
             }
         }
+        "blockchain" => {
+            let state_stats = node.state_manager.get_stats();
+            println!("Blockchain State:");
+            println!("  Block height: {}", node.get_block_height());
+            println!("  State root: {}", node.get_state_root());
+            println!("  Total accounts: {}", state_stats.total_accounts);
+            println!("  Total balance: {}", state_stats.total_balance);
+            println!("  Active validators: {}", state_stats.active_validators);
+            println!("  Total staked: {}", state_stats.total_staked);
+        }
+        "account" => {
+            let my_address = node.get_address();
+            if let Some(account) = node.get_account(&my_address) {
+                println!("My Account:");
+                println!("  Address: {}", my_address);
+                println!("  Balance: {}", account.balance);
+                println!("  Nonce: {}", account.nonce);
+                println!("  Type: {:?}", account.account_type);
+                println!(
+                    "  Storage: {}/{} bytes",
+                    account.storage_used, account.storage_quota
+                );
+            } else {
+                println!("❌ Account not found in state");
+            }
+        }
+        "transfer" => {
+            println!("Creating test transfer transaction...");
+            let from_address = node.get_address();
+            let to_address = Address::new([1u8; 20]);
+            let amount = Balance::from_egoc(10);
+
+            if let Some(account) = node.get_account(&from_address) {
+                let payload = TransactionPayload::Transfer {
+                    to: to_address,
+                    amount,
+                    memo: Some("Test transfer".to_string()),
+                };
+
+                let mut tx = Transaction::new(
+                    from_address,
+                    account.nonce + 1,
+                    payload,
+                    ego_core::ShardId::new(0).unwrap(),
+                    None,
+                );
+
+                if let Err(e) = tx.sign(node.get_keypair()) {
+                    println!("❌ Failed to sign transaction: {}", e);
+                } else {
+                    match node.execute_transaction(&tx).await {
+                        Ok(result) => {
+                            println!("✅ Transaction executed: {}", result.success);
+                            if let Some(error) = result.error {
+                                println!("   Error: {}", error);
+                            }
+                        }
+                        Err(e) => {
+                            println!("❌ Transaction failed: {}", e);
+                        }
+                    }
+                }
+            } else {
+                println!("❌ Account not found");
+            }
+        }
         "proofs" => {
             println!("Recent proofs: {} events", node.recent_proofs.len());
             for (i, proof) in node.recent_proofs.iter().rev().take(10).enumerate() {
@@ -1000,6 +1067,9 @@ fn print_commands() {
     println!("  peers          - List connected peers");
     println!("  roles          - Show current node roles");
     println!("  capabilities   - Show node capabilities");
+    println!("  blockchain     - Show blockchain state");
+    println!("  account        - Show my account details");
+    println!("  transfer       - Create test transfer transaction");
     println!("  proofs         - Show recent proof events");
     println!("  5g             - Show 5G configuration status");
     println!("  metrics        - Show performance metrics");
@@ -1061,6 +1131,14 @@ fn print_detailed_status(node: &Node) {
     println!("Listen Addresses: {:?}", node.listen_addresses);
     println!("Bootstrap Peers: {:?}", node.bootstrap_peers);
 
+    println!("\n🔗 Blockchain State");
+    let state_stats = node.state_manager.get_stats();
+    println!("Block Height: {}", node.get_block_height());
+    println!("State Root: {}", node.get_state_root());
+    println!("Total Accounts: {}", state_stats.total_accounts);
+    println!("Total Balance: {}", state_stats.total_balance);
+    println!("Active Validators: {}", state_stats.active_validators);
+
     println!("\n🔧 Optimization Features");
     println!(
         "Current Network: {:?}",
@@ -1092,6 +1170,11 @@ fn print_metrics(node: &Node) {
         "Storage Utilization: {} GB available",
         node.storage_capacity_bytes / 1_000_000_000
     );
+
+    let state_stats = node.state_manager.get_stats();
+    println!("Blockchain Accounts: {}", state_stats.total_accounts);
+    println!("Total Balance: {}", state_stats.total_balance);
+    println!("Active Validators: {}", state_stats.active_validators);
 
     let mut proof_counts = std::collections::HashMap::new();
     for proof in &node.recent_proofs {
@@ -1216,6 +1299,12 @@ fn print_final_stats(node: &Node) {
     if sharing_stats.enabled {
         println!("Total EGOC earned: {:.4}", sharing_stats.total_earned_egoc);
     }
+
+    let state_stats = node.state_manager.get_stats();
+    println!("Final blockchain state:");
+    println!("  Total accounts: {}", state_stats.total_accounts);
+    println!("  Total balance: {}", state_stats.total_balance);
+    println!("  Block height: {}", node.get_block_height());
 }
 
 async fn generate_proofs(node: &mut Node) -> anyhow::Result<()> {
