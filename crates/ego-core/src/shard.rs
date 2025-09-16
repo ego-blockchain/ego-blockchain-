@@ -461,7 +461,6 @@ impl TransactionPool {
         }
     }
 
-    /// Get transactions for block production
     pub fn get_transactions_for_block(&mut self, max_count: usize) -> Vec<Transaction> {
         let mut transactions = Vec::new();
         let mut count = 0;

@@ -190,7 +190,6 @@ impl StateManager {
         self.accounts.insert(address, account);
     }
 
-    /// Create a new account
     pub fn create_account(&self, address: Address, account_type: AccountType) -> EgoResult<()> {
         if self.accounts.contains_key(&address) {
             return Err(EgoError::InvalidTransaction(
