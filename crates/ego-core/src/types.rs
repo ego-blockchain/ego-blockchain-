@@ -369,12 +369,20 @@ impl Balance {
         Self(egoc as u128 * crate::EGOC_BASE_UNIT)
     }
 
+    pub fn from_uegoc(uegoc: u128) -> Self {
+        Self(uegoc)
+    }
+
     pub fn as_u128(&self) -> u128 {
         self.0
     }
 
     pub fn to_egoc(&self) -> f64 {
         self.0 as f64 / crate::EGOC_BASE_UNIT as f64
+    }
+
+    pub fn to_uegoc(&self) -> u128 {
+        self.0
     }
 
     pub fn checked_add(&self, other: Balance) -> Option<Balance> {
@@ -384,11 +392,23 @@ impl Balance {
     pub fn checked_sub(&self, other: Balance) -> Option<Balance> {
         self.0.checked_sub(other.0).map(Balance)
     }
+
+    pub fn checked_mul(&self, multiplier: u128) -> Option<Balance> {
+        self.0.checked_mul(multiplier).map(Balance)
+    }
+
+    pub fn checked_div(&self, divisor: u128) -> Option<Balance> {
+        if divisor == 0 {
+            None
+        } else {
+            Some(Balance(self.0 / divisor))
+        }
+    }
 }
 
 impl fmt::Display for Balance {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:.6} EGOC", self.to_egoc())
+        write!(f, "{:.8} EGOC", self.to_egoc())
     }
 }
 
