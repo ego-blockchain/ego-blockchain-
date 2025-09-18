@@ -10,57 +10,36 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct StateManager {
     accounts: Arc<DashMap<Address, Account>>,
-
     storage: Arc<DashMap<Hash, StorageEntry>>,
-
     validators: Arc<DashMap<Address, ValidatorInfo>>,
-
     slices: Arc<DashMap<String, SliceConfig>>,
-
     cross_shard_state: Arc<DashMap<ShardId, CrossShardState>>,
-
     state_root: Hash,
-
     block_height: BlockHeight,
-
     stats: StateStats,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct StorageEntry {
     pub data_hash: Hash,
-
     pub size: u64,
-
     pub expires_at: BlockHeight,
-
     pub provider: Address,
-
     pub slice_id: Option<String>,
-
     pub stored_at: Timestamp,
-
     pub replica_count: u8,
-
     pub payment: Balance,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct ValidatorInfo {
     pub address: Address,
-
     pub public_key: crate::PublicKey,
-
     pub total_stake: Balance,
-
     pub own_stake: Balance,
-
     pub commission_rate: u16,
-
     pub status: ValidatorStatus,
-
     pub performance: ValidatorPerformance,
-
     pub jail_info: Option<JailInfo>,
 }
 
@@ -75,47 +54,31 @@ pub enum ValidatorStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct ValidatorPerformance {
     pub blocks_proposed: u64,
-
     pub blocks_missed: u64,
-
     pub attestations_made: u64,
-
     pub attestations_missed: u64,
-
     pub last_active: BlockHeight,
-
     pub uptime_score: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct JailInfo {
     pub jailed_at: BlockHeight,
-
     pub release_at: BlockHeight,
-
     pub reason: String,
-
     pub slashed_amount: Balance,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct SliceConfig {
     pub slice_id: String,
-
     pub slice_type: SliceType,
-
     pub authorized_devices: Vec<Address>,
-
     pub bandwidth_allocation: u64,
-
     pub latency_ms: u32,
-
     pub reliability_score: u8,
-
     pub status: SliceStatus,
-
     pub created_at: Timestamp,
-
     pub updated_at: Timestamp,
 }
 
@@ -138,32 +101,21 @@ pub enum SliceStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct CrossShardState {
     pub shard_id: ShardId,
-
     pub last_state_root: Hash,
-
     pub last_block_height: BlockHeight,
-
     pub pending_receipts: Vec<Hash>,
-
     pub receipt_nonce: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StateStats {
     pub total_accounts: u64,
-
     pub total_balance: Balance,
-
     pub storage_entries: u64,
-
     pub total_storage_bytes: u64,
-
     pub active_validators: u32,
-
     pub total_staked: Balance,
-
     pub active_slices: u32,
-
     pub last_updated: Timestamp,
 }
 
@@ -198,7 +150,7 @@ impl StateManager {
         }
 
         let account = match account_type {
-            AccountType::User => Account::new_user(address),
+            AccountType::EOA => Account::new_eoa(address, vec![0u8; 1312]),
             AccountType::Device {
                 device_id,
                 geohash: _,
@@ -212,15 +164,22 @@ impl StateManager {
                     last_poc: None,
                     post_stats: Default::default(),
                 };
-                Account::new_device(address, device_id, capabilities)
+                Account::new_device(
+                    address,
+                    device_id,
+                    capabilities,
+                    vec![0u8; 1312],
+                    "peer_id".to_string(),
+                )
             }
-            AccountType::Validator {
-                validator_pubkey,
-                commission_rate,
-            } => Account::new_validator(address, validator_pubkey, commission_rate, Balance::ZERO)?,
-            _ => {
+            AccountType::Contract { .. } => {
                 return Err(EgoError::InvalidTransaction(
-                    "Unsupported account type for direct creation".to_string(),
+                    "Contract accounts must be created through deployment".to_string(),
+                ));
+            }
+            AccountType::System { .. } => {
+                return Err(EgoError::InvalidTransaction(
+                    "System accounts cannot be created directly".to_string(),
                 ));
             }
         };
@@ -249,6 +208,7 @@ impl StateManager {
                 account_address,
                 account_type,
                 initial_balance,
+                dilithium_pk: _,
             } => self.execute_create_account(
                 &mut sender,
                 *account_address,
@@ -262,6 +222,7 @@ impl StateManager {
                 duration,
                 data_hash,
                 slice_id,
+                storage_credits,
             } => self.execute_store_data(
                 &mut sender,
                 *chunk_id,
@@ -269,6 +230,7 @@ impl StateManager {
                 *duration,
                 *data_hash,
                 slice_id.clone(),
+                *storage_credits,
             )?,
 
             TransactionPayload::Stake {
@@ -311,7 +273,7 @@ impl StateManager {
 
         let mut recipient = self
             .get_account(&to)
-            .unwrap_or_else(|| Account::new_user(to));
+            .unwrap_or_else(|| Account::new_eoa(to, vec![0u8; 1312]));
         recipient.credit(amount);
 
         self.set_account(recipient);
@@ -411,6 +373,7 @@ impl StateManager {
         duration: u64,
         data_hash: Hash,
         slice_id: crate::SliceId,
+        storage_credits: u64,
     ) -> EgoResult<TransactionResult> {
         sender.update_storage_usage(data_size)?;
 
@@ -420,8 +383,7 @@ impl StateManager {
             });
         }
 
-        let storage_cost = Balance::new(((data_size * duration) / 1000) as u128);
-        sender.debit(storage_cost)?;
+        sender.use_storage_credits(storage_credits)?;
 
         let storage_entry = StorageEntry {
             data_hash,
@@ -431,7 +393,7 @@ impl StateManager {
             slice_id: Some(slice_id.as_str().to_string()),
             stored_at: Timestamp::now(),
             replica_count: 3,
-            payment: storage_cost,
+            payment: Balance::new(storage_credits as u128),
         };
 
         self.storage.insert(chunk_id, storage_entry);

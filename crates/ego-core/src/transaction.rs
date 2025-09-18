@@ -16,6 +16,7 @@ pub struct Transaction {
     pub timestamp: Timestamp,
     pub shard_id: ShardId,
     pub slice_id: Option<SliceId>,
+    pub dilithium_signature: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -29,6 +30,7 @@ pub enum TransactionPayload {
         account_address: Address,
         account_type: crate::account::AccountType,
         initial_balance: Balance,
+        dilithium_pk: Vec<u8>,
     },
     UpdateAccount {
         account_address: Address,
@@ -40,12 +42,14 @@ pub enum TransactionPayload {
         duration: u64,
         data_hash: Hash,
         slice_id: SliceId,
+        storage_credits: u64,
     },
     SubmitProof {
         proof_type: String,
         proof_data: Vec<u8>,
         challenge_hash: Hash,
         location_id: String,
+        witness_data: Option<crate::block::WitnessData>,
     },
     Stake {
         amount: Balance,
@@ -81,6 +85,40 @@ pub enum TransactionPayload {
         data: Vec<u8>,
         auth_level: u8,
     },
+    DeployContract {
+        contract_code: Vec<u8>,
+        constructor_args: Vec<u8>,
+        deploy_credits: u64,
+        use_free_quota: bool,
+    },
+    BuyStorageCredits {
+        amount: Balance,
+        credits: u64,
+    },
+    BuyDeployCredits {
+        amount: Balance,
+        credits: u64,
+    },
+    UpdateDRS {
+        node_id: Address,
+        metrics_hash: Hash,
+        epoch: u64,
+    },
+    PoCWitness {
+        prover: Address,
+        location_data: Vec<u8>,
+        signal_data: Vec<u8>,
+        witnesses: Vec<Address>,
+    },
+    PoStChallenge {
+        challenged_node: Address,
+        challenge_data: Vec<u8>,
+        deadline_block: u64,
+    },
+    PoStResponse {
+        challenge_hash: Hash,
+        proof_data: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -90,6 +128,9 @@ pub struct AccountUpdates {
     pub remove_slices: Vec<SliceId>,
     pub device_capabilities: Option<crate::account::DeviceCapabilities>,
     pub metadata_updates: HashMap<String, Option<String>>,
+    pub dilithium_pk: Option<Vec<u8>>,
+    pub mlkem_pk: Option<Vec<u8>>,
+    pub peer_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -133,6 +174,9 @@ pub enum StateChangeType {
     SliceAuthorization,
     ValidatorUpdate,
     ContractState,
+    DRSScoreUpdate,
+    StorageCreditsUpdate,
+    DeployCreditsUpdate,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -170,6 +214,7 @@ impl Transaction {
             timestamp: Timestamp::now(),
             shard_id,
             slice_id,
+            dilithium_signature: None,
         }
     }
 
@@ -181,8 +226,12 @@ impl Transaction {
                 "Sender address does not match public key".to_string(),
             ));
         }
+
         let signing_data = self.create_signing_data()?;
+
         self.signature = keypair.sign(&signing_data);
+        self.dilithium_signature = Some(keypair.sign_dilithium(&signing_data));
+
         self.hash = crate::crypto::hash_multiple(&[&signing_data, self.signature.as_bytes()]);
         Ok(())
     }
@@ -192,8 +241,12 @@ impl Transaction {
         if expected_address != self.from {
             return Ok(false);
         }
+
         let signing_data = self.create_signing_data()?;
-        verify_signature(&self.public_key, &signing_data, &self.signature)
+
+        let ed25519_valid = verify_signature(&self.public_key, &signing_data, &self.signature)?;
+
+        Ok(ed25519_valid)
     }
 
     fn create_signing_data(&self) -> EgoResult<Vec<u8>> {
@@ -235,22 +288,41 @@ impl Transaction {
             TransactionPayload::RollupCommit { tx_count, .. } => 5000 + (*tx_count as u64 * 10),
             TransactionPayload::SliceOperation { .. } => 2000,
             TransactionPayload::SystemOperation { .. } => 10000,
+            TransactionPayload::DeployContract { contract_code, .. } => {
+                5000 + (contract_code.len() as u64 / 100)
+            }
+            TransactionPayload::BuyStorageCredits { .. } => 300,
+            TransactionPayload::BuyDeployCredits { .. } => 300,
+            TransactionPayload::UpdateDRS { .. } => 1000,
+            TransactionPayload::PoCWitness { .. } => 2000,
+            TransactionPayload::PoStChallenge { .. } => 1500,
+            TransactionPayload::PoStResponse { proof_data, .. } => {
+                3000 + (proof_data.len() as u64 / 64)
+            }
         }
     }
 
     pub fn validate_against_account(&self, account: &Account) -> EgoResult<()> {
-        if self.nonce != account.nonce + 1 {
+        let expected_nonce = if self.is_cross_shard() {
+            account.get_shard_nonce(self.shard_id.as_u32()) + 1
+        } else {
+            account.nonce + 1
+        };
+
+        if self.nonce != expected_nonce {
             return Err(EgoError::InvalidNonce {
-                expected: account.nonce + 1,
+                expected: expected_nonce,
                 got: self.nonce,
             });
         }
+
         let now = Timestamp::now();
         if self.timestamp.as_millis() > now.as_millis() + 300_000 {
             return Err(EgoError::InvalidTransaction(
                 "Transaction timestamp too far in future".to_string(),
             ));
         }
+
         if let Some(ref slice_id) = self.slice_id {
             if !account.is_authorized_for_slice(slice_id) {
                 return Err(EgoError::UnauthorizedSlice {
@@ -258,7 +330,15 @@ impl Transaction {
                 });
             }
         }
+
         self.validate_payload_requirements(account)
+    }
+
+    fn is_cross_shard(&self) -> bool {
+        matches!(
+            self.payload,
+            TransactionPayload::CrossShard { .. } | TransactionPayload::RollupCommit { .. }
+        )
     }
 
     fn validate_payload_requirements(&self, account: &Account) -> EgoResult<()> {
@@ -281,11 +361,21 @@ impl Transaction {
                     });
                 }
             }
-            TransactionPayload::StoreData { data_size, .. } => {
+            TransactionPayload::StoreData {
+                data_size,
+                storage_credits,
+                ..
+            } => {
                 if !account.can_store(*data_size) {
                     return Err(EgoError::StorageQuotaExceeded {
                         used: account.storage_used + data_size,
                         limit: account.storage_quota,
+                    });
+                }
+                if account.storage_credits < *storage_credits {
+                    return Err(EgoError::InsufficientBalance {
+                        required: *storage_credits as u128,
+                        available: account.storage_credits as u128,
                     });
                 }
             }
@@ -298,8 +388,62 @@ impl Transaction {
                     });
                 }
             }
+            TransactionPayload::DeployContract {
+                deploy_credits,
+                use_free_quota,
+                ..
+            } => {
+                if *use_free_quota {
+                    if !account.can_deploy_free() {
+                        return Err(EgoError::InvalidTransaction(
+                            "No free deploys remaining".to_string(),
+                        ));
+                    }
+                } else if !account.can_use_deploy_credits(*deploy_credits) {
+                    return Err(EgoError::InsufficientBalance {
+                        required: *deploy_credits as u128,
+                        available: account.deploy_credits as u128,
+                    });
+                }
+            }
+            TransactionPayload::BuyStorageCredits { amount, .. }
+            | TransactionPayload::BuyDeployCredits { amount, .. } => {
+                if !account.can_spend(*amount) {
+                    return Err(EgoError::InsufficientBalance {
+                        required: amount.as_u128(),
+                        available: account.balance.as_u128(),
+                    });
+                }
+            }
             _ => {}
         }
         Ok(())
+    }
+
+    pub fn requires_dilithium(&self) -> bool {
+        matches!(
+            self.payload,
+            TransactionPayload::SystemOperation { .. }
+                | TransactionPayload::UpdateDRS { .. }
+                | TransactionPayload::CreateAccount { .. }
+        )
+    }
+
+    pub fn get_priority(&self) -> u8 {
+        match &self.payload {
+            TransactionPayload::SystemOperation { .. } => 255,
+            TransactionPayload::PoStChallenge { .. } | TransactionPayload::PoStResponse { .. } => {
+                200
+            }
+            TransactionPayload::PoCWitness { .. } => 180,
+            TransactionPayload::CrossShard { .. } => 160,
+            TransactionPayload::RollupCommit { .. } => 140,
+            TransactionPayload::SubmitProof { .. } => 120,
+            TransactionPayload::UpdateDRS { .. } => 100,
+            TransactionPayload::DeployContract { .. } => 80,
+            TransactionPayload::Stake { .. } | TransactionPayload::Delegate { .. } => 60,
+            TransactionPayload::Transfer { .. } => 40,
+            _ => 20,
+        }
     }
 }

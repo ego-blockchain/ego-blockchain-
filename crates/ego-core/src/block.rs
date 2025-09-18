@@ -7,11 +7,20 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct BlockHeader {
+    pub core: BlockHeaderCore,
+    pub qc: QuorumCert,
+    pub metadata: BlockMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct BlockHeaderCore {
     pub height: BlockHeight,
     pub previous_hash: Hash,
     pub transactions_root: Hash,
     pub state_root: Hash,
-    pub rollup_root: Hash,
+    pub receipts_root: Hash,
+    pub events_root: Hash,
+    pub da_root: Hash,
     pub timestamp: Timestamp,
     pub shard_id: ShardId,
     pub epoch: EpochNumber,
@@ -20,27 +29,48 @@ pub struct BlockHeader {
     pub tx_count: u32,
     pub compute_used: u64,
     pub storage_used: u64,
-    pub metadata: BlockMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct QuorumCert {
+    pub view: u64,
+    pub height: BlockHeight,
+    pub block_hash: Hash,
+    pub signatures: Vec<ValidatorSignature>,
+    pub aggregated_signature: Option<Vec<u8>>,
+    pub voting_power: u64,
+    pub timestamp: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct ValidatorSignature {
+    pub validator: Address,
+    pub signature: Signature,
+    pub voting_power: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct BlockMetadata {
     pub protocol_version: u32,
     pub block_size: u64,
-    pub avg_tx_fee: u64,
-    pub network_stats: NetworkStats,
     pub cross_shard_receipts: u32,
     pub rollup_commits: u32,
     pub poc_events: u32,
     pub post_events: u32,
+    pub resource_pricing: Option<ResourcePricing>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct ResourcePricing {
+    pub bytes_cost: u64,
+    pub ru_cost: u64,
+    pub pob_floor: u64,
 }
 
 impl PartialEq for BlockMetadata {
     fn eq(&self, other: &Self) -> bool {
         self.protocol_version == other.protocol_version
             && self.block_size == other.block_size
-            && self.avg_tx_fee == other.avg_tx_fee
-            && self.network_stats == other.network_stats
             && self.cross_shard_receipts == other.cross_shard_receipts
             && self.rollup_commits == other.rollup_commits
             && self.poc_events == other.poc_events
@@ -56,7 +86,7 @@ pub struct NetworkStats {
     pub bandwidth_utilization: u64,
     pub avg_latency_ms: u32,
     pub active_slices: u32,
-    pub storage_utilization: f64,
+    pub storage_utilization: u64,
 }
 
 impl PartialEq for NetworkStats {
@@ -65,7 +95,7 @@ impl PartialEq for NetworkStats {
             && self.bandwidth_utilization == other.bandwidth_utilization
             && self.avg_latency_ms == other.avg_latency_ms
             && self.active_slices == other.active_slices
-            && (self.storage_utilization - other.storage_utilization).abs() < f64::EPSILON
+            && self.storage_utilization == other.storage_utilization
     }
 }
 
@@ -85,6 +115,8 @@ pub struct BlockBody {
     pub rollup_commitments: Vec<RollupCommitment>,
     pub cross_shard_receipts: Vec<CrossShardReceipt>,
     pub proof_events: Vec<ProofEvent>,
+    pub drs_events: Vec<DRSEvent>,
+    pub deploy_events: Vec<DeployEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -122,6 +154,54 @@ pub struct ProofEvent {
     pub slice_id: Option<String>,
     pub timestamp: Timestamp,
     pub verified: bool,
+    pub witness_data: Option<WitnessData>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct WitnessData {
+    pub rsrp: i16,
+    pub rsrq: i16,
+    pub sinr: i16,
+    pub timing_advance: u32,
+    pub gps_coords: Option<(i64, i64)>,
+    pub witnesses: Vec<Address>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct DRSEvent {
+    pub node_id: Address,
+    pub epoch: u64,
+    pub score: u64,
+    pub components: DRSComponents,
+    pub timestamp: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct DRSComponents {
+    pub uptime_score: u64,
+    pub proof_success_rate: u64,
+    pub witness_quality: u64,
+    pub coverage_value: u64,
+    pub utility_score: u64,
+    pub density_multiplier: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct DeployEvent {
+    pub deployer: Address,
+    pub contract_address: Option<Address>,
+    pub deploy_type: DeployType,
+    pub credits_used: u64,
+    pub free_deploy_used: bool,
+    pub bond_amount: Option<crate::Balance>,
+    pub timestamp: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub enum DeployType {
+    Contract { code_size_kb: u32 },
+    StorageDeal { data_size_gb: u32 },
+    RollupState { state_size_kb: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,7 +226,6 @@ impl Block {
         let timestamp = Timestamp::now();
 
         let transactions_root = Self::compute_transactions_root(&transactions);
-        let rollup_root = Self::compute_rollup_root(&rollup_commitments);
 
         let tx_count = transactions.len() as u32;
         let compute_used = transactions
@@ -155,31 +234,28 @@ impl Block {
             .sum();
         let storage_used = transactions.iter().map(|tx| tx.size() as u64).sum();
 
-        let network_stats = NetworkStats {
-            active_devices: 0,
-            bandwidth_utilization: 0,
-            avg_latency_ms: 50,
-            active_slices: 1,
-            storage_utilization: 0.5,
-        };
-
         let metadata = BlockMetadata {
             protocol_version: crate::PROTOCOL_VERSION,
             block_size: 0,
-            avg_tx_fee: 0,
-            network_stats,
             cross_shard_receipts: 0,
             rollup_commits: rollup_commitments.len() as u32,
             poc_events: 0,
             post_events: 0,
+            resource_pricing: Some(ResourcePricing {
+                bytes_cost: 100,
+                ru_cost: 10,
+                pob_floor: 1000,
+            }),
         };
 
-        let header = BlockHeader {
+        let core = BlockHeaderCore {
             height,
             previous_hash,
             transactions_root,
             state_root: Hash::ZERO,
-            rollup_root,
+            receipts_root: Hash::ZERO,
+            events_root: Hash::ZERO,
+            da_root: Hash::ZERO,
             timestamp,
             shard_id,
             epoch,
@@ -188,8 +264,19 @@ impl Block {
             tx_count,
             compute_used,
             storage_used,
-            metadata,
         };
+
+        let qc = QuorumCert {
+            view: 0,
+            height,
+            block_hash: Hash::ZERO,
+            signatures: Vec::new(),
+            aggregated_signature: None,
+            voting_power: 0,
+            timestamp,
+        };
+
+        let header = BlockHeader { core, qc, metadata };
 
         let body = BlockBody {
             transactions,
@@ -197,6 +284,8 @@ impl Block {
             rollup_commitments,
             cross_shard_receipts: Vec::new(),
             proof_events: Vec::new(),
+            drs_events: Vec::new(),
+            deploy_events: Vec::new(),
         };
 
         let mut block = Self {
@@ -226,34 +315,22 @@ impl Block {
         merkle_tree.root_hash().unwrap_or(Hash::ZERO)
     }
 
-    fn compute_rollup_root(commitments: &[RollupCommitment]) -> Hash {
-        if commitments.is_empty() {
-            return Hash::ZERO;
-        }
-
-        let commitment_hashes: Vec<Vec<u8>> =
-            commitments.iter().map(|c| c.state_root.to_vec()).collect();
-
-        let merkle_tree = crate::crypto::MerkleTree::build(commitment_hashes);
-        merkle_tree.root_hash().unwrap_or(Hash::ZERO)
-    }
-
     pub fn sign(&mut self, keypair: &crate::crypto::KeyPair) -> EgoResult<()> {
         let expected_proposer = Address::from_public_key(&keypair.public_key());
-        if expected_proposer != self.header.proposer {
+        if expected_proposer != self.header.core.proposer {
             return Err(EgoError::InvalidBlock(
                 "Proposer address does not match signing key".to_string(),
             ));
         }
 
-        let mut header_copy = self.header.clone();
-        header_copy.signature = Signature::new([0u8; 64]);
+        let mut core_copy = self.header.core.clone();
+        core_copy.signature = Signature::new([0u8; 64]);
 
         let config = bincode::config::standard();
-        let signing_data = bincode::encode_to_vec(&header_copy, config)
+        let signing_data = bincode::encode_to_vec(&core_copy, config)
             .map_err(|e| EgoError::SerializationError(e.to_string()))?;
 
-        self.header.signature = keypair.sign(&signing_data);
+        self.header.core.signature = keypair.sign(&signing_data);
         self.hash = self.compute_hash();
 
         Ok(())
@@ -261,43 +338,40 @@ impl Block {
 
     pub fn verify_signature(&self, proposer_pubkey: &crate::PublicKey) -> EgoResult<bool> {
         let expected_proposer = Address::from_public_key(proposer_pubkey);
-        if expected_proposer != self.header.proposer {
+        if expected_proposer != self.header.core.proposer {
             return Ok(false);
         }
 
-        let mut header_copy = self.header.clone();
-        header_copy.signature = Signature::new([0u8; 64]);
+        let mut core_copy = self.header.core.clone();
+        core_copy.signature = Signature::new([0u8; 64]);
 
         let config = bincode::config::standard();
-        let signing_data = bincode::encode_to_vec(&header_copy, config)
+        let signing_data = bincode::encode_to_vec(&core_copy, config)
             .map_err(|e| EgoError::SerializationError(e.to_string()))?;
 
-        crate::crypto::verify_signature(proposer_pubkey, &signing_data, &self.header.signature)
+        crate::crypto::verify_signature(proposer_pubkey, &signing_data, &self.header.core.signature)
     }
 
     pub fn validate_structure(&self) -> EgoResult<()> {
-        if self.header.tx_count != self.body.transactions.len() as u32 {
+        if self.header.core.tx_count != self.body.transactions.len() as u32 {
             return Err(EgoError::InvalidBlock(
                 "Transaction count mismatch".to_string(),
             ));
         }
 
         let computed_tx_root = Self::compute_transactions_root(&self.body.transactions);
-        if computed_tx_root != self.header.transactions_root {
+        if computed_tx_root != self.header.core.transactions_root {
             return Err(EgoError::InvalidBlock(
                 "Transaction root mismatch".to_string(),
             ));
-        }
-
-        let computed_rollup_root = Self::compute_rollup_root(&self.body.rollup_commitments);
-        if computed_rollup_root != self.header.rollup_root {
-            return Err(EgoError::InvalidBlock("Rollup root mismatch".to_string()));
         }
 
         let computed_hash = self.compute_hash();
         if computed_hash != self.hash {
             return Err(EgoError::InvalidBlock("Block hash mismatch".to_string()));
         }
+
+        self.validate_quorum_cert()?;
 
         for tx in &self.body.transactions {
             if !tx.verify_signature()? {
@@ -311,6 +385,14 @@ impl Block {
         Ok(())
     }
 
+    pub fn validate_quorum_cert(&self) -> EgoResult<()> {
+        if self.header.qc.signatures.is_empty() {
+            return Ok(());
+        }
+
+        Ok(())
+    }
+
     pub fn size(&self) -> usize {
         let config = bincode::config::standard();
         bincode::encode_to_vec(self, config)
@@ -319,37 +401,25 @@ impl Block {
     }
 
     pub fn is_genesis(&self) -> bool {
-        self.header.height == BlockHeight::GENESIS
+        self.header.core.height == BlockHeight::GENESIS
     }
 
     pub fn summary(&self) -> String {
         format!(
-            "Block {} [Shard {}] - Height: {}, TXs: {}, Size: {} bytes, Proposer: {}",
+            "Block {} [Shard {}] - Height: {}, TXs: {}, Size: {} bytes, Proposer: {}, DRS Events: {}",
             self.hash,
-            self.header.shard_id,
-            self.header.height.as_u64(),
-            self.header.tx_count,
+            self.header.core.shard_id,
+            self.header.core.height.as_u64(),
+            self.header.core.tx_count,
             self.size(),
-            self.header.proposer
+            self.header.core.proposer,
+            self.body.drs_events.len()
         )
     }
 
     pub fn add_transaction_results(&mut self, results: Vec<TransactionResult>) {
         self.body.transaction_results = results;
-
-        self.header.metadata.poc_events = self
-            .body
-            .proof_events
-            .iter()
-            .filter(|e| e.proof_type == "poc")
-            .count() as u32;
-
-        self.header.metadata.post_events = self
-            .body
-            .proof_events
-            .iter()
-            .filter(|e| e.proof_type == "post")
-            .count() as u32;
+        self.update_event_counts();
     }
 
     pub fn add_cross_shard_receipts(&mut self, receipts: Vec<CrossShardReceipt>) {
@@ -359,7 +429,18 @@ impl Block {
 
     pub fn add_proof_events(&mut self, events: Vec<ProofEvent>) {
         self.body.proof_events = events;
+        self.update_event_counts();
+    }
 
+    pub fn add_drs_events(&mut self, events: Vec<DRSEvent>) {
+        self.body.drs_events = events;
+    }
+
+    pub fn add_deploy_events(&mut self, events: Vec<DeployEvent>) {
+        self.body.deploy_events = events;
+    }
+
+    fn update_event_counts(&mut self) {
         self.header.metadata.poc_events = self
             .body
             .proof_events
@@ -376,7 +457,17 @@ impl Block {
     }
 
     pub fn set_state_root(&mut self, state_root: Hash) {
-        self.header.state_root = state_root;
+        self.header.core.state_root = state_root;
+        self.hash = self.compute_hash();
+    }
+
+    pub fn set_da_root(&mut self, da_root: Hash) {
+        self.header.core.da_root = da_root;
+        self.hash = self.compute_hash();
+    }
+
+    pub fn set_events_root(&mut self, events_root: Hash) {
+        self.header.core.events_root = events_root;
         self.hash = self.compute_hash();
     }
 }

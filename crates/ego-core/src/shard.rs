@@ -10,179 +10,122 @@ use tokio::sync::RwLock;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardConfig {
     pub shard_id: ShardId,
-
     pub committee_size: u32,
-
     pub replication_factor: u8,
-
     pub max_txs_per_block: u32,
-
     pub target_block_time_ms: u64,
-
     pub micro_slot_duration_ms: u64,
-
     pub epoch_duration_blocks: u64,
-
     pub cross_shard_enabled: bool,
-
     pub storage_config: ShardStorageConfig,
-
     pub preferred_slices: Vec<String>,
-
     pub geo_constraints: Option<GeoConstraints>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardStorageConfig {
     pub max_storage_per_node: u64,
-
     pub proof_frequency: u64,
-
     pub retention_period: u64,
-
     pub erasure_coding: ErasureCodingConfig,
-
     pub gc_config: GarbageCollectionConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErasureCodingConfig {
     pub data_chunks: u8,
-
     pub parity_chunks: u8,
-
     pub chunk_size: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GarbageCollectionConfig {
     pub frequency: u64,
-
     pub threshold: f64,
-
     pub aggressive_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeoConstraints {
     pub allowed_regions: Vec<String>,
-
     pub max_latency_ms: u32,
-
     pub min_nodes_per_region: u32,
 }
 
 #[derive(Debug)]
 pub struct ShardManager {
     pub config: ShardConfig,
-
     pub state: Arc<RwLock<StateManager>>,
-
     blocks: Arc<RwLock<VecDeque<Block>>>,
-
     pub current_epoch: EpochInfo,
-
     tx_pool: Arc<RwLock<TransactionPool>>,
-
     cross_shard_state: CrossShardManager,
-
     metrics: ShardMetrics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpochInfo {
     pub epoch_number: u64,
-
     pub start_block: crate::BlockHeight,
-
     pub end_block: crate::BlockHeight,
-
     pub start_time: Timestamp,
-
     pub committee: Vec<crate::Address>,
-
     pub leader_schedule: Vec<crate::Address>,
-
     pub stats: EpochStats,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EpochStats {
     pub blocks_produced: u64,
-
     pub transactions_processed: u64,
-
     pub avg_block_time_ms: u64,
-
     pub cross_shard_txs: u64,
-
     pub storage_proofs_verified: u64,
-
     pub network_utilization: f64,
 }
 
 #[derive(Debug, Default)]
 pub struct TransactionPool {
     pending: HashMap<u8, VecDeque<Transaction>>,
-
     by_hash: HashMap<Hash, Transaction>,
-
     stats: PoolStats,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PoolStats {
     pub pending_count: usize,
-
     pub pool_size_bytes: u64,
-
     pub avg_tx_age_ms: u64,
-
     pub txs_added: u64,
-
     pub txs_removed: u64,
 }
 
 #[derive(Debug)]
 pub struct CrossShardManager {
     outbound_receipts: HashMap<ShardId, VecDeque<crate::block::CrossShardReceipt>>,
-
     inbound_receipts: HashMap<ShardId, VecDeque<crate::block::CrossShardReceipt>>,
-
     receipt_acks: HashMap<Hash, bool>,
-
     stats: CrossShardStats,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CrossShardStats {
     pub receipts_sent: u64,
-
     pub receipts_received: u64,
-
     pub receipts_pending: u64,
-
     pub avg_receipt_latency_ms: u64,
-
     pub failed_receipts: u64,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ShardMetrics {
     pub tps: f64,
-
     pub bps: f64,
-
     pub avg_tx_latency_ms: u64,
-
     pub storage_utilization: f64,
-
     pub network_usage_bps: u64,
-
     pub active_nodes: u32,
-
     pub consensus_participation: f64,
-
     pub last_updated: Timestamp,
 }
 
@@ -305,7 +248,7 @@ impl ShardManager {
             let new_state_root = state.compute_state_root();
             block.set_state_root(new_state_root);
 
-            state.set_block_height(block.header.height);
+            state.set_block_height(block.header.core.height);
         }
 
         block.add_transaction_results(transaction_results);
@@ -328,8 +271,9 @@ impl ShardManager {
             }
         }
 
-        if block.header.height.as_u64() >= self.current_epoch.end_block.as_u64() {
-            self.start_new_epoch(block.header.height.next()).await?;
+        if block.header.core.height.as_u64() >= self.current_epoch.end_block.as_u64() {
+            self.start_new_epoch(block.header.core.height.next())
+                .await?;
         }
 
         Ok(())
@@ -360,7 +304,7 @@ impl ShardManager {
         let now = Timestamp::now();
 
         let block_time_ms = self.config.target_block_time_ms as f64 / 1000.0;
-        self.metrics.tps = block.header.tx_count as f64 / block_time_ms;
+        self.metrics.tps = block.header.core.tx_count as f64 / block_time_ms;
 
         self.metrics.bps = 1.0 / block_time_ms;
 
@@ -400,19 +344,12 @@ impl ShardManager {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardStats {
     pub shard_id: ShardId,
-
     pub current_block_height: BlockHeight,
-
     pub current_epoch: EpochInfo,
-
     pub state_stats: crate::state::StateStats,
-
     pub pool_stats: PoolStats,
-
     pub metrics: ShardMetrics,
-
     pub blocks_stored: u64,
-
     pub cross_shard_stats: CrossShardStats,
 }
 
