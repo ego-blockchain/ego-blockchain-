@@ -18,6 +18,7 @@ clap = "4.5.47"
 libp2p = { version = "0.56.0", features = ["tcp", "mdns", "noise", "yamux", "gossipsub", "kad", "identify", "ping", "macros", "tokio", "autonat",
                                            "dcutr", "relay"] }
 bincode = "2.0.1"
+hex = "0.4.3"
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
