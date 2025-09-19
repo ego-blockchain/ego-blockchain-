@@ -3,8 +3,9 @@ use crate::{BandwidthSharingManager, DataOptimizer, NetworkManager, NetworkType}
 use crate::{NodeBehaviour, NodeRole, Placement, ProofEvent, SecureKeystore, ShardConfig};
 
 use ego_core::{
-    Account, AccountType, Address, Balance, Block, BlockHeight, DeviceCapabilities, EgoResult,
-    Hash, SliceId, StateManager, Timestamp, Transaction, TransactionResult,
+    Account, Address, Balance, Block, BlockHeight, DeviceCapabilities, EgoResult, Hash, PublicKey,
+    SliceId, StateManager, Transaction, TransactionResult, calculate_shard_for_address,
+    current_timestamp, format_storage_size,
 };
 
 use libp2p::{
@@ -14,7 +15,7 @@ use libp2p::{
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct Node {
     pub peer_id: PeerId,
@@ -99,7 +100,7 @@ pub enum OptimizationCommand {
 }
 
 impl Node {
-    pub fn get_public_key(&self) -> ego_core::PublicKey {
+    pub fn get_public_key(&self) -> PublicKey {
         self.keystore.public_key()
     }
 
@@ -197,9 +198,13 @@ impl Node {
         let network_manager = NetworkManager::new();
         let bandwidth_sharing = BandwidthSharingManager::new(Default::default());
         let data_optimizer = DataOptimizer::new();
-        let state_manager = StateManager::new();
+        let mut state_manager = StateManager::new();
 
         let (optimization_events, optimization_receiver) = mpsc::unbounded_channel();
+
+        let node_address = Address::from_public_key(&keystore.public_key());
+        let node_account = Account::new_user(node_address);
+        state_manager.set_account(node_account);
 
         info!(
             "Creating optimized node {} with roles: {:?}, shards: {:?}",
@@ -241,7 +246,11 @@ impl Node {
     }
 
     pub async fn new_validator(shard_ids: Vec<u32>) -> anyhow::Result<Self> {
-        let mut node = Self::new(vec![NodeRole::Validator, NodeRole::Relay], shard_ids).await?;
+        let mut node = Self::new(
+            vec![NodeRole::Validator, NodeRole::Relay],
+            shard_ids.clone(),
+        )
+        .await?;
         node.node_type = "validator".to_string();
         node.max_peers_per_shard = 150;
         node.max_topics_per_role = 25;
@@ -254,10 +263,16 @@ impl Node {
             node.keystore.public_key(),
             500,
             Balance::from_egoc(1000),
-        )?;
+            node.keystore.dilithium_public_key(),
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to create validator account: {}", e))?;
+
         node.state_manager.set_account(validator_account);
 
-        info!("✅ Validator node created with enhanced consensus capabilities");
+        info!(
+            "✅ Validator node created with enhanced consensus capabilities for shards: {:?}",
+            shard_ids
+        );
         Ok(node)
     }
 
@@ -276,13 +291,19 @@ impl Node {
             bandwidth_capacity: node.bandwidth_capacity_bps,
             storage_capacity: capacity_bytes,
             supported_slices: vec![],
-            coverage_area: Some(geohash),
-            hardware_specs: HashMap::new(),
+            coverage_area: Some(geohash.clone()),
+            hardware_specs: HashMap::from([
+                ("type".to_string(), "storage_miner".to_string()),
+                (
+                    "capacity_gb".to_string(),
+                    (capacity_bytes / 1_000_000_000).to_string(),
+                ),
+            ]),
             last_poc: None,
             post_stats: Default::default(),
         };
 
-        let device_account = Account::new_device(
+        let device_account = Account::new_device_simple(
             device_address,
             format!("storage-{}", node.peer_id),
             capabilities,
@@ -290,8 +311,9 @@ impl Node {
         node.state_manager.set_account(device_account);
 
         info!(
-            "✅ Storage miner created with {} GB capacity",
-            capacity_bytes / 1_000_000_000
+            "✅ Storage miner created with {} capacity at geohash: {}",
+            format_storage_size(capacity_bytes),
+            geohash
         );
         Ok(node)
     }
@@ -328,12 +350,15 @@ impl Node {
             hardware_specs: HashMap::from([
                 ("type".to_string(), "5g_gateway".to_string()),
                 ("slice".to_string(), slice_id.clone()),
+                ("lat".to_string(), lat.to_string()),
+                ("lon".to_string(), lon.to_string()),
+                ("bandwidth_mbps".to_string(), bandwidth_mbps.to_string()),
             ]),
             last_poc: None,
             post_stats: Default::default(),
         };
 
-        let gateway_account = Account::new_device(
+        let gateway_account = Account::new_device_simple(
             gateway_address,
             format!("gateway-{}-{}", slice_id, node.peer_id),
             capabilities,
@@ -341,8 +366,8 @@ impl Node {
         node.state_manager.set_account(gateway_account);
 
         info!(
-            "✅ 5G Edge Gateway created with {} Mbps capacity",
-            bandwidth_mbps
+            "✅ 5G Edge Gateway created with {} Mbps capacity for slice: {} at ({}, {})",
+            bandwidth_mbps, slice_id, lat, lon
         );
         Ok(node)
     }
@@ -355,7 +380,7 @@ impl Node {
                 NodeRole::Relay,
                 NodeRole::Witness,
             ],
-            shard_ids,
+            shard_ids.clone(),
         )
         .await?;
 
@@ -370,9 +395,30 @@ impl Node {
         let mut full_account = Account::new_user(node_address);
         full_account.storage_quota = storage_capacity;
         full_account.credit(Balance::from_egoc(1000));
+        full_account.storage_credits = 10000;
+        full_account.deploy_credits = 5000;
+
+        let capabilities = DeviceCapabilities {
+            bandwidth_capacity: node.bandwidth_capacity_bps,
+            storage_capacity,
+            supported_slices: vec![],
+            coverage_area: node.geohash.clone(),
+            hardware_specs: HashMap::from([
+                ("type".to_string(), "full_node".to_string()),
+                ("shards".to_string(), format!("{:?}", shard_ids)),
+            ]),
+            last_poc: None,
+            post_stats: Default::default(),
+        };
+        full_account.device_capabilities = Some(capabilities);
+
         node.state_manager.set_account(full_account);
 
-        info!("✅ Full node created with comprehensive capabilities");
+        info!(
+            "✅ Full node created with comprehensive capabilities for shards: {:?}, storage: {}",
+            shard_ids,
+            format_storage_size(storage_capacity)
+        );
         Ok(node)
     }
 
@@ -389,9 +435,13 @@ impl Node {
         let mut seed_account = Account::new_user(seed_address);
         seed_account.storage_quota = 50_000_000_000;
         seed_account.credit(Balance::from_egoc(10000));
+        seed_account.storage_credits = 50000;
+        seed_account.deploy_credits = 25000;
+        seed_account.free_deploys_remaining = 100;
+
         node.state_manager.set_account(seed_account);
 
-        info!("✅ Seed node created for network bootstrapping");
+        info!("✅ Seed node created for network bootstrapping with enhanced peer capacity");
         Ok(node)
     }
 
@@ -399,7 +449,11 @@ impl Node {
         shard_ids: Vec<u32>,
         storage_capacity: u64,
     ) -> anyhow::Result<Self> {
-        let mut node = Self::new(vec![NodeRole::Indexer, NodeRole::Storage], shard_ids).await?;
+        let mut node = Self::new(
+            vec![NodeRole::Indexer, NodeRole::Storage],
+            shard_ids.clone(),
+        )
+        .await?;
         node.node_type = "indexer".to_string();
         node.set_storage_capacity(storage_capacity);
         node.max_peers_per_shard = 150;
@@ -411,14 +465,44 @@ impl Node {
         let mut indexer_account = Account::new_user(indexer_address);
         indexer_account.storage_quota = storage_capacity;
         indexer_account.credit(Balance::from_egoc(500));
+        indexer_account.storage_credits = 20000;
+        indexer_account.deploy_credits = 10000;
+
+        let capabilities = DeviceCapabilities {
+            bandwidth_capacity: node.bandwidth_capacity_bps,
+            storage_capacity,
+            supported_slices: vec![],
+            coverage_area: node.geohash.clone(),
+            hardware_specs: HashMap::from([
+                ("type".to_string(), "indexer".to_string()),
+                ("shards".to_string(), format!("{:?}", shard_ids)),
+                ("indexing_capacity".to_string(), "high".to_string()),
+            ]),
+            last_poc: None,
+            post_stats: Default::default(),
+        };
+        indexer_account.device_capabilities = Some(capabilities);
+
         node.state_manager.set_account(indexer_account);
 
-        info!("✅ Indexer node created with cross-shard indexing capabilities");
+        info!(
+            "✅ Indexer node created with cross-shard indexing capabilities for shards: {:?}, storage: {}",
+            shard_ids,
+            format_storage_size(storage_capacity)
+        );
         Ok(node)
     }
 
     pub async fn execute_transaction(&mut self, tx: &Transaction) -> EgoResult<TransactionResult> {
-        self.state_manager.execute_transaction(tx)
+        self.performance_metrics.messages_received += 1;
+
+        let result = self.state_manager.execute_transaction(tx)?;
+
+        if result.success {
+            self.performance_metrics.bytes_sent += tx.size() as u64;
+        }
+
+        Ok(result)
     }
 
     pub async fn create_block(
@@ -435,7 +519,7 @@ impl Node {
 
         let proposer_address = Address::from_public_key(&self.keystore.public_key());
 
-        let block = Block::new(
+        let mut block = Block::new(
             height,
             previous_hash,
             shard_id,
@@ -445,23 +529,31 @@ impl Node {
             vec![],
         );
 
+        block.sign(self.get_keypair())?;
+
+        info!(
+            "Created block {} at height {} with {} transactions",
+            block.hash,
+            height,
+            block.body.transactions.len()
+        );
+
         Ok(block)
     }
 
     pub async fn validate_block(&self, block: &Block) -> EgoResult<bool> {
         block.validate_structure()?;
 
-        if let Some(account) = self.state_manager.get_account(&block.header.proposer) {
-            match &account.account_type {
-                AccountType::Validator {
-                    validator_pubkey, ..
-                } => {
-                    return block.verify_signature(validator_pubkey);
-                }
-                _ => {}
+        if let Some(account) = self.state_manager.get_account(&block.header.core.proposer) {
+            if let Some(validator_pubkey) = account.get_validator_pubkey() {
+                return block.verify_signature(&validator_pubkey);
             }
         }
 
+        warn!(
+            "Cannot fully validate block {} - proposer account not found",
+            block.hash
+        );
         Ok(true)
     }
 
@@ -477,26 +569,53 @@ impl Node {
     pub fn add_bootstrap_peer(&mut self, addr: Multiaddr) {
         if !self.bootstrap_peers.contains(&addr) {
             self.bootstrap_peers.push(addr.clone());
-            self.swarm
-                .behaviour_mut()
-                .kademlia
-                .add_address(&self.peer_id, addr.clone());
-            info!("🔗 Added bootstrap peer: {}", addr);
+
+            if let Some(libp2p::multiaddr::Protocol::P2p(peer_id)) = addr.iter().last() {
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, addr.clone());
+                info!("🔗 Added bootstrap peer to Kademlia: {}", addr);
+            } else {
+                info!("🔗 Added bootstrap peer: {}", addr);
+            }
         }
     }
 
     pub async fn connect_to_bootstrap_peers(&mut self) -> anyhow::Result<()> {
+        if self.bootstrap_peers.is_empty() {
+            return Err(anyhow::anyhow!("No bootstrap peers configured"));
+        }
+
+        let mut connected = 0;
+        let mut errors = Vec::new();
+
         for addr in self.bootstrap_peers.clone() {
             match self.swarm.dial(addr.clone()) {
                 Ok(_) => {
                     info!("📞 Dialing bootstrap peer: {}", addr);
                     self.connection_attempts += 1;
+                    connected += 1;
                 }
                 Err(e) => {
                     warn!("❌ Failed to dial bootstrap peer {}: {}", addr, e);
+                    errors.push((addr, e));
                 }
             }
         }
+
+        if connected == 0 {
+            return Err(anyhow::anyhow!(
+                "Failed to connect to any bootstrap peers: {:?}",
+                errors
+            ));
+        }
+
+        info!(
+            "✅ Initiated connections to {}/{} bootstrap peers",
+            connected,
+            self.bootstrap_peers.len()
+        );
         Ok(())
     }
 
@@ -535,15 +654,18 @@ impl Node {
         h3_cell: String,
         evidence_digest: Vec<u8>,
     ) -> anyhow::Result<()> {
-        let event = ego_core::ProofEvent {
+        let timestamp = current_timestamp();
+
+        let proof_event = ego_core::ProofEvent {
             proof_type: "poc".to_string(),
             prover: Address::from_public_key(&self.keystore.public_key()),
-            challenge_hash: Hash::new(rand::random()),
-            proof_data: evidence_digest,
+            challenge_hash: Hash::random(),
+            proof_data: evidence_digest.clone(),
             location_id: h3_cell.clone(),
             slice_id: self.slice_id.clone(),
-            timestamp: Timestamp::now(),
+            timestamp,
             verified: false,
+            witness_data: None,
         };
 
         let node_proof = ProofEvent {
@@ -551,8 +673,8 @@ impl Node {
             shard_id: None,
             piece_id: None,
             group_id: None,
-            evidence_digest: event.proof_data.clone(),
-            timestamp: event.timestamp.as_millis(),
+            evidence_digest: evidence_digest.clone(),
+            timestamp: timestamp.as_millis(),
             peer_id: self.peer_id.to_string(),
         };
 
@@ -560,10 +682,15 @@ impl Node {
         self.performance_metrics.proof_events_generated += 1;
 
         let topic = gossipsub::IdentTopic::new(format!("ego/poc/h3/{}", h3_cell));
-        let message = serde_json::to_string(&event)
-            .unwrap_or_default()
+        let message = serde_json::to_string(&proof_event)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize PoC proof: {}", e))?
             .into_bytes();
-        let _ = self.swarm.behaviour_mut().gossipsub.publish(topic, message);
+
+        self.swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(topic, message)
+            .map_err(|e| anyhow::anyhow!("Failed to publish PoC proof: {}", e))?;
 
         info!("✅ PoC proof emitted for H3 cell: {}", h3_cell);
         Ok(())
@@ -575,15 +702,18 @@ impl Node {
         piece_id: u32,
         evidence_digest: Vec<u8>,
     ) -> anyhow::Result<()> {
-        let event = ego_core::ProofEvent {
+        let timestamp = current_timestamp();
+
+        let proof_event = ego_core::ProofEvent {
             proof_type: "post".to_string(),
             prover: Address::from_public_key(&self.keystore.public_key()),
-            challenge_hash: Hash::new(rand::random()),
-            proof_data: evidence_digest,
+            challenge_hash: Hash::random(),
+            proof_data: evidence_digest.clone(),
             location_id: format!("shard-{}-piece-{}", shard_id, piece_id),
             slice_id: self.slice_id.clone(),
-            timestamp: Timestamp::now(),
+            timestamp,
             verified: false,
+            witness_data: None,
         };
 
         let node_proof = ProofEvent {
@@ -591,8 +721,8 @@ impl Node {
             shard_id: Some(shard_id),
             piece_id: Some(piece_id),
             group_id: None,
-            evidence_digest: event.proof_data.clone(),
-            timestamp: event.timestamp.as_millis(),
+            evidence_digest: evidence_digest.clone(),
+            timestamp: timestamp.as_millis(),
             peer_id: self.peer_id.to_string(),
         };
 
@@ -600,10 +730,15 @@ impl Node {
         self.performance_metrics.proof_events_generated += 1;
 
         let topic = gossipsub::IdentTopic::new(format!("ego/shard/{}/proofs", shard_id));
-        let message = serde_json::to_string(&event)
-            .unwrap_or_default()
+        let message = serde_json::to_string(&proof_event)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize PoST proof: {}", e))?
             .into_bytes();
-        let _ = self.swarm.behaviour_mut().gossipsub.publish(topic, message);
+
+        self.swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(topic, message)
+            .map_err(|e| anyhow::anyhow!("Failed to publish PoST proof: {}", e))?;
 
         info!(
             "✅ PoST proof emitted for shard {} piece {}",
@@ -613,155 +748,154 @@ impl Node {
     }
 
     pub fn subscribe_to_topics(&mut self) -> anyhow::Result<()> {
+        let mut subscribed_topics = 0;
+
         for &shard_id in &self.shard_ids {
             if self.has_role(NodeRole::Validator) {
-                self.swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .subscribe(&gossipsub::IdentTopic::new(format!(
-                        "ego/shard/{}/tx",
-                        shard_id
-                    )))?;
-                self.swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .subscribe(&gossipsub::IdentTopic::new(format!(
-                        "ego/shard/{}/headers",
-                        shard_id
-                    )))?;
-                self.swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .subscribe(&gossipsub::IdentTopic::new(format!(
-                        "ego/shard/{}/receipts",
-                        shard_id
-                    )))?;
-                self.swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .subscribe(&gossipsub::IdentTopic::new(format!(
-                        "ego/shard/{}/consensus",
-                        shard_id
-                    )))?;
+                let topics = [
+                    format!("ego/shard/{}/tx", shard_id),
+                    format!("ego/shard/{}/headers", shard_id),
+                    format!("ego/shard/{}/receipts", shard_id),
+                    format!("ego/shard/{}/consensus", shard_id),
+                ];
+
+                for topic in &topics {
+                    if let Err(e) = self
+                        .swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .subscribe(&gossipsub::IdentTopic::new(topic))
+                    {
+                        error!("Failed to subscribe to topic {}: {}", topic, e);
+                    } else {
+                        subscribed_topics += 1;
+                    }
+                }
             }
 
             if self.has_role(NodeRole::Storage) {
-                self.swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .subscribe(&gossipsub::IdentTopic::new(format!(
-                        "ego/shard/{}/proofs",
-                        shard_id
-                    )))?;
-                self.swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .subscribe(&gossipsub::IdentTopic::new(format!(
-                        "ego/shard/{}/storage",
-                        shard_id
-                    )))?;
+                let topics = [
+                    format!("ego/shard/{}/proofs", shard_id),
+                    format!("ego/shard/{}/storage", shard_id),
+                ];
+
+                for topic in &topics {
+                    if let Err(e) = self
+                        .swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .subscribe(&gossipsub::IdentTopic::new(topic))
+                    {
+                        error!("Failed to subscribe to topic {}: {}", topic, e);
+                    } else {
+                        subscribed_topics += 1;
+                    }
+                }
             }
 
             if self.has_role(NodeRole::Indexer) {
-                self.swarm
+                let topic = format!("ego/shard/{}/index", shard_id);
+                if let Err(e) = self
+                    .swarm
                     .behaviour_mut()
                     .gossipsub
-                    .subscribe(&gossipsub::IdentTopic::new(format!(
-                        "ego/shard/{}/index",
-                        shard_id
-                    )))?;
+                    .subscribe(&gossipsub::IdentTopic::new(topic.clone()))
+                {
+                    error!("Failed to subscribe to topic {}: {}", topic, e);
+                } else {
+                    subscribed_topics += 1;
+                }
             }
         }
 
+        let global_topics = self.get_global_topics_for_roles();
+        for topic in &global_topics {
+            if let Err(e) = self
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .subscribe(&gossipsub::IdentTopic::new(topic))
+            {
+                error!("Failed to subscribe to global topic {}: {}", topic, e);
+            } else {
+                subscribed_topics += 1;
+            }
+        }
+
+        let optimization_topics = [
+            "ego/optimization/bandwidth",
+            "ego/optimization/network",
+            "ego/optimization/cost",
+        ];
+
+        for topic in &optimization_topics {
+            if let Err(e) = self
+                .swarm
+                .behaviour_mut()
+                .gossipsub
+                .subscribe(&gossipsub::IdentTopic::new(*topic))
+            {
+                error!("Failed to subscribe to optimization topic {}: {}", topic, e);
+            } else {
+                subscribed_topics += 1;
+            }
+        }
+
+        info!(
+            "📡 Subscribed to {} topics for roles: {:?}",
+            subscribed_topics, self.roles
+        );
+        Ok(())
+    }
+
+    fn get_global_topics_for_roles(&self) -> Vec<String> {
+        let mut topics = Vec::new();
+
         if self.has_role(NodeRole::Validator) {
-            self.swarm
-                .behaviour_mut()
-                .gossipsub
-                .subscribe(&gossipsub::IdentTopic::new("ego/finality/commits"))?;
-            self.swarm
-                .behaviour_mut()
-                .gossipsub
-                .subscribe(&gossipsub::IdentTopic::new("ego/consensus/global"))?;
+            topics.extend([
+                "ego/finality/commits".to_string(),
+                "ego/consensus/global".to_string(),
+            ]);
         }
 
         if self.has_role(NodeRole::Witness) {
+            topics.push("ego/witness/beacons".to_string());
             if let Some(ref geohash) = self.geohash {
-                self.swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .subscribe(&gossipsub::IdentTopic::new(format!(
-                        "ego/poc/h3/{}",
-                        geohash
-                    )))?;
+                topics.push(format!("ego/poc/h3/{}", geohash));
             }
-            self.swarm
-                .behaviour_mut()
-                .gossipsub
-                .subscribe(&gossipsub::IdentTopic::new("ego/witness/beacons"))?;
         }
 
         if self.has_role(NodeRole::Storage) {
-            self.swarm
-                .behaviour_mut()
-                .gossipsub
-                .subscribe(&gossipsub::IdentTopic::new("ego/storage/global"))?;
-            self.swarm
-                .behaviour_mut()
-                .gossipsub
-                .subscribe(&gossipsub::IdentTopic::new("ego/storage/placement"))?;
-            self.swarm
-                .behaviour_mut()
-                .gossipsub
-                .subscribe(&gossipsub::IdentTopic::new("ego/storage/repair"))?;
+            topics.extend([
+                "ego/storage/global".to_string(),
+                "ego/storage/placement".to_string(),
+                "ego/storage/repair".to_string(),
+            ]);
         }
 
         if self.has_role(NodeRole::Gateway) {
-            self.swarm
-                .behaviour_mut()
-                .gossipsub
-                .subscribe(&gossipsub::IdentTopic::new("ego/gateway/requests"))?;
-            self.swarm
-                .behaviour_mut()
-                .gossipsub
-                .subscribe(&gossipsub::IdentTopic::new("ego/gateway/responses"))?;
+            topics.extend([
+                "ego/gateway/requests".to_string(),
+                "ego/gateway/responses".to_string(),
+            ]);
         }
 
         if self.has_role(NodeRole::Relay) {
-            self.swarm
-                .behaviour_mut()
-                .gossipsub
-                .subscribe(&gossipsub::IdentTopic::new("ego/relay/routing"))?;
+            topics.push("ego/relay/routing".to_string());
         }
 
         if self.has_role(NodeRole::Seed) {
-            self.swarm
-                .behaviour_mut()
-                .gossipsub
-                .subscribe(&gossipsub::IdentTopic::new("ego/seed/discovery"))?;
+            topics.push("ego/seed/discovery".to_string());
         }
 
         if self.has_role(NodeRole::Indexer) {
-            self.swarm
-                .behaviour_mut()
-                .gossipsub
-                .subscribe(&gossipsub::IdentTopic::new("ego/indexer/global"))?;
-            self.swarm
-                .behaviour_mut()
-                .gossipsub
-                .subscribe(&gossipsub::IdentTopic::new("ego/indexer/queries"))?;
+            topics.extend([
+                "ego/indexer/global".to_string(),
+                "ego/indexer/queries".to_string(),
+            ]);
         }
 
-        self.swarm
-            .behaviour_mut()
-            .gossipsub
-            .subscribe(&gossipsub::IdentTopic::new("ego/optimization/bandwidth"))?;
-        self.swarm
-            .behaviour_mut()
-            .gossipsub
-            .subscribe(&gossipsub::IdentTopic::new("ego/optimization/network"))?;
-
-        info!("📡 Subscribed to topics for roles: {:?}", self.roles);
-        Ok(())
+        topics
     }
 
     pub async fn process_optimization_events(&mut self) -> anyhow::Result<()> {
@@ -773,21 +907,38 @@ impl Node {
                 }
                 NetworkEvent::DataThresholdReached(usage_gb) => {
                     warn!("⚠️ Data threshold reached: {:.2} GB", usage_gb);
-                    if self
-                        .network_manager
-                        .interfaces
-                        .get(&NetworkType::WiFi)
-                        .map_or(false, |i| i.is_available)
+                    if let Some(wifi_interface) =
+                        self.network_manager.interfaces.get(&NetworkType::WiFi)
                     {
-                        let _ = self
-                            .optimization_events
-                            .send(OptimizationCommand::SwitchNetwork(NetworkType::WiFi));
+                        if wifi_interface.is_available {
+                            let _ = self
+                                .optimization_events
+                                .send(OptimizationCommand::SwitchNetwork(NetworkType::WiFi));
+                        }
                     }
                 }
                 NetworkEvent::CostThresholdReached(cost) => {
                     warn!("💰 Cost threshold reached: ${:.2}", cost);
+                    self.performance_metrics.cost_savings_usd += cost as f64 * 0.1;
                 }
-                _ => {}
+                NetworkEvent::SignalStrengthChanged(network_type, strength) => {
+                    debug!(
+                        "📶 Signal strength changed for {:?}: {}%",
+                        network_type, strength
+                    );
+                }
+                NetworkEvent::InterfaceAvailabilityChanged(network_type, available) => {
+                    info!(
+                        "🔄 Interface {:?} availability changed: {}",
+                        network_type, available
+                    );
+                    if available {
+                        if let Some(new_interface) = self.network_manager.switch_to_best_interface()
+                        {
+                            info!("🔄 Auto-switched to better interface: {:?}", new_interface);
+                        }
+                    }
+                }
             }
         }
 
@@ -796,11 +947,24 @@ impl Node {
                 BandwidthSharingEvent::DeviceConnected(device_id) => {
                     info!("📱 Device connected for bandwidth sharing: {}", device_id);
                 }
+                BandwidthSharingEvent::DeviceDisconnected(device_id) => {
+                    info!(
+                        "📱❌ Device disconnected from bandwidth sharing: {}",
+                        device_id
+                    );
+                }
                 BandwidthSharingEvent::EgocEarned(amount) => {
                     debug!("💰 Earned {:.4} EGOC from bandwidth sharing", amount);
                     self.performance_metrics.cost_savings_usd += amount as f64 * 0.1;
+                    self.performance_metrics.bandwidth_shared_bytes +=
+                        (amount * 1_000_000.0) as u64;
                 }
-                _ => {}
+                BandwidthSharingEvent::DataLimitReached(device_id) => {
+                    warn!("⚠️ Data limit reached for device: {}", device_id);
+                }
+                BandwidthSharingEvent::DailyLimitReached => {
+                    warn!("⚠️ Daily bandwidth sharing limit reached");
+                }
             }
         }
 
@@ -814,8 +978,17 @@ impl Node {
                 }
                 OptimizerEvent::CompressionCompleted(op_id, ratio) => {
                     debug!("🗜️ Compression completed for {}: ratio {:.2}", op_id, ratio);
+                    self.performance_metrics.data_compressed_bytes += 1024;
                 }
-                _ => {}
+                OptimizerEvent::OperationScheduled(op_id, scheduled_time) => {
+                    debug!("⏰ Operation {} scheduled for {}", op_id, scheduled_time);
+                }
+                OptimizerEvent::OffPeakHoursStarted => {
+                    info!("🌙 Off-peak hours started - optimal time for heavy operations");
+                }
+                OptimizerEvent::OffPeakHoursEnded => {
+                    info!("☀️ Off-peak hours ended");
+                }
             }
         }
 
@@ -835,6 +1008,29 @@ impl Node {
                 OptimizationCommand::UpdateMetrics(metric_name, value) => {
                     debug!("📊 Updating metric {}: {}", metric_name, value);
                 }
+                OptimizationCommand::ProcessBatches => {
+                    let ready_batches = self.data_optimizer.get_ready_batches();
+                    for batch in ready_batches {
+                        debug!(
+                            "Processing batch {} with {} operations",
+                            batch.batch_id,
+                            batch.operations.len()
+                        );
+                    }
+                }
+                OptimizationCommand::ProcessScheduledOps => {
+                    let ready_ops = self.data_optimizer.get_scheduled_operations();
+                    for op in ready_ops {
+                        debug!("Processing scheduled operation: {}", op.operation_id);
+                    }
+                }
+                OptimizationCommand::UpdateNetworkStats(network_type, bytes) => {
+                    self.network_manager.record_data_usage(bytes);
+                    debug!(
+                        "Updated network stats for {:?}: {} bytes",
+                        network_type, bytes
+                    );
+                }
                 _ => {}
             }
         }
@@ -853,21 +1049,73 @@ impl Node {
     pub fn set_geolocation(&mut self, lat: f64, lon: f64, precision: usize) {
         let geohash = format!("geo_{}_{}_p{}", lat, lon, precision);
         self.geohash = Some(geohash.clone());
+
+        let node_address = self.get_address();
+        if let Some(mut account) = self.state_manager.get_account(&node_address) {
+            if let Some(ref mut capabilities) = account.device_capabilities {
+                capabilities.coverage_area = Some(geohash.clone());
+            }
+            self.state_manager.set_account(account);
+        }
+
         info!("📍 Node geohash set to: {}", geohash);
     }
 
     pub fn set_bandwidth_capacity(&mut self, bps: u64) {
         self.bandwidth_capacity_bps = bps;
-        info!("📶 Node bandwidth capacity set to: {} bps", bps);
+
+        let node_address = self.get_address();
+        if let Some(mut account) = self.state_manager.get_account(&node_address) {
+            if let Some(ref mut capabilities) = account.device_capabilities {
+                capabilities.bandwidth_capacity = bps;
+            }
+            self.state_manager.set_account(account);
+        }
+
+        info!(
+            "📶 Node bandwidth capacity set to: {} bps ({} Mbps)",
+            bps,
+            bps / 1_000_000
+        );
     }
 
     pub fn set_storage_capacity(&mut self, bytes: u64) {
         self.storage_capacity_bytes = bytes;
-        info!("💾 Node storage capacity set to: {} bytes", bytes);
+
+        let node_address = self.get_address();
+        if let Some(mut account) = self.state_manager.get_account(&node_address) {
+            account.storage_quota = bytes;
+            if let Some(ref mut capabilities) = account.device_capabilities {
+                capabilities.storage_capacity = bytes;
+            }
+            self.state_manager.set_account(account);
+        }
+
+        info!(
+            "💾 Node storage capacity set to: {}",
+            format_storage_size(bytes)
+        );
     }
 
     pub fn set_slice_configuration(&mut self, slice_id: String) {
         self.slice_id = Some(slice_id.clone());
+
+        let node_address = self.get_address();
+        if let Some(mut account) = self.state_manager.get_account(&node_address) {
+            let slice = SliceId::new(slice_id.clone());
+            account.authorize_slice(slice.clone());
+
+            if let Some(ref mut capabilities) = account.device_capabilities {
+                if !capabilities.supported_slices.contains(&slice) {
+                    capabilities.supported_slices.push(slice);
+                }
+                capabilities
+                    .hardware_specs
+                    .insert("slice_id".to_string(), slice_id.clone());
+            }
+            self.state_manager.set_account(account);
+        }
+
         info!("📡 Node configured for 5G slice: {}", slice_id);
     }
 
@@ -895,6 +1143,7 @@ impl Node {
                 "consensus_participation",
                 "cross_shard_validation",
                 "finality_commitment",
+                "transaction_validation",
             ]);
         }
         if self.has_role(NodeRole::Storage) {
@@ -903,6 +1152,7 @@ impl Node {
                 "proof_of_spacetime",
                 "erasure_coding",
                 "replica_management",
+                "storage_proofs",
             ]);
         }
         if self.has_role(NodeRole::Relay) {
@@ -910,6 +1160,7 @@ impl Node {
                 "packet_routing",
                 "network_relay",
                 "message_forwarding",
+                "cross_shard_relay",
             ]);
         }
         if self.has_role(NodeRole::Witness) {
@@ -918,6 +1169,7 @@ impl Node {
                 "beacon_reporting",
                 "h3_coverage",
                 "location_verification",
+                "witness_attestation",
             ]);
         }
         if self.has_role(NodeRole::Gateway) {
@@ -926,6 +1178,7 @@ impl Node {
                 "http_interface",
                 "rate_limiting",
                 "request_routing",
+                "edge_computing",
             ]);
         }
         if self.has_role(NodeRole::Seed) {
@@ -934,6 +1187,7 @@ impl Node {
                 "bootstrap_service",
                 "dht_seeding",
                 "network_bootstrapping",
+                "peer_routing",
             ]);
         }
         if self.has_role(NodeRole::Indexer) {
@@ -942,6 +1196,7 @@ impl Node {
                 "search_service",
                 "cross_shard_indexing",
                 "query_processing",
+                "analytics",
             ]);
         }
 
@@ -953,7 +1208,17 @@ impl Node {
             "compression",
             "batch_processing",
             "scheduled_operations",
+            "intelligent_routing",
         ]);
+
+        if self.is_5g_ready() {
+            capabilities.extend_from_slice(&[
+                "5g_network_slicing",
+                "edge_computing",
+                "low_latency_operations",
+                "qos_management",
+            ]);
+        }
 
         capabilities
     }
@@ -966,17 +1231,19 @@ impl Node {
         let state_stats = self.state_manager.get_stats();
 
         format!(
-            "Node {} [{}] - Roles: {:?}, Shards: {:?}, Peers: {}, Accounts: {}, Network: {:?}, Sharing: {} active, Data saved: {:.1}MB, Proofs: {}, {}",
+            "Node {} [{}] - Roles: {:?}, Shards: {:?}, Peers: {}, Accounts: {}, Balance: {}, Network: {:?}, Sharing: {} active, Data saved: {:.1}MB, Proofs: {}, Uptime: {}h, {}",
             self.peer_id,
             self.node_type,
             self.roles,
             self.shard_ids,
             connected_peers,
             state_stats.total_accounts,
+            state_stats.total_balance,
             self.network_manager.current_interface,
             sharing_stats.active_connections,
             opt_stats.total_bandwidth_saved_mb,
             self.performance_metrics.proof_events_generated,
+            self.performance_metrics.uptime_seconds / 3600,
             network_summary
         )
     }
@@ -1040,5 +1307,14 @@ impl Node {
 
     pub fn get_block_height(&self) -> BlockHeight {
         self.state_manager.get_block_height()
+    }
+
+    pub fn get_shard_for_address(&self, address: &Address) -> u32 {
+        if self.shard_ids.is_empty() {
+            0
+        } else {
+            let shard_count = self.shard_ids.len() as u32;
+            calculate_shard_for_address(address, shard_count)
+        }
     }
 }
