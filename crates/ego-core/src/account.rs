@@ -69,6 +69,11 @@ pub enum AccountType {
     System {
         purpose: String,
     },
+    Validator {
+        validator_pubkey: PublicKey,
+        commission_rate: u16,
+        is_active: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -189,6 +194,38 @@ impl Account {
         }
     }
 
+    pub fn new_user(address: Address) -> Self {
+        let now = Timestamp::now();
+        Self {
+            address,
+            balance: Balance::ZERO,
+            nonce: 0,
+            per_shard_nonces: Some(HashMap::new()),
+            created_at: now,
+            last_activity: now,
+            dilithium_pk: vec![0u8; 1312],
+            ed25519_pk: None,
+            mlkem_pk: None,
+            storage_quota: 10 * 1024 * 1024,
+            storage_used: 0,
+            storage_credits: 1000,
+            deploy_credits: 100,
+            free_deploys_remaining: 5,
+            deploy_bond_locked_until: None,
+            staking_info: None,
+            validator_info: None,
+            last_drs_score: Some(100000),
+            last_drs_epoch: Some(0),
+            account_type: AccountType::EOA,
+            contract_info: None,
+            peer_id: None,
+            tmp_attestation: None,
+            authorized_slices: Vec::new(),
+            device_capabilities: None,
+            metadata: HashMap::new(),
+        }
+    }
+
     pub fn new_device(
         address: Address,
         device_id: String,
@@ -223,6 +260,45 @@ impl Account {
             },
             contract_info: None,
             peer_id: Some(peer_id),
+            tmp_attestation: None,
+            authorized_slices: capabilities.supported_slices.clone(),
+            device_capabilities: Some(capabilities),
+            metadata: HashMap::new(),
+        }
+    }
+
+    pub fn new_device_simple(
+        address: Address,
+        device_id: String,
+        capabilities: DeviceCapabilities,
+    ) -> Self {
+        let now = Timestamp::now();
+        Self {
+            address,
+            balance: Balance::ZERO,
+            nonce: 0,
+            per_shard_nonces: Some(HashMap::new()),
+            created_at: now,
+            last_activity: now,
+            dilithium_pk: vec![0u8; 1312],
+            ed25519_pk: None,
+            mlkem_pk: None,
+            storage_quota: capabilities.storage_capacity,
+            storage_used: 0,
+            storage_credits: 1000,
+            deploy_credits: 100,
+            free_deploys_remaining: 5,
+            deploy_bond_locked_until: None,
+            staking_info: None,
+            validator_info: None,
+            last_drs_score: Some(100000),
+            last_drs_epoch: Some(0),
+            account_type: AccountType::Device {
+                device_id,
+                geohash: None,
+            },
+            contract_info: None,
+            peer_id: None,
             tmp_attestation: None,
             authorized_slices: capabilities.supported_slices.clone(),
             device_capabilities: Some(capabilities),
@@ -285,7 +361,11 @@ impl Account {
             validator_info: Some(validator_info),
             last_drs_score: Some(100000),
             last_drs_epoch: Some(0),
-            account_type: AccountType::EOA,
+            account_type: AccountType::Validator {
+                validator_pubkey,
+                commission_rate,
+                is_active: true,
+            },
             contract_info: None,
             peer_id: None,
             tmp_attestation: None,
@@ -440,6 +520,26 @@ impl Account {
             self.storage_quota,
             self.last_drs_score.map(|s| s as f64 / 1000.0)
         )
+    }
+
+    pub fn is_validator(&self) -> bool {
+        matches!(self.account_type, AccountType::Validator { .. }) || self.validator_info.is_some()
+    }
+
+    pub fn is_device(&self) -> bool {
+        matches!(self.account_type, AccountType::Device { .. })
+    }
+
+    pub fn get_validator_pubkey(&self) -> Option<PublicKey> {
+        match &self.account_type {
+            AccountType::Validator {
+                validator_pubkey, ..
+            } => Some(*validator_pubkey),
+            _ => self
+                .validator_info
+                .as_ref()
+                .map(|info| info.validator_pubkey),
+        }
     }
 }
 

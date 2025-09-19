@@ -172,6 +172,19 @@ impl StateManager {
                     "peer_id".to_string(),
                 )
             }
+            AccountType::Validator {
+                validator_pubkey,
+                commission_rate,
+                is_active: _,
+            } => {
+                Account::new_validator(
+                    address,
+                    validator_pubkey,
+                    commission_rate,
+                    Balance::ZERO, // Initial stake of zero
+                    vec![0u8; 1312],
+                )?
+            }
             AccountType::Contract { .. } => {
                 return Err(EgoError::InvalidTransaction(
                     "Contract accounts must be created through deployment".to_string(),

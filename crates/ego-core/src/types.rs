@@ -41,6 +41,10 @@ impl Hash {
         bytes.copy_from_slice(slice);
         Ok(Self(bytes))
     }
+
+    pub fn random() -> Self {
+        Self(rand::random())
+    }
 }
 
 impl fmt::Display for Hash {
@@ -81,6 +85,18 @@ impl PublicKey {
     pub fn to_vec(&self) -> Vec<u8> {
         self.0.to_vec()
     }
+
+    pub fn from_slice(slice: &[u8]) -> Result<Self, crate::EgoError> {
+        if slice.len() != 32 {
+            return Err(crate::EgoError::CryptoError(format!(
+                "Invalid public key length: expected 32, got {}",
+                slice.len()
+            )));
+        }
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(slice);
+        Ok(Self(bytes))
+    }
 }
 
 impl fmt::Display for PublicKey {
@@ -103,6 +119,18 @@ impl Signature {
 
     pub fn to_vec(&self) -> Vec<u8> {
         self.0.to_vec()
+    }
+
+    pub fn from_slice(slice: &[u8]) -> Result<Self, crate::EgoError> {
+        if slice.len() != 64 {
+            return Err(crate::EgoError::CryptoError(format!(
+                "Invalid signature length: expected 64, got {}",
+                slice.len()
+            )));
+        }
+        let mut bytes = [0u8; 64];
+        bytes.copy_from_slice(slice);
+        Ok(Self(bytes))
     }
 }
 
@@ -180,6 +208,22 @@ impl Address {
         bytes.copy_from_slice(&hash.as_bytes()[..20]);
         Self(bytes)
     }
+
+    pub fn from_slice(slice: &[u8]) -> Result<Self, crate::EgoError> {
+        if slice.len() != 20 {
+            return Err(crate::EgoError::CryptoError(format!(
+                "Invalid address length: expected 20, got {}",
+                slice.len()
+            )));
+        }
+        let mut bytes = [0u8; 20];
+        bytes.copy_from_slice(slice);
+        Ok(Self(bytes))
+    }
+
+    pub fn random() -> Self {
+        Self(rand::random())
+    }
 }
 
 impl fmt::Display for Address {
@@ -218,12 +262,24 @@ impl Timestamp {
         Self(millis)
     }
 
+    pub fn from_secs(secs: u64) -> Self {
+        Self(secs * 1000)
+    }
+
     pub fn as_millis(&self) -> u64 {
         self.0
     }
 
     pub fn as_secs(&self) -> u64 {
         self.0 / 1000
+    }
+
+    pub fn elapsed_millis(&self) -> u64 {
+        Self::now().0.saturating_sub(self.0)
+    }
+
+    pub fn elapsed_secs(&self) -> u64 {
+        self.elapsed_millis() / 1000
     }
 }
 
@@ -260,6 +316,10 @@ impl ShardId {
 
     pub fn as_u32(&self) -> u32 {
         self.0
+    }
+
+    pub fn from_u32(id: u32) -> Self {
+        Self(id)
     }
 }
 
@@ -298,6 +358,14 @@ impl BlockHeight {
     pub fn next(&self) -> Self {
         Self(self.0 + 1)
     }
+
+    pub fn prev(&self) -> Self {
+        Self(self.0.saturating_sub(1))
+    }
+
+    pub fn is_genesis(&self) -> bool {
+        self.0 == 0
+    }
 }
 
 impl fmt::Display for BlockHeight {
@@ -334,6 +402,16 @@ impl EpochNumber {
 
     pub fn next(&self) -> Self {
         Self(self.0 + 1)
+    }
+
+    pub fn prev(&self) -> Self {
+        Self(self.0.saturating_sub(1))
+    }
+}
+
+impl fmt::Display for EpochNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "epoch-{}", self.0)
     }
 }
 
@@ -404,11 +482,35 @@ impl Balance {
             Some(Balance(self.0 / divisor))
         }
     }
+
+    pub fn saturating_add(&self, other: Balance) -> Balance {
+        Balance(self.0.saturating_add(other.0))
+    }
+
+    pub fn saturating_sub(&self, other: Balance) -> Balance {
+        Balance(self.0.saturating_sub(other.0))
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.0 == 0
+    }
 }
 
 impl fmt::Display for Balance {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:.8} EGOC", self.to_egoc())
+    }
+}
+
+impl From<u128> for Balance {
+    fn from(amount: u128) -> Self {
+        Self(amount)
+    }
+}
+
+impl From<u64> for Balance {
+    fn from(amount: u64) -> Self {
+        Self(amount as u128)
     }
 }
 
@@ -425,10 +527,134 @@ impl SliceId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
+    pub fn is_valid(&self) -> bool {
+        !self.0.is_empty()
+            && self.0.len() <= 64
+            && self
+                .0
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    }
 }
 
 impl fmt::Display for SliceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl From<String> for SliceId {
+    fn from(id: String) -> Self {
+        Self(id)
+    }
+}
+
+impl From<&str> for SliceId {
+    fn from(id: &str) -> Self {
+        Self(id.to_string())
+    }
+}
+
+// Additional types for better node integration
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PeerId(pub String);
+
+impl PeerId {
+    pub fn new(id: String) -> Self {
+        Self(id)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PeerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<libp2p::PeerId> for PeerId {
+    fn from(peer_id: libp2p::PeerId) -> Self {
+        Self(peer_id.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeId(pub PeerId);
+
+impl NodeId {
+    pub fn new(peer_id: PeerId) -> Self {
+        Self(peer_id)
+    }
+
+    pub fn from_libp2p(peer_id: libp2p::PeerId) -> Self {
+        Self(PeerId::from(peer_id))
+    }
+}
+
+impl fmt::Display for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NetworkQuality {
+    pub latency_ms: u32,
+    pub bandwidth_mbps: u64,
+    pub reliability_score: u8,
+    pub cost_per_gb_usd: f64,
+}
+
+impl Default for NetworkQuality {
+    fn default() -> Self {
+        Self {
+            latency_ms: 100,
+            bandwidth_mbps: 100,
+            reliability_score: 80,
+            cost_per_gb_usd: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeoLocation {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub h3_index: Option<String>,
+    pub country_code: Option<String>,
+    pub region: Option<String>,
+}
+
+impl GeoLocation {
+    pub fn new(latitude: f64, longitude: f64) -> Self {
+        Self {
+            latitude,
+            longitude,
+            h3_index: None,
+            country_code: None,
+            region: None,
+        }
+    }
+
+    pub fn distance_to(&self, other: &GeoLocation) -> f64 {
+        let r = 6371.0;
+        let lat1 = self.latitude.to_radians();
+        let lat2 = other.latitude.to_radians();
+        let delta_lat = (other.latitude - self.latitude).to_radians();
+        let delta_lon = (other.longitude - self.longitude).to_radians();
+
+        let a = (delta_lat / 2.0).sin().powi(2)
+            + lat1.cos() * lat2.cos() * (delta_lon / 2.0).sin().powi(2);
+        let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+
+        r * c
     }
 }
