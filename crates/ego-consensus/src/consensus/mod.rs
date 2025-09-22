@@ -7,8 +7,9 @@ pub use validation::{ValidationError, ValidationResult};
 use crate::aggregator::PoCEvent;
 use crate::error::PoCResult;
 use crate::types::*;
-use ego_core::{Address, Hash, Timestamp};
+use ego_core::{Address, Timestamp};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsensusState {
@@ -23,7 +24,7 @@ pub struct ConsensusState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FraudReport {
-    pub report_id: Hash,
+    pub report_id: ego_core::Hash,
     pub reporter: Address,
     pub accused: Address,
     pub fraud_type: crate::FraudType,
@@ -53,20 +54,22 @@ pub struct ConsensusParams {
     pub challenge_difficulty: u8,
     pub reward_multiplier: f64,
     pub slash_multiplier: f64,
+    pub co_beacon_min_fraction: f64,
 }
 
 impl Default for ConsensusParams {
     fn default() -> Self {
         Self {
-            min_witnesses: 1,
+            min_witnesses: 3,
             max_witnesses: 14,
-            witness_timeout_ms: 30_000,
+            witness_timeout_ms: 10_000,
             fraud_threshold: 0.8,
             min_coherence_score: 0.5,
             beacon_interval_ms: 30_000,
             challenge_difficulty: 1,
             reward_multiplier: 1.0,
             slash_multiplier: 2.0,
+            co_beacon_min_fraction: 0.5,
         }
     }
 }
@@ -102,9 +105,15 @@ impl Default for FraudReportStatus {
 pub trait ConsensusParticipant: Send + Sync {
     fn participant_id(&self) -> Address;
 
-    async fn validate_poc_event(&self, event: &PoCEvent) -> PoCResult<ValidationResult>;
+    fn validate_poc_event(
+        &self,
+        event: &PoCEvent,
+    ) -> impl Future<Output = PoCResult<ValidationResult>> + Send;
 
-    async fn submit_fraud_report(&mut self, report: FraudReport) -> PoCResult<()>;
+    fn submit_fraud_report(
+        &mut self,
+        report: FraudReport,
+    ) -> impl Future<Output = PoCResult<()>> + Send;
 
     fn get_drs_score(&self) -> Option<f64>;
 
@@ -121,6 +130,9 @@ mod tests {
         assert!(params.min_witnesses < params.max_witnesses);
         assert!(params.fraud_threshold <= 1.0);
         assert!(params.min_coherence_score <= 1.0);
+        assert_eq!(params.min_witnesses, 3);
+        assert_eq!(params.witness_timeout_ms, 10_000);
+        assert_eq!(params.co_beacon_min_fraction, 0.5);
     }
 
     #[test]

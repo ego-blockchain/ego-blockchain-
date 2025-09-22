@@ -20,17 +20,18 @@ pub use types::*;
 pub use witness::{WitnessNode, WitnessReport};
 
 use ego_core::{Address, PublicKey, Timestamp};
+use std::future::Future;
 
 pub const POC_BEACON_INTERVAL_MS: u64 = 30_000;
 pub const POC_WITNESS_WINDOW_MS: u64 = 10_000;
 pub const POC_AGGREGATION_WINDOW_MS: u64 = 60_000;
-pub const POC_MIN_WITNESSES: usize = 1;
+pub const POC_MIN_WITNESSES: usize = 3;
 pub const POC_MAX_WITNESSES: usize = 14;
 pub const POC_CELLULAR_SAFE_RATE_HZ: f32 = 0.75;
 pub const POC_BATCH_SIZE: usize = 10;
 pub const POC_COMPRESSION_THRESHOLD: usize = 1024;
 
-pub const H3_RESOLUTION: u8 = 7;
+pub const H3_RESOLUTION: u8 = 9;
 pub const H3_NEIGHBOR_RINGS: usize = 2;
 
 pub const MIN_RSRP_DBM: i16 = -140;
@@ -40,6 +41,8 @@ pub const MAX_RSRQ_DB: i16 = -3;
 pub const MIN_SINR_DB: i16 = -20;
 pub const MAX_SINR_DB: i16 = 30;
 pub const MAX_TIMING_ADVANCE: u32 = 1282;
+
+pub const CO_BEACON_MIN_FRACTION: f64 = 0.5;
 
 pub trait PoCNode: Send + Sync {
     fn node_id(&self) -> Address;
@@ -52,13 +55,25 @@ pub trait PoCNode: Send + Sync {
 pub type PoCResult<T> = Result<T, PoCError>;
 
 pub trait PoCEventHandler: Send + Sync {
-    async fn handle_beacon_announcement(
+    fn handle_beacon_announcement(
         &mut self,
         announcement: BeaconAnnouncement,
-    ) -> PoCResult<()>;
-    async fn handle_witness_report(&mut self, report: WitnessReport) -> PoCResult<()>;
-    async fn handle_poc_bundle(&mut self, bundle: PoCBundle) -> PoCResult<()>;
-    async fn handle_fraud_proof(&mut self, proof: FraudProof) -> PoCResult<()>;
+    ) -> impl Future<Output = PoCResult<()>> + Send;
+
+    fn handle_witness_report(
+        &mut self,
+        report: WitnessReport,
+    ) -> impl Future<Output = PoCResult<()>> + Send;
+
+    fn handle_poc_bundle(
+        &mut self,
+        bundle: PoCBundle,
+    ) -> impl Future<Output = PoCResult<()>> + Send;
+
+    fn handle_fraud_proof(
+        &mut self,
+        proof: FraudProof,
+    ) -> impl Future<Output = PoCResult<()>> + Send;
 }
 
 #[cfg(test)]
@@ -70,5 +85,8 @@ mod tests {
         assert!(POC_BEACON_INTERVAL_MS > POC_WITNESS_WINDOW_MS);
         assert!(POC_AGGREGATION_WINDOW_MS > POC_BEACON_INTERVAL_MS);
         assert!(POC_MIN_WITNESSES < POC_MAX_WITNESSES);
+        assert_eq!(POC_MIN_WITNESSES, 3);
+        assert_eq!(H3_RESOLUTION, 9);
+        assert_eq!(CO_BEACON_MIN_FRACTION, 0.5);
     }
 }

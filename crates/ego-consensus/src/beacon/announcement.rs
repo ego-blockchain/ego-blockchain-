@@ -291,7 +291,6 @@ impl BeaconAnnouncement {
     }
 }
 
-// Remove PartialEq and Eq from BeaconTxParams because of f32 field
 impl PartialEq for BeaconAnnouncement {
     fn eq(&self, other: &Self) -> bool {
         self.beacon_id == other.beacon_id

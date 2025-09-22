@@ -438,7 +438,11 @@ impl Aggregator for AggregatorNode {
             hash_bytes[..len].copy_from_slice(&sig_bytes[..len]);
             hash_bytes
         });
-        let witness_set = WitnessSet::new(announcement, self.config.witness_collection_window_ms);
+        let witness_set = WitnessSet::new(
+            announcement,
+            self.config.witness_collection_window_ms,
+            Timestamp::now().as_millis(),
+        );
 
         {
             let mut sets = self.active_witness_sets.write().unwrap();

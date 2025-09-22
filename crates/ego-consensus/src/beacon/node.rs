@@ -2,11 +2,10 @@ use super::{Beacon, BeaconAnnouncement, BeaconMetrics, BeaconStatus};
 use crate::config::BeaconConfig;
 use crate::error::{PoCError, PoCResult};
 use crate::types::*;
-use ego_core::{Address, Hash, KeyPair, PublicKey, Timestamp};
-use std::collections::HashMap;
+use ego_core::{Address, KeyPair, Timestamp};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 pub struct BeaconNode {
     config: BeaconConfig,
@@ -36,6 +35,9 @@ pub struct BeaconNode {
     announcement_sender: Option<mpsc::UnboundedSender<BeaconAnnouncement>>,
 
     drs_score: Arc<RwLock<Option<f64>>>,
+
+    recent_transmissions:
+        Arc<RwLock<std::collections::HashMap<(Address, Vec<u8>, u64), Timestamp>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +58,7 @@ impl BeaconNode {
     ) -> Self {
         let address = Address::from_public_key(&keypair.public_key());
 
-        let mut status = BeaconStatus {
+        let status = BeaconStatus {
             beacon_id: address,
             is_active: false,
             last_transmission: None,
@@ -85,6 +87,7 @@ impl BeaconNode {
             challenge_receiver: None,
             announcement_sender: None,
             drs_score: Arc::new(RwLock::new(None)),
+            recent_transmissions: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 
@@ -93,8 +96,8 @@ impl BeaconNode {
 
         self.validate_config()?;
 
-        let (challenge_sender, challenge_receiver) = mpsc::unbounded_channel();
-        let (announcement_sender, announcement_receiver) = mpsc::unbounded_channel();
+        let (_challenge_sender, challenge_receiver) = mpsc::unbounded_channel();
+        let (announcement_sender, _announcement_receiver) = mpsc::unbounded_channel();
 
         self.challenge_receiver = Some(challenge_receiver);
         self.announcement_sender = Some(announcement_sender);
@@ -123,7 +126,6 @@ impl BeaconNode {
         Ok(())
     }
 
-    /// Update node location
     pub fn update_location(&mut self, location: LocationData) -> PoCResult<()> {
         {
             let mut current_location = self.location.write().unwrap();
@@ -179,6 +181,25 @@ impl BeaconNode {
             "Processing challenge {} for beacon {}",
             challenge.challenge_hash, self.address
         );
+
+        let epoch = Timestamp::now().as_secs() / 3600;
+        let key = (self.address, challenge.nonce.clone(), epoch);
+
+        {
+            let mut recent = self.recent_transmissions.write().unwrap();
+
+            // Clean old entries
+            let cutoff = Timestamp::now().as_millis().saturating_sub(3_600_000);
+            recent.retain(|_, timestamp| timestamp.as_millis() > cutoff);
+
+            if recent.contains_key(&key) {
+                return Err(PoCError::DuplicateSubmission(
+                    "Duplicate beacon transmission detected".to_string(),
+                ));
+            }
+
+            recent.insert(key, Timestamp::now());
+        }
 
         if !self.check_rate_limit()? {
             return Err(PoCError::RateLimitExceeded {
@@ -410,7 +431,7 @@ mod tests {
             altitude: Some(10.0),
             accuracy: Some(5.0),
             timestamp: Timestamp::now().as_millis(),
-            h3_index: "87283472bffffff".to_string(),
+            h3_index: "872834720ffffff".to_string(),
         };
 
         BeaconNode::new(
@@ -445,8 +466,8 @@ mod tests {
         beacon.start().await.unwrap();
 
         let challenge = Challenge {
-            challenge_hash: Hash::new([1u8; 32]),
-            h3_cell: "87283472bffffff".to_string(),
+            challenge_hash: ego_core::Hash::new([1u8; 32]),
+            h3_cell: "872834720ffffff".to_string(),
             nonce: vec![2u8; 16],
             timestamp: Timestamp::now(),
             difficulty: 1,
@@ -458,6 +479,25 @@ mod tests {
         let metrics = beacon.get_metrics();
         assert_eq!(metrics.total_transmissions, 1);
         assert_eq!(metrics.successful_transmissions, 1);
+    }
+
+    #[tokio::test]
+    async fn test_anti_replay_protection() {
+        let mut beacon = create_test_beacon();
+        beacon.start().await.unwrap();
+
+        let challenge = Challenge {
+            challenge_hash: ego_core::Hash::new([1u8; 32]),
+            h3_cell: "872834720ffffff".to_string(),
+            nonce: vec![2u8; 16],
+            timestamp: Timestamp::now(),
+            difficulty: 1,
+            reward_scale: 1.0,
+        };
+
+        assert!(beacon.process_challenge(challenge.clone()).await.is_ok());
+
+        assert!(beacon.process_challenge(challenge).await.is_err());
     }
 
     #[test]
