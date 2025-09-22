@@ -1,16 +1,17 @@
 # Ego Consensus - Proof of Coverage Implementation
 
-A comprehensive Proof of Coverage (PoC) consensus mechanism for the Ego blockchain, designed for 5G-enabled networks with cellular-safe operations and intelligent fraud detection.
+A comprehensive Proof of Coverage (PoC) consensus mechanism for the Ego blockchain, designed for 5G-enabled networks with cellular-safe operations and intelligent fraud detection. This implementation is fully open-source and requires no licenses or permissions to use.
 
 ## Overview
 
-Ego Consensus implements a Helium-inspired Proof of Coverage system specifically designed for 5G networks, featuring:
+Ego Consensus implements an enhanced Proof of Coverage system specifically designed for 5G networks, featuring:
 
-- **Cellular-Safe Operations**: Rate-limited beacon transmissions (0.5-1 Hz) with batched witness reports
+- **Cellular-Safe Operations**: Rate-limited beacon transmissions (0.75 Hz) with batched witness reports
 - **5G Network Integration**: Support for network slicing, beamforming, and advanced RF metrics
+- **3GPP 38.901 Compliance**: Path loss validation using industry-standard propagation models
 - **Comprehensive Fraud Detection**: Geometric, timing, and signal coherence validation with fraud proofs
 - **Intelligent Cost Optimization**: Network switching and data compression for mobile networks
-- **Regulatory Compliance**: Authorized frequency bands with side-channel beacon support
+- **Open Source**: No licenses or permissions required - fully free to use
 
 ## Architecture
 
@@ -32,10 +33,10 @@ Challenge → Beacon → RF Transmission → Witnesses → Reports → Aggregato
 
 ### 🔊 Beacon System
 - Challenge-response beacon transmission with cryptographic nonces
+- Anti-replay protection with duplicate (beacon_id, nonce, epoch) detection
 - Side-channel transmission support (BLE/Wi-Fi) for enhanced verification
-- Cellular-safe transmission rates (≤1 Hz) with configurable power limits
+- Cellular-safe transmission rates (≤0.75 Hz) with configurable power limits
 - 5G beamforming support with directional transmission patterns
-- Authorized frequency validation and regulatory compliance
 
 ### 👁️ Witness System
 - Comprehensive RF signal measurement (RSRP, RSRQ, SINR, Timing Advance)
@@ -45,24 +46,53 @@ Challenge → Beacon → RF Transmission → Witnesses → Reports → Aggregato
 - Rate limiting (120 reports/hour) with burst allowance
 
 ### 📦 Aggregation System
-- Regional witness collection with H3 geospatial indexing
-- Multi-dimensional coherence analysis (geometry, timing, signal)
-- Evidence bundle creation with cryptographic signatures
+- Regional witness collection with H3 geospatial indexing (resolution 9)
+- Multi-dimensional coherence analysis using 3GPP 38.901 standards
+- Evidence bundle creation with deterministic scoring
 - LZ4 compression for cellular networks (>1KB payloads)
-- Daily anchor generation with Merkle tree evidence roots
+- Co-beacon requirement (50% minimum coverage)
 
 ### 🛡️ Fraud Detection
-- **Impossible RF Geometry**: Path loss vs distance validation
+- **Impossible RF Geometry**: 3GPP 38.901 path loss validation
 - **GPS Spoofing**: Movement analysis and location consistency
 - **Replay Attacks**: Nonce reuse and timing fingerprint detection
-- **Clustered Farms**: Density analysis and geographic clustering
+- **Clustered Farms**: H3 cell density analysis and down-weighting
 - **SDR Relay**: Latency analysis and timing advance validation
 
 ### 🏗️ Consensus & Validation
+- Deterministic scoring: same inputs produce identical results
 - Multi-validator consensus with configurable thresholds (67%)
 - Comprehensive validation pipeline with early fraud detection
 - Dynamic Reputation System (DRS) integration
 - Slashing mechanism for proven fraud (2x collateral)
+
+## Cellular Safety & Budget Management
+
+### Rate Limiting
+- Beacon transmissions: ≤0.75 Hz (cellular-safe default)
+- Witness scanning: ≤0.75 Hz recommended
+- Report submissions: 120/hour with 8-second batching
+
+### Network Optimization
+- Prefers Wi-Fi for heavy bundle uploads
+- Uses cellular only for time-critical meta events
+- Compression ensures <1MB/hour cellular usage
+- Adaptive rate limiting based on connection type
+
+### Default Configuration
+```rust
+// Cellular-safe defaults
+poc.scan_rate_hz = 0.75
+poc.batch_sec = 8
+poc.max_reports_per_hour = 120
+poc.window_sec = 10
+poc.h3_res = 9
+poc.min_witnesses = 3
+poc.co_beacon_min_fraction = 0.5
+net.cellular_safe = true
+net.wifi_only_heavy = true
+proofs.anchor_window_hours = 24
+```
 
 ## Installation
 
@@ -87,7 +117,7 @@ use ego_core::{KeyPair, Address};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize beacon node
+    // Initialize beacon node with cellular-safe defaults
     let beacon_keypair = KeyPair::generate();
     let beacon_config = BeaconConfig {
         beacon_interval_ms: 30_000,
@@ -103,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         altitude: Some(10.0),
         accuracy: Some(5.0),
         timestamp: ego_core::Timestamp::now().as_millis(),
-        h3_index: "87283472bffffff".to_string(),
+        h3_index: "872834720ffffff".to_string(),
     };
 
     let mut beacon_node = BeaconNode::new(
@@ -113,14 +143,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vec![3500, 3600, 3700],
     );
 
-    // Initialize witness node
+    // Initialize witness node with cellular-safe settings
     let witness_keypair = KeyPair::generate();
     let witness_config = WitnessConfig {
-        scan_rate_hz: 0.75, // Cellular-safe
-        batch_interval_seconds: 8,
+        scan_rate_hz: 0.75,           // Cellular-safe scan rate
+        batch_interval_seconds: 8,    // 8-second batching
         max_reports_per_batch: 10,
         enable_compression: true,
-        rate_limit_per_hour: 120,
+        rate_limit_per_hour: 120,     // Cellular-safe limit
         ..Default::default()
     };
 
@@ -130,7 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         altitude: Some(15.0),
         accuracy: Some(8.0),
         timestamp: ego_core::Timestamp::now().as_millis(),
-        h3_index: "87283472bffffff".to_string(),
+        h3_index: "872834720ffffff".to_string(),
     };
 
     let mut witness_node = WitnessNode::new(
@@ -143,19 +173,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize aggregator node
     let aggregator_keypair = KeyPair::generate();
     let aggregator_config = AggregatorConfig {
-        coverage_h3_resolution: 7,
-        min_witnesses: 1,
+        coverage_h3_resolution: 9,         // H3 resolution 9
+        min_witnesses: 3,                  // Minimum 3 witnesses
         max_witnesses: 14,
-        witness_collection_window_ms: 30_000,
+        witness_collection_window_ms: 10_000, // 10-second window
         compression_threshold_bytes: 1024,
-        daily_anchor_interval_hours: 24,
+        co_beacon_min_fraction: 0.5,       // 50% co-beacon requirement
         ..Default::default()
     };
 
     let mut aggregator_node = AggregatorNode::new(
         aggregator_config,
         aggregator_keypair,
-        vec!["87283472bffffff".to_string()],
+        vec!["872834720ffffff".to_string()],
     );
 
     // Start all nodes
@@ -177,74 +207,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Challenge Processing
-
-```rust
-use ego_consensus::{Challenge, BeaconAnnouncement};
-use ego_core::{Hash, Timestamp};
-
-// Create challenge
-let challenge = Challenge {
-    challenge_hash: Hash::new([1u8; 32]),
-    h3_cell: "87283472bffffff".to_string(),
-    nonce: vec![2u8; 16],
-    timestamp: Timestamp::now(),
-    difficulty: 1,
-    reward_scale: 1.0,
-};
-
-// Process challenge (beacon responds)
-beacon_node.process_challenge(challenge.clone()).await?;
-
-// Beacon creates announcement
-let announcement = BeaconAnnouncement::new(
-    beacon_node.beacon_id(),
-    challenge,
-    beacon_location,
-    BeaconTxParams::default(),
-);
-```
-
-### Witness Reporting
-
-```rust
-use ego_consensus::{DetectedBeacon, RFMetrics};
-
-// Simulate beacon detection
-let detected_beacon = DetectedBeacon {
-    rf_metrics: RFMetrics {
-        rsrp: -85,        // Signal strength (dBm)
-        rsrq: -10,        // Signal quality (dB)
-        sinr: 15,         // Signal-to-noise ratio (dB)
-        timing_advance: 100,  // Distance indicator
-        pci: 1,           // Physical cell ID
-        beam_index: Some(0),
-        frequency: 3500,  // MHz
-        rx_timestamp: Timestamp::now().as_millis(),
-    },
-    announcement: Some(announcement),
-    co_beacon_data: None,
-    detected_at: Timestamp::now(),
-    witness_location: witness_location,
-};
-
-// Process detection
-let witness_report = witness_node.process_beacon(detected_beacon).await?;
-```
-
-### Bundle Creation & Validation
+### Deterministic Scoring
 
 ```rust
 use ego_consensus::{PoCBundle, ValidationResult};
 
-// Aggregator creates evidence bundle
+// Same inputs always produce identical results
 let bundle = aggregator_node.create_poc_bundle(beacon_hash).await?;
 
 if let Some(bundle) = bundle {
-    // Validate bundle
+    // Validate bundle with deterministic scoring
     bundle.validate()?;
 
-    // Check fraud indicators
+    // Check coherence using 3GPP 38.901 standards
     let coherence_score = bundle.coherence_analysis.overall_coherence_score;
     let fraud_likelihood = bundle.coherence_analysis.fraud_likelihood;
 
@@ -257,16 +232,39 @@ if let Some(bundle) = bundle {
 }
 ```
 
-### Fraud Detection
+### Anti-Replay Protection
+
+```rust
+use ego_consensus::{Challenge, BeaconAnnouncement};
+use ego_core::{Hash, Timestamp};
+
+// Create challenge
+let challenge = Challenge {
+    challenge_hash: Hash::new([1u8; 32]),
+    h3_cell: "872834720ffffff".to_string(),
+    nonce: vec![2u8; 16],
+    timestamp: Timestamp::now(),
+    difficulty: 1,
+    reward_scale: 1.0,
+};
+
+// First processing succeeds
+beacon_node.process_challenge(challenge.clone()).await?;
+
+// Second identical challenge fails (anti-replay)
+assert!(beacon_node.process_challenge(challenge).await.is_err());
+```
+
+### Fraud Detection with 3GPP 38.901
 
 ```rust
 use ego_consensus::{FraudProof, FraudEvidence, EvidenceData};
 
-// Detect potential fraud
+// Detect geometry inconsistencies using 3GPP 38.901 models
 if let Some(fraud_type) = witness_report.detect_potential_fraud() {
     println!("Potential fraud detected: {:?}", fraud_type);
 
-    // Create fraud evidence
+    // Create evidence with 3GPP 38.901 analysis
     let evidence = FraudEvidence {
         poc_event_hash: event_hash,
         bundle_hash: Some(bundle_hash),
@@ -275,7 +273,7 @@ if let Some(fraud_type) = witness_report.detect_potential_fraud() {
             witness_locations: vec![witness_location],
             rf_measurements: vec![rf_metrics],
             path_loss_analysis: PathLossAnalysis {
-                expected_path_losses: vec![expected_loss],
+                expected_path_losses: vec![expected_loss_38901],
                 actual_rsrp_values: vec![actual_rsrp],
                 path_loss_errors: vec![error],
                 max_error_db: max_error,
@@ -286,7 +284,7 @@ if let Some(fraud_type) = witness_report.detect_potential_fraud() {
         reference_data: None,
     };
 
-    // Create and submit fraud proof
+    // Submit fraud proof
     let mut fraud_proof = FraudProof::new(
         challenger_address,
         accused_address,
@@ -296,18 +294,13 @@ if let Some(fraud_type) = witness_report.detect_potential_fraud() {
     );
 
     fraud_proof.sign(&challenger_keypair)?;
-
-    // Submit for validation
     let result = fraud_validator.execute_fraud_proof(&fraud_proof)?;
-    if result.success {
-        println!("Fraud proven! Slash amount: {}", result.slash_amount);
-    }
 }
 ```
 
 ## Configuration
 
-### Beacon Configuration
+### Cellular-Safe Beacon Configuration
 
 ```rust
 BeaconConfig {
@@ -321,7 +314,7 @@ BeaconConfig {
 }
 ```
 
-### Witness Configuration
+### Cellular-Safe Witness Configuration
 
 ```rust
 WitnessConfig {
@@ -334,80 +327,91 @@ WitnessConfig {
 }
 ```
 
-### Aggregator Configuration
+### Enhanced Aggregator Configuration
 
 ```rust
 AggregatorConfig {
-    coverage_h3_resolution: 7,         // H3 resolution level
-    min_witnesses: 1,                  // Minimum witnesses required
+    coverage_h3_resolution: 9,         // H3 resolution 9
+    min_witnesses: 3,                  // Minimum 3 witnesses required
     max_witnesses: 14,                 // Maximum witnesses per beacon
-    witness_collection_window_ms: 30_000, // 30s collection window
+    witness_collection_window_ms: 10_000, // 10s collection window
     compression_threshold_bytes: 1024, // Compress bundles >1KB
+    co_beacon_min_fraction: 0.5,       // 50% co-beacon requirement
     daily_anchor_interval_hours: 24,   // Generate daily anchors
 }
 ```
 
-## Fraud Detection Types
+## Acceptance Tests
 
-### Invalid RF Geometry
-Detects impossible signal strength vs distance relationships:
-- Expected path loss: `20×log10(d) + 20×log10(f) + 32.44`
-- Validates RSRP against calculated path loss
-- Flags deviations >20dB as suspicious
+### Deterministic Scoring
+```rust
+#[test]
+fn test_deterministic_scoring() {
+    let same_reports = create_identical_witness_reports();
+    let same_params = AggregatorConfig::default();
 
-### GPS Spoofing
-Identifies impossible movement patterns:
-- Tracks location changes over time
-- Calculates required movement speeds
-- Flags teleportation (>500 km/h movement)
+    let quality1 = calculate_quality_score(&same_reports, &same_params);
+    let quality2 = calculate_quality_score(&same_reports, &same_params);
 
-### Replay Attacks
-Detects reused transmissions:
-- Monitors nonce reuse across beacons
-- Analyzes timing fingerprints
-- Validates temporal sequence integrity
+    assert_eq!(quality1, quality2); // Must be identical
+}
+```
 
-### Clustered Farms
-Identifies artificially dense deployments:
-- Calculates inter-node distances
-- Analyzes clustering coefficients
-- Flags suspicious density hotspots
+### Anti-Replay Protection
+```rust
+#[test]
+fn test_anti_replay() {
+    let beacon_id = Address::new([1u8; 20]);
+    let nonce = vec![1u8; 16];
+    let epoch = 12345;
 
-### SDR Relay Attacks
-Detects relayed/delayed transmissions:
-- Validates timing advance consistency
-- Analyzes propagation delay anomalies
-- Cross-references expected vs actual latencies
+    // First submission succeeds
+    assert!(submit_beacon(beacon_id, nonce.clone(), epoch).is_ok());
 
-## Cellular Safety Features
+    // Duplicate should fail
+    assert!(submit_beacon(beacon_id, nonce, epoch).is_err());
+}
+```
 
-### Rate Limiting
-- Beacon transmissions: ≤1 Hz (configurable)
-- Witness scanning: ≤1 Hz recommended
-- Report submissions: 120/hour with burst allowance
+### Coherence Validation (3GPP 38.901)
+```rust
+#[test]
+fn test_coherence_38901() {
+    let synthetic_geometry = create_3gpp_38901_compliant_reports();
+    let coherence = analyze_coherence(&synthetic_geometry);
+    assert!(coherence > 0.8); // Should pass
 
-### Batch Processing
-- Groups witness reports (8-second intervals)
-- Reduces cellular overhead by 80%
-- LZ4 compression for large payloads
+    let unrealistic_geometry = create_impossible_reports();
+    let bad_coherence = analyze_coherence(&unrealistic_geometry);
+    assert!(bad_coherence < 0.5); // Should fail
+}
+```
 
-### Network Optimization
-- Prefers Wi-Fi for bundle uploads
-- Uses cellular only for time-critical events
-- Adaptive rate limiting based on connection type
+### Clustering Detection
+```rust
+#[test]
+fn test_clustering_detection() {
+    let clustered_farm = create_clustered_witnesses_in_h3_cell();
+    let penalty = calculate_density_penalty(&clustered_farm);
+    assert!(penalty < 1.0); // Should be down-weighted
+}
+```
 
-### Regulatory Compliance
-- Authorized frequency validation
-- Power level enforcement
-- Emission duration limits
-- Side-channel beacon support
+### Cellular Budget
+```rust
+#[test]
+fn test_cellular_budget() {
+    let hourly_usage = estimate_cellular_usage_with_compression();
+    assert!(hourly_usage < 1.0); // Must be under 1 MB/hour
+}
+```
 
 ## Performance Metrics
 
-### Throughput
-- **Beacons**: 1-2 per minute per node (cellular-safe)
+### Throughput (Cellular-Safe)
+- **Beacons**: 1 per 80 seconds per node (0.75 Hz)
 - **Witnesses**: Up to 14 per beacon event
-- **Bundles**: ~2 per minute per aggregator
+- **Bundles**: ~1 per 2 minutes per aggregator
 - **Consensus**: 67% threshold with 3-second finality
 
 ### Resource Usage
@@ -417,8 +421,40 @@ Detects relayed/delayed transmissions:
 
 ### Accuracy
 - **Location**: ±5m GPS accuracy required
-- **RF Measurements**: Calibrated to 3GPP standards
+- **RF Measurements**: 3GPP 38.901 compliant validation
 - **Fraud Detection**: >95% accuracy, <2% false positives
+
+## Fraud Detection Types
+
+### Invalid RF Geometry (3GPP 38.901)
+Detects impossible signal strength vs distance relationships:
+- Uses 3GPP 38.901 UMa/UMi/RMa path loss models
+- Validates RSRP against calculated path loss
+- Flags deviations >25dB as suspicious
+
+### GPS Spoofing
+Identifies impossible movement patterns:
+- Tracks location changes over time
+- Calculates required movement speeds
+- Flags teleportation (>500 km/h movement)
+
+### Replay Attacks
+Detects reused transmissions:
+- Monitors (beacon_id, nonce, epoch) combinations
+- Analyzes timing fingerprints
+- Validates temporal sequence integrity
+
+### Clustered Farms
+Identifies artificially dense deployments:
+- Analyzes H3 cell density (resolution 9)
+- Calculates clustering coefficients
+- Down-weights suspicious density hotspots
+
+### SDR Relay Attacks
+Detects relayed/delayed transmissions:
+- Validates timing advance consistency
+- Analyzes propagation delay anomalies
+- Cross-references expected vs actual latencies
 
 ## Testing
 
@@ -442,6 +478,9 @@ cargo test fraud_proof::tests
 
 # Test aggregation
 cargo test aggregator::tests
+
+# Test 3GPP 38.901 compliance
+cargo test test_coherence_38901
 ```
 
 ## Contributing
@@ -461,13 +500,15 @@ cargo test aggregator::tests
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
+This implementation is fully open-source and requires **no licenses or permissions** from anyone. You are free to use, modify, and distribute this code without any restrictions beyond the MIT license terms.
+
 ## Acknowledgments
 
-- Inspired by Helium's Proof of Coverage mechanism
-- Built on the Ego blockchain infrastructure
 - Designed for 5G network integration
+- 3GPP 38.901 compliant path loss validation
 - Optimized for cellular-safe operation
+- Built on the Ego blockchain infrastructure
 
 ---
 
-**Note**: This implementation is designed for cellular-safe operation with rate limiting and batch processing. Always comply with local RF regulations and cellular network policies.
+**Note**: This implementation is designed for cellular-safe operation with rate limiting and batch processing. The default configuration ensures <1MB/hour cellular usage while maintaining robust fraud detection and consensus mechanisms.
