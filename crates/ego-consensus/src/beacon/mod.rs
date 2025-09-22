@@ -4,11 +4,11 @@ pub mod node;
 pub use announcement::BeaconAnnouncement;
 pub use node::BeaconNode;
 
-use crate::config::BeaconConfig;
 use crate::error::PoCResult;
 use crate::types::*;
-use ego_core::{Address, Hash, Timestamp};
+use ego_core::{Address, Timestamp};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 
 pub trait Beacon: Send + Sync {
     fn beacon_id(&self) -> Address;
@@ -19,13 +19,15 @@ pub trait Beacon: Send + Sync {
 
     fn authorized_frequencies(&self) -> Vec<u32>;
 
-    async fn prepare_announcement(&mut self, challenge: Challenge)
-    -> PoCResult<BeaconAnnouncement>;
+    fn prepare_announcement(
+        &mut self,
+        challenge: Challenge,
+    ) -> impl Future<Output = PoCResult<BeaconAnnouncement>> + Send;
 
-    async fn transmit_beacon(
+    fn transmit_beacon(
         &mut self,
         announcement: &BeaconAnnouncement,
-    ) -> PoCResult<BeaconTxLog>;
+    ) -> impl Future<Output = PoCResult<BeaconTxLog>> + Send;
 
     fn get_tx_log(&self) -> Option<BeaconTxLog>;
 

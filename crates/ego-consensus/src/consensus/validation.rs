@@ -1,6 +1,5 @@
-use crate::error::{PoCError, PoCResult};
 use crate::types::*;
-use ego_core::{Address, Hash, Timestamp};
+use ego_core::Timestamp;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +125,62 @@ impl PoCValidator {
 
         Ok(())
     }
+
+    pub fn validate_geometry_coherence(
+        &self,
+        beacon_location: &LocationData,
+        witness_location: &LocationData,
+        rf_metrics: &RFMetrics,
+        tx_power_dbm: i16,
+    ) -> ValidationResult {
+        let distance_km = self.calculate_distance(beacon_location, witness_location);
+        let frequency_ghz = rf_metrics.frequency as f64 / 1_000_000.0;
+
+        let path_loss = if distance_km < 0.01 {
+            20.0 * distance_km.log10() + 20.0 * (frequency_ghz as f32).log10() + 32.44
+        } else {
+            let fc = (frequency_ghz * 1000.0) as f32;
+            let d3d = (distance_km * 1000.0) as f32;
+            let h_bs = 25.0_f32;
+            let h_ut = 1.5_f32;
+
+            let pl_los = 28.0 + 22.0 * d3d.log10() + 20.0 * fc.log10();
+            let pl_nlos = 13.54 + 39.08 * d3d.log10() + 20.0 * fc.log10() - 0.6 * (h_ut - 1.5);
+
+            pl_los.max(pl_nlos)
+        };
+
+        let expected_rsrp = tx_power_dbm as f32 - path_loss;
+        let actual_rsrp = rf_metrics.rsrp as f32;
+        let error = (expected_rsrp - actual_rsrp).abs();
+
+        if error > self.config.rf_validation.path_loss_tolerance_db {
+            return Err(ValidationError {
+                error_type: ValidationErrorType::GeometryInconsistent,
+                message: format!(
+                    "Path loss error {} dB exceeds tolerance for distance {} km",
+                    error, distance_km
+                ),
+                field: Some("geometry".to_string()),
+                severity: ValidationSeverity::Error,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn calculate_distance(&self, loc1: &LocationData, loc2: &LocationData) -> f32 {
+        let lat1 = loc1.latitude.to_radians();
+        let lat2 = loc2.latitude.to_radians();
+        let delta_lat = (loc2.latitude - loc1.latitude).to_radians();
+        let delta_lon = (loc2.longitude - loc1.longitude).to_radians();
+
+        let a = (delta_lat / 2.0).sin().powi(2)
+            + lat1.cos() * lat2.cos() * (delta_lon / 2.0).sin().powi(2);
+        let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+
+        6371.0 * c as f32
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,7 +258,7 @@ impl Default for GeoValidationConfig {
             min_distance_m: 100.0,
             gps_accuracy_threshold_m: 10.0,
             enable_h3_validation: true,
-            h3_resolution: 7,
+            h3_resolution: 9,
             neighbor_ring_count: 2,
         }
     }
@@ -242,7 +297,7 @@ mod tests {
         assert!(validator.validate_rf_metrics(&valid_metrics).is_ok());
 
         let invalid_metrics = RFMetrics {
-            rsrp: -200, // Invalid
+            rsrp: -200,
             rsrq: -10,
             sinr: 15,
             timing_advance: 100,
@@ -265,7 +320,7 @@ mod tests {
             altitude: Some(10.0),
             accuracy: Some(5.0),
             timestamp: Timestamp::now().as_millis(),
-            h3_index: "87283472bffffff".to_string(),
+            h3_index: "872834720ffffff".to_string(),
         };
 
         assert!(validator.validate_location(&valid_location).is_ok());
@@ -276,9 +331,49 @@ mod tests {
             altitude: Some(10.0),
             accuracy: Some(5.0),
             timestamp: Timestamp::now().as_millis(),
-            h3_index: "87283472bffffff".to_string(),
+            h3_index: "872834720ffffff".to_string(),
         };
 
         assert!(validator.validate_location(&invalid_location).is_err());
+    }
+
+    #[test]
+    fn test_geometry_coherence_validation() {
+        let validator = PoCValidator::new(ValidationConfig::default());
+
+        let beacon_location = LocationData {
+            latitude: 37.7749,
+            longitude: -122.4194,
+            altitude: Some(10.0),
+            accuracy: Some(5.0),
+            timestamp: Timestamp::now().as_millis(),
+            h3_index: "872834720ffffff".to_string(),
+        };
+
+        let witness_location = LocationData {
+            latitude: 37.7849,
+            longitude: -122.4094,
+            altitude: Some(10.0),
+            accuracy: Some(5.0),
+            timestamp: Timestamp::now().as_millis(),
+            h3_index: "872834720ffffff".to_string(),
+        };
+
+        let rf_metrics = RFMetrics {
+            rsrp: -85,
+            rsrq: -10,
+            sinr: 15,
+            timing_advance: 100,
+            pci: 1,
+            beam_index: Some(0),
+            frequency: 3500,
+            rx_timestamp: Timestamp::now().as_millis(),
+        };
+
+        assert!(
+            validator
+                .validate_geometry_coherence(&beacon_location, &witness_location, &rf_metrics, 23)
+                .is_ok()
+        );
     }
 }

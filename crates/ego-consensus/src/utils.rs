@@ -1,7 +1,6 @@
 use crate::error::{PoCError, PoCResult};
 use crate::types::*;
-use ego_core::{Hash, Timestamp};
-use std::collections::HashMap;
+use ego_core::Timestamp;
 
 pub mod h3 {
     use super::*;
@@ -11,7 +10,7 @@ pub mod h3 {
             return Err(PoCError::H3Error("Empty H3 index".to_string()));
         }
 
-        if h3_index.len() < 8 || h3_index.len() > 15 {
+        if h3_index.len() < 8 || h3_index.len() > 18 {
             return Err(PoCError::H3Error(format!(
                 "Invalid H3 index length: {}",
                 h3_index
@@ -43,6 +42,7 @@ pub mod h3 {
             10..=11 => 6,
             12..=13 => 7,
             14..=15 => 8,
+            16..=18 => 9,
             _ => 0,
         }
     }
@@ -102,27 +102,28 @@ pub mod rf {
         Ok(())
     }
 
-    pub fn calculate_path_loss(
+    pub fn calculate_path_loss_38901(
         distance_km: f32,
         frequency_ghz: f32,
         environment: Environment,
     ) -> f32 {
+        let d = distance_km * 1000.0;
+        let fc = frequency_ghz * 1000.0;
+
         match environment {
-            Environment::FreeSpace => {
-                20.0 * distance_km.log10() + 20.0 * frequency_ghz.log10() + 32.44
+            Environment::UrbanMacro => {
+                let h_bs = 25.0;
+                let h_ut = 1.5;
+
+                if d < 10.0 {
+                    32.4 + 20.0 * d.log10() + 20.0 * fc.log10()
+                } else {
+                    13.54 + 39.08 * d.log10() + 20.0 * fc.log10() - 0.6 * (h_ut - 1.5)
+                }
             }
-            Environment::Urban => {
-                let fspl = 20.0 * distance_km.log10() + 20.0 * frequency_ghz.log10() + 32.44;
-                fspl + 10.0
-            }
-            Environment::Suburban => {
-                let fspl = 20.0 * distance_km.log10() + 20.0 * frequency_ghz.log10() + 32.44;
-                fspl + 5.0
-            }
-            Environment::Rural => {
-                let fspl = 20.0 * distance_km.log10() + 20.0 * frequency_ghz.log10() + 32.44;
-                fspl + 2.0
-            }
+            Environment::UrbanMicro => 32.4 + 21.0 * d.log10() + 20.0 * fc.log10(),
+            Environment::Rural => 32.4 + 30.0 * d.log10() + 20.0 * fc.log10(),
+            Environment::Indoor => 32.4 + 17.3 * d.log10() + 20.0 * fc.log10(),
         }
     }
 
@@ -132,16 +133,16 @@ pub mod rf {
         frequency_ghz: f32,
         environment: Environment,
     ) -> f32 {
-        let path_loss = calculate_path_loss(distance_km, frequency_ghz, environment);
+        let path_loss = calculate_path_loss_38901(distance_km, frequency_ghz, environment);
         tx_power_dbm as f32 - path_loss
     }
 
     #[derive(Debug, Clone)]
     pub enum Environment {
-        FreeSpace,
-        Urban,
-        Suburban,
+        UrbanMacro,
+        UrbanMicro,
         Rural,
+        Indoor,
     }
 }
 
@@ -249,14 +250,22 @@ pub mod compression {
     pub fn should_compress(data_size: usize, threshold: usize) -> bool {
         data_size >= threshold
     }
+
+    pub fn estimate_cellular_usage_mb_per_hour(
+        reports_per_hour: u32,
+        avg_report_size: usize,
+        compression_ratio: f32,
+    ) -> f32 {
+        let total_bytes = reports_per_hour as f32 * avg_report_size as f32 * compression_ratio;
+        total_bytes / 1_048_576.0
+    }
 }
 
 pub mod fraud {
-    use super::*;
     use crate::beacon::BeaconAnnouncement;
     use crate::witness::WitnessReport;
 
-    pub fn analyze_witness_coherence(
+    pub fn analyze_witness_coherence_38901(
         reports: &[WitnessReport],
         beacon: &BeaconAnnouncement,
     ) -> f64 {
@@ -267,14 +276,17 @@ pub mod fraud {
         let mut coherence_scores = Vec::new();
 
         for report in reports {
-            let score = calculate_individual_coherence(report, beacon);
+            let score = calculate_individual_coherence_38901(report, beacon);
             coherence_scores.push(score);
         }
 
         coherence_scores.iter().sum::<f64>() / coherence_scores.len() as f64
     }
 
-    fn calculate_individual_coherence(report: &WitnessReport, beacon: &BeaconAnnouncement) -> f64 {
+    fn calculate_individual_coherence_38901(
+        report: &WitnessReport,
+        beacon: &BeaconAnnouncement,
+    ) -> f64 {
         let mut score: f64 = 1.0;
 
         let distance_km = super::geo::haversine_distance(
@@ -288,7 +300,7 @@ pub mod fraud {
             beacon.tx_params.tx_power_dbm,
             distance_km,
             beacon.tx_params.frequency as f32 / 1_000_000.0,
-            super::rf::Environment::Suburban,
+            super::rf::Environment::UrbanMacro,
         );
 
         let rsrp_error = (expected_rsrp - report.rf_metrics.rsrp as f32).abs();
@@ -313,33 +325,33 @@ pub mod fraud {
         score.max(0.0).min(1.0)
     }
 
-    pub fn detect_clustering(reports: &[WitnessReport]) -> bool {
+    pub fn detect_clustering_enhanced(reports: &[WitnessReport], max_density_per_km2: f32) -> bool {
         if reports.len() < 3 {
             return false;
         }
 
-        let mut close_pairs = 0;
-        let total_pairs = reports.len() * (reports.len() - 1) / 2;
+        let mut density_areas: std::collections::HashMap<(i32, i32), u32> =
+            std::collections::HashMap::new();
 
-        for i in 0..reports.len() {
-            for j in i + 1..reports.len() {
-                let distance = super::geo::haversine_distance(
-                    reports[i].witness_location.latitude,
-                    reports[i].witness_location.longitude,
-                    reports[j].witness_location.latitude,
-                    reports[j].witness_location.longitude,
-                );
+        for report in reports {
+            let grid_x = (report.witness_location.latitude * 111.0) as i32;
+            let grid_y = (report.witness_location.longitude
+                * 111.0
+                * report.witness_location.latitude.cos()) as i32;
 
-                if distance < 0.1 {
-                    close_pairs += 1;
-                }
-            }
+            let count = density_areas.entry((grid_x, grid_y)).or_insert(0);
+            *count += 1;
         }
 
-        (close_pairs as f32 / total_pairs as f32) > 0.5
+        density_areas
+            .values()
+            .any(|&count| count as f32 > max_density_per_km2)
     }
 
-    pub fn check_impossible_geometry(report: &WitnessReport, beacon: &BeaconAnnouncement) -> bool {
+    pub fn check_impossible_geometry_38901(
+        report: &WitnessReport,
+        beacon: &BeaconAnnouncement,
+    ) -> bool {
         let distance_km = super::geo::haversine_distance(
             report.witness_location.latitude,
             report.witness_location.longitude,
@@ -347,21 +359,21 @@ pub mod fraud {
             beacon.location.longitude,
         );
 
-        if distance_km > 10.0 && report.rf_metrics.rsrp > -50 {
-            return true;
-        }
+        let expected_rsrp = super::rf::estimate_received_power(
+            beacon.tx_params.tx_power_dbm,
+            distance_km,
+            beacon.tx_params.frequency as f32 / 1_000_000.0,
+            super::rf::Environment::UrbanMacro,
+        );
 
-        if distance_km < 1.0 && report.rf_metrics.rsrp < -120 {
-            return true;
-        }
+        let rsrp_error = (expected_rsrp - report.rf_metrics.rsrp as f32).abs();
 
-        false
+        rsrp_error > 25.0
     }
 }
 
 pub mod stats {
-    use super::*;
-
+    /// Calculate mean deterministically
     pub fn mean(values: &[f64]) -> f64 {
         if values.is_empty() {
             0.0
@@ -435,7 +447,7 @@ mod tests {
 
     #[test]
     fn test_h3_validation() {
-        assert!(h3::validate_h3_index("87283472bffffff", Some(7)).is_ok());
+        assert!(h3::validate_h3_index("872834720ffffff", Some(9)).is_ok());
         assert!(h3::validate_h3_index("", None).is_err());
         assert!(h3::validate_h3_index("invalid", None).is_err());
     }
@@ -464,8 +476,8 @@ mod tests {
     }
 
     #[test]
-    fn test_path_loss_calculation() {
-        let path_loss = rf::calculate_path_loss(1.0, 3.5, rf::Environment::FreeSpace);
+    fn test_path_loss_38901() {
+        let path_loss = rf::calculate_path_loss_38901(1.0, 3.5, rf::Environment::UrbanMacro);
         assert!(path_loss > 0.0);
         assert!(path_loss < 200.0);
     }
@@ -492,6 +504,12 @@ mod tests {
 
         let decompressed = compression::decompress_lz4(&compressed, data.len()).unwrap();
         assert_eq!(data, decompressed);
+    }
+
+    #[test]
+    fn test_cellular_usage_estimation() {
+        let usage_mb = compression::estimate_cellular_usage_mb_per_hour(120, 500, 0.6);
+        assert!(usage_mb < 1.0);
     }
 
     #[test]

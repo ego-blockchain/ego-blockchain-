@@ -5,11 +5,11 @@ pub use node::WitnessNode;
 pub use report::WitnessReport;
 
 use crate::beacon::BeaconAnnouncement;
-use crate::config::WitnessConfig;
 use crate::error::PoCResult;
 use crate::types::*;
 use ego_core::{Address, Timestamp};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 
 pub trait Witness: Send + Sync {
     fn witness_id(&self) -> Address;
@@ -18,7 +18,10 @@ pub trait Witness: Send + Sync {
 
     fn scanning_frequencies(&self) -> Vec<u32>;
 
-    async fn process_beacon(&mut self, beacon: DetectedBeacon) -> PoCResult<Option<WitnessReport>>;
+    fn process_beacon(
+        &mut self,
+        beacon: DetectedBeacon,
+    ) -> impl Future<Output = PoCResult<Option<WitnessReport>>> + Send;
 
     fn get_pending_reports(&self) -> Vec<WitnessReport>;
 

@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoCConsensusConfig {
@@ -40,6 +39,7 @@ pub struct AggregatorConfig {
     pub witness_collection_window_ms: u64,
     pub compression_threshold_bytes: usize,
     pub daily_anchor_interval_hours: u64,
+    pub co_beacon_min_fraction: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,12 +181,13 @@ impl Default for WitnessConfig {
 impl Default for AggregatorConfig {
     fn default() -> Self {
         Self {
-            coverage_h3_resolution: 7,
-            min_witnesses: 1,
+            coverage_h3_resolution: 9,
+            min_witnesses: 3,
             max_witnesses: 14,
-            witness_collection_window_ms: 30_000,
+            witness_collection_window_ms: 10_000,
             compression_threshold_bytes: 1024,
             daily_anchor_interval_hours: 24,
+            co_beacon_min_fraction: 0.5,
         }
     }
 }
@@ -226,7 +227,7 @@ impl Default for GeoValidationConfig {
             min_distance_m: 100.0,
             gps_accuracy_threshold_m: 10.0,
             enable_h3_validation: true,
-            h3_resolution: 7,
+            h3_resolution: 9,
             neighbor_ring_count: 2,
         }
     }
@@ -279,7 +280,7 @@ impl Default for RateLimits {
     fn default() -> Self {
         Self {
             beacon_announcements_per_hour: 120,
-            witness_reports_per_hour: 1800,
+            witness_reports_per_hour: 120,
             aggregator_bundles_per_hour: 60,
             burst_allowance: 10,
         }

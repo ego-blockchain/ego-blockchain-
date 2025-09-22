@@ -5,25 +5,36 @@ pub use bundle::{PoCBundle, PoCEvent};
 pub use node::AggregatorNode;
 
 use crate::beacon::BeaconAnnouncement;
-use crate::config::AggregatorConfig;
 use crate::error::PoCResult;
 use crate::types::*;
 use crate::witness::WitnessReport;
 use ego_core::{Address, Hash, Timestamp};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 
 pub trait Aggregator: Send + Sync {
     fn aggregator_id(&self) -> Address;
     fn is_active(&self) -> bool;
     fn coverage_region(&self) -> Vec<String>;
-    async fn process_beacon_announcement(
+
+    fn process_beacon_announcement(
         &mut self,
         announcement: BeaconAnnouncement,
-    ) -> PoCResult<()>;
-    async fn process_witness_report(&mut self, report: WitnessReport) -> PoCResult<()>;
-    async fn create_poc_bundle(&mut self, beacon_hash: Hash) -> PoCResult<Option<PoCBundle>>;
-    async fn submit_poc_event(&mut self, event: PoCEvent) -> PoCResult<()>;
-    async fn generate_daily_anchor(&mut self) -> PoCResult<Hash>;
+    ) -> impl Future<Output = PoCResult<()>> + Send;
+
+    fn process_witness_report(
+        &mut self,
+        report: WitnessReport,
+    ) -> impl Future<Output = PoCResult<()>> + Send;
+
+    fn create_poc_bundle(
+        &mut self,
+        beacon_hash: Hash,
+    ) -> impl Future<Output = PoCResult<Option<PoCBundle>>> + Send;
+
+    fn submit_poc_event(&mut self, event: PoCEvent) -> impl Future<Output = PoCResult<()>> + Send;
+
+    fn generate_daily_anchor(&mut self) -> impl Future<Output = PoCResult<Hash>> + Send;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,10 +112,11 @@ pub struct WitnessSet {
     pub is_complete: bool,
     pub coherence_score: Option<f64>,
     pub coverage_quality: Option<CoverageQuality>,
+    pub epoch: u64,
 }
 
 impl WitnessSet {
-    pub fn new(announcement: BeaconAnnouncement, collection_window_ms: u64) -> Self {
+    pub fn new(announcement: BeaconAnnouncement, collection_window_ms: u64, epoch: u64) -> Self {
         let beacon_hash = Hash::new({
             let sig_bytes = announcement.signature.as_bytes();
             let mut hash_bytes = [0u8; 32];
@@ -122,6 +134,7 @@ impl WitnessSet {
             is_complete: false,
             coherence_score: None,
             coverage_quality: None,
+            epoch,
         }
     }
 
@@ -149,6 +162,21 @@ impl WitnessSet {
     pub fn witness_count(&self) -> usize {
         self.witness_reports.len()
     }
+
+    pub fn has_sufficient_co_beacon_coverage(&self) -> bool {
+        let co_beacon_count = self
+            .witness_reports
+            .iter()
+            .filter(|r| r.co_beacon_verification.is_some())
+            .count();
+
+        let total_reports = self.witness_reports.len();
+        if total_reports == 0 {
+            return false;
+        }
+
+        (co_beacon_count as f64 / total_reports as f64) >= crate::CO_BEACON_MIN_FRACTION
+    }
 }
 
 #[cfg(test)]
@@ -167,5 +195,41 @@ mod tests {
         let metrics = AggregatorMetrics::default();
         assert_eq!(metrics.total_beacon_announcements, 0);
         assert_eq!(metrics.fraud_reports_generated, 0);
+    }
+
+    #[test]
+    fn test_witness_set_co_beacon_coverage() {
+        use crate::beacon::BeaconAnnouncement;
+        use crate::beacon::announcement::BeaconTxParams;
+        use crate::types::{Challenge, LocationData};
+
+        let challenge = Challenge {
+            challenge_hash: Hash::new([1u8; 32]),
+            h3_cell: "872834720ffffff".to_string(),
+            nonce: vec![2u8; 16],
+            timestamp: Timestamp::now(),
+            difficulty: 1,
+            reward_scale: 1.0,
+        };
+
+        let location = LocationData {
+            latitude: 37.7749,
+            longitude: -122.4194,
+            altitude: Some(10.0),
+            accuracy: Some(5.0),
+            timestamp: Timestamp::now().as_millis(),
+            h3_index: "872834720ffffff".to_string(),
+        };
+
+        let announcement = BeaconAnnouncement::new(
+            Address::new([1u8; 20]),
+            challenge,
+            location,
+            BeaconTxParams::default(),
+        );
+
+        let mut witness_set = WitnessSet::new(announcement, 10_000, 1);
+
+        assert!(!witness_set.has_sufficient_co_beacon_coverage());
     }
 }
