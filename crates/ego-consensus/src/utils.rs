@@ -373,7 +373,6 @@ pub mod fraud {
 }
 
 pub mod stats {
-    /// Calculate mean deterministically
     pub fn mean(values: &[f64]) -> f64 {
         if values.is_empty() {
             0.0
