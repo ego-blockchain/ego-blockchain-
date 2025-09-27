@@ -1,0 +1,22 @@
+[node]
+type = "full"
+port = 9000
+interactive = false
+
+[network]
+max_peers = 200
+enable_mdns = true
+enable_autonat = true
+
+[storage]
+capacity_gb = 100
+
+[bandwidth]
+capacity_mbps = 100
+sharing_enabled = false
+
+[optimization]
+enable_compression = true
+enable_auto_switching = true
+cost_threshold_usd = 100.0
+data_threshold_gb = 40.0
