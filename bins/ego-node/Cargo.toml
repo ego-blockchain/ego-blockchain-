@@ -7,6 +7,8 @@ authors.workspace = true
 
 [dependencies]
 ego-core = { path = "../../crates/ego-core" }
+ego-rollup = { path = "../../crates/ego-rollup" }
+ego-consensus = { path = "../../crates/ego-consensus" }
 
 anyhow.workspace = true
 chrono = { version = "0.4.41", features = ["serde"] }

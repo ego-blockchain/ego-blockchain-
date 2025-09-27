@@ -616,12 +616,10 @@ mod tests {
     fn test_key_derivation() {
         let mut keystore = SecureKeystore::new();
         let derived = keystore.derive_keypair("test", None).unwrap();
+        let derived_pubkey = derived.public_key().as_bytes().to_vec();
 
         let derived2 = keystore.get_derived_keypair("test").unwrap();
-        assert_eq!(
-            derived.public_key().as_bytes(),
-            derived2.public_key().as_bytes()
-        );
+        assert_eq!(derived_pubkey, derived2.public_key().as_bytes());
     }
 
     #[test]

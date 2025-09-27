@@ -188,7 +188,6 @@ impl BeaconNode {
         {
             let mut recent = self.recent_transmissions.write().unwrap();
 
-            // Clean old entries
             let cutoff = Timestamp::now().as_millis().saturating_sub(3_600_000);
             recent.retain(|_, timestamp| timestamp.as_millis() > cutoff);
 
