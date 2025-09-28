@@ -13,6 +13,7 @@ use std::fmt;
     bincode::Encode,
     bincode::Decode,
 )]
+<<<<<<< HEAD
 pub enum AlgorithmId {
     Ed25519 = 1,
     MlDsa2 = 2,
@@ -56,6 +57,8 @@ impl AlgorithmId {
     bincode::Encode,
     bincode::Decode,
 )]
+=======
+>>>>>>> cbfb2ff9702b4b16642dd1b7db7e4ce4f8ec0048
 pub struct Hash([u8; 32]);
 
 impl Hash {
@@ -102,6 +105,7 @@ impl From<[u8; 32]> for Hash {
     }
 }
 
+<<<<<<< HEAD
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, bincode::Encode, bincode::Decode)]
 pub struct PublicKey {
     pub algorithm: AlgorithmId,
@@ -231,11 +235,51 @@ impl PublicKey {
         } else {
             None
         }
+=======
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    bincode::Encode,
+    bincode::Decode,
+)]
+pub struct PublicKey([u8; 32]);
+
+impl PublicKey {
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.0.to_vec()
+    }
+
+    pub fn from_slice(slice: &[u8]) -> Result<Self, crate::EgoError> {
+        if slice.len() != 32 {
+            return Err(crate::EgoError::CryptoError(format!(
+                "Invalid public key length: expected 32, got {}",
+                slice.len()
+            )));
+        }
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(slice);
+        Ok(Self(bytes))
+>>>>>>> cbfb2ff9702b4b16642dd1b7db7e4ce4f8ec0048
     }
 }
 
 impl fmt::Display for PublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+<<<<<<< HEAD
         write!(
             f,
             "{:?}:{}",
@@ -379,6 +423,79 @@ impl SessionRecord {
             nonce,
             aead_tag,
         }
+=======
+        write!(f, "{}", hex::encode(self.0))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bincode::Encode, bincode::Decode)]
+pub struct Signature([u8; 64]);
+
+impl Signature {
+    pub fn new(bytes: [u8; 64]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 64] {
+        &self.0
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.0.to_vec()
+    }
+
+    pub fn from_slice(slice: &[u8]) -> Result<Self, crate::EgoError> {
+        if slice.len() != 64 {
+            return Err(crate::EgoError::CryptoError(format!(
+                "Invalid signature length: expected 64, got {}",
+                slice.len()
+            )));
+        }
+        let mut bytes = [0u8; 64];
+        bytes.copy_from_slice(slice);
+        Ok(Self(bytes))
+    }
+}
+
+impl serde::Serialize for Signature {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Signature {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SignatureVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for SignatureVisitor {
+            type Value = Signature;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("64 bytes")
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v.len() == 64 {
+                    let mut bytes = [0u8; 64];
+                    bytes.copy_from_slice(v);
+                    Ok(Signature(bytes))
+                } else {
+                    Err(E::invalid_length(v.len(), &self))
+                }
+            }
+        }
+
+        deserializer.deserialize_bytes(SignatureVisitor)
+>>>>>>> cbfb2ff9702b4b16642dd1b7db7e4ce4f8ec0048
     }
 }
 
@@ -410,7 +527,11 @@ impl Address {
     }
 
     pub fn from_public_key(pubkey: &PublicKey) -> Self {
+<<<<<<< HEAD
         let hash = blake3::hash(&pubkey.to_vec());
+=======
+        let hash = blake3::hash(pubkey.as_bytes());
+>>>>>>> cbfb2ff9702b4b16642dd1b7db7e4ce4f8ec0048
         let mut bytes = [0u8; 20];
         bytes.copy_from_slice(&hash.as_bytes()[..20]);
         Self(bytes)
@@ -767,6 +888,10 @@ impl From<&str> for SliceId {
     }
 }
 
+<<<<<<< HEAD
+=======
+// Additional types for better node integration
+>>>>>>> cbfb2ff9702b4b16642dd1b7db7e4ce4f8ec0048
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PeerId(pub String);
 
