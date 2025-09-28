@@ -618,8 +618,6 @@ This project is licensed under the MIT License. This implementation is fully ope
 ## Acknowledgments
 
 - **Proof of Coverage**: 5G network integration with 3GPP 38.901 compliance
-- **Proof of Replication**: Filecoin-inspired storage proving with GPU acceleration
-- **Proof of SpaceTime**: Chia-inspired spacetime consensus with deterministic windows
 - **Integration**: Seamless multi-consensus coordination with shared security model
 
 This implementation provides a complete, production-ready consensus framework for decentralized storage and coverage networks with comprehensive fraud detection, automated repair, and operational monitoring.
