@@ -1,0 +1,12 @@
+{application,erl_bridge,
+             [{description,"An OTP application"},
+              {vsn,"0.1.0"},
+              {registered,[]},
+              {mod,{erl_bridge_app,[]}},
+              {applications,[kernel,stdlib]},
+              {env,[]},
+              {modules,[complete_demo,erl_bridge_app,erl_bridge_sup,
+                        sbft_consensus_manager,sbft_cross_shard,sbft_helper,
+                        sbft_shard_consensus,sbft_validator_manager]},
+              {licenses,["Apache-2.0"]},
+              {links,[]}]}.

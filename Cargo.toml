@@ -3,6 +3,7 @@ members = [
   "crates/ego-core",
   "crates/ego-p2p",
   "crates/ego-consensus",
+  "crates/ego-rollup",
   "crates/ego-ffi",
   "bins/ego-node",
 ]

@@ -1,38 +1,52 @@
-# Ego Blockchain Node
+# Ego Blockchain Node 🚀
 
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](https://github.com/ego-blockchain/ego-node)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+[![5G Ready](https://img.shields.io/badge/5G-Ready-green.svg)](#5g-features)
 
-A high-performance, 5G-enabled blockchain node implementation for the Ego distributed network. Built with Rust and libp2p, featuring advanced sharding, proof-of-coverage (PoC), proof-of-spacetime (PoST), and seamless 5G network integration.
+**Ego Blockchain Node** - Next-generation decentralized network node with advanced 5G optimization, intelligent cost management, and bandwidth monetization capabilities.
 
-## 🌟 Features
+## ✨ Features
 
-### Core Blockchain Features
-- **Multi-Shard Support**: Participate in multiple blockchain shards simultaneously
-- **Role-Based Architecture**: Flexible node roles (Validator, Storage, Gateway, Relay, Witness, Seed, Indexer)
-- **Advanced Consensus**: Cross-shard validation and finality commitment
-- **Distributed Storage**: Erasure coding with replica management and automated repair
+### 🌐 Core Blockchain Capabilities
+- **Multi-Role Support**: Validator, Storage, Gateway, Relay, Witness, Seed, Indexer
+- **Cross-Shard Operations**: Participate in multiple blockchain shards simultaneously
 - **Proof Systems**: Proof-of-Coverage (PoC) and Proof-of-Spacetime (PoST)
+- **State Management**: Complete blockchain state with account management
+- **Transaction Processing**: Full transaction validation and execution
 
-### 5G Network Integration
-- **Network Slice Support**: Configure nodes for specific 5G network slices
-- **Geolocation Awareness**: H3-based geographical indexing and coverage proofs
-- **Edge Computing**: Optimized for 5G edge deployments
-- **High-Bandwidth Operations**: Support for 100+ Mbps network requirements
+### 📡 5G & Network Optimization
+- **5G Network Slicing**: Native support for 5G network slices with dedicated bandwidth
+- **Intelligent Network Switching**: Automatic switching between WiFi, 5G, Ethernet, and 4G
+- **Cost Optimization**: Real-time monitoring of data usage and costs with configurable thresholds
+- **Geolocation Integration**: H3-based geohashing for location-aware operations
+- **Off-Peak Optimization**: Smart scheduling for cost-effective operations
 
-### Networking & Discovery
-- **Peer-to-Peer Networking**: Built on libp2p with gossipsub, Kademlia DHT, and mDNS
-- **Auto-NAT Traversal**: Automatic NAT detection and traversal
-- **Bootstrap Support**: Connect to existing network via bootstrap peers
-- **Resource Management**: Configurable peer and topic limits
+### 💰 Bandwidth Monetization
+- **Bandwidth Sharing**: Earn EGOC tokens by sharing unused bandwidth
+- **Tiered Pricing**: Multiple bandwidth sharing tiers (Basic, Standard, Premium)
+- **Usage Limits**: Configurable daily and monthly data limits
+- **Real-time Monitoring**: Live tracking of earnings and data usage
+
+### ⚡ Data Optimization
+- **Advanced Compression**: Gzip, Zstd, and LZ4 compression algorithms
+- **Batch Processing**: Intelligent batching of operations to reduce network overhead
+- **Scheduled Operations**: Off-peak scheduling for heavy operations
+- **Bandwidth Savings**: Significant reduction in data usage through optimization
+
+### 🔒 Security & Privacy
+- **Secure Keystore**: Hardware-backed key management with account binding
+- **Cryptographic Proofs**: Ed25519 signatures for all operations
+- **Peer-to-Peer Security**: Noise protocol encryption for all network communications
+- **Account Binding**: Secure linking of on-chain accounts to node identity
 
 ## 🚀 Quick Start
 
 ### Prerequisites
-
-- **Rust 1.70+**: Install from [rustup.rs](https://rustup.rs/)
-- **Git**: For cloning the repository
+- Rust 1.70+
+- At least 4GB RAM
+- Stable internet connection (WiFi/Ethernet/5G)
+- Storage space (varies by node type)
 
 ### Installation
 
@@ -44,396 +58,369 @@ cd ego-node
 # Build the project
 cargo build --release
 
-# Or run directly in development mode
-cargo run -- --help
+# Run a full node
+./target/release/ego-node --type full --port 9000 --interactive
 ```
 
-### Basic Usage
+### Quick Examples
 
+#### 🏛️ Run a Validator Node
 ```bash
-# Run a full node with interactive mode
-cargo run -- --type full --shards 0,1,2 --interactive
-
-# Run a validator node for specific shards
-cargo run -- --type validator --shards 0,1,2 --port 9000
-
-# Run a storage miner with high capacity
-cargo run -- --type storage --storage 500 --lat 37.7749 --lon -122.4194
-
-# Run a 5G edge gateway
-cargo run -- --type gateway --slice-id "slice-001" --lat 40.7128 --lon -74.0060 --bandwidth 1000
+ego-node --type validator --shards 0,1,2 --port 9000 --interactive
 ```
 
-## 📖 Node Types
-
-### Validator Node
-Validates transactions and participates in consensus.
-
+#### 💾 Run a Storage Node
 ```bash
-# Basic validator
-cargo run -- --type validator --shards 0,1,2
-
-# Validator with metrics
-cargo run -- --type validator --shards 0,1,2 --metrics --interactive
+ego-node --type storage --storage 500 --lat 40.7128 --lon -74.0060 --enable-sharing
 ```
 
-**Capabilities**: Block validation, consensus participation, cross-shard validation
-
-### Storage Node
-Provides distributed storage with proof-of-spacetime.
-
+#### 🌐 Run a 5G Gateway
 ```bash
-# Storage miner with 1TB capacity
-cargo run -- --type storage --storage 1000 --lat 34.0522 --lon -118.2437
-
-# Storage node with specific geolocation
-cargo run -- --type storage --storage 500 --lat 51.5074 --lon -0.1278 --interactive
+ego-node --type gateway --slice-id "emergency-services" --lat 40.7128 --lon -74.0060 --bandwidth 1000
 ```
 
-**Capabilities**: Data storage, proof-of-spacetime, erasure coding, beacon reporting
-
-### Gateway Node
-API gateway with 5G network slice integration.
-
+#### 🌱 Run a Seed Node
 ```bash
-# 5G edge gateway
-cargo run -- --type gateway \
-  --slice-id "urllc-slice" \
-  --lat 35.6762 --lon 139.6503 \
-  --bandwidth 2000 \
-  --port 8080
-
-# Gateway with bootstrap peers
-cargo run -- --type gateway \
-  --bootstrap "/ip4/203.0.113.1/tcp/9000,/ip4/203.0.113.2/tcp/9000" \
-  --interactive
+ego-node --type seed --port 8000 --sharing-bandwidth 200 --sharing-limit 5000
 ```
 
-**Capabilities**: API gateway, HTTP interface, rate limiting, packet routing, network relay, proof-of-coverage
+## 📋 Node Types
 
-### Full Node
-Combines validator, storage, and relay capabilities.
+| Type | Description | Primary Roles | Use Case |
+|------|-------------|---------------|----------|
+| **Full** | Complete blockchain node | Validator, Storage, Relay, Witness | General purpose, home users |
+| **Validator** | Block validation and consensus | Validator, Relay | High-performance servers |
+| **Storage** | Data storage and retrieval | Storage, Witness | Storage providers |
+| **Gateway** | 5G edge computing | Gateway, Witness, Relay | 5G infrastructure |
+| **Seed** | Network bootstrapping | Seed, Relay | Network infrastructure |
+| **Indexer** | Data indexing and search | Indexer, Storage | Analytics and search |
 
+## ⚙️ Configuration
+
+### Command Line Options
+
+#### Basic Configuration
 ```bash
-# Full node with comprehensive setup
-cargo run -- --type full \
+--type <NODE_TYPE>           # Node type: validator, storage, gateway, full, seed, indexer
+--port <PORT>                # P2P listen port (default: 9000)
+--shards <SHARD_IDS>         # Comma-separated shard IDs (default: 0,1,2)
+--storage <GB>               # Storage capacity in GB (default: 100)
+--bandwidth <MBPS>           # Bandwidth capacity in Mbps (default: 500)
+```
+
+#### 5G & Location
+```bash
+--slice-id <SLICE_ID>        # 5G network slice identifier
+--lat <LATITUDE>             # Node latitude for geolocation
+--lon <LONGITUDE>            # Node longitude for geolocation
+```
+
+#### Bandwidth Sharing
+```bash
+--enable-sharing             # Enable bandwidth sharing to earn EGOC
+--sharing-bandwidth <MBPS>   # Max bandwidth to share (default: 50)
+--sharing-limit <MB>         # Daily data sharing limit (default: 1000)
+```
+
+#### Cost Optimization
+```bash
+--cost-threshold <USD>       # Monthly cost threshold (default: $100)
+--data-threshold <GB>        # Monthly data threshold (default: 40GB)
+--disable-compression        # Disable data compression
+--disable-auto-switch        # Disable automatic network switching
+```
+
+#### Networking
+```bash
+--bootstrap <PEERS>          # Bootstrap peer addresses (comma-separated)
+--max-peers <COUNT>          # Maximum number of peers (default: 200)
+--disable-mdns               # Disable mDNS local discovery
+--disable-autonat            # Disable AutoNAT
+```
+
+### Example Configurations
+
+#### High-Performance Validator
+```bash
+ego-node \
+  --type validator \
   --shards 0,1,2,3 \
-  --storage 250 \
-  --bandwidth 500 \
   --port 9000 \
-  --metrics \
-  --interactive
+  --max-peers 300 \
+  --bandwidth 1000 \
+  --enable-sharing \
+  --sharing-bandwidth 100
+```
 
-# Full node with 5G configuration
-cargo run -- --type full \
-  --shards 0,1 \
+#### 5G Edge Gateway
+```bash
+ego-node \
+  --type gateway \
+  --slice-id "iot-slice-1" \
+  --lat 37.7749 \
+  --lon -122.4194 \
+  --bandwidth 2000 \
+  --storage 200 \
+  --enable-sharing \
+  --sharing-bandwidth 500 \
+  --cost-threshold 500
+```
+
+#### Cost-Optimized Home Node
+```bash
+ego-node \
+  --type full \
   --storage 100 \
-  --slice-id "embb-slice" \
-  --lat 48.8566 --lon 2.3522 \
-  --bandwidth 1500
+  --bandwidth 100 \
+  --enable-sharing \
+  --cost-threshold 50 \
+  --data-threshold 20 \
+  --enable-auto-switch
 ```
 
-**Capabilities**: Block validation, data storage, network relay, consensus participation, proof-of-spacetime
+## 🖥️ Interactive Mode
 
-### Seed Node
-Provides peer discovery and network bootstrapping.
+Run with `--interactive` to access the built-in command interface:
 
-```bash
-# Seed node for network bootstrapping
-cargo run -- --type seed --port 9000
-
-# Seed node with high peer capacity
-cargo run -- --type seed --port 9000 --metrics
+### Essential Commands
+```
+status          - Show detailed node status
+peers           - List connected peers
+blockchain      - Show blockchain state
+account         - Show account details
+network         - Show network status and usage
+sharing         - Show bandwidth sharing stats
+metrics         - Show performance metrics
 ```
 
-**Capabilities**: Peer discovery, bootstrap service, DHT seeding, packet routing
-
-### Indexer Node
-Indexes blockchain data for search and analytics.
-
-```bash
-# Indexer node with storage
-cargo run -- --type indexer --storage 200 --shards 0,1,2
-
-# Indexer with cross-shard support
-cargo run -- --type indexer --storage 500 --shards 0,1,2,3,4 --interactive
+### Control Commands
+```
+enable-sharing  - Enable bandwidth sharing
+disable-sharing - Disable bandwidth sharing
+switch-wifi     - Switch to WiFi network
+switch-5g       - Switch to 5G network
+reset-stats     - Reset statistics
 ```
 
-**Capabilities**: Data indexing, search service, cross-shard indexing, data storage
-
-## ⚙️ Configuration Options
-
-### Command Line Arguments
-
-| Argument | Short | Description | Default | Example |
-|----------|-------|-------------|---------|---------|
-| `--type` | `-t` | Node type (validator, storage, gateway, full, seed, indexer) | `full` | `--type validator` |
-| `--shards` | `-s` | Comma-separated shard IDs | `0,1` | `--shards 0,1,2,3` |
-| `--port` | `-p` | P2P listen port | `9000` | `--port 8080` |
-| `--bootstrap` | `-b` | Bootstrap peer addresses | `""` | `--bootstrap "/ip4/1.2.3.4/tcp/9000"` |
-| `--storage` | | Storage capacity in GB | `100` | `--storage 500` |
-| `--lat` | | Node latitude | | `--lat 37.7749` |
-| `--lon` | | Node longitude | | `--lon -122.4194` |
-| `--bandwidth` | | Bandwidth capacity in Mbps | `100` | `--bandwidth 1000` |
-| `--slice-id` | | 5G network slice identifier | | `--slice-id "slice-001"` |
-| `--interactive` | `-i` | Enable interactive mode | `false` | `--interactive` |
-| `--metrics` | `-m` | Enable metrics collection | `false` | `--metrics` |
-
-### Network Configuration Examples
-
-```bash
-# Connect to existing network
-cargo run -- --type full \
-  --bootstrap "/ip4/203.0.113.10/tcp/9000,/ip4/203.0.113.11/tcp/9000" \
-  --shards 0,1,2
-
-# Custom port configuration
-cargo run -- --type validator --port 8545 --shards 0
-
-# High-performance setup
-cargo run -- --type full \
-  --storage 1000 \
-  --bandwidth 5000 \
-  --port 9000 \
-  --metrics \
-  --interactive
+### Test Commands
+```
+test-poc        - Generate Proof of Coverage
+test-post       - Generate Proof of Spacetime
+transfer        - Create test transaction
+connect         - Retry bootstrap connections
 ```
 
-## 🎮 Interactive Mode
+## 💰 Earning EGOC Tokens
 
-Launch any node with `--interactive` to access the command interface:
+### Bandwidth Sharing Tiers
 
-```bash
-cargo run -- --type full --shards 0,1,2 --interactive
-```
+| Tier | Daily Limit | Price per MB | Max Speed | Earnings Potential |
+|------|-------------|--------------|-----------|-------------------|
+| **Basic** | 50 MB | 0.005 EGOC | 5 Mbps | ~0.25 EGOC/day |
+| **Standard** | 200 MB | 0.01 EGOC | 20 Mbps | ~2 EGOC/day |
+| **Premium** | 500 MB | 0.02 EGOC | 50 Mbps | ~10 EGOC/day |
 
-### Available Commands
+### Optimization Features
+- **Data Compression**: Save up to 60% on bandwidth costs
+- **Smart Scheduling**: Operations during off-peak hours (11PM-6AM)
+- **Network Intelligence**: Automatic switching to most cost-effective connection
+- **Usage Monitoring**: Real-time tracking of data usage and costs
 
-| Command | Description |
-|---------|-------------|
-| `help` | Show available commands |
-| `status` | Display detailed node status |
-| `peers` | List connected peers |
-| `roles` | Show current node roles |
-| `capabilities` | Display node capabilities |
-| `proofs` | Show recent proof events |
-| `5g` | Display 5G configuration status |
-| `metrics` | Show performance metrics |
-| `test-poc` | Generate test Proof of Coverage |
-| `test-post` | Generate test Proof of Spacetime |
-| `quit`/`exit` | Shutdown the node |
+## 🏗️ Architecture
 
-### Interactive Session Example
+### Core Components
 
 ```
-> status
-📊 Detailed Node Status
-════════════════════════
-Peer ID: 12D3KooWExample...
-Roles: [Validator, Storage, Relay]
-Shards: [0, 1, 2]
-Storage Capacity: 100 GB
-5G Ready: true
-
-> peers
-Connected peers: [12D3KooWPeer1..., 12D3KooWPeer2...]
-
-> test-post
-Generated PoST proof for shard 0
-
-> metrics
-📈 Node Metrics
-═══════════════
-Connected Peers: 5
-Recent Proof Events: 23
-Active Placements: 12
+ego-node/
+├── bandwidth_sharing/    # Bandwidth monetization system
+├── data_optimizer/       # Compression and batching
+├── keystore/            # Secure key management
+├── network_manager/     # Network interface management
+└── node/               # Main node implementation
 ```
 
-## 🌐 5G Integration
+### Network Stack
+- **Transport**: TCP with Yamux multiplexing
+- **Security**: Noise protocol encryption
+- **Discovery**: mDNS, Kademlia DHT, AutoNAT
+- **Messaging**: GossipSub for pub/sub communication
+- **Peer Management**: Connection limits and quality scoring
 
-### Prerequisites for 5G Features
+### Blockchain Integration
+- **State Management**: Account balances and validator stakes
+- **Transaction Processing**: Full validation and execution
+- **Cross-Shard Communication**: Efficient shard coordination
+- **Proof Verification**: PoC and PoST proof validation
 
-- **Minimum Bandwidth**: 100 Mbps for 5G readiness
-- **Geolocation**: Latitude and longitude coordinates
-- **Network Slice**: Valid 5G slice identifier
-
-### 5G Edge Gateway Setup
-
-```bash
-# Urban 5G deployment
-cargo run -- --type gateway \
-  --slice-id "urllc-automotive" \
-  --lat 40.7128 --lon -74.0060 \
-  --bandwidth 2000 \
-  --port 9000 \
-  --interactive
-
-# Industrial IoT 5G slice
-cargo run -- --type gateway \
-  --slice-id "mmtc-industrial" \
-  --lat 52.5200 --lon 13.4050 \
-  --bandwidth 1500 \
-  --storage 200
-```
-
-### Verifying 5G Readiness
-
-```bash
-# Check 5G status in interactive mode
-> 5g
-5G Ready: true
-Slice ID: urllc-automotive
-
-# Or check programmatically
-cargo run -- --type gateway --slice-id "test" --lat 0 --lon 0 --bandwidth 150
-```
-
-## 📊 Monitoring & Metrics
-
-### Enable Metrics Collection
-
-```bash
-# Run with metrics enabled
-cargo run -- --type full --metrics --interactive
-
-# View metrics in interactive mode
-> metrics
-📈 Node Metrics
-═══════════════
-Connected Peers: 8
-Recent Proof Events: 45
-Active Placements: 23
-Network Bandwidth: 500 Mbps
-Storage Utilization: 250 GB available
-```
-
-### Performance Monitoring
-
-```bash
-# High-performance monitoring setup
-cargo run -- --type full \
-  --shards 0,1,2,3,4 \
-  --storage 1000 \
-  --bandwidth 2000 \
-  --metrics \
-  --interactive
-
-# Check proof generation
-> proofs
-Recent proofs: 15 events
-  1: post - 12D3KooWExample...
-  2: poc - 12D3KooWExample...
-  3: repair - 12D3KooWExample...
-```
-
-## 🔧 Advanced Configuration
-
-### Multi-Shard Validator
-
-```bash
-# Validator for multiple shards with high capacity
-cargo run -- --type validator \
-  --shards 0,1,2,3,4,5,6,7 \
-  --port 9000 \
-  --bootstrap "/ip4/seed1.ego.network/tcp/9000" \
-  --metrics
-```
-
-### Distributed Storage Cluster
-
-```bash
-# Storage node 1
-cargo run -- --type storage \
-  --storage 500 \
-  --lat 37.7749 --lon -122.4194 \
-  --port 9001 \
-  --bootstrap "/ip4/seed.ego.network/tcp/9000"
-
-# Storage node 2
-cargo run -- --type storage \
-  --storage 500 \
-  --lat 40.7128 --lon -74.0060 \
-  --port 9002 \
-  --bootstrap "/ip4/seed.ego.network/tcp/9000"
-```
-
-### Network Bootstrapping
-
-```bash
-# Seed node for network
-cargo run -- --type seed --port 9000
-
-# Connect new nodes to the network
-cargo run -- --type full \
-  --bootstrap "/ip4/your-seed-node/tcp/9000" \
-  --shards 0,1,2
-```
-
-## 🏗️ Development
+## 🔧 Development
 
 ### Building from Source
-
 ```bash
-# Clone repository
-git clone https://github.com/ego-blockchain/ego-blockchain.git
-cd bins/ego-node
-
 # Development build
 cargo build
 
-# Release build
+# Optimized release build
 cargo build --release
 
 # Run tests
 cargo test
 
-# Check code formatting
-cargo fmt --check
-
-# Run clippy lints
-cargo clippy -- -D warnings
+# Run with logging
+RUST_LOG=debug cargo run -- --interactive
 ```
 
-### Project Structure
+### Running Tests
+```bash
+# Run all tests
+cargo test
 
+# Run specific test
+cargo test test_bandwidth_sharing
+
+# Run with output
+cargo test -- --nocapture
 ```
-ego-node/
-├── src/
-│   ├── main.rs          # CLI interface and node orchestration
-│   ├── node.rs          # Core node implementation
-│   ├── keystore.rs      # Cryptographic key management
-│   ├── types.rs         # Data structures and enums
-│   └── lib.rs           # Library exports
-├── Cargo.toml           # Dependencies and metadata
-└── README.md            # This file
+
+### Code Structure
+```rust
+// Key traits and interfaces
+pub trait NodeRole: Clone + Debug + Hash + Eq {}
+pub trait NetworkOptimization {
+    fn optimize_for_cost(&mut self) -> Result<(), NetworkError>;
+    fn optimize_for_performance(&mut self) -> Result<(), NetworkError>;
+}
+
+// Main node implementation
+pub struct Node {
+    pub peer_id: PeerId,
+    pub roles: HashSet<NodeRole>,
+    pub network_manager: NetworkManager,
+    pub bandwidth_sharing: BandwidthSharingManager,
+    pub data_optimizer: DataOptimizer,
+    // ... other components
+}
 ```
+
+## 🌍 Network Topology
+
+### Shard Architecture
+- **Cross-Shard Coordination**: Efficient communication between shards
+- **Load Balancing**: Dynamic peer distribution across shards
+- **Fault Tolerance**: Automatic failover and recovery mechanisms
+
+### 5G Integration
+- **Network Slicing**: Dedicated bandwidth allocation for different services
+- **Edge Computing**: Local processing to reduce latency
+- **Quality of Service**: Prioritization of critical blockchain operations
+
+## 📊 Monitoring & Metrics
+
+### Performance Metrics
+- **Uptime**: Node availability and reliability
+- **Throughput**: Messages and transactions per second
+- **Latency**: Network round-trip times
+- **Resource Usage**: CPU, memory, storage, bandwidth
+
+### Financial Metrics
+- **EGOC Earnings**: Real-time bandwidth sharing revenue
+- **Cost Savings**: Network optimization benefits
+- **ROI Tracking**: Return on infrastructure investment
+
+### Network Health
+- **Peer Connectivity**: Connected peer count and quality
+- **Data Usage**: Bandwidth consumption by service type
+- **Error Rates**: Network and transaction error tracking
+
+## 🚨 Troubleshooting
+
+### Common Issues
+
+#### No Peers Connected
+```bash
+# Check network connectivity
+ping 8.8.8.8
+
+# Verify firewall settings
+sudo ufw status
+
+# Try different bootstrap peers
+ego-node --bootstrap "/ip4/1.2.3.4/tcp/9000/p2p/12D3K..."
+```
+
+#### High Data Usage
+```bash
+# Enable compression
+ego-node --enable-compression
+
+# Set strict data limits
+ego-node --data-threshold 10 --cost-threshold 20
+
+# Use WiFi only
+ego-node --disable-auto-switch
+```
+
+#### Low EGOC Earnings
+```bash
+# Check bandwidth sharing status
+> sharing
+
+# Increase shared bandwidth
+> enable-sharing
+
+# Verify network connectivity
+> network
+```
+
+### Getting Help
+- **Interactive Help**: Type `help` in interactive mode
+- **Logs**: Check `RUST_LOG=debug` output for detailed information
+- **Community**: Join our Discord server for support
+- **Issues**: Report bugs on GitHub
 
 ## 🤝 Contributing
 
-We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details.
+We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
 
+### Development Setup
 1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+2. Create a feature branch: `git checkout -b feature/my-feature`
+3. Make your changes with tests
+4. Run the test suite: `cargo test`
+5. Submit a pull request
+
+### Coding Standards
+- Follow Rust best practices and idioms
+- Add comprehensive tests for new features
+- Update documentation for API changes
+- Use descriptive commit messages
 
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 🆘 Support
+## 🎯 Roadmap
 
-- **Documentation**: [docs.ego-blockchain.io](https:egoblockchain.io)
-- **Issues**: [GitHub Issues](https://github.com/ego-blockchain/bins/ego-node/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/ego-blockchain/bins/ego-node/discussions)
+### 2024 Q4
+- [ ] Enhanced 5G network slicing
+- [ ] Advanced machine learning for network optimization
+- [ ] Mobile app for node monitoring
+- [ ] Staking rewards integration
 
-## 🌟 Acknowledgments
+### 2025 Q1
+- [ ] Cross-chain bridge support
+- [ ] Enhanced consensus mechanisms
+- [ ] Advanced analytics dashboard
+- [ ] Enterprise deployment tools
 
-- Built with [libp2p](https://libp2p.io/) for robust peer-to-peer networking
-- Powered by [Rust](https://www.rust-lang.org/) for performance and safety
-- Inspired by cutting-edge blockchain and 5G technologies
+## 📞 Support
+
+- **Documentation**: [https://docs.ego-blockchain.org](https://docs.ego-blockchain.org)
+- **Community**: [Discord Server](https://discord.gg/ego-blockchain)
+- **Issues**: [GitHub Issues](https://github.com/ego-blockchain/ego-node/issues)
+- **Email**: support@ego-blockchain.org
 
 ---
 
-**Ego Blockchain Node** - Empowering the next generation of decentralized 5G networks.
+**Built with ❤️ by the Ego Blockchain Team**
+
+*Making decentralized infrastructure accessible, profitable, and intelligent.*
