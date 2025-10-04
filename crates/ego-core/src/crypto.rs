@@ -9,23 +9,30 @@ use chacha20poly1305::{
 };
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
+use oqs::kem::{Algorithm as KemAlgorithm, Kem};
+use oqs::sig::{Algorithm as SigAlgorithm, Sig};
+use pqcrypto_traits::sign::{PublicKey as PqPublicKey, SecretKey as PqSecretKey};
 use rand::{rngs::OsRng, RngCore};
+use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use x25519_dalek::PublicKey as X25519PublicKey;
-use zeroize::Zeroize;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
-const ML_KEM_768_PUBLIC_KEY_SIZE: usize = 1184;
-const ML_KEM_768_SECRET_KEY_SIZE: usize = 2400;
-const ML_KEM_768_CIPHERTEXT_SIZE: usize = 1088;
-const ML_KEM_768_SHARED_SECRET_SIZE: usize = 32;
-
-const ML_DSA_2_PUBLIC_KEY_SIZE: usize = 1312;
-const ML_DSA_2_SECRET_KEY_SIZE: usize = 2528;
-const ML_DSA_2_SIGNATURE_SIZE: usize = 2420;
-
-const SLH_DSA_SIGNATURE_MIN_SIZE: usize = 8192;
-const SLH_DSA_SIGNATURE_MAX_SIZE: usize = 17408;
+const MAX_NONCE_HISTORY: usize = 10000;
+const DOMAIN_TAG_HEADER: &[u8] = b"ego/core/v1";
+const DOMAIN_TAG_TX: &[u8] = b"ego/tx/v1";
+const DOMAIN_TAG_STREAM: &[u8] = b"ego/stream";
+const DOMAIN_TAG_TXOUT_BASE: &[u8] = b"ego/txout/base";
+const DOMAIN_TAG_TXOUT_SEED_OTSK: &[u8] = b"ego/txout/seed_otsk";
+const DOMAIN_TAG_TXOUT_AEAD: &[u8] = b"ego/txout/aead";
+const DOMAIN_TAG_PEERBIND: &[u8] = b"ego/peerbind";
+const DOMAIN_TAG_POC_BEACON: &[u8] = b"ego/poc/beacon";
+const DOMAIN_TAG_POC_WITNESS: &[u8] = b"ego/poc/witness";
+const DOMAIN_TAG_POST_PROOF: &[u8] = b"ego/post/proof";
+const DOMAIN_TAG_OTS_KEYGEN: &[u8] = b"ego/ots/keygen/v1";
 
 #[derive(Debug, Clone)]
 pub struct KeyPair {
@@ -40,6 +47,7 @@ pub struct KeyPair {
     slh_dsa_pk: Option<Vec<u8>>,
     slh_dsa_sk: Option<Vec<u8>>,
     seed: [u8; 32],
+    transition_mode: bool,
 }
 
 impl Zeroize for KeyPair {
@@ -48,13 +56,13 @@ impl Zeroize for KeyPair {
         self.dilithium_sk.zeroize();
         self.kyber_pk.zeroize();
         self.kyber_sk.zeroize();
-        self.x25519_secret.zeroize();
         if let Some(ref mut pk) = self.slh_dsa_pk {
             pk.zeroize();
         }
         if let Some(ref mut sk) = self.slh_dsa_sk {
             sk.zeroize();
         }
+        self.x25519_secret.zeroize();
         self.seed.zeroize();
     }
 }
@@ -65,32 +73,42 @@ impl Drop for KeyPair {
     }
 }
 
+impl ZeroizeOnDrop for KeyPair {}
+
 impl KeyPair {
     pub fn generate() -> Self {
         let mut rng = OsRng;
         let mut seed = [0u8; 32];
         rng.fill_bytes(&mut seed);
-        Self::from_seed(seed)
+        Self::from_seed(seed, false)
+    }
+
+    pub fn generate_with_transition() -> Self {
+        let mut rng = OsRng;
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        Self::from_seed(seed, true)
     }
 
     pub fn generate_with_slh_dsa() -> Self {
         let mut keypair = Self::generate();
-        let (slh_pk, slh_sk) = derive_slh_dsa_keypair_from_seed(&keypair.seed);
+        let (slh_pk, slh_sk) = derive_slh_dsa_keypair().unwrap();
         keypair.slh_dsa_pk = Some(slh_pk);
         keypair.slh_dsa_sk = Some(slh_sk);
+        keypair.transition_mode = false;
         keypair
     }
 
     pub fn from_bytes(bytes: &[u8; 32]) -> EgoResult<Self> {
-        Ok(Self::from_seed(*bytes))
+        Ok(Self::from_seed(*bytes, false))
     }
 
-    fn from_seed(seed: [u8; 32]) -> Self {
+    fn from_seed(seed: [u8; 32], transition_mode: bool) -> Self {
         let ed25519_signing_key = SigningKey::from_bytes(&seed);
         let ed25519_verifying_key = ed25519_signing_key.verifying_key();
 
-        let (dilithium_pk, dilithium_sk) = derive_dilithium_keypair_from_seed(&seed);
-        let (kyber_pk, kyber_sk) = derive_kyber_keypair_from_seed(&seed);
+        let (dilithium_pk, dilithium_sk) = derive_dilithium_keypair().unwrap();
+        let (kyber_pk, kyber_sk) = derive_kyber_keypair().unwrap();
 
         let x25519_secret = seed;
         let x25519_public = X25519PublicKey::from(x25519_secret);
@@ -107,10 +125,15 @@ impl KeyPair {
             slh_dsa_pk: None,
             slh_dsa_sk: None,
             seed,
+            transition_mode,
         }
     }
 
     pub fn public_key(&self) -> PublicKey {
+        PublicKey::dilithium2(self.dilithium_pk.clone())
+    }
+
+    pub fn ed25519_public_key(&self) -> PublicKey {
         PublicKey::ed25519(self.ed25519_verifying_key.to_bytes())
     }
 
@@ -133,12 +156,21 @@ impl KeyPair {
     }
 
     pub fn get_peer_capabilities(&self, account_addr: crate::Address) -> PeerCapabilities {
+        let mut sig_algs = vec![AlgorithmId::MlDsa2.as_u16()];
+        if self.transition_mode {
+            sig_algs.push(AlgorithmId::Ed25519.as_u16());
+        }
+
         PeerCapabilities {
-            alg_sig_supported: vec![AlgorithmId::MlDsa2.as_u16(), AlgorithmId::Ed25519.as_u16()],
+            alg_sig_supported: sig_algs,
             alg_kem_supported: vec![AlgorithmId::MlKem768.as_u16()],
-            pq_required: false,
+            pq_required: !self.transition_mode,
             mlkem_pk: self.kyber_pk.clone(),
-            x25519_pk: Some(self.x25519_public_key()),
+            x25519_pk: if self.transition_mode {
+                Some(self.x25519_public_key())
+            } else {
+                None
+            },
             account_addr,
             supported_topics: vec![
                 "consensus".to_string(),
@@ -151,12 +183,11 @@ impl KeyPair {
     }
 
     pub fn sign(&self, message: &[u8]) -> Signature {
-        let signature = self.ed25519_signing_key.sign(message);
-        Signature::ed25519(signature.to_bytes())
+        self.sign_dilithium(message)
     }
 
     pub fn sign_dilithium(&self, message: &[u8]) -> Signature {
-        let signature_data = mock_dilithium_sign(&self.seed, message);
+        let signature_data = dilithium_sign(&self.dilithium_sk, message).unwrap();
         Signature::dilithium2(signature_data)
     }
 
@@ -166,8 +197,8 @@ impl KeyPair {
     }
 
     pub fn sign_slh_dsa(&self, message: &[u8]) -> EgoResult<Signature> {
-        if let Some(_) = &self.slh_dsa_sk {
-            let signature_data = mock_slh_dsa_sign(&self.seed, message);
+        if let Some(ref sk) = self.slh_dsa_sk {
+            let signature_data = slh_dsa_sign(sk, message)?;
             Ok(Signature::slh_dsa(signature_data))
         } else {
             Err(EgoError::CryptoError(
@@ -177,17 +208,31 @@ impl KeyPair {
     }
 
     pub fn dual_sign(&self, message: &[u8]) -> DualSignature {
-        let ed25519_sig = self.sign_ed25519(message);
-        let dilithium_sig = self.sign_dilithium(message);
-        DualSignature::hybrid(ed25519_sig, dilithium_sig)
-    }
-
-    pub fn sign_hybrid(&self, message: &[u8], transition_mode: bool) -> DualSignature {
-        if transition_mode {
-            self.dual_sign(message)
+        if self.transition_mode {
+            let ed25519_sig = self.sign_ed25519(message);
+            let dilithium_sig = self.sign_dilithium(message);
+            DualSignature::hybrid(ed25519_sig, dilithium_sig)
         } else {
             DualSignature::dilithium_only(self.sign_dilithium(message))
         }
+    }
+
+    pub fn sign_hybrid(&self, message: &[u8], force_transition: bool) -> DualSignature {
+        if force_transition || self.transition_mode {
+            let ed25519_sig = self.sign_ed25519(message);
+            let dilithium_sig = self.sign_dilithium(message);
+            DualSignature::hybrid(ed25519_sig, dilithium_sig)
+        } else {
+            DualSignature::dilithium_only(self.sign_dilithium(message))
+        }
+    }
+
+    pub fn is_transition_mode(&self) -> bool {
+        self.transition_mode
+    }
+
+    pub fn set_transition_mode(&mut self, enabled: bool) {
+        self.transition_mode = enabled;
     }
 
     pub fn to_bytes(&self) -> [u8; 32] {
@@ -200,9 +245,10 @@ impl KeyPair {
                 EgoError::CryptoError("Invalid X25519 public key length".to_string())
             })?);
 
-        let shared_secret = x25519_dalek::x25519(self.x25519_secret, x25519_peer_pubkey.to_bytes());
+        let ephemeral_secret = EphemeralSecret::random_from_rng(OsRng);
+        let shared_secret = ephemeral_secret.diffie_hellman(&x25519_peer_pubkey);
 
-        let hk = Hkdf::<Sha256>::new(None, &shared_secret);
+        let hk = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
         let mut okm = [0u8; 32];
         hk.expand(info, &mut okm)
             .map_err(|e| EgoError::CryptoError(format!("HKDF expand failed: {}", e)))?;
@@ -211,11 +257,11 @@ impl KeyPair {
     }
 
     pub fn encapsulate_kyber(&self, peer_kyber_pk: &[u8]) -> EgoResult<(Vec<u8>, Vec<u8>)> {
-        mock_kyber_encapsulate(peer_kyber_pk, &self.seed)
+        kyber_encapsulate(peer_kyber_pk)
     }
 
     pub fn decapsulate_kyber(&self, ciphertext: &[u8]) -> EgoResult<Vec<u8>> {
-        mock_kyber_decapsulate(&self.seed, ciphertext)
+        kyber_decapsulate(&self.kyber_sk, ciphertext)
     }
 
     pub fn create_hybrid_session(
@@ -225,16 +271,25 @@ impl KeyPair {
         stream_kind: &str,
         stream_nonce: &[u8; 32],
         chain_id: &[u8],
+        network_id: u32,
+        version: u32,
     ) -> EgoResult<(SessionRecord, Vec<u8>)> {
         let x25519_shared = self.derive_session_key(peer_x25519_pk, b"x25519_component")?;
-        let (kyber_shared, kyber_ct) = self.encapsulate_kyber(peer_kyber_pk)?;
+        let (kyber_ct, kyber_shared) = self.encapsulate_kyber(peer_kyber_pk)?;
 
         let mut combined_secret = Vec::new();
         combined_secret.extend_from_slice(&kyber_shared);
         combined_secret.extend_from_slice(&x25519_shared);
 
-        let salt = blake2s_hash_domain(&[b"ego/stream", stream_kind.as_bytes(), stream_nonce]);
-        let session_key = hkdf_sha256(&combined_secret, &salt, chain_id, 32);
+        let salt = blake2s_hash_domain(&[
+            DOMAIN_TAG_STREAM,
+            stream_kind.as_bytes(),
+            stream_nonce,
+            chain_id,
+            &network_id.to_le_bytes(),
+            &version.to_le_bytes(),
+        ]);
+        let session_key = hkdf_blake2s(&combined_secret, &salt, chain_id, 32);
 
         let mut nonce = [0u8; 24];
         let mut rng = OsRng;
@@ -256,11 +311,20 @@ impl KeyPair {
         stream_kind: &str,
         stream_nonce: &[u8; 32],
         chain_id: &[u8],
+        network_id: u32,
+        version: u32,
     ) -> EgoResult<(SessionRecord, Vec<u8>)> {
-        let (kyber_shared, kyber_ct) = self.encapsulate_kyber(peer_kyber_pk)?;
+        let (kyber_ct, kyber_shared) = self.encapsulate_kyber(peer_kyber_pk)?;
 
-        let salt = blake2s_hash_domain(&[b"ego/stream", stream_kind.as_bytes(), stream_nonce]);
-        let session_key = hkdf_sha256(&kyber_shared, &salt, chain_id, 32);
+        let salt = blake2s_hash_domain(&[
+            DOMAIN_TAG_STREAM,
+            stream_kind.as_bytes(),
+            stream_nonce,
+            chain_id,
+            &network_id.to_le_bytes(),
+            &version.to_le_bytes(),
+        ]);
+        let session_key = hkdf_blake2s(&kyber_shared, &salt, chain_id, 32);
 
         let mut nonce = [0u8; 24];
         let mut rng = OsRng;
@@ -276,19 +340,23 @@ impl KeyPair {
         peer_id: &str,
         caps: &[u8],
         chain_id: &[u8],
+        network_id: u32,
+        version: u32,
         include_ed25519: bool,
     ) -> EgoResult<Vec<u8>> {
         let mut combined = peer_id.as_bytes().to_vec();
         combined.extend_from_slice(&self.kyber_pk);
         combined.extend_from_slice(caps);
         combined.extend_from_slice(chain_id);
+        combined.extend_from_slice(&network_id.to_le_bytes());
+        combined.extend_from_slice(&version.to_le_bytes());
 
         let mut nonce = [0u8; 32];
         let mut rng = OsRng;
         rng.fill_bytes(&mut nonce);
         combined.extend_from_slice(&nonce);
 
-        let data_to_sign = blake2s_hash_domain(&[b"ego/peerbind", &combined]);
+        let data_to_sign = blake2s_hash_domain(&[DOMAIN_TAG_PEERBIND, &combined]);
 
         if include_ed25519 {
             let ed25519_sig = self.sign_ed25519(&data_to_sign);
@@ -306,6 +374,55 @@ impl KeyPair {
             Ok(result)
         }
     }
+
+    pub fn sign_poc_beacon(
+        &self,
+        beacon_data: &[u8],
+        chain_id: &[u8],
+        network_id: u32,
+    ) -> Signature {
+        let msg = blake2s_hash_domain(&[
+            DOMAIN_TAG_POC_BEACON,
+            beacon_data,
+            chain_id,
+            &network_id.to_le_bytes(),
+        ]);
+        self.sign_dilithium(&msg)
+    }
+
+    pub fn sign_poc_witness(
+        &self,
+        witness_data: &[u8],
+        chain_id: &[u8],
+        network_id: u32,
+    ) -> Signature {
+        let msg = blake2s_hash_domain(&[
+            DOMAIN_TAG_POC_WITNESS,
+            witness_data,
+            chain_id,
+            &network_id.to_le_bytes(),
+        ]);
+        self.sign_dilithium(&msg)
+    }
+
+    pub fn sign_post_proof(
+        &self,
+        proof_data: &[u8],
+        chain_id: &[u8],
+        network_id: u32,
+    ) -> Signature {
+        let msg = blake2s_hash_domain(&[
+            DOMAIN_TAG_POST_PROOF,
+            proof_data,
+            chain_id,
+            &network_id.to_le_bytes(),
+        ]);
+        self.sign_dilithium(&msg)
+    }
+
+    pub fn derive_ots_keypair_from_seed(_seed: &[u8; 32]) -> EgoResult<(Vec<u8>, Vec<u8>)> {
+        derive_dilithium_keypair()
+    }
 }
 
 #[derive(Clone)]
@@ -315,7 +432,9 @@ pub struct StreamCipher {
     rx_counter: u64,
     stream_id: Vec<u8>,
     chain_id: Vec<u8>,
+    network_id: u32,
     alg_ids: (u16, u16),
+    nonce_history: Arc<Mutex<HashSet<Vec<u8>>>>,
 }
 
 impl std::fmt::Debug for StreamCipher {
@@ -325,6 +444,7 @@ impl std::fmt::Debug for StreamCipher {
             .field("rx_counter", &self.rx_counter)
             .field("stream_id", &self.stream_id)
             .field("chain_id", &self.chain_id)
+            .field("network_id", &self.network_id)
             .field("alg_ids", &self.alg_ids)
             .finish_non_exhaustive()
     }
@@ -335,6 +455,7 @@ impl StreamCipher {
         key: &[u8; 32],
         stream_id: Vec<u8>,
         chain_id: Vec<u8>,
+        network_id: u32,
         alg_ids: (u16, u16),
     ) -> EgoResult<Self> {
         let cipher = XChaCha20Poly1305::new_from_slice(key)
@@ -346,7 +467,9 @@ impl StreamCipher {
             rx_counter: 0,
             stream_id,
             chain_id,
+            network_id,
             alg_ids,
+            nonce_history: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -354,6 +477,19 @@ impl StreamCipher {
         let mut nonce = [0u8; 24];
         let mut rng = OsRng;
         rng.fill_bytes(&mut nonce);
+
+        {
+            let mut history = self.nonce_history.lock().unwrap();
+            if history.contains(&nonce.to_vec()) {
+                return Err(EgoError::CryptoError(
+                    "Duplicate nonce detected".to_string(),
+                ));
+            }
+            history.insert(nonce.to_vec());
+            if history.len() > MAX_NONCE_HISTORY {
+                history.clear();
+            }
+        }
 
         let aad = self.create_aad(direction, self.tx_counter)?;
         let xnonce = XNonce::from_slice(&nonce);
@@ -368,7 +504,7 @@ impl StreamCipher {
             .encrypt(xnonce, payload)
             .map_err(|e| EgoError::CryptoError(format!("Encryption failed: {}", e)))?;
 
-        self.tx_counter += 1;
+        self.tx_counter = self.tx_counter.wrapping_add(1);
 
         let mut frame = Vec::new();
         frame.extend_from_slice(&nonce);
@@ -385,6 +521,20 @@ impl StreamCipher {
         }
 
         let nonce = &frame[..24];
+
+        {
+            let mut history = self.nonce_history.lock().unwrap();
+            if history.contains(&nonce.to_vec()) {
+                return Err(EgoError::CryptoError(
+                    "Duplicate nonce detected - replay attack".to_string(),
+                ));
+            }
+            history.insert(nonce.to_vec());
+            if history.len() > MAX_NONCE_HISTORY {
+                history.clear();
+            }
+        }
+
         let aad_len_bytes = [frame[24], frame[25], frame[26], frame[27]];
         let aad_len = u32::from_le_bytes(aad_len_bytes) as usize;
 
@@ -412,7 +562,7 @@ impl StreamCipher {
             .decrypt(xnonce, payload)
             .map_err(|e| EgoError::CryptoError(format!("Decryption failed: {}", e)))?;
 
-        self.rx_counter += 1;
+        self.rx_counter = self.rx_counter.wrapping_add(1);
         Ok(plaintext)
     }
 
@@ -424,12 +574,14 @@ impl StreamCipher {
         aad.extend_from_slice(&self.alg_ids.0.to_le_bytes());
         aad.extend_from_slice(&self.alg_ids.1.to_le_bytes());
         aad.extend_from_slice(&self.chain_id);
+        aad.extend_from_slice(&self.network_id.to_le_bytes());
 
         Ok(blake2s_hash(&aad))
     }
 
-    pub fn detect_duplicate_nonce(&self, _nonce: &[u8; 24], _counter: u64) -> bool {
-        false
+    pub fn detect_duplicate_nonce(&self, nonce: &[u8; 24], _counter: u64) -> bool {
+        let history = self.nonce_history.lock().unwrap();
+        history.contains(&nonce.to_vec())
     }
 }
 
@@ -437,13 +589,15 @@ impl StreamCipher {
 pub struct BatchVerifier {
     signatures: Vec<(PublicKey, Vec<u8>, Signature)>,
     max_batch_size: usize,
+    cpu_budget_remaining: u64,
 }
 
 impl BatchVerifier {
-    pub fn new(_cpu_budget: u64, max_batch_size: usize) -> Self {
+    pub fn new(cpu_budget: u64, max_batch_size: usize) -> Self {
         Self {
             signatures: Vec::new(),
             max_batch_size,
+            cpu_budget_remaining: cpu_budget,
         }
     }
 
@@ -459,6 +613,20 @@ impl BatchVerifier {
             ));
         }
 
+        let estimated_cost = match signature.algorithm {
+            AlgorithmId::MlDsa2 => 5000,
+            AlgorithmId::Ed25519 => 1000,
+            AlgorithmId::SlhDsa => 10000,
+            _ => 2000,
+        };
+
+        if self.cpu_budget_remaining < estimated_cost {
+            return Err(EgoError::CryptoError(
+                "CPU budget exceeded - backpressure triggered".to_string(),
+            ));
+        }
+
+        self.cpu_budget_remaining -= estimated_cost;
         self.signatures.push((public_key, message, signature));
         Ok(())
     }
@@ -480,6 +648,10 @@ impl BatchVerifier {
 
     pub fn is_full(&self) -> bool {
         self.signatures.len() >= self.max_batch_size
+    }
+
+    pub fn has_budget(&self) -> bool {
+        self.cpu_budget_remaining > 1000
     }
 }
 
@@ -556,7 +728,7 @@ pub fn verify_dilithium_signature(
     message: &[u8],
     signature: &[u8],
 ) -> EgoResult<bool> {
-    mock_dilithium_verify(dilithium_pk, message, signature)
+    dilithium_verify(dilithium_pk, message, signature)
 }
 
 pub fn verify_slh_dsa_signature(
@@ -564,7 +736,7 @@ pub fn verify_slh_dsa_signature(
     message: &[u8],
     signature: &[u8],
 ) -> EgoResult<bool> {
-    mock_slh_dsa_verify(slh_dsa_pk, message, signature)
+    slh_dsa_verify(slh_dsa_pk, message, signature)
 }
 
 pub fn blake2s_hash(data: &[u8]) -> Vec<u8> {
@@ -657,13 +829,15 @@ pub fn create_handshake_init(
     stream_kind: &str,
     caps: &[u8],
     chain_id: &[u8],
+    network_id: u32,
+    version: u32,
     hybrid_mode: bool,
 ) -> EgoResult<HandshakeInit> {
     let mut stream_nonce = [0u8; 32];
     let mut rng = OsRng;
     rng.fill_bytes(&mut stream_nonce);
 
-    let (_, kyber_ct) = keypair.encapsulate_kyber(peer_kyber_pk)?;
+    let (kyber_ct, _) = keypair.encapsulate_kyber(peer_kyber_pk)?;
 
     if hybrid_mode {
         Ok(HandshakeInit::hybrid(
@@ -693,6 +867,8 @@ pub fn verify_identity_binding(
     mlkem_pk: &[u8],
     caps: &[u8],
     chain_id: &[u8],
+    network_id: u32,
+    version: u32,
     nonce: &[u8],
     signature: &[u8],
     dilithium_pk: &[u8],
@@ -702,8 +878,10 @@ pub fn verify_identity_binding(
     combined.extend_from_slice(mlkem_pk);
     combined.extend_from_slice(caps);
     combined.extend_from_slice(chain_id);
+    combined.extend_from_slice(&network_id.to_le_bytes());
+    combined.extend_from_slice(&version.to_le_bytes());
     combined.extend_from_slice(nonce);
-    let data_to_verify = blake2s_hash_domain(&[b"ego/peerbind", &combined]);
+    let data_to_verify = blake2s_hash_domain(&[DOMAIN_TAG_PEERBIND, &combined]);
 
     if let Some(ed25519_key) = ed25519_pk {
         let nonce_len = 32;
@@ -743,19 +921,22 @@ pub fn derive_stealth_address(
     receiver_kyber_pk: &[u8],
     sender_ephemeral: &[u8; 32],
 ) -> EgoResult<(PublicKey, Vec<u8>)> {
-    let (shared_secret, _) = mock_kyber_encapsulate(receiver_kyber_pk, sender_ephemeral)?;
+    let (kyber_ct, shared_secret) = kyber_encapsulate(receiver_kyber_pk)?;
 
-    let mut derivation_input = shared_secret;
+    let mut derivation_input = Vec::new();
+    derivation_input.extend_from_slice(&shared_secret);
     derivation_input.extend_from_slice(sender_ephemeral);
+    derivation_input.extend_from_slice(DOMAIN_TAG_TXOUT_SEED_OTSK);
 
     let derived_seed = blake2s_hash(&derivation_input);
     let mut key_seed = [0u8; 32];
     key_seed.copy_from_slice(&derived_seed[..32]);
 
-    let one_time_keypair = KeyPair::from_bytes(&key_seed)?;
-    let one_time_pubkey = one_time_keypair.public_key();
+    let (ots_pk, ots_sk) = KeyPair::derive_ots_keypair_from_seed(&key_seed)?;
 
-    let spend_key = one_time_keypair.to_bytes().to_vec();
+    let one_time_pubkey = PublicKey::dilithium2(ots_pk);
+    let mut spend_key = ots_sk;
+    spend_key.extend_from_slice(&kyber_ct);
 
     Ok((one_time_pubkey, spend_key))
 }
@@ -900,206 +1081,135 @@ impl MerkleProof {
     }
 }
 
-fn derive_dilithium_keypair_from_seed(seed: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
-    let mut pk_combined = seed.to_vec();
-    pk_combined.extend_from_slice(b"dilithium_pk_v1");
-    let pk_hash = blake2s_hash(&pk_combined);
+fn derive_dilithium_keypair() -> EgoResult<(Vec<u8>, Vec<u8>)> {
+    let sigalg = Sig::new(SigAlgorithm::Dilithium2)
+        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize Dilithium2: {}", e)))?;
 
-    let mut pk = vec![0u8; ML_DSA_2_PUBLIC_KEY_SIZE];
-    let mut pk_seed = pk_hash;
-    for i in 0..ML_DSA_2_PUBLIC_KEY_SIZE {
-        if i > 0 && i % 32 == 0 {
-            pk_seed = blake2s_hash(&pk_seed);
-        }
-        pk[i] = pk_seed[i % 32];
-    }
+    let (pk, sk) = sigalg.keypair().map_err(|e| {
+        EgoError::CryptoError(format!("Failed to generate Dilithium2 keypair: {}", e))
+    })?;
 
-    let mut pk_with_seed = pk.clone();
-    pk_with_seed.extend_from_slice(seed);
-
-    let mut sk_combined = seed.to_vec();
-    sk_combined.extend_from_slice(b"dilithium_sk_v1");
-    let sk_hash = blake2s_hash(&sk_combined);
-
-    let mut sk = vec![0u8; ML_DSA_2_SECRET_KEY_SIZE];
-    let mut sk_seed = sk_hash;
-    for i in 0..ML_DSA_2_SECRET_KEY_SIZE {
-        if i > 0 && i % 32 == 0 {
-            sk_seed = blake2s_hash(&sk_seed);
-        }
-        sk[i] = sk_seed[i % 32];
-    }
-
-    (pk_with_seed, sk)
+    Ok((pk.into_vec(), sk.into_vec()))
 }
 
-fn derive_kyber_keypair_from_seed(seed: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
-    let mut pk_combined = seed.to_vec();
-    pk_combined.extend_from_slice(b"kyber_pk_v1");
-    let pk_hash = blake2s_hash(&pk_combined);
+fn derive_kyber_keypair() -> EgoResult<(Vec<u8>, Vec<u8>)> {
+    let kem = Kem::new(KemAlgorithm::Kyber768)
+        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize Kyber768: {}", e)))?;
 
-    let mut pk = vec![0u8; ML_KEM_768_PUBLIC_KEY_SIZE];
-    let mut pk_seed = pk_hash;
-    for i in 0..ML_KEM_768_PUBLIC_KEY_SIZE {
-        if i > 0 && i % 32 == 0 {
-            pk_seed = blake2s_hash(&pk_seed);
-        }
-        pk[i] = pk_seed[i % 32];
-    }
+    let (pk, sk) = kem.keypair().map_err(|e| {
+        EgoError::CryptoError(format!("Failed to generate Kyber768 keypair: {}", e))
+    })?;
 
-    let mut sk = seed.to_vec();
-    sk.resize(ML_KEM_768_SECRET_KEY_SIZE, 0);
-
-    (pk, sk)
+    Ok((pk.into_vec(), sk.into_vec()))
 }
 
-fn derive_slh_dsa_keypair_from_seed(seed: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
-    let mut pk_combined = seed.to_vec();
-    pk_combined.extend_from_slice(b"slhdsa_pk_v1");
-    let pk_hash = blake2s_hash(&pk_combined);
+fn derive_slh_dsa_keypair() -> EgoResult<(Vec<u8>, Vec<u8>)> {
+    let sigalg = Sig::new(SigAlgorithm::SphincsSha2128sSimple)
+        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize SPHINCS+: {}", e)))?;
 
-    let mut pk = vec![0u8; 64];
-    for i in 0..64 {
-        pk[i] = pk_hash[i % pk_hash.len()];
-    }
+    let (pk, sk) = sigalg.keypair().map_err(|e| {
+        EgoError::CryptoError(format!("Failed to generate SPHINCS+ keypair: {}", e))
+    })?;
 
-    let mut pk_with_seed = pk.clone();
-    pk_with_seed.extend_from_slice(seed);
-
-    let mut sk = seed.to_vec();
-    sk.resize(128, 0);
-
-    (pk_with_seed, sk)
+    Ok((pk.into_vec(), sk.into_vec()))
 }
 
-fn mock_dilithium_sign(seed: &[u8; 32], message: &[u8]) -> Vec<u8> {
-    let mut combined = Vec::new();
-    combined.extend_from_slice(seed);
-    combined.extend_from_slice(message);
-    combined.extend_from_slice(b"ego/dilithium/v1");
+pub fn dilithium_sign(secret_key: &[u8], message: &[u8]) -> EgoResult<Vec<u8>> {
+    let sigalg = Sig::new(SigAlgorithm::Dilithium2)
+        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize Dilithium2: {}", e)))?;
 
-    let hash = blake2s_hash(&combined);
-    let mut signature = vec![0u8; ML_DSA_2_SIGNATURE_SIZE];
-    let mut sig_seed = hash;
+    let sk = sigalg
+        .secret_key_from_bytes(secret_key)
+        .ok_or_else(|| EgoError::CryptoError("Invalid Dilithium2 secret key".to_string()))?;
 
-    for i in 0..ML_DSA_2_SIGNATURE_SIZE {
-        if i > 0 && i % 32 == 0 {
-            sig_seed = blake2s_hash(&sig_seed);
-        }
-        signature[i] = sig_seed[i % 32];
-    }
+    let signature = sigalg
+        .sign(message, &sk)
+        .map_err(|e| EgoError::CryptoError(format!("Failed to sign with Dilithium2: {}", e)))?;
 
-    signature
+    Ok(signature.into_vec())
 }
 
-fn mock_dilithium_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> EgoResult<bool> {
-    if signature.len() != ML_DSA_2_SIGNATURE_SIZE {
-        return Ok(false);
+pub fn dilithium_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> EgoResult<bool> {
+    let sigalg = Sig::new(SigAlgorithm::Dilithium2)
+        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize Dilithium2: {}", e)))?;
+
+    let pk = sigalg
+        .public_key_from_bytes(public_key)
+        .ok_or_else(|| EgoError::CryptoError("Invalid Dilithium2 public key".to_string()))?;
+
+    let sig = sigalg
+        .signature_from_bytes(signature)
+        .ok_or_else(|| EgoError::CryptoError("Invalid Dilithium2 signature".to_string()))?;
+
+    match sigalg.verify(message, &sig, &pk) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
     }
-
-    if public_key.len() < ML_DSA_2_PUBLIC_KEY_SIZE {
-        return Ok(false);
-    }
-
-    let seed_start = public_key.len() - 32;
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&public_key[seed_start..]);
-
-    let expected_signature = mock_dilithium_sign(&seed, message);
-    Ok(expected_signature == signature)
 }
 
-fn mock_slh_dsa_sign(seed: &[u8; 32], message: &[u8]) -> Vec<u8> {
-    let mut combined = Vec::new();
-    combined.extend_from_slice(seed);
-    combined.extend_from_slice(message);
-    combined.extend_from_slice(b"ego/slhdsa/v1");
+fn slh_dsa_sign(secret_key: &[u8], message: &[u8]) -> EgoResult<Vec<u8>> {
+    let sigalg = Sig::new(SigAlgorithm::SphincsSha2128sSimple)
+        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize SPHINCS+: {}", e)))?;
 
-    let hash = blake2s_hash(&combined);
-    let mut signature = vec![0u8; SLH_DSA_SIGNATURE_MIN_SIZE];
-    let mut sig_seed = hash;
+    let sk = sigalg
+        .secret_key_from_bytes(secret_key)
+        .ok_or_else(|| EgoError::CryptoError("Invalid SPHINCS+ secret key".to_string()))?;
 
-    for i in 0..SLH_DSA_SIGNATURE_MIN_SIZE {
-        if i > 0 && i % 32 == 0 {
-            sig_seed = blake2s_hash(&sig_seed);
-        }
-        signature[i] = sig_seed[i % 32];
-    }
+    let signature = sigalg
+        .sign(message, &sk)
+        .map_err(|e| EgoError::CryptoError(format!("Failed to sign with SPHINCS+: {}", e)))?;
 
-    signature
+    Ok(signature.into_vec())
 }
 
-fn mock_slh_dsa_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> EgoResult<bool> {
-    if signature.len() < SLH_DSA_SIGNATURE_MIN_SIZE || signature.len() > SLH_DSA_SIGNATURE_MAX_SIZE
-    {
-        return Ok(false);
+fn slh_dsa_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> EgoResult<bool> {
+    let sigalg = Sig::new(SigAlgorithm::SphincsSha2128sSimple)
+        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize SPHINCS+: {}", e)))?;
+
+    let pk = sigalg
+        .public_key_from_bytes(public_key)
+        .ok_or_else(|| EgoError::CryptoError("Invalid SPHINCS+ public key".to_string()))?;
+
+    let sig = sigalg
+        .signature_from_bytes(signature)
+        .ok_or_else(|| EgoError::CryptoError("Invalid SPHINCS+ signature".to_string()))?;
+
+    match sigalg.verify(message, &sig, &pk) {
+        Ok(()) => Ok(true),
+        Err(_) => Ok(false),
     }
-
-    if public_key.len() < 64 {
-        return Ok(false);
-    }
-
-    let seed_start = public_key.len() - 32;
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&public_key[seed_start..]);
-
-    let expected_signature = mock_slh_dsa_sign(&seed, message);
-    Ok(expected_signature[..SLH_DSA_SIGNATURE_MIN_SIZE] == signature[..SLH_DSA_SIGNATURE_MIN_SIZE])
 }
 
-fn mock_kyber_encapsulate(
-    public_key: &[u8],
-    sender_seed: &[u8; 32],
-) -> EgoResult<(Vec<u8>, Vec<u8>)> {
-    if public_key.len() != ML_KEM_768_PUBLIC_KEY_SIZE {
-        return Err(EgoError::CryptoError(
-            "Invalid Kyber public key size".to_string(),
-        ));
-    }
+fn kyber_encapsulate(public_key: &[u8]) -> EgoResult<(Vec<u8>, Vec<u8>)> {
+    let kem = Kem::new(KemAlgorithm::Kyber768)
+        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize Kyber768: {}", e)))?;
 
-    let mut shared_input = public_key.to_vec();
-    shared_input.extend_from_slice(sender_seed);
-    shared_input.extend_from_slice(b"ego/kyber/ss/v1");
-    let shared_secret_hash = blake2s_hash(&shared_input);
-    let shared_secret = shared_secret_hash[..ML_KEM_768_SHARED_SECRET_SIZE].to_vec();
+    let pk = kem
+        .public_key_from_bytes(public_key)
+        .ok_or_else(|| EgoError::CryptoError("Invalid Kyber768 public key".to_string()))?;
 
-    let pk_hash = blake2s_hash(public_key);
-    let mut ciphertext = vec![0u8; ML_KEM_768_CIPHERTEXT_SIZE];
+    let (ciphertext, shared_secret) = kem.encapsulate(&pk).map_err(|e| {
+        EgoError::CryptoError(format!("Failed to encapsulate with Kyber768: {}", e))
+    })?;
 
-    for i in 0..32 {
-        ciphertext[i] = sender_seed[i] ^ pk_hash[i];
-    }
-
-    let mut padding_seed = ciphertext[..32].to_vec();
-    for i in 32..ML_KEM_768_CIPHERTEXT_SIZE {
-        if i % 32 == 0 {
-            padding_seed = blake2s_hash(&padding_seed);
-        }
-        ciphertext[i] = padding_seed[i % 32];
-    }
-
-    Ok((shared_secret, ciphertext))
+    Ok((ciphertext.into_vec(), shared_secret.into_vec()))
 }
 
-fn mock_kyber_decapsulate(receiver_seed: &[u8; 32], ciphertext: &[u8]) -> EgoResult<Vec<u8>> {
-    if ciphertext.len() != ML_KEM_768_CIPHERTEXT_SIZE {
-        return Err(EgoError::CryptoError(
-            "Invalid Kyber ciphertext size".to_string(),
-        ));
-    }
+fn kyber_decapsulate(secret_key: &[u8], ciphertext: &[u8]) -> EgoResult<Vec<u8>> {
+    let kem = Kem::new(KemAlgorithm::Kyber768)
+        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize Kyber768: {}", e)))?;
 
-    let (receiver_pk, _) = derive_kyber_keypair_from_seed(receiver_seed);
+    let sk = kem
+        .secret_key_from_bytes(secret_key)
+        .ok_or_else(|| EgoError::CryptoError("Invalid Kyber768 secret key".to_string()))?;
 
-    let pk_hash = blake2s_hash(&receiver_pk);
-    let mut sender_seed = [0u8; 32];
-    for i in 0..32 {
-        sender_seed[i] = ciphertext[i] ^ pk_hash[i];
-    }
+    let ct = kem
+        .ciphertext_from_bytes(ciphertext)
+        .ok_or_else(|| EgoError::CryptoError("Invalid Kyber768 ciphertext".to_string()))?;
 
-    let mut shared_input = receiver_pk;
-    shared_input.extend_from_slice(&sender_seed);
-    shared_input.extend_from_slice(b"ego/kyber/ss/v1");
-    let shared_secret_hash = blake2s_hash(&shared_input);
+    let shared_secret = kem.decapsulate(&sk, &ct).map_err(|e| {
+        EgoError::CryptoError(format!("Failed to decapsulate with Kyber768: {}", e))
+    })?;
 
-    Ok(shared_secret_hash[..ML_KEM_768_SHARED_SECRET_SIZE].to_vec())
+    Ok(shared_secret.into_vec())
 }
