@@ -75,6 +75,38 @@ impl Drop for KeyPair {
 
 impl ZeroizeOnDrop for KeyPair {}
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportedKeys {
+    pub ed25519_public: Vec<u8>,
+    pub ed25519_secret: Vec<u8>,
+    pub dilithium_public: Vec<u8>,
+    pub dilithium_secret: Vec<u8>,
+    pub kyber_public: Vec<u8>,
+    pub kyber_secret: Vec<u8>,
+    pub x25519_public: Vec<u8>,
+    pub x25519_secret: Vec<u8>,
+    pub slh_dsa_public: Option<Vec<u8>>,
+    pub slh_dsa_secret: Option<Vec<u8>>,
+    pub seed: Vec<u8>,
+    pub transition_mode: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportedKeysHex {
+    pub ed25519_public: String,
+    pub ed25519_secret: String,
+    pub dilithium_public: String,
+    pub dilithium_secret: String,
+    pub kyber_public: String,
+    pub kyber_secret: String,
+    pub x25519_public: String,
+    pub x25519_secret: String,
+    pub slh_dsa_public: Option<String>,
+    pub slh_dsa_secret: Option<String>,
+    pub seed: String,
+    pub transition_mode: bool,
+}
+
 impl KeyPair {
     pub fn generate() -> Self {
         let mut rng = OsRng;
@@ -422,6 +454,64 @@ impl KeyPair {
 
     pub fn derive_ots_keypair_from_seed(_seed: &[u8; 32]) -> EgoResult<(Vec<u8>, Vec<u8>)> {
         derive_dilithium_keypair()
+    }
+
+    pub fn export_keys(&self) -> ExportedKeys {
+        ExportedKeys {
+            ed25519_public: self.ed25519_verifying_key.to_bytes().to_vec(),
+            ed25519_secret: self.ed25519_signing_key.to_bytes().to_vec(),
+            dilithium_public: self.dilithium_pk.clone(),
+            dilithium_secret: self.dilithium_sk.clone(),
+            kyber_public: self.kyber_pk.clone(),
+            kyber_secret: self.kyber_sk.clone(),
+            x25519_public: self.x25519_public.as_bytes().to_vec(),
+            x25519_secret: self.x25519_secret.to_vec(),
+            slh_dsa_public: self.slh_dsa_pk.clone(),
+            slh_dsa_secret: self.slh_dsa_sk.clone(),
+            seed: self.seed.to_vec(),
+            transition_mode: self.transition_mode,
+        }
+    }
+
+    pub fn export_keys_hex(&self) -> ExportedKeysHex {
+        ExportedKeysHex {
+            ed25519_public: hex::encode(self.ed25519_verifying_key.to_bytes()),
+            ed25519_secret: hex::encode(self.ed25519_signing_key.to_bytes()),
+            dilithium_public: hex::encode(&self.dilithium_pk),
+            dilithium_secret: hex::encode(&self.dilithium_sk),
+            kyber_public: hex::encode(&self.kyber_pk),
+            kyber_secret: hex::encode(&self.kyber_sk),
+            x25519_public: hex::encode(self.x25519_public.as_bytes()),
+            x25519_secret: hex::encode(&self.x25519_secret),
+            slh_dsa_public: self.slh_dsa_pk.as_ref().map(|pk| hex::encode(pk)),
+            slh_dsa_secret: self.slh_dsa_sk.as_ref().map(|sk| hex::encode(sk)),
+            seed: hex::encode(&self.seed),
+            transition_mode: self.transition_mode,
+        }
+    }
+
+    pub fn get_dilithium_secret_key(&self) -> &[u8] {
+        &self.dilithium_sk
+    }
+
+    pub fn get_kyber_secret_key(&self) -> &[u8] {
+        &self.kyber_sk
+    }
+
+    pub fn get_ed25519_secret_key(&self) -> &[u8] {
+        self.ed25519_signing_key.as_bytes()
+    }
+
+    pub fn get_x25519_secret_key(&self) -> &[u8; 32] {
+        &self.x25519_secret
+    }
+
+    pub fn get_seed(&self) -> &[u8; 32] {
+        &self.seed
+    }
+
+    pub fn get_slh_dsa_secret_key(&self) -> Option<&[u8]> {
+        self.slh_dsa_sk.as_ref().map(|sk| sk.as_slice())
     }
 }
 
