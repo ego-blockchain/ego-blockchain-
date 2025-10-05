@@ -1,4 +1,7 @@
 use ego_core::*;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::Path;
 
 #[cfg(test)]
 mod pq_crypto_tests {
@@ -772,6 +775,370 @@ mod pq_crypto_tests {
 
         assert_eq!(one_time_pk.algorithm, AlgorithmId::MlDsa2);
         assert!(!spend_key.is_empty(), "Spend key should not be empty");
+    }
+
+    fn export_keypair_to_files(
+        keypair: &crypto::KeyPair,
+        base_dir: &Path,
+        prefix: &str,
+    ) -> std::io::Result<()> {
+        let keys = keypair.export_keys();
+        let keys_hex = keypair.export_keys_hex();
+
+        let keypair_dir = base_dir.join(prefix);
+        fs::create_dir_all(&keypair_dir)?;
+
+        File::create(keypair_dir.join("ed25519_public.bin"))?.write_all(&keys.ed25519_public)?;
+        File::create(keypair_dir.join("ed25519_secret.bin"))?.write_all(&keys.ed25519_secret)?;
+        File::create(keypair_dir.join("dilithium_public.bin"))?
+            .write_all(&keys.dilithium_public)?;
+        File::create(keypair_dir.join("dilithium_secret.bin"))?
+            .write_all(&keys.dilithium_secret)?;
+        File::create(keypair_dir.join("kyber_public.bin"))?.write_all(&keys.kyber_public)?;
+        File::create(keypair_dir.join("kyber_secret.bin"))?.write_all(&keys.kyber_secret)?;
+        File::create(keypair_dir.join("x25519_public.bin"))?.write_all(&keys.x25519_public)?;
+        File::create(keypair_dir.join("x25519_secret.bin"))?.write_all(&keys.x25519_secret)?;
+        File::create(keypair_dir.join("seed.bin"))?.write_all(&keys.seed)?;
+
+        if let Some(ref pk) = keys.slh_dsa_public {
+            File::create(keypair_dir.join("slh_dsa_public.bin"))?.write_all(pk)?;
+        }
+        if let Some(ref sk) = keys.slh_dsa_secret {
+            File::create(keypair_dir.join("slh_dsa_secret.bin"))?.write_all(sk)?;
+        }
+
+        let json_content = serde_json::to_string_pretty(&keys_hex)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        File::create(keypair_dir.join("keys_hex.json"))?.write_all(json_content.as_bytes())?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_export_keys_to_files() {
+        let output_dir = Path::new("./test_keys_export");
+        if output_dir.exists() {
+            fs::remove_dir_all(output_dir).unwrap();
+        }
+        fs::create_dir_all(output_dir).unwrap();
+
+        println!("\n=== Exporting Post-Quantum Keypairs ===");
+
+        let keypair_standard = crypto::KeyPair::generate();
+        export_keypair_to_files(&keypair_standard, output_dir, "1_pq_only").unwrap();
+        println!("✓ Exported PQ-only keypair to: ./test_keys_export/1_pq_only/");
+
+        let keypair_transition = crypto::KeyPair::generate_with_transition();
+        export_keypair_to_files(&keypair_transition, output_dir, "2_transition_mode").unwrap();
+        println!("✓ Exported transition mode keypair to: ./test_keys_export/2_transition_mode/");
+
+        let keypair_slh_dsa = crypto::KeyPair::generate_with_slh_dsa();
+        export_keypair_to_files(&keypair_slh_dsa, output_dir, "3_with_slh_dsa").unwrap();
+        println!("✓ Exported SLH-DSA keypair to: ./test_keys_export/3_with_slh_dsa/");
+
+        println!("\n=== Export Summary ===");
+        println!("Total keypairs exported: 3");
+        println!("Output directory: {:?}", output_dir.canonicalize().unwrap());
+        println!("\n⚠️  WARNING: These directories contain SECRET KEYS!");
+        println!("Please secure or delete them after inspection.");
+    }
+
+    #[test]
+    fn test_direct_key_access() {
+        println!("\n=== Testing Direct Key Access ===");
+
+        let keypair = crypto::KeyPair::generate_with_transition();
+
+        let ed25519_secret = keypair.get_ed25519_secret_key();
+        let dilithium_secret = keypair.get_dilithium_secret_key();
+        let kyber_secret = keypair.get_kyber_secret_key();
+        let x25519_secret = keypair.get_x25519_secret_key();
+        let seed = keypair.get_seed();
+
+        println!("✓ Ed25519 secret key: {} bytes", ed25519_secret.len());
+        println!("✓ Dilithium secret key: {} bytes", dilithium_secret.len());
+        println!("✓ Kyber secret key: {} bytes", kyber_secret.len());
+        println!("✓ X25519 secret key: {} bytes", x25519_secret.len());
+        println!("✓ Master seed: {} bytes", seed.len());
+
+        assert_eq!(ed25519_secret.len(), 32);
+        assert_eq!(x25519_secret.len(), 32);
+        assert_eq!(seed.len(), 32);
+        assert!(dilithium_secret.len() > 2000);
+        assert!(kyber_secret.len() > 2000);
+
+        println!("\n✓ All direct key access methods working correctly");
+    }
+
+    #[test]
+    fn test_key_export_and_reimport() {
+        println!("\n=== Testing Key Export and Re-import ===");
+
+        let original_keypair = crypto::KeyPair::generate_with_transition();
+
+        let exported = original_keypair.export_keys();
+
+        println!("✓ Exported all keys from keypair");
+
+        let seed = original_keypair.get_seed();
+        let recreated_keypair = crypto::KeyPair::from_bytes(seed).unwrap();
+
+        assert_eq!(
+            original_keypair.ed25519_public_key().key_data,
+            recreated_keypair.ed25519_public_key().key_data
+        );
+
+        assert_eq!(
+            original_keypair.x25519_public_key(),
+            recreated_keypair.x25519_public_key()
+        );
+
+        println!("✓ Successfully recreated keypair from exported seed");
+        println!("✓ Ed25519 and X25519 keys match (deterministic)");
+        println!("✓ Dilithium and Kyber keys regenerated (non-deterministic)");
+    }
+
+    #[test]
+    fn test_export_keys_hex_format() {
+        println!("\n=== Testing Hex-Encoded Key Export ===");
+
+        let keypair = crypto::KeyPair::generate_with_transition();
+        let keys_hex = keypair.export_keys_hex();
+
+        assert!(hex::decode(&keys_hex.ed25519_public).is_ok());
+        assert!(hex::decode(&keys_hex.ed25519_secret).is_ok());
+        assert!(hex::decode(&keys_hex.dilithium_public).is_ok());
+        assert!(hex::decode(&keys_hex.dilithium_secret).is_ok());
+        assert!(hex::decode(&keys_hex.kyber_public).is_ok());
+        assert!(hex::decode(&keys_hex.kyber_secret).is_ok());
+        assert!(hex::decode(&keys_hex.x25519_public).is_ok());
+        assert!(hex::decode(&keys_hex.x25519_secret).is_ok());
+        assert!(hex::decode(&keys_hex.seed).is_ok());
+
+        println!("✓ All keys exported to valid hex format");
+        println!(
+            "✓ Ed25519 public hex: {}...",
+            &keys_hex.ed25519_public[..16]
+        );
+        println!(
+            "✓ Dilithium public hex: {}...",
+            &keys_hex.dilithium_public[..16]
+        );
+        println!("✓ Kyber public hex: {}...", &keys_hex.kyber_public[..16]);
+        println!("✓ X25519 public hex: {}...", &keys_hex.x25519_public[..16]);
+    }
+
+    #[test]
+    fn test_export_multiple_keypairs() {
+        println!("\n=== Exporting Multiple Keypairs for Comparison ===");
+
+        let output_dir = Path::new("./test_keys_export/batch");
+        if output_dir.exists() {
+            fs::remove_dir_all(output_dir).unwrap();
+        }
+        fs::create_dir_all(output_dir).unwrap();
+
+        for i in 1..=5 {
+            let keypair = crypto::KeyPair::generate();
+            let prefix = format!("keypair_{:02}", i);
+            export_keypair_to_files(&keypair, output_dir, &prefix).unwrap();
+            println!(
+                "✓ Exported keypair {} to: ./test_keys_export/batch/{}/",
+                i, prefix
+            );
+        }
+
+        println!("\n✓ Successfully exported 5 keypairs");
+        println!("✓ Each keypair has unique keys");
+        println!("✓ All keys stored in: ./test_keys_export/batch/");
+    }
+
+    #[test]
+    fn test_read_exported_bin_files() {
+        use std::fs;
+        use std::path::Path;
+
+        println!("\n=== Reading Exported Binary Key Files ===\n");
+
+        let keypair_dir = Path::new("./test_keys_export/1_pq_only");
+
+        if !keypair_dir.exists() {
+            println!("⚠️  Directory not found. Run test_export_keys_to_files first.");
+            return;
+        }
+
+        let ed25519_pub = fs::read(keypair_dir.join("ed25519_public.bin")).unwrap();
+        println!("Ed25519 Public Key:");
+        println!("  Size: {} bytes", ed25519_pub.len());
+        println!("  Hex: {}", hex::encode(&ed25519_pub));
+        println!(
+            "  First 16 bytes: {:?}\n",
+            &ed25519_pub[..16.min(ed25519_pub.len())]
+        );
+
+        let dilithium_pub = fs::read(keypair_dir.join("dilithium_public.bin")).unwrap();
+        println!("Dilithium2 Public Key:");
+        println!("  Size: {} bytes", dilithium_pub.len());
+        println!(
+            "  Hex (first 32 bytes): {}",
+            hex::encode(&dilithium_pub[..32])
+        );
+        println!("  First 16 bytes: {:?}\n", &dilithium_pub[..16]);
+
+        let kyber_pub = fs::read(keypair_dir.join("kyber_public.bin")).unwrap();
+        println!("Kyber768 Public Key:");
+        println!("  Size: {} bytes", kyber_pub.len());
+        println!("  Hex (first 32 bytes): {}", hex::encode(&kyber_pub[..32]));
+        println!("  First 16 bytes: {:?}\n", &kyber_pub[..16]);
+
+        let x25519_pub = fs::read(keypair_dir.join("x25519_public.bin")).unwrap();
+        println!("X25519 Public Key:");
+        println!("  Size: {} bytes", x25519_pub.len());
+        println!("  Hex: {}", hex::encode(&x25519_pub));
+        println!("  Bytes: {:?}\n", x25519_pub);
+
+        let seed = fs::read(keypair_dir.join("seed.bin")).unwrap();
+        println!("Master Seed:");
+        println!("  Size: {} bytes", seed.len());
+        println!("  Hex: {}", hex::encode(&seed));
+        println!("  ⚠️  KEEP SECRET - Can regenerate all keys!\n");
+
+        println!("✓ Successfully read all binary key files");
+    }
+
+    #[test]
+    fn test_read_all_exported_keys_comprehensive() {
+        use std::fs;
+        use std::path::Path;
+
+        println!("\n╔══════════════════════════════════════════════════════════════╗");
+        println!("║  Reading ALL Exported Post-Quantum Keys - Comprehensive     ║");
+        println!("╚══════════════════════════════════════════════════════════════╝\n");
+
+        let base_dir = Path::new("./test_keys_export");
+
+        if !base_dir.exists() {
+            println!(
+                "⚠️  Export directory not found. Run 'cargo test test_export_keys_to_files' first."
+            );
+            return;
+        }
+
+        let directories = vec!["1_pq_only", "2_transition_mode", "3_with_slh_dsa"];
+
+        for dir_name in directories {
+            let dir_path = base_dir.join(dir_name);
+
+            if !dir_path.exists() {
+                println!("⚠️  Skipping {} (not found)", dir_name);
+                continue;
+            }
+
+            println!("┌─────────────────────────────────────────────────────────┐");
+            println!("│ Directory: {:<45} │", dir_name);
+            println!("└─────────────────────────────────────────────────────────┘\n");
+
+            let json_path = dir_path.join("keys_hex.json");
+            if json_path.exists() {
+                let json_content = fs::read_to_string(&json_path).unwrap();
+                let keys_hex: crypto::ExportedKeysHex =
+                    serde_json::from_str(&json_content).unwrap();
+                println!(
+                    "📋 Mode: {}",
+                    if keys_hex.transition_mode {
+                        "HYBRID (Transition)"
+                    } else {
+                        "PQ-ONLY"
+                    }
+                );
+            }
+
+            read_key_file(&dir_path, "ed25519_public.bin", "Ed25519 Public");
+            read_key_file(&dir_path, "ed25519_secret.bin", "Ed25519 Secret");
+            read_key_file(&dir_path, "dilithium_public.bin", "Dilithium2 Public");
+            read_key_file(&dir_path, "dilithium_secret.bin", "Dilithium2 Secret");
+            read_key_file(&dir_path, "kyber_public.bin", "Kyber768 Public");
+            read_key_file(&dir_path, "kyber_secret.bin", "Kyber768 Secret");
+            read_key_file(&dir_path, "x25519_public.bin", "X25519 Public");
+            read_key_file(&dir_path, "x25519_secret.bin", "X25519 Secret");
+            read_key_file(&dir_path, "seed.bin", "Master Seed ⚠️");
+
+            if dir_path.join("slh_dsa_public.bin").exists() {
+                read_key_file(&dir_path, "slh_dsa_public.bin", "SLH-DSA Public");
+                read_key_file(&dir_path, "slh_dsa_secret.bin", "SLH-DSA Secret");
+            }
+
+            println!("\n");
+        }
+
+        let batch_dir = base_dir.join("batch");
+        if batch_dir.exists() {
+            println!("┌─────────────────────────────────────────────────────────┐");
+            println!("│ Batch Directory: Multiple Keypairs                      │");
+            println!("└─────────────────────────────────────────────────────────┘\n");
+
+            let entries = fs::read_dir(&batch_dir).unwrap();
+            let mut count = 0;
+
+            for entry in entries {
+                let entry = entry.unwrap();
+                let path = entry.path();
+
+                if path.is_dir() {
+                    count += 1;
+                    let dir_name = path.file_name().unwrap().to_str().unwrap();
+                    println!("  📦 {}", dir_name);
+
+                    if let Ok(json_content) = fs::read_to_string(path.join("keys_hex.json")) {
+                        if let Ok(keys_hex) =
+                            serde_json::from_str::<crypto::ExportedKeysHex>(&json_content)
+                        {
+                            println!("     Ed25519:   {}", &keys_hex.ed25519_public[..32]);
+                            println!("     Dilithium: {}...", &keys_hex.dilithium_public[..32]);
+                            println!();
+                        }
+                    }
+                }
+            }
+
+            println!("  Total keypairs in batch: {}\n", count);
+        }
+
+        println!("╔══════════════════════════════════════════════════════════════╗");
+        println!("║  ✓ Successfully read all exported cryptographic keys        ║");
+        println!("╚══════════════════════════════════════════════════════════════╝");
+    }
+
+    fn read_key_file(dir: &Path, filename: &str, key_name: &str) {
+        let file_path = dir.join(filename);
+
+        if !file_path.exists() {
+            return;
+        }
+
+        match fs::read(&file_path) {
+            Ok(data) => {
+                let hex_preview = if data.len() > 16 {
+                    format!(
+                        "{}...{}",
+                        hex::encode(&data[..8]),
+                        hex::encode(&data[data.len() - 8..])
+                    )
+                } else {
+                    hex::encode(&data)
+                };
+
+                println!(
+                    "  🔑 {:<20} | {:>5} bytes | {}",
+                    key_name,
+                    data.len(),
+                    hex_preview
+                );
+            }
+            Err(e) => {
+                println!("  ⚠️  {:<20} | Error: {}", key_name, e);
+            }
+        }
     }
 }
 

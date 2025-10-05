@@ -21,3 +21,4 @@ dist-ssr
 *.sln
 *.sw?
 .env
+test_keys_export
