@@ -150,7 +150,7 @@ impl StateManager {
         }
 
         let account = match account_type {
-            AccountType::EOA => Account::new_eoa(address, vec![0u8; 1312]),
+            AccountType::EOA => Account::new_eoa(address, vec![0u8; 1312], vec![0u8; 1184]),
             AccountType::Device {
                 device_id,
                 geohash: _,
@@ -163,12 +163,17 @@ impl StateManager {
                     hardware_specs: HashMap::new(),
                     last_poc: None,
                     post_stats: Default::default(),
+                    cellular_safe: true,
+                    max_bandwidth_cellular: 50_000_000,
+                    monthly_data_limit_gb: 10,
+                    cost_awareness: Default::default(),
                 };
                 Account::new_device(
                     address,
                     device_id,
                     capabilities,
                     vec![0u8; 1312],
+                    vec![0u8; 1184],
                     "peer_id".to_string(),
                 )
             }
@@ -182,6 +187,7 @@ impl StateManager {
                 commission_rate,
                 Balance::ZERO,
                 vec![0u8; 1312],
+                vec![0u8; 1184],
             )?,
             AccountType::Contract { .. } => {
                 return Err(EgoError::InvalidTransaction(
@@ -219,7 +225,7 @@ impl StateManager {
                 account_address,
                 account_type,
                 initial_balance,
-                dilithium_pk: _,
+                ..
             } => self.execute_create_account(
                 &mut sender,
                 *account_address,
@@ -234,6 +240,7 @@ impl StateManager {
                 data_hash,
                 slice_id,
                 storage_credits,
+                ..
             } => self.execute_store_data(
                 &mut sender,
                 *chunk_id,
@@ -248,12 +255,17 @@ impl StateManager {
                 amount,
                 validator_pubkey,
                 commission_rate,
-            } => self.execute_stake(&mut sender, *amount, *validator_pubkey, *commission_rate)?,
+            } => self.execute_stake(
+                &mut sender,
+                *amount,
+                validator_pubkey.clone(),
+                *commission_rate,
+            )?,
 
             TransactionPayload::Delegate {
                 amount,
                 validator_pubkey,
-            } => self.execute_delegate(&mut sender, *amount, *validator_pubkey)?,
+            } => self.execute_delegate(&mut sender, *amount, validator_pubkey.clone())?,
 
             _ => TransactionResult {
                 tx_hash: tx.hash,
@@ -264,6 +276,7 @@ impl StateManager {
                 state_changes: Vec::new(),
                 events: Vec::new(),
                 cross_shard_receipts: Vec::new(),
+                pq_verification_result: Default::default(),
             },
         };
 
@@ -284,7 +297,7 @@ impl StateManager {
 
         let mut recipient = self
             .get_account(&to)
-            .unwrap_or_else(|| Account::new_eoa(to, vec![0u8; 1312]));
+            .unwrap_or_else(|| Account::new_eoa(to, vec![0u8; 1312], vec![0u8; 1184]));
         recipient.credit(amount);
 
         self.set_account(recipient);
@@ -329,6 +342,7 @@ impl StateManager {
                 tx_index: 0,
             }],
             cross_shard_receipts: Vec::new(),
+            pq_verification_result: Default::default(),
         })
     }
 
@@ -373,6 +387,7 @@ impl StateManager {
                 tx_index: 0,
             }],
             cross_shard_receipts: Vec::new(),
+            pq_verification_result: Default::default(),
         })
     }
 
@@ -429,6 +444,7 @@ impl StateManager {
                 tx_index: 0,
             }],
             cross_shard_receipts: Vec::new(),
+            pq_verification_result: Default::default(),
         })
     }
 
@@ -474,7 +490,7 @@ impl StateManager {
 
             let validator_info = ValidatorInfo {
                 address: validator_address,
-                public_key: validator_pubkey,
+                public_key: validator_pubkey.clone(),
                 total_stake: amount,
                 own_stake: amount,
                 commission_rate: commission,
@@ -512,6 +528,7 @@ impl StateManager {
                 tx_index: 0,
             }],
             cross_shard_receipts: Vec::new(),
+            pq_verification_result: Default::default(),
         })
     }
 
@@ -559,6 +576,7 @@ impl StateManager {
                 tx_index: 0,
             }],
             cross_shard_receipts: Vec::new(),
+            pq_verification_result: Default::default(),
         })
     }
 
