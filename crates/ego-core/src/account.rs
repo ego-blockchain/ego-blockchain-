@@ -13,7 +13,9 @@ pub struct Account {
 
     pub dilithium_pk: Vec<u8>,
     pub ed25519_pk: Option<Vec<u8>>,
-    pub mlkem_pk: Option<Vec<u8>>,
+    pub mlkem_pk: Vec<u8>,
+    pub x25519_pk: Option<Vec<u8>>,
+    pub slh_dsa_pk: Option<Vec<u8>>,
 
     pub storage_quota: u64,
     pub storage_used: u64,
@@ -38,6 +40,16 @@ pub struct Account {
     pub authorized_slices: Vec<SliceId>,
     pub device_capabilities: Option<DeviceCapabilities>,
     pub metadata: HashMap<String, String>,
+
+    pub pq_transition_info: Option<PQTransitionInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct PQTransitionInfo {
+    pub transition_started_epoch: u64,
+    pub pq_only_mode: bool,
+    pub ed25519_disabled_epoch: Option<u64>,
+    pub supported_algorithms: Vec<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -76,7 +88,7 @@ pub enum AccountType {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct DeviceCapabilities {
     pub bandwidth_capacity: u64,
     pub storage_capacity: u64,
@@ -85,6 +97,19 @@ pub struct DeviceCapabilities {
     pub hardware_specs: HashMap<String, String>,
     pub last_poc: Option<Timestamp>,
     pub post_stats: PostStats,
+    pub cellular_safe: bool,
+    pub max_bandwidth_cellular: u64,
+    pub monthly_data_limit_gb: u64,
+    pub cost_awareness: CostAwareness,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct CostAwareness {
+    pub cellular_safe_mode: bool,
+    pub max_monthly_cost_usd: f64,
+    pub current_month_usage_gb: u64,
+    pub wifi_only_operations: Vec<String>,
+    pub cellular_throttle_threshold_gb: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -94,6 +119,8 @@ pub struct PostStats {
     pub last_proof: Option<Timestamp>,
     pub challenges_responded: u64,
     pub integrity_score: u8,
+    pub proof_frequency_hz: f64,
+    pub batch_enabled: bool,
 }
 
 impl PartialEq for PostStats {
@@ -105,8 +132,6 @@ impl PartialEq for PostStats {
             && self.integrity_score == other.integrity_score
     }
 }
-
-impl Eq for PostStats {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct StakingInfo {
@@ -140,7 +165,7 @@ pub struct SlashingEvent {
     pub evidence_hash: Hash,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct ValidatorPerformance {
     pub blocks_validated: u64,
     pub uptime_percentage: u64,
@@ -149,20 +174,8 @@ pub struct ValidatorPerformance {
     pub penalties: u32,
 }
 
-impl PartialEq for ValidatorPerformance {
-    fn eq(&self, other: &Self) -> bool {
-        self.blocks_validated == other.blocks_validated
-            && self.uptime_percentage == other.uptime_percentage
-            && self.attestation_accuracy == other.attestation_accuracy
-            && self.last_active_epoch == other.last_active_epoch
-            && self.penalties == other.penalties
-    }
-}
-
-impl Eq for ValidatorPerformance {}
-
 impl Account {
-    pub fn new_eoa(address: Address, dilithium_pk: Vec<u8>) -> Self {
+    pub fn new_eoa(address: Address, dilithium_pk: Vec<u8>, mlkem_pk: Vec<u8>) -> Self {
         let now = Timestamp::now();
         Self {
             address,
@@ -173,7 +186,9 @@ impl Account {
             last_activity: now,
             dilithium_pk,
             ed25519_pk: None,
-            mlkem_pk: None,
+            mlkem_pk,
+            x25519_pk: None,
+            slh_dsa_pk: None,
             storage_quota: 1024 * 1024,
             storage_used: 0,
             storage_credits: 0,
@@ -191,6 +206,16 @@ impl Account {
             authorized_slices: Vec::new(),
             device_capabilities: None,
             metadata: HashMap::new(),
+            pq_transition_info: Some(PQTransitionInfo {
+                transition_started_epoch: 0,
+                pq_only_mode: false,
+                ed25519_disabled_epoch: None,
+                supported_algorithms: vec![
+                    crate::AlgorithmId::MlDsa2.as_u16(),
+                    crate::AlgorithmId::Ed25519.as_u16(),
+                    crate::AlgorithmId::MlKem768.as_u16(),
+                ],
+            }),
         }
     }
 
@@ -205,7 +230,9 @@ impl Account {
             last_activity: now,
             dilithium_pk: vec![0u8; 1312],
             ed25519_pk: None,
-            mlkem_pk: None,
+            mlkem_pk: vec![0u8; 1184],
+            x25519_pk: None,
+            slh_dsa_pk: None,
             storage_quota: 10 * 1024 * 1024,
             storage_used: 0,
             storage_credits: 1000,
@@ -223,6 +250,16 @@ impl Account {
             authorized_slices: Vec::new(),
             device_capabilities: None,
             metadata: HashMap::new(),
+            pq_transition_info: Some(PQTransitionInfo {
+                transition_started_epoch: 0,
+                pq_only_mode: false,
+                ed25519_disabled_epoch: None,
+                supported_algorithms: vec![
+                    crate::AlgorithmId::MlDsa2.as_u16(),
+                    crate::AlgorithmId::Ed25519.as_u16(),
+                    crate::AlgorithmId::MlKem768.as_u16(),
+                ],
+            }),
         }
     }
 
@@ -231,6 +268,7 @@ impl Account {
         device_id: String,
         capabilities: DeviceCapabilities,
         dilithium_pk: Vec<u8>,
+        mlkem_pk: Vec<u8>,
         peer_id: String,
     ) -> Self {
         let now = Timestamp::now();
@@ -243,7 +281,9 @@ impl Account {
             last_activity: now,
             dilithium_pk,
             ed25519_pk: None,
-            mlkem_pk: None,
+            mlkem_pk,
+            x25519_pk: None,
+            slh_dsa_pk: None,
             storage_quota: capabilities.storage_capacity,
             storage_used: 0,
             storage_credits: 1000,
@@ -264,6 +304,16 @@ impl Account {
             authorized_slices: capabilities.supported_slices.clone(),
             device_capabilities: Some(capabilities),
             metadata: HashMap::new(),
+            pq_transition_info: Some(PQTransitionInfo {
+                transition_started_epoch: 0,
+                pq_only_mode: false,
+                ed25519_disabled_epoch: None,
+                supported_algorithms: vec![
+                    crate::AlgorithmId::MlDsa2.as_u16(),
+                    crate::AlgorithmId::Ed25519.as_u16(),
+                    crate::AlgorithmId::MlKem768.as_u16(),
+                ],
+            }),
         }
     }
 
@@ -282,7 +332,9 @@ impl Account {
             last_activity: now,
             dilithium_pk: vec![0u8; 1312],
             ed25519_pk: None,
-            mlkem_pk: None,
+            mlkem_pk: vec![0u8; 1184],
+            x25519_pk: None,
+            slh_dsa_pk: None,
             storage_quota: capabilities.storage_capacity,
             storage_used: 0,
             storage_credits: 1000,
@@ -303,6 +355,16 @@ impl Account {
             authorized_slices: capabilities.supported_slices.clone(),
             device_capabilities: Some(capabilities),
             metadata: HashMap::new(),
+            pq_transition_info: Some(PQTransitionInfo {
+                transition_started_epoch: 0,
+                pq_only_mode: false,
+                ed25519_disabled_epoch: None,
+                supported_algorithms: vec![
+                    crate::AlgorithmId::MlDsa2.as_u16(),
+                    crate::AlgorithmId::Ed25519.as_u16(),
+                    crate::AlgorithmId::MlKem768.as_u16(),
+                ],
+            }),
         }
     }
 
@@ -312,6 +374,7 @@ impl Account {
         commission_rate: u16,
         initial_stake: Balance,
         dilithium_pk: Vec<u8>,
+        mlkem_pk: Vec<u8>,
     ) -> EgoResult<Self> {
         if commission_rate > 10000 {
             return Err(EgoError::InvalidTransaction(
@@ -335,7 +398,7 @@ impl Account {
         };
 
         let validator_info = ValidatorInfo {
-            validator_pubkey,
+            validator_pubkey: validator_pubkey.clone(),
             commission_rate,
             is_active: true,
             jail_info: None,
@@ -350,7 +413,9 @@ impl Account {
             last_activity: now,
             dilithium_pk,
             ed25519_pk: None,
-            mlkem_pk: None,
+            mlkem_pk,
+            x25519_pk: None,
+            slh_dsa_pk: None,
             storage_quota: 10 * 1024 * 1024,
             storage_used: 0,
             storage_credits: 10000,
@@ -372,6 +437,16 @@ impl Account {
             authorized_slices: Vec::new(),
             device_capabilities: None,
             metadata: HashMap::new(),
+            pq_transition_info: Some(PQTransitionInfo {
+                transition_started_epoch: 0,
+                pq_only_mode: false,
+                ed25519_disabled_epoch: None,
+                supported_algorithms: vec![
+                    crate::AlgorithmId::MlDsa2.as_u16(),
+                    crate::AlgorithmId::Ed25519.as_u16(),
+                    crate::AlgorithmId::MlKem768.as_u16(),
+                ],
+            }),
         })
     }
 
@@ -509,16 +584,70 @@ impl Account {
         Ok(())
     }
 
+    pub fn is_pq_only_mode(&self) -> bool {
+        self.pq_transition_info
+            .as_ref()
+            .map_or(false, |info| info.pq_only_mode)
+    }
+
+    pub fn supports_algorithm(&self, algorithm_id: u16) -> bool {
+        self.pq_transition_info.as_ref().map_or(false, |info| {
+            info.supported_algorithms.contains(&algorithm_id)
+        })
+    }
+
+    pub fn enable_pq_only_mode(&mut self, epoch: u64) {
+        if let Some(ref mut pq_info) = self.pq_transition_info {
+            pq_info.pq_only_mode = true;
+            pq_info.ed25519_disabled_epoch = Some(epoch);
+            pq_info
+                .supported_algorithms
+                .retain(|&id| id != crate::AlgorithmId::Ed25519.as_u16());
+        }
+        self.last_activity = Timestamp::now();
+    }
+
+    pub fn is_cellular_safe(&self) -> bool {
+        self.device_capabilities
+            .as_ref()
+            .map_or(true, |caps| caps.cellular_safe)
+    }
+
+    pub fn within_data_limits(&self, data_size_gb: u64) -> bool {
+        if let Some(ref caps) = self.device_capabilities {
+            caps.cost_awareness.current_month_usage_gb + data_size_gb
+                <= caps.cost_awareness.cellular_throttle_threshold_gb
+        } else {
+            true
+        }
+    }
+
+    pub fn should_use_wifi_only(&self, operation: &str) -> bool {
+        self.device_capabilities.as_ref().map_or(false, |caps| {
+            caps.cost_awareness.cellular_safe_mode
+                && caps
+                    .cost_awareness
+                    .wifi_only_operations
+                    .contains(&operation.to_string())
+        })
+    }
+
     pub fn summary(&self) -> String {
+        let pq_status = if self.is_pq_only_mode() {
+            "PQ-Only"
+        } else {
+            "Hybrid"
+        };
         format!(
-            "Account {} - Balance: {}, Type: {:?}, Nonce: {}, Storage: {}/{}, DRS: {:?}",
+            "Account {} - Balance: {}, Type: {:?}, Nonce: {}, Storage: {}/{}, DRS: {:?}, PQ: {}",
             self.address,
             self.balance,
             self.account_type,
             self.nonce,
             self.storage_used,
             self.storage_quota,
-            self.last_drs_score.map(|s| s as f64 / 1000.0)
+            self.last_drs_score.map(|s| s as f64 / 1000.0),
+            pq_status
         )
     }
 
@@ -534,11 +663,11 @@ impl Account {
         match &self.account_type {
             AccountType::Validator {
                 validator_pubkey, ..
-            } => Some(*validator_pubkey),
+            } => Some(validator_pubkey.clone()),
             _ => self
                 .validator_info
                 .as_ref()
-                .map(|info| info.validator_pubkey),
+                .map(|info| info.validator_pubkey.clone()),
         }
     }
 }
@@ -551,6 +680,24 @@ impl Default for PostStats {
             last_proof: None,
             challenges_responded: 0,
             integrity_score: 100,
+            proof_frequency_hz: 0.5,
+            batch_enabled: true,
+        }
+    }
+}
+
+impl Default for CostAwareness {
+    fn default() -> Self {
+        Self {
+            cellular_safe_mode: true,
+            max_monthly_cost_usd: 50.0,
+            current_month_usage_gb: 0,
+            wifi_only_operations: vec![
+                "heavy_compute".to_string(),
+                "large_storage".to_string(),
+                "bulk_sync".to_string(),
+            ],
+            cellular_throttle_threshold_gb: 5,
         }
     }
 }

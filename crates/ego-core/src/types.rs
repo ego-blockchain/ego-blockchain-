@@ -14,33 +14,33 @@ use std::fmt;
     bincode::Decode,
 )]
 pub enum AlgorithmId {
-    Ed25519 = 1,
-    MlDsa2 = 2,
-    SlhDsa = 3,
-    X25519 = 4,
-    MlKem768 = 5,
-    XChaCha20Poly1305 = 6,
-    Blake2s = 7,
-    HkdfBlake2s = 8,
+    Ed25519 = 0xED01,
+    MlDsa2 = 0x0202,
+    SlhDsa = 0x0303,
+    X25519 = 0x0101,
+    MlKem768 = 0x0302,
+    XChaCha20Poly1305 = 0x0401,
+    Blake2s256 = 0x0501,
+    HkdfBlake2s = 0x0502,
 }
 
 impl AlgorithmId {
-    pub fn from_u8(value: u8) -> Option<Self> {
+    pub fn from_u16(value: u16) -> Option<Self> {
         match value {
-            1 => Some(Self::Ed25519),
-            2 => Some(Self::MlDsa2),
-            3 => Some(Self::SlhDsa),
-            4 => Some(Self::X25519),
-            5 => Some(Self::MlKem768),
-            6 => Some(Self::XChaCha20Poly1305),
-            7 => Some(Self::Blake2s),
-            8 => Some(Self::HkdfBlake2s),
+            0xED01 => Some(Self::Ed25519),
+            0x0202 => Some(Self::MlDsa2),
+            0x0303 => Some(Self::SlhDsa),
+            0x0101 => Some(Self::X25519),
+            0x0302 => Some(Self::MlKem768),
+            0x0401 => Some(Self::XChaCha20Poly1305),
+            0x0501 => Some(Self::Blake2s256),
+            0x0502 => Some(Self::HkdfBlake2s),
             _ => None,
         }
     }
 
-    pub fn as_u8(&self) -> u8 {
-        *self as u8
+    pub fn as_u16(&self) -> u16 {
+        *self as u16
     }
 }
 
@@ -102,10 +102,10 @@ impl From<[u8; 32]> for Hash {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, bincode::Encode, bincode::Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, bincode::Encode, bincode::Decode)]
 pub struct PublicKey {
     pub algorithm: AlgorithmId,
-    pub key_data: [u8; 64],
+    pub key_data: Vec<u8>,
 }
 
 impl Serialize for PublicKey {
@@ -116,7 +116,7 @@ impl Serialize for PublicKey {
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("PublicKey", 2)?;
         state.serialize_field("algorithm", &self.algorithm)?;
-        state.serialize_field("key_data", &self.key_data.as_slice())?;
+        state.serialize_field("key_data", &self.key_data)?;
         state.end()
     }
 }
@@ -133,60 +133,39 @@ impl<'de> Deserialize<'de> for PublicKey {
         }
 
         let helper = PublicKeyHelper::deserialize(deserializer)?;
-        if helper.key_data.len() != 64 {
-            return Err(serde::de::Error::custom(format!(
-                "Expected 64 bytes, got {}",
-                helper.key_data.len()
-            )));
-        }
-
-        let mut key_data = [0u8; 64];
-        key_data.copy_from_slice(&helper.key_data);
-
         Ok(PublicKey {
             algorithm: helper.algorithm,
-            key_data,
+            key_data: helper.key_data,
         })
     }
 }
 
 impl PublicKey {
-    pub fn new(algorithm: AlgorithmId, key_data: &[u8]) -> Self {
-        let mut data = [0u8; 64];
-        let len = key_data.len().min(64);
-        data[..len].copy_from_slice(&key_data[..len]);
+    pub fn new(algorithm: AlgorithmId, key_data: Vec<u8>) -> Self {
         Self {
             algorithm,
-            key_data: data,
+            key_data,
         }
     }
 
     pub fn ed25519(bytes: [u8; 32]) -> Self {
-        let mut data = [0u8; 64];
-        data[..32].copy_from_slice(&bytes);
         Self {
             algorithm: AlgorithmId::Ed25519,
-            key_data: data,
+            key_data: bytes.to_vec(),
         }
     }
 
-    pub fn dilithium2(key_data: &[u8]) -> Self {
-        let mut data = [0u8; 64];
-        let len = key_data.len().min(64);
-        data[..len].copy_from_slice(&key_data[..len]);
+    pub fn dilithium2(key_data: Vec<u8>) -> Self {
         Self {
             algorithm: AlgorithmId::MlDsa2,
-            key_data: data,
+            key_data,
         }
     }
 
-    pub fn kyber768(key_data: &[u8]) -> Self {
-        let mut data = [0u8; 64];
-        let len = key_data.len().min(64);
-        data[..len].copy_from_slice(&key_data[..len]);
+    pub fn kyber768(key_data: Vec<u8>) -> Self {
         Self {
             algorithm: AlgorithmId::MlKem768,
-            key_data: data,
+            key_data,
         }
     }
 
@@ -196,26 +175,33 @@ impl PublicKey {
 
     pub fn to_vec(&self) -> Vec<u8> {
         let mut result = Vec::new();
-        result.push(self.algorithm.as_u8());
+        result.extend_from_slice(&self.algorithm.as_u16().to_le_bytes());
+        result.extend_from_slice(&(self.key_data.len() as u32).to_le_bytes());
         result.extend_from_slice(&self.key_data);
         result
     }
 
     pub fn from_slice(slice: &[u8]) -> Result<Self, crate::EgoError> {
-        if slice.len() < 1 {
+        if slice.len() < 6 {
             return Err(crate::EgoError::CryptoError(
                 "Invalid public key format: too short".to_string(),
             ));
         }
 
-        let algorithm = AlgorithmId::from_u8(slice[0])
+        let alg_bytes = [slice[0], slice[1]];
+        let algorithm = AlgorithmId::from_u16(u16::from_le_bytes(alg_bytes))
             .ok_or_else(|| crate::EgoError::CryptoError("Invalid algorithm ID".to_string()))?;
 
-        let mut key_data = [0u8; 64];
-        let len = (slice.len() - 1).min(64);
-        if len > 0 {
-            key_data[..len].copy_from_slice(&slice[1..1 + len]);
+        let len_bytes = [slice[2], slice[3], slice[4], slice[5]];
+        let len = u32::from_le_bytes(len_bytes) as usize;
+
+        if slice.len() != 6 + len {
+            return Err(crate::EgoError::CryptoError(
+                "Invalid public key format: length mismatch".to_string(),
+            ));
         }
+
+        let key_data = slice[6..].to_vec();
 
         Ok(Self {
             algorithm,
@@ -224,9 +210,9 @@ impl PublicKey {
     }
 
     pub fn ed25519_bytes(&self) -> Option<[u8; 32]> {
-        if self.algorithm == AlgorithmId::Ed25519 {
+        if self.algorithm == AlgorithmId::Ed25519 && self.key_data.len() == 32 {
             let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(&self.key_data[..32]);
+            bytes.copy_from_slice(&self.key_data);
             Some(bytes)
         } else {
             None
@@ -240,7 +226,7 @@ impl fmt::Display for PublicKey {
             f,
             "{:?}:{}",
             self.algorithm,
-            hex::encode(&self.key_data[..32])
+            hex::encode(&self.key_data[..self.key_data.len().min(32)])
         )
     }
 }
@@ -273,37 +259,46 @@ impl Signature {
         }
     }
 
+    pub fn slh_dsa(signature_data: Vec<u8>) -> Self {
+        Self {
+            algorithm: AlgorithmId::SlhDsa,
+            signature_data,
+        }
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.signature_data
     }
 
     pub fn to_vec(&self) -> Vec<u8> {
         let mut result = Vec::new();
-        result.push(self.algorithm.as_u8());
+        result.extend_from_slice(&self.algorithm.as_u16().to_le_bytes());
         result.extend_from_slice(&(self.signature_data.len() as u32).to_le_bytes());
         result.extend_from_slice(&self.signature_data);
         result
     }
 
     pub fn from_slice(slice: &[u8]) -> Result<Self, crate::EgoError> {
-        if slice.len() < 5 {
+        if slice.len() < 6 {
             return Err(crate::EgoError::CryptoError(
                 "Invalid signature format: too short".to_string(),
             ));
         }
 
-        let algorithm = AlgorithmId::from_u8(slice[0])
+        let alg_bytes = [slice[0], slice[1]];
+        let algorithm = AlgorithmId::from_u16(u16::from_le_bytes(alg_bytes))
             .ok_or_else(|| crate::EgoError::CryptoError("Invalid algorithm ID".to_string()))?;
 
-        let len = u32::from_le_bytes([slice[1], slice[2], slice[3], slice[4]]) as usize;
+        let len_bytes = [slice[2], slice[3], slice[4], slice[5]];
+        let len = u32::from_le_bytes(len_bytes) as usize;
 
-        if slice.len() != 5 + len {
+        if slice.len() != 6 + len {
             return Err(crate::EgoError::CryptoError(
                 "Invalid signature format: length mismatch".to_string(),
             ));
         }
 
-        let signature_data = slice[5..].to_vec();
+        let signature_data = slice[6..].to_vec();
 
         Ok(Self {
             algorithm,
@@ -326,6 +321,7 @@ impl Signature {
 pub struct DualSignature {
     pub ed25519_sig: Option<Signature>,
     pub dilithium_sig: Option<Signature>,
+    pub protocol_version: u32,
 }
 
 impl DualSignature {
@@ -333,6 +329,7 @@ impl DualSignature {
         Self {
             ed25519_sig,
             dilithium_sig,
+            protocol_version: crate::PROTOCOL_VERSION,
         }
     }
 
@@ -340,6 +337,7 @@ impl DualSignature {
         Self {
             ed25519_sig: Some(sig),
             dilithium_sig: None,
+            protocol_version: crate::PROTOCOL_VERSION,
         }
     }
 
@@ -347,6 +345,7 @@ impl DualSignature {
         Self {
             ed25519_sig: None,
             dilithium_sig: Some(sig),
+            protocol_version: crate::PROTOCOL_VERSION,
         }
     }
 
@@ -354,6 +353,7 @@ impl DualSignature {
         Self {
             ed25519_sig: Some(ed25519_sig),
             dilithium_sig: Some(dilithium_sig),
+            protocol_version: crate::PROTOCOL_VERSION,
         }
     }
 }
@@ -364,6 +364,9 @@ pub struct SessionRecord {
     pub kyber_ciphertext: Vec<u8>,
     pub nonce: [u8; 24],
     pub aead_tag: Vec<u8>,
+    pub alg_kem_id: u16,
+    pub alg_dh_legacy_id: Option<u16>,
+    pub protocol_version: u32,
 }
 
 impl SessionRecord {
@@ -373,11 +376,132 @@ impl SessionRecord {
         nonce: [u8; 24],
         aead_tag: Vec<u8>,
     ) -> Self {
+        let alg_dh_legacy_id = x25519_pubkey.as_ref().map(|_| AlgorithmId::X25519.as_u16());
         Self {
             x25519_pubkey,
             kyber_ciphertext,
             nonce,
             aead_tag,
+            alg_kem_id: AlgorithmId::MlKem768.as_u16(),
+            alg_dh_legacy_id,
+            protocol_version: crate::PROTOCOL_VERSION,
+        }
+    }
+
+    pub fn hybrid(
+        x25519_pubkey: Vec<u8>,
+        kyber_ciphertext: Vec<u8>,
+        nonce: [u8; 24],
+        aead_tag: Vec<u8>,
+    ) -> Self {
+        Self {
+            x25519_pubkey: Some(x25519_pubkey),
+            kyber_ciphertext,
+            nonce,
+            aead_tag,
+            alg_kem_id: AlgorithmId::MlKem768.as_u16(),
+            alg_dh_legacy_id: Some(AlgorithmId::X25519.as_u16()),
+            protocol_version: crate::PROTOCOL_VERSION,
+        }
+    }
+
+    pub fn kyber_only(kyber_ciphertext: Vec<u8>, nonce: [u8; 24], aead_tag: Vec<u8>) -> Self {
+        Self {
+            x25519_pubkey: None,
+            kyber_ciphertext,
+            nonce,
+            aead_tag,
+            alg_kem_id: AlgorithmId::MlKem768.as_u16(),
+            alg_dh_legacy_id: None,
+            protocol_version: crate::PROTOCOL_VERSION,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct HandshakeInit {
+    pub version: u32,
+    pub alg_kem: u16,
+    pub alg_dh_legacy: Option<u16>,
+    pub x25519_c_pk: Option<Vec<u8>>,
+    pub ct_pq_c2s: Vec<u8>,
+    pub stream_kind: String,
+    pub stream_nonce: [u8; 32],
+    pub caps: Vec<u8>,
+    pub chain_id: Vec<u8>,
+}
+
+impl HandshakeInit {
+    pub fn new(
+        alg_kem: u16,
+        ct_pq_c2s: Vec<u8>,
+        stream_kind: String,
+        stream_nonce: [u8; 32],
+        caps: Vec<u8>,
+        chain_id: Vec<u8>,
+    ) -> Self {
+        Self {
+            version: crate::PROTOCOL_VERSION,
+            alg_kem,
+            alg_dh_legacy: None,
+            x25519_c_pk: None,
+            ct_pq_c2s,
+            stream_kind,
+            stream_nonce,
+            caps,
+            chain_id,
+        }
+    }
+
+    pub fn hybrid(
+        alg_kem: u16,
+        alg_dh_legacy: u16,
+        x25519_c_pk: Vec<u8>,
+        ct_pq_c2s: Vec<u8>,
+        stream_kind: String,
+        stream_nonce: [u8; 32],
+        caps: Vec<u8>,
+        chain_id: Vec<u8>,
+    ) -> Self {
+        Self {
+            version: crate::PROTOCOL_VERSION,
+            alg_kem,
+            alg_dh_legacy: Some(alg_dh_legacy),
+            x25519_c_pk: Some(x25519_c_pk),
+            ct_pq_c2s,
+            stream_kind,
+            stream_nonce,
+            caps,
+            chain_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct PeerCapabilities {
+    pub alg_sig_supported: Vec<u16>,
+    pub alg_kem_supported: Vec<u16>,
+    pub pq_required: bool,
+    pub mlkem_pk: Vec<u8>,
+    pub x25519_pk: Option<Vec<u8>>,
+    pub account_addr: Address,
+    pub supported_topics: Vec<String>,
+    pub max_bandwidth: u64,
+    pub cellular_safe: bool,
+}
+
+impl Default for PeerCapabilities {
+    fn default() -> Self {
+        Self {
+            alg_sig_supported: vec![AlgorithmId::MlDsa2.as_u16(), AlgorithmId::Ed25519.as_u16()],
+            alg_kem_supported: vec![AlgorithmId::MlKem768.as_u16()],
+            pq_required: false,
+            mlkem_pk: vec![0u8; 1184],
+            x25519_pk: Some(vec![0u8; 32]),
+            account_addr: Address::new([0u8; 20]),
+            supported_topics: Vec::new(),
+            max_bandwidth: 100_000_000,
+            cellular_safe: true,
         }
     }
 }

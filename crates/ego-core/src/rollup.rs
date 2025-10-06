@@ -239,6 +239,7 @@ impl RollupAggregator {
                 state_changes: Vec::new(),
                 events: Vec::new(),
                 cross_shard_receipts: Vec::new(),
+                pq_verification_result: None,
             };
 
             results.push(result);
