@@ -236,7 +236,6 @@ impl StateManager {
             TransactionPayload::StoreData {
                 chunk_id,
                 data_size,
-                duration,
                 data_hash,
                 slice_id,
                 storage_credits,
@@ -245,7 +244,7 @@ impl StateManager {
                 &mut sender,
                 *chunk_id,
                 *data_size,
-                *duration,
+                1000,
                 *data_hash,
                 slice_id.clone(),
                 *storage_credits,
@@ -255,6 +254,7 @@ impl StateManager {
                 amount,
                 validator_pubkey,
                 commission_rate,
+                lock_duration_epochs,
             } => self.execute_stake(
                 &mut sender,
                 *amount,
@@ -277,6 +277,7 @@ impl StateManager {
                 events: Vec::new(),
                 cross_shard_receipts: Vec::new(),
                 pq_verification_result: Default::default(),
+                proof_verifications: Vec::new(),
             },
         };
 
@@ -343,6 +344,7 @@ impl StateManager {
             }],
             cross_shard_receipts: Vec::new(),
             pq_verification_result: Default::default(),
+            proof_verifications: Vec::new(),
         })
     }
 
@@ -388,6 +390,7 @@ impl StateManager {
             }],
             cross_shard_receipts: Vec::new(),
             pq_verification_result: Default::default(),
+            proof_verifications: Vec::new(),
         })
     }
 
@@ -445,6 +448,7 @@ impl StateManager {
             }],
             cross_shard_receipts: Vec::new(),
             pq_verification_result: Default::default(),
+            proof_verifications: Vec::new(),
         })
     }
 
@@ -529,6 +533,7 @@ impl StateManager {
             }],
             cross_shard_receipts: Vec::new(),
             pq_verification_result: Default::default(),
+            proof_verifications: Vec::new(),
         })
     }
 
@@ -577,6 +582,7 @@ impl StateManager {
             }],
             cross_shard_receipts: Vec::new(),
             pq_verification_result: Default::default(),
+            proof_verifications: Vec::new(),
         })
     }
 

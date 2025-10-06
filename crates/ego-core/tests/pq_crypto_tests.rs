@@ -1216,6 +1216,7 @@ fn test_full_pq_workflow() {
             new_algorithms: vec![AlgorithmId::MlDsa2.as_u16()],
             disable_legacy: true,
             transition_epoch: 50,
+            migration_period_epochs: 50,
         },
         ShardId::new(0).unwrap(),
         None,

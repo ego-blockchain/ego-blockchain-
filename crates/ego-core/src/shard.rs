@@ -241,6 +241,7 @@ impl ShardManager {
                             events: Vec::new(),
                             cross_shard_receipts: Vec::new(),
                             pq_verification_result: Default::default(),
+                            proof_verifications: Vec::new(),
                         });
                     }
                 }
@@ -434,7 +435,6 @@ impl TransactionPool {
         match &tx.payload {
             crate::TransactionPayload::SystemOperation { .. } => 255,
             crate::TransactionPayload::CrossShard { .. } => 200,
-            crate::TransactionPayload::SubmitProof { .. } => 150,
             crate::TransactionPayload::RollupCommit { .. } => 100,
             crate::TransactionPayload::Transfer { .. } => 50,
             _ => 25,
