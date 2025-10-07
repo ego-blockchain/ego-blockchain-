@@ -5,6 +5,10 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub const DOMAINTAG_TX_V1: &[u8] = b"ego/tx/v1";
+pub const DOMAINTAG_HEADER_V1: &[u8] = b"ego/header/v1";
+pub const DOMAINTAG_EVENT_V1: &[u8] = b"ego/event/v1";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct Transaction {
     pub hash: Hash,
@@ -17,9 +21,13 @@ pub struct Transaction {
     pub shard_id: ShardId,
     pub slice_id: Option<SliceId>,
     pub protocol_version: u32,
+    pub chain_id: u32,
     pub required_algorithms: Vec<u16>,
-    pub gas_limit: u64,
-    pub priority_fee: Balance,
+
+    pub ru_limit: u64,
+    pub ru_estimate: u64,
+    pub pob_burn_credits: u64,
+    pub priority_hint: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -274,6 +282,20 @@ pub enum TransactionPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct TxOutStealth {
+    pub pk_1t: Vec<u8>,
+    pub enc: StealthEncryption,
+    pub receiver_pk_id: Option<Hash>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct StealthEncryption {
+    pub kyber_ct: Vec<u8>,
+    pub nonce24: [u8; 24],
+    pub aead_ct: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct TriadPlacement {
     pub primary: NodeLocation,
     pub replica_a: NodeLocation,
@@ -306,14 +328,21 @@ pub enum PlacementUpdateReason {
 pub struct ErasureCodingParams {
     pub k: u16,
     pub m: u16,
-    pub codec: String,
+    pub codec: ErasureCodec,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub enum ErasureCodec {
+    ReedSolomon,
+    LDPC,
+    Fountain,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct EncryptionEnvelope {
     pub kyber_ciphertexts: Vec<Vec<u8>>,
     pub recipient_addresses: Vec<Address>,
-    pub aes_nonce: [u8; 24],
+    pub nonce24: [u8; 24],
     pub auth_tag: Vec<u8>,
 }
 
@@ -366,7 +395,7 @@ pub struct SignalQuality {
 pub struct FraudProof {
     pub claim_hash: Hash,
     pub proof_data: Vec<u8>,
-    pub challenge_period_blocks: u64,
+    pub challenge_period_epochs: u64,
     pub fraud_type: FraudType,
 }
 
@@ -437,7 +466,7 @@ pub struct TransactionResult {
     pub tx_hash: Hash,
     pub success: bool,
     pub error: Option<String>,
-    pub compute_used: u64,
+    pub ru_used: u64,
     pub storage_used: u64,
     pub state_changes: Vec<StateChange>,
     pub events: Vec<TransactionEvent>,
@@ -498,11 +527,12 @@ pub struct TransactionEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct CrossShardReceipt {
-    pub from_shard: ShardId,
-    pub to_shard: ShardId,
+    pub src_shard: ShardId,
+    pub dst_shard: ShardId,
+    pub src_block_hash: Hash,
+    pub tx_id: Hash,
     pub payload: Vec<u8>,
     pub nonce: u64,
-    pub timestamp: Timestamp,
     pub deadline_epoch: u64,
     pub merkle_proof: Vec<Hash>,
 }
@@ -514,6 +544,7 @@ impl Transaction {
         payload: TransactionPayload,
         shard_id: ShardId,
         slice_id: Option<SliceId>,
+        chain_id: u32,
     ) -> Self {
         Self {
             hash: Hash::ZERO,
@@ -530,9 +561,12 @@ impl Transaction {
             shard_id,
             slice_id,
             protocol_version: crate::PROTOCOL_VERSION,
+            chain_id,
             required_algorithms: vec![AlgorithmId::MlDsa2.as_u16()],
-            gas_limit: 1_000_000,
-            priority_fee: Balance::ZERO,
+            ru_limit: 1_000_000,
+            ru_estimate: 100_000,
+            pob_burn_credits: 0,
+            priority_hint: 0,
         }
     }
 
@@ -598,13 +632,20 @@ impl Transaction {
 
     fn create_signing_data(&self) -> EgoResult<Vec<u8>> {
         let mut data = Vec::new();
+
+        data.extend_from_slice(DOMAINTAG_TX_V1);
+
         data.extend_from_slice(self.from.as_bytes());
         data.extend_from_slice(&self.nonce.to_le_bytes());
         data.extend_from_slice(&self.timestamp.as_millis().to_le_bytes());
         data.extend_from_slice(&self.shard_id.as_u32().to_le_bytes());
         data.extend_from_slice(&self.protocol_version.to_le_bytes());
-        data.extend_from_slice(&self.gas_limit.to_le_bytes());
-        data.extend_from_slice(&self.priority_fee.as_u128().to_le_bytes());
+        data.extend_from_slice(&self.chain_id.to_le_bytes());
+
+        data.extend_from_slice(&self.ru_limit.to_le_bytes());
+        data.extend_from_slice(&self.ru_estimate.to_le_bytes());
+        data.extend_from_slice(&self.pob_burn_credits.to_le_bytes());
+        data.extend_from_slice(&[self.priority_hint]);
 
         for &alg_id in &self.required_algorithms {
             data.extend_from_slice(&alg_id.to_le_bytes());
@@ -619,7 +660,7 @@ impl Transaction {
             .map_err(|e| EgoError::SerializationError(e.to_string()))?;
         data.extend_from_slice(&payload_bytes);
 
-        Ok(data)
+        Ok(crate::crypto::blake2s_hash(&data).to_vec())
     }
 
     fn signature_bytes(&self) -> Vec<u8> {
@@ -634,8 +675,8 @@ impl Transaction {
             .unwrap_or(0)
     }
 
-    pub fn estimate_compute_cost(&self) -> u64 {
-        let base_cost = match &self.payload {
+    pub fn estimate_resource_units(&self) -> u64 {
+        let base_ru = match &self.payload {
             TransactionPayload::Transfer { stealth_mode, .. } => {
                 if *stealth_mode {
                     500
@@ -645,9 +686,9 @@ impl Transaction {
             }
             TransactionPayload::CreateAccount { .. } => 1000,
             TransactionPayload::UpdateAccount { updates, .. } => {
-                let mut cost = 500;
-                cost += updates.metadata_updates.len() as u64 * 50;
-                cost
+                let mut ru = 500;
+                ru += updates.metadata_updates.len() as u64 * 50;
+                ru
             }
             TransactionPayload::StoreData {
                 data_size,
@@ -682,10 +723,7 @@ impl Transaction {
             TransactionPayload::Delegate { .. } => 400,
             TransactionPayload::UpdateValidatorMetrics { .. } => 1000,
             TransactionPayload::CrossShard { .. } => 1500,
-            TransactionPayload::DeployContract {
-                contract_code_hash: _,
-                ..
-            } => 5000,
+            TransactionPayload::DeployContract { .. } => 5000,
             TransactionPayload::ExecuteContract { .. } => 2000,
             TransactionPayload::SliceOperation { .. } => 2000,
             TransactionPayload::UpdateDRS { .. } => 1000,
@@ -701,7 +739,7 @@ impl Transaction {
             TransactionPayload::DAOVote { .. } => 500,
         };
 
-        let signature_cost =
+        let signature_ru =
             if self.signature.ed25519_sig.is_some() && self.signature.dilithium_sig.is_some() {
                 150
             } else if self.signature.dilithium_sig.is_some() {
@@ -710,7 +748,7 @@ impl Transaction {
                 50
             };
 
-        base_cost + signature_cost
+        base_ru + signature_ru
     }
 
     pub fn validate_against_account(&self, account: &Account) -> EgoResult<()> {
@@ -743,6 +781,12 @@ impl Transaction {
         if self.timestamp.as_millis() > now.as_millis() + 300_000 {
             return Err(EgoError::InvalidTransaction(
                 "Transaction timestamp too far in future".to_string(),
+            ));
+        }
+
+        if self.ru_estimate > self.ru_limit {
+            return Err(EgoError::InvalidTransaction(
+                "RU estimate exceeds RU limit".to_string(),
             ));
         }
 
@@ -960,6 +1004,10 @@ impl Transaction {
     }
 
     pub fn get_priority(&self) -> u8 {
+        if self.priority_hint > 0 {
+            return self.priority_hint;
+        }
+
         match &self.payload {
             TransactionPayload::SystemOperation {
                 epoch_anchor: true, ..
@@ -1126,6 +1174,28 @@ impl Transaction {
         }
         Ok(())
     }
+
+    pub fn extract_cross_shard_receipt(&self) -> Option<CrossShardReceipt> {
+        match &self.payload {
+            TransactionPayload::CrossShard {
+                target_shard,
+                message,
+                nonce,
+                deadline_epoch,
+                ..
+            } => Some(CrossShardReceipt {
+                src_shard: self.shard_id,
+                dst_shard: *target_shard,
+                src_block_hash: Hash::ZERO,
+                tx_id: self.hash,
+                payload: message.clone(),
+                nonce: *nonce,
+                deadline_epoch: *deadline_epoch,
+                merkle_proof: vec![],
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1165,20 +1235,26 @@ pub struct TransactionBuilder {
     payload: Option<TransactionPayload>,
     shard_id: ShardId,
     slice_id: Option<SliceId>,
-    gas_limit: u64,
-    priority_fee: Balance,
+    chain_id: u32,
+    ru_limit: u64,
+    ru_estimate: u64,
+    pob_burn_credits: u64,
+    priority_hint: u8,
 }
 
 impl TransactionBuilder {
-    pub fn new(from: Address, nonce: u64, shard_id: ShardId) -> Self {
+    pub fn new(from: Address, nonce: u64, shard_id: ShardId, chain_id: u32) -> Self {
         Self {
             from,
             nonce,
             payload: None,
             shard_id,
             slice_id: None,
-            gas_limit: 1_000_000,
-            priority_fee: Balance::ZERO,
+            chain_id,
+            ru_limit: 1_000_000,
+            ru_estimate: 100_000,
+            pob_burn_credits: 0,
+            priority_hint: 0,
         }
     }
 
@@ -1192,13 +1268,23 @@ impl TransactionBuilder {
         self
     }
 
-    pub fn gas_limit(mut self, gas_limit: u64) -> Self {
-        self.gas_limit = gas_limit;
+    pub fn ru_limit(mut self, ru_limit: u64) -> Self {
+        self.ru_limit = ru_limit;
         self
     }
 
-    pub fn priority_fee(mut self, priority_fee: Balance) -> Self {
-        self.priority_fee = priority_fee;
+    pub fn ru_estimate(mut self, ru_estimate: u64) -> Self {
+        self.ru_estimate = ru_estimate;
+        self
+    }
+
+    pub fn pob_burn_credits(mut self, pob_burn_credits: u64) -> Self {
+        self.pob_burn_credits = pob_burn_credits;
+        self
+    }
+
+    pub fn priority_hint(mut self, priority_hint: u8) -> Self {
+        self.priority_hint = priority_hint;
         self
     }
 
@@ -1207,9 +1293,18 @@ impl TransactionBuilder {
             EgoError::InvalidTransaction("Transaction payload is required".to_string())
         })?;
 
-        let mut tx = Transaction::new(self.from, self.nonce, payload, self.shard_id, self.slice_id);
-        tx.gas_limit = self.gas_limit;
-        tx.priority_fee = self.priority_fee;
+        let mut tx = Transaction::new(
+            self.from,
+            self.nonce,
+            payload,
+            self.shard_id,
+            self.slice_id,
+            self.chain_id,
+        );
+        tx.ru_limit = self.ru_limit;
+        tx.ru_estimate = self.ru_estimate;
+        tx.pob_burn_credits = self.pob_burn_credits;
+        tx.priority_hint = self.priority_hint;
 
         Ok(tx)
     }
