@@ -1178,6 +1178,7 @@ fn test_full_pq_workflow() {
         },
         ShardId::new(0).unwrap(),
         None,
+        1,
     );
 
     transfer_tx.sign(&alice_keypair, true).unwrap();
@@ -1220,6 +1221,7 @@ fn test_full_pq_workflow() {
         },
         ShardId::new(0).unwrap(),
         None,
+        1,
     );
 
     pq_only_tx.sign(&alice_keypair_pq, false).unwrap();

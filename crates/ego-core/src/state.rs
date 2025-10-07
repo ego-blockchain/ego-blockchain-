@@ -271,7 +271,7 @@ impl StateManager {
                 tx_hash: tx.hash,
                 success: true,
                 error: None,
-                compute_used: tx.estimate_compute_cost(),
+                ru_used: tx.estimate_resource_units(),
                 storage_used: tx.size() as u64,
                 state_changes: Vec::new(),
                 events: Vec::new(),
@@ -307,7 +307,7 @@ impl StateManager {
             tx_hash: Hash::ZERO,
             success: true,
             error: None,
-            compute_used: 100,
+            ru_used: 100,
             storage_used: 0,
             state_changes: vec![
                 crate::transaction::StateChange {
@@ -370,7 +370,7 @@ impl StateManager {
             tx_hash: Hash::ZERO,
             success: true,
             error: None,
-            compute_used: 1000,
+            ru_used: 1000,
             storage_used: 256,
             state_changes: vec![crate::transaction::StateChange {
                 account: account_address,
@@ -431,7 +431,7 @@ impl StateManager {
             tx_hash: Hash::ZERO,
             success: true,
             error: None,
-            compute_used: 1000 + (data_size / 1024),
+            ru_used: 1000 + (data_size / 1024),
             storage_used: data_size,
             state_changes: Vec::new(),
             events: vec![crate::transaction::TransactionEvent {
@@ -517,7 +517,7 @@ impl StateManager {
             tx_hash: Hash::ZERO,
             success: true,
             error: None,
-            compute_used: 800,
+            ru_used: 800,
             storage_used: 0,
             state_changes: Vec::new(),
             events: vec![crate::transaction::TransactionEvent {
@@ -566,7 +566,7 @@ impl StateManager {
             tx_hash: Hash::ZERO,
             success: true,
             error: None,
-            compute_used: 400,
+            ru_used: 400,
             storage_used: 0,
             state_changes: Vec::new(),
             events: vec![crate::transaction::TransactionEvent {

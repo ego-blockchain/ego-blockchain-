@@ -235,7 +235,7 @@ impl ShardManager {
                             tx_hash: tx.hash,
                             success: false,
                             error: Some(e.to_string()),
-                            compute_used: 0,
+                            ru_used: 0,
                             storage_used: 0,
                             state_changes: Vec::new(),
                             events: Vec::new(),

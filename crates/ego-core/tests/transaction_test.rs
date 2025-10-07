@@ -5,9 +5,13 @@ mod transaction_tests {
         PublicKey, ShardId, SliceId, Timestamp,
     };
     use std::collections::HashMap;
+
+    const TEST_CHAIN_ID: u32 = 1;
+
     fn create_test_keypair() -> KeyPair {
         KeyPair::generate()
     }
+
     fn create_test_account(address: Address, balance: Balance) -> Account {
         let keypair = create_test_keypair();
         let mut account = Account {
@@ -52,6 +56,7 @@ mod transaction_tests {
         account.address = Address::from_public_key(&keypair.dilithium_public_key());
         account
     }
+
     #[test]
     fn test_transaction_creation() {
         let keypair = create_test_keypair();
@@ -63,11 +68,12 @@ mod transaction_tests {
             memo: Some("Test transfer".to_string()),
             stealth_mode: false,
         };
-        let tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         assert_eq!(tx.from, from);
         assert_eq!(tx.nonce, 1);
         assert_eq!(tx.shard_id, ShardId::from_u32(0));
     }
+
     #[test]
     fn test_transaction_signing_and_verification() {
         let keypair = create_test_keypair();
@@ -79,11 +85,12 @@ mod transaction_tests {
             memo: None,
             stealth_mode: false,
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).expect("Signing failed");
         let is_valid = tx.verify_signature().expect("Verification failed");
         assert!(is_valid, "Signature should be valid");
     }
+
     #[test]
     fn test_transaction_signing_transition_mode() {
         let keypair = KeyPair::generate();
@@ -94,7 +101,7 @@ mod transaction_tests {
             memo: None,
             stealth_mode: false,
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, true).expect("Signing failed");
         tx.public_keys.ed25519_pk = Some(keypair.ed25519_public_key());
         assert!(
@@ -126,6 +133,7 @@ mod transaction_tests {
             validation_result.err()
         );
     }
+
     #[test]
     fn test_transaction_nonce_validation() {
         let keypair = create_test_keypair();
@@ -141,15 +149,23 @@ mod transaction_tests {
             memo: None,
             stealth_mode: false,
         };
-        let mut tx = Transaction::new(from, 10, payload.clone(), ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(
+            from,
+            10,
+            payload.clone(),
+            ShardId::from_u32(0),
+            None,
+            TEST_CHAIN_ID,
+        );
         tx.sign(&keypair, false).unwrap();
         let result = tx.validate_against_account(&account);
         assert!(result.is_err(), "Should fail with wrong nonce");
-        let mut tx = Transaction::new(from, 6, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 6, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).unwrap();
         let result = tx.validate_against_account(&account);
         assert!(result.is_ok(), "Should succeed with correct nonce");
     }
+
     #[test]
     fn test_transaction_balance_validation() {
         let keypair = create_test_keypair();
@@ -162,11 +178,12 @@ mod transaction_tests {
             memo: None,
             stealth_mode: false,
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).unwrap();
         let result = tx.validate_against_account(&account);
         assert!(result.is_err(), "Should fail with insufficient balance");
     }
+
     #[test]
     fn test_store_data_transaction() {
         let keypair = create_test_keypair();
@@ -209,11 +226,11 @@ mod transaction_tests {
             erasure_coding: ErasureCodingParams {
                 k: 10,
                 m: 4,
-                codec: "reed-solomon".to_string(),
+                codec: ErasureCodec::ReedSolomon,
             },
             encryption_envelope: None,
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).unwrap();
         let triad = tx.extract_triad_placement();
         assert!(triad.is_some());
@@ -221,6 +238,7 @@ mod transaction_tests {
         let chunk_ids = tx.get_affected_chunk_ids();
         assert_eq!(chunk_ids.len(), 1);
     }
+
     #[test]
     fn test_triad_diversity_validation() {
         let keypair = create_test_keypair();
@@ -263,15 +281,16 @@ mod transaction_tests {
             erasure_coding: ErasureCodingParams {
                 k: 5,
                 m: 2,
-                codec: "reed-solomon".to_string(),
+                codec: ErasureCodec::ReedSolomon,
             },
             encryption_envelope: None,
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).unwrap();
         let result = tx.validate_triad_diversity(100.0);
         assert!(result.is_err(), "Should fail diversity check");
     }
+
     #[test]
     fn test_post_challenge_and_response() {
         let keypair = create_test_keypair();
@@ -289,8 +308,14 @@ mod transaction_tests {
             deadline_block: 1000,
             epoch: 10,
         };
-        let mut challenge_tx =
-            Transaction::new(from, 1, challenge_payload, ShardId::from_u32(0), None);
+        let mut challenge_tx = Transaction::new(
+            from,
+            1,
+            challenge_payload,
+            ShardId::from_u32(0),
+            None,
+            TEST_CHAIN_ID,
+        );
         challenge_tx.sign(&keypair, false).unwrap();
         assert_eq!(challenge_tx.get_priority(), 200);
         assert!(challenge_tx.is_proof_transaction());
@@ -321,6 +346,7 @@ mod transaction_tests {
             response_payload,
             ShardId::from_u32(0),
             None,
+            TEST_CHAIN_ID,
         );
         let responder_keypair = create_test_keypair();
         response_tx.from = Address::from_public_key(&responder_keypair.dilithium_public_key());
@@ -330,6 +356,7 @@ mod transaction_tests {
         let result = response_tx.validate_proof_latency(100);
         assert!(result.is_err());
     }
+
     #[test]
     fn test_stake_and_delegate() {
         let keypair = create_test_keypair();
@@ -344,7 +371,14 @@ mod transaction_tests {
             lock_duration_epochs: 100,
             commission_rate: Some(500),
         };
-        let mut stake_tx = Transaction::new(from, 1, stake_payload, ShardId::from_u32(0), None);
+        let mut stake_tx = Transaction::new(
+            from,
+            1,
+            stake_payload,
+            ShardId::from_u32(0),
+            None,
+            TEST_CHAIN_ID,
+        );
         stake_tx.sign(&keypair, false).unwrap();
         let result = stake_tx.validate_against_account(&account);
         assert!(result.is_ok());
@@ -353,12 +387,19 @@ mod transaction_tests {
             amount: Balance::from(30_000u64),
             validator_pubkey: validator_pk,
         };
-        let mut delegate_tx =
-            Transaction::new(from, 2, delegate_payload, ShardId::from_u32(0), None);
+        let mut delegate_tx = Transaction::new(
+            from,
+            2,
+            delegate_payload,
+            ShardId::from_u32(0),
+            None,
+            TEST_CHAIN_ID,
+        );
         delegate_tx.sign(&keypair, false).unwrap();
         let result = delegate_tx.validate_against_account(&account);
         assert!(result.is_ok());
     }
+
     #[test]
     fn test_claim_rewards() {
         let keypair = create_test_keypair();
@@ -378,11 +419,19 @@ mod transaction_tests {
             drs_multiplier: 1.2,
             evidence_hash: Hash::new([80u8; 32]),
         };
-        let mut tx = Transaction::new(node_id, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(
+            node_id,
+            1,
+            payload,
+            ShardId::from_u32(0),
+            None,
+            TEST_CHAIN_ID,
+        );
         tx.sign(&keypair, false).unwrap();
         assert_eq!(tx.get_priority(), 90);
         assert!(tx.is_reward_transaction());
     }
+
     #[test]
     fn test_cross_shard_transaction() {
         let keypair = create_test_keypair();
@@ -394,10 +443,11 @@ mod transaction_tests {
             deadline_epoch: 200,
             nonce: 123,
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).unwrap();
         assert_eq!(tx.get_priority(), 160);
     }
+
     #[test]
     fn test_rollup_commit() {
         let keypair = create_test_keypair();
@@ -415,11 +465,12 @@ mod transaction_tests {
             fraud_proofs: vec![],
             operator_signature: vec![14, 15, 16],
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).unwrap();
         assert_eq!(tx.get_priority(), 140);
         assert!(tx.requires_dilithium());
     }
+
     #[test]
     fn test_deploy_contract() {
         let keypair = create_test_keypair();
@@ -435,13 +486,14 @@ mod transaction_tests {
             use_free_quota: true,
             storage_refs: vec![],
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).unwrap();
         let result = tx.validate_against_account(&account);
         assert!(result.is_ok());
-        let cost = tx.estimate_compute_cost();
-        assert!(cost >= 5000);
+        let ru = tx.estimate_resource_units();
+        assert!(ru >= 5000);
     }
+
     #[test]
     fn test_dao_proposal_and_vote() {
         let keypair = create_test_keypair();
@@ -457,8 +509,14 @@ mod transaction_tests {
             voting_period_epochs: 10,
             execution_delay_epochs: 2,
         };
-        let mut proposal_tx =
-            Transaction::new(from, 1, proposal_payload, ShardId::from_u32(0), None);
+        let mut proposal_tx = Transaction::new(
+            from,
+            1,
+            proposal_payload,
+            ShardId::from_u32(0),
+            None,
+            TEST_CHAIN_ID,
+        );
         proposal_tx.sign(&keypair, false).unwrap();
         let proposal_hash = Hash::new([120u8; 32]);
         let vote_payload = TransactionPayload::DAOVote {
@@ -466,11 +524,19 @@ mod transaction_tests {
             vote: true,
             voting_power: Balance::from(10_000u64),
         };
-        let mut vote_tx = Transaction::new(from, 2, vote_payload, ShardId::from_u32(0), None);
+        let mut vote_tx = Transaction::new(
+            from,
+            2,
+            vote_payload,
+            ShardId::from_u32(0),
+            None,
+            TEST_CHAIN_ID,
+        );
         vote_tx.sign(&keypair, false).unwrap();
         assert_eq!(proposal_tx.get_priority(), 20);
         assert_eq!(vote_tx.get_priority(), 20);
     }
+
     #[test]
     fn test_update_drs() {
         let keypair = create_test_keypair();
@@ -487,7 +553,14 @@ mod transaction_tests {
             final_multiplier: 1.15,
             metrics_hash: Hash::new([130u8; 32]),
         };
-        let mut tx = Transaction::new(node_id, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(
+            node_id,
+            1,
+            payload,
+            ShardId::from_u32(0),
+            None,
+            TEST_CHAIN_ID,
+        );
         tx.sign(&keypair, false).unwrap();
         let drs_info = tx.extract_drs_update();
         assert!(drs_info.is_some());
@@ -496,6 +569,7 @@ mod transaction_tests {
         assert_eq!(info.final_multiplier, 1.15);
         assert!(tx.requires_dilithium());
     }
+
     #[test]
     fn test_transaction_builder() {
         let keypair = create_test_keypair();
@@ -507,18 +581,19 @@ mod transaction_tests {
             memo: Some("Builder test".to_string()),
             stealth_mode: false,
         };
-        let tx = TransactionBuilder::new(from, 1, ShardId::from_u32(0))
+        let tx = TransactionBuilder::new(from, 1, ShardId::from_u32(0), TEST_CHAIN_ID)
             .payload(payload)
-            .gas_limit(2_000_000)
-            .priority_fee(Balance::from(100u64))
+            .ru_limit(2_000_000)
+            .priority_hint(50)
             .build_and_sign(&keypair, false)
             .expect("Failed to build transaction");
         assert_eq!(tx.from, from);
         assert_eq!(tx.nonce, 1);
-        assert_eq!(tx.gas_limit, 2_000_000);
-        assert_eq!(tx.priority_fee, Balance::from(100u64));
+        assert_eq!(tx.ru_limit, 2_000_000);
+        assert_eq!(tx.priority_hint, 50);
         assert!(tx.verify_signature().unwrap());
     }
+
     #[test]
     fn test_transaction_size() {
         let keypair = create_test_keypair();
@@ -530,12 +605,13 @@ mod transaction_tests {
             memo: None,
             stealth_mode: false,
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).unwrap();
         let size = tx.size();
         assert!(size > 0, "Transaction size should be greater than 0");
         assert!(size < 10_000, "Transaction size should be reasonable");
     }
+
     #[test]
     fn test_pq_transition() {
         let keypair = create_test_keypair();
@@ -546,11 +622,12 @@ mod transaction_tests {
             transition_epoch: 1000,
             migration_period_epochs: 100,
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).unwrap();
         assert_eq!(tx.get_priority(), 230);
         assert!(tx.requires_dilithium());
     }
+
     #[test]
     fn test_system_operation() {
         let keypair = create_test_keypair();
@@ -562,14 +639,15 @@ mod transaction_tests {
             epoch_anchor: true,
             requires_quorum: true,
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).unwrap();
         assert_eq!(tx.get_priority(), 255);
         assert!(tx.requires_dilithium());
         assert!(tx.requires_slh_dsa());
-        let cost = tx.estimate_compute_cost();
-        assert!(cost >= 20_000);
+        let ru = tx.estimate_resource_units();
+        assert!(ru >= 20_000);
     }
+
     #[test]
     fn test_transaction_categories() {
         let keypair = create_test_keypair();
@@ -579,7 +657,14 @@ mod transaction_tests {
             credits_byte_months: 10_000_000,
             burn_proof: Hash::new([160u8; 32]),
         };
-        let mut store_tx = Transaction::new(from, 1, store_payload, ShardId::from_u32(0), None);
+        let mut store_tx = Transaction::new(
+            from,
+            1,
+            store_payload,
+            ShardId::from_u32(0),
+            None,
+            TEST_CHAIN_ID,
+        );
         store_tx.sign(&keypair, false).unwrap();
         assert!(store_tx.is_storage_transaction());
         let proof_payload = TransactionPayload::SubmitProofBatch {
@@ -589,7 +674,14 @@ mod transaction_tests {
             epoch: 50,
             rollup_id: None,
         };
-        let mut proof_tx = Transaction::new(from, 2, proof_payload, ShardId::from_u32(0), None);
+        let mut proof_tx = Transaction::new(
+            from,
+            2,
+            proof_payload,
+            ShardId::from_u32(0),
+            None,
+            TEST_CHAIN_ID,
+        );
         proof_tx.sign(&keypair, false).unwrap();
         assert!(proof_tx.is_proof_transaction());
         let reward_payload = TransactionPayload::PayRetrievalFee {
@@ -599,10 +691,18 @@ mod transaction_tests {
             rate_per_gb: Balance::from(100u64),
             session_proof: vec![1, 2, 3],
         };
-        let mut reward_tx = Transaction::new(from, 3, reward_payload, ShardId::from_u32(0), None);
+        let mut reward_tx = Transaction::new(
+            from,
+            3,
+            reward_payload,
+            ShardId::from_u32(0),
+            None,
+            TEST_CHAIN_ID,
+        );
         reward_tx.sign(&keypair, false).unwrap();
         assert!(reward_tx.is_reward_transaction());
     }
+
     #[test]
     fn test_invalid_signature_address_mismatch() {
         let keypair1 = create_test_keypair();
@@ -615,13 +715,14 @@ mod transaction_tests {
             memo: None,
             stealth_mode: false,
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         let result = tx.sign(&keypair2, false);
         assert!(
             result.is_err(),
             "Should fail when address doesn't match keypair"
         );
     }
+
     #[test]
     fn test_future_timestamp_validation() {
         let keypair = create_test_keypair();
@@ -634,12 +735,13 @@ mod transaction_tests {
             memo: None,
             stealth_mode: false,
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.timestamp = Timestamp::from_millis(Timestamp::now().as_millis() + 360_000);
         tx.sign(&keypair, false).unwrap();
         let result = tx.validate_against_account(&account);
         assert!(result.is_err(), "Should fail with future timestamp");
     }
+
     #[test]
     fn test_slice_authorization() {
         let keypair = create_test_keypair();
@@ -664,6 +766,7 @@ mod transaction_tests {
             payload.clone(),
             ShardId::from_u32(0),
             Some(SliceId::new("private".to_string())),
+            TEST_CHAIN_ID,
         );
         tx.sign(&keypair, false).unwrap();
         let result = tx.validate_against_account(&account);
@@ -674,11 +777,13 @@ mod transaction_tests {
             payload,
             ShardId::from_u32(0),
             Some(SliceId::new("personal".to_string())),
+            TEST_CHAIN_ID,
         );
         tx.sign(&keypair, false).unwrap();
         let result = tx.validate_against_account(&account);
         assert!(result.is_ok(), "Should succeed with authorized slice");
     }
+
     #[test]
     fn test_storage_quota_validation() {
         let keypair = create_test_keypair();
@@ -699,15 +804,16 @@ mod transaction_tests {
             erasure_coding: ErasureCodingParams {
                 k: 5,
                 m: 2,
-                codec: "reed-solomon".to_string(),
+                codec: ErasureCodec::ReedSolomon,
             },
             encryption_envelope: None,
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).unwrap();
         let result = tx.validate_against_account(&account);
         assert!(result.is_err(), "Should fail when exceeding storage quota");
     }
+
     #[test]
     fn test_storage_credits_validation() {
         let keypair = create_test_keypair();
@@ -727,11 +833,11 @@ mod transaction_tests {
             erasure_coding: ErasureCodingParams {
                 k: 5,
                 m: 2,
-                codec: "reed-solomon".to_string(),
+                codec: ErasureCodec::ReedSolomon,
             },
             encryption_envelope: None,
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).unwrap();
         let result = tx.validate_against_account(&account);
         assert!(
@@ -739,6 +845,7 @@ mod transaction_tests {
             "Should fail with insufficient storage credits"
         );
     }
+
     #[test]
     fn test_deploy_credits_validation() {
         let keypair = create_test_keypair();
@@ -753,7 +860,7 @@ mod transaction_tests {
             use_free_quota: false,
             storage_refs: vec![],
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).unwrap();
         let result = tx.validate_against_account(&account);
         assert!(
@@ -761,6 +868,7 @@ mod transaction_tests {
             "Should fail with insufficient deploy credits"
         );
     }
+
     #[test]
     fn test_encryption_envelope() {
         let keypair = create_test_keypair();
@@ -768,7 +876,7 @@ mod transaction_tests {
         let envelope = EncryptionEnvelope {
             kyber_ciphertexts: vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]],
             recipient_addresses: vec![Address::new([10u8; 20]), Address::new([11u8; 20])],
-            aes_nonce: [99u8; 24],
+            nonce24: [99u8; 24],
             auth_tag: vec![88, 77, 66],
         };
         let triad = create_test_triad_placement();
@@ -784,11 +892,11 @@ mod transaction_tests {
             erasure_coding: ErasureCodingParams {
                 k: 5,
                 m: 2,
-                codec: "reed-solomon".to_string(),
+                codec: ErasureCodec::ReedSolomon,
             },
             encryption_envelope: Some(envelope),
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).unwrap();
         if let TransactionPayload::StoreData {
             encryption_envelope,
@@ -803,6 +911,7 @@ mod transaction_tests {
             panic!("Wrong payload type");
         }
     }
+
     #[test]
     fn test_fraud_challenge_lifecycle() {
         let keypair = create_test_keypair();
@@ -818,8 +927,14 @@ mod transaction_tests {
             challenger,
             challenge_bond: Balance::from(10_000u64),
         };
-        let mut challenge_tx =
-            Transaction::new(challenger, 1, challenge_payload, ShardId::from_u32(0), None);
+        let mut challenge_tx = Transaction::new(
+            challenger,
+            1,
+            challenge_payload,
+            ShardId::from_u32(0),
+            None,
+            TEST_CHAIN_ID,
+        );
         challenge_tx.sign(&keypair, false).unwrap();
         let result = challenge_tx.validate_against_account(&account);
         assert!(result.is_ok(), "Should succeed with sufficient bond");
@@ -830,11 +945,18 @@ mod transaction_tests {
             evidence: vec![6, 7, 8, 9],
             slashing_amount: Some(Balance::from(5000u64)),
         };
-        let mut resolve_tx =
-            Transaction::new(challenger, 2, resolve_payload, ShardId::from_u32(0), None);
+        let mut resolve_tx = Transaction::new(
+            challenger,
+            2,
+            resolve_payload,
+            ShardId::from_u32(0),
+            None,
+            TEST_CHAIN_ID,
+        );
         resolve_tx.sign(&keypair, false).unwrap();
         assert_eq!(resolve_tx.get_priority(), 125);
     }
+
     #[test]
     fn test_poc_witness_report() {
         let keypair = create_test_keypair();
@@ -874,13 +996,21 @@ mod transaction_tests {
             multi_witness_proof: vec![7, 8, 9],
             timestamp_proof: vec![10, 11, 12],
         };
-        let mut tx = Transaction::new(prover, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(
+            prover,
+            1,
+            payload,
+            ShardId::from_u32(0),
+            None,
+            TEST_CHAIN_ID,
+        );
         tx.sign(&keypair, false).unwrap();
         assert_eq!(tx.get_priority(), 180);
         assert!(tx.is_proof_transaction());
-        let cost = tx.estimate_compute_cost();
-        assert!(cost >= 2200);
+        let ru = tx.estimate_resource_units();
+        assert!(ru >= 2200);
     }
+
     #[test]
     fn test_update_account() {
         let keypair = create_test_keypair();
@@ -908,11 +1038,12 @@ mod transaction_tests {
             account_address: from,
             updates,
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).unwrap();
-        let cost = tx.estimate_compute_cost();
-        assert_eq!(cost, 700);
+        let ru = tx.estimate_resource_units();
+        assert_eq!(ru, 700);
     }
+
     #[test]
     fn test_slice_operations() {
         let keypair = create_test_keypair();
@@ -925,11 +1056,12 @@ mod transaction_tests {
             slice_id: SliceId::new("new-slice".to_string()),
             params,
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).unwrap();
-        let cost = tx.estimate_compute_cost();
-        assert_eq!(cost, 2100);
+        let ru = tx.estimate_resource_units();
+        assert_eq!(ru, 2100);
     }
+
     #[test]
     fn test_validator_only_operations() {
         let keypair = create_test_keypair();
@@ -943,7 +1075,7 @@ mod transaction_tests {
             epoch_anchor: true,
             requires_quorum: true,
         };
-        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(from, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair, false).unwrap();
         let result = tx.validate_against_account(&non_validator_account);
         assert!(
@@ -951,6 +1083,7 @@ mod transaction_tests {
             "Non-validators cannot submit epoch anchors"
         );
     }
+
     #[test]
     fn test_claim_rewards_validation() {
         let keypair1 = create_test_keypair();
@@ -973,18 +1106,19 @@ mod transaction_tests {
             drs_multiplier: 1.1,
             evidence_hash: Hash::new([32u8; 32]),
         };
-        let mut tx = Transaction::new(node1, 1, payload, ShardId::from_u32(0), None);
+        let mut tx = Transaction::new(node1, 1, payload, ShardId::from_u32(0), None, TEST_CHAIN_ID);
         tx.sign(&keypair1, false).unwrap();
         let result = tx.validate_against_account(&account);
         assert!(result.is_err(), "Cannot claim rewards for another node");
     }
+
     #[test]
     fn test_transaction_result_structure() {
         let tx_result = TransactionResult {
             tx_hash: Hash::new([33u8; 32]),
             success: true,
             error: None,
-            compute_used: 1500,
+            ru_used: 1500,
             storage_used: 1024,
             state_changes: vec![StateChange {
                 account: Address::new([34u8; 20]),
@@ -1012,6 +1146,7 @@ mod transaction_tests {
         assert_eq!(tx_result.events.len(), 1);
         assert!(tx_result.pq_verification_result.is_some());
     }
+
     fn create_test_triad_placement() -> TriadPlacement {
         TriadPlacement {
             primary: NodeLocation {
@@ -1041,6 +1176,7 @@ mod transaction_tests {
         }
     }
 }
+
 #[cfg(test)]
 mod transaction_integration_tests {
     use ego_core::{
@@ -1048,6 +1184,9 @@ mod transaction_integration_tests {
         SliceId, Timestamp,
     };
     use std::collections::HashMap;
+
+    const TEST_CHAIN_ID: u32 = 1;
+
     #[test]
     fn test_full_transaction_lifecycle() {
         let sender_keypair = KeyPair::generate();
@@ -1098,10 +1237,10 @@ mod transaction_integration_tests {
             memo: Some("Integration test".to_string()),
             stealth_mode: false,
         };
-        let tx = TransactionBuilder::new(sender_addr, 1, ShardId::from_u32(0))
+        let tx = TransactionBuilder::new(sender_addr, 1, ShardId::from_u32(0), TEST_CHAIN_ID)
             .payload(payload)
-            .gas_limit(1_000_000)
-            .priority_fee(Balance::from(10u64))
+            .ru_limit(1_000_000)
+            .priority_hint(10)
             .build_and_sign(&sender_keypair, false)
             .expect("Failed to build transaction");
         assert!(tx.verify_signature().unwrap());
@@ -1111,6 +1250,7 @@ mod transaction_integration_tests {
         assert_eq!(sender_account.nonce, 1);
         assert_eq!(sender_account.balance, Balance::from(94_990u64));
     }
+
     #[test]
     fn test_multi_transaction_sequence() {
         let keypair = KeyPair::generate();
@@ -1173,7 +1313,14 @@ mod transaction_integration_tests {
         ];
         for (i, payload) in transactions.into_iter().enumerate() {
             let nonce = (i as u64) + 1;
-            let mut tx = Transaction::new(addr, nonce, payload, ShardId::from_u32(0), None);
+            let mut tx = Transaction::new(
+                addr,
+                nonce,
+                payload,
+                ShardId::from_u32(0),
+                None,
+                TEST_CHAIN_ID,
+            );
             tx.sign(&keypair, false).expect("Signing failed");
             assert!(tx.verify_signature().unwrap());
             assert!(
