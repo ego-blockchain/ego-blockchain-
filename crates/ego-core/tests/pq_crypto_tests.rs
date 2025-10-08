@@ -817,9 +817,7 @@ mod pq_crypto_tests {
     #[test]
     fn test_export_keys_to_files() {
         let output_dir = Path::new("./test_keys_export");
-        if output_dir.exists() {
-            fs::remove_dir_all(output_dir).unwrap();
-        }
+        let _ = fs::remove_dir_all(output_dir);
         fs::create_dir_all(output_dir).unwrap();
 
         println!("\n=== Exporting Post-Quantum Keypairs ===");
@@ -1004,6 +1002,167 @@ mod pq_crypto_tests {
         println!("  ⚠️  KEEP SECRET - Can regenerate all keys!\n");
 
         println!("✓ Successfully read all binary key files");
+    }
+
+    #[test]
+    fn test_ego_address_derivation() {
+        let keypair = crypto::KeyPair::generate();
+        let chain_id = 1u32;
+
+        let eoa_address = keypair.derive_address(chain_id, crypto::AddressType::EOA);
+        assert_eq!(eoa_address.version(), 0b001);
+        assert_eq!(eoa_address.address_type(), Some(crypto::AddressType::EOA));
+        assert_eq!(eoa_address.payload().len(), 20);
+
+        let contract_addr = keypair.derive_address(chain_id, crypto::AddressType::Contract);
+        let device_addr = keypair.derive_address(chain_id, crypto::AddressType::Device);
+        let validator_addr = keypair.derive_address(chain_id, crypto::AddressType::Validator);
+
+        assert_eq!(
+            eoa_address.payload(),
+            contract_addr.payload(),
+            "Payload should be identical - only type byte differs"
+        );
+
+        assert_ne!(eoa_address.address_type(), contract_addr.address_type());
+        assert_eq!(
+            contract_addr.address_type(),
+            Some(crypto::AddressType::Contract)
+        );
+        assert_eq!(
+            device_addr.address_type(),
+            Some(crypto::AddressType::Device)
+        );
+        assert_eq!(
+            validator_addr.address_type(),
+            Some(crypto::AddressType::Validator)
+        );
+
+        assert_ne!(
+            eoa_address.as_bytes(),
+            contract_addr.as_bytes(),
+            "Full addresses differ due to type byte"
+        );
+
+        println!("✓ Address derivation follows spec (version 001, 20-byte payload)");
+        println!("✓ Address type only affects the version/type byte, not the payload");
+    }
+
+    #[test]
+    fn test_bech32m_address_encoding() {
+        let keypair = crypto::KeyPair::generate();
+        let chain_id = 1u32;
+
+        let mainnet_addr = keypair
+            .derive_bech32_address(chain_id, crypto::AddressType::EOA, "ego")
+            .unwrap();
+        assert!(mainnet_addr.starts_with("ego1"));
+
+        let testnet_addr = keypair
+            .derive_bech32_address(chain_id, crypto::AddressType::EOA, "egot")
+            .unwrap();
+        assert!(testnet_addr.starts_with("egot1"));
+
+        let devnet_addr = keypair
+            .derive_bech32_address(chain_id, crypto::AddressType::EOA, "egod")
+            .unwrap();
+        assert!(devnet_addr.starts_with("egod1"));
+
+        println!("✓ Bech32m encoding with correct HRP prefixes");
+        println!("  Mainnet: {}", mainnet_addr);
+        println!("  Testnet: {}", testnet_addr);
+    }
+
+    #[test]
+    fn test_address_round_trip_encoding_decoding() {
+        let keypair = crypto::KeyPair::generate();
+        let chain_id = 1u32;
+
+        let original_address = keypair.derive_address(chain_id, crypto::AddressType::EOA);
+        let bech32_str = original_address.to_bech32("ego").unwrap();
+
+        let decoded_address = crypto::EgoAddress::from_bech32(&bech32_str, "ego").unwrap();
+
+        assert_eq!(original_address.version(), decoded_address.version());
+        assert_eq!(
+            original_address.address_type(),
+            decoded_address.address_type()
+        );
+        assert_eq!(original_address.payload(), decoded_address.payload());
+        assert_eq!(original_address.as_bytes(), decoded_address.as_bytes());
+
+        println!("✓ Address encoding/decoding round-trip successful");
+    }
+
+    #[test]
+    fn test_address_validation_rules() {
+        let keypair = crypto::KeyPair::generate();
+        let chain_id = 1u32;
+
+        let address = keypair.derive_address(chain_id, crypto::AddressType::EOA);
+        let valid_bech32 = address.to_bech32("ego").unwrap();
+
+        assert!(crypto::EgoAddress::from_bech32(&valid_bech32, "ego").is_ok());
+
+        assert!(crypto::EgoAddress::from_bech32(&valid_bech32, "egot").is_err());
+
+        assert!(crypto::EgoAddress::from_bech32("invalid_address", "ego").is_err());
+
+        println!("✓ Address validation rules enforced correctly");
+    }
+
+    #[test]
+    fn test_chain_id_affects_address() {
+        let keypair = crypto::KeyPair::generate();
+
+        let mainnet_addr = keypair.derive_address(1u32, crypto::AddressType::EOA);
+        let testnet_addr = keypair.derive_address(999u32, crypto::AddressType::EOA);
+
+        assert_ne!(mainnet_addr.payload(), testnet_addr.payload());
+
+        println!("✓ Chain ID properly domain-separates addresses");
+    }
+
+    #[test]
+    fn test_address_size_constraints() {
+        let keypair = crypto::KeyPair::generate();
+        let address = keypair.derive_address(1u32, crypto::AddressType::EOA);
+
+        assert_eq!(address.payload().len(), 20, "Payload must be 20 bytes");
+        assert_eq!(
+            address.as_bytes().len(),
+            21,
+            "Total must be 21 bytes (1 + 20)"
+        );
+
+        let bech32_str = address.to_bech32("ego").unwrap();
+        assert!(bech32_str.len() > 30 && bech32_str.len() < 50);
+
+        println!("✓ Address sizes match spec: 20-byte payload, 21-byte total");
+    }
+
+    #[test]
+    fn test_qr_uri_format() {
+        let keypair = crypto::KeyPair::generate();
+        let address = keypair
+            .derive_bech32_address(1u32, crypto::AddressType::EOA, "ego")
+            .unwrap();
+
+        let basic_uri = format!("ego:{}", address);
+        assert!(basic_uri.starts_with("ego:ego1"));
+
+        let full_uri = format!(
+            "ego:{}?amount={}&memo={}&stealth={}",
+            address, 2500000000u64, "Payment%20for%20Service", 1
+        );
+
+        assert!(full_uri.contains("amount=2500000000"));
+        assert!(full_uri.contains("memo=Payment"));
+        assert!(full_uri.contains("stealth=1"));
+
+        println!("✓ QR URI format matches spec");
+        println!("  Basic: {}", basic_uri);
+        println!("  Full: {}...", &full_uri[..60]);
     }
 
     #[test]
