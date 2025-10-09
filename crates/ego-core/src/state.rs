@@ -189,6 +189,26 @@ impl StateManager {
                 vec![0u8; 1312],
                 vec![0u8; 1184],
             )?,
+            AccountType::StorageProvider {
+                provider_id,
+                region,
+            } => Account::new_storage_provider(
+                address,
+                provider_id,
+                region,
+                1_000_000_000,
+                vec![0u8; 1312],
+                vec![0u8; 1184],
+                "peer_id".to_string(),
+            ),
+            AccountType::Hybrid { roles } => Account::new_hybrid_node(
+                address,
+                roles,
+                1_000_000_000,
+                vec![0u8; 1312],
+                vec![0u8; 1184],
+                "peer_id".to_string(),
+            ),
             AccountType::Contract { .. } => {
                 return Err(EgoError::InvalidTransaction(
                     "Contract accounts must be created through deployment".to_string(),
