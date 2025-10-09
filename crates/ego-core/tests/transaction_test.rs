@@ -52,6 +52,10 @@ mod transaction_tests {
             last_drs_score: None,
             last_activity: Timestamp::now(),
             created_at: Timestamp::now(),
+            hot_set_mode: ego_core::account::HotSetMode::LightClient,
+            pruning_config: None,
+            archival_config: None,
+            storage_provider_info: None,
         };
         account.address = Address::from_public_key(&keypair.dilithium_public_key());
         account
@@ -1229,6 +1233,10 @@ mod transaction_integration_tests {
             last_drs_score: None,
             last_activity: Timestamp::now(),
             created_at: Timestamp::now(),
+            hot_set_mode: ego_core::account::HotSetMode::LightClient,
+            pruning_config: None,
+            archival_config: None,
+            storage_provider_info: None,
         };
         let recipient_addr = Address::new([99u8; 20]);
         let payload = TransactionPayload::Transfer {
@@ -1293,6 +1301,10 @@ mod transaction_integration_tests {
             last_drs_score: None,
             last_activity: Timestamp::now(),
             created_at: Timestamp::now(),
+            hot_set_mode: ego_core::account::HotSetMode::LightClient,
+            pruning_config: None,
+            archival_config: None,
+            storage_provider_info: None,
         };
         let transactions = vec![
             TransactionPayload::BuyStorageCredits {
