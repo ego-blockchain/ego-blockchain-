@@ -873,7 +873,7 @@ impl Transaction {
         Ok(())
     }
 
-    fn is_cross_shard(&self) -> bool {
+    pub fn is_cross_shard(&self) -> bool {
         matches!(
             self.payload,
             TransactionPayload::CrossShard { .. } | TransactionPayload::RollupCommit { .. }
