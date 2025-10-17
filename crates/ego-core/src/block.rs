@@ -295,7 +295,7 @@ impl Block {
         let tx_count = transactions.len() as u32;
         let compute_used = transactions
             .iter()
-            .map(|tx| tx.estimate_compute_cost())
+            .map(|tx| tx.estimate_resource_units())
             .sum();
         let storage_used = transactions.iter().map(|tx| tx.size() as u64).sum();
 

@@ -17,7 +17,14 @@ pub use block::{
     DeployEvent, NetworkStats, ProofEvent, QuorumCert, ResourcePricing, RollupCommitment,
     ValidatorSignature, WitnessData,
 };
-pub use crypto::*;
+pub use crypto::{
+    blake2s_hash, blake2s_hash_domain, create_authenticated_transcript, create_handshake_init,
+    derive_stealth_address, dilithium_sign, dilithium_verify, hash_data, hash_multiple,
+    hkdf_blake2s, hkdf_sha256, verify_dilithium_signature, verify_downgrade_protection,
+    verify_dual_signature, verify_identity_binding, verify_signature, verify_slh_dsa_signature,
+    xchacha20poly1305_decrypt, xchacha20poly1305_encrypt, AddressType, BatchVerifier, EgoAddress,
+    ExportedKeys, ExportedKeysHex, KeyPair, MerkleNode, MerkleProof, MerkleTree, StreamCipher,
+};
 pub use deploy_policy::*;
 pub use drs::*;
 pub use error::*;
