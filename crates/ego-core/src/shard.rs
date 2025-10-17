@@ -181,7 +181,7 @@ impl Default for GarbageCollectionConfig {
 
 impl ShardManager {
     pub fn new(config: ShardConfig) -> Self {
-        let state = Arc::new(RwLock::new(StateManager::new()));
+        let state = Arc::new(RwLock::new(StateManager::new(1, 1)));
         let blocks = Arc::new(RwLock::new(VecDeque::new()));
         let tx_pool = Arc::new(RwLock::new(TransactionPool::new()));
 
