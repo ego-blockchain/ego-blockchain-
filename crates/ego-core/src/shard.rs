@@ -181,7 +181,7 @@ impl Default for GarbageCollectionConfig {
 
 impl ShardManager {
     pub fn new(config: ShardConfig) -> Self {
-        let state = Arc::new(RwLock::new(StateManager::new()));
+        let state = Arc::new(RwLock::new(StateManager::new(1, 1)));
         let blocks = Arc::new(RwLock::new(VecDeque::new()));
         let tx_pool = Arc::new(RwLock::new(TransactionPool::new()));
 
@@ -235,12 +235,13 @@ impl ShardManager {
                             tx_hash: tx.hash,
                             success: false,
                             error: Some(e.to_string()),
-                            compute_used: 0,
+                            ru_used: 0,
                             storage_used: 0,
                             state_changes: Vec::new(),
                             events: Vec::new(),
                             cross_shard_receipts: Vec::new(),
                             pq_verification_result: Default::default(),
+                            proof_verifications: Vec::new(),
                         });
                     }
                 }
@@ -434,7 +435,6 @@ impl TransactionPool {
         match &tx.payload {
             crate::TransactionPayload::SystemOperation { .. } => 255,
             crate::TransactionPayload::CrossShard { .. } => 200,
-            crate::TransactionPayload::SubmitProof { .. } => 150,
             crate::TransactionPayload::RollupCommit { .. } => 100,
             crate::TransactionPayload::Transfer { .. } => 50,
             _ => 25,

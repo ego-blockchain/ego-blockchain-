@@ -234,12 +234,13 @@ impl RollupAggregator {
                 tx_hash: tx.hash,
                 success: true,
                 error: None,
-                compute_used: tx.estimate_compute_cost(),
+                ru_used: tx.estimate_resource_units(),
                 storage_used: tx.size() as u64,
                 state_changes: Vec::new(),
                 events: Vec::new(),
                 cross_shard_receipts: Vec::new(),
                 pq_verification_result: None,
+                proof_verifications: Vec::new(),
             };
 
             results.push(result);

@@ -2,6 +2,7 @@ use crate::{
     AlgorithmId, DualSignature, EgoError, EgoResult, HandshakeInit, Hash, PeerCapabilities,
     PublicKey, SessionRecord, Signature,
 };
+use bech32::{decode, encode, Hrp};
 use blake2::{Blake2s256, Digest};
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
@@ -11,9 +12,7 @@ use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use oqs::kem::{Algorithm as KemAlgorithm, Kem};
 use oqs::sig::{Algorithm as SigAlgorithm, Sig};
-use pqcrypto_traits::sign::{PublicKey as PqPublicKey, SecretKey as PqSecretKey};
 use rand::{rngs::OsRng, RngCore};
-use rand_chacha::{rand_core::SeedableRng, ChaCha20Rng};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashSet;
@@ -33,6 +32,139 @@ const DOMAIN_TAG_POC_BEACON: &[u8] = b"ego/poc/beacon";
 const DOMAIN_TAG_POC_WITNESS: &[u8] = b"ego/poc/witness";
 const DOMAIN_TAG_POST_PROOF: &[u8] = b"ego/post/proof";
 const DOMAIN_TAG_OTS_KEYGEN: &[u8] = b"ego/ots/keygen/v1";
+const DOMAIN_TAG_ADDRESS: &[u8] = b"ego/addr/v1";
+
+const HRP_MAINNET: &str = "ego";
+const HRP_TESTNET: &str = "egot";
+const HRP_DEVNET: &str = "egod";
+
+const ADDRESS_VERSION: u8 = 0b001;
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AddressType {
+    EOA = 0,
+    Contract = 1,
+    Device = 2,
+    Validator = 3,
+}
+
+impl AddressType {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(AddressType::EOA),
+            1 => Some(AddressType::Contract),
+            2 => Some(AddressType::Device),
+            3 => Some(AddressType::Validator),
+            _ => None,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgoAddress {
+    version_type: u8,
+    payload: [u8; 20],
+}
+
+impl EgoAddress {
+    pub fn from_dilithium_pk(
+        dilithium_pk: &[u8],
+        chain_id: u32,
+        address_type: AddressType,
+    ) -> Self {
+        let mut hasher = Blake2s256::new();
+        hasher.update(DOMAIN_TAG_ADDRESS);
+        hasher.update(chain_id.to_le_bytes());
+        hasher.update(dilithium_pk);
+        let digest = hasher.finalize();
+
+        let version_bits = ADDRESS_VERSION << 5;
+        let type_bits = address_type.as_u8() & 0b1_1111;
+        let version_type = version_bits | type_bits;
+
+        let mut payload = [0u8; 20];
+        payload.copy_from_slice(&digest[..20]);
+
+        Self {
+            version_type,
+            payload,
+        }
+    }
+
+    pub fn to_bech32(&self, hrp_str: &str) -> EgoResult<String> {
+        let mut full_payload = Vec::with_capacity(21);
+        full_payload.push(self.version_type);
+        full_payload.extend_from_slice(&self.payload);
+
+        let hrp = Hrp::parse(hrp_str)
+            .map_err(|e| EgoError::CryptoError(format!("Invalid HRP: {}", e)))?;
+
+        encode::<bech32::Bech32m>(hrp, &full_payload)
+            .map_err(|e| EgoError::CryptoError(format!("Bech32m encoding failed: {}", e)))
+    }
+
+    pub fn from_bech32(address: &str, expected_hrp: &str) -> EgoResult<Self> {
+        let (hrp, data) = decode(address)
+            .map_err(|e| EgoError::CryptoError(format!("Bech32m decoding failed: {}", e)))?;
+
+        if hrp.as_str() != expected_hrp {
+            return Err(EgoError::CryptoError(format!(
+                "HRP mismatch: expected {}, got {}",
+                expected_hrp, hrp
+            )));
+        }
+
+        if data.len() != 21 {
+            return Err(EgoError::CryptoError(format!(
+                "Invalid payload length: expected 21, got {}",
+                data.len()
+            )));
+        }
+
+        let version_type = data[0];
+        let version = version_type >> 5;
+
+        if version != ADDRESS_VERSION {
+            return Err(EgoError::CryptoError(format!(
+                "Invalid version: expected {}, got {}",
+                ADDRESS_VERSION, version
+            )));
+        }
+
+        let mut payload = [0u8; 20];
+        payload.copy_from_slice(&data[1..21]);
+
+        Ok(Self {
+            version_type,
+            payload,
+        })
+    }
+
+    pub fn address_type(&self) -> Option<AddressType> {
+        let type_bits = self.version_type & 0b1_1111;
+        AddressType::from_u8(type_bits)
+    }
+
+    pub fn version(&self) -> u8 {
+        self.version_type >> 5
+    }
+
+    pub fn payload(&self) -> &[u8; 20] {
+        &self.payload
+    }
+
+    pub fn as_bytes(&self) -> [u8; 21] {
+        let mut bytes = [0u8; 21];
+        bytes[0] = self.version_type;
+        bytes[1..21].copy_from_slice(&self.payload);
+        bytes
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct KeyPair {
@@ -159,6 +291,20 @@ impl KeyPair {
             seed,
             transition_mode,
         }
+    }
+
+    pub fn derive_address(&self, chain_id: u32, address_type: AddressType) -> EgoAddress {
+        EgoAddress::from_dilithium_pk(&self.dilithium_pk, chain_id, address_type)
+    }
+
+    pub fn derive_bech32_address(
+        &self,
+        chain_id: u32,
+        address_type: AddressType,
+        hrp: &str,
+    ) -> EgoResult<String> {
+        let address = self.derive_address(chain_id, address_type);
+        address.to_bech32(hrp)
     }
 
     pub fn public_key(&self) -> PublicKey {
@@ -957,8 +1103,8 @@ pub fn verify_identity_binding(
     mlkem_pk: &[u8],
     caps: &[u8],
     chain_id: &[u8],
-    network_id: u32,
-    version: u32,
+    _network_id: u32,
+    _version: u32,
     nonce: &[u8],
     signature: &[u8],
     dilithium_pk: &[u8],
@@ -968,8 +1114,8 @@ pub fn verify_identity_binding(
     combined.extend_from_slice(mlkem_pk);
     combined.extend_from_slice(caps);
     combined.extend_from_slice(chain_id);
-    combined.extend_from_slice(&network_id.to_le_bytes());
-    combined.extend_from_slice(&version.to_le_bytes());
+    combined.extend_from_slice(&_network_id.to_le_bytes());
+    combined.extend_from_slice(&_version.to_le_bytes());
     combined.extend_from_slice(nonce);
     let data_to_verify = blake2s_hash_domain(&[DOMAIN_TAG_PEERBIND, &combined]);
 
