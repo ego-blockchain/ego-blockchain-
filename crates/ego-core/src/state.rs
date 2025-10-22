@@ -1,3 +1,4 @@
+use crate::block::PQSignatureCount;
 use crate::transaction::{
     CrossShardReceipt, PQVerificationResult, ProofType, ProofVerificationResult,
 };
