@@ -24,7 +24,7 @@ mod shard_tests {
     }
 
     fn create_test_account(address: Address, balance: Balance) -> Account {
-        let keypair = create_test_keypair();
+        let _keypair = create_test_keypair();
         Account {
             address,
             balance,
@@ -100,7 +100,9 @@ mod shard_tests {
             state_root: Hash::ZERO,
             transactions_root,
             receipts_root: Hash::ZERO,
-            events_root: Hash::ZERO,
+            events_root_post: Hash::ZERO,
+            events_root_poc: Hash::ZERO,
+            rollup_root: Hash::ZERO,
             da_root: Hash::ZERO,
             shard_id,
             proposer: Address::new([1u8; 20]),
@@ -116,6 +118,10 @@ mod shard_tests {
                 slh_dsa_sigs: 0,
             },
             signature: ego_core::DualSignature::new(None, None),
+            chain_id: TEST_CHAIN_ID,
+            network_id: TEST_NETWORK_ID,
+            vrf_output: [0u8; 32],
+            vrf_proof: None,
         };
 
         let header = BlockHeader {
@@ -129,6 +135,10 @@ mod shard_tests {
                 timestamp: Timestamp::now(),
                 pq_compliant: false,
                 signatures: Vec::new(),
+                validator_set_id: 0,
+                round: 0,
+                bitmap: vec![],
+                signatures_root: Hash::ZERO,
             },
             metadata: ego_core::BlockMetadata {
                 protocol_version: ego_core::PROTOCOL_VERSION,
@@ -137,9 +147,31 @@ mod shard_tests {
                 rollup_commits: 0,
                 poc_events: 0,
                 post_events: 0,
-                resource_pricing: None,
-                pq_transition_data: None,
-                cellular_stats: None,
+                resource_pricing: ego_core::block::ResourcePricing {
+                    bytes_cost: 100,
+                    ru_cost: 10,
+                    pob_floor: 1000,
+                    pq_signature_cost: 50,
+                    cellular_premium: 25,
+                },
+                pq_transition_data: ego_core::block::PQTransitionData {
+                    transition_phase: 1,
+                    pq_required_topics: vec![],
+                    legacy_support_end_epoch: None,
+                    algorithm_usage_stats: HashMap::new(),
+                },
+                cellular_stats: ego_core::block::CellularStats {
+                    cellular_safe_txs: 0,
+                    wifi_only_txs: 0,
+                    throttled_operations: 0,
+                    avg_cellular_cost_per_tx: 0.0,
+                    total_data_bytes_cellular: 0,
+                    total_data_bytes_wifi: 0,
+                },
+                density_events: 0,
+                drs_events: 0,
+                deploy_events: 0,
+                fraud_proofs: 0,
             },
         };
 
@@ -152,6 +184,8 @@ mod shard_tests {
             drs_events: Vec::new(),
             deploy_events: Vec::new(),
             pq_transition_events: Vec::new(),
+            density_events: Vec::new(),
+            fraud_proofs: Vec::new(),
         };
 
         let mut block = Block {
@@ -314,7 +348,6 @@ mod shard_tests {
     #[tokio::test]
     async fn test_cross_shard_add_outbound_receipt() {
         let manager = CrossShardManager::new();
-        let _keypair = create_test_keypair();
 
         let receipt = CrossShardReceipt {
             src_shard: ShardId::from_u32(0),
@@ -593,6 +626,7 @@ mod shard_tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
     async fn test_shard_manager_get_transactions_for_block() {
         let config = create_test_shard_config(0);
         let manager = ShardManager::new(config, TEST_CHAIN_ID, TEST_NETWORK_ID);
@@ -605,14 +639,14 @@ mod shard_tests {
         account.mlkem_pk = keypair.kyber_public_key().key_data.clone();
 
         {
-            let mut state = manager.state.write().await;
+            let state = manager.state.write().await;
             state.set_account(account.clone());
         }
 
         for i in 1..=10 {
             account.nonce = i - 1;
             {
-                let mut state = manager.state.write().await;
+                let state = manager.state.write().await;
                 state.set_account(account.clone());
             }
 
@@ -623,66 +657,7 @@ mod shard_tests {
         let transactions = manager.get_transactions_for_block(5).await;
         assert_eq!(transactions.len(), 5);
 
-        let block1 = Block {
-            hash: Hash::ZERO,
-            header: ego_core::BlockHeader {
-                core: ego_core::BlockHeaderCore {
-                    height: ego_core::BlockHeight::new(1),
-                    timestamp: Timestamp::now(),
-                    previous_hash: Hash::ZERO,
-                    state_root: Hash::ZERO,
-                    transactions_root: Hash::ZERO,
-                    receipts_root: Hash::ZERO,
-                    events_root: Hash::ZERO,
-                    da_root: Hash::ZERO,
-                    shard_id: ShardId::from_u32(0),
-                    proposer: from,
-                    tx_count: transactions.len() as u32,
-                    protocol_version: ego_core::PROTOCOL_VERSION,
-                    epoch: ego_core::EpochNumber(0),
-                    compute_used: 0,
-                    storage_used: 0,
-                    pq_signature_count: PQSignatureCount {
-                        dilithium_sigs: 0,
-                        ed25519_sigs: 0,
-                        hybrid_sigs: 0,
-                        slh_dsa_sigs: 0,
-                    },
-                    signature: ego_core::DualSignature::new(None, None),
-                },
-                qc: ego_core::QuorumCert {
-                    block_hash: Hash::ZERO,
-                    height: ego_core::BlockHeight::new(0),
-                    view: 0,
-                    aggregated_signature: None,
-                    voting_power: 0,
-                    timestamp: Timestamp::now(),
-                    pq_compliant: false,
-                    signatures: Vec::new(),
-                },
-                metadata: ego_core::BlockMetadata {
-                    protocol_version: ego_core::PROTOCOL_VERSION,
-                    block_size: 0,
-                    cross_shard_receipts: 0,
-                    rollup_commits: 0,
-                    poc_events: 0,
-                    post_events: 0,
-                    resource_pricing: None,
-                    pq_transition_data: None,
-                    cellular_stats: None,
-                },
-            },
-            body: ego_core::BlockBody {
-                transactions,
-                transaction_results: Vec::new(),
-                cross_shard_receipts: Vec::new(),
-                rollup_commitments: Vec::new(),
-                proof_events: Vec::new(),
-                drs_events: Vec::new(),
-                deploy_events: Vec::new(),
-                pq_transition_events: Vec::new(),
-            },
-        };
+        let block1 = create_test_block(1, ShardId::from_u32(0), transactions);
 
         manager.process_block(block1).await.unwrap();
 
@@ -694,66 +669,8 @@ mod shard_tests {
         let transactions2 = manager.get_transactions_for_block(5).await;
         assert_eq!(transactions2.len(), 5);
 
-        let block2 = Block {
-            hash: Hash::ZERO,
-            header: ego_core::BlockHeader {
-                core: ego_core::BlockHeaderCore {
-                    height: ego_core::BlockHeight::new(2),
-                    timestamp: Timestamp::now(),
-                    previous_hash: Hash::ZERO,
-                    state_root: Hash::ZERO,
-                    transactions_root: Hash::ZERO,
-                    receipts_root: Hash::ZERO,
-                    events_root: Hash::ZERO,
-                    da_root: Hash::ZERO,
-                    shard_id: ShardId::from_u32(0),
-                    proposer: from,
-                    tx_count: transactions2.len() as u32,
-                    protocol_version: ego_core::PROTOCOL_VERSION,
-                    epoch: ego_core::EpochNumber(0),
-                    compute_used: 0,
-                    storage_used: 0,
-                    pq_signature_count: PQSignatureCount {
-                        dilithium_sigs: 0,
-                        ed25519_sigs: 0,
-                        hybrid_sigs: 0,
-                        slh_dsa_sigs: 0,
-                    },
-                    signature: ego_core::DualSignature::new(None, None),
-                },
-                qc: ego_core::QuorumCert {
-                    block_hash: Hash::ZERO,
-                    height: ego_core::BlockHeight::new(1),
-                    view: 0,
-                    aggregated_signature: None,
-                    voting_power: 0,
-                    timestamp: Timestamp::now(),
-                    pq_compliant: false,
-                    signatures: Vec::new(),
-                },
-                metadata: ego_core::BlockMetadata {
-                    protocol_version: ego_core::PROTOCOL_VERSION,
-                    block_size: 0,
-                    cross_shard_receipts: 0,
-                    rollup_commits: 0,
-                    poc_events: 0,
-                    post_events: 0,
-                    resource_pricing: None,
-                    pq_transition_data: None,
-                    cellular_stats: None,
-                },
-            },
-            body: ego_core::BlockBody {
-                transactions: transactions2,
-                transaction_results: Vec::new(),
-                cross_shard_receipts: Vec::new(),
-                rollup_commitments: Vec::new(),
-                proof_events: Vec::new(),
-                drs_events: Vec::new(),
-                deploy_events: Vec::new(),
-                pq_transition_events: Vec::new(),
-            },
-        };
+        let block2 = create_test_block(2, ShardId::from_u32(0), transactions2);
+
         manager.process_block(block2).await.unwrap();
 
         let final_stats = manager.get_stats().await;
@@ -776,7 +693,6 @@ mod shard_tests {
         assert_eq!(recent[0].header.core.height.as_u64(), 2);
         assert_eq!(recent[1].header.core.height.as_u64(), 1);
     }
-
     #[tokio::test]
     async fn test_multi_shard_cross_communication() {
         let config0 = create_test_shard_config(0);
