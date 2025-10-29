@@ -153,14 +153,14 @@ impl RollupBlock {
             timestamp: Timestamp::now(),
             transactions,
             operator,
-            signature: Signature::new([0u8; 64]),
+            signature: Signature::ed25519([0u8; 64]),
         }
     }
 
     pub fn hash(&self) -> Hash {
         let config = bincode::config::standard();
         let mut block_copy = self.clone();
-        block_copy.signature = Signature::new([0u8; 64]);
+        block_copy.signature = Signature::ed25519([0u8; 64]);
 
         let data = bincode::encode_to_vec(&block_copy, config).unwrap_or_default();
         ego_core::crypto::hash_data(&data)
@@ -229,9 +229,11 @@ mod tests {
                 to: Address::new([2u8; 20]),
                 amount: Balance::from_egoc(100),
                 memo: None,
+                stealth_mode: false,
             },
             ShardId::new(0).unwrap(),
             None,
+            1, // chain_id
         );
 
         let rollup_tx = RollupTransaction::new(inner_tx, 1, 1000);

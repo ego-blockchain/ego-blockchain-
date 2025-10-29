@@ -198,12 +198,12 @@ impl Node {
         let network_manager = NetworkManager::new();
         let bandwidth_sharing = BandwidthSharingManager::new(Default::default());
         let data_optimizer = DataOptimizer::new();
-        let mut state_manager = StateManager::new();
+        let mut state_manager = StateManager::new(1, 1); // chain_id=1, network_id=1
 
         let (optimization_events, optimization_receiver) = mpsc::unbounded_channel();
 
         let node_address = Address::from_public_key(&keystore.public_key());
-        let node_account = Account::new_user(node_address);
+        let node_account = Account::new_eoa(node_address, vec![0u8; 32], vec![0u8; 32]);
         state_manager.set_account(node_account);
 
         info!(
@@ -263,7 +263,8 @@ impl Node {
             node.keystore.public_key(),
             500,
             Balance::from_egoc(1000),
-            node.keystore.dilithium_public_key(),
+            node.keystore.dilithium_public_key().key_data,
+            node.keystore.kyber_public_key().key_data,
         )
         .map_err(|e| anyhow::anyhow!("Failed to create validator account: {}", e))?;
 
@@ -301,12 +302,25 @@ impl Node {
             ]),
             last_poc: None,
             post_stats: Default::default(),
+            cellular_safe: true,
+            max_bandwidth_cellular: 10_000_000,
+            monthly_data_limit_gb: 100,
+            cost_awareness: ego_core::CostAwareness {
+                cellular_safe_mode: true,
+                max_monthly_cost_usd: 50.0,
+                current_month_usage_gb: 0,
+                wifi_only_operations: vec![],
+                cellular_throttle_threshold_gb: 80,
+            },
         };
 
-        let device_account = Account::new_device_simple(
+        let device_account = Account::new_device(
             device_address,
             format!("storage-{}", node.peer_id),
             capabilities,
+            node.keystore.dilithium_public_key().key_data,
+            node.keystore.kyber_public_key().key_data,
+            node.peer_id.to_string(),
         );
         node.state_manager.set_account(device_account);
 
@@ -356,12 +370,25 @@ impl Node {
             ]),
             last_poc: None,
             post_stats: Default::default(),
+            cellular_safe: true,
+            max_bandwidth_cellular: 100_000_000,
+            monthly_data_limit_gb: 500,
+            cost_awareness: ego_core::CostAwareness {
+                cellular_safe_mode: true,
+                max_monthly_cost_usd: 200.0,
+                current_month_usage_gb: 0,
+                wifi_only_operations: vec![],
+                cellular_throttle_threshold_gb: 400,
+            },
         };
 
-        let gateway_account = Account::new_device_simple(
+        let gateway_account = Account::new_device(
             gateway_address,
             format!("gateway-{}-{}", slice_id, node.peer_id),
             capabilities,
+            node.keystore.dilithium_public_key().key_data,
+            node.keystore.kyber_public_key().key_data,
+            node.peer_id.to_string(),
         );
         node.state_manager.set_account(gateway_account);
 
@@ -392,7 +419,7 @@ impl Node {
         let _ = node.enable_bandwidth_sharing(75, 1500);
 
         let node_address = Address::from_public_key(&node.keystore.public_key());
-        let mut full_account = Account::new_user(node_address);
+        let mut full_account = Account::new_eoa(node_address, vec![0u8; 32], vec![0u8; 32]);
         full_account.storage_quota = storage_capacity;
         full_account.credit(Balance::from_egoc(1000));
         full_account.storage_credits = 10000;
@@ -409,6 +436,16 @@ impl Node {
             ]),
             last_poc: None,
             post_stats: Default::default(),
+            cellular_safe: true,
+            max_bandwidth_cellular: 50_000_000,
+            monthly_data_limit_gb: 200,
+            cost_awareness: ego_core::CostAwareness {
+                cellular_safe_mode: true,
+                max_monthly_cost_usd: 100.0,
+                current_month_usage_gb: 0,
+                wifi_only_operations: vec![],
+                cellular_throttle_threshold_gb: 150,
+            },
         };
         full_account.device_capabilities = Some(capabilities);
 
@@ -432,7 +469,7 @@ impl Node {
         let _ = node.enable_bandwidth_sharing(200, 5000);
 
         let seed_address = Address::from_public_key(&node.keystore.public_key());
-        let mut seed_account = Account::new_user(seed_address);
+        let mut seed_account = Account::new_eoa(seed_address, vec![0u8; 32], vec![0u8; 32]);
         seed_account.storage_quota = 50_000_000_000;
         seed_account.credit(Balance::from_egoc(10000));
         seed_account.storage_credits = 50000;
@@ -462,7 +499,7 @@ impl Node {
         let _ = node.enable_bandwidth_sharing(40, 800);
 
         let indexer_address = Address::from_public_key(&node.keystore.public_key());
-        let mut indexer_account = Account::new_user(indexer_address);
+        let mut indexer_account = Account::new_eoa(indexer_address, vec![0u8; 32], vec![0u8; 32]);
         indexer_account.storage_quota = storage_capacity;
         indexer_account.credit(Balance::from_egoc(500));
         indexer_account.storage_credits = 20000;
@@ -480,6 +517,16 @@ impl Node {
             ]),
             last_poc: None,
             post_stats: Default::default(),
+            cellular_safe: true,
+            max_bandwidth_cellular: 50_000_000,
+            monthly_data_limit_gb: 200,
+            cost_awareness: ego_core::CostAwareness {
+                cellular_safe_mode: true,
+                max_monthly_cost_usd: 100.0,
+                current_month_usage_gb: 0,
+                wifi_only_operations: vec![],
+                cellular_throttle_threshold_gb: 150,
+            },
         };
         indexer_account.device_capabilities = Some(capabilities);
 
@@ -527,9 +574,11 @@ impl Node {
             proposer_address,
             transactions,
             vec![],
+            1, // chain_id
+            1, // network_id
         );
 
-        block.sign(self.get_keypair())?;
+        block.sign(self.get_keypair(), false)?; // transition_mode = false
 
         info!(
             "Created block {} at height {} with {} transactions",
@@ -546,7 +595,12 @@ impl Node {
 
         if let Some(account) = self.state_manager.get_account(&block.header.core.proposer) {
             if let Some(validator_pubkey) = account.get_validator_pubkey() {
-                return block.verify_signature(&validator_pubkey);
+                let ed25519_pk = account.ed25519_pk.as_ref()
+                    .and_then(|bytes| {
+                        let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
+                        Some(ego_core::PublicKey::ed25519(arr))
+                    });
+                return block.verify_signature(&validator_pubkey, ed25519_pk.as_ref());
             }
         }
 
@@ -657,15 +711,19 @@ impl Node {
         let timestamp = current_timestamp();
 
         let proof_event = ego_core::ProofEvent {
-            proof_type: "poc".to_string(),
+            proof_type: ego_core::block::ProofEventType::PoC,
             prover: Address::from_public_key(&self.keystore.public_key()),
             challenge_hash: Hash::random(),
-            proof_data: evidence_digest.clone(),
+            proof_data_hash: ego_core::crypto::hash_data(&evidence_digest),
             location_id: h3_cell.clone(),
             slice_id: self.slice_id.clone(),
             timestamp,
             verified: false,
+            latency_ms: 0,
             witness_data: None,
+            batch_proof: false,
+            cellular_optimized: true,
+            evidence_cid: None,
         };
 
         let node_proof = ProofEvent {
@@ -705,15 +763,19 @@ impl Node {
         let timestamp = current_timestamp();
 
         let proof_event = ego_core::ProofEvent {
-            proof_type: "post".to_string(),
+            proof_type: ego_core::block::ProofEventType::PoSt,
             prover: Address::from_public_key(&self.keystore.public_key()),
             challenge_hash: Hash::random(),
-            proof_data: evidence_digest.clone(),
+            proof_data_hash: ego_core::crypto::hash_data(&evidence_digest),
             location_id: format!("shard-{}-piece-{}", shard_id, piece_id),
             slice_id: self.slice_id.clone(),
             timestamp,
             verified: false,
+            latency_ms: 0,
             witness_data: None,
+            batch_proof: false,
+            cellular_optimized: true,
+            evidence_cid: None,
         };
 
         let node_proof = ProofEvent {

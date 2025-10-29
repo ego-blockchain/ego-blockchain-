@@ -823,6 +823,7 @@ async fn handle_interactive_command(
                     to: to_address,
                     amount,
                     memo: Some("Test transfer".to_string()),
+                    stealth_mode: false,
                 };
 
                 let mut tx = Transaction::new(
@@ -831,9 +832,10 @@ async fn handle_interactive_command(
                     payload,
                     ego_core::ShardId::new(0).unwrap(),
                     None,
+                    1, // chain_id
                 );
 
-                if let Err(e) = tx.sign(node.get_keypair()) {
+                if let Err(e) = tx.sign(node.get_keypair(), false) {
                     println!("❌ Failed to sign transaction: {}", e);
                 } else {
                     match node.execute_transaction(&tx).await {
