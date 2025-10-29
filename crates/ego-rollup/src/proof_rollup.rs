@@ -1,14 +1,12 @@
-use crate::commitment::RollupCommitment;
 use crate::config::RollupConfig;
 use crate::da::{DAChunk, DataAvailability};
 use crate::error::{RollupError, RollupResult};
-use crate::metrics::RollupMetrics;
 use ego_core::{Address, Hash, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// ProofRollup: Aggregates PoC/PoSt/PoRep events and evidence bundles
 /// Posts roots and minimal validity to shards with Dilithium-2 signatures
