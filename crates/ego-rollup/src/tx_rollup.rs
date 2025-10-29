@@ -1,9 +1,7 @@
-use crate::commitment::RollupCommitment;
 use crate::config::RollupConfig;
 use crate::da::{DAChunk, DataAvailability};
 use crate::error::{RollupError, RollupResult};
 use crate::fraud::{FraudProof, FraudProofVerifier};
-use crate::metrics::RollupMetrics;
 use crate::types::{CommitmentStatus, RollupTransaction};
 use ego_core::{Address, Hash, Timestamp};
 use serde::{Deserialize, Serialize};
