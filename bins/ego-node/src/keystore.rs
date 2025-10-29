@@ -146,10 +146,13 @@ impl DerivationPath {
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SecureKeystore {
     primary_keypair: KeyPair,
+    #[zeroize(skip)]
     derived_keypairs: HashMap<String, KeyPair>,
+    #[zeroize(skip)]
     account_bindings: HashMap<String, AccountBinding>,
     #[zeroize(skip)]
     metadata: KeystoreMetadata,
+    #[zeroize(skip)]
     libp2p_keypair: Option<libp2p::identity::Keypair>,
     transition_mode: bool,
 }
@@ -567,10 +570,22 @@ impl SecureKeystore {
         &self,
         peer_x25519_pk: &[u8],
         peer_kyber_pk: &[u8],
-        info: &[u8],
+        stream_kind: &str,
+        stream_nonce: &[u8; 32],
+        chain_id: &[u8],
+        network_id: u32,
+        version: u32,
     ) -> Result<(ego_core::SessionRecord, Vec<u8>), KeystoreError> {
         self.primary_keypair
-            .create_hybrid_session(peer_x25519_pk, peer_kyber_pk, info)
+            .create_hybrid_session(
+                peer_x25519_pk,
+                peer_kyber_pk,
+                stream_kind,
+                stream_nonce,
+                chain_id,
+                network_id,
+                version,
+            )
             .map_err(|e| KeystoreError::CoreError(e))
     }
 

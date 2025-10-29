@@ -145,7 +145,7 @@ impl BatchBuilder {
     }
 
     pub fn add_transaction(&mut self, tx: RollupTransaction) -> RollupResult<bool> {
-        let tx_gas = tx.inner.estimate_compute_cost();
+        let tx_gas = tx.inner.estimate_resource_units();
         let tx_size = tx.size();
 
         if self.current_transactions.len() >= self.max_batch_size as usize {
@@ -170,7 +170,7 @@ impl BatchBuilder {
     }
 
     pub fn can_add_transaction(&self, tx: &RollupTransaction) -> bool {
-        let tx_gas = tx.inner.estimate_compute_cost();
+        let tx_gas = tx.inner.estimate_resource_units();
 
         self.current_transactions.len() < self.max_batch_size as usize
             && self.current_gas + tx_gas <= self.max_gas_limit
@@ -283,7 +283,7 @@ impl BatchProcessor {
         Ok(RollupExecutionResult {
             tx_hash: tx.hash(),
             success: result.success,
-            gas_used: result.compute_used,
+            gas_used: result.ru_used,
             state_changes: vec![],
             events: vec![],
             error: result.error,
@@ -368,9 +368,11 @@ mod tests {
                 to: Address::new([2u8; 20]),
                 amount: Balance::from_egoc(100),
                 memo: None,
+                stealth_mode: false,
             },
             ShardId::new(0).unwrap(),
             None,
+            1, // chain_id
         );
 
         RollupTransaction::new(inner, nonce, 1000)

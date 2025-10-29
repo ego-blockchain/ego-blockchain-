@@ -39,3 +39,16 @@ pids
 # Temporary files
 *.tmp
 *.temp
+
+# Documentation
+# Ignore all markdown files except README.md
+*.md
+!README.md
+
+# Ignore docs folder
+docs/
+
+# Node management scripts and data
+node_data_*
+start_node*
+manage_node*

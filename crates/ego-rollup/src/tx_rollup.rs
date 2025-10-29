@@ -163,7 +163,7 @@ impl TxRollupOperator {
             config.da.compression_level,
         )?;
         
-        let fraud_verifier = FraudProofVerifier::new();
+        let fraud_verifier = FraudProofVerifier::new(0.8, 24);
         
         Ok(Self {
             config,
@@ -296,7 +296,7 @@ impl TxRollupOperator {
             block_range_end: batch.l1_block_number,
             min_validity_proof: MinValidityProof::StateWitness,
             alg_sig_id: 2, // ML-DSA-2 (Dilithium-2)
-            operator_addr: self.operator_addr.as_bytes().try_into().unwrap_or([0u8; 20]),
+            operator_addr: *self.operator_addr.as_bytes(),
             operator_sig: Vec::new(), // TODO: Sign with Dilithium-2
             created_at: Timestamp::now(),
         };
@@ -379,7 +379,7 @@ impl TxRollupOperator {
             }
             ChallengeType::Timeout => {
                 warn!("Challenge is for timeout - cannot defend");
-                return Err(RollupError::ChallengeDefenseFailed("Timeout challenge".to_string()));
+                return Err(RollupError::OperatorError("Timeout challenge cannot be defended".to_string()));
             }
         }
         
@@ -445,7 +445,7 @@ impl TxRollupOperator {
         hasher.update(b"new_state");
         
         let hash_bytes = hasher.finalize();
-        Ok(Hash::from_bytes(hash_bytes.as_bytes()))
+        Ok(Hash::new(*hash_bytes.as_bytes()))
     }
     
     fn serialize_transactions(&self, transactions: &[RollupTransaction]) -> RollupResult<Vec<u8>> {
@@ -538,9 +538,11 @@ mod tests {
                 to: Address::new([2u8; 20]),
                 amount: Balance::from_egoc(100),
                 memo: None,
+                stealth_mode: false,
             },
             ShardId::new(0).unwrap(),
             None,
+            1,
         );
         
         RollupTransaction::new(inner, 1, 1000)

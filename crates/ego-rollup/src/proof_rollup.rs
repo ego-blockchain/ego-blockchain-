@@ -284,7 +284,8 @@ impl ProofRollupOperator {
         // Verify Dilithium signature
         self.verify_dilithium_signature(&proof.dilithium_sig, &proof.sector_id).await?;
         
-        let proof_hash = Hash::from_bytes(&proof.sector_id);
+        let proof_hash = Hash::from_slice(&proof.sector_id)
+            .unwrap_or_else(|_| ego_core::crypto::hash_data(&proof.sector_id));
         
         {
             let mut pending = self.pending_porep.write().await;
@@ -353,7 +354,7 @@ impl ProofRollupOperator {
             blob_bytes: bundle.compressed_data.len() as u64,
             min_validity_proof: MinValidityProof::InclusionOnly,
             alg_sig_id: 2, // ML-DSA-2 (Dilithium-2)
-            operator_addr: self.operator_addr.as_bytes().try_into().unwrap_or([0u8; 20]),
+            operator_addr: *self.operator_addr.as_bytes(),
             operator_sig: Vec::new(), // TODO: Sign with Dilithium-2
             created_at: Timestamp::now(),
         };
@@ -426,7 +427,7 @@ impl ProofRollupOperator {
         
         // Compress with zstd
         let compressed_data = zstd::bulk::compress(&data, self.config.da.compression_level as i32)
-            .map_err(|e| RollupError::CompressionError(e.to_string()))?;
+            .map_err(|e| RollupError::SerializationError(e.to_string()))?;
         
         let compression_ratio = original_size as f64 / compressed_data.len() as f64;
         
@@ -469,7 +470,7 @@ impl ProofRollupOperator {
         merkle_tree.root_hash().unwrap_or(Hash::ZERO)
     }
     
-    fn compute_evidence_hash<T: Serialize>(&self, evidence: &T) -> Hash {
+    fn compute_evidence_hash<T: Serialize + bincode::Encode>(&self, evidence: &T) -> Hash {
         let config = bincode::config::standard();
         let data = bincode::encode_to_vec(evidence, config).unwrap_or_default();
         ego_core::crypto::hash_data(&data)
