@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+pub const PROTOCOL_VERSION: u32 = 1;
+pub const MAX_SHARD_COUNT: u32 = 256;
+pub const EGOC_BASE_UNIT: u128 = 1_000_000_000;
 
 #[derive(
     Debug,
@@ -41,6 +44,37 @@ impl AlgorithmId {
 
     pub fn as_u16(&self) -> u16 {
         *self as u16
+    }
+
+    pub fn is_signature_algorithm(&self) -> bool {
+        matches!(self, Self::Ed25519 | Self::MlDsa2 | Self::SlhDsa)
+    }
+
+    pub fn is_kem_algorithm(&self) -> bool {
+        matches!(self, Self::MlKem768 | Self::X25519)
+    }
+
+    pub fn is_pq_algorithm(&self) -> bool {
+        matches!(self, Self::MlDsa2 | Self::SlhDsa | Self::MlKem768)
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Ed25519 => "Ed25519",
+            Self::MlDsa2 => "ML-DSA-2 (Dilithium-2)",
+            Self::SlhDsa => "SLH-DSA (SPHINCS+)",
+            Self::X25519 => "X25519",
+            Self::MlKem768 => "ML-KEM-768 (Kyber-768)",
+            Self::XChaCha20Poly1305 => "XChaCha20-Poly1305",
+            Self::Blake2s256 => "BLAKE2s-256",
+            Self::HkdfBlake2s => "HKDF-BLAKE2s",
+        }
+    }
+}
+
+impl fmt::Display for AlgorithmId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.name())
     }
 }
 
@@ -88,6 +122,20 @@ impl Hash {
     pub fn random() -> Self {
         Self(rand::random())
     }
+
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+
+    pub fn from_hex(hex_str: &str) -> Result<Self, crate::EgoError> {
+        let bytes = hex::decode(hex_str)
+            .map_err(|e| crate::EgoError::CryptoError(format!("Invalid hex string: {}", e)))?;
+        Self::from_slice(&bytes)
+    }
+
+    pub fn short_display(&self) -> String {
+        format!("{}...{}", &self.to_hex()[..8], &self.to_hex()[56..])
+    }
 }
 
 impl fmt::Display for Hash {
@@ -99,6 +147,12 @@ impl fmt::Display for Hash {
 impl From<[u8; 32]> for Hash {
     fn from(bytes: [u8; 32]) -> Self {
         Self(bytes)
+    }
+}
+
+impl AsRef<[u8]> for Hash {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -218,15 +272,47 @@ impl PublicKey {
             None
         }
     }
+
+    pub fn size(&self) -> usize {
+        6 + self.key_data.len()
+    }
+
+    pub fn validate(&self) -> Result<(), crate::EgoError> {
+        match self.algorithm {
+            AlgorithmId::Ed25519 => {
+                if self.key_data.len() != 32 {
+                    return Err(crate::EgoError::CryptoError(
+                        "Ed25519 key must be 32 bytes".to_string(),
+                    ));
+                }
+            }
+            AlgorithmId::MlDsa2 => {
+                if self.key_data.len() != 1312 {
+                    return Err(crate::EgoError::CryptoError(
+                        "ML-DSA-2 key must be 1312 bytes".to_string(),
+                    ));
+                }
+            }
+            AlgorithmId::MlKem768 => {
+                if self.key_data.len() != 1184 {
+                    return Err(crate::EgoError::CryptoError(
+                        "ML-KEM-768 key must be 1184 bytes".to_string(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for PublicKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{:?}:{}",
+            "{}:{}...",
             self.algorithm,
-            hex::encode(&self.key_data[..self.key_data.len().min(32)])
+            hex::encode(&self.key_data[..self.key_data.len().min(16)])
         )
     }
 }
@@ -315,6 +401,16 @@ impl Signature {
             None
         }
     }
+
+    pub fn size(&self) -> usize {
+        6 + self.signature_data.len()
+    }
+}
+
+impl fmt::Display for Signature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}({}B)", self.algorithm, self.signature_data.len())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -329,7 +425,7 @@ impl DualSignature {
         Self {
             ed25519_sig,
             dilithium_sig,
-            protocol_version: crate::PROTOCOL_VERSION,
+            protocol_version: PROTOCOL_VERSION,
         }
     }
 
@@ -337,7 +433,7 @@ impl DualSignature {
         Self {
             ed25519_sig: Some(sig),
             dilithium_sig: None,
-            protocol_version: crate::PROTOCOL_VERSION,
+            protocol_version: PROTOCOL_VERSION,
         }
     }
 
@@ -345,7 +441,7 @@ impl DualSignature {
         Self {
             ed25519_sig: None,
             dilithium_sig: Some(sig),
-            protocol_version: crate::PROTOCOL_VERSION,
+            protocol_version: PROTOCOL_VERSION,
         }
     }
 
@@ -353,8 +449,27 @@ impl DualSignature {
         Self {
             ed25519_sig: Some(ed25519_sig),
             dilithium_sig: Some(dilithium_sig),
-            protocol_version: crate::PROTOCOL_VERSION,
+            protocol_version: PROTOCOL_VERSION,
         }
+    }
+
+    pub fn is_pq_only(&self) -> bool {
+        self.dilithium_sig.is_some() && self.ed25519_sig.is_none()
+    }
+
+    pub fn is_hybrid(&self) -> bool {
+        self.dilithium_sig.is_some() && self.ed25519_sig.is_some()
+    }
+
+    pub fn algorithms_used(&self) -> Vec<AlgorithmId> {
+        let mut algs = Vec::new();
+        if self.ed25519_sig.is_some() {
+            algs.push(AlgorithmId::Ed25519);
+        }
+        if self.dilithium_sig.is_some() {
+            algs.push(AlgorithmId::MlDsa2);
+        }
+        algs
     }
 }
 
@@ -384,7 +499,7 @@ impl SessionRecord {
             aead_tag,
             alg_kem_id: AlgorithmId::MlKem768.as_u16(),
             alg_dh_legacy_id,
-            protocol_version: crate::PROTOCOL_VERSION,
+            protocol_version: PROTOCOL_VERSION,
         }
     }
 
@@ -401,7 +516,7 @@ impl SessionRecord {
             aead_tag,
             alg_kem_id: AlgorithmId::MlKem768.as_u16(),
             alg_dh_legacy_id: Some(AlgorithmId::X25519.as_u16()),
-            protocol_version: crate::PROTOCOL_VERSION,
+            protocol_version: PROTOCOL_VERSION,
         }
     }
 
@@ -413,8 +528,16 @@ impl SessionRecord {
             aead_tag,
             alg_kem_id: AlgorithmId::MlKem768.as_u16(),
             alg_dh_legacy_id: None,
-            protocol_version: crate::PROTOCOL_VERSION,
+            protocol_version: PROTOCOL_VERSION,
         }
+    }
+
+    pub fn is_pq_only(&self) -> bool {
+        self.x25519_pubkey.is_none()
+    }
+
+    pub fn is_hybrid(&self) -> bool {
+        self.x25519_pubkey.is_some()
     }
 }
 
@@ -441,7 +564,7 @@ impl HandshakeInit {
         chain_id: Vec<u8>,
     ) -> Self {
         Self {
-            version: crate::PROTOCOL_VERSION,
+            version: PROTOCOL_VERSION,
             alg_kem,
             alg_dh_legacy: None,
             x25519_c_pk: None,
@@ -464,7 +587,7 @@ impl HandshakeInit {
         chain_id: Vec<u8>,
     ) -> Self {
         Self {
-            version: crate::PROTOCOL_VERSION,
+            version: PROTOCOL_VERSION,
             alg_kem,
             alg_dh_legacy: Some(alg_dh_legacy),
             x25519_c_pk: Some(x25519_c_pk),
@@ -555,11 +678,32 @@ impl Address {
     pub fn random() -> Self {
         Self(rand::random())
     }
+
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+
+    pub fn from_hex(hex_str: &str) -> Result<Self, crate::EgoError> {
+        let bytes = hex::decode(hex_str)
+            .map_err(|e| crate::EgoError::CryptoError(format!("Invalid hex string: {}", e)))?;
+        Self::from_slice(&bytes)
+    }
+
+    pub fn short_display(&self) -> String {
+        let hex = self.to_hex();
+        format!("ego{}...{}", &hex[..6], &hex[34..])
+    }
 }
 
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ego{}", hex::encode(self.0))
+    }
+}
+
+impl AsRef<[u8]> for Address {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -612,11 +756,24 @@ impl Timestamp {
     pub fn elapsed_secs(&self) -> u64 {
         self.elapsed_millis() / 1000
     }
+
+    pub fn is_expired(&self, duration_millis: u64) -> bool {
+        self.elapsed_millis() > duration_millis
+    }
+
+    pub fn add_millis(&self, millis: u64) -> Self {
+        Self(self.0.saturating_add(millis))
+    }
+
+    pub fn add_secs(&self, secs: u64) -> Self {
+        self.add_millis(secs * 1000)
+    }
 }
 
 impl fmt::Display for Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let datetime = chrono::DateTime::from_timestamp_millis(self.0 as i64).unwrap_or_default();
+        let datetime = chrono::DateTime::from_timestamp_millis(self.0 as i64)
+            .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH);
         write!(f, "{}", datetime.format("%Y-%m-%d %H:%M:%S UTC"))
     }
 }
@@ -639,7 +796,7 @@ pub struct ShardId(pub u32);
 
 impl ShardId {
     pub fn new(id: u32) -> Result<Self, crate::EgoError> {
-        if id >= crate::MAX_SHARD_COUNT {
+        if id >= MAX_SHARD_COUNT {
             return Err(crate::EgoError::InvalidShardId { shard_id: id });
         }
         Ok(Self(id))
@@ -651,6 +808,14 @@ impl ShardId {
 
     pub fn from_u32(id: u32) -> Self {
         Self(id)
+    }
+
+    pub fn next(&self) -> Result<Self, crate::EgoError> {
+        Self::new(self.0 + 1)
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.0 < MAX_SHARD_COUNT
     }
 }
 
@@ -697,6 +862,14 @@ impl BlockHeight {
     pub fn is_genesis(&self) -> bool {
         self.0 == 0
     }
+
+    pub fn distance_to(&self, other: Self) -> u64 {
+        if self.0 >= other.0 {
+            self.0 - other.0
+        } else {
+            other.0 - self.0
+        }
+    }
 }
 
 impl fmt::Display for BlockHeight {
@@ -738,6 +911,10 @@ impl EpochNumber {
     pub fn prev(&self) -> Self {
         Self(self.0.saturating_sub(1))
     }
+
+    pub fn is_genesis(&self) -> bool {
+        self.0 == 0
+    }
 }
 
 impl fmt::Display for EpochNumber {
@@ -769,13 +946,14 @@ impl Default for Balance {
 
 impl Balance {
     pub const ZERO: Self = Balance(0);
+    pub const MAX: Self = Balance(u128::MAX);
 
     pub fn new(amount: u128) -> Self {
         Self(amount)
     }
 
     pub fn from_egoc(egoc: u64) -> Self {
-        Self(egoc as u128 * crate::EGOC_BASE_UNIT)
+        Self(egoc as u128 * EGOC_BASE_UNIT)
     }
 
     pub fn from_uegoc(uegoc: u128) -> Self {
@@ -787,7 +965,7 @@ impl Balance {
     }
 
     pub fn to_egoc(&self) -> f64 {
-        self.0 as f64 / crate::EGOC_BASE_UNIT as f64
+        self.0 as f64 / EGOC_BASE_UNIT as f64
     }
 
     pub fn to_uegoc(&self) -> u128 {
@@ -822,8 +1000,29 @@ impl Balance {
         Balance(self.0.saturating_sub(other.0))
     }
 
+    pub fn saturating_mul(&self, multiplier: u128) -> Balance {
+        Balance(self.0.saturating_mul(multiplier))
+    }
+
     pub fn is_zero(&self) -> bool {
         self.0 == 0
+    }
+
+    pub fn is_positive(&self) -> bool {
+        self.0 > 0
+    }
+
+    pub fn percent_of(&self, total: Balance) -> f64 {
+        if total.is_zero() {
+            0.0
+        } else {
+            (self.0 as f64 / total.0 as f64) * 100.0
+        }
+    }
+
+    pub fn apply_multiplier(&self, multiplier: f64) -> Balance {
+        let result = (self.0 as f64 * multiplier).round() as u128;
+        Balance(result.min(u128::MAX))
     }
 }
 
@@ -842,6 +1041,22 @@ impl From<u128> for Balance {
 impl From<u64> for Balance {
     fn from(amount: u64) -> Self {
         Self(amount as u128)
+    }
+}
+
+impl std::ops::Add for Balance {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        self.saturating_add(other)
+    }
+}
+
+impl std::ops::Sub for Balance {
+    type Output = Self;
+
+    fn sub(self, other: Self) -> Self {
+        self.saturating_sub(other)
     }
 }
 
@@ -870,6 +1085,16 @@ impl SliceId {
                 .0
                 .chars()
                 .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    }
+
+    pub fn validate(&self) -> Result<(), crate::EgoError> {
+        if !self.is_valid() {
+            return Err(crate::EgoError::InvalidTransaction(format!(
+                "Invalid slice ID: {}",
+                self.0
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -902,6 +1127,10 @@ impl PeerId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
 }
 
 impl fmt::Display for PeerId {
@@ -927,6 +1156,10 @@ impl NodeId {
     pub fn from_libp2p(peer_id: libp2p::PeerId) -> Self {
         Self(PeerId::from(peer_id))
     }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
 }
 
 impl fmt::Display for NodeId {
@@ -941,6 +1174,8 @@ pub struct NetworkQuality {
     pub bandwidth_mbps: u64,
     pub reliability_score: u8,
     pub cost_per_gb_usd: f64,
+    pub jitter_ms: u16,
+    pub packet_loss_percent: f32,
 }
 
 impl Default for NetworkQuality {
@@ -950,7 +1185,25 @@ impl Default for NetworkQuality {
             bandwidth_mbps: 100,
             reliability_score: 80,
             cost_per_gb_usd: 0.0,
+            jitter_ms: 5,
+            packet_loss_percent: 0.1,
         }
+    }
+}
+
+impl NetworkQuality {
+    pub fn is_acceptable(&self, min_reliability: u8, max_latency_ms: u32) -> bool {
+        self.reliability_score >= min_reliability && self.latency_ms <= max_latency_ms
+    }
+
+    pub fn quality_score(&self) -> f64 {
+        let latency_score = (1000.0 / (self.latency_ms as f64 + 1.0)).min(100.0);
+        let reliability_score = self.reliability_score as f64;
+        let jitter_score = (100.0 / (self.jitter_ms as f64 + 1.0)).min(100.0);
+        let loss_score = (100.0 - self.packet_loss_percent as f64 * 10.0).max(0.0);
+
+        (latency_score * 0.3 + reliability_score * 0.4 + jitter_score * 0.15 + loss_score * 0.15)
+            .min(100.0)
     }
 }
 
@@ -958,9 +1211,12 @@ impl Default for NetworkQuality {
 pub struct GeoLocation {
     pub latitude: f64,
     pub longitude: f64,
+    pub altitude_m: Option<f32>,
     pub h3_index: Option<String>,
+    pub h3_resolution: Option<u8>,
     pub country_code: Option<String>,
     pub region: Option<String>,
+    pub city: Option<String>,
 }
 
 impl GeoLocation {
@@ -968,23 +1224,420 @@ impl GeoLocation {
         Self {
             latitude,
             longitude,
+            altitude_m: None,
             h3_index: None,
+            h3_resolution: None,
             country_code: None,
             region: None,
+            city: None,
         }
     }
 
+    pub fn with_h3(mut self, h3_index: String, resolution: u8) -> Self {
+        self.h3_index = Some(h3_index);
+        self.h3_resolution = Some(resolution);
+        self
+    }
+
+    pub fn with_region(mut self, country: String, region: String, city: Option<String>) -> Self {
+        self.country_code = Some(country);
+        self.region = Some(region);
+        self.city = city;
+        self
+    }
+
     pub fn distance_to(&self, other: &GeoLocation) -> f64 {
-        let r = 6371.0;
-        let lat1 = self.latitude.to_radians();
-        let lat2 = other.latitude.to_radians();
-        let delta_lat = (other.latitude - self.latitude).to_radians();
-        let delta_lon = (other.longitude - self.longitude).to_radians();
+        haversine_distance(
+            (self.latitude, self.longitude),
+            (other.latitude, other.longitude),
+        )
+    }
 
-        let a = (delta_lat / 2.0).sin().powi(2)
-            + lat1.cos() * lat2.cos() * (delta_lon / 2.0).sin().powi(2);
-        let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+    pub fn is_within_radius(&self, other: &GeoLocation, radius_km: f64) -> bool {
+        self.distance_to(other) <= radius_km
+    }
 
-        r * c
+    pub fn validate(&self) -> Result<(), crate::EgoError> {
+        if self.latitude < -90.0 || self.latitude > 90.0 {
+            return Err(crate::EgoError::InvalidTransaction(
+                "Invalid latitude".to_string(),
+            ));
+        }
+        if self.longitude < -180.0 || self.longitude > 180.0 {
+            return Err(crate::EgoError::InvalidTransaction(
+                "Invalid longitude".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn haversine_distance(coord1: (f64, f64), coord2: (f64, f64)) -> f64 {
+    let (lat1, lon1) = coord1;
+    let (lat2, lon2) = coord2;
+
+    let r = 6371.0;
+    let lat1_rad = lat1.to_radians();
+    let lat2_rad = lat2.to_radians();
+    let delta_lat = (lat2 - lat1).to_radians();
+    let delta_lon = (lon2 - lon1).to_radians();
+
+    let a = (delta_lat / 2.0).sin().powi(2)
+        + lat1_rad.cos() * lat2_rad.cos() * (delta_lon / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+
+    r * c
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ResourceUnits(pub u64);
+
+impl ResourceUnits {
+    pub const ZERO: Self = ResourceUnits(0);
+
+    pub fn new(units: u64) -> Self {
+        Self(units)
+    }
+
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+
+    pub fn checked_add(&self, other: ResourceUnits) -> Option<ResourceUnits> {
+        self.0.checked_add(other.0).map(ResourceUnits)
+    }
+
+    pub fn saturating_add(&self, other: ResourceUnits) -> ResourceUnits {
+        ResourceUnits(self.0.saturating_add(other.0))
+    }
+
+    pub fn saturating_sub(&self, other: ResourceUnits) -> ResourceUnits {
+        ResourceUnits(self.0.saturating_sub(other.0))
+    }
+}
+
+impl fmt::Display for ResourceUnits {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} RU", self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StorageCredits(pub u64);
+
+impl StorageCredits {
+    pub const ZERO: Self = StorageCredits(0);
+
+    pub fn new(credits: u64) -> Self {
+        Self(credits)
+    }
+
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+
+    pub fn for_size_duration(size_bytes: u64, duration_epochs: u64) -> Self {
+        let byte_months = (size_bytes * duration_epochs) / (30 * 24 * 60 * 3);
+        Self(byte_months)
+    }
+
+    pub fn checked_add(&self, other: StorageCredits) -> Option<StorageCredits> {
+        self.0.checked_add(other.0).map(StorageCredits)
+    }
+
+    pub fn saturating_sub(&self, other: StorageCredits) -> StorageCredits {
+        StorageCredits(self.0.saturating_sub(other.0))
+    }
+}
+
+impl fmt::Display for StorageCredits {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} credits", self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DeployCredits(pub u64);
+
+impl DeployCredits {
+    pub const ZERO: Self = DeployCredits(0);
+
+    pub fn new(credits: u64) -> Self {
+        Self(credits)
+    }
+
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+
+    pub fn for_code_size(size_kb: u32, ru_estimate: u64) -> Self {
+        let size_credits = size_kb as u64 * 100;
+        let ru_credits = ru_estimate / 100;
+        Self(size_credits + ru_credits)
+    }
+
+    pub fn saturating_sub(&self, other: DeployCredits) -> DeployCredits {
+        DeployCredits(self.0.saturating_sub(other.0))
+    }
+}
+
+impl fmt::Display for DeployCredits {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} deploy credits", self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolVersion {
+    pub major: u16,
+    pub minor: u16,
+    pub patch: u16,
+}
+
+impl ProtocolVersion {
+    pub fn new(major: u16, minor: u16, patch: u16) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+
+    pub fn current() -> Self {
+        Self::from_u32(PROTOCOL_VERSION)
+    }
+
+    pub fn from_u32(version: u32) -> Self {
+        let major = ((version >> 16) & 0xFFFF) as u16;
+        let minor = ((version >> 8) & 0xFF) as u16;
+        let patch = (version & 0xFF) as u16;
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+
+    pub fn as_u32(&self) -> u32 {
+        ((self.major as u32) << 16) | ((self.minor as u32) << 8) | (self.patch as u32)
+    }
+
+    pub fn is_compatible_with(&self, other: &ProtocolVersion) -> bool {
+        self.major == other.major && self.minor >= other.minor
+    }
+}
+
+impl fmt::Display for ProtocolVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "v{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ChainId(pub u32);
+
+impl ChainId {
+    pub const MAINNET: Self = ChainId(1);
+    pub const TESTNET: Self = ChainId(2);
+    pub const DEVNET: Self = ChainId(3);
+
+    pub fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    pub fn as_u32(&self) -> u32 {
+        self.0
+    }
+
+    pub fn is_mainnet(&self) -> bool {
+        self.0 == Self::MAINNET.0
+    }
+
+    pub fn is_testnet(&self) -> bool {
+        self.0 == Self::TESTNET.0
+    }
+
+    pub fn network_name(&self) -> &'static str {
+        match self.0 {
+            1 => "mainnet",
+            2 => "testnet",
+            3 => "devnet",
+            _ => "custom",
+        }
+    }
+}
+
+impl fmt::Display for ChainId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "chain-{} ({})", self.0, self.network_name())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NetworkId(pub u32);
+
+impl NetworkId {
+    pub const MAINNET: Self = NetworkId(1);
+    pub const TESTNET: Self = NetworkId(2);
+    pub const DEVNET: Self = NetworkId(3);
+
+    pub fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    pub fn as_u32(&self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for NetworkId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "network-{}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_algorithm_id_conversion() {
+        assert_eq!(AlgorithmId::from_u16(0xED01), Some(AlgorithmId::Ed25519));
+        assert_eq!(AlgorithmId::from_u16(0x0202), Some(AlgorithmId::MlDsa2));
+        assert_eq!(AlgorithmId::from_u16(0x9999), None);
+
+        assert_eq!(AlgorithmId::Ed25519.as_u16(), 0xED01);
+        assert_eq!(AlgorithmId::MlDsa2.as_u16(), 0x0202);
+    }
+
+    #[test]
+    fn test_hash_operations() {
+        let hash1 = Hash::new([1u8; 32]);
+        let hash2 = Hash::new([2u8; 32]);
+
+        assert_eq!(hash1, hash1);
+        assert_ne!(hash1, hash2);
+        assert_eq!(hash1.as_bytes(), &[1u8; 32]);
+
+        let hex = hash1.to_hex();
+        assert_eq!(hex.len(), 64);
+        assert_eq!(Hash::from_hex(&hex).unwrap(), hash1);
+    }
+
+    #[test]
+    fn test_balance_operations() {
+        let balance1 = Balance::from_egoc(10);
+        let balance2 = Balance::from_egoc(5);
+
+        assert_eq!(balance1.to_egoc(), 10.0);
+        assert_eq!(balance1.checked_add(balance2), Some(Balance::from_egoc(15)));
+        assert_eq!(balance1.checked_sub(balance2), Some(Balance::from_egoc(5)));
+        assert!(balance2.checked_sub(balance1).is_none());
+
+        let multiplied = balance1.apply_multiplier(1.3);
+        assert!(multiplied > balance1);
+    }
+
+    #[test]
+    fn test_timestamp() {
+        let ts1 = Timestamp::now();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let ts2 = Timestamp::now();
+
+        assert!(ts2 > ts1);
+        assert!(ts1.elapsed_millis() >= 10);
+
+        let future = ts1.add_secs(3600);
+        assert_eq!(future.as_secs(), ts1.as_secs() + 3600);
+    }
+
+    #[test]
+    fn test_shard_id() {
+        let shard = ShardId::new(0).unwrap();
+        assert_eq!(shard.as_u32(), 0);
+        assert!(shard.is_valid());
+
+        assert!(ShardId::new(MAX_SHARD_COUNT).is_err());
+
+        let next = shard.next().unwrap();
+        assert_eq!(next.as_u32(), 1);
+    }
+
+    #[test]
+    fn test_block_height() {
+        let genesis = BlockHeight::GENESIS;
+        assert!(genesis.is_genesis());
+        assert_eq!(genesis.as_u64(), 0);
+
+        let next = genesis.next();
+        assert_eq!(next.as_u64(), 1);
+        assert!(!next.is_genesis());
+
+        assert_eq!(next.prev(), genesis);
+    }
+
+    #[test]
+    fn test_address_from_public_key() {
+        let pubkey = PublicKey::new(AlgorithmId::Ed25519, vec![1u8; 32]);
+        let addr1 = Address::from_public_key(&pubkey);
+        let addr2 = Address::from_public_key(&pubkey);
+
+        assert_eq!(addr1, addr2);
+        assert_eq!(addr1.as_bytes().len(), 20);
+    }
+
+    #[test]
+    fn test_geo_location_distance() {
+        let london = GeoLocation::new(51.5074, -0.1278);
+        let paris = GeoLocation::new(48.8566, 2.3522);
+
+        let distance = london.distance_to(&paris);
+        assert!(distance > 300.0 && distance < 400.0);
+
+        assert!(!london.is_within_radius(&paris, 100.0));
+        assert!(london.is_within_radius(&paris, 500.0));
+    }
+
+    #[test]
+    fn test_slice_id_validation() {
+        let valid = SliceId::new("my-slice_123".to_string());
+        assert!(valid.is_valid());
+
+        let invalid1 = SliceId::new("my slice".to_string());
+        assert!(!invalid1.is_valid());
+
+        let invalid2 = SliceId::new("a".repeat(65));
+        assert!(!invalid2.is_valid());
+    }
+
+    #[test]
+    fn test_protocol_version() {
+        let v1 = ProtocolVersion::new(1, 0, 0);
+        let v1_1 = ProtocolVersion::new(1, 1, 0);
+        let v2 = ProtocolVersion::new(2, 0, 0);
+
+        assert!(v1.is_compatible_with(&v1));
+        assert!(v1_1.is_compatible_with(&v1));
+        assert!(!v1.is_compatible_with(&v2));
+
+        let as_u32 = v1.as_u32();
+        let from_u32 = ProtocolVersion::from_u32(as_u32);
+        assert_eq!(v1, from_u32);
+    }
+
+    #[test]
+    fn test_storage_credits_calculation() {
+        let credits = StorageCredits::for_size_duration(1_000_000_000, 100);
+        assert!(credits.as_u64() > 0);
+
+        let remaining = credits.saturating_sub(StorageCredits::new(100));
+        assert_eq!(remaining.as_u64(), credits.as_u64() - 100);
+    }
+
+    #[test]
+    fn test_deploy_credits_calculation() {
+        let credits = DeployCredits::for_code_size(100, 10000);
+        assert!(credits.as_u64() > 0);
+        assert_eq!(credits.as_u64(), 100 * 100 + 10000 / 100);
     }
 }
