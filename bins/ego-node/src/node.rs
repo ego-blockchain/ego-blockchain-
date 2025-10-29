@@ -198,7 +198,7 @@ impl Node {
         let network_manager = NetworkManager::new();
         let bandwidth_sharing = BandwidthSharingManager::new(Default::default());
         let data_optimizer = DataOptimizer::new();
-        let mut state_manager = StateManager::new(1, 1); // chain_id=1, network_id=1
+        let state_manager = StateManager::new(1, 1); // chain_id=1, network_id=1
 
         let (optimization_events, optimization_receiver) = mpsc::unbounded_channel();
 

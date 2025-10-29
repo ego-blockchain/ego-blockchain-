@@ -2,7 +2,6 @@ use ego_core::{
     Address, AlgorithmId, DualSignature, EgoError, KeyPair, PublicKey, Signature,
     verify_dual_signature, verify_signature,
 };
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
