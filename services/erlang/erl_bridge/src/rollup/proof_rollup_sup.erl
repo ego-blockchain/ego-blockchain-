@@ -1,8 +1,7 @@
 %%%-------------------------------------------------------------------
 %%% @doc ProofRollup Supervisor
-%%% Manages ProofRollup servers for L1 shard integration
-%%% Handles PoC/PoSt/PoRep evidence aggregation and commitment acceptance
-%%% @end
+%%% Manages ProofRollup servers for L1 shard integration.
+%%% Handles PoC/PoSt/PoRep evidence aggregation and commitment acceptance.
 %%%-------------------------------------------------------------------
 
 -module(proof_rollup_sup).
@@ -22,20 +21,16 @@
 %%%===================================================================
 
 %%--------------------------------------------------------------------
-%% @doc
-%% Starts the supervisor
-%% @end
+%% @doc Starts the supervisor
 %%--------------------------------------------------------------------
 -spec start_link() -> {ok, Pid :: pid()} | {error, Reason :: term()}.
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
 %%--------------------------------------------------------------------
-%% @doc
-%% Start a new ProofRollup server instance
-%% @end
+%% @doc Start a new ProofRollup server instance and register it
 %%--------------------------------------------------------------------
--spec start_rollup(RollupId :: binary(), Config :: map()) -> 
+-spec start_rollup(RollupId :: binary(), Config :: map()) ->
     {ok, Pid :: pid()} | {error, Reason :: term()}.
 start_rollup(RollupId, Config) ->
     ChildSpec = #{
@@ -46,15 +41,22 @@ start_rollup(RollupId, Config) ->
         type => worker,
         modules => [proof_rollup_server]
     },
-    supervisor:start_child(?SERVER, ChildSpec).
+    case supervisor:start_child(?SERVER, ChildSpec) of
+        {ok, Pid} ->
+            proof_rollup_registry:register(RollupId, Pid),
+            io:format("[ProofRollupSup] Registered rollup ~p -> ~p~n", [RollupId, Pid]),
+            {ok, Pid};
+        {error, Reason} ->
+            io:format("[ProofRollupSup] Failed to start rollup ~p: ~p~n", [RollupId, Reason]),
+            {error, Reason}
+    end.
 
 %%--------------------------------------------------------------------
-%% @doc
-%% Stop a ProofRollup server instance
-%% @end
+%% @doc Stop and unregister a ProofRollup server instance
 %%--------------------------------------------------------------------
 -spec stop_rollup(RollupId :: binary()) -> ok | {error, not_found}.
 stop_rollup(RollupId) ->
+    proof_rollup_registry:unregister(RollupId),
     case supervisor:terminate_child(?SERVER, {proof_rollup, RollupId}) of
         ok ->
             supervisor:delete_child(?SERVER, {proof_rollup, RollupId});
@@ -68,12 +70,7 @@ stop_rollup(RollupId) ->
 
 %%--------------------------------------------------------------------
 %% @private
-%% @doc
-%% Whenever a supervisor is started using supervisor:start_link/[2,3],
-%% this function is called by the new process to find out about
-%% restart strategy, maximum restart intensity, and child
-%% specifications.
-%% @end
+%% @doc Initialize supervisor and start registry
 %%--------------------------------------------------------------------
 -spec init(Args :: term()) ->
     {ok, {SupFlags :: supervisor:sup_flags(),
@@ -84,7 +81,7 @@ init([]) ->
         intensity => 10,
         period => 60
     },
-    
+
     %% Start the ProofRollup registry
     RegistrySpec = #{
         id => proof_rollup_registry,
@@ -94,7 +91,7 @@ init([]) ->
         type => worker,
         modules => [proof_rollup_registry]
     },
-    
+
     {ok, {SupFlags, [RegistrySpec]}}.
 
 %%%===================================================================

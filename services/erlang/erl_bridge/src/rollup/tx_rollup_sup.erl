@@ -1,8 +1,7 @@
 %%%-------------------------------------------------------------------
 %%% @doc TxRollup Supervisor
-%%% Manages TxRollup servers for L1 shard integration
-%%% Handles transaction batching, commitments, and challenge resolution
-%%% @end
+%%% Manages TxRollup servers for L1 shard integration.
+%%% Handles transaction batching, commitments, and challenge resolution.
 %%%-------------------------------------------------------------------
 
 -module(tx_rollup_sup).
@@ -21,11 +20,17 @@
 %%% API functions
 %%%===================================================================
 
+%%--------------------------------------------------------------------
+%% @doc Start the supervisor
+%%--------------------------------------------------------------------
+-spec start_link() -> {ok, pid()} | {error, any()}.
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
--spec start_rollup(RollupId :: binary(), Config :: map()) -> 
-    {ok, Pid :: pid()} | {error, Reason :: term()}.
+%%--------------------------------------------------------------------
+%% @doc Start a new TxRollup server instance and register it
+%%--------------------------------------------------------------------
+-spec start_rollup(binary(), map()) -> {ok, pid()} | {error, term()}.
 start_rollup(RollupId, Config) ->
     ChildSpec = #{
         id => {tx_rollup, RollupId},
@@ -35,10 +40,21 @@ start_rollup(RollupId, Config) ->
         type => worker,
         modules => [tx_rollup_server]
     },
-    supervisor:start_child(?SERVER, ChildSpec).
+    case supervisor:start_child(?SERVER, ChildSpec) of
+        {ok, Pid} ->
+            io:format("[TxRollup] Started for ~p (pid=~p)~n", [RollupId, Pid]),
+            tx_rollup_registry:register(RollupId, Pid),
+            {ok, Pid};
+        Error ->
+            Error
+    end.
 
--spec stop_rollup(RollupId :: binary()) -> ok | {error, not_found}.
+%%--------------------------------------------------------------------
+%% @doc Stop a TxRollup server instance and unregister it
+%%--------------------------------------------------------------------
+-spec stop_rollup(binary()) -> ok | {error, term()}.
 stop_rollup(RollupId) ->
+    tx_rollup_registry:unregister(RollupId),
     case supervisor:terminate_child(?SERVER, {tx_rollup, RollupId}) of
         ok ->
             supervisor:delete_child(?SERVER, {tx_rollup, RollupId});
@@ -50,16 +66,19 @@ stop_rollup(RollupId) ->
 %%% Supervisor callbacks
 %%%===================================================================
 
--spec init(Args :: term()) ->
-    {ok, {SupFlags :: supervisor:sup_flags(),
-          [ChildSpec :: supervisor:child_spec()]}} | ignore.
+%%--------------------------------------------------------------------
+%% @private
+%% Initialize supervisor strategy and start the registry
+%%--------------------------------------------------------------------
+-spec init(term()) ->
+    {ok, {supervisor:sup_flags(), [supervisor:child_spec()]}} | ignore.
 init([]) ->
     SupFlags = #{
         strategy => one_for_one,
         intensity => 10,
         period => 60
     },
-    
+
     RegistrySpec = #{
         id => tx_rollup_registry,
         start => {tx_rollup_registry, start_link, []},
@@ -68,5 +87,5 @@ init([]) ->
         type => worker,
         modules => [tx_rollup_registry]
     },
-    
+
     {ok, {SupFlags, [RegistrySpec]}}.
