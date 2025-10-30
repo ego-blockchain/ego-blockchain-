@@ -513,9 +513,11 @@ mod tests {
                 to: Address::new([2u8; 20]),
                 amount: Balance::from_egoc(100),
                 memo: None,
+                stealth_mode: false,
             },
             ShardId::new(0).unwrap(),
             None,
+            1,
         );
 
         crate::types::RollupTransaction::new(inner, 1, 1000)

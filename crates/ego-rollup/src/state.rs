@@ -61,7 +61,7 @@ impl RollupState {
         let mut state = Self::new();
 
         for (address, balance) in genesis_accounts {
-            let mut account = Account::new_user(address);
+            let mut account = Account::new_eoa(address, vec![0u8; 32], vec![0u8; 32]);
             account.credit(balance);
             state.accounts.insert(address, account);
             state.total_supply = state
@@ -83,11 +83,13 @@ impl RollupState {
                 tx_hash: tx.hash(),
                 success: false,
                 error: Some("Invalid signature".to_string()),
-                compute_used: 0,
+                ru_used: 0,
                 storage_used: 0,
                 state_changes: vec![],
                 events: vec![],
                 cross_shard_receipts: vec![],
+                pq_verification_result: None,
+                proof_verifications: vec![],
             });
         }
 
@@ -101,11 +103,13 @@ impl RollupState {
                     current_nonce + 1,
                     tx.rollup_nonce
                 )),
-                compute_used: 0,
+                ru_used: 0,
                 storage_used: 0,
                 state_changes: vec![],
                 events: vec![],
                 cross_shard_receipts: vec![],
+                pq_verification_result: None,
+                proof_verifications: vec![],
             });
         }
 
@@ -132,21 +136,25 @@ impl RollupState {
                 tx_hash: tx.hash,
                 success: true,
                 error: None,
-                compute_used: 100000,
+                ru_used: 100000,
                 storage_used: 0,
                 state_changes: vec![],
                 events: vec![],
                 cross_shard_receipts: vec![],
+                pq_verification_result: None,
+                proof_verifications: vec![],
             }),
             _ => Ok(TransactionResult {
                 tx_hash: tx.hash,
                 success: false,
                 error: Some("Unsupported transaction type".to_string()),
-                compute_used: 0,
+                ru_used: 0,
                 storage_used: 0,
                 state_changes: vec![],
                 events: vec![],
                 cross_shard_receipts: vec![],
+                pq_verification_result: None,
+                proof_verifications: vec![],
             }),
         }
     }
@@ -165,11 +173,13 @@ impl RollupState {
                 tx_hash: Hash::ZERO,
                 success: false,
                 error: Some("Insufficient balance".to_string()),
-                compute_used: 21000,
+                ru_used: 21000,
                 storage_used: 0,
                 state_changes: vec![],
                 events: vec![],
                 cross_shard_receipts: vec![],
+                pq_verification_result: None,
+                proof_verifications: vec![],
             });
         }
 
@@ -185,11 +195,13 @@ impl RollupState {
             tx_hash: Hash::ZERO,
             success: true,
             error: None,
-            compute_used: 21000,
+            ru_used: 21000,
             storage_used: 0,
             state_changes: vec![],
             events: vec![],
             cross_shard_receipts: vec![],
+            pq_verification_result: None,
+            proof_verifications: vec![],
         })
     }
 
@@ -199,7 +211,7 @@ impl RollupState {
 
     pub fn get_or_create_account(&mut self, address: Address) -> Account {
         self.accounts.get(&address).cloned().unwrap_or_else(|| {
-            let account = Account::new_user(address);
+            let account = Account::new_eoa(address, vec![0u8; 32], vec![0u8; 32]);
             self.accounts.insert(address, account.clone());
             account
         })
@@ -342,7 +354,7 @@ impl RollupState {
     pub fn apply_state_delta(&mut self, delta: &StateDelta) -> RollupResult<()> {
         for (address, account_delta) in &delta.account_changes {
             if account_delta.created {
-                let mut account = Account::new_user(*address);
+                let mut account = Account::new_eoa(*address, vec![0u8; 32], vec![0u8; 32]);
                 account.balance = account_delta.new_balance;
                 account.nonce = account_delta.new_nonce;
                 self.accounts.insert(*address, account);
@@ -455,6 +467,7 @@ mod tests {
                 to,
                 amount,
                 memo: None,
+                stealth_mode: false,
             },
             ShardId::new(0).unwrap(),
             None,
@@ -558,7 +571,7 @@ mod tests {
         let mut state = RollupState::new();
         let initial_root = state.compute_state_root();
 
-        let account = Account::new_user(Address::new([1u8; 20]));
+        let account = Account::new_eoa(Address::new([1u8; 20]), vec![0u8; 32], vec![0u8; 32]);
         state.accounts.insert(Address::new([1u8; 20]), account);
 
         let new_root = state.compute_state_root();

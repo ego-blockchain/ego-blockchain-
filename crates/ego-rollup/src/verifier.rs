@@ -453,7 +453,7 @@ mod tests {
             block_range: (1000, 1000),
             l1_block_number: 1000,
             timestamp: Timestamp::now(),
-            operator_signature: ego_core::Signature::new([1u8; 64]),
+            operator_signature: ego_core::Signature::ed25519([0u8; 64]),
             proof_data: vec![],
             da_chunks: vec![0, 1, 2, 3],
             gas_used: 21000,
@@ -469,9 +469,11 @@ mod tests {
                 to: Address::new([2u8; 20]),
                 amount: Balance::from_egoc(100),
                 memo: None,
+                stealth_mode: false,
             },
             ShardId::new(0).unwrap(),
             None,
+            1,
         );
 
         crate::types::RollupTransaction::new(inner, 1, 1000)

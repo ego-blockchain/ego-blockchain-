@@ -115,8 +115,8 @@ impl FraudProof {
             evidence,
             confidence,
             timestamp,
-            signature: Signature::new([0u8; 64]),
-            public_key: PublicKey::new([0u8; 32]),
+            signature: Signature::ed25519([0u8; 64]),
+            public_key: PublicKey::ed25519([0u8; 32]),
         }
     }
 
@@ -259,8 +259,8 @@ impl FraudProof {
                 poc_event_hash: self.commitment_hash,
                 bundle_hash: None,
                 evidence_data: ego_consensus::EvidenceData::InvalidSignature {
-                    claimed_signature: self.signature,
-                    public_key: self.public_key,
+                    claimed_signature: self.signature.clone(),
+                    public_key: self.public_key.clone(),
                     message: vec![],
                     verification_result: false,
                 },
@@ -296,7 +296,7 @@ impl InvalidInclusionProof {
             inclusion_proof,
             fraud_reason,
             timestamp,
-            signature: Signature::new([0u8; 64]),
+            signature: Signature::ed25519([0u8; 64]),
         }
     }
 
@@ -475,7 +475,7 @@ mod tests {
             block_range: (1000, 1000),
             l1_block_number: 1000,
             timestamp: Timestamp::now(),
-            operator_signature: Signature::new([0u8; 64]),
+            operator_signature: Signature::ed25519([0u8; 64]),
             proof_data: vec![],
             da_chunks: vec![],
             gas_used: 21000,
@@ -491,9 +491,11 @@ mod tests {
                 to: Address::new([2u8; 20]),
                 amount: Balance::from_egoc(100),
                 memo: None,
+                stealth_mode: false,
             },
             ShardId::new(0).unwrap(),
             None,
+            1,
         );
 
         crate::types::RollupTransaction::new(inner, 1, 1000)

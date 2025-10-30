@@ -367,8 +367,8 @@ impl FraudProof {
             challenge_reward,
             collateral_required,
             timestamp,
-            signature: Signature::new([0u8; 64]),
-            public_key: PublicKey::new([0u8; 32]),
+            signature: Signature::ed25519([0u8; 64]),
+            public_key: PublicKey::ed25519([0u8; 32]),
         }
     }
 
@@ -739,8 +739,8 @@ mod tests {
             poc_event_hash: Hash::new([1u8; 32]),
             bundle_hash: None,
             evidence_data: EvidenceData::InvalidSignature {
-                claimed_signature: Signature::new([0u8; 64]),
-                public_key: PublicKey::new([0u8; 32]),
+                claimed_signature: Signature::ed25519([0u8; 64]),
+                public_key: PublicKey::ed25519([0u8; 32]),
                 message: vec![1, 2, 3],
                 verification_result: false,
             },

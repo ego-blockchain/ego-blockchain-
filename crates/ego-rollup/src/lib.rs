@@ -6,7 +6,9 @@ pub mod error;
 pub mod fraud;
 pub mod metrics;
 pub mod operator;
+pub mod proof_rollup;
 pub mod state;
+pub mod tx_rollup;
 pub mod types;
 pub mod verifier;
 
@@ -18,7 +20,19 @@ pub use error::{RollupError, RollupResult};
 pub use fraud::{FraudProof, FraudProofVerifier, InvalidInclusionProof};
 pub use metrics::RollupMetrics;
 pub use operator::{OperatorNode, RollupOperator};
+pub use proof_rollup::{
+    BeaconAnnouncement, CoherenceStats, EvidenceBundle, EvidenceBundleType,
+    MinValidityProof as ProofMinValidityProof, PartitionInfo, PoCEvidence,
+    PoRepProof, PoStEvidence, ProofRollupCommit, ProofRollupMetrics,
+    ProofRollupOperator, ProverStats, ThresholdParams, WitnessReport,
+    WindowPoStProof,
+};
 pub use state::{RollupState, StateDelta, StateTransition};
+pub use tx_rollup::{
+    ChallengeStatus as TxChallengeStatus, ChallengeType, TxRollupBatch,
+    TxRollupChallenge, TxRollupCommit, TxRollupMetrics, TxRollupOperator,
+    MinValidityProof as TxMinValidityProof,
+};
 pub use types::*;
 pub use verifier::{RollupVerifier, VerificationResult};
 
