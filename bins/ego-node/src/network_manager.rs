@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 pub enum NetworkType {

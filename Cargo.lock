@@ -1183,6 +1183,7 @@ dependencies = [
  "ego-consensus",
  "ego-core",
  "futures",
+ "hex",
  "libp2p 0.53.2",
  "lru 0.12.5",
  "num_cpus",

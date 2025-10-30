@@ -112,7 +112,7 @@ impl PoRepEvent {
             proof_hash,
             cid_hint: None,
             alg_sig_id: 1,
-            node_sig: Signature::new([0u8; 64]),
+            node_sig: Signature::ed25519([0u8; 64]),
             ts_ms: Timestamp::now().as_millis(),
         }
     }
