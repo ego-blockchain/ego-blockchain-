@@ -471,6 +471,7 @@ mod tests {
             },
             ShardId::new(0).unwrap(),
             None,
+            1, 
         );
 
         crate::types::RollupTransaction::new(inner, nonce, 1000)

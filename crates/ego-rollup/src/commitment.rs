@@ -537,6 +537,7 @@ mod tests {
             },
             ShardId::new(0).unwrap(),
             None,
+            1, 
         );
         let rollup_tx = crate::types::RollupTransaction::new(inner_tx, 1, 1000);
 
