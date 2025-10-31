@@ -22,16 +22,14 @@ pub use metrics::RollupMetrics;
 pub use operator::{OperatorNode, RollupOperator};
 pub use proof_rollup::{
     BeaconAnnouncement, CoherenceStats, EvidenceBundle, EvidenceBundleType,
-    MinValidityProof as ProofMinValidityProof, PartitionInfo, PoCEvidence,
-    PoRepProof, PoStEvidence, ProofRollupCommit, ProofRollupMetrics,
-    ProofRollupOperator, ProverStats, ThresholdParams, WitnessReport,
-    WindowPoStProof,
+    MinValidityProof as ProofMinValidityProof, PartitionInfo, PoCEvidence, PoRepProof,
+    PoStEvidence, ProofRollupCommit, ProofRollupMetrics, ProofRollupOperator, ProverStats,
+    ThresholdParams, WindowPoStProof, WitnessReport,
 };
 pub use state::{RollupState, StateDelta, StateTransition};
 pub use tx_rollup::{
-    ChallengeStatus as TxChallengeStatus, ChallengeType, TxRollupBatch,
-    TxRollupChallenge, TxRollupCommit, TxRollupMetrics, TxRollupOperator,
-    MinValidityProof as TxMinValidityProof,
+    ChallengeStatus as TxChallengeStatus, ChallengeType, MinValidityProof as TxMinValidityProof,
+    TxRollupBatch, TxRollupChallenge, TxRollupCommit, TxRollupMetrics, TxRollupOperator,
 };
 pub use types::*;
 pub use verifier::{RollupVerifier, VerificationResult};
@@ -40,44 +38,30 @@ use ego_core::{Address, Hash, Timestamp};
 use serde::{Deserialize, Serialize};
 
 pub const ROLLUP_VERSION: u32 = 1;
-
 pub const DEFAULT_CHALLENGE_PERIOD: u64 = 1000;
-
 pub const DEFAULT_DA_K: usize = 128;
 pub const DEFAULT_DA_M: usize = 64;
 pub const DEFAULT_DA_N: usize = 192;
-
 pub const DEFAULT_CHUNK_SIZE: usize = 65536;
-
 pub const DEFAULT_SAMPLE_SIZE: usize = 16;
-
 pub const DEFAULT_RESPONSE_WINDOW: u64 = 100;
-
 pub const DEFAULT_MIN_BOND: u64 = 1000000;
-
 pub const DEFAULT_DA_SLASH: u64 = 100000;
 pub const DEFAULT_INVALID_SLASH: u64 = 500000;
-
 pub const DEFAULT_MAX_COMMIT_FREQUENCY: u32 = 60;
-
 pub const DEFAULT_MAX_COMMIT_SIZE: u32 = 10000;
 
 #[async_trait::async_trait]
 pub trait RollupSystem: Send + Sync {
     async fn submit_batch(&mut self, batch: RollupBatch) -> RollupResult<Hash>;
-
     async fn post_commitment(&mut self, commitment: RollupCommitment) -> RollupResult<Hash>;
-
     async fn challenge_commitment(&mut self, proof: FraudProof) -> RollupResult<Hash>;
-
     async fn sample_da(
         &self,
         commitment_hash: Hash,
         sample_indices: Vec<usize>,
     ) -> RollupResult<Vec<DAChunk>>;
-
     async fn get_state(&self, commitment_hash: Hash) -> RollupResult<RollupState>;
-
     fn get_metrics(&self) -> RollupMetrics;
 }
 
@@ -205,11 +189,8 @@ impl Default for RollupParams {
 
 pub trait RollupGovernance {
     fn update_params(&mut self, params: RollupParams) -> RollupResult<()>;
-
     fn get_params(&self) -> RollupParams;
-
     fn propose_change(&mut self, proposal: ParamProposal) -> RollupResult<Hash>;
-
     fn vote(&mut self, proposal_hash: Hash, vote: bool) -> RollupResult<()>;
 }
 
