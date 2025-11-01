@@ -140,7 +140,7 @@ impl RollupOperator {
             self.shard_id.as_u32()
         );
 
-        self.config.validate()?;
+        self.config.validate();
 
         if (self.bond_amount as u128) < self.config.operator.bond_amount.as_u128() {
             return Err(RollupError::InsufficientBond {
