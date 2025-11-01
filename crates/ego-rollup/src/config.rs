@@ -1,4 +1,3 @@
-use crate::error::{RollupError, RollupResult};
 use ego_core::{Address, AlgorithmId, Balance, Hash, ShardId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -25,6 +24,9 @@ pub struct RollupConfig {
     pub drs: DRSConfig,
     pub economics: EconomicsConfig,
     pub cellular: CellularConfig,
+    pub deploy_policy: DeployPolicyConfig,
+    pub ai_content_filter: AIContentFilterConfig,
+    pub device: DeviceConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +52,10 @@ pub struct OperatorConfig {
     pub attestation_required: bool,
     pub device_cert_path: Option<PathBuf>,
     pub tpm_enabled: bool,
+    pub se_enabled: bool,
+    pub threshold_signature_members: u32,
+    pub ota_update_enabled: bool,
+    pub firmware_allowlist_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +67,7 @@ pub struct DAConfig {
     pub sample_size: usize,
     pub enable_compression: bool,
     pub compression_level: i32,
+    pub compression_algorithm: CompressionAlgorithm,
     pub storage_duration_epochs: u64,
     pub replication_factor: u8,
     pub enable_erasure_coding: bool,
@@ -74,6 +81,9 @@ pub struct DAConfig {
     pub enable_ipns: bool,
     pub max_evidence_bundle_size: usize,
     pub daily_anchor_enabled: bool,
+    pub sampling_failure_threshold: f64,
+    pub chunk_availability_timeout_blocks: u64,
+    pub da_sampling_client_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +102,9 @@ pub struct FraudProofConfig {
     pub enable_optimistic_verification: bool,
     pub dispute_resolution_timeout_blocks: u64,
     pub min_stake_to_challenge: Balance,
+    pub da_unavailability_proof_enabled: bool,
+    pub invalid_inclusion_proof_enabled: bool,
+    pub invalid_state_transition_proof_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,12 +117,16 @@ pub struct NetworkConfig {
     pub enable_mdns: bool,
     pub gossip: GossipConfig,
     pub enable_nat_traversal: bool,
+    pub enable_dcutr: bool,
     pub max_bandwidth_mbps: u32,
     pub enable_quic: bool,
     pub enable_tcp: bool,
     pub enable_upnp: bool,
     pub relay_enabled: bool,
     pub relay_max_circuits: u32,
+    pub peer_scoring_enabled: bool,
+    pub peer_ban_threshold: i32,
+    pub peer_ban_duration_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +143,8 @@ pub struct GossipConfig {
     pub opportunistic_graft_ticks: u64,
     pub prune_backoff: Duration,
     pub topics: Vec<String>,
+    pub per_topic_backpressure_enabled: bool,
+    pub per_topic_rate_limit: HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +169,8 @@ pub struct PerformanceConfig {
     pub signature_verification_batch_size: usize,
     pub cpu_budget_per_batch: u64,
     pub enable_backpressure: bool,
+    pub backpressure_threshold: f64,
+    pub max_memory_usage_mb: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +189,11 @@ pub struct FiveGConfig {
     pub embb_enabled: bool,
     pub mmtc_enabled: bool,
     pub network_slice_params: NetworkSliceParams,
+    pub integrated_gnb_enabled: bool,
+    pub five_g_core_components: FiveGCoreComponents,
+    pub spectrum_config: SpectrumConfig,
+    pub micro_slots_enabled: bool,
+    pub micro_slot_duration_ms: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +211,26 @@ pub enum ResourceType {
     GBR,
     NonGBR,
     DelayGBR,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FiveGCoreComponents {
+    pub amf_enabled: bool,
+    pub smf_enabled: bool,
+    pub upf_enabled: bool,
+    pub ausf_enabled: bool,
+    pub udm_enabled: bool,
+    pub pcf_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpectrumConfig {
+    pub band: String,
+    pub frequency_mhz: u32,
+    pub bandwidth_mhz: u32,
+    pub cbrs_enabled: bool,
+    pub sas_enabled: bool,
+    pub compliance_checks_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +255,18 @@ pub struct SecurityConfig {
     pub enable_slh_dsa_anchors: bool,
     pub kyber_kem_enabled: bool,
     pub x25519_fallback_enabled: bool,
+    pub hw_root_of_trust_enabled: bool,
+    pub key_rotation_enabled: bool,
+    pub key_rotation_interval_epochs: u64,
+    pub session_key_derivation: SessionKeyDerivation,
+    pub identity_binding_required: bool,
+    pub downgrade_attack_protection: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionKeyDerivation {
+    HybridXChaCha20Poly1305,
+    KyberOnlyXChaCha20Poly1305,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,6 +274,7 @@ pub struct StorageConfig {
     pub data_dir: PathBuf,
     pub enable_pruning: bool,
     pub keep_epochs: u64,
+    pub prune_interval_epochs: u64,
     pub snapshot_interval_epochs: u64,
     pub max_storage_gb: u64,
     pub enable_compression: bool,
@@ -225,6 +284,9 @@ pub struct StorageConfig {
     pub enable_state_snapshots: bool,
     pub enable_archival_mode: bool,
     pub archival_replication_factor: u8,
+    pub keep_headers_forever: bool,
+    pub keep_qcs_forever: bool,
+    pub ipfs_overlay_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +312,7 @@ pub struct RocksDBConfig {
     pub target_file_size_base: u64,
     pub level_zero_file_num_compaction_trigger: i32,
     pub enable_statistics: bool,
+    pub block_cache_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +327,14 @@ pub struct ShardingConfig {
     pub shard_prefix_bits: u8,
     pub enable_global_finality: bool,
     pub finality_committee_size: u32,
+    pub shard_mapping_strategy: ShardMappingStrategy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShardMappingStrategy {
+    PrefixBased,
+    HashBased,
+    RangeBased,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -280,14 +351,22 @@ pub struct ProofsConfig {
     pub porep_params_version: u32,
     pub porep_stacked_drg_layers: u8,
     pub porep_base_degree: u8,
+    pub porep_merkle_tree_arity: u8,
     pub poc_beacon_frequency_hz: f64,
     pub poc_witness_min_count: u32,
     pub poc_h3_resolution: u8,
     pub poc_quality_min: f64,
+    pub poc_distance_max_km: f64,
+    pub poc_path_loss_exponent_range: (f64, f64),
+    pub poc_rsrp_rmse_threshold_db: f64,
+    pub poc_density_cap_per_cell: u32,
     pub enable_gpu_proving: bool,
     pub gpu_device_id: Option<u32>,
     pub enable_batch_verification: bool,
     pub proof_aggregation_enabled: bool,
+    pub proof_compression_enabled: bool,
+    pub enable_co_beacon: bool,
+    pub fake_poc_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,6 +384,20 @@ pub struct DRSConfig {
     pub weights_version: u32,
     pub enable_puc: bool,
     pub puc_coefficient_range: (f64, f64),
+    pub puc_metrics: PUCMetrics,
+    pub density_penalty_per_device: f64,
+    pub density_penalty_min_multiplier: f64,
+    pub density_penalty_h3_resolution: u8,
+    pub density_dwell_threshold_percentage: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PUCMetrics {
+    pub uptime_percent_weight: f64,
+    pub peer_degree_weight: f64,
+    pub relay_bytes_weight: f64,
+    pub iot_sessions_weight: f64,
+    pub shard_demand_score_weight: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,6 +421,9 @@ pub struct EconomicsConfig {
     pub enable_staking: bool,
     pub min_stake_amount: Balance,
     pub validator_commission_max: u16,
+    pub ru_metering_enabled: bool,
+    pub pob_floor_min: u64,
+    pub storage_credit_to_byte_months: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +442,104 @@ pub struct CellularConfig {
     pub compression_mandatory: bool,
     pub enable_usage_alerts: bool,
     pub alert_threshold_percentage: u8,
+    pub baseline_usage_gb_per_month: u64,
+    pub enable_internet_sharing: bool,
+    pub sharing_rate_limit_mbps: u32,
+    pub sharing_pricing_per_gb: Balance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployPolicyConfig {
+    pub enabled: bool,
+    pub free_staker_quota_per_epoch: u32,
+    pub pob_deploy_credits_per_kb: u64,
+    pub pob_deploy_credits_per_ru: u64,
+    pub deploy_bond_required: bool,
+    pub deploy_bond_amount: Balance,
+    pub deploy_bond_anti_spam: bool,
+    pub hard_cap_deploys_per_epoch: u32,
+    pub enable_deduplication: bool,
+    pub code_hash_cache_size: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AIContentFilterConfig {
+    pub enabled: bool,
+    pub filter_patterns: Vec<String>,
+    pub require_human_verification: bool,
+    pub dilithium_signature_required: bool,
+    pub human_verified_tag_required: bool,
+    pub rejection_on_detection: bool,
+    pub zk_verification_enabled: bool,
+    pub zk_proof_required_for_sensitive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceConfig {
+    pub ego_device_only: bool,
+    pub ue_embedded_antennas: bool,
+    pub hardware_requirements: HardwareRequirements,
+    pub os_stack: OSStackConfig,
+    pub provisioning: ProvisioningConfig,
+    pub certification: CertificationConfig,
+    pub lifecycle: LifecycleConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HardwareRequirements {
+    pub min_ram_gb: u32,
+    pub min_storage_gb: u32,
+    pub architecture: String,
+    pub modem_required: bool,
+    pub gps_required: bool,
+    pub tpm_se_required: bool,
+    pub external_antennas_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OSStackConfig {
+    pub preferred_os: String,
+    pub erlang_otp_enabled: bool,
+    pub go_libp2p_sidecar: bool,
+    pub rust_ports_enabled: bool,
+    pub rocksdb_backend: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvisioningConfig {
+    pub manufacturing_ca_required: bool,
+    pub device_cert_enrollment: bool,
+    pub attestation_nonce_verification: bool,
+    pub role_tokens_by_sku: bool,
+    pub periodic_re_attestation_enabled: bool,
+    pub re_attestation_interval_blocks: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertificationConfig {
+    pub ptcrb_required: bool,
+    pub operator_iot_required: bool,
+    pub sar_emc_compliance: bool,
+    pub fcc_certified: bool,
+    pub ce_certified: bool,
+    pub device_cert_sn_label: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LifecycleConfig {
+    pub auto_update_enabled: bool,
+    pub ota_update_policy: OTAUpdatePolicy,
+    pub firmware_signing_threshold: u32,
+    pub health_reporting_enabled: bool,
+    pub decommission_key_wipe: bool,
+    pub revocation_check_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OTAUpdatePolicy {
+    Automatic,
+    Manual,
+    Scheduled,
 }
 
 impl Default for RollupConfig {
@@ -369,6 +563,9 @@ impl Default for RollupConfig {
             drs: DRSConfig::default(),
             economics: EconomicsConfig::default(),
             cellular: CellularConfig::default(),
+            deploy_policy: DeployPolicyConfig::default(),
+            ai_content_filter: AIContentFilterConfig::default(),
+            device: DeviceConfig::default(),
         }
     }
 }
@@ -397,6 +594,10 @@ impl Default for OperatorConfig {
             attestation_required: true,
             device_cert_path: None,
             tpm_enabled: false,
+            se_enabled: false,
+            threshold_signature_members: 3,
+            ota_update_enabled: true,
+            firmware_allowlist_path: None,
         }
     }
 }
@@ -411,6 +612,7 @@ impl Default for DAConfig {
             sample_size: 16,
             enable_compression: true,
             compression_level: 6,
+            compression_algorithm: CompressionAlgorithm::Zstd,
             storage_duration_epochs: 7200,
             replication_factor: 3,
             enable_erasure_coding: true,
@@ -424,6 +626,9 @@ impl Default for DAConfig {
             enable_ipns: true,
             max_evidence_bundle_size: 50 * 1024 * 1024,
             daily_anchor_enabled: true,
+            sampling_failure_threshold: 0.6,
+            chunk_availability_timeout_blocks: 1000,
+            da_sampling_client_enabled: true,
         }
     }
 }
@@ -445,6 +650,9 @@ impl Default for FraudProofConfig {
             enable_optimistic_verification: true,
             dispute_resolution_timeout_blocks: 500,
             min_stake_to_challenge: Balance::new(50_000_000_000_000_000),
+            da_unavailability_proof_enabled: true,
+            invalid_inclusion_proof_enabled: true,
+            invalid_state_transition_proof_enabled: true,
         }
     }
 }
@@ -460,12 +668,16 @@ impl Default for NetworkConfig {
             enable_mdns: true,
             gossip: GossipConfig::default(),
             enable_nat_traversal: true,
+            enable_dcutr: true,
             max_bandwidth_mbps: 1000,
             enable_quic: true,
             enable_tcp: true,
             enable_upnp: true,
             relay_enabled: true,
             relay_max_circuits: 32,
+            peer_scoring_enabled: true,
+            peer_ban_threshold: -100,
+            peer_ban_duration_secs: 3600,
         }
     }
 }
@@ -491,6 +703,8 @@ impl Default for GossipConfig {
                 "ego/receipts".to_string(),
                 "ego/finality/commits".to_string(),
             ],
+            per_topic_backpressure_enabled: true,
+            per_topic_rate_limit: HashMap::new(),
         }
     }
 }
@@ -511,6 +725,8 @@ impl Default for PerformanceConfig {
             signature_verification_batch_size: 128,
             cpu_budget_per_batch: 1_000_000,
             enable_backpressure: true,
+            backpressure_threshold: 0.8,
+            max_memory_usage_mb: 4096,
         }
     }
 }
@@ -538,6 +754,11 @@ impl Default for FiveGConfig {
             embb_enabled: false,
             mmtc_enabled: false,
             network_slice_params: NetworkSliceParams::default(),
+            integrated_gnb_enabled: false,
+            five_g_core_components: FiveGCoreComponents::default(),
+            spectrum_config: SpectrumConfig::default(),
+            micro_slots_enabled: false,
+            micro_slot_duration_ms: 100,
         }
     }
 }
@@ -551,6 +772,32 @@ impl Default for NetworkSliceParams {
             session_ambr_dl: 100_000_000,
             priority_level: 5,
             resource_type: ResourceType::NonGBR,
+        }
+    }
+}
+
+impl Default for FiveGCoreComponents {
+    fn default() -> Self {
+        Self {
+            amf_enabled: false,
+            smf_enabled: false,
+            upf_enabled: false,
+            ausf_enabled: false,
+            udm_enabled: false,
+            pcf_enabled: false,
+        }
+    }
+}
+
+impl Default for SpectrumConfig {
+    fn default() -> Self {
+        Self {
+            band: "n48".to_string(),
+            frequency_mhz: 3550,
+            bandwidth_mhz: 20,
+            cbrs_enabled: false,
+            sas_enabled: false,
+            compliance_checks_enabled: true,
         }
     }
 }
@@ -582,6 +829,12 @@ impl Default for SecurityConfig {
             enable_slh_dsa_anchors: false,
             kyber_kem_enabled: true,
             x25519_fallback_enabled: false,
+            hw_root_of_trust_enabled: true,
+            key_rotation_enabled: true,
+            key_rotation_interval_epochs: 10000,
+            session_key_derivation: SessionKeyDerivation::HybridXChaCha20Poly1305,
+            identity_binding_required: true,
+            downgrade_attack_protection: true,
         }
     }
 }
@@ -592,6 +845,7 @@ impl Default for StorageConfig {
             data_dir: PathBuf::from("./rollup-data"),
             enable_pruning: true,
             keep_epochs: 100,
+            prune_interval_epochs: 10,
             snapshot_interval_epochs: 1000,
             max_storage_gb: 100,
             enable_compression: true,
@@ -601,6 +855,9 @@ impl Default for StorageConfig {
             enable_state_snapshots: true,
             enable_archival_mode: false,
             archival_replication_factor: 3,
+            keep_headers_forever: true,
+            keep_qcs_forever: true,
+            ipfs_overlay_enabled: true,
         }
     }
 }
@@ -614,6 +871,7 @@ impl Default for RocksDBConfig {
             target_file_size_base: 64 * 1024 * 1024,
             level_zero_file_num_compaction_trigger: 4,
             enable_statistics: true,
+            block_cache_size: 256 * 1024 * 1024,
         }
     }
 }
@@ -631,6 +889,7 @@ impl Default for ShardingConfig {
             shard_prefix_bits: 4,
             enable_global_finality: true,
             finality_committee_size: 64,
+            shard_mapping_strategy: ShardMappingStrategy::PrefixBased,
         }
     }
 }
@@ -650,14 +909,22 @@ impl Default for ProofsConfig {
             porep_params_version: 1,
             porep_stacked_drg_layers: 11,
             porep_base_degree: 6,
+            porep_merkle_tree_arity: 8,
             poc_beacon_frequency_hz: 1.0,
             poc_witness_min_count: 3,
             poc_h3_resolution: 8,
             poc_quality_min: 0.5,
+            poc_distance_max_km: 8.0,
+            poc_path_loss_exponent_range: (2.0, 3.5),
+            poc_rsrp_rmse_threshold_db: 8.0,
+            poc_density_cap_per_cell: 3,
             enable_gpu_proving: false,
             gpu_device_id: None,
             enable_batch_verification: true,
             proof_aggregation_enabled: true,
+            proof_compression_enabled: true,
+            enable_co_beacon: true,
+            fake_poc_mode: true,
         }
     }
 }
@@ -678,6 +945,23 @@ impl Default for DRSConfig {
             weights_version: 1,
             enable_puc: false,
             puc_coefficient_range: (0.8, 1.2),
+            puc_metrics: PUCMetrics::default(),
+            density_penalty_per_device: 0.1,
+            density_penalty_min_multiplier: 0.4,
+            density_penalty_h3_resolution: 12,
+            density_dwell_threshold_percentage: 10,
+        }
+    }
+}
+
+impl Default for PUCMetrics {
+    fn default() -> Self {
+        Self {
+            uptime_percent_weight: 0.2,
+            peer_degree_weight: 0.2,
+            relay_bytes_weight: 0.2,
+            iot_sessions_weight: 0.2,
+            shard_demand_score_weight: 0.2,
         }
     }
 }
@@ -704,6 +988,9 @@ impl Default for EconomicsConfig {
             enable_staking: true,
             min_stake_amount: Balance::new(1_000_000_000_000_000_000),
             validator_commission_max: 2000,
+            ru_metering_enabled: true,
+            pob_floor_min: 1000,
+            storage_credit_to_byte_months: 1000,
         }
     }
 }
@@ -725,32 +1012,147 @@ impl Default for CellularConfig {
             compression_mandatory: true,
             enable_usage_alerts: true,
             alert_threshold_percentage: 90,
+            baseline_usage_gb_per_month: 1,
+            enable_internet_sharing: false,
+            sharing_rate_limit_mbps: 50,
+            sharing_pricing_per_gb: Balance::new(500_000_000_000_000),
+        }
+    }
+}
+
+impl Default for DeployPolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            free_staker_quota_per_epoch: 5,
+            pob_deploy_credits_per_kb: 100,
+            pob_deploy_credits_per_ru: 1,
+            deploy_bond_required: true,
+            deploy_bond_amount: Balance::new(1_000_000_000_000_000),
+            deploy_bond_anti_spam: true,
+            hard_cap_deploys_per_epoch: 10000,
+            enable_deduplication: true,
+            code_hash_cache_size: 1000,
+        }
+    }
+}
+
+impl Default for AIContentFilterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            filter_patterns: vec![
+                "do you want me to".to_string(),
+                "let me know if you need".to_string(),
+                "as an ai model".to_string(),
+                "i'm an ai".to_string(),
+                "anything else".to_string(),
+            ],
+            require_human_verification: true,
+            dilithium_signature_required: true,
+            human_verified_tag_required: true,
+            rejection_on_detection: true,
+            zk_verification_enabled: false,
+            zk_proof_required_for_sensitive: false,
+        }
+    }
+}
+
+impl Default for DeviceConfig {
+    fn default() -> Self {
+        Self {
+            ego_device_only: false,
+            ue_embedded_antennas: true,
+            hardware_requirements: HardwareRequirements::default(),
+            os_stack: OSStackConfig::default(),
+            provisioning: ProvisioningConfig::default(),
+            certification: CertificationConfig::default(),
+            lifecycle: LifecycleConfig::default(),
+        }
+    }
+}
+
+impl Default for HardwareRequirements {
+    fn default() -> Self {
+        Self {
+            min_ram_gb: 4,
+            min_storage_gb: 64,
+            architecture: "aarch64".to_string(),
+            modem_required: false,
+            gps_required: false,
+            tpm_se_required: false,
+            external_antennas_count: 0,
+        }
+    }
+}
+
+impl Default for OSStackConfig {
+    fn default() -> Self {
+        Self {
+            preferred_os: "Ubuntu".to_string(),
+            erlang_otp_enabled: true,
+            go_libp2p_sidecar: true,
+            rust_ports_enabled: true,
+            rocksdb_backend: true,
+        }
+    }
+}
+
+impl Default for ProvisioningConfig {
+    fn default() -> Self {
+        Self {
+            manufacturing_ca_required: false,
+            device_cert_enrollment: false,
+            attestation_nonce_verification: true,
+            role_tokens_by_sku: false,
+            periodic_re_attestation_enabled: true,
+            re_attestation_interval_blocks: 1000,
+        }
+    }
+}
+
+impl Default for CertificationConfig {
+    fn default() -> Self {
+        Self {
+            ptcrb_required: false,
+            operator_iot_required: false,
+            sar_emc_compliance: false,
+            fcc_certified: false,
+            ce_certified: false,
+            device_cert_sn_label: false,
+        }
+    }
+}
+
+impl Default for LifecycleConfig {
+    fn default() -> Self {
+        Self {
+            auto_update_enabled: true,
+            ota_update_policy: OTAUpdatePolicy::Automatic,
+            firmware_signing_threshold: 2,
+            health_reporting_enabled: true,
+            decommission_key_wipe: true,
+            revocation_check_enabled: true,
         }
     }
 }
 
 impl RollupConfig {
-    pub fn validate(&self) -> RollupResult<()> {
+    pub fn validate(&self) -> Result<(), String> {
         if self.chain_id == 0 {
-            return Err(RollupError::ConfigError("Chain ID must be > 0".to_string()));
+            return Err("Chain ID must be > 0".to_string());
         }
 
         if self.network_id == 0 {
-            return Err(RollupError::ConfigError(
-                "Network ID must be > 0".to_string(),
-            ));
+            return Err("Network ID must be > 0".to_string());
         }
 
         if self.rollup_id.is_empty() {
-            return Err(RollupError::ConfigError(
-                "Rollup ID cannot be empty".to_string(),
-            ));
+            return Err("Rollup ID cannot be empty".to_string());
         }
 
         if self.protocol_version == 0 {
-            return Err(RollupError::ConfigError(
-                "Protocol version must be > 0".to_string(),
-            ));
+            return Err("Protocol version must be > 0".to_string());
         }
 
         self.validate_da()?;
@@ -764,363 +1166,308 @@ impl RollupConfig {
         self.validate_drs()?;
         self.validate_economics()?;
         self.validate_cellular()?;
+        self.validate_deploy_policy()?;
+        self.validate_device()?;
 
         Ok(())
     }
 
-    fn validate_da(&self) -> RollupResult<()> {
+    fn validate_da(&self) -> Result<(), String> {
         if (self.da.k + self.da.m) != self.da.n {
-            return Err(RollupError::ConfigError(
-                "DA parameters: k + m must equal n".to_string(),
-            ));
+            return Err("DA parameters: k + m must equal n".to_string());
         }
 
         if self.da.k == 0 || self.da.m == 0 {
-            return Err(RollupError::ConfigError(
-                "DA parameters: k and m must be > 0".to_string(),
-            ));
+            return Err("DA parameters: k and m must be > 0".to_string());
         }
 
         if self.da.sample_size > self.da.k as usize {
-            return Err(RollupError::ConfigError(
-                "DA sample size cannot exceed k".to_string(),
-            ));
+            return Err("DA sample size cannot exceed k".to_string());
         }
 
         if self.da.chunk_size == 0 {
-            return Err(RollupError::ConfigError(
-                "DA chunk size must be > 0".to_string(),
-            ));
+            return Err("DA chunk size must be > 0".to_string());
         }
 
         if self.da.replication_factor < 1 || self.da.replication_factor > 5 {
-            return Err(RollupError::ConfigError(
-                "DA replication factor must be between 1 and 5".to_string(),
-            ));
+            return Err("DA replication factor must be between 1 and 5".to_string());
         }
 
         if self.da.max_blob_size == 0 {
-            return Err(RollupError::ConfigError(
-                "DA max blob size must be > 0".to_string(),
-            ));
+            return Err("DA max blob size must be > 0".to_string());
         }
 
         if self.da.anchor_window_hours == 0 {
-            return Err(RollupError::ConfigError(
-                "DA anchor window must be > 0".to_string(),
-            ));
+            return Err("DA anchor window must be > 0".to_string());
+        }
+
+        if self.da.sampling_failure_threshold < 0.5 || self.da.sampling_failure_threshold > 1.0 {
+            return Err("DA sampling failure threshold must be between 0.5 and 1.0".to_string());
         }
 
         Ok(())
     }
 
-    fn validate_operator(&self) -> RollupResult<()> {
+    fn validate_operator(&self) -> Result<(), String> {
         if self.operator.bond_amount.as_u128() < 100_000_000_000_000_000 {
-            return Err(RollupError::ConfigError(
-                "Operator bond must be at least 0.1 EGOC".to_string(),
-            ));
+            return Err("Operator bond must be at least 0.1 EGOC".to_string());
         }
 
         if self.operator.max_batch_size == 0 {
-            return Err(RollupError::ConfigError(
-                "Max batch size must be > 0".to_string(),
-            ));
+            return Err("Max batch size must be > 0".to_string());
         }
 
         if self.operator.max_gas_limit == 0 {
-            return Err(RollupError::ConfigError(
-                "Max gas limit must be > 0".to_string(),
-            ));
+            return Err("Max gas limit must be > 0".to_string());
         }
 
         if self.operator.min_batch_size > self.operator.max_batch_size {
-            return Err(RollupError::ConfigError(
-                "Min batch size cannot exceed max batch size".to_string(),
-            ));
+            return Err("Min batch size cannot exceed max batch size".to_string());
         }
 
         if self.operator.batch_timeout_secs == 0 {
-            return Err(RollupError::ConfigError(
-                "Batch timeout must be > 0".to_string(),
-            ));
+            return Err("Batch timeout must be > 0".to_string());
         }
 
         if self.operator.commit_frequency_secs == 0 {
-            return Err(RollupError::ConfigError(
-                "Commit frequency must be > 0".to_string(),
-            ));
+            return Err("Commit frequency must be > 0".to_string());
         }
 
         if self.operator.dilithium_pk.is_empty() {
-            return Err(RollupError::ConfigError(
-                "Operator Dilithium public key is required".to_string(),
-            ));
+            return Err("Operator Dilithium public key is required".to_string());
         }
 
         if self.operator.mlkem_pk.is_empty() {
-            return Err(RollupError::ConfigError(
-                "Operator ML-KEM public key is required".to_string(),
-            ));
+            return Err("Operator ML-KEM public key is required".to_string());
         }
 
         if self.operator.attestation_required && self.operator.device_cert_path.is_none() {
-            return Err(RollupError::ConfigError(
-                "Device certificate path required when attestation is enabled".to_string(),
-            ));
+            return Err("Device certificate path required when attestation is enabled".to_string());
+        }
+
+        if self.operator.threshold_signature_members < 2 {
+            return Err("Threshold signature members must be >= 2".to_string());
         }
 
         Ok(())
     }
 
-    fn validate_fraud_proofs(&self) -> RollupResult<()> {
+    fn validate_fraud_proofs(&self) -> Result<(), String> {
         if self.fraud_proofs.min_confidence < 0.5 || self.fraud_proofs.min_confidence > 1.0 {
-            return Err(RollupError::ConfigError(
-                "Fraud proof confidence must be between 0.5 and 1.0".to_string(),
-            ));
+            return Err("Fraud proof confidence must be between 0.5 and 1.0".to_string());
         }
 
         if self.fraud_proofs.challenge_period_blocks < 100 {
-            return Err(RollupError::ConfigError(
-                "Challenge period must be at least 100 blocks".to_string(),
-            ));
+            return Err("Challenge period must be at least 100 blocks".to_string());
         }
 
         if self.fraud_proofs.response_window_blocks == 0 {
-            return Err(RollupError::ConfigError(
-                "Response window must be > 0".to_string(),
-            ));
+            return Err("Response window must be > 0".to_string());
         }
 
         if self.fraud_proofs.fraud_proof_window_blocks == 0 {
-            return Err(RollupError::ConfigError(
-                "Fraud proof window must be > 0".to_string(),
-            ));
+            return Err("Fraud proof window must be > 0".to_string());
         }
 
         if self.fraud_proofs.challenge_bond.as_u128() == 0 {
-            return Err(RollupError::ConfigError(
-                "Challenge bond must be > 0".to_string(),
-            ));
+            return Err("Challenge bond must be > 0".to_string());
         }
 
         if self.fraud_proofs.slashing_percentage > 10000 {
-            return Err(RollupError::ConfigError(
-                "Slashing percentage cannot exceed 100%".to_string(),
-            ));
+            return Err("Slashing percentage cannot exceed 100%".to_string());
         }
 
         if self.fraud_proofs.challenger_reward_percentage > 10000 {
-            return Err(RollupError::ConfigError(
-                "Challenger reward percentage cannot exceed 100%".to_string(),
-            ));
+            return Err("Challenger reward percentage cannot exceed 100%".to_string());
         }
 
         Ok(())
     }
 
-    fn validate_five_g(&self) -> RollupResult<()> {
+    fn validate_five_g(&self) -> Result<(), String> {
         if self.five_g.enabled {
             if self.five_g.latency_target_ms == 0 {
-                return Err(RollupError::ConfigError(
-                    "5G latency target must be > 0".to_string(),
-                ));
+                return Err("5G latency target must be > 0".to_string());
             }
 
             if self.five_g.bandwidth_mbps == 0 {
-                return Err(RollupError::ConfigError(
-                    "5G bandwidth allocation must be > 0".to_string(),
-                ));
+                return Err("5G bandwidth allocation must be > 0".to_string());
             }
 
             if self.five_g.qos_class > 9 {
-                return Err(RollupError::ConfigError(
-                    "5G QoS class must be between 0 and 9".to_string(),
-                ));
+                return Err("5G QoS class must be between 0 and 9".to_string());
             }
 
             if self.five_g.cellular_safe_mode && self.five_g.max_cellular_data_gb_per_month == 0 {
-                return Err(RollupError::ConfigError(
+                return Err(
                     "Max cellular data must be > 0 when cellular safe mode is enabled".to_string(),
-                ));
+                );
+            }
+
+            if self.five_g.micro_slots_enabled && self.five_g.micro_slot_duration_ms == 0 {
+                return Err("Micro slot duration must be > 0 when enabled".to_string());
+            }
+
+            if self.five_g.spectrum_config.bandwidth_mhz == 0 {
+                return Err("Spectrum bandwidth must be > 0".to_string());
             }
         }
 
         Ok(())
     }
 
-    fn validate_security(&self) -> RollupResult<()> {
+    fn validate_security(&self) -> Result<(), String> {
         if self.security.max_tx_size_bytes == 0 {
-            return Err(RollupError::ConfigError(
-                "Max transaction size must be > 0".to_string(),
-            ));
+            return Err("Max transaction size must be > 0".to_string());
         }
 
         if self.security.enable_rate_limiting && self.security.rate_limit_per_second == 0 {
-            return Err(RollupError::ConfigError(
-                "Rate limit must be > 0 when rate limiting is enabled".to_string(),
-            ));
+            return Err("Rate limit must be > 0 when rate limiting is enabled".to_string());
         }
 
         if self.security.pq_transition_phase > 3 {
-            return Err(RollupError::ConfigError(
-                "PQ transition phase must be between 0 and 3".to_string(),
-            ));
+            return Err("PQ transition phase must be between 0 and 3".to_string());
         }
 
         if self.security.required_algorithms.is_empty() {
-            return Err(RollupError::ConfigError(
-                "At least one required algorithm must be specified".to_string(),
-            ));
+            return Err("At least one required algorithm must be specified".to_string());
         }
 
         if self.security.pq_only_mode && !self.security.require_dilithium {
-            return Err(RollupError::ConfigError(
-                "Dilithium must be required in PQ-only mode".to_string(),
-            ));
+            return Err("Dilithium must be required in PQ-only mode".to_string());
+        }
+
+        if self.security.key_rotation_enabled && self.security.key_rotation_interval_epochs == 0 {
+            return Err("Key rotation interval must be > 0 when enabled".to_string());
         }
 
         Ok(())
     }
 
-    fn validate_storage(&self) -> RollupResult<()> {
+    fn validate_storage(&self) -> Result<(), String> {
         if self.storage.data_dir.as_os_str().is_empty() {
-            return Err(RollupError::ConfigError(
-                "Storage data directory cannot be empty".to_string(),
-            ));
+            return Err("Storage data directory cannot be empty".to_string());
         }
 
         if self.storage.enable_pruning && self.storage.keep_epochs == 0 {
-            return Err(RollupError::ConfigError(
-                "Keep epochs must be > 0 when pruning is enabled".to_string(),
-            ));
+            return Err("Keep epochs must be > 0 when pruning is enabled".to_string());
         }
 
         if self.storage.max_storage_gb == 0 {
-            return Err(RollupError::ConfigError(
-                "Max storage must be > 0".to_string(),
-            ));
+            return Err("Max storage must be > 0".to_string());
         }
 
         if self.storage.archival_replication_factor < 1
             || self.storage.archival_replication_factor > 5
         {
-            return Err(RollupError::ConfigError(
-                "Archival replication factor must be between 1 and 5".to_string(),
-            ));
+            return Err("Archival replication factor must be between 1 and 5".to_string());
+        }
+
+        if self.storage.enable_pruning && self.storage.prune_interval_epochs == 0 {
+            return Err("Prune interval must be > 0 when pruning is enabled".to_string());
         }
 
         Ok(())
     }
 
-    fn validate_sharding(&self) -> RollupResult<()> {
+    fn validate_sharding(&self) -> Result<(), String> {
         if self.sharding.enabled {
             if self.sharding.num_shards == 0 {
-                return Err(RollupError::ConfigError(
-                    "Number of shards must be > 0".to_string(),
-                ));
+                return Err("Number of shards must be > 0".to_string());
             }
 
             if self.sharding.shard_ids.len() != self.sharding.num_shards as usize {
-                return Err(RollupError::ConfigError(
-                    "Shard IDs count must match number of shards".to_string(),
-                ));
+                return Err("Shard IDs count must match number of shards".to_string());
             }
 
             if self.sharding.shard_prefix_bits > 8 {
-                return Err(RollupError::ConfigError(
-                    "Shard prefix bits cannot exceed 8".to_string(),
-                ));
+                return Err("Shard prefix bits cannot exceed 8".to_string());
             }
 
             if self.sharding.cross_shard_enabled
                 && self.sharding.cross_shard_receipt_timeout_blocks == 0
             {
-                return Err(RollupError::ConfigError(
+                return Err(
                     "Cross-shard receipt timeout must be > 0 when cross-shard is enabled"
                         .to_string(),
-                ));
+                );
             }
 
             if self.sharding.enable_global_finality && self.sharding.finality_committee_size == 0 {
-                return Err(RollupError::ConfigError(
+                return Err(
                     "Finality committee size must be > 0 when global finality is enabled"
                         .to_string(),
-                ));
+                );
             }
         }
 
         Ok(())
     }
 
-    fn validate_proofs(&self) -> RollupResult<()> {
+    fn validate_proofs(&self) -> Result<(), String> {
         if self.proofs.post_enabled {
             if self.proofs.post_frequency_epochs == 0 {
-                return Err(RollupError::ConfigError(
-                    "PoSt frequency must be > 0".to_string(),
-                ));
+                return Err("PoSt frequency must be > 0".to_string());
             }
 
             if self.proofs.post_sla_ms == 0 {
-                return Err(RollupError::ConfigError("PoSt SLA must be > 0".to_string()));
+                return Err("PoSt SLA must be > 0".to_string());
             }
 
             if self.proofs.post_challenge_count == 0 {
-                return Err(RollupError::ConfigError(
-                    "PoSt challenge count must be > 0".to_string(),
-                ));
+                return Err("PoSt challenge count must be > 0".to_string());
             }
 
             if self.proofs.post_partition_size == 0 {
-                return Err(RollupError::ConfigError(
-                    "PoSt partition size must be > 0".to_string(),
-                ));
+                return Err("PoSt partition size must be > 0".to_string());
             }
         }
 
         if self.proofs.porep_enabled {
             if self.proofs.porep_sector_size_gib == 0 {
-                return Err(RollupError::ConfigError(
-                    "PoRep sector size must be > 0".to_string(),
-                ));
+                return Err("PoRep sector size must be > 0".to_string());
             }
 
             if self.proofs.porep_stacked_drg_layers == 0 {
-                return Err(RollupError::ConfigError(
-                    "PoRep stacked DRG layers must be > 0".to_string(),
-                ));
+                return Err("PoRep stacked DRG layers must be > 0".to_string());
             }
 
             if self.proofs.porep_base_degree == 0 {
-                return Err(RollupError::ConfigError(
-                    "PoRep base degree must be > 0".to_string(),
-                ));
+                return Err("PoRep base degree must be > 0".to_string());
+            }
+
+            if self.proofs.porep_merkle_tree_arity == 0 {
+                return Err("PoRep Merkle tree arity must be > 0".to_string());
             }
         }
 
         if self.proofs.poc_enabled {
             if self.proofs.poc_beacon_frequency_hz <= 0.0 {
-                return Err(RollupError::ConfigError(
-                    "PoC beacon frequency must be > 0".to_string(),
-                ));
+                return Err("PoC beacon frequency must be > 0".to_string());
             }
 
             if self.proofs.poc_witness_min_count < 3 {
-                return Err(RollupError::ConfigError(
-                    "PoC minimum witness count must be >= 3".to_string(),
-                ));
+                return Err("PoC minimum witness count must be >= 3".to_string());
             }
 
             if self.proofs.poc_quality_min < 0.0 || self.proofs.poc_quality_min > 1.0 {
-                return Err(RollupError::ConfigError(
-                    "PoC quality minimum must be between 0.0 and 1.0".to_string(),
-                ));
+                return Err("PoC quality minimum must be between 0.0 and 1.0".to_string());
+            }
+
+            if self.proofs.poc_distance_max_km <= 0.0 {
+                return Err("PoC max distance must be > 0".to_string());
+            }
+
+            let (min_exp, max_exp) = self.proofs.poc_path_loss_exponent_range;
+            if min_exp > max_exp || min_exp < 0.0 {
+                return Err("PoC path loss exponent range is invalid".to_string());
             }
         }
 
         Ok(())
     }
 
-    fn validate_drs(&self) -> RollupResult<()> {
+    fn validate_drs(&self) -> Result<(), String> {
         if self.drs.enabled {
             let total_weight = self.drs.uptime_weight
                 + self.drs.post_latency_weight
@@ -1130,54 +1477,64 @@ impl RollupConfig {
                 + self.drs.density_penalty_weight;
 
             if (total_weight - 1.0).abs() > 0.001 {
-                return Err(RollupError::ConfigError(
-                    "DRS weights must sum to 1.0".to_string(),
-                ));
+                return Err("DRS weights must sum to 1.0".to_string());
             }
 
             if self.drs.multiplier_min > self.drs.multiplier_max {
-                return Err(RollupError::ConfigError(
-                    "DRS multiplier min cannot exceed max".to_string(),
-                ));
+                return Err("DRS multiplier min cannot exceed max".to_string());
             }
 
             if self.drs.multiplier_min <= 0.0 {
-                return Err(RollupError::ConfigError(
-                    "DRS multiplier min must be > 0".to_string(),
-                ));
+                return Err("DRS multiplier min must be > 0".to_string());
             }
 
             if self.drs.calculation_epoch_interval == 0 {
-                return Err(RollupError::ConfigError(
-                    "DRS calculation epoch interval must be > 0".to_string(),
-                ));
+                return Err("DRS calculation epoch interval must be > 0".to_string());
             }
 
             if self.drs.enable_puc {
                 let (min, max) = self.drs.puc_coefficient_range;
                 if min > max {
-                    return Err(RollupError::ConfigError(
-                        "PUC coefficient min cannot exceed max".to_string(),
-                    ));
+                    return Err("PUC coefficient min cannot exceed max".to_string());
                 }
+
+                let puc_total = self.drs.puc_metrics.uptime_percent_weight
+                    + self.drs.puc_metrics.peer_degree_weight
+                    + self.drs.puc_metrics.relay_bytes_weight
+                    + self.drs.puc_metrics.iot_sessions_weight
+                    + self.drs.puc_metrics.shard_demand_score_weight;
+
+                if (puc_total - 1.0).abs() > 0.001 {
+                    return Err("PUC metrics weights must sum to 1.0".to_string());
+                }
+            }
+
+            if self.drs.density_penalty_per_device < 0.0
+                || self.drs.density_penalty_per_device > 1.0
+            {
+                return Err("Density penalty per device must be between 0.0 and 1.0".to_string());
+            }
+
+            if self.drs.density_penalty_min_multiplier < 0.0
+                || self.drs.density_penalty_min_multiplier > 1.0
+            {
+                return Err(
+                    "Density penalty min multiplier must be between 0.0 and 1.0".to_string()
+                );
             }
         }
 
         Ok(())
     }
 
-    fn validate_economics(&self) -> RollupResult<()> {
+    fn validate_economics(&self) -> Result<(), String> {
         if self.economics.enable_emissions {
             if self.economics.initial_supply.as_u128() == 0 {
-                return Err(RollupError::ConfigError(
-                    "Initial supply must be > 0".to_string(),
-                ));
+                return Err("Initial supply must be > 0".to_string());
             }
 
             if self.economics.emission_rate_per_epoch.as_u128() == 0 {
-                return Err(RollupError::ConfigError(
-                    "Emission rate per epoch must be > 0".to_string(),
-                ));
+                return Err("Emission rate per epoch must be > 0".to_string());
             }
 
             let total_percentage = self.economics.storage_bucket_percentage
@@ -1186,101 +1543,148 @@ impl RollupConfig {
                 + self.economics.dao_bucket_percentage;
 
             if total_percentage != 10000 {
-                return Err(RollupError::ConfigError(
-                    "Bucket percentages must sum to 100%".to_string(),
-                ));
+                return Err("Bucket percentages must sum to 100%".to_string());
             }
         }
 
         if self.economics.enable_staking {
             if self.economics.min_stake_amount.as_u128() == 0 {
-                return Err(RollupError::ConfigError(
-                    "Minimum stake amount must be > 0".to_string(),
-                ));
+                return Err("Minimum stake amount must be > 0".to_string());
             }
 
             if self.economics.validator_commission_max > 10000 {
-                return Err(RollupError::ConfigError(
-                    "Validator commission max cannot exceed 100%".to_string(),
-                ));
+                return Err("Validator commission max cannot exceed 100%".to_string());
             }
         }
 
         if self.economics.pob_burn_enabled {
             if self.economics.storage_credits_rate == 0 {
-                return Err(RollupError::ConfigError(
-                    "Storage credits rate must be > 0".to_string(),
-                ));
+                return Err("Storage credits rate must be > 0".to_string());
             }
 
             if self.economics.deploy_credits_rate == 0 {
-                return Err(RollupError::ConfigError(
-                    "Deploy credits rate must be > 0".to_string(),
-                ));
+                return Err("Deploy credits rate must be > 0".to_string());
+            }
+
+            if self.economics.storage_credit_to_byte_months == 0 {
+                return Err("Storage credit to byte months rate must be > 0".to_string());
             }
         }
 
         Ok(())
     }
 
-    fn validate_cellular(&self) -> RollupResult<()> {
+    fn validate_cellular(&self) -> Result<(), String> {
         if self.cellular.enabled {
             if self.cellular.safe_mode_default {
                 if self.cellular.max_monthly_usage_gb == 0 {
-                    return Err(RollupError::ConfigError(
-                        "Max monthly usage must be > 0 in cellular safe mode".to_string(),
-                    ));
+                    return Err("Max monthly usage must be > 0 in cellular safe mode".to_string());
                 }
 
                 if self.cellular.throttle_threshold_gb > self.cellular.max_monthly_usage_gb {
-                    return Err(RollupError::ConfigError(
-                        "Throttle threshold cannot exceed max monthly usage".to_string(),
-                    ));
+                    return Err("Throttle threshold cannot exceed max monthly usage".to_string());
                 }
             }
 
             if self.cellular.enable_wifi_offload && self.cellular.offload_threshold_percentage > 100
             {
-                return Err(RollupError::ConfigError(
-                    "WiFi offload threshold cannot exceed 100%".to_string(),
-                ));
+                return Err("WiFi offload threshold cannot exceed 100%".to_string());
             }
 
             if self.cellular.enable_usage_alerts && self.cellular.alert_threshold_percentage > 100 {
-                return Err(RollupError::ConfigError(
-                    "Usage alert threshold cannot exceed 100%".to_string(),
-                ));
+                return Err("Usage alert threshold cannot exceed 100%".to_string());
             }
 
             if self.cellular.batch_operations_enabled && self.cellular.batch_window_secs == 0 {
-                return Err(RollupError::ConfigError(
-                    "Batch window must be > 0 when batch operations are enabled".to_string(),
-                ));
+                return Err(
+                    "Batch window must be > 0 when batch operations are enabled".to_string()
+                );
+            }
+
+            if self.cellular.enable_internet_sharing && self.cellular.sharing_rate_limit_mbps == 0 {
+                return Err(
+                    "Sharing rate limit must be > 0 when internet sharing is enabled".to_string(),
+                );
             }
         }
 
         Ok(())
     }
 
-    pub fn from_file(path: &str) -> RollupResult<Self> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| RollupError::ConfigError(format!("Failed to read config file: {}", e)))?;
+    fn validate_deploy_policy(&self) -> Result<(), String> {
+        if self.deploy_policy.enabled {
+            if self.deploy_policy.pob_deploy_credits_per_kb == 0 {
+                return Err("PoB deploy credits per KB must be > 0".to_string());
+            }
 
-        let config: Self = toml::from_str(&content)
-            .map_err(|e| RollupError::ConfigError(format!("Failed to parse config: {}", e)))?;
+            if self.deploy_policy.pob_deploy_credits_per_ru == 0 {
+                return Err("PoB deploy credits per RU must be > 0".to_string());
+            }
+
+            if self.deploy_policy.deploy_bond_required
+                && self.deploy_policy.deploy_bond_amount.as_u128() == 0
+            {
+                return Err("Deploy bond amount must be > 0 when required".to_string());
+            }
+
+            if self.deploy_policy.hard_cap_deploys_per_epoch == 0 {
+                return Err("Hard cap deploys per epoch must be > 0".to_string());
+            }
+
+            if self.deploy_policy.enable_deduplication
+                && self.deploy_policy.code_hash_cache_size == 0
+            {
+                return Err(
+                    "Code hash cache size must be > 0 when deduplication is enabled".to_string(),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_device(&self) -> Result<(), String> {
+        if self.device.ego_device_only {
+            if self.device.hardware_requirements.min_ram_gb == 0 {
+                return Err("Minimum RAM must be > 0".to_string());
+            }
+
+            if self.device.hardware_requirements.min_storage_gb == 0 {
+                return Err("Minimum storage must be > 0".to_string());
+            }
+
+            if self.device.provisioning.periodic_re_attestation_enabled
+                && self.device.provisioning.re_attestation_interval_blocks == 0
+            {
+                return Err("Re-attestation interval must be > 0 when enabled".to_string());
+            }
+
+            if self.device.lifecycle.firmware_signing_threshold < 1 {
+                return Err("Firmware signing threshold must be >= 1".to_string());
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn from_file(path: &str) -> Result<Self, String> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read config file: {}", e))?;
+
+        let config: Self =
+            toml::from_str(&content).map_err(|e| format!("Failed to parse config: {}", e))?;
 
         config.validate()?;
         Ok(config)
     }
 
-    pub fn to_file(&self, path: &str) -> RollupResult<()> {
+    pub fn to_file(&self, path: &str) -> Result<(), String> {
         self.validate()?;
 
         let content = toml::to_string_pretty(self)
-            .map_err(|e| RollupError::ConfigError(format!("Failed to serialize config: {}", e)))?;
+            .map_err(|e| format!("Failed to serialize config: {}", e))?;
 
-        std::fs::write(path, content)
-            .map_err(|e| RollupError::ConfigError(format!("Failed to write config file: {}", e)))?;
+        std::fs::write(path, content).map_err(|e| format!("Failed to write config file: {}", e))?;
 
         Ok(())
     }
@@ -1491,6 +1895,9 @@ impl RollupConfig {
         }
 
         if self.proofs.poc_enabled {
+            for res in 0..=self.proofs.poc_h3_resolution {
+                topics.push(format!("ego/poc/h3/{}", res));
+            }
             topics.push("ego/poc/beacons".to_string());
             topics.push("ego/poc/witnesses".to_string());
         }
@@ -1577,192 +1984,262 @@ impl RollupConfig {
             self.performance.metrics_address, self.performance.metrics_port
         )
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_default_config_validation() {
-        let config = RollupConfig::default();
-        assert!(config.validate().is_ok());
+    pub fn is_ego_device_only(&self) -> bool {
+        self.device.ego_device_only
     }
 
-    #[test]
-    fn test_da_params_validation() {
-        let mut config = RollupConfig::default();
-        config.da.k = 100;
-        config.da.m = 50;
-        config.da.n = 140;
-        assert!(config.validate().is_err());
+    pub fn requires_tpm_se(&self) -> bool {
+        self.device.ego_device_only && self.device.hardware_requirements.tpm_se_required
     }
 
-    #[test]
-    fn test_5g_optimization_detection() {
-        let mut config = RollupConfig::default();
-        assert!(!config.is_5g_optimized());
+    pub fn get_density_penalty_multiplier(&self, device_count: u32) -> f64 {
+        if device_count <= 1 {
+            return 1.0;
+        }
 
-        config.five_g.enabled = true;
-        config.five_g.slice_id = Some("slice-1".to_string());
-        assert!(config.is_5g_optimized());
+        let penalty = 1.0 - (self.drs.density_penalty_per_device * (device_count - 1) as f64);
+        penalty.max(self.drs.density_penalty_min_multiplier)
     }
 
-    #[test]
-    fn test_da_redundancy_calculation() {
-        let config = RollupConfig::default();
-        let redundancy = config.da_redundancy_factor();
-        assert_eq!(redundancy, 192.0 / 128.0);
+    pub fn calculate_deploy_credits_needed(&self, code_size_kb: u64, ru_estimate: u64) -> u64 {
+        let size_credits = code_size_kb * self.deploy_policy.pob_deploy_credits_per_kb;
+        let ru_credits = ru_estimate * self.deploy_policy.pob_deploy_credits_per_ru;
+        size_credits + ru_credits
     }
 
-    #[test]
-    fn test_target_latency() {
-        let mut config = RollupConfig::default();
-        assert_eq!(config.target_latency(), Duration::from_millis(250));
-
-        config.five_g.enabled = true;
-        config.five_g.latency_target_ms = 10;
-        assert_eq!(config.target_latency(), Duration::from_millis(10));
+    pub fn should_filter_ai_content(&self) -> bool {
+        self.ai_content_filter.enabled
     }
 
-    #[test]
-    fn test_cellular_safe_mode() {
-        let mut config = RollupConfig::default();
-        config.five_g.enabled = true;
-        config.five_g.cellular_safe_mode = true;
-        assert!(config.is_cellular_safe());
+    pub fn detect_ai_filler(&self, content: &str) -> bool {
+        if !self.ai_content_filter.enabled {
+            return false;
+        }
 
-        assert!(config.is_wifi_only_operation("large_storage"));
-        assert!(!config.is_wifi_only_operation("small_transfer"));
+        let content_lower = content.to_lowercase();
+        for pattern in &self.ai_content_filter.filter_patterns {
+            if content_lower.contains(&pattern.to_lowercase()) {
+                return true;
+            }
+        }
+        false
     }
 
-    #[test]
-    fn test_5g_optimization() {
-        let mut config = RollupConfig::default();
-        config.operator.max_batch_size = 10000;
-        config.five_g.enabled = true;
-        config.five_g.bandwidth_mbps = 200;
-
-        config.optimize_for_5g();
-
-        assert!(config.operator.max_batch_size <= 500);
-        assert!(config.operator.batch_timeout_secs <= 10);
-        assert_eq!(config.network.max_bandwidth_mbps, 200);
+    pub fn requires_human_verification(&self) -> bool {
+        self.ai_content_filter.enabled && self.ai_content_filter.require_human_verification
     }
 
-    #[test]
-    fn test_cellular_optimization() {
-        let mut config = RollupConfig::default();
-        config.cellular.safe_mode_default = true;
-
-        config.optimize_for_cellular();
-
-        assert!(config.operator.max_batch_size <= 250);
-        assert!(config.da.enable_compression);
-        assert_eq!(config.da.compression_level, 9);
+    pub fn get_session_key_derivation(&self) -> SessionKeyDerivation {
+        self.security.session_key_derivation
     }
 
-    #[test]
-    fn test_fraud_proof_config_validation() {
-        let mut config = RollupConfig::default();
-        config.fraud_proofs.challenge_period_blocks = 50;
-        assert!(config.validate().is_err());
-
-        config.fraud_proofs.challenge_period_blocks = 1000;
-        config.fraud_proofs.fraud_proof_window_blocks = 0;
-        assert!(config.validate().is_err());
+    pub fn is_identity_binding_required(&self) -> bool {
+        self.security.identity_binding_required
     }
 
-    #[test]
-    fn test_chain_id_validation() {
-        let mut config = RollupConfig::default();
-        config.chain_id = 0;
-        assert!(config.validate().is_err());
+    pub fn has_downgrade_protection(&self) -> bool {
+        self.security.downgrade_attack_protection
     }
 
-    #[test]
-    fn test_cellular_budget_check() {
-        let mut config = RollupConfig::default();
-        config.cellular.safe_mode_default = true;
-        config.cellular.max_monthly_usage_gb = 5;
-
-        assert!(config.is_within_cellular_budget(3));
-        assert!(!config.is_within_cellular_budget(6));
+    pub fn is_internet_sharing_enabled(&self) -> bool {
+        self.cellular.enable_internet_sharing
     }
 
-    #[test]
-    fn test_monthly_usage_estimate() {
-        let config = RollupConfig::default();
-        let usage = config.estimate_monthly_cellular_usage_mb();
-        assert!(usage > 0);
+    pub fn get_sharing_rate_limit_mbps(&self) -> u32 {
+        self.cellular.sharing_rate_limit_mbps
     }
 
-    #[test]
-    fn test_sharding_validation() {
-        let mut config = RollupConfig::default();
-        config.sharding.enabled = true;
-        config.sharding.num_shards = 2;
-        config.sharding.shard_ids = vec![ShardId::new(0).unwrap()];
-        assert!(config.validate().is_err());
-
-        config.sharding.shard_ids = vec![ShardId::new(0).unwrap(), ShardId::new(1).unwrap()];
-        assert!(config.validate().is_ok());
+    pub fn get_sharing_price_per_gb(&self) -> Balance {
+        self.cellular.sharing_pricing_per_gb
     }
 
-    #[test]
-    fn test_drs_weights_validation() {
-        let mut config = RollupConfig::default();
-        config.drs.enabled = true;
-        config.drs.uptime_weight = 0.5;
-        assert!(config.validate().is_err());
+    pub fn is_fake_poc_mode(&self) -> bool {
+        self.proofs.fake_poc_mode
     }
 
-    #[test]
-    fn test_economics_bucket_validation() {
-        let mut config = RollupConfig::default();
-        config.economics.storage_bucket_percentage = 5000;
-        assert!(config.validate().is_err());
+    pub fn get_poc_density_cap(&self) -> u32 {
+        self.proofs.poc_density_cap_per_cell
     }
 
-    #[test]
-    fn test_pq_mode_validation() {
-        let mut config = RollupConfig::default();
-        config.security.pq_only_mode = true;
-        config.security.require_dilithium = false;
-        assert!(config.validate().is_err());
+    pub fn get_poc_max_distance_km(&self) -> f64 {
+        self.proofs.poc_distance_max_km
     }
 
-    #[test]
-    fn test_gossip_topics_generation() {
-        let mut config = RollupConfig::default();
-        config.sharding.enabled = true;
-        config.sharding.num_shards = 2;
-        config.sharding.shard_ids = vec![ShardId::new(0), ShardId::new(1)];
-
-        let topics = config.get_gossip_topics();
-        assert!(topics.contains(&"ego/shard/0/tx".to_string()));
-        assert!(topics.contains(&"ego/shard/1/headers".to_string()));
+    pub fn enable_5g_core_components(&mut self, enable: bool) {
+        self.five_g.five_g_core_components.amf_enabled = enable;
+        self.five_g.five_g_core_components.smf_enabled = enable;
+        self.five_g.five_g_core_components.upf_enabled = enable;
+        self.five_g.five_g_core_components.ausf_enabled = enable;
+        self.five_g.five_g_core_components.udm_enabled = enable;
+        self.five_g.five_g_core_components.pcf_enabled = enable;
     }
 
-    #[test]
-    fn test_cellular_throttle() {
-        let mut config = RollupConfig::default();
-        config.cellular.safe_mode_default = true;
-        config.cellular.max_monthly_usage_gb = 5;
-        config.cellular.throttle_threshold_gb = 4;
-
-        assert!(!config.should_throttle_cellular(3));
-        assert!(config.should_throttle_cellular(4));
+    pub fn enable_ego_device_mode(&mut self) {
+        self.device.ego_device_only = true;
+        self.device.hardware_requirements.tpm_se_required = true;
+        self.device.provisioning.manufacturing_ca_required = true;
+        self.device.provisioning.device_cert_enrollment = true;
+        self.device.certification.ptcrb_required = true;
+        self.device.certification.operator_iot_required = true;
+        self.security.enable_tpm = true;
+        self.security.enable_secure_boot = true;
+        self.security.hw_root_of_trust_enabled = true;
     }
 
-    #[test]
-    fn test_usage_alert() {
-        let mut config = RollupConfig::default();
-        config.cellular.enable_usage_alerts = true;
-        config.cellular.max_monthly_usage_gb = 5;
-        config.cellular.alert_threshold_percentage = 90;
+    pub fn get_anchor_window_duration(&self) -> Duration {
+        Duration::from_secs(self.da.anchor_window_hours * 3600)
+    }
 
-        assert!(!config.should_alert_cellular_usage(4));
-        assert!(config.should_alert_cellular_usage(5));
+    pub fn get_puc_metrics(&self) -> &PUCMetrics {
+        &self.drs.puc_metrics
+    }
+
+    pub fn is_puc_enabled(&self) -> bool {
+        self.drs.enable_puc
+    }
+
+    pub fn get_ru_metering_enabled(&self) -> bool {
+        self.economics.ru_metering_enabled
+    }
+
+    pub fn get_pob_floor_min(&self) -> u64 {
+        self.economics.pob_floor_min
+    }
+
+    pub fn should_enable_co_beacon(&self) -> bool {
+        self.proofs.enable_co_beacon
+    }
+
+    pub fn get_micro_slot_duration(&self) -> Duration {
+        if self.five_g.micro_slots_enabled {
+            Duration::from_millis(self.five_g.micro_slot_duration_ms as u64)
+        } else {
+            Duration::from_millis(1000)
+        }
+    }
+
+    pub fn get_spectrum_band(&self) -> &str {
+        &self.five_g.spectrum_config.band
+    }
+
+    pub fn is_cbrs_enabled(&self) -> bool {
+        self.five_g.spectrum_config.cbrs_enabled
+    }
+
+    pub fn requires_attestation(&self) -> bool {
+        self.operator.attestation_required || self.security.enable_attestation
+    }
+
+    pub fn get_attestation_interval(&self) -> u64 {
+        self.security.attestation_interval_blocks
+    }
+
+    pub fn get_ota_update_policy(&self) -> OTAUpdatePolicy {
+        self.device.lifecycle.ota_update_policy
+    }
+
+    pub fn get_firmware_signing_threshold(&self) -> u32 {
+        self.device.lifecycle.firmware_signing_threshold
+    }
+
+    pub fn should_dedup_deploys(&self) -> bool {
+        self.deploy_policy.enabled && self.deploy_policy.enable_deduplication
+    }
+
+    pub fn get_deploy_bond(&self) -> Balance {
+        self.deploy_policy.deploy_bond_amount
+    }
+
+    pub fn get_free_deploy_quota(&self) -> u32 {
+        self.deploy_policy.free_staker_quota_per_epoch
+    }
+
+    pub fn get_storage_credit_rate(&self) -> u64 {
+        self.economics.storage_credits_rate
+    }
+
+    pub fn get_deploy_credit_rate(&self) -> u64 {
+        self.economics.deploy_credits_rate
+    }
+
+    pub fn convert_pob_to_storage_credits(&self, pob_amount: Balance) -> u64 {
+        (pob_amount.as_u128() / self.economics.storage_credits_rate as u128) as u64
+    }
+
+    pub fn convert_pob_to_deploy_credits(&self, pob_amount: Balance) -> u64 {
+        (pob_amount.as_u128() / self.economics.deploy_credits_rate as u128) as u64
+    }
+
+    pub fn get_replication_factor(&self) -> u8 {
+        self.da.replication_factor
+    }
+
+    pub fn is_da_sampling_enabled(&self) -> bool {
+        self.da.da_sampling_client_enabled
+    }
+
+    pub fn get_da_sampling_threshold(&self) -> f64 {
+        self.da.sampling_failure_threshold
+    }
+
+    pub fn is_optimistic_verification_enabled(&self) -> bool {
+        self.fraud_proofs.enable_optimistic_verification
+    }
+
+    pub fn get_slashing_percentage(&self) -> u16 {
+        self.fraud_proofs.slashing_percentage
+    }
+
+    pub fn get_challenger_reward_percentage(&self) -> u16 {
+        self.fraud_proofs.challenger_reward_percentage
+    }
+
+    pub fn is_backpressure_enabled(&self) -> bool {
+        self.performance.enable_backpressure
+    }
+
+    pub fn get_backpressure_threshold(&self) -> f64 {
+        self.performance.backpressure_threshold
+    }
+
+    pub fn get_cpu_budget_per_batch(&self) -> u64 {
+        self.performance.cpu_budget_per_batch
+    }
+
+    pub fn get_signature_batch_size(&self) -> usize {
+        self.performance.signature_verification_batch_size
+    }
+
+    pub fn is_peer_scoring_enabled(&self) -> bool {
+        self.network.peer_scoring_enabled
+    }
+
+    pub fn get_peer_ban_threshold(&self) -> i32 {
+        self.network.peer_ban_threshold
+    }
+
+    pub fn get_dcutr_enabled(&self) -> bool {
+        self.network.enable_dcutr
+    }
+
+    pub fn get_compression_algorithm(&self) -> CompressionAlgorithm {
+        self.da.compression_algorithm
+    }
+
+    pub fn is_ipfs_overlay_enabled(&self) -> bool {
+        self.storage.ipfs_overlay_enabled
+    }
+
+    pub fn should_keep_headers_forever(&self) -> bool {
+        self.storage.keep_headers_forever
+    }
+
+    pub fn should_keep_qcs_forever(&self) -> bool {
+        self.storage.keep_qcs_forever
+    }
+
+    pub fn get_shard_mapping_strategy(&self) -> ShardMappingStrategy {
+        self.sharding.shard_mapping_strategy
     }
 }
