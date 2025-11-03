@@ -1,9 +1,83 @@
-use crate::commitment::RollupCommitment;
-use crate::error::{RollupError, RollupResult};
-use crate::types::RollupTransaction;
-use ego_core::{Address, Hash, Timestamp};
+use ego_core::{
+    Address, AlgorithmId, Balance, BlockHeight, EgoError, EgoResult, EpochNumber, Hash, PublicKey,
+    ShardId, Timestamp,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RollupError {
+    FraudProof(String),
+    SerializationError(String),
+    InvalidCommitment(String),
+    ValidationError(String),
+}
+
+pub type RollupResult<T> = Result<T, RollupError>;
+
+impl From<EgoError> for RollupError {
+    fn from(err: EgoError) -> Self {
+        match err {
+            EgoError::SerializationError(s) => RollupError::SerializationError(s),
+            EgoError::InvalidBlock(s) => RollupError::ValidationError(s),
+            EgoError::InvalidTransaction(s) => RollupError::ValidationError(s),
+            _ => RollupError::ValidationError(format!("{:?}", err)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct RollupCommitment {
+    pub rollup_id: String,
+    pub state_root: Hash,
+    pub previous_state_root: Hash,
+    pub tx_root: Hash,
+    pub proofs_root: Hash,
+    pub da_root: Hash,
+    pub tx_count: u32,
+    pub block_range: (u64, u64),
+    pub operator: Address,
+    pub timestamp: Timestamp,
+    pub epoch: u64,
+    pub commitment_hash: Hash,
+}
+
+impl RollupCommitment {
+    pub fn compute_hash(&self) -> Hash {
+        let _config = bincode::config::standard();
+        let mut data = Vec::new();
+        data.extend_from_slice(b"ego/rollup/commit/v1");
+        data.extend_from_slice(self.rollup_id.as_bytes());
+        data.extend_from_slice(self.state_root.as_bytes());
+        data.extend_from_slice(self.previous_state_root.as_bytes());
+        data.extend_from_slice(self.tx_root.as_bytes());
+        data.extend_from_slice(self.proofs_root.as_bytes());
+        data.extend_from_slice(self.da_root.as_bytes());
+        data.extend_from_slice(&self.tx_count.to_le_bytes());
+        data.extend_from_slice(&self.block_range.0.to_le_bytes());
+        data.extend_from_slice(&self.block_range.1.to_le_bytes());
+        data.extend_from_slice(self.operator.as_bytes());
+        data.extend_from_slice(&self.epoch.to_le_bytes());
+        ego_core::crypto::hash_data(&data)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct RollupTransaction {
+    pub inner: ego_core::Transaction,
+    pub rollup_id: String,
+    pub batch_index: u32,
+}
+
+impl RollupTransaction {
+    pub fn hash(&self) -> Hash {
+        self.inner.hash
+    }
+
+    pub fn verify_signature(&self) -> RollupResult<bool> {
+        self.inner.verify_signature().map_err(|e| e.into())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct FraudProof {
@@ -198,6 +272,7 @@ pub enum ResolutionType {
     Expired,
 }
 
+#[derive(Debug, Clone)]
 pub struct FraudProofVerifier {
     min_confidence: f64,
     max_age_hours: u64,
@@ -231,7 +306,6 @@ impl Default for SlashingParams {
         base_slash_amounts.insert(RollupFraudType::InvalidCrossShardReceipt, 350_000);
         base_slash_amounts.insert(RollupFraudType::MerkleRootMismatch, 250_000);
         base_slash_amounts.insert(RollupFraudType::InvalidEpochAnchor, 800_000);
-
         Self {
             base_slash_amounts,
             confidence_multiplier_enabled: true,
@@ -255,7 +329,6 @@ impl FraudProof {
     ) -> Self {
         let timestamp = Timestamp::now();
         let proof_id = Self::compute_proof_id(challenger, commitment_hash, &fraud_type, timestamp);
-
         Self {
             proof_id,
             challenger,
@@ -274,23 +347,18 @@ impl FraudProof {
 
     pub fn sign(&mut self, keypair: &ego_core::crypto::KeyPair) -> RollupResult<()> {
         self.dilithium_pk = keypair.dilithium_public_key().key_data;
-        self.ed25519_pk = keypair
-            .ed25519_public_key()
-            .key_data
-            .get(..32)
-            .map(|s| s.to_vec());
-
+        if keypair.is_transition_mode() {
+            self.ed25519_pk = Some(keypair.ed25519_public_key().key_data[..32].to_vec());
+        }
         let expected_challenger = Address::from_public_key(&keypair.dilithium_public_key());
         if expected_challenger != self.challenger {
             return Err(RollupError::FraudProof(
                 "Challenger address does not match signing key".to_string(),
             ));
         }
-
         let signing_data = self.create_signing_data()?;
         let sig = keypair.sign_dilithium(&signing_data);
         self.signature = sig.signature_data;
-
         Ok(())
     }
 
@@ -298,20 +366,18 @@ impl FraudProof {
         if self.dilithium_pk.is_empty() {
             return Ok(false);
         }
-
-        let pubkey = ego_core::PublicKey::dilithium2(self.dilithium_pk.clone());
+        let pubkey = PublicKey::dilithium2(self.dilithium_pk.clone());
         let expected_challenger = Address::from_public_key(&pubkey);
         if expected_challenger != self.challenger {
             return Ok(false);
         }
-
         let signing_data = self.create_signing_data()?;
         ego_core::crypto::verify_dilithium_signature(
             &self.dilithium_pk,
             &signing_data,
             &self.signature,
         )
-        .map_err(|e| RollupError::FraudProof(format!("Signature verification failed: {}", e)))
+        .map_err(|e| RollupError::FraudProof(format!("Signature verification failed: {:?}", e)))
     }
 
     pub fn validate(&self) -> RollupResult<()> {
@@ -320,21 +386,17 @@ impl FraudProof {
                 "Confidence must be between 0.0 and 1.0".to_string(),
             ));
         }
-
         if self.confidence < 0.7 {
             return Err(RollupError::FraudProof(
                 "Confidence too low for fraud proof submission".to_string(),
             ));
         }
-
         if self.challenge_bond == 0 {
             return Err(RollupError::FraudProof(
                 "Challenge bond must be greater than zero".to_string(),
             ));
         }
-
         self.validate_evidence()?;
-
         Ok(())
     }
 
@@ -410,8 +472,8 @@ impl FraudProof {
                         "Total chunks must be greater than zero".to_string(),
                     ));
                 }
-                for &chunk_id in missing_chunks {
-                    if chunk_id >= *total_chunks {
+                for chunk_id in missing_chunks.iter() {
+                    if *chunk_id >= *total_chunks {
                         return Err(RollupError::FraudProof(
                             "Missing chunk ID out of range".to_string(),
                         ));
@@ -485,13 +547,11 @@ impl FraudProof {
                 }
             }
         }
-
         Ok(())
     }
 
     fn create_signing_data(&self) -> RollupResult<Vec<u8>> {
         let config = bincode::config::standard();
-
         let mut data = Vec::new();
         data.extend_from_slice(b"ego/fraud/v1");
         data.extend_from_slice(self.proof_id.as_bytes());
@@ -501,16 +561,13 @@ impl FraudProof {
         data.extend_from_slice(&self.confidence.to_le_bytes());
         data.extend_from_slice(&self.challenge_bond.to_le_bytes());
         data.extend_from_slice(&self.deadline_epoch.to_le_bytes());
-
         let fraud_type_bytes = bincode::encode_to_vec(&self.fraud_type, config)
             .map_err(|e| RollupError::SerializationError(e.to_string()))?;
         data.extend_from_slice(&fraud_type_bytes);
-
         let evidence_bytes = bincode::encode_to_vec(&self.evidence, config)
             .map_err(|e| RollupError::SerializationError(e.to_string()))?;
         let evidence_hash = ego_core::crypto::hash_data(&evidence_bytes);
         data.extend_from_slice(evidence_hash.as_bytes());
-
         Ok(ego_core::crypto::blake2s_hash(&data))
     }
 
@@ -522,7 +579,6 @@ impl FraudProof {
     ) -> Hash {
         let config = bincode::config::standard();
         let fraud_type_bytes = bincode::encode_to_vec(fraud_type, config).unwrap_or_default();
-
         ego_core::crypto::hash_multiple(&[
             b"ego/fraud/id/v1",
             challenger.as_bytes(),
@@ -546,116 +602,8 @@ impl FraudProof {
             RollupFraudType::DuplicateTransaction => 2,
             RollupFraudType::InvalidSignature => 1,
         };
-
         let confidence_bonus = (self.confidence * 5.0) as u32;
         base_severity + confidence_bonus
-    }
-}
-
-impl InvalidInclusionProof {
-    pub fn new(
-        challenger: Address,
-        commitment_hash: Hash,
-        invalid_transaction: RollupTransaction,
-        inclusion_proof: Vec<Hash>,
-        fraud_reason: InclusionFraudReason,
-        expected_merkle_root: Hash,
-        actual_merkle_root: Hash,
-    ) -> Self {
-        let timestamp = Timestamp::now();
-        let proof_id = ego_core::crypto::hash_multiple(&[
-            b"ego/fraud/inclusion/v1",
-            challenger.as_bytes(),
-            commitment_hash.as_bytes(),
-            invalid_transaction.hash().as_bytes(),
-            &timestamp.as_millis().to_le_bytes(),
-        ]);
-
-        Self {
-            proof_id,
-            challenger,
-            commitment_hash,
-            invalid_transaction,
-            inclusion_proof,
-            fraud_reason,
-            timestamp,
-            signature: Vec::new(),
-            expected_merkle_root,
-            actual_merkle_root,
-        }
-    }
-
-    pub fn sign(&mut self, keypair: &ego_core::crypto::KeyPair) -> RollupResult<()> {
-        let signing_data = self.create_signing_data()?;
-        let sig = keypair.sign_dilithium(&signing_data);
-        self.signature = sig.signature_data;
-        Ok(())
-    }
-
-    pub fn verify_signature(&self, dilithium_pk: &[u8]) -> RollupResult<bool> {
-        let pubkey = ego_core::PublicKey::dilithium2(dilithium_pk.to_vec());
-        let expected_challenger = Address::from_public_key(&pubkey);
-        if expected_challenger != self.challenger {
-            return Ok(false);
-        }
-
-        let signing_data = self.create_signing_data()?;
-        ego_core::crypto::verify_dilithium_signature(dilithium_pk, &signing_data, &self.signature)
-            .map_err(|e| RollupError::FraudProof(format!("Signature verification failed: {}", e)))
-    }
-
-    pub fn validate(&self) -> RollupResult<()> {
-        if self.expected_merkle_root == self.actual_merkle_root {
-            return Err(RollupError::FraudProof(
-                "Expected and actual merkle roots are the same".to_string(),
-            ));
-        }
-
-        if self.inclusion_proof.is_empty() {
-            return Err(RollupError::FraudProof(
-                "Inclusion proof cannot be empty".to_string(),
-            ));
-        }
-
-        match self.fraud_reason {
-            InclusionFraudReason::InvalidSignature => {
-                if self.invalid_transaction.inner.verify_signature()? {
-                    return Err(RollupError::FraudProof(
-                        "Transaction signature is actually valid".to_string(),
-                    ));
-                }
-            }
-            InclusionFraudReason::MalformedTransaction => {
-                if self.invalid_transaction.inner.size() == 0 {
-                    return Err(RollupError::FraudProof(
-                        "Transaction appears to be properly formed".to_string(),
-                    ));
-                }
-            }
-            _ => {}
-        }
-
-        Ok(())
-    }
-
-    fn create_signing_data(&self) -> RollupResult<Vec<u8>> {
-        let config = bincode::config::standard();
-
-        let mut data = Vec::new();
-        data.extend_from_slice(b"ego/fraud/inclusion/v1");
-        data.extend_from_slice(self.proof_id.as_bytes());
-        data.extend_from_slice(self.challenger.as_bytes());
-        data.extend_from_slice(self.commitment_hash.as_bytes());
-        data.extend_from_slice(self.invalid_transaction.hash().as_bytes());
-        data.extend_from_slice(&self.timestamp.as_millis().to_le_bytes());
-        data.extend_from_slice(self.expected_merkle_root.as_bytes());
-        data.extend_from_slice(self.actual_merkle_root.as_bytes());
-
-        let fraud_reason_bytes = bincode::encode_to_vec(&self.fraud_reason, config)
-            .map_err(|e| RollupError::SerializationError(e.to_string()))?;
-        data.extend_from_slice(&fraud_reason_bytes);
-
-        Ok(ego_core::crypto::blake2s_hash(&data))
     }
 }
 
@@ -678,29 +626,23 @@ impl FraudProofVerifier {
 
     pub fn verify_fraud_proof(&mut self, proof: &FraudProof) -> RollupResult<bool> {
         proof.validate()?;
-
         if proof.confidence < self.min_confidence {
             return Ok(false);
         }
-
         let age_hours = (Timestamp::now().as_millis() - proof.timestamp.as_millis()) / 3_600_000;
         if age_hours > self.max_age_hours {
             return Ok(false);
         }
-
         if !proof.verify_signature()? {
             return Ok(false);
         }
-
         if self.verified_proofs.contains(&proof.proof_id) {
             return Ok(true);
         }
-
         let evidence_valid = self.verify_evidence(proof)?;
         if evidence_valid {
             self.verified_proofs.insert(proof.proof_id);
         }
-
         Ok(evidence_valid)
     }
 
@@ -812,16 +754,13 @@ impl FraudProofVerifier {
         if proof.is_empty() {
             return Ok(false);
         }
-
         let mut current_hash = *leaf;
-
         for proof_element in proof {
             current_hash = ego_core::crypto::hash_multiple(&[
                 current_hash.as_bytes(),
                 proof_element.as_bytes(),
             ]);
         }
-
         Ok(current_hash != *root)
     }
 
@@ -830,7 +769,6 @@ impl FraudProofVerifier {
             .iter()
             .map(|p| ego_core::crypto::hash_data(p).to_vec())
             .collect();
-
         let merkle_tree = ego_core::crypto::MerkleTree::build(proof_hashes);
         merkle_tree
             .root_hash()
@@ -847,14 +785,12 @@ impl FraudProofVerifier {
                 slashed_party: None,
             });
         }
-
         let base_slash = self
             .slashing_params
             .base_slash_amounts
             .get(&proof.fraud_type)
             .copied()
             .unwrap_or(100_000);
-
         let slash_amount = if self.slashing_params.confidence_multiplier_enabled {
             let multiplied = (base_slash as f64 * proof.confidence) as u64;
             multiplied
@@ -865,10 +801,8 @@ impl FraudProofVerifier {
                 .min(self.slashing_params.max_slash_amount)
                 .max(self.slashing_params.min_slash_amount)
         };
-
         let challenger_reward =
             (slash_amount * self.slashing_params.challenger_reward_percentage) / 100;
-
         Ok(FraudProofResult {
             success: true,
             slash_amount,
@@ -884,14 +818,12 @@ impl FraudProofVerifier {
                 "Cannot create challenge from invalid proof".to_string(),
             ));
         }
-
         let challenge_id = ego_core::crypto::hash_multiple(&[
             b"ego/fraud/challenge/v1",
             proof.proof_id.as_bytes(),
             proof.commitment_hash.as_bytes(),
             &Timestamp::now().as_millis().to_le_bytes(),
         ]);
-
         let challenge = FraudChallenge {
             challenge_id,
             proof_id: proof.proof_id,
@@ -907,7 +839,6 @@ impl FraudProofVerifier {
             response: None,
             resolution: None,
         };
-
         self.active_challenges
             .insert(challenge_id, challenge.clone());
         Ok(challenge)
@@ -922,22 +853,18 @@ impl FraudProofVerifier {
             .active_challenges
             .get_mut(&challenge_id)
             .ok_or_else(|| RollupError::FraudProof("Challenge not found".to_string()))?;
-
         if challenge.status != ChallengeStatus::Pending {
             return Err(RollupError::FraudProof(
                 "Challenge is not in pending state".to_string(),
             ));
         }
-
         if response.responder != challenge.operator {
             return Err(RollupError::FraudProof(
                 "Response must come from challenged operator".to_string(),
             ));
         }
-
         challenge.response = Some(response);
         challenge.status = ChallengeStatus::Responded;
-
         Ok(())
     }
 
@@ -952,7 +879,6 @@ impl FraudProofVerifier {
             .get(&challenge_id)
             .ok_or_else(|| RollupError::FraudProof("Challenge not found".to_string()))?
             .clone();
-
         if challenge.status == ChallengeStatus::Validated
             || challenge.status == ChallengeStatus::Rejected
         {
@@ -960,13 +886,11 @@ impl FraudProofVerifier {
                 "Challenge already resolved".to_string(),
             ));
         }
-
         let resolution_type: ResolutionType;
         let slashed_party: Option<Address>;
         let slash_amount: u64;
         let reward_amount: u64;
         let new_status: ChallengeStatus;
-
         if current_epoch > challenge.deadline_epoch {
             if challenge.response.is_none() {
                 resolution_type = ResolutionType::ChallengeValid;
@@ -983,7 +907,6 @@ impl FraudProofVerifier {
             }
         } else if let Some(ref response) = challenge.response {
             let counter_evidence_valid = self.verify_counter_evidence(&challenge, response)?;
-
             if counter_evidence_valid {
                 resolution_type = ResolutionType::ChallengeInvalid;
                 slashed_party = Some(challenge.challenger);
@@ -1002,20 +925,16 @@ impl FraudProofVerifier {
                 "Challenge not ready for resolution".to_string(),
             ));
         }
-
-        let evidence_data = bincode::encode_to_vec(
-            &(challenge.proof_id, challenge.response.as_ref()),
-            bincode::config::standard(),
-        )
-        .map_err(|e| RollupError::SerializationError(e.to_string()))?;
+        let config = bincode::config::standard();
+        let evidence_data =
+            bincode::encode_to_vec(&(challenge.proof_id, challenge.response.as_ref()), config)
+                .map_err(|e| RollupError::SerializationError(e.to_string()))?;
         let evidence_hash = ego_core::crypto::hash_data(&evidence_data);
-
         let resolution_id = ego_core::crypto::hash_multiple(&[
             b"ego/fraud/resolution/v1",
             challenge_id.as_bytes(),
             &Timestamp::now().as_millis().to_le_bytes(),
         ]);
-
         let resolution = ChallengeResolution {
             resolution_id,
             challenge_id,
@@ -1027,17 +946,13 @@ impl FraudProofVerifier {
             resolved_at: Timestamp::now(),
             resolver,
         };
-
         let challenge_mut = self
             .active_challenges
             .get_mut(&challenge_id)
             .ok_or_else(|| RollupError::FraudProof("Challenge not found".to_string()))?;
-
         challenge_mut.status = new_status;
         challenge_mut.resolution = Some(resolution.clone());
-
         self.resolution_history.push(resolution.clone());
-
         Ok(resolution)
     }
 
@@ -1049,11 +964,9 @@ impl FraudProofVerifier {
         if response.counter_evidence.is_empty() {
             return Ok(false);
         }
-
         if response.proof_correctness.is_empty() {
             return Ok(false);
         }
-
         Ok(response.counter_evidence.len() >= 100)
     }
 
@@ -1076,11 +989,9 @@ impl FraudProofVerifier {
 
     pub fn prune_old_challenges(&mut self, cutoff_epoch: u64) -> usize {
         let before_count = self.active_challenges.len();
-
         self.active_challenges.retain(|_, challenge| {
             challenge.deadline_epoch >= cutoff_epoch || challenge.status == ChallengeStatus::Pending
         });
-
         before_count - self.active_challenges.len()
     }
 
@@ -1092,21 +1003,17 @@ impl FraudProofVerifier {
             .values()
             .filter(|c| c.status == ChallengeStatus::Pending)
             .count();
-
         let successful_challenges = self
             .resolution_history
             .iter()
             .filter(|r| r.resolution_type == ResolutionType::ChallengeValid)
             .count();
-
         let total_slashed: u64 = self.resolution_history.iter().map(|r| r.slash_amount).sum();
-
         let total_rewards: u64 = self
             .resolution_history
             .iter()
             .map(|r| r.reward_amount)
             .sum();
-
         let fraud_types: HashMap<RollupFraudType, usize> = self
             .active_challenges
             .values()
@@ -1119,7 +1026,6 @@ impl FraudProofVerifier {
                 *acc.entry(challenge.fraud_type.clone()).or_insert(0) += 1;
                 acc
             });
-
         FraudStatistics {
             total_challenges,
             resolved_challenges,
@@ -1169,7 +1075,6 @@ impl ChallengeResponse {
             responder.as_bytes(),
             &Timestamp::now().as_millis().to_le_bytes(),
         ]);
-
         Self {
             response_id,
             responder,
@@ -1194,7 +1099,313 @@ impl ChallengeResponse {
         data.extend_from_slice(self.responder.as_bytes());
         data.extend_from_slice(&ego_core::crypto::hash_data(&self.counter_evidence).to_vec());
         data.extend_from_slice(&self.timestamp.as_millis().to_le_bytes());
-
         Ok(ego_core::crypto::blake2s_hash(&data))
     }
+}
+
+pub struct FraudProofBuilder {
+    challenger: Address,
+    commitment: RollupCommitment,
+    fraud_type: RollupFraudType,
+    confidence: f64,
+    challenge_bond: u64,
+    deadline_epoch: u64,
+    evidence_type: Option<FraudEvidenceType>,
+    proof_data: Vec<u8>,
+    witness_data: Option<Vec<u8>>,
+    auxiliary_data: HashMap<String, Vec<u8>>,
+}
+
+impl FraudProofBuilder {
+    pub fn new(
+        challenger: Address,
+        commitment: RollupCommitment,
+        fraud_type: RollupFraudType,
+    ) -> Self {
+        Self {
+            challenger,
+            commitment,
+            fraud_type,
+            confidence: 0.9,
+            challenge_bond: 100_000,
+            deadline_epoch: 0,
+            evidence_type: None,
+            proof_data: Vec::new(),
+            witness_data: None,
+            auxiliary_data: HashMap::new(),
+        }
+    }
+
+    pub fn confidence(mut self, confidence: f64) -> Self {
+        self.confidence = confidence;
+        self
+    }
+
+    pub fn challenge_bond(mut self, bond: u64) -> Self {
+        self.challenge_bond = bond;
+        self
+    }
+
+    pub fn deadline_epoch(mut self, epoch: u64) -> Self {
+        self.deadline_epoch = epoch;
+        self
+    }
+
+    pub fn evidence_type(mut self, evidence_type: FraudEvidenceType) -> Self {
+        self.evidence_type = Some(evidence_type);
+        self
+    }
+
+    pub fn proof_data(mut self, data: Vec<u8>) -> Self {
+        self.proof_data = data;
+        self
+    }
+
+    pub fn witness_data(mut self, data: Vec<u8>) -> Self {
+        self.witness_data = Some(data);
+        self
+    }
+
+    pub fn auxiliary_data(mut self, key: String, value: Vec<u8>) -> Self {
+        self.auxiliary_data.insert(key, value);
+        self
+    }
+
+    pub fn build(self) -> RollupResult<FraudProof> {
+        let evidence_type = self
+            .evidence_type
+            .ok_or_else(|| RollupError::FraudProof("Evidence type is required".to_string()))?;
+        let evidence = FraudEvidence {
+            commitment: self.commitment.clone(),
+            evidence_type,
+            proof_data: self.proof_data,
+            witness_data: self.witness_data,
+            reference_commitments: Vec::new(),
+            auxiliary_data: self.auxiliary_data,
+        };
+        let commitment_hash = self.commitment.compute_hash();
+        Ok(FraudProof::new(
+            self.challenger,
+            commitment_hash,
+            self.fraud_type,
+            evidence,
+            self.confidence,
+            self.challenge_bond,
+            self.deadline_epoch,
+        ))
+    }
+
+    pub fn build_and_sign(self, keypair: &ego_core::crypto::KeyPair) -> RollupResult<FraudProof> {
+        let mut proof = self.build()?;
+        proof.sign(keypair)?;
+        Ok(proof)
+    }
+}
+
+impl InvalidInclusionProof {
+    pub fn new(
+        challenger: Address,
+        commitment_hash: Hash,
+        invalid_transaction: RollupTransaction,
+        inclusion_proof: Vec<Hash>,
+        fraud_reason: InclusionFraudReason,
+        expected_merkle_root: Hash,
+        actual_merkle_root: Hash,
+    ) -> Self {
+        let timestamp = Timestamp::now();
+        let proof_id = ego_core::crypto::hash_multiple(&[
+            b"ego/fraud/inclusion/v1",
+            challenger.as_bytes(),
+            commitment_hash.as_bytes(),
+            invalid_transaction.hash().as_bytes(),
+            &timestamp.as_millis().to_le_bytes(),
+        ]);
+        Self {
+            proof_id,
+            challenger,
+            commitment_hash,
+            invalid_transaction,
+            inclusion_proof,
+            fraud_reason,
+            timestamp,
+            signature: Vec::new(),
+            expected_merkle_root,
+            actual_merkle_root,
+        }
+    }
+
+    pub fn sign(&mut self, keypair: &ego_core::crypto::KeyPair) -> RollupResult<()> {
+        let signing_data = self.create_signing_data()?;
+        let sig = keypair.sign_dilithium(&signing_data);
+        self.signature = sig.signature_data;
+        Ok(())
+    }
+
+    pub fn verify_signature(&self, dilithium_pk: &[u8]) -> RollupResult<bool> {
+        let pubkey = PublicKey::dilithium2(dilithium_pk.to_vec());
+        let expected_challenger = Address::from_public_key(&pubkey);
+        if expected_challenger != self.challenger {
+            return Ok(false);
+        }
+        let signing_data = self.create_signing_data()?;
+        ego_core::crypto::verify_dilithium_signature(dilithium_pk, &signing_data, &self.signature)
+            .map_err(|e| RollupError::FraudProof(format!("Signature verification failed: {:?}", e)))
+    }
+
+    pub fn validate(&self) -> RollupResult<()> {
+        if self.expected_merkle_root == self.actual_merkle_root {
+            return Err(RollupError::FraudProof(
+                "Expected and actual merkle roots are the same".to_string(),
+            ));
+        }
+        if self.inclusion_proof.is_empty() {
+            return Err(RollupError::FraudProof(
+                "Inclusion proof cannot be empty".to_string(),
+            ));
+        }
+        match self.fraud_reason {
+            InclusionFraudReason::InvalidSignature => {
+                if self.invalid_transaction.verify_signature()? {
+                    return Err(RollupError::FraudProof(
+                        "Transaction signature is actually valid".to_string(),
+                    ));
+                }
+            }
+            InclusionFraudReason::MalformedTransaction => {
+                if self.invalid_transaction.inner.size() == 0 {
+                    return Err(RollupError::FraudProof(
+                        "Transaction appears to be properly formed".to_string(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn create_signing_data(&self) -> RollupResult<Vec<u8>> {
+        let config = bincode::config::standard();
+        let mut data = Vec::new();
+        data.extend_from_slice(b"ego/fraud/inclusion/v1");
+        data.extend_from_slice(self.proof_id.as_bytes());
+        data.extend_from_slice(self.challenger.as_bytes());
+        data.extend_from_slice(self.commitment_hash.as_bytes());
+        data.extend_from_slice(self.invalid_transaction.hash().as_bytes());
+        data.extend_from_slice(&self.timestamp.as_millis().to_le_bytes());
+        data.extend_from_slice(self.expected_merkle_root.as_bytes());
+        data.extend_from_slice(self.actual_merkle_root.as_bytes());
+        let fraud_reason_bytes = bincode::encode_to_vec(&self.fraud_reason, config)
+            .map_err(|e| RollupError::SerializationError(e.to_string()))?;
+        data.extend_from_slice(&fraud_reason_bytes);
+        Ok(ego_core::crypto::blake2s_hash(&data))
+    }
+}
+
+pub fn create_state_transition_fraud(
+    challenger: Address,
+    commitment: RollupCommitment,
+    pre_state: Hash,
+    post_state: Hash,
+    expected_post_state: Hash,
+    execution_trace: Vec<u8>,
+    transaction_batch: Vec<RollupTransaction>,
+    intermediate_states: Vec<Hash>,
+) -> FraudProof {
+    let evidence_type = FraudEvidenceType::StateTransition {
+        pre_state,
+        post_state,
+        expected_post_state,
+        execution_trace,
+        transaction_batch,
+        intermediate_states,
+    };
+    let evidence = FraudEvidence {
+        commitment: commitment.clone(),
+        evidence_type,
+        proof_data: Vec::new(),
+        witness_data: None,
+        reference_commitments: Vec::new(),
+        auxiliary_data: HashMap::new(),
+    };
+    let commitment_hash = commitment.compute_hash();
+    FraudProof::new(
+        challenger,
+        commitment_hash,
+        RollupFraudType::InvalidStateTransition,
+        evidence,
+        0.95,
+        200_000,
+        0,
+    )
+}
+
+pub fn create_data_unavailability_fraud(
+    challenger: Address,
+    commitment: RollupCommitment,
+    missing_chunks: Vec<u32>,
+    total_chunks: u32,
+    timeout_evidence: Vec<TimeoutEvidence>,
+    sampling_requests: Vec<SamplingRequest>,
+) -> FraudProof {
+    let evidence_type = FraudEvidenceType::DataUnavailability {
+        missing_chunks,
+        sample_proofs: Vec::new(),
+        timeout_evidence,
+        sampling_requests,
+        total_chunks,
+    };
+    let evidence = FraudEvidence {
+        commitment: commitment.clone(),
+        evidence_type,
+        proof_data: Vec::new(),
+        witness_data: None,
+        reference_commitments: Vec::new(),
+        auxiliary_data: HashMap::new(),
+    };
+    let commitment_hash = commitment.compute_hash();
+    FraudProof::new(
+        challenger,
+        commitment_hash,
+        RollupFraudType::DataUnavailable,
+        evidence,
+        0.9,
+        150_000,
+        0,
+    )
+}
+
+pub fn create_invalid_inclusion_fraud(
+    challenger: Address,
+    commitment: RollupCommitment,
+    claimed_transaction: RollupTransaction,
+    inclusion_proof: Vec<Hash>,
+    merkle_root: Hash,
+    invalid_reason: String,
+    transaction_index: u32,
+) -> FraudProof {
+    let evidence_type = FraudEvidenceType::InvalidInclusion {
+        inclusion_proof,
+        merkle_root,
+        invalid_reason,
+        transaction_index,
+        claimed_transaction,
+    };
+    let evidence = FraudEvidence {
+        commitment: commitment.clone(),
+        evidence_type,
+        proof_data: Vec::new(),
+        witness_data: None,
+        reference_commitments: Vec::new(),
+        auxiliary_data: HashMap::new(),
+    };
+    let commitment_hash = commitment.compute_hash();
+    FraudProof::new(
+        challenger,
+        commitment_hash,
+        RollupFraudType::InvalidInclusion,
+        evidence,
+        0.92,
+        180_000,
+        0,
+    )
 }

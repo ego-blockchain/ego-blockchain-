@@ -1,5 +1,5 @@
 use crate::error::{RollupError, RollupResult};
-use ego_core::{Address, Hash, Timestamp};
+use ego_core::{Address, Balance, Hash, Timestamp};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -37,7 +37,7 @@ pub struct DAUnavailabilityProof {
     pub failed_requests: Vec<FailedRequest>,
     pub timestamp: Timestamp,
     pub challenger: Address,
-    pub challenge_bond: u64,
+    pub challenge_bond: Balance,
     pub expected_providers: Vec<Address>,
 }
 
@@ -101,7 +101,7 @@ pub struct DAChallenge {
     pub sample_indices: Vec<u32>,
     pub timestamp: Timestamp,
     pub deadline_epoch: u64,
-    pub bond: u64,
+    pub bond: Balance,
     pub status: ChallengeStatus,
 }
 
@@ -355,14 +355,14 @@ impl DataAvailability {
     ) -> RollupResult<Vec<DAChunk>> {
         let chunks = self
             .stored_chunks
-            .get(&commitment_hash)
+            .get_mut(&commitment_hash)
             .ok_or_else(|| RollupError::DataAvailability("Commitment not found".to_string()))?;
 
         let mut sampled_chunks = Vec::new();
         for &index in &sample_indices {
-            if let Some(mut chunk) = chunks.get(&index).cloned() {
+            if let Some(chunk) = chunks.get_mut(&index) {
                 chunk.access_count += 1;
-                sampled_chunks.push(chunk);
+                sampled_chunks.push(chunk.clone());
             } else {
                 return Err(RollupError::DataAvailability(format!(
                     "Chunk {} not available for sampling",
@@ -457,6 +457,8 @@ impl DataAvailability {
                 })?,
             );
 
+            self.verified_proofs.insert(proof_hash);
+
             Ok(true)
         } else {
             Ok(false)
@@ -468,7 +470,7 @@ impl DataAvailability {
         commitment_hash: Hash,
         sample_indices: Vec<u32>,
         challenger: Address,
-        challenge_bond: u64,
+        challenge_bond: Balance,
     ) -> RollupResult<DAUnavailabilityProof> {
         let mut missing_chunks = Vec::new();
         let mut failed_requests = Vec::new();
@@ -677,7 +679,7 @@ impl DataAvailability {
         challenge_type: ChallengeType,
         sample_size: u32,
         deadline_epoch: u64,
-        bond: u64,
+        bond: Balance,
     ) -> RollupResult<DAChallenge> {
         if !self.commitments.contains_key(&commitment_hash) {
             return Err(RollupError::DataAvailability(
@@ -759,7 +761,10 @@ impl DataAvailability {
         }
     }
 
-    pub fn slash_on_unavailability(&mut self, challenge_id: Hash) -> RollupResult<(Address, u64)> {
+    pub fn slash_on_unavailability(
+        &mut self,
+        challenge_id: Hash,
+    ) -> RollupResult<(Address, Balance)> {
         let challenge = self
             .active_challenges
             .get_mut(&challenge_id)
@@ -777,7 +782,10 @@ impl DataAvailability {
             .ok_or_else(|| RollupError::DataAvailability("Commitment not found".to_string()))?;
 
         let operator = commitment.operator;
-        let slash_amount = challenge.bond * 2;
+        let slash_amount = challenge
+            .bond
+            .checked_mul(2u128.into())
+            .unwrap_or(challenge.bond);
 
         challenge.status = ChallengeStatus::Slashed;
 
@@ -975,7 +983,7 @@ impl DAUnavailabilityProof {
             }
         }
 
-        if self.challenge_bond == 0 {
+        if self.challenge_bond.as_u128() == 0 {
             return Err(RollupError::DataAvailability(
                 "Challenge bond cannot be zero".to_string(),
             ));
