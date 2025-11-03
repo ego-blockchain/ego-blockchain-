@@ -761,14 +761,18 @@ impl RollupVerifier {
     }
 
     pub fn verify_fraud_proof(&mut self, proof: &FraudProof) -> RollupResult<bool> {
-        self.fraud_verifier.verify_fraud_proof(proof)
+        self.fraud_verifier
+            .verify_fraud_proof(proof)
+            .map_err(Into::into)
     }
 
     pub fn execute_fraud_proof(
         &mut self,
         proof: &FraudProof,
     ) -> RollupResult<crate::fraud::FraudProofResult> {
-        self.fraud_verifier.execute_fraud_proof(proof)
+        self.fraud_verifier
+            .execute_fraud_proof(proof)
+            .map_err(Into::into)
     }
 
     pub fn register_operator_pubkey(&mut self, operator: Address, pubkey: PublicKey) {
