@@ -1,5 +1,5 @@
-use crate::{
-    Account, Address, AlgorithmId, Balance, Block, BlockHeight, EgoError, EgoResult, EpochNumber,
+use ego_core::{
+    Account, AccountType, Address, Balance, Block, BlockHeight, EgoError, EgoResult, EpochNumber,
     Hash, ShardId, Transaction, TransactionPayload,
 };
 use serde::{Deserialize, Serialize};
@@ -158,7 +158,7 @@ pub struct ProofMetrics {
     pub evidence_bundle_size_avg_mb: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProofType {
     PoSt,
     PoRep,
@@ -189,7 +189,7 @@ pub struct DRSScoreSnapshot {
     pub timestamp: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RollupMetrics {
     pub rollup_id: String,
     pub operator: Address,
@@ -902,13 +902,13 @@ impl MetricsCollector {
             .body
             .proof_events
             .iter()
-            .filter(|e| matches!(e.proof_type, crate::ProofEventType::PoC))
+            .filter(|e| matches!(e.proof_type, ego_core::ProofEventType::PoC))
             .count() as u64;
         let post_events = block
             .body
             .proof_events
             .iter()
-            .filter(|e| matches!(e.proof_type, crate::ProofEventType::PoSt))
+            .filter(|e| matches!(e.proof_type, ego_core::ProofEventType::PoSt))
             .count() as u64;
 
         network.poc_events_total += poc_events;
@@ -1144,9 +1144,7 @@ impl MetricsCollector {
         if !account.is_device() {
             return Ok(());
         }
-
         let mut devices = self.device_metrics.lock().unwrap();
-
         if let Some(ref device_caps) = account.device_capabilities {
             let device = devices.entry(address).or_insert_with(|| DeviceMetrics {
                 device_address: address,
@@ -1169,28 +1167,21 @@ impl MetricsCollector {
                 density_multiplier: 1.0,
                 co_beacon_verified: false,
             });
-
-            if let crate::account::AccountType::Device { device_id, geohash } =
-                &account.account_type
-            {
+            if let AccountType::Device { device_id, geohash } = &account.account_type {
                 device.device_id = device_id.clone();
                 device.geohash = geohash.clone();
             }
-
             device.cellular_safe_mode = device_caps.cellular_safe;
             device.cellular_data_used_mb = device_caps.cost_awareness.current_month_usage_gb * 1024;
             device.monthly_cellular_estimate_mb =
                 device_caps.cost_awareness.cellular_throttle_threshold_gb * 1024;
-
             if device_caps.cellular_safe {
                 let mut network = self.network_metrics.lock().unwrap();
                 network.cellular_node_count += 1;
             }
-
             let mut network = self.network_metrics.lock().unwrap();
             network.active_devices += 1;
         }
-
         Ok(())
     }
 
