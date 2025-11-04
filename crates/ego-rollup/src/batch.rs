@@ -1,9 +1,7 @@
 use crate::commitment::RollupCommitment;
 use crate::error::{RollupError, RollupResult};
 use crate::types::{RollupExecutionResult, RollupTransaction};
-use ego_core::{
-    Address, Balance, EgoError, EgoResult, EpochNumber, Hash, PROTOCOL_VERSION, ShardId, Timestamp,
-};
+use ego_core::{Address, EpochNumber, Hash, PROTOCOL_VERSION, ShardId, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
