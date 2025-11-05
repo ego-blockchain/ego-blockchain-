@@ -1,12 +1,18 @@
-use crate::config::RollupConfig;
-use crate::da::{DAChunk, DataAvailability};
-use crate::error::{RollupError, RollupResult};
-use ego_core::{Address, Hash, Timestamp};
+use ego_core::{
+    Account, Address, AlgorithmId, Balance, BlockHeight, DualSignature, EgoError, EgoResult, Hash,
+    PublicKey, ShardId, Timestamp, Transaction, TransactionPayload,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+
+pub const DOMAIN_TAG_ROLLUP_COMMIT: &[u8] = b"ego/proof-rollup/commit/v1";
+pub const DOMAIN_TAG_POC_BEACON: &[u8] = b"ego/poc/beacon/v1";
+pub const DOMAIN_TAG_POC_WITNESS: &[u8] = b"ego/poc/witness/v1";
+pub const DOMAIN_TAG_POST_PROOF: &[u8] = b"ego/post/proof/v1";
+pub const DOMAIN_TAG_POREP_PROOF: &[u8] = b"ego/porep/proof/v1";
+pub const DOMAIN_TAG_EVIDENCE_BUNDLE: &[u8] = b"ego/evidence/bundle/v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct ProofRollupCommit {
@@ -19,12 +25,12 @@ pub struct ProofRollupCommit {
     pub count_proofs: u32,
     pub blob_bytes: u64,
     pub min_validity_proof: MinValidityProof,
-    pub alg_sig_id: u16,
-    pub operator_addr: [u8; 20],
-    pub operator_sig: Vec<u8>,
+    pub operator_addr: Address,
+    pub operator_sig: DualSignature,
     pub chain_id: u32,
     pub network_id: u32,
     pub created_at: Timestamp,
+    pub commitment_hash: Hash,
 }
 
 #[derive(
@@ -207,6 +213,146 @@ pub struct ProofRollupMetrics {
     pub sector_proven_count: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollupConfig {
+    pub rollup_id: String,
+    pub chain_id: u32,
+    pub network_id: u32,
+    pub da: DaConfig,
+    pub five_g: FiveGConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaConfig {
+    pub k: u16,
+    pub m: u16,
+    pub chunk_size: usize,
+    pub enable_compression: bool,
+    pub compression_level: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FiveGConfig {
+    pub cellular_safe_mode: bool,
+}
+
+impl Default for RollupConfig {
+    fn default() -> Self {
+        Self {
+            rollup_id: "ego-rollup-1".to_string(),
+            chain_id: 1,
+            network_id: 1,
+            da: DaConfig {
+                k: 64,
+                m: 32,
+                chunk_size: 32768,
+                enable_compression: true,
+                compression_level: 3,
+            },
+            five_g: FiveGConfig {
+                cellular_safe_mode: true,
+            },
+        }
+    }
+}
+
+pub struct DataAvailability {
+    k: usize,
+    m: usize,
+    chunk_size: usize,
+    enable_compression: bool,
+    compression_level: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct DAChunk {
+    pub chunk_id: u32,
+    pub chunk_hash: Hash,
+    pub data: Vec<u8>,
+    pub parity: bool,
+    pub rollup_id: String,
+    pub operator: Address,
+    pub epoch: u64,
+}
+
+impl DataAvailability {
+    pub fn new(
+        k: usize,
+        m: usize,
+        chunk_size: usize,
+        enable_compression: bool,
+        compression_level: i32,
+    ) -> EgoResult<Self> {
+        Ok(Self {
+            k,
+            m,
+            chunk_size,
+            enable_compression,
+            compression_level,
+        })
+    }
+
+    pub fn encode_data(
+        &mut self,
+        bundle_id: Hash,
+        data: Vec<u8>,
+        rollup_id: String,
+        operator: Address,
+        epoch: u64,
+    ) -> EgoResult<Vec<DAChunk>> {
+        let mut chunks = Vec::new();
+        let chunk_count = (data.len() + self.chunk_size - 1) / self.chunk_size;
+
+        for i in 0..chunk_count {
+            let start = i * self.chunk_size;
+            let end = std::cmp::min(start + self.chunk_size, data.len());
+            let chunk_data = data[start..end].to_vec();
+
+            let chunk_hash = ego_core::crypto::hash_data(&chunk_data);
+
+            chunks.push(DAChunk {
+                chunk_id: i as u32,
+                chunk_hash,
+                data: chunk_data,
+                parity: false,
+                rollup_id: rollup_id.clone(),
+                operator,
+                epoch,
+            });
+        }
+
+        for i in 0..self.m {
+            let parity_data = self.generate_parity_chunk(i, &chunks);
+            let chunk_hash = ego_core::crypto::hash_data(&parity_data);
+
+            chunks.push(DAChunk {
+                chunk_id: (chunk_count + i) as u32,
+                chunk_hash,
+                data: parity_data,
+                parity: true,
+                rollup_id: rollup_id.clone(),
+                operator,
+                epoch,
+            });
+        }
+
+        Ok(chunks)
+    }
+
+    fn generate_parity_chunk(&self, parity_index: usize, data_chunks: &[DAChunk]) -> Vec<u8> {
+        let max_len = data_chunks.iter().map(|c| c.data.len()).max().unwrap_or(0);
+        let mut parity = vec![0u8; max_len];
+
+        for chunk in data_chunks {
+            for (i, &byte) in chunk.data.iter().enumerate() {
+                parity[i] ^= byte;
+            }
+        }
+
+        parity
+    }
+}
+
 impl ProofRollupOperator {
     pub fn new(
         config: RollupConfig,
@@ -214,7 +360,7 @@ impl ProofRollupOperator {
         region_id: u32,
         operator_addr: Address,
         keypair: ego_core::crypto::KeyPair,
-    ) -> RollupResult<Self> {
+    ) -> EgoResult<Self> {
         let da_manager = DataAvailability::new(
             config.da.k as usize,
             config.da.m as usize,
@@ -245,7 +391,7 @@ impl ProofRollupOperator {
         })
     }
 
-    pub async fn submit_poc_evidence(&self, evidence: PoCEvidence) -> RollupResult<Hash> {
+    pub async fn submit_poc_evidence(&self, evidence: PoCEvidence) -> EgoResult<Hash> {
         let verify_start = std::time::Instant::now();
 
         self.verify_poc_signatures(&evidence).await?;
@@ -268,18 +414,10 @@ impl ProofRollupOperator {
                 (evidence.beacon_announcements.len() + evidence.witness_reports.len()) as u64;
         }
 
-        info!(
-            "Received PoC evidence: {} ({} beacons, {} witnesses) verified in {}ms",
-            evidence_hash,
-            evidence.beacon_announcements.len(),
-            evidence.witness_reports.len(),
-            verification_time
-        );
-
         Ok(evidence_hash)
     }
 
-    pub async fn submit_post_evidence(&self, evidence: PoStEvidence) -> RollupResult<Hash> {
+    pub async fn submit_post_evidence(&self, evidence: PoStEvidence) -> EgoResult<Hash> {
         let verify_start = std::time::Instant::now();
 
         self.verify_post_signatures(&evidence).await?;
@@ -301,26 +439,17 @@ impl ProofRollupOperator {
             metrics.dilithium_signatures_verified += evidence.window_post_proofs.len() as u64;
         }
 
-        info!(
-            "Received PoSt evidence: {} ({} partitions, {} sectors) verified in {}ms",
-            evidence_hash,
-            evidence.partition_indices.len(),
-            evidence.prover_stats.proven_sectors,
-            verification_time
-        );
-
         Ok(evidence_hash)
     }
 
-    pub async fn submit_porep_proof(&self, proof: PoRepProof) -> RollupResult<Hash> {
+    pub async fn submit_porep_proof(&self, proof: PoRepProof) -> EgoResult<Hash> {
         let verify_start = std::time::Instant::now();
 
         self.verify_porep_signature(&proof).await?;
 
         let verification_time = verify_start.elapsed().as_millis() as u64;
 
-        let proof_hash = Hash::from_slice(&proof.sector_id)
-            .unwrap_or_else(|_| ego_core::crypto::hash_data(&proof.sector_id));
+        let proof_hash = ego_core::crypto::hash_data(&proof.sector_id);
 
         {
             let mut pending = self.pending_porep.write().await;
@@ -333,15 +462,10 @@ impl ProofRollupOperator {
             metrics.dilithium_signatures_verified += 1;
         }
 
-        info!(
-            "Received PoRep proof: {} verified in {}ms",
-            proof_hash, verification_time
-        );
-
         Ok(proof_hash)
     }
 
-    pub async fn aggregate_and_commit(&self, is_cellular: bool) -> RollupResult<Hash> {
+    pub async fn aggregate_and_commit(&self, is_cellular: bool) -> EgoResult<Hash> {
         let epoch = *self.current_epoch.read().await;
         let window_id = *self.current_window.read().await;
 
@@ -361,19 +485,10 @@ impl ProofRollupOperator {
         };
 
         if poc_evidence.is_empty() && post_evidence.is_empty() && porep_proofs.is_empty() {
-            return Err(RollupError::InvalidBatch(
+            return Err(EgoError::InvalidTransaction(
                 "No evidence to aggregate".to_string(),
             ));
         }
-
-        info!(
-            "Aggregating evidence for epoch {} window {}: {} PoC, {} PoSt, {} PoRep",
-            epoch,
-            window_id,
-            poc_evidence.len(),
-            post_evidence.len(),
-            porep_proofs.len()
-        );
 
         let bundle = self
             .create_evidence_bundle(poc_evidence, post_evidence, porep_proofs)
@@ -382,11 +497,7 @@ impl ProofRollupOperator {
         let bundle_size_bytes = bundle.compressed_data.len() as u64;
 
         if self.cellular_safe_mode && is_cellular && bundle_size_bytes > 512 * 1024 {
-            warn!(
-                "Bundle size {} KB exceeds cellular-safe limit, deferring until WiFi",
-                bundle_size_bytes / 1024
-            );
-            return Err(RollupError::DataAvailability(
+            return Err(EgoError::InvalidTransaction(
                 "Bundle too large for cellular upload".to_string(),
             ));
         }
@@ -407,17 +518,18 @@ impl ProofRollupOperator {
             count_proofs: bundle.count_proofs(),
             blob_bytes: bundle_size_bytes,
             min_validity_proof: MinValidityProof::InclusionOnly,
-            alg_sig_id: 2,
-            operator_addr: *self.operator_addr.as_bytes(),
-            operator_sig: Vec::new(),
+            operator_addr: self.operator_addr,
+            operator_sig: DualSignature::new(None, None),
             chain_id: self.config.chain_id,
             network_id: self.config.network_id,
             created_at: Timestamp::now(),
+            commitment_hash: Hash::ZERO,
         };
 
         self.sign_commitment(&mut commitment)?;
 
         let commitment_hash = self.compute_commitment_hash(&commitment);
+        commitment.commitment_hash = commitment_hash;
 
         {
             let mut bundles = self.evidence_bundles.write().await;
@@ -450,15 +562,6 @@ impl ProofRollupOperator {
             }
         }
 
-        info!(
-            "Posted ProofRollup commitment: {} (epoch={}, window={}, {} proofs, {} KB)",
-            commitment_hash,
-            epoch,
-            window_id,
-            bundle.count_proofs(),
-            bundle_size_bytes / 1024
-        );
-
         Ok(commitment_hash)
     }
 
@@ -467,7 +570,7 @@ impl ProofRollupOperator {
         poc_evidence: Vec<PoCEvidence>,
         post_evidence: Vec<PoStEvidence>,
         porep_proofs: Vec<PoRepProof>,
-    ) -> RollupResult<EvidenceBundle> {
+    ) -> EgoResult<EvidenceBundle> {
         let bundle_type = if !poc_evidence.is_empty() && !post_evidence.is_empty() {
             EvidenceBundleType::Combined
         } else if !poc_evidence.is_empty() {
@@ -483,26 +586,26 @@ impl ProofRollupOperator {
 
         if !poc_evidence.is_empty() {
             let poc_data = bincode::encode_to_vec(&poc_evidence, config)
-                .map_err(|e| RollupError::SerializationError(e.to_string()))?;
+                .map_err(|e| EgoError::SerializationError(e.to_string()))?;
             data.extend_from_slice(&poc_data);
         }
 
         if !post_evidence.is_empty() {
             let post_data = bincode::encode_to_vec(&post_evidence, config)
-                .map_err(|e| RollupError::SerializationError(e.to_string()))?;
+                .map_err(|e| EgoError::SerializationError(e.to_string()))?;
             data.extend_from_slice(&post_data);
         }
 
         if !porep_proofs.is_empty() {
             let porep_data = bincode::encode_to_vec(&porep_proofs, config)
-                .map_err(|e| RollupError::SerializationError(e.to_string()))?;
+                .map_err(|e| EgoError::SerializationError(e.to_string()))?;
             data.extend_from_slice(&porep_data);
         }
 
         let original_size = data.len() as u64;
 
         let compressed_data = zstd::bulk::compress(&data, self.config.da.compression_level)
-            .map_err(|e| RollupError::DataAvailability(format!("Compression failed: {}", e)))?;
+            .map_err(|e| EgoError::CryptoError(format!("Compression failed: {}", e)))?;
 
         let compressed_size = compressed_data.len() as u64;
         let compression_ratio = if compressed_size > 0 {
@@ -529,7 +632,7 @@ impl ProofRollupOperator {
         })
     }
 
-    async fn create_da_chunks(&self, bundle: &EvidenceBundle) -> RollupResult<Vec<DAChunk>> {
+    async fn create_da_chunks(&self, bundle: &EvidenceBundle) -> EgoResult<Vec<DAChunk>> {
         let epoch = *self.current_epoch.read().await;
 
         let mut da_manager = self.da_manager.write().await;
@@ -564,7 +667,7 @@ impl ProofRollupOperator {
 
     fn compute_commitment_hash(&self, commitment: &ProofRollupCommit) -> Hash {
         let mut data = Vec::new();
-        data.extend_from_slice(b"ego/proof-rollup/commit/v1");
+        data.extend_from_slice(DOMAIN_TAG_ROLLUP_COMMIT);
         data.extend_from_slice(&commitment.rollup_id);
         data.extend_from_slice(&commitment.region_id.to_le_bytes());
         data.extend_from_slice(&commitment.epoch.to_le_bytes());
@@ -579,19 +682,16 @@ impl ProofRollupOperator {
         ego_core::crypto::hash_data(&data)
     }
 
-    fn sign_commitment(&self, commitment: &mut ProofRollupCommit) -> RollupResult<()> {
+    fn sign_commitment(&self, commitment: &mut ProofRollupCommit) -> EgoResult<()> {
         let signing_data = self.create_commitment_signing_data(commitment)?;
-        let sig = self.keypair.sign_dilithium(&signing_data);
-        commitment.operator_sig = sig.signature_data;
+        let sig = self.keypair.sign_hybrid(&signing_data, false);
+        commitment.operator_sig = sig;
         Ok(())
     }
 
-    fn create_commitment_signing_data(
-        &self,
-        commitment: &ProofRollupCommit,
-    ) -> RollupResult<Vec<u8>> {
+    fn create_commitment_signing_data(&self, commitment: &ProofRollupCommit) -> EgoResult<Vec<u8>> {
         let mut data = Vec::new();
-        data.extend_from_slice(b"ego/proof-rollup/commit/v1");
+        data.extend_from_slice(DOMAIN_TAG_ROLLUP_COMMIT);
         data.extend_from_slice(&commitment.rollup_id);
         data.extend_from_slice(&commitment.region_id.to_le_bytes());
         data.extend_from_slice(&commitment.epoch.to_le_bytes());
@@ -605,15 +705,14 @@ impl ProofRollupOperator {
         Ok(ego_core::crypto::blake2s_hash(&data))
     }
 
-    async fn verify_poc_signatures(&self, evidence: &PoCEvidence) -> RollupResult<()> {
+    async fn verify_poc_signatures(&self, evidence: &PoCEvidence) -> EgoResult<()> {
         let mut verified = 0;
         let mut failed = 0;
 
         for beacon in &evidence.beacon_announcements {
             match self.verify_beacon_signature(beacon).await {
                 Ok(_) => verified += 1,
-                Err(e) => {
-                    warn!("Beacon signature verification failed: {}", e);
+                Err(_) => {
                     failed += 1;
                 }
             }
@@ -622,8 +721,7 @@ impl ProofRollupOperator {
         for witness in &evidence.witness_reports {
             match self.verify_witness_signature(witness).await {
                 Ok(_) => verified += 1,
-                Err(e) => {
-                    warn!("Witness signature verification failed: {}", e);
+                Err(_) => {
                     failed += 1;
                 }
             }
@@ -635,24 +733,23 @@ impl ProofRollupOperator {
         }
 
         if verified == 0 {
-            return Err(RollupError::InvalidBatch(
+            return Err(EgoError::InvalidTransaction(
                 "No valid signatures in PoC evidence".to_string(),
             ));
         }
 
-        debug!("PoC verification: {} verified, {} failed", verified, failed);
         Ok(())
     }
 
-    async fn verify_beacon_signature(&self, beacon: &BeaconAnnouncement) -> RollupResult<()> {
+    async fn verify_beacon_signature(&self, beacon: &BeaconAnnouncement) -> EgoResult<()> {
         if beacon.dilithium_pk.is_empty() || beacon.dilithium_sig.is_empty() {
-            return Err(RollupError::InvalidBatch(
+            return Err(EgoError::InvalidTransaction(
                 "Missing beacon signature".to_string(),
             ));
         }
 
         let mut signing_data = Vec::new();
-        signing_data.extend_from_slice(b"ego/poc/beacon/v1");
+        signing_data.extend_from_slice(DOMAIN_TAG_POC_BEACON);
         signing_data.extend_from_slice(&beacon.device_id);
         signing_data.extend_from_slice(beacon.location_hash.as_bytes());
         signing_data.extend_from_slice(&beacon.signal_strength_dbm.to_le_bytes());
@@ -667,27 +764,27 @@ impl ProofRollupOperator {
             &data_hash,
             &beacon.dilithium_sig,
         )
-        .map_err(|e| RollupError::InvalidBatch(format!("Beacon signature invalid: {}", e)))
+        .map_err(|e| EgoError::InvalidTransaction(format!("Beacon signature invalid: {}", e)))
         .and_then(|valid| {
             if valid {
                 Ok(())
             } else {
-                Err(RollupError::InvalidBatch(
+                Err(EgoError::InvalidTransaction(
                     "Beacon signature verification failed".to_string(),
                 ))
             }
         })
     }
 
-    async fn verify_witness_signature(&self, witness: &WitnessReport) -> RollupResult<()> {
+    async fn verify_witness_signature(&self, witness: &WitnessReport) -> EgoResult<()> {
         if witness.dilithium_pk.is_empty() || witness.dilithium_sig.is_empty() {
-            return Err(RollupError::InvalidBatch(
+            return Err(EgoError::InvalidTransaction(
                 "Missing witness signature".to_string(),
             ));
         }
 
         let mut signing_data = Vec::new();
-        signing_data.extend_from_slice(b"ego/poc/witness/v1");
+        signing_data.extend_from_slice(DOMAIN_TAG_POC_WITNESS);
         signing_data.extend_from_slice(&witness.witness_id);
         signing_data.extend_from_slice(&witness.beacon_id);
         signing_data.extend_from_slice(&witness.rsrp_dbm.to_le_bytes());
@@ -706,27 +803,26 @@ impl ProofRollupOperator {
             &data_hash,
             &witness.dilithium_sig,
         )
-        .map_err(|e| RollupError::InvalidBatch(format!("Witness signature invalid: {}", e)))
+        .map_err(|e| EgoError::InvalidTransaction(format!("Witness signature invalid: {}", e)))
         .and_then(|valid| {
             if valid {
                 Ok(())
             } else {
-                Err(RollupError::InvalidBatch(
+                Err(EgoError::InvalidTransaction(
                     "Witness signature verification failed".to_string(),
                 ))
             }
         })
     }
 
-    async fn verify_post_signatures(&self, evidence: &PoStEvidence) -> RollupResult<()> {
+    async fn verify_post_signatures(&self, evidence: &PoStEvidence) -> EgoResult<()> {
         let mut verified = 0;
         let mut failed = 0;
 
         for proof in &evidence.window_post_proofs {
             match self.verify_post_proof_signature(proof).await {
                 Ok(_) => verified += 1,
-                Err(e) => {
-                    warn!("PoSt proof signature verification failed: {}", e);
+                Err(_) => {
                     failed += 1;
                 }
             }
@@ -738,27 +834,23 @@ impl ProofRollupOperator {
         }
 
         if verified == 0 {
-            return Err(RollupError::InvalidBatch(
+            return Err(EgoError::InvalidTransaction(
                 "No valid signatures in PoSt evidence".to_string(),
             ));
         }
 
-        debug!(
-            "PoSt verification: {} verified, {} failed",
-            verified, failed
-        );
         Ok(())
     }
 
-    async fn verify_post_proof_signature(&self, proof: &WindowPoStProof) -> RollupResult<()> {
+    async fn verify_post_proof_signature(&self, proof: &WindowPoStProof) -> EgoResult<()> {
         if proof.dilithium_pk.is_empty() || proof.dilithium_sig.is_empty() {
-            return Err(RollupError::InvalidBatch(
+            return Err(EgoError::InvalidTransaction(
                 "Missing PoSt signature".to_string(),
             ));
         }
 
         let mut signing_data = Vec::new();
-        signing_data.extend_from_slice(b"ego/post/proof/v1");
+        signing_data.extend_from_slice(DOMAIN_TAG_POST_PROOF);
         signing_data.extend_from_slice(&proof.partition_id.to_le_bytes());
         signing_data.extend_from_slice(&proof.challenge_seed);
         signing_data.extend_from_slice(&ego_core::crypto::hash_data(&proof.proof_bytes).to_vec());
@@ -774,27 +866,27 @@ impl ProofRollupOperator {
             &data_hash,
             &proof.dilithium_sig,
         )
-        .map_err(|e| RollupError::InvalidBatch(format!("PoSt signature invalid: {}", e)))
+        .map_err(|e| EgoError::InvalidTransaction(format!("PoSt signature invalid: {}", e)))
         .and_then(|valid| {
             if valid {
                 Ok(())
             } else {
-                Err(RollupError::InvalidBatch(
+                Err(EgoError::InvalidTransaction(
                     "PoSt signature verification failed".to_string(),
                 ))
             }
         })
     }
 
-    async fn verify_porep_signature(&self, proof: &PoRepProof) -> RollupResult<()> {
+    async fn verify_porep_signature(&self, proof: &PoRepProof) -> EgoResult<()> {
         if proof.dilithium_pk.is_empty() || proof.dilithium_sig.is_empty() {
-            return Err(RollupError::InvalidBatch(
+            return Err(EgoError::InvalidTransaction(
                 "Missing PoRep signature".to_string(),
             ));
         }
 
         let mut signing_data = Vec::new();
-        signing_data.extend_from_slice(b"ego/porep/proof/v1");
+        signing_data.extend_from_slice(DOMAIN_TAG_POREP_PROOF);
         signing_data.extend_from_slice(&proof.sector_id);
         signing_data.extend_from_slice(&proof.comm_r);
         signing_data.extend_from_slice(&proof.comm_d);
@@ -808,12 +900,12 @@ impl ProofRollupOperator {
             &data_hash,
             &proof.dilithium_sig,
         )
-        .map_err(|e| RollupError::InvalidBatch(format!("PoRep signature invalid: {}", e)))
+        .map_err(|e| EgoError::InvalidTransaction(format!("PoRep signature invalid: {}", e)))
         .and_then(|valid| {
             if valid {
                 Ok(())
             } else {
-                Err(RollupError::InvalidBatch(
+                Err(EgoError::InvalidTransaction(
                     "PoRep signature verification failed".to_string(),
                 ))
             }
@@ -837,16 +929,14 @@ impl ProofRollupOperator {
     pub async fn advance_epoch(&self) {
         let mut epoch = self.current_epoch.write().await;
         *epoch += 1;
-        info!("Advanced to epoch {}", *epoch);
     }
 
     pub async fn advance_window(&self) {
         let mut window = self.current_window.write().await;
         *window += 1;
-        info!("Advanced to window {}", *window);
     }
 
-    pub async fn prune_old_evidence(&self, retention_epochs: u64) -> RollupResult<usize> {
+    pub async fn prune_old_evidence(&self, retention_epochs: u64) -> EgoResult<usize> {
         let current_epoch = *self.current_epoch.read().await;
         let cutoff_epoch = current_epoch.saturating_sub(retention_epochs);
 
@@ -857,14 +947,48 @@ impl ProofRollupOperator {
 
         let pruned = before_count - bundles.len();
 
-        if pruned > 0 {
-            info!(
-                "Pruned {} old evidence bundles (cutoff epoch: {})",
-                pruned, cutoff_epoch
-            );
-        }
-
         Ok(pruned)
+    }
+
+    pub async fn create_rollup_transaction(
+        &self,
+        commitment: &ProofRollupCommit,
+        from: Address,
+        nonce: u64,
+        shard_id: ShardId,
+        chain_id: u32,
+    ) -> EgoResult<Transaction> {
+        let payload = TransactionPayload::RollupCommit {
+            rollup_id: hex::encode(commitment.rollup_id),
+            state_root: commitment.proofs_root,
+            tx_root: commitment.da_root,
+            proofs_root: commitment.proofs_root,
+            da_root: commitment.da_root,
+            tx_count: commitment.count_proofs,
+            block_range: (commitment.epoch, commitment.epoch),
+            epoch: commitment.epoch,
+            min_validity_proof: vec![],
+            fraud_proofs: vec![],
+            operator_signature: vec![],
+        };
+
+        let mut tx = Transaction::new(from, nonce, payload, shard_id, None, chain_id);
+
+        tx.sign(&self.keypair, false)?;
+
+        Ok(tx)
+    }
+
+    pub fn verify_commitment_signature(&self, commitment: &ProofRollupCommit) -> EgoResult<bool> {
+        let signing_data = self.create_commitment_signing_data(commitment)?;
+
+        let dilithium_pk = self.keypair.dilithium_public_key();
+
+        if let Some(ref dilithium_sig) = commitment.operator_sig.dilithium_sig {
+            ego_core::crypto::verify_signature(&dilithium_pk, &signing_data, dilithium_sig)
+        } else {
+            Ok(false)
+        }
     }
 }
 
@@ -889,16 +1013,22 @@ impl EvidenceBundle {
     pub fn is_cellular_safe(&self) -> bool {
         self.compressed_data.len() <= 512 * 1024
     }
+
+    pub fn verify_bundle_hash(&self) -> bool {
+        let computed_hash = ego_core::crypto::hash_data(&self.compressed_data);
+        computed_hash == self.bundle_id
+    }
+
+    pub fn decompress(&self) -> EgoResult<Vec<u8>> {
+        zstd::bulk::decompress(&self.compressed_data, self.original_size as usize)
+            .map_err(|e| EgoError::CryptoError(format!("Decompression failed: {}", e)))
+    }
 }
 
 impl ProofRollupCommit {
-    pub fn verify_signature(&self, operator_pk: &[u8]) -> RollupResult<bool> {
-        if self.operator_sig.is_empty() {
-            return Ok(false);
-        }
-
+    pub fn verify_signature(&self, operator_pk: &PublicKey) -> EgoResult<bool> {
         let mut data = Vec::new();
-        data.extend_from_slice(b"ego/proof-rollup/commit/v1");
+        data.extend_from_slice(DOMAIN_TAG_ROLLUP_COMMIT);
         data.extend_from_slice(&self.rollup_id);
         data.extend_from_slice(&self.region_id.to_le_bytes());
         data.extend_from_slice(&self.epoch.to_le_bytes());
@@ -911,8 +1041,29 @@ impl ProofRollupCommit {
 
         let data_hash = ego_core::crypto::blake2s_hash(&data);
 
-        ego_core::crypto::verify_dilithium_signature(operator_pk, &data_hash, &self.operator_sig)
-            .map_err(|e| RollupError::VerificationFailed(e.to_string()))
+        if let Some(ref dilithium_sig) = self.operator_sig.dilithium_sig {
+            ego_core::crypto::verify_signature(operator_pk, &data_hash, dilithium_sig)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.count_proofs > 0
+            && self.blob_bytes > 0
+            && self.proofs_root != Hash::ZERO
+            && self.da_root != Hash::ZERO
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "RollupCommit epoch={} window={} proofs={} size={}KB region={}",
+            self.epoch,
+            self.window_id,
+            self.count_proofs,
+            self.blob_bytes / 1024,
+            self.region_id
+        )
     }
 }
 
@@ -994,5 +1145,39 @@ mod tests {
         };
 
         assert!(bundle.is_cellular_safe());
+    }
+
+    #[tokio::test]
+    async fn test_commitment_signature() {
+        let config = create_test_config();
+        let rollup_id = [1u8; 16];
+        let keypair = KeyPair::generate();
+        let operator_addr = Address::from_public_key(&keypair.dilithium_public_key());
+
+        let operator =
+            ProofRollupOperator::new(config, rollup_id, 1, operator_addr, keypair).unwrap();
+
+        let mut commitment = ProofRollupCommit {
+            rollup_id,
+            region_id: 1,
+            epoch: 100,
+            window_id: 5,
+            proofs_root: Hash::ZERO,
+            da_root: Hash::ZERO,
+            count_proofs: 10,
+            blob_bytes: 1024,
+            min_validity_proof: MinValidityProof::InclusionOnly,
+            operator_addr,
+            operator_sig: DualSignature::new(None, None),
+            chain_id: 1,
+            network_id: 1,
+            created_at: Timestamp::now(),
+            commitment_hash: Hash::ZERO,
+        };
+
+        operator.sign_commitment(&mut commitment).unwrap();
+
+        let valid = operator.verify_commitment_signature(&commitment).unwrap();
+        assert!(valid);
     }
 }
