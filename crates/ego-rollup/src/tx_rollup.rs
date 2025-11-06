@@ -3,7 +3,7 @@ use crate::da::{DAChunk, DataAvailability};
 use crate::error::{RollupError, RollupResult};
 use crate::fraud::{FraudProof, FraudProofVerifier};
 use crate::types::{CommitmentStatus, RollupTransaction};
-use ego_core::{Address, Hash, Timestamp};
+use ego_core::{Address, Balance, Hash, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -28,6 +28,10 @@ pub struct TxRollupCommit {
     pub operator_addr: [u8; 20],
     pub operator_sig: Vec<u8>,
     pub created_at: Timestamp,
+    pub fraud_proof_window: u64,
+    pub proofs_root: Hash,
+    pub chain_id: u32,
+    pub network_id: u32,
 }
 
 #[derive(
@@ -52,6 +56,8 @@ pub struct TxRollupBatch {
     pub timestamp: Timestamp,
     pub tx_root: Hash,
     pub state_transitions: Vec<StateTransitionProof>,
+    pub ru_total: u64,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -72,7 +78,7 @@ pub struct TxRollupChallenge {
     pub submitted_at: Timestamp,
     pub deadline: Timestamp,
     pub status: ChallengeStatus,
-    pub bond_amount: u64,
+    pub bond_amount: Balance,
     pub evidence: Vec<u8>,
 }
 
@@ -152,6 +158,8 @@ pub struct TxRollupOperator {
     l1_block_number: Arc<RwLock<u64>>,
     da_chunk_cache: Arc<RwLock<HashMap<Hash, Vec<DAChunk>>>>,
     state_witness_cache: Arc<RwLock<HashMap<Hash, StateWitness>>>,
+    chain_id: u32,
+    network_id: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -172,6 +180,8 @@ pub struct TxRollupMetrics {
     pub avg_commitment_latency_ms: u64,
     pub da_chunks_generated: u64,
     pub state_witnesses_generated: u64,
+    pub total_ru_used: u64,
+    pub avg_ru_per_tx: u64,
 }
 
 impl TxRollupOperator {
@@ -180,6 +190,8 @@ impl TxRollupOperator {
         rollup_id: [u8; 16],
         region_id: u32,
         keypair: ego_core::crypto::KeyPair,
+        chain_id: u32,
+        network_id: u32,
     ) -> RollupResult<Self> {
         let operator_addr = Address::from_public_key(&keypair.dilithium_public_key());
 
@@ -213,6 +225,8 @@ impl TxRollupOperator {
             l1_block_number: Arc::new(RwLock::new(0)),
             da_chunk_cache: Arc::new(RwLock::new(HashMap::new())),
             state_witness_cache: Arc::new(RwLock::new(HashMap::new())),
+            chain_id,
+            network_id,
         })
     }
 
@@ -231,6 +245,15 @@ impl TxRollupOperator {
             return Err(RollupError::InvalidBatch(
                 "Dilithium signature required".to_string(),
             ));
+        }
+
+        if tx.inner.chain_id != self.chain_id {
+            let mut metrics = self.metrics.write().await;
+            metrics.transactions_failed += 1;
+            return Err(RollupError::InvalidBatch(format!(
+                "Chain ID mismatch: expected {}, got {}",
+                self.chain_id, tx.inner.chain_id
+            )));
         }
 
         let tx_hash = tx.hash();
@@ -286,6 +309,13 @@ impl TxRollupOperator {
         let batch_data = self.serialize_transactions(&transactions)?;
         let batch_id = ego_core::crypto::hash_data(&batch_data);
 
+        let ru_total: u64 = transactions
+            .iter()
+            .map(|tx| tx.inner.estimate_resource_units())
+            .sum();
+
+        let size_bytes = batch_data.len() as u64;
+
         let batch = TxRollupBatch {
             batch_id,
             rollup_id: self.rollup_id,
@@ -297,6 +327,8 @@ impl TxRollupOperator {
             timestamp: Timestamp::now(),
             tx_root,
             state_transitions,
+            ru_total,
+            size_bytes,
         };
 
         {
@@ -308,16 +340,22 @@ impl TxRollupOperator {
             let mut metrics = self.metrics.write().await;
             metrics.batches_created += 1;
             metrics.transactions_processed += batch.transactions.len() as u64;
+            metrics.total_ru_used += ru_total;
 
             if metrics.batches_created > 0 {
                 metrics.avg_batch_size = metrics.transactions_processed / metrics.batches_created;
             }
+
+            if metrics.transactions_processed > 0 {
+                metrics.avg_ru_per_tx = metrics.total_ru_used / metrics.transactions_processed;
+            }
         }
 
         info!(
-            "Built batch {} with {} transactions",
+            "Built batch {} with {} transactions, {} RU",
             batch_id,
-            batch.transactions.len()
+            batch.transactions.len(),
+            ru_total
         );
         Ok(batch)
     }
@@ -346,6 +384,8 @@ impl TxRollupOperator {
             cache.insert(batch.batch_id, state_witness);
         }
 
+        let proofs_root = self.compute_proofs_root(&batch);
+
         let mut commitment = TxRollupCommit {
             rollup_id: self.rollup_id,
             region_id: self.region_id,
@@ -363,6 +403,10 @@ impl TxRollupOperator {
             operator_addr: *self.operator_addr.as_bytes(),
             operator_sig: Vec::new(),
             created_at: Timestamp::now(),
+            fraud_proof_window: self.config.fraud_proofs.fraud_proof_window_blocks,
+            proofs_root,
+            chain_id: self.chain_id,
+            network_id: self.network_id,
         };
 
         self.sign_commitment(&mut commitment)?;
@@ -735,6 +779,26 @@ impl TxRollupOperator {
         merkle_tree.root_hash().unwrap_or(Hash::ZERO)
     }
 
+    fn compute_proofs_root(&self, batch: &TxRollupBatch) -> Hash {
+        if batch.state_transitions.is_empty() {
+            return Hash::ZERO;
+        }
+
+        let config = bincode::config::standard();
+        let proof_hashes: Vec<Vec<u8>> = batch
+            .state_transitions
+            .iter()
+            .filter_map(|st| bincode::encode_to_vec(st, config).ok())
+            .collect();
+
+        if proof_hashes.is_empty() {
+            return Hash::ZERO;
+        }
+
+        let merkle_tree = ego_core::crypto::MerkleTree::build(proof_hashes);
+        merkle_tree.root_hash().unwrap_or(Hash::ZERO)
+    }
+
     async fn generate_state_witness(&self, batch: &TxRollupBatch) -> RollupResult<StateWitness> {
         let transaction_hashes: Vec<Hash> = batch.transactions.iter().map(|tx| tx.hash()).collect();
 
@@ -838,9 +902,12 @@ impl TxRollupOperator {
         data.extend_from_slice(commitment.tx_root.as_bytes());
         data.extend_from_slice(commitment.state_root.as_bytes());
         data.extend_from_slice(commitment.da_root.as_bytes());
+        data.extend_from_slice(commitment.proofs_root.as_bytes());
         data.extend_from_slice(&commitment.count_tx.to_le_bytes());
         data.extend_from_slice(&commitment.block_range_start.to_le_bytes());
         data.extend_from_slice(&commitment.block_range_end.to_le_bytes());
+        data.extend_from_slice(&commitment.chain_id.to_le_bytes());
+        data.extend_from_slice(&commitment.network_id.to_le_bytes());
 
         Ok(ego_core::crypto::blake2s_hash(&data))
     }
@@ -963,6 +1030,22 @@ impl TxRollupOperator {
         info!("Cleaned up {} old data entries", cleaned);
         cleaned
     }
+
+    pub fn get_chain_id(&self) -> u32 {
+        self.chain_id
+    }
+
+    pub fn get_network_id(&self) -> u32 {
+        self.network_id
+    }
+
+    pub fn get_rollup_id(&self) -> [u8; 16] {
+        self.rollup_id
+    }
+
+    pub fn get_operator_address(&self) -> Address {
+        self.operator_addr
+    }
 }
 
 impl TxRollupCommit {
@@ -981,9 +1064,12 @@ impl TxRollupCommit {
         data.extend_from_slice(self.tx_root.as_bytes());
         data.extend_from_slice(self.state_root.as_bytes());
         data.extend_from_slice(self.da_root.as_bytes());
+        data.extend_from_slice(self.proofs_root.as_bytes());
         data.extend_from_slice(&self.count_tx.to_le_bytes());
         data.extend_from_slice(&self.block_range_start.to_le_bytes());
         data.extend_from_slice(&self.block_range_end.to_le_bytes());
+        data.extend_from_slice(&self.chain_id.to_le_bytes());
+        data.extend_from_slice(&self.network_id.to_le_bytes());
 
         let signing_data = ego_core::crypto::blake2s_hash(&data);
 
@@ -1037,13 +1123,21 @@ impl TxRollupBatch {
 impl InclusionProof {
     pub fn verify(&self) -> bool {
         if self.merkle_path.is_empty() {
-            return false;
+            return self.tx_hash == self.root;
         }
 
         let mut current = self.tx_hash;
+        let mut index = self.leaf_index;
 
         for sibling in &self.merkle_path {
-            current = ego_core::crypto::hash_multiple(&[current.as_bytes(), sibling.as_bytes()]);
+            if index % 2 == 0 {
+                current =
+                    ego_core::crypto::hash_multiple(&[current.as_bytes(), sibling.as_bytes()]);
+            } else {
+                current =
+                    ego_core::crypto::hash_multiple(&[sibling.as_bytes(), current.as_bytes()]);
+            }
+            index /= 2;
         }
 
         current == self.root
@@ -1084,9 +1178,11 @@ mod tests {
         let region_id = 1;
         let keypair = ego_core::crypto::KeyPair::generate();
 
-        let operator = TxRollupOperator::new(config, rollup_id, region_id, keypair).unwrap();
+        let operator = TxRollupOperator::new(config, rollup_id, region_id, keypair, 1, 1).unwrap();
         assert_eq!(operator.rollup_id, rollup_id);
         assert_eq!(operator.region_id, region_id);
+        assert_eq!(operator.chain_id, 1);
+        assert_eq!(operator.network_id, 1);
     }
 
     #[tokio::test]
@@ -1095,7 +1191,7 @@ mod tests {
         let rollup_id = [1u8; 16];
         let keypair = ego_core::crypto::KeyPair::generate();
 
-        let operator = TxRollupOperator::new(config, rollup_id, 1, keypair).unwrap();
+        let operator = TxRollupOperator::new(config, rollup_id, 1, keypair, 1, 1).unwrap();
 
         let tx = create_test_transaction();
         let hash = operator.submit_transaction(tx).await.unwrap();
@@ -1114,7 +1210,7 @@ mod tests {
         let rollup_id = [1u8; 16];
         let keypair = ego_core::crypto::KeyPair::generate();
 
-        let operator = TxRollupOperator::new(config, rollup_id, 1, keypair).unwrap();
+        let operator = TxRollupOperator::new(config, rollup_id, 1, keypair, 1, 1).unwrap();
 
         for _ in 0..5 {
             let tx = create_test_transaction();
@@ -1124,6 +1220,7 @@ mod tests {
         let batch = operator.build_batch(10).await.unwrap();
         assert_eq!(batch.transactions.len(), 5);
         assert!(batch.validate().is_ok());
+        assert!(batch.ru_total > 0);
 
         let metrics = operator.get_metrics().await;
         assert_eq!(metrics.batches_created, 1);
@@ -1136,7 +1233,7 @@ mod tests {
         let rollup_id = [1u8; 16];
         let keypair = ego_core::crypto::KeyPair::generate();
 
-        let operator = TxRollupOperator::new(config, rollup_id, 1, keypair).unwrap();
+        let operator = TxRollupOperator::new(config, rollup_id, 1, keypair, 1, 1).unwrap();
 
         for _ in 0..3 {
             let tx = create_test_transaction();
@@ -1175,7 +1272,7 @@ mod tests {
         let rollup_id = [1u8; 16];
         let keypair = ego_core::crypto::KeyPair::generate();
 
-        let operator = TxRollupOperator::new(config, rollup_id, 1, keypair).unwrap();
+        let operator = TxRollupOperator::new(config, rollup_id, 1, keypair, 1, 1).unwrap();
 
         for _ in 0..2 {
             let tx = create_test_transaction();
@@ -1194,7 +1291,7 @@ mod tests {
             submitted_at: Timestamp::now(),
             deadline: Timestamp::from_millis(Timestamp::now().as_millis() + 86400000),
             status: ChallengeStatus::Pending,
-            bond_amount: 1000,
+            bond_amount: Balance::from_egoc(1000),
             evidence: vec![],
         };
 
@@ -1203,5 +1300,29 @@ mod tests {
         let metrics = operator.get_metrics().await;
         assert_eq!(metrics.challenges_received, 1);
         assert_eq!(metrics.challenges_defended, 1);
+    }
+
+    #[tokio::test]
+    async fn test_commitment_signature_verification() {
+        let config = create_test_config();
+        let rollup_id = [1u8; 16];
+        let keypair = ego_core::crypto::KeyPair::generate();
+
+        let operator = TxRollupOperator::new(config, rollup_id, 1, keypair.clone(), 1, 1).unwrap();
+
+        for _ in 0..2 {
+            let tx = create_test_transaction();
+            operator.submit_transaction(tx).await.unwrap();
+        }
+
+        let batch = operator.build_batch(10).await.unwrap();
+        let commitment_hash = operator.post_commitment(batch).await.unwrap();
+
+        let commitment_opt = operator.get_commitment(commitment_hash).await;
+        assert!(commitment_opt.is_some());
+
+        let (commitment, _) = commitment_opt.unwrap();
+        let pubkey = keypair.dilithium_public_key();
+        assert!(commitment.verify_signature(&pubkey).unwrap());
     }
 }
