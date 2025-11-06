@@ -1,5 +1,5 @@
 use crate::commitment::RollupCommitment;
-use crate::da::{DAChunk, DataAvailability};
+use crate::da::DataAvailability;
 use crate::error::{RollupError, RollupResult};
 use crate::fraud::{FraudProof, FraudProofVerifier, RollupFraudType};
 use crate::state::RollupState;
@@ -480,7 +480,7 @@ impl RollupVerifier {
                 .copied()
                 .unwrap_or(Hash::ZERO);
 
-            let mut temp_state = RollupState::new();
+            let mut temp_state = RollupState::new(self.chain_id, self.network_id);
             temp_state.set_state_root(state_root);
 
             let result = self
@@ -1155,7 +1155,7 @@ mod tests {
     async fn test_commitment_verification() {
         let mut verifier = create_test_verifier();
         let commitment = create_test_commitment();
-        let state = RollupState::new();
+        let state = RollupState::new(1, 1);
         let transactions = vec![create_test_transaction()];
 
         verifier.register_operator_pubkey(
@@ -1188,7 +1188,7 @@ mod tests {
     async fn test_verification_caching() {
         let mut verifier = create_test_verifier();
         let commitment = create_test_commitment();
-        let state = RollupState::new();
+        let state = RollupState::new(1, 1);
         let transactions = vec![create_test_transaction()];
 
         verifier.register_operator_pubkey(
