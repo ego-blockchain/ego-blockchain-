@@ -1,6 +1,6 @@
-use crate::batch::RollupBatch;
 use crate::da::{DAChunk, DataAvailability};
 use crate::error::{RollupError, RollupResult};
+use crate::operator::RollupBatch;
 use crate::types::{ChallengeStatus, CommitmentStatus};
 use ego_core::{Address, DualSignature, EpochNumber, Hash, PROTOCOL_VERSION, PublicKey, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -101,7 +101,7 @@ impl RollupCommitment {
         let commitment_hash = Self::compute_commitment_hash(
             &operator,
             &batch.prev_state_root,
-            &batch.post_state_root,
+            &batch.new_state_root,
             &tx_root,
             &da_root,
             l1_block_number,
@@ -114,7 +114,7 @@ impl RollupCommitment {
             commitment_hash,
             operator,
             rollup_id,
-            state_root: batch.post_state_root,
+            state_root: batch.new_state_root,
             previous_state_root: batch.prev_state_root,
             tx_root,
             da_root,
@@ -138,8 +138,6 @@ impl RollupCommitment {
     }
 
     pub fn from_batch(batch: &RollupBatch, fraud_proof_window: u64) -> RollupResult<Self> {
-        batch.validate()?;
-
         let da_root = Hash::ZERO;
         let proofs_root = Hash::ZERO;
 
