@@ -12,7 +12,7 @@ pub mod tx_rollup;
 pub mod types;
 pub mod verifier;
 
-pub use batch::{BatchBuilder, BatchProcessor, RollupBatch};
+pub use batch::{BatchConfig, BatchManager, CommittedBatch, FinalizedBatch, PendingBatch};
 pub use commitment::{CommitmentManager, RollupCommit, RollupCommitment};
 pub use config::RollupConfig;
 pub use da::{DAChunk, DAProof, DAUnavailabilityProof, DataAvailability};
@@ -53,7 +53,7 @@ pub const DEFAULT_MAX_COMMIT_SIZE: u32 = 10000;
 
 #[async_trait::async_trait]
 pub trait RollupSystem: Send + Sync {
-    async fn submit_batch(&mut self, batch: RollupBatch) -> RollupResult<Hash>;
+    async fn submit_batch(&mut self, batch: crate::operator::RollupBatch) -> RollupResult<Hash>;
     async fn post_commitment(&mut self, commitment: RollupCommitment) -> RollupResult<Hash>;
     async fn challenge_commitment(&mut self, proof: FraudProof) -> RollupResult<Hash>;
     async fn sample_da(
