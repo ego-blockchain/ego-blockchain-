@@ -22,7 +22,7 @@ pub enum RollupError {
     #[error("Challenge period expired")]
     ChallengePeriodExpired,
     #[error("Insufficient bond: required {required}, available {available}")]
-    InsufficientBond { required: u64, available: u64 },
+    InsufficientBond { required: u128, available: u128 },
     #[error("Rate limit exceeded: {operation}")]
     RateLimitExceeded { operation: String },
     #[error("Serialization error: {0}")]
@@ -39,6 +39,8 @@ pub enum RollupError {
     CoreError(#[from] ego_core::EgoError),
     #[error("Consensus error: {0}")]
     ConsensusError(String),
+    #[error("Invalid challenge: {0}")]
+    InvalidChallenge(String),
 }
 
 impl From<bincode::error::EncodeError> for RollupError {
