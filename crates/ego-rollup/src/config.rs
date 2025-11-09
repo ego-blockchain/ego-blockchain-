@@ -287,6 +287,10 @@ pub struct StorageConfig {
     pub keep_headers_forever: bool,
     pub keep_qcs_forever: bool,
     pub ipfs_overlay_enabled: bool,
+    pub prune_old_bodies: bool,
+    pub prune_old_receipts: bool,
+    pub prune_old_events: bool,
+    pub prune_expired_storage: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -328,6 +332,8 @@ pub struct ShardingConfig {
     pub enable_global_finality: bool,
     pub finality_committee_size: u32,
     pub shard_mapping_strategy: ShardMappingStrategy,
+    pub max_cross_shard_receipts_per_epoch: usize,
+    pub receipt_deadline_epochs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,26 +373,37 @@ pub struct ProofsConfig {
     pub proof_compression_enabled: bool,
     pub enable_co_beacon: bool,
     pub fake_poc_mode: bool,
+    pub windows_per_day: u32,
+    pub challenges_per_sector: u32,
+    pub sectors_per_partition: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DRSConfig {
     pub enabled: bool,
     pub calculation_epoch_interval: u64,
-    pub uptime_weight: f64,
-    pub post_latency_weight: f64,
-    pub post_pass_rate_weight: f64,
-    pub poc_quality_weight: f64,
-    pub serve_ratio_weight: f64,
-    pub density_penalty_weight: f64,
-    pub multiplier_min: f64,
-    pub multiplier_max: f64,
+    pub w_uptime: f64,
+    pub w_post_pass: f64,
+    pub w_inv_latency: f64,
+    pub w_poc: f64,
+    pub w_serve: f64,
+    pub a1_failed_post: f64,
+    pub a2_replay_incoherence: f64,
+    pub a3_equivocation: f64,
+    pub p_max: f64,
+    pub sla_ms: u64,
+    pub smoothing_alpha: f64,
+    pub multiplier_slope_beta: f64,
+    pub m_min: f64,
+    pub m_max: f64,
+    pub density_penalty_rate: f64,
+    pub density_min_multiplier: f64,
+    pub high_band_threshold: f64,
+    pub mid_band_threshold: f64,
     pub weights_version: u32,
     pub enable_puc: bool,
     pub puc_coefficient_range: (f64, f64),
     pub puc_metrics: PUCMetrics,
-    pub density_penalty_per_device: f64,
-    pub density_penalty_min_multiplier: f64,
     pub density_penalty_h3_resolution: u8,
     pub density_dwell_threshold_percentage: u8,
 }
@@ -424,6 +441,8 @@ pub struct EconomicsConfig {
     pub ru_metering_enabled: bool,
     pub pob_floor_min: u64,
     pub storage_credit_to_byte_months: u64,
+    pub min_validator_stake: u128,
+    pub min_storage_collateral: u128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,19 +465,38 @@ pub struct CellularConfig {
     pub enable_internet_sharing: bool,
     pub sharing_rate_limit_mbps: u32,
     pub sharing_pricing_per_gb: Balance,
+    pub proof_rate_hz: f64,
+    pub proof_batch_size: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeployPolicyConfig {
     pub enabled: bool,
-    pub free_staker_quota_per_epoch: u32,
-    pub pob_deploy_credits_per_kb: u64,
-    pub pob_deploy_credits_per_ru: u64,
-    pub deploy_bond_required: bool,
+    pub free_deploys_per_epoch: u32,
+    pub min_stake_for_quota: Balance,
+    pub credits_per_kb: u64,
+    pub credits_per_ru: u64,
+    pub max_deploy_size_kb: u32,
+    pub max_ru_per_deploy: u64,
     pub deploy_bond_amount: Balance,
-    pub deploy_bond_anti_spam: bool,
-    pub hard_cap_deploys_per_epoch: u32,
-    pub enable_deduplication: bool,
+    pub bond_lock_duration_blocks: u64,
+    pub bond_slash_threshold: u32,
+    pub max_deploys_per_epoch: u32,
+    pub max_deploys_per_user_per_epoch: u32,
+    pub max_total_size_per_epoch_gb: u32,
+    pub enable_dedup: bool,
+    pub dedup_lookback_epochs: u64,
+    pub pob_floor_enabled: bool,
+    pub pob_floor_per_kb: u64,
+    pub pob_floor_per_ru: u64,
+    pub anti_spam_enabled: bool,
+    pub max_deploys_per_hour: u32,
+    pub max_deploys_per_day: u32,
+    pub min_deploy_interval_seconds: u64,
+    pub human_verification_required: bool,
+    pub ai_pattern_detection_enabled: bool,
+    pub emergency_mode: bool,
+    pub whitelist_only_mode: bool,
     pub code_hash_cache_size: usize,
 }
 
@@ -858,6 +896,10 @@ impl Default for StorageConfig {
             keep_headers_forever: true,
             keep_qcs_forever: true,
             ipfs_overlay_enabled: true,
+            prune_old_bodies: true,
+            prune_old_receipts: true,
+            prune_old_events: true,
+            prune_expired_storage: true,
         }
     }
 }
@@ -890,6 +932,8 @@ impl Default for ShardingConfig {
             enable_global_finality: true,
             finality_committee_size: 64,
             shard_mapping_strategy: ShardMappingStrategy::PrefixBased,
+            max_cross_shard_receipts_per_epoch: 100_000,
+            receipt_deadline_epochs: 100,
         }
     }
 }
@@ -925,6 +969,9 @@ impl Default for ProofsConfig {
             proof_compression_enabled: true,
             enable_co_beacon: true,
             fake_poc_mode: true,
+            windows_per_day: 48,
+            challenges_per_sector: 24,
+            sectors_per_partition: 2349,
         }
     }
 }
@@ -934,20 +981,28 @@ impl Default for DRSConfig {
         Self {
             enabled: true,
             calculation_epoch_interval: 1,
-            uptime_weight: 0.2,
-            post_latency_weight: 0.2,
-            post_pass_rate_weight: 0.2,
-            poc_quality_weight: 0.2,
-            serve_ratio_weight: 0.1,
-            density_penalty_weight: 0.1,
-            multiplier_min: 0.7,
-            multiplier_max: 1.3,
+            w_uptime: 0.20,
+            w_post_pass: 0.40,
+            w_inv_latency: 0.10,
+            w_poc: 0.20,
+            w_serve: 0.10,
+            a1_failed_post: 0.10,
+            a2_replay_incoherence: 0.20,
+            a3_equivocation: 0.40,
+            p_max: 0.5,
+            sla_ms: 600_000,
+            smoothing_alpha: 0.3,
+            multiplier_slope_beta: 0.6,
+            m_min: 0.7,
+            m_max: 1.3,
+            density_penalty_rate: 0.10,
+            density_min_multiplier: 0.40,
+            high_band_threshold: 0.8,
+            mid_band_threshold: 0.5,
             weights_version: 1,
             enable_puc: false,
             puc_coefficient_range: (0.8, 1.2),
             puc_metrics: PUCMetrics::default(),
-            density_penalty_per_device: 0.1,
-            density_penalty_min_multiplier: 0.4,
             density_penalty_h3_resolution: 12,
             density_dwell_threshold_percentage: 10,
         }
@@ -991,6 +1046,8 @@ impl Default for EconomicsConfig {
             ru_metering_enabled: true,
             pob_floor_min: 1000,
             storage_credit_to_byte_months: 1000,
+            min_validator_stake: 100_000_000_000,
+            min_storage_collateral: 10_000_000_000,
         }
     }
 }
@@ -1016,6 +1073,8 @@ impl Default for CellularConfig {
             enable_internet_sharing: false,
             sharing_rate_limit_mbps: 50,
             sharing_pricing_per_gb: Balance::new(500_000_000_000_000),
+            proof_rate_hz: 0.5,
+            proof_batch_size: 100,
         }
     }
 }
@@ -1024,14 +1083,31 @@ impl Default for DeployPolicyConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            free_staker_quota_per_epoch: 5,
-            pob_deploy_credits_per_kb: 100,
-            pob_deploy_credits_per_ru: 1,
-            deploy_bond_required: true,
-            deploy_bond_amount: Balance::new(1_000_000_000_000_000),
-            deploy_bond_anti_spam: true,
-            hard_cap_deploys_per_epoch: 10000,
-            enable_deduplication: true,
+            free_deploys_per_epoch: 5,
+            min_stake_for_quota: Balance::from_egoc(1000),
+            credits_per_kb: 100,
+            credits_per_ru: 10,
+            max_deploy_size_kb: 1024,
+            max_ru_per_deploy: 10000,
+            deploy_bond_amount: Balance::new(1000000),
+            bond_lock_duration_blocks: 1000,
+            bond_slash_threshold: 3,
+            max_deploys_per_epoch: 10000,
+            max_deploys_per_user_per_epoch: 50,
+            max_total_size_per_epoch_gb: 100,
+            enable_dedup: true,
+            dedup_lookback_epochs: 10,
+            pob_floor_enabled: false,
+            pob_floor_per_kb: 50,
+            pob_floor_per_ru: 5,
+            anti_spam_enabled: true,
+            max_deploys_per_hour: 10,
+            max_deploys_per_day: 50,
+            min_deploy_interval_seconds: 60,
+            human_verification_required: false,
+            ai_pattern_detection_enabled: true,
+            emergency_mode: false,
+            whitelist_only_mode: false,
             code_hash_cache_size: 1000,
         }
     }
@@ -1399,6 +1475,14 @@ impl RollupConfig {
                         .to_string(),
                 );
             }
+
+            if self.sharding.max_cross_shard_receipts_per_epoch == 0 {
+                return Err("Max cross-shard receipts per epoch must be > 0".to_string());
+            }
+
+            if self.sharding.receipt_deadline_epochs == 0 {
+                return Err("Receipt deadline epochs must be > 0".to_string());
+            }
         }
 
         Ok(())
@@ -1420,6 +1504,18 @@ impl RollupConfig {
 
             if self.proofs.post_partition_size == 0 {
                 return Err("PoSt partition size must be > 0".to_string());
+            }
+
+            if self.proofs.windows_per_day == 0 {
+                return Err("PoSt windows per day must be > 0".to_string());
+            }
+
+            if self.proofs.challenges_per_sector == 0 {
+                return Err("PoSt challenges per sector must be > 0".to_string());
+            }
+
+            if self.proofs.sectors_per_partition == 0 {
+                return Err("PoSt sectors per partition must be > 0".to_string());
             }
         }
 
@@ -1469,22 +1565,21 @@ impl RollupConfig {
 
     fn validate_drs(&self) -> Result<(), String> {
         if self.drs.enabled {
-            let total_weight = self.drs.uptime_weight
-                + self.drs.post_latency_weight
-                + self.drs.post_pass_rate_weight
-                + self.drs.poc_quality_weight
-                + self.drs.serve_ratio_weight
-                + self.drs.density_penalty_weight;
+            let total_weight = self.drs.w_uptime
+                + self.drs.w_post_pass
+                + self.drs.w_inv_latency
+                + self.drs.w_poc
+                + self.drs.w_serve;
 
             if (total_weight - 1.0).abs() > 0.001 {
                 return Err("DRS weights must sum to 1.0".to_string());
             }
 
-            if self.drs.multiplier_min > self.drs.multiplier_max {
+            if self.drs.m_min > self.drs.m_max {
                 return Err("DRS multiplier min cannot exceed max".to_string());
             }
 
-            if self.drs.multiplier_min <= 0.0 {
+            if self.drs.m_min <= 0.0 {
                 return Err("DRS multiplier min must be > 0".to_string());
             }
 
@@ -1509,17 +1604,19 @@ impl RollupConfig {
                 }
             }
 
-            if self.drs.density_penalty_per_device < 0.0
-                || self.drs.density_penalty_per_device > 1.0
-            {
-                return Err("Density penalty per device must be between 0.0 and 1.0".to_string());
+            if self.drs.density_penalty_rate < 0.0 || self.drs.density_penalty_rate > 1.0 {
+                return Err("Density penalty rate must be between 0.0 and 1.0".to_string());
             }
 
-            if self.drs.density_penalty_min_multiplier < 0.0
-                || self.drs.density_penalty_min_multiplier > 1.0
-            {
+            if self.drs.density_min_multiplier < 0.0 || self.drs.density_min_multiplier > 1.0 {
                 return Err(
                     "Density penalty min multiplier must be between 0.0 and 1.0".to_string()
+                );
+            }
+
+            if self.drs.high_band_threshold <= self.drs.mid_band_threshold {
+                return Err(
+                    "DRS high band threshold must be greater than mid band threshold".to_string(),
                 );
             }
         }
@@ -1571,6 +1668,14 @@ impl RollupConfig {
             }
         }
 
+        if self.economics.min_validator_stake == 0 {
+            return Err("Min validator stake must be > 0".to_string());
+        }
+
+        if self.economics.min_storage_collateral == 0 {
+            return Err("Min storage collateral must be > 0".to_string());
+        }
+
         Ok(())
     }
 
@@ -1606,6 +1711,14 @@ impl RollupConfig {
                     "Sharing rate limit must be > 0 when internet sharing is enabled".to_string(),
                 );
             }
+
+            if self.cellular.proof_rate_hz <= 0.0 {
+                return Err("Proof rate Hz must be > 0".to_string());
+            }
+
+            if self.cellular.proof_batch_size == 0 {
+                return Err("Proof batch size must be > 0".to_string());
+            }
         }
 
         Ok(())
@@ -1613,30 +1726,44 @@ impl RollupConfig {
 
     fn validate_deploy_policy(&self) -> Result<(), String> {
         if self.deploy_policy.enabled {
-            if self.deploy_policy.pob_deploy_credits_per_kb == 0 {
-                return Err("PoB deploy credits per KB must be > 0".to_string());
+            if self.deploy_policy.credits_per_kb == 0 {
+                return Err("Deploy credits per KB must be > 0".to_string());
             }
 
-            if self.deploy_policy.pob_deploy_credits_per_ru == 0 {
-                return Err("PoB deploy credits per RU must be > 0".to_string());
+            if self.deploy_policy.credits_per_ru == 0 {
+                return Err("Deploy credits per RU must be > 0".to_string());
             }
 
-            if self.deploy_policy.deploy_bond_required
-                && self.deploy_policy.deploy_bond_amount.as_u128() == 0
-            {
-                return Err("Deploy bond amount must be > 0 when required".to_string());
+            if self.deploy_policy.max_deploy_size_kb == 0 {
+                return Err("Max deploy size must be > 0".to_string());
             }
 
-            if self.deploy_policy.hard_cap_deploys_per_epoch == 0 {
+            if self.deploy_policy.max_ru_per_deploy == 0 {
+                return Err("Max RU per deploy must be > 0".to_string());
+            }
+
+            if self.deploy_policy.max_deploys_per_epoch == 0 {
                 return Err("Hard cap deploys per epoch must be > 0".to_string());
             }
 
-            if self.deploy_policy.enable_deduplication
-                && self.deploy_policy.code_hash_cache_size == 0
-            {
+            if self.deploy_policy.enable_dedup && self.deploy_policy.code_hash_cache_size == 0 {
                 return Err(
                     "Code hash cache size must be > 0 when deduplication is enabled".to_string(),
                 );
+            }
+
+            if self.deploy_policy.bond_slash_threshold == 0 {
+                return Err("Bond slash threshold must be > 0".to_string());
+            }
+
+            if self.deploy_policy.anti_spam_enabled {
+                if self.deploy_policy.max_deploys_per_hour == 0 {
+                    return Err("Max deploys per hour must be > 0".to_string());
+                }
+
+                if self.deploy_policy.max_deploys_per_day == 0 {
+                    return Err("Max deploys per day must be > 0".to_string());
+                }
             }
         }
 
@@ -1687,6 +1814,181 @@ impl RollupConfig {
         std::fs::write(path, content).map_err(|e| format!("Failed to write config file: {}", e))?;
 
         Ok(())
+    }
+
+    pub fn to_shard_config(&self, shard_id: ShardId) -> ego_core::shard::ShardConfig {
+        ego_core::shard::ShardConfig {
+            shard_id,
+            committee_size: self.sharding.finality_committee_size,
+            replication_factor: self.da.replication_factor,
+            max_txs_per_block: self.operator.max_batch_size,
+            target_block_time_ms: (self.operator.commit_frequency_secs * 1000
+                / self.sharding.num_shards.max(1) as u64),
+            micro_slot_duration_ms: self.five_g.micro_slot_duration_ms as u64,
+            epoch_duration_blocks: 12_000,
+            cross_shard_enabled: self.sharding.cross_shard_enabled,
+            storage_config: self.to_shard_storage_config(),
+            preferred_slices: vec![],
+            geo_constraints: None,
+            pob_config: self.to_pob_config(),
+            drs_config: self.to_shard_drs_config(),
+            cellular_safe_config: self.to_cellular_safe_config(),
+            pq_transition_config: self.to_pq_transition_config(),
+        }
+    }
+
+    pub fn to_shard_storage_config(&self) -> ego_core::shard::ShardStorageConfig {
+        ego_core::shard::ShardStorageConfig {
+            max_storage_per_node: self.storage.max_storage_gb * 1024 * 1024 * 1024,
+            proof_frequency: self.proofs.post_frequency_epochs,
+            retention_period: self.storage.keep_epochs,
+            erasure_coding: ego_core::shard::ErasureCodingConfig {
+                data_chunks: self.da.k as u8,
+                parity_chunks: self.da.m as u8,
+                chunk_size: self.da.chunk_size as u32,
+                codec: "ReedSolomon".to_string(),
+            },
+            gc_config: ego_core::shard::GarbageCollectionConfig {
+                frequency: self.storage.prune_interval_epochs,
+                threshold: 0.8,
+                aggressive_mode: false,
+                prune_old_bodies: self.storage.prune_old_bodies,
+                prune_old_receipts: self.storage.prune_old_receipts,
+                prune_old_events: self.storage.prune_old_events,
+            },
+            porep_params: ego_core::shard::PoRepParams {
+                sector_size: (self.proofs.porep_sector_size_gib as u64) * 1024 * 1024 * 1024,
+                layers: self.proofs.porep_stacked_drg_layers,
+                base_degree: self.proofs.porep_base_degree,
+                tree_arity: self.proofs.porep_merkle_tree_arity,
+                params_version: self.proofs.porep_params_version,
+            },
+            post_params: ego_core::shard::PoStParams {
+                windows_per_day: self.proofs.windows_per_day,
+                challenges_per_sector: self.proofs.challenges_per_sector,
+                sla_ms: self.proofs.post_sla_ms,
+                sectors_per_partition: self.proofs.sectors_per_partition,
+                enable_aggregation: self.proofs.proof_aggregation_enabled,
+            },
+        }
+    }
+
+    pub fn to_pob_config(&self) -> ego_core::shard::PoBConfig {
+        ego_core::shard::PoBConfig {
+            enabled: self.economics.pob_burn_enabled,
+            storage_credit_price: self.economics.storage_credits_rate,
+            deploy_credit_price: self.economics.deploy_credits_rate,
+            burn_address: Address::new([0u8; 20]),
+            floors_enabled: self.deploy_policy.pob_floor_enabled,
+        }
+    }
+
+    pub fn to_shard_drs_config(&self) -> ego_core::shard::DRSConfig {
+        ego_core::shard::DRSConfig {
+            weight_uptime: self.drs.w_uptime,
+            weight_post_pass: self.drs.w_post_pass,
+            weight_inv_latency: self.drs.w_inv_latency,
+            weight_poc: self.drs.w_poc,
+            weight_serve: self.drs.w_serve,
+            penalty_failed_post: self.drs.a1_failed_post,
+            penalty_replay: self.drs.a2_replay_incoherence,
+            penalty_equivocation: self.drs.a3_equivocation,
+            penalty_max: self.drs.p_max,
+            smoothing_alpha: self.drs.smoothing_alpha,
+            multiplier_slope: self.drs.multiplier_slope_beta,
+            multiplier_min: self.drs.m_min,
+            multiplier_max: self.drs.m_max,
+            post_sla_ms: self.drs.sla_ms,
+        }
+    }
+
+    pub fn to_cellular_safe_config(&self) -> ego_core::shard::CellularSafeConfig {
+        ego_core::shard::CellularSafeConfig {
+            enabled: self.cellular.enabled && self.cellular.safe_mode_default,
+            max_monthly_data_gb: self.cellular.max_monthly_usage_gb,
+            wifi_only_operations: self.five_g.wifi_only_operations.clone(),
+            throttle_threshold_gb: self.cellular.throttle_threshold_gb,
+            proof_rate_hz: self.cellular.proof_rate_hz,
+            proof_batch_size: self.cellular.proof_batch_size,
+        }
+    }
+
+    pub fn to_pq_transition_config(&self) -> ego_core::shard::PQTransitionConfig {
+        ego_core::shard::PQTransitionConfig {
+            transition_epoch: 0,
+            migration_period_epochs: 1000,
+            pq_only_required: self.security.pq_only_mode,
+            supported_algorithms: self.security.supported_algorithms.clone(),
+            legacy_deadline_epoch: self.security.legacy_support_end_epoch,
+        }
+    }
+
+    pub fn to_deploy_policy_manager_config(&self) -> ego_core::deploy_policy::DeployPolicyConfig {
+        ego_core::deploy_policy::DeployPolicyConfig {
+            free_deploys_per_epoch: self.deploy_policy.free_deploys_per_epoch,
+            min_stake_for_quota: self.deploy_policy.min_stake_for_quota,
+            credits_per_kb: self.deploy_policy.credits_per_kb,
+            credits_per_ru: self.deploy_policy.credits_per_ru,
+            max_deploy_size_kb: self.deploy_policy.max_deploy_size_kb,
+            max_ru_per_deploy: self.deploy_policy.max_ru_per_deploy,
+            deploy_bond_amount: self.deploy_policy.deploy_bond_amount,
+            bond_lock_duration_blocks: self.deploy_policy.bond_lock_duration_blocks,
+            bond_slash_threshold: self.deploy_policy.bond_slash_threshold,
+            max_deploys_per_epoch: self.deploy_policy.max_deploys_per_epoch,
+            max_deploys_per_user_per_epoch: self.deploy_policy.max_deploys_per_user_per_epoch,
+            max_total_size_per_epoch_gb: self.deploy_policy.max_total_size_per_epoch_gb,
+            enable_dedup: self.deploy_policy.enable_dedup,
+            dedup_lookback_epochs: self.deploy_policy.dedup_lookback_epochs,
+            pob_floor_enabled: self.deploy_policy.pob_floor_enabled,
+            pob_floor_per_kb: self.deploy_policy.pob_floor_per_kb,
+            pob_floor_per_ru: self.deploy_policy.pob_floor_per_ru,
+            anti_spam_enabled: self.deploy_policy.anti_spam_enabled,
+            max_deploys_per_hour: self.deploy_policy.max_deploys_per_hour,
+            max_deploys_per_day: self.deploy_policy.max_deploys_per_day,
+            min_deploy_interval_seconds: self.deploy_policy.min_deploy_interval_seconds,
+            human_verification_required: self.deploy_policy.human_verification_required,
+            ai_pattern_detection_enabled: self.deploy_policy.ai_pattern_detection_enabled,
+            emergency_mode: self.deploy_policy.emergency_mode,
+            whitelist_only_mode: self.deploy_policy.whitelist_only_mode,
+        }
+    }
+
+    pub fn to_drs_config(&self) -> ego_core::drs::DRSConfig {
+        ego_core::drs::DRSConfig {
+            w_uptime: self.drs.w_uptime,
+            w_post_pass: self.drs.w_post_pass,
+            w_inv_latency: self.drs.w_inv_latency,
+            w_poc: self.drs.w_poc,
+            w_serve: self.drs.w_serve,
+            a1_failed_post: self.drs.a1_failed_post,
+            a2_replay_incoherence: self.drs.a2_replay_incoherence,
+            a3_equivocation: self.drs.a3_equivocation,
+            p_max: self.drs.p_max,
+            sla_ms: self.drs.sla_ms,
+            smoothing_alpha: self.drs.smoothing_alpha,
+            multiplier_slope_beta: self.drs.multiplier_slope_beta,
+            m_min: self.drs.m_min,
+            m_max: self.drs.m_max,
+            density_penalty_rate: self.drs.density_penalty_rate,
+            density_min_multiplier: self.drs.density_min_multiplier,
+            high_band_threshold: self.drs.high_band_threshold,
+            mid_band_threshold: self.drs.mid_band_threshold,
+        }
+    }
+
+    pub fn to_state_pruning_config(&self) -> ego_core::state::PruningConfig {
+        ego_core::state::PruningConfig {
+            enabled: self.storage.enable_pruning,
+            keep_epochs: self.storage.keep_epochs,
+            prune_interval_epochs: self.storage.prune_interval_epochs,
+            keep_headers_forever: self.storage.keep_headers_forever,
+            keep_state_snapshots: self.storage.enable_state_snapshots,
+            snapshot_interval_epochs: self.storage.snapshot_interval_epochs,
+            prune_old_bodies: self.storage.prune_old_bodies,
+            prune_old_receipts: self.storage.prune_old_receipts,
+            prune_old_events: self.storage.prune_old_events,
+            prune_expired_storage: self.storage.prune_expired_storage,
+        }
     }
 
     pub fn is_5g_optimized(&self) -> bool {
@@ -1912,15 +2214,11 @@ impl RollupConfig {
 
     pub fn get_drs_weights(&self) -> HashMap<String, f64> {
         let mut weights = HashMap::new();
-        weights.insert("uptime".to_string(), self.drs.uptime_weight);
-        weights.insert("post_latency".to_string(), self.drs.post_latency_weight);
-        weights.insert("post_pass_rate".to_string(), self.drs.post_pass_rate_weight);
-        weights.insert("poc_quality".to_string(), self.drs.poc_quality_weight);
-        weights.insert("serve_ratio".to_string(), self.drs.serve_ratio_weight);
-        weights.insert(
-            "density_penalty".to_string(),
-            self.drs.density_penalty_weight,
-        );
+        weights.insert("uptime".to_string(), self.drs.w_uptime);
+        weights.insert("post_pass".to_string(), self.drs.w_post_pass);
+        weights.insert("inv_latency".to_string(), self.drs.w_inv_latency);
+        weights.insert("poc".to_string(), self.drs.w_poc);
+        weights.insert("serve".to_string(), self.drs.w_serve);
         weights
     }
 
@@ -1998,13 +2296,13 @@ impl RollupConfig {
             return 1.0;
         }
 
-        let penalty = 1.0 - (self.drs.density_penalty_per_device * (device_count - 1) as f64);
-        penalty.max(self.drs.density_penalty_min_multiplier)
+        let penalty = 1.0 - (self.drs.density_penalty_rate * (device_count - 1) as f64);
+        penalty.max(self.drs.density_min_multiplier)
     }
 
     pub fn calculate_deploy_credits_needed(&self, code_size_kb: u64, ru_estimate: u64) -> u64 {
-        let size_credits = code_size_kb * self.deploy_policy.pob_deploy_credits_per_kb;
-        let ru_credits = ru_estimate * self.deploy_policy.pob_deploy_credits_per_ru;
+        let size_credits = code_size_kb * self.deploy_policy.credits_per_kb;
+        let ru_credits = ru_estimate * self.deploy_policy.credits_per_ru;
         size_credits + ru_credits
     }
 
@@ -2144,7 +2442,7 @@ impl RollupConfig {
     }
 
     pub fn should_dedup_deploys(&self) -> bool {
-        self.deploy_policy.enabled && self.deploy_policy.enable_deduplication
+        self.deploy_policy.enabled && self.deploy_policy.enable_dedup
     }
 
     pub fn get_deploy_bond(&self) -> Balance {
@@ -2152,7 +2450,7 @@ impl RollupConfig {
     }
 
     pub fn get_free_deploy_quota(&self) -> u32 {
-        self.deploy_policy.free_staker_quota_per_epoch
+        self.deploy_policy.free_deploys_per_epoch
     }
 
     pub fn get_storage_credit_rate(&self) -> u64 {
@@ -2241,5 +2539,124 @@ impl RollupConfig {
 
     pub fn get_shard_mapping_strategy(&self) -> ShardMappingStrategy {
         self.sharding.shard_mapping_strategy
+    }
+
+    pub fn get_max_cross_shard_receipts(&self) -> usize {
+        self.sharding.max_cross_shard_receipts_per_epoch
+    }
+
+    pub fn get_receipt_deadline_epochs(&self) -> u64 {
+        self.sharding.receipt_deadline_epochs
+    }
+
+    pub fn get_min_validator_stake(&self) -> u128 {
+        self.economics.min_validator_stake
+    }
+
+    pub fn get_min_storage_collateral(&self) -> u128 {
+        self.economics.min_storage_collateral
+    }
+
+    pub fn get_ai_filter_patterns(&self) -> &[String] {
+        &self.ai_content_filter.filter_patterns
+    }
+
+    pub fn requires_dilithium_verification(&self) -> bool {
+        self.ai_content_filter.dilithium_signature_required
+    }
+
+    pub fn get_post_windows_per_day(&self) -> u32 {
+        self.proofs.windows_per_day
+    }
+
+    pub fn get_post_challenges_per_sector(&self) -> u32 {
+        self.proofs.challenges_per_sector
+    }
+
+    pub fn get_sectors_per_partition(&self) -> u32 {
+        self.proofs.sectors_per_partition
+    }
+
+    pub fn get_porep_sector_size_bytes(&self) -> u64 {
+        (self.proofs.porep_sector_size_gib as u64) * 1024 * 1024 * 1024
+    }
+
+    pub fn create_test_config() -> Self {
+        let mut config = Self::default();
+        config.chain_id = 99;
+        config.network_id = 99;
+        config.rollup_id = "ego-rollup-test".to_string();
+        config.operator.max_batch_size = 100;
+        config.operator.batch_timeout_secs = 10;
+        config.operator.commit_frequency_secs = 30;
+        config.sharding.enabled = true;
+        config.sharding.num_shards = 2;
+        config.sharding.shard_ids = vec![ShardId::new(0).unwrap(), ShardId::new(1).unwrap()];
+        config.storage.enable_pruning = false;
+        config.proofs.fake_poc_mode = true;
+        config
+    }
+
+    pub fn create_production_config() -> Self {
+        let mut config = Self::default();
+        config.operator.enable_batch_compression = true;
+        config.operator.compression_level = 9;
+        config.security.pq_only_mode = true;
+        config.security.require_dilithium = true;
+        config.security.enable_tpm = true;
+        config.security.enable_secure_boot = true;
+        config.storage.enable_pruning = true;
+        config.storage.keep_epochs = 1000;
+        config.proofs.fake_poc_mode = false;
+        config.proofs.poc_enabled = true;
+        config.drs.enabled = true;
+        config.deploy_policy.enabled = true;
+        config.deploy_policy.human_verification_required = true;
+        config.ai_content_filter.enabled = true;
+        config
+    }
+
+    pub fn create_5g_optimized_config() -> Self {
+        let mut config = Self::default();
+        config.five_g.enabled = true;
+        config.five_g.cellular_safe_mode = true;
+        config.five_g.urllc_enabled = true;
+        config.five_g.latency_target_ms = 5;
+        config.five_g.bandwidth_mbps = 100;
+        config.cellular.enabled = true;
+        config.cellular.safe_mode_default = true;
+        config.cellular.max_monthly_usage_gb = 10;
+        config.cellular.heavy_operations_wifi_only = true;
+        config.cellular.batch_operations_enabled = true;
+        config.cellular.compression_mandatory = true;
+        config.operator.enable_batch_compression = true;
+        config.operator.compression_level = 9;
+        config.da.enable_compression = true;
+        config.da.compression_level = 9;
+        config.optimize_for_5g();
+        config.optimize_for_cellular();
+        config.optimize_for_latency();
+        config
+    }
+
+    pub fn create_ego_device_config() -> Self {
+        let mut config = Self::default();
+        config.enable_ego_device_mode();
+        config.device.hardware_requirements.modem_required = true;
+        config.device.hardware_requirements.gps_required = true;
+        config.device.provisioning.manufacturing_ca_required = true;
+        config.device.provisioning.device_cert_enrollment = true;
+        config.device.provisioning.periodic_re_attestation_enabled = true;
+        config.device.certification.ptcrb_required = true;
+        config.device.certification.operator_iot_required = true;
+        config.device.lifecycle.auto_update_enabled = true;
+        config.device.lifecycle.ota_update_policy = OTAUpdatePolicy::Automatic;
+        config.security.enable_tpm = true;
+        config.security.enable_secure_boot = true;
+        config.security.enable_attestation = true;
+        config.operator.attestation_required = true;
+        config.operator.tpm_enabled = true;
+        config.operator.se_enabled = true;
+        config
     }
 }
