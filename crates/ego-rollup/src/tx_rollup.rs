@@ -1,9 +1,11 @@
 use crate::config::RollupConfig;
+use crate::da::CellularSafeConfig;
 use crate::da::{DAChunk, DataAvailability};
 use crate::error::{RollupError, RollupResult};
 use crate::fraud::{FraudProof, FraudProofVerifier};
 use crate::types::{CommitmentStatus, RollupTransaction};
 use ego_core::{Address, Balance, Hash, Timestamp};
+use ego_core::{BlockHeight, ShardId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -195,12 +197,22 @@ impl TxRollupOperator {
     ) -> RollupResult<Self> {
         let operator_addr = Address::from_public_key(&keypair.dilithium_public_key());
 
+        let cellular_safe_config = CellularSafeConfig {
+            enabled: true,
+            max_chunk_size: 1024 * 256,
+            max_batch_size: 100,
+            compression_required: true,
+            monthly_limit_bytes: 50 * 1024 * 1024 * 1024,
+        };
+
         let da_manager = DataAvailability::new(
             config.da.k as usize,
             config.da.m as usize,
             config.da.chunk_size,
             config.da.enable_compression,
             config.da.compression_level,
+            cellular_safe_config,
+            600_000,
         )?;
 
         let fraud_verifier = FraudProofVerifier::new(0.8, 24);
@@ -755,6 +767,7 @@ impl TxRollupOperator {
         let mut da_manager = self.da_manager.write().await;
 
         let epoch = *self.current_epoch.read().await;
+        let l1_block_number = *self.l1_block_number.read().await;
 
         da_manager.encode_data(
             batch.batch_id,
@@ -762,6 +775,9 @@ impl TxRollupOperator {
             format!("rollup_{:?}", self.rollup_id),
             self.operator_addr,
             epoch,
+            BlockHeight::new(l1_block_number),
+            ShardId::new(0).unwrap(),
+            batch.batch_id,
         )
     }
 
