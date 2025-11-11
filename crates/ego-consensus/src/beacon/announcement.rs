@@ -100,8 +100,8 @@ impl BeaconAnnouncement {
             tx_params,
             co_beacon: None,
             timestamp,
-            signature: Signature::new([0u8; 64]),
-            public_key: PublicKey::new([0u8; 32]),
+            signature: Signature::ed25519([0u8; 64]),
+            public_key: PublicKey::ed25519([0u8; 32]),
             slice_context: None,
             time_window,
         }

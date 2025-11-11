@@ -129,8 +129,8 @@ impl PoCBundle {
             coverage_quality,
             compression_info: None,
             created_at,
-            signature: Signature::new([0u8; 64]),
-            public_key: PublicKey::new([0u8; 32]),
+            signature: Signature::ed25519([0u8; 64]),
+            public_key: PublicKey::ed25519([0u8; 32]),
             cid_hint: None,
         }
     }
@@ -259,7 +259,7 @@ impl PoCBundle {
             epoch,
             cid_hint: self.cid_hint.clone(),
             timestamp: self.created_at,
-            aggregator_signature: self.signature,
+            aggregator_signature: self.signature.clone(),
         }
     }
 

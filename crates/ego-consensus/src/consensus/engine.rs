@@ -156,7 +156,7 @@ mod tests {
             epoch: 1,
             cid_hint: None,
             timestamp: Timestamp::now(),
-            aggregator_signature: ego_core::Signature::new([0u8; 64]),
+            aggregator_signature: ego_core::Signature::ed25519([0u8; 64]),
         };
 
         assert!(engine.submit_event(event).await.is_ok());
@@ -184,7 +184,7 @@ mod tests {
             epoch: Timestamp::now().as_secs() / 3600,
             cid_hint: None,
             timestamp: Timestamp::now(),
-            aggregator_signature: ego_core::Signature::new([0u8; 64]),
+            aggregator_signature: ego_core::Signature::ed25519([0u8; 64]),
         };
 
         let result1 = engine.validate_single_event(&event).await.unwrap();

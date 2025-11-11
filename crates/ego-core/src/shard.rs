@@ -1,8 +1,8 @@
+use crate::transaction::CrossShardReceipt as TxCrossShardReceipt;
 use crate::{
-    Account, Address, AlgorithmId, Balance, Block, BlockHeight,
-    CrossShardReceipt as TxCrossShardReceipt, DualSignature, EgoError, EgoResult, Hash, PublicKey,
-    ShardId, SliceId, StateManager, Timestamp, Transaction, TransactionPayload, TransactionResult,
-    PROTOCOL_VERSION,
+    Account, Address, AlgorithmId, Balance, Block, BlockHeight, DualSignature, EgoError, EgoResult,
+    Hash, PublicKey, ShardId, SliceId, StateManager, Timestamp, Transaction, TransactionPayload,
+    TransactionResult, PROTOCOL_VERSION,
 };
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};

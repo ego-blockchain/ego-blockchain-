@@ -115,7 +115,7 @@ impl PoStEvent {
             result,
             latency_ms,
             alg_sig_id: 1,
-            node_sig: Signature::new([0u8; 64]),
+            node_sig: Signature::ed25519([0u8; 64]),
             cid_hint: None,
         }
     }

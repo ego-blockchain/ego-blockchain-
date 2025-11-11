@@ -12,35 +12,15 @@ pub mod types;
 pub mod utils;
 
 pub use account::*;
-pub use block::{
-    Block, BlockBody, BlockHeader, BlockHeaderCore, BlockMetadata, CrossShardReceipt, DRSEvent,
-    DeployEvent, NetworkStats, ProofEvent, QuorumCert, ResourcePricing, RollupCommitment,
-    ValidatorSignature, WitnessData,
-};
-pub use crypto::{
-    blake2s_hash, blake2s_hash_domain, create_authenticated_transcript, create_handshake_init,
-    derive_stealth_address, dilithium_sign, dilithium_verify, hash_data, hash_multiple,
-    hkdf_blake2s, hkdf_sha256, verify_dilithium_signature, verify_downgrade_protection,
-    verify_dual_signature, verify_identity_binding, verify_signature, verify_slh_dsa_signature,
-    xchacha20poly1305_decrypt, xchacha20poly1305_encrypt, AddressType, BatchVerifier, EgoAddress,
-    ExportedKeys, ExportedKeysHex, KeyPair, MerkleNode, MerkleProof, MerkleTree, StreamCipher,
-};
+pub use block::*;
+pub use crypto::*;
 pub use deploy_policy::*;
 pub use drs::*;
 pub use error::*;
-pub use rollup::{
-    BatchStatus, Challenge, ChallengeStatus, ChallengeType, FeeStructure, FraudProofConfig,
-    RollupAggregator, RollupConfig, RollupMetrics, RollupState, RollupStats, TransactionBatch,
-};
+pub use rollup::*;
 pub use shard::*;
-pub use state::{
-    CrossShardState, JailInfo, SliceConfig, SliceStatus, SliceType, StateManager, StateStats,
-    StorageEntry, ValidatorInfo as StateValidatorInfo, ValidatorStatus,
-};
-pub use transaction::{
-    AccountUpdates, CrossShardReceipt as TxCrossShardReceipt, SliceOperationType, StateChange,
-    StateChangeType, Transaction, TransactionEvent, TransactionPayload, TransactionResult,
-};
+pub use state::*;
+pub use transaction::*;
 pub use types::*;
 pub use utils::*;
 
@@ -171,6 +151,246 @@ pub fn format_storage_size(bytes: u64) -> String {
     }
 }
 
+pub fn format_bandwidth(bytes_per_sec: u64) -> String {
+    const UNITS: &[&str] = &["B/s", "KB/s", "MB/s", "GB/s"];
+    const THRESHOLD: f64 = 1024.0;
+
+    if bytes_per_sec == 0 {
+        return "0 B/s".to_string();
+    }
+
+    let mut rate = bytes_per_sec as f64;
+    let mut unit_index = 0;
+
+    while rate >= THRESHOLD && unit_index < UNITS.len() - 1 {
+        rate /= THRESHOLD;
+        unit_index += 1;
+    }
+
+    if unit_index == 0 {
+        format!("{} {}", bytes_per_sec, UNITS[unit_index])
+    } else {
+        format!("{:.2} {}", rate, UNITS[unit_index])
+    }
+}
+
+pub fn format_duration(millis: u64) -> String {
+    if millis < 1000 {
+        return format!("{}ms", millis);
+    }
+
+    let seconds = millis / 1000;
+    if seconds < 60 {
+        return format!("{}s", seconds);
+    }
+
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        let remaining_secs = seconds % 60;
+        return format!("{}m {}s", minutes, remaining_secs);
+    }
+
+    let hours = minutes / 60;
+    let remaining_mins = minutes % 60;
+    if hours < 24 {
+        return format!("{}h {}m", hours, remaining_mins);
+    }
+
+    let days = hours / 24;
+    let remaining_hours = hours % 24;
+    format!("{}d {}h", days, remaining_hours)
+}
+
+pub fn format_hash_short(hash: &Hash) -> String {
+    let hex = hash.to_hex();
+    format!("{}...{}", &hex[..8], &hex[56..])
+}
+
+pub fn format_address_short(address: &Address) -> String {
+    address.short_display()
+}
+
+pub fn validate_commission_rate(rate: u16) -> EgoResult<()> {
+    if rate > 10000 {
+        return Err(EgoError::InvalidCommissionRate { rate });
+    }
+    Ok(())
+}
+
+pub fn validate_epoch_number(
+    epoch: u64,
+    current_epoch: u64,
+    max_future_epochs: u64,
+) -> EgoResult<()> {
+    if epoch > current_epoch + max_future_epochs {
+        return Err(EgoError::InvalidTransaction(format!(
+            "Epoch {} is too far in the future (current: {})",
+            epoch, current_epoch
+        )));
+    }
+    Ok(())
+}
+
+pub fn validate_timestamp(timestamp: Timestamp, max_future_ms: u64) -> EgoResult<()> {
+    let now = Timestamp::now();
+    if timestamp.as_millis() > now.as_millis() + max_future_ms {
+        return Err(EgoError::InvalidTransaction(
+            "Timestamp too far in future".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn calculate_block_reward(epoch: u64) -> Balance {
+    let base_emission = 1_000_000_000_000u128;
+    let halvings = epoch / 525_600;
+    let emission = base_emission >> halvings.min(10);
+    Balance::new(emission)
+}
+
+pub fn calculate_storage_cost(size_bytes: u64, duration_epochs: u64) -> StorageCredits {
+    StorageCredits::for_size_duration(size_bytes, duration_epochs)
+}
+
+pub fn calculate_deploy_cost(code_size_kb: u32, ru_estimate: u64) -> DeployCredits {
+    DeployCredits::for_code_size(code_size_kb, ru_estimate)
+}
+
+pub fn is_off_peak_hour(hour: u8) -> bool {
+    if OFF_PEAK_HOURS_START > OFF_PEAK_HOURS_END {
+        hour >= OFF_PEAK_HOURS_START || hour < OFF_PEAK_HOURS_END
+    } else {
+        hour >= OFF_PEAK_HOURS_START && hour < OFF_PEAK_HOURS_END
+    }
+}
+
+pub fn estimate_tx_resource_units(payload: &TransactionPayload) -> u64 {
+    match payload {
+        TransactionPayload::Transfer { stealth_mode, .. } => {
+            if *stealth_mode {
+                500
+            } else {
+                100
+            }
+        }
+        TransactionPayload::CreateAccount { .. } => 1000,
+        TransactionPayload::UpdateAccount { .. } => 500,
+        TransactionPayload::StoreData {
+            data_size,
+            replication_factor,
+            ..
+        } => 1000 + (*data_size / 1024) * (*replication_factor as u64),
+        TransactionPayload::UpdateTriadPlacement { .. } => 800,
+        TransactionPayload::SubmitProofBatch { proofs, .. } => 2000 + (proofs.len() as u64 * 100),
+        TransactionPayload::PoStChallenge { chunk_ids, .. } => 1500 + (chunk_ids.len() as u64 * 50),
+        TransactionPayload::PoStResponse { proofs, .. } => 3000 + (proofs.len() as u64 * 150),
+        TransactionPayload::PoCWitnessReport {
+            witness_reports, ..
+        } => 2000 + (witness_reports.len() as u64 * 100),
+        TransactionPayload::RollupCommit {
+            tx_count,
+            fraud_proofs,
+            ..
+        } => 5000 + (*tx_count as u64 * 10) + (fraud_proofs.len() as u64 * 500),
+        TransactionPayload::ChallengeFraud { .. } => 3000,
+        TransactionPayload::ResolveFraudChallenge { .. } => 4000,
+        TransactionPayload::ClaimRewards { .. } => 1200,
+        TransactionPayload::BuyStorageCredits { .. } => 300,
+        TransactionPayload::BuyDeployCredits { .. } => 300,
+        TransactionPayload::StreamStoragePayment { .. } => 200,
+        TransactionPayload::PayRetrievalFee { .. } => 250,
+        TransactionPayload::Stake { .. } => 800,
+        TransactionPayload::Unstake { .. } => 600,
+        TransactionPayload::Delegate { .. } => 400,
+        TransactionPayload::UpdateValidatorMetrics { .. } => 1000,
+        TransactionPayload::CrossShard { .. } => 1500,
+        TransactionPayload::DeployContract { .. } => 5000,
+        TransactionPayload::ExecuteContract { .. } => 2000,
+        TransactionPayload::SliceOperation { .. } => 2000,
+        TransactionPayload::UpdateDRS { .. } => 1000,
+        TransactionPayload::SystemOperation { epoch_anchor, .. } => {
+            if *epoch_anchor {
+                20000
+            } else {
+                10000
+            }
+        }
+        TransactionPayload::PQTransition { .. } => 5000,
+        TransactionPayload::DAOProposal { .. } => 3000,
+        TransactionPayload::DAOVote { .. } => 500,
+    }
+}
+
+pub fn verify_triad_diversity(
+    primary_region: &str,
+    replica_a_region: &str,
+    replica_b_region: &str,
+) -> bool {
+    let mut regions = std::collections::HashSet::new();
+    regions.insert(primary_region);
+    regions.insert(replica_a_region);
+    regions.insert(replica_b_region);
+    regions.len() >= 2
+}
+
+pub fn calculate_triad_diversity_score(
+    primary_h3: &str,
+    replica_a_h3: &str,
+    replica_b_h3: &str,
+) -> f64 {
+    let mut unique_cells = std::collections::HashSet::new();
+    unique_cells.insert(primary_h3);
+    unique_cells.insert(replica_a_h3);
+    unique_cells.insert(replica_b_h3);
+
+    match unique_cells.len() {
+        3 => 1.0,
+        2 => 0.66,
+        1 => 0.33,
+        _ => 0.0,
+    }
+}
+
+pub fn is_cellular_safe_operation(operation: &str, data_size_bytes: u64) -> bool {
+    const CELLULAR_SAFE_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024;
+
+    let heavy_operations = [
+        "heavy_compute",
+        "large_storage",
+        "bulk_sync",
+        "firmware_update",
+        "full_state_sync",
+    ];
+
+    if heavy_operations.contains(&operation) {
+        return false;
+    }
+
+    data_size_bytes <= CELLULAR_SAFE_THRESHOLD_BYTES
+}
+
+pub fn calculate_network_quality_score(
+    latency_ms: u32,
+    bandwidth_mbps: u64,
+    reliability_score: u8,
+    packet_loss_percent: f32,
+) -> f64 {
+    let latency_score = (1000.0 / (latency_ms as f64 + 1.0)).min(100.0);
+    let bandwidth_score = (bandwidth_mbps as f64).min(100.0);
+    let reliability = reliability_score as f64;
+    let loss_score = (100.0 - packet_loss_percent as f64 * 10.0).max(0.0);
+
+    (latency_score * 0.3 + bandwidth_score * 0.1 + reliability * 0.4 + loss_score * 0.2).min(100.0)
+}
+
+pub fn should_compress_data(data_size: u64) -> bool {
+    data_size >= DEFAULT_COMPRESSION_MIN_SIZE
+}
+
+pub fn estimate_compressed_size(original_size: u64) -> u64 {
+    (original_size as f64 * 0.7) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +400,9 @@ mod tests {
         let address = Address::new([1u8; 20]);
         let shard = calculate_shard_for_address(&address, 10);
         assert!(shard < 10);
+
+        let same_shard = calculate_shard_for_address(&address, 10);
+        assert_eq!(shard, same_shard);
     }
 
     #[test]
@@ -202,5 +425,163 @@ mod tests {
     fn test_current_epoch() {
         let epoch = current_epoch();
         assert!(epoch.as_u64() > 0);
+    }
+
+    #[test]
+    fn test_format_balance() {
+        let balance = Balance::from_egoc(100);
+        let formatted = format_balance(&balance);
+        assert!(formatted.contains("100.00000000 EGOC"));
+    }
+
+    #[test]
+    fn test_validate_commission_rate() {
+        assert!(validate_commission_rate(5000).is_ok());
+        assert!(validate_commission_rate(10000).is_ok());
+        assert!(validate_commission_rate(10001).is_err());
+    }
+
+    #[test]
+    fn test_calculate_block_reward() {
+        let reward = calculate_block_reward(0);
+        assert_eq!(reward.as_u128(), 1_000_000_000_000);
+
+        let halved_reward = calculate_block_reward(525_600);
+        assert_eq!(halved_reward.as_u128(), 500_000_000_000);
+    }
+
+    #[test]
+    fn test_is_off_peak_hour() {
+        assert!(is_off_peak_hour(23));
+        assert!(is_off_peak_hour(0));
+        assert!(is_off_peak_hour(5));
+        assert!(!is_off_peak_hour(12));
+        assert!(!is_off_peak_hour(18));
+    }
+
+    #[test]
+    fn test_verify_triad_diversity() {
+        assert!(verify_triad_diversity("us-east", "eu-west", "ap-south"));
+        assert!(verify_triad_diversity("us-east", "us-east", "eu-west"));
+        assert!(!verify_triad_diversity("us-east", "us-east", "us-east"));
+    }
+
+    #[test]
+    fn test_calculate_triad_diversity_score() {
+        let score_high = calculate_triad_diversity_score("abc123", "def456", "ghi789");
+        assert_eq!(score_high, 1.0);
+
+        let score_mid = calculate_triad_diversity_score("abc123", "abc123", "def456");
+        assert_eq!(score_mid, 0.66);
+
+        let score_low = calculate_triad_diversity_score("abc123", "abc123", "abc123");
+        assert_eq!(score_low, 0.33);
+    }
+
+    #[test]
+    fn test_is_cellular_safe_operation() {
+        assert!(is_cellular_safe_operation("normal_transfer", 1024));
+        assert!(is_cellular_safe_operation("small_proof", 100 * 1024));
+        assert!(!is_cellular_safe_operation("heavy_compute", 1024));
+        assert!(!is_cellular_safe_operation("normal_op", 20 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_calculate_network_quality_score() {
+        let score = calculate_network_quality_score(50, 100, 95, 0.1);
+        assert!(score > 70.0 && score <= 100.0);
+
+        let poor_score = calculate_network_quality_score(500, 10, 50, 5.0);
+        assert!(poor_score < 50.0);
+    }
+
+    #[test]
+    fn test_should_compress_data() {
+        assert!(!should_compress_data(512));
+        assert!(should_compress_data(2048));
+        assert!(should_compress_data(1024 * 1024));
+    }
+
+    #[test]
+    fn test_estimate_compressed_size() {
+        let original = 1000;
+        let compressed = estimate_compressed_size(original);
+        assert_eq!(compressed, 700);
+    }
+
+    #[test]
+    fn test_format_duration() {
+        assert_eq!(format_duration(500), "500ms");
+        assert_eq!(format_duration(5000), "5s");
+        assert_eq!(format_duration(125000), "2m 5s");
+        assert_eq!(format_duration(7200000), "2h 0m");
+    }
+
+    #[test]
+    fn test_calculate_storage_cost() {
+        let cost = calculate_storage_cost(1_000_000_000, 100);
+        assert!(cost.as_u64() > 0);
+    }
+
+    #[test]
+    fn test_calculate_deploy_cost() {
+        let cost = calculate_deploy_cost(100, 10000);
+        assert_eq!(cost.as_u64(), 100 * 100 + 10000 / 100);
+    }
+
+    #[test]
+    fn test_estimate_tx_resource_units() {
+        let transfer_payload = TransactionPayload::Transfer {
+            to: Address::new([0u8; 20]),
+            amount: Balance::from_egoc(10),
+            memo: None,
+            stealth_mode: false,
+        };
+        let ru = estimate_tx_resource_units(&transfer_payload);
+        assert_eq!(ru, 100);
+
+        let stealth_transfer = TransactionPayload::Transfer {
+            to: Address::new([0u8; 20]),
+            amount: Balance::from_egoc(10),
+            memo: None,
+            stealth_mode: true,
+        };
+        let stealth_ru = estimate_tx_resource_units(&stealth_transfer);
+        assert_eq!(stealth_ru, 500);
+    }
+
+    #[test]
+    fn test_format_hash_short() {
+        let hash = Hash::new([1u8; 32]);
+        let short = format_hash_short(&hash);
+        assert!(short.contains("..."));
+        assert_eq!(short.len(), 19);
+    }
+
+    #[test]
+    fn test_validate_epoch_number() {
+        assert!(validate_epoch_number(100, 100, 10).is_ok());
+        assert!(validate_epoch_number(105, 100, 10).is_ok());
+        assert!(validate_epoch_number(200, 100, 10).is_err());
+    }
+
+    #[test]
+    fn test_validate_timestamp() {
+        let now = Timestamp::now();
+        assert!(validate_timestamp(now, 300_000).is_ok());
+
+        let future = now.add_millis(100_000);
+        assert!(validate_timestamp(future, 300_000).is_ok());
+
+        let far_future = now.add_millis(500_000);
+        assert!(validate_timestamp(far_future, 300_000).is_err());
+    }
+
+    #[test]
+    fn test_format_bandwidth() {
+        assert_eq!(format_bandwidth(0), "0 B/s");
+        assert_eq!(format_bandwidth(1024), "1.00 KB/s");
+        assert_eq!(format_bandwidth(1024 * 1024), "1.00 MB/s");
+        assert_eq!(format_bandwidth(1024 * 1024 * 1024), "1.00 GB/s");
     }
 }

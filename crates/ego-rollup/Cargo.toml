@@ -29,6 +29,9 @@ rand = "0.8"
 async-trait = "0.1"
 num_cpus = "1.0"
 toml = "0.8"
+hex = "0.4"
+flate2 = "1.0"
+serde_json = "1.0"
 
 [features]
 default = ["metrics"]
