@@ -3,9 +3,8 @@ use crate::transaction::{
     CrossShardReceipt, PQVerificationResult, ProofType, ProofVerificationResult,
 };
 use crate::{
-    Account, AccountType, Address, Balance, BlockHeight,
-    CrossShardReceipt as BlockCrossShardReceipt, EgoError, EgoResult, Hash, PublicKey, ShardId,
-    SliceId, StateChange, StateChangeType, Timestamp, Transaction, TransactionEvent,
+    Account, AccountType, Address, Balance, BlockHeight, EgoError, EgoResult, Hash, PublicKey,
+    ShardId, SliceId, StateChange, StateChangeType, Timestamp, Transaction, TransactionEvent,
     TransactionPayload, TransactionResult,
 };
 use dashmap::DashMap;

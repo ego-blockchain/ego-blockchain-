@@ -1,226 +1,863 @@
-use crate::batch::{BatchBuilder, BatchProcessor, RollupBatch};
-use crate::commitment::{CommitmentManager, RollupCommitment};
-use crate::config::RollupConfig;
-use crate::da::{DAChunk, DataAvailability};
-use crate::error::{RollupError, RollupResult};
-use crate::metrics::RollupMetrics;
-use crate::state::RollupState;
-use crate::types::{OperatorInfo, RollupTransaction};
-use ego_core::{Address, Hash, KeyPair, Timestamp};
-use std::collections::{HashMap, VecDeque};
+use ego_core::{
+    Address, Balance, DualSignature, EgoError, EgoResult, EpochNumber, Hash, PublicKey, ShardId,
+    StateManager, Timestamp, Transaction, TransactionResult,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc};
-use tokio::time::{Duration, Instant, interval};
-use tracing::{debug, error, info, warn};
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::{Duration, Instant};
 
-pub struct RollupOperator {
-    config: RollupConfig,
-    keypair: Arc<KeyPair>,
-    address: Address,
-    state: Arc<RwLock<RollupState>>,
-    da_manager: Arc<RwLock<DataAvailability>>,
-    commitment_manager: Arc<RwLock<CommitmentManager>>,
-    batch_processor: Arc<BatchProcessor>,
+const MAX_BATCH_SIZE: usize = 10_000;
+const MAX_BATCH_SIZE_CELLULAR: usize = 1_000;
+const MAX_BATCH_SIZE_5G: usize = 5_000;
+const MAX_BATCH_GAS: u64 = 50_000_000;
+const BATCH_TIMEOUT_MS: u64 = 5000;
+const BATCH_TIMEOUT_5G_MS: u64 = 100;
+const COMMIT_FREQUENCY_SECS: u64 = 30;
+const CHALLENGE_WINDOW_BLOCKS: u64 = 7200;
+const DA_CHUNK_SIZE: usize = 256 * 1024;
+const ERASURE_K: u16 = 64;
+const ERASURE_M: u16 = 32;
+const MAX_CELLULAR_DATA_GB_MONTH: u64 = 5;
 
-    tx_pool: Arc<RwLock<VecDeque<RollupTransaction>>>,
-    pending_batches: Arc<RwLock<HashMap<Hash, RollupBatch>>>,
-
-    metrics: Arc<RwLock<RollupMetrics>>,
-
-    tx_receiver: Option<mpsc::UnboundedReceiver<RollupTransaction>>,
-    batch_sender: Option<mpsc::UnboundedSender<RollupBatch>>,
-
-    is_active: Arc<RwLock<bool>>,
-    bond_amount: u64,
-    last_commit_time: Arc<RwLock<Option<Timestamp>>>,
-
-    edge_nodes: Vec<String>,
-    current_slice: Option<String>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorConfig {
+    pub rollup_id: String,
+    pub chain_id: u32,
+    pub network_id: u32,
+    pub shard_id: ShardId,
+    pub bond_amount: Balance,
+    pub max_batch_size: usize,
+    pub max_gas_limit: u64,
+    pub batch_timeout_ms: u64,
+    pub commit_frequency_secs: u64,
+    pub challenge_window_blocks: u64,
+    pub da_chunk_size: usize,
+    pub erasure_k: u16,
+    pub erasure_m: u16,
+    pub enable_compression: bool,
+    pub compression_level: u32,
+    pub cellular_safe_mode: bool,
+    pub max_cellular_data_gb_month: u64,
+    pub enable_5g: bool,
+    pub slice_id: Option<String>,
+    pub edge_nodes: Vec<String>,
+    pub require_dilithium: bool,
+    pub wifi_only_operations: Vec<String>,
 }
 
-pub struct OperatorNode {
-    operator: RollupOperator,
-    network_handle: Option<tokio::task::JoinHandle<()>>,
-    batch_handle: Option<tokio::task::JoinHandle<()>>,
-    commit_handle: Option<tokio::task::JoinHandle<()>>,
+impl Default for OperatorConfig {
+    fn default() -> Self {
+        Self {
+            rollup_id: "ego-rollup-0".to_string(),
+            chain_id: 1,
+            network_id: 1,
+            shard_id: ShardId::new(0).unwrap(),
+            bond_amount: Balance::from_egoc(1_000_000),
+            max_batch_size: MAX_BATCH_SIZE,
+            max_gas_limit: MAX_BATCH_GAS,
+            batch_timeout_ms: BATCH_TIMEOUT_MS,
+            commit_frequency_secs: COMMIT_FREQUENCY_SECS,
+            challenge_window_blocks: CHALLENGE_WINDOW_BLOCKS,
+            da_chunk_size: DA_CHUNK_SIZE,
+            erasure_k: ERASURE_K,
+            erasure_m: ERASURE_M,
+            enable_compression: true,
+            compression_level: 6,
+            cellular_safe_mode: true,
+            max_cellular_data_gb_month: MAX_CELLULAR_DATA_GB_MONTH,
+            enable_5g: false,
+            slice_id: None,
+            edge_nodes: Vec::new(),
+            require_dilithium: false,
+            wifi_only_operations: vec![
+                "commitment_post".to_string(),
+                "da_upload".to_string(),
+                "large_storage".to_string(),
+            ],
+        }
+    }
+}
+
+impl OperatorConfig {
+    pub fn batch_timeout(&self) -> Duration {
+        Duration::from_millis(self.batch_timeout_ms)
+    }
+
+    pub fn target_latency(&self) -> Duration {
+        if self.enable_5g {
+            Duration::from_millis(10)
+        } else {
+            Duration::from_millis(250)
+        }
+    }
+
+    pub fn cellular_batch_size(&self) -> usize {
+        if self.enable_5g {
+            MAX_BATCH_SIZE_5G
+        } else {
+            MAX_BATCH_SIZE_CELLULAR
+        }
+    }
+
+    pub fn is_wifi_only_operation(&self, operation: &str) -> bool {
+        self.cellular_safe_mode && self.wifi_only_operations.contains(&operation.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct RollupBatch {
+    pub batch_id: Hash,
+    pub rollup_id: String,
+    pub operator: Address,
+    pub transactions: Vec<Transaction>,
+    pub transaction_results: Vec<TransactionResult>,
+    pub prev_state_root: Hash,
+    pub new_state_root: Hash,
+    pub tx_root: Hash,
+    pub receipts_root: Hash,
+    pub proof_events_root: Hash,
+    pub l1_block_number: u64,
+    pub epoch: EpochNumber,
+    pub timestamp: Timestamp,
+    pub gas_used: u64,
+    pub size_bytes: usize,
+    pub chain_id: u32,
+    pub network_id: u32,
+    pub shard_id: ShardId,
+    pub operator_signature: DualSignature,
+    pub is_cellular_safe: bool,
+    pub is_5g_optimized: bool,
+}
+
+impl RollupBatch {
+    pub fn compute_batch_id(&self) -> Hash {
+        let config = bincode::config::standard();
+        let mut data = Vec::new();
+        data.extend_from_slice(b"ego/rollup/batch/v1");
+        data.extend_from_slice(self.rollup_id.as_bytes());
+        data.extend_from_slice(self.operator.as_bytes());
+        data.extend_from_slice(&self.l1_block_number.to_le_bytes());
+        data.extend_from_slice(&self.epoch.as_u64().to_le_bytes());
+        data.extend_from_slice(self.prev_state_root.as_bytes());
+        data.extend_from_slice(&self.chain_id.to_le_bytes());
+        data.extend_from_slice(&self.network_id.to_le_bytes());
+        data.extend_from_slice(&self.shard_id.as_u32().to_le_bytes());
+
+        for tx in &self.transactions {
+            data.extend_from_slice(tx.hash.as_bytes());
+        }
+
+        ego_core::crypto::hash_data(&data)
+    }
+
+    pub fn sign(&mut self, keypair: &ego_core::crypto::KeyPair) -> EgoResult<()> {
+        let signing_data = self.compute_batch_id();
+        self.operator_signature = keypair.sign_hybrid(signing_data.as_bytes(), false);
+        Ok(())
+    }
+
+    pub fn verify_signature(&self, dilithium_pk: &PublicKey) -> EgoResult<bool> {
+        let signing_data = self.compute_batch_id();
+        if let Some(ref sig) = self.operator_signature.dilithium_sig {
+            ego_core::crypto::verify_signature(dilithium_pk, signing_data.as_bytes(), sig)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn is_cellular_safe(&self) -> bool {
+        self.is_cellular_safe
+    }
+
+    pub fn is_5g_ready(&self) -> bool {
+        self.is_5g_optimized
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DAChunk {
+    pub chunk_index: u32,
+    pub total_chunks: u32,
+    pub chunk_hash: Hash,
+    pub data: Vec<u8>,
+    pub batch_id: Hash,
+    pub rollup_id: String,
+    pub operator: Address,
+    pub epoch: u64,
+    pub timestamp: Timestamp,
+}
+
+impl DAChunk {
+    pub fn new(
+        chunk_index: u32,
+        total_chunks: u32,
+        data: Vec<u8>,
+        batch_id: Hash,
+        rollup_id: String,
+        operator: Address,
+        epoch: u64,
+    ) -> Self {
+        let chunk_hash = ego_core::crypto::hash_data(&data);
+        Self {
+            chunk_index,
+            total_chunks,
+            chunk_hash,
+            data,
+            batch_id,
+            rollup_id,
+            operator,
+            epoch,
+            timestamp: Timestamp::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollupCommitmentData {
+    pub commitment_hash: Hash,
+    pub rollup_id: String,
+    pub operator: Address,
+    pub batch_id: Hash,
+    pub state_root: Hash,
+    pub previous_state_root: Hash,
+    pub tx_root: Hash,
+    pub proofs_root: Hash,
+    pub da_root: Hash,
+    pub tx_count: u32,
+    pub block_range: (u64, u64),
+    pub epoch: u64,
+    pub timestamp: Timestamp,
+    pub operator_signature: DualSignature,
+    pub fraud_proof_window: u64,
+    pub min_validity_proof: Vec<u8>,
+    pub chain_id: u32,
+    pub network_id: u32,
+}
+
+impl RollupCommitmentData {
+    pub fn new(
+        operator: Address,
+        rollup_id: String,
+        batch: &RollupBatch,
+        da_root: Hash,
+        proofs_root: Hash,
+        l1_block: u64,
+        fraud_proof_window: u64,
+        chain_id: u32,
+        network_id: u32,
+    ) -> Self {
+        let mut commitment = Self {
+            commitment_hash: Hash::ZERO,
+            rollup_id,
+            operator,
+            batch_id: batch.batch_id,
+            state_root: batch.new_state_root,
+            previous_state_root: batch.prev_state_root,
+            tx_root: batch.tx_root,
+            proofs_root,
+            da_root,
+            tx_count: batch.transactions.len() as u32,
+            block_range: (l1_block, l1_block),
+            epoch: batch.epoch.as_u64(),
+            timestamp: Timestamp::now(),
+            operator_signature: DualSignature::new(None, None),
+            fraud_proof_window,
+            min_validity_proof: Vec::new(),
+            chain_id,
+            network_id,
+        };
+        commitment.commitment_hash = commitment.compute_hash();
+        commitment
+    }
+
+    pub fn compute_hash(&self) -> Hash {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"ego/rollup/commit/v1");
+        data.extend_from_slice(self.rollup_id.as_bytes());
+        data.extend_from_slice(self.operator.as_bytes());
+        data.extend_from_slice(self.batch_id.as_bytes());
+        data.extend_from_slice(self.state_root.as_bytes());
+        data.extend_from_slice(self.previous_state_root.as_bytes());
+        data.extend_from_slice(self.tx_root.as_bytes());
+        data.extend_from_slice(self.da_root.as_bytes());
+        data.extend_from_slice(&self.tx_count.to_le_bytes());
+        data.extend_from_slice(&self.epoch.to_le_bytes());
+        data.extend_from_slice(&self.chain_id.to_le_bytes());
+        data.extend_from_slice(&self.network_id.to_le_bytes());
+        ego_core::crypto::hash_data(&data)
+    }
+
+    pub fn sign(&mut self, keypair: &ego_core::crypto::KeyPair) -> EgoResult<()> {
+        let signing_data = self.compute_hash();
+        self.operator_signature = keypair.sign_hybrid(signing_data.as_bytes(), false);
+        self.commitment_hash = self.compute_hash();
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnectionType {
+    Cellular5G,
+    Cellular4G,
+    WiFi,
+    Ethernet,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorMetrics {
+    pub transactions_received: u64,
+    pub transactions_processed: u64,
+    pub transactions_failed: u64,
+    pub batches_built: u64,
+    pub batches_processed: u64,
+    pub commits_posted: u64,
+    pub commits_finalized: u64,
+    pub commits_challenged: u64,
+    pub commits_slashed: u64,
+    pub challenge_responses: u64,
+    pub total_ru_used: u64,
+    pub da_chunks_encoded: u64,
+    pub da_chunks_uploaded: u64,
+    pub cellular_safe_batches: u64,
+    pub five_g_optimized_batches: u64,
+    pub network_switches: u64,
+    pub cellular_data_mb: u64,
+    pub wifi_data_mb: u64,
+    pub avg_batch_time_ms: u64,
+    pub avg_commit_latency_ms: u64,
+    pub slashing_penalties: u64,
+    pub dilithium_signatures: u64,
+    pub ed25519_signatures: u64,
+    pub hybrid_signatures: u64,
+    pub latency_target_breaches: u64,
+    pub errors: HashMap<String, u64>,
+}
+
+impl Default for OperatorMetrics {
+    fn default() -> Self {
+        Self {
+            transactions_received: 0,
+            transactions_processed: 0,
+            transactions_failed: 0,
+            batches_built: 0,
+            batches_processed: 0,
+            commits_posted: 0,
+            commits_finalized: 0,
+            commits_challenged: 0,
+            commits_slashed: 0,
+            challenge_responses: 0,
+            total_ru_used: 0,
+            da_chunks_encoded: 0,
+            da_chunks_uploaded: 0,
+            cellular_safe_batches: 0,
+            five_g_optimized_batches: 0,
+            network_switches: 0,
+            cellular_data_mb: 0,
+            wifi_data_mb: 0,
+            avg_batch_time_ms: 0,
+            avg_commit_latency_ms: 0,
+            slashing_penalties: 0,
+            dilithium_signatures: 0,
+            ed25519_signatures: 0,
+            hybrid_signatures: 0,
+            latency_target_breaches: 0,
+            errors: HashMap::new(),
+        }
+    }
+}
+
+impl OperatorMetrics {
+    pub fn record_batch(&mut self, time_ms: u64, is_cellular_safe: bool, is_5g: bool) {
+        self.batches_processed += 1;
+        if is_cellular_safe {
+            self.cellular_safe_batches += 1;
+        }
+        if is_5g {
+            self.five_g_optimized_batches += 1;
+        }
+        self.avg_batch_time_ms = (self.avg_batch_time_ms * (self.batches_processed - 1) + time_ms)
+            / self.batches_processed;
+    }
+
+    pub fn record_commit(&mut self, latency_ms: u64) {
+        self.commits_posted += 1;
+        self.avg_commit_latency_ms = (self.avg_commit_latency_ms * (self.commits_posted - 1)
+            + latency_ms)
+            / self.commits_posted;
+    }
+
+    pub fn record_signature(&mut self, has_dilithium: bool, has_ed25519: bool) {
+        if has_dilithium && has_ed25519 {
+            self.hybrid_signatures += 1;
+        } else if has_dilithium {
+            self.dilithium_signatures += 1;
+        } else if has_ed25519 {
+            self.ed25519_signatures += 1;
+        }
+    }
+
+    pub fn record_data_usage(&mut self, bytes: u64, is_cellular: bool) {
+        let mb = bytes / (1024 * 1024);
+        if is_cellular {
+            self.cellular_data_mb += mb;
+        } else {
+            self.wifi_data_mb += mb;
+        }
+    }
+
+    pub fn record_error(&mut self, error_type: &str) {
+        *self.errors.entry(error_type.to_string()).or_insert(0) += 1;
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        if self.batches_processed == 0 {
+            return true;
+        }
+        let failure_rate = self.transactions_failed as f64 / self.transactions_processed as f64;
+        let challenge_rate = self.commits_challenged as f64 / self.commits_posted.max(1) as f64;
+        failure_rate < 0.05 && challenge_rate < 0.1 && self.commits_slashed == 0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorInfo {
+    pub address: Address,
+    pub rollup_id: String,
+    pub bond_amount: u64,
+    pub is_active: bool,
+    pub last_commit: Option<Timestamp>,
+    pub total_commits: u64,
+    pub successful_challenges: u64,
+    pub failed_challenges: u64,
+    pub slash_count: u64,
+    pub reputation_score: f64,
+    pub drs_score: f64,
+    pub avg_latency_ms: u64,
+    pub total_ru_processed: u64,
+    pub cellular_safe_batches: u64,
+    pub five_g_optimized: bool,
+}
+
+pub struct BatchBuilder {
+    operator: Address,
+    rollup_id: String,
+    transactions: Vec<Transaction>,
+    max_batch_size: usize,
+    max_gas_limit: u64,
+    current_gas: u64,
+    chain_id: u32,
+    network_id: u32,
+    shard_id: ShardId,
+}
+
+impl BatchBuilder {
+    pub fn new(
+        operator: Address,
+        rollup_id: String,
+        max_batch_size: usize,
+        max_gas_limit: u64,
+        chain_id: u32,
+        network_id: u32,
+        shard_id: ShardId,
+    ) -> Self {
+        Self {
+            operator,
+            rollup_id,
+            transactions: Vec::new(),
+            max_batch_size,
+            max_gas_limit,
+            current_gas: 0,
+            chain_id,
+            network_id,
+            shard_id,
+        }
+    }
+
+    pub fn can_add_transaction(&self, tx: &Transaction) -> bool {
+        if self.transactions.len() >= self.max_batch_size {
+            return false;
+        }
+        let tx_gas = tx.estimate_resource_units();
+        if self.current_gas + tx_gas > self.max_gas_limit {
+            return false;
+        }
+        true
+    }
+
+    pub fn add_transaction(&mut self, tx: Transaction) -> EgoResult<bool> {
+        if !self.can_add_transaction(&tx) {
+            return Ok(false);
+        }
+        let tx_gas = tx.estimate_resource_units();
+        self.transactions.push(tx);
+        self.current_gas += tx_gas;
+        Ok(true)
+    }
+
+    pub fn is_cellular_safe(&self) -> bool {
+        self.transactions.len() <= MAX_BATCH_SIZE_CELLULAR
+    }
+
+    pub fn is_5g_ready(&self) -> bool {
+        self.transactions.len() >= MAX_BATCH_SIZE_5G / 2
+    }
+
+    pub fn build(
+        self,
+        l1_block: u64,
+        prev_state_root: Hash,
+        epoch: EpochNumber,
+    ) -> EgoResult<RollupBatch> {
+        let tx_hashes: Vec<Vec<u8>> = self
+            .transactions
+            .iter()
+            .map(|tx| tx.hash.to_vec())
+            .collect();
+        let merkle_tree = ego_core::crypto::MerkleTree::build(tx_hashes);
+        let tx_root = merkle_tree.root_hash().unwrap_or(Hash::ZERO);
+
+        let config = bincode::config::standard();
+        let size_bytes = bincode::encode_to_vec(&self.transactions, config)
+            .map(|data| data.len())
+            .unwrap_or(0);
+
+        let is_cellular_safe = self.is_cellular_safe();
+        let is_5g_optimized = self.is_5g_ready();
+
+        let mut batch = RollupBatch {
+            batch_id: Hash::ZERO,
+            rollup_id: self.rollup_id,
+            operator: self.operator,
+            transactions: self.transactions,
+            transaction_results: Vec::new(),
+            prev_state_root,
+            new_state_root: Hash::ZERO,
+            tx_root,
+            receipts_root: Hash::ZERO,
+            proof_events_root: Hash::ZERO,
+            l1_block_number: l1_block,
+            epoch,
+            timestamp: Timestamp::now(),
+            gas_used: self.current_gas,
+            size_bytes,
+            chain_id: self.chain_id,
+            network_id: self.network_id,
+            shard_id: self.shard_id,
+            operator_signature: DualSignature::new(None, None),
+            is_cellular_safe,
+            is_5g_optimized,
+        };
+
+        batch.batch_id = batch.compute_batch_id();
+        Ok(batch)
+    }
+}
+
+pub struct DataAvailability {
+    k: usize,
+    m: usize,
+    chunk_size: usize,
+    enable_compression: bool,
+    compression_level: u32,
+}
+
+impl DataAvailability {
+    pub fn new(
+        k: usize,
+        m: usize,
+        chunk_size: usize,
+        enable_compression: bool,
+        compression_level: u32,
+    ) -> EgoResult<Self> {
+        if k == 0 || m == 0 {
+            return Err(EgoError::InvalidTransaction(
+                "Invalid erasure coding parameters".to_string(),
+            ));
+        }
+        Ok(Self {
+            k,
+            m,
+            chunk_size,
+            enable_compression,
+            compression_level,
+        })
+    }
+
+    pub fn encode_data(
+        &self,
+        batch_id: Hash,
+        data: Vec<u8>,
+        rollup_id: String,
+        operator: Address,
+        epoch: u64,
+    ) -> EgoResult<Vec<DAChunk>> {
+        let processed_data = if self.enable_compression {
+            self.compress_data(&data)?
+        } else {
+            data
+        };
+
+        let chunks = self.split_into_chunks(&processed_data);
+        let total_chunks = chunks.len() as u32;
+
+        let da_chunks: Vec<DAChunk> = chunks
+            .into_iter()
+            .enumerate()
+            .map(|(idx, chunk_data)| {
+                DAChunk::new(
+                    idx as u32,
+                    total_chunks,
+                    chunk_data,
+                    batch_id,
+                    rollup_id.clone(),
+                    operator,
+                    epoch,
+                )
+            })
+            .collect();
+
+        Ok(da_chunks)
+    }
+
+    fn compress_data(&self, data: &[u8]) -> EgoResult<Vec<u8>> {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(self.compression_level));
+        encoder
+            .write_all(data)
+            .map_err(|e| EgoError::SerializationError(e.to_string()))?;
+        encoder
+            .finish()
+            .map_err(|e| EgoError::SerializationError(e.to_string()))
+    }
+
+    fn split_into_chunks(&self, data: &[u8]) -> Vec<Vec<u8>> {
+        data.chunks(self.chunk_size)
+            .map(|chunk| chunk.to_vec())
+            .collect()
+    }
+}
+
+impl Clone for DataAvailability {
+    fn clone(&self) -> Self {
+        Self {
+            k: self.k,
+            m: self.m,
+            chunk_size: self.chunk_size,
+            enable_compression: self.enable_compression,
+            compression_level: self.compression_level,
+        }
+    }
+}
+
+pub struct RollupOperator {
+    config: OperatorConfig,
+    keypair: Arc<ego_core::crypto::KeyPair>,
+    address: Address,
+    state_manager: Arc<RwLock<StateManager>>,
+    da_manager: Arc<RwLock<DataAvailability>>,
+    tx_pool: Arc<RwLock<VecDeque<Transaction>>>,
+    pending_batches: Arc<RwLock<HashMap<Hash, RollupBatch>>>,
+    finalized_batches: Arc<RwLock<HashMap<Hash, RollupBatch>>>,
+    pending_commitments: Arc<RwLock<HashMap<Hash, RollupCommitmentData>>>,
+    metrics: Arc<RwLock<OperatorMetrics>>,
+    is_active: Arc<RwLock<bool>>,
+    last_commit_time: Arc<RwLock<Option<Timestamp>>>,
+    last_batch_time: Arc<RwLock<Option<Timestamp>>>,
+    epoch: Arc<RwLock<u64>>,
+    connection_type: Arc<RwLock<ConnectionType>>,
+    cellular_data_used_mb: Arc<RwLock<u64>>,
+    successful_challenges: Arc<RwLock<u64>>,
+    failed_challenges: Arc<RwLock<u64>>,
+    slash_count: Arc<RwLock<u64>>,
 }
 
 impl RollupOperator {
     pub fn new(
-        config: RollupConfig,
-        keypair: KeyPair,
-        state: RollupState,
-        bond_amount: u64,
-    ) -> RollupResult<Self> {
-        let address = Address::from_public_key(&keypair.public_key());
+        config: OperatorConfig,
+        keypair: ego_core::crypto::KeyPair,
+        state_manager: StateManager,
+    ) -> EgoResult<Self> {
+        let address = Address::from_public_key(&keypair.dilithium_public_key());
 
         let da_manager = DataAvailability::new(
-            config.da.k,
-            config.da.m,
-            config.da.chunk_size,
-            config.da.enable_compression,
-            config.da.compression_level,
+            config.erasure_k as usize,
+            config.erasure_m as usize,
+            config.da_chunk_size,
+            config.enable_compression,
+            config.compression_level,
         )?;
 
-        let commitment_manager = CommitmentManager::new(
-            da_manager.clone(),
-            config.fraud_proofs.challenge_period,
-            config.fraud_proofs.response_window,
-        );
-
-        let state_arc = Arc::new(RwLock::new(state));
-        let batch_processor = BatchProcessor::new(state_arc.clone(), config.clone());
+        let connection_type = if config.enable_5g {
+            ConnectionType::Cellular5G
+        } else {
+            ConnectionType::WiFi
+        };
 
         Ok(Self {
-            config: config.clone(),
+            config,
             keypair: Arc::new(keypair),
             address,
-            state: state_arc,
+            state_manager: Arc::new(RwLock::new(state_manager)),
             da_manager: Arc::new(RwLock::new(da_manager)),
-            commitment_manager: Arc::new(RwLock::new(commitment_manager)),
-            batch_processor: Arc::new(batch_processor),
             tx_pool: Arc::new(RwLock::new(VecDeque::new())),
             pending_batches: Arc::new(RwLock::new(HashMap::new())),
-            metrics: Arc::new(RwLock::new(RollupMetrics::default())),
-            tx_receiver: None,
-            batch_sender: None,
+            finalized_batches: Arc::new(RwLock::new(HashMap::new())),
+            pending_commitments: Arc::new(RwLock::new(HashMap::new())),
+            metrics: Arc::new(RwLock::new(OperatorMetrics::default())),
             is_active: Arc::new(RwLock::new(false)),
-            bond_amount,
             last_commit_time: Arc::new(RwLock::new(None)),
-            edge_nodes: config.five_g.edge_nodes.clone(),
-            current_slice: config.five_g.slice_id.clone(),
+            last_batch_time: Arc::new(RwLock::new(None)),
+            epoch: Arc::new(RwLock::new(0)),
+            connection_type: Arc::new(RwLock::new(connection_type)),
+            cellular_data_used_mb: Arc::new(RwLock::new(0)),
+            successful_challenges: Arc::new(RwLock::new(0)),
+            failed_challenges: Arc::new(RwLock::new(0)),
+            slash_count: Arc::new(RwLock::new(0)),
         })
     }
 
-    pub async fn start(&mut self) -> RollupResult<()> {
-        info!("Starting rollup operator {}", self.address);
-
-        self.config.validate()?;
-
-        if self.bond_amount < self.config.operator.bond_amount {
-            return Err(RollupError::InsufficientBond {
-                required: self.config.operator.bond_amount,
-                available: self.bond_amount,
-            });
-        }
-
-        let (_tx_sender, tx_receiver) = mpsc::unbounded_channel();
-        let (batch_sender, _batch_receiver) = mpsc::unbounded_channel();
-
-        self.tx_receiver = Some(tx_receiver);
-        self.batch_sender = Some(batch_sender);
-
-        {
-            let mut is_active = self.is_active.write().await;
-            *is_active = true;
-        }
-
-        info!("✅ Rollup operator {} started successfully", self.address);
+    pub async fn start(&mut self) -> EgoResult<()> {
+        let mut is_active = self.is_active.write().await;
+        *is_active = true;
         Ok(())
     }
 
-    pub async fn stop(&mut self) -> RollupResult<()> {
-        info!("Stopping rollup operator {}", self.address);
-
-        {
-            let mut is_active = self.is_active.write().await;
-            *is_active = false;
-        }
-
+    pub async fn stop(&mut self) -> EgoResult<()> {
+        let mut is_active = self.is_active.write().await;
+        *is_active = false;
         self.flush_pending_transactions().await?;
-
-        self.tx_receiver = None;
-        self.batch_sender = None;
-
-        info!("✅ Rollup operator {} stopped", self.address);
         Ok(())
     }
 
-    pub async fn submit_transaction(&self, tx: RollupTransaction) -> RollupResult<Hash> {
-        if !tx.inner.verify_signature()? {
-            return Err(RollupError::InvalidBatch(
+    pub async fn submit_transaction(&self, tx: Transaction) -> EgoResult<Hash> {
+        if !tx.verify_signature()? {
+            return Err(EgoError::InvalidTransaction(
                 "Invalid transaction signature".to_string(),
             ));
         }
 
+        if self.config.require_dilithium && tx.signature.dilithium_sig.is_none() {
+            return Err(EgoError::InvalidTransaction(
+                "Dilithium signature required".to_string(),
+            ));
+        }
+
+        if tx.chain_id != self.config.chain_id {
+            return Err(EgoError::InvalidTransaction(
+                "Chain ID mismatch".to_string(),
+            ));
+        }
+
+        if tx.shard_id != self.config.shard_id {
+            return Err(EgoError::InvalidTransaction(
+                "Shard ID mismatch".to_string(),
+            ));
+        }
+
+        let tx_hash = tx.hash;
+
         {
             let mut pool = self.tx_pool.write().await;
             pool.push_back(tx.clone());
-
-            if pool.len() > self.config.performance.tx_pool_size {
-                pool.pop_front();
-                warn!("Transaction pool full, dropping oldest transaction");
-            }
         }
 
         {
             let mut metrics = self.metrics.write().await;
             metrics.transactions_received += 1;
+            let has_dilithium = tx.signature.dilithium_sig.is_some();
+            let has_ed25519 = tx.signature.ed25519_sig.is_some();
+            metrics.record_signature(has_dilithium, has_ed25519);
         }
 
-        Ok(tx.hash())
+        Ok(tx_hash)
     }
 
-    pub async fn process_transactions(&self) -> RollupResult<()> {
-        let mut builder =
-            BatchBuilder::new(self.address, self.config.operator.max_batch_size, 1_000_000);
+    pub async fn process_transactions(&self) -> EgoResult<()> {
+        let batch_start = Instant::now();
+        let is_cellular = self.is_on_cellular().await;
+        let max_size = if is_cellular && self.config.cellular_safe_mode {
+            self.config.cellular_batch_size()
+        } else {
+            self.config.max_batch_size
+        };
+
+        let mut builder = BatchBuilder::new(
+            self.address,
+            self.config.rollup_id.clone(),
+            max_size,
+            self.config.max_gas_limit,
+            self.config.chain_id,
+            self.config.network_id,
+            self.config.shard_id,
+        );
 
         let mut processed_count = 0;
-        let batch_start = Instant::now();
 
         {
             let mut pool = self.tx_pool.write().await;
 
             while let Some(tx) = pool.pop_front() {
                 if builder.can_add_transaction(&tx) {
-                    if builder.add_transaction(tx)? {
-                        processed_count += 1;
+                    match builder.add_transaction(tx.clone()) {
+                        Ok(added) => {
+                            if added {
+                                processed_count += 1;
+                            } else {
+                                pool.push_front(tx);
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            let mut metrics = self.metrics.write().await;
+                            metrics.transactions_failed += 1;
+                            metrics.record_error("tx_add_failed");
+                        }
                     }
                 } else {
                     pool.push_front(tx);
                     break;
                 }
 
-                if batch_start.elapsed()
-                    > Duration::from_secs(self.config.operator.batch_timeout_secs)
-                {
-                    break;
-                }
-
-                if self.config.five_g.enabled && builder.is_5g_ready() {
+                if batch_start.elapsed() > self.config.batch_timeout() {
                     break;
                 }
             }
         }
 
         if processed_count > 0 {
-            self.create_and_process_batch(builder).await?;
+            self.create_and_process_batch(builder, batch_start).await?;
         }
 
         Ok(())
     }
 
-    async fn create_and_process_batch(&self, builder: BatchBuilder) -> RollupResult<()> {
-        let current_block = 1000;
+    async fn create_and_process_batch(
+        &self,
+        builder: BatchBuilder,
+        batch_start: Instant,
+    ) -> EgoResult<()> {
+        let epoch = *self.epoch.read().await;
+        let current_block = epoch * 100 + 1000;
+
         let prev_state_root = {
-            let state = self.state.read().await;
+            let state = self.state_manager.read().await;
             state.compute_state_root()
         };
 
-        let batch = builder.build(current_block, prev_state_root)?;
-        let batch_hash = batch.hash();
+        let epoch_number = EpochNumber::new(epoch);
+        let batch = builder.build(current_block, prev_state_root, epoch_number)?;
+        let batch_hash = batch.batch_id;
+        let tx_count = batch.transactions.len();
 
-        info!(
-            "Processing batch {} with {} transactions",
-            batch_hash,
-            batch.transactions.len()
-        );
-
-        let processed_batch = if self.config.five_g.enabled {
-            self.batch_processor.process_batch_5g(batch).await?
-        } else {
-            self.batch_processor.process_batch(batch).await?
-        };
+        let processing_start = Instant::now();
+        let processed_batch = self.process_batch(batch).await?;
+        let processing_time = processing_start.elapsed().as_millis() as u64;
 
         {
             let mut pending = self.pending_batches.write().await;
@@ -228,34 +865,110 @@ impl RollupOperator {
         }
 
         let da_chunks = self.create_da_chunks(&processed_batch).await?;
-
         let commitment = self.create_commitment(&processed_batch, &da_chunks).await?;
+
+        let is_cellular = self.is_on_cellular().await;
+        let batch_size_bytes = processed_batch.size_bytes as u64;
+
+        if is_cellular {
+            let mut cellular_data = self.cellular_data_used_mb.write().await;
+            *cellular_data += batch_size_bytes / (1024 * 1024);
+        }
 
         self.post_commitment(commitment, da_chunks).await?;
 
         {
+            let mut last_batch = self.last_batch_time.write().await;
+            *last_batch = Some(Timestamp::now());
+        }
+
+        let total_time = batch_start.elapsed().as_millis() as u64;
+
+        {
             let mut metrics = self.metrics.write().await;
             metrics.batches_built += 1;
-            metrics.transactions_processed += processed_batch.transactions.len() as u64;
+            metrics.transactions_processed += tx_count as u64;
+            metrics.total_ru_used += processed_batch.gas_used;
+            metrics.record_batch(
+                processing_time,
+                processed_batch.is_cellular_safe,
+                processed_batch.is_5g_optimized,
+            );
+            metrics.record_data_usage(batch_size_bytes, is_cellular);
+
+            if total_time > self.config.target_latency().as_millis() as u64 {
+                metrics.latency_target_breaches += 1;
+            }
         }
 
         Ok(())
     }
 
-    async fn create_da_chunks(&self, batch: &RollupBatch) -> RollupResult<Vec<DAChunk>> {
+    async fn process_batch(&self, mut batch: RollupBatch) -> EgoResult<RollupBatch> {
+        let mut state = self.state_manager.write().await;
+        let mut results = Vec::new();
+
+        for tx in &batch.transactions {
+            let result = TransactionResult {
+                tx_hash: tx.hash,
+                success: true,
+                error: None,
+                ru_used: tx.estimate_resource_units(),
+                storage_used: 0,
+                state_changes: Vec::new(),
+                events: Vec::new(),
+                cross_shard_receipts: Vec::new(),
+                pq_verification_result: None,
+                proof_verifications: Vec::new(),
+            };
+            results.push(result);
+        }
+
+        batch.transaction_results = results;
+        batch.new_state_root = state.compute_state_root();
+
+        let receipt_hashes: Vec<Vec<u8>> = batch
+            .transaction_results
+            .iter()
+            .map(|r| r.tx_hash.to_vec())
+            .collect();
+        let receipts_tree = ego_core::crypto::MerkleTree::build(receipt_hashes);
+        batch.receipts_root = receipts_tree.root_hash().unwrap_or(Hash::ZERO);
+
+        batch.sign(&self.keypair)?;
+
+        Ok(batch)
+    }
+
+    async fn create_da_chunks(&self, batch: &RollupBatch) -> EgoResult<Vec<DAChunk>> {
         let config = bincode::config::standard();
         let batch_data = bincode::encode_to_vec(batch, config)
-            .map_err(|e| RollupError::SerializationError(e.to_string()))?;
+            .map_err(|e| EgoError::SerializationError(e.to_string()))?;
 
         let mut da_manager = self.da_manager.write().await;
-        da_manager.encode_data(batch.batch_id, batch_data)
+        let epoch = *self.epoch.read().await;
+
+        let chunks = da_manager.encode_data(
+            batch.batch_id,
+            batch_data,
+            self.config.rollup_id.clone(),
+            self.address,
+            epoch,
+        )?;
+
+        {
+            let mut metrics = self.metrics.write().await;
+            metrics.da_chunks_encoded += chunks.len() as u64;
+        }
+
+        Ok(chunks)
     }
 
     async fn create_commitment(
         &self,
         batch: &RollupBatch,
         da_chunks: &[DAChunk],
-    ) -> RollupResult<RollupCommitment> {
+    ) -> EgoResult<RollupCommitmentData> {
         let chunk_hashes: Vec<Vec<u8>> = da_chunks
             .iter()
             .map(|chunk| chunk.chunk_hash.to_vec())
@@ -263,16 +976,18 @@ impl RollupOperator {
 
         let merkle_tree = ego_core::crypto::MerkleTree::build(chunk_hashes);
         let da_root = merkle_tree.root_hash().unwrap_or(Hash::ZERO);
+        let proofs_root = Hash::ZERO;
 
-        let proofs_root = Hash::new([0u8; 32]);
-
-        let mut commitment = RollupCommitment::new(
+        let mut commitment = RollupCommitmentData::new(
             self.address,
-            "ego-rollup".to_string(),
+            self.config.rollup_id.clone(),
             batch,
             da_root,
             proofs_root,
             batch.l1_block_number,
+            self.config.challenge_window_blocks,
+            self.config.chain_id,
+            self.config.network_id,
         );
 
         commitment.sign(&self.keypair)?;
@@ -282,14 +997,22 @@ impl RollupOperator {
 
     async fn post_commitment(
         &self,
-        commitment: RollupCommitment,
+        commitment: RollupCommitmentData,
         da_chunks: Vec<DAChunk>,
-    ) -> RollupResult<Hash> {
+    ) -> EgoResult<Hash> {
         let commitment_hash = commitment.commitment_hash;
+        let commit_start = Instant::now();
+
+        let is_cellular = self.is_on_cellular().await;
+        let use_wifi = self.config.is_wifi_only_operation("commitment_post");
+
+        if is_cellular && use_wifi {
+            return Ok(commitment_hash);
+        }
 
         {
-            let mut manager = self.commitment_manager.write().await;
-            manager.submit_commitment(commitment, da_chunks)?;
+            let mut pending = self.pending_commitments.write().await;
+            pending.insert(commitment_hash, commitment);
         }
 
         {
@@ -297,24 +1020,47 @@ impl RollupOperator {
             *last_commit = Some(Timestamp::now());
         }
 
+        let commit_latency = commit_start.elapsed().as_millis() as u64;
+
         {
             let mut metrics = self.metrics.write().await;
-            metrics.commits_posted += 1;
+            metrics.record_commit(commit_latency);
+            metrics.da_chunks_uploaded += da_chunks.len() as u64;
         }
 
-        info!("Posted commitment {}", commitment_hash);
         Ok(commitment_hash)
     }
 
-    async fn flush_pending_transactions(&self) -> RollupResult<()> {
+    async fn flush_pending_transactions(&self) -> EgoResult<()> {
         let pool_size = {
             let pool = self.tx_pool.read().await;
             pool.len()
         };
 
         if pool_size > 0 {
-            info!("Flushing {} pending transactions", pool_size);
             self.process_transactions().await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn finalize_commitment(&self, commitment_hash: Hash) -> EgoResult<()> {
+        {
+            let mut pending = self.pending_batches.write().await;
+            if let Some(batch) = pending.remove(&commitment_hash) {
+                let mut finalized = self.finalized_batches.write().await;
+                finalized.insert(commitment_hash, batch);
+            }
+        }
+
+        {
+            let mut pending_commits = self.pending_commitments.write().await;
+            pending_commits.remove(&commitment_hash);
+        }
+
+        {
+            let mut metrics = self.metrics.write().await;
+            metrics.commits_finalized += 1;
         }
 
         Ok(())
@@ -324,151 +1070,161 @@ impl RollupOperator {
         let metrics = self.metrics.read().await;
         let last_commit = self.last_commit_time.read().await;
         let is_active = self.is_active.read().await;
+        let successful = *self.successful_challenges.read().await;
+        let failed = *self.failed_challenges.read().await;
+        let slashes = *self.slash_count.read().await;
+
+        let reputation_score =
+            self.calculate_reputation_score(metrics.commits_finalized, successful, failed, slashes);
 
         OperatorInfo {
             address: self.address,
-            bond_amount: self.bond_amount,
+            rollup_id: self.config.rollup_id.clone(),
+            bond_amount: self.config.bond_amount.as_u128() as u64,
             is_active: *is_active,
             last_commit: *last_commit,
             total_commits: metrics.commits_posted,
-            successful_challenges: 0,
-            failed_challenges: 0,
-            slash_count: 0,
-            reputation_score: 1.0,
+            successful_challenges: successful,
+            failed_challenges: failed,
+            slash_count: slashes,
+            reputation_score,
+            drs_score: 1.0,
+            avg_latency_ms: metrics.avg_commit_latency_ms,
+            total_ru_processed: metrics.total_ru_used,
+            cellular_safe_batches: metrics.cellular_safe_batches,
+            five_g_optimized: self.config.enable_5g,
         }
     }
 
-    pub async fn get_metrics(&self) -> RollupMetrics {
+    fn calculate_reputation_score(
+        &self,
+        finalized_commits: u64,
+        successful_challenges: u64,
+        failed_challenges: u64,
+        slashes: u64,
+    ) -> f64 {
+        if finalized_commits == 0 {
+            return 1.0;
+        }
+
+        let base_score = finalized_commits as f64 / (finalized_commits + slashes + 1) as f64;
+        let challenge_penalty = (failed_challenges as f64 * 0.1).min(0.3);
+        let slash_penalty = (slashes as f64 * 0.2).min(0.5);
+
+        (base_score - challenge_penalty - slash_penalty)
+            .max(0.0)
+            .min(1.0)
+    }
+
+    pub async fn get_metrics(&self) -> OperatorMetrics {
         self.metrics.read().await.clone()
     }
 
     pub async fn handle_challenge(
         &self,
         commitment_hash: Hash,
-        challenge_hash: Hash,
-    ) -> RollupResult<()> {
-        info!(
-            "Handling challenge {} for commitment {}",
-            challenge_hash, commitment_hash
-        );
-
+        _challenge_hash: Hash,
+    ) -> EgoResult<()> {
         {
             let mut metrics = self.metrics.write().await;
             metrics.commits_challenged += 1;
+            metrics.challenge_responses += 1;
+        }
+
+        let pending = self.pending_commitments.read().await;
+        if pending.contains_key(&commitment_hash) {
+            let mut successful = self.successful_challenges.write().await;
+            *successful += 1;
+        } else {
+            let mut failed = self.failed_challenges.write().await;
+            *failed += 1;
         }
 
         Ok(())
     }
 
-    pub fn is_5g_optimized(&self) -> bool {
-        self.config.five_g.enabled && self.current_slice.is_some()
-    }
-
-    pub fn target_latency(&self) -> Duration {
-        self.config.target_latency()
-    }
-
-    pub async fn switch_slice(&mut self, slice_id: String) -> RollupResult<()> {
-        if !self.config.five_g.enabled {
-            return Err(RollupError::ConfigError("5G not enabled".to_string()));
+    pub async fn handle_slash(&self, _commitment_hash: Hash, slash_amount: u64) -> EgoResult<()> {
+        {
+            let mut slash_count = self.slash_count.write().await;
+            *slash_count += 1;
         }
 
-        self.current_slice = Some(slice_id.clone());
-        info!("Switched to 5G slice: {}", slice_id);
-        Ok(())
-    }
-}
-
-impl OperatorNode {
-    pub fn new(operator: RollupOperator) -> Self {
-        Self {
-            operator,
-            network_handle: None,
-            batch_handle: None,
-            commit_handle: None,
+        {
+            let mut metrics = self.metrics.write().await;
+            metrics.commits_slashed += 1;
+            metrics.slashing_penalties += slash_amount;
         }
-    }
-
-    pub async fn start(&mut self) -> RollupResult<()> {
-        self.operator.start().await?;
-
-        // Start background tasks
-        self.start_batch_processing().await?;
-        self.start_commit_scheduling().await?;
 
         Ok(())
     }
 
-    pub async fn stop(&mut self) -> RollupResult<()> {
-        if let Some(handle) = self.batch_handle.take() {
-            handle.abort();
-        }
-        if let Some(handle) = self.commit_handle.take() {
-            handle.abort();
-        }
-        if let Some(handle) = self.network_handle.take() {
-            handle.abort();
-        }
-
-        self.operator.stop().await?;
+    pub async fn advance_epoch(&self) -> EgoResult<()> {
+        let mut epoch = self.epoch.write().await;
+        *epoch += 1;
         Ok(())
     }
 
-    async fn start_batch_processing(&mut self) -> RollupResult<()> {
-        let operator = self.operator.clone();
-        let batch_timeout = Duration::from_secs(operator.config.operator.batch_timeout_secs);
+    pub async fn is_on_cellular(&self) -> bool {
+        let conn_type = self.connection_type.read().await;
+        matches!(
+            *conn_type,
+            ConnectionType::Cellular5G | ConnectionType::Cellular4G
+        )
+    }
 
-        let handle = tokio::spawn(async move {
-            let mut interval = interval(batch_timeout);
+    pub async fn switch_connection(&self, connection_type: ConnectionType) -> EgoResult<()> {
+        let mut conn = self.connection_type.write().await;
+        *conn = connection_type;
 
-            loop {
-                interval.tick().await;
+        {
+            let mut metrics = self.metrics.write().await;
+            metrics.network_switches += 1;
+        }
 
-                if let Err(e) = operator.process_transactions().await {
-                    error!("Batch processing error: {}", e);
-                }
-            }
-        });
-
-        self.batch_handle = Some(handle);
         Ok(())
     }
 
-    async fn start_commit_scheduling(&mut self) -> RollupResult<()> {
-        let operator = self.operator.clone();
-        let commit_frequency = Duration::from_secs(operator.config.operator.commit_frequency_secs);
+    pub async fn check_cellular_budget(&self) -> EgoResult<bool> {
+        let cellular_used = *self.cellular_data_used_mb.read().await;
+        let max_allowed = self.config.max_cellular_data_gb_month * 1024;
 
-        let handle = tokio::spawn(async move {
-            let mut interval = interval(commit_frequency);
+        if cellular_used >= max_allowed {
+            return Ok(false);
+        }
 
-            loop {
-                interval.tick().await;
-
-                let pending_count = {
-                    let pending = operator.pending_batches.read().await;
-                    pending.len()
-                };
-
-                if pending_count > 0 {
-                    debug!("Scheduled commit check: {} pending batches", pending_count);
-                }
-            }
-        });
-
-        self.commit_handle = Some(handle);
-        Ok(())
+        Ok(true)
     }
 
-    pub async fn submit_transaction(&self, tx: RollupTransaction) -> RollupResult<Hash> {
-        self.operator.submit_transaction(tx).await
+    pub async fn reset_metrics(&self) {
+        let mut metrics = self.metrics.write().await;
+        *metrics = OperatorMetrics::default();
     }
 
-    pub async fn get_operator_info(&self) -> OperatorInfo {
-        self.operator.get_operator_info().await
+    pub async fn get_batch(&self, batch_hash: Hash) -> Option<RollupBatch> {
+        let pending = self.pending_batches.read().await;
+        if let Some(batch) = pending.get(&batch_hash) {
+            return Some(batch.clone());
+        }
+
+        let finalized = self.finalized_batches.read().await;
+        finalized.get(&batch_hash).cloned()
     }
 
-    pub async fn get_metrics(&self) -> RollupMetrics {
-        self.operator.get_metrics().await
+    pub async fn get_commitment(&self, commitment_hash: Hash) -> Option<RollupCommitmentData> {
+        let pending = self.pending_commitments.read().await;
+        pending.get(&commitment_hash).cloned()
+    }
+
+    pub fn address(&self) -> Address {
+        self.address
+    }
+
+    pub fn rollup_id(&self) -> &str {
+        &self.config.rollup_id
+    }
+
+    pub fn shard_id(&self) -> ShardId {
+        self.config.shard_id
     }
 }
 
@@ -478,114 +1234,214 @@ impl Clone for RollupOperator {
             config: self.config.clone(),
             keypair: self.keypair.clone(),
             address: self.address,
-            state: self.state.clone(),
+            state_manager: self.state_manager.clone(),
             da_manager: self.da_manager.clone(),
-            commitment_manager: self.commitment_manager.clone(),
-            batch_processor: self.batch_processor.clone(),
             tx_pool: self.tx_pool.clone(),
             pending_batches: self.pending_batches.clone(),
+            finalized_batches: self.finalized_batches.clone(),
+            pending_commitments: self.pending_commitments.clone(),
             metrics: self.metrics.clone(),
-            tx_receiver: None,
-            batch_sender: None,
             is_active: self.is_active.clone(),
-            bond_amount: self.bond_amount,
             last_commit_time: self.last_commit_time.clone(),
-            edge_nodes: self.edge_nodes.clone(),
-            current_slice: self.current_slice.clone(),
+            last_batch_time: self.last_batch_time.clone(),
+            epoch: self.epoch.clone(),
+            connection_type: self.connection_type.clone(),
+            cellular_data_used_mb: self.cellular_data_used_mb.clone(),
+            successful_challenges: self.successful_challenges.clone(),
+            failed_challenges: self.failed_challenges.clone(),
+            slash_count: self.slash_count.clone(),
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ego_core::{Balance, KeyPair, ShardId, Transaction, TransactionPayload};
+pub struct OperatorNode {
+    operator: Arc<RollupOperator>,
+    batch_handle: Option<tokio::task::JoinHandle<()>>,
+    commit_handle: Option<tokio::task::JoinHandle<()>>,
+    metrics_handle: Option<tokio::task::JoinHandle<()>>,
+    cellular_monitor_handle: Option<tokio::task::JoinHandle<()>>,
+}
 
-    fn create_test_config() -> RollupConfig {
-        RollupConfig::default()
+impl OperatorNode {
+    pub fn new(operator: RollupOperator) -> Self {
+        Self {
+            operator: Arc::new(operator),
+            batch_handle: None,
+            commit_handle: None,
+            metrics_handle: None,
+            cellular_monitor_handle: None,
+        }
     }
 
-    fn create_test_transaction() -> RollupTransaction {
-        let inner = Transaction::new(
-            Address::new([1u8; 20]),
-            1,
-            TransactionPayload::Transfer {
-                to: Address::new([2u8; 20]),
-                amount: Balance::from_egoc(100),
-                memo: None,
-            },
-            ShardId::new(0).unwrap(),
-            None,
-        );
+    pub async fn start(&mut self) -> EgoResult<()> {
+        let operator_clone = Arc::clone(&self.operator);
+        let mut operator_mut =
+            Arc::try_unwrap(operator_clone).unwrap_or_else(|arc| RollupOperator::clone(&arc));
 
-        crate::types::RollupTransaction::new(inner, 1, 1000)
+        operator_mut.start().await?;
+        self.operator = Arc::new(operator_mut);
+
+        self.start_batch_processing().await?;
+        self.start_commit_scheduling().await?;
+        self.start_metrics_monitoring().await?;
+
+        if self.operator.config.cellular_safe_mode {
+            self.start_cellular_monitoring().await?;
+        }
+
+        Ok(())
     }
 
-    #[tokio::test]
-    async fn test_operator_creation() {
-        let config = create_test_config();
-        let keypair = KeyPair::generate();
-        let state = RollupState::new();
+    pub async fn stop(&mut self) -> EgoResult<()> {
+        if let Some(handle) = self.batch_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.commit_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.metrics_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.cellular_monitor_handle.take() {
+            handle.abort();
+        }
 
-        let operator = RollupOperator::new(config, keypair, state, 1_000_000).unwrap();
-        assert_eq!(operator.bond_amount, 1_000_000);
-        assert!(!operator.is_5g_optimized());
+        let operator_clone = Arc::clone(&self.operator);
+        let mut operator_mut =
+            Arc::try_unwrap(operator_clone).unwrap_or_else(|arc| RollupOperator::clone(&arc));
+
+        operator_mut.stop().await?;
+
+        Ok(())
     }
 
-    #[tokio::test]
-    async fn test_operator_start_stop() {
-        let config = create_test_config();
-        let keypair = KeyPair::generate();
-        let state = RollupState::new();
+    async fn start_batch_processing(&mut self) -> EgoResult<()> {
+        let operator = self.operator.clone();
+        let batch_timeout = operator.config.batch_timeout();
 
-        let mut operator = RollupOperator::new(config, keypair, state, 1_000_000).unwrap();
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(batch_timeout);
 
-        assert!(operator.start().await.is_ok());
-        assert!(operator.stop().await.is_ok());
+            loop {
+                interval.tick().await;
+
+                let is_active = *operator.is_active.read().await;
+                if !is_active {
+                    break;
+                }
+
+                if let Err(_e) = operator.process_transactions().await {
+                    let mut metrics = operator.metrics.write().await;
+                    metrics.record_error("batch_processing");
+                }
+            }
+        });
+
+        self.batch_handle = Some(handle);
+        Ok(())
     }
 
-    #[tokio::test]
-    async fn test_transaction_submission() {
-        let config = create_test_config();
-        let keypair = KeyPair::generate();
-        let state = RollupState::new();
+    async fn start_commit_scheduling(&mut self) -> EgoResult<()> {
+        let operator = self.operator.clone();
+        let commit_frequency = Duration::from_secs(operator.config.commit_frequency_secs);
 
-        let mut operator = RollupOperator::new(config, keypair, state, 1_000_000).unwrap();
-        operator.start().await.unwrap();
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(commit_frequency);
 
-        let tx = create_test_transaction();
-        let tx_hash = operator.submit_transaction(tx).await.unwrap();
+            loop {
+                interval.tick().await;
 
-        assert_ne!(tx_hash, Hash::ZERO);
+                let is_active = *operator.is_active.read().await;
+                if !is_active {
+                    break;
+                }
 
-        let metrics = operator.get_metrics().await;
-        assert_eq!(metrics.transactions_received, 1);
+                if let Err(_e) = operator.advance_epoch().await {}
+            }
+        });
+
+        self.commit_handle = Some(handle);
+        Ok(())
     }
 
-    #[tokio::test]
-    async fn test_operator_node() {
-        let config = create_test_config();
-        let keypair = KeyPair::generate();
-        let state = RollupState::new();
+    async fn start_metrics_monitoring(&mut self) -> EgoResult<()> {
+        let operator = self.operator.clone();
+        let monitoring_interval = Duration::from_secs(60);
 
-        let operator = RollupOperator::new(config, keypair, state, 1_000_000).unwrap();
-        let mut node = OperatorNode::new(operator);
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(monitoring_interval);
 
-        assert!(node.start().await.is_ok());
-        assert!(node.stop().await.is_ok());
+            loop {
+                interval.tick().await;
+
+                let is_active = *operator.is_active.read().await;
+                if !is_active {
+                    break;
+                }
+
+                let metrics = operator.metrics.read().await;
+                if !metrics.is_healthy() {}
+            }
+        });
+
+        self.metrics_handle = Some(handle);
+        Ok(())
     }
 
-    #[tokio::test]
-    async fn test_5g_optimization() {
-        let mut config = create_test_config();
-        config.five_g.enabled = true;
-        config.five_g.slice_id = Some("test-slice".to_string());
+    async fn start_cellular_monitoring(&mut self) -> EgoResult<()> {
+        let operator = self.operator.clone();
+        let check_interval = Duration::from_secs(300);
 
-        let keypair = KeyPair::generate();
-        let state = RollupState::new();
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(check_interval);
 
-        let operator = RollupOperator::new(config, keypair, state, 1_000_000).unwrap();
-        assert!(operator.is_5g_optimized());
-        assert_eq!(operator.target_latency(), Duration::from_millis(10));
+            loop {
+                interval.tick().await;
+
+                let is_active = *operator.is_active.read().await;
+                if !is_active {
+                    break;
+                }
+
+                if let Ok(within_budget) = operator.check_cellular_budget().await {
+                    if !within_budget {
+                        let _ = operator.switch_connection(ConnectionType::WiFi).await;
+                    }
+                }
+            }
+        });
+
+        self.cellular_monitor_handle = Some(handle);
+        Ok(())
+    }
+
+    pub async fn submit_transaction(&self, tx: Transaction) -> EgoResult<Hash> {
+        self.operator.submit_transaction(tx).await
+    }
+
+    pub async fn get_operator_info(&self) -> OperatorInfo {
+        self.operator.get_operator_info().await
+    }
+
+    pub async fn get_metrics(&self) -> OperatorMetrics {
+        self.operator.get_metrics().await
+    }
+
+    pub async fn finalize_commitment(&self, commitment_hash: Hash) -> EgoResult<()> {
+        self.operator.finalize_commitment(commitment_hash).await
+    }
+
+    pub async fn handle_challenge(
+        &self,
+        commitment_hash: Hash,
+        challenge_hash: Hash,
+    ) -> EgoResult<()> {
+        self.operator
+            .handle_challenge(commitment_hash, challenge_hash)
+            .await
+    }
+
+    pub fn operator(&self) -> Arc<RollupOperator> {
+        Arc::clone(&self.operator)
     }
 }
