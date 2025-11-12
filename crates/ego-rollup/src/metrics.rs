@@ -38,6 +38,14 @@ pub struct NetworkMetrics {
     pub cellular_bandwidth_gb: u64,
     pub epoch: EpochNumber,
     pub last_updated: u64,
+    pub deploy_requests_total: u64,
+    pub deploy_requests_accepted: u64,
+    pub deploy_requests_rejected: u64,
+    pub free_deploys_used: u64,
+    pub credits_consumed_total: u64,
+    pub pob_burns_total: u64,
+    pub deploy_bonds_collected: Balance,
+    pub deploy_bonds_slashed: Balance,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +64,8 @@ pub struct ShardMetrics {
     pub storage_provider_count: u32,
     pub last_block_hash: Hash,
     pub last_block_timestamp: u64,
+    pub epoch_deploys: u64,
+    pub epoch_ru_consumed: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +86,11 @@ pub struct ValidatorMetrics {
     pub pq_compliance: bool,
     pub dilithium_signatures: u64,
     pub hybrid_signatures: u64,
+    pub puc_coefficient: f64,
+    pub peer_degree: u16,
+    pub relay_bytes: u64,
+    pub iot_sessions: u32,
+    pub shard_demand_score: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +121,8 @@ pub struct StorageProviderMetrics {
     pub drs_multiplier: f64,
     pub last_audit_epoch: u64,
     pub collateral_locked: Balance,
+    pub triad_primary_count: u32,
+    pub triad_replica_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +155,84 @@ pub enum ConnectionType {
     WiFi,
     Ethernet,
     Unknown,
+}
+
+impl Default for NetworkMetrics {
+    fn default() -> Self {
+        Self {
+            total_blocks: 0,
+            total_transactions: 0,
+            active_validators: 0,
+            active_storage_providers: 0,
+            active_devices: 0,
+            total_staked: Balance::ZERO,
+            network_hash_rate: 0,
+            avg_block_time_ms: 0,
+            tps_current: 0.0,
+            tps_peak: 0.0,
+            total_storage_capacity_gb: 0,
+            total_storage_used_gb: 0,
+            total_shards: 1,
+            cross_shard_transactions: 0,
+            rollup_commits: 0,
+            poc_events_total: 0,
+            post_proofs_total: 0,
+            porep_seals_total: 0,
+            drs_updates_total: 0,
+            fraud_proofs_submitted: 0,
+            fraud_proofs_valid: 0,
+            pq_adoption_rate: 0.0,
+            cellular_node_count: 0,
+            wifi_node_count: 0,
+            hybrid_node_count: 0,
+            total_bandwidth_used_gb: 0,
+            cellular_bandwidth_gb: 0,
+            epoch: EpochNumber::new(0),
+            last_updated: Self::current_timestamp(),
+            deploy_requests_total: 0,
+            deploy_requests_accepted: 0,
+            deploy_requests_rejected: 0,
+            free_deploys_used: 0,
+            credits_consumed_total: 0,
+            pob_burns_total: 0,
+            deploy_bonds_collected: Balance::ZERO,
+            deploy_bonds_slashed: Balance::ZERO,
+        }
+    }
+}
+
+impl NetworkMetrics {
+    pub fn current_timestamp() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    pub fn update_timestamp(&mut self) {
+        self.last_updated = Self::current_timestamp();
+    }
+
+    pub fn storage_utilization_percent(&self) -> f64 {
+        if self.total_storage_capacity_gb == 0 {
+            return 0.0;
+        }
+        (self.total_storage_used_gb as f64 / self.total_storage_capacity_gb as f64) * 100.0
+    }
+
+    pub fn fraud_proof_accuracy(&self) -> f64 {
+        if self.fraud_proofs_submitted == 0 {
+            return 0.0;
+        }
+        (self.fraud_proofs_valid as f64 / self.fraud_proofs_submitted as f64) * 100.0
+    }
+
+    pub fn deploy_acceptance_rate(&self) -> f64 {
+        if self.deploy_requests_total == 0 {
+            return 0.0;
+        }
+        (self.deploy_requests_accepted as f64 / self.deploy_requests_total as f64) * 100.0
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +282,55 @@ pub struct DRSScoreSnapshot {
     pub score: f64,
     pub multiplier: f64,
     pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployMetrics {
+    pub total_deploys: u64,
+    pub successful_deploys: u64,
+    pub failed_deploys: u64,
+    pub rejected_deploys: u64,
+    pub free_quota_deploys: u64,
+    pub credits_deploys: u64,
+    pub total_credits_used: u64,
+    pub total_pob_burned: u64,
+    pub avg_deploy_size_kb: u32,
+    pub avg_ru_per_deploy: u64,
+    pub bonds_collected: Balance,
+    pub bonds_slashed: Balance,
+    pub blacklisted_contracts: u32,
+    pub duplicate_contracts_rejected: u32,
+    pub spam_rejected: u32,
+    pub ai_pattern_detected: u32,
+    pub human_verified: u32,
+    pub last_deploy_timestamp: u64,
+    pub epoch_deploys: u64,
+}
+
+impl Default for DeployMetrics {
+    fn default() -> Self {
+        Self {
+            total_deploys: 0,
+            successful_deploys: 0,
+            failed_deploys: 0,
+            rejected_deploys: 0,
+            free_quota_deploys: 0,
+            credits_deploys: 0,
+            total_credits_used: 0,
+            total_pob_burned: 0,
+            avg_deploy_size_kb: 0,
+            avg_ru_per_deploy: 0,
+            bonds_collected: Balance::ZERO,
+            bonds_slashed: Balance::ZERO,
+            blacklisted_contracts: 0,
+            duplicate_contracts_rejected: 0,
+            spam_rejected: 0,
+            ai_pattern_detected: 0,
+            human_verified: 0,
+            last_deploy_timestamp: 0,
+            epoch_deploys: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -256,6 +400,34 @@ pub struct PQCryptoMetrics {
     pub signature_verification_failures: u64,
 }
 
+impl Default for PQCryptoMetrics {
+    fn default() -> Self {
+        Self {
+            total_dilithium_signatures: 0,
+            total_ed25519_signatures: 0,
+            total_hybrid_signatures: 0,
+            total_slh_dsa_signatures: 0,
+            total_kyber_exchanges: 0,
+            total_x25519_exchanges: 0,
+            pq_handshakes: 0,
+            hybrid_handshakes: 0,
+            avg_dilithium_sign_time_ms: 0,
+            avg_dilithium_verify_time_ms: 0,
+            avg_kyber_encap_time_ms: 0,
+            avg_kyber_decap_time_ms: 0,
+            batch_verifications: 0,
+            avg_batch_verify_time_ms: 0,
+            pq_adoption_rate: 0.0,
+            transition_phase: 1,
+            pq_only_accounts: 0,
+            hybrid_accounts: 0,
+            legacy_accounts: 0,
+            downgrade_attempts_detected: 0,
+            signature_verification_failures: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CellularMetrics {
     pub total_cellular_nodes: u32,
@@ -271,6 +443,26 @@ pub struct CellularMetrics {
     pub cellular_efficiency_score: f64,
     pub bandwidth_sharing_enabled_nodes: u32,
     pub total_bandwidth_shared_gb: u64,
+}
+
+impl Default for CellularMetrics {
+    fn default() -> Self {
+        Self {
+            total_cellular_nodes: 0,
+            cellular_safe_transactions: 0,
+            wifi_only_transactions: 0,
+            throttled_operations: 0,
+            total_cellular_data_gb: 0,
+            total_wifi_data_gb: 0,
+            avg_cellular_cost_per_tx: 0.0,
+            nodes_near_limit: 0,
+            nodes_exceeded_limit: 0,
+            monthly_cellular_avg_gb: 0.0,
+            cellular_efficiency_score: 0.0,
+            bandwidth_sharing_enabled_nodes: 0,
+            total_bandwidth_shared_gb: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,6 +485,9 @@ pub struct EpochMetrics {
     pub rollup_commits: u64,
     pub fraud_proofs: u64,
     pub epoch_finalized: bool,
+    pub deploys_submitted: u64,
+    pub deploys_accepted: u64,
+    pub deploys_rejected: u64,
 }
 
 #[derive(Debug)]
@@ -360,6 +555,10 @@ pub enum AlertType {
     TriadPlacementFailure,
     SectorFaulty,
     DensityPenaltyHigh,
+    DeployQuotaExceeded,
+    DeploySpamDetected,
+    DeployAIPatternDetected,
+    DeployBondSlashed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -393,162 +592,9 @@ pub struct AlertThresholds {
     pub min_drs_score: f64,
     pub max_density_penalty: f64,
     pub max_consecutive_post_misses: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetricsSnapshot {
-    pub timestamp: u64,
-    pub network: NetworkMetrics,
-    pub shards: Vec<ShardMetrics>,
-    pub validators: Vec<ValidatorMetrics>,
-    pub storage_providers: Vec<StorageProviderMetrics>,
-    pub devices: Vec<DeviceMetrics>,
-    pub proofs: Vec<ProofMetrics>,
-    pub drs_scores: Vec<DRSMetrics>,
-    pub rollups: Vec<RollupMetrics>,
-    pub pq_crypto: PQCryptoMetrics,
-    pub cellular: CellularMetrics,
-    pub epoch: EpochMetrics,
-    pub performance: HashMap<String, PerformanceSummary>,
-}
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct AlertStats {
-    pub total_alerts: u64,
-    pub active_alerts: u64,
-    pub resolved_alerts: u64,
-    pub info_alerts: u64,
-    pub warning_alerts: u64,
-    pub error_alerts: u64,
-    pub critical_alerts: u64,
-    pub avg_resolution_time_ms: u64,
-}
-
-pub struct MetricsCollector {
-    network_metrics: Arc<Mutex<NetworkMetrics>>,
-    shard_metrics: Arc<Mutex<HashMap<ShardId, ShardMetrics>>>,
-    validator_metrics: Arc<Mutex<HashMap<Address, ValidatorMetrics>>>,
-    storage_provider_metrics: Arc<Mutex<HashMap<Address, StorageProviderMetrics>>>,
-    device_metrics: Arc<Mutex<HashMap<Address, DeviceMetrics>>>,
-    proof_metrics: Arc<Mutex<HashMap<ProofType, ProofMetrics>>>,
-    drs_metrics: Arc<Mutex<HashMap<Address, DRSMetrics>>>,
-    rollup_metrics: Arc<Mutex<HashMap<String, RollupMetrics>>>,
-    pq_crypto_metrics: Arc<Mutex<PQCryptoMetrics>>,
-    cellular_metrics: Arc<Mutex<CellularMetrics>>,
-    epoch_metrics: Arc<Mutex<HashMap<u64, EpochMetrics>>>,
-    performance_tracker: Arc<Mutex<PerformanceTracker>>,
-    alerts: Arc<Mutex<SystemAlerts>>,
-}
-
-impl Default for NetworkMetrics {
-    fn default() -> Self {
-        Self {
-            total_blocks: 0,
-            total_transactions: 0,
-            active_validators: 0,
-            active_storage_providers: 0,
-            active_devices: 0,
-            total_staked: Balance::ZERO,
-            network_hash_rate: 0,
-            avg_block_time_ms: 0,
-            tps_current: 0.0,
-            tps_peak: 0.0,
-            total_storage_capacity_gb: 0,
-            total_storage_used_gb: 0,
-            total_shards: 1,
-            cross_shard_transactions: 0,
-            rollup_commits: 0,
-            poc_events_total: 0,
-            post_proofs_total: 0,
-            porep_seals_total: 0,
-            drs_updates_total: 0,
-            fraud_proofs_submitted: 0,
-            fraud_proofs_valid: 0,
-            pq_adoption_rate: 0.0,
-            cellular_node_count: 0,
-            wifi_node_count: 0,
-            hybrid_node_count: 0,
-            total_bandwidth_used_gb: 0,
-            cellular_bandwidth_gb: 0,
-            epoch: EpochNumber::new(0),
-            last_updated: Self::current_timestamp(),
-        }
-    }
-}
-
-impl NetworkMetrics {
-    pub fn current_timestamp() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
-    }
-
-    pub fn update_timestamp(&mut self) {
-        self.last_updated = Self::current_timestamp();
-    }
-
-    pub fn storage_utilization_percent(&self) -> f64 {
-        if self.total_storage_capacity_gb == 0 {
-            return 0.0;
-        }
-        (self.total_storage_used_gb as f64 / self.total_storage_capacity_gb as f64) * 100.0
-    }
-
-    pub fn fraud_proof_accuracy(&self) -> f64 {
-        if self.fraud_proofs_submitted == 0 {
-            return 0.0;
-        }
-        (self.fraud_proofs_valid as f64 / self.fraud_proofs_submitted as f64) * 100.0
-    }
-}
-
-impl Default for PQCryptoMetrics {
-    fn default() -> Self {
-        Self {
-            total_dilithium_signatures: 0,
-            total_ed25519_signatures: 0,
-            total_hybrid_signatures: 0,
-            total_slh_dsa_signatures: 0,
-            total_kyber_exchanges: 0,
-            total_x25519_exchanges: 0,
-            pq_handshakes: 0,
-            hybrid_handshakes: 0,
-            avg_dilithium_sign_time_ms: 0,
-            avg_dilithium_verify_time_ms: 0,
-            avg_kyber_encap_time_ms: 0,
-            avg_kyber_decap_time_ms: 0,
-            batch_verifications: 0,
-            avg_batch_verify_time_ms: 0,
-            pq_adoption_rate: 0.0,
-            transition_phase: 1,
-            pq_only_accounts: 0,
-            hybrid_accounts: 0,
-            legacy_accounts: 0,
-            downgrade_attempts_detected: 0,
-            signature_verification_failures: 0,
-        }
-    }
-}
-
-impl Default for CellularMetrics {
-    fn default() -> Self {
-        Self {
-            total_cellular_nodes: 0,
-            cellular_safe_transactions: 0,
-            wifi_only_transactions: 0,
-            throttled_operations: 0,
-            total_cellular_data_gb: 0,
-            total_wifi_data_gb: 0,
-            avg_cellular_cost_per_tx: 0.0,
-            nodes_near_limit: 0,
-            nodes_exceeded_limit: 0,
-            monthly_cellular_avg_gb: 0.0,
-            cellular_efficiency_score: 0.0,
-            bandwidth_sharing_enabled_nodes: 0,
-            total_bandwidth_shared_gb: 0,
-        }
-    }
+    pub max_deploy_spam_score: u32,
+    pub max_deploy_rejection_rate: f64,
+    pub min_deploy_human_verification_rate: f64,
 }
 
 impl Default for AlertThresholds {
@@ -575,8 +621,41 @@ impl Default for AlertThresholds {
             min_drs_score: 0.7,
             max_density_penalty: 0.3,
             max_consecutive_post_misses: 2,
+            max_deploy_spam_score: 100,
+            max_deploy_rejection_rate: 0.5,
+            min_deploy_human_verification_rate: 0.8,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsSnapshot {
+    pub timestamp: u64,
+    pub network: NetworkMetrics,
+    pub shards: Vec<ShardMetrics>,
+    pub validators: Vec<ValidatorMetrics>,
+    pub storage_providers: Vec<StorageProviderMetrics>,
+    pub devices: Vec<DeviceMetrics>,
+    pub proofs: Vec<ProofMetrics>,
+    pub drs_scores: Vec<DRSMetrics>,
+    pub rollups: Vec<RollupMetrics>,
+    pub pq_crypto: PQCryptoMetrics,
+    pub cellular: CellularMetrics,
+    pub epoch: EpochMetrics,
+    pub performance: HashMap<String, PerformanceSummary>,
+    pub deploy: DeployMetrics,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct AlertStats {
+    pub total_alerts: u64,
+    pub active_alerts: u64,
+    pub resolved_alerts: u64,
+    pub info_alerts: u64,
+    pub warning_alerts: u64,
+    pub error_alerts: u64,
+    pub critical_alerts: u64,
+    pub avg_resolution_time_ms: u64,
 }
 
 impl PerformanceTracker {
@@ -829,6 +908,23 @@ impl Default for SystemAlerts {
     }
 }
 
+pub struct MetricsCollector {
+    network_metrics: Arc<Mutex<NetworkMetrics>>,
+    shard_metrics: Arc<Mutex<HashMap<ShardId, ShardMetrics>>>,
+    validator_metrics: Arc<Mutex<HashMap<Address, ValidatorMetrics>>>,
+    storage_provider_metrics: Arc<Mutex<HashMap<Address, StorageProviderMetrics>>>,
+    device_metrics: Arc<Mutex<HashMap<Address, DeviceMetrics>>>,
+    proof_metrics: Arc<Mutex<HashMap<ProofType, ProofMetrics>>>,
+    drs_metrics: Arc<Mutex<HashMap<Address, DRSMetrics>>>,
+    rollup_metrics: Arc<Mutex<HashMap<String, RollupMetrics>>>,
+    pq_crypto_metrics: Arc<Mutex<PQCryptoMetrics>>,
+    cellular_metrics: Arc<Mutex<CellularMetrics>>,
+    epoch_metrics: Arc<Mutex<HashMap<u64, EpochMetrics>>>,
+    performance_tracker: Arc<Mutex<PerformanceTracker>>,
+    alerts: Arc<Mutex<SystemAlerts>>,
+    deploy_metrics: Arc<Mutex<DeployMetrics>>,
+}
+
 impl MetricsCollector {
     pub fn new() -> Self {
         Self {
@@ -845,6 +941,7 @@ impl MetricsCollector {
             epoch_metrics: Arc::new(Mutex::new(HashMap::new())),
             performance_tracker: Arc::new(Mutex::new(PerformanceTracker::new(1000))),
             alerts: Arc::new(Mutex::new(SystemAlerts::new())),
+            deploy_metrics: Arc::new(Mutex::new(DeployMetrics::default())),
         }
     }
 
@@ -887,6 +984,8 @@ impl MetricsCollector {
                 storage_provider_count: 0,
                 last_block_hash: Hash::ZERO,
                 last_block_timestamp: 0,
+                epoch_deploys: 0,
+                epoch_ru_consumed: 0,
             });
 
         shard.block_height = block.header.core.height;
@@ -966,8 +1065,6 @@ impl MetricsCollector {
     }
 
     pub fn record_transaction(&self, tx: &Transaction) -> EgoResult<()> {
-        let mut network = self.network_metrics.lock().unwrap();
-
         if tx.signature.dilithium_sig.is_some() && tx.signature.ed25519_sig.is_some() {
             let mut pq_metrics = self.pq_crypto_metrics.lock().unwrap();
             pq_metrics.total_hybrid_signatures += 1;
@@ -995,7 +1092,121 @@ impl MetricsCollector {
                 let mut cellular = self.cellular_metrics.lock().unwrap();
                 cellular.cellular_safe_transactions += 1;
             }
+            TransactionPayload::DeployContract { .. } => {
+                let mut deploy = self.deploy_metrics.lock().unwrap();
+                deploy.total_deploys += 1;
+                deploy.last_deploy_timestamp = NetworkMetrics::current_timestamp();
+            }
             _ => {}
+        }
+
+        Ok(())
+    }
+
+    pub fn record_deploy_decision(
+        &self,
+        accepted: bool,
+        free_quota_used: bool,
+        credits_used: u64,
+        size_kb: u32,
+        ru_consumed: u64,
+        rejection_reason: Option<&str>,
+    ) -> EgoResult<()> {
+        let mut deploy = self.deploy_metrics.lock().unwrap();
+        let mut network = self.network_metrics.lock().unwrap();
+
+        network.deploy_requests_total += 1;
+
+        if accepted {
+            deploy.successful_deploys += 1;
+            network.deploy_requests_accepted += 1;
+
+            if free_quota_used {
+                deploy.free_quota_deploys += 1;
+                network.free_deploys_used += 1;
+            } else {
+                deploy.credits_deploys += 1;
+            }
+
+            deploy.total_credits_used += credits_used;
+            network.credits_consumed_total += credits_used;
+
+            let total_successful = deploy.successful_deploys;
+            deploy.avg_deploy_size_kb = ((deploy.avg_deploy_size_kb as u64
+                * (total_successful - 1))
+                + size_kb as u64) as u32
+                / total_successful as u32;
+            deploy.avg_ru_per_deploy = ((deploy.avg_ru_per_deploy * (total_successful - 1))
+                + ru_consumed)
+                / total_successful;
+        } else {
+            deploy.rejected_deploys += 1;
+            network.deploy_requests_rejected += 1;
+
+            if let Some(reason) = rejection_reason {
+                if reason.contains("spam") || reason.contains("Anti-spam") {
+                    deploy.spam_rejected += 1;
+                } else if reason.contains("Duplicate") {
+                    deploy.duplicate_contracts_rejected += 1;
+                } else if reason.contains("AI") || reason.contains("filler") {
+                    deploy.ai_pattern_detected += 1;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn record_deploy_bond_event(&self, collected: bool, amount: Balance) -> EgoResult<()> {
+        let mut deploy = self.deploy_metrics.lock().unwrap();
+        let mut network = self.network_metrics.lock().unwrap();
+
+        if collected {
+            deploy.bonds_collected = deploy
+                .bonds_collected
+                .checked_add(amount)
+                .unwrap_or(deploy.bonds_collected);
+            network.deploy_bonds_collected = network
+                .deploy_bonds_collected
+                .checked_add(amount)
+                .unwrap_or(network.deploy_bonds_collected);
+        } else {
+            deploy.bonds_slashed = deploy
+                .bonds_slashed
+                .checked_add(amount)
+                .unwrap_or(deploy.bonds_slashed);
+            network.deploy_bonds_slashed = network
+                .deploy_bonds_slashed
+                .checked_add(amount)
+                .unwrap_or(network.deploy_bonds_slashed);
+        }
+
+        Ok(())
+    }
+
+    pub fn record_deploy_pob_burn(&self, amount: u64) -> EgoResult<()> {
+        let mut deploy = self.deploy_metrics.lock().unwrap();
+        let mut network = self.network_metrics.lock().unwrap();
+
+        deploy.total_pob_burned += amount;
+        network.pob_burns_total += amount;
+
+        Ok(())
+    }
+
+    pub fn record_deploy_verification(
+        &self,
+        human_verified: bool,
+        ai_detected: bool,
+    ) -> EgoResult<()> {
+        let mut deploy = self.deploy_metrics.lock().unwrap();
+
+        if human_verified {
+            deploy.human_verified += 1;
+        }
+
+        if ai_detected {
+            deploy.ai_pattern_detected += 1;
         }
 
         Ok(())
@@ -1026,6 +1237,11 @@ impl MetricsCollector {
                 pq_compliance: false,
                 dilithium_signatures: 0,
                 hybrid_signatures: 0,
+                puc_coefficient: 1.0,
+                peer_degree: 0,
+                relay_bytes: 0,
+                iot_sessions: 0,
+                shard_demand_score: 0,
             });
 
         if let Some(ref validator_info) = account.validator_info {
@@ -1094,6 +1310,8 @@ impl MetricsCollector {
                     drs_multiplier: 1.0,
                     last_audit_epoch: 0,
                     collateral_locked: Balance::ZERO,
+                    triad_primary_count: 0,
+                    triad_replica_count: 0,
                 });
 
             provider.storage_capacity_gb = provider_info.storage_capacity / (1024 * 1024 * 1024);
@@ -1184,7 +1402,9 @@ impl MetricsCollector {
         }
         Ok(())
     }
+}
 
+impl MetricsCollector {
     pub fn record_proof_submission(
         &self,
         proof_type: ProofType,
@@ -1358,6 +1578,69 @@ impl MetricsCollector {
         Ok(())
     }
 
+    pub fn record_rollup_batch(&self, rollup_id: &str, batch_time_ms: u64) -> EgoResult<()> {
+        let mut rollups = self.rollup_metrics.lock().unwrap();
+        if let Some(rollup) = rollups.get_mut(rollup_id) {
+            rollup.batches_built += 1;
+            rollup.avg_batch_processing_time_ms = ((rollup.avg_batch_processing_time_ms
+                * (rollup.batches_built - 1))
+                + batch_time_ms)
+                / rollup.batches_built;
+        }
+        Ok(())
+    }
+
+    pub fn record_rollup_da_activity(
+        &self,
+        rollup_id: &str,
+        chunks_encoded: u64,
+        chunks_served: u64,
+        sample_failures: u64,
+        serve_latency_ms: u64,
+    ) -> EgoResult<()> {
+        let mut rollups = self.rollup_metrics.lock().unwrap();
+        if let Some(rollup) = rollups.get_mut(rollup_id) {
+            rollup.da_chunks_encoded += chunks_encoded;
+            rollup.da_chunks_served += chunks_served;
+            rollup.da_sample_failures += sample_failures;
+            if chunks_served > 0 {
+                rollup.da_serve_latency_ms = ((rollup.da_serve_latency_ms
+                    * (rollup.da_chunks_served - chunks_served))
+                    + (serve_latency_ms * chunks_served))
+                    / rollup.da_chunks_served;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn record_rollup_fraud_proof(&self, rollup_id: &str, valid: bool) -> EgoResult<()> {
+        let mut rollups = self.rollup_metrics.lock().unwrap();
+        if let Some(rollup) = rollups.get_mut(rollup_id) {
+            rollup.fraud_proofs_submitted += 1;
+            if valid {
+                rollup.fraud_proofs_valid += 1;
+            } else {
+                rollup.fraud_proofs_invalid += 1;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn record_rollup_finalization(&self, rollup_id: &str, finalized: bool) -> EgoResult<()> {
+        let mut rollups = self.rollup_metrics.lock().unwrap();
+        if let Some(rollup) = rollups.get_mut(rollup_id) {
+            if finalized {
+                rollup.commits_finalized += 1;
+            }
+            rollup.finalize_ratio = if rollup.commits_posted > 0 {
+                (rollup.commits_finalized as f64 / rollup.commits_posted as f64) * 100.0
+            } else {
+                0.0
+            };
+        }
+        Ok(())
+    }
+
     pub fn record_pq_crypto_operation(
         &self,
         operation: PQCryptoOperation,
@@ -1442,6 +1725,9 @@ impl MetricsCollector {
                 rollup_commits: 0,
                 fraud_proofs: 0,
                 epoch_finalized: false,
+                deploys_submitted: 0,
+                deploys_accepted: 0,
+                deploys_rejected: 0,
             },
         );
         Ok(())
@@ -1456,6 +1742,22 @@ impl MetricsCollector {
         Ok(())
     }
 
+    pub fn update_epoch_deploy_stats(
+        &self,
+        epoch: u64,
+        submitted: u64,
+        accepted: u64,
+        rejected: u64,
+    ) -> EgoResult<()> {
+        let mut epochs = self.epoch_metrics.lock().unwrap();
+        if let Some(epoch_metrics) = epochs.get_mut(&epoch) {
+            epoch_metrics.deploys_submitted += submitted;
+            epoch_metrics.deploys_accepted += accepted;
+            epoch_metrics.deploys_rejected += rejected;
+        }
+        Ok(())
+    }
+
     pub fn check_and_create_alerts(&self) -> EgoResult<()> {
         let mut alerts = self.alerts.lock().unwrap();
         let network = self.network_metrics.lock().unwrap();
@@ -1463,6 +1765,7 @@ impl MetricsCollector {
         let providers = self.storage_provider_metrics.lock().unwrap();
         let cellular = self.cellular_metrics.lock().unwrap();
         let pq_metrics = self.pq_crypto_metrics.lock().unwrap();
+        let deploy = self.deploy_metrics.lock().unwrap();
 
         for (addr, validator) in validators.iter() {
             if validator.uptime_percent < alerts.alert_thresholds.min_validator_uptime_percent {
@@ -1640,6 +1943,46 @@ impl MetricsCollector {
             );
         }
 
+        if deploy.total_deploys > 0 {
+            let rejection_rate = deploy.rejected_deploys as f64 / deploy.total_deploys as f64;
+            if rejection_rate > alerts.alert_thresholds.max_deploy_rejection_rate {
+                let mut metadata = HashMap::new();
+                metadata.insert(
+                    "rejection_rate".to_string(),
+                    format!("{:.2}", rejection_rate),
+                );
+                metadata.insert("rejected".to_string(), deploy.rejected_deploys.to_string());
+                metadata.insert("total".to_string(), deploy.total_deploys.to_string());
+
+                alerts.create_alert_with_metadata(
+                    AlertType::DeploySpamDetected,
+                    AlertSeverity::Warning,
+                    format!("High deploy rejection rate: {:.1}%", rejection_rate * 100.0),
+                    metadata,
+                );
+            }
+        }
+
+        if deploy.total_deploys > 0 && deploy.ai_pattern_detected as u64 > deploy.total_deploys / 10
+        {
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                "ai_detected".to_string(),
+                deploy.ai_pattern_detected.to_string(),
+            );
+            metadata.insert("total".to_string(), deploy.total_deploys.to_string());
+
+            alerts.create_alert_with_metadata(
+                AlertType::DeployAIPatternDetected,
+                AlertSeverity::Warning,
+                format!(
+                    "High AI pattern detection in deploys: {} out of {}",
+                    deploy.ai_pattern_detected, deploy.total_deploys
+                ),
+                metadata,
+            );
+        }
+
         Ok(())
     }
 
@@ -1692,6 +2035,7 @@ impl MetricsCollector {
         let pq_crypto = self.pq_crypto_metrics.lock().unwrap().clone();
         let cellular = self.cellular_metrics.lock().unwrap().clone();
         let performance = self.performance_tracker.lock().unwrap().summary();
+        let deploy = self.deploy_metrics.lock().unwrap().clone();
 
         let current_epoch = network.epoch.as_u64();
         let epoch = self
@@ -1719,6 +2063,9 @@ impl MetricsCollector {
                 rollup_commits: 0,
                 fraud_proofs: 0,
                 epoch_finalized: false,
+                deploys_submitted: 0,
+                deploys_accepted: 0,
+                deploys_rejected: 0,
             });
 
         MetricsSnapshot {
@@ -1735,6 +2082,7 @@ impl MetricsCollector {
             cellular,
             epoch,
             performance,
+            deploy,
         }
     }
 
@@ -1759,6 +2107,7 @@ impl MetricsCollector {
         *self.cellular_metrics.lock().unwrap() = CellularMetrics::default();
         self.epoch_metrics.lock().unwrap().clear();
         self.performance_tracker.lock().unwrap().reset();
+        *self.deploy_metrics.lock().unwrap() = DeployMetrics::default();
     }
 
     pub fn export_metrics_json(&self) -> EgoResult<String> {
@@ -1774,6 +2123,7 @@ impl MetricsCollector {
         *self.network_metrics.lock().unwrap() = snapshot.network;
         *self.pq_crypto_metrics.lock().unwrap() = snapshot.pq_crypto;
         *self.cellular_metrics.lock().unwrap() = snapshot.cellular;
+        *self.deploy_metrics.lock().unwrap() = snapshot.deploy;
 
         let mut shards = self.shard_metrics.lock().unwrap();
         for shard in snapshot.shards {
@@ -1858,6 +2208,10 @@ fn alert_type_to_string(alert_type: &AlertType) -> &str {
         AlertType::TriadPlacementFailure => "triad_placement_failure",
         AlertType::SectorFaulty => "sector_faulty",
         AlertType::DensityPenaltyHigh => "density_penalty_high",
+        AlertType::DeployQuotaExceeded => "deploy_quota_exceeded",
+        AlertType::DeploySpamDetected => "deploy_spam_detected",
+        AlertType::DeployAIPatternDetected => "deploy_ai_pattern_detected",
+        AlertType::DeployBondSlashed => "deploy_bond_slashed",
     }
 }
 
@@ -1918,6 +2272,14 @@ pub fn calculate_network_health_score(snapshot: &MetricsSnapshot) -> f64 {
         score -= snapshot.cellular.nodes_exceeded_limit as f64 * 0.5;
     }
 
+    if snapshot.deploy.total_deploys > 0 {
+        let rejection_rate =
+            snapshot.deploy.rejected_deploys as f64 / snapshot.deploy.total_deploys as f64;
+        if rejection_rate > 0.3 {
+            score -= (rejection_rate - 0.3) * 20.0;
+        }
+    }
+
     score.max(0.0).min(100.0)
 }
 
@@ -1953,6 +2315,34 @@ pub fn calculate_drs_aggregate_score(drs_metrics: &[DRSMetrics]) -> f64 {
     total_score / drs_metrics.len() as f64
 }
 
+pub fn calculate_deploy_health_score(deploy: &DeployMetrics) -> f64 {
+    let mut score = 100.0;
+
+    if deploy.total_deploys > 0 {
+        let success_rate = deploy.successful_deploys as f64 / deploy.total_deploys as f64;
+        if success_rate < 0.9 {
+            score -= (0.9 - success_rate) * 50.0;
+        }
+
+        let rejection_rate = deploy.rejected_deploys as f64 / deploy.total_deploys as f64;
+        if rejection_rate > 0.2 {
+            score -= (rejection_rate - 0.2) * 30.0;
+        }
+
+        let ai_detection_rate = deploy.ai_pattern_detected as f64 / deploy.total_deploys as f64;
+        if ai_detection_rate > 0.1 {
+            score -= (ai_detection_rate - 0.1) * 40.0;
+        }
+
+        let human_verification_rate = deploy.human_verified as f64 / deploy.total_deploys as f64;
+        if human_verification_rate < 0.8 {
+            score -= (0.8 - human_verification_rate) * 20.0;
+        }
+    }
+
+    score.max(0.0).min(100.0)
+}
+
 pub fn format_metrics_summary(snapshot: &MetricsSnapshot) -> String {
     format!(
         "Ego Blockchain Metrics Summary\n\
@@ -1974,7 +2364,13 @@ pub fn format_metrics_summary(snapshot: &MetricsSnapshot) -> String {
         - Nodes: {} | Data Used: {} GB | Efficiency: {:.1}%\n\
         - Safe Transactions: {} | WiFi Only: {}\n\
         \n\
-        Health Score: {:.1}/100\n",
+        Deploy:\n\
+        - Total: {} | Accepted: {} | Rejected: {}\n\
+        - Free Quota: {} | Credits: {}\n\
+        - AI Detected: {} | Human Verified: {}\n\
+        - Spam Rejected: {} | Duplicates: {}\n\
+        \n\
+        Health Score: {:.1}/100 | Deploy Health: {:.1}/100\n",
         snapshot.network.epoch.as_u64(),
         snapshot.network.total_blocks,
         snapshot.network.total_transactions,
@@ -2000,7 +2396,17 @@ pub fn format_metrics_summary(snapshot: &MetricsSnapshot) -> String {
         calculate_cellular_efficiency(&snapshot.cellular),
         snapshot.cellular.cellular_safe_transactions,
         snapshot.cellular.wifi_only_transactions,
-        calculate_network_health_score(snapshot)
+        snapshot.deploy.total_deploys,
+        snapshot.deploy.successful_deploys,
+        snapshot.deploy.rejected_deploys,
+        snapshot.deploy.free_quota_deploys,
+        snapshot.deploy.credits_deploys,
+        snapshot.deploy.ai_pattern_detected,
+        snapshot.deploy.human_verified,
+        snapshot.deploy.spam_rejected,
+        snapshot.deploy.duplicate_contracts_rejected,
+        calculate_network_health_score(snapshot),
+        calculate_deploy_health_score(&snapshot.deploy)
     )
 }
 
@@ -2014,6 +2420,7 @@ mod tests {
         let snapshot = collector.get_snapshot();
         assert_eq!(snapshot.network.total_blocks, 0);
         assert_eq!(snapshot.network.active_validators, 0);
+        assert_eq!(snapshot.deploy.total_deploys, 0);
     }
 
     #[test]
@@ -2085,11 +2492,132 @@ mod tests {
                 rollup_commits: 0,
                 fraud_proofs: 0,
                 epoch_finalized: false,
+                deploys_submitted: 0,
+                deploys_accepted: 0,
+                deploys_rejected: 0,
             },
             performance: HashMap::new(),
+            deploy: DeployMetrics::default(),
         };
 
         let score = calculate_network_health_score(&snapshot);
         assert!(score >= 0.0 && score <= 100.0);
+    }
+
+    #[test]
+    fn test_deploy_metrics_recording() {
+        let collector = MetricsCollector::new();
+
+        collector
+            .record_deploy_decision(true, true, 0, 100, 5000, None)
+            .unwrap();
+        collector
+            .record_deploy_decision(true, false, 1000, 200, 8000, None)
+            .unwrap();
+        collector
+            .record_deploy_decision(false, false, 0, 150, 6000, Some("spam detected"))
+            .unwrap();
+
+        let snapshot = collector.get_snapshot();
+        assert_eq!(snapshot.deploy.successful_deploys, 2);
+        assert_eq!(snapshot.deploy.rejected_deploys, 1);
+        assert_eq!(snapshot.deploy.free_quota_deploys, 1);
+        assert_eq!(snapshot.deploy.credits_deploys, 1);
+        assert_eq!(snapshot.deploy.spam_rejected, 1);
+    }
+
+    #[test]
+    fn test_deploy_verification_recording() {
+        let collector = MetricsCollector::new();
+
+        collector.record_deploy_verification(true, false).unwrap();
+        collector.record_deploy_verification(false, true).unwrap();
+        collector.record_deploy_verification(true, false).unwrap();
+
+        let snapshot = collector.get_snapshot();
+        assert_eq!(snapshot.deploy.human_verified, 2);
+        assert_eq!(snapshot.deploy.ai_pattern_detected, 1);
+    }
+
+    #[test]
+    fn test_deploy_bond_events() {
+        let collector = MetricsCollector::new();
+
+        let bond_amount = Balance::new(1000000);
+        collector
+            .record_deploy_bond_event(true, bond_amount)
+            .unwrap();
+        collector
+            .record_deploy_bond_event(false, bond_amount)
+            .unwrap();
+
+        let snapshot = collector.get_snapshot();
+        assert_eq!(snapshot.deploy.bonds_collected.as_u128(), 1000000);
+        assert_eq!(snapshot.deploy.bonds_slashed.as_u128(), 1000000);
+    }
+
+    #[test]
+    fn test_deploy_pob_burn() {
+        let collector = MetricsCollector::new();
+
+        collector.record_deploy_pob_burn(5000).unwrap();
+        collector.record_deploy_pob_burn(3000).unwrap();
+
+        let snapshot = collector.get_snapshot();
+        assert_eq!(snapshot.deploy.total_pob_burned, 8000);
+        assert_eq!(snapshot.network.pob_burns_total, 8000);
+    }
+
+    #[test]
+    fn test_deploy_health_score_calculation() {
+        let mut deploy = DeployMetrics::default();
+        deploy.total_deploys = 100;
+        deploy.successful_deploys = 95;
+        deploy.rejected_deploys = 5;
+        deploy.ai_pattern_detected = 2;
+        deploy.human_verified = 85;
+
+        let score = calculate_deploy_health_score(&deploy);
+        assert!(score > 80.0 && score <= 100.0);
+    }
+
+    #[test]
+    fn test_alert_thresholds_for_deploy() {
+        let thresholds = AlertThresholds::default();
+        assert_eq!(thresholds.max_deploy_spam_score, 100);
+        assert_eq!(thresholds.max_deploy_rejection_rate, 0.5);
+        assert_eq!(thresholds.min_deploy_human_verification_rate, 0.8);
+    }
+
+    #[test]
+    fn test_epoch_deploy_stats_update() {
+        let collector = MetricsCollector::new();
+        collector.start_epoch(0).unwrap();
+
+        collector.update_epoch_deploy_stats(0, 10, 8, 2).unwrap();
+        collector.update_epoch_deploy_stats(0, 5, 4, 1).unwrap();
+
+        let epochs = collector.epoch_metrics.lock().unwrap();
+        let epoch = epochs.get(&0).unwrap();
+        assert_eq!(epoch.deploys_submitted, 15);
+        assert_eq!(epoch.deploys_accepted, 12);
+        assert_eq!(epoch.deploys_rejected, 3);
+    }
+
+    #[test]
+    fn test_metrics_export_import() {
+        let collector = MetricsCollector::new();
+        collector
+            .record_deploy_decision(true, true, 0, 100, 5000, None)
+            .unwrap();
+
+        let json = collector.export_metrics_json().unwrap();
+        assert!(!json.is_empty());
+
+        let new_collector = MetricsCollector::new();
+        new_collector.import_metrics_json(&json).unwrap();
+
+        let snapshot = new_collector.get_snapshot();
+        assert_eq!(snapshot.deploy.successful_deploys, 1);
     }
 }
