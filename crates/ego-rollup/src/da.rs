@@ -1,9 +1,9 @@
 use crate::error::{RollupError, RollupResult};
-use ego_core::{Address, Balance, Hash, Timestamp};
+use ego_core::{Address, Balance, Hash, Timestamp, BlockHeight, ShardId};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use zstd;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct DAChunk {
@@ -16,6 +16,8 @@ pub struct DAChunk {
     pub provider: Option<Address>,
     pub replica_count: u8,
     pub access_count: u64,
+    pub shard_id: ShardId,
+    pub epoch: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -27,6 +29,8 @@ pub struct DAProof {
     pub root_hash: Hash,
     pub proof_timestamp: Timestamp,
     pub prover: Address,
+    pub signature: Vec<u8>,
+    pub alg_sig_id: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -39,6 +43,8 @@ pub struct DAUnavailabilityProof {
     pub challenger: Address,
     pub challenge_bond: Balance,
     pub expected_providers: Vec<Address>,
+    pub evidence_root: Hash,
+    pub signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -49,6 +55,7 @@ pub struct FailedRequest {
     pub timeout_time: Timestamp,
     pub error: String,
     pub retry_count: u32,
+    pub last_attempt: Timestamp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -61,8 +68,12 @@ pub struct DACommitment {
     pub rs_params: RSParams,
     pub timestamp: Timestamp,
     pub epoch: u64,
+    pub block_height: BlockHeight,
     pub rollup_id: String,
     pub operator: Address,
+    pub shard_id: ShardId,
+    pub proof_batch_hash: Hash,
+    pub cellular_safe_verified: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -72,6 +83,8 @@ pub struct DASamplingRequest {
     pub random_seed: [u8; 32],
     pub requester: Address,
     pub deadline_epoch: u64,
+    pub shard_id: ShardId,
+    pub priority: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -81,6 +94,8 @@ pub struct DASamplingResponse {
     pub proof: DAProof,
     pub responder: Address,
     pub response_time_ms: u32,
+    pub latency_within_sla: bool,
+    pub signature: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -90,6 +105,8 @@ pub struct DAWindow {
     pub commitments: Vec<Hash>,
     pub challenge_period: u64,
     pub active_challenges: HashMap<Hash, Vec<Address>>,
+    pub finalized: bool,
+    pub shard_id: ShardId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -103,6 +120,8 @@ pub struct DAChallenge {
     pub deadline_epoch: u64,
     pub bond: Balance,
     pub status: ChallengeStatus,
+    pub response_hash: Option<Hash>,
+    pub slash_amount: Option<Balance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -110,6 +129,7 @@ pub enum ChallengeType {
     Availability,
     Integrity,
     Performance,
+    Fraud,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -119,6 +139,7 @@ pub enum ChallengeStatus {
     Resolved,
     Failed,
     Slashed,
+    Expired,
 }
 
 #[derive(Debug, Clone)]
@@ -127,13 +148,17 @@ pub struct DataAvailability {
     chunk_size: usize,
     compression_enabled: bool,
     compression_level: i32,
-    stored_chunks: HashMap<Hash, HashMap<u32, DAChunk>>,
-    chunk_providers: HashMap<u32, Vec<Address>>,
-    commitments: HashMap<Hash, DACommitment>,
-    active_challenges: HashMap<Hash, DAChallenge>,
-    windows: Vec<DAWindow>,
-    sample_cache: HashMap<Hash, Vec<DAChunk>>,
-    verified_proofs: HashSet<Hash>,
+    stored_chunks: Arc<Mutex<HashMap<Hash, HashMap<u32, DAChunk>>>>,
+    chunk_providers: Arc<Mutex<HashMap<u32, Vec<Address>>>>,
+    commitments: Arc<Mutex<HashMap<Hash, DACommitment>>>,
+    active_challenges: Arc<Mutex<HashMap<Hash, DAChallenge>>>,
+    windows: Arc<Mutex<VecDeque<DAWindow>>>,
+    sample_cache: Arc<Mutex<HashMap<Hash, Vec<DAChunk>>>>,
+    verified_proofs: Arc<Mutex<HashSet<Hash>>>,
+    provider_performance: Arc<Mutex<HashMap<Address, ProviderMetrics>>>,
+    cellular_safe_config: CellularSafeConfig,
+    sla_ms: u32,
+    max_windows: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -143,6 +168,37 @@ pub struct RSParams {
     pub n: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct CellularSafeConfig {
+    pub enabled: bool,
+    pub max_chunk_size: usize,
+    pub max_batch_size: usize,
+    pub compression_required: bool,
+    pub monthly_limit_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProviderMetrics {
+    pub chunks_served: u64,
+    pub chunks_failed: u64,
+    pub avg_response_time_ms: u32,
+    pub last_activity: Timestamp,
+    pub reputation_score: f64,
+    pub total_bandwidth_served: u64,
+}
+
+impl Default for CellularSafeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_chunk_size: 1024 * 256,
+            max_batch_size: 100,
+            compression_required: true,
+            monthly_limit_bytes: 50 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
 impl DataAvailability {
     pub fn new(
         k: usize,
@@ -150,6 +206,8 @@ impl DataAvailability {
         chunk_size: usize,
         compression_enabled: bool,
         compression_level: i32,
+        cellular_safe_config: CellularSafeConfig,
+        sla_ms: u32,
     ) -> RollupResult<Self> {
         if k == 0 || m == 0 {
             return Err(RollupError::DataAvailability(
@@ -171,25 +229,36 @@ impl DataAvailability {
             chunk_size,
             compression_enabled,
             compression_level,
-            stored_chunks: HashMap::new(),
-            chunk_providers: HashMap::new(),
-            commitments: HashMap::new(),
-            active_challenges: HashMap::new(),
-            windows: Vec::new(),
-            sample_cache: HashMap::new(),
-            verified_proofs: HashSet::new(),
+            stored_chunks: Arc::new(Mutex::new(HashMap::new())),
+            chunk_providers: Arc::new(Mutex::new(HashMap::new())),
+            commitments: Arc::new(Mutex::new(HashMap::new())),
+            active_challenges: Arc::new(Mutex::new(HashMap::new())),
+            windows: Arc::new(Mutex::new(VecDeque::new())),
+            sample_cache: Arc::new(Mutex::new(HashMap::new())),
+            verified_proofs: Arc::new(Mutex::new(HashSet::new())),
+            provider_performance: Arc::new(Mutex::new(HashMap::new())),
+            cellular_safe_config,
+            sla_ms,
+            max_windows: 1000,
         })
     }
 
     pub fn encode_data(
-        &mut self,
+        &self,
         commitment_hash: Hash,
         data: Vec<u8>,
         rollup_id: String,
         operator: Address,
         epoch: u64,
+        block_height: BlockHeight,
+        shard_id: ShardId,
+        proof_batch_hash: Hash,
     ) -> RollupResult<Vec<DAChunk>> {
         let original_size = data.len();
+
+        if self.cellular_safe_config.enabled {
+            self.validate_cellular_constraints(original_size)?;
+        }
 
         let processed_data = if self.compression_enabled {
             zstd::encode_all(&data[..], self.compression_level)
@@ -244,24 +313,34 @@ impl DataAvailability {
                 provider: Some(operator),
                 replica_count: 1,
                 access_count: 0,
+                shard_id,
+                epoch,
             };
 
             da_chunks.push(da_chunk);
         }
 
-        self.stored_chunks.insert(
+        let mut stored_chunks = self.stored_chunks.lock().unwrap();
+        stored_chunks.insert(
             commitment_hash,
             da_chunks
                 .iter()
                 .map(|chunk| (chunk.chunk_id, chunk.clone()))
                 .collect(),
         );
+        drop(stored_chunks);
 
         let all_hashes: Vec<Vec<u8>> = da_chunks.iter().map(|c| c.chunk_hash.to_vec()).collect();
         let merkle_tree = ego_core::crypto::MerkleTree::build(all_hashes);
         let data_root = merkle_tree
             .root_hash()
             .unwrap_or_else(|| Hash::new([0u8; 32]));
+
+        let cellular_safe_verified = if self.cellular_safe_config.enabled {
+            self.verify_cellular_safe_commitment(original_size, compressed_size)
+        } else {
+            true
+        };
 
         let commitment = DACommitment {
             commitment_hash,
@@ -272,11 +351,19 @@ impl DataAvailability {
             rs_params: self.rs_params.clone(),
             timestamp,
             epoch,
+            block_height,
             rollup_id,
             operator,
+            shard_id,
+            proof_batch_hash,
+            cellular_safe_verified,
         };
 
-        self.commitments.insert(commitment_hash, commitment);
+        let mut commitments = self.commitments.lock().unwrap();
+        commitments.insert(commitment_hash, commitment);
+        drop(commitments);
+
+        self.update_provider_metrics(operator, da_chunks.len() as u64, 0);
 
         Ok(da_chunks)
     }
@@ -349,12 +436,12 @@ impl DataAvailability {
     }
 
     pub fn sample_chunks(
-        &mut self,
+        &self,
         commitment_hash: Hash,
         sample_indices: Vec<u32>,
     ) -> RollupResult<Vec<DAChunk>> {
-        let chunks = self
-            .stored_chunks
+        let mut stored_chunks = self.stored_chunks.lock().unwrap();
+        let chunks = stored_chunks
             .get_mut(&commitment_hash)
             .ok_or_else(|| RollupError::DataAvailability("Commitment not found".to_string()))?;
 
@@ -370,9 +457,11 @@ impl DataAvailability {
                 )));
             }
         }
+        drop(stored_chunks);
 
-        self.sample_cache
-            .insert(commitment_hash, sampled_chunks.clone());
+        let mut sample_cache = self.sample_cache.lock().unwrap();
+        sample_cache.insert(commitment_hash, sampled_chunks.clone());
+        drop(sample_cache);
 
         Ok(sampled_chunks)
     }
@@ -382,9 +471,11 @@ impl DataAvailability {
         commitment_hash: Hash,
         chunk_indices: Vec<u32>,
         prover: Address,
+        signature: Vec<u8>,
+        alg_sig_id: u16,
     ) -> RollupResult<DAProof> {
-        let chunks = self
-            .stored_chunks
+        let stored_chunks = self.stored_chunks.lock().unwrap();
+        let chunks = stored_chunks
             .get(&commitment_hash)
             .ok_or_else(|| RollupError::DataAvailability("Commitment not found".to_string()))?;
 
@@ -420,15 +511,18 @@ impl DataAvailability {
             root_hash,
             proof_timestamp: Timestamp::now(),
             prover,
+            signature,
+            alg_sig_id,
         })
     }
 
-    pub fn verify_da_proof(&mut self, proof: &DAProof) -> RollupResult<bool> {
+    pub fn verify_da_proof(&self, proof: &DAProof) -> RollupResult<bool> {
         if proof.chunk_indices.len() != proof.chunk_hashes.len() {
             return Ok(false);
         }
 
-        if let Some(chunks) = self.stored_chunks.get(&proof.commitment_hash) {
+        let stored_chunks = self.stored_chunks.lock().unwrap();
+        if let Some(chunks) = stored_chunks.get(&proof.commitment_hash) {
             for (&index, &expected_hash) in
                 proof.chunk_indices.iter().zip(proof.chunk_hashes.iter())
             {
@@ -457,7 +551,9 @@ impl DataAvailability {
                 })?,
             );
 
-            self.verified_proofs.insert(proof_hash);
+            let mut verified_proofs = self.verified_proofs.lock().unwrap();
+            verified_proofs.insert(proof_hash);
+            drop(verified_proofs);
 
             Ok(true)
         } else {
@@ -471,17 +567,21 @@ impl DataAvailability {
         sample_indices: Vec<u32>,
         challenger: Address,
         challenge_bond: Balance,
+        signature: Vec<u8>,
     ) -> RollupResult<DAUnavailabilityProof> {
         let mut missing_chunks = Vec::new();
         let mut failed_requests = Vec::new();
         let mut expected_providers = Vec::new();
 
-        if let Some(chunks) = self.stored_chunks.get(&commitment_hash) {
+        let stored_chunks = self.stored_chunks.lock().unwrap();
+        let chunk_providers = self.chunk_providers.lock().unwrap();
+
+        if let Some(chunks) = stored_chunks.get(&commitment_hash) {
             for &index in &sample_indices {
                 if !chunks.contains_key(&index) {
                     missing_chunks.push(index);
 
-                    if let Some(providers) = self.chunk_providers.get(&index) {
+                    if let Some(providers) = chunk_providers.get(&index) {
                         expected_providers.extend(providers.clone());
 
                         for provider in providers {
@@ -492,6 +592,7 @@ impl DataAvailability {
                                 timeout_time: Timestamp::now(),
                                 error: "Chunk not available".to_string(),
                                 retry_count: 3,
+                                last_attempt: Timestamp::now(),
                             });
                         }
                     } else {
@@ -502,6 +603,7 @@ impl DataAvailability {
                             timeout_time: Timestamp::now(),
                             error: "No provider registered".to_string(),
                             retry_count: 0,
+                            last_attempt: Timestamp::now(),
                         });
                     }
                 }
@@ -517,15 +619,27 @@ impl DataAvailability {
                     timeout_time: Timestamp::now(),
                     error: "Commitment not found".to_string(),
                     retry_count: 0,
+                    last_attempt: Timestamp::now(),
                 });
             }
         }
+
+        drop(stored_chunks);
+        drop(chunk_providers);
 
         if missing_chunks.is_empty() {
             return Err(RollupError::DataAvailability(
                 "All chunks are available - cannot create unavailability proof".to_string(),
             ));
         }
+
+        let evidence_data = bincode::encode_to_vec(
+            &(&missing_chunks, &failed_requests),
+            bincode::config::standard(),
+        )
+        .map_err(|e| RollupError::DataAvailability(format!("Evidence encoding failed: {}", e)))?;
+
+        let evidence_root = ego_core::crypto::hash_data(&evidence_data);
 
         Ok(DAUnavailabilityProof {
             commitment_hash,
@@ -536,18 +650,22 @@ impl DataAvailability {
             challenger,
             challenge_bond,
             expected_providers,
+            evidence_root,
+            signature,
         })
     }
 
-    pub fn register_chunk_provider(&mut self, chunk_id: u32, provider: Address) {
-        self.chunk_providers
+    pub fn register_chunk_provider(&self, chunk_id: u32, provider: Address) {
+        let mut chunk_providers = self.chunk_providers.lock().unwrap();
+        chunk_providers
             .entry(chunk_id)
             .or_insert_with(Vec::new)
             .push(provider);
     }
 
     pub fn get_chunk_providers(&self, chunk_id: u32) -> Vec<Address> {
-        self.chunk_providers
+        let chunk_providers = self.chunk_providers.lock().unwrap();
+        chunk_providers
             .get(&chunk_id)
             .cloned()
             .unwrap_or_default()
@@ -581,12 +699,16 @@ impl DataAvailability {
         random_seed: [u8; 32],
         requester: Address,
         deadline_epoch: u64,
+        shard_id: ShardId,
+        priority: u8,
     ) -> RollupResult<DASamplingRequest> {
-        if !self.commitments.contains_key(&commitment_hash) {
+        let commitments = self.commitments.lock().unwrap();
+        if !commitments.contains_key(&commitment_hash) {
             return Err(RollupError::DataAvailability(
                 "Commitment not found".to_string(),
             ));
         }
+        drop(commitments);
 
         Ok(DASamplingRequest {
             commitment_hash,
@@ -594,13 +716,16 @@ impl DataAvailability {
             random_seed,
             requester,
             deadline_epoch,
+            shard_id,
+            priority,
         })
     }
 
     pub fn respond_to_sampling(
-        &mut self,
+        &self,
         request: &DASamplingRequest,
         responder: Address,
+        signature: Vec<u8>,
     ) -> RollupResult<DASamplingResponse> {
         let start_time = std::time::Instant::now();
 
@@ -612,9 +737,16 @@ impl DataAvailability {
 
         let chunks = self.sample_chunks(request.commitment_hash, sample_indices.clone())?;
 
-        let proof = self.generate_da_proof(request.commitment_hash, sample_indices, responder)?;
+        let proof = self.generate_da_proof(
+            request.commitment_hash,
+            sample_indices,
+            responder,
+            signature.clone(),
+            1,
+        )?;
 
         let response_time_ms = start_time.elapsed().as_millis() as u32;
+        let latency_within_sla = response_time_ms <= self.sla_ms;
 
         let request_hash = ego_core::crypto::hash_data(
             &bincode::encode_to_vec(request, bincode::config::standard()).map_err(|e| {
@@ -622,12 +754,16 @@ impl DataAvailability {
             })?,
         );
 
+        self.update_provider_metrics(responder, chunks.len() as u64, response_time_ms);
+
         Ok(DASamplingResponse {
             request_hash,
             chunks,
             proof,
             responder,
             response_time_ms,
+            latency_within_sla,
+            signature,
         })
     }
 
@@ -637,12 +773,13 @@ impl DataAvailability {
         sample_size: u32,
         random_seed: &[u8; 32],
     ) -> RollupResult<Vec<u32>> {
-        let commitment = self
-            .commitments
+        let commitments = self.commitments.lock().unwrap();
+        let commitment = commitments
             .get(&commitment_hash)
             .ok_or_else(|| RollupError::DataAvailability("Commitment not found".to_string()))?;
 
         let chunk_count = commitment.chunk_count;
+        drop(commitments);
 
         if sample_size > chunk_count {
             return Err(RollupError::DataAvailability(
@@ -673,7 +810,7 @@ impl DataAvailability {
     }
 
     pub fn create_challenge(
-        &mut self,
+        &self,
         commitment_hash: Hash,
         challenger: Address,
         challenge_type: ChallengeType,
@@ -681,11 +818,13 @@ impl DataAvailability {
         deadline_epoch: u64,
         bond: Balance,
     ) -> RollupResult<DAChallenge> {
-        if !self.commitments.contains_key(&commitment_hash) {
+        let commitments = self.commitments.lock().unwrap();
+        if !commitments.contains_key(&commitment_hash) {
             return Err(RollupError::DataAvailability(
                 "Commitment not found".to_string(),
             ));
         }
+        drop(commitments);
 
         let mut random_seed = [0u8; 32];
         use rand::RngCore;
@@ -717,21 +856,24 @@ impl DataAvailability {
             deadline_epoch,
             bond,
             status: ChallengeStatus::Pending,
+            response_hash: None,
+            slash_amount: None,
         };
 
-        self.active_challenges
-            .insert(challenge_id, challenge.clone());
+        let mut active_challenges = self.active_challenges.lock().unwrap();
+        active_challenges.insert(challenge_id, challenge.clone());
+        drop(active_challenges);
 
         Ok(challenge)
     }
 
     pub fn resolve_challenge(
-        &mut self,
+        &self,
         challenge_id: Hash,
         proof: DAProof,
     ) -> RollupResult<ChallengeStatus> {
-        let challenge = self
-            .active_challenges
+        let mut active_challenges = self.active_challenges.lock().unwrap();
+        let challenge = active_challenges
             .get(&challenge_id)
             .ok_or_else(|| RollupError::DataAvailability("Challenge not found".to_string()))?;
 
@@ -742,15 +884,22 @@ impl DataAvailability {
                 "Challenge already resolved".to_string(),
             ));
         }
+        drop(active_challenges);
 
         let verified = self.verify_da_proof(&proof)?;
 
-        let challenge = self
-            .active_challenges
+        let mut active_challenges = self.active_challenges.lock().unwrap();
+        let challenge = active_challenges
             .get_mut(&challenge_id)
             .ok_or_else(|| RollupError::DataAvailability("Challenge not found".to_string()))?;
 
         challenge.status = ChallengeStatus::Responding;
+
+        let proof_hash = ego_core::crypto::hash_data(
+            &bincode::encode_to_vec(&proof, bincode::config::standard())
+                .map_err(|e| RollupError::DataAvailability(format!("Encoding failed: {}", e)))?,
+        );
+        challenge.response_hash = Some(proof_hash);
 
         if verified {
             challenge.status = ChallengeStatus::Resolved;
@@ -762,11 +911,11 @@ impl DataAvailability {
     }
 
     pub fn slash_on_unavailability(
-        &mut self,
+        &self,
         challenge_id: Hash,
     ) -> RollupResult<(Address, Balance)> {
-        let challenge = self
-            .active_challenges
+        let mut active_challenges = self.active_challenges.lock().unwrap();
+        let challenge = active_challenges
             .get_mut(&challenge_id)
             .ok_or_else(|| RollupError::DataAvailability("Challenge not found".to_string()))?;
 
@@ -776,27 +925,37 @@ impl DataAvailability {
             ));
         }
 
-        let commitment = self
-            .commitments
-            .get(&challenge.commitment_hash)
+        let commitment_hash = challenge.commitment_hash;
+        drop(active_challenges);
+
+        let commitments = self.commitments.lock().unwrap();
+        let commitment = commitments
+            .get(&commitment_hash)
             .ok_or_else(|| RollupError::DataAvailability("Commitment not found".to_string()))?;
 
         let operator = commitment.operator;
+        drop(commitments);
+
+        let mut active_challenges = self.active_challenges.lock().unwrap();
+        let challenge = active_challenges.get_mut(&challenge_id).unwrap();
+
         let slash_amount = challenge
             .bond
             .checked_mul(2u128.into())
             .unwrap_or(challenge.bond);
 
         challenge.status = ChallengeStatus::Slashed;
+        challenge.slash_amount = Some(slash_amount);
 
         Ok((operator, slash_amount))
     }
 
     pub fn create_window(
-        &mut self,
+        &self,
         start_epoch: u64,
         end_epoch: u64,
         challenge_period: u64,
+        shard_id: ShardId,
     ) -> DAWindow {
         let window = DAWindow {
             start_epoch,
@@ -804,87 +963,126 @@ impl DataAvailability {
             commitments: Vec::new(),
             challenge_period,
             active_challenges: HashMap::new(),
+            finalized: false,
+            shard_id,
         };
 
-        self.windows.push(window.clone());
+        let mut windows = self.windows.lock().unwrap();
+        windows.push_back(window.clone());
+
+        while windows.len() > self.max_windows {
+            windows.pop_front();
+        }
+        drop(windows);
+
         window
     }
 
-    pub fn add_commitment_to_window(&mut self, window_index: usize, commitment_hash: Hash) {
-        if let Some(window) = self.windows.get_mut(window_index) {
+    pub fn add_commitment_to_window(&self, window_index: usize, commitment_hash: Hash) {
+        let mut windows = self.windows.lock().unwrap();
+        if let Some(window) = windows.get_mut(window_index) {
             window.commitments.push(commitment_hash);
         }
     }
 
-    pub fn get_active_window(&self, current_epoch: u64) -> Option<&DAWindow> {
-        self.windows
+    pub fn finalize_window(&self, window_index: usize) -> RollupResult<()> {
+        let mut windows = self.windows.lock().unwrap();
+        if let Some(window) = windows.get_mut(window_index) {
+            window.finalized = true;
+            Ok(())
+        } else {
+            Err(RollupError::DataAvailability(
+                "Window not found".to_string(),
+            ))
+        }
+    }
+
+    pub fn get_active_window(&self, current_epoch: u64) -> Option<DAWindow> {
+        let windows = self.windows.lock().unwrap();
+        windows
             .iter()
             .find(|w| current_epoch >= w.start_epoch && current_epoch <= w.end_epoch)
+            .cloned()
     }
 
-    pub fn get_commitment(&self, commitment_hash: Hash) -> Option<&DACommitment> {
-        self.commitments.get(&commitment_hash)
+    pub fn get_commitment(&self, commitment_hash: Hash) -> Option<DACommitment> {
+        let commitments = self.commitments.lock().unwrap();
+        commitments.get(&commitment_hash).cloned()
     }
 
-    pub fn get_chunk(&self, commitment_hash: Hash, chunk_id: u32) -> Option<&DAChunk> {
-        self.stored_chunks
+    pub fn get_chunk(&self, commitment_hash: Hash, chunk_id: u32) -> Option<DAChunk> {
+        let stored_chunks = self.stored_chunks.lock().unwrap();
+        stored_chunks
             .get(&commitment_hash)
             .and_then(|chunks| chunks.get(&chunk_id))
+            .cloned()
     }
 
-    pub fn prune_old_data(&mut self, cutoff_epoch: u64) -> usize {
+    pub fn prune_old_data(&self, cutoff_epoch: u64) -> usize {
         let mut pruned_count = 0;
 
-        let expired_commitments: Vec<Hash> = self
-            .commitments
+        let mut commitments = self.commitments.lock().unwrap();
+        let expired_commitments: Vec<Hash> = commitments
             .iter()
             .filter(|(_, c)| c.epoch < cutoff_epoch)
             .map(|(h, _)| *h)
             .collect();
 
+        let mut stored_chunks = self.stored_chunks.lock().unwrap();
         for commitment_hash in expired_commitments {
-            if self.stored_chunks.remove(&commitment_hash).is_some() {
+            if stored_chunks.remove(&commitment_hash).is_some() {
                 pruned_count += 1;
             }
-            self.commitments.remove(&commitment_hash);
-            self.sample_cache.remove(&commitment_hash);
+            commitments.remove(&commitment_hash);
+
+            let mut sample_cache = self.sample_cache.lock().unwrap();
+            sample_cache.remove(&commitment_hash);
+            drop(sample_cache);
         }
+        drop(stored_chunks);
+        drop(commitments);
 
-        self.windows.retain(|w| w.end_epoch >= cutoff_epoch);
+        let mut windows = self.windows.lock().unwrap();
+        windows.retain(|w| w.end_epoch >= cutoff_epoch);
+        drop(windows);
 
-        let expired_challenges: Vec<Hash> = self
-            .active_challenges
+        let mut active_challenges = self.active_challenges.lock().unwrap();
+        let expired_challenges: Vec<Hash> = active_challenges
             .iter()
             .filter(|(_, c)| c.deadline_epoch < cutoff_epoch)
             .map(|(h, _)| *h)
             .collect();
 
         for challenge_id in expired_challenges {
-            self.active_challenges.remove(&challenge_id);
+            active_challenges.remove(&challenge_id);
         }
+        drop(active_challenges);
 
         pruned_count
     }
 
     pub fn get_storage_stats(&self) -> DAStorageStats {
-        let total_commitments = self.commitments.len();
-        let total_chunks: usize = self.stored_chunks.values().map(|c| c.len()).sum();
+        let commitments = self.commitments.lock().unwrap();
+        let stored_chunks = self.stored_chunks.lock().unwrap();
+        let active_challenges = self.active_challenges.lock().unwrap();
+        let verified_proofs = self.verified_proofs.lock().unwrap();
 
-        let total_data_size: usize = self
-            .stored_chunks
+        let total_commitments = commitments.len();
+        let total_chunks: usize = stored_chunks.values().map(|c| c.len()).sum();
+
+        let total_data_size: usize = stored_chunks
             .values()
             .flat_map(|chunks| chunks.values())
             .map(|chunk| chunk.data.len())
             .sum();
 
-        let total_original_size: usize = self.commitments.values().map(|c| c.original_size).sum();
+        let total_original_size: usize = commitments.values().map(|c| c.original_size).sum();
 
-        let total_compressed_size: usize =
-            self.commitments.values().map(|c| c.compressed_size).sum();
+        let total_compressed_size: usize = commitments.values().map(|c| c.compressed_size).sum();
 
-        let active_challenges = self.active_challenges.len();
+        let active_challenges_count = active_challenges.len();
 
-        let verified_proofs = self.verified_proofs.len();
+        let verified_proofs_count = verified_proofs.len();
 
         DAStorageStats {
             total_commitments,
@@ -892,8 +1090,8 @@ impl DataAvailability {
             total_data_size,
             total_original_size,
             total_compressed_size,
-            active_challenges,
-            verified_proofs,
+            active_challenges: active_challenges_count,
+            verified_proofs: verified_proofs_count,
             compression_ratio: if total_original_size > 0 {
                 total_compressed_size as f64 / total_original_size as f64
             } else {
@@ -904,8 +1102,8 @@ impl DataAvailability {
     }
 
     pub fn estimate_bandwidth_cost(&self, commitment_hash: Hash) -> RollupResult<u64> {
-        let commitment = self
-            .commitments
+        let commitments = self.commitments.lock().unwrap();
+        let commitment = commitments
             .get(&commitment_hash)
             .ok_or_else(|| RollupError::DataAvailability("Commitment not found".to_string()))?;
 
@@ -921,15 +1119,218 @@ impl DataAvailability {
     }
 
     pub fn validate_cellular_safe(&self, commitment_hash: Hash) -> RollupResult<bool> {
-        let commitment = self
-            .commitments
+        if !self.cellular_safe_config.enabled {
+            return Ok(true);
+        }
+
+        let bandwidth_cost = self.estimate_bandwidth_cost(commitment_hash)?;
+        let cellular_limit = self.cellular_safe_config.monthly_limit_bytes / 30;
+
+        Ok(bandwidth_cost <= cellular_limit)
+    }
+
+    fn validate_cellular_constraints(&self, data_size: usize) -> RollupResult<()> {
+        if !self.cellular_safe_config.enabled {
+            return Ok(());
+        }
+
+        if data_size > self.cellular_safe_config.max_chunk_size * self.cellular_safe_config.max_batch_size {
+            return Err(RollupError::DataAvailability(
+                "Data size exceeds cellular-safe limits".to_string(),
+            ));
+        }
+
+        if self.cellular_safe_config.compression_required && !self.compression_enabled {
+            return Err(RollupError::DataAvailability(
+                "Compression required for cellular-safe mode".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn verify_cellular_safe_commitment(&self, original_size: usize, compressed_size: usize) -> bool {
+        if !self.cellular_safe_config.enabled {
+            return true;
+        }
+
+        let compression_ratio = compressed_size as f64 / original_size as f64;
+        compression_ratio <= 0.8 && compressed_size <= self.cellular_safe_config.max_chunk_size * self.cellular_safe_config.max_batch_size
+    }
+
+    fn update_provider_metrics(&self, provider: Address, chunks_served: u64, response_time_ms: u32) {
+        let mut provider_performance = self.provider_performance.lock().unwrap();
+        let metrics = provider_performance.entry(provider).or_insert_with(ProviderMetrics::default);
+
+        metrics.chunks_served += chunks_served;
+        metrics.last_activity = Timestamp::now();
+        metrics.total_bandwidth_served += chunks_served * self.chunk_size as u64;
+
+        if response_time_ms > 0 {
+            let total_responses = metrics.chunks_served;
+            metrics.avg_response_time_ms =
+                ((metrics.avg_response_time_ms as u64 * (total_responses - chunks_served) + response_time_ms as u64 * chunks_served) / total_responses) as u32;
+        }
+
+        let success_rate = metrics.chunks_served as f64 / (metrics.chunks_served + metrics.chunks_failed).max(1) as f64;
+        let latency_score = if metrics.avg_response_time_ms <= self.sla_ms {
+            1.0
+        } else {
+            self.sla_ms as f64 / metrics.avg_response_time_ms as f64
+        };
+
+        metrics.reputation_score = (success_rate * 0.7 + latency_score * 0.3).clamp(0.0, 1.0);
+    }
+
+    pub fn get_provider_metrics(&self, provider: &Address) -> Option<ProviderMetrics> {
+        let provider_performance = self.provider_performance.lock().unwrap();
+        provider_performance.get(provider).cloned()
+    }
+
+    pub fn get_top_providers(&self, limit: usize) -> Vec<(Address, ProviderMetrics)> {
+        let provider_performance = self.provider_performance.lock().unwrap();
+        let mut providers: Vec<(Address, ProviderMetrics)> = provider_performance
+            .iter()
+            .map(|(addr, metrics)| (*addr, metrics.clone()))
+            .collect();
+
+        providers.sort_by(|a, b| b.1.reputation_score.partial_cmp(&a.1.reputation_score).unwrap());
+        providers.truncate(limit);
+        providers
+    }
+
+    pub fn expire_challenges(&self, current_epoch: u64) -> Vec<Hash> {
+        let mut active_challenges = self.active_challenges.lock().unwrap();
+        let mut expired = Vec::new();
+
+        for (challenge_id, challenge) in active_challenges.iter_mut() {
+            if challenge.deadline_epoch < current_epoch && challenge.status == ChallengeStatus::Pending {
+                challenge.status = ChallengeStatus::Expired;
+                expired.push(*challenge_id);
+            }
+        }
+
+        expired
+    }
+
+    pub fn get_challenge(&self, challenge_id: &Hash) -> Option<DAChallenge> {
+        let active_challenges = self.active_challenges.lock().unwrap();
+        active_challenges.get(challenge_id).cloned()
+    }
+
+    pub fn get_challenges_for_commitment(&self, commitment_hash: Hash) -> Vec<DAChallenge> {
+        let active_challenges = self.active_challenges.lock().unwrap();
+        active_challenges
+            .values()
+            .filter(|c| c.commitment_hash == commitment_hash)
+            .cloned()
+            .collect()
+    }
+
+    pub fn validate_commitment_integrity(&self, commitment_hash: Hash) -> RollupResult<bool> {
+        let commitments = self.commitments.lock().unwrap();
+        let commitment = commitments
             .get(&commitment_hash)
             .ok_or_else(|| RollupError::DataAvailability("Commitment not found".to_string()))?;
 
-        let bandwidth_cost = self.estimate_bandwidth_cost(commitment_hash)?;
-        let cellular_limit = 1024 * 1024 * 100;
+        let stored_chunks = self.stored_chunks.lock().unwrap();
+        let chunks = stored_chunks
+            .get(&commitment_hash)
+            .ok_or_else(|| RollupError::DataAvailability("Chunks not found".to_string()))?;
 
-        Ok(bandwidth_cost <= cellular_limit)
+        for chunk in chunks.values() {
+            let computed_hash = ego_core::crypto::hash_data(&chunk.data);
+            if computed_hash != chunk.chunk_hash {
+                return Ok(false);
+            }
+        }
+
+        let all_hashes: Vec<Vec<u8>> = chunks.values().map(|c| c.chunk_hash.to_vec()).collect();
+        let merkle_tree = ego_core::crypto::MerkleTree::build(all_hashes);
+        let computed_root = merkle_tree.root_hash().ok_or_else(|| {
+            RollupError::DataAvailability("Failed to compute Merkle root".to_string())
+        })?;
+
+        Ok(computed_root == commitment.data_root)
+    }
+
+    pub fn get_commitments_by_epoch(&self, epoch: u64) -> Vec<DACommitment> {
+        let commitments = self.commitments.lock().unwrap();
+        commitments
+            .values()
+            .filter(|c| c.epoch == epoch)
+            .cloned()
+            .collect()
+    }
+
+    pub fn get_commitments_by_shard(&self, shard_id: ShardId) -> Vec<DACommitment> {
+        let commitments = self.commitments.lock().unwrap();
+        commitments
+            .values()
+            .filter(|c| c.shard_id == shard_id)
+            .cloned()
+            .collect()
+    }
+
+    pub fn get_commitments_by_operator(&self, operator: Address) -> Vec<DACommitment> {
+        let commitments = self.commitments.lock().unwrap();
+        commitments
+            .values()
+            .filter(|c| c.operator == operator)
+            .cloned()
+            .collect()
+    }
+
+    pub fn record_chunk_failure(&self, provider: Address, chunk_id: u32) {
+        let mut provider_performance = self.provider_performance.lock().unwrap();
+        let metrics = provider_performance.entry(provider).or_insert_with(ProviderMetrics::default);
+        metrics.chunks_failed += 1;
+
+        let success_rate = metrics.chunks_served as f64 / (metrics.chunks_served + metrics.chunks_failed).max(1) as f64;
+        let latency_score = if metrics.avg_response_time_ms <= self.sla_ms {
+            1.0
+        } else {
+            self.sla_ms as f64 / metrics.avg_response_time_ms as f64
+        };
+
+        metrics.reputation_score = (success_rate * 0.7 + latency_score * 0.3).clamp(0.0, 1.0);
+    }
+
+    pub fn get_window_by_epoch(&self, epoch: u64) -> Option<DAWindow> {
+        let windows = self.windows.lock().unwrap();
+        windows
+            .iter()
+            .find(|w| epoch >= w.start_epoch && epoch <= w.end_epoch)
+            .cloned()
+    }
+
+    pub fn count_active_commitments(&self) -> usize {
+        let commitments = self.commitments.lock().unwrap();
+        commitments.len()
+    }
+
+    pub fn count_active_challenges(&self) -> usize {
+        let active_challenges = self.active_challenges.lock().unwrap();
+        active_challenges
+            .values()
+            .filter(|c| c.status == ChallengeStatus::Pending || c.status == ChallengeStatus::Responding)
+            .count()
+    }
+
+    pub fn get_sla_ms(&self) -> u32 {
+        self.sla_ms
+    }
+
+    pub fn get_rs_params(&self) -> RSParams {
+        self.rs_params.clone()
+    }
+
+    pub fn is_compression_enabled(&self) -> bool {
+        self.compression_enabled
+    }
+
+    pub fn get_cellular_safe_config(&self) -> CellularSafeConfig {
+        self.cellular_safe_config.clone()
     }
 }
 
@@ -958,6 +1359,11 @@ impl DAChunk {
 
     pub fn is_available(&self) -> bool {
         self.provider.is_some() && self.replica_count > 0
+    }
+
+    pub fn age_seconds(&self) -> u64 {
+        let now = Timestamp::now();
+        (now.as_millis().saturating_sub(self.timestamp.as_millis())) / 1000
     }
 }
 
@@ -1020,6 +1426,11 @@ impl DACommitment {
         let actual_storage = self.chunk_count as usize * 1024;
         actual_storage as f64 / self.original_size as f64
     }
+
+    pub fn age_seconds(&self) -> u64 {
+        let now = Timestamp::now();
+        (now.as_millis().saturating_sub(self.timestamp.as_millis())) / 1000
+    }
 }
 
 impl DASamplingRequest {
@@ -1069,6 +1480,11 @@ impl DAChallenge {
         self.status == ChallengeStatus::Failed
             || (self.is_expired(current_epoch) && self.status == ChallengeStatus::Pending)
     }
+
+    pub fn age_seconds(&self) -> u64 {
+        let now = Timestamp::now();
+        (now.as_millis().saturating_sub(self.timestamp.as_millis())) / 1000
+    }
 }
 
 impl DAWindow {
@@ -1089,5 +1505,9 @@ impl DAWindow {
 
     pub fn commitment_count(&self) -> usize {
         self.commitments.len()
+    }
+
+    pub fn can_finalize(&self, current_epoch: u64) -> bool {
+        !self.finalized && current_epoch > self.end_epoch + self.challenge_period
     }
 }

@@ -1,16 +1,25 @@
 use ego_rollup::*;
 use ego_core::{Address, KeyPair, Transaction, TransactionPayload, Balance, ShardId};
 
-#[tokio::test]
 async fn test_tx_rollup_transaction_processing() {
     let config = RollupConfig::default();
     let rollup_id = [1u8; 16];
     let region_id = 1;
+    let chain_id = 1u32;
+    let network_id = 1u32;
     let keypair = KeyPair::generate();
     let operator_addr = Address::from_public_key(&keypair.public_key());
     
-    let operator = TxRollupOperator::new(config, rollup_id, region_id, operator_addr)
-        .expect("Failed to create TxRollupOperator");
+    // Fixed: Added semicolon and removed duplicate line
+    let operator = TxRollupOperator::new(
+        config, 
+        rollup_id, 
+        region_id, 
+        keypair,
+        chain_id,
+        network_id
+    )
+    .expect("Failed to create TxRollupOperator");  // Added semicolon here
     
     // Create test transaction with a keypair that matches the from address
     let tx_keypair = KeyPair::generate();

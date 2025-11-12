@@ -1097,18 +1097,47 @@ mod tests {
         let rollup_id = [1u8; 16];
         let keypair = KeyPair::generate();
         let operator_addr = Address::from_public_key(&keypair.dilithium_public_key());
-
+    
         let operator =
-            ProofRollupOperator::new(config, rollup_id, 1, operator_addr, keypair).unwrap();
-
+            ProofRollupOperator::new(config, rollup_id, 1, operator_addr, keypair.clone()).unwrap();
+    
+        // Create a signed beacon announcement
+        let beacon_keypair = KeyPair::generate();
+        let device_id = [1u8; 32];
+        let location_hash = Hash::new([2u8; 32]);
+        let timestamp = Timestamp::now();
+        
+        let mut signing_data = Vec::new();
+        signing_data.extend_from_slice(DOMAIN_TAG_POC_BEACON);
+        signing_data.extend_from_slice(&device_id);
+        signing_data.extend_from_slice(location_hash.as_bytes());
+        signing_data.extend_from_slice(&(-80i16).to_le_bytes());
+        signing_data.extend_from_slice(&2400u32.to_le_bytes());
+        signing_data.extend_from_slice(&12345u64.to_le_bytes());
+        signing_data.extend_from_slice(&timestamp.as_millis().to_le_bytes());
+        let data_hash = ego_core::crypto::blake2s_hash(&signing_data);
+        
+        let beacon_sig = beacon_keypair.sign_dilithium(&data_hash);
+    
+        let beacon = BeaconAnnouncement {
+            device_id,
+            location_hash,
+            signal_strength_dbm: -80,
+            frequency_mhz: 2400,
+            h3_cell: 12345,
+            timestamp,
+            dilithium_pk: beacon_keypair.dilithium_public_key().key_data,
+            dilithium_sig: beacon_sig.signature_data,
+        };
+    
         let poc_evidence = PoCEvidence {
-            beacon_announcements: vec![],
+            beacon_announcements: vec![beacon],  // Changed from empty vec![]
             witness_reports: vec![],
             coherence_stats: CoherenceStats {
-                total_beacons: 10,
-                total_witnesses: 20,
-                valid_reports: 18,
-                invalid_reports: 2,
+                total_beacons: 1,  // Changed from 10
+                total_witnesses: 0,  // Changed from 20
+                valid_reports: 0,  // Changed from 18
+                invalid_reports: 0,  // Changed from 2
                 coherence_score: 0.9,
                 path_loss_rmse: 5.2,
                 diversity_score: 0.85,
@@ -1121,10 +1150,10 @@ mod tests {
             },
             timestamp: Timestamp::now(),
         };
-
+    
         let hash = operator.submit_poc_evidence(poc_evidence).await.unwrap();
         assert_ne!(hash, Hash::ZERO);
-
+    
         let metrics = operator.get_metrics().await;
         assert_eq!(metrics.poc_events_received, 1);
     }
