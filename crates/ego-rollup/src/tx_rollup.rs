@@ -1,9 +1,11 @@
 use crate::config::RollupConfig;
+use crate::da::CellularSafeConfig;
 use crate::da::{DAChunk, DataAvailability};
 use crate::error::{RollupError, RollupResult};
 use crate::fraud::{FraudProof, FraudProofVerifier};
 use crate::types::{CommitmentStatus, RollupTransaction};
 use ego_core::{Address, Balance, Hash, Timestamp};
+use ego_core::{BlockHeight, ShardId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -195,12 +197,22 @@ impl TxRollupOperator {
     ) -> RollupResult<Self> {
         let operator_addr = Address::from_public_key(&keypair.dilithium_public_key());
 
+        let cellular_safe_config = CellularSafeConfig {
+            enabled: true,
+            max_chunk_size: 1024 * 256,
+            max_batch_size: 100,
+            compression_required: true,
+            monthly_limit_bytes: 50 * 1024 * 1024 * 1024,
+        };
+
         let da_manager = DataAvailability::new(
             config.da.k as usize,
             config.da.m as usize,
             config.da.chunk_size,
             config.da.enable_compression,
             config.da.compression_level,
+            cellular_safe_config,
+            600_000,
         )?;
 
         let fraud_verifier = FraudProofVerifier::new(0.8, 24);
@@ -755,6 +767,7 @@ impl TxRollupOperator {
         let mut da_manager = self.da_manager.write().await;
 
         let epoch = *self.current_epoch.read().await;
+        let l1_block_number = *self.l1_block_number.read().await;
 
         da_manager.encode_data(
             batch.batch_id,
@@ -762,6 +775,9 @@ impl TxRollupOperator {
             format!("rollup_{:?}", self.rollup_id),
             self.operator_addr,
             epoch,
+            BlockHeight::new(l1_block_number),
+            ShardId::new(0).unwrap(),
+            batch.batch_id,
         )
     }
 
@@ -1154,8 +1170,12 @@ mod tests {
     }
 
     fn create_test_transaction() -> RollupTransaction {
-        let inner = Transaction::new(
-            Address::new([1u8; 20]),
+        // Create keypair and derive address from it
+        let keypair = ego_core::crypto::KeyPair::generate();
+        let from_addr = Address::from_public_key(&keypair.dilithium_public_key());
+        
+        let mut inner = Transaction::new(
+            from_addr,  // Use address derived from keypair
             1,
             TransactionPayload::Transfer {
                 to: Address::new([2u8; 20]),
@@ -1167,7 +1187,10 @@ mod tests {
             None,
             1,
         );
-
+        
+        // Sign the transaction
+        inner.sign(&keypair, false).expect("Failed to sign transaction");
+    
         RollupTransaction::new(inner, 1, 1000)
     }
 
@@ -1271,20 +1294,21 @@ mod tests {
         let config = create_test_config();
         let rollup_id = [1u8; 16];
         let keypair = ego_core::crypto::KeyPair::generate();
-
+    
         let operator = TxRollupOperator::new(config, rollup_id, 1, keypair, 1, 1).unwrap();
-
+    
         for _ in 0..2 {
             let tx = create_test_transaction();
             operator.submit_transaction(tx).await.unwrap();
         }
-
+    
         let batch = operator.build_batch(10).await.unwrap();
+        let batch_id = batch.batch_id;  // Save the batch_id
         let commitment_hash = operator.post_commitment(batch).await.unwrap();
-
+    
         let challenge = TxRollupChallenge {
             challenge_id: Hash::new([3u8; 32]),
-            commitment_hash,
+            commitment_hash: batch_id,  // Use batch_id instead of commitment_hash
             challenger: Address::new([4u8; 20]),
             challenge_type: ChallengeType::DAUnavailable,
             fraud_proof: None,
@@ -1294,9 +1318,9 @@ mod tests {
             bond_amount: Balance::from_egoc(1000),
             evidence: vec![],
         };
-
+    
         assert!(operator.handle_challenge(challenge).await.is_ok());
-
+    
         let metrics = operator.get_metrics().await;
         assert_eq!(metrics.challenges_received, 1);
         assert_eq!(metrics.challenges_defended, 1);
