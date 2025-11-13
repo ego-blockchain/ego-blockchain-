@@ -45,6 +45,10 @@ pub struct OperatorConfig {
     pub edge_nodes: Vec<String>,
     pub require_dilithium: bool,
     pub wifi_only_operations: Vec<String>,
+    pub drs_enabled: bool,
+    pub deploy_policy_enabled: bool,
+    pub enable_ai_pattern_detection: bool,
+    pub require_human_verification: bool,
 }
 
 impl Default for OperatorConfig {
@@ -76,6 +80,10 @@ impl Default for OperatorConfig {
                 "da_upload".to_string(),
                 "large_storage".to_string(),
             ],
+            drs_enabled: true,
+            deploy_policy_enabled: true,
+            enable_ai_pattern_detection: true,
+            require_human_verification: false,
         }
     }
 }
@@ -118,6 +126,8 @@ pub struct RollupBatch {
     pub tx_root: Hash,
     pub receipts_root: Hash,
     pub proof_events_root: Hash,
+    pub deploy_events_root: Hash,
+    pub drs_events_root: Hash,
     pub l1_block_number: u64,
     pub epoch: EpochNumber,
     pub timestamp: Timestamp,
@@ -129,6 +139,8 @@ pub struct RollupBatch {
     pub operator_signature: DualSignature,
     pub is_cellular_safe: bool,
     pub is_5g_optimized: bool,
+    pub drs_scores_applied: u32,
+    pub deploy_requests_processed: u32,
 }
 
 impl RollupBatch {
@@ -225,6 +237,8 @@ pub struct RollupCommitmentData {
     pub tx_root: Hash,
     pub proofs_root: Hash,
     pub da_root: Hash,
+    pub deploy_root: Hash,
+    pub drs_root: Hash,
     pub tx_count: u32,
     pub block_range: (u64, u64),
     pub epoch: u64,
@@ -243,6 +257,8 @@ impl RollupCommitmentData {
         batch: &RollupBatch,
         da_root: Hash,
         proofs_root: Hash,
+        deploy_root: Hash,
+        drs_root: Hash,
         l1_block: u64,
         fraud_proof_window: u64,
         chain_id: u32,
@@ -258,6 +274,8 @@ impl RollupCommitmentData {
             tx_root: batch.tx_root,
             proofs_root,
             da_root,
+            deploy_root,
+            drs_root,
             tx_count: batch.transactions.len() as u32,
             block_range: (l1_block, l1_block),
             epoch: batch.epoch.as_u64(),
@@ -282,6 +300,8 @@ impl RollupCommitmentData {
         data.extend_from_slice(self.previous_state_root.as_bytes());
         data.extend_from_slice(self.tx_root.as_bytes());
         data.extend_from_slice(self.da_root.as_bytes());
+        data.extend_from_slice(self.deploy_root.as_bytes());
+        data.extend_from_slice(self.drs_root.as_bytes());
         data.extend_from_slice(&self.tx_count.to_le_bytes());
         data.extend_from_slice(&self.epoch.to_le_bytes());
         data.extend_from_slice(&self.chain_id.to_le_bytes());
@@ -333,6 +353,12 @@ pub struct OperatorMetrics {
     pub ed25519_signatures: u64,
     pub hybrid_signatures: u64,
     pub latency_target_breaches: u64,
+    pub deploy_requests_evaluated: u64,
+    pub deploy_requests_accepted: u64,
+    pub deploy_requests_rejected: u64,
+    pub drs_scores_computed: u64,
+    pub ai_patterns_detected: u64,
+    pub human_verifications_required: u64,
     pub errors: HashMap<String, u64>,
 }
 
@@ -364,6 +390,12 @@ impl Default for OperatorMetrics {
             ed25519_signatures: 0,
             hybrid_signatures: 0,
             latency_target_breaches: 0,
+            deploy_requests_evaluated: 0,
+            deploy_requests_accepted: 0,
+            deploy_requests_rejected: 0,
+            drs_scores_computed: 0,
+            ai_patterns_detected: 0,
+            human_verifications_required: 0,
             errors: HashMap::new(),
         }
     }
@@ -412,6 +444,27 @@ impl OperatorMetrics {
         *self.errors.entry(error_type.to_string()).or_insert(0) += 1;
     }
 
+    pub fn record_deploy_decision(&mut self, accepted: bool) {
+        self.deploy_requests_evaluated += 1;
+        if accepted {
+            self.deploy_requests_accepted += 1;
+        } else {
+            self.deploy_requests_rejected += 1;
+        }
+    }
+
+    pub fn record_drs_computation(&mut self) {
+        self.drs_scores_computed += 1;
+    }
+
+    pub fn record_ai_pattern_detection(&mut self) {
+        self.ai_patterns_detected += 1;
+    }
+
+    pub fn record_human_verification_required(&mut self) {
+        self.human_verifications_required += 1;
+    }
+
     pub fn is_healthy(&self) -> bool {
         if self.batches_processed == 0 {
             return true;
@@ -439,6 +492,7 @@ pub struct OperatorInfo {
     pub total_ru_processed: u64,
     pub cellular_safe_batches: u64,
     pub five_g_optimized: bool,
+    pub deploy_acceptance_rate: f64,
 }
 
 pub struct BatchBuilder {
@@ -538,6 +592,8 @@ impl BatchBuilder {
             tx_root,
             receipts_root: Hash::ZERO,
             proof_events_root: Hash::ZERO,
+            deploy_events_root: Hash::ZERO,
+            drs_events_root: Hash::ZERO,
             l1_block_number: l1_block,
             epoch,
             timestamp: Timestamp::now(),
@@ -549,6 +605,8 @@ impl BatchBuilder {
             operator_signature: DualSignature::new(None, None),
             is_cellular_safe,
             is_5g_optimized,
+            drs_scores_applied: 0,
+            deploy_requests_processed: 0,
         };
 
         batch.batch_id = batch.compute_batch_id();
@@ -675,6 +733,8 @@ pub struct RollupOperator {
     successful_challenges: Arc<RwLock<u64>>,
     failed_challenges: Arc<RwLock<u64>>,
     slash_count: Arc<RwLock<u64>>,
+    deploy_policy_manager: Arc<RwLock<Option<ego_core::deploy_policy::DeployPolicyManager>>>,
+    drs_manager: Arc<RwLock<Option<ego_core::drs::DRSManager>>>,
 }
 
 impl RollupOperator {
@@ -699,6 +759,48 @@ impl RollupOperator {
             ConnectionType::WiFi
         };
 
+        let deploy_policy_manager = if config.deploy_policy_enabled {
+            let policy_config = ego_core::deploy_policy::DeployPolicyConfig {
+                free_deploys_per_epoch: 5,
+                min_stake_for_quota: Balance::from_egoc(1000),
+                credits_per_kb: 100,
+                credits_per_ru: 10,
+                max_deploy_size_kb: 1024,
+                max_ru_per_deploy: 10000,
+                deploy_bond_amount: Balance::new(1000000),
+                bond_lock_duration_blocks: 1000,
+                bond_slash_threshold: 3,
+                max_deploys_per_epoch: 10000,
+                max_deploys_per_user_per_epoch: 50,
+                max_total_size_per_epoch_gb: 100,
+                enable_dedup: true,
+                dedup_lookback_epochs: 10,
+                pob_floor_enabled: false,
+                pob_floor_per_kb: 50,
+                pob_floor_per_ru: 5,
+                anti_spam_enabled: true,
+                max_deploys_per_hour: 10,
+                max_deploys_per_day: 50,
+                min_deploy_interval_seconds: 60,
+                human_verification_required: config.require_human_verification,
+                ai_pattern_detection_enabled: config.enable_ai_pattern_detection,
+                emergency_mode: false,
+                whitelist_only_mode: false,
+            };
+            Some(ego_core::deploy_policy::DeployPolicyManager::new(
+                policy_config,
+            ))
+        } else {
+            None
+        };
+
+        let drs_manager = if config.drs_enabled {
+            let drs_config = ego_core::drs::DRSConfig::default();
+            Some(ego_core::drs::DRSManager::new(drs_config))
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             keypair: Arc::new(keypair),
@@ -719,6 +821,8 @@ impl RollupOperator {
             successful_challenges: Arc::new(RwLock::new(0)),
             failed_challenges: Arc::new(RwLock::new(0)),
             slash_count: Arc::new(RwLock::new(0)),
+            deploy_policy_manager: Arc::new(RwLock::new(deploy_policy_manager)),
+            drs_manager: Arc::new(RwLock::new(drs_manager)),
         })
     }
 
@@ -907,21 +1011,85 @@ impl RollupOperator {
     async fn process_batch(&self, mut batch: RollupBatch) -> EgoResult<RollupBatch> {
         let mut state = self.state_manager.write().await;
         let mut results = Vec::new();
+        let mut deploy_events = Vec::new();
+        let mut drs_events = Vec::new();
 
         for tx in &batch.transactions {
-            let result = TransactionResult {
-                tx_hash: tx.hash,
-                success: true,
-                error: None,
-                ru_used: tx.estimate_resource_units(),
-                storage_used: 0,
-                state_changes: Vec::new(),
-                events: Vec::new(),
-                cross_shard_receipts: Vec::new(),
-                pq_verification_result: None,
-                proof_verifications: Vec::new(),
-            };
+            let result = state.execute_transaction(tx)?;
             results.push(result);
+        }
+
+        if self.config.deploy_policy_enabled {
+            let mut deploy_mgr_lock = self.deploy_policy_manager.write().await;
+            if let Some(ref mut deploy_mgr) = *deploy_mgr_lock {
+                for tx in &batch.transactions {
+                    if let ego_core::TransactionPayload::DeployContract { .. } = &tx.payload {
+                        let staker_stake = state.get_account(&tx.from).map(|acc| acc.balance);
+                        let request = ego_core::deploy_policy::DeployRequest {
+                            deployer: tx.from,
+                            deploy_type: ego_core::deploy_policy::DeployType::SmartContract {
+                                code_size_kb: 100,
+                                estimated_ru: 5000,
+                            },
+                            code: vec![],
+                            metadata: HashMap::new(),
+                            use_free_quota: true,
+                            preferred_shard: Some(self.config.shard_id.as_u32()),
+                            human_verification_signature: None,
+                            dilithium_verification_pk: None,
+                        };
+                        match deploy_mgr.evaluate_deploy_request(
+                            &request,
+                            staker_stake,
+                            batch.l1_block_number,
+                        ) {
+                            Ok(decision) => {
+                                let accepted = matches!(
+                                    decision,
+                                    ego_core::deploy_policy::DeployDecision::AcceptWithFreeQuota { .. } |
+                                    ego_core::deploy_policy::DeployDecision::AcceptWithCredits { .. }
+                                );
+                                let mut metrics = self.metrics.write().await;
+                                metrics.record_deploy_decision(accepted);
+                                drop(metrics);
+                                batch.deploy_requests_processed += 1;
+                                deploy_events.push(tx.hash);
+                            }
+                            Err(_) => {
+                                let mut metrics = self.metrics.write().await;
+                                metrics.record_deploy_decision(false);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.config.drs_enabled {
+            let drs_mgr_lock = self.drs_manager.read().await;
+            if let Some(ref drs_mgr) = *drs_mgr_lock {
+                for tx in &batch.transactions {
+                    if let Some(account) = state.get_account(&tx.from) {
+                        let evidence = ego_core::drs::create_evidence_bundle_from_account(
+                            &account,
+                            batch.epoch.as_u64(),
+                            vec![],
+                            None,
+                        );
+
+                        match drs_mgr.calculate_drs_score(evidence) {
+                            Ok(score) => {
+                                batch.drs_scores_applied += 1;
+                                drs_events.push(tx.hash);
+
+                                let mut metrics = self.metrics.write().await;
+                                metrics.record_drs_computation();
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+            }
         }
 
         batch.transaction_results = results;
@@ -934,6 +1102,20 @@ impl RollupOperator {
             .collect();
         let receipts_tree = ego_core::crypto::MerkleTree::build(receipt_hashes);
         batch.receipts_root = receipts_tree.root_hash().unwrap_or(Hash::ZERO);
+
+        if !deploy_events.is_empty() {
+            let deploy_tree = ego_core::crypto::MerkleTree::build(
+                deploy_events.iter().map(|h| h.to_vec()).collect(),
+            );
+            batch.deploy_events_root = deploy_tree.root_hash().unwrap_or(Hash::ZERO);
+        }
+
+        if !drs_events.is_empty() {
+            let drs_tree = ego_core::crypto::MerkleTree::build(
+                drs_events.iter().map(|h| h.to_vec()).collect(),
+            );
+            batch.drs_events_root = drs_tree.root_hash().unwrap_or(Hash::ZERO);
+        }
 
         batch.sign(&self.keypair)?;
 
@@ -984,6 +1166,8 @@ impl RollupOperator {
             batch,
             da_root,
             proofs_root,
+            batch.deploy_events_root,
+            batch.drs_events_root,
             batch.l1_block_number,
             self.config.challenge_window_blocks,
             self.config.chain_id,
@@ -1077,6 +1261,12 @@ impl RollupOperator {
         let reputation_score =
             self.calculate_reputation_score(metrics.commits_finalized, successful, failed, slashes);
 
+        let deploy_acceptance_rate = if metrics.deploy_requests_evaluated > 0 {
+            metrics.deploy_requests_accepted as f64 / metrics.deploy_requests_evaluated as f64
+        } else {
+            1.0
+        };
+
         OperatorInfo {
             address: self.address,
             rollup_id: self.config.rollup_id.clone(),
@@ -1093,6 +1283,7 @@ impl RollupOperator {
             total_ru_processed: metrics.total_ru_used,
             cellular_safe_batches: metrics.cellular_safe_batches,
             five_g_optimized: self.config.enable_5g,
+            deploy_acceptance_rate,
         }
     }
 
@@ -1160,7 +1351,23 @@ impl RollupOperator {
 
     pub async fn advance_epoch(&self) -> EgoResult<()> {
         let mut epoch = self.epoch.write().await;
-        *epoch += 1;
+        let new_epoch = *epoch + 1;
+        *epoch = new_epoch;
+
+        if self.config.deploy_policy_enabled {
+            let mut deploy_mgr_lock = self.deploy_policy_manager.write().await;
+            if let Some(ref mut deploy_mgr) = *deploy_mgr_lock {
+                deploy_mgr.advance_epoch(new_epoch)?;
+            }
+        }
+
+        if self.config.drs_enabled {
+            let drs_mgr_lock = self.drs_manager.read().await;
+            if let Some(ref drs_mgr) = *drs_mgr_lock {
+                let _ = drs_mgr.finalize_epoch(new_epoch);
+            }
+        }
+
         Ok(())
     }
 
@@ -1226,6 +1433,46 @@ impl RollupOperator {
     pub fn shard_id(&self) -> ShardId {
         self.config.shard_id
     }
+
+    pub async fn update_deploy_policy_config(
+        &self,
+        new_config: ego_core::deploy_policy::DeployPolicyConfig,
+    ) -> EgoResult<()> {
+        let mut deploy_mgr_lock = self.deploy_policy_manager.write().await;
+        if let Some(ref mut deploy_mgr) = *deploy_mgr_lock {
+            deploy_mgr.update_config(new_config)?;
+        }
+        Ok(())
+    }
+
+    pub async fn update_drs_config(&self, new_config: ego_core::drs::DRSConfig) -> EgoResult<()> {
+        let drs_mgr_lock = self.drs_manager.read().await;
+        if let Some(ref drs_mgr) = *drs_mgr_lock {
+            drs_mgr.update_config(new_config)?;
+        }
+        Ok(())
+    }
+
+    pub async fn get_deploy_policy_stats(
+        &self,
+    ) -> Option<ego_core::deploy_policy::EpochDeployStats> {
+        let deploy_mgr_lock = self.deploy_policy_manager.read().await;
+        if let Some(ref deploy_mgr) = *deploy_mgr_lock {
+            let epoch = deploy_mgr.get_current_epoch();
+            deploy_mgr.get_epoch_stats(epoch)
+        } else {
+            None
+        }
+    }
+
+    pub async fn get_drs_epoch_stats(&self, epoch: u64) -> Option<ego_core::drs::EpochStats> {
+        let drs_mgr_lock = self.drs_manager.read().await;
+        if let Some(ref drs_mgr) = *drs_mgr_lock {
+            drs_mgr.get_epoch_stats(epoch)
+        } else {
+            None
+        }
+    }
 }
 
 impl Clone for RollupOperator {
@@ -1250,6 +1497,8 @@ impl Clone for RollupOperator {
             successful_challenges: self.successful_challenges.clone(),
             failed_challenges: self.failed_challenges.clone(),
             slash_count: self.slash_count.clone(),
+            deploy_policy_manager: self.deploy_policy_manager.clone(),
+            drs_manager: self.drs_manager.clone(),
         }
     }
 }
@@ -1260,6 +1509,8 @@ pub struct OperatorNode {
     commit_handle: Option<tokio::task::JoinHandle<()>>,
     metrics_handle: Option<tokio::task::JoinHandle<()>>,
     cellular_monitor_handle: Option<tokio::task::JoinHandle<()>>,
+    deploy_policy_handle: Option<tokio::task::JoinHandle<()>>,
+    drs_update_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl OperatorNode {
@@ -1270,6 +1521,8 @@ impl OperatorNode {
             commit_handle: None,
             metrics_handle: None,
             cellular_monitor_handle: None,
+            deploy_policy_handle: None,
+            drs_update_handle: None,
         }
     }
 
@@ -1289,6 +1542,14 @@ impl OperatorNode {
             self.start_cellular_monitoring().await?;
         }
 
+        if self.operator.config.deploy_policy_enabled {
+            self.start_deploy_policy_monitoring().await?;
+        }
+
+        if self.operator.config.drs_enabled {
+            self.start_drs_updates().await?;
+        }
+
         Ok(())
     }
 
@@ -1303,6 +1564,12 @@ impl OperatorNode {
             handle.abort();
         }
         if let Some(handle) = self.cellular_monitor_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.deploy_policy_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.drs_update_handle.take() {
             handle.abort();
         }
 
@@ -1415,6 +1682,63 @@ impl OperatorNode {
         Ok(())
     }
 
+    async fn start_deploy_policy_monitoring(&mut self) -> EgoResult<()> {
+        let operator = self.operator.clone();
+        let check_interval = Duration::from_secs(120);
+
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(check_interval);
+
+            loop {
+                interval.tick().await;
+
+                let is_active = *operator.is_active.read().await;
+                if !is_active {
+                    break;
+                }
+
+                if let Some(stats) = operator.get_deploy_policy_stats().await {
+                    if stats.rejected_spam > 100 {
+                        let mut metrics = operator.metrics.write().await;
+                        metrics.record_error("high_spam_rate");
+                    }
+                }
+            }
+        });
+
+        self.deploy_policy_handle = Some(handle);
+        Ok(())
+    }
+
+    async fn start_drs_updates(&mut self) -> EgoResult<()> {
+        let operator = self.operator.clone();
+        let update_interval = Duration::from_secs(180);
+
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(update_interval);
+
+            loop {
+                interval.tick().await;
+
+                let is_active = *operator.is_active.read().await;
+                if !is_active {
+                    break;
+                }
+
+                let epoch = *operator.epoch.read().await;
+                if let Some(stats) = operator.get_drs_epoch_stats(epoch).await {
+                    if stats.total_nodes > 0 {
+                        let mut metrics = operator.metrics.write().await;
+                        metrics.record_drs_computation();
+                    }
+                }
+            }
+        });
+
+        self.drs_update_handle = Some(handle);
+        Ok(())
+    }
+
     pub async fn submit_transaction(&self, tx: Transaction) -> EgoResult<Hash> {
         self.operator.submit_transaction(tx).await
     }
@@ -1441,7 +1765,347 @@ impl OperatorNode {
             .await
     }
 
+    pub async fn handle_slash(&self, commitment_hash: Hash, slash_amount: u64) -> EgoResult<()> {
+        self.operator
+            .handle_slash(commitment_hash, slash_amount)
+            .await
+    }
+
+    pub async fn switch_connection(&self, connection_type: ConnectionType) -> EgoResult<()> {
+        self.operator.switch_connection(connection_type).await
+    }
+
+    pub async fn check_cellular_budget(&self) -> EgoResult<bool> {
+        self.operator.check_cellular_budget().await
+    }
+
+    pub async fn reset_metrics(&self) {
+        self.operator.reset_metrics().await
+    }
+
+    pub async fn get_batch(&self, batch_hash: Hash) -> Option<RollupBatch> {
+        self.operator.get_batch(batch_hash).await
+    }
+
+    pub async fn get_commitment(&self, commitment_hash: Hash) -> Option<RollupCommitmentData> {
+        self.operator.get_commitment(commitment_hash).await
+    }
+
+    pub async fn update_deploy_policy_config(
+        &self,
+        new_config: ego_core::deploy_policy::DeployPolicyConfig,
+    ) -> EgoResult<()> {
+        self.operator.update_deploy_policy_config(new_config).await
+    }
+
+    pub async fn update_drs_config(&self, new_config: ego_core::drs::DRSConfig) -> EgoResult<()> {
+        self.operator.update_drs_config(new_config).await
+    }
+
+    pub async fn get_deploy_policy_stats(
+        &self,
+    ) -> Option<ego_core::deploy_policy::EpochDeployStats> {
+        self.operator.get_deploy_policy_stats().await
+    }
+
+    pub async fn get_drs_epoch_stats(&self, epoch: u64) -> Option<ego_core::drs::EpochStats> {
+        self.operator.get_drs_epoch_stats(epoch).await
+    }
+
     pub fn operator(&self) -> Arc<RollupOperator> {
         Arc::clone(&self.operator)
     }
+
+    pub fn address(&self) -> Address {
+        self.operator.address()
+    }
+
+    pub fn rollup_id(&self) -> &str {
+        self.operator.rollup_id()
+    }
+
+    pub fn shard_id(&self) -> ShardId {
+        self.operator.shard_id()
+    }
+
+    pub async fn is_active(&self) -> bool {
+        *self.operator.is_active.read().await
+    }
+
+    pub async fn advance_epoch(&self) -> EgoResult<()> {
+        self.operator.advance_epoch().await
+    }
+}
+
+pub fn create_test_operator_config(
+    rollup_id: String,
+    shard_id: u32,
+    enable_5g: bool,
+) -> OperatorConfig {
+    OperatorConfig {
+        rollup_id,
+        chain_id: 1,
+        network_id: 1,
+        shard_id: ShardId::new(shard_id).unwrap(),
+        bond_amount: Balance::from_egoc(100_000),
+        max_batch_size: if enable_5g {
+            MAX_BATCH_SIZE_5G
+        } else {
+            MAX_BATCH_SIZE_CELLULAR
+        },
+        max_gas_limit: MAX_BATCH_GAS,
+        batch_timeout_ms: if enable_5g {
+            BATCH_TIMEOUT_5G_MS
+        } else {
+            BATCH_TIMEOUT_MS
+        },
+        commit_frequency_secs: COMMIT_FREQUENCY_SECS,
+        challenge_window_blocks: CHALLENGE_WINDOW_BLOCKS,
+        da_chunk_size: DA_CHUNK_SIZE,
+        erasure_k: ERASURE_K,
+        erasure_m: ERASURE_M,
+        enable_compression: true,
+        compression_level: 6,
+        cellular_safe_mode: !enable_5g,
+        max_cellular_data_gb_month: MAX_CELLULAR_DATA_GB_MONTH,
+        enable_5g,
+        slice_id: None,
+        edge_nodes: Vec::new(),
+        require_dilithium: true,
+        wifi_only_operations: vec!["commitment_post".to_string(), "da_upload".to_string()],
+        drs_enabled: true,
+        deploy_policy_enabled: true,
+        enable_ai_pattern_detection: true,
+        require_human_verification: false,
+    }
+}
+
+pub fn create_test_operator(
+    rollup_id: String,
+    shard_id: u32,
+    keypair: ego_core::crypto::KeyPair,
+) -> EgoResult<RollupOperator> {
+    let config = create_test_operator_config(rollup_id, shard_id, false);
+    let state_manager = StateManager::new(config.chain_id, config.network_id);
+    RollupOperator::new(config, keypair, state_manager)
+}
+
+pub async fn estimate_batch_size(transactions: &[Transaction]) -> usize {
+    let config = bincode::config::standard();
+    bincode::encode_to_vec(transactions, config)
+        .map(|data| data.len())
+        .unwrap_or(0)
+}
+
+pub async fn estimate_da_overhead(batch_size: usize, erasure_k: u16, erasure_m: u16) -> usize {
+    let total_chunks = erasure_k + erasure_m;
+    let overhead_ratio = total_chunks as f64 / erasure_k as f64;
+    (batch_size as f64 * overhead_ratio) as usize
+}
+
+pub fn calculate_cellular_data_usage(
+    batches_processed: u64,
+    avg_batch_size_kb: u64,
+    da_overhead_ratio: f64,
+) -> u64 {
+    let base_usage = batches_processed * avg_batch_size_kb;
+    let total_usage = (base_usage as f64 * (1.0 + da_overhead_ratio)) as u64;
+    total_usage / 1024
+}
+
+pub fn is_within_cellular_budget(current_usage_mb: u64, max_monthly_gb: u64) -> bool {
+    current_usage_mb < (max_monthly_gb * 1024)
+}
+
+pub async fn validate_rollup_commitment(
+    commitment: &RollupCommitmentData,
+    operator_pubkey: &PublicKey,
+) -> EgoResult<bool> {
+    let signing_data = commitment.compute_hash();
+
+    if let Some(ref sig) = commitment.operator_signature.dilithium_sig {
+        ego_core::crypto::verify_signature(operator_pubkey, signing_data.as_bytes(), sig)
+    } else {
+        Ok(false)
+    }
+}
+
+pub async fn validate_batch_integrity(
+    batch: &RollupBatch,
+    operator_pubkey: &PublicKey,
+) -> EgoResult<bool> {
+    batch.verify_signature(operator_pubkey)
+}
+
+pub fn calculate_commitment_hash(
+    batch_id: Hash,
+    state_root: Hash,
+    tx_root: Hash,
+    da_root: Hash,
+    deploy_root: Hash,
+    drs_root: Hash,
+    epoch: u64,
+) -> Hash {
+    let mut data = Vec::new();
+    data.extend_from_slice(b"ego/rollup/commit/v1");
+    data.extend_from_slice(batch_id.as_bytes());
+    data.extend_from_slice(state_root.as_bytes());
+    data.extend_from_slice(tx_root.as_bytes());
+    data.extend_from_slice(da_root.as_bytes());
+    data.extend_from_slice(deploy_root.as_bytes());
+    data.extend_from_slice(drs_root.as_bytes());
+    data.extend_from_slice(&epoch.to_le_bytes());
+    ego_core::crypto::hash_data(&data)
+}
+
+pub fn estimate_commitment_latency(
+    connection_type: ConnectionType,
+    commitment_size_kb: u64,
+) -> Duration {
+    let base_latency_ms = match connection_type {
+        ConnectionType::Cellular5G => 10,
+        ConnectionType::Cellular4G => 50,
+        ConnectionType::WiFi => 20,
+        ConnectionType::Ethernet => 5,
+        ConnectionType::Unknown => 100,
+    };
+
+    let bandwidth_mbps = match connection_type {
+        ConnectionType::Cellular5G => 100.0,
+        ConnectionType::Cellular4G => 20.0,
+        ConnectionType::WiFi => 50.0,
+        ConnectionType::Ethernet => 100.0,
+        ConnectionType::Unknown => 10.0,
+    };
+
+    let transfer_time_ms = (commitment_size_kb as f64 * 8.0) / (bandwidth_mbps * 1000.0) * 1000.0;
+    let total_latency_ms = base_latency_ms + transfer_time_ms as u64;
+
+    Duration::from_millis(total_latency_ms)
+}
+
+pub fn should_switch_to_wifi(
+    cellular_usage_mb: u64,
+    max_monthly_gb: u64,
+    threshold_pct: f64,
+) -> bool {
+    let max_mb = max_monthly_gb * 1024;
+    let threshold_mb = (max_mb as f64 * threshold_pct) as u64;
+    cellular_usage_mb >= threshold_mb
+}
+
+pub fn calculate_operator_reputation(
+    total_commits: u64,
+    finalized_commits: u64,
+    successful_challenges: u64,
+    failed_challenges: u64,
+    slashes: u64,
+) -> f64 {
+    if total_commits == 0 {
+        return 1.0;
+    }
+
+    let finalization_rate = finalized_commits as f64 / total_commits as f64;
+    let challenge_success_rate = if successful_challenges + failed_challenges > 0 {
+        successful_challenges as f64 / (successful_challenges + failed_challenges) as f64
+    } else {
+        1.0
+    };
+
+    let slash_penalty = (slashes as f64 * 0.2).min(0.5);
+
+    let reputation = (finalization_rate * 0.5 + challenge_success_rate * 0.5 - slash_penalty)
+        .max(0.0)
+        .min(1.0);
+
+    reputation
+}
+
+pub fn estimate_batch_gas(transactions: &[Transaction]) -> u64 {
+    transactions
+        .iter()
+        .map(|tx| tx.estimate_resource_units())
+        .sum()
+}
+
+pub fn can_fit_in_batch(
+    current_gas: u64,
+    current_count: usize,
+    tx_gas: u64,
+    max_gas: u64,
+    max_count: usize,
+) -> bool {
+    current_gas + tx_gas <= max_gas && current_count < max_count
+}
+
+pub async fn compress_batch_data(data: &[u8], compression_level: u32) -> EgoResult<Vec<u8>> {
+    use flate2::Compression;
+    use flate2::write::ZlibEncoder;
+    use std::io::Write;
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(compression_level));
+    encoder
+        .write_all(data)
+        .map_err(|e| EgoError::SerializationError(e.to_string()))?;
+    encoder
+        .finish()
+        .map_err(|e| EgoError::SerializationError(e.to_string()))
+}
+
+pub async fn decompress_batch_data(compressed_data: &[u8]) -> EgoResult<Vec<u8>> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
+
+    let mut decoder = ZlibDecoder::new(compressed_data);
+    let mut decompressed = Vec::new();
+    decoder
+        .read_to_end(&mut decompressed)
+        .map_err(|e| EgoError::SerializationError(e.to_string()))?;
+    Ok(decompressed)
+}
+
+pub fn calculate_da_chunk_count(
+    data_size: usize,
+    chunk_size: usize,
+    erasure_k: u16,
+    erasure_m: u16,
+) -> u32 {
+    let data_chunks = (data_size + chunk_size - 1) / chunk_size;
+    let total_chunks = erasure_k + erasure_m;
+    let erasure_groups = (data_chunks + erasure_k as usize - 1) / erasure_k as usize;
+    (erasure_groups * total_chunks as usize) as u32
+}
+
+pub fn validate_operator_config(config: &OperatorConfig) -> EgoResult<()> {
+    if config.max_batch_size == 0 {
+        return Err(EgoError::InvalidTransaction(
+            "max_batch_size cannot be zero".to_string(),
+        ));
+    }
+
+    if config.max_gas_limit == 0 {
+        return Err(EgoError::InvalidTransaction(
+            "max_gas_limit cannot be zero".to_string(),
+        ));
+    }
+
+    if config.erasure_k == 0 || config.erasure_m == 0 {
+        return Err(EgoError::InvalidTransaction(
+            "erasure coding parameters cannot be zero".to_string(),
+        ));
+    }
+
+    if config.da_chunk_size == 0 {
+        return Err(EgoError::InvalidTransaction(
+            "da_chunk_size cannot be zero".to_string(),
+        ));
+    }
+
+    if config.bond_amount.as_u128() == 0 {
+        return Err(EgoError::InvalidTransaction(
+            "bond_amount cannot be zero".to_string(),
+        ));
+    }
+
+    Ok(())
 }
