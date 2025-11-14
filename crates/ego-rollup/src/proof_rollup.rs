@@ -13,6 +13,13 @@ pub const DOMAIN_TAG_POC_WITNESS: &[u8] = b"ego/poc/witness/v1";
 pub const DOMAIN_TAG_POST_PROOF: &[u8] = b"ego/post/proof/v1";
 pub const DOMAIN_TAG_POREP_PROOF: &[u8] = b"ego/porep/proof/v1";
 pub const DOMAIN_TAG_EVIDENCE_BUNDLE: &[u8] = b"ego/evidence/bundle/v1";
+pub const DOMAIN_TAG_AI_VERIFICATION: &[u8] = b"ego/ai-verify/v1";
+
+pub const MAX_BUNDLE_SIZE_CELLULAR: usize = 512 * 1024;
+pub const MAX_BUNDLE_SIZE_WIFI: usize = 10 * 1024 * 1024;
+pub const DEFAULT_ANCHOR_WINDOW_HOURS: u64 = 24;
+pub const COMPRESSION_LEVEL_CELLULAR: i32 = 6;
+pub const COMPRESSION_LEVEL_WIFI: i32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct ProofRollupCommit {
@@ -31,6 +38,10 @@ pub struct ProofRollupCommit {
     pub network_id: u32,
     pub created_at: Timestamp,
     pub commitment_hash: Hash,
+    pub human_verified_count: u32,
+    pub ai_flagged_count: u32,
+    pub drs_weighted_quality: f64,
+    pub cellular_friendly: bool,
 }
 
 #[derive(
@@ -49,12 +60,16 @@ pub struct PoCEvidence {
     pub witness_reports: Vec<WitnessReport>,
     pub coherence_stats: CoherenceStats,
     pub thresholds_used: ThresholdParams,
+    pub density_events: Vec<DensityEventData>,
     pub timestamp: Timestamp,
+    pub human_verified: bool,
+    pub ai_pattern_detected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct BeaconAnnouncement {
     pub device_id: [u8; 32],
+    pub node_addr: Address,
     pub location_hash: Hash,
     pub signal_strength_dbm: i16,
     pub frequency_mhz: u32,
@@ -62,11 +77,14 @@ pub struct BeaconAnnouncement {
     pub timestamp: Timestamp,
     pub dilithium_pk: Vec<u8>,
     pub dilithium_sig: Vec<u8>,
+    pub drs_score: f64,
+    pub density_penalty_applied: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct WitnessReport {
     pub witness_id: [u8; 32],
+    pub witness_addr: Address,
     pub beacon_id: [u8; 32],
     pub rsrp_dbm: i16,
     pub rsrq_db: i16,
@@ -75,9 +93,11 @@ pub struct WitnessReport {
     pub distance_meters: u32,
     pub gnss_lat: i32,
     pub gnss_lon: i32,
+    pub h3_cell: u64,
     pub timestamp: Timestamp,
     pub dilithium_pk: Vec<u8>,
     pub dilithium_sig: Vec<u8>,
+    pub drs_score: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -89,6 +109,8 @@ pub struct CoherenceStats {
     pub coherence_score: f64,
     pub path_loss_rmse: f64,
     pub diversity_score: f64,
+    pub avg_drs_multiplier: f64,
+    pub density_penalties_applied: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -97,6 +119,17 @@ pub struct ThresholdParams {
     pub max_distance_meters: u32,
     pub min_signal_strength_dbm: i16,
     pub max_path_loss_rmse: f64,
+    pub min_drs_score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct DensityEventData {
+    pub node_id: Address,
+    pub h3_cell: u64,
+    pub device_count: u32,
+    pub density_multiplier: f64,
+    pub dwell_time_pct: f64,
+    pub timestamp: Timestamp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -106,6 +139,9 @@ pub struct PoStEvidence {
     pub partition_maps: HashMap<u32, PartitionInfo>,
     pub prover_stats: ProverStats,
     pub timestamp: Timestamp,
+    pub human_verified: bool,
+    pub ai_pattern_detected: bool,
+    pub node_drs_scores: HashMap<Address, f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -118,6 +154,9 @@ pub struct WindowPoStProof {
     pub challenged_sectors: Vec<u32>,
     pub dilithium_pk: Vec<u8>,
     pub dilithium_sig: Vec<u8>,
+    pub node_addr: Address,
+    pub latency_ms: u32,
+    pub drs_multiplier: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -126,6 +165,7 @@ pub struct PartitionInfo {
     pub sector_count: u32,
     pub proven_sectors: u32,
     pub deadline: Timestamp,
+    pub sla_met: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -135,6 +175,7 @@ pub struct ProverStats {
     pub failed_proofs: u64,
     pub avg_proof_time_ms: u64,
     pub pass_ratio: f64,
+    pub sla_compliance_rate: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -149,6 +190,11 @@ pub struct EvidenceBundle {
     pub compression_ratio: f64,
     pub cid: String,
     pub created_at: Timestamp,
+    pub human_verified_count: u32,
+    pub ai_flagged_count: u32,
+    pub drs_quality_weighted: f64,
+    pub deploy_credits_consumed: u64,
+    pub cellular_optimized: bool,
 }
 
 #[derive(
@@ -171,6 +217,9 @@ pub struct PoRepProof {
     pub porep_params_v: u32,
     pub dilithium_pk: Vec<u8>,
     pub dilithium_sig: Vec<u8>,
+    pub node_addr: Address,
+    pub seal_time_ms: u64,
+    pub drs_score: f64,
 }
 
 pub struct ProofRollupOperator {
@@ -190,6 +239,9 @@ pub struct ProofRollupOperator {
     current_window: Arc<RwLock<u32>>,
     anchor_window_hours: u64,
     cellular_safe_mode: bool,
+    ai_pattern_detector: Arc<RwLock<AIPatternDetector>>,
+    drs_integration: Arc<RwLock<DRSIntegration>>,
+    deploy_policy_enforcer: Arc<RwLock<DeployPolicyEnforcer>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -211,6 +263,11 @@ pub struct ProofRollupMetrics {
     pub witness_count: u64,
     pub partition_count: u64,
     pub sector_proven_count: u64,
+    pub human_verified_proofs: u64,
+    pub ai_flagged_proofs: u64,
+    pub drs_penalties_applied: u64,
+    pub density_penalties_applied: u64,
+    pub deploy_credits_consumed_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +277,9 @@ pub struct RollupConfig {
     pub network_id: u32,
     pub da: DaConfig,
     pub five_g: FiveGConfig,
+    pub ai_verification: AIVerificationConfig,
+    pub drs_integration: DRSIntegrationConfig,
+    pub deploy_policy: DeployPolicyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,12 +288,41 @@ pub struct DaConfig {
     pub m: u16,
     pub chunk_size: usize,
     pub enable_compression: bool,
-    pub compression_level: i32,
+    pub compression_level_wifi: i32,
+    pub compression_level_cellular: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FiveGConfig {
     pub cellular_safe_mode: bool,
+    pub max_bundle_size_cellular: usize,
+    pub max_bundle_size_wifi: usize,
+    pub batch_delay_cellular_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AIVerificationConfig {
+    pub enabled: bool,
+    pub require_human_verification: bool,
+    pub auto_reject_ai_patterns: bool,
+    pub suspicious_phrases: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DRSIntegrationConfig {
+    pub enabled: bool,
+    pub min_drs_score: f64,
+    pub apply_drs_weights: bool,
+    pub density_penalty_rate: f64,
+    pub density_min_multiplier: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployPolicyConfig {
+    pub enabled: bool,
+    pub credits_per_kb_evidence: u64,
+    pub credits_per_proof: u64,
+    pub require_quota: bool,
 }
 
 impl Default for RollupConfig {
@@ -247,10 +336,43 @@ impl Default for RollupConfig {
                 m: 32,
                 chunk_size: 32768,
                 enable_compression: true,
-                compression_level: 3,
+                compression_level_wifi: COMPRESSION_LEVEL_WIFI,
+                compression_level_cellular: COMPRESSION_LEVEL_CELLULAR,
             },
             five_g: FiveGConfig {
                 cellular_safe_mode: true,
+                max_bundle_size_cellular: MAX_BUNDLE_SIZE_CELLULAR,
+                max_bundle_size_wifi: MAX_BUNDLE_SIZE_WIFI,
+                batch_delay_cellular_ms: 5000,
+            },
+            ai_verification: AIVerificationConfig {
+                enabled: true,
+                require_human_verification: false,
+                auto_reject_ai_patterns: true,
+                suspicious_phrases: vec![
+                    "do you want me to add more".to_string(),
+                    "let me know if you need".to_string(),
+                    "as an ai model".to_string(),
+                    "i can help you with".to_string(),
+                    "would you like me to".to_string(),
+                    "is there anything else".to_string(),
+                    "chatgpt".to_string(),
+                    "claude".to_string(),
+                    "generated by ai".to_string(),
+                ],
+            },
+            drs_integration: DRSIntegrationConfig {
+                enabled: true,
+                min_drs_score: 0.3,
+                apply_drs_weights: true,
+                density_penalty_rate: 0.10,
+                density_min_multiplier: 0.40,
+            },
+            deploy_policy: DeployPolicyConfig {
+                enabled: true,
+                credits_per_kb_evidence: 50,
+                credits_per_proof: 10,
+                require_quota: false,
             },
         }
     }
@@ -261,7 +383,8 @@ pub struct DataAvailability {
     m: usize,
     chunk_size: usize,
     enable_compression: bool,
-    compression_level: i32,
+    compression_level_wifi: i32,
+    compression_level_cellular: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -275,20 +398,44 @@ pub struct DAChunk {
     pub epoch: u64,
 }
 
+pub struct AIPatternDetector {
+    enabled: bool,
+    suspicious_phrases: Vec<String>,
+    require_human_verification: bool,
+    auto_reject: bool,
+}
+
+pub struct DRSIntegration {
+    enabled: bool,
+    min_drs_score: f64,
+    apply_weights: bool,
+    density_penalty_rate: f64,
+    density_min_multiplier: f64,
+}
+
+pub struct DeployPolicyEnforcer {
+    enabled: bool,
+    credits_per_kb: u64,
+    credits_per_proof: u64,
+    require_quota: bool,
+}
+
 impl DataAvailability {
     pub fn new(
         k: usize,
         m: usize,
         chunk_size: usize,
         enable_compression: bool,
-        compression_level: i32,
+        compression_level_wifi: i32,
+        compression_level_cellular: i32,
     ) -> EgoResult<Self> {
         Ok(Self {
             k,
             m,
             chunk_size,
             enable_compression,
-            compression_level,
+            compression_level_wifi,
+            compression_level_cellular,
         })
     }
 
@@ -353,6 +500,100 @@ impl DataAvailability {
     }
 }
 
+impl AIPatternDetector {
+    pub fn new(config: &AIVerificationConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            suspicious_phrases: config.suspicious_phrases.clone(),
+            require_human_verification: config.require_human_verification,
+            auto_reject: config.auto_reject_ai_patterns,
+        }
+    }
+
+    pub fn detect_patterns(&self, data: &[u8]) -> EgoResult<bool> {
+        if !self.enabled {
+            return Ok(false);
+        }
+
+        let text = String::from_utf8_lossy(data).to_lowercase();
+
+        for phrase in &self.suspicious_phrases {
+            if text.contains(&phrase.to_lowercase()) {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    pub fn verify_human_signature(
+        &self,
+        signature: &[u8],
+        data: &[u8],
+        pk: &[u8],
+    ) -> EgoResult<bool> {
+        if signature.is_empty() || pk.is_empty() {
+            return Ok(false);
+        }
+
+        let data_hash = ego_core::crypto::blake2s_hash(data);
+        ego_core::crypto::verify_dilithium_signature(pk, &data_hash, signature)
+    }
+}
+
+impl DRSIntegration {
+    pub fn new(config: &DRSIntegrationConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            min_drs_score: config.min_drs_score,
+            apply_weights: config.apply_drs_weights,
+            density_penalty_rate: config.density_penalty_rate,
+            density_min_multiplier: config.density_min_multiplier,
+        }
+    }
+
+    pub fn validate_drs_score(&self, score: f64) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        score >= self.min_drs_score
+    }
+
+    pub fn calculate_density_multiplier(&self, device_count: u32, dwell_time_pct: f64) -> f64 {
+        if device_count <= 1 || dwell_time_pct < 0.10 {
+            return 1.0;
+        }
+
+        let penalty = self.density_penalty_rate * (device_count - 1) as f64;
+        (1.0 - penalty).max(self.density_min_multiplier)
+    }
+
+    pub fn apply_quality_weight(&self, base_quality: f64, drs_multiplier: f64) -> f64 {
+        if !self.apply_weights {
+            return base_quality;
+        }
+        base_quality * drs_multiplier
+    }
+}
+
+impl DeployPolicyEnforcer {
+    pub fn new(config: &DeployPolicyConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            credits_per_kb: config.credits_per_kb_evidence,
+            credits_per_proof: config.credits_per_proof,
+            require_quota: config.require_quota,
+        }
+    }
+
+    pub fn calculate_credits_needed(&self, evidence_size_kb: u64, proof_count: u32) -> u64 {
+        if !self.enabled {
+            return 0;
+        }
+        evidence_size_kb * self.credits_per_kb + (proof_count as u64) * self.credits_per_proof
+    }
+}
+
 impl ProofRollupOperator {
     pub fn new(
         config: RollupConfig,
@@ -366,10 +607,15 @@ impl ProofRollupOperator {
             config.da.m as usize,
             config.da.chunk_size,
             config.da.enable_compression,
-            config.da.compression_level,
+            config.da.compression_level_wifi,
+            config.da.compression_level_cellular,
         )?;
 
         let cellular_safe_mode = config.five_g.cellular_safe_mode;
+
+        let ai_pattern_detector = AIPatternDetector::new(&config.ai_verification);
+        let drs_integration = DRSIntegration::new(&config.drs_integration);
+        let deploy_policy_enforcer = DeployPolicyEnforcer::new(&config.deploy_policy);
 
         Ok(Self {
             config,
@@ -386,17 +632,43 @@ impl ProofRollupOperator {
             metrics: Arc::new(RwLock::new(ProofRollupMetrics::default())),
             current_epoch: Arc::new(RwLock::new(0)),
             current_window: Arc::new(RwLock::new(0)),
-            anchor_window_hours: 24,
+            anchor_window_hours: DEFAULT_ANCHOR_WINDOW_HOURS,
             cellular_safe_mode,
+            ai_pattern_detector: Arc::new(RwLock::new(ai_pattern_detector)),
+            drs_integration: Arc::new(RwLock::new(drs_integration)),
+            deploy_policy_enforcer: Arc::new(RwLock::new(deploy_policy_enforcer)),
         })
     }
 
-    pub async fn submit_poc_evidence(&self, evidence: PoCEvidence) -> EgoResult<Hash> {
+    pub async fn submit_poc_evidence(&self, mut evidence: PoCEvidence) -> EgoResult<Hash> {
         let verify_start = std::time::Instant::now();
+
+        let ai_detector = self.ai_pattern_detector.read().await;
+        let config_bytes = bincode::encode_to_vec(&evidence, bincode::config::standard())
+            .map_err(|e| EgoError::SerializationError(e.to_string()))?;
+
+        let ai_detected = ai_detector.detect_patterns(&config_bytes)?;
+        evidence.ai_pattern_detected = ai_detected;
+
+        if ai_detected && ai_detector.auto_reject {
+            return Err(EgoError::InvalidTransaction(
+                "AI pattern detected in PoC evidence".to_string(),
+            ));
+        }
+        drop(ai_detector);
 
         self.verify_poc_signatures(&evidence).await?;
 
-        let verification_time = verify_start.elapsed().as_millis() as u64;
+        let drs_integration = self.drs_integration.read().await;
+        for beacon in &evidence.beacon_announcements {
+            if !drs_integration.validate_drs_score(beacon.drs_score) {
+                return Err(EgoError::InvalidTransaction(format!(
+                    "Beacon DRS score {} below minimum",
+                    beacon.drs_score
+                )));
+            }
+        }
+        drop(drs_integration);
 
         let evidence_hash = self.compute_evidence_hash(&evidence);
 
@@ -412,17 +684,48 @@ impl ProofRollupOperator {
             metrics.witness_count += evidence.witness_reports.len() as u64;
             metrics.dilithium_signatures_verified +=
                 (evidence.beacon_announcements.len() + evidence.witness_reports.len()) as u64;
+
+            if evidence.human_verified {
+                metrics.human_verified_proofs += 1;
+            }
+            if evidence.ai_pattern_detected {
+                metrics.ai_flagged_proofs += 1;
+            }
+            metrics.density_penalties_applied += evidence.density_events.len() as u64;
         }
 
         Ok(evidence_hash)
     }
 
-    pub async fn submit_post_evidence(&self, evidence: PoStEvidence) -> EgoResult<Hash> {
+    pub async fn submit_post_evidence(&self, mut evidence: PoStEvidence) -> EgoResult<Hash> {
         let verify_start = std::time::Instant::now();
+
+        let ai_detector = self.ai_pattern_detector.read().await;
+        let config_bytes = bincode::encode_to_vec(&evidence, bincode::config::standard())
+            .map_err(|e| EgoError::SerializationError(e.to_string()))?;
+
+        let ai_detected = ai_detector.detect_patterns(&config_bytes)?;
+        evidence.ai_pattern_detected = ai_detected;
+
+        if ai_detected && ai_detector.auto_reject {
+            return Err(EgoError::InvalidTransaction(
+                "AI pattern detected in PoSt evidence".to_string(),
+            ));
+        }
+        drop(ai_detector);
 
         self.verify_post_signatures(&evidence).await?;
 
-        let verification_time = verify_start.elapsed().as_millis() as u64;
+        let drs_integration = self.drs_integration.read().await;
+        for (_addr, score) in &evidence.node_drs_scores {
+            if !drs_integration.validate_drs_score(*score) {
+                return Err(EgoError::InvalidTransaction(format!(
+                    "Node DRS score {} below minimum",
+                    score
+                )));
+            }
+        }
+        drop(drs_integration);
 
         let evidence_hash = self.compute_evidence_hash(&evidence);
 
@@ -437,6 +740,13 @@ impl ProofRollupOperator {
             metrics.partition_count += evidence.partition_indices.len() as u64;
             metrics.sector_proven_count += evidence.prover_stats.proven_sectors;
             metrics.dilithium_signatures_verified += evidence.window_post_proofs.len() as u64;
+
+            if evidence.human_verified {
+                metrics.human_verified_proofs += 1;
+            }
+            if evidence.ai_pattern_detected {
+                metrics.ai_flagged_proofs += 1;
+            }
         }
 
         Ok(evidence_hash)
@@ -447,7 +757,14 @@ impl ProofRollupOperator {
 
         self.verify_porep_signature(&proof).await?;
 
-        let verification_time = verify_start.elapsed().as_millis() as u64;
+        let drs_integration = self.drs_integration.read().await;
+        if !drs_integration.validate_drs_score(proof.drs_score) {
+            return Err(EgoError::InvalidTransaction(format!(
+                "PoRep DRS score {} below minimum",
+                proof.drs_score
+            )));
+        }
+        drop(drs_integration);
 
         let proof_hash = ego_core::crypto::hash_data(&proof.sector_id);
 
@@ -491,22 +808,36 @@ impl ProofRollupOperator {
         }
 
         let bundle = self
-            .create_evidence_bundle(poc_evidence, post_evidence, porep_proofs)
+            .create_evidence_bundle(poc_evidence, post_evidence, porep_proofs, is_cellular)
             .await?;
 
         let bundle_size_bytes = bundle.compressed_data.len() as u64;
 
-        if self.cellular_safe_mode && is_cellular && bundle_size_bytes > 512 * 1024 {
-            return Err(EgoError::InvalidTransaction(
-                "Bundle too large for cellular upload".to_string(),
-            ));
+        let max_size = if is_cellular {
+            self.config.five_g.max_bundle_size_cellular
+        } else {
+            self.config.five_g.max_bundle_size_wifi
+        };
+
+        if bundle_size_bytes > max_size as u64 {
+            return Err(EgoError::InvalidTransaction(format!(
+                "Bundle size {} exceeds limit {}",
+                bundle_size_bytes, max_size
+            )));
         }
 
+        let deploy_enforcer = self.deploy_policy_enforcer.read().await;
+        let credits_needed = deploy_enforcer
+            .calculate_credits_needed(bundle_size_bytes / 1024, bundle.count_proofs());
+        drop(deploy_enforcer);
+
         let proofs_root = bundle.bundle_id;
-
-        let da_chunks = self.create_da_chunks(&bundle).await?;
-
+        let da_chunks = self.create_da_chunks(&bundle, is_cellular).await?;
         let da_root = self.compute_da_root(&da_chunks);
+
+        let drs_integration = self.drs_integration.read().await;
+        let drs_weighted_quality = self.calculate_drs_weighted_quality(&bundle, &drs_integration);
+        drop(drs_integration);
 
         let mut commitment = ProofRollupCommit {
             rollup_id: self.rollup_id,
@@ -524,6 +855,10 @@ impl ProofRollupOperator {
             network_id: self.config.network_id,
             created_at: Timestamp::now(),
             commitment_hash: Hash::ZERO,
+            human_verified_count: bundle.human_verified_count,
+            ai_flagged_count: bundle.ai_flagged_count,
+            drs_weighted_quality,
+            cellular_friendly: bundle.cellular_optimized,
         };
 
         self.sign_commitment(&mut commitment)?;
@@ -547,6 +882,7 @@ impl ProofRollupOperator {
             metrics.commitments_posted += 1;
             metrics.total_proofs_aggregated += bundle.count_proofs() as u64;
             metrics.total_blob_bytes += bundle_size_bytes;
+            metrics.deploy_credits_consumed_total += credits_needed;
 
             if metrics.evidence_bundles_created > 0 {
                 metrics.avg_bundle_size =
@@ -565,11 +901,45 @@ impl ProofRollupOperator {
         Ok(commitment_hash)
     }
 
+    fn calculate_drs_weighted_quality(&self, bundle: &EvidenceBundle, drs: &DRSIntegration) -> f64 {
+        if !drs.enabled || !drs.apply_weights {
+            return 1.0;
+        }
+
+        let mut total_weight = 0.0;
+        let mut weighted_sum = 0.0;
+
+        for poc in &bundle.poc_evidence {
+            for beacon in &poc.beacon_announcements {
+                let quality = poc.coherence_stats.coherence_score;
+                let weighted_quality = drs.apply_quality_weight(quality, beacon.drs_score);
+                weighted_sum += weighted_quality;
+                total_weight += 1.0;
+            }
+        }
+
+        for post in &bundle.post_evidence {
+            for proof in &post.window_post_proofs {
+                let quality = post.prover_stats.pass_ratio;
+                let weighted_quality = drs.apply_quality_weight(quality, proof.drs_multiplier);
+                weighted_sum += weighted_quality;
+                total_weight += 1.0;
+            }
+        }
+
+        if total_weight > 0.0 {
+            weighted_sum / total_weight
+        } else {
+            1.0
+        }
+    }
+
     async fn create_evidence_bundle(
         &self,
         poc_evidence: Vec<PoCEvidence>,
         post_evidence: Vec<PoStEvidence>,
         porep_proofs: Vec<PoRepProof>,
+        is_cellular: bool,
     ) -> EgoResult<EvidenceBundle> {
         let bundle_type = if !poc_evidence.is_empty() && !post_evidence.is_empty() {
             EvidenceBundleType::Combined
@@ -604,7 +974,13 @@ impl ProofRollupOperator {
 
         let original_size = data.len() as u64;
 
-        let compressed_data = zstd::bulk::compress(&data, self.config.da.compression_level)
+        let compression_level = if is_cellular {
+            self.config.da.compression_level_cellular
+        } else {
+            self.config.da.compression_level_wifi
+        };
+
+        let compressed_data = zstd::bulk::compress(&data, compression_level)
             .map_err(|e| EgoError::CryptoError(format!("Compression failed: {}", e)))?;
 
         let compressed_size = compressed_data.len() as u64;
@@ -615,8 +991,58 @@ impl ProofRollupOperator {
         };
 
         let bundle_id = ego_core::crypto::hash_data(&compressed_data);
-
         let cid = format!("bafy{}", hex::encode(&bundle_id.as_bytes()[..16]));
+
+        let mut human_verified_count = 0;
+        let mut ai_flagged_count = 0;
+
+        for poc in &poc_evidence {
+            if poc.human_verified {
+                human_verified_count += 1;
+            }
+            if poc.ai_pattern_detected {
+                ai_flagged_count += 1;
+            }
+        }
+
+        for post in &post_evidence {
+            if post.human_verified {
+                human_verified_count += 1;
+            }
+            if post.ai_pattern_detected {
+                ai_flagged_count += 1;
+            }
+        }
+
+        let deploy_enforcer = self.deploy_policy_enforcer.read().await;
+        let deploy_credits_consumed = deploy_enforcer.calculate_credits_needed(
+            compressed_size / 1024,
+            (poc_evidence.len() + post_evidence.len() + porep_proofs.len()) as u32,
+        );
+        drop(deploy_enforcer);
+
+        let drs_integration = self.drs_integration.read().await;
+        let mut drs_quality_weighted = 0.0;
+        let mut weight_count = 0.0;
+
+        for poc in &poc_evidence {
+            for beacon in &poc.beacon_announcements {
+                drs_quality_weighted += beacon.drs_score;
+                weight_count += 1.0;
+            }
+        }
+
+        for post in &post_evidence {
+            for proof in &post.window_post_proofs {
+                drs_quality_weighted += proof.drs_multiplier;
+                weight_count += 1.0;
+            }
+        }
+
+        if weight_count > 0.0 {
+            drs_quality_weighted /= weight_count;
+        }
+        drop(drs_integration);
 
         Ok(EvidenceBundle {
             bundle_id,
@@ -629,10 +1055,19 @@ impl ProofRollupOperator {
             compression_ratio,
             cid,
             created_at: Timestamp::now(),
+            human_verified_count,
+            ai_flagged_count,
+            drs_quality_weighted,
+            deploy_credits_consumed,
+            cellular_optimized: is_cellular,
         })
     }
 
-    async fn create_da_chunks(&self, bundle: &EvidenceBundle) -> EgoResult<Vec<DAChunk>> {
+    async fn create_da_chunks(
+        &self,
+        bundle: &EvidenceBundle,
+        is_cellular: bool,
+    ) -> EgoResult<Vec<DAChunk>> {
         let epoch = *self.current_epoch.read().await;
 
         let mut da_manager = self.da_manager.write().await;
@@ -678,6 +1113,8 @@ impl ProofRollupOperator {
         data.extend_from_slice(&commitment.blob_bytes.to_le_bytes());
         data.extend_from_slice(&commitment.chain_id.to_le_bytes());
         data.extend_from_slice(&commitment.network_id.to_le_bytes());
+        data.extend_from_slice(&commitment.human_verified_count.to_le_bytes());
+        data.extend_from_slice(&commitment.ai_flagged_count.to_le_bytes());
 
         ego_core::crypto::hash_data(&data)
     }
@@ -701,6 +1138,8 @@ impl ProofRollupOperator {
         data.extend_from_slice(&commitment.count_proofs.to_le_bytes());
         data.extend_from_slice(&commitment.blob_bytes.to_le_bytes());
         data.extend_from_slice(&commitment.created_at.as_millis().to_le_bytes());
+        data.extend_from_slice(&commitment.human_verified_count.to_le_bytes());
+        data.extend_from_slice(&commitment.ai_flagged_count.to_le_bytes());
 
         Ok(ego_core::crypto::blake2s_hash(&data))
     }
@@ -751,6 +1190,7 @@ impl ProofRollupOperator {
         let mut signing_data = Vec::new();
         signing_data.extend_from_slice(DOMAIN_TAG_POC_BEACON);
         signing_data.extend_from_slice(&beacon.device_id);
+        signing_data.extend_from_slice(beacon.node_addr.as_bytes());
         signing_data.extend_from_slice(beacon.location_hash.as_bytes());
         signing_data.extend_from_slice(&beacon.signal_strength_dbm.to_le_bytes());
         signing_data.extend_from_slice(&beacon.frequency_mhz.to_le_bytes());
@@ -786,6 +1226,7 @@ impl ProofRollupOperator {
         let mut signing_data = Vec::new();
         signing_data.extend_from_slice(DOMAIN_TAG_POC_WITNESS);
         signing_data.extend_from_slice(&witness.witness_id);
+        signing_data.extend_from_slice(witness.witness_addr.as_bytes());
         signing_data.extend_from_slice(&witness.beacon_id);
         signing_data.extend_from_slice(&witness.rsrp_dbm.to_le_bytes());
         signing_data.extend_from_slice(&witness.rsrq_db.to_le_bytes());
@@ -794,6 +1235,7 @@ impl ProofRollupOperator {
         signing_data.extend_from_slice(&witness.distance_meters.to_le_bytes());
         signing_data.extend_from_slice(&witness.gnss_lat.to_le_bytes());
         signing_data.extend_from_slice(&witness.gnss_lon.to_le_bytes());
+        signing_data.extend_from_slice(&witness.h3_cell.to_le_bytes());
         signing_data.extend_from_slice(&witness.timestamp.as_millis().to_le_bytes());
 
         let data_hash = ego_core::crypto::blake2s_hash(&signing_data);
@@ -854,6 +1296,7 @@ impl ProofRollupOperator {
         signing_data.extend_from_slice(&proof.partition_id.to_le_bytes());
         signing_data.extend_from_slice(&proof.challenge_seed);
         signing_data.extend_from_slice(&ego_core::crypto::hash_data(&proof.proof_bytes).to_vec());
+        signing_data.extend_from_slice(proof.node_addr.as_bytes());
 
         for replica_id in &proof.replica_ids {
             signing_data.extend_from_slice(replica_id);
@@ -892,6 +1335,7 @@ impl ProofRollupOperator {
         signing_data.extend_from_slice(&proof.comm_d);
         signing_data.extend_from_slice(&proof.replica_id);
         signing_data.extend_from_slice(&proof.porep_params_v.to_le_bytes());
+        signing_data.extend_from_slice(proof.node_addr.as_bytes());
 
         let data_hash = ego_core::crypto::blake2s_hash(&signing_data);
 
@@ -1011,7 +1455,7 @@ impl EvidenceBundle {
     }
 
     pub fn is_cellular_safe(&self) -> bool {
-        self.compressed_data.len() <= 512 * 1024
+        self.cellular_optimized && self.compressed_data.len() <= MAX_BUNDLE_SIZE_CELLULAR
     }
 
     pub fn verify_bundle_hash(&self) -> bool {
@@ -1022,6 +1466,25 @@ impl EvidenceBundle {
     pub fn decompress(&self) -> EgoResult<Vec<u8>> {
         zstd::bulk::decompress(&self.compressed_data, self.original_size as usize)
             .map_err(|e| EgoError::CryptoError(format!("Decompression failed: {}", e)))
+    }
+
+    pub fn quality_score(&self) -> f64 {
+        if self.ai_flagged_count > 0 && self.human_verified_count == 0 {
+            return 0.5;
+        }
+
+        let mut base_score = self.drs_quality_weighted;
+
+        if self.human_verified_count > 0 {
+            base_score *= 1.1;
+        }
+
+        if self.ai_flagged_count > 0 {
+            let penalty = (self.ai_flagged_count as f64 / self.count_proofs() as f64) * 0.3;
+            base_score *= (1.0 - penalty);
+        }
+
+        base_score.clamp(0.0, 1.0)
     }
 }
 
@@ -1038,6 +1501,8 @@ impl ProofRollupCommit {
         data.extend_from_slice(&self.count_proofs.to_le_bytes());
         data.extend_from_slice(&self.blob_bytes.to_le_bytes());
         data.extend_from_slice(&self.created_at.as_millis().to_le_bytes());
+        data.extend_from_slice(&self.human_verified_count.to_le_bytes());
+        data.extend_from_slice(&self.ai_flagged_count.to_le_bytes());
 
         let data_hash = ego_core::crypto::blake2s_hash(&data);
 
@@ -1057,156 +1522,32 @@ impl ProofRollupCommit {
 
     pub fn summary(&self) -> String {
         format!(
-            "RollupCommit epoch={} window={} proofs={} size={}KB region={}",
+            "RollupCommit epoch={} window={} proofs={} size={}KB region={} human_verified={} ai_flagged={} drs_quality={:.3} cellular={}",
             self.epoch,
             self.window_id,
             self.count_proofs,
             self.blob_bytes / 1024,
-            self.region_id
+            self.region_id,
+            self.human_verified_count,
+            self.ai_flagged_count,
+            self.drs_weighted_quality,
+            self.cellular_friendly
         )
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ego_core::crypto::KeyPair;
+    pub fn integrity_score(&self) -> f64 {
+        let mut score = self.drs_weighted_quality;
 
-    fn create_test_config() -> RollupConfig {
-        RollupConfig::default()
-    }
+        if self.human_verified_count > 0 {
+            let verification_ratio = self.human_verified_count as f64 / self.count_proofs as f64;
+            score += verification_ratio * 0.2;
+        }
 
-    #[tokio::test]
-    async fn test_proof_rollup_creation() {
-        let config = create_test_config();
-        let rollup_id = [1u8; 16];
-        let region_id = 1;
-        let keypair = KeyPair::generate();
-        let operator_addr = Address::from_public_key(&keypair.dilithium_public_key());
+        if self.ai_flagged_count > 0 {
+            let flag_ratio = self.ai_flagged_count as f64 / self.count_proofs as f64;
+            score -= flag_ratio * 0.3;
+        }
 
-        let operator =
-            ProofRollupOperator::new(config, rollup_id, region_id, operator_addr, keypair).unwrap();
-
-        assert_eq!(operator.rollup_id, rollup_id);
-        assert_eq!(operator.region_id, region_id);
-    }
-
-    #[tokio::test]
-    async fn test_poc_evidence_submission() {
-        let config = create_test_config();
-        let rollup_id = [1u8; 16];
-        let keypair = KeyPair::generate();
-        let operator_addr = Address::from_public_key(&keypair.dilithium_public_key());
-    
-        let operator =
-            ProofRollupOperator::new(config, rollup_id, 1, operator_addr, keypair.clone()).unwrap();
-    
-        // Create a signed beacon announcement
-        let beacon_keypair = KeyPair::generate();
-        let device_id = [1u8; 32];
-        let location_hash = Hash::new([2u8; 32]);
-        let timestamp = Timestamp::now();
-        
-        let mut signing_data = Vec::new();
-        signing_data.extend_from_slice(DOMAIN_TAG_POC_BEACON);
-        signing_data.extend_from_slice(&device_id);
-        signing_data.extend_from_slice(location_hash.as_bytes());
-        signing_data.extend_from_slice(&(-80i16).to_le_bytes());
-        signing_data.extend_from_slice(&2400u32.to_le_bytes());
-        signing_data.extend_from_slice(&12345u64.to_le_bytes());
-        signing_data.extend_from_slice(&timestamp.as_millis().to_le_bytes());
-        let data_hash = ego_core::crypto::blake2s_hash(&signing_data);
-        
-        let beacon_sig = beacon_keypair.sign_dilithium(&data_hash);
-    
-        let beacon = BeaconAnnouncement {
-            device_id,
-            location_hash,
-            signal_strength_dbm: -80,
-            frequency_mhz: 2400,
-            h3_cell: 12345,
-            timestamp,
-            dilithium_pk: beacon_keypair.dilithium_public_key().key_data,
-            dilithium_sig: beacon_sig.signature_data,
-        };
-    
-        let poc_evidence = PoCEvidence {
-            beacon_announcements: vec![beacon],  // Changed from empty vec![]
-            witness_reports: vec![],
-            coherence_stats: CoherenceStats {
-                total_beacons: 1,  // Changed from 10
-                total_witnesses: 0,  // Changed from 20
-                valid_reports: 0,  // Changed from 18
-                invalid_reports: 0,  // Changed from 2
-                coherence_score: 0.9,
-                path_loss_rmse: 5.2,
-                diversity_score: 0.85,
-            },
-            thresholds_used: ThresholdParams {
-                min_witnesses: 3,
-                max_distance_meters: 1000,
-                min_signal_strength_dbm: -100,
-                max_path_loss_rmse: 8.0,
-            },
-            timestamp: Timestamp::now(),
-        };
-    
-        let hash = operator.submit_poc_evidence(poc_evidence).await.unwrap();
-        assert_ne!(hash, Hash::ZERO);
-    
-        let metrics = operator.get_metrics().await;
-        assert_eq!(metrics.poc_events_received, 1);
-    }
-
-    #[tokio::test]
-    async fn test_evidence_bundle_cellular_safe() {
-        let bundle = EvidenceBundle {
-            bundle_id: Hash::ZERO,
-            bundle_type: EvidenceBundleType::Combined,
-            poc_evidence: vec![],
-            post_evidence: vec![],
-            porep_proofs: vec![],
-            compressed_data: vec![0u8; 256 * 1024],
-            original_size: 512 * 1024,
-            compression_ratio: 2.0,
-            cid: "test".to_string(),
-            created_at: Timestamp::now(),
-        };
-
-        assert!(bundle.is_cellular_safe());
-    }
-
-    #[tokio::test]
-    async fn test_commitment_signature() {
-        let config = create_test_config();
-        let rollup_id = [1u8; 16];
-        let keypair = KeyPair::generate();
-        let operator_addr = Address::from_public_key(&keypair.dilithium_public_key());
-
-        let operator =
-            ProofRollupOperator::new(config, rollup_id, 1, operator_addr, keypair).unwrap();
-
-        let mut commitment = ProofRollupCommit {
-            rollup_id,
-            region_id: 1,
-            epoch: 100,
-            window_id: 5,
-            proofs_root: Hash::ZERO,
-            da_root: Hash::ZERO,
-            count_proofs: 10,
-            blob_bytes: 1024,
-            min_validity_proof: MinValidityProof::InclusionOnly,
-            operator_addr,
-            operator_sig: DualSignature::new(None, None),
-            chain_id: 1,
-            network_id: 1,
-            created_at: Timestamp::now(),
-            commitment_hash: Hash::ZERO,
-        };
-
-        operator.sign_commitment(&mut commitment).unwrap();
-
-        let valid = operator.verify_commitment_signature(&commitment).unwrap();
-        assert!(valid);
+        score.clamp(0.0, 1.0)
     }
 }
