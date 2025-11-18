@@ -344,6 +344,21 @@ impl Default for BatchConfig {
 }
 
 impl BatchManager {
+    pub async fn set_batch_ready(&self, batch_id: &Hash, state_root_post: Hash) -> EgoResult<()> {
+        let mut batch = self
+            .pending_batches
+            .get_mut(batch_id)
+            .ok_or(EgoError::InvalidTransaction("Batch not found".to_string()))?;
+        if batch.status != BatchStatus::Building {
+            return Err(EgoError::InvalidTransaction(
+                "Batch is not in Building state".to_string(),
+            ));
+        }
+        batch.state_root_post = state_root_post;
+        batch.status = BatchStatus::Ready;
+        Ok(())
+    }
+
     pub fn new(
         config: BatchConfig,
         drs_manager: Arc<DRSManager>,
@@ -1118,51 +1133,45 @@ impl BatchManager {
 
     pub async fn advance_epoch(&self, new_epoch: u64) -> EgoResult<()> {
         let mut tracker = self.epoch_tracker.lock().await;
-        let current_epoch = tracker.current_epoch;
-
-        if new_epoch <= current_epoch {
+        let mut current = tracker.current_epoch;
+        if new_epoch <= current {
             return Err(EgoError::InvalidTransaction(
                 "New epoch must be greater than current epoch".to_string(),
             ));
         }
-
-        if let Some(batch_ids) = tracker.epoch_batches.get(&current_epoch) {
-            let mut stats = EpochBatchStats {
-                epoch: current_epoch,
-                ..Default::default()
-            };
-
-            for batch_id in batch_ids {
-                if let Some(finalized) = self.finalized_batches.get(batch_id) {
-                    stats.finalized_batches += 1;
-                    stats.operators_active.insert(finalized.operator);
+        while current < new_epoch {
+            let epoch = current;
+            if let Some(batch_ids) = tracker.epoch_batches.get(&epoch) {
+                let mut stats = EpochBatchStats {
+                    epoch,
+                    ..Default::default()
+                };
+                for batch_id in batch_ids {
+                    if let Some(finalized) = self.finalized_batches.get(batch_id) {
+                        stats.finalized_batches += 1;
+                        stats.operators_active.insert(finalized.operator);
+                    }
+                    if let Some(committed) = self.committed_batches.get(batch_id) {
+                        stats.total_batches += 1;
+                    }
+                    if let Some(pending) = self.pending_batches.get(batch_id) {
+                        stats.total_transactions += pending.transactions.len() as u64;
+                        stats.total_ru_consumed += pending.ru_consumed;
+                        stats.total_storage_used += pending.storage_used;
+                    }
                 }
-
-                if let Some(committed) = self.committed_batches.get(batch_id) {
-                    stats.total_batches += 1;
+                if stats.total_batches > 0 {
+                    stats.avg_batch_size =
+                        stats.total_transactions as f64 / stats.total_batches as f64;
                 }
-
-                if let Some(pending) = self.pending_batches.get(batch_id) {
-                    stats.total_transactions += pending.transactions.len() as u64;
-                    stats.total_ru_consumed += pending.ru_consumed;
-                    stats.total_storage_used += pending.storage_used;
-                }
+                tracker.epoch_stats.insert(epoch, stats);
             }
-
-            if stats.total_batches > 0 {
-                stats.avg_batch_size = stats.total_transactions as f64 / stats.total_batches as f64;
-            }
-
-            tracker.epoch_stats.insert(current_epoch, stats);
+            current += 1;
         }
-
         tracker.current_epoch = new_epoch;
-
         drop(tracker);
-
         self.sync_drs_scores(new_epoch).await?;
         self.sync_deploy_stats(new_epoch).await?;
-
         Ok(())
     }
 
