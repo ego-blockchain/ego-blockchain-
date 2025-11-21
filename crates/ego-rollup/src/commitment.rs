@@ -132,7 +132,7 @@ enum ChallengeInfoStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ResolvedChallenge {
+pub struct ResolvedChallenge {
     challenge_hash: Hash,
     commitment_hash: Hash,
     challenger: Address,
@@ -159,7 +159,7 @@ pub enum ChallengeType {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct OperatorStats {
+pub struct OperatorStats {
     total_commitments: u64,
     finalized_commitments: u64,
     challenged_commitments: u64,
