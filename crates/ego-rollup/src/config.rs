@@ -113,6 +113,10 @@ pub struct NetworkConfig {
     pub listen_port: u16,
     pub bootstrap_peers: Vec<String>,
     pub max_peers: u32,
+    #[serde(
+        serialize_with = "serde_helpers::serialize_duration",
+        deserialize_with = "serde_helpers::deserialize_duration"
+    )]
     pub connection_timeout: Duration,
     pub enable_mdns: bool,
     pub gossip: GossipConfig,
@@ -131,8 +135,16 @@ pub struct NetworkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GossipConfig {
+    #[serde(
+        serialize_with = "serde_helpers::serialize_duration",
+        deserialize_with = "serde_helpers::deserialize_duration"
+    )]
     pub heartbeat_interval: Duration,
     pub max_message_size: usize,
+    #[serde(
+        serialize_with = "serde_helpers::serialize_duration",
+        deserialize_with = "serde_helpers::deserialize_duration"
+    )]
     pub duplicate_cache_time: Duration,
     pub validation_mode: ValidationMode,
     pub mesh_n: usize,
@@ -141,6 +153,10 @@ pub struct GossipConfig {
     pub gossip_lazy: usize,
     pub gossip_factor: f64,
     pub opportunistic_graft_ticks: u64,
+    #[serde(
+        serialize_with = "serde_helpers::serialize_duration",
+        deserialize_with = "serde_helpers::deserialize_duration"
+    )]
     pub prune_backoff: Duration,
     pub topics: Vec<String>,
     pub per_topic_backpressure_enabled: bool,
@@ -295,16 +311,24 @@ pub struct StorageConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompressionAlgorithm {
+    #[serde(rename = "zstd")]
     Zstd,
+    #[serde(rename = "lz4")]
     Lz4,
+    #[serde(rename = "snappy")]
     Snappy,
+    #[serde(rename = "none")]
     None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DatabaseBackend {
+    #[serde(rename = "rocksdb")]
     RocksDB,
+    #[serde(rename = "surrealdb")]
     SurrealDB,
+    #[serde(rename = "custom")]
     Custom,
 }
 
@@ -578,6 +602,26 @@ pub enum OTAUpdatePolicy {
     Automatic,
     Manual,
     Scheduled,
+}
+
+mod serde_helpers {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize_duration<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u64(duration.as_secs())
+    }
+
+    pub fn deserialize_duration<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let secs = u64::deserialize(deserializer)?;
+        Ok(Duration::from_secs(secs))
+    }
 }
 
 impl Default for RollupConfig {
