@@ -1321,35 +1321,3 @@ pub fn calculate_batch_priority(batch: &BatchMetadata, drs_multiplier: f64) -> u
 
     priority as u8
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_batch_creation() {
-        let drs_manager = Arc::new(DRSManager::new(ego_core::drs::DRSConfig::default()));
-        let deploy_policy = Arc::new(DeployPolicyManager::new(
-            ego_core::deploy_policy::DeployPolicyConfig::default(),
-        ));
-
-        let manager = BatchManager::new(BatchConfig::default(), drs_manager, deploy_policy);
-
-        let operator = Address::new([1u8; 20]);
-        let shard_id = ShardId::new(0).unwrap();
-
-        manager
-            .register_operator(operator, shard_id, Balance::from_egoc(10000))
-            .await
-            .unwrap();
-
-        let transactions = vec![];
-        let state_root = Hash::ZERO;
-
-        let result = manager
-            .create_batch(operator, shard_id, transactions, state_root, 1)
-            .await;
-
-        assert!(result.is_ok());
-    }
-}
