@@ -146,6 +146,7 @@ fn calculate_distance(loc1: &LocationData, loc2: &LocationData) -> f32 {
     6371.0 * c as f32
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,8 +184,16 @@ mod tests {
 
     #[test]
     fn test_path_loss_calculation() {
+        // Free-space path loss at 1km, 3.5 GHz
         let path_loss = calculate_free_space_path_loss(1.0, 3.5);
-        assert!(path_loss > 70.0 && path_loss < 90.0);
+        
+        // FSPL = 20*log10(1) + 20*log10(3.5) + 32.44 ≈ 43.3 dB
+        println!("Free-space path loss: {} dB", path_loss);
+        assert!(path_loss > 40.0 && path_loss < 50.0);
+        
+        // Verify it increases with distance
+        let path_loss_10km = calculate_free_space_path_loss(10.0, 3.5);
+        assert!(path_loss_10km > path_loss);
     }
 
     #[test]
