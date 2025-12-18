@@ -1,10 +1,10 @@
 use crate::{BandwidthSharingEvent, NetworkEvent, OptimizerEvent};
 use crate::{BandwidthSharingManager, DataOptimizer, NetworkManager, NetworkType};
-use crate::{NodeBehaviour, NodeRole, Placement, ProofEvent, SecureKeystore, ShardConfig};
+use crate::{NodeBehaviour, Placement, ProofEvent, SecureKeystore, ShardConfig};
 
 use ego_core::{
-    Account, Address, Balance, Block, BlockHeight, DeviceCapabilities, EgoResult, Hash, PublicKey,
-    SliceId, StateManager, Transaction, TransactionResult, calculate_shard_for_address,
+    Account, Address, Balance, Block, BlockHeight, DeviceCapabilities, EgoResult, Hash, NodeRole,
+    PublicKey, SliceId, StateManager, Transaction, TransactionResult, calculate_shard_for_address,
     current_timestamp, format_storage_size,
 };
 
@@ -198,12 +198,16 @@ impl Node {
         let network_manager = NetworkManager::new();
         let bandwidth_sharing = BandwidthSharingManager::new(Default::default());
         let data_optimizer = DataOptimizer::new();
-        let state_manager = StateManager::new(1, 1); // chain_id=1, network_id=1
+        let state_manager = StateManager::new(1, 1);
 
         let (optimization_events, optimization_receiver) = mpsc::unbounded_channel();
 
         let node_address = Address::from_public_key(&keystore.public_key());
-        let node_account = Account::new_eoa(node_address, vec![0u8; 32], vec![0u8; 32]);
+        let node_account = Account::new_eoa(
+            node_address,
+            keystore.dilithium_public_key().key_data.clone(),
+            keystore.kyber_public_key().key_data.clone(),
+        );
         state_manager.set_account(node_account);
 
         info!(
@@ -246,11 +250,7 @@ impl Node {
     }
 
     pub async fn new_validator(shard_ids: Vec<u32>) -> anyhow::Result<Self> {
-        let mut node = Self::new(
-            vec![NodeRole::Validator, NodeRole::Relay],
-            shard_ids.clone(),
-        )
-        .await?;
+        let mut node = Self::new(vec![NodeRole::Validator], shard_ids.clone()).await?;
         node.node_type = "validator".to_string();
         node.max_peers_per_shard = 150;
         node.max_topics_per_role = 25;
@@ -263,8 +263,8 @@ impl Node {
             node.keystore.public_key(),
             500,
             Balance::from_egoc(1000),
-            node.keystore.dilithium_public_key().key_data,
-            node.keystore.kyber_public_key().key_data,
+            node.keystore.dilithium_public_key().key_data.clone(),
+            node.keystore.kyber_public_key().key_data.clone(),
         )
         .map_err(|e| anyhow::anyhow!("Failed to create validator account: {}", e))?;
 
@@ -278,7 +278,7 @@ impl Node {
     }
 
     pub async fn new_storage_miner(capacity_bytes: u64, geohash: String) -> anyhow::Result<Self> {
-        let mut node = Self::new(vec![NodeRole::Storage, NodeRole::Witness], vec![]).await?;
+        let mut node = Self::new(vec![NodeRole::StorageProvider], vec![]).await?;
         node.node_type = "storage".to_string();
         node.set_storage_capacity(capacity_bytes);
         node.geohash = Some(geohash.clone());
@@ -318,8 +318,8 @@ impl Node {
             device_address,
             format!("storage-{}", node.peer_id),
             capabilities,
-            node.keystore.dilithium_public_key().key_data,
-            node.keystore.kyber_public_key().key_data,
+            node.keystore.dilithium_public_key().key_data.clone(),
+            node.keystore.kyber_public_key().key_data.clone(),
             node.peer_id.to_string(),
         );
         node.state_manager.set_account(device_account);
@@ -338,11 +338,7 @@ impl Node {
         lon: f64,
         bandwidth_bps: u64,
     ) -> anyhow::Result<Self> {
-        let mut node = Self::new(
-            vec![NodeRole::Gateway, NodeRole::Witness, NodeRole::Relay],
-            vec![],
-        )
-        .await?;
+        let mut node = Self::new(vec![NodeRole::Gateway], vec![]).await?;
 
         node.node_type = "gateway".to_string();
         node.set_slice_configuration(slice_id.clone());
@@ -386,8 +382,8 @@ impl Node {
             gateway_address,
             format!("gateway-{}-{}", slice_id, node.peer_id),
             capabilities,
-            node.keystore.dilithium_public_key().key_data,
-            node.keystore.kyber_public_key().key_data,
+            node.keystore.dilithium_public_key().key_data.clone(),
+            node.keystore.kyber_public_key().key_data.clone(),
             node.peer_id.to_string(),
         );
         node.state_manager.set_account(gateway_account);
@@ -401,12 +397,7 @@ impl Node {
 
     pub async fn new_full_node(shard_ids: Vec<u32>, storage_capacity: u64) -> anyhow::Result<Self> {
         let mut node = Self::new(
-            vec![
-                NodeRole::Validator,
-                NodeRole::Storage,
-                NodeRole::Relay,
-                NodeRole::Witness,
-            ],
+            vec![NodeRole::Validator, NodeRole::StorageProvider],
             shard_ids.clone(),
         )
         .await?;
@@ -419,7 +410,11 @@ impl Node {
         let _ = node.enable_bandwidth_sharing(75, 1500);
 
         let node_address = Address::from_public_key(&node.keystore.public_key());
-        let mut full_account = Account::new_eoa(node_address, vec![0u8; 32], vec![0u8; 32]);
+        let mut full_account = Account::new_eoa(
+            node_address,
+            node.keystore.dilithium_public_key().key_data.clone(),
+            node.keystore.kyber_public_key().key_data.clone(),
+        );
         full_account.storage_quota = storage_capacity;
         full_account.credit(Balance::from_egoc(1000));
         full_account.storage_credits = 10000;
@@ -460,7 +455,7 @@ impl Node {
     }
 
     pub async fn new_seed_node() -> anyhow::Result<Self> {
-        let mut node = Self::new(vec![NodeRole::Seed, NodeRole::Relay], vec![]).await?;
+        let mut node = Self::new(vec![NodeRole::Gateway], vec![]).await?;
         node.node_type = "seed".to_string();
         node.is_bootstrap = true;
         node.max_peers_per_shard = 1000;
@@ -469,7 +464,11 @@ impl Node {
         let _ = node.enable_bandwidth_sharing(200, 5000);
 
         let seed_address = Address::from_public_key(&node.keystore.public_key());
-        let mut seed_account = Account::new_eoa(seed_address, vec![0u8; 32], vec![0u8; 32]);
+        let mut seed_account = Account::new_eoa(
+            seed_address,
+            node.keystore.dilithium_public_key().key_data.clone(),
+            node.keystore.kyber_public_key().key_data.clone(),
+        );
         seed_account.storage_quota = 50_000_000_000;
         seed_account.credit(Balance::from_egoc(10000));
         seed_account.storage_credits = 50000;
@@ -486,11 +485,7 @@ impl Node {
         shard_ids: Vec<u32>,
         storage_capacity: u64,
     ) -> anyhow::Result<Self> {
-        let mut node = Self::new(
-            vec![NodeRole::Indexer, NodeRole::Storage],
-            shard_ids.clone(),
-        )
-        .await?;
+        let mut node = Self::new(vec![NodeRole::StorageProvider], shard_ids.clone()).await?;
         node.node_type = "indexer".to_string();
         node.set_storage_capacity(storage_capacity);
         node.max_peers_per_shard = 150;
@@ -499,7 +494,11 @@ impl Node {
         let _ = node.enable_bandwidth_sharing(40, 800);
 
         let indexer_address = Address::from_public_key(&node.keystore.public_key());
-        let mut indexer_account = Account::new_eoa(indexer_address, vec![0u8; 32], vec![0u8; 32]);
+        let mut indexer_account = Account::new_eoa(
+            indexer_address,
+            node.keystore.dilithium_public_key().key_data.clone(),
+            node.keystore.kyber_public_key().key_data.clone(),
+        );
         indexer_account.storage_quota = storage_capacity;
         indexer_account.credit(Balance::from_egoc(500));
         indexer_account.storage_credits = 20000;
@@ -574,11 +573,11 @@ impl Node {
             proposer_address,
             transactions,
             vec![],
-            1, // chain_id
-            1, // network_id
+            1,
+            1,
         );
 
-        block.sign(self.get_keypair(), false)?; // transition_mode = false
+        block.sign(self.get_keypair(), false)?;
 
         info!(
             "Created block {} at height {} with {} transactions",
@@ -595,11 +594,10 @@ impl Node {
 
         if let Some(account) = self.state_manager.get_account(&block.header.core.proposer) {
             if let Some(validator_pubkey) = account.get_validator_pubkey() {
-                let ed25519_pk = account.ed25519_pk.as_ref()
-                    .and_then(|bytes| {
-                        let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
-                        Some(ego_core::PublicKey::ed25519(arr))
-                    });
+                let ed25519_pk = account.ed25519_pk.as_ref().and_then(|bytes| {
+                    let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
+                    Some(ego_core::PublicKey::ed25519(arr))
+                });
                 return block.verify_signature(&validator_pubkey, ed25519_pk.as_ref());
             }
         }
@@ -835,7 +833,7 @@ impl Node {
                 }
             }
 
-            if self.has_role(NodeRole::Storage) {
+            if self.has_role(NodeRole::StorageProvider) {
                 let topics = [
                     format!("ego/shard/{}/proofs", shard_id),
                     format!("ego/shard/{}/storage", shard_id),
@@ -852,20 +850,6 @@ impl Node {
                     } else {
                         subscribed_topics += 1;
                     }
-                }
-            }
-
-            if self.has_role(NodeRole::Indexer) {
-                let topic = format!("ego/shard/{}/index", shard_id);
-                if let Err(e) = self
-                    .swarm
-                    .behaviour_mut()
-                    .gossipsub
-                    .subscribe(&gossipsub::IdentTopic::new(topic.clone()))
-                {
-                    error!("Failed to subscribe to topic {}: {}", topic, e);
-                } else {
-                    subscribed_topics += 1;
                 }
             }
         }
@@ -920,14 +904,7 @@ impl Node {
             ]);
         }
 
-        if self.has_role(NodeRole::Witness) {
-            topics.push("ego/witness/beacons".to_string());
-            if let Some(ref geohash) = self.geohash {
-                topics.push(format!("ego/poc/h3/{}", geohash));
-            }
-        }
-
-        if self.has_role(NodeRole::Storage) {
+        if self.has_role(NodeRole::StorageProvider) {
             topics.extend([
                 "ego/storage/global".to_string(),
                 "ego/storage/placement".to_string(),
@@ -942,19 +919,8 @@ impl Node {
             ]);
         }
 
-        if self.has_role(NodeRole::Relay) {
-            topics.push("ego/relay/routing".to_string());
-        }
-
-        if self.has_role(NodeRole::Seed) {
-            topics.push("ego/seed/discovery".to_string());
-        }
-
-        if self.has_role(NodeRole::Indexer) {
-            topics.extend([
-                "ego/indexer/global".to_string(),
-                "ego/indexer/queries".to_string(),
-            ]);
+        if self.has_role(NodeRole::Rollup) {
+            topics.push("ego/rollup/commits".to_string());
         }
 
         topics
@@ -1208,30 +1174,13 @@ impl Node {
                 "transaction_validation",
             ]);
         }
-        if self.has_role(NodeRole::Storage) {
+        if self.has_role(NodeRole::StorageProvider) {
             capabilities.extend_from_slice(&[
                 "data_storage",
                 "proof_of_spacetime",
                 "erasure_coding",
                 "replica_management",
                 "storage_proofs",
-            ]);
-        }
-        if self.has_role(NodeRole::Relay) {
-            capabilities.extend_from_slice(&[
-                "packet_routing",
-                "network_relay",
-                "message_forwarding",
-                "cross_shard_relay",
-            ]);
-        }
-        if self.has_role(NodeRole::Witness) {
-            capabilities.extend_from_slice(&[
-                "proof_of_coverage",
-                "beacon_reporting",
-                "h3_coverage",
-                "location_verification",
-                "witness_attestation",
             ]);
         }
         if self.has_role(NodeRole::Gateway) {
@@ -1241,10 +1190,6 @@ impl Node {
                 "rate_limiting",
                 "request_routing",
                 "edge_computing",
-            ]);
-        }
-        if self.has_role(NodeRole::Seed) {
-            capabilities.extend_from_slice(&[
                 "peer_discovery",
                 "bootstrap_service",
                 "dht_seeding",
@@ -1252,13 +1197,12 @@ impl Node {
                 "peer_routing",
             ]);
         }
-        if self.has_role(NodeRole::Indexer) {
+        if self.has_role(NodeRole::Rollup) {
             capabilities.extend_from_slice(&[
-                "data_indexing",
-                "search_service",
-                "cross_shard_indexing",
-                "query_processing",
-                "analytics",
+                "rollup_sequencing",
+                "batch_processing",
+                "state_commitment",
+                "fraud_proof_generation",
             ]);
         }
 
