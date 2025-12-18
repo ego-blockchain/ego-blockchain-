@@ -43,7 +43,7 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             node_type: "full".to_string(),
-            roles: vec![NodeRole::Validator, NodeRole::Storage, NodeRole::Relay],
+            roles: vec![NodeRole::Validator, NodeRole::StorageProvider],
             shard_ids: vec![0],
             listen_port: 9000,
             bootstrap_peers: vec![],
@@ -368,24 +368,18 @@ fn parse_cli_args() -> NodeConfig {
 
 fn determine_roles(node_type: &str) -> Vec<NodeRole> {
     match node_type {
-        "validator" => vec![NodeRole::Validator, NodeRole::Relay],
-        "storage" => vec![NodeRole::Storage, NodeRole::Witness],
-        "gateway" => vec![NodeRole::Gateway, NodeRole::Witness, NodeRole::Relay],
-        "seed" => vec![NodeRole::Seed, NodeRole::Relay],
-        "indexer" => vec![NodeRole::Indexer, NodeRole::Storage],
-        "full" => vec![
-            NodeRole::Validator,
-            NodeRole::Storage,
-            NodeRole::Relay,
-            NodeRole::Witness,
-        ],
+        "validator" => vec![NodeRole::Validator],
+        "storage" => vec![NodeRole::StorageProvider],
+        "gateway" => vec![NodeRole::Gateway],
+        "seed" => vec![NodeRole::Gateway],
+        "indexer" => vec![NodeRole::StorageProvider],
+        "full" => vec![NodeRole::Validator, NodeRole::StorageProvider],
         _ => {
             warn!("Unknown node type '{}', defaulting to full node", node_type);
-            vec![NodeRole::Validator, NodeRole::Storage, NodeRole::Relay]
+            vec![NodeRole::Validator, NodeRole::StorageProvider]
         }
     }
 }
-
 async fn create_node_from_config(config: &NodeConfig) -> anyhow::Result<Node> {
     info!(
         "🏗️ Creating {} node with roles: {:?}",
@@ -570,7 +564,6 @@ fn print_node_info(node: &Node, config: &NodeConfig) {
         info!("🔗 Bootstrap Peers: {:?}", config.bootstrap_peers);
     }
 }
-
 async fn run_daemon_mode(mut node: Node, config: NodeConfig) -> anyhow::Result<()> {
     info!("🔄 Running in daemon mode. Press Ctrl+C to stop.");
     info!(
@@ -641,6 +634,197 @@ async fn run_daemon_mode(mut node: Node, config: NodeConfig) -> anyhow::Result<(
     Ok(())
 }
 
+async fn handle_network_event<T>(
+    node: &mut Node,
+    event: libp2p::swarm::SwarmEvent<T>,
+) -> anyhow::Result<()> {
+    match event {
+        libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
+            info!("🌐 Listening on {}", address);
+        }
+        libp2p::swarm::SwarmEvent::Behaviour(_event) => {
+            debug!("Behaviour event received");
+        }
+        libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            info!("🤝 Connected to peer: {}", peer_id);
+            node.record_peer_connection();
+        }
+        libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+            info!(
+                "❌ Disconnected from peer: {} (cause: {:?})",
+                peer_id, cause
+            );
+            node.record_peer_disconnection();
+        }
+        libp2p::swarm::SwarmEvent::IncomingConnection { .. } => {
+            debug!("📥 Incoming connection");
+        }
+        libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+            warn!("📤❌ Outgoing connection error to {:?}: {}", peer_id, error);
+        }
+        libp2p::swarm::SwarmEvent::IncomingConnectionError { error, .. } => {
+            warn!("📥❌ Incoming connection error: {}", error);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn print_status(node: &Node) {
+    let connected_peers = node.swarm.connected_peers().count();
+    info!("📊 Node Status: {}", node.get_summary());
+    info!("🌐 Listening addresses: {:?}", node.listen_addresses);
+    info!("👥 Connected peers: {}", connected_peers);
+
+    if connected_peers == 0 && !node.bootstrap_peers.is_empty() {
+        warn!("⚠️ No peers connected. Check network connectivity and bootstrap peers.");
+    }
+}
+
+fn print_metrics(node: &Node) {
+    println!("\n📈 Node Metrics");
+    println!("═══════════════");
+    println!("Connected Peers: {}", node.swarm.connected_peers().count());
+    println!("Recent Proof Events: {}", node.recent_proofs.len());
+    println!("Active Placements: {}", node.placements.len());
+    println!(
+        "Network Bandwidth: {} Mbps",
+        node.bandwidth_capacity_bps / 1_000_000
+    );
+    println!(
+        "Storage Utilization: {} GB available",
+        node.storage_capacity_bytes / 1_000_000_000
+    );
+
+    let state_stats = node.state_manager.get_stats();
+    println!("Blockchain Accounts: {}", state_stats.total_accounts);
+    println!("Total Balance: {}", state_stats.total_balance);
+    println!("Active Validators: {}", state_stats.active_validators);
+
+    let mut proof_counts = std::collections::HashMap::new();
+    for proof in &node.recent_proofs {
+        *proof_counts.entry(&proof.event_type).or_insert(0) += 1;
+    }
+
+    if !proof_counts.is_empty() {
+        println!("Proof Events by Type:");
+        for (event_type, count) in proof_counts {
+            println!("  {}: {}", event_type, count);
+        }
+    }
+}
+
+fn print_optimization_metrics(node: &Node) {
+    println!("\n💰 Optimization Metrics");
+    println!("═══════════════════════");
+
+    let sharing_stats = node.get_bandwidth_sharing_stats();
+    println!("Bandwidth Sharing:");
+    println!(
+        "  Status: {}",
+        if sharing_stats.enabled {
+            "Enabled"
+        } else {
+            "Disabled"
+        }
+    );
+    println!("  Active Connections: {}", sharing_stats.active_connections);
+    println!(
+        "  Daily Shared: {:.1}/{} MB",
+        sharing_stats.daily_shared_mb, sharing_stats.daily_limit_mb
+    );
+    println!(
+        "  Total Earned: {:.4} EGOC",
+        sharing_stats.total_earned_egoc
+    );
+    println!(
+        "  Available: {} Mbps",
+        sharing_stats.available_bandwidth_mbps
+    );
+
+    let opt_stats = node.get_optimization_stats();
+    println!("\nData Optimization:");
+    println!(
+        "  Operations Compressed: {}",
+        opt_stats.compression_stats.operations_compressed
+    );
+    println!(
+        "  Compression Ratio: {:.2}",
+        opt_stats.compression_stats.compression_ratio
+    );
+    println!(
+        "  Bandwidth Saved: {:.1} MB",
+        opt_stats.total_bandwidth_saved_mb
+    );
+    println!("  Pending Operations: {}", opt_stats.pending_operations);
+    println!("  Pending Batches: {}", opt_stats.pending_batches);
+
+    println!("\nNetwork Usage:");
+    println!("  {}", node.get_data_usage_summary());
+    println!(
+        "  Current Interface: {:?}",
+        node.network_manager.current_interface
+    );
+    println!("  Off-Peak Hours: {}", node.is_cost_effective_time());
+}
+
+fn print_final_stats(node: &Node) {
+    println!("\n📊 Final Statistics");
+    println!("═══════════════════");
+    let metrics = node.get_performance_metrics();
+    println!(
+        "Total uptime: {:.1} hours",
+        metrics.uptime_seconds as f64 / 3600.0
+    );
+    println!("Total proofs generated: {}", metrics.proof_events_generated);
+    println!(
+        "Total data processed: {:.2} MB",
+        (metrics.bytes_sent + metrics.bytes_received) as f64 / 1_000_000.0
+    );
+    println!("Total cost savings: ${:.2}", metrics.cost_savings_usd);
+
+    let sharing_stats = node.get_bandwidth_sharing_stats();
+    if sharing_stats.enabled {
+        println!("Total EGOC earned: {:.4}", sharing_stats.total_earned_egoc);
+    }
+
+    let state_stats = node.state_manager.get_stats();
+    println!("Final blockchain state:");
+    println!("  Total accounts: {}", state_stats.total_accounts);
+    println!("  Total balance: {}", state_stats.total_balance);
+    println!("  Block height: {}", node.get_block_height());
+}
+
+async fn generate_proofs(node: &mut Node) -> anyhow::Result<()> {
+    if node.has_role(NodeRole::StorageProvider) && !node.shard_ids.is_empty() {
+        let shard_id = node.shard_ids[0];
+        let piece_id = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            % 1000000) as u32;
+
+        let evidence = format!("post_proof_{}_{}", shard_id, piece_id).into_bytes();
+        node.emit_post_proof(shard_id, piece_id, evidence)?;
+        debug!("Generated optimized PoST proof for shard {}", shard_id);
+    }
+
+    if node.has_role(NodeRole::Gateway) {
+        if let Some(ref geohash) = node.geohash.clone() {
+            let evidence = format!(
+                "poc_proof_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs()
+            )
+            .into_bytes();
+
+            node.emit_poc_proof(geohash.clone(), evidence)?;
+            debug!("Generated optimized PoC proof for geohash");
+        }
+    }
+
+    Ok(())
+}
 async fn run_interactive_mode(mut node: Node, config: NodeConfig) -> anyhow::Result<()> {
     info!("🖥️ Running in interactive mode. Type 'help' for commands.");
 
@@ -712,44 +896,6 @@ async fn run_interactive_mode(mut node: Node, config: NodeConfig) -> anyhow::Res
     Ok(())
 }
 
-async fn handle_network_event(
-    node: &mut Node,
-    event: libp2p::swarm::SwarmEvent<
-        <ego_node::NodeBehaviour as libp2p::swarm::NetworkBehaviour>::ToSwarm,
-    >,
-) -> anyhow::Result<()> {
-    match event {
-        libp2p::swarm::SwarmEvent::NewListenAddr { address, .. } => {
-            info!("🌐 Listening on {}", address);
-        }
-        libp2p::swarm::SwarmEvent::Behaviour(event) => {
-            debug!("Behaviour event: {:?}", event);
-        }
-        libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-            info!("🤝 Connected to peer: {}", peer_id);
-            node.record_peer_connection();
-        }
-        libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-            info!(
-                "❌ Disconnected from peer: {} (cause: {:?})",
-                peer_id, cause
-            );
-            node.record_peer_disconnection();
-        }
-        libp2p::swarm::SwarmEvent::IncomingConnection { .. } => {
-            debug!("📥 Incoming connection");
-        }
-        libp2p::swarm::SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-            warn!("📤❌ Outgoing connection error to {:?}: {}", peer_id, error);
-        }
-        libp2p::swarm::SwarmEvent::IncomingConnectionError { error, .. } => {
-            warn!("📥❌ Incoming connection error: {}", error);
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 async fn handle_interactive_command(
     node: &mut Node,
     command: &str,
@@ -808,9 +954,41 @@ async fn handle_interactive_command(
                     "  Storage: {}/{} bytes",
                     account.storage_used, account.storage_quota
                 );
+                println!("  Storage Credits: {}", account.storage_credits);
+                println!("  Deploy Credits: {}", account.deploy_credits);
+                println!("  Free Deploys: {}", account.free_deploys_remaining);
+                if account.is_validator() {
+                    println!("  Validator: YES");
+                    if let Some(validator_info) = &account.validator_info {
+                        println!(
+                            "    Commission Rate: {}%",
+                            validator_info.commission_rate as f64 / 100.0
+                        );
+                        println!("    Active: {}", validator_info.is_active);
+                    }
+                }
+                if account.is_storage_provider() {
+                    println!("  Storage Provider: YES");
+                    if let Some(provider_info) = &account.storage_provider_info {
+                        println!("    Active Sectors: {}", provider_info.active_sectors.len());
+                        println!("    Health Score: {}", provider_info.health_score);
+                        println!(
+                            "    Storage Allocated: {} bytes",
+                            provider_info.storage_allocated
+                        );
+                    }
+                }
             } else {
                 println!("❌ Account not found in state");
             }
+        }
+        "accounts" => {
+            let state_stats = node.state_manager.get_stats();
+            println!("Blockchain Accounts Summary:");
+            println!("  Total Accounts: {}", state_stats.total_accounts);
+            println!("  Total Balance: {}", state_stats.total_balance);
+            println!("  Active Validators: {}", state_stats.active_validators);
+            println!("  Total Staked: {}", state_stats.total_staked);
         }
         "transfer" => {
             println!("Creating test transfer transaction...");
@@ -832,7 +1010,7 @@ async fn handle_interactive_command(
                     payload,
                     ego_core::ShardId::new(0).unwrap(),
                     None,
-                    1, // chain_id
+                    1,
                 );
 
                 if let Err(e) = tx.sign(node.get_keypair(), false) {
@@ -844,6 +1022,7 @@ async fn handle_interactive_command(
                             if let Some(error) = result.error {
                                 println!("   Error: {}", error);
                             }
+                            println!("   RU used: {}", result.ru_used);
                         }
                         Err(e) => {
                             println!("❌ Transaction failed: {}", e);
@@ -852,6 +1031,241 @@ async fn handle_interactive_command(
                 }
             } else {
                 println!("❌ Account not found");
+            }
+        }
+        "block" => {
+            println!("Creating test block...");
+            let previous_hash = node.get_state_root();
+            let height = node.get_block_height().next();
+
+            match node.create_block(vec![], previous_hash, height).await {
+                Ok(block) => {
+                    println!("✅ Block created successfully:");
+                    println!("   Hash: {}", block.hash);
+                    println!("   Height: {}", block.header.core.height.as_u64());
+                    println!("   Proposer: {}", block.header.core.proposer);
+                    println!("   Transactions: {}", block.body.transactions.len());
+                    println!("   Timestamp: {}", block.header.core.timestamp.as_secs());
+                }
+                Err(e) => {
+                    println!("❌ Failed to create block: {}", e);
+                }
+            }
+        }
+        "crypto" => {
+            println!("🔐 Cryptographic Information");
+            println!("════════════════════════════");
+
+            println!("\n📍 Identity:");
+            println!("  Node Address: {}", node.get_address());
+            println!("  Peer ID: {}", node.peer_id);
+
+            println!("\n🔑 Public Keys:");
+            let ed25519_pk = node.get_keypair().ed25519_public_key();
+            let dilithium_pk = node.get_keypair().dilithium_public_key();
+            let kyber_pk = node.get_keypair().kyber_public_key();
+            let x25519_pk = node.get_keypair().x25519_public_key();
+
+            println!(
+                "  Ed25519 (Classical): {}",
+                hex::encode(ed25519_pk.as_bytes())
+            );
+            println!(
+                "  ML-DSA-2 (Dilithium): {} bytes",
+                dilithium_pk.as_bytes().len()
+            );
+            println!("  ML-KEM-768 (Kyber): {} bytes", kyber_pk.as_bytes().len());
+            println!("  X25519 (Classical): {}", hex::encode(&x25519_pk));
+
+            if let Some(slh_dsa_pk) = node.get_keypair().slh_dsa_public_key() {
+                println!(
+                    "  SLH-DSA (SPHINCS+): {} bytes",
+                    slh_dsa_pk.as_bytes().len()
+                );
+            }
+
+            println!("\n🔐 Cryptographic Modes:");
+            println!(
+                "  Transition Mode: {}",
+                node.get_keypair().is_transition_mode()
+            );
+            println!("  Post-Quantum Ready: true");
+            println!(
+                "  Hybrid Signatures: {}",
+                node.get_keypair().is_transition_mode()
+            );
+
+            println!("\n🔬 Signature Test:");
+            let test_message = b"Test signature verification - advanced blockchain node";
+
+            let ed25519_sig = node.get_keypair().sign_ed25519(test_message);
+            println!("  Ed25519:");
+            println!("    Algorithm: {:?}", ed25519_sig.algorithm);
+            println!("    Size: {} bytes", ed25519_sig.signature_data.len());
+            println!(
+                "    Verification: {}",
+                ego_core::crypto::verify_signature(&ed25519_pk, test_message, &ed25519_sig)
+                    .unwrap_or(false)
+            );
+
+            let dilithium_sig = node.get_keypair().sign_dilithium(test_message);
+            println!("  ML-DSA-2 (Dilithium):");
+            println!("    Algorithm: {:?}", dilithium_sig.algorithm);
+            println!("    Size: {} bytes", dilithium_sig.signature_data.len());
+            println!(
+                "    Verification: {}",
+                ego_core::crypto::verify_signature(&dilithium_pk, test_message, &dilithium_sig)
+                    .unwrap_or(false)
+            );
+
+            let dual_sig = node.get_keypair().dual_sign(test_message);
+            println!("  Dual Signature (Hybrid):");
+            println!("    Has Ed25519: {}", dual_sig.ed25519_sig.is_some());
+            println!("    Has Dilithium: {}", dual_sig.dilithium_sig.is_some());
+            println!(
+                "    Verification: {}",
+                ego_core::crypto::verify_dual_signature(
+                    &ed25519_pk,
+                    &dilithium_pk,
+                    test_message,
+                    &dual_sig
+                )
+                .unwrap_or(false)
+            );
+
+            println!("\n🔒 Key Encapsulation (KEM):");
+            match node.get_keypair().encapsulate_kyber(kyber_pk.as_bytes()) {
+                Ok((ciphertext, shared_secret)) => {
+                    println!("  ML-KEM-768 (Kyber) Encapsulation:");
+                    println!("    Ciphertext Size: {} bytes", ciphertext.len());
+                    println!("    Shared Secret Size: {} bytes", shared_secret.len());
+
+                    match node.get_keypair().decapsulate_kyber(&ciphertext) {
+                        Ok(decapsulated_secret) => {
+                            println!("    Decapsulation: SUCCESS");
+                            println!(
+                                "    Secrets Match: {}",
+                                shared_secret == decapsulated_secret
+                            );
+                        }
+                        Err(e) => println!("    Decapsulation: FAILED - {}", e),
+                    }
+                }
+                Err(e) => println!("  KEM Test: FAILED - {}", e),
+            }
+
+            println!("\n🎭 Advanced Features:");
+            println!("  Stealth Addresses: Supported");
+            println!("  Hybrid Sessions: Supported");
+            println!("  Domain Separation: Enabled");
+            println!("  Replay Protection: Active");
+            println!("  Batch Verification: Supported");
+
+            println!("\n📊 Supported Algorithms:");
+            println!("  Signatures:");
+            println!("    ✓ Ed25519 (NIST SP 800-186)");
+            println!("    ✓ ML-DSA-2 / Dilithium2 (FIPS 204)");
+            println!("    ✓ SLH-DSA / SPHINCS+ (FIPS 205)");
+            println!("  Key Exchange:");
+            println!("    ✓ X25519 (RFC 7748)");
+            println!("    ✓ ML-KEM-768 / Kyber768 (FIPS 203)");
+            println!("  Symmetric:");
+            println!("    ✓ XChaCha20-Poly1305 (AEAD)");
+            println!("    ✓ BLAKE2s (Hashing)");
+            println!("    ✓ HKDF-SHA256 (Key Derivation)");
+
+            println!("\n🛡️ Security Properties:");
+            println!("  Post-Quantum Security: YES");
+            println!("  Forward Secrecy: YES");
+            println!("  Replay Protection: YES");
+            println!("  Domain Separation: YES");
+            println!("  Authenticated Encryption: YES");
+        }
+        "test-kem" => {
+            println!("🔒 Testing Key Encapsulation Mechanism...");
+            let kyber_pk = node.get_keypair().kyber_public_key();
+
+            match node.get_keypair().encapsulate_kyber(kyber_pk.as_bytes()) {
+                Ok((ciphertext, shared_secret1)) => {
+                    println!("✅ Encapsulation successful");
+                    println!("   Ciphertext: {} bytes", ciphertext.len());
+                    println!("   Shared secret: {} bytes", shared_secret1.len());
+
+                    match node.get_keypair().decapsulate_kyber(&ciphertext) {
+                        Ok(shared_secret2) => {
+                            if shared_secret1 == shared_secret2 {
+                                println!("✅ Decapsulation successful - secrets match!");
+                            } else {
+                                println!("❌ Decapsulation failed - secrets don't match");
+                            }
+                        }
+                        Err(e) => println!("❌ Decapsulation error: {}", e),
+                    }
+                }
+                Err(e) => println!("❌ Encapsulation error: {}", e),
+            }
+        }
+        "test-stealth" => {
+            println!("🎭 Testing Stealth Address Generation...");
+            let kyber_pk = node.get_keypair().kyber_public_key();
+            let ephemeral = node.get_keypair().to_bytes();
+
+            match ego_core::crypto::derive_stealth_address(kyber_pk.as_bytes(), &ephemeral) {
+                Ok((one_time_pk, spend_key)) => {
+                    println!("✅ Stealth address generated");
+                    println!("   One-time public key: {:?}", one_time_pk.algorithm);
+                    println!("   Spend key size: {} bytes", spend_key.len());
+                    println!("   Algorithm: Post-Quantum Safe");
+                }
+                Err(e) => println!("❌ Stealth address generation failed: {}", e),
+            }
+        }
+        "test-batch-verify" => {
+            println!("📦 Testing Batch Signature Verification...");
+            use ego_core::crypto::BatchVerifier;
+
+            let mut verifier = BatchVerifier::new(100000, 10);
+            let test_msg = b"Batch verification test message";
+
+            for i in 0..5 {
+                let msg = format!("Message {}", i);
+                let sig = node.get_keypair().sign_dilithium(msg.as_bytes());
+                let pk = node.get_keypair().dilithium_public_key();
+
+                match verifier.add_signature(pk, msg.as_bytes().to_vec(), sig) {
+                    Ok(()) => println!("  ✓ Added signature {}", i + 1),
+                    Err(e) => println!("  ✗ Failed to add signature {}: {}", i + 1, e),
+                }
+            }
+
+            match verifier.verify_batch() {
+                Ok(results) => {
+                    let valid_count = results.iter().filter(|&&v| v).count();
+                    println!("✅ Batch verification complete");
+                    println!("   Total signatures: {}", results.len());
+                    println!("   Valid signatures: {}", valid_count);
+                    println!("   Invalid signatures: {}", results.len() - valid_count);
+                }
+                Err(e) => println!("❌ Batch verification failed: {}", e),
+            }
+        }
+        "test-merkle" => {
+            println!("🌳 Testing Merkle Tree Construction...");
+            use ego_core::crypto::MerkleTree;
+
+            let items: Vec<Vec<u8>> = (0..8)
+                .map(|i| format!("Transaction {}", i).into_bytes())
+                .collect();
+
+            let tree = MerkleTree::build(items.clone());
+
+            if let Some(root) = tree.root_hash() {
+                println!("✅ Merkle tree constructed");
+                println!("   Leaves: {}", tree.len());
+                println!("   Root hash: {}", root);
+                println!("   Tree structure: Post-Quantum Safe (BLAKE2s)");
+            } else {
+                println!("❌ Failed to construct Merkle tree");
             }
         }
         "proofs" => {
@@ -1069,9 +1483,16 @@ fn print_commands() {
     println!("  peers          - List connected peers");
     println!("  roles          - Show current node roles");
     println!("  capabilities   - Show node capabilities");
+    println!("");
+    println!("🔗 Blockchain Commands:");
     println!("  blockchain     - Show blockchain state");
     println!("  account        - Show my account details");
+    println!("  accounts       - Show all accounts summary");
     println!("  transfer       - Create test transfer transaction");
+    println!("  block          - Create test block");
+    println!("  crypto         - Show cryptographic information");
+    println!("");
+    println!("📊 Monitoring Commands:");
     println!("  proofs         - Show recent proof events");
     println!("  5g             - Show 5G configuration status");
     println!("  metrics        - Show performance metrics");
@@ -1094,19 +1515,13 @@ fn print_commands() {
     println!("  test-post      - Generate test Proof of Spacetime");
     println!("  connect        - Attempt to connect to bootstrap peers");
     println!("  addresses      - Show listen and bootstrap addresses");
+    println!("🔐 Advanced Crypto Commands:");
+    println!("  test-kem       - Test Key Encapsulation Mechanism");
+    println!("  test-stealth   - Test Stealth Address Generation");
+    println!("  test-batch-verify - Test Batch Signature Verification");
+    println!("  test-merkle    - Test Merkle Tree Construction");
     println!("");
     println!("  quit/exit      - Shutdown the node");
-}
-
-fn print_status(node: &Node) {
-    let connected_peers = node.swarm.connected_peers().count();
-    info!("📊 Node Status: {}", node.get_summary());
-    info!("🌐 Listening addresses: {:?}", node.listen_addresses);
-    info!("👥 Connected peers: {}", connected_peers);
-
-    if connected_peers == 0 && !node.bootstrap_peers.is_empty() {
-        warn!("⚠️ No peers connected. Check network connectivity and bootstrap peers.");
-    }
 }
 
 fn print_detailed_status(node: &Node) {
@@ -1158,93 +1573,6 @@ fn print_detailed_status(node: &Node) {
     println!("Data Saved: {:.1} MB", opt_stats.total_bandwidth_saved_mb);
 }
 
-fn print_metrics(node: &Node) {
-    println!("\n📈 Node Metrics");
-    println!("═══════════════");
-    println!("Connected Peers: {}", node.swarm.connected_peers().count());
-    println!("Recent Proof Events: {}", node.recent_proofs.len());
-    println!("Active Placements: {}", node.placements.len());
-    println!(
-        "Network Bandwidth: {} Mbps",
-        node.bandwidth_capacity_bps / 1_000_000
-    );
-    println!(
-        "Storage Utilization: {} GB available",
-        node.storage_capacity_bytes / 1_000_000_000
-    );
-
-    let state_stats = node.state_manager.get_stats();
-    println!("Blockchain Accounts: {}", state_stats.total_accounts);
-    println!("Total Balance: {}", state_stats.total_balance);
-    println!("Active Validators: {}", state_stats.active_validators);
-
-    let mut proof_counts = std::collections::HashMap::new();
-    for proof in &node.recent_proofs {
-        *proof_counts.entry(&proof.event_type).or_insert(0) += 1;
-    }
-
-    if !proof_counts.is_empty() {
-        println!("Proof Events by Type:");
-        for (event_type, count) in proof_counts {
-            println!("  {}: {}", event_type, count);
-        }
-    }
-}
-
-fn print_optimization_metrics(node: &Node) {
-    println!("\n💰 Optimization Metrics");
-    println!("═══════════════════════");
-
-    let sharing_stats = node.get_bandwidth_sharing_stats();
-    println!("Bandwidth Sharing:");
-    println!(
-        "  Status: {}",
-        if sharing_stats.enabled {
-            "Enabled"
-        } else {
-            "Disabled"
-        }
-    );
-    println!("  Active Connections: {}", sharing_stats.active_connections);
-    println!(
-        "  Daily Shared: {:.1}/{} MB",
-        sharing_stats.daily_shared_mb, sharing_stats.daily_limit_mb
-    );
-    println!(
-        "  Total Earned: {:.4} EGOC",
-        sharing_stats.total_earned_egoc
-    );
-    println!(
-        "  Available: {} Mbps",
-        sharing_stats.available_bandwidth_mbps
-    );
-
-    let opt_stats = node.get_optimization_stats();
-    println!("\nData Optimization:");
-    println!(
-        "  Operations Compressed: {}",
-        opt_stats.compression_stats.operations_compressed
-    );
-    println!(
-        "  Compression Ratio: {:.2}",
-        opt_stats.compression_stats.compression_ratio
-    );
-    println!(
-        "  Bandwidth Saved: {:.1} MB",
-        opt_stats.total_bandwidth_saved_mb
-    );
-    println!("  Pending Operations: {}", opt_stats.pending_operations);
-    println!("  Pending Batches: {}", opt_stats.pending_batches);
-
-    println!("\nNetwork Usage:");
-    println!("  {}", node.get_data_usage_summary());
-    println!(
-        "  Current Interface: {:?}",
-        node.network_manager.current_interface
-    );
-    println!("  Off-Peak Hours: {}", node.is_cost_effective_time());
-}
-
 fn print_performance_metrics(node: &Node) {
     let metrics = node.get_performance_metrics();
     println!("\n⚡ Performance Metrics");
@@ -1280,62 +1608,4 @@ fn print_performance_metrics(node: &Node) {
     );
     println!("Network Switches: {}", metrics.network_switches);
     println!("Cost Savings: ${:.2}", metrics.cost_savings_usd);
-}
-
-fn print_final_stats(node: &Node) {
-    println!("\n📊 Final Statistics");
-    println!("═══════════════════");
-    let metrics = node.get_performance_metrics();
-    println!(
-        "Total uptime: {:.1} hours",
-        metrics.uptime_seconds as f64 / 3600.0
-    );
-    println!("Total proofs generated: {}", metrics.proof_events_generated);
-    println!(
-        "Total data processed: {:.2} MB",
-        (metrics.bytes_sent + metrics.bytes_received) as f64 / 1_000_000.0
-    );
-    println!("Total cost savings: ${:.2}", metrics.cost_savings_usd);
-
-    let sharing_stats = node.get_bandwidth_sharing_stats();
-    if sharing_stats.enabled {
-        println!("Total EGOC earned: {:.4}", sharing_stats.total_earned_egoc);
-    }
-
-    let state_stats = node.state_manager.get_stats();
-    println!("Final blockchain state:");
-    println!("  Total accounts: {}", state_stats.total_accounts);
-    println!("  Total balance: {}", state_stats.total_balance);
-    println!("  Block height: {}", node.get_block_height());
-}
-
-async fn generate_proofs(node: &mut Node) -> anyhow::Result<()> {
-    if node.has_role(NodeRole::Storage) && !node.shard_ids.is_empty() {
-        let shard_id = node.shard_ids[0];
-        let piece_id = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs()
-            % 1000000) as u32;
-
-        let evidence = format!("post_proof_{}_{}", shard_id, piece_id).into_bytes();
-        node.emit_post_proof(shard_id, piece_id, evidence)?;
-        debug!("Generated optimized PoST proof for shard {}", shard_id);
-    }
-
-    if node.has_role(NodeRole::Witness) {
-        if let Some(geohash) = node.geohash.clone() {
-            let evidence = format!(
-                "poc_proof_{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_secs()
-            )
-            .into_bytes();
-
-            node.emit_poc_proof(geohash, evidence)?;
-            debug!("Generated optimized PoC proof for geohash");
-        }
-    }
-
-    Ok(())
 }

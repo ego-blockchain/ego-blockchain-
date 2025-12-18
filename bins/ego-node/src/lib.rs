@@ -4,10 +4,9 @@ pub mod keystore;
 pub mod network_manager;
 pub mod node;
 
-pub use ego_core::*;
-
 pub use bandwidth_sharing::*;
 pub use data_optimizer::*;
+pub use ego_core::*;
 pub use keystore::*;
 pub use network_manager::*;
 pub use node::*;
@@ -22,18 +21,6 @@ pub struct NodeBehaviour {
     pub autonat: autonat::Behaviour,
     pub mdns: mdns::tokio::Behaviour,
     pub ping: ping::Behaviour,
-}
-
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum NodeRole {
-    Validator,
-    Storage,
-    Relay,
-    Witness,
-    Gateway,
-    Seed,
-    Indexer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
