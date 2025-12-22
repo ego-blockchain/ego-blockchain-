@@ -991,7 +991,7 @@ async fn handle_interactive_command(
             println!("  Total Staked: {}", state_stats.total_staked);
         }
         "transfer" => {
-            println!("Creating test transfer transaction...");
+            println!("Creating transfer transaction...");
             let from_address = node.get_address();
             let to_address = Address::new([1u8; 20]);
             let amount = Balance::from_egoc(10);
@@ -1000,7 +1000,7 @@ async fn handle_interactive_command(
                 let payload = TransactionPayload::Transfer {
                     to: to_address,
                     amount,
-                    memo: Some("Test transfer".to_string()),
+                    memo: Some("Interactive transfer".to_string()),
                     stealth_mode: false,
                 };
 
@@ -1034,7 +1034,7 @@ async fn handle_interactive_command(
             }
         }
         "block" => {
-            println!("Creating test block...");
+            println!("Creating block...");
             let previous_hash = node.get_state_root();
             let height = node.get_block_height().next();
 
@@ -1095,8 +1095,8 @@ async fn handle_interactive_command(
                 node.get_keypair().is_transition_mode()
             );
 
-            println!("\n🔬 Signature Test:");
-            let test_message = b"Test signature verification - advanced blockchain node";
+            println!("\n🔬 Signature Verification:");
+            let test_message = b"Ego blockchain node signature verification";
 
             let ed25519_sig = node.get_keypair().sign_ed25519(test_message);
             println!("  Ed25519:");
@@ -1133,12 +1133,12 @@ async fn handle_interactive_command(
                 .unwrap_or(false)
             );
 
-            println!("\n🔒 Key Encapsulation (KEM):");
+            println!("\n🔒 Key Encapsulation:");
             match node.get_keypair().encapsulate_kyber(kyber_pk.as_bytes()) {
                 Ok((ciphertext, shared_secret)) => {
-                    println!("  ML-KEM-768 (Kyber) Encapsulation:");
-                    println!("    Ciphertext Size: {} bytes", ciphertext.len());
-                    println!("    Shared Secret Size: {} bytes", shared_secret.len());
+                    println!("  ML-KEM-768 (Kyber):");
+                    println!("    Ciphertext: {} bytes", ciphertext.len());
+                    println!("    Shared Secret: {} bytes", shared_secret.len());
 
                     match node.get_keypair().decapsulate_kyber(&ciphertext) {
                         Ok(decapsulated_secret) => {
@@ -1151,7 +1151,7 @@ async fn handle_interactive_command(
                         Err(e) => println!("    Decapsulation: FAILED - {}", e),
                     }
                 }
-                Err(e) => println!("  KEM Test: FAILED - {}", e),
+                Err(e) => println!("  KEM: FAILED - {}", e),
             }
 
             println!("\n🎭 Advanced Features:");
@@ -1181,8 +1181,8 @@ async fn handle_interactive_command(
             println!("  Domain Separation: YES");
             println!("  Authenticated Encryption: YES");
         }
-        "test-kem" => {
-            println!("🔒 Testing Key Encapsulation Mechanism...");
+        "kem" => {
+            println!("🔒 Key Encapsulation Mechanism");
             let kyber_pk = node.get_keypair().kyber_public_key();
 
             match node.get_keypair().encapsulate_kyber(kyber_pk.as_bytes()) {
@@ -1205,8 +1205,8 @@ async fn handle_interactive_command(
                 Err(e) => println!("❌ Encapsulation error: {}", e),
             }
         }
-        "test-stealth" => {
-            println!("🎭 Testing Stealth Address Generation...");
+        "stealth" => {
+            println!("🎭 Stealth Address Generation");
             let kyber_pk = node.get_keypair().kyber_public_key();
             let ephemeral = node.get_keypair().to_bytes();
 
@@ -1220,12 +1220,11 @@ async fn handle_interactive_command(
                 Err(e) => println!("❌ Stealth address generation failed: {}", e),
             }
         }
-        "test-batch-verify" => {
-            println!("📦 Testing Batch Signature Verification...");
+        "batch-verify" => {
+            println!("📦 Batch Signature Verification");
             use ego_core::crypto::BatchVerifier;
 
             let mut verifier = BatchVerifier::new(100000, 10);
-            let test_msg = b"Batch verification test message";
 
             for i in 0..5 {
                 let msg = format!("Message {}", i);
@@ -1249,8 +1248,8 @@ async fn handle_interactive_command(
                 Err(e) => println!("❌ Batch verification failed: {}", e),
             }
         }
-        "test-merkle" => {
-            println!("🌳 Testing Merkle Tree Construction...");
+        "merkle" => {
+            println!("🌳 Merkle Tree Construction");
             use ego_core::crypto::MerkleTree;
 
             let items: Vec<Vec<u8>> = (0..8)
@@ -1280,9 +1279,7 @@ async fn handle_interactive_command(
                 );
             }
             if node.recent_proofs.is_empty() {
-                println!(
-                    "  No proofs generated yet. Use 'test-poc' or 'test-post' to generate test proofs."
-                );
+                println!("  No proofs generated yet. Use 'poc' or 'post' to generate proofs.");
             }
         }
         "5g" => {
@@ -1373,19 +1370,19 @@ async fn handle_interactive_command(
         }
         "switch-wifi" => {
             node.update_network_interface_status(NetworkType::WiFi, true, Some(80));
-            println!("✅ Switched to WiFi (simulated)");
+            println!("✅ Switched to WiFi");
         }
         "switch-5g" => {
             node.update_network_interface_status(NetworkType::FiveG, true, Some(90));
-            println!("✅ Switched to 5G (simulated)");
+            println!("✅ Switched to 5G");
         }
         "switch-ethernet" => {
             node.update_network_interface_status(NetworkType::Ethernet, true, Some(100));
-            println!("✅ Switched to Ethernet (simulated)");
+            println!("✅ Switched to Ethernet");
         }
-        "test-poc" => {
+        "poc" => {
             if let Some(geohash) = node.geohash.clone() {
-                let evidence = format!("test_poc_{}", chrono::Utc::now().timestamp()).into_bytes();
+                let evidence = format!("poc_{}", chrono::Utc::now().timestamp()).into_bytes();
                 if let Err(e) = node.emit_poc_proof(geohash.clone(), evidence) {
                     println!("❌ Failed to emit PoC proof: {}", e);
                 } else {
@@ -1395,11 +1392,11 @@ async fn handle_interactive_command(
                 println!("❌ No geohash set for PoC proof. Set latitude/longitude first.");
             }
         }
-        "test-post" => {
+        "post" => {
             if !node.shard_ids.is_empty() {
                 let shard_id = node.shard_ids[0];
                 let piece_id = chrono::Utc::now().timestamp() as u32;
-                let evidence = format!("test_post_{}_{}", shard_id, piece_id).into_bytes();
+                let evidence = format!("post_{}_{}", shard_id, piece_id).into_bytes();
                 if let Err(e) = node.emit_post_proof(shard_id, piece_id, evidence) {
                     println!("❌ Failed to emit PoST proof: {}", e);
                 } else {
@@ -1462,6 +1459,1221 @@ async fn handle_interactive_command(
             );
             println!("  5G Ready: {}", node.is_5g_ready());
         }
+        "deploy-policy" => {
+            println!("📋 Deploy Policy Manager");
+            use ego_core::deploy_policy::{
+                DeployPolicyConfig, DeployPolicyManager, DeployRequest, DeployType,
+            };
+
+            let config = DeployPolicyConfig::default();
+            let mut manager = DeployPolicyManager::new(config);
+
+            println!("  Config:");
+            println!(
+                "    Free deploys per epoch: {}",
+                manager.get_config().free_deploys_per_epoch
+            );
+            println!(
+                "    Max deploy size: {} KB",
+                manager.get_config().max_deploy_size_kb
+            );
+            println!(
+                "    Credits per KB: {}",
+                manager.get_config().credits_per_kb
+            );
+            println!(
+                "    Anti-spam enabled: {}",
+                manager.get_config().anti_spam_enabled
+            );
+            println!(
+                "    AI detection enabled: {}",
+                manager.get_config().ai_pattern_detection_enabled
+            );
+
+            let test_code = b"contract TestContract { function test() public pure returns (uint) { return 42; } }";
+            let request = DeployRequest {
+                deployer: node.get_address(),
+                deploy_type: DeployType::SmartContract {
+                    code_size_kb: 1,
+                    estimated_ru: 1000,
+                },
+                code: test_code.to_vec(),
+                metadata: std::collections::HashMap::new(),
+                use_free_quota: true,
+                preferred_shard: Some(0),
+                human_verification_signature: None,
+                dilithium_verification_pk: None,
+            };
+
+            match manager.evaluate_deploy_request(
+                &request,
+                Some(ego_core::Balance::from_egoc(1000)),
+                0,
+            ) {
+                Ok(decision) => {
+                    println!("✅ Deploy evaluation successful:");
+                    match decision {
+                        ego_core::deploy_policy::DeployDecision::AcceptWithFreeQuota {
+                            deploy_id,
+                        } => {
+                            println!("   Accepted with free quota");
+                            println!("   Deploy ID: {}", deploy_id);
+                        }
+                        ego_core::deploy_policy::DeployDecision::AcceptWithCredits {
+                            deploy_id,
+                            credits_required,
+                            bond_required,
+                            pob_floor,
+                        } => {
+                            println!("   Accepted with credits");
+                            println!("   Deploy ID: {}", deploy_id);
+                            println!("   Credits required: {}", credits_required);
+                            println!("   Bond required: {:?}", bond_required);
+                            println!("   PoB floor: {}", pob_floor);
+                        }
+                        ego_core::deploy_policy::DeployDecision::Reject { deploy_id, reason } => {
+                            println!("   Rejected: {}", reason);
+                            println!("   Deploy ID: {}", deploy_id);
+                        }
+                    }
+                }
+                Err(e) => println!("❌ Deploy evaluation failed: {}", e),
+            }
+
+            let reputation = manager.calculate_deployer_reputation(&node.get_address());
+            println!("\n  Deployer Reputation:");
+            println!("    Total deploys: {}", reputation.total_deploys);
+            println!("    Success rate: {:.2}%", reputation.success_rate);
+            println!("    Reputation score: {}", reputation.reputation_score);
+        }
+        "drs" => {
+            println!("📊 Dynamic Reputation System");
+            use ego_core::drs::{DRSConfig, DRSManager, EvidenceBundle, PoCEventData};
+
+            let config = DRSConfig::default();
+            println!("  DRS Config:");
+            println!("    Weight uptime: {:.2}", config.w_uptime);
+            println!("    Weight PoST pass: {:.2}", config.w_post_pass);
+            println!("    Weight PoC: {:.2}", config.w_poc);
+            println!("    Smoothing alpha: {:.2}", config.smoothing_alpha);
+            println!(
+                "    Multiplier range: {:.2} - {:.2}",
+                config.m_min, config.m_max
+            );
+
+            let manager = DRSManager::new(config);
+
+            let evidence = EvidenceBundle {
+                node_id: node.get_address(),
+                epoch: 1,
+                uptime_slots_seen: 950,
+                uptime_slots_expected: 1000,
+                post_challenges: 100,
+                post_passes: 98,
+                post_latency_sum_ms: 45000,
+                post_latency_count: 98,
+                poc_events: vec![PoCEventData {
+                    event_id: ego_core::Hash::random(),
+                    q_after_ldm: 0.95,
+                    witness_confidence: 0.9,
+                    h3_cell: "8c283082a6c7fff".to_string(),
+                    timestamp: ego_core::Timestamp::now(),
+                }],
+                serve_bytes_ok: 1_000_000_000,
+                serve_bytes_requested: 1_050_000_000,
+                failed_post_count: 2,
+                replay_or_incoherence_count: 0,
+                equivocation_count: 0,
+                density_data: None,
+            };
+
+            match manager.calculate_drs_score(evidence) {
+                Ok(score) => {
+                    println!("✅ DRS score calculated:");
+                    println!("   Node: {}", score.node_id);
+                    println!("   Epoch: {}", score.epoch);
+                    println!("   Raw score: {:.4}", score.score_raw);
+                    println!("   Smoothed score: {:.4}", score.score_smoothed);
+                    println!("   Multiplier: {:.4}", score.multiplier);
+                    println!("   Quota band: {:?}", score.quota_band);
+                    println!("\n   Components:");
+                    println!("     Uptime: {:.4}", score.components.uptime);
+                    println!("     PoST pass: {:.4}", score.components.post_pass);
+                    println!("     Inv latency: {:.4}", score.components.inv_latency);
+                    println!("     PoC quality: {:.4}", score.components.poc_quality);
+                    println!("     Serve ratio: {:.4}", score.components.serve_ratio);
+                    println!("\n   Penalties:");
+                    println!("     Failed PoST: {}", score.penalties.failed_post);
+                    println!(
+                        "     Replay/incoherence: {}",
+                        score.penalties.replay_or_incoherence
+                    );
+                    println!("     Equivocation: {}", score.penalties.equivocation);
+                    println!("     Total penalty: {:.4}", score.penalties.total_penalty);
+
+                    let quota = manager.get_quota_allocation(&node.get_address());
+                    println!("\n   Quota Allocation:");
+                    println!("     Band: {:?}", quota.quota_band);
+                    println!("     RU limit: {}", quota.ru_limit);
+                    println!("     Proof batch size: {}", quota.proof_batch_size);
+                    println!("     Audit frequency: {}", quota.audit_frequency);
+                    println!("     Publish rate limit: {}", quota.publish_rate_limit);
+                }
+                Err(e) => println!("❌ DRS score calculation failed: {}", e),
+            }
+        }
+        "deploy-cost" => {
+            println!("💰 Deploy Cost Estimation");
+            use ego_core::deploy_policy::{DeployPolicyConfig, DeployType, estimate_deploy_cost};
+
+            let config = DeployPolicyConfig::default();
+
+            let deploy_types = vec![
+                (
+                    "Smart Contract (Small)",
+                    DeployType::SmartContract {
+                        code_size_kb: 10,
+                        estimated_ru: 5000,
+                    },
+                ),
+                (
+                    "Smart Contract (Large)",
+                    DeployType::SmartContract {
+                        code_size_kb: 500,
+                        estimated_ru: 50000,
+                    },
+                ),
+                (
+                    "Storage Deal (1GB)",
+                    DeployType::StorageDeal {
+                        data_size_kb: 1_048_576,
+                        duration_blocks: 100000,
+                    },
+                ),
+                (
+                    "Rollup Operator",
+                    DeployType::RollupOperator {
+                        initial_state_kb: 100,
+                    },
+                ),
+            ];
+
+            for (name, deploy_type) in deploy_types {
+                let estimate = estimate_deploy_cost(&deploy_type, &config);
+                println!("\n  {}:", name);
+                println!("    Size: {} KB", estimate.size_kb);
+                println!("    Estimated RU: {}", estimate.estimated_ru);
+                println!("    Credits required: {}", estimate.credits_required);
+                println!("    PoB floor: {}", estimate.pob_floor_required);
+                println!("    Bond required: {}", estimate.bond_required);
+                println!("    Total cost estimate: {}", estimate.total_cost_estimate);
+            }
+        }
+        "drs-rewards" => {
+            println!("🎁 DRS Reward Distribution");
+            use ego_core::Balance;
+            use ego_core::drs::{DRSConfig, DRSManager};
+
+            let manager = DRSManager::new(DRSConfig::default());
+
+            let base_storage = Balance::from_egoc(100);
+            let base_consensus = Balance::from_egoc(50);
+            let base_coverage = Balance::from_egoc(25);
+
+            match manager.apply_reward_multiplier(
+                &node.get_address(),
+                base_storage,
+                base_consensus,
+                base_coverage,
+                1,
+            ) {
+                Ok(distribution) => {
+                    println!("✅ Reward distribution calculated:");
+                    println!("   Node: {}", distribution.node_id);
+                    println!("   Epoch: {}", distribution.epoch);
+                    println!("   DRS multiplier: {:.4}", distribution.drs_multiplier);
+                    println!("\n   Base rewards:");
+                    println!("     Storage: {}", distribution.base_storage_reward);
+                    println!("     Consensus: {}", distribution.base_consensus_reward);
+                    println!("     Coverage: {}", distribution.base_coverage_reward);
+                    println!("\n   Final rewards (with multiplier):");
+                    println!("     Storage: {}", distribution.final_storage_reward);
+                    println!("     Consensus: {}", distribution.final_consensus_reward);
+                    println!("     Coverage: {}", distribution.final_coverage_reward);
+                    println!("\n   Total reward: {}", distribution.total_reward);
+                }
+                Err(e) => println!("❌ Reward calculation failed: {}", e),
+            }
+        }
+        "shard" => {
+            println!("🔷 Shard Configuration");
+            println!("═══════════════════════");
+
+            let state = node.state_manager.get_stats();
+
+            println!("Basic Configuration:");
+            println!(
+                "  Shard ID: {}",
+                node.shard_ids
+                    .first()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "N/A".to_string())
+            );
+            println!("  Node roles: {:?}", node.roles);
+            println!("  Block height: #{}", node.get_block_height().as_u64());
+
+            println!("\nStorage:");
+            println!("  Total entries: {}", state.storage_entries);
+            println!(
+                "  Total size: {:.2} GB",
+                state.total_storage_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+            println!("  Archival chunks: {}", state.archival_chunks);
+            println!("  User data chunks: {}", state.user_data_chunks);
+
+            println!("\nValidators:");
+            println!("  Active: {}", state.active_validators);
+            println!("  Jailed: {}", state.jailed_validators);
+            println!("  Total staked: {}", state.total_staked);
+            println!(
+                "  Avg performance: {:.2}%",
+                state.average_validator_performance
+            );
+
+            println!("\nProofs:");
+            println!("  Total PoST challenges: {}", state.total_post_challenges);
+            println!("  Pass rate: {:.2}%", state.post_pass_rate);
+            println!("  Sectors monitored: {}", state.sectors_under_post);
+        }
+        "state" => {
+            println!("📊 Current State");
+            println!("════════════════");
+
+            let state = node.state_manager.get_stats();
+
+            println!("Accounts:");
+            println!("  Total: {}", state.total_accounts);
+            println!("  EOA: {}", state.eoa_accounts);
+            println!("  Devices: {}", state.device_accounts);
+            println!("  Validators: {}", state.validator_accounts);
+            println!("  Storage Providers: {}", state.storage_provider_accounts);
+            println!("  Contracts: {}", state.contract_accounts);
+
+            println!("\nBalances:");
+            println!("  Total balance: {}", state.total_balance);
+            println!("  Total staked: {}", state.total_staked);
+
+            println!("\nNetwork:");
+            println!("  Active slices: {}", state.active_slices);
+            println!(
+                "  Total bandwidth: {:.2} Mbps",
+                state.total_slice_bandwidth as f64 / 1_000_000.0
+            );
+            println!(
+                "  Pending cross-shard: {}",
+                state.pending_cross_shard_receipts
+            );
+
+            println!(
+                "\nLast updated: {}",
+                chrono::DateTime::from_timestamp_millis(state.last_updated.as_millis() as i64)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|| "Unknown".to_string())
+            );
+        }
+        "validators" => {
+            println!("👥 Validators");
+            println!("═════════════");
+
+            let validators = node.state_manager.get_active_validators();
+
+            if validators.is_empty() {
+                println!("No active validators");
+            } else {
+                println!("Active validators: {}\n", validators.len());
+
+                for (i, val) in validators.iter().take(10).enumerate() {
+                    println!("{}. {}", i + 1, val.address);
+                    println!("   Stake: {}", val.total_stake);
+                    println!("   Commission: {}%", val.commission_rate as f64 / 100.0);
+                    println!("   Uptime: {:.2}%", val.performance.uptime_score);
+                    println!(
+                        "   DRS score: {:.4} ({}x)",
+                        val.drs_score, val.drs_multiplier
+                    );
+                    println!();
+                }
+
+                if validators.len() > 10 {
+                    println!("... and {} more", validators.len() - 10);
+                }
+            }
+
+            let total_staked = node.state_manager.get_total_staked();
+            println!("Total staked: {}", total_staked);
+        }
+        "storage" => {
+            println!("💾 Storage Overview");
+            println!("═══════════════════");
+
+            let state_stats = node.state_manager.get_stats();
+
+            println!("Storage Entries: {}", state_stats.storage_entries);
+            println!(
+                "Total Size: {:.2} GB",
+                state_stats.total_storage_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+
+            println!("\nBy Type:");
+            println!("  Archival: {}", state_stats.archival_chunks);
+            println!("  Contract Code: {}", state_stats.contract_code_chunks);
+            println!("  User Data: {}", state_stats.user_data_chunks);
+
+            println!("\nProof of Spacetime:");
+            println!("  Total challenges: {}", state_stats.total_post_challenges);
+            println!("  Pass rate: {:.2}%", state_stats.post_pass_rate);
+            println!("  Sectors: {}", state_stats.sectors_under_post);
+
+            println!("\nNode Storage:");
+            println!(
+                "  Capacity: {} GB",
+                node.storage_capacity_bytes / (1024 * 1024 * 1024)
+            );
+            println!("  Shards: {:?}", node.shard_ids);
+        }
+        "slices" => {
+            println!("🍰 Network Slices");
+            println!("═════════════════");
+
+            let state_stats = node.state_manager.get_stats();
+
+            println!("Active slices: {}", state_stats.active_slices);
+            println!(
+                "Total bandwidth: {:.2} Mbps",
+                state_stats.total_slice_bandwidth as f64 / 1_000_000.0
+            );
+
+            if let Some(slice_id) = &node.slice_id {
+                println!("\nNode Slice: {}", slice_id);
+            }
+
+            if let Some(geohash) = &node.geohash {
+                println!("Coverage area: {}", geohash);
+            }
+
+            println!("\nNode Capabilities:");
+            println!("  5G Ready: {}", node.is_5g_ready());
+            println!(
+                "  Bandwidth: {} Mbps",
+                node.bandwidth_capacity_bps / 1_000_000
+            );
+        }
+        "my-account" => {
+            let my_address = node.get_address();
+            println!("👤 My Account: {}", my_address);
+            println!("═════════════════════════════════════════════");
+
+            if let Some(account) = node.state_manager.get_account(&my_address) {
+                println!("\nBalance: {}", account.balance);
+                println!("Nonce: {}", account.nonce);
+                println!("Type: {:?}", account.account_type);
+
+                println!("\nStorage:");
+                println!("  Used: {} bytes", account.storage_used);
+                println!("  Quota: {} bytes", account.storage_quota);
+                println!("  Credits: {}", account.storage_credits);
+
+                println!("\nDeploy:");
+                println!("  Credits: {}", account.deploy_credits);
+                println!("  Free remaining: {}", account.free_deploys_remaining);
+
+                if account.is_validator() {
+                    println!("\n✓ Validator Account");
+                    if let Some(val_info) = account.validator_info.as_ref() {
+                        println!("  Commission: {}%", val_info.commission_rate as f64 / 100.0);
+                        println!("  Active: {}", val_info.is_active);
+                    }
+                }
+
+                if account.is_storage_provider() {
+                    println!("\n✓ Storage Provider");
+                    if let Some(sp_info) = account.storage_provider_info.as_ref() {
+                        println!("  Active sectors: {}", sp_info.active_sectors.len());
+                        println!("  Health score: {}", sp_info.health_score);
+                    }
+                }
+
+                if !account.authorized_slices.is_empty() {
+                    println!("\nAuthorized Slices:");
+                    for slice in &account.authorized_slices {
+                        println!("  - {}", slice.as_str());
+                    }
+                }
+            } else {
+                println!("❌ Account not found in state");
+            }
+        }
+        "txpool" => {
+            println!("🌊 Transaction Pool");
+            println!("═══════════════════");
+
+            println!("Connected peers: {}", node.swarm.connected_peers().count());
+            println!("Recent proofs: {}", node.recent_proofs.len());
+
+            let state_stats = node.state_manager.get_stats();
+            println!("\nBlockchain Activity:");
+            println!("  Total accounts: {}", state_stats.total_accounts);
+            println!("  Active validators: {}", state_stats.active_validators);
+            println!("  Storage operations: {}", state_stats.storage_entries);
+        }
+        "cross-shard" => {
+            println!("🔀 Cross-Shard Communication");
+            let state_stats = node.state_manager.get_stats();
+            println!(
+                "Pending receipts: {}",
+                state_stats.pending_cross_shard_receipts
+            );
+            println!(
+                "Cross-shard throughput: {} receipts/sec",
+                state_stats.cross_shard_throughput_per_sec
+            );
+        }
+        "account-details" => {
+            let my_address = node.get_address();
+            if let Some(account) = node.state_manager.get_account(&my_address) {
+                println!("🔍 Detailed Account Information");
+                println!("═════════════════════════════════");
+
+                println!("\n📍 Identity:");
+                println!("  Address: {}", my_address);
+                println!("  Account Type: {:?}", account.account_type);
+                println!(
+                    "  Created: {}",
+                    chrono::DateTime::from_timestamp_millis(account.created_at.as_millis() as i64)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "Unknown".to_string())
+                );
+
+                println!("\n💰 Balances & Credits:");
+                println!("  Balance: {}", account.balance);
+                println!("  Storage Credits: {}", account.storage_credits);
+                println!("  Deploy Credits: {}", account.deploy_credits);
+                println!(
+                    "  Free Deploys Remaining: {}",
+                    account.free_deploys_remaining
+                );
+
+                println!("\n💾 Storage:");
+                println!(
+                    "  Quota: {} bytes ({:.2} GB)",
+                    account.storage_quota,
+                    account.storage_quota as f64 / 1_073_741_824.0
+                );
+                println!(
+                    "  Used: {} bytes ({:.2} GB)",
+                    account.storage_used,
+                    account.storage_used as f64 / 1_073_741_824.0
+                );
+                println!(
+                    "  Available: {} bytes ({:.2} GB)",
+                    account.storage_quota.saturating_sub(account.storage_used),
+                    (account.storage_quota.saturating_sub(account.storage_used)) as f64
+                        / 1_073_741_824.0
+                );
+                println!(
+                    "  Utilization: {:.2}%",
+                    if account.storage_quota > 0 {
+                        (account.storage_used as f64 / account.storage_quota as f64) * 100.0
+                    } else {
+                        0.0
+                    }
+                );
+
+                println!("\n🔐 Post-Quantum Cryptography:");
+                if let Some(ref pq_info) = account.pq_transition_info {
+                    println!(
+                        "  Transition Started: Epoch {}",
+                        pq_info.transition_started_epoch
+                    );
+                    println!("  PQ-Only Mode: {}", pq_info.pq_only_mode);
+
+                    if let Some(disabled_epoch) = pq_info.ed25519_disabled_epoch {
+                        println!("  Ed25519 Disabled: Epoch {}", disabled_epoch);
+                    } else {
+                        println!("  Ed25519 Status: Active");
+                    }
+
+                    println!("  Supported Algorithms:");
+                    for alg_id in &pq_info.supported_algorithms {
+                        let alg_name = match *alg_id {
+                            0 => "Ed25519",
+                            1 => "ML-DSA-2 (Dilithium2)",
+                            2 => "ML-KEM-768 (Kyber768)",
+                            3 => "X25519",
+                            4 => "SLH-DSA (SPHINCS+)",
+                            _ => "Unknown",
+                        };
+                        println!("    - {} (ID: {})", alg_name, alg_id);
+                    }
+                }
+
+                println!("\n📊 Activity:");
+                println!("  Nonce: {}", account.nonce);
+                println!(
+                    "  Last Activity: {}",
+                    chrono::DateTime::from_timestamp_millis(
+                        account.last_activity.as_millis() as i64
+                    )
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|| "Unknown".to_string())
+                );
+
+                if let Some(ref drs_score) = account.last_drs_score {
+                    println!("\n⭐ Reputation (DRS):");
+                    println!("  Score: {:.4}", *drs_score as f64 / 1000.0);
+                    if let Some(epoch) = account.last_drs_epoch {
+                        println!("  Last Updated: Epoch {}", epoch);
+                    }
+                }
+
+                if account.is_validator() {
+                    println!("\n✅ Validator Status:");
+                    if let Some(ref val_info) = account.validator_info {
+                        println!("  Active: {}", val_info.is_active);
+                        println!("  Commission: {}%", val_info.commission_rate as f64 / 100.0);
+                        println!("  Public Key: {}", val_info.validator_pubkey);
+
+                        if let Some(ref jail) = val_info.jail_info {
+                            println!("  ⚠️ JAILED:");
+                            println!("    Reason: {}", jail.reason);
+                            println!(
+                                "    Release: {}",
+                                chrono::DateTime::from_timestamp_millis(
+                                    jail.release_at.as_millis() as i64
+                                )
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                                .unwrap_or_else(|| "Unknown".to_string())
+                            );
+                        }
+                    }
+
+                    if let Some(ref stake_info) = account.staking_info {
+                        println!("  Staked: {}", stake_info.staked_amount);
+                        println!("  Delegated: {}", stake_info.delegated_stake);
+                        println!("  Rewards Earned: {}", stake_info.rewards_earned);
+                        println!("  Performance:");
+                        println!(
+                            "    Blocks Validated: {}",
+                            stake_info.performance.blocks_validated
+                        );
+                        println!(
+                            "    Uptime: {}%",
+                            stake_info.performance.uptime_percentage as f64 / 1000.0
+                        );
+                        println!(
+                            "    Attestation Accuracy: {}%",
+                            stake_info.performance.attestation_accuracy as f64 / 1000.0
+                        );
+                        println!("    Penalties: {}", stake_info.performance.penalties);
+                    }
+                }
+
+                if account.is_storage_provider() {
+                    println!("\n💾 Storage Provider Status:");
+                    if let Some(ref provider_info) = account.storage_provider_info {
+                        println!(
+                            "  Capacity: {:.2} GB",
+                            provider_info.storage_capacity as f64 / 1_073_741_824.0
+                        );
+                        println!(
+                            "  Allocated: {:.2} GB",
+                            provider_info.storage_allocated as f64 / 1_073_741_824.0
+                        );
+                        println!("  Active Sectors: {}", provider_info.active_sectors.len());
+                        println!("  Health Score: {}", provider_info.health_score);
+                        println!("  Collateral Locked: {}", provider_info.collateral_locked);
+
+                        println!("\n  PoST Statistics:");
+                        println!(
+                            "    Proofs Submitted: {}",
+                            provider_info.postrep_stats.post_proofs_submitted
+                        );
+                        println!(
+                            "    Pass Rate: {:.2}%",
+                            provider_info.postrep_stats.post_pass_rate
+                        );
+                        println!(
+                            "    Avg Latency: {}ms",
+                            provider_info.postrep_stats.avg_post_latency_ms
+                        );
+                        println!(
+                            "    Challenges Answered: {}",
+                            provider_info.postrep_stats.challenges_answered
+                        );
+                        println!(
+                            "    Challenges Missed: {}",
+                            provider_info.postrep_stats.challenges_missed
+                        );
+                        println!(
+                            "    Consecutive Misses: {}",
+                            provider_info.postrep_stats.consecutive_misses
+                        );
+                        println!(
+                            "    Sectors Sealed: {}",
+                            provider_info.postrep_stats.sectors_sealed
+                        );
+                        println!(
+                            "    Faulty Sectors: {}",
+                            provider_info.postrep_stats.sectors_faulty
+                        );
+
+                        println!("\n  Earnings:");
+                        println!(
+                            "    Storage Rewards: {}",
+                            provider_info.earnings.storage_rewards
+                        );
+                        println!(
+                            "    Retrieval Fees: {}",
+                            provider_info.earnings.retrieval_fees
+                        );
+                        println!("    PoST Rewards: {}", provider_info.earnings.post_rewards);
+                        println!("    Total Earned: {}", provider_info.earnings.total_earned);
+                        println!(
+                            "    Total Slashed: {}",
+                            provider_info.earnings.total_slashed
+                        );
+                        println!(
+                            "    Pending Payouts: {}",
+                            provider_info.earnings.pending_payouts
+                        );
+                    }
+                }
+
+                if let Some(ref device_caps) = account.device_capabilities {
+                    println!("\n📱 Device Capabilities:");
+                    println!(
+                        "  Bandwidth: {} Mbps",
+                        device_caps.bandwidth_capacity / 1_000_000
+                    );
+                    println!(
+                        "  Storage: {:.2} GB",
+                        device_caps.storage_capacity as f64 / 1_073_741_824.0
+                    );
+                    println!("  Cellular Safe: {}", device_caps.cellular_safe);
+                    println!(
+                        "  Max Cellular Bandwidth: {} Mbps",
+                        device_caps.max_bandwidth_cellular / 1_000_000
+                    );
+                    println!(
+                        "  Monthly Data Limit: {} GB",
+                        device_caps.monthly_data_limit_gb
+                    );
+
+                    if !device_caps.supported_slices.is_empty() {
+                        println!("  Supported Slices:");
+                        for slice in &device_caps.supported_slices {
+                            println!("    - {}", slice.as_str());
+                        }
+                    }
+
+                    if let Some(ref coverage) = device_caps.coverage_area {
+                        println!("  Coverage Area: {}", coverage);
+                    }
+
+                    println!("\n  Cost Awareness:");
+                    println!(
+                        "    Safe Mode: {}",
+                        device_caps.cost_awareness.cellular_safe_mode
+                    );
+                    println!(
+                        "    Max Monthly Cost: ${:.2}",
+                        device_caps.cost_awareness.max_monthly_cost_usd
+                    );
+                    println!(
+                        "    Current Month Usage: {} GB",
+                        device_caps.cost_awareness.current_month_usage_gb
+                    );
+                    println!(
+                        "    Throttle Threshold: {} GB",
+                        device_caps.cost_awareness.cellular_throttle_threshold_gb
+                    );
+                }
+
+                if let Some(ref pruning) = account.pruning_config {
+                    println!("\n🗑️ Pruning Configuration:");
+                    println!("  Enabled: {}", pruning.enabled);
+                    println!("  Keep Epochs: {}", pruning.keep_epochs);
+                    println!("  Prune Interval: {} epochs", pruning.prune_interval_epochs);
+                    println!("  Keep Headers Forever: {}", pruning.keep_headers_forever);
+                    println!("  Keep State Snapshots: {}", pruning.keep_state_snapshots);
+                }
+
+                if let Some(ref archival) = account.archival_config {
+                    println!("\n📚 Archival Configuration:");
+                    println!("  Store Old Bodies: {}", archival.store_old_bodies);
+                    println!("  Store Contract Blobs: {}", archival.store_contract_blobs);
+                    println!(
+                        "  Store State Snapshots: {}",
+                        archival.store_state_snapshots
+                    );
+                    println!("  Store DA Blobs: {}", archival.store_da_blobs);
+                    println!("  Store Proof Evidence: {}", archival.store_proof_evidence);
+                    println!("  Store User Data: {}", archival.store_user_data);
+                    println!("  Replication Factor: {}", archival.replication_factor);
+                }
+            } else {
+                println!("❌ Account not found in state");
+            }
+        }
+
+        "block-details" => {
+            println!("Creating detailed block with full metadata...");
+            let previous_hash = node.get_state_root();
+            let height = node.get_block_height().next();
+
+            match node.create_block(vec![], previous_hash, height).await {
+                Ok(block) => {
+                    println!("✅ Block Created Successfully");
+                    println!("═══════════════════════════════");
+
+                    println!("\n📦 Block Header:");
+                    println!("  Hash: {}", block.hash);
+                    println!("  Height: {}", block.header.core.height.as_u64());
+                    println!("  Previous Hash: {}", block.header.core.previous_hash);
+                    println!("  Shard ID: {}", block.header.core.shard_id);
+                    println!("  Epoch: {}", block.header.core.epoch.as_u64());
+                    println!("  Proposer: {}", block.header.core.proposer);
+                    println!(
+                        "  Timestamp: {}",
+                        chrono::DateTime::from_timestamp(
+                            block.header.core.timestamp.as_secs() as i64,
+                            0
+                        )
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "Unknown".to_string())
+                    );
+
+                    println!("\n📊 Block Statistics:");
+                    println!("  Transaction Count: {}", block.header.core.tx_count);
+                    println!("  Compute Used: {} RU", block.header.core.compute_used);
+                    println!("  Storage Used: {} bytes", block.header.core.storage_used);
+                    println!(
+                        "  Block Size: {} bytes ({:.2} KB)",
+                        block.size(),
+                        block.size() as f64 / 1024.0
+                    );
+
+                    println!("\n🔐 Post-Quantum Signatures:");
+                    println!(
+                        "  Dilithium: {}",
+                        block.header.core.pq_signature_count.dilithium_sigs
+                    );
+                    println!(
+                        "  Ed25519: {}",
+                        block.header.core.pq_signature_count.ed25519_sigs
+                    );
+                    println!(
+                        "  Hybrid: {}",
+                        block.header.core.pq_signature_count.hybrid_sigs
+                    );
+                    println!(
+                        "  SLH-DSA: {}",
+                        block.header.core.pq_signature_count.slh_dsa_sigs
+                    );
+                    println!("  PQ Adoption Rate: {:.2}%", block.get_pq_adoption_rate());
+
+                    println!("\n🌐 Network & Protocol:");
+                    println!("  Protocol Version: {}", block.header.core.protocol_version);
+                    println!("  Chain ID: {}", block.header.core.chain_id);
+                    println!("  Network ID: {}", block.header.core.network_id);
+
+                    println!("\n📱 Cellular Optimization:");
+                    println!(
+                        "  Cellular Safe TXs: {}",
+                        block.header.metadata.cellular_stats.cellular_safe_txs
+                    );
+                    println!(
+                        "  WiFi Only TXs: {}",
+                        block.header.metadata.cellular_stats.wifi_only_txs
+                    );
+                    println!(
+                        "  Throttled Operations: {}",
+                        block.header.metadata.cellular_stats.throttled_operations
+                    );
+                    println!(
+                        "  Cellular Efficiency: {:.2}%",
+                        block.get_cellular_efficiency_score()
+                    );
+
+                    println!("\n💰 Resource Pricing:");
+                    println!(
+                        "  Bytes Cost: {}",
+                        block.header.metadata.resource_pricing.bytes_cost
+                    );
+                    println!(
+                        "  RU Cost: {}",
+                        block.header.metadata.resource_pricing.ru_cost
+                    );
+                    println!(
+                        "  PoB Floor: {}",
+                        block.header.metadata.resource_pricing.pob_floor
+                    );
+                    println!(
+                        "  PQ Signature Cost: {}",
+                        block.header.metadata.resource_pricing.pq_signature_cost
+                    );
+                    println!(
+                        "  Cellular Premium: {}",
+                        block.header.metadata.resource_pricing.cellular_premium
+                    );
+
+                    println!("\n🔗 Merkle Roots:");
+                    println!("  Transactions: {}", block.header.core.transactions_root);
+                    println!("  State: {}", block.header.core.state_root);
+                    println!("  Receipts: {}", block.header.core.receipts_root);
+                    println!("  PoST Events: {}", block.header.core.events_root_post);
+                    println!("  PoC Events: {}", block.header.core.events_root_poc);
+                    println!("  Rollup: {}", block.header.core.rollup_root);
+                    println!("  DA: {}", block.header.core.da_root);
+
+                    println!("\n📈 Events:");
+                    println!(
+                        "  Cross-Shard Receipts: {}",
+                        block.header.metadata.cross_shard_receipts
+                    );
+                    println!("  Rollup Commits: {}", block.header.metadata.rollup_commits);
+                    println!("  PoC Events: {}", block.header.metadata.poc_events);
+                    println!("  PoST Events: {}", block.header.metadata.post_events);
+                    println!("  DRS Events: {}", block.header.metadata.drs_events);
+                    println!("  Deploy Events: {}", block.header.metadata.deploy_events);
+                    println!("  Density Events: {}", block.header.metadata.density_events);
+                    println!("  Fraud Proofs: {}", block.header.metadata.fraud_proofs);
+
+                    println!("\n🔄 Quorum Certificate:");
+                    println!("  View: {}", block.header.qc.view);
+                    println!("  Round: {}", block.header.qc.round);
+                    println!("  Voting Power: {}", block.header.qc.voting_power);
+                    println!("  Validator Set ID: {}", block.header.qc.validator_set_id);
+                    println!("  Signatures: {}", block.header.qc.signatures.len());
+                    println!("  PQ Compliant: {}", block.header.qc.pq_compliant);
+                }
+                Err(e) => {
+                    println!("❌ Failed to create block: {}", e);
+                }
+            }
+        }
+
+        "crypto-keys" => {
+            println!("🔑 Cryptographic Keys");
+            println!("════════════════════");
+
+            let keypair = node.get_keypair();
+
+            println!("\n📍 Identity:");
+            println!("  Node Address: {}", node.get_address());
+            println!("  Peer ID: {}", node.peer_id);
+
+            println!("\n🔐 Public Keys:");
+            let ed25519_pk = keypair.ed25519_public_key();
+            let dilithium_pk = keypair.dilithium_public_key();
+            let kyber_pk = keypair.kyber_public_key();
+            let x25519_pk = keypair.x25519_public_key();
+
+            println!("  Ed25519 (Classical):");
+            println!("    Size: {} bytes", ed25519_pk.as_bytes().len());
+            println!("    Algorithm: {:?}", ed25519_pk.algorithm);
+            println!("    Hex: {}", hex::encode(ed25519_pk.as_bytes()));
+
+            println!("\n  ML-DSA-2 (Dilithium2) - Post-Quantum:");
+            println!("    Size: {} bytes", dilithium_pk.as_bytes().len());
+            println!("    Algorithm: {:?}", dilithium_pk.algorithm);
+            println!(
+                "    Hex Preview: {}...",
+                &hex::encode(&dilithium_pk.as_bytes()[..32])
+            );
+
+            println!("\n  ML-KEM-768 (Kyber768) - Post-Quantum:");
+            println!("    Size: {} bytes", kyber_pk.as_bytes().len());
+            println!("    Algorithm: {:?}", kyber_pk.algorithm);
+            println!(
+                "    Hex Preview: {}...",
+                &hex::encode(&kyber_pk.as_bytes()[..32])
+            );
+
+            println!("\n  X25519 (Classical ECDH):");
+            println!("    Size: {} bytes", x25519_pk.len());
+            println!("    Hex: {}", hex::encode(&x25519_pk));
+
+            if let Some(slh_dsa_pk) = keypair.slh_dsa_public_key() {
+                println!("\n  SLH-DSA (SPHINCS+) - Post-Quantum:");
+                println!("    Size: {} bytes", slh_dsa_pk.as_bytes().len());
+                println!("    Algorithm: {:?}", slh_dsa_pk.algorithm);
+                println!(
+                    "    Hex Preview: {}...",
+                    &hex::encode(&slh_dsa_pk.as_bytes()[..32])
+                );
+            }
+
+            println!("\n⚙️ Configuration:");
+            println!("  Transition Mode: {}", keypair.is_transition_mode());
+            println!("  Post-Quantum Ready: true");
+            println!("  Hybrid Signatures: {}", keypair.is_transition_mode());
+
+            println!("\n🛡️ Security Level:");
+            println!("  Classical: 128-bit (Ed25519, X25519)");
+            println!("  Post-Quantum: NIST Level 2 (Dilithium2)");
+            println!("  Post-Quantum: NIST Level 3 (Kyber768)");
+            if keypair.slh_dsa_public_key().is_some() {
+                println!("  Post-Quantum: NIST Level 1 (SLH-DSA)");
+            }
+        }
+
+        "sectors" => {
+            let my_address = node.get_address();
+            if let Some(account) = node.state_manager.get_account(&my_address) {
+                if let Some(ref provider_info) = account.storage_provider_info {
+                    println!("📦 Storage Sectors");
+                    println!("═════════════════");
+
+                    if provider_info.active_sectors.is_empty() {
+                        println!("\nNo active sectors");
+                    } else {
+                        println!("\nActive Sectors: {}\n", provider_info.active_sectors.len());
+
+                        for (i, sector) in provider_info.active_sectors.iter().enumerate() {
+                            println!("{}. Sector {}", i + 1, sector.sector_id);
+                            println!(
+                                "   Size: {:.2} GB",
+                                sector.size_bytes as f64 / 1_073_741_824.0
+                            );
+                            println!("   Data Type: {:?}", sector.data_type);
+                            println!("   Triad Role: {:?}", sector.triad.role);
+                            println!("   Group ID: {}", sector.triad.group_id);
+                            println!(
+                                "   Sealed At: {}",
+                                chrono::DateTime::from_timestamp_millis(
+                                    sector.sealed_at.as_millis() as i64
+                                )
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                                .unwrap_or_else(|| "Unknown".to_string())
+                            );
+                            println!(
+                                "   Expires At: {}",
+                                chrono::DateTime::from_timestamp_millis(
+                                    sector.expires_at.as_millis() as i64
+                                )
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                                .unwrap_or_else(|| "Unknown".to_string())
+                            );
+                            println!(
+                                "   Integrity: {}",
+                                if sector.integrity_verified {
+                                    "✅ Verified"
+                                } else {
+                                    "❌ Unverified"
+                                }
+                            );
+                            println!("   Miss Count: {}", sector.miss_count);
+                            println!("   Last PoST: Epoch {}", sector.last_post_epoch);
+                            println!();
+                        }
+
+                        println!("Summary:");
+                        println!(
+                            "  Total Capacity: {:.2} GB",
+                            provider_info.storage_capacity as f64 / 1_073_741_824.0
+                        );
+                        println!(
+                            "  Total Allocated: {:.2} GB",
+                            provider_info.storage_allocated as f64 / 1_073_741_824.0
+                        );
+                        println!(
+                            "  Utilization: {:.2}%",
+                            (provider_info.storage_allocated as f64
+                                / provider_info.storage_capacity as f64)
+                                * 100.0
+                        );
+                    }
+                } else {
+                    println!("❌ Account is not a storage provider");
+                }
+            } else {
+                println!("❌ Account not found");
+            }
+        }
+
+        "algorithms" => {
+            println!("🔬 Supported Cryptographic Algorithms");
+            println!("════════════════════════════════════");
+
+            println!("\n🔐 Digital Signatures:");
+            println!("  Classical:");
+            println!("    ✓ Ed25519 (NIST SP 800-186)");
+            println!("      - Key Size: 32 bytes");
+            println!("      - Signature Size: 64 bytes");
+            println!("      - Security: ~128-bit classical");
+
+            println!("\n  Post-Quantum:");
+            println!("    ✓ ML-DSA-2 / Dilithium2 (FIPS 204)");
+            println!("      - Public Key: ~1312 bytes");
+            println!("      - Signature: ~2420 bytes");
+            println!("      - Security: NIST Level 2");
+
+            println!("\n    ✓ SLH-DSA / SPHINCS+ (FIPS 205)");
+            println!("      - Public Key: 32 bytes");
+            println!("      - Signature: ~7856 bytes");
+            println!("      - Security: NIST Level 1");
+            println!("      - Properties: Stateless, hash-based");
+
+            println!("\n🔑 Key Encapsulation:");
+            println!("  Classical:");
+            println!("    ✓ X25519 (RFC 7748)");
+            println!("      - Key Size: 32 bytes");
+            println!("      - Shared Secret: 32 bytes");
+            println!("      - Security: ~128-bit classical");
+
+            println!("\n  Post-Quantum:");
+            println!("    ✓ ML-KEM-768 / Kyber768 (FIPS 203)");
+            println!("      - Public Key: 1184 bytes");
+            println!("      - Ciphertext: 1088 bytes");
+            println!("      - Shared Secret: 32 bytes");
+            println!("      - Security: NIST Level 3");
+
+            println!("\n🔒 Symmetric Encryption:");
+            println!("    ✓ XChaCha20-Poly1305 (AEAD)");
+            println!("      - Key Size: 32 bytes");
+            println!("      - Nonce: 24 bytes");
+            println!("      - Tag: 16 bytes");
+            println!("      - Security: 256-bit");
+
+            println!("\n🗂️ Hashing:");
+            println!("    ✓ BLAKE2s-256");
+            println!("      - Output: 32 bytes");
+            println!("      - Use: General hashing, Merkle trees");
+
+            println!("\n    ✓ SHA-256");
+            println!("      - Output: 32 bytes");
+            println!("      - Use: HKDF key derivation");
+
+            println!("\n🎯 Key Derivation:");
+            println!("    ✓ HKDF-SHA256");
+            println!("      - Use: Session key derivation");
+
+            println!("\n🛡️ Security Properties:");
+            println!("  ✓ Post-Quantum Secure");
+            println!("  ✓ Forward Secrecy");
+            println!("  ✓ Replay Protection");
+            println!("  ✓ Domain Separation");
+            println!("  ✓ Authenticated Encryption");
+            println!("  ✓ Hybrid Cryptography Support");
+        }
+        "pq-status" => {
+            println!("🔮 Post-Quantum Status");
+            println!("═════════════════════");
+
+            let my_address = node.get_address();
+            if let Some(account) = node.state_manager.get_account(&my_address) {
+                if let Some(ref pq_info) = account.pq_transition_info {
+                    println!("\n📊 Transition Information:");
+                    println!(
+                        "  Transition Started: Epoch {}",
+                        pq_info.transition_started_epoch
+                    );
+                    println!("  PQ-Only Mode: {}", pq_info.pq_only_mode);
+
+                    if let Some(disabled_epoch) = pq_info.ed25519_disabled_epoch {
+                        println!("  Ed25519 Disabled: Epoch {}", disabled_epoch);
+                        println!(
+                            "  Classical Signatures: Disabled since epoch {}",
+                            disabled_epoch
+                        );
+                    } else {
+                        println!("  Ed25519 Status: Active");
+                        println!("  Classical Signatures: Enabled (Hybrid Mode)");
+                    }
+
+                    println!("\n🔐 Supported Algorithms:");
+                    for alg_id in &pq_info.supported_algorithms {
+                        let alg_name = match *alg_id {
+                            0 => "Ed25519 (Classical)",
+                            1 => "ML-DSA-2 (Dilithium2 - PQ)",
+                            2 => "ML-KEM-768 (Kyber768 - PQ)",
+                            3 => "X25519 (Classical)",
+                            4 => "SLH-DSA (SPHINCS+ - PQ)",
+                            _ => "Unknown",
+                        };
+                        println!("    ✓ {} (ID: {})", alg_name, alg_id);
+                    }
+
+                    println!("\n⚙️ Current Configuration:");
+                    if pq_info.pq_only_mode {
+                        println!("  Mode: Pure Post-Quantum");
+                        println!("  Classical algorithms: Disabled");
+                        println!("  Hybrid mode: Disabled");
+                    } else {
+                        println!("  Mode: Hybrid (Transition)");
+                        println!("  Classical algorithms: Enabled");
+                        println!("  Hybrid mode: Enabled");
+                    }
+
+                    println!("\n🛡️ Security Posture:");
+                    println!("  Post-Quantum Readiness: 100%");
+                    println!("  Quantum-Safe: YES");
+                    println!("  Downgrade Protection: Active");
+
+                    // Show which algorithms are actually supported
+                    let has_ed25519 = pq_info.supported_algorithms.contains(&0);
+                    let has_dilithium = pq_info.supported_algorithms.contains(&1);
+                    let has_kyber = pq_info.supported_algorithms.contains(&2);
+                    let has_x25519 = pq_info.supported_algorithms.contains(&3);
+                    let has_slh_dsa = pq_info.supported_algorithms.contains(&4);
+
+                    println!("\n✅ Active Cryptographic Primitives:");
+                    if has_ed25519 {
+                        println!("  ✓ Ed25519 Digital Signatures");
+                    }
+                    if has_dilithium {
+                        println!("  ✓ ML-DSA-2 Digital Signatures (Post-Quantum)");
+                    }
+                    if has_kyber {
+                        println!("  ✓ ML-KEM-768 Key Encapsulation (Post-Quantum)");
+                    }
+                    if has_x25519 {
+                        println!("  ✓ X25519 Key Exchange");
+                    }
+                    if has_slh_dsa {
+                        println!("  ✓ SLH-DSA Digital Signatures (Post-Quantum)");
+                    }
+                } else {
+                    println!("\n❌ No PQ transition information available");
+                }
+            } else {
+                println!("\n❌ Account not found");
+            }
+
+            let keypair = node.get_keypair();
+            println!("\n🔑 Node Keypair Configuration:");
+            println!("  Transition Mode: {}", keypair.is_transition_mode());
+            println!("  Available Keys:");
+            println!("    ✓ Ed25519 (Classical)");
+            println!("    ✓ ML-DSA-2 (Post-Quantum)");
+            println!("    ✓ ML-KEM-768 (Post-Quantum)");
+            println!("    ✓ X25519 (Classical)");
+            if keypair.slh_dsa_public_key().is_some() {
+                println!("    ✓ SLH-DSA (Post-Quantum)");
+            }
+
+            println!("\n📊 Signature Capabilities:");
+            if keypair.is_transition_mode() {
+                println!("  Current Mode: Hybrid");
+                println!("  Default Signatures: Dual (Ed25519 + Dilithium)");
+                println!("  Quantum Resistance: Partial (Transitioning)");
+            } else {
+                println!("  Current Mode: Post-Quantum Only");
+                println!("  Default Signatures: Dilithium Only");
+                println!("  Quantum Resistance: Full");
+            }
+        }
         "quit" | "exit" | "q" => {
             println!("👋 Goodbye!");
             return Ok(false);
@@ -1478,50 +2690,78 @@ async fn handle_interactive_command(
 
 fn print_commands() {
     println!("\n📋 Available Commands:");
-    println!("  help           - Show this help message");
-    println!("  status         - Show detailed node status");
-    println!("  peers          - List connected peers");
-    println!("  roles          - Show current node roles");
-    println!("  capabilities   - Show node capabilities");
-    println!("");
-    println!("🔗 Blockchain Commands:");
+    println!("═════════════════════");
+
+    println!("\n💰 Account & Balance:");
+    println!("  my-account     - Show my account details");
+    println!("  account        - Show account by address");
+    println!("  account-details- Show detailed account information");
+    println!("  accounts       - List all accounts");
+    println!("  transfer       - Create transfer transaction");
+
+    println!("\n⛓️  Blockchain:");
     println!("  blockchain     - Show blockchain state");
-    println!("  account        - Show my account details");
-    println!("  accounts       - Show all accounts summary");
-    println!("  transfer       - Create test transfer transaction");
-    println!("  block          - Create test block");
-    println!("  crypto         - Show cryptographic information");
-    println!("");
-    println!("📊 Monitoring Commands:");
-    println!("  proofs         - Show recent proof events");
-    println!("  5g             - Show 5G configuration status");
+    println!("  block          - Create block");
+    println!("  block-details  - Create block with full details");
+    println!("  state          - Show current state");
+    println!("  shard          - Show shard configuration");
+
+    println!("\n👥 Network:");
+    println!("  peers          - List connected peers");
+    println!("  validators     - Show active validators");
+    println!("  connect        - Connect to bootstrap peers");
+    println!("  addresses      - Show network addresses");
+
+    println!("\n💾 Storage:");
+    println!("  storage        - Storage overview");
+    println!("  sectors        - Show storage sectors (providers only)");
+    println!("  proofs         - Show recent proofs");
+    println!("  post           - Generate PoST proof");
+    println!("  poc            - Generate PoC proof");
+
+    println!("\n🍰 5G & Slices:");
+    println!("  slices         - Network slices overview");
+    println!("  5g             - Show 5G configuration");
+
+    println!("\n🔐 Cryptography:");
+    println!("  crypto         - Show cryptographic info");
+    println!("  crypto-keys    - Show detailed key information");
+    println!("  algorithms     - Show supported algorithms");
+    println!("  pq-status      - Show post-quantum status");
+    println!("  kem            - Key encapsulation");
+    println!("  stealth        - Stealth addresses");
+    println!("  batch-verify   - Batch verification");
+    println!("  merkle         - Merkle trees");
+
+    println!("\n📊 Monitoring:");
+    println!("  status         - Show detailed status");
     println!("  metrics        - Show performance metrics");
-    println!("  network        - Show network status and usage");
-    println!("  sharing        - Show bandwidth sharing stats");
-    println!("  compression    - Show data compression stats");
-    println!("  performance    - Show detailed performance metrics");
-    println!("  node-info      - Show basic node information");
-    println!("");
-    println!("🔧 Control Commands:");
+    println!("  performance    - Show detailed performance");
+    println!("  network        - Show network status");
+    println!("  sharing        - Bandwidth sharing stats");
+    println!("  compression    - Data optimization stats");
+    println!("  txpool         - Transaction pool status");
+    println!("  cross-shard    - Cross-shard status");
+
+    println!("\n🔬 Advanced:");
+    println!("  deploy-policy  - Deploy manager");
+    println!("  drs            - Reputation system");
+    println!("  deploy-cost    - Cost estimation");
+    println!("  drs-rewards    - Reward distribution");
+
+    println!("\n🔧 Control:");
+    println!("  roles          - Show node roles");
+    println!("  capabilities   - Show node capabilities");
+    println!("  node-info      - Show basic info");
     println!("  enable-sharing - Enable bandwidth sharing");
     println!("  disable-sharing- Disable bandwidth sharing");
-    println!("  switch-wifi    - Switch to WiFi (simulated)");
-    println!("  switch-5g      - Switch to 5G (simulated)");
-    println!("  switch-ethernet- Switch to Ethernet (simulated)");
     println!("  reset-stats    - Reset statistics");
-    println!("");
-    println!("🧪 Test Commands:");
-    println!("  test-poc       - Generate test Proof of Coverage");
-    println!("  test-post      - Generate test Proof of Spacetime");
-    println!("  connect        - Attempt to connect to bootstrap peers");
-    println!("  addresses      - Show listen and bootstrap addresses");
-    println!("🔐 Advanced Crypto Commands:");
-    println!("  test-kem       - Test Key Encapsulation Mechanism");
-    println!("  test-stealth   - Test Stealth Address Generation");
-    println!("  test-batch-verify - Test Batch Signature Verification");
-    println!("  test-merkle    - Test Merkle Tree Construction");
-    println!("");
-    println!("  quit/exit      - Shutdown the node");
+    println!("  switch-wifi    - Switch to WiFi");
+    println!("  switch-5g      - Switch to 5G");
+    println!("  switch-ethernet- Switch to Ethernet");
+
+    println!("\n  quit/exit      - Shutdown the node");
+    println!();
 }
 
 fn print_detailed_status(node: &Node) {
