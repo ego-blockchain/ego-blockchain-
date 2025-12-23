@@ -564,6 +564,26 @@ fn print_node_info(node: &Node, config: &NodeConfig) {
         info!("🔗 Bootstrap Peers: {:?}", config.bootstrap_peers);
     }
 }
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    const THRESHOLD: u64 = 1024;
+
+    if bytes < THRESHOLD {
+        return format!("{} B", bytes);
+    }
+
+    let mut size = bytes as f64;
+    let mut unit_index = 0;
+
+    while size >= THRESHOLD as f64 && unit_index < UNITS.len() - 1 {
+        size /= THRESHOLD as f64;
+        unit_index += 1;
+    }
+
+    format!("{:.2} {}", size, UNITS[unit_index])
+}
+
 async fn run_daemon_mode(mut node: Node, config: NodeConfig) -> anyhow::Result<()> {
     info!("🔄 Running in daemon mode. Press Ctrl+C to stop.");
     info!(
@@ -1926,6 +1946,7 @@ async fn handle_interactive_command(
             println!("  Active validators: {}", state_stats.active_validators);
             println!("  Storage operations: {}", state_stats.storage_entries);
         }
+
         "cross-shard" => {
             println!("🔀 Cross-Shard Communication");
             let state_stats = node.state_manager.get_stats();
@@ -2225,7 +2246,362 @@ async fn handle_interactive_command(
                 println!("❌ Account not found in state");
             }
         }
+        "epoch" => {
+            println!("📅 Epoch Information");
+            println!("═══════════════════");
 
+            if let Some(shard_manager) = &node.shard_manager {
+                let epoch = shard_manager.get_current_epoch().await;
+
+                println!("\n🔢 Current Epoch: {}", epoch.epoch_number);
+                println!("  Start Block: #{}", epoch.start_block.as_u64());
+                println!("  End Block: #{}", epoch.end_block.as_u64());
+                println!("  Start Time: {}", epoch.start_time);
+                println!(
+                    "  Duration: {} blocks",
+                    epoch.end_block.as_u64() - epoch.start_block.as_u64()
+                );
+
+                println!("\n👥 Committee:");
+                println!("  Size: {} validators", epoch.committee.len());
+                println!("  Leader Schedule: {} slots", epoch.leader_schedule.len());
+
+                println!("\n📊 Epoch Statistics:");
+                println!("  Blocks Produced: {}", epoch.stats.blocks_produced);
+                println!(
+                    "  Transactions Processed: {}",
+                    epoch.stats.transactions_processed
+                );
+                println!("  Average Block Time: {}ms", epoch.stats.avg_block_time_ms);
+                println!("  Average TPS: {:.2}", epoch.stats.avg_tps);
+                println!("  Cross-Shard TXs: {}", epoch.stats.cross_shard_txs);
+                println!(
+                    "  Network Utilization: {:.2}%",
+                    epoch.stats.network_utilization * 100.0
+                );
+
+                println!("\n🔍 Proof Verification:");
+                println!(
+                    "  Storage Proofs (PoST): {}",
+                    epoch.stats.storage_proofs_verified
+                );
+                println!(
+                    "  Coverage Proofs (PoC): {}",
+                    epoch.stats.coverage_proofs_verified
+                );
+
+                println!("\n💰 Resource Usage:");
+                println!("  Total RU Consumed: {}", epoch.stats.total_ru_consumed);
+                println!(
+                    "  Storage Credits Burned: {}",
+                    epoch.stats.total_storage_credits_burned
+                );
+                println!(
+                    "  Deploy Credits Burned: {}",
+                    epoch.stats.total_deploy_credits_burned
+                );
+
+                println!("\n🎁 Epoch Rewards:");
+                println!("  Total: {} EGOC", epoch.total_rewards.to_egoc());
+                println!(
+                    "  Storage Bucket: {} EGOC",
+                    epoch.reward_buckets.storage_rewards.to_egoc()
+                );
+                println!(
+                    "  Consensus Bucket: {} EGOC",
+                    epoch.reward_buckets.consensus_rewards.to_egoc()
+                );
+                println!(
+                    "  Coverage Bucket: {} EGOC",
+                    epoch.reward_buckets.coverage_rewards.to_egoc()
+                );
+                println!(
+                    "  Retrieval Bucket: {} EGOC",
+                    epoch.reward_buckets.retrieval_rewards.to_egoc()
+                );
+                println!(
+                    "  DAO Treasury: {} EGOC",
+                    epoch.reward_buckets.dao_treasury.to_egoc()
+                );
+            } else {
+                println!("\n❌ Shard manager not initialized");
+            }
+        }
+        "shard-config" => {
+            println!("⚙️  Shard Configuration");
+            println!("═══════════════════════");
+
+            if let Some(shard_manager) = &node.shard_manager {
+                let config = shard_manager.get_config();
+
+                println!("\n🆔 Shard Identity:");
+                println!("  Shard ID: {}", config.shard_id.as_u32());
+                println!("  Chain ID: {}", shard_manager.chain_id);
+                println!("  Network ID: {}", shard_manager.network_id);
+
+                println!("\n👥 Consensus Configuration:");
+                println!("  Committee Size: {} validators", config.committee_size);
+                println!("  Replication Factor: {}", config.replication_factor);
+                println!("  Epoch Duration: {} blocks", config.epoch_duration_blocks);
+                println!("  Micro Slot Duration: {}ms", config.micro_slot_duration_ms);
+
+                println!("\n📦 Block Configuration:");
+                println!("  Max TXs per Block: {}", config.max_txs_per_block);
+                println!("  Target Block Time: {}ms", config.target_block_time_ms);
+
+                println!("\n🔗 Cross-Shard:");
+                println!("  Enabled: {}", config.cross_shard_enabled);
+
+                println!("\n💾 Storage Configuration:");
+                println!(
+                    "  Max Storage per Node: {}",
+                    format_bytes(config.storage_config.max_storage_per_node)
+                );
+                println!(
+                    "  Proof Frequency: every {} blocks",
+                    config.storage_config.proof_frequency
+                );
+                println!(
+                    "  Retention Period: {} blocks",
+                    config.storage_config.retention_period
+                );
+
+                println!("\n🧩 Erasure Coding:");
+                println!(
+                    "  Data Chunks: {}",
+                    config.storage_config.erasure_coding.data_chunks
+                );
+                println!(
+                    "  Parity Chunks: {}",
+                    config.storage_config.erasure_coding.parity_chunks
+                );
+                println!(
+                    "  Chunk Size: {}",
+                    format_bytes(config.storage_config.erasure_coding.chunk_size as u64)
+                );
+                println!("  Codec: {}", config.storage_config.erasure_coding.codec);
+
+                println!("\n🗑️  Garbage Collection:");
+                println!(
+                    "  Frequency: every {} blocks",
+                    config.storage_config.gc_config.frequency
+                );
+                println!(
+                    "  Threshold: {:.0}%",
+                    config.storage_config.gc_config.threshold * 100.0
+                );
+                println!(
+                    "  Aggressive Mode: {}",
+                    config.storage_config.gc_config.aggressive_mode
+                );
+                println!(
+                    "  Prune Old Bodies: {}",
+                    config.storage_config.gc_config.prune_old_bodies
+                );
+                println!(
+                    "  Prune Old Receipts: {}",
+                    config.storage_config.gc_config.prune_old_receipts
+                );
+
+                println!("\n📍 PoRep Parameters:");
+                println!(
+                    "  Sector Size: {}",
+                    format_bytes(config.storage_config.porep_params.sector_size)
+                );
+                println!("  Layers: {}", config.storage_config.porep_params.layers);
+                println!(
+                    "  Base Degree: {}",
+                    config.storage_config.porep_params.base_degree
+                );
+                println!(
+                    "  Tree Arity: {}",
+                    config.storage_config.porep_params.tree_arity
+                );
+
+                println!("\n⏱️  PoST Parameters:");
+                println!(
+                    "  Windows per Day: {}",
+                    config.storage_config.post_params.windows_per_day
+                );
+                println!(
+                    "  Challenges per Sector: {}",
+                    config.storage_config.post_params.challenges_per_sector
+                );
+                println!("  SLA: {}ms", config.storage_config.post_params.sla_ms);
+                println!(
+                    "  Sectors per Partition: {}",
+                    config.storage_config.post_params.sectors_per_partition
+                );
+                println!(
+                    "  Enable Aggregation: {}",
+                    config.storage_config.post_params.enable_aggregation
+                );
+
+                println!("\n💎 Proof of Burn (PoB):");
+                println!("  Enabled: {}", config.pob_config.enabled);
+                println!(
+                    "  Storage Credit Price: {} uEGOC",
+                    config.pob_config.storage_credit_price
+                );
+                println!(
+                    "  Deploy Credit Price: {} uEGOC",
+                    config.pob_config.deploy_credit_price
+                );
+                println!("  Floors Enabled: {}", config.pob_config.floors_enabled);
+
+                println!("\n📊 DRS (Reputation System):");
+                println!("  Weight Uptime: {:.2}", config.drs_config.weight_uptime);
+                println!(
+                    "  Weight PoST Pass: {:.2}",
+                    config.drs_config.weight_post_pass
+                );
+                println!(
+                    "  Weight Inv. Latency: {:.2}",
+                    config.drs_config.weight_inv_latency
+                );
+                println!("  Weight PoC: {:.2}", config.drs_config.weight_poc);
+                println!("  Weight Serve: {:.2}", config.drs_config.weight_serve);
+                println!(
+                    "  Multiplier Range: {:.2} - {:.2}",
+                    config.drs_config.multiplier_min, config.drs_config.multiplier_max
+                );
+                println!("  PoST SLA: {}ms", config.drs_config.post_sla_ms);
+
+                println!("\n📱 Cellular Safe Mode:");
+                println!("  Enabled: {}", config.cellular_safe_config.enabled);
+                println!(
+                    "  Max Monthly Data: {} GB",
+                    config.cellular_safe_config.max_monthly_data_gb
+                );
+                println!(
+                    "  Throttle Threshold: {} GB",
+                    config.cellular_safe_config.throttle_threshold_gb
+                );
+                println!(
+                    "  Proof Rate: {} Hz",
+                    config.cellular_safe_config.proof_rate_hz
+                );
+                println!(
+                    "  Proof Batch Size: {}",
+                    config.cellular_safe_config.proof_batch_size
+                );
+
+                println!("\n🔐 Post-Quantum Transition:");
+                println!(
+                    "  Transition Epoch: {}",
+                    config.pq_transition_config.transition_epoch
+                );
+                println!(
+                    "  Migration Period: {} epochs",
+                    config.pq_transition_config.migration_period_epochs
+                );
+                println!(
+                    "  PQ-Only Required: {}",
+                    config.pq_transition_config.pq_only_required
+                );
+                println!(
+                    "  Supported Algorithms: {:?}",
+                    config.pq_transition_config.supported_algorithms
+                );
+                if let Some(deadline) = config.pq_transition_config.legacy_deadline_epoch {
+                    println!("  Legacy Deadline: Epoch {}", deadline);
+                }
+
+                if !config.preferred_slices.is_empty() {
+                    println!("\n🍰 Preferred Slices:");
+                    for slice in &config.preferred_slices {
+                        println!("  • {}", slice);
+                    }
+                }
+
+                if let Some(geo) = &config.geo_constraints {
+                    println!("\n🌍 Geographic Constraints:");
+                    println!("  Allowed Regions: {}", geo.allowed_regions.join(", "));
+                    println!("  Max Latency: {}ms", geo.max_latency_ms);
+                    println!("  Min Nodes per Region: {}", geo.min_nodes_per_region);
+                    println!("  H3 Resolution: {}", geo.h3_resolution);
+                }
+            } else {
+                println!("\n❌ Shard manager not initialized");
+            }
+        }
+        "txpool" => {
+            println!("🔄 Transaction Pool Status");
+            println!("═════════════════════════");
+
+            if let Some(shard_manager) = &node.shard_manager {
+                let stats = shard_manager.tx_pool.get_stats().await;
+
+                println!("\n📊 Pool Statistics:");
+                println!("  Pending Transactions: {}", stats.pending_count);
+                println!("  Pool Size: {}", format_bytes(stats.pool_size_bytes));
+                println!("  Average TX Age: {}ms", stats.avg_tx_age_ms);
+
+                println!("\n📈 Transaction Counters:");
+                println!("  Total Added: {}", stats.txs_added);
+                println!("  Total Removed: {}", stats.txs_removed);
+                println!("  Total Rejected: {}", stats.txs_rejected);
+
+                println!("\n⏰ Status:");
+                println!("  Last Updated: {}", stats.last_updated);
+
+                if stats.pending_count > 0 {
+                    println!("\n💡 Pool Health:");
+                    let health = if stats.pending_count < 100 {
+                        "✅ Healthy"
+                    } else if stats.pending_count < 1000 {
+                        "⚠️  Busy"
+                    } else {
+                        "🔴 Congested"
+                    };
+                    println!("  {}", health);
+
+                    if stats.txs_rejected > 0 {
+                        let rejection_rate =
+                            (stats.txs_rejected as f64 / stats.txs_added as f64) * 100.0;
+                        println!("  Rejection Rate: {:.2}%", rejection_rate);
+                    }
+                }
+            } else {
+                println!("\n❌ Shard manager not initialized");
+            }
+        }
+        "cross-shard" => {
+            println!("🔗 Cross-Shard Status");
+            println!("═══════════════════");
+
+            if let Some(shard_manager) = &node.shard_manager {
+                let stats = shard_manager.cross_shard.get_stats().await;
+
+                println!("\n📊 Receipt Statistics:");
+                println!("  Receipts Sent: {}", stats.receipts_sent);
+                println!("  Receipts Received: {}", stats.receipts_received);
+                println!("  Receipts Pending: {}", stats.receipts_pending);
+                println!("  Failed Receipts: {}", stats.failed_receipts);
+
+                println!("\n⚡ Performance:");
+                println!("  Average Latency: {}ms", stats.avg_receipt_latency_ms);
+
+                if stats.receipts_sent > 0 {
+                    let success_rate = ((stats.receipts_sent - stats.failed_receipts) as f64
+                        / stats.receipts_sent as f64)
+                        * 100.0;
+                    println!("  Success Rate: {:.2}%", success_rate);
+                }
+
+                println!("\n⏰ Last Updated: {}", stats.last_updated);
+
+                if stats.receipts_pending > 0 {
+                    println!("\n⚠️  {} receipts pending delivery", stats.receipts_pending);
+                }
+
+                if stats.failed_receipts > 0 {
+                    println!("\n❌ {} receipts failed", stats.failed_receipts);
+                }
+            } else {
+                println!("\n❌ Shard manager not initialized");
+            }
+        }
         "block-details" => {
             println!("Creating detailed block with full metadata...");
             let previous_hash = node.get_state_root();
@@ -2705,6 +3081,9 @@ fn print_commands() {
     println!("  block-details  - Create block with full details");
     println!("  state          - Show current state");
     println!("  shard          - Show shard configuration");
+
+    println!("  txpool         - Transaction pool status");
+    println!("  cross-shard    - Cross-shard communication status");
 
     println!("\n👥 Network:");
     println!("  peers          - List connected peers");
