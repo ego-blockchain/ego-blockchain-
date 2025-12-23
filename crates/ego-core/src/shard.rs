@@ -281,13 +281,13 @@ pub struct ShardManager {
     pub state: Arc<RwLock<StateManager>>,
     blocks: Arc<RwLock<VecDeque<Block>>>,
     pub current_epoch: Arc<RwLock<EpochInfo>>,
-    tx_pool: Arc<TransactionPool>,
-    cross_shard: Arc<CrossShardManager>,
+    pub tx_pool: Arc<TransactionPool>,
+    pub cross_shard: Arc<CrossShardManager>,
     metrics: Arc<RwLock<ShardMetrics>>,
     total_blocks: Arc<AtomicU64>,
     total_transactions: Arc<AtomicU64>,
-    chain_id: u32,
-    network_id: u32,
+    pub chain_id: u32,
+    pub network_id: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
