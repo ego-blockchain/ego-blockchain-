@@ -2,11 +2,13 @@ use crate::{BandwidthSharingEvent, NetworkEvent, OptimizerEvent};
 use crate::{BandwidthSharingManager, DataOptimizer, NetworkManager, NetworkType};
 use crate::{NodeBehaviour, Placement, ProofEvent, SecureKeystore, ShardConfig};
 
+use ego_core::ShardManager;
 use ego_core::{
     Account, Address, Balance, Block, BlockHeight, DeviceCapabilities, EgoResult, Hash, NodeRole,
     PublicKey, SliceId, StateManager, Transaction, TransactionResult, calculate_shard_for_address,
     current_timestamp, format_storage_size,
 };
+use std::sync::Arc;
 
 use libp2p::{
     Multiaddr, PeerId, Swarm, Transport, autonat, core::upgrade::Version, gossipsub, identify, kad,
@@ -36,7 +38,7 @@ pub struct Node {
     pub recent_proofs: Vec<ProofEvent>,
 
     pub state_manager: StateManager,
-
+    pub shard_manager: Option<Arc<ego_core::ShardManager>>,
     pub network_manager: NetworkManager,
     pub bandwidth_sharing: BandwidthSharingManager,
     pub data_optimizer: DataOptimizer,
@@ -233,6 +235,7 @@ impl Node {
             max_topics_per_role: 20,
             recent_proofs: Vec::new(),
             state_manager,
+            shard_manager: None,
             network_manager,
             bandwidth_sharing,
             data_optimizer,
