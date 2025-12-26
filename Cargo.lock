@@ -1167,6 +1167,25 @@ dependencies = [
 [[package]]
 name = "ego-p2p"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bincode",
+ "chrono",
+ "dashmap 6.1.0",
+ "ego-core",
+ "futures",
+ "libp2p 0.56.0",
+ "lru 0.16.2",
+ "rand 0.9.2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-test",
+ "tracing",
+]
 
 [[package]]
 name = "ego-rollup"
