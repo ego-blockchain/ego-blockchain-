@@ -49,6 +49,24 @@ pub enum P2PError {
 
     #[error("JSON error: {0}")]
     JsonError(#[from] serde_json::Error),
+
+    #[error("Noise error: {0}")]
+    NoiseError(String),
+
+    #[error("Transport error: {0}")]
+    TransportError(String),
+}
+
+impl From<libp2p::noise::Error> for P2PError {
+    fn from(err: libp2p::noise::Error) -> Self {
+        P2PError::NoiseError(err.to_string())
+    }
+}
+
+impl From<Box<dyn std::error::Error>> for P2PError {
+    fn from(err: Box<dyn std::error::Error>) -> Self {
+        P2PError::Libp2pError(err.to_string())
+    }
 }
 
 pub type P2PResult<T> = Result<T, P2PError>;
