@@ -1,17 +1,25 @@
 pub mod behaviour;
+pub mod builder;
 pub mod codec;
 pub mod config;
+pub mod discovery;
 pub mod error;
 pub mod event;
+pub mod network;
 pub mod peer;
+pub mod subscription;
 pub mod topic;
 pub mod types;
 
 pub use behaviour::EgoBehaviour;
+pub use builder::MessageBuilder;
 pub use codec::MessageCodec;
 pub use config::NetworkConfig;
+pub use discovery::{DiscoveredPeer, DiscoveryManager, DiscoverySource};
 pub use error::{P2PError, P2PResult};
 pub use event::{EventHandler, NetworkEvent};
+pub use network::NetworkManager;
 pub use peer::PeerManager;
+pub use subscription::SubscriptionManager;
 pub use topic::{TopicManager, get_standard_topics};
 pub use types::*;
