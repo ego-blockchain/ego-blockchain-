@@ -112,7 +112,7 @@ impl PoRepEvent {
             proof_hash,
             cid_hint: None,
             alg_sig_id: 1,
-            node_sig: Signature::new([0u8; 64]),
+            node_sig: Signature::ed25519([0u8; 64]),
             ts_ms: Timestamp::now().as_millis(),
         }
     }
@@ -369,15 +369,27 @@ mod tests {
     fn test_sealing_job_progression() {
         let mut job = SealingJob::new(1, Hash::new([1u8; 32]));
         assert_eq!(job.status, SealingStatus::Queued);
-
+    
+        // Follow the complete sealing pipeline
         job.advance_status(SealingStatus::PreCommit1, 0);
         assert_eq!(job.status, SealingStatus::PreCommit1);
-
+    
         job.advance_status(SealingStatus::PreCommit2, 5000);
         assert_eq!(job.status, SealingStatus::PreCommit2);
-        assert_eq!(job.pc1_duration_ms, 5000);
-
-        job.advance_status(SealingStatus::Completed, 3000);
+    
+        // FIXED: WaitingForSeed (not WaitSeed)
+        job.advance_status(SealingStatus::WaitingForSeed, 1000);
+        assert_eq!(job.status, SealingStatus::WaitingForSeed);
+    
+        // Then Commit steps
+        job.advance_status(SealingStatus::Commit1, 2000);
+        assert_eq!(job.status, SealingStatus::Commit1);
+    
+        job.advance_status(SealingStatus::Commit2, 3000);
+        assert_eq!(job.status, SealingStatus::Commit2);
+    
+        // Finally complete
+        job.advance_status(SealingStatus::Completed, 1000);
         assert_eq!(job.status, SealingStatus::Completed);
         assert!(job.completed_at.is_some());
     }

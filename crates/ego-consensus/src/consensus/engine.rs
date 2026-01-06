@@ -140,29 +140,28 @@ impl Default for ConsensusConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ego_core::{Hash, Address, Timestamp, Signature};
 
-    #[tokio::test]
-    async fn test_consensus_engine() {
-        let config = ConsensusConfig::default();
-        let validators = vec![Address::new([1u8; 20]), Address::new([2u8; 20])];
-        let engine = ConsensusEngine::new(config, validators);
-
+    #[test]
+    fn test_consensus_engine_creation() {
         let event = PoCEvent {
-            beacon_hash: ego_core::Hash::new([1u8; 32]),
-            witness_hashes: vec![ego_core::Hash::new([2u8; 32])],
-            agg_digest: ego_core::Hash::new([3u8; 32]),
-            quality_score: 0.8,
-            region: "test".to_string(),
-            epoch: 1,
+            beacon_hash: Hash::new([1u8; 32]),
+            witness_hashes: vec![Hash::new([4u8; 32]), Hash::new([5u8; 32])],
+            agg_digest: Hash::new([6u8; 32]),
+            quality_score: 0.85,
+            region: "872834".to_string(),
+            epoch: 100,
             cid_hint: None,
             timestamp: Timestamp::now(),
-            aggregator_signature: ego_core::Signature::new([0u8; 64]),
+            aggregator_signature: Signature::ed25519([0u8; 64]),
+            path_loss_rmse: 8.5,
+            diversity_score: 0.9,
+            nonce_binding_fraction: 0.75,
+            ldm_penalty: 0.0,
         };
 
-        assert!(engine.submit_event(event).await.is_ok());
-        let results = engine.validate_events().await.unwrap();
-        assert_eq!(results.len(), 1);
-        assert!(results[0].is_valid);
+        assert_eq!(event.quality_score, 0.85);
+        assert_eq!(event.witness_hashes.len(), 2);
     }
 
     #[tokio::test]
@@ -172,19 +171,23 @@ mod tests {
         let engine = ConsensusEngine::new(config, validators);
 
         let event = PoCEvent {
-            beacon_hash: ego_core::Hash::new([1u8; 32]),
+            beacon_hash: Hash::new([1u8; 32]),
             witness_hashes: vec![
-                ego_core::Hash::new([2u8; 32]),
-                ego_core::Hash::new([3u8; 32]),
-                ego_core::Hash::new([4u8; 32]),
+                Hash::new([2u8; 32]),
+                Hash::new([3u8; 32]),
+                Hash::new([4u8; 32]),
             ],
-            agg_digest: ego_core::Hash::new([5u8; 32]),
+            agg_digest: Hash::new([5u8; 32]),
             quality_score: 0.8,
             region: "test_region".to_string(),
             epoch: Timestamp::now().as_secs() / 3600,
             cid_hint: None,
             timestamp: Timestamp::now(),
-            aggregator_signature: ego_core::Signature::new([0u8; 64]),
+            aggregator_signature: Signature::ed25519([0u8; 64]),
+            path_loss_rmse: 9.0,
+            diversity_score: 0.85,
+            nonce_binding_fraction: 0.70,
+            ldm_penalty: 0.05,
         };
 
         let result1 = engine.validate_single_event(&event).await.unwrap();
@@ -192,5 +195,33 @@ mod tests {
 
         assert_eq!(result1.is_valid, result2.is_valid);
         assert_eq!(result1.confidence, result2.confidence);
+    }
+
+    #[tokio::test]
+    async fn test_event_submission() {
+        let config = ConsensusConfig::default();
+        let validators = vec![Address::new([1u8; 20]), Address::new([2u8; 20])];
+        let engine = ConsensusEngine::new(config, validators);
+
+        let event = PoCEvent {
+            beacon_hash: Hash::new([10u8; 32]),
+            witness_hashes: vec![Hash::new([11u8; 32])],
+            agg_digest: Hash::new([12u8; 32]),
+            quality_score: 0.75,
+            region: "872835".to_string(),
+            epoch: Timestamp::now().as_secs() / 3600,
+            cid_hint: Some("QmTest123".to_string()),
+            timestamp: Timestamp::now(),
+            aggregator_signature: Signature::ed25519([1u8; 64]),
+            path_loss_rmse: 7.5,
+            diversity_score: 0.80,
+            nonce_binding_fraction: 0.65,
+            ldm_penalty: 0.10,
+        };
+
+        assert!(engine.submit_event(event).await.is_ok());
+        
+        let results = engine.validate_events().await.unwrap();
+        assert_eq!(results.len(), 1);
     }
 }

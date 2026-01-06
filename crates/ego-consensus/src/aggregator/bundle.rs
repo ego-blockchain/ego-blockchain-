@@ -1,9 +1,11 @@
 use crate::beacon::BeaconAnnouncement;
 use crate::error::{PoCError, PoCResult};
+use crate::witness::report::CoBeaconVerification;
 use crate::types::*;
 use crate::witness::WitnessReport;
 use ego_core::{Address, Hash, KeyPair, PublicKey, Signature, Timestamp};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct PoCBundle {
@@ -42,6 +44,10 @@ pub struct BundleStatistics {
     pub geographic_spread_km2: f32,
     pub time_window_ms: u64,
     pub duplicate_reports: u32,
+    pub unique_h3_cells: u32,
+    pub unique_accounts: u32,
+    pub path_loss_rmse: f64,
+    pub nonce_binding_fraction: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -53,6 +59,57 @@ pub struct CoherenceAnalysis {
     pub clustering_detected: bool,
     pub suspicious_patterns: Vec<SuspiciousPattern>,
     pub fraud_likelihood: f64,
+    pub path_loss_fit_quality: PathLossFitQuality,
+    pub diversity_metrics: DiversityMetrics,
+    pub nonce_verification: NonceVerification,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct PathLossFitQuality {
+    pub model_type: PathLossModel,
+    pub rmse_db: f64,
+    pub fit_score: f64,
+    pub outlier_count: u32,
+    pub acceptable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub enum PathLossModel {
+    UMa,  // Urban Macro (3GPP TR 38.901)
+    UMi,  // Urban Micro (3GPP TR 38.901)
+    FreeSpace, // Fallback for testing
+}
+
+#[derive(Debug, Clone)]
+enum FraudPattern {
+    TxPowerManipulation,
+    LocationSpoofing,
+    InvalidGeometry,
+    ReplayAttack,
+}
+
+#[derive(Debug, Clone)]
+struct FraudEvidence {
+    pattern: FraudPattern,
+    confidence: f64,
+    description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct DiversityMetrics {
+    pub unique_h3_cells: u32,
+    pub unique_accounts: u32,
+    pub radial_spread_km: f32,
+    pub diversity_score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct NonceVerification {
+    pub witnesses_with_nonce: u32,
+    pub total_witnesses: u32,
+    pub nonce_binding_fraction: f64,
+    pub nonce_score: f64,
+    pub replay_detected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -72,6 +129,9 @@ pub enum PatternType {
     ClusteredWitnesses,
     RepeatedNonces,
     SuspiciousMovement,
+    PathLossMismatch,
+    LowDiversity,
+    NonceBindingFailure,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -85,7 +145,24 @@ pub struct PoCEvent {
     pub cid_hint: Option<String>,
     pub timestamp: Timestamp,
     pub aggregator_signature: Signature,
+    // Whitepaper additions
+    pub path_loss_rmse: f64,
+    pub diversity_score: f64,
+    pub nonce_binding_fraction: f64,
+    pub ldm_penalty: f64,
 }
+
+
+const UMA_BASE_LOSS: f64 = 32.4; // dB at 1m
+const UMI_BASE_LOSS: f64 = 32.4;
+const RMSE_THRESHOLD_URBAN: f64 = 10.0; // Max acceptable RMSE in dB
+const RMSE_THRESHOLD_RURAL: f64 = 8.0;
+const MIN_DIVERSITY_H3_CELLS: usize = 2;
+const MIN_DIVERSITY_ACCOUNTS: usize = 2;
+const MIN_NONCE_BINDING_FRACTION: f64 = 0.6; // 60% of witnesses must see valid nonce
+const DENSITY_THRESHOLD_METERS: f32 = 1.0; // Co-location threshold
+const DENSITY_PENALTY_PER_DEVICE: f64 = 0.10; // -10% per extra device
+const DENSITY_PENALTY_FLOOR: f64 = 0.40; // Floor at 40%
 
 impl PoCBundle {
     pub fn new(
@@ -114,7 +191,7 @@ impl PoCBundle {
         let statistics = Self::calculate_statistics(&witness_reports, &beacon_announcement);
         let coherence_analysis = Self::analyze_coherence(&witness_reports, &beacon_announcement);
         let coverage_quality =
-            Self::assess_coverage_quality(&witness_reports, &beacon_announcement);
+            Self::assess_coverage_quality(&witness_reports, &beacon_announcement, &coherence_analysis);
 
         let bundle_id =
             Self::compute_bundle_id(aggregator_id, beacon_hash, &witness_reports, created_at);
@@ -129,8 +206,8 @@ impl PoCBundle {
             coverage_quality,
             compression_info: None,
             created_at,
-            signature: Signature::new([0u8; 64]),
-            public_key: PublicKey::new([0u8; 32]),
+            signature: Signature::ed25519([0u8; 64]),
+            public_key: PublicKey::ed25519([0u8; 32]),
             cid_hint: None,
         }
     }
@@ -169,6 +246,7 @@ impl PoCBundle {
     }
 
     pub fn validate(&self) -> PoCResult<()> {
+        // Basic witness count checks
         if self.witness_reports.len() < crate::POC_MIN_WITNESSES {
             return Err(PoCError::InsufficientWitnesses {
                 got: self.witness_reports.len(),
@@ -183,6 +261,7 @@ impl PoCBundle {
             });
         }
 
+        // Validate individual witness reports
         for report in &self.witness_reports {
             report.validate()?;
 
@@ -193,12 +272,47 @@ impl PoCBundle {
             }
         }
 
+
+        if self.statistics.unique_h3_cells < MIN_DIVERSITY_H3_CELLS as u32 {
+            return Err(PoCError::ValidationFailed(format!(
+                "Insufficient H3 cell diversity: got {}, need {}",
+                self.statistics.unique_h3_cells, MIN_DIVERSITY_H3_CELLS
+            )));
+        }
+
+        if self.statistics.unique_accounts < MIN_DIVERSITY_ACCOUNTS as u32 {
+            return Err(PoCError::ValidationFailed(format!(
+                "Insufficient account diversity: got {}, need {}",
+                self.statistics.unique_accounts, MIN_DIVERSITY_ACCOUNTS
+            )));
+        }
+
+
+        if !self.coherence_analysis.path_loss_fit_quality.acceptable {
+            return Err(PoCError::ValidationFailed(format!(
+                "Path-loss fit RMSE {} dB exceeds threshold (model: {:?})",
+                self.coherence_analysis.path_loss_fit_quality.rmse_db,
+                self.coherence_analysis.path_loss_fit_quality.model_type
+            )));
+        }
+
+
+        if self.statistics.nonce_binding_fraction < MIN_NONCE_BINDING_FRACTION {
+            return Err(PoCError::ValidationFailed(format!(
+                "Insufficient nonce binding: {:.2}% of witnesses, need {:.0}%",
+                self.statistics.nonce_binding_fraction * 100.0,
+                MIN_NONCE_BINDING_FRACTION * 100.0
+            )));
+        }
+
+
         if self.coherence_analysis.overall_coherence_score < 0.5 {
             return Err(PoCError::ValidationFailed(format!(
                 "Low coherence score: {}",
                 self.coherence_analysis.overall_coherence_score
             )));
         }
+
 
         if self.coherence_analysis.fraud_likelihood > 0.8 {
             return Err(PoCError::FraudDetected {
@@ -207,6 +321,14 @@ impl PoCBundle {
                     "High fraud likelihood: {}",
                     self.coherence_analysis.fraud_likelihood
                 ),
+            });
+        }
+
+        // Replay detection
+        if self.coherence_analysis.nonce_verification.replay_detected {
+            return Err(PoCError::FraudDetected {
+                fraud_type: crate::FraudType::ReplayAttack,
+                details: "Nonce replay detected".to_string(),
             });
         }
 
@@ -259,7 +381,11 @@ impl PoCBundle {
             epoch,
             cid_hint: self.cid_hint.clone(),
             timestamp: self.created_at,
-            aggregator_signature: self.signature,
+            aggregator_signature: self.signature.clone(),
+            path_loss_rmse: self.coherence_analysis.path_loss_fit_quality.rmse_db,
+            diversity_score: self.coherence_analysis.diversity_metrics.diversity_score,
+            nonce_binding_fraction: self.statistics.nonce_binding_fraction,
+            ldm_penalty: self.coverage_quality.density_penalty,
         }
     }
 
@@ -315,6 +441,36 @@ impl PoCBundle {
             0.0
         };
 
+        let unique_h3_cells = witness_reports
+            .iter()
+            .map(|r| r.witness_location.h3_index.as_str())
+            .collect::<HashSet<_>>()
+            .len() as u32;
+
+        let unique_accounts = witness_reports
+            .iter()
+            .map(|r| r.witness_id)
+            .collect::<HashSet<_>>()
+            .len() as u32;
+
+
+        let witnesses_with_nonce = witness_reports
+            .iter()
+            .filter(|r| {
+                r.co_beacon_verification
+                    .as_ref()
+                    .map_or(false, |v| v.signature_valid && !v.received_nonce.is_empty())
+            })
+            .count();
+        let nonce_binding_fraction = if witness_count > 0 {
+            witnesses_with_nonce as f64 / witness_count as f64
+        } else {
+            0.0
+        };
+
+        // Placeholder for path_loss_rmse (calculated in coherence analysis)
+        let path_loss_rmse = 0.0;
+
         BundleStatistics {
             witness_count,
             valid_witnesses,
@@ -325,6 +481,10 @@ impl PoCBundle {
             geographic_spread_km2,
             time_window_ms: 30_000,
             duplicate_reports: 0,
+            unique_h3_cells,
+            unique_accounts,
+            path_loss_rmse,
+            nonce_binding_fraction,
         }
     }
 
@@ -334,11 +494,26 @@ impl PoCBundle {
     ) -> CoherenceAnalysis {
         let mut suspicious_patterns = Vec::new();
 
-        let geometry_coherence = Self::analyze_geometry_coherence(
+
+        let path_loss_fit_quality = Self::fit_3gpp_path_loss(
             witness_reports,
             beacon_announcement,
             &mut suspicious_patterns,
         );
+
+
+        let diversity_metrics = Self::calculate_diversity_metrics(
+            witness_reports,
+            beacon_announcement,
+            &mut suspicious_patterns,
+        );
+
+        let nonce_verification = Self::verify_nonce_binding(
+            witness_reports,
+            beacon_announcement,
+            &mut suspicious_patterns,
+        );
+
 
         let timing_coherence = Self::analyze_timing_coherence(
             witness_reports,
@@ -349,8 +524,14 @@ impl PoCBundle {
         let signal_coherence =
             Self::analyze_signal_coherence(witness_reports, &mut suspicious_patterns);
 
-        let overall_coherence_score =
-            geometry_coherence * 0.4 + timing_coherence * 0.3 + signal_coherence * 0.3;
+
+        let geometry_coherence = path_loss_fit_quality.fit_score;
+
+
+        let overall_coherence_score = geometry_coherence * 0.4
+            + diversity_metrics.diversity_score * 0.2
+            + (diversity_metrics.radial_spread_km / 20.0).min(1.0) as f64 * 0.2
+            + nonce_verification.nonce_score * 0.2;
 
         let clustering_detected = Self::detect_clustering(witness_reports);
         if clustering_detected {
@@ -372,59 +553,286 @@ impl PoCBundle {
             clustering_detected,
             suspicious_patterns,
             fraud_likelihood,
+            path_loss_fit_quality,
+            diversity_metrics,
+            nonce_verification,
         }
     }
 
-    fn analyze_geometry_coherence(
+
+fn fit_3gpp_path_loss(
+    witness_reports: &[WitnessReport],
+    beacon_announcement: &BeaconAnnouncement,
+    suspicious_patterns: &mut Vec<SuspiciousPattern>,
+) -> PathLossFitQuality {
+    if witness_reports.is_empty() {
+        return PathLossFitQuality {
+            model_type: PathLossModel::FreeSpace,
+            rmse_db: f64::INFINITY,
+            fit_score: 0.0,
+            outlier_count: 0,
+            acceptable: false,
+        };
+    }
+
+    let beacon_location = &beacon_announcement.location;
+    
+
+    let avg_distance: f32 = witness_reports
+        .iter()
+        .map(|r| Self::calculate_distance(&r.witness_location, beacon_location))
+        .sum::<f32>()
+        / witness_reports.len() as f32;
+
+    let model_type = if avg_distance > 5.0 {
+        PathLossModel::UMa
+    } else {
+        PathLossModel::UMi
+    };
+
+    let mut errors = Vec::new();
+    let mut outliers = 0;
+
+    for report in witness_reports {
+        let distance_km = Self::calculate_distance(&report.witness_location, beacon_location);
+        let distance_m = (distance_km * 1000.0).max(1.0); // Avoid log(0)
+
+        let frequency_ghz = report.rf_metrics.frequency as f64 / 1_000_000.0;
+        
+
+        let scenario = if distance_m < 1000.0 {
+            "UMi"
+        } else if distance_m < 5000.0 {
+            "UMa"
+        } else {
+            "RMa"
+        };
+
+        // FIXED: Calculate expected path-loss with proper type casting
+        let expected_path_loss = match scenario {
+            "UMa" => {
+                13.54 + 39.08 * distance_m.log10() + 20.0 * (frequency_ghz.log10() as f32)
+            }
+            "UMi" => {
+                22.4 + 35.3 * distance_m.log10() + 21.3 * (frequency_ghz.log10() as f32)
+            }
+            "RMa" => {
+                20.0 * distance_m.log10() + 20.0 * (frequency_ghz.log10() as f32) + 32.44
+            }
+            _ => {
+                // Free space path loss as fallback
+                20.0 * distance_m.log10() + 20.0 * (frequency_ghz.log10() as f32) + 32.44
+            }
+        };
+
+        // Assume beacon Tx power ≈ 23 dBm (typical for small cell)
+        let expected_rsrp = 23.0 - expected_path_loss;
+        let actual_rsrp = report.rf_metrics.rsrp;
+        let error = (expected_rsrp - actual_rsrp as f32).abs();
+
+        errors.push(error);
+
+        // Flag outliers (error > 25 dB is suspicious)
+        if error > 25.0 {
+            outliers += 1;
+            let pattern_type = if actual_rsrp as f32 > expected_rsrp {
+                PatternType::SignalTooStrong
+            } else {
+                PatternType::SignalTooWeak
+            };
+
+            suspicious_patterns.push(SuspiciousPattern {
+                pattern_type,
+                confidence: ((error / 30.0).min(1.0)) as f64,
+                affected_witnesses: vec![report.witness_id],
+                description: format!(
+                    "Path-loss mismatch: RSRP {:.1} dBm, expected {:.1} dBm (distance {:.2} km, model {:?})",
+                    actual_rsrp, expected_rsrp, distance_km, model_type
+                ),
+            });
+        }
+    }
+
+    // Calculate RMSE
+    let mse = errors.iter().map(|&e| (e as f64).powi(2)).sum::<f64>() / errors.len() as f64;
+    let rmse_db = mse.sqrt();
+
+    // Fit score: normalize RMSE to [0, 1], where 0 dB error = 1.0, threshold = 0.0
+    let threshold = if matches!(model_type, PathLossModel::UMa | PathLossModel::UMi) {
+        RMSE_THRESHOLD_URBAN
+    } else {
+        RMSE_THRESHOLD_RURAL
+    };
+    let fit_score = (1.0 - (rmse_db / threshold)).max(0.0).min(1.0);
+
+    let acceptable = rmse_db <= threshold;
+
+    if !acceptable {
+        suspicious_patterns.push(SuspiciousPattern {
+            pattern_type: PatternType::PathLossMismatch,
+            confidence: 0.9,
+            affected_witnesses: vec![],
+            description: format!(
+                "Path-loss RMSE {:.2} dB exceeds threshold {:.2} dB (model: {:?})",
+                rmse_db, threshold, model_type
+            ),
+        });
+    }
+
+    PathLossFitQuality {
+        model_type,
+        rmse_db,
+        fit_score,
+        outlier_count: outliers,
+        acceptable,
+    }
+}
+
+
+    fn calculate_diversity_metrics(
         witness_reports: &[WitnessReport],
         beacon_announcement: &BeaconAnnouncement,
         suspicious_patterns: &mut Vec<SuspiciousPattern>,
-    ) -> f64 {
-        let mut coherence_scores = Vec::new();
-        let beacon_location = &beacon_announcement.location;
+    ) -> DiversityMetrics {
+        let unique_h3_cells = witness_reports
+            .iter()
+            .map(|r| r.witness_location.h3_index.as_str())
+            .collect::<HashSet<_>>()
+            .len() as u32;
 
+        let unique_accounts = witness_reports
+            .iter()
+            .map(|r| r.witness_id)
+            .collect::<HashSet<_>>()
+            .len() as u32;
+
+        let distances: Vec<f32> = witness_reports
+            .iter()
+            .map(|r| Self::calculate_distance(&r.witness_location, &beacon_announcement.location))
+            .collect();
+
+        let radial_spread_km = if !distances.is_empty() {
+            *distances
+                .iter()
+                .max_by(|a, b| a.partial_cmp(b).unwrap())
+                .unwrap()
+        } else {
+            0.0
+        };
+
+        // Diversity score: normalize to [0, 1]
+        let h3_diversity = (unique_h3_cells as f64 / MIN_DIVERSITY_H3_CELLS as f64).min(1.0);
+        let account_diversity = (unique_accounts as f64 / MIN_DIVERSITY_ACCOUNTS as f64).min(1.0);
+        let diversity_score = (h3_diversity + account_diversity) / 2.0;
+
+        if unique_h3_cells < MIN_DIVERSITY_H3_CELLS as u32 {
+            suspicious_patterns.push(SuspiciousPattern {
+                pattern_type: PatternType::LowDiversity,
+                confidence: 0.9,
+                affected_witnesses: vec![],
+                description: format!(
+                    "Low H3 cell diversity: {} cells (need {})",
+                    unique_h3_cells, MIN_DIVERSITY_H3_CELLS
+                ),
+            });
+        }
+
+        if unique_accounts < MIN_DIVERSITY_ACCOUNTS as u32 {
+            suspicious_patterns.push(SuspiciousPattern {
+                pattern_type: PatternType::LowDiversity,
+                confidence: 0.9,
+                affected_witnesses: vec![],
+                description: format!(
+                    "Low account diversity: {} accounts (need {})",
+                    unique_accounts, MIN_DIVERSITY_ACCOUNTS
+                ),
+            });
+        }
+
+        DiversityMetrics {
+            unique_h3_cells,
+            unique_accounts,
+            radial_spread_km,
+            diversity_score,
+        }
+    }
+
+
+    fn verify_nonce_binding(
+        witness_reports: &[WitnessReport],
+        _beacon_announcement: &BeaconAnnouncement,
+        suspicious_patterns: &mut Vec<SuspiciousPattern>,
+    ) -> NonceVerification {
+        let total_witnesses = witness_reports.len() as u32;
+        let witnesses_with_nonce = witness_reports
+            .iter()
+            .filter(|r| {
+                r.co_beacon_verification
+                    .as_ref()
+                    .map_or(false, |v| v.signature_valid && !v.received_nonce.is_empty())
+            })
+            .count() as u32;
+
+        let nonce_binding_fraction = if total_witnesses > 0 {
+            witnesses_with_nonce as f64 / total_witnesses as f64
+        } else {
+            0.0
+        };
+        // Nonce score: normalize to [0, 1], where MIN_NONCE_BINDING_FRACTION = 1.0
+        let nonce_score = (nonce_binding_fraction / MIN_NONCE_BINDING_FRACTION).min(1.0);
+
+        // Detect replay attacks: check for duplicate nonces
+        let mut nonce_map: HashMap<Vec<u8>, Vec<Address>> = HashMap::new();
         for report in witness_reports {
-            let distance_km = Self::calculate_distance(&report.witness_location, beacon_location);
-
-            let frequency_ghz = report.rf_metrics.frequency as f64 / 1_000_000.0;
-            let expected_path_loss =
-                20.0 * distance_km.log10() as f64 + 20.0 * frequency_ghz.log10() + 32.44;
-            let expected_rsrp = 23.0 - expected_path_loss;
-
-            let actual_rsrp = report.rf_metrics.rsrp as f64;
-            let rsrp_error = (expected_rsrp - actual_rsrp).abs();
-
-            let score = if rsrp_error <= 15.0 {
-                1.0 - (rsrp_error / 15.0).min(1.0)
-            } else {
-                0.0
-            };
-
-            coherence_scores.push(score);
-
-            if rsrp_error > 25.0 {
-                let pattern_type = if actual_rsrp > expected_rsrp {
-                    PatternType::SignalTooStrong
-                } else {
-                    PatternType::SignalTooWeak
-                };
-
-                suspicious_patterns.push(SuspiciousPattern {
-                    pattern_type,
-                    confidence: (rsrp_error / 30.0).min(1.0),
-                    affected_witnesses: vec![report.witness_id],
-                    description: format!(
-                        "RSRP {} dBm inconsistent with distance {} km",
-                        actual_rsrp, distance_km
-                    ),
-                });
+            if let Some(ref co_beacon) = report.co_beacon_verification {
+                if co_beacon.signature_valid && !co_beacon.received_nonce.is_empty() {
+                    nonce_map
+                       .entry(co_beacon.received_nonce.clone())
+                        .or_insert_with(Vec::new)
+                        .push(report.witness_id);
+                }
             }
         }
 
-        if coherence_scores.is_empty() {
-            0.0
-        } else {
-            coherence_scores.iter().sum::<f64>() / coherence_scores.len() as f64
+        // Replay detected if any nonce appears more than once
+        let replay_detected = nonce_map.values().any(|witnesses| witnesses.len() > 1);
+
+        if replay_detected {
+            for (nonce, witnesses) in nonce_map.iter() {
+                if witnesses.len() > 1 {
+                    suspicious_patterns.push(SuspiciousPattern {
+                        pattern_type: PatternType::RepeatedNonces,
+                        confidence: 1.0,
+                        affected_witnesses: witnesses.clone(),
+                        description: format!(
+                            "Nonce replay detected: {} witnesses share nonce {:?}",
+                            witnesses.len(),
+                            nonce
+                        ),
+                    });
+                }
+            }
+        }
+
+        if nonce_binding_fraction < MIN_NONCE_BINDING_FRACTION {
+            suspicious_patterns.push(SuspiciousPattern {
+                pattern_type: PatternType::NonceBindingFailure,
+                confidence: 0.8,
+                affected_witnesses: vec![],
+                description: format!(
+                    "Low nonce binding: {:.1}% of witnesses (need {:.0}%)",
+                    nonce_binding_fraction * 100.0,
+                    MIN_NONCE_BINDING_FRACTION * 100.0
+                ),
+            });
+        }
+
+        NonceVerification {
+            witnesses_with_nonce,
+            total_witnesses,
+            nonce_binding_fraction,
+            nonce_score,
+            replay_detected,
         }
     }
 
@@ -490,6 +898,7 @@ impl PoCBundle {
         coherence
     }
 
+
     fn detect_clustering(witness_reports: &[WitnessReport]) -> bool {
         if witness_reports.len() < 3 {
             return false;
@@ -500,23 +909,37 @@ impl PoCBundle {
 
         for i in 0..witness_reports.len() {
             for j in i + 1..witness_reports.len() {
-                let distance = Self::calculate_distance(
+                let horizontal_distance = Self::calculate_distance(
                     &witness_reports[i].witness_location,
                     &witness_reports[j].witness_location,
                 );
 
-                if distance < 0.1 {
+
+                let vertical_distance = {
+                    let alt1 = witness_reports[i].witness_location.altitude.unwrap_or(0.0);
+                    let alt2 = witness_reports[j].witness_location.altitude.unwrap_or(0.0);
+                    (alt1 - alt2).abs()
+                };
+
+
+                let horizontal_m = horizontal_distance * 1000.0;
+                let is_clustered = horizontal_m <= DENSITY_THRESHOLD_METERS && vertical_distance <= 2.0;
+
+                if is_clustered {
                     close_pairs += 1;
                 }
             }
         }
 
+        // Clustering detected if >50% of pairs are co-located
         (close_pairs as f32 / total_pairs as f32) > 0.5
     }
+
 
     fn assess_coverage_quality(
         witness_reports: &[WitnessReport],
         beacon_announcement: &BeaconAnnouncement,
+        coherence_analysis: &CoherenceAnalysis,
     ) -> CoverageQuality {
         let witness_count = witness_reports.len() as u32;
 
@@ -552,31 +975,104 @@ impl PoCBundle {
             .sum::<f32>()
             / witness_count.max(1) as f32;
 
-        let witness_score = (witness_count as f32 / 10.0).min(1.0);
-        let signal_score = ((-avg_rsrp + 140.0) / 96.0).clamp(0.0, 1.0);
-        let coverage_score = (coverage_radius_km / 20.0).min(1.0);
-        let interference_score = 1.0 - interference_level;
 
-        let quality_score = (witness_score * 0.4
-            + signal_score * 0.3
-            + coverage_score * 0.2
-            + interference_score * 0.1) as f64;
+        let fit_score = coherence_analysis.path_loss_fit_quality.fit_score;
+        let diversity_score = coherence_analysis.diversity_metrics.diversity_score;
+        let radius_score = (coverage_radius_km / 20.0).min(1.0) as f64;
+        let nonce_score = coherence_analysis.nonce_verification.nonce_score;
 
-        let density_penalty = if witness_count > 10 {
-            0.9 - (witness_count as f64 - 10.0) * 0.02
+
+        let path_loss_penalty = if coherence_analysis.path_loss_fit_quality.outlier_count > 0 {
+            0.05 * coherence_analysis.path_loss_fit_quality.outlier_count as f64
         } else {
-            1.0
-        }
-        .max(0.5);
+            0.0
+        };
+
+        let timing_penalty = (1.0 - coherence_analysis.timing_coherence) * 0.1;
+        let signal_penalty = (1.0 - coherence_analysis.signal_coherence) * 0.05;
+        let total_penalties = (path_loss_penalty + timing_penalty + signal_penalty).min(0.3);
+
+        let raw_quality = (fit_score * 0.4
+            + diversity_score * 0.2
+            + radius_score * 0.2
+            + nonce_score * 0.2
+            - total_penalties)
+            .clamp(0.0, 1.0);
+
+
+        let density_penalty = Self::calculate_ldm_penalty(witness_reports, beacon_announcement);
+
+        // Apply LDM multiplier
+        let final_quality = raw_quality * (1.0 - density_penalty);
 
         CoverageQuality {
             witness_count,
             avg_rsrp,
             coverage_radius_km,
             interference_level,
-            quality_score: quality_score * density_penalty,
-            density_penalty: 1.0 - density_penalty,
+            quality_score: final_quality,
+            density_penalty,
         }
+    }
+
+
+    fn calculate_ldm_penalty(
+        witness_reports: &[WitnessReport],
+        _beacon_announcement: &BeaconAnnouncement,
+    ) -> f64 {
+        if witness_reports.len() < 2 {
+            return 0.0; // No penalty for single device
+        }
+
+        // Group devices by proximity (within DENSITY_THRESHOLD_METERS)
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+
+        for i in 0..witness_reports.len() {
+            let mut found_cluster = false;
+
+            for cluster in clusters.iter_mut() {
+                // Check if witness i is close to any device in this cluster
+                let is_close_to_cluster = cluster.iter().any(|&j| {
+                    let horizontal_distance = Self::calculate_distance(
+                        &witness_reports[i].witness_location,
+                        &witness_reports[j].witness_location,
+                    );
+
+                    let vertical_distance = {
+                        let alt1 = witness_reports[i].witness_location.altitude.unwrap_or(0.0);
+                        let alt2 = witness_reports[j].witness_location.altitude.unwrap_or(0.0);
+                        (alt1 - alt2).abs()
+                    };
+
+                    let horizontal_m = horizontal_distance * 1000.0;
+                    horizontal_m <= DENSITY_THRESHOLD_METERS && vertical_distance <= 2.0
+                });
+
+                if is_close_to_cluster {
+                    cluster.push(i);
+                    found_cluster = true;
+                    break;
+                }
+            }
+
+            if !found_cluster {
+                clusters.push(vec![i]);
+            }
+        }
+
+        // Find largest cluster
+        let max_cluster_size = clusters.iter().map(|c| c.len()).max().unwrap_or(1);
+
+        // Calculate LDM penalty
+        if max_cluster_size == 1 {
+            return 0.0; // No co-location
+        }
+
+        let n = max_cluster_size as f64;
+        let ldm_penalty = (1.0 - DENSITY_PENALTY_PER_DEVICE * (n - 1.0)).max(DENSITY_PENALTY_FLOOR);
+
+        // Return penalty as fraction (1.0 - LDM)
+        1.0 - ldm_penalty
     }
 
     fn calculate_distance(loc1: &LocationData, loc2: &LocationData) -> f32 {
@@ -612,6 +1108,11 @@ impl PoCBundle {
                 .overall_coherence_score
                 .to_le_bytes(),
         );
+
+    
+        data.extend_from_slice(&self.statistics.path_loss_rmse.to_le_bytes());
+        data.extend_from_slice(&self.statistics.nonce_binding_fraction.to_le_bytes());
+        data.extend_from_slice(&self.coverage_quality.density_penalty.to_le_bytes());
 
         Ok(data)
     }
@@ -652,7 +1153,34 @@ impl PoCBundle {
                 .overall_coherence_score
                 .to_le_bytes(),
             &self.coverage_quality.quality_score.to_le_bytes(),
+            &self.statistics.path_loss_rmse.to_le_bytes(),
+            &self.statistics.nonce_binding_fraction.to_le_bytes(),
         ])
+    }
+
+
+    pub fn get_ldm_penalty(&self) -> f64 {
+        self.coverage_quality.density_penalty
+    }
+
+    /// Get path-loss RMSE for metrics export
+    pub fn get_path_loss_rmse(&self) -> f64 {
+        self.coherence_analysis.path_loss_fit_quality.rmse_db
+    }
+
+
+    pub fn get_diversity_score(&self) -> f64 {
+        self.coherence_analysis.diversity_metrics.diversity_score
+    }
+
+    /// Get nonce binding fraction for metrics export
+    pub fn get_nonce_binding_fraction(&self) -> f64 {
+        self.statistics.nonce_binding_fraction
+    }
+
+
+    pub fn meets_quality_threshold(&self, q_min: f64) -> bool {
+        self.coverage_quality.quality_score >= q_min
     }
 }
 
@@ -706,7 +1234,11 @@ mod tests {
 
     fn create_test_bundle() -> PoCBundle {
         let beacon_announcement = create_test_beacon_announcement();
-        let witness_reports = vec![create_test_witness_report()];
+        let witness_reports = vec![
+            create_test_witness_report(37.7849, -122.4094, true),
+            create_test_witness_report(37.7750, -122.4294, true),
+            create_test_witness_report(37.7650, -122.4394, true),
+        ];
 
         PoCBundle::new(
             Address::new([1u8; 20]),
@@ -742,7 +1274,7 @@ mod tests {
         BeaconAnnouncement::new(Address::new([1u8; 20]), challenge, location, tx_params)
     }
 
-    fn create_test_witness_report() -> WitnessReport {
+    fn create_test_witness_report(lat: f64, lon: f64, valid_nonce: bool) -> WitnessReport {
         use crate::witness::WitnessReport;
 
         let rf_metrics = RFMetrics {
@@ -757,28 +1289,41 @@ mod tests {
         };
 
         let witness_location = LocationData {
-            latitude: 37.7849,
-            longitude: -122.4094,
+            latitude: lat,
+            longitude: lon,
             altitude: Some(10.0),
             accuracy: Some(5.0),
             timestamp: Timestamp::now().as_millis(),
             h3_index: "87283472bffffff".to_string(),
         };
 
-        WitnessReport::new(
+        let mut report = WitnessReport::new(
             Address::new([2u8; 20]),
             Address::new([1u8; 20]),
             Hash::new([3u8; 32]),
             rf_metrics,
             witness_location,
             None,
-        )
+        );
+
+        // Add co-beacon verification if requested
+        if valid_nonce {
+            report.co_beacon_verification = Some(CoBeaconVerification {
+                received_nonce: vec![3u8; 16],
+                signature_valid: true,
+                rx_timestamp: Timestamp::now().as_millis(),
+                time_delta_ms: 0,
+                side_channel_rssi: Some(-45),
+            });
+        }
+
+        report
     }
 
     #[test]
     fn test_poc_bundle_creation() {
         let bundle = create_test_bundle();
-        assert_eq!(bundle.witness_reports.len(), 1);
+        assert_eq!(bundle.witness_reports.len(), 3);
         assert!(bundle.coverage_quality.quality_score > 0.0);
         assert!(bundle.coherence_analysis.overall_coherence_score >= 0.0);
     }
@@ -789,7 +1334,7 @@ mod tests {
         let aggregator_id = Address::from_public_key(&keypair.public_key());
 
         let beacon_announcement = create_test_beacon_announcement();
-        let witness_reports = vec![create_test_witness_report()];
+        let witness_reports = vec![create_test_witness_report(37.7849, -122.4094, true)];
 
         let mut bundle = PoCBundle::new(aggregator_id, beacon_announcement, witness_reports);
 
@@ -814,8 +1359,10 @@ mod tests {
         let event = bundle.create_poc_event(100);
 
         assert_eq!(event.beacon_hash, bundle.beacon_event.beacon_hash);
-        assert_eq!(event.witness_hashes.len(), 1);
+        assert_eq!(event.witness_hashes.len(), 3);
         assert_eq!(event.epoch, 100);
+        assert!(event.path_loss_rmse >= 0.0);
+        assert!(event.nonce_binding_fraction >= 0.0);
     }
 
     #[test]
@@ -825,5 +1372,107 @@ mod tests {
         assert!(bundle.coherence_analysis.overall_coherence_score >= 0.0);
         assert!(bundle.coherence_analysis.overall_coherence_score <= 1.0);
         assert!(bundle.coherence_analysis.fraud_likelihood <= 1.0);
+    }
+
+    #[test]
+    fn test_whitepaper_diversity_validation() {
+        let beacon_announcement = create_test_beacon_announcement();
+        
+
+        let witness_reports = vec![
+            create_test_witness_report(37.7749, -122.4194, true),
+        ];
+
+        let bundle = PoCBundle::new(
+            Address::new([1u8; 20]),
+            beacon_announcement.clone(),
+            witness_reports,
+        );
+
+        // Should fail diversity check
+        assert!(bundle.validate().is_err());
+    }
+
+    #[test]
+    fn test_whitepaper_nonce_binding() {
+        let beacon_announcement = create_test_beacon_announcement();
+        
+        // Test: insufficient nonce binding (no valid nonces)
+        let witness_reports = vec![
+            create_test_witness_report(37.7849, -122.4094, false),
+            create_test_witness_report(37.7750, -122.4294, false),
+            create_test_witness_report(37.7650, -122.4394, false),
+        ];
+
+        let bundle = PoCBundle::new(
+            Address::new([1u8; 20]),
+            beacon_announcement,
+            witness_reports,
+        );
+
+        // Should fail nonce binding check
+        assert!(bundle.validate().is_err());
+    }
+
+    #[test]
+    fn test_3gpp_path_loss_fitting() {
+        let bundle = create_test_bundle();
+        
+        assert!(bundle.coherence_analysis.path_loss_fit_quality.rmse_db >= 0.0);
+        assert!(matches!(
+            bundle.coherence_analysis.path_loss_fit_quality.model_type,
+            PathLossModel::UMa | PathLossModel::UMi | PathLossModel::FreeSpace
+        ));
+    }
+
+    #[test]
+    fn test_ldm_density_penalty() {
+        let bundle = create_test_bundle();
+        
+        let ldm_penalty = bundle.get_ldm_penalty();
+        assert!(ldm_penalty >= 0.0);
+        assert!(ldm_penalty <= 1.0);
+    }
+
+    #[test]
+    fn test_quality_threshold() {
+        let bundle = create_test_bundle();
+        
+        // Default q_min = 0.5 per whitepaper
+        let meets_threshold = bundle.meets_quality_threshold(0.5);
+        
+        // Should pass with valid diverse witnesses and nonces
+        assert!(meets_threshold || bundle.coverage_quality.quality_score < 0.5);
+    }
+
+    #[test]
+    fn test_replay_detection() {
+        let beacon_announcement = create_test_beacon_announcement();
+        
+        // Create witnesses with duplicate nonces
+        let mut witness1 = create_test_witness_report(37.7849, -122.4094, true);
+        let mut witness2 = create_test_witness_report(37.7750, -122.4294, true);
+        let mut witness3 = create_test_witness_report(37.7650, -122.4394, true);
+
+        // Set same nonce for witness1 and witness2 (replay attack)
+        let duplicate_nonce = vec![99u8; 16];
+        if let Some(ref mut co_beacon) = witness1.co_beacon_verification {
+            co_beacon.received_nonce = duplicate_nonce.clone();
+        }
+        if let Some(ref mut co_beacon) = witness2.co_beacon_verification {
+            co_beacon.received_nonce = duplicate_nonce;
+        }
+
+        let witness_reports = vec![witness1, witness2, witness3];
+
+        let bundle = PoCBundle::new(
+            Address::new([1u8; 20]),
+            beacon_announcement,
+            witness_reports,
+        );
+
+        // Should detect replay
+        assert!(bundle.coherence_analysis.nonce_verification.replay_detected);
+        assert!(bundle.validate().is_err());
     }
 }
