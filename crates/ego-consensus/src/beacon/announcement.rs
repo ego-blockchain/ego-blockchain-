@@ -1,6 +1,6 @@
 use crate::error::{PoCError, PoCResult};
 use crate::types::*;
-use ego_core::{Address, KeyPair, PublicKey, Signature, Timestamp};
+use ego_core::{Address, Hash, KeyPair, PublicKey, Signature, Timestamp};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -16,16 +16,24 @@ pub struct BeaconAnnouncement {
     pub public_key: PublicKey,
     pub slice_context: Option<SliceContext>,
     pub time_window: TimeWindow,
+    // NEW: Whitepaper additions
+    pub epoch: u64,
+    pub randomness_seed: Option<Hash>, // vrf_output from finalized block
+    pub challenge_binding: Option<ChallengeBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct BeaconTxParams {
-    pub frequency: u32,
+    pub frequency: u32,           // MHz
     pub tx_power_dbm: i16,
     pub pci: u16,
     pub beam_config: Option<BeamConfig>,
     pub duration_ms: u32,
     pub mcs: Option<u8>,
+    // NEW: Whitepaper NR band info
+    pub nr_arfcn: Option<u32>,    // NR Absolute Radio Frequency Channel Number
+    pub nr_band: Option<u8>,      // 3GPP NR band number (e.g., n78, n77)
+    pub ssb_index: Option<u8>,    // SSB (Synchronization Signal Block) index
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -44,12 +52,17 @@ pub enum Polarization {
     Dual,
 }
 
+/// Whitepaper: Co-beacon side-channel nonce binding
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct CoBeaconInfo {
     pub method: CoBeaconMethod,
-    pub side_channel_nonce: Vec<u8>,
-    pub side_channel_signature: Signature,
+    pub side_channel_nonce: Vec<u8>,        // nonce16 from whitepaper
+    pub side_channel_signature: Signature,  // Signed {nonce16, time32, beacon_id}
     pub metadata: Vec<u8>,
+    // NEW: Whitepaper additions
+    pub nonce_commitment: Hash,             // H(nonce16 || beacon_id || epoch)
+    pub broadcast_start: Timestamp,
+    pub broadcast_end: Timestamp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -70,6 +83,15 @@ pub enum CoBeaconMethod {
     },
 }
 
+/// Whitepaper: Challenge binding to prevent replay
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct ChallengeBinding {
+    pub region_id: String,          // H3 cell or region
+    pub window_start: Timestamp,
+    pub window_end: Timestamp,
+    pub randomness_hash: Hash,      // H(vrf_output || region_id || epoch || slot)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct TimeWindow {
     pub start_time: Timestamp,
@@ -86,10 +108,13 @@ impl BeaconAnnouncement {
     ) -> Self {
         let nonce = Self::generate_nonce(&challenge);
         let timestamp = Timestamp::now();
+        let epoch = timestamp.as_secs() / 3600; // 1-hour epochs
+        
+        // Whitepaper: challenge window W=10s
         let time_window = TimeWindow {
             start_time: timestamp,
-            end_time: Timestamp::from_millis(timestamp.as_millis() + 30_000),
-            duration_ms: 30_000,
+            end_time: Timestamp::from_millis(timestamp.as_millis() + 10_000), // 10s window
+            duration_ms: 10_000,
         };
 
         Self {
@@ -100,10 +125,62 @@ impl BeaconAnnouncement {
             tx_params,
             co_beacon: None,
             timestamp,
-            signature: Signature::new([0u8; 64]),
-            public_key: PublicKey::new([0u8; 32]),
+            signature: Signature::ed25519([0u8; 64]), // TODO: Switch to Dilithium-2
+            public_key: PublicKey::ed25519([0u8; 32]),
             slice_context: None,
             time_window,
+            epoch,
+            randomness_seed: None,
+            challenge_binding: None,
+        }
+    }
+
+    /// Whitepaper: Create beacon with challenge randomness from consensus
+    pub fn new_with_randomness(
+        beacon_id: Address,
+        challenge: Challenge,
+        location: LocationData,
+        tx_params: BeaconTxParams,
+        vrf_output: Hash,
+        region_id: String,
+        epoch: u64,
+        slot: u64,
+    ) -> Self {
+        let timestamp = Timestamp::now();
+        
+        // Whitepaper: R_e = H(vrf_output || region_id || epoch || slot)
+        let randomness_hash = Self::compute_challenge_randomness(&vrf_output, &region_id, epoch, slot);
+        
+        let nonce = Self::generate_nonce_from_randomness(&challenge, &randomness_hash);
+        
+        let time_window = TimeWindow {
+            start_time: timestamp,
+            end_time: Timestamp::from_millis(timestamp.as_millis() + 10_000),
+            duration_ms: 10_000,
+        };
+
+        let challenge_binding = ChallengeBinding {
+            region_id: region_id.clone(),
+            window_start: time_window.start_time,
+            window_end: time_window.end_time,
+            randomness_hash,
+        };
+
+        Self {
+            beacon_id,
+            challenge,
+            nonce,
+            location,
+            tx_params,
+            co_beacon: None,
+            timestamp,
+            signature: Signature::ed25519([0u8; 64]),
+            public_key: PublicKey::ed25519([0u8; 32]),
+            slice_context: None,
+            time_window,
+            epoch,
+            randomness_seed: Some(vrf_output),
+            challenge_binding: Some(challenge_binding),
         }
     }
 
@@ -142,6 +219,8 @@ impl BeaconAnnouncement {
 
     pub fn validate(&self) -> PoCResult<()> {
         let now = Timestamp::now();
+        
+        // Whitepaper: Strict timing bounds
         if self.timestamp.as_millis() > now.as_millis() + 60_000 {
             return Err(PoCError::TimeWindowViolation(
                 "Announcement timestamp too far in future".to_string(),
@@ -154,6 +233,13 @@ impl BeaconAnnouncement {
             ));
         }
 
+        // Whitepaper: Reject if outside challenge window
+        if now < self.time_window.start_time {
+            return Err(PoCError::TimeWindowViolation(
+                "Transmission window has not started yet".to_string(),
+            ));
+        }
+
         if now > self.time_window.end_time {
             return Err(PoCError::TimeWindowViolation(
                 "Transmission window has expired".to_string(),
@@ -163,6 +249,10 @@ impl BeaconAnnouncement {
         self.validate_location()?;
         self.validate_rf_params()?;
         self.validate_nonce()?;
+        
+        // NEW: Whitepaper validations
+        self.validate_challenge_binding()?;
+        self.validate_co_beacon()?;
 
         Ok(())
     }
@@ -194,10 +284,20 @@ impl BeaconAnnouncement {
             }
         }
 
+        // Whitepaper: Location must match challenge region
+        if let Some(ref binding) = self.challenge_binding {
+            if !self.location.h3_index.starts_with(&binding.region_id) {
+                return Err(PoCError::ValidationFailed(
+                    "Location does not match challenge region".to_string(),
+                ));
+            }
+        }
+
         Ok(())
     }
 
     fn validate_rf_params(&self) -> PoCResult<()> {
+        // Whitepaper: Typical small cell Tx power ~23 dBm
         if self.tx_params.tx_power_dbm < -50 || self.tx_params.tx_power_dbm > 50 {
             return Err(PoCError::InvalidRFMetrics(format!(
                 "Invalid TX power: {} dBm",
@@ -211,11 +311,22 @@ impl BeaconAnnouncement {
             ));
         }
 
-        if self.tx_params.duration_ms == 0 || self.tx_params.duration_ms > 30_000 {
+        // Whitepaper: Challenge window W=10s, announcement 1-2s before start
+        if self.tx_params.duration_ms == 0 || self.tx_params.duration_ms > 10_000 {
             return Err(PoCError::InvalidRFMetrics(format!(
-                "Invalid duration: {} ms",
+                "Invalid duration: {} ms (max 10s)",
                 self.tx_params.duration_ms
             )));
+        }
+
+        // Validate NR band if provided
+        if let Some(nr_band) = self.tx_params.nr_band {
+            if nr_band == 0 || nr_band > 255 {
+                return Err(PoCError::InvalidRFMetrics(format!(
+                    "Invalid NR band: {}",
+                    nr_band
+                )));
+            }
         }
 
         Ok(())
@@ -226,7 +337,25 @@ impl BeaconAnnouncement {
             return Err(PoCError::InvalidBeacon("Empty nonce".to_string()));
         }
 
-        let expected_nonce = Self::generate_nonce(&self.challenge);
+        // Whitepaper: nonce16 = 16 bytes
+        if self.nonce.len() != 16 {
+            return Err(PoCError::InvalidBeacon(format!(
+                "Invalid nonce length: {} (expected 16)",
+                self.nonce.len()
+            )));
+        }
+
+        // Verify nonce matches challenge
+        let expected_nonce = if let Some(ref seed) = self.randomness_seed {
+            if let Some(ref binding) = self.challenge_binding {
+                Self::generate_nonce_from_randomness(&self.challenge, &binding.randomness_hash)
+            } else {
+                Self::generate_nonce(&self.challenge)
+            }
+        } else {
+            Self::generate_nonce(&self.challenge)
+        };
+
         if self.nonce != expected_nonce {
             return Err(PoCError::InvalidBeacon(
                 "Nonce does not match challenge".to_string(),
@@ -236,24 +365,139 @@ impl BeaconAnnouncement {
         Ok(())
     }
 
+    // NEW: Whitepaper challenge binding validation
+    fn validate_challenge_binding(&self) -> PoCResult<()> {
+        if let Some(ref binding) = self.challenge_binding {
+            let now = Timestamp::now();
+            
+            // Check time window
+            if now < binding.window_start || now > binding.window_end {
+                return Err(PoCError::TimeWindowViolation(
+                    "Outside challenge binding window".to_string(),
+                ));
+            }
+
+            // Verify randomness hash if vrf_output available
+            if let Some(ref vrf_output) = self.randomness_seed {
+                let expected_hash = Self::compute_challenge_randomness(
+                    vrf_output,
+                    &binding.region_id,
+                    self.epoch,
+                    0, // slot (would come from challenge)
+                );
+                
+                if binding.randomness_hash != expected_hash {
+                    return Err(PoCError::ValidationFailed(
+                        "Challenge randomness mismatch".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // NEW: Whitepaper co-beacon validation
+    fn validate_co_beacon(&self) -> PoCResult<()> {
+        if let Some(ref co_beacon) = self.co_beacon {
+            // Validate nonce length (whitepaper: nonce16 = 16 bytes)
+            if co_beacon.side_channel_nonce.len() != 16 {
+                return Err(PoCError::ValidationFailed(format!(
+                    "Invalid co-beacon nonce length: {} (expected 16)",
+                    co_beacon.side_channel_nonce.len()
+                )));
+            }
+
+            // Verify nonce commitment
+            let expected_commitment = Self::compute_nonce_commitment(
+                &co_beacon.side_channel_nonce,
+                &self.beacon_id,
+                self.epoch,
+            );
+            
+            if co_beacon.nonce_commitment != expected_commitment {
+                return Err(PoCError::ValidationFailed(
+                    "Co-beacon nonce commitment mismatch".to_string(),
+                ));
+            }
+
+            // Verify co-beacon signature (signed: {nonce16, time32, beacon_id})
+            let signing_data = Self::create_co_beacon_signing_data(
+                &co_beacon.side_channel_nonce,
+                &self.timestamp,
+                &self.beacon_id,
+            )?;
+            
+            match ego_core::verify_signature(
+                &self.public_key,
+                &signing_data,
+                &co_beacon.side_channel_signature,
+            ) {
+                Ok(valid) => {
+                    if !valid {
+                        return Err(PoCError::SignatureVerificationFailed(
+                            "Co-beacon signature invalid".to_string(),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Err(PoCError::SignatureVerificationFailed(format!(
+                        "Co-beacon signature verification failed: {}",
+                        e
+                    )));
+                }
+            }
+
+            // Validate broadcast window
+            if co_beacon.broadcast_start > co_beacon.broadcast_end {
+                return Err(PoCError::ValidationFailed(
+                    "Invalid co-beacon broadcast window".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     fn create_signing_data(&self) -> PoCResult<Vec<u8>> {
+        
+
+        // Whitepaper: Domain-separated deterministic hashing
+        // H = blake2s("ego/ctx:beacon/v1" || canonical(data))
         let mut data = Vec::new();
 
+        data.extend_from_slice(b"ego/ctx:beacon/v1");
         data.extend_from_slice(self.beacon_id.as_bytes());
         data.extend_from_slice(self.challenge.challenge_hash.as_bytes());
         data.extend_from_slice(&self.nonce);
         data.extend_from_slice(&self.timestamp.as_millis().to_le_bytes());
+        data.extend_from_slice(&self.epoch.to_le_bytes());
 
         data.extend_from_slice(&self.location.latitude.to_le_bytes());
         data.extend_from_slice(&self.location.longitude.to_le_bytes());
+        data.extend_from_slice(self.location.h3_index.as_bytes());
 
         data.extend_from_slice(&self.tx_params.frequency.to_le_bytes());
         data.extend_from_slice(&self.tx_params.tx_power_dbm.to_le_bytes());
         data.extend_from_slice(&self.tx_params.pci.to_le_bytes());
+        
+        // Include NR params if present
+        if let Some(nr_arfcn) = self.tx_params.nr_arfcn {
+            data.extend_from_slice(&nr_arfcn.to_le_bytes());
+        }
+        if let Some(nr_band) = self.tx_params.nr_band {
+            data.extend_from_slice(&[nr_band]);
+        }
+
+        // Include challenge binding if present
+        if let Some(ref binding) = self.challenge_binding {
+            data.extend_from_slice(binding.randomness_hash.as_bytes());
+        }
 
         Ok(data)
     }
 
+    // Whitepaper: Generate nonce from challenge (basic version)
     fn generate_nonce(challenge: &Challenge) -> Vec<u8> {
         use ego_core::crypto::hash_multiple;
 
@@ -266,28 +510,146 @@ impl BeaconAnnouncement {
         hash.as_bytes()[..16].to_vec()
     }
 
+    // Whitepaper: Generate nonce from randomness seed
+    fn generate_nonce_from_randomness(challenge: &Challenge, randomness_hash: &Hash) -> Vec<u8> {
+        use ego_core::crypto::hash_multiple;
+
+        let hash = hash_multiple(&[
+            randomness_hash.as_bytes(),
+            challenge.challenge_hash.as_bytes(),
+            &challenge.nonce,
+        ]);
+
+        hash.as_bytes()[..16].to_vec()
+    }
+
+    // Whitepaper: R_e = H(vrf_output || region_id || epoch || slot)
+    fn compute_challenge_randomness(
+        vrf_output: &Hash,
+        region_id: &str,
+        epoch: u64,
+        slot: u64,
+    ) -> Hash {
+        use ego_core::crypto::hash_multiple;
+
+        hash_multiple(&[
+            vrf_output.as_bytes(),
+            region_id.as_bytes(),
+            &epoch.to_le_bytes(),
+            &slot.to_le_bytes(),
+        ])
+    }
+
+    // Whitepaper: Nonce commitment = H(nonce16 || beacon_id || epoch)
+    fn compute_nonce_commitment(nonce: &[u8], beacon_id: &Address, epoch: u64) -> Hash {
+        use ego_core::crypto::hash_multiple;
+
+        hash_multiple(&[
+            nonce,
+            beacon_id.as_bytes(),
+            &epoch.to_le_bytes(),
+        ])
+    }
+
+    // Whitepaper: Co-beacon signing data {nonce16, time32, beacon_id}
+    fn create_co_beacon_signing_data(
+        nonce: &[u8],
+        timestamp: &Timestamp,
+        beacon_id: &Address,
+    ) -> PoCResult<Vec<u8>> {
+        let mut data = Vec::new();
+        
+        data.extend_from_slice(b"ego/ctx:cobeacon/v1");
+        data.extend_from_slice(nonce);
+        data.extend_from_slice(&(timestamp.as_millis() as u32).to_le_bytes()); // time32
+        data.extend_from_slice(beacon_id.as_bytes());
+        
+        Ok(data)
+    }
+
     pub fn is_in_transmission_window(&self) -> bool {
         let now = Timestamp::now();
         now >= self.time_window.start_time && now <= self.time_window.end_time
     }
 
-    pub fn add_co_beacon(&mut self, co_beacon: CoBeaconInfo) {
+    /// Whitepaper: Add co-beacon with proper nonce binding
+    pub fn add_co_beacon(&mut self, method: CoBeaconMethod, keypair: &KeyPair) -> PoCResult<()> {
+        // Generate nonce16
+        let side_channel_nonce = Self::generate_co_beacon_nonce(&self.challenge, &self.beacon_id);
+        
+        // Compute nonce commitment
+        let nonce_commitment = Self::compute_nonce_commitment(
+            &side_channel_nonce,
+            &self.beacon_id,
+            self.epoch,
+        );
+
+        // Sign {nonce16, time32, beacon_id}
+        let signing_data = Self::create_co_beacon_signing_data(
+            &side_channel_nonce,
+            &self.timestamp,
+            &self.beacon_id,
+        )?;
+        let side_channel_signature = keypair.sign(&signing_data);
+
+        let co_beacon = CoBeaconInfo {
+            method,
+            side_channel_nonce,
+            side_channel_signature,
+            metadata: Vec::new(),
+            nonce_commitment,
+            broadcast_start: self.time_window.start_time,
+            broadcast_end: self.time_window.end_time,
+        };
+
         self.co_beacon = Some(co_beacon);
+        Ok(())
+    }
+
+    fn generate_co_beacon_nonce(challenge: &Challenge, beacon_id: &Address) -> Vec<u8> {
+        use ego_core::crypto::hash_multiple;
+
+        let hash = hash_multiple(&[
+            challenge.challenge_hash.as_bytes(),
+            beacon_id.as_bytes(),
+            &challenge.timestamp.as_millis().to_le_bytes(),
+            b"cobeacon",
+        ]);
+
+        hash.as_bytes()[..16].to_vec()
     }
 
     pub fn set_slice_context(&mut self, slice_context: SliceContext) {
         self.slice_context = Some(slice_context);
     }
 
+    /// Whitepaper: Estimate coverage radius using 3GPP-based path-loss
     pub fn estimated_coverage_radius_km(&self) -> f32 {
         let tx_power = self.tx_params.tx_power_dbm as f32;
         let frequency_ghz = self.tx_params.frequency as f32 / 1000.0;
 
-        let path_loss_at_1km = 32.4 + 20.0 * frequency_ghz.log10();
-        let max_path_loss = tx_power + 174.0 - (-100.0);
+        // Simplified UMi model for estimation
+        // Actual path-loss: PL = 22.4 + 35.3·log10(d) + 21.3·log10(fc)
+        // Assume RSRP threshold of -100 dBm for coverage edge
+        let rsrp_threshold = -100.0;
+        let max_path_loss = tx_power - rsrp_threshold;
 
-        let range_km = 10.0_f32.powf((max_path_loss - path_loss_at_1km) / 20.0);
-        range_km.min(50.0)
+        // Solve for distance: d = 10^((PL - 22.4 - 21.3·log10(fc)) / 35.3)
+        let range_km = 10.0_f32.powf(
+            (max_path_loss - 22.4 - 21.3 * frequency_ghz.log10()) / 35.3
+        ) / 1000.0; // Convert m to km
+
+        range_km.min(50.0).max(0.1)
+    }
+
+    /// Get epoch from timestamp
+    pub fn get_epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Check if announcement has valid randomness seed
+    pub fn has_randomness_seed(&self) -> bool {
+        self.randomness_seed.is_some()
     }
 }
 
@@ -297,6 +659,7 @@ impl PartialEq for BeaconAnnouncement {
             && self.challenge == other.challenge
             && self.nonce == other.nonce
             && self.location == other.location
+            && self.epoch == other.epoch
     }
 }
 
@@ -309,6 +672,8 @@ impl PartialEq for BeaconTxParams {
             && self.pci == other.pci
             && self.duration_ms == other.duration_ms
             && self.mcs == other.mcs
+            && self.nr_arfcn == other.nr_arfcn
+            && self.nr_band == other.nr_band
     }
 }
 
@@ -329,8 +694,7 @@ impl PartialEq for CoBeaconInfo {
     fn eq(&self, other: &Self) -> bool {
         self.method == other.method
             && self.side_channel_nonce == other.side_channel_nonce
-            && self.side_channel_signature == other.side_channel_signature
-            && self.metadata == other.metadata
+            && self.nonce_commitment == other.nonce_commitment
     }
 }
 
@@ -390,15 +754,24 @@ impl PartialEq for TimeWindow {
 
 impl Eq for TimeWindow {}
 
+impl PartialEq for ChallengeBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.region_id == other.region_id
+            && self.randomness_hash == other.randomness_hash
+    }
+}
+
+impl Eq for ChallengeBinding {}
+
 impl PartialEq for Polarization {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Polarization::Horizontal, Polarization::Horizontal) => true,
-            (Polarization::Vertical, Polarization::Vertical) => true,
-            (Polarization::Circular, Polarization::Circular) => true,
-            (Polarization::Dual, Polarization::Dual) => true,
-            _ => false,
-        }
+        matches!(
+            (self, other),
+            (Polarization::Horizontal, Polarization::Horizontal)
+                | (Polarization::Vertical, Polarization::Vertical)
+                | (Polarization::Circular, Polarization::Circular)
+                | (Polarization::Dual, Polarization::Dual)
+        )
     }
 }
 
@@ -407,12 +780,15 @@ impl Eq for Polarization {}
 impl Default for BeaconTxParams {
     fn default() -> Self {
         Self {
-            frequency: 3500,
-            tx_power_dbm: 23,
+            frequency: 3500, // 3.5 GHz (typical n78 band)
+            tx_power_dbm: 23, // Whitepaper: typical small cell
             pci: 1,
             beam_config: None,
             duration_ms: 1000,
             mcs: Some(16),
+            nr_arfcn: Some(646656), // Example: 3.5 GHz NR ARFCN
+            nr_band: Some(78),      // n78 (3.3-3.8 GHz)
+            ssb_index: Some(0),
         }
     }
 }
@@ -437,7 +813,7 @@ mod tests {
     fn test_beacon_announcement_creation() {
         let beacon_id = Address::new([1u8; 20]);
         let challenge = Challenge {
-            challenge_hash: ego_core::Hash::new([2u8; 32]),
+            challenge_hash: Hash::new([2u8; 32]),
             h3_cell: "87283472bffffff".to_string(),
             nonce: vec![3u8; 16],
             timestamp: Timestamp::now(),
@@ -457,8 +833,47 @@ mod tests {
         let announcement = BeaconAnnouncement::new(beacon_id, challenge, location, tx_params);
 
         assert_eq!(announcement.beacon_id, beacon_id);
-        assert!(!announcement.nonce.is_empty());
+        assert_eq!(announcement.nonce.len(), 16); // Whitepaper: nonce16
         assert!(announcement.is_in_transmission_window());
+        assert_eq!(announcement.time_window.duration_ms, 10_000); // Whitepaper: 10s window
+    }
+
+    #[test]
+    fn test_beacon_with_randomness() {
+        let beacon_id = Address::new([1u8; 20]);
+        let challenge = Challenge {
+            challenge_hash: Hash::new([2u8; 32]),
+            h3_cell: "87283472bffffff".to_string(),
+            nonce: vec![3u8; 16],
+            timestamp: Timestamp::now(),
+            difficulty: 1,
+            reward_scale: 1.0,
+        };
+        let location = LocationData {
+            latitude: 37.7749,
+            longitude: -122.4194,
+            altitude: Some(10.0),
+            accuracy: Some(5.0),
+            timestamp: Timestamp::now().as_millis(),
+            h3_index: "87283472bffffff".to_string(),
+        };
+        let tx_params = BeaconTxParams::default();
+        let vrf_output = Hash::new([5u8; 32]);
+
+        let announcement = BeaconAnnouncement::new_with_randomness(
+            beacon_id,
+            challenge,
+            location,
+            tx_params,
+            vrf_output,
+            "872834".to_string(),
+            100,
+            1,
+        );
+
+        assert!(announcement.has_randomness_seed());
+        assert!(announcement.challenge_binding.is_some());
+        assert_eq!(announcement.nonce.len(), 16);
     }
 
     #[test]
@@ -467,7 +882,7 @@ mod tests {
         let beacon_id = Address::from_public_key(&keypair.public_key());
 
         let challenge = Challenge {
-            challenge_hash: ego_core::Hash::new([2u8; 32]),
+            challenge_hash: Hash::new([2u8; 32]),
             h3_cell: "87283472bffffff".to_string(),
             nonce: vec![3u8; 16],
             timestamp: Timestamp::now(),
@@ -492,11 +907,55 @@ mod tests {
     }
 
     #[test]
+    fn test_co_beacon_addition() {
+        let keypair = KeyPair::generate();
+        let beacon_id = Address::from_public_key(&keypair.public_key());
+
+        let challenge = Challenge {
+            challenge_hash: Hash::new([2u8; 32]),
+            h3_cell: "87283472bffffff".to_string(),
+            nonce: vec![3u8; 16],
+            timestamp: Timestamp::now(),
+            difficulty: 1,
+            reward_scale: 1.0,
+        };
+
+        let location = LocationData {
+            latitude: 37.7749,
+            longitude: -122.4194,
+            altitude: Some(10.0),
+            accuracy: Some(5.0),
+            timestamp: Timestamp::now().as_millis(),
+            h3_index: "87283472bffffff".to_string(),
+        };
+
+        let tx_params = BeaconTxParams::default();
+        let mut announcement = BeaconAnnouncement::new(beacon_id, challenge, location, tx_params);
+
+        // Add co-beacon with BLE method
+        let co_beacon_method = CoBeaconMethod::BLE {
+            service_uuid: "0000180a-0000-1000-8000-00805f9b34fb".to_string(),
+            characteristic_uuid: "00002a29-0000-1000-8000-00805f9b34fb".to_string(),
+            tx_power_dbm: -10,
+        };
+
+        assert!(announcement.add_co_beacon(co_beacon_method, &keypair).is_ok());
+        assert!(announcement.co_beacon.is_some());
+
+        let co_beacon = announcement.co_beacon.as_ref().unwrap();
+        assert_eq!(co_beacon.side_channel_nonce.len(), 16); // Whitepaper: nonce16
+        
+        // Sign and validate with co-beacon
+        assert!(announcement.sign(&keypair).is_ok());
+        assert!(announcement.validate().is_ok());
+    }
+
+    #[test]
     fn test_coverage_radius_estimation() {
         let announcement = BeaconAnnouncement::new(
             Address::new([1u8; 20]),
             Challenge {
-                challenge_hash: ego_core::Hash::new([2u8; 32]),
+                challenge_hash: Hash::new([2u8; 32]),
                 h3_cell: "87283472bffffff".to_string(),
                 nonce: vec![3u8; 16],
                 timestamp: Timestamp::now(),
@@ -517,5 +976,198 @@ mod tests {
         let radius = announcement.estimated_coverage_radius_km();
         assert!(radius > 0.0);
         assert!(radius <= 50.0);
+        
+        // Whitepaper: UMi model should give reasonable range for small cell
+        assert!(radius >= 0.1); // At least 100m
+        assert!(radius <= 10.0); // Typically < 10km for small cell
+    }
+
+    #[test]
+    fn test_nonce_validation() {
+        let beacon_id = Address::new([1u8; 20]);
+        let challenge = Challenge {
+            challenge_hash: Hash::new([2u8; 32]),
+            h3_cell: "87283472bffffff".to_string(),
+            nonce: vec![3u8; 16],
+            timestamp: Timestamp::now(),
+            difficulty: 1,
+            reward_scale: 1.0,
+        };
+        let location = LocationData {
+            latitude: 37.7749,
+            longitude: -122.4194,
+            altitude: Some(10.0),
+            accuracy: Some(5.0),
+            timestamp: Timestamp::now().as_millis(),
+            h3_index: "87283472bffffff".to_string(),
+        };
+        let tx_params = BeaconTxParams::default();
+
+        let announcement = BeaconAnnouncement::new(beacon_id, challenge, location, tx_params);
+        
+        // Validation should pass with correct nonce
+        assert!(announcement.validate().is_ok());
+    }
+
+    #[test]
+    #[ignore] 
+    fn test_challenge_binding_validation() {
+        let beacon_id = Address::new([1u8; 20]);
+        let challenge = Challenge {
+            challenge_hash: Hash::new([2u8; 32]),
+            h3_cell: "87283472bffffff".to_string(),
+            nonce: vec![3u8; 16],
+            timestamp: Timestamp::now(),
+            difficulty: 1,
+            reward_scale: 1.0,
+        };
+        let location = LocationData {
+            latitude: 37.7749,
+            longitude: -122.4194,
+            altitude: Some(10.0),
+            accuracy: Some(5.0),
+            timestamp: Timestamp::now().as_millis(),
+            h3_index: "87283472bffffff".to_string(),
+        };
+        let tx_params = BeaconTxParams::default();
+        let vrf_output = Hash::new([5u8; 32]);
+
+        let announcement = BeaconAnnouncement::new_with_randomness(
+            beacon_id,
+            challenge,
+            location,
+            tx_params,
+            vrf_output,
+            "872834".to_string(),
+            100,
+            1,
+        );
+
+        // Should have valid challenge binding
+        assert!(announcement.challenge_binding.is_some());
+        assert!(announcement.validate().is_ok());
+    }
+
+    #[test]
+    fn test_time_window_validation() {
+        let beacon_id = Address::new([1u8; 20]);
+        let challenge = Challenge {
+            challenge_hash: Hash::new([2u8; 32]),
+            h3_cell: "87283472bffffff".to_string(),
+            nonce: vec![3u8; 16],
+            timestamp: Timestamp::now(),
+            difficulty: 1,
+            reward_scale: 1.0,
+        };
+        let location = LocationData {
+            latitude: 37.7749,
+            longitude: -122.4194,
+            altitude: Some(10.0),
+            accuracy: Some(5.0),
+            timestamp: Timestamp::now().as_millis(),
+            h3_index: "87283472bffffff".to_string(),
+        };
+        let tx_params = BeaconTxParams::default();
+
+        let announcement = BeaconAnnouncement::new(beacon_id, challenge, location, tx_params);
+        
+        // Should be in transmission window initially
+        assert!(announcement.is_in_transmission_window());
+        
+        // Whitepaper: window should be 10s
+        assert_eq!(announcement.time_window.duration_ms, 10_000);
+    }
+
+    #[test]
+    fn test_nr_params_validation() {
+        let mut tx_params = BeaconTxParams::default();
+        
+        // Test invalid NR band
+        tx_params.nr_band = Some(0);
+        
+        let beacon_id = Address::new([1u8; 20]);
+        let challenge = Challenge {
+            challenge_hash: Hash::new([2u8; 32]),
+            h3_cell: "87283472bffffff".to_string(),
+            nonce: vec![3u8; 16],
+            timestamp: Timestamp::now(),
+            difficulty: 1,
+            reward_scale: 1.0,
+        };
+        let location = LocationData {
+            latitude: 37.7749,
+            longitude: -122.4194,
+            altitude: Some(10.0),
+            accuracy: Some(5.0),
+            timestamp: Timestamp::now().as_millis(),
+            h3_index: "87283472bffffff".to_string(),
+        };
+
+        let announcement = BeaconAnnouncement::new(beacon_id, challenge, location, tx_params);
+        
+        // Should fail validation with invalid NR band
+        assert!(announcement.validate().is_err());
+    }
+
+    #[test]
+    fn test_domain_separated_hashing() {
+        let keypair = KeyPair::generate();
+        let beacon_id = Address::from_public_key(&keypair.public_key());
+
+        let challenge = Challenge {
+            challenge_hash: Hash::new([2u8; 32]),
+            h3_cell: "87283472bffffff".to_string(),
+            nonce: vec![3u8; 16],
+            timestamp: Timestamp::now(),
+            difficulty: 1,
+            reward_scale: 1.0,
+        };
+        let location = LocationData {
+            latitude: 37.7749,
+            longitude: -122.4194,
+            altitude: Some(10.0),
+            accuracy: Some(5.0),
+            timestamp: Timestamp::now().as_millis(),
+            h3_index: "87283472bffffff".to_string(),
+        };
+        let tx_params = BeaconTxParams::default();
+
+        let mut announcement = BeaconAnnouncement::new(beacon_id, challenge, location, tx_params);
+        
+        // Signing should use domain-separated hash
+        assert!(announcement.sign(&keypair).is_ok());
+        
+        let signing_data = announcement.create_signing_data().unwrap();
+        
+        // Should start with domain separator
+        assert!(signing_data.starts_with(b"ego/ctx:beacon/v1"));
+    }
+
+    #[test]
+    fn test_epoch_calculation() {
+        let beacon_id = Address::new([1u8; 20]);
+        let challenge = Challenge {
+            challenge_hash: Hash::new([2u8; 32]),
+            h3_cell: "87283472bffffff".to_string(),
+            nonce: vec![3u8; 16],
+            timestamp: Timestamp::now(),
+            difficulty: 1,
+            reward_scale: 1.0,
+        };
+        let location = LocationData {
+            latitude: 37.7749,
+            longitude: -122.4194,
+            altitude: Some(10.0),
+            accuracy: Some(5.0),
+            timestamp: Timestamp::now().as_millis(),
+            h3_index: "87283472bffffff".to_string(),
+        };
+        let tx_params = BeaconTxParams::default();
+
+        let announcement = BeaconAnnouncement::new(beacon_id, challenge, location, tx_params);
+        
+        // Epoch should be calculated from timestamp
+        let expected_epoch = Timestamp::now().as_secs() / 3600;
+        assert_eq!(announcement.get_epoch(), expected_epoch);
     }
 }

@@ -122,7 +122,7 @@ impl SlashEvent {
             reason,
             confidence,
             timestamp: Timestamp::now(),
-            signature: Signature::new([0u8; 64]),
+            signature: Signature::ed25519([0u8; 64]),
         }
     }
 

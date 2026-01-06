@@ -1,8 +1,22 @@
 pub mod bundle;
 pub mod node;
+pub mod validation;
+pub mod dos_limits;
 
 pub use bundle::{PoCBundle, PoCEvent};
 pub use node::AggregatorNode;
+pub use validation::{
+    verify_witness_diversity,
+    verify_3gpp_path_loss,
+    calculate_deterministic_quality_score,
+    apply_density_penalty,
+    ValidationResult,
+};
+pub use dos_limits::{
+    RateLimiter,
+    DRSQuotaManager,
+    CellularSafeMode,
+};
 
 use crate::beacon::BeaconAnnouncement;
 use crate::error::PoCResult;
@@ -65,6 +79,15 @@ pub struct AggregatorMetrics {
     pub avg_witnesses_per_beacon: f32,
     pub fraud_reports_generated: u32,
     pub last_updated: Timestamp,
+    // Whitepaper additions for DRS metrics
+    pub path_loss_fit_failures: u32,
+    pub nonce_binding_failures: u32,
+    pub density_penalties_applied: u32,
+    pub dos_rate_limit_hits: u32,
+    pub avg_path_loss_rmse: f64,
+    pub avg_diversity_score: f64,
+    pub avg_nonce_binding_fraction: f64,
+    pub cellular_safe_mode_active: bool,
 }
 
 impl Default for AggregatorStatus {
@@ -99,6 +122,15 @@ impl Default for AggregatorMetrics {
             avg_witnesses_per_beacon: 0.0,
             fraud_reports_generated: 0,
             last_updated: Timestamp::now(),
+            // Whitepaper metrics
+            path_loss_fit_failures: 0,
+            nonce_binding_failures: 0,
+            density_penalties_applied: 0,
+            dos_rate_limit_hits: 0,
+            avg_path_loss_rmse: 0.0,
+            avg_diversity_score: 0.0,
+            avg_nonce_binding_fraction: 0.0,
+            cellular_safe_mode_active: false,
         }
     }
 }
@@ -179,6 +211,145 @@ impl WitnessSet {
     }
 }
 
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DensityEvent {
+    pub node_id: Address,
+    pub h3_cell: String,
+    pub device_count: u32,
+    pub ldm: f64,
+    pub evidence_root: Hash,
+    pub epoch: u64,
+    pub timestamp: Timestamp,
+}
+
+impl DensityEvent {
+    pub fn new(
+        node_id: Address,
+        h3_cell: String,
+        device_count: u32,
+        ldm: f64,
+        evidence_root: Hash,
+        epoch: u64,
+    ) -> Self {
+        Self {
+            node_id,
+            h3_cell,
+            device_count,
+            ldm,
+            evidence_root,
+            epoch,
+            timestamp: Timestamp::now(),
+        }
+    }
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyEvidenceRoot {
+    pub evidence_root: Hash,
+    pub bundle_count: u32,
+    pub date: String,
+    pub epoch: u64,
+    pub aggregator_id: Address,
+    pub aggregator_signature: ego_core::Signature,
+    pub timestamp: Timestamp,
+}
+
+impl DailyEvidenceRoot {
+    pub fn new(
+        evidence_root: Hash,
+        bundle_count: u32,
+        date: String,
+        epoch: u64,
+        aggregator_id: Address,
+    ) -> Self {
+        Self {
+            evidence_root,
+            bundle_count,
+            date,
+            epoch,
+            aggregator_id,
+            aggregator_signature: ego_core::Signature::ed25519([0u8; 64]), // Placeholder, sign later
+            timestamp: Timestamp::now(),
+        }
+    }
+
+    pub fn sign(&mut self, keypair: &ego_core::KeyPair) -> PoCResult<()> {
+        let signing_data = self.create_signing_data()?;
+        self.aggregator_signature = keypair.sign(&signing_data);
+        Ok(())
+    }
+
+    pub fn verify_signature(&self, public_key: &ego_core::PublicKey) -> PoCResult<bool> {
+        let signing_data = self.create_signing_data()?;
+        match ego_core::verify_signature(public_key, &signing_data, &self.aggregator_signature) {
+            Ok(valid) => Ok(valid),
+            Err(e) => Err(crate::error::PoCError::SignatureVerificationFailed(format!(
+                "Daily evidence root signature verification failed: {}",
+                e
+            ))),
+        }
+    }
+
+    fn create_signing_data(&self) -> PoCResult<Vec<u8>> {
+        let mut data = Vec::new();
+        data.extend_from_slice(self.evidence_root.as_bytes());
+        data.extend_from_slice(&self.bundle_count.to_le_bytes());
+        data.extend_from_slice(self.date.as_bytes());
+        data.extend_from_slice(&self.epoch.to_le_bytes());
+        data.extend_from_slice(self.aggregator_id.as_bytes());
+        data.extend_from_slice(&self.timestamp.as_millis().to_le_bytes());
+        Ok(data)
+    }
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoCFraudEvidence {
+    pub fraud_type: PoCFraudType,
+    pub beacon_hash: Hash,
+    pub bundle_id: Hash,
+    pub aggregator_id: Address,
+    pub epoch: u64,
+    pub evidence_data: Vec<u8>,
+    pub reporter_id: Address,
+    pub timestamp: Timestamp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PoCFraudType {
+    InvalidGeometry,
+    InvalidWitnessSet,
+    ReplayAttack,
+    InsufficientDiversity,
+    PathLossMismatch,
+    NonceBindingFailure,
+}
+
+impl PoCFraudEvidence {
+    pub fn new(
+        fraud_type: PoCFraudType,
+        beacon_hash: Hash,
+        bundle_id: Hash,
+        aggregator_id: Address,
+        epoch: u64,
+        evidence_data: Vec<u8>,
+        reporter_id: Address,
+    ) -> Self {
+        Self {
+            fraud_type,
+            beacon_hash,
+            bundle_id,
+            aggregator_id,
+            epoch,
+            evidence_data,
+            reporter_id,
+            timestamp: Timestamp::now(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +366,8 @@ mod tests {
         let metrics = AggregatorMetrics::default();
         assert_eq!(metrics.total_beacon_announcements, 0);
         assert_eq!(metrics.fraud_reports_generated, 0);
+        assert_eq!(metrics.path_loss_fit_failures, 0);
+        assert_eq!(metrics.nonce_binding_failures, 0);
     }
 
     #[test]
@@ -231,5 +404,56 @@ mod tests {
         let mut witness_set = WitnessSet::new(announcement, 10_000, 1);
 
         assert!(!witness_set.has_sufficient_co_beacon_coverage());
+    }
+
+    #[test]
+    fn test_density_event_creation() {
+        let event = DensityEvent::new(
+            Address::new([1u8; 20]),
+            "87283472bffffff".to_string(),
+            5,
+            0.6,
+            Hash::new([2u8; 32]),
+            100,
+        );
+
+        assert_eq!(event.device_count, 5);
+        assert_eq!(event.ldm, 0.6);
+        assert_eq!(event.epoch, 100);
+    }
+
+    #[test]
+    fn test_daily_evidence_root_signing() {
+        use ego_core::KeyPair;
+
+        let keypair = KeyPair::generate();
+        let aggregator_id = Address::from_public_key(&keypair.public_key());
+
+        let mut evidence_root = DailyEvidenceRoot::new(
+            Hash::new([1u8; 32]),
+            42,
+            "2025-11-15".to_string(),
+            100,
+            aggregator_id,
+        );
+
+        assert!(evidence_root.sign(&keypair).is_ok());
+        assert!(evidence_root.verify_signature(&keypair.public_key()).unwrap());
+    }
+
+    #[test]
+    fn test_poc_fraud_evidence_creation() {
+        let evidence = PoCFraudEvidence::new(
+            PoCFraudType::ReplayAttack,
+            Hash::new([1u8; 32]),
+            Hash::new([2u8; 32]),
+            Address::new([3u8; 20]),
+            100,
+            vec![1, 2, 3, 4],
+            Address::new([4u8; 20]),
+        );
+
+        assert!(matches!(evidence.fraud_type, PoCFraudType::ReplayAttack));
+        assert_eq!(evidence.epoch, 100);
     }
 }
