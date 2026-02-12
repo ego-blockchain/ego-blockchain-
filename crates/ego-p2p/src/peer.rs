@@ -9,6 +9,8 @@ pub struct PeerManager {
     peers: Arc<DashMap<PeerId, PeerInfo>>,
     max_peers: usize,
     reputation_threshold: f64,
+    dilithium_keys: Arc<DashMap<PeerId, Vec<u8>>>,
+    attestations: Arc<DashMap<PeerId, Vec<u8>>>,
 }
 
 impl PeerManager {
@@ -17,7 +19,14 @@ impl PeerManager {
             peers: Arc::new(DashMap::new()),
             max_peers,
             reputation_threshold: 0.3,
+            dilithium_keys: Arc::new(DashMap::new()),
+            attestations: Arc::new(DashMap::new()),
         }
+    }
+
+    pub fn with_reputation_threshold(mut self, threshold: f64) -> Self {
+        self.reputation_threshold = threshold.clamp(0.0, 1.0);
+        self
     }
 
     pub fn add_peer(&self, peer_id: PeerId) -> P2PResult<()> {
@@ -46,6 +55,8 @@ impl PeerManager {
 
     pub fn remove_peer(&self, peer_id: &PeerId) -> P2PResult<()> {
         self.peers.remove(peer_id);
+        self.dilithium_keys.remove(peer_id);
+        self.attestations.remove(peer_id);
         Ok(())
     }
 
@@ -63,6 +74,49 @@ impl PeerManager {
     pub fn update_identity(&self, peer_id: &PeerId, identity: NodeIdentity) {
         if let Some(mut entry) = self.peers.get_mut(peer_id) {
             entry.identity = Some(identity);
+        }
+    }
+
+    pub fn set_dilithium_key(&self, peer_id: &PeerId, public_key: Vec<u8>) -> P2PResult<()> {
+        if public_key.is_empty() {
+            return Err(P2PError::InvalidCapabilities(
+                "Dilithium key is empty".to_string(),
+            ));
+        }
+        self.dilithium_keys.insert(*peer_id, public_key);
+        Ok(())
+    }
+
+    pub fn get_dilithium_key(&self, peer_id: &PeerId) -> Option<Vec<u8>> {
+        self.dilithium_keys.get(peer_id).map(|entry| entry.clone())
+    }
+
+    pub fn set_attestation(&self, peer_id: &PeerId, attestation: Vec<u8>) -> P2PResult<()> {
+        if attestation.is_empty() {
+            return Err(P2PError::InvalidAttestation(
+                "Attestation is empty".to_string(),
+            ));
+        }
+        self.attestations.insert(*peer_id, attestation);
+        Ok(())
+    }
+
+    pub fn get_attestation(&self, peer_id: &PeerId) -> Option<Vec<u8>> {
+        self.attestations.get(peer_id).map(|entry| entry.clone())
+    }
+
+    pub fn verify_peer_attestation(&self, peer_id: &PeerId) -> P2PResult<bool> {
+        let attestation = self.get_attestation(peer_id);
+        let dilithium_key = self.get_dilithium_key(peer_id);
+
+        match (attestation, dilithium_key) {
+            (Some(att), Some(key)) => {
+                if att.is_empty() || key.is_empty() {
+                    return Ok(false);
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
         }
     }
 
@@ -136,6 +190,8 @@ impl PeerManager {
 
         for peer_id in to_remove {
             self.peers.remove(&peer_id);
+            self.dilithium_keys.remove(&peer_id);
+            self.attestations.remove(&peer_id);
         }
     }
 
@@ -165,5 +221,38 @@ impl PeerManager {
             })
             .map(|entry| entry.peer_id)
             .collect()
+    }
+
+    pub fn get_peers_with_capability(&self, capability: &str) -> Vec<PeerId> {
+        self.peers
+            .iter()
+            .filter(|entry| {
+                if let Some(ref identity) = entry.identity {
+                    identity
+                        .capabilities
+                        .protocols
+                        .contains(&capability.to_string())
+                } else {
+                    false
+                }
+            })
+            .map(|entry| entry.peer_id)
+            .collect()
+    }
+
+    pub fn ban_peer(&self, peer_id: &PeerId) {
+        self.adjust_reputation(peer_id, -1.0);
+    }
+
+    pub fn get_banned_peers(&self) -> Vec<PeerId> {
+        self.peers
+            .iter()
+            .filter(|entry| entry.reputation_score <= 0.0)
+            .map(|entry| entry.peer_id)
+            .collect()
+    }
+
+    pub fn is_peer_banned(&self, peer_id: &PeerId) -> bool {
+        self.get_reputation(peer_id) <= 0.0
     }
 }
