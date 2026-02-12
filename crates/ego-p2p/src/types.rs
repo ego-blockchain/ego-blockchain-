@@ -12,19 +12,42 @@ pub struct NodeIdentity {
     pub created_at: Timestamp,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct NodeCapabilities {
     pub roles: Vec<String>,
     pub shard_ids: Vec<u32>,
     pub supported_protocols: Vec<String>,
+    pub protocols: Vec<String>,
     pub max_bandwidth_bps: u64,
     pub storage_capacity_bytes: u64,
     pub is_5g_capable: bool,
     pub slice_ids: Vec<String>,
     pub geohash: Option<String>,
+    pub is_validator: bool,
+    pub is_storage_provider: bool,
+    pub is_gateway: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Default for NodeCapabilities {
+    fn default() -> Self {
+        Self {
+            roles: Vec::new(),
+            shard_ids: Vec::new(),
+            supported_protocols: Vec::new(),
+            protocols: Vec::new(),
+            max_bandwidth_bps: 0,
+            storage_capacity_bytes: 0,
+            is_5g_capable: false,
+            slice_ids: Vec::new(),
+            geohash: None,
+            is_validator: false,
+            is_storage_provider: false,
+            is_gateway: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub enum P2PMessage {
     Transaction(TransactionMessage),
     Block(BlockMessage),
@@ -34,7 +57,7 @@ pub enum P2PMessage {
     Identify(IdentifyMessage),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct TransactionMessage {
     pub tx_hash: Hash,
     pub shard_id: ShardId,
@@ -42,7 +65,7 @@ pub struct TransactionMessage {
     pub timestamp: Timestamp,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct BlockMessage {
     pub block_hash: Hash,
     pub height: u64,
@@ -51,7 +74,7 @@ pub struct BlockMessage {
     pub timestamp: Timestamp,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct ProofMessage {
     pub proof_type: ProofType,
     pub prover: Address,
@@ -59,14 +82,14 @@ pub struct ProofMessage {
     pub timestamp: Timestamp,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub enum ProofType {
     PoSt,
     PoC,
     PoRep,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct SyncMessage {
     pub sync_type: SyncType,
     pub from_height: u64,
@@ -74,14 +97,14 @@ pub struct SyncMessage {
     pub shard_id: ShardId,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub enum SyncType {
     Headers,
     Blocks,
     State,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct CrossShardMessage {
     pub source_shard: ShardId,
     pub target_shard: ShardId,
@@ -90,7 +113,7 @@ pub struct CrossShardMessage {
     pub timestamp: Timestamp,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct IdentifyMessage {
     pub listen_addrs: Vec<String>,
     pub protocols: Vec<String>,
@@ -135,10 +158,11 @@ pub struct TopicInfo {
     pub created_at: Timestamp,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct NetworkStats {
     pub total_peers: usize,
     pub connected_peers: usize,
+    pub gossipsub_peers: usize,
     pub total_messages_sent: u64,
     pub total_messages_received: u64,
     pub total_bytes_sent: u64,

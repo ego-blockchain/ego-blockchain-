@@ -21,7 +21,6 @@ impl TopicManager {
         if self.topics.contains_key(&name) {
             return Ok(());
         }
-
         let topic_info = TopicInfo {
             name: name.clone(),
             shard_id,
@@ -29,16 +28,13 @@ impl TopicManager {
             message_count: 0,
             created_at: Timestamp::now(),
         };
-
         self.topics.insert(name.clone(), topic_info);
-
         if let Some(shard) = shard_id {
             self.shard_topics
                 .entry(shard.as_u32())
                 .or_insert_with(Vec::new)
                 .push(name);
         }
-
         Ok(())
     }
 
@@ -93,6 +89,20 @@ impl TopicManager {
     pub fn create_ident_topic(name: &str) -> IdentTopic {
         IdentTopic::new(name)
     }
+
+    pub fn get_message_count(&self, topic_name: &str) -> u64 {
+        self.topics
+            .get(topic_name)
+            .map(|entry| entry.message_count)
+            .unwrap_or(0)
+    }
+
+    pub fn get_subscriber_count(&self, topic_name: &str) -> usize {
+        self.topics
+            .get(topic_name)
+            .map(|entry| entry.subscriber_count)
+            .unwrap_or(0)
+    }
 }
 
 impl Default for TopicManager {
@@ -103,15 +113,12 @@ impl Default for TopicManager {
 
 pub fn get_standard_topics(shard_ids: &[u32]) -> Vec<(String, Option<ShardId>)> {
     let mut topics = Vec::new();
-
     topics.push(("ego/global/finality".to_string(), None));
     topics.push(("ego/global/consensus".to_string(), None));
     topics.push(("ego/global/storage".to_string(), None));
     topics.push(("ego/global/rollup".to_string(), None));
-
     for &shard_id in shard_ids {
         let shard = ShardId::new(shard_id).ok();
-
         topics.push((
             TopicManager::build_topic_name("ego", Some(shard_id), "tx"),
             shard,
@@ -133,6 +140,5 @@ pub fn get_standard_topics(shard_ids: &[u32]) -> Vec<(String, Option<ShardId>)> 
             shard,
         ));
     }
-
     topics
 }
