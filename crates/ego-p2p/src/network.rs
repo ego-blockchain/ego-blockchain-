@@ -1,25 +1,63 @@
 use crate::{
-    P2PError, P2PMessage, P2PResult, behaviour::EgoBehaviour, config::NetworkConfig,
-    peer::PeerManager, topic::TopicManager,
+    NetworkMetrics, P2PError, P2PMessage, P2PResult, behaviour::EgoBehaviour,
+    config::NetworkConfig, discovery::DiscoveryManager, peer::PeerManager, topic::TopicManager,
 };
 use ego_core::{Address, KeyPair, ShardId};
 use libp2p::{
     Multiaddr, PeerId, Swarm, Transport, core::upgrade::Version, gossipsub::IdentTopic, identity,
-    noise, yamux,
+    kad, noise, yamux,
 };
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tracing::{debug, info};
+
+pub struct PublishQueue {
+    queue: VecDeque<(String, P2PMessage)>,
+    max_size: usize,
+}
+
+impl PublishQueue {
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            queue: VecDeque::with_capacity(max_size),
+            max_size,
+        }
+    }
+
+    pub fn enqueue(&mut self, topic: String, message: P2PMessage) -> Result<(), ()> {
+        if self.queue.len() >= self.max_size {
+            return Err(());
+        }
+        self.queue.push_back((topic, message));
+        Ok(())
+    }
+
+    pub fn dequeue(&mut self) -> Option<(String, P2PMessage)> {
+        self.queue.pop_front()
+    }
+
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+}
 
 pub struct NetworkManager {
     pub swarm: Swarm<EgoBehaviour>,
     pub peer_manager: Arc<PeerManager>,
     pub topic_manager: Arc<TopicManager>,
+    pub discovery_manager: Arc<DiscoveryManager>,
     pub config: NetworkConfig,
     pub keypair: KeyPair,
     pub peer_id: PeerId,
     pub address: Address,
     pub shard_ids: Vec<u32>,
     pub started: bool,
+    pub metrics: Arc<NetworkMetrics>,
+    pub publish_queues: Arc<dashmap::DashMap<String, PublishQueue>>,
 }
 
 impl NetworkManager {
@@ -28,6 +66,8 @@ impl NetworkManager {
         config: NetworkConfig,
         shard_ids: Vec<u32>,
     ) -> P2PResult<Self> {
+        config.validate()?;
+
         let libp2p_keypair = Self::create_libp2p_keypair(&keypair)?;
         let peer_id = PeerId::from_public_key(&libp2p_keypair.public());
         let address = Address::from_public_key(&keypair.ed25519_public_key());
@@ -50,6 +90,9 @@ impl NetworkManager {
 
         let peer_manager = Arc::new(PeerManager::new(config.max_peers));
         let topic_manager = Arc::new(TopicManager::new());
+        let discovery_manager = Arc::new(DiscoveryManager::new(config.max_peers));
+        let metrics = Arc::new(NetworkMetrics::new());
+        let publish_queues = Arc::new(dashmap::DashMap::new());
 
         info!("Network manager created with peer_id: {}", peer_id);
 
@@ -57,12 +100,15 @@ impl NetworkManager {
             swarm,
             peer_manager,
             topic_manager,
+            discovery_manager,
             config,
             keypair,
             peer_id,
             address,
             shard_ids,
             started: false,
+            metrics,
+            publish_queues,
         })
     }
 
@@ -123,6 +169,11 @@ impl NetworkManager {
                 .subscribe(&topic)
                 .map_err(|e| P2PError::TopicError(format!("Subscribe failed: {}", e)))?;
 
+            self.publish_queues.insert(
+                topic_name.clone(),
+                PublishQueue::new(self.config.publish_queue_size),
+            );
+
             debug!("Subscribed to topic: {}", topic_name);
         }
 
@@ -142,11 +193,13 @@ impl NetworkManager {
 
             self.peer_manager.add_peer(peer_id)?;
 
+            let _ = self.swarm.behaviour_mut().kademlia.bootstrap();
+
             self.swarm.dial(addr.clone()).map_err(|e| {
                 P2PError::ConnectionError(format!("Failed to dial {}: {}", addr, e))
             })?;
 
-            info!("Added bootstrap peer: {}", addr);
+            info!("Added bootstrap peer and initiated bootstrap: {}", addr);
         }
 
         Ok(())
@@ -154,16 +207,83 @@ impl NetworkManager {
 
     pub async fn publish_message(&mut self, topic: &str, message: P2PMessage) -> P2PResult<()> {
         let encoded = crate::codec::MessageCodec::encode(&message)?;
-
         let gossip_topic = IdentTopic::new(topic);
+
+        let peer_count = self
+            .swarm
+            .behaviour()
+            .gossipsub
+            .mesh_peers(&gossip_topic.hash())
+            .count();
+
+        if peer_count == 0 {
+            if let Some(mut queue) = self.publish_queues.get_mut(topic) {
+                if queue.enqueue(topic.to_string(), message).is_ok() {
+                    info!("Message queued for topic {} (no peers)", topic);
+                    self.metrics.set_publish_queue_length(queue.len());
+                    return Ok(());
+                } else {
+                    return Err(P2PError::QueueFullError(format!(
+                        "Publish queue full for topic {}",
+                        topic
+                    )));
+                }
+            }
+        }
+
         self.swarm
             .behaviour_mut()
             .gossipsub
-            .publish(gossip_topic, encoded)
+            .publish(gossip_topic, encoded.clone())
             .map_err(|e| P2PError::NetworkError(format!("Publish failed: {}", e)))?;
 
         self.topic_manager.increment_message_count(topic);
+        self.metrics.increment_messages_sent();
+        self.metrics.add_bytes_sent(encoded.len() as u64);
+        self.metrics
+            .add_topic_bandwidth_out(topic.to_string(), encoded.len() as u64);
+
         debug!("Published message to topic: {}", topic);
+        Ok(())
+    }
+
+    pub async fn process_publish_queues(&mut self) -> P2PResult<()> {
+        let topics: Vec<String> = self
+            .publish_queues
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for topic in topics {
+            let gossip_topic = IdentTopic::new(&topic);
+            let peer_count = self
+                .swarm
+                .behaviour()
+                .gossipsub
+                .mesh_peers(&gossip_topic.hash())
+                .count();
+
+            if peer_count > 0 {
+                if let Some(mut queue) = self.publish_queues.get_mut(&topic) {
+                    while let Some((_, message)) = queue.dequeue() {
+                        let encoded = crate::codec::MessageCodec::encode(&message)?;
+                        self.swarm
+                            .behaviour_mut()
+                            .gossipsub
+                            .publish(gossip_topic.clone(), encoded.clone())
+                            .map_err(|e| {
+                                P2PError::NetworkError(format!("Publish failed: {}", e))
+                            })?;
+
+                        self.metrics.increment_messages_sent();
+                        self.metrics.add_bytes_sent(encoded.len() as u64);
+                        info!("Dequeued and published message to topic {}", topic);
+                    }
+                    self.metrics.set_publish_queue_length(queue.len());
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -175,6 +295,51 @@ impl NetworkManager {
     ) -> P2PResult<()> {
         let topic = TopicManager::build_topic_name("ego", Some(shard_id.as_u32()), message_type);
         self.publish_message(&topic, message).await
+    }
+
+    pub async fn start_providing_evidence(&mut self, cid: Vec<u8>) -> P2PResult<()> {
+        let key = DiscoveryManager::evidence_record_key(&cid);
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .start_providing(key)
+            .map_err(|e| P2PError::DhtError(format!("Failed to start providing: {:?}", e)))?;
+        info!("Started providing evidence for CID: {:?}", cid);
+        Ok(())
+    }
+
+    pub async fn start_providing_da(
+        &mut self,
+        blob_id: Vec<u8>,
+        chunk_index: u64,
+    ) -> P2PResult<()> {
+        let key = DiscoveryManager::da_record_key(&blob_id, chunk_index);
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .start_providing(key)
+            .map_err(|e| P2PError::DhtError(format!("Failed to start providing: {:?}", e)))?;
+        info!(
+            "Started providing DA for blob: {:?}, chunk: {}",
+            blob_id, chunk_index
+        );
+        Ok(())
+    }
+
+    pub async fn find_evidence_providers(&mut self, cid: Vec<u8>) -> P2PResult<kad::QueryId> {
+        let key = DiscoveryManager::evidence_record_key(&cid);
+        let query_id = self.swarm.behaviour_mut().kademlia.get_providers(key);
+        Ok(query_id)
+    }
+
+    pub async fn find_da_providers(
+        &mut self,
+        blob_id: Vec<u8>,
+        chunk_index: u64,
+    ) -> P2PResult<kad::QueryId> {
+        let key = DiscoveryManager::da_record_key(&blob_id, chunk_index);
+        let query_id = self.swarm.behaviour_mut().kademlia.get_providers(key);
+        Ok(query_id)
     }
 
     pub fn peer_id(&self) -> PeerId {
@@ -193,6 +358,14 @@ impl NetworkManager {
         self.topic_manager.clone()
     }
 
+    pub fn discovery_manager(&self) -> Arc<DiscoveryManager> {
+        self.discovery_manager.clone()
+    }
+
+    pub fn metrics(&self) -> Arc<NetworkMetrics> {
+        self.metrics.clone()
+    }
+
     pub fn connected_peers(&self) -> Vec<PeerId> {
         self.swarm.connected_peers().copied().collect()
     }
@@ -202,15 +375,50 @@ impl NetworkManager {
     }
 
     pub fn get_network_stats(&self) -> crate::NetworkStats {
+        let connected = self.swarm.connected_peers().count();
+        let gossipsub_peers = self.swarm.behaviour().gossipsub.all_peers().count();
+
+        self.metrics.set_connected_peers(connected);
+
         crate::NetworkStats {
             total_peers: self.peer_manager.get_all_peers().len(),
-            connected_peers: self.peer_manager.count_connected_peers(),
-            total_messages_sent: 0,
-            total_messages_received: 0,
-            total_bytes_sent: 0,
-            total_bytes_received: 0,
+            connected_peers: connected,
+            gossipsub_peers,
+            total_messages_sent: self
+                .metrics
+                .messages_sent
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_messages_received: self
+                .metrics
+                .messages_received
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_bytes_sent: self
+                .metrics
+                .bytes_sent
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_bytes_received: self
+                .metrics
+                .bytes_received
+                .load(std::sync::atomic::Ordering::Relaxed),
             active_topics: self.topic_manager.get_all_topics().len(),
             uptime_seconds: 0,
         }
+    }
+
+    pub fn get_topic_peer_counts(&self) -> Vec<(String, usize)> {
+        let mut counts = Vec::new();
+        for topic_info in self.topic_manager.get_all_topics() {
+            let topic = IdentTopic::new(&topic_info.name);
+            let count = self
+                .swarm
+                .behaviour()
+                .gossipsub
+                .mesh_peers(&topic.hash())
+                .count();
+            self.metrics
+                .set_topic_peer_count(topic_info.name.clone(), count);
+            counts.push((topic_info.name, count));
+        }
+        counts
     }
 }
