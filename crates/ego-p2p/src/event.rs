@@ -1,5 +1,6 @@
 use crate::P2PMessage;
-use libp2p::{Multiaddr, PeerId, autonat, gossipsub, identify, kad, mdns, ping};
+use crate::behaviour::{DaRequest, DaResponse, EvidenceRequest, EvidenceResponse};
+use libp2p::{Multiaddr, PeerId, autonat, gossipsub, identify, kad, mdns, ping, request_response};
 
 #[derive(Debug)]
 pub enum NetworkEvent {
@@ -82,6 +83,16 @@ pub enum NetworkEvent {
     KademliaGetRecord {
         key: Vec<u8>,
     },
+    KademliaStartProviding {
+        key: Vec<u8>,
+    },
+    KademliaStopProviding {
+        key: Vec<u8>,
+    },
+    KademliaProviderFound {
+        key: Vec<u8>,
+        providers: Vec<PeerId>,
+    },
     MdnsDiscovered {
         peer_id: PeerId,
         addresses: Vec<Multiaddr>,
@@ -89,6 +100,62 @@ pub enum NetworkEvent {
     MdnsExpired {
         peer_id: PeerId,
         addresses: Vec<Multiaddr>,
+    },
+    DaRequest {
+        peer_id: PeerId,
+        request_id: request_response::InboundRequestId,
+        request: DaRequest,
+    },
+    DaResponse {
+        peer_id: PeerId,
+        request_id: request_response::OutboundRequestId,
+        response: DaResponse,
+    },
+    DaRequestFailed {
+        peer_id: PeerId,
+        request_id: request_response::OutboundRequestId,
+        error: String,
+    },
+    EvidenceRequest {
+        peer_id: PeerId,
+        request_id: request_response::InboundRequestId,
+        request: EvidenceRequest,
+    },
+    EvidenceResponse {
+        peer_id: PeerId,
+        request_id: request_response::OutboundRequestId,
+        response: EvidenceResponse,
+    },
+    EvidenceRequestFailed {
+        peer_id: PeerId,
+        request_id: request_response::OutboundRequestId,
+        error: String,
+    },
+    MessageValidated {
+        peer_id: PeerId,
+        message_id: gossipsub::MessageId,
+        accepted: bool,
+        reason: Option<String>,
+    },
+    IdentifyHandshakeFailed {
+        peer_id: PeerId,
+        reason: String,
+    },
+    PublishQueued {
+        topic: String,
+        queue_size: usize,
+    },
+    PublishDequeued {
+        topic: String,
+        queue_size: usize,
+    },
+    BackpressureActivated {
+        topic: String,
+        queue_size: usize,
+    },
+    BackpressureDeactivated {
+        topic: String,
+        queue_size: usize,
     },
 }
 
@@ -150,6 +217,30 @@ impl EventHandler {
     pub fn handle_kademlia_event(&self, event: kad::Event) {
         match event {
             kad::Event::OutboundQueryProgressed { id, result, .. } => {
+                match &result {
+                    kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders {
+                        key,
+                        providers,
+                        ..
+                    })) => {
+                        self.emit(NetworkEvent::KademliaProviderFound {
+                            key: key.to_vec(),
+                            providers: providers.iter().copied().collect(),
+                        });
+                    }
+                    kad::QueryResult::StartProviding(Ok(kad::AddProviderOk { key })) => {
+                        self.emit(NetworkEvent::KademliaStartProviding { key: key.to_vec() });
+                    }
+                    kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(record))) => {
+                        self.emit(NetworkEvent::KademliaGetRecord {
+                            key: record.record.key.to_vec(),
+                        });
+                    }
+                    kad::QueryResult::PutRecord(Ok(kad::PutRecordOk { key })) => {
+                        self.emit(NetworkEvent::KademliaPutRecord { key: key.to_vec() });
+                    }
+                    _ => {}
+                }
                 self.emit(NetworkEvent::KademliaQueryResult {
                     query_id: id,
                     result,
@@ -215,5 +306,40 @@ impl EventHandler {
             }
             _ => {}
         }
+    }
+
+    pub fn emit_message_validated(
+        &self,
+        peer_id: PeerId,
+        message_id: gossipsub::MessageId,
+        accepted: bool,
+        reason: Option<String>,
+    ) {
+        self.emit(NetworkEvent::MessageValidated {
+            peer_id,
+            message_id,
+            accepted,
+            reason,
+        });
+    }
+
+    pub fn emit_identify_handshake_failed(&self, peer_id: PeerId, reason: String) {
+        self.emit(NetworkEvent::IdentifyHandshakeFailed { peer_id, reason });
+    }
+
+    pub fn emit_publish_queued(&self, topic: String, queue_size: usize) {
+        self.emit(NetworkEvent::PublishQueued { topic, queue_size });
+    }
+
+    pub fn emit_publish_dequeued(&self, topic: String, queue_size: usize) {
+        self.emit(NetworkEvent::PublishDequeued { topic, queue_size });
+    }
+
+    pub fn emit_backpressure_activated(&self, topic: String, queue_size: usize) {
+        self.emit(NetworkEvent::BackpressureActivated { topic, queue_size });
+    }
+
+    pub fn emit_backpressure_deactivated(&self, topic: String, queue_size: usize) {
+        self.emit(NetworkEvent::BackpressureDeactivated { topic, queue_size });
     }
 }
