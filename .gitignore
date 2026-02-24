@@ -52,3 +52,4 @@ docs/
 node_data_*
 start_node*
 manage_node*
+services/erlang/erl_bridge/_build

@@ -1,14 +1,56 @@
-{application, erl_bridge, [
-    {description, "An OTP application"},
-    {vsn, "0.1.0"},
-    {registered, []},
-    {mod, {erl_bridge_app, []}},
-    {applications, [
-        kernel,
-        stdlib
-    ]},
-    {env, []},
-    {modules, []},
-    {licenses, ["Apache-2.0"]},
-    {links, []}
- ]}.
+{application, erl_bridge,
+ [
+  {description,  "ERL Bridge - Erlang BFT Consensus Service for Ego Blockchain"},
+  {vsn,          "0.2.0"},
+  {registered, [
+      erl_bridge_sup,
+      sbft_event_bus,
+      sbft_nif_server,
+      sbft_validator_manager,
+      sbft_slashing,
+      sbft_cross_shard,
+      sbft_consensus_manager,
+      sbft_rust_bridge
+  ]},
+  {mod, {erl_bridge_app, []}},
+  {applications, [
+      kernel,
+      stdlib,
+      crypto,
+      sasl
+  ]},
+  {env, [
+      {rust_bridge_enabled,       false},
+      {rust_bridge_transport,     tcp},
+      {rust_bridge_host,          "127.0.0.1"},
+      {rust_bridge_port,          14777},
+      {rust_bridge_socket_path,   "/tmp/ego_sbft_bridge.sock"},
+      {pqc_enabled,               true},
+      {sig_algorithm,             dilithium2},
+      {consensus_timeout_ms,      3000},
+      {view_change_timeout_ms,    6000},
+      {min_validators_per_shard,  4},
+      {max_validators_per_shard,  100},
+      {demo_mode,                 false},
+      {node_id,                   undefined},
+      {log_level,                 info}
+  ]},
+  {modules, [
+      erl_bridge_app,
+      erl_bridge_sup,
+      sbft_consensus_manager,
+      sbft_shard_consensus,
+      sbft_validator_manager,
+      sbft_cross_shard,
+      sbft_slashing,
+      sbft_event_bus,
+      sbft_rust_bridge,
+      sbft_crypto,
+      sbft_nif,
+      sbft_nif_server,
+      sbft_helper
+  ]},
+  {licenses,  ["Apache-2.0"]},
+  {links,     [{"GitHub", "https://github.com/ego-blockchain"}]}
+ ]
+}.
