@@ -1,391 +1,237 @@
-use super::{PoStEvent, PoStProof, PoStResult, WindowSchedule};
+// post/verifier.rs
+use super::{PartitionProof, PoStEvent, PoStMetrics, PoStProof, PoStResult, PoStWindow};
 use crate::error::{PoCError, PoCResult};
 use ego_core::{Address, Hash, Timestamp};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info, warn};
 
 pub struct PoStVerifier {
     verifier_id: Address,
-    verification_cache: Arc<RwLock<HashMap<Hash, PostVerificationResult>>>,
-    window_assignments: Arc<RwLock<HashMap<Address, WindowSchedule>>>,
-    verification_params: VerificationParams,
+    verification_cache: Arc<RwLock<HashMap<Hash, VerificationResult>>>,
+    params_registry: Arc<RwLock<HashMap<u32, VerificationParams>>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct PostVerificationResult {
+pub struct VerificationResult {
     pub proof_hash: Hash,
     pub is_valid: bool,
     pub verification_time_ms: u64,
     pub verifier_id: Address,
     pub timestamp: Timestamp,
-    pub partition_results: Vec<PartitionVerificationResult>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PartitionVerificationResult {
-    pub partition_id: u64,
-    pub challenges_verified: u32,
-    pub responses_valid: u32,
-    pub is_valid: bool,
+    pub confidence: f64,
 }
 
 #[derive(Debug, Clone)]
 pub struct VerificationParams {
-    pub max_verification_time_ms: u64,
-    pub challenge_sampling_rate: f64,
-    pub partition_failure_threshold: f64,
-    pub cache_ttl_hours: u64,
+    pub params_version: u32,
+    pub sector_size: u64,
+    pub challenge_count: u32,
+    pub activation_epoch: u64,
 }
 
 impl PoStVerifier {
     pub fn new(verifier_id: Address) -> Self {
-        let verification_params = VerificationParams {
-            max_verification_time_ms: 30_000,
-            challenge_sampling_rate: 0.1,
-            partition_failure_threshold: 0.05,
-            cache_ttl_hours: 24,
-        };
+        let mut params_registry = HashMap::new();
+        params_registry.insert(1, VerificationParams {
+            params_version: 1,
+            sector_size: 32 * 1024 * 1024 * 1024,
+            challenge_count: 2,
+            activation_epoch: 0,
+        });
 
         Self {
             verifier_id,
             verification_cache: Arc::new(RwLock::new(HashMap::new())),
-            window_assignments: Arc::new(RwLock::new(HashMap::new())),
-            verification_params,
+            params_registry: Arc::new(RwLock::new(params_registry)),
         }
     }
 
     pub async fn start(&mut self) -> PoCResult<()> {
         info!("Starting PoSt verifier {}", self.verifier_id);
-
-        self.start_cache_maintenance().await?;
-        self.start_window_tracking().await?;
-
-        info!("✅ PoSt verifier {} started successfully", self.verifier_id);
+        self.start_cache_cleaner().await?;
+        info!("✅ PoSt verifier {} started", self.verifier_id);
         Ok(())
     }
 
-    pub async fn stop(&mut self) -> PoCResult<()> {
-        info!("Stopping PoSt verifier {}", self.verifier_id);
-        info!("✅ PoSt verifier {} stopped", self.verifier_id);
-        Ok(())
-    }
-
+    /// Verify a PoStEvent emitted by a prover node.
     pub async fn verify_post_event(&self, event: &PoStEvent) -> PoCResult<bool> {
-        debug!(
-            "Verifying PoSt event for node {} window {} (verifier {})",
-            event.node_addr, event.window_id, self.verifier_id
-        );
+        debug!("Verifying PoSt event for window {} (verifier {})",
+               event.window_id, self.verifier_id);
 
         event.validate()?;
 
-        let verification_start = Timestamp::now();
-
-        let proof_hash = self.compute_event_proof_hash(event);
-
-        {
-            let cache = self.verification_cache.read().unwrap();
-            if let Some(cached_result) = cache.get(&proof_hash) {
-                debug!("Using cached PoSt verification result");
-                return Ok(cached_result.is_valid);
+        match &event.result {
+            PoStResult::Pass => self.verify_successful_post(event).await,
+            PoStResult::Miss => {
+                // A miss has no proof to verify — record as confirmed miss
+                debug!("PoSt miss recorded for window {} node {}",
+                       event.window_id, event.node_addr);
+                Ok(true) // Miss is a valid (if penalised) outcome
             }
+            PoStResult::Fault => self.verify_faulted_post(event).await,
         }
-
-        let is_valid = match &event.result {
-            PoStResult::Success => self.verify_successful_post(event).await?,
-            PoStResult::PartialFailure { failed_partitions } => {
-                self.verify_partial_failure(event, failed_partitions)
-                    .await?
-            }
-            PoStResult::TotalFailure => self.verify_total_failure(event).await?,
-            PoStResult::Timeout => self.verify_timeout(event).await?,
-        };
-
-        let verification_time_ms = Timestamp::now().as_millis() - verification_start.as_millis();
-
-        let verification_result = PostVerificationResult {
-            proof_hash,
-            is_valid,
-            verification_time_ms,
-            verifier_id: self.verifier_id,
-            timestamp: Timestamp::now(),
-            partition_results: vec![],
-        };
-
-        {
-            let mut cache = self.verification_cache.write().unwrap();
-            cache.insert(proof_hash, verification_result);
-        }
-
-        info!(
-            "✅ Verified PoSt event for window {} in {}ms: {} (verifier {})",
-            event.window_id, verification_time_ms, is_valid, self.verifier_id
-        );
-
-        Ok(is_valid)
-    }
-
-    pub async fn verify_post_proof(&self, proof: &PoStProof) -> PoCResult<bool> {
-        debug!(
-            "Verifying PoSt proof for window {} (verifier {})",
-            proof.window_id, self.verifier_id
-        );
-
-        proof.validate()?;
-
-        let verification_start = Timestamp::now();
-        let mut partition_results = Vec::new();
-
-        for partition in &proof.partitions {
-            let partition_result = self
-                .verify_partition(partition, &proof.challenge_seed)
-                .await?;
-            partition_results.push(partition_result.clone());
-
-            if !partition_result.is_valid {
-                warn!("Partition {} verification failed", partition.partition_id);
-            }
-        }
-
-        let failed_partitions = partition_results.iter().filter(|r| !r.is_valid).count();
-        let total_partitions = partition_results.len();
-        let failure_rate = failed_partitions as f64 / total_partitions as f64;
-
-        let is_valid = failure_rate <= self.verification_params.partition_failure_threshold;
-
-        let verification_time_ms = Timestamp::now().as_millis() - verification_start.as_millis();
-
-        if verification_time_ms > self.verification_params.max_verification_time_ms {
-            warn!(
-                "PoSt verification took too long: {}ms",
-                verification_time_ms
-            );
-            return Ok(false);
-        }
-
-        info!(
-            "✅ Verified PoSt proof for window {} in {}ms: {} (verifier {})",
-            proof.window_id, verification_time_ms, is_valid, self.verifier_id
-        );
-
-        Ok(is_valid)
     }
 
     async fn verify_successful_post(&self, event: &PoStEvent) -> PoCResult<bool> {
-        if event.latency_ms > 1800_000 {
+        if event.proof_hash == Hash::new([0u8; 32]) {
             return Ok(false);
         }
 
-        if event.partitions_covered.is_empty() {
+        if event.partition_ids.is_empty() {
             return Ok(false);
         }
 
-        let expected_schedule = self
-            .get_expected_window_schedule(event.node_addr, event.epoch)
-            .await?;
-        let expected_window = expected_schedule
-            .assigned_windows
-            .iter()
-            .find(|w| w.window_id == event.window_id);
-
-        if let Some(window) = expected_window {
-            let required_partitions: std::collections::HashSet<u64> =
-                window.required_partitions.iter().cloned().collect();
-            let covered_partitions: std::collections::HashSet<u64> =
-                event.partitions_covered.iter().cloned().collect();
-
-            Ok(required_partitions.is_subset(&covered_partitions))
-        } else {
-            Ok(false)
-        }
-    }
-
-    async fn verify_partial_failure(
-        &self,
-        event: &PoStEvent,
-        failed_partitions: &[u64],
-    ) -> PoCResult<bool> {
-        if failed_partitions.is_empty() {
+        // Verify latency is plausible
+        if event.latency_ms > 3_600_000 {
+            warn!("PoSt proof latency implausibly high: {} ms", event.latency_ms);
             return Ok(false);
         }
 
-        let total_partitions = event.partitions_covered.len() + failed_partitions.len();
-        let failure_rate = failed_partitions.len() as f64 / total_partitions as f64;
-
-        Ok(
-            failure_rate <= self.verification_params.partition_failure_threshold
-                && failure_rate > 0.0,
-        )
-    }
-
-    async fn verify_total_failure(&self, _event: &PoStEvent) -> PoCResult<bool> {
         Ok(true)
     }
 
-    async fn verify_timeout(&self, event: &PoStEvent) -> PoCResult<bool> {
-        Ok(event.latency_ms >= 1800_000)
+    async fn verify_faulted_post(&self, event: &PoStEvent) -> PoCResult<bool> {
+        // A fault means proof was submitted but invalid — record confirmed fault
+        debug!("PoSt fault recorded for window {} node {}",
+               event.window_id, event.node_addr);
+        Ok(true)
     }
 
-    async fn verify_partition(
-        &self,
-        partition: &super::PartitionProof,
-        challenge_seed: &Hash,
-    ) -> PoCResult<PartitionVerificationResult> {
-        let challenges_to_verify = (partition.challenges.len() as f64
-            * self.verification_params.challenge_sampling_rate)
-            .max(1.0) as usize;
-        let mut verified_challenges = 0;
-        let mut valid_responses = 0;
+    /// Verify a full PoStProof object (used by the proving pipeline).
+    pub async fn verify_post_proof(&self, proof: &PoStProof) -> PoCResult<bool> {
+        debug!("Verifying PoSt proof for window {} (verifier {})",
+               proof.window_id, self.verifier_id);
 
-        for i in 0..challenges_to_verify {
-            let challenge_idx = i % partition.challenges.len();
-            let challenge = partition.challenges[challenge_idx];
-            let response = partition.responses[challenge_idx];
+        proof.validate()?;
 
-            let expected_response = self
-                .compute_expected_response(&partition.sector_ids, challenge)
-                .await?;
+        let proof_hash = self.compute_proof_hash(proof);
 
-            verified_challenges += 1;
-            if expected_response == response {
-                valid_responses += 1;
+        // Check cache
+        {
+            let cache = self.verification_cache.read().unwrap();
+            if let Some(cached) = cache.get(&proof_hash) {
+                return Ok(cached.is_valid);
             }
         }
 
-        let success_rate = valid_responses as f64 / verified_challenges as f64;
-        let is_valid = success_rate >= 0.9;
+        let start_time = Timestamp::now();
+        let is_valid = self.perform_proof_verification(proof).await?;
+        let verification_time_ms = Timestamp::now().as_millis() - start_time.as_millis();
 
-        Ok(PartitionVerificationResult {
-            partition_id: partition.partition_id,
-            challenges_verified: verified_challenges as u32,
-            responses_valid: valid_responses as u32,
-            is_valid,
-        })
+        // Cache result
+        {
+            let mut cache = self.verification_cache.write().unwrap();
+            cache.insert(proof_hash, VerificationResult {
+                proof_hash,
+                is_valid,
+                verification_time_ms,
+                verifier_id: self.verifier_id,
+                timestamp: Timestamp::now(),
+                confidence: if is_valid { 0.95 } else { 0.05 },
+            });
+
+            if cache.len() > 1000 {
+                let oldest: Vec<_> = cache.iter()
+                    .take(cache.len() - 1000)
+                    .map(|(k, _)| *k)
+                    .collect();
+                for k in oldest { cache.remove(&k); }
+            }
+        }
+
+        info!("✅ Verified PoSt proof for window {} in {} ms (verifier {})",
+              proof.window_id, verification_time_ms, self.verifier_id);
+        Ok(is_valid)
     }
 
-    async fn compute_expected_response(
+    async fn perform_proof_verification(&self, proof: &PoStProof) -> PoCResult<bool> {
+        for partition in &proof.partitions {
+            if !self.verify_partition_proof(partition, &proof.challenge_seed).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn verify_partition_proof(
         &self,
-        sector_ids: &[u64],
-        challenge: u64,
-    ) -> PoCResult<[u8; 32]> {
+        partition: &PartitionProof,
+        _challenge_seed: &Hash,
+    ) -> PoCResult<bool> {
+        if partition.challenges.len() != partition.responses.len() {
+            return Ok(false);
+        }
+
+        for (i, &challenge) in partition.challenges.iter().enumerate() {
+            let expected = Self::compute_challenge_response(&partition.sector_ids, challenge).await?;
+            if expected != partition.responses[i] {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    async fn compute_challenge_response(sector_ids: &[u64], challenge: u64) -> PoCResult<[u8; 32]> {
         use ego_core::crypto::hash_multiple;
 
-        let mut inputs = vec![&challenge.to_le_bytes()];
-        for &sector_id in sector_ids {
-            inputs.push(&sector_id.to_le_bytes());
+        let challenge_bytes = challenge.to_le_bytes();
+        let sector_bytes: Vec<[u8; 8]> = sector_ids.iter().map(|s| s.to_le_bytes()).collect();
+
+        let mut inputs: Vec<&[u8]> = vec![&challenge_bytes];
+        for b in &sector_bytes {
+            inputs.push(b.as_slice());
         }
 
         let response_hash = hash_multiple(&inputs);
-        Ok(response_hash.as_bytes().try_into().unwrap())
+        let bytes: &[u8] = response_hash.as_bytes();
+        bytes[..32].try_into().map_err(|_| {
+            PoCError::InternalError("Hash slice conversion failed".to_string())
+        })
     }
 
-    async fn get_expected_window_schedule(
-        &self,
-        node_addr: Address,
-        epoch: u64,
-    ) -> PoCResult<WindowSchedule> {
-        {
-            let assignments = self.window_assignments.read().unwrap();
-            if let Some(schedule) = assignments.get(&node_addr) {
-                if schedule.epoch == epoch {
-                    return Ok(schedule.clone());
-                }
-            }
-        }
-
-        let schedule = WindowSchedule::generate_deterministic_schedule(node_addr, epoch, 1000, 48);
-
-        {
-            let mut assignments = self.window_assignments.write().unwrap();
-            assignments.insert(node_addr, schedule.clone());
-        }
-
-        Ok(schedule)
-    }
-
-    fn compute_event_proof_hash(&self, event: &PoStEvent) -> Hash {
+    fn compute_proof_hash(&self, proof: &PoStProof) -> Hash {
         use ego_core::crypto::hash_multiple;
-
         hash_multiple(&[
-            event.node_addr.as_bytes(),
-            &event.epoch.to_le_bytes(),
-            &event.window_id.to_le_bytes(),
-            event.challenges_root.as_bytes(),
-            event.post_agg_proof_hash.as_bytes(),
+            proof.prover_id.as_bytes(),
+            &proof.epoch.to_le_bytes(),
+            &proof.window_id.to_le_bytes(),
+            proof.challenge_seed.as_bytes(),
         ])
     }
 
-    async fn start_cache_maintenance(&self) -> PoCResult<()> {
-        let verification_cache = self.verification_cache.clone();
-        let cache_ttl_hours = self.verification_params.cache_ttl_hours;
+    async fn start_cache_cleaner(&self) -> PoCResult<()> {
+        let cache = self.verification_cache.clone();
         let verifier_id = self.verifier_id;
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
-
             loop {
                 interval.tick().await;
-
-                let mut cache = verification_cache.write().unwrap();
+                let mut cache_lock = cache.write().unwrap();
                 let now = Timestamp::now();
-                let ttl_ms = cache_ttl_hours * 3_600_000;
-
-                cache.retain(|_, result| now.as_millis() - result.timestamp.as_millis() < ttl_ms);
-
-                debug!(
-                    "Cache maintenance completed, {} entries remaining (verifier {})",
-                    cache.len(),
-                    verifier_id
-                );
+                cache_lock.retain(|_, result| {
+                    now.as_millis() - result.timestamp.as_millis() < 86_400_000
+                });
+                debug!("Cache cleanup done, {} entries remain (verifier {})",
+                       cache_lock.len(), verifier_id);
             }
         });
 
         Ok(())
     }
 
-    async fn start_window_tracking(&self) -> PoCResult<()> {
-        let window_assignments = self.window_assignments.clone();
-        let verifier_id = self.verifier_id;
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
-
-            loop {
-                interval.tick().await;
-
-                let mut assignments = window_assignments.write().unwrap();
-                let current_epoch = Timestamp::now().as_secs() / 3600;
-
-                assignments
-                    .retain(|_, schedule| schedule.epoch >= current_epoch.saturating_sub(24));
-
-                debug!(
-                    "Window tracking updated, {} node schedules active (verifier {})",
-                    assignments.len(),
-                    verifier_id
-                );
-            }
-        });
-
-        Ok(())
-    }
-
-    pub fn get_verification_stats(&self) -> PostVerificationStats {
+    pub fn get_verification_stats(&self) -> VerificationStats {
         let cache = self.verification_cache.read().unwrap();
+        let total = cache.len() as u64;
+        let valid = cache.values().filter(|r| r.is_valid).count() as u64;
 
-        let total_verifications = cache.len() as u64;
-        let valid_proofs = cache.values().filter(|r| r.is_valid).count() as u64;
-        let avg_verification_time = if total_verifications > 0 {
-            cache.values().map(|r| r.verification_time_ms).sum::<u64>() / total_verifications
-        } else {
-            0
-        };
-
-        PostVerificationStats {
-            total_verifications,
-            valid_proofs,
-            invalid_proofs: total_verifications - valid_proofs,
-            avg_verification_time_ms: avg_verification_time,
+        VerificationStats {
+            total_verifications: total,
+            valid_proofs: valid,
+            invalid_proofs: total - valid,
             cache_size: cache.len() as u32,
             last_updated: Timestamp::now(),
         }
@@ -393,11 +239,10 @@ impl PoStVerifier {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PostVerificationStats {
+pub struct VerificationStats {
     pub total_verifications: u64,
     pub valid_proofs: u64,
     pub invalid_proofs: u64,
-    pub avg_verification_time_ms: u64,
     pub cache_size: u32,
     pub last_updated: Timestamp,
 }
@@ -405,58 +250,100 @@ pub struct PostVerificationStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::post::{PartitionProof, PoStProof};
+    use ego_core::{Address, Hash};
 
     #[tokio::test]
     async fn test_post_verifier_creation() {
         let verifier = PoStVerifier::new(Address::new([1u8; 20]));
         assert_eq!(verifier.verifier_id, Address::new([1u8; 20]));
-        assert_eq!(
-            verifier.verification_params.max_verification_time_ms,
-            30_000
-        );
     }
 
     #[tokio::test]
-    async fn test_post_event_verification() {
-        let mut verifier = PoStVerifier::new(Address::new([1u8; 20]));
-        verifier.start().await.unwrap();
+    async fn test_proof_verification() {
+        let verifier = PoStVerifier::new(Address::new([1u8; 20]));
 
-        let event = PoStEvent::new(
+        let sector_ids = vec![1u64, 2u64];
+        let challenges = vec![100u64, 200u64];
+        let responses = vec![
+            PoStVerifier::compute_challenge_response(&sector_ids, 100).await.unwrap(),
+            PoStVerifier::compute_challenge_response(&sector_ids, 200).await.unwrap(),
+        ];
+
+        let proof = PoStProof::new(
             Address::new([2u8; 20]),
-            100,
+            5,
             1,
-            vec![1, 2, 3],
-            Hash::new([3u8; 32]),
-            Hash::new([4u8; 32]),
-            PoStResult::Success,
-            5000,
+            vec![PartitionProof { partition_id: 0, sector_ids, challenges, responses }],
+            Hash::new([9u8; 32]),
         );
 
-        let result = verifier.verify_post_event(&event).await;
-        assert!(result.is_ok());
+        let result = verifier.verify_post_proof(&proof).await.unwrap();
+        assert!(result);
     }
 
     #[tokio::test]
     async fn test_verification_caching() {
         let verifier = PoStVerifier::new(Address::new([1u8; 20]));
 
-        let event = PoStEvent::new(
+        let proof = PoStProof::new(
             Address::new([2u8; 20]),
-            100,
+            5,
             1,
-            vec![1, 2, 3],
-            Hash::new([3u8; 32]),
-            Hash::new([4u8; 32]),
-            PoStResult::Success,
-            5000,
+            vec![PartitionProof {
+                partition_id: 0,
+                sector_ids: vec![1],
+                challenges: vec![42],
+                responses: vec![
+                    PoStVerifier::compute_challenge_response(&[1], 42).await.unwrap(),
+                ],
+            }],
+            Hash::new([9u8; 32]),
         );
 
-        let result1 = verifier.verify_post_event(&event).await.unwrap();
-        let result2 = verifier.verify_post_event(&event).await.unwrap();
-
-        assert_eq!(result1, result2);
+        let r1 = verifier.verify_post_proof(&proof).await.unwrap();
+        let r2 = verifier.verify_post_proof(&proof).await.unwrap();
+        assert_eq!(r1, r2);
 
         let cache = verifier.verification_cache.read().unwrap();
         assert_eq!(cache.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_post_event_verification() {
+        let verifier = PoStVerifier::new(Address::new([1u8; 20]));
+
+        let event = crate::post::PoStEvent::new(
+            Address::new([2u8; 20]),
+            10,
+            3,
+            vec![0, 1],
+            Hash::new([5u8; 32]),
+            Hash::new([6u8; 32]),
+            PoStResult::Pass,
+            3_000,
+        );
+
+        let result = verifier.verify_post_event(&event).await.unwrap();
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn test_miss_event_verification() {
+        let verifier = PoStVerifier::new(Address::new([1u8; 20]));
+
+        let event = crate::post::PoStEvent::new(
+            Address::new([2u8; 20]),
+            10,
+            3,
+            vec![0, 1],
+            Hash::new([5u8; 32]),
+            Hash::new([0u8; 32]), // zero hash for miss
+            PoStResult::Miss,
+            0,
+        );
+
+        let result = verifier.verify_post_event(&event).await.unwrap();
+        assert!(result); // miss is valid outcome, just penalised
     }
 }
