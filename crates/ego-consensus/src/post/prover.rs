@@ -307,16 +307,25 @@ impl PoStProver {
         Ok(responses)
     }
 
+    // FIX: collect temporaries before building the &[u8] slice —
+    // to_le_bytes() returns [u8; N] which is a temporary; we must keep
+    // the owned arrays alive for the duration of the hash_multiple call.
     async fn compute_challenge_response(sector_ids: &[u64], challenge: u64) -> PoCResult<[u8; 32]> {
         use ego_core::crypto::hash_multiple;
 
-        let mut inputs = vec![&challenge.to_le_bytes()];
-        for &sector_id in sector_ids {
-            inputs.push(&sector_id.to_le_bytes());
+        let challenge_bytes = challenge.to_le_bytes();
+        let sector_bytes: Vec<[u8; 8]> = sector_ids.iter().map(|s| s.to_le_bytes()).collect();
+
+        let mut inputs: Vec<&[u8]> = vec![challenge_bytes.as_slice()];
+        for b in &sector_bytes {
+            inputs.push(b.as_slice());
         }
 
         let response_hash = hash_multiple(&inputs);
-        Ok(response_hash.as_bytes().try_into().unwrap())
+        let bytes = response_hash.as_bytes();
+        bytes[..32].try_into().map_err(|_| {
+            PoCError::InternalError("Hash slice conversion failed".to_string())
+        })
     }
 
     fn create_sector_partitions(
@@ -324,14 +333,16 @@ impl PoStProver {
         windows_per_day: u32,
     ) -> HashMap<u64, Vec<u64>> {
         let mut partitions = HashMap::new();
-        let sectors_per_partition = total_sectors / windows_per_day;
+        let base = total_sectors / windows_per_day;
+        let remainder = total_sectors % windows_per_day;
+        let mut sector_cursor = 0u32;
 
         for partition_idx in 0..windows_per_day {
-            let start_sector = partition_idx * sectors_per_partition;
-            let end_sector = ((partition_idx + 1) * sectors_per_partition).min(total_sectors);
-
-            let sector_ids: Vec<u64> = (start_sector..end_sector).map(|i| i as u64).collect();
+            // Distribute remainder sectors one each to the first `remainder` partitions
+            let count = base + if partition_idx < remainder { 1 } else { 0 };
+            let sector_ids: Vec<u64> = (sector_cursor..sector_cursor + count).map(|i| i as u64).collect();
             partitions.insert(partition_idx as u64, sector_ids);
+            sector_cursor += count;
         }
 
         partitions
@@ -422,7 +433,7 @@ impl PoStProver {
     async fn verify_partition_proof(
         &self,
         partition: &PartitionProof,
-        challenge_seed: &Hash,
+        _challenge_seed: &Hash,
     ) -> PoCResult<bool> {
         if partition.challenges.len() != partition.responses.len() {
             return Ok(false);
@@ -487,15 +498,22 @@ impl PoStProver {
         Ok(event)
     }
 
+    // FIX: same temporaries pattern — collect partition_id bytes before slicing.
     fn compute_challenges_root(&self, window: &PoStWindow) -> Hash {
         use ego_core::crypto::hash_multiple;
 
-        let mut challenge_inputs = vec![window.challenge_seed.as_bytes()];
-        for &partition_id in &window.required_partitions {
-            challenge_inputs.push(&partition_id.to_le_bytes());
+        let partition_bytes: Vec<[u8; 8]> = window
+            .required_partitions
+            .iter()
+            .map(|p| p.to_le_bytes())
+            .collect();
+
+        let mut inputs: Vec<&[u8]> = vec![window.challenge_seed.as_bytes()];
+        for b in &partition_bytes {
+            inputs.push(b.as_slice());
         }
 
-        hash_multiple(&challenge_inputs)
+        hash_multiple(&inputs)
     }
 
     pub fn get_sector_utilization(&self) -> f64 {
