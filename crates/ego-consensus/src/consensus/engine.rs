@@ -1,11 +1,30 @@
+// consensus/engine.rs
+//
+// Wires BFT engine and DRS scorer.
+// Method signatures match the actual bft.rs and drs.rs in this repo.
+
 use crate::aggregator::PoCEvent;
+use crate::consensus::bft::{BftEngine, BlockHeader, BlockRoots, QuorumCertificate, Vote};
+use crate::consensus::drs::{DRSInputs, DRSScoreEvent, DRSScorer};
 use crate::config::ValidationConfig;
 use crate::error::PoCResult;
-use ego_core::{Address, Timestamp};
+use ego_core::{Address, Hash, KeyPair, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::RwLock;
 use tracing::debug;
+
+/// Engine-local validation result.
+/// (validation::ValidationResult is a type alias for Result<(), ValidationError> — not a struct)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventValidationResult {
+    pub event_hash: Hash,
+    pub is_valid: bool,
+    pub confidence: f64,
+    pub validator_votes: HashMap<Address, bool>,
+    pub fraud_indicators: Vec<String>,
+    pub timestamp: Timestamp,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsensusConfig {
@@ -14,115 +33,6 @@ pub struct ConsensusConfig {
     pub max_validation_time_ms: u64,
     pub fraud_detection_enabled: bool,
     pub batch_validation_size: usize,
-}
-
-pub struct ConsensusEngine {
-    config: ConsensusConfig,
-    validators: Vec<Address>,
-    pending_events: RwLock<VecDeque<PoCEvent>>,
-    validated_events: RwLock<HashMap<ego_core::Hash, ValidationResult>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidationResult {
-    pub event_hash: ego_core::Hash,
-    pub is_valid: bool,
-    pub confidence: f64,
-    pub validator_votes: HashMap<Address, bool>,
-    pub fraud_indicators: Vec<String>,
-    pub timestamp: Timestamp,
-}
-
-impl ConsensusEngine {
-    pub fn new(config: ConsensusConfig, validators: Vec<Address>) -> Self {
-        Self {
-            config,
-            validators,
-            pending_events: RwLock::new(VecDeque::new()),
-            validated_events: RwLock::new(HashMap::new()),
-        }
-    }
-
-    pub async fn submit_event(&self, event: PoCEvent) -> PoCResult<()> {
-        let mut pending = self.pending_events.write().await;
-        pending.push_back(event);
-        Ok(())
-    }
-
-    pub async fn validate_events(&self) -> PoCResult<Vec<ValidationResult>> {
-        let mut pending = self.pending_events.write().await;
-        let mut results = Vec::new();
-
-        while let Some(event) = pending.pop_front() {
-            let result = self.validate_single_event(&event).await?;
-            results.push(result.clone());
-
-            let mut validated = self.validated_events.write().await;
-            validated.insert(event.beacon_hash, result);
-        }
-
-        Ok(results)
-    }
-
-    async fn validate_single_event(&self, event: &PoCEvent) -> PoCResult<ValidationResult> {
-        debug!("Validating PoC event for beacon {}", event.beacon_hash);
-
-        let mut validator_votes = HashMap::new();
-        let mut fraud_indicators = Vec::new();
-
-        for validator in &self.validators {
-            let vote = self.deterministic_validator_vote(event, validator).await;
-            validator_votes.insert(*validator, vote);
-        }
-
-        let positive_votes = validator_votes.values().filter(|&&v| v).count();
-        let total_votes = validator_votes.len();
-        let confidence = positive_votes as f64 / total_votes as f64;
-
-        let is_valid = confidence >= self.config.min_consensus_threshold;
-
-        if !is_valid {
-            fraud_indicators.push("Low consensus threshold".to_string());
-        }
-
-        if event.quality_score < 0.5 {
-            fraud_indicators.push("Low quality score".to_string());
-        }
-
-        Ok(ValidationResult {
-            event_hash: event.beacon_hash,
-            is_valid,
-            confidence,
-            validator_votes,
-            fraud_indicators,
-            timestamp: Timestamp::now(),
-        })
-    }
-
-    async fn deterministic_validator_vote(&self, event: &PoCEvent, _validator: &Address) -> bool {
-        let mut score = 1.0;
-
-        if event.quality_score < 0.6 {
-            score *= 0.5;
-        }
-
-        if event.witness_hashes.is_empty() {
-            score *= 0.1;
-        } else if event.witness_hashes.len() < 3 {
-            score *= 0.7;
-        }
-
-        if event.region.is_empty() {
-            score *= 0.8;
-        }
-
-        let current_epoch = Timestamp::now().as_secs() / 3600;
-        if event.epoch + 24 < current_epoch {
-            score *= 0.3;
-        }
-
-        score > 0.7
-    }
 }
 
 impl Default for ConsensusConfig {
@@ -137,91 +47,235 @@ impl Default for ConsensusConfig {
     }
 }
 
+pub struct ConsensusEngine {
+    config: ConsensusConfig,
+    validators: Vec<Address>,
+    pending_events: RwLock<VecDeque<PoCEvent>>,
+    /// DRS scorer — stateless, holds only weights version + params digest
+    drs_scorer: DRSScorer,
+    /// Keypair used by the DRS scorer to sign score events
+    scorer_keypair: KeyPair,
+    bft: BftEngine,
+    validated_events: RwLock<HashMap<Hash, EventValidationResult>>,
+    /// Latest DRS score per node — keyed by node_addr
+    drs_scores: RwLock<HashMap<Address, DRSScoreEvent>>,
+}
+
+impl ConsensusEngine {
+    pub fn new(config: ConsensusConfig, validators: Vec<Address>, keypair: KeyPair) -> Self {
+        // DRSScorer::new() takes no args
+        let drs_scorer = DRSScorer::new();
+        // Keep a separate keypair for signing score events
+        let scorer_keypair = KeyPair::generate();
+        let bft = BftEngine::new(keypair, validators.clone());
+
+        Self {
+            config,
+            validators,
+            pending_events: RwLock::new(VecDeque::new()),
+            drs_scorer,
+            scorer_keypair,
+            bft,
+            validated_events: RwLock::new(HashMap::new()),
+            drs_scores: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn new_observer(config: ConsensusConfig, validators: Vec<Address>) -> Self {
+        Self::new(config, validators, KeyPair::generate())
+    }
+
+    pub async fn submit_event(&self, event: PoCEvent) -> PoCResult<()> {
+        self.pending_events.write().await.push_back(event);
+        Ok(())
+    }
+
+    pub async fn validate_events(&self) -> PoCResult<Vec<EventValidationResult>> {
+        let mut pending = self.pending_events.write().await;
+        let mut results = Vec::new();
+
+        while let Some(event) = pending.pop_front() {
+            let result = self.validate_single_event(&event).await?;
+            results.push(result.clone());
+            self.validated_events.write().await.insert(event.beacon_hash, result);
+        }
+
+        Ok(results)
+    }
+
+    async fn validate_single_event(&self, event: &PoCEvent) -> PoCResult<EventValidationResult> {
+        debug!("Validating PoC event for beacon {}", event.beacon_hash);
+
+        let mut validator_votes = HashMap::new();
+        let mut fraud_indicators = Vec::new();
+
+        for validator in &self.validators {
+            let vote = self.drs_weighted_vote(event, validator).await;
+            validator_votes.insert(*validator, vote);
+        }
+
+        let positive = validator_votes.values().filter(|&&v| v).count();
+        let confidence = if self.validators.is_empty() {
+            0.0
+        } else {
+            positive as f64 / self.validators.len() as f64
+        };
+        let is_valid = confidence >= self.config.min_consensus_threshold;
+
+        if !is_valid       { fraud_indicators.push("Consensus threshold not met".to_string()); }
+        if event.quality_score < 0.5    { fraud_indicators.push("Low quality score".to_string()); }
+        if event.path_loss_rmse > 10.0  { fraud_indicators.push("High path-loss RMSE".to_string()); }
+        if event.nonce_binding_fraction < 0.6 { fraud_indicators.push("Insufficient nonce binding".to_string()); }
+
+        Ok(EventValidationResult {
+            event_hash: event.beacon_hash,
+            is_valid,
+            confidence,
+            validator_votes,
+            fraud_indicators,
+            timestamp: Timestamp::now(),
+        })
+    }
+
+    /// DRS-aware vote — uses cached raw_score (f64 field on DRSScoreEvent).
+    async fn drs_weighted_vote(&self, event: &PoCEvent, validator: &Address) -> bool {
+        let threshold = {
+            let scores = self.drs_scores.read().await;
+            scores.get(validator)
+                .map(|s| s.raw_score * 0.6)  // raw_score is the f64 field
+                .unwrap_or(0.42)
+        };
+
+        let mut score = event.quality_score;
+        if event.path_loss_rmse > 10.0       { score *= 0.7; }
+        if event.nonce_binding_fraction < 0.6 { score *= 0.8; }
+        if event.witness_hashes.len() < 3    { score *= 0.7; }
+
+        let current_epoch = Timestamp::now().as_secs() / 3600;
+        if event.epoch + 24 < current_epoch  { score *= 0.3; }
+
+        score >= threshold
+    }
+
+    /// Cache an externally-produced DRS score event.
+    pub async fn update_drs_score(&self, event: DRSScoreEvent) {
+        // node_addr is the correct field name (not node_id)
+        self.drs_scores.write().await.insert(event.node_addr, event);
+    }
+
+    /// Score a batch of nodes for one epoch.
+    /// DRSScorer::score_event takes (&DRSInputs, &KeyPair) — node_addr and epoch
+    /// are embedded in DRSInputs, not separate args.
+    pub async fn score_epoch(
+        &self,
+        inputs_batch: Vec<DRSInputs>,
+    ) -> PoCResult<Vec<DRSScoreEvent>> {
+        let mut events = Vec::with_capacity(inputs_batch.len());
+        let mut scores = self.drs_scores.write().await;
+
+        for inputs in inputs_batch {
+            let event = self.drs_scorer.score_event(&inputs, &self.scorer_keypair)?;
+            scores.insert(event.node_addr, event.clone());
+            events.push(event);
+        }
+
+        Ok(events)
+    }
+
+    /// Propose a block — sync, takes only roots (BftEngine manages height/epoch internally).
+    pub fn propose_block(&self, roots: BlockRoots) -> PoCResult<BlockHeader> {
+        self.bft.propose_block(roots)
+    }
+
+    /// Process an incoming proposal — returns a Vote if this node accepts it.
+    pub fn receive_proposal(&self, header: &BlockHeader) -> PoCResult<Option<Vote>> {
+        self.bft.receive_proposal(header)
+    }
+
+    /// Receive a vote — sync, takes &Vote.
+    pub fn receive_vote(&self, vote: &Vote) -> PoCResult<Option<QuorumCertificate>> {
+        self.bft.receive_vote(vote)
+    }
+
+    /// Commit a finalized block (was commit_block — actual method is finalize_block).
+    pub fn finalize_block(&self, header: BlockHeader, qc: QuorumCertificate) -> PoCResult<()> {
+        self.bft.finalize_block(header, qc)
+    }
+
+    /// VRF output for beacon challenge randomness.
+    pub fn get_vrf_output(&self, epoch: u64) -> Option<Hash> {
+        self.bft.get_vrf_output(epoch)
+    }
+
+    pub fn get_current_height(&self) -> u64 { self.bft.get_current_height() }
+    pub fn get_current_epoch(&self) -> u64   { self.bft.get_current_epoch() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ego_core::{Hash, Address, Timestamp, Signature};
 
-    #[test]
-    fn test_consensus_engine_creation() {
+    fn make_engine() -> ConsensusEngine {
+        ConsensusEngine::new(
+            ConsensusConfig::default(),
+            vec![Address::new([1u8; 20]), Address::new([2u8; 20]), Address::new([3u8; 20])],
+            KeyPair::generate(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_event_validation() {
+        let engine = make_engine();
         let event = PoCEvent {
             beacon_hash: Hash::new([1u8; 32]),
-            witness_hashes: vec![Hash::new([4u8; 32]), Hash::new([5u8; 32])],
-            agg_digest: Hash::new([6u8; 32]),
+            witness_hashes: vec![Hash::new([2u8; 32]), Hash::new([3u8; 32]), Hash::new([4u8; 32])],
+            agg_digest: Hash::new([5u8; 32]),
             quality_score: 0.85,
             region: "872834".to_string(),
-            epoch: 100,
+            epoch: Timestamp::now().as_secs() / 3600,
             cid_hint: None,
             timestamp: Timestamp::now(),
             aggregator_signature: Signature::ed25519([0u8; 64]),
-            path_loss_rmse: 8.5,
+            path_loss_rmse: 8.0,
             diversity_score: 0.9,
             nonce_binding_fraction: 0.75,
             ldm_penalty: 0.0,
         };
 
-        assert_eq!(event.quality_score, 0.85);
-        assert_eq!(event.witness_hashes.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_deterministic_scoring() {
-        let config = ConsensusConfig::default();
-        let validators = vec![Address::new([1u8; 20])];
-        let engine = ConsensusEngine::new(config, validators);
-
-        let event = PoCEvent {
-            beacon_hash: Hash::new([1u8; 32]),
-            witness_hashes: vec![
-                Hash::new([2u8; 32]),
-                Hash::new([3u8; 32]),
-                Hash::new([4u8; 32]),
-            ],
-            agg_digest: Hash::new([5u8; 32]),
-            quality_score: 0.8,
-            region: "test_region".to_string(),
-            epoch: Timestamp::now().as_secs() / 3600,
-            cid_hint: None,
-            timestamp: Timestamp::now(),
-            aggregator_signature: Signature::ed25519([0u8; 64]),
-            path_loss_rmse: 9.0,
-            diversity_score: 0.85,
-            nonce_binding_fraction: 0.70,
-            ldm_penalty: 0.05,
-        };
-
-        let result1 = engine.validate_single_event(&event).await.unwrap();
-        let result2 = engine.validate_single_event(&event).await.unwrap();
-
-        assert_eq!(result1.is_valid, result2.is_valid);
-        assert_eq!(result1.confidence, result2.confidence);
-    }
-
-    #[tokio::test]
-    async fn test_event_submission() {
-        let config = ConsensusConfig::default();
-        let validators = vec![Address::new([1u8; 20]), Address::new([2u8; 20])];
-        let engine = ConsensusEngine::new(config, validators);
-
-        let event = PoCEvent {
-            beacon_hash: Hash::new([10u8; 32]),
-            witness_hashes: vec![Hash::new([11u8; 32])],
-            agg_digest: Hash::new([12u8; 32]),
-            quality_score: 0.75,
-            region: "872835".to_string(),
-            epoch: Timestamp::now().as_secs() / 3600,
-            cid_hint: Some("QmTest123".to_string()),
-            timestamp: Timestamp::now(),
-            aggregator_signature: Signature::ed25519([1u8; 64]),
-            path_loss_rmse: 7.5,
-            diversity_score: 0.80,
-            nonce_binding_fraction: 0.65,
-            ldm_penalty: 0.10,
-        };
-
-        assert!(engine.submit_event(event).await.is_ok());
-        
+        engine.submit_event(event).await.unwrap();
         let results = engine.validate_events().await.unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_drs_score_epoch() {
+        let engine = make_engine();
+        let node = Address::new([7u8; 20]);
+
+        let inputs = DRSInputs {
+            node_addr: node,
+            epoch: 1,
+            uptime_fraction: 1.0,
+            post_windows_assigned: 48,
+            post_windows_passed: 48,
+            post_latency_p50_ms: 3_000,
+            consecutive_post_misses: 0,
+            avg_poc_quality: 0.9,
+            poc_event_count: 10,
+            data_requests_received: 100,
+            data_requests_served: 98,
+            equivocations: 0,
+            replay_attacks: 0,
+            evidence_root: Hash::new([0u8; 32]),
+        };
+
+        let events = engine.score_epoch(vec![inputs]).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].node_addr, node);
+        assert!(events[0].raw_score > 0.9);
+
+        let cached = engine.drs_scores.read().await;
+        assert!(cached.contains_key(&node));
     }
 }
