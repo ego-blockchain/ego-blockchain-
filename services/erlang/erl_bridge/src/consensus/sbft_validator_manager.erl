@@ -85,7 +85,7 @@
     metrics                 = #{} :: map(),
     slash_counts            = #{} :: #{validator_id() => non_neg_integer()}
 }).
-A
+
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
@@ -556,7 +556,7 @@ update_performance_score(ValidatorId, Perf) ->
                Perf#validator_performance.votes_missed,
     Score    = case Total of
         0 -> 1.0;
-        N ->
+        _ ->
             UptimeScore  = compute_uptime_score(Perf#validator_performance.uptime_samples),
             ProposalScore = case Perf#validator_performance.blocks_proposed of
                 0 -> 1.0;
