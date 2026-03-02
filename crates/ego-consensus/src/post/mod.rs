@@ -1,34 +1,299 @@
-use crate::error::PoCResult;
-use ego_core::{Address, Hash, Signature, Timestamp};
+pub mod prover;
+pub mod verifier;
+
+pub use prover::PoStProver;
+pub use verifier::PoStVerifier;
+
+use crate::error::{PoCError, PoCResult};
+use ego_core::{Address, Hash, KeyPair, Signature, Timestamp};
+use ego_core::crypto::hash_multiple;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 
+// ─── PoSt result ─────────────────────────────────────────────────────────────
+
+/// Outcome of a single WindowPoSt window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub enum PoStResult {
+    /// Proof submitted on time and verified
+    Pass,
+    /// Window deadline missed — no proof submitted
+    Miss,
+    /// Proof submitted but failed verification
+    Fault,
+}
+
+// ─── PoSt event (on-chain record) ────────────────────────────────────────────
+
+/// Emitted once per WindowPoSt window per node.
+/// Consumed by the DRS scorer and the slashing engine.
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct PoStEvent {
+    pub event_id: Hash,
     pub node_addr: Address,
     pub epoch: u64,
     pub window_id: u64,
-    pub partitions_covered: Vec<u64>,
+    /// Partition IDs proven in this window
+    pub partition_ids: Vec<u64>,
+    /// Merkle root of the challenge set
     pub challenges_root: Hash,
-    pub post_agg_proof_hash: Hash,
+    /// Hash of the proof submitted (or zero-hash on Miss)
+    pub proof_hash: Hash,
     pub result: PoStResult,
+    /// Proof submission latency in ms (0 on Miss/Fault)
     pub latency_ms: u64,
+    /// Optional IPFS CID for proof archival
+    pub cid_hint: Option<String>,
+    /// Algorithm ID: 1 = Ed25519 placeholder, 2 = Dilithium-2
     pub alg_sig_id: u8,
     pub node_sig: Signature,
-    pub cid_hint: Option<String>,
+    pub ts_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
-pub struct PoStProof {
-    pub prover_id: Address,
-    pub epoch: u64,
+impl PoStEvent {
+    pub fn new(
+        node_addr: Address,
+        epoch: u64,
+        window_id: u64,
+        partition_ids: Vec<u64>,
+        challenges_root: Hash,
+        proof_hash: Hash,
+        result: PoStResult,
+        latency_ms: u64,
+    ) -> Self {
+        let event_id = Self::compute_event_id(node_addr, epoch, window_id, &result);
+
+        Self {
+            event_id,
+            node_addr,
+            epoch,
+            window_id,
+            partition_ids,
+            challenges_root,
+            proof_hash,
+            result,
+            latency_ms,
+            cid_hint: None,
+            alg_sig_id: 1,
+            node_sig: Signature::ed25519([0u8; 64]),
+            ts_ms: Timestamp::now().as_millis(),
+        }
+    }
+
+    pub fn sign(&mut self, keypair: &KeyPair) -> PoCResult<()> {
+        let msg = self.signing_bytes();
+        self.node_sig = keypair.sign(&msg);
+        Ok(())
+    }
+
+    pub fn validate(&self) -> PoCResult<()> {
+        let now = Timestamp::now().as_millis();
+        if self.ts_ms > now + 60_000 {
+            return Err(PoCError::TimeWindowViolation(
+                "PoSt event timestamp too far in future".to_string(),
+            ));
+        }
+        if self.partition_ids.is_empty() {
+            return Err(PoCError::ValidationFailed(
+                "PoSt event must cover at least one partition".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn is_pass(&self) -> bool {
+        self.result == PoStResult::Pass
+    }
+
+    pub fn is_miss(&self) -> bool {
+        self.result == PoStResult::Miss
+    }
+
+    pub fn is_fault(&self) -> bool {
+        self.result == PoStResult::Fault
+    }
+
+    fn signing_bytes(&self) -> Vec<u8> {
+        let mut buf = b"ego/post/event/v1:".to_vec();
+        buf.extend_from_slice(self.event_id.as_bytes());
+        buf.extend_from_slice(self.node_addr.as_bytes());
+        buf.extend_from_slice(&self.epoch.to_le_bytes());
+        buf.extend_from_slice(&self.window_id.to_le_bytes());
+        buf.extend_from_slice(self.challenges_root.as_bytes());
+        buf.extend_from_slice(&self.ts_ms.to_le_bytes());
+        buf
+    }
+
+    fn compute_event_id(
+        node_addr: Address,
+        epoch: u64,
+        window_id: u64,
+        result: &PoStResult,
+    ) -> Hash {
+        let result_byte = match result {
+            PoStResult::Pass => 1u8,
+            PoStResult::Miss => 2u8,
+            PoStResult::Fault => 3u8,
+        };
+        hash_multiple(&[
+            node_addr.as_bytes(),
+            &epoch.to_le_bytes(),
+            &window_id.to_le_bytes(),
+            &[result_byte],
+            &Timestamp::now().as_millis().to_le_bytes(),
+        ])
+    }
+}
+
+// ─── WindowPoSt window ───────────────────────────────────────────────────────
+
+/// A single assigned proving window for a storage node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoStWindow {
     pub window_id: u64,
-    pub partitions: Vec<PartitionProof>,
+    pub epoch: u64,
+    /// Partitions (sector groups) that must be proven in this window
+    pub required_partitions: Vec<u64>,
+    /// VRF-derived challenge seed: R_e = H(vrf_output || deal_id || epoch)
     pub challenge_seed: Hash,
-    pub proof_data: Vec<u8>,
-    pub created_at: Timestamp,
+    pub open_at_ms: u64,
+    pub close_at_ms: u64,
+    /// Proof hashes submitted for this window
+    pub submitted_proofs: Vec<Hash>,
 }
 
+impl PoStWindow {
+    pub fn new(
+        window_id: u64,
+        epoch: u64,
+        required_partitions: Vec<u64>,
+        challenge_seed: Hash,
+        open_at_ms: u64,
+        duration_ms: u64,
+    ) -> Self {
+        Self {
+            window_id,
+            epoch,
+            required_partitions,
+            challenge_seed,
+            open_at_ms,
+            close_at_ms: open_at_ms + duration_ms,
+            submitted_proofs: Vec::new(),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        let now = Timestamp::now().as_millis();
+        now >= self.open_at_ms && now < self.close_at_ms
+    }
+
+    pub fn is_expired(&self) -> bool {
+        Timestamp::now().as_millis() >= self.close_at_ms
+    }
+
+    pub fn remaining_ms(&self) -> u64 {
+        self.close_at_ms
+            .saturating_sub(Timestamp::now().as_millis())
+    }
+
+    pub fn is_proven(&self) -> bool {
+        !self.submitted_proofs.is_empty()
+    }
+
+    /// Derive partition-specific challenge indices from the window seed.
+    /// challenge_i = H(challenge_seed || partition_id || i) mod sector_count
+    pub fn generate_partition_challenges(
+        &self,
+        partition_id: u64,
+        sector_count: u32,
+    ) -> Vec<u64> {
+        const CHALLENGES_PER_PARTITION: u32 = 2;
+
+        (0..CHALLENGES_PER_PARTITION)
+            .map(|i| {
+                let h = hash_multiple(&[
+                    self.challenge_seed.as_bytes(),
+                    &partition_id.to_le_bytes(),
+                    &i.to_le_bytes(),
+                ]);
+                let bytes = h.as_bytes();
+                let raw = u64::from_le_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3],
+                    bytes[4], bytes[5], bytes[6], bytes[7],
+                ]);
+                raw % sector_count as u64
+            })
+            .collect()
+    }
+}
+
+// ─── Window schedule ─────────────────────────────────────────────────────────
+
+/// Full set of windows assigned to one node for one epoch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowSchedule {
+    pub node_addr: Address,
+    pub epoch: u64,
+    pub assigned_windows: Vec<PoStWindow>,
+    pub generated_at: Timestamp,
+}
+
+impl WindowSchedule {
+    /// Deterministic schedule derived from node address, epoch, and sector count.
+    /// Each node gets `windows_per_day` windows spread evenly across the epoch.
+    pub fn generate_deterministic_schedule(
+        node_addr: Address,
+        epoch: u64,
+        total_sectors: u32,
+        windows_per_day: u32,
+    ) -> Self {
+        let epoch_start_ms = epoch * 3_600_000;
+        let window_duration_ms = 3_600_000 / windows_per_day as u64;
+        let base = total_sectors / windows_per_day;
+        let remainder = total_sectors % windows_per_day;
+
+        let mut windows = Vec::with_capacity(windows_per_day as usize);
+        let mut sector_cursor = 0u32;
+
+        for idx in 0..windows_per_day {
+            let challenge_seed = hash_multiple(&[
+                node_addr.as_bytes(),
+                &epoch.to_le_bytes(),
+                &idx.to_le_bytes(),
+                b"ego/post/window/v1",
+            ]);
+
+            // Distribute remainder one-per-window to first `remainder` windows
+            let count = base + if idx < remainder { 1 } else { 0 };
+            let partitions: Vec<u64> = (sector_cursor..sector_cursor + count).map(|s| s as u64).collect();
+            sector_cursor += count;
+
+            let open_at_ms = epoch_start_ms + idx as u64 * window_duration_ms;
+
+            let window = PoStWindow::new(
+                idx as u64,
+                epoch,
+                partitions,
+                challenge_seed,
+                open_at_ms,
+                window_duration_ms,
+            );
+
+            windows.push(window);
+        }
+
+        Self {
+            node_addr,
+            epoch,
+            assigned_windows: windows,
+            generated_at: Timestamp::now(),
+        }
+    }
+}
+
+// ─── Partition proof ─────────────────────────────────────────────────────────
+
+/// Proof for one partition within a WindowPoSt window.
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct PartitionProof {
     pub partition_id: u64,
@@ -37,110 +302,35 @@ pub struct PartitionProof {
     pub responses: Vec<[u8; 32]>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
-pub enum PoStResult {
-    Success,
-    PartialFailure { failed_partitions: Vec<u64> },
-    TotalFailure,
-    Timeout,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PoStWindow {
-    pub window_id: u64,
-    pub epoch: u64,
-    pub start_time: Timestamp,
-    pub end_time: Timestamp,
-    pub challenge_seed: Hash,
-    pub required_partitions: Vec<u64>,
-    pub submitted_proofs: Vec<Hash>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WindowSchedule {
-    pub node_addr: Address,
-    pub epoch: u64,
-    pub assigned_windows: Vec<PoStWindow>,
-    pub windows_per_day: u32,
-    pub partition_size: u32,
-}
-
-pub trait PoStProvider: Send + Sync {
-    fn provider_id(&self) -> Address;
-
-    fn generate_post_proof(
-        &self,
-        window: &PoStWindow,
-    ) -> impl Future<Output = PoCResult<PoStProof>> + Send;
-
-    fn verify_post_proof(&self, proof: &PoStProof) -> impl Future<Output = PoCResult<bool>> + Send;
-
-    fn get_window_assignment(
-        &self,
-        epoch: u64,
-    ) -> impl Future<Output = PoCResult<WindowSchedule>> + Send;
-
-    fn get_proving_metrics(&self) -> PoStMetrics;
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PoStMetrics {
-    pub windows_proven: u64,
-    pub windows_missed: u64,
-    pub avg_latency_ms: f64,
-    pub p50_latency_ms: u64,
-    pub p95_latency_ms: u64,
-    pub partition_failures: u32,
-    pub last_updated: Timestamp,
-}
-
-impl PoStEvent {
-    pub fn new(
-        node_addr: Address,
-        epoch: u64,
-        window_id: u64,
-        partitions_covered: Vec<u64>,
-        challenges_root: Hash,
-        post_agg_proof_hash: Hash,
-        result: PoStResult,
-        latency_ms: u64,
-    ) -> Self {
-        Self {
-            node_addr,
-            epoch,
-            window_id,
-            partitions_covered,
-            challenges_root,
-            post_agg_proof_hash,
-            result,
-            latency_ms,
-            alg_sig_id: 1,
-            node_sig: Signature::ed25519([0u8; 64]),
-            cid_hint: None,
-        }
-    }
-
+impl PartitionProof {
     pub fn validate(&self) -> PoCResult<()> {
-        if self.partitions_covered.is_empty() {
-            return Err(crate::error::PoCError::ValidationFailed(
-                "PoSt event must cover at least one partition".to_string(),
+        if self.challenges.len() != self.responses.len() {
+            return Err(PoCError::ValidationFailed(
+                "Challenge/response count mismatch in partition proof".to_string(),
             ));
         }
-
-        if self.window_id == 0 {
-            return Err(crate::error::PoCError::ValidationFailed(
-                "Invalid window ID".to_string(),
+        if self.sector_ids.is_empty() {
+            return Err(PoCError::ValidationFailed(
+                "Partition proof has no sector IDs".to_string(),
             ));
         }
-
-        if self.latency_ms > 1800_000 {
-            return Err(crate::error::PoCError::ValidationFailed(
-                "PoSt latency exceeds maximum allowed time".to_string(),
-            ));
-        }
-
         Ok(())
     }
+}
+
+// ─── PoSt proof ──────────────────────────────────────────────────────────────
+
+/// Aggregated proof for a full WindowPoSt window.
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+pub struct PoStProof {
+    pub proof_id: Hash,
+    pub prover_id: Address,
+    pub epoch: u64,
+    pub window_id: u64,
+    pub partitions: Vec<PartitionProof>,
+    pub challenge_seed: Hash,
+    pub created_at: Timestamp,
+    pub signature: Signature,
 }
 
 impl PoStProof {
@@ -151,318 +341,275 @@ impl PoStProof {
         partitions: Vec<PartitionProof>,
         challenge_seed: Hash,
     ) -> Self {
-        let proof_data = Self::aggregate_partition_proofs(&partitions);
+        let proof_id = hash_multiple(&[
+            prover_id.as_bytes(),
+            &epoch.to_le_bytes(),
+            &window_id.to_le_bytes(),
+            challenge_seed.as_bytes(),
+        ]);
 
         Self {
+            proof_id,
             prover_id,
             epoch,
             window_id,
             partitions,
             challenge_seed,
-            proof_data,
             created_at: Timestamp::now(),
+            signature: Signature::ed25519([0u8; 64]),
         }
+    }
+
+    pub fn sign(&mut self, keypair: &KeyPair) -> PoCResult<()> {
+        let msg = self.signing_bytes();
+        self.signature = keypair.sign(&msg);
+        Ok(())
     }
 
     pub fn validate(&self) -> PoCResult<()> {
         if self.partitions.is_empty() {
-            return Err(crate::error::PoCError::ValidationFailed(
-                "PoSt proof must have at least one partition".to_string(),
+            return Err(PoCError::ValidationFailed(
+                "PoSt proof has no partitions".to_string(),
             ));
         }
-
-        for partition in &self.partitions {
-            if partition.sector_ids.is_empty() {
-                return Err(crate::error::PoCError::ValidationFailed(
-                    "Partition must have at least one sector".to_string(),
-                ));
-            }
-
-            if partition.challenges.len() != partition.responses.len() {
-                return Err(crate::error::PoCError::ValidationFailed(
-                    "Challenge/response count mismatch".to_string(),
-                ));
-            }
+        for p in &self.partitions {
+            p.validate()?;
         }
-
         Ok(())
     }
 
-    fn aggregate_partition_proofs(partitions: &[PartitionProof]) -> Vec<u8> {
-        let mut aggregated = Vec::new();
-
-        for partition in partitions {
-            aggregated.extend_from_slice(&partition.partition_id.to_le_bytes());
-
-            for response in &partition.responses {
-                aggregated.extend_from_slice(response);
-            }
-        }
-
-        aggregated
+    fn signing_bytes(&self) -> Vec<u8> {
+        let mut buf = b"ego/post/proof/v1:".to_vec();
+        buf.extend_from_slice(self.proof_id.as_bytes());
+        buf.extend_from_slice(self.prover_id.as_bytes());
+        buf.extend_from_slice(&self.epoch.to_le_bytes());
+        buf.extend_from_slice(&self.window_id.to_le_bytes());
+        buf
     }
 }
 
-impl PoStWindow {
-    pub fn new(
-        window_id: u64,
-        epoch: u64,
-        duration_ms: u64,
-        required_partitions: Vec<u64>,
-    ) -> Self {
-        let start_time = Timestamp::now();
-        let end_time = Timestamp::from_millis(start_time.as_millis() + duration_ms);
+// ─── Metrics ─────────────────────────────────────────────────────────────────
 
-        let challenge_seed = Self::generate_window_challenge_seed(epoch, window_id);
-
-        Self {
-            window_id,
-            epoch,
-            start_time,
-            end_time,
-            challenge_seed,
-            required_partitions,
-            submitted_proofs: Vec::new(),
-        }
-    }
-
-    pub fn is_active(&self) -> bool {
-        let now = Timestamp::now();
-        now >= self.start_time && now <= self.end_time
-    }
-
-    pub fn is_expired(&self) -> bool {
-        Timestamp::now() > self.end_time
-    }
-
-    pub fn generate_partition_challenges(&self, partition_id: u64, sector_count: u32) -> Vec<u64> {
-        use ego_core::crypto::hash_data;
-
-        let mut challenges = Vec::new();
-        let challenges_per_sector: u32 = 10;
-
-        for sector_idx in 0..sector_count {
-            for challenge_idx in 0..challenges_per_sector {
-                let mut data = Vec::new();
-                data.extend_from_slice(self.challenge_seed.as_bytes());
-                data.extend_from_slice(&partition_id.to_le_bytes());
-                data.extend_from_slice(&sector_idx.to_le_bytes());
-                data.extend_from_slice(&challenge_idx.to_le_bytes());
-
-                let challenge_hash = hash_data(&data);
-
-                let challenge_bytes = challenge_hash.as_bytes();
-                let challenge_value = u64::from_le_bytes([
-                    challenge_bytes[0],
-                    challenge_bytes[1],
-                    challenge_bytes[2],
-                    challenge_bytes[3],
-                    challenge_bytes[4],
-                    challenge_bytes[5],
-                    challenge_bytes[6],
-                    challenge_bytes[7],
-                ]);
-
-                challenges.push(challenge_value);
-            }
-        }
-
-        challenges
-    }
-
-    fn generate_window_challenge_seed(epoch: u64, window_id: u64) -> Hash {
-        use ego_core::crypto::hash_data;
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&epoch.to_le_bytes());
-        data.extend_from_slice(&window_id.to_le_bytes());
-        data.extend_from_slice(b"post_challenge_seed");
-
-        hash_data(&data)
-    }
+/// Accumulated PoSt proving metrics — fed into DRS scorer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoStMetrics {
+    pub windows_proven: u64,
+    pub windows_missed: u64,
+    pub windows_faulted: u64,
+    /// Rolling average latency
+    pub avg_latency_ms: f64,
+    /// P50 latency (updated periodically)
+    pub p50_latency_ms: u64,
+    /// P95 latency
+    pub p95_latency_ms: u64,
+    /// Pass rate = proven / (proven + missed + faulted)
+    pub pass_rate: f64,
+    pub last_updated: Timestamp,
 }
 
-impl WindowSchedule {
-    pub fn generate_deterministic_schedule(
-        node_addr: Address,
-        epoch: u64,
-        total_sectors: u32,
-        windows_per_day: u32,
-    ) -> Self {
-        let partition_size = total_sectors / windows_per_day;
-        let mut assigned_windows = Vec::new();
-
-        for window_idx in 0..windows_per_day {
-            let window_id = Self::compute_window_id(node_addr, epoch, window_idx);
-            let start_partition = window_idx * partition_size;
-            let end_partition = ((window_idx + 1) * partition_size).min(total_sectors);
-
-            let required_partitions: Vec<u64> =
-                (start_partition..end_partition).map(|i| i as u64).collect();
-
-            let window = PoStWindow::new(window_id, epoch, 1800_000, required_partitions);
-
-            assigned_windows.push(window);
-        }
-
-        Self {
-            node_addr,
-            epoch,
-            assigned_windows,
-            windows_per_day,
-            partition_size,
-        }
-    }
-
-    fn compute_window_id(node_addr: Address, epoch: u64, window_idx: u32) -> u64 {
-        use ego_core::crypto::hash_data;
-
-        let mut data = Vec::new();
-        data.extend_from_slice(node_addr.as_bytes());
-        data.extend_from_slice(&epoch.to_le_bytes());
-        data.extend_from_slice(&window_idx.to_le_bytes());
-
-        let window_hash = hash_data(&data);
-
-        let hash_bytes = window_hash.as_bytes();
-        u64::from_le_bytes([
-            hash_bytes[0],
-            hash_bytes[1],
-            hash_bytes[2],
-            hash_bytes[3],
-            hash_bytes[4],
-            hash_bytes[5],
-            hash_bytes[6],
-            hash_bytes[7],
-        ])
+impl PoStMetrics {
+    pub fn update_pass_rate(&mut self) {
+        let total = self.windows_proven + self.windows_missed + self.windows_faulted;
+        self.pass_rate = if total == 0 {
+            0.0
+        } else {
+            self.windows_proven as f64 / total as f64
+        };
     }
 }
-
-impl PartialEq for PoStEvent {
-    fn eq(&self, other: &Self) -> bool {
-        self.node_addr == other.node_addr
-            && self.epoch == other.epoch
-            && self.window_id == other.window_id
-    }
-}
-
-impl Eq for PoStEvent {}
-
-impl PartialEq for PoStProof {
-    fn eq(&self, other: &Self) -> bool {
-        self.prover_id == other.prover_id
-            && self.epoch == other.epoch
-            && self.window_id == other.window_id
-            && self.challenge_seed == other.challenge_seed
-    }
-}
-
-impl Eq for PoStProof {}
-
-impl PartialEq for PoStResult {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (PoStResult::Success, PoStResult::Success) => true,
-            (PoStResult::TotalFailure, PoStResult::TotalFailure) => true,
-            (PoStResult::Timeout, PoStResult::Timeout) => true,
-            (
-                PoStResult::PartialFailure {
-                    failed_partitions: f1,
-                },
-                PoStResult::PartialFailure {
-                    failed_partitions: f2,
-                },
-            ) => f1 == f2,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for PoStResult {}
 
 impl Default for PoStMetrics {
     fn default() -> Self {
         Self {
             windows_proven: 0,
             windows_missed: 0,
+            windows_faulted: 0,
             avg_latency_ms: 0.0,
             p50_latency_ms: 0,
             p95_latency_ms: 0,
-            partition_failures: 0,
+            pass_rate: 0.0,
             last_updated: Timestamp::now(),
         }
     }
 }
+
+// ─── Provider trait ──────────────────────────────────────────────────────────
+
+pub trait PoStProvider: Send + Sync {
+    fn provider_id(&self) -> Address;
+
+    fn generate_post_proof(
+        &self,
+        window: &PoStWindow,
+    ) -> impl Future<Output = PoCResult<PoStProof>> + Send;
+
+    fn verify_post_proof(
+        &self,
+        proof: &PoStProof,
+    ) -> impl Future<Output = PoCResult<bool>> + Send;
+
+    fn get_window_assignment(
+        &self,
+        epoch: u64,
+    ) -> impl Future<Output = PoCResult<WindowSchedule>> + Send;
+
+    fn get_proving_metrics(&self) -> PoStMetrics;
+}
+
+// ─── Triad health ─────────────────────────────────────────────────────────────
+
+/// RF=3 replica set health — all three nodes must be healthy for a deal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriadHealth {
+    pub deal_id: Hash,
+    pub nodes: [Address; 3],
+    pub node_pass_rates: [f64; 3],
+    pub node_miss_counts: [u32; 3],
+    pub is_healthy: bool,
+    pub faulty_node: Option<Address>,
+    pub last_updated: Timestamp,
+}
+
+impl TriadHealth {
+    pub fn new(deal_id: Hash, nodes: [Address; 3]) -> Self {
+        Self {
+            deal_id,
+            nodes,
+            node_pass_rates: [1.0; 3],
+            node_miss_counts: [0; 3],
+            is_healthy: true,
+            faulty_node: None,
+            last_updated: Timestamp::now(),
+        }
+    }
+
+    /// Update health after a PoSt event from one of the triad members.
+    pub fn record_post_event(&mut self, node_addr: Address, result: &PoStResult) {
+        for (i, &node) in self.nodes.iter().enumerate() {
+            if node == node_addr {
+                match result {
+                    PoStResult::Pass => {
+                        // Exponential moving average
+                        self.node_pass_rates[i] =
+                            self.node_pass_rates[i] * 0.9 + 0.1;
+                    }
+                    PoStResult::Miss | PoStResult::Fault => {
+                        self.node_miss_counts[i] += 1;
+                        self.node_pass_rates[i] = self.node_pass_rates[i] * 0.9;
+                        if self.node_pass_rates[i] < 0.5 {
+                            self.is_healthy = false;
+                            self.faulty_node = Some(node_addr);
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        self.last_updated = Timestamp::now();
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_post_event_creation() {
+    fn test_post_event_creation_and_validation() {
         let event = PoStEvent::new(
             Address::new([1u8; 20]),
-            100,
-            1,
-            vec![1, 2, 3],
-            Hash::new([2u8; 32]),
-            Hash::new([3u8; 32]),
-            PoStResult::Success,
-            5000,
+            10,
+            3,
+            vec![0, 1, 2],
+            Hash::new([5u8; 32]),
+            Hash::new([6u8; 32]),
+            PoStResult::Pass,
+            3_500,
         );
 
-        assert_eq!(event.epoch, 100);
-        assert_eq!(event.partitions_covered.len(), 3);
         assert!(event.validate().is_ok());
+        assert!(event.is_pass());
+        assert!(!event.is_miss());
+        assert_eq!(event.latency_ms, 3_500);
     }
 
     #[test]
     fn test_window_schedule_generation() {
-        let schedule =
-            WindowSchedule::generate_deterministic_schedule(Address::new([1u8; 20]), 100, 1000, 48);
+        let node = Address::new([2u8; 20]);
+        let schedule = WindowSchedule::generate_deterministic_schedule(node, 100, 1000, 48);
 
         assert_eq!(schedule.assigned_windows.len(), 48);
-        assert_eq!(schedule.windows_per_day, 48);
+        assert_eq!(schedule.epoch, 100);
 
-        let schedule2 =
-            WindowSchedule::generate_deterministic_schedule(Address::new([1u8; 20]), 100, 1000, 48);
-
-        assert_eq!(
-            schedule.assigned_windows.len(),
-            schedule2.assigned_windows.len()
-        );
+        // All windows should cover distinct partitions summing to 1000
+        let total: usize = schedule
+            .assigned_windows
+            .iter()
+            .map(|w| w.required_partitions.len())
+            .sum();
+        assert_eq!(total, 1000);
     }
 
     #[test]
-    fn test_post_window_challenges() {
-        let window = PoStWindow::new(1, 100, 1800_000, vec![1, 2, 3]);
+    fn test_partition_challenges_deterministic() {
+        let window = PoStWindow::new(
+            0, 1, vec![0, 1], Hash::new([9u8; 32]), 0, 3_600_000,
+        );
 
-        let challenges1 = window.generate_partition_challenges(1, 10);
-        let challenges2 = window.generate_partition_challenges(1, 10);
+        let c1 = window.generate_partition_challenges(0, 100);
+        let c2 = window.generate_partition_challenges(0, 100);
+        assert_eq!(c1, c2, "Challenges must be deterministic");
 
-        assert_eq!(challenges1, challenges2);
-        assert_eq!(challenges1.len(), 100);
+        let c3 = window.generate_partition_challenges(1, 100);
+        assert_ne!(c1, c3, "Different partitions should yield different challenges");
     }
 
     #[test]
     fn test_post_proof_validation() {
-        let partitions = vec![PartitionProof {
-            partition_id: 1,
-            sector_ids: vec![1, 2, 3],
-            challenges: vec![100, 200, 300],
-            responses: vec![[1u8; 32], [2u8; 32], [3u8; 32]],
-        }];
-
         let proof = PoStProof::new(
             Address::new([1u8; 20]),
-            100,
-            1,
-            partitions,
-            Hash::new([1u8; 32]),
+            5,
+            2,
+            vec![PartitionProof {
+                partition_id: 0,
+                sector_ids: vec![1, 2],
+                challenges: vec![10],
+                responses: vec![[0u8; 32]],
+            }],
+            Hash::new([7u8; 32]),
         );
 
         assert!(proof.validate().is_ok());
-        assert_eq!(proof.partitions.len(), 1);
-        assert!(!proof.proof_data.is_empty());
+    }
+
+    #[test]
+    fn test_triad_health_tracking() {
+        let deal_id = Hash::new([1u8; 32]);
+        let nodes = [
+            Address::new([1u8; 20]),
+            Address::new([2u8; 20]),
+            Address::new([3u8; 20]),
+        ];
+
+        let mut health = TriadHealth::new(deal_id, nodes);
+        assert!(health.is_healthy);
+
+        // Record many misses for node 0
+        for _ in 0..20 {
+            health.record_post_event(nodes[0], &PoStResult::Miss);
+        }
+
+        assert!(!health.is_healthy);
+        assert_eq!(health.faulty_node, Some(nodes[0]));
+    }
+
+    #[test]
+    fn test_post_metrics_pass_rate() {
+        let mut metrics = PoStMetrics::default();
+        metrics.windows_proven = 90;
+        metrics.windows_missed = 10;
+        metrics.update_pass_rate();
+        assert!((metrics.pass_rate - 0.9).abs() < 0.001);
     }
 }
