@@ -1,4 +1,5 @@
 use crate::beacon::BeaconAnnouncement;
+use crate::config::epoch::{EpochConfig, EpochConfigProvider};
 use crate::error::PoCResult;
 use crate::types::*;
 use crate::witness::WitnessReport;
@@ -241,8 +242,11 @@ pub fn verify_3gpp_path_loss(
     })
 }
 
-/// Whitepaper: Co-beacon nonce binding verification
-pub fn verify_nonce_binding(witness_reports: &[WitnessReport]) -> PoCResult<NonceCheck> {
+/// Whitepaper: Co-beacon nonce binding verification with custom threshold
+pub fn verify_nonce_binding_with_threshold(
+    witness_reports: &[WitnessReport],
+    min_binding_fraction: f64,
+) -> PoCResult<NonceCheck> {
     let total_witnesses = witness_reports.len();
 
     let witnesses_with_valid_nonce = witness_reports
@@ -260,7 +264,7 @@ pub fn verify_nonce_binding(witness_reports: &[WitnessReport]) -> PoCResult<Nonc
         0.0
     };
 
-    let min_fraction_met = binding_fraction >= MIN_NONCE_BINDING_FRACTION;
+    let min_fraction_met = binding_fraction >= min_binding_fraction;
 
     // Detect replay attacks: check for duplicate nonces
     let mut nonce_map: HashMap<Vec<u8>, Vec<Address>> = HashMap::new();
@@ -275,10 +279,10 @@ pub fn verify_nonce_binding(witness_reports: &[WitnessReport]) -> PoCResult<Nonc
         }
     }
 
-    let replay_detected = nonce_map.values().any(|witnesses| witnesses.len() > 1);
+    let replay_detected = nonce_map.values().any(|addresses| addresses.len() > 1);
 
     // Nonce score: normalize to [0, 1]
-    let nonce_score = (binding_fraction / MIN_NONCE_BINDING_FRACTION).min(1.0);
+    let nonce_score = (binding_fraction / min_binding_fraction).min(1.0);
 
     Ok(NonceCheck {
         witnesses_with_valid_nonce,
@@ -288,6 +292,11 @@ pub fn verify_nonce_binding(witness_reports: &[WitnessReport]) -> PoCResult<Nonc
         replay_detected,
         nonce_score,
     })
+}
+
+/// Whitepaper: Co-beacon nonce binding verification (legacy version)
+pub fn verify_nonce_binding(witness_reports: &[WitnessReport]) -> PoCResult<NonceCheck> {
+    verify_nonce_binding_with_threshold(witness_reports, MIN_NONCE_BINDING_FRACTION)
 }
 
 /// Whitepaper: Deterministic quality score calculation
@@ -366,11 +375,38 @@ pub fn apply_density_penalty(witness_reports: &[WitnessReport]) -> f64 {
     1.0 - ldm
 }
 
+/// Complete validation check per whitepaper with epoch-aware thresholds
+pub fn validate_poc_bundle_with_epoch_config(
+    witness_reports: &[WitnessReport],
+    beacon_announcement: &BeaconAnnouncement,
+    epoch_config: &EpochConfig,
+    epoch: u64,
+) -> PoCResult<ValidationResult> {
+    let thresholds = epoch_config.get_config(epoch);
+    validate_poc_bundle_impl(
+        witness_reports,
+        beacon_announcement,
+        thresholds.quality_thresholds.min_quality_score,
+        Some(thresholds),
+    )
+}
+
 /// Complete validation check per whitepaper
+/// DEPRECATED: Use validate_poc_bundle_with_epoch_config for new code
 pub fn validate_poc_bundle(
     witness_reports: &[WitnessReport],
     beacon_announcement: &BeaconAnnouncement,
     quality_threshold: f64,
+) -> PoCResult<ValidationResult> {
+    validate_poc_bundle_impl(witness_reports, beacon_announcement, quality_threshold, None)
+}
+
+/// Internal implementation with optional epoch config
+fn validate_poc_bundle_impl(
+    witness_reports: &[WitnessReport],
+    beacon_announcement: &BeaconAnnouncement,
+    quality_threshold: f64,
+    epoch_config: Option<&crate::config::epoch::ThresholdConfig>,
 ) -> PoCResult<ValidationResult> {
     let mut errors = Vec::new();
 
@@ -396,12 +432,17 @@ pub fn validate_poc_bundle(
         ));
     }
 
-    let nonce_check = verify_nonce_binding(witness_reports)?;
+    // Use epoch-based nonce binding threshold if available
+    let min_nonce_binding = epoch_config
+        .map(|cfg| cfg.quality_thresholds.min_nonce_binding_fraction)
+        .unwrap_or(MIN_NONCE_BINDING_FRACTION);
+
+    let nonce_check = verify_nonce_binding_with_threshold(witness_reports, min_nonce_binding)?;
     if !nonce_check.min_fraction_met {
         errors.push(format!(
             "Insufficient nonce binding: {:.1}% of witnesses (need {:.0}%)",
             nonce_check.binding_fraction * 100.0,
-            MIN_NONCE_BINDING_FRACTION * 100.0
+            min_nonce_binding * 100.0
         ));
     }
     if nonce_check.replay_detected {

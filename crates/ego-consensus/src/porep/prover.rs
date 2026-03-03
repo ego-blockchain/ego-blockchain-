@@ -1,6 +1,7 @@
 use super::{
     PoRepChallenge, PoRepEvent, PoRepFraudEvidence, PoRepFraudType, PoRepProof, PoRepProvider,
     SealingJob, SealingStatus, SectorCommitment,
+    persistence::{PoRepPersistence, PoRepRestoredState},
 };
 use crate::error::{PoCError, PoCResult};
 use ego_core::{
@@ -10,10 +11,11 @@ use ego_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, error};
 
 pub struct PoRepProver {
     keypair: Arc<KeyPair>,
@@ -28,6 +30,7 @@ pub struct PoRepProver {
     nvme_path: String,
     proof_event_sender: Option<mpsc::UnboundedSender<ProofEvent>>,
     fraud_event_sender: Option<mpsc::UnboundedSender<PoRepFraudEvidence>>,
+    persistence: Arc<PoRepPersistence>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +103,17 @@ impl PoRepProver {
             params_version: config.params_version,
         };
 
+        // Create temporary persistence with unique directory (for backwards compatibility)
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let thread_id = std::thread::current().id();
+        let unique_id = format!("porep_test_{}_{:?}", timestamp, thread_id);
+        let temp_dir = std::env::temp_dir().join(unique_id);
+        let temp_persistence = PoRepPersistence::new(&temp_dir, address)
+            .unwrap_or_else(|e| panic!("Failed to create temporary persistence: {}", e));
+
         Self {
             keypair: Arc::new(keypair),
             address,
@@ -113,7 +127,57 @@ impl PoRepProver {
             nvme_path: config.nvme_path,
             proof_event_sender: None,
             fraud_event_sender: None,
+            persistence: Arc::new(temp_persistence),
         }
+    }
+
+    /// Create new PoRepProver with persistent storage
+    pub fn new_with_persistence<P: AsRef<Path>>(
+        keypair: KeyPair,
+        config: ProverConfig,
+        db_path: P
+    ) -> PoCResult<Self> {
+        let address = Address::from_public_key(&keypair.public_key());
+
+        let partitions = (config.sector_size / (1024 * 1024 * 32)).max(1) as u32;
+
+        let proving_params = ProvingParams {
+            porep_id: Self::compute_porep_id(config.sector_size, config.params_version),
+            sector_size: config.sector_size,
+            partitions,
+            challenge_count: 176,
+            params_version: config.params_version,
+        };
+
+        // Initialize persistence layer
+        let persistence = PoRepPersistence::new(db_path, address)?;
+
+        // Try to restore state from persistence
+        let restored_state = persistence.restore_state()?;
+
+        info!("🔄 Restored PoRep state: {} sectors, {} jobs, {} commitments",
+              restored_state.active_sectors.len(),
+              restored_state.sealing_queue.len(),
+              restored_state.commitments.len());
+
+        let prover = Self {
+            keypair: Arc::new(keypair),
+            address,
+            sector_size: config.sector_size,
+            sealing_queue: Arc::new(RwLock::new(restored_state.sealing_queue)),
+            active_sectors: Arc::new(RwLock::new(restored_state.active_sectors)),
+            commitments: Arc::new(RwLock::new(restored_state.commitments)),
+            submitted_proofs: Arc::new(RwLock::new(restored_state.submitted_proofs)),
+            proving_params,
+            gpu_available: config.gpu_available,
+            nvme_path: config.nvme_path,
+            proof_event_sender: None,
+            fraud_event_sender: None,
+            persistence: Arc::new(persistence),
+        };
+
+        info!("✅ PoRepProver initialized with persistent storage");
+        Ok(prover)
     }
 
     pub fn with_proof_event_sender(mut self, sender: mpsc::UnboundedSender<ProofEvent>) -> Self {
@@ -480,6 +544,15 @@ impl PoRepProver {
             comm.deal_ids = deal_ids;
         }
 
+        // Drop locks before persistence to avoid deadlock
+        drop(sectors);
+        drop(comms);
+
+        // Persist the updated state
+        self.persist_sector_state(sector_id)?;
+        self.persist_commitment(sector_id)?;
+
+        debug!("💾 Persisted deal IDs update for sector {}", sector_id);
         Ok(())
     }
 
@@ -723,9 +796,28 @@ impl PoRepProvider for PoRepProver {
             submitted.insert(proof_hash);
         }
 
+        // Persist the sector state and submitted proofs after sealing completion
+        if let Err(e) = self.persist_sector_state(sector_id) {
+            warn!("Failed to persist sector state after sealing {}: {}", sector_id, e);
+        }
+
+        // Update sector proof count
+        {
+            let mut sectors = self.active_sectors.write().unwrap();
+            if let Some(sector_state) = sectors.get_mut(&sector_id) {
+                sector_state.proof_count += 1;
+                sector_state.last_challenged_at = Some(Timestamp::now());
+            }
+        }
+
+        // Persist the updated proof count
+        if let Err(e) = self.persist_sector_state(sector_id) {
+            warn!("Failed to persist sector state after proof count update {}: {}", sector_id, e);
+        }
+
         self.emit_proof_event(sector_id, true, 0, None);
 
-        info!("Sealed sector={} prover={}", sector_id, self.address);
+        info!("✅ Sealed sector={} prover={} (proof count incremented)", sector_id, self.address);
         Ok(proof)
     }
 
@@ -851,6 +943,110 @@ impl PoRepProvider for PoRepProver {
             .keys()
             .cloned()
             .collect()
+    }
+}
+
+impl PoRepProver {
+    /// Persist a sector state immediately after change
+    fn persist_sector_state(&self, sector_id: u64) -> PoCResult<()> {
+        let sectors = self.active_sectors.read().unwrap();
+        if let Some(sector_state) = sectors.get(&sector_id) {
+            if let Err(e) = self.persistence.save_sector_state(sector_state) {
+                error!("Failed to persist sector state {}: {}", sector_id, e);
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist sector commitment immediately after change
+    fn persist_commitment(&self, sector_id: u64) -> PoCResult<()> {
+        let commitments = self.commitments.read().unwrap();
+        if let Some(commitment) = commitments.get(&sector_id) {
+            if let Err(e) = self.persistence.save_commitment(sector_id, commitment) {
+                error!("Failed to persist commitment for sector {}: {}", sector_id, e);
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Start periodic backup task to ensure data is persisted regularly
+    pub fn start_periodic_backup(&self) -> mpsc::UnboundedSender<()> {
+        let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
+
+        let active_sectors = Arc::clone(&self.active_sectors);
+        let sealing_queue = Arc::clone(&self.sealing_queue);
+        let commitments = Arc::clone(&self.commitments);
+        let submitted_proofs = Arc::clone(&self.submitted_proofs);
+        let persistence = Arc::clone(&self.persistence);
+
+        tokio::spawn(async move {
+            let mut backup_interval = interval(Duration::from_secs(300)); // Every 5 minutes
+            loop {
+                tokio::select! {
+                    _ = backup_interval.tick() => {
+                        info!("🔄 Starting periodic PoRep state backup...");
+
+                        // Read all state data
+                        let sectors_snapshot = active_sectors.read().unwrap().clone();
+                        let queue_snapshot = sealing_queue.read().unwrap().clone();
+                        let commitments_snapshot = commitments.read().unwrap().clone();
+                        let proofs_snapshot = submitted_proofs.read().unwrap().clone();
+
+                        // Perform backup
+                        if let Err(e) = persistence.backup_state(
+                            &sectors_snapshot,
+                            &queue_snapshot,
+                            &commitments_snapshot,
+                            &proofs_snapshot,
+                        ) {
+                            error!("Periodic backup failed: {}", e);
+                        } else {
+                            debug!("✅ Periodic backup completed successfully");
+                        }
+                    }
+                    _ = shutdown_rx.recv() => {
+                        info!("📁 Shutting down periodic backup task");
+                        break;
+                    }
+                }
+            }
+        });
+
+        shutdown_tx
+    }
+
+    /// Perform immediate backup of current state
+    pub fn backup_current_state(&self) -> PoCResult<()> {
+        info!("💾 Performing immediate state backup...");
+
+        let sectors_snapshot = self.active_sectors.read().unwrap().clone();
+        let queue_snapshot = self.sealing_queue.read().unwrap().clone();
+        let commitments_snapshot = self.commitments.read().unwrap().clone();
+        let proofs_snapshot = self.submitted_proofs.read().unwrap().clone();
+
+        self.persistence.backup_state(
+            &sectors_snapshot,
+            &queue_snapshot,
+            &commitments_snapshot,
+            &proofs_snapshot,
+        )?;
+
+        info!("✅ Immediate backup completed");
+        Ok(())
+    }
+
+    /// Clean up old sectors from persistence
+    pub fn cleanup_old_sectors(&self, retention_days: u64) -> PoCResult<u32> {
+        let retention_ms = retention_days * 24 * 60 * 60 * 1000;
+        let cutoff_time = Timestamp::from_millis(Timestamp::now().as_millis().saturating_sub(retention_ms));
+        self.persistence.cleanup_completed_sectors(cutoff_time)
+    }
+
+    /// Get persistence statistics
+    pub fn get_persistence_stats(&self) -> PoCResult<super::persistence::PoRepStorageStats> {
+        self.persistence.get_stats()
     }
 }
 
