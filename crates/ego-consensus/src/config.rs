@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub mod epoch;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoCConsensusConfig {
     pub beacon_config: BeaconConfig,
@@ -40,6 +42,8 @@ pub struct AggregatorConfig {
     pub compression_threshold_bytes: usize,
     pub daily_anchor_interval_hours: u64,
     pub co_beacon_min_fraction: f64,
+    pub erlang_bridge_host: Option<String>,
+    pub erlang_bridge_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +192,8 @@ impl Default for AggregatorConfig {
             compression_threshold_bytes: 1024,
             daily_anchor_interval_hours: 24,
             co_beacon_min_fraction: 0.5,
+            erlang_bridge_host: None,
+            erlang_bridge_port: None,
         }
     }
 }

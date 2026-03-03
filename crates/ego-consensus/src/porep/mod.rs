@@ -1,3 +1,10 @@
+pub mod persistence;
+pub mod prover;
+pub mod verifier;
+
+#[cfg(feature = "testing")]
+pub mod integration_example;
+
 use crate::error::PoCResult;
 use ego_core::{Address, Hash, Signature, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -40,7 +47,7 @@ pub struct PoRepChallenge {
     pub deadline: Timestamp,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct SealingJob {
     pub job_id: Hash,
     pub sector_id: u64,
@@ -54,7 +61,7 @@ pub struct SealingJob {
     pub completed_at: Option<Timestamp>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub enum SealingStatus {
     Queued,
     PreCommit1,
@@ -550,9 +557,6 @@ impl PartialEq for SealingStatus {
 }
 
 impl Eq for SealingStatus {}
-
-pub mod prover;
-pub mod verifier;
 
 pub use prover::PoRepProver;
 pub use verifier::PoRepVerifier;
