@@ -1,3 +1,8 @@
+pub mod bridge;
+pub mod engine;
+
+pub use engine::SlashingEngine;
+
 use crate::error::PoCResult;
 use ego_core::{Address, Hash, Signature, Timestamp};
 use serde::{Deserialize, Serialize};
