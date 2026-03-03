@@ -156,6 +156,12 @@ impl AsRef<[u8]> for Hash {
     }
 }
 
+impl Default for Hash {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, bincode::Encode, bincode::Decode)]
 pub struct PublicKey {
     pub algorithm: AlgorithmId,
@@ -317,6 +323,12 @@ impl fmt::Display for PublicKey {
     }
 }
 
+impl Default for PublicKey {
+    fn default() -> Self {
+        Self::ed25519([0u8; 32])
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct Signature {
     pub algorithm: AlgorithmId,
@@ -410,6 +422,12 @@ impl Signature {
 impl fmt::Display for Signature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}({}B)", self.algorithm, self.signature_data.len())
+    }
+}
+
+impl Default for Signature {
+    fn default() -> Self {
+        Self::ed25519([0u8; 64])
     }
 }
 
