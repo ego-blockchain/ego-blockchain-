@@ -1,0 +1,52 @@
+[package]
+name = "ego-desktop-mvp"
+version = "0.1.0"
+description = "Ego Desktop MVP - Quantum-Safe Blockchain Demo"
+authors = ["Ego Blockchain Team"]
+license = "MIT"
+repository = "https://github.com/ego-blockchain/ego-desktop-mvp"
+edition = "2021"
+rust-version = "1.75"
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+tauri = { version = "1.0", features = [
+    "clipboard-write-text", "process-relaunch", "clipboard-read-text",
+    "os-all", "dialog-message", "window-unmaximize", "window-show",
+    "shell-open", "dialog-ask", "window-hide", "dialog-confirm",
+    "fs-all", "window-start-dragging", "window-maximize", "process-exit",
+    "notification-all", "dialog-save", "dialog-open", "window-close",
+    "path-all", "window-unminimize", "system-tray", "window-minimize"
+] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+thiserror = "1.0"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+directories = "5.0"
+qrcode = "0.14"
+base64 = "0.21"
+bech32 = "0.9"
+
+# Ego Blockchain dependencies
+ego-core = { path = "../../crates/ego-core" }
+
+# File system and encryption
+aes-gcm = "0.10"
+rand = "0.8"
+zeroize = { version = "1.6", features = ["derive"] }
+hex = "0.4"
+dirs = "5.0"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+igd = "0.12"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+# Prevent src-tauri from joining the parent ego-blockchain workspace.
+[workspace]

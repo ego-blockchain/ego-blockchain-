@@ -1,0 +1,5 @@
+[build]
+rustflags = ["-C", "target-cpu=x86-64"]
+
+[env]
+OPENSSL_STATIC = "1"
