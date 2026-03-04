@@ -1,0 +1,92 @@
+name: Build & Release
+
+# Triggered automatically on version tags (e.g. v0.1.0)
+# or manually from the Actions tab via workflow_dispatch.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  # ── Windows (x64) ─────────────────────────────────────────────────────────
+  build-windows:
+    name: Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ego-desktop-mvp/src-tauri -> target
+
+      - name: Install frontend dependencies
+        working-directory: ego-desktop-mvp
+        run: npm install
+
+      - name: Build (Windows)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: ego-desktop-mvp
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: 'Ego Desktop ${{ github.ref_name }}'
+          releaseBody: |
+            ## Ego Desktop ${{ github.ref_name }}
+
+            Download the installer for your platform:
+            - **Windows**: `.msi` (recommended) or `-setup.exe`
+            - **macOS**: `.dmg` (universal — Intel + Apple Silicon)
+          releaseDraft: true
+          prerelease: false
+
+  # ── macOS (universal binary: Intel + Apple Silicon) ───────────────────────
+  build-macos:
+    name: macOS Universal
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Both targets needed for a universal binary
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ego-desktop-mvp/src-tauri -> target
+
+      - name: Install frontend dependencies
+        working-directory: ego-desktop-mvp
+        run: npm install
+
+      - name: Build (macOS universal)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: ego-desktop-mvp
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: 'Ego Desktop ${{ github.ref_name }}'
+          releaseBody: |
+            ## Ego Desktop ${{ github.ref_name }}
+
+            Download the installer for your platform:
+            - **Windows**: `.msi` (recommended) or `-setup.exe`
+            - **macOS**: `.dmg` (universal — Intel + Apple Silicon)
+          releaseDraft: true
+          prerelease: false
+          # universal-apple-darwin = fat binary that runs on both Intel and M1/M2/M3
+          args: --target universal-apple-darwin
