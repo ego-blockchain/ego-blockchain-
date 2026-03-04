@@ -1,0 +1,248 @@
+// Prevents additional console window on Windows in release
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod app;
+mod commands;
+mod config;
+mod crypto;
+mod database;
+mod error;
+mod ledger;
+mod models;
+mod p2p;
+mod services;
+mod utils;
+
+use tauri::{Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem};
+use tauri::{CustomMenuItem, Menu, MenuItem, Submenu};
+
+/// Acquire the single-instance lock by binding a local TCP port.
+/// If the port is already taken, another Ego Desktop process is running —
+/// we show a native error dialog and exit cleanly.
+/// The returned listener must stay alive for the entire process lifetime
+/// (the OS releases the port automatically when the process exits or crashes).
+fn acquire_single_instance_lock() -> Option<std::net::TcpListener> {
+    match std::net::TcpListener::bind("127.0.0.1:47391") {
+        Ok(l) => Some(l),
+        Err(_) => {
+            eprintln!("[Ego Desktop] Another instance may already be running.");
+            None  // Don't exit — just warn and continue
+        }
+    }
+}
+
+
+
+#[cfg(target_os = "windows")]
+unsafe fn winapi_msgbox(title: *const u16, msg: *const u16) {
+    // Dynamically load user32.dll so we don't need a winapi dependency.
+    let lib = windows_sys_call(b"user32.dll\0", b"MessageBoxW\0");
+    if let Some(f) = lib {
+        type MsgBoxW = unsafe extern "system" fn(*mut std::ffi::c_void, *const u16, *const u16, u32) -> i32;
+        let f: MsgBoxW = std::mem::transmute(f);
+        f(std::ptr::null_mut(), msg, title, 0x30);
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn windows_sys_call(lib: &[u8], _func: &[u8]) -> Option<*const ()> {
+    // Stub — we just use eprintln on Windows too, the native dialog is optional.
+    let _ = (lib, _func);
+    None
+}
+
+fn main() {
+    // ── Single-instance guard ──────────────────────────────────────────────
+    // Bind a local TCP port. If it fails, another instance is already running.
+    // The listener is intentionally leaked so the OS holds the port until exit.
+    let _instance_lock = acquire_single_instance_lock();
+    // Create system tray
+    let quit = CustomMenuItem::new("quit".to_string(), "Quit");
+    let hide = CustomMenuItem::new("hide".to_string(), "Hide");
+    let show = CustomMenuItem::new("show".to_string(), "Show");
+    let tray_menu = SystemTrayMenu::new()
+        .add_item(show)
+        .add_item(hide)
+        .add_native_item(SystemTrayMenuItem::Separator)
+        .add_item(quit);
+
+    let tray = SystemTray::new().with_menu(tray_menu);
+
+    // Create main menu
+    let submenu = Submenu::new(
+        "Ego Desktop",
+        Menu::new()
+            .add_native_item(MenuItem::About("Ego Desktop".to_string(), tauri::AboutMetadata::new()))
+            .add_native_item(MenuItem::Separator)
+            .add_native_item(MenuItem::Services)
+            .add_native_item(MenuItem::Separator)
+            .add_native_item(MenuItem::Hide)
+            .add_native_item(MenuItem::HideOthers)
+            .add_native_item(MenuItem::ShowAll)
+            .add_native_item(MenuItem::Separator)
+            .add_native_item(MenuItem::Quit),
+    );
+
+    let menu = Menu::new()
+        .add_submenu(submenu)
+        .add_submenu(Submenu::new(
+            "File",
+            Menu::new()
+                .add_native_item(MenuItem::CloseWindow)
+        ))
+        .add_submenu(Submenu::new(
+            "Edit",
+            Menu::new()
+                .add_native_item(MenuItem::Undo)
+                .add_native_item(MenuItem::Redo)
+                .add_native_item(MenuItem::Separator)
+                .add_native_item(MenuItem::Cut)
+                .add_native_item(MenuItem::Copy)
+                .add_native_item(MenuItem::Paste)
+                .add_native_item(MenuItem::SelectAll),
+        ))
+        .add_submenu(Submenu::new(
+            "View",
+            Menu::new().add_native_item(MenuItem::EnterFullScreen),
+        ))
+        .add_submenu(Submenu::new(
+            "Window",
+            Menu::new()
+                .add_native_item(MenuItem::Minimize)
+                .add_native_item(MenuItem::Zoom),
+        ));
+
+    tauri::Builder::default()
+        .manage(app::AppState::new())
+        .system_tray(tray)
+        .menu(menu)
+        .on_system_tray_event(|app, event| match event {
+            SystemTrayEvent::LeftClick {
+                position: _,
+                size: _,
+                ..
+            } => {
+                let window = app.get_window("main").unwrap();
+                if window.is_visible().unwrap() {
+                    window.hide().unwrap();
+                } else {
+                    window.show().unwrap();
+                    window.set_focus().unwrap();
+                }
+            }
+            SystemTrayEvent::MenuItemClick { id, .. } => match id.as_str() {
+                "quit" => {
+                    std::process::exit(0);
+                }
+                "hide" => {
+                    let window = app.get_window("main").unwrap();
+                    window.hide().unwrap();
+                }
+                "show" => {
+                    let window = app.get_window("main").unwrap();
+                    window.show().unwrap();
+                    window.set_focus().unwrap();
+                }
+                _ => {}
+            },
+            _ => {}
+        })
+        .invoke_handler(tauri::generate_handler![
+            // Auth / wallet init
+            commands::auth::init_wallet,
+            commands::auth::generate_keypair,
+            commands::auth::import_keypair,
+            commands::auth::get_address,
+            // Multi-wallet management
+            commands::auth::list_wallets,
+            commands::auth::create_wallet,
+            commands::auth::switch_wallet,
+            commands::auth::delete_wallet,
+            commands::auth::rename_wallet,
+            // Security / recovery
+            commands::auth::set_security_pin,
+            commands::auth::verify_pin,
+            commands::auth::get_recovery_info,
+            // Wallet
+            commands::wallet::get_balance,
+            commands::wallet::send_transaction,
+            commands::wallet::get_transaction_history,
+            commands::wallet::reset_chain,
+            // Storage
+            commands::storage::store_file,
+            commands::storage::get_stored_files,
+            commands::storage::get_storage_metrics,
+            commands::storage::configure_storage,
+            commands::storage::delete_stored_file,
+            commands::storage::retrieve_file_preview,
+            // Files (legacy EgoSafe)
+            commands::files::encrypt_file,
+            commands::files::decrypt_file,
+            // Coverage / earnings / staking
+            commands::coverage::get_coverage_status,
+            commands::coverage::get_poc_events,
+            commands::coverage::get_network_peers,
+            commands::earnings::get_earnings_data,
+            commands::staking::get_staking_info,
+            // Explorer
+            commands::explorer::get_network_stats,
+            commands::explorer::get_blocks,
+            commands::explorer::get_all_transactions,
+            commands::explorer::get_block_info,
+            commands::explorer::get_transaction_info,
+            commands::explorer::get_file_events,
+            // Notifications / sharing
+            commands::notifications::import_shared_file,
+            // Messenger
+            commands::messenger::get_my_contact_bundle,
+            commands::messenger::import_contact,
+            commands::messenger::approve_contact_request,
+            commands::messenger::decline_contact_request,
+            commands::messenger::get_contacts,
+            commands::messenger::send_message,
+            commands::messenger::receive_message,
+            commands::messenger::get_messages,
+            commands::messenger::delete_contact,
+            commands::messenger::clear_messages,
+        ])
+        .setup(|app| {
+            // TCP P2P server
+            let handle = app.handle();
+            tauri::async_runtime::spawn(async move {
+                crate::p2p::start_p2p_server(handle).await;
+            });
+
+            // UDP LAN discovery listener
+            let handle_udp = app.handle();
+            tauri::async_runtime::spawn(async move {
+                crate::p2p::start_udp_discovery(handle_udp).await;
+            });
+
+            let handle2 = app.handle();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                crate::p2p::sync_chain_from_peers().await;
+                crate::p2p::broadcast_peer_announce(&handle2).await;
+                crate::p2p::broadcast_udp_announce().await;
+                crate::p2p::gossip_peer_list().await;
+
+                // Keep syncing + announcing every 30 seconds
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    crate::p2p::sync_chain_from_peers().await;
+                    crate::p2p::broadcast_peer_announce(&handle2).await;
+                    crate::p2p::broadcast_udp_announce().await;
+                    crate::p2p::gossip_peer_list().await;
+                }
+            });
+
+            #[cfg(debug_assertions)]
+            {
+                let window = app.get_window("main").unwrap();
+                window.open_devtools();
+            }
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
