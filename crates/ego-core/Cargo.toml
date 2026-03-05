@@ -30,10 +30,9 @@ hkdf = "0.12.4"
 sha2 = "0.10.9"
 zeroize = { version = "1.8.1", features = ["zeroize_derive"] }
 serde-big-array = "0.5.1"
-oqs = { version = "0.11", default-features = false }
-pqcrypto-kyber = "0.8.1"
-pqcrypto-dilithium = "0.5.0"
-pqcrypto-sphincsplus = "0.7.2"
+pqcrypto-kyber = "0.7"
+pqcrypto-dilithium = "0.4"
+pqcrypto-sphincsplus = "0.6"
 pqcrypto-traits = "0.3.5"
 bech32 = "0.11.0"
 
