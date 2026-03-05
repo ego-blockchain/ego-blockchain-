@@ -4,6 +4,8 @@
 // Method signatures match the actual bft.rs and drs.rs in this repo.
 
 use crate::aggregator::PoCEvent;
+use crate::challenge::{ChallengeService, ChallengeConfig};
+use crate::config::epoch::EpochConfig;
 use crate::consensus::bft::{BftEngine, BlockHeader, BlockRoots, QuorumCertificate, Vote};
 use crate::consensus::drs::{DRSInputs, DRSScoreEvent, DRSScorer};
 use crate::config::ValidationConfig;
@@ -11,8 +13,8 @@ use crate::error::PoCResult;
 use ego_core::{Address, Hash, KeyPair, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use tokio::sync::RwLock;
-use tracing::debug;
+use tokio::sync::{mpsc, RwLock};
+use tracing::{debug, info, warn};
 
 /// Engine-local validation result.
 /// (validation::ValidationResult is a type alias for Result<(), ValidationError> — not a struct)
@@ -59,6 +61,12 @@ pub struct ConsensusEngine {
     validated_events: RwLock<HashMap<Hash, EventValidationResult>>,
     /// Latest DRS score per node — keyed by node_addr
     drs_scores: RwLock<HashMap<Address, DRSScoreEvent>>,
+    /// Epoch-based configuration for dynamic thresholds
+    epoch_config: EpochConfig,
+    /// Challenge generation service
+    challenge_service: Option<ChallengeService>,
+    /// Block finalization event sender for challenge generation
+    block_finalization_sender: Option<mpsc::UnboundedSender<(BlockHeader, QuorumCertificate)>>,
 }
 
 impl ConsensusEngine {
@@ -78,6 +86,9 @@ impl ConsensusEngine {
             bft,
             validated_events: RwLock::new(HashMap::new()),
             drs_scores: RwLock::new(HashMap::new()),
+            epoch_config: EpochConfig::new(),
+            challenge_service: None,
+            block_finalization_sender: None,
         }
     }
 
@@ -122,10 +133,20 @@ impl ConsensusEngine {
         };
         let is_valid = confidence >= self.config.min_consensus_threshold;
 
-        if !is_valid       { fraud_indicators.push("Consensus threshold not met".to_string()); }
-        if event.quality_score < 0.5    { fraud_indicators.push("Low quality score".to_string()); }
-        if event.path_loss_rmse > 10.0  { fraud_indicators.push("High path-loss RMSE".to_string()); }
-        if event.nonce_binding_fraction < 0.6 { fraud_indicators.push("Insufficient nonce binding".to_string()); }
+        // Use epoch-based thresholds for validation
+        let current_epoch = Timestamp::now().as_secs() / 3600;
+        let thresholds = self.epoch_config.get_config(current_epoch);
+
+        if !is_valid { fraud_indicators.push("Consensus threshold not met".to_string()); }
+        if event.quality_score < thresholds.quality_thresholds.min_quality_score {
+            fraud_indicators.push("Low quality score".to_string());
+        }
+        if event.path_loss_rmse > thresholds.quality_thresholds.max_path_loss_rmse {
+            fraud_indicators.push("High path-loss RMSE".to_string());
+        }
+        if event.nonce_binding_fraction < thresholds.quality_thresholds.min_nonce_binding_fraction {
+            fraud_indicators.push("Insufficient nonce binding".to_string());
+        }
 
         Ok(EventValidationResult {
             event_hash: event.beacon_hash,
@@ -139,19 +160,28 @@ impl ConsensusEngine {
 
     /// DRS-aware vote — uses cached raw_score (f64 field on DRSScoreEvent).
     async fn drs_weighted_vote(&self, event: &PoCEvent, validator: &Address) -> bool {
+        // Get epoch-based thresholds
+        let current_epoch = Timestamp::now().as_secs() / 3600;
+        let thresholds = self.epoch_config.get_config(current_epoch);
+
         let threshold = {
             let scores = self.drs_scores.read().await;
             scores.get(validator)
-                .map(|s| s.raw_score * 0.6)  // raw_score is the f64 field
+                .map(|s| s.raw_score * thresholds.consensus_thresholds.drs_vote_multiplier)
                 .unwrap_or(0.42)
         };
 
         let mut score = event.quality_score;
-        if event.path_loss_rmse > 10.0       { score *= 0.7; }
-        if event.nonce_binding_fraction < 0.6 { score *= 0.8; }
-        if event.witness_hashes.len() < 3    { score *= 0.7; }
+        if event.path_loss_rmse > thresholds.quality_thresholds.max_path_loss_rmse {
+            score *= 0.7;
+        }
+        if event.nonce_binding_fraction < thresholds.quality_thresholds.min_nonce_binding_fraction {
+            score *= 0.8;
+        }
+        if event.witness_hashes.len() < thresholds.consensus_thresholds.min_witness_count {
+            score *= 0.7;
+        }
 
-        let current_epoch = Timestamp::now().as_secs() / 3600;
         if event.epoch + 24 < current_epoch  { score *= 0.3; }
 
         score >= threshold
@@ -199,7 +229,20 @@ impl ConsensusEngine {
 
     /// Commit a finalized block (was commit_block — actual method is finalize_block).
     pub fn finalize_block(&self, header: BlockHeader, qc: QuorumCertificate) -> PoCResult<()> {
-        self.bft.finalize_block(header, qc)
+        // Finalize block in BFT engine
+        self.bft.finalize_block(header.clone(), qc.clone())?;
+
+        // Emit block finalization event for challenge generation
+        if let Some(ref sender) = self.block_finalization_sender {
+            if let Err(e) = sender.send((header.clone(), qc)) {
+                warn!("Failed to send block finalization event for challenge generation: {}", e);
+            } else {
+                debug!("Emitted block finalization event for challenge generation: height={}, epoch={}",
+                       header.height, header.epoch);
+            }
+        }
+
+        Ok(())
     }
 
     /// VRF output for beacon challenge randomness.
@@ -209,6 +252,57 @@ impl ConsensusEngine {
 
     pub fn get_current_height(&self) -> u64 { self.bft.get_current_height() }
     pub fn get_current_epoch(&self) -> u64   { self.bft.get_current_epoch() }
+
+    /// Update epoch configuration with new thresholds
+    pub fn update_epoch_config(&mut self, config: EpochConfig) {
+        self.epoch_config = config;
+    }
+
+    /// Get current epoch configuration
+    pub fn get_epoch_config(&self) -> &EpochConfig {
+        &self.epoch_config
+    }
+
+    /// Enable challenge generation from finalized blocks
+    pub async fn enable_challenge_generation(&mut self, challenge_config: ChallengeConfig) -> PoCResult<()> {
+        let (block_sender, block_receiver) = mpsc::unbounded_channel();
+        let mut challenge_service = ChallengeService::new(challenge_config);
+
+        // Start the challenge service
+        challenge_service.start(block_receiver).await?;
+
+        self.challenge_service = Some(challenge_service);
+        self.block_finalization_sender = Some(block_sender);
+
+        info!("✅ Challenge generation enabled from finalized blocks");
+        Ok(())
+    }
+
+    /// Subscribe a beacon node to receive challenges for specific regions
+    pub fn subscribe_to_challenges(
+        &mut self,
+        node_id: Address,
+        regions: Vec<String>
+    ) -> Option<mpsc::UnboundedReceiver<crate::types::Challenge>> {
+        if let Some(ref mut challenge_service) = self.challenge_service {
+            Some(challenge_service.subscribe_node(node_id, regions))
+        } else {
+            warn!("Challenge generation not enabled - call enable_challenge_generation() first");
+            None
+        }
+    }
+
+    /// Update regional beacon mapping for challenge generation
+    pub fn update_region_beacons(&self, region_id: String, beacons: Vec<Address>) {
+        if let Some(ref challenge_service) = self.challenge_service {
+            challenge_service.update_region_beacons(region_id, beacons);
+        }
+    }
+
+    /// Get challenge generation statistics
+    pub fn get_challenge_stats(&self) -> Option<crate::challenge::GeneratorStats> {
+        self.challenge_service.as_ref().map(|service| service.get_stats())
+    }
 }
 
 #[cfg(test)]

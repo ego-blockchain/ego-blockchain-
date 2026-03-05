@@ -1,6 +1,7 @@
 pub mod bundle;
 pub mod node;
 pub mod validation;
+pub mod validator;
 pub mod dos_limits;
 
 pub use bundle::{PoCBundle, PoCEvent};
@@ -12,6 +13,7 @@ pub use validation::{
     apply_density_penalty,
     ValidationResult,
 };
+pub use validator::{PoCValidator, ValidatorVote, VoteType, ValidationResult as ValidatorResult};
 pub use dos_limits::{
     RateLimiter,
     DRSQuotaManager,
@@ -212,7 +214,7 @@ impl WitnessSet {
 }
 
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct DensityEvent {
     pub node_id: Address,
     pub h3_cell: String,
@@ -245,7 +247,7 @@ impl DensityEvent {
 }
 
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct DailyEvidenceRoot {
     pub evidence_root: Hash,
     pub bundle_count: u32,

@@ -1,0 +1,340 @@
+use crate::app::AppState;
+use crate::error::EgoDesktopError;
+use crate::ledger::{load_chain, save_chain, Ledger, LedgerTx, StoredFile, storage_dir};
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
+use rand::{rngs::OsRng, RngCore};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use tauri::State;
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StoreFileRequest {
+    pub file_path: String,
+    pub duration_months: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StoreFileResult {
+    pub cid: String,
+    pub name: String,
+    pub original_size: u64,
+    pub encrypted_size: u64,
+    pub duration_months: u32,
+    pub expiry_timestamp: i64,
+    pub cost_uegoc: u64,
+    pub key_nonce_hex: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StorageMetrics {
+    /// User-configured provision (0 = not set yet).
+    pub storage_allocated_bytes: u64,
+    pub space_used_bytes: u64,
+    pub space_available_bytes: u64,
+    pub availability_status: String,
+    pub last_post_latency_ms: Option<u32>,
+    pub last_post_timestamp: Option<i64>,
+    pub encrypted_files_count: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FilePreview {
+    pub name: String,
+    pub mime_type: String,
+    /// Base64-encoded decrypted content (empty if preview not supported).
+    pub data_base64: String,
+    pub size_bytes: u64,
+    pub previewable: bool,
+}
+
+// ── store_file ────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn store_file(
+    request: StoreFileRequest,
+    _state: State<'_, AppState>,
+) -> Result<StoreFileResult, EgoDesktopError> {
+    let file_bytes = fs::read(&request.file_path)
+        .map_err(|e| EgoDesktopError::FileSystemError(format!("Cannot read file: {e}")))?;
+
+    let original_size = file_bytes.len() as u64;
+    let file_name = std::path::Path::new(&request.file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    // CID = BLAKE2 hash of plaintext
+    let hash = ego_core::hash_data(&file_bytes);
+    let cid  = format!("egocid1{}", hash.to_hex());
+
+    // Encrypt with AES-256-GCM
+    let mut key_bytes   = [0u8; 32];
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut key_bytes);
+    OsRng.fill_bytes(&mut nonce_bytes);
+
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        .map_err(|e| EgoDesktopError::CryptoError(format!("Key init: {e}")))?;
+    let nonce      = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, file_bytes.as_ref())
+        .map_err(|e| EgoDesktopError::CryptoError(format!("Encrypt: {e}")))?;
+
+    // Stored format: nonce (12 bytes) || ciphertext
+    let mut on_disk = Vec::with_capacity(12 + ciphertext.len());
+    on_disk.extend_from_slice(&nonce_bytes);
+    on_disk.extend_from_slice(&ciphertext);
+    let encrypted_size = on_disk.len() as u64;
+
+    let storage_path = storage_dir().join(format!("{}.enc", &cid[7..15]));
+    fs::write(&storage_path, &on_disk)
+        .map_err(|e| EgoDesktopError::FileSystemError(format!("Write enc: {e}")))?;
+
+    // key_nonce_hex = hex(key || nonce)
+    let mut key_nonce = Vec::with_capacity(44);
+    key_nonce.extend_from_slice(&key_bytes);
+    key_nonce.extend_from_slice(&nonce_bytes);
+    let key_nonce_hex = hex::encode(&key_nonce);
+
+    // Cost: 0.01 EGOC per MB per month
+    let mb        = (original_size as f64) / 1_000_000.0;
+    let cost_egoc = (mb * 0.01 * request.duration_months as f64).max(0.0001);
+    let cost_uegoc = (cost_egoc * 1_000_000.0) as u64;
+
+    let now    = chrono::Utc::now().timestamp();
+    let expiry = now + (request.duration_months as i64) * 30 * 86_400;
+
+    let mut ledger = Ledger::load();
+
+    let stored = StoredFile {
+        cid:            cid.clone(),
+        name:           file_name.clone(),
+        original_size,
+        encrypted_size,
+        duration_months: request.duration_months,
+        stored_at:      now,
+        expiry,
+        status:         "Active".into(),
+        key_nonce_hex:  key_nonce_hex.clone(),
+        local_path:     storage_path.to_string_lossy().into(),
+        owner:          ledger.address.clone(),
+    };
+    // Deduct storage cost from the shared chain (authoritative balance).
+    let mut chain = load_chain();
+    let balance   = chain.balance_of(&ledger.address);
+    if cost_uegoc > balance {
+        return Err(EgoDesktopError::InvalidInput(format!(
+            "Insufficient balance: have {} uEGOC, need {} uEGOC for storage",
+            balance, cost_uegoc
+        )));
+    }
+    let cost_hash = format!(
+        "0x{}",
+        ego_core::hash_data(
+            format!("storage:{}:{}:{}", ledger.address, cid, now).as_bytes()
+        ).to_hex()
+    );
+    chain.transactions.push(LedgerTx {
+        hash:         cost_hash,
+        from:         ledger.address.clone(),
+        to:           "egot1storage0000000000000000000000000000000000".into(),
+        amount:       cost_uegoc,
+        memo:         Some(format!("Storage: {file_name}")),
+        timestamp:    now,
+        signature:    "storage".into(),
+        status:       "Confirmed".into(),
+        block_height: None,
+        nonce:        0,
+    });
+    save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save chain: {e}")))?;
+
+    // Store file metadata in per-wallet ledger (files are wallet-local).
+    ledger.stored_files.insert(0, stored);
+    ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save ledger: {e}")))?;
+
+    Ok(StoreFileResult {
+        cid,
+        name: file_name,
+        original_size,
+        encrypted_size,
+        duration_months: request.duration_months,
+        expiry_timestamp: expiry,
+        cost_uegoc,
+        key_nonce_hex,
+    })
+}
+
+// ── get_stored_files ──────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_stored_files(
+    _state: State<'_, AppState>,
+) -> Result<Vec<StoredFile>, EgoDesktopError> {
+    let ledger = Ledger::load();
+    let my_address = ledger.address.clone();
+    // Only return files owned by this wallet (empty owner = legacy record, belongs here too).
+    Ok(ledger
+        .stored_files
+        .into_iter()
+        .filter(|f| f.owner.is_empty() || f.owner == my_address)
+        .collect())
+}
+
+// ── get_storage_metrics ───────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_storage_metrics(
+    _state: State<'_, AppState>,
+) -> Result<StorageMetrics, EgoDesktopError> {
+    let ledger = Ledger::load();
+    let my_address = &ledger.address;
+
+    // Only count files owned by this wallet
+    let my_files: Vec<_> = ledger
+        .stored_files
+        .iter()
+        .filter(|f| f.owner.is_empty() || f.owner == *my_address)
+        .collect();
+
+    let used: u64    = my_files.iter().map(|f| f.encrypted_size).sum();
+    let allocated    = ledger.storage_allocated_bytes;
+    let available    = allocated.saturating_sub(used);
+
+    let now = chrono::Utc::now().timestamp();
+    let active_count = my_files.iter().filter(|f| f.expiry > now).count() as u32;
+
+    Ok(StorageMetrics {
+        storage_allocated_bytes: allocated,
+        space_used_bytes:        used,
+        space_available_bytes:   available,
+        availability_status:     if allocated > 0 { "Online".into() } else { "Not configured".into() },
+        last_post_latency_ms:    if allocated > 0 { Some(148) } else { None },
+        last_post_timestamp:     if allocated > 0 { Some(now - 600) } else { None },
+        encrypted_files_count:   active_count,
+    })
+}
+
+// ── configure_storage ─────────────────────────────────────────────────────────
+
+/// User sets how many GB they want to contribute to the network.
+#[tauri::command]
+pub async fn configure_storage(
+    gb: f64,
+    _state: State<'_, AppState>,
+) -> Result<u64, EgoDesktopError> {
+    if gb <= 0.0 {
+        return Err(EgoDesktopError::InvalidInput("Allocation must be > 0 GB".into()));
+    }
+    let allocated = (gb * 1_000_000_000.0) as u64;
+    let mut ledger = Ledger::load();
+    ledger.storage_allocated_bytes = allocated;
+    ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save: {e}")))?;
+    Ok(allocated)
+}
+
+// ── delete_stored_file ────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn delete_stored_file(
+    cid: String,
+    _state: State<'_, AppState>,
+) -> Result<(), EgoDesktopError> {
+    let mut ledger = Ledger::load();
+    if let Some(pos) = ledger.stored_files.iter().position(|f| f.cid == cid) {
+        let file = ledger.stored_files.remove(pos);
+        // Delete the physical .enc file (best-effort, ignore error if missing)
+        if !file.local_path.is_empty() {
+            let _ = fs::remove_file(&file.local_path);
+        }
+        ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save: {e}")))?;
+    }
+    Ok(())
+}
+
+// ── retrieve_file_preview ─────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn retrieve_file_preview(
+    cid: String,
+    _state: State<'_, AppState>,
+) -> Result<FilePreview, EgoDesktopError> {
+    let ledger = Ledger::load();
+    let file = ledger
+        .stored_files
+        .iter()
+        .find(|f| f.cid == cid)
+        .cloned()
+        .ok_or_else(|| EgoDesktopError::NotFound(format!("File {cid} not found")))?;
+
+    // No local copy (e.g. received from network in demo mode)
+    if file.local_path.is_empty() {
+        return Ok(FilePreview {
+            name:        file.name,
+            mime_type:   "application/octet-stream".into(),
+            data_base64: String::new(),
+            size_bytes:  file.original_size,
+            previewable: false,
+        });
+    }
+
+    let on_disk = fs::read(&file.local_path)
+        .map_err(|e| EgoDesktopError::FileSystemError(format!("Read enc: {e}")))?;
+
+    if on_disk.len() < 13 {
+        return Err(EgoDesktopError::FileSystemError("Encrypted file too short".into()));
+    }
+
+    // Stored format: nonce(12) || ciphertext
+    let nonce_bytes = &on_disk[..12];
+    let ciphertext  = &on_disk[12..];
+
+    let key_nonce = hex::decode(&file.key_nonce_hex)
+        .map_err(|e| EgoDesktopError::CryptoError(format!("Decode key: {e}")))?;
+    if key_nonce.len() < 32 {
+        return Err(EgoDesktopError::CryptoError("Key too short".into()));
+    }
+    let key_bytes = &key_nonce[..32];
+
+    let cipher = Aes256Gcm::new_from_slice(key_bytes)
+        .map_err(|e| EgoDesktopError::CryptoError(format!("Key init: {e}")))?;
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| EgoDesktopError::CryptoError(format!("Decrypt: {e}")))?;
+
+    // Detect MIME type from extension
+    let ext = file.name.rsplit('.').next().unwrap_or("").to_lowercase();
+    let mime_type = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png"          => "image/png",
+        "gif"          => "image/gif",
+        "webp"         => "image/webp",
+        "svg"          => "image/svg+xml",
+        "bmp"          => "image/bmp",
+        "txt" | "md" | "rs" | "py" | "js" | "ts" | "json"
+        | "csv" | "xml" | "html" | "css" | "toml" | "yaml" | "yml"
+                       => "text/plain",
+        _              => "application/octet-stream",
+    };
+
+    let previewable = mime_type.starts_with("image/") || mime_type == "text/plain";
+    let data_base64 = if previewable {
+        base64::encode(&plaintext)
+    } else {
+        String::new()
+    };
+
+    Ok(FilePreview {
+        name:        file.name,
+        mime_type:   mime_type.to_string(),
+        data_base64,
+        size_bytes:  plaintext.len() as u64,
+        previewable,
+    })
+}

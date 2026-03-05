@@ -1,4 +1,5 @@
 use super::{DetectedBeacon, Witness, WitnessMetrics, WitnessReport, WitnessStatus};
+use super::bridge::create_witness_sender;
 use crate::config::WitnessConfig;
 use crate::error::{PoCError, PoCResult};
 use crate::types::*;
@@ -105,7 +106,7 @@ impl WitnessNode {
         self.validate_config()?;
 
         let (_beacon_sender, beacon_receiver) = mpsc::unbounded_channel();
-        let (report_sender, _report_receiver) = mpsc::unbounded_channel();
+        let report_sender = create_witness_sender();
 
         self.beacon_receiver = Some(beacon_receiver);
         self.report_sender = Some(report_sender);
@@ -217,7 +218,7 @@ impl WitnessNode {
 
     async fn start_batch_processing(&self) -> PoCResult<()> {
         let batch_processor = self.batch_processor.clone();
-        let _report_sender = self.report_sender.clone();
+        let report_sender = self.report_sender.clone();
         let config = self.config.clone();
         let address = self.address;
 
@@ -234,11 +235,34 @@ impl WitnessNode {
                         || processor.batch_start_time.elapsed() >= processor.batch_interval);
 
                 if should_submit {
+                    let batch_size = processor.current_batch.len();
                     debug!(
                         "Submitting batch of {} reports from witness {}",
-                        processor.current_batch.len(),
+                        batch_size,
                         address
                     );
+
+                    // Send each report to aggregator via bridge
+                    if let Some(ref sender) = report_sender {
+                        let mut sent_count = 0;
+                        for report in &processor.current_batch {
+                            match sender.send(report.clone()) {
+                                Ok(()) => {
+                                    sent_count += 1;
+                                    debug!("Sent witness report {} to aggregator",
+                                           format!("{:?}", report.report_id));
+                                }
+                                Err(e) => {
+                                    warn!("Failed to send witness report: {}", e);
+                                }
+                            }
+                        }
+
+                        info!("📡 Sent {}/{} witness reports to aggregators",
+                              sent_count, batch_size);
+                    } else {
+                        warn!("No report sender available for witness {}", address);
+                    }
 
                     if config.enable_compression && processor.current_batch.len() > 1 {
                         debug!("Compressing batch for cellular-safe transmission");

@@ -89,6 +89,7 @@ pub enum PendingSlashStatus {
 
 // ── Engine ────────────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub struct SlashingEngine {
     keypair: Arc<KeyPair>,
     manager_addr: Address,
@@ -267,6 +268,74 @@ impl SlashingEngine {
         Ok(None)
     }
 
+
+    /// Report invalid PoC event for slashing - connects DensityEvent to slashing pipeline
+    /// This is called when aggregator detects co-location or other density violations
+    pub fn report_invalid_poc(
+        &self,
+        density_event: &crate::aggregator::DensityEvent,
+        reporter: Address,
+    ) -> PoCResult<Option<SlashEvent>> {
+        info!("Processing density violation for node {} in cell {} (LDM: {:.3})",
+              density_event.node_id, density_event.h3_cell, density_event.ldm);
+
+        // Calculate confidence based on LDM (Local Density Measurement)
+        // Higher LDM = more co-located devices = higher confidence of violation
+        let confidence = if density_event.ldm > 0.8 {
+            0.95 // Very high confidence for clear co-location
+        } else if density_event.ldm > 0.6 {
+            0.85 // High confidence
+        } else if density_event.ldm > 0.4 {
+            0.75 // Medium confidence
+        } else {
+            0.65 // Lower confidence, but still actionable
+        };
+
+        // Create evidence for the density violation
+        let evidence = SlashEvidence {
+            evidence_id: density_event.evidence_root,
+            accused: density_event.node_id,
+            reporter,
+            evidence_type: EvidenceType::PoCFraud, // Co-location is PoC fraud
+            proof_bytes: self.serialize_density_evidence(density_event)?,
+            confidence,
+            epoch: density_event.epoch,
+            affected_sectors: vec![], // Density violations don't affect specific sectors
+            submitted_at: density_event.timestamp,
+        };
+
+        // Propose slash for review
+        if let Some(slash_id) = self.propose_slash(evidence)? {
+            info!("Proposed slash {} for density violation by {} (confidence: {:.2})",
+                  format!("{:?}", slash_id), density_event.node_id, confidence);
+
+            // Auto-execute high-confidence density violations
+            if confidence >= 0.90 {
+                warn!("Auto-executing high-confidence density violation slash for {}",
+                      density_event.node_id);
+                let (event, _) = self.execute_slash(slash_id)?;
+                return Ok(Some(event));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Serialize density event evidence for slash proof
+    fn serialize_density_evidence(&self, density_event: &crate::aggregator::DensityEvent) -> PoCResult<Vec<u8>> {
+        // For now, create a simple serialized representation
+        let mut evidence_bytes = Vec::new();
+        evidence_bytes.extend_from_slice(density_event.node_id.as_bytes());
+        evidence_bytes.extend_from_slice(density_event.h3_cell.as_bytes());
+        evidence_bytes.extend_from_slice(&density_event.device_count.to_le_bytes());
+        evidence_bytes.extend_from_slice(&density_event.ldm.to_le_bytes());
+        evidence_bytes.extend_from_slice(density_event.evidence_root.as_bytes());
+        evidence_bytes.extend_from_slice(&density_event.timestamp.0.to_le_bytes());
+        evidence_bytes.extend_from_slice(&density_event.epoch.to_le_bytes());
+
+        Ok(evidence_bytes)
+    }
+
     /// Process consecutive PoSt misses — auto-execute if misses ≥ threshold.
     pub fn process_post_failure(
         &self,
@@ -279,7 +348,7 @@ impl SlashingEngine {
             return Ok(None);
         }
 
-        let confidence = (0.70 + (consecutive_misses as f64 - 3.0) * 0.05).min(0.99);
+        let confidence = (0.80 + (consecutive_misses as f64 - 3.0) * 0.05).min(0.99);
         let evidence_id = hash_multiple(&[
             node.as_bytes(),
             &epoch.to_le_bytes(),
