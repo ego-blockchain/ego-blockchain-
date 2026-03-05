@@ -96,7 +96,7 @@ jobs:
         with:
           workspaces: ego-desktop-mvp/src-tauri -> target
 
-      - name: Install OpenSSL and patch Cargo config (macOS ARM)
+      - name: Install OpenSSL (macOS ARM)
         run: |
           brew install openssl@3
           OPENSSL_PREFIX=$(brew --prefix openssl@3)
@@ -105,7 +105,7 @@ jobs:
           echo "OPENSSL_INCLUDE_DIR=$OPENSSL_PREFIX/include" >> $GITHUB_ENV
           echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
           echo "PKG_CONFIG_PATH=$OPENSSL_PREFIX/lib/pkgconfig" >> $GITHUB_ENV
-          printf '\n[target.aarch64-apple-darwin]\nrustflags = ["-L", "%s/lib", "-C", "target-cpu=apple-m1"]\n' "$OPENSSL_PREFIX" >> ego-desktop-mvp/src-tauri/.cargo/config.toml
+          echo "RUSTFLAGS=-L$OPENSSL_PREFIX/lib" >> $GITHUB_ENV
         env:
           HOMEBREW_NO_AUTO_UPDATE: 1
 
