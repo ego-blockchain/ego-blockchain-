@@ -74,8 +74,6 @@ jobs:
           node-version: '20'
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -89,6 +87,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
         with:
           projectPath: ego-desktop-mvp
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
@@ -96,7 +95,8 @@ jobs:
           releaseBody: ${{ env.RELEASE_BODY }}
           releaseDraft: true
           prerelease: false
-          args: --target aarch64-apple-darwin
+          # No --target flag: builds natively on the ARM runner so ring's
+          # NEON feature assertions pass without cross-compilation issues.
 
   # ── macOS Intel (x86_64) ──────────────────────────────────────────────────
   build-macos-intel:
@@ -111,8 +111,6 @@ jobs:
           node-version: '20'
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-apple-darwin
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -126,6 +124,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MACOSX_DEPLOYMENT_TARGET: '10.13'
         with:
           projectPath: ego-desktop-mvp
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
@@ -133,4 +132,4 @@ jobs:
           releaseBody: ${{ env.RELEASE_BODY }}
           releaseDraft: true
           prerelease: false
-          args: --target x86_64-apple-darwin
+          # No --target flag: builds natively on the Intel runner.
