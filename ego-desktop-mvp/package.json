@@ -1,0 +1,36 @@
+{
+  "name": "ego-desktop-mvp",
+  "version": "0.1.0",
+  "description": "Ego Desktop MVP - Quantum-Safe Blockchain Demo",
+  "main": "dist/index.html",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri-dev": "tauri dev",
+    "tauri-build": "tauri build"
+  },
+  "dependencies": {
+    "@heroicons/react": "^2.0.16",
+    "@tauri-apps/api": "^1.2.0",
+    "autoprefixer": "^10.4.14",
+    "chart.js": "^4.2.1",
+    "postcss": "^8.4.21",
+    "qrcode-generator": "^1.4.4",
+    "react": "^18.2.0",
+    "react-chartjs-2": "^5.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.8.0",
+    "tailwindcss": "^3.2.7"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^1.6.3",
+    "@types/react": "^18.0.28",
+    "@types/react-dom": "^18.0.11",
+    "@vitejs/plugin-react": "^3.1.0",
+    "typescript": "^4.9.4",
+    "vite": "^4.1.0"
+  },
+  "license": "MIT"
+}

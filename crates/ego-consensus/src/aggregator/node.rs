@@ -2,7 +2,10 @@ use super::{
     Aggregator, AggregatorMetrics, AggregatorStatus, DailyEvidenceRoot, DensityEvent,
     PoCBundle, PoCEvent, PoCFraudEvidence, PoCFraudType, WitnessSet,
 };
-use super::validation::{validate_poc_bundle, MIN_QUALITY_SCORE};
+use crate::bridge::{BftBridge, create_aggregator_bridge};
+use crate::witness::bridge::register_global_aggregator;
+use super::validation::{validate_poc_bundle, validate_poc_bundle_with_epoch_config, MIN_QUALITY_SCORE};
+use crate::config::epoch::{EpochConfig, EpochConfigProvider};
 use super::dos_limits::{
     RateLimiter, RateLimitConfig, DRSQuotaManager, CellularSafeMode,
 };
@@ -39,7 +42,8 @@ pub struct AggregatorNode {
     compression_enabled: bool,
     compression_threshold: usize,
     cellular_safe_mode: bool,
-    quality_threshold: f64, 
+    quality_threshold: f64,
+    epoch_config: Arc<RwLock<EpochConfig>>, 
 }
 
 impl AggregatorNode {
@@ -88,6 +92,7 @@ impl AggregatorNode {
             compression_threshold: config.compression_threshold_bytes,
             cellular_safe_mode: false,
             quality_threshold: MIN_QUALITY_SCORE, // Use whitepaper default
+            epoch_config: Arc::new(RwLock::new(EpochConfig::new())),
         }
     }
 
@@ -100,11 +105,25 @@ impl AggregatorNode {
         self.validate_config()?;
 
         let (_beacon_sender, beacon_receiver) = mpsc::unbounded_channel();
-        let (_witness_sender, witness_receiver) = mpsc::unbounded_channel();
-        let (event_sender, _event_receiver) = mpsc::unbounded_channel();
+        let (_witness_sender, witness_receiver) = mpsc::unbounded_channel::<WitnessReport>();
         let (fraud_sender, _fraud_receiver) = mpsc::unbounded_channel();
-        let (density_event_sender, _density_receiver) = mpsc::unbounded_channel();
-        let (daily_anchor_sender, _anchor_receiver) = mpsc::unbounded_channel();
+
+        // Create BFT bridge connection to Erlang consensus layer
+        let erlang_endpoint = format!("{}:{}",
+            self.config.erlang_bridge_host.as_deref().unwrap_or("localhost"),
+            self.config.erlang_bridge_port.unwrap_or(25010)
+        );
+        let (event_sender, density_event_sender, daily_anchor_sender) =
+            create_aggregator_bridge(erlang_endpoint.clone());
+
+        info!("🔗 BFT bridge connected to Erlang consensus layer at {}", erlang_endpoint);
+
+        // Create witness receiver channel
+        let (witness_sender, witness_receiver) = mpsc::unbounded_channel();
+
+        // Register this aggregator with witness bridge for its coverage regions
+        register_global_aggregator(self.coverage_region.clone(), witness_sender);
+        info!("📍 Registered aggregator for regions: {:?}", self.coverage_region);
 
         self.beacon_receiver = Some(beacon_receiver);
         self.witness_receiver = Some(witness_receiver);
@@ -611,7 +630,7 @@ impl AggregatorNode {
         };
 
         for bundle in bundles {
-            let event = bundle.create_poc_event(self.get_current_epoch());
+            let event = bundle.create_poc_event(self.get_current_epoch_impl());
             self.submit_poc_event(event).await?;
         }
 
@@ -646,7 +665,7 @@ impl AggregatorNode {
         Ok(())
     }
 
-    fn get_current_epoch(&self) -> u64 {
+    fn get_current_epoch_impl(&self) -> u64 {
         Timestamp::now().as_secs() / 3600
     }
 
@@ -899,11 +918,16 @@ impl Aggregator for AggregatorNode {
         }
 
 
-        let validation_result = validate_poc_bundle(
+        // Use epoch-based validation with current epoch
+        let current_epoch = self.get_current_epoch();
+        let epoch_config = self.get_epoch_config_guard();
+        let validation_result = validate_poc_bundle_with_epoch_config(
             &witness_set.witness_reports,
             &witness_set.beacon_announcement,
-            self.quality_threshold,
+            &epoch_config,
+            current_epoch,
         )?;
+        drop(epoch_config); // Release read lock early
 
         if !validation_result.valid {
             warn!(
@@ -1085,6 +1109,31 @@ impl Aggregator for AggregatorNode {
         );
 
         Ok(evidence_root)
+    }
+}
+
+impl EpochConfigProvider for AggregatorNode {
+    fn get_epoch_config(&self) -> &EpochConfig {
+        // This is a bit of a hack since we need &EpochConfig but have Arc<RwLock<EpochConfig>>
+        // In practice, we'll use the methods that don't require this trait
+        unimplemented!("Use get_epoch_config_guard() method instead")
+    }
+}
+
+impl AggregatorNode {
+    /// Get epoch configuration (thread-safe access)
+    pub fn get_epoch_config_guard(&self) -> std::sync::RwLockReadGuard<'_, EpochConfig> {
+        self.epoch_config.read().unwrap()
+    }
+
+    /// Update epoch configuration
+    pub fn update_epoch_config(&self, epoch_config: EpochConfig) {
+        *self.epoch_config.write().unwrap() = epoch_config;
+    }
+
+    /// Get current epoch number based on timestamp
+    pub fn get_current_epoch(&self) -> u64 {
+        Timestamp::now().as_secs() / 3600 // 1-hour epochs
     }
 }
 

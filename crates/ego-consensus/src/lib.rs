@@ -1,5 +1,7 @@
 pub mod aggregator;
 pub mod beacon;
+pub mod bridge;
+pub mod challenge;
 pub mod config;
 pub mod consensus;
 pub mod deal;

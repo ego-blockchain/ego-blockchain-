@@ -2,12 +2,13 @@ use crate::{BandwidthSharingEvent, NetworkEvent, OptimizerEvent};
 use crate::{BandwidthSharingManager, DataOptimizer, NetworkManager, NetworkType};
 use crate::{NodeBehaviour, Placement, ProofEvent, SecureKeystore, ShardConfig};
 
-use ego_core::ShardManager;
 use ego_core::{
     Account, Address, Balance, Block, BlockHeight, DeviceCapabilities, EgoResult, Hash, NodeRole,
     PublicKey, SliceId, StateManager, Transaction, TransactionResult, calculate_shard_for_address,
     current_timestamp, format_storage_size,
 };
+use ego_consensus::porep::{PoRepProver, PoRepVerifier, PoRepEvent};
+use ego_consensus::porep::prover::ProverConfig;
 use std::sync::Arc;
 
 use libp2p::{
@@ -42,9 +43,14 @@ pub struct Node {
     pub network_manager: NetworkManager,
     pub bandwidth_sharing: BandwidthSharingManager,
     pub data_optimizer: DataOptimizer,
+    pub porep_prover: Option<Arc<PoRepProver>>,
+    pub porep_verifier: Option<Arc<PoRepVerifier>>,
 
     pub optimization_events: mpsc::UnboundedSender<OptimizationCommand>,
     optimization_receiver: mpsc::UnboundedReceiver<OptimizationCommand>,
+
+    pub porep_events: mpsc::UnboundedSender<PoRepEvent>,
+    porep_receiver: mpsc::UnboundedReceiver<PoRepEvent>,
 
     pub node_type: String,
     pub is_bootstrap: bool,
@@ -202,9 +208,24 @@ impl Node {
         let data_optimizer = DataOptimizer::new();
         let state_manager = StateManager::new(1, 1);
 
-        let (optimization_events, optimization_receiver) = mpsc::unbounded_channel();
+        // Initialize PoRep components
+        let porep_prover = if roles_set.contains(&NodeRole::StorageProvider) {
+            let keypair = keystore.keypair().clone();
+            let config = ProverConfig::default();
+            Some(Arc::new(PoRepProver::new(keypair, config)))
+        } else {
+            None
+        };
 
         let node_address = Address::from_public_key(&keystore.public_key());
+        let porep_verifier = if roles_set.contains(&NodeRole::Validator) {
+            Some(Arc::new(PoRepVerifier::new(node_address)))
+        } else {
+            None
+        };
+
+        let (optimization_events, optimization_receiver) = mpsc::unbounded_channel();
+        let (porep_events, porep_receiver) = mpsc::unbounded_channel();
         let node_account = Account::new_eoa(
             node_address,
             keystore.dilithium_public_key().key_data.clone(),
@@ -239,8 +260,12 @@ impl Node {
             network_manager,
             bandwidth_sharing,
             data_optimizer,
+            porep_prover,
+            porep_verifier,
             optimization_events,
             optimization_receiver,
+            porep_events,
+            porep_receiver,
             node_type: "full".to_string(),
             is_bootstrap: false,
             connection_attempts: 0,
@@ -1325,5 +1350,37 @@ impl Node {
             let shard_count = self.shard_ids.len() as u32;
             calculate_shard_for_address(address, shard_count)
         }
+    }
+
+    /// Handle PoRep events from prover and verifier
+    pub async fn handle_porep_events(&mut self) {
+        while let Ok(event) = self.porep_receiver.try_recv() {
+            info!("Received PoRep event for sector {}", event.sector_id);
+
+            // Record proof generation metrics
+            self.performance_metrics.proof_events_generated += 1;
+
+            // Store recent proof for monitoring
+            let proof_event = ProofEvent {
+                event_type: "porep_event".to_string(),
+                shard_id: None,
+                piece_id: Some(event.sector_id as u32),
+                group_id: None,
+                evidence_digest: event.proof_hash.as_bytes().to_vec(),
+                timestamp: event.ts_ms,
+                peer_id: event.node_addr.to_string(),
+            };
+            self.recent_proofs.push(proof_event);
+
+            // Keep only the last 100 proofs
+            if self.recent_proofs.len() > 100 {
+                self.recent_proofs.remove(0);
+            }
+        }
+    }
+
+    /// Get PoRep event sender for external components to send events
+    pub fn get_porep_event_sender(&self) -> mpsc::UnboundedSender<PoRepEvent> {
+        self.porep_events.clone()
     }
 }

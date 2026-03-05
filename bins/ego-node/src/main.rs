@@ -630,6 +630,9 @@ async fn run_daemon_mode(mut node: Node, config: NodeConfig) -> anyhow::Result<(
                 if let Err(e) = node.process_optimization_events().await {
                     warn!("Error processing optimization events: {}", e);
                 }
+
+                // Process PoRep events
+                node.handle_porep_events().await;
             },
 
             _ = daily_reset_interval.tick() => {
@@ -890,6 +893,9 @@ async fn run_interactive_mode(mut node: Node, config: NodeConfig) -> anyhow::Res
                 if let Err(e) = node.process_optimization_events().await {
                     warn!("Error processing optimization events: {}", e);
                 }
+
+                // Process PoRep events
+                node.handle_porep_events().await;
             },
 
             _ = uptime_interval.tick() => {
