@@ -95,6 +95,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MACOSX_DEPLOYMENT_TARGET: '11.0'
+          RUSTFLAGS: '-C target-cpu=apple-m1'
         with:
           projectPath: ego-desktop-mvp
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
