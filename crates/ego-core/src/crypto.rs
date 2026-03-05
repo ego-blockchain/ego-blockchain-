@@ -10,8 +10,17 @@ use chacha20poly1305::{
 };
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
-use oqs::kem::{Algorithm as KemAlgorithm, Kem};
-use oqs::sig::{Algorithm as SigAlgorithm, Sig};
+use pqcrypto_dilithium::dilithium2;
+use pqcrypto_kyber::kyber768;
+use pqcrypto_sphincsplus::sphincssha2128ssimple;
+use pqcrypto_traits::kem::{
+    Ciphertext as PqKemCiphertext, PublicKey as PqKemPublicKey, SecretKey as PqKemSecretKey,
+    SharedSecret as PqSharedSecret,
+};
+use pqcrypto_traits::sign::{
+    DetachedSignature as PqDetachedSignature, PublicKey as PqSignPublicKey,
+    SecretKey as PqSignSecretKey,
+};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -1318,134 +1327,68 @@ impl MerkleProof {
 }
 
 fn derive_dilithium_keypair() -> EgoResult<(Vec<u8>, Vec<u8>)> {
-    let sigalg = Sig::new(SigAlgorithm::Dilithium2)
-        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize Dilithium2: {}", e)))?;
-
-    let (pk, sk) = sigalg.keypair().map_err(|e| {
-        EgoError::CryptoError(format!("Failed to generate Dilithium2 keypair: {}", e))
-    })?;
-
-    Ok((pk.into_vec(), sk.into_vec()))
+    let (pk, sk) = dilithium2::keypair();
+    Ok((pk.as_bytes().to_vec(), sk.as_bytes().to_vec()))
 }
 
 fn derive_kyber_keypair() -> EgoResult<(Vec<u8>, Vec<u8>)> {
-    let kem = Kem::new(KemAlgorithm::Kyber768)
-        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize Kyber768: {}", e)))?;
-
-    let (pk, sk) = kem.keypair().map_err(|e| {
-        EgoError::CryptoError(format!("Failed to generate Kyber768 keypair: {}", e))
-    })?;
-
-    Ok((pk.into_vec(), sk.into_vec()))
+    let (pk, sk) = kyber768::keypair();
+    Ok((pk.as_bytes().to_vec(), sk.as_bytes().to_vec()))
 }
 
 fn derive_slh_dsa_keypair() -> EgoResult<(Vec<u8>, Vec<u8>)> {
-    let sigalg = Sig::new(SigAlgorithm::SphincsSha2128sSimple)
-        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize SPHINCS+: {}", e)))?;
-
-    let (pk, sk) = sigalg.keypair().map_err(|e| {
-        EgoError::CryptoError(format!("Failed to generate SPHINCS+ keypair: {}", e))
-    })?;
-
-    Ok((pk.into_vec(), sk.into_vec()))
+    let (pk, sk) = sphincssha2128ssimple::keypair();
+    Ok((pk.as_bytes().to_vec(), sk.as_bytes().to_vec()))
 }
 
 pub fn dilithium_sign(secret_key: &[u8], message: &[u8]) -> EgoResult<Vec<u8>> {
-    let sigalg = Sig::new(SigAlgorithm::Dilithium2)
-        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize Dilithium2: {}", e)))?;
-
-    let sk = sigalg
-        .secret_key_from_bytes(secret_key)
-        .ok_or_else(|| EgoError::CryptoError("Invalid Dilithium2 secret key".to_string()))?;
-
-    let signature = sigalg
-        .sign(message, &sk)
-        .map_err(|e| EgoError::CryptoError(format!("Failed to sign with Dilithium2: {}", e)))?;
-
-    Ok(signature.into_vec())
+    let sk = dilithium2::SecretKey::from_bytes(secret_key)
+        .map_err(|_| EgoError::CryptoError("Invalid Dilithium2 secret key".to_string()))?;
+    let sig = dilithium2::detached_sign(message, &sk);
+    Ok(sig.as_bytes().to_vec())
 }
 
 pub fn dilithium_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> EgoResult<bool> {
-    let sigalg = Sig::new(SigAlgorithm::Dilithium2)
-        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize Dilithium2: {}", e)))?;
-
-    let pk = sigalg
-        .public_key_from_bytes(public_key)
-        .ok_or_else(|| EgoError::CryptoError("Invalid Dilithium2 public key".to_string()))?;
-
-    let sig = sigalg
-        .signature_from_bytes(signature)
-        .ok_or_else(|| EgoError::CryptoError("Invalid Dilithium2 signature".to_string()))?;
-
-    match sigalg.verify(message, &sig, &pk) {
+    let pk = dilithium2::PublicKey::from_bytes(public_key)
+        .map_err(|_| EgoError::CryptoError("Invalid Dilithium2 public key".to_string()))?;
+    let sig = dilithium2::DetachedSignature::from_bytes(signature)
+        .map_err(|_| EgoError::CryptoError("Invalid Dilithium2 signature".to_string()))?;
+    match dilithium2::verify_detached_signature(&sig, message, &pk) {
         Ok(()) => Ok(true),
         Err(_) => Ok(false),
     }
 }
 
 fn slh_dsa_sign(secret_key: &[u8], message: &[u8]) -> EgoResult<Vec<u8>> {
-    let sigalg = Sig::new(SigAlgorithm::SphincsSha2128sSimple)
-        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize SPHINCS+: {}", e)))?;
-
-    let sk = sigalg
-        .secret_key_from_bytes(secret_key)
-        .ok_or_else(|| EgoError::CryptoError("Invalid SPHINCS+ secret key".to_string()))?;
-
-    let signature = sigalg
-        .sign(message, &sk)
-        .map_err(|e| EgoError::CryptoError(format!("Failed to sign with SPHINCS+: {}", e)))?;
-
-    Ok(signature.into_vec())
+    let sk = sphincssha2128ssimple::SecretKey::from_bytes(secret_key)
+        .map_err(|_| EgoError::CryptoError("Invalid SPHINCS+ secret key".to_string()))?;
+    let sig = sphincssha2128ssimple::detached_sign(message, &sk);
+    Ok(sig.as_bytes().to_vec())
 }
 
 fn slh_dsa_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> EgoResult<bool> {
-    let sigalg = Sig::new(SigAlgorithm::SphincsSha2128sSimple)
-        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize SPHINCS+: {}", e)))?;
-
-    let pk = sigalg
-        .public_key_from_bytes(public_key)
-        .ok_or_else(|| EgoError::CryptoError("Invalid SPHINCS+ public key".to_string()))?;
-
-    let sig = sigalg
-        .signature_from_bytes(signature)
-        .ok_or_else(|| EgoError::CryptoError("Invalid SPHINCS+ signature".to_string()))?;
-
-    match sigalg.verify(message, &sig, &pk) {
+    let pk = sphincssha2128ssimple::PublicKey::from_bytes(public_key)
+        .map_err(|_| EgoError::CryptoError("Invalid SPHINCS+ public key".to_string()))?;
+    let sig = sphincssha2128ssimple::DetachedSignature::from_bytes(signature)
+        .map_err(|_| EgoError::CryptoError("Invalid SPHINCS+ signature".to_string()))?;
+    match sphincssha2128ssimple::verify_detached_signature(&sig, message, &pk) {
         Ok(()) => Ok(true),
         Err(_) => Ok(false),
     }
 }
 
 fn kyber_encapsulate(public_key: &[u8]) -> EgoResult<(Vec<u8>, Vec<u8>)> {
-    let kem = Kem::new(KemAlgorithm::Kyber768)
-        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize Kyber768: {}", e)))?;
-
-    let pk = kem
-        .public_key_from_bytes(public_key)
-        .ok_or_else(|| EgoError::CryptoError("Invalid Kyber768 public key".to_string()))?;
-
-    let (ciphertext, shared_secret) = kem.encapsulate(&pk).map_err(|e| {
-        EgoError::CryptoError(format!("Failed to encapsulate with Kyber768: {}", e))
-    })?;
-
-    Ok((ciphertext.into_vec(), shared_secret.into_vec()))
+    let pk = kyber768::PublicKey::from_bytes(public_key)
+        .map_err(|_| EgoError::CryptoError("Invalid Kyber768 public key".to_string()))?;
+    let (ct, ss) = kyber768::encapsulate(&pk);
+    Ok((ct.as_bytes().to_vec(), ss.as_bytes().to_vec()))
 }
 
 fn kyber_decapsulate(secret_key: &[u8], ciphertext: &[u8]) -> EgoResult<Vec<u8>> {
-    let kem = Kem::new(KemAlgorithm::Kyber768)
-        .map_err(|e| EgoError::CryptoError(format!("Failed to initialize Kyber768: {}", e)))?;
-
-    let sk = kem
-        .secret_key_from_bytes(secret_key)
-        .ok_or_else(|| EgoError::CryptoError("Invalid Kyber768 secret key".to_string()))?;
-
-    let ct = kem
-        .ciphertext_from_bytes(ciphertext)
-        .ok_or_else(|| EgoError::CryptoError("Invalid Kyber768 ciphertext".to_string()))?;
-
-    let shared_secret = kem.decapsulate(&sk, &ct).map_err(|e| {
-        EgoError::CryptoError(format!("Failed to decapsulate with Kyber768: {}", e))
-    })?;
-
-    Ok(shared_secret.into_vec())
+    let sk = kyber768::SecretKey::from_bytes(secret_key)
+        .map_err(|_| EgoError::CryptoError("Invalid Kyber768 secret key".to_string()))?;
+    let ct = kyber768::Ciphertext::from_bytes(ciphertext)
+        .map_err(|_| EgoError::CryptoError("Invalid Kyber768 ciphertext".to_string()))?;
+    let ss = kyber768::decapsulate(&ct, &sk);
+    Ok(ss.as_bytes().to_vec())
 }
