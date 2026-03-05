@@ -45,6 +45,13 @@ jobs:
         with:
           workspaces: ego-desktop-mvp/src-tauri -> target
 
+      - name: Install OpenSSL (Windows)
+        run: |
+          choco install openssl --no-progress -y
+          echo "OPENSSL_DIR=C:/Program Files/OpenSSL-Win64" >> $env:GITHUB_ENV
+          echo "OPENSSL_STATIC=1" >> $env:GITHUB_ENV
+        shell: pwsh
+
       - name: Install frontend dependencies
         working-directory: ego-desktop-mvp
         run: npm install
