@@ -65,6 +65,30 @@ pub async fn get_network_stats() -> Result<NetworkStats, EgoDesktopError> {
     })
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct P2pStatus {
+    /// "ok" | "failed" | "pending"
+    pub upnp: String,
+    pub upnp_error: Option<String>,
+    pub public_endpoint: String,
+    pub p2p_port: u16,
+}
+
+#[tauri::command]
+pub async fn get_p2p_status(state: tauri::State<'_, crate::app::AppState>) -> Result<P2pStatus, EgoDesktopError> {
+    let (upnp, upnp_error) = match state.get_upnp_status() {
+        None => ("pending".into(), None),
+        Some(Ok(())) => ("ok".into(), None),
+        Some(Err(e)) => ("failed".into(), Some(e)),
+    };
+    Ok(P2pStatus {
+        upnp,
+        upnp_error,
+        public_endpoint: state.get_public_endpoint(),
+        p2p_port: crate::p2p::P2P_PORT,
+    })
+}
+
 #[tauri::command]
 pub async fn get_blocks() -> Result<Vec<LedgerBlock>, EgoDesktopError> {
     let mut blocks = load_chain().blocks;

@@ -262,18 +262,26 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
 
     // Attempt UPnP port mapping so internet peers can reach us.
     // Runs in the background so it doesn't delay server startup.
-    tokio::spawn(async {
-        match upnp_map_port().await {
-            Ok(()) => eprintln!(
-                "[P2P] UPnP: port {} mapped — internet-wide P2P enabled",
-                P2P_PORT
-            ),
-            Err(e) => eprintln!(
-                "[P2P] UPnP unavailable ({}). \
-                 Internet P2P requires manual port forwarding of TCP {} on your router.",
-                e, P2P_PORT
-            ),
+    let app_for_upnp = app.clone();
+    tokio::spawn(async move {
+        let upnp_result = upnp_map_port().await;
+        let public_ep = get_public_endpoint().await;
+        let state = app_for_upnp.state::<crate::app::AppState>();
+        state.set_public_endpoint(public_ep.clone());
+        match &upnp_result {
+            Ok(()) => {
+                eprintln!("[P2P] UPnP: port {} mapped — internet-wide P2P enabled ({})", P2P_PORT, public_ep);
+                state.set_upnp_status(Ok(()));
+            }
+            Err(e) => {
+                eprintln!(
+                    "[P2P] UPnP unavailable ({}). Internet P2P requires manual port forwarding of TCP {} on your router.",
+                    e, P2P_PORT
+                );
+                state.set_upnp_status(Err(e.clone()));
+            }
         }
+        let _ = app_for_upnp.emit_all("ego://p2p-status-changed", ());
     });
 
     let listener = match TcpListener::bind(format!("0.0.0.0:{}", P2P_PORT)).await {
@@ -838,9 +846,14 @@ pub async fn send_message(endpoint: &str, msg: &P2PMessage) -> Result<(), String
     let mut stream = TcpStream::connect(endpoint)
         .await
         .map_err(|e| {
-            let hint = if e.raw_os_error() == Some(10060) || e.raw_os_error() == Some(110) {
-                " (the remote device may have Windows Firewall blocking port 47393 — \
-                  they should run Ego Desktop as Administrator once to add the firewall rule)"
+            let hint = if e.raw_os_error() == Some(10061) || e.raw_os_error() == Some(111) {
+                // ECONNREFUSED: port open on the internet but firewall/app blocking
+                " (Windows Firewall is likely blocking port 47393 — \
+                  the recipient should run Ego Desktop as Administrator once to add the firewall rule, \
+                  or run: netsh advfirewall firewall add rule name=\"Ego P2P\" dir=in action=allow protocol=TCP localport=47393)"
+            } else if e.raw_os_error() == Some(10060) || e.raw_os_error() == Some(110) {
+                // ETIMEDOUT: no route / port not forwarded on router
+                " (connection timed out — the recipient may need to forward TCP port 47393 on their router)"
             } else {
                 ""
             };

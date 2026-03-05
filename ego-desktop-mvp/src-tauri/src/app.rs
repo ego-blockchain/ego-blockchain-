@@ -26,6 +26,10 @@ pub struct AppState {
     pub last_earnings_credit: Arc<Mutex<i64>>,
     /// Live peers seen via PeerAnnounce P2P messages.
     pub active_peers: Arc<Mutex<Vec<PeerInfo>>>,
+    /// Result of UPnP port mapping attempt: None = pending, Some(Ok) = success, Some(Err) = failed.
+    pub upnp_status: Arc<Mutex<Option<Result<(), String>>>>,
+    /// Our detected public endpoint (ip:port), set after UPnP attempt.
+    pub public_endpoint: Arc<Mutex<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,7 +201,25 @@ impl AppState {
             session_started: Arc::new(Mutex::new(0)),
             last_earnings_credit: Arc::new(Mutex::new(0)),
             active_peers: Arc::new(Mutex::new(Vec::new())),
+            upnp_status: Arc::new(Mutex::new(None)),
+            public_endpoint: Arc::new(Mutex::new(String::new())),
         }
+    }
+
+    pub fn set_upnp_status(&self, result: Result<(), String>) {
+        *self.upnp_status.lock().unwrap() = Some(result);
+    }
+
+    pub fn set_public_endpoint(&self, endpoint: String) {
+        *self.public_endpoint.lock().unwrap() = endpoint;
+    }
+
+    pub fn get_upnp_status(&self) -> Option<Result<(), String>> {
+        self.upnp_status.lock().unwrap().clone()
+    }
+
+    pub fn get_public_endpoint(&self) -> String {
+        self.public_endpoint.lock().unwrap().clone()
     }
 
     /// Insert or update a peer (keyed by address).
