@@ -39,11 +39,21 @@ jobs:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: 'Ego Desktop ${{ github.ref_name }}'
           releaseBody: |
-            ## Ego Desktop ${{ github.ref_name }}
+            ## Download
 
-            Download the installer for your platform:
-            - **Windows**: `.msi` (recommended) or `-setup.exe`
-            - **macOS**: `.dmg` (universal — Intel + Apple Silicon)
+            | Platform | File |
+            |----------|------|
+            | **Windows** | `Ego Desktop_${{ github.ref_name }}_x64_en-US.msi` ← recommended |
+            | **Windows** (alt) | `Ego Desktop_${{ github.ref_name }}_x64-setup.exe` |
+            | **macOS** (Intel + Apple Silicon) | `Ego Desktop_${{ github.ref_name }}_universal.dmg` |
+
+            ### Windows
+            1. Download the `.msi` file and run it — follow the installer wizard.
+
+            ### macOS
+            1. Download the `.dmg` file.
+            2. Open it and drag **Ego Desktop** into your Applications folder.
+            3. First launch: **right-click the app → Open → Open** (required once since the app is not yet notarized).
           releaseDraft: true
           prerelease: false
 
@@ -81,11 +91,21 @@ jobs:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: 'Ego Desktop ${{ github.ref_name }}'
           releaseBody: |
-            ## Ego Desktop ${{ github.ref_name }}
+            ## Download
 
-            Download the installer for your platform:
-            - **Windows**: `.msi` (recommended) or `-setup.exe`
-            - **macOS**: `.dmg` (universal — Intel + Apple Silicon)
+            | Platform | File |
+            |----------|------|
+            | **Windows** | `Ego Desktop_${{ github.ref_name }}_x64_en-US.msi` ← recommended |
+            | **Windows** (alt) | `Ego Desktop_${{ github.ref_name }}_x64-setup.exe` |
+            | **macOS** (Intel + Apple Silicon) | `Ego Desktop_${{ github.ref_name }}_universal.dmg` |
+
+            ### Windows
+            1. Download the `.msi` file and run it — follow the installer wizard.
+
+            ### macOS
+            1. Download the `.dmg` file.
+            2. Open it and drag **Ego Desktop** into your Applications folder.
+            3. First launch: **right-click the app → Open → Open** (required once since the app is not yet notarized).
           releaseDraft: true
           prerelease: false
           # universal-apple-darwin = fat binary that runs on both Intel and M1/M2/M3
