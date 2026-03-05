@@ -12,7 +12,7 @@ use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use pqcrypto_dilithium::dilithium2;
 use pqcrypto_kyber::kyber768;
-use pqcrypto_sphincsplus::sphincssha2128ssimple;
+use pqcrypto_sphincsplus::sphincssha256128ssimple;
 use pqcrypto_traits::kem::{
     Ciphertext as PqKemCiphertext, PublicKey as PqKemPublicKey, SecretKey as PqKemSecretKey,
     SharedSecret as PqSharedSecret,
@@ -1337,7 +1337,7 @@ fn derive_kyber_keypair() -> EgoResult<(Vec<u8>, Vec<u8>)> {
 }
 
 fn derive_slh_dsa_keypair() -> EgoResult<(Vec<u8>, Vec<u8>)> {
-    let (pk, sk) = sphincssha2128ssimple::keypair();
+    let (pk, sk): (sphincssha256128ssimple::PublicKey, sphincssha256128ssimple::SecretKey) = sphincssha256128ssimple::keypair();
     Ok((pk.as_bytes().to_vec(), sk.as_bytes().to_vec()))
 }
 
@@ -1360,18 +1360,18 @@ pub fn dilithium_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> 
 }
 
 fn slh_dsa_sign(secret_key: &[u8], message: &[u8]) -> EgoResult<Vec<u8>> {
-    let sk = sphincssha2128ssimple::SecretKey::from_bytes(secret_key)
+    let sk = sphincssha256128ssimple::SecretKey::from_bytes(secret_key)
         .map_err(|_| EgoError::CryptoError("Invalid SPHINCS+ secret key".to_string()))?;
-    let sig = sphincssha2128ssimple::detached_sign(message, &sk);
+    let sig = sphincssha256128ssimple::detached_sign(message, &sk);
     Ok(sig.as_bytes().to_vec())
 }
 
 fn slh_dsa_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> EgoResult<bool> {
-    let pk = sphincssha2128ssimple::PublicKey::from_bytes(public_key)
+    let pk = sphincssha256128ssimple::PublicKey::from_bytes(public_key)
         .map_err(|_| EgoError::CryptoError("Invalid SPHINCS+ public key".to_string()))?;
-    let sig = sphincssha2128ssimple::DetachedSignature::from_bytes(signature)
+    let sig = sphincssha256128ssimple::DetachedSignature::from_bytes(signature)
         .map_err(|_| EgoError::CryptoError("Invalid SPHINCS+ signature".to_string()))?;
-    match sphincssha2128ssimple::verify_detached_signature(&sig, message, &pk) {
+    match sphincssha256128ssimple::verify_detached_signature(&sig, message, &pk) {
         Ok(()) => Ok(true),
         Err(_) => Ok(false),
     }
