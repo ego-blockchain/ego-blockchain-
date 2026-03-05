@@ -1157,11 +1157,6 @@ impl fmt::Display for PeerId {
     }
 }
 
-impl From<libp2p::PeerId> for PeerId {
-    fn from(peer_id: libp2p::PeerId) -> Self {
-        Self(peer_id.to_string())
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeId(pub PeerId);
@@ -1169,10 +1164,6 @@ pub struct NodeId(pub PeerId);
 impl NodeId {
     pub fn new(peer_id: PeerId) -> Self {
         Self(peer_id)
-    }
-
-    pub fn from_libp2p(peer_id: libp2p::PeerId) -> Self {
-        Self(PeerId::from(peer_id))
     }
 
     pub fn as_str(&self) -> &str {
