@@ -122,7 +122,7 @@ jobs:
   # ── macOS Intel (x86_64) ──────────────────────────────────────────────────
   build-macos-intel:
     name: macOS Intel
-    runs-on: macos-13       # macos-13 = last Intel runner on GitHub Actions
+    runs-on: macos-13-large       # macos-13 = last Intel runner on GitHub Actions
 
     steps:
       - uses: actions/checkout@v4
