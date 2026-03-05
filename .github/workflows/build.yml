@@ -46,11 +46,14 @@ jobs:
           workspaces: ego-desktop-mvp/src-tauri -> target
 
       - name: Install OpenSSL (Windows)
-        run: |
-          choco install openssl --no-progress -y
-          echo "OPENSSL_DIR=C:/Program Files/OpenSSL-Win64" >> $env:GITHUB_ENV
-          echo "OPENSSL_STATIC=1" >> $env:GITHUB_ENV
         shell: pwsh
+        run: |
+          choco install openssl --version=1.1.1.2100 -y
+          $OPENSSL_ROOT = "C:\Program Files\OpenSSL-Win64"
+          echo "OPENSSL_DIR=$OPENSSL_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "OPENSSL_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "LIB=$OPENSSL_ROOT\lib;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
+          echo "INCLUDE=$OPENSSL_ROOT\include;$env:INCLUDE" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install frontend dependencies
         working-directory: ego-desktop-mvp
@@ -86,6 +89,19 @@ jobs:
         with:
           workspaces: ego-desktop-mvp/src-tauri -> target
 
+      - name: Install OpenSSL (macOS ARM)
+        run: |
+          brew install openssl@3
+          OPENSSL_PREFIX=$(brew --prefix openssl@3)
+          echo "OPENSSL_DIR=$OPENSSL_PREFIX" >> $GITHUB_ENV
+          echo "OPENSSL_LIB_DIR=$OPENSSL_PREFIX/lib" >> $GITHUB_ENV
+          echo "OPENSSL_INCLUDE_DIR=$OPENSSL_PREFIX/include" >> $GITHUB_ENV
+          echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$OPENSSL_PREFIX/lib/pkgconfig" >> $GITHUB_ENV
+          echo "RUSTFLAGS=-C target-cpu=apple-m1" >> $GITHUB_ENV
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+
       - name: Install frontend dependencies
         working-directory: ego-desktop-mvp
         run: npm install
@@ -95,7 +111,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MACOSX_DEPLOYMENT_TARGET: '11.0'
-          RUSTFLAGS: '-C target-cpu=apple-m1'
         with:
           projectPath: ego-desktop-mvp
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
@@ -103,8 +118,6 @@ jobs:
           releaseBody: ${{ env.RELEASE_BODY }}
           releaseDraft: true
           prerelease: false
-          # No --target flag: builds natively on the ARM runner so ring's
-          # NEON feature assertions pass without cross-compilation issues.
 
   # ── macOS Intel (x86_64) ──────────────────────────────────────────────────
   build-macos-intel:
@@ -124,6 +137,18 @@ jobs:
         with:
           workspaces: ego-desktop-mvp/src-tauri -> target
 
+      - name: Install OpenSSL (macOS Intel)
+        run: |
+          brew install openssl@3
+          OPENSSL_PREFIX=$(brew --prefix openssl@3)
+          echo "OPENSSL_DIR=$OPENSSL_PREFIX" >> $GITHUB_ENV
+          echo "OPENSSL_LIB_DIR=$OPENSSL_PREFIX/lib" >> $GITHUB_ENV
+          echo "OPENSSL_INCLUDE_DIR=$OPENSSL_PREFIX/include" >> $GITHUB_ENV
+          echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$OPENSSL_PREFIX/lib/pkgconfig" >> $GITHUB_ENV
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+
       - name: Install frontend dependencies
         working-directory: ego-desktop-mvp
         run: npm install
@@ -140,4 +165,3 @@ jobs:
           releaseBody: ${{ env.RELEASE_BODY }}
           releaseDraft: true
           prerelease: false
-          # No --target flag: builds natively on the Intel runner.
