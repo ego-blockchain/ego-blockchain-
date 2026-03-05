@@ -1,7 +1,5 @@
 name: Build & Release
 
-# Triggered automatically on version tags (e.g. v0.1.0)
-# or manually from the Actions tab via workflow_dispatch.
 on:
   push:
     tags: ['v*']
@@ -15,14 +13,13 @@ env:
     |----------|------|
     | **Windows** | `Ego Desktop_*_x64_en-US.msi` ← recommended |
     | **Windows** (alt) | `Ego Desktop_*_x64-setup.exe` |
-    | **macOS Apple Silicon** (M1/M2/M3/M4) | `Ego Desktop_*_aarch64.dmg` |
-    | **macOS Intel** | `Ego Desktop_*_x64.dmg` |
+    | **macOS** (M1/M2/M3/M4) | `Ego Desktop_*_aarch64.dmg` |
 
     ### Windows
     1. Download the `.msi` file and run it — follow the installer wizard.
 
     ### macOS
-    1. Download the `.dmg` for your Mac (Apple Silicon = M-chip, Intel = older Mac).
+    1. Download the `.dmg` file.
     2. Open it and drag **Ego Desktop** into your Applications folder.
     3. First launch: **right-click the app → Open → Open** (required once since the app is not yet notarized).
 
@@ -74,7 +71,7 @@ jobs:
   # ── macOS Apple Silicon (aarch64 — M1/M2/M3/M4) ──────────────────────────
   build-macos-arm:
     name: macOS Apple Silicon
-    runs-on: macos-latest   # macos-latest = Apple Silicon runner
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -89,7 +86,7 @@ jobs:
         with:
           workspaces: ego-desktop-mvp/src-tauri -> target
 
-      - name: Install OpenSSL (macOS ARM)
+      - name: Install OpenSSL and patch Cargo config (macOS ARM)
         run: |
           brew install openssl@3
           OPENSSL_PREFIX=$(brew --prefix openssl@3)
@@ -98,7 +95,8 @@ jobs:
           echo "OPENSSL_INCLUDE_DIR=$OPENSSL_PREFIX/include" >> $GITHUB_ENV
           echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
           echo "PKG_CONFIG_PATH=$OPENSSL_PREFIX/lib/pkgconfig" >> $GITHUB_ENV
-          echo "RUSTFLAGS=-C target-cpu=apple-m1" >> $GITHUB_ENV
+          # Inject OpenSSL lib path into Cargo config so oqs-sys finds libcrypto
+          printf '\n[target.aarch64-apple-darwin]\nrustflags = ["-L", "%s/lib", "-C", "target-cpu=apple-m1"]\n' "$OPENSSL_PREFIX" >> ego-desktop-mvp/src-tauri/.cargo/config.toml
         env:
           HOMEBREW_NO_AUTO_UPDATE: 1
 
@@ -111,53 +109,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MACOSX_DEPLOYMENT_TARGET: '11.0'
-        with:
-          projectPath: ego-desktop-mvp
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-          releaseName: 'Ego Desktop ${{ github.ref_name }}'
-          releaseBody: ${{ env.RELEASE_BODY }}
-          releaseDraft: true
-          prerelease: false
-
-  # ── macOS Intel (x86_64) ──────────────────────────────────────────────────
-  build-macos-intel:
-    name: macOS Intel
-    runs-on: macos-13-large       # macos-13 = last Intel runner on GitHub Actions
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: ego-desktop-mvp/src-tauri -> target
-
-      - name: Install OpenSSL (macOS Intel)
-        run: |
-          brew install openssl@3
-          OPENSSL_PREFIX=$(brew --prefix openssl@3)
-          echo "OPENSSL_DIR=$OPENSSL_PREFIX" >> $GITHUB_ENV
-          echo "OPENSSL_LIB_DIR=$OPENSSL_PREFIX/lib" >> $GITHUB_ENV
-          echo "OPENSSL_INCLUDE_DIR=$OPENSSL_PREFIX/include" >> $GITHUB_ENV
-          echo "OPENSSL_STATIC=1" >> $GITHUB_ENV
-          echo "PKG_CONFIG_PATH=$OPENSSL_PREFIX/lib/pkgconfig" >> $GITHUB_ENV
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: 1
-
-      - name: Install frontend dependencies
-        working-directory: ego-desktop-mvp
-        run: npm install
-
-      - name: Build (macOS Intel)
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MACOSX_DEPLOYMENT_TARGET: '10.13'
         with:
           projectPath: ego-desktop-mvp
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
