@@ -186,6 +186,7 @@ fn main() {
             commands::staking::get_staking_info,
             // Explorer
             commands::explorer::get_network_stats,
+            commands::explorer::get_p2p_status,
             commands::explorer::get_blocks,
             commands::explorer::get_all_transactions,
             commands::explorer::get_block_info,

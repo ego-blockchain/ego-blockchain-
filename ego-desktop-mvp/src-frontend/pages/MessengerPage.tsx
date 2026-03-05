@@ -80,6 +80,10 @@ const MessengerPage: React.FC = () => {
   const msgEndRef = useRef<HTMLDivElement>(null);
   const [importedIds, setImportedIds] = useState<Set<string>>(new Set());
 
+  // P2P connectivity status
+  interface P2pStatus { upnp: string; upnp_error: string | null; public_endpoint: string; p2p_port: number; }
+  const [p2pStatus, setP2pStatus] = useState<P2pStatus | null>(null);
+
   // ── Data loaders ─────────────────────────────────────────────────────────
 
   async function loadContacts() {
@@ -106,6 +110,14 @@ const MessengerPage: React.FC = () => {
   // latest value without stale closure issues.
   const selectedRef = useRef<Contact | null>(null);
   useEffect(() => { selectedRef.current = selected; }, [selected]);
+
+  useEffect(() => {
+    invoke<P2pStatus>('get_p2p_status').then(setP2pStatus).catch(() => {});
+    const unlistenP2p = listen('ego://p2p-status-changed', () => {
+      invoke<P2pStatus>('get_p2p_status').then(setP2pStatus).catch(() => {});
+    });
+    return () => { unlistenP2p.then(fn => fn()); };
+  }, []);
 
   useEffect(() => {
     loadContacts();
@@ -272,7 +284,25 @@ const MessengerPage: React.FC = () => {
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
-    <div className="flex h-screen bg-gray-900 text-white overflow-hidden">
+    <div className="flex flex-col h-screen bg-gray-900 text-white overflow-hidden">
+
+      {/* ── P2P connectivity banner ── */}
+      {p2pStatus?.upnp === 'failed' && (
+        <div className="bg-yellow-900/80 border-b border-yellow-600/40 px-4 py-2 flex items-start gap-2 shrink-0">
+          <span className="text-yellow-400 shrink-0 mt-0.5">⚠️</span>
+          <div className="text-xs text-yellow-200 leading-relaxed">
+            <strong>Cross-network messaging may not work.</strong> UPnP port mapping failed — peers on other networks can't reach you.
+            Fix: forward <strong>TCP port {p2pStatus.p2p_port}</strong> to your local machine in your router settings.
+          </div>
+        </div>
+      )}
+      {p2pStatus?.upnp === 'ok' && (
+        <div className="bg-green-900/40 border-b border-green-700/30 px-4 py-1.5 shrink-0">
+          <span className="text-xs text-green-400">✓ Internet P2P active — reachable at {p2pStatus.public_endpoint}</span>
+        </div>
+      )}
+
+      <div className="flex flex-1 overflow-hidden">
 
       {/* ── Left sidebar: contacts ── */}
       <div className="w-64 bg-gray-800 border-r border-gray-700 flex flex-col shrink-0">
@@ -587,6 +617,8 @@ const MessengerPage: React.FC = () => {
           </div>
         )}
       </div>
+
+      </div>{/* end flex-1 row */}
 
       {/* ── Share My Card modal ── */}
       {showMyCard && (
