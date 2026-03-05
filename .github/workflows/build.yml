@@ -7,6 +7,25 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+env:
+  RELEASE_BODY: |
+    ## Download
+
+    | Platform | File |
+    |----------|------|
+    | **Windows** | `Ego Desktop_*_x64_en-US.msi` ← recommended |
+    | **Windows** (alt) | `Ego Desktop_*_x64-setup.exe` |
+    | **macOS Apple Silicon** (M1/M2/M3/M4) | `Ego Desktop_*_aarch64.dmg` |
+    | **macOS Intel** | `Ego Desktop_*_x64.dmg` |
+
+    ### Windows
+    1. Download the `.msi` file and run it — follow the installer wizard.
+
+    ### macOS
+    1. Download the `.dmg` for your Mac (Apple Silicon = M-chip, Intel = older Mac).
+    2. Open it and drag **Ego Desktop** into your Applications folder.
+    3. First launch: **right-click the app → Open → Open** (required once since the app is not yet notarized).
+
 jobs:
   # ── Windows (x64) ─────────────────────────────────────────────────────────
   build-windows:
@@ -38,29 +57,14 @@ jobs:
           projectPath: ego-desktop-mvp
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: 'Ego Desktop ${{ github.ref_name }}'
-          releaseBody: |
-            ## Download
-
-            | Platform | File |
-            |----------|------|
-            | **Windows** | `Ego Desktop_${{ github.ref_name }}_x64_en-US.msi` ← recommended |
-            | **Windows** (alt) | `Ego Desktop_${{ github.ref_name }}_x64-setup.exe` |
-            | **macOS** (Intel + Apple Silicon) | `Ego Desktop_${{ github.ref_name }}_universal.dmg` |
-
-            ### Windows
-            1. Download the `.msi` file and run it — follow the installer wizard.
-
-            ### macOS
-            1. Download the `.dmg` file.
-            2. Open it and drag **Ego Desktop** into your Applications folder.
-            3. First launch: **right-click the app → Open → Open** (required once since the app is not yet notarized).
+          releaseBody: ${{ env.RELEASE_BODY }}
           releaseDraft: true
           prerelease: false
 
-  # ── macOS (universal binary: Intel + Apple Silicon) ───────────────────────
-  build-macos:
-    name: macOS Universal
-    runs-on: macos-latest
+  # ── macOS Apple Silicon (aarch64 — M1/M2/M3/M4) ──────────────────────────
+  build-macos-arm:
+    name: macOS Apple Silicon
+    runs-on: macos-latest   # macos-latest = Apple Silicon runner
 
     steps:
       - uses: actions/checkout@v4
@@ -69,10 +73,9 @@ jobs:
         with:
           node-version: '20'
 
-      # Both targets needed for a universal binary
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-apple-darwin,aarch64-apple-darwin
+          targets: aarch64-apple-darwin
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -82,7 +85,7 @@ jobs:
         working-directory: ego-desktop-mvp
         run: npm install
 
-      - name: Build (macOS universal)
+      - name: Build (macOS Apple Silicon)
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -90,23 +93,44 @@ jobs:
           projectPath: ego-desktop-mvp
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: 'Ego Desktop ${{ github.ref_name }}'
-          releaseBody: |
-            ## Download
-
-            | Platform | File |
-            |----------|------|
-            | **Windows** | `Ego Desktop_${{ github.ref_name }}_x64_en-US.msi` ← recommended |
-            | **Windows** (alt) | `Ego Desktop_${{ github.ref_name }}_x64-setup.exe` |
-            | **macOS** (Intel + Apple Silicon) | `Ego Desktop_${{ github.ref_name }}_universal.dmg` |
-
-            ### Windows
-            1. Download the `.msi` file and run it — follow the installer wizard.
-
-            ### macOS
-            1. Download the `.dmg` file.
-            2. Open it and drag **Ego Desktop** into your Applications folder.
-            3. First launch: **right-click the app → Open → Open** (required once since the app is not yet notarized).
+          releaseBody: ${{ env.RELEASE_BODY }}
           releaseDraft: true
           prerelease: false
-          # universal-apple-darwin = fat binary that runs on both Intel and M1/M2/M3
-          args: --target universal-apple-darwin
+          args: --target aarch64-apple-darwin
+
+  # ── macOS Intel (x86_64) ──────────────────────────────────────────────────
+  build-macos-intel:
+    name: macOS Intel
+    runs-on: macos-13       # macos-13 = last Intel runner on GitHub Actions
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ego-desktop-mvp/src-tauri -> target
+
+      - name: Install frontend dependencies
+        working-directory: ego-desktop-mvp
+        run: npm install
+
+      - name: Build (macOS Intel)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: ego-desktop-mvp
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: 'Ego Desktop ${{ github.ref_name }}'
+          releaseBody: ${{ env.RELEASE_BODY }}
+          releaseDraft: true
+          prerelease: false
+          args: --target x86_64-apple-darwin
