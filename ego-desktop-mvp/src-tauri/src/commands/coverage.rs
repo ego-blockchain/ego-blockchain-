@@ -4,8 +4,6 @@ use serde::Deserialize;
 use tauri::State;
 
 // ── ip-api.com extended response ──────────────────────────────────────────────
-// Endpoint: http://ip-api.com/json?fields=status,lat,lon,city,regionName,country,isp,org,proxy,hosting
-// The `proxy` and `hosting` fields are available on the free tier when requested explicitly.
 
 #[derive(Deserialize)]
 struct IpApiResponse {
@@ -18,32 +16,23 @@ struct IpApiResponse {
     country: Option<String>,
     isp: Option<String>,
     org: Option<String>,
-    /// true if ip-api detects a proxy / VPN
     proxy: Option<bool>,
-    /// true if the IP belongs to a hosting / datacenter provider
     hosting: Option<bool>,
 }
 
 // ── VPN / proxy keyword blocklist ─────────────────────────────────────────────
-// Matches against ISP and org fields (lowercased). Covers major VPN providers
-// and datacenter ranges commonly used as VPN exit nodes.
+
 const VPN_KEYWORDS: &[&str] = &[
-    // Named VPN services
     "nordvpn", "expressvpn", "mullvad", "surfshark", "privatevpn",
     "cyberghost", "ipvanish", "purevpn", "protonvpn", "windscribe",
     "tunnelbear", "hotspot shield", "private internet access", "pia vpn",
     "torguard", "zenmate", "hide.me", "astrill", "ivpn", "ovpn",
     "hidemyass", "hma", "perfect privacy", "strongvpn", "vyprvpn",
     "avast vpn", "avg vpn", "norton vpn", "f-secure vpn", "bitdefender vpn",
-    // Generic proxy / anonymiser terms
     "vpn", "proxy", "anonymizer", "anonymiser", "tor exit", "tor relay",
     "socks", "openvpn", "wireguard relay",
-    // Datacenter / hosting providers often used as VPN exit nodes
     "datacamp", "m247", "leaseweb", "quadranet", "serverius",
     "choopa", "vultr", "linode", "akamai", "fastly",
-    // Note: we intentionally leave out "digitalocean", "aws", "cloudflare",
-    // "hetzner" etc. because many legitimate business ISPs use those networks.
-    // The ip-api `hosting` flag already catches datacenter IPs more precisely.
 ];
 
 fn vpn_keyword_match(resp: &IpApiResponse) -> Option<String> {
@@ -63,36 +52,25 @@ fn vpn_keyword_match(resp: &IpApiResponse) -> Option<String> {
 }
 
 fn detect_vpn(resp: &IpApiResponse) -> Option<String> {
-    // 1 – ip-api's own proxy flag
     if resp.proxy.unwrap_or(false) {
         return Some("IP flagged as proxy/VPN by ip-api.com".to_string());
     }
-    // 2 – hosting/datacenter flag
     if resp.hosting.unwrap_or(false) {
         return Some(format!(
             "IP belongs to a datacenter/hosting provider (ISP: {})",
             resp.isp.as_deref().unwrap_or("unknown")
         ));
     }
-    // 3 – keyword match in ISP / org name
     vpn_keyword_match(resp)
 }
 
 // ── Machine fingerprint ───────────────────────────────────────────────────────
-// Used to detect multiple wallets/instances on the same physical machine
-// attempting to multiply coverage rewards.
 
 fn get_machine_id() -> String {
-    // Windows: Windows Machine GUID from registry (unique per installation, survives reboots)
     #[cfg(target_os = "windows")]
     {
         if let Ok(output) = std::process::Command::new("reg")
-            .args([
-                "query",
-                r"HKLM\SOFTWARE\Microsoft\Cryptography",
-                "/v",
-                "MachineGuid",
-            ])
+            .args(["query", r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"])
             .output()
         {
             let text = String::from_utf8_lossy(&output.stdout);
@@ -106,25 +84,16 @@ fn get_machine_id() -> String {
         }
     }
 
-    // Linux: /etc/machine-id (systemd)
     #[cfg(target_os = "linux")]
     {
-        if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
-            let id = id.trim().to_string();
-            if !id.is_empty() {
-                return id;
-            }
-        }
-        // Fallback: /var/lib/dbus/machine-id
-        if let Ok(id) = std::fs::read_to_string("/var/lib/dbus/machine-id") {
-            let id = id.trim().to_string();
-            if !id.is_empty() {
-                return id;
+        for path in &["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+            if let Ok(id) = std::fs::read_to_string(path) {
+                let id = id.trim().to_string();
+                if !id.is_empty() { return id; }
             }
         }
     }
 
-    // macOS: IOPlatformUUID
     #[cfg(target_os = "macos")]
     {
         if let Ok(output) = std::process::Command::new("ioreg")
@@ -134,26 +103,36 @@ fn get_machine_id() -> String {
             let text = String::from_utf8_lossy(&output.stdout);
             for line in text.lines() {
                 if line.contains("IOPlatformUUID") {
-                    // Line looks like: "IOPlatformUUID" = "XXXXXXXX-XXXX-..."
                     let parts: Vec<&str> = line.splitn(2, '=').collect();
                     if let Some(val) = parts.get(1) {
                         let trimmed = val.trim().trim_matches('"');
-                        if !trimmed.is_empty() {
-                            return trimmed.to_string();
-                        }
+                        if !trimmed.is_empty() { return trimmed.to_string(); }
                     }
                 }
             }
         }
     }
 
-    // Universal fallback: hash of COMPUTERNAME (Windows) or HOSTNAME env var.
-    // Not as stable as a proper machine UUID but better than nothing.
     let hostname = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "unknown".to_string());
     let hash_bytes = ego_core::hash_data(hostname.as_bytes());
-    hex::encode(&hash_bytes.as_bytes()[..8]) // 16 hex chars
+    hex::encode(&hash_bytes.as_bytes()[..8])
+}
+
+// ── Network quality from peer count ──────────────────────────────────────────
+
+/// Derive network quality from how many live peers we can see.
+/// 0 peers = Offline (no P2P neighbours found yet).
+/// The thresholds are intentionally low for an early network.
+fn quality_from_peers(peer_count: usize, base_online: bool) -> NetworkQuality {
+    if !base_online { return NetworkQuality::Offline; }
+    match peer_count {
+        0           => NetworkQuality::Fair,      // online but isolated
+        1..=2       => NetworkQuality::Good,
+        3..=4       => NetworkQuality::Good,
+        _           => NetworkQuality::Excellent,
+    }
 }
 
 // ── PoC event recording ───────────────────────────────────────────────────────
@@ -168,7 +147,6 @@ fn quality_str(q: &NetworkQuality) -> &'static str {
     }
 }
 
-/// Derive a pseudo H3-style cell hex from lat/lon (same formula as frontend).
 fn derive_h3_cell(lat: f64, lon: f64) -> String {
     let a = (lat.abs() * 1_000.0).round() as u64;
     let b = (lon.abs() * 1_000.0).round() as u64;
@@ -176,8 +154,6 @@ fn derive_h3_cell(lat: f64, lon: f64) -> String {
     format!("892{:09x}ff", n % 1_000_000_000)
 }
 
-/// Append a PoC event to the wallet's poc_events.json if ≥240 s have elapsed
-/// since the last recorded event. Safe to call on every page visit.
 fn maybe_record_poc_event(status: &CoverageStatus) {
     let now    = chrono::Utc::now().timestamp();
     let mut events = crate::ledger::load_poc_events();
@@ -186,13 +162,10 @@ fn maybe_record_poc_event(status: &CoverageStatus) {
         .map(|e| now - e.timestamp >= 240)
         .unwrap_or(true);
 
-    if !should_record {
-        return;
-    }
+    if !should_record { return; }
 
     let quality = quality_str(&status.network_quality);
 
-    // Per-event reward: 8 EGOC/day ÷ 360 events ≈ 22 222 uEGOC
     let reward_uegoc: u64 = match quality {
         "Excellent" => 22_222,
         "Good"      => 18_518,
@@ -200,10 +173,11 @@ fn maybe_record_poc_event(status: &CoverageStatus) {
         _           => 11_111,
     };
 
-    // Solo node — no real peers on the network yet.
-    let peers: u32 = 0;
+    // FIX: use the real peer count from coverage_synced_count
+    let peers = status.coverage_synced_count;
 
-    let h3_cell = status.location.as_ref().map(|loc| derive_h3_cell(loc.latitude, loc.longitude));
+    let h3_cell = status.location.as_ref()
+        .map(|loc| derive_h3_cell(loc.latitude, loc.longitude));
 
     let next_id = events.last().map(|e| e.id + 1).unwrap_or(0);
 
@@ -216,7 +190,6 @@ fn maybe_record_poc_event(status: &CoverageStatus) {
         h3_cell,
     });
 
-    // Keep at most 200 events on disk
     if events.len() > 200 {
         let drain = events.len() - 200;
         events.drain(0..drain);
@@ -231,51 +204,82 @@ fn maybe_record_poc_event(status: &CoverageStatus) {
 pub async fn get_coverage_status(
     state: State<'_, AppState>,
 ) -> Result<CoverageStatus, EgoDesktopError> {
-    // Check cache first to avoid hammering ip-api.com on every page visit.
-    let cached = {
-        let cache = state.cache.lock().unwrap();
-        cache.coverage_status.clone()
+    // ── FIX: always fetch live peer count — don't rely on stale cache for this.
+    // The cache is only used for the IP geolocation part (expensive HTTP call).
+    // Peer count changes every few seconds and must be read fresh every call.
+
+    let machine_id  = get_machine_id();
+    let ledger      = crate::ledger::Ledger::load();
+    let node_active = !ledger.address.is_empty();
+
+    // ── FIX: read active peers from AppState (populated by P2P PeerAnnounce).
+    // active_peers_count uses a 300-second window — same as get_network_peers.
+    // "seen in last 5 minutes" is a reasonable definition of "online peer".
+    let active_peers = state.get_active_peers(300);
+    let peer_count   = active_peers.len();
+
+    // Also count approved contacts whose endpoint we know, as a fallback for
+    // peers that haven't sent a PeerAnnounce yet this session.
+    let contact_count = {
+        let contacts = crate::commands::messenger::load_contacts();
+        contacts.iter()
+            .filter(|c| c.status == "approved" && !c.endpoint.is_empty())
+            .count()
     };
 
-    let status = if let Some(s) = cached {
-        s
-    } else {
-        let machine_id  = get_machine_id();
-        let ledger      = crate::ledger::Ledger::load();
-        let node_active = !ledger.address.is_empty();
+    // Use whichever is larger — live PeerAnnounce beats stale contact list,
+    // but the contact list ensures we don't show 0 if the peer hasn't announced yet.
+    let visible_peers = peer_count.max(contact_count);
 
-        let (location, vpn_detected, vpn_reason) = fetch_ip_data().await;
-        let is_online = node_active && !vpn_detected;
-
-        let s = CoverageStatus {
-            location,
-            coverage_synced_count: if is_online { 1 } else { 0 },
-            last_coverage_event: if is_online {
-                Some(chrono::Utc::now().timestamp())
-            } else {
-                None
-            },
-            is_online,
-            network_quality: if is_online {
-                NetworkQuality::Excellent
-            } else {
-                NetworkQuality::Offline
-            },
-            vpn_detected,
-            vpn_reason,
-            machine_id,
+    // IP geolocation: use cache if available (avoid hammering ip-api.com)
+    let (location, vpn_detected, vpn_reason) = {
+        let cached_loc = {
+            let cache = state.cache.lock().unwrap();
+            cache.coverage_status.as_ref().map(|s| (
+                s.location.clone(),
+                s.vpn_detected,
+                s.vpn_reason.clone(),
+            ))
         };
-
-        state.update_coverage_status(s.clone());
-        s
+        if let Some(cached) = cached_loc {
+            cached
+        } else {
+            fetch_ip_data().await
+        }
     };
 
-    // Record a real PoC event (throttled to one per 240 s) if coverage is up.
-    if status.is_online {
-        maybe_record_poc_event(&status);
+    let is_online = node_active && !vpn_detected;
+
+    // ── FIX: coverage_synced_count = real visible peer count, not hardcoded 1
+    let coverage_synced_count = if is_online { visible_peers as u32 } else { 0u32 };
+
+    // ── FIX: network quality derived from actual peer count
+    let network_quality = quality_from_peers(visible_peers, is_online);
+
+    let s = CoverageStatus {
+        location,
+        // How many peer nodes this node can currently see
+        coverage_synced_count,
+        last_coverage_event: if is_online {
+            Some(chrono::Utc::now().timestamp())
+        } else {
+            None
+        },
+        is_online,
+        network_quality,
+        vpn_detected,
+        vpn_reason,
+        machine_id,
+    };
+
+    // Update cache so the IP geolocation part is reused next call
+    state.update_coverage_status(s.clone());
+
+    if s.is_online {
+        maybe_record_poc_event(&s);
     }
 
-    Ok(status)
+    Ok(s)
 }
 
 /// Return stored PoC events for this wallet, newest-first, capped at 100.
@@ -288,7 +292,6 @@ pub fn get_poc_events() -> Vec<crate::ledger::PocEvent> {
 }
 
 /// Fetch IP geolocation + proxy/hosting flags from ip-api.com (free tier).
-/// Returns (location, vpn_detected, reason_string).
 async fn fetch_ip_data() -> (Option<Location>, bool, String) {
     let url = "http://ip-api.com/json?fields=status,lat,lon,city,regionName,country,isp,org,proxy,hosting";
 
@@ -310,7 +313,7 @@ async fn fetch_ip_data() -> (Option<Location>, bool, String) {
         (Some(lat), Some(lon)) => Some(Location {
             latitude:  lat,
             longitude: lon,
-            accuracy:  Some(15_000.0), // IP geolocation ~1–15 km
+            accuracy:  Some(15_000.0),
             altitude:  None,
             city:      data.city.clone(),
             region:    data.region_name.clone(),
@@ -326,7 +329,6 @@ async fn fetch_ip_data() -> (Option<Location>, bool, String) {
 
     (location, vpn_detected, vpn_reason)
 }
-
 
 /// Return all peer nodes seen via P2P PeerAnnounce within the last 5 minutes.
 #[tauri::command]
