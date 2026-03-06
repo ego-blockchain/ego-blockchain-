@@ -1,4 +1,4 @@
-name: Build & Release
+name: Build macOS Intel
 
 on:
   push:
@@ -28,10 +28,9 @@ env:
     3. First launch: **right-click the app → Open → Open** (required once since the app is not yet notarized).
 
 jobs:
-  # ── Windows (x64) ─────────────────────────────────────────────────────────
-  build-windows:
-    name: Windows x64
-    runs-on: windows-latest
+  build-macos-intel:
+    name: macOS Intel
+    runs-on: macos-13
 
     steps:
       - uses: actions/checkout@v4
@@ -50,10 +49,11 @@ jobs:
         working-directory: ego-desktop-mvp
         run: npm install
 
-      - name: Build (Windows)
+      - name: Build (macOS Intel)
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MACOSX_DEPLOYMENT_TARGET: '10.15'
         with:
           projectPath: ego-desktop-mvp
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
@@ -61,40 +61,3 @@ jobs:
           releaseBody: ${{ env.RELEASE_BODY }}
           releaseDraft: true
           prerelease: false
-
-  # ── macOS Apple Silicon (aarch64 — M1/M2/M3/M4) ──────────────────────────
-  build-macos-arm:
-    name: macOS Apple Silicon
-    runs-on: macos-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: swatinem/rust-cache@v2
-        with:
-          workspaces: ego-desktop-mvp/src-tauri -> target
-
-      - name: Install frontend dependencies
-        working-directory: ego-desktop-mvp
-        run: npm install
-
-      - name: Build (macOS Apple Silicon)
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MACOSX_DEPLOYMENT_TARGET: '11.0'
-          RUSTFLAGS: '-C target-cpu=apple-m1'
-        with:
-          projectPath: ego-desktop-mvp
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-          releaseName: 'Ego Desktop ${{ github.ref_name }}'
-          releaseBody: ${{ env.RELEASE_BODY }}
-          releaseDraft: true
-          prerelease: false
-
