@@ -620,11 +620,8 @@ async fn handle_event(
         }
 
         SwarmEvent::Behaviour(EgoBehaviourEvent::Identify(identify::Event::Received {
-            peer_id: remote_peer_id, info, ..
+            peer_id: _remote_peer_id, info, ..
         })) => {
-            for addr in &info.listen_addrs {
-                swarm.behaviour_mut().kad.add_address(&remote_peer_id, addr.clone());
-            }
             let observed = info.observed_addr.clone();
             swarm.add_external_address(observed.clone());
             if !external_addrs.contains(&observed) {
