@@ -30,6 +30,9 @@ const RELAY_NODES: &[&str] = &[
     "/ip4/40.233.82.42/tcp/4001/p2p/12D3KooWPj6m7jzmVyMh1zWrsoux3YiVs9j2HwsjrFXzDcqAGGz4",
 ];
 
+/// HTTP chain API on the relay server — global source-of-truth for the blockchain.
+const RELAY_HTTP_API: &str = "http://40.233.82.42:8080";
+
 // ── Wire protocol ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -894,6 +897,52 @@ async fn merge_remote_chain(
         chain.blocks.sort_by_key(|b| b.height);
         let _ = save_chain(&chain);
         let _ = app.emit_all("ego://chain-updated", ());
+    }
+}
+
+// ── Relay HTTP chain sync ─────────────────────────────────────────────────────
+
+/// Fetch the full chain from the relay seed node and merge it into the local
+/// chain.json.  Called once on startup before any P2P peer connections so that
+/// every node always starts with the global history even after a fresh install.
+pub async fn fetch_chain_from_relay(app: &tauri::AppHandle) {
+    let url = format!("{}/chain", RELAY_HTTP_API);
+    eprintln!("[Relay] Fetching chain from {}", url);
+    let resp = match reqwest::get(&url).await {
+        Ok(r)  => r,
+        Err(e) => { eprintln!("[Relay] fetch_chain HTTP error: {}", e); return; }
+    };
+    let body = match resp.text().await {
+        Ok(b)  => b,
+        Err(e) => { eprintln!("[Relay] fetch_chain read error: {}", e); return; }
+    };
+    let remote: crate::ledger::SharedChain = match serde_json::from_str(&body) {
+        Ok(c)  => c,
+        Err(e) => { eprintln!("[Relay] fetch_chain parse error: {}", e); return; }
+    };
+    if remote.blocks.is_empty() && remote.transactions.is_empty() {
+        eprintln!("[Relay] Relay chain is empty — nothing to merge");
+        return;
+    }
+    merge_remote_chain(remote.blocks, remote.transactions, app).await;
+    eprintln!("[Relay] Chain merged from relay seed node");
+}
+
+/// Push a newly confirmed tx + block to the relay seed node so the global chain
+/// is updated immediately and not just when other peers sync.
+pub async fn push_tx_to_relay(tx: &crate::ledger::LedgerTx, block: &crate::ledger::LedgerBlock) {
+    let client = reqwest::Client::new();
+    // Push tx
+    if let Err(e) = client.post(format!("{}/chain/tx", RELAY_HTTP_API))
+        .json(tx).send().await
+    {
+        eprintln!("[Relay] push tx error: {}", e);
+    }
+    // Push block
+    if let Err(e) = client.post(format!("{}/chain/block", RELAY_HTTP_API))
+        .json(block).send().await
+    {
+        eprintln!("[Relay] push block error: {}", e);
     }
 }
 

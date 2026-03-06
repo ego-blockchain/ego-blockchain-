@@ -219,6 +219,12 @@ fn main() {
                     eprintln!("[Startup] Public endpoint ready: {}", my_endpoint);
                 }
 
+                // Fetch the global chain from the relay seed node.
+                // This ensures every node starts with the full shared history
+                // even on a fresh install, before any P2P peer connections.
+                crate::p2p::fetch_chain_from_relay(&handle_startup).await;
+                eprintln!("[Startup] Relay chain sync complete");
+
                 // Announce our (now relay-circuit) endpoint to all contacts.
                 // This refreshes their stale stored endpoint for us.
                 crate::p2p::broadcast_peer_announce(&handle_startup).await;
