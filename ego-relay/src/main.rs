@@ -1,13 +1,16 @@
-//! Ego Relay Server — libp2p circuit relay v2 + HTTP chain API.
+//! Ego Relay Server — libp2p circuit relay v2 + HTTP chain/peer API.
 //!
 //! Runs two services in parallel:
 //!   • libp2p swarm on TCP port 4001 — NAT traversal relay for all peers
-//!   • axum HTTP server on TCP port 8080 — global chain seed node
+//!   • axum HTTP server on TCP port 8080 — global chain seed + peer directory
 //!
-//! The HTTP API is the global source-of-truth for the blockchain.
-//! Every Ego Desktop node fetches the chain from here on startup and
-//! pushes every new confirmed tx/block back here so no local node can
-//! delete or roll back the shared history.
+//! HTTP endpoints:
+//!   GET  /chain        — full global blockchain
+//!   POST /chain/tx     — submit a confirmed transaction
+//!   POST /chain/block  — submit a mined block
+//!   GET  /peers        — list all known peer endpoints (refreshed every session)
+//!   POST /peers        — register/update your relay circuit address
+//!   GET  /health       — liveness probe
 
 use axum::{
     extract::State,
@@ -83,16 +86,46 @@ fn save_chain(chain: &SharedChain) {
     }
 }
 
+// ── Peer directory ────────────────────────────────────────────────────────────
+
+const PEERS_PATH: &str = "peers.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PeerEntry {
+    /// Ego wallet address (egot1...)
+    address:   String,
+    /// Display name
+    name:      String,
+    /// libp2p multiaddr — always a relay circuit addr if available
+    endpoint:  String,
+    last_seen: i64,
+}
+
+fn load_peers() -> Vec<PeerEntry> {
+    if let Ok(data) = fs::read_to_string(PEERS_PATH) {
+        if let Ok(p) = serde_json::from_str::<Vec<PeerEntry>>(&data) {
+            return p;
+        }
+    }
+    Vec::new()
+}
+
+fn save_peers(peers: &[PeerEntry]) {
+    if let Ok(data) = serde_json::to_string_pretty(peers) {
+        let _ = fs::write(PEERS_PATH, data);
+    }
+}
+
 // ── Shared HTTP state ─────────────────────────────────────────────────────────
 
 type ChainState = Arc<RwLock<SharedChain>>;
+type PeersState = Arc<RwLock<Vec<PeerEntry>>>;
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
 
 /// GET /chain — returns the full chain as JSON.
-async fn get_chain(State(state): State<ChainState>) -> Json<SharedChain> {
-    let chain = state.read().unwrap().clone();
-    Json(chain)
+async fn get_chain(State((chain, _)): State<(ChainState, PeersState)>) -> Json<SharedChain> {
+    Json(chain.read().unwrap().clone())
 }
 
 /// GET /health — simple liveness probe.
@@ -100,12 +133,44 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// GET /peers — returns all known peer relay circuit addresses.
+async fn get_peers(State((_, peers)): State<(ChainState, PeersState)>) -> Json<Vec<PeerEntry>> {
+    Json(peers.read().unwrap().clone())
+}
+
+/// POST /peers — register or refresh a peer's relay circuit endpoint.
+/// Peers call this as soon as their relay reservation is accepted.
+async fn post_peer(
+    State((_, peers)): State<(ChainState, PeersState)>,
+    Json(entry): Json<PeerEntry>,
+) -> StatusCode {
+    if entry.address.is_empty() || entry.endpoint.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+    let mut list = peers.write().unwrap();
+    let now = chrono::Utc::now().timestamp();
+    if let Some(existing) = list.iter_mut().find(|p| p.address == entry.address) {
+        existing.endpoint  = entry.endpoint.clone();
+        existing.name      = entry.name.clone();
+        existing.last_seen = now;
+        println!("[peers] Updated endpoint for {} → {}", entry.address, entry.endpoint);
+    } else {
+        println!("[peers] New peer {} → {}", entry.address, entry.endpoint);
+        list.push(PeerEntry { last_seen: now, ..entry });
+    }
+    // Prune peers not seen in 7 days
+    let cutoff = now - 7 * 86_400;
+    list.retain(|p| p.last_seen >= cutoff);
+    save_peers(&list);
+    StatusCode::OK
+}
+
 /// POST /chain/tx — accepts a confirmed transaction; deduplicates by hash.
 async fn post_tx(
-    State(state): State<ChainState>,
+    State((chain_state, _)): State<(ChainState, PeersState)>,
     Json(tx): Json<LedgerTx>,
 ) -> StatusCode {
-    let mut chain = state.write().unwrap();
+    let mut chain = chain_state.write().unwrap();
     if !chain.transactions.iter().any(|t| t.hash == tx.hash) {
         println!("[chain] New tx {} from {} → {} ({} uEGOC)", tx.hash, tx.from, tx.to, tx.amount);
         chain.transactions.push(tx);
@@ -116,14 +181,13 @@ async fn post_tx(
 
 /// POST /chain/block — accepts a mined block; deduplicates by hash.
 async fn post_block(
-    State(state): State<ChainState>,
+    State((chain_state, _)): State<(ChainState, PeersState)>,
     Json(block): Json<LedgerBlock>,
 ) -> StatusCode {
-    let mut chain = state.write().unwrap();
+    let mut chain = chain_state.write().unwrap();
     if !chain.blocks.iter().any(|b| b.hash == block.hash) {
         println!("[chain] New block #{} hash {}", block.height, block.hash);
         chain.blocks.push(block);
-        // keep blocks sorted by height
         chain.blocks.sort_by_key(|b| b.height);
         save_chain(&chain);
     }
@@ -156,27 +220,31 @@ async fn main() {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(8080);
 
-    // ── Load persisted chain ──────────────────────────────────────────────
+    // ── Load persisted chain + peer list ─────────────────────────────────
     let chain_state: ChainState = Arc::new(RwLock::new(load_chain()));
+    let peers_state: PeersState = Arc::new(RwLock::new(load_peers()));
     {
         let c = chain_state.read().unwrap();
+        let p = peers_state.read().unwrap();
         println!("[chain] Loaded {} blocks, {} txs from {}", c.blocks.len(), c.transactions.len(), CHAIN_PATH);
+        println!("[peers] Loaded {} known peers from {}", p.len(), PEERS_PATH);
     }
 
     // ── Start HTTP API in background ──────────────────────────────────────
-    let http_state = chain_state.clone();
-    let http_addr  = format!("0.0.0.0:{}", http_port);
+    let shared = (chain_state.clone(), peers_state.clone());
+    let http_addr = format!("0.0.0.0:{}", http_port);
     tokio::spawn(async move {
         let app = Router::new()
             .route("/chain",       get(get_chain))
             .route("/chain/tx",    post(post_tx))
             .route("/chain/block", post(post_block))
+            .route("/peers",       get(get_peers).post(post_peer))
             .route("/health",      get(health))
-            .with_state(http_state);
+            .with_state(shared);
 
         let listener = tokio::net::TcpListener::bind(&http_addr).await
             .expect("HTTP bind failed");
-        println!("[http] Chain API listening on {}", http_addr);
+        println!("[http] Chain + peer API listening on {}", http_addr);
         axum::serve(listener, app).await.expect("HTTP server error");
     });
 
