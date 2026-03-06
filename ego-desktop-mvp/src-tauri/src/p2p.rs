@@ -12,15 +12,12 @@ use chrono::Utc;
 use futures::StreamExt;
 use futures::{AsyncReadExt, AsyncWriteExt};
 use libp2p::{
-    autonat, dcutr, identify, kad, noise, ping, relay,
+    autonat, dcutr, identify, noise, ping, relay,
     request_response::{self, OutboundRequestId, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
 };
 use serde::{Deserialize, Serialize};
-// FIX: HashMap<PeerId, Multiaddr> stores the full relay transport address.
-// HashSet<PeerId> is removed — it only stored the ID, not the IP+port needed
-// to build a valid circuit reservation multiaddr.
 use std::{collections::HashMap, io, sync::OnceLock, time::Duration};
 use tauri::Manager;
 use tokio::sync::{mpsc, oneshot};
@@ -178,7 +175,6 @@ struct EgoBehaviour {
     request_response: request_response::Behaviour<EgoCodec>,
     autonat:          autonat::Behaviour,
     ping:             ping::Behaviour,
-    kad:              kad::Behaviour<kad::store::MemoryStore>,
 }
 
 // ── Commands: Tauri → swarm ───────────────────────────────────────────────────
@@ -218,23 +214,27 @@ pub async fn get_public_endpoint() -> String {
     reply_rx.await.unwrap_or_default()
 }
 
-fn is_routable_endpoint(ep: &str) -> bool {
-    if ep.contains("/p2p-circuit") { return true; }
-    if ep.starts_with("/ip4/") {
-        return !ep.starts_with("/ip4/127.") &&
-               !ep.starts_with("/ip4/10.")  &&
-               !ep.starts_with("/ip4/192.168.") &&
-               !ep.starts_with("/ip4/172.");
-    }
-    false
-}
-
+/// Wait up to `timeout_secs` for a relay circuit endpoint.
+/// A relay circuit address is the only address guaranteed to work cross-internet.
+/// Falls back to whatever we have (direct public IP) if relay isn't ready in time.
 pub async fn wait_for_public_endpoint(timeout_secs: u64) -> String {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let mut best = String::new();
     loop {
         let ep = get_public_endpoint().await;
-        if is_routable_endpoint(&ep) { return ep; }
-        if tokio::time::Instant::now() >= deadline { return ep; }
+        // Relay circuit address works behind any NAT — return immediately
+        if ep.contains("/p2p-circuit") {
+            return ep;
+        }
+        // Track best non-empty fallback (direct public IP)
+        if !ep.is_empty() && !ep.contains("/ip4/127.") && !ep.contains("/ip4/192.168.")
+            && !ep.contains("/ip4/10.") && !ep.contains("/ip4/172.")
+        {
+            best = ep;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return if best.is_empty() { get_public_endpoint().await } else { best };
+        }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
@@ -382,11 +382,7 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     if let Err(e) = swarm.listen_on(tcp_addr)  { eprintln!("[P2P] TCP listen: {}", e); }
     if let Err(e) = swarm.listen_on(quic_addr) { eprintln!("[P2P] QUIC listen: {}", e); }
 
-    let _ = swarm.behaviour_mut().kad.bootstrap();
-    let self_key = kad::RecordKey::new(&local_peer_id.to_bytes());
-    let _ = swarm.behaviour_mut().kad.start_providing(self_key);
-
-    // ── FIX: store the full relay multiaddr (including IP+port) keyed by PeerId.
+    // Store the full relay multiaddr (including IP+port) keyed by PeerId.
     // When ConnectionEstablished fires we need the FULL address to build the
     // correct circuit multiaddr:
     //   CORRECT:  /ip4/40.233.82.42/tcp/4001/p2p/<relay_id>/p2p-circuit
@@ -457,38 +453,22 @@ async fn build_swarm(
         .with_quic()
         .with_dns()?
         .with_relay_client(noise::Config::new, yamux::Config::default)?
-        .with_behaviour(|key, relay_client| {
-            let mut kad_cfg = kad::Config::default();
-            kad_cfg.set_query_timeout(Duration::from_secs(30));
-            let store = kad::store::MemoryStore::new(peer_id);
-            let mut kad = kad::Behaviour::with_config(peer_id, store, kad_cfg);
-            for relay_str in RELAY_NODES {
-                if let Ok(addr) = relay_str.parse::<Multiaddr>() {
-                    if let Some(pid) = peer_id_from_multiaddr(&addr) {
-                        kad.add_address(&pid, addr);
-                    }
-                }
-            }
-            kad.set_mode(Some(kad::Mode::Client));
-
-            EgoBehaviour {
-                relay_client,
-                dcutr:    dcutr::Behaviour::new(peer_id),
-                identify: identify::Behaviour::new(
-                    identify::Config::new("/ego/identify/1.0.0".to_string(), key.public())
-                        .with_interval(Duration::from_secs(60)),
-                ),
-                request_response: request_response::Behaviour::new(
-                    [(StreamProtocol::new("/ego/msg/1.0.0"), ProtocolSupport::Full)],
-                    request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(30)),
-                ),
-                autonat: autonat::Behaviour::new(peer_id, autonat::Config::default()),
-                ping:    ping::Behaviour::new(
-                    ping::Config::new().with_interval(Duration::from_secs(30)),
-                ),
-                kad,
-            }
+        .with_behaviour(|key, relay_client| EgoBehaviour {
+            relay_client,
+            dcutr:    dcutr::Behaviour::new(peer_id),
+            identify: identify::Behaviour::new(
+                identify::Config::new("/ego/identify/1.0.0".to_string(), key.public())
+                    .with_interval(Duration::from_secs(60)),
+            ),
+            request_response: request_response::Behaviour::new(
+                [(StreamProtocol::new("/ego/msg/1.0.0"), ProtocolSupport::Full)],
+                request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(30)),
+            ),
+            autonat: autonat::Behaviour::new(peer_id, autonat::Config::default()),
+            ping:    ping::Behaviour::new(
+                ping::Config::new().with_interval(Duration::from_secs(30)),
+            ),
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
         .build();
@@ -517,9 +497,7 @@ fn handle_send(
         in_flight.insert(req_id, reply);
     } else {
         pending_sends.entry(peer_id).or_default().push((msg, reply));
-        if swarm.dial(peer_addr).is_err() {
-            swarm.behaviour_mut().kad.get_closest_peers(peer_id);
-        }
+        let _ = swarm.dial(peer_addr);
     }
 }
 
@@ -633,9 +611,10 @@ async fn handle_event(
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             eprintln!("[P2P] Dial error {:?}: {}", peer_id, error);
             if let Some(pid) = peer_id {
-                if pending_sends.contains_key(&pid) {
-                    eprintln!("[P2P] Falling back to DHT lookup for {}", pid);
-                    swarm.behaviour_mut().kad.get_closest_peers(pid);
+                if let Some(pending) = pending_sends.remove(&pid) {
+                    for (_, reply) in pending {
+                        let _ = reply.send(Err(format!("Cannot reach peer: {}", error)));
+                    }
                 }
             }
         }
@@ -728,38 +707,6 @@ async fn handle_event(
             eprintln!("[P2P] DCUtR event: {:?}", event);
         }
 
-        SwarmEvent::Behaviour(EgoBehaviourEvent::Kad(
-            kad::Event::OutboundQueryProgressed {
-                result: kad::QueryResult::GetClosestPeers(Ok(ok)),
-                ..
-            },
-        )) => {
-            for peer in ok.peers {
-                if pending_sends.contains_key(&peer.peer_id) && !swarm.is_connected(&peer.peer_id) {
-                    for addr in &peer.addrs {
-                        let _ = swarm.dial(addr.clone());
-                    }
-                }
-            }
-        }
-
-        SwarmEvent::Behaviour(EgoBehaviourEvent::Kad(
-            kad::Event::OutboundQueryProgressed {
-                result: kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders {
-                    providers, ..
-                })),
-                ..
-            },
-        )) => {
-            for peer in providers {
-                if pending_sends.contains_key(&peer) && !swarm.is_connected(&peer) {
-                    let _ = swarm.dial(peer);
-                }
-            }
-        }
-
-        SwarmEvent::Behaviour(EgoBehaviourEvent::Kad(_)) => {}
-
         _ => {}
     }
 }
@@ -830,7 +777,17 @@ async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                 endpoint:  endpoint.clone(),
                 last_seen: Utc::now().timestamp(),
             });
-            upsert_peer_cache(PeerEntry { address, endpoint, last_seen: Utc::now().timestamp() });
+            upsert_peer_cache(PeerEntry { address: address.clone(), endpoint: endpoint.clone(), last_seen: Utc::now().timestamp() });
+            // Update stored contact endpoint so future messages use the fresh relay address
+            if !endpoint.is_empty() {
+                let mut contacts = load_contacts();
+                if let Some(c) = contacts.iter_mut().find(|c| c.address == address) {
+                    if c.endpoint != endpoint {
+                        c.endpoint = endpoint;
+                        let _ = save_contacts(&contacts);
+                    }
+                }
+            }
         }
 
         P2PMessage::ChatMessage { bundle } => {
