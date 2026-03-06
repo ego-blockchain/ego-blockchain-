@@ -42,7 +42,12 @@ zeroize = { version = "1.6", features = ["derive"] }
 hex = "0.4"
 dirs = "5.0"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
-igd = "0.12"
+futures = "0.3"
+libp2p = { version = "0.56", features = [
+    "tokio", "tcp", "quic", "dns", "noise", "yamux",
+    "identify", "dcutr", "autonat", "relay",
+    "request-response", "ping", "macros", "ed25519",
+] }
 
 [features]
 default = ["custom-protocol"]
