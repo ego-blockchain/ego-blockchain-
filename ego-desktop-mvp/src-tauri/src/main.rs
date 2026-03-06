@@ -151,7 +151,6 @@ fn main() {
             commands::wallet::send_transaction,
             commands::wallet::get_transaction_history,
             commands::wallet::reset_chain,
-            commands::wallet::sync_chain,          // ← NEW: manual sync from frontend
             // Storage
             commands::storage::store_file,
             commands::storage::get_stored_files,
