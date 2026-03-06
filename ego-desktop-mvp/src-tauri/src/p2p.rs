@@ -10,6 +10,7 @@ use crate::commands::messenger::{load_contacts, save_contacts, Contact};
 use crate::ledger::{base_data_dir, load_chain, save_chain, LedgerBlock, LedgerTx};
 use chrono::Utc;
 use futures::StreamExt;
+use futures::{AsyncReadExt, AsyncWriteExt};
 use libp2p::{
     autonat, dcutr, identify, noise, ping, relay,
     request_response::{self, OutboundRequestId, ProtocolSupport},
@@ -19,10 +20,7 @@ use libp2p::{
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, io, sync::OnceLock, time::Duration};
 use tauri::Manager;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::{mpsc, oneshot},
-};
+use tokio::sync::{mpsc, oneshot};
 
 pub const P2P_PORT: u16 = 47393;
 
@@ -99,7 +97,7 @@ impl request_response::Codec for EgoCodec {
     type Response = ();
 
     async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
-    where T: tokio::io::AsyncRead + Unpin + Send {
+    where T: futures::io::AsyncRead + Unpin + Send {
         let mut len_buf = [0u8; 4];
         io.read_exact(&mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
@@ -112,10 +110,10 @@ impl request_response::Codec for EgoCodec {
     }
 
     async fn read_response<T>(&mut self, _: &Self::Protocol, _io: &mut T) -> io::Result<Self::Response>
-    where T: tokio::io::AsyncRead + Unpin + Send { Ok(()) }
+    where T: futures::io::AsyncRead + Unpin + Send { Ok(()) }
 
     async fn write_request<T>(&mut self, _: &Self::Protocol, io: &mut T, req: Self::Request) -> io::Result<()>
-    where T: tokio::io::AsyncWrite + Unpin + Send {
+    where T: futures::io::AsyncWrite + Unpin + Send {
         let data = serde_json::to_vec(&req)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         io.write_all(&(data.len() as u32).to_be_bytes()).await?;
@@ -124,7 +122,7 @@ impl request_response::Codec for EgoCodec {
     }
 
     async fn write_response<T>(&mut self, _: &Self::Protocol, _io: &mut T, _: Self::Response) -> io::Result<()>
-    where T: tokio::io::AsyncWrite + Unpin + Send { Ok(()) }
+    where T: futures::io::AsyncWrite + Unpin + Send { Ok(()) }
 }
 
 // ── Combined network behaviour ────────────────────────────────────────────────
@@ -557,28 +555,21 @@ async fn handle_event(
             }
         }
 
-        // Relay: reservation accepted — we now have a relay address for inbound
+        // Relay: reservation accepted — relay will forward inbound connections to us
         SwarmEvent::Behaviour(EgoBehaviourEvent::RelayClient(
-            relay::client::Event::ReservationReqAccepted { relay_addr, .. },
+            relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
         )) => {
-            eprintln!("[P2P] Relay reservation accepted at {}", relay_addr);
+            eprintln!("[P2P] Relay reservation accepted with {}", relay_peer_id);
             let peer_id = *swarm.local_peer_id();
-            // Add the relay circuit address so peers can reach us through it
-            if let Ok(addr) = format!("{}/p2p-circuit/p2p/{}", relay_addr, peer_id).parse::<Multiaddr>() {
-                if !external_addrs.contains(&addr) {
-                    external_addrs.push(addr);
-                }
-                let state = app.state::<crate::app::AppState>();
-                state.set_upnp_status(Ok(()));
-                state.set_public_endpoint(best_endpoint(external_addrs, &peer_id));
-                let _ = app.emit_all("ego://p2p-status-changed", ());
-            }
+            let state = app.state::<crate::app::AppState>();
+            state.set_upnp_status(Ok(()));
+            state.set_public_endpoint(best_endpoint(external_addrs, &peer_id));
+            let _ = app.emit_all("ego://p2p-status-changed", ());
         }
 
-        SwarmEvent::Behaviour(EgoBehaviourEvent::Dcutr(
-            dcutr::Event::RemoteInitiatedDirectConnectionUpgrade { remote_peer_id, .. },
-        )) => {
-            eprintln!("[P2P] DCUtR hole punch with {}", remote_peer_id);
+        // DCUtR: hole punch attempt
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Dcutr(event)) => {
+            eprintln!("[P2P] DCUtR event: {:?}", event);
         }
 
         _ => {}
