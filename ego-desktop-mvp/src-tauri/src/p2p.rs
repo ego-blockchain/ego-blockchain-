@@ -18,7 +18,7 @@ use libp2p::{
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, io, sync::OnceLock, time::Duration};
+use std::{collections::{HashMap, HashSet}, io, sync::OnceLock, time::Duration};
 use tauri::Manager;
 use tokio::sync::{mpsc, oneshot};
 
@@ -363,9 +363,16 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     if let Err(e) = swarm.listen_on(tcp_addr)  { eprintln!("[P2P] TCP listen: {}", e); }
     if let Err(e) = swarm.listen_on(quic_addr) { eprintln!("[P2P] QUIC listen: {}", e); }
 
+    // Parse relay peer IDs upfront so ConnectionEstablished can recognise them
+    // and immediately listen on the circuit relay address.
+    let mut relay_peer_ids: HashSet<PeerId> = HashSet::new();
+
     // Dial relay nodes so we can reserve a relay slot for inbound connections
-    for relay_addr in RELAY_NODES {
-        if let Ok(addr) = relay_addr.parse::<Multiaddr>() {
+    for relay_str in RELAY_NODES {
+        if let Ok(addr) = relay_str.parse::<Multiaddr>() {
+            if let Some(pid) = peer_id_from_multiaddr(&addr) {
+                relay_peer_ids.insert(pid);
+            }
             let _ = swarm.dial(addr);
         }
     }
@@ -395,7 +402,7 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                 handle_event(
                     event, &app,
                     &mut external_addrs, &mut pending_sends, &mut in_flight,
-                    &mut swarm,
+                    &mut swarm, &relay_peer_ids,
                 ).await;
             }
         }
@@ -429,7 +436,7 @@ async fn build_swarm(
                 ping::Config::new().with_interval(Duration::from_secs(30)),
             ),
         })?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
         .build();
     Ok(swarm)
 }
@@ -468,6 +475,15 @@ fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
 }
 
 fn best_endpoint(external_addrs: &[Multiaddr], peer_id: &PeerId) -> String {
+    let pid_str = peer_id.to_string();
+
+    // Prefer circuit relay addresses — they work across any NAT/firewall
+    if let Some(relay_addr) = external_addrs.iter().find(|a| a.to_string().contains("/p2p-circuit")) {
+        let s = relay_addr.to_string();
+        return if s.contains(&pid_str) { s } else { format!("{}/p2p/{}", s, peer_id) };
+    }
+
+    // Then prefer public IPv4
     let is_public = |a: &Multiaddr| {
         let s = a.to_string();
         !s.starts_with("/ip4/127.") &&
@@ -485,20 +501,51 @@ fn best_endpoint(external_addrs: &[Multiaddr], peer_id: &PeerId) -> String {
 // ── Swarm event handler ───────────────────────────────────────────────────────
 
 async fn handle_event(
-    event:         SwarmEvent<EgoBehaviourEvent>,
-    app:           &tauri::AppHandle,
+    event:          SwarmEvent<EgoBehaviourEvent>,
+    app:            &tauri::AppHandle,
     external_addrs: &mut Vec<Multiaddr>,
-    pending_sends: &mut HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>>,
-    in_flight:     &mut HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>>,
-    swarm:         &mut libp2p::Swarm<EgoBehaviour>,
+    pending_sends:  &mut HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>>,
+    in_flight:      &mut HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>>,
+    swarm:          &mut libp2p::Swarm<EgoBehaviour>,
+    relay_peer_ids: &HashSet<PeerId>,
 ) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
             eprintln!("[P2P] Listening on {}", address);
+            // Circuit relay addresses are externally reachable — track them
+            if address.to_string().contains("/p2p-circuit") {
+                let peer_id = *swarm.local_peer_id();
+                let with_id = {
+                    let s = address.to_string();
+                    if s.contains(&peer_id.to_string()) {
+                        address.clone()
+                    } else {
+                        format!("{}/p2p/{}", s, peer_id).parse().unwrap_or(address.clone())
+                    }
+                };
+                if !external_addrs.contains(&with_id) {
+                    external_addrs.push(with_id.clone());
+                    eprintln!("[P2P] Relay circuit address: {}", with_id);
+                }
+                let state = app.state::<crate::app::AppState>();
+                state.set_public_endpoint(best_endpoint(external_addrs, &peer_id));
+                let _ = app.emit_all("ego://p2p-status-changed", ());
+            }
         }
 
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             eprintln!("[P2P] Connected to {}", peer_id);
+            // If this is a relay node, immediately reserve a relay slot so
+            // peers behind NAT can reach us through it.
+            if relay_peer_ids.contains(&peer_id) {
+                let circuit_addr: Multiaddr = format!("/p2p/{}/p2p-circuit", peer_id)
+                    .parse()
+                    .expect("valid circuit multiaddr");
+                match swarm.listen_on(circuit_addr.clone()) {
+                    Ok(_)  => eprintln!("[P2P] Reserving relay slot via {}", peer_id),
+                    Err(e) => eprintln!("[P2P] Relay listen error: {}", e),
+                }
+            }
             if let Some(pending) = pending_sends.remove(&peer_id) {
                 for (msg, reply) in pending {
                     let req_id = swarm.behaviour_mut().request_response.send_request(&peer_id, msg);
@@ -526,14 +573,17 @@ async fn handle_event(
             }
         }
 
-        // Identify: learn our own external addresses
+        // Identify: learn our own external address from what the remote peer
+        // observed us as — this is our real public IP:port, not the remote's addrs.
         SwarmEvent::Behaviour(EgoBehaviourEvent::Identify(identify::Event::Received {
             info, ..
         })) => {
-            for addr in &info.listen_addrs {
-                if !external_addrs.contains(addr) {
-                    external_addrs.push(addr.clone());
-                }
+            let observed = info.observed_addr.clone();
+            // Tell the swarm about our external address (enables AutoNAT etc.)
+            swarm.add_external_address(observed.clone());
+            if !external_addrs.contains(&observed) {
+                external_addrs.push(observed.clone());
+                eprintln!("[P2P] Observed external address: {}", observed);
             }
             let peer_id = *swarm.local_peer_id();
             let state = app.state::<crate::app::AppState>();
