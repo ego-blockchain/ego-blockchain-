@@ -17,6 +17,7 @@ env:
     | **Windows** | `Ego Desktop_*_x64_en-US.msi` ← recommended |
     | **Windows** (alt) | `Ego Desktop_*_x64-setup.exe` |
     | **macOS** (M1/M2/M3/M4) | `Ego Desktop_*_aarch64.dmg` |
+    | **macOS** (Intel) | `Ego Desktop_*_x64.dmg` |
 
     ### Windows
     1. Download the `.msi` file and run it — follow the installer wizard.
@@ -89,6 +90,41 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MACOSX_DEPLOYMENT_TARGET: '11.0'
           RUSTFLAGS: '-C target-cpu=apple-m1'
+        with:
+          projectPath: ego-desktop-mvp
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: 'Ego Desktop ${{ github.ref_name }}'
+          releaseBody: ${{ env.RELEASE_BODY }}
+          releaseDraft: true
+          prerelease: false
+
+  # ── macOS Intel (x86_64) ──────────────────────────────────────────────────
+  build-macos-intel:
+    name: macOS Intel
+    runs-on: macos-13
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ego-desktop-mvp/src-tauri -> target
+
+      - name: Install frontend dependencies
+        working-directory: ego-desktop-mvp
+        run: npm install
+
+      - name: Build (macOS Intel)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MACOSX_DEPLOYMENT_TARGET: '10.15'
         with:
           projectPath: ego-desktop-mvp
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
