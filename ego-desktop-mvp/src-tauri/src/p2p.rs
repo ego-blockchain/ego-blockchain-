@@ -12,7 +12,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use futures::{AsyncReadExt, AsyncWriteExt};
 use libp2p::{
-    autonat, dcutr, identify, noise, ping, relay,
+    autonat, dcutr, identify, kad, noise, ping, relay,
     request_response::{self, OutboundRequestId, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
@@ -176,6 +176,7 @@ struct EgoBehaviour {
     request_response: request_response::Behaviour<EgoCodec>,
     autonat:          autonat::Behaviour,
     ping:             ping::Behaviour,
+    kad:              kad::Behaviour<kad::store::MemoryStore>,
 }
 
 // ── Commands: Tauri → swarm ───────────────────────────────────────────────────
@@ -363,6 +364,10 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     if let Err(e) = swarm.listen_on(tcp_addr)  { eprintln!("[P2P] TCP listen: {}", e); }
     if let Err(e) = swarm.listen_on(quic_addr) { eprintln!("[P2P] QUIC listen: {}", e); }
 
+    // Bootstrap into the IPFS DHT so peers can find each other
+    // without port forwarding or manual IP exchange.
+    let _ = swarm.behaviour_mut().kad.bootstrap();
+
     // Parse relay peer IDs upfront so ConnectionEstablished can recognise them
     // and immediately listen on the circuit relay address.
     let mut relay_peer_ids: HashSet<PeerId> = HashSet::new();
@@ -419,22 +424,41 @@ async fn build_swarm(
         .with_quic()
         .with_dns()?
         .with_relay_client(noise::Config::new, yamux::Config::default)?
-        .with_behaviour(|key, relay_client| EgoBehaviour {
-            relay_client,
-            dcutr:    dcutr::Behaviour::new(peer_id),
-            identify: identify::Behaviour::new(
-                identify::Config::new("/ego/identify/1.0.0".to_string(), key.public())
-                    .with_interval(Duration::from_secs(60)),
-            ),
-            request_response: request_response::Behaviour::new(
-                [(StreamProtocol::new("/ego/msg/1.0.0"), ProtocolSupport::Full)],
-                request_response::Config::default()
-                    .with_request_timeout(Duration::from_secs(30)),
-            ),
-            autonat: autonat::Behaviour::new(peer_id, autonat::Config::default()),
-            ping:    ping::Behaviour::new(
-                ping::Config::new().with_interval(Duration::from_secs(30)),
-            ),
+        .with_behaviour(|key, relay_client| {
+            // Kademlia DHT — bootstrap into IPFS network for peer discovery
+            let mut kad_cfg = kad::Config::default();
+            kad_cfg.set_query_timeout(Duration::from_secs(30));
+            let store = kad::store::MemoryStore::new(peer_id);
+            let mut kad = kad::Behaviour::with_config(peer_id, store, kad_cfg);
+            // Add IPFS bootstrap nodes as known DHT peers
+            for relay_str in RELAY_NODES {
+                if let Ok(addr) = relay_str.parse::<Multiaddr>() {
+                    if let Some(pid) = peer_id_from_multiaddr(&addr) {
+                        kad.add_address(&pid, addr);
+                    }
+                }
+            }
+            // Client mode — we query the DHT but don't serve as a full DHT node
+            kad.set_mode(Some(kad::Mode::Client));
+
+            EgoBehaviour {
+                relay_client,
+                dcutr:    dcutr::Behaviour::new(peer_id),
+                identify: identify::Behaviour::new(
+                    identify::Config::new("/ego/identify/1.0.0".to_string(), key.public())
+                        .with_interval(Duration::from_secs(60)),
+                ),
+                request_response: request_response::Behaviour::new(
+                    [(StreamProtocol::new("/ego/msg/1.0.0"), ProtocolSupport::Full)],
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(30)),
+                ),
+                autonat: autonat::Behaviour::new(peer_id, autonat::Config::default()),
+                ping:    ping::Behaviour::new(
+                    ping::Config::new().with_interval(Duration::from_secs(30)),
+                ),
+                kad,
+            }
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
         .build();
@@ -462,8 +486,15 @@ fn handle_send(
         let req_id = swarm.behaviour_mut().request_response.send_request(&peer_id, msg);
         in_flight.insert(req_id, reply);
     } else {
-        let _ = swarm.dial(peer_addr);
+        // Queue the message, then try direct dial first.
+        // If that fails, ConnectionEstablished will flush the queue after a
+        // DHT-assisted dial (the kad peer routing table may have fresh addrs).
         pending_sends.entry(peer_id).or_default().push((msg, reply));
+        // Try dial with the address we have
+        if swarm.dial(peer_addr).is_err() {
+            // Address unusable — ask the DHT for better addresses
+            swarm.behaviour_mut().kad.get_closest_peers(peer_id);
+        }
     }
 }
 
@@ -573,13 +604,18 @@ async fn handle_event(
             }
         }
 
-        // Identify: learn our own external address from what the remote peer
-        // observed us as — this is our real public IP:port, not the remote's addrs.
+        // Identify: learn our own external address + feed remote addrs into DHT
         SwarmEvent::Behaviour(EgoBehaviourEvent::Identify(identify::Event::Received {
-            info, ..
+            peer_id: remote_peer_id, info, ..
         })) => {
+            // Feed the remote peer's listen addresses into Kademlia so the
+            // DHT can route to them in the future.
+            for addr in &info.listen_addrs {
+                swarm.behaviour_mut().kad.add_address(&remote_peer_id, addr.clone());
+            }
+
+            // info.observed_addr is OUR address as seen by the remote peer.
             let observed = info.observed_addr.clone();
-            // Tell the swarm about our external address (enables AutoNAT etc.)
             swarm.add_external_address(observed.clone());
             if !external_addrs.contains(&observed) {
                 external_addrs.push(observed.clone());
@@ -662,6 +698,24 @@ async fn handle_event(
         SwarmEvent::Behaviour(EgoBehaviourEvent::Dcutr(event)) => {
             eprintln!("[P2P] DCUtR event: {:?}", event);
         }
+
+        // Kademlia: peer found via DHT — dial them
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Kad(
+            kad::Event::OutboundQueryProgressed {
+                result: kad::QueryResult::GetClosestPeers(Ok(ok)),
+                ..
+            },
+        )) => {
+            for peer in ok.peers {
+                if !swarm.is_connected(&peer.peer_id) {
+                    for addr in peer.addrs {
+                        let _ = swarm.dial(addr);
+                    }
+                }
+            }
+        }
+
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Kad(_)) => {}
 
         _ => {}
     }
