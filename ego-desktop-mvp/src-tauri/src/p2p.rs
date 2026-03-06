@@ -219,6 +219,34 @@ pub async fn get_public_endpoint() -> String {
     reply_rx.await.unwrap_or_default()
 }
 
+/// Returns true if the endpoint is publicly reachable (relay circuit or public IP).
+fn is_routable_endpoint(ep: &str) -> bool {
+    if ep.contains("/p2p-circuit") { return true; }
+    if ep.starts_with("/ip4/") {
+        return !ep.starts_with("/ip4/127.") &&
+               !ep.starts_with("/ip4/10.")  &&
+               !ep.starts_with("/ip4/192.168.") &&
+               !ep.starts_with("/ip4/172.");
+    }
+    false
+}
+
+/// Wait up to `timeout_secs` for a publicly-routable endpoint (relay or public IP).
+/// Used when generating contact bundles so the bundle works cross-internet.
+pub async fn wait_for_public_endpoint(timeout_secs: u64) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        let ep = get_public_endpoint().await;
+        if is_routable_endpoint(&ep) {
+            return ep;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return ep;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 pub fn get_local_ip() -> String {
     if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
         let _ = sock.connect("8.8.8.8:80");
@@ -367,6 +395,10 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     // Bootstrap into the IPFS DHT so peers can find each other
     // without port forwarding or manual IP exchange.
     let _ = swarm.behaviour_mut().kad.bootstrap();
+
+    // Advertise ourselves in the DHT so other Ego peers can look us up by peer ID.
+    let self_key = kad::RecordKey::new(&local_peer_id.to_bytes());
+    let _ = swarm.behaviour_mut().kad.start_providing(self_key);
 
     // Parse relay peer IDs upfront so ConnectionEstablished can recognise them
     // and immediately listen on the circuit relay address.
@@ -596,10 +628,11 @@ async fn handle_event(
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             eprintln!("[P2P] Dial error {:?}: {}", peer_id, error);
             if let Some(pid) = peer_id {
-                if let Some(pending) = pending_sends.remove(&pid) {
-                    for (_, reply) in pending {
-                        let _ = reply.send(Err(format!("Cannot reach peer: {}", error)));
-                    }
+                if pending_sends.contains_key(&pid) {
+                    // Direct dial failed — ask the DHT for fresh addresses.
+                    // If DHT finds the peer, ConnectionEstablished will flush the queue.
+                    eprintln!("[P2P] Falling back to DHT lookup for {}", pid);
+                    swarm.behaviour_mut().kad.get_closest_peers(pid);
                 }
             }
         }
@@ -699,7 +732,7 @@ async fn handle_event(
             eprintln!("[P2P] DCUtR event: {:?}", event);
         }
 
-        // Kademlia: peer found via DHT — dial them
+        // Kademlia: closest-peers result — dial any we have pending sends for
         SwarmEvent::Behaviour(EgoBehaviourEvent::Kad(
             kad::Event::OutboundQueryProgressed {
                 result: kad::QueryResult::GetClosestPeers(Ok(ok)),
@@ -707,10 +740,27 @@ async fn handle_event(
             },
         )) => {
             for peer in ok.peers {
-                if !swarm.is_connected(&peer.peer_id) {
-                    for addr in peer.addrs {
-                        let _ = swarm.dial(addr);
+                if pending_sends.contains_key(&peer.peer_id) && !swarm.is_connected(&peer.peer_id) {
+                    for addr in &peer.addrs {
+                        let _ = swarm.dial(addr.clone());
                     }
+                }
+            }
+        }
+
+        // Kademlia: provider result — the peer registered itself; dial their addresses
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Kad(
+            kad::Event::OutboundQueryProgressed {
+                result: kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders {
+                    providers, ..
+                })),
+                ..
+            },
+        )) => {
+            for peer in providers {
+                if pending_sends.contains_key(&peer) && !swarm.is_connected(&peer) {
+                    // Dial using whatever addresses the swarm has for this peer
+                    let _ = swarm.dial(peer);
                 }
             }
         }
