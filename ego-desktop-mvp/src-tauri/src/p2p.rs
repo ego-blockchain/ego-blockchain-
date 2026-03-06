@@ -24,11 +24,16 @@ use tokio::sync::{mpsc, oneshot};
 
 pub const P2P_PORT: u16 = 47393;
 
-/// Public relay nodes (Protocol Labs / IPFS network, support relay v2).
+/// Ego relay server addresses.
+/// Deploy ego-relay/ to any public VPS, get its IP + peer ID, then add here.
+/// Format: "/ip4/<PUBLIC_IP>/tcp/4001/p2p/<PEER_ID>"
+///
+/// The IPFS bootstrap nodes (bootstrap.libp2p.io) do NOT work — they use
+/// WebSocket-only endpoints and reject non-IPFS connections.
 const RELAY_NODES: &[&str] = &[
-    "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
-    "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
-    "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+    // TODO: replace with your deployed ego-relay address after running:
+    //   cargo run --release in ego-relay/
+    //   then add: "/ip4/<YOUR_SERVER_IP>/tcp/4001/p2p/<PEER_ID>"
 ];
 
 // ── Wire protocol ─────────────────────────────────────────────────────────────

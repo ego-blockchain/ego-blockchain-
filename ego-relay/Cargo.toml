@@ -1,0 +1,14 @@
+[package]
+name = "ego-relay"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone binary — not part of the workspace
+[workspace]
+
+[dependencies]
+libp2p = { version = "0.56", features = [
+    "tokio", "tcp", "noise", "yamux", "relay", "identify", "ping", "macros",
+] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
