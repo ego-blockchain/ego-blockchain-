@@ -219,9 +219,14 @@ fn main() {
                     eprintln!("[Startup] Public endpoint ready: {}", my_endpoint);
                 }
 
+                // Fetch fresh peer endpoints from the relay directory.
+                // This resolves stale contact endpoints even when direct P2P
+                // is impossible (both nodes behind different NATs).
+                crate::p2p::fetch_peers_from_relay(&handle_startup).await;
+                eprintln!("[Startup] Relay peer directory synced");
+
                 // Fetch the global chain from the relay seed node.
-                // This ensures every node starts with the full shared history
-                // even on a fresh install, before any P2P peer connections.
+                // Ensures every node starts with full shared history.
                 crate::p2p::fetch_chain_from_relay(&handle_startup).await;
                 eprintln!("[Startup] Relay chain sync complete");
 
@@ -248,11 +253,17 @@ fn main() {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
-                    // Re-announce with latest endpoint (relay may have rotated)
+                    // Refresh peer endpoints from relay directory first so
+                    // subsequent P2P calls use up-to-date relay circuit addrs.
+                    crate::p2p::fetch_peers_from_relay(&handle_startup).await;
+
+                    // Re-announce with latest endpoint.
                     crate::p2p::broadcast_peer_announce(&handle_startup).await;
 
-                    // Sync chain — uses live peer endpoints from AppState,
-                    // so stale contact endpoints are automatically bypassed
+                    // Sync chain from relay (catches txs sent while we were offline).
+                    crate::p2p::fetch_chain_from_relay(&handle_startup).await;
+
+                    // Also sync from live P2P peers.
                     crate::p2p::sync_chain_from_peers().await;
                 }
             });

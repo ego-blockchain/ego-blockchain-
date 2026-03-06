@@ -695,10 +695,27 @@ async fn handle_event(
             let peer_id = *swarm.local_peer_id();
             let state = app.state::<crate::app::AppState>();
             state.set_upnp_status(Ok(()));
-            state.set_public_endpoint(best_endpoint(external_addrs, &peer_id));
+            let endpoint = best_endpoint(external_addrs, &peer_id);
+            state.set_public_endpoint(endpoint.clone());
             let _ = app.emit_all("ego://p2p-status-changed", ());
-            // Re-broadcast our new relay circuit address to all contacts so
-            // they immediately update our stale direct-IP endpoint.
+
+            // Register our relay circuit address with the relay HTTP peer
+            // directory so other nodes can discover our fresh endpoint even
+            // if direct P2P contact is impossible (stale-endpoint deadlock fix).
+            let address = crate::ledger::Ledger::load().address;
+            let registry  = crate::ledger::load_registry();
+            let active_id = crate::ledger::get_active_wallet_id();
+            let name = registry.wallets.iter()
+                .find(|w| w.id == active_id)
+                .map(|w| w.name.clone())
+                .unwrap_or_else(|| "Ego Node".to_string());
+            let endpoint_clone = endpoint.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                register_with_relay(address, name, endpoint_clone).await;
+            });
+
+            // Also re-broadcast to all direct contacts.
             let app_clone = app.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -932,18 +949,89 @@ pub async fn fetch_chain_from_relay(app: &tauri::AppHandle) {
 /// is updated immediately and not just when other peers sync.
 pub async fn push_tx_to_relay(tx: &crate::ledger::LedgerTx, block: &crate::ledger::LedgerBlock) {
     let client = reqwest::Client::new();
-    // Push tx
     if let Err(e) = client.post(format!("{}/chain/tx", RELAY_HTTP_API))
         .json(tx).send().await
     {
         eprintln!("[Relay] push tx error: {}", e);
     }
-    // Push block
     if let Err(e) = client.post(format!("{}/chain/block", RELAY_HTTP_API))
         .json(block).send().await
     {
         eprintln!("[Relay] push block error: {}", e);
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RelayPeerEntry {
+    address:   String,
+    name:      String,
+    endpoint:  String,
+    last_seen: i64,
+}
+
+/// Register our relay circuit address with the relay HTTP peer directory.
+/// Called as soon as ReservationReqAccepted fires so other nodes can find us
+/// even if direct P2P contact is impossible.
+pub async fn register_with_relay(address: String, name: String, endpoint: String) {
+    if address.is_empty() || endpoint.is_empty() { return; }
+    let entry = RelayPeerEntry { address: address.clone(), name, endpoint: endpoint.clone(), last_seen: 0 };
+    let client = reqwest::Client::new();
+    match client.post(format!("{}/peers", RELAY_HTTP_API))
+        .json(&entry).send().await
+    {
+        Ok(_)  => eprintln!("[Relay] Registered endpoint: {}", endpoint),
+        Err(e) => eprintln!("[Relay] register error: {}", e),
+    }
+}
+
+/// Fetch fresh peer endpoints from the relay directory and update local contacts.
+/// This breaks the stale-endpoint deadlock: even if two nodes can't reach each
+/// other directly, they both register with the relay and can discover each other here.
+pub async fn fetch_peers_from_relay(app: &tauri::AppHandle) {
+    let url = format!("{}/peers", RELAY_HTTP_API);
+    let resp = match reqwest::get(&url).await {
+        Ok(r)  => r,
+        Err(e) => { eprintln!("[Relay] fetch_peers error: {}", e); return; }
+    };
+    let body = match resp.text().await {
+        Ok(b)  => b,
+        Err(e) => { eprintln!("[Relay] fetch_peers read error: {}", e); return; }
+    };
+    let remote_peers: Vec<RelayPeerEntry> = match serde_json::from_str(&body) {
+        Ok(p)  => p,
+        Err(e) => { eprintln!("[Relay] fetch_peers parse error: {}", e); return; }
+    };
+    if remote_peers.is_empty() { return; }
+
+    // Update AppState peer list
+    let state = app.state::<crate::app::AppState>();
+    for p in &remote_peers {
+        state.upsert_peer(crate::app::PeerInfo {
+            address:   p.address.clone(),
+            name:      p.name.clone(),
+            endpoint:  p.endpoint.clone(),
+            last_seen: p.last_seen,
+        });
+    }
+
+    // Update stored contact endpoints so future messages use relay circuit addrs
+    let mut contacts = load_contacts();
+    let mut changed  = false;
+    for remote in &remote_peers {
+        if remote.endpoint.is_empty() { continue; }
+        if let Some(c) = contacts.iter_mut().find(|c| c.address == remote.address) {
+            if c.endpoint != remote.endpoint {
+                eprintln!("[Relay] Updated contact {} endpoint → {}", remote.address, remote.endpoint);
+                c.endpoint = remote.endpoint.clone();
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let _ = save_contacts(&contacts);
+        let _ = app.emit_all("ego://peers-updated", ());
+    }
+    eprintln!("[Relay] Fetched {} peers from relay directory", remote_peers.len());
 }
 
 // ── Windows firewall ──────────────────────────────────────────────────────────
