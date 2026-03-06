@@ -90,43 +90,80 @@ pub struct PeerEntry {
 
 #[derive(Debug, Clone, Default)]
 struct EgoCodec;
-
 impl request_response::Codec for EgoCodec {
     type Protocol = StreamProtocol;
     type Request  = P2PMessage;
     type Response = ();
 
-    async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
-    where T: futures::io::AsyncRead + Unpin + Send
+    fn read_request<'life0, 'life1, 'life2, 'async_trait, T>(
+        &'life0 mut self,
+        _: &'life1 Self::Protocol,
+        io: &'life2 mut T,
+    ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = io::Result<Self::Request>> + ::core::marker::Send + 'async_trait>>
+    where
+        T: futures::io::AsyncRead + Unpin + Send + 'async_trait,
+        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait,
+        Self: 'async_trait,
     {
-        let mut len_buf = [0u8; 4];
-        AsyncReadExt::read_exact(io, &mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        if len > 8 * 1024 * 1024 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "message too large"));
-        }
-        let mut buf = vec![0u8; len];
-        AsyncReadExt::read_exact(io, &mut buf).await?;
-        serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        Box::pin(async move {
+            let mut len_buf = [0u8; 4];
+            AsyncReadExt::read_exact(io, &mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            if len > 8 * 1024 * 1024 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "message too large"));
+            }
+            let mut buf = vec![0u8; len];
+            AsyncReadExt::read_exact(io, &mut buf).await?;
+            serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        })
     }
 
-    async fn read_response<T>(&mut self, _: &Self::Protocol, _io: &mut T) -> io::Result<Self::Response>
-    where T: futures::io::AsyncRead + Unpin + Send
-    { Ok(()) }
-
-    async fn write_request<T>(&mut self, _: &Self::Protocol, io: &mut T, req: Self::Request) -> io::Result<()>
-    where T: futures::io::AsyncWrite + Unpin + Send
+    fn read_response<'life0, 'life1, 'life2, 'async_trait, T>(
+        &'life0 mut self,
+        _: &'life1 Self::Protocol,
+        _io: &'life2 mut T,
+    ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = io::Result<Self::Response>> + ::core::marker::Send + 'async_trait>>
+    where
+        T: futures::io::AsyncRead + Unpin + Send + 'async_trait,
+        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait,
+        Self: 'async_trait,
     {
-        let data = serde_json::to_vec(&req)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        AsyncWriteExt::write_all(io, &(data.len() as u32).to_be_bytes()).await?;
-        AsyncWriteExt::write_all(io, &data).await?;
-        AsyncWriteExt::flush(io).await
+        Box::pin(async move { Ok(()) })
     }
 
-    async fn write_response<T>(&mut self, _: &Self::Protocol, _io: &mut T, _: Self::Response) -> io::Result<()>
-    where T: futures::io::AsyncWrite + Unpin + Send
-    { Ok(()) }
+    fn write_request<'life0, 'life1, 'life2, 'async_trait, T>(
+        &'life0 mut self,
+        _: &'life1 Self::Protocol,
+        io: &'life2 mut T,
+        req: Self::Request,
+    ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = io::Result<()>> + ::core::marker::Send + 'async_trait>>
+    where
+        T: futures::io::AsyncWrite + Unpin + Send + 'async_trait,
+        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let data = serde_json::to_vec(&req)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            AsyncWriteExt::write_all(io, &(data.len() as u32).to_be_bytes()).await?;
+            AsyncWriteExt::write_all(io, &data).await?;
+            AsyncWriteExt::flush(io).await
+        })
+    }
+
+    fn write_response<'life0, 'life1, 'life2, 'async_trait, T>(
+        &'life0 mut self,
+        _: &'life1 Self::Protocol,
+        _io: &'life2 mut T,
+        _: Self::Response,
+    ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = io::Result<()>> + ::core::marker::Send + 'async_trait>>
+    where
+        T: futures::io::AsyncWrite + Unpin + Send + 'async_trait,
+        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move { Ok(()) })
+    }
 }
 
 // ── Combined network behaviour ────────────────────────────────────────────────
