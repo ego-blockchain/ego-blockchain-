@@ -133,13 +133,19 @@ pub async fn send_transaction(
     save_chain(&chain)
         .map_err(|e| EgoDesktopError::WalletError(format!("Save chain: {e}")))?;
 
-    // ── 6. Broadcast to all P2P peers (fire-and-forget) ───────────────────
-    // Pushes the confirmed tx+block to every machine that has us as a contact
-    // so their chain.json, balance, and explorer update in real-time.
+    // ── 6. Broadcast to relay + all P2P peers (fire-and-forget) ──────────
+    // a) Push to relay seed node → makes the tx globally visible immediately
+    //    (persisted forever, not deletable by any local user)
+    // b) Push to every P2P contact → real-time update for connected peers
     if let (Some(tx_b), Some(blk_b)) = (
         chain.transactions.iter().find(|t| t.hash == tx_hash).cloned(),
         chain.blocks.last().cloned(),
     ) {
+        let tx_relay  = tx_b.clone();
+        let blk_relay = blk_b.clone();
+        tokio::spawn(async move {
+            crate::p2p::push_tx_to_relay(&tx_relay, &blk_relay).await;
+        });
         tokio::spawn(async move {
             crate::p2p::broadcast_tx(tx_b, blk_b).await;
         });

@@ -8,4 +8,5 @@ FROM debian:bookworm-slim
 WORKDIR /app
 COPY --from=builder /app/target/release/ego-relay .
 EXPOSE 4001
+EXPOSE 8080
 CMD ["./ego-relay"]
