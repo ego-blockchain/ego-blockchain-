@@ -18,18 +18,17 @@ use libp2p::{
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::{HashMap, HashSet}, io, sync::OnceLock, time::Duration};
+// FIX: HashMap<PeerId, Multiaddr> stores the full relay transport address.
+// HashSet<PeerId> is removed — it only stored the ID, not the IP+port needed
+// to build a valid circuit reservation multiaddr.
+use std::{collections::HashMap, io, sync::OnceLock, time::Duration};
 use tauri::Manager;
 use tokio::sync::{mpsc, oneshot};
 
 pub const P2P_PORT: u16 = 47393;
 
 /// Ego relay server addresses.
-/// Deploy ego-relay/ to any public VPS, get its IP + peer ID, then add here.
 /// Format: "/ip4/<PUBLIC_IP>/tcp/4001/p2p/<PEER_ID>"
-///
-/// The IPFS bootstrap nodes (bootstrap.libp2p.io) do NOT work — they use
-/// WebSocket-only endpoints and reject non-IPFS connections.
 const RELAY_NODES: &[&str] = &[
     "/ip4/40.233.82.42/tcp/4001/p2p/12D3KooWPj6m7jzmVyMh1zWrsoux3YiVs9j2HwsjrFXzDcqAGGz4",
 ];
@@ -197,10 +196,8 @@ pub enum SwarmCmd {
 
 static SWARM_TX: OnceLock<mpsc::Sender<SwarmCmd>> = OnceLock::new();
 
-// ── Public API (same interface as old p2p.rs) ─────────────────────────────────
+// ── Public API ────────────────────────────────────────────────────────────────
 
-/// Send a P2P message to a peer. `endpoint` is a libp2p multiaddr string,
-/// e.g. `/ip4/1.2.3.4/tcp/47393/p2p/12D3KooW...`
 pub async fn send_message(endpoint: &str, msg: &P2PMessage) -> Result<(), String> {
     let tx = SWARM_TX.get().ok_or_else(|| "P2P not started".to_string())?;
     let peer_addr: Multiaddr = endpoint.parse()
@@ -212,7 +209,6 @@ pub async fn send_message(endpoint: &str, msg: &P2PMessage) -> Result<(), String
     reply_rx.await.map_err(|_| "Swarm dropped reply".to_string())?
 }
 
-/// Best public endpoint for sharing in contact bundles.
 pub async fn get_public_endpoint() -> String {
     let Some(tx) = SWARM_TX.get() else { return String::new(); };
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -222,7 +218,6 @@ pub async fn get_public_endpoint() -> String {
     reply_rx.await.unwrap_or_default()
 }
 
-/// Returns true if the endpoint is publicly reachable (relay circuit or public IP).
 fn is_routable_endpoint(ep: &str) -> bool {
     if ep.contains("/p2p-circuit") { return true; }
     if ep.starts_with("/ip4/") {
@@ -234,18 +229,12 @@ fn is_routable_endpoint(ep: &str) -> bool {
     false
 }
 
-/// Wait up to `timeout_secs` for a publicly-routable endpoint (relay or public IP).
-/// Used when generating contact bundles so the bundle works cross-internet.
 pub async fn wait_for_public_endpoint(timeout_secs: u64) -> String {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         let ep = get_public_endpoint().await;
-        if is_routable_endpoint(&ep) {
-            return ep;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return ep;
-        }
+        if is_routable_endpoint(&ep) { return ep; }
+        if tokio::time::Instant::now() >= deadline { return ep; }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
@@ -265,7 +254,6 @@ pub fn get_local_endpoint() -> String {
     format!("/ip4/{}/tcp/{}", get_local_ip(), P2P_PORT)
 }
 
-// No-ops — libp2p handles LAN discovery and peer gossip internally.
 pub async fn start_udp_discovery(_app: tauri::AppHandle) {}
 pub async fn broadcast_udp_announce() {}
 pub async fn gossip_peer_list() {}
@@ -358,7 +346,7 @@ pub fn upsert_peer_cache(entry: PeerEntry) {
     save_peer_cache(&peers);
 }
 
-// ── Identity (persisted per-device, independent of wallet) ───────────────────
+// ── Identity ──────────────────────────────────────────────────────────────────
 
 fn load_or_create_identity() -> libp2p::identity::Keypair {
     let path = base_data_dir().join("p2p_identity.bin");
@@ -389,30 +377,31 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
         Err(e) => { eprintln!("[P2P] Failed to build swarm: {}", e); return; }
     };
 
-    // Listen on TCP and QUIC
     let tcp_addr:  Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", P2P_PORT).parse().unwrap();
     let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", P2P_PORT).parse().unwrap();
     if let Err(e) = swarm.listen_on(tcp_addr)  { eprintln!("[P2P] TCP listen: {}", e); }
     if let Err(e) = swarm.listen_on(quic_addr) { eprintln!("[P2P] QUIC listen: {}", e); }
 
-    // Bootstrap into the IPFS DHT so peers can find each other
-    // without port forwarding or manual IP exchange.
     let _ = swarm.behaviour_mut().kad.bootstrap();
-
-    // Advertise ourselves in the DHT so other Ego peers can look us up by peer ID.
     let self_key = kad::RecordKey::new(&local_peer_id.to_bytes());
     let _ = swarm.behaviour_mut().kad.start_providing(self_key);
 
-    // Parse relay peer IDs upfront so ConnectionEstablished can recognise them
-    // and immediately listen on the circuit relay address.
-    let mut relay_peer_ids: HashSet<PeerId> = HashSet::new();
+    // ── FIX: store the full relay multiaddr (including IP+port) keyed by PeerId.
+    // When ConnectionEstablished fires we need the FULL address to build the
+    // correct circuit multiaddr:
+    //   CORRECT:  /ip4/40.233.82.42/tcp/4001/p2p/<relay_id>/p2p-circuit
+    //   WRONG:    /p2p/<relay_id>/p2p-circuit   ← what the old code produced
+    let mut relay_addrs: HashMap<PeerId, Multiaddr> = HashMap::new();
 
-    // Dial relay nodes so we can reserve a relay slot for inbound connections
     for relay_str in RELAY_NODES {
         if let Ok(addr) = relay_str.parse::<Multiaddr>() {
             if let Some(pid) = peer_id_from_multiaddr(&addr) {
-                relay_peer_ids.insert(pid);
+                // Strip the /p2p/<id> tail — we want just the transport part
+                // e.g. /ip4/40.233.82.42/tcp/4001
+                let base = strip_p2p_suffix(&addr);
+                relay_addrs.insert(pid, base);
             }
+            eprintln!("[P2P] Dialling relay {}", relay_str);
             let _ = swarm.dial(addr);
         }
     }
@@ -442,11 +431,20 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                 handle_event(
                     event, &app,
                     &mut external_addrs, &mut pending_sends, &mut in_flight,
-                    &mut swarm, &relay_peer_ids,
+                    &mut swarm, &relay_addrs,
                 ).await;
             }
         }
     }
+}
+
+/// Strip the trailing /p2p/<PeerId> component from a multiaddr so we keep
+/// only the transport portion (e.g. /ip4/40.233.82.42/tcp/4001).
+fn strip_p2p_suffix(addr: &Multiaddr) -> Multiaddr {
+    use libp2p::multiaddr::Protocol;
+    addr.iter()
+        .filter(|p| !matches!(p, Protocol::P2p(_)))
+        .collect()
 }
 
 async fn build_swarm(
@@ -460,12 +458,10 @@ async fn build_swarm(
         .with_dns()?
         .with_relay_client(noise::Config::new, yamux::Config::default)?
         .with_behaviour(|key, relay_client| {
-            // Kademlia DHT — bootstrap into IPFS network for peer discovery
             let mut kad_cfg = kad::Config::default();
             kad_cfg.set_query_timeout(Duration::from_secs(30));
             let store = kad::store::MemoryStore::new(peer_id);
             let mut kad = kad::Behaviour::with_config(peer_id, store, kad_cfg);
-            // Add IPFS bootstrap nodes as known DHT peers
             for relay_str in RELAY_NODES {
                 if let Ok(addr) = relay_str.parse::<Multiaddr>() {
                     if let Some(pid) = peer_id_from_multiaddr(&addr) {
@@ -473,7 +469,6 @@ async fn build_swarm(
                     }
                 }
             }
-            // Client mode — we query the DHT but don't serve as a full DHT node
             kad.set_mode(Some(kad::Mode::Client));
 
             EgoBehaviour {
@@ -521,13 +516,8 @@ fn handle_send(
         let req_id = swarm.behaviour_mut().request_response.send_request(&peer_id, msg);
         in_flight.insert(req_id, reply);
     } else {
-        // Queue the message, then try direct dial first.
-        // If that fails, ConnectionEstablished will flush the queue after a
-        // DHT-assisted dial (the kad peer routing table may have fresh addrs).
         pending_sends.entry(peer_id).or_default().push((msg, reply));
-        // Try dial with the address we have
         if swarm.dial(peer_addr).is_err() {
-            // Address unusable — ask the DHT for better addresses
             swarm.behaviour_mut().kad.get_closest_peers(peer_id);
         }
     }
@@ -546,7 +536,7 @@ fn best_endpoint(external_addrs: &[Multiaddr], peer_id: &PeerId) -> String {
     // Prefer circuit relay addresses — they work across any NAT/firewall
     if let Some(relay_addr) = external_addrs.iter().find(|a| a.to_string().contains("/p2p-circuit")) {
         let s = relay_addr.to_string();
-        return if s.contains(&pid_str) { s } else { format!("{}/p2p/{}", s, peer_id) };
+        return if s.contains(&pid_str) { s } else { format!("{}/p2p/{}", s, pid_str) };
     }
 
     // Then prefer public IPv4
@@ -561,7 +551,7 @@ fn best_endpoint(external_addrs: &[Multiaddr], peer_id: &PeerId) -> String {
         .or_else(|| external_addrs.first())
         .map(|a| a.to_string())
         .unwrap_or_else(|| format!("/ip4/{}/tcp/{}", get_local_ip(), P2P_PORT));
-    if base.contains("/p2p/") { base } else { format!("{}/p2p/{}", base, peer_id) }
+    if base.contains("/p2p/") { base } else { format!("{}/p2p/{}", base, pid_str) }
 }
 
 // ── Swarm event handler ───────────────────────────────────────────────────────
@@ -573,12 +563,12 @@ async fn handle_event(
     pending_sends:  &mut HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>>,
     in_flight:      &mut HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>>,
     swarm:          &mut libp2p::Swarm<EgoBehaviour>,
-    relay_peer_ids: &HashSet<PeerId>,
+    // ── FIX: now a map from PeerId → base transport addr (no /p2p suffix)
+    relay_addrs:    &HashMap<PeerId, Multiaddr>,
 ) {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => {
             eprintln!("[P2P] Listening on {}", address);
-            // Circuit relay addresses are externally reachable — track them
             if address.to_string().contains("/p2p-circuit") {
                 let peer_id = *swarm.local_peer_id();
                 let with_id = {
@@ -591,7 +581,7 @@ async fn handle_event(
                 };
                 if !external_addrs.contains(&with_id) {
                     external_addrs.push(with_id.clone());
-                    eprintln!("[P2P] Relay circuit address: {}", with_id);
+                    eprintln!("[P2P] Relay circuit address ready: {}", with_id);
                 }
                 let state = app.state::<crate::app::AppState>();
                 state.set_public_endpoint(best_endpoint(external_addrs, &peer_id));
@@ -601,17 +591,29 @@ async fn handle_event(
 
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             eprintln!("[P2P] Connected to {}", peer_id);
-            // If this is a relay node, immediately reserve a relay slot so
-            // peers behind NAT can reach us through it.
-            if relay_peer_ids.contains(&peer_id) {
-                let circuit_addr: Multiaddr = format!("/p2p/{}/p2p-circuit", peer_id)
-                    .parse()
-                    .expect("valid circuit multiaddr");
-                match swarm.listen_on(circuit_addr.clone()) {
-                    Ok(_)  => eprintln!("[P2P] Reserving relay slot via {}", peer_id),
-                    Err(e) => eprintln!("[P2P] Relay listen error: {}", e),
+
+            // ── FIX: build the circuit address as
+            //    <relay_base>/p2p/<relay_id>/p2p-circuit
+            // e.g. /ip4/40.233.82.42/tcp/4001/p2p/12D3KooW.../p2p-circuit
+            if let Some(relay_base) = relay_addrs.get(&peer_id) {
+                let circuit_addr_str = format!(
+                    "{}/p2p/{}/p2p-circuit",
+                    relay_base,   // /ip4/40.233.82.42/tcp/4001
+                    peer_id       // 12D3KooWPj6m...
+                );
+                match circuit_addr_str.parse::<Multiaddr>() {
+                    Ok(circuit_addr) => {
+                        eprintln!("[P2P] Reserving relay slot: {}", circuit_addr_str);
+                        match swarm.listen_on(circuit_addr) {
+                            Ok(_)  => eprintln!("[P2P] Relay reservation requested ✓"),
+                            Err(e) => eprintln!("[P2P] Relay listen error: {}", e),
+                        }
+                    }
+                    Err(e) => eprintln!("[P2P] Bad circuit multiaddr '{}': {}", circuit_addr_str, e),
                 }
             }
+
+            // Flush any messages that were queued while we were connecting
             if let Some(pending) = pending_sends.remove(&peer_id) {
                 for (msg, reply) in pending {
                     let req_id = swarm.behaviour_mut().request_response.send_request(&peer_id, msg);
@@ -632,25 +634,18 @@ async fn handle_event(
             eprintln!("[P2P] Dial error {:?}: {}", peer_id, error);
             if let Some(pid) = peer_id {
                 if pending_sends.contains_key(&pid) {
-                    // Direct dial failed — ask the DHT for fresh addresses.
-                    // If DHT finds the peer, ConnectionEstablished will flush the queue.
                     eprintln!("[P2P] Falling back to DHT lookup for {}", pid);
                     swarm.behaviour_mut().kad.get_closest_peers(pid);
                 }
             }
         }
 
-        // Identify: learn our own external address + feed remote addrs into DHT
         SwarmEvent::Behaviour(EgoBehaviourEvent::Identify(identify::Event::Received {
             peer_id: remote_peer_id, info, ..
         })) => {
-            // Feed the remote peer's listen addresses into Kademlia so the
-            // DHT can route to them in the future.
             for addr in &info.listen_addrs {
                 swarm.behaviour_mut().kad.add_address(&remote_peer_id, addr.clone());
             }
-
-            // info.observed_addr is OUR address as seen by the remote peer.
             let observed = info.observed_addr.clone();
             swarm.add_external_address(observed.clone());
             if !external_addrs.contains(&observed) {
@@ -663,7 +658,6 @@ async fn handle_event(
             let _ = app.emit_all("ego://p2p-status-changed", ());
         }
 
-        // Request-response: incoming message
         SwarmEvent::Behaviour(EgoBehaviourEvent::RequestResponse(
             request_response::Event::Message {
                 message: request_response::Message::Request { request, channel, .. },
@@ -675,7 +669,6 @@ async fn handle_event(
             tokio::spawn(async move { handle_incoming(request, &app).await; });
         }
 
-        // Request-response: our send succeeded
         SwarmEvent::Behaviour(EgoBehaviourEvent::RequestResponse(
             request_response::Event::Message {
                 message: request_response::Message::Response { request_id, .. },
@@ -687,7 +680,6 @@ async fn handle_event(
             }
         }
 
-        // Request-response: our send failed
         SwarmEvent::Behaviour(EgoBehaviourEvent::RequestResponse(
             request_response::Event::OutboundFailure { request_id, error, .. },
         )) => {
@@ -696,7 +688,6 @@ async fn handle_event(
             }
         }
 
-        // AutoNAT: detected NAT status
         SwarmEvent::Behaviour(EgoBehaviourEvent::Autonat(autonat::Event::StatusChanged {
             new, ..
         })) => {
@@ -718,11 +709,10 @@ async fn handle_event(
             }
         }
 
-        // Relay: reservation accepted — relay will forward inbound connections to us
         SwarmEvent::Behaviour(EgoBehaviourEvent::RelayClient(
             relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
         )) => {
-            eprintln!("[P2P] Relay reservation accepted with {}", relay_peer_id);
+            eprintln!("[P2P] Relay reservation accepted ✓ via {}", relay_peer_id);
             let peer_id = *swarm.local_peer_id();
             let state = app.state::<crate::app::AppState>();
             state.set_upnp_status(Ok(()));
@@ -730,12 +720,14 @@ async fn handle_event(
             let _ = app.emit_all("ego://p2p-status-changed", ());
         }
 
-        // DCUtR: hole punch attempt
+        SwarmEvent::Behaviour(EgoBehaviourEvent::RelayClient(event)) => {
+            eprintln!("[P2P] Relay event: {:?}", event);
+        }
+
         SwarmEvent::Behaviour(EgoBehaviourEvent::Dcutr(event)) => {
             eprintln!("[P2P] DCUtR event: {:?}", event);
         }
 
-        // Kademlia: closest-peers result — dial any we have pending sends for
         SwarmEvent::Behaviour(EgoBehaviourEvent::Kad(
             kad::Event::OutboundQueryProgressed {
                 result: kad::QueryResult::GetClosestPeers(Ok(ok)),
@@ -751,7 +743,6 @@ async fn handle_event(
             }
         }
 
-        // Kademlia: provider result — the peer registered itself; dial their addresses
         SwarmEvent::Behaviour(EgoBehaviourEvent::Kad(
             kad::Event::OutboundQueryProgressed {
                 result: kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders {
@@ -762,7 +753,6 @@ async fn handle_event(
         )) => {
             for peer in providers {
                 if pending_sends.contains_key(&peer) && !swarm.is_connected(&peer) {
-                    // Dial using whatever addresses the swarm has for this peer
                     let _ = swarm.dial(peer);
                 }
             }
