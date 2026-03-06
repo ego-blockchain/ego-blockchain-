@@ -97,32 +97,36 @@ impl request_response::Codec for EgoCodec {
     type Response = ();
 
     async fn read_request<T>(&mut self, _: &Self::Protocol, io: &mut T) -> io::Result<Self::Request>
-    where T: futures::io::AsyncRead + Unpin + Send {
+    where T: futures::io::AsyncRead + Unpin + Send
+    {
         let mut len_buf = [0u8; 4];
-        io.read_exact(&mut len_buf).await?;
+        AsyncReadExt::read_exact(io, &mut len_buf).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
         if len > 8 * 1024 * 1024 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "message too large"));
         }
         let mut buf = vec![0u8; len];
-        io.read_exact(&mut buf).await?;
+        AsyncReadExt::read_exact(io, &mut buf).await?;
         serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     async fn read_response<T>(&mut self, _: &Self::Protocol, _io: &mut T) -> io::Result<Self::Response>
-    where T: futures::io::AsyncRead + Unpin + Send { Ok(()) }
+    where T: futures::io::AsyncRead + Unpin + Send
+    { Ok(()) }
 
     async fn write_request<T>(&mut self, _: &Self::Protocol, io: &mut T, req: Self::Request) -> io::Result<()>
-    where T: futures::io::AsyncWrite + Unpin + Send {
+    where T: futures::io::AsyncWrite + Unpin + Send
+    {
         let data = serde_json::to_vec(&req)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        io.write_all(&(data.len() as u32).to_be_bytes()).await?;
-        io.write_all(&data).await?;
-        io.flush().await
+        AsyncWriteExt::write_all(io, &(data.len() as u32).to_be_bytes()).await?;
+        AsyncWriteExt::write_all(io, &data).await?;
+        AsyncWriteExt::flush(io).await
     }
 
     async fn write_response<T>(&mut self, _: &Self::Protocol, _io: &mut T, _: Self::Response) -> io::Result<()>
-    where T: futures::io::AsyncWrite + Unpin + Send { Ok(()) }
+    where T: futures::io::AsyncWrite + Unpin + Send
+    { Ok(()) }
 }
 
 // ── Combined network behaviour ────────────────────────────────────────────────
