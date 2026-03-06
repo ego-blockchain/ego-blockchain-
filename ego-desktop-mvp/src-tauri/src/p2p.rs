@@ -31,9 +31,7 @@ pub const P2P_PORT: u16 = 47393;
 /// The IPFS bootstrap nodes (bootstrap.libp2p.io) do NOT work — they use
 /// WebSocket-only endpoints and reject non-IPFS connections.
 const RELAY_NODES: &[&str] = &[
-    // TODO: replace with your deployed ego-relay address after running:
-    //   cargo run --release in ego-relay/
-    //   then add: "/ip4/<YOUR_SERVER_IP>/tcp/4001/p2p/<PEER_ID>"
+    "/ip4/40.233.82.42/tcp/4001/p2p/12D3KooWPj6m7jzmVyMh1zWrsoux3YiVs9j2HwsjrFXzDcqAGGz4",
 ];
 
 // ── Wire protocol ─────────────────────────────────────────────────────────────
