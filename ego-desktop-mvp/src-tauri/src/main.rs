@@ -211,7 +211,7 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 // Block until relay circuit address is confirmed (max 15 s).
                 // After the p2p fix this typically takes 2–4 s.
-                let my_endpoint = crate::p2p::wait_for_public_endpoint(15).await;
+                let my_endpoint = crate::p2p::wait_for_public_endpoint(30).await;
 
                 if my_endpoint.is_empty() {
                     eprintln!("[Startup] No public endpoint after 15s — running in local-only mode");

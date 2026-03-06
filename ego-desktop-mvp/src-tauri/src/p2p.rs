@@ -694,6 +694,14 @@ async fn handle_event(
             state.set_upnp_status(Ok(()));
             state.set_public_endpoint(best_endpoint(external_addrs, &peer_id));
             let _ = app.emit_all("ego://p2p-status-changed", ());
+            // Re-broadcast our new relay circuit address to all contacts so
+            // they immediately update our stale direct-IP endpoint.
+            let app_clone = app.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                broadcast_peer_announce(&app_clone).await;
+                eprintln!("[P2P] Peer announce sent after relay reservation");
+            });
         }
 
         SwarmEvent::Behaviour(EgoBehaviourEvent::RelayClient(event)) => {
@@ -716,7 +724,14 @@ async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
             from_addr, from_name, from_ed25519, from_kyber, from_shared_key, from_endpoint,
         } => {
             let mut contacts = load_contacts();
-            if contacts.iter().any(|c| c.address == from_addr) { return; }
+            // If we already have this contact, just update their endpoint
+            if let Some(existing) = contacts.iter_mut().find(|c| c.address == from_addr) {
+                if !from_endpoint.is_empty() && existing.endpoint != from_endpoint {
+                    existing.endpoint = from_endpoint.clone();
+                    let _ = save_contacts(&contacts);
+                }
+                return;
+            }
             let contact = Contact {
                 address:        from_addr.clone(),
                 name:           from_name.clone(),
