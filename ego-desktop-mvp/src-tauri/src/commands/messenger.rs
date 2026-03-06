@@ -223,9 +223,9 @@ pub async fn get_my_contact_bundle(
     let my_addr      = ledger.address.clone();
     let ed25519_b64  = STANDARD.encode(keypair.ed25519_public_key().as_bytes());
     let name_b64     = STANDARD.encode(my_name.trim().as_bytes());
-    // Use public (internet-routable) IP so the card works across different networks.
-    // Falls back to LAN IP if offline.
-    let public_endpoint = p2p::get_public_endpoint().await;
+    // Wait up to 10 s for a relay/public endpoint so the card works cross-internet.
+    // Falls back to LAN IP if the relay hasn't been set up yet (offline scenario).
+    let public_endpoint = p2p::wait_for_public_endpoint(10).await;
     let endpoint_b64 = STANDARD.encode(public_endpoint.as_bytes());
 
     Ok(format!(
@@ -291,7 +291,7 @@ pub async fn import_contact(
     let mut key_bytes = [0u8; 32];
     OsRng.fill_bytes(&mut key_bytes);
     let shared_key_hex = hex::encode(key_bytes);
-    let my_endpoint    = p2p::get_public_endpoint().await;
+    let my_endpoint    = p2p::wait_for_public_endpoint(5).await;
 
     let request = p2p::P2PMessage::ContactRequest {
         from_addr:       my_addr.clone(),
