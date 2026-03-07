@@ -209,61 +209,36 @@ fn main() {
             // relay endpoint and can dial us back through the relay.
             let handle_startup = app.handle();
             tauri::async_runtime::spawn(async move {
-                // Block until relay circuit address is confirmed (max 15 s).
-                // After the p2p fix this typically takes 2–4 s.
-                let my_endpoint = crate::p2p::wait_for_public_endpoint(30).await;
+                // Wait 5s for swarm to start, then proceed without blocking on relay.
+                // ReservationReqAccepted fires async and triggers re-announce automatically.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let my_endpoint = crate::p2p::get_public_endpoint().await;
 
                 if my_endpoint.is_empty() {
-                    eprintln!("[Startup] No public endpoint after 15s — running in local-only mode");
+                    eprintln!("[Startup] No public endpoint yet — relay will announce when ready");
                 } else {
                     eprintln!("[Startup] Public endpoint ready: {}", my_endpoint);
                 }
 
-                // Fetch fresh peer endpoints from the relay directory.
-                // This resolves stale contact endpoints even when direct P2P
-                // is impossible (both nodes behind different NATs).
                 crate::p2p::fetch_peers_from_relay(&handle_startup).await;
                 eprintln!("[Startup] Relay peer directory synced");
 
-                // Fetch the global chain from the relay seed node.
-                // Ensures every node starts with full shared history.
                 crate::p2p::fetch_chain_from_relay(&handle_startup).await;
                 eprintln!("[Startup] Relay chain sync complete");
 
-                // Announce our (now relay-circuit) endpoint to all contacts.
-                // This refreshes their stale stored endpoint for us.
                 crate::p2p::broadcast_peer_announce(&handle_startup).await;
                 eprintln!("[Startup] Peer announce sent");
 
-                // Small gap so the announce arrives before the sync request,
-                // giving peers a chance to update our endpoint first.
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-                // Request full chain sync from all reachable peers.
-                // Uses fresh relay endpoints (announce above may have just
-                // triggered a PeerAnnounce response that refreshed their addr).
                 crate::p2p::sync_chain_from_peers().await;
                 eprintln!("[Startup] Chain sync requested");
 
-                // ── 3. Periodic keep-alive loop ────────────────────────────
-                // Re-announce and re-sync every 30 s to:
-                //   - Keep relay reservation alive (relay drops idle circuits)
-                //   - Pick up any txs that arrived while we were offline
-                //   - Refresh peer endpoints if a contact reconnected via relay
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-
-                    // Refresh peer endpoints from relay directory first so
-                    // subsequent P2P calls use up-to-date relay circuit addrs.
                     crate::p2p::fetch_peers_from_relay(&handle_startup).await;
-
-                    // Re-announce with latest endpoint.
                     crate::p2p::broadcast_peer_announce(&handle_startup).await;
-
-                    // Sync chain from relay (catches txs sent while we were offline).
                     crate::p2p::fetch_chain_from_relay(&handle_startup).await;
-
-                    // Also sync from live P2P peers.
                     crate::p2p::sync_chain_from_peers().await;
                 }
             });
