@@ -412,11 +412,16 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     let (tx, mut rx) = mpsc::channel::<SwarmCmd>(64);
     let _ = SWARM_TX.set(tx);
 
-    // Single authoritative list of reachable addresses for this node.
-    // ALL endpoint updates go through this vec; best_endpoint() reads it.
     let mut external_addrs: Vec<Multiaddr> = Vec::new();
     let mut pending_sends:  HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>> = HashMap::new();
     let mut in_flight:      HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>> = HashMap::new();
+
+    // Retry relay connection every 15 s when circuit is not confirmed.
+    // Recovers from relay being down at startup — once it comes back up the
+    // next tick redials and the circuit establishes automatically.
+    let mut relay_retry = tokio::time::interval(Duration::from_secs(15));
+    relay_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    relay_retry.tick().await; // consume the immediate first tick
 
     loop {
         tokio::select! {
@@ -439,6 +444,23 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                     &mut external_addrs, &mut pending_sends, &mut in_flight,
                     &mut swarm, &relay_addrs,
                 ).await;
+            }
+            _ = relay_retry.tick() => {
+                // Only redial if relay circuit not yet confirmed.
+                // Once circuit is live this branch is a cheap no-op.
+                if !has_circuit_addr(&external_addrs) {
+                    for relay_str in RELAY_NODES {
+                        if let Ok(addr) = relay_str.parse::<Multiaddr>() {
+                            let already = peer_id_from_multiaddr(&addr)
+                                .map(|p| swarm.is_connected(&p))
+                                .unwrap_or(false);
+                            if !already {
+                                eprintln!("[P2P] Relay not connected — redialling {}", relay_str);
+                                let _ = swarm.dial(addr);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
