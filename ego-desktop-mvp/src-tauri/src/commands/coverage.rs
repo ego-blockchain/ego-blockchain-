@@ -268,6 +268,7 @@ async fn tick_coverage(
 
     let coverage_synced_count = if is_online { visible_peers as u32 } else { 0 };
     let network_quality       = quality_from_peers(visible_peers, is_online);
+    let network_quality_str   = quality_str(&network_quality);
 
     let status = CoverageStatus {
         location:             location.clone(),
@@ -290,7 +291,7 @@ async fn tick_coverage(
         eprintln!(
             "[Coverage] tick — peers: {}, quality: {}, PoC eligible",
             visible_peers,
-            quality_str(&network_quality)
+            network_quality_str
         );
     }
 }
