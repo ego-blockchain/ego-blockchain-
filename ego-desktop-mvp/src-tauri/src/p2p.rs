@@ -688,11 +688,26 @@ async fn handle_event(
             }
         }
 
-        SwarmEvent::Behaviour(EgoBehaviourEvent::RelayClient(
+SwarmEvent::Behaviour(EgoBehaviourEvent::RelayClient(
             relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
         )) => {
             eprintln!("[P2P] Relay reservation accepted ✓ via {}", relay_peer_id);
             let peer_id = *swarm.local_peer_id();
+
+            // Add circuit address so best_endpoint() returns it instead of direct IP
+            if let Some(relay_base) = relay_addrs.get(&relay_peer_id) {
+                let circuit = format!(
+                    "{}/p2p/{}/p2p-circuit/p2p/{}",
+                    relay_base, relay_peer_id, peer_id
+                );
+                if let Ok(addr) = circuit.parse::<Multiaddr>() {
+                    if !external_addrs.contains(&addr) {
+                        external_addrs.push(addr.clone());
+                        eprintln!("[P2P] Circuit address added: {}", addr);
+                    }
+                }
+            }
+
             let state = app.state::<crate::app::AppState>();
             state.set_upnp_status(Ok(()));
             let endpoint = best_endpoint(external_addrs, &peer_id);
