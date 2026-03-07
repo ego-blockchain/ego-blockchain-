@@ -1,7 +1,7 @@
 use crate::app::{AppState, CoverageStatus, Location, NetworkQuality};
 use crate::error::EgoDesktopError;
 use serde::Deserialize;
-use tauri::State;
+use tauri::{Manager, State};
 
 // ── ip-api.com extended response ──────────────────────────────────────────────
 
@@ -115,7 +115,7 @@ fn get_machine_id() -> String {
 
     let hostname = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|| "unknown".to_string());
+        .unwrap_or_else(|_| "unknown".to_string());
     let hash_bytes = ego_core::hash_data(hostname.as_bytes());
     hex::encode(&hash_bytes.as_bytes()[..8])
 }
