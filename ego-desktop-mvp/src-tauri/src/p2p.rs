@@ -562,6 +562,10 @@ fn best_endpoint(external_addrs: &[Multiaddr], peer_id: &PeerId) -> String {
     if base.contains("/p2p/") { base } else { format!("{}/p2p/{}", base, pid_str) }
 }
 
+fn has_circuit_addr(addrs: &[Multiaddr]) -> bool {
+    addrs.iter().any(|a| a.to_string().contains("/p2p-circuit"))
+}
+
 // Build the full dialable circuit address:
 //   /ip4/<relay_ip>/tcp/<port>/p2p/<relay_id>/p2p-circuit/p2p/<our_id>
 fn build_circuit_addr(
