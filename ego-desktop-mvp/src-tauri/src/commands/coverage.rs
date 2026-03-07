@@ -115,23 +115,20 @@ fn get_machine_id() -> String {
 
     let hostname = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown".to_string());
+        .unwrap_or_else(|| "unknown".to_string());
     let hash_bytes = ego_core::hash_data(hostname.as_bytes());
     hex::encode(&hash_bytes.as_bytes()[..8])
 }
 
 // ── Network quality from peer count ──────────────────────────────────────────
 
-/// Derive network quality from how many live peers we can see.
-/// 0 peers = Offline (no P2P neighbours found yet).
-/// The thresholds are intentionally low for an early network.
 fn quality_from_peers(peer_count: usize, base_online: bool) -> NetworkQuality {
     if !base_online { return NetworkQuality::Offline; }
     match peer_count {
-        0           => NetworkQuality::Fair,      // online but isolated
-        1..=2       => NetworkQuality::Good,
-        3..=4       => NetworkQuality::Good,
-        _           => NetworkQuality::Excellent,
+        0     => NetworkQuality::Fair,
+        1..=2 => NetworkQuality::Good,
+        3..=4 => NetworkQuality::Good,
+        _     => NetworkQuality::Excellent,
     }
 }
 
@@ -164,21 +161,16 @@ fn maybe_record_poc_event(status: &CoverageStatus) {
 
     if !should_record { return; }
 
-    let quality = quality_str(&status.network_quality);
-
+    let quality      = quality_str(&status.network_quality);
     let reward_uegoc: u64 = match quality {
         "Excellent" => 22_222,
         "Good"      => 18_518,
         "Fair"      => 14_814,
         _           => 11_111,
     };
-
-    // FIX: use the real peer count from coverage_synced_count
-    let peers = status.coverage_synced_count;
-
+    let peers   = status.coverage_synced_count;
     let h3_cell = status.location.as_ref()
         .map(|loc| derive_h3_cell(loc.latitude, loc.longitude));
-
     let next_id = events.last().map(|e| e.id + 1).unwrap_or(0);
 
     events.push(crate::ledger::PocEvent {
@@ -194,95 +186,204 @@ fn maybe_record_poc_event(status: &CoverageStatus) {
         let drain = events.len() - 200;
         events.drain(0..drain);
     }
-
     let _ = crate::ledger::save_poc_events(&events);
 }
 
-// ── Commands ──────────────────────────────────────────────────────────────────
+// ── Background coverage loop ──────────────────────────────────────────────────
+//
+// Runs forever in its own Tokio task (started from main.rs setup).
+// Ticks every 60 seconds regardless of whether the window is visible.
+// This is the ONLY place that calls maybe_record_poc_event and probe_peers
+// so PoC rewards and peer discovery continue when the app is minimized.
+//
+// Why 60 s?  PoC events require 240 s between them, so 60 s gives us
+// 4 checks per window — enough resolution without hammering the relay.
+pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
+    // Wait for relay circuit to be confirmed before first probe.
+    // This prevents a flood of failed dials on startup.
+    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
 
-#[tauri::command]
-pub async fn get_coverage_status(
-    state: State<'_, AppState>,
-) -> Result<CoverageStatus, EgoDesktopError> {
-    // ── FIX: always fetch live peer count — don't rely on stale cache for this.
-    // The cache is only used for the IP geolocation part (expensive HTTP call).
-    // Peer count changes every few seconds and must be read fresh every call.
+    // Fetch IP data once — it changes rarely, no need to re-fetch every tick.
+    let (location, vpn_detected, vpn_reason) = fetch_ip_data().await;
 
-    let machine_id  = get_machine_id();
+    // Store in AppState so UI polls can use it without an HTTP call.
+    {
+        let state = app.state::<AppState>();
+        let machine_id  = get_machine_id();
+        let ledger      = crate::ledger::Ledger::load();
+        let node_active = !ledger.address.is_empty();
+        let is_online   = node_active && !vpn_detected;
+        let placeholder = CoverageStatus {
+            location:              location.clone(),
+            coverage_synced_count: 0,
+            last_coverage_event:   None,
+            is_online,
+            network_quality:       if is_online { NetworkQuality::Fair } else { NetworkQuality::Offline },
+            vpn_detected,
+            vpn_reason:            vpn_reason.clone(),
+            machine_id,
+        };
+        state.update_coverage_status(placeholder);
+    }
+
+    loop {
+        tick_coverage(&app, &location, vpn_detected, &vpn_reason).await;
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    }
+}
+
+/// One coverage tick: probe peers, count, record PoC event, announce.
+async fn tick_coverage(
+    app:          &tauri::AppHandle,
+    location:     &Option<Location>,
+    vpn_detected: bool,
+    vpn_reason:   &str,
+) {
+    let state = app.state::<AppState>();
+
     let ledger      = crate::ledger::Ledger::load();
     let node_active = !ledger.address.is_empty();
+    let machine_id  = get_machine_id();
+    let is_online   = node_active && !vpn_detected;
 
-    // ── FIX: read active peers from AppState (populated by P2P PeerAnnounce).
-    // active_peers_count uses a 300-second window — same as get_network_peers.
-    // "seen in last 5 minutes" is a reasonable definition of "online peer".
+    // ── Step 1: probe known peers from relay directory ─────────────────────
+    // Fetches latest endpoints from relay HTTP API and sends each peer a
+    // PeerListRequest so they announce back to us. This actively discovers
+    // new nodes even if they haven't sent a PeerAnnounce to us yet.
+    if is_online {
+        probe_peers_from_relay(app).await;
+    }
+
+    // ── Step 2: count live peers ───────────────────────────────────────────
     let active_peers = state.get_active_peers(300);
     let peer_count   = active_peers.len();
 
-    // Also count approved contacts whose endpoint we know, as a fallback for
-    // peers that haven't sent a PeerAnnounce yet this session.
     let contact_count = {
         let contacts = crate::commands::messenger::load_contacts();
         contacts.iter()
             .filter(|c| c.status == "approved" && !c.endpoint.is_empty())
             .count()
     };
-
-    // Use whichever is larger — live PeerAnnounce beats stale contact list,
-    // but the contact list ensures we don't show 0 if the peer hasn't announced yet.
     let visible_peers = peer_count.max(contact_count);
 
-    // IP geolocation: use cache if available (avoid hammering ip-api.com)
-    let (location, vpn_detected, vpn_reason) = {
-        let cached_loc = {
-            let cache = state.cache.lock().unwrap();
-            cache.coverage_status.as_ref().map(|s| (
-                s.location.clone(),
-                s.vpn_detected,
-                s.vpn_reason.clone(),
-            ))
-        };
-        if let Some(cached) = cached_loc {
-            cached
-        } else {
-            fetch_ip_data().await
-        }
-    };
+    let coverage_synced_count = if is_online { visible_peers as u32 } else { 0 };
+    let network_quality       = quality_from_peers(visible_peers, is_online);
 
-    let is_online = node_active && !vpn_detected;
-
-    // ── FIX: coverage_synced_count = real visible peer count, not hardcoded 1
-    let coverage_synced_count = if is_online { visible_peers as u32 } else { 0u32 };
-
-    // ── FIX: network quality derived from actual peer count
-    let network_quality = quality_from_peers(visible_peers, is_online);
-
-    let s = CoverageStatus {
-        location,
-        // How many peer nodes this node can currently see
+    let status = CoverageStatus {
+        location:             location.clone(),
         coverage_synced_count,
-        last_coverage_event: if is_online {
-            Some(chrono::Utc::now().timestamp())
-        } else {
-            None
-        },
+        last_coverage_event:  if is_online { Some(chrono::Utc::now().timestamp()) } else { None },
         is_online,
         network_quality,
         vpn_detected,
-        vpn_reason,
+        vpn_reason:           vpn_reason.to_string(),
         machine_id,
     };
 
-    // Update cache so the IP geolocation part is reused next call
-    state.update_coverage_status(s.clone());
+    // ── Step 3: update AppState so UI reads fresh data ─────────────────────
+    state.update_coverage_status(status.clone());
+    let _ = app.emit_all("ego://coverage-updated", ());
 
-    if s.is_online {
-        maybe_record_poc_event(&s);
+    // ── Step 4: record PoC event (rate-limited to 1 per 240 s internally) ──
+    if is_online {
+        maybe_record_poc_event(&status);
+        eprintln!(
+            "[Coverage] tick — peers: {}, quality: {}, PoC eligible",
+            visible_peers,
+            quality_str(&network_quality)
+        );
     }
-
-    Ok(s)
 }
 
-/// Return stored PoC events for this wallet, newest-first, capped at 100.
+/// Fetch peer list from relay HTTP directory, update AppState, then send
+/// PeerListRequest to any peer we don't currently have in active peers.
+/// This actively recruits nodes that are online but haven't announced to us yet.
+async fn probe_peers_from_relay(app: &tauri::AppHandle) {
+    // Pull fresh endpoints from relay directory
+    crate::p2p::fetch_peers_from_relay(app).await;
+
+    let state        = app.state::<AppState>();
+    let my_endpoint  = crate::p2p::get_public_endpoint().await;
+    let active_peers = state.get_active_peers(300);
+    let active_eps:  std::collections::HashSet<String> =
+        active_peers.iter().map(|p| p.endpoint.clone()).collect();
+
+    // Also load contacts — they might have relay circuit addresses
+    let contacts = crate::commands::messenger::load_contacts();
+
+    // Combine relay-directory peers + contacts into a candidate list
+    let mut candidates: Vec<String> = Vec::new();
+
+    // From AppState (populated by fetch_peers_from_relay)
+    let all_known = state.get_active_peers(86_400); // last 24h, not just 5min
+    for p in &all_known {
+        if !p.endpoint.is_empty() && p.endpoint != my_endpoint {
+            candidates.push(p.endpoint.clone());
+        }
+    }
+    // From contacts
+    for c in &contacts {
+        if c.status == "approved" && !c.endpoint.is_empty() && c.endpoint != my_endpoint {
+            if !candidates.contains(&c.endpoint) {
+                candidates.push(c.endpoint.clone());
+            }
+        }
+    }
+
+    // Send PeerListRequest to every candidate not already active.
+    // This causes them to reply with PeerListResponse → we learn their
+    // current endpoint, and they get our endpoint too via PeerAnnounce.
+    let requester_endpoint = my_endpoint.clone();
+    for endpoint in candidates {
+        if active_eps.contains(&endpoint) { continue; } // already talking
+        let ep  = endpoint.clone();
+        let req = crate::p2p::P2PMessage::PeerListRequest {
+            requester_endpoint: requester_endpoint.clone(),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = crate::p2p::send_message(&ep, &req).await {
+                eprintln!("[Coverage] probe {}: {}", ep, e);
+            }
+        });
+    }
+}
+
+// ── Commands (called by UI) ───────────────────────────────────────────────────
+//
+// These now just READ from the AppState cache that the background loop keeps
+// fresh. No blocking HTTP calls, no peer counting inline — just a cache read.
+
+#[tauri::command]
+pub async fn get_coverage_status(
+    state: State<'_, AppState>,
+) -> Result<CoverageStatus, EgoDesktopError> {
+    // Return what the background loop last computed.
+    // If the loop hasn't run yet (first few seconds), compute once inline.
+    let cached = {
+        let cache = state.cache.lock().unwrap();
+        cache.coverage_status.clone()
+    };
+
+    if let Some(status) = cached {
+        return Ok(status);
+    }
+
+    // First-call fallback: background loop hasn't ticked yet.
+    // Return a minimal status so the UI isn't blank.
+    let ledger     = crate::ledger::Ledger::load();
+    let machine_id = get_machine_id();
+    Ok(CoverageStatus {
+        location:              None,
+        coverage_synced_count: 0,
+        last_coverage_event:   None,
+        is_online:             !ledger.address.is_empty(),
+        network_quality:       NetworkQuality::Fair,
+        vpn_detected:          false,
+        vpn_reason:            String::new(),
+        machine_id,
+    })
+}
+
 #[tauri::command]
 pub fn get_poc_events() -> Vec<crate::ledger::PocEvent> {
     let mut events = crate::ledger::load_poc_events();
@@ -291,24 +392,28 @@ pub fn get_poc_events() -> Vec<crate::ledger::PocEvent> {
     events
 }
 
-/// Fetch IP geolocation + proxy/hosting flags from ip-api.com (free tier).
+#[tauri::command]
+pub async fn get_network_peers(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::app::PeerInfo>, EgoDesktopError> {
+    Ok(state.get_active_peers(300))
+}
+
+// ── IP geolocation (called once on startup, cached) ──────────────────────────
+
 async fn fetch_ip_data() -> (Option<Location>, bool, String) {
     let url = "http://ip-api.com/json?fields=status,lat,lon,city,regionName,country,isp,org,proxy,hosting";
-
     let resp = match reqwest::get(url).await {
         Ok(r)  => r,
         Err(_) => return (None, false, String::new()),
     };
-
     let data = match resp.json::<IpApiResponse>().await {
         Ok(d)  => d,
         Err(_) => return (None, false, String::new()),
     };
-
     if data.status != "success" {
         return (None, false, String::new());
     }
-
     let location = match (data.lat, data.lon) {
         (Some(lat), Some(lon)) => Some(Location {
             latitude:  lat,
@@ -321,19 +426,9 @@ async fn fetch_ip_data() -> (Option<Location>, bool, String) {
         }),
         _ => None,
     };
-
     let (vpn_detected, vpn_reason) = match detect_vpn(&data) {
         Some(reason) => (true, reason),
         None         => (false, String::new()),
     };
-
     (location, vpn_detected, vpn_reason)
-}
-
-/// Return all peer nodes seen via P2P PeerAnnounce within the last 5 minutes.
-#[tauri::command]
-pub async fn get_network_peers(
-    state: State<'_, AppState>,
-) -> Result<Vec<crate::app::PeerInfo>, EgoDesktopError> {
-    Ok(state.get_active_peers(300))
 }

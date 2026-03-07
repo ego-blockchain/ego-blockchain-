@@ -1,10 +1,11 @@
 //! libp2p P2P engine for Ego Desktop.
-//! Replaces raw TCP + UPnP with proper NAT traversal:
 //! - QUIC + TCP transports
-//! - Circuit Relay v2 (fallback when direct fails)
+//! - Circuit Relay v2  (cross-NAT fallback)
 //! - DCUtR hole punching (upgrades relay → direct)
-//! - AutoNAT (detects NAT type, updates UI)
+//! - AutoNAT (detects NAT type)
 //! - Identify (address exchange)
+//!
+//! Kademlia removed — IPFS bootstrap nodes reject non-IPFS peers.
 
 use crate::commands::messenger::{load_contacts, save_contacts, Contact};
 use crate::ledger::{base_data_dir, load_chain, save_chain, LedgerBlock, LedgerTx};
@@ -18,20 +19,33 @@ use libp2p::{
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashMap, io, sync::OnceLock, time::Duration};
 use tauri::Manager;
 use tokio::sync::{mpsc, oneshot};
 
 pub const P2P_PORT: u16 = 47393;
 
-/// Ego relay server addresses.
-/// Format: "/ip4/<PUBLIC_IP>/tcp/4001/p2p/<PEER_ID>"
-const RELAY_NODES: &[&str] = &[
+pub const RELAY_NODES: &[&str] = &[
     "/ip4/40.233.82.42/tcp/4001/p2p/12D3KooWPj6m7jzmVyMh1zWrsoux3YiVs9j2HwsjrFXzDcqAGGz4",
 ];
 
-/// HTTP chain API on the relay server — global source-of-truth for the blockchain.
 const RELAY_HTTP_API: &str = "http://40.233.82.42:8080";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SINGLE SOURCE OF TRUTH FOR RELAY CIRCUIT STATE
+//
+// This flag is set ONLY from inside the swarm event loop (handle_event) via
+// inject_circuit(). It is NEVER set from a spawned task.
+//
+// wait_for_public_endpoint() polls this flag. When true it calls
+// get_public_endpoint() which reads from external_addrs via GetEndpoint cmd.
+// external_addrs is also only mutated from inside the swarm loop.
+//
+// This means all three (RELAY_CIRCUIT_READY, external_addrs, AppState endpoint)
+// are always consistent with each other.
+// ─────────────────────────────────────────────────────────────────────────────
+static RELAY_CIRCUIT_READY: AtomicBool = AtomicBool::new(false);
 
 // ── Wire protocol ─────────────────────────────────────────────────────────────
 
@@ -104,8 +118,7 @@ impl request_response::Codec for EgoCodec {
     ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = io::Result<Self::Request>> + ::core::marker::Send + 'async_trait>>
     where
         T: futures::io::AsyncRead + Unpin + Send + 'async_trait,
-        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait,
-        Self: 'async_trait,
+        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait,
     {
         Box::pin(async move {
             let mut len_buf = [0u8; 4];
@@ -116,7 +129,8 @@ impl request_response::Codec for EgoCodec {
             }
             let mut buf = vec![0u8; len];
             AsyncReadExt::read_exact(io, &mut buf).await?;
-            serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            serde_json::from_slice(&buf)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         })
     }
 
@@ -127,11 +141,8 @@ impl request_response::Codec for EgoCodec {
     ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = io::Result<Self::Response>> + ::core::marker::Send + 'async_trait>>
     where
         T: futures::io::AsyncRead + Unpin + Send + 'async_trait,
-        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait,
-        Self: 'async_trait,
-    {
-        Box::pin(async move { Ok(()) })
-    }
+        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait,
+    { Box::pin(async move { Ok(()) }) }
 
     fn write_request<'life0, 'life1, 'life2, 'async_trait, T>(
         &'life0 mut self,
@@ -141,8 +152,7 @@ impl request_response::Codec for EgoCodec {
     ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = io::Result<()>> + ::core::marker::Send + 'async_trait>>
     where
         T: futures::io::AsyncWrite + Unpin + Send + 'async_trait,
-        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait,
-        Self: 'async_trait,
+        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait,
     {
         Box::pin(async move {
             let data = serde_json::to_vec(&req)
@@ -161,14 +171,11 @@ impl request_response::Codec for EgoCodec {
     ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = io::Result<()>> + ::core::marker::Send + 'async_trait>>
     where
         T: futures::io::AsyncWrite + Unpin + Send + 'async_trait,
-        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait,
-        Self: 'async_trait,
-    {
-        Box::pin(async move { Ok(()) })
-    }
+        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait,
+    { Box::pin(async move { Ok(()) }) }
 }
 
-// ── Combined network behaviour ────────────────────────────────────────────────
+// ── Network behaviour ─────────────────────────────────────────────────────────
 
 #[derive(NetworkBehaviour)]
 struct EgoBehaviour {
@@ -180,7 +187,7 @@ struct EgoBehaviour {
     ping:             ping::Behaviour,
 }
 
-// ── Commands: Tauri → swarm ───────────────────────────────────────────────────
+// ── Swarm command channel ─────────────────────────────────────────────────────
 
 pub enum SwarmCmd {
     Send {
@@ -199,7 +206,8 @@ static SWARM_TX: OnceLock<mpsc::Sender<SwarmCmd>> = OnceLock::new();
 
 pub async fn send_message(endpoint: &str, msg: &P2PMessage) -> Result<(), String> {
     let tx = SWARM_TX.get().ok_or_else(|| "P2P not started".to_string())?;
-    let peer_addr: Multiaddr = endpoint.parse()
+    let peer_addr: Multiaddr = endpoint
+        .parse()
         .map_err(|e| format!("Invalid multiaddr '{}': {}", endpoint, e))?;
     let (reply_tx, reply_rx) = oneshot::channel();
     tx.send(SwarmCmd::Send { peer_addr, msg: msg.clone(), reply: reply_tx })
@@ -217,28 +225,28 @@ pub async fn get_public_endpoint() -> String {
     reply_rx.await.unwrap_or_default()
 }
 
-/// Wait up to `timeout_secs` for a relay circuit endpoint.
-/// A relay circuit address is the only address guaranteed to work cross-internet.
-/// Falls back to whatever we have (direct public IP) if relay isn't ready in time.
+/// Wait up to `timeout_secs` for a confirmed relay circuit endpoint.
+///
+/// RELAY_CIRCUIT_READY is set only from inside the swarm loop when either:
+///   (a) NewListenAddr fires with /p2p-circuit, OR
+///   (b) ReservationReqAccepted fires and we synthesise the circuit address.
+///
+/// Both paths update external_addrs before setting the flag, so
+/// get_public_endpoint() is guaranteed to return the circuit address
+/// the instant the flag is true.
 pub async fn wait_for_public_endpoint(timeout_secs: u64) -> String {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-    let mut best = String::new();
     loop {
-        let ep = get_public_endpoint().await;
-        // Relay circuit address works behind any NAT — return immediately
-        if ep.contains("/p2p-circuit") {
-            return ep;
-        }
-        // Track best non-empty fallback (direct public IP)
-        if !ep.is_empty() && !ep.contains("/ip4/127.") && !ep.contains("/ip4/192.168.")
-            && !ep.contains("/ip4/10.") && !ep.contains("/ip4/172.")
-        {
-            best = ep;
+        if RELAY_CIRCUIT_READY.load(Ordering::Relaxed) {
+            let ep = get_public_endpoint().await;
+            if ep.contains("/p2p-circuit") {
+                return ep;
+            }
         }
         if tokio::time::Instant::now() >= deadline {
-            return if best.is_empty() { get_public_endpoint().await } else { best };
+            return get_public_endpoint().await;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
 }
 
@@ -257,6 +265,7 @@ pub fn get_local_endpoint() -> String {
     format!("/ip4/{}/tcp/{}", get_local_ip(), P2P_PORT)
 }
 
+// No-ops kept for API compatibility
 pub async fn start_udp_discovery(_app: tauri::AppHandle) {}
 pub async fn broadcast_udp_announce() {}
 pub async fn gossip_peer_list() {}
@@ -290,7 +299,7 @@ pub async fn sync_chain_from_peers() {
 }
 
 pub async fn broadcast_peer_announce(app: &tauri::AppHandle) {
-    let address = { crate::ledger::Ledger::load().address.clone() };
+    let address = crate::ledger::Ledger::load().address.clone();
     if address.is_empty() { return; }
     let my_endpoint = get_public_endpoint().await;
     let registry  = crate::ledger::load_registry();
@@ -380,25 +389,20 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
         Err(e) => { eprintln!("[P2P] Failed to build swarm: {}", e); return; }
     };
 
-    let tcp_addr:  Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", P2P_PORT).parse().unwrap();
-    let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", P2P_PORT).parse().unwrap();
-    if let Err(e) = swarm.listen_on(tcp_addr)  { eprintln!("[P2P] TCP listen: {}", e); }
-    if let Err(e) = swarm.listen_on(quic_addr) { eprintln!("[P2P] QUIC listen: {}", e); }
+    if let Err(e) = swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", P2P_PORT).parse().unwrap()) {
+        eprintln!("[P2P] TCP listen: {}", e);
+    }
+    if let Err(e) = swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", P2P_PORT).parse().unwrap()) {
+        eprintln!("[P2P] QUIC listen: {}", e);
+    }
 
-    // Store the full relay multiaddr (including IP+port) keyed by PeerId.
-    // When ConnectionEstablished fires we need the FULL address to build the
-    // correct circuit multiaddr:
-    //   CORRECT:  /ip4/40.233.82.42/tcp/4001/p2p/<relay_id>/p2p-circuit
-    //   WRONG:    /p2p/<relay_id>/p2p-circuit   ← what the old code produced
+    // relay PeerId → base transport addr (no /p2p/<id> suffix)
+    // e.g.  12D3KooWPj6m... → /ip4/40.233.82.42/tcp/4001
     let mut relay_addrs: HashMap<PeerId, Multiaddr> = HashMap::new();
-
     for relay_str in RELAY_NODES {
         if let Ok(addr) = relay_str.parse::<Multiaddr>() {
             if let Some(pid) = peer_id_from_multiaddr(&addr) {
-                // Strip the /p2p/<id> tail — we want just the transport part
-                // e.g. /ip4/40.233.82.42/tcp/4001
-                let base = strip_p2p_suffix(&addr);
-                relay_addrs.insert(pid, base);
+                relay_addrs.insert(pid, strip_p2p_suffix(&addr));
             }
             eprintln!("[P2P] Dialling relay {}", relay_str);
             let _ = swarm.dial(addr);
@@ -408,6 +412,8 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     let (tx, mut rx) = mpsc::channel::<SwarmCmd>(64);
     let _ = SWARM_TX.set(tx);
 
+    // Single authoritative list of reachable addresses for this node.
+    // ALL endpoint updates go through this vec; best_endpoint() reads it.
     let mut external_addrs: Vec<Multiaddr> = Vec::new();
     let mut pending_sends:  HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>> = HashMap::new();
     let mut in_flight:      HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>> = HashMap::new();
@@ -418,7 +424,8 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                 let Some(cmd) = cmd else { break; };
                 match cmd {
                     SwarmCmd::Send { peer_addr, msg, reply } => {
-                        handle_send(&mut swarm, peer_addr, msg, reply, &mut pending_sends, &mut in_flight);
+                        handle_send(&mut swarm, peer_addr, msg, reply,
+                            &mut pending_sends, &mut in_flight);
                     }
                     SwarmCmd::GetEndpoint { reply } => {
                         let ep = best_endpoint(&external_addrs, &local_peer_id);
@@ -437,13 +444,9 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     }
 }
 
-/// Strip the trailing /p2p/<PeerId> component from a multiaddr so we keep
-/// only the transport portion (e.g. /ip4/40.233.82.42/tcp/4001).
 fn strip_p2p_suffix(addr: &Multiaddr) -> Multiaddr {
     use libp2p::multiaddr::Protocol;
-    addr.iter()
-        .filter(|p| !matches!(p, Protocol::P2p(_)))
-        .collect()
+    addr.iter().filter(|p| !matches!(p, Protocol::P2p(_))).collect()
 }
 
 async fn build_swarm(
@@ -507,24 +510,26 @@ fn handle_send(
 fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
     use libp2p::multiaddr::Protocol;
     addr.iter().find_map(|p| {
-        if let Protocol::P2p(peer_id) = p { Some(peer_id) } else { None }
+        if let Protocol::P2p(pid) = p { Some(pid) } else { None }
     })
 }
 
+/// Select best reachable endpoint.
+///   1. /p2p-circuit   — works behind any NAT
+///   2. Public IPv4    — works if port-forwarded
+///   3. LAN / loopback — last resort
 fn best_endpoint(external_addrs: &[Multiaddr], peer_id: &PeerId) -> String {
     let pid_str = peer_id.to_string();
 
-    // Prefer circuit relay addresses — they work across any NAT/firewall
-    if let Some(relay_addr) = external_addrs.iter().find(|a| a.to_string().contains("/p2p-circuit")) {
-        let s = relay_addr.to_string();
+    if let Some(a) = external_addrs.iter().find(|a| a.to_string().contains("/p2p-circuit")) {
+        let s = a.to_string();
         return if s.contains(&pid_str) { s } else { format!("{}/p2p/{}", s, pid_str) };
     }
 
-    // Then prefer public IPv4
     let is_public = |a: &Multiaddr| {
         let s = a.to_string();
-        !s.starts_with("/ip4/127.") &&
-        !s.starts_with("/ip4/10.")  &&
+        !s.starts_with("/ip4/127.")     &&
+        !s.starts_with("/ip4/10.")      &&
         !s.starts_with("/ip4/192.168.") &&
         !s.starts_with("/ip4/172.")
     };
@@ -533,6 +538,59 @@ fn best_endpoint(external_addrs: &[Multiaddr], peer_id: &PeerId) -> String {
         .map(|a| a.to_string())
         .unwrap_or_else(|| format!("/ip4/{}/tcp/{}", get_local_ip(), P2P_PORT));
     if base.contains("/p2p/") { base } else { format!("{}/p2p/{}", base, pid_str) }
+}
+
+// Build the full dialable circuit address:
+//   /ip4/<relay_ip>/tcp/<port>/p2p/<relay_id>/p2p-circuit/p2p/<our_id>
+fn build_circuit_addr(
+    relay_base:    &Multiaddr,
+    relay_peer_id: &PeerId,
+    our_peer_id:   &PeerId,
+) -> Option<Multiaddr> {
+    format!("{}/p2p/{}/p2p-circuit/p2p/{}", relay_base, relay_peer_id, our_peer_id)
+        .parse()
+        .ok()
+}
+
+// ── Circuit injection (called from multiple event paths) ──────────────────────
+
+/// Add `circuit` to external_addrs and set RELAY_CIRCUIT_READY.
+/// MUST only be called from within the swarm event loop so that
+/// external_addrs mutations are always single-threaded.
+fn inject_circuit(
+    circuit:        Multiaddr,
+    external_addrs: &mut Vec<Multiaddr>,
+    app:            &tauri::AppHandle,
+    local_peer_id:  &PeerId,
+) {
+    if !external_addrs.contains(&circuit) {
+        eprintln!("[P2P] ✓ Circuit injected: {}", circuit);
+        external_addrs.push(circuit);
+    }
+    RELAY_CIRCUIT_READY.store(true, Ordering::Relaxed);
+    let ep    = best_endpoint(external_addrs, local_peer_id);
+    let state = app.state::<crate::app::AppState>();
+    state.set_public_endpoint(ep.clone());
+    state.set_upnp_status(Ok(()));
+    let _ = app.emit_all("ego://p2p-status-changed", ());
+
+    // Register with HTTP relay directory (async, non-blocking)
+    let address_str = crate::ledger::Ledger::load().address;
+    let registry    = crate::ledger::load_registry();
+    let active_id   = crate::ledger::get_active_wallet_id();
+    let name = registry.wallets.iter()
+        .find(|w| w.id == active_id)
+        .map(|w| w.name.clone())
+        .unwrap_or_else(|| "Ego Node".to_string());
+    let ep_clone  = ep.clone();
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        register_with_relay(address_str, name, ep_clone).await;
+        // Small delay so contacts have time to register too before we announce
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        broadcast_peer_announce(&app_clone).await;
+        eprintln!("[P2P] Re-announced after relay circuit confirmed");
+    });
 }
 
 // ── Swarm event handler ───────────────────────────────────────────────────────
@@ -544,69 +602,82 @@ async fn handle_event(
     pending_sends:  &mut HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>>,
     in_flight:      &mut HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>>,
     swarm:          &mut libp2p::Swarm<EgoBehaviour>,
-    // ── FIX: now a map from PeerId → base transport addr (no /p2p suffix)
     relay_addrs:    &HashMap<PeerId, Multiaddr>,
 ) {
     match event {
+
+        // ─── NewListenAddr ────────────────────────────────────────────────────
+        // When the relay accepts our reservation it assigns a circuit listen
+        // address.  libp2p fires NewListenAddr with that address.
+        // This is the PRIMARY confirmation path.
         SwarmEvent::NewListenAddr { address, .. } => {
-            eprintln!("[P2P] Listening on {}", address);
-            if address.to_string().contains("/p2p-circuit") {
+            let addr_str = address.to_string();
+            eprintln!("[P2P] Listening on {}", addr_str);
+
+            if addr_str.contains("/p2p-circuit") {
                 let peer_id = *swarm.local_peer_id();
-                let with_id = {
-                    let s = address.to_string();
-                    if s.contains(&peer_id.to_string()) {
-                        address.clone()
-                    } else {
-                        format!("{}/p2p/{}", s, peer_id).parse().unwrap_or(address.clone())
-                    }
+                let pid_str = peer_id.to_string();
+                // Ensure /p2p/<our_id> is appended so remote peers can dial us
+                let full: Multiaddr = if addr_str.contains(&pid_str) {
+                    address.clone()
+                } else {
+                    format!("{}/p2p/{}", addr_str, pid_str)
+                        .parse()
+                        .unwrap_or(address.clone())
                 };
-                if !external_addrs.contains(&with_id) {
-                    external_addrs.push(with_id.clone());
-                    eprintln!("[P2P] Relay circuit address ready: {}", with_id);
-                }
-                let state = app.state::<crate::app::AppState>();
-                state.set_public_endpoint(best_endpoint(external_addrs, &peer_id));
-                let _ = app.emit_all("ego://p2p-status-changed", ());
+                eprintln!("[P2P] ✓ Relay circuit LIVE (NewListenAddr): {}", full);
+                inject_circuit(full, external_addrs, app, &peer_id);
             }
         }
 
+        // ─── ConnectionEstablished ────────────────────────────────────────────
+        // For relays: call swarm.listen_on(circuit_addr) to request a slot.
+        // The relay server will respond with ReservationReqAccepted which
+        // triggers NewListenAddr.
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             eprintln!("[P2P] Connected to {}", peer_id);
 
-            // ── FIX: build the circuit address as
-            //    <relay_base>/p2p/<relay_id>/p2p-circuit
-            // e.g. /ip4/40.233.82.42/tcp/4001/p2p/12D3KooW.../p2p-circuit
             if let Some(relay_base) = relay_addrs.get(&peer_id) {
-                let circuit_addr_str = format!(
-                    "{}/p2p/{}/p2p-circuit",
-                    relay_base,   // /ip4/40.233.82.42/tcp/4001
-                    peer_id       // 12D3KooWPj6m...
-                );
-                match circuit_addr_str.parse::<Multiaddr>() {
+                // Listen addr for reservation request:
+                //   <relay_transport>/p2p/<relay_id>/p2p-circuit
+                // Do NOT append /p2p/<our_id> here — libp2p adds it after acceptance
+                let circuit_str = format!("{}/p2p/{}/p2p-circuit", relay_base, peer_id);
+                match circuit_str.parse::<Multiaddr>() {
                     Ok(circuit_addr) => {
-                        eprintln!("[P2P] Reserving relay slot: {}", circuit_addr_str);
+                        eprintln!("[P2P] Reserving relay slot: {}", circuit_str);
                         match swarm.listen_on(circuit_addr) {
                             Ok(_)  => eprintln!("[P2P] Relay reservation requested ✓"),
                             Err(e) => eprintln!("[P2P] Relay listen error: {}", e),
                         }
                     }
-                    Err(e) => eprintln!("[P2P] Bad circuit multiaddr '{}': {}", circuit_addr_str, e),
+                    Err(e) => eprintln!("[P2P] Bad circuit addr '{}': {}", circuit_str, e),
                 }
             }
 
-            // Flush any messages that were queued while we were connecting
+            // Flush queued messages for this peer
             if let Some(pending) = pending_sends.remove(&peer_id) {
                 for (msg, reply) in pending {
-                    let req_id = swarm.behaviour_mut().request_response.send_request(&peer_id, msg);
+                    let req_id = swarm.behaviour_mut()
+                        .request_response.send_request(&peer_id, msg);
                     in_flight.insert(req_id, reply);
                 }
             }
         }
 
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
+            if relay_addrs.contains_key(&peer_id) {
+                eprintln!("[P2P] Relay {} disconnected — clearing circuit, redialling", peer_id);
+                RELAY_CIRCUIT_READY.store(false, Ordering::Relaxed);
+                external_addrs.retain(|a| !a.to_string().contains("/p2p-circuit"));
+                for relay_str in RELAY_NODES {
+                    if let Ok(addr) = relay_str.parse::<Multiaddr>() {
+                        let _ = swarm.dial(addr);
+                    }
+                }
+            }
             if let Some(pending) = pending_sends.remove(&peer_id) {
                 for (_, reply) in pending {
-                    let _ = reply.send(Err("Connection closed before message could be sent".into()));
+                    let _ = reply.send(Err("Connection closed before send".into()));
                 }
             }
         }
@@ -622,25 +693,77 @@ async fn handle_event(
             }
         }
 
-        SwarmEvent::Behaviour(EgoBehaviourEvent::Identify(identify::Event::Received {
-            peer_id: _remote_peer_id, info, ..
-        })) => {
+        // ─── Identify ─────────────────────────────────────────────────────────
+        // Learn our own external address as seen by a remote peer.
+        // Only update AppState from here if relay circuit isn't live yet.
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Identify(
+            identify::Event::Received { info, .. },
+        )) => {
             let observed = info.observed_addr.clone();
             swarm.add_external_address(observed.clone());
             if !external_addrs.contains(&observed) {
                 external_addrs.push(observed.clone());
                 eprintln!("[P2P] Observed external address: {}", observed);
             }
-            let peer_id = *swarm.local_peer_id();
-            let state = app.state::<crate::app::AppState>();
-            state.set_public_endpoint(best_endpoint(external_addrs, &peer_id));
-            let _ = app.emit_all("ego://p2p-status-changed", ());
+            if !RELAY_CIRCUIT_READY.load(Ordering::Relaxed) {
+                let peer_id = *swarm.local_peer_id();
+                let state   = app.state::<crate::app::AppState>();
+                state.set_public_endpoint(best_endpoint(external_addrs, &peer_id));
+                let _ = app.emit_all("ego://p2p-status-changed", ());
+            }
         }
 
+        // ─── ReservationReqAccepted ───────────────────────────────────────────
+        // Belt-and-suspenders path: if NewListenAddr already fired this is a
+        // no-op (inject_circuit deduplicates).  If NewListenAddr didn't fire
+        // (version quirk), we synthesise the full circuit address ourselves.
+        SwarmEvent::Behaviour(EgoBehaviourEvent::RelayClient(
+            relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
+        )) => {
+            eprintln!("[P2P] ✓ Relay reservation ACCEPTED via {}", relay_peer_id);
+            let our_peer_id = *swarm.local_peer_id();
+            if let Some(relay_base) = relay_addrs.get(&relay_peer_id) {
+                if let Some(circuit) = build_circuit_addr(relay_base, &relay_peer_id, &our_peer_id) {
+                    inject_circuit(circuit, external_addrs, app, &our_peer_id);
+                }
+            }
+        }
+
+        SwarmEvent::Behaviour(EgoBehaviourEvent::RelayClient(event)) => {
+            eprintln!("[P2P] Relay event: {:?}", event);
+        }
+
+        // ─── AutoNAT ──────────────────────────────────────────────────────────
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Autonat(
+            autonat::Event::StatusChanged { new, .. },
+        )) => {
+            let state = app.state::<crate::app::AppState>();
+            match new {
+                autonat::NatStatus::Public(addr) => {
+                    eprintln!("[P2P] AutoNAT: public at {}", addr);
+                    state.set_upnp_status(Ok(()));
+                    if !RELAY_CIRCUIT_READY.load(Ordering::Relaxed) {
+                        if !external_addrs.contains(&addr) {
+                            external_addrs.push(addr.clone());
+                        }
+                        let peer_id = *swarm.local_peer_id();
+                        state.set_public_endpoint(best_endpoint(external_addrs, &peer_id));
+                        let _ = app.emit_all("ego://p2p-status-changed", ());
+                    }
+                }
+                autonat::NatStatus::Private => {
+                    eprintln!("[P2P] AutoNAT: behind NAT — relay required");
+                    state.set_upnp_status(Err("Behind NAT — using relay".into()));
+                    let _ = app.emit_all("ego://p2p-status-changed", ());
+                }
+                autonat::NatStatus::Unknown => {}
+            }
+        }
+
+        // ─── request-response ─────────────────────────────────────────────────
         SwarmEvent::Behaviour(EgoBehaviourEvent::RequestResponse(
             request_response::Event::Message {
-                message: request_response::Message::Request { request, channel, .. },
-                ..
+                message: request_response::Message::Request { request, channel, .. }, ..
             },
         )) => {
             let _ = swarm.behaviour_mut().request_response.send_response(channel, ());
@@ -650,8 +773,7 @@ async fn handle_event(
 
         SwarmEvent::Behaviour(EgoBehaviourEvent::RequestResponse(
             request_response::Event::Message {
-                message: request_response::Message::Response { request_id, .. },
-                ..
+                message: request_response::Message::Response { request_id, .. }, ..
             },
         )) => {
             if let Some(reply) = in_flight.remove(&request_id) {
@@ -667,84 +789,8 @@ async fn handle_event(
             }
         }
 
-        SwarmEvent::Behaviour(EgoBehaviourEvent::Autonat(autonat::Event::StatusChanged {
-            new, ..
-        })) => {
-            let state = app.state::<crate::app::AppState>();
-            match new {
-                autonat::NatStatus::Public(addr) => {
-                    let peer_id = *swarm.local_peer_id();
-                    eprintln!("[P2P] AutoNAT: public at {}", addr);
-                    state.set_upnp_status(Ok(()));
-                    state.set_public_endpoint(format!("{}/p2p/{}", addr, peer_id));
-                    let _ = app.emit_all("ego://p2p-status-changed", ());
-                }
-                autonat::NatStatus::Private => {
-                    eprintln!("[P2P] AutoNAT: behind NAT — using relay");
-                    state.set_upnp_status(Err("Behind NAT — using relay for connectivity".into()));
-                    let _ = app.emit_all("ego://p2p-status-changed", ());
-                }
-                autonat::NatStatus::Unknown => {}
-            }
-        }
-
-SwarmEvent::Behaviour(EgoBehaviourEvent::RelayClient(
-            relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
-        )) => {
-            eprintln!("[P2P] Relay reservation accepted ✓ via {}", relay_peer_id);
-            let peer_id = *swarm.local_peer_id();
-
-            // Add circuit address so best_endpoint() returns it instead of direct IP
-            if let Some(relay_base) = relay_addrs.get(&relay_peer_id) {
-                let circuit = format!(
-                    "{}/p2p/{}/p2p-circuit/p2p/{}",
-                    relay_base, relay_peer_id, peer_id
-                );
-                if let Ok(addr) = circuit.parse::<Multiaddr>() {
-                    if !external_addrs.contains(&addr) {
-                        external_addrs.push(addr.clone());
-                        eprintln!("[P2P] Circuit address added: {}", addr);
-                    }
-                }
-            }
-
-            let state = app.state::<crate::app::AppState>();
-            state.set_upnp_status(Ok(()));
-            let endpoint = best_endpoint(external_addrs, &peer_id);
-            state.set_public_endpoint(endpoint.clone());
-            let _ = app.emit_all("ego://p2p-status-changed", ());
-
-            // Register our relay circuit address with the relay HTTP peer
-            // directory so other nodes can discover our fresh endpoint even
-            // if direct P2P contact is impossible (stale-endpoint deadlock fix).
-            let address = crate::ledger::Ledger::load().address;
-            let registry  = crate::ledger::load_registry();
-            let active_id = crate::ledger::get_active_wallet_id();
-            let name = registry.wallets.iter()
-                .find(|w| w.id == active_id)
-                .map(|w| w.name.clone())
-                .unwrap_or_else(|| "Ego Node".to_string());
-            let endpoint_clone = endpoint.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                register_with_relay(address, name, endpoint_clone).await;
-            });
-
-            // Also re-broadcast to all direct contacts.
-            let app_clone = app.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                broadcast_peer_announce(&app_clone).await;
-                eprintln!("[P2P] Peer announce sent after relay reservation");
-            });
-        }
-
-        SwarmEvent::Behaviour(EgoBehaviourEvent::RelayClient(event)) => {
-            eprintln!("[P2P] Relay event: {:?}", event);
-        }
-
         SwarmEvent::Behaviour(EgoBehaviourEvent::Dcutr(event)) => {
-            eprintln!("[P2P] DCUtR event: {:?}", event);
+            eprintln!("[P2P] DCUtR: {:?}", event);
         }
 
         _ => {}
@@ -759,10 +805,9 @@ async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
             from_addr, from_name, from_ed25519, from_kyber, from_shared_key, from_endpoint,
         } => {
             let mut contacts = load_contacts();
-            // If we already have this contact, just update their endpoint
             if let Some(existing) = contacts.iter_mut().find(|c| c.address == from_addr) {
                 if !from_endpoint.is_empty() && existing.endpoint != from_endpoint {
-                    existing.endpoint = from_endpoint.clone();
+                    existing.endpoint = from_endpoint;
                     let _ = save_contacts(&contacts);
                 }
                 return;
@@ -779,44 +824,65 @@ async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
             };
             contacts.push(contact.clone());
             let _ = save_contacts(&contacts);
-            let _ = tauri::api::notification::Notification::new(&app.config().tauri.bundle.identifier)
-                .title("Contact Request")
-                .body(&format!("{} wants to connect with you", from_name))
-                .show();
+            let _ = tauri::api::notification::Notification::new(
+                &app.config().tauri.bundle.identifier,
+            )
+            .title("Contact Request")
+            .body(&format!("{} wants to connect with you", from_name))
+            .show();
             let _ = app.emit_all("ego://contact-request", &contact);
         }
 
-        P2PMessage::ContactResponse { from_addr, from_name, from_ed25519, from_kyber, approved, shared_key } => {
+        P2PMessage::ContactResponse {
+            from_addr, from_name, from_ed25519, from_kyber, approved, shared_key,
+        } => {
             let mut contacts = load_contacts();
             if approved {
-                if let Some(pending) = contacts.iter_mut()
+                if let Some(p) = contacts.iter_mut()
                     .find(|c| c.status == "pending_out" && c.shared_key_hex == shared_key)
                 {
-                    pending.address        = from_addr.clone();
-                    pending.name           = from_name.clone();
-                    pending.ed25519_pubkey = from_ed25519;
-                    pending.kyber_pubkey   = from_kyber;
-                    pending.status         = "approved".to_string();
-                    let contact = pending.clone();
+                    p.address        = from_addr.clone();
+                    p.name           = from_name.clone();
+                    p.ed25519_pubkey = from_ed25519;
+                    p.kyber_pubkey   = from_kyber;
+                    p.status         = "approved".to_string();
+                    let contact = p.clone();
                     let _ = save_contacts(&contacts);
-                    let _ = tauri::api::notification::Notification::new(&app.config().tauri.bundle.identifier)
-                        .title("Contact Request Accepted!")
-                        .body(&format!("{} accepted your request", from_name))
-                        .show();
+                    let _ = tauri::api::notification::Notification::new(
+                        &app.config().tauri.bundle.identifier,
+                    )
+                    .title("Contact Request Accepted!")
+                    .body(&format!("{} accepted your request", from_name))
+                    .show();
                     let _ = app.emit_all("ego://contact-approved", &contact);
                 }
             } else {
                 contacts.retain(|c| !(c.status == "pending_out" && c.shared_key_hex == shared_key));
                 let _ = save_contacts(&contacts);
-                let _ = tauri::api::notification::Notification::new(&app.config().tauri.bundle.identifier)
-                    .title("Contact Request Declined")
-                    .body("Your contact request was declined.")
-                    .show();
+                let _ = tauri::api::notification::Notification::new(
+                    &app.config().tauri.bundle.identifier,
+                )
+                .title("Contact Request Declined")
+                .body("Your contact request was declined.")
+                .show();
                 let _ = app.emit_all("ego://contact-declined", ());
             }
         }
 
         P2PMessage::PeerAnnounce { address, name, endpoint } => {
+            if !endpoint.is_empty() {
+                let mut contacts = load_contacts();
+                if let Some(c) = contacts.iter_mut().find(|c| c.address == address) {
+                    let relay_in   = endpoint.contains("/p2p-circuit");
+                    let relay_curr = c.endpoint.contains("/p2p-circuit");
+                    // relay circuit always wins; raw IP only updates non-relay
+                    if (relay_in || !relay_curr) && c.endpoint != endpoint {
+                        eprintln!("[P2P] Updated contact {} endpoint → {}", address, endpoint);
+                        c.endpoint = endpoint.clone();
+                        let _ = save_contacts(&contacts);
+                    }
+                }
+            }
             let state = app.state::<crate::app::AppState>();
             state.upsert_peer(crate::app::PeerInfo {
                 address:   address.clone(),
@@ -824,17 +890,11 @@ async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                 endpoint:  endpoint.clone(),
                 last_seen: Utc::now().timestamp(),
             });
-            upsert_peer_cache(PeerEntry { address: address.clone(), endpoint: endpoint.clone(), last_seen: Utc::now().timestamp() });
-            // Update stored contact endpoint so future messages use the fresh relay address
-            if !endpoint.is_empty() {
-                let mut contacts = load_contacts();
-                if let Some(c) = contacts.iter_mut().find(|c| c.address == address) {
-                    if c.endpoint != endpoint {
-                        c.endpoint = endpoint;
-                        let _ = save_contacts(&contacts);
-                    }
-                }
-            }
+            upsert_peer_cache(PeerEntry {
+                address,
+                endpoint,
+                last_seen: Utc::now().timestamp(),
+            });
         }
 
         P2PMessage::ChatMessage { bundle } => {
@@ -845,8 +905,12 @@ async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                     } else {
                         msg.content.clone()
                     };
-                    let _ = tauri::api::notification::Notification::new(&app.config().tauri.bundle.identifier)
-                        .title("New Message").body(&preview).show();
+                    let _ = tauri::api::notification::Notification::new(
+                        &app.config().tauri.bundle.identifier,
+                    )
+                    .title("New Message")
+                    .body(&preview)
+                    .show();
                     let _ = app.emit_all("ego://message-received", &msg);
                 }
                 Err(e) => eprintln!("[P2P] Decrypt error: {}", e),
@@ -858,7 +922,7 @@ async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
         }
 
         P2PMessage::ChainSyncRequest { requester_endpoint } => {
-            let chain = load_chain();
+            let chain    = load_chain();
             let response = P2PMessage::ChainSyncResponse {
                 blocks:       chain.blocks,
                 transactions: chain.transactions,
@@ -875,8 +939,8 @@ async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
         }
 
         P2PMessage::PeerListRequest { requester_endpoint } => {
-            let known = load_peer_cache();
-            let response = P2PMessage::PeerListResponse { peers: known };
+            let peers    = load_peer_cache();
+            let response = P2PMessage::PeerListResponse { peers };
             tokio::spawn(async move {
                 if let Err(e) = send_message(&requester_endpoint, &response).await {
                     eprintln!("[P2P] peer list reply: {}", e);
@@ -932,11 +996,8 @@ async fn merge_remote_chain(
     }
 }
 
-// ── Relay HTTP chain sync ─────────────────────────────────────────────────────
+// ── Relay HTTP helpers ────────────────────────────────────────────────────────
 
-/// Fetch the full chain from the relay seed node and merge it into the local
-/// chain.json.  Called once on startup before any P2P peer connections so that
-/// every node always starts with the global history even after a fresh install.
 pub async fn fetch_chain_from_relay(app: &tauri::AppHandle) {
     let url = format!("{}/chain", RELAY_HTTP_API);
     eprintln!("[Relay] Fetching chain from {}", url);
@@ -960,8 +1021,6 @@ pub async fn fetch_chain_from_relay(app: &tauri::AppHandle) {
     eprintln!("[Relay] Chain merged from relay seed node");
 }
 
-/// Push a newly confirmed tx + block to the relay seed node so the global chain
-/// is updated immediately and not just when other peers sync.
 pub async fn push_tx_to_relay(tx: &crate::ledger::LedgerTx, block: &crate::ledger::LedgerBlock) {
     let client = reqwest::Client::new();
     if let Err(e) = client.post(format!("{}/chain/tx", RELAY_HTTP_API))
@@ -976,7 +1035,7 @@ pub async fn push_tx_to_relay(tx: &crate::ledger::LedgerTx, block: &crate::ledge
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RelayPeerEntry {
     address:   String,
     name:      String,
@@ -984,12 +1043,9 @@ struct RelayPeerEntry {
     last_seen: i64,
 }
 
-/// Register our relay circuit address with the relay HTTP peer directory.
-/// Called as soon as ReservationReqAccepted fires so other nodes can find us
-/// even if direct P2P contact is impossible.
 pub async fn register_with_relay(address: String, name: String, endpoint: String) {
     if address.is_empty() || endpoint.is_empty() { return; }
-    let entry = RelayPeerEntry { address: address.clone(), name, endpoint: endpoint.clone(), last_seen: 0 };
+    let entry  = RelayPeerEntry { address: address.clone(), name, endpoint: endpoint.clone(), last_seen: 0 };
     let client = reqwest::Client::new();
     match client.post(format!("{}/peers", RELAY_HTTP_API))
         .json(&entry).send().await
@@ -999,9 +1055,6 @@ pub async fn register_with_relay(address: String, name: String, endpoint: String
     }
 }
 
-/// Fetch fresh peer endpoints from the relay directory and update local contacts.
-/// This breaks the stale-endpoint deadlock: even if two nodes can't reach each
-/// other directly, they both register with the relay and can discover each other here.
 pub async fn fetch_peers_from_relay(app: &tauri::AppHandle) {
     let url = format!("{}/peers", RELAY_HTTP_API);
     let resp = match reqwest::get(&url).await {
@@ -1010,15 +1063,14 @@ pub async fn fetch_peers_from_relay(app: &tauri::AppHandle) {
     };
     let body = match resp.text().await {
         Ok(b)  => b,
-        Err(e) => { eprintln!("[Relay] fetch_peers read error: {}", e); return; }
+        Err(e) => { eprintln!("[Relay] fetch_peers read: {}", e); return; }
     };
     let remote_peers: Vec<RelayPeerEntry> = match serde_json::from_str(&body) {
         Ok(p)  => p,
-        Err(e) => { eprintln!("[Relay] fetch_peers parse error: {}", e); return; }
+        Err(e) => { eprintln!("[Relay] fetch_peers parse: {}", e); return; }
     };
     if remote_peers.is_empty() { return; }
 
-    // Update AppState peer list
     let state = app.state::<crate::app::AppState>();
     for p in &remote_peers {
         state.upsert_peer(crate::app::PeerInfo {
@@ -1029,14 +1081,15 @@ pub async fn fetch_peers_from_relay(app: &tauri::AppHandle) {
         });
     }
 
-    // Update stored contact endpoints so future messages use relay circuit addrs
     let mut contacts = load_contacts();
     let mut changed  = false;
     for remote in &remote_peers {
         if remote.endpoint.is_empty() { continue; }
         if let Some(c) = contacts.iter_mut().find(|c| c.address == remote.address) {
-            if c.endpoint != remote.endpoint {
-                eprintln!("[Relay] Updated contact {} endpoint → {}", remote.address, remote.endpoint);
+            let relay_in   = remote.endpoint.contains("/p2p-circuit");
+            let relay_curr = c.endpoint.contains("/p2p-circuit");
+            if (relay_in || !relay_curr) && c.endpoint != remote.endpoint {
+                eprintln!("[Relay] Updated {} endpoint → {}", remote.address, remote.endpoint);
                 c.endpoint = remote.endpoint.clone();
                 changed = true;
             }
