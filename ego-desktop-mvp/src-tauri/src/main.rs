@@ -26,26 +26,9 @@ fn acquire_single_instance_lock() -> Option<std::net::TcpListener> {
     }
 }
 
-#[cfg(target_os = "windows")]
-unsafe fn winapi_msgbox(title: *const u16, msg: *const u16) {
-    let lib = windows_sys_call(b"user32.dll\0", b"MessageBoxW\0");
-    if let Some(f) = lib {
-        type MsgBoxW = unsafe extern "system" fn(*mut std::ffi::c_void, *const u16, *const u16, u32) -> i32;
-        let f: MsgBoxW = std::mem::transmute(f);
-        f(std::ptr::null_mut(), msg, title, 0x30);
-    }
-}
-
-#[cfg(target_os = "windows")]
-unsafe fn windows_sys_call(lib: &[u8], _func: &[u8]) -> Option<*const ()> {
-    let _ = (lib, _func);
-    None
-}
-
 fn main() {
     let _instance_lock = acquire_single_instance_lock();
 
-    // ── System tray ────────────────────────────────────────────────────────
     let quit = CustomMenuItem::new("quit".to_string(), "Quit");
     let hide = CustomMenuItem::new("hide".to_string(), "Hide");
     let show = CustomMenuItem::new("show".to_string(), "Show");
@@ -56,14 +39,10 @@ fn main() {
         .add_item(quit);
     let tray = SystemTray::new().with_menu(tray_menu);
 
-    // ── App menu ───────────────────────────────────────────────────────────
     let submenu = Submenu::new(
         "Ego Desktop",
         Menu::new()
-            .add_native_item(MenuItem::About(
-                "Ego Desktop".to_string(),
-                tauri::AboutMetadata::new(),
-            ))
+            .add_native_item(MenuItem::About("Ego Desktop".to_string(), tauri::AboutMetadata::new()))
             .add_native_item(MenuItem::Separator)
             .add_native_item(MenuItem::Services)
             .add_native_item(MenuItem::Separator)
@@ -75,12 +54,9 @@ fn main() {
     );
     let menu = Menu::new()
         .add_submenu(submenu)
-        .add_submenu(Submenu::new(
-            "File",
-            Menu::new().add_native_item(MenuItem::CloseWindow),
-        ))
-        .add_submenu(Submenu::new(
-            "Edit",
+        .add_submenu(Submenu::new("File",
+            Menu::new().add_native_item(MenuItem::CloseWindow)))
+        .add_submenu(Submenu::new("Edit",
             Menu::new()
                 .add_native_item(MenuItem::Undo)
                 .add_native_item(MenuItem::Redo)
@@ -88,18 +64,13 @@ fn main() {
                 .add_native_item(MenuItem::Cut)
                 .add_native_item(MenuItem::Copy)
                 .add_native_item(MenuItem::Paste)
-                .add_native_item(MenuItem::SelectAll),
-        ))
-        .add_submenu(Submenu::new(
-            "View",
-            Menu::new().add_native_item(MenuItem::EnterFullScreen),
-        ))
-        .add_submenu(Submenu::new(
-            "Window",
+                .add_native_item(MenuItem::SelectAll)))
+        .add_submenu(Submenu::new("View",
+            Menu::new().add_native_item(MenuItem::EnterFullScreen)))
+        .add_submenu(Submenu::new("Window",
             Menu::new()
                 .add_native_item(MenuItem::Minimize)
-                .add_native_item(MenuItem::Zoom),
-        ));
+                .add_native_item(MenuItem::Zoom)));
 
     tauri::Builder::default()
         .manage(app::AppState::new())
@@ -108,66 +79,51 @@ fn main() {
         .on_system_tray_event(|app, event| match event {
             SystemTrayEvent::LeftClick { .. } => {
                 let window = app.get_window("main").unwrap();
-                if window.is_visible().unwrap() {
-                    window.hide().unwrap();
-                } else {
-                    window.show().unwrap();
-                    window.set_focus().unwrap();
-                }
+                if window.is_visible().unwrap() { window.hide().unwrap(); }
+                else { window.show().unwrap(); window.set_focus().unwrap(); }
             }
             SystemTrayEvent::MenuItemClick { id, .. } => match id.as_str() {
                 "quit" => std::process::exit(0),
-                "hide" => {
-                    let window = app.get_window("main").unwrap();
-                    window.hide().unwrap();
-                }
+                "hide" => app.get_window("main").unwrap().hide().unwrap(),
                 "show" => {
-                    let window = app.get_window("main").unwrap();
-                    window.show().unwrap();
-                    window.set_focus().unwrap();
+                    let w = app.get_window("main").unwrap();
+                    w.show().unwrap(); w.set_focus().unwrap();
                 }
                 _ => {}
             },
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
-            // Auth / wallet init
             commands::auth::init_wallet,
             commands::auth::generate_keypair,
             commands::auth::import_keypair,
             commands::auth::get_address,
-            // Multi-wallet management
             commands::auth::list_wallets,
             commands::auth::create_wallet,
             commands::auth::switch_wallet,
             commands::auth::delete_wallet,
             commands::auth::rename_wallet,
-            // Security / recovery
             commands::auth::set_security_pin,
             commands::auth::verify_pin,
             commands::auth::get_recovery_info,
-            // Wallet
             commands::wallet::get_balance,
             commands::wallet::send_transaction,
             commands::wallet::get_transaction_history,
             commands::wallet::reset_chain,
-            // Storage
+            commands::wallet::sync_chain,
             commands::storage::store_file,
             commands::storage::get_stored_files,
             commands::storage::get_storage_metrics,
             commands::storage::configure_storage,
             commands::storage::delete_stored_file,
             commands::storage::retrieve_file_preview,
-            // Files (legacy EgoSafe)
             commands::files::encrypt_file,
             commands::files::decrypt_file,
-            // Coverage / earnings / staking
             commands::coverage::get_coverage_status,
             commands::coverage::get_poc_events,
             commands::coverage::get_network_peers,
             commands::earnings::get_earnings_data,
             commands::staking::get_staking_info,
-            // Explorer
             commands::explorer::get_network_stats,
             commands::explorer::get_p2p_status,
             commands::explorer::get_blocks,
@@ -175,9 +131,7 @@ fn main() {
             commands::explorer::get_block_info,
             commands::explorer::get_transaction_info,
             commands::explorer::get_file_events,
-            // Notifications / sharing
             commands::notifications::import_shared_file,
-            // Messenger
             commands::messenger::get_my_contact_bundle,
             commands::messenger::import_contact,
             commands::messenger::approve_contact_request,
@@ -190,34 +144,26 @@ fn main() {
             commands::messenger::clear_messages,
         ])
         .setup(|app| {
-            // ── 1. Start the libp2p swarm ──────────────────────────────────
-            // This connects to the relay and begins the reservation handshake.
-            // Nothing else should fire until the relay circuit is ready.
+            // ── Task 1: libp2p swarm ───────────────────────────────────────
+            // Connects to relay, handles all P2P traffic.
             let handle_p2p = app.handle();
             tauri::async_runtime::spawn(async move {
                 crate::p2p::start_p2p_server(handle_p2p).await;
             });
 
-            // ── 2. Startup sync + announce sequence ────────────────────────
-            //
-            // OLD problem: fired after 3 s → relay not ready → stale LAN
-            // endpoints used → all broadcasts time out silently.
-            //
-            // FIX: wait_for_public_endpoint(15) blocks until we have a relay
-            // circuit address (or 15 s timeout). Only then do we announce
-            // ourselves and sync the chain, so peers receive our current
-            // relay endpoint and can dial us back through the relay.
+            // ── Task 2: startup announce + chain sync ──────────────────────
+            // Waits for relay circuit before announcing so peers receive our
+            // real circuit address (not the raw public IP which is firewalled).
             let handle_startup = app.handle();
             tauri::async_runtime::spawn(async move {
-                // Wait 5s for swarm to start, then proceed without blocking on relay.
-                // ReservationReqAccepted fires async and triggers re-announce automatically.
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                let my_endpoint = crate::p2p::get_public_endpoint().await;
+                let my_endpoint = crate::p2p::wait_for_public_endpoint(20).await;
 
-                if my_endpoint.is_empty() {
-                    eprintln!("[Startup] No public endpoint yet — relay will announce when ready");
+                if my_endpoint.contains("/p2p-circuit") {
+                    eprintln!("[Startup] ✓ Relay circuit confirmed: {}", my_endpoint);
+                } else if !my_endpoint.is_empty() {
+                    eprintln!("[Startup] ⚠ Relay not confirmed in 20s — using: {}", my_endpoint);
                 } else {
-                    eprintln!("[Startup] Public endpoint ready: {}", my_endpoint);
+                    eprintln!("[Startup] ✗ No endpoint — check network");
                 }
 
                 crate::p2p::fetch_peers_from_relay(&handle_startup).await;
@@ -227,13 +173,15 @@ fn main() {
                 eprintln!("[Startup] Relay chain sync complete");
 
                 crate::p2p::broadcast_peer_announce(&handle_startup).await;
-                eprintln!("[Startup] Peer announce sent");
+                eprintln!("[Startup] Peer announce sent (endpoint: {})", my_endpoint);
 
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
                 crate::p2p::sync_chain_from_peers().await;
                 eprintln!("[Startup] Chain sync requested");
 
+                // Keep-alive: re-announce + sync every 30 s.
+                // This refreshes the relay reservation and propagates any
+                // endpoint changes to contacts.
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                     crate::p2p::fetch_peers_from_relay(&handle_startup).await;
@@ -243,11 +191,17 @@ fn main() {
                 }
             });
 
+            // ── Task 3: background coverage loop ──────────────────────────
+            // Runs every 60 s regardless of window visibility.
+            // Handles: peer probing, PoC event recording, coverage status.
+            // Keeps working when app is minimized or in system tray.
+            let handle_coverage = app.handle();
+            tauri::async_runtime::spawn(async move {
+                crate::commands::coverage::run_background_coverage_loop(handle_coverage).await;
+            });
+
             #[cfg(debug_assertions)]
-            {
-                let window = app.get_window("main").unwrap();
-                window.open_devtools();
-            }
+            app.get_window("main").unwrap().open_devtools();
 
             Ok(())
         })
