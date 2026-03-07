@@ -155,7 +155,7 @@ fn main() {
             // real circuit address (not the raw public IP which is firewalled).
             let handle_startup = app.handle();
             tauri::async_runtime::spawn(async move {
-                let my_endpoint = crate::p2p::wait_for_public_endpoint(20).await;
+                let my_endpoint = crate::p2p::wait_for_public_endpoint(60).await;
 
                 if my_endpoint.contains("/p2p-circuit") {
                     eprintln!("[Startup] ✓ Relay circuit confirmed: {}", my_endpoint);
