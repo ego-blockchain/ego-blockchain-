@@ -188,11 +188,36 @@ fn main() {
                 crate::p2p::sync_chain_from_peers().await;
                 eprintln!("[Startup] Chain sync requested");
 
-                // Keep-alive: re-announce + sync every 30 s.
-                // This refreshes the relay reservation and propagates any
-                // endpoint changes to contacts.
+                // Keep-alive: re-register + re-announce + sync every 30 s.
+                // re-register keeps last_seen fresh on the relay so the
+                // 10-minute recency filter in fetch_peers_from_relay works.
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+                    // Re-register with relay (refreshes last_seen + location).
+                    let ledger    = crate::ledger::Ledger::load();
+                    let registry  = crate::ledger::load_registry();
+                    let active_id = crate::ledger::get_active_wallet_id();
+                    let name = registry.wallets.iter()
+                        .find(|w| w.id == active_id)
+                        .map(|w| w.name.clone())
+                        .unwrap_or_else(|| "Ego Node".to_string());
+                    let endpoint = crate::p2p::get_public_endpoint().await;
+                    // Pull city/country from the coverage status if available.
+                    let (city, country) = {
+                        let state  = handle_startup.state::<crate::app::AppState>();
+                        let cache  = state.cache.lock().unwrap();
+                        let loc    = cache.coverage_status.as_ref()
+                            .and_then(|s| s.location.as_ref());
+                        (loc.and_then(|l| l.city.clone()),
+                         loc.and_then(|l| l.country.clone()))
+                    };
+                    if !ledger.address.is_empty() && !endpoint.is_empty() {
+                        crate::p2p::register_with_relay(
+                            ledger.address, name, endpoint, city, country,
+                        ).await;
+                    }
+
                     crate::p2p::fetch_peers_from_relay(&handle_startup).await;
                     crate::p2p::broadcast_peer_announce(&handle_startup).await;
                     crate::p2p::fetch_chain_from_relay(&handle_startup).await;

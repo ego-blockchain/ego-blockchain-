@@ -99,6 +99,12 @@ struct PeerEntry {
     /// libp2p multiaddr — always a relay circuit addr if available
     endpoint:  String,
     last_seen: i64,
+    /// Self-reported city from peer's own IP geolocation
+    #[serde(default)]
+    city:    Option<String>,
+    /// Self-reported country
+    #[serde(default)]
+    country: Option<String>,
 }
 
 fn load_peers() -> Vec<PeerEntry> {
@@ -153,13 +159,16 @@ async fn post_peer(
         existing.endpoint  = entry.endpoint.clone();
         existing.name      = entry.name.clone();
         existing.last_seen = now;
+        if entry.city.is_some()    { existing.city    = entry.city.clone(); }
+        if entry.country.is_some() { existing.country = entry.country.clone(); }
         println!("[peers] Updated endpoint for {} → {}", entry.address, entry.endpoint);
     } else {
         println!("[peers] New peer {} → {}", entry.address, entry.endpoint);
         list.push(PeerEntry { last_seen: now, ..entry });
     }
-    // Prune peers not seen in 7 days
-    let cutoff = now - 7 * 86_400;
+    // Prune peers not seen in 10 minutes — desktop re-registers every 30 s
+    // so active peers are always fresh; offline peers vanish quickly.
+    let cutoff = now - 600;
     list.retain(|p| p.last_seen >= cutoff);
     save_peers(&list);
     StatusCode::OK

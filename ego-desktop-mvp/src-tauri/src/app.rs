@@ -11,6 +11,10 @@ pub struct PeerInfo {
     pub name:      String,
     pub endpoint:  String,
     pub last_seen: i64,   // Unix timestamp
+    #[serde(default)]
+    pub city:    Option<String>,
+    #[serde(default)]
+    pub country: Option<String>,
 }
 
 #[derive(Debug, Clone)]

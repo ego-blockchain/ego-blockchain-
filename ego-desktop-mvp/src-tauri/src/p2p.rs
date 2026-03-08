@@ -100,6 +100,10 @@ pub struct PeerEntry {
     pub address:   String,
     pub endpoint:  String,
     pub last_seen: i64,
+    #[serde(default)]
+    pub city:    Option<String>,
+    #[serde(default)]
+    pub country: Option<String>,
 }
 
 // ── Request-response codec (4-byte length prefix + JSON) ─────────────────────
@@ -320,6 +324,8 @@ pub async fn broadcast_peer_announce(app: &tauri::AppHandle) {
             name:      name.clone(),
             endpoint:  my_endpoint.clone(),
             last_seen: Utc::now().timestamp(),
+            city:      None,
+            country:   None,
         });
     }
     let msg = P2PMessage::PeerAnnounce { address, name, endpoint: my_endpoint };
@@ -620,7 +626,9 @@ fn inject_circuit(
     let ep_clone  = ep.clone();
     let app_clone = app.clone();
     tokio::spawn(async move {
-        register_with_relay(address_str, name, ep_clone).await;
+        // city/country not yet known at circuit injection time — the 30 s
+        // keep-alive loop will re-register with location once coverage runs.
+        register_with_relay(address_str, name, ep_clone, None, None).await;
         // Small delay so contacts have time to register too before we announce
         tokio::time::sleep(Duration::from_millis(300)).await;
         broadcast_peer_announce(&app_clone).await;
@@ -938,11 +946,15 @@ async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                 name,
                 endpoint:  endpoint.clone(),
                 last_seen: Utc::now().timestamp(),
+                city:      None,
+                country:   None,
             });
             upsert_peer_cache(PeerEntry {
                 address,
                 endpoint,
                 last_seen: Utc::now().timestamp(),
+                city:      None,
+                country:   None,
             });
         }
 
@@ -1005,6 +1017,8 @@ async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                     address:   peer.address,
                     endpoint:  peer.endpoint,
                     last_seen: Utc::now().timestamp(),
+                    city:      None,
+                    country:   None,
                 });
             }
         }
@@ -1090,11 +1104,28 @@ struct RelayPeerEntry {
     name:      String,
     endpoint:  String,
     last_seen: i64,
+    #[serde(default)]
+    city:    Option<String>,
+    #[serde(default)]
+    country: Option<String>,
 }
 
-pub async fn register_with_relay(address: String, name: String, endpoint: String) {
+pub async fn register_with_relay(
+    address:  String,
+    name:     String,
+    endpoint: String,
+    city:     Option<String>,
+    country:  Option<String>,
+) {
     if address.is_empty() || endpoint.is_empty() { return; }
-    let entry  = RelayPeerEntry { address: address.clone(), name, endpoint: endpoint.clone(), last_seen: 0 };
+    let entry = RelayPeerEntry {
+        address:   address.clone(),
+        name,
+        endpoint:  endpoint.clone(),
+        last_seen: 0,
+        city,
+        country,
+    };
     let client = reqwest::Client::new();
     match client.post(format!("{}/peers", RELAY_HTTP_API))
         .json(&entry).send().await
@@ -1120,18 +1151,25 @@ pub async fn fetch_peers_from_relay(app: &tauri::AppHandle) {
     };
     if remote_peers.is_empty() { return; }
 
+    // Only treat peers as active if they registered with the relay in the
+    // last 10 minutes.  The desktop re-registers every 30 s, so a peer that
+    // has been online continuously will always pass this filter.  Stale
+    // entries left over from previous days are silently ignored.
+    let now        = Utc::now().timestamp();
+    let cutoff_10m = now - 600;
+    let active_peers: Vec<&RelayPeerEntry> = remote_peers.iter()
+        .filter(|p| p.last_seen >= cutoff_10m && !p.endpoint.is_empty())
+        .collect();
+
     let state = app.state::<crate::app::AppState>();
-    let now   = Utc::now().timestamp();
-    for p in &remote_peers {
-        // Use now, not p.last_seen (which is when they registered with relay,
-        // potentially minutes ago).  As long as a peer is in the relay directory
-        // they are considered online — AppState::get_active_peers(300) will keep
-        // them visible until the NEXT relay fetch fails to include them.
+    for p in &active_peers {
         state.upsert_peer(crate::app::PeerInfo {
             address:   p.address.clone(),
             name:      p.name.clone(),
             endpoint:  p.endpoint.clone(),
-            last_seen: now,
+            last_seen: p.last_seen,
+            city:      p.city.clone(),
+            country:   p.country.clone(),
         });
         // Also write to the file-based peer cache so resolve_endpoint()
         // (in messenger.rs) can find it without another HTTP round-trip.
@@ -1140,14 +1178,15 @@ pub async fn fetch_peers_from_relay(app: &tauri::AppHandle) {
                 address:   p.address.clone(),
                 endpoint:  p.endpoint.clone(),
                 last_seen: Utc::now().timestamp(),
+                city:      p.city.clone(),
+                country:   p.country.clone(),
             });
         }
     }
 
     let mut contacts = load_contacts();
     let mut changed  = false;
-    for remote in &remote_peers {
-        if remote.endpoint.is_empty() { continue; }
+    for remote in &active_peers {
         if let Some(c) = contacts.iter_mut().find(|c| c.address == remote.address) {
             let relay_in   = remote.endpoint.contains("/p2p-circuit");
             let relay_curr = c.endpoint.contains("/p2p-circuit");
@@ -1162,7 +1201,7 @@ pub async fn fetch_peers_from_relay(app: &tauri::AppHandle) {
         let _ = save_contacts(&contacts);
         let _ = app.emit_all("ego://peers-updated", ());
     }
-    eprintln!("[Relay] Fetched {} peers from relay directory", remote_peers.len());
+    eprintln!("[Relay] Fetched {} peers ({} active)", remote_peers.len(), active_peers.len());
 }
 
 /// Live relay HTTP lookup — returns the peer's current relay circuit endpoint
