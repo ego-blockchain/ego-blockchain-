@@ -86,11 +86,16 @@ function locationLabel(loc: Location): string {
   return parts.length > 0 ? parts.join(', ') : 'Unknown';
 }
 
+interface P2pStatus {
+  public_endpoint: string;
+}
+
 const CoveragePage: React.FC = () => {
-  const [coverage, setCoverage] = useState<CoverageStatus | null>(null);
-  const [events,   setEvents]   = useState<PocEvent[]>([]);
-  const [peers,    setPeers]    = useState<PeerInfo[]>([]);
-  const [loading,  setLoading]  = useState(true);
+  const [coverage,   setCoverage]   = useState<CoverageStatus | null>(null);
+  const [events,     setEvents]     = useState<PocEvent[]>([]);
+  const [peers,      setPeers]      = useState<PeerInfo[]>([]);
+  const [p2pStatus,  setP2pStatus]  = useState<P2pStatus | null>(null);
+  const [loading,    setLoading]    = useState(true);
 
   useEffect(() => {
     invoke<CoverageStatus>('get_coverage_status')
@@ -102,6 +107,9 @@ const CoveragePage: React.FC = () => {
       .catch(() => {});
     invoke<PeerInfo[]>('get_network_peers')
       .then(setPeers)
+      .catch(() => {});
+    invoke<P2pStatus>('get_p2p_status')
+      .then(setP2pStatus)
       .catch(() => {});
     // Refresh peers every 30 s
     const t = setInterval(() => {
@@ -121,6 +129,14 @@ const CoveragePage: React.FC = () => {
   const h3Cell     = loc ? deriveH3Cell(loc.latitude, loc.longitude) : null;
   const coordStr   = loc ? fmtCoord(loc.latitude, loc.longitude) : null;
   const cityStr    = loc ? locationLabel(loc) : null;
+
+  // My own peer ID derived from my relay circuit endpoint
+  const myPeerId = p2pStatus?.public_endpoint
+    ? extractPeerId(p2pStatus.public_endpoint)
+    : '';
+
+  // Only show peers that have location data (city or country)
+  const visiblePeers = peers.filter(p => p.city || p.country);
 
   const nowTs      = Math.floor(Date.now() / 1000);
   const todayStart = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
@@ -201,34 +217,47 @@ const CoveragePage: React.FC = () => {
         <div className="px-5 py-4 border-b border-gray-700 flex items-center justify-between">
           <h3 className="font-semibold">Live Network Nodes</h3>
           <span className="text-xs text-gray-400">
-            {peers.length === 0 ? 'No peers seen yet' : `${peers.length} online`}
+            {`${visiblePeers.length + (myPeerId ? 1 : 0)} online`}
           </span>
         </div>
-        {peers.length === 0 ? (
-          <div className="px-5 py-6 text-center text-gray-500 text-sm">
-            No other nodes detected.
-            Nodes appear here after they send a heartbeat.
-          </div>
-        ) : (
-          <div className="divide-y divide-gray-700/50">
-            {peers.map(p => {
-              const peerId   = extractPeerId(p.endpoint);
-              const parts    = [p.city, p.country].filter(Boolean);
-              const location = parts.length > 0 ? parts.join(', ') : '—';
-              return (
-                <div key={p.address} className="flex items-center gap-4 px-5 py-3">
-                  <div className="w-2 h-2 rounded-full bg-green-400 shrink-0" />
-                  <div className="font-mono text-sm text-gray-200">
-                    {shortPeerId(peerId)}
-                  </div>
-                  <div className="text-xs text-gray-400 ml-auto">
-                    {location}
-                  </div>
+        <div className="divide-y divide-gray-700/50">
+          {/* Own node — always shown at the top */}
+          {myPeerId && (
+            <div className="flex items-center gap-4 px-5 py-3">
+              <div className="w-2 h-2 rounded-full bg-blue-400 shrink-0" />
+              <div className="font-mono text-sm text-gray-200">
+                {shortPeerId(myPeerId)}
+              </div>
+              <span className="text-xs bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded-full font-medium">
+                me
+              </span>
+              <div className="text-xs text-gray-400 ml-auto">
+                {cityStr ?? '—'}
+              </div>
+            </div>
+          )}
+          {/* Other nodes — only shown if they have location data */}
+          {visiblePeers.length === 0 && !myPeerId ? (
+            <div className="px-5 py-6 text-center text-gray-500 text-sm">
+              No other nodes detected.
+              Nodes appear here after they send a heartbeat.
+            </div>
+          ) : visiblePeers.map(p => {
+            const peerId   = extractPeerId(p.endpoint);
+            const location = [p.city, p.country].filter(Boolean).join(', ');
+            return (
+              <div key={p.address} className="flex items-center gap-4 px-5 py-3">
+                <div className="w-2 h-2 rounded-full bg-green-400 shrink-0" />
+                <div className="font-mono text-sm text-gray-200">
+                  {shortPeerId(peerId)}
                 </div>
-              );
-            })}
-          </div>
-        )}
+                <div className="text-xs text-gray-400 ml-auto">
+                  {location}
+                </div>
+              </div>
+            );
+          })}
+        </div>
       </div>
 
       <div className="grid grid-cols-5 gap-4">

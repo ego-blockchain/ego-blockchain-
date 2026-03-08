@@ -69,8 +69,12 @@ fn detect_vpn(resp: &IpApiResponse) -> Option<String> {
 fn get_machine_id() -> String {
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
         if let Ok(output) = std::process::Command::new("reg")
             .args(["query", r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
         {
             let text = String::from_utf8_lossy(&output.stdout);
