@@ -590,3 +590,59 @@ pub async fn delete_contact(
     save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
     Ok(())
 }
+
+/// Re-send ContactRequests to all `pending_out` contacts.
+/// Called every 30 s from the keep-alive loop so requests are automatically
+/// delivered once the remote comes online or updates their build.
+pub async fn retry_pending_contacts(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    let state = app.state::<AppState>();
+    let keypair = match state.get_keypair() {
+        Some(k) => k,
+        None    => return,
+    };
+
+    let ledger  = crate::ledger::Ledger::load();
+    let my_addr = ledger.address.clone();
+    if my_addr.is_empty() { return; }
+
+    let my_endpoint = crate::p2p::get_public_endpoint().await;
+    if my_endpoint.is_empty() { return; }
+
+    let my_ed25519_hex = hex::encode(keypair.ed25519_public_key().as_bytes());
+    let my_kyber_hex   = hex::encode(keypair.kyber_public_key().as_bytes());
+
+    // Use wallet display name so the other side sees who is requesting.
+    let registry  = crate::ledger::load_registry();
+    let active_id = crate::ledger::get_active_wallet_id();
+    let my_name   = registry.wallets.iter()
+        .find(|w| w.id == active_id)
+        .map(|w| w.name.clone())
+        .unwrap_or_else(|| "Ego User".to_string());
+
+    let contacts = load_contacts();
+    for contact in contacts.iter().filter(|c| c.status == "pending_out" && !c.endpoint.is_empty()) {
+        let endpoint = resolve_endpoint(&contact.address, &contact.endpoint).await;
+        let request  = crate::p2p::P2PMessage::ContactRequest {
+            from_addr:       my_addr.clone(),
+            from_name:       my_name.clone(),
+            from_ed25519:    my_ed25519_hex.clone(),
+            from_kyber:      my_kyber_hex.clone(),
+            from_shared_key: contact.shared_key_hex.clone(),
+            from_endpoint:   my_endpoint.clone(),
+        };
+        match crate::p2p::send_message(&endpoint, &request).await {
+            Ok(()) => eprintln!(
+                "[Messenger] Pending request delivered to {}",
+                contact.address
+            ),
+            Err(e) => {
+                // "none of the requested protocols" = remote on old build, try again next cycle.
+                let msg = e.to_string();
+                if !msg.contains("none of the requested protocols") {
+                    eprintln!("[Messenger] Retry to {}: {}", contact.address, e);
+                }
+            }
+        }
+    }
+}
