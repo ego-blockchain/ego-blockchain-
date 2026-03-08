@@ -137,6 +137,8 @@ fn parse_msg_bundle(
 //     before the peer had a relay circuit.
 //   - The relay HTTP directory is updated by every peer on ReservationReqAccepted.
 //   - Using a stale raw IP → "actively refused" or "timeout" errors.
+//   - Even if stored endpoint has /p2p-circuit, the peer may have reconnected
+//     and gotten a new reservation — always do a live lookup to be safe.
 async fn resolve_endpoint(contact_addr: &str, stored_endpoint: &str) -> String {
     // 1. Check file-based peer cache (populated by fetch_peers_from_relay).
     let cache = crate::p2p::load_peer_cache();
@@ -159,23 +161,20 @@ async fn resolve_endpoint(contact_addr: &str, stored_endpoint: &str) -> String {
         }
     }
 
-    // 2. Fallback: live relay HTTP lookup.
-    // Handles the startup timing window where the local cache is still empty
-    // but the peer has already registered their circuit with the relay.
-    if !stored_endpoint.contains("/p2p-circuit") {
-        if let Some(relay_ep) = crate::p2p::get_relay_endpoint(contact_addr).await {
-            if !relay_ep.is_empty() && relay_ep != stored_endpoint {
-                eprintln!(
-                    "[Messenger] Relay: fresher endpoint for {}: {}",
-                    contact_addr, relay_ep
-                );
-                let mut contacts = load_contacts();
-                if let Some(c) = contacts.iter_mut().find(|c| c.address == contact_addr) {
-                    c.endpoint = relay_ep.clone();
-                    let _ = save_contacts(&contacts);
-                }
-                return relay_ep;
+    // 2. Always do a live relay HTTP lookup — even if stored endpoint already
+    // has a circuit address, the peer may have reconnected with a new reservation.
+    if let Some(relay_ep) = crate::p2p::get_relay_endpoint(contact_addr).await {
+        if !relay_ep.is_empty() && relay_ep != stored_endpoint {
+            eprintln!(
+                "[Messenger] Relay: fresher endpoint for {}: {}",
+                contact_addr, relay_ep
+            );
+            let mut contacts = load_contacts();
+            if let Some(c) = contacts.iter_mut().find(|c| c.address == contact_addr) {
+                c.endpoint = relay_ep.clone();
+                let _ = save_contacts(&contacts);
             }
+            return relay_ep;
         }
     }
 
