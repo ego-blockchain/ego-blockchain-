@@ -5,12 +5,12 @@ use ego_core::{Address, KeyPair};
 use std::collections::HashMap;
 
 /// Info about an active peer node seen via P2P PeerAnnounce.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PeerInfo {
     pub address:   String,
     pub name:      String,
     pub endpoint:  String,
-    pub last_seen: i64,
+    pub last_seen: i64,   // Unix timestamp
 }
 
 #[derive(Debug, Clone)]
@@ -24,8 +24,8 @@ pub struct AppState {
     pub session_started: Arc<Mutex<i64>>,
     /// Unix timestamp of the last time we credited accumulated earnings to the ledger.
     pub last_earnings_credit: Arc<Mutex<i64>>,
-    /// Live peers seen via PeerAnnounce P2P messages.
-    pub active_peers: Arc<Mutex<Vec<PeerInfo>>>,
+    /// Live peers seen via PeerAnnounce P2P messages (keyed by address).
+    pub peers: Arc<Mutex<HashMap<String, PeerInfo>>>,
     /// Result of UPnP port mapping attempt: None = pending, Some(Ok) = success, Some(Err) = failed.
     pub upnp_status: Arc<Mutex<Option<Result<(), String>>>>,
     /// Our detected public endpoint (ip:port), set after UPnP attempt.
@@ -200,7 +200,7 @@ impl AppState {
             cache: Arc::new(Mutex::new(AppCache::default())),
             session_started: Arc::new(Mutex::new(0)),
             last_earnings_credit: Arc::new(Mutex::new(0)),
-            active_peers: Arc::new(Mutex::new(Vec::new())),
+            peers: Arc::new(Mutex::new(HashMap::new())),
             upnp_status: Arc::new(Mutex::new(None)),
             public_endpoint: Arc::new(Mutex::new(String::new())),
         }
@@ -222,22 +222,17 @@ impl AppState {
         self.public_endpoint.lock().unwrap().clone()
     }
 
-    /// Insert or update a peer (keyed by address).
-    pub fn upsert_peer(&self, peer: PeerInfo) {
-        let mut peers = self.active_peers.lock().unwrap();
-        if let Some(existing) = peers.iter_mut().find(|p| p.address == peer.address) {
-            *existing = peer;
-        } else {
-            peers.push(peer);
-        }
+    pub fn upsert_peer(&self, info: PeerInfo) {
+        let mut peers = self.peers.lock().unwrap();
+        peers.insert(info.address.clone(), info);
     }
 
-    /// Return peers seen within `max_age_secs` seconds.
-    pub fn get_active_peers(&self, max_age_secs: i64) -> Vec<PeerInfo> {
-        let now   = chrono::Utc::now().timestamp();
-        let peers = self.active_peers.lock().unwrap();
-        peers.iter()
-            .filter(|p| now - p.last_seen <= max_age_secs)
+
+    pub fn get_active_peers(&self, window_secs: i64) -> Vec<PeerInfo> {
+        let peers  = self.peers.lock().unwrap();
+        let cutoff = chrono::Utc::now().timestamp() - window_secs;
+        peers.values()
+            .filter(|p| p.last_seen >= cutoff)
             .cloned()
             .collect()
     }

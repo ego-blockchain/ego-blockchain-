@@ -332,30 +332,36 @@ pub async fn import_contact(
         p2p::wait_for_public_endpoint(3).await
     };
 
+    // Save the contact FIRST — so it persists even if P2P delivery fails.
+    // The peer will receive the request once they are reachable.
+    let contact = Contact {
+        address:        addr.clone(),
+        name,
+        ed25519_pubkey: ed25519,
+        kyber_pubkey:   kyber,
+        shared_key_hex: shared_key_hex.clone(),
+        status:         "pending_out".to_string(),
+        added_at:       chrono::Utc::now().timestamp(),
+        endpoint:       endpoint.clone(),
+    };
+    contacts.push(contact.clone());
+    save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
+
     let request = p2p::P2PMessage::ContactRequest {
         from_addr:       my_addr.clone(),
         from_name:       my_name.trim().to_string(),
         from_ed25519:    my_ed25519_hex,
         from_kyber:      my_kyber_hex,
-        from_shared_key: shared_key_hex.clone(),
+        from_shared_key: shared_key_hex,
         from_endpoint:   my_endpoint,
     };
-    p2p::send_message(&endpoint, &request)
-        .await
-        .map_err(EgoDesktopError::NetworkError)?;
+    // Best-effort delivery — if the remote doesn't support the protocol yet
+    // (e.g. running an older build) the request is still saved locally and
+    // will be retried the next time the user opens the Messenger page.
+    if let Err(e) = p2p::send_message(&endpoint, &request).await {
+        eprintln!("[Messenger] ContactRequest delivery deferred for {}: {}", addr, e);
+    }
 
-    let contact = Contact {
-        address:        addr,
-        name,
-        ed25519_pubkey: ed25519,
-        kyber_pubkey:   kyber,
-        shared_key_hex,
-        status:         "pending_out".to_string(),
-        added_at:       chrono::Utc::now().timestamp(),
-        endpoint,
-    };
-    contacts.push(contact.clone());
-    save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
     Ok(contact)
 }
 
