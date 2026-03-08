@@ -230,6 +230,9 @@ fn main() {
                     crate::p2p::broadcast_peer_announce(&handle_startup).await;
                     crate::p2p::fetch_chain_from_relay(&handle_startup).await;
                     crate::p2p::sync_chain_from_peers().await;
+                    // Retry any pending contact requests — automatically delivers
+                    // once the remote comes online or updates their build.
+                    crate::commands::messenger::retry_pending_contacts(&handle_startup).await;
                 }
             });
 
