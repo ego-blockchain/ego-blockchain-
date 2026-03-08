@@ -1228,12 +1228,16 @@ pub async fn get_relay_endpoint(address: &str) -> Option<String> {
 
 #[cfg(target_os = "windows")]
 fn ensure_firewall_rule() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
     for (name, proto, port) in [
         (format!("Ego Desktop P2P TCP {}", P2P_PORT), "TCP", P2P_PORT),
         (format!("Ego Desktop P2P UDP {}", P2P_PORT), "UDP", P2P_PORT),
     ] {
         let check = std::process::Command::new("netsh")
             .args(["advfirewall", "firewall", "show", "rule", &format!("name={}", name)])
+            .creation_flags(CREATE_NO_WINDOW)
             .output();
         if let Ok(out) = check {
             if out.status.success() && !out.stdout.is_empty() { continue; }
@@ -1247,6 +1251,7 @@ fn ensure_firewall_rule() {
                 &format!("localport={}", port),
                 "enable=yes", "profile=any",
             ])
+            .creation_flags(CREATE_NO_WINDOW)
             .output();
     }
 }
