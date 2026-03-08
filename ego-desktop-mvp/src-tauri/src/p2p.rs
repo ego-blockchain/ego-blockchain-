@@ -1201,6 +1201,14 @@ pub async fn fetch_peers_from_relay(app: &tauri::AppHandle) {
         let _ = save_contacts(&contacts);
         let _ = app.emit_all("ego://peers-updated", ());
     }
+
+    // Remove any peer from AppState that is no longer in the relay's active list
+    // AND hasn't been heard from directly (via PeerAnnounce) in the last 5 min.
+    // This ensures ghost peers vanish from the UI quickly after going offline.
+    let active_addrs: std::collections::HashSet<String> =
+        active_peers.iter().map(|p| p.address.clone()).collect();
+    state.cleanup_stale_peers(&active_addrs, now - 300);
+
     eprintln!("[Relay] Fetched {} peers ({} active)", remote_peers.len(), active_peers.len());
 }
 

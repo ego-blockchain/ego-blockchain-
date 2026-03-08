@@ -241,6 +241,22 @@ impl AppState {
             .collect()
     }
 
+    /// Remove peers from the in-memory map that are:
+    ///   - NOT in `active_addresses` (i.e. not currently registered on the relay)
+    ///   - AND whose last direct P2P contact was more than `p2p_cutoff` seconds ago
+    ///
+    /// Called after every relay fetch so ghost peers vanish quickly.
+    pub fn cleanup_stale_peers(
+        &self,
+        active_addresses: &std::collections::HashSet<String>,
+        p2p_cutoff: i64,
+    ) {
+        let mut peers = self.peers.lock().unwrap();
+        peers.retain(|addr, p| {
+            active_addresses.contains(addr) || p.last_seen >= p2p_cutoff
+        });
+    }
+
     /// Record the session start time and reset the earnings credit clock.
     pub fn set_session_start(&self, ts: i64) {
         *self.session_started.lock().unwrap() = ts;

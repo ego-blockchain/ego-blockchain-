@@ -316,7 +316,7 @@ async fn probe_peers_from_relay(app: &tauri::AppHandle) {
     let mut candidates: Vec<String> = Vec::new();
 
     // From AppState (populated by fetch_peers_from_relay)
-    let all_known = state.get_active_peers(86_400); // last 24h, not just 5min
+    let all_known = state.get_active_peers(600); // last 10 min — matches relay active window
     for p in &all_known {
         if !p.endpoint.is_empty() && p.endpoint != my_endpoint {
             candidates.push(p.endpoint.clone());
