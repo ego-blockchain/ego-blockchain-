@@ -660,14 +660,19 @@ const MessengerPage: React.FC = () => {
                 {generatingCard ? 'Generating…' : 'Generate Card'}
               </button>
               {myCard && (() => {
-                // Short display: egocontact1:egot1xxxx"Name"xxxx
                 const addr = myCard.split(':')[1] ?? '';
-                const shortCard = `egocontact1:${addr.slice(0, 10)}"${myCardName}"${addr.slice(-8)}`;
+                const shortAddr = addr.slice(0, 10) + '…' + addr.slice(-8);
                 return (
-                  <div className="space-y-2">
-                    <div className="text-xs text-green-400 font-medium">✓ Share this with your contact:</div>
-                    <div className="bg-gray-900 rounded-xl p-3 text-sm font-mono text-gray-200 text-center select-all">
-                      {shortCard}
+                  <div className="space-y-3">
+                    <div className="text-xs text-green-400 font-medium">✓ Card ready — click Copy and share it:</div>
+                    <div className="bg-gray-900 rounded-xl px-4 py-3 flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-lg font-black shrink-0">
+                        {myCardName.charAt(0).toUpperCase()}
+                      </div>
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-white">{myCardName}</div>
+                        <div className="text-xs text-gray-400 font-mono">{shortAddr}</div>
+                      </div>
                     </div>
                     <button
                       onClick={async () => {
@@ -681,7 +686,7 @@ const MessengerPage: React.FC = () => {
                           : 'bg-green-600 hover:bg-green-500'
                       }`}
                     >
-                      {copied ? '✓ Copied!' : '📋 Copy Full Card'}
+                      {copied ? '✓ Copied!' : '📋 Copy Card'}
                     </button>
                   </div>
                 );
