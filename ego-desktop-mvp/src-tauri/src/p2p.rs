@@ -673,20 +673,11 @@ async fn handle_event(
             }
         }
 
-        // ─── ConnectionEstablished ────────────────────────────────────────────
-        // For relays: call swarm.listen_on(circuit_addr) to request a slot,
-        // then IMMEDIATELY inject the circuit address optimistically.
-        //
-        // Why optimistic: the relay almost always accepts, the circuit multiaddr
-        // is deterministic, and waiting for ReservationReqAccepted / NewListenAddr
-        // is unreliable — the event may arrive after wait_for_public_endpoint
-        // has already timed out, or get lost entirely during reconnects.
-        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+       SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             eprintln!("[P2P] Connected to {}", peer_id);
 
             if let Some(relay_base) = relay_addrs.get(&peer_id) {
                 let our_peer_id = *swarm.local_peer_id();
-                // Request slot: <relay_base>/p2p/<relay_id>/p2p-circuit
                 let circuit_str = format!("{}/p2p/{}/p2p-circuit", relay_base, peer_id);
                 match circuit_str.parse::<Multiaddr>() {
                     Ok(circuit_addr) => {
@@ -694,10 +685,6 @@ async fn handle_event(
                         match swarm.listen_on(circuit_addr) {
                             Ok(_)  => {
                                 eprintln!("[P2P] Relay reservation requested ✓");
-                                // Optimistically inject the full circuit address
-                                // immediately — don't wait for ReservationReqAccepted
-                                // or NewListenAddr, which are unreliable on disconnect/
-                                // reconnect cycles.
                                 if let Some(full_circuit) = build_circuit_addr(
                                     relay_base, &peer_id, &our_peer_id,
                                 ) {
@@ -711,6 +698,10 @@ async fn handle_event(
                 }
             }
 
+            // Force identify exchange so remote learns our protocols before
+            // any request_response message is attempted over the circuit.
+            swarm.behaviour_mut().identify.push(std::iter::once(peer_id));
+
             // Flush queued messages for this peer
             if let Some(pending) = pending_sends.remove(&peer_id) {
                 for (msg, reply) in pending {
@@ -720,7 +711,7 @@ async fn handle_event(
                 }
             }
         }
-
+        
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
             if relay_addrs.contains_key(&peer_id) {
                 eprintln!("[P2P] Relay {} disconnected — clearing circuit, redialling", peer_id);
