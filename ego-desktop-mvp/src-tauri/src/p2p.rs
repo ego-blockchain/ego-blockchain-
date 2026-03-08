@@ -673,7 +673,7 @@ async fn handle_event(
             }
         }
 
-       SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             eprintln!("[P2P] Connected to {}", peer_id);
 
             if let Some(relay_base) = relay_addrs.get(&peer_id) {
@@ -698,18 +698,12 @@ async fn handle_event(
                 }
             }
 
-            // Force identify exchange so remote learns our protocols before
-            // any request_response message is attempted over the circuit.
+            // Force identify exchange so remote learns our protocols immediately.
             swarm.behaviour_mut().identify.push(std::iter::once(peer_id));
 
-            // Flush queued messages for this peer
-            if let Some(pending) = pending_sends.remove(&peer_id) {
-                for (msg, reply) in pending {
-                    let req_id = swarm.behaviour_mut()
-                        .request_response.send_request(&peer_id, msg);
-                    in_flight.insert(req_id, reply);
-                }
-            }
+            // Do NOT flush pending_sends here — wait for ReservationReqAccepted
+            // which guarantees the relay has an active slot for us before we
+            // attempt to dial any peer through it.
         }
 
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -761,10 +755,6 @@ async fn handle_event(
             }
         }
 
-        // ─── ReservationReqAccepted ───────────────────────────────────────────
-        // Belt-and-suspenders path: if NewListenAddr already fired this is a
-        // no-op (inject_circuit deduplicates).  If NewListenAddr didn't fire
-        // (version quirk), we synthesise the full circuit address ourselves.
         SwarmEvent::Behaviour(EgoBehaviourEvent::RelayClient(
             relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
         )) => {
@@ -773,6 +763,15 @@ async fn handle_event(
             if let Some(relay_base) = relay_addrs.get(&relay_peer_id) {
                 if let Some(circuit) = build_circuit_addr(relay_base, &relay_peer_id, &our_peer_id) {
                     inject_circuit(circuit, external_addrs, app, &our_peer_id);
+                }
+            }
+            // Reservation confirmed — now safe to dial peers through the relay.
+            for (peer_id, pending) in pending_sends.drain() {
+                eprintln!("[P2P] Flushing {} queued messages to {} after reservation", pending.len(), peer_id);
+                for (msg, reply) in pending {
+                    let req_id = swarm.behaviour_mut()
+                        .request_response.send_request(&peer_id, msg);
+                    in_flight.insert(req_id, reply);
                 }
             }
         }
