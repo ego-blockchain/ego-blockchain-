@@ -9,12 +9,12 @@ const TitleBar: React.FC = () => {
     >
       {/* Traffic-light buttons */}
       <div className="flex items-center gap-[6px] pl-3 pr-4 group">
-        {/* Red — Close */}
+        {/* Red — Hide to tray (close would destroy the window; hide keeps P2P alive) */}
         <button
-          onClick={() => appWindow.close()}
+          onClick={() => appWindow.hide()}
           className="w-3 h-3 rounded-full flex items-center justify-center transition-opacity"
           style={{ backgroundColor: '#ff5f57' }}
-          title="Close"
+          title="Hide to tray"
         >
           <svg
             className="w-[7px] h-[7px] opacity-0 group-hover:opacity-100 transition-opacity"
@@ -25,12 +25,12 @@ const TitleBar: React.FC = () => {
           </svg>
         </button>
 
-        {/* Yellow — Minimize */}
+        {/* Yellow — Hide to tray (avoids WebView2 flash on minimized windows) */}
         <button
-          onClick={() => appWindow.minimize()}
+          onClick={() => appWindow.hide()}
           className="w-3 h-3 rounded-full flex items-center justify-center transition-opacity"
           style={{ backgroundColor: '#ffbd2e' }}
-          title="Minimize"
+          title="Minimize to tray"
         >
           <svg
             className="w-[7px] h-[7px] opacity-0 group-hover:opacity-100 transition-opacity"
