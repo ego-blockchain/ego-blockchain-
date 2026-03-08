@@ -546,9 +546,9 @@ fn handle_send(
 
 fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
     use libp2p::multiaddr::Protocol;
-    addr.iter().find_map(|p| {
+    addr.iter().filter_map(|p| {
         if let Protocol::P2p(pid) = p { Some(pid) } else { None }
-    })
+    }).last()
 }
 
 /// Select best reachable endpoint.
@@ -711,7 +711,7 @@ async fn handle_event(
                 }
             }
         }
-        
+
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
             if relay_addrs.contains_key(&peer_id) {
                 eprintln!("[P2P] Relay {} disconnected — clearing circuit, redialling", peer_id);
