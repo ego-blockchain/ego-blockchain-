@@ -343,7 +343,12 @@ async fn probe_peers_from_relay(app: &tauri::AppHandle) {
         };
         tokio::spawn(async move {
             if let Err(e) = crate::p2p::send_message(&ep, &req).await {
-                eprintln!("[Coverage] probe {}: {}", ep, e);
+                // "none of the requested protocols" is expected when probing
+                // peers on a different app version — don't log as an error.
+                let msg = e.to_string();
+                if !msg.contains("none of the requested protocols") {
+                    eprintln!("[Coverage] probe {}: {}", ep, e);
+                }
             }
         });
     }
