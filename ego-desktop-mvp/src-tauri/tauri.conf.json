@@ -126,7 +126,8 @@
         "center": true,
         "decorations": false,
         "alwaysOnTop": false,
-        "skipTaskbar": false
+        "skipTaskbar": false,
+        "visible": false
       }
     ],
     "systemTray": {

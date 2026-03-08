@@ -153,6 +153,14 @@ fn main() {
             commands::messenger::clear_messages,
         ])
         .setup(|app| {
+            // Show the window only after the frontend signals it's ready,
+            // preventing the white-flash / multi-render flicker on startup.
+            let window = app.get_window("main").unwrap();
+            app.listen_global("frontend-ready", move |_| {
+                window.show().unwrap();
+                window.set_focus().unwrap();
+            });
+
             // ── Task 1: libp2p swarm ───────────────────────────────────────
             // Connects to relay, handles all P2P traffic.
             let handle_p2p = app.handle();

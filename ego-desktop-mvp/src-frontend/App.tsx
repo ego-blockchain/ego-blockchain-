@@ -2,6 +2,7 @@ import React, { createContext, useContext, useEffect, useState } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/tauri';
 import { open as openUrl } from '@tauri-apps/api/shell';
+import { emit } from '@tauri-apps/api/event';
 import Layout from './components/Layout';
 import TitleBar from './components/TitleBar';
 import WelcomeScreen from './pages/WelcomeScreen';
@@ -246,6 +247,7 @@ function App() {
   }
 
   useEffect(() => {
+    emit('frontend-ready');
     initWallet();
   }, []);
 
