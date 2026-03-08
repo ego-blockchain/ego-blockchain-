@@ -296,11 +296,6 @@ const MessengerPage: React.FC = () => {
           </div>
         </div>
       )}
-      {p2pStatus?.upnp === 'ok' && (
-        <div className="bg-green-900/40 border-b border-green-700/30 px-4 py-1.5 shrink-0">
-          <span className="text-xs text-green-400">✓ Internet P2P active — reachable at {p2pStatus.public_endpoint}</span>
-        </div>
-      )}
 
       <div className="flex flex-1 overflow-hidden">
 
@@ -421,7 +416,7 @@ const MessengerPage: React.FC = () => {
           {pendingOutContacts.map(c => (
             <div
               key={c.address}
-              className="flex items-center gap-3 px-4 py-3 opacity-50"
+              className="flex items-center gap-3 px-4 py-3 opacity-60"
             >
               <div className="w-9 h-9 rounded-full bg-gray-600 flex items-center justify-center text-base shrink-0">
                 ⏳
@@ -430,6 +425,18 @@ const MessengerPage: React.FC = () => {
                 <div className="text-sm text-gray-300 truncate">{c.name}</div>
                 <div className="text-xs text-gray-500 mt-0.5">Waiting for approval…</div>
               </div>
+              <button
+                onClick={async () => {
+                  try {
+                    await invoke('delete_contact', { contactAddr: c.address });
+                    await loadContacts();
+                  } catch (e) { console.error(e); }
+                }}
+                className="shrink-0 w-6 h-6 flex items-center justify-center text-gray-500 hover:text-red-400 hover:bg-red-500/10 rounded-full transition-colors text-sm"
+                title="Cancel request"
+              >
+                ✕
+              </button>
             </div>
           ))}
 
@@ -652,28 +659,33 @@ const MessengerPage: React.FC = () => {
               >
                 {generatingCard ? 'Generating…' : 'Generate Card'}
               </button>
-              {myCard && (
-                <div className="space-y-2">
-                  <div className="text-xs text-green-400 font-medium">✓ Share this with your contact:</div>
-                  <div className="bg-gray-900 rounded-xl p-3 text-xs font-mono break-all text-gray-300 max-h-28 overflow-y-auto">
-                    {myCard}
+              {myCard && (() => {
+                // Short display: egocontact1:egot1xxxx"Name"xxxx
+                const addr = myCard.split(':')[1] ?? '';
+                const shortCard = `egocontact1:${addr.slice(0, 10)}"${myCardName}"${addr.slice(-8)}`;
+                return (
+                  <div className="space-y-2">
+                    <div className="text-xs text-green-400 font-medium">✓ Share this with your contact:</div>
+                    <div className="bg-gray-900 rounded-xl p-3 text-sm font-mono text-gray-200 text-center select-all">
+                      {shortCard}
+                    </div>
+                    <button
+                      onClick={async () => {
+                        await writeText(myCard);
+                        setCopied(true);
+                        setTimeout(() => setCopied(false), 2000);
+                      }}
+                      className={`w-full py-2 rounded-xl text-sm font-medium transition-colors ${
+                        copied
+                          ? 'bg-green-800 text-green-300 cursor-default'
+                          : 'bg-green-600 hover:bg-green-500'
+                      }`}
+                    >
+                      {copied ? '✓ Copied!' : '📋 Copy Full Card'}
+                    </button>
                   </div>
-                  <button
-                    onClick={async () => {
-                      await writeText(myCard);
-                      setCopied(true);
-                      setTimeout(() => setCopied(false), 2000);
-                    }}
-                    className={`w-full py-2 rounded-xl text-sm font-medium transition-colors ${
-                      copied
-                        ? 'bg-green-800 text-green-300 cursor-default'
-                        : 'bg-green-600 hover:bg-green-500'
-                    }`}
-                  >
-                    {copied ? '✓ Copied!' : '📋 Copy Card'}
-                  </button>
-                </div>
-              )}
+                );
+              })()}
             </div>
           </div>
         </div>
