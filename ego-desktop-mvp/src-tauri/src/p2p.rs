@@ -278,7 +278,9 @@ pub async fn broadcast_tx(tx: LedgerTx, block: LedgerBlock) {
         let msg_clone = msg.clone();
         tokio::spawn(async move {
             if let Err(e) = send_message(&endpoint, &msg_clone).await {
-                eprintln!("[P2P] broadcast_tx to {}: {}", endpoint, e);
+                if !e.contains("none of the requested protocols") {
+                    eprintln!("[P2P] broadcast_tx to {}: {}", endpoint, e);
+                }
             }
         });
     }
@@ -287,12 +289,15 @@ pub async fn broadcast_tx(tx: LedgerTx, block: LedgerBlock) {
 pub async fn sync_chain_from_peers() {
     let my_endpoint = get_public_endpoint().await;
     let msg = P2PMessage::ChainSyncRequest { requester_endpoint: my_endpoint };
-    for contact in load_contacts().iter().filter(|c| !c.endpoint.is_empty()) {
+    // Only approved contacts — pending contacts may be on old builds.
+    for contact in load_contacts().iter().filter(|c| c.status == "approved" && !c.endpoint.is_empty()) {
         let endpoint  = contact.endpoint.clone();
         let msg_clone = msg.clone();
         tokio::spawn(async move {
             if let Err(e) = send_message(&endpoint, &msg_clone).await {
-                eprintln!("[P2P] sync request to {}: {}", endpoint, e);
+                if !e.contains("none of the requested protocols") {
+                    eprintln!("[P2P] sync request to {}: {}", endpoint, e);
+                }
             }
         });
     }
@@ -318,12 +323,16 @@ pub async fn broadcast_peer_announce(app: &tauri::AppHandle) {
         });
     }
     let msg = P2PMessage::PeerAnnounce { address, name, endpoint: my_endpoint };
-    for contact in load_contacts().iter().filter(|c| !c.endpoint.is_empty()) {
+    // Send to approved contacts only — pending contacts haven't confirmed
+    // protocol compatibility yet.
+    for contact in load_contacts().iter().filter(|c| c.status == "approved" && !c.endpoint.is_empty()) {
         let endpoint  = contact.endpoint.clone();
         let msg_clone = msg.clone();
         tokio::spawn(async move {
             if let Err(e) = send_message(&endpoint, &msg_clone).await {
-                eprintln!("[P2P] peer announce to {}: {}", endpoint, e);
+                if !e.contains("none of the requested protocols") {
+                    eprintln!("[P2P] peer announce to {}: {}", endpoint, e);
+                }
             }
         });
     }
@@ -1112,12 +1121,17 @@ pub async fn fetch_peers_from_relay(app: &tauri::AppHandle) {
     if remote_peers.is_empty() { return; }
 
     let state = app.state::<crate::app::AppState>();
+    let now   = Utc::now().timestamp();
     for p in &remote_peers {
+        // Use now, not p.last_seen (which is when they registered with relay,
+        // potentially minutes ago).  As long as a peer is in the relay directory
+        // they are considered online — AppState::get_active_peers(300) will keep
+        // them visible until the NEXT relay fetch fails to include them.
         state.upsert_peer(crate::app::PeerInfo {
             address:   p.address.clone(),
             name:      p.name.clone(),
             endpoint:  p.endpoint.clone(),
-            last_seen: p.last_seen,
+            last_seen: now,
         });
         // Also write to the file-based peer cache so resolve_endpoint()
         // (in messenger.rs) can find it without another HTTP round-trip.

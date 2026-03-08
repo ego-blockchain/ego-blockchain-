@@ -29,6 +29,26 @@ interface PeerInfo {
   last_seen: number;
 }
 
+// Extract the libp2p peer ID from a multiaddr endpoint string.
+// e.g. ".../p2p/12D3KooWAbc..." → "12D3KooWAbc..."
+function extractPeerId(endpoint: string): string {
+  const m = endpoint.match(/\/p2p\/([A-Za-z0-9]+)$/);
+  return m ? m[1] : endpoint;
+}
+
+// Extract the first IPv4 address from a multiaddr.
+// e.g. "/ip4/1.2.3.4/tcp/4001/..." → "1.2.3.4"
+function extractIp(endpoint: string): string | null {
+  const m = endpoint.match(/\/ip4\/([\d.]+)/);
+  return m ? m[1] : null;
+}
+
+// Short display: first 8 + last 6 chars of peer ID
+function shortPeerId(id: string): string {
+  if (id.length <= 16) return id;
+  return id.slice(0, 8) + '…' + id.slice(-6);
+}
+
 interface PocEvent {
   id: number;
   timestamp: number;
@@ -72,10 +92,12 @@ function locationLabel(loc: Location): string {
 }
 
 const CoveragePage: React.FC = () => {
-  const [coverage, setCoverage] = useState<CoverageStatus | null>(null);
-  const [events,   setEvents]   = useState<PocEvent[]>([]);
-  const [peers,    setPeers]    = useState<PeerInfo[]>([]);
-  const [loading,  setLoading]  = useState(true);
+  const [coverage,   setCoverage]   = useState<CoverageStatus | null>(null);
+  const [events,     setEvents]     = useState<PocEvent[]>([]);
+  const [peers,      setPeers]      = useState<PeerInfo[]>([]);
+  const [loading,    setLoading]    = useState(true);
+  // ip → "City, Country" (cached to avoid repeated API calls)
+  const [geoCache,   setGeoCache]   = useState<Record<string, string>>({});
 
   useEffect(() => {
     invoke<CoverageStatus>('get_coverage_status')
@@ -94,6 +116,27 @@ const CoveragePage: React.FC = () => {
     }, 30_000);
     return () => clearInterval(t);
   }, []);
+
+  // Lookup city/country for each new peer IP (only once per IP)
+  useEffect(() => {
+    const ips = peers
+      .map(p => extractIp(p.endpoint))
+      .filter((ip): ip is string => !!ip && !(ip in geoCache));
+    const unique = [...new Set(ips)];
+    if (unique.length === 0) return;
+    unique.forEach(ip => {
+      fetch(`http://ip-api.com/json/${ip}?fields=city,country`)
+        .then(r => r.json())
+        .then((d: { city?: string; country?: string }) => {
+          const parts = [d.city, d.country].filter(Boolean);
+          const label = parts.length > 0 ? parts.join(', ') : 'Unknown';
+          setGeoCache(prev => ({ ...prev, [ip]: label }));
+        })
+        .catch(() => {
+          setGeoCache(prev => ({ ...prev, [ip]: 'Unknown' }));
+        });
+    });
+  }, [peers]);
 
   const quality    = coverage?.network_quality ?? 'Excellent';
   const synced     = coverage?.coverage_synced_count ?? 0;
@@ -191,27 +234,26 @@ const CoveragePage: React.FC = () => {
         {peers.length === 0 ? (
           <div className="px-5 py-6 text-center text-gray-500 text-sm">
             No other nodes detected.
-            Nodes appear here after they send a heartbeat — add them as contacts first.
+            Nodes appear here after they send a heartbeat.
           </div>
         ) : (
           <div className="divide-y divide-gray-700/50">
-            {peers.map(p => (
-              <div key={p.address} className="flex items-center justify-between px-5 py-3">
-                <div className="flex items-center gap-3">
+            {peers.map(p => {
+              const peerId  = extractPeerId(p.endpoint);
+              const ip      = extractIp(p.endpoint);
+              const location = ip ? (geoCache[ip] ?? '…') : 'Unknown';
+              return (
+                <div key={p.address} className="flex items-center gap-4 px-5 py-3">
                   <div className="w-2 h-2 rounded-full bg-green-400 shrink-0" />
-                  <div>
-                    <div className="text-sm font-medium">{p.name || 'Unknown'}</div>
-                    <div className="text-xs text-gray-500 font-mono">
-                      {p.address.length > 18 ? p.address.slice(0, 10) + '…' + p.address.slice(-6) : p.address}
-                    </div>
+                  <div className="font-mono text-sm text-gray-200">
+                    {shortPeerId(peerId)}
+                  </div>
+                  <div className="text-xs text-gray-400 ml-auto">
+                    {location}
                   </div>
                 </div>
-                <div className="text-right">
-                  <div className="text-xs text-gray-400 font-mono">{p.endpoint}</div>
-                  <div className="text-xs text-gray-500">{timeAgo(p.last_seen)}</div>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
