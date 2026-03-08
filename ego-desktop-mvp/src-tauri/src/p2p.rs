@@ -1105,6 +1105,15 @@ pub async fn fetch_peers_from_relay(app: &tauri::AppHandle) {
             endpoint:  p.endpoint.clone(),
             last_seen: p.last_seen,
         });
+        // Also write to the file-based peer cache so resolve_endpoint()
+        // (in messenger.rs) can find it without another HTTP round-trip.
+        if !p.endpoint.is_empty() {
+            upsert_peer_cache(PeerEntry {
+                address:   p.address.clone(),
+                endpoint:  p.endpoint.clone(),
+                last_seen: Utc::now().timestamp(),
+            });
+        }
     }
 
     let mut contacts = load_contacts();
@@ -1126,6 +1135,18 @@ pub async fn fetch_peers_from_relay(app: &tauri::AppHandle) {
         let _ = app.emit_all("ego://peers-updated", ());
     }
     eprintln!("[Relay] Fetched {} peers from relay directory", remote_peers.len());
+}
+
+/// Live relay HTTP lookup — returns the peer's current relay circuit endpoint
+/// for the given wallet address, or `None` if not found.
+/// Called by resolve_endpoint() as a fallback when the local cache is stale.
+pub async fn get_relay_endpoint(address: &str) -> Option<String> {
+    let resp = reqwest::get(format!("{}/peers", RELAY_HTTP_API)).await.ok()?;
+    let body = resp.text().await.ok()?;
+    let peers: Vec<RelayPeerEntry> = serde_json::from_str(&body).ok()?;
+    peers.into_iter()
+        .find(|p| p.address == address && !p.endpoint.is_empty())
+        .map(|p| p.endpoint)
 }
 
 // ── Windows firewall ──────────────────────────────────────────────────────────
