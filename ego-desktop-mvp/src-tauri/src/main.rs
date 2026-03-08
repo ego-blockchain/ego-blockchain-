@@ -76,6 +76,16 @@ fn main() {
         .manage(app::AppState::new())
         .system_tray(tray)
         .menu(menu)
+        // Intercept window close (Alt+F4, red button fallback) — hide to tray
+        // instead of destroying the window.  Destroying the window stops P2P/
+        // coverage background tasks; hiding keeps them alive.
+        // The only way to actually quit is via the tray "Quit" menu item.
+        .on_window_event(|event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event.event() {
+                event.window().hide().unwrap();
+                api.prevent_close();
+            }
+        })
         .on_system_tray_event(|app, event| match event {
             SystemTrayEvent::LeftClick { .. } => {
                 let window = app.get_window("main").unwrap();
