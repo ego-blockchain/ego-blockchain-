@@ -354,9 +354,9 @@ pub async fn import_contact(
         from_shared_key: shared_key_hex,
         from_endpoint:   my_endpoint,
     };
-    if let Err(e) = p2p::send_message(&resolved_peer_ep, &response).await {
-        eprintln!("[P2P] Could not notify requester of approval: {}", e);
-        deposit_in_relay_inbox(&contact_addr, &my_addr, &response).await;
+    if let Err(e) = p2p::send_message(&endpoint, &request).await {
+        eprintln!("[Messenger] ContactRequest delivery deferred for {}: {}", addr, e);
+        deposit_in_relay_inbox(&addr, &my_addr, &request).await;
     }
 
     Ok(contact)
