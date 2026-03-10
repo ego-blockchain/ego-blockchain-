@@ -402,9 +402,12 @@ pub async fn approve_contact_request(
             approved:     true,
             shared_key:   shared_key_hex,
         };
-            if let Err(e) = p2p::send_message(&resolved_peer_ep, &response).await {
-                eprintln!("[P2P] Could not notify requester of approval: {}", e);
-                deposit_in_relay_inbox(&contact_addr, &my_addr, &response).await;
+            if let Err(e) = p2p::send_message(&endpoint, &request).await {
+                    eprintln!("[Messenger] ContactRequest delivery deferred for {}: {}", addr, e);
+                    deposit_in_relay_inbox(&addr, &my_addr, &request).await;
+                }
+
+                Ok(contact)
             }
 
         // FIX: also send a PeerAnnounce so the requester gets our current
@@ -419,7 +422,7 @@ pub async fn approve_contact_request(
                 .map(|w| w.name.clone())
                 .unwrap_or_else(|| my_name.trim().to_string());
             let announce = p2p::P2PMessage::PeerAnnounce {
-                address:  my_addr,
+                address:  my_addr.clone(),
                 name:     my_name_str,
                 endpoint: my_endpoint,
             };
