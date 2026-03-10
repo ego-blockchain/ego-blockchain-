@@ -30,8 +30,7 @@ pub const RELAY_NODES: &[&str] = &[
     "/ip4/40.233.82.42/tcp/4001/p2p/12D3KooWPj6m7jzmVyMh1zWrsoux3YiVs9j2HwsjrFXzDcqAGGz4",
 ];
 
-const RELAY_HTTP_API: &str = "http://40.233.82.42:8080";
-
+pub const RELAY_HTTP_API: &str = "http://40.233.82.42:8080";
 // ─────────────────────────────────────────────────────────────────────────────
 // SINGLE SOURCE OF TRUTH FOR RELAY CIRCUIT STATE
 //
