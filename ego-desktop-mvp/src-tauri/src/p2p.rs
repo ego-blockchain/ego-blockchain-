@@ -140,12 +140,18 @@ impl request_response::Codec for EgoCodec {
     fn read_response<'life0, 'life1, 'life2, 'async_trait, T>(
         &'life0 mut self,
         _: &'life1 Self::Protocol,
-        _io: &'life2 mut T,
+        io: &'life2 mut T,
     ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = io::Result<Self::Response>> + ::core::marker::Send + 'async_trait>>
     where
         T: futures::io::AsyncRead + Unpin + Send + 'async_trait,
         'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait,
-    { Box::pin(async move { Ok(()) }) }
+    {
+        Box::pin(async move {
+            let mut buf = [0u8; 1];
+            AsyncReadExt::read_exact(io, &mut buf).await?;
+            Ok(())
+        })
+    }
 
     fn write_request<'life0, 'life1, 'life2, 'async_trait, T>(
         &'life0 mut self,
@@ -166,16 +172,21 @@ impl request_response::Codec for EgoCodec {
         })
     }
 
-    fn write_response<'life0, 'life1, 'life2, 'async_trait, T>(
-        &'life0 mut self,
-        _: &'life1 Self::Protocol,
-        _io: &'life2 mut T,
-        _: Self::Response,
-    ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = io::Result<()>> + ::core::marker::Send + 'async_trait>>
-    where
-        T: futures::io::AsyncWrite + Unpin + Send + 'async_trait,
-        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait,
-    { Box::pin(async move { Ok(()) }) }
+        fn write_response<'life0, 'life1, 'life2, 'async_trait, T>(
+            &'life0 mut self,
+            _: &'life1 Self::Protocol,
+            io: &'life2 mut T,
+            _: Self::Response,
+        ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = io::Result<()>> + ::core::marker::Send + 'async_trait>>
+        where
+            T: futures::io::AsyncWrite + Unpin + Send + 'async_trait,
+            'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait,
+        {
+            Box::pin(async move {
+                AsyncWriteExt::write_all(io, &[0u8]).await?;
+                AsyncWriteExt::flush(io).await
+            })
+        }
 }
 
 // ── Network behaviour ─────────────────────────────────────────────────────────
