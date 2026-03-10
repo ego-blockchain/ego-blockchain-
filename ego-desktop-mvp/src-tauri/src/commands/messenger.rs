@@ -354,10 +354,9 @@ pub async fn import_contact(
         from_shared_key: shared_key_hex,
         from_endpoint:   my_endpoint,
     };
-    if let Err(e) = p2p::send_message(&endpoint, &request).await {
-        eprintln!("[Messenger] ContactRequest delivery deferred for {}: {}", addr, e);
-        // Fallback: deposit in relay inbox so recipient gets it when they come online
-        deposit_in_relay_inbox(&addr, &my_addr, &request).await;
+    if let Err(e) = p2p::send_message(&resolved_peer_ep, &response).await {
+        eprintln!("[P2P] Could not notify requester of approval: {}", e);
+        deposit_in_relay_inbox(&contact_addr, &my_addr, &response).await;
     }
 
     Ok(contact)
@@ -403,9 +402,10 @@ pub async fn approve_contact_request(
             approved:     true,
             shared_key:   shared_key_hex,
         };
-        if let Err(e) = p2p::send_message(&resolved_peer_ep, &response).await {
-            eprintln!("[P2P] Could not notify requester of approval: {}", e);
-        }
+            if let Err(e) = p2p::send_message(&resolved_peer_ep, &response).await {
+                eprintln!("[P2P] Could not notify requester of approval: {}", e);
+                deposit_in_relay_inbox(&contact_addr, &my_addr, &response).await;
+            }
 
         // FIX: also send a PeerAnnounce so the requester gets our current
         // relay circuit endpoint. ContactResponse doesn't carry our endpoint
@@ -423,9 +423,10 @@ pub async fn approve_contact_request(
                 name:     my_name_str,
                 endpoint: my_endpoint,
             };
-            if let Err(e) = p2p::send_message(&resolved_peer_ep, &announce).await {
-                eprintln!("[P2P] Could not send PeerAnnounce after approval: {}", e);
-            }
+                if let Err(e) = p2p::send_message(&resolved_peer_ep, &announce).await {
+                    eprintln!("[P2P] Could not send PeerAnnounce after approval: {}", e);
+                    deposit_in_relay_inbox(&contact_addr, &my_addr, &announce).await;
+                }
         }
     }
 
