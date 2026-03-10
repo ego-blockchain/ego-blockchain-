@@ -297,10 +297,10 @@ async fn main() {
                 peer_id,
                 relay::Config {
                     max_reservations:          1024,
-                    max_reservations_per_peer: 8,
+                    max_reservations_per_peer: 32,
                     reservation_duration:      Duration::from_secs(3600),
-                    max_circuits:              512,
-                    max_circuits_per_peer:     16,
+                    max_circuits:              2048,
+                    max_circuits_per_peer:     128,
                     max_circuit_duration:      Duration::from_secs(7200),
                     max_circuit_bytes:         0,
                     ..Default::default()

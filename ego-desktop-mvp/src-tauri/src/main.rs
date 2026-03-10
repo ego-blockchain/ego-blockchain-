@@ -237,6 +237,9 @@ fn main() {
                     // Retry any pending contact requests — automatically delivers
                     // once the remote comes online or updates their build.
                     crate::commands::messenger::retry_pending_contacts(&handle_startup).await;
+                    // Poll relay inbox so messages/contact-requests arrive live
+                    // without requiring an app restart.
+                    crate::commands::messenger::fetch_relay_inbox(&handle_startup).await;
                 }
             });
 
