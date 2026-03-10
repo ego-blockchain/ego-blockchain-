@@ -190,7 +190,7 @@ fn main() {
                 eprintln!("[Startup] Relay chain sync complete");
 
                 // Fetch any offline messages waiting in relay inbox
-                crate::commands::messenger::fetch_relay_inbox(&app_handle).await;
+                crate::commands::messenger::fetch_relay_inbox(&handle_startup).await;
                 eprintln!("[Startup] Relay inbox checked");
 
                 crate::p2p::broadcast_peer_announce(&handle_startup).await;
