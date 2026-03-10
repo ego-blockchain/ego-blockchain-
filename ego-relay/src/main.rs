@@ -1,19 +1,17 @@
 //! Ego Relay Server — libp2p circuit relay v2 + HTTP chain/peer API.
 //!
-//! Runs two services in parallel:
-//!   • libp2p swarm on TCP port 4001 — NAT traversal relay for all peers
-//!   • axum HTTP server on TCP port 8080 — global chain seed + peer directory
-//!
 //! HTTP endpoints:
-//!   GET  /chain        — full global blockchain
-//!   POST /chain/tx     — submit a confirmed transaction
-//!   POST /chain/block  — submit a mined block
-//!   GET  /peers        — list all known peer endpoints (refreshed every session)
-//!   POST /peers        — register/update your relay circuit address
-//!   GET  /health       — liveness probe
+//!   GET  /chain            — full global blockchain
+//!   POST /chain/tx         — submit a confirmed transaction
+//!   POST /chain/block      — submit a mined block
+//!   GET  /peers            — list all known peer endpoints
+//!   POST /peers            — register/update your relay circuit address
+//!   POST /inbox/:address   — store a message for an offline peer
+//!   GET  /inbox/:address   — fetch and clear pending messages (called on startup)
+//!   GET  /health           — liveness probe
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -26,13 +24,13 @@ use libp2p::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     sync::{Arc, RwLock},
     time::Duration,
 };
 
 // ── Chain data model ──────────────────────────────────────────────────────────
-// Mirrors the structs in ego-desktop's ledger.rs — kept in sync manually.
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct SharedChain {
@@ -92,17 +90,12 @@ const PEERS_PATH: &str = "peers.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PeerEntry {
-    /// Ego wallet address (egot1...)
     address:   String,
-    /// Display name
     name:      String,
-    /// libp2p multiaddr — always a relay circuit addr if available
     endpoint:  String,
     last_seen: i64,
-    /// Self-reported city from peer's own IP geolocation
     #[serde(default)]
     city:    Option<String>,
-    /// Self-reported country
     #[serde(default)]
     country: Option<String>,
 }
@@ -122,38 +115,49 @@ fn save_peers(peers: &[PeerEntry]) {
     }
 }
 
+// ── Inbox (store-and-forward) ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InboxMessage {
+    /// JSON-serialised P2PMessage, base64-encoded
+    payload:   String,
+    deposited: i64,
+    from_addr: String,
+}
+
 // ── Shared HTTP state ─────────────────────────────────────────────────────────
 
 type ChainState = Arc<RwLock<SharedChain>>;
 type PeersState = Arc<RwLock<Vec<PeerEntry>>>;
+type InboxState = Arc<RwLock<HashMap<String, Vec<InboxMessage>>>>;
+
+#[derive(Clone)]
+struct AppState {
+    chain: ChainState,
+    peers: PeersState,
+    inbox: InboxState,
+}
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
 
-/// GET /chain — returns the full chain as JSON.
-async fn get_chain(State((chain, _)): State<(ChainState, PeersState)>) -> Json<SharedChain> {
-    Json(chain.read().unwrap().clone())
+async fn get_chain(State(s): State<AppState>) -> Json<SharedChain> {
+    Json(s.chain.read().unwrap().clone())
 }
 
-/// GET /health — simple liveness probe.
-async fn health() -> &'static str {
-    "ok"
+async fn health() -> &'static str { "ok" }
+
+async fn get_peers(State(s): State<AppState>) -> Json<Vec<PeerEntry>> {
+    Json(s.peers.read().unwrap().clone())
 }
 
-/// GET /peers — returns all known peer relay circuit addresses.
-async fn get_peers(State((_, peers)): State<(ChainState, PeersState)>) -> Json<Vec<PeerEntry>> {
-    Json(peers.read().unwrap().clone())
-}
-
-/// POST /peers — register or refresh a peer's relay circuit endpoint.
-/// Peers call this as soon as their relay reservation is accepted.
 async fn post_peer(
-    State((_, peers)): State<(ChainState, PeersState)>,
+    State(s): State<AppState>,
     Json(entry): Json<PeerEntry>,
 ) -> StatusCode {
     if entry.address.is_empty() || entry.endpoint.is_empty() {
         return StatusCode::BAD_REQUEST;
     }
-    let mut list = peers.write().unwrap();
+    let mut list = s.peers.write().unwrap();
     let now = chrono::Utc::now().timestamp();
     if let Some(existing) = list.iter_mut().find(|p| p.address == entry.address) {
         existing.endpoint  = entry.endpoint.clone();
@@ -166,20 +170,17 @@ async fn post_peer(
         println!("[peers] New peer {} → {}", entry.address, entry.endpoint);
         list.push(PeerEntry { last_seen: now, ..entry });
     }
-    // Prune peers not seen in 10 minutes — desktop re-registers every 30 s
-    // so active peers are always fresh; offline peers vanish quickly.
     let cutoff = now - 600;
     list.retain(|p| p.last_seen >= cutoff);
     save_peers(&list);
     StatusCode::OK
 }
 
-/// POST /chain/tx — accepts a confirmed transaction; deduplicates by hash.
 async fn post_tx(
-    State((chain_state, _)): State<(ChainState, PeersState)>,
+    State(s): State<AppState>,
     Json(tx): Json<LedgerTx>,
 ) -> StatusCode {
-    let mut chain = chain_state.write().unwrap();
+    let mut chain = s.chain.write().unwrap();
     if !chain.transactions.iter().any(|t| t.hash == tx.hash) {
         println!("[chain] New tx {} from {} → {} ({} uEGOC)", tx.hash, tx.from, tx.to, tx.amount);
         chain.transactions.push(tx);
@@ -188,12 +189,11 @@ async fn post_tx(
     StatusCode::OK
 }
 
-/// POST /chain/block — accepts a mined block; deduplicates by hash.
 async fn post_block(
-    State((chain_state, _)): State<(ChainState, PeersState)>,
+    State(s): State<AppState>,
     Json(block): Json<LedgerBlock>,
 ) -> StatusCode {
-    let mut chain = chain_state.write().unwrap();
+    let mut chain = s.chain.write().unwrap();
     if !chain.blocks.iter().any(|b| b.hash == block.hash) {
         println!("[chain] New block #{} hash {}", block.height, block.hash);
         chain.blocks.push(block);
@@ -201,6 +201,40 @@ async fn post_block(
         save_chain(&chain);
     }
     StatusCode::OK
+}
+
+/// POST /inbox/:address — deposit a message for an offline peer.
+/// The desktop calls this when direct P2P delivery fails.
+async fn post_inbox(
+    Path(address): Path<String>,
+    State(s): State<AppState>,
+    Json(msg): Json<InboxMessage>,
+) -> StatusCode {
+    if address.is_empty() || msg.payload.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+    let mut map = s.inbox.write().unwrap();
+    let bucket = map.entry(address.clone()).or_default();
+    // Deduplicate by payload so retries don't stack up
+    if !bucket.iter().any(|m| m.payload == msg.payload) {
+        println!("[inbox] Stored message for {} from {}", address, msg.from_addr);
+        bucket.push(msg);
+    }
+    StatusCode::OK
+}
+
+/// GET /inbox/:address — fetch and clear all pending messages.
+/// The desktop calls this on every startup to receive offline messages.
+async fn get_inbox(
+    Path(address): Path<String>,
+    State(s): State<AppState>,
+) -> Json<Vec<InboxMessage>> {
+    let mut map = s.inbox.write().unwrap();
+    let msgs = map.remove(&address).unwrap_or_default();
+    if !msgs.is_empty() {
+        println!("[inbox] Delivered {} message(s) to {}", msgs.len(), address);
+    }
+    Json(msgs)
 }
 
 // ── libp2p relay behaviour ────────────────────────────────────────────────────
@@ -220,44 +254,40 @@ async fn main() {
     let peer_id  = identity.public().to_peer_id();
 
     let p2p_port = std::env::var("EGO_RELAY_PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(4001);
-
+        .ok().and_then(|p| p.parse::<u16>().ok()).unwrap_or(4001);
     let http_port = std::env::var("EGO_HTTP_PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(8080);
+        .ok().and_then(|p| p.parse::<u16>().ok()).unwrap_or(8080);
 
-    // ── Load persisted chain + peer list ─────────────────────────────────
-    let chain_state: ChainState = Arc::new(RwLock::new(load_chain()));
-    let peers_state: PeersState = Arc::new(RwLock::new(load_peers()));
+    let state = AppState {
+        chain: Arc::new(RwLock::new(load_chain())),
+        peers: Arc::new(RwLock::new(load_peers())),
+        inbox: Arc::new(RwLock::new(HashMap::new())),
+    };
     {
-        let c = chain_state.read().unwrap();
-        let p = peers_state.read().unwrap();
+        let c = state.chain.read().unwrap();
+        let p = state.peers.read().unwrap();
         println!("[chain] Loaded {} blocks, {} txs from {}", c.blocks.len(), c.transactions.len(), CHAIN_PATH);
         println!("[peers] Loaded {} known peers from {}", p.len(), PEERS_PATH);
     }
 
-    // ── Start HTTP API in background ──────────────────────────────────────
-    let shared = (chain_state.clone(), peers_state.clone());
     let http_addr = format!("0.0.0.0:{}", http_port);
+    let state_clone = state.clone();
     tokio::spawn(async move {
         let app = Router::new()
-            .route("/chain",       get(get_chain))
-            .route("/chain/tx",    post(post_tx))
-            .route("/chain/block", post(post_block))
-            .route("/peers",       get(get_peers).post(post_peer))
-            .route("/health",      get(health))
-            .with_state(shared);
+            .route("/chain",          get(get_chain))
+            .route("/chain/tx",       post(post_tx))
+            .route("/chain/block",    post(post_block))
+            .route("/peers",          get(get_peers).post(post_peer))
+            .route("/inbox/:address", get(get_inbox).post(post_inbox))
+            .route("/health",         get(health))
+            .with_state(state_clone);
 
         let listener = tokio::net::TcpListener::bind(&http_addr).await
             .expect("HTTP bind failed");
-        println!("[http] Chain + peer API listening on {}", http_addr);
+        println!("[http] Listening on {}", http_addr);
         axum::serve(listener, app).await.expect("HTTP server error");
     });
 
-    // ── Build libp2p swarm ────────────────────────────────────────────────
     let mut swarm = SwarmBuilder::with_existing_identity(identity.clone())
         .with_tokio()
         .with_tcp(tcp::Config::default().nodelay(true), noise::Config::new, yamux::Config::default)
@@ -292,25 +322,16 @@ async fn main() {
     swarm.listen_on(listen_addr).expect("listen");
 
     println!("╔═══════════════════════════════════════════╗");
-    println!("║       Ego Relay + Chain Seed v0.2.0       ║");
+    println!("║       Ego Relay + Chain Seed v0.3.0       ║");
     println!("╚═══════════════════════════════════════════╝");
     println!("Peer ID   : {}", peer_id);
     println!("P2P port  : {}", p2p_port);
     println!("HTTP port : {}", http_port);
-    println!();
-    println!("RELAY_NODES in p2p.rs:");
-    println!("  \"/ip4/<PUBLIC_IP>/tcp/{}/p2p/{}\",", p2p_port, peer_id);
-    println!();
-    println!("RELAY_HTTP_API in p2p.rs:");
-    println!("  \"http://<PUBLIC_IP>:{}\",", http_port);
-    println!();
 
-    // ── Event loop ────────────────────────────────────────────────────────
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {
                 println!("[relay] Listening on {}", address);
-                println!("[relay] Share with peers: {}/p2p/{}", address, peer_id);
             }
             SwarmEvent::ConnectionEstablished { peer_id: pid, .. } => {
                 println!("[relay] Peer connected: {}", pid);
