@@ -390,8 +390,6 @@ pub async fn approve_contact_request(
     save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
 
     if !peer_endpoint.is_empty() {
-        // FIX: resolve peer endpoint before sending — they may have a newer
-        // relay circuit address than what they sent in the ContactRequest.
         let resolved_peer_ep = resolve_endpoint(&contact_addr, &peer_endpoint).await;
 
         let response = p2p::P2PMessage::ContactResponse {
@@ -402,17 +400,11 @@ pub async fn approve_contact_request(
             approved:     true,
             shared_key:   shared_key_hex,
         };
-            if let Err(e) = p2p::send_message(&endpoint, &request).await {
-                    eprintln!("[Messenger] ContactRequest delivery deferred for {}: {}", addr, e);
-                    deposit_in_relay_inbox(&addr, &my_addr, &request).await;
-                }
+        if let Err(e) = p2p::send_message(&resolved_peer_ep, &response).await {
+            eprintln!("[P2P] Could not notify requester of approval: {}", e);
+            deposit_in_relay_inbox(&contact_addr, &my_addr, &response).await;
+        }
 
-                Ok(contact)
-            }
-
-        // FIX: also send a PeerAnnounce so the requester gets our current
-        // relay circuit endpoint. ContactResponse doesn't carry our endpoint
-        // so without this the requester would only know our stale address.
         let my_endpoint = p2p::get_public_endpoint().await;
         if !my_endpoint.is_empty() {
             let registry  = crate::ledger::load_registry();
@@ -426,10 +418,10 @@ pub async fn approve_contact_request(
                 name:     my_name_str,
                 endpoint: my_endpoint,
             };
-                if let Err(e) = p2p::send_message(&resolved_peer_ep, &announce).await {
-                    eprintln!("[P2P] Could not send PeerAnnounce after approval: {}", e);
-                    deposit_in_relay_inbox(&contact_addr, &my_addr, &announce).await;
-                }
+            if let Err(e) = p2p::send_message(&resolved_peer_ep, &announce).await {
+                eprintln!("[P2P] Could not send PeerAnnounce after approval: {}", e);
+                deposit_in_relay_inbox(&contact_addr, &my_addr, &announce).await;
+            }
         }
     }
 
