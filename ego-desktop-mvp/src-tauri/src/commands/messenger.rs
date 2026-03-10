@@ -354,11 +354,10 @@ pub async fn import_contact(
         from_shared_key: shared_key_hex,
         from_endpoint:   my_endpoint,
     };
-    // Best-effort delivery — if the remote doesn't support the protocol yet
-    // (e.g. running an older build) the request is still saved locally and
-    // will be retried the next time the user opens the Messenger page.
     if let Err(e) = p2p::send_message(&endpoint, &request).await {
         eprintln!("[Messenger] ContactRequest delivery deferred for {}: {}", addr, e);
+        // Fallback: deposit in relay inbox so recipient gets it when they come online
+        deposit_in_relay_inbox(&addr, &my_addr, &request).await;
     }
 
     Ok(contact)
@@ -590,6 +589,58 @@ pub async fn delete_contact(
     Ok(())
 }
 
+/// Deposit a P2PMessage in the relay inbox for offline delivery.
+async fn deposit_in_relay_inbox(to_addr: &str, from_addr: &str, msg: &crate::p2p::P2PMessage) {
+    let relay_api = crate::p2p::RELAY_HTTP_API;
+    let payload = match serde_json::to_string(msg) {
+        Ok(j) => STANDARD.encode(j.as_bytes()),
+        Err(e) => { eprintln!("[Inbox] Serialize error: {}", e); return; }
+    };
+    let body = serde_json::json!({
+        "payload":   payload,
+        "deposited": chrono::Utc::now().timestamp(),
+        "from_addr": from_addr,
+    });
+    let url = format!("{}/inbox/{}", relay_api, to_addr);
+    let client = reqwest::Client::new();
+    match client.post(&url).json(&body).send().await {
+        Ok(_)  => eprintln!("[Inbox] Deposited message for {} in relay inbox", to_addr),
+        Err(e) => eprintln!("[Inbox] Failed to deposit in relay inbox: {}", e),
+    }
+}
+
+/// Fetch and process any messages waiting in our relay inbox.
+/// Called once on startup after relay circuit is confirmed.
+pub async fn fetch_relay_inbox(app: &tauri::AppHandle) {
+    let ledger  = crate::ledger::Ledger::load();
+    let my_addr = ledger.address.clone();
+    if my_addr.is_empty() { return; }
+
+    let relay_api = crate::p2p::RELAY_HTTP_API;
+    let url = format!("{}/inbox/{}", relay_api, my_addr);
+    let client = reqwest::Client::new();
+    let msgs: Vec<serde_json::Value> = match client.get(&url).send().await {
+        Ok(r)  => r.json().await.unwrap_or_default(),
+        Err(e) => { eprintln!("[Inbox] Fetch error: {}", e); return; }
+    };
+
+    if msgs.is_empty() { return; }
+    eprintln!("[Inbox] Got {} offline message(s) from relay inbox", msgs.len());
+
+    for entry in msgs {
+        let payload = match entry["payload"].as_str()
+            .and_then(|p| STANDARD.decode(p).ok())
+            .and_then(|b| String::from_utf8(b).ok())
+        {
+            Some(p) => p,
+            None    => continue,
+        };
+        if let Ok(p2p_msg) = serde_json::from_str::<crate::p2p::P2PMessage>(&payload) {
+            crate::p2p::handle_incoming(p2p_msg, app).await;
+        }
+    }
+}
+
 /// Re-send ContactRequests to all `pending_out` contacts.
 /// Called every 30 s from the keep-alive loop so requests are automatically
 /// delivered once the remote comes online or updates their build.
@@ -631,17 +682,14 @@ pub async fn retry_pending_contacts(app: &tauri::AppHandle) {
             from_endpoint:   my_endpoint.clone(),
         };
         match crate::p2p::send_message(&endpoint, &request).await {
-            Ok(()) => eprintln!(
-                "[Messenger] Pending request delivered to {}",
-                contact.address
-            ),
-            Err(e) => {
-                // "none of the requested protocols" = remote on old build, try again next cycle.
-                let msg = e.to_string();
-                if !msg.contains("none of the requested protocols") {
-                    eprintln!("[Messenger] Retry to {}: {}", contact.address, e);
+                    Ok(()) => eprintln!(
+                        "[Messenger] Pending request delivered to {}",
+                        contact.address
+                    ),
+                    Err(e) => {
+                        eprintln!("[Messenger] Retry to {}: {} — depositing in relay inbox", contact.address, e);
+                        deposit_in_relay_inbox(&contact.address, &my_addr, &request).await;
+                    }
                 }
-            }
-        }
     }
 }

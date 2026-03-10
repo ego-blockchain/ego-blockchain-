@@ -846,7 +846,7 @@ async fn handle_event(
 
 // ── Incoming message handler ──────────────────────────────────────────────────
 
-async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
+pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
     match msg {
         P2PMessage::ContactRequest {
             from_addr, from_name, from_ed25519, from_kyber, from_shared_key, from_endpoint,
