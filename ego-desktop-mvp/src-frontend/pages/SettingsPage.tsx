@@ -1,5 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
+import { open as openUrl } from '@tauri-apps/api/shell';
 import { useWallet } from '../App';
 import qrcode from 'qrcode-generator';
 
@@ -42,10 +43,6 @@ const SettingsPage: React.FC = () => {
   const [loadingRecovery, setLoadingRecovery] = useState(false);
   const [showSeedHex, setShowSeedHex]       = useState(false);
 
-  // Data management
-  const [confirmReset, setConfirmReset]     = useState<'chain' | 'messages' | null>(null);
-  const [resetting, setResetting]           = useState(false);
-  const [resetMsg, setResetMsg]             = useState('');
 
   const addressQR = useMemo(() => makeQR(wallet?.address ?? ''), [wallet?.address]);
 
@@ -80,20 +77,6 @@ const SettingsPage: React.FC = () => {
   }
 
   function save() { setSaved(true); setTimeout(() => setSaved(false), 2000); }
-
-  async function handleReset(type: 'chain' | 'messages') {
-    setResetting(true); setResetMsg('');
-    try {
-      if (type === 'chain') {
-        await invoke('reset_chain');
-        setResetMsg('Blockchain data cleared.');
-      } else {
-        await invoke('clear_messages');
-        setResetMsg('Chat history cleared.');
-      }
-    } catch (e: any) { setResetMsg('Error: ' + String(e)); }
-    finally { setResetting(false); setConfirmReset(null); setTimeout(() => setResetMsg(''), 3000); }
-  }
 
   return (
     <div className="p-6 max-w-2xl mx-auto space-y-5">
@@ -141,17 +124,25 @@ const SettingsPage: React.FC = () => {
         </div>
 
         {/* Security PIN */}
-        <div className="px-5 py-4 border-b border-gray-700/50 flex items-center justify-between">
-          <div>
-            <div className="text-sm font-medium">Security PIN</div>
-            <div className="text-xs text-gray-400">Protects access to your private key and seed phrase</div>
+        <div className="px-5 py-4 border-b border-gray-700/50">
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="text-sm font-medium">Security PIN</div>
+              <div className="text-xs text-gray-400">Protects access to your private key and seed phrase</div>
+            </div>
+            <button
+              onClick={() => { setShowSetPin(true); setPinInput(''); setPinConfirm(''); setPinMsg(''); }}
+              className="text-xs bg-yellow-600/20 hover:bg-yellow-600/40 text-yellow-400 px-3 py-1.5 rounded-lg transition"
+            >
+              Set / Change PIN
+            </button>
           </div>
-          <button
-            onClick={() => { setShowSetPin(true); setPinInput(''); setPinConfirm(''); setPinMsg(''); }}
-            className="text-xs bg-yellow-600/20 hover:bg-yellow-600/40 text-yellow-400 px-3 py-1.5 rounded-lg transition"
-          >
-            Set / Change PIN
-          </button>
+          <div className="mt-2 text-xs text-gray-500">
+            🔒 Changing your PIN requires your device security (Windows Hello / Touch ID).
+            If you forgot your PIN, contact support at{' '}
+            <span className="text-blue-400">support@egoblockchain.com</span> or visit{' '}
+            <span className="text-blue-400">www.egoblockchain.com/support</span>.
+          </div>
         </div>
 
         {/* View private key / seed phrase */}
@@ -184,46 +175,16 @@ const SettingsPage: React.FC = () => {
               <span className="font-mono text-xs">{row.val}</span>
             </div>
           ))}
-        </div>
-      </div>
-
-      {/* Data Management */}
-      <div className="bg-gray-800 rounded-2xl border border-red-900/40 overflow-hidden">
-        <div className="px-5 py-4 border-b border-gray-700">
-          <h3 className="font-semibold text-red-400">Data Management</h3>
-          <div className="text-xs text-gray-400 mt-0.5">Danger zone — these actions are irreversible</div>
-        </div>
-        <div className="divide-y divide-gray-700/50">
-          <div className="flex items-center justify-between px-5 py-4">
-            <div>
-              <div className="text-sm font-medium">Reset Blockchain Data</div>
-              <div className="text-xs text-gray-400">Wipes all blocks, transactions, and balances (keeps wallets &amp; keys)</div>
-            </div>
+          <div className="flex justify-between pt-1 border-t border-gray-700/50 mt-2">
+            <span className="text-gray-400">Website</span>
             <button
-              onClick={() => setConfirmReset('chain')}
-              className="text-xs bg-red-700/30 hover:bg-red-700/60 text-red-400 px-3 py-1.5 rounded-lg transition"
+              onClick={() => openUrl('https://www.egoblockchain.com').catch(() => {})}
+              className="text-blue-400 hover:text-blue-300 text-xs transition"
             >
-              Reset Chain
-            </button>
-          </div>
-          <div className="flex items-center justify-between px-5 py-4">
-            <div>
-              <div className="text-sm font-medium">Clear Chat History</div>
-              <div className="text-xs text-gray-400">Deletes all messages for the current wallet (contacts kept)</div>
-            </div>
-            <button
-              onClick={() => setConfirmReset('messages')}
-              className="text-xs bg-red-700/30 hover:bg-red-700/60 text-red-400 px-3 py-1.5 rounded-lg transition"
-            >
-              Clear Messages
+              www.egoblockchain.com ↗
             </button>
           </div>
         </div>
-        {resetMsg && (
-          <div className="px-5 py-3 text-xs text-green-400 bg-green-500/10 border-t border-gray-700">
-            ✓ {resetMsg}
-          </div>
-        )}
       </div>
 
       <button
@@ -242,6 +203,12 @@ const SettingsPage: React.FC = () => {
               <button onClick={() => setShowSetPin(false)} className="text-gray-400 hover:text-white text-xl">✕</button>
             </div>
             <div className="space-y-4">
+              <div className="flex items-start gap-2 bg-yellow-500/10 border border-yellow-500/30 rounded-xl px-3 py-2.5">
+                <span className="text-yellow-400 shrink-0">🔒</span>
+                <div className="text-xs text-yellow-200 leading-relaxed">
+                  Your PIN is stored securely and will persist on this device. To change it, your device security (Windows Hello / Touch ID) will be required.
+                </div>
+              </div>
               <div className="text-sm text-gray-400">Choose a PIN to protect your private key and seed phrase. Minimum 4 characters.</div>
               <input
                 type="password"
@@ -270,44 +237,15 @@ const SettingsPage: React.FC = () => {
               >
                 {settingPin ? 'Setting…' : 'Set PIN'}
               </button>
+              <div className="text-center text-xs text-gray-500">
+                Forgot your PIN?{' '}
+                <span className="text-blue-400">support@egoblockchain.com</span>
+              </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* ── Confirm Reset Modal ────────────────────────────────────────── */}
-      {confirmReset && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
-          <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-sm border border-red-700/50 shadow-2xl">
-            <div className="text-center mb-5">
-              <div className="text-4xl mb-3">⚠️</div>
-              <h3 className="text-lg font-bold text-red-400">
-                {confirmReset === 'chain' ? 'Reset Blockchain?' : 'Clear Chat History?'}
-              </h3>
-              <p className="text-sm text-gray-400 mt-2">
-                {confirmReset === 'chain'
-                  ? 'This will permanently delete all blocks and transactions. Balances will reset to zero. This cannot be undone.'
-                  : 'This will permanently delete all messages for this wallet. Contacts will remain. This cannot be undone.'}
-              </p>
-            </div>
-            <div className="flex gap-3">
-              <button
-                onClick={() => setConfirmReset(null)}
-                className="flex-1 bg-gray-700 hover:bg-gray-600 py-2.5 rounded-xl text-sm font-semibold transition"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => handleReset(confirmReset)}
-                disabled={resetting}
-                className="flex-1 bg-red-700 hover:bg-red-600 disabled:opacity-40 py-2.5 rounded-xl text-sm font-semibold transition"
-              >
-                {resetting ? 'Clearing…' : 'Yes, Delete'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* ── View Recovery Info Modal ───────────────────────────────────── */}
       {showRecovery && (

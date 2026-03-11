@@ -286,6 +286,13 @@ const MessengerPage: React.FC = () => {
     } catch (e) { console.error(e); }
   }
 
+  async function handleDeleteMessage(msgId: string) {
+    try {
+      await invoke('delete_message', { messageId: msgId });
+      if (selected) await loadMessages(selected.address);
+    } catch (e) { console.error(e); }
+  }
+
   function closePendingAction() {
     setPendingAction(null);
     setActionName('');
@@ -474,22 +481,14 @@ const MessengerPage: React.FC = () => {
         {selected ? (
           <>
             {/* Chat header */}
-            <div className="px-6 py-3 border-b border-gray-700 flex items-center justify-between shrink-0">
-              <div className="flex items-center gap-3">
-                <div className="w-9 h-9 rounded-full bg-gradient-to-br from-purple-500 to-pink-600 flex items-center justify-center text-sm font-bold shrink-0">
-                  {(selected.name || '?').charAt(0).toUpperCase()}
-                </div>
-                <div>
-                  <div className="font-semibold text-sm">{selected.name}</div>
-                  <div className="text-xs text-gray-400 font-mono">{truncAddr(selected.address)}</div>
-                </div>
+            <div className="px-6 py-3 border-b border-gray-700 flex items-center shrink-0">
+              <div className="w-9 h-9 rounded-full bg-gradient-to-br from-purple-500 to-pink-600 flex items-center justify-center text-sm font-bold shrink-0">
+                {(selected.name || '?').charAt(0).toUpperCase()}
               </div>
-              <button
-                onClick={() => handleDeleteContact(selected.address)}
-                className="px-3 py-1.5 text-xs text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
-              >
-                Remove
-              </button>
+              <div className="ml-3">
+                <div className="font-semibold text-sm">{selected.name}</div>
+                <div className="text-xs text-gray-400 font-mono">{truncAddr(selected.address)}</div>
+              </div>
             </div>
 
             {/* Messages */}
@@ -504,7 +503,16 @@ const MessengerPage: React.FC = () => {
                 const isFileBundle = m.message_type === 'file_bundle';
                 const imported = importedIds.has(m.id);
                 return (
-                  <div key={m.id} className={`flex ${m.outgoing ? 'justify-end' : 'justify-start'}`}>
+                  <div key={m.id} className={`flex items-end gap-1 group ${m.outgoing ? 'justify-end' : 'justify-start'}`}>
+                    {m.outgoing && (
+                      <button
+                        onClick={() => handleDeleteMessage(m.id)}
+                        className="opacity-0 group-hover:opacity-100 transition-opacity w-5 h-5 flex items-center justify-center text-gray-500 hover:text-red-400 shrink-0 text-xs"
+                        title="Delete message"
+                      >
+                        🗑
+                      </button>
+                    )}
                     <div
                       className={`max-w-xs lg:max-w-md xl:max-w-lg px-4 py-2.5 rounded-2xl ${
                         m.outgoing
@@ -555,6 +563,15 @@ const MessengerPage: React.FC = () => {
                         {fmtTime(m.timestamp)}
                       </p>
                     </div>
+                    {!m.outgoing && (
+                      <button
+                        onClick={() => handleDeleteMessage(m.id)}
+                        className="opacity-0 group-hover:opacity-100 transition-opacity w-5 h-5 flex items-center justify-center text-gray-500 hover:text-red-400 shrink-0 text-xs"
+                        title="Delete message"
+                      >
+                        🗑
+                      </button>
+                    )}
                   </div>
                 );
               })}
