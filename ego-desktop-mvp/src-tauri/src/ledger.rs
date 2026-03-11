@@ -171,6 +171,14 @@ pub struct Ledger {
     pub storage_allocated_bytes: u64,
     #[serde(default)]
     pub security_pin_hash: String,
+    #[serde(default)]
+    pub staked_amount: u64,
+    #[serde(default)]
+    pub staked_at: Option<i64>,
+    #[serde(default)]
+    pub stake_lock_days: u32,
+    #[serde(default)]
+    pub unstake_at: Option<i64>,
 }
 
 impl Ledger {

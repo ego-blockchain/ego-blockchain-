@@ -133,6 +133,8 @@ fn main() {
             commands::coverage::get_network_peers,
             commands::earnings::get_earnings_data,
             commands::staking::get_staking_info,
+            commands::staking::stake_coins,
+            commands::staking::unstake_coins,
             commands::explorer::get_network_stats,
             commands::explorer::get_p2p_status,
             commands::explorer::get_blocks,

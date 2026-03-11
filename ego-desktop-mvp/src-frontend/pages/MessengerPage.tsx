@@ -577,23 +577,6 @@ const MessengerPage: React.FC = () => {
                   {sending ? '…' : 'Send'}
                 </button>
               </div>
-              <div className="flex gap-2">
-                <button
-                  onClick={() => handleSend('file_bundle')}
-                  disabled={!msgInput.trim() || sending}
-                  className="text-xs px-3 py-1.5 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 rounded-lg transition-colors"
-                  title="Paste an egoshare1:… bundle above, then click this"
-                >
-                  📎 Send as File Bundle
-                </button>
-                <button
-                  onClick={() => handleSend('decrypt_key')}
-                  disabled={!msgInput.trim() || sending}
-                  className="text-xs px-3 py-1.5 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 rounded-lg transition-colors"
-                >
-                  🔑 Send as Decrypt Key
-                </button>
-              </div>
             </div>
           </>
         ) : (

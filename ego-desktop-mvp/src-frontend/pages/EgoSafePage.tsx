@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
+import { open as openDialog } from '@tauri-apps/api/dialog';
 import { useWallet } from '../App';
 
 interface Contact {
@@ -33,6 +34,17 @@ interface SharedFile {
   shared: number;
 }
 
+interface StoreFileResult {
+  cid: string;
+  name: string;
+  key_nonce_hex: string;
+}
+
+interface SelectedContact {
+  address: string;
+  name: string;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function fmtBytes(b: number) {
@@ -51,24 +63,6 @@ function buildShareBundle(file: StoredFile, ownerAddress: string): string {
 
 type ShareStep = 'idle' | 'select' | 'recipients' | 'sharing' | 'done';
 
-const FILE_INPUT_ID = 'egosafe-file-input';
-
-const SHARE_STAGES = [
-  { label: 'Encrypt file',       detail: 'XChaCha20-Poly1305',             ms: 1200 },
-  { label: 'Seal key (Kyber)',   detail: 'ML-KEM-768 per recipient',       ms: 800  },
-  { label: 'Upload to storage',  detail: 'RS 8+4 · Primary + 2 Replicas', ms: 1500 },
-  { label: 'Emit key envelopes', detail: 'Signed per-recipient envelopes', ms: 600  },
-];
-
-const DEMO_SHARED: SharedFile[] = [
-  {
-    id: '1', name: 'contract_draft.pdf',
-    cid: 'bafybeig4xqv4p7wjhga3y5xv6kn4ql2mzj7rp8sdjf3mwvecvt2piqye',
-    size: 850_000,
-    recipients: ['ego1alice0000000000000000000000000000000001', 'ego1bob00000000000000000000000000000000002'],
-    shared: Date.now() / 1000 - 7200,
-  },
-];
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
@@ -77,15 +71,14 @@ const EgoSafePage: React.FC = () => {
   const myAddress  = wallet?.address ?? '';
 
   // ── Share-new-file flow state ──────────────────────────────────────────────
-  const [shared, setShared]       = useState<SharedFile[]>(DEMO_SHARED);
-  const [step, setStep]           = useState<ShareStep>('idle');
-  const [fileName, setFileName]   = useState('');
-  const [fileSize, setFileSize]   = useState(0);
-  const [recipient, setRecipient] = useState('');
-  const [recipients, setRecipients] = useState<string[]>([]);
-  const [stageIdx, setStageIdx]   = useState(-1);
-  const [stageProgress, setStageProgress] = useState(0);
-  const [resultCid, setResultCid] = useState('');
+  const [shared, setShared]           = useState<SharedFile[]>([]);
+  const [step, setStep]               = useState<ShareStep>('idle');
+  const [fileName, setFileName]       = useState('');
+  const [filePath, setFilePath]       = useState('');
+  const [fileSize, setFileSize]       = useState(0);
+  const [selectedContacts, setSelectedContacts] = useState<SelectedContact[]>([]);
+  const [resultCid, setResultCid]     = useState('');
+  const [shareError, setShareError]   = useState('');
 
   // ── Share stored file state ────────────────────────────────────────────────
   const [storedFiles, setStoredFiles]       = useState<StoredFile[]>([]);
@@ -175,55 +168,46 @@ const EgoSafePage: React.FC = () => {
 
   // ── Share-new-file flow helpers ────────────────────────────────────────────
 
-  function addRecipient() {
-    if (recipient.trim() && !recipients.includes(recipient.trim())) {
-      setRecipients(r => [...r, recipient.trim()]);
-      setRecipient('');
-    }
-  }
-
-  function startShare() {
+  async function startShare() {
+    if (!filePath || selectedContacts.length === 0) return;
     setStep('sharing');
-    setStageIdx(0);
-    setStageProgress(0);
-    runShare(0);
-  }
-
-  function runShare(idx: number) {
-    if (idx >= SHARE_STAGES.length) {
-      const cid = 'bafybei' + Math.random().toString(36).slice(2, 58);
-      setResultCid(cid);
-      setStep('done');
+    setShareError('');
+    try {
+      const result = await invoke<StoreFileResult>('store_file', {
+        request: { file_path: filePath, duration_months: 1 },
+      });
+      const name64 = btoa(unescape(encodeURIComponent(result.name)));
+      const bundle = `egoshare1:${result.cid}:${result.key_nonce_hex}:${name64}:${myAddress}`;
+      for (const c of selectedContacts) {
+        await invoke('send_message', {
+          contactAddr: c.address,
+          content:     bundle,
+          messageType: 'file_bundle',
+        });
+      }
+      setResultCid(result.cid);
       setShared(prev => [{
         id: Date.now().toString(),
-        name: fileName, cid,
-        size: fileSize, recipients,
+        name: fileName, cid: result.cid,
+        size: fileSize,
+        recipients: selectedContacts.map(c => c.address),
         shared: Date.now() / 1000,
       }, ...prev]);
-      return;
+      setStep('done');
+    } catch (e: any) {
+      setShareError(String(e));
+      setStep('recipients');
     }
-    setStageIdx(idx);
-    setStageProgress(0);
-    const steps = 20;
-    const interval = SHARE_STAGES[idx].ms / steps;
-    let count = 0;
-    function tick() {
-      count++;
-      setStageProgress(Math.min(100, Math.floor((count / steps) * 100)));
-      if (count < steps) setTimeout(tick, interval);
-      else setTimeout(() => runShare(idx + 1), 200);
-    }
-    tick();
   }
 
   function reset() {
     setStep('idle');
     setFileName('');
+    setFilePath('');
     setFileSize(0);
-    setRecipients([]);
-    setRecipient('');
-    setStageIdx(-1);
+    setSelectedContacts([]);
     setResultCid('');
+    setShareError('');
   }
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -271,30 +255,35 @@ const EgoSafePage: React.FC = () => {
 
           {step === 'select' && (
             <div className="max-w-md mx-auto space-y-4">
-              <input
-                id={FILE_INPUT_ID}
-                type="file"
-                className="hidden"
-                onChange={e => {
-                  const file = e.target.files?.[0];
-                  if (file) { setFileName(file.name); setFileSize(file.size); }
-                }}
-              />
               {fileName ? (
                 <div
                   className="flex items-center gap-3 bg-gray-900 border border-purple-500/40 rounded-xl px-4 py-3 cursor-pointer hover:border-purple-400 transition"
-                  onClick={() => document.getElementById(FILE_INPUT_ID)?.click()}
+                  onClick={async () => {
+                    const p = await openDialog({ multiple: false });
+                    if (typeof p === 'string') {
+                      setFilePath(p);
+                      setFileName(p.split(/[/\\]/).pop() ?? p);
+                      setFileSize(0);
+                    }
+                  }}
                 >
                   <span className="text-2xl">📄</span>
                   <div className="min-w-0 flex-1">
                     <div className="text-sm font-medium truncate">{fileName}</div>
-                    <div className="text-xs text-gray-400">{fmtBytes(fileSize)}</div>
+                    <div className="text-xs text-gray-400">Click to change</div>
                   </div>
                   <span className="text-xs text-purple-400 shrink-0">Change</span>
                 </div>
               ) : (
                 <button
-                  onClick={() => document.getElementById(FILE_INPUT_ID)?.click()}
+                  onClick={async () => {
+                    const p = await openDialog({ multiple: false });
+                    if (typeof p === 'string') {
+                      setFilePath(p);
+                      setFileName(p.split(/[/\\]/).pop() ?? p);
+                      setFileSize(0);
+                    }
+                  }}
                   className="w-full border-2 border-dashed border-gray-600 hover:border-purple-500 rounded-xl py-10 flex flex-col items-center gap-2 transition group"
                 >
                   <span className="text-4xl">📂</span>
@@ -303,7 +292,7 @@ const EgoSafePage: React.FC = () => {
                 </button>
               )}
               <button
-                disabled={!fileName || fileSize <= 0}
+                disabled={!filePath}
                 onClick={() => setStep('recipients')}
                 className="w-full bg-purple-600 hover:bg-purple-500 disabled:opacity-40 py-3 rounded-xl font-semibold transition"
               >
@@ -316,41 +305,56 @@ const EgoSafePage: React.FC = () => {
             <div className="max-w-md mx-auto space-y-4">
               <div className="bg-gray-900 rounded-xl p-3 flex items-center gap-3">
                 <span className="text-2xl">📄</span>
-                <div>
-                  <div className="font-medium text-sm">{fileName}</div>
-                  <div className="text-xs text-gray-400">{fmtBytes(fileSize)}</div>
+                <div className="min-w-0">
+                  <div className="font-medium text-sm truncate">{fileName}</div>
+                  <div className="text-xs text-gray-400">Select contacts to send to</div>
                 </div>
               </div>
-              <div>
-                <label className="text-xs text-gray-400 block mb-1.5">Add Recipient (ego1 address)</label>
-                <div className="flex gap-2">
-                  <input
-                    value={recipient}
-                    onChange={e => setRecipient(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && addRecipient()}
-                    className="flex-1 bg-gray-900 border border-gray-700 focus:border-purple-500 rounded-xl px-4 py-3 text-sm font-mono outline-none transition"
-                    placeholder="ego1..."
-                  />
-                  <button onClick={addRecipient} className="bg-purple-600 hover:bg-purple-500 px-4 rounded-xl transition text-sm">Add</button>
+              {contacts.length === 0 ? (
+                <div className="text-center text-gray-500 py-4 text-sm">
+                  No approved contacts yet.<br/>
+                  <span className="text-xs">Add contacts in the Messenger tab first.</span>
                 </div>
-              </div>
-              {recipients.length > 0 && (
+              ) : (
                 <div className="space-y-2">
-                  {recipients.map((r, i) => (
-                    <div key={r} className="flex items-center justify-between bg-gray-900 rounded-xl px-4 py-2">
-                      <span className="font-mono text-xs text-gray-300">{r.slice(0, 20)}…{r.slice(-6)}</span>
-                      <button onClick={() => setRecipients(prev => prev.filter((_, j) => j !== i))} className="text-gray-500 hover:text-red-400 transition text-lg leading-none">✕</button>
-                    </div>
-                  ))}
+                  <div className="text-xs text-gray-400 mb-1">Select recipients:</div>
+                  {contacts.map(c => {
+                    const sel = selectedContacts.some(s => s.address === c.address);
+                    return (
+                      <button
+                        key={c.address}
+                        onClick={() => setSelectedContacts(prev =>
+                          sel ? prev.filter(s => s.address !== c.address)
+                              : [...prev, { address: c.address, name: c.name }]
+                        )}
+                        className={`w-full flex items-center gap-3 px-4 py-3 border rounded-xl transition text-left ${
+                          sel
+                            ? 'bg-purple-600/20 border-purple-500/50'
+                            : 'bg-gray-900 border-gray-700 hover:border-purple-500/40'
+                        }`}
+                      >
+                        <div className={`w-5 h-5 rounded border flex items-center justify-center shrink-0 ${sel ? 'bg-purple-600 border-purple-600' : 'border-gray-600'}`}>
+                          {sel && <span className="text-xs text-white">✓</span>}
+                        </div>
+                        <div className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-500 to-pink-600 flex items-center justify-center text-xs font-bold shrink-0">
+                          {(c.name || '?').charAt(0).toUpperCase()}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="text-sm font-medium">{c.name}</div>
+                          <div className="text-xs text-gray-400 font-mono">{c.address.slice(0, 12)}…{c.address.slice(-6)}</div>
+                        </div>
+                      </button>
+                    );
+                  })}
                 </div>
               )}
-              <div className="bg-gray-900 rounded-xl p-3 text-xs text-gray-400">
-                💡 Each recipient gets a unique Kyber-sealed key envelope. No file re-upload needed to share with more people later.
-              </div>
+              {shareError && (
+                <div className="text-xs text-red-400 bg-red-500/10 rounded-xl px-3 py-2">{shareError}</div>
+              )}
               <div className="grid grid-cols-2 gap-3">
                 <button onClick={() => setStep('select')} className="bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition">← Back</button>
                 <button
-                  disabled={recipients.length === 0}
+                  disabled={selectedContacts.length === 0}
                   onClick={startShare}
                   className="bg-purple-600 hover:bg-purple-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
                 >
@@ -361,36 +365,12 @@ const EgoSafePage: React.FC = () => {
           )}
 
           {step === 'sharing' && (
-            <div className="max-w-md mx-auto space-y-3">
-              <div className="text-center mb-4">
-                <div className="text-3xl mb-1">⚙️</div>
-                <div className="font-semibold">Securing {fileName}</div>
+            <div className="max-w-md mx-auto text-center py-8 space-y-4">
+              <div className="text-4xl animate-spin">⚙️</div>
+              <div className="font-semibold">Encrypting & sending {fileName}…</div>
+              <div className="text-sm text-gray-400">
+                Storing encrypted file and delivering to {selectedContacts.length} contact{selectedContacts.length !== 1 ? 's' : ''}
               </div>
-              {SHARE_STAGES.map((stage, i) => {
-                const done   = i < stageIdx;
-                const active = i === stageIdx;
-                return (
-                  <div key={i} className={`rounded-xl p-4 border transition ${
-                    done   ? 'border-green-500/30 bg-green-500/5' :
-                    active ? 'border-purple-500/50 bg-purple-500/10' :
-                             'border-gray-700 bg-gray-900 opacity-40'
-                  }`}>
-                    <div className="flex items-center justify-between mb-1">
-                      <div className="flex items-center gap-2">
-                        <span>{done ? '✅' : active ? '⏳' : '○'}</span>
-                        <span className="text-sm font-medium">{stage.label}</span>
-                      </div>
-                      {active && <span className="text-xs text-purple-400">{stageProgress}%</span>}
-                    </div>
-                    <div className="text-xs text-gray-400 ml-6">{stage.detail}</div>
-                    {active && (
-                      <div className="mt-2 ml-6 bg-gray-700 rounded-full h-1.5">
-                        <div className="bg-purple-500 h-1.5 rounded-full transition-all duration-100" style={{ width: `${stageProgress}%` }} />
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
             </div>
           )}
 
@@ -399,7 +379,7 @@ const EgoSafePage: React.FC = () => {
               <div className="text-center py-4">
                 <div className="text-5xl mb-2">🔐</div>
                 <div className="text-xl font-bold text-green-400">Shared Securely!</div>
-                <div className="text-sm text-gray-400 mt-1">{recipients.length} recipient{recipients.length > 1 ? 's' : ''} notified</div>
+                <div className="text-sm text-gray-400 mt-1">{selectedContacts.length} recipient{selectedContacts.length !== 1 ? 's' : ''} notified</div>
               </div>
               <div className="bg-gray-900 rounded-xl p-4 space-y-2 text-sm">
                 <div className="text-xs text-gray-400 mb-2">Content ID (CID)</div>
