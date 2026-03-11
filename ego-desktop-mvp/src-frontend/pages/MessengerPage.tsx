@@ -146,6 +146,22 @@ const MessengerPage: React.FC = () => {
           loadMessages(cur.address);
         }
       }),
+
+      // Window focused after a notification: open the relevant chat
+      listen<{ address: string }>('ego://open-chat', (event) => {
+        const addr = event.payload.address;
+        invoke<Contact[]>('get_contacts').then(cs => {
+          setContacts(cs);
+          const contact = cs.find(c => c.address === addr && c.status === 'approved');
+          if (contact) setSelected(contact);
+        }).catch(() => {
+          setContacts(prev => {
+            const contact = prev.find(c => c.address === addr && c.status === 'approved');
+            if (contact) setSelected(contact);
+            return prev;
+          });
+        });
+      }),
     ];
 
     return () => { unlisteners.forEach(p => p.then(fn => fn())); };
