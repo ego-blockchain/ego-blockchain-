@@ -272,8 +272,8 @@ pub async fn retrieve_file_preview(
         .cloned()
         .ok_or_else(|| EgoDesktopError::NotFound(format!("File {cid} not found")))?;
 
-    // No local copy (e.g. received from network in demo mode)
-    if file.local_path.is_empty() {
+    // No local copy (e.g. received from network) or pending download
+    if file.local_path.is_empty() || file.local_path.starts_with("sender:") {
         return Ok(FilePreview {
             name:        file.name,
             mime_type:   "application/octet-stream".into(),
@@ -317,13 +317,21 @@ pub async fn retrieve_file_preview(
         "webp"         => "image/webp",
         "svg"          => "image/svg+xml",
         "bmp"          => "image/bmp",
+        "pdf"          => "application/pdf",
+        "mp4"          => "video/mp4",
+        "webm"         => "video/webm",
+        "mov"          => "video/quicktime",
+        "avi"          => "video/avi",
         "txt" | "md" | "rs" | "py" | "js" | "ts" | "json"
         | "csv" | "xml" | "html" | "css" | "toml" | "yaml" | "yml"
                        => "text/plain",
         _              => "application/octet-stream",
     };
 
-    let previewable = mime_type.starts_with("image/") || mime_type == "text/plain";
+    let previewable = mime_type.starts_with("image/")
+        || mime_type == "text/plain"
+        || mime_type == "application/pdf"
+        || mime_type.starts_with("video/");
     let data_base64 = if previewable {
         base64::encode(&plaintext)
     } else {
@@ -337,4 +345,67 @@ pub async fn retrieve_file_preview(
         size_bytes:  plaintext.len() as u64,
         previewable,
     })
+}
+
+// ── save_file_to_disk ─────────────────────────────────────────────────────────
+
+/// Decrypt a stored file and write the plaintext to `dest_path`.
+#[tauri::command]
+pub async fn save_file_to_disk(
+    cid: String,
+    dest_path: String,
+    _state: State<'_, AppState>,
+) -> Result<(), EgoDesktopError> {
+    let ledger = Ledger::load();
+    let file = ledger.stored_files.iter().find(|f| f.cid == cid).cloned()
+        .ok_or_else(|| EgoDesktopError::NotFound(format!("File {cid} not found")))?;
+    if file.local_path.is_empty() || file.local_path.starts_with("sender:") {
+        return Err(EgoDesktopError::FileSystemError("No local encrypted copy".into()));
+    }
+    let on_disk = fs::read(&file.local_path)
+        .map_err(|e| EgoDesktopError::FileSystemError(format!("Read enc: {e}")))?;
+    if on_disk.len() < 13 {
+        return Err(EgoDesktopError::FileSystemError("Encrypted file too short".into()));
+    }
+    let nonce_bytes = &on_disk[..12];
+    let ciphertext  = &on_disk[12..];
+    let key_nonce = hex::decode(&file.key_nonce_hex)
+        .map_err(|e| EgoDesktopError::CryptoError(format!("Decode key: {e}")))?;
+    if key_nonce.len() < 32 {
+        return Err(EgoDesktopError::CryptoError("Key too short".into()));
+    }
+    let cipher = Aes256Gcm::new_from_slice(&key_nonce[..32])
+        .map_err(|e| EgoDesktopError::CryptoError(format!("Key init: {e}")))?;
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let plaintext = cipher.decrypt(nonce, ciphertext)
+        .map_err(|e| EgoDesktopError::CryptoError(format!("Decrypt: {e}")))?;
+    fs::write(&dest_path, &plaintext)
+        .map_err(|e| EgoDesktopError::FileSystemError(format!("Write: {e}")))?;
+    Ok(())
+}
+
+// ── request_file_from_contact ─────────────────────────────────────────────────
+
+/// Request a file from the sender via P2P (for received files with no local copy).
+#[tauri::command]
+pub async fn request_file_from_contact(
+    cid: String,
+    from_addr: String,
+    _state: State<'_, AppState>,
+) -> Result<(), EgoDesktopError> {
+    use crate::commands::messenger::load_contacts;
+    let contacts = load_contacts();
+    let contact = contacts.iter()
+        .find(|c| c.address == from_addr && c.status == "approved")
+        .ok_or_else(|| EgoDesktopError::NotFound("Contact not found".into()))?;
+    let endpoint = crate::p2p::get_relay_endpoint(&from_addr).await
+        .unwrap_or_else(|| contact.endpoint.clone());
+    if endpoint.is_empty() {
+        return Err(EgoDesktopError::InvalidInput("Contact has no known endpoint".into()));
+    }
+    let my_endpoint = crate::p2p::get_public_endpoint().await;
+    let msg = crate::p2p::P2PMessage::FileRequest { cid, requester_endpoint: my_endpoint };
+    crate::p2p::send_message(&endpoint, &msg).await
+        .map_err(|e| EgoDesktopError::InvalidInput(format!("P2P send: {e}")))?;
+    Ok(())
 }

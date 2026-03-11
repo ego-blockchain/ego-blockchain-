@@ -81,9 +81,21 @@ fn main() {
         // coverage background tasks; hiding keeps them alive.
         // The only way to actually quit is via the tray "Quit" menu item.
         .on_window_event(|event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event.event() {
-                event.window().hide().unwrap();
-                api.prevent_close();
+            match event.event() {
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    event.window().hide().unwrap();
+                    api.prevent_close();
+                }
+                tauri::WindowEvent::Focused(true) => {
+                    use tauri::Manager;
+                    let app_handle = event.window().app_handle();
+                    let state = app_handle.state::<app::AppState>();
+                    let maybe_addr = state.pending_chat_address.lock().unwrap().take();
+                    if let Some(addr) = maybe_addr {
+                        let _ = event.window().emit("ego://open-chat", serde_json::json!({ "address": addr }));
+                    }
+                }
+                _ => {}
             }
         })
         .on_system_tray_event(|app, event| match event {
@@ -126,6 +138,8 @@ fn main() {
             commands::storage::configure_storage,
             commands::storage::delete_stored_file,
             commands::storage::retrieve_file_preview,
+            commands::storage::save_file_to_disk,
+            commands::storage::request_file_from_contact,
             commands::files::encrypt_file,
             commands::files::decrypt_file,
             commands::coverage::get_coverage_status,

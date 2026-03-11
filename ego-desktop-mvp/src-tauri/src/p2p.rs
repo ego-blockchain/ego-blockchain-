@@ -92,6 +92,15 @@ pub enum P2PMessage {
     PeerListResponse {
         peers: Vec<PeerEntry>,
     },
+    FileRequest {
+        cid: String,
+        requester_endpoint: String,
+    },
+    FileData {
+        cid: String,
+        enc_data_b64: String,
+        file_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -964,17 +973,30 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
         P2PMessage::ChatMessage { bundle } => {
             match crate::commands::messenger::receive_message_inner(&bundle) {
                 Ok(msg) => {
-                    let preview = if msg.content.len() > 40 {
-                        format!("{}…", &msg.content[..40])
+                    if msg.message_type == "file_bundle" {
+                        // Auto-import into ledger so it appears in EgoSafe immediately.
+                        crate::commands::notifications::try_auto_import(
+                            app, &msg.content, &msg.from,
+                        ).await;
                     } else {
-                        msg.content.clone()
-                    };
-                    let _ = tauri::api::notification::Notification::new(
-                        &app.config().tauri.bundle.identifier,
-                    )
-                    .title("New Message")
-                    .body(&preview)
-                    .show();
+                        // Only show "New Message" notification for text messages.
+                        // Record the sender so window focus opens their chat.
+                        {
+                            let state = app.state::<crate::app::AppState>();
+                            *state.pending_chat_address.lock().unwrap() = Some(msg.from.clone());
+                        }
+                        let preview = if msg.content.len() > 40 {
+                            format!("{}…", &msg.content[..40])
+                        } else {
+                            msg.content.clone()
+                        };
+                        let _ = tauri::api::notification::Notification::new(
+                            &app.config().tauri.bundle.identifier,
+                        )
+                        .title("New Message")
+                        .body(&preview)
+                        .show();
+                    }
                     let _ = app.emit_all("ego://message-received", &msg);
                 }
                 Err(e) => eprintln!("[P2P] Decrypt error: {}", e),
@@ -1023,6 +1045,47 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                     city:      None,
                     country:   None,
                 });
+            }
+        }
+
+        P2PMessage::FileRequest { cid, requester_endpoint } => {
+            let ledger = crate::ledger::Ledger::load();
+            if let Some(file) = ledger.stored_files.iter().find(|f| f.cid == cid).cloned() {
+                if !file.local_path.is_empty() && !file.local_path.starts_with("sender:") {
+                    if let Ok(enc_bytes) = std::fs::read(&file.local_path) {
+                        use base64::Engine as _;
+                        let enc_data_b64 = base64::engine::general_purpose::STANDARD.encode(&enc_bytes);
+                        let response = P2PMessage::FileData {
+                            cid: cid.clone(),
+                            enc_data_b64,
+                            file_name: file.name.clone(),
+                        };
+                        tokio::spawn(async move {
+                            if let Err(e) = send_message(&requester_endpoint, &response).await {
+                                eprintln!("[P2P] FileData send error: {}", e);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        P2PMessage::FileData { cid, enc_data_b64, file_name } => {
+            use base64::Engine as _;
+            if let Ok(enc_bytes) = base64::engine::general_purpose::STANDARD.decode(&enc_data_b64) {
+                let storage = crate::ledger::storage_dir();
+                let short = &cid[7..cid.len().min(7 + 8)];
+                let enc_path = storage.join(format!("{}.enc", short));
+                if std::fs::write(&enc_path, &enc_bytes).is_ok() {
+                    let mut ledger = crate::ledger::Ledger::load();
+                    if let Some(f) = ledger.stored_files.iter_mut().find(|f| f.cid == cid) {
+                        f.local_path = enc_path.to_string_lossy().to_string();
+                        if f.name.is_empty() { f.name = file_name.clone(); }
+                        let _ = ledger.save();
+                        eprintln!("[P2P] FileData saved for {}", cid);
+                        let _ = app.emit_all("ego://file-downloaded", serde_json::json!({ "cid": cid }));
+                    }
+                }
             }
         }
     }

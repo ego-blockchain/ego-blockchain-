@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { open as openDialog } from '@tauri-apps/api/dialog';
+import { listen } from '@tauri-apps/api/event';
 import { useWallet } from '../App';
 
 interface Contact {
@@ -82,6 +83,7 @@ const EgoSafePage: React.FC = () => {
 
   // ── Share stored file state ────────────────────────────────────────────────
   const [storedFiles, setStoredFiles]       = useState<StoredFile[]>([]);
+  const [receivedFiles, setReceivedFiles]   = useState<StoredFile[]>([]);
   const [shareTarget, setShareTarget]       = useState<StoredFile | null>(null);
   const [copiedCid, setCopiedCid]           = useState<string | null>(null);
 
@@ -97,17 +99,34 @@ const EgoSafePage: React.FC = () => {
   const [importing, setImporting]     = useState(false);
   const [importMsg, setImportMsg]     = useState('');
 
+  // ── Preview modal state ────────────────────────────────────────────────────
+  const [previewFile, setPreviewFile] = useState<StoredFile | null>(null);
+  const [preview, setPreview]         = useState<{ name: string; mime_type: string; data_base64: string; size_bytes: number; previewable: boolean } | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+
+  // ── P2P file request state ─────────────────────────────────────────────────
+  const [requestingCid, setRequestingCid] = useState<string | null>(null);
+
   useEffect(() => {
     loadStoredFiles();
     invoke<Contact[]>('get_contacts')
       .then(cs => setContacts(cs.filter(c => c.status === 'approved')))
       .catch(() => {});
+    // Refresh when a new message arrives (file bundles auto-import in backend)
+    const unlistenMsg = listen('ego://message-received', () => { loadStoredFiles(); });
+    // Refresh when a P2P file download completes
+    const unlistenDl  = listen('ego://file-downloaded', () => { loadStoredFiles(); });
+    return () => {
+      unlistenMsg.then(fn => fn());
+      unlistenDl.then(fn => fn());
+    };
   }, []);
 
   async function loadStoredFiles() {
     try {
       const files = await invoke<StoredFile[]>('get_stored_files');
       setStoredFiles(files.filter(f => f.status === 'Active'));
+      setReceivedFiles(files.filter(f => f.status === 'Received'));
     } catch {}
   }
 
@@ -430,6 +449,21 @@ const EgoSafePage: React.FC = () => {
                     </div>
                     <div className="flex gap-2 shrink-0">
                       <button
+                        onClick={async () => {
+                          setPreviewFile(file);
+                          setPreview(null);
+                          setPreviewLoading(true);
+                          try {
+                            const p = await invoke<{ name: string; mime_type: string; data_base64: string; size_bytes: number; previewable: boolean }>('retrieve_file_preview', { cid: file.cid });
+                            setPreview(p);
+                          } catch {}
+                          setPreviewLoading(false);
+                        }}
+                        className="text-xs bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded-lg transition"
+                      >
+                        👁 View
+                      </button>
+                      <button
                         onClick={() => setShareTarget(isOpen ? null : file)}
                         className="text-xs bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded-lg transition"
                       >
@@ -470,6 +504,83 @@ const EgoSafePage: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* ── Received Files ───────────────────────────────────────────────── */}
+      {receivedFiles.length > 0 && (
+        <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
+          <div className="flex items-center justify-between px-5 py-4 border-b border-gray-700">
+            <div>
+              <h3 className="font-semibold">Received Files ({receivedFiles.length})</h3>
+              <p className="text-xs text-gray-400 mt-0.5">Files shared with you — ready to download</p>
+            </div>
+            <button onClick={loadStoredFiles} className="text-xs text-gray-400 hover:text-white transition">↻ Refresh</button>
+          </div>
+          <div className="divide-y divide-gray-700/50">
+            {receivedFiles.map(file => {
+              const isPending  = !file.local_path || file.local_path.startsWith('sender:');
+              const senderAddr = isPending && file.local_path.startsWith('sender:')
+                ? file.local_path.replace('sender:', '')
+                : '';
+              const isRequesting = requestingCid === file.cid;
+              return (
+                <div key={file.cid} className="px-5 py-4">
+                  <div className="flex items-center gap-4">
+                    <div className="text-2xl">{isPending ? '⏳' : '📥'}</div>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm font-medium truncate">{file.name}</div>
+                      <div className="font-mono text-xs text-green-400 truncate mt-0.5">{file.cid.slice(0, 20)}…</div>
+                    </div>
+                    <div className="shrink-0 flex items-center gap-1.5">
+                      {isPending ? (
+                        <>
+                          <span className="text-xs bg-yellow-500/20 text-yellow-400 px-2 py-1 rounded-lg">Not downloaded</span>
+                          {senderAddr && (
+                            <button
+                              disabled={isRequesting}
+                              onClick={async () => {
+                                setRequestingCid(file.cid);
+                                try {
+                                  await invoke('request_file_from_contact', { cid: file.cid, fromAddr: senderAddr });
+                                } catch (e: any) {
+                                  alert('Request failed: ' + String(e));
+                                } finally {
+                                  setRequestingCid(null);
+                                }
+                              }}
+                              className="text-xs bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 px-3 py-1 rounded-lg transition disabled:opacity-40"
+                            >
+                              {isRequesting ? '⏳ Requesting…' : '📥 Request File'}
+                            </button>
+                          )}
+                        </>
+                      ) : (
+                        <>
+                          <span className="text-xs bg-green-500/20 text-green-400 px-2 py-1 rounded-lg">✓ Downloaded</span>
+                          <button
+                            onClick={async () => {
+                              setPreviewFile(file);
+                              setPreview(null);
+                              setPreviewLoading(true);
+                              try {
+                                const p = await invoke<{ name: string; mime_type: string; data_base64: string; size_bytes: number; previewable: boolean }>('retrieve_file_preview', { cid: file.cid });
+                                setPreview(p);
+                              } catch {}
+                              setPreviewLoading(false);
+                            }}
+                            className="text-xs bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded-lg transition"
+                          >
+                            👁 View
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* ── Import Shared File ───────────────────────────────────────────── */}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
@@ -548,6 +659,44 @@ const EgoSafePage: React.FC = () => {
           ))}
         </div>
       </div>
+
+      {/* ── File Preview Modal ───────────────────────────────────────── */}
+      {previewFile && (
+        <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
+          <div className="bg-gray-800 rounded-2xl w-full max-w-2xl border border-gray-700 shadow-2xl max-h-[90vh] flex flex-col">
+            <div className="px-5 py-4 border-b border-gray-700 flex items-center justify-between shrink-0">
+              <h3 className="font-bold truncate">{previewFile.name}</h3>
+              <button onClick={() => { setPreviewFile(null); setPreview(null); }} className="text-gray-400 hover:text-white text-xl shrink-0 ml-3">✕</button>
+            </div>
+            <div className="flex-1 overflow-auto p-4">
+              {previewLoading && <div className="text-center py-8 text-gray-400">Loading preview…</div>}
+              {preview && !previewLoading && (
+                preview.previewable ? (
+                  preview.mime_type.startsWith('image/') ? (
+                    <img src={`data:${preview.mime_type};base64,${preview.data_base64}`} alt={preview.name} className="max-w-full mx-auto rounded-lg" />
+                  ) : preview.mime_type === 'application/pdf' ? (
+                    <embed src={`data:application/pdf;base64,${preview.data_base64}`} type="application/pdf" className="w-full h-96 rounded-lg" />
+                  ) : preview.mime_type.startsWith('video/') ? (
+                    <video controls className="w-full rounded-lg">
+                      <source src={`data:${preview.mime_type};base64,${preview.data_base64}`} type={preview.mime_type} />
+                    </video>
+                  ) : (
+                    <pre className="text-xs text-gray-300 whitespace-pre-wrap break-all font-mono bg-gray-900 rounded-xl p-4 overflow-auto max-h-80">
+                      {atob(preview.data_base64)}
+                    </pre>
+                  )
+                ) : (
+                  <div className="text-center py-8 text-gray-400">
+                    <div className="text-4xl mb-3">📄</div>
+                    <div className="text-sm">Preview not available for this file type</div>
+                    <div className="text-xs text-gray-500 mt-1">{preview.mime_type}</div>
+                  </div>
+                )
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Send to Contact modal ─────────────────────────────────────── */}
       {sendTarget && (

@@ -3,13 +3,15 @@ import { invoke } from '@tauri-apps/api/tauri';
 import { useWallet } from '../App';
 
 interface StakingInfo {
-  staked_amount:    number;
-  lock_period_days: number;
-  apr:              number;
-  pending_rewards:  number;
-  unlock_date:      number | null;
-  staked_at:        number | null;
-  is_locked:        boolean;
+  staked_amount:      number;
+  lock_period_days:   number;
+  apr:                number;
+  pending_rewards:    number;
+  unlock_date:        number | null;
+  staked_at:          number | null;
+  is_locked:          boolean;
+  projected_interest: number;
+  early_unstake_fee:  number;
 }
 
 interface Balance { uegoc: number; formatted: string; }
@@ -85,13 +87,17 @@ const StakingPage: React.FC = () => {
     }
   }
 
-  async function handleUnstake() {
+  async function handleUnstake(earlyUnstake: boolean = false) {
+    if (earlyUnstake) {
+      const fee = info ? (info.early_unstake_fee / 1_000_000).toFixed(4) : '0';
+      if (!window.confirm(`Early unstake will deduct ${fee} EGOC (10% fee). Proceed?`)) return;
+    }
     setSubmitting(true);
     setResult(null);
     try {
-      await invoke('unstake_coins');
+      await invoke('unstake_coins', { early: earlyUnstake });
       await load();
-      setResult({ ok: true, msg: 'Stake returned to your wallet.' });
+      setResult({ ok: true, msg: earlyUnstake ? 'Early unstake complete (10% fee applied).' : 'Stake returned to your wallet.' });
     } catch (e: any) {
       setResult({ ok: false, msg: String(e) });
     } finally {
@@ -109,12 +115,13 @@ const StakingPage: React.FC = () => {
   return (
     <div className="p-6 space-y-5 max-w-4xl mx-auto">
       {/* Summary cards */}
-      <div className="grid grid-cols-4 gap-3">
+      <div className="grid grid-cols-5 gap-3">
         {[
-          { label: 'Staked',          val: `${fmtEgoc(info?.staked_amount ?? 0)} EGOC`, color: 'text-blue-400'   },
-          { label: 'APR',             val: `${info?.apr ?? APR}%`,                       color: 'text-green-400'  },
-          { label: 'Pending Rewards', val: `${pendingRew.toFixed(2)} EGOC`,              color: 'text-yellow-400' },
-          { label: 'Lock Remaining',  val: hasStake ? `${lockLeft} days` : '—',          color: 'text-purple-400' },
+          { label: 'Staked',              val: `${fmtEgoc(info?.staked_amount ?? 0)} EGOC`,                                  color: 'text-blue-400'   },
+          { label: 'APR',                 val: `${info?.apr ?? APR}%`,                                                        color: 'text-green-400'  },
+          { label: 'Projected Interest',  val: hasStake ? `${((info?.projected_interest ?? 0) / 1_000_000).toFixed(4)} EGOC` : '—', color: 'text-cyan-400'   },
+          { label: 'Pending Rewards',     val: `${pendingRew.toFixed(2)} EGOC`,                                               color: 'text-yellow-400' },
+          { label: 'Lock Remaining',      val: hasStake ? `${lockLeft} days` : '—',                                          color: 'text-purple-400' },
         ].map(c => (
           <div key={c.label} className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
             <div className="text-xs text-gray-400 mb-1">{c.label}</div>
@@ -269,28 +276,38 @@ const StakingPage: React.FC = () => {
                         </div>
                         {info!.is_locked && (
                           <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3 text-xs text-yellow-300 mt-1">
-                            🔒 Locked for {lockLeft} more day{lockLeft !== 1 ? 's' : ''}.
-                            You can unstake on {fmtDate(info!.unlock_date)}.
+                            🔒 Lock period ends on {fmtDate(info!.unlock_date)}. Early unstake fee: {((info!.early_unstake_fee) / 1_000_000).toFixed(4)} EGOC (10%)
                           </div>
                         )}
                         {canUnstake && (
                           <div className="bg-green-500/10 border border-green-500/30 rounded-lg p-3 text-xs text-green-300 mt-1">
-                            ✅ Lock period has ended. You can unstake now.
+                            ✅ Lock period has ended. Ready to unstake — no fee.
                           </div>
                         )}
                       </div>
 
-                      <button
-                        onClick={handleUnstake}
-                        disabled={!canUnstake || submitting}
-                        className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-40 py-3 rounded-xl font-semibold transition"
-                      >
-                        {submitting
-                          ? '⏳ Processing...'
-                          : info!.is_locked
-                            ? `🔒 Locked — ${lockLeft} days remaining`
-                            : '🔓 Unstake EGOC'}
-                      </button>
+                      {info!.is_locked ? (
+                        <div className="space-y-2">
+                          <button
+                            onClick={() => handleUnstake(true)}
+                            disabled={submitting}
+                            className="w-full bg-yellow-600 hover:bg-yellow-500 disabled:opacity-40 py-3 rounded-xl font-semibold transition"
+                          >
+                            {submitting ? '⏳ Processing...' : `⚡ Unstake Early (10% fee)`}
+                          </button>
+                          <div className="text-center text-xs text-gray-500 py-1">
+                            — or — wait until {fmtDate(info!.unlock_date)} for no fee
+                          </div>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => handleUnstake(false)}
+                          disabled={!canUnstake || submitting}
+                          className="w-full bg-green-600 hover:bg-green-500 disabled:opacity-40 py-3 rounded-xl font-semibold transition"
+                        >
+                          {submitting ? '⏳ Processing...' : '🔓 Unstake Now (no fee)'}
+                        </button>
+                      )}
                     </>
                   ) : (
                     <div className="text-center py-8 text-gray-500">

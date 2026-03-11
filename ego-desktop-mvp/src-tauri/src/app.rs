@@ -34,6 +34,8 @@ pub struct AppState {
     pub upnp_status: Arc<Mutex<Option<Result<(), String>>>>,
     /// Our detected public endpoint (ip:port), set after UPnP attempt.
     pub public_endpoint: Arc<Mutex<String>>,
+    /// Contact address whose chat triggered the last notification; consumed on window focus.
+    pub pending_chat_address: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,6 +209,7 @@ impl AppState {
             peers: Arc::new(Mutex::new(HashMap::new())),
             upnp_status: Arc::new(Mutex::new(None)),
             public_endpoint: Arc::new(Mutex::new(String::new())),
+            pending_chat_address: Arc::new(Mutex::new(None)),
         }
     }
 
