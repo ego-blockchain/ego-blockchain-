@@ -537,7 +537,8 @@ pub async fn send_message(
         let endpoint = resolve_endpoint(&contact_addr_key, &stored_endpoint).await;
         let p2p_msg  = p2p::P2PMessage::ChatMessage { bundle };
         if let Err(e) = p2p::send_message(&endpoint, &p2p_msg).await {
-            eprintln!("[Messenger] deliver to {}: {}", endpoint, e);
+            eprintln!("[Messenger] deliver to {}: {} — depositing in relay inbox", endpoint, e);
+            deposit_in_relay_inbox(&contact_addr_key, &my_addr, &p2p_msg).await;
         }
     });
 
