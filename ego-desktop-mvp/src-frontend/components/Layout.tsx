@@ -211,6 +211,19 @@ const WalletSwitcher: React.FC = () => {
 
 const Layout: React.FC = () => {
   const { theme, toggleTheme } = useTheme();
+  const [chainStats, setChainStats] = useState<{ latest_block: number; total_transactions: number } | null>(null);
+
+  useEffect(() => {
+    const fetch = () => {
+      invoke<{ latest_block: number; total_transactions: number }>('get_network_stats')
+        .then(s => setChainStats(s))
+        .catch(() => {});
+    };
+    fetch();
+    const t = setInterval(fetch, 15_000);
+    return () => clearInterval(t);
+  }, []);
+
   return (
     <div className="flex flex-col h-screen bg-gray-900 text-white overflow-hidden">
       <TitleBar />
@@ -271,9 +284,19 @@ const Layout: React.FC = () => {
               <div className={`w-4 h-4 bg-white rounded-full shadow absolute top-0.5 transition-all ${theme === 'light' ? 'left-5' : 'left-0.5'}`} />
             </button>
           </div>
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-gray-500">Block</span>
-            <span className="text-xs text-gray-300 font-mono">#12,489</span>
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs text-gray-500">Block</span>
+              <span className="text-xs text-gray-300 font-mono">
+                #{chainStats ? chainStats.latest_block.toLocaleString() : '—'}
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs text-gray-500">Txs</span>
+              <span className="text-xs text-blue-400 font-mono">
+                {chainStats ? chainStats.total_transactions.toLocaleString() : '—'}
+              </span>
+            </div>
           </div>
         </div>
       </aside>

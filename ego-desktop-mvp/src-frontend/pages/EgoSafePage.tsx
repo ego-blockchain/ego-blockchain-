@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/tauri';
 import { open as openDialog } from '@tauri-apps/api/dialog';
 import { listen } from '@tauri-apps/api/event';
 import { useWallet } from '../App';
+import { useConfirm } from '../hooks/useConfirm';
 
 interface Contact {
   address: string;
@@ -70,6 +71,7 @@ type ShareStep = 'idle' | 'select' | 'recipients' | 'sharing' | 'done';
 const EgoSafePage: React.FC = () => {
   const { wallet } = useWallet();
   const myAddress  = wallet?.address ?? '';
+  const { confirm, ConfirmDialog } = useConfirm();
 
   // ── Share-new-file flow state ──────────────────────────────────────────────
   const [shared, setShared]           = useState<SharedFile[]>([]);
@@ -233,6 +235,7 @@ const EgoSafePage: React.FC = () => {
 
   return (
     <div className="p-6 space-y-5 max-w-4xl mx-auto">
+      {ConfirmDialog}
 
       {/* Header */}
       <div className="bg-gradient-to-br from-purple-700 to-blue-700 rounded-2xl p-5">
@@ -485,6 +488,18 @@ const EgoSafePage: React.FC = () => {
                       >
                         📤 Send
                       </button>
+                      <button
+                        onClick={async () => {
+                          if (!await confirm(`Delete "${file.name}"?`, { detail: 'This removes the encrypted copy from your storage and cannot be undone.', confirmLabel: 'Delete' })) return;
+                          try {
+                            await invoke('delete_stored_file', { cid: file.cid });
+                            await loadStoredFiles();
+                          } catch (e: any) { alert('Delete failed: ' + String(e)); }
+                        }}
+                        className="text-xs bg-red-600/20 hover:bg-red-600/40 text-red-400 px-3 py-1.5 rounded-lg transition font-medium"
+                      >
+                        🗑
+                      </button>
                     </div>
                   </div>
 
@@ -541,8 +556,9 @@ const EgoSafePage: React.FC = () => {
                                 setRequestingCid(file.cid);
                                 try {
                                   await invoke('request_file_from_contact', { cid: file.cid, fromAddr: senderAddr });
+                                  alert('File requested! The sender will deliver it — check back shortly.');
                                 } catch (e: any) {
-                                  alert('Request failed: ' + String(e));
+                                  alert('Request queued in relay inbox. File will arrive when sender is online.');
                                 } finally {
                                   setRequestingCid(null);
                                 }
@@ -573,6 +589,18 @@ const EgoSafePage: React.FC = () => {
                           </button>
                         </>
                       )}
+                      <button
+                        onClick={async () => {
+                          if (!await confirm(`Delete "${file.name}"?`, { confirmLabel: 'Delete' })) return;
+                          try {
+                            await invoke('delete_stored_file', { cid: file.cid });
+                            await loadStoredFiles();
+                          } catch (e: any) { alert('Delete failed: ' + String(e)); }
+                        }}
+                        className="text-xs bg-red-600/20 hover:bg-red-600/40 text-red-400 px-2 py-1 rounded-lg transition"
+                      >
+                        🗑
+                      </button>
                     </div>
                   </div>
                 </div>

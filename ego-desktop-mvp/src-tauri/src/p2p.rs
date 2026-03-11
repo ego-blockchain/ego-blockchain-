@@ -94,6 +94,7 @@ pub enum P2PMessage {
     },
     FileRequest {
         cid: String,
+        requester_addr: String,
         requester_endpoint: String,
     },
     FileData {
@@ -1048,8 +1049,9 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
             }
         }
 
-        P2PMessage::FileRequest { cid, requester_endpoint } => {
+        P2PMessage::FileRequest { cid, requester_addr, requester_endpoint } => {
             let ledger = crate::ledger::Ledger::load();
+            let my_addr = ledger.address.clone();
             if let Some(file) = ledger.stored_files.iter().find(|f| f.cid == cid).cloned() {
                 if !file.local_path.is_empty() && !file.local_path.starts_with("sender:") {
                     if let Ok(enc_bytes) = std::fs::read(&file.local_path) {
@@ -1062,7 +1064,10 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                         };
                         tokio::spawn(async move {
                             if let Err(e) = send_message(&requester_endpoint, &response).await {
-                                eprintln!("[P2P] FileData send error: {}", e);
+                                eprintln!("[P2P] FileData P2P failed: {} — depositing in relay inbox", e);
+                                crate::commands::messenger::deposit_in_relay_inbox(
+                                    &requester_addr, &my_addr, &response,
+                                ).await;
                             }
                         });
                     }

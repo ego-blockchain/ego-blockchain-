@@ -587,7 +587,7 @@ pub async fn delete_contact(
 }
 
 /// Deposit a P2PMessage in the relay inbox for offline delivery.
-async fn deposit_in_relay_inbox(to_addr: &str, from_addr: &str, msg: &crate::p2p::P2PMessage) {
+pub async fn deposit_in_relay_inbox(to_addr: &str, from_addr: &str, msg: &crate::p2p::P2PMessage) {
     let relay_api = crate::p2p::RELAY_HTTP_API;
     let payload = match serde_json::to_string(msg) {
         Ok(j) => STANDARD.encode(j.as_bytes()),
