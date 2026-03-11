@@ -147,8 +147,9 @@ impl request_response::Codec for EgoCodec {
         'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait,
     {
         Box::pin(async move {
+            // Read ack byte — ignore errors (old peers send nothing)
             let mut buf = [0u8; 1];
-            AsyncReadExt::read_exact(io, &mut buf).await?;
+            let _ = AsyncReadExt::read_exact(io, &mut buf).await;
             Ok(())
         })
     }
@@ -172,21 +173,23 @@ impl request_response::Codec for EgoCodec {
         })
     }
 
-        fn write_response<'life0, 'life1, 'life2, 'async_trait, T>(
-            &'life0 mut self,
-            _: &'life1 Self::Protocol,
-            io: &'life2 mut T,
-            _: Self::Response,
-        ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = io::Result<()>> + ::core::marker::Send + 'async_trait>>
-        where
-            T: futures::io::AsyncWrite + Unpin + Send + 'async_trait,
-            'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait,
-        {
-            Box::pin(async move {
-                AsyncWriteExt::write_all(io, &[0u8]).await?;
-                AsyncWriteExt::flush(io).await
-            })
-        }
+    fn write_response<'life0, 'life1, 'life2, 'async_trait, T>(
+        &'life0 mut self,
+        _: &'life1 Self::Protocol,
+        io: &'life2 mut T,
+        _: Self::Response,
+    ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = io::Result<()>> + ::core::marker::Send + 'async_trait>>
+    where
+        T: futures::io::AsyncWrite + Unpin + Send + 'async_trait,
+        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait,
+    {
+        Box::pin(async move {
+            // Write ack byte — ignore errors (remote may have already closed)
+            let _ = AsyncWriteExt::write_all(io, &[0u8]).await;
+            let _ = AsyncWriteExt::flush(io).await;
+            Ok(())
+        })
+    }
 }
 
 // ── Network behaviour ─────────────────────────────────────────────────────────
@@ -514,7 +517,7 @@ async fn build_swarm(
                     .with_interval(Duration::from_secs(60)),
             ),
             request_response: request_response::Behaviour::new(
-                [(StreamProtocol::new("/ego/msg/1.0.0"), ProtocolSupport::Full)],
+                [(StreamProtocol::new("/ego/msg/1.1.0"), ProtocolSupport::Full)],
                 request_response::Config::default()
                     .with_request_timeout(Duration::from_secs(30)),
             ),
