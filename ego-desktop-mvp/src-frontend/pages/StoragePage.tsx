@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { open } from '@tauri-apps/api/dialog';
 import { useWallet } from '../App';
+import { useConfirm } from '../hooks/useConfirm';
 
 interface StorageMetrics {
   storage_allocated_bytes: number;
@@ -76,6 +77,7 @@ const PROCESS_STAGES: { key: ProcessStage; label: string; detail: string; ms: nu
 const StoragePage: React.FC = () => {
   const { wallet } = useWallet();
   const myAddress = wallet?.address ?? '';
+  const { confirm, ConfirmDialog } = useConfirm();
 
   const [metrics, setMetrics] = useState<StorageMetrics | null>(null);
   const [files, setFiles] = useState<StoredFile[]>([]);
@@ -215,7 +217,7 @@ const StoragePage: React.FC = () => {
   // ── Delete file ───────────────────────────────────────────────────────────
 
   async function handleDelete(cid: string) {
-    if (!confirm('Permanently delete this file and its encryption key? This cannot be undone.')) return;
+    if (!await confirm('Permanently delete this file?', { detail: 'This also removes the encryption key. This cannot be undone.', confirmLabel: 'Delete' })) return;
     try {
       await invoke('delete_stored_file', { cid });
       setFiles(prev => prev.filter(f => f.cid !== cid));
@@ -248,6 +250,7 @@ const StoragePage: React.FC = () => {
 
   return (
     <div className="p-6 space-y-5 max-w-4xl mx-auto">
+      {ConfirmDialog}
 
       {/* ── Storage Provider Configuration ─────────────────────────────── */}
       {!isConfigured ? (

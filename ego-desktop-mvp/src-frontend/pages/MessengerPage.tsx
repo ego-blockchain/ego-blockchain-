@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { listen } from '@tauri-apps/api/event';
 import { writeText } from '@tauri-apps/api/clipboard';
+import { useConfirm } from '../hooks/useConfirm';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -46,6 +47,7 @@ function msgTypeLabel(t: string): string {
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 const MessengerPage: React.FC = () => {
+  const { confirm, ConfirmDialog } = useConfirm();
   // Core state
   const [contacts, setContacts]     = useState<Contact[]>([]);
   const [selected, setSelected]     = useState<Contact | null>(null);
@@ -276,7 +278,7 @@ const MessengerPage: React.FC = () => {
   }
 
   async function handleDeleteContact(addr: string) {
-    if (!window.confirm('Remove this contact?')) return;
+    if (!await confirm('Remove this contact?', { detail: 'All messages with this contact will remain but you will no longer be able to send new ones.', confirmLabel: 'Remove' })) return;
     try {
       await invoke('delete_contact', { contactAddr: addr });
       if (selected?.address === addr) setSelected(null);
@@ -301,6 +303,7 @@ const MessengerPage: React.FC = () => {
 
   return (
     <div className="flex flex-col h-screen bg-gray-900 text-white overflow-hidden">
+      {ConfirmDialog}
 
       {/* ── P2P connectivity banner ── */}
       {p2pStatus?.upnp === 'failed' && (

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 
 interface Location {
@@ -94,6 +94,7 @@ const CoveragePage: React.FC = () => {
   const [coverage,   setCoverage]   = useState<CoverageStatus | null>(null);
   const [events,     setEvents]     = useState<PocEvent[]>([]);
   const [peers,      setPeers]      = useState<PeerInfo[]>([]);
+  const eventLogRef = useRef<HTMLDivElement>(null);
   const [p2pStatus,  setP2pStatus]  = useState<P2pStatus | null>(null);
   const [loading,    setLoading]    = useState(true);
 
@@ -117,6 +118,13 @@ const CoveragePage: React.FC = () => {
     }, 30_000);
     return () => clearInterval(t);
   }, []);
+
+  // Auto-scroll event log to bottom whenever new events arrive
+  useEffect(() => {
+    if (eventLogRef.current) {
+      eventLogRef.current.scrollTop = eventLogRef.current.scrollHeight;
+    }
+  }, [events]);
 
 
   const quality    = coverage?.network_quality ?? 'Excellent';
@@ -266,7 +274,7 @@ const CoveragePage: React.FC = () => {
           <div className="px-5 py-4 border-b border-gray-700">
             <h3 className="font-semibold">PoC Event Log</h3>
           </div>
-          <div className="divide-y divide-gray-700/50 max-h-96 overflow-y-auto">
+          <div ref={eventLogRef} className="divide-y divide-gray-700/50 max-h-96 overflow-y-auto">
             {events.length === 0 ? (
               <div className="px-5 py-8 text-center text-gray-500 text-sm">
                 {online ? 'First event will appear in ~4 minutes…' : 'No events — coverage is offline'}

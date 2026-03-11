@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { useWallet } from '../App';
+import { useConfirm } from '../hooks/useConfirm';
 
 interface StakingInfo {
   staked_amount:      number;
@@ -15,6 +16,7 @@ interface StakingInfo {
 }
 
 interface Balance { uegoc: number; formatted: string; }
+interface Peer { address: string; name: string; endpoint: string; last_seen: number; }
 
 const APR = 12.5;
 const LOCK_OPTIONS = [
@@ -44,8 +46,10 @@ function daysUntil(ts: number | null): number {
 
 const StakingPage: React.FC = () => {
   const { wallet } = useWallet();
+  const { confirm, ConfirmDialog } = useConfirm();
   const [info, setInfo]           = useState<StakingInfo | null>(null);
   const [balance, setBalance]     = useState<Balance | null>(null);
+  const [peers, setPeers]         = useState<Peer[]>([]);
   const [stakeAmount, setStakeAmount] = useState('');
   const [lockDays, setLockDays]   = useState(30);
   const [mode, setMode]           = useState<'stake' | 'unstake'>('stake');
@@ -54,12 +58,14 @@ const StakingPage: React.FC = () => {
 
   const load = useCallback(async () => {
     try {
-      const [i, b] = await Promise.all([
+      const [i, b, ps] = await Promise.all([
         invoke<StakingInfo>('get_staking_info'),
         invoke<Balance>('get_balance'),
+        invoke<Peer[]>('get_network_peers'),
       ]);
       setInfo(i);
       setBalance(b);
+      setPeers(ps);
     } catch {}
   }, []);
 
@@ -90,7 +96,7 @@ const StakingPage: React.FC = () => {
   async function handleUnstake(earlyUnstake: boolean = false) {
     if (earlyUnstake) {
       const fee = info ? (info.early_unstake_fee / 1_000_000).toFixed(4) : '0';
-      if (!window.confirm(`Early unstake will deduct ${fee} EGOC (10% fee). Proceed?`)) return;
+      if (!await confirm(`Early unstake will deduct ${fee} EGOC as a 10% fee.`, { detail: 'This fee goes to network nodes. Are you sure you want to proceed?', confirmLabel: 'Unstake Early' })) return;
     }
     setSubmitting(true);
     setResult(null);
@@ -114,6 +120,7 @@ const StakingPage: React.FC = () => {
 
   return (
     <div className="p-6 space-y-5 max-w-4xl mx-auto">
+      {ConfirmDialog}
       {/* Summary cards */}
       <div className="grid grid-cols-5 gap-3">
         {[
@@ -335,25 +342,30 @@ const StakingPage: React.FC = () => {
           </div>
 
           <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
-            <h3 className="font-semibold mb-4">Validator Delegation</h3>
-            <div className="space-y-3">
-              {[
-                { name: 'EgoNode-Alpha', stake: '142k', apy: '13.2%' },
-                { name: 'EgoNode-Beta',  stake: '98k',  apy: '12.8%' },
-                { name: 'QuarkNode',     stake: '67k',  apy: '11.9%' },
-              ].map(v => (
-                <div key={v.name} className="flex items-center justify-between bg-gray-900 rounded-xl p-3 text-sm">
-                  <div>
-                    <div className="font-medium">{v.name}</div>
-                    <div className="text-xs text-gray-400">Stake: {v.stake} EGOC</div>
-                  </div>
-                  <div className="text-right">
-                    <div className="text-green-400 font-bold">{v.apy}</div>
-                    <div className="text-xs text-green-500">● Active</div>
-                  </div>
-                </div>
-              ))}
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="font-semibold">Active Network Nodes</h3>
+              <span className="text-xs text-gray-400">{peers.length} online</span>
             </div>
+            {peers.length === 0 ? (
+              <div className="text-center py-6 text-gray-500 text-sm">
+                <div className="text-2xl mb-2">📡</div>
+                No peers online right now
+              </div>
+            ) : (
+              <div className="space-y-2 max-h-48 overflow-y-auto">
+                {peers.map(p => (
+                  <div key={p.address} className="flex items-center justify-between bg-gray-900 rounded-xl p-3 text-sm">
+                    <div className="min-w-0">
+                      <div className="font-medium truncate">{p.name || 'Ego Node'}</div>
+                      <div className="text-xs text-gray-500 font-mono">{p.address.slice(0, 12)}…{p.address.slice(-6)}</div>
+                    </div>
+                    <div className="text-right shrink-0">
+                      <div className="text-xs text-green-500 font-medium">● Active</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       </div>

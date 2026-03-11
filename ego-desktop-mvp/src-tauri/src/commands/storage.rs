@@ -400,12 +400,22 @@ pub async fn request_file_from_contact(
         .ok_or_else(|| EgoDesktopError::NotFound("Contact not found".into()))?;
     let endpoint = crate::p2p::get_relay_endpoint(&from_addr).await
         .unwrap_or_else(|| contact.endpoint.clone());
-    if endpoint.is_empty() {
-        return Err(EgoDesktopError::InvalidInput("Contact has no known endpoint".into()));
-    }
+    let my_ledger  = crate::ledger::Ledger::load();
+    let my_addr    = my_ledger.address.clone();
     let my_endpoint = crate::p2p::get_public_endpoint().await;
-    let msg = crate::p2p::P2PMessage::FileRequest { cid, requester_endpoint: my_endpoint };
-    crate::p2p::send_message(&endpoint, &msg).await
-        .map_err(|e| EgoDesktopError::InvalidInput(format!("P2P send: {e}")))?;
+    let msg = crate::p2p::P2PMessage::FileRequest {
+        cid,
+        requester_addr:     my_addr.clone(),
+        requester_endpoint: my_endpoint,
+    };
+    if endpoint.is_empty() {
+        // Sender has no live endpoint — queue in relay inbox, they'll process it on next startup.
+        crate::commands::messenger::deposit_in_relay_inbox(&from_addr, &my_addr, &msg).await;
+        return Ok(());
+    }
+    if let Err(e) = crate::p2p::send_message(&endpoint, &msg).await {
+        eprintln!("[FileRequest] P2P failed: {} — depositing in relay inbox for {}", e, from_addr);
+        crate::commands::messenger::deposit_in_relay_inbox(&from_addr, &my_addr, &msg).await;
+    }
     Ok(())
 }
