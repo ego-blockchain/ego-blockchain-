@@ -515,7 +515,7 @@ pub async fn send_message(
     let mut msgs = load_messages();
     msgs.push(Message {
         id:           format!("{}-{}", ts, &nonce_hex[..8]),
-        from:         my_addr,
+        from:         my_addr.clone(),
         to:           contact_addr.clone(),
         content,
         message_type,
