@@ -576,6 +576,13 @@ pub async fn clear_messages() -> Result<(), EgoDesktopError> {
 }
 
 #[tauri::command]
+pub async fn delete_message(message_id: String) -> Result<(), EgoDesktopError> {
+    let mut msgs = load_messages();
+    msgs.retain(|m| m.id != message_id);
+    save_messages(&msgs).map_err(EgoDesktopError::FileSystemError)
+}
+
+#[tauri::command]
 pub async fn delete_contact(
     _state: State<'_, AppState>,
     contact_addr: String,

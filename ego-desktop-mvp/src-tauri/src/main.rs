@@ -167,6 +167,7 @@ fn main() {
             commands::messenger::get_messages,
             commands::messenger::delete_contact,
             commands::messenger::clear_messages,
+            commands::messenger::delete_message,
         ])
         .setup(|app| {
             // Show the window only after the frontend signals it's ready,

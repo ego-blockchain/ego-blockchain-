@@ -61,6 +61,13 @@ function buildShareBundle(file: StoredFile, ownerAddress: string): string {
   return `egoshare1:${file.cid}:${file.key_nonce_hex}:${name64}:${ownerAddress}`;
 }
 
+const VIDEO_EXTS = ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.m4v', '.flv', '.wmv', '.ts', '.mpg', '.mpeg'];
+
+function isVideoFile(name: string): boolean {
+  const lower = name.toLowerCase();
+  return VIDEO_EXTS.some(ext => lower.endsWith(ext));
+}
+
 // ── EgoSafe share-new-file flow ───────────────────────────────────────────────
 
 type ShareStep = 'idle' | 'select' | 'recipients' | 'sharing' | 'done';
@@ -313,6 +320,14 @@ const EgoSafePage: React.FC = () => {
                   <span className="text-xs text-gray-600">Any file type supported</span>
                 </button>
               )}
+              {filePath && isVideoFile(fileName) && (
+                <div className="flex items-start gap-2 bg-blue-500/10 border border-blue-500/30 rounded-xl px-4 py-3">
+                  <span className="text-blue-400 shrink-0 mt-0.5">🎬</span>
+                  <div className="text-xs text-blue-300 leading-relaxed">
+                    <strong>Video file detected.</strong> Large videos are delivered to recipients in chunks over the P2P network — the receiver will download all chunks automatically and reassemble them.
+                  </div>
+                </div>
+              )}
               <button
                 disabled={!filePath}
                 onClick={() => setStep('recipients')}
@@ -544,6 +559,9 @@ const EgoSafePage: React.FC = () => {
                     <div className="min-w-0 flex-1">
                       <div className="text-sm font-medium truncate">{file.name}</div>
                       <div className="font-mono text-xs text-green-400 truncate mt-0.5">{file.cid.slice(0, 20)}…</div>
+                      {isVideoFile(file.name) && (
+                        <div className="text-xs text-blue-400 mt-0.5">🎬 Video — delivered in chunks</div>
+                      )}
                     </div>
                     <div className="shrink-0 flex items-center gap-1.5">
                       {isPending ? (
