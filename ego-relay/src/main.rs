@@ -1140,8 +1140,8 @@ async fn post_pin_reset_confirm(
         u.pin_reset_token.as_deref() == Some(&req.token)
             && u.pin_reset_expiry.map(|e| e > now).unwrap_or(false)
     }) {
-        // Mark as confirmed so the app can detect it and set the PIN locally
-        user.pin_reset_token  = Some(format!("confirmed:{}", req.token));
+        // Store new PIN alongside confirmed marker so app can retrieve and apply it
+        user.pin_reset_token  = Some(format!("confirmed:{}:{}", req.token, req.new_pin_hash));
         user.pin_reset_expiry = Some(now + 300);
         save_users(&users);
         (StatusCode::OK, Json(ApiResponse { success: true, message: "PIN reset confirmed.".into() }))
@@ -1155,22 +1155,29 @@ async fn get_pin_reset_status(
     State(s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let users = s.users.read().unwrap();
-    let confirmed = users.iter().find(|u| u.address == address)
-        .map(|u| u.pin_reset_token.as_deref()
-            .map(|t| t.starts_with("confirmed:"))
-            .unwrap_or(false))
-        .unwrap_or(false);
+    let token_val = users.iter().find(|u| u.address == address)
+        .and_then(|u| u.pin_reset_token.clone());
     drop(users);
-    if confirmed {
-        // Clear the token so it can only be used once
-        let mut users = s.users.write().unwrap();
-        if let Some(u) = users.iter_mut().find(|u| u.address == address) {
-            u.pin_reset_token  = None;
-            u.pin_reset_expiry = None;
-            save_users(&users);
+
+    if let Some(ref t) = token_val {
+        if t.starts_with("confirmed:") {
+            // Extract new PIN: format is "confirmed:{token}:{pin}"
+            let parts: Vec<&str> = t.splitn(3, ':').collect();
+            let new_pin = if parts.len() == 3 { parts[2].to_string() } else { String::new() };
+            // Clear token so it can only be used once
+            let mut users = s.users.write().unwrap();
+            if let Some(u) = users.iter_mut().find(|u| u.address == address) {
+                u.pin_reset_token  = None;
+                u.pin_reset_expiry = None;
+                save_users(&users);
+            }
+            return (StatusCode::OK, Json(serde_json::json!({
+                "confirmed": true,
+                "new_pin": new_pin
+            })));
         }
     }
-    (StatusCode::OK, Json(serde_json::json!({ "confirmed": confirmed })))
+    (StatusCode::OK, Json(serde_json::json!({ "confirmed": false })))
 }
 
 fn load_or_create_identity() -> libp2p::identity::Keypair {
