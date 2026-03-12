@@ -1186,6 +1186,10 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                 }
             }
         }
+
+        P2PMessage::FileChunkComplete { .. } => {
+            // Unused — assembly happens in the FileChunk handler on last chunk.
+        }
     }
 }
 

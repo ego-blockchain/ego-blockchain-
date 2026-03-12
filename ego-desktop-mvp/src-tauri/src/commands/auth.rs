@@ -46,9 +46,8 @@ pub struct PinStatus {
 }
 
 #[tauri::command]
-pub async fn get_pin_status(state: tauri::State<'_, crate::app::AppState>) -> Result<PinStatus, String> {
-    let wallet_dir = state.wallet_dir.lock().await;
-    let pin_path   = wallet_dir.join("security_pin.bin");
+pub async fn get_pin_status(_state: tauri::State<'_, crate::app::AppState>) -> Result<PinStatus, String> {
+    let pin_path = wallet_dir().join("security_pin.bin");
     Ok(PinStatus { has_pin: pin_path.exists() })
 }
 

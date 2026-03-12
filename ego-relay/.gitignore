@@ -1,0 +1,6 @@
+/target
+.env
+*.bin
+chain.json
+peers.json
+users.json
