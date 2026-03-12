@@ -40,6 +40,18 @@ pub struct ImportKeypairRequest {
     pub recovery_phrase: Vec<String>,
 }
 
+#[derive(serde::Serialize)]
+pub struct PinStatus {
+    pub has_pin: bool,
+}
+
+#[tauri::command]
+pub async fn get_pin_status(state: tauri::State<'_, crate::app::AppState>) -> Result<PinStatus, String> {
+    let wallet_dir = state.wallet_dir.lock().await;
+    let pin_path   = wallet_dir.join("security_pin.bin");
+    Ok(PinStatus { has_pin: pin_path.exists() })
+}
+
 /// All CPU-heavy / blocking work isolated here so callers can run it in
 /// `tokio::task::spawn_blocking`, keeping the async executor free and ensuring
 /// any panic is caught and returned as an error (not a silent hang).

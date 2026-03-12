@@ -128,6 +128,7 @@ fn main() {
             commands::auth::set_security_pin,
             commands::auth::verify_pin,
             commands::auth::get_recovery_info,
+            commands::auth::get_pin_status,
             commands::wallet::get_balance,
             commands::wallet::send_transaction,
             commands::wallet::get_transaction_history,
