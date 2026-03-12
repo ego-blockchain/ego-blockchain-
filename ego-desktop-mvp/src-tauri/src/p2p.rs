@@ -916,9 +916,11 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
             let _ = app.emit_all("ego://contact-request", &contact);
         }
 
-            P2PMessage::FileChunk { .. } => {
-                eprintln!("[P2P] FileChunk ignored — chunking disabled");
-            }
+        P2PMessage::FileChunk { .. } => {
+            eprintln!("[P2P] FileChunk ignored — chunking disabled");
+        }
+
+        P2PMessage::FileChunkComplete { .. } => {}
 
         P2PMessage::ContactResponse {
             from_addr, from_name, from_ed25519, from_kyber, approved, shared_key,
