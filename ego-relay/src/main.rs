@@ -20,10 +20,11 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderValue, Method, StatusCode},
     routing::{get, post},
     Json, Router,
 };
+use tower_http::cors::{Any, CorsLayer};
 use futures::StreamExt;
 use lettre::{
     message::header::ContentType,
@@ -517,33 +518,44 @@ async fn post_reset_pin(
     State(s): State<AppState>,
     Json(req): Json<ResetPinRequest>,
 ) -> (StatusCode, Json<ApiResponse>) {
-    let mut users = s.users.write().unwrap();
-    if let Some(user) = users.iter_mut().find(|u| u.address == req.address) {
-        if !user.email_verified {
-            return (StatusCode::BAD_REQUEST, Json(ApiResponse {
-                success: false, message: "Email not verified".into(),
-            }));
+    let result = {
+        let mut users = s.users.write().unwrap();
+        if let Some(user) = users.iter_mut().find(|u| u.address == req.address) {
+            if !user.email_verified {
+                return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+                    success: false, message: "Email not verified".into(),
+                }));
+            }
+            let token  = Uuid::new_v4().to_string();
+            let expiry = chrono::Utc::now().timestamp() + 3600;
+            let email  = user.email.clone();
+            let name   = user.name.clone();
+            user.pin_reset_token  = Some(token.clone());
+            user.pin_reset_expiry = Some(expiry);
+            save_users(&users);
+            Some((email, name, token))
+        } else {
+            None
         }
-        let token  = Uuid::new_v4().to_string();
-        let expiry = chrono::Utc::now().timestamp() + 3600;
-        let email  = user.email.clone();
-        let name   = user.name.clone();
-        user.pin_reset_token  = Some(token.clone());
-        user.pin_reset_expiry = Some(expiry);
-        save_users(&users);
-        drop(users);
-        let reset_url = format!("{}/users/pin-reset/{}", s.config.base_url, token);
-        let body = email_html("Reset Your PIN", &format!(
-            r#"<p>Hi <strong>{name}</strong>,</p>
-            <p>Click below to reset your Ego Blockchain security PIN. This link expires in 1 hour.</p>
-            <p style="text-align:center"><a href="{url}" class="btn">Reset My PIN</a></p>
-            <p style="font-size:13px;color:#94a3b8">If you did not request this, ignore this email.</p>"#,
-            name = name, url = reset_url,
-        ));
-        send_email(&s.mailer, &s.config.smtp_from, &email, "Reset your Ego Blockchain PIN", body).await;
-        return (StatusCode::OK, Json(ApiResponse { success: true, message: "PIN reset email sent.".into() }));
+    }; // lock dropped here
+
+    match result {
+        None => (StatusCode::NOT_FOUND, Json(ApiResponse {
+            success: false, message: "Address not registered".into(),
+        })),
+        Some((email, name, token)) => {
+            let reset_url = format!("{}/users/pin-reset/{}", s.config.base_url, token);
+            let body = email_html("Reset Your PIN", &format!(
+                r#"<p>Hi <strong>{name}</strong>,</p>
+                <p>Click below to reset your Ego Blockchain security PIN. This link expires in 1 hour.</p>
+                <p style="text-align:center"><a href="{url}" class="btn">Reset My PIN</a></p>
+                <p style="font-size:13px;color:#94a3b8">If you did not request this, ignore this email.</p>"#,
+                name = name, url = reset_url,
+            ));
+            send_email(&s.mailer, &s.config.smtp_from, &email, "Reset your Ego Blockchain PIN", body).await;
+            (StatusCode::OK, Json(ApiResponse { success: true, message: "PIN reset email sent.".into() }))
+        }
     }
-    (StatusCode::NOT_FOUND, Json(ApiResponse { success: false, message: "Address not registered".into() }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -780,7 +792,13 @@ async fn main() {
             .route("/tx/confirm/:token",    get(get_confirm_tx))
             .route("/tx/cancel/:token",     get(get_cancel_tx))
             .route("/tx/status/:token",     get(get_tx_status))
-            .with_state(state_clone);
+            .with_state(state_clone)
+            .layer(
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods([Method::GET, Method::POST])
+                    .allow_headers(Any),
+            );
 
         let listener = tokio::net::TcpListener::bind(&http_addr).await
             .expect("HTTP bind failed");
