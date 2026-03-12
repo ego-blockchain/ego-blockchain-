@@ -129,6 +129,7 @@ fn main() {
             commands::auth::verify_pin,
             commands::auth::get_recovery_info,
             commands::auth::get_pin_status,
+            commands::auth::verify_biometric,
             commands::wallet::get_balance,
             commands::wallet::send_transaction,
             commands::wallet::prepare_transaction,
@@ -169,6 +170,7 @@ fn main() {
             commands::messenger::receive_message,
             commands::messenger::get_messages,
             commands::messenger::delete_contact,
+            commands::messenger::rename_contact,
             commands::messenger::clear_messages,
             commands::messenger::delete_message,
         ])

@@ -593,6 +593,22 @@ pub async fn delete_contact(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn rename_contact(
+    contact_addr: String,
+    new_name: String,
+) -> Result<(), EgoDesktopError> {
+    let new_name = new_name.trim().to_string();
+    if new_name.is_empty() {
+        return Err(EgoDesktopError::InvalidInput("Name cannot be empty".into()));
+    }
+    let mut contacts = load_contacts();
+    let contact = contacts.iter_mut().find(|c| c.address == contact_addr)
+        .ok_or_else(|| EgoDesktopError::NotFound("Contact not found".into()))?;
+    contact.name = new_name;
+    save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)
+}
+
 /// Deposit a P2PMessage in the relay inbox for offline delivery.
 pub async fn deposit_in_relay_inbox(to_addr: &str, from_addr: &str, msg: &crate::p2p::P2PMessage) {
     let relay_api = crate::p2p::RELAY_HTTP_API;

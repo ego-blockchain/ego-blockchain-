@@ -27,10 +27,10 @@ use tokio::sync::{mpsc, oneshot};
 pub const P2P_PORT: u16 = 47393;
 
 pub const RELAY_NODES: &[&str] = &[
-    "/ip4/40.233.82.42/tcp/4001/p2p/12D3KooWPj6m7jzmVyMh1zWrsoux3YiVs9j2HwsjrFXzDcqAGGz4",
+    "/dns4/EgoRelay.egoblockchain.com/tcp/4001/p2p/12D3KooWPj6m7jzmVyMh1zWrsoux3YiVs9j2HwsjrFXzDcqAGGz4",
 ];
 
-pub const RELAY_HTTP_API: &str = "http://40.233.82.42:8080";
+pub const RELAY_HTTP_API: &str = "http://EgoRelay.egoblockchain.com:8080";
 // ─────────────────────────────────────────────────────────────────────────────
 // SINGLE SOURCE OF TRUTH FOR RELAY CIRCUIT STATE
 //
