@@ -152,6 +152,8 @@ fn main() {
             commands::earnings::get_earnings_data,
             commands::staking::get_staking_info,
             commands::staking::stake_coins,
+            commands::auth::get_app_settings,
+            commands::auth::save_app_settings,
             commands::staking::unstake_coins,
             commands::explorer::get_network_stats,
             commands::explorer::get_p2p_status,
