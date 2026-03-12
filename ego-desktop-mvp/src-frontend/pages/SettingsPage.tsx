@@ -5,7 +5,7 @@ import { fetch as tauriFetch, Body } from '@tauri-apps/api/http';
 import { useWallet } from '../App';
 import qrcode from 'qrcode-generator';
 
-const RELAY = 'http://40.233.82.42:8080';
+import { RELAY_HTTP as RELAY } from '../config';
 
 function makeQR(text: string): string {
   if (!text) return '';
@@ -38,12 +38,20 @@ const SettingsPage: React.FC = () => {
   const [pinConfirm, setPinConfirm]           = useState('');
   const [pinMsg, setPinMsg]                   = useState('');
   const [settingPin, setSettingPin]           = useState(false);
+  const [biometricLoading, setBiometricLoading] = useState(false);
 
   // PIN reset via email
   const [resetSent, setResetSent]             = useState(false);
   const [resetLoading, setResetLoading]       = useState(false);
   const [resetMsg, setResetMsg]               = useState('');
   const [maskedEmail, setMaskedEmail]         = useState('');
+
+  // Change email
+  const [showChangeEmail, setShowChangeEmail] = useState(false);
+  const [newEmail, setNewEmail]               = useState('');
+  const [changeEmailMsg, setChangeEmailMsg]   = useState('');
+  const [changingEmail, setChangingEmail]     = useState(false);
+  const [changeEmailSent, setChangeEmailSent] = useState(false);
 
   // Recovery info (PIN-gated)
   const [showRecovery, setShowRecovery]       = useState(false);
@@ -108,6 +116,27 @@ const SettingsPage: React.FC = () => {
       setResetMsg('Network error. Please try again.');
     } finally {
       setResetLoading(false);
+    }
+  }
+
+  async function handleChangeEmail() {
+    if (!wallet?.address || !newEmail.trim()) return;
+    setChangingEmail(true); setChangeEmailMsg('');
+    try {
+      const res = await tauriFetch<{ success: boolean; message: string }>(
+        `${RELAY}/users/change-email`,
+        { method: 'POST', body: Body.json({ address: wallet.address, new_email: newEmail.trim() }) }
+      );
+      if (res.data.success) {
+        setChangeEmailSent(true);
+        setChangeEmailMsg(`Verification link sent to ${newEmail.trim()}. Click it to confirm the change.`);
+      } else {
+        setChangeEmailMsg('Error: ' + res.data.message);
+      }
+    } catch {
+      setChangeEmailMsg('Network error. Please try again.');
+    } finally {
+      setChangingEmail(false);
     }
   }
 
@@ -177,12 +206,37 @@ const SettingsPage: React.FC = () => {
               </div>
             </div>
             <button
-              onClick={() => { setShowSetPin(true); setPinInput(''); setPinConfirm(''); setPinMsg(''); setResetSent(false); setResetMsg(''); }}
-              className="text-xs bg-yellow-600/20 hover:bg-yellow-600/40 text-yellow-400 px-3 py-1.5 rounded-lg transition"
+              disabled={biometricLoading}
+              onClick={async () => {
+                setBiometricLoading(true);
+                try {
+                  const ok = await invoke<boolean>('verify_biometric', {
+                    reason: hasPin ? 'Authorize PIN change' : 'Authorize PIN setup',
+                  });
+                  if (ok) {
+                    setPinInput(''); setPinConfirm(''); setPinMsg('');
+                    setResetSent(false); setResetMsg('');
+                    setShowSetPin(true);
+                  } else {
+                    setPinMsg('Biometric verification failed. Please try again.');
+                  }
+                } catch {
+                  // Biometric unavailable — open modal directly
+                  setPinInput(''); setPinConfirm(''); setPinMsg('');
+                  setResetSent(false); setResetMsg('');
+                  setShowSetPin(true);
+                } finally {
+                  setBiometricLoading(false);
+                }
+              }}
+              className="text-xs bg-yellow-600/20 hover:bg-yellow-600/40 disabled:opacity-50 text-yellow-400 px-3 py-1.5 rounded-lg transition"
             >
-              {hasPin ? 'Change PIN' : 'Set PIN'}
+              {biometricLoading ? '🔐 Verifying…' : hasPin ? 'Change PIN' : 'Set PIN'}
             </button>
           </div>
+          {pinMsg && !showSetPin && (
+            <div className="mt-2 text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{pinMsg}</div>
+          )}
           {maskedEmail && (
             <div className="mt-2 text-xs text-gray-500">
               🔑 Account email: <span className="text-gray-400">{maskedEmail}</span>
@@ -202,6 +256,22 @@ const SettingsPage: React.FC = () => {
               {resetMsg}
             </div>
           )}
+        </div>
+
+        {/* Change email */}
+        <div className="px-5 py-4 border-b border-gray-700/50 flex items-center justify-between">
+          <div>
+            <div className="text-sm font-medium">Account Email</div>
+            <div className="text-xs text-gray-400">
+              {maskedEmail ? `Current: ${maskedEmail}` : 'No email linked'}
+            </div>
+          </div>
+          <button
+            onClick={() => { setShowChangeEmail(true); setNewEmail(''); setChangeEmailMsg(''); setChangeEmailSent(false); }}
+            className="text-xs bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 px-3 py-1.5 rounded-lg transition"
+          >
+            Change Email
+          </button>
         </div>
 
         {/* View recovery keys */}
@@ -398,6 +468,57 @@ const SettingsPage: React.FC = () => {
                   className="w-full bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition"
                 >
                   Close
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── Change Email Modal ─────────────────────────────────────────────── */}
+      {showChangeEmail && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
+          <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-sm border border-gray-700 shadow-2xl">
+            <div className="flex justify-between items-center mb-5">
+              <h3 className="text-lg font-bold">Change Email Address</h3>
+              <button onClick={() => setShowChangeEmail(false)} className="text-gray-400 hover:text-white text-xl">✕</button>
+            </div>
+            {changeEmailSent ? (
+              <div className="space-y-4">
+                <div className="bg-green-500/10 border border-green-500/30 rounded-xl p-4 text-sm text-green-300">
+                  ✅ {changeEmailMsg}
+                </div>
+                <p className="text-xs text-gray-400">Once you click the link in the email, your address will be updated automatically.</p>
+                <button
+                  onClick={() => setShowChangeEmail(false)}
+                  className="w-full bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition"
+                >
+                  Close
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <p className="text-sm text-gray-400">Enter your new email. A verification link will be sent to it — your address only changes after you click the link.</p>
+                {maskedEmail && (
+                  <div className="text-xs text-gray-500">Current: <span className="text-gray-400">{maskedEmail}</span></div>
+                )}
+                <input
+                  type="email"
+                  value={newEmail}
+                  onChange={e => setNewEmail(e.target.value)}
+                  placeholder="New email address"
+                  className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition"
+                  onKeyDown={e => e.key === 'Enter' && handleChangeEmail()}
+                />
+                {changeEmailMsg && (
+                  <div className="text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{changeEmailMsg}</div>
+                )}
+                <button
+                  onClick={handleChangeEmail}
+                  disabled={changingEmail || !newEmail.trim()}
+                  className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
+                >
+                  {changingEmail ? 'Sending…' : 'Send Verification Email'}
                 </button>
               </div>
             )}

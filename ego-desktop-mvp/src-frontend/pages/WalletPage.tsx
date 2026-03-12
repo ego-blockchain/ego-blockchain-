@@ -5,7 +5,7 @@ import { fetch as tauriFetch, Body } from '@tauri-apps/api/http';
 import { useWallet } from '../App';
 import qrcode from 'qrcode-generator';
 
-const RELAY = 'http://40.233.82.42:8080';
+import { RELAY_HTTP as RELAY } from '../config';
 
 function makeQR(text: string): string {
   if (!text) return '';

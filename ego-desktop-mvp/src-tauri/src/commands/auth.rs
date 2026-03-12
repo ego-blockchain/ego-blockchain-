@@ -51,6 +51,88 @@ pub async fn get_pin_status(_state: tauri::State<'_, crate::app::AppState>) -> R
     Ok(PinStatus { has_pin: pin_path.exists() })
 }
 
+// ── Platform-specific biometric helpers ──────────────────────────────────────
+
+#[cfg(target_os = "windows")]
+fn biometric_platform(reason: &str) -> Result<bool, String> {
+    // Use PowerShell UserConsentVerifier (Windows Hello — PIN, face, fingerprint)
+    let script = format!(
+        r#"
+try {{
+  $ucv = [Windows.Security.Credentials.UI.UserConsentVerifier,Windows.Security.Credentials.UI,ContentType=WindowsRuntime]
+  $asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() |
+    Where-Object {{ $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.IsGenericMethodDefinition }}) |
+    Select-Object -First 1
+  $chk = $asTask.MakeGenericMethod(
+    [Windows.Security.Credentials.UI.UserConsentVerifierAvailability]
+  ).Invoke($null, @($ucv.GetMethod('CheckAvailabilityAsync').Invoke($null, @())))
+  if ($chk.Result -ne 'Available') {{ exit 2 }}
+  $verify = $asTask.MakeGenericMethod(
+    [Windows.Security.Credentials.UI.UserConsentVerificationResult]
+  ).Invoke($null, @($ucv.GetMethod('RequestVerificationAsync').Invoke($null, @('{reason}'))))
+  if ($verify.Result -eq 'Verified') {{ exit 0 }} else {{ exit 1 }}
+}} catch {{ exit 1 }}
+"#,
+        reason = reason.replace('\'', "''")
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
+        .output()
+        .map_err(|e| format!("PowerShell error: {e}"))?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(2) => Ok(true), // Windows Hello not available — allow through
+        _ => Ok(false),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn biometric_platform(reason: &str) -> Result<bool, String> {
+    // Write a temp Swift script that calls LAContext (Touch ID / Face ID / password fallback)
+    let swift_code = format!(
+        r#"import LocalAuthentication
+import Foundation
+let sem = DispatchSemaphore(value: 0)
+let ctx = LAContext()
+var err: NSError?
+let policy: LAPolicy = ctx.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &err)
+    ? .deviceOwnerAuthenticationWithBiometrics
+    : .deviceOwnerAuthentication
+ctx.evaluatePolicy(policy, localizedReason: "{reason}") {{ ok, _ in
+    exit(ok ? 0 : 1)
+}}
+sem.wait()
+"#,
+        reason = reason.replace('"', "\\\"")
+    );
+    let tmp = std::env::temp_dir().join("ego_biometric_check.swift");
+    std::fs::write(&tmp, &swift_code).map_err(|e| format!("Write swift file: {e}"))?;
+    let out = std::process::Command::new("swift")
+        .arg(&tmp)
+        .output()
+        .map_err(|e| format!("Swift error: {e}"));
+    let _ = std::fs::remove_file(&tmp);
+    match out {
+        Ok(o) => Ok(o.status.success()),
+        Err(_) => Ok(true), // swift not available — allow through
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn biometric_platform(_reason: &str) -> Result<bool, String> {
+    Ok(true) // Not supported on Linux — allow through
+}
+
+/// Show the platform's biometric / device-credential prompt.
+/// Returns `true` if the user was verified (or if the platform doesn't support it).
+/// Returns `false` if the user cancelled / failed.
+#[tauri::command]
+pub async fn verify_biometric(reason: String) -> Result<bool, String> {
+    tokio::task::spawn_blocking(move || biometric_platform(&reason))
+        .await
+        .map_err(|e| format!("Task error: {e}"))?
+}
+
 /// All CPU-heavy / blocking work isolated here so callers can run it in
 /// `tokio::task::spawn_blocking`, keeping the async executor free and ensuring
 /// any panic is caught and returned as an error (not a silent hang).

@@ -1,8 +1,7 @@
 import React, { useState } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { fetch as tauriFetch, Body } from '@tauri-apps/api/http';
-
-const RELAY = 'http://40.233.82.42:8080';
+import { RELAY_HTTP as RELAY } from '../config';
 
 interface Props {
   address: string;

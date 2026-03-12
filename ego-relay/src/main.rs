@@ -182,6 +182,10 @@ struct UserRecord {
     pin_reset_token:  Option<String>,
     pin_reset_expiry: Option<i64>,
     registered_at:    i64,
+    #[serde(default)]
+    pending_email:       Option<String>,
+    #[serde(default)]
+    email_change_token:  Option<String>,
 }
 
 fn load_users() -> Vec<UserRecord> {
@@ -501,6 +505,85 @@ async fn get_user(
 }
 
 #[derive(Debug, Deserialize)]
+struct ChangeEmailRequest { address: String, new_email: String }
+
+async fn post_change_email(
+    State(s): State<AppState>,
+    Json(req): Json<ChangeEmailRequest>,
+) -> (StatusCode, Json<ApiResponse>) {
+    let new_email = req.new_email.trim().to_lowercase();
+    if !new_email.contains('@') {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            success: false, message: "Invalid email address".into(),
+        }));
+    }
+
+    let token = uuid::Uuid::new_v4().to_string();
+    let base_url = s.config.base_url.clone();
+    let (mailer_clone, from_clone, name_clone) = {
+        let mut users = s.users.write().unwrap();
+        let user = match users.iter_mut().find(|u| u.address == req.address) {
+            Some(u) => u,
+            None => return (StatusCode::NOT_FOUND, Json(ApiResponse {
+                success: false, message: "Address not registered".into(),
+            })),
+        };
+        if !user.email_verified {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+                success: false, message: "Current email is not verified".into(),
+            }));
+        }
+        if user.email == new_email {
+            return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+                success: false, message: "New email is the same as current email".into(),
+            }));
+        }
+        user.pending_email      = Some(new_email.clone());
+        user.email_change_token = Some(token.clone());
+        save_users(&users);
+        (s.mailer.clone(), s.config.smtp_from.clone(), user.name.clone())
+    };
+
+    let verify_url = format!("{}/users/verify-email-change/{}", base_url, token);
+    let body = format!(
+        "Hi {name},\n\nClick the link below to confirm your new email address for Ego Desktop:\n\n{url}\n\nIf you did not request this change, ignore this email — your current address stays active.\n\nEgo Blockchain Team",
+        name = name_clone, url = verify_url
+    );
+    let _ = send_email(&mailer_clone, &from_clone, &new_email, "Confirm your new Ego email", &body).await;
+
+    (StatusCode::OK, Json(ApiResponse { success: true, message: "Verification email sent to new address.".into() }))
+}
+
+async fn get_verify_email_change(
+    Path(token): Path<String>,
+    State(s): State<AppState>,
+) -> (StatusCode, axum::response::Html<String>) {
+    let mut users = s.users.write().unwrap();
+    if let Some(user) = users.iter_mut().find(|u| u.email_change_token.as_deref() == Some(&token)) {
+        if let Some(new_email) = user.pending_email.take() {
+            user.email              = new_email;
+            user.email_change_token = None;
+            save_users(&users);
+            return (StatusCode::OK, axum::response::Html(r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Email Updated</title>
+<style>body{font-family:sans-serif;background:#0f172a;color:#e2e8f0;display:flex;
+align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{background:#1e293b;border-radius:16px;padding:48px;text-align:center;
+max-width:400px;border:1px solid #334155}
+.icon{font-size:64px;margin-bottom:16px}h1{color:#34d399;margin:0 0 12px}
+p{color:#94a3b8}a{color:#3b82f6}</style></head>
+<body><div class="card"><div class="icon">✅</div>
+<h1>Email Updated!</h1>
+<p>Your Ego Desktop email address has been changed successfully.</p>
+<p style="margin-top:24px"><a href="https://egoblockchain.com">egoblockchain.com</a></p>
+</div></body></html>"#.into()));
+        }
+    }
+    (StatusCode::BAD_REQUEST,
+     axum::response::Html("<h1>Invalid or expired email change link.</h1>".into()))
+}
+
+#[derive(Debug, Deserialize)]
 struct ResetPinRequest { address: String }
 
 async fn post_reset_pin(
@@ -773,10 +856,12 @@ async fn main() {
             .route("/inbox/:address",       get(get_inbox).post(post_inbox))
             .route("/health",               get(health))
             // ── new endpoints ──
-            .route("/users/register",       post(post_register))
-            .route("/users/verify/:token",  get(get_verify))
-            .route("/users/reset-pin",      post(post_reset_pin))
-            .route("/users/:address",       get(get_user))
+            .route("/users/register",                  post(post_register))
+            .route("/users/verify/:token",             get(get_verify))
+            .route("/users/verify-email-change/:token",get(get_verify_email_change))
+            .route("/users/change-email",              post(post_change_email))
+            .route("/users/reset-pin",                 post(post_reset_pin))
+            .route("/users/:address",                  get(get_user))
             .route("/tx/pending",           post(post_pending_tx))
             .route("/tx/confirm/:token",    get(get_confirm_tx))
             .route("/tx/cancel/:token",     get(get_cancel_tx))

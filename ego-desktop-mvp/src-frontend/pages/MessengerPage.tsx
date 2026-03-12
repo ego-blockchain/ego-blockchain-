@@ -82,6 +82,11 @@ const MessengerPage: React.FC = () => {
   const msgEndRef = useRef<HTMLDivElement>(null);
   const [importedIds, setImportedIds] = useState<Set<string>>(new Set());
 
+  // Inline rename state
+  const [editingName, setEditingName] = useState(false);
+  const [nameInput, setNameInput]     = useState('');
+  const nameInputRef = useRef<HTMLInputElement>(null);
+
   // P2P connectivity status
   interface P2pStatus { upnp: string; upnp_error: string | null; public_endpoint: string; p2p_port: number; }
   const [p2pStatus, setP2pStatus] = useState<P2pStatus | null>(null);
@@ -286,6 +291,17 @@ const MessengerPage: React.FC = () => {
     } catch (e) { console.error(e); }
   }
 
+  async function handleRenameContact(addr: string, newName: string) {
+    const trimmed = newName.trim();
+    if (!trimmed) { setEditingName(false); return; }
+    try {
+      await invoke('rename_contact', { contactAddr: addr, newName: trimmed });
+      await loadContacts();
+      setSelected(prev => prev && prev.address === addr ? { ...prev, name: trimmed } : prev);
+    } catch (e) { console.error(e); }
+    setEditingName(false);
+  }
+
   async function handleDeleteMessage(msgId: string) {
     try {
       await invoke('delete_message', { messageId: msgId });
@@ -481,18 +497,49 @@ const MessengerPage: React.FC = () => {
         {selected ? (
           <>
             {/* Chat header */}
-            <div className="px-6 py-3 border-b border-gray-700 flex items-center shrink-0">
+            <div className="px-6 py-3 border-b border-gray-700 flex items-center shrink-0 gap-3">
               <div className="w-9 h-9 rounded-full bg-gradient-to-br from-purple-500 to-pink-600 flex items-center justify-center text-sm font-bold shrink-0">
                 {(selected.name || '?').charAt(0).toUpperCase()}
               </div>
-              <div className="ml-3">
-                <div className="font-semibold text-sm">{selected.name}</div>
+              <div className="flex-1 min-w-0">
+                {editingName ? (
+                  <input
+                    ref={nameInputRef}
+                    value={nameInput}
+                    onChange={e => setNameInput(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') handleRenameContact(selected.address, nameInput);
+                      if (e.key === 'Escape') setEditingName(false);
+                    }}
+                    onBlur={() => handleRenameContact(selected.address, nameInput)}
+                    autoFocus
+                    className="bg-gray-700 border border-blue-500 rounded-lg px-2 py-0.5 text-sm font-semibold w-full outline-none"
+                  />
+                ) : (
+                  <div className="flex items-center gap-1.5 group/name">
+                    <span className="font-semibold text-sm truncate">{selected.name}</span>
+                    <button
+                      onClick={() => { setNameInput(selected.name); setEditingName(true); setTimeout(() => nameInputRef.current?.select(), 0); }}
+                      className="opacity-0 group-hover/name:opacity-100 transition-opacity text-gray-500 hover:text-gray-300 text-xs px-1"
+                      title="Edit name"
+                    >
+                      ✏️
+                    </button>
+                  </div>
+                )}
                 <div className="text-xs text-gray-400 font-mono">{truncAddr(selected.address)}</div>
               </div>
+              <button
+                onClick={() => handleDeleteContact(selected.address)}
+                className="shrink-0 px-3 py-1.5 text-xs text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-lg transition-colors"
+                title="Remove contact"
+              >
+                Remove
+              </button>
             </div>
 
             {/* Messages */}
-            <div className="flex-1 overflow-y-auto px-6 py-4 space-y-2">
+            <div className="flex-1 overflow-y-auto px-6 py-4 space-y-2 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
               {messages.length === 0 && (
                 <div className="text-center text-gray-500 text-sm py-12">
                   <div className="text-3xl mb-2">🔐</div>

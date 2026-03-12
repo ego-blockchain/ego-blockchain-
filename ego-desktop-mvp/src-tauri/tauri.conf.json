@@ -60,7 +60,7 @@
       "http": {
         "all": false,
         "request": true,
-        "scope": ["http://40.233.82.42:8080/**"]
+        "scope": ["http://EgoRelay.egoblockchain.com:8080/**"]
       },
       "process": {
         "all": false,
@@ -114,7 +114,7 @@
       }
     },
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' http://40.233.82.42:8080 ws://40.233.82.42:8080; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:"
+      "csp": "default-src 'self'; connect-src 'self' http://EgoRelay.egoblockchain.com:8080 ws://EgoRelay.egoblockchain.com:8080; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:"
     },
     "updater": {
       "active": false
