@@ -63,21 +63,39 @@ const SettingsPage: React.FC = () => {
 
   const addressQR = useMemo(() => makeQR(wallet?.address ?? ''), [wallet?.address]);
 
-  // Load PIN status and masked email on mount
-// Poll for PIN reset confirmation after email link clicked
+  useEffect(() => {
+    console.log('[Settings] wallet address:', wallet?.address);
+    invoke<{ has_pin: boolean }>('get_pin_status')
+      .then(s => { console.log('[Settings] pin status:', s); setHasPin(s.has_pin); })
+      .catch((e) => console.error('[Settings] pin status error:', e));
+    if (wallet?.address) {
+      tauriFetch<{ email_masked?: string }>(`${RELAY}/users/${wallet.address}`)
+        .then(r => { 
+          console.log('[Settings] user data:', r.data);
+          if (r.data.email_masked) setMaskedEmail(r.data.email_masked); 
+        })
+        .catch((e) => console.error('[Settings] fetch error:', e));
+    }
+  }, [wallet?.address]);
+
 useEffect(() => {
   if (!resetSent || !wallet?.address) return;
   const interval = setInterval(async () => {
     try {
-      const res = await tauriFetch<{ confirmed: boolean }>(
+      const res = await tauriFetch<{ confirmed: boolean; new_pin?: string }>(
         `${RELAY}/users/pin-reset-status/${wallet.address}`
       );
-      if (res.data.confirmed) {
+      if (res.data.confirmed && res.data.new_pin) {
         clearInterval(interval);
+        // Apply the new PIN directly — no need to ask again
+        await invoke('set_security_pin', { pin: res.data.new_pin });
+        setHasPin(true);
         setResetSent(false);
         setResetMsg('');
-        setPinInput(''); setPinConfirm(''); setPinMsg('');
-        setShowSetPin(true);
+        setShowSetPin(false);
+        // Show success briefly
+        setPinMsg('✅ PIN updated successfully from email!');
+        setTimeout(() => setPinMsg(''), 3000);
       }
     } catch {}
   }, 3000);
@@ -357,10 +375,10 @@ useEffect(() => {
         <div className="space-y-4">
           <div className="flex items-start gap-2 bg-blue-500/10 border border-blue-500/30 rounded-xl px-3 py-3">
             <span className="text-blue-400 shrink-0 text-lg">📧</span>
-            <div className="text-sm text-blue-200 leading-relaxed">
-              For security, changing your PIN requires email verification.
-              We'll send a confirmation link to <strong>{maskedEmail}</strong>.
-            </div>
+        <div className="text-sm text-blue-200 leading-relaxed">
+          For security, changing your PIN requires email verification.
+          {maskedEmail ? <> We'll send a confirmation link to <strong>{maskedEmail}</strong>.</> : ' We\'ll send a confirmation link to your registered email.'}
+        </div>
           </div>
           {resetSent ? (
             <div className="space-y-3">
