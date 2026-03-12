@@ -419,3 +419,72 @@ pub async fn request_file_from_contact(
     }
     Ok(())
 }
+
+// ── download_stored_file ──────────────────────────────────────────────────────
+
+/// Decrypt a stored/received file and save it to the user's Downloads folder.
+#[tauri::command]
+pub async fn download_stored_file(
+    cid: String,
+    _state: State<'_, AppState>,
+) -> Result<String, EgoDesktopError> {
+    let ledger = Ledger::load();
+    let file = ledger.stored_files.iter().find(|f| f.cid == cid).cloned()
+        .ok_or_else(|| EgoDesktopError::NotFound(format!("File {cid} not found")))?;
+
+    if file.local_path.is_empty() || file.local_path.starts_with("sender:") {
+        return Err(EgoDesktopError::FileSystemError(
+            "File not yet downloaded — please wait for transfer to complete.".into(),
+        ));
+    }
+
+    let on_disk = fs::read(&file.local_path)
+        .map_err(|e| EgoDesktopError::FileSystemError(format!("Read enc: {e}")))?;
+    if on_disk.len() < 13 {
+        return Err(EgoDesktopError::FileSystemError("Encrypted file too short".into()));
+    }
+
+    let nonce_bytes = &on_disk[..12];
+    let ciphertext  = &on_disk[12..];
+
+    let key_nonce = hex::decode(&file.key_nonce_hex)
+        .map_err(|e| EgoDesktopError::CryptoError(format!("Decode key: {e}")))?;
+    if key_nonce.len() < 32 {
+        return Err(EgoDesktopError::CryptoError("Key too short".into()));
+    }
+
+    let cipher = Aes256Gcm::new_from_slice(&key_nonce[..32])
+        .map_err(|e| EgoDesktopError::CryptoError(format!("Key init: {e}")))?;
+    let nonce     = Nonce::from_slice(nonce_bytes);
+    let plaintext = cipher.decrypt(nonce, ciphertext)
+        .map_err(|e| EgoDesktopError::CryptoError(format!("Decrypt: {e}")))?;
+
+    // Resolve Downloads folder
+    let downloads_dir = dirs::download_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+        .ok_or_else(|| EgoDesktopError::FileSystemError("Cannot find Downloads folder".into()))?;
+
+    // Avoid overwriting existing files — append (2), (3) etc.
+    let base_name = &file.name;
+    let stem = std::path::Path::new(base_name)
+        .file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext  = std::path::Path::new(base_name)
+        .extension().and_then(|s| s.to_str()).unwrap_or("");
+
+    let mut dest = downloads_dir.join(base_name);
+    let mut counter = 2u32;
+    while dest.exists() {
+        let new_name = if ext.is_empty() {
+            format!("{} ({})", stem, counter)
+        } else {
+            format!("{} ({}).{}", stem, counter, ext)
+        };
+        dest = downloads_dir.join(new_name);
+        counter += 1;
+    }
+
+    fs::write(&dest, &plaintext)
+        .map_err(|e| EgoDesktopError::FileSystemError(format!("Write: {e}")))?;
+
+    Ok(dest.to_string_lossy().to_string())
+}

@@ -1030,38 +1030,67 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
             });
         }
 
-        P2PMessage::ChatMessage { bundle } => {
-            match crate::commands::messenger::receive_message_inner(&bundle) {
-                Ok(msg) => {
-                    if msg.message_type == "file_bundle" {
-                        // Auto-import into ledger so it appears in EgoSafe immediately.
-                        crate::commands::notifications::try_auto_import(
-                            app, &msg.content, &msg.from,
-                        ).await;
-                    } else {
-                        // Only show "New Message" notification for text messages.
-                        // Record the sender so window focus opens their chat.
-                        {
-                            let state = app.state::<crate::app::AppState>();
-                            *state.pending_chat_address.lock().unwrap() = Some(msg.from.clone());
+P2PMessage::ChatMessage { bundle } => {
+    match crate::commands::messenger::receive_message_inner(&bundle) {
+        Ok(msg) => {
+            if msg.message_type == "file_bundle" {
+                // Auto-import into ledger so it appears in EgoSafe immediately.
+                crate::commands::notifications::try_auto_import(
+                    app, &msg.content, &msg.from,
+                ).await;
+                // Immediately request the file from sender — no manual action needed
+                let parts: Vec<&str> = msg.content.splitn(5, ':').collect();
+                if parts.len() >= 2 {
+                    let cid       = parts[1].to_string();
+                    let from_addr = msg.from.clone();
+                    let app_clone = app.clone();
+                    tokio::spawn(async move {
+                        // Small delay so sender's ledger entry is ready
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        let contacts = load_contacts();
+                        if let Some(contact) = contacts.iter().find(|c| {
+                            c.address == from_addr && !c.endpoint.is_empty()
+                        }) {
+                            let endpoint  = contact.endpoint.clone();
+                            let my_ep     = get_public_endpoint().await;
+                            let my_addr   = crate::ledger::Ledger::load().address;
+                            let file_req  = P2PMessage::FileRequest {
+                                cid:                cid.clone(),
+                                requester_addr:     my_addr,
+                                requester_endpoint: my_ep,
+                            };
+                            if let Err(e) = send_message(&endpoint, &file_req).await {
+                                eprintln!("[P2P] Auto file request failed: {}", e);
+                            } else {
+                                eprintln!("[P2P] Auto-requested file {} from {}", cid, endpoint);
+                            }
                         }
-                        let preview = if msg.content.len() > 40 {
-                            format!("{}…", &msg.content[..40])
-                        } else {
-                            msg.content.clone()
-                        };
-                        let _ = tauri::api::notification::Notification::new(
-                            &app.config().tauri.bundle.identifier,
-                        )
-                        .title("New Message")
-                        .body(&preview)
-                        .show();
-                    }
-                    let _ = app.emit_all("ego://message-received", &msg);
+                    });
                 }
-                Err(e) => eprintln!("[P2P] Decrypt error: {}", e),
+            } else {
+                // Only show "New Message" notification for text messages.
+                // Record the sender so window focus opens their chat.
+                {
+                    let state = app.state::<crate::app::AppState>();
+                    *state.pending_chat_address.lock().unwrap() = Some(msg.from.clone());
+                }
+                let preview = if msg.content.len() > 40 {
+                    format!("{}…", &msg.content[..40])
+                } else {
+                    msg.content.clone()
+                };
+                let _ = tauri::api::notification::Notification::new(
+                    &app.config().tauri.bundle.identifier,
+                )
+                .title("New Message")
+                .body(&preview)
+                .show();
             }
+            let _ = app.emit_all("ego://message-received", &msg);
         }
+        Err(e) => eprintln!("[P2P] Decrypt error: {}", e),
+    }
+}
 
         P2PMessage::TxBroadcast { tx, block } => {
             apply_incoming_tx(tx, block, app).await;
