@@ -114,7 +114,7 @@
       }
     },
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; connect-src 'self' http://40.233.82.42:8080 ws://40.233.82.42:8080; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:"
     },
     "updater": {
       "active": false
