@@ -429,7 +429,7 @@ async fn post_register(
                 address: req.address.clone(), name: req.name.clone(),
                 email: req.email.clone(), email_verified: false,
                 verify_token: Some(token.clone()), pin_reset_token: None,
-                pin_reset_expiry: None, registered_at: now,
+                pin_reset_expiry: None, registered_at: now, pending_email: None, email_change_token: None,
             });
         }
         save_users(&users);
@@ -540,8 +540,9 @@ async fn post_change_email(
         }
         user.pending_email      = Some(new_email.clone());
         user.email_change_token = Some(token.clone());
+        let name = user.name.clone();
         save_users(&users);
-        (s.mailer.clone(), s.config.smtp_from.clone(), user.name.clone())
+        (s.mailer.clone(), s.config.smtp_from.clone(), name)
     };
 
     let verify_url = format!("{}/users/verify-email-change/{}", base_url, token);
@@ -549,7 +550,7 @@ async fn post_change_email(
         "Hi {name},\n\nClick the link below to confirm your new email address for Ego Desktop:\n\n{url}\n\nIf you did not request this change, ignore this email — your current address stays active.\n\nEgo Blockchain Team",
         name = name_clone, url = verify_url
     );
-    let _ = send_email(&mailer_clone, &from_clone, &new_email, "Confirm your new Ego email", &body).await;
+    let _ = send_email(&mailer_clone, &from_clone, &new_email, "Confirm your new Ego email", body).await;
 
     (StatusCode::OK, Json(ApiResponse { success: true, message: "Verification email sent to new address.".into() }))
 }
@@ -860,6 +861,7 @@ async fn main() {
             .route("/users/verify/:token",             get(get_verify))
             .route("/users/verify-email-change/:token",get(get_verify_email_change))
             .route("/users/change-email",              post(post_change_email))
+            .route("/users/confirm-email-change/:token", get(get_confirm_email_change))
             .route("/users/reset-pin",                 post(post_reset_pin))
             .route("/users/:address",                  get(get_user))
             .route("/tx/pending",           post(post_pending_tx))
@@ -943,6 +945,41 @@ async fn main() {
             }
             _ => {}
         }
+    }
+}
+
+
+async fn get_confirm_email_change(
+    Path(token): Path<String>,
+    State(s): State<AppState>,
+) -> (StatusCode, axum::response::Html<String>) {
+    let mut users = s.users.write().unwrap();
+    let result = users.iter_mut().find(|u| {
+        u.verify_token.as_deref()
+            .map(|t| t.starts_with(&format!("email_change:{}:", token)))
+            .unwrap_or(false)
+    }).map(|u| {
+        let new_email = u.verify_token.as_deref().unwrap_or("")
+            .splitn(3, ':').nth(2).unwrap_or("").to_string();
+        u.email = new_email.clone();
+        u.verify_token = None;
+        new_email
+    });
+    save_users(&users);
+    drop(users);
+    match result {
+        Some(new_email) => (StatusCode::OK, axum::response::Html(format!(r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Email Updated</title>
+<style>body{{font-family:sans-serif;background:#0f172a;color:#e2e8f0;display:flex;
+align-items:center;justify-content:center;min-height:100vh;margin:0}}
+.card{{background:#1e293b;border-radius:16px;padding:48px;text-align:center;max-width:400px}}
+.icon{{font-size:64px}}h1{{color:#34d399}}</style></head>
+<body><div class="card"><div class="icon">✅</div>
+<h1>Email Updated!</h1>
+<p>Your account email is now <strong>{}</strong>.</p>
+</div></body></html>"#, new_email))),
+        None => (StatusCode::BAD_REQUEST,
+            axum::response::Html("<h1>Invalid or expired link.</h1>".into())),
     }
 }
 
