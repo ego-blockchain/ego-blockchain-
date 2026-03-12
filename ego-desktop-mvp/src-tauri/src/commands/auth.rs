@@ -45,12 +45,36 @@ pub struct PinStatus {
     pub has_pin: bool,
 }
 
-#[tauri::command]
-pub async fn get_pin_status(_state: tauri::State<'_, crate::app::AppState>) -> Result<PinStatus, String> {
-    let pin_path = wallet_dir(&get_active_wallet_id()).join("security_pin.bin");
-    Ok(PinStatus { has_pin: pin_path.exists() })
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct AppSettings {
+    pub auto_start:        bool,
+    pub minimize_to_tray:  bool,
+    pub notifications:     bool,
 }
 
+#[tauri::command]
+pub async fn get_app_settings() -> Result<AppSettings, String> {
+    let path = base_data_dir().join("settings.json");
+    if let Ok(data) = fs::read_to_string(&path) {
+        if let Ok(s) = serde_json::from_str::<AppSettings>(&data) {
+            return Ok(s);
+        }
+    }
+    Ok(AppSettings { auto_start: true, minimize_to_tray: true, notifications: true })
+}
+
+#[tauri::command]
+pub async fn save_app_settings(settings: AppSettings) -> Result<(), String> {
+    let path = base_data_dir().join("settings.json");
+    let data = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    fs::write(path, data).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_pin_status(_state: tauri::State<'_, crate::app::AppState>) -> Result<PinStatus, String> {
+    let ledger = Ledger::load();
+    Ok(PinStatus { has_pin: !ledger.security_pin_hash.is_empty() })
+}
 // ── Platform-specific biometric helpers ──────────────────────────────────────
 
 #[cfg(target_os = "windows")]

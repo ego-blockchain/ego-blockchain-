@@ -325,7 +325,7 @@ const MessengerPage: React.FC = () => {
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
-    <div className="flex flex-col h-screen bg-gray-900 text-white overflow-hidden">
+    <div className="flex flex-col h-full bg-gray-900 text-white overflow-hidden">
       {ConfirmDialog}
 
       {/* ── P2P connectivity banner ── */}
