@@ -37,7 +37,7 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
       setStep('verify_pending');
       startPollingVerification();
     } catch (e) {
-      setError('Could not connect to server. Check your internet connection.');
+      setError('Error: ' + String(e));
     } finally {
       setLoading(false);
     }
