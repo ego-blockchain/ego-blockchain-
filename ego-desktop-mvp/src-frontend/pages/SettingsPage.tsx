@@ -64,14 +64,25 @@ const SettingsPage: React.FC = () => {
   const addressQR = useMemo(() => makeQR(wallet?.address ?? ''), [wallet?.address]);
 
   // Load PIN status and masked email on mount
-  useEffect(() => {
-    invoke<{ has_pin: boolean }>('get_pin_status').then(s => setHasPin(s.has_pin)).catch(() => {});
-    if (wallet?.address) {
-      tauriFetch<{ email_masked?: string }>(`${RELAY}/users/${wallet.address}`)
-        .then(r => { if (r.data.email_masked) setMaskedEmail(r.data.email_masked); })
-        .catch(() => {});
-    }
-  }, [wallet?.address]);
+// Poll for PIN reset confirmation after email link clicked
+useEffect(() => {
+  if (!resetSent || !wallet?.address) return;
+  const interval = setInterval(async () => {
+    try {
+      const res = await tauriFetch<{ confirmed: boolean }>(
+        `${RELAY}/users/pin-reset-status/${wallet.address}`
+      );
+      if (res.data.confirmed) {
+        clearInterval(interval);
+        setResetSent(false);
+        setResetMsg('');
+        setPinInput(''); setPinConfirm(''); setPinMsg('');
+        setShowSetPin(true);
+      }
+    } catch {}
+  }, 3000);
+  return () => clearInterval(interval);
+}, [resetSent, wallet?.address]);
 
   const Toggle: React.FC<{ value: boolean; onChange: (v: boolean) => void }> = ({ value, onChange }) => (
     <button
@@ -196,67 +207,76 @@ const SettingsPage: React.FC = () => {
           </div>
         </div>
 
-        {/* Security PIN */}
-        <div className="px-5 py-4 border-b border-gray-700/50">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-sm font-medium">Security PIN</div>
-              <div className="text-xs text-gray-400">
-                {hasPin ? '🔒 PIN is set — required to view your keys' : '⚠️ No PIN set — your keys are unprotected'}
-              </div>
-            </div>
-            <button
-              disabled={biometricLoading}
-              onClick={async () => {
-                setBiometricLoading(true);
-                try {
-                  const ok = await invoke<boolean>('verify_biometric', {
-                    reason: hasPin ? 'Authorize PIN change' : 'Authorize PIN setup',
-                  });
-                  if (ok) {
-                    setPinInput(''); setPinConfirm(''); setPinMsg('');
-                    setResetSent(false); setResetMsg('');
-                    setShowSetPin(true);
-                  } else {
-                    setPinMsg('Biometric verification failed. Please try again.');
-                  }
-                } catch {
-                  // Biometric unavailable — open modal directly
-                  setPinInput(''); setPinConfirm(''); setPinMsg('');
-                  setResetSent(false); setResetMsg('');
-                  setShowSetPin(true);
-                } finally {
-                  setBiometricLoading(false);
-                }
-              }}
-              className="text-xs bg-yellow-600/20 hover:bg-yellow-600/40 disabled:opacity-50 text-yellow-400 px-3 py-1.5 rounded-lg transition"
-            >
-              {biometricLoading ? '🔐 Verifying…' : hasPin ? 'Change PIN' : 'Set PIN'}
-            </button>
+       {/* Security PIN */}
+<div className="px-5 py-4 border-b border-gray-700/50">
+  <div className="flex items-center justify-between">
+    <div>
+      <div className="text-sm font-medium">Security PIN</div>
+      <div className="text-xs text-gray-400">
+        {hasPin ? '🔒 PIN is set — required to view your keys' : '⚠️ No PIN set — your keys are unprotected'}
+      </div>
+    </div>
+    <button
+      disabled={biometricLoading}
+      onClick={async () => {
+        setBiometricLoading(true);
+        try {
+          const ok = await invoke<boolean>('verify_biometric', {
+            reason: hasPin ? 'Authorize PIN change' : 'Authorize PIN setup',
+          });
+          if (ok) {
+            setPinInput(''); setPinConfirm(''); setPinMsg('');
+            setResetSent(false); setResetMsg('');
+            setShowSetPin(true);
+          } else {
+            setPinMsg('Biometric verification failed. Please try again.');
+          }
+        } catch {
+          setPinInput(''); setPinConfirm(''); setPinMsg('');
+          setResetSent(false); setResetMsg('');
+          setShowSetPin(true);
+        } finally {
+          setBiometricLoading(false);
+        }
+      }}
+      className="text-xs bg-yellow-600/20 hover:bg-yellow-600/40 disabled:opacity-50 text-yellow-400 px-3 py-1.5 rounded-lg transition"
+    >
+      {biometricLoading ? '🔐 Verifying…' : hasPin ? 'Change PIN' : 'Set PIN'}
+    </button>
+  </div>
+  {pinMsg && !showSetPin && (
+    <div className="mt-2 text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{pinMsg}</div>
+  )}
+  {/* Forgot PIN — only shown when PIN is set and email is linked */}
+  {hasPin && maskedEmail && (
+    <div className="mt-3 pt-3 border-t border-gray-700/50">
+      <div className="text-xs text-gray-500 mb-2">
+        🔑 Account email: <span className="text-gray-400">{maskedEmail}</span>
+      </div>
+      {resetSent ? (
+        <div className="bg-green-500/10 border border-green-500/30 rounded-xl px-3 py-2.5 text-xs text-green-300">
+          ✅ Reset link sent to <strong>{maskedEmail}</strong>. 
+          Click it in your email — the app will automatically open the PIN setup once confirmed.
+          <div className="flex items-center gap-2 mt-2 text-green-400">
+            <div className="w-3 h-3 border-2 border-green-400 border-t-transparent rounded-full animate-spin" />
+            Waiting for confirmation…
           </div>
-          {pinMsg && !showSetPin && (
-            <div className="mt-2 text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{pinMsg}</div>
-          )}
-          {maskedEmail && (
-            <div className="mt-2 text-xs text-gray-500">
-              🔑 Account email: <span className="text-gray-400">{maskedEmail}</span>
-              {hasPin && (
-                <> · <button
-                  onClick={handleForgotPin}
-                  disabled={resetLoading}
-                  className="text-blue-400 hover:text-blue-300 transition"
-                >
-                  {resetLoading ? 'Sending…' : 'Forgot PIN? Send reset email'}
-                </button></>
-              )}
-            </div>
-          )}
-          {resetMsg && (
-            <div className={`mt-2 text-xs px-3 py-2 rounded-lg ${resetSent ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
-              {resetMsg}
-            </div>
-          )}
         </div>
+      ) : (
+        <button
+          onClick={handleForgotPin}
+          disabled={resetLoading}
+          className="text-xs text-blue-400 hover:text-blue-300 disabled:opacity-50 transition"
+        >
+          {resetLoading ? '📧 Sending…' : 'Forgot PIN? Send reset link to email'}
+        </button>
+      )}
+      {resetMsg && !resetSent && (
+        <div className="mt-2 text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{resetMsg}</div>
+      )}
+    </div>
+  )}
+</div>
 
         {/* Change email */}
         <div className="px-5 py-4 border-b border-gray-700/50 flex items-center justify-between">
@@ -323,71 +343,99 @@ const SettingsPage: React.FC = () => {
         {saved ? '✓ Saved' : 'Save Settings'}
       </button>
 
-      {/* ── Set / Change PIN Modal ─────────────────────────────────────────── */}
-      {showSetPin && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
-          <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-sm border border-gray-700 shadow-2xl">
-            <div className="flex justify-between items-center mb-5">
-              <h3 className="text-lg font-bold">{hasPin ? 'Change Security PIN' : 'Set Security PIN'}</h3>
-              <button onClick={() => setShowSetPin(false)} className="text-gray-400 hover:text-white text-xl">✕</button>
-            </div>
-            <div className="space-y-4">
-              <div className="flex items-start gap-2 bg-yellow-500/10 border border-yellow-500/30 rounded-xl px-3 py-2.5">
-                <span className="text-yellow-400 shrink-0">🔒</span>
-                <div className="text-xs text-yellow-200 leading-relaxed">
-                  Your PIN is saved securely on this device. You'll need it to view your private keys.
-                  Use <strong>Windows Hello / Touch ID</strong> to authorise changes.
-                </div>
-              </div>
-              <div className="text-sm text-gray-400">Choose a PIN (minimum 4 characters).</div>
-              <input
-                type="password"
-                value={pinInput}
-                onChange={e => setPinInput(e.target.value)}
-                placeholder="New PIN"
-                className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition"
-              />
-              <input
-                type="password"
-                value={pinConfirm}
-                onChange={e => setPinConfirm(e.target.value)}
-                placeholder="Confirm PIN"
-                className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition"
-                onKeyDown={e => e.key === 'Enter' && handleSetPin()}
-              />
-              {pinMsg && (
-                <div className={`text-xs px-3 py-2 rounded-lg ${pinMsg.includes('success') ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
-                  {pinMsg}
-                </div>
-              )}
-              <button
-                onClick={handleSetPin}
-                disabled={settingPin || !pinInput || !pinConfirm}
-                className="w-full bg-yellow-600 hover:bg-yellow-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
-              >
-                {settingPin ? 'Saving…' : hasPin ? 'Update PIN' : 'Set PIN'}
-              </button>
-              {/* Forgot PIN */}
-              {hasPin && maskedEmail && (
-                <div className="text-center">
-                  <button
-                    onClick={handleForgotPin}
-                    disabled={resetLoading}
-                    className="text-xs text-blue-400 hover:text-blue-300 transition"
-                  >
-                    {resetLoading ? 'Sending reset email…' : `Forgot PIN? Send reset to ${maskedEmail}`}
-                  </button>
-                  {resetMsg && (
-                    <div className={`mt-2 text-xs px-3 py-2 rounded-lg ${resetSent ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
-                      {resetMsg}
-                    </div>
-                  )}
-                </div>
-              )}
+{/* ── Change PIN Modal ─────────────────────────────────────────── */}
+{showSetPin && (
+  <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
+    <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-sm border border-gray-700 shadow-2xl">
+      <div className="flex justify-between items-center mb-5">
+        <h3 className="text-lg font-bold">{hasPin ? 'Change Security PIN' : 'Set Security PIN'}</h3>
+        <button onClick={() => { setShowSetPin(false); setResetSent(false); setResetMsg(''); }} className="text-gray-400 hover:text-white text-xl">✕</button>
+      </div>
+
+      {/* If PIN already set — require email verification first */}
+      {hasPin ? (
+        <div className="space-y-4">
+          <div className="flex items-start gap-2 bg-blue-500/10 border border-blue-500/30 rounded-xl px-3 py-3">
+            <span className="text-blue-400 shrink-0 text-lg">📧</span>
+            <div className="text-sm text-blue-200 leading-relaxed">
+              For security, changing your PIN requires email verification.
+              We'll send a confirmation link to <strong>{maskedEmail}</strong>.
             </div>
           </div>
+          {resetSent ? (
+            <div className="space-y-3">
+              <div className="bg-green-500/10 border border-green-500/30 rounded-xl px-4 py-3 text-sm text-green-300">
+                ✅ Reset link sent to <strong>{maskedEmail}</strong>.<br />
+                Click the link in your email to continue.
+              </div>
+              <div className="flex items-center gap-2 text-xs text-gray-400">
+                <div className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+                Waiting for email confirmation…
+              </div>
+              <button
+                onClick={() => { setResetSent(false); setResetMsg(''); }}
+                className="w-full bg-gray-700 hover:bg-gray-600 py-2.5 rounded-xl text-sm text-gray-300 transition"
+              >
+                ← Resend email
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={handleForgotPin}
+              disabled={resetLoading || !maskedEmail}
+              className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
+            >
+              {resetLoading ? '📧 Sending…' : '📧 Send PIN Change Link'}
+            </button>
+          )}
+          {resetMsg && !resetSent && (
+            <div className="text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{resetMsg}</div>
+          )}
+        </div>
+      ) : (
+        /* No PIN yet — allow setting directly */
+        <div className="space-y-4">
+          <div className="flex items-start gap-2 bg-yellow-500/10 border border-yellow-500/30 rounded-xl px-3 py-2.5">
+            <span className="text-yellow-400 shrink-0">🔒</span>
+            <div className="text-xs text-yellow-200 leading-relaxed">
+              Your PIN is saved securely on this device. You'll need it to view your private keys.
+            </div>
+          </div>
+          <div className="text-sm text-gray-400">Choose a PIN (minimum 4 characters).</div>
+          <input
+            type="password"
+            value={pinInput}
+            onChange={e => setPinInput(e.target.value)}
+            placeholder="New PIN"
+            className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition"
+          />
+          <input
+            type="password"
+            value={pinConfirm}
+            onChange={e => setPinConfirm(e.target.value)}
+            placeholder="Confirm PIN"
+            className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition"
+            onKeyDown={e => e.key === 'Enter' && handleSetPin()}
+          />
+          {pinMsg && (
+            <div className={`text-xs px-3 py-2 rounded-lg ${pinMsg.includes('success') ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
+              {pinMsg}
+            </div>
+          )}
+          <button
+            onClick={handleSetPin}
+            disabled={settingPin || !pinInput || !pinConfirm}
+            className="w-full bg-yellow-600 hover:bg-yellow-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
+          >
+            {settingPin ? 'Saving…' : 'Set PIN'}
+          </button>
         </div>
       )}
+    </div>
+  </div>
+)}
+
+
 
       {/* ── View Recovery Info Modal ───────────────────────────────────────── */}
       {showRecovery && (
