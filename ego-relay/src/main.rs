@@ -864,6 +864,7 @@ async fn main() {
             .route("/users/confirm-email-change/:token", get(get_confirm_email_change))
             .route("/users/reset-pin",                 post(post_reset_pin))
             .route("/users/pin-reset/:token",          get(get_pin_reset))
+            .route("/users/pin-reset-confirm",          post(post_pin_reset_confirm))
             .route("/users/pin-reset-status/:address", get(get_pin_reset_status))
             .route("/users/:address",                  get(get_user))
             .route("/tx/pending",           post(post_pending_tx))
@@ -991,33 +992,161 @@ async fn get_pin_reset(
     State(s): State<AppState>,
 ) -> (StatusCode, axum::response::Html<String>) {
     let now = chrono::Utc::now().timestamp();
-    let mut users = s.users.write().unwrap();
-    let valid = users.iter_mut().find(|u| {
+    let users = s.users.read().unwrap();
+    let valid = users.iter().any(|u| {
         u.pin_reset_token.as_deref() == Some(&token)
             && u.pin_reset_expiry.map(|e| e > now).unwrap_or(false)
-    }).map(|u| {
-        u.pin_reset_token  = Some(format!("confirmed:{}", token));
-        u.pin_reset_expiry = Some(now + 300);
-        true
-    }).unwrap_or(false);
-    if valid { save_users(&users); }
+    });
     drop(users);
     if valid {
         (StatusCode::OK, axum::response::Html(format!(r#"<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>PIN Reset Confirmed</title>
-<style>body{{font-family:sans-serif;background:#0f172a;color:#e2e8f0;display:flex;
-align-items:center;justify-content:center;min-height:100vh;margin:0}}
-.card{{background:#1e293b;border-radius:16px;padding:48px;text-align:center;max-width:400px}}
-.icon{{font-size:64px}}h1{{color:#34d399}}</style></head>
-<body><div class="card"><div class="icon">✅</div>
-<h1>PIN Reset Confirmed!</h1>
-<p>Return to the Ego Desktop app — you will be prompted to set a new PIN.</p>
-<p style="color:#94a3b8;font-size:13px">This window can be closed.</p>
-</div></body></html>"#)))
+<html><head><meta charset="utf-8"><title>Set New PIN</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}}
+.card{{background:#1e293b;border-radius:20px;padding:40px 32px;width:100%;max-width:420px;border:1px solid #334155;box-shadow:0 25px 50px rgba(0,0,0,0.5)}}
+.logo{{text-align:center;margin-bottom:24px;font-size:40px}}
+h1{{text-align:center;font-size:22px;font-weight:700;margin-bottom:8px}}
+.sub{{text-align:center;color:#94a3b8;font-size:14px;margin-bottom:32px}}
+label{{display:block;font-size:13px;color:#94a3b8;margin-bottom:6px;margin-top:16px}}
+.input-wrap{{position:relative}}
+input{{width:100%;background:#0f172a;border:1px solid #334155;border-radius:12px;padding:14px 48px 14px 16px;font-size:15px;color:#e2e8f0;outline:none;transition:border-color .2s}}
+input:focus{{border-color:#3b82f6}}
+.eye{{position:absolute;right:14px;top:50%;transform:translateY(-50%);background:none;border:none;color:#64748b;cursor:pointer;font-size:18px;padding:4px;line-height:1}}
+.eye:hover{{color:#94a3b8}}
+.strength{{height:4px;border-radius:2px;margin-top:8px;transition:all .3s;background:#334155;overflow:hidden}}
+.strength-bar{{height:100%;border-radius:2px;transition:all .3s;width:0}}
+.strength-label{{font-size:11px;color:#64748b;margin-top:4px;text-align:right}}
+button.submit{{width:100%;margin-top:24px;background:#3b82f6;color:white;border:none;border-radius:12px;padding:15px;font-size:16px;font-weight:600;cursor:pointer;transition:background .2s}}
+button.submit:hover{{background:#2563eb}}
+button.submit:disabled{{background:#334155;color:#64748b;cursor:not-allowed}}
+.msg{{margin-top:16px;padding:12px 16px;border-radius:10px;font-size:13px;text-align:center;display:none}}
+.msg.error{{background:#450a0a;border:1px solid #7f1d1d;color:#fca5a5;display:block}}
+.msg.success{{background:#052e16;border:1px solid #14532d;color:#86efac;display:block}}
+.match-icon{{position:absolute;right:48px;top:50%;transform:translateY(-50%);font-size:14px}}
+</style></head>
+<body>
+<div class="card">
+  <div class="logo">🔐</div>
+  <h1>Set New PIN</h1>
+  <p class="sub">Choose a new security PIN for your Ego Wallet</p>
+
+  <label>New PIN</label>
+  <div class="input-wrap">
+    <input type="password" id="pin1" placeholder="Enter new PIN" oninput="checkStrength()" autocomplete="new-password"/>
+    <button class="eye" onclick="toggle('pin1','eye1')" type="button"><span id="eye1">👁</span></button>
+  </div>
+  <div class="strength"><div class="strength-bar" id="sbar"></div></div>
+  <div class="strength-label" id="slabel"></div>
+
+  <label>Confirm PIN</label>
+  <div class="input-wrap">
+    <input type="password" id="pin2" placeholder="Confirm your PIN" oninput="checkMatch()" autocomplete="new-password"/>
+    <span class="match-icon" id="match-icon"></span>
+    <button class="eye" onclick="toggle('pin2','eye2')" type="button"><span id="eye2">👁</span></button>
+  </div>
+
+  <div class="msg" id="msg"></div>
+  <button class="submit" id="btn" onclick="submit()" disabled>Set PIN</button>
+</div>
+<script>
+const TOKEN = '{token}';
+function toggle(id, eyeId) {{
+  const el = document.getElementById(id);
+  const eye = document.getElementById(eyeId);
+  if (el.type === 'password') {{ el.type = 'text'; eye.textContent = '🙈'; }}
+  else {{ el.type = 'password'; eye.textContent = '👁'; }}
+}}
+function checkStrength() {{
+  const v = document.getElementById('pin1').value;
+  const bar = document.getElementById('sbar');
+  const lbl = document.getElementById('slabel');
+  let score = 0;
+  if (v.length >= 4) score++;
+  if (v.length >= 8) score++;
+  if (/[0-9]/.test(v) && /[a-zA-Z]/.test(v)) score++;
+  if (/[^a-zA-Z0-9]/.test(v)) score++;
+  const colors = ['#ef4444','#f97316','#eab308','#22c55e'];
+  const labels = ['Too short','Weak','Good','Strong'];
+  if (v.length === 0) {{ bar.style.width='0'; lbl.textContent=''; }}
+  else {{ bar.style.width=(score*25)+'%'; bar.style.background=colors[score-1]||colors[0]; lbl.textContent=labels[score-1]||labels[0]; }}
+  checkMatch();
+}}
+function checkMatch() {{
+  const p1 = document.getElementById('pin1').value;
+  const p2 = document.getElementById('pin2').value;
+  const icon = document.getElementById('match-icon');
+  const btn = document.getElementById('btn');
+  if (p2.length === 0) {{ icon.textContent=''; btn.disabled=true; return; }}
+  if (p1 === p2 && p1.length >= 4) {{ icon.textContent='✅'; btn.disabled=false; }}
+  else {{ icon.textContent='❌'; btn.disabled=true; }}
+}}
+async function submit() {{
+  const pin = document.getElementById('pin1').value;
+  const btn = document.getElementById('btn');
+  const msg = document.getElementById('msg');
+  if (pin.length < 4) {{ showMsg('PIN must be at least 4 characters.', false); return; }}
+  btn.disabled = true; btn.textContent = 'Saving…';
+  try {{
+    const r = await fetch('/users/pin-reset-confirm', {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify({{ token: TOKEN, new_pin_hash: pin }})
+    }});
+    const d = await r.json();
+    if (d.success) {{
+      showMsg('✅ PIN updated! You can close this window.', true);
+      btn.textContent = 'Done';
+    }} else {{
+      showMsg(d.message || 'Error. Please try again.', false);
+      btn.disabled = false; btn.textContent = 'Set PIN';
+    }}
+  }} catch {{ showMsg('Network error. Please try again.', false); btn.disabled=false; btn.textContent='Set PIN'; }}
+}}
+function showMsg(text, ok) {{
+  const msg = document.getElementById('msg');
+  msg.textContent = text;
+  msg.className = 'msg ' + (ok ? 'success' : 'error');
+}}
+</script>
+</body></html>"#, token = token)))
     } else {
-        (StatusCode::BAD_REQUEST, axum::response::Html(
-            "<h1>Invalid or expired reset link.</h1>".into()
-        ))
+        (StatusCode::BAD_REQUEST, axum::response::Html(r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Invalid Link</title>
+<style>body{{font-family:sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh}}
+.card{{background:#1e293b;border-radius:16px;padding:48px;text-align:center;max-width:400px;border:1px solid #7f1d1d}}
+h1{{color:#f87171}}</style></head>
+<body><div class="card"><div style="font-size:48px">❌</div>
+<h1>Invalid or Expired Link</h1>
+<p style="color:#94a3b8;margin-top:12px">This PIN reset link has expired or already been used.</p>
+</div></body></html>"#.into()))
+    }
+}
+
+
+#[derive(Debug, Deserialize)]
+struct PinResetConfirmRequest {
+    token: String,
+    new_pin_hash: String,
+}
+
+async fn post_pin_reset_confirm(
+    State(s): State<AppState>,
+    Json(req): Json<PinResetConfirmRequest>,
+) -> (StatusCode, Json<ApiResponse>) {
+    let now = chrono::Utc::now().timestamp();
+    let mut users = s.users.write().unwrap();
+    if let Some(user) = users.iter_mut().find(|u| {
+        u.pin_reset_token.as_deref() == Some(&req.token)
+            && u.pin_reset_expiry.map(|e| e > now).unwrap_or(false)
+    }) {
+        // Mark as confirmed so the app can detect it and set the PIN locally
+        user.pin_reset_token  = Some(format!("confirmed:{}", req.token));
+        user.pin_reset_expiry = Some(now + 300);
+        save_users(&users);
+        (StatusCode::OK, Json(ApiResponse { success: true, message: "PIN reset confirmed.".into() }))
+    } else {
+        (StatusCode::BAD_REQUEST, Json(ApiResponse { success: false, message: "Invalid or expired token.".into() }))
     }
 }
 
