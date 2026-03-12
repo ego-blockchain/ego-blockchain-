@@ -113,8 +113,6 @@ const EgoSafePage: React.FC = () => {
   const [preview, setPreview]         = useState<{ name: string; mime_type: string; data_base64: string; size_bytes: number; previewable: boolean } | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
 
-  // ── P2P file request state ─────────────────────────────────────────────────
-  const [requestingCid, setRequestingCid] = useState<string | null>(null);
 
   useEffect(() => {
     loadStoredFiles();
@@ -535,98 +533,86 @@ const EgoSafePage: React.FC = () => {
         )}
       </div>
 
-      {/* ── Received Files ───────────────────────────────────────────────── */}
-      {receivedFiles.length > 0 && (
-        <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
-          <div className="flex items-center justify-between px-5 py-4 border-b border-gray-700">
-            <div>
-              <h3 className="font-semibold">Received Files ({receivedFiles.length})</h3>
-              <p className="text-xs text-gray-400 mt-0.5">Files shared with you — ready to download</p>
+
+{/* ── Received Files ───────────────────────────────────────────────── */}
+{receivedFiles.length > 0 && (
+  <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
+    <div className="flex items-center justify-between px-5 py-4 border-b border-gray-700">
+      <div>
+        <h3 className="font-semibold">Received Files ({receivedFiles.length})</h3>
+        <p className="text-xs text-gray-400 mt-0.5">Files shared with you</p>
+      </div>
+      <button onClick={loadStoredFiles} className="text-xs text-gray-400 hover:text-white transition">↻ Refresh</button>
+    </div>
+    <div className="divide-y divide-gray-700/50">
+      {receivedFiles.map(file => {
+        const isReady = !!file.local_path && !file.local_path.startsWith('sender:');
+        return (
+          <div key={file.cid} className="px-5 py-4">
+            <div className="flex items-center gap-4">
+              <div className="text-2xl">{isReady ? '📥' : '⏳'}</div>
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium truncate">{file.name}</div>
+                <div className="font-mono text-xs text-green-400 truncate mt-0.5">{file.cid.slice(0, 20)}…</div>
+                {isVideoFile(file.name) && (
+                  <div className="text-xs text-blue-400 mt-0.5">🎬 Video — delivered in chunks</div>
+                )}
+              </div>
+              <div className="shrink-0 flex items-center gap-1.5">
+                {isReady ? (
+                  <>
+                    <button
+                      onClick={async () => {
+                        try {
+                          const path = await invoke<string>('download_stored_file', { cid: file.cid });
+                          alert(`✅ Saved to: ${path}`);
+                        } catch (e: any) { alert('Download failed: ' + String(e)); }
+                      }}
+                      className="text-xs bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 px-3 py-1.5 rounded-lg transition font-medium"
+                    >
+                      ⬇ Download
+                    </button>
+                    <button
+                      onClick={async () => {
+                        setPreviewFile(file);
+                        setPreview(null);
+                        setPreviewLoading(true);
+                        try {
+                          const p = await invoke<{ name: string; mime_type: string; data_base64: string; size_bytes: number; previewable: boolean }>('retrieve_file_preview', { cid: file.cid });
+                          setPreview(p);
+                        } catch {}
+                        setPreviewLoading(false);
+                      }}
+                      className="text-xs bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded-lg transition"
+                    >
+                      👁 View
+                    </button>
+                  </>
+                ) : (
+                  <span className="text-xs bg-yellow-500/20 text-yellow-400 px-2 py-1 rounded-lg">
+                    ⏳ Incoming…
+                  </span>
+                )}
+                <button
+                  onClick={async () => {
+                    if (!await confirm(`Delete "${file.name}"?`, { confirmLabel: 'Delete' })) return;
+                    try {
+                      await invoke('delete_stored_file', { cid: file.cid });
+                      await loadStoredFiles();
+                    } catch (e: any) { alert('Delete failed: ' + String(e)); }
+                  }}
+                  className="text-xs bg-red-600/20 hover:bg-red-600/40 text-red-400 px-2 py-1.5 rounded-lg transition"
+                >
+                  🗑
+                </button>
+              </div>
             </div>
-            <button onClick={loadStoredFiles} className="text-xs text-gray-400 hover:text-white transition">↻ Refresh</button>
           </div>
-          <div className="divide-y divide-gray-700/50">
-            {receivedFiles.map(file => {
-              const isPending  = !file.local_path || file.local_path.startsWith('sender:');
-              const senderAddr = isPending && file.local_path.startsWith('sender:')
-                ? file.local_path.replace('sender:', '')
-                : '';
-              const isRequesting = requestingCid === file.cid;
-              return (
-                <div key={file.cid} className="px-5 py-4">
-                  <div className="flex items-center gap-4">
-                    <div className="text-2xl">{isPending ? '⏳' : '📥'}</div>
-                    <div className="min-w-0 flex-1">
-                      <div className="text-sm font-medium truncate">{file.name}</div>
-                      <div className="font-mono text-xs text-green-400 truncate mt-0.5">{file.cid.slice(0, 20)}…</div>
-                      {isVideoFile(file.name) && (
-                        <div className="text-xs text-blue-400 mt-0.5">🎬 Video — delivered in chunks</div>
-                      )}
-                    </div>
-                    <div className="shrink-0 flex items-center gap-1.5">
-                      {isPending ? (
-                        <>
-                          <span className="text-xs bg-yellow-500/20 text-yellow-400 px-2 py-1 rounded-lg">Not downloaded</span>
-                          {senderAddr && (
-                            <button
-                              disabled={isRequesting}
-                              onClick={async () => {
-                                setRequestingCid(file.cid);
-                                try {
-                                  await invoke('request_file_from_contact', { cid: file.cid, fromAddr: senderAddr });
-                                  alert('File requested! The sender will deliver it — check back shortly.');
-                                } catch (e: any) {
-                                  alert('Request queued in relay inbox. File will arrive when sender is online.');
-                                } finally {
-                                  setRequestingCid(null);
-                                }
-                              }}
-                              className="text-xs bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 px-3 py-1 rounded-lg transition disabled:opacity-40"
-                            >
-                              {isRequesting ? '⏳ Requesting…' : '📥 Request File'}
-                            </button>
-                          )}
-                        </>
-                      ) : (
-                        <>
-                          <span className="text-xs bg-green-500/20 text-green-400 px-2 py-1 rounded-lg">✓ Downloaded</span>
-                          <button
-                            onClick={async () => {
-                              setPreviewFile(file);
-                              setPreview(null);
-                              setPreviewLoading(true);
-                              try {
-                                const p = await invoke<{ name: string; mime_type: string; data_base64: string; size_bytes: number; previewable: boolean }>('retrieve_file_preview', { cid: file.cid });
-                                setPreview(p);
-                              } catch {}
-                              setPreviewLoading(false);
-                            }}
-                            className="text-xs bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded-lg transition"
-                          >
-                            👁 View
-                          </button>
-                        </>
-                      )}
-                      <button
-                        onClick={async () => {
-                          if (!await confirm(`Delete "${file.name}"?`, { confirmLabel: 'Delete' })) return;
-                          try {
-                            await invoke('delete_stored_file', { cid: file.cid });
-                            await loadStoredFiles();
-                          } catch (e: any) { alert('Delete failed: ' + String(e)); }
-                        }}
-                        className="text-xs bg-red-600/20 hover:bg-red-600/40 text-red-400 px-2 py-1 rounded-lg transition"
-                      >
-                        🗑
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
+        );
+      })}
+    </div>
+  </div>
+)}
 
       {/* ── Import Shared File ───────────────────────────────────────────── */}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
