@@ -59,11 +59,15 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
     setTimeout(() => { clearInterval(interval); setPolling(false); }, 15 * 60 * 1000);
   }
 
-  async function loadRecovery() {
+async function loadRecovery() {
     try {
-      const info = await invoke<{ recovery_phrase: string[]; seed_hex: string }>(
-        'get_recovery_info', { pin: '' }
-      );
+      let info: { recovery_phrase: string[]; seed_hex: string };
+      try {
+        info = await invoke('get_recovery_info', { pin: '' });
+      } catch {
+        const pin = window.prompt('Enter your security PIN to view recovery phrase:') ?? '';
+        info = await invoke('get_recovery_info', { pin });
+      }
       setRecovery(info.recovery_phrase);
       setSeedHex(info.seed_hex);
       setStep('recovery');
