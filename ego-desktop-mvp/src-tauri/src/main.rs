@@ -131,6 +131,8 @@ fn main() {
             commands::auth::get_pin_status,
             commands::wallet::get_balance,
             commands::wallet::send_transaction,
+            commands::wallet::prepare_transaction,
+            commands::wallet::commit_transaction,
             commands::wallet::get_transaction_history,
             commands::wallet::reset_chain,
             commands::storage::store_file,

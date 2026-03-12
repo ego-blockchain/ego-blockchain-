@@ -1,6 +1,6 @@
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
-use crate::ledger::{load_chain, save_chain, tx_signing_bytes, Ledger, LedgerTx};
+use crate::ledger::{load_chain, save_chain, tx_signing_bytes, Ledger, LedgerBlock, LedgerTx};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -160,6 +160,99 @@ pub async fn send_transaction(
         success: true,
         message: "Transaction confirmed and broadcast to all nodes".into(),
         block_height,
+    })
+}
+
+// ── prepare_transaction ───────────────────────────────────────────────────────
+// Builds and signs a tx+block but does NOT save anything.
+// Returns JSON strings so the frontend can POST them to the relay for email confirmation.
+
+#[derive(Debug, Serialize)]
+pub struct PreparedTransaction {
+    pub tx_json:    String,
+    pub block_json: String,
+    pub tx_hash:    String,
+    pub amount:     u64,
+    pub from:       String,
+    pub to:         String,
+}
+
+#[tauri::command]
+pub async fn prepare_transaction(
+    request: SendTransactionRequest,
+    state: State<'_, AppState>,
+) -> Result<PreparedTransaction, EgoDesktopError> {
+    let mut ledger = Ledger::load();
+    let from = ledger.address.clone();
+    if from.is_empty() {
+        return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
+    }
+    let mut chain = load_chain();
+    let balance   = chain.balance_of(&from);
+    if request.amount == 0 {
+        return Err(EgoDesktopError::InvalidInput("Amount must be > 0".into()));
+    }
+    if request.amount > balance {
+        return Err(EgoDesktopError::InvalidInput(format!(
+            "Insufficient balance: have {} uEGOC, need {}", balance, request.amount
+        )));
+    }
+    let nonce      = ledger.nonce + 1;
+    let ts         = chrono::Utc::now().timestamp();
+    let sign_bytes = tx_signing_bytes(&from, &request.to_address, request.amount, nonce, ts);
+    let signature_hex = if let Some(kp) = state.get_keypair() {
+        hex::encode(kp.sign_ed25519(&sign_bytes).as_bytes())
+    } else {
+        return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
+    };
+    let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+    let tx = LedgerTx {
+        hash: tx_hash.clone(), from: from.clone(), to: request.to_address.clone(),
+        amount: request.amount, memo: request.memo.clone(), timestamp: ts,
+        signature: signature_hex, status: "Pending".into(),
+        block_height: None, nonce,
+    };
+    chain.transactions.push(tx.clone());
+    chain.mine_block(&tx_hash, &from);
+    let block = chain.blocks.last().cloned().ok_or_else(||
+        EgoDesktopError::WalletError("Block not created".into())
+    )?;
+    // DO NOT save — just return JSON for relay submission
+    let tx_json    = serde_json::to_string(&tx).map_err(|e| EgoDesktopError::WalletError(e.to_string()))?;
+    let block_json = serde_json::to_string(&block).map_err(|e| EgoDesktopError::WalletError(e.to_string()))?;
+    Ok(PreparedTransaction { tx_json, block_json, tx_hash, amount: request.amount, from, to: request.to_address })
+}
+
+// ── commit_transaction ────────────────────────────────────────────────────────
+// Called after user confirms via email. Saves tx+block locally and broadcasts.
+
+#[tauri::command]
+pub async fn commit_transaction(
+    tx_json: String,
+    block_json: String,
+) -> Result<TransactionResponse, EgoDesktopError> {
+    let tx: LedgerTx = serde_json::from_str(&tx_json)
+        .map_err(|e| EgoDesktopError::WalletError(format!("Invalid tx JSON: {e}")))?;
+    let block: LedgerBlock = serde_json::from_str(&block_json)
+        .map_err(|e| EgoDesktopError::WalletError(format!("Invalid block JSON: {e}")))?;
+    let mut chain = load_chain();
+    if !chain.transactions.iter().any(|t| t.hash == tx.hash) {
+        chain.transactions.push(tx.clone());
+        chain.blocks.push(block.clone());
+        chain.blocks.sort_by_key(|b| b.height);
+        save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save: {e}")))?;
+    }
+    let mut ledger = Ledger::load();
+    if tx.nonce > ledger.nonce { ledger.nonce = tx.nonce; let _ = ledger.save(); }
+    let block_height = tx.block_height;
+    let tx_hash = tx.hash.clone();
+    let tx2 = tx.clone(); let blk2 = block.clone();
+    let tx3 = tx.clone(); let blk3 = block.clone();
+    tokio::spawn(async move { crate::p2p::push_tx_to_relay(&tx2, &blk2).await; });
+    tokio::spawn(async move { crate::p2p::broadcast_tx(tx3, blk3).await; });
+    Ok(TransactionResponse {
+        hash: tx_hash, success: true,
+        message: "Transaction confirmed and broadcast".into(), block_height,
     })
 }
 

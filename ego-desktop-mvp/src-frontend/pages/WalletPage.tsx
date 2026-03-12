@@ -1,8 +1,11 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { listen } from '@tauri-apps/api/event';
+import { fetch as tauriFetch, Body } from '@tauri-apps/api/http';
 import { useWallet } from '../App';
 import qrcode from 'qrcode-generator';
+
+const RELAY = 'http://40.233.82.42:8080';
 
 function makeQR(text: string): string {
   if (!text) return '';
@@ -92,6 +95,12 @@ const WalletPage: React.FC = () => {
   const [txResult, setTxResult] = useState<TxResult | null>(null);
   const [copied, setCopied] = useState(false);
 
+  // Email confirmation flow
+  type EmailStep = 'idle' | 'waiting' | 'confirmed' | 'cancelled' | 'expired';
+  const [emailStep, setEmailStep]     = useState<EmailStep>('idle');
+  const [emailToken, setEmailToken]   = useState('');
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   useEffect(() => {
     load();
     // Refresh balance + history whenever a peer pushes a new transaction to us.
@@ -119,16 +128,74 @@ const WalletPage: React.FC = () => {
     if (!sendForm.to || !sendForm.amount) return;
     setSending(true);
     try {
-      const res = await invoke<TxResult>('send_transaction', {
-        request: {
-          to_address: sendForm.to,
-          amount: Math.floor(parseFloat(sendForm.amount) * 1_000_000),
-          memo: sendForm.memo || null,
-        },
-      });
-      setTxResult(res);
-      await load();
-      reloadWallet(); // refresh sidebar balance
+      const amount = Math.floor(parseFloat(sendForm.amount) * 1_000_000);
+      const request = { to_address: sendForm.to, amount, memo: sendForm.memo || null };
+
+      // Check if user has a verified email on the relay
+      let hasEmail = false;
+      try {
+        const r = await tauriFetch<{ registered: boolean; email_verified: boolean }>(
+          `${RELAY}/users/${myAddress}`
+        );
+        hasEmail = r.data.registered && r.data.email_verified;
+      } catch {}
+
+      if (hasEmail) {
+        // Email confirmation flow
+        const prepared = await invoke<{
+          tx_json: string; block_json: string; tx_hash: string; amount: number; from: string; to: string;
+        }>('prepare_transaction', { request });
+
+        const res = await tauriFetch<{ success: boolean; message: string }>(
+          `${RELAY}/tx/pending`,
+          { method: 'POST', body: Body.json({
+            address:    prepared.from,
+            tx_json:    prepared.tx_json,
+            block_json: prepared.block_json,
+            tx_type:    'send',
+            amount:     prepared.amount,
+            to:         prepared.to,
+          })}
+        );
+        if (!res.data.success) throw new Error(res.data.message);
+        const token = res.data.message; // relay returns token as message
+        setEmailToken(token);
+        setEmailStep('waiting');
+        setSending(false);
+
+        // Poll /tx/status/:token every 3s
+        pollRef.current = setInterval(async () => {
+          try {
+            const s = await tauriFetch<{ status: string }>(`${RELAY}/tx/status/${token}`);
+            if (s.data.status === 'confirmed') {
+              clearInterval(pollRef.current!);
+              setEmailStep('confirmed');
+              // Commit locally
+              const result = await invoke<TxResult>('commit_transaction', {
+                txJson: prepared.tx_json, blockJson: prepared.block_json,
+              });
+              setTxResult(result);
+              await load(); reloadWallet();
+            } else if (s.data.status === 'cancelled') {
+              clearInterval(pollRef.current!);
+              setEmailStep('cancelled');
+            } else if (s.data.status === 'expired') {
+              clearInterval(pollRef.current!);
+              setEmailStep('expired');
+            }
+          } catch {}
+        }, 3000);
+
+        // Auto-expire after 31 min
+        setTimeout(() => {
+          if (pollRef.current) { clearInterval(pollRef.current); setEmailStep('expired'); }
+        }, 31 * 60 * 1000);
+      } else {
+        // No email registered — send directly
+        const res = await invoke<TxResult>('send_transaction', { request });
+        setTxResult(res);
+        await load(); reloadWallet();
+      }
     } catch (e: any) {
       setTxResult({ hash: '', success: false, message: String(e) });
     } finally {
@@ -137,9 +204,12 @@ const WalletPage: React.FC = () => {
   }
 
   function resetSend() {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
     setShowSend(false);
     setSendForm({ to: '', amount: '', memo: '' });
     setTxResult(null);
+    setEmailStep('idle');
+    setEmailToken('');
   }
 
   async function copyAddr() {
@@ -270,7 +340,37 @@ const WalletPage: React.FC = () => {
       {showSend && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
           <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-md border border-gray-700 shadow-2xl">
-            {txResult ? (
+            {emailStep === 'waiting' ? (
+              <div className="text-center space-y-4">
+                <div className="text-5xl">📧</div>
+                <div className="text-xl font-bold">Check Your Email</div>
+                <p className="text-sm text-gray-400">
+                  A confirmation email was sent to your registered address.<br />
+                  Click <strong className="text-white">Confirm</strong> in the email to complete the transaction.
+                </p>
+                <div className="flex items-center justify-center gap-2 text-sm text-gray-400">
+                  <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+                  Waiting for confirmation…
+                </div>
+                <button onClick={resetSend} className="w-full bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition">
+                  Cancel
+                </button>
+              </div>
+            ) : emailStep === 'cancelled' ? (
+              <div className="text-center space-y-4">
+                <div className="text-5xl">❌</div>
+                <div className="text-xl font-bold">Transaction Cancelled</div>
+                <p className="text-sm text-gray-400">You cancelled this transaction via email. No funds were moved.</p>
+                <button onClick={resetSend} className="w-full bg-blue-600 hover:bg-blue-500 py-3 rounded-xl font-semibold transition">Close</button>
+              </div>
+            ) : emailStep === 'expired' ? (
+              <div className="text-center space-y-4">
+                <div className="text-5xl">⏰</div>
+                <div className="text-xl font-bold">Confirmation Expired</div>
+                <p className="text-sm text-gray-400">The confirmation link expired. Please try sending again.</p>
+                <button onClick={resetSend} className="w-full bg-blue-600 hover:bg-blue-500 py-3 rounded-xl font-semibold transition">Close</button>
+              </div>
+            ) : txResult ? (
               <div className="text-center space-y-4">
                 <div className="text-5xl">{txResult.success ? '✅' : '❌'}</div>
                 <div className="text-xl font-bold">
