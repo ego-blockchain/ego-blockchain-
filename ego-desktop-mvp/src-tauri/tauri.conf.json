@@ -57,6 +57,11 @@
       "path": {
         "all": true
       },
+      "http": {
+        "all": false,
+        "request": true,
+        "scope": ["http://40.233.82.42:8080/**"]
+      },
       "process": {
         "all": false,
         "relaunch": true,
