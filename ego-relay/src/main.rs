@@ -441,17 +441,6 @@ async fn post_register(
     ));
     send_email(&s.mailer, &s.config.smtp_from, &req.email, "Verify your Ego Blockchain email", user_body).await;
 
-    let support_body = email_html("New User Registration", &format!(
-        r#"<p>A new user registered on Ego Blockchain.</p>
-        <table><tr><td style="color:#94a3b8">Name</td><td><strong>{name}</strong></td></tr>
-        <tr><td style="color:#94a3b8">Email</td><td>{email}</td></tr>
-        <tr><td style="color:#94a3b8">Wallet</td><td style="font-family:monospace;font-size:12px">{addr}</td></tr>
-        <tr><td style="color:#94a3b8">Time</td><td>{time}</td></tr></table>"#,
-        name = req.name, email = req.email, addr = req.address,
-        time = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC"),
-    ));
-    send_email(&s.mailer, &s.config.smtp_from, &s.config.support_email, &format!("New Ego User: {}", req.name), support_body).await;
-
     println!("[users] Registered {} <{}>", req.name, req.email);
     (StatusCode::OK, Json(ApiResponse { success: true, message: "Verification email sent.".into() }))
 }
