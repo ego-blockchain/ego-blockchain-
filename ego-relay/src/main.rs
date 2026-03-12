@@ -863,6 +863,8 @@ async fn main() {
             .route("/users/change-email",              post(post_change_email))
             .route("/users/confirm-email-change/:token", get(get_confirm_email_change))
             .route("/users/reset-pin",                 post(post_reset_pin))
+            .route("/users/pin-reset/:token",          get(get_pin_reset))
+            .route("/users/pin-reset-status/:address", get(get_pin_reset_status))
             .route("/users/:address",                  get(get_user))
             .route("/tx/pending",           post(post_pending_tx))
             .route("/tx/confirm/:token",    get(get_confirm_tx))
@@ -981,6 +983,65 @@ align-items:center;justify-content:center;min-height:100vh;margin:0}}
         None => (StatusCode::BAD_REQUEST,
             axum::response::Html("<h1>Invalid or expired link.</h1>".into())),
     }
+}
+
+
+async fn get_pin_reset(
+    Path(token): Path<String>,
+    State(s): State<AppState>,
+) -> (StatusCode, axum::response::Html<String>) {
+    let now = chrono::Utc::now().timestamp();
+    let mut users = s.users.write().unwrap();
+    let valid = users.iter_mut().find(|u| {
+        u.pin_reset_token.as_deref() == Some(&token)
+            && u.pin_reset_expiry.map(|e| e > now).unwrap_or(false)
+    }).map(|u| {
+        u.pin_reset_token  = Some(format!("confirmed:{}", token));
+        u.pin_reset_expiry = Some(now + 300);
+        true
+    }).unwrap_or(false);
+    if valid { save_users(&users); }
+    drop(users);
+    if valid {
+        (StatusCode::OK, axum::response::Html(format!(r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>PIN Reset Confirmed</title>
+<style>body{{font-family:sans-serif;background:#0f172a;color:#e2e8f0;display:flex;
+align-items:center;justify-content:center;min-height:100vh;margin:0}}
+.card{{background:#1e293b;border-radius:16px;padding:48px;text-align:center;max-width:400px}}
+.icon{{font-size:64px}}h1{{color:#34d399}}</style></head>
+<body><div class="card"><div class="icon">✅</div>
+<h1>PIN Reset Confirmed!</h1>
+<p>Return to the Ego Desktop app — you will be prompted to set a new PIN.</p>
+<p style="color:#94a3b8;font-size:13px">This window can be closed.</p>
+</div></body></html>"#)))
+    } else {
+        (StatusCode::BAD_REQUEST, axum::response::Html(
+            "<h1>Invalid or expired reset link.</h1>".into()
+        ))
+    }
+}
+
+async fn get_pin_reset_status(
+    Path(address): Path<String>,
+    State(s): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let users = s.users.read().unwrap();
+    let confirmed = users.iter().find(|u| u.address == address)
+        .map(|u| u.pin_reset_token.as_deref()
+            .map(|t| t.starts_with("confirmed:"))
+            .unwrap_or(false))
+        .unwrap_or(false);
+    drop(users);
+    if confirmed {
+        // Clear the token so it can only be used once
+        let mut users = s.users.write().unwrap();
+        if let Some(u) = users.iter_mut().find(|u| u.address == address) {
+            u.pin_reset_token  = None;
+            u.pin_reset_expiry = None;
+            save_users(&users);
+        }
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "confirmed": confirmed })))
 }
 
 fn load_or_create_identity() -> libp2p::identity::Keypair {
