@@ -1,6 +1,6 @@
 [package]
 name = "ego-relay"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 
 # Standalone binary — not part of the workspace
@@ -16,3 +16,7 @@ axum = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+# ── new ──
+lettre = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "smtp-transport", "builder"] }
+uuid   = { version = "1",    features = ["v4"] }

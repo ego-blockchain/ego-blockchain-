@@ -15,6 +15,7 @@ import StakingPage from './pages/StakingPage';
 import ExplorerPage from './pages/ExplorerPage';
 import SettingsPage from './pages/SettingsPage';
 import MessengerPage from './pages/MessengerPage';
+import RegistrationFlow from './components/RegistrationFlow';
 
 // ── Theme context ─────────────────────────────────────────────────────────────
 
@@ -207,6 +208,9 @@ function App() {
     (localStorage.getItem('ego-theme') as Theme) ?? 'dark'
   );
 
+  // ── new: tracks whether this address completed the registration flow ───────
+  const [registered, setRegistered] = useState(false);
+
   function toggleTheme() {
     setTheme(t => {
       const next = t === 'dark' ? 'light' : 'dark';
@@ -238,6 +242,9 @@ function App() {
       const info = await Promise.race([invoke<WalletInfo>('init_wallet'), timeout]);
       setWallet(info);
       await loadRegistry();
+      // Check if this address already completed registration
+      const done = localStorage.getItem(`ego-registered-${info.address}`) === 'true';
+      setRegistered(done);
     } catch (e) {
       console.error('init_wallet failed:', e);
       setInitError(e instanceof Error ? e.message : String(e));
@@ -251,7 +258,7 @@ function App() {
     initWallet();
   }, []);
 
-  // Show consent gate before anything else — blocks the whole app.
+  // 1. Terms gate — unchanged
   if (!termsAgreed) {
     return (
       <div data-theme={theme} className="flex flex-col h-screen bg-gray-900">
@@ -268,6 +275,7 @@ function App() {
     );
   }
 
+  // 2. Loading — unchanged
   if (loading) {
     return (
       <div data-theme={theme} className="flex flex-col h-screen bg-gray-900">
@@ -283,6 +291,7 @@ function App() {
     );
   }
 
+  // 3. Init error — unchanged
   if (initError) {
     return (
       <div data-theme={theme} className="flex flex-col h-screen bg-gray-900">
@@ -306,6 +315,28 @@ function App() {
     );
   }
 
+  // 4. Registration flow — shown once after terms + wallet init, before main app
+  if (!registered && wallet) {
+    return (
+      <ThemeContext.Provider value={{ theme, toggleTheme }}>
+        <WalletContext.Provider
+          value={{ wallet, registry, loading, reload: initWallet, reloadRegistry: loadRegistry }}
+        >
+          <div data-theme={theme} className="flex flex-col h-screen bg-gray-900">
+            <TitleBar />
+            <div className="flex-1 overflow-auto">
+              <RegistrationFlow
+                address={wallet.address}
+                onComplete={() => setRegistered(true)}
+              />
+            </div>
+          </div>
+        </WalletContext.Provider>
+      </ThemeContext.Provider>
+    );
+  }
+
+  // 5. Main app — unchanged
   return (
     <ThemeContext.Provider value={{ theme, toggleTheme }}>
       <WalletContext.Provider
