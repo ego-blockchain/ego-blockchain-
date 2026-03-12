@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { open as openUrl } from '@tauri-apps/api/shell';
+import { fetch as tauriFetch, Body } from '@tauri-apps/api/http';
 import { useWallet } from '../App';
 import qrcode from 'qrcode-generator';
 
@@ -58,9 +59,8 @@ const SettingsPage: React.FC = () => {
   useEffect(() => {
     invoke<{ has_pin: boolean }>('get_pin_status').then(s => setHasPin(s.has_pin)).catch(() => {});
     if (wallet?.address) {
-      fetch(`${RELAY}/users/${wallet.address}`)
-        .then(r => r.json())
-        .then(d => { if (d.email_masked) setMaskedEmail(d.email_masked); })
+      tauriFetch<{ email_masked?: string }>(`${RELAY}/users/${wallet.address}`)
+        .then(r => { if (r.data.email_masked) setMaskedEmail(r.data.email_masked); })
         .catch(() => {});
     }
   }, [wallet?.address]);
@@ -93,12 +93,11 @@ const SettingsPage: React.FC = () => {
     if (!wallet?.address) return;
     setResetLoading(true); setResetMsg('');
     try {
-      const res  = await fetch(`${RELAY}/users/reset-pin`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ address: wallet.address }),
-      });
-      const data = await res.json();
+      const res  = await tauriFetch<{ success: boolean; message: string }>(
+        `${RELAY}/users/reset-pin`,
+        { method: 'POST', body: Body.json({ address: wallet.address }) }
+      );
+      const data = res.data;
       if (data.success) {
         setResetSent(true);
         setResetMsg(`PIN reset link sent to ${maskedEmail || 'your email'}.`);

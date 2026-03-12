@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
+import { fetch as tauriFetch, Body } from '@tauri-apps/api/http';
 
 const RELAY = 'http://40.233.82.42:8080';
 
@@ -27,12 +28,11 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { setError('Please enter a valid email address.'); return; }
     setLoading(true); setError('');
     try {
-      const res = await fetch(`${RELAY}/users/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ address, name: name.trim(), email: email.trim() }),
-      });
-      const data = await res.json();
+      const res = await tauriFetch<{ success: boolean; message: string }>(
+        `${RELAY}/users/register`,
+        { method: 'POST', body: Body.json({ address, name: name.trim(), email: email.trim() }) }
+      );
+      const data = res.data;
       if (!data.success) { setError(data.message); return; }
       setStep('verify_pending');
       startPollingVerification();
@@ -47,8 +47,8 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
     setPolling(true);
     const interval = setInterval(async () => {
       try {
-        const res  = await fetch(`${RELAY}/users/${address}`);
-        const data = await res.json();
+        const res  = await tauriFetch<{ email_verified: boolean }>(`${RELAY}/users/${address}`);
+        const data = res.data;
         if (data.email_verified) {
           clearInterval(interval);
           setPolling(false);
