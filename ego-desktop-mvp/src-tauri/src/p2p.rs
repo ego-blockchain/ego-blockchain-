@@ -979,14 +979,14 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
             .show();
             let _ = app.emit_all("ego://contact-request", &contact);
         }
-            P2PMessage::FileChunk { .. } => {
-                eprintln!("[P2P] FileChunk ignored — 50MB max file size enforced at upload");
-            }
 
-            P2PMessage::FileChunkComplete { .. } => {
-                eprintln!("[P2P] FileChunkComplete ignored — 50MB max file size enforced at upload");
-            }
-}
+        P2PMessage::FileChunk { .. } => {
+            eprintln!("[P2P] FileChunk ignored — 50MB max file size enforced at upload");
+        }
+
+        P2PMessage::FileChunkComplete { .. } => {
+            eprintln!("[P2P] FileChunkComplete ignored — 50MB max file size enforced at upload");
+        }
 
         P2PMessage::ContactResponse {
             from_addr, from_name, from_ed25519, from_kyber, approved, shared_key,
@@ -1283,6 +1283,7 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
     }
 }
     }
+}
 
 
 // ── Chain helpers ─────────────────────────────────────────────────────────────
