@@ -127,20 +127,37 @@ fn parse_msg_bundle(
         parts[5].to_string(),
     ))
 }
-
-// ── FIX: resolve_endpoint ─────────────────────────────────────────────────────
-// Before every send, check the relay HTTP directory for a fresher endpoint.
-// Relay circuit addresses (/p2p-circuit) are always preferred over raw IPs.
-//
-// Why this matters:
-//   - Stored contact.endpoint may be a stale LAN IP or raw public IP from
-//     before the peer had a relay circuit.
-//   - The relay HTTP directory is updated by every peer on ReservationReqAccepted.
-//   - Using a stale raw IP → "actively refused" or "timeout" errors.
-//   - Even if stored endpoint has /p2p-circuit, the peer may have reconnected
-//     and gotten a new reservation — always do a live lookup to be safe.
+// ── resolve_endpoint ──────────────────────────────────────────────────────────
+// Always do a live relay HTTP lookup first — this gives us the peer's current
+// circuit address regardless of what's stored locally. If the peer has a new
+// peer ID (reinstall, new device) or reconnected and got a new reservation,
+// the relay directory always has the truth.
 async fn resolve_endpoint(contact_addr: &str, stored_endpoint: &str) -> String {
-    // 1. Check file-based peer cache (populated by fetch_peers_from_relay).
+    // 1. Live relay HTTP lookup — always fresh, handles peer ID changes
+    if let Some(live_ep) = crate::p2p::get_relay_endpoint(contact_addr).await {
+        if !live_ep.is_empty() {
+            // Persist so future sends skip the HTTP round-trip on cache hit
+            let mut contacts = load_contacts();
+            if let Some(c) = contacts.iter_mut().find(|c| c.address == contact_addr) {
+                if c.endpoint != live_ep {
+                    eprintln!("[Messenger] Relay: updated endpoint for {}: {}", contact_addr, live_ep);
+                    c.endpoint = live_ep.clone();
+                    let _ = save_contacts(&contacts);
+                }
+            }
+            // Also update peer cache
+            crate::p2p::upsert_peer_cache(crate::p2p::PeerEntry {
+                address:   contact_addr.to_string(),
+                endpoint:  live_ep.clone(),
+                last_seen: chrono::Utc::now().timestamp(),
+                city:      None,
+                country:   None,
+            });
+            return live_ep;
+        }
+    }
+
+    // 2. Fall back to file-based peer cache (populated by fetch_peers_from_relay)
     let cache = crate::p2p::load_peer_cache();
     if let Some(entry) = cache.iter().find(|p| p.address == contact_addr) {
         if !entry.endpoint.is_empty() {
