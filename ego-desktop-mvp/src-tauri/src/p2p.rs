@@ -1069,7 +1069,7 @@ P2PMessage::ChatMessage { bundle } => {
                     &app.config().tauri.bundle.identifier,
                 )
                 .title("File Received")
-                .body(&format!("{} sent you a file: {}", msg.from_name, file_name))
+                .body(&format!("You received a file: {}", file_name))
                 .show();
             } else {
                 // Only show "New Message" notification for text messages.
