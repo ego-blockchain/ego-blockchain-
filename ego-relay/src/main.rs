@@ -162,10 +162,11 @@ fn save_peers(peers: &[PeerEntry]) {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct InboxMessage {
-    /// JSON-serialised P2PMessage, base64-encoded
-    payload:   String,
+    payload:   String,   // empty string if stored on disk
     deposited: i64,
     from_addr: String,
+    #[serde(default)]
+    disk_path: Option<String>,  // set if payload is on disk
 }
 
 // ── User registration ─────────────────────────────────────────────────────────
@@ -362,35 +363,81 @@ async fn post_block(
     StatusCode::OK
 }
 
-/// POST /inbox/:address — deposit a message for an offline peer.
+const INBOX_DISK_THRESHOLD: usize = 1 * 1024 * 1024; // 1 MB
+const INBOX_DIR: &str = "inbox_files";
+
 async fn post_inbox(
     Path(address): Path<String>,
     State(s): State<AppState>,
     Json(msg): Json<InboxMessage>,
 ) -> StatusCode {
-    if address.is_empty() || msg.payload.is_empty() {
+    if address.is_empty() || (msg.payload.is_empty() && msg.disk_path.is_none()) {
         return StatusCode::BAD_REQUEST;
     }
+    let _ = std::fs::create_dir_all(INBOX_DIR);
+
+    let stored_msg = if msg.payload.len() > INBOX_DISK_THRESHOLD {
+        // Write payload to disk
+        let file_name = format!("{}/{}_{}.bin", INBOX_DIR, address, uuid::Uuid::new_v4());
+        if let Err(e) = std::fs::write(&file_name, msg.payload.as_bytes()) {
+            eprintln!("[inbox] Failed to write to disk: {}", e);
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+        println!("[inbox] Stored large message for {} on disk ({} bytes)", 
+            address, msg.payload.len());
+        InboxMessage {
+            payload:   String::new(),
+            deposited: msg.deposited,
+            from_addr: msg.from_addr,
+            disk_path: Some(file_name),
+        }
+    } else {
+        msg
+    };
+
     let mut map = s.inbox.write().unwrap();
     let bucket = map.entry(address.clone()).or_default();
-    if !bucket.iter().any(|m| m.payload == msg.payload) {
-        println!("[inbox] Stored message for {} from {}", address, msg.from_addr);
-        bucket.push(msg);
+    if !bucket.iter().any(|m| m.disk_path == stored_msg.disk_path && !stored_msg.disk_path.is_none())
+        && !bucket.iter().any(|m| !m.payload.is_empty() && m.payload == stored_msg.payload) {
+        bucket.push(stored_msg);
     }
     StatusCode::OK
 }
 
-/// GET /inbox/:address — fetch and clear all pending messages.
 async fn get_inbox(
     Path(address): Path<String>,
     State(s): State<AppState>,
 ) -> Json<Vec<InboxMessage>> {
     let mut map = s.inbox.write().unwrap();
     let msgs = map.remove(&address).unwrap_or_default();
-    if !msgs.is_empty() {
-        println!("[inbox] Delivered {} message(s) to {}", msgs.len(), address);
+    if msgs.is_empty() {
+        return Json(vec![]);
     }
-    Json(msgs)
+    println!("[inbox] Delivering {} message(s) to {}", msgs.len(), address);
+
+    // Rehydrate disk-backed messages
+    let mut result = Vec::new();
+    for msg in msgs {
+        if let Some(ref path) = msg.disk_path {
+            match std::fs::read_to_string(path) {
+                Ok(payload) => {
+                    let _ = std::fs::remove_file(path); // clean up
+                    result.push(InboxMessage {
+                        payload,
+                        deposited: msg.deposited,
+                        from_addr: msg.from_addr,
+                        disk_path: None,
+                    });
+                }
+                Err(e) => {
+                    eprintln!("[inbox] Failed to read disk message {}: {}", path, e);
+                }
+            }
+        } else {
+            result.push(msg);
+        }
+    }
+    Json(result)
 }
 
 // ── HTTP handlers — new email/user/tx endpoints ───────────────────────────────
@@ -877,7 +924,8 @@ async fn main() {
                     .allow_origin(Any)
                     .allow_methods([Method::GET, Method::POST])
                     .allow_headers(Any),
-            );
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024 * 1024));
 
         let listener = tokio::net::TcpListener::bind(&http_addr).await
             .expect("HTTP bind failed");
