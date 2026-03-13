@@ -925,7 +925,7 @@ async fn main() {
                     .allow_methods([Method::GET, Method::POST])
                     .allow_headers(Any),
             )
-            .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024 * 1024));
+            .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024));
 
         let listener = tokio::net::TcpListener::bind(&http_addr).await
             .expect("HTTP bind failed");
