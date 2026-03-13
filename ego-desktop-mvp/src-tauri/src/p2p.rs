@@ -1056,11 +1056,11 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                 country:   None,
             });
         }
-
 P2PMessage::ChatMessage { bundle } => {
     match crate::commands::messenger::receive_message_inner(&bundle) {
         Ok(msg) => {
             if msg.message_type == "file_bundle" {
+                use base64::Engine as _;
                 let parts: Vec<&str> = msg.content.splitn(5, ':').collect();
                 let file_name = parts.get(3)
                     .and_then(|n| base64::engine::general_purpose::STANDARD.decode(n).ok())
