@@ -982,21 +982,33 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
 
 P2PMessage::FileChunkComplete { cid, file_name, enc_data_b64 } => {
     if enc_data_b64.starts_with("CHUNKED:") {
-        // Parse manifest: CHUNKED:<total_chunks>:<key_nonce_hex>:<size>
         let parts: Vec<&str> = enc_data_b64.splitn(4, ':').collect();
         let total_chunks: u32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         let key_nonce_hex = parts.get(2).unwrap_or(&"").to_string();
-        eprintln!("[P2P] Chunk manifest for {}: {} chunks expected", cid, total_chunks);
+        eprintln!("[P2P] Chunk manifest for {}: {} chunks, key len={}", cid, total_chunks, key_nonce_hex.len());
 
-        // Store manifest in ledger so we know what to expect
         let mut ledger = crate::ledger::Ledger::load();
         if let Some(f) = ledger.stored_files.iter_mut().find(|f| f.cid == cid) {
-            f.key_nonce_hex = key_nonce_hex;
+            if !key_nonce_hex.is_empty() { f.key_nonce_hex = key_nonce_hex; }
             f.status = "chunked_incoming".to_string();
-            let _ = ledger.save();
+        } else {
+            // Create placeholder so key is saved before chunks arrive
+            let now = chrono::Utc::now().timestamp();
+            ledger.stored_files.push(crate::ledger::StoredFile {
+                cid:             cid.clone(),
+                name:            file_name,
+                original_size:   0,
+                encrypted_size:  0,
+                duration_months: 0,
+                stored_at:       now,
+                expiry:          0,
+                status:          "chunked_incoming".to_string(),
+                key_nonce_hex,
+                local_path:      String::new(),
+                owner:           String::new(),
+            });
         }
-    } else {
-        eprintln!("[P2P] FileChunkComplete ignored — use FileData for non-chunked files");
+        let _ = ledger.save();
     }
 }
 
@@ -1004,9 +1016,10 @@ P2PMessage::FileChunk { cid, chunk_index, total_chunks, data_b64, file_name } =>
     use base64::Engine as _;
     eprintln!("[P2P] FileChunk {}/{} for {}", chunk_index + 1, total_chunks, cid);
 
-    // Store chunk to a temp file
-    let storage    = crate::ledger::storage_dir();
-    let chunk_path = storage.join(format!("{}.chunk.{}", &cid[cid.len().saturating_sub(16)..], chunk_index));
+    let storage = crate::ledger::storage_dir();
+    let short   = &cid[cid.len().saturating_sub(16)..];
+    let chunk_path = storage.join(format!("{}.chunk.{}", short, chunk_index));
+
     match base64::engine::general_purpose::STANDARD.decode(&data_b64) {
         Err(e) => { eprintln!("[P2P] Chunk decode error: {}", e); return; }
         Ok(bytes) => {
@@ -1016,8 +1029,6 @@ P2PMessage::FileChunk { cid, chunk_index, total_chunks, data_b64, file_name } =>
         }
     }
 
-    // Check if all chunks are present
-    let short = &cid[cid.len().saturating_sub(16)..];
     let all_present = (0..total_chunks).all(|i| {
         storage.join(format!("{}.chunk.{}", short, i)).exists()
     });
@@ -1038,11 +1049,18 @@ P2PMessage::FileChunk { cid, chunk_index, total_chunks, data_b64, file_name } =>
             eprintln!("[P2P] Assembled write error: {}", e); return;
         }
 
-        let mut ledger = crate::ledger::Ledger::load();
-        let enc_str    = enc_path.to_string_lossy().to_string();
+        let mut ledger    = crate::ledger::Ledger::load();
+        let enc_str       = enc_path.to_string_lossy().to_string();
+        // Pull key saved by the manifest (FileChunkComplete)
+        let key_nonce_hex = ledger.stored_files.iter()
+            .find(|f| f.cid == cid)
+            .map(|f| f.key_nonce_hex.clone())
+            .unwrap_or_default();
+
         if let Some(f) = ledger.stored_files.iter_mut().find(|f| f.cid == cid) {
-            f.local_path = enc_str.clone();
-            f.status     = "Received".to_string();
+            f.local_path     = enc_str.clone();
+            f.status         = "Received".to_string();
+            f.encrypted_size = assembled.len() as u64;
             if f.name.is_empty() { f.name = file_name.clone(); }
         } else {
             let now = chrono::Utc::now().timestamp();
@@ -1055,13 +1073,13 @@ P2PMessage::FileChunk { cid, chunk_index, total_chunks, data_b64, file_name } =>
                 stored_at:       now,
                 expiry:          0,
                 status:          "Received".to_string(),
-                key_nonce_hex:   String::new(),
+                key_nonce_hex,
                 local_path:      enc_str,
                 owner:           String::new(),
             });
         }
         let _ = ledger.save();
-        eprintln!("[P2P] File reassembled for {}", cid);
+        eprintln!("[P2P] File reassembled and saved for {}", cid);
         let _ = app.emit_all("ego://file-downloaded", serde_json::json!({ "cid": cid }));
     }
 }
