@@ -1337,7 +1337,7 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
     }
 }
     }
-}
+
 
 // ── Chain helpers ─────────────────────────────────────────────────────────────
 
