@@ -385,38 +385,58 @@ pub async fn save_file_to_disk(
 }
 
 // ── request_file_from_contact ─────────────────────────────────────────────────
-
-/// Request a file from the sender via P2P (for received files with no local copy).
 #[tauri::command]
 pub async fn request_file_from_contact(
-    cid: String,
+    cid:       String,
     from_addr: String,
-    _state: State<'_, AppState>,
+    content:   String,   // full file_bundle content string for ledger import
+    app:       tauri::AppHandle,
+    _state:    State<'_, AppState>,
 ) -> Result<(), EgoDesktopError> {
     use crate::commands::messenger::load_contacts;
+
+    // 1. Import into ledger so EgoSafe shows it immediately (as "pending download")
+    crate::commands::notifications::try_auto_import(&app, &content, &from_addr).await;
+
+    // 2. Find contact and build endpoint list
     let contacts = load_contacts();
     let contact = contacts.iter()
         .find(|c| c.address == from_addr && c.status == "approved")
         .ok_or_else(|| EgoDesktopError::NotFound("Contact not found".into()))?;
-    let endpoint = crate::p2p::get_relay_endpoint(&from_addr).await
-        .unwrap_or_else(|| contact.endpoint.clone());
-    let my_ledger  = crate::ledger::Ledger::load();
-    let my_addr    = my_ledger.address.clone();
+
+    let my_addr     = crate::ledger::Ledger::load().address.clone();
     let my_endpoint = crate::p2p::get_public_endpoint().await;
     let msg = crate::p2p::P2PMessage::FileRequest {
-        cid,
+        cid:                cid.clone(),
         requester_addr:     my_addr.clone(),
         requester_endpoint: my_endpoint,
     };
-    if endpoint.is_empty() {
-        // Sender has no live endpoint — queue in relay inbox, they'll process it on next startup.
+
+    // 3. Build multi-path endpoint list: all_endpoints first, fallback to relay lookup
+    let mut eps = contact.all_endpoints.clone();
+    if eps.is_empty() {
+        let relay_ep = crate::p2p::get_relay_endpoint(&from_addr).await
+            .unwrap_or_else(|| contact.endpoint.clone());
+        if !relay_ep.is_empty() {
+            eps.push(relay_ep);
+        }
+    }
+    if !eps.contains(&contact.endpoint) && !contact.endpoint.is_empty() {
+        eps.push(contact.endpoint.clone());
+    }
+
+    if eps.is_empty() {
+        // No endpoint at all — drop in inbox, sender will process on next startup
+        eprintln!("[FileRequest] No endpoint for {} — depositing in relay inbox", from_addr);
         crate::commands::messenger::deposit_in_relay_inbox(&from_addr, &my_addr, &msg).await;
         return Ok(());
     }
-    if let Err(e) = crate::p2p::send_message(&endpoint, &msg).await {
-        eprintln!("[FileRequest] P2P failed: {} — depositing in relay inbox for {}", e, from_addr);
+
+    if let Err(e) = crate::p2p::send_message_any(&eps, &msg).await {
+        eprintln!("[FileRequest] All paths failed: {} — depositing in relay inbox", e);
         crate::commands::messenger::deposit_in_relay_inbox(&from_addr, &my_addr, &msg).await;
     }
+
     Ok(())
 }
 

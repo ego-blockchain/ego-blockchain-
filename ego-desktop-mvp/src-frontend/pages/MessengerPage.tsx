@@ -572,22 +572,38 @@ const MessengerPage: React.FC = () => {
                           {msgTypeLabel(m.message_type)}
                         </div>
                       )}
-                      {isFileBundle ? (
-                        <div className="space-y-2">
-                          <div className="text-xs font-mono break-all text-purple-200 bg-black/20 rounded-lg px-2 py-1.5 max-h-20 overflow-hidden">
-                            {m.content.slice(0, 60)}…
+{isFileBundle ? (() => {
+                        const parts = m.content.trim().split(':');
+                        const cid          = parts[1] ?? '';
+                        const key_nonce_hex = parts[2] ?? '';
+                        const name64       = parts[3] ?? '';
+                        const from_address = parts[4] ?? '';
+                        let display_name   = cid.slice(0, 12);
+                        try { display_name = decodeURIComponent(escape(atob(name64))); } catch {}
+                        return (
+                        <div className="space-y-2 min-w-[200px]">
+                          {/* File card */}
+                          <div className="flex items-center gap-2 bg-black/20 rounded-xl px-3 py-2">
+                            <span className="text-2xl shrink-0">📎</span>
+                            <div className="min-w-0">
+                              <div className="text-sm font-medium truncate">{display_name}</div>
+                              <div className="text-xs text-gray-400 font-mono">{cid.slice(0, 14)}…</div>
+                            </div>
                           </div>
+                          {/* Import button — only for incoming messages */}
                           {!m.outgoing && (
                             <button
                               onClick={async () => {
-                                const parts = m.content.trim().split(':');
-                                if (parts.length < 5) return;
-                                const [, cid, key_nonce_hex, name64, from_address] = parts;
-                                let display_name = cid.slice(0, 12);
-                                try { display_name = decodeURIComponent(escape(atob(name64))); } catch {}
+                                if (imported) return;
                                 try {
+                                  // Step 1: register in ledger
                                   await invoke('import_shared_file', {
                                     bundle: { cid, key_nonce_hex, display_name, from_address },
+                                  });
+                                  // Step 2: request the actual file data from sender
+                                  await invoke('request_file_from_contact', {
+                                    cid,
+                                    fromAddr: from_address,
                                   });
                                   setImportedIds(s => new Set([...s, m.id]));
                                 } catch (e) { console.error(e); }
@@ -599,11 +615,17 @@ const MessengerPage: React.FC = () => {
                                   : 'bg-purple-600 hover:bg-purple-500 text-white'
                               }`}
                             >
-                              {imported ? '✓ Imported to Storage' : '📥 Import File'}
+                              {imported ? '✓ Importing… check EgoSafe' : '📥 Import File'}
                             </button>
                           )}
+                          {m.outgoing && (
+                            <div className="text-xs text-center text-gray-400 py-0.5">
+                              Sent — waiting for recipient to import
+                            </div>
+                          )}
                         </div>
-                      ) : (
+                        );
+                      })() : (
                         <p className="text-sm break-all whitespace-pre-wrap">{m.content}</p>
                       )}
                       <p className={`text-xs mt-1 text-right ${m.outgoing ? 'text-blue-200' : 'text-gray-400'}`}>

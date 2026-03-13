@@ -1061,42 +1061,16 @@ P2PMessage::ChatMessage { bundle } => {
     match crate::commands::messenger::receive_message_inner(&bundle) {
         Ok(msg) => {
             if msg.message_type == "file_bundle" {
-                // Auto-import into ledger so it appears in EgoSafe immediately.
-                crate::commands::notifications::try_auto_import(
-                    app, &msg.content, &msg.from,
-                ).await;
-                // Immediately request the file from sender — no manual action needed
+                // Just deliver to chat — user clicks "Import File" to download.
+                // Show a notification so they know a file arrived.
                 let parts: Vec<&str> = msg.content.splitn(5, ':').collect();
-                if parts.len() >= 2 {
-                    let cid       = parts[1].to_string();
-                    let from_addr = msg.from.clone();
-                    let app_clone = app.clone();
-                    tokio::spawn(async move {
-                        // Small delay so sender's ledger entry is ready
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        let contacts = load_contacts();
-                        if let Some(contact) = contacts.iter().find(|c| {
-                            c.address == from_addr && !c.endpoint.is_empty()
-                        }) {
-                            let endpoint  = contact.endpoint.clone();
-                            let my_ep     = get_public_endpoint().await;
-                            let my_addr   = crate::ledger::Ledger::load().address;
-                            let file_req  = P2PMessage::FileRequest {
-                                cid:                cid.clone(),
-                                requester_addr:     my_addr,
-                                requester_endpoint: my_ep,
-                            };
-                            let all_eps = contact.all_endpoints.clone();
-                            let mut eps = if all_eps.is_empty() { vec![endpoint.clone()] } else { all_eps };
-                            if !eps.contains(&endpoint) { eps.push(endpoint.clone()); }
-                            if let Err(e) = send_message_any(&eps, &file_req).await {
-                                eprintln!("[P2P] Auto file request failed: {}", e);
-                            } else {
-                                eprintln!("[P2P] Auto-requested file {} from {}", cid, endpoint);
-                            }
-                        }
-                    });
-                }
+                let file_name = parts.get(2).unwrap_or(&"File").to_string();
+                let _ = tauri::api::notification::Notification::new(
+                    &app.config().tauri.bundle.identifier,
+                )
+                .title("File Received")
+                .body(&format!("{} sent you a file: {}", msg.from_name, file_name))
+                .show();
             } else {
                 // Only show "New Message" notification for text messages.
                 // Record the sender so window focus opens their chat.
