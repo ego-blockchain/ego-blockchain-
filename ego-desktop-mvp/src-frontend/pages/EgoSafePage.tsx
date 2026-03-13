@@ -114,20 +114,20 @@ const EgoSafePage: React.FC = () => {
   const [previewLoading, setPreviewLoading] = useState(false);
 
 
-  useEffect(() => {
-    loadStoredFiles();
-    invoke<Contact[]>('get_contacts')
-      .then(cs => setContacts(cs.filter(c => c.status === 'approved')))
-      .catch(() => {});
-    // Refresh when a new message arrives (file bundles auto-import in backend)
-    const unlistenMsg = listen('ego://message-received', () => { loadStoredFiles(); });
-    // Refresh when a P2P file download completes
-    const unlistenDl  = listen('ego://file-downloaded', () => { loadStoredFiles(); });
-    return () => {
-      unlistenMsg.then(fn => fn());
-      unlistenDl.then(fn => fn());
-    };
-  }, []);
+useEffect(() => {
+  loadStoredFiles();
+  invoke<Contact[]>('get_contacts')
+    .then(cs => setContacts(cs.filter(c => c.status === 'approved')))
+    .catch(() => {});
+  const unlistenMsg    = listen('ego://message-received', () => { loadStoredFiles(); });
+  const unlistenDl     = listen('ego://file-downloaded',  () => { loadStoredFiles(); });
+  const unlistenFailed = listen('ego://file-failed',      () => { loadStoredFiles(); });
+  return () => {
+    unlistenMsg.then(fn => fn());
+    unlistenDl.then(fn => fn());
+    unlistenFailed.then(fn => fn());
+  };
+}, []);
 
   async function loadStoredFiles() {
     try {
@@ -564,11 +564,12 @@ const EgoSafePage: React.FC = () => {
     </div>
     <div className="divide-y divide-gray-700/50">
       {receivedFiles.map(file => {
-        const isReady = !!file.local_path && !file.local_path.startsWith('sender:');
+        const isFailed = file.status === 'Failed';
+        const isReady  = !!file.local_path && !file.local_path.startsWith('sender:') && !isFailed;
         return (
           <div key={file.cid} className="px-5 py-4">
             <div className="flex items-center gap-4">
-              <div className="text-2xl">{isReady ? '📥' : '⏳'}</div>
+              <div className="text-2xl">{isReady ? '📥' : isFailed ? '❌' : '⏳'}</div>
               <div className="min-w-0 flex-1">
                 <div className="text-sm font-medium truncate">{file.name}</div>
                 <div className="font-mono text-xs text-green-400 truncate mt-0.5">{file.cid.slice(0, 20)}…</div>
@@ -591,11 +592,9 @@ const EgoSafePage: React.FC = () => {
                       ⬇ Download
                     </button>
                     <button
-                      // Replace the preview button onClick for received files:
                       onClick={async () => {
-                        // For video/PDF, just download and open instead of in-app preview
                         const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
-                        const isLarge = file.encrypted_size > 50 * 1024 * 1024; // 50MB
+                        const isLarge = file.encrypted_size > 50 * 1024 * 1024;
                         if (isLarge || ['mp4','mkv','avi','mov','webm','pdf','wav','mp3'].includes(ext)) {
                           try {
                             const path = await invoke<string>('download_stored_file', { cid: file.cid });
@@ -617,6 +616,18 @@ const EgoSafePage: React.FC = () => {
                       👁 View
                     </button>
                   </>
+                ) : isFailed ? (
+                  <button
+                    onClick={async () => {
+                      try {
+                        await invoke('delete_stored_file', { cid: file.cid });
+                        await loadStoredFiles();
+                      } catch {}
+                    }}
+                    className="text-xs bg-red-600/20 hover:bg-red-600/40 text-red-400 px-3 py-1.5 rounded-lg transition font-medium"
+                  >
+                    🔄 Retry
+                  </button>
                 ) : (
                   <span className="text-xs bg-yellow-500/20 text-yellow-400 px-2 py-1 rounded-lg">
                     ⏳ Incoming…
@@ -636,6 +647,12 @@ const EgoSafePage: React.FC = () => {
                 </button>
               </div>
             </div>
+            {isFailed && (
+              <div className="flex items-center gap-2 mt-2 text-xs text-red-400 bg-red-500/10 rounded-lg px-3 py-2">
+                <span>⚠️</span>
+                <span>Transfer failed — sender may be offline. Ask them to resend.</span>
+              </div>
+            )}
           </div>
         );
       })}
@@ -695,7 +712,7 @@ const EgoSafePage: React.FC = () => {
         )}
       </div>
 
-      {/* ── Recently shared (EgoSafe encrypt+share) ─────────────────────── */}
+    {/* ── Recently shared (EgoSafe encrypt+share) ─────────────────────── */}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="px-5 py-4 border-b border-gray-700">
           <h3 className="font-semibold">Recently Shared ({shared.length})</h3>
