@@ -143,6 +143,7 @@ fn main() {
             commands::storage::delete_stored_file,
             commands::storage::retrieve_file_preview,
             commands::storage::save_file_to_disk,
+            commands::storage::download_stored_file,
             commands::storage::request_file_from_contact,
             commands::files::encrypt_file,
             commands::files::decrypt_file,

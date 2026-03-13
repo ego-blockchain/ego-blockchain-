@@ -68,9 +68,11 @@ pub enum P2PMessage {
         shared_key:   String,
     },
     PeerAnnounce {
-        address:  String,
-        name:     String,
-        endpoint: String,
+        address:   String,
+        name:      String,
+        endpoint:  String,
+        #[serde(default)]
+        endpoints: Vec<String>,
     },
     ChatMessage {
         bundle: String,
@@ -256,6 +258,39 @@ pub async fn send_message(endpoint: &str, msg: &P2PMessage) -> Result<(), String
     reply_rx.await.map_err(|_| "Swarm dropped reply".to_string())?
 }
 
+/// Try endpoints in order: LAN first, public IP second, relay circuit last.
+/// Returns Ok on first success, Err if all fail.
+pub async fn send_message_any(endpoints: &[String], msg: &P2PMessage) -> Result<(), String> {
+    if endpoints.is_empty() {
+        return Err("No endpoints available".to_string());
+    }
+    // Sort: LAN (0) → public IP (1) → relay circuit (2)
+    let mut sorted = endpoints.to_vec();
+    sorted.sort_by_key(|ep| {
+        if ep.contains("/ip4/192.168.") || ep.contains("/ip4/10.") || ep.contains("/ip4/172.") {
+            0usize
+        } else if ep.contains("/p2p-circuit") {
+            2
+        } else {
+            1
+        }
+    });
+    let mut last_err = String::new();
+    for ep in &sorted {
+        match send_message(ep, msg).await {
+            Ok(_)  => {
+                eprintln!("[P2P] Connected via {}", ep);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("[P2P] Failed {}: {}", ep, e);
+                last_err = e;
+            }
+        }
+    }
+    Err(last_err)
+}
+
 pub async fn get_public_endpoint() -> String {
     let Some(tx) = SWARM_TX.get() else { return String::new(); };
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -315,9 +350,12 @@ pub async fn broadcast_tx(tx: LedgerTx, block: LedgerBlock) {
     let msg = P2PMessage::TxBroadcast { tx, block };
     for contact in contacts.iter().filter(|c| c.status == "approved" && !c.endpoint.is_empty()) {
         let endpoint  = contact.endpoint.clone();
+        let all_eps   = contact.all_endpoints.clone();
         let msg_clone = msg.clone();
         tokio::spawn(async move {
-            if let Err(e) = send_message(&endpoint, &msg_clone).await {
+            let mut eps = if all_eps.is_empty() { vec![endpoint.clone()] } else { all_eps };
+            if !eps.contains(&endpoint) { eps.push(endpoint.clone()); }
+            if let Err(e) = send_message_any(&eps, &msg_clone).await {
                 if !e.contains("none of the requested protocols") {
                     eprintln!("[P2P] broadcast_tx to {}: {}", endpoint, e);
                 }
@@ -329,12 +367,14 @@ pub async fn broadcast_tx(tx: LedgerTx, block: LedgerBlock) {
 pub async fn sync_chain_from_peers() {
     let my_endpoint = get_public_endpoint().await;
     let msg = P2PMessage::ChainSyncRequest { requester_endpoint: my_endpoint };
-    // Only approved contacts — pending contacts may be on old builds.
     for contact in load_contacts().iter().filter(|c| c.status == "approved" && !c.endpoint.is_empty()) {
         let endpoint  = contact.endpoint.clone();
+        let all_eps   = contact.all_endpoints.clone();
         let msg_clone = msg.clone();
         tokio::spawn(async move {
-            if let Err(e) = send_message(&endpoint, &msg_clone).await {
+            let mut eps = if all_eps.is_empty() { vec![endpoint.clone()] } else { all_eps };
+            if !eps.contains(&endpoint) { eps.push(endpoint.clone()); }
+            if let Err(e) = send_message_any(&eps, &msg_clone).await {
                 if !e.contains("none of the requested protocols") {
                     eprintln!("[P2P] sync request to {}: {}", endpoint, e);
                 }
@@ -364,14 +404,37 @@ pub async fn broadcast_peer_announce(app: &tauri::AppHandle) {
             country:   None,
         });
     }
-    let msg = P2PMessage::PeerAnnounce { address, name, endpoint: my_endpoint };
+    // Collect all local IPs as additional endpoints so peers can try direct connection
+    let local_peer_id = {
+        let ep = my_endpoint.clone();
+        ep.split("/p2p/").last().unwrap_or("").to_string()
+    };
+    let mut all_endpoints = vec![my_endpoint.clone()];
+    if let Ok(ifaces) = local_ip_address::list_afinet_netifas() {
+        for (_name, ip) in ifaces {
+            if ip.is_ipv4() && !ip.is_loopback() {
+                let ep = format!("/ip4/{}/tcp/{}/p2p/{}", ip, P2P_PORT, local_peer_id);
+                if !all_endpoints.contains(&ep) {
+                    all_endpoints.push(ep);
+                }
+            }
+        }
+    }
+    let msg = P2PMessage::PeerAnnounce {
+        address, name,
+        endpoint:  my_endpoint,
+        endpoints: all_endpoints,
+    };
     // Send to approved contacts only — pending contacts haven't confirmed
     // protocol compatibility yet.
     for contact in load_contacts().iter().filter(|c| c.status == "approved" && !c.endpoint.is_empty()) {
         let endpoint  = contact.endpoint.clone();
         let msg_clone = msg.clone();
+        let all_eps = contact.all_endpoints.clone();
         tokio::spawn(async move {
-            if let Err(e) = send_message(&endpoint, &msg_clone).await {
+            let mut eps = if all_eps.is_empty() { vec![endpoint.clone()] } else { all_eps };
+            if !eps.contains(&endpoint) { eps.push(endpoint.clone()); }
+            if let Err(e) = send_message_any(&eps, &msg_clone).await {
                 if !e.contains("none of the requested protocols") {
                     eprintln!("[P2P] peer announce to {}: {}", endpoint, e);
                 }
@@ -904,6 +967,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                 status:         "pending_in".to_string(),
                 added_at:       Utc::now().timestamp(),
                 endpoint:       from_endpoint,
+                all_endpoints:  Vec::new(),
             };
             contacts.push(contact.clone());
             let _ = save_contacts(&contacts);
@@ -958,18 +1022,21 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
             }
         }
 
-        P2PMessage::PeerAnnounce { address, name, endpoint } => {
+        P2PMessage::PeerAnnounce { address, name, endpoint, endpoints } => {
             if !endpoint.is_empty() {
                 let mut contacts = load_contacts();
                 if let Some(c) = contacts.iter_mut().find(|c| c.address == address) {
                     let relay_in   = endpoint.contains("/p2p-circuit");
                     let relay_curr = c.endpoint.contains("/p2p-circuit");
-                    // relay circuit always wins; raw IP only updates non-relay
                     if (relay_in || !relay_curr) && c.endpoint != endpoint {
                         eprintln!("[P2P] Updated contact {} endpoint → {}", address, endpoint);
                         c.endpoint = endpoint.clone();
-                        let _ = save_contacts(&contacts);
                     }
+                    // Store all endpoints for multi-path dialling
+                    if !endpoints.is_empty() {
+                        c.all_endpoints = endpoints.clone();
+                    }
+                    let _ = save_contacts(&contacts);
                 }
             }
             let state = app.state::<crate::app::AppState>();
@@ -1019,7 +1086,10 @@ P2PMessage::ChatMessage { bundle } => {
                                 requester_addr:     my_addr,
                                 requester_endpoint: my_ep,
                             };
-                            if let Err(e) = send_message(&endpoint, &file_req).await {
+                            let all_eps = contact.all_endpoints.clone();
+                            let mut eps = if all_eps.is_empty() { vec![endpoint.clone()] } else { all_eps };
+                            if !eps.contains(&endpoint) { eps.push(endpoint.clone()); }
+                            if let Err(e) = send_message_any(&eps, &file_req).await {
                                 eprintln!("[P2P] Auto file request failed: {}", e);
                             } else {
                                 eprintln!("[P2P] Auto-requested file {} from {}", cid, endpoint);
@@ -1063,7 +1133,8 @@ P2PMessage::ChatMessage { bundle } => {
                 transactions: chain.transactions,
             };
             tokio::spawn(async move {
-                if let Err(e) = send_message(&requester_endpoint, &response).await {
+                let eps = vec![requester_endpoint.clone()];
+                if let Err(e) = send_message_any(&eps, &response).await {
                     eprintln!("[P2P] chain sync reply: {}", e);
                 }
             });
@@ -1077,7 +1148,8 @@ P2PMessage::ChatMessage { bundle } => {
             let peers    = load_peer_cache();
             let response = P2PMessage::PeerListResponse { peers };
             tokio::spawn(async move {
-                if let Err(e) = send_message(&requester_endpoint, &response).await {
+                let eps = vec![requester_endpoint.clone()];
+                if let Err(e) = send_message_any(&eps, &response).await {
                     eprintln!("[P2P] peer list reply: {}", e);
                 }
             });
@@ -1125,7 +1197,10 @@ P2PMessage::ChatMessage { bundle } => {
                         file_name,
                         key_nonce_hex,
                     };
-                    if let Err(e) = send_message(&ep, &response).await {
+                    // Try requester_endpoint directly — send_message_any will
+                    // also try LAN addresses once all_endpoints is populated
+                    let eps = vec![ep.clone()];
+                    if let Err(e) = send_message_any(&eps, &response).await {
                         eprintln!("[P2P] FileData send failed: {} — depositing in relay inbox", e);
                         crate::commands::messenger::deposit_in_relay_inbox(
                             &addr, &my_addr, &response,

@@ -26,11 +26,11 @@ pub struct Contact {
     pub ed25519_pubkey: String,
     pub kyber_pubkey:   String,
     pub shared_key_hex: String,
-    /// "pending_out" | "pending_in" | "approved"
-    pub status:   String,
-    pub added_at: i64,
+    pub status:         String,
+    pub added_at:       i64,
+    pub endpoint:       String,
     #[serde(default)]
-    pub endpoint: String,
+    pub all_endpoints:  Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
