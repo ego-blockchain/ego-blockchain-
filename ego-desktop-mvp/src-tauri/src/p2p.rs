@@ -1074,7 +1074,6 @@ P2PMessage::ChatMessage { bundle } => {
                 .title("File Received")
                 .body(&format!("You received a file: {}", file_name))
                 .show();
-                // Auto-request the file bytes from sender
                 if parts.len() >= 2 {
                     let cid       = parts[1].to_string();
                     let from_addr = msg.from.clone();
@@ -1102,11 +1101,46 @@ P2PMessage::ChatMessage { bundle } => {
                                 eprintln!("[P2P] Auto-requested file {} from {}", cid, endpoint);
                             }
                         }
+
+                        // ── Timeout watcher: poll every 10s for up to 3 minutes ──
+                        let cid_watch = cid.clone();
+                        let app_watch = app_clone.clone();
+                        tokio::spawn(async move {
+                            const POLL_INTERVAL: u64 = 10;
+                            const TIMEOUT_SECS:  u64 = 180;
+                            let mut elapsed = 0u64;
+                            loop {
+                                tokio::time::sleep(Duration::from_secs(POLL_INTERVAL)).await;
+                                elapsed += POLL_INTERVAL;
+                                let ledger = crate::ledger::Ledger::load();
+                                if let Some(f) = ledger.stored_files.iter().find(|f| f.cid == cid_watch) {
+                                    if f.status == "Received" && !f.local_path.is_empty()
+                                        && !f.local_path.starts_with("sender:") {
+                                        eprintln!("[P2P] File {} received OK within {}s", cid_watch, elapsed);
+                                        return;
+                                    }
+                                }
+                                if elapsed >= TIMEOUT_SECS {
+                                    eprintln!("[P2P] File {} timed out after {}s — marking failed", cid_watch, elapsed);
+                                    let mut ledger = crate::ledger::Ledger::load();
+                                    if let Some(f) = ledger.stored_files.iter_mut().find(|f| f.cid == cid_watch) {
+                                        if f.status != "Received" {
+                                            f.status = "Failed".to_string();
+                                            let _ = ledger.save();
+                                            let _ = app_watch.emit_all("ego://file-failed", serde_json::json!({
+                                                "cid":    cid_watch,
+                                                "reason": "File transfer timed out. The sender may be offline."
+                                            }));
+                                        }
+                                    }
+                                    return;
+                                }
+                            }
+                        });
                     });
                 }
             } else {
                 // Only show "New Message" notification for text messages.
-                // Record the sender so window focus opens their chat.
                 {
                     let state = app.state::<crate::app::AppState>();
                     *state.pending_chat_address.lock().unwrap() = Some(msg.from.clone());
