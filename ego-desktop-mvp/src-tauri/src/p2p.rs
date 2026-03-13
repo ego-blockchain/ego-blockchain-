@@ -986,60 +986,6 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
             P2PMessage::FileChunkComplete { .. } => {
                 eprintln!("[P2P] FileChunkComplete ignored — 50MB max file size enforced at upload");
             }
-
-    let all_present = (0..total_chunks).all(|i| {
-        storage.join(format!("{}.chunk.{}", short, i)).exists()
-    });
-
-    if all_present {
-        eprintln!("[P2P] All {} chunks received for {} — reassembling", total_chunks, cid);
-        let mut assembled: Vec<u8> = Vec::new();
-        for i in 0..total_chunks {
-            let path = storage.join(format!("{}.chunk.{}", short, i));
-            match std::fs::read(&path) {
-                Ok(b)  => { assembled.extend_from_slice(&b); let _ = std::fs::remove_file(&path); }
-                Err(e) => { eprintln!("[P2P] Chunk read error {}: {}", i, e); return; }
-            }
-        }
-
-        let enc_path = storage.join(format!("{}.enc", short));
-        if let Err(e) = std::fs::write(&enc_path, &assembled) {
-            eprintln!("[P2P] Assembled write error: {}", e); return;
-        }
-
-        let mut ledger    = crate::ledger::Ledger::load();
-        let enc_str       = enc_path.to_string_lossy().to_string();
-        // Pull key saved by the manifest (FileChunkComplete)
-        let key_nonce_hex = ledger.stored_files.iter()
-            .find(|f| f.cid == cid)
-            .map(|f| f.key_nonce_hex.clone())
-            .unwrap_or_default();
-
-        if let Some(f) = ledger.stored_files.iter_mut().find(|f| f.cid == cid) {
-            f.local_path     = enc_str.clone();
-            f.status         = "Received".to_string();
-            f.encrypted_size = assembled.len() as u64;
-            if f.name.is_empty() { f.name = file_name.clone(); }
-        } else {
-            let now = chrono::Utc::now().timestamp();
-            ledger.stored_files.push(crate::ledger::StoredFile {
-                cid:             cid.clone(),
-                name:            file_name,
-                original_size:   assembled.len() as u64,
-                encrypted_size:  assembled.len() as u64,
-                duration_months: 0,
-                stored_at:       now,
-                expiry:          0,
-                status:          "Received".to_string(),
-                key_nonce_hex,
-                local_path:      enc_str,
-                owner:           String::new(),
-            });
-        }
-        let _ = ledger.save();
-        eprintln!("[P2P] File reassembled and saved for {}", cid);
-        let _ = app.emit_all("ego://file-downloaded", serde_json::json!({ "cid": cid }));
-    }
 }
 
         P2PMessage::ContactResponse {
