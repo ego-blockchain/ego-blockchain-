@@ -133,7 +133,7 @@ useEffect(() => {
     try {
       const files = await invoke<StoredFile[]>('get_stored_files');
       setStoredFiles(files.filter(f => f.status === 'Active'));
-      setReceivedFiles(files.filter(f => f.status === 'Received'));
+      setReceivedFiles(files.filter(f => f.status === 'Received' || f.status === 'Failed'));
     } catch {}
   }
 
