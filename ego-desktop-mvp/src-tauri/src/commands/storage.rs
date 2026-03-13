@@ -385,6 +385,12 @@ pub async fn save_file_to_disk(
 }
 
 #[tauri::command]
+pub fn get_file_metadata(path: String) -> Result<serde_json::Value, String> {
+    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "size": meta.len() }))
+}
+
+#[tauri::command]
 pub async fn open_file(path: String) -> Result<(), EgoDesktopError> {
     opener::open(&path)
         .map_err(|e| EgoDesktopError::FileSystemError(format!("Open: {e}")))?;
