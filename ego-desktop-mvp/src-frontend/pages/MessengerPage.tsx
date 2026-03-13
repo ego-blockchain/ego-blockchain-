@@ -4,6 +4,7 @@ import { listen } from '@tauri-apps/api/event';
 import { writeText } from '@tauri-apps/api/clipboard';
 import { useConfirm } from '../hooks/useConfirm';
 
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 interface Contact {
@@ -63,6 +64,7 @@ const MessengerPage: React.FC = () => {
   const [generatingCard, setGeneratingCard] = useState(false);
   const [copied, setCopied]                 = useState(false);
 
+  const [knownCids, setKnownCids] = useState<Set<string>>(new Set());
   // "Add Contact" modal
   const [showAdd, setShowAdd]     = useState(false);
   const [addBundle, setAddBundle] = useState('');
@@ -102,6 +104,13 @@ const MessengerPage: React.FC = () => {
     }
   }
 
+  async function loadKnownCids() {
+  try {
+    const files = await invoke<{ cid: string; status: string }[]>('get_stored_files');
+    setKnownCids(new Set(files.map(f => f.cid)));
+  } catch {}
+}
+
   async function loadMessages(addr: string) {
     try {
       const ms = await invoke<Message[]>('get_messages', { contactAddr: addr });
@@ -128,7 +137,7 @@ const MessengerPage: React.FC = () => {
 
   useEffect(() => {
     loadContacts();
-
+     loadKnownCids();
     const unlisteners: Promise<() => void>[] = [
       // B receives A's contact request
       listen<Contact>('ego://contact-request', () => { loadContacts(); }),
@@ -143,7 +152,7 @@ const MessengerPage: React.FC = () => {
 
       // A receives B's decline
       listen('ego://contact-declined', () => { loadContacts(); }),
-
+      listen('ego://file-downloaded', () => { loadKnownCids(); }),
       // Incoming chat message delivered by P2P server
       listen<Message>('ego://message-received', (event) => {
         const msg = event.payload;
@@ -174,10 +183,14 @@ const MessengerPage: React.FC = () => {
     return () => { unlisteners.forEach(p => p.then(fn => fn())); };
   }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => {
-    if (selected) loadMessages(selected.address);
-    else setMessages([]);
-  }, [selected]);
+useEffect(() => {
+  if (selected) {
+    loadMessages(selected.address);
+    loadKnownCids();
+  } else {
+    setMessages([]);
+  }
+}, [selected]);
 
   useEffect(() => {
     msgEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -548,7 +561,6 @@ const MessengerPage: React.FC = () => {
               )}
               {messages.map(m => {
                 const isFileBundle = m.message_type === 'file_bundle';
-                const imported = importedIds.has(m.id);
                 return (
                   <div key={m.id} className={`flex items-end gap-1 group ${m.outgoing ? 'justify-end' : 'justify-start'}`}>
                     {m.outgoing && (
@@ -572,58 +584,58 @@ const MessengerPage: React.FC = () => {
                           {msgTypeLabel(m.message_type)}
                         </div>
                       )}
-{isFileBundle ? (() => {
-                        const parts = m.content.trim().split(':');
-                        const cid          = parts[1] ?? '';
-                        const key_nonce_hex = parts[2] ?? '';
-                        const name64       = parts[3] ?? '';
-                        const from_address = parts[4] ?? '';
-                        let display_name   = cid.slice(0, 12);
-                        try { display_name = decodeURIComponent(escape(atob(name64))); } catch {}
-                        return (
-                        <div className="space-y-2 min-w-[200px]">
-                          {/* File card */}
-                          <div className="flex items-center gap-2 bg-black/20 rounded-xl px-3 py-2">
-                            <span className="text-2xl shrink-0">📎</span>
-                            <div className="min-w-0">
-                              <div className="text-sm font-medium truncate">{display_name}</div>
-                              <div className="text-xs text-gray-400 font-mono">{cid.slice(0, 14)}…</div>
+                  {isFileBundle ? (() => {
+                    const parts = m.content.trim().split(':');
+                    const cid           = parts[1] ?? '';
+                    const key_nonce_hex = parts[2] ?? '';
+                    const name64        = parts[3] ?? '';
+                    const from_address  = parts[4] ?? '';
+                    let display_name    = cid.slice(0, 12);
+                    try { display_name = decodeURIComponent(escape(atob(name64))); } catch {}
+
+                    const imported = importedIds.has(m.id) || knownCids.has(cid);
+                      return (
+                          <div className="space-y-2 min-w-[200px]">
+                            <div className="flex items-center gap-2 bg-black/20 rounded-xl px-3 py-2">
+                              <span className="text-2xl shrink-0">📎</span>
+                              <div className="min-w-0">
+                                <div className="text-sm font-medium truncate">{display_name}</div>
+                                <div className="text-xs text-gray-400 font-mono">{cid.slice(0, 14)}…</div>
+                              </div>
                             </div>
+                            {!m.outgoing && (
+                              <button
+                                onClick={async () => {
+                                  if (imported) return;
+                                  try {
+                                    await invoke('import_shared_file', {
+                                      bundle: { cid, key_nonce_hex, display_name, from_address },
+                                    });
+                                    await invoke('request_file_from_contact', {
+                                      cid,
+                                      fromAddr: from_address,
+                                      content: m.content,
+                                    });
+                                    setImportedIds(s => new Set([...s, m.id]));
+                                    await loadKnownCids();
+                                  } catch (e) { console.error(e); }
+                                }}
+                                disabled={imported}
+                                className={`w-full text-xs py-1.5 rounded-lg font-medium transition ${
+                                  imported
+                                    ? 'bg-green-700/50 text-green-300 cursor-default'
+                                    : 'bg-purple-600 hover:bg-purple-500 text-white'
+                                }`}
+                              >
+                                {imported ? '✓ Importing… check EgoSafe' : '📥 Import File'}
+                              </button>
+                            )}
+                            {m.outgoing && (
+                              <div className="text-xs text-center text-gray-400 py-0.5">
+                                Sent — waiting for recipient to import
+                              </div>
+                            )}
                           </div>
-                          {/* Import button — only for incoming messages */}
-                          {!m.outgoing && (
-                            <button
-                              onClick={async () => {
-                                if (imported) return;
-                                try {
-                                  // Step 1: register in ledger
-                                  await invoke('import_shared_file', {
-                                    bundle: { cid, key_nonce_hex, display_name, from_address },
-                                  });
-                                  // Step 2: request the actual file data from sender
-                                  await invoke('request_file_from_contact', {
-                                    cid,
-                                    fromAddr: from_address,
-                                  });
-                                  setImportedIds(s => new Set([...s, m.id]));
-                                } catch (e) { console.error(e); }
-                              }}
-                              disabled={imported}
-                              className={`w-full text-xs py-1.5 rounded-lg font-medium transition ${
-                                imported
-                                  ? 'bg-green-700/50 text-green-300 cursor-default'
-                                  : 'bg-purple-600 hover:bg-purple-500 text-white'
-                              }`}
-                            >
-                              {imported ? '✓ Importing… check EgoSafe' : '📥 Import File'}
-                            </button>
-                          )}
-                          {m.outgoing && (
-                            <div className="text-xs text-center text-gray-400 py-0.5">
-                              Sent — waiting for recipient to import
-                            </div>
-                          )}
-                        </div>
                         );
                       })() : (
                         <p className="text-sm break-all whitespace-pre-wrap">{m.content}</p>
