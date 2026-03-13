@@ -1061,16 +1061,47 @@ P2PMessage::ChatMessage { bundle } => {
     match crate::commands::messenger::receive_message_inner(&bundle) {
         Ok(msg) => {
             if msg.message_type == "file_bundle" {
-                // Just deliver to chat — user clicks "Import File" to download.
-                // Show a notification so they know a file arrived.
                 let parts: Vec<&str> = msg.content.splitn(5, ':').collect();
-                let file_name = parts.get(2).unwrap_or(&"File").to_string();
+                let file_name = parts.get(3)
+                    .and_then(|n| base64::engine::general_purpose::STANDARD.decode(n).ok())
+                    .and_then(|b| String::from_utf8(b).ok())
+                    .unwrap_or_else(|| "File".to_string());
                 let _ = tauri::api::notification::Notification::new(
                     &app.config().tauri.bundle.identifier,
                 )
                 .title("File Received")
                 .body(&format!("You received a file: {}", file_name))
                 .show();
+                // Auto-request the file bytes from sender
+                if parts.len() >= 2 {
+                    let cid       = parts[1].to_string();
+                    let from_addr = msg.from.clone();
+                    let app_clone = app.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        let contacts = load_contacts();
+                        if let Some(contact) = contacts.iter().find(|c| {
+                            c.address == from_addr && !c.endpoint.is_empty()
+                        }) {
+                            let endpoint = contact.endpoint.clone();
+                            let my_ep    = get_public_endpoint().await;
+                            let my_addr  = crate::ledger::Ledger::load().address;
+                            let file_req = P2PMessage::FileRequest {
+                                cid:                cid.clone(),
+                                requester_addr:     my_addr.clone(),
+                                requester_endpoint: my_ep,
+                            };
+                            if let Err(e) = send_message(&endpoint, &file_req).await {
+                                eprintln!("[P2P] Auto file request failed: {} — depositing in sender inbox", e);
+                                crate::commands::messenger::deposit_in_relay_inbox(
+                                    &from_addr, &my_addr, &file_req,
+                                ).await;
+                            } else {
+                                eprintln!("[P2P] Auto-requested file {} from {}", cid, endpoint);
+                            }
+                        }
+                    });
+                }
             } else {
                 // Only show "New Message" notification for text messages.
                 // Record the sender so window focus opens their chat.
@@ -1209,6 +1240,7 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
                 f.local_path = enc_str.clone();
                 if !key_nonce_hex.is_empty() { f.key_nonce_hex = key_nonce_hex.clone(); }
                 if f.name.is_empty() { f.name = file_name.clone(); }
+                f.status = "Received".to_string(); // ← add this
             } else {
                 // Not yet in ledger (race) — create entry
                 let now = chrono::Utc::now().timestamp();
