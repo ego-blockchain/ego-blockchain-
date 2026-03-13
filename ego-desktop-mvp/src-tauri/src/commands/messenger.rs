@@ -342,6 +342,7 @@ pub async fn import_contact(
         status:         "pending_out".to_string(),
         added_at:       chrono::Utc::now().timestamp(),
         endpoint:       endpoint.clone(),
+        all_endpoints:  Vec::new(),
     };
     contacts.push(contact.clone());
     save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
@@ -414,9 +415,10 @@ pub async fn approve_contact_request(
                 .map(|w| w.name.clone())
                 .unwrap_or_else(|| my_name.trim().to_string());
             let announce = p2p::P2PMessage::PeerAnnounce {
-                address:  my_addr.clone(),
-                name:     my_name_str,
-                endpoint: my_endpoint,
+                address:   my_addr.clone(),
+                name:      my_name_str,
+                endpoint:  my_endpoint.clone(),
+                endpoints: vec![my_endpoint.clone()],
             };
             if let Err(e) = p2p::send_message(&resolved_peer_ep, &announce).await {
                 eprintln!("[P2P] Could not send PeerAnnounce after approval: {}", e);
