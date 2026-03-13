@@ -573,7 +573,18 @@ const EgoSafePage: React.FC = () => {
                       ⬇ Download
                     </button>
                     <button
+                      // Replace the preview button onClick for received files:
                       onClick={async () => {
+                        // For video/PDF, just download and open instead of in-app preview
+                        const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+                        const isLarge = file.encrypted_size > 50 * 1024 * 1024; // 50MB
+                        if (isLarge || ['mp4','mkv','avi','mov','webm','pdf','wav','mp3'].includes(ext)) {
+                          try {
+                            const path = await invoke<string>('download_stored_file', { cid: file.cid });
+                            await invoke('open_file', { path });
+                          } catch (e: any) { alert('Open failed: ' + String(e)); }
+                          return;
+                        }
                         setPreviewFile(file);
                         setPreview(null);
                         setPreviewLoading(true);

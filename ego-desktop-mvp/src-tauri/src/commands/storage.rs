@@ -384,6 +384,13 @@ pub async fn save_file_to_disk(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn open_file(path: String) -> Result<(), EgoDesktopError> {
+    opener::open(&path)
+        .map_err(|e| EgoDesktopError::FileSystemError(format!("Open: {e}")))?;
+    Ok(())
+}
+
 // ── request_file_from_contact ─────────────────────────────────────────────────
 #[tauri::command]
 pub async fn request_file_from_contact(

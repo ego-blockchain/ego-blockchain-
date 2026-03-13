@@ -572,6 +572,14 @@ useEffect(() => {
                         🗑
                       </button>
                     )}
+
+                    {/* Avatar for incoming messages */}
+                    {!m.outgoing && (
+                      <div className="w-7 h-7 rounded-full bg-gradient-to-br from-purple-500 to-pink-600 flex items-center justify-center text-xs font-bold shrink-0 mb-1">
+                        {(selected?.name || '?').charAt(0).toUpperCase()}
+                      </div>
+                    )}
+
                     <div
                       className={`max-w-xs lg:max-w-md xl:max-w-lg px-4 py-2.5 rounded-2xl ${
                         m.outgoing
@@ -584,17 +592,17 @@ useEffect(() => {
                           {msgTypeLabel(m.message_type)}
                         </div>
                       )}
-                  {isFileBundle ? (() => {
-                    const parts = m.content.trim().split(':');
-                    const cid           = parts[1] ?? '';
-                    const key_nonce_hex = parts[2] ?? '';
-                    const name64        = parts[3] ?? '';
-                    const from_address  = parts[4] ?? '';
-                    let display_name    = cid.slice(0, 12);
-                    try { display_name = decodeURIComponent(escape(atob(name64))); } catch {}
+                      {isFileBundle ? (() => {
+                        const parts = m.content.trim().split(':');
+                        const cid           = parts[1] ?? '';
+                        const key_nonce_hex = parts[2] ?? '';
+                        const name64        = parts[3] ?? '';
+                        const from_address  = parts[4] ?? '';
+                        let display_name    = cid.slice(0, 12);
+                        try { display_name = decodeURIComponent(escape(atob(name64))); } catch {}
 
-                    const imported = importedIds.has(m.id) || knownCids.has(cid);
-                      return (
+                        const imported = importedIds.has(m.id) || knownCids.has(cid);
+                        return (
                           <div className="space-y-2 min-w-[200px]">
                             <div className="flex items-center gap-2 bg-black/20 rounded-xl px-3 py-2">
                               <span className="text-2xl shrink-0">📎</span>
@@ -644,6 +652,7 @@ useEffect(() => {
                         {fmtTime(m.timestamp)}
                       </p>
                     </div>
+
                     {!m.outgoing && (
                       <button
                         onClick={() => handleDeleteMessage(m.id)}
