@@ -288,6 +288,15 @@ const EgoSafePage: React.FC = () => {
                   onClick={async () => {
                     const p = await openDialog({ multiple: false });
                     if (typeof p === 'string') {
+                      try {
+                        const { size } = await invoke<{ size: number }>('get_file_metadata', { path: p });
+                        if (size > 50 * 1024 * 1024) {
+                          alert(`This file is ${(size / 1024 / 1024).toFixed(1)}MB. Maximum file size is 50MB.`);
+                          return;
+                        }
+                      } catch (_) {
+                        // Can't check size — proceed and let backend enforce
+                      }
                       setFilePath(p);
                       setFileName(p.split(/[/\\]/).pop() ?? p);
                       setFileSize(0);
@@ -318,17 +327,26 @@ const EgoSafePage: React.FC = () => {
                   <span className="text-xs text-gray-600">Any file type supported</span>
                 </button>
               )}
-              {filePath && isVideoFile(fileName) && (
-                <div className="flex items-start gap-2 bg-blue-500/10 border border-blue-500/30 rounded-xl px-4 py-3">
-                  <span className="text-blue-400 shrink-0 mt-0.5">🎬</span>
-                  <div className="text-xs text-blue-300 leading-relaxed">
-                    <strong>Video file detected.</strong> Large videos are delivered to recipients in chunks over the P2P network — the receiver will download all chunks automatically and reassemble them.
-                  </div>
+              <div className="flex items-start gap-2 bg-gray-700/50 border border-gray-600 rounded-xl px-4 py-3">
+                <span className="text-gray-400 shrink-0 mt-0.5">ℹ️</span>
+                <div className="text-xs text-gray-300 leading-relaxed">
+                  Maximum file size is <strong>50MB</strong>. Files larger than 50MB cannot be shared.
                 </div>
-              )}
+              </div>
               <button
                 disabled={!filePath}
-                onClick={() => setStep('recipients')}
+                onClick={async () => {
+                  try {
+                    const stat = await invoke<{ size: number }>('get_file_metadata', { path: filePath });
+                    if (stat.size > 50 * 1024 * 1024) {
+                      alert(`This file is ${(stat.size / 1024 / 1024).toFixed(1)}MB. Maximum file size is 50MB.`);
+                      return;
+                    }
+                  } catch (_) {
+                    // Can't check size — proceed and let backend enforce
+                  }
+                  setStep('recipients');
+}}
                 className="w-full bg-purple-600 hover:bg-purple-500 disabled:opacity-40 py-3 rounded-xl font-semibold transition"
               >
                 Continue →
