@@ -9,6 +9,7 @@ permissions:
   contents: write
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   RELEASE_BODY: |
     ## Download
 
@@ -32,8 +33,6 @@ jobs:
   build-windows:
     name: Windows x64
     runs-on: windows-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - uses: actions/checkout@v4
@@ -68,8 +67,6 @@ jobs:
   build-macos-arm:
     name: macOS Apple Silicon
     runs-on: macos-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - uses: actions/checkout@v4
