@@ -980,81 +980,12 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
             let _ = app.emit_all("ego://contact-request", &contact);
         }
 
-P2PMessage::FileChunk { cid, chunk_index, total_chunks, data_b64, file_name } => {
-    use base64::Engine as _;
-    eprintln!("[P2P] FileChunk {}/{} for {}", chunk_index + 1, total_chunks, cid);
-    match base64::engine::general_purpose::STANDARD.decode(&data_b64) {
-        Err(e) => eprintln!("[P2P] Chunk decode failed: {}", e),
-        Ok(chunk_bytes) => {
-            let storage = crate::ledger::storage_dir();
-            let short   = &cid[cid.len().saturating_sub(16)..];
-            // Write chunk to a numbered temp file
-            let chunk_path = storage.join(format!("{}.chunk.{}", short, chunk_index));
-            if let Err(e) = std::fs::write(&chunk_path, &chunk_bytes) {
-                eprintln!("[P2P] Chunk write failed: {}", e);
-            }
-        }
-    }
+P2PMessage::FileChunk { .. } => {
+    eprintln!("[P2P] FileChunk ignored — chunking removed, using FileData via relay inbox");
 }
 
-P2PMessage::FileChunkComplete { cid, file_name, enc_data_b64: key_nonce_hex } => {
-    use base64::Engine as _;
-    eprintln!("[P2P] FileChunkComplete for {}", cid);
-    let storage = crate::ledger::storage_dir();
-    let short   = &cid[cid.len().saturating_sub(16)..];
-
-    // Reassemble all chunks in order
-    let mut chunk_index = 0u32;
-    let mut all_bytes   = Vec::new();
-    loop {
-        let chunk_path = storage.join(format!("{}.chunk.{}", short, chunk_index));
-        match std::fs::read(&chunk_path) {
-            Ok(bytes) => {
-                all_bytes.extend_from_slice(&bytes);
-                let _ = std::fs::remove_file(&chunk_path); // clean up
-                chunk_index += 1;
-            }
-            Err(_) => break, // no more chunks
-        }
-    }
-
-    if all_bytes.is_empty() {
-        eprintln!("[P2P] ChunkComplete: no chunks found for {}", cid);
-        return;
-    }
-
-    let enc_path = storage.join(format!("{}.enc", short));
-    if let Err(e) = std::fs::write(&enc_path, &all_bytes) {
-        eprintln!("[P2P] ChunkComplete write failed: {}", e);
-        return;
-    }
-
-    let mut ledger  = crate::ledger::Ledger::load();
-    let enc_str     = enc_path.to_string_lossy().to_string();
-    if let Some(f) = ledger.stored_files.iter_mut().find(|f| f.cid == cid) {
-        f.local_path  = enc_str.clone();
-        f.status      = "Received".to_string();
-        if !key_nonce_hex.is_empty() { f.key_nonce_hex = key_nonce_hex.clone(); }
-        if f.name.is_empty() { f.name = file_name.clone(); }
-    } else {
-        let now = chrono::Utc::now().timestamp();
-        ledger.stored_files.push(crate::ledger::StoredFile {
-            cid:             cid.clone(),
-            name:            file_name,
-            original_size:   all_bytes.len() as u64,
-            encrypted_size:  all_bytes.len() as u64,
-            duration_months: 0,
-            stored_at:       now,
-            expiry:          0,
-            status:          "Received".to_string(),
-            key_nonce_hex,
-            local_path:      enc_str,
-            owner:           String::new(),
-        });
-    }
-    let _ = ledger.save();
-    eprintln!("[P2P] Reassembled {} chunks for {}", chunk_index, cid);
-    let _ = app.emit_all("ego://file-downloaded", serde_json::json!({ "cid": cid }));
+P2PMessage::FileChunkComplete { .. } => {
+    eprintln!("[P2P] FileChunkComplete ignored — chunking removed, using FileData via relay inbox");
 }
 
         P2PMessage::ContactResponse {
@@ -1265,18 +1196,19 @@ P2PMessage::FileRequest { cid, requester_addr, requester_endpoint } => {
                 let ep            = requester_endpoint.clone();
                 let addr          = requester_addr.clone();
 
-                const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MB per chunk
+                const DIRECT_LIMIT: usize = 4 * 1024 * 1024; // 4 MB — safe for direct P2P
 
-                if enc_bytes.len() <= CHUNK_SIZE {
-                    // Small file — send as single FileData (existing path)
+                tokio::spawn(async move {
                     let enc_data_b64 = base64::engine::general_purpose::STANDARD.encode(&enc_bytes);
-                    tokio::spawn(async move {
-                        let response = P2PMessage::FileData {
-                            cid: cid2.clone(),
-                            enc_data_b64,
-                            file_name,
-                            key_nonce_hex,
-                        };
+                    let response = P2PMessage::FileData {
+                        cid:           cid2.clone(),
+                        enc_data_b64,
+                        file_name,
+                        key_nonce_hex,
+                    };
+
+                    if enc_bytes.len() <= DIRECT_LIMIT {
+                        // Small file — try direct P2P first, fall back to relay inbox
                         let eps = vec![ep.clone()];
                         if let Err(e) = send_message_any(&eps, &response).await {
                             eprintln!("[P2P] FileData send failed: {} — depositing in relay inbox", e);
@@ -1286,48 +1218,14 @@ P2PMessage::FileRequest { cid, requester_addr, requester_endpoint } => {
                         } else {
                             eprintln!("[P2P] FileData sent OK for {}", cid2);
                         }
-                    });
-                } else {
-                    // Large file — send in chunks
-                    let total_chunks = ((enc_bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
-                    eprintln!("[P2P] Sending {} chunks for {} ({} bytes)", total_chunks, cid2, enc_bytes.len());
-                    tokio::spawn(async move {
-                        for (i, chunk) in enc_bytes.chunks(CHUNK_SIZE).enumerate() {
-                            let chunk_b64 = base64::engine::general_purpose::STANDARD.encode(chunk);
-                            let chunk_msg = P2PMessage::FileChunk {
-                                cid:          cid2.clone(),
-                                chunk_index:  i as u32,
-                                total_chunks,
-                                data_b64:     chunk_b64,
-                                file_name:    file_name.clone(),
-                            };
-                            let eps = vec![ep.clone()];
-                            if let Err(e) = send_message_any(&eps, &chunk_msg).await {
-                                eprintln!("[P2P] Chunk {} failed: {} — depositing in relay inbox", i, e);
-                                crate::commands::messenger::deposit_in_relay_inbox(
-                                    &addr, &my_addr, &chunk_msg,
-                                ).await;
-                            } else {
-                                eprintln!("[P2P] Chunk {}/{} sent for {}", i + 1, total_chunks, cid2);
-                            }
-                            // Small delay to avoid flooding the swarm
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        }
-                        // Send completion signal with key
-                        let complete = P2PMessage::FileChunkComplete {
-                            cid:          cid2.clone(),
-                            file_name:    file_name.clone(),
-                            enc_data_b64: key_nonce_hex.clone(), // reuse field to carry key
-                        };
-                        let eps = vec![ep.clone()];
-                        if let Err(e) = send_message_any(&eps, &complete).await {
-                            crate::commands::messenger::deposit_in_relay_inbox(
-                                &addr, &my_addr, &complete,
-                            ).await;
-                            eprintln!("[P2P] ChunkComplete failed: {}", e);
-                        }
-                    });
-                }
+                    } else {
+                        // Large file — relay inbox only (no size limit, no ordering issues)
+                        eprintln!("[P2P] Large file ({} bytes) — sending via relay inbox", enc_bytes.len());
+                        crate::commands::messenger::deposit_in_relay_inbox(
+                            &addr, &my_addr, &response,
+                        ).await;
+                    }
+                });
             }
         }
     } else {
