@@ -112,7 +112,7 @@ pub fn next_wallet_id(registry: &WalletRegistry) -> String {
 // ── Ledger structs ────────────────────────────────────────────────────────────
 
 /// A single signed transaction in the local ledger.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LedgerTx {
     pub hash: String,
     pub from: String,
@@ -129,6 +129,14 @@ pub struct LedgerTx {
     /// Hex-encoded Ed25519 public key of the sender — required for relay-side verification.
     #[serde(default)]
     pub public_key_ed25519: String,
+    /// Hex-encoded Dilithium2 public key (1312 bytes = 2624 hex chars).
+    /// Derives the egot1 address — proves quantum-safe ownership of the from address.
+    #[serde(default)]
+    pub dilithium_pubkey: String,
+    /// Hex-encoded Dilithium2 detached signature (2420 bytes = 4840 hex chars).
+    /// Signs the same canonical bytes as `signature` — quantum-safe proof of intent.
+    #[serde(default)]
+    pub dilithium_signature: String,
 }
 
 /// A local "block" produced whenever a transaction is confirmed.

@@ -73,7 +73,7 @@ pub async fn get_earnings_data(
                     status:             "Confirmed".into(),
                     block_height:       None,
                     nonce:              0,
-                    public_key_ed25519: String::new(),
+                    public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
                 });
                 let _ = save_chain(&chain);
             }

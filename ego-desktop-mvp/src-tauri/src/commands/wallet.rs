@@ -95,10 +95,13 @@ pub async fn send_transaction(
     let ts         = chrono::Utc::now().timestamp();
     let sign_bytes = tx_signing_bytes(&from, &request.to_address, request.amount, nonce, ts);
 
-    let (signature_hex, pubkey_hex) = if let Some(kp) = state.get_keypair() {
-        let sig = kp.sign_ed25519(&sign_bytes);
-        let pk  = hex::encode(kp.ed25519_public_key().as_bytes());
-        (hex::encode(sig.as_bytes()), pk)
+    let (signature_hex, pubkey_hex, dil_sig_hex, dil_pubkey_hex) = if let Some(kp) = state.get_keypair() {
+        let ed_sig  = kp.sign_ed25519(&sign_bytes);
+        let dil_sig = kp.sign_dilithium(&sign_bytes);
+        let ed_pk   = hex::encode(kp.ed25519_public_key().as_bytes());
+        let dil_pk  = hex::encode(&kp.dilithium_public_key().key_data);
+        (hex::encode(ed_sig.as_bytes()), ed_pk,
+         hex::encode(&dil_sig.signature_data), dil_pk)
     } else {
         return Err(EgoDesktopError::WalletError(
             "Wallet not initialized – call init_wallet first".into(),
@@ -120,6 +123,8 @@ pub async fn send_transaction(
         block_height:        None,
         nonce,
         public_key_ed25519:  pubkey_hex,
+        dilithium_pubkey:    dil_pubkey_hex,
+        dilithium_signature: dil_sig_hex,
     });
 
     // ── 4. Mine a block → confirms the tx ────────────────────────────────
@@ -202,10 +207,13 @@ pub async fn prepare_transaction(
     let nonce      = ledger.nonce + 1;
     let ts         = chrono::Utc::now().timestamp();
     let sign_bytes = tx_signing_bytes(&from, &request.to_address, request.amount, nonce, ts);
-    let (signature_hex, pubkey_hex) = if let Some(kp) = state.get_keypair() {
-        let sig = kp.sign_ed25519(&sign_bytes);
-        let pk  = hex::encode(kp.ed25519_public_key().as_bytes());
-        (hex::encode(sig.as_bytes()), pk)
+    let (signature_hex, pubkey_hex, dil_sig_hex, dil_pubkey_hex) = if let Some(kp) = state.get_keypair() {
+        let ed_sig  = kp.sign_ed25519(&sign_bytes);
+        let dil_sig = kp.sign_dilithium(&sign_bytes);
+        let ed_pk   = hex::encode(kp.ed25519_public_key().as_bytes());
+        let dil_pk  = hex::encode(&kp.dilithium_public_key().key_data);
+        (hex::encode(ed_sig.as_bytes()), ed_pk,
+         hex::encode(&dil_sig.signature_data), dil_pk)
     } else {
         return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
     };
@@ -215,6 +223,7 @@ pub async fn prepare_transaction(
         amount: request.amount, memo: request.memo.clone(), timestamp: ts,
         signature: signature_hex, status: "Pending".into(),
         block_height: None, nonce, public_key_ed25519: pubkey_hex,
+        dilithium_pubkey: dil_pubkey_hex, dilithium_signature: dil_sig_hex,
     };
     chain.transactions.push(tx.clone());
     chain.mine_block(&tx_hash, &from);

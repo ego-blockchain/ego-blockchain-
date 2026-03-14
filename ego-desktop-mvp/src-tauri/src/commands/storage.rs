@@ -151,7 +151,7 @@ pub async fn store_file(
         status:             "Confirmed".into(),
         block_height:       None,
         nonce:              0,
-        public_key_ed25519: String::new(),
+        public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
     });
     save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save chain: {e}")))?;
 
