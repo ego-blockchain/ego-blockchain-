@@ -303,6 +303,7 @@ fn create_wallet_files(address_override: Option<&str>) -> Result<String, EgoDesk
             tx_count:   1,
             size_bytes: 256,
             reward:     10_000 * 1_000_000,
+            coinbase_tx: None,
         });
         save_chain(&chain).map_err(EgoDesktopError::WalletError)?;
     }
