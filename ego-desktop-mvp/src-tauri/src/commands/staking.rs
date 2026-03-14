@@ -99,7 +99,7 @@ pub async fn stake_coins(
         status:             "Pending".into(),
         block_height:       None,
         nonce,
-        public_key_ed25519: String::new(),
+        public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
     });
     chain.mine_block(&tx_hash, &from);
     save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save chain: {e}")))?;
@@ -177,7 +177,7 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
             status:             "Pending".into(),
             block_height:       None,
             nonce:              fee_nonce,
-            public_key_ed25519: String::new(),
+            public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
         });
 
         // Return tx: staking contract → user
@@ -196,7 +196,7 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
             status:             "Pending".into(),
             block_height:       None,
             nonce:              ret_nonce,
-            public_key_ed25519: String::new(),
+            public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
         });
         chain.mine_block(&ret_hash, &from);
         save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save chain: {e}")))?;
@@ -241,7 +241,7 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
             status:             "Pending".into(),
             block_height:       None,
             nonce,
-            public_key_ed25519: String::new(),
+            public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
         });
         chain.mine_block(&tx_hash, &from);
         save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save chain: {e}")))?;

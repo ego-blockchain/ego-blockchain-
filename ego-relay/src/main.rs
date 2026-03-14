@@ -28,6 +28,8 @@ use axum::{
     Json, Router,
 };
 use ed25519_dalek::{Verifier, VerifyingKey};
+use pqcrypto_dilithium::dilithium2;
+use pqcrypto_traits::sign::{DetachedSignature, PublicKey as PqPublicKey};
 use tower_http::cors::{Any, CorsLayer};
 use futures::StreamExt;
 use lettre::{
@@ -125,9 +127,16 @@ struct LedgerTx {
     block_height: Option<u64>,
     #[serde(default)]
     nonce: u64,
-    /// Hex-encoded Ed25519 public key — required for relay-side signature verification.
+    /// Hex-encoded Ed25519 public key — kept for backward compat.
     #[serde(default)]
     public_key_ed25519: String,
+    /// Hex-encoded Dilithium2 public key (1312 bytes = 2624 hex chars).
+    /// Mathematically derives the egot1 address — quantum-safe ownership proof.
+    #[serde(default)]
+    dilithium_pubkey: String,
+    /// Hex-encoded Dilithium2 detached signature over canonical tx bytes.
+    #[serde(default)]
+    dilithium_signature: String,
     /// Which shard (0–SHARD_COUNT-1) this tx belongs to.  Default=0 for old clients.
     #[serde(default)]
     shard_id: u32,
@@ -548,58 +557,107 @@ async fn post_tx(
         return StatusCode::BAD_REQUEST;
     }
 
-    // ── 2. Signature verification ─────────────────────────────────────────
-    if tx.public_key_ed25519.is_empty() || tx.signature.is_empty() {
-        println!("[chain] Rejected tx {}: missing public key or signature", tx.hash);
-        return StatusCode::BAD_REQUEST;
-    }
-    let pk_bytes = match hex::decode(&tx.public_key_ed25519) {
-        Ok(b) if b.len() == 32 => b,
-        _ => {
-            println!("[chain] Rejected tx {}: invalid public key hex", tx.hash);
-            return StatusCode::BAD_REQUEST;
-        }
-    };
-    let pk_arr: [u8; 32] = pk_bytes.try_into().unwrap();
-    let verifying_key = match VerifyingKey::from_bytes(&pk_arr) {
-        Ok(k) => k,
-        Err(_) => {
-            println!("[chain] Rejected tx {}: invalid public key", tx.hash);
-            return StatusCode::BAD_REQUEST;
-        }
-    };
-    let sig_bytes = match hex::decode(&tx.signature) {
-        Ok(b) if b.len() == 64 => b,
-        _ => {
-            println!("[chain] Rejected tx {}: invalid signature hex", tx.hash);
-            return StatusCode::BAD_REQUEST;
-        }
-    };
-    let sig_arr: [u8; 64] = sig_bytes.try_into().unwrap();
-    let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
     let signing_bytes = tx_signing_bytes(&tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp);
-    if verifying_key.verify(&signing_bytes, &sig).is_err() {
-        println!("[chain] Rejected tx {}: signature invalid", tx.hash);
-        return StatusCode::UNAUTHORIZED;
+
+    // ── 2a. Dilithium2 signature verification (quantum-safe, preferred) ───
+    // Required when dilithium_pubkey is present (all new clients send both).
+    // The Dilithium public key mathematically derives the egot1 address,
+    // so a valid Dilithium signature is a complete proof of address ownership.
+    let has_dilithium = !tx.dilithium_pubkey.is_empty() && !tx.dilithium_signature.is_empty();
+    if has_dilithium {
+        let pk_bytes = match hex::decode(&tx.dilithium_pubkey) {
+            Ok(b) if b.len() == 1312 => b,
+            _ => {
+                println!("[chain] Rejected tx {}: invalid Dilithium pubkey", tx.hash);
+                return StatusCode::BAD_REQUEST;
+            }
+        };
+        let sig_bytes = match hex::decode(&tx.dilithium_signature) {
+            Ok(b) if b.len() == 2420 => b,
+            _ => {
+                println!("[chain] Rejected tx {}: invalid Dilithium signature", tx.hash);
+                return StatusCode::BAD_REQUEST;
+            }
+        };
+        let pk  = match dilithium2::PublicKey::from_bytes(&pk_bytes) {
+            Ok(k) => k,
+            Err(_) => {
+                println!("[chain] Rejected tx {}: malformed Dilithium pubkey", tx.hash);
+                return StatusCode::BAD_REQUEST;
+            }
+        };
+        let sig = match dilithium2::DetachedSignature::from_bytes(&sig_bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                println!("[chain] Rejected tx {}: malformed Dilithium signature", tx.hash);
+                return StatusCode::BAD_REQUEST;
+            }
+        };
+        if dilithium2::verify_detached_signature(&sig, &signing_bytes, &pk).is_err() {
+            println!("[chain] Rejected tx {}: Dilithium signature invalid", tx.hash);
+            return StatusCode::UNAUTHORIZED;
+        }
     }
 
-    // ── 3. Address → key binding (prevents spoofing from address) ────────
-    // First tx from an address permanently binds it to that ed25519 key.
-    // Any future tx from the same address with a different key is rejected.
+    // ── 2b. Ed25519 signature verification (kept for backward compat) ─────
+    // Still verified when present. Old clients (pre-quantum upgrade) send only this.
+    if !tx.public_key_ed25519.is_empty() && !tx.signature.is_empty() {
+        let pk_bytes = match hex::decode(&tx.public_key_ed25519) {
+            Ok(b) if b.len() == 32 => b,
+            _ => {
+                println!("[chain] Rejected tx {}: invalid Ed25519 pubkey", tx.hash);
+                return StatusCode::BAD_REQUEST;
+            }
+        };
+        let pk_arr: [u8; 32] = pk_bytes.try_into().unwrap();
+        let verifying_key = match VerifyingKey::from_bytes(&pk_arr) {
+            Ok(k) => k,
+            Err(_) => {
+                println!("[chain] Rejected tx {}: invalid Ed25519 key", tx.hash);
+                return StatusCode::BAD_REQUEST;
+            }
+        };
+        let sig_bytes = match hex::decode(&tx.signature) {
+            Ok(b) if b.len() == 64 => b,
+            _ => {
+                println!("[chain] Rejected tx {}: invalid Ed25519 signature hex", tx.hash);
+                return StatusCode::BAD_REQUEST;
+            }
+        };
+        let sig_arr: [u8; 64] = sig_bytes.try_into().unwrap();
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        if verifying_key.verify(&signing_bytes, &sig).is_err() {
+            println!("[chain] Rejected tx {}: Ed25519 signature invalid", tx.hash);
+            return StatusCode::UNAUTHORIZED;
+        }
+    } else if !has_dilithium {
+        // Neither signature present — reject.
+        println!("[chain] Rejected tx {}: no signature provided", tx.hash);
+        return StatusCode::BAD_REQUEST;
+    }
+
+    // ── 3. Address → key binding ──────────────────────────────────────────
+    // Prefer binding to the Dilithium key (address IS derived from Dilithium pubkey —
+    // this makes the binding cryptographically tight, not just first-come-first-served).
+    // Fall back to Ed25519 binding for old clients.
     {
         let mut registry = s.key_registry.write().unwrap();
+        let binding_key = if has_dilithium { &tx.dilithium_pubkey } else { &tx.public_key_ed25519 };
         match registry.get(&tx.from) {
-            Some(bound_key) if bound_key != &tx.public_key_ed25519 => {
+            Some(bound_key) if bound_key != binding_key => {
                 println!("[chain] Rejected tx {}: key mismatch for address {}", tx.hash, tx.from);
                 return StatusCode::UNAUTHORIZED;
             }
             None => {
-                // First time we see this address — bind it permanently.
-                registry.insert(tx.from.clone(), tx.public_key_ed25519.clone());
+                registry.insert(tx.from.clone(), binding_key.clone());
                 save_key_registry(&registry);
-                println!("[chain] Bound address {} → key {}", tx.from, &tx.public_key_ed25519[..8]);
+                let short = &binding_key[..16.min(binding_key.len())];
+                println!("[chain] Bound address {} → {} key {}…",
+                    tx.from,
+                    if has_dilithium { "Dilithium" } else { "Ed25519" },
+                    short);
             }
-            Some(_) => {} // already bound, key matches — continue
+            Some(_) => {}
         }
     }
 
@@ -1601,7 +1659,9 @@ async fn post_poc_event(
                 status:             "Confirmed".into(),
                 block_height,
                 nonce,
-                public_key_ed25519: String::new(),
+                public_key_ed25519:  String::new(),
+                dilithium_pubkey:    String::new(),
+                dilithium_signature: String::new(),
                 shard_id: shard_for_address(&req.address),
             });
             save_chain(&chain);

@@ -22,5 +22,7 @@ dotenvy = "0.15"
 lettre     = { version = "0.11", features = ["tokio1", "tokio1-native-tls", "smtp-transport", "builder"] }
 uuid       = { version = "1",    features = ["v4"] }
 tower-http    = { version = "0.5", features = ["cors"] }
-ed25519-dalek = "2"
-hex           = "0.4"
+ed25519-dalek    = "2"
+hex              = "0.4"
+pqcrypto-dilithium = "0.4"
+pqcrypto-traits    = "0.3.5"
