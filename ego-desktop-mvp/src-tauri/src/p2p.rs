@@ -1900,14 +1900,36 @@ pub struct CidHolder {
 
 /// After storing a file locally, register it on the relay shard so any peer
 /// (not just contacts) can discover the holder and request it directly.
+/// Signs the registration with Ed25519 to prevent registry poisoning.
 pub async fn register_cid_on_relay(cid: &str, holder_addr: &str, endpoint: &str) {
-    let shard_id = shard_for_cid(cid);
-    let payload  = serde_json::json!({
-        "cid":           cid,
-        "holder_addr":   holder_addr,
-        "endpoint":      endpoint,
-        "shard_id":      shard_id,
-        "registered_at": chrono::Utc::now().timestamp(),
+    let shard_id  = shard_for_cid(cid);
+    let timestamp = chrono::Utc::now().timestamp();
+
+    // Sign "cid:holder_addr:timestamp" with the wallet's Ed25519 key.
+    let sign_bytes = format!("{}:{}:{}", cid, holder_addr, timestamp).into_bytes();
+    let (sig_hex, pubkey_hex) = {
+        let seed_bytes = match std::fs::read(crate::ledger::seed_path()) {
+            Ok(b) if b.len() == 32 => b,
+            _ => { eprintln!("[CID] register: seed not available, skipping"); return; }
+        };
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&seed_bytes);
+        let kp = match ego_core::KeyPair::from_bytes(&seed) {
+            Ok(k) => k,
+            Err(e) => { eprintln!("[CID] register: keypair error: {}", e); return; }
+        };
+        let sig = kp.sign_ed25519(&sign_bytes);
+        let pk  = hex::encode(kp.ed25519_public_key().as_bytes());
+        (hex::encode(sig.as_bytes()), pk)
+    };
+
+    let payload = serde_json::json!({
+        "cid":         cid,
+        "holder_addr": holder_addr,
+        "endpoint":    endpoint,
+        "timestamp":   timestamp,
+        "signature":   sig_hex,
+        "public_key":  pubkey_hex,
     });
     let client = reqwest::Client::new();
     if let Err(e) = client
