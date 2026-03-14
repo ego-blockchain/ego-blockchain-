@@ -115,6 +115,9 @@ struct LedgerTx {
     /// Hex-encoded Ed25519 public key — required for relay-side signature verification.
     #[serde(default)]
     public_key_ed25519: String,
+    /// Which shard (0–SHARD_COUNT-1) this tx belongs to.  Default=0 for old clients.
+    #[serde(default)]
+    shard_id: u32,
 }
 
 impl SharedChain {
@@ -355,6 +358,22 @@ type InboxState   = Arc<RwLock<HashMap<String, Vec<InboxMessage>>>>;
 type UsersState   = Arc<RwLock<Vec<UserRecord>>>;
 type PendingState     = Arc<RwLock<Vec<PendingTx>>>;
 type KeyRegistryState = Arc<RwLock<HashMap<String, String>>>;
+type ShardPoolState   = Arc<RwLock<HashMap<u32, Vec<LedgerTx>>>>;
+
+/// Number of shards. Each shard processes transactions independently.
+/// Increase this as validator count grows (target: 1 shard per ~25 validators).
+const SHARD_COUNT: u32 = 4;
+
+/// Derive a shard ID from a wallet address string.
+/// Uses the same XOR-fold algorithm as ego-core::calculate_shard_for_address
+/// so desktop clients and the relay always agree on shard assignment.
+fn shard_for_address(address: &str) -> u32 {
+    let mut h: u32 = 0;
+    for (i, b) in address.bytes().enumerate() {
+        h ^= (b as u32) << (8 * (i % 4));
+    }
+    h % SHARD_COUNT
+}
 
 const KEY_REGISTRY_PATH: &str = "key_registry.json";
 
@@ -380,6 +399,7 @@ struct AppState {
     pending:      PendingState,
     poc_events:   PocState,
     key_registry: KeyRegistryState,
+    shard_pools:  ShardPoolState,
     mailer:       Arc<AsyncSmtpTransport<Tokio1Executor>>,
     config:       Arc<Config>,
 }
@@ -580,18 +600,26 @@ async fn post_tx(
 
     // ── 6. Accept — relay is the authority; accepted txs are always Confirmed ──
     let mut tx = tx;
-    tx.status = "Confirmed".to_string();
+    tx.status  = "Confirmed".to_string();
+    tx.shard_id = shard_for_address(&tx.from);
+
+    let is_cross_shard = shard_for_address(&tx.to) != tx.shard_id;
+
     if let Some(existing) = chain.transactions.iter_mut().find(|t| t.hash == tx.hash) {
         if existing.status != "Confirmed" {
-            existing.status = "Confirmed".to_string();
+            existing.status  = "Confirmed".to_string();
+            existing.shard_id = tx.shard_id;
             save_chain(&chain);
         }
     } else {
-        println!("[chain] ✓ Verified tx {} from {} → {} ({} uEGOC)", tx.hash, tx.from, tx.to, tx.amount);
-        // Gossip to all connected desktop peers so they learn about this tx
-        // even if they have no direct contact relationship with the sender.
+        println!(
+            "[chain] ✓ Verified tx {} shard={}{} from {} → {} ({} uEGOC)",
+            tx.hash, tx.shard_id,
+            if is_cross_shard { " (cross-shard)" } else { "" },
+            tx.from, tx.to, tx.amount
+        );
+        // Gossip to all connected desktop peers
         if let Some(gtx) = RELAY_GOSSIP_TX.get() {
-            // Use the same TxBroadcast shape the desktop gossip handler expects.
             let stub_block = LedgerBlock { height: 0, hash: String::new(), prev_hash: String::new(),
                 timestamp: 0, miner: String::new(), tx_count: 1, size_bytes: 0, reward: 0 };
             if let Ok(bytes) = serde_json::to_vec(&serde_json::json!({
@@ -602,8 +630,36 @@ async fn post_tx(
                 let _ = gtx.send(("ego-txs-v1".to_string(), bytes));
             }
         }
+        // Route into the sender's shard pool (cap at 50K per shard)
+        {
+            let mut pools = s.shard_pools.write().unwrap();
+            let pool = pools.entry(tx.shard_id).or_default();
+            pool.push(tx.clone());
+            if pool.len() > 50_000 {
+                pool.drain(0..1_000); // evict oldest 1K entries on overflow
+            }
+        }
+        let from_shard = tx.shard_id;
+        let to_shard   = shard_for_address(&tx.to);
+        let tx_hash    = tx.hash.clone();
         chain.transactions.push(tx);
         save_chain(&chain);
+        drop(chain); // release write lock before gossip
+
+        // Gossip a cross-shard receipt so destination-shard validators learn
+        // about incoming transfers (foundation for future shard finalisation).
+        if is_cross_shard {
+            if let Some(gtx) = RELAY_GOSSIP_TX.get() {
+                if let Ok(bytes) = serde_json::to_vec(&serde_json::json!({
+                    "type": "cross_shard_receipt",
+                    "from_shard": from_shard,
+                    "to_shard":   to_shard,
+                    "tx_hash":    tx_hash,
+                })) {
+                    let _ = gtx.send(("ego-shards-v1".to_string(), bytes));
+                }
+            }
+        }
     }
     StatusCode::OK
 }
@@ -1145,6 +1201,92 @@ struct PocEventRequest {
     public_key: String,
 }
 
+// ── Shard endpoints ───────────────────────────────────────────────────────────
+
+/// GET /shards — overview of all shards with tx counts and cross-shard stats.
+async fn get_shards(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let pools = s.shard_pools.read().unwrap();
+    let chain = s.chain.read().unwrap();
+    let shards: Vec<serde_json::Value> = (0..SHARD_COUNT).map(|id| {
+        let pending   = pools.get(&id).map(|v| v.len()).unwrap_or(0);
+        let confirmed = chain.transactions.iter()
+            .filter(|t| t.shard_id == id && t.status == "Confirmed")
+            .count();
+        let cross_out = chain.transactions.iter()
+            .filter(|t| t.shard_id == id && shard_for_address(&t.to) != id && t.status == "Confirmed")
+            .count();
+        serde_json::json!({
+            "shard_id":          id,
+            "pending_txs":       pending,
+            "confirmed_txs":     confirmed,
+            "cross_shard_out":   cross_out,
+        })
+    }).collect();
+
+    let total_confirmed: usize = shards.iter()
+        .map(|s| s["confirmed_txs"].as_u64().unwrap_or(0) as usize)
+        .sum();
+    let total_cross: usize = shards.iter()
+        .map(|s| s["cross_shard_out"].as_u64().unwrap_or(0) as usize)
+        .sum();
+
+    Json(serde_json::json!({
+        "shard_count":       SHARD_COUNT,
+        "total_confirmed":   total_confirmed,
+        "total_cross_shard": total_cross,
+        "shards":            shards,
+    }))
+}
+
+/// GET /shard/:id/txs — all transactions routed to a specific shard.
+async fn get_shard_txs(
+    Path(id): Path<u32>,
+    State(s): State<AppState>,
+) -> Result<Json<Vec<LedgerTx>>, StatusCode> {
+    if id >= SHARD_COUNT { return Err(StatusCode::NOT_FOUND); }
+    let pools = s.shard_pools.read().unwrap();
+    Ok(Json(pools.get(&id).cloned().unwrap_or_default()))
+}
+
+/// GET /shard/:id/stats — detailed stats for a single shard.
+async fn get_shard_stats(
+    Path(id): Path<u32>,
+    State(s): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if id >= SHARD_COUNT { return Err(StatusCode::NOT_FOUND); }
+    let chain = s.chain.read().unwrap();
+
+    let confirmed_txs: Vec<&LedgerTx> = chain.transactions.iter()
+        .filter(|t| t.shard_id == id && t.status == "Confirmed")
+        .collect();
+
+    let volume_uegoc: u64 = confirmed_txs.iter().map(|t| t.amount).sum();
+    let cross_out = confirmed_txs.iter()
+        .filter(|t| shard_for_address(&t.to) != id)
+        .count();
+    let cross_in = chain.transactions.iter()
+        .filter(|t| t.shard_id != id && shard_for_address(&t.to) == id && t.status == "Confirmed")
+        .count();
+
+    // Rough TPS: confirmed txs / elapsed seconds since first tx in this shard
+    let tps = {
+        let first_ts = confirmed_txs.iter().map(|t| t.timestamp).min().unwrap_or(0);
+        let last_ts  = confirmed_txs.iter().map(|t| t.timestamp).max().unwrap_or(0);
+        let elapsed  = (last_ts - first_ts).max(1) as f64;
+        confirmed_txs.len() as f64 / elapsed
+    };
+
+    Ok(Json(serde_json::json!({
+        "shard_id":        id,
+        "confirmed_txs":   confirmed_txs.len(),
+        "volume_uegoc":    volume_uegoc,
+        "cross_shard_out": cross_out,
+        "cross_shard_in":  cross_in,
+        "tps_lifetime":    (tps * 100.0).round() / 100.0,
+        "shard_count":     SHARD_COUNT,
+    })))
+}
+
 /// POST /poc/event — submit a signed Proof of Coverage beacon event.
 async fn post_poc_event(
     State(s): State<AppState>,
@@ -1246,6 +1388,7 @@ async fn post_poc_event(
                 block_height,
                 nonce,
                 public_key_ed25519: String::new(),
+                shard_id: shard_for_address(&req.address),
             });
             save_chain(&chain);
         }
@@ -1378,15 +1521,29 @@ async fn main() {
         .credentials(creds)
         .build();
 
-    let poc_loaded = load_poc_events();
+    let poc_loaded    = load_poc_events();
+    let chain_loaded  = load_chain();
+
+    // Pre-populate per-shard pools from confirmed on-disk transactions so
+    // GET /shard/:id/stats shows accurate history on a fresh relay restart.
+    let initial_shard_pools: HashMap<u32, Vec<LedgerTx>> = {
+        let mut pools: HashMap<u32, Vec<LedgerTx>> = HashMap::new();
+        for tx in &chain_loaded.transactions {
+            let sid = shard_for_address(&tx.from);
+            pools.entry(sid).or_default().push(tx.clone());
+        }
+        pools
+    };
+
     let state = AppState {
-        chain:        Arc::new(RwLock::new(load_chain())),
+        chain:        Arc::new(RwLock::new(chain_loaded)),
         peers:        Arc::new(RwLock::new(load_peers())),
         inbox:        Arc::new(RwLock::new(HashMap::new())),
         users:        Arc::new(RwLock::new(load_users())),
         pending:      Arc::new(RwLock::new(Vec::new())),
         poc_events:   Arc::new(RwLock::new(poc_loaded)),
         key_registry: Arc::new(RwLock::new(load_key_registry())),
+        shard_pools:  Arc::new(RwLock::new(initial_shard_pools)),
         mailer:       Arc::new(mailer),
         config:       Arc::new(cfg),
     };
@@ -1428,6 +1585,10 @@ async fn main() {
             .route("/tx/confirm/:token",    get(get_confirm_tx))
             .route("/tx/cancel/:token",     get(get_cancel_tx))
             .route("/tx/status/:token",     get(get_tx_status))
+            // ── Sharding ──
+            .route("/shards",               get(get_shards))
+            .route("/shard/:id/txs",        get(get_shard_txs))
+            .route("/shard/:id/stats",      get(get_shard_stats))
             // ── PoC / DRS ──
             .route("/poc/event",            post(post_poc_event))
             .route("/poc/score/:address",   get(get_poc_score))
@@ -1506,8 +1667,10 @@ async fn main() {
     // ── Gossipsub: subscribe to chain topics ──────────────────────────────────
     let tx_topic    = gossipsub::IdentTopic::new("ego-txs-v1");
     let blk_topic   = gossipsub::IdentTopic::new("ego-blocks-v1");
+    let shard_topic = gossipsub::IdentTopic::new("ego-shards-v1");
     let _ = swarm.behaviour_mut().gossipsub.subscribe(&tx_topic);
     let _ = swarm.behaviour_mut().gossipsub.subscribe(&blk_topic);
+    let _ = swarm.behaviour_mut().gossipsub.subscribe(&shard_topic);
 
     // ── Gossip channel: HTTP handlers publish here; swarm loop drains it ──────
     let (gossip_tx, mut gossip_rx) =
