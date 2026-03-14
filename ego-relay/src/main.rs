@@ -24,6 +24,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use ed25519_dalek::{Verifier, VerifyingKey};
 use tower_http::cors::{Any, CorsLayer};
 use futures::StreamExt;
 use lettre::{
@@ -106,6 +107,31 @@ struct LedgerTx {
     block_height: Option<u64>,
     #[serde(default)]
     nonce: u64,
+    /// Hex-encoded Ed25519 public key — required for relay-side signature verification.
+    #[serde(default)]
+    public_key_ed25519: String,
+}
+
+impl SharedChain {
+    /// Recalculate balance for an address from confirmed transactions only.
+    fn balance_of(&self, address: &str) -> u64 {
+        let incoming: u64 = self.transactions.iter()
+            .filter(|t| t.to == address && t.status == "Confirmed")
+            .map(|t| t.amount).sum();
+        let outgoing: u64 = self.transactions.iter()
+            .filter(|t| t.from == address && t.status == "Confirmed")
+            .map(|t| t.amount).sum();
+        incoming.saturating_sub(outgoing)
+    }
+
+    /// Highest confirmed nonce for an address (0 if none).
+    fn last_nonce(&self, address: &str) -> u64 {
+        self.transactions.iter()
+            .filter(|t| t.from == address && t.status == "Confirmed")
+            .map(|t| t.nonce)
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 // ── Persistent chain storage ──────────────────────────────────────────────────
@@ -125,6 +151,22 @@ fn save_chain(chain: &SharedChain) {
     if let Ok(data) = serde_json::to_string_pretty(chain) {
         let _ = fs::write(CHAIN_PATH, data);
     }
+}
+
+/// Canonical bytes that were signed by the sender — must match desktop exactly.
+fn tx_signing_bytes(from: &str, to: &str, amount: u64, nonce: u64, timestamp: i64) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"ego/tx/v1:");
+    v.extend_from_slice(from.as_bytes());
+    v.extend_from_slice(b":");
+    v.extend_from_slice(to.as_bytes());
+    v.extend_from_slice(b":");
+    v.extend_from_slice(&amount.to_le_bytes());
+    v.extend_from_slice(b":");
+    v.extend_from_slice(&nonce.to_le_bytes());
+    v.extend_from_slice(b":");
+    v.extend_from_slice(&timestamp.to_le_bytes());
+    v
 }
 
 // ── Peer directory ────────────────────────────────────────────────────────────
@@ -340,9 +382,76 @@ async fn post_tx(
     State(s): State<AppState>,
     Json(tx): Json<LedgerTx>,
 ) -> StatusCode {
+    // ── 1. Basic sanity ───────────────────────────────────────────────────
+    if tx.from.is_empty() || tx.to.is_empty() || tx.amount == 0 {
+        println!("[chain] Rejected tx: missing fields");
+        return StatusCode::BAD_REQUEST;
+    }
+
+    // ── 2. Signature verification ─────────────────────────────────────────
+    if tx.public_key_ed25519.is_empty() || tx.signature.is_empty() {
+        println!("[chain] Rejected tx {}: missing public key or signature", tx.hash);
+        return StatusCode::BAD_REQUEST;
+    }
+    let pk_bytes = match hex::decode(&tx.public_key_ed25519) {
+        Ok(b) if b.len() == 32 => b,
+        _ => {
+            println!("[chain] Rejected tx {}: invalid public key hex", tx.hash);
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+    let pk_arr: [u8; 32] = pk_bytes.try_into().unwrap();
+    let verifying_key = match VerifyingKey::from_bytes(&pk_arr) {
+        Ok(k) => k,
+        Err(_) => {
+            println!("[chain] Rejected tx {}: invalid public key", tx.hash);
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+    let sig_bytes = match hex::decode(&tx.signature) {
+        Ok(b) if b.len() == 64 => b,
+        _ => {
+            println!("[chain] Rejected tx {}: invalid signature hex", tx.hash);
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+    let sig_arr: [u8; 64] = sig_bytes.try_into().unwrap();
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+    let signing_bytes = tx_signing_bytes(&tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp);
+    if verifying_key.verify(&signing_bytes, &sig).is_err() {
+        println!("[chain] Rejected tx {}: signature invalid", tx.hash);
+        return StatusCode::UNAUTHORIZED;
+    }
+
+    // ── 3. Timestamp freshness (reject if older than 10 minutes) ─────────
+    let now = chrono::Utc::now().timestamp();
+    if (now - tx.timestamp).abs() > 600 {
+        println!("[chain] Rejected tx {}: timestamp too old/future", tx.hash);
+        return StatusCode::BAD_REQUEST;
+    }
+
     let mut chain = s.chain.write().unwrap();
+
+    // ── 4. Nonce enforcement (strictly increasing per address) ────────────
+    let last = chain.last_nonce(&tx.from);
+    if tx.nonce == 0 || tx.nonce <= last {
+        println!("[chain] Rejected tx {}: nonce {} <= last confirmed {}", tx.hash, tx.nonce, last);
+        return StatusCode::CONFLICT;
+    }
+
+    // ── 5. Server-side balance check ──────────────────────────────────────
+    // Special case: genesis/faucet transactions are always allowed.
+    if tx.from != "egot1faucet000000000000000000000000000000000000" {
+        let balance = chain.balance_of(&tx.from);
+        if tx.amount > balance {
+            println!("[chain] Rejected tx {}: insufficient balance ({} > {})", tx.hash, tx.amount, balance);
+            return StatusCode::BAD_REQUEST;
+        }
+    }
+
+    // ── 6. Accept ─────────────────────────────────────────────────────────
     if !chain.transactions.iter().any(|t| t.hash == tx.hash) {
-        println!("[chain] New tx {} from {} → {} ({} uEGOC)", tx.hash, tx.from, tx.to, tx.amount);
+        println!("[chain] ✓ Verified tx {} from {} → {} ({} uEGOC)", tx.hash, tx.from, tx.to, tx.amount);
         chain.transactions.push(tx);
         save_chain(&chain);
     }

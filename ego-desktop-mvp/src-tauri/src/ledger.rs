@@ -126,6 +126,9 @@ pub struct LedgerTx {
     pub block_height: Option<u64>,
     #[serde(default)]
     pub nonce: u64,
+    /// Hex-encoded Ed25519 public key of the sender — required for relay-side verification.
+    #[serde(default)]
+    pub public_key_ed25519: String,
 }
 
 /// A local "block" produced whenever a transaction is confirmed.

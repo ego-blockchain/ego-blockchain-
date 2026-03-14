@@ -95,9 +95,10 @@ pub async fn send_transaction(
     let ts         = chrono::Utc::now().timestamp();
     let sign_bytes = tx_signing_bytes(&from, &request.to_address, request.amount, nonce, ts);
 
-    let signature_hex = if let Some(kp) = state.get_keypair() {
+    let (signature_hex, pubkey_hex) = if let Some(kp) = state.get_keypair() {
         let sig = kp.sign_ed25519(&sign_bytes);
-        hex::encode(sig.as_bytes())
+        let pk  = hex::encode(kp.ed25519_public_key().as_bytes());
+        (hex::encode(sig.as_bytes()), pk)
     } else {
         return Err(EgoDesktopError::WalletError(
             "Wallet not initialized – call init_wallet first".into(),
@@ -108,16 +109,17 @@ pub async fn send_transaction(
 
     // ── 3. Add tx to the shared chain as "Pending" ────────────────────────
     chain.transactions.push(LedgerTx {
-        hash:         tx_hash.clone(),
-        from:         from.clone(),
-        to:           request.to_address.clone(),
-        amount:       request.amount,
-        memo:         request.memo.clone(),
-        timestamp:    ts,
-        signature:    signature_hex,
-        status:       "Pending".into(),
-        block_height: None,
+        hash:                tx_hash.clone(),
+        from:                from.clone(),
+        to:                  request.to_address.clone(),
+        amount:              request.amount,
+        memo:                request.memo.clone(),
+        timestamp:           ts,
+        signature:           signature_hex,
+        status:              "Pending".into(),
+        block_height:        None,
         nonce,
+        public_key_ed25519:  pubkey_hex,
     });
 
     // ── 4. Mine a block → confirms the tx ────────────────────────────────
@@ -200,8 +202,10 @@ pub async fn prepare_transaction(
     let nonce      = ledger.nonce + 1;
     let ts         = chrono::Utc::now().timestamp();
     let sign_bytes = tx_signing_bytes(&from, &request.to_address, request.amount, nonce, ts);
-    let signature_hex = if let Some(kp) = state.get_keypair() {
-        hex::encode(kp.sign_ed25519(&sign_bytes).as_bytes())
+    let (signature_hex, pubkey_hex) = if let Some(kp) = state.get_keypair() {
+        let sig = kp.sign_ed25519(&sign_bytes);
+        let pk  = hex::encode(kp.ed25519_public_key().as_bytes());
+        (hex::encode(sig.as_bytes()), pk)
     } else {
         return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
     };
@@ -210,7 +214,7 @@ pub async fn prepare_transaction(
         hash: tx_hash.clone(), from: from.clone(), to: request.to_address.clone(),
         amount: request.amount, memo: request.memo.clone(), timestamp: ts,
         signature: signature_hex, status: "Pending".into(),
-        block_height: None, nonce,
+        block_height: None, nonce, public_key_ed25519: pubkey_hex,
     };
     chain.transactions.push(tx.clone());
     chain.mine_block(&tx_hash, &from);
