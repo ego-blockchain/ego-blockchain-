@@ -268,16 +268,17 @@ fn create_wallet_files(address_override: Option<&str>) -> Result<String, EgoDesk
         let genesis_block_height = chain.blocks.len() as u64;
 
         chain.transactions.push(LedgerTx {
-            hash:         genesis_hash.clone(),
-            from:         "egot1faucet000000000000000000000000000000000000".into(),
-            to:           final_address.clone(),
-            amount:       10_000 * 1_000_000,
-            memo:         Some("Testnet faucet – welcome!".into()),
-            timestamp:    ts,
-            signature:    "genesis".into(),
-            status:       "Confirmed".into(),
-            block_height: Some(genesis_block_height),
-            nonce:        0,
+            hash:               genesis_hash.clone(),
+            from:               "egot1faucet000000000000000000000000000000000000".into(),
+            to:                 final_address.clone(),
+            amount:             10_000 * 1_000_000,
+            memo:               Some("Testnet faucet – welcome!".into()),
+            timestamp:          ts,
+            signature:          "genesis".into(),
+            status:             "Confirmed".into(),
+            block_height:       Some(genesis_block_height),
+            nonce:              0,
+            public_key_ed25519: String::new(),
         });
         chain.blocks.push(LedgerBlock {
             height:     genesis_block_height,

@@ -89,16 +89,17 @@ pub async fn stake_coins(
     let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
 
     chain.transactions.push(LedgerTx {
-        hash:         tx_hash.clone(),
-        from:         from.clone(),
-        to:           STAKING_ADDR.to_string(),
-        amount:       amount_uegoc,
-        memo:         Some(format!("Stake {} days", lock_days)),
-        timestamp:    ts,
-        signature:    sig_hex,
-        status:       "Pending".into(),
-        block_height: None,
+        hash:               tx_hash.clone(),
+        from:               from.clone(),
+        to:                 STAKING_ADDR.to_string(),
+        amount:             amount_uegoc,
+        memo:               Some(format!("Stake {} days", lock_days)),
+        timestamp:          ts,
+        signature:          sig_hex,
+        status:             "Pending".into(),
+        block_height:       None,
         nonce,
+        public_key_ed25519: String::new(),
     });
     chain.mine_block(&tx_hash, &from);
     save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save chain: {e}")))?;
@@ -166,16 +167,17 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
         let fee_hash = format!("0x{}", ego_core::hash_data(&fee_sign_bytes).to_hex());
 
         chain.transactions.push(LedgerTx {
-            hash:         fee_hash.clone(),
-            from:         from.clone(),
-            to:           STAKING_ADDR.to_string(),
-            amount:       fee,
-            memo:         Some("Early unstake fee".to_string()),
-            timestamp:    ts,
-            signature:    fee_sig_hex,
-            status:       "Pending".into(),
-            block_height: None,
-            nonce:        fee_nonce,
+            hash:               fee_hash.clone(),
+            from:               from.clone(),
+            to:                 STAKING_ADDR.to_string(),
+            amount:             fee,
+            memo:               Some("Early unstake fee".to_string()),
+            timestamp:          ts,
+            signature:          fee_sig_hex,
+            status:             "Pending".into(),
+            block_height:       None,
+            nonce:              fee_nonce,
+            public_key_ed25519: String::new(),
         });
 
         // Return tx: staking contract → user
@@ -184,16 +186,17 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
         let ret_hash       = format!("0x{}", ego_core::hash_data(&ret_sign_bytes).to_hex());
 
         chain.transactions.push(LedgerTx {
-            hash:         ret_hash.clone(),
-            from:         STAKING_ADDR.to_string(),
-            to:           from.clone(),
-            amount:       return_amount,
-            memo:         Some("Early unstake return".to_string()),
-            timestamp:    ts,
-            signature:    "staking_system".to_string(),
-            status:       "Pending".into(),
-            block_height: None,
-            nonce:        ret_nonce,
+            hash:               ret_hash.clone(),
+            from:               STAKING_ADDR.to_string(),
+            to:                 from.clone(),
+            amount:             return_amount,
+            memo:               Some("Early unstake return".to_string()),
+            timestamp:          ts,
+            signature:          "staking_system".to_string(),
+            status:             "Pending".into(),
+            block_height:       None,
+            nonce:              ret_nonce,
+            public_key_ed25519: String::new(),
         });
         chain.mine_block(&ret_hash, &from);
         save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save chain: {e}")))?;
@@ -228,16 +231,17 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
         let tx_hash    = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
 
         chain.transactions.push(LedgerTx {
-            hash:         tx_hash.clone(),
-            from:         STAKING_ADDR.to_string(),
-            to:           from.clone(),
-            amount:       staked_amount,
-            memo:         Some("Unstake return".to_string()),
-            timestamp:    ts,
-            signature:    "staking_system".to_string(),
-            status:       "Pending".into(),
-            block_height: None,
+            hash:               tx_hash.clone(),
+            from:               STAKING_ADDR.to_string(),
+            to:                 from.clone(),
+            amount:             staked_amount,
+            memo:               Some("Unstake return".to_string()),
+            timestamp:          ts,
+            signature:          "staking_system".to_string(),
+            status:             "Pending".into(),
+            block_height:       None,
             nonce,
+            public_key_ed25519: String::new(),
         });
         chain.mine_block(&tx_hash, &from);
         save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save chain: {e}")))?;

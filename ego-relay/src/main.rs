@@ -17,6 +17,9 @@
 //!   GET  /tx/confirm/:token       — user clicks → tx executes
 //!   GET  /tx/cancel/:token        — user clicks → tx cancelled
 //!   GET  /tx/status/:token        — desktop polls for confirmation status
+//!   POST /poc/event               — submit signed Proof of Coverage beacon event
+//!   GET  /poc/score/:address      — DRS score + validator rank for an address
+//!   GET  /poc/validators          — ranked list of active PoC validators
 
 use axum::{
     extract::{Path, State},
@@ -133,6 +136,80 @@ impl SharedChain {
             .unwrap_or(0)
     }
 }
+
+// ── Proof of Coverage (PoC) data model ───────────────────────────────────────
+
+const POC_EVENTS_PATH: &str = "poc_events.json";
+/// Minimum number of validators with PoC scores before the block gate activates.
+/// Below this threshold the network is in bootstrap mode and any miner is accepted.
+const POC_BOOTSTRAP_THRESHOLD: usize = 3;
+/// Maximum one PoC event per address per 10 minutes (prevents spam).
+const POC_RATE_LIMIT_SECS: i64 = 600;
+
+fn quality_score(q: &str) -> u32 {
+    match q { "Excellent" => 4, "Good" => 3, "Fair" => 2, "Poor" => 1, _ => 0 }
+}
+
+fn poc_reward_uegoc(q: &str) -> u64 {
+    match q { "Excellent" => 22_222, "Good" => 16_666, "Fair" => 11_111, "Poor" => 5_555, _ => 0 }
+}
+
+/// Canonical bytes that must be signed for a PoC event (matches desktop).
+fn poc_signing_bytes(address: &str, quality: &str, peers: u32, h3_cell: &str, timestamp: i64) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"ego/poc/v1:");
+    v.extend_from_slice(address.as_bytes());
+    v.extend_from_slice(b":");
+    v.extend_from_slice(quality.as_bytes());
+    v.extend_from_slice(b":");
+    v.extend_from_slice(&peers.to_le_bytes());
+    v.extend_from_slice(b":");
+    v.extend_from_slice(h3_cell.as_bytes());
+    v.extend_from_slice(b":");
+    v.extend_from_slice(&timestamp.to_le_bytes());
+    v
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PocEventRecord {
+    id:           String,
+    address:      String,
+    quality:      String,
+    peers:        u32,
+    h3_cell:      Option<String>,
+    timestamp:    i64,
+    signature:    String,
+    public_key:   String,
+    reward_uegoc: u64,
+    accepted_at:  i64,
+}
+
+fn load_poc_events() -> Vec<PocEventRecord> {
+    fs::read_to_string(POC_EVENTS_PATH)
+        .ok()
+        .and_then(|d| serde_json::from_str(&d).ok())
+        .unwrap_or_default()
+}
+
+fn save_poc_events(events: &[PocEventRecord]) {
+    if let Ok(data) = serde_json::to_string_pretty(events) {
+        let _ = fs::write(POC_EVENTS_PATH, data);
+    }
+}
+
+/// DRS score = Σ quality_pts(last 24h) × ln(1 + count_24h)
+/// Inspired by whitepaper DRS formula; simplified for testnet with PoC as primary signal.
+fn compute_drs_score(events: &[PocEventRecord], address: &str) -> f64 {
+    let cutoff = chrono::Utc::now().timestamp() - 86_400;
+    let recent: Vec<_> = events.iter()
+        .filter(|e| e.address == address && e.timestamp >= cutoff)
+        .collect();
+    if recent.is_empty() { return 0.0; }
+    let total_pts: u32 = recent.iter().map(|e| quality_score(&e.quality)).sum();
+    total_pts as f64 * (1.0_f64 + recent.len() as f64).ln()
+}
+
+type PocState = Arc<RwLock<Vec<PocEventRecord>>>;
 
 // ── Persistent chain storage ──────────────────────────────────────────────────
 
@@ -269,13 +346,14 @@ type PendingState = Arc<RwLock<Vec<PendingTx>>>;
 
 #[derive(Clone)]
 struct AppState {
-    chain:   ChainState,
-    peers:   PeersState,
-    inbox:   InboxState,
-    users:   UsersState,
-    pending: PendingState,
-    mailer:  Arc<AsyncSmtpTransport<Tokio1Executor>>,
-    config:  Arc<Config>,
+    chain:      ChainState,
+    peers:      PeersState,
+    inbox:      InboxState,
+    users:      UsersState,
+    pending:    PendingState,
+    poc_events: PocState,
+    mailer:     Arc<AsyncSmtpTransport<Tokio1Executor>>,
+    config:     Arc<Config>,
 }
 
 // ── Email helpers ─────────────────────────────────────────────────────────────
@@ -462,9 +540,40 @@ async fn post_block(
     State(s): State<AppState>,
     Json(block): Json<LedgerBlock>,
 ) -> StatusCode {
+    // ── PoC gate ──────────────────────────────────────────────────────────────
+    // Blocks may only be proposed by miners that have proven coverage (DRS > 0).
+    // During bootstrap (< POC_BOOTSTRAP_THRESHOLD active validators) we allow
+    // any miner so the network can get started without a chicken-and-egg problem.
+    {
+        let poc = s.poc_events.read().unwrap();
+        let unique_validators = poc.iter()
+            .map(|e| e.address.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        if unique_validators >= POC_BOOTSTRAP_THRESHOLD {
+            let miner_score = compute_drs_score(&poc, &block.miner);
+            if miner_score == 0.0 {
+                println!("[chain] Rejected block #{} from {}: no PoC score (validators={})",
+                    block.height, block.miner, unique_validators);
+                return StatusCode::FORBIDDEN;
+            }
+        }
+    }
+
     let mut chain = s.chain.write().unwrap();
+
+    // ── Chain linkage check ────────────────────────────────────────────────────
+    // Reject a block whose prev_hash doesn't connect to the current tip.
+    if let Some(tip) = chain.blocks.last() {
+        if block.height == tip.height + 1 && block.prev_hash != tip.hash {
+            println!("[chain] Rejected block #{}: prev_hash mismatch (got {}, want {})",
+                block.height, block.prev_hash, tip.hash);
+            return StatusCode::BAD_REQUEST;
+        }
+    }
+
     if !chain.blocks.iter().any(|b| b.hash == block.hash) {
-        println!("[chain] New block #{} hash {}", block.height, block.hash);
+        println!("[chain] ✓ Block #{} hash {} miner {}", block.height, block.hash, block.miner);
         chain.blocks.push(block);
         chain.blocks.sort_by_key(|b| b.height);
         save_chain(&chain);
@@ -951,6 +1060,215 @@ async fn get_tx_status(
     Json(TxStatusResponse { status: "confirmed".into() })
 }
 
+// ── PoC HTTP handlers ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct PocEventRequest {
+    address:    String,
+    quality:    String,
+    peers:      u32,
+    h3_cell:    Option<String>,
+    timestamp:  i64,
+    signature:  String,
+    public_key: String,
+}
+
+/// POST /poc/event — submit a signed Proof of Coverage beacon event.
+async fn post_poc_event(
+    State(s): State<AppState>,
+    Json(req): Json<PocEventRequest>,
+) -> (StatusCode, Json<ApiResponse>) {
+    // 1. Validate quality value
+    if !["Excellent", "Good", "Fair", "Poor"].contains(&req.quality.as_str()) {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            success: false, message: "Invalid quality level".into(),
+        }));
+    }
+
+    // 2. Timestamp freshness ±30 minutes
+    let now = chrono::Utc::now().timestamp();
+    if (now - req.timestamp).abs() > 1800 {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            success: false, message: "Timestamp out of range (±30 min)".into(),
+        }));
+    }
+
+    // 3. Ed25519 signature verification
+    let pk_bytes = match hex::decode(&req.public_key) {
+        Ok(b) if b.len() == 32 => b,
+        _ => return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            success: false, message: "Invalid public key".into(),
+        })),
+    };
+    let pk_arr: [u8; 32] = pk_bytes.try_into().unwrap();
+    let verifying_key = match VerifyingKey::from_bytes(&pk_arr) {
+        Ok(k) => k,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            success: false, message: "Invalid public key bytes".into(),
+        })),
+    };
+    let sig_bytes = match hex::decode(&req.signature) {
+        Ok(b) if b.len() == 64 => b,
+        _ => return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            success: false, message: "Invalid signature".into(),
+        })),
+    };
+    let sig_arr: [u8; 64] = sig_bytes.try_into().unwrap();
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+    let h3 = req.h3_cell.as_deref().unwrap_or("");
+    let signing_bytes = poc_signing_bytes(&req.address, &req.quality, req.peers, h3, req.timestamp);
+    if verifying_key.verify(&signing_bytes, &sig).is_err() {
+        println!("[poc] Rejected event from {}: bad signature", req.address);
+        return (StatusCode::UNAUTHORIZED, Json(ApiResponse {
+            success: false, message: "Invalid signature".into(),
+        }));
+    }
+
+    // 4. Rate-limit: max 1 event per address per POC_RATE_LIMIT_SECS
+    let reward = poc_reward_uegoc(&req.quality);
+    {
+        let mut events = s.poc_events.write().unwrap();
+        let cutoff = now - POC_RATE_LIMIT_SECS;
+        if events.iter().any(|e| e.address == req.address && e.timestamp > cutoff) {
+            return (StatusCode::TOO_MANY_REQUESTS, Json(ApiResponse {
+                success: false, message: format!("Rate limit: 1 PoC event per {} minutes",
+                    POC_RATE_LIMIT_SECS / 60),
+            }));
+        }
+        events.push(PocEventRecord {
+            id:          uuid::Uuid::new_v4().to_string(),
+            address:     req.address.clone(),
+            quality:     req.quality.clone(),
+            peers:       req.peers,
+            h3_cell:     req.h3_cell.clone(),
+            timestamp:   req.timestamp,
+            signature:   req.signature.clone(),
+            public_key:  req.public_key.clone(),
+            reward_uegoc: reward,
+            accepted_at: now,
+        });
+        // Prune events older than 30 days to keep the file manageable
+        let cutoff_30d = now - 86_400 * 30;
+        events.retain(|e| e.timestamp >= cutoff_30d);
+        save_poc_events(&events);
+    }
+
+    // 5. Emit coverage reward tx from faucet address on the shared chain
+    if reward > 0 {
+        let reward_hash = format!("0xpoc-{}-{}",
+            &req.address[req.address.len().saturating_sub(8)..], req.timestamp);
+        let mut chain = s.chain.write().unwrap();
+        if !chain.transactions.iter().any(|t| t.hash == reward_hash) {
+            let faucet       = "egot1faucet000000000000000000000000000000000000";
+            let nonce        = chain.last_nonce(faucet) + 1;
+            let block_height = chain.blocks.last().map(|b| b.height);
+            chain.transactions.push(LedgerTx {
+                hash:               reward_hash,
+                from:               faucet.into(),
+                to:                 req.address.clone(),
+                amount:             reward,
+                memo:               Some(format!("PoC coverage reward ({})", req.quality)),
+                timestamp:          now,
+                signature:          "relay-issued".into(),
+                status:             "Confirmed".into(),
+                block_height,
+                nonce,
+                public_key_ed25519: String::new(),
+            });
+            save_chain(&chain);
+        }
+    }
+
+    println!("[poc] ✓ Event from {} quality={} peers={} reward={}uEGOC",
+        req.address, req.quality, req.peers, reward);
+    (StatusCode::OK, Json(ApiResponse {
+        success: true,
+        message: format!("PoC event accepted, reward: {} uEGOC (DRS updated)", reward),
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct DrsScoreResponse {
+    address:        String,
+    drs_score:      f64,
+    events_24h:     u32,
+    total_events:   u64,
+    last_event:     Option<i64>,
+    is_validator:   bool,
+    validator_rank: Option<usize>,
+}
+
+/// GET /poc/score/:address — DRS score and validator status for an address.
+async fn get_poc_score(
+    Path(address): Path<String>,
+    State(s): State<AppState>,
+) -> Json<DrsScoreResponse> {
+    let events  = s.poc_events.read().unwrap();
+    let now     = chrono::Utc::now().timestamp();
+    let cutoff  = now - 86_400;
+    let events_24h   = events.iter().filter(|e| e.address == address && e.timestamp >= cutoff).count() as u32;
+    let total_events = events.iter().filter(|e| e.address == address).count() as u64;
+    let last_event   = events.iter().filter(|e| e.address == address).map(|e| e.timestamp).max();
+    let drs_score    = compute_drs_score(&events, &address);
+
+    // Rank among all validators (any address with drs_score > 0)
+    let mut all: Vec<(String, f64)> = events.iter()
+        .map(|e| e.address.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .map(|a| { let sc = compute_drs_score(&events, &a); (a, sc) })
+        .filter(|(_, sc)| *sc > 0.0)
+        .collect();
+    all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let validator_rank = all.iter().position(|(a, _)| *a == address).map(|i| i + 1);
+
+    Json(DrsScoreResponse {
+        address, drs_score, events_24h, total_events, last_event,
+        is_validator: drs_score > 0.0,
+        validator_rank,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct ValidatorInfo {
+    address:    String,
+    drs_score:  f64,
+    events_24h: u32,
+    last_event: Option<i64>,
+    rank:       usize,
+}
+
+/// GET /poc/validators — ranked list of active PoC validators (last 24 h).
+async fn get_poc_validators(
+    State(s): State<AppState>,
+) -> Json<Vec<ValidatorInfo>> {
+    let events = s.poc_events.read().unwrap();
+    let now    = chrono::Utc::now().timestamp();
+    let cutoff = now - 86_400;
+
+    let mut addr_map: std::collections::HashMap<String, (u32, Option<i64>)> = std::collections::HashMap::new();
+    for e in events.iter() {
+        let entry = addr_map.entry(e.address.clone()).or_insert((0, None));
+        if e.timestamp >= cutoff { entry.0 += 1; }
+        entry.1 = Some(entry.1.map(|t: i64| t.max(e.timestamp)).unwrap_or(e.timestamp));
+    }
+
+    let mut validators: Vec<ValidatorInfo> = addr_map.iter()
+        .filter(|(_, (cnt, _))| *cnt > 0)
+        .map(|(addr, (cnt, last))| ValidatorInfo {
+            address:    addr.clone(),
+            drs_score:  compute_drs_score(&events, addr),
+            events_24h: *cnt,
+            last_event: *last,
+            rank:       0,
+        })
+        .collect();
+    validators.sort_by(|a, b| b.drs_score.partial_cmp(&a.drs_score)
+        .unwrap_or(std::cmp::Ordering::Equal));
+    for (i, v) in validators.iter_mut().enumerate() { v.rank = i + 1; }
+    Json(validators)
+}
+
 // ── libp2p relay behaviour ────────────────────────────────────────────────────
 
 #[derive(NetworkBehaviour)]
@@ -984,22 +1302,28 @@ async fn main() {
         .credentials(creds)
         .build();
 
+    let poc_loaded = load_poc_events();
     let state = AppState {
-        chain:   Arc::new(RwLock::new(load_chain())),
-        peers:   Arc::new(RwLock::new(load_peers())),
-        inbox:   Arc::new(RwLock::new(HashMap::new())),
-        users:   Arc::new(RwLock::new(load_users())),
-        pending: Arc::new(RwLock::new(Vec::new())),
-        mailer:  Arc::new(mailer),
-        config:  Arc::new(cfg),
+        chain:      Arc::new(RwLock::new(load_chain())),
+        peers:      Arc::new(RwLock::new(load_peers())),
+        inbox:      Arc::new(RwLock::new(HashMap::new())),
+        users:      Arc::new(RwLock::new(load_users())),
+        pending:    Arc::new(RwLock::new(Vec::new())),
+        poc_events: Arc::new(RwLock::new(poc_loaded)),
+        mailer:     Arc::new(mailer),
+        config:     Arc::new(cfg),
     };
     {
-        let c = state.chain.read().unwrap();
-        let p = state.peers.read().unwrap();
-        let u = state.users.read().unwrap();
+        let c   = state.chain.read().unwrap();
+        let p   = state.peers.read().unwrap();
+        let u   = state.users.read().unwrap();
+        let poc = state.poc_events.read().unwrap();
         println!("[chain] Loaded {} blocks, {} txs from {}", c.blocks.len(), c.transactions.len(), CHAIN_PATH);
         println!("[peers] Loaded {} known peers from {}", p.len(), PEERS_PATH);
         println!("[users] Loaded {} registered users", u.len());
+        println!("[poc]   Loaded {} coverage events ({} unique validators)",
+            poc.len(),
+            poc.iter().map(|e| e.address.as_str()).collect::<std::collections::HashSet<_>>().len());
     }
 
     let http_addr   = format!("0.0.0.0:{}", http_port);
@@ -1027,6 +1351,10 @@ async fn main() {
             .route("/tx/confirm/:token",    get(get_confirm_tx))
             .route("/tx/cancel/:token",     get(get_cancel_tx))
             .route("/tx/status/:token",     get(get_tx_status))
+            // ── PoC / DRS ──
+            .route("/poc/event",            post(post_poc_event))
+            .route("/poc/score/:address",   get(get_poc_score))
+            .route("/poc/validators",       get(get_poc_validators))
             .with_state(state_clone)
             .layer(
                 CorsLayer::new()

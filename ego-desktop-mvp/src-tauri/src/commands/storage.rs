@@ -141,16 +141,17 @@ pub async fn store_file(
         ).to_hex()
     );
     chain.transactions.push(LedgerTx {
-        hash:         cost_hash,
-        from:         ledger.address.clone(),
-        to:           "egot1storage0000000000000000000000000000000000".into(),
-        amount:       cost_uegoc,
-        memo:         Some(format!("Storage: {file_name}")),
-        timestamp:    now,
-        signature:    "storage".into(),
-        status:       "Confirmed".into(),
-        block_height: None,
-        nonce:        0,
+        hash:               cost_hash,
+        from:               ledger.address.clone(),
+        to:                 "egot1storage0000000000000000000000000000000000".into(),
+        amount:             cost_uegoc,
+        memo:               Some(format!("Storage: {file_name}")),
+        timestamp:          now,
+        signature:          "storage".into(),
+        status:             "Confirmed".into(),
+        block_height:       None,
+        nonce:              0,
+        public_key_ed25519: String::new(),
     });
     save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save chain: {e}")))?;
 

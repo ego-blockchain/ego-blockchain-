@@ -25,6 +25,15 @@ interface StorageMetrics {
   space_used_bytes: number;
 }
 
+interface PocScoreResult {
+  drs_score:      number;
+  events_24h:     number;
+  total_events:   number;
+  last_event:     number | null;
+  is_validator:   boolean;
+  validator_rank: number | null;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function fmtEgoc(uegoc: number, decimals = 4) {
@@ -47,20 +56,57 @@ function fmtDuration(secs: number): string {
 const EarningsPage: React.FC = () => {
   const navigate = useNavigate();
 
-  const [earnings, setEarnings]         = useState<EarningsData | null>(null);
-  const [storageMeta, setStorageMeta]   = useState<StorageMetrics | null>(null);
+  const [earnings, setEarnings]           = useState<EarningsData | null>(null);
+  const [storageMeta, setStorageMeta]     = useState<StorageMetrics | null>(null);
+  const [pocScore, setPocScore]           = useState<PocScoreResult | null>(null);
+  const [lastPocMsg, setLastPocMsg]       = useState<string>('');
   // Live session-earnings counter (in uEGOC, fractional)
   const [sessionEarned, setSessionEarned] = useState(0);
   // Seconds the node has been running this session
-  const [uptime, setUptime]             = useState(0);
-  const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [uptime, setUptime]               = useState(0);
+  const tickRef    = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pocTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     loadAll();
+    loadPocScore();
     // Refresh from backend every 30 s (also credits elapsed earnings)
     const refresh = setInterval(loadAll, 30_000);
-    return () => clearInterval(refresh);
+    // Refresh DRS score every 5 minutes
+    const scoreRefresh = setInterval(loadPocScore, 5 * 60_000);
+    return () => { clearInterval(refresh); clearInterval(scoreRefresh); };
   }, []);
+
+  // PoC beacon: fire once on mount, then every 10 minutes while coverage is online
+  useEffect(() => {
+    if (!earnings?.coverage_online) return;
+    submitPocBeacon(); // fire immediately on first online detection
+    if (pocTimerRef.current) clearInterval(pocTimerRef.current);
+    pocTimerRef.current = setInterval(submitPocBeacon, 10 * 60_000);
+    return () => { if (pocTimerRef.current) clearInterval(pocTimerRef.current); };
+  }, [earnings?.coverage_online]);
+
+  async function submitPocBeacon() {
+    try {
+      const result = await invoke<{ success: boolean; message: string; reward_uegoc: number }>(
+        'submit_poc_event',
+        { quality: 'Good', peers: 3, h3Cell: null }
+      );
+      if (result.success) {
+        setLastPocMsg(`+${(result.reward_uegoc / 1_000_000).toFixed(6)} EGOC PoC reward`);
+        loadPocScore(); // refresh DRS after new event
+      }
+    } catch {
+      // relay unreachable — silent fail (still earns locally)
+    }
+  }
+
+  async function loadPocScore() {
+    try {
+      const score = await invoke<PocScoreResult>('get_poc_score');
+      setPocScore(score);
+    } catch { /* ignore */ }
+  }
 
   async function loadAll() {
     try {
@@ -271,13 +317,27 @@ const EarningsPage: React.FC = () => {
                 )}
               </div>
               <div className="flex justify-between items-center">
-                <span className="text-gray-400">DRS multiplier</span>
-                <span className="text-green-400 font-semibold">{earnings?.drs_multiplier.toFixed(2)}×</span>
+                <span className="text-gray-400">DRS score (relay)</span>
+                {pocScore ? (
+                  <span className={`font-semibold ${pocScore.drs_score > 0 ? 'text-green-400' : 'text-gray-500'}`}>
+                    {pocScore.drs_score.toFixed(2)}
+                    {pocScore.validator_rank && (
+                      <span className="ml-1.5 text-xs text-blue-400">#{pocScore.validator_rank}</span>
+                    )}
+                  </span>
+                ) : <span className="text-gray-500 text-xs">loading…</span>}
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-gray-400">PoC events (24h)</span>
+                <span className="text-gray-300">{pocScore?.events_24h ?? '—'}</span>
               </div>
               <div className="flex justify-between items-center">
                 <span className="text-gray-400">Session uptime</span>
                 <span className="font-mono text-gray-300">{fmtDuration(uptime)}</span>
               </div>
+              {lastPocMsg && (
+                <div className="text-xs text-green-400 animate-pulse">{lastPocMsg}</div>
+              )}
             </div>
           </div>
 

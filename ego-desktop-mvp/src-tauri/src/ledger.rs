@@ -354,7 +354,23 @@ pub fn save_poc_events(events: &[PocEvent]) -> Result<(), String> {
     fs::write(poc_events_path(), data).map_err(|e| e.to_string())
 }
 
-// ── Canonical tx signing ──────────────────────────────────────────────────────
+// ── Canonical signing helpers ─────────────────────────────────────────────────
+
+/// Canonical bytes to sign for a PoC coverage event (must match relay exactly).
+pub fn poc_signing_bytes(address: &str, quality: &str, peers: u32, h3_cell: &str, timestamp: i64) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"ego/poc/v1:");
+    v.extend_from_slice(address.as_bytes());
+    v.extend_from_slice(b":");
+    v.extend_from_slice(quality.as_bytes());
+    v.extend_from_slice(b":");
+    v.extend_from_slice(&peers.to_le_bytes());
+    v.extend_from_slice(b":");
+    v.extend_from_slice(h3_cell.as_bytes());
+    v.extend_from_slice(b":");
+    v.extend_from_slice(&timestamp.to_le_bytes());
+    v
+}
 
 /// Canonical bytes to sign for a transaction.
 pub fn tx_signing_bytes(from: &str, to: &str, amount: u64, nonce: u64, timestamp: i64) -> Vec<u8> {
