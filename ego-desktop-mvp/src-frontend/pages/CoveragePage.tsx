@@ -247,7 +247,7 @@ const CoveragePage: React.FC = () => {
       {/* DRS Breakdown */}
       <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
         <div className="flex items-center justify-between mb-4">
-          <h3 className="font-semibold">Dynamic Reputation Score</h3>
+          <h3 className="font-semibold">Deterministic Reward Scoring</h3>
           <div className="flex items-center gap-2">
             {drs?.validator_rank != null && (
               <span className="text-xs bg-purple-500/20 text-purple-400 px-2.5 py-0.5 rounded-full font-medium">

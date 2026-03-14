@@ -1573,7 +1573,7 @@ async fn handle_interactive_command(
             println!("    Reputation score: {}", reputation.reputation_score);
         }
         "drs" => {
-            println!("📊 Dynamic Reputation System");
+            println!("📊 Deterministic Reward Scoring");
             use ego_core::drs::{DRSConfig, DRSManager, EvidenceBundle, PoCEventData};
 
             let config = DRSConfig::default();
