@@ -72,6 +72,14 @@ pub struct P2pStatus {
     pub upnp_error: Option<String>,
     pub public_endpoint: String,
     pub p2p_port: u16,
+    /// True when this node is acting as a relay server for NAT peers.
+    pub relay_server_active: bool,
+    /// Community relay nodes discovered via DataManifest.
+    pub community_relays: Vec<String>,
+    /// Storage quota this node offers to the network (bytes).
+    pub storage_quota_bytes: u64,
+    /// Storage currently used (bytes).
+    pub storage_used_bytes: u64,
 }
 
 #[tauri::command]
@@ -81,11 +89,17 @@ pub async fn get_p2p_status(state: tauri::State<'_, crate::app::AppState>) -> Re
         Some(Ok(())) => ("ok".into(), None),
         Some(Err(e)) => ("failed".into(), Some(e)),
     };
+    let ledger = crate::ledger::Ledger::load();
+    let used: u64 = ledger.stored_files.iter().map(|f| f.encrypted_size).sum();
     Ok(P2pStatus {
         upnp,
         upnp_error,
-        public_endpoint: state.get_public_endpoint(),
-        p2p_port: crate::p2p::P2P_PORT,
+        public_endpoint:      state.get_public_endpoint(),
+        p2p_port:             crate::p2p::P2P_PORT,
+        relay_server_active:  crate::p2p::relay_mode_active(),
+        community_relays:     crate::p2p::get_discovered_relay_nodes(),
+        storage_quota_bytes:  ledger.storage_allocated_bytes,
+        storage_used_bytes:   used,
     })
 }
 

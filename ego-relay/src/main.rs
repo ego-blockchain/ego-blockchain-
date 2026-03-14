@@ -260,6 +260,10 @@ struct PeerEntry {
     city:    Option<String>,
     #[serde(default)]
     country: Option<String>,
+    /// True when this desktop peer is also running as a relay server.
+    /// Returned in GET /peers so other nodes can use it as a hop.
+    #[serde(default)]
+    is_relay: bool,
 }
 
 fn load_peers() -> Vec<PeerEntry> {
@@ -443,11 +447,14 @@ async fn post_peer(
         existing.endpoint  = entry.endpoint.clone();
         existing.name      = entry.name.clone();
         existing.last_seen = now;
+        existing.is_relay  = entry.is_relay;
         if entry.city.is_some()    { existing.city    = entry.city.clone(); }
         if entry.country.is_some() { existing.country = entry.country.clone(); }
-        println!("[peers] Updated endpoint for {} → {}", entry.address, entry.endpoint);
+        if entry.is_relay { println!("[peers] Updated endpoint for {} → {} [RELAY]", entry.address, entry.endpoint); }
+        else              { println!("[peers] Updated endpoint for {} → {}", entry.address, entry.endpoint); }
     } else {
-        println!("[peers] New peer {} → {}", entry.address, entry.endpoint);
+        if entry.is_relay { println!("[peers] New relay node {} → {}", entry.address, entry.endpoint); }
+        else              { println!("[peers] New peer {} → {}", entry.address, entry.endpoint); }
         list.push(PeerEntry { last_seen: now, ..entry });
     }
     let cutoff = now - 600;

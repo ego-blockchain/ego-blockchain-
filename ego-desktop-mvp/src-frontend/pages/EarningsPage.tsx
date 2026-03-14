@@ -34,6 +34,13 @@ interface PocScoreResult {
   validator_rank: number | null;
 }
 
+interface P2pStatus {
+  relay_server_active:  boolean;
+  community_relays:     string[];
+  storage_quota_bytes:  number;
+  storage_used_bytes:   number;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function fmtEgoc(uegoc: number, decimals = 4) {
@@ -59,6 +66,7 @@ const EarningsPage: React.FC = () => {
   const [earnings, setEarnings]           = useState<EarningsData | null>(null);
   const [storageMeta, setStorageMeta]     = useState<StorageMetrics | null>(null);
   const [pocScore, setPocScore]           = useState<PocScoreResult | null>(null);
+  const [p2pStatus, setP2pStatus]         = useState<P2pStatus | null>(null);
   const [lastPocMsg, setLastPocMsg]       = useState<string>('');
   // Live session-earnings counter (in uEGOC, fractional)
   const [sessionEarned, setSessionEarned] = useState(0);
@@ -70,11 +78,14 @@ const EarningsPage: React.FC = () => {
   useEffect(() => {
     loadAll();
     loadPocScore();
+    loadP2pStatus();
     // Refresh from backend every 30 s (also credits elapsed earnings)
     const refresh = setInterval(loadAll, 30_000);
     // Refresh DRS score every 5 minutes
     const scoreRefresh = setInterval(loadPocScore, 5 * 60_000);
-    return () => { clearInterval(refresh); clearInterval(scoreRefresh); };
+    // Refresh P2P status every 60 s
+    const p2pRefresh = setInterval(loadP2pStatus, 60_000);
+    return () => { clearInterval(refresh); clearInterval(scoreRefresh); clearInterval(p2pRefresh); };
   }, []);
 
   // PoC beacon: fire once on mount, then every 10 minutes while coverage is online
@@ -105,6 +116,13 @@ const EarningsPage: React.FC = () => {
     try {
       const score = await invoke<PocScoreResult>('get_poc_score');
       setPocScore(score);
+    } catch { /* ignore */ }
+  }
+
+  async function loadP2pStatus() {
+    try {
+      const s = await invoke<P2pStatus>('get_p2p_status');
+      setP2pStatus(s);
     } catch { /* ignore */ }
   }
 
@@ -314,6 +332,16 @@ const EarningsPage: React.FC = () => {
                   <span className="text-green-400 font-medium">{allocatedGb.toFixed(1)} GB active</span>
                 ) : (
                   <span className="text-yellow-400 font-medium">Not configured</span>
+                )}
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-gray-400">Relay server</span>
+                {p2pStatus?.relay_server_active ? (
+                  <span className="flex items-center gap-1.5 text-purple-400 font-medium">
+                    <span className="w-2 h-2 rounded-full bg-purple-400 animate-pulse"></span> Active
+                  </span>
+                ) : (
+                  <span className="text-gray-500 text-xs">NAT (client only)</span>
                 )}
               </div>
               <div className="flex justify-between items-center">
