@@ -82,7 +82,10 @@ const MessengerPage: React.FC = () => {
   const [actionDone, setActionDone] = useState(false);
 
   const msgEndRef = useRef<HTMLDivElement>(null);
-  const [importedIds, setImportedIds] = useState<Set<string>>(new Set());
+
+  type FileImportStatus = 'idle' | 'importing' | 'done' | 'error';
+  const [fileImportStates, setFileImportStates] = useState<Record<string, { status: FileImportStatus; error?: string }>>({});
+  const importTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
   // Inline rename state
   const [editingName, setEditingName] = useState(false);
@@ -180,7 +183,11 @@ const MessengerPage: React.FC = () => {
       }),
     ];
 
-    return () => { unlisteners.forEach(p => p.then(fn => fn())); };
+    return () => {
+      unlisteners.forEach(p => p.then(fn => fn()));
+      // Clear all pending import timers
+      Object.values(importTimers.current).forEach(clearTimeout);
+    };
   }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
 useEffect(() => {
@@ -320,6 +327,50 @@ useEffect(() => {
       await invoke('delete_message', { messageId: msgId });
       if (selected) await loadMessages(selected.address);
     } catch (e) { console.error(e); }
+  }
+
+  // ── File import with 1-minute timeout ────────────────────────────────────
+
+  async function handleImportFile(
+    msgId: string,
+    cid: string,
+    key_nonce_hex: string,
+    display_name: string,
+    from_address: string,
+    content: string,
+  ) {
+    setFileImportStates(s => ({ ...s, [msgId]: { status: 'importing' } }));
+    // Clear any existing timer for this message
+    if (importTimers.current[msgId]) clearTimeout(importTimers.current[msgId]);
+    // Start 60-second timeout
+    importTimers.current[msgId] = setTimeout(() => {
+      setFileImportStates(s => {
+        if (s[msgId]?.status === 'importing') {
+          return { ...s, [msgId]: { status: 'error', error: 'Download timed out. Tap Retry.' } };
+        }
+        return s;
+      });
+    }, 60_000);
+
+    try {
+      await invoke('import_shared_file', {
+        bundle: { cid, key_nonce_hex, display_name, from_address },
+      });
+      await invoke('request_file_from_contact', {
+        cid,
+        fromAddr: from_address,
+        content,
+      });
+      clearTimeout(importTimers.current[msgId]);
+      setFileImportStates(s => ({ ...s, [msgId]: { status: 'done' } }));
+      await loadKnownCids();
+    } catch (e: any) {
+      clearTimeout(importTimers.current[msgId]);
+      setFileImportStates(s => ({
+        ...s,
+        [msgId]: { status: 'error', error: 'Import failed. Tap Retry.' },
+      }));
+    }
   }
 
   function closePendingAction() {
@@ -601,7 +652,11 @@ useEffect(() => {
                         let display_name    = cid.slice(0, 12);
                         try { display_name = decodeURIComponent(escape(atob(name64))); } catch {}
 
-                        const imported = importedIds.has(m.id) || knownCids.has(cid);
+                        const alreadyKnown = knownCids.has(cid);
+                        const importState = fileImportStates[m.id];
+                        const isDone = alreadyKnown || importState?.status === 'done';
+                        const isImporting = !isDone && importState?.status === 'importing';
+                        const isError = !isDone && importState?.status === 'error';
                         return (
                           <div className="space-y-2 min-w-[200px]">
                             <div className="flex items-center gap-2 bg-black/20 rounded-xl px-3 py-2">
@@ -612,31 +667,36 @@ useEffect(() => {
                               </div>
                             </div>
                             {!m.outgoing && (
-                              <button
-                                onClick={async () => {
-                                  if (imported) return;
-                                  try {
-                                    await invoke('import_shared_file', {
-                                      bundle: { cid, key_nonce_hex, display_name, from_address },
-                                    });
-                                    await invoke('request_file_from_contact', {
-                                      cid,
-                                      fromAddr: from_address,
-                                      content: m.content,
-                                    });
-                                    setImportedIds(s => new Set([...s, m.id]));
-                                    await loadKnownCids();
-                                  } catch (e) { console.error(e); }
-                                }}
-                                disabled={imported}
-                                className={`w-full text-xs py-1.5 rounded-lg font-medium transition ${
-                                  imported
-                                    ? 'bg-green-700/50 text-green-300 cursor-default'
-                                    : 'bg-purple-600 hover:bg-purple-500 text-white'
-                                }`}
-                              >
-                                {imported ? '✓ Importing… check EgoSafe' : '📥 Import File'}
-                              </button>
+                              <>
+                                {isDone ? (
+                                  <div className="w-full text-xs py-1.5 rounded-lg font-medium text-center bg-green-700/50 text-green-300">
+                                    ✓ Importing… check EgoSafe
+                                  </div>
+                                ) : isImporting ? (
+                                  <div className="w-full text-xs py-1.5 rounded-lg font-medium text-center bg-gray-600/60 text-gray-300 cursor-default">
+                                    <span className="animate-pulse">Importing…</span>
+                                  </div>
+                                ) : isError ? (
+                                  <div className="space-y-1">
+                                    <div className="text-xs text-red-400 text-center">
+                                      ✕ {importState?.error}
+                                    </div>
+                                    <button
+                                      onClick={() => handleImportFile(m.id, cid, key_nonce_hex, display_name, from_address, m.content)}
+                                      className="w-full text-xs py-1.5 rounded-lg font-medium bg-yellow-600 hover:bg-yellow-500 text-white transition"
+                                    >
+                                      ↺ Retry
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <button
+                                    onClick={() => handleImportFile(m.id, cid, key_nonce_hex, display_name, from_address, m.content)}
+                                    className="w-full text-xs py-1.5 rounded-lg font-medium bg-purple-600 hover:bg-purple-500 text-white transition"
+                                  >
+                                    📥 Import File
+                                  </button>
+                                )}
+                              </>
                             )}
                             {m.outgoing && (
                               <div className="text-xs text-center text-gray-400 py-0.5">
