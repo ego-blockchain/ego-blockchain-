@@ -259,13 +259,6 @@ pub async fn sync_chain(state: State<'_, AppState>) -> Result<String, EgoDesktop
     Ok(format!("Sync requested from {}/{} peers. Chain will update shortly.", reached, total))
 }
 
-// ── reset_chain ───────────────────────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn reset_chain() -> Result<(), EgoDesktopError> {
-    let empty = crate::ledger::SharedChain::default();
-    save_chain(&empty).map_err(EgoDesktopError::FileSystemError)
-}
 
 // ── get_transaction_history ───────────────────────────────────────────────────
 

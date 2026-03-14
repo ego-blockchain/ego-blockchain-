@@ -280,16 +280,6 @@ pub async fn commit_transaction(
     })
 }
 
-// ── reset_chain ──────────────────────────────────────────────────────────────
-
-/// Wipe all blocks and transactions from chain.json (keeps wallets and keys).
-/// Useful for testing — all balances will reset to zero.
-#[tauri::command]
-pub async fn reset_chain() -> Result<(), EgoDesktopError> {
-    let empty = crate::ledger::SharedChain::default();
-    save_chain(&empty).map_err(|e| EgoDesktopError::FileSystemError(e))
-}
-
 // ── get_transaction_history ───────────────────────────────────────────────────
 //
 // Returns all chain txs that involve this wallet address (sent or received).

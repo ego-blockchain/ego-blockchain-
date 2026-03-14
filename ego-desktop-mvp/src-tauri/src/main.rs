@@ -136,7 +136,6 @@ fn main() {
             commands::wallet::prepare_transaction,
             commands::wallet::commit_transaction,
             commands::wallet::get_transaction_history,
-            commands::wallet::reset_chain,
             commands::storage::store_file,
             commands::storage::get_file_metadata,
             commands::storage::get_stored_files,
