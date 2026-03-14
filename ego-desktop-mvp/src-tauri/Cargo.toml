@@ -40,6 +40,7 @@ aes-gcm = "0.10"
 rand = "0.8"
 zeroize = { version = "1.6", features = ["derive"] }
 hex = "0.4"
+blake3 = "1"
 dirs = "5.0"
 opener = "0.6"
 local-ip-address = "0.6"

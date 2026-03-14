@@ -10,6 +10,7 @@ mod error;
 mod ledger;
 mod models;
 mod p2p;
+mod proof;
 mod services;
 mod utils;
 
@@ -179,7 +180,10 @@ fn main() {
             commands::messenger::rename_contact,
             commands::messenger::clear_messages,
             commands::messenger::delete_message,
-            commands::storage::open_file
+            commands::storage::open_file,
+            commands::consensus::get_porep_status,
+            commands::consensus::respond_to_challenges,
+            commands::consensus::get_post_score
         ])
         .setup(|app| {
             // Show the window only after the frontend signals it's ready,
@@ -275,7 +279,14 @@ fn main() {
                 }
             });
 
-            // ── Task 3: background coverage loop ──────────────────────────
+            // ── Task 3: PoST proof loop ────────────────────────────────────
+            // Polls the relay for pending PoST challenges every 30 minutes and
+            // automatically responds with Merkle proofs over stored files.
+            tauri::async_runtime::spawn(async move {
+                crate::commands::consensus::run_post_loop().await;
+            });
+
+            // ── Task 4: background coverage loop ──────────────────────────
             // Runs every 60 s regardless of window visibility.
             // Handles: peer probing, PoC event recording, coverage status.
             // Keeps working when app is minimized or in system tray.

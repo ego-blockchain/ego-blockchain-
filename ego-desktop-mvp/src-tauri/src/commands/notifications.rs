@@ -36,7 +36,8 @@ pub async fn import_shared_file(
         status:          "Received".into(),
         key_nonce_hex:   bundle.key_nonce_hex.clone(),
         local_path:      String::new(), // no local .enc yet
-        owner:           ledger.address.clone(), // belongs to this wallet
+        owner:           ledger.address.clone(),
+        ..Default::default()
     };
     // Avoid duplicates
     if !ledger.stored_files.iter().any(|f| f.cid == bundle.cid) {
@@ -98,6 +99,7 @@ pub async fn try_auto_import(app: &AppHandle, content: &str, from_addr: &str) {
         key_nonce_hex:   key_nonce_hex.to_string(),
         local_path:      format!("sender:{}", from_addr),
         owner:           ledger.address.clone(),
+        ..Default::default()
     };
     ledger.stored_files.insert(0, stored);
     if let Ok(()) = ledger.save() {
