@@ -353,18 +353,35 @@ type ChainState   = Arc<RwLock<SharedChain>>;
 type PeersState   = Arc<RwLock<Vec<PeerEntry>>>;
 type InboxState   = Arc<RwLock<HashMap<String, Vec<InboxMessage>>>>;
 type UsersState   = Arc<RwLock<Vec<UserRecord>>>;
-type PendingState = Arc<RwLock<Vec<PendingTx>>>;
+type PendingState     = Arc<RwLock<Vec<PendingTx>>>;
+type KeyRegistryState = Arc<RwLock<HashMap<String, String>>>;
+
+const KEY_REGISTRY_PATH: &str = "key_registry.json";
+
+fn load_key_registry() -> HashMap<String, String> {
+    std::fs::read_to_string(KEY_REGISTRY_PATH)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_key_registry(reg: &HashMap<String, String>) {
+    if let Ok(data) = serde_json::to_string_pretty(reg) {
+        let _ = std::fs::write(KEY_REGISTRY_PATH, data);
+    }
+}
 
 #[derive(Clone)]
 struct AppState {
-    chain:      ChainState,
-    peers:      PeersState,
-    inbox:      InboxState,
-    users:      UsersState,
-    pending:    PendingState,
-    poc_events: PocState,
-    mailer:     Arc<AsyncSmtpTransport<Tokio1Executor>>,
-    config:     Arc<Config>,
+    chain:        ChainState,
+    peers:        PeersState,
+    inbox:        InboxState,
+    users:        UsersState,
+    pending:      PendingState,
+    poc_events:   PocState,
+    key_registry: KeyRegistryState,
+    mailer:       Arc<AsyncSmtpTransport<Tokio1Executor>>,
+    config:       Arc<Config>,
 }
 
 // ── Email helpers ─────────────────────────────────────────────────────────────
@@ -515,7 +532,27 @@ async fn post_tx(
         return StatusCode::UNAUTHORIZED;
     }
 
-    // ── 3. Timestamp freshness (reject if older than 10 minutes) ─────────
+    // ── 3. Address → key binding (prevents spoofing from address) ────────
+    // First tx from an address permanently binds it to that ed25519 key.
+    // Any future tx from the same address with a different key is rejected.
+    {
+        let mut registry = s.key_registry.write().unwrap();
+        match registry.get(&tx.from) {
+            Some(bound_key) if bound_key != &tx.public_key_ed25519 => {
+                println!("[chain] Rejected tx {}: key mismatch for address {}", tx.hash, tx.from);
+                return StatusCode::UNAUTHORIZED;
+            }
+            None => {
+                // First time we see this address — bind it permanently.
+                registry.insert(tx.from.clone(), tx.public_key_ed25519.clone());
+                save_key_registry(&registry);
+                println!("[chain] Bound address {} → key {}", tx.from, &tx.public_key_ed25519[..8]);
+            }
+            Some(_) => {} // already bound, key matches — continue
+        }
+    }
+
+    // ── 4. Timestamp freshness (reject if older than 10 minutes) ─────────
     let now = chrono::Utc::now().timestamp();
     if (now - tx.timestamp).abs() > 600 {
         println!("[chain] Rejected tx {}: timestamp too old/future", tx.hash);
@@ -1343,14 +1380,15 @@ async fn main() {
 
     let poc_loaded = load_poc_events();
     let state = AppState {
-        chain:      Arc::new(RwLock::new(load_chain())),
-        peers:      Arc::new(RwLock::new(load_peers())),
-        inbox:      Arc::new(RwLock::new(HashMap::new())),
-        users:      Arc::new(RwLock::new(load_users())),
-        pending:    Arc::new(RwLock::new(Vec::new())),
-        poc_events: Arc::new(RwLock::new(poc_loaded)),
-        mailer:     Arc::new(mailer),
-        config:     Arc::new(cfg),
+        chain:        Arc::new(RwLock::new(load_chain())),
+        peers:        Arc::new(RwLock::new(load_peers())),
+        inbox:        Arc::new(RwLock::new(HashMap::new())),
+        users:        Arc::new(RwLock::new(load_users())),
+        pending:      Arc::new(RwLock::new(Vec::new())),
+        poc_events:   Arc::new(RwLock::new(poc_loaded)),
+        key_registry: Arc::new(RwLock::new(load_key_registry())),
+        mailer:       Arc::new(mailer),
+        config:       Arc::new(cfg),
     };
     {
         let c   = state.chain.read().unwrap();
