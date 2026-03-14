@@ -22,11 +22,12 @@
 //!   GET  /poc/validators          — ranked list of active PoC validators
 
 use axum::{
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{HeaderValue, Method, StatusCode},
     routing::{get, post},
     Json, Router,
 };
+use std::net::SocketAddr;
 use ed25519_dalek::{Verifier, VerifyingKey};
 use pqcrypto_dilithium::dilithium2;
 use pqcrypto_traits::sign::{DetachedSignature, PublicKey as PqPublicKey};
@@ -384,6 +385,56 @@ type ShardPoolState    = Arc<RwLock<HashMap<u32, Vec<LedgerTx>>>>;
 /// cid → vec of holders (multiple nodes can hold the same CID).
 type CidRegistryState  = Arc<RwLock<HashMap<String, Vec<CidHolder>>>>;
 
+// ── Rate limiter ──────────────────────────────────────────────────────────────
+//
+// Fixed-window per-IP counter. No extra crates needed.
+// Each protected endpoint gets its own limiter with independent limits.
+
+struct RateLimiter {
+    /// ip_string → (hit_count, window_start_unix_secs)
+    windows: std::sync::RwLock<HashMap<String, (u32, i64)>>,
+    /// Max hits allowed per window.
+    limit: u32,
+    /// Window size in seconds.
+    window_secs: i64,
+}
+
+impl RateLimiter {
+    fn new(limit: u32, window_secs: i64) -> Arc<Self> {
+        Arc::new(Self {
+            windows: std::sync::RwLock::new(HashMap::new()),
+            limit,
+            window_secs,
+        })
+    }
+
+    /// Returns true if the request is allowed, false if rate-limited.
+    fn check(&self, ip: &str) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        let mut map = self.windows.write().unwrap();
+        let entry = map.entry(ip.to_string()).or_insert((0, now));
+        if now - entry.1 >= self.window_secs {
+            // New window — reset counter.
+            *entry = (1, now);
+            true
+        } else if entry.0 < self.limit {
+            entry.0 += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Periodically call this to evict stale windows and prevent unbounded growth.
+    fn evict_stale(&self) {
+        let now = chrono::Utc::now().timestamp();
+        let mut map = self.windows.write().unwrap();
+        map.retain(|_, (_, start)| now - *start < self.window_secs * 10);
+    }
+}
+
+type RateLimiterState = Arc<RateLimiter>;
+
 const CID_REGISTRY_PATH: &str = "cid_registry.json";
 
 fn load_cid_registry() -> HashMap<String, Vec<CidHolder>> {
@@ -440,8 +491,12 @@ struct AppState {
     key_registry: KeyRegistryState,
     shard_pools:   ShardPoolState,
     cid_registry:  CidRegistryState,
+    rl_inbox:      RateLimiterState, // 20 req/min — POST /inbox
+    rl_cid:        RateLimiterState, // 60 req/min — POST /shard/:id/cid
+    rl_register:   RateLimiterState, // 5  req/min — POST /users/register
+    rl_tx_pending: RateLimiterState, // 10 req/min — POST /tx/pending
     mailer:        Arc<AsyncSmtpTransport<Tokio1Executor>>,
-    config:       Arc<Config>,
+    config:        Arc<Config>,
 }
 
 // ── Email helpers ─────────────────────────────────────────────────────────────
@@ -806,10 +861,14 @@ const INBOX_DIR: &str = "inbox_files";
 const INBOX_FILE_SIZE_LIMIT: usize = 512 * 1024; // 512 KB
 
 async fn post_inbox(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(address): Path<String>,
     State(s): State<AppState>,
     Json(msg): Json<InboxMessage>,
 ) -> StatusCode {
+    if !s.rl_inbox.check(&addr.ip().to_string()) {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
     if address.is_empty() || (msg.payload.is_empty() && msg.disk_path.is_none()) {
         return StatusCode::BAD_REQUEST;
     }
@@ -905,9 +964,15 @@ struct ApiResponse {
 }
 
 async fn post_register(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(s): State<AppState>,
     Json(req): Json<RegisterRequest>,
 ) -> (StatusCode, Json<ApiResponse>) {
+    if !s.rl_register.check(&addr.ip().to_string()) {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(ApiResponse {
+            success: false, message: "Too many registration attempts".into(),
+        }));
+    }
     if req.address.is_empty() || req.name.is_empty() || req.email.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(ApiResponse {
             success: false, message: "address, name and email required".into(),
@@ -1138,9 +1203,15 @@ struct PendingTxRequest {
 }
 
 async fn post_pending_tx(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(s): State<AppState>,
     Json(req): Json<PendingTxRequest>,
 ) -> (StatusCode, Json<ApiResponse>) {
+    if !s.rl_tx_pending.check(&addr.ip().to_string()) {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(ApiResponse {
+            success: false, message: "Too many requests".into(),
+        }));
+    }
     let (email, name) = {
         let users = s.users.read().unwrap();
         match users.iter().find(|u| u.address == req.address && u.email_verified) {
@@ -1492,31 +1563,74 @@ async fn get_shard_stats(
     })))
 }
 
+/// Signed CID registration request — prevents strangers from poisoning the registry.
+/// The Ed25519 signature proves the submitter controls the holder_addr key.
+#[derive(Debug, Deserialize)]
+struct RegisterCidRequest {
+    cid:         String,
+    holder_addr: String,
+    endpoint:    String,
+    timestamp:   i64,
+    /// Ed25519 hex signature over "cid:holder_addr:timestamp"
+    signature:   String,
+    /// Hex-encoded Ed25519 public key (32 bytes = 64 hex chars)
+    public_key:  String,
+}
+
 /// POST /shard/:id/cid — register that this node holds a specific CID.
-/// Desktop calls this after storing a file so other nodes can find it.
+/// Requires a valid Ed25519 signature to prevent registry poisoning.
 async fn post_shard_cid(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(id): Path<u32>,
     State(s): State<AppState>,
-    Json(holder): Json<CidHolder>,
+    Json(req): Json<RegisterCidRequest>,
 ) -> StatusCode {
-    if id >= SHARD_COUNT || holder.cid.is_empty() || holder.holder_addr.is_empty() {
+    if !s.rl_cid.check(&addr.ip().to_string()) {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    if id >= SHARD_COUNT || req.cid.is_empty() || req.holder_addr.is_empty() {
         return StatusCode::BAD_REQUEST;
     }
+    // Verify timestamp freshness (±5 minutes)
+    let now = chrono::Utc::now().timestamp();
+    if (now - req.timestamp).abs() > 300 {
+        return StatusCode::BAD_REQUEST;
+    }
+    // Verify Ed25519 signature over "cid:holder_addr:timestamp"
+    let sign_bytes = format!("{}:{}:{}", req.cid, req.holder_addr, req.timestamp).into_bytes();
+    let pk_bytes = match hex::decode(&req.public_key) {
+        Ok(b) if b.len() == 32 => b,
+        _ => return StatusCode::BAD_REQUEST,
+    };
+    let pk_arr: [u8; 32] = pk_bytes.try_into().unwrap();
+    let verifying_key = match VerifyingKey::from_bytes(&pk_arr) {
+        Ok(k) => k,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+    let sig_bytes = match hex::decode(&req.signature) {
+        Ok(b) if b.len() == 64 => b,
+        _ => return StatusCode::BAD_REQUEST,
+    };
+    let sig_arr: [u8; 64] = sig_bytes.try_into().unwrap();
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+    if verifying_key.verify(&sign_bytes, &sig).is_err() {
+        println!("[shard-{id}] Rejected CID registration from {}: bad signature", addr.ip());
+        return StatusCode::UNAUTHORIZED;
+    }
     let mut reg = s.cid_registry.write().unwrap();
-    let holders = reg.entry(holder.cid.clone()).or_default();
-    // Upsert: replace existing entry for this holder_addr, or push new
-    if let Some(existing) = holders.iter_mut().find(|h| h.holder_addr == holder.holder_addr) {
-        existing.endpoint      = holder.endpoint.clone();
-        existing.registered_at = chrono::Utc::now().timestamp();
+    let holders = reg.entry(req.cid.clone()).or_default();
+    if let Some(existing) = holders.iter_mut().find(|h| h.holder_addr == req.holder_addr) {
+        existing.endpoint      = req.endpoint.clone();
+        existing.registered_at = now;
     } else {
         holders.push(CidHolder {
-            cid:           holder.cid.clone(),
-            holder_addr:   holder.holder_addr.clone(),
-            endpoint:      holder.endpoint.clone(),
+            cid:           req.cid.clone(),
+            holder_addr:   req.holder_addr.clone(),
+            endpoint:      req.endpoint.clone(),
             shard_id:      id,
-            registered_at: chrono::Utc::now().timestamp(),
+            registered_at: now,
         });
-        println!("[shard-{id}] CID registered: {} by {}", &holder.cid[..16.min(holder.cid.len())], holder.holder_addr);
+        println!("[shard-{id}] CID registered: {} by {}", &req.cid[..16.min(req.cid.len())], req.holder_addr);
     }
     save_cid_registry(&reg);
     StatusCode::OK
@@ -1819,6 +1933,10 @@ async fn main() {
         key_registry: Arc::new(RwLock::new(load_key_registry())),
         shard_pools:   Arc::new(RwLock::new(initial_shard_pools)),
         cid_registry:  Arc::new(RwLock::new(load_cid_registry())),
+        rl_inbox:      RateLimiter::new(20,  60),
+        rl_cid:        RateLimiter::new(60,  60),
+        rl_register:   RateLimiter::new(5,   60),
+        rl_tx_pending: RateLimiter::new(10,  60),
         mailer:        Arc::new(mailer),
         config:       Arc::new(cfg),
     };
@@ -1883,8 +2001,27 @@ async fn main() {
         let listener = tokio::net::TcpListener::bind(&http_addr).await
             .expect("HTTP bind failed");
         println!("[http] Listening on {}", http_addr);
-        axum::serve(listener, app).await.expect("HTTP server error");
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+            .await.expect("HTTP server error");
     });
+
+    // Background task: evict stale rate-limiter windows every 60 seconds.
+    {
+        let rl_inbox      = state.rl_inbox.clone();
+        let rl_cid        = state.rl_cid.clone();
+        let rl_register   = state.rl_register.clone();
+        let rl_tx_pending = state.rl_tx_pending.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                rl_inbox.evict_stale();
+                rl_cid.evict_stale();
+                rl_register.evict_stale();
+                rl_tx_pending.evict_stale();
+            }
+        });
+    }
 
     // Start one block-mining task per shard (runs every SHARD_BLOCK_INTERVAL_SECS).
     start_shard_miners(state.clone());
