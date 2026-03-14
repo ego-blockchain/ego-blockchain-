@@ -183,7 +183,9 @@ fn main() {
             commands::storage::open_file,
             commands::consensus::get_porep_status,
             commands::consensus::respond_to_challenges,
-            commands::consensus::get_post_score
+            commands::consensus::get_post_score,
+            commands::consensus::get_combined_drs,
+            commands::consensus::get_tokenomics
         ])
         .setup(|app| {
             // Show the window only after the frontend signals it's ready,

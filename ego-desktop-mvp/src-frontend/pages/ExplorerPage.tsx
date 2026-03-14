@@ -71,7 +71,38 @@ function timeAgo(ts: number) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
-type Tab = 'blocks' | 'txs' | 'files';
+interface Tokenomics {
+  total_supply_egoc:  number;
+  circulating_egoc:   number;
+  circulating_pct:    number;
+  emission_pools: {
+    genesis:       { cap_uegoc: number; pct: number };
+    block_rewards: { cap_uegoc: number; pct: number };
+    storage:       { cap_uegoc: number; pct: number };
+    coverage:      { cap_uegoc: number; pct: number };
+    ecosystem:     { cap_uegoc: number; pct: number };
+  };
+  block_rewards_issued_uegoc: number;
+  halving: {
+    era:                    number;
+    interval_blocks:        number;
+    current_reward_egoc:    number;
+    blocks_to_next_halving: number;
+    next_halving_at_block:  number;
+    max_block_height:       number;
+  };
+  staking: {
+    total_staked_egoc: number;
+    active_stakers:    number;
+    min_stake_egoc:    number;
+  };
+  drs: {
+    min_drs_to_mine: number;
+    weights: { poc: number; post: number; stake: number };
+  };
+}
+
+type Tab = 'blocks' | 'txs' | 'files' | 'tokenomics';
 
 const ExplorerPage: React.FC = () => {
   const [tab, setTab] = useState<Tab>('blocks');
@@ -79,6 +110,7 @@ const ExplorerPage: React.FC = () => {
   const [txs, setTxs] = useState<LedgerTx[]>([]);
   const [fileEvents, setFileEvents] = useState<FileEvent[]>([]);
   const [netStats, setNetStats] = useState<NetworkStats | null>(null);
+  const [tokenomics, setTokenomics] = useState<Tokenomics | null>(null);
   const [selectedBlock, setSelectedBlock] = useState<LedgerBlock | null>(null);
   const [selectedTx, setSelectedTx] = useState<LedgerTx | null>(null);
   const [selectedFile, setSelectedFile] = useState<FileEvent | null>(null);
@@ -87,7 +119,6 @@ const ExplorerPage: React.FC = () => {
 
   useEffect(() => {
     loadData();
-    // Auto-refresh when a peer pushes a new transaction or block to us.
     const unsub = listen('ego://chain-updated', () => { loadData(); });
     return () => { unsub.then(fn => fn()); };
   }, []);
@@ -110,6 +141,7 @@ const ExplorerPage: React.FC = () => {
     } finally {
       setLoading(false);
     }
+    invoke<Tokenomics>('get_tokenomics').then(setTokenomics).catch(() => {});
   }
 
   async function handleSearch() {
@@ -134,9 +166,10 @@ const ExplorerPage: React.FC = () => {
   }
 
   const tabs: { key: Tab; label: string; count: number }[] = [
-    { key: 'blocks', label: '🧱 Blocks',       count: blocks.length },
-    { key: 'txs',    label: '↔️ Transactions', count: txs.length    },
-    { key: 'files',  label: '📁 Files',         count: fileEvents.length },
+    { key: 'blocks',     label: '🧱 Blocks',       count: blocks.length      },
+    { key: 'txs',        label: '↔️ Transactions', count: txs.length         },
+    { key: 'files',      label: '📁 Files',         count: fileEvents.length  },
+    { key: 'tokenomics', label: '💰 Tokenomics',    count: 0                  },
   ];
 
   const statsCards = [
@@ -293,6 +326,98 @@ const ExplorerPage: React.FC = () => {
                   ))}
                 </tbody>
               </table>
+            </div>
+          )
+
+        ) : tab === 'tokenomics' ? (
+          /* ── Tokenomics tab ── */
+          !tokenomics ? (
+            <div className="py-16 text-center text-gray-500">
+              <div className="text-3xl mb-3 animate-pulse">💰</div>
+              <div className="text-sm">Loading tokenomics from relay…</div>
+              <div className="text-xs mt-1 text-gray-600">Relay must be reachable</div>
+            </div>
+          ) : (
+            <div className="p-5 space-y-5">
+              {/* Supply overview */}
+              <div className="grid grid-cols-3 gap-3">
+                {[
+                  { label: 'Total Supply',   val: `${tokenomics.total_supply_egoc.toLocaleString()} EGOC`, color: 'text-white' },
+                  { label: 'Circulating',    val: `${tokenomics.circulating_egoc.toLocaleString(undefined,{maximumFractionDigits:0})} EGOC`, color: 'text-green-400' },
+                  { label: 'Circulating %',  val: `${tokenomics.circulating_pct}%`, color: 'text-blue-400' },
+                ].map(c => (
+                  <div key={c.label} className="bg-gray-900 rounded-xl p-4 border border-gray-700/50">
+                    <div className="text-xs text-gray-400 mb-1">{c.label}</div>
+                    <div className={`text-lg font-bold ${c.color}`}>{c.val}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Emission pools */}
+              <div>
+                <div className="text-xs text-gray-400 mb-3 font-semibold uppercase tracking-wide">Emission Pools</div>
+                <div className="space-y-2">
+                  {Object.entries({
+                    'Genesis Allocation': { ...tokenomics.emission_pools.genesis,       color: 'bg-purple-500' },
+                    'Block Rewards':      { ...tokenomics.emission_pools.block_rewards,  color: 'bg-blue-500'   },
+                    'Storage (PoST)':     { ...tokenomics.emission_pools.storage,        color: 'bg-green-500'  },
+                    'Coverage (PoC)':     { ...tokenomics.emission_pools.coverage,       color: 'bg-yellow-500' },
+                    'Ecosystem':          { ...tokenomics.emission_pools.ecosystem,      color: 'bg-orange-500' },
+                  }).map(([name, pool]) => (
+                    <div key={name} className="flex items-center gap-3">
+                      <div className="w-32 text-xs text-gray-400 shrink-0">{name}</div>
+                      <div className="flex-1 h-2 bg-gray-700 rounded-full overflow-hidden">
+                        <div className={`h-full ${pool.color} rounded-full`} style={{ width: `${pool.pct}%` }} />
+                      </div>
+                      <div className="text-xs text-gray-300 w-10 text-right">{pool.pct}%</div>
+                      <div className="text-xs text-gray-500 w-40 text-right font-mono">
+                        {(pool.cap_uegoc / 1_000_000).toLocaleString(undefined,{maximumFractionDigits:0})} EGOC cap
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Halving schedule */}
+              <div className="bg-gray-900 rounded-xl p-4 border border-gray-700/50">
+                <div className="text-xs font-semibold text-gray-300 mb-3">Halving Schedule</div>
+                <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+                  {[
+                    { label: 'Current Era',          val: `Era ${tokenomics.halving.era}` },
+                    { label: 'Current Block Reward',  val: `${tokenomics.halving.current_reward_egoc} EGOC` },
+                    { label: 'Halving Interval',      val: `${tokenomics.halving.interval_blocks.toLocaleString()} blocks` },
+                    { label: 'Next Halving At',       val: `Block #${tokenomics.halving.next_halving_at_block.toLocaleString()}` },
+                    { label: 'Blocks to Halving',     val: tokenomics.halving.blocks_to_next_halving.toLocaleString() },
+                    { label: 'Current Height',        val: `#${tokenomics.halving.max_block_height.toLocaleString()}` },
+                  ].map(r => (
+                    <div key={r.label} className="flex justify-between gap-2">
+                      <span className="text-gray-400">{r.label}</span>
+                      <span className="font-mono text-xs">{r.val}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Staking + DRS */}
+              <div className="grid grid-cols-2 gap-3">
+                <div className="bg-gray-900 rounded-xl p-4 border border-gray-700/50">
+                  <div className="text-xs font-semibold text-gray-300 mb-3">Network Staking</div>
+                  <div className="space-y-2 text-sm">
+                    <div className="flex justify-between"><span className="text-gray-400">Total Staked</span><span className="text-orange-400 font-mono">{tokenomics.staking.total_staked_egoc.toLocaleString(undefined,{maximumFractionDigits:0})} EGOC</span></div>
+                    <div className="flex justify-between"><span className="text-gray-400">Active Stakers</span><span className="font-mono">{tokenomics.staking.active_stakers}</span></div>
+                    <div className="flex justify-between"><span className="text-gray-400">Min to Mine</span><span className="font-mono">{tokenomics.staking.min_stake_egoc.toLocaleString()} EGOC</span></div>
+                  </div>
+                </div>
+                <div className="bg-gray-900 rounded-xl p-4 border border-gray-700/50">
+                  <div className="text-xs font-semibold text-gray-300 mb-3">DRS Validator Gate</div>
+                  <div className="space-y-2 text-sm">
+                    <div className="flex justify-between"><span className="text-gray-400">Min DRS to Mine</span><span className="font-mono">{tokenomics.drs.min_drs_to_mine}</span></div>
+                    <div className="flex justify-between"><span className="text-gray-400">PoC Weight</span><span className="text-blue-400 font-mono">{(tokenomics.drs.weights.poc * 100).toFixed(0)}%</span></div>
+                    <div className="flex justify-between"><span className="text-gray-400">PoST Weight</span><span className="text-purple-400 font-mono">{(tokenomics.drs.weights.post * 100).toFixed(0)}%</span></div>
+                    <div className="flex justify-between"><span className="text-gray-400">Stake Weight</span><span className="text-orange-400 font-mono">{(tokenomics.drs.weights.stake * 100).toFixed(0)}%</span></div>
+                  </div>
+                </div>
+              </div>
             </div>
           )
 

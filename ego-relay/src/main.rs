@@ -225,17 +225,6 @@ fn save_poc_events(events: &[PocEventRecord]) {
     }
 }
 
-/// DRS score = Σ quality_pts(last 24h) × ln(1 + count_24h)
-/// Inspired by whitepaper DRS formula; simplified for testnet with PoC as primary signal.
-fn compute_drs_score(events: &[PocEventRecord], address: &str) -> f64 {
-    let cutoff = chrono::Utc::now().timestamp() - 86_400;
-    let recent: Vec<_> = events.iter()
-        .filter(|e| e.address == address && e.timestamp >= cutoff)
-        .collect();
-    if recent.is_empty() { return 0.0; }
-    let total_pts: u32 = recent.iter().map(|e| quality_score(&e.quality)).sum();
-    total_pts as f64 * (1.0_f64 + recent.len() as f64).ln()
-}
 
 type PocState = Arc<RwLock<Vec<PocEventRecord>>>;
 
@@ -462,6 +451,51 @@ const POST_WINDOW_SECS: i64 = 30 * 60;
 /// How many windows without a proof before we mark the sector as faulted.
 const POST_FAULT_AFTER_WINDOWS: i64 = 3;
 
+// ── EGOC Tokenomics ───────────────────────────────────────────────────────────
+
+/// Hard cap: 1 billion EGOC = 1 × 10¹⁵ uEGOC.
+const TOTAL_SUPPLY_UEGOC:         u64 = 1_000_000_000_000_000;
+const POOL_GENESIS_UEGOC:         u64 = 150_000_000_000_000; // 15 % — pre-mined genesis
+const POOL_BLOCK_UEGOC:           u64 = 300_000_000_000_000; // 30 % — block rewards
+const POOL_STORAGE_UEGOC:         u64 = 250_000_000_000_000; // 25 % — PoST storage rewards
+const POOL_COVERAGE_UEGOC:        u64 = 200_000_000_000_000; // 20 % — PoC coverage rewards
+const POOL_ECOSYSTEM_UEGOC:       u64 = 100_000_000_000_000; // 10 % — ecosystem / grants
+/// Per-block reward for desktop miners (before halving).
+const INITIAL_BLOCK_REWARD_UEGOC: u64 = 50_000_000;          // 50 EGOC
+/// Halving every 2.1 M blocks per shard (≈ 2 years at ~30 s target block time).
+const HALVING_INTERVAL:           u64 = 2_100_000;
+/// Minimum stake (uEGOC) required for a miner to propose blocks (1 000 EGOC).
+const MIN_STAKE_UEGOC:            u64 = 1_000_000_000;
+/// Minimum combined DRS required for block-mining eligibility.
+const MIN_DRS:                    f64 = 0.5;
+
+// ── Stake registry ────────────────────────────────────────────────────────────
+
+const STAKE_REGISTRY_PATH: &str = "stake_registry.json";
+
+/// An address's reported stake amount, updated when the desktop calls POST /stake/update.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StakeRecord {
+    address:      String,
+    amount_uegoc: u64,
+    updated_at:   i64,
+}
+
+type StakeRegistryState = Arc<RwLock<HashMap<String, StakeRecord>>>;
+
+fn load_stake_registry() -> HashMap<String, StakeRecord> {
+    std::fs::read_to_string(STAKE_REGISTRY_PATH)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_stake_registry(reg: &HashMap<String, StakeRecord>) {
+    if let Ok(data) = serde_json::to_string_pretty(reg) {
+        let _ = std::fs::write(STAKE_REGISTRY_PATH, data);
+    }
+}
+
 /// A registered PoRep commitment for one stored file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PoRepSector {
@@ -610,6 +644,71 @@ fn verify_post_proofs(
 type PoRepState      = Arc<RwLock<HashMap<String, PoRepSector>>>;
 type PostChalState   = Arc<RwLock<HashMap<String, Vec<PostChallenge>>>>;
 
+// ── Combined DRS (Dynamic Reputation Score) ───────────────────────────────────
+//
+// DRS = 0.40 × poc_score + 0.40 × post_score + 0.20 × stake_score
+//
+// poc_score   = Σ quality_pts(last 24 h) × ln(1 + event_count_24h)
+// post_score  = active_sectors × proof_ratio × ln(1 + total_GB)
+// stake_score = ln(1 + staked_EGOC / 100)
+
+#[derive(Debug, Clone, Copy)]
+struct DrsComponents {
+    combined: f64,
+    poc:      f64,
+    post:     f64,
+    stake:    f64,
+}
+
+fn compute_combined_drs(
+    address:        &str,
+    poc_events:     &[PocEventRecord],
+    porep_sectors:  &HashMap<String, PoRepSector>,
+    stake_registry: &HashMap<String, StakeRecord>,
+) -> DrsComponents {
+    let now    = chrono::Utc::now().timestamp();
+    let cutoff = now - 86_400;
+
+    // ── PoC component (40 %) ──────────────────────────────────────────────
+    let poc_recent: Vec<&PocEventRecord> = poc_events.iter()
+        .filter(|e| e.address == address && e.timestamp >= cutoff)
+        .collect();
+    let poc_score = if poc_recent.is_empty() {
+        0.0_f64
+    } else {
+        let pts: u32 = poc_recent.iter().map(|e| quality_score(&e.quality)).sum();
+        pts as f64 * (1.0_f64 + poc_recent.len() as f64).ln()
+    };
+
+    // ── PoST component (40 %) ─────────────────────────────────────────────
+    let sectors: Vec<&PoRepSector> = porep_sectors.values()
+        .filter(|s| s.prover_addr == address && s.status == "active")
+        .collect();
+    let active      = sectors.len() as f64;
+    let total_bytes: u64 = sectors.iter().map(|s| s.file_size).sum();
+    let total_gb    = total_bytes as f64 / 1_000_000_000.0;
+    let proved:  f64 = sectors.iter().map(|s| s.windows_proved).sum::<u64>() as f64;
+    let total_w: f64 = sectors.iter()
+        .map(|s| s.windows_proved + s.windows_missed)
+        .sum::<u64>() as f64;
+    let ratio       = if total_w > 0.0 { proved / total_w } else { 0.0 };
+    let post_score  = active * ratio * (1.0 + total_gb).ln();
+
+    // ── Stake component (20 %) ────────────────────────────────────────────
+    let staked_uegoc = stake_registry.get(address)
+        .map(|r| r.amount_uegoc)
+        .unwrap_or(0) as f64;
+    let staked_egoc  = staked_uegoc / 1_000_000.0;
+    let stake_score  = (1.0 + staked_egoc / 100.0).ln();
+
+    DrsComponents {
+        combined: 0.40 * poc_score + 0.40 * post_score + 0.20 * stake_score,
+        poc:      poc_score,
+        post:     post_score,
+        stake:    stake_score,
+    }
+}
+
 /// Number of shards. Each shard processes transactions independently.
 /// Increase this as validator count grows (target: 1 shard per ~25 validators).
 const SHARD_COUNT: u32 = 4;
@@ -655,6 +754,8 @@ struct AppState {
     porep_sectors:  PoRepState,
     /// Pending PoST challenges — keyed by prover_addr.
     post_challenges: PostChalState,
+    /// Stake amounts reported by desktop nodes after staking — keyed by address.
+    stake_registry:  StakeRegistryState,
     rl_inbox:       RateLimiterState, // 20 req/min — POST /inbox
     rl_cid:         RateLimiterState, // 60 req/min — POST /shard/:id/cid
     rl_register:    RateLimiterState, // 5  req/min — POST /users/register
@@ -976,21 +1077,35 @@ async fn post_block(
     State(s): State<AppState>,
     Json(block): Json<LedgerBlock>,
 ) -> StatusCode {
-    // ── PoC gate ──────────────────────────────────────────────────────────────
-    // Blocks may only be proposed by miners that have proven coverage (DRS > 0).
-    // During bootstrap (< POC_BOOTSTRAP_THRESHOLD active validators) we allow
-    // any miner so the network can get started without a chicken-and-egg problem.
+    // ── Combined DRS + Stake gate ─────────────────────────────────────────────
+    // After bootstrap (≥ POC_BOOTSTRAP_THRESHOLD active PoC validators) a miner
+    // must have combined_DRS ≥ MIN_DRS AND staked ≥ MIN_STAKE_UEGOC.
+    // Below that threshold any miner is accepted so the network can bootstrap.
     {
-        let poc = s.poc_events.read().unwrap();
+        let poc   = s.poc_events.read().unwrap();
         let unique_validators = poc.iter()
             .map(|e| e.address.as_str())
             .collect::<std::collections::HashSet<_>>()
             .len();
         if unique_validators >= POC_BOOTSTRAP_THRESHOLD {
-            let miner_score = compute_drs_score(&poc, &block.miner);
-            if miner_score == 0.0 {
-                println!("[chain] Rejected block #{} from {}: no PoC score (validators={})",
-                    block.height, block.miner, unique_validators);
+            let porep = s.porep_sectors.read().unwrap();
+            let stake = s.stake_registry.read().unwrap();
+            let drs = compute_combined_drs(&block.miner, &poc, &porep, &stake);
+            let combined = drs.combined;
+            let miner_stake = stake.get(&block.miner)
+                .map(|r| r.amount_uegoc)
+                .unwrap_or(0);
+            // Stake gate: only enforce when at least one validator has registered stake
+            // (prevents a cold-start deadlock if no one has staked yet).
+            let stake_gate_active = stake.values().any(|r| r.amount_uegoc >= MIN_STAKE_UEGOC);
+            if combined < MIN_DRS {
+                println!("[chain] Rejected block #{} from {}: DRS {:.4} < {:.2} (validators={})",
+                    block.height, block.miner, combined, MIN_DRS, unique_validators);
+                return StatusCode::FORBIDDEN;
+            }
+            if stake_gate_active && miner_stake < MIN_STAKE_UEGOC {
+                println!("[chain] Rejected block #{} from {}: stake {} < {} uEGOC",
+                    block.height, block.miner, miner_stake, MIN_STAKE_UEGOC);
                 return StatusCode::FORBIDDEN;
             }
         }
@@ -1584,6 +1699,10 @@ fn mine_shard_block(chain: &mut SharedChain, shard_id: u32) -> Option<LedgerBloc
             acc ^ ((b as u64) << (8 * (i % 8)))
         }));
 
+    // Block reward with halving: reward halves every HALVING_INTERVAL blocks.
+    let era           = height / HALVING_INTERVAL;
+    let block_reward  = INITIAL_BLOCK_REWARD_UEGOC >> era.min(63);
+
     let block = LedgerBlock {
         height,
         hash:       block_hash.clone(),
@@ -1592,7 +1711,7 @@ fn mine_shard_block(chain: &mut SharedChain, shard_id: u32) -> Option<LedgerBloc
         miner:      RELAY_MINER_ADDR.into(),
         tx_count,
         size_bytes,
-        reward:     0, // relay doesn't claim rewards
+        reward:     block_reward,
         shard_id,
     };
 
@@ -2072,19 +2191,29 @@ async fn post_post_proof(
         }
         save_post_challenges(&map);
     }
-    // Issue storage reward TX from faucet
+    // Issue storage reward TX from faucet — check pool cap before issuing
     {
-        let faucet   = "egot1faucet000000000000000000000000000000000000";
+        let faucet    = "egot1faucet000000000000000000000000000000000000";
         let mut chain = s.chain.write().unwrap();
+        let storage_used = pool_emitted(&chain, "PoST storage reward");
+        let supply_used  = total_emitted(&chain);
+        let capped_reward = if storage_used + reward_uegoc > POOL_STORAGE_UEGOC
+            || supply_used + reward_uegoc > TOTAL_SUPPLY_UEGOC
+        {
+            println!("[post] Storage pool cap reached: storage_used={} cap={}", storage_used, POOL_STORAGE_UEGOC);
+            0
+        } else {
+            reward_uegoc
+        };
         let reward_hash = format!("0xpost-{}-{}", &req.cid[..8.min(req.cid.len())], now);
-        if !chain.transactions.iter().any(|t| t.hash == reward_hash) {
+        if capped_reward > 0 && !chain.transactions.iter().any(|t| t.hash == reward_hash) {
             let nonce = chain.last_nonce(faucet) + 1;
             let bh    = chain.blocks.last().map(|b| b.height);
             chain.transactions.push(LedgerTx {
                 hash:               reward_hash.clone(),
                 from:               faucet.into(),
                 to:                 req.prover_addr.clone(),
-                amount:             reward_uegoc,
+                amount:             capped_reward,
                 memo:               Some(format!("PoST storage reward ({} window)", &req.cid[..8.min(req.cid.len())])),
                 timestamp:          now,
                 signature:          "relay-post-reward".into(),
@@ -2220,6 +2349,26 @@ fn start_post_challenger(state: AppState) {
     });
 }
 
+/// Sum all confirmed faucet emissions whose memo starts with `memo_prefix`.
+/// Used to enforce per-pool emission caps.
+fn pool_emitted(chain: &SharedChain, memo_prefix: &str) -> u64 {
+    let faucet = "egot1faucet000000000000000000000000000000000000";
+    chain.transactions.iter()
+        .filter(|t| t.from == faucet && t.status == "Confirmed")
+        .filter(|t| t.memo.as_deref().map(|m| m.starts_with(memo_prefix)).unwrap_or(false))
+        .map(|t| t.amount)
+        .sum()
+}
+
+/// Sum all confirmed faucet emissions (total circulating supply from faucet).
+fn total_emitted(chain: &SharedChain) -> u64 {
+    let faucet = "egot1faucet000000000000000000000000000000000000";
+    chain.transactions.iter()
+        .filter(|t| t.from == faucet && t.status == "Confirmed")
+        .map(|t| t.amount)
+        .sum()
+}
+
 /// POST /poc/event — submit a signed Proof of Coverage beacon event.
 async fn post_poc_event(
     State(s): State<AppState>,
@@ -2300,7 +2449,18 @@ async fn post_poc_event(
         save_poc_events(&events);
     }
 
-    // 5. Emit coverage reward tx from faucet address on the shared chain
+    // 5. Emit coverage reward tx — check pool cap before issuing
+    let reward = {
+        let chain_read = s.chain.read().unwrap();
+        let coverage_used = pool_emitted(&chain_read, "PoC coverage reward");
+        let supply_used   = total_emitted(&chain_read);
+        if coverage_used + reward > POOL_COVERAGE_UEGOC || supply_used + reward > TOTAL_SUPPLY_UEGOC {
+            println!("[poc] Pool cap reached for {}: coverage_used={} cap={}", req.address, coverage_used, POOL_COVERAGE_UEGOC);
+            0 // emit nothing
+        } else {
+            reward
+        }
+    };
     if reward > 0 {
         let reward_hash = format!("0xpoc-{}-{}",
             &req.address[req.address.len().saturating_sub(8)..], req.timestamp);
@@ -2339,41 +2499,54 @@ async fn post_poc_event(
 
 #[derive(Debug, Serialize)]
 struct DrsScoreResponse {
-    address:        String,
-    drs_score:      f64,
-    events_24h:     u32,
-    total_events:   u64,
-    last_event:     Option<i64>,
-    is_validator:   bool,
-    validator_rank: Option<usize>,
+    address:         String,
+    drs_score:       f64,
+    poc_component:   f64,
+    post_component:  f64,
+    stake_component: f64,
+    events_24h:      u32,
+    total_events:    u64,
+    last_event:      Option<i64>,
+    is_validator:    bool,
+    validator_rank:  Option<usize>,
 }
 
-/// GET /poc/score/:address — DRS score and validator status for an address.
+/// GET /poc/score/:address — combined DRS score and validator status for an address.
 async fn get_poc_score(
     Path(address): Path<String>,
     State(s): State<AppState>,
 ) -> Json<DrsScoreResponse> {
     let events  = s.poc_events.read().unwrap();
+    let porep   = s.porep_sectors.read().unwrap();
+    let stake   = s.stake_registry.read().unwrap();
     let now     = chrono::Utc::now().timestamp();
     let cutoff  = now - 86_400;
     let events_24h   = events.iter().filter(|e| e.address == address && e.timestamp >= cutoff).count() as u32;
     let total_events = events.iter().filter(|e| e.address == address).count() as u64;
     let last_event   = events.iter().filter(|e| e.address == address).map(|e| e.timestamp).max();
-    let drs_score    = compute_drs_score(&events, &address);
+    let drs          = compute_combined_drs(&address, &events, &porep, &stake);
+    let drs_score    = drs.combined;
 
-    // Rank among all validators (any address with drs_score > 0)
+    // Rank among all validators (any address with combined DRS > 0)
     let mut all: Vec<(String, f64)> = events.iter()
         .map(|e| e.address.clone())
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
-        .map(|a| { let sc = compute_drs_score(&events, &a); (a, sc) })
+        .map(|a| { let sc = compute_combined_drs(&a, &events, &porep, &stake).combined; (a, sc) })
         .filter(|(_, sc)| *sc > 0.0)
         .collect();
     all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let validator_rank = all.iter().position(|(a, _)| *a == address).map(|i| i + 1);
 
     Json(DrsScoreResponse {
-        address, drs_score, events_24h, total_events, last_event,
+        address,
+        drs_score,
+        poc_component:   drs.poc,
+        post_component:  drs.post,
+        stake_component: drs.stake,
+        events_24h,
+        total_events,
+        last_event,
         is_validator: drs_score > 0.0,
         validator_rank,
     })
@@ -2388,11 +2561,13 @@ struct ValidatorInfo {
     rank:       usize,
 }
 
-/// GET /poc/validators — ranked list of active PoC validators (last 24 h).
+/// GET /poc/validators — ranked list of active validators by combined DRS (last 24 h).
 async fn get_poc_validators(
     State(s): State<AppState>,
 ) -> Json<Vec<ValidatorInfo>> {
     let events = s.poc_events.read().unwrap();
+    let porep  = s.porep_sectors.read().unwrap();
+    let stake  = s.stake_registry.read().unwrap();
     let now    = chrono::Utc::now().timestamp();
     let cutoff = now - 86_400;
 
@@ -2407,7 +2582,7 @@ async fn get_poc_validators(
         .filter(|(_, (cnt, _))| *cnt > 0)
         .map(|(addr, (cnt, last))| ValidatorInfo {
             address:    addr.clone(),
-            drs_score:  compute_drs_score(&events, addr),
+            drs_score:  compute_combined_drs(addr, &events, &porep, &stake).combined,
             events_24h: *cnt,
             last_event: *last,
             rank:       0,
@@ -2417,6 +2592,128 @@ async fn get_poc_validators(
         .unwrap_or(std::cmp::Ordering::Equal));
     for (i, v) in validators.iter_mut().enumerate() { v.rank = i + 1; }
     Json(validators)
+}
+
+// ── Stake update + Tokenomics endpoints ──────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct StakeUpdateRequest {
+    address:      String,
+    amount_uegoc: u64,
+    timestamp:    i64,
+    /// Ed25519 signature over "stake:{address}:{amount_uegoc}:{timestamp}"
+    signature:    String,
+    public_key:   String,
+}
+
+/// POST /stake/update — desktop calls this after staking/unstaking to keep the
+/// relay's stake registry up-to-date for DRS scoring.
+async fn post_stake_update(
+    State(s): State<AppState>,
+    Json(req): Json<StakeUpdateRequest>,
+) -> StatusCode {
+    if req.address.is_empty() { return StatusCode::BAD_REQUEST; }
+    // Freshness ±5 min
+    let now = chrono::Utc::now().timestamp();
+    if (now - req.timestamp).abs() > 300 { return StatusCode::BAD_REQUEST; }
+    // Verify Ed25519 signature over "stake:address:amount:timestamp"
+    let sign_bytes = format!("stake:{}:{}:{}", req.address, req.amount_uegoc, req.timestamp)
+        .into_bytes();
+    let pk_arr: [u8; 32] = match hex::decode(&req.public_key)
+        .ok().and_then(|b| b.try_into().ok())
+    {
+        Some(a) => a,
+        None    => return StatusCode::BAD_REQUEST,
+    };
+    let vk = match VerifyingKey::from_bytes(&pk_arr) {
+        Ok(k)  => k,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+    let sig_arr: [u8; 64] = match hex::decode(&req.signature)
+        .ok().and_then(|b| b.try_into().ok())
+    {
+        Some(a) => a,
+        None    => return StatusCode::BAD_REQUEST,
+    };
+    if vk.verify(&sign_bytes, &ed25519_dalek::Signature::from_bytes(&sig_arr)).is_err() {
+        println!("[stake] Rejected update from {}: bad signature", req.address);
+        return StatusCode::UNAUTHORIZED;
+    }
+    let mut reg = s.stake_registry.write().unwrap();
+    reg.insert(req.address.clone(), StakeRecord {
+        address:      req.address.clone(),
+        amount_uegoc: req.amount_uegoc,
+        updated_at:   now,
+    });
+    save_stake_registry(&reg);
+    println!("[stake] Updated: {} → {} uEGOC ({:.4} EGOC)",
+        req.address, req.amount_uegoc, req.amount_uegoc as f64 / 1_000_000.0);
+    StatusCode::OK
+}
+
+/// GET /tokenomics — total supply, emission pools, halving schedule, staking stats.
+async fn get_tokenomics(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let chain = s.chain.read().unwrap();
+    let stake = s.stake_registry.read().unwrap();
+
+    // Circulating supply = confirmed outbound from faucet (genesis + all rewards)
+    let faucet = "egot1faucet000000000000000000000000000000000000";
+    let emitted: u64 = chain.transactions.iter()
+        .filter(|t| t.from == faucet && t.status == "Confirmed")
+        .map(|t| t.amount)
+        .sum();
+
+    // Block rewards recorded in chain blocks
+    let block_rewards_issued: u64 = chain.blocks.iter().map(|b| b.reward).sum();
+
+    // Current halving era (max block height across all shards)
+    let max_height = chain.blocks.iter().map(|b| b.height).max().unwrap_or(0);
+    let era               = max_height / HALVING_INTERVAL;
+    let current_reward    = INITIAL_BLOCK_REWARD_UEGOC >> era.min(63);
+    let next_halving_blk  = (era + 1) * HALVING_INTERVAL;
+    let blocks_to_halving = next_halving_blk.saturating_sub(max_height);
+
+    // Staking stats
+    let total_staked: u64 = stake.values().map(|r| r.amount_uegoc).sum();
+    let active_stakers    = stake.values().filter(|r| r.amount_uegoc > 0).count();
+
+    Json(serde_json::json!({
+        "total_supply_uegoc":  TOTAL_SUPPLY_UEGOC,
+        "total_supply_egoc":   TOTAL_SUPPLY_UEGOC as f64 / 1_000_000.0,
+        "circulating_uegoc":   emitted,
+        "circulating_egoc":    emitted as f64 / 1_000_000.0,
+        "circulating_pct":     if TOTAL_SUPPLY_UEGOC > 0 {
+                                   (emitted as f64 / TOTAL_SUPPLY_UEGOC as f64 * 100.0 * 100.0).round() / 100.0
+                               } else { 0.0 },
+        "emission_pools": {
+            "genesis":        { "cap_uegoc": POOL_GENESIS_UEGOC,   "pct": 15 },
+            "block_rewards":  { "cap_uegoc": POOL_BLOCK_UEGOC,     "pct": 30 },
+            "storage":        { "cap_uegoc": POOL_STORAGE_UEGOC,   "pct": 25 },
+            "coverage":       { "cap_uegoc": POOL_COVERAGE_UEGOC,  "pct": 20 },
+            "ecosystem":      { "cap_uegoc": POOL_ECOSYSTEM_UEGOC, "pct": 10 },
+        },
+        "block_rewards_issued_uegoc": block_rewards_issued,
+        "halving": {
+            "era":                      era,
+            "interval_blocks":          HALVING_INTERVAL,
+            "current_reward_uegoc":     current_reward,
+            "current_reward_egoc":      current_reward as f64 / 1_000_000.0,
+            "blocks_to_next_halving":   blocks_to_halving,
+            "next_halving_at_block":    next_halving_blk,
+            "max_block_height":         max_height,
+        },
+        "staking": {
+            "total_staked_uegoc":  total_staked,
+            "total_staked_egoc":   total_staked as f64 / 1_000_000.0,
+            "active_stakers":      active_stakers,
+            "min_stake_uegoc":     MIN_STAKE_UEGOC,
+            "min_stake_egoc":      MIN_STAKE_UEGOC as f64 / 1_000_000.0,
+        },
+        "drs": {
+            "min_drs_to_mine":  MIN_DRS,
+            "weights": { "poc": 0.40, "post": 0.40, "stake": 0.20 },
+        },
+    }))
 }
 
 // ── libp2p relay behaviour ────────────────────────────────────────────────────
@@ -2482,6 +2779,7 @@ async fn main() {
         cid_registry:    Arc::new(RwLock::new(load_cid_registry())),
         porep_sectors:   Arc::new(RwLock::new(load_porep_registry())),
         post_challenges: Arc::new(RwLock::new(load_post_challenges())),
+        stake_registry:  Arc::new(RwLock::new(load_stake_registry())),
         rl_inbox:        RateLimiter::new(20,  60),
         rl_cid:          RateLimiter::new(60,  60),
         rl_register:     RateLimiter::new(5,   60),
@@ -2544,6 +2842,9 @@ async fn main() {
             .route("/poc/event",            post(post_poc_event))
             .route("/poc/score/:address",   get(get_poc_score))
             .route("/poc/validators",       get(get_poc_validators))
+            // ── Staking + Tokenomics ──
+            .route("/stake/update",         post(post_stake_update))
+            .route("/tokenomics",           get(get_tokenomics))
             .with_state(state_clone)
             .layer(
                 CorsLayer::new()
