@@ -153,7 +153,7 @@ pub struct LedgerBlock {
 }
 
 /// Metadata for an encrypted file stored on disk.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StoredFile {
     pub cid: String,
     pub name: String,
@@ -167,6 +167,28 @@ pub struct StoredFile {
     pub local_path: String,
     #[serde(default)]
     pub owner: String,
+    // ── PoRep commitment fields (set at store_file time) ──────────────────────
+    /// Merkle root of the encrypted file (hex). Empty for pre-PoRep files.
+    #[serde(default)]
+    pub comm_d: String,
+    /// H(comm_d ‖ replica_id ‖ "ego/porep/v1") (hex).
+    #[serde(default)]
+    pub comm_r: String,
+    /// Monotonically-increasing sector ID within this wallet.
+    #[serde(default)]
+    pub sector_id: u64,
+    /// Number of real (non-padding) 1 KB leaves in the Merkle tree.
+    #[serde(default)]
+    pub n_real_leaves: usize,
+    /// Next-power-of-two leaf count used by the tree builder.
+    #[serde(default)]
+    pub n_padded_leaves: usize,
+    /// PoST status: "" | "registered" | "challenged" | "proved" | "faulted"
+    #[serde(default)]
+    pub post_status: String,
+    /// Unix timestamp of the most recent successful PoST proof.
+    #[serde(default)]
+    pub last_proved: Option<i64>,
 }
 
 /// The complete local wallet state, persisted to JSON.

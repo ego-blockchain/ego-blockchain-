@@ -450,6 +450,166 @@ fn save_cid_registry(reg: &HashMap<String, Vec<CidHolder>>) {
     }
 }
 
+// ── PoRep / PoST data model ───────────────────────────────────────────────────
+
+const POREP_REGISTRY_PATH: &str = "porep_registry.json";
+const POST_CHALLENGES_PATH: &str = "post_challenges.json";
+
+/// Number of Merkle proofs the prover must supply per PoST window.
+const POST_N_CHALLENGES: usize = 8;
+/// PoST window duration in seconds (30 minutes, matches desktop).
+const POST_WINDOW_SECS: i64 = 30 * 60;
+/// How many windows without a proof before we mark the sector as faulted.
+const POST_FAULT_AFTER_WINDOWS: i64 = 3;
+
+/// A registered PoRep commitment for one stored file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PoRepSector {
+    cid:             String,
+    prover_addr:     String,
+    /// Merkle root of the encrypted file (hex, 64 chars).
+    comm_d:          String,
+    /// H(comm_d ‖ replica_id ‖ "ego/porep/v1") (hex).
+    comm_r:          String,
+    n_real_leaves:   usize,
+    n_padded_leaves: usize,
+    sector_id:       u64,
+    file_size:       u64,
+    registered_at:   i64,
+    expiry:          i64,
+    last_challenged: Option<i64>,
+    last_proved:     Option<i64>,
+    windows_proved:  u64,
+    windows_missed:  u64,
+    status:          String, // "active" | "faulted" | "expired"
+}
+
+/// A pending PoST challenge issued by the relay for one sector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PostChallenge {
+    challenge_id:    String,
+    cid:             String,
+    prover_addr:     String,
+    comm_d:          String,
+    n_real_leaves:   usize,
+    n_padded_leaves: usize,
+    /// 32-byte random seed (hex) — deterministically selects which leaves to prove.
+    challenge_seed:  String,
+    issued_at:       i64,
+    /// Unix deadline: prover must respond before this time.
+    deadline:        i64,
+}
+
+fn load_porep_registry() -> HashMap<String, PoRepSector> {
+    std::fs::read_to_string(POREP_REGISTRY_PATH)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_porep_registry(reg: &HashMap<String, PoRepSector>) {
+    if let Ok(data) = serde_json::to_string_pretty(reg) {
+        let _ = std::fs::write(POREP_REGISTRY_PATH, data);
+    }
+}
+
+fn load_post_challenges() -> HashMap<String, Vec<PostChallenge>> {
+    // Key: prover_addr → pending challenges for that prover
+    std::fs::read_to_string(POST_CHALLENGES_PATH)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_post_challenges(chs: &HashMap<String, Vec<PostChallenge>>) {
+    if let Ok(data) = serde_json::to_string_pretty(chs) {
+        let _ = std::fs::write(POST_CHALLENGES_PATH, data);
+    }
+}
+
+// ── PoST Merkle-proof verification (mirrors proof.rs in desktop) ──────────────
+//
+// We duplicate the tiny verification logic here rather than import the desktop
+// crate — keeps the relay as a single self-contained binary.
+
+fn blake3_hash(data: &[u8]) -> [u8; 32] {
+    *blake3::hash(data).as_bytes()
+}
+
+fn blake3_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(left);
+    h.update(right);
+    *h.finalize().as_bytes()
+}
+
+/// Verify one Merkle proof against a registered root.
+fn verify_merkle_proof(
+    leaf_index:  u64,
+    leaf:        &[u8; 32],
+    path:        &[[u8; 32]],
+    root:        &[u8; 32],
+    n_padded:    usize,
+) -> bool {
+    let mut current = *leaf;
+    let mut pos     = n_padded as u64 + leaf_index;
+    for sibling in path {
+        current = if pos % 2 == 0 {
+            blake3_pair(&current, sibling)
+        } else {
+            blake3_pair(sibling, &current)
+        };
+        pos /= 2;
+    }
+    &current == root
+}
+
+/// Derive challenge leaf indices from a seed (identical to desktop `derive_challenge_indices`).
+fn derive_challenge_indices(seed: &[u8; 32], n_real: usize) -> Vec<u64> {
+    (0..POST_N_CHALLENGES).map(|i| {
+        let mut h = blake3::Hasher::new();
+        h.update(seed);
+        h.update(&(i as u64).to_le_bytes());
+        let raw = u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap());
+        raw % n_real as u64
+    }).collect()
+}
+
+/// Verify all POST_N_CHALLENGES proofs against comm_d + challenge_seed.
+fn verify_post_proofs(
+    proofs_json:    &[serde_json::Value],
+    comm_d:         &[u8; 32],
+    challenge_seed: &[u8; 32],
+    n_real:         usize,
+    n_padded:       usize,
+) -> bool {
+    if proofs_json.len() != POST_N_CHALLENGES { return false; }
+    let expected_indices = derive_challenge_indices(challenge_seed, n_real);
+    for (proof_val, &expected_idx) in proofs_json.iter().zip(expected_indices.iter()) {
+        let leaf_index = match proof_val["leaf_index"].as_u64() { Some(v) => v, None => return false };
+        if leaf_index != expected_idx { return false; }
+        let leaf_hex  = match proof_val["leaf"].as_str()         { Some(v) => v, None => return false };
+        let path_arr  = match proof_val["path"].as_array()       { Some(v) => v, None => return false };
+        let leaf_bytes = match hex::decode(leaf_hex).ok().and_then(|b| b.try_into().ok()) {
+            Some(arr) => arr,
+            None      => return false,
+        };
+        let path_bytes: Option<Vec<[u8; 32]>> = path_arr.iter().map(|h| {
+            h.as_str()
+                .and_then(|s| hex::decode(s).ok())
+                .and_then(|b| b.try_into().ok())
+        }).collect();
+        let path = match path_bytes { Some(p) => p, None => return false };
+        if !verify_merkle_proof(leaf_index, &leaf_bytes, &path, comm_d, n_padded) {
+            return false;
+        }
+    }
+    true
+}
+
+type PoRepState      = Arc<RwLock<HashMap<String, PoRepSector>>>;
+type PostChalState   = Arc<RwLock<HashMap<String, Vec<PostChallenge>>>>;
+
 /// Number of shards. Each shard processes transactions independently.
 /// Increase this as validator count grows (target: 1 shard per ~25 validators).
 const SHARD_COUNT: u32 = 4;
@@ -482,21 +642,25 @@ fn save_key_registry(reg: &HashMap<String, String>) {
 
 #[derive(Clone)]
 struct AppState {
-    chain:        ChainState,
-    peers:        PeersState,
-    inbox:        InboxState,
-    users:        UsersState,
-    pending:      PendingState,
-    poc_events:   PocState,
-    key_registry: KeyRegistryState,
-    shard_pools:   ShardPoolState,
-    cid_registry:  CidRegistryState,
-    rl_inbox:      RateLimiterState, // 20 req/min — POST /inbox
-    rl_cid:        RateLimiterState, // 60 req/min — POST /shard/:id/cid
-    rl_register:   RateLimiterState, // 5  req/min — POST /users/register
-    rl_tx_pending: RateLimiterState, // 10 req/min — POST /tx/pending
-    mailer:        Arc<AsyncSmtpTransport<Tokio1Executor>>,
-    config:        Arc<Config>,
+    chain:          ChainState,
+    peers:          PeersState,
+    inbox:          InboxState,
+    users:          UsersState,
+    pending:        PendingState,
+    poc_events:     PocState,
+    key_registry:   KeyRegistryState,
+    shard_pools:    ShardPoolState,
+    cid_registry:   CidRegistryState,
+    /// PoRep sector commitments — keyed by CID.
+    porep_sectors:  PoRepState,
+    /// Pending PoST challenges — keyed by prover_addr.
+    post_challenges: PostChalState,
+    rl_inbox:       RateLimiterState, // 20 req/min — POST /inbox
+    rl_cid:         RateLimiterState, // 60 req/min — POST /shard/:id/cid
+    rl_register:    RateLimiterState, // 5  req/min — POST /users/register
+    rl_tx_pending:  RateLimiterState, // 10 req/min — POST /tx/pending
+    mailer:         Arc<AsyncSmtpTransport<Tokio1Executor>>,
+    config:         Arc<Config>,
 }
 
 // ── Email helpers ─────────────────────────────────────────────────────────────
@@ -1673,6 +1837,389 @@ async fn get_shard_files(
     Ok(Json(files))
 }
 
+// ── PoRep / PoST HTTP handlers ────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct PoRepCommitRequest {
+    cid:             String,
+    prover_addr:     String,
+    comm_d:          String,
+    comm_r:          String,
+    n_real_leaves:   usize,
+    n_padded_leaves: usize,
+    sector_id:       u64,
+    file_size:       u64,
+    expiry:          i64,
+    timestamp:       i64,
+    signature:       String,
+    public_key:      String,
+}
+
+/// POST /porep/commit — register a PoRep sector commitment.
+/// Requires an Ed25519 signature over "cid:comm_d:timestamp" to prevent spoofing.
+async fn post_porep_commit(
+    State(s): State<AppState>,
+    Json(req): Json<PoRepCommitRequest>,
+) -> StatusCode {
+    if req.cid.is_empty() || req.prover_addr.is_empty()
+        || req.comm_d.len() != 64 || req.comm_r.len() != 64
+        || req.n_real_leaves == 0
+    {
+        return StatusCode::BAD_REQUEST;
+    }
+    // Freshness check ±5 minutes
+    let now = chrono::Utc::now().timestamp();
+    if (now - req.timestamp).abs() > 300 {
+        return StatusCode::BAD_REQUEST;
+    }
+    // Verify signature over "cid:comm_d:timestamp"
+    let sign_bytes = format!("{}:{}:{}", req.cid, req.comm_d, req.timestamp).into_bytes();
+    let pk_bytes: [u8; 32] = match hex::decode(&req.public_key)
+        .ok().and_then(|b| b.try_into().ok())
+    {
+        Some(arr) => arr,
+        None => return StatusCode::BAD_REQUEST,
+    };
+    let verifying_key = match VerifyingKey::from_bytes(&pk_bytes) {
+        Ok(k)  => k,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+    let sig_bytes: [u8; 64] = match hex::decode(&req.signature)
+        .ok().and_then(|b| b.try_into().ok())
+    {
+        Some(arr) => arr,
+        None => return StatusCode::BAD_REQUEST,
+    };
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    if verifying_key.verify(&sign_bytes, &sig).is_err() {
+        println!("[porep] Rejected commit from {}: bad signature", req.prover_addr);
+        return StatusCode::UNAUTHORIZED;
+    }
+    // Verify comm_r = blake3(comm_d || replica_id || "ego/porep/v1")
+    // where replica_id = blake3(prover_addr:cid)
+    {
+        let comm_d_bytes: [u8; 32] = match hex::decode(&req.comm_d)
+            .ok().and_then(|b| b.try_into().ok())
+        {
+            Some(arr) => arr,
+            None => return StatusCode::BAD_REQUEST,
+        };
+        let replica_id = {
+            let mut h = blake3::Hasher::new();
+            h.update(req.prover_addr.as_bytes());
+            h.update(b":");
+            h.update(req.cid.as_bytes());
+            *h.finalize().as_bytes()
+        };
+        let expected_comm_r = {
+            let mut h = blake3::Hasher::new();
+            h.update(&comm_d_bytes);
+            h.update(&replica_id);
+            h.update(b"ego/porep/v1");
+            *h.finalize().as_bytes()
+        };
+        if hex::encode(expected_comm_r) != req.comm_r {
+            println!("[porep] Rejected commit: comm_r mismatch for {}", req.cid);
+            return StatusCode::BAD_REQUEST;
+        }
+    }
+
+    let sector = PoRepSector {
+        cid:             req.cid.clone(),
+        prover_addr:     req.prover_addr.clone(),
+        comm_d:          req.comm_d.clone(),
+        comm_r:          req.comm_r.clone(),
+        n_real_leaves:   req.n_real_leaves,
+        n_padded_leaves: req.n_padded_leaves,
+        sector_id:       req.sector_id,
+        file_size:       req.file_size,
+        registered_at:   now,
+        expiry:          req.expiry,
+        last_challenged: None,
+        last_proved:     None,
+        windows_proved:  0,
+        windows_missed:  0,
+        status:          "active".into(),
+    };
+
+    {
+        let mut reg = s.porep_sectors.write().unwrap();
+        let is_new  = !reg.contains_key(&req.cid);
+        reg.insert(req.cid.clone(), sector);
+        save_porep_registry(&reg);
+        if is_new {
+            println!("[porep] ✓ New sector: {} prover={} leaves={}",
+                &req.cid[..16.min(req.cid.len())], req.prover_addr, req.n_real_leaves);
+        }
+    }
+    StatusCode::OK
+}
+
+/// GET /post/challenges/:address — return pending PoST challenges for a prover.
+async fn get_post_challenges(
+    Path(address): Path<String>,
+    State(s): State<AppState>,
+) -> Json<Vec<PostChallenge>> {
+    let map = s.post_challenges.read().unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let challenges: Vec<PostChallenge> = map.get(&address)
+        .map(|v| v.iter().filter(|c| c.deadline > now).cloned().collect())
+        .unwrap_or_default();
+    Json(challenges)
+}
+
+#[derive(Debug, Deserialize)]
+struct PostProofRequest {
+    challenge_id:    String,
+    cid:             String,
+    prover_addr:     String,
+    comm_d:          String,
+    n_real_leaves:   usize,
+    n_padded_leaves: usize,
+    proofs:          Vec<serde_json::Value>, // MerkleProof JSON objects
+    timestamp:       i64,
+    signature:       String,
+    public_key:      String,
+}
+
+/// POST /post/proof — submit Merkle proofs in response to a PoST challenge.
+/// Relay verifies proofs, marks sector as proved, issues storage reward TX.
+async fn post_post_proof(
+    State(s): State<AppState>,
+    Json(req): Json<PostProofRequest>,
+) -> (StatusCode, Json<ApiResponse>) {
+    // Freshness ±5 min
+    let now = chrono::Utc::now().timestamp();
+    if (now - req.timestamp).abs() > 300 {
+        return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            success: false, message: "Timestamp out of range".into() }));
+    }
+    // Signature over "challenge_id:cid:timestamp"
+    let sign_bytes = format!("{}:{}:{}", req.challenge_id, req.cid, req.timestamp).into_bytes();
+    let pk_arr: [u8; 32] = match hex::decode(&req.public_key)
+        .ok().and_then(|b| b.try_into().ok())
+    {
+        Some(a) => a, None => return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            success: false, message: "Invalid public key".into() })),
+    };
+    let vk = match VerifyingKey::from_bytes(&pk_arr) {
+        Ok(k)  => k,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            success: false, message: "Bad public key".into() })),
+    };
+    let sig_arr: [u8; 64] = match hex::decode(&req.signature)
+        .ok().and_then(|b| b.try_into().ok())
+    {
+        Some(a) => a, None => return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            success: false, message: "Invalid signature".into() })),
+    };
+    if vk.verify(&sign_bytes, &ed25519_dalek::Signature::from_bytes(&sig_arr)).is_err() {
+        return (StatusCode::UNAUTHORIZED, Json(ApiResponse {
+            success: false, message: "Signature invalid".into() }));
+    }
+    // Find the pending challenge
+    let challenge_seed_hex = {
+        let map = s.post_challenges.read().unwrap();
+        let ch  = map.get(&req.prover_addr)
+            .and_then(|v| v.iter().find(|c| c.challenge_id == req.challenge_id))
+            .cloned();
+        match ch {
+            Some(c) if c.deadline > now => c.challenge_seed.clone(),
+            Some(_) => return (StatusCode::GONE, Json(ApiResponse {
+                success: false, message: "Challenge expired".into() })),
+            None => return (StatusCode::NOT_FOUND, Json(ApiResponse {
+                success: false, message: "Challenge not found".into() })),
+        }
+    };
+    // Decode comm_d and challenge_seed
+    let comm_d: [u8; 32] = match hex::decode(&req.comm_d)
+        .ok().and_then(|b| b.try_into().ok())
+    {
+        Some(a) => a, None => return (StatusCode::BAD_REQUEST, Json(ApiResponse {
+            success: false, message: "Invalid comm_d".into() })),
+    };
+    let seed: [u8; 32] = match hex::decode(&challenge_seed_hex)
+        .ok().and_then(|b| b.try_into().ok())
+    {
+        Some(a) => a, None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse {
+            success: false, message: "Internal: bad seed".into() })),
+    };
+    // Verify Merkle proofs
+    if !verify_post_proofs(&req.proofs, &comm_d, &seed, req.n_real_leaves, req.n_padded_leaves) {
+        println!("[post] ✗ Proof INVALID for {} prover={}", &req.cid[..16.min(req.cid.len())], req.prover_addr);
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(ApiResponse {
+            success: false, message: "Proof verification failed".into() }));
+    }
+    // Mark proved + remove challenge
+    let reward_uegoc = {
+        let mut reg = s.porep_sectors.write().unwrap();
+        if let Some(sector) = reg.get_mut(&req.cid) {
+            sector.last_proved    = Some(now);
+            sector.windows_proved += 1;
+            if sector.status == "faulted" { sector.status = "active".into(); }
+        }
+        save_porep_registry(&reg);
+        // Reward = 0.5 EGOC / GB / day ≈ per 30-min window:
+        //   file_size_bytes * 0.5 EGOC/GB/day * (1 day/48 windows) * 1_000_000 uEGOC/EGOC
+        //   = file_size * 0.5 / 1e9 / 48 * 1e6 = file_size * 10416 / 1e9
+        let file_size = reg.get(&req.cid).map(|s| s.file_size).unwrap_or(0);
+        (file_size as f64 * 10_416.0 / 1_000_000_000.0).max(10.0) as u64
+    };
+    {
+        let mut map = s.post_challenges.write().unwrap();
+        if let Some(v) = map.get_mut(&req.prover_addr) {
+            v.retain(|c| c.challenge_id != req.challenge_id);
+        }
+        save_post_challenges(&map);
+    }
+    // Issue storage reward TX from faucet
+    {
+        let faucet   = "egot1faucet000000000000000000000000000000000000";
+        let mut chain = s.chain.write().unwrap();
+        let reward_hash = format!("0xpost-{}-{}", &req.cid[..8.min(req.cid.len())], now);
+        if !chain.transactions.iter().any(|t| t.hash == reward_hash) {
+            let nonce = chain.last_nonce(faucet) + 1;
+            let bh    = chain.blocks.last().map(|b| b.height);
+            chain.transactions.push(LedgerTx {
+                hash:               reward_hash.clone(),
+                from:               faucet.into(),
+                to:                 req.prover_addr.clone(),
+                amount:             reward_uegoc,
+                memo:               Some(format!("PoST storage reward ({} window)", &req.cid[..8.min(req.cid.len())])),
+                timestamp:          now,
+                signature:          "relay-post-reward".into(),
+                status:             "Confirmed".into(),
+                block_height:       bh,
+                nonce,
+                public_key_ed25519:  String::new(),
+                dilithium_pubkey:    String::new(),
+                dilithium_signature: String::new(),
+                shard_id: shard_for_address(&req.prover_addr),
+            });
+            save_chain(&chain);
+        }
+    }
+    println!("[post] ✓ Proved {} prover={} reward={}uEGOC",
+        &req.cid[..16.min(req.cid.len())], req.prover_addr, reward_uegoc);
+    (StatusCode::OK, Json(ApiResponse {
+        success: true,
+        message: format!("Proof accepted, reward: {} uEGOC", reward_uegoc),
+    }))
+}
+
+/// GET /post/score/:address — PoST stats for an address (active sectors, proved windows, etc.)
+async fn get_post_score(
+    Path(address): Path<String>,
+    State(s): State<AppState>,
+) -> Json<serde_json::Value> {
+    let reg  = s.porep_sectors.read().unwrap();
+    let sectors: Vec<&PoRepSector> = reg.values()
+        .filter(|sec| sec.prover_addr == address)
+        .collect();
+    let active  = sectors.iter().filter(|s| s.status == "active").count();
+    let proved  = sectors.iter().map(|s| s.windows_proved).sum::<u64>();
+    let missed  = sectors.iter().map(|s| s.windows_missed).sum::<u64>();
+    let last    = sectors.iter().filter_map(|s| s.last_proved).max();
+    Json(serde_json::json!({
+        "address":        address,
+        "active_sectors": active,
+        "proved_windows": proved,
+        "fault_count":    missed,
+        "last_proved":    last,
+    }))
+}
+
+/// GET /porep/sectors/:address — list all registered sectors for an address.
+async fn get_porep_sectors(
+    Path(address): Path<String>,
+    State(s): State<AppState>,
+) -> Json<Vec<PoRepSector>> {
+    let reg = s.porep_sectors.read().unwrap();
+    let sectors: Vec<PoRepSector> = reg.values()
+        .filter(|sec| sec.prover_addr == address)
+        .cloned()
+        .collect();
+    Json(sectors)
+}
+
+/// Background task: issue PoST challenges for all active sectors every 30 minutes.
+fn start_post_challenger(state: AppState) {
+    tokio::spawn(async move {
+        // Stagger first run by 5 minutes so it doesn't coincide with startup.
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        let mut interval = tokio::time::interval(
+            std::time::Duration::from_secs(POST_WINDOW_SECS as u64)
+        );
+        loop {
+            interval.tick().await;
+            let now  = chrono::Utc::now().timestamp();
+            let sectors_to_challenge: Vec<PoRepSector> = {
+                let reg = state.porep_sectors.read().unwrap();
+                reg.values()
+                    .filter(|s| s.status == "active" && s.expiry > now)
+                    .filter(|s| s.last_challenged.map(|t| now - t >= POST_WINDOW_SECS).unwrap_or(true))
+                    .cloned()
+                    .collect()
+            };
+            if sectors_to_challenge.is_empty() { continue; }
+
+            let mut chal_map = state.post_challenges.write().unwrap();
+            let mut reg      = state.porep_sectors.write().unwrap();
+            let mut issued   = 0u32;
+
+            for sector in &sectors_to_challenge {
+                // Generate 32-byte random challenge seed.
+                let mut seed = [0u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+
+                let challenge = PostChallenge {
+                    challenge_id:    uuid::Uuid::new_v4().to_string(),
+                    cid:             sector.cid.clone(),
+                    prover_addr:     sector.prover_addr.clone(),
+                    comm_d:          sector.comm_d.clone(),
+                    n_real_leaves:   sector.n_real_leaves,
+                    n_padded_leaves: sector.n_padded_leaves,
+                    challenge_seed:  hex::encode(seed),
+                    issued_at:       now,
+                    deadline:        now + POST_WINDOW_SECS,
+                };
+
+                chal_map
+                    .entry(sector.prover_addr.clone())
+                    .or_default()
+                    .push(challenge);
+
+                // Update last_challenged and detect missed windows.
+                if let Some(sec) = reg.get_mut(&sector.cid) {
+                    if let Some(last_ch) = sec.last_challenged {
+                        if let Some(last_pr) = sec.last_proved {
+                            if last_pr < last_ch {
+                                // Previous challenge was not answered in time.
+                                sec.windows_missed += 1;
+                                if sec.windows_missed as i64 >= POST_FAULT_AFTER_WINDOWS {
+                                    sec.status = "faulted".into();
+                                    println!("[post] Sector {} FAULTED ({}x missed)",
+                                        &sec.cid[..16.min(sec.cid.len())], sec.windows_missed);
+                                }
+                            }
+                        } else {
+                            // Never proved — count as missed if challenged before.
+                            sec.windows_missed += 1;
+                        }
+                    }
+                    sec.last_challenged = Some(now);
+                }
+                issued += 1;
+            }
+            save_post_challenges(&chal_map);
+            save_porep_registry(&reg);
+            if issued > 0 {
+                println!("[post] Issued {} PoST challenge(s)", issued);
+            }
+        }
+    });
+}
+
 /// POST /poc/event — submit a signed Proof of Coverage beacon event.
 async fn post_poc_event(
     State(s): State<AppState>,
@@ -1924,21 +2471,23 @@ async fn main() {
     };
 
     let state = AppState {
-        chain:        Arc::new(RwLock::new(chain_loaded)),
-        peers:        Arc::new(RwLock::new(load_peers())),
-        inbox:        Arc::new(RwLock::new(HashMap::new())),
-        users:        Arc::new(RwLock::new(load_users())),
-        pending:      Arc::new(RwLock::new(Vec::new())),
-        poc_events:   Arc::new(RwLock::new(poc_loaded)),
-        key_registry: Arc::new(RwLock::new(load_key_registry())),
-        shard_pools:   Arc::new(RwLock::new(initial_shard_pools)),
-        cid_registry:  Arc::new(RwLock::new(load_cid_registry())),
-        rl_inbox:      RateLimiter::new(20,  60),
-        rl_cid:        RateLimiter::new(60,  60),
-        rl_register:   RateLimiter::new(5,   60),
-        rl_tx_pending: RateLimiter::new(10,  60),
-        mailer:        Arc::new(mailer),
-        config:       Arc::new(cfg),
+        chain:           Arc::new(RwLock::new(chain_loaded)),
+        peers:           Arc::new(RwLock::new(load_peers())),
+        inbox:           Arc::new(RwLock::new(HashMap::new())),
+        users:           Arc::new(RwLock::new(load_users())),
+        pending:         Arc::new(RwLock::new(Vec::new())),
+        poc_events:      Arc::new(RwLock::new(poc_loaded)),
+        key_registry:    Arc::new(RwLock::new(load_key_registry())),
+        shard_pools:     Arc::new(RwLock::new(initial_shard_pools)),
+        cid_registry:    Arc::new(RwLock::new(load_cid_registry())),
+        porep_sectors:   Arc::new(RwLock::new(load_porep_registry())),
+        post_challenges: Arc::new(RwLock::new(load_post_challenges())),
+        rl_inbox:        RateLimiter::new(20,  60),
+        rl_cid:          RateLimiter::new(60,  60),
+        rl_register:     RateLimiter::new(5,   60),
+        rl_tx_pending:   RateLimiter::new(10,  60),
+        mailer:          Arc::new(mailer),
+        config:          Arc::new(cfg),
     };
     {
         let c   = state.chain.read().unwrap();
@@ -1985,6 +2534,12 @@ async fn main() {
             .route("/shard/:id/files",      get(get_shard_files))
             .route("/shard/:id/cid",        post(post_shard_cid))
             .route("/shard/:id/cid/:cid",   get(get_shard_cid))
+            // ── PoRep / PoST ──
+            .route("/porep/commit",              post(post_porep_commit))
+            .route("/porep/sectors/:address",    get(get_porep_sectors))
+            .route("/post/challenges/:address",  get(get_post_challenges))
+            .route("/post/proof",                post(post_post_proof))
+            .route("/post/score/:address",       get(get_post_score))
             // ── PoC / DRS ──
             .route("/poc/event",            post(post_poc_event))
             .route("/poc/score/:address",   get(get_poc_score))
@@ -2022,6 +2577,10 @@ async fn main() {
             }
         });
     }
+
+    // Start PoST challenger: issues Merkle challenges to registered sectors every 30 min.
+    start_post_challenger(state.clone());
+    println!("[post]  PoST challenger started ({}s window)", POST_WINDOW_SECS);
 
     // Start one block-mining task per shard (runs every SHARD_BLOCK_INTERVAL_SECS).
     start_shard_miners(state.clone());

@@ -1738,6 +1738,7 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
                     key_nonce_hex,
                     local_path:      enc_str,
                     owner:           String::new(),
+                    ..Default::default()
                 });
             }
             let _ = ledger.save();
@@ -1939,6 +1940,92 @@ pub async fn register_cid_on_relay(cid: &str, holder_addr: &str, endpoint: &str)
         .await
     {
         eprintln!("[CID] register error: {}", e);
+    }
+}
+
+/// Register a PoRep commitment on the relay so it can issue PoST challenges.
+/// Called fire-and-forget after store_file succeeds.
+pub async fn register_porep_commitment(
+    cid:            &str,
+    prover_addr:    &str,
+    comm_d:         &str,
+    comm_r:         &str,
+    n_real_leaves:  usize,
+    n_padded_leaves: usize,
+    sector_id:      u64,
+    file_size:      u64,
+    expiry:         i64,
+) {
+    let timestamp = chrono::Utc::now().timestamp();
+    // Sign "cid:comm_d:timestamp" with Ed25519 to prove address ownership.
+    let sign_bytes = format!("{}:{}:{}", cid, comm_d, timestamp).into_bytes();
+    let (sig_hex, pubkey_hex) = {
+        let seed_bytes = match std::fs::read(crate::ledger::seed_path()) {
+            Ok(b) if b.len() == 32 => b,
+            _ => { eprintln!("[PoRep] register: seed not available"); return; }
+        };
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&seed_bytes);
+        let kp = match ego_core::KeyPair::from_bytes(&seed) {
+            Ok(k) => k,
+            Err(e) => { eprintln!("[PoRep] register: keypair error: {e}"); return; }
+        };
+        let sig = kp.sign_ed25519(&sign_bytes);
+        let pk  = hex::encode(kp.ed25519_public_key().as_bytes());
+        (hex::encode(sig.as_bytes()), pk)
+    };
+
+    let payload = serde_json::json!({
+        "cid":             cid,
+        "prover_addr":     prover_addr,
+        "comm_d":          comm_d,
+        "comm_r":          comm_r,
+        "n_real_leaves":   n_real_leaves,
+        "n_padded_leaves": n_padded_leaves,
+        "sector_id":       sector_id,
+        "file_size":       file_size,
+        "expiry":          expiry,
+        "timestamp":       timestamp,
+        "signature":       sig_hex,
+        "public_key":      pubkey_hex,
+    });
+
+    let client = reqwest::Client::new();
+    match client
+        .post(format!("{}/porep/commit", RELAY_HTTP_API))
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() =>
+            eprintln!("[PoRep] ✓ Commitment registered for {}", &cid[..16.min(cid.len())]),
+        Ok(r) =>
+            eprintln!("[PoRep] register rejected: {}", r.status()),
+        Err(e) =>
+            eprintln!("[PoRep] register error: {e}"),
+    }
+}
+
+/// Fetch pending PoST challenges from the relay for this address.
+pub async fn fetch_post_challenges(prover_addr: &str) -> Vec<serde_json::Value> {
+    let url = format!("{}/post/challenges/{}", RELAY_HTTP_API, prover_addr);
+    match reqwest::get(&url).await {
+        Ok(r)  => r.json::<Vec<serde_json::Value>>().await.unwrap_or_default(),
+        Err(e) => { eprintln!("[PoST] fetch challenges error: {e}"); vec![] }
+    }
+}
+
+/// Submit PoST proofs to the relay in response to a challenge.
+pub async fn submit_post_proof(payload: serde_json::Value) -> bool {
+    let client = reqwest::Client::new();
+    match client
+        .post(format!("{}/post/proof", RELAY_HTTP_API))
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(r) => r.status().is_success(),
+        Err(e) => { eprintln!("[PoST] submit proof error: {e}"); false }
     }
 }
 

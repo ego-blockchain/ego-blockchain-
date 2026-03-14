@@ -8,3 +8,4 @@ pub mod staking;
 pub mod explorer;
 pub mod notifications;
 pub mod messenger;
+pub mod consensus;

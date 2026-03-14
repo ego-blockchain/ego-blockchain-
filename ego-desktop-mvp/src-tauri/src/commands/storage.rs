@@ -112,18 +112,37 @@ pub async fn store_file(
 
     let mut ledger = Ledger::load();
 
+    // Compute PoRep commitment over the encrypted bytes (what's on disk).
+    // This is the cryptographic proof that the file was replicated, binding
+    // the prover's address and CID to the actual stored data.
+    let porep = crate::proof::compute_porep_commitment(&on_disk, &ledger.address, &cid);
+
+    // Assign a monotonically-increasing sector ID from the ledger.
+    let sector_id = ledger.stored_files
+        .iter()
+        .filter_map(|f| if f.sector_id > 0 { Some(f.sector_id) } else { None })
+        .max()
+        .unwrap_or(0) + 1;
+
     let stored = StoredFile {
-        cid:            cid.clone(),
-        name:           file_name.clone(),
+        cid:              cid.clone(),
+        name:             file_name.clone(),
         original_size,
         encrypted_size,
-        duration_months: request.duration_months,
-        stored_at:      now,
+        duration_months:  request.duration_months,
+        stored_at:        now,
         expiry,
-        status:         "Active".into(),
-        key_nonce_hex:  key_nonce_hex.clone(),
-        local_path:     storage_path.to_string_lossy().into(),
-        owner:          ledger.address.clone(),
+        status:           "Active".into(),
+        key_nonce_hex:    key_nonce_hex.clone(),
+        local_path:       storage_path.to_string_lossy().into(),
+        owner:            ledger.address.clone(),
+        comm_d:           hex::encode(porep.comm_d),
+        comm_r:           hex::encode(porep.comm_r),
+        sector_id,
+        n_real_leaves:    porep.n_real_leaves,
+        n_padded_leaves:  porep.n_padded_leaves,
+        post_status:      String::new(), // will become "registered" after relay ACKs
+        last_proved:      None,
     };
     // Deduct storage cost from the shared chain (authoritative balance).
     let mut chain = load_chain();
@@ -159,16 +178,28 @@ pub async fn store_file(
     ledger.stored_files.insert(0, stored);
     ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save ledger: {e}")))?;
 
-    // Register this CID on the relay shard so any peer can discover us as a holder,
-    // even if they don't have us as a contact. Fire-and-forget — doesn't block return.
+    // Register this CID on the relay shard so any peer can discover us as a holder.
+    // Also register the PoRep commitment so the relay can issue PoST challenges.
     {
-        let cid2  = cid.clone();
-        let addr2 = ledger.address.clone();
+        let cid2    = cid.clone();
+        let addr2   = ledger.address.clone();
+        let comm_d2 = hex::encode(porep.comm_d);
+        let comm_r2 = hex::encode(porep.comm_r);
+        let n_real2   = porep.n_real_leaves;
+        let n_padded2 = porep.n_padded_leaves;
+        let sec_id2   = sector_id;
+        let expiry2   = expiry;
+        let file_size2 = encrypted_size;
         tokio::spawn(async move {
             let endpoint = crate::p2p::get_public_endpoint().await;
             if !endpoint.is_empty() {
                 crate::p2p::register_cid_on_relay(&cid2, &addr2, &endpoint).await;
             }
+            // Register PoRep commitment — enables relay to issue PoST challenges.
+            crate::p2p::register_porep_commitment(
+                &cid2, &addr2, &comm_d2, &comm_r2,
+                n_real2, n_padded2, sec_id2, file_size2, expiry2,
+            ).await;
         });
     }
 
