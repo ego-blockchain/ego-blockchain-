@@ -240,7 +240,7 @@ pub struct CombinedDrsScore {
     /// Local staked amount (uEGOC) — from ledger, not relay.
     pub staked_uegoc:   u64,
     pub validator_rank: Option<usize>,
-    /// True when combined_score ≥ 0.5 AND staked ≥ 1 000 EGOC.
+    /// True when combined_score ≥ 0.5 (PoC + PoST performance). Staking is not required.
     pub is_eligible:    bool,
 }
 
@@ -276,9 +276,8 @@ pub async fn get_combined_drs() -> Result<CombinedDrsScore, EgoDesktopError> {
     let post_windows   = post_json["proved_windows"].as_u64().unwrap_or(0);
     let post_faults    = post_json["fault_count"].as_u64().unwrap_or(0);
 
-    const MIN_DRS:   f64 = 0.5;
-    const MIN_STAKE: u64 = 1_000_000_000; // 1 000 EGOC
-    let is_eligible = combined_score >= MIN_DRS && staked_uegoc >= MIN_STAKE;
+    const MIN_DRS: f64 = 0.5;
+    let is_eligible = combined_score >= MIN_DRS;
 
     Ok(CombinedDrsScore {
         address: addr,

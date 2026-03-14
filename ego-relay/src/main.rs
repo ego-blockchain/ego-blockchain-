@@ -464,8 +464,6 @@ const POOL_ECOSYSTEM_UEGOC:       u64 = 100_000_000_000_000; // 10 % — ecosyst
 const INITIAL_BLOCK_REWARD_UEGOC: u64 = 50_000_000;          // 50 EGOC
 /// Halving every 2.1 M blocks per shard (≈ 2 years at ~30 s target block time).
 const HALVING_INTERVAL:           u64 = 2_100_000;
-/// Minimum stake (uEGOC) required for a miner to propose blocks (1 000 EGOC).
-const MIN_STAKE_UEGOC:            u64 = 1_000_000_000;
 /// Minimum combined DRS required for block-mining eligibility.
 const MIN_DRS:                    f64 = 0.5;
 
@@ -1077,10 +1075,11 @@ async fn post_block(
     State(s): State<AppState>,
     Json(block): Json<LedgerBlock>,
 ) -> StatusCode {
-    // ── Combined DRS + Stake gate ─────────────────────────────────────────────
+    // ── DRS gate ──────────────────────────────────────────────────────────────
     // After bootstrap (≥ POC_BOOTSTRAP_THRESHOLD active PoC validators) a miner
-    // must have combined_DRS ≥ MIN_DRS AND staked ≥ MIN_STAKE_UEGOC.
-    // Below that threshold any miner is accepted so the network can bootstrap.
+    // must have combined_DRS ≥ MIN_DRS, driven by PoC + PoST performance.
+    // Staking is NOT a hard requirement — it contributes 20% to DRS score
+    // (more stake = higher DRS = larger reward share) but does not block mining.
     {
         let poc   = s.poc_events.read().unwrap();
         let unique_validators = poc.iter()
@@ -1091,21 +1090,9 @@ async fn post_block(
             let porep = s.porep_sectors.read().unwrap();
             let stake = s.stake_registry.read().unwrap();
             let drs = compute_combined_drs(&block.miner, &poc, &porep, &stake);
-            let combined = drs.combined;
-            let miner_stake = stake.get(&block.miner)
-                .map(|r| r.amount_uegoc)
-                .unwrap_or(0);
-            // Stake gate: only enforce when at least one validator has registered stake
-            // (prevents a cold-start deadlock if no one has staked yet).
-            let stake_gate_active = stake.values().any(|r| r.amount_uegoc >= MIN_STAKE_UEGOC);
-            if combined < MIN_DRS {
+            if drs.combined < MIN_DRS {
                 println!("[chain] Rejected block #{} from {}: DRS {:.4} < {:.2} (validators={})",
-                    block.height, block.miner, combined, MIN_DRS, unique_validators);
-                return StatusCode::FORBIDDEN;
-            }
-            if stake_gate_active && miner_stake < MIN_STAKE_UEGOC {
-                println!("[chain] Rejected block #{} from {}: stake {} < {} uEGOC",
-                    block.height, block.miner, miner_stake, MIN_STAKE_UEGOC);
+                    block.height, block.miner, drs.combined, MIN_DRS, unique_validators);
                 return StatusCode::FORBIDDEN;
             }
         }
@@ -2706,11 +2693,10 @@ async fn get_tokenomics(State(s): State<AppState>) -> Json<serde_json::Value> {
             "total_staked_uegoc":  total_staked,
             "total_staked_egoc":   total_staked as f64 / 1_000_000.0,
             "active_stakers":      active_stakers,
-            "min_stake_uegoc":     MIN_STAKE_UEGOC,
-            "min_stake_egoc":      MIN_STAKE_UEGOC as f64 / 1_000_000.0,
         },
         "drs": {
             "min_drs_to_mine":  MIN_DRS,
+            "note": "Staking is not required to mine — it boosts DRS (20% weight) for higher reward share",
             "weights": { "poc": 0.40, "post": 0.40, "stake": 0.20 },
         },
     }))

@@ -94,7 +94,6 @@ interface Tokenomics {
   staking: {
     total_staked_egoc: number;
     active_stakers:    number;
-    min_stake_egoc:    number;
   };
   drs: {
     min_drs_to_mine: number;
@@ -405,7 +404,7 @@ const ExplorerPage: React.FC = () => {
                   <div className="space-y-2 text-sm">
                     <div className="flex justify-between"><span className="text-gray-400">Total Staked</span><span className="text-orange-400 font-mono">{tokenomics.staking.total_staked_egoc.toLocaleString(undefined,{maximumFractionDigits:0})} EGOC</span></div>
                     <div className="flex justify-between"><span className="text-gray-400">Active Stakers</span><span className="font-mono">{tokenomics.staking.active_stakers}</span></div>
-                    <div className="flex justify-between"><span className="text-gray-400">Min to Mine</span><span className="font-mono">{tokenomics.staking.min_stake_egoc.toLocaleString()} EGOC</span></div>
+                    <div className="flex justify-between text-xs"><span className="text-gray-500">Staking boosts DRS (optional)</span></div>
                   </div>
                 </div>
                 <div className="bg-gray-900 rounded-xl p-4 border border-gray-700/50">

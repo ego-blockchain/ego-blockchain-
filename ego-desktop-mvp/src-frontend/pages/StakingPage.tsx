@@ -39,7 +39,6 @@ interface Tokenomics {
   staking: {
     total_staked_egoc: number;
     active_stakers:    number;
-    min_stake_egoc:    number;
   };
 }
 
@@ -382,21 +381,21 @@ const StakingPage: React.FC = () => {
                   />
                 </div>
               </div>
-              {/* Stake requirement */}
+              {/* Stake — optional boost */}
               <div>
                 <div className="flex justify-between text-xs text-gray-400 mb-1">
-                  <span>Stake (min {MIN_STAKE_EGOC} EGOC)</span>
-                  <span className={hasStake && (info?.staked_amount ?? 0) >= MIN_STAKE_EGOC * 1_000_000 ? 'text-green-400' : 'text-yellow-400'}>
-                    {fmtEgoc(info?.staked_amount ?? 0)} EGOC
-                    {hasStake && (info?.staked_amount ?? 0) >= MIN_STAKE_EGOC * 1_000_000 ? ' ✓' : ''}
+                  <span>Stake <span className="text-purple-400">(boosts DRS +20%)</span></span>
+                  <span className={hasStake ? 'text-purple-400' : 'text-gray-500'}>
+                    {fmtEgoc(info?.staked_amount ?? 0)} EGOC{hasStake ? ' ✓' : ''}
                   </span>
                 </div>
                 <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
                   <div
-                    className={`h-full rounded-full ${(info?.staked_amount ?? 0) >= MIN_STAKE_EGOC * 1_000_000 ? 'bg-green-500' : 'bg-yellow-500'}`}
+                    className="h-full rounded-full bg-purple-500"
                     style={{ width: `${Math.min(100, ((info?.staked_amount ?? 0) / (MIN_STAKE_EGOC * 1_000_000)) * 100)}%` }}
                   />
                 </div>
+                <p className="text-xs text-gray-500 mt-1">Staking is optional — more stake = higher DRS = larger reward share</p>
               </div>
               {/* Result pill */}
               <div className={`mt-1 rounded-xl p-3 text-center text-sm font-semibold ${
