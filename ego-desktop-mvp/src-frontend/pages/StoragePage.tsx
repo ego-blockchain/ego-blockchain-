@@ -25,6 +25,27 @@ interface StoredFile {
   status: string;
   key_nonce_hex: string;
   local_path: string;
+  // PoRep / PoST fields
+  comm_d?: string;
+  sector_id?: number;
+  post_status?: string;   // "" | "registered" | "challenged" | "proved" | "faulted"
+  last_proved?: number | null;
+}
+
+function postBadge(f: StoredFile) {
+  if (!f.comm_d) return null; // no PoRep commitment yet
+  const s = f.post_status ?? '';
+  if (s === 'proved')     return <span className="text-xs px-1.5 py-0.5 rounded bg-green-500/15 text-green-400 font-medium">✓ Proved</span>;
+  if (s === 'faulted')    return <span className="text-xs px-1.5 py-0.5 rounded bg-red-500/15 text-red-400 font-medium">⚠ Faulted</span>;
+  if (s === 'challenged') return <span className="text-xs px-1.5 py-0.5 rounded bg-yellow-500/15 text-yellow-400 font-medium">⏳ Challenged</span>;
+  return <span className="text-xs px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-400 font-medium">PoRep ✓</span>;
+}
+
+function timeAgo(ts: number) {
+  const diff = Math.floor(Date.now() / 1000 - ts);
+  if (diff < 60)   return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  return `${Math.floor(diff / 3600)}h ago`;
 }
 
 interface StoreFileResult {
@@ -469,6 +490,7 @@ const StoragePage: React.FC = () => {
                         file.status === 'Received' ? 'bg-blue-500/20 text-blue-400' :
                                                      'bg-red-500/20 text-red-400'
                       }`}>{file.status}</span>
+                      {postBadge(file)}
                     </div>
                     {/* Network ID = CID (node sees only this, not the name) */}
                     <div className="text-xs text-gray-600 mb-1">
@@ -598,6 +620,33 @@ const StoragePage: React.FC = () => {
                 </div>
               ))}
             </div>
+
+            {/* PoRep / PoST proof status */}
+            {selectedFile.comm_d && (
+              <div className="mb-4 bg-gray-900 rounded-xl p-4 space-y-2">
+                <div className="text-xs font-semibold text-gray-300 mb-2">Proof of Replication / Space-Time</div>
+                <div className="grid grid-cols-2 gap-2 text-xs">
+                  <div>
+                    <div className="text-gray-500 mb-0.5">Sector ID</div>
+                    <div className="font-mono text-gray-300">#{selectedFile.sector_id ?? 0}</div>
+                  </div>
+                  <div>
+                    <div className="text-gray-500 mb-0.5">PoST Status</div>
+                    <div>{postBadge(selectedFile) ?? <span className="text-gray-500">—</span>}</div>
+                  </div>
+                  <div>
+                    <div className="text-gray-500 mb-0.5">comm_d (Merkle root)</div>
+                    <div className="font-mono text-green-400 break-all">{selectedFile.comm_d.slice(0, 16)}…</div>
+                  </div>
+                  <div>
+                    <div className="text-gray-500 mb-0.5">Last Proved</div>
+                    <div className="text-gray-300">
+                      {selectedFile.last_proved ? timeAgo(selectedFile.last_proved) : '—'}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
 
             <div className="mb-3">
               <div className="text-xs text-gray-400 mb-1">Network CID</div>

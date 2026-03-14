@@ -18,6 +18,31 @@ interface StakingInfo {
 interface Balance { uegoc: number; formatted: string; }
 interface Peer { address: string; name: string; endpoint: string; last_seen: number; }
 
+interface CombinedDrs {
+  combined_score: number;
+  staked_uegoc:   number;
+  validator_rank: number | null;
+  is_eligible:    boolean;
+  poc_events_24h: number;
+  post_sectors:   number;
+}
+
+interface Tokenomics {
+  total_supply_egoc:  number;
+  circulating_egoc:   number;
+  circulating_pct:    number;
+  halving: {
+    era:                    number;
+    current_reward_egoc:    number;
+    blocks_to_next_halving: number;
+  };
+  staking: {
+    total_staked_egoc: number;
+    active_stakers:    number;
+    min_stake_egoc:    number;
+  };
+}
+
 const APR = 12.5;
 const LOCK_OPTIONS = [
   { days: 30,  bonus: '0%',   label: '30 days'  },
@@ -44,12 +69,16 @@ function daysUntil(ts: number | null): number {
   return Math.max(0, Math.ceil((ts - Date.now() / 1000) / 86400));
 }
 
+const MIN_STAKE_EGOC = 1000;
+
 const StakingPage: React.FC = () => {
   const { wallet } = useWallet();
   const { confirm, ConfirmDialog } = useConfirm();
   const [info, setInfo]           = useState<StakingInfo | null>(null);
   const [balance, setBalance]     = useState<Balance | null>(null);
   const [peers, setPeers]         = useState<Peer[]>([]);
+  const [drs, setDrs]             = useState<CombinedDrs | null>(null);
+  const [tokenomics, setTokenomics] = useState<Tokenomics | null>(null);
   const [stakeAmount, setStakeAmount] = useState('');
   const [lockDays, setLockDays]   = useState(30);
   const [mode, setMode]           = useState<'stake' | 'unstake'>('stake');
@@ -67,6 +96,8 @@ const StakingPage: React.FC = () => {
       setBalance(b);
       setPeers(ps);
     } catch {}
+    invoke<CombinedDrs>('get_combined_drs').then(setDrs).catch(() => {});
+    invoke<Tokenomics>('get_tokenomics').then(setTokenomics).catch(() => {});
   }, []);
 
   useEffect(() => { load(); }, [load, wallet?.address]);
@@ -329,41 +360,100 @@ const StakingPage: React.FC = () => {
           )}
         </div>
 
-        {/* Info cards */}
+        {/* Right-column cards */}
         <div className="col-span-2 space-y-4">
+
+          {/* Mining eligibility */}
           <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
-            <h3 className="font-semibold mb-4">How Staking Works</h3>
-            <div className="space-y-3 text-sm text-gray-300">
-              <div className="flex gap-2.5"><span className="text-lg shrink-0">🔒</span><span>Lock EGOC to earn staking rewards + governance rights</span></div>
-              <div className="flex gap-2.5"><span className="text-lg shrink-0">📈</span><span>Rewards are locked for 30 days and earn 20% simple interest</span></div>
-              <div className="flex gap-2.5"><span className="text-lg shrink-0">⚡</span><span>Stakers get free contract deploys up to the epoch quota</span></div>
-              <div className="flex gap-2.5"><span className="text-lg shrink-0">🛡️</span><span>Higher stake → better DRS multiplier → more emissions</span></div>
+            <h3 className="font-semibold mb-4">Mining Eligibility</h3>
+            <div className="space-y-3">
+              {/* DRS score */}
+              <div>
+                <div className="flex justify-between text-xs text-gray-400 mb-1">
+                  <span>Combined DRS</span>
+                  <span className={drs && drs.combined_score >= 0.5 ? 'text-green-400' : 'text-red-400'}>
+                    {drs ? drs.combined_score.toFixed(3) : '—'} {drs && drs.combined_score >= 0.5 ? '✓' : '< 0.5 required'}
+                  </span>
+                </div>
+                <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                  <div
+                    className={`h-full rounded-full ${drs && drs.combined_score >= 0.5 ? 'bg-green-500' : 'bg-red-500'}`}
+                    style={{ width: `${Math.min(100, ((drs?.combined_score ?? 0) / 5) * 100)}%` }}
+                  />
+                </div>
+              </div>
+              {/* Stake requirement */}
+              <div>
+                <div className="flex justify-between text-xs text-gray-400 mb-1">
+                  <span>Stake (min {MIN_STAKE_EGOC} EGOC)</span>
+                  <span className={hasStake && (info?.staked_amount ?? 0) >= MIN_STAKE_EGOC * 1_000_000 ? 'text-green-400' : 'text-yellow-400'}>
+                    {fmtEgoc(info?.staked_amount ?? 0)} EGOC
+                    {hasStake && (info?.staked_amount ?? 0) >= MIN_STAKE_EGOC * 1_000_000 ? ' ✓' : ''}
+                  </span>
+                </div>
+                <div className="h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                  <div
+                    className={`h-full rounded-full ${(info?.staked_amount ?? 0) >= MIN_STAKE_EGOC * 1_000_000 ? 'bg-green-500' : 'bg-yellow-500'}`}
+                    style={{ width: `${Math.min(100, ((info?.staked_amount ?? 0) / (MIN_STAKE_EGOC * 1_000_000)) * 100)}%` }}
+                  />
+                </div>
+              </div>
+              {/* Result pill */}
+              <div className={`mt-1 rounded-xl p-3 text-center text-sm font-semibold ${
+                drs?.is_eligible
+                  ? 'bg-green-500/15 border border-green-500/30 text-green-400'
+                  : 'bg-gray-700/50 border border-gray-600/30 text-gray-400'
+              }`}>
+                {drs?.is_eligible ? '✅ Eligible to mine blocks' : '⏳ Not yet eligible to mine'}
+              </div>
+              {drs?.validator_rank != null && (
+                <div className="text-center text-xs text-purple-400">
+                  Validator rank #{drs.validator_rank}
+                </div>
+              )}
             </div>
           </div>
 
+          {/* Tokenomics snapshot */}
           <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="font-semibold">Active Network Nodes</h3>
-              <span className="text-xs text-gray-400">{peers.length} online</span>
-            </div>
-            {peers.length === 0 ? (
-              <div className="text-center py-6 text-gray-500 text-sm">
-                <div className="text-2xl mb-2">📡</div>
-                No peers online right now
+            <h3 className="font-semibold mb-4">EGOC Tokenomics</h3>
+            {tokenomics ? (
+              <div className="space-y-3 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-gray-400">Total supply</span>
+                  <span className="font-mono">{tokenomics.total_supply_egoc.toLocaleString()} EGOC</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-400">Circulating</span>
+                  <span className="font-mono text-green-400">
+                    {tokenomics.circulating_egoc.toLocaleString(undefined, { maximumFractionDigits: 0 })} EGOC
+                    <span className="text-gray-500 ml-1">({tokenomics.circulating_pct}%)</span>
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-400">Block reward</span>
+                  <span className="font-mono text-yellow-400">
+                    {tokenomics.halving.current_reward_egoc} EGOC
+                    <span className="text-gray-500 ml-1">(era {tokenomics.halving.era})</span>
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-400">Next halving</span>
+                  <span className="font-mono text-blue-400">
+                    {tokenomics.halving.blocks_to_next_halving.toLocaleString()} blocks
+                  </span>
+                </div>
+                <div className="border-t border-gray-700 pt-3 flex justify-between">
+                  <span className="text-gray-400">Network staked</span>
+                  <span className="font-mono text-orange-400">
+                    {tokenomics.staking.total_staked_egoc.toLocaleString(undefined, { maximumFractionDigits: 0 })} EGOC
+                    <span className="text-gray-500 ml-1">({tokenomics.staking.active_stakers} stakers)</span>
+                  </span>
+                </div>
               </div>
             ) : (
-              <div className="space-y-2 max-h-48 overflow-y-auto">
-                {peers.map(p => (
-                  <div key={p.address} className="flex items-center justify-between bg-gray-900 rounded-xl p-3 text-sm">
-                    <div className="min-w-0">
-                      <div className="font-medium truncate">{p.name || 'Ego Node'}</div>
-                      <div className="text-xs text-gray-500 font-mono">{p.address.slice(0, 12)}…{p.address.slice(-6)}</div>
-                    </div>
-                    <div className="text-right shrink-0">
-                      <div className="text-xs text-green-500 font-medium">● Active</div>
-                    </div>
-                  </div>
-                ))}
+              <div className="text-center text-sm text-gray-500 py-4">
+                <div className="animate-pulse">Loading tokenomics…</div>
               </div>
             )}
           </div>

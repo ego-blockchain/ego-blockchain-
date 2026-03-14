@@ -2029,6 +2029,50 @@ pub async fn submit_post_proof(payload: serde_json::Value) -> bool {
     }
 }
 
+/// After staking or unstaking, call this to update the relay's stake registry
+/// so the combined DRS score reflects the new stake amount immediately.
+/// Signs "stake:{address}:{amount_uegoc}:{timestamp}" with Ed25519.
+pub async fn report_stake_to_relay(address: &str, amount_uegoc: u64) {
+    let timestamp = chrono::Utc::now().timestamp();
+    let sign_bytes = format!("stake:{}:{}:{}", address, amount_uegoc, timestamp).into_bytes();
+
+    let seed_bytes = match std::fs::read(crate::ledger::seed_path()) {
+        Ok(b) if b.len() == 32 => b,
+        _ => { eprintln!("[stake] seed not available, skipping relay update"); return; }
+    };
+    let mut seed_arr = [0u8; 32];
+    seed_arr.copy_from_slice(&seed_bytes);
+    let kp = match ego_core::KeyPair::from_bytes(&seed_arr) {
+        Ok(k)  => k,
+        Err(e) => { eprintln!("[stake] keypair error: {e}"); return; }
+    };
+    let sig_hex    = hex::encode(kp.sign_ed25519(&sign_bytes).as_bytes());
+    let pubkey_hex = hex::encode(kp.ed25519_public_key().as_bytes());
+
+    let payload = serde_json::json!({
+        "address":      address,
+        "amount_uegoc": amount_uegoc,
+        "timestamp":    timestamp,
+        "signature":    sig_hex,
+        "public_key":   pubkey_hex,
+    });
+
+    let client = reqwest::Client::new();
+    match client
+        .post(format!("{}/stake/update", RELAY_HTTP_API))
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() =>
+            println!("[stake] Reported to relay: {} → {} uEGOC", address, amount_uegoc),
+        Ok(r) =>
+            eprintln!("[stake] Relay rejected stake update: {}", r.status()),
+        Err(e) =>
+            eprintln!("[stake] stake update error: {e}"),
+    }
+}
+
 /// Query the relay shard registry to find who holds a CID.
 /// Returns a list of holders so the requester can pick the best one.
 pub async fn find_cid_holders(cid: &str) -> Vec<CidHolder> {

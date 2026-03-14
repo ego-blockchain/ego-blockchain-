@@ -90,12 +90,32 @@ interface P2pStatus {
   public_endpoint: string;
 }
 
+interface CombinedDrs {
+  address:        string;
+  combined_score: number;
+  poc_events_24h: number;
+  poc_total:      number;
+  post_sectors:   number;
+  post_windows:   number;
+  post_faults:    number;
+  staked_uegoc:   number;
+  validator_rank: number | null;
+  is_eligible:    boolean;
+}
+
+function drsColor(score: number) {
+  if (score >= 2)   return 'text-green-400';
+  if (score >= 0.5) return 'text-yellow-400';
+  return 'text-red-400';
+}
+
 const CoveragePage: React.FC = () => {
   const [coverage,   setCoverage]   = useState<CoverageStatus | null>(null);
   const [events,     setEvents]     = useState<PocEvent[]>([]);
   const [peers,      setPeers]      = useState<PeerInfo[]>([]);
   const eventLogRef = useRef<HTMLDivElement>(null);
   const [p2pStatus,  setP2pStatus]  = useState<P2pStatus | null>(null);
+  const [drs,        setDrs]        = useState<CombinedDrs | null>(null);
   const [loading,    setLoading]    = useState(true);
 
   useEffect(() => {
@@ -112,10 +132,14 @@ const CoveragePage: React.FC = () => {
     invoke<P2pStatus>('get_p2p_status')
       .then(setP2pStatus)
       .catch(() => {});
-    // Refresh peers every 30 s
+    invoke<CombinedDrs>('get_combined_drs')
+      .then(setDrs)
+      .catch(() => {});
+    // Refresh peers + DRS every 60 s
     const t = setInterval(() => {
       invoke<PeerInfo[]>('get_network_peers').then(setPeers).catch(() => {});
-    }, 30_000);
+      invoke<CombinedDrs>('get_combined_drs').then(setDrs).catch(() => {});
+    }, 60_000);
     return () => clearInterval(t);
   }, []);
 
@@ -218,6 +242,108 @@ const CoveragePage: React.FC = () => {
             <div className={`text-xl font-bold ${c.color}`}>{c.val}</div>
           </div>
         ))}
+      </div>
+
+      {/* DRS Breakdown */}
+      <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="font-semibold">Dynamic Reputation Score</h3>
+          <div className="flex items-center gap-2">
+            {drs?.validator_rank != null && (
+              <span className="text-xs bg-purple-500/20 text-purple-400 px-2.5 py-0.5 rounded-full font-medium">
+                Rank #{drs.validator_rank}
+              </span>
+            )}
+            <span className={`text-xs px-2.5 py-0.5 rounded-full font-semibold ${
+              drs?.is_eligible
+                ? 'bg-green-500/20 text-green-400'
+                : (drs?.combined_score ?? 0) >= 0.5
+                  ? 'bg-yellow-500/20 text-yellow-400'
+                  : 'bg-gray-600/30 text-gray-400'
+            }`}>
+              {drs?.is_eligible ? '✓ Mining Eligible' : (drs?.combined_score ?? 0) >= 0.5 ? '◑ Validator' : 'Building Score'}
+            </span>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-4 gap-4">
+          {/* Big score */}
+          <div className="col-span-1 flex flex-col justify-center">
+            <div className={`text-5xl font-black tabular-nums ${drsColor(drs?.combined_score ?? 0)}`}>
+              {(drs?.combined_score ?? 0).toFixed(2)}
+            </div>
+            <div className="text-xs text-gray-500 mt-1">combined DRS</div>
+            <div className="mt-3 h-1.5 bg-gray-700 rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all ${drsColor(drs?.combined_score ?? 0).replace('text-', 'bg-')}`}
+                style={{ width: `${Math.min(100, ((drs?.combined_score ?? 0) / 5) * 100)}%` }}
+              />
+            </div>
+            <div className="text-xs text-gray-600 mt-1">0 — 5+ scale</div>
+          </div>
+
+          {/* Three signal columns */}
+          <div className="col-span-3 grid grid-cols-3 gap-3">
+            {/* PoC */}
+            <div className="bg-gray-900 rounded-xl p-4 border border-gray-700/50">
+              <div className="text-xs text-gray-400 mb-2 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-blue-500 inline-block"/>
+                PoC Coverage <span className="text-gray-600">(40%)</span>
+              </div>
+              <div className="text-2xl font-bold text-blue-400">{drs?.poc_events_24h ?? 0}</div>
+              <div className="text-xs text-gray-500">events / 24 h</div>
+              <div className="mt-2 text-xs text-gray-500">
+                {drs?.poc_total ?? 0} total events
+              </div>
+            </div>
+            {/* PoST */}
+            <div className="bg-gray-900 rounded-xl p-4 border border-gray-700/50">
+              <div className="text-xs text-gray-400 mb-2 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-purple-500 inline-block"/>
+                PoST Storage <span className="text-gray-600">(40%)</span>
+              </div>
+              <div className="text-2xl font-bold text-purple-400">{drs?.post_sectors ?? 0}</div>
+              <div className="text-xs text-gray-500">active sectors</div>
+              <div className="mt-2 text-xs text-gray-500">
+                {drs?.post_windows ?? 0} windows proved
+                {(drs?.post_faults ?? 0) > 0 && (
+                  <span className="text-red-400 ml-1">· {drs!.post_faults} faults</span>
+                )}
+              </div>
+            </div>
+            {/* Stake */}
+            <div className="bg-gray-900 rounded-xl p-4 border border-gray-700/50">
+              <div className="text-xs text-gray-400 mb-2 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-orange-500 inline-block"/>
+                Stake Weight <span className="text-gray-600">(20%)</span>
+              </div>
+              <div className="text-2xl font-bold text-orange-400">
+                {drs ? (drs.staked_uegoc / 1_000_000).toLocaleString(undefined, { maximumFractionDigits: 0 }) : 0}
+              </div>
+              <div className="text-xs text-gray-500">EGOC staked</div>
+              <div className="mt-2">
+                <div className="h-1 bg-gray-700 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-orange-500 rounded-full"
+                    style={{ width: `${Math.min(100, ((drs?.staked_uegoc ?? 0) / 1_000_000_000) * 100)}%` }}
+                  />
+                </div>
+                <div className="text-xs text-gray-600 mt-0.5">min 1 000 EGOC to mine</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {!drs?.is_eligible && (
+          <div className="mt-4 bg-gray-900 rounded-xl p-3 text-xs text-gray-400 space-y-1">
+            {(drs?.combined_score ?? 0) < 0.5 && (
+              <div>• DRS {(drs?.combined_score ?? 0).toFixed(3)} &lt; 0.5 — send more PoC beacons, store files, or increase stake</div>
+            )}
+            {(drs?.staked_uegoc ?? 0) < 1_000_000_000 && (
+              <div>• Stake {(1000 - (drs?.staked_uegoc ?? 0) / 1_000_000).toFixed(0)} more EGOC to meet the 1 000 EGOC mining minimum</div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Live network peers */}

@@ -121,6 +121,10 @@ pub async fn stake_coins(
     ledger.nonce            = nonce;
     ledger.save().map_err(EgoDesktopError::FileSystemError)?;
 
+    // Notify relay so it can update the DRS stake component immediately.
+    let addr2 = from.clone();
+    tokio::spawn(async move { crate::p2p::report_stake_to_relay(&addr2, amount_uegoc).await; });
+
     Ok(())
 }
 
@@ -224,6 +228,8 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
         ledger.unstake_at      = None;
         ledger.nonce           = ledger.nonce + 2;
         ledger.save().map_err(EgoDesktopError::FileSystemError)?;
+        let addr2 = from.clone();
+        tokio::spawn(async move { crate::p2p::report_stake_to_relay(&addr2, 0).await; });
     } else {
         // Normal unstake (lock expired): return full amount
         let nonce      = ledger.nonce + 1;
@@ -263,6 +269,8 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
         ledger.unstake_at      = None;
         ledger.nonce           = nonce;
         ledger.save().map_err(EgoDesktopError::FileSystemError)?;
+        let addr2 = from.clone();
+        tokio::spawn(async move { crate::p2p::report_stake_to_relay(&addr2, 0).await; });
     }
 
     Ok(())

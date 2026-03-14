@@ -223,6 +223,90 @@ pub async fn get_post_score() -> Result<PostScore, EgoDesktopError> {
     }
 }
 
+// ── get_combined_drs ──────────────────────────────────────────────────────────
+
+/// Full DRS picture: combined score + all three raw signals.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CombinedDrsScore {
+    pub address:        String,
+    pub combined_score: f64,
+    /// PoC events submitted in the last 24 h.
+    pub poc_events_24h: u32,
+    pub poc_total:      u64,
+    /// Active PoST sectors on the relay.
+    pub post_sectors:   u32,
+    pub post_windows:   u64,
+    pub post_faults:    u64,
+    /// Local staked amount (uEGOC) — from ledger, not relay.
+    pub staked_uegoc:   u64,
+    pub validator_rank: Option<usize>,
+    /// True when combined_score ≥ 0.5 AND staked ≥ 1 000 EGOC.
+    pub is_eligible:    bool,
+}
+
+/// Fetch the combined DRS score for this wallet by querying the relay.
+/// Merges `/poc/score/:addr` + `/post/score/:addr` + local ledger stake.
+#[tauri::command]
+pub async fn get_combined_drs() -> Result<CombinedDrsScore, EgoDesktopError> {
+    let ledger = Ledger::load();
+    let addr   = ledger.address.clone();
+    if addr.is_empty() {
+        return Ok(CombinedDrsScore::default());
+    }
+    let staked_uegoc = ledger.staked_amount;
+
+    let poc_url  = format!("{}/poc/score/{}", crate::p2p::RELAY_HTTP_API, addr);
+    let post_url = format!("{}/post/score/{}", crate::p2p::RELAY_HTTP_API, addr);
+    let (poc_r, post_r) = tokio::join!(reqwest::get(&poc_url), reqwest::get(&post_url));
+
+    let poc_json: serde_json::Value = match poc_r {
+        Ok(r)  => r.json().await.unwrap_or_default(),
+        Err(_) => serde_json::Value::Null,
+    };
+    let post_json: serde_json::Value = match post_r {
+        Ok(r)  => r.json().await.unwrap_or_default(),
+        Err(_) => serde_json::Value::Null,
+    };
+
+    let combined_score = poc_json["drs_score"].as_f64().unwrap_or(0.0);
+    let poc_events_24h = poc_json["events_24h"].as_u64().unwrap_or(0) as u32;
+    let poc_total      = poc_json["total_events"].as_u64().unwrap_or(0);
+    let validator_rank = poc_json["validator_rank"].as_u64().map(|r| r as usize);
+    let post_sectors   = post_json["active_sectors"].as_u64().unwrap_or(0) as u32;
+    let post_windows   = post_json["proved_windows"].as_u64().unwrap_or(0);
+    let post_faults    = post_json["fault_count"].as_u64().unwrap_or(0);
+
+    const MIN_DRS:   f64 = 0.5;
+    const MIN_STAKE: u64 = 1_000_000_000; // 1 000 EGOC
+    let is_eligible = combined_score >= MIN_DRS && staked_uegoc >= MIN_STAKE;
+
+    Ok(CombinedDrsScore {
+        address: addr,
+        combined_score,
+        poc_events_24h,
+        poc_total,
+        post_sectors,
+        post_windows,
+        post_faults,
+        staked_uegoc,
+        validator_rank,
+        is_eligible,
+    })
+}
+
+// ── get_tokenomics ────────────────────────────────────────────────────────────
+
+/// Fetch live tokenomics data from the relay (`GET /tokenomics`).
+#[tauri::command]
+pub async fn get_tokenomics() -> Result<serde_json::Value, EgoDesktopError> {
+    let url = format!("{}/tokenomics", crate::p2p::RELAY_HTTP_API);
+    match reqwest::get(&url).await {
+        Ok(r)  => r.json::<serde_json::Value>().await
+            .map_err(|e| EgoDesktopError::WalletError(format!("Parse: {e}"))),
+        Err(e) => Err(EgoDesktopError::WalletError(format!("Fetch: {e}"))),
+    }
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn sign_payload(data: &[u8]) -> Option<(String, String)> {
