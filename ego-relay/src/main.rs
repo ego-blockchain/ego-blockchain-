@@ -644,7 +644,7 @@ fn verify_post_proofs(
 type PoRepState      = Arc<RwLock<HashMap<String, PoRepSector>>>;
 type PostChalState   = Arc<RwLock<HashMap<String, Vec<PostChallenge>>>>;
 
-// ── Combined DRS (Dynamic Reputation Score) ───────────────────────────────────
+// ── Combined DRS (Deterministic Reward Scoring) ───────────────────────────────────
 //
 // DRS = 0.40 × poc_score + 0.40 × post_score + 0.20 × stake_score
 //
