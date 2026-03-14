@@ -269,6 +269,9 @@ fn main() {
                     // Poll relay inbox so messages/contact-requests arrive live
                     // without requiring an app restart.
                     crate::commands::messenger::fetch_relay_inbox(&handle_startup).await;
+                    // Broadcast DataManifest every 5 cycles (~2.5 min) so peers
+                    // learn which CIDs we hold and whether we act as a relay.
+                    crate::p2p::broadcast_data_manifest().await;
                 }
             });
 

@@ -46,6 +46,28 @@ pub const RELAY_HTTP_API: &str = "http://EgoRelay.egoblockchain.com:8080";
 // ─────────────────────────────────────────────────────────────────────────────
 static RELAY_CIRCUIT_READY: AtomicBool = AtomicBool::new(false);
 
+/// Set to true when AutoNAT confirms a public IP — this node then acts as a
+/// relay server for peers behind NAT (same role as the central EgoRelay server).
+static IS_RELAY_SERVER: AtomicBool = AtomicBool::new(false);
+
+pub fn relay_mode_active() -> bool { IS_RELAY_SERVER.load(Ordering::Relaxed) }
+
+/// Peer-relay nodes discovered via DataManifest (addr → endpoint).
+/// Lets us dial through community relay nodes, not just the central server.
+static PEER_RELAY_NODES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
+    std::sync::OnceLock::new();
+
+fn peer_relay_nodes() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
+    PEER_RELAY_NODES
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+}
+
+pub fn get_discovered_relay_nodes() -> Vec<String> {
+    peer_relay_nodes().values().cloned().collect()
+}
+
 // ── Wire protocol ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +138,27 @@ pub enum P2PMessage {
         cid:       String,
         file_name: String,
         enc_data_b64: String,
+    },
+    /// Announce what data this node holds and how much space it has.
+    /// Sent periodically so peers can discover content locations and relay nodes.
+    DataManifest {
+        from_addr:    String,
+        cids:         Vec<String>,
+        available_gb: f64,
+        is_relay:     bool,     // true = this node is also a relay server
+        endpoint:     String,
+    },
+    /// Ask a peer to replicate (pin) one of our files on their node.
+    PinRequest {
+        cid:           String,
+        from_addr:     String,
+        from_endpoint: String,
+    },
+    /// Response to a PinRequest.
+    PinAck {
+        cid:      String,
+        accepted: bool,
+        reason:   String,
     },
 }
 
@@ -222,6 +265,10 @@ impl request_response::Codec for EgoCodec {
 #[derive(NetworkBehaviour)]
 struct EgoBehaviour {
     relay_client:     relay::client::Behaviour,
+    /// Server-side relay — active on all nodes but only useful when AutoNAT
+    /// reports Public.  Peers that discover us via Identify will see we support
+    /// the relay server protocol and can use us as a hop.
+    relay_server:     relay::Behaviour,
     dcutr:            dcutr::Behaviour,
     identify:         identify::Behaviour,
     request_response: request_response::Behaviour<EgoCodec>,
@@ -443,6 +490,96 @@ pub async fn broadcast_peer_announce(app: &tauri::AppHandle) {
     }
 }
 
+/// Broadcast a DataManifest to all approved contacts so they know:
+///  - which CIDs we're storing (for content routing)
+///  - how much free space we have (so they can pin files to us)
+///  - whether we're a relay server (so they can use us as a hop)
+pub async fn broadcast_data_manifest() {
+    let ledger = crate::ledger::Ledger::load();
+    if ledger.address.is_empty() { return; }
+    let cids: Vec<String> = ledger.stored_files.iter()
+        .filter(|f| !f.local_path.is_empty() && !f.local_path.starts_with("sender:"))
+        .map(|f| f.cid.clone())
+        .collect();
+    let used: u64 = ledger.stored_files.iter().map(|f| f.encrypted_size).sum();
+    let capacity  = ledger.storage_allocated_bytes;
+    let avail_gb  = if capacity > used {
+        (capacity - used) as f64 / 1_000_000_000.0
+    } else { 0.0 };
+    let endpoint = get_public_endpoint().await;
+    let msg = P2PMessage::DataManifest {
+        from_addr:    ledger.address,
+        cids,
+        available_gb: avail_gb,
+        is_relay:     IS_RELAY_SERVER.load(Ordering::Relaxed),
+        endpoint,
+    };
+    for contact in load_contacts().iter().filter(|c| c.status == "approved" && !c.endpoint.is_empty()) {
+        let ep      = contact.endpoint.clone();
+        let all_eps = contact.all_endpoints.clone();
+        let msg2    = msg.clone();
+        tokio::spawn(async move {
+            let mut eps = if all_eps.is_empty() { vec![ep.clone()] } else { all_eps };
+            if !eps.contains(&ep) { eps.push(ep); }
+            if let Err(e) = send_message_any(&eps, &msg2).await {
+                if !e.contains("none of the requested protocols") {
+                    eprintln!("[P2P] DataManifest failed: {}", e);
+                }
+            }
+        });
+    }
+}
+
+/// Ask approved contacts to pin files we hold — increases replication factor.
+pub async fn request_file_pinning(cids: Vec<String>) {
+    if cids.is_empty() { return; }
+    let ledger = crate::ledger::Ledger::load();
+    if ledger.address.is_empty() { return; }
+    let my_ep = get_public_endpoint().await;
+    for contact in load_contacts().iter().filter(|c| c.status == "approved" && !c.endpoint.is_empty()) {
+        let ep      = contact.endpoint.clone();
+        let all_eps = contact.all_endpoints.clone();
+        let from    = ledger.address.clone();
+        let my_ep2  = my_ep.clone();
+        let cids2   = cids.clone();
+        tokio::spawn(async move {
+            let mut eps = if all_eps.is_empty() { vec![ep.clone()] } else { all_eps };
+            if !eps.contains(&ep) { eps.push(ep); }
+            for cid in cids2 {
+                let msg = P2PMessage::PinRequest {
+                    cid,
+                    from_addr:     from.clone(),
+                    from_endpoint: my_ep2.clone(),
+                };
+                if let Err(e) = send_message_any(&eps, &msg).await {
+                    if !e.contains("none of the requested protocols") {
+                        eprintln!("[P2P] PinRequest failed: {}", e);
+                    }
+                    break; // don't spam if peer unreachable
+                }
+            }
+        });
+    }
+}
+
+/// Called when AutoNAT confirms public IP — register as relay + broadcast manifest.
+async fn announce_as_relay(app: &tauri::AppHandle) {
+    let address  = crate::ledger::Ledger::load().address;
+    let registry = crate::ledger::load_registry();
+    let active   = crate::ledger::get_active_wallet_id();
+    let name = registry.wallets.iter()
+        .find(|w| w.id == active)
+        .map(|w| w.name.clone())
+        .unwrap_or_else(|| "Ego Node".to_string());
+    let ep = get_public_endpoint().await;
+    // Re-register with relay HTTP so other nodes see is_relay=true in /peers
+    register_with_relay(address, name, ep, None, None).await;
+    // Let all contacts know we're a relay node
+    broadcast_data_manifest().await;
+    broadcast_peer_announce(app).await;
+    eprintln!("[relay-server] Announced as community relay node");
+}
+
 // ── Peer cache ────────────────────────────────────────────────────────────────
 
 fn peer_cache_path() -> std::path::PathBuf { base_data_dir().join("peers.json") }
@@ -597,6 +734,22 @@ async fn build_swarm(
         .with_relay_client(noise::Config::new, yamux::Config::default)?
         .with_behaviour(|key, relay_client| EgoBehaviour {
             relay_client,
+            // Desktop relay server: runs on every node, becomes useful when
+            // AutoNAT reports Public.  Limits are ~1/4 of the central relay's
+            // to avoid overloading consumer hardware.
+            relay_server: relay::Behaviour::new(
+                peer_id,
+                relay::Config {
+                    max_reservations:          128,
+                    max_reservations_per_peer: 2,
+                    reservation_duration:      Duration::from_secs(3600),
+                    max_circuits:              256,
+                    max_circuits_per_peer:     8,
+                    max_circuit_duration:      Duration::from_secs(7200),
+                    max_circuit_bytes:         0,
+                    ..Default::default()
+                },
+            ),
             dcutr:    dcutr::Behaviour::new(peer_id),
             identify: identify::Behaviour::new(
                 identify::Config::new("/ego/identify/1.0.0".to_string(), key.public())
@@ -879,6 +1032,19 @@ async fn handle_event(
             eprintln!("[P2P] Relay event: {:?}", event);
         }
 
+        // ─── Relay server events (this node relaying for others) ──────────
+        SwarmEvent::Behaviour(EgoBehaviourEvent::RelayServer(
+            relay::Event::ReservationReqAccepted { src_peer_id, .. },
+        )) => {
+            eprintln!("[relay-server] Reservation accepted for {}", src_peer_id);
+        }
+        SwarmEvent::Behaviour(EgoBehaviourEvent::RelayServer(
+            relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id, .. },
+        )) => {
+            eprintln!("[relay-server] Circuit opened: {} → {}", src_peer_id, dst_peer_id);
+        }
+        SwarmEvent::Behaviour(EgoBehaviourEvent::RelayServer(_)) => {}
+
         // ─── AutoNAT ──────────────────────────────────────────────────────────
         SwarmEvent::Behaviour(EgoBehaviourEvent::Autonat(
             autonat::Event::StatusChanged { new, .. },
@@ -888,13 +1054,21 @@ async fn handle_event(
                 autonat::NatStatus::Public(addr) => {
                     eprintln!("[P2P] AutoNAT: public at {}", addr);
                     state.set_upnp_status(Ok(()));
+                    if !external_addrs.contains(&addr) {
+                        external_addrs.push(addr.clone());
+                    }
                     if !RELAY_CIRCUIT_READY.load(Ordering::Relaxed) {
-                        if !external_addrs.contains(&addr) {
-                            external_addrs.push(addr.clone());
-                        }
                         let peer_id = *swarm.local_peer_id();
                         state.set_public_endpoint(best_endpoint(external_addrs, &peer_id));
                         let _ = app.emit_all("ego://p2p-status-changed", ());
+                    }
+                    // Enable relay server mode — this node can now relay for NAT peers.
+                    if !IS_RELAY_SERVER.load(Ordering::Relaxed) {
+                        IS_RELAY_SERVER.store(true, Ordering::Relaxed);
+                        eprintln!("[relay-server] Public IP confirmed — relay server ACTIVE");
+                        let _ = app.emit_all("ego://relay-server-enabled", ());
+                        let app_clone = app.clone();
+                        tokio::spawn(async move { announce_as_relay(&app_clone).await; });
                     }
                 }
                 autonat::NatStatus::Private => {
@@ -986,6 +1160,67 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
 
         P2PMessage::FileChunkComplete { .. } => {
             eprintln!("[P2P] FileChunkComplete ignored — 50MB max file size enforced at upload");
+        }
+
+        // ── Distributed storage: data manifest ───────────────────────────
+        P2PMessage::DataManifest { from_addr, cids, available_gb, is_relay, endpoint } => {
+            eprintln!("[P2P] DataManifest from {} — {} CIDs, {:.1}GB free, relay={}",
+                from_addr, cids.len(), available_gb, is_relay);
+            // Track peer relay nodes so we can use them as additional hops
+            if is_relay && !endpoint.is_empty() {
+                peer_relay_nodes().insert(from_addr.clone(), endpoint.clone());
+                eprintln!("[relay-server] Discovered community relay node at {}", endpoint);
+            }
+            let _ = app.emit_all("ego://data-manifest", serde_json::json!({
+                "from_addr":    from_addr,
+                "cid_count":    cids.len(),
+                "available_gb": available_gb,
+                "is_relay":     is_relay,
+            }));
+        }
+
+        // ── Distributed storage: pin request ────────────────────────────
+        P2PMessage::PinRequest { cid, from_addr, from_endpoint } => {
+            eprintln!("[P2P] PinRequest for {} from {}", cid, from_addr);
+            let ledger    = crate::ledger::Ledger::load();
+            let used: u64 = ledger.stored_files.iter().map(|f| f.encrypted_size).sum();
+            let capacity  = ledger.storage_allocated_bytes;
+            let has_file  = ledger.stored_files.iter()
+                .any(|f| f.cid == cid && !f.local_path.is_empty() && !f.local_path.starts_with("sender:"));
+            let my_addr   = ledger.address.clone();
+            let ep        = from_endpoint.clone();
+            if has_file {
+                tokio::spawn(async move {
+                    let _ = send_message_any(&[ep], &P2PMessage::PinAck {
+                        cid, accepted: true, reason: "Already stored".into(),
+                    }).await;
+                });
+            } else if capacity > 0 && used + 10_000_000 < capacity {
+                // We have space — pull the file from the requester to pin it
+                let my_ep = get_public_endpoint().await;
+                let cid2  = cid.clone();
+                let ep2   = ep.clone();
+                tokio::spawn(async move {
+                    let _ = send_message_any(&[ep2.clone()], &P2PMessage::FileRequest {
+                        cid: cid2.clone(),
+                        requester_addr:     my_addr,
+                        requester_endpoint: my_ep,
+                    }).await;
+                    let _ = send_message_any(&[ep2], &P2PMessage::PinAck {
+                        cid: cid2, accepted: true, reason: "Pinning".into(),
+                    }).await;
+                });
+            } else {
+                tokio::spawn(async move {
+                    let _ = send_message_any(&[ep], &P2PMessage::PinAck {
+                        cid, accepted: false, reason: "Insufficient capacity".into(),
+                    }).await;
+                });
+            }
+        }
+
+        P2PMessage::PinAck { cid, accepted, reason } => {
+            eprintln!("[P2P] PinAck for {} — accepted={} ({})", cid, accepted, reason);
         }
 
         P2PMessage::ContactResponse {
@@ -1107,7 +1342,7 @@ P2PMessage::ChatMessage { bundle } => {
                         let app_watch = app_clone.clone();
                         tokio::spawn(async move {
                             const POLL_INTERVAL: u64 = 10;
-                            const TIMEOUT_SECS:  u64 = 180;
+                            const TIMEOUT_SECS:  u64 = 60;
                             let mut elapsed = 0u64;
                             loop {
                                 tokio::time::sleep(Duration::from_secs(POLL_INTERVAL)).await;
@@ -1403,6 +1638,9 @@ struct RelayPeerEntry {
     city:    Option<String>,
     #[serde(default)]
     country: Option<String>,
+    /// True when this desktop node is also acting as a relay server.
+    #[serde(default)]
+    is_relay: bool,
 }
 
 pub async fn register_with_relay(
@@ -1420,6 +1658,7 @@ pub async fn register_with_relay(
         last_seen: 0,
         city,
         country,
+        is_relay:  IS_RELAY_SERVER.load(Ordering::Relaxed),
     };
     let client = reqwest::Client::new();
     match client.post(format!("{}/peers", RELAY_HTTP_API))

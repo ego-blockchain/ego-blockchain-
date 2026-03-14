@@ -223,6 +223,20 @@ async fn load_active_wallet(
         .map_err(|e| EgoDesktopError::WalletError(format!("{e}")))?;
     state.set_session_start(chrono::Utc::now().timestamp());
 
+    // Auto-provision 10 GB of distributed storage on every node.
+    // This ensures the network has storage capacity from day one without
+    // requiring manual configuration — mirrors how BitTorrent works.
+    {
+        let mut ledger = Ledger::load();
+        if ledger.storage_allocated_bytes == 0 {
+            ledger.storage_allocated_bytes = 10 * 1_000_000_000; // 10 GB
+            let _ = ledger.save();
+            // Ensure the storage directory exists
+            let _ = fs::create_dir_all(storage_dir());
+            eprintln!("[storage] Auto-provisioned 10 GB storage quota");
+        }
+    }
+
     Ok(WalletInfo {
         address:              keys.address,
         public_key_ed25519:   keys.ed25519_hex,
