@@ -545,6 +545,31 @@ pub async fn broadcast_data_manifest() {
         is_relay:     IS_RELAY_SERVER.load(Ordering::Relaxed),
         endpoint,
     };
+    // Publish to gossipsub so ALL shard subscribers learn about our CIDs
+    // (not just contacts we dial directly).
+    if let Ok(data) = serde_json::to_vec(&msg) {
+        publish_gossip("ego-shards-v1", data).await;
+    }
+
+    // Register each CID in the relay's shard CID registry (fire-and-forget).
+    // This lets any node discover file holders without having them as a contact.
+    {
+        let ledger2  = crate::ledger::Ledger::load();
+        let endpoint = get_public_endpoint().await;
+        let addr     = ledger2.address.clone();
+        let cids2: Vec<String> = ledger2.stored_files.iter()
+            .filter(|f| !f.local_path.is_empty() && !f.local_path.starts_with("sender:"))
+            .map(|f| f.cid.clone())
+            .collect();
+        if !addr.is_empty() && !endpoint.is_empty() {
+            tokio::spawn(async move {
+                for cid in &cids2 {
+                    register_cid_on_relay(cid, &addr, &endpoint).await;
+                }
+            });
+        }
+    }
+
     for contact in load_contacts().iter().filter(|c| c.status == "approved" && !c.endpoint.is_empty()) {
         let ep      = contact.endpoint.clone();
         let all_eps = contact.all_endpoints.clone();
@@ -1850,6 +1875,59 @@ pub async fn register_with_relay(
     {
         Ok(_)  => eprintln!("[Relay] Registered endpoint: {}", endpoint),
         Err(e) => eprintln!("[Relay] register error: {}", e),
+    }
+}
+
+// ── CID registry (shard-aware file discovery) ─────────────────────────────────
+
+/// Derive which relay shard owns a CID (same XOR-fold as the relay).
+fn shard_for_cid(cid: &str) -> u32 {
+    let mut h: u32 = 0;
+    for (i, b) in cid.bytes().enumerate() {
+        h ^= (b as u32) << (8 * (i % 4));
+    }
+    h % 4 // SHARD_COUNT = 4; keep in sync with relay
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CidHolder {
+    pub cid:           String,
+    pub holder_addr:   String,
+    pub endpoint:      String,
+    pub shard_id:      u32,
+    pub registered_at: i64,
+}
+
+/// After storing a file locally, register it on the relay shard so any peer
+/// (not just contacts) can discover the holder and request it directly.
+pub async fn register_cid_on_relay(cid: &str, holder_addr: &str, endpoint: &str) {
+    let shard_id = shard_for_cid(cid);
+    let payload  = serde_json::json!({
+        "cid":           cid,
+        "holder_addr":   holder_addr,
+        "endpoint":      endpoint,
+        "shard_id":      shard_id,
+        "registered_at": chrono::Utc::now().timestamp(),
+    });
+    let client = reqwest::Client::new();
+    if let Err(e) = client
+        .post(format!("{}/shard/{}/cid", RELAY_HTTP_API, shard_id))
+        .json(&payload)
+        .send()
+        .await
+    {
+        eprintln!("[CID] register error: {}", e);
+    }
+}
+
+/// Query the relay shard registry to find who holds a CID.
+/// Returns a list of holders so the requester can pick the best one.
+pub async fn find_cid_holders(cid: &str) -> Vec<CidHolder> {
+    let shard_id = shard_for_cid(cid);
+    let url      = format!("{}/shard/{}/cid/{}", RELAY_HTTP_API, shard_id, cid);
+    match reqwest::get(&url).await {
+        Ok(resp) => resp.json::<Vec<CidHolder>>().await.unwrap_or_default(),
+        Err(e)   => { eprintln!("[CID] lookup error: {}", e); vec![] }
     }
 }
 

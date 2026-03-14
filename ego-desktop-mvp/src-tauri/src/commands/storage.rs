@@ -159,6 +159,19 @@ pub async fn store_file(
     ledger.stored_files.insert(0, stored);
     ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save ledger: {e}")))?;
 
+    // Register this CID on the relay shard so any peer can discover us as a holder,
+    // even if they don't have us as a contact. Fire-and-forget — doesn't block return.
+    {
+        let cid2  = cid.clone();
+        let addr2 = ledger.address.clone();
+        tokio::spawn(async move {
+            let endpoint = crate::p2p::get_public_endpoint().await;
+            if !endpoint.is_empty() {
+                crate::p2p::register_cid_on_relay(&cid2, &addr2, &endpoint).await;
+            }
+        });
+    }
+
     Ok(StoreFileResult {
         cid,
         name: file_name,
@@ -439,16 +452,39 @@ pub async fn request_file_from_contact(
         eps.push(contact.endpoint.clone());
     }
 
+    // 4. Shard registry fallback — query relay to discover holders we don't have as contacts.
+    //    This is how strangers can share files without being in each other's contact list.
     if eps.is_empty() {
-        // No endpoint at all — drop in inbox, sender will process on next startup
-        eprintln!("[FileRequest] No endpoint for {} — depositing in relay inbox", from_addr);
+        let holders = crate::p2p::find_cid_holders(&cid).await;
+        for h in &holders {
+            if !h.endpoint.is_empty() && h.holder_addr != my_addr {
+                eps.push(h.endpoint.clone());
+            }
+        }
+    }
+
+    if eps.is_empty() {
+        eprintln!("[FileRequest] No endpoint for {} and no shard holders — depositing in relay inbox", from_addr);
         crate::commands::messenger::deposit_in_relay_inbox(&from_addr, &my_addr, &msg).await;
         return Ok(());
     }
 
     if let Err(e) = crate::p2p::send_message_any(&eps, &msg).await {
-        eprintln!("[FileRequest] All paths failed: {} — depositing in relay inbox", e);
-        crate::commands::messenger::deposit_in_relay_inbox(&from_addr, &my_addr, &msg).await;
+        // Last resort: try shard registry holders before giving up
+        let holders = crate::p2p::find_cid_holders(&cid).await;
+        let mut shard_eps: Vec<String> = holders.iter()
+            .filter(|h| !h.endpoint.is_empty() && h.holder_addr != my_addr && !eps.contains(&h.endpoint))
+            .map(|h| h.endpoint.clone())
+            .collect();
+        if !shard_eps.is_empty() {
+            if let Err(e2) = crate::p2p::send_message_any(&shard_eps, &msg).await {
+                eprintln!("[FileRequest] Shard holders also unreachable: {} — depositing in relay inbox", e2);
+                crate::commands::messenger::deposit_in_relay_inbox(&from_addr, &my_addr, &msg).await;
+            }
+        } else {
+            eprintln!("[FileRequest] All paths failed: {} — depositing in relay inbox", e);
+            crate::commands::messenger::deposit_in_relay_inbox(&from_addr, &my_addr, &msg).await;
+        }
     }
 
     Ok(())
