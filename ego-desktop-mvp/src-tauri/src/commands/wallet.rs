@@ -221,8 +221,12 @@ pub async fn prepare_transaction(
     let block = chain.blocks.last().cloned().ok_or_else(||
         EgoDesktopError::WalletError("Block not created".into())
     )?;
+    // Serialize the confirmed tx (after mine_block set status="Confirmed"),
+    // not the original `tx` variable which still has status="Pending".
+    let confirmed_tx = chain.transactions.iter().find(|t| t.hash == tx_hash).cloned()
+        .ok_or_else(|| EgoDesktopError::WalletError("Tx not found after mining".into()))?;
     // DO NOT save — just return JSON for relay submission
-    let tx_json    = serde_json::to_string(&tx).map_err(|e| EgoDesktopError::WalletError(e.to_string()))?;
+    let tx_json    = serde_json::to_string(&confirmed_tx).map_err(|e| EgoDesktopError::WalletError(e.to_string()))?;
     let block_json = serde_json::to_string(&block).map_err(|e| EgoDesktopError::WalletError(e.to_string()))?;
     Ok(PreparedTransaction { tx_json, block_json, tx_hash, amount: request.amount, from, to: request.to_address })
 }
@@ -235,17 +239,24 @@ pub async fn commit_transaction(
     tx_json: String,
     block_json: String,
 ) -> Result<TransactionResponse, EgoDesktopError> {
-    let tx: LedgerTx = serde_json::from_str(&tx_json)
+    let mut tx: LedgerTx = serde_json::from_str(&tx_json)
         .map_err(|e| EgoDesktopError::WalletError(format!("Invalid tx JSON: {e}")))?;
     let block: LedgerBlock = serde_json::from_str(&block_json)
         .map_err(|e| EgoDesktopError::WalletError(format!("Invalid block JSON: {e}")))?;
+    // Always confirm — the tx is being committed by the user, so it's confirmed.
+    tx.status = "Confirmed".to_string();
+    if tx.block_height.is_none() { tx.block_height = Some(block.height); }
     let mut chain = load_chain();
-    if !chain.transactions.iter().any(|t| t.hash == tx.hash) {
+    if let Some(existing) = chain.transactions.iter_mut().find(|t| t.hash == tx.hash) {
+        // Upgrade status if previously saved as Pending.
+        existing.status = "Confirmed".to_string();
+        existing.block_height = tx.block_height;
+    } else {
         chain.transactions.push(tx.clone());
         chain.blocks.push(block.clone());
         chain.blocks.sort_by_key(|b| b.height);
-        save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save: {e}")))?;
     }
+    save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save: {e}")))?;
     let mut ledger = Ledger::load();
     if tx.nonce > ledger.nonce { ledger.nonce = tx.nonce; let _ = ledger.save(); }
     let block_height = tx.block_height;
