@@ -534,8 +534,15 @@ async fn post_tx(
         }
     }
 
-    // ── 6. Accept ─────────────────────────────────────────────────────────
-    if !chain.transactions.iter().any(|t| t.hash == tx.hash) {
+    // ── 6. Accept — relay is the authority; accepted txs are always Confirmed ──
+    let mut tx = tx;
+    tx.status = "Confirmed".to_string();
+    if let Some(existing) = chain.transactions.iter_mut().find(|t| t.hash == tx.hash) {
+        if existing.status != "Confirmed" {
+            existing.status = "Confirmed".to_string();
+            save_chain(&chain);
+        }
+    } else {
         println!("[chain] ✓ Verified tx {} from {} → {} ({} uEGOC)", tx.hash, tx.from, tx.to, tx.amount);
         chain.transactions.push(tx);
         save_chain(&chain);

@@ -1573,7 +1573,14 @@ async fn merge_remote_chain(
     let mut chain   = load_chain();
     let mut changed = false;
     for tx in transactions {
-        if !chain.transactions.iter().any(|t| t.hash == tx.hash) {
+        if let Some(existing) = chain.transactions.iter_mut().find(|t| t.hash == tx.hash) {
+            // Upgrade a locally-pending tx to confirmed if the relay has confirmed it.
+            if existing.status == "Pending" && tx.status == "Confirmed" {
+                existing.status = "Confirmed".to_string();
+                existing.block_height = tx.block_height;
+                changed = true;
+            }
+        } else {
             chain.transactions.push(tx); changed = true;
         }
     }
