@@ -150,6 +150,9 @@ pub struct LedgerBlock {
     pub tx_count: u32,
     pub size_bytes: u64,
     pub reward: u64,
+    /// Coinbase TX hash — miner self-issues their block reward.
+    #[serde(default)]
+    pub coinbase_tx: Option<String>,
 }
 
 /// Metadata for an encrypted file stored on disk.
@@ -235,7 +238,7 @@ impl Ledger {
             .blocks
             .last()
             .map(|b| b.hash.clone())
-            .unwrap_or_else(|| "0".repeat(64));
+            .unwrap_or_else(|| GENESIS_HASH.into());
 
         let height = self.blocks.len() as u64;
         let timestamp = chrono::Utc::now().timestamp();
@@ -259,6 +262,7 @@ impl Ledger {
             tx_count: 1,
             size_bytes: 512,
             reward: 50_000_000,
+            coinbase_tx: None,
         });
     }
 
@@ -267,6 +271,10 @@ impl Ledger {
         format!("{:.2} EGOC", egoc)
     }
 }
+
+const INITIAL_BLOCK_REWARD_UEGOC: u64 = 50_000_000;
+const HALVING_INTERVAL:           u64 = 2_100_000;
+const FAUCET_ADDRESS: &str            = "egot1faucet000000000000000000000000000000000000";
 
 // ── Shared chain (P2P broadcast ledger) ──────────────────────────────────────
 
@@ -283,14 +291,37 @@ pub fn chain_path() -> PathBuf {
     base_data_dir().join("chain.json")
 }
 
+pub const GENESIS_HASH: &str  = "ego00000000000000000000000000000000000000000000000000000000genesis1";
+pub const GENESIS_MINER: &str = "ego1genesis000000000000000000000000000000000000";
+pub const GENESIS_TS: i64     = 1_741_910_400; // 2026-03-14 00:00:00 UTC
+
+pub fn genesis_block() -> LedgerBlock {
+    LedgerBlock {
+        height:     0,
+        hash:       GENESIS_HASH.into(),
+        prev_hash:  "0000000000000000000000000000000000000000000000000000000000000000".into(),
+        timestamp:  GENESIS_TS,
+        miner:      GENESIS_MINER.into(),
+        tx_count:   0,
+        size_bytes: 0,
+        reward:     0,
+        coinbase_tx: None,
+    }
+}
+
 pub fn load_chain() -> SharedChain {
     let path = chain_path();
     if let Ok(data) = fs::read_to_string(&path) {
         if let Ok(chain) = serde_json::from_str::<SharedChain>(&data) {
-            return chain;
+            if !chain.blocks.is_empty() {
+                return chain;
+            }
         }
     }
-    SharedChain::default()
+    let mut chain = SharedChain::default();
+    chain.blocks.push(genesis_block());
+    let _ = save_chain(&chain);
+    chain
 }
 
 pub fn save_chain(chain: &SharedChain) -> Result<(), String> {
@@ -324,10 +355,33 @@ impl SharedChain {
             .blocks
             .last()
             .map(|b| b.hash.clone())
-            .unwrap_or_else(|| "0".repeat(64));
+            .unwrap_or_else(|| GENESIS_HASH.into());
 
         let height = self.blocks.len() as u64;
         let timestamp = chrono::Utc::now().timestamp();
+
+        // Coinbase TX — miner self-issues the block reward (halving schedule)
+        let era = height / HALVING_INTERVAL;
+        let block_reward = INITIAL_BLOCK_REWARD_UEGOC >> era.min(63);
+        let cb_nonce = self.last_nonce(miner) + 1;
+        let cb_data = format!("coinbase:{miner}:{height}:{block_reward}:{timestamp}");
+        let cb_hash = ego_core::hash_data(cb_data.as_bytes()).to_hex();
+        let coinbase = LedgerTx {
+            hash:                cb_hash.clone(),
+            from:                FAUCET_ADDRESS.into(),
+            to:                  miner.into(),
+            amount:              block_reward,
+            memo:                Some(format!("block reward height={height} era={era}")),
+            timestamp,
+            signature:           String::new(),
+            status:              "Confirmed".to_string(),
+            nonce:               cb_nonce,
+            block_height:        Some(height),
+            public_key_ed25519:  String::new(),
+            dilithium_pubkey:    String::new(),
+            dilithium_signature: String::new(),
+        };
+        self.transactions.push(coinbase);
 
         let block_data = format!("{prev_hash}{tx_hash}{height}{timestamp}");
         let hash = ego_core::hash_data(block_data.as_bytes()).to_hex();
@@ -345,10 +399,19 @@ impl SharedChain {
             prev_hash,
             timestamp,
             miner: miner.to_string(),
-            tx_count: 1,
+            tx_count: 2, // coinbase + user tx
             size_bytes: 512,
-            reward: 50_000_000,
+            reward: block_reward,
+            coinbase_tx: Some(cb_hash),
         });
+    }
+
+    pub fn last_nonce(&self, address: &str) -> u64 {
+        self.transactions.iter()
+            .filter(|t| t.from == address)
+            .map(|t| t.nonce)
+            .max()
+            .unwrap_or(0)
     }
 }
 

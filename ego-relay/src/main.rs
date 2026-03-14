@@ -103,6 +103,10 @@ struct LedgerBlock {
     /// Which shard produced this block. Default=0 for legacy blocks.
     #[serde(default)]
     shard_id:   u32,
+    /// Coinbase TX hash — the miner self-issues their block reward.
+    /// None for genesis and relay-mined blocks (legacy).
+    #[serde(default)]
+    coinbase_tx: Option<String>,
 }
 
 /// A node that claims to hold a specific CID (registered via POST /shard/:id/cid).
@@ -237,13 +241,40 @@ static RELAY_GOSSIP_TX: OnceLock<tokio_mpsc::UnboundedSender<(String, Vec<u8>)>>
 
 const CHAIN_PATH: &str = "chain.json";
 
+/// The genesis block is hardcoded — identical on every relay and every desktop node.
+/// No one controls it; it is defined by the source code.
+const GENESIS_HASH: &str  = "ego00000000000000000000000000000000000000000000000000000000genesis1";
+const GENESIS_MINER: &str = "ego1genesis000000000000000000000000000000000000";
+const GENESIS_TS: i64     = 1_741_910_400; // 2026-03-14 00:00:00 UTC — chain birth
+
+fn genesis_block() -> LedgerBlock {
+    LedgerBlock {
+        height:     0,
+        hash:       GENESIS_HASH.into(),
+        prev_hash:  "0000000000000000000000000000000000000000000000000000000000000000".into(),
+        timestamp:  GENESIS_TS,
+        miner:      GENESIS_MINER.into(),
+        tx_count:   0,
+        size_bytes: 0,
+        reward:     0,
+        shard_id:   0,
+        coinbase_tx: None,
+    }
+}
+
 fn load_chain() -> SharedChain {
     if let Ok(data) = fs::read_to_string(CHAIN_PATH) {
-        if let Ok(c) = serde_json::from_str::<SharedChain>(&data) {
-            return c;
+        if let Ok(chain) = serde_json::from_str::<SharedChain>(&data) {
+            if !chain.blocks.is_empty() {
+                return chain;
+            }
         }
     }
-    SharedChain::default()
+    // Fresh chain — seed with hardcoded genesis block
+    let mut chain = SharedChain::default();
+    chain.blocks.push(genesis_block());
+    save_chain(&chain);
+    chain
 }
 
 fn save_chain(chain: &SharedChain) {
@@ -1028,7 +1059,7 @@ async fn post_tx(
         // Gossip to all connected desktop peers
         if let Some(gtx) = RELAY_GOSSIP_TX.get() {
             let stub_block = LedgerBlock { height: 0, hash: String::new(), prev_hash: String::new(),
-                timestamp: 0, miner: String::new(), tx_count: 1, size_bytes: 0, reward: 0, shard_id: tx.shard_id };
+                timestamp: 0, miner: String::new(), tx_count: 1, size_bytes: 0, reward: 0, shard_id: tx.shard_id, coinbase_tx: None };
             if let Ok(bytes) = serde_json::to_vec(&serde_json::json!({
                 "type": "tx_broadcast",
                 "tx": &tx,
@@ -1106,6 +1137,37 @@ async fn post_block(
         if block.height == tip.height + 1 && block.prev_hash != tip.hash {
             println!("[chain] Rejected block #{}: prev_hash mismatch (got {}, want {})",
                 block.height, block.prev_hash, tip.hash);
+            return StatusCode::BAD_REQUEST;
+        }
+    }
+
+    // ── Coinbase validation ────────────────────────────────────────────────────
+    // If the block carries a coinbase_tx, verify the miner paid themselves
+    // exactly the correct halving-era reward and that the block pool cap holds.
+    if let Some(ref cb_hash) = block.coinbase_tx {
+        let era = block.height / HALVING_INTERVAL;
+        let expected_reward = INITIAL_BLOCK_REWARD_UEGOC >> era.min(63);
+        // Find the coinbase TX in the submitted transactions
+        let cb_tx = chain.transactions.iter().find(|t| &t.hash == cb_hash);
+        if let Some(tx) = cb_tx {
+            if tx.to != block.miner {
+                println!("[chain] Rejected block #{}: coinbase recipient {} != miner {}",
+                    block.height, tx.to, block.miner);
+                return StatusCode::FORBIDDEN;
+            }
+            if tx.amount != expected_reward {
+                println!("[chain] Rejected block #{}: coinbase amount {} != expected {}",
+                    block.height, tx.amount, expected_reward);
+                return StatusCode::FORBIDDEN;
+            }
+            // Pool cap check
+            let already_issued = pool_emitted(&chain, "block reward");
+            if already_issued + expected_reward > POOL_BLOCK_UEGOC {
+                println!("[chain] Rejected block #{}: block reward pool exhausted", block.height);
+                return StatusCode::FORBIDDEN;
+            }
+        } else {
+            println!("[chain] Rejected block #{}: coinbase TX {} not found", block.height, cb_hash);
             return StatusCode::BAD_REQUEST;
         }
     }
@@ -1669,7 +1731,7 @@ fn mine_shard_block(chain: &mut SharedChain, shard_id: u32) -> Option<LedgerBloc
         .filter(|b| b.shard_id == shard_id)
         .max_by_key(|b| b.height)
         .map(|b| b.hash.clone())
-        .unwrap_or_else(|| "0000000000000000".into());
+        .unwrap_or_else(|| GENESIS_HASH.into());
 
     let now        = chrono::Utc::now().timestamp();
     let tx_count   = unblocked_hashes.len() as u32;
@@ -1700,6 +1762,7 @@ fn mine_shard_block(chain: &mut SharedChain, shard_id: u32) -> Option<LedgerBloc
         size_bytes,
         reward:     block_reward,
         shard_id,
+        coinbase_tx: None,
     };
 
     // Assign block_height to all txs in this block
