@@ -97,6 +97,19 @@ struct LedgerBlock {
     tx_count:   u32,
     size_bytes: u64,
     reward:     u64,
+    /// Which shard produced this block. Default=0 for legacy blocks.
+    #[serde(default)]
+    shard_id:   u32,
+}
+
+/// A node that claims to hold a specific CID (registered via POST /shard/:id/cid).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CidHolder {
+    cid:           String,
+    holder_addr:   String,
+    endpoint:      String,
+    shard_id:      u32,
+    registered_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,7 +371,24 @@ type InboxState   = Arc<RwLock<HashMap<String, Vec<InboxMessage>>>>;
 type UsersState   = Arc<RwLock<Vec<UserRecord>>>;
 type PendingState     = Arc<RwLock<Vec<PendingTx>>>;
 type KeyRegistryState = Arc<RwLock<HashMap<String, String>>>;
-type ShardPoolState   = Arc<RwLock<HashMap<u32, Vec<LedgerTx>>>>;
+type ShardPoolState    = Arc<RwLock<HashMap<u32, Vec<LedgerTx>>>>;
+/// cid → vec of holders (multiple nodes can hold the same CID).
+type CidRegistryState  = Arc<RwLock<HashMap<String, Vec<CidHolder>>>>;
+
+const CID_REGISTRY_PATH: &str = "cid_registry.json";
+
+fn load_cid_registry() -> HashMap<String, Vec<CidHolder>> {
+    std::fs::read_to_string(CID_REGISTRY_PATH)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_cid_registry(reg: &HashMap<String, Vec<CidHolder>>) {
+    if let Ok(data) = serde_json::to_string_pretty(reg) {
+        let _ = std::fs::write(CID_REGISTRY_PATH, data);
+    }
+}
 
 /// Number of shards. Each shard processes transactions independently.
 /// Increase this as validator count grows (target: 1 shard per ~25 validators).
@@ -399,8 +429,9 @@ struct AppState {
     pending:      PendingState,
     poc_events:   PocState,
     key_registry: KeyRegistryState,
-    shard_pools:  ShardPoolState,
-    mailer:       Arc<AsyncSmtpTransport<Tokio1Executor>>,
+    shard_pools:   ShardPoolState,
+    cid_registry:  CidRegistryState,
+    mailer:        Arc<AsyncSmtpTransport<Tokio1Executor>>,
     config:       Arc<Config>,
 }
 
@@ -621,7 +652,7 @@ async fn post_tx(
         // Gossip to all connected desktop peers
         if let Some(gtx) = RELAY_GOSSIP_TX.get() {
             let stub_block = LedgerBlock { height: 0, hash: String::new(), prev_hash: String::new(),
-                timestamp: 0, miner: String::new(), tx_count: 1, size_bytes: 0, reward: 0 };
+                timestamp: 0, miner: String::new(), tx_count: 1, size_bytes: 0, reward: 0, shard_id: tx.shard_id };
             if let Ok(bytes) = serde_json::to_vec(&serde_json::json!({
                 "type": "tx_broadcast",
                 "tx": &tx,
@@ -712,6 +743,10 @@ async fn post_block(
 const INBOX_DISK_THRESHOLD: usize = 1 * 1024 * 1024; // 1 MB
 const INBOX_DIR: &str = "inbox_files";
 
+/// Hard limit: inbox messages carrying file data must go P2P, not through the relay.
+/// This prevents the relay from being overwhelmed at scale (1M users × multi-MB files).
+const INBOX_FILE_SIZE_LIMIT: usize = 512 * 1024; // 512 KB
+
 async fn post_inbox(
     Path(address): Path<String>,
     State(s): State<AppState>,
@@ -719,6 +754,16 @@ async fn post_inbox(
 ) -> StatusCode {
     if address.is_empty() || (msg.payload.is_empty() && msg.disk_path.is_none()) {
         return StatusCode::BAD_REQUEST;
+    }
+    // Reject large file payloads — FileData must travel P2P, not through the relay.
+    // The desktop falls back here only for small control messages (FileRequest, etc.).
+    if msg.payload.len() > INBOX_FILE_SIZE_LIMIT {
+        // Check if it looks like a FileData message (contains enc_data_b64)
+        if msg.payload.contains("\"file_data\"") || msg.payload.contains("enc_data_b64") {
+            eprintln!("[inbox] Rejected large FileData ({} bytes) for {} — must use P2P",
+                msg.payload.len(), address);
+            return StatusCode::PAYLOAD_TOO_LARGE;
+        }
     }
     let _ = std::fs::create_dir_all(INBOX_DIR);
 
@@ -1201,6 +1246,108 @@ struct PocEventRequest {
     public_key: String,
 }
 
+// ── Per-shard block miner ─────────────────────────────────────────────────────
+
+const RELAY_MINER_ADDR: &str = "egot1relay000000000000000000000000000000000000";
+const SHARD_BLOCK_INTERVAL_SECS: u64 = 5;
+
+/// Mine one block per shard from confirmed-but-unblocked txs in that shard pool.
+/// Called from a background tokio task every SHARD_BLOCK_INTERVAL_SECS.
+fn mine_shard_block(chain: &mut SharedChain, shard_id: u32) -> Option<LedgerBlock> {
+    // Collect indices of confirmed txs in this shard without a block_height
+    let unblocked_hashes: Vec<String> = chain.transactions.iter()
+        .filter(|t| t.shard_id == shard_id && t.status == "Confirmed" && t.block_height.is_none())
+        .map(|t| t.hash.clone())
+        .collect();
+
+    if unblocked_hashes.is_empty() { return None; }
+
+    // Next height for this shard
+    let height = chain.blocks.iter()
+        .filter(|b| b.shard_id == shard_id)
+        .map(|b| b.height)
+        .max()
+        .map(|h| h + 1)
+        .unwrap_or(1);
+
+    let prev_hash = chain.blocks.iter()
+        .filter(|b| b.shard_id == shard_id)
+        .max_by_key(|b| b.height)
+        .map(|b| b.hash.clone())
+        .unwrap_or_else(|| "0000000000000000".into());
+
+    let now        = chrono::Utc::now().timestamp();
+    let tx_count   = unblocked_hashes.len() as u32;
+    let size_bytes = chain.transactions.iter()
+        .filter(|t| unblocked_hashes.contains(&t.hash))
+        .map(|t| t.amount.to_string().len() as u64 + 200)
+        .sum::<u64>();
+
+    // Block hash = hex of XOR-fold of all tx hashes + height + shard_id
+    let hash_input = format!("{shard_id}:{height}:{prev_hash}:{now}");
+    let block_hash = format!("{:016x}", hash_input.bytes()
+        .enumerate()
+        .fold(height ^ (shard_id as u64 * 0xDEAD_BEEF), |acc, (i, b)| {
+            acc ^ ((b as u64) << (8 * (i % 8)))
+        }));
+
+    let block = LedgerBlock {
+        height,
+        hash:       block_hash.clone(),
+        prev_hash,
+        timestamp:  now,
+        miner:      RELAY_MINER_ADDR.into(),
+        tx_count,
+        size_bytes,
+        reward:     0, // relay doesn't claim rewards
+        shard_id,
+    };
+
+    // Assign block_height to all txs in this block
+    for tx in chain.transactions.iter_mut() {
+        if unblocked_hashes.contains(&tx.hash) {
+            tx.block_height = Some(height);
+        }
+    }
+
+    chain.blocks.push(block.clone());
+    Some(block)
+}
+
+/// Spawn one background task per shard to periodically mine blocks.
+fn start_shard_miners(state: AppState) {
+    for shard_id in 0..SHARD_COUNT {
+        let state2 = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(
+                std::time::Duration::from_secs(SHARD_BLOCK_INTERVAL_SECS)
+            );
+            loop {
+                interval.tick().await;
+                let block = {
+                    let mut chain = state2.chain.write().unwrap();
+                    let blk = mine_shard_block(&mut chain, shard_id);
+                    if blk.is_some() { save_chain(&chain); }
+                    blk
+                };
+                if let Some(blk) = block {
+                    println!("[shard-{shard_id}] Mined block #{} ({} txs)", blk.height, blk.tx_count);
+                    // Gossip the new block so desktop peers update their chain
+                    if let Some(gtx) = RELAY_GOSSIP_TX.get() {
+                        if let Ok(bytes) = serde_json::to_vec(&serde_json::json!({
+                            "type": "chain_sync_response",
+                            "blocks": [&blk],
+                            "transactions": [],
+                        })) {
+                            let _ = gtx.send(("ego-blocks-v1".to_string(), bytes));
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
 // ── Shard endpoints ───────────────────────────────────────────────────────────
 
 /// GET /shards — overview of all shards with tx counts and cross-shard stats.
@@ -1285,6 +1432,73 @@ async fn get_shard_stats(
         "tps_lifetime":    (tps * 100.0).round() / 100.0,
         "shard_count":     SHARD_COUNT,
     })))
+}
+
+/// POST /shard/:id/cid — register that this node holds a specific CID.
+/// Desktop calls this after storing a file so other nodes can find it.
+async fn post_shard_cid(
+    Path(id): Path<u32>,
+    State(s): State<AppState>,
+    Json(holder): Json<CidHolder>,
+) -> StatusCode {
+    if id >= SHARD_COUNT || holder.cid.is_empty() || holder.holder_addr.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+    let mut reg = s.cid_registry.write().unwrap();
+    let holders = reg.entry(holder.cid.clone()).or_default();
+    // Upsert: replace existing entry for this holder_addr, or push new
+    if let Some(existing) = holders.iter_mut().find(|h| h.holder_addr == holder.holder_addr) {
+        existing.endpoint      = holder.endpoint.clone();
+        existing.registered_at = chrono::Utc::now().timestamp();
+    } else {
+        holders.push(CidHolder {
+            cid:           holder.cid.clone(),
+            holder_addr:   holder.holder_addr.clone(),
+            endpoint:      holder.endpoint.clone(),
+            shard_id:      id,
+            registered_at: chrono::Utc::now().timestamp(),
+        });
+        println!("[shard-{id}] CID registered: {} by {}", &holder.cid[..16.min(holder.cid.len())], holder.holder_addr);
+    }
+    save_cid_registry(&reg);
+    StatusCode::OK
+}
+
+/// GET /shard/:id/cid/:cid — find all nodes that hold a specific CID.
+/// Desktop uses this to discover file holders it doesn't have as contacts.
+async fn get_shard_cid(
+    Path((id, cid)): Path<(u32, String)>,
+    State(s): State<AppState>,
+) -> Result<Json<Vec<CidHolder>>, StatusCode> {
+    if id >= SHARD_COUNT { return Err(StatusCode::NOT_FOUND); }
+    let reg = s.cid_registry.read().unwrap();
+    let holders = reg.get(&cid)
+        .map(|v| v.iter().filter(|h| h.shard_id == id).cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    Ok(Json(holders))
+}
+
+/// GET /shard/:id/files — list all CIDs registered on this shard (for explorer/debugging).
+async fn get_shard_files(
+    Path(id): Path<u32>,
+    State(s): State<AppState>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    if id >= SHARD_COUNT { return Err(StatusCode::NOT_FOUND); }
+    let reg = s.cid_registry.read().unwrap();
+    let files: Vec<serde_json::Value> = reg.iter()
+        .filter_map(|(cid, holders)| {
+            let shard_holders: Vec<_> = holders.iter()
+                .filter(|h| h.shard_id == id)
+                .collect();
+            if shard_holders.is_empty() { return None; }
+            Some(serde_json::json!({
+                "cid":          cid,
+                "holder_count": shard_holders.len(),
+                "holders":      shard_holders.iter().map(|h| &h.holder_addr).collect::<Vec<_>>(),
+            }))
+        })
+        .collect();
+    Ok(Json(files))
 }
 
 /// POST /poc/event — submit a signed Proof of Coverage beacon event.
@@ -1543,8 +1757,9 @@ async fn main() {
         pending:      Arc::new(RwLock::new(Vec::new())),
         poc_events:   Arc::new(RwLock::new(poc_loaded)),
         key_registry: Arc::new(RwLock::new(load_key_registry())),
-        shard_pools:  Arc::new(RwLock::new(initial_shard_pools)),
-        mailer:       Arc::new(mailer),
+        shard_pools:   Arc::new(RwLock::new(initial_shard_pools)),
+        cid_registry:  Arc::new(RwLock::new(load_cid_registry())),
+        mailer:        Arc::new(mailer),
         config:       Arc::new(cfg),
     };
     {
@@ -1589,6 +1804,9 @@ async fn main() {
             .route("/shards",               get(get_shards))
             .route("/shard/:id/txs",        get(get_shard_txs))
             .route("/shard/:id/stats",      get(get_shard_stats))
+            .route("/shard/:id/files",      get(get_shard_files))
+            .route("/shard/:id/cid",        post(post_shard_cid))
+            .route("/shard/:id/cid/:cid",   get(get_shard_cid))
             // ── PoC / DRS ──
             .route("/poc/event",            post(post_poc_event))
             .route("/poc/score/:address",   get(get_poc_score))
@@ -1607,6 +1825,11 @@ async fn main() {
         println!("[http] Listening on {}", http_addr);
         axum::serve(listener, app).await.expect("HTTP server error");
     });
+
+    // Start one block-mining task per shard (runs every SHARD_BLOCK_INTERVAL_SECS).
+    start_shard_miners(state.clone());
+    println!("[shard] Started {} per-shard block miners ({}s interval)",
+        SHARD_COUNT, SHARD_BLOCK_INTERVAL_SECS);
 
     let mut swarm = SwarmBuilder::with_existing_identity(identity.clone())
         .with_tokio()
