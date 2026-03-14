@@ -13,7 +13,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use futures::{AsyncReadExt, AsyncWriteExt};
 use libp2p::{
-    autonat, dcutr, identify, noise, ping, relay,
+    autonat, dcutr, gossipsub, identify, kad, noise, ping, relay,
     request_response::{self, OutboundRequestId, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
@@ -23,6 +23,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashMap, io, sync::OnceLock, time::Duration};
 use tauri::Manager;
 use tokio::sync::{mpsc, oneshot};
+
+/// Gossip publish channel: anything outside the swarm loop calls `publish_gossip()`
+/// which queues a (topic, bytes) pair. The swarm loop drains it and calls
+/// `swarm.behaviour_mut().gossipsub.publish(...)`.
+static GOSSIP_TX: OnceLock<mpsc::UnboundedSender<(String, Vec<u8>)>> = OnceLock::new();
 
 pub const P2P_PORT: u16 = 47393;
 
@@ -274,6 +279,11 @@ struct EgoBehaviour {
     request_response: request_response::Behaviour<EgoCodec>,
     autonat:          autonat::Behaviour,
     ping:             ping::Behaviour,
+    /// Gossipsub — pub/sub mesh for chain tx/block propagation.
+    /// Peers receive blocks and transactions even without direct contacts.
+    gossipsub:        gossipsub::Behaviour,
+    /// Kademlia DHT — decentralised peer discovery without the central relay.
+    kad:              kad::Behaviour<kad::store::MemoryStore>,
 }
 
 // ── Swarm command channel ─────────────────────────────────────────────────────
@@ -286,6 +296,11 @@ pub enum SwarmCmd {
     },
     GetEndpoint {
         reply: oneshot::Sender<String>,
+    },
+    /// Fire-and-forget gossipsub publish. Routed from GOSSIP_TX into the swarm loop.
+    GossipPublish {
+        topic: String,
+        data:  Vec<u8>,
     },
 }
 
@@ -392,9 +407,25 @@ pub async fn start_udp_discovery(_app: tauri::AppHandle) {}
 pub async fn broadcast_udp_announce() {}
 pub async fn gossip_peer_list() {}
 
+/// Enqueue a gossipsub publish to the swarm event loop.
+/// Fire-and-forget; silently drops if P2P hasn't started yet.
+pub async fn publish_gossip(topic: &str, data: Vec<u8>) {
+    if let Some(tx) = GOSSIP_TX.get() {
+        let _ = tx.send((topic.to_string(), data));
+    }
+}
+
 pub async fn broadcast_tx(tx: LedgerTx, block: LedgerBlock) {
-    let contacts = load_contacts();
     let msg = P2PMessage::TxBroadcast { tx, block };
+
+    // ── Gossipsub: reaches ALL subscribers, not just known contacts ───────────
+    // This is the primary true-P2P broadcast path.
+    if let Ok(data) = serde_json::to_vec(&msg) {
+        publish_gossip("ego-txs-v1", data).await;
+    }
+
+    // ── Direct P2P to approved contacts (fast path for known peers) ───────────
+    let contacts = load_contacts();
     for contact in contacts.iter().filter(|c| c.status == "approved" && !c.endpoint.is_empty()) {
         let endpoint  = contact.endpoint.clone();
         let all_eps   = contact.all_endpoints.clone();
@@ -660,6 +691,21 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
         }
     }
 
+    // ── Gossipsub subscriptions ───────────────────────────────────────────────
+    let tx_topic       = gossipsub::IdentTopic::new("ego-txs-v1");
+    let block_topic    = gossipsub::IdentTopic::new("ego-blocks-v1");
+    let _ = swarm.behaviour_mut().gossipsub.subscribe(&tx_topic);
+    let _ = swarm.behaviour_mut().gossipsub.subscribe(&block_topic);
+
+    // ── Kademlia bootstrap ────────────────────────────────────────────────────
+    // Contacts the seeded relay nodes and discovers the rest of the DHT network.
+    let _ = swarm.behaviour_mut().kad.bootstrap();
+
+    // ── Gossip channel (fire-and-forget from broadcast_tx etc.) ──────────────
+    let (gossip_unbounded_tx, mut gossip_rx) =
+        mpsc::unbounded_channel::<(String, Vec<u8>)>();
+    let _ = GOSSIP_TX.set(gossip_unbounded_tx);
+
     let (tx, mut rx) = mpsc::channel::<SwarmCmd>(64);
     let _ = SWARM_TX.set(tx);
 
@@ -668,14 +714,29 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     let mut in_flight:      HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>> = HashMap::new();
 
     // Retry relay connection every 15 s when circuit is not confirmed.
-    // Recovers from relay being down at startup — once it comes back up the
-    // next tick redials and the circuit establishes automatically.
     let mut relay_retry = tokio::time::interval(Duration::from_secs(15));
     relay_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    relay_retry.tick().await; // consume the immediate first tick
+    relay_retry.tick().await;
+
+    // Periodic Kademlia random-walk discovery (every 5 minutes).
+    let mut kad_discovery = tokio::time::interval(Duration::from_secs(300));
+    kad_discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    kad_discovery.tick().await;
 
     loop {
         tokio::select! {
+            // ── Gossip publish (from broadcast_tx / publish_gossip) ───────────
+            Some((topic_str, data)) = gossip_rx.recv() => {
+                let topic = gossipsub::IdentTopic::new(topic_str.clone());
+                match swarm.behaviour_mut().gossipsub.publish(topic, data) {
+                    Ok(_) => {}
+                    // InsufficientPeers is normal at startup — suppress silently.
+                    Err(gossipsub::PublishError::NoPeersSubscribedToTopic) => {}
+                    Err(e) => eprintln!("[Gossip] publish '{}': {:?}", topic_str, e),
+                }
+            }
+
+            // ── SwarmCmd (send / get-endpoint) ────────────────────────────────
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { break; };
                 match cmd {
@@ -687,8 +748,18 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                         let ep = best_endpoint(&external_addrs, &local_peer_id);
                         let _ = reply.send(ep);
                     }
+                    SwarmCmd::GossipPublish { topic, data } => {
+                        let t = gossipsub::IdentTopic::new(topic.clone());
+                        match swarm.behaviour_mut().gossipsub.publish(t, data) {
+                            Ok(_) => {}
+                            Err(gossipsub::PublishError::NoPeersSubscribedToTopic) => {}
+                            Err(e) => eprintln!("[Gossip] publish '{}': {:?}", topic, e),
+                        }
+                    }
                 }
             }
+
+            // ── Swarm events ──────────────────────────────────────────────────
             event = swarm.select_next_some() => {
                 handle_event(
                     event, &app,
@@ -696,9 +767,9 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                     &mut swarm, &relay_addrs,
                 ).await;
             }
+
+            // ── Relay circuit retry ───────────────────────────────────────────
             _ = relay_retry.tick() => {
-                // Only redial if relay circuit not yet confirmed.
-                // Once circuit is live this branch is a cheap no-op.
                 if !has_circuit_addr(&external_addrs) {
                     for relay_str in RELAY_NODES {
                         if let Ok(addr) = relay_str.parse::<Multiaddr>() {
@@ -712,6 +783,11 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                         }
                     }
                 }
+            }
+
+            // ── Kademlia periodic discovery ───────────────────────────────────
+            _ = kad_discovery.tick() => {
+                let _ = swarm.behaviour_mut().kad.bootstrap();
             }
         }
     }
@@ -732,38 +808,71 @@ async fn build_swarm(
         .with_quic()
         .with_dns()?
         .with_relay_client(noise::Config::new, yamux::Config::default)?
-        .with_behaviour(|key, relay_client| EgoBehaviour {
-            relay_client,
-            // Desktop relay server: runs on every node, becomes useful when
-            // AutoNAT reports Public.  Limits are ~1/4 of the central relay's
-            // to avoid overloading consumer hardware.
-            relay_server: relay::Behaviour::new(
-                peer_id,
-                relay::Config {
-                    max_reservations:          128,
-                    max_reservations_per_peer: 2,
-                    reservation_duration:      Duration::from_secs(3600),
-                    max_circuits:              256,
-                    max_circuits_per_peer:     8,
-                    max_circuit_duration:      Duration::from_secs(7200),
-                    max_circuit_bytes:         0,
-                    ..Default::default()
-                },
-            ),
-            dcutr:    dcutr::Behaviour::new(peer_id),
-            identify: identify::Behaviour::new(
-                identify::Config::new("/ego/identify/1.0.0".to_string(), key.public())
-                    .with_interval(Duration::from_secs(60)),
-            ),
-            request_response: request_response::Behaviour::new(
-                [(StreamProtocol::new("/ego/msg/1.1.0"), ProtocolSupport::Full)],
-                request_response::Config::default()
-                    .with_request_timeout(Duration::from_secs(120)),
-            ),
-            autonat: autonat::Behaviour::new(peer_id, autonat::Config::default()),
-            ping:    ping::Behaviour::new(
-                ping::Config::new().with_interval(Duration::from_secs(30)),
-            ),
+        .with_behaviour(|key, relay_client| {
+            // ── Gossipsub ─────────────────────────────────────────────────────
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                .heartbeat_interval(Duration::from_secs(10))
+                .validation_mode(gossipsub::ValidationMode::Permissive)
+                .max_transmit_size(512 * 1024) // 512 KB
+                .build()
+                .expect("gossipsub config");
+            let gossipsub_behaviour = gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::RandomAuthor,
+                gossipsub_config,
+            )
+            .expect("gossipsub::Behaviour");
+
+            // ── Kademlia DHT ──────────────────────────────────────────────────
+            let store = kad::store::MemoryStore::new(peer_id);
+            let mut kad_behaviour = kad::Behaviour::new(peer_id, store);
+            // Seed the routing table with all known relay nodes so we can
+            // bootstrap even if we've never connected to any peer before.
+            for relay_str in RELAY_NODES {
+                if let Ok(addr) = relay_str.parse::<Multiaddr>() {
+                    if let Some(relay_pid) = peer_id_from_multiaddr(&addr) {
+                        kad_behaviour.add_address(&relay_pid, strip_p2p_suffix(&addr));
+                    }
+                }
+            }
+            // Every Ego node participates as a full DHT server so the network
+            // can discover peers without the central HTTP relay.
+            kad_behaviour.set_mode(Some(kad::Mode::Server));
+
+            EgoBehaviour {
+                relay_client,
+                // Desktop relay server: runs on every node, becomes useful when
+                // AutoNAT reports Public.  Limits are ~1/4 of the central relay's
+                // to avoid overloading consumer hardware.
+                relay_server: relay::Behaviour::new(
+                    peer_id,
+                    relay::Config {
+                        max_reservations:          128,
+                        max_reservations_per_peer: 2,
+                        reservation_duration:      Duration::from_secs(3600),
+                        max_circuits:              256,
+                        max_circuits_per_peer:     8,
+                        max_circuit_duration:      Duration::from_secs(7200),
+                        max_circuit_bytes:         0,
+                        ..Default::default()
+                    },
+                ),
+                dcutr:    dcutr::Behaviour::new(peer_id),
+                identify: identify::Behaviour::new(
+                    identify::Config::new("/ego/identify/1.0.0".to_string(), key.public())
+                        .with_interval(Duration::from_secs(60)),
+                ),
+                request_response: request_response::Behaviour::new(
+                    [(StreamProtocol::new("/ego/msg/1.1.0"), ProtocolSupport::Full)],
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(120)),
+                ),
+                autonat: autonat::Behaviour::new(peer_id, autonat::Config::default()),
+                ping:    ping::Behaviour::new(
+                    ping::Config::new().with_interval(Duration::from_secs(30)),
+                ),
+                gossipsub: gossipsub_behaviour,
+                kad:       kad_behaviour,
+            }
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
         .build();
@@ -1112,6 +1221,67 @@ async fn handle_event(
         SwarmEvent::Behaviour(EgoBehaviourEvent::Dcutr(event)) => {
             eprintln!("[P2P] DCUtR: {:?}", event);
         }
+
+        // ── Gossipsub: incoming broadcast (tx or block from any peer) ─────────
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Gossipsub(
+            gossipsub::Event::Message { message, .. },
+        )) => {
+            let topic = message.topic.to_string();
+            if topic == "ego-txs-v1" {
+                // TxBroadcast envelope: { type, tx, block }
+                if let Ok(P2PMessage::TxBroadcast { tx, block }) =
+                    serde_json::from_slice::<P2PMessage>(&message.data)
+                {
+                    let app2 = app.clone();
+                    tokio::spawn(async move { apply_incoming_tx(tx, block, &app2).await; });
+                }
+            } else if topic == "ego-blocks-v1" {
+                // ChainSyncResponse envelope: { type, blocks, transactions }
+                if let Ok(P2PMessage::ChainSyncResponse { blocks, transactions }) =
+                    serde_json::from_slice::<P2PMessage>(&message.data)
+                {
+                    let app2 = app.clone();
+                    tokio::spawn(async move { merge_remote_chain(blocks, transactions, &app2).await; });
+                }
+            }
+        }
+
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Gossipsub(
+            gossipsub::Event::Subscribed { peer_id: pid, topic },
+        )) => {
+            eprintln!("[Gossip] {} subscribed to {}", pid, topic);
+        }
+
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Gossipsub(_)) => {}
+
+        // ── Kademlia: new peer discovered via DHT ─────────────────────────────
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Kad(
+            kad::Event::RoutingUpdated { peer, addresses, .. },
+        )) => {
+            eprintln!("[DHT] Routing updated: {} ({} addrs)", peer, addresses.len());
+            // Try to connect so gossipsub mesh includes them.
+            if let Some(addr) = addresses.iter().next() {
+                let full: Multiaddr = format!("{}/p2p/{}", addr, peer)
+                    .parse()
+                    .unwrap_or_else(|_| addr.clone());
+                let _ = swarm.dial(full);
+            }
+        }
+
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Kad(
+            kad::Event::OutboundQueryProgressed { result, .. },
+        )) => {
+            if let kad::QueryResult::Bootstrap(Ok(
+                kad::BootstrapOk { num_remaining, .. },
+            )) = result
+            {
+                if num_remaining == 0 {
+                    eprintln!("[DHT] Bootstrap complete");
+                }
+            }
+        }
+
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Kad(_)) => {}
 
         _ => {}
     }
@@ -1622,6 +1792,13 @@ pub async fn fetch_chain_from_relay(app: &tauri::AppHandle) {
 }
 
 pub async fn push_tx_to_relay(tx: &crate::ledger::LedgerTx, block: &crate::ledger::LedgerBlock) {
+    // ── Gossipsub broadcast (true P2P — reaches all subscribers directly) ─────
+    let gossip_msg = P2PMessage::TxBroadcast { tx: tx.clone(), block: block.clone() };
+    if let Ok(data) = serde_json::to_vec(&gossip_msg) {
+        publish_gossip("ego-txs-v1", data).await;
+    }
+
+    // ── HTTP relay fallback (ensures the relay seed node also gets it) ────────
     let client = reqwest::Client::new();
     if let Err(e) = client.post(format!("{}/chain/tx", RELAY_HTTP_API))
         .json(tx).send().await
