@@ -9,6 +9,7 @@ edition = "2021"
 [dependencies]
 libp2p = { version = "0.56", features = [
     "tokio", "tcp", "noise", "yamux", "relay", "identify", "ping", "macros",
+    "gossipsub", "kad",
 ] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"

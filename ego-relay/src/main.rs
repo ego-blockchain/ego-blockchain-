@@ -36,10 +36,12 @@ use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
 use libp2p::{
-    identify, noise, ping, relay,
+    gossipsub, identify, kad, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux, Multiaddr, SwarmBuilder,
+    tcp, yamux, Multiaddr, PeerId, SwarmBuilder,
 };
+use std::sync::OnceLock;
+use tokio::sync::mpsc as tokio_mpsc;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -210,6 +212,11 @@ fn compute_drs_score(events: &[PocEventRecord], address: &str) -> f64 {
 }
 
 type PocState = Arc<RwLock<Vec<PocEventRecord>>>;
+
+/// Sender for gossip publishes pushed from HTTP handlers into the swarm loop.
+/// Holds (topic_string, message_bytes).
+static RELAY_GOSSIP_TX: OnceLock<tokio_mpsc::UnboundedSender<(String, Vec<u8>)>> =
+    OnceLock::new();
 
 // ── Persistent chain storage ──────────────────────────────────────────────────
 
@@ -544,6 +551,20 @@ async fn post_tx(
         }
     } else {
         println!("[chain] ✓ Verified tx {} from {} → {} ({} uEGOC)", tx.hash, tx.from, tx.to, tx.amount);
+        // Gossip to all connected desktop peers so they learn about this tx
+        // even if they have no direct contact relationship with the sender.
+        if let Some(gtx) = RELAY_GOSSIP_TX.get() {
+            // Use the same TxBroadcast shape the desktop gossip handler expects.
+            let stub_block = LedgerBlock { height: 0, hash: String::new(), prev_hash: String::new(),
+                timestamp: 0, miner: String::new(), tx_count: 1, size_bytes: 0, reward: 0 };
+            if let Ok(bytes) = serde_json::to_vec(&serde_json::json!({
+                "type": "tx_broadcast",
+                "tx": &tx,
+                "block": stub_block,
+            })) {
+                let _ = gtx.send(("ego-txs-v1".to_string(), bytes));
+            }
+        }
         chain.transactions.push(tx);
         save_chain(&chain);
     }
@@ -1287,9 +1308,13 @@ async fn get_poc_validators(
 
 #[derive(NetworkBehaviour)]
 struct RelayBehaviour {
-    relay:    relay::Behaviour,
-    identify: identify::Behaviour,
-    ping:     ping::Behaviour,
+    relay:     relay::Behaviour,
+    identify:  identify::Behaviour,
+    ping:      ping::Behaviour,
+    /// Gossipsub: fans out chain tx/block messages to all connected desktop nodes.
+    gossipsub: gossipsub::Behaviour,
+    /// Kademlia: the relay is the bootstrap node for the DHT network.
+    kad:       kad::Behaviour<kad::store::MemoryStore>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -1388,27 +1413,50 @@ async fn main() {
         .with_tokio()
         .with_tcp(tcp::Config::default().nodelay(true), noise::Config::new, yamux::Config::default)
         .expect("TCP transport")
-        .with_behaviour(|key| RelayBehaviour {
-            relay: relay::Behaviour::new(
-                peer_id,
-                relay::Config {
-                    max_reservations:          1024,
-                    max_reservations_per_peer: 32,
-                    reservation_duration:      Duration::from_secs(3600),
-                    max_circuits:              2048,
-                    max_circuits_per_peer:     128,
-                    max_circuit_duration:      Duration::from_secs(7200),
-                    max_circuit_bytes:         0,
-                    ..Default::default()
-                },
-            ),
-            identify: identify::Behaviour::new(
-                identify::Config::new("/ego/identify/1.0.0".to_string(), key.public())
-                    .with_interval(Duration::from_secs(60)),
-            ),
-            ping: ping::Behaviour::new(
-                ping::Config::new().with_interval(Duration::from_secs(30)),
-            ),
+        .with_behaviour(|key| {
+            // ── Gossipsub ─────────────────────────────────────────────────────
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                .heartbeat_interval(Duration::from_secs(10))
+                .validation_mode(gossipsub::ValidationMode::Permissive)
+                .max_transmit_size(512 * 1024)
+                .build()
+                .expect("relay gossipsub config");
+            let gossipsub_behaviour = gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::RandomAuthor,
+                gossipsub_config,
+            )
+            .expect("relay gossipsub::Behaviour");
+
+            // ── Kademlia ──────────────────────────────────────────────────────
+            // The relay IS the bootstrap node — it just answers DHT queries.
+            let store = kad::store::MemoryStore::new(peer_id);
+            let mut kad_behaviour = kad::Behaviour::new(peer_id, store);
+            kad_behaviour.set_mode(Some(kad::Mode::Server));
+
+            RelayBehaviour {
+                relay: relay::Behaviour::new(
+                    peer_id,
+                    relay::Config {
+                        max_reservations:          1024,
+                        max_reservations_per_peer: 32,
+                        reservation_duration:      Duration::from_secs(3600),
+                        max_circuits:              2048,
+                        max_circuits_per_peer:     128,
+                        max_circuit_duration:      Duration::from_secs(7200),
+                        max_circuit_bytes:         0,
+                        ..Default::default()
+                    },
+                ),
+                identify: identify::Behaviour::new(
+                    identify::Config::new("/ego/identify/1.0.0".to_string(), key.public())
+                        .with_interval(Duration::from_secs(60)),
+                ),
+                ping: ping::Behaviour::new(
+                    ping::Config::new().with_interval(Duration::from_secs(30)),
+                ),
+                gossipsub: gossipsub_behaviour,
+                kad: kad_behaviour,
+            }
         })
         .expect("behaviour")
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(3600)))
@@ -1416,6 +1464,20 @@ async fn main() {
 
     let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", p2p_port).parse().unwrap();
     swarm.listen_on(listen_addr).expect("listen");
+
+    // ── Gossipsub: subscribe to chain topics ──────────────────────────────────
+    let tx_topic    = gossipsub::IdentTopic::new("ego-txs-v1");
+    let blk_topic   = gossipsub::IdentTopic::new("ego-blocks-v1");
+    let _ = swarm.behaviour_mut().gossipsub.subscribe(&tx_topic);
+    let _ = swarm.behaviour_mut().gossipsub.subscribe(&blk_topic);
+
+    // ── Gossip channel: HTTP handlers publish here; swarm loop drains it ──────
+    let (gossip_tx, mut gossip_rx) =
+        tokio_mpsc::unbounded_channel::<(String, Vec<u8>)>();
+    let _ = RELAY_GOSSIP_TX.set(gossip_tx);
+
+    // Clone AppState for use inside the gossipsub message handler
+    let state_gossip = state.clone();
 
     println!("╔═══════════════════════════════════════════╗");
     println!("║       Ego Relay + Chain Seed v0.4.0       ║");
@@ -1425,7 +1487,19 @@ async fn main() {
     println!("HTTP port : {}", http_port);
 
     loop {
-        match swarm.select_next_some().await {
+        tokio::select! {
+            // ── Gossip publish from HTTP handlers ─────────────────────────────
+            Some((topic_str, data)) = gossip_rx.recv() => {
+                let topic = gossipsub::IdentTopic::new(topic_str.clone());
+                match swarm.behaviour_mut().gossipsub.publish(topic, data) {
+                    Ok(_) => {}
+                    Err(gossipsub::PublishError::NoPeersSubscribedToTopic) => {}
+                    Err(e) => eprintln!("[relay] gossip publish '{}': {:?}", topic_str, e),
+                }
+            }
+
+            // ── Swarm events ──────────────────────────────────────────────────
+            event = swarm.select_next_some() => match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 println!("[relay] Listening on {}", address);
             }
@@ -1445,8 +1519,60 @@ async fn main() {
             )) => {
                 println!("[relay] Circuit: {} -> {}", src_peer_id, dst_peer_id);
             }
+
+            // ── Gossipsub: incoming tx/block from any desktop peer ────────────
+            SwarmEvent::Behaviour(RelayBehaviourEvent::Gossipsub(
+                gossipsub::Event::Message { message, .. },
+            )) => {
+                let topic = message.topic.to_string();
+                if topic == "ego-txs-v1" {
+                    // Deserialize as the TxBroadcast envelope desktop uses
+                    #[derive(serde::Deserialize)]
+                    struct TxEnvelope { tx: LedgerTx }
+                    if let Ok(env) = serde_json::from_slice::<TxEnvelope>(&message.data) {
+                        let mut chain = state_gossip.chain.write().unwrap();
+                        if !chain.transactions.iter().any(|t| t.hash == env.tx.hash) {
+                            let mut tx = env.tx;
+                            tx.status = "Confirmed".to_string();
+                            println!("[gossip] Accepted tx {} via gossipsub", tx.hash);
+                            chain.transactions.push(tx);
+                            save_chain(&chain);
+                        }
+                    }
+                } else if topic == "ego-blocks-v1" {
+                    #[derive(serde::Deserialize)]
+                    struct BlkEnvelope { blocks: Vec<LedgerBlock>, #[serde(default)] transactions: Vec<LedgerTx> }
+                    if let Ok(env) = serde_json::from_slice::<BlkEnvelope>(&message.data) {
+                        let mut chain = state_gossip.chain.write().unwrap();
+                        let mut changed = false;
+                        for blk in env.blocks {
+                            if !chain.blocks.iter().any(|b| b.hash == blk.hash) {
+                                chain.blocks.push(blk); changed = true;
+                            }
+                        }
+                        for tx in env.transactions {
+                            if !chain.transactions.iter().any(|t| t.hash == tx.hash) {
+                                chain.transactions.push(tx); changed = true;
+                            }
+                        }
+                        if changed { save_chain(&chain); }
+                    }
+                }
+            }
+
+            SwarmEvent::Behaviour(RelayBehaviourEvent::Gossipsub(_)) => {}
+
+            // ── Kademlia ──────────────────────────────────────────────────────
+            SwarmEvent::Behaviour(RelayBehaviourEvent::Kad(
+                kad::Event::RoutingUpdated { peer, .. },
+            )) => {
+                println!("[kad] Routing updated: {}", peer);
+            }
+            SwarmEvent::Behaviour(RelayBehaviourEvent::Kad(_)) => {}
+
             _ => {}
-        }
+        } // end match event
+        } // end select!
     }
 }
 
