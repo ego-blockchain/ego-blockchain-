@@ -1,8 +1,9 @@
 use clap::{Arg, Command};
 use ego_core::{Address, Balance, Transaction, TransactionPayload};
-use ego_node::{NetworkType, Node, NodeRole};
+use ego_node::{NetworkType, Node, NodeRole, rpc::{RpcState, serve as rpc_serve}};
 use libp2p::{Multiaddr, futures::StreamExt};
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
@@ -105,6 +106,23 @@ async fn main() -> anyhow::Result<()> {
     info!("⚡ Optimization features setup completed");
 
     print_node_info(&node, &config);
+
+    // Start HTTP RPC server on port 8545
+    let rpc_state = Arc::new(RpcState {
+        state_manager: node.state_manager.clone(),
+        peer_id:       node.peer_id.to_string(),
+        pending_txs:   Mutex::new(Vec::new()),
+        recent_blocks: Mutex::new(Vec::new()),
+        node_stats:    Mutex::new(Default::default()),
+    });
+    let rpc_addr = format!("0.0.0.0:{}", 8545u16);
+    let rpc_state_clone = Arc::clone(&rpc_state);
+    tokio::spawn(async move {
+        if let Err(e) = rpc_serve(&rpc_addr, rpc_state_clone).await {
+            tracing::error!("RPC server error: {e}");
+        }
+    });
+    info!("🌐 HTTP RPC listening on 0.0.0.0:8545");
 
     if config.enable_interactive {
         info!("🖥️ Starting interactive mode");
