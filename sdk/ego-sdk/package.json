@@ -1,0 +1,20 @@
+{
+  "name": "@ego-blockchain/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for the Ego Blockchain network",
+  "main": "dist/index.js",
+  "module": "dist/index.esm.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest"
+  },
+  "keywords": ["ego", "blockchain", "sdk", "web3"],
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "@types/node": "^20.0.0"
+  }
+}
