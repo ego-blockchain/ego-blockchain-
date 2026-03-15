@@ -1,0 +1,12 @@
+[package]
+name    = "urego"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "urego"
+path = "src/main.rs"
+
+[dependencies]
+urego-compiler = { path = "../../crates/urego-compiler" }

@@ -1,0 +1,16 @@
+[package]
+name = "urego-compiler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Urego smart contract language compiler — source → WASM"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wat = "1.219"
+
+[dev-dependencies]
+tempfile = "3"

@@ -13,6 +13,7 @@ const NAV_ITEMS = [
   { path: '/egosafe',   label: 'EgoSafe',   icon: '🔐', desc: 'Encrypted sharing' },
   { path: '/messenger', label: 'Messages',  icon: '💬', desc: 'P2P encrypted chat' },
   { path: '/explorer',  label: 'Explorer',  icon: '🔍', desc: 'Blocks & txs' },
+  { path: '/contracts', label: 'Contracts', icon: '📜', desc: 'Deploy & interact' },
   { path: '/settings',  label: 'Settings',  icon: '⚙️',  desc: 'Preferences' },
 ];
 
