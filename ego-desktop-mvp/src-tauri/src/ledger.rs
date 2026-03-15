@@ -137,7 +137,24 @@ pub struct LedgerTx {
     /// Signs the same canonical bytes as `signature` — quantum-safe proof of intent.
     #[serde(default)]
     pub dilithium_signature: String,
+    /// TX type: "transfer" | "deploy" | "call"
+    #[serde(default = "default_tx_type")]
+    pub tx_type: String,
+    /// For deploy TXs: hex-encoded WASM bytecode
+    #[serde(default)]
+    pub wasm_code: String,
+    /// For call TXs: target contract address (hex)
+    #[serde(default)]
+    pub contract_addr: String,
+    /// For call TXs: entrypoint name
+    #[serde(default)]
+    pub entrypoint: String,
+    /// For deploy/call TXs: ABI-encoded arguments (hex)
+    #[serde(default)]
+    pub call_args: String,
 }
+
+fn default_tx_type() -> String { "transfer".to_string() }
 
 /// A local "block" produced whenever a transaction is confirmed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,6 +308,13 @@ pub fn chain_path() -> PathBuf {
     base_data_dir().join("chain.json")
 }
 
+/// Directory where contract WASM code and state are stored.
+pub fn contracts_dir() -> PathBuf {
+    let dir = base_data_dir().join("contracts");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
 pub const GENESIS_HASH: &str  = "ego00000000000000000000000000000000000000000000000000000000genesis1";
 pub const GENESIS_MINER: &str = "ego1genesis000000000000000000000000000000000000";
 pub const GENESIS_TS: i64     = 1_741_910_400; // 2026-03-14 00:00:00 UTC
@@ -380,6 +404,7 @@ impl SharedChain {
             public_key_ed25519:  String::new(),
             dilithium_pubkey:    String::new(),
             dilithium_signature: String::new(),
+            ..LedgerTx::default()
         };
         self.transactions.push(coinbase);
 

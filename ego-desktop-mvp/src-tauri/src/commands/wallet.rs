@@ -125,6 +125,7 @@ pub async fn send_transaction(
         public_key_ed25519:  pubkey_hex,
         dilithium_pubkey:    dil_pubkey_hex,
         dilithium_signature: dil_sig_hex,
+        ..LedgerTx::default()
     });
 
     // ── 4. Mine a block → confirms the tx ────────────────────────────────
@@ -224,6 +225,7 @@ pub async fn prepare_transaction(
         signature: signature_hex, status: "Pending".into(),
         block_height: None, nonce, public_key_ed25519: pubkey_hex,
         dilithium_pubkey: dil_pubkey_hex, dilithium_signature: dil_sig_hex,
+        ..LedgerTx::default()
     };
     chain.transactions.push(tx.clone());
     chain.mine_block(&tx_hash, &from);

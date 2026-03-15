@@ -184,7 +184,11 @@ fn main() {
             commands::consensus::respond_to_challenges,
             commands::consensus::get_post_score,
             commands::consensus::get_combined_drs,
-            commands::consensus::get_tokenomics
+            commands::consensus::get_tokenomics,
+            commands::contracts::deploy_contract,
+            commands::contracts::call_contract,
+            commands::contracts::get_contract_state,
+            commands::contracts::list_deployed_contracts
         ])
         .setup(|app| {
             // Show the window only after the frontend signals it's ready,

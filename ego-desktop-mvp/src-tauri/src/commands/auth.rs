@@ -293,6 +293,7 @@ fn create_wallet_files(address_override: Option<&str>) -> Result<String, EgoDesk
             block_height:       Some(genesis_block_height),
             nonce:              0,
             public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
+            ..LedgerTx::default()
         });
         chain.blocks.push(LedgerBlock {
             height:     genesis_block_height,

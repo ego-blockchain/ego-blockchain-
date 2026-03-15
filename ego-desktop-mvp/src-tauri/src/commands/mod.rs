@@ -9,3 +9,4 @@ pub mod explorer;
 pub mod notifications;
 pub mod messenger;
 pub mod consensus;
+pub mod contracts;

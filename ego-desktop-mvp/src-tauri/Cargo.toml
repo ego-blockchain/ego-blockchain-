@@ -34,6 +34,7 @@ bech32 = "0.9"
 
 # Ego Blockchain dependencies
 ego-core = { path = "../../crates/ego-core" }
+ego-vm   = { path = "../../crates/ego-vm" }
 
 # File system and encryption
 aes-gcm = "0.10"
