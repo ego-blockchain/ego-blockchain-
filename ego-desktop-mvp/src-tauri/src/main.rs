@@ -8,6 +8,7 @@ mod crypto;
 mod database;
 mod error;
 mod ledger;
+mod mempool;
 mod models;
 mod p2p;
 mod proof;
@@ -188,7 +189,9 @@ fn main() {
             commands::contracts::deploy_contract,
             commands::contracts::call_contract,
             commands::contracts::get_contract_state,
-            commands::contracts::list_deployed_contracts
+            commands::contracts::list_deployed_contracts,
+            commands::rollup::get_rollup_status,
+            commands::rollup::get_shard_stats
         ])
         .setup(|app| {
             // Show the window only after the frontend signals it's ready,
@@ -299,7 +302,15 @@ fn main() {
                 crate::commands::consensus::run_post_loop().await;
             });
 
-            // ── Task 4: background coverage loop ──────────────────────────
+            // ── Task 4: rollup batch loop ──────────────────────────────
+            // Drains the shard-partitioned mempool every 50 ms and mines
+            // one block per batch (up to 2,000 TXs × 16 shards = 32,000
+            // TXs per tick → ~100,000 TPS target).
+            tauri::async_runtime::spawn(async move {
+                crate::mempool::run_batch_loop().await;
+            });
+
+            // ── Task 5: background coverage loop ──────────────────────────
             // Runs every 60 s regardless of window visibility.
             // Handles: peer probing, PoC event recording, coverage status.
             // Keeps working when app is minimized or in system tray.

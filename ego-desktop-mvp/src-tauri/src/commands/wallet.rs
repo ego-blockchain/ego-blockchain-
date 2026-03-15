@@ -77,8 +77,8 @@ pub async fn send_transaction(
     }
 
     // ── 1. Validate balance from shared chain ─────────────────────────────
-    let mut chain   = load_chain();
-    let balance     = chain.balance_of(&from);
+    let chain   = load_chain();
+    let balance = chain.balance_of(&from);
 
     if request.amount == 0 {
         return Err(EgoDesktopError::InvalidInput("Amount must be > 0".into()));
@@ -110,8 +110,7 @@ pub async fn send_transaction(
 
     let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
 
-    // ── 3. Add tx to the shared chain as "Pending" ────────────────────────
-    chain.transactions.push(LedgerTx {
+    let tx = LedgerTx {
         hash:                tx_hash.clone(),
         from:                from.clone(),
         to:                  request.to_address.clone(),
@@ -126,48 +125,22 @@ pub async fn send_transaction(
         dilithium_pubkey:    dil_pubkey_hex,
         dilithium_signature: dil_sig_hex,
         ..LedgerTx::default()
-    });
+    };
 
-    // ── 4. Mine a block → confirms the tx ────────────────────────────────
-    chain.mine_block(&tx_hash, &from);
+    // ── 3. Route to mempool (batch loop will mine + broadcast) ───────────
+    // The TX is confirmed inside the next batch window (≤ BATCH_INTERVAL_MS).
+    // This decouples signing from disk I/O — enabling 100k TPS throughput.
+    crate::mempool::get_mempool().push(tx);
 
-    let block_height = chain
-        .transactions
-        .iter()
-        .find(|t| t.hash == tx_hash)
-        .and_then(|t| t.block_height);
-
-    // ── 5. Save chain locally ─────────────────────────────────────────────
-    save_chain(&chain)
-        .map_err(|e| EgoDesktopError::WalletError(format!("Save chain: {e}")))?;
-
-    // ── 6. Broadcast to relay + all P2P peers (fire-and-forget) ──────────
-    // a) Push to relay seed node → makes the tx globally visible immediately
-    //    (persisted forever, not deletable by any local user)
-    // b) Push to every P2P contact → real-time update for connected peers
-    if let (Some(tx_b), Some(blk_b)) = (
-        chain.transactions.iter().find(|t| t.hash == tx_hash).cloned(),
-        chain.blocks.last().cloned(),
-    ) {
-        let tx_relay  = tx_b.clone();
-        let blk_relay = blk_b.clone();
-        tokio::spawn(async move {
-            crate::p2p::push_tx_to_relay(&tx_relay, &blk_relay).await;
-        });
-        tokio::spawn(async move {
-            crate::p2p::broadcast_tx(tx_b, blk_b).await;
-        });
-    }
-
-    // ── 7. Persist updated nonce in per-wallet ledger ─────────────────────
+    // ── 4. Persist updated nonce in per-wallet ledger ─────────────────────
     ledger.nonce = nonce;
     let _ = ledger.save();
 
     Ok(TransactionResponse {
-        hash: tx_hash,
-        success: true,
-        message: "Transaction confirmed and broadcast to all nodes".into(),
-        block_height,
+        hash:         tx_hash,
+        success:      true,
+        message:      "Transaction queued — confirms within the next batch window".into(),
+        block_height: None, // assigned by batch loop
     })
 }
 

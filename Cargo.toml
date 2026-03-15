@@ -7,6 +7,8 @@ members = [
   "crates/ego-ffi",
   "crates/ego-vm",
   "bins/ego-node",
+  "crates/urego-compiler",
+  "bins/urego",
 ]
 resolver = "2"
 

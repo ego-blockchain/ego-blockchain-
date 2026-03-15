@@ -15,6 +15,7 @@ import StakingPage from './pages/StakingPage';
 import ExplorerPage from './pages/ExplorerPage';
 import SettingsPage from './pages/SettingsPage';
 import MessengerPage from './pages/MessengerPage';
+import ContractsPage from './pages/ContractsPage';
 import RegistrationFlow from './components/RegistrationFlow';
 
 // ── Theme context ─────────────────────────────────────────────────────────────
@@ -356,7 +357,8 @@ function App() {
                 <Route path="staking"  element={<StakingPage />} />
                 <Route path="explorer" element={<ExplorerPage />} />
                 <Route path="settings"   element={<SettingsPage />} />
-                <Route path="messenger" element={<MessengerPage />} />
+                <Route path="messenger"  element={<MessengerPage />} />
+                <Route path="contracts" element={<ContractsPage />} />
               </Route>
             </Routes>
           </div>
