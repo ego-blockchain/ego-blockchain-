@@ -5,6 +5,7 @@ members = [
   "crates/ego-consensus",
   "crates/ego-rollup",
   "crates/ego-ffi",
+  "crates/ego-vm",
   "bins/ego-node",
 ]
 resolver = "2"
