@@ -230,6 +230,12 @@ fn main() {
                 crate::p2p::broadcast_peer_announce(&handle_startup).await;
                 eprintln!("[Startup] Peer announce sent (endpoint: {})", my_endpoint);
 
+                // Also publish to DHT so peers can find us without the central relay
+                crate::p2p::dht_publish_self(&{
+                    let l = crate::ledger::Ledger::load(); l.address
+                }, &my_endpoint, "Ego Node").await;
+                crate::p2p::dht_discover_peers().await;
+
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 crate::p2p::sync_chain_from_peers().await;
                 eprintln!("[Startup] Chain sync requested");
@@ -260,8 +266,10 @@ fn main() {
                     };
                     if !ledger.address.is_empty() && !endpoint.is_empty() {
                         crate::p2p::register_with_relay(
-                            ledger.address, name, endpoint, city, country,
+                            ledger.address.clone(), name.clone(), endpoint.clone(), city, country,
                         ).await;
+                        // Also publish to DHT so peers can find us without the central relay
+                        crate::p2p::dht_publish_self(&ledger.address, &endpoint, &name).await;
                     }
 
                     crate::p2p::fetch_peers_from_relay(&handle_startup).await;

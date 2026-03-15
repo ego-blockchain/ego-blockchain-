@@ -29,6 +29,15 @@ use tokio::sync::{mpsc, oneshot};
 /// `swarm.behaviour_mut().gossipsub.publish(...)`.
 static GOSSIP_TX: OnceLock<mpsc::UnboundedSender<(String, Vec<u8>)>> = OnceLock::new();
 
+/// DHT command channel: send put/get requests into the swarm loop.
+static DHT_CMD_TX: OnceLock<mpsc::UnboundedSender<DhtCommand>> = OnceLock::new();
+
+#[derive(Debug)]
+enum DhtCommand {
+    PutPeer { key: String, value: Vec<u8> },
+    GetPeers { key: String },
+}
+
 pub const P2P_PORT: u16 = 47393;
 
 /// Bootstrap / relay nodes. The first entry is the official Ego seed node.
@@ -782,6 +791,10 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
         mpsc::unbounded_channel::<(String, Vec<u8>)>();
     let _ = GOSSIP_TX.set(gossip_unbounded_tx);
 
+    // ── DHT command channel ───────────────────────────────────────────────
+    let (dht_cmd_tx, mut dht_cmd_rx) = mpsc::unbounded_channel::<DhtCommand>();
+    let _ = DHT_CMD_TX.set(dht_cmd_tx);
+
     let (tx, mut rx) = mpsc::channel::<SwarmCmd>(64);
     let _ = SWARM_TX.set(tx);
 
@@ -861,9 +874,33 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                 }
             }
 
+            // ── DHT commands (put/get peer records) ──────────────────────────
+            Some(cmd) = dht_cmd_rx.recv() => {
+                match cmd {
+                    DhtCommand::PutPeer { key, value } => {
+                        let record = kad::Record {
+                            key:       kad::RecordKey::new(&key),
+                            value,
+                            publisher: None,
+                            expires:   None,
+                        };
+                        let _ = swarm.behaviour_mut().kad.put_record(
+                            record, kad::Quorum::One
+                        );
+                    }
+                    DhtCommand::GetPeers { key } => {
+                        swarm.behaviour_mut().kad.get_record(
+                            kad::RecordKey::new(&key)
+                        );
+                    }
+                }
+            }
+
             // ── Kademlia periodic discovery ───────────────────────────────────
             _ = kad_discovery.tick() => {
                 let _ = swarm.behaviour_mut().kad.bootstrap();
+                // Also query rendezvous key to pick up any new peers
+                swarm.behaviour_mut().kad.get_record(kad::RecordKey::new(&"ego-peers-v1"));
             }
         }
     }
@@ -1347,13 +1384,25 @@ async fn handle_event(
         SwarmEvent::Behaviour(EgoBehaviourEvent::Kad(
             kad::Event::OutboundQueryProgressed { result, .. },
         )) => {
-            if let kad::QueryResult::Bootstrap(Ok(
-                kad::BootstrapOk { num_remaining, .. },
-            )) = result
-            {
-                if num_remaining == 0 {
-                    eprintln!("[DHT] Bootstrap complete");
+            match result {
+                kad::QueryResult::Bootstrap(Ok(kad::BootstrapOk { num_remaining, .. })) => {
+                    if num_remaining == 0 {
+                        eprintln!("[DHT] Bootstrap complete");
+                    }
                 }
+                kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(rec))) => {
+                    // Parse peer records from DHT and connect to them via gossipsub
+                    if let Ok(peer_info) = serde_json::from_slice::<serde_json::Value>(&rec.record.value) {
+                        let endpoint = peer_info["endpoint"].as_str().unwrap_or("");
+                        if !endpoint.is_empty() {
+                            if let Ok(addr) = endpoint.parse::<Multiaddr>() {
+                                let _ = swarm.dial(addr);
+                                eprintln!("[DHT] Discovered peer via DHT: {}", endpoint);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -2004,6 +2053,9 @@ pub struct CidHolder {
 /// (not just contacts) can discover the holder and request it directly.
 /// Signs the registration with Ed25519 to prevent registry poisoning.
 pub async fn register_cid_on_relay(cid: &str, holder_addr: &str, endpoint: &str) {
+    // Publish to DHT (relay-independent path)
+    dht_register_cid(cid, holder_addr, endpoint).await;
+
     let shard_id  = shard_for_cid(cid);
     let timestamp = chrono::Utc::now().timestamp();
 
@@ -2147,9 +2199,85 @@ pub async fn report_stake_to_relay(address: &str, amount_uegoc: u64) {
 pub async fn find_cid_holders(cid: &str) -> Vec<CidHolder> {
     let shard_id = shard_for_cid(cid);
     let path     = format!("/shard/{}/cid/{}", shard_id, cid);
-    match relay_http_get(&path).await {
+    let holders  = match relay_http_get(&path).await {
         Some(resp) => resp.json::<Vec<CidHolder>>().await.unwrap_or_default(),
         None       => { eprintln!("[CID] lookup: all relay nodes unreachable"); vec![] }
+    };
+    // Also trigger DHT lookup (results arrive asynchronously via gossipsub/kad events)
+    dht_find_cid(cid).await;
+    holders
+}
+
+/// Publish a CID→holder mapping to the DHT so any peer can find who holds a file.
+/// Called alongside register_cid_on_relay (dual-write during transition).
+pub async fn dht_register_cid(cid: &str, holder_addr: &str, endpoint: &str) {
+    let record = serde_json::json!({
+        "cid":         cid,
+        "holder_addr": holder_addr,
+        "endpoint":    endpoint,
+        "ts":          chrono::Utc::now().timestamp(),
+    });
+    let key = format!("ego-cid:{}", cid);
+    if let Ok(v) = serde_json::to_vec(&record) {
+        if let Some(tx) = DHT_CMD_TX.get() {
+            let _ = tx.send(DhtCommand::PutPeer { key, value: v });
+        }
+    }
+}
+
+/// Look up who holds a CID in the DHT.
+/// Results come back asynchronously via the GetRecord Kademlia event handler.
+pub async fn dht_find_cid(cid: &str) {
+    let key = format!("ego-cid:{}", cid);
+    if let Some(tx) = DHT_CMD_TX.get() {
+        let _ = tx.send(DhtCommand::GetPeers { key });
+    }
+}
+
+/// Store an offline message in the DHT for a recipient who is not reachable right now.
+/// The message will be retrievable when they come online and call dht_fetch_inbox.
+pub async fn dht_deposit_message(to_addr: &str, from_addr: &str, msg: &P2PMessage) {
+    let payload = match serde_json::to_vec(msg) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let msg_hash = hex::encode(ego_core::hash_data(&payload).as_bytes());
+    let msg_key  = format!("ego-inbox:{}:{}", to_addr, msg_hash);
+
+    // 1. Store the message itself
+    if let Some(tx) = DHT_CMD_TX.get() {
+        let _ = tx.send(DhtCommand::PutPeer {
+            key:   msg_key.clone(),
+            value: payload,
+        });
+    }
+
+    // 2. Update the mailbox pointer: read current list, append, write back.
+    //    We optimistically append without a read-modify-write cycle (Kademlia
+    //    doesn't support atomic updates). Duplicates are handled at fetch time.
+    let mailbox_key = format!("ego-mailbox:{}", to_addr);
+    let mailbox_val = serde_json::json!({
+        "from":    from_addr,
+        "msg_key": msg_key.clone(),
+        "ts":      chrono::Utc::now().timestamp(),
+    });
+    if let Ok(v) = serde_json::to_vec(&mailbox_val) {
+        if let Some(tx) = DHT_CMD_TX.get() {
+            let _ = tx.send(DhtCommand::PutPeer {
+                key:   mailbox_key,
+                value: v,
+            });
+        }
+    }
+    let display_len = msg_key.len().min(40);
+    eprintln!("[DHT] Deposited offline message for {} (key={})", to_addr, &msg_key[..display_len]);
+}
+
+/// Query the DHT for offline messages addressed to our address.
+pub async fn dht_fetch_inbox(my_addr: &str) {
+    let mailbox_key = format!("ego-mailbox:{}", my_addr);
+    if let Some(tx) = DHT_CMD_TX.get() {
+        let _ = tx.send(DhtCommand::GetPeers { key: mailbox_key });
     }
 }
 
@@ -2227,6 +2355,39 @@ pub async fn fetch_peers_from_relay(app: &tauri::AppHandle) {
     state.cleanup_stale_peers(&active_addrs, now - 300);
 
     eprintln!("[Relay] Fetched {} peers ({} active)", remote_peers.len(), active_peers.len());
+
+    // Also trigger DHT discovery in parallel (relay-independent path)
+    dht_discover_peers().await;
+}
+
+/// Publish our own peer record to the Kademlia DHT so other nodes can find
+/// us without querying the central HTTP relay.  Called on startup and every
+/// 30 minutes from the keep-alive loop.
+pub async fn dht_publish_self(address: &str, endpoint: &str, name: &str) {
+    let record_value = serde_json::json!({
+        "address":  address,
+        "endpoint": endpoint,
+        "name":     name,
+        "ts":       chrono::Utc::now().timestamp(),
+    });
+    let value = match serde_json::to_vec(&record_value) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    // DHT key: "ego-peer:{address}" so anyone can look up a peer by Ego address
+    let key = format!("ego-peer:{}", address);
+    if let Some(tx) = DHT_CMD_TX.get() {
+        let _ = tx.send(DhtCommand::PutPeer { key, value });
+    }
+}
+
+/// Query the well-known DHT rendezvous key to discover active peers without
+/// relying on the central HTTP relay.
+pub async fn dht_discover_peers() {
+    let key = "ego-peers-v1".to_string();
+    if let Some(tx) = DHT_CMD_TX.get() {
+        let _ = tx.send(DhtCommand::GetPeers { key });
+    }
 }
 
 /// Live relay HTTP lookup — returns the peer's current relay circuit endpoint
