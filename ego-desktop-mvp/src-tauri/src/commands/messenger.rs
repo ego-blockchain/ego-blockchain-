@@ -630,7 +630,6 @@ pub async fn rename_contact(
 
 /// Deposit a P2PMessage in the relay inbox for offline delivery.
 pub async fn deposit_in_relay_inbox(to_addr: &str, from_addr: &str, msg: &crate::p2p::P2PMessage) {
-    let relay_api = crate::p2p::RELAY_HTTP_API;
     let payload = match serde_json::to_string(msg) {
         Ok(j) => STANDARD.encode(j.as_bytes()),
         Err(e) => { eprintln!("[Inbox] Serialize error: {}", e); return; }
@@ -640,11 +639,11 @@ pub async fn deposit_in_relay_inbox(to_addr: &str, from_addr: &str, msg: &crate:
         "deposited": chrono::Utc::now().timestamp(),
         "from_addr": from_addr,
     });
-    let url = format!("{}/inbox/{}", relay_api, to_addr);
-    let client = reqwest::Client::new();
-    match client.post(&url).json(&body).send().await {
-        Ok(_)  => eprintln!("[Inbox] Deposited message for {} in relay inbox", to_addr),
-        Err(e) => eprintln!("[Inbox] Failed to deposit in relay inbox: {}", e),
+    let path = format!("/inbox/{}", to_addr);
+    if crate::p2p::relay_http_post_json(&path, &body).await {
+        eprintln!("[Inbox] Deposited message for {} in relay inbox", to_addr);
+    } else {
+        eprintln!("[Inbox] Failed to deposit in relay inbox: all relay nodes unreachable");
     }
 }
 
@@ -655,12 +654,10 @@ pub async fn fetch_relay_inbox(app: &tauri::AppHandle) {
     let my_addr = ledger.address.clone();
     if my_addr.is_empty() { return; }
 
-    let relay_api = crate::p2p::RELAY_HTTP_API;
-    let url = format!("{}/inbox/{}", relay_api, my_addr);
-    let client = reqwest::Client::new();
-    let msgs: Vec<serde_json::Value> = match client.get(&url).send().await {
-        Ok(r)  => r.json().await.unwrap_or_default(),
-        Err(e) => { eprintln!("[Inbox] Fetch error: {}", e); return; }
+    let path = format!("/inbox/{}", my_addr);
+    let msgs: Vec<serde_json::Value> = match crate::p2p::relay_http_get(&path).await {
+        Some(r) => r.json().await.unwrap_or_default(),
+        None    => { eprintln!("[Inbox] Fetch error: all relay nodes unreachable"); return; }
     };
 
     if msgs.is_empty() { return; }

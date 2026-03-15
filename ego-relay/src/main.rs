@@ -556,8 +556,12 @@ struct PostChallenge {
     comm_d:          String,
     n_real_leaves:   usize,
     n_padded_leaves: usize,
-    /// 32-byte random seed (hex) — deterministically selects which leaves to prove.
+    /// 32-byte seed (hex) derived deterministically from block hash — any node can verify.
     challenge_seed:  String,
+    /// The block hash used to derive challenge_seed — desktop uses this for proof construction.
+    challenge_block_hash: String,
+    /// The challenge window number (unix_ts / POST_WINDOW_SECS) used in derivation.
+    challenge_window: u64,
     issued_at:       i64,
     /// Unix deadline: prover must respond before this time.
     deadline:        i64,
@@ -638,6 +642,14 @@ fn derive_challenge_indices(seed: &[u8; 32], n_real: usize) -> Vec<u64> {
     }).collect()
 }
 
+/// Derive PoST challenge seed deterministically from block hash + prover address + window.
+/// Any node can compute this independently — no central issuer needed.
+fn derive_post_challenge(block_hash: &str, prover_addr: &str, cid: &str, window: u64) -> String {
+    let input = format!("post-challenge:{}:{}:{}:{}", block_hash, prover_addr, cid, window);
+    let hash = blake3::hash(input.as_bytes());
+    hex::encode(hash.as_bytes())
+}
+
 /// Verify all POST_N_CHALLENGES proofs against comm_d + challenge_seed.
 fn verify_post_proofs(
     proofs_json:    &[serde_json::Value],
@@ -689,11 +701,35 @@ struct DrsComponents {
     stake:    f64,
 }
 
+/// Staking contract address — must match STAKING_ADDR in ego-desktop-mvp/src-tauri/src/commands/staking.rs.
+const STAKE_CONTRACT_ADDR: &str = "egot1staking000000000000000000000000000000000";
+
+/// Compute the net staked amount for an address from on-chain TX history.
+/// Sums all confirmed stake TXs (user → contract, memo="stake") minus unstake TXs
+/// (user → contract, memo="unstake") so the relay never needs a separate stake registry.
+fn chain_stake_for(address: &str, chain: &SharedChain) -> u64 {
+    let staked_in: u64 = chain.transactions.iter()
+        .filter(|t| t.from == address
+                 && t.to   == STAKE_CONTRACT_ADDR
+                 && t.memo.as_deref() == Some("stake")
+                 && t.status == "Confirmed")
+        .map(|t| t.amount)
+        .sum();
+    let staked_out: u64 = chain.transactions.iter()
+        .filter(|t| t.from == address
+                 && t.to   == STAKE_CONTRACT_ADDR
+                 && t.memo.as_deref() == Some("unstake")
+                 && t.status == "Confirmed")
+        .map(|t| t.amount)
+        .sum();
+    staked_in.saturating_sub(staked_out)
+}
+
 fn compute_combined_drs(
-    address:        &str,
-    poc_events:     &[PocEventRecord],
-    porep_sectors:  &HashMap<String, PoRepSector>,
-    stake_registry: &HashMap<String, StakeRecord>,
+    address:       &str,
+    poc_events:    &[PocEventRecord],
+    porep_sectors: &HashMap<String, PoRepSector>,
+    chain:         &SharedChain,
 ) -> DrsComponents {
     let now    = chrono::Utc::now().timestamp();
     let cutoff = now - 86_400;
@@ -723,10 +759,8 @@ fn compute_combined_drs(
     let ratio       = if total_w > 0.0 { proved / total_w } else { 0.0 };
     let post_score  = active * ratio * (1.0 + total_gb).ln();
 
-    // ── Stake component (20 %) ────────────────────────────────────────────
-    let staked_uegoc = stake_registry.get(address)
-        .map(|r| r.amount_uegoc)
-        .unwrap_or(0) as f64;
+    // ── Stake component (20 %) — read from on-chain TX history ────────────
+    let staked_uegoc = chain_stake_for(address, chain) as f64;
     let staked_egoc  = staked_uegoc / 1_000_000.0;
     let stake_score  = (1.0 + staked_egoc / 100.0).ln();
 
@@ -1118,9 +1152,9 @@ async fn post_block(
             .collect::<std::collections::HashSet<_>>()
             .len();
         if unique_validators >= POC_BOOTSTRAP_THRESHOLD {
-            let porep = s.porep_sectors.read().unwrap();
-            let stake = s.stake_registry.read().unwrap();
-            let drs = compute_combined_drs(&block.miner, &poc, &porep, &stake);
+            let porep  = s.porep_sectors.read().unwrap();
+            let chain_ = s.chain.read().unwrap();
+            let drs = compute_combined_drs(&block.miner, &poc, &porep, &chain_);
             if drs.combined < MIN_DRS {
                 println!("[chain] Rejected block #{} from {}: DRS {:.4} < {:.2} (validators={})",
                     block.height, block.miner, drs.combined, MIN_DRS, unique_validators);
@@ -2125,14 +2159,34 @@ async fn post_porep_commit(
 }
 
 /// GET /post/challenges/:address — return pending PoST challenges for a prover.
+/// Seeds are re-derived from the current chain tip so any node can independently verify them.
 async fn get_post_challenges(
     Path(address): Path<String>,
     State(s): State<AppState>,
 ) -> Json<Vec<PostChallenge>> {
-    let map = s.post_challenges.read().unwrap();
     let now = chrono::Utc::now().timestamp();
-    let challenges: Vec<PostChallenge> = map.get(&address)
-        .map(|v| v.iter().filter(|c| c.deadline > now).cloned().collect())
+    // Get current chain tip hash for deterministic seed derivation.
+    let tip_hash = {
+        let chain = s.chain.read().unwrap();
+        chain.blocks.last()
+            .map(|b| b.hash.clone())
+            .unwrap_or_else(|| GENESIS_HASH.into())
+    };
+    let window = (now as u64) / (POST_WINDOW_SECS as u64);
+    let mut map = s.post_challenges.write().unwrap();
+    let challenges: Vec<PostChallenge> = map.get_mut(&address)
+        .map(|v| {
+            v.iter_mut()
+                .filter(|c| c.deadline > now)
+                .map(|c| {
+                    // Re-derive seed from current tip — keeps challenge verifiable by any node.
+                    c.challenge_seed = derive_post_challenge(&tip_hash, &address, &c.cid, window);
+                    c.challenge_block_hash = tip_hash.clone();
+                    c.challenge_window = window;
+                    c.clone()
+                })
+                .collect()
+        })
         .unwrap_or_default();
     Json(challenges)
 }
@@ -2346,10 +2400,19 @@ fn start_post_challenger(state: AppState) {
             let mut reg      = state.porep_sectors.write().unwrap();
             let mut issued   = 0u32;
 
+            // Derive challenge seed deterministically from the current chain tip hash.
+            // Any node can independently compute and verify the same challenge.
+            let tip_hash = {
+                let chain = state.chain.read().unwrap();
+                chain.blocks.last()
+                    .map(|b| b.hash.clone())
+                    .unwrap_or_else(|| GENESIS_HASH.into())
+            };
+            let window = (now as u64) / (POST_WINDOW_SECS as u64);
+
             for sector in &sectors_to_challenge {
-                // Generate 32-byte random challenge seed.
-                let mut seed = [0u8; 32];
-                rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+                // Derive deterministic seed from block hash + prover + cid + window.
+                let seed_hex = derive_post_challenge(&tip_hash, &sector.prover_addr, &sector.cid, window);
 
                 let challenge = PostChallenge {
                     challenge_id:    uuid::Uuid::new_v4().to_string(),
@@ -2358,7 +2421,9 @@ fn start_post_challenger(state: AppState) {
                     comm_d:          sector.comm_d.clone(),
                     n_real_leaves:   sector.n_real_leaves,
                     n_padded_leaves: sector.n_padded_leaves,
-                    challenge_seed:  hex::encode(seed),
+                    challenge_seed:  seed_hex,
+                    challenge_block_hash: tip_hash.clone(),
+                    challenge_window: window,
                     issued_at:       now,
                     deadline:        now + POST_WINDOW_SECS,
                 };
@@ -2568,13 +2633,13 @@ async fn get_poc_score(
 ) -> Json<DrsScoreResponse> {
     let events  = s.poc_events.read().unwrap();
     let porep   = s.porep_sectors.read().unwrap();
-    let stake   = s.stake_registry.read().unwrap();
+    let chain_  = s.chain.read().unwrap();
     let now     = chrono::Utc::now().timestamp();
     let cutoff  = now - 86_400;
     let events_24h   = events.iter().filter(|e| e.address == address && e.timestamp >= cutoff).count() as u32;
     let total_events = events.iter().filter(|e| e.address == address).count() as u64;
     let last_event   = events.iter().filter(|e| e.address == address).map(|e| e.timestamp).max();
-    let drs          = compute_combined_drs(&address, &events, &porep, &stake);
+    let drs          = compute_combined_drs(&address, &events, &porep, &chain_);
     let drs_score    = drs.combined;
 
     // Rank among all validators (any address with combined DRS > 0)
@@ -2582,7 +2647,7 @@ async fn get_poc_score(
         .map(|e| e.address.clone())
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
-        .map(|a| { let sc = compute_combined_drs(&a, &events, &porep, &stake).combined; (a, sc) })
+        .map(|a| { let sc = compute_combined_drs(&a, &events, &porep, &chain_).combined; (a, sc) })
         .filter(|(_, sc)| *sc > 0.0)
         .collect();
     all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -2617,7 +2682,7 @@ async fn get_poc_validators(
 ) -> Json<Vec<ValidatorInfo>> {
     let events = s.poc_events.read().unwrap();
     let porep  = s.porep_sectors.read().unwrap();
-    let stake  = s.stake_registry.read().unwrap();
+    let chain_ = s.chain.read().unwrap();
     let now    = chrono::Utc::now().timestamp();
     let cutoff = now - 86_400;
 
@@ -2632,7 +2697,7 @@ async fn get_poc_validators(
         .filter(|(_, (cnt, _))| *cnt > 0)
         .map(|(addr, (cnt, last))| ValidatorInfo {
             address:    addr.clone(),
-            drs_score:  compute_combined_drs(addr, &events, &porep, &stake).combined,
+            drs_score:  compute_combined_drs(addr, &events, &porep, &chain_).combined,
             events_24h: *cnt,
             last_event: *last,
             rank:       0,
@@ -2704,7 +2769,6 @@ async fn post_stake_update(
 /// GET /tokenomics — total supply, emission pools, halving schedule, staking stats.
 async fn get_tokenomics(State(s): State<AppState>) -> Json<serde_json::Value> {
     let chain = s.chain.read().unwrap();
-    let stake = s.stake_registry.read().unwrap();
 
     // Circulating supply = confirmed outbound from faucet (genesis + all rewards)
     let faucet = "egot1faucet000000000000000000000000000000000000";
@@ -2723,9 +2787,19 @@ async fn get_tokenomics(State(s): State<AppState>) -> Json<serde_json::Value> {
     let next_halving_blk  = (era + 1) * HALVING_INTERVAL;
     let blocks_to_halving = next_halving_blk.saturating_sub(max_height);
 
-    // Staking stats
-    let total_staked: u64 = stake.values().map(|r| r.amount_uegoc).sum();
-    let active_stakers    = stake.values().filter(|r| r.amount_uegoc > 0).count();
+    // Staking stats — derived from on-chain TX history (source of truth)
+    let stakers: std::collections::HashSet<&str> = chain.transactions.iter()
+        .filter(|t| t.to == STAKE_CONTRACT_ADDR
+                 && t.memo.as_deref() == Some("stake")
+                 && t.status == "Confirmed")
+        .map(|t| t.from.as_str())
+        .collect();
+    let total_staked: u64 = stakers.iter()
+        .map(|addr| chain_stake_for(addr, &chain))
+        .sum();
+    let active_stakers = stakers.iter()
+        .filter(|addr| chain_stake_for(addr, &chain) > 0)
+        .count();
 
     Json(serde_json::json!({
         "total_supply_uegoc":  TOTAL_SUPPLY_UEGOC,
