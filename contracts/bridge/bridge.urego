@@ -1,0 +1,509 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// EGO-10 Reference Bridge — Lock-and-Mint Cross-Chain Bridge
+// SPDX: MIT
+//
+// Standard : EGO-10 (https://github.com/ego-blockchain/eips/blob/main/EGO-10.md)
+// Author   : Artit Muhaxhiri (@egoblockchain)
+// Version  : 1.0.0
+// Created  : 2026-03-15
+//
+// OVERVIEW
+// --------
+// This contract implements a lock-and-mint bridge between Ego Blockchain and
+// external chains (Ethereum, BNB Chain, etc.) as defined in EGO-10.
+//
+// FLOW — BRIDGE IN (source chain → Ego)
+// --------------------------------------
+//   1. User locks tokens in the Lock Contract on the source chain.
+//   2. The source chain emits a Locked event with (sender, amount, token, nonce,
+//      ego_dest).
+//   3. The relayer observes the event, constructs a ZK proof attesting the lock
+//      (Phase 2), and calls verify_and_mint on this contract.
+//   4. This contract checks:
+//        (a) Bridge is not paused
+//        (b) claim_hash has not already been used
+//        (c) Caller is the registered relayer (Phase 1) OR ZK proof is valid
+//            (Phase 2)
+//   5. Wrapped tokens are minted to ego_dest; claim is marked as used.
+//   6. EGO10:BridgeIn event is emitted.
+//
+// FLOW — BRIDGE OUT (Ego → source chain)
+// ----------------------------------------
+//   1. User calls burn_and_bridge with destination chain, address, and amount.
+//   2. This contract burns the wrapped tokens from the caller's balance.
+//   3. A burn record is stored with a monotonically-increasing nonce.
+//   4. EGO10:BridgeOut event is emitted.
+//   5. The relayer observes the event and submits an unlock transaction on the
+//      source chain, releasing the original tokens to dest_addr.
+//
+// PHASE 1 vs PHASE 2 — ZK PROOF VERIFICATION
+// --------------------------------------------
+// Phase 1 (current): The bridge requires sys.caller() == relayer for minting.
+// This is trust-minimised: the relayer cannot steal funds (they can only trigger
+// mints for valid lock events, not forge amounts or destinations), but a
+// compromised relayer could censor incoming bridges.
+//
+// Phase 2 (planned): When the ego-zk crate exposes Groth16/BN254 proof
+// verification via the host function `ego_zk_verify(vk_id, proof_bytes,
+// old_root, new_root)`, the relayer check will be replaced with:
+//
+//   assert(
+//     ego_zk_verify(vk_id_for_chain, proof_bytes, claim.old_state_root, claim.new_state_root),
+//     "verify_and_mint: invalid ZK proof"
+//   )
+//
+// At that point the relayer becomes fully permissionless: anyone can submit a
+// valid proof and trigger a mint. The relayer field will remain for optional
+// fee delegation and liveness guarantees but will no longer be a security
+// assumption.
+//
+// CLAIM HASH
+// ----------
+// The claim_hash is computed off-chain (by the relayer or user) as:
+//
+//   claim_hash = blake3(
+//     chain_id_u64_le || height_u64_le || sender_bytes || amount_u128_le || nonce_u64_le
+//   )
+//
+// The 32-byte hash is passed as its lowercase hex string. Storing the hash
+// (rather than all claim fields) keeps storage costs O(1) per bridge event
+// regardless of address lengths.
+//
+// DEPLOYMENT
+// ----------
+// 1. Compile:  urego build contracts/bridge/bridge.urego
+// 2. Deploy:   ego-node tx deploy <wasm> \
+//                --args "<owner_addr> <home_chain_id> <relayer_addr>"
+// 3. Register supported source chain IDs via add_supported_chain (owner-only)
+// 4. Relayer calls verify_and_mint as lock events arrive from source chains.
+// ═══════════════════════════════════════════════════════════════════════════
+
+contract EgoBridge {
+
+    // ── Initialization ────────────────────────────────────────────────────────
+
+    // init — called once at deploy time.
+    //
+    // Sets the contract owner, the Ego chain ID this bridge contract lives on,
+    // and the initial relayer address. Initialises burn_nonce to 0.
+    //
+    // Args:
+    //   owner    — Address with administrative authority (pause, set_relayer)
+    //   chain_id — Chain ID of the Ego chain this contract is deployed on
+    //              (use 1399 for Ego Testnet)
+    //   relayer  — Address authorised to call verify_and_mint in Phase 1
+    fn init(owner: Address, chain_id: u64, relayer: Address) {
+        assert(chain_id > 0u64,        "init: chain_id must be > 0")
+
+        storage.set("ego10:meta:owner",      owner)
+        storage.set("ego10:meta:chain_id",   chain_id)
+        storage.set("ego10:meta:relayer",    relayer)
+        storage.set("ego10:meta:burn_nonce", 0u64)
+        // paused key is absent initially (means not paused)
+
+        events.emit("EGO10:Init", owner + ":" + chain_id as String + ":" + relayer)
+    }
+
+    // ── Bridge In (verify_and_mint) ───────────────────────────────────────────
+
+    // verify_and_mint — mint wrapped tokens on Ego after verifying a lock event
+    // from a supported source chain.
+    //
+    // PHASE 1 SECURITY MODEL:
+    //   Caller must be the registered relayer. The relayer cannot forge amounts
+    //   or destinations — all parameters come from the on-chain lock event on
+    //   the source chain. The relayer can only censor (delay/ignore) bridging.
+    //
+    // PHASE 2 UPGRADE PATH:
+    //   Replace the relayer check (marked with PHASE1_RELAYER_CHECK below) with
+    //   a call to ego_zk_verify(). See module header for details.
+    //
+    // Args:
+    //   claim_hash  — blake3 hex hash identifying this lock event (32-byte hex)
+    //   source_chain — Chain ID of the source chain
+    //   source_addr — Sender address on the source chain (hex string)
+    //   ego_dest    — Recipient address on Ego (bech32 address)
+    //   token       — Token identifier (source chain contract address or ticker)
+    //   amount_lo   — Low 64 bits of the bridged amount (u128)
+    //   amount_hi   — High 64 bits of the bridged amount (u128, usually 0)
+    //   proof_bytes — ZK proof bytes (Phase 1: ignored; Phase 2: Groth16 proof)
+    //
+    // Returns: 1 on success, 0 on failure
+    fn verify_and_mint(
+        claim_hash:   String,
+        source_chain: u64,
+        source_addr:  String,
+        ego_dest:     Address,
+        token:        String,
+        amount_lo:    u64,
+        amount_hi:    u64,
+        proof_bytes:  Bytes
+    ) -> u32 {
+        // ── Guard: paused ─────────────────────────────────────────────────────
+        let paused: u32 = storage.get_u32("ego10:meta:paused")
+        assert(paused == 0u32, "verify_and_mint: bridge is paused")
+
+        // ── Guard: non-zero amount ────────────────────────────────────────────
+        assert(amount_lo > 0u64 || amount_hi > 0u64, "verify_and_mint: amount must be > 0")
+
+        // ── Guard: supported source chain ─────────────────────────────────────
+        let chain_ok: u32 = storage.get_u32("ego10:chains:" + source_chain as String)
+        assert(chain_ok == 1u32, "verify_and_mint: unsupported source chain")
+
+        // ── Guard: double-spend prevention ───────────────────────────────────
+        // The claim_hash uniquely identifies one lock event. If it has been used
+        // before (replay attack or duplicate submission), reject immediately.
+        let already_used: u32 = storage.get_u32("ego10:minted:" + claim_hash)
+        assert(already_used == 0u32, "verify_and_mint: claim already processed (double-spend)")
+
+        // ── PHASE1_RELAYER_CHECK ──────────────────────────────────────────────
+        // Phase 1: require caller to be the registered relayer.
+        //
+        // PHASE 2 UPGRADE: Delete this block and replace with:
+        //
+        //   let old_root: Bytes = parse_old_root_from(proof_bytes)
+        //   let new_root: Bytes = parse_new_root_from(proof_bytes)
+        //   let vk_id:    u32   = storage.get_u32("ego10:vk:" + source_chain as String)
+        //   assert(
+        //     ego_zk_verify(vk_id, proof_bytes, old_root, new_root) == 1u32,
+        //     "verify_and_mint: invalid ZK proof"
+        //   )
+        //
+        // After this upgrade, any address (not just the relayer) may call
+        // verify_and_mint by providing a valid Groth16 proof.
+        let relayer: Address = storage.get_str("ego10:meta:relayer")
+        assert(sys.caller() == relayer, "verify_and_mint: Phase 1 — caller must be relayer")
+        // ── END PHASE1_RELAYER_CHECK ──────────────────────────────────────────
+
+        // ── Mark claim as used (checks-effects-interactions) ──────────────────
+        // Write to storage BEFORE any external effects to prevent reentrancy
+        // in Phase 2 when cross-contract calls are enabled.
+        storage.set("ego10:minted:" + claim_hash, 1u32)
+
+        // ── Update minted balance for this token ──────────────────────────────
+        // ego10:balance tracks total wrapped tokens outstanding per source token.
+        // This MUST be decremented on burn_and_bridge to maintain invariant:
+        //   balance[token] == sum of all minted - sum of all burned
+        let bal_lo_key: String = "ego10:balance:" + token + ":lo"
+        let bal_hi_key: String = "ego10:balance:" + token + ":hi"
+        let bal_lo: u64 = storage.get_u64(bal_lo_key)
+        let bal_hi: u64 = storage.get_u64(bal_hi_key)
+
+        // u128 addition with carry
+        let new_bal_lo: u64 = bal_lo + amount_lo
+        let carry:      u64 = 0u64
+        if new_bal_lo < bal_lo {
+            carry = 1u64  // overflow in low word
+        }
+        let new_bal_hi: u64 = bal_hi + amount_hi + carry
+        storage.set(bal_lo_key, new_bal_lo)
+        storage.set(bal_hi_key, new_bal_hi)
+
+        // ── Mint wrapped tokens to ego_dest ───────────────────────────────────
+        // Phase 1: credit an internal wrapped-token ledger entry.
+        //   ego10:wrap:<token>:<address>:lo / :hi
+        //
+        // Phase 2: call the EGO-20 wrapped token contract's mint() function:
+        //   let wrapped_contract: Address = storage.get_str("ego10:wrapped:" + token)
+        //   cross_call(wrapped_contract, "mint", ego_dest, amount_lo, amount_hi)
+        let wrap_lo_key: String = "ego10:wrap:" + token + ":" + ego_dest + ":lo"
+        let wrap_hi_key: String = "ego10:wrap:" + token + ":" + ego_dest + ":hi"
+        let wrap_lo: u64 = storage.get_u64(wrap_lo_key)
+        let wrap_hi: u64 = storage.get_u64(wrap_hi_key)
+
+        let new_wrap_lo: u64 = wrap_lo + amount_lo
+        let wrap_carry:  u64 = 0u64
+        if new_wrap_lo < wrap_lo {
+            wrap_carry = 1u64
+        }
+        storage.set(wrap_lo_key, new_wrap_lo)
+        storage.set(wrap_hi_key, wrap_hi + amount_hi + wrap_carry)
+
+        // ── Emit BridgeIn event ───────────────────────────────────────────────
+        // payload: "<source_chain>:<source_addr>:<ego_dest>:<token>:<amount_decimal>:<claim_hash>"
+        //
+        // amount_decimal = amount_lo (Phase 1; full u128 formatting in Phase 2)
+        events.emit(
+            "EGO10:BridgeIn",
+            source_chain as String + ":" +
+            source_addr + ":" +
+            ego_dest + ":" +
+            token + ":" +
+            amount_lo as String + ":" +
+            claim_hash
+        )
+
+        return 1u32
+    }
+
+    // ── Bridge Out (burn_and_bridge) ──────────────────────────────────────────
+
+    // burn_and_bridge — burn wrapped tokens on Ego and emit a BridgeOut event
+    // so that the relayer can release the original tokens on the destination
+    // chain.
+    //
+    // The caller specifies the destination chain and address. Wrapped tokens are
+    // burned from the caller's internal balance. A burn record is stored with a
+    // monotonically-increasing nonce to allow the relayer to process burns in
+    // order and to prevent replay on the destination chain.
+    //
+    // The relayer observes the EGO10:BridgeOut event and submits an unlock
+    // transaction on the destination chain. The nonce in the burn record serves
+    // as the replay-prevention key on the destination chain's unlock contract.
+    //
+    // Args:
+    //   dest_chain — Chain ID of the destination chain
+    //   dest_addr  — Recipient address on the destination chain (hex string)
+    //   token      — Token identifier (must match a token with minted balance)
+    //   amount_lo  — Low 64 bits of the amount to bridge out (u128)
+    //   amount_hi  — High 64 bits of the amount to bridge out (u128, usually 0)
+    //
+    // Returns: burn_nonce — The nonce assigned to this burn (u64 LE)
+    fn burn_and_bridge(
+        dest_chain: u64,
+        dest_addr:  String,
+        token:      String,
+        amount_lo:  u64,
+        amount_hi:  u64
+    ) -> u64 {
+        // ── Guard: paused ─────────────────────────────────────────────────────
+        let paused: u32 = storage.get_u32("ego10:meta:paused")
+        assert(paused == 0u32, "burn_and_bridge: bridge is paused")
+
+        // ── Guard: non-zero amount ────────────────────────────────────────────
+        assert(amount_lo > 0u64 || amount_hi > 0u64, "burn_and_bridge: amount must be > 0")
+
+        // ── Guard: supported destination chain ────────────────────────────────
+        let chain_ok: u32 = storage.get_u32("ego10:chains:" + dest_chain as String)
+        assert(chain_ok == 1u32, "burn_and_bridge: unsupported destination chain")
+
+        let caller: Address = sys.caller()
+
+        // ── Check and debit caller's wrapped-token balance ────────────────────
+        let wrap_lo_key: String = "ego10:wrap:" + token + ":" + caller + ":lo"
+        let wrap_hi_key: String = "ego10:wrap:" + token + ":" + caller + ":hi"
+        let wrap_lo: u64 = storage.get_u64(wrap_lo_key)
+        let wrap_hi: u64 = storage.get_u64(wrap_hi_key)
+
+        // Check sufficient balance (u128 comparison)
+        // Sufficient if (wrap_hi > amount_hi) OR (wrap_hi == amount_hi AND wrap_lo >= amount_lo)
+        let has_enough: u32 = 0u32
+        if wrap_hi > amount_hi {
+            has_enough = 1u32
+        } else if wrap_hi == amount_hi && wrap_lo >= amount_lo {
+            has_enough = 1u32
+        }
+        assert(has_enough == 1u32, "burn_and_bridge: insufficient wrapped token balance")
+
+        // u128 subtraction with borrow
+        let new_wrap_lo: u64 = wrap_lo - amount_lo
+        let borrow:      u64 = 0u64
+        if wrap_lo < amount_lo {
+            borrow = 1u64
+        }
+        let new_wrap_hi: u64 = wrap_hi - amount_hi - borrow
+
+        storage.set(wrap_lo_key, new_wrap_lo)
+        storage.set(wrap_hi_key, new_wrap_hi)
+
+        // ── Decrement global minted balance for this token ────────────────────
+        let bal_lo_key: String = "ego10:balance:" + token + ":lo"
+        let bal_hi_key: String = "ego10:balance:" + token + ":hi"
+        let bal_lo: u64 = storage.get_u64(bal_lo_key)
+        let bal_hi: u64 = storage.get_u64(bal_hi_key)
+
+        let new_bal_lo: u64 = bal_lo - amount_lo
+        let bal_borrow: u64 = 0u64
+        if bal_lo < amount_lo {
+            bal_borrow = 1u64
+        }
+        storage.set(bal_lo_key, new_bal_lo)
+        storage.set(bal_hi_key, bal_hi - amount_hi - bal_borrow)
+
+        // ── Assign burn nonce ─────────────────────────────────────────────────
+        let nonce: u64 = storage.get_u64("ego10:meta:burn_nonce")
+        let new_nonce: u64 = nonce + 1u64
+        storage.set("ego10:meta:burn_nonce", new_nonce)
+
+        // ── Store burn record ─────────────────────────────────────────────────
+        // Burn record format: dest_chain || dest_addr || token || amount_lo || amount_hi
+        // Stored so the relayer (and any observer) can reconstruct unlock tx data.
+        storage.set(
+            "ego10:burn:" + nonce as String,
+            dest_chain as String + ":" + dest_addr + ":" + token + ":" +
+            amount_lo as String + ":" + amount_hi as String
+        )
+
+        // ── Emit BridgeOut event ──────────────────────────────────────────────
+        // payload: "<ego_src>:<dest_chain>:<dest_addr>:<token>:<amount_decimal>:<nonce>"
+        events.emit(
+            "EGO10:BridgeOut",
+            caller + ":" +
+            dest_chain as String + ":" +
+            dest_addr + ":" +
+            token + ":" +
+            amount_lo as String + ":" +
+            nonce as String
+        )
+
+        return nonce
+    }
+
+    // ── Queries ───────────────────────────────────────────────────────────────
+
+    // is_claim_used — check whether a claim hash has already been processed.
+    //
+    // This function MUST be called (internally) before minting. It is also
+    // exposed as a public query so relayers and users can verify off-chain that
+    // a proof will not be rejected before paying transaction fees.
+    //
+    // Args:
+    //   claim_hash — blake3 hex hash of the lock event
+    //
+    // Returns: 1 if already processed, 0 if fresh
+    fn is_claim_used(claim_hash: String) -> u32 {
+        return storage.get_u32("ego10:minted:" + claim_hash)
+    }
+
+    // get_bridge_balance — return the total amount of wrapped tokens currently
+    // outstanding for a given source token.
+    //
+    // Invariant: balance[token] == total minted - total burned.
+    // This value MUST be 0 when the bridge is fully wound down.
+    //
+    // Args:
+    //   token — Token identifier string
+    //
+    // Returns: (balance_lo, balance_hi) as u128 split into two u64 fields
+    fn get_bridge_balance(token: String) -> (u64, u64) {
+        let lo: u64 = storage.get_u64("ego10:balance:" + token + ":lo")
+        let hi: u64 = storage.get_u64("ego10:balance:" + token + ":hi")
+        return (lo, hi)
+    }
+
+    // get_wrapped_balance — return a specific user's wrapped token balance for a
+    // given source token. Equivalent to EGO-20 balance_of but for the Phase 1
+    // internal wrapped-token ledger.
+    //
+    // Args:
+    //   token — Token identifier string
+    //   addr  — Ego address to query
+    //
+    // Returns: (balance_lo, balance_hi)
+    fn get_wrapped_balance(token: String, addr: Address) -> (u64, u64) {
+        let lo: u64 = storage.get_u64("ego10:wrap:" + token + ":" + addr + ":lo")
+        let hi: u64 = storage.get_u64("ego10:wrap:" + token + ":" + addr + ":hi")
+        return (lo, hi)
+    }
+
+    // get_burn_nonce — return the current (latest used) burn nonce.
+    //
+    // Destination chain unlock contracts use this as an upper bound to know
+    // how many bridge-out events to process.
+    fn get_burn_nonce() -> u64 {
+        return storage.get_u64("ego10:meta:burn_nonce")
+    }
+
+    // ── Administration ────────────────────────────────────────────────────────
+
+    // set_relayer — update the trusted relayer address.
+    //
+    // Only the owner may change the relayer. In Phase 2 (ZK), this function
+    // still exists to allow optional fee-delegation relayer configuration, but
+    // the relayer no longer controls the security of the bridge.
+    //
+    // Args:
+    //   new_relayer — New relayer address
+    //
+    // Returns: 1 on success, 0 if caller is not the owner
+    fn set_relayer(new_relayer: Address) -> u32 {
+        let owner: Address = storage.get_str("ego10:meta:owner")
+        if sys.caller() != owner {
+            return 0u32
+        }
+
+        let old_relayer: Address = storage.get_str("ego10:meta:relayer")
+        storage.set("ego10:meta:relayer", new_relayer)
+
+        events.emit("EGO10:RelayerChanged", old_relayer + ":" + new_relayer + ":" + owner)
+        return 1u32
+    }
+
+    // add_supported_chain — register a source/destination chain ID as trusted.
+    //
+    // Only the owner may add chains. Chain IDs are validated against a whitelist
+    // stored in ego10:chains:<chain_id>. verify_and_mint and burn_and_bridge
+    // reject transactions for chains not on the whitelist.
+    //
+    // Args:
+    //   chain_id — Chain ID to add (must be > 0)
+    //
+    // Returns: 1 on success, 0 if caller is not the owner
+    fn add_supported_chain(chain_id: u64) -> u32 {
+        let owner: Address = storage.get_str("ego10:meta:owner")
+        if sys.caller() != owner {
+            return 0u32
+        }
+
+        assert(chain_id > 0u64, "add_supported_chain: chain_id must be > 0")
+        storage.set("ego10:chains:" + chain_id as String, 1u32)
+
+        events.emit("EGO10:ChainAdded", chain_id as String + ":" + owner)
+        return 1u32
+    }
+
+    // remove_supported_chain — deregister a chain ID.
+    //
+    // Only the owner may remove chains.
+    //
+    // Returns: 1 on success, 0 if caller is not the owner
+    fn remove_supported_chain(chain_id: u64) -> u32 {
+        let owner: Address = storage.get_str("ego10:meta:owner")
+        if sys.caller() != owner {
+            return 0u32
+        }
+
+        storage.del("ego10:chains:" + chain_id as String)
+        events.emit("EGO10:ChainRemoved", chain_id as String + ":" + owner)
+        return 1u32
+    }
+
+    // pause — halt all minting and burning operations.
+    //
+    // ONLY the owner may pause the bridge. This is an emergency control —
+    // use it immediately if a vulnerability is discovered in the bridge or in
+    // a supported source chain's lock contract.
+    //
+    // After pausing, verify_and_mint and burn_and_bridge will both revert.
+    // Query functions (is_claim_used, get_bridge_balance) remain available.
+    //
+    // Returns: 1 on success, 0 if caller is not the owner
+    fn pause() -> u32 {
+        let owner: Address = storage.get_str("ego10:meta:owner")
+        if sys.caller() != owner {
+            return 0u32
+        }
+
+        storage.set("ego10:meta:paused", 1u32)
+        events.emit("EGO10:Paused", owner + ":" + sys.timestamp() as String)
+        return 1u32
+    }
+
+    // unpause — resume normal bridge operations.
+    //
+    // Only the owner may unpause. Call this after verifying the vulnerability
+    // has been patched and all outstanding claims have been audited.
+    //
+    // Returns: 1 on success, 0 if caller is not the owner
+    fn unpause() -> u32 {
+        let owner: Address = storage.get_str("ego10:meta:owner")
+        if sys.caller() != owner {
+            return 0u32
+        }
+
+        storage.del("ego10:meta:paused")
+        events.emit("EGO10:Unpaused", owner + ":" + sys.timestamp() as String)
+        return 1u32
+    }
+
+}

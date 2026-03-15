@@ -1,0 +1,310 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// EGO-21 Reference Vesting Contract — Cliff + Linear Token Vesting
+// SPDX: MIT
+//
+// Standard : EGO-21 (https://github.com/ego-blockchain/eips/blob/main/EGO-21.md)
+// Author   : Artit Muhaxhiri (@egoblockchain)
+// Version  : 1.0.0
+// Created  : 2026-03-15
+//
+// OVERVIEW
+// --------
+// This contract implements the Vesting sub-standard of EGO-21. It manages
+// multiple independent vesting schedules, each with a cliff period and a
+// linear vesting duration. A beneficiary accumulates tokens linearly after
+// the cliff and may claim the vested-but-unclaimed portion at any time.
+//
+// VESTING FORMULA
+// ---------------
+// Given a schedule with cliff_block and end_block:
+//
+//   if block_number() < cliff_block:
+//       vested = 0
+//
+//   elif block_number() >= end_block:
+//       vested = total_amount
+//
+//   else:
+//       vest_duration = end_block - cliff_block
+//       vested = total_amount * (block_number() - cliff_block) / vest_duration
+//
+//   claimable = vested - claimed
+//
+// REVOCATION
+// ----------
+// Revocable schedules allow the creator to claw back unvested tokens. After
+// revocation:
+//   - The beneficiary retains all tokens vested up to the revocation block.
+//   - The creator receives: total_amount - vested_at_revocation.
+//   - The beneficiary can still call claim() for their remaining claimable
+//     tokens (vested but not yet claimed).
+//
+// DEPLOYMENT
+// ----------
+// 1. Compile:  urego build contracts/utils/vesting.urego
+// 2. Deploy:   ego-node tx deploy <wasm> (no constructor args)
+// 3. Create:   approve this contract on the token, then call create_vest(...)
+//
+// STORAGE PREFIX: ego21v:
+// ═══════════════════════════════════════════════════════════════════════════
+
+contract TokenVesting {
+
+    // ── Initialisation ────────────────────────────────────────────────────────
+
+    // init — initialise the vest counter to zero.
+    //
+    // Called once at deploy time. No admin key is stored — each vest schedule
+    // is independently owned by its creator; there is no global privileged role.
+    pub fn init() {
+        storage_set_u64("ego21v:vest_count", 0u64)
+    }
+
+    // ── Schedule Creation ─────────────────────────────────────────────────────
+
+    // create_vest — create a new vesting schedule.
+    //
+    // Pulls total_amount tokens from the caller via transfer_from before
+    // storing the schedule. The caller MUST have approved this contract address
+    // on the EGO-20 token before calling.
+    //
+    // Args:
+    //   token                  — EGO-20 token to vest
+    //   beneficiary            — address that will receive vested tokens
+    //   total_amount           — total tokens locked in this schedule (u128)
+    //   cliff_blocks           — blocks from now before any tokens vest (u64)
+    //   vest_duration_blocks   — blocks over which tokens vest linearly after cliff (u64)
+    //   revocable              — whether the creator can revoke unvested tokens
+    //
+    // Returns: vest_id — the ID of the newly created schedule
+    pub fn create_vest(token: address, beneficiary: address, total_amount: u128, cliff_blocks: u64, vest_duration_blocks: u64, revocable: bool) -> u64 {
+        require(total_amount > 0u128, "create_vest: total_amount must be > 0")
+        require(vest_duration_blocks > 0u64, "create_vest: vest_duration_blocks must be > 0")
+
+        let vest_id: u64 = storage_get_u64("ego21v:vest_count")
+        let id_str: str = u64_to_str(vest_id)
+        let creator: address = caller()
+        let creator_str: str = address_to_str(creator)
+
+        let cliff_block: u64 = block_number() + cliff_blocks
+        let end_block: u64 = cliff_block + vest_duration_blocks
+
+        // Store all schedule fields
+        storage_set_address(concat("ego21v:vest:", concat(id_str, ":token")), token)
+        storage_set_address(concat("ego21v:vest:", concat(id_str, ":beneficiary")), beneficiary)
+        storage_set_address(concat("ego21v:vest:", concat(id_str, ":creator")), creator)
+        storage_set_u128(concat("ego21v:vest:", concat(id_str, ":total_amount")), total_amount)
+        storage_set_u128(concat("ego21v:vest:", concat(id_str, ":claimed")), 0u128)
+        storage_set_u64(concat("ego21v:vest:", concat(id_str, ":cliff_block")), cliff_block)
+        storage_set_u64(concat("ego21v:vest:", concat(id_str, ":end_block")), end_block)
+        storage_set_bool(concat("ego21v:vest:", concat(id_str, ":revocable")), revocable)
+        storage_set_bool(concat("ego21v:vest:", concat(id_str, ":revoked")), false)
+
+        // Increment vest counter
+        storage_set_u64("ego21v:vest_count", vest_id + 1u64)
+
+        // Pull tokens from creator into this contract
+        let token_str: str = address_to_str(token)
+        let amount_str: str = u128_to_str(total_amount)
+        cross_call(token_str, "transfer_from", concat(creator_str, concat(" ", amount_str)))
+
+        let beneficiary_str: str = address_to_str(beneficiary)
+        let cliff_str: str = u64_to_str(cliff_block)
+        let end_str: str = u64_to_str(end_block)
+        emit VestCreated(vest_id, token, beneficiary, total_amount, cliff_block, end_block)
+
+        return vest_id
+    }
+
+    // ── View Functions ────────────────────────────────────────────────────────
+
+    // vested_amount — compute the total tokens vested as of the current block.
+    //
+    // Before the cliff: 0.
+    // At or after end_block: total_amount.
+    // Between cliff and end: linear interpolation.
+    //
+    // Args:
+    //   vest_id — schedule to query
+    //
+    // Returns: vested token amount (u128)
+    pub fn vested_amount(vest_id: u64) -> u128 {
+        let vest_count: u64 = storage_get_u64("ego21v:vest_count")
+        require(vest_id < vest_count, "vested_amount: invalid vest_id")
+
+        let id_str: str = u64_to_str(vest_id)
+        let cliff_block: u64 = storage_get_u64(concat("ego21v:vest:", concat(id_str, ":cliff_block")))
+        let end_block: u64 = storage_get_u64(concat("ego21v:vest:", concat(id_str, ":end_block")))
+        let total_amount: u128 = storage_get_u128(concat("ego21v:vest:", concat(id_str, ":total_amount")))
+        let current: u64 = block_number()
+
+        if current < cliff_block {
+            return 0u128
+        }
+
+        if current >= end_block {
+            return total_amount
+        }
+
+        // Linear interpolation between cliff and end
+        let vest_duration: u64 = end_block - cliff_block
+        let elapsed: u64 = current - cliff_block
+        return total_amount * elapsed as u128 / vest_duration as u128
+    }
+
+    // claimable — returns vested_amount minus already-claimed tokens.
+    //
+    // If the schedule is revoked, this still returns the claimable portion
+    // up to the revocation snapshot (since revoked schedules freeze the
+    // vested amount at the revocation block).
+    //
+    // Args:
+    //   vest_id — schedule to query
+    //
+    // Returns: claimable token amount (u128)
+    pub fn claimable(vest_id: u64) -> u128 {
+        let vest_count: u64 = storage_get_u64("ego21v:vest_count")
+        require(vest_id < vest_count, "claimable: invalid vest_id")
+
+        let id_str: str = u64_to_str(vest_id)
+        let claimed: u128 = storage_get_u128(concat("ego21v:vest:", concat(id_str, ":claimed")))
+        let vested: u128 = vested_amount(vest_id)
+
+        if vested <= claimed {
+            return 0u128
+        }
+
+        return vested - claimed
+    }
+
+    // ── Claim ─────────────────────────────────────────────────────────────────
+
+    // claim — beneficiary claims all currently claimable tokens.
+    //
+    // Reverts if the caller is not the beneficiary, or if nothing is
+    // claimable yet. Transfers claimable tokens to the beneficiary and
+    // increments the claimed counter.
+    //
+    // Args:
+    //   vest_id — schedule to claim from
+    pub fn claim(vest_id: u64) {
+        let vest_count: u64 = storage_get_u64("ego21v:vest_count")
+        require(vest_id < vest_count, "claim: invalid vest_id")
+
+        let id_str: str = u64_to_str(vest_id)
+        let beneficiary: address = storage_get_address(concat("ego21v:vest:", concat(id_str, ":beneficiary")))
+        require(caller() == beneficiary, "claim: caller is not beneficiary")
+
+        let amount: u128 = claimable(vest_id)
+        require(amount > 0u128, "claim: nothing claimable yet")
+
+        // Update claimed counter before transfer (checks-effects-interactions)
+        let claimed: u128 = storage_get_u128(concat("ego21v:vest:", concat(id_str, ":claimed")))
+        storage_set_u128(concat("ego21v:vest:", concat(id_str, ":claimed")), claimed + amount)
+
+        // Transfer tokens to beneficiary
+        let token: address = storage_get_address(concat("ego21v:vest:", concat(id_str, ":token")))
+        let token_str: str = address_to_str(token)
+        let beneficiary_str: str = address_to_str(beneficiary)
+        let amount_str: str = u128_to_str(amount)
+        cross_call(token_str, "transfer", concat(beneficiary_str, concat(" ", amount_str)))
+
+        emit Claimed(vest_id, beneficiary, amount)
+    }
+
+    // ── Revocation ────────────────────────────────────────────────────────────
+
+    // revoke — creator reclaims all unvested tokens from a revocable schedule.
+    //
+    // The beneficiary retains all tokens vested up to this block (they can
+    // still call claim() for any vested-but-unclaimed amount). The creator
+    // receives: total_amount - vested_at_revocation_block.
+    //
+    // Reverts if:
+    //   - caller is not the creator
+    //   - schedule is not revocable
+    //   - schedule is already revoked
+    //
+    // Args:
+    //   vest_id — schedule to revoke
+    pub fn revoke(vest_id: u64) {
+        let vest_count: u64 = storage_get_u64("ego21v:vest_count")
+        require(vest_id < vest_count, "revoke: invalid vest_id")
+
+        let id_str: str = u64_to_str(vest_id)
+        let creator: address = storage_get_address(concat("ego21v:vest:", concat(id_str, ":creator")))
+        require(caller() == creator, "revoke: caller is not creator")
+
+        let revocable: bool = storage_get_bool(concat("ego21v:vest:", concat(id_str, ":revocable")))
+        require(revocable, "revoke: schedule is not revocable")
+
+        let already_revoked: bool = storage_get_bool(concat("ego21v:vest:", concat(id_str, ":revoked")))
+        require(!already_revoked, "revoke: schedule already revoked")
+
+        let total_amount: u128 = storage_get_u128(concat("ego21v:vest:", concat(id_str, ":total_amount")))
+        let vested: u128 = vested_amount(vest_id)
+
+        // Unvested tokens are returned to creator; vested tokens remain claimable
+        let unvested: u128 = 0u128
+        if total_amount > vested {
+            unvested = total_amount - vested
+        }
+
+        // Mark revoked before any transfer
+        storage_set_bool(concat("ego21v:vest:", concat(id_str, ":revoked")), true)
+
+        // Return unvested tokens to creator
+        if unvested > 0u128 {
+            let token: address = storage_get_address(concat("ego21v:vest:", concat(id_str, ":token")))
+            let token_str: str = address_to_str(token)
+            let creator_str: str = address_to_str(creator)
+            let unvested_str: str = u128_to_str(unvested)
+            cross_call(token_str, "transfer", concat(creator_str, concat(" ", unvested_str)))
+        }
+
+        emit Revoked(vest_id, creator, unvested)
+    }
+
+    // ── Queries ───────────────────────────────────────────────────────────────
+
+    // get_vest_count — returns total number of vesting schedules created.
+    pub fn get_vest_count() -> u64 {
+        return storage_get_u64("ego21v:vest_count")
+    }
+
+    // get_vest_info — returns schedule metadata as a concatenated string for
+    // off-chain parsing and display. Format:
+    //   "vest_id:token:beneficiary:total:claimed:cliff:end:revocable:revoked"
+    pub fn get_vest_info(vest_id: u64) -> str {
+        let vest_count: u64 = storage_get_u64("ego21v:vest_count")
+        require(vest_id < vest_count, "get_vest_info: invalid vest_id")
+
+        let id_str: str = u64_to_str(vest_id)
+        let token: address = storage_get_address(concat("ego21v:vest:", concat(id_str, ":token")))
+        let beneficiary: address = storage_get_address(concat("ego21v:vest:", concat(id_str, ":beneficiary")))
+        let total_amount: u128 = storage_get_u128(concat("ego21v:vest:", concat(id_str, ":total_amount")))
+        let claimed: u128 = storage_get_u128(concat("ego21v:vest:", concat(id_str, ":claimed")))
+        let cliff_block: u64 = storage_get_u64(concat("ego21v:vest:", concat(id_str, ":cliff_block")))
+        let end_block: u64 = storage_get_u64(concat("ego21v:vest:", concat(id_str, ":end_block")))
+        let revocable: bool = storage_get_bool(concat("ego21v:vest:", concat(id_str, ":revocable")))
+        let revoked: bool = storage_get_bool(concat("ego21v:vest:", concat(id_str, ":revoked")))
+
+        let revocable_str: str = "false"
+        if revocable {
+            revocable_str = "true"
+        }
+        let revoked_str: str = "false"
+        if revoked {
+            revoked_str = "true"
+        }
+
+        return concat(id_str, concat(":", concat(address_to_str(token), concat(":", concat(address_to_str(beneficiary), concat(":", concat(u128_to_str(total_amount), concat(":", concat(u128_to_str(claimed), concat(":", concat(u64_to_str(cliff_block), concat(":", concat(u64_to_str(end_block), concat(":", concat(revocable_str, concat(":", revoked_str)))))))))))))))
+    }
+
+    // ── Events ────────────────────────────────────────────────────────────────
+
+    event VestCreated(vest_id: u64, token: address, beneficiary: address, total_amount: u128, cliff_block: u64, end_block: u64)
+    event Claimed(vest_id: u64, beneficiary: address, amount: u128)
+    event Revoked(vest_id: u64, creator: address, returned_amount: u128)
+
+}

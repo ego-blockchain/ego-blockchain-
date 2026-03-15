@@ -120,4 +120,105 @@ mod tests {
         let result = compile("contract Foo { fn bad() { @invalid } }");
         assert!(result.is_err());
     }
+
+    const FOR_LOOP: &str = r#"
+        contract Loops {
+            fn sum_range(n: u64) -> u64 {
+                let acc: u64 = 0;
+                for i in 0..n {
+                    acc += i;
+                }
+                return acc;
+            }
+        }
+    "#;
+
+    const STRUCT_CONTRACT: &str = r#"
+        contract Structs {
+            struct Point {
+                x: u64,
+                y: u64,
+            }
+            fn make_point(a: u64, b: u64) -> u64 {
+                let p = Point { x: a, y: b };
+                return a + b;
+            }
+        }
+    "#;
+
+    const MATCH_CONTRACT: &str = r#"
+        contract Matcher {
+            fn classify(n: u64) -> u64 {
+                match n {
+                    0 => { return 0; }
+                    1 => { return 1; }
+                    _ => { return 2; }
+                }
+            }
+        }
+    "#;
+
+    const EMIT_CONTRACT: &str = r#"
+        contract Emitter {
+            fn transfer(amount: u64) {
+                emit Transfer { amount: amount };
+            }
+        }
+    "#;
+
+    const ARRAY_CONTRACT: &str = r#"
+        contract Arrays {
+            fn first(a: u64, b: u64, c: u64) -> u64 {
+                let arr = [a, b, c];
+                return arr[0];
+            }
+        }
+    "#;
+
+    const NEW_TYPES: &str = r#"
+        contract Types {
+            fn cast_it(x: u64) -> u64 {
+                let small: u8 = x as u8;
+                let wide: u128 = x as u128;
+                return wide as u64;
+            }
+        }
+    "#;
+
+    #[test]
+    fn test_for_loop_compiles() {
+        let wat = compile_to_wat(FOR_LOOP).expect("for loop should compile");
+        assert!(wat.contains("$for_break"));
+        assert!(wat.contains("$for_continue"));
+    }
+
+    #[test]
+    fn test_struct_compiles() {
+        let wasm = compile(STRUCT_CONTRACT).expect("struct contract should compile");
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_match_compiles() {
+        let wat = compile_to_wat(MATCH_CONTRACT).expect("match should compile");
+        assert!(wat.contains("$__match_val"));
+    }
+
+    #[test]
+    fn test_emit_compiles() {
+        let wat = compile_to_wat(EMIT_CONTRACT).expect("emit should compile");
+        assert!(wat.contains("events_emit"));
+    }
+
+    #[test]
+    fn test_array_compiles() {
+        let wasm = compile(ARRAY_CONTRACT).expect("array contract should compile");
+        assert!(!wasm.is_empty());
+    }
+
+    #[test]
+    fn test_new_integer_types_compile() {
+        let wasm = compile(NEW_TYPES).expect("u8/u128 cast should compile");
+        assert!(!wasm.is_empty());
+    }
 }

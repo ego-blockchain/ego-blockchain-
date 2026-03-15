@@ -1294,6 +1294,62 @@ impl MerkleTree {
     pub fn is_empty(&self) -> bool {
         self.leaves.is_empty()
     }
+
+    /// Generate an inclusion proof for the leaf at `leaf_index`.
+    /// Returns `None` if the index is out of bounds or the tree is empty.
+    pub fn generate_proof(&self, leaf_index: usize) -> Option<MerkleProof> {
+        if self.leaves.is_empty() || leaf_index >= self.leaves.len() {
+            return None;
+        }
+
+        let leaf_hash = hash_data(&self.leaves[leaf_index]);
+        let tree_size = self.leaves.len();
+
+        // Rebuild the level-by-level hash list so we can walk sibling paths.
+        // Level 0 = leaf hashes; each subsequent level halves the count.
+        let mut levels: Vec<Vec<Hash>> = Vec::new();
+        let leaf_level: Vec<Hash> = self
+            .leaves
+            .iter()
+            .map(|data| hash_data(data))
+            .collect();
+        levels.push(leaf_level);
+
+        while levels.last().unwrap().len() > 1 {
+            let prev = levels.last().unwrap();
+            let mut next = Vec::new();
+            for chunk in prev.chunks(2) {
+                if chunk.len() == 2 {
+                    next.push(hash_multiple(&[chunk[0].as_bytes(), chunk[1].as_bytes()]));
+                } else {
+                    // Odd node: duplicated (mirrors MerkleNode::internal logic)
+                    next.push(hash_multiple(&[chunk[0].as_bytes(), chunk[0].as_bytes()]));
+                }
+            }
+            levels.push(next);
+        }
+
+        // Collect one sibling hash per level (bottom-up, excluding root level).
+        let mut proof_hashes = Vec::new();
+        let mut idx = leaf_index;
+        for level in levels.iter().take(levels.len() - 1) {
+            let sibling_idx = if idx % 2 == 0 {
+                // Right sibling; if it doesn't exist the node was duplicated.
+                (idx + 1).min(level.len() - 1)
+            } else {
+                idx - 1
+            };
+            proof_hashes.push(level[sibling_idx]);
+            idx /= 2;
+        }
+
+        Some(MerkleProof {
+            leaf_index,
+            leaf_hash,
+            proof_hashes,
+            tree_size,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

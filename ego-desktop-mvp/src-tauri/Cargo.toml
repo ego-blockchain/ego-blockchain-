@@ -33,9 +33,10 @@ base64 = "0.21"
 bech32 = "0.9"
 
 # Ego Blockchain dependencies
-ego-core   = { path = "../../crates/ego-core" }
-ego-vm     = { path = "../../crates/ego-vm" }
-ego-rollup = { path = "../../crates/ego-rollup" }
+ego-core        = { path = "../../crates/ego-core" }
+ego-vm          = { path = "../../crates/ego-vm" }
+ego-rollup      = { path = "../../crates/ego-rollup" }
+urego-compiler  = { path = "../../crates/urego-compiler" }
 
 # Mempool / rollup
 once_cell = "1.19"

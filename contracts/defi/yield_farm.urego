@@ -1,0 +1,424 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// EGO-19 Reference Yield Farm — MasterChef-style Multi-Pool Liquidity Mining
+// SPDX: MIT
+//
+// Standard : EGO-19 (https://github.com/ego-blockchain/eips/blob/main/EGO-19.md)
+// Author   : Artit Muhaxhiri (@egoblockchain)
+// Version  : 1.0.0
+// Created  : 2026-03-15
+//
+// OVERVIEW
+// --------
+// This contract implements a MasterChef-style yield farm as specified by EGO-19.
+// One contract manages multiple farming pools. Each pool has a dedicated staking
+// token (typically an EGO-4 LP token) and an allocation point weight. A single
+// reward token (EGOC or any EGO-20) is emitted at a fixed rate per block and
+// distributed across pools proportionally by allocation points.
+//
+// REWARD FORMULA
+// --------------
+// Per block, each pool accrues:
+//
+//   pool_reward = reward_per_block * alloc_points / total_alloc_points * elapsed
+//   acc_reward_per_share += pool_reward * 1_000_000_000_000 / total_staked
+//
+// For each user:
+//
+//   pending = user_amount * acc_reward_per_share / 1_000_000_000_000 - reward_debt
+//
+// reward_debt is reset after every deposit, withdraw, or harvest so that the
+// user never claims the same reward twice.
+//
+// DEPLOYMENT
+// ----------
+// 1. Compile:   urego build contracts/defi/yield_farm.urego
+// 2. Deploy:    ego-node tx deploy <wasm> --args "owner_addr reward_token_addr 1000000"
+//               (1_000_000 uEGOC per block = 1 EGOC per block)
+// 3. Pre-fund:  transfer enough reward tokens to this contract address.
+// 4. Add pools: call add_pool(lp_token_addr, alloc_points) for each pool.
+// 5. Announce:  users call deposit(pool_id, amount) to start farming.
+//
+// STORAGE PREFIX: ego19:
+// ═══════════════════════════════════════════════════════════════════════════
+
+contract YieldFarm {
+
+    // ── Constants ────────────────────────────────────────────────────────────
+    //
+    // ACC_PRECISION is the scaling factor applied to acc_reward_per_share so
+    // that per-share rewards retain 12 decimal places of precision. Matching
+    // the value used in the canonical SushiSwap MasterChef implementation.
+    //
+    // ACC_PRECISION = 1_000_000_000_000  (10^12)
+
+    // ── Initialisation ───────────────────────────────────────────────────────
+
+    // init — called once at deploy time.
+    //
+    // Stores the owner, reward token address, and per-block emission rate.
+    // Initialises pool_count and total_alloc_points to zero.
+    //
+    // Args:
+    //   owner_addr        — admin address; can add pools and change rates
+    //   reward_token_addr — EGO-20 contract that pays farming rewards
+    //   reward_per_block  — total reward tokens emitted per block (u128)
+    pub fn init(owner_addr: address, reward_token_addr: address, reward_per_block: u128) {
+        require(reward_per_block > 0u128, "init: reward_per_block must be > 0")
+
+        storage_set_address("ego19:owner", owner_addr)
+        storage_set_address("ego19:reward_token", reward_token_addr)
+        storage_set_u128("ego19:reward_per_block", reward_per_block)
+        storage_set_u64("ego19:pool_count", 0u64)
+        storage_set_u64("ego19:total_alloc_points", 0u64)
+
+        emit Initialised(owner_addr, reward_token_addr, reward_per_block)
+    }
+
+    // ── Pool Management ───────────────────────────────────────────────────────
+
+    // add_pool — register a new staking pool.
+    //
+    // Only the owner may add pools. Each pool gets an independent staking
+    // token and allocation point weight. The pool's reward accumulator starts
+    // at zero and its last_reward_block is set to the current block so that
+    // users who deposit immediately after creation do not receive retroactive
+    // rewards from before the pool existed.
+    //
+    // Args:
+    //   staking_token — EGO-20 token users will stake (often an EGO-4 LP token)
+    //   alloc_points  — weight relative to other pools (e.g. 100 = 1x, 200 = 2x)
+    pub fn add_pool(staking_token: address, alloc_points: u64) {
+        let owner: address = storage_get_address("ego19:owner")
+        require(caller() == owner, "add_pool: caller is not owner")
+        require(alloc_points > 0u64, "add_pool: alloc_points must be > 0")
+
+        let pool_id: u64 = storage_get_u64("ego19:pool_count")
+        let id_str: str = u64_to_str(pool_id)
+
+        // Store pool metadata
+        storage_set_address(concat("ego19:pool:", concat(id_str, ":token")), staking_token)
+        storage_set_u64(concat("ego19:pool:", concat(id_str, ":alloc_points")), alloc_points)
+        storage_set_u128(concat("ego19:pool:", concat(id_str, ":total_staked")), 0u128)
+        storage_set_u128(concat("ego19:pool:", concat(id_str, ":acc_reward_per_share")), 0u128)
+        storage_set_u64(concat("ego19:pool:", concat(id_str, ":last_reward_block")), block_number())
+
+        // Increment counters
+        storage_set_u64("ego19:pool_count", pool_id + 1u64)
+        let total_alloc: u64 = storage_get_u64("ego19:total_alloc_points")
+        storage_set_u64("ego19:total_alloc_points", total_alloc + alloc_points)
+
+        emit PoolAdded(pool_id, staking_token, alloc_points)
+    }
+
+    // set_alloc_points — change a pool's allocation weight.
+    //
+    // Only owner. Adjusts total_alloc_points to reflect the change.
+    // Does NOT call update_pool first; admin SHOULD call update_pool before
+    // changing alloc_points if they want rewards to be settled at the current
+    // ratio before the new ratio takes effect.
+    //
+    // Args:
+    //   pool_id      — pool to adjust
+    //   alloc_points — new allocation point weight
+    pub fn set_alloc_points(pool_id: u64, alloc_points: u64) {
+        let owner: address = storage_get_address("ego19:owner")
+        require(caller() == owner, "set_alloc_points: caller is not owner")
+        require(alloc_points > 0u64, "set_alloc_points: alloc_points must be > 0")
+
+        let pool_count: u64 = storage_get_u64("ego19:pool_count")
+        require(pool_id < pool_count, "set_alloc_points: invalid pool_id")
+
+        let id_str: str = u64_to_str(pool_id)
+        let old_alloc: u64 = storage_get_u64(concat("ego19:pool:", concat(id_str, ":alloc_points")))
+        let total_alloc: u64 = storage_get_u64("ego19:total_alloc_points")
+
+        // Replace old weight with new weight in the total
+        storage_set_u64("ego19:total_alloc_points", total_alloc - old_alloc + alloc_points)
+        storage_set_u64(concat("ego19:pool:", concat(id_str, ":alloc_points")), alloc_points)
+    }
+
+    // set_reward_per_block — update the global emission rate.
+    //
+    // Only owner. Takes effect from the next block. Does not retroactively
+    // change rewards already accrued but not yet settled.
+    //
+    // Args:
+    //   amount — new reward tokens emitted per block (u128)
+    pub fn set_reward_per_block(amount: u128) {
+        let owner: address = storage_get_address("ego19:owner")
+        require(caller() == owner, "set_reward_per_block: caller is not owner")
+
+        storage_set_u128("ego19:reward_per_block", amount)
+
+        emit RewardRateUpdated(amount)
+    }
+
+    // ── Internal Accounting ───────────────────────────────────────────────────
+
+    // update_pool — settle pending rewards for a pool up to the current block.
+    //
+    // Called internally before every deposit, withdraw, or harvest. Computes
+    // new rewards since last_reward_block and adds them to acc_reward_per_share.
+    // If total_staked is zero (empty pool), rewards for elapsed blocks are
+    // simply dropped — they are not retroactively distributed when liquidity
+    // arrives later.
+    //
+    // Args:
+    //   pool_id — pool to update
+    pub fn update_pool(pool_id: u64) {
+        let id_str: str = u64_to_str(pool_id)
+
+        let last_reward_block: u64 = storage_get_u64(concat("ego19:pool:", concat(id_str, ":last_reward_block")))
+        let current_block: u64 = block_number()
+
+        // Nothing to do if already up-to-date
+        if current_block <= last_reward_block {
+            return
+        }
+
+        let total_staked: u128 = storage_get_u128(concat("ego19:pool:", concat(id_str, ":total_staked")))
+
+        // Update last_reward_block unconditionally so we don't re-enter this range
+        storage_set_u64(concat("ego19:pool:", concat(id_str, ":last_reward_block")), current_block)
+
+        // If no tokens are staked, rewards for this period are discarded
+        if total_staked == 0u128 {
+            return
+        }
+
+        let elapsed: u64 = current_block - last_reward_block
+        let reward_per_block: u128 = storage_get_u128("ego19:reward_per_block")
+        let alloc_points: u64 = storage_get_u64(concat("ego19:pool:", concat(id_str, ":alloc_points")))
+        let total_alloc: u64 = storage_get_u64("ego19:total_alloc_points")
+
+        // pool_reward = reward_per_block * elapsed * alloc_points / total_alloc_points
+        // acc_reward_per_share += pool_reward * 1e12 / total_staked
+        let pool_reward: u128 = reward_per_block * elapsed as u128 * alloc_points as u128 / total_alloc as u128
+        let acc: u128 = storage_get_u128(concat("ego19:pool:", concat(id_str, ":acc_reward_per_share")))
+        let new_acc: u128 = acc + pool_reward * 1000000000000u128 / total_staked
+
+        storage_set_u128(concat("ego19:pool:", concat(id_str, ":acc_reward_per_share")), new_acc)
+    }
+
+    // ── User Actions ──────────────────────────────────────────────────────────
+
+    // deposit — stake tokens into a pool and harvest any pending rewards.
+    //
+    // Calls update_pool first to settle rewards to the current block.
+    // If the user already has a balance, their pending reward is harvested
+    // before the new amount is added. Staking tokens are pulled via
+    // cross_call to the staking token's transfer_from function.
+    //
+    // Args:
+    //   pool_id — pool to stake into
+    //   amount  — number of staking tokens to deposit (u128)
+    pub fn deposit(pool_id: u64, amount: u128) {
+        require(amount > 0u128, "deposit: amount must be > 0")
+
+        let pool_count: u64 = storage_get_u64("ego19:pool_count")
+        require(pool_id < pool_count, "deposit: invalid pool_id")
+
+        update_pool(pool_id)
+
+        let id_str: str = u64_to_str(pool_id)
+        let user_addr: address = caller()
+        let user_str: str = address_to_str(user_addr)
+
+        let acc_per_share: u128 = storage_get_u128(concat("ego19:pool:", concat(id_str, ":acc_reward_per_share")))
+        let user_amount: u128 = storage_get_u128(concat("ego19:user:", concat(id_str, concat(":", concat(user_str, ":amount")))))
+        let reward_debt: u128 = storage_get_u128(concat("ego19:user:", concat(id_str, concat(":", concat(user_str, ":reward_debt")))))
+
+        // Harvest pending rewards if the user already has a stake
+        if user_amount > 0u128 {
+            let pending: u128 = user_amount * acc_per_share / 1000000000000u128 - reward_debt
+            if pending > 0u128 {
+                let reward_token: address = storage_get_address("ego19:reward_token")
+                let reward_token_str: str = address_to_str(reward_token)
+                let pending_str: str = u128_to_str(pending)
+                cross_call(reward_token_str, "transfer", concat(user_str, concat(" ", pending_str)))
+                emit Harvested(pool_id, user_addr, pending)
+            }
+        }
+
+        // Update user balance and pool total
+        let new_user_amount: u128 = user_amount + amount
+        let total_staked: u128 = storage_get_u128(concat("ego19:pool:", concat(id_str, ":total_staked")))
+        storage_set_u128(concat("ego19:user:", concat(id_str, concat(":", concat(user_str, ":amount")))), new_user_amount)
+        storage_set_u128(concat("ego19:pool:", concat(id_str, ":total_staked")), total_staked + amount)
+
+        // Reset reward debt to current acc_per_share * new_amount
+        let new_debt: u128 = new_user_amount * acc_per_share / 1000000000000u128
+        storage_set_u128(concat("ego19:user:", concat(id_str, concat(":", concat(user_str, ":reward_debt")))), new_debt)
+
+        // Pull staking tokens from the caller
+        let staking_token: address = storage_get_address(concat("ego19:pool:", concat(id_str, ":token")))
+        let staking_token_str: str = address_to_str(staking_token)
+        let amount_str: str = u128_to_str(amount)
+        cross_call(staking_token_str, "transfer_from", concat(user_str, concat(" ", amount_str)))
+
+        emit Deposited(pool_id, user_addr, amount)
+    }
+
+    // withdraw — unstake tokens from a pool and harvest pending rewards.
+    //
+    // Harvests all pending rewards before returning staking tokens. Reverts
+    // if the user attempts to withdraw more than their staked balance.
+    //
+    // Args:
+    //   pool_id — pool to withdraw from
+    //   amount  — number of staking tokens to withdraw (u128)
+    pub fn withdraw(pool_id: u64, amount: u128) {
+        require(amount > 0u128, "withdraw: amount must be > 0")
+
+        let pool_count: u64 = storage_get_u64("ego19:pool_count")
+        require(pool_id < pool_count, "withdraw: invalid pool_id")
+
+        let id_str: str = u64_to_str(pool_id)
+        let user_addr: address = caller()
+        let user_str: str = address_to_str(user_addr)
+
+        let user_amount: u128 = storage_get_u128(concat("ego19:user:", concat(id_str, concat(":", concat(user_str, ":amount")))))
+        require(user_amount >= amount, "withdraw: insufficient staked balance")
+
+        update_pool(pool_id)
+
+        let acc_per_share: u128 = storage_get_u128(concat("ego19:pool:", concat(id_str, ":acc_reward_per_share")))
+        let reward_debt: u128 = storage_get_u128(concat("ego19:user:", concat(id_str, concat(":", concat(user_str, ":reward_debt")))))
+
+        // Harvest pending rewards
+        let pending: u128 = user_amount * acc_per_share / 1000000000000u128 - reward_debt
+        if pending > 0u128 {
+            let reward_token: address = storage_get_address("ego19:reward_token")
+            let reward_token_str: str = address_to_str(reward_token)
+            let pending_str: str = u128_to_str(pending)
+            cross_call(reward_token_str, "transfer", concat(user_str, concat(" ", pending_str)))
+            emit Harvested(pool_id, user_addr, pending)
+        }
+
+        // Update user balance and pool total
+        let new_user_amount: u128 = user_amount - amount
+        let total_staked: u128 = storage_get_u128(concat("ego19:pool:", concat(id_str, ":total_staked")))
+        storage_set_u128(concat("ego19:user:", concat(id_str, concat(":", concat(user_str, ":amount")))), new_user_amount)
+        storage_set_u128(concat("ego19:pool:", concat(id_str, ":total_staked")), total_staked - amount)
+
+        // Reset reward debt
+        let new_debt: u128 = new_user_amount * acc_per_share / 1000000000000u128
+        storage_set_u128(concat("ego19:user:", concat(id_str, concat(":", concat(user_str, ":reward_debt")))), new_debt)
+
+        // Return staking tokens to the caller
+        let staking_token: address = storage_get_address(concat("ego19:pool:", concat(id_str, ":token")))
+        let staking_token_str: str = address_to_str(staking_token)
+        let amount_str: str = u128_to_str(amount)
+        cross_call(staking_token_str, "transfer", concat(user_str, concat(" ", amount_str)))
+
+        emit Withdrawn(pool_id, user_addr, amount)
+    }
+
+    // harvest — claim pending rewards without changing the staked balance.
+    //
+    // Reverts if there is nothing to claim (pending == 0) to prevent
+    // zero-value reward token transfers.
+    //
+    // Args:
+    //   pool_id — pool to harvest from
+    pub fn harvest(pool_id: u64) {
+        let pool_count: u64 = storage_get_u64("ego19:pool_count")
+        require(pool_id < pool_count, "harvest: invalid pool_id")
+
+        update_pool(pool_id)
+
+        let id_str: str = u64_to_str(pool_id)
+        let user_addr: address = caller()
+        let user_str: str = address_to_str(user_addr)
+
+        let acc_per_share: u128 = storage_get_u128(concat("ego19:pool:", concat(id_str, ":acc_reward_per_share")))
+        let user_amount: u128 = storage_get_u128(concat("ego19:user:", concat(id_str, concat(":", concat(user_str, ":amount")))))
+        let reward_debt: u128 = storage_get_u128(concat("ego19:user:", concat(id_str, concat(":", concat(user_str, ":reward_debt")))))
+
+        let pending: u128 = user_amount * acc_per_share / 1000000000000u128 - reward_debt
+        require(pending > 0u128, "harvest: no pending rewards")
+
+        // Update reward debt before transfer (checks-effects-interactions)
+        let new_debt: u128 = user_amount * acc_per_share / 1000000000000u128
+        storage_set_u128(concat("ego19:user:", concat(id_str, concat(":", concat(user_str, ":reward_debt")))), new_debt)
+
+        // Transfer reward tokens to caller
+        let reward_token: address = storage_get_address("ego19:reward_token")
+        let reward_token_str: str = address_to_str(reward_token)
+        let pending_str: str = u128_to_str(pending)
+        cross_call(reward_token_str, "transfer", concat(user_str, concat(" ", pending_str)))
+
+        emit Harvested(pool_id, user_addr, pending)
+    }
+
+    // ── View Functions ────────────────────────────────────────────────────────
+
+    // pending_reward — compute the pending reward for a user without modifying
+    // state. Simulates what update_pool would calculate at the current block.
+    //
+    // Args:
+    //   pool_id — pool to query
+    //   user    — address to query
+    //
+    // Returns: pending reward amount (u128)
+    pub fn pending_reward(pool_id: u64, user: address) -> u128 {
+        let pool_count: u64 = storage_get_u64("ego19:pool_count")
+        require(pool_id < pool_count, "pending_reward: invalid pool_id")
+
+        let id_str: str = u64_to_str(pool_id)
+        let user_str: str = address_to_str(user)
+
+        let acc_per_share: u128 = storage_get_u128(concat("ego19:pool:", concat(id_str, ":acc_reward_per_share")))
+        let total_staked: u128 = storage_get_u128(concat("ego19:pool:", concat(id_str, ":total_staked")))
+        let last_reward_block: u64 = storage_get_u64(concat("ego19:pool:", concat(id_str, ":last_reward_block")))
+        let current_block: u64 = block_number()
+
+        // Simulate update_pool without writing state
+        if current_block > last_reward_block && total_staked > 0u128 {
+            let elapsed: u64 = current_block - last_reward_block
+            let reward_per_block: u128 = storage_get_u128("ego19:reward_per_block")
+            let alloc_points: u64 = storage_get_u64(concat("ego19:pool:", concat(id_str, ":alloc_points")))
+            let total_alloc: u64 = storage_get_u64("ego19:total_alloc_points")
+            let pool_reward: u128 = reward_per_block * elapsed as u128 * alloc_points as u128 / total_alloc as u128
+            acc_per_share = acc_per_share + pool_reward * 1000000000000u128 / total_staked
+        }
+
+        let user_amount: u128 = storage_get_u128(concat("ego19:user:", concat(id_str, concat(":", concat(user_str, ":amount")))))
+        let reward_debt: u128 = storage_get_u128(concat("ego19:user:", concat(id_str, concat(":", concat(user_str, ":reward_debt")))))
+
+        return user_amount * acc_per_share / 1000000000000u128 - reward_debt
+    }
+
+    // get_pool_count — returns total number of registered pools.
+    pub fn get_pool_count() -> u64 {
+        return storage_get_u64("ego19:pool_count")
+    }
+
+    // get_total_staked — returns total tokens staked in a pool.
+    pub fn get_total_staked(pool_id: u64) -> u128 {
+        let id_str: str = u64_to_str(pool_id)
+        return storage_get_u128(concat("ego19:pool:", concat(id_str, ":total_staked")))
+    }
+
+    // get_user_amount — returns a user's staked balance in a pool.
+    pub fn get_user_amount(pool_id: u64, user: address) -> u128 {
+        let id_str: str = u64_to_str(pool_id)
+        let user_str: str = address_to_str(user)
+        return storage_get_u128(concat("ego19:user:", concat(id_str, concat(":", concat(user_str, ":amount")))))
+    }
+
+    // get_reward_per_block — returns the current global emission rate.
+    pub fn get_reward_per_block() -> u128 {
+        return storage_get_u128("ego19:reward_per_block")
+    }
+
+    // ── Events ────────────────────────────────────────────────────────────────
+
+    event Initialised(owner: address, reward_token: address, reward_per_block: u128)
+    event PoolAdded(pool_id: u64, staking_token: address, alloc_points: u64)
+    event Deposited(pool_id: u64, user: address, amount: u128)
+    event Withdrawn(pool_id: u64, user: address, amount: u128)
+    event Harvested(pool_id: u64, user: address, amount: u128)
+    event RewardRateUpdated(new_rate: u128)
+
+}

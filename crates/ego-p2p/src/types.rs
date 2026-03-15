@@ -97,7 +97,7 @@ pub struct SyncMessage {
     pub shard_id: ShardId,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub enum SyncType {
     Headers,
     Blocks,

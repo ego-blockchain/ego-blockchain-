@@ -1,0 +1,151 @@
+// WEGOC — Wrapped EGOC
+// EGO-16: EGO-20 wrapper for native EGOC. Deposit EGOC → get WEGOC. Burn WEGOC → get EGOC back.
+// Fully permissionless, no admin, no owner.
+// Storage prefix: ego16:
+//   ego16:bal:{addr}              — u128 WEGOC balance
+//   ego16:allow:{owner}:{spender} — u128 allowance
+//   ego16:supply                  — u128 total supply
+
+contract WEGOC {
+
+    // ─── Events ──────────────────────────────────────────────────────────────
+
+    event Wrapped(account: address, amount: u128);
+    event Unwrapped(account: address, amount: u128);
+    event Transfer(from: address, to: address, amount: u128);
+    event Approval(owner: address, spender: address, amount: u128);
+
+    // ─── EGO-20 Metadata ─────────────────────────────────────────────────────
+
+    pub fn name() -> String {
+        return "Wrapped EGOC";
+    }
+
+    pub fn symbol() -> String {
+        return "WEGOC";
+    }
+
+    // 8 decimals — matches native EGOC denomination.
+    pub fn decimals() -> u8 {
+        return 8u8;
+    }
+
+    // ─── EGO-20 Supply & Balances ─────────────────────────────────────────────
+
+    pub fn total_supply() -> u128 {
+        let supply: u128 = storage_get_u128("ego16:supply");
+        return supply;
+    }
+
+    pub fn balance_of(account: address) -> u128 {
+        let key: String = concat("ego16:bal:", address_to_str(account));
+        let bal: u128 = storage_get_u128(key);
+        return bal;
+    }
+
+    pub fn allowance(owner: address, spender: address) -> u128 {
+        let key: String = concat("ego16:allow:", address_to_str(owner), ":", address_to_str(spender));
+        let allowed: u128 = storage_get_u128(key);
+        return allowed;
+    }
+
+    // ─── Wrap / Unwrap ────────────────────────────────────────────────────────
+
+    // wrap: caller sends native EGOC via tx.value; receives equal WEGOC.
+    // amount must equal tx.value — enforced by the VM's value field check.
+    pub fn wrap(amount: u128) {
+        assert(tx_value() == amount, "WEGOC: value mismatch");
+        assert(amount > 0u128, "WEGOC: zero amount");
+
+        let caller: address = msg_sender();
+
+        // Credit caller balance.
+        let bal_key: String = concat("ego16:bal:", address_to_str(caller));
+        let old_bal: u128 = storage_get_u128(bal_key);
+        storage_set_u128(bal_key, old_bal + amount);
+
+        // Increase total supply.
+        let old_supply: u128 = storage_get_u128("ego16:supply");
+        storage_set_u128("ego16:supply", old_supply + amount);
+
+        emit Wrapped(caller, amount);
+        // Minting convention: Transfer from zero address.
+        emit Transfer(zero_address(), caller, amount);
+    }
+
+    // unwrap: burns amount WEGOC from caller; returns native EGOC to caller.
+    pub fn unwrap(amount: u128) {
+        assert(amount > 0u128, "WEGOC: zero amount");
+
+        let caller: address = msg_sender();
+        let bal_key: String = concat("ego16:bal:", address_to_str(caller));
+        let old_bal: u128 = storage_get_u128(bal_key);
+
+        assert(old_bal >= amount, "WEGOC: insufficient balance");
+
+        // Debit balance before sending to prevent reentrancy.
+        storage_set_u128(bal_key, old_bal - amount);
+
+        let old_supply: u128 = storage_get_u128("ego16:supply");
+        storage_set_u128("ego16:supply", old_supply - amount);
+
+        // Return native EGOC to caller.
+        transfer_native(caller, amount);
+
+        emit Unwrapped(caller, amount);
+        // Burning convention: Transfer to zero address.
+        emit Transfer(caller, zero_address(), amount);
+    }
+
+    // ─── EGO-20 Transfer ─────────────────────────────────────────────────────
+
+    pub fn transfer(to: address, amount: u128) -> bool {
+        let caller: address = msg_sender();
+        _transfer(caller, to, amount);
+        return true;
+    }
+
+    pub fn transfer_from(from: address, to: address, amount: u128) -> bool {
+        let caller: address = msg_sender();
+        let allow_key: String = concat("ego16:allow:", address_to_str(from), ":", address_to_str(caller));
+        let current_allowance: u128 = storage_get_u128(allow_key);
+
+        assert(current_allowance >= amount, "WEGOC: allowance exceeded");
+
+        // Decrease allowance.
+        storage_set_u128(allow_key, current_allowance - amount);
+
+        _transfer(from, to, amount);
+        return true;
+    }
+
+    // ─── EGO-20 Approve ──────────────────────────────────────────────────────
+
+    pub fn approve(spender: address, amount: u128) -> bool {
+        let caller: address = msg_sender();
+        let allow_key: String = concat("ego16:allow:", address_to_str(caller), ":", address_to_str(spender));
+        storage_set_u128(allow_key, amount);
+        emit Approval(caller, spender, amount);
+        return true;
+    }
+
+    // ─── Internal ─────────────────────────────────────────────────────────────
+
+    fn _transfer(from: address, to: address, amount: u128) {
+        assert(amount > 0u128, "WEGOC: zero transfer");
+
+        let from_key: String = concat("ego16:bal:", address_to_str(from));
+        let to_key: String   = concat("ego16:bal:", address_to_str(to));
+
+        let from_bal: u128 = storage_get_u128(from_key);
+        assert(from_bal >= amount, "WEGOC: insufficient balance");
+
+        storage_set_u128(from_key, from_bal - amount);
+
+        let to_bal: u128 = storage_get_u128(to_key);
+        storage_set_u128(to_key, to_bal + amount);
+
+        emit Transfer(from, to, amount);
+    }
+
+}

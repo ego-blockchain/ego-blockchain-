@@ -14,6 +14,7 @@ const NAV_ITEMS = [
   { path: '/messenger', label: 'Messages',  icon: '💬', desc: 'P2P encrypted chat' },
   { path: '/explorer',  label: 'Explorer',  icon: '🔍', desc: 'Blocks & txs' },
   { path: '/contracts', label: 'Contracts', icon: '📜', desc: 'Deploy & interact' },
+  { path: '/ide',       label: 'dApp IDE',  icon: '🧑‍💻', desc: 'Write & deploy contracts' },
   { path: '/settings',  label: 'Settings',  icon: '⚙️',  desc: 'Preferences' },
 ];
 

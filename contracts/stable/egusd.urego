@@ -1,0 +1,204 @@
+// EGUSD — Ego USD Stablecoin
+// EGO-11: Bridge-backed, pegged 1:1 to USDC/USDT
+// EGO-20 compliant token minted exclusively by the EGO-10 canonical bridge.
+//
+// Storage layout  (ego11: prefix)
+//   ego11:supply               — u128  total supply in uEGUSD
+//   ego11:bal:{addr}           — u128  per-account balance
+//   ego11:allow:{owner}:{spender} — u128  EGO-20 allowance
+//   ego11:bridge               — address  authorised minter (bridge only)
+//   ego11:col:{claim_hash}     — bool  double-mint guard
+//   ego11:paused               — bool  emergency pause
+//
+// 1 EGUSD = 1,000,000 uEGUSD  (6 decimals, matches USDC/USDT)
+
+contract EGUSD {
+
+    // ── EGO-20 View Functions ────────────────────────────────────────────────
+
+    pub fn name() -> String {
+        return "Ego USD";
+    }
+
+    pub fn symbol() -> String {
+        return "EGUSD";
+    }
+
+    pub fn decimals() -> u8 {
+        return 6u8;
+    }
+
+    pub fn total_supply() -> u128 {
+        let supply: u128 = storage_get_u128("ego11:supply");
+        return supply;
+    }
+
+    pub fn balance_of(account: address) -> u128 {
+        let key: String = concat("ego11:bal:", address_to_str(account));
+        let bal: u128 = storage_get_u128(key);
+        return bal;
+    }
+
+    pub fn allowance(owner: address, spender: address) -> u128 {
+        let key: String = concat("ego11:allow:", concat(address_to_str(owner), concat(":", address_to_str(spender))));
+        let allow: u128 = storage_get_u128(key);
+        return allow;
+    }
+
+    // ── EGO-20 State-Changing Functions ─────────────────────────────────────
+
+    pub fn transfer(to: address, amount: u128) -> bool {
+        _require_not_paused();
+        let from: address = caller();
+        _transfer(from, to, amount);
+        return true;
+    }
+
+    pub fn transfer_from(from: address, to: address, amount: u128) -> bool {
+        _require_not_paused();
+        let spender: address = caller();
+        let key: String = concat("ego11:allow:", concat(address_to_str(from), concat(":", address_to_str(spender))));
+        let current: u128 = storage_get_u128(key);
+        require(current >= amount, "EGUSD: insufficient allowance");
+        storage_set_u128(key, current - amount);
+        _transfer(from, to, amount);
+        return true;
+    }
+
+    pub fn approve(spender: address, amount: u128) -> bool {
+        let owner: address = caller();
+        let key: String = concat("ego11:allow:", concat(address_to_str(owner), concat(":", address_to_str(spender))));
+        storage_set_u128(key, amount);
+        emit Approval(owner, spender, amount);
+        return true;
+    }
+
+    // ── Mint (bridge only) ───────────────────────────────────────────────────
+
+    // Called by the EGO-10 bridge after verifying a cross-chain lock proof.
+    // collateral_symbol: "USDC" or "USDT"
+    // claim_hash:        blake3(chain_id || height || sender || amount || nonce)
+    pub fn mint(
+        recipient:        address,
+        amount:           u128,
+        collateral_symbol: String,
+        claim_hash:       String,
+    ) -> bool {
+        _require_bridge();
+        _require_not_paused();
+
+        // Double-mint prevention
+        let col_key: String = concat("ego11:col:", claim_hash);
+        let already_claimed: bool = storage_get_bool(col_key);
+        require(!already_claimed, "EGUSD: claim already used");
+        storage_set_bool(col_key, true);
+
+        // Mint tokens
+        let bal_key: String = concat("ego11:bal:", address_to_str(recipient));
+        let old_bal: u128 = storage_get_u128(bal_key);
+        storage_set_u128(bal_key, old_bal + amount);
+
+        let old_supply: u128 = storage_get_u128("ego11:supply");
+        storage_set_u128("ego11:supply", old_supply + amount);
+
+        emit Transfer(zero_address(), recipient, amount);
+        emit Minted(collateral_symbol, amount, recipient);
+        return true;
+    }
+
+    // ── Burn (any holder — triggers redemption on source chain) ─────────────
+
+    // Caller burns their own EGUSD. Relayer observes the Burned event and
+    // releases USDC/USDT on the source chain to eth_recipient.
+    // collateral_hint: "USDC" or "USDT" — preferred redemption asset
+    pub fn burn(
+        amount:           u128,
+        eth_recipient:    String,
+        collateral_hint:  String,
+    ) -> bool {
+        _require_not_paused();
+        let from: address = caller();
+        let bal_key: String = concat("ego11:bal:", address_to_str(from));
+        let bal: u128 = storage_get_u128(bal_key);
+        require(bal >= amount, "EGUSD: burn amount exceeds balance");
+        storage_set_u128(bal_key, bal - amount);
+
+        let old_supply: u128 = storage_get_u128("ego11:supply");
+        storage_set_u128("ego11:supply", old_supply - amount);
+
+        emit Transfer(from, zero_address(), amount);
+        emit Burned(amount, eth_recipient, collateral_hint);
+        return true;
+    }
+
+    // ── Admin: set bridge (DAO governance only) ──────────────────────────────
+
+    pub fn set_bridge(new_bridge: address) {
+        _require_dao();
+        let old: address = _get_bridge();
+        storage_set_address("ego11:bridge", new_bridge);
+        emit BridgeUpdated(old, new_bridge);
+    }
+
+    // ── Emergency pause (DAO or guardian) ───────────────────────────────────
+
+    pub fn pause() {
+        _require_dao();
+        storage_set_bool("ego11:paused", true);
+        emit Paused(caller());
+    }
+
+    pub fn unpause() {
+        _require_dao();
+        storage_set_bool("ego11:paused", false);
+        emit Unpaused(caller());
+    }
+
+    pub fn is_paused() -> bool {
+        return storage_get_bool("ego11:paused");
+    }
+
+    // ── Internal helpers ─────────────────────────────────────────────────────
+
+    fn _transfer(from: address, to: address, amount: u128) {
+        require(to != zero_address(), "EGUSD: transfer to zero address");
+        let from_key: String = concat("ego11:bal:", address_to_str(from));
+        let to_key:   String = concat("ego11:bal:", address_to_str(to));
+        let from_bal: u128 = storage_get_u128(from_key);
+        require(from_bal >= amount, "EGUSD: transfer amount exceeds balance");
+        storage_set_u128(from_key, from_bal - amount);
+        let to_bal: u128 = storage_get_u128(to_key);
+        storage_set_u128(to_key, to_bal + amount);
+        emit Transfer(from, to, amount);
+    }
+
+    fn _get_bridge() -> address {
+        return storage_get_address("ego11:bridge");
+    }
+
+    fn _require_bridge() {
+        let bridge: address = _get_bridge();
+        require(caller() == bridge, "EGUSD: caller is not bridge");
+    }
+
+    fn _require_dao() {
+        // In production: check against the DAO contract address stored in genesis.
+        // For now: only the stored bridge/admin address (set at deploy) can call this.
+        // Replace with real DAO check once EGO-8 contract is deployed.
+        require(caller() == storage_get_address("ego11:bridge"), "EGUSD: not authorised");
+    }
+
+    fn _require_not_paused() {
+        require(!storage_get_bool("ego11:paused"), "EGUSD: contract paused");
+    }
+
+    // ── Events ───────────────────────────────────────────────────────────────
+
+    event Transfer(from: address, to: address, amount: u128);
+    event Approval(owner: address, spender: address, amount: u128);
+    event Minted(collateral_symbol: String, amount_uegusd: u128, recipient: address);
+    event Burned(amount_uegusd: u128, eth_recipient: String, collateral_hint: String);
+    event BridgeUpdated(old_bridge: address, new_bridge: address);
+    event Paused(by: address);
+    event Unpaused(by: address);
+}

@@ -1,0 +1,197 @@
+// EGO-15: Government Services Standard
+// SocialPrograms — on-chain grant and subsidy distribution
+// Storage prefix: ego15s:
+
+contract SocialPrograms {
+
+event ProgramCreated(program_id: u64, name: String, amount_per_recipient: u128, max_recipients: u64)
+event ProgramFunded(program_id: u64, amount: u128)
+event RecipientAdded(program_id: u64, recipient: address)
+event GrantClaimed(program_id: u64, recipient: address, amount: u128)
+event UnclaimedReclaimed(program_id: u64, amount: u128)
+
+// ── Initialisation ────────────────────────────────────────────────────────────
+
+pub fn init(authority_addr: address) {
+    storage_set_address("ego15s:authority", authority_addr);
+    storage_set_u64("ego15s:program_count", 0);
+}
+
+// ── Program administration ────────────────────────────────────────────────────
+
+// Create a new grant/subsidy program. Returns the assigned program_id.
+// amount_per_recipient: uEGOC awarded to each eligible claimer.
+// claim_start_block / claim_end_block: the window during which claims are accepted.
+// max_recipients: hard cap on the number of successful claims.
+pub fn create_program(name: String, amount_per_recipient: u128, claim_start_block: u64, claim_end_block: u64, max_recipients: u64) -> u64 {
+    _require_authority();
+    require(amount_per_recipient > 0, "amount_per_recipient must be positive");
+    require(claim_end_block > claim_start_block, "claim_end_block must be after claim_start_block");
+    require(max_recipients > 0, "max_recipients must be positive");
+
+    let count: u64 = storage_get_u64("ego15s:program_count");
+    let program_id: u64 = count + 1;
+    storage_set_u64("ego15s:program_count", program_id);
+
+    let pbase: String = concat("ego15s:program:", u64_to_str(program_id));
+    storage_set_str(concat(pbase, ":name"), name);
+    storage_set_u128(concat(pbase, ":amount_per_recipient"), amount_per_recipient);
+    storage_set_u64(concat(pbase, ":claim_start_block"), claim_start_block);
+    storage_set_u64(concat(pbase, ":claim_end_block"), claim_end_block);
+    storage_set_u64(concat(pbase, ":max_recipients"), max_recipients);
+    storage_set_u128(concat(pbase, ":funded"), 0);
+    storage_set_u64(concat(pbase, ":claimed_count"), 0);
+
+    emit ProgramCreated(program_id, name, amount_per_recipient, max_recipients);
+    return program_id;
+}
+
+// ── Funding ───────────────────────────────────────────────────────────────────
+
+// Authority deposits uEGOC into a program's pool to cover future claims.
+pub fn fund_program(program_id: u64, amount: u128) {
+    _require_authority();
+    require(amount > 0, "amount must be positive");
+
+    let pbase: String = concat("ego15s:program:", u64_to_str(program_id));
+    let name: String = storage_get_str(concat(pbase, ":name"));
+    require(name != "", "program does not exist");
+
+    let funded_key: String = concat(pbase, ":funded");
+    let prev: u128 = storage_get_u128(funded_key);
+    storage_set_u128(funded_key, prev + amount);
+
+    emit ProgramFunded(program_id, amount);
+}
+
+// ── Recipient management ──────────────────────────────────────────────────────
+
+// Add an address to the eligibility list for a program.
+pub fn add_recipient(program_id: u64, recipient: address) {
+    _require_authority();
+    let pbase: String = concat("ego15s:program:", u64_to_str(program_id));
+    let name: String = storage_get_str(concat(pbase, ":name"));
+    require(name != "", "program does not exist");
+
+    let key: String = concat("ego15s:eligible:", concat(u64_to_str(program_id), concat(":", address_to_str(recipient))));
+    storage_set_bool(key, true);
+
+    emit RecipientAdded(program_id, recipient);
+}
+
+// Remove an address from the eligibility list for a program.
+pub fn remove_recipient(program_id: u64, recipient: address) {
+    _require_authority();
+    let key: String = concat("ego15s:eligible:", concat(u64_to_str(program_id), concat(":", address_to_str(recipient))));
+    storage_set_bool(key, false);
+}
+
+// ── Claiming ──────────────────────────────────────────────────────────────────
+
+// Eligible caller claims their grant from a program.
+// The claim window, eligibility, single-claim, recipient cap, and funding are all enforced.
+pub fn claim(program_id: u64) {
+    let pbase: String = concat("ego15s:program:", u64_to_str(program_id));
+    let name: String = storage_get_str(concat(pbase, ":name"));
+    require(name != "", "program does not exist");
+
+    let start: u64 = storage_get_u64(concat(pbase, ":claim_start_block"));
+    let end: u64 = storage_get_u64(concat(pbase, ":claim_end_block"));
+    let current: u64 = block_number();
+    require(current >= start, "claim window has not opened");
+    require(current <= end, "claim window has closed");
+
+    let recipient: address = caller();
+    require(is_eligible(program_id, recipient), "caller is not eligible");
+    require(!has_claimed(program_id, recipient), "caller has already claimed");
+
+    let max_recipients: u64 = storage_get_u64(concat(pbase, ":max_recipients"));
+    let claimed_count: u64 = storage_get_u64(concat(pbase, ":claimed_count"));
+    require(claimed_count < max_recipients, "recipient cap reached");
+
+    let amount_per_recipient: u128 = storage_get_u128(concat(pbase, ":amount_per_recipient"));
+    let funded_key: String = concat(pbase, ":funded");
+    let funded: u128 = storage_get_u128(funded_key);
+    require(funded >= amount_per_recipient, "insufficient program funds");
+
+    // Mark claimed and update counters
+    let claimed_key: String = concat("ego15s:claimed:", concat(u64_to_str(program_id), concat(":", address_to_str(recipient))));
+    storage_set_bool(claimed_key, true);
+    storage_set_u64(concat(pbase, ":claimed_count"), claimed_count + 1);
+    storage_set_u128(funded_key, funded - amount_per_recipient);
+
+    emit GrantClaimed(program_id, recipient, amount_per_recipient);
+}
+
+// ── Fund reclamation ──────────────────────────────────────────────────────────
+
+// After the claim window closes, the authority can reclaim any remaining funded balance.
+pub fn reclaim_unclaimed(program_id: u64) {
+    _require_authority();
+    let pbase: String = concat("ego15s:program:", u64_to_str(program_id));
+    let name: String = storage_get_str(concat(pbase, ":name"));
+    require(name != "", "program does not exist");
+
+    let end: u64 = storage_get_u64(concat(pbase, ":claim_end_block"));
+    require(block_number() > end, "claim window has not closed");
+
+    let funded_key: String = concat(pbase, ":funded");
+    let remaining: u128 = storage_get_u128(funded_key);
+    require(remaining > 0, "no funds to reclaim");
+
+    storage_set_u128(funded_key, 0);
+
+    emit UnclaimedReclaimed(program_id, remaining);
+}
+
+// ── View functions ────────────────────────────────────────────────────────────
+
+// Returns true if the given address is eligible to claim from the program.
+pub fn is_eligible(program_id: u64, recipient: address) -> bool {
+    let key: String = concat("ego15s:eligible:", concat(u64_to_str(program_id), concat(":", address_to_str(recipient))));
+    return storage_get_bool(key);
+}
+
+// Returns true if the given address has already claimed from the program.
+pub fn has_claimed(program_id: u64, recipient: address) -> bool {
+    let key: String = concat("ego15s:claimed:", concat(u64_to_str(program_id), concat(":", address_to_str(recipient))));
+    return storage_get_bool(key);
+}
+
+// Returns the name of a program.
+pub fn get_program_name(program_id: u64) -> String {
+    let pbase: String = concat("ego15s:program:", u64_to_str(program_id));
+    return storage_get_str(concat(pbase, ":name"));
+}
+
+// Returns the number of successful claims made against a program.
+pub fn get_claimed_count(program_id: u64) -> u64 {
+    let pbase: String = concat("ego15s:program:", u64_to_str(program_id));
+    return storage_get_u64(concat(pbase, ":claimed_count"));
+}
+
+// Returns the total number of programs created.
+pub fn get_program_count() -> u64 {
+    return storage_get_u64("ego15s:program_count");
+}
+
+// Returns the remaining funded balance for a program.
+pub fn get_funded_balance(program_id: u64) -> u128 {
+    let pbase: String = concat("ego15s:program:", u64_to_str(program_id));
+    return storage_get_u128(concat(pbase, ":funded"));
+}
+
+// Returns the grant amount per recipient for a program.
+pub fn get_amount_per_recipient(program_id: u64) -> u128 {
+    let pbase: String = concat("ego15s:program:", u64_to_str(program_id));
+    return storage_get_u128(concat(pbase, ":amount_per_recipient"));
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn _require_authority() {
+    let auth: address = storage_get_address("ego15s:authority");
+    require(caller() == auth, "caller is not authority");
+}
+
+}

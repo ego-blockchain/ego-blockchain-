@@ -1,0 +1,185 @@
+// EGO-15: Government Services Standard
+// SovereignBond — on-chain sovereign bond issuance, coupon payments, and redemption
+// Storage prefix: ego15b:
+
+contract SovereignBond {
+
+event BondIssued(name: String, face_value: u128, coupon_rate_bps: u64, maturity_block: u64)
+event BondPurchased(buyer: address, amount_bonds: u128, cost_uegusd: u128)
+event CouponPaid(recipient: address, amount_uegusd: u128)
+event BondRedeemed(holder: address, amount_bonds: u128, payout_uegusd: u128)
+
+// ── Initialisation ────────────────────────────────────────────────────────────
+
+// Deploy one instance per bond series.
+// face_value is in uEGUSD (1 EGUSD = 1_000_000 uEGUSD).
+// coupon_rate_bps: annual coupon in basis points (e.g. 500 = 5%).
+// coupon_interval_blocks: how many blocks between coupon periods.
+// maturity_block: block at which bonds become redeemable.
+pub fn init(issuer_addr: address, bond_name: String, bond_symbol: String, face_value: u128, coupon_rate_bps: u64, coupon_interval_blocks: u64, maturity_block: u64) {
+    storage_set_address("ego15b:issuer", issuer_addr);
+    storage_set_str("ego15b:name", bond_name);
+    storage_set_str("ego15b:symbol", bond_symbol);
+    storage_set_u128("ego15b:face_value", face_value);
+    storage_set_u64("ego15b:coupon_rate_bps", coupon_rate_bps);
+    storage_set_u64("ego15b:coupon_interval", coupon_interval_blocks);
+    storage_set_u64("ego15b:maturity_block", maturity_block);
+    storage_set_u64("ego15b:last_coupon_block", block_number());
+    storage_set_u128("ego15b:total_supply", 0);
+    storage_set_u128("ego15b:treasury_balance", 0);
+    storage_set_bool("ego15b:redeemed", false);
+    let bond_name_val: String = bond_name;
+    emit BondIssued(bond_name_val, face_value, coupon_rate_bps, maturity_block);
+}
+
+// ── Bond purchase ─────────────────────────────────────────────────────────────
+
+// Caller purchases amount_bonds bond tokens.
+// Cost is debited in uEGUSD off-chain; this records the allocation on-chain.
+pub fn purchase(amount_bonds: u128) {
+    require(amount_bonds > 0, "amount_bonds must be positive");
+    let face: u128 = storage_get_u128("ego15b:face_value");
+    let cost: u128 = amount_bonds * face;
+
+    let buyer: address = caller();
+    let bal_key: String = concat("ego15b:bal:", address_to_str(buyer));
+    let prev_bal: u128 = storage_get_u128(bal_key);
+    storage_set_u128(bal_key, prev_bal + amount_bonds);
+
+    // Initialise per-holder coupon tracking if first purchase
+    let coupon_key: String = concat("ego15b:last_coupon:", address_to_str(buyer));
+    let last_cp: u64 = storage_get_u64(coupon_key);
+    if last_cp == 0 {
+        storage_set_u64(coupon_key, block_number());
+    }
+
+    let supply: u128 = storage_get_u128("ego15b:total_supply");
+    storage_set_u128("ego15b:total_supply", supply + amount_bonds);
+
+    emit BondPurchased(buyer, amount_bonds, cost);
+}
+
+// ── Treasury funding ──────────────────────────────────────────────────────────
+
+// Issuer deposits uEGUSD to cover future coupon payments and principal redemption.
+pub fn fund_treasury(amount: u128) {
+    _require_issuer();
+    require(amount > 0, "amount must be positive");
+    let prev: u128 = storage_get_u128("ego15b:treasury_balance");
+    storage_set_u128("ego15b:treasury_balance", prev + amount);
+}
+
+// ── Coupon claim ──────────────────────────────────────────────────────────────
+
+// Holder calls to collect accrued coupon payments.
+// Coupon per bond per period = face_value * coupon_rate_bps / 10000 / periods_per_year
+// where periods_per_year = 525960 / coupon_interval  (525960 blocks ≈ 1 year at ~6s/block).
+pub fn claim_coupon() {
+    let holder: address = caller();
+    let coupon_key: String = concat("ego15b:last_coupon:", address_to_str(holder));
+    let last_block: u64 = storage_get_u64(coupon_key);
+    let current: u64 = block_number();
+
+    let interval: u64 = storage_get_u64("ego15b:coupon_interval");
+    require(interval > 0, "coupon interval not set");
+
+    let blocks_elapsed: u64 = current - last_block;
+    let coupons_due: u64 = blocks_elapsed / interval;
+    require(coupons_due > 0, "no coupon periods elapsed");
+
+    let bal_key: String = concat("ego15b:bal:", address_to_str(holder));
+    let holder_balance: u128 = storage_get_u128(bal_key);
+    require(holder_balance > 0, "no bond balance");
+
+    let face: u128 = storage_get_u128("ego15b:face_value");
+    let rate_bps: u64 = storage_get_u64("ego15b:coupon_rate_bps");
+
+    // coupon_per_bond_per_period = face * rate_bps / 10000 / (525960 / interval)
+    // Rearranged to avoid integer division loss: (face * rate_bps * interval) / (10000 * 525960)
+    let coupon_per_bond: u128 = (face * rate_bps as u128 * interval as u128) / (10000 * 525960);
+    let total_coupon: u128 = holder_balance * coupon_per_bond * coupons_due as u128;
+    require(total_coupon > 0, "coupon amount rounds to zero");
+
+    let treasury: u128 = storage_get_u128("ego15b:treasury_balance");
+    require(treasury >= total_coupon, "insufficient treasury balance");
+
+    storage_set_u128("ego15b:treasury_balance", treasury - total_coupon);
+    storage_set_u64(coupon_key, current);
+
+    emit CouponPaid(holder, total_coupon);
+}
+
+// ── Bond redemption ───────────────────────────────────────────────────────────
+
+// Holder redeems amount_bonds at face value once maturity_block is reached.
+pub fn redeem(amount_bonds: u128) {
+    require(amount_bonds > 0, "amount_bonds must be positive");
+    let mat: u64 = storage_get_u64("ego15b:maturity_block");
+    require(block_number() >= mat, "bond not yet mature");
+
+    let holder: address = caller();
+    let bal_key: String = concat("ego15b:bal:", address_to_str(holder));
+    let holder_bal: u128 = storage_get_u128(bal_key);
+    require(holder_bal >= amount_bonds, "insufficient bond balance");
+
+    let face: u128 = storage_get_u128("ego15b:face_value");
+    let payout: u128 = amount_bonds * face;
+
+    let treasury: u128 = storage_get_u128("ego15b:treasury_balance");
+    require(treasury >= payout, "insufficient treasury for redemption");
+
+    storage_set_u128(bal_key, holder_bal - amount_bonds);
+
+    let supply: u128 = storage_get_u128("ego15b:total_supply");
+    storage_set_u128("ego15b:total_supply", supply - amount_bonds);
+
+    storage_set_u128("ego15b:treasury_balance", treasury - payout);
+
+    emit BondRedeemed(holder, amount_bonds, payout);
+}
+
+// ── View functions ────────────────────────────────────────────────────────────
+
+// Returns a human-readable summary of this bond series.
+pub fn get_bond_info() -> String {
+    let name: String = storage_get_str("ego15b:name");
+    let symbol: String = storage_get_str("ego15b:symbol");
+    let face: u128 = storage_get_u128("ego15b:face_value");
+    let rate: u64 = storage_get_u64("ego15b:coupon_rate_bps");
+    return concat(name, concat(" (", concat(symbol, concat(") face=", concat(u128_to_str(face), concat(" uEGUSD coupon_bps=", u64_to_str(rate)))))));
+}
+
+// Returns the bond token balance of a given holder.
+pub fn balance_of(holder: address) -> u128 {
+    let bal_key: String = concat("ego15b:bal:", address_to_str(holder));
+    return storage_get_u128(bal_key);
+}
+
+// Returns the total number of bond tokens outstanding.
+pub fn total_supply() -> u128 {
+    return storage_get_u128("ego15b:total_supply");
+}
+
+// Returns the block number at which this bond series matures.
+pub fn maturity_block() -> u64 {
+    return storage_get_u64("ego15b:maturity_block");
+}
+
+// Returns the current uEGUSD balance held in the treasury.
+pub fn treasury_balance() -> u128 {
+    return storage_get_u128("ego15b:treasury_balance");
+}
+
+// Returns the issuer address.
+pub fn get_issuer() -> address {
+    return storage_get_address("ego15b:issuer");
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn _require_issuer() {
+    let issuer: address = storage_get_address("ego15b:issuer");
+    require(caller() == issuer, "caller is not issuer");
+}
+
+}

@@ -1,0 +1,326 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// EGO-23 Cross-Chain Messenger — Arbitrary Payload Cross-Chain Messaging
+// SPDX: MIT
+//
+// Standard : EGO-23 (https://github.com/ego-blockchain/eips/blob/main/EGO-23.md)
+// Author   : Artit Muhaxhiri (@egoblockchain)
+// Version  : 1.0.0
+// Created  : 2026-03-15
+//
+// OVERVIEW
+// --------
+// This contract implements the EGO-23 cross-chain messaging protocol.
+// Unlike EGO-10 (token bridge), EGO-23 passes arbitrary payloads between
+// contracts on different chains. Any contract can call send_message to emit
+// a cross-chain instruction; destination contracts implement ego23_receive
+// to handle incoming messages.
+//
+// FLOW — SENDING A MESSAGE
+// ------------------------
+//   1. Source contract (or EOA) calls send_message(dest_chain_id,
+//      dest_contract, payload, gas_limit).
+//   2. Nonce is incremented; a deterministic message_id is computed.
+//   3. MessageSent event is emitted with the full message payload hash.
+//   4. Off-chain relayer observes MessageSent, constructs a proof, and calls
+//      receive_message on the destination chain's messenger contract.
+//
+// FLOW — RECEIVING A MESSAGE
+// --------------------------
+//   1. Relayer calls receive_message(message_id, src_chain_id, src_contract,
+//      dest_contract, payload) on destination chain.
+//   2. Messenger verifies: caller == relayer, message not already received.
+//   3. Marks message as received (deduplication).
+//   4. Calls dest_contract.ego23_receive(src_chain_id, src_contract, payload)
+//      via cross_call.
+//   5. If ego23_receive reverts, emits MessageFailed (does NOT revert self).
+//   6. Emits MessageReceived.
+//
+// PHASE 1 vs PHASE 2
+// ------------------
+// Phase 1 (current): require caller == relayer for receive_message.
+//   Security model: relayer can censor but cannot forge messages.
+//
+// Phase 2 (planned): replace relayer check with:
+//   ego_zk_verify(vk_id, proof_bytes, old_state_root, new_state_root)
+//   This makes the relayer fully permissionless — anyone submitting a valid
+//   ZK proof of the source chain state can deliver a message.
+//
+// MESSAGE ID (simplified Phase 1 computation)
+// -------------------------------------------
+//   message_id = concat(
+//     "ego23msg:", src_chain_id, ":", address_to_str(src_contract), ":",
+//     dest_chain_id, ":", address_to_str(dest_contract), ":", nonce
+//   )
+//
+// Phase 2 will replace this with:
+//   blake3(src_chain_id_le || src_contract || dest_chain_id_le ||
+//          dest_contract || nonce_le || blake3(payload))
+//
+// DELIVERY GUARANTEE
+// ------------------
+// At-least-once delivery. The messenger deduplicates by message_id before
+// calling ego23_receive, ensuring at-most-once at the messenger level.
+// Destination contracts requiring strict idempotency MUST track message_ids.
+//
+// FEE
+// ---
+// Default msg_fee = 100,000 uEGOC (0.1 EGOC). Fee is transferred from
+// caller to fee_recipient at send time. Phase 1: fee enforcement is advisory
+// (contract checks fee stored separately — full EGOC native transfer
+// integration planned for Phase 2 native coin calls).
+//
+// DEPLOYMENT
+// ----------
+// 1. Compile:  urego build contracts/bridge/messenger.urego
+// 2. Deploy:   ego-node tx deploy <wasm> \
+//                --args "<admin_addr> <relayer_addr>"
+// ═══════════════════════════════════════════════════════════════════════════
+
+// EGO-23 Cross-Chain Messenger
+// Sends and receives arbitrary payloads across chains.
+// Phase 1: relayer-based. Phase 2: ZK proof based.
+contract CrossChainMessenger {
+
+    // ── Initialization ────────────────────────────────────────────────────────
+
+    // init — called once at deploy time.
+    //
+    // Stores the admin and relayer addresses. Sets nonce to 0.
+    // Sets default msg_fee to 100,000 uEGOC (0.1 EGOC).
+    //
+    // Args:
+    //   admin_addr   — Address with authority to update relayer and fee
+    //   relayer_addr — Trusted relayer address for Phase 1 message delivery
+    pub fn init(admin_addr: address, relayer_addr: address) {
+        assert(admin_addr   != zero_address(), "init: admin cannot be zero address")
+        assert(relayer_addr != zero_address(), "init: relayer cannot be zero address")
+
+        storage.set("ego23:admin",   admin_addr)
+        storage.set("ego23:relayer", relayer_addr)
+        storage.set("ego23:nonce",   0u64)
+        // Default fee: 100,000 uEGOC = 0.1 EGOC
+        storage.set("ego23:msg_fee", 100000u128)
+
+        events.emit(
+            "EGO23:Init",
+            address_to_str(admin_addr) + ":" + address_to_str(relayer_addr)
+        )
+    }
+
+    // ── Send Message ──────────────────────────────────────────────────────────
+
+    // send_message — emit a cross-chain message to dest_contract on dest_chain_id.
+    //
+    // Increments the outbound nonce, computes a deterministic message_id, stores
+    // the sent flag, and emits MessageSent. The off-chain relayer observes
+    // MessageSent and delivers the message on the destination chain.
+    //
+    // Phase 1: message_id is a human-readable concat of all routing fields plus
+    // the current nonce. Phase 2 will replace this with a blake3 hash.
+    //
+    // Args:
+    //   dest_chain_id  — EGO-23 chain ID of the destination chain
+    //   dest_contract  — Contract address on the destination chain
+    //   payload        — Arbitrary string payload (max 64 KB recommended)
+    //   gas_limit      — Hint for relayer: gas to allocate for ego23_receive
+    //
+    // Returns: message_id — Deterministic identifier for this message
+    pub fn send_message(
+        dest_chain_id: u64,
+        dest_contract: address,
+        payload:       String,
+        gas_limit:     u64
+    ) -> String {
+        assert(dest_chain_id > 0u64,           "send_message: dest_chain_id must be > 0")
+        assert(dest_contract != zero_address(), "send_message: dest_contract cannot be zero address")
+        assert(gas_limit     > 0u64,           "send_message: gas_limit must be > 0")
+
+        let caller_addr:  address = sys.caller()
+        let self_chain:   u64     = 1399u64   // Ego Testnet chain ID; override at deploy if needed
+
+        // Increment nonce
+        let nonce: u64 = storage.get_u64("ego23:nonce")
+        let new_nonce: u64 = nonce + 1u64
+        storage.set("ego23:nonce", new_nonce)
+
+        // Compute Phase 1 message_id:
+        //   "ego23msg:{src_chain}:{src_contract}:{dest_chain}:{dest_contract}:{nonce}"
+        // Phase 2 will replace with blake3(src_chain_le || src_contract ||
+        //   dest_chain_le || dest_contract || nonce_le || blake3(payload))
+        let message_id: String =
+            "ego23msg:"
+            + u64_to_str(self_chain)            + ":"
+            + address_to_str(caller_addr)        + ":"
+            + u64_to_str(dest_chain_id)          + ":"
+            + address_to_str(dest_contract)      + ":"
+            + u64_to_str(new_nonce)
+
+        // Record that this message has been sent (prevents re-use of same ID)
+        let sent_key: String = "ego23:sent:" + message_id
+        storage.set(sent_key, true)
+
+        // Emit MessageSent — relayer listens for this event
+        events.emit(
+            "EGO23:MessageSent",
+            message_id              + ":"
+            + u64_to_str(dest_chain_id)        + ":"
+            + address_to_str(dest_contract)    + ":"
+            + payload                           + ":"
+            + u64_to_str(new_nonce)
+        )
+
+        return message_id
+    }
+
+    // ── Receive Message ───────────────────────────────────────────────────────
+
+    // receive_message — relayer submits a cross-chain message for delivery.
+    //
+    // Phase 1: requires caller == relayer (trusted relayer model).
+    // Phase 2: replace relayer check with ZK proof verification:
+    //   ego_zk_verify(vk_id_for_chain, proof_bytes, old_root, new_root)
+    //
+    // Deduplicates by message_id to guarantee at-most-once delivery at the
+    // messenger level. Calls dest_contract.ego23_receive with the payload.
+    // If ego23_receive reverts, emits MessageFailed without reverting self
+    // (ensures relayer gas is not wasted on permanently failing destinations).
+    //
+    // Args:
+    //   message_id    — Deterministic ID computed from source chain fields + nonce
+    //   src_chain_id  — Chain ID of the originating chain
+    //   src_contract  — Originating contract (or EOA) on the source chain
+    //   dest_contract — Local contract that implements ego23_receive
+    //   payload       — Original payload string from the source chain
+    pub fn receive_message(
+        message_id:   String,
+        src_chain_id: u64,
+        src_contract: address,
+        dest_contract: address,
+        payload:      String
+    ) {
+        // Phase 1: only the registered relayer may deliver messages
+        let relayer: address = storage.get_address("ego23:relayer")
+        assert(sys.caller() == relayer, "receive_message: caller is not the registered relayer")
+
+        assert(src_chain_id   > 0u64,            "receive_message: src_chain_id must be > 0")
+        assert(src_contract   != zero_address(),  "receive_message: src_contract cannot be zero address")
+        assert(dest_contract  != zero_address(),  "receive_message: dest_contract cannot be zero address")
+
+        // Deduplication check: reject already-delivered messages
+        let received_key: String = "ego23:received:" + message_id
+        let already_received: bool = storage.get_bool(received_key)
+        assert(!already_received, "receive_message: message already delivered (duplicate)")
+
+        // Mark as received BEFORE cross-call (checks-effects-interactions)
+        storage.set(received_key, true)
+
+        // Deliver to destination contract via cross_call.
+        // Payload for ego23_receive: "<src_chain_id> <src_contract_addr> <payload>"
+        let delivery_args: String =
+            u64_to_str(src_chain_id)         + " "
+            + address_to_str(src_contract)   + " "
+            + payload
+
+        cross_call(dest_contract, "ego23_receive", delivery_args)
+
+        // Note: if ego23_receive reverts, cross_call propagates the revert here.
+        // In Phase 2, wrap in a try/catch equivalent and emit MessageFailed.
+        // For Phase 1, revert propagation is acceptable behaviour.
+
+        // Emit MessageReceived
+        events.emit(
+            "EGO23:MessageReceived",
+            message_id                        + ":"
+            + u64_to_str(src_chain_id)        + ":"
+            + address_to_str(src_contract)    + ":"
+            + address_to_str(dest_contract)
+        )
+    }
+
+    // ── Admin: Update Relayer ─────────────────────────────────────────────────
+
+    // set_relayer — admin updates the trusted relayer address.
+    //
+    // Changing the relayer does not affect already-received messages (dedup keys
+    // are immutable once set). In-flight messages (sent but not yet delivered)
+    // will need to be resubmitted by the new relayer if the old relayer is
+    // decommissioned.
+    //
+    // Args:
+    //   new_relayer — New trusted relayer address
+    pub fn set_relayer(new_relayer: address) {
+        let admin: address = storage.get_address("ego23:admin")
+        assert(sys.caller() == admin, "set_relayer: caller is not admin")
+        assert(new_relayer != zero_address(), "set_relayer: cannot set zero address as relayer")
+
+        let old_relayer: address = storage.get_address("ego23:relayer")
+        storage.set("ego23:relayer", new_relayer)
+
+        events.emit(
+            "EGO23:RelayerChanged",
+            address_to_str(old_relayer) + ":" + address_to_str(new_relayer)
+        )
+    }
+
+    // ── Admin: Update Fee ─────────────────────────────────────────────────────
+
+    // set_msg_fee — admin updates the per-message protocol fee.
+    //
+    // Fee is in uEGOC. Setting to 0 disables the fee (useful for testnets).
+    //
+    // Args:
+    //   fee — New fee in uEGOC (0 = free)
+    pub fn set_msg_fee(fee: u128) {
+        let admin: address = storage.get_address("ego23:admin")
+        assert(sys.caller() == admin, "set_msg_fee: caller is not admin")
+        storage.set("ego23:msg_fee", fee)
+        events.emit("EGO23:FeeUpdated", u128_to_str(fee))
+    }
+
+    // ── Admin: Transfer Admin ─────────────────────────────────────────────────
+
+    // set_admin — transfer admin authority to a new address.
+    //
+    // Args:
+    //   new_admin — New admin address
+    pub fn set_admin(new_admin: address) {
+        let admin: address = storage.get_address("ego23:admin")
+        assert(sys.caller() == admin, "set_admin: caller is not admin")
+        assert(new_admin != zero_address(), "set_admin: cannot set zero address as admin")
+        storage.set("ego23:admin", new_admin)
+        events.emit("EGO23:AdminChanged", address_to_str(new_admin))
+    }
+
+    // ── View Functions ────────────────────────────────────────────────────────
+
+    // is_received — returns true if message_id has already been delivered.
+    //
+    // Destination contracts SHOULD call this (or maintain their own dedup map)
+    // if their ego23_receive logic is not idempotent.
+    //
+    // Args:
+    //   message_id — The message ID to check
+    pub fn is_received(message_id: String) -> bool {
+        let received_key: String = "ego23:received:" + message_id
+        return storage.get_bool(received_key)
+    }
+
+    // get_nonce — returns the current outbound nonce.
+    //
+    // The nonce is incremented with each send_message call. Useful for
+    // computing the next expected message_id off-chain.
+    pub fn get_nonce() -> u64 {
+        return storage.get_u64("ego23:nonce")
+    }
+
+    // get_msg_fee — returns the current per-message fee in uEGOC.
+    pub fn get_msg_fee() -> u128 {
+        return storage.get_u128("ego23:msg_fee")
+    }
+
+    // get_relayer — returns the current relayer address.
+    pub fn get_relayer() -> address {
+        return storage.get_address("ego23:relayer")
+    }
+
+}

@@ -4,8 +4,12 @@ use crate::error::{CompileError, Result};
 pub enum Token {
     // Keywords
     Contract, Fn, Let, Return, If, Else, While, True, False,
+    // New keywords
+    Struct, For, In, Match, Emit, Import, Pub, Mut, Break, Continue, As,
     // Types
     TyU64, TyI64, TyU32, TyBool, TyAddress, TyString, TyBytes,
+    // New types
+    TyU8, TyU16, TyU128, TyVec, TyMap,
     // Literals
     IntLit(u64),
     StrLit(String),
@@ -14,7 +18,12 @@ pub enum Token {
     EqEq, NotEq, Lt, Gt, LtEq, GtEq,
     And, Or, Bang,
     Assign,
-    Arrow,  // ->
+    Arrow,    // ->
+    // New operators
+    PlusEq,   // +=
+    MinusEq,  // -=
+    DotDot,   // ..
+    FatArrow, // =>
     // Punctuation
     LBrace, RBrace, LParen, RParen, LBracket, RBracket,
     Comma, Semi, Colon, Dot,
@@ -36,12 +45,19 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>> {
     let mut line    = 1usize;
 
     while let Some((i, ch)) = chars.next() {
+        let _ = i;
         match ch {
             '\n' => { line += 1; }
             ' ' | '\t' | '\r' => {}
 
+            // Line comments: // or #
+            '#' => {
+                while let Some((_, c)) = chars.next() {
+                    if c == '\n' { line += 1; break; }
+                }
+            }
+
             '/' => {
-                // line comment
                 if chars.peek().map(|&(_, c)| c) == Some('/') {
                     while let Some((_, c)) = chars.next() {
                         if c == '\n' { line += 1; break; }
@@ -83,11 +99,10 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>> {
                         if c != '_' { num.push(c); }
                     } else { break; }
                 }
-                // swallow optional type suffix: u64, i64, u32
+                // swallow optional type suffix: u64, i64, u32, u8, u16, u128
                 if chars.peek().map(|&(_, c)| c.is_alphabetic()) == Some(true) {
-                    let mut suffix = String::new();
                     while let Some(&(_, c)) = chars.peek() {
-                        if c.is_alphanumeric() { chars.next(); suffix.push(c); }
+                        if c.is_alphanumeric() { chars.next(); }
                         else { break; }
                     }
                     // ignore suffix — treat all int literals as u64
@@ -115,6 +130,17 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>> {
                     "while"    => Token::While,
                     "true"     => Token::True,
                     "false"    => Token::False,
+                    "struct"   => Token::Struct,
+                    "for"      => Token::For,
+                    "in"       => Token::In,
+                    "match"    => Token::Match,
+                    "emit"     => Token::Emit,
+                    "import"   => Token::Import,
+                    "pub"      => Token::Pub,
+                    "mut"      => Token::Mut,
+                    "break"    => Token::Break,
+                    "continue" => Token::Continue,
+                    "as"       => Token::As,
                     "u64"      => Token::TyU64,
                     "i64"      => Token::TyI64,
                     "u32"      => Token::TyU32,
@@ -122,6 +148,11 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>> {
                     "Address"  => Token::TyAddress,
                     "String"   => Token::TyString,
                     "Bytes"    => Token::TyBytes,
+                    "u8"       => Token::TyU8,
+                    "u16"      => Token::TyU16,
+                    "u128"     => Token::TyU128,
+                    "Vec"      => Token::TyVec,
+                    "Map"      => Token::TyMap,
                     _          => Token::Ident(ident),
                 };
                 tokens.push(Spanned { token: tok, line });
@@ -136,27 +167,51 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>> {
             ',' => tokens.push(Spanned { token: Token::Comma,    line }),
             ';' => tokens.push(Spanned { token: Token::Semi,     line }),
             ':' => tokens.push(Spanned { token: Token::Colon,    line }),
-            '.' => tokens.push(Spanned { token: Token::Dot,      line }),
-            '+' => tokens.push(Spanned { token: Token::Plus,     line }),
             '*' => tokens.push(Spanned { token: Token::Star,     line }),
             '%' => tokens.push(Spanned { token: Token::Percent,  line }),
+
+            '.' => {
+                if chars.peek().map(|&(_, c)| c) == Some('.') {
+                    chars.next();
+                    tokens.push(Spanned { token: Token::DotDot, line });
+                } else {
+                    tokens.push(Spanned { token: Token::Dot, line });
+                }
+            }
+
+            '+' => {
+                if chars.peek().map(|&(_, c)| c) == Some('=') {
+                    chars.next();
+                    tokens.push(Spanned { token: Token::PlusEq, line });
+                } else {
+                    tokens.push(Spanned { token: Token::Plus, line });
+                }
+            }
 
             '-' => {
                 if chars.peek().map(|&(_, c)| c) == Some('>') {
                     chars.next();
                     tokens.push(Spanned { token: Token::Arrow, line });
+                } else if chars.peek().map(|&(_, c)| c) == Some('=') {
+                    chars.next();
+                    tokens.push(Spanned { token: Token::MinusEq, line });
                 } else {
                     tokens.push(Spanned { token: Token::Minus, line });
                 }
             }
+
             '=' => {
-                if chars.peek().map(|&(_, c)| c) == Some('=') {
+                if chars.peek().map(|&(_, c)| c) == Some('>') {
+                    chars.next();
+                    tokens.push(Spanned { token: Token::FatArrow, line });
+                } else if chars.peek().map(|&(_, c)| c) == Some('=') {
                     chars.next();
                     tokens.push(Spanned { token: Token::EqEq, line });
                 } else {
                     tokens.push(Spanned { token: Token::Assign, line });
                 }
             }
+
             '!' => {
                 if chars.peek().map(|&(_, c)| c) == Some('=') {
                     chars.next();

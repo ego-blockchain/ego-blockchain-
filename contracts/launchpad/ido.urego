@@ -1,0 +1,480 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// EGO-22 Reference IDO Launchpad — Token Sale / Initial DEX Offering
+// SPDX: MIT
+//
+// Standard : EGO-22 (https://github.com/ego-blockchain/eips/blob/main/EGO-22.md)
+// Author   : Artit Muhaxhiri (@egoblockchain)
+// Version  : 1.0.0
+// Created  : 2026-03-15
+//
+// OVERVIEW
+// --------
+// This contract implements a permissionless IDO launchpad as defined in EGO-22.
+//
+// SALE LIFECYCLE
+// --------------
+//   1. Project owner calls create_sale, depositing sale tokens into escrow.
+//   2. Participants call participate(sale_id, amount) during [start_block, end_block].
+//   3. Anyone calls finalize(sale_id) after end_block.
+//      - raised >= soft_cap → status = "success"
+//      - raised  < soft_cap → status = "failed"
+//   4a. Success: participants call claim_tokens; project owner calls withdraw_raise.
+//   4b. Failure: participants call claim_refund to recover their raise tokens.
+//
+// ALLOCATION FORMULA
+// ------------------
+//   allocation_i = contributed_i * total_sale_tokens / total_raised
+//
+// Pro-rata distribution. Integer division; dust stays in the contract.
+//
+// PLATFORM FEE
+// ------------
+//   fee = total_raised * fee_bps / 10000
+//
+// Default fee_bps = 300 (3%). Admin may change fee_bps; capped at 1000 (10%).
+// Fee is paid to fee_recipient at the time project owner calls withdraw_raise.
+//
+// CROSS-CONTRACT CALLS
+// --------------------
+// create_sale   → sale_token.transfer_from(project_owner, self, total_tokens)
+// participate   → raise_token.transfer_from(participant, self, amount)
+// claim_tokens  → sale_token.transfer(participant, allocation)
+// claim_refund  → raise_token.transfer(participant, contributed)
+// withdraw_raise→ raise_token.transfer(fee_recipient, fee)
+//                 raise_token.transfer(project_owner, total_raised - fee)
+//
+// DEPLOYMENT
+// ----------
+// 1. Compile:  urego build contracts/launchpad/ido.urego
+// 2. Deploy:   ego-node tx deploy <wasm> \
+//                --args "<admin_addr> <fee_recipient_addr>"
+// 3. Projects call create_sale to register their IDO.
+// ═══════════════════════════════════════════════════════════════════════════
+
+contract IDOLaunchpad {
+
+    // ── Initialization ────────────────────────────────────────────────────────
+
+    // init — called once at deploy time.
+    //
+    // Sets the admin address, fee recipient, default fee (300 bps = 3%),
+    // and initialises the sale counter to zero.
+    //
+    // Args:
+    //   admin_addr         — Address with administrative authority (set_fee, etc.)
+    //   fee_recipient_addr — Address that receives platform fees on each sale
+    pub fn init(admin_addr: address, fee_recipient_addr: address) {
+        assert(admin_addr        != zero_address(), "init: admin cannot be zero address")
+        assert(fee_recipient_addr != zero_address(), "init: fee_recipient cannot be zero address")
+
+        storage.set("ego22:admin",         admin_addr)
+        storage.set("ego22:fee_recipient", fee_recipient_addr)
+        storage.set("ego22:fee_bps",       300u64)
+        storage.set("ego22:sale_count",    0u64)
+
+        events.emit("EGO22:Init", address_to_str(admin_addr) + ":" + address_to_str(fee_recipient_addr))
+    }
+
+    // ── Sale Creation ─────────────────────────────────────────────────────────
+
+    // create_sale — register a new IDO sale and escrow the sale tokens.
+    //
+    // Permissionless: any address may create a sale. The caller becomes the
+    // project_owner and MUST have approved this contract to spend total_sale_tokens
+    // of sale_token via EGO-20 approve() before calling.
+    //
+    // Args:
+    //   sale_token        — EGO-20 contract of the token being sold
+    //   raise_token       — EGO-20 contract of the token accepted as payment
+    //   price             — Informational: raise uUnits per sale uUnit (stored only)
+    //   soft_cap          — Minimum raise required for success (u128 uUnits)
+    //   hard_cap          — Maximum raise accepted (u128 uUnits); hard cap >= soft_cap
+    //   start_block       — First block at which participants may join
+    //   end_block         — Last block at which participants may join (exclusive)
+    //   total_sale_tokens — Total sale tokens to be distributed (escrowed now)
+    //
+    // Returns: sale_id — The assigned sale identifier (u64)
+    pub fn create_sale(
+        sale_token:        address,
+        raise_token:       address,
+        price:             u128,
+        soft_cap:          u128,
+        hard_cap:          u128,
+        start_block:       u64,
+        end_block:         u64,
+        total_sale_tokens: u128
+    ) -> u64 {
+        assert(end_block > start_block,     "create_sale: end_block must be after start_block")
+        assert(hard_cap  >= soft_cap,       "create_sale: hard_cap must be >= soft_cap")
+        assert(soft_cap  > 0u128,           "create_sale: soft_cap must be > 0")
+        assert(hard_cap  > 0u128,           "create_sale: hard_cap must be > 0")
+        assert(total_sale_tokens > 0u128,   "create_sale: total_sale_tokens must be > 0")
+        assert(sale_token  != zero_address(), "create_sale: sale_token cannot be zero address")
+        assert(raise_token != zero_address(), "create_sale: raise_token cannot be zero address")
+
+        // Assign sale_id and increment counter
+        let sale_id:    u64     = storage.get_u64("ego22:sale_count")
+        let new_count:  u64     = sale_id + 1u64
+        storage.set("ego22:sale_count", new_count)
+
+        let caller_addr: address = sys.caller()
+        let self_addr:   address = sys.contract()
+
+        // Build per-sale storage key prefix
+        let pfx: String = "ego22:sale:" + u64_to_str(sale_id) + ":"
+
+        // Store sale parameters
+        storage.set(pfx + "token",       sale_token)
+        storage.set(pfx + "raise_token", raise_token)
+        storage.set(pfx + "price",       price)
+        storage.set(pfx + "soft_cap",    soft_cap)
+        storage.set(pfx + "hard_cap",    hard_cap)
+        storage.set(pfx + "start_block", start_block)
+        storage.set(pfx + "end_block",   end_block)
+        storage.set(pfx + "total_tokens",total_sale_tokens)
+        storage.set(pfx + "total_raised",0u128)
+        storage.set(pfx + "status",      "active")
+        storage.set(pfx + "owner",       caller_addr)
+        storage.set(pfx + "wl_enabled",  false)
+
+        // Escrow sale tokens from project owner into this contract
+        // Requires prior EGO-20 approve(this_contract, total_sale_tokens)
+        cross_call(
+            sale_token,
+            "transfer_from",
+            address_to_str(caller_addr) + " " + address_to_str(self_addr) + " " + u128_to_str(total_sale_tokens)
+        )
+
+        // Emit SaleCreated
+        events.emit(
+            "EGO22:SaleCreated",
+            u64_to_str(sale_id) + ":"
+            + address_to_str(caller_addr) + ":"
+            + address_to_str(sale_token)  + ":"
+            + address_to_str(raise_token) + ":"
+            + u128_to_str(hard_cap)       + ":"
+            + u64_to_str(start_block)     + ":"
+            + u64_to_str(end_block)
+        )
+
+        return sale_id
+    }
+
+    // ── Participation ─────────────────────────────────────────────────────────
+
+    // participate — deposit raise tokens during the active sale window.
+    //
+    // The caller MUST have approved this contract to spend `amount` of the
+    // raise_token before calling. Contributions are accepted only within the
+    // [start_block, end_block] range and up to the hard cap.
+    //
+    // Args:
+    //   sale_id — The sale to participate in
+    //   amount  — Amount of raise_token (uUnits) to contribute
+    pub fn participate(sale_id: u64, amount: u128) {
+        assert(amount > 0u128, "participate: amount must be > 0")
+
+        let pfx:    String  = "ego22:sale:" + u64_to_str(sale_id) + ":"
+        let status: String  = storage.get_str(pfx + "status")
+        assert(status == "active", "participate: sale is not active")
+
+        let start_block: u64   = storage.get_u64(pfx + "start_block")
+        let end_block:   u64   = storage.get_u64(pfx + "end_block")
+        let now:         u64   = block_number()
+        assert(now >= start_block, "participate: sale has not started yet")
+        assert(now <= end_block,   "participate: sale window has closed")
+
+        let hard_cap:     u128 = storage.get_u128(pfx + "hard_cap")
+        let total_raised: u128 = storage.get_u128(pfx + "total_raised")
+        assert(total_raised + amount <= hard_cap, "participate: contribution would exceed hard cap")
+
+        let caller_addr: address = sys.caller()
+
+        // Check whitelist if enabled
+        let wl_enabled: bool = storage.get_bool(pfx + "wl_enabled")
+        if wl_enabled {
+            let wl_key: String = pfx + "wl:" + address_to_str(caller_addr)
+            let approved: bool = storage.get_bool(wl_key)
+            assert(approved, "participate: caller is not whitelisted for this sale")
+        }
+
+        // Update user contribution
+        let user_key:        String = pfx + "user:" + address_to_str(caller_addr) + ":"
+        let prev_contributed: u128  = storage.get_u128(user_key + "contributed")
+        storage.set(user_key + "contributed", prev_contributed + amount)
+
+        // Update running total
+        storage.set(pfx + "total_raised", total_raised + amount)
+
+        // Pull raise tokens from participant
+        let raise_token: address = storage.get_address(pfx + "raise_token")
+        let self_addr:   address = sys.contract()
+        cross_call(
+            raise_token,
+            "transfer_from",
+            address_to_str(caller_addr) + " " + address_to_str(self_addr) + " " + u128_to_str(amount)
+        )
+
+        // Emit Participated
+        events.emit(
+            "EGO22:Participated",
+            u64_to_str(sale_id)             + ":"
+            + address_to_str(caller_addr)   + ":"
+            + u128_to_str(amount)           + ":"
+            + u128_to_str(total_raised + amount)
+        )
+    }
+
+    // ── Finalization ──────────────────────────────────────────────────────────
+
+    // finalize — settle the sale outcome after the window closes.
+    //
+    // Permissionless: anyone may call finalize once block_number() > end_block.
+    // Compares total_raised against soft_cap and sets status accordingly.
+    //
+    // Args:
+    //   sale_id — The sale to finalize
+    pub fn finalize(sale_id: u64) {
+        let pfx:      String = "ego22:sale:" + u64_to_str(sale_id) + ":"
+        let status:   String = storage.get_str(pfx + "status")
+        assert(status == "active", "finalize: sale is not in active state")
+
+        let end_block: u64 = storage.get_u64(pfx + "end_block")
+        assert(block_number() > end_block, "finalize: sale window has not closed yet")
+
+        let total_raised: u128 = storage.get_u128(pfx + "total_raised")
+        let soft_cap:     u128 = storage.get_u128(pfx + "soft_cap")
+
+        let success: bool = total_raised >= soft_cap
+        if success {
+            storage.set(pfx + "status", "success")
+        } else {
+            storage.set(pfx + "status", "failed")
+        }
+
+        // Emit SaleFinalized — encode bool as "1" / "0"
+        let success_str: String = "0"
+        if success {
+            success_str = "1"
+        }
+        events.emit(
+            "EGO22:SaleFinalized",
+            u64_to_str(sale_id)       + ":"
+            + success_str             + ":"
+            + u128_to_str(total_raised)
+        )
+    }
+
+    // ── Claim Tokens (Success Path) ───────────────────────────────────────────
+
+    // claim_tokens — after a successful sale, claim pro-rata allocation of sale tokens.
+    //
+    // allocation = contributed * total_sale_tokens / total_raised (integer floor)
+    //
+    // Args:
+    //   sale_id — The sale to claim from
+    pub fn claim_tokens(sale_id: u64) {
+        let pfx:    String = "ego22:sale:" + u64_to_str(sale_id) + ":"
+        let status: String = storage.get_str(pfx + "status")
+        assert(status == "success", "claim_tokens: sale did not succeed")
+
+        let caller_addr: address = sys.caller()
+        let user_key:    String  = pfx + "user:" + address_to_str(caller_addr) + ":"
+
+        let already_claimed: bool = storage.get_bool(user_key + "claimed")
+        assert(!already_claimed, "claim_tokens: already claimed")
+
+        let contributed:    u128 = storage.get_u128(user_key + "contributed")
+        assert(contributed > 0u128, "claim_tokens: no contribution found")
+
+        let total_tokens: u128 = storage.get_u128(pfx + "total_tokens")
+        let total_raised: u128 = storage.get_u128(pfx + "total_raised")
+
+        // Pro-rata allocation: floor division
+        let allocation: u128 = contributed * total_tokens / total_raised
+
+        // Mark claimed BEFORE transfer (checks-effects-interactions)
+        storage.set(user_key + "claimed", true)
+
+        // Transfer sale tokens to claimer
+        let sale_token: address = storage.get_address(pfx + "token")
+        cross_call(
+            sale_token,
+            "transfer",
+            address_to_str(caller_addr) + " " + u128_to_str(allocation)
+        )
+
+        events.emit(
+            "EGO22:TokensClaimed",
+            u64_to_str(sale_id)           + ":"
+            + address_to_str(caller_addr) + ":"
+            + u128_to_str(allocation)
+        )
+    }
+
+    // ── Claim Refund (Failure Path) ───────────────────────────────────────────
+
+    // claim_refund — after a failed sale, recover deposited raise tokens.
+    //
+    // Args:
+    //   sale_id — The sale to refund from
+    pub fn claim_refund(sale_id: u64) {
+        let pfx:    String = "ego22:sale:" + u64_to_str(sale_id) + ":"
+        let status: String = storage.get_str(pfx + "status")
+        assert(status == "failed", "claim_refund: sale did not fail (check status)")
+
+        let caller_addr: address = sys.caller()
+        let user_key:    String  = pfx + "user:" + address_to_str(caller_addr) + ":"
+
+        let already_claimed: bool = storage.get_bool(user_key + "claimed")
+        assert(!already_claimed, "claim_refund: already refunded")
+
+        let contributed: u128 = storage.get_u128(user_key + "contributed")
+        assert(contributed > 0u128, "claim_refund: no contribution to refund")
+
+        // Mark claimed BEFORE transfer (checks-effects-interactions)
+        storage.set(user_key + "claimed", true)
+
+        // Return raise tokens to participant
+        let raise_token: address = storage.get_address(pfx + "raise_token")
+        cross_call(
+            raise_token,
+            "transfer",
+            address_to_str(caller_addr) + " " + u128_to_str(contributed)
+        )
+
+        events.emit(
+            "EGO22:RefundClaimed",
+            u64_to_str(sale_id)           + ":"
+            + address_to_str(caller_addr) + ":"
+            + u128_to_str(contributed)
+        )
+    }
+
+    // ── Project Withdraw ──────────────────────────────────────────────────────
+
+    // withdraw_raise — project owner withdraws raised funds minus platform fee.
+    //
+    // MUST be called by the project_owner. Deducts fee_bps of total_raised as
+    // platform fee and sends remainder to project_owner. Sets status = "finalized"
+    // to prevent double-withdrawal.
+    //
+    // Args:
+    //   sale_id — The sale to withdraw from
+    pub fn withdraw_raise(sale_id: u64) {
+        let pfx:    String  = "ego22:sale:" + u64_to_str(sale_id) + ":"
+        let status: String  = storage.get_str(pfx + "status")
+        assert(status == "success", "withdraw_raise: sale has not succeeded")
+
+        let caller_addr:   address = sys.caller()
+        let project_owner: address = storage.get_address(pfx + "owner")
+        assert(caller_addr == project_owner, "withdraw_raise: caller is not project owner")
+
+        let total_raised:   u128   = storage.get_u128(pfx + "total_raised")
+        let fee_bps:        u64    = storage.get_u64("ego22:fee_bps")
+        let fee_recipient:  address = storage.get_address("ego22:fee_recipient")
+        let raise_token:   address = storage.get_address(pfx + "raise_token")
+
+        // Calculate fee: total_raised * fee_bps / 10000
+        let fee:       u128 = total_raised * fee_bps as u128 / 10000u128
+        let net_raise: u128 = total_raised - fee
+
+        // Mark finalized BEFORE transfers (checks-effects-interactions)
+        storage.set(pfx + "status", "finalized")
+
+        // Send platform fee
+        if fee > 0u128 {
+            cross_call(
+                raise_token,
+                "transfer",
+                address_to_str(fee_recipient) + " " + u128_to_str(fee)
+            )
+        }
+
+        // Send net proceeds to project owner
+        cross_call(
+            raise_token,
+            "transfer",
+            address_to_str(project_owner) + " " + u128_to_str(net_raise)
+        )
+
+        events.emit(
+            "EGO22:RaiseWithdrawn",
+            u64_to_str(sale_id)              + ":"
+            + address_to_str(project_owner)  + ":"
+            + u128_to_str(net_raise)         + ":"
+            + u128_to_str(fee)
+        )
+    }
+
+    // ── Admin Functions ───────────────────────────────────────────────────────
+
+    // set_fee_bps — admin updates the platform fee rate.
+    //
+    // Capped at 1000 bps (10%) by this standard.
+    //
+    // Args:
+    //   new_fee_bps — New fee in basis points (0..1000)
+    pub fn set_fee_bps(new_fee_bps: u64) {
+        let admin: address = storage.get_address("ego22:admin")
+        assert(sys.caller() == admin, "set_fee_bps: caller is not admin")
+        assert(new_fee_bps <= 1000u64, "set_fee_bps: fee_bps cannot exceed 1000 (10%)")
+        storage.set("ego22:fee_bps", new_fee_bps)
+        events.emit("EGO22:FeeUpdated", u64_to_str(new_fee_bps))
+    }
+
+    // set_fee_recipient — admin updates the fee recipient address.
+    //
+    // Args:
+    //   new_recipient — New fee recipient address
+    pub fn set_fee_recipient(new_recipient: address) {
+        let admin: address = storage.get_address("ego22:admin")
+        assert(sys.caller() == admin, "set_fee_recipient: caller is not admin")
+        assert(new_recipient != zero_address(), "set_fee_recipient: cannot be zero address")
+        storage.set("ego22:fee_recipient", new_recipient)
+        events.emit("EGO22:FeeRecipientUpdated", address_to_str(new_recipient))
+    }
+
+    // ── View Functions ────────────────────────────────────────────────────────
+
+    // get_sale_status — returns the current status string for a sale.
+    //
+    // Possible values: "active", "success", "failed", "finalized"
+    //
+    // Args:
+    //   sale_id — The sale to query
+    pub fn get_sale_status(sale_id: u64) -> String {
+        let pfx: String = "ego22:sale:" + u64_to_str(sale_id) + ":"
+        return storage.get_str(pfx + "status")
+    }
+
+    // get_user_contribution — returns how much raise token a user contributed.
+    //
+    // Args:
+    //   sale_id — The sale to query
+    //   user    — The participant address
+    pub fn get_user_contribution(sale_id: u64, user: address) -> u128 {
+        let user_key: String = "ego22:sale:" + u64_to_str(sale_id) + ":user:" + address_to_str(user) + ":"
+        return storage.get_u128(user_key + "contributed")
+    }
+
+    // get_allocation — view the pro-rata token allocation for a participant.
+    //
+    // Returns 0 if total_raised is 0 (sale has no contributions yet).
+    //
+    // Args:
+    //   sale_id — The sale to query
+    //   user    — The participant address
+    pub fn get_allocation(sale_id: u64, user: address) -> u128 {
+        let pfx:          String = "ego22:sale:" + u64_to_str(sale_id) + ":"
+        let total_raised: u128   = storage.get_u128(pfx + "total_raised")
+        if total_raised == 0u128 {
+            return 0u128
+        }
+        let total_tokens: u128 = storage.get_u128(pfx + "total_tokens")
+        let user_key:     String = pfx + "user:" + address_to_str(user) + ":"
+        let contributed:  u128   = storage.get_u128(user_key + "contributed")
+        return contributed * total_tokens / total_raised
+    }
+
+}

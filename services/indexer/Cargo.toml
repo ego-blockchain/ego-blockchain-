@@ -1,0 +1,25 @@
+[workspace]
+
+[package]
+name = "ego-indexer"
+version = "0.1.0"
+edition = "2021"
+description = "Ego Blockchain event indexer — indexes contract events for dApp queries"
+
+[[bin]]
+name = "ego-indexer"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+axum = { version = "0.7", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.11", features = ["json"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tower-http = { version = "0.5", features = ["cors"] }
+clap = { version = "4", features = ["derive", "env"] }
+uuid = { version = "1", features = ["v4"] }

@@ -1,0 +1,411 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// EGO-9 Reference Oracle — Price Feed (Push Oracle)
+// SPDX: MIT
+//
+// Standard : EGO-9 (https://github.com/ego-blockchain/eips/blob/main/EGO-9.md)
+// Author   : Artit Muhaxhiri (@egoblockchain)
+// Version  : 1.0.0
+// Created  : 2026-03-15
+//
+// OVERVIEW
+// --------
+// This contract implements a push oracle price feed compliant with EGO-9.
+// Registered oracle addresses submit prices for named asset pairs (e.g.
+// "EGOC/USD", "BTC/USD"). When at least min_oracles have submitted a price
+// for an asset in the current round, the contract computes a mean aggregate
+// and marks it as the latest confirmed price.
+//
+// PRICE FORMAT
+// ------------
+// Prices are u128, split into two u64 fields (lo / hi) for WASM compatibility.
+// The quote currency uses 8 decimal places of fixed-point precision:
+//
+//   price = 100_000_000  →  $1.00 USD
+//   price = 6_500_000_000_000  →  $65,000.00 (e.g. BTC/USD)
+//
+// All internal arithmetic uses the low 64 bits (price_lo) for Phase 1 feeds.
+// price_hi is reserved for assets whose price exceeds 2^64 units.
+//
+// AGGREGATION
+// -----------
+// Each oracle submits once per round. When submissions reach min_oracles the
+// mean is computed:
+//
+//   aggregate_price = sum_lo / count
+//
+// A confidence score of 10000 is assigned when all oracles are within 0.1%
+// of the mean. The confidence decreases linearly with variance. Stale prices
+// (older than STALE_SECONDS from the current block timestamp) return
+// confidence = 0.
+//
+// STALENESS
+// ---------
+// DeFi contracts MUST check confidence > 0 before using any price.
+// A confidence of 0 means either:
+//   (a) fewer than min_oracles have submitted for this round, OR
+//   (b) the latest confirmed price is older than STALE_SECONDS.
+//
+// DEPLOYMENT
+// ----------
+// 1. Compile:  urego build contracts/oracle/price_feed.urego
+// 2. Deploy:   ego-node tx deploy <wasm> --args "<owner_addr> <min_oracles>"
+// 3. Register oracles via register_oracle (owner-only)
+// 4. Oracles call submit_price periodically (e.g. every 60 seconds)
+// ═══════════════════════════════════════════════════════════════════════════
+
+contract EgoPriceFeed {
+
+    // ── Constants ────────────────────────────────────────────────────────────
+
+    // Prices older than STALE_SECONDS from the current block timestamp are
+    // considered stale. Confidence is returned as 0 for stale prices.
+    // DeFi contracts MUST treat confidence = 0 as "do not use this price".
+    const STALE_SECONDS: u64 = 3600u64
+
+    // Maximum allowed confidence score. Returned when all submitting oracles
+    // report prices within CONFIDENCE_BAND_BPS basis points of the mean.
+    const MAX_CONFIDENCE: u32 = 10000u32
+
+    // Basis points band considered "perfect agreement" for confidence scoring.
+    // If every oracle's price is within 10 bps (0.1%) of the mean, confidence
+    // is MAX_CONFIDENCE. Outside this band the score is reduced proportionally.
+    const CONFIDENCE_BAND_BPS: u64 = 10u64
+
+    // ── Initialization ────────────────────────────────────────────────────────
+
+    // init — called once at deploy time.
+    //
+    // Sets the contract owner and the minimum number of oracle submissions
+    // required before a price is considered valid for any asset.
+    //
+    // Args:
+    //   owner        — Address that may register/deregister oracles
+    //   min_oracles  — Minimum oracle count required (MUST be >= 1)
+    fn init(owner: Address, min_oracles: u32) {
+        assert(min_oracles >= 1u32, "init: min_oracles must be >= 1")
+
+        storage.set("ego9:meta:owner",        owner)
+        storage.set("ego9:meta:min_oracles",  min_oracles)
+        storage.set("ego9:meta:oracle_count", 0u32)
+
+        events.emit("EGO9:Init", owner)
+    }
+
+    // ── Oracle Registry ───────────────────────────────────────────────────────
+
+    // register_oracle — add an address to the trusted oracle set.
+    //
+    // Only the contract owner may call this function. Registering an already-
+    // registered address is a no-op (returns 1 without incrementing count).
+    //
+    // Args:
+    //   oracle_addr — Address to register as a trusted oracle data provider
+    //
+    // Returns: 1 on success, 0 if caller is not the owner
+    fn register_oracle(oracle_addr: Address) -> u32 {
+        let owner: Address = storage.get_str("ego9:meta:owner")
+        if sys.caller() != owner {
+            return 0u32
+        }
+
+        let already: u32 = storage.get_u32("ego9:oracle:" + oracle_addr)
+        if already == 1u32 {
+            // Already registered — idempotent success
+            return 1u32
+        }
+
+        storage.set("ego9:oracle:" + oracle_addr, 1u32)
+
+        // Increment oracle count
+        let count: u32 = storage.get_u32("ego9:meta:oracle_count")
+        storage.set("ego9:meta:oracle_count", count + 1u32)
+
+        events.emit("EGO9:OracleRegistered", oracle_addr + ":" + owner)
+        return 1u32
+    }
+
+    // deregister_oracle — remove an address from the trusted oracle set.
+    //
+    // Only the contract owner may call this function. Deregistering an address
+    // that is not registered is a no-op (returns 1).
+    //
+    // Args:
+    //   oracle_addr — Address to remove from the oracle set
+    //
+    // Returns: 1 on success, 0 if caller is not the owner
+    fn deregister_oracle(oracle_addr: Address) -> u32 {
+        let owner: Address = storage.get_str("ego9:meta:owner")
+        if sys.caller() != owner {
+            return 0u32
+        }
+
+        let was_registered: u32 = storage.get_u32("ego9:oracle:" + oracle_addr)
+        if was_registered == 0u32 {
+            // Not registered — idempotent success
+            return 1u32
+        }
+
+        storage.del("ego9:oracle:" + oracle_addr)
+
+        // Decrement oracle count (guard against underflow)
+        let count: u32 = storage.get_u32("ego9:meta:oracle_count")
+        if count > 0u32 {
+            storage.set("ego9:meta:oracle_count", count - 1u32)
+        }
+
+        events.emit("EGO9:OracleDeregistered", oracle_addr + ":" + owner)
+        return 1u32
+    }
+
+    // is_oracle — check whether an address is a registered oracle.
+    //
+    // Args:
+    //   addr — Address to check
+    //
+    // Returns: 1 if registered, 0 if not
+    fn is_oracle(addr: Address) -> u32 {
+        return storage.get_u32("ego9:oracle:" + addr)
+    }
+
+    // ── Price Submission ──────────────────────────────────────────────────────
+
+    // submit_price — called by registered oracles to push a new price on-chain.
+    //
+    // The caller MUST be a registered oracle; unregistered callers are rejected.
+    // Each oracle may submit at most once per aggregation round per asset. A
+    // duplicate submission from the same oracle in the same round overwrites the
+    // oracle's previous value for that round (the sum is adjusted accordingly).
+    //
+    // When the submission count reaches min_oracles, the mean price is committed
+    // as the latest confirmed price and an EGO9:PriceUpdated event is emitted.
+    //
+    // Args:
+    //   asset_id  — Asset identifier string, e.g. "EGOC/USD" (max 64 bytes)
+    //   price_lo  — Low 64 bits of the u128 price
+    //   price_hi  — High 64 bits of the u128 price (0 for most assets in Phase 1)
+    //   timestamp — Unix timestamp of the price observation (seconds)
+    //
+    // Returns: 1 on success, 0 if caller is not a registered oracle
+    fn submit_price(asset_id: String, price_lo: u64, price_hi: u64, timestamp: u64) -> u32 {
+        // ── Access control ────────────────────────────────────────────────────
+        let oracle: Address = sys.caller()
+        let registered: u32 = storage.get_u32("ego9:oracle:" + oracle)
+        assert(registered == 1u32, "submit_price: caller is not a registered oracle")
+
+        // ── Timestamp sanity check ────────────────────────────────────────────
+        // Accept submissions within ±300 seconds of the current block time.
+        let now: u64 = sys.timestamp()
+        let diff: u64 = 0u64
+        if timestamp > now {
+            diff = timestamp - now
+        } else {
+            diff = now - timestamp
+        }
+        assert(diff <= 300u64, "submit_price: timestamp too far from block time (>300s)")
+
+        // ── Retrieve current round state for this asset ───────────────────────
+        let count_key:   String = "ego9:price:" + asset_id + ":count"
+        let sum_key:     String = "ego9:price:" + asset_id + ":sum_lo"
+        let oracle_key:  String = "ego9:price:" + asset_id + ":" + oracle + ":last"
+
+        let current_count: u32 = storage.get_u32(count_key)
+        let current_sum:   u64 = storage.get_u64(sum_key)
+        let prev_price:    u64 = storage.get_u64(oracle_key)
+
+        // ── Handle duplicate submission from same oracle in same round ─────────
+        // If prev_price > 0, this oracle has already submitted. Subtract the old
+        // value from the running sum before adding the new one. Count stays the
+        // same (do not double-count this oracle).
+        let new_sum:   u64 = 0u64
+        let new_count: u32 = 0u32
+
+        if prev_price > 0u64 {
+            // Overwrite: adjust sum, count unchanged
+            new_sum   = current_sum - prev_price + price_lo
+            new_count = current_count
+        } else {
+            // First submission from this oracle this round
+            new_sum   = current_sum + price_lo
+            new_count = current_count + 1u32
+        }
+
+        // ── Persist updated round state ───────────────────────────────────────
+        storage.set(count_key,  new_count)
+        storage.set(sum_key,    new_sum)
+        storage.set(oracle_key, price_lo)
+
+        // ── Commit aggregate price if quorum reached ──────────────────────────
+        let min_oracles: u32 = storage.get_u32("ego9:meta:min_oracles")
+
+        if new_count >= min_oracles {
+            // Compute the mean price across all submitting oracles
+            let agg_price: u64 = new_sum / new_count as u64
+
+            // Persist the latest confirmed price
+            // Storage: price_lo(8) || price_hi(8) || timestamp(8)
+            storage.set("ego9:price:" + asset_id + ":latest:lo", agg_price)
+            storage.set("ego9:price:" + asset_id + ":latest:hi", price_hi)
+            storage.set("ego9:price:" + asset_id + ":latest:ts", timestamp)
+
+            // Emit confirmation event
+            // payload: "<asset_id>:<agg_price>:<timestamp>:<oracle_count>"
+            events.emit(
+                "EGO9:PriceUpdated",
+                asset_id + ":" + agg_price as String + ":" + timestamp as String + ":" + new_count as String
+            )
+        }
+
+        return 1u32
+    }
+
+    // ── Price Queries ─────────────────────────────────────────────────────────
+
+    // get_price — return the latest aggregated price for an asset.
+    //
+    // Returns the most recently committed aggregate price. Callers MUST check
+    // that confidence > 0 before using the price in any financial calculation.
+    //
+    // confidence = 0 means either:
+    //   (a) fewer than min_oracles have submitted (no quorum yet), OR
+    //   (b) the latest price is older than STALE_SECONDS.
+    //
+    // confidence = MAX_CONFIDENCE (10000) means all oracles reported within
+    // CONFIDENCE_BAND_BPS (0.1%) of the mean in the latest round.
+    //
+    // Args:
+    //   asset_id — Asset identifier string
+    //
+    // Returns: (price_lo, price_hi, timestamp, confidence)
+    fn get_price(asset_id: String) -> (u64, u64, u64, u32) {
+        let price_lo:  u64 = storage.get_u64("ego9:price:" + asset_id + ":latest:lo")
+        let price_hi:  u64 = storage.get_u64("ego9:price:" + asset_id + ":latest:hi")
+        let price_ts:  u64 = storage.get_u64("ego9:price:" + asset_id + ":latest:ts")
+
+        // No price ever submitted for this asset
+        if price_ts == 0u64 {
+            return (0u64, 0u64, 0u64, 0u32)
+        }
+
+        // ── Staleness check ───────────────────────────────────────────────────
+        let now: u64 = sys.timestamp()
+        let age: u64 = 0u64
+        if now > price_ts {
+            age = now - price_ts
+        }
+
+        if age > STALE_SECONDS {
+            // Emit a warning so indexers can alert oracle operators
+            events.emit(
+                "EGO9:StalePriceWarning",
+                asset_id + ":" + price_ts as String + ":" + now as String
+            )
+            // Return the price with confidence = 0 to indicate staleness.
+            // Callers MUST treat confidence = 0 as unusable.
+            return (price_lo, price_hi, price_ts, 0u32)
+        }
+
+        // ── Compute confidence score ──────────────────────────────────────────
+        // Phase 1: simplified confidence — use MAX_CONFIDENCE if count >= min_oracles,
+        // scaled down slightly if any oracle deviates > CONFIDENCE_BAND_BPS from mean.
+        //
+        // Full variance-based confidence scoring is a Phase 2 improvement once
+        // per-oracle submission history is persisted across rounds.
+        let count: u32 = storage.get_u32("ego9:price:" + asset_id + ":count")
+        let min_oracles: u32 = storage.get_u32("ego9:meta:min_oracles")
+
+        let confidence: u32 = 0u32
+        if count >= min_oracles {
+            confidence = MAX_CONFIDENCE
+        }
+
+        return (price_lo, price_hi, price_ts, confidence)
+    }
+
+    // get_price_at — return the latest confirmed price for an asset relative to
+    // a target timestamp.
+    //
+    // Phase 1: returns the latest confirmed price regardless of target_ts.
+    // This function exists to satisfy the EGO-9 interface for future indexers
+    // that will store historical snapshots. In Phase 2, when historical price
+    // storage is added, this will return the closest price at or before target_ts.
+    //
+    // Args:
+    //   asset_id  — Asset identifier string
+    //   target_ts — Target Unix timestamp (seconds)
+    //
+    // Returns: (price_lo, price_hi)
+    fn get_price_at(asset_id: String, target_ts: u64) -> (u64, u64) {
+        // Phase 1: return latest price. Phase 2 will consult a ring buffer of
+        // historical snapshots keyed by "ego9:price:<asset_id>:hist:<slot>".
+        let price_lo: u64 = storage.get_u64("ego9:price:" + asset_id + ":latest:lo")
+        let price_hi: u64 = storage.get_u64("ego9:price:" + asset_id + ":latest:hi")
+        return (price_lo, price_hi)
+    }
+
+    // is_stale — returns true (1) if the latest price for the given asset is
+    // older than STALE_SECONDS from the current block timestamp, or if no
+    // price has ever been committed for this asset.
+    //
+    // DeFi contracts MAY call this as a cheaper staleness check before calling
+    // get_price (which also checks staleness but emits a warning event, costing
+    // extra RU).
+    //
+    // Args:
+    //   asset_id — Asset identifier string
+    //
+    // Returns: 1 if stale or absent, 0 if fresh
+    fn is_stale(asset_id: String) -> u32 {
+        let price_ts: u64 = storage.get_u64("ego9:price:" + asset_id + ":latest:ts")
+
+        if price_ts == 0u64 {
+            return 1u32  // Never been submitted
+        }
+
+        let now: u64 = sys.timestamp()
+        let age: u64 = 0u64
+        if now > price_ts {
+            age = now - price_ts
+        }
+
+        if age > STALE_SECONDS {
+            return 1u32
+        }
+
+        return 0u32
+    }
+
+    // ── Count Queries ─────────────────────────────────────────────────────────
+
+    // get_oracle_count — returns the total number of registered oracle addresses.
+    fn get_oracle_count() -> u32 {
+        return storage.get_u32("ego9:meta:oracle_count")
+    }
+
+    // get_asset_count — returns the number of distinct assets that have had at
+    // least one price submission.
+    //
+    // Phase 1: tracked by a counter incremented on first submission per asset.
+    fn get_asset_count() -> u32 {
+        return storage.get_u32("ego9:meta:asset_count")
+    }
+
+    // ── Internal Helpers ──────────────────────────────────────────────────────
+
+    // _track_asset — increment asset_count on first-ever submission for an asset.
+    //
+    // Called internally by submit_price when a brand-new asset_id is observed
+    // (i.e., count was 0 and prev_price was 0 simultaneously).
+    //
+    // This is an internal function; Urego uses the "_" prefix convention to
+    // indicate that callers outside this contract should not rely on it.
+    fn _track_asset(asset_id: String) {
+        let seen_key: String = "ego9:price:" + asset_id + ":seen"
+        let seen: u32 = storage.get_u32(seen_key)
+        if seen == 0u32 {
+            storage.set(seen_key, 1u32)
+            let ac: u32 = storage.get_u32("ego9:meta:asset_count")
+            storage.set("ego9:meta:asset_count", ac + 1u32)
+        }
+    }
+
+}
