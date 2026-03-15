@@ -2046,11 +2046,56 @@ async fn apply_incoming_tx(tx: LedgerTx, block: LedgerBlock, app: &tauri::AppHan
     let _ = app.emit_all("ego://chain-updated", ());
 }
 
+/// Execute any Deploy or Call transactions from incoming blocks.
+/// Called on every node when new blocks are finalized — this is how
+/// contract state stays in sync across the network without a central executor.
+fn execute_contract_txs(chain: &crate::ledger::SharedChain, txs: &[crate::ledger::LedgerTx]) {
+    let height    = chain.blocks.last().map(|b| b.height).unwrap_or(0);
+    let timestamp = chrono::Utc::now().timestamp();
+    let contracts_dir = crate::ledger::contracts_dir();
+
+    let exec = match ego_vm::Executor::new(contracts_dir) {
+        Ok(e)  => e,
+        Err(e) => { eprintln!("[VM] Executor init failed: {}", e); return; }
+    };
+
+    for tx in txs {
+        match tx.tx_type.as_str() {
+            "deploy" => {
+                if tx.wasm_code.is_empty() { continue; }
+                let wasm_bytes = match hex::decode(&tx.wasm_code) {
+                    Ok(b)  => b,
+                    Err(_) => continue,
+                };
+                let init_args = hex::decode(&tx.call_args).unwrap_or_default();
+                match exec.deploy(&wasm_bytes, &tx.from, &init_args, height, timestamp,
+                                  ego_vm::types::DEFAULT_DEPLOY_FUEL) {
+                    Ok(r)  => eprintln!("[VM] Deployed contract {} (RU={})", r.contract_address, r.ru_used),
+                    Err(e) => eprintln!("[VM] Deploy failed for tx {}: {}", tx.hash, e),
+                }
+            }
+            "call" => {
+                if tx.contract_addr.is_empty() || tx.entrypoint.is_empty() { continue; }
+                let call_args = hex::decode(&tx.call_args).unwrap_or_default();
+                match exec.call(&tx.contract_addr, &tx.from, &tx.entrypoint,
+                                &call_args, height, timestamp,
+                                ego_vm::types::DEFAULT_CALL_FUEL) {
+                    Ok(r)  => eprintln!("[VM] Called {}.{}() — success={} RU={}",
+                                        tx.contract_addr, tx.entrypoint, r.success, r.ru_used),
+                    Err(e) => eprintln!("[VM] Call failed for tx {}: {}", tx.hash, e),
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 async fn merge_remote_chain(
     blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: &tauri::AppHandle,
 ) {
     let mut chain   = load_chain();
     let mut changed = false;
+    let mut new_txs: Vec<LedgerTx> = Vec::new();
     for tx in transactions {
         if let Some(existing) = chain.transactions.iter_mut().find(|t| t.hash == tx.hash) {
             // Upgrade a locally-pending tx to confirmed if the relay has confirmed it.
@@ -2060,7 +2105,9 @@ async fn merge_remote_chain(
                 changed = true;
             }
         } else {
-            chain.transactions.push(tx); changed = true;
+            new_txs.push(tx.clone());
+            chain.transactions.push(tx);
+            changed = true;
         }
     }
     for block in blocks {
@@ -2070,7 +2117,9 @@ async fn merge_remote_chain(
     }
     if changed {
         chain.blocks.sort_by_key(|b| b.height);
-        let _ = save_chain(&chain);
+        let _ = crate::ledger::save_chain(&chain);
+        // Execute any Deploy/Call TXs in newly arrived blocks
+        execute_contract_txs(&chain, &new_txs);
         let _ = app.emit_all("ego://chain-updated", ());
     }
 }

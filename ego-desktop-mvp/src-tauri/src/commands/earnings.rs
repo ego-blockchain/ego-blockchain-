@@ -73,6 +73,7 @@ pub async fn get_earnings_data(
                     block_height:       None,
                     nonce:              0,
                     public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
+                    ..LedgerTx::default()
                 });
                 let _ = save_chain(&chain);
             }
