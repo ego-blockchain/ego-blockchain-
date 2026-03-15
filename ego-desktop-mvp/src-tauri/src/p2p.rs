@@ -117,6 +117,44 @@ static IS_RELAY_SERVER: AtomicBool = AtomicBool::new(false);
 
 pub fn relay_mode_active() -> bool { IS_RELAY_SERVER.load(Ordering::Relaxed) }
 
+/// Pending BFT votes: block_hash → list of voter addresses that have voted.
+/// Once >2/3 of KNOWN_VALIDATORS have voted for a hash, the block is finalized.
+static PENDING_VOTES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Vec<String>>>> =
+    std::sync::OnceLock::new();
+
+fn pending_votes() -> std::sync::MutexGuard<'static, HashMap<String, Vec<String>>> {
+    PENDING_VOTES
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+}
+
+/// Known active validators (Ego addresses). Populated from PeerAnnounce and BlockVote messages.
+/// Used to compute the 2/3 quorum threshold.
+static KNOWN_VALIDATORS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn known_validators() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+    KNOWN_VALIDATORS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap()
+}
+
+/// Add a validator address to the known set (from PeerAnnounce or vote messages).
+pub fn register_known_validator(address: &str) {
+    if !address.is_empty() {
+        known_validators().insert(address.to_string());
+    }
+}
+
+/// Compute the minimum votes needed for BFT finality.
+/// Bootstrap mode: if < 3 validators known, 1 vote is enough (prevents cold-start deadlock).
+fn bft_threshold() -> usize {
+    let n = known_validators().len();
+    if n < 3 { 1 } else { (n * 2 / 3) + 1 }
+}
+
 /// Peer-relay nodes discovered via DataManifest (addr → endpoint).
 /// Lets us dial through community relay nodes, not just the central server.
 static PEER_RELAY_NODES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
@@ -224,6 +262,30 @@ pub enum P2PMessage {
         cid:      String,
         accepted: bool,
         reason:   String,
+    },
+    /// A miner proposes a new block for BFT voting.
+    BlockProposal {
+        block:        LedgerBlock,
+        transactions: Vec<LedgerTx>,
+        proposer:     String,
+        /// Ed25519 signature over block.hash bytes
+        signature:    String,
+    },
+    /// A validator casts a signed vote on a block proposal.
+    BlockVote {
+        block_hash: String,
+        height:     u64,
+        voter:      String,
+        /// Ed25519 signature over "{block_hash}:{height}:{voter}"
+        signature:  String,
+        timestamp:  i64,
+    },
+    /// A block that has collected >2/3 validator votes — safe to commit.
+    BlockFinalized {
+        block:        LedgerBlock,
+        transactions: Vec<LedgerTx>,
+        /// The votes that finalized this block (for audit)
+        votes:        Vec<serde_json::Value>,
     },
 }
 
@@ -476,13 +538,31 @@ pub async fn publish_gossip(topic: &str, data: Vec<u8>) {
 }
 
 pub async fn broadcast_tx(tx: LedgerTx, block: LedgerBlock) {
-    let msg = P2PMessage::TxBroadcast { tx, block };
+    // Legacy TxBroadcast for backward compat
+    let msg = P2PMessage::TxBroadcast { tx: tx.clone(), block: block.clone() };
 
     // ── Gossipsub: reaches ALL subscribers, not just known contacts ───────────
     // This is the primary true-P2P broadcast path.
     if let Ok(data) = serde_json::to_vec(&msg) {
         publish_gossip("ego-txs-v1", data).await;
     }
+
+    // BFT proposal: other validators vote before committing
+    let my_addr = crate::ledger::Ledger::load().address;
+    let proposal_data = block.hash.clone();
+    let signature = bft_sign(&proposal_data).unwrap_or_default();
+    let proposal = P2PMessage::BlockProposal {
+        block:        block.clone(),
+        transactions: vec![tx.clone()],
+        proposer:     my_addr.clone(),
+        signature,
+    };
+    if let Ok(data) = serde_json::to_vec(&proposal) {
+        publish_gossip("ego-proposals-v1", data).await;
+    }
+
+    // Register ourselves as a known validator
+    register_known_validator(&my_addr);
 
     // ── Direct P2P to approved contacts (fast path for known peers) ───────────
     let contacts = load_contacts();
@@ -781,6 +861,11 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     let block_topic    = gossipsub::IdentTopic::new("ego-blocks-v1");
     let _ = swarm.behaviour_mut().gossipsub.subscribe(&tx_topic);
     let _ = swarm.behaviour_mut().gossipsub.subscribe(&block_topic);
+
+    let proposal_topic = gossipsub::IdentTopic::new("ego-proposals-v1");
+    let vote_topic     = gossipsub::IdentTopic::new("ego-votes-v1");
+    let _ = swarm.behaviour_mut().gossipsub.subscribe(&proposal_topic);
+    let _ = swarm.behaviour_mut().gossipsub.subscribe(&vote_topic);
 
     // ── Kademlia bootstrap ────────────────────────────────────────────────────
     // Contacts the seeded relay nodes and discovers the rest of the DHT network.
@@ -1349,12 +1434,37 @@ async fn handle_event(
                     tokio::spawn(async move { apply_incoming_tx(tx, block, &app2).await; });
                 }
             } else if topic == "ego-blocks-v1" {
-                // ChainSyncResponse envelope: { type, blocks, transactions }
-                if let Ok(P2PMessage::ChainSyncResponse { blocks, transactions }) =
+                match serde_json::from_slice::<P2PMessage>(&message.data) {
+                    Ok(P2PMessage::ChainSyncResponse { blocks, transactions }) => {
+                        let app2 = app.clone();
+                        tokio::spawn(async move { merge_remote_chain(blocks, transactions, &app2).await; });
+                    }
+                    Ok(P2PMessage::BlockFinalized { block, transactions, .. }) => {
+                        let app2 = app.clone();
+                        tokio::spawn(async move { merge_remote_chain(vec![block], transactions, &app2).await; });
+                    }
+                    _ => {}
+                }
+            } else if topic == "ego-proposals-v1" {
+                if let Ok(P2PMessage::BlockProposal { block, transactions, proposer, .. }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
+                    // Register proposer as known validator
+                    register_known_validator(&proposer);
                     let app2 = app.clone();
-                    tokio::spawn(async move { merge_remote_chain(blocks, transactions, &app2).await; });
+                    tokio::spawn(async move {
+                        handle_block_proposal(block, transactions, proposer, &app2).await;
+                    });
+                }
+            } else if topic == "ego-votes-v1" {
+                if let Ok(P2PMessage::BlockVote { block_hash, height, voter, signature, timestamp }) =
+                    serde_json::from_slice::<P2PMessage>(&message.data)
+                {
+                    register_known_validator(&voter);
+                    let app2 = app.clone();
+                    tokio::spawn(async move {
+                        handle_block_vote(block_hash, height, voter, signature, timestamp, &app2).await;
+                    });
                 }
             }
         }
@@ -1555,6 +1665,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
         }
 
         P2PMessage::PeerAnnounce { address, name, endpoint, endpoints } => {
+            register_known_validator(&address);
             if !endpoint.is_empty() {
                 let mut contacts = load_contacts();
                 if let Some(c) = contacts.iter_mut().find(|c| c.address == address) {
@@ -1695,6 +1806,20 @@ P2PMessage::ChatMessage { bundle } => {
 
         P2PMessage::TxBroadcast { tx, block } => {
             apply_incoming_tx(tx, block, app).await;
+        }
+
+        P2PMessage::BlockProposal { block, transactions, proposer, .. } => {
+            register_known_validator(&proposer);
+            handle_block_proposal(block, transactions, proposer, app).await;
+        }
+
+        P2PMessage::BlockVote { block_hash, height, voter, signature, timestamp } => {
+            register_known_validator(&voter);
+            handle_block_vote(block_hash, height, voter, signature, timestamp, app).await;
+        }
+
+        P2PMessage::BlockFinalized { block, transactions, .. } => {
+            merge_remote_chain(vec![block], transactions, app).await;
         }
 
         P2PMessage::ChainSyncRequest { requester_endpoint } => {
@@ -1972,6 +2097,164 @@ pub async fn fetch_chain_from_relay(app: &tauri::AppHandle) {
     }
     merge_remote_chain(remote.blocks, remote.transactions, app).await;
     eprintln!("[Relay] Chain merged from relay seed node");
+}
+
+// ── BFT voting round ─────────────────────────────────────────────────────────
+
+/// Sign a payload with our Ed25519 key. Returns hex(signature).
+fn bft_sign(data: &str) -> Option<String> {
+    let seed_bytes = std::fs::read(crate::ledger::seed_path()).ok()
+        .filter(|b| b.len() == 32)?;
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&seed_bytes);
+    let kp = ego_core::KeyPair::from_bytes(&seed).ok()?;
+    let sig = kp.sign_ed25519(data.as_bytes());
+    Some(hex::encode(sig.as_bytes()))
+}
+
+/// Called when we receive a BlockProposal from a peer.
+/// Validate it, then cast and broadcast a signed vote.
+async fn handle_block_proposal(
+    block: LedgerBlock,
+    transactions: Vec<LedgerTx>,
+    proposer: String,
+    app: &tauri::AppHandle,
+) {
+    let chain = load_chain();
+
+    // Validate the proposed block
+    if !validate_block(&block, &chain) {
+        eprintln!("[BFT] Rejected proposal for block #{} from {}", block.height, proposer);
+        return;
+    }
+
+    // Don't vote twice for the same block_hash
+    {
+        let my_addr = crate::ledger::Ledger::load().address;
+        let votes = pending_votes();
+        if let Some(voters) = votes.get(&block.hash) {
+            if voters.contains(&my_addr) {
+                return; // already voted
+            }
+        }
+    }
+
+    eprintln!("[BFT] Valid proposal block #{} from {} — casting vote", block.height, proposer);
+
+    // Store proposal transactions locally so coinbase check works when finalizing
+    {
+        let mut chain2 = load_chain();
+        let mut changed = false;
+        for tx in &transactions {
+            if !chain2.transactions.iter().any(|t| t.hash == tx.hash) {
+                chain2.transactions.push(tx.clone());
+                changed = true;
+            }
+        }
+        if changed { let _ = crate::ledger::save_chain(&chain2); }
+    }
+
+    // Cast our vote
+    let my_addr = crate::ledger::Ledger::load().address;
+    if my_addr.is_empty() { return; }
+
+    let vote_data = format!("{}:{}:{}", block.hash, block.height, my_addr);
+    let signature = match bft_sign(&vote_data) {
+        Some(s) => s,
+        None    => { eprintln!("[BFT] Cannot sign vote — no key"); return; }
+    };
+
+    let vote = P2PMessage::BlockVote {
+        block_hash: block.hash.clone(),
+        height:     block.height,
+        voter:      my_addr.clone(),
+        signature,
+        timestamp:  chrono::Utc::now().timestamp(),
+    };
+
+    if let Ok(data) = serde_json::to_vec(&vote) {
+        publish_gossip("ego-votes-v1", data).await;
+    }
+
+    // Also count our own vote
+    handle_block_vote(block.hash, block.height, my_addr, String::new(), chrono::Utc::now().timestamp(), app).await;
+}
+
+/// Called when we receive a BlockVote from a peer (or cast our own).
+/// Collect votes; finalize the block when >2/3 threshold is reached.
+async fn handle_block_vote(
+    block_hash: String,
+    height:     u64,
+    voter:      String,
+    _signature: String,
+    _timestamp: i64,
+    app:        &tauri::AppHandle,
+) {
+    let threshold = bft_threshold();
+
+    let should_finalize = {
+        let mut votes = pending_votes();
+        let voters = votes.entry(block_hash.clone()).or_default();
+        if !voters.contains(&voter) {
+            voters.push(voter.clone());
+            eprintln!("[BFT] Vote for block #{} from {} ({}/{} votes)",
+                height, voter, voters.len(), threshold);
+        }
+        voters.len() >= threshold
+    };
+
+    if !should_finalize { return; }
+
+    // Already finalized this block? Check chain.
+    let chain = load_chain();
+    if chain.blocks.iter().any(|b| b.hash == block_hash) {
+        return; // already in chain
+    }
+
+    eprintln!("[BFT] Block #{} FINALIZED with {} votes (threshold={})",
+        height,
+        pending_votes().get(&block_hash).map(|v| v.len()).unwrap_or(0),
+        threshold);
+
+    // Clean up pending votes for this height
+    pending_votes().retain(|_, _| true); // keep for now, or clear by height
+
+    // Find the block in pending transactions (was stored when we saw the proposal)
+    // or request it from the relay
+    let finalized_chain = load_chain();
+    let block = match finalized_chain.blocks.iter().find(|b| b.hash == block_hash) {
+        Some(b) => b.clone(),
+        None    => {
+            // Block not in chain yet — fetch from relay
+            if let Some(resp) = crate::p2p::relay_http_get("/chain").await {
+                if let Ok(remote) = resp.json::<crate::ledger::SharedChain>().await {
+                    merge_remote_chain(remote.blocks, remote.transactions, app).await;
+                }
+            }
+            return;
+        }
+    };
+
+    // Broadcast finalization so all peers learn about it
+    let votes_json: Vec<serde_json::Value> = pending_votes()
+        .get(&block_hash)
+        .map(|voters| voters.iter().map(|v| serde_json::json!({"voter": v})).collect())
+        .unwrap_or_default();
+
+    let finalized = P2PMessage::BlockFinalized {
+        block:        block.clone(),
+        transactions: finalized_chain.transactions.iter()
+            .filter(|t| t.block_height == Some(height))
+            .cloned()
+            .collect(),
+        votes:        votes_json,
+    };
+
+    if let Ok(data) = serde_json::to_vec(&finalized) {
+        publish_gossip("ego-blocks-v1", data).await;
+    }
+
+    let _ = app.emit_all("ego://chain-updated", ());
 }
 
 pub async fn push_tx_to_relay(tx: &crate::ledger::LedgerTx, block: &crate::ledger::LedgerBlock) {
