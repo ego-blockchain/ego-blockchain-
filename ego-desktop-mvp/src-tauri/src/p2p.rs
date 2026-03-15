@@ -31,11 +31,62 @@ static GOSSIP_TX: OnceLock<mpsc::UnboundedSender<(String, Vec<u8>)>> = OnceLock:
 
 pub const P2P_PORT: u16 = 47393;
 
+/// Bootstrap / relay nodes. The first entry is the official Ego seed node.
+/// Anyone can run an additional relay — add their multiaddr here in future releases.
+/// The network remains functional as long as at least one of these is reachable.
 pub const RELAY_NODES: &[&str] = &[
+    // Official Ego seed node
     "/dns4/EgoRelay.egoblockchain.com/tcp/4001/p2p/12D3KooWPj6m7jzmVyMh1zWrsoux3YiVs9j2HwsjrFXzDcqAGGz4",
+    // Community relay 1 — placeholder, replace with real peer when available
+    // "/dns4/relay2.egoblockchain.com/tcp/4001/p2p/12D3KooW...",
+    // Community relay 2 — placeholder
+    // "/dns4/relay3.egoblockchain.com/tcp/4001/p2p/12D3KooW...",
 ];
 
+/// HTTP API endpoints — tried in order, first reachable one wins.
+pub const RELAY_HTTP_NODES: &[&str] = &[
+    "http://EgoRelay.egoblockchain.com:8080",
+    // "http://relay2.egoblockchain.com:8080",
+];
+
+/// Kept for backward compatibility — callers in other crates that haven't been
+/// migrated yet can still reference this; internally p2p.rs uses RELAY_HTTP_NODES.
+#[allow(dead_code)]
 pub const RELAY_HTTP_API: &str = "http://EgoRelay.egoblockchain.com:8080";
+
+/// Try each relay HTTP node in order, return the first successful response.
+/// This makes the network resilient to any single relay going down.
+pub async fn relay_http_get(path: &str) -> Option<reqwest::Response> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .unwrap_or_default();
+    for base in RELAY_HTTP_NODES {
+        let url = format!("{}{}", base, path);
+        if let Ok(resp) = client.get(&url).send().await {
+            if resp.status().is_success() {
+                return Some(resp);
+            }
+        }
+    }
+    None
+}
+
+pub async fn relay_http_post_json<T: serde::Serialize>(path: &str, body: &T) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .unwrap_or_default();
+    for base in RELAY_HTTP_NODES {
+        let url = format!("{}{}", base, path);
+        if let Ok(resp) = client.post(&url).json(body).send().await {
+            if resp.status().is_success() {
+                return true;
+            }
+        }
+    }
+    false
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // SINGLE SOURCE OF TRUTH FOR RELAY CIRCUIT STATE
 //
@@ -1753,9 +1804,67 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
 
 // ── Chain helpers ─────────────────────────────────────────────────────────────
 
+/// Validate a block received from a remote peer before accepting it into the local chain.
+/// Returns true if the block is structurally valid according to consensus rules.
+fn validate_block(block: &crate::ledger::LedgerBlock, chain: &crate::ledger::SharedChain) -> bool {
+    // 1. Genesis block is always valid.
+    if block.height == 0 {
+        return block.hash == crate::ledger::GENESIS_HASH;
+    }
+
+    // 2. Must connect to a known previous block.
+    let prev_exists = chain.blocks.iter().any(|b| b.hash == block.prev_hash);
+    if !prev_exists {
+        eprintln!("[Validate] Block #{} rejected: unknown prev_hash {}", block.height, block.prev_hash);
+        return false;
+    }
+
+    // 3. No duplicate hash — not an error, just skip.
+    if chain.blocks.iter().any(|b| b.hash == block.hash) {
+        return false;
+    }
+
+    // 4. Reward must match halving schedule (or be zero for non-coinbase blocks).
+    const INITIAL_BLOCK_REWARD: u64 = 50_000_000;
+    const HALVING_INTERVAL: u64 = 2_100_000;
+    let era = block.height / HALVING_INTERVAL;
+    let expected_reward = INITIAL_BLOCK_REWARD >> era.min(63);
+    if block.reward != expected_reward && block.reward != 0 {
+        eprintln!("[Validate] Block #{} rejected: reward {} != expected {}",
+            block.height, block.reward, expected_reward);
+        return false;
+    }
+
+    // 5. If coinbase_tx is set, verify it exists and pays the right amount to the miner.
+    if let Some(ref cb_hash) = block.coinbase_tx {
+        let cb_tx = chain.transactions.iter().find(|t| &t.hash == cb_hash);
+        match cb_tx {
+            Some(tx) => {
+                if tx.to != block.miner || tx.amount != expected_reward {
+                    eprintln!("[Validate] Block #{} rejected: invalid coinbase tx (to={}, amount={}, miner={}, expected={})",
+                        block.height, tx.to, tx.amount, block.miner, expected_reward);
+                    return false;
+                }
+            }
+            None => {
+                // Coinbase TX may not have arrived yet in this gossip batch — allow if reward=0
+                // to avoid rejecting blocks whose coinbase TX arrives alongside the block.
+                if block.reward != 0 {
+                    eprintln!("[Validate] Block #{} rejected: coinbase TX {} not found",
+                        block.height, cb_hash);
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
 async fn apply_incoming_tx(tx: LedgerTx, block: LedgerBlock, app: &tauri::AppHandle) {
     let mut chain = load_chain();
     if chain.transactions.iter().any(|t| t.hash == tx.hash) { return; }
+    if !validate_block(&block, &chain) { return; }
     chain.transactions.push(tx);
     chain.blocks.push(block);
     chain.blocks.sort_by_key(|b| b.height);
@@ -1781,7 +1890,7 @@ async fn merge_remote_chain(
         }
     }
     for block in blocks {
-        if !chain.blocks.iter().any(|b| b.hash == block.hash) {
+        if validate_block(&block, &chain) {
             chain.blocks.push(block); changed = true;
         }
     }
@@ -1795,11 +1904,10 @@ async fn merge_remote_chain(
 // ── Relay HTTP helpers ────────────────────────────────────────────────────────
 
 pub async fn fetch_chain_from_relay(app: &tauri::AppHandle) {
-    let url = format!("{}/chain", RELAY_HTTP_API);
-    eprintln!("[Relay] Fetching chain from {}", url);
-    let resp = match reqwest::get(&url).await {
-        Ok(r)  => r,
-        Err(e) => { eprintln!("[Relay] fetch_chain HTTP error: {}", e); return; }
+    eprintln!("[Relay] Fetching chain from relay nodes");
+    let resp = match relay_http_get("/chain").await {
+        Some(r) => r,
+        None    => { eprintln!("[Relay] fetch_chain: all relay nodes unreachable"); return; }
     };
     let body = match resp.text().await {
         Ok(b)  => b,
@@ -1825,16 +1933,11 @@ pub async fn push_tx_to_relay(tx: &crate::ledger::LedgerTx, block: &crate::ledge
     }
 
     // ── HTTP relay fallback (ensures the relay seed node also gets it) ────────
-    let client = reqwest::Client::new();
-    if let Err(e) = client.post(format!("{}/chain/tx", RELAY_HTTP_API))
-        .json(tx).send().await
-    {
-        eprintln!("[Relay] push tx error: {}", e);
+    if !relay_http_post_json("/chain/tx", tx).await {
+        eprintln!("[Relay] push tx: all relay nodes unreachable");
     }
-    if let Err(e) = client.post(format!("{}/chain/block", RELAY_HTTP_API))
-        .json(block).send().await
-    {
-        eprintln!("[Relay] push block error: {}", e);
+    if !relay_http_post_json("/chain/block", block).await {
+        eprintln!("[Relay] push block: all relay nodes unreachable");
     }
 }
 
@@ -1870,12 +1973,10 @@ pub async fn register_with_relay(
         country,
         is_relay:  IS_RELAY_SERVER.load(Ordering::Relaxed),
     };
-    let client = reqwest::Client::new();
-    match client.post(format!("{}/peers", RELAY_HTTP_API))
-        .json(&entry).send().await
-    {
-        Ok(_)  => eprintln!("[Relay] Registered endpoint: {}", endpoint),
-        Err(e) => eprintln!("[Relay] register error: {}", e),
+    if relay_http_post_json("/peers", &entry).await {
+        eprintln!("[Relay] Registered endpoint: {}", endpoint);
+    } else {
+        eprintln!("[Relay] register: all relay nodes unreachable");
     }
 }
 
@@ -1932,14 +2033,9 @@ pub async fn register_cid_on_relay(cid: &str, holder_addr: &str, endpoint: &str)
         "signature":   sig_hex,
         "public_key":  pubkey_hex,
     });
-    let client = reqwest::Client::new();
-    if let Err(e) = client
-        .post(format!("{}/shard/{}/cid", RELAY_HTTP_API, shard_id))
-        .json(&payload)
-        .send()
-        .await
-    {
-        eprintln!("[CID] register error: {}", e);
+    let path = format!("/shard/{}/cid", shard_id);
+    if !relay_http_post_json(&path, &payload).await {
+        eprintln!("[CID] register: all relay nodes unreachable");
     }
 }
 
@@ -1990,43 +2086,25 @@ pub async fn register_porep_commitment(
         "public_key":      pubkey_hex,
     });
 
-    let client = reqwest::Client::new();
-    match client
-        .post(format!("{}/porep/commit", RELAY_HTTP_API))
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() =>
-            eprintln!("[PoRep] ✓ Commitment registered for {}", &cid[..16.min(cid.len())]),
-        Ok(r) =>
-            eprintln!("[PoRep] register rejected: {}", r.status()),
-        Err(e) =>
-            eprintln!("[PoRep] register error: {e}"),
+    if relay_http_post_json("/porep/commit", &payload).await {
+        eprintln!("[PoRep] ✓ Commitment registered for {}", &cid[..16.min(cid.len())]);
+    } else {
+        eprintln!("[PoRep] register: all relay nodes unreachable");
     }
 }
 
 /// Fetch pending PoST challenges from the relay for this address.
 pub async fn fetch_post_challenges(prover_addr: &str) -> Vec<serde_json::Value> {
-    let url = format!("{}/post/challenges/{}", RELAY_HTTP_API, prover_addr);
-    match reqwest::get(&url).await {
-        Ok(r)  => r.json::<Vec<serde_json::Value>>().await.unwrap_or_default(),
-        Err(e) => { eprintln!("[PoST] fetch challenges error: {e}"); vec![] }
+    let path = format!("/post/challenges/{}", prover_addr);
+    match relay_http_get(&path).await {
+        Some(r) => r.json::<Vec<serde_json::Value>>().await.unwrap_or_default(),
+        None    => { eprintln!("[PoST] fetch challenges: all relay nodes unreachable"); vec![] }
     }
 }
 
 /// Submit PoST proofs to the relay in response to a challenge.
 pub async fn submit_post_proof(payload: serde_json::Value) -> bool {
-    let client = reqwest::Client::new();
-    match client
-        .post(format!("{}/post/proof", RELAY_HTTP_API))
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(r) => r.status().is_success(),
-        Err(e) => { eprintln!("[PoST] submit proof error: {e}"); false }
-    }
+    relay_http_post_json("/post/proof", &payload).await
 }
 
 /// After staking or unstaking, call this to update the relay's stake registry
@@ -2057,19 +2135,10 @@ pub async fn report_stake_to_relay(address: &str, amount_uegoc: u64) {
         "public_key":   pubkey_hex,
     });
 
-    let client = reqwest::Client::new();
-    match client
-        .post(format!("{}/stake/update", RELAY_HTTP_API))
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() =>
-            println!("[stake] Reported to relay: {} → {} uEGOC", address, amount_uegoc),
-        Ok(r) =>
-            eprintln!("[stake] Relay rejected stake update: {}", r.status()),
-        Err(e) =>
-            eprintln!("[stake] stake update error: {e}"),
+    if relay_http_post_json("/stake/update", &payload).await {
+        println!("[stake] Reported to relay: {} → {} uEGOC", address, amount_uegoc);
+    } else {
+        eprintln!("[stake] stake update: all relay nodes unreachable");
     }
 }
 
@@ -2077,18 +2146,17 @@ pub async fn report_stake_to_relay(address: &str, amount_uegoc: u64) {
 /// Returns a list of holders so the requester can pick the best one.
 pub async fn find_cid_holders(cid: &str) -> Vec<CidHolder> {
     let shard_id = shard_for_cid(cid);
-    let url      = format!("{}/shard/{}/cid/{}", RELAY_HTTP_API, shard_id, cid);
-    match reqwest::get(&url).await {
-        Ok(resp) => resp.json::<Vec<CidHolder>>().await.unwrap_or_default(),
-        Err(e)   => { eprintln!("[CID] lookup error: {}", e); vec![] }
+    let path     = format!("/shard/{}/cid/{}", shard_id, cid);
+    match relay_http_get(&path).await {
+        Some(resp) => resp.json::<Vec<CidHolder>>().await.unwrap_or_default(),
+        None       => { eprintln!("[CID] lookup: all relay nodes unreachable"); vec![] }
     }
 }
 
 pub async fn fetch_peers_from_relay(app: &tauri::AppHandle) {
-    let url = format!("{}/peers", RELAY_HTTP_API);
-    let resp = match reqwest::get(&url).await {
-        Ok(r)  => r,
-        Err(e) => { eprintln!("[Relay] fetch_peers error: {}", e); return; }
+    let resp = match relay_http_get("/peers").await {
+        Some(r) => r,
+        None    => { eprintln!("[Relay] fetch_peers: all relay nodes unreachable"); return; }
     };
     let body = match resp.text().await {
         Ok(b)  => b,
@@ -2165,7 +2233,7 @@ pub async fn fetch_peers_from_relay(app: &tauri::AppHandle) {
 /// for the given wallet address, or `None` if not found.
 /// Called by resolve_endpoint() as a fallback when the local cache is stale.
 pub async fn get_relay_endpoint(address: &str) -> Option<String> {
-    let resp = reqwest::get(format!("{}/peers", RELAY_HTTP_API)).await.ok()?;
+    let resp = relay_http_get("/peers").await?;
     let body = resp.text().await.ok()?;
     let peers: Vec<RelayPeerEntry> = serde_json::from_str(&body).ok()?;
     peers.into_iter()

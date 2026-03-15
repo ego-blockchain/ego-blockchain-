@@ -90,12 +90,15 @@ pub async fn respond_to_challenges() -> Result<PostChallengeResult, EgoDesktopEr
     let mut details   = Vec::new();
 
     for ch in &challenges {
-        let challenge_id = ch["challenge_id"].as_str().unwrap_or("").to_string();
-        let cid          = ch["cid"].as_str().unwrap_or("").to_string();
-        let seed_hex     = ch["challenge_seed"].as_str().unwrap_or("").to_string();
-        let n_real       = ch["n_real_leaves"].as_u64().unwrap_or(0) as usize;
-        let n_padded     = ch["n_padded_leaves"].as_u64().unwrap_or(0) as usize;
-        let comm_d_hex   = ch["comm_d"].as_str().unwrap_or("").to_string();
+        let challenge_id       = ch["challenge_id"].as_str().unwrap_or("").to_string();
+        let cid                = ch["cid"].as_str().unwrap_or("").to_string();
+        let seed_hex           = ch["challenge_seed"].as_str().unwrap_or("").to_string();
+        let n_real             = ch["n_real_leaves"].as_u64().unwrap_or(0) as usize;
+        let n_padded           = ch["n_padded_leaves"].as_u64().unwrap_or(0) as usize;
+        let comm_d_hex         = ch["comm_d"].as_str().unwrap_or("").to_string();
+        // challenge_block_hash is the block hash used to derive the challenge seed
+        // deterministically — included for auditability; proofs are generated from seed_hex.
+        let _challenge_block_hash = ch["challenge_block_hash"].as_str().unwrap_or("").to_string();
 
         if cid.is_empty() || seed_hex.is_empty() || n_real == 0 {
             failures += 1;
@@ -215,11 +218,11 @@ pub async fn get_post_score() -> Result<PostScore, EgoDesktopError> {
         return Ok(PostScore { address: String::new(), active_sectors: 0,
             proved_windows: 0, fault_count: 0, last_proved: None });
     }
-    let url = format!("{}/post/score/{}", crate::p2p::RELAY_HTTP_API, ledger.address);
-    match reqwest::get(&url).await {
-        Ok(r) => r.json::<PostScore>().await
+    let path = format!("/post/score/{}", ledger.address);
+    match crate::p2p::relay_http_get(&path).await {
+        Some(r) => r.json::<PostScore>().await
             .map_err(|e| EgoDesktopError::WalletError(format!("Parse: {e}"))),
-        Err(e) => Err(EgoDesktopError::WalletError(format!("Fetch: {e}"))),
+        None => Err(EgoDesktopError::WalletError("All relay nodes unreachable".into())),
     }
 }
 
@@ -255,17 +258,20 @@ pub async fn get_combined_drs() -> Result<CombinedDrsScore, EgoDesktopError> {
     }
     let staked_uegoc = ledger.staked_amount;
 
-    let poc_url  = format!("{}/poc/score/{}", crate::p2p::RELAY_HTTP_API, addr);
-    let post_url = format!("{}/post/score/{}", crate::p2p::RELAY_HTTP_API, addr);
-    let (poc_r, post_r) = tokio::join!(reqwest::get(&poc_url), reqwest::get(&post_url));
+    let poc_path  = format!("/poc/score/{}", addr);
+    let post_path = format!("/post/score/{}", addr);
+    let (poc_r, post_r) = tokio::join!(
+        crate::p2p::relay_http_get(&poc_path),
+        crate::p2p::relay_http_get(&post_path)
+    );
 
     let poc_json: serde_json::Value = match poc_r {
-        Ok(r)  => r.json().await.unwrap_or_default(),
-        Err(_) => serde_json::Value::Null,
+        Some(r) => r.json().await.unwrap_or_default(),
+        None    => serde_json::Value::Null,
     };
     let post_json: serde_json::Value = match post_r {
-        Ok(r)  => r.json().await.unwrap_or_default(),
-        Err(_) => serde_json::Value::Null,
+        Some(r) => r.json().await.unwrap_or_default(),
+        None    => serde_json::Value::Null,
     };
 
     let combined_score = poc_json["drs_score"].as_f64().unwrap_or(0.0);
@@ -298,11 +304,10 @@ pub async fn get_combined_drs() -> Result<CombinedDrsScore, EgoDesktopError> {
 /// Fetch live tokenomics data from the relay (`GET /tokenomics`).
 #[tauri::command]
 pub async fn get_tokenomics() -> Result<serde_json::Value, EgoDesktopError> {
-    let url = format!("{}/tokenomics", crate::p2p::RELAY_HTTP_API);
-    match reqwest::get(&url).await {
-        Ok(r)  => r.json::<serde_json::Value>().await
+    match crate::p2p::relay_http_get("/tokenomics").await {
+        Some(r) => r.json::<serde_json::Value>().await
             .map_err(|e| EgoDesktopError::WalletError(format!("Parse: {e}"))),
-        Err(e) => Err(EgoDesktopError::WalletError(format!("Fetch: {e}"))),
+        None => Err(EgoDesktopError::WalletError("All relay nodes unreachable".into())),
     }
 }
 
