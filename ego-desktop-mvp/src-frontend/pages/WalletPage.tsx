@@ -26,6 +26,19 @@ interface Balance {
   formatted: string;
 }
 
+// Matches src/commands/wallet.rs RemoteNodeInfo struct
+interface RemoteNodeInfo {
+  address: string;
+  public_key_hex: string;
+  peer_id: string;
+  payout_address: string | null;
+  balance_uegoc: number;
+  balance_egoc: number;
+  formatted: string;
+  block_height: number;
+  rpc_url: string;
+}
+
 // Matches src/ledger.rs LedgerTx struct
 interface LedgerTx {
   hash: string;
@@ -94,6 +107,28 @@ const WalletPage: React.FC = () => {
   const [sending, setSending] = useState(false);
   const [txResult, setTxResult] = useState<TxResult | null>(null);
   const [copied, setCopied] = useState(false);
+
+  // Remote node viewer
+  const [showRemoteNode, setShowRemoteNode] = useState(false);
+  const [remoteRpcUrl, setRemoteRpcUrl] = useState('http://localhost:8545');
+  const [remoteNode, setRemoteNode] = useState<RemoteNodeInfo | null>(null);
+  const [remoteLoading, setRemoteLoading] = useState(false);
+  const [remoteError, setRemoteError] = useState('');
+
+  async function queryRemoteNode() {
+    if (!remoteRpcUrl.trim()) return;
+    setRemoteLoading(true);
+    setRemoteError('');
+    setRemoteNode(null);
+    try {
+      const info = await invoke<RemoteNodeInfo>('query_remote_node', { rpcUrl: remoteRpcUrl.trim() });
+      setRemoteNode(info);
+    } catch (e: any) {
+      setRemoteError(String(e));
+    } finally {
+      setRemoteLoading(false);
+    }
+  }
 
   // Email confirmation flow
   type EmailStep = 'idle' | 'waiting' | 'confirmed' | 'cancelled' | 'expired';
@@ -332,6 +367,80 @@ const WalletPage: React.FC = () => {
                 </button>
               );
             })}
+          </div>
+        )}
+      </div>
+
+      {/* ── REMOTE NODE PANEL ── */}
+      <div className="bg-gray-800/60 rounded-2xl border border-gray-700/50 overflow-hidden">
+        <button
+          onClick={() => setShowRemoteNode(v => !v)}
+          className="w-full flex items-center justify-between px-5 py-4 hover:bg-gray-700/30 transition"
+        >
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-purple-500/15 flex items-center justify-center text-lg">🖥️</div>
+            <div className="text-left">
+              <div className="font-semibold text-sm">Remote Node Balance</div>
+              <div className="text-xs text-gray-400">Monitor a headless ego-node by RPC URL</div>
+            </div>
+          </div>
+          <span className="text-gray-500 text-sm">{showRemoteNode ? '▲' : '▼'}</span>
+        </button>
+
+        {showRemoteNode && (
+          <div className="px-5 pb-5 space-y-4 border-t border-gray-700/50 pt-4">
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={remoteRpcUrl}
+                onChange={e => setRemoteRpcUrl(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && queryRemoteNode()}
+                placeholder="http://your-server:8545"
+                className="flex-1 bg-gray-700/60 border border-gray-600 rounded-xl px-3 py-2 text-sm font-mono focus:outline-none focus:border-purple-500"
+              />
+              <button
+                onClick={queryRemoteNode}
+                disabled={remoteLoading}
+                className="bg-purple-600 hover:bg-purple-500 disabled:opacity-50 px-4 py-2 rounded-xl text-sm font-semibold transition"
+              >
+                {remoteLoading ? '…' : 'Query'}
+              </button>
+            </div>
+
+            {remoteError && (
+              <div className="bg-red-500/10 border border-red-500/30 rounded-xl px-4 py-3 text-sm text-red-400">
+                {remoteError}
+              </div>
+            )}
+
+            {remoteNode && (
+              <div className="space-y-3">
+                {/* Balance highlight */}
+                <div className="bg-purple-500/10 border border-purple-500/20 rounded-xl px-4 py-3 flex items-center justify-between">
+                  <div>
+                    <div className="text-xs text-gray-400">Node Balance</div>
+                    <div className="text-xl font-bold text-purple-300">{remoteNode.formatted}</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-xs text-gray-400">Block Height</div>
+                    <div className="text-sm font-mono text-gray-300">#{remoteNode.block_height.toLocaleString()}</div>
+                  </div>
+                </div>
+
+                {/* Identity fields */}
+                {[
+                  { label: 'Node Address',    val: remoteNode.address,     mono: true },
+                  { label: 'Peer ID',         val: remoteNode.peer_id,     mono: true },
+                  { label: 'Payout Address',  val: remoteNode.payout_address ?? '— not set —', mono: !!remoteNode.payout_address },
+                  { label: 'Ed25519 PubKey',  val: remoteNode.public_key_hex.slice(0, 32) + '…', mono: true },
+                ].map(({ label, val, mono }) => (
+                  <div key={label} className="flex justify-between items-start gap-4 py-1 border-b border-gray-700/40 last:border-0">
+                    <span className="text-gray-400 text-xs shrink-0">{label}</span>
+                    <span className={`text-right text-xs break-all ${mono ? 'font-mono text-gray-300' : 'text-white'}`}>{val}</span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
       </div>

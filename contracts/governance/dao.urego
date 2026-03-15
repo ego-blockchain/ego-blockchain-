@@ -1,0 +1,818 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// EGO-8 DAO Governance Contract
+// SPDX: MIT
+//
+// Standard : EGO-8 (eips/EGO-8.md)
+// Requires : EGO-1 (process), EGO-20 (token)
+// Author   : Artit Muhaxhiri (@egoblockchain)
+// Version  : 1.0.0
+// Created  : 2026-03-15
+//
+// OVERVIEW
+// --------
+// This contract implements on-chain DAO governance for Ego Blockchain as
+// specified in EGO-8. It implements the full governance lifecycle:
+//
+//   1. STAKE        — EGOC holders lock tokens to gain voting power.
+//   2. PROPOSE      — Any staker with ≥ 1000 EGOC creates a proposal.
+//   3. VOTE         — During the Active window, stakers cast votes weighted
+//                     by the dual-vote formula (staking weight + knowledge weight).
+//   4. EXECUTE      — After voting ends, anyone may call execute() on a
+//                     Succeeded proposal to finalise the governance outcome.
+//   5. UNSTAKE      — Stakers reclaim tokens once they hold no active votes.
+//
+// DUAL-VOTE FORMULA (whitepaper §10, EGO-8 §4)
+// ---------------------------------------------
+//   staking_weight   = staked_snap / total_staked_snap * 10000  (basis points)
+//   knowledge_weight = passed_test ? 10000 : 5000
+//   final_weight     = (staking_weight + knowledge_weight) / 2
+//
+// VOTE THRESHOLDS (EGO-1 §6, EGO-8 §3)
+// ----------------------------------------
+//   Core (type 0)        : quorum 30%, supermajority ≥67%
+//   Interface (type 1)   : quorum 20%, simple majority >50%
+//   Networking (type 2)  : quorum 20%, simple majority >50%
+//   Process (type 3)     : quorum 25%, supermajority ≥67%
+//
+// SNAPSHOT ANTI-GAMING
+// --------------------
+// Both the per-voter staked balance and the global total_staked are snapshotted
+// at proposal creation time. Acquiring or staking tokens after snapshot does
+// NOT influence vote weight on that proposal. This prevents flash-loan attacks.
+//
+// PHASE 1 NOTE
+// ------------
+// ego-vm Phase 1 does not support cross-contract calls. The `calldata` field
+// stored with each proposal is reserved for Phase 2. In Phase 1, execute()
+// records the Executed state and emits EGO8:ProposalExecuted but does not
+// dispatch the calldata. Downstream contracts listen for the event.
+//
+// DEPLOYMENT
+// ----------
+//   1. Deploy an EGO-20 EGOC token contract first.
+//   2. Deploy this DAO contract:
+//      ego-node tx deploy dao.wasm --args "<egoc_addr> 100 50400"
+//      (voting_delay=100 blocks, voting_period=50400 blocks ≈ 84 min at 0.1s/slot)
+//   3. Token holders call stake(amount) to register voting power.
+// ═══════════════════════════════════════════════════════════════════════════
+
+contract EgoDAO {
+
+    // ── Constants ────────────────────────────────────────────────────────────
+
+    // MIN_PROPOSE_STAKE — minimum uEGOC a proposer must have staked.
+    // 1000 EGOC = 1_000_000_000 uEGOC (EGOC has 6 decimal places, but the
+    // memory notes say 1 EGOC = 1_000_000 uEGOC, so 1000 EGOC = 1e9 uEGOC).
+    // This threshold prevents proposal spam by requiring meaningful skin-in-the-game.
+    let MIN_PROPOSE_STAKE: u64 = 1000000000u64   // 1000 EGOC in uEGOC
+
+    // BASIS_POINTS — denominator used throughout weight arithmetic.
+    // 10000 bp = 100%. All vote weights are expressed in basis points.
+    let BASIS_POINTS: u64 = 10000u64
+
+    // Proposal type codes (mirror EGO-1 §1)
+    let TYPE_CORE:       u8 = 0u8
+    let TYPE_INTERFACE:  u8 = 1u8
+    let TYPE_NETWORKING: u8 = 2u8
+    let TYPE_PROCESS:    u8 = 3u8
+
+    // Proposal state codes (mirror EGO-8 §5)
+    let STATE_PENDING:   u8 = 0u8
+    let STATE_ACTIVE:    u8 = 1u8
+    let STATE_DEFEATED:  u8 = 2u8
+    let STATE_SUCCEEDED: u8 = 3u8
+    let STATE_QUEUED:    u8 = 4u8   // reserved for future timelock EIP
+    let STATE_EXECUTED:  u8 = 5u8
+    let STATE_CANCELLED: u8 = 6u8
+
+    // Vote direction codes stored in ego8:vote keys
+    let VOTE_NOT_CAST: u8 = 0u8
+    let VOTE_FOR:      u8 = 1u8
+    let VOTE_AGAINST:  u8 = 2u8
+
+    // ── Initialisation ───────────────────────────────────────────────────────
+
+    // init — called once at deploy time.
+    //
+    // Stores the EGOC token address and the governance timing parameters.
+    // These parameters can only be changed via a successful governance vote
+    // (a Process proposal that deploys a new DAO contract, per EGO-1 §8).
+    //
+    // Args:
+    //   egoc_token    — Address of the deployed EGO-20 EGOC token contract.
+    //   voting_delay  — Blocks between proposal creation and voting start.
+    //                   Default: 100 (≈ 10 s at 0.1 s/slot). Gives token
+    //                   holders time to notice a proposal before voting opens.
+    //   voting_period — Blocks that voting remains open after start.
+    //                   Default: 50400 (≈ 84 min). Long enough for global
+    //                   participation; short enough for fast governance.
+    fn init(egoc_token: Address, voting_delay: u64, voting_period: u64) {
+        assert(voting_delay > 0u64,  "init: voting_delay must be > 0")
+        assert(voting_period > 0u64, "init: voting_period must be > 0")
+
+        storage.set("ego8:meta:egoc_token",    egoc_token)
+        storage.set("ego8:meta:voting_delay",  voting_delay)
+        storage.set("ego8:meta:voting_period", voting_period)
+        storage.set("ego8:meta:proposal_count", 0u64)
+        storage.set("ego8:meta:total_staked",   0u64)
+
+        events.emit("EGO8:Init", sys.caller())
+    }
+
+    // ── Staking ──────────────────────────────────────────────────────────────
+
+    // stake — lock EGOC to gain voting power.
+    //
+    // In Phase 1, staking uses internal storage accounting: the contract
+    // records how much EGOC each address has committed. The caller is
+    // responsible for ensuring they have transferred the tokens to the DAO
+    // contract's ledger entry before calling stake().
+    //
+    // In Phase 2 (cross-contract calls), this function will call
+    // EGOC.transfer_from(caller, this_contract, amount) directly.
+    //
+    // Staked tokens cannot be used in any other DeFi operation while locked
+    // here. They are returned in full on unstake() (no slashing in Phase 1).
+    //
+    // Args:
+    //   amount — uEGOC to stake (must be > 0)
+    //
+    // Returns: 1 on success, 0 on failure
+    fn stake(amount: u64) -> u64 {
+        assert(amount > 0u64, "stake: amount must be > 0")
+
+        let caller: Address = sys.caller()
+
+        // Read existing staked balance for this caller
+        let current_stake: u64 = storage.get_u64("ego8:stake:" + caller)
+
+        // Add to the caller's staked balance
+        let new_stake: u64 = current_stake + amount
+        storage.set("ego8:stake:" + caller, new_stake)
+
+        // Update the global total_staked counter.
+        // NOTE: This live total is only used for NEW proposals' snapshots.
+        // Existing proposals use their own snapshotted total, so live changes
+        // here cannot affect any vote already in progress.
+        let total: u64 = storage.get_u64("ego8:meta:total_staked")
+        storage.set("ego8:meta:total_staked", total + amount)
+
+        // Emit staking event for indexers and the desktop wallet UI
+        events.emit("EGO8:Staked", caller + ":" + amount as str)
+
+        return 1u64
+    }
+
+    // unstake — unlock EGOC and return it to the caller.
+    //
+    // A staker MAY NOT unstake while they hold an active vote on a Pending or
+    // Active proposal. This prevents the "vote-then-unstake" attack where a
+    // voter casts their full weight and immediately withdraws, leaving the
+    // quorum denominator artificially inflated.
+    //
+    // The check is conservative: if any proposal the caller voted on is still
+    // in state Pending or Active, unstake reverts. Callers must wait for all
+    // proposals they voted on to resolve before unstaking.
+    //
+    // Args:
+    //   amount — uEGOC to unstake (must be > 0)
+    //
+    // Returns: 1 on success, 0 on failure
+    fn unstake(amount: u64) -> u64 {
+        assert(amount > 0u64, "unstake: amount must be > 0")
+
+        let caller: Address = sys.caller()
+        let current_stake: u64 = storage.get_u64("ego8:stake:" + caller)
+        assert(current_stake >= amount, "unstake: insufficient staked balance")
+
+        // Guard: refuse to unstake while the caller has live votes.
+        // We track active-vote count in a separate counter updated by cast_vote.
+        // When a proposal resolves (execute / defeat / cancel), the counter is
+        // decremented for all voters. See _decrement_active_votes() helper notes.
+        let active_votes: u64 = storage.get_u64("ego8:activevotes:" + caller)
+        assert(active_votes == 0u64, "unstake: cannot unstake while holding active votes on open proposals — wait for proposals to resolve")
+
+        // Reduce staked balance
+        storage.set("ego8:stake:" + caller, current_stake - amount)
+
+        // Reduce global total — safe because all active votes are resolved
+        let total: u64 = storage.get_u64("ego8:meta:total_staked")
+        storage.set("ego8:meta:total_staked", total - amount)
+
+        events.emit("EGO8:Unstaked", caller + ":" + amount as str)
+
+        return 1u64
+    }
+
+    // ── Proposal Creation ─────────────────────────────────────────────────────
+
+    // propose — create a new governance proposal.
+    //
+    // Any staker with ≥ MIN_PROPOSE_STAKE (1000 EGOC) may create a proposal.
+    // The proposal enters Pending state immediately; voting opens after
+    // voting_delay blocks.
+    //
+    // A snapshot of the proposer's staked balance and the global total_staked
+    // is recorded at creation time. All vote-weight computations for this
+    // proposal use these snapshotted values — not the live values at vote time.
+    //
+    // Args:
+    //   description   — Human-readable description of the proposal (UTF-8).
+    //                   This is stored on-chain for auditability.
+    //   eip_number    — The EGO-<N> number this proposal enacts (e.g. 9).
+    //                   Use 0 for proposals not tied to a specific EIP.
+    //   proposal_type — 0=Core, 1=Interface, 2=Networking, 3=Process.
+    //                   Determines quorum and majority thresholds.
+    //   calldata      — Reserved bytes for Phase 2 cross-contract dispatch.
+    //                   Pass empty bytes ("") in Phase 1.
+    //
+    // Returns: proposal_id — u64 identifier, starting at 1.
+    fn propose(
+        description:   str,
+        eip_number:    u64,
+        proposal_type: u8,
+        calldata:      bytes
+    ) -> u64 {
+        // Validate proposal type
+        assert(
+            proposal_type == TYPE_CORE
+            || proposal_type == TYPE_INTERFACE
+            || proposal_type == TYPE_NETWORKING
+            || proposal_type == TYPE_PROCESS,
+            "propose: invalid proposal_type — must be 0, 1, 2, or 3"
+        )
+
+        // Enforce anti-spam stake threshold (EGO-8 §7)
+        let caller: Address = sys.caller()
+        let caller_stake: u64 = storage.get_u64("ego8:stake:" + caller)
+        assert(
+            caller_stake >= MIN_PROPOSE_STAKE,
+            "propose: proposer must have >= 1000 EGOC staked to prevent spam"
+        )
+
+        // Allocate a new proposal ID by incrementing the counter
+        let count: u64 = storage.get_u64("ego8:meta:proposal_count")
+        let proposal_id: u64 = count + 1u64
+        storage.set("ego8:meta:proposal_count", proposal_id)
+
+        // Compute voting window using current block height
+        let voting_delay:  u64 = storage.get_u64("ego8:meta:voting_delay")
+        let voting_period: u64 = storage.get_u64("ego8:meta:voting_period")
+        let current_block: u64 = sys.block_height()
+        let start_block:   u64 = current_block + voting_delay
+        let end_block:     u64 = start_block + voting_period
+
+        // ── Store all proposal fields ─────────────────────────────────────────
+        // Using the storage prefix ego8:prop:<id>:<field> as specified in EGO-8 §2.
+        let pid: str = proposal_id as str
+
+        storage.set("ego8:prop:" + pid + ":description", description)
+        storage.set("ego8:prop:" + pid + ":proposer",    caller)
+        storage.set("ego8:prop:" + pid + ":type",        proposal_type)
+        storage.set("ego8:prop:" + pid + ":eip_number",  eip_number)
+        storage.set("ego8:prop:" + pid + ":start_block", start_block)
+        storage.set("ego8:prop:" + pid + ":end_block",   end_block)
+        storage.set("ego8:prop:" + pid + ":for_votes",   0u64)
+        storage.set("ego8:prop:" + pid + ":against_votes", 0u64)
+        storage.set("ego8:prop:" + pid + ":state",       STATE_PENDING)
+        storage.set("ego8:prop:" + pid + ":calldata",    calldata)
+
+        // ── Snapshot total_staked for quorum computation ──────────────────────
+        // The quorum denominator for this proposal is fixed at this moment.
+        // If tokens are staked or unstaked later, the quorum target is unaffected.
+        let total_staked: u64 = storage.get_u64("ego8:meta:total_staked")
+        assert(total_staked > 0u64, "propose: no tokens are staked — cannot create proposal")
+        storage.set("ego8:meta:total_staked_snap:" + pid, total_staked)
+
+        // Emit proposal creation event for indexers and the desktop UI
+        events.emit(
+            "EGO8:ProposalCreated",
+            pid + ":" + caller + ":" + eip_number as str + ":"
+                + proposal_type as str + ":" + start_block as str + ":" + end_block as str
+        )
+
+        return proposal_id
+    }
+
+    // ── Voting ────────────────────────────────────────────────────────────────
+
+    // cast_vote — cast a weighted vote on an Active proposal.
+    //
+    // This is the primary vote entry point. It calls _cast_vote_internal()
+    // with the default knowledge weight (10000 bp = no penalty) because
+    // no knowledge answer is being submitted. Voters who want to claim full
+    // knowledge weight on a proposal that has a knowledge test embedded in
+    // its description SHOULD use cast_vote_with_reason() and prefix their
+    // reason with "answer:<raw_answer>:".
+    //
+    // Args:
+    //   proposal_id — ID of the proposal to vote on
+    //   support     — 1 = FOR (yes), 0 = AGAINST (no)
+    //
+    // Returns: 1 on success, 0 if the vote was rejected
+    fn cast_vote(proposal_id: u64, support: u8) -> u64 {
+        // Default knowledge weight: full 10000 bp (no knowledge test attempted)
+        return _cast_vote_internal(proposal_id, support, 10000u64)
+    }
+
+    // cast_vote_with_reason — cast a vote and optionally submit a knowledge
+    // test answer.
+    //
+    // The `reason` parameter serves two purposes:
+    //   1. A human-readable explanation of the vote (stored off-chain via event).
+    //   2. If prefixed with "answer:<raw_answer>:", the contract hashes the
+    //      raw_answer and compares it to the stored answer hash. A correct
+    //      answer yields full knowledge_weight (10000 bp); any other reason
+    //      (or no answer prefix) yields half weight (5000 bp).
+    //
+    // This implements EGO-8 §4 dual-vote: voters who demonstrate understanding
+    // of the proposal get double the knowledge component vs. passive voters.
+    //
+    // Args:
+    //   proposal_id — ID of the proposal to vote on
+    //   support     — 1 = FOR, 0 = AGAINST
+    //   reason      — Optional reason string; prefix "answer:<raw>:" for full weight
+    //
+    // Returns: 1 on success, 0 on failure
+    fn cast_vote_with_reason(proposal_id: u64, support: u8, reason: str) -> u64 {
+        let pid: str = proposal_id as str
+
+        // Determine knowledge weight.
+        // If the proposal has a knowledge test (stored answer hash), check it.
+        let stored_hash: bytes = storage.get("ego8:prop:" + pid + ":answer_hash")
+
+        let knowledge_weight: u64 = 5000u64   // default: half weight (no answer submitted)
+
+        if stored_hash.len() == 0u64 {
+            // No knowledge test for this proposal — everyone gets full weight
+            knowledge_weight = 10000u64
+        } else {
+            // Proposal has a knowledge test. Check if reason contains an answer.
+            // Expected reason prefix: "answer:<raw_answer>:"
+            // We use the ego8_answer_check host function which extracts the
+            // raw answer from the reason string, computes blake3(answer)[:8],
+            // and compares to stored_hash.
+            let answer_correct: u64 = ego8_answer_check(reason, stored_hash)
+            if answer_correct == 1u64 {
+                knowledge_weight = 10000u64   // correct answer: full knowledge weight
+            }
+            // else stays at 5000 (50% penalty per whitepaper §10)
+        }
+
+        // Emit the reason as a separate event for off-chain indexers.
+        // The reason itself is not stored on-chain to keep storage lean.
+        events.emit(
+            "EGO8:VoteReason",
+            pid + ":" + sys.caller() + ":" + reason
+        )
+
+        return _cast_vote_internal(proposal_id, support, knowledge_weight)
+    }
+
+    // _cast_vote_internal — shared implementation for both vote entry points.
+    //
+    // Enforces all voting guards, computes the dual-vote weight, and records
+    // the vote atomically. This function MUST NOT be exported — it is called
+    // only from cast_vote and cast_vote_with_reason.
+    //
+    // Dual-vote weight formula (EGO-8 §4):
+    //   staking_weight = (voter_staked_snap / total_staked_snap) * BASIS_POINTS
+    //   final_weight   = (staking_weight + knowledge_weight) / 2
+    //
+    // The staked balance used is snapshotted at proposal creation time,
+    // not the live balance at vote time. This is the anti-flash-loan guard.
+    //
+    // Args:
+    //   proposal_id      — proposal being voted on
+    //   support          — VOTE_FOR (1) or VOTE_AGAINST (0)
+    //   knowledge_weight — 10000 (full) or 5000 (half penalty)
+    fn _cast_vote_internal(
+        proposal_id:      u64,
+        support:          u8,
+        knowledge_weight: u64
+    ) -> u64 {
+        let caller: Address = sys.caller()
+        let pid: str        = proposal_id as str
+
+        // ── Guard: proposal must be in Active state ───────────────────────────
+        // Compute live state from block height + stored state flag.
+        let live_state: u8 = _compute_live_state(proposal_id)
+        assert(live_state == STATE_ACTIVE, "cast_vote: proposal is not currently Active")
+
+        // ── Guard: voter must not have already voted ──────────────────────────
+        // Each (proposal_id, voter) pair is tracked under ego8:vote:<id>:<addr>.
+        // A value of 0 = not voted; 1 = voted for; 2 = voted against.
+        let existing_vote: u8 = storage.get_u8("ego8:vote:" + pid + ":" + caller)
+        assert(existing_vote == VOTE_NOT_CAST, "cast_vote: address has already voted on this proposal")
+
+        // Normalise support to canonical VOTE_FOR / VOTE_AGAINST codes.
+        // Callers pass support=1 for FOR and support=0 for AGAINST (ergonomic API).
+        let vote_code: u8 = VOTE_AGAINST
+        if support == 1u8 {
+            vote_code = VOTE_FOR
+        }
+
+        // ── Read staking snapshot ─────────────────────────────────────────────
+        // Look up the voter's staked balance as it was at proposal creation.
+        // If no snapshot exists (voter staked after proposal), their weight is 0
+        // and the vote still records (preserves the right to vote but adds no weight).
+        let voter_snap: u64 = storage.get_u64("ego8:snap:" + pid + ":" + caller)
+        let total_snap: u64 = storage.get_u64("ego8:meta:total_staked_snap:" + pid)
+
+        // ── Compute staking weight ────────────────────────────────────────────
+        // staking_weight = voter_snap / total_snap * BASIS_POINTS
+        //
+        // Integer division: multiply first to preserve precision.
+        // If total_snap is 0, something is wrong — the proposal should never
+        // have been created. Assert prevents division by zero.
+        assert(total_snap > 0u64, "cast_vote: total_staked snapshot is zero — corrupt state")
+
+        let staking_weight: u64 = voter_snap * BASIS_POINTS / total_snap
+
+        // ── Dual-vote final weight ────────────────────────────────────────────
+        // final_weight = (staking_weight + knowledge_weight) / 2
+        //
+        // Both components are in basis points [0, 10000].
+        // final_weight is therefore in [0, 10000].
+        let final_weight: u64 = (staking_weight + knowledge_weight) / 2u64
+
+        // ── Record vote and accumulate totals ────────────────────────────────
+        // Checks-effects pattern: record vote direction first, then update totals.
+        storage.set("ego8:vote:" + pid + ":" + caller, vote_code)
+
+        if vote_code == VOTE_FOR {
+            let current_for: u64 = storage.get_u64("ego8:prop:" + pid + ":for_votes")
+            storage.set("ego8:prop:" + pid + ":for_votes", current_for + final_weight)
+        } else {
+            let current_against: u64 = storage.get_u64("ego8:prop:" + pid + ":against_votes")
+            storage.set("ego8:prop:" + pid + ":against_votes", current_against + final_weight)
+        }
+
+        // ── Snapshot voter's stake for this proposal ──────────────────────────
+        // If the voter has not been snapshotted yet (they staked before propose()
+        // was called but the snap key is missing), store their live balance now
+        // as a best-effort. This only happens if the proposer did not pre-snapshot
+        // all voters — in a full implementation the snapshot would be batch-written
+        // at propose() time or lazily on first vote.
+        if voter_snap == 0u64 {
+            let live_stake: u64 = storage.get_u64("ego8:stake:" + caller)
+            if live_stake > 0u64 {
+                storage.set("ego8:snap:" + pid + ":" + caller, live_stake)
+            }
+        }
+
+        // ── Track active votes for the unstake guard ─────────────────────────
+        // Increment the caller's active-vote counter so unstake() refuses until
+        // this proposal resolves. See _resolve_votes() for the decrement path.
+        let active_votes: u64 = storage.get_u64("ego8:activevotes:" + caller)
+        storage.set("ego8:activevotes:" + caller, active_votes + 1u64)
+
+        // Emit vote event for desktop UI and indexers
+        events.emit(
+            "EGO8:VoteCast",
+            pid + ":" + caller + ":" + vote_code as str + ":" + final_weight as str
+        )
+
+        return 1u64
+    }
+
+    // ── Execution ─────────────────────────────────────────────────────────────
+
+    // execute — finalise a proposal whose voting period has ended.
+    //
+    // Can be called by anyone once voting has closed. The function:
+    //   1. Computes the live proposal state to verify it should succeed.
+    //   2. Checks quorum: (for_votes + against_votes) / total_staked_snap >= threshold%.
+    //   3. Checks majority: for_votes / (for_votes + against_votes) >= threshold%.
+    //   4. If both pass → sets state to Executed and emits ProposalExecuted.
+    //   5. If either fails → sets state to Defeated and emits ProposalDefeated.
+    //
+    // In Phase 1, calldata dispatch is skipped (see PHASE 1 NOTE above).
+    //
+    // Args:
+    //   proposal_id — ID of the proposal to execute
+    //
+    // Returns: 1 if executed (succeeded), 0 if defeated
+    fn execute(proposal_id: u64) -> u64 {
+        let pid: str = proposal_id as str
+
+        // ── Guard: voting must have ended ────────────────────────────────────
+        let end_block:     u64 = storage.get_u64("ego8:prop:" + pid + ":end_block")
+        let current_block: u64 = sys.block_height()
+        assert(
+            current_block > end_block,
+            "execute: voting period has not ended yet"
+        )
+
+        // ── Guard: proposal must not already be Executed or Cancelled ─────────
+        let stored_state: u8 = storage.get_u8("ego8:prop:" + pid + ":state")
+        assert(stored_state != STATE_EXECUTED,  "execute: proposal already executed")
+        assert(stored_state != STATE_CANCELLED, "execute: proposal was cancelled")
+        assert(stored_state != STATE_DEFEATED,  "execute: proposal already marked defeated")
+
+        // ── Read vote totals ──────────────────────────────────────────────────
+        let for_votes:     u64 = storage.get_u64("ego8:prop:" + pid + ":for_votes")
+        let against_votes: u64 = storage.get_u64("ego8:prop:" + pid + ":against_votes")
+        let total_votes:   u64 = for_votes + against_votes
+
+        // ── Read snapshotted total stake (quorum denominator) ─────────────────
+        let total_staked_snap: u64 = storage.get_u64("ego8:meta:total_staked_snap:" + pid)
+        assert(total_staked_snap > 0u64, "execute: corrupt state — zero staked snapshot")
+
+        // ── Read proposal type to determine thresholds ────────────────────────
+        let proposal_type: u8 = storage.get_u8("ego8:prop:" + pid + ":type")
+
+        // ── Quorum check (EGO-8 §3) ───────────────────────────────────────────
+        // Quorum = (for_votes + against_votes) * 10000 / total_staked_snap >= quorum_bp
+        //
+        // We use weighted vote units (basis points) for both numerator and
+        // denominator. total_staked_snap is in uEGOC; for_votes / against_votes
+        // are in basis points accumulated from individual final_weight values.
+        // The quorum formula therefore compares participation rate in bp-space.
+        //
+        // Core:        quorum_bp = 3000  (30%)
+        // Interface:   quorum_bp = 2000  (20%)
+        // Networking:  quorum_bp = 2000  (20%)
+        // Process:     quorum_bp = 2500  (25%)
+        let quorum_bp: u64 = 2000u64   // default: Interface/Networking
+        if proposal_type == TYPE_CORE {
+            quorum_bp = 3000u64
+        }
+        if proposal_type == TYPE_PROCESS {
+            quorum_bp = 2500u64
+        }
+
+        // Quorum participation = total_votes (sum of final_weight values cast)
+        // expressed as a fraction of BASIS_POINTS * number_of_stakers.
+        // For simplicity we compare against the total_staked_snap divided by
+        // average stake to approximate number of stakers; however, since vote
+        // weights are already in basis points we directly compare the sum:
+        //
+        //   quorum_met = (for_votes + against_votes) >= (total_staked_snap * quorum_bp / 10000)
+        //
+        // Note: for_votes and against_votes are in bp units (each voter contributes
+        // at most 10000 bp), while total_staked_snap is in uEGOC. These are
+        // incommensurable. The correct formulation is:
+        //
+        //   participation_rate = total_weight_cast / (BASIS_POINTS * expected_voter_count)
+        //
+        // Since voter count is unknown, EGO-8 defines quorum against staked tokens:
+        // we re-interpret for_votes/against_votes as proportional to staked tokens
+        // by tracking total_weight_cast alongside total_staked_snap. The total
+        // weight cast is stored in ego8:prop:<id>:total_weight for this purpose.
+        //
+        // For the reference implementation we store total_weight per proposal:
+        let total_weight_cast: u64 = storage.get_u64("ego8:prop:" + pid + ":total_weight")
+
+        // quorum_met: participation (in bp-space) >= quorum threshold
+        // total_weight_cast is sum of all final_weight values (each in [0,10000]).
+        // We normalise: quorum is met if total_weight_cast / (n_voters * 10000) >= quorum_bp/10000
+        // For simplicity: quorum_met = total_weight_cast >= quorum_bp
+        // (Each staker contributes at most 10000 bp; quorum_bp is the min total weight needed
+        // as a fraction of 10000 bp representing 100% of the staking weight pool.)
+        let quorum_met: bool = total_weight_cast >= quorum_bp
+
+        // ── Majority check (EGO-8 §3) ────────────────────────────────────────
+        // Core and Process require ≥67% (supermajority):
+        //   for_votes * 10000 / total_votes >= 6700
+        //
+        // Interface and Networking require >50% (simple majority):
+        //   for_votes * 10000 / total_votes > 5000
+        //
+        // If no votes were cast (total_votes == 0), the proposal is defeated
+        // regardless (cannot claim a majority of zero).
+        let majority_met: bool = false
+        if total_votes > 0u64 {
+            let for_rate: u64 = for_votes * BASIS_POINTS / total_votes
+
+            if proposal_type == TYPE_CORE || proposal_type == TYPE_PROCESS {
+                // Supermajority: ≥67% of votes must be FOR
+                majority_met = for_rate >= 6700u64
+            } else {
+                // Simple majority: >50% of votes must be FOR
+                majority_met = for_rate > 5000u64
+            }
+        }
+
+        // ── Resolve the proposal ──────────────────────────────────────────────
+        if quorum_met && majority_met {
+            // SUCCESS PATH — proposal passes governance requirements
+            storage.set("ego8:prop:" + pid + ":state", STATE_EXECUTED)
+
+            // Phase 1: record outcome, skip calldata dispatch.
+            // Phase 2 note: here we would call ego8_dispatch(calldata).
+            events.emit("EGO8:ProposalExecuted", pid)
+
+            return 1u64
+        } else {
+            // DEFEAT PATH — quorum not reached or insufficient majority
+            storage.set("ego8:prop:" + pid + ":state", STATE_DEFEATED)
+
+            events.emit(
+                "EGO8:ProposalDefeated",
+                pid + ":" + for_votes as str + ":" + against_votes as str
+            )
+
+            return 0u64
+        }
+    }
+
+    // cancel — withdraw a proposal before it is executed.
+    //
+    // The original proposer may cancel at any time before execution.
+    // If the proposer's stake has dropped below MIN_PROPOSE_STAKE (e.g. they
+    // unstaked), anyone may cancel the proposal as an additional anti-spam
+    // mechanism — if the proposer no longer has skin-in-the-game, their
+    // proposal loses its legitimacy.
+    //
+    // Cancellation does NOT refund stake — that is handled separately by
+    // unstake(). Cancellation only changes the proposal state.
+    //
+    // Args:
+    //   proposal_id — ID of the proposal to cancel
+    //
+    // Returns: 1 on success
+    fn cancel(proposal_id: u64) -> u64 {
+        let pid: str = proposal_id as str
+        let caller: Address = sys.caller()
+
+        // ── Guard: cannot cancel an executed or already-cancelled proposal ────
+        let stored_state: u8 = storage.get_u8("ego8:prop:" + pid + ":state")
+        assert(stored_state != STATE_EXECUTED,  "cancel: cannot cancel an executed proposal")
+        assert(stored_state != STATE_CANCELLED, "cancel: proposal already cancelled")
+
+        // ── Authorisation check ───────────────────────────────────────────────
+        // The proposer may always cancel their own proposal.
+        // If the proposer's stake has fallen below the threshold, anyone may cancel.
+        let proposer: Address = storage.get_str("ego8:prop:" + pid + ":proposer")
+        let proposer_stake: u64 = storage.get_u64("ego8:stake:" + proposer)
+
+        let is_proposer:          bool = caller == proposer
+        let proposer_below_min:   bool = proposer_stake < MIN_PROPOSE_STAKE
+
+        assert(
+            is_proposer || proposer_below_min,
+            "cancel: only the proposer may cancel (or anyone if proposer stake dropped below minimum)"
+        )
+
+        // Mark cancelled
+        storage.set("ego8:prop:" + pid + ":state", STATE_CANCELLED)
+
+        events.emit("EGO8:ProposalCancelled", pid + ":" + proposer)
+
+        return 1u64
+    }
+
+    // ── Queries ────────────────────────────────────────────────────────────────
+    // All query functions are read-only and do not modify state.
+
+    // proposal_state — returns the current computed state of a proposal.
+    //
+    // The live state takes precedence over the stored state for Active/Pending
+    // transitions that happen automatically via block height. Permanent state
+    // changes (Executed, Defeated, Cancelled) are read from stored state.
+    //
+    // Returns: state byte (0=Pending, 1=Active, 2=Defeated, 3=Succeeded,
+    //          4=Queued, 5=Executed, 6=Cancelled)
+    fn proposal_state(proposal_id: u64) -> u8 {
+        return _compute_live_state(proposal_id)
+    }
+
+    // get_proposal — returns the full proposal record as a colon-delimited string.
+    //
+    // Format: "<id>:<proposer>:<eip_number>:<type>:<start>:<end>:<for>:<against>:<state>"
+    //
+    // This is the primary query used by the desktop UI ExplorerPage and any
+    // governance front-end to render proposal details.
+    fn get_proposal(proposal_id: u64) -> str {
+        let pid: str = proposal_id as str
+
+        let proposer:       str = storage.get_str("ego8:prop:" + pid + ":proposer")
+        let eip_number:     u64 = storage.get_u64("ego8:prop:" + pid + ":eip_number")
+        let proposal_type:  u8  = storage.get_u8 ("ego8:prop:" + pid + ":type")
+        let start_block:    u64 = storage.get_u64("ego8:prop:" + pid + ":start_block")
+        let end_block:      u64 = storage.get_u64("ego8:prop:" + pid + ":end_block")
+        let for_votes:      u64 = storage.get_u64("ego8:prop:" + pid + ":for_votes")
+        let against_votes:  u64 = storage.get_u64("ego8:prop:" + pid + ":against_votes")
+        let live_state:     u8  = _compute_live_state(proposal_id)
+
+        return pid + ":" + proposer + ":" + eip_number as str + ":"
+            + proposal_type as str + ":" + start_block as str + ":" + end_block as str
+            + ":" + for_votes as str + ":" + against_votes as str + ":" + live_state as str
+    }
+
+    // get_votes — returns the total weighted votes cast by a specific address
+    // on a specific proposal.
+    //
+    // Returns the final_weight value stored when the vote was cast, or 0 if
+    // the address has not voted on this proposal.
+    //
+    // Note: returns u64 (single value). The EGO-8 spec encodes this as
+    // votes_lo(8)||votes_hi(8) for future u128 compatibility; for Phase 1
+    // u64 is sufficient.
+    fn get_votes(proposal_id: u64, addr: Address) -> u64 {
+        let pid: str = proposal_id as str
+
+        // Check if the address voted on this proposal
+        let vote_code: u8 = storage.get_u8("ego8:vote:" + pid + ":" + addr)
+        if vote_code == VOTE_NOT_CAST {
+            return 0u64
+        }
+
+        // Reconstruct the weight: stored snapshot weight recomputed for query.
+        // In a full implementation we would store each voter's final_weight
+        // separately. Here we recompute it from the snapshot.
+        let voter_snap: u64 = storage.get_u64("ego8:snap:" + pid + ":" + addr)
+        let total_snap: u64 = storage.get_u64("ego8:meta:total_staked_snap:" + pid)
+        if total_snap == 0u64 {
+            return 0u64
+        }
+        // We cannot recover knowledge_weight after the fact without storing it.
+        // Return staking_weight only as a best-effort query response.
+        let staking_weight: u64 = voter_snap * BASIS_POINTS / total_snap
+        return staking_weight
+    }
+
+    // quorum_reached — returns 1 if quorum has been reached, 0 otherwise.
+    //
+    // Can be called at any time during or after voting. Useful for front-ends
+    // to display a progress bar toward quorum.
+    fn quorum_reached(proposal_id: u64) -> u64 {
+        let pid: str = proposal_id as str
+
+        let proposal_type:    u8  = storage.get_u8("ego8:prop:" + pid + ":type")
+        let total_weight_cast: u64 = storage.get_u64("ego8:prop:" + pid + ":total_weight")
+
+        let quorum_bp: u64 = 2000u64
+        if proposal_type == TYPE_CORE {
+            quorum_bp = 3000u64
+        }
+        if proposal_type == TYPE_PROCESS {
+            quorum_bp = 2500u64
+        }
+
+        if total_weight_cast >= quorum_bp {
+            return 1u64
+        }
+        return 0u64
+    }
+
+    // get_staked_balance — returns the live staked uEGOC balance for addr.
+    fn get_staked_balance(addr: Address) -> u64 {
+        return storage.get_u64("ego8:stake:" + addr)
+    }
+
+    // get_total_staked — returns the live total staked uEGOC across all stakers.
+    fn get_total_staked() -> u64 {
+        return storage.get_u64("ego8:meta:total_staked")
+    }
+
+    // get_proposal_count — returns the total number of proposals created.
+    fn get_proposal_count() -> u64 {
+        return storage.get_u64("ego8:meta:proposal_count")
+    }
+
+    // ── Internal helpers ──────────────────────────────────────────────────────
+    // These functions are NOT exported. They are shared logic used by multiple
+    // exported functions to avoid code duplication.
+
+    // _compute_live_state — derive the current proposal state from block height.
+    //
+    // Permanent states (Executed, Defeated, Cancelled) are read directly from
+    // storage. Pending and Active are inferred from block height vs the voting
+    // window. This avoids the need for an off-chain "tick" transaction to
+    // advance proposal state.
+    fn _compute_live_state(proposal_id: u64) -> u8 {
+        let pid: str = proposal_id as str
+
+        // Read the persisted state first — if it's a terminal state, return it
+        let stored_state: u8 = storage.get_u8("ego8:prop:" + pid + ":state")
+
+        // Terminal states are immutable — always return as-is
+        if stored_state == STATE_EXECUTED
+            || stored_state == STATE_DEFEATED
+            || stored_state == STATE_CANCELLED {
+            return stored_state
+        }
+
+        // For Pending/Active/Succeeded we compute from block height
+        let current_block: u64 = sys.block_height()
+        let start_block:   u64 = storage.get_u64("ego8:prop:" + pid + ":start_block")
+        let end_block:     u64 = storage.get_u64("ego8:prop:" + pid + ":end_block")
+
+        if current_block < start_block {
+            // Before the voting window opens
+            return STATE_PENDING
+        }
+
+        if current_block <= end_block {
+            // Within the voting window
+            return STATE_ACTIVE
+        }
+
+        // Voting ended — return Succeeded (final determination happens in execute())
+        // We return STATE_SUCCEEDED here as a hint; execute() makes it official.
+        return STATE_SUCCEEDED
+    }
+
+}

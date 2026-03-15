@@ -10,6 +10,7 @@ interface ContractInfo {
   deployer:    string;
   deployed_at: number;
   code_hash:   string;
+  abi:         string[];
 }
 
 interface DeployResult {
@@ -19,11 +20,19 @@ interface DeployResult {
 }
 
 interface CallResult {
-  success:      boolean;
-  return_value: number[];
-  ru_used:      number;
-  events:       { topic: string; data: number[] }[];
-  error:        string | null;
+  success:    boolean;
+  return_val: number[];
+  ru_used:    number;
+  events:     { contract: string; topic: string; payload: number[]; height: number; timestamp: number }[];
+  error:      string | null;
+}
+
+interface StoredEvent {
+  topic:        string;
+  payload_hex:  string;
+  timestamp:    number;
+  block_height: number;
+  entrypoint:   string;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -55,12 +64,32 @@ function hexToDisplay(hex: string): string {
   try {
     const bytes = hex.match(/.{1,2}/g)!.map(b => parseInt(b, 16));
     const text  = new TextDecoder().decode(new Uint8Array(bytes));
-    // Show text only if it's mostly printable
     const printable = text.replace(/[^\x20-\x7e]/g, '').length;
     return printable / Math.max(1, text.length) > 0.8 ? text : hex;
   } catch {
     return hex;
   }
+}
+
+/** Detect what kind of contract this is from its ABI signatures. */
+function detectContractType(abi: string[]): { label: string; color: string } | null {
+  const names = abi.map(s => s.split('(')[0].toLowerCase());
+  if (names.includes('transfer') && (names.includes('total_supply') || names.includes('balance_of'))) {
+    return { label: 'EGO-20', color: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/30' };
+  }
+  if (names.includes('vote_yes') || names.includes('vote') || names.includes('propose')) {
+    return { label: 'DAO', color: 'bg-violet-500/20 text-violet-300 border-violet-500/30' };
+  }
+  if (names.includes('mint') && names.includes('burn') && names.includes('total_supply')) {
+    return { label: 'Token', color: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/30' };
+  }
+  if (names.includes('release') || names.includes('refund')) {
+    return { label: 'Escrow', color: 'bg-teal-500/20 text-teal-300 border-teal-500/30' };
+  }
+  if (abi.length > 0) {
+    return { label: 'Custom', color: 'bg-blue-500/20 text-blue-300 border-blue-500/30' };
+  }
+  return null;
 }
 
 // ── Deploy tab ────────────────────────────────────────────────────────────────
@@ -210,6 +239,15 @@ const DeployTab: React.FC<{ onDeployed: () => void }> = ({ onDeployed }) => {
   );
 };
 
+// ── Genesis / well-known contracts ────────────────────────────────────────────
+
+const GENESIS_CONTRACTS = [
+  { name: 'EgoDAO',        address: 'egot1qdao000000000000000000000000000000001', standard: 'EGO-8',  icon: '🗳️' },
+  { name: 'EgoPriceFeed',  address: 'egot1qoracle00000000000000000000000000001', standard: 'EGO-9',  icon: '📊' },
+  { name: 'EgoBridge',     address: 'egot1qbridge00000000000000000000000000001', standard: 'EGO-10', icon: '🌉' },
+  { name: 'EGUSD',         address: 'egot1qegusd000000000000000000000000000001', standard: 'EGO-11', icon: '💵' },
+];
+
 // ── Interact tab ──────────────────────────────────────────────────────────────
 
 const InteractTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => {
@@ -220,6 +258,11 @@ const InteractTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => 
   const [busy,       setBusy]       = useState(false);
   const [result,     setResult]     = useState<CallResult | null>(null);
   const [error,      setError]      = useState('');
+
+  // ABI of the currently selected deployed contract
+  const selectedAbi = contracts.find(c => c.address === addr)?.abi ?? [];
+  // Filter out init — not callable post-deploy
+  const callableFns = selectedAbi.filter(s => !s.startsWith('init'));
 
   async function handleCall() {
     if (!addr)       { setError('Enter a contract address.'); return; }
@@ -242,6 +285,30 @@ const InteractTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => 
 
   return (
     <div className="space-y-5 max-w-lg">
+      {/* Genesis contracts quick-select */}
+      <div>
+        <div className="text-xs text-gray-500 font-medium mb-2">Testnet Genesis Contracts</div>
+        <div className="grid grid-cols-2 gap-2">
+          {GENESIS_CONTRACTS.map(gc => (
+            <button
+              key={gc.address}
+              onClick={() => setAddr(gc.address)}
+              className={`flex items-center gap-2 px-3 py-2 rounded-xl border text-left transition text-xs ${
+                addr === gc.address
+                  ? 'bg-blue-600/20 border-blue-500/50 text-blue-300'
+                  : 'bg-gray-800 border-gray-700 text-gray-300 hover:border-gray-500'
+              }`}
+            >
+              <span>{gc.icon}</span>
+              <div className="min-w-0">
+                <div className="font-medium truncate">{gc.name}</div>
+                <div className="text-gray-500">{gc.standard}</div>
+              </div>
+            </button>
+          ))}
+        </div>
+      </div>
+
       {/* Contract address */}
       <div>
         <label className="text-xs text-gray-400 block mb-1.5">Contract Address</label>
@@ -271,6 +338,32 @@ const InteractTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => 
           </div>
         )}
       </div>
+
+      {/* ABI quick-call buttons — shown when the selected contract has a known ABI */}
+      {callableFns.length > 0 && (
+        <div>
+          <div className="text-xs text-gray-500 font-medium mb-2">Contract Functions</div>
+          <div className="flex flex-wrap gap-1.5">
+            {callableFns.map((sig, i) => {
+              const name = sig.split('(')[0];
+              return (
+                <button
+                  key={i}
+                  onClick={() => setEntrypoint(name)}
+                  title={sig}
+                  className={`text-xs px-2.5 py-1 rounded-lg font-mono transition border ${
+                    entrypoint === name
+                      ? 'bg-purple-600 text-white border-purple-500'
+                      : 'bg-gray-800 text-gray-300 border-gray-700 hover:border-purple-500 hover:text-purple-300'
+                  }`}
+                >
+                  {sig}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Entrypoint */}
       <div>
@@ -338,8 +431,8 @@ const InteractTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => 
             <div>
               <div className="text-xs text-gray-400">Return value</div>
               <div className="font-mono text-xs text-white mt-0.5 break-all">
-                {result.return_value.length > 0
-                  ? hexToDisplay(bytesToHex(result.return_value))
+                {(result.return_val?.length ?? 0) > 0
+                  ? hexToDisplay(bytesToHex(result.return_val))
                   : '(empty)'}
               </div>
             </div>
@@ -348,15 +441,15 @@ const InteractTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => 
               <div className="text-yellow-400 font-mono text-xs mt-0.5">{result.ru_used.toLocaleString()}</div>
             </div>
           </div>
-          {result.events.length > 0 && (
+          {(result.events?.length ?? 0) > 0 && (
             <div>
               <div className="text-xs text-gray-400 mb-1.5">Events ({result.events.length})</div>
               <div className="space-y-1.5">
                 {result.events.map((ev, i) => (
                   <div key={i} className="bg-gray-900/60 rounded-xl px-3 py-2 text-xs font-mono">
                     <span className="text-blue-400">{ev.topic}</span>
-                    {ev.data.length > 0 && (
-                      <span className="text-gray-300 ml-2">{hexToDisplay(bytesToHex(ev.data))}</span>
+                    {(ev.payload?.length ?? 0) > 0 && (
+                      <span className="text-gray-300 ml-2">{hexToDisplay(bytesToHex(ev.payload))}</span>
                     )}
                   </div>
                 ))}
@@ -483,48 +576,195 @@ const StateTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => {
   );
 };
 
+// ── Events tab ────────────────────────────────────────────────────────────────
+
+const EventsTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => {
+  const [addr,   setAddr]   = useState('');
+  const [events, setEvents] = useState<StoredEvent[]>([]);
+  const [busy,   setBusy]   = useState(false);
+
+  const loadEvents = useCallback(async (a: string) => {
+    if (!a) return;
+    setBusy(true);
+    try {
+      const res = await invoke<StoredEvent[]>('get_contract_events', {
+        contractAddr: a,
+        limit: 50,
+      });
+      setEvents(res);
+    } catch {
+      setEvents([]);
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  useEffect(() => { loadEvents(addr); }, [addr, loadEvents]);
+
+  return (
+    <div className="space-y-5 max-w-lg">
+      <div>
+        <label className="text-xs text-gray-400 block mb-1.5">Contract Address</label>
+        <input
+          type="text"
+          value={addr}
+          onChange={e => setAddr(e.target.value.trim())}
+          placeholder="egot1… or hex address"
+          className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none font-mono transition"
+        />
+        {contracts.length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {contracts.map(c => (
+              <button
+                key={c.address}
+                onClick={() => setAddr(c.address)}
+                className={`text-xs px-2.5 py-1 rounded-lg transition ${
+                  addr === c.address
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                }`}
+              >
+                {c.name || truncAddr(c.address)}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {!addr ? (
+        <div className="text-center py-10 text-gray-500">
+          <div className="text-4xl mb-3">📋</div>
+          <div className="text-sm">Select a contract to view its event log</div>
+        </div>
+      ) : busy ? (
+        <div className="text-center py-8 text-gray-500 animate-pulse text-sm">Loading events…</div>
+      ) : events.length === 0 ? (
+        <div className="text-center py-10 text-gray-500">
+          <div className="text-3xl mb-2">🔇</div>
+          <div className="text-sm">No events recorded yet</div>
+          <div className="text-xs mt-1">Events are captured when you call contract functions</div>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <div className="text-xs text-gray-500 font-medium">{events.length} event{events.length !== 1 ? 's' : ''} (newest first)</div>
+          {events.map((ev, i) => (
+            <div key={i} className="bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-xs">
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-blue-400 font-mono font-semibold">{ev.topic}</span>
+                <span className="text-gray-500">{new Date(ev.timestamp * 1000).toLocaleTimeString()}</span>
+              </div>
+              <div className="text-gray-400 mb-1">
+                via <span className="text-purple-400 font-mono">{ev.entrypoint}()</span>
+                {' · '}block <span className="text-gray-300">{ev.block_height}</span>
+              </div>
+              {ev.payload_hex && (
+                <div className="font-mono text-gray-300 break-all bg-gray-900/60 rounded-lg px-2 py-1 mt-1">
+                  {hexToDisplay(ev.payload_hex)}
+                  {hexToDisplay(ev.payload_hex) !== ev.payload_hex && (
+                    <span className="text-gray-600 ml-2">(hex: {ev.payload_hex})</span>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ── Example contracts ─────────────────────────────────────────────────────────
 
 const EXAMPLES = [
   {
     icon: '🪙',
-    title: 'Fungible Token',
+    title: 'EGO-20 Token',
     color: 'from-yellow-500/20 to-orange-500/10 border-yellow-500/30',
     badge: 'bg-yellow-500/20 text-yellow-300',
-    badgeLabel: 'Finance',
-    description: 'Issue your own token on the Ego network with fixed supply, transfers, and balance queries.',
-    entrypoints: ['init(name, symbol, supply)', 'transfer(to, amount)', 'balance_of(addr)'],
-    useCases: ['Community currencies', 'In-app credits', 'Reward points'],
+    badgeLabel: 'EGO-20',
+    description: 'Issue your own fungible token with fixed supply, transfers, and allowances. The Ego standard for all fungible assets.',
+    entrypoints: ['init(name, symbol, supply)', 'transfer(to, amount)', 'approve(spender, amount)', 'balance_of(addr)'],
+    useCases: ['Community currencies', 'In-app credits', 'Governance tokens'],
+  },
+  {
+    icon: '💱',
+    title: 'DEX / AMM Pool',
+    color: 'from-blue-500/20 to-cyan-500/10 border-blue-500/30',
+    badge: 'bg-blue-500/20 text-blue-300',
+    badgeLabel: 'EGO-4',
+    description: 'Automated market maker using x×y=k constant product formula. Add liquidity, swap tokens, earn fees. Feeless for stakers.',
+    entrypoints: ['add_liquidity(token_a, token_b, amount_a, amount_b)', 'swap_exact_in(token_in, amount_in, min_out)', 'remove_liquidity(lp_amount)'],
+    useCases: ['Token swaps', 'Liquidity provision', 'LP yield farming'],
+  },
+  {
+    icon: '🏦',
+    title: 'Lending Pool',
+    color: 'from-green-500/20 to-teal-500/10 border-green-500/30',
+    badge: 'bg-green-500/20 text-green-300',
+    badgeLabel: 'EGO-13',
+    description: 'Overcollateralised lending. Suppliers earn yield. Borrowers post collateral. Health factor < 1.0 triggers liquidation.',
+    entrypoints: ['supply(asset, amount)', 'borrow(asset, amount)', 'repay(asset, amount)', 'get_health_factor(user)'],
+    useCases: ['Yield on idle tokens', 'Leverage trading', 'Stablecoin borrowing'],
+  },
+  {
+    icon: '🌾',
+    title: 'Yield Farm',
+    color: 'from-lime-500/20 to-green-500/10 border-lime-500/30',
+    badge: 'bg-lime-500/20 text-lime-300',
+    badgeLabel: 'EGO-19',
+    description: 'MasterChef-style liquidity mining. Stake LP tokens, earn EGOC rewards per block. Multiple pools with allocation points.',
+    entrypoints: ['add_pool(staking_token, alloc_points)', 'deposit(pool_id, amount)', 'harvest(pool_id)', 'pending_reward(pool_id, user)'],
+    useCases: ['Incentivize DEX pools', 'Protocol-owned liquidity', 'Bootstrap token distribution'],
+  },
+  {
+    icon: '🚀',
+    title: 'IDO Launchpad',
+    color: 'from-orange-500/20 to-red-500/10 border-orange-500/30',
+    badge: 'bg-orange-500/20 text-orange-300',
+    badgeLabel: 'EGO-22',
+    description: 'Token sale with soft cap / hard cap, pro-rata allocation if oversubscribed. Refunds if soft cap not met. 3% platform fee.',
+    entrypoints: ['create_sale(token, raise_token, price, soft_cap, hard_cap, start, end, supply)', 'participate(sale_id, amount)', 'claim_tokens(sale_id)', 'claim_refund(sale_id)'],
+    useCases: ['Project fundraising', 'Fair token launches', 'Community rounds'],
   },
   {
     icon: '🗳️',
-    title: 'DAO Voting',
-    color: 'from-blue-500/20 to-purple-500/10 border-blue-500/30',
-    badge: 'bg-blue-500/20 text-blue-300',
-    badgeLabel: 'Governance',
-    description: 'On-chain proposals and weighted voting. Any address can submit a proposal; votes are tallied by stake weight.',
-    entrypoints: ['propose(title, options)', 'vote(proposal_id, option)', 'tally(proposal_id)'],
-    useCases: ['Protocol upgrades', 'Fund allocation', 'Community decisions'],
+    title: 'DAO Governance',
+    color: 'from-violet-500/20 to-purple-500/10 border-violet-500/30',
+    badge: 'bg-violet-500/20 text-violet-300',
+    badgeLabel: 'EGO-8',
+    description: 'Full on-chain DAO with dual voting (staking + knowledge weight), quorum thresholds per category, and time-locked execution.',
+    entrypoints: ['propose(title, category, calldata)', 'vote(proposal_id, support)', 'queue(proposal_id)', 'execute(proposal_id)'],
+    useCases: ['Protocol upgrades', 'Treasury management', 'Parameter changes'],
+  },
+  {
+    icon: '🏛️',
+    title: 'Government Services',
+    color: 'from-slate-500/20 to-gray-500/10 border-slate-500/30',
+    badge: 'bg-slate-500/20 text-slate-300',
+    badgeLabel: 'EGO-15',
+    description: 'First L1-native government module: tax collection, public tenders, sovereign bonds, loan programs, and social grants.',
+    entrypoints: ['pay_tax(tax_id, period, amount)', 'publish_tender(title, budget, deadline)', 'participate_sale(sale_id, amount)', 'claim(program_id)'],
+    useCases: ['Tax payments', 'Public procurement', 'Citizen grants', 'Sovereign bonds'],
+  },
+  {
+    icon: '🏠',
+    title: 'Real Estate Token',
+    color: 'from-amber-500/20 to-yellow-500/10 border-amber-500/30',
+    badge: 'bg-amber-500/20 text-amber-300',
+    badgeLabel: 'EGO-3',
+    description: 'Tokenise real-world property as a deed + 1,000,000 fractional EGO-20 shares. KYC-gated transfers, rental income distribution.',
+    entrypoints: ['register_property(jurisdiction, cadastral_id, valuation)', 'transfer_shares(to, amount)', 'distribute_rental(amount)', 'set_kyc(addr, approved)'],
+    useCases: ['Property fractionalisation', 'REIT on-chain', 'Cross-border real estate'],
   },
   {
     icon: '🤝',
     title: 'Escrow',
-    color: 'from-green-500/20 to-teal-500/10 border-green-500/30',
-    badge: 'bg-green-500/20 text-green-300',
+    color: 'from-teal-500/20 to-cyan-500/10 border-teal-500/30',
+    badge: 'bg-teal-500/20 text-teal-300',
     badgeLabel: 'Payments',
-    description: 'Lock EGOC between two parties. Funds release automatically when both sides confirm delivery, or refund after a deadline.',
+    description: 'Lock EGOC between two parties. Funds release automatically when both confirm delivery, or refund after a deadline.',
     entrypoints: ['create(buyer, seller, amount, deadline)', 'confirm(escrow_id)', 'refund(escrow_id)'],
     useCases: ['P2P trades', 'Freelance payments', 'Marketplace deals'],
-  },
-  {
-    icon: '📁',
-    title: 'File Registry',
-    color: 'from-purple-500/20 to-pink-500/10 border-purple-500/30',
-    badge: 'bg-purple-500/20 text-purple-300',
-    badgeLabel: 'Storage',
-    description: 'Register CIDs on-chain with ownership proofs. Verify who owns a file, transfer ownership, and set access policies.',
-    entrypoints: ['register(cid, name)', 'transfer(cid, new_owner)', 'owner_of(cid)'],
-    useCases: ['Content ownership', 'Licensing NFTs', 'Provenance tracking'],
   },
 ];
 
@@ -538,7 +778,7 @@ const ExamplesSection: React.FC = () => {
         <span className="text-xs text-gray-500 font-medium px-2">What can you build?</span>
         <div className="h-px flex-1 bg-gray-700" />
       </div>
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-2 gap-3 max-h-[520px] overflow-y-auto pr-1">
         {EXAMPLES.map((ex, i) => (
           <div
             key={i}
@@ -581,7 +821,7 @@ const ExamplesSection: React.FC = () => {
         ))}
       </div>
       <p className="text-xs text-gray-500 mt-3 text-center">
-        Write contracts in Urego — a Rust-inspired language that compiles to WASM and runs on every Ego node.
+        10 standards built-in — write contracts in Urego (compiles to WASM) or deploy Solidity via EVM compatibility (EGO-12).
       </p>
     </div>
   );
@@ -604,34 +844,55 @@ const ContractsList: React.FC<{ contracts: ContractInfo[]; loading: boolean }> =
         <div className="text-center py-10 text-gray-500">
           <div className="text-5xl mb-4">📜</div>
           <div className="text-sm font-medium">No contracts deployed yet</div>
-          <div className="text-xs mt-1">Use the Deploy tab to upload a .wasm contract</div>
+          <div className="text-xs mt-1">Use the dApp IDE to write, compile, and deploy a Urego contract</div>
         </div>
       ) : (
         <div className="space-y-3">
-          {contracts.map(c => (
-            <div key={c.address} className="bg-gray-800 border border-gray-700 rounded-2xl p-5">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2 mb-1">
-                    <span className="text-base">📜</span>
-                    <span className="font-semibold text-white">{c.name || 'Unnamed Contract'}</span>
+          {contracts.map(c => {
+            const contractType = detectContractType(c.abi);
+            return (
+              <div key={c.address} className="bg-gray-800 border border-gray-700 rounded-2xl p-5">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 mb-1 flex-wrap">
+                      <span className="text-base">📜</span>
+                      <span className="font-semibold text-white">{c.name || 'Unnamed Contract'}</span>
+                      {contractType && (
+                        <span className={`text-xs px-2 py-0.5 rounded-lg border font-medium ${contractType.color}`}>
+                          {contractType.label}
+                        </span>
+                      )}
+                    </div>
+                    <div className="font-mono text-xs text-gray-400 break-all">{c.address}</div>
                   </div>
-                  <div className="font-mono text-xs text-gray-400 break-all">{c.address}</div>
+                  <div className="text-xs text-gray-500 shrink-0">{fmtDate(c.deployed_at)}</div>
                 </div>
-                <div className="text-xs text-gray-500 shrink-0">{fmtDate(c.deployed_at)}</div>
+                <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
+                  <div>
+                    <div className="text-gray-500 mb-0.5">Deployer</div>
+                    <div className="font-mono text-gray-300">{truncAddr(c.deployer)}</div>
+                  </div>
+                  <div>
+                    <div className="text-gray-500 mb-0.5">Code hash</div>
+                    <div className="font-mono text-gray-300">{c.code_hash.slice(0, 20)}…</div>
+                  </div>
+                </div>
+                {/* ABI preview */}
+                {c.abi.length > 0 && (
+                  <div className="mt-3">
+                    <div className="text-gray-500 text-xs mb-1.5">Functions ({c.abi.length})</div>
+                    <div className="flex flex-wrap gap-1">
+                      {c.abi.filter(s => !s.startsWith('init')).map((sig, i) => (
+                        <span key={i} className="font-mono text-xs bg-gray-900 text-gray-300 rounded px-2 py-0.5">
+                          {sig.split('(')[0]}()
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
-              <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
-                <div>
-                  <div className="text-gray-500 mb-0.5">Deployer</div>
-                  <div className="font-mono text-gray-300">{truncAddr(c.deployer)}</div>
-                </div>
-                <div>
-                  <div className="text-gray-500 mb-0.5">Code hash</div>
-                  <div className="font-mono text-gray-300">{c.code_hash.slice(0, 20)}…</div>
-                </div>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
       <ExamplesSection />
@@ -739,7 +1000,7 @@ const RollupBar: React.FC = () => {
 
 // ── ContractsPage ─────────────────────────────────────────────────────────────
 
-type Tab = 'contracts' | 'deploy' | 'interact' | 'state';
+type Tab = 'contracts' | 'deploy' | 'interact' | 'state' | 'events';
 
 const ContractsPage: React.FC = () => {
   const { wallet }                     = useWallet();
@@ -763,6 +1024,7 @@ const ContractsPage: React.FC = () => {
     { id: 'deploy',    label: 'Deploy',     icon: '🚀' },
     { id: 'interact',  label: 'Interact',   icon: '⚡' },
     { id: 'state',     label: 'Read State', icon: '🔎' },
+    { id: 'events',    label: 'Events',     icon: '📋' },
   ];
 
   return (
@@ -788,7 +1050,7 @@ const ContractsPage: React.FC = () => {
           <button
             key={t.id}
             onClick={() => setTab(t.id)}
-            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-sm font-medium transition ${
+            className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 rounded-xl text-xs font-medium transition ${
               tab === t.id
                 ? 'bg-blue-600 text-white shadow'
                 : 'text-gray-400 hover:text-white hover:bg-gray-700'
@@ -812,6 +1074,9 @@ const ContractsPage: React.FC = () => {
       )}
       {tab === 'state' && (
         <StateTab contracts={contracts} />
+      )}
+      {tab === 'events' && (
+        <EventsTab contracts={contracts} />
       )}
     </div>
   );

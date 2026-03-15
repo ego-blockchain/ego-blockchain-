@@ -16,6 +16,7 @@ import ExplorerPage from './pages/ExplorerPage';
 import SettingsPage from './pages/SettingsPage';
 import MessengerPage from './pages/MessengerPage';
 import ContractsPage from './pages/ContractsPage';
+import IDEPage from './pages/IDEPage';
 import RegistrationFlow from './components/RegistrationFlow';
 
 // ── Theme context ─────────────────────────────────────────────────────────────
@@ -359,6 +360,7 @@ function App() {
                 <Route path="settings"   element={<SettingsPage />} />
                 <Route path="messenger"  element={<MessengerPage />} />
                 <Route path="contracts" element={<ContractsPage />} />
+                <Route path="ide"       element={<IDEPage />} />
               </Route>
             </Routes>
           </div>

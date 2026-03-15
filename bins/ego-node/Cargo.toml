@@ -11,6 +11,7 @@ ego-rollup = { path = "../../crates/ego-rollup" }
 ego-consensus = { path = "../../crates/ego-consensus" }
 
 axum = { version = "0.7", features = ["json"] }
+async-trait = "0.1"
 tower-http = { version = "0.5", features = ["cors"] }
 
 anyhow.workspace = true

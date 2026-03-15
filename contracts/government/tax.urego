@@ -1,0 +1,143 @@
+// EGO-15: Government Services Standard
+// TaxCollector — on-chain tax payment and receipt issuance
+// Storage prefix: ego15t:
+
+contract TaxCollector {
+
+event TaxpayerRegistered(taxpayer: address, id_hash: String)
+event TaxPaid(taxpayer: address, tax_id: String, period: String, amount: u128, receipt_id: String)
+event RefundIssued(taxpayer: address, amount: u128, receipt_id: String, reason: String)
+
+// ── Initialisation ────────────────────────────────────────────────────────────
+
+pub fn init(authority_addr: address, treasury_addr: address) {
+    storage_set_address("ego15t:authority", authority_addr);
+    storage_set_address("ego15t:treasury", treasury_addr);
+    storage_set_u64("ego15t:receipt_count", 0);
+}
+
+// ── Administration ────────────────────────────────────────────────────────────
+
+// Register a taxpayer and bind their national-ID hash to their address.
+// Only the authority may call this.
+pub fn register_taxpayer(taxpayer: address, national_id_hash: String) {
+    _require_authority();
+    require(national_id_hash != "", "id_hash must not be empty");
+    let key: String = concat("ego15t:taxpayer:", concat(address_to_str(taxpayer), ":id_hash"));
+    storage_set_str(key, national_id_hash);
+    emit TaxpayerRegistered(taxpayer, national_id_hash);
+}
+
+// ── Tax payment ───────────────────────────────────────────────────────────────
+
+// Accept a tax payment from the caller.
+// Returns the newly minted receipt ID (e.g. "R42").
+pub fn pay_tax(tax_id: String, period: String, amount: u128) -> String {
+    require(amount > 0, "amount must be positive");
+
+    // Mint receipt ID
+    let count: u64 = storage_get_u64("ego15t:receipt_count");
+    let new_count: u64 = count + 1;
+    storage_set_u64("ego15t:receipt_count", new_count);
+    let receipt_id: String = concat("R", u64_to_str(new_count));
+
+    // Persist receipt fields
+    let payer: address = caller();
+    let rbase: String = concat("ego15t:receipt:", receipt_id);
+    storage_set_address(concat(rbase, ":payer"), payer);
+    storage_set_u128(concat(rbase, ":amount"), amount);
+    storage_set_str(concat(rbase, ":tax_id"), tax_id);
+    storage_set_str(concat(rbase, ":period"), period);
+    storage_set_bool(concat(rbase, ":refunded"), false);
+
+    // Accumulate total paid for this address
+    let bal_key: String = concat("ego15t:balance:", address_to_str(payer));
+    let prev: u128 = storage_get_u128(bal_key);
+    storage_set_u128(bal_key, prev + amount);
+
+    emit TaxPaid(payer, tax_id, period, amount, receipt_id);
+    return receipt_id;
+}
+
+// ── Refund ────────────────────────────────────────────────────────────────────
+
+// Issue a refund against a previously paid receipt.
+// Only the authority may call this; each receipt may be refunded at most once.
+pub fn issue_refund(taxpayer: address, receipt_id: String, amount: u128, reason: String) {
+    _require_authority();
+    require(amount > 0, "refund amount must be positive");
+
+    let rbase: String = concat("ego15t:receipt:", receipt_id);
+    let already: bool = storage_get_bool(concat(rbase, ":refunded"));
+    require(!already, "receipt already refunded");
+
+    // Verify the receipt belongs to this taxpayer
+    let stored_payer: address = storage_get_address(concat(rbase, ":payer"));
+    require(stored_payer == taxpayer, "taxpayer mismatch");
+
+    storage_set_bool(concat(rbase, ":refunded"), true);
+
+    emit RefundIssued(taxpayer, amount, receipt_id, reason);
+}
+
+// ── View functions ────────────────────────────────────────────────────────────
+
+// Deterministic helper: given a sequence number n, return the receipt ID.
+pub fn get_receipt_id_for_count(n: u64) -> String {
+    return concat("R", u64_to_str(n));
+}
+
+// Return the total amount (uEGOC) paid by a taxpayer across all receipts.
+pub fn get_taxpayer_paid(taxpayer: address) -> u128 {
+    let bal_key: String = concat("ego15t:balance:", address_to_str(taxpayer));
+    return storage_get_u128(bal_key);
+}
+
+// Return true if the address has been registered with a national-ID hash.
+pub fn is_registered(taxpayer: address) -> bool {
+    let key: String = concat("ego15t:taxpayer:", concat(address_to_str(taxpayer), ":id_hash"));
+    let hash: String = storage_get_str(key);
+    return hash != "";
+}
+
+// Return the authority address.
+pub fn get_authority() -> address {
+    return storage_get_address("ego15t:authority");
+}
+
+// Return the treasury address.
+pub fn get_treasury() -> address {
+    return storage_get_address("ego15t:treasury");
+}
+
+// Return the total number of receipts issued so far.
+pub fn get_receipt_count() -> u64 {
+    return storage_get_u64("ego15t:receipt_count");
+}
+
+// Return a single receipt's payer address.
+pub fn get_receipt_payer(receipt_id: String) -> address {
+    let rbase: String = concat("ego15t:receipt:", receipt_id);
+    return storage_get_address(concat(rbase, ":payer"));
+}
+
+// Return a single receipt's paid amount.
+pub fn get_receipt_amount(receipt_id: String) -> u128 {
+    let rbase: String = concat("ego15t:receipt:", receipt_id);
+    return storage_get_u128(concat(rbase, ":amount"));
+}
+
+// Return whether a receipt has been refunded.
+pub fn get_receipt_refunded(receipt_id: String) -> bool {
+    let rbase: String = concat("ego15t:receipt:", receipt_id);
+    return storage_get_bool(concat(rbase, ":refunded"));
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn _require_authority() {
+    let auth: address = storage_get_address("ego15t:authority");
+    require(caller() == auth, "caller is not authority");
+}
+
+}

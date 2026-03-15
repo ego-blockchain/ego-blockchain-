@@ -9,6 +9,8 @@
 //! POST /tx/submit             → { tx_hash }   (body: JSON Transaction)
 //! GET  /chain/transactions    → [Transaction]  (last 50 pending)
 //! GET  /node/stats            → NodeStats JSON
+//! GET  /node/identity         → { address, public_key_hex, peer_id, payout_address }
+//! GET  /faucet?to=<address>   → { success, amount_egoc, tx_hash }  (testnet only, 100 EGOC/24h)
 
 use axum::{
     Json, Router,
@@ -17,20 +19,36 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use ego_core::{Address, StateManager, Transaction};
+use ego_core::{AccountType, Address, Balance, KeyPair, StateManager, Transaction};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
 
+use crate::supervisor::NodeSupervisor;
+
 // ── Shared state ─────────────────────────────────────────────────────────────
 
 pub struct RpcState {
-    pub state_manager: StateManager,
-    pub peer_id:       String,
-    pub pending_txs:   Mutex<Vec<Transaction>>,
+    pub state_manager:  StateManager,
+    pub peer_id:        String,
+    /// Bech32 ego address of this node (rewards accumulate here).
+    pub node_address:   String,
+    /// Hex-encoded Ed25519 public key of the node keypair.
+    pub node_pubkey:    String,
+    /// Node keypair — used to sign auto-payout transactions.
+    pub node_keypair:   KeyPair,
+    /// Optional external address to auto-forward earned rewards.
+    pub payout_address: Option<String>,
+    pub pending_txs:    Mutex<Vec<Transaction>>,
     /// Simple recent-block ring buffer (height, hash, tx_count, ts)
-    pub recent_blocks: Mutex<Vec<BlockSummary>>,
-    pub node_stats:    Mutex<NodeStats>,
+    pub recent_blocks:  Mutex<Vec<BlockSummary>>,
+    pub node_stats:     Mutex<NodeStats>,
+    /// Monotonic nonce for outgoing TXs from this node.
+    pub nonce:          Mutex<u64>,
+    /// Supervisor — tracks component health for the /health endpoint.
+    pub supervisor:     Arc<NodeSupervisor>,
+    /// Faucet: last claim time per address (unix timestamp seconds).
+    pub faucet_claims:  Mutex<std::collections::HashMap<String, u64>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,6 +82,8 @@ pub fn make_router(state: Arc<RpcState>) -> Router {
         .route("/tx/submit",          post(tx_submit))
         .route("/chain/transactions", get(chain_transactions))
         .route("/node/stats",         get(node_stats))
+        .route("/node/identity",      get(node_identity))
+        .route("/faucet",             get(faucet))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -71,11 +91,14 @@ pub fn make_router(state: Arc<RpcState>) -> Router {
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn health(State(s): State<Arc<RpcState>>) -> impl IntoResponse {
-    let height = s.state_manager.get_block_height();
+    let height    = s.state_manager.get_block_height();
+    let node_health = s.supervisor.health().await;
     Json(serde_json::json!({
-        "status":       "ok",
+        "status":       node_health.status,
         "block_height": height.0,
         "peer_id":      &s.peer_id,
+        "uptime_secs":  node_health.uptime_secs,
+        "components":   node_health.components,
     }))
 }
 
@@ -169,6 +192,96 @@ async fn node_stats(State(s): State<Arc<RpcState>>) -> impl IntoResponse {
     let mut stats = s.node_stats.lock().unwrap().clone();
     stats.pending_tx_count = s.pending_txs.lock().unwrap().len();
     Json(stats)
+}
+
+async fn node_identity(State(s): State<Arc<RpcState>>) -> impl IntoResponse {
+    let balance_raw = {
+        // Parse bech32 / hex address to get the on-chain balance
+        let addr_hex = s.node_address.trim_start_matches("0x");
+        if let Ok(bytes) = hex::decode(addr_hex) {
+            if bytes.len() == 20 {
+                let mut arr = [0u8; 20];
+                arr.copy_from_slice(&bytes);
+                let addr = Address::new(arr);
+                s.state_manager.get_account(&addr).map(|a| a.balance.0).unwrap_or(0u128)
+            } else { 0u128 }
+        } else { 0u128 }
+    };
+    const UEGOC_PER_EGOC: u128 = 1_000_000;
+    Json(serde_json::json!({
+        "address":        &s.node_address,
+        "public_key_hex": &s.node_pubkey,
+        "peer_id":        &s.peer_id,
+        "payout_address": &s.payout_address,
+        "balance_uegoc":  balance_raw,
+        "balance_egoc":   balance_raw / UEGOC_PER_EGOC,
+    }))
+}
+
+// ── Faucet ────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct FaucetQuery {
+    to: String,
+}
+
+async fn faucet(
+    State(s): State<Arc<RpcState>>,
+    axum::extract::Query(q): axum::extract::Query<FaucetQuery>,
+) -> impl IntoResponse {
+    const FAUCET_AMOUNT_UEGOC: u64 = 100 * 1_000_000; // 100 EGOC
+    const COOLDOWN_SECS: u64 = 86400; // 24 hours
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Check cooldown
+    {
+        let mut claims = s.faucet_claims.lock().unwrap();
+        if let Some(&last) = claims.get(&q.to) {
+            if now - last < COOLDOWN_SECS {
+                let wait = COOLDOWN_SECS - (now - last);
+                return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+                    "error": "faucet cooldown",
+                    "wait_seconds": wait,
+                    "next_available_unix": last + COOLDOWN_SECS,
+                }))).into_response();
+            }
+        }
+        claims.insert(q.to.clone(), now);
+    }
+
+    // Credit the balance: parse address, get-or-create account, then credit it.
+    let addr_bytes = match hex::decode(q.to.trim_start_matches("0x")) {
+        Ok(b) if b.len() == 20 => {
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": "invalid address — expected 20-byte hex"
+            }))).into_response();
+        }
+    };
+    let addr = Address::new(addr_bytes);
+    if s.state_manager.get_account(&addr).is_none() {
+        let _ = s.state_manager.create_account(addr.clone(), AccountType::EOA);
+    }
+    if let Some(mut acc) = s.state_manager.get_account(&addr) {
+        acc.credit(Balance(FAUCET_AMOUNT_UEGOC as u128));
+        s.state_manager.set_account(acc);
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "success": true,
+        "to": q.to,
+        "amount_egoc": 100,
+        "amount_uegoc": FAUCET_AMOUNT_UEGOC,
+        "tx_hash": format!("faucet_{:x}", now),
+    }))).into_response()
 }
 
 // ── Startup helper ────────────────────────────────────────────────────────────

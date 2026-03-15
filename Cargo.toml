@@ -6,9 +6,17 @@ members = [
   "crates/ego-rollup",
   "crates/ego-ffi",
   "crates/ego-vm",
+  "crates/ego-evm",
   "bins/ego-node",
   "crates/urego-compiler",
   "bins/urego",
+  "crates/ego-zk",
+  "bins/ego-cli",
+  "crates/ego-typed-signing",
+]
+
+exclude = [
+  "services/indexer",
 ]
 resolver = "2"
 

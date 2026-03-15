@@ -1,0 +1,443 @@
+// SPDX: MIT
+// EGO-7 Social Recovery Wallet — Reference Implementation
+// Standard: EGO-7 Account Abstraction
+//
+// Social Recovery Flow
+// ====================
+// This wallet is owned by a single address (the "owner") and protected by a
+// set of trusted "guardians" (e.g. friends, family, a hardware device).
+//
+// Normal operation: only the owner can call execute().
+//
+// Recovery when the owner loses their key:
+//   1. Any guardian calls initiate_recovery(new_owner).
+//      A recovery record is created with the current timestamp.
+//   2. Additional guardians call confirm_recovery(recovery_id) until
+//      the guardian threshold is reached.
+//   3. After both (a) enough confirmations AND (b) 48 hours have elapsed
+//      since initiation, anyone can call execute_recovery(recovery_id).
+//      Ownership transfers to new_owner.
+//   4. If the original owner is still alive and did NOT authorise the
+//      recovery, they can call cancel_recovery(recovery_id) at any time
+//      before execute_recovery succeeds. The 48-hour window is exactly
+//      this cancellation window.
+//
+// Guardian management: only the current owner can add or remove guardians.
+// The guardian threshold can also be updated by the owner.
+//
+// Storage uses ego7: prefix (EGO-7 §2).
+
+// ---------------------------------------------------------------------------
+// Storage layout
+//
+// ego7:owner:current               → address (the single owner)
+// ego7:threshold:value             → u32 LE  (guardian sigs needed for recovery)
+// ego7:guardian:<address>          → 1 byte  (is guardian flag)
+// ego7:guardian:count              → u32 LE
+// ego7:nonce:value                 → u64 LE  (replay-protection for execute)
+// ego7:recovery:<id>:owner         → new owner address bytes
+// ego7:recovery:<id>:initiated     → i64 LE  (Unix timestamp of initiation)
+// ego7:recovery:<id>:sigs          → u32 LE  (number of confirmations so far)
+// ego7:recovery:<id>:confirmed:<g> → 1 byte  (has guardian g confirmed id?)
+// ego7:recovery:<id>:initiator     → address (the guardian who started it)
+// ---------------------------------------------------------------------------
+
+// RECOVERY_DELAY_SECS: 48 hours in seconds.
+// This constant enforces the minimum window the owner has to cancel a
+// malicious or mistaken recovery attempt.
+const RECOVERY_DELAY_SECS: i64 = 172800
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+
+// Deploy a social recovery wallet.
+//   owner              — the initial owner address
+//   guardians          — list of trusted guardian addresses
+//   recovery_threshold — how many guardians must confirm before recovery executes
+//
+// Reverts if:
+//   - owner is zero address
+//   - guardians list is empty
+//   - recovery_threshold is 0 or > guardian count
+fn init(owner: address, guardians: [address], recovery_threshold: u32) {
+    assert(owner != ZERO_ADDR)
+    let n = guardians.len() as u32
+    assert(n > 0)
+    assert(recovery_threshold >= 1)
+    assert(recovery_threshold <= n)
+
+    storage.set("ego7:owner", "current", owner)
+    storage.set("ego7:threshold", "value", u32_to_le(recovery_threshold))
+    storage.set("ego7:nonce", "value", u64_to_le(0))
+
+    let i: u32 = 0
+    for guardian in guardians {
+        assert(guardian != ZERO_ADDR)
+        assert(guardian != owner)        // owner should not be their own guardian
+        storage.set("ego7:guardian", guardian, [1u8])
+        i += 1
+    }
+    storage.set("ego7:guardian", "count", u32_to_le(n))
+
+    events.emit("EGO7:OwnerAdded", concat(sys.self(), ":", owner))
+    for guardian in guardians {
+        events.emit("EGO7:GuardianAdded", concat(sys.self(), ":", guardian))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+fn _owner() -> address {
+    return storage.get("ego7:owner", "current")
+}
+
+fn _is_guardian(addr: address) -> bool {
+    let flag = storage.get("ego7:guardian", addr)
+    return flag != nil
+}
+
+fn _guardian_threshold() -> u32 {
+    return le_to_u32(storage.get("ego7:threshold", "value"))
+}
+
+fn _nonce() -> u64 {
+    return le_to_u64(storage.get("ego7:nonce", "value"))
+}
+
+fn _bump_nonce() {
+    let n = _nonce()
+    storage.set("ego7:nonce", "value", u64_to_le(n + 1))
+}
+
+// ---------------------------------------------------------------------------
+// IAccount — required exports (EGO-7 §1)
+// ---------------------------------------------------------------------------
+
+fn get_nonce() -> u64 {
+    return _nonce()
+}
+
+// A social recovery wallet has a single owner; threshold = 1.
+fn get_threshold() -> u32 {
+    return 1u32
+}
+
+fn get_owners() -> [address] {
+    return [_owner()]
+}
+
+// validate_tx: verify the owner's signature on tx_hash.
+// Returns true iff the single owner signed correctly.
+fn validate_tx(tx_hash: bytes, signatures: [bytes]) -> bool {
+    assert(signatures.len() >= 1)
+    let signer = sys.ecrecover(tx_hash, signatures[0])
+    return signer == _owner()
+}
+
+// ---------------------------------------------------------------------------
+// execute — owner-only transaction execution
+// ---------------------------------------------------------------------------
+
+// Execute a transaction from this account.
+// Only the owner may call this. The owner signs:
+//   tx_hash = blake2(nonce_u64_le || to || value_u128_le || data)
+//
+// Nonce increments unconditionally (prevents replay of failures).
+fn execute(to: address, value: u128, data: bytes, signature: bytes) -> bool {
+    let nonce = _nonce()
+    let tx_hash = sys.blake2(
+        concat(u64_to_le(nonce), to, u128_to_le(value), data)
+    )
+
+    let signer = sys.ecrecover(tx_hash, signature)
+    _bump_nonce()
+    assert(signer == _owner())
+
+    let success = sys.call(to, value, data)
+
+    events.emit(
+        "EGO7:Executed",
+        concat(sys.self(), ":", to, ":", u128_to_str(value), ":", sys.caller())
+    )
+
+    return success
+}
+
+// execute_batch — owner-only batch execution (non-atomic per item)
+fn execute_batch(ops: [{to: address, value: u128, data: bytes}], signature: bytes) -> u32 {
+    let nonce = _nonce()
+    let batch_payload: bytes = u64_to_le(nonce)
+    for op in ops {
+        batch_payload = concat(batch_payload, op.to, u128_to_le(op.value), op.data)
+    }
+    let tx_hash = sys.blake2(batch_payload)
+
+    let signer = sys.ecrecover(tx_hash, signature)
+    _bump_nonce()
+    assert(signer == _owner())
+
+    let success_count: u32 = 0
+    let total = ops.len() as u32
+    for op in ops {
+        let ok = sys.call(op.to, op.value, op.data)
+        if ok { success_count += 1 }
+    }
+
+    events.emit(
+        "EGO7:BatchExecuted",
+        concat(sys.self(), ":", u32_to_str(success_count), ":", u32_to_str(total))
+    )
+    return success_count
+}
+
+// ---------------------------------------------------------------------------
+// Guardian management — owner-only
+// ---------------------------------------------------------------------------
+
+// add_guardian: the owner registers a new guardian.
+// Cannot add the zero address or the owner themselves.
+fn add_guardian(guardian: address) -> bool {
+    assert(sys.caller() == _owner())
+    assert(guardian != ZERO_ADDR)
+    assert(guardian != _owner())
+    let existing = storage.get("ego7:guardian", guardian)
+    assert(existing == nil)    // already a guardian
+
+    let count = le_to_u32(storage.get("ego7:guardian", "count"))
+    storage.set("ego7:guardian", guardian, [1u8])
+    storage.set("ego7:guardian", "count", u32_to_le(count + 1))
+
+    events.emit("EGO7:GuardianAdded", concat(sys.self(), ":", guardian))
+    return true
+}
+
+// remove_guardian: the owner removes a guardian.
+// Reverts if removal would leave threshold > guardian count.
+fn remove_guardian(guardian: address) -> bool {
+    assert(sys.caller() == _owner())
+    let is_g = storage.get("ego7:guardian", guardian)
+    assert(is_g != nil)
+
+    let count = le_to_u32(storage.get("ego7:guardian", "count"))
+    let threshold = _guardian_threshold()
+    // Prevent locking the wallet: must always be able to reach threshold
+    assert(threshold <= count - 1)
+
+    storage.del("ego7:guardian", guardian)
+    storage.set("ego7:guardian", "count", u32_to_le(count - 1))
+
+    events.emit("EGO7:GuardianRemoved", concat(sys.self(), ":", guardian))
+    return true
+}
+
+// change_recovery_threshold: owner updates how many guardians must confirm.
+fn change_recovery_threshold(new_threshold: u32) -> bool {
+    assert(sys.caller() == _owner())
+    let count = le_to_u32(storage.get("ego7:guardian", "count"))
+    assert(new_threshold >= 1)
+    assert(new_threshold <= count)
+    storage.set("ego7:threshold", "value", u32_to_le(new_threshold))
+    events.emit(
+        "EGO7:ThresholdChanged",
+        concat(sys.self(), ":", u32_to_str(_guardian_threshold()), ":", u32_to_str(new_threshold))
+    )
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Recovery flow
+// ---------------------------------------------------------------------------
+
+// initiate_recovery: a guardian starts the recovery process.
+//
+// Step 1 of the recovery flow. Any single guardian can call this.
+// A recovery record is created with:
+//   - the proposed new owner address
+//   - the current timestamp (starts the 48-hour clock)
+//   - sig count = 1 (the initiating guardian counts as a confirmation)
+//
+// Recovery ID is derived from blake2(new_owner || timestamp) so that
+// multiple concurrent recovery attempts (e.g. two guardians proposing
+// different new owners) have distinct IDs.
+//
+// The initiating guardian's confirmation is recorded immediately.
+fn initiate_recovery(new_owner: address) -> bytes {
+    // Only guardians may initiate
+    assert(_is_guardian(sys.caller()))
+    assert(new_owner != ZERO_ADDR)
+    assert(new_owner != _owner())    // no-op recovery not allowed
+
+    let now: i64 = sys.timestamp()
+    let recovery_id = sys.blake2(concat(new_owner, i64_to_le(now), sys.caller()))
+    let id_hex = bytes_to_hex(recovery_id)
+
+    // Ensure no active recovery with this ID already exists
+    let existing = storage.get("ego7:recovery", concat(id_hex, ":initiated"))
+    assert(existing == nil)
+
+    // Write recovery record
+    storage.set("ego7:recovery", concat(id_hex, ":owner"), new_owner)
+    storage.set("ego7:recovery", concat(id_hex, ":initiated"), i64_to_le(now))
+    storage.set("ego7:recovery", concat(id_hex, ":sigs"), u32_to_le(1))
+    storage.set("ego7:recovery", concat(id_hex, ":initiator"), sys.caller())
+
+    // Record the initiating guardian's confirmation
+    storage.set(
+        "ego7:recovery",
+        concat(id_hex, ":confirmed:", sys.caller()),
+        [1u8]
+    )
+
+    events.emit(
+        "EGO7:RecoveryInitiated",
+        concat(sys.self(), ":", id_hex, ":", new_owner, ":", sys.caller())
+    )
+
+    // If threshold is 1, recovery can proceed immediately after the delay
+    return recovery_id
+}
+
+// confirm_recovery: an additional guardian confirms an in-progress recovery.
+//
+// Step 2 of the recovery flow (repeated until threshold is reached).
+// The same guardian cannot confirm twice. Returns the new confirmation count.
+fn confirm_recovery(recovery_id: bytes) -> u32 {
+    assert(_is_guardian(sys.caller()))
+
+    let id_hex = bytes_to_hex(recovery_id)
+
+    // Recovery must exist
+    let initiated_raw = storage.get("ego7:recovery", concat(id_hex, ":initiated"))
+    assert(initiated_raw != nil)
+
+    // Guardian must not have already confirmed
+    let already = storage.get(
+        "ego7:recovery",
+        concat(id_hex, ":confirmed:", sys.caller())
+    )
+    assert(already == nil)
+
+    // Record confirmation
+    storage.set(
+        "ego7:recovery",
+        concat(id_hex, ":confirmed:", sys.caller()),
+        [1u8]
+    )
+
+    let sigs = le_to_u32(storage.get("ego7:recovery", concat(id_hex, ":sigs")))
+    let new_sigs = sigs + 1
+    storage.set("ego7:recovery", concat(id_hex, ":sigs"), u32_to_le(new_sigs))
+
+    events.emit(
+        "EGO7:RecoveryConfirmed",
+        concat(
+            sys.self(), ":", id_hex, ":",
+            sys.caller(), ":", u32_to_str(new_sigs)
+        )
+    )
+
+    return new_sigs
+}
+
+// execute_recovery: finalise the recovery and transfer ownership.
+//
+// Step 3 — the last step of the recovery flow.
+// Can be called by anyone (typically the new owner or a guardian) once:
+//   (a) The confirmation count >= guardian threshold, AND
+//   (b) At least 48 hours have elapsed since initiation.
+//
+// The 48-hour delay is the owner's cancellation window (see cancel_recovery).
+// Both conditions MUST be satisfied simultaneously.
+fn execute_recovery(recovery_id: bytes) -> bool {
+    let id_hex = bytes_to_hex(recovery_id)
+
+    let initiated_raw = storage.get("ego7:recovery", concat(id_hex, ":initiated"))
+    assert(initiated_raw != nil)
+
+    let initiated: i64 = le_to_i64(initiated_raw)
+    let now: i64 = sys.timestamp()
+
+    // Enforce the 48-hour delay
+    assert(now >= initiated + RECOVERY_DELAY_SECS)
+
+    // Enforce the confirmation threshold
+    let sigs = le_to_u32(storage.get("ego7:recovery", concat(id_hex, ":sigs")))
+    let threshold = _guardian_threshold()
+    assert(sigs >= threshold)
+
+    let new_owner: address = storage.get("ego7:recovery", concat(id_hex, ":owner"))
+    let old_owner: address = _owner()
+
+    // Transfer ownership
+    storage.set("ego7:owner", "current", new_owner)
+
+    // Clean up recovery record to free storage
+    storage.del("ego7:recovery", concat(id_hex, ":owner"))
+    storage.del("ego7:recovery", concat(id_hex, ":initiated"))
+    storage.del("ego7:recovery", concat(id_hex, ":sigs"))
+    storage.del("ego7:recovery", concat(id_hex, ":initiator"))
+
+    events.emit(
+        "EGO7:RecoveryCompleted",
+        concat(sys.self(), ":", id_hex, ":", old_owner, ":", new_owner)
+    )
+
+    return true
+}
+
+// cancel_recovery: the current owner aborts a recovery attempt.
+//
+// This is the owner's defence against guardian collusion or an honest mistake.
+// The owner has the full 48-hour window from initiation to call this.
+// After execute_recovery succeeds, this is a no-op (record already deleted).
+fn cancel_recovery(recovery_id: bytes) -> bool {
+    // Only the current owner can cancel
+    assert(sys.caller() == _owner())
+
+    let id_hex = bytes_to_hex(recovery_id)
+
+    let initiated_raw = storage.get("ego7:recovery", concat(id_hex, ":initiated"))
+    assert(initiated_raw != nil)    // recovery must exist
+
+    // Delete the recovery record
+    storage.del("ego7:recovery", concat(id_hex, ":owner"))
+    storage.del("ego7:recovery", concat(id_hex, ":initiated"))
+    storage.del("ego7:recovery", concat(id_hex, ":sigs"))
+    storage.del("ego7:recovery", concat(id_hex, ":initiator"))
+
+    events.emit(
+        "EGO7:RecoveryCancelled",
+        concat(sys.self(), ":", id_hex, ":", sys.caller())
+    )
+
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Read-only queries (for UIs and other contracts)
+// ---------------------------------------------------------------------------
+
+// is_guardian: check whether an address is a registered guardian.
+fn is_guardian(addr: address) -> bool {
+    return _is_guardian(addr)
+}
+
+// recovery_status: return current sig count and time remaining for a recovery.
+// Returns (sigs, seconds_until_executable). If sigs == 0 record does not exist.
+fn recovery_status(recovery_id: bytes) -> (u32, i64) {
+    let id_hex = bytes_to_hex(recovery_id)
+    let initiated_raw = storage.get("ego7:recovery", concat(id_hex, ":initiated"))
+    if initiated_raw == nil {
+        return (0u32, 0i64)
+    }
+    let initiated: i64 = le_to_i64(initiated_raw)
+    let sigs = le_to_u32(storage.get("ego7:recovery", concat(id_hex, ":sigs")))
+    let now: i64 = sys.timestamp()
+    let unlock_at: i64 = initiated + RECOVERY_DELAY_SECS
+    let remaining: i64 = unlock_at - now
+    if remaining < 0 { remaining = 0 }
+    return (sigs, remaining)
+}

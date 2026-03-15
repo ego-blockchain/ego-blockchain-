@@ -186,12 +186,15 @@ fn main() {
             commands::consensus::get_post_score,
             commands::consensus::get_combined_drs,
             commands::consensus::get_tokenomics,
+            commands::contracts::compile_urego,
             commands::contracts::deploy_contract,
             commands::contracts::call_contract,
             commands::contracts::get_contract_state,
             commands::contracts::list_deployed_contracts,
+            commands::contracts::get_contract_events,
             commands::rollup::get_rollup_status,
-            commands::rollup::get_shard_stats
+            commands::rollup::get_shard_stats,
+            commands::wallet::query_remote_node
         ])
         .setup(|app| {
             // Show the window only after the frontend signals it's ready,

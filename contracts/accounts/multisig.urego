@@ -1,0 +1,313 @@
+// SPDX: MIT
+// EGO-7 Multi-Sig Wallet — Reference Implementation
+// Standard: EGO-7 Account Abstraction
+//
+// M-of-N Threshold Pattern
+// ========================
+// "M-of-N" means: there are N owners, and any M of them must co-sign a
+// transaction before it executes. For example, a 2-of-3 wallet has three
+// owners; any two must sign. This removes the single point of failure of a
+// regular wallet: an attacker must compromise M separate keys simultaneously.
+//
+// Deployment: call init(owners, threshold) once. The contract address
+// becomes the account address. Send EGOC to it like any address.
+// All subsequent operations require M valid owner signatures on the tx hash.
+
+// ---------------------------------------------------------------------------
+// Storage
+// All keys use the ego7: prefix (EGO-7 §2) to avoid collisions.
+// ---------------------------------------------------------------------------
+
+// ego7:owner:<index>        → address string
+// ego7:owner:count          → u32 LE   — number of owners
+// ego7:threshold:value      → u32 LE   — required signatures (M)
+// ego7:nonce:value          → u64 LE   — replay-protection counter
+// ego7:is_owner:<address>   → 1 byte   — quick membership check
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+
+// Deploy with a list of owner addresses and the required threshold M.
+// Reverts if:
+//   - owners list is empty
+//   - threshold is 0 or greater than owner count
+//   - any owner address is the zero address
+//   - duplicate owners are present
+fn init(owners: [address], threshold: u32) {
+    let n = owners.len() as u32
+    assert(n > 0)                   // must have at least one owner
+    assert(threshold >= 1)          // threshold of 0 is nonsensical
+    assert(threshold <= n)          // can't require more sigs than owners
+
+    // Store the threshold and initialise nonce to 0
+    storage.set("ego7:threshold", "value", u32_to_le(threshold))
+    storage.set("ego7:nonce", "value", u64_to_le(0))
+
+    // Register each owner; check for zero address and duplicates
+    let i: u32 = 0
+    for owner in owners {
+        assert(owner != ZERO_ADDR)
+        // Duplicate check: if already flagged as owner, revert
+        let existing = storage.get("ego7:is_owner", owner)
+        assert(existing == nil)
+
+        storage.set("ego7:owner", u32_to_str(i), owner)
+        storage.set("ego7:is_owner", owner, [1u8])
+        i += 1
+    }
+    storage.set("ego7:owner", "count", u32_to_le(n))
+
+    events.emit("EGO7:OwnerAdded", concat(sys.self(), ":", owner) )
+    // Emit one OwnerAdded per owner
+    let j: u32 = 0
+    for owner in owners {
+        events.emit("EGO7:OwnerAdded", concat(sys.self(), ":", owner))
+        j += 1
+    }
+    events.emit(
+        "EGO7:ThresholdChanged",
+        concat(sys.self(), ":0:", u32_to_str(threshold))
+    )
+}
+
+// ---------------------------------------------------------------------------
+// IAccount — required exports (EGO-7 §1)
+// ---------------------------------------------------------------------------
+
+// get_nonce: return the current replay-protection nonce.
+// The caller embeds this nonce in the tx hash they sign.
+fn get_nonce() -> u64 {
+    let raw = storage.get("ego7:nonce", "value")
+    return le_to_u64(raw)
+}
+
+// get_threshold: return M (minimum signatures required).
+fn get_threshold() -> u32 {
+    let raw = storage.get("ego7:threshold", "value")
+    return le_to_u32(raw)
+}
+
+// get_owners: return all current owner addresses.
+fn get_owners() -> [address] {
+    let count = le_to_u32(storage.get("ego7:owner", "count"))
+    let result: [address] = []
+    let i: u32 = 0
+    for i < count {
+        let addr = storage.get("ego7:owner", u32_to_str(i))
+        result.push(addr)
+        i += 1
+    }
+    return result
+}
+
+// validate_tx: verify that at least M distinct owners have signed tx_hash.
+//
+// The wallet does NOT execute here — it only checks signatures.
+// Signatures are Ed25519 (64 bytes each). The function iterates all
+// provided signatures, checks each against the owner set, deduplicates,
+// and returns 1 iff the count of valid distinct owner signatures >= threshold.
+//
+// The nonce is NOT incremented here; only execute() does that.
+fn validate_tx(tx_hash: bytes, signatures: [bytes]) -> bool {
+    let threshold = get_threshold()
+    let valid_count: u32 = 0
+    let seen: map<address, bool> = {}  // deduplicate signers
+
+    for sig in signatures {
+        // sys.ecrecover returns the signer address for this (hash, sig) pair
+        let signer = sys.ecrecover(tx_hash, sig)
+        if signer == nil { continue }                             // bad sig
+        if seen[signer] { continue }                             // duplicate
+        let is_owner = storage.get("ego7:is_owner", signer)
+        if is_owner == nil { continue }                          // not an owner
+
+        seen[signer] = true
+        valid_count += 1
+        if valid_count >= threshold { return true }
+    }
+
+    return false
+}
+
+// execute: run a single operation after M-of-N validation.
+//
+// The caller must have obtained M signatures on the canonical tx hash:
+//   tx_hash = blake2(nonce_u64_le || to || value_u128_le || data)
+// then call validate_tx first (or embed both in one user-operation).
+//
+// On success the nonce is incremented and EGO7:Executed is emitted.
+// On failure the nonce is still incremented (prevents replay of failures).
+fn execute(to: address, value: u128, data: bytes, signatures: [bytes]) -> bool {
+    // Build the canonical hash that owners must have signed
+    let nonce = get_nonce()
+    let tx_hash = sys.blake2(
+        concat(u64_to_le(nonce), to, u128_to_le(value), data)
+    )
+
+    let valid = validate_tx(tx_hash, signatures)
+
+    // Increment nonce regardless of execution result (prevents replay)
+    storage.set("ego7:nonce", "value", u64_to_le(nonce + 1))
+
+    assert(valid)   // revert if not enough sigs; nonce already saved above
+
+    // Transfer EGOC and/or dispatch call data
+    let success = sys.call(to, value, data)
+
+    events.emit(
+        "EGO7:Executed",
+        concat(sys.self(), ":", to, ":", u128_to_str(value), ":", sys.caller())
+    )
+
+    return success
+}
+
+// execute_batch: execute multiple operations in one transaction.
+//
+// Each operation is signed independently (different tx_hash per op),
+// OR the batch itself is hashed as a whole — both are valid; the caller
+// chooses. Here we use per-op hashes for maximum flexibility.
+//
+// Failures in individual ops are counted but do NOT revert prior ops.
+// Returns the number of successful ops.
+fn execute_batch(ops: [{to: address, value: u128, data: bytes}], signatures: [bytes]) -> u32 {
+    let nonce = get_nonce()
+    let total = ops.len() as u32
+
+    // Build a combined hash over the whole batch + nonce
+    let batch_payload: bytes = u64_to_le(nonce)
+    for op in ops {
+        batch_payload = concat(batch_payload, op.to, u128_to_le(op.value), op.data)
+    }
+    let tx_hash = sys.blake2(batch_payload)
+
+    let valid = validate_tx(tx_hash, signatures)
+
+    // Nonce increments unconditionally
+    storage.set("ego7:nonce", "value", u64_to_le(nonce + 1))
+
+    assert(valid)
+
+    let success_count: u32 = 0
+    for op in ops {
+        let ok = sys.call(op.to, op.value, op.data)
+        if ok { success_count += 1 }
+    }
+
+    events.emit(
+        "EGO7:BatchExecuted",
+        concat(sys.self(), ":", u32_to_str(success_count), ":", u32_to_str(total))
+    )
+
+    return success_count
+}
+
+// ---------------------------------------------------------------------------
+// Owner management — all require M-of-N approval
+// ---------------------------------------------------------------------------
+
+// add_owner: add a new owner to the wallet.
+//
+// Requires M signatures on: blake2(nonce || "add_owner" || new_owner)
+// The threshold stays the same; owner count increases by 1.
+fn add_owner(new_owner: address, signatures: [bytes]) -> bool {
+    assert(new_owner != ZERO_ADDR)
+    let existing = storage.get("ego7:is_owner", new_owner)
+    assert(existing == nil)   // already an owner
+
+    let nonce = get_nonce()
+    let tx_hash = sys.blake2(concat(u64_to_le(nonce), "add_owner", new_owner))
+    let valid = validate_tx(tx_hash, signatures)
+    storage.set("ego7:nonce", "value", u64_to_le(nonce + 1))
+    assert(valid)
+
+    let count = le_to_u32(storage.get("ego7:owner", "count"))
+    storage.set("ego7:owner", u32_to_str(count), new_owner)
+    storage.set("ego7:is_owner", new_owner, [1u8])
+    storage.set("ego7:owner", "count", u32_to_le(count + 1))
+
+    events.emit("EGO7:OwnerAdded", concat(sys.self(), ":", new_owner))
+    return true
+}
+
+// remove_owner: remove an existing owner.
+//
+// Requires M signatures. Reverts if removal would make threshold > owner count
+// (which would permanently lock the wallet).
+fn remove_owner(owner: address, signatures: [bytes]) -> bool {
+    let is_owner = storage.get("ego7:is_owner", owner)
+    assert(is_owner != nil)
+
+    let count = le_to_u32(storage.get("ego7:owner", "count"))
+    let threshold = get_threshold()
+    // Ensure threshold invariant: M <= N-1 after removal
+    assert(threshold <= count - 1)
+
+    let nonce = get_nonce()
+    let tx_hash = sys.blake2(concat(u64_to_le(nonce), "remove_owner", owner))
+    let valid = validate_tx(tx_hash, signatures)
+    storage.set("ego7:nonce", "value", u64_to_le(nonce + 1))
+    assert(valid)
+
+    // Remove from is_owner flag
+    storage.del("ego7:is_owner", owner)
+
+    // Rebuild the indexed list without the removed owner
+    // (swap the removed entry with the last entry, then decrement count)
+    let new_count = count - 1
+    let found_idx: u32 = 0
+    let i: u32 = 0
+    for i < count {
+        let addr = storage.get("ego7:owner", u32_to_str(i))
+        if addr == owner {
+            found_idx = i
+        }
+        i += 1
+    }
+    // Swap with last
+    let last_addr = storage.get("ego7:owner", u32_to_str(new_count))
+    storage.set("ego7:owner", u32_to_str(found_idx), last_addr)
+    storage.del("ego7:owner", u32_to_str(new_count))
+    storage.set("ego7:owner", "count", u32_to_le(new_count))
+
+    events.emit("EGO7:OwnerRemoved", concat(sys.self(), ":", owner))
+    return true
+}
+
+// change_threshold: update M. Requires current M-of-N approval.
+fn change_threshold(new_threshold: u32, signatures: [bytes]) -> bool {
+    let count = le_to_u32(storage.get("ego7:owner", "count"))
+    assert(new_threshold >= 1)
+    assert(new_threshold <= count)
+
+    let old_threshold = get_threshold()
+
+    let nonce = get_nonce()
+    let tx_hash = sys.blake2(
+        concat(u64_to_le(nonce), "change_threshold", u32_to_le(new_threshold))
+    )
+    let valid = validate_tx(tx_hash, signatures)
+    storage.set("ego7:nonce", "value", u64_to_le(nonce + 1))
+    assert(valid)
+
+    storage.set("ego7:threshold", "value", u32_to_le(new_threshold))
+
+    events.emit(
+        "EGO7:ThresholdChanged",
+        concat(
+            sys.self(), ":",
+            u32_to_str(old_threshold), ":",
+            u32_to_str(new_threshold)
+        )
+    )
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Helper: is_owner query (read-only, for UIs)
+// ---------------------------------------------------------------------------
+fn is_owner(addr: address) -> bool {
+    let flag = storage.get("ego7:is_owner", addr)
+    return flag != nil
+}

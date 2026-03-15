@@ -1,0 +1,240 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// EGO-21 Reference Locker Contract — Time-Locked Token Vault
+// SPDX: MIT
+//
+// Standard : EGO-21 (https://github.com/ego-blockchain/eips/blob/main/EGO-21.md)
+// Author   : Artit Muhaxhiri (@egoblockchain)
+// Version  : 1.0.0
+// Created  : 2026-03-15
+//
+// OVERVIEW
+// --------
+// This contract implements the Locker sub-standard of EGO-21. Tokens are
+// deposited and locked until a specified block height. There is NO early
+// withdrawal mechanism — once locked, tokens are inaccessible until
+// unlock_block is reached. This provides a cryptographic guarantee to
+// token buyers that team/liquidity tokens cannot be moved before the
+// specified date.
+//
+// INTENDED USE CASES
+// ------------------
+// - Liquidity lock: LP tokens from an EGO-4 pool are locked so that the
+//   project team cannot drain the pool before the lock expires.
+// - Team token lock: Raw tokens are locked to prove founders cannot sell
+//   before a specified block (used alongside vesting for belt-and-suspenders).
+// - Treasury lock: Protocol treasuries lock tokens to signal long-term
+//   commitment to the community.
+//
+// DEPLOYMENT
+// ----------
+// 1. Compile:  urego build contracts/utils/locker.urego
+// 2. Deploy:   ego-node tx deploy <wasm> (no constructor args)
+// 3. Lock:     approve this contract on the token, then call:
+//              lock(token_addr, amount, unlock_block, recipient)
+// 4. Verify:   call get_lock_info(lock_id) to confirm on-chain
+// 5. Unlock:   call unlock(lock_id) after block_number() >= unlock_block
+//
+// STORAGE PREFIX: ego21l:
+// ═══════════════════════════════════════════════════════════════════════════
+
+contract TokenLocker {
+
+    // ── Token Locking ─────────────────────────────────────────────────────────
+
+    // lock — deposit tokens and lock them until a specific block height.
+    //
+    // Reverts if unlock_block is not strictly in the future (locking until
+    // the current block would be immediately withdrawable, which defeats the
+    // purpose). Reverts if amount is zero.
+    //
+    // The caller MUST approve this contract address on the EGO-20 token for
+    // at least `amount` before calling. Tokens are pulled via transfer_from.
+    //
+    // Args:
+    //   token        — EGO-20 token to lock
+    //   amount       — number of tokens to lock (u128, must be > 0)
+    //   unlock_block — block height after which unlock() can be called
+    //   recipient    — address that will receive tokens on unlock
+    //
+    // Returns: lock_id — the ID of the newly created lock
+    pub fn lock(token: address, amount: u128, unlock_block: u64, recipient: address) -> u64 {
+        require(amount > 0u128, "lock: amount must be > 0")
+        require(unlock_block > block_number(), "lock: unlock_block must be in the future")
+
+        let lock_id: u64 = storage_get_u64("ego21l:lock_count")
+        let id_str: str = u64_to_str(lock_id)
+        let depositor: address = caller()
+        let depositor_str: str = address_to_str(depositor)
+
+        // Store lock metadata
+        storage_set_address(concat("ego21l:lock:", concat(id_str, ":token")), token)
+        storage_set_address(concat("ego21l:lock:", concat(id_str, ":depositor")), depositor)
+        storage_set_address(concat("ego21l:lock:", concat(id_str, ":recipient")), recipient)
+        storage_set_u128(concat("ego21l:lock:", concat(id_str, ":amount")), amount)
+        storage_set_u64(concat("ego21l:lock:", concat(id_str, ":unlock_block")), unlock_block)
+        storage_set_bool(concat("ego21l:lock:", concat(id_str, ":withdrawn")), false)
+
+        // Increment lock counter
+        storage_set_u64("ego21l:lock_count", lock_id + 1u64)
+
+        // Pull tokens from depositor into this contract
+        let token_str: str = address_to_str(token)
+        let amount_str: str = u128_to_str(amount)
+        cross_call(token_str, "transfer_from", concat(depositor_str, concat(" ", amount_str)))
+
+        emit Locked(lock_id, token, depositor, recipient, amount, unlock_block)
+
+        return lock_id
+    }
+
+    // ── Token Release ─────────────────────────────────────────────────────────
+
+    // unlock — release locked tokens to the recipient after unlock_block.
+    //
+    // Only the recipient may call unlock; this prevents third parties from
+    // triggering the release on behalf of the recipient (which could have
+    // tax or other legal implications in some jurisdictions). The recipient
+    // calls when they are ready to receive.
+    //
+    // Reverts if:
+    //   - block_number() < unlock_block  (too early)
+    //   - withdrawn == true              (already unlocked)
+    //   - caller() != recipient          (not the recipient)
+    //
+    // Args:
+    //   lock_id — lock to release
+    pub fn unlock(lock_id: u64) {
+        let lock_count: u64 = storage_get_u64("ego21l:lock_count")
+        require(lock_id < lock_count, "unlock: invalid lock_id")
+
+        let id_str: str = u64_to_str(lock_id)
+
+        let unlock_block: u64 = storage_get_u64(concat("ego21l:lock:", concat(id_str, ":unlock_block")))
+        require(block_number() >= unlock_block, "unlock: lock has not expired yet")
+
+        let withdrawn: bool = storage_get_bool(concat("ego21l:lock:", concat(id_str, ":withdrawn")))
+        require(!withdrawn, "unlock: tokens already withdrawn")
+
+        let recipient: address = storage_get_address(concat("ego21l:lock:", concat(id_str, ":recipient")))
+        require(caller() == recipient, "unlock: caller is not recipient")
+
+        let amount: u128 = storage_get_u128(concat("ego21l:lock:", concat(id_str, ":amount")))
+        let token: address = storage_get_address(concat("ego21l:lock:", concat(id_str, ":token")))
+
+        // Mark withdrawn before transfer (checks-effects-interactions)
+        storage_set_bool(concat("ego21l:lock:", concat(id_str, ":withdrawn")), true)
+
+        // Transfer tokens to recipient
+        let token_str: str = address_to_str(token)
+        let recipient_str: str = address_to_str(recipient)
+        let amount_str: str = u128_to_str(amount)
+        cross_call(token_str, "transfer", concat(recipient_str, concat(" ", amount_str)))
+
+        emit Unlocked(lock_id, recipient, amount)
+    }
+
+    // ── View Functions ────────────────────────────────────────────────────────
+
+    // get_lock_count — returns total number of locks ever created.
+    //
+    // This includes all locks regardless of status (active or withdrawn).
+    // Off-chain indexers can iterate from 0 to lock_count-1 to enumerate all.
+    pub fn get_lock_count() -> u64 {
+        return storage_get_u64("ego21l:lock_count")
+    }
+
+    // get_lock_info — returns lock metadata as a human-readable string.
+    //
+    // Intended for off-chain display (wallets, block explorers, lock
+    // verification sites). Format:
+    //
+    //   "lock_id:token:depositor:recipient:amount:unlock_block:withdrawn"
+    //
+    // where withdrawn is "true" or "false".
+    //
+    // Args:
+    //   lock_id — lock to query
+    pub fn get_lock_info(lock_id: u64) -> str {
+        let lock_count: u64 = storage_get_u64("ego21l:lock_count")
+        require(lock_id < lock_count, "get_lock_info: invalid lock_id")
+
+        let id_str: str = u64_to_str(lock_id)
+        let token: address = storage_get_address(concat("ego21l:lock:", concat(id_str, ":token")))
+        let depositor: address = storage_get_address(concat("ego21l:lock:", concat(id_str, ":depositor")))
+        let recipient: address = storage_get_address(concat("ego21l:lock:", concat(id_str, ":recipient")))
+        let amount: u128 = storage_get_u128(concat("ego21l:lock:", concat(id_str, ":amount")))
+        let unlock_block: u64 = storage_get_u64(concat("ego21l:lock:", concat(id_str, ":unlock_block")))
+        let withdrawn: bool = storage_get_bool(concat("ego21l:lock:", concat(id_str, ":withdrawn")))
+
+        let withdrawn_str: str = "false"
+        if withdrawn {
+            withdrawn_str = "true"
+        }
+
+        return concat(id_str, concat(":", concat(address_to_str(token), concat(":", concat(address_to_str(depositor), concat(":", concat(address_to_str(recipient), concat(":", concat(u128_to_str(amount), concat(":", concat(u64_to_str(unlock_block), concat(":", withdrawn_str)))))))))))
+    }
+
+    // is_locked — convenience view: returns true if a lock is active (not yet
+    // withdrawn and not yet past unlock_block).
+    //
+    // A lock that is past its unlock_block but not yet withdrawn is still
+    // technically "locked" in the sense that tokens are still in the contract,
+    // but this function returns false to signal that the lock has expired and
+    // can be released.
+    //
+    // Args:
+    //   lock_id — lock to check
+    //
+    // Returns: true if tokens are still locked and cannot yet be released
+    pub fn is_locked(lock_id: u64) -> bool {
+        let lock_count: u64 = storage_get_u64("ego21l:lock_count")
+        require(lock_id < lock_count, "is_locked: invalid lock_id")
+
+        let id_str: str = u64_to_str(lock_id)
+        let withdrawn: bool = storage_get_bool(concat("ego21l:lock:", concat(id_str, ":withdrawn")))
+
+        if withdrawn {
+            return false
+        }
+
+        let unlock_block: u64 = storage_get_u64(concat("ego21l:lock:", concat(id_str, ":unlock_block")))
+        return block_number() < unlock_block
+    }
+
+    // blocks_until_unlock — returns the number of blocks remaining until the
+    // lock expires. Returns 0 if the lock has already expired or been withdrawn.
+    //
+    // Wallets can multiply this by the block time (~0.1 s) to display a
+    // human-readable countdown timer to users.
+    //
+    // Args:
+    //   lock_id — lock to query
+    //
+    // Returns: blocks remaining (u64); 0 means unlockable now or already done
+    pub fn blocks_until_unlock(lock_id: u64) -> u64 {
+        let lock_count: u64 = storage_get_u64("ego21l:lock_count")
+        require(lock_id < lock_count, "blocks_until_unlock: invalid lock_id")
+
+        let id_str: str = u64_to_str(lock_id)
+        let withdrawn: bool = storage_get_bool(concat("ego21l:lock:", concat(id_str, ":withdrawn")))
+
+        if withdrawn {
+            return 0u64
+        }
+
+        let unlock_block: u64 = storage_get_u64(concat("ego21l:lock:", concat(id_str, ":unlock_block")))
+        let current: u64 = block_number()
+
+        if current >= unlock_block {
+            return 0u64
+        }
+
+        return unlock_block - current
+    }
+
+    // ── Events ────────────────────────────────────────────────────────────────
+
+    event Locked(lock_id: u64, token: address, depositor: address, recipient: address, amount: u128, unlock_block: u64)
+    event Unlocked(lock_id: u64, recipient: address, amount: u128)
+
+}

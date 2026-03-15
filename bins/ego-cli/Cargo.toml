@@ -1,0 +1,22 @@
+[package]
+name = "ego-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Ego Blockchain developer CLI — compile, deploy, call, test"
+
+[[bin]]
+name = "ego"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.11", features = ["json", "blocking"] }
+hex = "0.4"
+blake2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+colored = "2"
+ego-core = { path = "../../crates/ego-core" }
+urego-compiler = { path = "../../crates/urego-compiler" }

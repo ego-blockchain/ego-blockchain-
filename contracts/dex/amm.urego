@@ -1,0 +1,496 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// EGO-4 Reference AMM — Constant Product Market Maker (x*y=k)
+// SPDX: MIT
+//
+// Standard : EGO-4 (https://github.com/ego-blockchain/eips/blob/main/EGO-4.md)
+// Author   : Artit Muhaxhiri (@egoblockchain)
+// Version  : 1.0.0
+// Created  : 2026-03-15
+//
+// OVERVIEW
+// --------
+// This contract implements an automated market maker (AMM) liquidity pool for
+// a pair of EGO-20 tokens using the constant-product formula:
+//
+//   reserve_a * reserve_b = k
+//
+// The invariant k must never decrease after a swap (it can only grow as fees
+// accumulate). Liquidity providers deposit both tokens and receive LP tokens
+// representing their proportional share of the pool. Swappers pay a fee
+// (configurable in basis points) that is retained in the pool reserves,
+// incrementally rewarding LPs.
+//
+// FEE FORMULA
+// -----------
+// Given fee_bps (e.g. 30 for 0.30%):
+//
+//   fee_adjusted_in = amount_in * (10000 - fee_bps) / 10000
+//   amount_out      = reserve_out * fee_adjusted_in / (reserve_in + fee_adjusted_in)
+//
+// DEPLOYMENT
+// ----------
+// 1. Compile:  urego build contracts/dex/amm.urego
+// 2. Deploy:   ego-node tx deploy <wasm> --args "token_a_addr token_b_addr 30"
+//              (30 bps = 0.30% fee; token_a must be lexicographically < token_b)
+// 3. Seed liquidity via add_liquidity before any swaps.
+//
+// PHASE 1 NOTE (Cross-contract calls)
+// ------------------------------------
+// EGO-vm Phase 1 does not support cross-contract calls, so this AMM cannot
+// call EGO-20 transfer_from / transfer directly. Instead, it uses internal
+// storage-based accounting: callers deposit tokens into the pool's own ledger
+// entry before calling add_liquidity or swap_exact_in. When ego-vm Phase 2
+// enables cross-contract calls, replace the internal balance reads with actual
+// EGO-20 transfer_from / transfer calls.
+// ═══════════════════════════════════════════════════════════════════════════
+
+contract EgoAMM {
+
+    // ── Storage key constants ────────────────────────────────────────────────
+    // All keys are namespaced with "ego4:" to prevent collisions if this
+    // contract is ever extended with additional standards.
+
+    // ── Initialization ────────────────────────────────────────────────────────
+
+    // init — called once at deploy time.
+    //
+    // Stores the token pair and fee rate; initialises reserves to zero.
+    // IMPORTANT: token_a MUST be lexicographically less than token_b.
+    // Callers should sort addresses off-chain before deploying.
+    //
+    // Args:
+    //   token_a  — EGO-20 contract address of the first token (canonical ordering)
+    //   token_b  — EGO-20 contract address of the second token
+    //   fee_bps  — Fee in basis points (e.g. 30 = 0.30%, max 10000)
+    fn init(token_a: Address, token_b: Address, fee_bps: u64) {
+        // Enforce canonical ordering: token_a < token_b lexicographically.
+        // This ensures there is exactly one pool address per token pair.
+        assert(token_a < token_b, "init: token_a must be < token_b lexicographically")
+        assert(fee_bps <= 10000, "init: fee_bps must be <= 10000")
+
+        storage.set("ego4:meta:token_a", token_a)
+        storage.set("ego4:meta:token_b", token_b)
+        storage.set("ego4:meta:fee_bps", fee_bps)
+        storage.set("ego4:meta:owner", sys.caller())
+
+        // Initialise reserves to zero
+        storage.set("ego4:reserve:a", 0u128)
+        storage.set("ego4:reserve:b", 0u128)
+
+        // Initialise LP supply to zero
+        storage.set("ego4:lp:total", 0u64)
+
+        events.emit("EGO4:Init", sys.caller())
+    }
+
+    // ── Liquidity Management ─────────────────────────────────────────────────
+
+    // add_liquidity — deposit token A and token B to receive LP tokens.
+    //
+    // On the very first deposit the LP supply is seeded using the geometric
+    // mean: lp_minted = sqrt(amount_a * amount_b). This prevents the
+    // "inflation attack" where an attacker seeds with 1 unit and inflates the
+    // LP price per share.
+    //
+    // On subsequent deposits, LP tokens are minted proportionally to the
+    // smaller of the two ratios (amount / reserve). This prevents existing LPs
+    // from being diluted by off-ratio deposits.
+    //
+    // Args:
+    //   amount_a — Amount of token A to deposit
+    //   amount_b — Amount of token B to deposit
+    //   min_lp   — Minimum LP tokens expected (slippage protection)
+    //
+    // Returns: lp_minted — Number of LP tokens issued to the caller
+    fn add_liquidity(amount_a: u128, amount_b: u128, min_lp: u64) -> u64 {
+        assert(amount_a > 0u128, "add_liquidity: amount_a must be > 0")
+        assert(amount_b > 0u128, "add_liquidity: amount_b must be > 0")
+
+        let reserve_a: u128 = storage.get_u128("ego4:reserve:a")
+        let reserve_b: u128 = storage.get_u128("ego4:reserve:b")
+        let total_lp:  u64  = storage.get_u64("ego4:lp:total")
+
+        let lp_minted: u64 = 0u64
+
+        if total_lp == 0u64 {
+            // ── Initial deposit ──────────────────────────────────────────────
+            // LP supply is seeded as the geometric mean of the two amounts.
+            // We use the ego4_sqrt host function for integer square root of
+            // the u128 product. This prevents the inflation attack.
+            //
+            //   lp_minted = sqrt(amount_a * amount_b)
+            //
+            // NOTE: ego4_sqrt returns the floor of the square root.
+            lp_minted = ego4_sqrt(amount_a * amount_b)
+            assert(lp_minted > 0u64, "add_liquidity: initial LP rounds to zero — deposit more")
+        } else {
+            // ── Subsequent deposit ───────────────────────────────────────────
+            // Mint LP proportional to the smaller ratio to avoid diluting
+            // existing LPs:
+            //
+            //   lp_from_a = amount_a * total_lp / reserve_a
+            //   lp_from_b = amount_b * total_lp / reserve_b
+            //   lp_minted = min(lp_from_a, lp_from_b)
+            //
+            // Callers SHOULD compute the ideal ratio off-chain and pass amounts
+            // that are exactly proportional to current reserves.
+            let lp_from_a: u64 = (amount_a * total_lp as u128 / reserve_a) as u64
+            let lp_from_b: u64 = (amount_b * total_lp as u128 / reserve_b) as u64
+
+            if lp_from_a < lp_from_b {
+                lp_minted = lp_from_a
+            } else {
+                lp_minted = lp_from_b
+            }
+        }
+
+        // Slippage check: caller specified a minimum LP expectation
+        assert(lp_minted >= min_lp, "add_liquidity: slippage — LP minted below minimum")
+
+        // ── Update reserves ──────────────────────────────────────────────────
+        storage.set("ego4:reserve:a", reserve_a + amount_a)
+        storage.set("ego4:reserve:b", reserve_b + amount_b)
+
+        // ── Mint LP tokens to caller ─────────────────────────────────────────
+        let caller: Address    = sys.caller()
+        let caller_lp: u64     = storage.get_u64("ego4:lp:" + caller)
+        storage.set("ego4:lp:" + caller, caller_lp + lp_minted)
+        storage.set("ego4:lp:total", total_lp + lp_minted)
+
+        // Emit events for indexers
+        events.emit("EGO4:LiquidityAdded", lp_minted)
+        ego4_emit_sync(sys.contract(), reserve_a + amount_a, reserve_b + amount_b)
+
+        return lp_minted
+    }
+
+    // remove_liquidity — burn LP tokens and withdraw proportional reserves.
+    //
+    // The caller burns exactly lp_amount LP tokens and receives back their
+    // proportional share of both reserves:
+    //
+    //   amount_a = lp_amount * reserve_a / total_lp
+    //   amount_b = lp_amount * reserve_b / total_lp
+    //
+    // Args:
+    //   lp_amount — Number of LP tokens to burn
+    //   min_a     — Minimum token A expected (slippage protection)
+    //   min_b     — Minimum token B expected (slippage protection)
+    //
+    // Returns: amount_a — Amount of token A returned (amount_b is also
+    //          returned but callers read it from the EGO4:LiquidityRemoved event)
+    fn remove_liquidity(lp_amount: u64, min_a: u128, min_b: u128) -> u128 {
+        assert(lp_amount > 0u64, "remove_liquidity: lp_amount must be > 0")
+
+        let caller: Address = sys.caller()
+        let caller_lp: u64  = storage.get_u64("ego4:lp:" + caller)
+        assert(caller_lp >= lp_amount, "remove_liquidity: insufficient LP balance")
+
+        let reserve_a: u128 = storage.get_u128("ego4:reserve:a")
+        let reserve_b: u128 = storage.get_u128("ego4:reserve:b")
+        let total_lp:  u64  = storage.get_u64("ego4:lp:total")
+
+        // Proportional withdrawal based on LP share
+        let amount_a: u128 = lp_amount as u128 * reserve_a / total_lp as u128
+        let amount_b: u128 = lp_amount as u128 * reserve_b / total_lp as u128
+
+        // Slippage checks
+        assert(amount_a >= min_a, "remove_liquidity: slippage — token A below minimum")
+        assert(amount_b >= min_b, "remove_liquidity: slippage — token B below minimum")
+
+        // ── Burn LP tokens first (checks-effects pattern) ────────────────────
+        storage.set("ego4:lp:" + caller, caller_lp - lp_amount)
+        storage.set("ego4:lp:total", total_lp - lp_amount)
+
+        // ── Update reserves ──────────────────────────────────────────────────
+        let new_reserve_a: u128 = reserve_a - amount_a
+        let new_reserve_b: u128 = reserve_b - amount_b
+        storage.set("ego4:reserve:a", new_reserve_a)
+        storage.set("ego4:reserve:b", new_reserve_b)
+
+        // Emit events
+        events.emit("EGO4:LiquidityRemoved", lp_amount)
+        ego4_emit_sync(sys.contract(), new_reserve_a, new_reserve_b)
+
+        return amount_a
+    }
+
+    // ── Swapping ──────────────────────────────────────────────────────────────
+
+    // swap_exact_in — swap a fixed input amount for as many output tokens
+    // as possible, subject to a minimum output (slippage protection).
+    //
+    // The constant-product formula with fee:
+    //
+    //   fee_adjusted_in = amount_in * (10000 - fee_bps) / 10000
+    //   amount_out      = reserve_out * fee_adjusted_in
+    //                     / (reserve_in + fee_adjusted_in)
+    //
+    // The fee portion (amount_in * fee_bps / 10000) is implicitly retained in
+    // the pool reserves. After the swap, reserve_in * reserve_out > k_prev,
+    // meaning k grows and all LPs benefit.
+    //
+    // Args:
+    //   is_a_to_b — true = swap token A → token B; false = swap token B → A
+    //   amount_in — Exact amount of input token to spend
+    //   min_out   — Minimum output tokens to receive (slippage guard)
+    //
+    // Returns: amount_out — Actual output tokens received
+    fn swap_exact_in(is_a_to_b: bool, amount_in: u128, min_out: u128) -> u128 {
+        assert(amount_in > 0u128, "swap_exact_in: amount_in must be > 0")
+
+        let reserve_a: u128 = storage.get_u128("ego4:reserve:a")
+        let reserve_b: u128 = storage.get_u128("ego4:reserve:b")
+        let fee_bps:   u64  = storage.get_u64("ego4:meta:fee_bps")
+
+        // Assign directional reserves
+        let reserve_in:  u128 = 0u128
+        let reserve_out: u128 = 0u128
+
+        if is_a_to_b {
+            reserve_in  = reserve_a
+            reserve_out = reserve_b
+        } else {
+            reserve_in  = reserve_b
+            reserve_out = reserve_a
+        }
+
+        // Pool must have liquidity in both tokens
+        assert(reserve_in > 0u128,  "swap_exact_in: pool has no input-token liquidity")
+        assert(reserve_out > 0u128, "swap_exact_in: pool has no output-token liquidity")
+
+        // ── x*y=k formula with fee ───────────────────────────────────────────
+        // Deduct the fee from the input before computing the output. The fee
+        // stays in the pool (reserve_in increases by the full amount_in, not
+        // fee_adjusted_in), so k grows after each swap.
+        let fee_factor:     u128 = (10000u64 - fee_bps) as u128
+        let fee_adjusted:   u128 = amount_in * fee_factor / 10000u128
+        let amount_out:     u128 = reserve_out * fee_adjusted / (reserve_in + fee_adjusted)
+
+        // Slippage protection
+        assert(amount_out >= min_out, "swap_exact_in: slippage — output below minimum")
+        // Sanity: cannot drain the pool entirely
+        assert(amount_out < reserve_out, "swap_exact_in: insufficient pool liquidity")
+
+        // ── Update reserves (full amount_in enters; amount_out leaves) ───────
+        let new_reserve_a: u128 = 0u128
+        let new_reserve_b: u128 = 0u128
+
+        if is_a_to_b {
+            new_reserve_a = reserve_a + amount_in
+            new_reserve_b = reserve_b - amount_out
+        } else {
+            new_reserve_b = reserve_b + amount_in
+            new_reserve_a = reserve_a - amount_out
+        }
+
+        storage.set("ego4:reserve:a", new_reserve_a)
+        storage.set("ego4:reserve:b", new_reserve_b)
+
+        // Emit swap and sync events
+        let token_a: Address = storage.get_str("ego4:meta:token_a")
+        let token_b: Address = storage.get_str("ego4:meta:token_b")
+
+        if is_a_to_b {
+            ego4_emit_swap(sys.contract(), token_a, token_b, amount_in, amount_out, sys.caller())
+        } else {
+            ego4_emit_swap(sys.contract(), token_b, token_a, amount_in, amount_out, sys.caller())
+        }
+
+        ego4_emit_sync(sys.contract(), new_reserve_a, new_reserve_b)
+
+        return amount_out
+    }
+
+    // swap_exact_out — pay as few input tokens as possible to receive an exact
+    // output amount, subject to a maximum input (slippage protection).
+    //
+    // Inverse of swap_exact_in:
+    //
+    //   amount_in = ceil(reserve_in * amount_out
+    //               / ((reserve_out - amount_out) * (10000 - fee_bps) / 10000))
+    //
+    // The +1 in the ceiling ensures the invariant is never violated due to
+    // integer truncation.
+    //
+    // Args:
+    //   is_a_to_b  — true = swap token A → token B; false = swap token B → A
+    //   amount_out — Exact amount of output token desired
+    //   max_in     — Maximum input tokens willing to spend (slippage guard)
+    //
+    // Returns: amount_in — Actual input tokens spent
+    fn swap_exact_out(is_a_to_b: bool, amount_out: u128, max_in: u128) -> u128 {
+        assert(amount_out > 0u128, "swap_exact_out: amount_out must be > 0")
+
+        let reserve_a: u128 = storage.get_u128("ego4:reserve:a")
+        let reserve_b: u128 = storage.get_u128("ego4:reserve:b")
+        let fee_bps:   u64  = storage.get_u64("ego4:meta:fee_bps")
+
+        let reserve_in:  u128 = 0u128
+        let reserve_out: u128 = 0u128
+
+        if is_a_to_b {
+            reserve_in  = reserve_a
+            reserve_out = reserve_b
+        } else {
+            reserve_in  = reserve_b
+            reserve_out = reserve_a
+        }
+
+        assert(reserve_in > 0u128,  "swap_exact_out: pool has no input-token liquidity")
+        assert(reserve_out > 0u128, "swap_exact_out: pool has no output-token liquidity")
+        assert(amount_out < reserve_out, "swap_exact_out: insufficient pool liquidity")
+
+        // ── Inverse constant-product formula with fee ────────────────────────
+        // amount_in = reserve_in * amount_out
+        //             / ((reserve_out - amount_out) * fee_factor / 10000)  + 1
+        let fee_factor: u128 = (10000u64 - fee_bps) as u128
+        let denominator: u128 = (reserve_out - amount_out) * fee_factor / 10000u128
+        let amount_in: u128  = reserve_in * amount_out / denominator + 1u128
+
+        // Slippage protection
+        assert(amount_in <= max_in, "swap_exact_out: slippage — input exceeds maximum")
+
+        // ── Update reserves ──────────────────────────────────────────────────
+        let new_reserve_a: u128 = 0u128
+        let new_reserve_b: u128 = 0u128
+
+        if is_a_to_b {
+            new_reserve_a = reserve_a + amount_in
+            new_reserve_b = reserve_b - amount_out
+        } else {
+            new_reserve_b = reserve_b + amount_in
+            new_reserve_a = reserve_a - amount_out
+        }
+
+        storage.set("ego4:reserve:a", new_reserve_a)
+        storage.set("ego4:reserve:b", new_reserve_b)
+
+        let token_a: Address = storage.get_str("ego4:meta:token_a")
+        let token_b: Address = storage.get_str("ego4:meta:token_b")
+
+        if is_a_to_b {
+            ego4_emit_swap(sys.contract(), token_a, token_b, amount_in, amount_out, sys.caller())
+        } else {
+            ego4_emit_swap(sys.contract(), token_b, token_a, amount_in, amount_out, sys.caller())
+        }
+
+        ego4_emit_sync(sys.contract(), new_reserve_a, new_reserve_b)
+
+        return amount_in
+    }
+
+    // ── Queries ───────────────────────────────────────────────────────────────
+    // All query functions are read-only and do not modify state.
+
+    // get_reserve_a — returns the current reserve of token A (u128).
+    fn get_reserve_a() -> u128 {
+        return storage.get_u128("ego4:reserve:a")
+    }
+
+    // get_reserve_b — returns the current reserve of token B (u128).
+    fn get_reserve_b() -> u128 {
+        return storage.get_u128("ego4:reserve:b")
+    }
+
+    // get_reserves — returns both reserves as a tuple.
+    // Equivalent to calling get_reserve_a + get_reserve_b in one RPC call.
+    fn get_reserves() -> (u128, u128) {
+        let ra: u128 = storage.get_u128("ego4:reserve:a")
+        let rb: u128 = storage.get_u128("ego4:reserve:b")
+        return (ra, rb)
+    }
+
+    // get_lp_balance — returns the LP token balance of addr.
+    fn get_lp_balance(addr: Address) -> u64 {
+        return storage.get_u64("ego4:lp:" + addr)
+    }
+
+    // get_lp_total — returns the total LP token supply.
+    fn get_lp_total() -> u64 {
+        return storage.get_u64("ego4:lp:total")
+    }
+
+    // get_fee_bps — returns the pool fee in basis points (e.g. 30 = 0.30%).
+    fn get_fee_bps() -> u64 {
+        return storage.get_u64("ego4:meta:fee_bps")
+    }
+
+    // get_token_a — returns the address of token A.
+    fn get_token_a() -> Address {
+        return storage.get_str("ego4:meta:token_a")
+    }
+
+    // get_token_b — returns the address of token B.
+    fn get_token_b() -> Address {
+        return storage.get_str("ego4:meta:token_b")
+    }
+
+    // quote — estimate the output amount for a given input amount and direction.
+    //
+    // Applies the fee-adjusted constant-product formula without modifying state.
+    // Wallets and aggregators SHOULD call this before constructing a swap tx.
+    //
+    // Args:
+    //   amount_in — Input token amount
+    //   is_a_to_b — true = A→B, false = B→A
+    //
+    // Returns: estimated output amount (may differ slightly from actual swap
+    //          if another swap occurs in the same block)
+    fn quote(amount_in: u128, is_a_to_b: bool) -> u128 {
+        assert(amount_in > 0u128, "quote: amount_in must be > 0")
+
+        let reserve_a: u128 = storage.get_u128("ego4:reserve:a")
+        let reserve_b: u128 = storage.get_u128("ego4:reserve:b")
+        let fee_bps:   u64  = storage.get_u64("ego4:meta:fee_bps")
+
+        let reserve_in:  u128 = 0u128
+        let reserve_out: u128 = 0u128
+
+        if is_a_to_b {
+            reserve_in  = reserve_a
+            reserve_out = reserve_b
+        } else {
+            reserve_in  = reserve_b
+            reserve_out = reserve_a
+        }
+
+        if reserve_in == 0u128 || reserve_out == 0u128 {
+            return 0u128
+        }
+
+        let fee_factor:   u128 = (10000u64 - fee_bps) as u128
+        let fee_adjusted: u128 = amount_in * fee_factor / 10000u128
+        return reserve_out * fee_adjusted / (reserve_in + fee_adjusted)
+    }
+
+    // get_price — spot price of token_in denominated in token_out, scaled by
+    // 10^18 to preserve precision in integer arithmetic.
+    //
+    // price = reserve_out * 10^18 / reserve_in   (before fee)
+    //
+    // NOTE: This is the spot price at current reserves, not a TWAP. It is
+    // susceptible to manipulation in the same block. Use only for display
+    // purposes, not as an on-chain oracle. A TWAP oracle is planned for EGO-5.
+    fn get_price(is_a_to_b: bool) -> u128 {
+        let reserve_a: u128 = storage.get_u128("ego4:reserve:a")
+        let reserve_b: u128 = storage.get_u128("ego4:reserve:b")
+
+        let reserve_in:  u128 = 0u128
+        let reserve_out: u128 = 0u128
+
+        if is_a_to_b {
+            reserve_in  = reserve_a
+            reserve_out = reserve_b
+        } else {
+            reserve_in  = reserve_b
+            reserve_out = reserve_a
+        }
+
+        assert(reserve_in > 0u128, "get_price: pool is empty")
+
+        // Scale by 10^18 for 18 decimal places of precision
+        return reserve_out * 1000000000000000000u128 / reserve_in
+    }
+
+}

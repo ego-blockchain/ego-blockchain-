@@ -1,10 +1,12 @@
 pub mod bft;
 pub mod drs;
 pub mod engine;
+pub mod fork_choice;
 pub mod validation;
 
 // Only re-export items confirmed to exist by the compiler errors
 pub use bft::{BftEngine, BlockHeader, BlockRoots, QuorumCertificate, Vote};
+pub use fork_choice::{ForkChoiceStore, ViewChangeMsg};
 pub use drs::{DRSInputs, DRSScoreEvent, DRSScorer, W_POST_PASS, W_UPTIME};
 pub use engine::{ConsensusConfig, ConsensusEngine};
 pub use validation::{ValidationError, ValidationResult};

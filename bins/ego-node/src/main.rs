@@ -1,6 +1,11 @@
 use clap::{Arg, Command};
-use ego_core::{Address, Balance, Transaction, TransactionPayload};
-use ego_node::{NetworkType, Node, NodeRole, rpc::{RpcState, serve as rpc_serve}};
+use ego_core::{Address, Balance, ShardId, Transaction, TransactionPayload};
+use ego_node::{
+    NetworkType, Node, NodeRole,
+    engine::EgoExecutionEngine,
+    rpc::{RpcState, serve as rpc_serve},
+    supervisor::NodeSupervisor,
+};
 use libp2p::{Multiaddr, futures::StreamExt};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
@@ -25,6 +30,11 @@ struct NodeConfig {
     pub slice_id: Option<String>,
     pub enable_metrics: bool,
     pub enable_interactive: bool,
+
+    /// Forward earned rewards to this external address every `payout_interval_blocks` blocks.
+    pub payout_address: Option<String>,
+    /// How often (in blocks) to sweep rewards to payout_address. Default: 100.
+    pub payout_interval_blocks: u64,
 
     pub enable_bandwidth_sharing: bool,
     pub sharing_bandwidth_mbps: u64,
@@ -57,6 +67,8 @@ impl Default for NodeConfig {
             enable_metrics: false,
             enable_interactive: false,
 
+            payout_address: None,
+            payout_interval_blocks: 100,
             enable_bandwidth_sharing: false,
             sharing_bandwidth_mbps: 50,
             sharing_daily_limit_mb: 1000,
@@ -107,13 +119,29 @@ async fn main() -> anyhow::Result<()> {
 
     print_node_info(&node, &config);
 
+    // Derive node identity from its keystore
+    let node_address = format!("0x{}", hex::encode(node.get_address().as_bytes()));
+    let node_pubkey  = hex::encode(&node.get_keypair().ed25519_public_key().key_data);
+    let node_keypair = node.get_keypair().clone();
+
+    // Instantiate the execution engine and supervisor (single-client resilience).
+    let _engine = EgoExecutionEngine::new();
+    let (supervisor, _heartbeat) = NodeSupervisor::new();
+
     // Start HTTP RPC server on port 8545
     let rpc_state = Arc::new(RpcState {
-        state_manager: node.state_manager.clone(),
-        peer_id:       node.peer_id.to_string(),
-        pending_txs:   Mutex::new(Vec::new()),
-        recent_blocks: Mutex::new(Vec::new()),
-        node_stats:    Mutex::new(Default::default()),
+        state_manager:  node.state_manager.clone(),
+        peer_id:        node.peer_id.to_string(),
+        node_address:   node_address.clone(),
+        node_pubkey,
+        node_keypair,
+        payout_address: config.payout_address.clone(),
+        pending_txs:    Mutex::new(Vec::new()),
+        recent_blocks:  Mutex::new(Vec::new()),
+        node_stats:     Mutex::new(Default::default()),
+        nonce:          Mutex::new(0),
+        supervisor,
+        faucet_claims:  Mutex::new(std::collections::HashMap::new()),
     });
     let rpc_addr = format!("0.0.0.0:{}", 8545u16);
     let rpc_state_clone = Arc::clone(&rpc_state);
@@ -123,6 +151,85 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     info!("🌐 HTTP RPC listening on 0.0.0.0:8545");
+
+    // Auto-payout loop: sweep earned EGOC to payout_address every N blocks
+    if let Some(payout_to) = config.payout_address.clone() {
+        let payout_state  = Arc::clone(&rpc_state);
+        let interval_blks = config.payout_interval_blocks;
+        info!("💸 Auto-payout enabled: every {} blocks → {}", interval_blks, &payout_to);
+        tokio::spawn(async move {
+            let mut last_payout_height: u64 = 0;
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let current_height = payout_state.state_manager.get_block_height().0;
+                if current_height < last_payout_height + interval_blks {
+                    continue;
+                }
+
+                // Parse the node's own address
+                let addr_hex = payout_state.node_address.trim_start_matches("0x").to_string();
+                let from_addr = match hex::decode(&addr_hex) {
+                    Ok(b) if b.len() == 20 => {
+                        let mut arr = [0u8; 20];
+                        arr.copy_from_slice(&b);
+                        Address::new(arr)
+                    }
+                    _ => continue,
+                };
+
+                // Check balance
+                let balance_raw = payout_state.state_manager
+                    .get_account(&from_addr)
+                    .map(|a| a.balance.0)
+                    .unwrap_or(0u128);
+                if balance_raw == 0 {
+                    continue;
+                }
+
+                // Parse payout destination
+                let to_hex = payout_to.trim_start_matches("0x");
+                let to_addr = match hex::decode(to_hex) {
+                    Ok(b) if b.len() == 20 => {
+                        let mut arr = [0u8; 20];
+                        arr.copy_from_slice(&b);
+                        Address::new(arr)
+                    }
+                    _ => { warn!("Invalid payout address: {}", payout_to); continue; }
+                };
+
+                // Build and sign the transfer TX
+                let nonce = {
+                    let mut n = payout_state.nonce.lock().unwrap();
+                    let v = *n;
+                    *n += 1;
+                    v
+                };
+                let mut tx = Transaction::new(
+                    from_addr,
+                    nonce,
+                    TransactionPayload::Transfer {
+                        to:           to_addr,
+                        amount:       Balance(balance_raw),
+                        memo:         Some("auto-payout".to_string()),
+                        stealth_mode: false,
+                    },
+                    ShardId::from_u32(0),
+                    None,
+                    1, // chain_id testnet
+                );
+                if let Err(e) = tx.sign(&payout_state.node_keypair, false) {
+                    warn!("Auto-payout sign error: {e}");
+                    continue;
+                }
+                payout_state.pending_txs.lock().unwrap().push(tx);
+                last_payout_height = current_height;
+                info!(
+                    "💸 Auto-payout: {} uEGOC → {}  (block {})",
+                    balance_raw, payout_to, current_height
+                );
+            }
+        });
+    }
 
     if config.enable_interactive {
         info!("🖥️ Starting interactive mode");
@@ -280,6 +387,19 @@ fn parse_cli_args() -> NodeConfig {
                 .help("Disable AutoNAT")
                 .action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("payout-address")
+                .long("payout-address")
+                .help("Auto-forward earned EGOC to this address every N blocks")
+                .value_name("ADDRESS"),
+        )
+        .arg(
+            Arg::new("payout-interval")
+                .long("payout-interval")
+                .help("Blocks between automatic reward sweeps (default: 100)")
+                .default_value("100")
+                .value_name("BLOCKS"),
+        )
         .get_matches();
 
     let node_type = matches.get_one::<String>("type").unwrap().clone();
@@ -356,6 +476,13 @@ fn parse_cli_args() -> NodeConfig {
     let enable_mdns = !matches.get_flag("disable-mdns");
     let enable_autonat = !matches.get_flag("disable-autonat");
 
+    let payout_address = matches.get_one::<String>("payout-address").cloned();
+    let payout_interval_blocks: u64 = matches
+        .get_one::<String>("payout-interval")
+        .unwrap()
+        .parse()
+        .unwrap_or(100);
+
     NodeConfig {
         node_type,
         roles,
@@ -381,6 +508,8 @@ fn parse_cli_args() -> NodeConfig {
         connection_timeout_secs: 30,
         enable_mdns,
         enable_autonat,
+        payout_address,
+        payout_interval_blocks,
     }
 }
 

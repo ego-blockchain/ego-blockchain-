@@ -1,9 +1,11 @@
 pub mod bandwidth_sharing;
 pub mod data_optimizer;
+pub mod engine;
 pub mod keystore;
 pub mod network_manager;
 pub mod node;
 pub mod rpc;
+pub mod supervisor;
 
 pub use bandwidth_sharing::*;
 pub use data_optimizer::*;

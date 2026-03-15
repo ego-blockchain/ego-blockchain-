@@ -1,0 +1,204 @@
+// EGO-15: Government Services Standard
+// PublicProcurement — transparent tender lifecycle management
+// Storage prefix: ego15p:
+
+contract PublicProcurement {
+
+event TenderPublished(tender_id: u64, title: String, budget: u128, deadline: u64)
+event BidSubmitted(tender_id: u64, bid_id: u64, bidder: address, price: u128)
+event TenderAwarded(tender_id: u64, bid_id: u64, winner: address, amount: u128)
+event TenderCompleted(tender_id: u64, deliverable_hash: String)
+event PaymentReleased(tender_id: u64, contractor: address, amount: u128)
+
+// ── Initialisation ────────────────────────────────────────────────────────────
+
+pub fn init(authority_addr: address) {
+    storage_set_address("ego15p:authority", authority_addr);
+    storage_set_u64("ego15p:tender_count", 0);
+    storage_set_u64("ego15p:bid_count", 0);
+}
+
+// ── Tender lifecycle ──────────────────────────────────────────────────────────
+
+// Publish a new public tender.
+// Returns the new tender_id (1-indexed).
+pub fn publish_tender(title: String, description_hash: String, budget_max: u128, deadline: u64) -> u64 {
+    _require_authority();
+    require(budget_max > 0, "budget must be positive");
+    require(deadline > block_number(), "deadline must be in the future");
+
+    let count: u64 = storage_get_u64("ego15p:tender_count");
+    let tender_id: u64 = count + 1;
+    storage_set_u64("ego15p:tender_count", tender_id);
+
+    let tbase: String = concat("ego15p:tender:", u64_to_str(tender_id));
+    storage_set_str(concat(tbase, ":title"), title);
+    storage_set_str(concat(tbase, ":description_hash"), description_hash);
+    storage_set_u128(concat(tbase, ":budget_max"), budget_max);
+    storage_set_u64(concat(tbase, ":deadline"), deadline);
+    storage_set_str(concat(tbase, ":status"), "Open");
+    storage_set_u64(concat(tbase, ":winning_bid_id"), 0);
+
+    emit TenderPublished(tender_id, title, budget_max, deadline);
+    return tender_id;
+}
+
+// Submit a bid on an open tender.
+// Returns the new bid_id (1-indexed).
+pub fn submit_bid(tender_id: u64, price: u128, proposal_hash: String) -> u64 {
+    let tbase: String = concat("ego15p:tender:", u64_to_str(tender_id));
+    let status: String = storage_get_str(concat(tbase, ":status"));
+    require(status == "Open", "tender is not open");
+
+    let deadline: u64 = storage_get_u64(concat(tbase, ":deadline"));
+    require(block_number() < deadline, "tender deadline has passed");
+
+    let budget_max: u128 = storage_get_u128(concat(tbase, ":budget_max"));
+    require(price <= budget_max, "bid price exceeds budget maximum");
+    require(price > 0, "bid price must be positive");
+
+    let bcount: u64 = storage_get_u64("ego15p:bid_count");
+    let bid_id: u64 = bcount + 1;
+    storage_set_u64("ego15p:bid_count", bid_id);
+
+    let bbase: String = concat("ego15p:bid:", u64_to_str(bid_id));
+    storage_set_u64(concat(bbase, ":tender_id"), tender_id);
+    storage_set_address(concat(bbase, ":bidder"), caller());
+    storage_set_u128(concat(bbase, ":price"), price);
+    storage_set_str(concat(bbase, ":proposal_hash"), proposal_hash);
+    storage_set_str(concat(bbase, ":status"), "pending");
+
+    emit BidSubmitted(tender_id, bid_id, caller(), price);
+    return bid_id;
+}
+
+// Award a tender to a winning bid.
+// Tender must be in "Open" or "Evaluating" status.
+pub fn award_tender(tender_id: u64, winning_bid_id: u64) {
+    _require_authority();
+
+    let tbase: String = concat("ego15p:tender:", u64_to_str(tender_id));
+    let status: String = storage_get_str(concat(tbase, ":status"));
+    require(status == "Open" || status == "Evaluating", "tender cannot be awarded in current status");
+
+    // Verify the bid belongs to this tender
+    let bbase: String = concat("ego15p:bid:", u64_to_str(winning_bid_id));
+    let bid_tender: u64 = storage_get_u64(concat(bbase, ":tender_id"));
+    require(bid_tender == tender_id, "bid does not belong to this tender");
+
+    let winner: address = storage_get_address(concat(bbase, ":bidder"));
+    let amount: u128 = storage_get_u128(concat(bbase, ":price"));
+
+    storage_set_u64(concat(tbase, ":winning_bid_id"), winning_bid_id);
+    storage_set_address(concat(tbase, ":winning_bidder"), winner);
+    storage_set_str(concat(tbase, ":status"), "Awarded");
+    storage_set_str(concat(bbase, ":status"), "awarded");
+
+    emit TenderAwarded(tender_id, winning_bid_id, winner, amount);
+}
+
+// Reject a specific bid (e.g. non-compliant proposal).
+pub fn reject_bid(tender_id: u64, bid_id: u64, reason: String) {
+    _require_authority();
+
+    let bbase: String = concat("ego15p:bid:", u64_to_str(bid_id));
+    let bid_tender: u64 = storage_get_u64(concat(bbase, ":tender_id"));
+    require(bid_tender == tender_id, "bid does not belong to this tender");
+
+    storage_set_str(concat(bbase, ":status"), "rejected");
+    storage_set_str(concat(bbase, ":rejection_reason"), reason);
+}
+
+// Winning contractor signals delivery by submitting the deliverable hash.
+pub fn complete_tender(tender_id: u64, deliverable_hash: String) {
+    let tbase: String = concat("ego15p:tender:", u64_to_str(tender_id));
+    let status: String = storage_get_str(concat(tbase, ":status"));
+    require(status == "Awarded", "tender is not in Awarded status");
+
+    let winner: address = storage_get_address(concat(tbase, ":winning_bidder"));
+    require(caller() == winner, "caller is not the winning bidder");
+
+    storage_set_str(concat(tbase, ":deliverable_hash"), deliverable_hash);
+    storage_set_str(concat(tbase, ":status"), "PendingApproval");
+
+    emit TenderCompleted(tender_id, deliverable_hash);
+}
+
+// Authority approves the deliverable and releases payment.
+pub fn approve_completion(tender_id: u64) {
+    _require_authority();
+
+    let tbase: String = concat("ego15p:tender:", u64_to_str(tender_id));
+    let status: String = storage_get_str(concat(tbase, ":status"));
+    require(status == "PendingApproval", "tender is not pending approval");
+
+    storage_set_str(concat(tbase, ":status"), "Completed");
+
+    let contractor: address = storage_get_address(concat(tbase, ":winning_bidder"));
+    let winning_bid_id: u64 = storage_get_u64(concat(tbase, ":winning_bid_id"));
+    let bbase: String = concat("ego15p:bid:", u64_to_str(winning_bid_id));
+    let amount: u128 = storage_get_u128(concat(bbase, ":price"));
+
+    emit PaymentReleased(tender_id, contractor, amount);
+}
+
+// Cancel a tender that has not yet been completed.
+pub fn cancel_tender(tender_id: u64, reason: String) {
+    _require_authority();
+
+    let tbase: String = concat("ego15p:tender:", u64_to_str(tender_id));
+    let status: String = storage_get_str(concat(tbase, ":status"));
+    require(status != "Completed", "cannot cancel a completed tender");
+    require(status != "Cancelled", "tender already cancelled");
+
+    storage_set_str(concat(tbase, ":status"), "Cancelled");
+    storage_set_str(concat(tbase, ":cancel_reason"), reason);
+}
+
+// ── View functions ────────────────────────────────────────────────────────────
+
+pub fn get_tender_status(tender_id: u64) -> String {
+    let tbase: String = concat("ego15p:tender:", u64_to_str(tender_id));
+    return storage_get_str(concat(tbase, ":status"));
+}
+
+pub fn get_bid_status(bid_id: u64) -> String {
+    let bbase: String = concat("ego15p:bid:", u64_to_str(bid_id));
+    return storage_get_str(concat(bbase, ":status"));
+}
+
+pub fn get_tender_count() -> u64 {
+    return storage_get_u64("ego15p:tender_count");
+}
+
+pub fn get_bid_count() -> u64 {
+    return storage_get_u64("ego15p:bid_count");
+}
+
+pub fn get_tender_budget(tender_id: u64) -> u128 {
+    let tbase: String = concat("ego15p:tender:", u64_to_str(tender_id));
+    return storage_get_u128(concat(tbase, ":budget_max"));
+}
+
+pub fn get_tender_deadline(tender_id: u64) -> u64 {
+    let tbase: String = concat("ego15p:tender:", u64_to_str(tender_id));
+    return storage_get_u64(concat(tbase, ":deadline"));
+}
+
+pub fn get_winning_bidder(tender_id: u64) -> address {
+    let tbase: String = concat("ego15p:tender:", u64_to_str(tender_id));
+    return storage_get_address(concat(tbase, ":winning_bidder"));
+}
+
+pub fn get_authority() -> address {
+    return storage_get_address("ego15p:authority");
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn _require_authority() {
+    let auth: address = storage_get_address("ego15p:authority");
+    require(caller() == auth, "caller is not authority");
+}
+
+}

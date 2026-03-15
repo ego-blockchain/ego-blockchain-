@@ -1,0 +1,1098 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ego Blockchain Explorer</title>
+<style>
+  :root {
+    --bg:         #0f0f1a;
+    --bg2:        #1a1a2e;
+    --bg3:        #12122a;
+    --border:     #2d2d4e;
+    --border2:    #3d3d6e;
+    --purple:     #7c3aed;
+    --purple-l:   #9d63f5;
+    --purple-d:   #5b21b6;
+    --purple-bg:  rgba(124,58,237,0.12);
+    --purple-glow:rgba(124,58,237,0.35);
+    --text:       #e2e8f0;
+    --text-muted: #8892aa;
+    --text-dim:   #556080;
+    --green:      #10b981;
+    --red:        #ef4444;
+    --yellow:     #f59e0b;
+    --radius:     10px;
+    --radius-sm:  6px;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    font-size: 14px;
+    line-height: 1.6;
+  }
+
+  /* ── Scrollbar ── */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--purple); }
+
+  /* ── Nav ── */
+  #navbar {
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(15,15,26,0.92);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px;
+    height: 58px;
+    display: flex; align-items: center; gap: 0;
+  }
+  .nav-logo {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 17px; font-weight: 700; letter-spacing: -0.3px;
+    color: var(--text); text-decoration: none; margin-right: 32px;
+    flex-shrink: 0;
+  }
+  .nav-logo .logo-icon {
+    width: 30px; height: 30px;
+    background: linear-gradient(135deg, var(--purple), #a855f7);
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px; font-weight: 800; color: #fff;
+    box-shadow: 0 0 16px var(--purple-glow);
+  }
+  .nav-links {
+    display: flex; align-items: center; gap: 2px;
+    flex: 1;
+  }
+  .nav-link {
+    padding: 6px 14px; border-radius: var(--radius-sm);
+    color: var(--text-muted); font-size: 13.5px; font-weight: 500;
+    cursor: pointer; transition: all .15s; user-select: none;
+    border: 1px solid transparent;
+  }
+  .nav-link:hover  { color: var(--text); background: var(--bg2); }
+  .nav-link.active { color: var(--purple-l); background: var(--purple-bg); border-color: rgba(124,58,237,0.3); }
+  .nav-right { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+  .refresh-badge {
+    display: flex; align-items: center; gap: 6px;
+    padding: 5px 12px; border-radius: 20px;
+    border: 1px solid var(--border);
+    font-size: 12px; color: var(--text-muted);
+    cursor: pointer; transition: all .15s;
+  }
+  .refresh-badge:hover { border-color: var(--purple); color: var(--text); }
+  .refresh-badge.on { border-color: var(--green); color: var(--green); }
+  .refresh-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-dim); }
+  .refresh-badge.on .refresh-dot { background: var(--green); animation: pulse 1.5s ease-in-out infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(0.85)} }
+  .settings-btn {
+    width: 34px; height: 34px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border); background: transparent;
+    color: var(--text-muted); cursor: pointer; transition: all .15s;
+    display: flex; align-items: center; justify-content: center; font-size: 16px;
+  }
+  .settings-btn:hover { border-color: var(--purple); color: var(--purple-l); background: var(--purple-bg); }
+
+  /* ── Main layout ── */
+  #app { max-width: 1200px; margin: 0 auto; padding: 28px 20px 60px; }
+
+  /* ── Pages ── */
+  .page { display: none; animation: fadeUp .2s ease; }
+  .page.active { display: block; }
+  @keyframes fadeUp { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+
+  /* ── Search bar ── */
+  .search-wrap {
+    background: linear-gradient(135deg, rgba(124,58,237,0.15) 0%, rgba(90,30,180,0.08) 100%);
+    border: 1px solid rgba(124,58,237,0.3);
+    border-radius: 14px; padding: 28px 32px 24px; margin-bottom: 28px;
+    position: relative; overflow: hidden;
+  }
+  .search-wrap::before {
+    content: ''; position: absolute; top: -60px; right: -60px;
+    width: 220px; height: 220px;
+    background: radial-gradient(circle, rgba(124,58,237,0.2), transparent 70%);
+    pointer-events: none;
+  }
+  .search-wrap h1 { font-size: 22px; font-weight: 700; margin-bottom: 4px; }
+  .search-wrap p { color: var(--text-muted); margin-bottom: 18px; font-size: 13.5px; }
+  .search-row { display: flex; gap: 10px; }
+  .search-input {
+    flex: 1; background: rgba(0,0,0,0.35); border: 1px solid var(--border2);
+    border-radius: var(--radius-sm); padding: 10px 16px;
+    color: var(--text); font-size: 14px; outline: none; transition: border-color .15s;
+    font-family: 'SF Mono', 'Fira Mono', monospace;
+  }
+  .search-input::placeholder { color: var(--text-dim); font-family: system-ui; }
+  .search-input:focus { border-color: var(--purple); box-shadow: 0 0 0 3px var(--purple-bg); }
+  .btn {
+    padding: 10px 20px; border-radius: var(--radius-sm);
+    border: none; font-size: 14px; font-weight: 600; cursor: pointer;
+    transition: all .15s; display: inline-flex; align-items: center; gap: 7px;
+  }
+  .btn-primary { background: var(--purple); color: #fff; }
+  .btn-primary:hover { background: var(--purple-l); box-shadow: 0 4px 16px var(--purple-glow); }
+  .btn-ghost { background: transparent; color: var(--text-muted); border: 1px solid var(--border); }
+  .btn-ghost:hover { border-color: var(--border2); color: var(--text); }
+  .btn-sm { padding: 6px 14px; font-size: 12.5px; }
+
+  /* ── Stats row ── */
+  .stats-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 26px;
+  }
+  @media (max-width:780px) { .stats-grid { grid-template-columns: repeat(2,1fr); } }
+  @media (max-width:460px) { .stats-grid { grid-template-columns: 1fr; } }
+  .stat-card {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px 20px;
+    transition: border-color .2s, transform .2s;
+  }
+  .stat-card:hover { border-color: var(--border2); transform: translateY(-2px); }
+  .stat-label { font-size: 11.5px; text-transform: uppercase; letter-spacing: .07em; color: var(--text-muted); margin-bottom: 8px; }
+  .stat-value { font-size: 24px; font-weight: 700; letter-spacing: -0.5px; color: var(--text); }
+  .stat-value.mono { font-family: 'SF Mono', 'Fira Mono', monospace; font-size: 13px; font-weight: 500; }
+  .stat-sub { font-size: 11px; color: var(--text-dim); margin-top: 3px; }
+  .stat-icon { font-size: 20px; margin-bottom: 8px; }
+
+  /* ── Two-column grid ── */
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width:860px) { .two-col { grid-template-columns: 1fr; } }
+
+  /* ── Card ── */
+  .card {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: var(--radius); overflow: hidden;
+  }
+  .card-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 20px; border-bottom: 1px solid var(--border);
+    background: rgba(0,0,0,0.18);
+  }
+  .card-title { font-size: 14px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 8px; }
+  .card-badge {
+    font-size: 11px; padding: 2px 8px; border-radius: 20px;
+    background: var(--purple-bg); color: var(--purple-l); font-weight: 600;
+  }
+  .card-link { font-size: 12px; color: var(--purple-l); cursor: pointer; }
+  .card-link:hover { text-decoration: underline; }
+
+  /* ── Table ── */
+  .tbl { width: 100%; border-collapse: collapse; }
+  .tbl th {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--text-dim); font-weight: 600; padding: 10px 16px;
+    text-align: left; border-bottom: 1px solid var(--border);
+  }
+  .tbl td { padding: 11px 16px; border-bottom: 1px solid rgba(45,45,78,0.5); vertical-align: middle; }
+  .tbl tr:last-child td { border-bottom: none; }
+  .tbl tbody tr { transition: background .12s; cursor: pointer; }
+  .tbl tbody tr:hover { background: rgba(124,58,237,0.06); }
+  .tbl-empty { padding: 32px; text-align: center; color: var(--text-muted); font-size: 13px; }
+
+  /* ── Mono hash ── */
+  .hash {
+    font-family: 'SF Mono', 'Fira Mono', monospace; font-size: 12.5px;
+    color: var(--purple-l); cursor: pointer; transition: color .12s;
+    white-space: nowrap;
+  }
+  .hash:hover { color: #c4b5fd; }
+  .hash.addr { color: #60a5fa; }
+  .hash.addr:hover { color: #93c5fd; }
+
+  /* ── Status badges ── */
+  .badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 600;
+           padding: 3px 9px; border-radius: 20px; }
+  .badge-green  { background: rgba(16,185,129,.15); color: var(--green); }
+  .badge-red    { background: rgba(239,68,68,.15);  color: var(--red); }
+  .badge-yellow { background: rgba(245,158,11,.15); color: var(--yellow); }
+  .badge-purple { background: var(--purple-bg); color: var(--purple-l); }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+  /* ── Page header ── */
+  .page-header { margin-bottom: 24px; display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+  .page-header-text h2 { font-size: 20px; font-weight: 700; margin-bottom: 3px; }
+  .page-header-text p { color: var(--text-muted); font-size: 13px; }
+  .breadcrumb { font-size: 12.5px; color: var(--text-dim); margin-bottom: 6px; display: flex; align-items: center; gap: 6px; }
+  .breadcrumb span { cursor: pointer; transition: color .12s; }
+  .breadcrumb span:hover { color: var(--purple-l); }
+  .breadcrumb-sep { color: var(--text-dim); }
+
+  /* ── Detail card ── */
+  .detail-card {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: var(--radius); margin-bottom: 20px;
+  }
+  .detail-row {
+    display: grid; grid-template-columns: 180px 1fr;
+    padding: 13px 20px; border-bottom: 1px solid rgba(45,45,78,0.5);
+    align-items: start; gap: 12px;
+  }
+  .detail-row:last-child { border-bottom: none; }
+  .detail-key { font-size: 12.5px; font-weight: 600; color: var(--text-muted); padding-top: 2px; }
+  .detail-val { font-size: 13.5px; color: var(--text); word-break: break-all; }
+  .detail-val .hash { font-size: 13px; }
+
+  /* ── JSON viewer ── */
+  pre.json-view {
+    background: var(--bg3); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 16px 18px;
+    font-size: 12px; font-family: 'SF Mono', 'Fira Mono', monospace;
+    overflow-x: auto; color: #c4b5fd; line-height: 1.7;
+    max-height: 400px; overflow-y: auto;
+  }
+
+  /* ── Loading spinner ── */
+  .spinner {
+    display: inline-block; width: 18px; height: 18px;
+    border: 2px solid var(--border2); border-top-color: var(--purple);
+    border-radius: 50%; animation: spin .7s linear infinite;
+  }
+  .spinner-lg { width: 36px; height: 36px; border-width: 3px; }
+  @keyframes spin { to{transform:rotate(360deg)} }
+  .loading-row { padding: 40px; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 14px; color: var(--text-muted); }
+
+  /* ── Error banner ── */
+  .error-banner {
+    background: rgba(239,68,68,.1); border: 1px solid rgba(239,68,68,.35);
+    border-radius: var(--radius-sm); padding: 12px 16px; margin-bottom: 20px;
+    color: #fca5a5; font-size: 13px; display: flex; align-items: center; gap: 10px;
+  }
+
+  /* ── Modal ── */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.65);
+    backdrop-filter: blur(4px); z-index: 200;
+    display: none; align-items: center; justify-content: center;
+  }
+  .modal-overlay.open { display: flex; animation: fadeIn .15s; }
+  @keyframes fadeIn { from{opacity:0} to{opacity:1} }
+  .modal {
+    background: var(--bg2); border: 1px solid var(--border2);
+    border-radius: 14px; padding: 28px; width: 480px; max-width: calc(100vw - 32px);
+    position: relative;
+  }
+  .modal h3 { font-size: 17px; font-weight: 700; margin-bottom: 18px; }
+  .modal-close {
+    position: absolute; top: 14px; right: 16px;
+    background: none; border: none; color: var(--text-muted);
+    font-size: 20px; cursor: pointer; line-height: 1;
+  }
+  .modal-close:hover { color: var(--text); }
+  .form-group { margin-bottom: 16px; }
+  .form-label { display: block; font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: .06em; }
+  .form-input {
+    width: 100%; background: rgba(0,0,0,.35); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 9px 12px; color: var(--text);
+    font-size: 13px; font-family: 'SF Mono','Fira Mono',monospace; outline: none;
+    transition: border-color .15s;
+  }
+  .form-input:focus { border-color: var(--purple); }
+
+  /* ── Node status ── */
+  .health-grid { display: grid; grid-template-columns: repeat(2,1fr); gap: 14px; margin-bottom: 20px; }
+  @media (max-width:580px) { .health-grid { grid-template-columns: 1fr; } }
+  .health-item {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 14px 16px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .health-icon { font-size: 22px; flex-shrink: 0; }
+  .health-label { font-size: 12px; color: var(--text-muted); margin-bottom: 2px; }
+  .health-val { font-size: 16px; font-weight: 700; }
+
+  /* ── Copy toast ── */
+  #toast {
+    position: fixed; bottom: 30px; right: 30px; z-index: 999;
+    background: #1e1e3a; border: 1px solid var(--purple);
+    color: var(--purple-l); padding: 10px 18px; border-radius: var(--radius-sm);
+    font-size: 13px; font-weight: 500;
+    transform: translateY(20px); opacity: 0; pointer-events: none;
+    transition: all .25s; display: flex; align-items: center; gap: 8px;
+  }
+  #toast.show { transform: translateY(0); opacity: 1; }
+
+  /* ── Arrow ── */
+  .arrow { color: var(--text-dim); font-size: 12px; margin: 0 4px; }
+
+  /* ── Faucet section ── */
+  .faucet-row { display: flex; gap: 10px; align-items: stretch; }
+  .faucet-row .search-input { font-size: 13px; }
+
+  /* ── Blocks page ── */
+  .page-toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
+
+  /* ── Address amount ── */
+  .amount { font-family: 'SF Mono','Fira Mono',monospace; font-size: 13px; color: var(--text); }
+  .amount.recv { color: var(--green); }
+  .amount.send { color: var(--red); }
+</style>
+</head>
+<body>
+
+<!-- Navbar -->
+<nav id="navbar">
+  <a class="nav-logo" href="#" onclick="navigate('home');return false;">
+    <div class="logo-icon">E</div>
+    <span>Ego Explorer</span>
+  </a>
+  <div class="nav-links">
+    <div class="nav-link active" data-page="home"    onclick="navigate('home')">Home</div>
+    <div class="nav-link"        data-page="blocks"  onclick="navigate('blocks')">Blocks</div>
+    <div class="nav-link"        data-page="txns"    onclick="navigate('txns')">Transactions</div>
+    <div class="nav-link"        data-page="status"  onclick="navigate('status')">Node Status</div>
+    <div class="nav-link"        data-page="faucet"  onclick="navigate('faucet')">Faucet</div>
+  </div>
+  <div class="nav-right">
+    <div class="refresh-badge on" id="refreshBadge" onclick="toggleAutoRefresh()">
+      <div class="refresh-dot"></div>
+      <span id="refreshLabel">Live</span>
+    </div>
+    <button class="settings-btn" onclick="openSettings()" title="Settings">⚙</button>
+  </div>
+</nav>
+
+<!-- Main -->
+<div id="app">
+
+  <!-- ── HOME ── -->
+  <div class="page active" id="page-home">
+    <div class="search-wrap">
+      <h1>Ego Blockchain Explorer</h1>
+      <p>Search by block height, transaction hash, or wallet address</p>
+      <div class="search-row">
+        <input class="search-input" id="searchInput" placeholder="Block height / Tx hash (0x...) / Address (0x...)"
+               onkeydown="if(event.key==='Enter')doSearch()">
+        <button class="btn btn-primary" onclick="doSearch()">Search</button>
+      </div>
+    </div>
+    <div id="homeError"></div>
+    <div class="stats-grid" id="statsGrid">
+      <div class="stat-card"><div class="stat-icon">⛏</div><div class="stat-label">Block Height</div><div class="stat-value" id="s-height">—</div></div>
+      <div class="stat-card"><div class="stat-icon">⚡</div><div class="stat-label">TPS (last 10)</div><div class="stat-value" id="s-tps">—</div></div>
+      <div class="stat-card"><div class="stat-icon">🔄</div><div class="stat-label">Pending Txs</div><div class="stat-value" id="s-txcount">—</div></div>
+      <div class="stat-card"><div class="stat-icon">🌐</div><div class="stat-label">Peer ID</div><div class="stat-value mono" id="s-peerid">—</div></div>
+    </div>
+    <div class="two-col">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">⛏ Latest Blocks</div>
+          <span class="card-link" onclick="navigate('blocks')">View all →</span>
+        </div>
+        <div id="latestBlocksBody">
+          <div class="loading-row"><div class="spinner"></div><span>Loading blocks…</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">🔄 Latest Transactions</div>
+          <span class="card-link" onclick="navigate('txns')">View all →</span>
+        </div>
+        <div id="latestTxBody">
+          <div class="loading-row"><div class="spinner"></div><span>Loading transactions…</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── BLOCKS ── -->
+  <div class="page" id="page-blocks">
+    <div class="page-toolbar">
+      <div class="page-header-text">
+        <h2>All Blocks</h2>
+        <p style="color:var(--text-muted);font-size:13px">Last 50 blocks produced by the network</p>
+      </div>
+    </div>
+    <div id="blocksError"></div>
+    <div class="card">
+      <div id="allBlocksBody">
+        <div class="loading-row"><div class="spinner"></div><span>Loading…</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── TRANSACTIONS ── -->
+  <div class="page" id="page-txns">
+    <div class="page-toolbar">
+      <div class="page-header-text">
+        <h2>Pending Transactions</h2>
+        <p style="color:var(--text-muted);font-size:13px">Transactions in the mempool awaiting inclusion</p>
+      </div>
+    </div>
+    <div id="txnsError"></div>
+    <div class="card">
+      <div id="allTxnsBody">
+        <div class="loading-row"><div class="spinner"></div><span>Loading…</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── BLOCK DETAIL ── -->
+  <div class="page" id="page-block-detail">
+    <div class="breadcrumb">
+      <span onclick="navigate('home')">Home</span>
+      <span class="breadcrumb-sep">›</span>
+      <span onclick="navigate('blocks')">Blocks</span>
+      <span class="breadcrumb-sep">›</span>
+      <span id="bdetail-crumb">—</span>
+    </div>
+    <div class="page-header">
+      <div class="page-header-text">
+        <h2>Block Detail</h2>
+        <p>Detailed information for a single block</p>
+      </div>
+    </div>
+    <div id="blockDetailContent">
+      <div class="loading-row"><div class="spinner-lg spinner"></div><span>Loading block…</span></div>
+    </div>
+  </div>
+
+  <!-- ── TX DETAIL ── -->
+  <div class="page" id="page-tx-detail">
+    <div class="breadcrumb">
+      <span onclick="navigate('home')">Home</span>
+      <span class="breadcrumb-sep">›</span>
+      <span onclick="navigate('txns')">Transactions</span>
+      <span class="breadcrumb-sep">›</span>
+      <span id="txdetail-crumb">—</span>
+    </div>
+    <div class="page-header">
+      <div class="page-header-text">
+        <h2>Transaction Detail</h2>
+        <p>Full transaction information</p>
+      </div>
+    </div>
+    <div id="txDetailContent">
+      <div class="loading-row"><div class="spinner-lg spinner"></div><span>Loading transaction…</span></div>
+    </div>
+  </div>
+
+  <!-- ── ADDRESS DETAIL ── -->
+  <div class="page" id="page-address-detail">
+    <div class="breadcrumb">
+      <span onclick="navigate('home')">Home</span>
+      <span class="breadcrumb-sep">›</span>
+      <span id="addrdetail-crumb">Address</span>
+    </div>
+    <div class="page-header">
+      <div class="page-header-text">
+        <h2>Address</h2>
+        <p>Account balance and activity</p>
+      </div>
+    </div>
+    <div id="addressDetailContent">
+      <div class="loading-row"><div class="spinner-lg spinner"></div><span>Loading address…</span></div>
+    </div>
+  </div>
+
+  <!-- ── NODE STATUS ── -->
+  <div class="page" id="page-status">
+    <div class="page-header-text" style="margin-bottom:24px">
+      <h2>Node Status</h2>
+      <p style="color:var(--text-muted);font-size:13px">Live health and performance of the connected ego-node</p>
+    </div>
+    <div id="statusError"></div>
+    <div id="statusContent">
+      <div class="loading-row"><div class="spinner-lg spinner"></div><span>Connecting…</span></div>
+    </div>
+  </div>
+
+  <!-- ── FAUCET ── -->
+  <div class="page" id="page-faucet">
+    <div class="page-header-text" style="margin-bottom:24px">
+      <h2>Testnet Faucet</h2>
+      <p style="color:var(--text-muted);font-size:13px">Request 100 EGOC every 24 hours for testing</p>
+    </div>
+    <div id="faucetError"></div>
+    <div class="card" style="max-width:560px">
+      <div class="card-header">
+        <div class="card-title">💧 Request EGOC</div>
+        <div class="badge badge-yellow">100 EGOC / 24h</div>
+      </div>
+      <div style="padding:24px">
+        <div class="form-group">
+          <label class="form-label">Destination Address (0x hex)</label>
+          <input class="form-input" id="faucetAddr" placeholder="0x..." style="width:100%">
+        </div>
+        <button class="btn btn-primary" id="faucetBtn" onclick="claimFaucet()" style="width:100%">
+          Request 100 EGOC
+        </button>
+        <div id="faucetResult" style="margin-top:16px"></div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- #app -->
+
+<!-- Settings modal -->
+<div class="modal-overlay" id="settingsModal" onclick="if(event.target===this)closeSettings()">
+  <div class="modal">
+    <button class="modal-close" onclick="closeSettings()">×</button>
+    <h3>⚙ Explorer Settings</h3>
+    <div class="form-group">
+      <label class="form-label">Node RPC URL</label>
+      <input class="form-input" id="nodeUrlInput" value="http://localhost:8545">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Indexer URL</label>
+      <input class="form-input" id="indexerUrlInput" value="http://localhost:8546">
+    </div>
+    <div style="display:flex;gap:10px;margin-top:4px">
+      <button class="btn btn-primary" onclick="saveSettings()">Save & Reconnect</button>
+      <button class="btn btn-ghost" onclick="closeSettings()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Copy toast -->
+<div id="toast">✓ Copied to clipboard</div>
+
+<script>
+'use strict';
+
+// ── Config ───────────────────────────────────────────────────────────────────
+let CFG = {
+  nodeUrl:    localStorage.getItem('ego_node_url')    || 'http://localhost:8545',
+  indexerUrl: localStorage.getItem('ego_indexer_url') || 'http://localhost:8546',
+};
+let autoRefresh = true;
+let refreshTimer = null;
+let currentPage  = 'home';
+
+// ── Routing ──────────────────────────────────────────────────────────────────
+function navigate(page, params) {
+  // Hide all pages
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-link').forEach(l => {
+    l.classList.toggle('active', l.dataset.page === page);
+  });
+  currentPage = page;
+  const el = document.getElementById('page-' + page);
+  if (el) el.classList.add('active');
+  loadPage(page, params);
+}
+
+async function loadPage(page, params) {
+  switch (page) {
+    case 'home':         await loadHome();         break;
+    case 'blocks':       await loadBlocks();       break;
+    case 'txns':         await loadTxns();         break;
+    case 'block-detail': await loadBlockDetail(params); break;
+    case 'tx-detail':    await loadTxDetail(params);    break;
+    case 'address-detail': await loadAddressDetail(params); break;
+    case 'status':       await loadStatus();       break;
+    case 'faucet':       break;
+  }
+}
+
+// ── Auto-refresh ─────────────────────────────────────────────────────────────
+function scheduleRefresh() {
+  clearTimeout(refreshTimer);
+  if (!autoRefresh) return;
+  refreshTimer = setTimeout(() => {
+    const refreshablePages = ['home','blocks','txns','status'];
+    if (refreshablePages.includes(currentPage)) loadPage(currentPage);
+    scheduleRefresh();
+  }, 3000);
+}
+
+function toggleAutoRefresh() {
+  autoRefresh = !autoRefresh;
+  const badge = document.getElementById('refreshBadge');
+  const label = document.getElementById('refreshLabel');
+  badge.classList.toggle('on', autoRefresh);
+  label.textContent = autoRefresh ? 'Live' : 'Paused';
+  if (autoRefresh) scheduleRefresh();
+}
+
+// ── API helpers ───────────────────────────────────────────────────────────────
+async function api(path, baseUrl) {
+  const url = (baseUrl || CFG.nodeUrl) + path;
+  const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+async function apiIndexer(path) {
+  return api(path, CFG.indexerUrl);
+}
+
+// ── Formatters ───────────────────────────────────────────────────────────────
+function truncHash(h, head=8, tail=6) {
+  if (!h || h.length <= head + tail + 3) return h || '—';
+  return h.slice(0, head) + '…' + h.slice(-tail);
+}
+
+function timeAgo(tsSeconds) {
+  if (!tsSeconds) return '—';
+  const diff = Math.floor(Date.now() / 1000) - tsSeconds;
+  if (diff < 5)   return 'just now';
+  if (diff < 60)  return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff/60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff/3600)}h ago`;
+  return `${Math.floor(diff/86400)}d ago`;
+}
+
+function fmtDuration(secs) {
+  if (!secs) return '—';
+  const d = Math.floor(secs/86400);
+  const h = Math.floor((secs%86400)/3600);
+  const m = Math.floor((secs%3600)/60);
+  const s = secs % 60;
+  if (d) return `${d}d ${h}h ${m}m`;
+  if (h) return `${h}h ${m}m ${s}s`;
+  if (m) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+function fmtBytes(b) {
+  if (!b) return '0 B';
+  const u = ['B','KB','MB','GB'];
+  let i = 0; let n = b;
+  while (n >= 1024 && i < u.length-1) { n /= 1024; i++; }
+  return n.toFixed(1) + ' ' + u[i];
+}
+
+function numFmt(n) {
+  if (n === undefined || n === null) return '—';
+  return Number(n).toLocaleString();
+}
+
+// ── Copy-to-clipboard ─────────────────────────────────────────────────────────
+let toastTimer;
+function copyText(text) {
+  navigator.clipboard.writeText(text).catch(() => {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); document.body.removeChild(ta);
+  });
+  const t = document.getElementById('toast');
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 1800);
+}
+
+function hashEl(val, isAddr) {
+  const cls = isAddr ? 'hash addr' : 'hash';
+  const display = truncHash(val, isAddr ? 8 : 10, 6);
+  return `<span class="${cls}" title="${val}" onclick="copyText('${val}')">${display}</span>`;
+}
+
+// ── Search ────────────────────────────────────────────────────────────────────
+function doSearch() {
+  const raw = document.getElementById('searchInput').value.trim();
+  if (!raw) return;
+  // Block height: pure digits
+  if (/^\d+$/.test(raw)) { navigate('block-detail', { height: parseInt(raw, 10) }); return; }
+  // Tx hash or address: starts with 0x
+  if (raw.startsWith('0x')) {
+    if (raw.length <= 44) { navigate('address-detail', { address: raw }); return; }
+    navigate('tx-detail', { hash: raw });
+    return;
+  }
+  // Unknown
+  setError('homeError', `Cannot determine type for query: "${raw}". Use a block height (number), tx hash (0x + 64 hex), or address (0x + 40 hex).`);
+}
+
+// ── Error helpers ─────────────────────────────────────────────────────────────
+function setError(id, msg) {
+  const el = document.getElementById(id);
+  if (el) el.innerHTML = msg
+    ? `<div class="error-banner">⚠ ${msg}</div>`
+    : '';
+}
+
+// ── HOME ──────────────────────────────────────────────────────────────────────
+async function loadHome() {
+  setError('homeError', '');
+  try {
+    const [health, blocks, txns] = await Promise.all([
+      api('/health'),
+      api('/chain/blocks'),
+      api('/chain/transactions'),
+    ]);
+
+    // Stats
+    document.getElementById('s-height').textContent  = numFmt(health.block_height);
+    document.getElementById('s-txcount').textContent = numFmt(health.pending_tx_count ?? txns.length);
+    const peerEl = document.getElementById('s-peerid');
+    const pid = health.peer_id || '—';
+    peerEl.textContent = truncHash(pid, 8, 6);
+    peerEl.title = pid;
+    peerEl.style.cursor = 'pointer';
+    peerEl.onclick = () => copyText(pid);
+
+    // TPS estimate from last 10 blocks
+    const sorted = [...blocks].sort((a,b) => b.height - a.height).slice(0,10);
+    let tps = '—';
+    if (sorted.length >= 2) {
+      const totalTx = sorted.reduce((s,b) => s + (b.tx_count||0), 0);
+      const dt = sorted[0].timestamp - sorted[sorted.length-1].timestamp;
+      tps = dt > 0 ? (totalTx / dt).toFixed(2) : '~' + totalTx;
+    }
+    document.getElementById('s-tps').textContent = tps;
+
+    // Latest blocks table (last 10)
+    const latestBlocks = sorted.slice(0,10);
+    document.getElementById('latestBlocksBody').innerHTML = latestBlocks.length
+      ? `<table class="tbl">
+          <thead><tr>
+            <th>Height</th><th>Hash</th><th>Txs</th><th>Age</th>
+          </tr></thead>
+          <tbody>
+            ${latestBlocks.map(b => `<tr onclick="navigate('block-detail',{height:${b.height}})">
+              <td><span class="badge badge-purple">${numFmt(b.height)}</span></td>
+              <td>${hashEl(b.hash)}</td>
+              <td>${b.tx_count ?? 0}</td>
+              <td style="color:var(--text-muted)">${timeAgo(b.timestamp)}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table>`
+      : `<div class="tbl-empty">No blocks found — node may be starting up</div>`;
+
+    // Latest transactions (last 10)
+    const latestTxns = [...txns].slice(-10).reverse();
+    document.getElementById('latestTxBody').innerHTML = latestTxns.length
+      ? `<table class="tbl">
+          <thead><tr>
+            <th>Hash</th><th>From</th><th>Nonce</th>
+          </tr></thead>
+          <tbody>
+            ${latestTxns.map(tx => `<tr onclick="navigate('tx-detail',{hash:'${tx.hash}',tx:${JSON.stringify(JSON.stringify(tx))}})">
+              <td>${hashEl(tx.hash)}</td>
+              <td>${hashEl(tx.from, true)}</td>
+              <td><span style="color:var(--text-muted)">${tx.nonce ?? '—'}</span></td>
+            </tr>`).join('')}
+          </tbody>
+        </table>`
+      : `<div class="tbl-empty">No pending transactions</div>`;
+
+  } catch (e) {
+    setError('homeError', `Cannot connect to node at ${CFG.nodeUrl} — ${e.message}`);
+    document.getElementById('latestBlocksBody').innerHTML = `<div class="tbl-empty">Unavailable</div>`;
+    document.getElementById('latestTxBody').innerHTML     = `<div class="tbl-empty">Unavailable</div>`;
+  }
+}
+
+// ── BLOCKS ────────────────────────────────────────────────────────────────────
+async function loadBlocks() {
+  setError('blocksError', '');
+  document.getElementById('allBlocksBody').innerHTML = `<div class="loading-row"><div class="spinner"></div><span>Loading blocks…</span></div>`;
+  try {
+    const blocks = await api('/chain/blocks');
+    const sorted = [...blocks].sort((a,b) => b.height - a.height);
+    document.getElementById('allBlocksBody').innerHTML = sorted.length
+      ? `<table class="tbl">
+          <thead><tr>
+            <th>Height</th><th>Hash</th><th>Transactions</th><th>Timestamp</th><th>Age</th>
+          </tr></thead>
+          <tbody>
+            ${sorted.map(b => `<tr onclick="navigate('block-detail',{height:${b.height}})">
+              <td><span class="badge badge-purple">${numFmt(b.height)}</span></td>
+              <td>${hashEl(b.hash)}</td>
+              <td>${b.tx_count ?? 0}</td>
+              <td style="color:var(--text-muted);font-size:12px">${b.timestamp ? new Date(b.timestamp*1000).toLocaleString() : '—'}</td>
+              <td style="color:var(--text-muted)">${timeAgo(b.timestamp)}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table>`
+      : `<div class="tbl-empty">No blocks available</div>`;
+  } catch(e) {
+    setError('blocksError', `Failed to load blocks: ${e.message}`);
+    document.getElementById('allBlocksBody').innerHTML = `<div class="tbl-empty">Error loading blocks</div>`;
+  }
+}
+
+// ── TRANSACTIONS ──────────────────────────────────────────────────────────────
+async function loadTxns() {
+  setError('txnsError', '');
+  document.getElementById('allTxnsBody').innerHTML = `<div class="loading-row"><div class="spinner"></div><span>Loading transactions…</span></div>`;
+  try {
+    const txns = await api('/chain/transactions');
+    const rev  = [...txns].reverse();
+    document.getElementById('allTxnsBody').innerHTML = rev.length
+      ? `<table class="tbl">
+          <thead><tr>
+            <th>Hash</th><th>From</th><th>Nonce</th>
+          </tr></thead>
+          <tbody>
+            ${rev.map(tx => `<tr onclick="openTxFromList(${JSON.stringify(JSON.stringify(tx))})">
+              <td>${hashEl(tx.hash)}</td>
+              <td>${hashEl(tx.from, true)}</td>
+              <td><span style="color:var(--text-muted)">${tx.nonce ?? '—'}</span></td>
+            </tr>`).join('')}
+          </tbody>
+        </table>`
+      : `<div class="tbl-empty">No pending transactions in mempool</div>`;
+  } catch(e) {
+    setError('txnsError', `Failed to load transactions: ${e.message}`);
+    document.getElementById('allTxnsBody').innerHTML = `<div class="tbl-empty">Error loading transactions</div>`;
+  }
+}
+
+function openTxFromList(txJson) {
+  const tx = JSON.parse(txJson);
+  navigate('tx-detail', { hash: tx.hash, txObj: tx });
+}
+
+// ── BLOCK DETAIL ──────────────────────────────────────────────────────────────
+async function loadBlockDetail(params) {
+  const height = params && params.height;
+  document.getElementById('bdetail-crumb').textContent = height !== undefined ? `#${numFmt(height)}` : '—';
+  const el = document.getElementById('blockDetailContent');
+  el.innerHTML = `<div class="loading-row"><div class="spinner-lg spinner"></div><span>Loading block ${height}…</span></div>`;
+  if (height === undefined) { el.innerHTML = `<div class="error-banner">⚠ No block height provided</div>`; return; }
+  try {
+    const b = await api(`/block/${height}`);
+    el.innerHTML = `
+      <div class="detail-card">
+        <div class="detail-row"><div class="detail-key">Height</div><div class="detail-val"><span class="badge badge-purple">#${numFmt(b.height)}</span></div></div>
+        <div class="detail-row"><div class="detail-key">Hash</div><div class="detail-val">${hashEl(b.hash)}<span style="color:var(--text-dim);margin-left:8px;font-size:12px">(click to copy)</span></div></div>
+        <div class="detail-row"><div class="detail-key">Transactions</div><div class="detail-val">${b.tx_count ?? 0}</div></div>
+        <div class="detail-row"><div class="detail-key">Timestamp</div><div class="detail-val">${b.timestamp ? new Date(b.timestamp*1000).toLocaleString() + ' (' + timeAgo(b.timestamp) + ')' : '—'}</div></div>
+      </div>
+      <div class="card">
+        <div class="card-header"><div class="card-title">Transactions in Block #${numFmt(b.height)}</div><div class="card-badge">${b.tx_count ?? 0}</div></div>
+        <div class="tbl-empty" style="padding:24px">${(b.tx_count ?? 0) === 0 ? 'No transactions in this block' : 'Transaction list not available — query the mempool for full TX data'}</div>
+      </div>`;
+  } catch(e) {
+    el.innerHTML = `<div class="error-banner">⚠ Block #${height} not found: ${e.message}</div>`;
+  }
+}
+
+// ── TX DETAIL ─────────────────────────────────────────────────────────────────
+async function loadTxDetail(params) {
+  const hash = params && (params.hash || params.tx_hash);
+  const preloaded = params && params.txObj;
+  document.getElementById('txdetail-crumb').textContent = hash ? truncHash(hash) : '—';
+  const el = document.getElementById('txDetailContent');
+
+  const renderTx = (tx) => {
+    const raw = JSON.parse(typeof tx === 'string' ? tx : JSON.stringify(tx));
+    el.innerHTML = `
+      <div class="detail-card">
+        <div class="detail-row"><div class="detail-key">Hash</div><div class="detail-val">${hashEl(raw.hash || hash)}</div></div>
+        <div class="detail-row"><div class="detail-key">From</div><div class="detail-val">${hashEl(raw.from, true)}</div></div>
+        ${raw.to ? `<div class="detail-row"><div class="detail-key">To</div><div class="detail-val">${hashEl(raw.to, true)}</div></div>` : ''}
+        <div class="detail-row"><div class="detail-key">Nonce</div><div class="detail-val">${raw.nonce ?? '—'}</div></div>
+        <div class="detail-row"><div class="detail-key">Status</div><div class="detail-val"><span class="badge badge-yellow"><span class="dot"></span>Pending</span></div></div>
+      </div>
+      <div class="card">
+        <div class="card-header"><div class="card-title">Raw Transaction Data</div></div>
+        <div style="padding:16px"><pre class="json-view">${escHtml(JSON.stringify(raw, null, 2))}</pre></div>
+      </div>`;
+  };
+
+  if (preloaded) { renderTx(preloaded); return; }
+  if (!hash) { el.innerHTML = `<div class="error-banner">⚠ No transaction hash provided</div>`; return; }
+
+  el.innerHTML = `<div class="loading-row"><div class="spinner-lg spinner"></div><span>Searching transactions…</span></div>`;
+  try {
+    // Search in pending transactions
+    const txns = await api('/chain/transactions');
+    const found = txns.find(t => t.hash === hash || t.hash === hash.replace('0x',''));
+    if (found) { renderTx(found); return; }
+    el.innerHTML = `<div class="error-banner">⚠ Transaction not found in mempool. It may have been included in a block. Hash: ${truncHash(hash)}</div>`;
+  } catch(e) {
+    el.innerHTML = `<div class="error-banner">⚠ Error looking up transaction: ${e.message}</div>`;
+  }
+}
+
+// ── ADDRESS DETAIL ────────────────────────────────────────────────────────────
+async function loadAddressDetail(params) {
+  const addr = params && params.address;
+  const el = document.getElementById('addressDetailContent');
+  const crumb = document.getElementById('addrdetail-crumb');
+  crumb.textContent = addr ? truncHash(addr, 10, 6) : 'Address';
+  el.innerHTML = `<div class="loading-row"><div class="spinner-lg spinner"></div><span>Loading address…</span></div>`;
+  if (!addr) { el.innerHTML = `<div class="error-banner">⚠ No address provided</div>`; return; }
+
+  try {
+    // Only hex addresses are supported by the balance endpoint
+    let balanceHtml = '';
+    const balData = await api(`/balance/${addr.replace('0x','')}`).catch(() => null);
+    if (balData) {
+      balanceHtml = `
+        <div class="detail-row"><div class="detail-key">Balance (EGOC)</div>
+          <div class="detail-val" style="font-size:22px;font-weight:700;color:var(--purple-l)">${numFmt(balData.balance_egoc)} <span style="font-size:14px;color:var(--text-muted)">EGOC</span></div></div>
+        <div class="detail-row"><div class="detail-key">Balance (uEGOC)</div>
+          <div class="detail-val">${numFmt(balData.balance_uegoc)}</div></div>`;
+    } else {
+      balanceHtml = `<div class="detail-row"><div class="detail-key">Balance</div><div class="detail-val" style="color:var(--text-muted)">Could not fetch (invalid address format or node error)</div></div>`;
+    }
+
+    el.innerHTML = `
+      <div class="detail-card">
+        <div class="detail-row"><div class="detail-key">Address</div><div class="detail-val">${hashEl(addr, true)}</div></div>
+        ${balanceHtml}
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">Activity / Events</div>
+          <div class="card-badge">Indexer</div>
+        </div>
+        <div id="addrEventsBody">
+          <div class="loading-row"><div class="spinner"></div><span>Querying indexer…</span></div>
+        </div>
+      </div>`;
+
+    // Try indexer events
+    loadAddressEvents(addr);
+  } catch(e) {
+    el.innerHTML = `<div class="error-banner">⚠ Failed to load address: ${e.message}</div>`;
+  }
+}
+
+async function loadAddressEvents(addr) {
+  const el = document.getElementById('addrEventsBody');
+  if (!el) return;
+  try {
+    const events = await apiIndexer(`/events?contract=${addr}&limit=20`);
+    if (!Array.isArray(events) || events.length === 0) {
+      el.innerHTML = `<div class="tbl-empty">No events found in indexer for this address</div>`; return;
+    }
+    el.innerHTML = `<table class="tbl">
+      <thead><tr><th>Event</th><th>Data</th></tr></thead>
+      <tbody>
+        ${events.map(ev => `<tr>
+          <td><span class="badge badge-purple">${escHtml(ev.type || ev.event || 'Event')}</span></td>
+          <td><pre style="font-size:11px;color:var(--text-muted);margin:0">${escHtml(JSON.stringify(ev, null, 2).slice(0,200))}</pre></td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
+  } catch(e) {
+    el.innerHTML = `<div class="tbl-empty" style="color:var(--text-dim)">Indexer unavailable at ${CFG.indexerUrl} — ${e.message}</div>`;
+  }
+}
+
+// ── NODE STATUS ───────────────────────────────────────────────────────────────
+async function loadStatus() {
+  setError('statusError', '');
+  const el = document.getElementById('statusContent');
+  try {
+    const [health, stats, identity] = await Promise.all([
+      api('/health'),
+      api('/node/stats'),
+      api('/node/identity'),
+    ]);
+
+    const statusColor = health.status === 'healthy' ? 'badge-green' : 'badge-yellow';
+    const components  = health.components || {};
+    const compKeys    = Object.keys(components);
+
+    el.innerHTML = `
+      <!-- Identity -->
+      <div class="card" style="margin-bottom:20px">
+        <div class="card-header"><div class="card-title">🔑 Node Identity</div><span class="badge ${statusColor}"><span class="dot"></span>${health.status || 'unknown'}</span></div>
+        <div class="detail-card" style="margin:0;border:0">
+          <div class="detail-row"><div class="detail-key">Node Address</div><div class="detail-val">${hashEl(identity.address, true)}</div></div>
+          <div class="detail-row"><div class="detail-key">Peer ID</div><div class="detail-val"><span class="hash" onclick="copyText('${identity.peer_id}')" title="${identity.peer_id}">${truncHash(identity.peer_id, 16, 8)}</span></div></div>
+          <div class="detail-row"><div class="detail-key">Public Key</div><div class="detail-val"><span class="hash" onclick="copyText('${identity.public_key_hex}')" title="${identity.public_key_hex}">${truncHash(identity.public_key_hex, 16, 8)}</span></div></div>
+          <div class="detail-row"><div class="detail-key">Balance</div><div class="detail-val" style="font-weight:600;color:var(--purple-l)">${numFmt(identity.balance_egoc)} EGOC</div></div>
+          ${identity.payout_address ? `<div class="detail-row"><div class="detail-key">Payout Address</div><div class="detail-val">${hashEl(identity.payout_address, true)}</div></div>` : ''}
+        </div>
+      </div>
+
+      <!-- Stats -->
+      <div class="health-grid">
+        <div class="health-item"><div class="health-icon">⏱</div><div><div class="health-label">Uptime</div><div class="health-val">${fmtDuration(stats.uptime_seconds)}</div></div></div>
+        <div class="health-item"><div class="health-icon">📨</div><div><div class="health-label">Messages Sent</div><div class="health-val">${numFmt(stats.messages_sent)}</div></div></div>
+        <div class="health-item"><div class="health-icon">📥</div><div><div class="health-label">Messages Received</div><div class="health-val">${numFmt(stats.messages_received)}</div></div></div>
+        <div class="health-item"><div class="health-icon">📡</div><div><div class="health-label">Peer Connections</div><div class="health-val">${numFmt(stats.peer_connections_established)}</div></div></div>
+        <div class="health-item"><div class="health-icon">⬆</div><div><div class="health-label">Bytes Sent</div><div class="health-val">${fmtBytes(stats.bytes_sent)}</div></div></div>
+        <div class="health-item"><div class="health-icon">⬇</div><div><div class="health-label">Bytes Received</div><div class="health-val">${fmtBytes(stats.bytes_received)}</div></div></div>
+        <div class="health-item"><div class="health-icon">🔧</div><div><div class="health-label">Pending Txs</div><div class="health-val">${numFmt(stats.pending_tx_count)}</div></div></div>
+        <div class="health-item"><div class="health-icon">🗄</div><div><div class="health-label">Shards</div><div class="health-val">${numFmt(stats.shard_count)}</div></div></div>
+      </div>
+
+      <!-- Components -->
+      ${compKeys.length ? `
+      <div class="card">
+        <div class="card-header"><div class="card-title">🔩 Component Health</div></div>
+        <table class="tbl">
+          <thead><tr><th>Component</th><th>Status</th></tr></thead>
+          <tbody>
+            ${compKeys.map(k => {
+              const v = components[k];
+              const ok = typeof v === 'string' ? v.toLowerCase().includes('ok') || v.toLowerCase().includes('healthy') : !!v;
+              return `<tr><td>${escHtml(k)}</td><td><span class="badge ${ok ? 'badge-green' : 'badge-red'}"><span class="dot"></span>${escHtml(String(v))}</span></td></tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>` : ''}
+
+      <!-- Block info -->
+      <div class="detail-card" style="margin-top:20px">
+        <div class="detail-row"><div class="detail-key">Block Height</div><div class="detail-val">${numFmt(health.block_height)}</div></div>
+        <div class="detail-row"><div class="detail-key">Uptime (raw)</div><div class="detail-val">${numFmt(health.uptime_secs)} seconds</div></div>
+      </div>
+    `;
+  } catch(e) {
+    setError('statusError', `Cannot connect to node at ${CFG.nodeUrl} — ${e.message}`);
+    el.innerHTML = `<div style="padding:32px;text-align:center;color:var(--text-muted)">Node unreachable</div>`;
+  }
+}
+
+// ── FAUCET ────────────────────────────────────────────────────────────────────
+async function claimFaucet() {
+  const addr = document.getElementById('faucetAddr').value.trim();
+  if (!addr) { document.getElementById('faucetResult').innerHTML = `<div class="error-banner">⚠ Please enter a destination address</div>`; return; }
+  const btn = document.getElementById('faucetBtn');
+  btn.disabled = true; btn.textContent = 'Requesting…';
+  setError('faucetError', '');
+  document.getElementById('faucetResult').innerHTML = '';
+  try {
+    const res = await api(`/faucet?to=${encodeURIComponent(addr)}`);
+    document.getElementById('faucetResult').innerHTML = `
+      <div style="background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.35);border-radius:var(--radius-sm);padding:14px 16px;">
+        <div style="color:var(--green);font-weight:700;margin-bottom:6px">✓ Faucet successful!</div>
+        <div style="font-size:13px;color:var(--text-muted)">Amount: <strong style="color:var(--text)">${res.amount_egoc} EGOC</strong></div>
+        <div style="font-size:12px;color:var(--text-dim);margin-top:4px">Tx: ${hashEl(res.tx_hash)}</div>
+      </div>`;
+  } catch(e) {
+    let msg = e.message;
+    if (msg.includes('429') || msg.toLowerCase().includes('cooldown')) msg = 'Faucet cooldown active — try again in 24 hours';
+    document.getElementById('faucetResult').innerHTML = `<div class="error-banner">⚠ ${escHtml(msg)}</div>`;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Request 100 EGOC';
+  }
+}
+
+// ── SETTINGS ──────────────────────────────────────────────────────────────────
+function openSettings() {
+  document.getElementById('nodeUrlInput').value    = CFG.nodeUrl;
+  document.getElementById('indexerUrlInput').value = CFG.indexerUrl;
+  document.getElementById('settingsModal').classList.add('open');
+}
+function closeSettings() {
+  document.getElementById('settingsModal').classList.remove('open');
+}
+function saveSettings() {
+  CFG.nodeUrl    = document.getElementById('nodeUrlInput').value.replace(/\/$/, '');
+  CFG.indexerUrl = document.getElementById('indexerUrlInput').value.replace(/\/$/, '');
+  localStorage.setItem('ego_node_url',    CFG.nodeUrl);
+  localStorage.setItem('ego_indexer_url', CFG.indexerUrl);
+  closeSettings();
+  loadPage(currentPage);
+}
+
+// ── Escape HTML ───────────────────────────────────────────────────────────────
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+navigate('home');
+scheduleRefresh();
+</script>
+</body>
+</html>

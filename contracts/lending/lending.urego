@@ -1,0 +1,824 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// EGO-13 Reference Lending Pool — Overcollateralised Lending & Borrowing
+// SPDX: MIT
+//
+// Standard : EGO-13 (https://github.com/ego-blockchain/eips/blob/main/EGO-13.md)
+// Author   : Artit Muhaxhiri (@egoblockchain)
+// Version  : 1.0.0
+// Created  : 2026-03-15
+//
+// OVERVIEW
+// --------
+// This contract implements a shared overcollateralised lending pool.
+// Lenders supply EGO-20 assets and receive iToken units (tracked internally)
+// that appreciate as interest accrues. Borrowers post collateral and take
+// out loans up to their max_ltv. Positions below the health factor threshold
+// of 1.0 (1e18 in scaled integer form) are liquidatable by anyone.
+//
+// INTEREST RATE MODEL
+// -------------------
+// Linear utilisation curve (Aave V2-style):
+//
+//   utilisation      = total_borrowed * 1e18 / total_supplied
+//   borrow_rate_apy  = BASE_RATE_BPS + utilisation * SLOPE_BPS / 1e18
+//   supply_rate_apy  = borrow_rate_apy * utilisation / 1e18
+//                      * (10000 - RESERVE_FACTOR_BPS) / 10000
+//
+// Constants (in basis points per year; 10000 bps = 100% APY):
+//   BASE_RATE_BPS     = 200    (2% APY)
+//   SLOPE_BPS         = 2000   (20% APY additional at 100% utilisation)
+//   RESERVE_FACTOR_BPS= 1000   (10% of interest goes to protocol reserve)
+//   BLOCKS_PER_YEAR   = 15_768_000  (~2-second blocks)
+//   LIQUIDATION_BONUS = 500    (5% bonus to liquidator, in bps)
+//   CLOSE_FACTOR_BPS  = 5000   (50% max close per liquidation call)
+//   SCALE             = 1_000_000_000_000_000_000  (1e18)
+//
+// ITOKEN ACCOUNTING
+// -----------------
+// iToken units are NOT separate EGO-20 contracts. The pool tracks:
+//   supplied_itoken_units  — grows as user deposits
+//   redeemable_underlying  = itoken_units * interest_index / 1e18
+//
+// PHASE 1 NOTE (Cross-contract calls)
+// ------------------------------------
+// EGO-vm Phase 1 uses internal balance accounting rather than live EGO-20
+// transfer_from / transfer. In Phase 2, replace internal balance adjustments
+// with actual EGO-20 cross-contract calls for full composability.
+//
+// DEPLOYMENT
+// ----------
+// 1. Compile:  urego build contracts/lending/lending.urego
+// 2. Deploy:   ego-node tx deploy <wasm> --args "<admin_addr> <oracle_addr>"
+// 3. Register assets via add_asset before any user interactions.
+// ═══════════════════════════════════════════════════════════════════════════
+
+contract LendingPool {
+
+    // ── Constants ─────────────────────────────────────────────────────────────
+
+    // All rates in basis points (10000 = 100%)
+    // BASE_RATE_BPS: 2% annual borrow floor
+    // SLOPE_BPS: 20% additional APY at 100% utilisation (linear slope)
+    // RESERVE_FACTOR_BPS: 10% of accrued interest kept as protocol reserve
+    // LIQUIDATION_BONUS_BPS: 5% bonus on seized collateral for liquidator
+    // CLOSE_FACTOR_BPS: 50% max of borrower's debt repayable per liquidation
+    // BLOCKS_PER_YEAR: 15,768,000 (~2s blocks × 60 × 60 × 24 × 365 / 2)
+    // SCALE: 1e18 fixed-point base for interest index and health factor
+
+    // ── Initialisation ────────────────────────────────────────────────────────
+
+    // init — called once at deploy time.
+    //
+    // Sets the pool administrator and the EGO-9 oracle contract address.
+    // The admin can later register assets via add_asset. The oracle must be
+    // a deployed EGO-9 compliant price feed contract.
+    //
+    // Args:
+    //   admin_addr  — address of pool administrator (ideally a DAO contract)
+    //   oracle_addr — address of EGO-9 price feed contract
+    pub fn init(admin_addr: address, oracle_addr: address) {
+        require(admin_addr != zero_address(), "LendingPool: admin is zero address");
+        require(oracle_addr != zero_address(), "LendingPool: oracle is zero address");
+
+        storage_set_address("ego13:admin", admin_addr);
+        storage_set_address("ego13:oracle", oracle_addr);
+
+        // Empty asset list on init — assets registered via add_asset
+        storage_set_str("ego13:assets", "");
+
+        emit ReserveAdded(zero_address(), 0u64, 0u64);
+    }
+
+    // ── Asset Management ──────────────────────────────────────────────────────
+
+    // add_asset — register a new EGO-20 asset with risk parameters.
+    //
+    // Admin-only. Adds the asset to the supported list and sets LTV and
+    // liquidation threshold in basis points. Initialises the interest index
+    // at 1e18 (= 1.0) and records the current block as the last update.
+    //
+    // Args:
+    //   asset             — EGO-20 token contract address
+    //   ltv_bps           — Max loan-to-value in bps (e.g. 7500 = 75%)
+    //   liq_threshold_bps — Liquidation threshold in bps (e.g. 8000 = 80%)
+    pub fn add_asset(asset: address, ltv_bps: u64, liq_threshold_bps: u64) {
+        _require_admin();
+        require(asset != zero_address(), "LendingPool: asset is zero address");
+        require(ltv_bps > 0u64 && ltv_bps <= 10000u64, "LendingPool: ltv_bps out of range");
+        require(
+            liq_threshold_bps > ltv_bps && liq_threshold_bps <= 10000u64,
+            "LendingPool: liq_threshold must be > ltv and <= 10000"
+        );
+
+        let asset_str: String = address_to_str(asset);
+
+        // Store risk parameters
+        let ltv_key: String   = concat("ego13:asset:", concat(asset_str, ":ltv"));
+        let liq_key: String   = concat("ego13:asset:", concat(asset_str, ":liq_threshold"));
+        storage_set_u64(ltv_key, ltv_bps);
+        storage_set_u64(liq_key, liq_threshold_bps);
+
+        // Initialise pool state
+        let ts_key:   String = concat("ego13:asset:", concat(asset_str, ":total_supplied"));
+        let tb_key:   String = concat("ego13:asset:", concat(asset_str, ":total_borrowed"));
+        let idx_key:  String = concat("ego13:asset:", concat(asset_str, ":interest_index"));
+        let blk_key:  String = concat("ego13:asset:", concat(asset_str, ":last_update_block"));
+        storage_set_u128(ts_key, 0u128);
+        storage_set_u128(tb_key, 0u128);
+        // interest_index starts at 1e18
+        storage_set_u128(idx_key, 1000000000000000000u128);
+        storage_set_u64(blk_key, sys.block());
+
+        // Append to asset list (comma-separated)
+        let existing: String = storage_get_str("ego13:assets");
+        let updated: String  = "";
+        if str_len(existing) == 0u64 {
+            updated = asset_str;
+        } else {
+            updated = concat(existing, concat(",", asset_str));
+        }
+        storage_set_str("ego13:assets", updated);
+
+        emit ReserveAdded(asset, ltv_bps, liq_threshold_bps);
+    }
+
+    // ── Core Pool Functions ───────────────────────────────────────────────────
+
+    // supply — deposit `amount` of `asset` into the pool.
+    //
+    // Before crediting the user, interest is accrued so the index is current.
+    // The caller's iToken units are computed as:
+    //
+    //   itoken_units = amount * 1e18 / interest_index
+    //
+    // iToken units are added to the caller's position record. The pool's
+    // total_supplied increases by `amount`. In Phase 2 this function will
+    // call asset.transfer_from(caller, contract, amount) via cross_call.
+    //
+    // Args:
+    //   asset  — EGO-20 token address (must be registered)
+    //   amount — Token amount to supply (in the token's native units)
+    pub fn supply(asset: address, amount: u128) {
+        require(amount > 0u128, "LendingPool: supply amount must be > 0");
+        _require_asset_registered(asset);
+
+        // Always accrue interest before any state mutation
+        accrue_interest(asset);
+
+        let asset_str:  String = address_to_str(asset);
+        let user:       address = caller();
+        let user_str:   String = address_to_str(user);
+
+        // Read current index (post-accrual)
+        let idx_key:   String = concat("ego13:asset:", concat(asset_str, ":interest_index"));
+        let index:     u128   = storage_get_u128(idx_key);
+
+        // iToken units = amount * 1e18 / index
+        let scale:     u128   = 1000000000000000000u128;
+        let itokens:   u128   = amount * scale / index;
+
+        // Update user position
+        let sup_key:   String = concat("ego13:pos:", concat(user_str, concat(":", concat(asset_str, ":supplied"))));
+        let old_sup:   u128   = storage_get_u128(sup_key);
+        storage_set_u128(sup_key, old_sup + itokens);
+
+        // Update pool total_supplied
+        let ts_key:    String = concat("ego13:asset:", concat(asset_str, ":total_supplied"));
+        let old_total: u128   = storage_get_u128(ts_key);
+        storage_set_u128(ts_key, old_total + amount);
+
+        // Phase 2: cross_call(asset, "transfer_from", (user, sys.contract(), amount))
+        emit Supplied(user, asset, amount);
+    }
+
+    // withdraw — redeem iToken units for underlying asset.
+    //
+    // The caller specifies the underlying `amount` to withdraw. The pool
+    // computes the required iToken units:
+    //
+    //   itokens_to_burn = amount * 1e18 / interest_index
+    //
+    // The caller's iToken balance must cover this. After withdrawal, the
+    // health factor is recalculated; the withdrawal is rejected if it would
+    // make the caller's position undercollateralised.
+    //
+    // Args:
+    //   asset  — EGO-20 token address
+    //   amount — Underlying token amount to withdraw
+    pub fn withdraw(asset: address, amount: u128) {
+        require(amount > 0u128, "LendingPool: withdraw amount must be > 0");
+        _require_asset_registered(asset);
+
+        accrue_interest(asset);
+
+        let asset_str:  String = address_to_str(asset);
+        let user:       address = caller();
+        let user_str:   String = address_to_str(user);
+
+        let idx_key:   String = concat("ego13:asset:", concat(asset_str, ":interest_index"));
+        let index:     u128   = storage_get_u128(idx_key);
+        let scale:     u128   = 1000000000000000000u128;
+
+        // Compute iToken units needed
+        let itokens_needed: u128 = amount * scale / index;
+
+        let sup_key:   String = concat("ego13:pos:", concat(user_str, concat(":", concat(asset_str, ":supplied"))));
+        let user_itokens: u128 = storage_get_u128(sup_key);
+        require(user_itokens >= itokens_needed, "LendingPool: insufficient supplied balance");
+
+        // Pool must have enough liquidity
+        let ts_key:    String = concat("ego13:asset:", concat(asset_str, ":total_supplied"));
+        let tb_key:    String = concat("ego13:asset:", concat(asset_str, ":total_borrowed"));
+        let total_sup: u128   = storage_get_u128(ts_key);
+        let total_bor: u128   = storage_get_u128(tb_key);
+        let available: u128   = total_sup - total_bor;
+        require(available >= amount, "LendingPool: insufficient pool liquidity");
+
+        // Deduct iToken units and underlying
+        storage_set_u128(sup_key, user_itokens - itokens_needed);
+        storage_set_u128(ts_key, total_sup - amount);
+
+        // Health check: withdrawal must not put existing borrows below threshold
+        let hf: u128 = get_health_factor(user);
+        // If user has no debt, hf will be u128::MAX sentinel — always safe
+        require(hf >= scale, "LendingPool: withdrawal would make position unhealthy");
+
+        // Phase 2: cross_call(asset, "transfer", (user, amount))
+        emit Withdrawn(user, asset, amount);
+    }
+
+    // borrow — borrow `amount` of `asset` from the pool.
+    //
+    // Records the current interest_index as the borrow snapshot. The user's
+    // outstanding debt at any future time is:
+    //
+    //   current_debt = borrowed_principal * current_index / borrow_index_snapshot
+    //
+    // This call reverts if the resulting health factor would fall below 1e18.
+    //
+    // Args:
+    //   asset  — EGO-20 token to borrow
+    //   amount — Amount to borrow (in the token's native units)
+    pub fn borrow(asset: address, amount: u128) {
+        require(amount > 0u128, "LendingPool: borrow amount must be > 0");
+        _require_asset_registered(asset);
+
+        accrue_interest(asset);
+
+        let asset_str:  String = address_to_str(asset);
+        let user:       address = caller();
+        let user_str:   String = address_to_str(user);
+        let scale:      u128   = 1000000000000000000u128;
+
+        // Pool must have liquidity
+        let ts_key:    String = concat("ego13:asset:", concat(asset_str, ":total_supplied"));
+        let tb_key:    String = concat("ego13:asset:", concat(asset_str, ":total_borrowed"));
+        let total_sup: u128   = storage_get_u128(ts_key);
+        let total_bor: u128   = storage_get_u128(tb_key);
+        let available: u128   = total_sup - total_bor;
+        require(available >= amount, "LendingPool: insufficient pool liquidity");
+
+        // Read current index for borrow snapshot
+        let idx_key:  String = concat("ego13:asset:", concat(asset_str, ":interest_index"));
+        let index:    u128   = storage_get_u128(idx_key);
+
+        // Update user debt position
+        let bor_key:  String = concat("ego13:pos:", concat(user_str, concat(":", concat(asset_str, ":borrowed"))));
+        let bidx_key: String = concat("ego13:pos:", concat(user_str, concat(":", concat(asset_str, ":borrow_index"))));
+        let old_debt: u128   = storage_get_u128(bor_key);
+        let old_bidx: u128   = storage_get_u128(bidx_key);
+
+        // Normalise existing debt to current index before adding new principal
+        let normalised_debt: u128 = 0u128;
+        if old_debt == 0u128 {
+            normalised_debt = amount;
+        } else {
+            // Scale existing debt to current index, then add new amount
+            normalised_debt = old_debt * index / old_bidx + amount;
+        }
+
+        storage_set_u128(bor_key, normalised_debt);
+        storage_set_u128(bidx_key, index);
+
+        // Update total_borrowed
+        storage_set_u128(tb_key, total_bor + amount);
+
+        // Health factor check: must be >= 1e18 after this borrow
+        let hf: u128 = get_health_factor(user);
+        require(hf >= scale, "LendingPool: borrow would make position unhealthy");
+
+        // Phase 2: cross_call(asset, "transfer", (user, amount))
+        emit Borrowed(user, asset, amount);
+    }
+
+    // repay — repay outstanding debt for `asset`.
+    //
+    // The caller may pass `amount = u128::MAX` to repay all outstanding debt.
+    // Actual interest owed is calculated as:
+    //
+    //   current_debt = borrowed_principal * current_index / borrow_index_snapshot
+    //
+    // Overpayment (amount > current_debt) is capped at current_debt so that
+    // callers using u128::MAX do not waste tokens.
+    //
+    // Args:
+    //   asset  — EGO-20 token to repay
+    //   amount — Amount to repay; pass u128::MAX to repay all
+    pub fn repay(asset: address, amount: u128) {
+        require(amount > 0u128, "LendingPool: repay amount must be > 0");
+        _require_asset_registered(asset);
+
+        accrue_interest(asset);
+
+        let asset_str:  String = address_to_str(asset);
+        let user:       address = caller();
+        let user_str:   String = address_to_str(user);
+        let scale:      u128   = 1000000000000000000u128;
+
+        let bor_key:  String = concat("ego13:pos:", concat(user_str, concat(":", concat(asset_str, ":borrowed"))));
+        let bidx_key: String = concat("ego13:pos:", concat(user_str, concat(":", concat(asset_str, ":borrow_index"))));
+        let principal:  u128 = storage_get_u128(bor_key);
+        require(principal > 0u128, "LendingPool: no outstanding debt");
+
+        let idx_key:  String = concat("ego13:asset:", concat(asset_str, ":interest_index"));
+        let index:    u128   = storage_get_u128(idx_key);
+        let borrow_idx: u128 = storage_get_u128(bidx_key);
+
+        // Current debt with accrued interest
+        let current_debt: u128 = principal * index / borrow_idx;
+
+        // Cap repayment at actual debt (handles u128::MAX "repay all" pattern)
+        let repay_amount: u128 = 0u128;
+        if amount >= current_debt {
+            repay_amount = current_debt;
+        } else {
+            repay_amount = amount;
+        }
+
+        // Remaining principal after repayment (back-calculate from index ratio)
+        let remaining_principal: u128 = (current_debt - repay_amount) * borrow_idx / index;
+        storage_set_u128(bor_key, remaining_principal);
+
+        // If fully repaid, clear borrow index snapshot
+        if remaining_principal == 0u128 {
+            storage_set_u128(bidx_key, 0u128);
+        }
+
+        // Reduce pool total_borrowed
+        let tb_key:    String = concat("ego13:asset:", concat(asset_str, ":total_borrowed"));
+        let total_bor: u128   = storage_get_u128(tb_key);
+        // Guard against underflow due to rounding
+        if total_bor >= repay_amount {
+            storage_set_u128(tb_key, total_bor - repay_amount);
+        } else {
+            storage_set_u128(tb_key, 0u128);
+        }
+
+        // Phase 2: cross_call(asset, "transfer_from", (user, sys.contract(), repay_amount))
+        emit Repaid(user, asset, repay_amount);
+    }
+
+    // liquidate — liquidate an undercollateralised position.
+    //
+    // Any caller (the liquidator) may call this when a borrower's health factor
+    // falls below 1e18. The liquidator repays up to 50% (CLOSE_FACTOR) of the
+    // borrower's debt in `debt_asset` and receives a proportional amount of
+    // `collateral_asset` from the borrower's supplied balance, plus a 5%
+    // liquidation bonus.
+    //
+    //   collateral_seized_usd = debt_repaid_usd * (10000 + LIQUIDATION_BONUS_BPS) / 10000
+    //   collateral_seized     = collateral_seized_usd / collateral_price * collateral_scale
+    //
+    // Args:
+    //   borrower         — address of the undercollateralised position owner
+    //   debt_asset       — asset the liquidator is repaying
+    //   collateral_asset — asset the liquidator receives as compensation
+    //   debt_amount      — amount of debt_asset to repay (capped at close factor)
+    pub fn liquidate(
+        borrower:         address,
+        debt_asset:       address,
+        collateral_asset: address,
+        debt_amount:      u128
+    ) {
+        require(debt_amount > 0u128, "LendingPool: debt_amount must be > 0");
+        require(borrower != caller(), "LendingPool: cannot self-liquidate");
+        _require_asset_registered(debt_asset);
+        _require_asset_registered(collateral_asset);
+
+        // Accrue interest on both affected assets before any reads
+        accrue_interest(debt_asset);
+        accrue_interest(collateral_asset);
+
+        let scale:         u128 = 1000000000000000000u128;
+        let liquidator:    address = caller();
+
+        // Verify position is unhealthy
+        let hf: u128 = get_health_factor(borrower);
+        require(hf < scale, "LendingPool: position is not liquidatable");
+
+        let borrower_str:   String = address_to_str(borrower);
+        let debt_str:       String = address_to_str(debt_asset);
+        let col_str:        String = address_to_str(collateral_asset);
+        let liq_str:        String = address_to_str(liquidator);
+
+        // ── Compute actual debt with interest ────────────────────────────────
+        let dbor_key:    String = concat("ego13:pos:", concat(borrower_str, concat(":", concat(debt_str, ":borrowed"))));
+        let dbidx_key:   String = concat("ego13:pos:", concat(borrower_str, concat(":", concat(debt_str, ":borrow_index"))));
+        let d_principal: u128   = storage_get_u128(dbor_key);
+        require(d_principal > 0u128, "LendingPool: borrower has no debt in this asset");
+
+        let d_idx_key:   String = concat("ego13:asset:", concat(debt_str, ":interest_index"));
+        let d_index:     u128   = storage_get_u128(d_idx_key);
+        let d_bidx:      u128   = storage_get_u128(dbidx_key);
+        let total_debt:  u128   = d_principal * d_index / d_bidx;
+
+        // Apply close factor: cap at 50% of total debt
+        let close_factor_bps: u64  = 5000u64;
+        let max_repay:        u128 = total_debt * close_factor_bps as u128 / 10000u128;
+        let actual_repay:     u128 = 0u128;
+        if debt_amount > max_repay {
+            actual_repay = max_repay;
+        } else {
+            actual_repay = debt_amount;
+        }
+
+        // ── Get prices from EGO-9 oracle ─────────────────────────────────────
+        let debt_price:       u128 = _get_price(debt_asset);
+        let collateral_price: u128 = _get_price(collateral_asset);
+
+        // ── Compute collateral to seize (with 5% bonus) ──────────────────────
+        // collateral_seized_usd = actual_repay_usd * 1.05
+        // collateral_seized     = collateral_seized_usd / collateral_price
+        //
+        // In integer math (all USD values scaled by oracle precision 1e8):
+        //   seized_usd  = actual_repay * debt_price / 1e8 * 10500 / 10000
+        //   col_seized  = seized_usd * 1e8 / collateral_price
+        //
+        // Simplifies (1e8 cancels):
+        //   col_seized  = actual_repay * debt_price * 10500 / (10000 * collateral_price)
+        let liquidation_bonus_bps: u64 = 500u64;
+        let col_seized: u128 = actual_repay
+            * debt_price
+            * (10000u64 + liquidation_bonus_bps) as u128
+            / (10000u128 * collateral_price);
+
+        // ── Verify borrower has enough collateral ────────────────────────────
+        let col_sup_key:    String = concat("ego13:pos:", concat(borrower_str, concat(":", concat(col_str, ":supplied"))));
+        let c_idx_key:      String = concat("ego13:asset:", concat(col_str, ":interest_index"));
+        let borrower_col_itokens: u128 = storage_get_u128(col_sup_key);
+        let col_index:      u128  = storage_get_u128(c_idx_key);
+        let borrower_col_underlying: u128 = borrower_col_itokens * col_index / scale;
+
+        // If borrower has less collateral than the bonus demands, seize all available
+        let actual_seized: u128 = 0u128;
+        if col_seized > borrower_col_underlying {
+            actual_seized = borrower_col_underlying;
+        } else {
+            actual_seized = col_seized;
+        }
+        require(actual_seized > 0u128, "LendingPool: borrower has no collateral in this asset");
+
+        // ── Reduce borrower's collateral iToken balance ──────────────────────
+        let seized_itokens: u128 = actual_seized * scale / col_index;
+        let remaining_col:  u128 = 0u128;
+        if borrower_col_itokens > seized_itokens {
+            remaining_col = borrower_col_itokens - seized_itokens;
+        } else {
+            remaining_col = 0u128;
+        }
+        storage_set_u128(col_sup_key, remaining_col);
+
+        // ── Credit liquidator with seized collateral iTokens ─────────────────
+        let liq_col_key: String = concat("ego13:pos:", concat(liq_str, concat(":", concat(col_str, ":supplied"))));
+        let liq_col_bal: u128   = storage_get_u128(liq_col_key);
+        storage_set_u128(liq_col_key, liq_col_bal + seized_itokens);
+
+        // ── Reduce borrower's debt ───────────────────────────────────────────
+        let new_remaining_debt: u128 = total_debt - actual_repay;
+        let new_principal:      u128 = new_remaining_debt * d_bidx / d_index;
+        storage_set_u128(dbor_key, new_principal);
+        if new_principal == 0u128 {
+            storage_set_u128(dbidx_key, 0u128);
+        }
+
+        // Update total_borrowed for debt asset
+        let tb_key:    String = concat("ego13:asset:", concat(debt_str, ":total_borrowed"));
+        let total_bor: u128   = storage_get_u128(tb_key);
+        if total_bor >= actual_repay {
+            storage_set_u128(tb_key, total_bor - actual_repay);
+        } else {
+            storage_set_u128(tb_key, 0u128);
+        }
+
+        // Phase 2: cross_call(debt_asset, "transfer_from", (liquidator, sys.contract(), actual_repay))
+        // Phase 2: cross_call(collateral_asset, "transfer", (liquidator, actual_seized))
+        emit Liquidated(liquidator, borrower, debt_asset, collateral_asset, actual_repay, actual_seized);
+    }
+
+    // ── Interest Accrual ──────────────────────────────────────────────────────
+
+    // accrue_interest — update the cumulative interest index for an asset.
+    //
+    // Called internally before every pool mutation. Computes the number of
+    // blocks elapsed since last update, derives the per-block borrow rate from
+    // the current utilisation, and multiplies the index accordingly.
+    //
+    // interest_index_new = interest_index_old
+    //                      * (SCALE + borrow_rate_per_block * delta_blocks)
+    //                      / SCALE
+    //
+    // If total_supplied == 0, the index stays at its current value (nothing
+    // to accrue). If delta_blocks == 0, this is a no-op.
+    //
+    // Args:
+    //   asset — asset address to accrue interest for
+    pub fn accrue_interest(asset: address) {
+        let asset_str:  String = address_to_str(asset);
+        let blk_key:    String = concat("ego13:asset:", concat(asset_str, ":last_update_block"));
+        let idx_key:    String = concat("ego13:asset:", concat(asset_str, ":interest_index"));
+        let ts_key:     String = concat("ego13:asset:", concat(asset_str, ":total_supplied"));
+        let tb_key:     String = concat("ego13:asset:", concat(asset_str, ":total_borrowed"));
+
+        let last_block:   u64  = storage_get_u64(blk_key);
+        let current_block: u64 = sys.block();
+        let delta_blocks: u64  = 0u64;
+
+        if current_block > last_block {
+            delta_blocks = current_block - last_block;
+        }
+
+        // No blocks elapsed or no liquidity → nothing to accrue
+        if delta_blocks == 0u64 {
+            return;
+        }
+
+        let total_sup: u128 = storage_get_u128(ts_key);
+        if total_sup == 0u128 {
+            storage_set_u64(blk_key, current_block);
+            return;
+        }
+
+        // Compute utilisation and borrow rate
+        let utilisation:     u128 = _utilisation_rate(asset);
+        let borrow_rate_apy: u128 = _borrow_rate(utilisation);
+
+        // Convert APY (in bps per year) to per-block rate scaled by 1e18
+        // blocks_per_year = 15_768_000
+        // rate_per_block  = borrow_rate_apy_bps * 1e18 / (10000 * blocks_per_year)
+        let blocks_per_year: u128 = 15768000u128;
+        let scale:           u128 = 1000000000000000000u128;
+        let rate_per_block:  u128 = borrow_rate_apy * scale / (10000u128 * blocks_per_year);
+
+        // interest_factor = SCALE + rate_per_block * delta_blocks
+        let interest_factor: u128 = scale + rate_per_block * delta_blocks as u128;
+
+        let old_index: u128 = storage_get_u128(idx_key);
+        let new_index: u128 = old_index * interest_factor / scale;
+
+        storage_set_u128(idx_key, new_index);
+        storage_set_u64(blk_key, current_block);
+    }
+
+    // ── View Functions ────────────────────────────────────────────────────────
+
+    // get_health_factor — return the health factor for `user`, scaled by 1e18.
+    //
+    // health_factor = Σ(collateral_i_usd * liq_threshold_i / 10000)
+    //                 / Σ(debt_i_usd)
+    //
+    // If the user has no outstanding debt, returns u128::MAX (340282366920938...)
+    // as a sentinel for "infinitely healthy". Callers SHOULD treat any value
+    // >= 1e18 as healthy and any value < 1e18 as liquidatable.
+    //
+    // Prices are fetched from the EGO-9 oracle. If any required price has
+    // confidence == 0 (stale), this function reverts.
+    pub fn get_health_factor(user: address) -> u128 {
+        let (total_col_usd, total_debt_usd, hf) = get_account_data(user);
+        return hf;
+    }
+
+    // get_account_data — return summary of a user's position.
+    //
+    // Returns:
+    //   total_collateral_usd — sum of all supplied assets valued in USD (scaled by 1e8)
+    //   total_debt_usd       — sum of all outstanding debts valued in USD (scaled by 1e8)
+    //   health_factor        — collateral / debt risk ratio scaled by 1e18 (1e18 = 1.0)
+    pub fn get_account_data(user: address) -> (u128, u128, u128) {
+        let user_str:  String = address_to_str(user);
+        let scale:     u128   = 1000000000000000000u128;
+        let assets_csv: String = storage_get_str("ego13:assets");
+
+        if str_len(assets_csv) == 0u64 {
+            // No assets registered
+            return (0u128, 0u128, scale);
+        }
+
+        let asset_list: Vec<String> = str_split(assets_csv, ",");
+        let total_collateral_usd: u128 = 0u128;
+        let total_debt_usd:       u128 = 0u128;
+        let weighted_col_usd:     u128 = 0u128;
+
+        let i: u64 = 0u64;
+        while i < vec_len(asset_list) {
+            let asset_str: String  = vec_get(asset_list, i);
+            let asset_addr: address = str_to_address(asset_str);
+
+            // ── Supplied balance → USD ───────────────────────────────────────
+            let sup_key:  String = concat("ego13:pos:", concat(user_str, concat(":", concat(asset_str, ":supplied"))));
+            let idx_key:  String = concat("ego13:asset:", concat(asset_str, ":interest_index"));
+            let liq_key:  String = concat("ego13:asset:", concat(asset_str, ":liq_threshold"));
+
+            let itokens:     u128 = storage_get_u128(sup_key);
+            let index:       u128 = storage_get_u128(idx_key);
+            let liq_thresh:  u64  = storage_get_u64(liq_key);
+
+            if itokens > 0u128 {
+                let underlying:  u128 = itokens * index / scale;
+                let price:       u128 = _get_price(asset_addr);
+                // USD value: underlying * price / 1e8 (oracle prices are 1e8 precision)
+                let col_usd:     u128 = underlying * price / 100000000u128;
+                total_collateral_usd = total_collateral_usd + col_usd;
+                // Weighted by liquidation threshold for health factor numerator
+                weighted_col_usd = weighted_col_usd + col_usd * liq_thresh as u128 / 10000u128;
+            }
+
+            // ── Borrowed balance → USD ───────────────────────────────────────
+            let bor_key:  String = concat("ego13:pos:", concat(user_str, concat(":", concat(asset_str, ":borrowed"))));
+            let bidx_key: String = concat("ego13:pos:", concat(user_str, concat(":", concat(asset_str, ":borrow_index"))));
+
+            let principal: u128 = storage_get_u128(bor_key);
+
+            if principal > 0u128 {
+                let borrow_idx: u128 = storage_get_u128(bidx_key);
+                let current_debt: u128 = principal * index / borrow_idx;
+                let price:        u128 = _get_price(asset_addr);
+                let debt_usd:     u128 = current_debt * price / 100000000u128;
+                total_debt_usd = total_debt_usd + debt_usd;
+            }
+
+            i = i + 1u64;
+        }
+
+        // Compute health factor
+        let health_factor: u128 = 0u128;
+        if total_debt_usd == 0u128 {
+            // No debt → sentinel for "infinite" health
+            health_factor = 340282366920938463463374607431768211455u128; // u128::MAX
+        } else {
+            health_factor = weighted_col_usd * scale / total_debt_usd;
+        }
+
+        return (total_collateral_usd, total_debt_usd, health_factor);
+    }
+
+    // get_asset_data — return pool-level data for a single asset.
+    //
+    // Returns:
+    //   total_supplied    — total underlying tokens in pool
+    //   total_borrowed    — total underlying tokens borrowed
+    //   interest_index    — current cumulative interest index (scaled 1e18)
+    //   borrow_rate_apy   — current annual borrow rate in bps
+    //   supply_rate_apy   — current annual supply rate in bps
+    pub fn get_asset_data(asset: address) -> (u128, u128, u128, u128, u128) {
+        let asset_str:  String = address_to_str(asset);
+        let ts_key:     String = concat("ego13:asset:", concat(asset_str, ":total_supplied"));
+        let tb_key:     String = concat("ego13:asset:", concat(asset_str, ":total_borrowed"));
+        let idx_key:    String = concat("ego13:asset:", concat(asset_str, ":interest_index"));
+
+        let total_sup: u128 = storage_get_u128(ts_key);
+        let total_bor: u128 = storage_get_u128(tb_key);
+        let index:     u128 = storage_get_u128(idx_key);
+
+        let utilisation:  u128 = _utilisation_rate(asset);
+        let borrow_rate:  u128 = _borrow_rate(utilisation);
+
+        // supply_rate = borrow_rate * utilisation * (10000 - reserve_factor) / (10000 * 1e18)
+        let reserve_factor_bps: u128 = 1000u128;
+        let scale:              u128 = 1000000000000000000u128;
+        let supply_rate: u128 = borrow_rate
+            * utilisation
+            * (10000u128 - reserve_factor_bps)
+            / (10000u128 * scale);
+
+        return (total_sup, total_bor, index, borrow_rate, supply_rate);
+    }
+
+    // get_user_position — return a user's raw position for a single asset.
+    //
+    // Returns:
+    //   supplied_itokens — iToken units held (multiply by index/1e18 for underlying)
+    //   borrowed_principal — debt principal at borrow_index snapshot
+    //   borrow_index     — interest_index at time of last borrow
+    pub fn get_user_position(user: address, asset: address) -> (u128, u128, u128) {
+        let user_str:  String = address_to_str(user);
+        let asset_str: String = address_to_str(asset);
+
+        let sup_key:  String = concat("ego13:pos:", concat(user_str, concat(":", concat(asset_str, ":supplied"))));
+        let bor_key:  String = concat("ego13:pos:", concat(user_str, concat(":", concat(asset_str, ":borrowed"))));
+        let bidx_key: String = concat("ego13:pos:", concat(user_str, concat(":", concat(asset_str, ":borrow_index"))));
+
+        let supplied:   u128 = storage_get_u128(sup_key);
+        let borrowed:   u128 = storage_get_u128(bor_key);
+        let borrow_idx: u128 = storage_get_u128(bidx_key);
+
+        return (supplied, borrowed, borrow_idx);
+    }
+
+    // get_supported_assets — return the comma-separated list of registered assets.
+    pub fn get_supported_assets() -> String {
+        return storage_get_str("ego13:assets");
+    }
+
+    // ── Internal Helpers ──────────────────────────────────────────────────────
+
+    // _utilisation_rate — pool utilisation for `asset`, scaled by 1e18.
+    //
+    // utilisation = total_borrowed * 1e18 / total_supplied
+    // Returns 0 if total_supplied == 0 (empty pool).
+    fn _utilisation_rate(asset: address) -> u128 {
+        let asset_str: String = address_to_str(asset);
+        let ts_key:    String = concat("ego13:asset:", concat(asset_str, ":total_supplied"));
+        let tb_key:    String = concat("ego13:asset:", concat(asset_str, ":total_borrowed"));
+
+        let total_sup: u128 = storage_get_u128(ts_key);
+        let total_bor: u128 = storage_get_u128(tb_key);
+
+        if total_sup == 0u128 {
+            return 0u128;
+        }
+
+        let scale: u128 = 1000000000000000000u128;
+        return total_bor * scale / total_sup;
+    }
+
+    // _borrow_rate — annual borrow rate in bps for given utilisation.
+    //
+    // borrow_rate_bps = BASE_RATE_BPS + utilisation * SLOPE_BPS / 1e18
+    //
+    // Args:
+    //   utilisation — pool utilisation scaled by 1e18 (0 to 1e18)
+    // Returns:
+    //   borrow_rate in basis points per year (e.g. 200 = 2% APY)
+    fn _borrow_rate(utilisation: u128) -> u128 {
+        let base_rate_bps: u128 = 200u128;   // 2% APY
+        let slope_bps:     u128 = 2000u128;  // 20% APY slope
+        let scale:         u128 = 1000000000000000000u128;
+
+        // borrow_rate = base + utilisation * slope / scale
+        return base_rate_bps + utilisation * slope_bps / scale;
+    }
+
+    // _get_price — fetch the USD price for `asset` from the EGO-9 oracle.
+    //
+    // Prices are in USD with 1e8 precision (100000000 = $1.00), matching
+    // EGO-9 §6. Reverts if the oracle returns confidence == 0 (stale price).
+    //
+    // Args:
+    //   asset — EGO-20 token address to price
+    // Returns:
+    //   price_usd — USD price scaled by 1e8
+    fn _get_price(asset: address) -> u128 {
+        let oracle: address = storage_get_address("ego13:oracle");
+        // EGO-9 get_price returns (price_lo, price_hi, timestamp, confidence)
+        let result: (u128, u128, u64, u32) = cross_call(oracle, "get_price", asset);
+        let price:      u128 = result.0;
+        let confidence: u32  = result.3;
+        require(confidence > 0u32, "LendingPool: oracle price is stale or unavailable");
+        require(price > 0u128, "LendingPool: oracle returned zero price");
+        return price;
+    }
+
+    // _require_admin — revert if caller is not the pool admin.
+    fn _require_admin() {
+        let admin: address = storage_get_address("ego13:admin");
+        require(caller() == admin, "LendingPool: caller is not admin");
+    }
+
+    // _require_asset_registered — revert if `asset` is not in the supported list.
+    //
+    // Checks for the presence of the ltv key as a proxy for registration;
+    // unregistered assets will return 0 for ltv_bps.
+    fn _require_asset_registered(asset: address) {
+        let asset_str: String = address_to_str(asset);
+        let ltv_key:   String = concat("ego13:asset:", concat(asset_str, ":ltv"));
+        let ltv:       u64    = storage_get_u64(ltv_key);
+        require(ltv > 0u64, "LendingPool: asset is not registered");
+    }
+
+    // ── Events ────────────────────────────────────────────────────────────────
+
+    event Supplied(user: address, asset: address, amount: u128)
+    event Withdrawn(user: address, asset: address, amount: u128)
+    event Borrowed(user: address, asset: address, amount: u128)
+    event Repaid(user: address, asset: address, amount: u128)
+    event Liquidated(
+        liquidator:        address,
+        borrower:          address,
+        debt_asset:        address,
+        collateral_asset:  address,
+        debt_amount:       u128,
+        collateral_seized: u128
+    )
+    event ReserveAdded(asset: address, ltv_bps: u64, liq_threshold_bps: u64)
+
+}

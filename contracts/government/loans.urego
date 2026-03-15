@@ -1,0 +1,222 @@
+// EGO-15: Government Services Standard
+// GovernmentLoans — loan program administration, application, approval, and repayment
+// Storage prefix: ego15l:
+
+contract GovernmentLoans {
+
+event ProgramCreated(program_id: u64, name: String, max_amount: u128, rate_bps: u64)
+event LoanApplied(loan_id: u64, borrower: address, program_id: u64, amount: u128)
+event LoanApproved(loan_id: u64, borrower: address, amount: u128)
+event LoanRepaid(loan_id: u64, amount: u128, repaid_total: u128)
+event LoanFullyRepaid(loan_id: u64, borrower: address)
+event LoanDefaulted(loan_id: u64, borrower: address, outstanding: u128)
+
+// ── Initialisation ────────────────────────────────────────────────────────────
+
+pub fn init(authority_addr: address) {
+    storage_set_address("ego15l:authority", authority_addr);
+    storage_set_u64("ego15l:program_count", 0);
+    storage_set_u64("ego15l:loan_count", 0);
+}
+
+// ── Program administration ────────────────────────────────────────────────────
+
+// Create a new loan program. Returns the assigned program_id.
+// interest_rate_bps: annual rate in basis points; 0 = interest-free.
+// repayment_blocks: number of blocks borrower has to fully repay.
+pub fn create_program(name: String, max_amount: u128, interest_rate_bps: u64, repayment_blocks: u64) -> u64 {
+    _require_authority();
+    require(max_amount > 0, "max_amount must be positive");
+    require(repayment_blocks > 0, "repayment_blocks must be positive");
+
+    let count: u64 = storage_get_u64("ego15l:program_count");
+    let program_id: u64 = count + 1;
+    storage_set_u64("ego15l:program_count", program_id);
+
+    let pbase: String = concat("ego15l:program:", u64_to_str(program_id));
+    storage_set_str(concat(pbase, ":name"), name);
+    storage_set_u128(concat(pbase, ":max_amount"), max_amount);
+    storage_set_u64(concat(pbase, ":rate_bps"), interest_rate_bps);
+    storage_set_u64(concat(pbase, ":repayment_blocks"), repayment_blocks);
+
+    emit ProgramCreated(program_id, name, max_amount, interest_rate_bps);
+    return program_id;
+}
+
+// ── Loan application ──────────────────────────────────────────────────────────
+
+// Caller applies for a loan under a given program.
+// purpose_hash: BLAKE2s hash of the off-chain purpose document.
+// Returns the assigned loan_id.
+pub fn apply_for_loan(program_id: u64, amount: u128, purpose_hash: String) -> u64 {
+    require(amount > 0, "amount must be positive");
+    require(purpose_hash != "", "purpose_hash must not be empty");
+
+    let pbase: String = concat("ego15l:program:", u64_to_str(program_id));
+    let max_amount: u128 = storage_get_u128(concat(pbase, ":max_amount"));
+    require(max_amount > 0, "program does not exist");
+    require(amount <= max_amount, "amount exceeds program maximum");
+
+    let count: u64 = storage_get_u64("ego15l:loan_count");
+    let loan_id: u64 = count + 1;
+    storage_set_u64("ego15l:loan_count", loan_id);
+
+    let lbase: String = concat("ego15l:loan:", u64_to_str(loan_id));
+    let borrower: address = caller();
+    storage_set_address(concat(lbase, ":borrower"), borrower);
+    storage_set_u64(concat(lbase, ":program_id"), program_id);
+    storage_set_u128(concat(lbase, ":amount"), amount);
+    storage_set_u128(concat(lbase, ":repaid"), 0);
+    storage_set_str(concat(lbase, ":status"), "applied");
+    storage_set_str(concat(lbase, ":purpose_hash"), purpose_hash);
+    storage_set_u64(concat(lbase, ":disbursed_block"), 0);
+    storage_set_u64(concat(lbase, ":due_block"), 0);
+
+    emit LoanApplied(loan_id, borrower, program_id, amount);
+    return loan_id;
+}
+
+// ── Loan approval / rejection ─────────────────────────────────────────────────
+
+// Authority approves an applied loan. Sets status to "active" and records timing.
+pub fn approve_loan(loan_id: u64) {
+    _require_authority();
+    let lbase: String = concat("ego15l:loan:", u64_to_str(loan_id));
+    let status: String = storage_get_str(concat(lbase, ":status"));
+    require(status == "applied", "loan is not in applied state");
+
+    let disbursed_block: u64 = block_number();
+    let program_id: u64 = storage_get_u64(concat(lbase, ":program_id"));
+    let pbase: String = concat("ego15l:program:", u64_to_str(program_id));
+    let repayment_blocks: u64 = storage_get_u64(concat(pbase, ":repayment_blocks"));
+    let due_block: u64 = disbursed_block + repayment_blocks;
+
+    storage_set_str(concat(lbase, ":status"), "active");
+    storage_set_u64(concat(lbase, ":disbursed_block"), disbursed_block);
+    storage_set_u64(concat(lbase, ":due_block"), due_block);
+
+    let borrower: address = storage_get_address(concat(lbase, ":borrower"));
+    let amount: u128 = storage_get_u128(concat(lbase, ":amount"));
+    emit LoanApproved(loan_id, borrower, amount);
+}
+
+// Authority rejects an applied loan and records the reason.
+pub fn reject_loan(loan_id: u64, reason: String) {
+    _require_authority();
+    let lbase: String = concat("ego15l:loan:", u64_to_str(loan_id));
+    let status: String = storage_get_str(concat(lbase, ":status"));
+    require(status == "applied", "loan is not in applied state");
+    storage_set_str(concat(lbase, ":status"), "rejected");
+    storage_set_str(concat(lbase, ":reject_reason"), reason);
+}
+
+// ── Repayment ─────────────────────────────────────────────────────────────────
+
+// Borrower repays some or all of an active loan.
+// Total owed = principal + accrued interest (simple interest).
+// Interest = principal * rate_bps * blocks_active / (10000 * 525960)
+pub fn repay_loan(loan_id: u64, amount: u128) {
+    require(amount > 0, "repayment amount must be positive");
+    let lbase: String = concat("ego15l:loan:", u64_to_str(loan_id));
+    let status: String = storage_get_str(concat(lbase, ":status"));
+    require(status == "active", "loan is not active");
+
+    let borrower: address = storage_get_address(concat(lbase, ":borrower"));
+    require(caller() == borrower, "caller is not the borrower");
+
+    let prev_repaid: u128 = storage_get_u128(concat(lbase, ":repaid"));
+    let new_repaid: u128 = prev_repaid + amount;
+    storage_set_u128(concat(lbase, ":repaid"), new_repaid);
+
+    emit LoanRepaid(loan_id, amount, new_repaid);
+
+    // Calculate total owed including simple interest
+    let principal: u128 = storage_get_u128(concat(lbase, ":amount"));
+    let program_id: u64 = storage_get_u64(concat(lbase, ":program_id"));
+    let pbase: String = concat("ego15l:program:", u64_to_str(program_id));
+    let rate_bps: u64 = storage_get_u64(concat(pbase, ":rate_bps"));
+    let disbursed_block: u64 = storage_get_u64(concat(lbase, ":disbursed_block"));
+    let blocks_active: u64 = block_number() - disbursed_block;
+
+    // interest = principal * rate_bps * blocks_active / (10000 * 525960)
+    let interest: u128 = (principal * rate_bps as u128 * blocks_active as u128) / (10000 * 525960);
+    let total_owed: u128 = principal + interest;
+
+    if new_repaid >= total_owed {
+        storage_set_str(concat(lbase, ":status"), "repaid");
+        emit LoanFullyRepaid(loan_id, borrower);
+    }
+}
+
+// ── Default handling ──────────────────────────────────────────────────────────
+
+// Authority marks a loan as defaulted if it is past due and still active.
+pub fn mark_defaulted(loan_id: u64) {
+    _require_authority();
+    let lbase: String = concat("ego15l:loan:", u64_to_str(loan_id));
+    let status: String = storage_get_str(concat(lbase, ":status"));
+    require(status == "active", "loan is not active");
+
+    let due_block: u64 = storage_get_u64(concat(lbase, ":due_block"));
+    require(block_number() > due_block, "loan is not yet past due");
+
+    storage_set_str(concat(lbase, ":status"), "defaulted");
+
+    let borrower: address = storage_get_address(concat(lbase, ":borrower"));
+    let principal: u128 = storage_get_u128(concat(lbase, ":amount"));
+    let repaid: u128 = storage_get_u128(concat(lbase, ":repaid"));
+    let outstanding: u128 = principal - repaid;
+
+    emit LoanDefaulted(loan_id, borrower, outstanding);
+}
+
+// ── View functions ────────────────────────────────────────────────────────────
+
+// Returns the status string of a loan ("applied", "active", "repaid", "rejected", "defaulted").
+pub fn get_loan_status(loan_id: u64) -> String {
+    let lbase: String = concat("ego15l:loan:", u64_to_str(loan_id));
+    return storage_get_str(concat(lbase, ":status"));
+}
+
+// Returns the principal amount of a loan.
+pub fn get_loan_amount(loan_id: u64) -> u128 {
+    let lbase: String = concat("ego15l:loan:", u64_to_str(loan_id));
+    return storage_get_u128(concat(lbase, ":amount"));
+}
+
+// Returns the total amount repaid so far on a loan.
+pub fn get_loan_repaid(loan_id: u64) -> u128 {
+    let lbase: String = concat("ego15l:loan:", u64_to_str(loan_id));
+    return storage_get_u128(concat(lbase, ":repaid"));
+}
+
+// Returns the total number of programs created.
+pub fn get_program_count() -> u64 {
+    return storage_get_u64("ego15l:program_count");
+}
+
+// Returns the total number of loan applications submitted.
+pub fn get_loan_count() -> u64 {
+    return storage_get_u64("ego15l:loan_count");
+}
+
+// Returns the borrower address for a loan.
+pub fn get_loan_borrower(loan_id: u64) -> address {
+    let lbase: String = concat("ego15l:loan:", u64_to_str(loan_id));
+    return storage_get_address(concat(lbase, ":borrower"));
+}
+
+// Returns the due block for a loan (0 if not yet approved).
+pub fn get_loan_due_block(loan_id: u64) -> u64 {
+    let lbase: String = concat("ego15l:loan:", u64_to_str(loan_id));
+    return storage_get_u64(concat(lbase, ":due_block"));
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn _require_authority() {
+    let auth: address = storage_get_address("ego15l:authority");
+    require(caller() == auth, "caller is not authority");
+}
+
+}

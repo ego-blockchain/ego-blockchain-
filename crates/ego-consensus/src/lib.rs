@@ -1,4 +1,6 @@
 pub mod aggregator;
+pub mod fee_market;
+pub mod mev_protection;
 pub mod beacon;
 pub mod bridge;
 pub mod challenge;

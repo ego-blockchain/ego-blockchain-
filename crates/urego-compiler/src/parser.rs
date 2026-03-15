@@ -50,17 +50,41 @@ impl Parser {
 
     fn parse_type(&mut self) -> Result<Type> {
         match self.peek().clone() {
-            Token::TyU64    => { self.advance(); Ok(Type::U64)     }
-            Token::TyI64    => { self.advance(); Ok(Type::I64)     }
-            Token::TyU32    => { self.advance(); Ok(Type::U32)     }
-            Token::TyBool   => { self.advance(); Ok(Type::Bool)    }
+            Token::TyU64     => { self.advance(); Ok(Type::U64)     }
+            Token::TyI64     => { self.advance(); Ok(Type::I64)     }
+            Token::TyU32     => { self.advance(); Ok(Type::U32)     }
+            Token::TyBool    => { self.advance(); Ok(Type::Bool)    }
             Token::TyAddress => { self.advance(); Ok(Type::Address) }
-            Token::TyString => { self.advance(); Ok(Type::StringT) }
-            Token::TyBytes  => { self.advance(); Ok(Type::Bytes)   }
-            Token::LParen   => {
+            Token::TyString  => { self.advance(); Ok(Type::StringT) }
+            Token::TyBytes   => { self.advance(); Ok(Type::Bytes)   }
+            Token::TyU8      => { self.advance(); Ok(Type::U8)      }
+            Token::TyU16     => { self.advance(); Ok(Type::U16)     }
+            Token::TyU128    => { self.advance(); Ok(Type::U128)    }
+            Token::TyVec     => {
+                self.advance();
+                self.expect(&Token::Lt)?;
+                let inner = self.parse_type()?;
+                self.expect(&Token::Gt)?;
+                Ok(Type::Vec(Box::new(inner)))
+            }
+            Token::TyMap     => {
+                self.advance();
+                self.expect(&Token::Lt)?;
+                let k = self.parse_type()?;
+                self.expect(&Token::Comma)?;
+                let v = self.parse_type()?;
+                self.expect(&Token::Gt)?;
+                Ok(Type::Map(Box::new(k), Box::new(v)))
+            }
+            Token::LParen    => {
                 self.advance();
                 self.expect(&Token::RParen)?;
                 Ok(Type::Unit)
+            }
+            Token::Ident(name) => {
+                let n = name.clone();
+                self.advance();
+                Ok(Type::Custom(n))
             }
             t => Err(CompileError::ParseError {
                 line: self.line(),
@@ -76,13 +100,53 @@ impl Parser {
         let name = self.expect_ident()?;
         self.expect(&Token::LBrace)?;
 
+        // Parse optional struct definitions before functions
+        let mut structs = Vec::new();
+        loop {
+            // Allow `pub struct` or bare `struct`
+            let is_pub_struct = self.peek() == &Token::Pub
+                && self.tokens.get(self.pos + 1).map(|s| &s.token) == Some(&Token::Struct);
+            let is_struct = self.peek() == &Token::Struct;
+
+            if is_pub_struct {
+                self.advance(); // consume `pub`
+                structs.push(self.parse_struct()?);
+            } else if is_struct {
+                structs.push(self.parse_struct()?);
+            } else {
+                break;
+            }
+        }
+
         let mut functions = Vec::new();
         while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
+            // Allow `pub fn`
+            if self.peek() == &Token::Pub {
+                self.advance(); // consume `pub`, treat same as fn
+            }
             functions.push(self.parse_function()?);
         }
         self.expect(&Token::RBrace)?;
 
-        Ok(Contract { name, functions })
+        Ok(Contract { name, structs, functions })
+    }
+
+    fn parse_struct(&mut self) -> Result<StructDef> {
+        self.expect(&Token::Struct)?;
+        let name = self.expect_ident()?;
+        self.expect(&Token::LBrace)?;
+        let mut fields = Vec::new();
+        while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
+            // Allow `pub` prefix on fields
+            if self.peek() == &Token::Pub { self.advance(); }
+            let fname = self.expect_ident()?;
+            self.expect(&Token::Colon)?;
+            let ty = self.parse_type()?;
+            fields.push(StructField { name: fname, ty });
+            if self.peek() == &Token::Comma { self.advance(); }
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(StructDef { name, fields })
     }
 
     fn parse_function(&mut self) -> Result<Function> {
@@ -92,6 +156,8 @@ impl Parser {
 
         let mut params = Vec::new();
         while self.peek() != &Token::RParen {
+            // Allow `mut` prefix on parameters
+            if self.peek() == &Token::Mut { self.advance(); }
             let pname = self.expect_ident()?;
             self.expect(&Token::Colon)?;
             let ty = self.parse_type()?;
@@ -128,6 +194,8 @@ impl Parser {
         match self.peek().clone() {
             Token::Let => {
                 self.advance();
+                // Allow `mut` after `let`
+                if self.peek() == &Token::Mut { self.advance(); }
                 let name = self.expect_ident()?;
                 let ty = if self.peek() == &Token::Colon {
                     self.advance();
@@ -149,22 +217,52 @@ impl Parser {
                     Ok(Stmt::Return(Some(e)))
                 }
             }
-            Token::If => self.parse_if(),
-            Token::While => self.parse_while(),
+            Token::If      => self.parse_if(),
+            Token::While   => self.parse_while(),
+            Token::For     => self.parse_for(),
+            Token::Match   => self.parse_match(),
+            Token::Emit    => self.parse_emit_stmt(),
+            Token::Break   => {
+                self.advance();
+                self.expect(&Token::Semi)?;
+                Ok(Stmt::Break)
+            }
+            Token::Continue => {
+                self.advance();
+                self.expect(&Token::Semi)?;
+                Ok(Stmt::Continue)
+            }
             Token::Ident(name) => {
-                // Could be assignment or expression statement
                 let name = name.clone();
-                // peek ahead
-                if self.tokens.get(self.pos + 1).map(|s| &s.token) == Some(&Token::Assign) {
-                    self.advance(); // consume ident
-                    self.advance(); // consume =
-                    let value = self.parse_expr()?;
-                    self.expect(&Token::Semi)?;
-                    Ok(Stmt::Assign { name, value })
-                } else {
-                    let e = self.parse_expr()?;
-                    self.expect(&Token::Semi)?;
-                    Ok(Stmt::Expr(e))
+                // Look at the next token to decide what kind of statement this is
+                let next = self.tokens.get(self.pos + 1).map(|s| s.token.clone());
+                match next {
+                    Some(Token::Assign) => {
+                        self.advance(); // consume ident
+                        self.advance(); // consume =
+                        let value = self.parse_expr()?;
+                        self.expect(&Token::Semi)?;
+                        Ok(Stmt::Assign { name, value })
+                    }
+                    Some(Token::PlusEq) => {
+                        self.advance(); // consume ident
+                        self.advance(); // consume +=
+                        let value = self.parse_expr()?;
+                        self.expect(&Token::Semi)?;
+                        Ok(Stmt::CompoundAssign { name, op: BinOp::Add, value })
+                    }
+                    Some(Token::MinusEq) => {
+                        self.advance(); // consume ident
+                        self.advance(); // consume -=
+                        let value = self.parse_expr()?;
+                        self.expect(&Token::Semi)?;
+                        Ok(Stmt::CompoundAssign { name, op: BinOp::Sub, value })
+                    }
+                    _ => {
+                        let e = self.parse_expr()?;
+                        self.expect(&Token::Semi)?;
+                        Ok(Stmt::Expr(e))
+                    }
                 }
             }
             _ => {
@@ -202,10 +300,85 @@ impl Parser {
         Ok(Stmt::While { cond, body })
     }
 
+    fn parse_for(&mut self) -> Result<Stmt> {
+        self.expect(&Token::For)?;
+        // Allow `mut` binding: for mut i in ...
+        if self.peek() == &Token::Mut { self.advance(); }
+        let var = self.expect_ident()?;
+        self.expect(&Token::In)?;
+        let iter = self.parse_expr()?;
+        self.expect(&Token::LBrace)?;
+        let body = self.parse_block()?;
+        self.expect(&Token::RBrace)?;
+        Ok(Stmt::For { var, iter, body })
+    }
+
+    fn parse_match(&mut self) -> Result<Stmt> {
+        self.expect(&Token::Match)?;
+        let expr = self.parse_expr()?;
+        self.expect(&Token::LBrace)?;
+        let mut arms = Vec::new();
+        while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
+            let pattern = self.parse_pattern()?;
+            self.expect(&Token::FatArrow)?;
+            self.expect(&Token::LBrace)?;
+            let body = self.parse_block()?;
+            self.expect(&Token::RBrace)?;
+            arms.push(MatchArm { pattern, body });
+            if self.peek() == &Token::Comma { self.advance(); }
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(Stmt::Match { expr, arms })
+    }
+
+    fn parse_pattern(&mut self) -> Result<Pattern> {
+        match self.peek().clone() {
+            Token::IntLit(n)                  => { self.advance(); Ok(Pattern::IntLit(n)) }
+            Token::True                        => { self.advance(); Ok(Pattern::BoolLit(true)) }
+            Token::False                       => { self.advance(); Ok(Pattern::BoolLit(false)) }
+            Token::StrLit(s)                   => { self.advance(); Ok(Pattern::StrLit(s)) }
+            Token::Ident(s) if s == "_"        => { self.advance(); Ok(Pattern::Wildcard) }
+            Token::Ident(s)                    => { let s = s.clone(); self.advance(); Ok(Pattern::Var(s)) }
+            t => Err(CompileError::ParseError {
+                line: self.line(),
+                msg: format!("expected pattern, got {:?}", t),
+            }),
+        }
+    }
+
+    fn parse_emit_stmt(&mut self) -> Result<Stmt> {
+        self.expect(&Token::Emit)?;
+        let event = self.expect_ident()?;
+        self.expect(&Token::LBrace)?;
+        let mut fields = Vec::new();
+        while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
+            let fname = self.expect_ident()?;
+            self.expect(&Token::Colon)?;
+            let val = self.parse_expr()?;
+            fields.push((fname, val));
+            if self.peek() == &Token::Comma { self.advance(); }
+        }
+        self.expect(&Token::RBrace)?;
+        self.expect(&Token::Semi)?;
+        Ok(Stmt::Emit { event, fields })
+    }
+
     // ── Expressions (precedence climbing) ────────────────────────────────────
 
     fn parse_expr(&mut self) -> Result<Expr> {
-        self.parse_or()
+        self.parse_range()
+    }
+
+    /// Lowest precedence: range `start..end`
+    fn parse_range(&mut self) -> Result<Expr> {
+        let left = self.parse_or()?;
+        if self.peek() == &Token::DotDot {
+            self.advance();
+            let right = self.parse_or()?;
+            Ok(Expr::Range { start: Box::new(left), end: Box::new(right) })
+        } else {
+            Ok(left)
+        }
     }
 
     fn parse_or(&mut self) -> Result<Expr> {
@@ -263,7 +436,7 @@ impl Parser {
     }
 
     fn parse_mul(&mut self) -> Result<Expr> {
-        let mut left = self.parse_unary()?;
+        let mut left = self.parse_cast()?;
         loop {
             let op = match self.peek() {
                 Token::Star    => BinOp::Mul,
@@ -272,22 +445,33 @@ impl Parser {
                 _ => break,
             };
             self.advance();
-            let right = self.parse_unary()?;
+            let right = self.parse_cast()?;
             left = Expr::BinOp { op, left: Box::new(left), right: Box::new(right) };
         }
         Ok(left)
+    }
+
+    /// Cast: expr as Type
+    fn parse_cast(&mut self) -> Result<Expr> {
+        let mut e = self.parse_unary()?;
+        while self.peek() == &Token::As {
+            self.advance();
+            let to = self.parse_type()?;
+            e = Expr::Cast { expr: Box::new(e), to };
+        }
+        Ok(e)
     }
 
     fn parse_unary(&mut self) -> Result<Expr> {
         match self.peek().clone() {
             Token::Minus => {
                 self.advance();
-                let e = self.parse_primary()?;
+                let e = self.parse_postfix()?;
                 Ok(Expr::UnOp { op: UnOp::Neg, expr: Box::new(e) })
             }
             Token::Bang => {
                 self.advance();
-                let e = self.parse_primary()?;
+                let e = self.parse_postfix()?;
                 Ok(Expr::UnOp { op: UnOp::Not, expr: Box::new(e) })
             }
             _ => self.parse_postfix(),
@@ -296,39 +480,85 @@ impl Parser {
 
     fn parse_postfix(&mut self) -> Result<Expr> {
         let mut base = self.parse_primary()?;
-        // handle method chaining: base.method(args)
-        while self.peek() == &Token::Dot {
-            self.advance();
-            let method = self.expect_ident()?;
-            self.expect(&Token::LParen)?;
-            let args = self.parse_args()?;
-            self.expect(&Token::RParen)?;
-            // Rewrite based on receiver
-            base = match &base {
-                Expr::Var(v) if v == "storage" =>
-                    Expr::StorageCall { method, args },
-                Expr::Var(v) if v == "events" =>
-                    Expr::EventsCall { method, args },
-                Expr::Var(v) if v == "sys" =>
-                    Expr::SysCall { method },
-                _ => Expr::Call { name: method, args },
-            };
+
+        loop {
+            match self.peek() {
+                Token::Dot => {
+                    self.advance();
+                    let field_or_method = self.expect_ident()?;
+                    if self.peek() == &Token::LParen {
+                        // Method call: base.method(args)
+                        self.advance();
+                        let args = self.parse_args()?;
+                        self.expect(&Token::RParen)?;
+                        base = match &base {
+                            Expr::Var(v) if v == "storage" =>
+                                Expr::StorageCall { method: field_or_method, args },
+                            Expr::Var(v) if v == "events" =>
+                                Expr::EventsCall { method: field_or_method, args },
+                            Expr::Var(v) if v == "sys" =>
+                                Expr::SysCall { method: field_or_method },
+                            _ => Expr::Call { name: field_or_method, args },
+                        };
+                    } else {
+                        // Field access: base.field
+                        base = Expr::FieldAccess { base: Box::new(base), field: field_or_method };
+                    }
+                }
+                Token::LBracket => {
+                    // Index access: base[idx]
+                    self.advance();
+                    let idx = self.parse_expr()?;
+                    self.expect(&Token::RBracket)?;
+                    base = Expr::Index { base: Box::new(base), index: Box::new(idx) };
+                }
+                _ => break,
+            }
         }
         Ok(base)
     }
 
     fn parse_primary(&mut self) -> Result<Expr> {
         match self.peek().clone() {
-            Token::IntLit(n)     => { self.advance(); Ok(Expr::IntLit(n)) }
-            Token::StrLit(s)     => { self.advance(); Ok(Expr::StrLit(s)) }
-            Token::True          => { self.advance(); Ok(Expr::BoolLit(true))  }
-            Token::False         => { self.advance(); Ok(Expr::BoolLit(false)) }
+            Token::IntLit(n) => { self.advance(); Ok(Expr::IntLit(n)) }
+            Token::StrLit(s) => { self.advance(); Ok(Expr::StrLit(s)) }
+            Token::True      => { self.advance(); Ok(Expr::BoolLit(true))  }
+            Token::False     => { self.advance(); Ok(Expr::BoolLit(false)) }
+
+            // Array literal: [a, b, c]
+            Token::LBracket => {
+                self.advance();
+                let mut elems = Vec::new();
+                while self.peek() != &Token::RBracket && self.peek() != &Token::Eof {
+                    elems.push(self.parse_expr()?);
+                    if self.peek() == &Token::Comma { self.advance(); }
+                }
+                self.expect(&Token::RBracket)?;
+                Ok(Expr::ArrayLit(elems))
+            }
 
             Token::LParen => {
                 self.advance();
-                let e = self.parse_expr()?;
-                self.expect(&Token::RParen)?;
-                Ok(e)
+                // Unit ()
+                if self.peek() == &Token::RParen {
+                    self.advance();
+                    return Ok(Expr::Tuple(Vec::new()));
+                }
+                let first = self.parse_expr()?;
+                if self.peek() == &Token::Comma {
+                    // Tuple
+                    self.advance();
+                    let mut elems = vec![first];
+                    while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
+                        elems.push(self.parse_expr()?);
+                        if self.peek() == &Token::Comma { self.advance(); }
+                    }
+                    self.expect(&Token::RParen)?;
+                    Ok(Expr::Tuple(elems))
+                } else {
+                    self.expect(&Token::RParen)?;
+                    Ok(first)
+                }
             }
 
             Token::Ident(name) => {
@@ -367,12 +597,25 @@ impl Parser {
                         Ok(Expr::Blake3Hash { data: Box::new(data) })
                     }
                     _ => {
-                        // function call or variable
                         if self.peek() == &Token::LParen {
+                            // Function call
                             self.advance();
                             let args = self.parse_args()?;
                             self.expect(&Token::RParen)?;
                             Ok(Expr::Call { name, args })
+                        } else if self.peek() == &Token::LBrace {
+                            // Struct literal: Name { field: val, ... }
+                            self.advance();
+                            let mut fields = Vec::new();
+                            while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
+                                let fname = self.expect_ident()?;
+                                self.expect(&Token::Colon)?;
+                                let val = self.parse_expr()?;
+                                fields.push((fname, val));
+                                if self.peek() == &Token::Comma { self.advance(); }
+                            }
+                            self.expect(&Token::RBrace)?;
+                            Ok(Expr::StructLit { name, fields })
                         } else {
                             Ok(Expr::Var(name))
                         }
@@ -389,7 +632,7 @@ impl Parser {
 
     fn parse_args(&mut self) -> Result<Vec<Expr>> {
         let mut args = Vec::new();
-        while self.peek() != &Token::RParen {
+        while self.peek() != &Token::RParen && self.peek() != &Token::Eof {
             args.push(self.parse_expr()?);
             if self.peek() == &Token::Comma { self.advance(); }
         }

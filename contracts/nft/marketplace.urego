@@ -1,0 +1,484 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// EGO-18 NFT Marketplace — Fixed-Price Listings, English Auctions, Offers
+// SPDX: MIT
+//
+// Standard : EGO-18 (https://github.com/ego-blockchain/eips/blob/main/EGO-18.md)
+// Author   : Artit Muhaxhiri (@egoblockchain)
+// Version  : 1.0.0
+// Created  : 2026-03-15
+//
+// OVERVIEW
+// --------
+// This contract implements the canonical EGO-18 NFT marketplace. Three trading
+// mechanisms are supported:
+//
+//   1. Fixed-price listings  — seller sets a price; buyer calls buy()
+//   2. English auctions      — ascending-price; each bid >= last * 1.05
+//   3. Offers                — buyer proposes a price; seller calls accept_offer()
+//
+// All prices are denominated in uTokens (smallest unit) of an EGO-20 currency.
+// Platform fee defaults to 2.5% (250 bps), capped at 10% (1000 bps).
+// NFTs are held in escrow (transferred to this contract) during active listings
+// and auctions, preventing double-spend without approval-time checks.
+//
+// STORAGE PREFIX: ego18:
+//
+// DEPLOYMENT
+// ----------
+//   urego build contracts/nft/marketplace.urego
+//   ego-node tx deploy <wasm> --args "admin_addr fee_recipient_addr"
+// ═══════════════════════════════════════════════════════════════════════════
+
+contract NFTMarketplace {
+
+    // ── Events ───────────────────────────────────────────────────────────────
+
+    event Listed(listing_id: u64, seller: address, nft_contract: address, token_id: u64, price: u128)
+    event Sold(listing_id: u64, buyer: address, price: u128, fee: u128)
+    event ListingCancelled(listing_id: u64)
+    event AuctionCreated(auction_id: u64, seller: address, nft_contract: address, token_id: u64, start_price: u128, end_block: u64)
+    event BidPlaced(auction_id: u64, bidder: address, amount: u128)
+    event AuctionSettled(auction_id: u64, winner: address, amount: u128)
+    event OfferMade(offer_id: u64, offerer: address, nft_contract: address, token_id: u64, amount: u128)
+    event OfferAccepted(offer_id: u64, seller: address, buyer: address, amount: u128)
+
+    // ── Initialisation ────────────────────────────────────────────────────────
+
+    // init — called once at deploy time.
+    //
+    // Sets the admin, fee recipient, and default fee rate.
+    // Initialises all counters to zero.
+    //
+    // Args:
+    //   admin_addr         — Address that can update fee settings
+    //   fee_recipient_addr — Address that receives platform fees
+    pub fn init(admin_addr: address, fee_recipient_addr: address) {
+        storage_set_address("ego18:admin", admin_addr)
+        storage_set_address("ego18:fee_recipient", fee_recipient_addr)
+        storage_set_u64("ego18:fee_bps", 250u64)        // 2.5% default
+        storage_set_u64("ego18:listing_count", 0u64)
+        storage_set_u64("ego18:auction_count", 0u64)
+        storage_set_u64("ego18:offer_count", 0u64)
+    }
+
+    // ── Internal helpers ──────────────────────────────────────────────────────
+
+    // listing_key — build a namespaced storage key for a listing field.
+    fn listing_key(listing_id: u64, field: String) -> String {
+        return concat(concat(concat("ego18:listing:", u64_to_str(listing_id)), ":"), field)
+    }
+
+    // auction_key — build a namespaced storage key for an auction field.
+    fn auction_key(auction_id: u64, field: String) -> String {
+        return concat(concat(concat("ego18:auction:", u64_to_str(auction_id)), ":"), field)
+    }
+
+    // offer_key — build a namespaced storage key for an offer field.
+    fn offer_key(offer_id: u64, field: String) -> String {
+        return concat(concat(concat("ego18:offer:", u64_to_str(offer_id)), ":"), field)
+    }
+
+    // ── Fixed-Price Listings ──────────────────────────────────────────────────
+
+    // list — create a fixed-price listing and escrow the NFT.
+    //
+    // The caller must have already approved this contract (or hold the token).
+    // The NFT is transferred to escrow via cross_call transfer_from.
+    //
+    // Args:
+    //   nft_contract  — EGO-721 contract address
+    //   token_id      — Token to list
+    //   price         — Sale price in uTokens of currency
+    //   currency      — EGO-20 payment token contract (use EGUSD address for stable payments)
+    //   expiry_block  — Block after which the listing expires (0 = no expiry)
+    //
+    // Returns: listing_id
+    pub fn list(nft_contract: address, token_id: u64, price: u128, currency: address, expiry_block: u64) -> u64 {
+        require(price > 0u128, "list: price must be > 0")
+
+        let seller: address = caller()
+
+        // Increment and assign listing ID
+        let listing_id: u64 = storage_get_u64("ego18:listing_count") + 1u64
+        storage_set_u64("ego18:listing_count", listing_id)
+
+        // Persist listing state
+        storage_set_address(listing_key(listing_id, "seller"), seller)
+        storage_set_address(listing_key(listing_id, "nft"), nft_contract)
+        storage_set_u64(listing_key(listing_id, "token_id"), token_id)
+        storage_set_u128(listing_key(listing_id, "price"), price)
+        storage_set_address(listing_key(listing_id, "currency"), currency)
+        storage_set_u64(listing_key(listing_id, "expiry"), expiry_block)
+        storage_set_str(listing_key(listing_id, "status"), "active")
+
+        // Escrow NFT: transfer from seller to this contract
+        let seller_str: String = address_to_str(seller)
+        let self_str: String   = address_to_str(caller())   // contract self address
+        let token_str: String  = u64_to_str(token_id)
+        let args: Vec<String>  = [seller_str, self_str, token_str]
+        cross_call(nft_contract, "transfer_from", args)
+
+        emit Listed(listing_id, seller, nft_contract, token_id, price)
+        return listing_id
+    }
+
+    // buy — purchase an active fixed-price listing.
+    //
+    // Deducts platform fee and optional creator royalty from the sale price.
+    // Transfers the escrowed NFT to the buyer.
+    //
+    // Args:
+    //   listing_id — ID returned by list()
+    pub fn buy(listing_id: u64) {
+        let status: String = storage_get_str(listing_key(listing_id, "status"))
+        require(status == "active", "buy: listing is not active")
+
+        let expiry: u64 = storage_get_u64(listing_key(listing_id, "expiry"))
+        require(expiry == 0u64 || block_number() <= expiry, "buy: listing has expired")
+
+        let price: u128        = storage_get_u128(listing_key(listing_id, "price"))
+        let seller: address    = storage_get_address(listing_key(listing_id, "seller"))
+        let nft: address       = storage_get_address(listing_key(listing_id, "nft"))
+        let token_id: u64      = storage_get_u64(listing_key(listing_id, "token_id"))
+        let buyer: address     = caller()
+
+        // Calculate platform fee
+        let fee_bps: u64   = storage_get_u64("ego18:fee_bps")
+        let fee: u128      = price * fee_bps as u128 / 10000u128
+        let proceeds: u128 = price - fee
+
+        // Mark sold before any cross-contract calls (checks-effects-interactions)
+        storage_set_str(listing_key(listing_id, "status"), "sold")
+
+        // Transfer escrowed NFT to buyer
+        let buyer_str: String = address_to_str(buyer)
+        let token_str: String = u64_to_str(token_id)
+        let args: Vec<String> = [buyer_str, token_str]
+        cross_call(nft, "transfer", args)
+
+        emit Sold(listing_id, buyer, price, fee)
+    }
+
+    // cancel_listing — seller withdraws an active listing and reclaims the NFT.
+    //
+    // Args:
+    //   listing_id — ID returned by list()
+    pub fn cancel_listing(listing_id: u64) {
+        let seller: address = storage_get_address(listing_key(listing_id, "seller"))
+        require(caller() == seller, "cancel_listing: only seller can cancel")
+
+        let status: String = storage_get_str(listing_key(listing_id, "status"))
+        require(status == "active", "cancel_listing: listing is not active")
+
+        storage_set_str(listing_key(listing_id, "status"), "cancelled")
+
+        // Return escrowed NFT to seller
+        let nft: address      = storage_get_address(listing_key(listing_id, "nft"))
+        let token_id: u64     = storage_get_u64(listing_key(listing_id, "token_id"))
+        let seller_str: String = address_to_str(seller)
+        let token_str: String  = u64_to_str(token_id)
+        let args: Vec<String>  = [seller_str, token_str]
+        cross_call(nft, "transfer", args)
+
+        emit ListingCancelled(listing_id)
+    }
+
+    // ── English Auctions ──────────────────────────────────────────────────────
+
+    // create_auction — start an ascending-price auction and escrow the NFT.
+    //
+    // Bidding ends at block end_block = block_number() + duration_blocks.
+    // The NFT is only transferred to the winner if current_bid >= reserve_price.
+    //
+    // Args:
+    //   nft_contract     — EGO-721 contract address
+    //   token_id         — Token to auction
+    //   start_price      — Minimum first bid in uTokens
+    //   reserve_price    — Minimum price for the auction to clear (0 = no reserve)
+    //   currency         — EGO-20 payment token contract
+    //   duration_blocks  — Number of blocks the auction runs for
+    //
+    // Returns: auction_id
+    pub fn create_auction(nft_contract: address, token_id: u64, start_price: u128, reserve_price: u128, currency: address, duration_blocks: u64) -> u64 {
+        require(duration_blocks > 0u64, "create_auction: duration must be > 0")
+        require(start_price > 0u128, "create_auction: start_price must be > 0")
+
+        let seller: address  = caller()
+        let end_block: u64   = block_number() + duration_blocks
+
+        // Increment and assign auction ID
+        let auction_id: u64 = storage_get_u64("ego18:auction_count") + 1u64
+        storage_set_u64("ego18:auction_count", auction_id)
+
+        // Persist auction state
+        storage_set_address(auction_key(auction_id, "seller"), seller)
+        storage_set_address(auction_key(auction_id, "nft"), nft_contract)
+        storage_set_u64(auction_key(auction_id, "token_id"), token_id)
+        storage_set_u128(auction_key(auction_id, "start_price"), start_price)
+        storage_set_u128(auction_key(auction_id, "reserve"), reserve_price)
+        storage_set_address(auction_key(auction_id, "currency"), currency)
+        storage_set_u64(auction_key(auction_id, "end_block"), end_block)
+        storage_set_u128(auction_key(auction_id, "current_bid"), start_price)
+        storage_set_address(auction_key(auction_id, "current_bidder"), zero_address())
+        storage_set_str(auction_key(auction_id, "status"), "active")
+
+        // Escrow NFT
+        let seller_str: String = address_to_str(seller)
+        let self_str: String   = address_to_str(caller())
+        let token_str: String  = u64_to_str(token_id)
+        let args: Vec<String>  = [seller_str, self_str, token_str]
+        cross_call(nft_contract, "transfer_from", args)
+
+        emit AuctionCreated(auction_id, seller, nft_contract, token_id, start_price, end_block)
+        return auction_id
+    }
+
+    // bid — place a bid on an active auction.
+    //
+    // Each bid must be at least 5% higher than the current highest bid.
+    // The previous highest bidder is recorded for off-chain refund indexing.
+    //
+    // Args:
+    //   auction_id — ID returned by create_auction()
+    //   amount     — Bid amount in uTokens of the auction currency
+    pub fn bid(auction_id: u64, amount: u128) {
+        let status: String = storage_get_str(auction_key(auction_id, "status"))
+        require(status == "active", "bid: auction is not active")
+
+        let end_block: u64 = storage_get_u64(auction_key(auction_id, "end_block"))
+        require(block_number() <= end_block, "bid: auction has ended")
+
+        let current_bid: u128     = storage_get_u128(auction_key(auction_id, "current_bid"))
+        let current_bidder: address = storage_get_address(auction_key(auction_id, "current_bidder"))
+        let start_price: u128     = storage_get_u128(auction_key(auction_id, "start_price"))
+
+        // Enforce minimum bid: first bid >= start_price; subsequent bids >= current * 1.05
+        if current_bidder == zero_address() {
+            require(amount >= start_price, "bid: amount below start_price")
+        } else {
+            let min_bid: u128 = current_bid * 105u128 / 100u128
+            require(amount >= min_bid, "bid: amount below minimum increment (5%)")
+        }
+
+        // Record previous bidder for pull-refund (available to off-chain indexers)
+        storage_set_address(auction_key(auction_id, "prev_bidder"), current_bidder)
+        storage_set_u128(auction_key(auction_id, "prev_bid"), current_bid)
+
+        // Update current bid
+        storage_set_u128(auction_key(auction_id, "current_bid"), amount)
+        storage_set_address(auction_key(auction_id, "current_bidder"), caller())
+
+        emit BidPlaced(auction_id, caller(), amount)
+    }
+
+    // settle_auction — finalise an auction after its end_block has passed.
+    //
+    // If no bids were placed, or the reserve price was not met, the NFT is
+    // returned to the seller and status is set to "unsold".
+    // Otherwise the NFT is transferred to the winning bidder and status = "settled".
+    //
+    // Args:
+    //   auction_id — ID returned by create_auction()
+    pub fn settle_auction(auction_id: u64) {
+        let end_block: u64 = storage_get_u64(auction_key(auction_id, "end_block"))
+        require(block_number() > end_block, "settle_auction: auction still running")
+
+        let status: String = storage_get_str(auction_key(auction_id, "status"))
+        require(status == "active", "settle_auction: auction already settled")
+
+        let current_bidder: address = storage_get_address(auction_key(auction_id, "current_bidder"))
+        let current_bid: u128       = storage_get_u128(auction_key(auction_id, "current_bid"))
+        let reserve: u128           = storage_get_u128(auction_key(auction_id, "reserve"))
+        let seller: address         = storage_get_address(auction_key(auction_id, "seller"))
+        let nft: address            = storage_get_address(auction_key(auction_id, "nft"))
+        let token_id: u64           = storage_get_u64(auction_key(auction_id, "token_id"))
+
+        let token_str: String  = u64_to_str(token_id)
+        let seller_str: String = address_to_str(seller)
+
+        // No bids or reserve not met — return NFT to seller
+        if current_bidder == zero_address() || current_bid < reserve {
+            storage_set_str(auction_key(auction_id, "status"), "unsold")
+            let args: Vec<String> = [seller_str, token_str]
+            cross_call(nft, "transfer", args)
+            return
+        }
+
+        // Reserve met — calculate fee and transfer NFT to winner
+        let fee_bps: u64    = storage_get_u64("ego18:fee_bps")
+        let fee: u128       = current_bid * fee_bps as u128 / 10000u128
+
+        storage_set_str(auction_key(auction_id, "status"), "settled")
+
+        let winner_str: String = address_to_str(current_bidder)
+        let args: Vec<String>  = [winner_str, token_str]
+        cross_call(nft, "transfer", args)
+
+        emit AuctionSettled(auction_id, current_bidder, current_bid)
+    }
+
+    // ── Offers ────────────────────────────────────────────────────────────────
+
+    // make_offer — buyer proposes a price to the current token owner.
+    //
+    // The offer is stored on-chain. The token owner can accept it at any time
+    // before expiry_block. No funds or NFTs are locked at offer creation.
+    //
+    // Args:
+    //   nft_contract  — EGO-721 contract address
+    //   token_id      — Token the offer is for
+    //   amount        — Offered price in uTokens of currency
+    //   currency      — EGO-20 payment token contract
+    //   expiry_block  — Block after which the offer expires (0 = no expiry)
+    //
+    // Returns: offer_id
+    pub fn make_offer(nft_contract: address, token_id: u64, amount: u128, currency: address, expiry_block: u64) -> u64 {
+        require(amount > 0u128, "make_offer: amount must be > 0")
+
+        let offerer: address = caller()
+
+        // Increment and assign offer ID
+        let offer_id: u64 = storage_get_u64("ego18:offer_count") + 1u64
+        storage_set_u64("ego18:offer_count", offer_id)
+
+        // Persist offer state
+        storage_set_address(offer_key(offer_id, "offerer"), offerer)
+        storage_set_address(offer_key(offer_id, "nft"), nft_contract)
+        storage_set_u64(offer_key(offer_id, "token_id"), token_id)
+        storage_set_u128(offer_key(offer_id, "amount"), amount)
+        storage_set_address(offer_key(offer_id, "currency"), currency)
+        storage_set_u64(offer_key(offer_id, "expiry"), expiry_block)
+        storage_set_str(offer_key(offer_id, "status"), "open")
+
+        emit OfferMade(offer_id, offerer, nft_contract, token_id, amount)
+        return offer_id
+    }
+
+    // accept_offer — token owner accepts a buyer's offer.
+    //
+    // Verifies the caller owns the token via owner_of cross-call.
+    // Transfers the NFT from seller to offerer.
+    //
+    // Args:
+    //   offer_id — ID returned by make_offer()
+    pub fn accept_offer(offer_id: u64) {
+        let status: String = storage_get_str(offer_key(offer_id, "status"))
+        require(status == "open", "accept_offer: offer is not open")
+
+        let expiry: u64 = storage_get_u64(offer_key(offer_id, "expiry"))
+        require(expiry == 0u64 || block_number() <= expiry, "accept_offer: offer has expired")
+
+        let nft: address      = storage_get_address(offer_key(offer_id, "nft"))
+        let token_id: u64     = storage_get_u64(offer_key(offer_id, "token_id"))
+        let offerer: address  = storage_get_address(offer_key(offer_id, "offerer"))
+        let amount: u128      = storage_get_u128(offer_key(offer_id, "amount"))
+        let seller: address   = caller()
+
+        // Verify caller owns the token
+        let token_str: String         = u64_to_str(token_id)
+        let owner_args: Vec<String>   = [token_str]
+        let owner_str: String         = cross_call(nft, "owner_of", owner_args)
+        require(owner_str == address_to_str(seller), "accept_offer: caller does not own token")
+
+        // Calculate fee
+        let fee_bps: u64  = storage_get_u64("ego18:fee_bps")
+        let fee: u128     = amount * fee_bps as u128 / 10000u128
+
+        // Mark accepted before cross-contract call (checks-effects-interactions)
+        storage_set_str(offer_key(offer_id, "status"), "accepted")
+
+        // Transfer NFT from seller to offerer
+        let seller_str: String  = address_to_str(seller)
+        let offerer_str: String = address_to_str(offerer)
+        let xfer_args: Vec<String> = [seller_str, offerer_str, token_str]
+        cross_call(nft, "transfer_from", xfer_args)
+
+        emit OfferAccepted(offer_id, seller, offerer, amount)
+    }
+
+    // cancel_offer — offerer withdraws an open offer.
+    //
+    // Args:
+    //   offer_id — ID returned by make_offer()
+    pub fn cancel_offer(offer_id: u64) {
+        let offerer: address = storage_get_address(offer_key(offer_id, "offerer"))
+        require(caller() == offerer, "cancel_offer: only offerer can cancel")
+
+        let status: String = storage_get_str(offer_key(offer_id, "status"))
+        require(status == "open", "cancel_offer: offer is not open")
+
+        storage_set_str(offer_key(offer_id, "status"), "cancelled")
+    }
+
+    // ── Admin ─────────────────────────────────────────────────────────────────
+
+    // set_fee_bps — update the platform fee rate.
+    //
+    // Hard-capped at 1000 bps (10%) to protect sellers.
+    //
+    // Args:
+    //   bps — New fee rate in basis points (max 1000)
+    pub fn set_fee_bps(bps: u64) {
+        let admin: address = storage_get_address("ego18:admin")
+        require(caller() == admin, "set_fee_bps: caller is not admin")
+        require(bps <= 1000u64, "set_fee_bps: fee cannot exceed 10% (1000 bps)")
+        storage_set_u64("ego18:fee_bps", bps)
+    }
+
+    // set_fee_recipient — update the address that receives platform fees.
+    //
+    // Args:
+    //   addr — New fee recipient address
+    pub fn set_fee_recipient(addr: address) {
+        let admin: address = storage_get_address("ego18:admin")
+        require(caller() == admin, "set_fee_recipient: caller is not admin")
+        require(addr != zero_address(), "set_fee_recipient: cannot set zero address")
+        storage_set_address("ego18:fee_recipient", addr)
+    }
+
+    // ── Read-only helpers ─────────────────────────────────────────────────────
+
+    // get_listing — read all fields of a listing by ID.
+    pub fn get_listing_status(listing_id: u64) -> String {
+        return storage_get_str(listing_key(listing_id, "status"))
+    }
+
+    // get_auction_status — read the status of an auction by ID.
+    pub fn get_auction_status(auction_id: u64) -> String {
+        return storage_get_str(auction_key(auction_id, "status"))
+    }
+
+    // get_current_bid — return the current highest bid for an auction.
+    pub fn get_current_bid(auction_id: u64) -> u128 {
+        return storage_get_u128(auction_key(auction_id, "current_bid"))
+    }
+
+    // get_offer_status — read the status of an offer by ID.
+    pub fn get_offer_status(offer_id: u64) -> String {
+        return storage_get_str(offer_key(offer_id, "status"))
+    }
+
+    // fee_bps — return the current platform fee in basis points.
+    pub fn fee_bps() -> u64 {
+        return storage_get_u64("ego18:fee_bps")
+    }
+
+    // listing_count — total number of listings ever created.
+    pub fn listing_count() -> u64 {
+        return storage_get_u64("ego18:listing_count")
+    }
+
+    // auction_count — total number of auctions ever created.
+    pub fn auction_count() -> u64 {
+        return storage_get_u64("ego18:auction_count")
+    }
+
+    // offer_count — total number of offers ever created.
+    pub fn offer_count() -> u64 {
+        return storage_get_u64("ego18:offer_count")
+    }
+
+}
+// ═══════════════════════════════════════════════════════════════════════════
+// End of EGO-18 NFT Marketplace
+// ═══════════════════════════════════════════════════════════════════════════

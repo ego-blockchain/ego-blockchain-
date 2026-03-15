@@ -8,6 +8,7 @@ pub mod event;
 pub mod network;
 pub mod peer;
 pub mod subscription;
+pub mod sync;
 pub mod topic;
 pub mod types;
 
@@ -29,6 +30,7 @@ pub use network::NetworkManager;
 pub use peer::PeerManager;
 pub use subscription::SubscriptionManager;
 pub use topic::{TopicManager, get_standard_topics};
+pub use sync::{SyncManager, SyncMode, SyncProgress};
 pub use types::*;
 
 pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;

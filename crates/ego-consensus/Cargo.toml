@@ -22,6 +22,7 @@ chrono = { version = "0.4.42", features = ["serde"] }
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 libp2p = { version = "0.56.0", features = ["tcp", "mdns", "noise", "yamux", "gossipsub", "kad", "identify", "ping", "macros", "tokio", "autonat"] }
 blake3 = "1.8.2"
+blake2 = "0.10"
 ed25519-dalek = "2.2.0"
 dashmap = "6.1.0"
 lru = "0.16.1"

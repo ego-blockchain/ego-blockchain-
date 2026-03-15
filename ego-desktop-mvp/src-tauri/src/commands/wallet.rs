@@ -285,3 +285,69 @@ pub async fn get_transaction_history(
     txs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     Ok(txs)
 }
+
+// ── query_remote_node ─────────────────────────────────────────────────────────
+//
+// Queries a headless ego-node's HTTP RPC and returns its identity + balance.
+// This lets desktop wallet holders monitor server nodes they operate.
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RemoteNodeInfo {
+    pub address:        String,
+    pub public_key_hex: String,
+    pub peer_id:        String,
+    pub payout_address: Option<String>,
+    pub balance_uegoc:  u64,
+    pub balance_egoc:   u64,
+    pub formatted:      String,
+    pub block_height:   u64,
+    pub rpc_url:        String,
+}
+
+#[tauri::command]
+pub async fn query_remote_node(
+    rpc_url: String,
+    _state: State<'_, AppState>,
+) -> Result<RemoteNodeInfo, EgoDesktopError> {
+    let url = rpc_url.trim_end_matches('/').to_string();
+
+    // Fetch identity (address, keys, balance)
+    let identity_url = format!("{}/node/identity", url);
+    let identity_resp = reqwest::get(&identity_url)
+        .await
+        .map_err(|e| EgoDesktopError::NetworkError(format!("Cannot reach node: {e}")))?;
+    if !identity_resp.status().is_success() {
+        return Err(EgoDesktopError::NetworkError(format!(
+            "Node returned HTTP {}",
+            identity_resp.status()
+        )));
+    }
+    let identity: serde_json::Value = identity_resp
+        .json()
+        .await
+        .map_err(|e| EgoDesktopError::NetworkError(format!("Invalid response: {e}")))?;
+
+    // Fetch block height from /health
+    let health_url = format!("{}/health", url);
+    let block_height: u64 = if let Ok(hr) = reqwest::get(&health_url).await {
+        hr.json::<serde_json::Value>().await
+            .ok()
+            .and_then(|v| v["block_height"].as_u64())
+            .unwrap_or(0)
+    } else { 0 };
+
+    let balance_uegoc = identity["balance_uegoc"].as_u64().unwrap_or(0);
+    let balance_egoc  = identity["balance_egoc"].as_u64().unwrap_or(0);
+
+    Ok(RemoteNodeInfo {
+        address:        identity["address"].as_str().unwrap_or("").to_string(),
+        public_key_hex: identity["public_key_hex"].as_str().unwrap_or("").to_string(),
+        peer_id:        identity["peer_id"].as_str().unwrap_or("").to_string(),
+        payout_address: identity["payout_address"].as_str().map(|s| s.to_string()),
+        balance_uegoc,
+        balance_egoc,
+        formatted: format!("{:.2} EGOC", balance_uegoc as f64 / 1_000_000.0),
+        block_height,
+        rpc_url: url,
+    })
+}
