@@ -247,16 +247,18 @@ pub async fn commit_transaction(
     let tx_hash = tx.hash.clone();
     let tx3 = tx.clone(); let blk3 = block.clone();
     tokio::spawn(async move { crate::p2p::broadcast_tx(tx3, blk3).await; });
-    // Forward to Oracle node so the public explorer can show the transaction.
+    // Forward tx + block to Oracle node so the public explorer can show them.
     let tx4 = tx.clone();
+    let blk4 = block.clone();
     tokio::spawn(async move {
+        let client = reqwest::Client::new();
         if let Ok(body) = serde_json::to_value(&tx4) {
-            let _ = reqwest::Client::new()
-                .post("https://rpc.egoblockchain.com/tx/broadcast")
-                .json(&body)
-                .timeout(std::time::Duration::from_secs(5))
-                .send()
-                .await;
+            let _ = client.post("https://rpc.egoblockchain.com/tx/broadcast")
+                .json(&body).timeout(std::time::Duration::from_secs(5)).send().await;
+        }
+        if let Ok(body) = serde_json::to_value(&blk4) {
+            let _ = client.post("https://rpc.egoblockchain.com/block/broadcast")
+                .json(&body).timeout(std::time::Duration::from_secs(5)).send().await;
         }
     });
     Ok(TransactionResponse {

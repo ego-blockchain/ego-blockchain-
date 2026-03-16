@@ -51,6 +51,8 @@ pub struct RpcState {
     pub faucet_claims:  Mutex<std::collections::HashMap<String, u64>>,
     /// Transactions broadcast from desktop clients (LedgerTx JSON, last 500).
     pub broadcast_txs:  Mutex<Vec<serde_json::Value>>,
+    /// Blocks broadcast from desktop clients (LedgerBlock JSON, last 500).
+    pub broadcast_blocks: Mutex<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,6 +90,7 @@ pub fn make_router(state: Arc<RpcState>) -> Router {
         .route("/node/identity",      get(node_identity))
         .route("/faucet",             get(faucet))
         .route("/tx/broadcast",       post(tx_broadcast))
+        .route("/block/broadcast",    post(block_broadcast))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -115,8 +118,38 @@ async fn health(State(s): State<Arc<RpcState>>) -> impl IntoResponse {
 }
 
 async fn chain_blocks(State(s): State<Arc<RpcState>>) -> impl IntoResponse {
-    let blocks = s.recent_blocks.lock().unwrap().clone();
-    Json(blocks)
+    let node_blocks: Vec<serde_json::Value> = s.recent_blocks.lock().unwrap().iter()
+        .map(|b| serde_json::to_value(b).unwrap_or_default())
+        .collect();
+    let broadcast: Vec<serde_json::Value> = s.broadcast_blocks.lock().unwrap().clone();
+    // Merge, deduplicate by height, sort descending.
+    let mut all: Vec<serde_json::Value> = node_blocks;
+    for b in broadcast {
+        let h = b.get("height").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+        if !all.iter().any(|x| x.get("height").and_then(|v| v.as_u64()) == Some(h)) {
+            all.push(b);
+        }
+    }
+    all.sort_by(|a, b| {
+        let ha = a.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+        let hb = b.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+        hb.cmp(&ha)
+    });
+    Json(all)
+}
+
+async fn block_broadcast(
+    State(s):   State<Arc<RpcState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let mut blocks = s.broadcast_blocks.lock().unwrap();
+    let height = body.get("height").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+    if blocks.iter().any(|b| b.get("height").and_then(|v| v.as_u64()) == Some(height)) {
+        return (StatusCode::OK, Json(serde_json::json!({ "status": "already known" }))).into_response();
+    }
+    blocks.push(body);
+    if blocks.len() > 500 { let excess = blocks.len() - 500; blocks.drain(0..excess); }
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "accepted" }))).into_response()
 }
 
 async fn block_by_height(
