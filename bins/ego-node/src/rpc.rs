@@ -224,7 +224,7 @@ async fn tx_broadcast(
     }
     txs.push(body);
     // Keep last 500 only.
-    if txs.len() > 500 { txs.drain(0..txs.len() - 500); }
+    if txs.len() > 500 { let excess = txs.len() - 500; txs.drain(0..excess); }
     (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "accepted" }))).into_response()
 }
 
