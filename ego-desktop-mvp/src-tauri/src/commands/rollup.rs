@@ -78,6 +78,11 @@ pub async fn get_rollup_status() -> Result<RollupStatus, EgoDesktopError> {
 }
 
 #[tauri::command]
+pub fn get_shard_map_status() -> serde_json::Value {
+    crate::sharding::get_shard_status()
+}
+
+#[tauri::command]
 pub async fn get_shard_stats() -> Result<Vec<ShardInfo>, EgoDesktopError> {
     let pool  = get_mempool();
     let chain = crate::ledger::load_chain();

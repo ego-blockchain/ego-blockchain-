@@ -245,6 +245,23 @@ pub enum P2PMessage {
         /// The votes that finalized this block (for audit)
         votes:        Vec<serde_json::Value>,
     },
+    /// Broadcast every 60s: "I hold these shards with this role."
+    ShardAnnounce {
+        from_addr:          String,
+        from_endpoint:      String,
+        held_shards:        Vec<u32>,
+        uptime_secs:        u64,
+        network_node_count: u32,
+        shard_count:        u32,
+    },
+    /// Slave promotes itself to master after detecting master is offline.
+    MasterPromotion {
+        shard_id:      u32,
+        new_master:    String,
+        new_endpoint:  String,
+        former_master: String,
+        timestamp:     i64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -684,6 +701,53 @@ pub async fn broadcast_data_manifest() {
     }
 }
 
+/// Returns Ego addresses of recently-seen peers from the in-memory peer cache.
+pub fn get_known_peers() -> Vec<String> {
+    load_peer_cache()
+        .into_iter()
+        .map(|p| p.address)
+        .filter(|a| !a.is_empty())
+        .collect()
+}
+
+pub async fn broadcast_shard_announce() {
+    let ledger = crate::ledger::Ledger::load();
+    let my_addr = ledger.address.clone();
+    if my_addr.is_empty() { return; }
+    let endpoint = get_public_endpoint().await;
+    let map = crate::sharding::load_shard_map();
+    let all_nodes: Vec<String> = map.assignments.iter()
+        .map(|a| a.node_address.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter().collect();
+    let held: Vec<u32> = crate::sharding::my_shards(&my_addr, &map, &all_nodes)
+        .into_iter().map(|(id, _)| id).collect();
+    let msg = crate::p2p::P2PMessage::ShardAnnounce {
+        from_addr:          my_addr,
+        from_endpoint:      endpoint,
+        held_shards:        if held.is_empty() { vec![0] } else { held },
+        uptime_secs:        0,
+        network_node_count: map.network_node_count.max(1),
+        shard_count:        map.shard_count.max(1),
+    };
+    if let Ok(data) = serde_json::to_vec(&msg) {
+        publish_gossip("ego-shards-v1", data).await;
+    }
+}
+
+pub async fn broadcast_master_promotion(shard_id: u32, new_master: &str, new_endpoint: &str, former_master: &str) {
+    let msg = crate::p2p::P2PMessage::MasterPromotion {
+        shard_id,
+        new_master:    new_master.to_string(),
+        new_endpoint:  new_endpoint.to_string(),
+        former_master: former_master.to_string(),
+        timestamp:     chrono::Utc::now().timestamp(),
+    };
+    if let Ok(data) = serde_json::to_vec(&msg) {
+        publish_gossip("ego-shards-v1", data).await;
+    }
+}
+
 /// Ask approved contacts to pin files we hold — increases replication factor.
 pub async fn request_file_pinning(cids: Vec<String>) {
     if cids.is_empty() { return; }
@@ -814,6 +878,9 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     let vote_topic     = gossipsub::IdentTopic::new("ego-votes-v1");
     let _ = swarm.behaviour_mut().gossipsub.subscribe(&proposal_topic);
     let _ = swarm.behaviour_mut().gossipsub.subscribe(&vote_topic);
+
+    let shard_topic = gossipsub::IdentTopic::new("ego-shards-v1");
+    swarm.behaviour_mut().gossipsub.subscribe(&shard_topic).ok();
 
     // ── Kademlia bootstrap ────────────────────────────────────────────────────
     // Contacts the seeded relay nodes and discovers the rest of the DHT network.
@@ -1403,6 +1470,35 @@ async fn handle_event(
                         handle_block_vote(block_hash, height, voter, signature, timestamp, &app2).await;
                     });
                 }
+            } else if topic == "ego-shards-v1" {
+                match serde_json::from_slice::<P2PMessage>(&message.data) {
+                    Ok(P2PMessage::ShardAnnounce { from_addr, from_endpoint, held_shards, uptime_secs, network_node_count, shard_count }) => {
+                        crate::sharding::handle_shard_announce_update(&from_addr, &from_endpoint, &held_shards, uptime_secs, network_node_count, shard_count);
+                    }
+                    Ok(P2PMessage::MasterPromotion { shard_id, new_master, new_endpoint, former_master, timestamp }) => {
+                        eprintln!("[Sharding] MasterPromotion: shard {} → new master {} (was {})", shard_id, new_master, former_master);
+                        let mut map = crate::sharding::load_shard_map();
+                        if let Some(old) = map.assignments.iter_mut().find(|a| a.shard_id == shard_id && a.node_address == former_master) {
+                            old.role = crate::sharding::ShardRole::Observer;
+                        }
+                        if let Some(new_m) = map.assignments.iter_mut().find(|a| a.shard_id == shard_id && a.node_address == new_master) {
+                            new_m.role = crate::sharding::ShardRole::Master;
+                            new_m.node_endpoint = new_endpoint.clone();
+                            new_m.last_seen = timestamp;
+                        } else {
+                            map.assignments.push(crate::sharding::ShardAssignment {
+                                shard_id,
+                                role: crate::sharding::ShardRole::Master,
+                                node_address: new_master,
+                                node_endpoint: new_endpoint,
+                                last_seen: timestamp,
+                                uptime_secs: 0,
+                            });
+                        }
+                        let _ = crate::sharding::save_shard_map(&map);
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -1864,6 +1960,33 @@ P2PMessage::FileRequest { cid, requester_addr, requester_endpoint } => {
         eprintln!("[P2P] FileRequest: CID {} not found in our ledger", cid);
     }
 }
+
+        P2PMessage::ShardAnnounce { from_addr, from_endpoint, held_shards, uptime_secs, network_node_count, shard_count } => {
+            crate::sharding::handle_shard_announce_update(&from_addr, &from_endpoint, &held_shards, uptime_secs, network_node_count, shard_count);
+        }
+
+        P2PMessage::MasterPromotion { shard_id, new_master, new_endpoint, former_master, timestamp } => {
+            eprintln!("[Sharding] MasterPromotion (direct): shard {} → new master {} (was {})", shard_id, new_master, former_master);
+            let mut map = crate::sharding::load_shard_map();
+            if let Some(old) = map.assignments.iter_mut().find(|a| a.shard_id == shard_id && a.node_address == former_master) {
+                old.role = crate::sharding::ShardRole::Observer;
+            }
+            if let Some(new_m) = map.assignments.iter_mut().find(|a| a.shard_id == shard_id && a.node_address == new_master) {
+                new_m.role = crate::sharding::ShardRole::Master;
+                new_m.node_endpoint = new_endpoint.clone();
+                new_m.last_seen = timestamp;
+            } else {
+                map.assignments.push(crate::sharding::ShardAssignment {
+                    shard_id,
+                    role: crate::sharding::ShardRole::Master,
+                    node_address: new_master,
+                    node_endpoint: new_endpoint,
+                    last_seen: timestamp,
+                    uptime_secs: 0,
+                });
+            }
+            let _ = crate::sharding::save_shard_map(&map);
+        }
 
 P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
     use base64::Engine as _;

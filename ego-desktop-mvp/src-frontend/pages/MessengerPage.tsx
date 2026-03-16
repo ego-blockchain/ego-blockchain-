@@ -3,6 +3,9 @@ import { invoke } from '@tauri-apps/api/tauri';
 import { listen } from '@tauri-apps/api/event';
 import { writeText } from '@tauri-apps/api/clipboard';
 import { useConfirm } from '../hooks/useConfirm';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+// @ts-ignore — vscDarkPlus style typings live in a subpath not covered by @types
+import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -34,6 +37,23 @@ function fmtTime(ts: number): string {
   return new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+function fmtDate(ts: number): string {
+  const d = new Date(ts * 1000);
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const yesterday = new Date(today.getTime() - 86400000);
+  const msgDay = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  if (msgDay.getTime() === today.getTime()) return 'Today';
+  if (msgDay.getTime() === yesterday.getTime()) return 'Yesterday';
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric', year: msgDay.getFullYear() !== today.getFullYear() ? 'numeric' : undefined });
+}
+
+function isSameDay(ts1: number, ts2: number): boolean {
+  const d1 = new Date(ts1 * 1000);
+  const d2 = new Date(ts2 * 1000);
+  return d1.getFullYear() === d2.getFullYear() && d1.getMonth() === d2.getMonth() && d1.getDate() === d2.getDate();
+}
+
 function truncAddr(addr: string): string {
   if (addr.length <= 16) return addr;
   return addr.slice(0, 10) + '…' + addr.slice(-4);
@@ -44,6 +64,87 @@ function msgTypeLabel(t: string): string {
   if (t === 'decrypt_key') return '🔑 Decrypt Key';
   return '';
 }
+
+// ── AI message renderer (markdown code blocks → syntax-highlighted) ───────────
+
+// Map non-standard or Ego-specific language names to Prism-supported ones
+function normalizeLang(lang: string): string {
+  const map: Record<string, string> = {
+    urego: 'rust', ego: 'rust', solidity: 'javascript',
+    ts: 'typescript', js: 'javascript', sh: 'bash', shell: 'bash',
+    toml: 'toml', yml: 'yaml', '': 'text',
+  };
+  return map[lang.toLowerCase()] ?? lang;
+}
+
+function AiMessageContent({ content }: { content: string }) {
+  const [copied, setCopied] = useState<number | null>(null);
+
+  // Split on triple-backtick boundaries.
+  // Even indices → plain text, odd indices → "lang\ncode" (open or unclosed block).
+  const segments = content.split('```');
+
+  return (
+    <div className="text-sm space-y-2">
+      {segments.map((seg, i) => {
+        if (i % 2 === 0) {
+          // Plain text
+          return seg ? (
+            <p key={i} className="whitespace-pre-wrap break-words leading-relaxed">{seg}</p>
+          ) : null;
+        }
+        // Code block: first line is the language identifier, rest is code
+        const newline = seg.indexOf('\n');
+        const lang = newline > -1 ? seg.slice(0, newline).trim() : '';
+        const code = newline > -1 ? seg.slice(newline + 1) : seg;
+        const handleCopy = async () => {
+          await writeText(code);
+          setCopied(i);
+          setTimeout(() => setCopied(null), 2000);
+        };
+        return (
+          <div key={i} className="rounded-xl overflow-hidden border border-white/10 my-1">
+            {/* Title bar */}
+            <div className="flex items-center justify-between bg-[#1e1e1e] px-3 py-1.5 border-b border-white/5">
+              <span className="text-xs text-gray-400 font-mono">{lang || 'code'}</span>
+              <button
+                onClick={handleCopy}
+                className="text-xs text-gray-400 hover:text-white flex items-center gap-1 transition-colors"
+              >
+                {copied === i ? '✓ Copied' : '⎘ Copy'}
+              </button>
+            </div>
+            <SyntaxHighlighter
+              language={normalizeLang(lang)}
+              style={vscDarkPlus}
+              customStyle={{ margin: 0, borderRadius: 0, fontSize: '0.78rem', maxHeight: '360px', overflowY: 'auto' }}
+              wrapLongLines={false}
+            >
+              {code.trimEnd()}
+            </SyntaxHighlighter>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Ego AI constants ──────────────────────────────────────────────────────────
+
+const EGO_AI_ADDRESS = 'ego_ai_assistant';
+
+const EGO_AI_CONTACT: Contact = {
+  address:        EGO_AI_ADDRESS,
+  name:           'Ego AI',
+  ed25519_pubkey: '',
+  kyber_pubkey:   '',
+  shared_key_hex: '',
+  status:         'approved',
+  added_at:       0,
+  endpoint:       '',
+};
+
+interface AiMsg { role: 'user' | 'assistant'; content: string; ts: number; }
 
 // ── Main page ─────────────────────────────────────────────────────────────────
 
@@ -56,6 +157,21 @@ const MessengerPage: React.FC = () => {
   const [msgInput, setMsgInput]     = useState('');
   const [sending, setSending]       = useState(false);
   const [sendError, setSendError]   = useState('');
+
+  // Ego AI state
+  const [aiMessages, setAiMessages]       = useState<AiMsg[]>(() => {
+    try {
+      const saved = localStorage.getItem('ego-ai-messages');
+      if (saved) return JSON.parse(saved) as AiMsg[];
+    } catch {}
+    return [];
+  });
+  const [aiThinking, setAiThinking]       = useState(false);
+  const [aiKeySet, setAiKeySet]           = useState(false);
+  const [showAiKeyModal, setShowAiKeyModal] = useState(false);
+  const [aiKeyInput, setAiKeyInput]       = useState('');
+  const [savingKey, setSavingKey]         = useState(false);
+  const [aiKeyError, setAiKeyError]       = useState('');
 
   // "Share My Card" modal
   const [showMyCard, setShowMyCard]         = useState(false);
@@ -130,8 +246,14 @@ const MessengerPage: React.FC = () => {
   const selectedRef = useRef<Contact | null>(null);
   useEffect(() => { selectedRef.current = selected; }, [selected]);
 
+  // Persist AI conversation whenever it changes
+  useEffect(() => {
+    try { localStorage.setItem('ego-ai-messages', JSON.stringify(aiMessages)); } catch {}
+  }, [aiMessages]);
+
   useEffect(() => {
     invoke<P2pStatus>('get_p2p_status').then(setP2pStatus).catch(() => {});
+    invoke<boolean>('get_ai_key_status').then(setAiKeySet).catch(() => {});
     const unlistenP2p = listen('ego://p2p-status-changed', () => {
       invoke<P2pStatus>('get_p2p_status').then(setP2pStatus).catch(() => {});
     });
@@ -201,7 +323,7 @@ useEffect(() => {
 
   useEffect(() => {
     msgEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [messages, aiMessages, aiThinking]);
 
   // ── Handlers ─────────────────────────────────────────────────────────────
 
@@ -281,7 +403,10 @@ useEffect(() => {
   }
 
   async function handleSend(msgType: string = 'text') {
-    if (!selected || !msgInput.trim()) return;
+    if (!selected) return;
+    // Route AI messages separately
+    if (selected.address === EGO_AI_ADDRESS) { await handleAiSend(); return; }
+    if (!msgInput.trim()) return;
     setSending(true);
     setSendError('');
     const text = msgInput.trim();
@@ -299,6 +424,48 @@ useEffect(() => {
       setMsgInput(text); // restore input on error
     } finally {
       setSending(false);
+    }
+  }
+
+  async function handleAiSend() {
+    const text = msgInput.trim();
+    if (!text) return;
+    if (!aiKeySet) { setShowAiKeyModal(true); return; }
+    setMsgInput('');
+    const userMsg: AiMsg = { role: 'user', content: text, ts: Date.now() / 1000 };
+    setAiMessages(prev => [...prev, userMsg]);
+    setAiThinking(true);
+    try {
+      const history = aiMessages.map(m => ({ role: m.role, content: m.content }));
+      const reply = await invoke<string>('ask_ego_ai', { question: text, history });
+      setAiMessages(prev => [...prev, { role: 'assistant', content: reply, ts: Date.now() / 1000 }]);
+    } catch (e: any) {
+      const err = String(e);
+      if (err === 'NO_API_KEY') {
+        setAiMessages(prev => prev.slice(0, -1));
+        setMsgInput(text);
+        setShowAiKeyModal(true);
+      } else {
+        setAiMessages(prev => [...prev, { role: 'assistant', content: `⚠️ ${err}`, ts: Date.now() / 1000 }]);
+      }
+    } finally {
+      setAiThinking(false);
+    }
+  }
+
+  async function handleSaveAiKey() {
+    if (!aiKeyInput.trim()) return;
+    setSavingKey(true);
+    setAiKeyError('');
+    try {
+      await invoke('save_ai_key', { key: aiKeyInput.trim() });
+      setAiKeySet(true);
+      setShowAiKeyModal(false);
+      setAiKeyInput('');
+    } catch (e: any) {
+      setAiKeyError(String(e));
+    } finally {
+      setSavingKey(false);
     }
   }
 
@@ -441,6 +608,25 @@ useEffect(() => {
         {/* Contact list */}
         <div className="flex-1 overflow-y-auto">
 
+          {/* Ego AI — pinned at top */}
+          <button
+            onClick={() => setSelected(EGO_AI_CONTACT)}
+            className={`w-full flex items-center gap-3 px-4 py-3 hover:bg-gray-700/60 transition-colors text-left border-b border-gray-700/50 ${
+              selected?.address === EGO_AI_ADDRESS
+                ? 'bg-yellow-500/10 border-l-2 border-yellow-400'
+                : ''
+            }`}
+          >
+            <div className="w-9 h-9 rounded-full bg-gradient-to-br from-yellow-400 to-green-500 flex items-center justify-center text-lg shrink-0">
+              🤖
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-semibold text-yellow-300">Ego AI</div>
+              <div className="text-xs text-gray-400">Blockchain assistant</div>
+            </div>
+            <div className="w-2 h-2 rounded-full bg-green-400 shrink-0" title="Always online" />
+          </button>
+
           {/* Pending-in: incoming contact requests */}
           {pendingInContacts.length > 0 && (
             <div className="border-b border-yellow-500/20">
@@ -561,59 +747,166 @@ useEffect(() => {
         {selected ? (
           <>
             {/* Chat header */}
-            <div className="px-6 py-3 border-b border-gray-700 flex items-center shrink-0 gap-3">
-              <div className="w-9 h-9 rounded-full bg-gradient-to-br from-purple-500 to-pink-600 flex items-center justify-center text-sm font-bold shrink-0">
-                {(selected.name || '?').charAt(0).toUpperCase()}
-              </div>
-              <div className="flex-1 min-w-0">
-                {editingName ? (
-                  <input
-                    ref={nameInputRef}
-                    value={nameInput}
-                    onChange={e => setNameInput(e.target.value)}
-                    onKeyDown={e => {
-                      if (e.key === 'Enter') handleRenameContact(selected.address, nameInput);
-                      if (e.key === 'Escape') setEditingName(false);
-                    }}
-                    onBlur={() => handleRenameContact(selected.address, nameInput)}
-                    autoFocus
-                    className="bg-gray-700 border border-blue-500 rounded-lg px-2 py-0.5 text-sm font-semibold w-full outline-none"
-                  />
-                ) : (
-                  <div className="flex items-center gap-1.5 group/name">
-                    <span className="font-semibold text-sm truncate">{selected.name}</span>
-                    <button
-                      onClick={() => { setNameInput(selected.name); setEditingName(true); setTimeout(() => nameInputRef.current?.select(), 0); }}
-                      className="opacity-0 group-hover/name:opacity-100 transition-opacity text-gray-500 hover:text-gray-300 text-xs px-1"
-                      title="Edit name"
-                    >
-                      ✏️
-                    </button>
-                  </div>
+            {selected.address === EGO_AI_ADDRESS ? (
+              <div className="px-6 py-3 border-b border-gray-700 flex items-center shrink-0 gap-3">
+                <div className="w-9 h-9 rounded-full bg-gradient-to-br from-yellow-400 to-green-500 flex items-center justify-center text-lg shrink-0">
+                  🤖
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="font-semibold text-sm text-yellow-300">Ego AI</div>
+                  <div className="text-xs text-gray-400">Ask about Ego blockchain, smart contracts, EIPs…</div>
+                </div>
+                {aiMessages.length > 0 && (
+                  <button
+                    onClick={() => setAiMessages([])}
+                    title="Clear conversation"
+                    className="shrink-0 px-2.5 py-1.5 text-xs text-gray-400 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
+                  >
+                    🗑 Clear
+                  </button>
                 )}
-                <div className="text-xs text-gray-400 font-mono">{truncAddr(selected.address)}</div>
               </div>
-              <button
-                onClick={() => handleDeleteContact(selected.address)}
-                className="shrink-0 px-3 py-1.5 text-xs text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-lg transition-colors"
-                title="Remove contact"
-              >
-                Remove
-              </button>
-            </div>
+            ) : (
+              <div className="px-6 py-3 border-b border-gray-700 flex items-center shrink-0 gap-3">
+                <div className="w-9 h-9 rounded-full bg-gradient-to-br from-purple-500 to-pink-600 flex items-center justify-center text-sm font-bold shrink-0">
+                  {(selected.name || '?').charAt(0).toUpperCase()}
+                </div>
+                <div className="flex-1 min-w-0">
+                  {editingName ? (
+                    <input
+                      ref={nameInputRef}
+                      value={nameInput}
+                      onChange={e => setNameInput(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') handleRenameContact(selected.address, nameInput);
+                        if (e.key === 'Escape') setEditingName(false);
+                      }}
+                      onBlur={() => handleRenameContact(selected.address, nameInput)}
+                      autoFocus
+                      className="bg-gray-700 border border-blue-500 rounded-lg px-2 py-0.5 text-sm font-semibold w-full outline-none"
+                    />
+                  ) : (
+                    <div className="flex items-center gap-1.5 group/name">
+                      <span className="font-semibold text-sm truncate">{selected.name}</span>
+                      <button
+                        onClick={() => { setNameInput(selected.name); setEditingName(true); setTimeout(() => nameInputRef.current?.select(), 0); }}
+                        className="opacity-0 group-hover/name:opacity-100 transition-opacity text-gray-500 hover:text-gray-300 text-xs px-1"
+                        title="Edit name"
+                      >
+                        ✏️
+                      </button>
+                    </div>
+                  )}
+                  <div className="text-xs text-gray-400 font-mono">{truncAddr(selected.address)}</div>
+                </div>
+                <button
+                  onClick={() => handleDeleteContact(selected.address)}
+                  className="shrink-0 px-3 py-1.5 text-xs text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-lg transition-colors"
+                  title="Remove contact"
+                >
+                  Remove
+                </button>
+              </div>
+            )}
 
             {/* Messages */}
             <div className="flex-1 overflow-y-auto px-6 py-4 space-y-2 [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
+
+              {/* AI chat view */}
+              {selected.address === EGO_AI_ADDRESS ? (
+                <>
+                  {aiMessages.length === 0 && !aiThinking && (
+                    <div className="text-center text-gray-500 text-sm py-10">
+                      <div className="text-5xl mb-3">🤖</div>
+                      <div className="text-gray-300 font-medium mb-1">Ego AI Assistant</div>
+                      <div className="text-xs text-gray-500 max-w-xs mx-auto leading-relaxed">
+                        Ask me anything about Ego blockchain — smart contracts, EIPs, tokenomics, how to use this app, or get help writing Urego code.
+                      </div>
+                      <div className="mt-4 space-y-2">
+                        {['How do I write a Urego token contract?', 'What is EGOC and how do I earn it?', 'Explain the HotStuff BFT consensus'].map(suggestion => (
+                          <button
+                            key={suggestion}
+                            onClick={() => { setMsgInput(suggestion); }}
+                            className="block w-full max-w-xs mx-auto text-xs bg-gray-700/60 hover:bg-gray-700 text-gray-300 px-4 py-2 rounded-xl transition-colors text-left"
+                          >
+                            💬 {suggestion}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {aiMessages.map((m, i) => {
+                    const showDateSep = i === 0 || !isSameDay(m.ts, aiMessages[i - 1].ts);
+                    return (
+                      <React.Fragment key={i}>
+                        {showDateSep && (
+                          <div className="flex items-center gap-3 my-3">
+                            <div className="flex-1 h-px bg-gray-700" />
+                            <span className="text-xs text-gray-500 px-1">{fmtDate(m.ts)}</span>
+                            <div className="flex-1 h-px bg-gray-700" />
+                          </div>
+                        )}
+                        <div className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'} mb-1`}>
+                          <p className="text-xs text-gray-500 mb-0.5 px-1">{fmtTime(m.ts)}</p>
+                          <div className={`flex items-end gap-2`}>
+                            {m.role === 'assistant' && (
+                              <div className="w-7 h-7 rounded-full bg-gradient-to-br from-yellow-400 to-green-500 flex items-center justify-center text-sm shrink-0">
+                                🤖
+                              </div>
+                            )}
+                            <div className={`max-w-xs lg:max-w-md xl:max-w-lg px-4 py-2.5 rounded-2xl ${
+                              m.role === 'user'
+                                ? 'bg-blue-600 rounded-br-sm'
+                                : 'bg-gray-700 rounded-bl-sm'
+                            }`}>
+                              {m.role === 'assistant'
+                                ? <AiMessageContent content={m.content} />
+                                : <p className="text-sm whitespace-pre-wrap break-words">{m.content}</p>
+                              }
+                            </div>
+                          </div>
+                        </div>
+                      </React.Fragment>
+                    );
+                  })}
+                  {aiThinking && (
+                    <div className="flex items-end gap-2 justify-start">
+                      <div className="w-7 h-7 rounded-full bg-gradient-to-br from-yellow-400 to-green-500 flex items-center justify-center text-sm shrink-0 mb-1">
+                        🤖
+                      </div>
+                      <div className="bg-gray-700 rounded-2xl rounded-bl-sm px-4 py-3">
+                        <div className="flex gap-1 items-center">
+                          <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                          <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                          <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <>
               {messages.length === 0 && (
                 <div className="text-center text-gray-500 text-sm py-12">
                   <div className="text-3xl mb-2">🔐</div>
                   No messages yet — send an encrypted message below.
                 </div>
               )}
-              {messages.map(m => {
+              {messages.map((m, idx) => {
                 const isFileBundle = m.message_type === 'file_bundle';
+                const showDateSep = idx === 0 || !isSameDay(m.timestamp, messages[idx - 1].timestamp);
                 return (
-                  <div key={m.id} className={`flex items-end gap-1 group ${m.outgoing ? 'justify-end' : 'justify-start'}`}>
+                  <React.Fragment key={m.id}>
+                    {showDateSep && (
+                      <div className="flex items-center gap-3 my-3">
+                        <div className="flex-1 h-px bg-gray-700" />
+                        <span className="text-xs text-gray-500 px-1">{fmtDate(m.timestamp)}</span>
+                        <div className="flex-1 h-px bg-gray-700" />
+                      </div>
+                    )}
+                  <div className={`flex flex-col ${m.outgoing ? 'items-end' : 'items-start'} group`}>
+                    <p className="text-xs text-gray-500 mb-0.5 px-2">{fmtTime(m.timestamp)}</p>
+                  <div className={`flex items-end gap-1 ${m.outgoing ? 'justify-end' : 'justify-start'}`}>
                     {m.outgoing && (
                       <button
                         onClick={() => handleDeleteMessage(m.id)}
@@ -626,7 +919,7 @@ useEffect(() => {
 
                     {/* Avatar for incoming messages */}
                     {!m.outgoing && (
-                      <div className="w-7 h-7 rounded-full bg-gradient-to-br from-purple-500 to-pink-600 flex items-center justify-center text-xs font-bold shrink-0 mb-1">
+                      <div className="w-7 h-7 rounded-full bg-gradient-to-br from-purple-500 to-pink-600 flex items-center justify-center text-xs font-bold shrink-0">
                         {(selected?.name || '?').charAt(0).toUpperCase()}
                       </div>
                     )}
@@ -706,11 +999,8 @@ useEffect(() => {
                           </div>
                         );
                       })() : (
-                        <p className="text-sm break-all whitespace-pre-wrap">{m.content}</p>
+                        <p className="text-sm whitespace-pre-wrap break-words">{m.content}</p>
                       )}
-                      <p className={`text-xs mt-1 text-right ${m.outgoing ? 'text-blue-200' : 'text-gray-400'}`}>
-                        {fmtTime(m.timestamp)}
-                      </p>
                     </div>
 
                     {!m.outgoing && (
@@ -723,12 +1013,16 @@ useEffect(() => {
                       </button>
                     )}
                   </div>
+                  </div>
+                  </React.Fragment>
                 );
               })}
+                </>
+              )}
               <div ref={msgEndRef} />
             </div>
 
-            {sendError && (
+            {sendError && selected.address !== EGO_AI_ADDRESS && (
               <div className="px-5 py-2 bg-red-500/10 border-t border-red-500/20">
                 <span className="text-xs text-red-400">✕ {sendError}</span>
                 <button
@@ -742,6 +1036,13 @@ useEffect(() => {
 
             {/* Input area */}
             <div className="px-5 py-4 border-t border-gray-700 shrink-0 space-y-2">
+              {/* API key prompt only shown if no built-in key is available */}
+              {selected.address === EGO_AI_ADDRESS && !aiKeySet && (
+                <div className="text-xs text-yellow-400/80 bg-yellow-500/10 rounded-xl px-3 py-2 flex items-center gap-2">
+                  <span>⚠️</span>
+                  <span>Ego AI is not configured. Contact support.</span>
+                </div>
+              )}
               <div className="flex gap-2">
                 <input
                   value={msgInput}
@@ -752,15 +1053,25 @@ useEffect(() => {
                       handleSend('text');
                     }
                   }}
-                  placeholder="Type a message… press Enter to send"
-                  className="flex-1 bg-gray-700 border border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-500"
+                  placeholder={selected.address === EGO_AI_ADDRESS ? 'Ask Ego AI anything…' : 'Type a message… press Enter to send'}
+                  className={`flex-1 bg-gray-700 border rounded-xl px-4 py-2.5 text-sm focus:outline-none ${
+                    selected.address === EGO_AI_ADDRESS
+                      ? 'border-yellow-600/40 focus:border-yellow-400'
+                      : 'border-gray-600 focus:border-blue-500'
+                  }`}
                 />
                 <button
                   onClick={() => handleSend('text')}
-                  disabled={sending || !msgInput.trim()}
-                  className="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-xl text-sm font-medium transition-colors"
+                  disabled={(selected.address === EGO_AI_ADDRESS ? aiThinking : sending) || !msgInput.trim()}
+                  className={`px-5 py-2.5 disabled:opacity-50 rounded-xl text-sm font-medium transition-colors ${
+                    selected.address === EGO_AI_ADDRESS
+                      ? 'bg-yellow-500 hover:bg-yellow-400 text-black'
+                      : 'bg-blue-600 hover:bg-blue-500 text-white'
+                  }`}
                 >
-                  {sending ? '…' : 'Send'}
+                  {selected.address === EGO_AI_ADDRESS
+                    ? (aiThinking ? '…' : 'Ask')
+                    : (sending ? '…' : 'Send')}
                 </button>
               </div>
             </div>
@@ -795,6 +1106,49 @@ useEffect(() => {
       </div>
 
       </div>{/* end flex-1 row */}
+
+      {/* ── Ego AI service key modal (internal/admin use only) ── */}
+      {showAiKeyModal && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+          <div className="bg-gray-800 rounded-2xl w-full max-w-md shadow-2xl">
+            <div className="px-6 py-4 border-b border-gray-700 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-xl">🤖</span>
+                <h3 className="font-bold">Ego AI — Configuration</h3>
+              </div>
+              <button onClick={() => setShowAiKeyModal(false)} className="text-gray-400 hover:text-white text-xl leading-none">✕</button>
+            </div>
+            <div className="p-6 space-y-4">
+              <p className="text-sm text-gray-400 leading-relaxed">
+                Enter your Ego AI service key to activate the assistant.
+                The key is stored locally on this device.
+              </p>
+              <div>
+                <label className="text-xs text-gray-400 mb-1.5 block">Service Key</label>
+                <input
+                  type="password"
+                  value={aiKeyInput}
+                  onChange={e => setAiKeyInput(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') handleSaveAiKey(); }}
+                  placeholder="ego-ai-…"
+                  autoFocus
+                  className="w-full bg-gray-700 border border-gray-600 rounded-xl px-4 py-2.5 text-sm font-mono focus:outline-none focus:border-yellow-400"
+                />
+              </div>
+              {aiKeyError && (
+                <div className="text-xs text-red-400 bg-red-500/10 rounded-lg px-3 py-2">{aiKeyError}</div>
+              )}
+              <button
+                onClick={handleSaveAiKey}
+                disabled={!aiKeyInput.trim() || savingKey}
+                className="w-full bg-yellow-500 hover:bg-yellow-400 disabled:opacity-50 text-black py-2.5 rounded-xl text-sm font-semibold transition-colors"
+              >
+                {savingKey ? 'Saving…' : 'Save & Start Chatting'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Share My Card modal ── */}
       {showMyCard && (
