@@ -52,50 +52,8 @@ pub const RELAY_NODES: &[&str] = &[
     // "/dns4/relay3.egoblockchain.com/tcp/4001/p2p/12D3KooW...",
 ];
 
-/// HTTP API endpoints — tried in order, first reachable one wins.
-pub const RELAY_HTTP_NODES: &[&str] = &[
-    "http://EgoRelay.egoblockchain.com:8080",
-    // "http://relay2.egoblockchain.com:8080",
-];
-
-/// Kept for backward compatibility — callers in other crates that haven't been
-/// migrated yet can still reference this; internally p2p.rs uses RELAY_HTTP_NODES.
-#[allow(dead_code)]
-pub const RELAY_HTTP_API: &str = "http://EgoRelay.egoblockchain.com:8080";
-
-/// Try each relay HTTP node in order, return the first successful response.
-/// This makes the network resilient to any single relay going down.
-pub async fn relay_http_get(path: &str) -> Option<reqwest::Response> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .unwrap_or_default();
-    for base in RELAY_HTTP_NODES {
-        let url = format!("{}{}", base, path);
-        if let Ok(resp) = client.get(&url).send().await {
-            if resp.status().is_success() {
-                return Some(resp);
-            }
-        }
-    }
-    None
-}
-
-pub async fn relay_http_post_json<T: serde::Serialize>(path: &str, body: &T) -> bool {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .unwrap_or_default();
-    for base in RELAY_HTTP_NODES {
-        let url = format!("{}{}", base, path);
-        if let Ok(resp) = client.post(&url).json(body).send().await {
-            if resp.status().is_success() {
-                return true;
-            }
-        }
-    }
-    false
-}
+/// Oracle RPC endpoint for chain sync.
+pub const ORACLE_RPC: &str = "https://rpc.egoblockchain.com";
 // ─────────────────────────────────────────────────────────────────────────────
 // SINGLE SOURCE OF TRUTH FOR RELAY CIRCUIT STATE
 //
@@ -758,18 +716,8 @@ pub async fn request_file_pinning(cids: Vec<String>) {
     }
 }
 
-/// Called when AutoNAT confirms public IP — register as relay + broadcast manifest.
+/// Called when AutoNAT confirms public IP — broadcast manifest + peer announce.
 async fn announce_as_relay(app: &tauri::AppHandle) {
-    let address  = crate::ledger::Ledger::load().address;
-    let registry = crate::ledger::load_registry();
-    let active   = crate::ledger::get_active_wallet_id();
-    let name = registry.wallets.iter()
-        .find(|w| w.id == active)
-        .map(|w| w.name.clone())
-        .unwrap_or_else(|| "Ego Node".to_string());
-    let ep = get_public_endpoint().await;
-    // Re-register with relay HTTP so other nodes see is_relay=true in /peers
-    register_with_relay(address, name, ep, None, None).await;
     // Let all contacts know we're a relay node
     broadcast_data_manifest().await;
     broadcast_peer_announce(app).await;
@@ -1174,21 +1122,10 @@ fn inject_circuit(
     state.set_upnp_status(Ok(()));
     let _ = app.emit_all("ego://p2p-status-changed", ());
 
-    // Register with HTTP relay directory (async, non-blocking)
-    let address_str = crate::ledger::Ledger::load().address;
-    let registry    = crate::ledger::load_registry();
-    let active_id   = crate::ledger::get_active_wallet_id();
-    let name = registry.wallets.iter()
-        .find(|w| w.id == active_id)
-        .map(|w| w.name.clone())
-        .unwrap_or_else(|| "Ego Node".to_string());
-    let ep_clone  = ep.clone();
+    // Announce to contacts after circuit is confirmed (async, non-blocking)
     let app_clone = app.clone();
     tokio::spawn(async move {
-        // city/country not yet known at circuit injection time — the 30 s
-        // keep-alive loop will re-register with location once coverage runs.
-        register_with_relay(address_str, name, ep_clone, None, None).await;
-        // Small delay so contacts have time to register too before we announce
+        // Small delay so contacts have time to connect too before we announce
         tokio::time::sleep(Duration::from_millis(300)).await;
         broadcast_peer_announce(&app_clone).await;
         eprintln!("[P2P] Re-announced after relay circuit confirmed");
@@ -2124,28 +2061,37 @@ async fn merge_remote_chain(
     }
 }
 
-// ── Relay HTTP helpers ────────────────────────────────────────────────────────
+// ── Oracle RPC chain sync ─────────────────────────────────────────────────────
 
-pub async fn fetch_chain_from_relay(app: &tauri::AppHandle) {
-    eprintln!("[Relay] Fetching chain from relay nodes");
-    let resp = match relay_http_get("/chain").await {
-        Some(r) => r,
-        None    => { eprintln!("[Relay] fetch_chain: all relay nodes unreachable"); return; }
+/// Fetch the canonical chain from the Oracle RPC node and merge it locally.
+/// Replaces fetch_chain_from_relay — no HTTP relay required.
+pub async fn fetch_chain_from_oracle(app: &tauri::AppHandle) {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+
+    // Fetch blocks
+    let blocks_url = format!("{}/chain/blocks", ORACLE_RPC);
+    let blocks: Vec<crate::ledger::LedgerBlock> = match client.get(&blocks_url).send().await {
+        Ok(resp) => resp.json().await.unwrap_or_default(),
+        Err(e) => { eprintln!("[Oracle] fetch blocks: {}", e); vec![] }
     };
-    let body = match resp.text().await {
-        Ok(b)  => b,
-        Err(e) => { eprintln!("[Relay] fetch_chain read error: {}", e); return; }
+
+    // Fetch transactions
+    let txs_url = format!("{}/chain/transactions", ORACLE_RPC);
+    let transactions: Vec<crate::ledger::LedgerTx> = match client.get(&txs_url).send().await {
+        Ok(resp) => resp.json().await.unwrap_or_default(),
+        Err(e) => { eprintln!("[Oracle] fetch txs: {}", e); vec![] }
     };
-    let remote: crate::ledger::SharedChain = match serde_json::from_str(&body) {
-        Ok(c)  => c,
-        Err(e) => { eprintln!("[Relay] fetch_chain parse error: {}", e); return; }
-    };
-    if remote.blocks.is_empty() && remote.transactions.is_empty() {
-        eprintln!("[Relay] Relay chain is empty — nothing to merge");
+
+    if blocks.is_empty() && transactions.is_empty() {
+        eprintln!("[Oracle] chain empty or unreachable — skipping merge");
         return;
     }
-    merge_remote_chain(remote.blocks, remote.transactions, app).await;
-    eprintln!("[Relay] Chain merged from relay seed node");
+
+    merge_remote_chain(blocks, transactions, app).await;
+    eprintln!("[Oracle] Chain merged from Oracle RPC");
 }
 
 // ── BFT voting round ─────────────────────────────────────────────────────────
@@ -2274,12 +2220,8 @@ async fn handle_block_vote(
     let block = match finalized_chain.blocks.iter().find(|b| b.hash == block_hash) {
         Some(b) => b.clone(),
         None    => {
-            // Block not in chain yet — fetch from relay
-            if let Some(resp) = crate::p2p::relay_http_get("/chain").await {
-                if let Ok(remote) = resp.json::<crate::ledger::SharedChain>().await {
-                    merge_remote_chain(remote.blocks, remote.transactions, app).await;
-                }
-            }
+            // Block not yet known locally — Oracle sync will pick it up on the next tick
+            eprintln!("[BFT] Block {} not found locally — will arrive via Oracle sync", block_hash);
             return;
         }
     };
@@ -2306,238 +2248,46 @@ async fn handle_block_vote(
     let _ = app.emit_all("ego://chain-updated", ());
 }
 
-pub async fn push_tx_to_relay(tx: &crate::ledger::LedgerTx, block: &crate::ledger::LedgerBlock) {
-    // ── Gossipsub broadcast (true P2P — reaches all subscribers directly) ─────
-    let gossip_msg = P2PMessage::TxBroadcast { tx: tx.clone(), block: block.clone() };
-    if let Ok(data) = serde_json::to_vec(&gossip_msg) {
-        publish_gossip("ego-txs-v1", data).await;
-    }
+/// No-op stub — HTTP relay decommissioned. Gossipsub broadcast is handled by
+/// broadcast_tx(); Oracle RPC receives TXs via the /tx/broadcast call in wallet.rs.
+pub async fn push_tx_to_relay(_tx: &crate::ledger::LedgerTx, _block: &crate::ledger::LedgerBlock) {}
 
-    // ── HTTP relay fallback (ensures the relay seed node also gets it) ────────
-    if !relay_http_post_json("/chain/tx", tx).await {
-        eprintln!("[Relay] push tx: all relay nodes unreachable");
-    }
-    if !relay_http_post_json("/chain/block", block).await {
-        eprintln!("[Relay] push block: all relay nodes unreachable");
-    }
-}
+// ── CID registry (DHT-only after relay decommission) ──────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RelayPeerEntry {
-    address:   String,
-    name:      String,
-    endpoint:  String,
-    last_seen: i64,
-    #[serde(default)]
-    city:    Option<String>,
-    #[serde(default)]
-    country: Option<String>,
-    /// True when this desktop node is also acting as a relay server.
-    #[serde(default)]
-    is_relay: bool,
-}
-
-pub async fn register_with_relay(
-    address:  String,
-    name:     String,
-    endpoint: String,
-    city:     Option<String>,
-    country:  Option<String>,
-) {
-    if address.is_empty() || endpoint.is_empty() { return; }
-    let entry = RelayPeerEntry {
-        address:   address.clone(),
-        name,
-        endpoint:  endpoint.clone(),
-        last_seen: 0,
-        city,
-        country,
-        is_relay:  IS_RELAY_SERVER.load(Ordering::Relaxed),
-    };
-    if relay_http_post_json("/peers", &entry).await {
-        eprintln!("[Relay] Registered endpoint: {}", endpoint);
-    } else {
-        eprintln!("[Relay] register: all relay nodes unreachable");
-    }
-}
-
-// ── CID registry (shard-aware file discovery) ─────────────────────────────────
-
-/// Derive which relay shard owns a CID (same XOR-fold as the relay).
-fn shard_for_cid(cid: &str) -> u32 {
-    let mut h: u32 = 0;
-    for (i, b) in cid.bytes().enumerate() {
-        h ^= (b as u32) << (8 * (i % 4));
-    }
-    h % 4 // SHARD_COUNT = 4; keep in sync with relay
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CidHolder {
-    pub cid:           String,
-    pub holder_addr:   String,
-    pub endpoint:      String,
-    pub shard_id:      u32,
-    pub registered_at: i64,
-}
-
-/// After storing a file locally, register it on the relay shard so any peer
-/// (not just contacts) can discover the holder and request it directly.
-/// Signs the registration with Ed25519 to prevent registry poisoning.
+/// After storing a file locally, register it on the DHT so peers can discover
+/// the holder and request it directly.
 pub async fn register_cid_on_relay(cid: &str, holder_addr: &str, endpoint: &str) {
-    // Publish to DHT (relay-independent path)
     dht_register_cid(cid, holder_addr, endpoint).await;
-
-    let shard_id  = shard_for_cid(cid);
-    let timestamp = chrono::Utc::now().timestamp();
-
-    // Sign "cid:holder_addr:timestamp" with the wallet's Ed25519 key.
-    let sign_bytes = format!("{}:{}:{}", cid, holder_addr, timestamp).into_bytes();
-    let (sig_hex, pubkey_hex) = {
-        let seed_bytes = match std::fs::read(crate::ledger::seed_path()) {
-            Ok(b) if b.len() == 32 => b,
-            _ => { eprintln!("[CID] register: seed not available, skipping"); return; }
-        };
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&seed_bytes);
-        let kp = match ego_core::KeyPair::from_bytes(&seed) {
-            Ok(k) => k,
-            Err(e) => { eprintln!("[CID] register: keypair error: {}", e); return; }
-        };
-        let sig = kp.sign_ed25519(&sign_bytes);
-        let pk  = hex::encode(kp.ed25519_public_key().as_bytes());
-        (hex::encode(sig.as_bytes()), pk)
-    };
-
-    let payload = serde_json::json!({
-        "cid":         cid,
-        "holder_addr": holder_addr,
-        "endpoint":    endpoint,
-        "timestamp":   timestamp,
-        "signature":   sig_hex,
-        "public_key":  pubkey_hex,
-    });
-    let path = format!("/shard/{}/cid", shard_id);
-    if !relay_http_post_json(&path, &payload).await {
-        eprintln!("[CID] register: all relay nodes unreachable");
-    }
 }
 
-/// Register a PoRep commitment on the relay so it can issue PoST challenges.
-/// Called fire-and-forget after store_file succeeds.
+/// No-op stub — PoRep commitments are tracked on-chain via deploy TXs.
 pub async fn register_porep_commitment(
-    cid:            &str,
-    prover_addr:    &str,
-    comm_d:         &str,
-    comm_r:         &str,
-    n_real_leaves:  usize,
-    n_padded_leaves: usize,
-    sector_id:      u64,
-    file_size:      u64,
-    expiry:         i64,
-) {
-    let timestamp = chrono::Utc::now().timestamp();
-    // Sign "cid:comm_d:timestamp" with Ed25519 to prove address ownership.
-    let sign_bytes = format!("{}:{}:{}", cid, comm_d, timestamp).into_bytes();
-    let (sig_hex, pubkey_hex) = {
-        let seed_bytes = match std::fs::read(crate::ledger::seed_path()) {
-            Ok(b) if b.len() == 32 => b,
-            _ => { eprintln!("[PoRep] register: seed not available"); return; }
-        };
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&seed_bytes);
-        let kp = match ego_core::KeyPair::from_bytes(&seed) {
-            Ok(k) => k,
-            Err(e) => { eprintln!("[PoRep] register: keypair error: {e}"); return; }
-        };
-        let sig = kp.sign_ed25519(&sign_bytes);
-        let pk  = hex::encode(kp.ed25519_public_key().as_bytes());
-        (hex::encode(sig.as_bytes()), pk)
-    };
+    _cid: &str, _prover_addr: &str, _comm_d: &str, _comm_r: &str,
+    _n_real_leaves: usize, _n_padded_leaves: usize,
+    _sector_id: u64, _file_size: u64, _expiry: i64,
+) {}
 
-    let payload = serde_json::json!({
-        "cid":             cid,
-        "prover_addr":     prover_addr,
-        "comm_d":          comm_d,
-        "comm_r":          comm_r,
-        "n_real_leaves":   n_real_leaves,
-        "n_padded_leaves": n_padded_leaves,
-        "sector_id":       sector_id,
-        "file_size":       file_size,
-        "expiry":          expiry,
-        "timestamp":       timestamp,
-        "signature":       sig_hex,
-        "public_key":      pubkey_hex,
-    });
-
-    if relay_http_post_json("/porep/commit", &payload).await {
-        eprintln!("[PoRep] ✓ Commitment registered for {}", &cid[..16.min(cid.len())]);
-    } else {
-        eprintln!("[PoRep] register: all relay nodes unreachable");
-    }
+/// No-op stub — PoST challenges will come from Oracle RPC in a future update.
+pub async fn fetch_post_challenges(_prover_addr: &str) -> Vec<serde_json::Value> {
+    vec![]
 }
 
-/// Fetch pending PoST challenges from the relay for this address.
-pub async fn fetch_post_challenges(prover_addr: &str) -> Vec<serde_json::Value> {
-    let path = format!("/post/challenges/{}", prover_addr);
-    match relay_http_get(&path).await {
-        Some(r) => r.json::<Vec<serde_json::Value>>().await.unwrap_or_default(),
-        None    => { eprintln!("[PoST] fetch challenges: all relay nodes unreachable"); vec![] }
-    }
+/// No-op stub — PoST proof submission will target Oracle RPC in a future update.
+pub async fn submit_post_proof(_payload: serde_json::Value) -> bool {
+    false
 }
 
-/// Submit PoST proofs to the relay in response to a challenge.
-pub async fn submit_post_proof(payload: serde_json::Value) -> bool {
-    relay_http_post_json("/post/proof", &payload).await
+/// Minimal holder info returned by find_cid_holders.
+#[derive(Debug, Clone, Default)]
+pub struct CidHolder {
+    pub holder_addr: String,
+    pub endpoint:    String,
 }
 
-/// After staking or unstaking, call this to update the relay's stake registry
-/// so the combined DRS score reflects the new stake amount immediately.
-/// Signs "stake:{address}:{amount_uegoc}:{timestamp}" with Ed25519.
-pub async fn report_stake_to_relay(address: &str, amount_uegoc: u64) {
-    let timestamp = chrono::Utc::now().timestamp();
-    let sign_bytes = format!("stake:{}:{}:{}", address, amount_uegoc, timestamp).into_bytes();
-
-    let seed_bytes = match std::fs::read(crate::ledger::seed_path()) {
-        Ok(b) if b.len() == 32 => b,
-        _ => { eprintln!("[stake] seed not available, skipping relay update"); return; }
-    };
-    let mut seed_arr = [0u8; 32];
-    seed_arr.copy_from_slice(&seed_bytes);
-    let kp = match ego_core::KeyPair::from_bytes(&seed_arr) {
-        Ok(k)  => k,
-        Err(e) => { eprintln!("[stake] keypair error: {e}"); return; }
-    };
-    let sig_hex    = hex::encode(kp.sign_ed25519(&sign_bytes).as_bytes());
-    let pubkey_hex = hex::encode(kp.ed25519_public_key().as_bytes());
-
-    let payload = serde_json::json!({
-        "address":      address,
-        "amount_uegoc": amount_uegoc,
-        "timestamp":    timestamp,
-        "signature":    sig_hex,
-        "public_key":   pubkey_hex,
-    });
-
-    if relay_http_post_json("/stake/update", &payload).await {
-        println!("[stake] Reported to relay: {} → {} uEGOC", address, amount_uegoc);
-    } else {
-        eprintln!("[stake] stake update: all relay nodes unreachable");
-    }
-}
-
-/// Query the relay shard registry to find who holds a CID.
-/// Returns a list of holders so the requester can pick the best one.
+/// Query the DHT to find who holds a CID.
 pub async fn find_cid_holders(cid: &str) -> Vec<CidHolder> {
-    let shard_id = shard_for_cid(cid);
-    let path     = format!("/shard/{}/cid/{}", shard_id, cid);
-    let holders  = match relay_http_get(&path).await {
-        Some(resp) => resp.json::<Vec<CidHolder>>().await.unwrap_or_default(),
-        None       => { eprintln!("[CID] lookup: all relay nodes unreachable"); vec![] }
-    };
-    // Also trigger DHT lookup (results arrive asynchronously via gossipsub/kad events)
     dht_find_cid(cid).await;
-    holders
+    vec![]
 }
 
 /// Publish a CID→holder mapping to the DHT so any peer can find who holds a file.
@@ -2613,82 +2363,8 @@ pub async fn dht_fetch_inbox(my_addr: &str) {
     }
 }
 
-pub async fn fetch_peers_from_relay(app: &tauri::AppHandle) {
-    let resp = match relay_http_get("/peers").await {
-        Some(r) => r,
-        None    => { eprintln!("[Relay] fetch_peers: all relay nodes unreachable"); return; }
-    };
-    let body = match resp.text().await {
-        Ok(b)  => b,
-        Err(e) => { eprintln!("[Relay] fetch_peers read: {}", e); return; }
-    };
-    let remote_peers: Vec<RelayPeerEntry> = match serde_json::from_str(&body) {
-        Ok(p)  => p,
-        Err(e) => { eprintln!("[Relay] fetch_peers parse: {}", e); return; }
-    };
-    if remote_peers.is_empty() { return; }
-
-    // Only treat peers as active if they registered with the relay in the
-    // last 10 minutes.  The desktop re-registers every 30 s, so a peer that
-    // has been online continuously will always pass this filter.  Stale
-    // entries left over from previous days are silently ignored.
-    let now        = Utc::now().timestamp();
-    let cutoff_10m = now - 600;
-    let active_peers: Vec<&RelayPeerEntry> = remote_peers.iter()
-        .filter(|p| p.last_seen >= cutoff_10m && !p.endpoint.is_empty())
-        .collect();
-
-    let state = app.state::<crate::app::AppState>();
-    for p in &active_peers {
-        state.upsert_peer(crate::app::PeerInfo {
-            address:   p.address.clone(),
-            name:      p.name.clone(),
-            endpoint:  p.endpoint.clone(),
-            last_seen: p.last_seen,
-            city:      p.city.clone(),
-            country:   p.country.clone(),
-        });
-        // Also write to the file-based peer cache so resolve_endpoint()
-        // (in messenger.rs) can find it without another HTTP round-trip.
-        if !p.endpoint.is_empty() {
-            upsert_peer_cache(PeerEntry {
-                address:   p.address.clone(),
-                endpoint:  p.endpoint.clone(),
-                last_seen: Utc::now().timestamp(),
-                city:      p.city.clone(),
-                country:   p.country.clone(),
-            });
-        }
-    }
-
-    let mut contacts = load_contacts();
-    let mut changed  = false;
-    for remote in &active_peers {
-        if let Some(c) = contacts.iter_mut().find(|c| c.address == remote.address) {
-            let relay_in   = remote.endpoint.contains("/p2p-circuit");
-            let relay_curr = c.endpoint.contains("/p2p-circuit");
-            if (relay_in || !relay_curr) && c.endpoint != remote.endpoint {
-                eprintln!("[Relay] Updated {} endpoint → {}", remote.address, remote.endpoint);
-                c.endpoint = remote.endpoint.clone();
-                changed = true;
-            }
-        }
-    }
-    if changed {
-        let _ = save_contacts(&contacts);
-        let _ = app.emit_all("ego://peers-updated", ());
-    }
-
-    // Remove any peer from AppState that is no longer in the relay's active list
-    // AND hasn't been heard from directly (via PeerAnnounce) in the last 5 min.
-    // This ensures ghost peers vanish from the UI quickly after going offline.
-    let active_addrs: std::collections::HashSet<String> =
-        active_peers.iter().map(|p| p.address.clone()).collect();
-    state.cleanup_stale_peers(&active_addrs, now - 300);
-
-    eprintln!("[Relay] Fetched {} peers ({} active)", remote_peers.len(), active_peers.len());
-
-    // Also trigger DHT discovery in parallel (relay-independent path)
+/// Discover peers via DHT only (HTTP relay decommissioned).
+pub async fn fetch_peers_from_relay(_app: &tauri::AppHandle) {
     dht_discover_peers().await;
 }
 
@@ -2722,16 +2398,9 @@ pub async fn dht_discover_peers() {
     }
 }
 
-/// Live relay HTTP lookup — returns the peer's current relay circuit endpoint
-/// for the given wallet address, or `None` if not found.
-/// Called by resolve_endpoint() as a fallback when the local cache is stale.
-pub async fn get_relay_endpoint(address: &str) -> Option<String> {
-    let resp = relay_http_get("/peers").await?;
-    let body = resp.text().await.ok()?;
-    let peers: Vec<RelayPeerEntry> = serde_json::from_str(&body).ok()?;
-    peers.into_iter()
-        .find(|p| p.address == address && !p.endpoint.is_empty())
-        .map(|p| p.endpoint)
+/// Endpoint lookup — HTTP relay removed; falls back to local peer cache only.
+pub async fn get_relay_endpoint(_address: &str) -> Option<String> {
+    None
 }
 
 // ── Windows firewall ──────────────────────────────────────────────────────────

@@ -114,13 +114,6 @@ pub async fn deploy_contract(args: DeployContractArgs) -> Result<DeployResult, E
     chain2.transactions.push(tx.clone());
     let _ = save_chain(&chain2);
 
-    // Broadcast to peers
-    if let Some(block) = chain2.blocks.last().cloned() {
-        tokio::spawn(async move {
-            crate::p2p::push_tx_to_relay(&tx, &block).await;
-        });
-    }
-
     Ok(result)
 }
 
@@ -207,11 +200,6 @@ pub async fn call_contract(args: CallContractArgs) -> Result<CallResult, EgoDesk
         chain2.transactions.push(tx.clone());
         let _ = save_chain(&chain2);
 
-        if let Some(block) = chain2.blocks.last().cloned() {
-            tokio::spawn(async move {
-                crate::p2p::push_tx_to_relay(&tx, &block).await;
-            });
-        }
     }
 
     Ok(result)

@@ -166,14 +166,7 @@ pub async fn run_batch_loop() {
                   block.height, txs.len(),
                   (txs.len() as u64 * 1000) / BATCH_INTERVAL_MS);
 
-        // Broadcast batch to relay + P2P peers (fire-and-forget)
-        let txs_relay = txs.clone();
-        let blk_relay = block.clone();
-        tokio::spawn(async move {
-            for tx in &txs_relay {
-                crate::p2p::push_tx_to_relay(tx, &blk_relay).await;
-            }
-        });
+        // Broadcast batch to P2P peers (fire-and-forget)
         tokio::spawn(async move {
             for tx in &txs {
                 crate::p2p::broadcast_tx(tx.clone(), block.clone()).await;
