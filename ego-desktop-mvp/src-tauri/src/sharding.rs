@@ -7,7 +7,7 @@
 //! In Phase 1 the shard math runs but always produces shard_count=1, so
 //! all existing chain.json storage is untouched.
 
-use crate::ledger::{base_data_dir, load_chain};
+use crate::ledger::{base_data_dir, load_chain, SharedChain, LedgerBlock, LedgerTx};
 use serde::{Deserialize, Serialize};
 use std::fs;
 
@@ -289,6 +289,55 @@ pub fn handle_shard_announce_update(
     }
 
     let _ = save_shard_map(&map);
+}
+
+// ── Phase 2 helpers ───────────────────────────────────────────────────────────
+
+/// Returns the blocks and their transactions belonging to `shard_id`,
+/// starting from `from_height` (exclusive). In Phase 1 (shard_count=1) returns
+/// all blocks above `from_height`.
+pub fn get_shard_blocks(
+    shard_id:    u32,
+    from_height: u64,
+    chain:       &SharedChain,
+    map:         &ShardMap,
+) -> (Vec<LedgerBlock>, Vec<LedgerTx>) {
+    let blocks: Vec<LedgerBlock> = chain.blocks.iter()
+        .filter(|b| {
+            b.height > from_height
+            && (map.shard_count <= 1
+                || shard_for_height(b.height, map.total_blocks.max(1), map.shard_count) == shard_id)
+        })
+        .cloned()
+        .collect();
+
+    if blocks.is_empty() {
+        return (blocks, vec![]);
+    }
+
+    let min_h = blocks.iter().map(|b| b.height).min().unwrap_or(0);
+    let max_h = blocks.iter().map(|b| b.height).max().unwrap_or(0);
+
+    // Return txs whose confirmed block_height falls within this shard's range.
+    let txs: Vec<LedgerTx> = chain.transactions.iter()
+        .filter(|t| t.block_height.map(|h| h >= min_h && h <= max_h).unwrap_or(false))
+        .cloned()
+        .collect();
+
+    (blocks, txs)
+}
+
+/// Returns the highest block height we already hold for a given shard.
+/// Used by slaves to request only the blocks they're missing.
+pub fn last_shard_height(shard_id: u32, chain: &SharedChain, map: &ShardMap) -> u64 {
+    chain.blocks.iter()
+        .filter(|b| {
+            map.shard_count <= 1
+            || shard_for_height(b.height, map.total_blocks.max(1), map.shard_count) == shard_id
+        })
+        .map(|b| b.height)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Returns a JSON summary of the current shard state for the frontend.

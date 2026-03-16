@@ -271,6 +271,8 @@ fn main() {
                     crate::sharding::run_shard_startup(&ledger_for_shard.address, &endpoint, &shard_peers, 0).await;
                     crate::p2p::broadcast_shard_announce().await;
                     crate::sharding::check_master_health(&ledger_for_shard.address, &endpoint, 0).await;
+                    // Phase 2: push shard data to slaves (no-op in Phase 1)
+                    crate::p2p::push_shard_data_to_slaves().await;
                 }
             });
 

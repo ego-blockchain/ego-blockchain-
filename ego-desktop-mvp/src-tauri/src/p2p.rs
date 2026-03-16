@@ -262,6 +262,19 @@ pub enum P2PMessage {
         former_master: String,
         timestamp:     i64,
     },
+    /// Slave asks master to send blocks for a specific shard starting from `from_height`.
+    ShardDataRequest {
+        shard_id:             u32,
+        from_height:          u64,
+        requester_address:    String,
+        requester_endpoint:   String,
+    },
+    /// Master replies with blocks + txs for the requested shard.
+    ShardDataResponse {
+        shard_id:     u32,
+        blocks:       Vec<LedgerBlock>,
+        transactions: Vec<LedgerTx>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -745,6 +758,47 @@ pub async fn broadcast_master_promotion(shard_id: u32, new_master: &str, new_end
     };
     if let Ok(data) = serde_json::to_vec(&msg) {
         publish_gossip("ego-shards-v1", data).await;
+    }
+}
+
+/// Phase 2: master pushes its shard blocks to known slaves so they stay in sync.
+/// Only runs when shard_count > 1 (Phase 2+). No-op in Phase 1.
+pub async fn push_shard_data_to_slaves() {
+    let map = crate::sharding::load_shard_map();
+    if map.shard_count <= 1 { return; }
+
+    let my_addr = crate::ledger::Ledger::load().address;
+    if my_addr.is_empty() { return; }
+    let my_ep = get_public_endpoint().await;
+
+    let all_nodes: Vec<String> = map.assignments.iter()
+        .map(|a| a.node_address.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter().collect();
+
+    let chain = load_chain();
+
+    for (shard_id, role) in crate::sharding::my_shards(&my_addr, &map, &all_nodes) {
+        if role != crate::sharding::ShardRole::Master { continue; }
+
+        // Find slave endpoints for this shard
+        let slave_eps: Vec<String> = map.assignments.iter()
+            .filter(|a| a.shard_id == shard_id && a.role == crate::sharding::ShardRole::Slave && !a.node_endpoint.is_empty())
+            .map(|a| a.node_endpoint.clone())
+            .collect();
+
+        if slave_eps.is_empty() { continue; }
+
+        let (blocks, txs) = crate::sharding::get_shard_blocks(shard_id, 0, &chain, &map);
+        if blocks.is_empty() { continue; }
+
+        let response = P2PMessage::ShardDataResponse { shard_id, blocks, transactions: txs };
+        let eps_clone = slave_eps.clone();
+        tokio::spawn(async move {
+            for ep in &eps_clone {
+                let _ = send_message_any(&[ep.clone()], &response).await;
+            }
+        });
     }
 }
 
@@ -1489,13 +1543,40 @@ async fn handle_event(
                             map.assignments.push(crate::sharding::ShardAssignment {
                                 shard_id,
                                 role: crate::sharding::ShardRole::Master,
-                                node_address: new_master,
-                                node_endpoint: new_endpoint,
+                                node_address: new_master.clone(),
+                                node_endpoint: new_endpoint.clone(),
                                 last_seen: timestamp,
                                 uptime_secs: 0,
                             });
                         }
                         let _ = crate::sharding::save_shard_map(&map);
+                        // Phase 2: if we are a slave for this shard, fill vacancy by
+                        // pulling the shard data from the new master
+                        let my_addr = crate::ledger::Ledger::load().address;
+                        let my_ep   = get_public_endpoint().await;
+                        let updated = crate::sharding::load_shard_map();
+                        let all_nodes: Vec<String> = updated.assignments.iter()
+                            .map(|a| a.node_address.clone())
+                            .collect::<std::collections::HashSet<_>>()
+                            .into_iter().collect();
+                        let is_slave = crate::sharding::my_shards(&my_addr, &updated, &all_nodes)
+                            .iter().any(|(sid, role)| *sid == shard_id && *role == crate::sharding::ShardRole::Slave);
+                        if is_slave && !new_endpoint.is_empty() {
+                            let my_ep2 = my_ep.clone();
+                            let my_a2  = my_addr.clone();
+                            let ep2    = new_endpoint.clone();
+                            let chain  = load_chain();
+                            let from_h = crate::sharding::last_shard_height(shard_id, &chain, &updated);
+                            tokio::spawn(async move {
+                                let req = P2PMessage::ShardDataRequest {
+                                    shard_id,
+                                    from_height:        from_h,
+                                    requester_address:  my_a2,
+                                    requester_endpoint: my_ep2,
+                                };
+                                let _ = send_message_any(&[ep2], &req).await;
+                            });
+                        }
                     }
                     _ => {}
                 }
@@ -1725,12 +1806,21 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                 country:   None,
             });
             upsert_peer_cache(PeerEntry {
-                address,
-                endpoint,
+                address:   address.clone(),
+                endpoint:  endpoint.clone(),
                 last_seen: Utc::now().timestamp(),
                 city:      None,
                 country:   None,
             });
+            // Phase 2: immediately request their chain when a new peer announces
+            if !endpoint.is_empty() {
+                let my_ep = get_public_endpoint().await;
+                let req   = P2PMessage::ChainSyncRequest { requester_endpoint: my_ep };
+                let ep2   = endpoint.clone();
+                tokio::spawn(async move {
+                    let _ = send_message_any(&[ep2], &req).await;
+                });
+            }
         }
 P2PMessage::ChatMessage { bundle } => {
     match crate::commands::messenger::receive_message_inner(&bundle) {
@@ -1870,6 +1960,24 @@ P2PMessage::ChatMessage { bundle } => {
         }
 
         P2PMessage::ChainSyncResponse { blocks, transactions } => {
+            merge_remote_chain(blocks, transactions, app).await;
+        }
+
+        // ── Phase 2: shard data replication ──────────────────────────────────
+        P2PMessage::ShardDataRequest { shard_id, from_height, requester_address: _, requester_endpoint } => {
+            let chain = load_chain();
+            let map   = crate::sharding::load_shard_map();
+            let (blocks, txs) = crate::sharding::get_shard_blocks(shard_id, from_height, &chain, &map);
+            let response = P2PMessage::ShardDataResponse { shard_id, blocks, transactions: txs };
+            tokio::spawn(async move {
+                if let Err(e) = send_message_any(&[requester_endpoint.clone()], &response).await {
+                    eprintln!("[Sharding] shard data reply to {}: {}", requester_endpoint, e);
+                }
+            });
+        }
+
+        P2PMessage::ShardDataResponse { shard_id, blocks, transactions } => {
+            eprintln!("[Sharding] received {} blocks for shard {}", blocks.len(), shard_id);
             merge_remote_chain(blocks, transactions, app).await;
         }
 
