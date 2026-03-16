@@ -340,6 +340,96 @@ pub fn last_shard_height(shard_id: u32, chain: &SharedChain, map: &ShardMap) -> 
         .unwrap_or(0)
 }
 
+// ── Phase 3 helpers ───────────────────────────────────────────────────────────
+
+/// Returns (shard_id, live_holder_count) for shards with fewer than
+/// REPLICATION_FACTOR confirmed-alive (last_seen < 5 min) holders.
+/// Only runs in Phase 3 (shard_count >= PHASE3_NODE_THRESHOLD).
+pub fn detect_vacant_shards(map: &ShardMap) -> Vec<(u32, u32)> {
+    if map.shard_count <= 1 { return vec![]; }
+    let now = chrono::Utc::now().timestamp();
+    let mut result = Vec::new();
+    for shard_id in 0..map.shard_count {
+        let live = map.assignments.iter()
+            .filter(|a| a.shard_id == shard_id && now - a.last_seen < 300)
+            .count() as u32;
+        if live < REPLICATION_FACTOR {
+            result.push((shard_id, live));
+        }
+    }
+    result
+}
+
+/// Returns true if this node should volunteer to hold `shard_id`:
+/// - It's not already assigned to that shard
+/// - The network is in Phase 3
+/// - This node has spare capacity (holds fewer than average shards)
+pub fn should_volunteer_for_shard(shard_id: u32, my_address: &str, map: &ShardMap) -> bool {
+    if map.shard_count <= 1 { return false; }
+    // Already holding this shard?
+    if map.assignments.iter().any(|a| a.shard_id == shard_id && a.node_address == my_address) {
+        return false;
+    }
+    // How many shards am I currently holding?
+    let my_count = map.assignments.iter()
+        .filter(|a| a.node_address == my_address)
+        .count() as u32;
+    // Average shards per node
+    let avg = (map.shard_count * REPLICATION_FACTOR).max(1) / map.network_node_count.max(1);
+    my_count <= avg
+}
+
+/// Phase 3 pruning: remove blocks for Observer shards when replication is confirmed.
+/// Only called when shard_count > 1 AND the shard has REPLICATION_FACTOR live holders.
+/// Writes the pruned chain back to disk.
+pub fn prune_observer_shards(my_address: &str) {
+    let map = load_shard_map();
+    if map.shard_count <= 1 { return; } // Phase 1/2: never prune
+
+    let now = chrono::Utc::now().timestamp();
+    let all_nodes: Vec<String> = map.assignments.iter()
+        .map(|a| a.node_address.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter().collect();
+
+    let my_shard_ids: Vec<u32> = my_shards(my_address, &map, &all_nodes)
+        .into_iter().map(|(id, _)| id).collect();
+
+    // Find shards we're Observer for AND that have full replication confirmed
+    let mut to_prune: Vec<u32> = Vec::new();
+    for shard_id in 0..map.shard_count {
+        if my_shard_ids.contains(&shard_id) { continue; } // we hold this one
+        let live_holders = map.assignments.iter()
+            .filter(|a| a.shard_id == shard_id && now - a.last_seen < 300)
+            .count() as u32;
+        if live_holders >= REPLICATION_FACTOR {
+            to_prune.push(shard_id);
+        }
+    }
+
+    if to_prune.is_empty() { return; }
+
+    let mut chain = load_chain();
+    let before = chain.blocks.len();
+
+    chain.blocks.retain(|b| {
+        let sid = shard_for_height(b.height, map.total_blocks.max(1), map.shard_count);
+        !to_prune.contains(&sid)
+    });
+
+    let after = chain.blocks.len();
+    if after < before {
+        eprintln!("[Sharding] Pruned {} blocks for Observer shards {:?}", before - after, to_prune);
+        // Also prune orphaned transactions (no matching block)
+        let block_heights: std::collections::HashSet<u64> =
+            chain.blocks.iter().map(|b| b.height).collect();
+        chain.transactions.retain(|t| {
+            t.block_height.map(|h| block_heights.contains(&h)).unwrap_or(true)
+        });
+        let _ = crate::ledger::save_chain(&chain);
+    }
+}
+
 /// Returns a JSON summary of the current shard state for the frontend.
 pub fn get_shard_status() -> serde_json::Value {
     let map = load_shard_map();
