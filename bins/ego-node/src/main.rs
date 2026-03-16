@@ -144,7 +144,8 @@ async fn main() -> anyhow::Result<()> {
         nonce:          Mutex::new(0),
         supervisor,
         faucet_claims:  Mutex::new(std::collections::HashMap::new()),
-        broadcast_txs:  Mutex::new(Vec::new()),
+        broadcast_txs:    Mutex::new(Vec::new()),
+        broadcast_blocks: Mutex::new(Vec::new()),
     });
     let rpc_addr = format!("0.0.0.0:{}", 8545u16);
     let rpc_state_clone = Arc::clone(&rpc_state);
