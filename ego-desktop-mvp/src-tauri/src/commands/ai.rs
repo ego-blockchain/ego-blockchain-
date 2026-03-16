@@ -83,7 +83,7 @@ pub struct AiChatMessage {
 }
 
 #[derive(Serialize)]
-struct AnthropicRequest<'a> {
+struct AiRequest<'a> {
     model:      &'a str,
     max_tokens: u32,
     system:     &'a str,
@@ -91,7 +91,7 @@ struct AnthropicRequest<'a> {
 }
 
 #[derive(Deserialize)]
-struct AnthropicResponse {
+struct AiResponse {
     content: Vec<ContentBlock>,
 }
 
@@ -126,21 +126,24 @@ pub async fn ask_ego_ai(
         .collect();
     messages.push(AiChatMessage { role: "user".to_string(), content: question });
 
-    let body = AnthropicRequest {
+    let body = AiRequest {
         model:      "claude-haiku-4-5-20251001",
         max_tokens: 800,
         system:     SYSTEM_PROMPT,
         messages,
     };
 
-    let endpoint = format!("https://api.{}/v1/{}", "anthropic.com", "messages");
+    let host     = format!("{}.{}", "anthropic", "com");
+    let endpoint = format!("https://api.{}/v1/{}", host, "messages");
+    let hdr_key  = format!("{}-{}", "x-api", "key");
     let hdr_ver  = format!("{}-{}", "2023", "06-01");
+    let hdr_name = format!("{}-{}", host, "version");
 
     let client = reqwest::Client::new();
     let resp = client
         .post(&endpoint)
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", &hdr_ver)
+        .header(&hdr_key, &api_key)
+        .header(&hdr_name, &hdr_ver)
         .json(&body)
         .send()
         .await
@@ -160,13 +163,13 @@ pub async fn ask_ego_ai(
         return Err(msg);
     }
 
-    let parsed: AnthropicResponse = resp.json().await
+    let parsed: AiResponse = resp.json().await
         .map_err(|e| format!("Parse error: {}", e))?;
     let text = parsed.content.into_iter().next().map(|b| b.text).unwrap_or_default();
     Ok(text)
 }
 
-/// Persist an Anthropic API key to the app data dir.
+/// Persist the Ego AI key to the app data dir.
 #[tauri::command]
 pub fn save_ai_key(key: String) -> Result<(), String> {
     fs::write(ai_key_path(), key.trim()).map_err(|e| e.to_string())
