@@ -254,6 +254,9 @@ fn main() {
                 crate::p2p::broadcast_shard_announce().await;
                 eprintln!("[Startup] Shard announce sent");
 
+                // Phase 3: publish shard assignments to DHT
+                crate::p2p::dht_publish_shard_assignments(&ledger_addr, &my_endpoint).await;
+
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 crate::p2p::sync_chain_from_peers().await;
                 eprintln!("[Startup] Chain sync requested");
@@ -273,6 +276,11 @@ fn main() {
                     crate::sharding::check_master_health(&ledger_for_shard.address, &endpoint, 0).await;
                     // Phase 2: push shard data to slaves (no-op in Phase 1)
                     crate::p2p::push_shard_data_to_slaves().await;
+                    // Phase 3: DHT shard registry + vacancy detection + pruning
+                    let ep3 = crate::p2p::get_public_endpoint().await;
+                    crate::p2p::dht_publish_shard_assignments(&ledger_for_shard.address, &ep3).await;
+                    crate::p2p::broadcast_vacancy_notices().await;
+                    crate::sharding::prune_observer_shards(&ledger_for_shard.address);
                 }
             });
 
