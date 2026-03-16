@@ -188,7 +188,7 @@ pub async fn submit_poc_event(
         public_key: &pubkey_hex,
     };
 
-    let url = format!("{}/poc/event", crate::p2p::RELAY_HTTP_API);
+    let url = format!("{}/poc/event", crate::p2p::ORACLE_RPC);
     match client.post(&url).json(&payload).send().await {
         Ok(resp) => {
             #[derive(Deserialize)]
@@ -248,7 +248,7 @@ pub async fn get_poc_score(
         });
     }
     let _ = state; // AppState not needed for HTTP fetch
-    let url = format!("{}/poc/score/{}", crate::p2p::RELAY_HTTP_API, address);
+    let url = format!("{}/poc/score/{}", crate::p2p::ORACLE_RPC, address);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()

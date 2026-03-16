@@ -128,42 +128,16 @@ fn parse_msg_bundle(
     ))
 }
 // ── resolve_endpoint ──────────────────────────────────────────────────────────
-// Always do a live relay HTTP lookup first — this gives us the peer's current
-// circuit address regardless of what's stored locally. If the peer has a new
-// peer ID (reinstall, new device) or reconnected and got a new reservation,
-// the relay directory always has the truth.
+// Falls back to local peer cache (populated by DHT discovery and PeerAnnounce).
+// HTTP relay lookup removed — relay decommissioned.
 async fn resolve_endpoint(contact_addr: &str, stored_endpoint: &str) -> String {
-    // 1. Live relay HTTP lookup — always fresh, handles peer ID changes
-    if let Some(live_ep) = crate::p2p::get_relay_endpoint(contact_addr).await {
-        if !live_ep.is_empty() {
-            // Persist so future sends skip the HTTP round-trip on cache hit
-            let mut contacts = load_contacts();
-            if let Some(c) = contacts.iter_mut().find(|c| c.address == contact_addr) {
-                if c.endpoint != live_ep {
-                    eprintln!("[Messenger] Relay: updated endpoint for {}: {}", contact_addr, live_ep);
-                    c.endpoint = live_ep.clone();
-                    let _ = save_contacts(&contacts);
-                }
-            }
-            // Also update peer cache
-            crate::p2p::upsert_peer_cache(crate::p2p::PeerEntry {
-                address:   contact_addr.to_string(),
-                endpoint:  live_ep.clone(),
-                last_seen: chrono::Utc::now().timestamp(),
-                city:      None,
-                country:   None,
-            });
-            return live_ep;
-        }
-    }
-
-    // 2. Fall back to file-based peer cache (populated by fetch_peers_from_relay)
+    // Check local peer cache (populated by PeerAnnounce + DHT)
     let cache = crate::p2p::load_peer_cache();
     if let Some(entry) = cache.iter().find(|p| p.address == contact_addr) {
         if !entry.endpoint.is_empty() {
-            let relay_is_better = entry.endpoint.contains("/p2p-circuit")
+            let cache_is_better = entry.endpoint.contains("/p2p-circuit")
                 || !stored_endpoint.contains("/p2p-circuit");
-            if relay_is_better && entry.endpoint != stored_endpoint {
+            if cache_is_better && entry.endpoint != stored_endpoint {
                 eprintln!(
                     "[Messenger] Cache: fresher endpoint for {}: {}",
                     contact_addr, entry.endpoint
@@ -175,23 +149,6 @@ async fn resolve_endpoint(contact_addr: &str, stored_endpoint: &str) -> String {
                 }
                 return entry.endpoint.clone();
             }
-        }
-    }
-
-    // 2. Always do a live relay HTTP lookup — even if stored endpoint already
-    // has a circuit address, the peer may have reconnected with a new reservation.
-    if let Some(relay_ep) = crate::p2p::get_relay_endpoint(contact_addr).await {
-        if !relay_ep.is_empty() && relay_ep != stored_endpoint {
-            eprintln!(
-                "[Messenger] Relay: fresher endpoint for {}: {}",
-                contact_addr, relay_ep
-            );
-            let mut contacts = load_contacts();
-            if let Some(c) = contacts.iter_mut().find(|c| c.address == contact_addr) {
-                c.endpoint = relay_ep.clone();
-                let _ = save_contacts(&contacts);
-            }
-            return relay_ep;
         }
     }
 
@@ -628,108 +585,9 @@ pub async fn rename_contact(
     save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)
 }
 
-/// Deposit a P2PMessage in the relay inbox for offline delivery.
+/// Deposit a P2PMessage in the DHT inbox for offline delivery.
+/// HTTP relay inbox removed — relay decommissioned.
 pub async fn deposit_in_relay_inbox(to_addr: &str, from_addr: &str, msg: &crate::p2p::P2PMessage) {
-    // Primary: DHT store — works without any relay
     crate::p2p::dht_deposit_message(to_addr, from_addr, msg).await;
-
-    // Secondary: relay HTTP inbox — for backward compat with older nodes
-    let payload = match serde_json::to_string(msg) {
-        Ok(j) => STANDARD.encode(j.as_bytes()),
-        Err(e) => { eprintln!("[Inbox] Serialize error: {}", e); return; }
-    };
-    let body = serde_json::json!({
-        "payload":   payload,
-        "deposited": chrono::Utc::now().timestamp(),
-        "from_addr": from_addr,
-    });
-    let path = format!("/inbox/{}", to_addr);
-    let _ = crate::p2p::relay_http_post_json(&path, &body).await;
 }
 
-/// Fetch and process any messages waiting in our relay inbox.
-/// Called once on startup after relay circuit is confirmed.
-pub async fn fetch_relay_inbox(app: &tauri::AppHandle) {
-    let ledger  = crate::ledger::Ledger::load();
-    let my_addr = ledger.address.clone();
-    if my_addr.is_empty() { return; }
-
-    // DHT inbox fetch (relay-independent)
-    crate::p2p::dht_fetch_inbox(&my_addr).await;
-
-    // HTTP relay inbox (backward compat)
-    let path = format!("/inbox/{}", my_addr);
-    let msgs: Vec<serde_json::Value> = match crate::p2p::relay_http_get(&path).await {
-        Some(r) => r.json().await.unwrap_or_default(),
-        None    => { eprintln!("[Inbox] HTTP relay unreachable — DHT only"); Vec::new() }
-    };
-
-    if msgs.is_empty() { return; }
-    eprintln!("[Inbox] Got {} offline message(s) from relay inbox", msgs.len());
-
-    for entry in msgs {
-        let payload = match entry["payload"].as_str()
-            .and_then(|p| STANDARD.decode(p).ok())
-            .and_then(|b| String::from_utf8(b).ok())
-        {
-            Some(p) => p,
-            None    => continue,
-        };
-        if let Ok(p2p_msg) = serde_json::from_str::<crate::p2p::P2PMessage>(&payload) {
-            crate::p2p::handle_incoming(p2p_msg, app).await;
-        }
-    }
-}
-
-/// Re-send ContactRequests to all `pending_out` contacts.
-/// Called every 30 s from the keep-alive loop so requests are automatically
-/// delivered once the remote comes online or updates their build.
-pub async fn retry_pending_contacts(app: &tauri::AppHandle) {
-    use tauri::Manager;
-    let state = app.state::<AppState>();
-    let keypair = match state.get_keypair() {
-        Some(k) => k,
-        None    => return,
-    };
-
-    let ledger  = crate::ledger::Ledger::load();
-    let my_addr = ledger.address.clone();
-    if my_addr.is_empty() { return; }
-
-    let my_endpoint = crate::p2p::get_public_endpoint().await;
-    if my_endpoint.is_empty() { return; }
-
-    let my_ed25519_hex = hex::encode(keypair.ed25519_public_key().as_bytes());
-    let my_kyber_hex   = hex::encode(keypair.kyber_public_key().as_bytes());
-
-    // Use wallet display name so the other side sees who is requesting.
-    let registry  = crate::ledger::load_registry();
-    let active_id = crate::ledger::get_active_wallet_id();
-    let my_name   = registry.wallets.iter()
-        .find(|w| w.id == active_id)
-        .map(|w| w.name.clone())
-        .unwrap_or_else(|| "Ego User".to_string());
-
-    let contacts = load_contacts();
-    for contact in contacts.iter().filter(|c| c.status == "pending_out" && !c.endpoint.is_empty()) {
-        let endpoint = resolve_endpoint(&contact.address, &contact.endpoint).await;
-        let request  = crate::p2p::P2PMessage::ContactRequest {
-            from_addr:       my_addr.clone(),
-            from_name:       my_name.clone(),
-            from_ed25519:    my_ed25519_hex.clone(),
-            from_kyber:      my_kyber_hex.clone(),
-            from_shared_key: contact.shared_key_hex.clone(),
-            from_endpoint:   my_endpoint.clone(),
-        };
-        match crate::p2p::send_message(&endpoint, &request).await {
-                    Ok(()) => eprintln!(
-                        "[Messenger] Pending request delivered to {}",
-                        contact.address
-                    ),
-                    Err(e) => {
-                        eprintln!("[Messenger] Retry to {}: {} — depositing in relay inbox", contact.address, e);
-                        deposit_in_relay_inbox(&contact.address, &my_addr, &request).await;
-                    }
-                }
-    }
-}

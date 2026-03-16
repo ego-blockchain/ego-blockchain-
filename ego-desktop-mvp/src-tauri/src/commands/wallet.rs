@@ -245,9 +245,7 @@ pub async fn commit_transaction(
     if tx.nonce > ledger.nonce { ledger.nonce = tx.nonce; let _ = ledger.save(); }
     let block_height = tx.block_height;
     let tx_hash = tx.hash.clone();
-    let tx2 = tx.clone(); let blk2 = block.clone();
     let tx3 = tx.clone(); let blk3 = block.clone();
-    tokio::spawn(async move { crate::p2p::push_tx_to_relay(&tx2, &blk2).await; });
     tokio::spawn(async move { crate::p2p::broadcast_tx(tx3, blk3).await; });
     // Forward to Oracle node so the public explorer can show the transaction.
     let tx4 = tx.clone();

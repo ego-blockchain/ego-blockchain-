@@ -300,12 +300,11 @@ async fn tick_coverage(
     }
 }
 
-/// Fetch peer list from relay HTTP directory, update AppState, then send
-/// PeerListRequest to any peer we don't currently have in active peers.
-/// This actively recruits nodes that are online but haven't announced to us yet.
+/// Probe peers discovered via DHT + contacts.
+/// HTTP relay directory removed — relay decommissioned.
 async fn probe_peers_from_relay(app: &tauri::AppHandle) {
-    // Pull fresh endpoints from relay directory
-    crate::p2p::fetch_peers_from_relay(app).await;
+    // Trigger DHT peer discovery
+    crate::p2p::dht_discover_peers().await;
 
     let state        = app.state::<AppState>();
     let my_endpoint  = crate::p2p::get_public_endpoint().await;
@@ -313,20 +312,15 @@ async fn probe_peers_from_relay(app: &tauri::AppHandle) {
     let active_eps:  std::collections::HashSet<String> =
         active_peers.iter().map(|p| p.endpoint.clone()).collect();
 
-    // Also load contacts — they might have relay circuit addresses
     let contacts = crate::commands::messenger::load_contacts();
 
-    // Combine relay-directory peers + contacts into a candidate list
+    // Build candidate list from peer cache + contacts
     let mut candidates: Vec<String> = Vec::new();
-
-    // From AppState (populated by fetch_peers_from_relay)
-    let all_known = state.get_active_peers(600); // last 10 min — matches relay active window
-    for p in &all_known {
+    for p in &crate::p2p::load_peer_cache() {
         if !p.endpoint.is_empty() && p.endpoint != my_endpoint {
             candidates.push(p.endpoint.clone());
         }
     }
-    // From contacts
     for c in &contacts {
         if c.status == "approved" && !c.endpoint.is_empty() && c.endpoint != my_endpoint {
             if !candidates.contains(&c.endpoint) {
@@ -335,20 +329,15 @@ async fn probe_peers_from_relay(app: &tauri::AppHandle) {
         }
     }
 
-    // Send PeerListRequest to every candidate not already active.
-    // This causes them to reply with PeerListResponse → we learn their
-    // current endpoint, and they get our endpoint too via PeerAnnounce.
     let requester_endpoint = my_endpoint.clone();
     for endpoint in candidates {
-        if active_eps.contains(&endpoint) { continue; } // already talking
+        if active_eps.contains(&endpoint) { continue; }
         let ep  = endpoint.clone();
         let req = crate::p2p::P2PMessage::PeerListRequest {
             requester_endpoint: requester_endpoint.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = crate::p2p::send_message(&ep, &req).await {
-                // "none of the requested protocols" is expected when probing
-                // peers on a different app version — don't log as an error.
                 let msg = e.to_string();
                 if !msg.contains("none of the requested protocols") {
                     eprintln!("[Coverage] probe {}: {}", ep, e);

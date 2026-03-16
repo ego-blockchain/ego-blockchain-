@@ -109,9 +109,6 @@ pub async fn stake_coins(
         chain.transactions.iter().find(|t| t.hash == tx_hash).cloned(),
         chain.blocks.last().cloned(),
     ) {
-        let tx2  = tx_b.clone();
-        let blk2 = blk_b.clone();
-        tokio::spawn(async move { crate::p2p::push_tx_to_relay(&tx2, &blk2).await; });
         tokio::spawn(async move { crate::p2p::broadcast_tx(tx_b, blk_b).await; });
     }
 
@@ -234,18 +231,12 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
             chain.transactions.iter().find(|t| t.hash == ret_hash).cloned(),
             chain.blocks.last().cloned(),
         ) {
-            let unstake_tx2 = unstake_tx.clone();
-            let fee_tx2     = fee_tx.clone();
-            let ret_tx2     = ret_tx.clone();
-            let blk_a = blk.clone(); let blk_b = blk.clone();
-            let blk_c = blk.clone(); let blk_d = blk.clone();
-            let blk_e = blk.clone(); let blk_f = blk;
-            tokio::spawn(async move { crate::p2p::push_tx_to_relay(&unstake_tx, &blk_a).await; });
-            tokio::spawn(async move { crate::p2p::broadcast_tx(unstake_tx2, blk_b).await; });
-            tokio::spawn(async move { crate::p2p::push_tx_to_relay(&fee_tx,    &blk_c).await; });
-            tokio::spawn(async move { crate::p2p::broadcast_tx(fee_tx2, blk_d).await; });
-            tokio::spawn(async move { crate::p2p::push_tx_to_relay(&ret_tx,    &blk_e).await; });
-            tokio::spawn(async move { crate::p2p::broadcast_tx(ret_tx2, blk_f).await; });
+            let blk_b = blk.clone();
+            let blk_d = blk.clone();
+            let blk_f = blk;
+            tokio::spawn(async move { crate::p2p::broadcast_tx(unstake_tx, blk_b).await; });
+            tokio::spawn(async move { crate::p2p::broadcast_tx(fee_tx, blk_d).await; });
+            tokio::spawn(async move { crate::p2p::broadcast_tx(ret_tx, blk_f).await; });
         }
 
         ledger.staked_amount   = 0;
@@ -310,14 +301,10 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
             chain.transactions.iter().find(|t| t.hash == ret_hash).cloned(),
             chain.blocks.last().cloned(),
         ) {
-            let unstake_tx2 = unstake_tx.clone();
-            let ret_tx2     = ret_tx.clone();
-            let blk_a = blk.clone(); let blk_b = blk.clone();
-            let blk_c = blk.clone(); let blk_d = blk;
-            tokio::spawn(async move { crate::p2p::push_tx_to_relay(&unstake_tx, &blk_a).await; });
-            tokio::spawn(async move { crate::p2p::broadcast_tx(unstake_tx2, blk_b).await; });
-            tokio::spawn(async move { crate::p2p::push_tx_to_relay(&ret_tx,    &blk_c).await; });
-            tokio::spawn(async move { crate::p2p::broadcast_tx(ret_tx2, blk_d).await; });
+            let blk_b = blk.clone();
+            let blk_d = blk;
+            tokio::spawn(async move { crate::p2p::broadcast_tx(unstake_tx, blk_b).await; });
+            tokio::spawn(async move { crate::p2p::broadcast_tx(ret_tx, blk_d).await; });
         }
 
         ledger.staked_amount   = 0;
