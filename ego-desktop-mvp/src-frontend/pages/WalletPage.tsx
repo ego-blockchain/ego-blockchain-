@@ -5,7 +5,7 @@ import { fetch as tauriFetch, Body } from '@tauri-apps/api/http';
 import { useWallet } from '../App';
 import qrcode from 'qrcode-generator';
 
-import { RELAY_HTTP as RELAY } from '../config';
+import { RELAY_HTTP as RELAY, RPC_URL } from '../config';
 
 function makeQR(text: string): string {
   if (!text) return '';
@@ -110,7 +110,7 @@ const WalletPage: React.FC = () => {
 
   // Remote node viewer
   const [showRemoteNode, setShowRemoteNode] = useState(false);
-  const [remoteRpcUrl, setRemoteRpcUrl] = useState('http://localhost:8545');
+  const [remoteRpcUrl, setRemoteRpcUrl] = useState(RPC_URL);
   const [remoteNode, setRemoteNode] = useState<RemoteNodeInfo | null>(null);
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [remoteError, setRemoteError] = useState('');

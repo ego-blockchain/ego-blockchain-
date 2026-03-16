@@ -13,6 +13,7 @@ mod models;
 mod p2p;
 mod proof;
 mod services;
+mod sharding;
 mod utils;
 
 use tauri::{Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem};
@@ -194,6 +195,7 @@ fn main() {
             commands::contracts::get_contract_events,
             commands::rollup::get_rollup_status,
             commands::rollup::get_shard_stats,
+            commands::rollup::get_shard_map_status,
             commands::wallet::query_remote_node,
             commands::ai::ask_ego_ai,
             commands::ai::save_ai_key,
@@ -245,6 +247,13 @@ fn main() {
                 }, &my_endpoint, "Ego Node").await;
                 crate::p2p::dht_discover_peers().await;
 
+                // Initialize shard map
+                let peers = crate::p2p::get_known_peers();
+                let ledger_addr = { let l = crate::ledger::Ledger::load(); l.address };
+                crate::sharding::run_shard_startup(&ledger_addr, &my_endpoint, &peers, 0).await;
+                crate::p2p::broadcast_shard_announce().await;
+                eprintln!("[Startup] Shard announce sent");
+
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 crate::p2p::sync_chain_from_peers().await;
                 eprintln!("[Startup] Chain sync requested");
@@ -256,6 +265,12 @@ fn main() {
                     crate::p2p::oracle_sync_chain().await;
                     crate::p2p::broadcast_peer_announce(&handle_startup).await;
                     crate::p2p::sync_chain_from_peers().await;
+                    let shard_peers = crate::p2p::get_known_peers();
+                    let ledger_for_shard = crate::ledger::Ledger::load();
+                    let endpoint = crate::p2p::get_public_endpoint().await;
+                    crate::sharding::run_shard_startup(&ledger_for_shard.address, &endpoint, &shard_peers, 0).await;
+                    crate::p2p::broadcast_shard_announce().await;
+                    crate::sharding::check_master_health(&ledger_for_shard.address, &endpoint, 0).await;
                 }
             });
 

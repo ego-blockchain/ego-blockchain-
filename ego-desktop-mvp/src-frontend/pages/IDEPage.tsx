@@ -1,6 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { RPC_URL } from '../config';
 import Editor from '@monaco-editor/react';
 import { invoke } from '@tauri-apps/api/tauri';
+import { open as dialogOpen } from '@tauri-apps/api/dialog';
+import { readDir, readTextFile, writeTextFile, createDir, type FileEntry } from '@tauri-apps/api/fs';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -44,7 +47,7 @@ const TEMPLATES = [
     files: {
       'src/main.urego': `// EGO-20 Fungible Token\n// Uses u64 for all amounts (1 EGOC = 1_000_000 uEGOC)\ncontract MyToken {\n    pub fn init(supply: u64) {\n        storage.set("supply", supply);\n        storage.set("minted", 0);\n        storage.set("burned", 0);\n    }\n\n    pub fn mint(amount: u64) {\n        let minted: u64 = storage.get_u64("minted");\n        let supply: u64 = storage.get_u64("supply");\n        assert(minted + amount <= supply, "exceeds supply");\n        storage.set("minted", minted + amount);\n        events.emit("minted", amount);\n    }\n\n    pub fn burn(amount: u64) {\n        let minted: u64 = storage.get_u64("minted");\n        let burned: u64 = storage.get_u64("burned");\n        assert(minted - burned >= amount, "insufficient");\n        storage.set("burned", burned + amount);\n        events.emit("burned", amount);\n    }\n\n    pub fn total_supply() -> u64 {\n        return storage.get_u64("supply");\n    }\n\n    pub fn circulating() -> u64 {\n        let minted: u64 = storage.get_u64("minted");\n        let burned: u64 = storage.get_u64("burned");\n        return minted - burned;\n    }\n}`,
       'frontend/index.html': `<!DOCTYPE html>\n<html>\n<head><title>My Token dApp</title>\n<style>body{font-family:sans-serif;max-width:600px;margin:40px auto;background:#0f0f1a;color:white;}input,button{padding:8px 12px;border-radius:8px;border:1px solid #333;background:#1a1a2e;color:white;margin:4px;}button{background:#7c3aed;cursor:pointer;border:none;}</style>\n</head>\n<body>\n<h1>🪙 My Token</h1>\n<p>Deploy the contract and call <code>init(supply)</code> to set up your token.</p>\n<p>Use <code>mint(amount)</code> and <code>burn(amount)</code> to manage supply.</p>\n</body>\n</html>`,
-      'ego.toml': `[project]\nname = "my-token"\nversion = "0.1.0"\nstandard = "EGO-20"\n\n[network]\ntestnet = "http://localhost:8545"\n`,
+      'ego.toml': `[project]\nname = "my-token"\nversion = "0.1.0"\nstandard = "EGO-20"\n\n[network]\ntestnet = "https://rpc.egoblockchain.com"\n`,
     },
   },
   {
@@ -54,7 +57,7 @@ const TEMPLATES = [
     files: {
       'src/main.urego': `// Hello World — your first Ego contract\ncontract HelloWorld {\n    pub fn init() {\n        storage.set("visits", 0);\n    }\n\n    pub fn visit() {\n        let v: u64 = storage.get_u64("visits");\n        storage.set("visits", v + 1);\n        emit Visited { count: v + 1 };\n    }\n\n    pub fn get_visits() -> u64 {\n        return storage.get_u64("visits");\n    }\n}`,
       'frontend/index.html': `<!DOCTYPE html>\n<html>\n<head><title>Hello World dApp</title>\n<style>body{font-family:sans-serif;max-width:500px;margin:60px auto;background:#0f0f1a;color:white;text-align:center;}button{padding:10px 16px;border-radius:10px;background:#7c3aed;color:white;border:none;cursor:pointer;font-weight:bold;margin:6px;}</style>\n</head>\n<body>\n<h1>👋 Hello World</h1>\n<p>Deploy the contract, call <code>init()</code>, then <code>visit()</code> to increment the counter.</p>\n<p>Read the count with <code>get_visits()</code>.</p>\n</body>\n</html>`,
-      'ego.toml': `[project]\nname = "hello-world"\nversion = "0.1.0"\n\n[network]\ntestnet = "http://localhost:8545"\n`,
+      'ego.toml': `[project]\nname = "hello-world"\nversion = "0.1.0"\n\n[network]\ntestnet = "https://rpc.egoblockchain.com"\n`,
     },
   },
   {
@@ -63,7 +66,7 @@ const TEMPLATES = [
     description: 'Lock an amount with release or refund',
     files: {
       'src/main.urego': `// Simple Escrow Contract\n// Status: 0 = active, 1 = released, 2 = refunded\ncontract Escrow {\n    pub fn init(amount: u64, deadline: u64) {\n        storage.set("amount", amount);\n        storage.set("deadline", deadline);\n        storage.set("released", 0);\n        storage.set("refunded", 0);\n    }\n\n    pub fn release() {\n        let released: u64 = storage.get_u64("released");\n        let refunded: u64 = storage.get_u64("refunded");\n        assert(released == 0, "already released");\n        assert(refunded == 0, "already refunded");\n        storage.set("released", 1);\n        let amt: u64 = storage.get_u64("amount");\n        emit Released { amount: amt };\n    }\n\n    pub fn refund() {\n        let released: u64 = storage.get_u64("released");\n        let refunded: u64 = storage.get_u64("refunded");\n        assert(released == 0, "already released");\n        assert(refunded == 0, "already refunded");\n        storage.set("refunded", 1);\n        let amt: u64 = storage.get_u64("amount");\n        emit Refunded { amount: amt };\n    }\n\n    pub fn get_amount() -> u64 {\n        return storage.get_u64("amount");\n    }\n\n    pub fn get_status() -> u64 {\n        let r: u64 = storage.get_u64("released");\n        let f: u64 = storage.get_u64("refunded");\n        if r == 1 {\n            return 1;\n        } else {\n            if f == 1 {\n                return 2;\n            } else {\n                return 0;\n            }\n        }\n    }\n}`,
-      'ego.toml': `[project]\nname = "escrow"\nversion = "0.1.0"\n\n[network]\ntestnet = "http://localhost:8545"\n`,
+      'ego.toml': `[project]\nname = "escrow"\nversion = "0.1.0"\n\n[network]\ntestnet = "https://rpc.egoblockchain.com"\n`,
     },
   },
   {
@@ -72,7 +75,7 @@ const TEMPLATES = [
     description: 'Simple on-chain yes/no voting',
     files: {
       'src/main.urego': `// Simple DAO Voting\n// active: 1 = open, 0 = closed\n// get_winner: 1 = yes wins, 0 = no wins / tied\ncontract SimpleDAO {\n    pub fn init() {\n        storage.set("yes_votes", 0);\n        storage.set("no_votes", 0);\n        storage.set("active", 1);\n    }\n\n    pub fn vote_yes() {\n        let active: u64 = storage.get_u64("active");\n        assert(active == 1, "voting closed");\n        let yes: u64 = storage.get_u64("yes_votes");\n        storage.set("yes_votes", yes + 1);\n        events.emit("voted", 1);\n    }\n\n    pub fn vote_no() {\n        let active: u64 = storage.get_u64("active");\n        assert(active == 1, "voting closed");\n        let no: u64 = storage.get_u64("no_votes");\n        storage.set("no_votes", no + 1);\n        events.emit("voted", 0);\n    }\n\n    pub fn close() {\n        storage.set("active", 0);\n        events.emit("closed", 0);\n    }\n\n    pub fn get_yes() -> u64 {\n        return storage.get_u64("yes_votes");\n    }\n\n    pub fn get_no() -> u64 {\n        return storage.get_u64("no_votes");\n    }\n\n    pub fn get_winner() -> u64 {\n        let yes: u64 = storage.get_u64("yes_votes");\n        let no: u64 = storage.get_u64("no_votes");\n        if yes > no {\n            return 1;\n        } else {\n            return 0;\n        }\n    }\n}`,
-      'ego.toml': `[project]\nname = "dao-vote"\nversion = "0.1.0"\nstandard = "EGO-8"\n\n[network]\ntestnet = "http://localhost:8545"\n`,
+      'ego.toml': `[project]\nname = "dao-vote"\nversion = "0.1.0"\nstandard = "EGO-8"\n\n[network]\ntestnet = "https://rpc.egoblockchain.com"\n`,
     },
   },
 ];
@@ -1084,7 +1087,7 @@ export default function IDEPage() {
   const [showTemplates, setShowTemplates] = useState(false);
   const [showNewProject, setShowNewProject] = useState(false);
   const [deleteConfirmPath, setDeleteConfirmPath] = useState<string | null>(null);
-  const [nodeUrl, setNodeUrl] = useState('http://localhost:8545');
+  const [nodeUrl, setNodeUrl] = useState(RPC_URL);
   const [initArgs, setInitArgs] = useState('');
   const [consoleOpen,   setConsoleOpen]   = useState(true);
   const [consoleHeight, setConsoleHeight] = useState(140);
@@ -1201,7 +1204,7 @@ export default function IDEPage() {
         },
         'ego.toml': {
           name: 'ego.toml',
-          content: `[project]\nname = "${name.toLowerCase().replace(/\s+/g, '-')}"\nversion = "0.1.0"\n\n[network]\ntestnet = "http://localhost:8545"\n`,
+          content: `[project]\nname = "${name.toLowerCase().replace(/\s+/g, '-')}"\nversion = "0.1.0"\n\n[network]\ntestnet = "https://rpc.egoblockchain.com"\n`,
           language: 'ini',
         },
       },
@@ -1489,6 +1492,110 @@ export default function IDEPage() {
     }
   }
 
+  // ── Flatten a recursive FileEntry tree into [path, fullPath] pairs ──────────
+  async function flattenEntries(
+    entries: FileEntry[],
+    rootPath: string,
+  ): Promise<{ rel: string; full: string }[]> {
+    const result: { rel: string; full: string }[] = [];
+    for (const entry of entries) {
+      if (entry.children) {
+        const nested = await flattenEntries(entry.children, rootPath);
+        result.push(...nested);
+      } else if (entry.path) {
+        // Normalise Windows backslashes → forward slashes for consistent rel-paths
+        const norm = entry.path.replace(/\\/g, '/');
+        const base = rootPath.replace(/\\/g, '/').replace(/\/$/, '');
+        const rel  = norm.startsWith(base + '/') ? norm.slice(base.length + 1) : norm.split('/').pop()!;
+        result.push({ rel, full: entry.path });
+      }
+    }
+    return result;
+  }
+
+  // ── Upload a project folder from disk ─────────────────────────────────────
+  async function handleOpenProjectFromDisk() {
+    const chosen = await dialogOpen({ directory: true, multiple: false, title: 'Open Project Folder' });
+    if (!chosen || typeof chosen !== 'string') return;
+
+    const projectName = chosen.replace(/\\/g, '/').split('/').pop() || 'Imported Project';
+    addLog('info', `Importing project "${projectName}"…`);
+
+    try {
+      const entries = await readDir(chosen, { recursive: true });
+      const flat    = await flattenEntries(entries, chosen);
+
+      const files: Record<string, ProjectFile> = {};
+      for (const { rel, full } of flat) {
+        try {
+          const content = await readTextFile(full);
+          files[rel] = { name: rel.split('/').pop()!, content, language: getLanguage(rel) };
+        } catch {
+          // skip unreadable / binary files silently
+        }
+      }
+
+      if (Object.keys(files).length === 0) {
+        addLog('error', 'No readable files found in that folder.');
+        return;
+      }
+
+      setProjects(prev => {
+        const updated = { ...prev, [projectName]: { name: projectName, files } };
+        saveProjects(updated);
+        return updated;
+      });
+      setActiveProject(projectName);
+      const firstFile = Object.keys(files).find(f => f.endsWith('.urego')) ?? Object.keys(files)[0] ?? null;
+      setActiveFile(firstFile);
+      setOpenTabs(firstFile ? [firstFile] : []);
+      setCompileResult(null);
+      setDeployResult(null);
+      addLog('success', `✓ Imported "${projectName}" — ${Object.keys(files).length} files`);
+    } catch (e) {
+      addLog('error', `Import failed: ${String(e)}`);
+    }
+  }
+
+  // ── Save current project to a folder on disk ──────────────────────────────
+  async function handleSaveProjectToDisk() {
+    if (!currentProject) return;
+
+    const destDir = await dialogOpen({ directory: true, multiple: false, title: 'Choose Save Location' });
+    if (!destDir || typeof destDir !== 'string') return;
+
+    const sep   = destDir.includes('\\') ? '\\' : '/';
+    const root  = `${destDir}${sep}${currentProject.name}`;
+
+    try {
+      await createDir(root, { recursive: true });
+      for (const [filePath, file] of Object.entries(currentProject.files)) {
+        const parts   = filePath.split('/');
+        const fileDir = parts.length > 1 ? `${root}${sep}${parts.slice(0, -1).join(sep)}` : root;
+        await createDir(fileDir, { recursive: true });
+        await writeTextFile(`${fileDir}${sep}${parts[parts.length - 1]}`, file.content);
+      }
+      addLog('success', `✓ Project saved to ${root}`);
+    } catch (e) {
+      addLog('error', `Save failed: ${String(e)}`);
+    }
+  }
+
+  // ── Export a single file to disk ──────────────────────────────────────────
+  async function handleSaveCurrentFile() {
+    if (!currentFile || !activeFile) return;
+    const destDir = await dialogOpen({ directory: true, multiple: false, title: 'Save File To…' });
+    if (!destDir || typeof destDir !== 'string') return;
+    const sep      = destDir.includes('\\') ? '\\' : '/';
+    const filename = activeFile.split('/').pop()!;
+    try {
+      await writeTextFile(`${destDir}${sep}${filename}`, currentFile.content);
+      addLog('success', `✓ Saved ${filename} to disk`);
+    } catch (e) {
+      addLog('error', `Save failed: ${String(e)}`);
+    }
+  }
+
   return (
     <div className="h-full flex flex-col bg-gray-900 overflow-hidden">
       {/* Header */}
@@ -1541,10 +1648,33 @@ export default function IDEPage() {
             New Project
           </button>
           <button
+            onClick={handleOpenProjectFromDisk}
+            title="Open a project folder from your computer"
+            className="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-white text-xs rounded border border-gray-600 transition-colors flex items-center gap-1"
+          >
+            📁 Open
+          </button>
+          <button
             onClick={() => setShowTemplates(true)}
             className="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-white text-xs rounded border border-gray-600 transition-colors"
           >
             Templates
+          </button>
+          <button
+            onClick={handleSaveProjectToDisk}
+            disabled={!currentProject}
+            title="Export entire project to a folder on disk"
+            className="px-3 py-1 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white text-xs rounded border border-gray-600 transition-colors flex items-center gap-1"
+          >
+            💾 Save Project
+          </button>
+          <button
+            onClick={handleSaveCurrentFile}
+            disabled={!currentFile}
+            title="Save current file to disk"
+            className="px-3 py-1 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white text-xs rounded border border-gray-600 transition-colors flex items-center gap-1"
+          >
+            ⬇ Save File
           </button>
           <button
             onClick={compile}
