@@ -156,14 +156,23 @@ async fn block_by_height(
     Path(height): Path<u64>,
     State(s):     State<Arc<RpcState>>,
 ) -> impl IntoResponse {
-    let blocks = s.recent_blocks.lock().unwrap();
-    match blocks.iter().find(|b| b.height == height) {
-        Some(b) => (StatusCode::OK, Json(serde_json::to_value(b).unwrap())).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "block not found" })),
-        ).into_response(),
+    // Check node blocks first
+    {
+        let blocks = s.recent_blocks.lock().unwrap();
+        if let Some(b) = blocks.iter().find(|b| b.height == height) {
+            return (StatusCode::OK, Json(serde_json::to_value(b).unwrap())).into_response();
+        }
     }
+    // Fall back to broadcast blocks from desktop clients
+    {
+        let broadcast = s.broadcast_blocks.lock().unwrap();
+        if let Some(b) = broadcast.iter().find(|b| {
+            b.get("height").and_then(|v| v.as_u64()) == Some(height)
+        }) {
+            return (StatusCode::OK, Json(b.clone())).into_response();
+        }
+    }
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "block not found" }))).into_response()
 }
 
 async fn balance(
