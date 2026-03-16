@@ -57,7 +57,9 @@ impl Default for NodeConfig {
             roles: vec![NodeRole::Validator, NodeRole::StorageProvider],
             shard_ids: vec![0],
             listen_port: 9000,
-            bootstrap_peers: vec![],
+            bootstrap_peers: vec![
+                "/dns4/rpc.egoblockchain.com/tcp/9000/p2p/12D3KooWMNRh7dJePAgtaZiwFCTisevVJQ5E52SpPqQqUPbHpJ72".to_string(),
+            ],
             storage_capacity_gb: Some(100.0),
             latitude: None,
             longitude: None,
