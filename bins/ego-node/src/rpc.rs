@@ -49,6 +49,8 @@ pub struct RpcState {
     pub supervisor:     Arc<NodeSupervisor>,
     /// Faucet: last claim time per address (unix timestamp seconds).
     pub faucet_claims:  Mutex<std::collections::HashMap<String, u64>>,
+    /// Transactions broadcast from desktop clients (LedgerTx JSON, last 500).
+    pub broadcast_txs:  Mutex<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -85,6 +87,7 @@ pub fn make_router(state: Arc<RpcState>) -> Router {
         .route("/node/stats",         get(node_stats))
         .route("/node/identity",      get(node_identity))
         .route("/faucet",             get(faucet))
+        .route("/tx/broadcast",       post(tx_broadcast))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -185,16 +188,44 @@ async fn tx_submit(
 }
 
 async fn chain_transactions(State(s): State<Arc<RpcState>>) -> impl IntoResponse {
-    let txs = s.pending_txs.lock().unwrap();
-    let start = txs.len().saturating_sub(50);
-    let slice: Vec<serde_json::Value> = txs[start..].iter()
-        .map(|tx| serde_json::json!({
-            "hash": hex::encode(tx.hash.as_bytes()),
-            "nonce": tx.nonce,
-            "from": format!("0x{}", hex::encode(tx.from.as_bytes())),
-        }))
-        .collect();
-    Json(slice)
+    let mut result: Vec<serde_json::Value> = {
+        let txs = s.pending_txs.lock().unwrap();
+        let start = txs.len().saturating_sub(50);
+        txs[start..].iter()
+            .map(|tx| serde_json::json!({
+                "hash":  hex::encode(tx.hash.as_bytes()),
+                "nonce": tx.nonce,
+                "from":  format!("0x{}", hex::encode(tx.from.as_bytes())),
+            }))
+            .collect()
+    };
+    // Append broadcast transactions from desktop clients (newest first).
+    let broadcast = s.broadcast_txs.lock().unwrap();
+    let bstart = broadcast.len().saturating_sub(50);
+    result.extend_from_slice(&broadcast[bstart..]);
+    result.sort_by(|a, b| {
+        let ta = a.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+        let tb = b.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+        tb.cmp(&ta)
+    });
+    Json(result)
+}
+
+/// Accept a raw LedgerTx JSON from desktop clients and store it for the explorer.
+async fn tx_broadcast(
+    State(s):   State<Arc<RpcState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let mut txs = s.broadcast_txs.lock().unwrap();
+    // Avoid duplicates by hash.
+    let hash = body.get("hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if !hash.is_empty() && txs.iter().any(|t| t.get("hash").and_then(|v| v.as_str()) == Some(&hash)) {
+        return (StatusCode::OK, Json(serde_json::json!({ "status": "already known" }))).into_response();
+    }
+    txs.push(body);
+    // Keep last 500 only.
+    if txs.len() > 500 { txs.drain(0..txs.len() - 500); }
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "accepted" }))).into_response()
 }
 
 async fn node_stats(State(s): State<Arc<RpcState>>) -> impl IntoResponse {
