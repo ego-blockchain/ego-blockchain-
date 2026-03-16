@@ -75,6 +75,7 @@ pub struct NodeStats {
 
 pub fn make_router(state: Arc<RpcState>) -> Router {
     Router::new()
+        .route("/",                   get(root))
         .route("/health",             get(health))
         .route("/chain/blocks",       get(chain_blocks))
         .route("/block/:height",      get(block_by_height))
@@ -89,6 +90,14 @@ pub fn make_router(state: Arc<RpcState>) -> Router {
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
+
+async fn root() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "name":    "Ego Blockchain Node",
+        "version": env!("CARGO_PKG_VERSION"),
+        "docs":    "/health · /chain/blocks · /chain/transactions · /balance/:address · /node/identity · /faucet?to=<address>",
+    }))
+}
 
 async fn health(State(s): State<Arc<RpcState>>) -> impl IntoResponse {
     let height    = s.state_manager.get_block_height();
