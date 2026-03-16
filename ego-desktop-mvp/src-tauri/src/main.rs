@@ -233,6 +233,9 @@ fn main() {
                 crate::p2p::fetch_chain_from_oracle(&handle_startup).await;
                 eprintln!("[Startup] Oracle chain sync complete");
 
+                // Push local chain to Oracle so explorer shows existing data.
+                crate::p2p::oracle_sync_chain().await;
+
                 crate::p2p::broadcast_peer_announce(&handle_startup).await;
                 eprintln!("[Startup] Peer announce sent (endpoint: {})", my_endpoint);
 
@@ -250,6 +253,7 @@ fn main() {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                     crate::p2p::fetch_chain_from_oracle(&handle_startup).await;
+                    crate::p2p::oracle_sync_chain().await;
                     crate::p2p::broadcast_peer_announce(&handle_startup).await;
                     crate::p2p::sync_chain_from_peers().await;
                 }

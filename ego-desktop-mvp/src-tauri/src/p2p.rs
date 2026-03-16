@@ -2065,6 +2065,32 @@ async fn merge_remote_chain(
 
 /// Fetch the canonical chain from the Oracle RPC node and merge it locally.
 /// Replaces fetch_chain_from_relay — no HTTP relay required.
+/// Push every local block and transaction to the Oracle node so the public
+/// explorer stays in sync. Runs on startup and every 30 s. The Oracle node
+/// deduplicates by height/hash so this is safe to call repeatedly.
+pub async fn oracle_sync_chain() {
+    let chain = load_chain();
+    if chain.blocks.is_empty() && chain.transactions.is_empty() { return; }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .unwrap_or_default();
+    for block in &chain.blocks {
+        if let Ok(body) = serde_json::to_value(block) {
+            let _ = client.post(format!("{}/block/broadcast", ORACLE_RPC))
+                .json(&body).send().await;
+        }
+    }
+    for tx in &chain.transactions {
+        if let Ok(body) = serde_json::to_value(tx) {
+            let _ = client.post(format!("{}/tx/broadcast", ORACLE_RPC))
+                .json(&body).send().await;
+        }
+    }
+    eprintln!("[Oracle] Synced {} blocks, {} txs to Oracle explorer",
+        chain.blocks.len(), chain.transactions.len());
+}
+
 pub async fn fetch_chain_from_oracle(app: &tauri::AppHandle) {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
