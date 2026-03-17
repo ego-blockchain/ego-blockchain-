@@ -1,0 +1,10 @@
+target/
+ego-desktop-mvp/src-tauri/target/
+ego-desktop-mvp/node_modules/
+services/indexer/target/
+**/.git/
+**/*.exe
+simple_challenge_test.*
+simple_persistence_test.*
+test_*.rs
+test_*.exe
