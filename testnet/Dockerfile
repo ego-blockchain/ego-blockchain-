@@ -1,5 +1,5 @@
 # ─── Stage 1: Builder ────────────────────────────────────────────────────────
-FROM rust:1.75-slim AS builder
+FROM rust:1.85-slim AS builder
 
 RUN apt-get update -qq && \
     apt-get install -y pkg-config libssl-dev && \
