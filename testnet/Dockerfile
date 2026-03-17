@@ -2,7 +2,7 @@
 FROM rust:1.85-slim AS builder
 
 RUN apt-get update -qq && \
-    apt-get install -y pkg-config libssl-dev && \
+    apt-get install -y pkg-config libssl-dev clang libclang-dev llvm && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
