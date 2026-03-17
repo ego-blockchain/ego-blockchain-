@@ -4,13 +4,10 @@ use crate::ledger::{load_chain, poc_signing_bytes, save_chain, Ledger, LedgerTx}
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-/// Storage reward rate: 0.5 EGOC per GB per day = 500_000 uEGOC per GB per day.
-const STORAGE_RATE_UEGOC_PER_GB_DAY: f64 = 500_000.0;
-
-/// Fixed testnet reward buckets (per day, in uEGOC).
-const CONSENSUS_DAILY: u64 = 10_000_000; //  10 EGOC/day — block validation
-const RETRIEVAL_DAILY: u64 =  2_000_000; //   2 EGOC/day — retrieval fees
-const COVERAGE_DAILY:  u64 =  8_000_000; //   8 EGOC/day — PoC beacon (only when online)
+use crate::tokenomics::{
+    STORAGE_RATE_UEGOC_PER_GB_DAY, CONSENSUS_DAILY_UEGOC, RETRIEVAL_DAILY_UEGOC,
+    COVERAGE_DAILY_UEGOC, node_reward_scale,
+};
 
 #[tauri::command]
 pub async fn get_earnings_data(
@@ -22,7 +19,14 @@ pub async fn get_earnings_data(
     // ── Reward rates ─────────────────────────────────────────────────────────
 
     let allocated_gb = ledger.storage_allocated_bytes as f64 / 1_000_000_000.0;
-    let daily_storage = (allocated_gb * STORAGE_RATE_UEGOC_PER_GB_DAY) as u64;
+
+    // Scale all node-pool rewards by the depletion factor (full until 80% used, tapers to 0).
+    let chain = load_chain();
+    let scale = node_reward_scale(&chain);
+
+    let daily_storage  = (allocated_gb * STORAGE_RATE_UEGOC_PER_GB_DAY * scale) as u64;
+    let consensus_rate = (CONSENSUS_DAILY_UEGOC as f64 * scale) as u64;
+    let retrieval_rate = (RETRIEVAL_DAILY_UEGOC as f64 * scale) as u64;
 
     // Coverage reward is only earned while the node is online.
     let coverage_online = state
@@ -34,12 +38,12 @@ pub async fn get_earnings_data(
         .map(|s| s.is_online)
         .unwrap_or(true); // default true when coverage hasn't been checked yet
 
-    let daily_coverage = if coverage_online { COVERAGE_DAILY } else { 0 };
+    let coverage_rate  = if coverage_online { (COVERAGE_DAILY_UEGOC as f64 * scale) as u64 } else { 0 };
 
     let daily_total = daily_storage
-        .saturating_add(CONSENSUS_DAILY)
-        .saturating_add(daily_coverage)
-        .saturating_add(RETRIEVAL_DAILY);
+        .saturating_add(consensus_rate)
+        .saturating_add(coverage_rate)
+        .saturating_add(retrieval_rate);
 
     // ── Credit elapsed earnings to the real ledger balance ───────────────────
     // This makes the balance actually grow while the app is open.
@@ -53,15 +57,15 @@ pub async fn get_earnings_data(
         // Only write to chain when at least 1000 uEGOC (0.001 EGOC) has accrued
         // to avoid spamming the chain with sub-second micro-rewards.
         if credit >= 1_000 {
-            let mut chain = load_chain();
+            let mut chain_w = load_chain();
             let reward_hash = format!(
                 "0x{}",
                 ego_core::hash_data(
                     format!("reward:{}:{}", ledger.address, now).as_bytes()
                 ).to_hex()
             );
-            if !chain.transactions.iter().any(|t| t.hash == reward_hash) {
-                chain.transactions.push(LedgerTx {
+            if !chain_w.transactions.iter().any(|t| t.hash == reward_hash) {
+                chain_w.transactions.push(LedgerTx {
                     hash:               reward_hash,
                     from:               "egot1rewards00000000000000000000000000000000000".into(),
                     to:                 ledger.address.clone(),
@@ -75,7 +79,7 @@ pub async fn get_earnings_data(
                     public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
                     ..LedgerTx::default()
                 });
-                let _ = save_chain(&chain);
+                let _ = save_chain(&chain_w);
             }
         }
     }
@@ -83,7 +87,7 @@ pub async fn get_earnings_data(
 
     // ── Derived stats ─────────────────────────────────────────────────────────
 
-    // total_earned = all rewards credited to this address from the rewards faucet
+    // Reload chain to capture any reward TX just written above.
     let chain = load_chain();
     let total_earned: u64 = chain
         .transactions
@@ -106,9 +110,9 @@ pub async fn get_earnings_data(
         drs_multiplier: 1.5,
         reward_breakdown: RewardBreakdown {
             storage_rewards:   daily_storage,
-            consensus_rewards: CONSENSUS_DAILY,
-            coverage_rewards:  daily_coverage,
-            retrieval_rewards: RETRIEVAL_DAILY,
+            consensus_rewards: consensus_rate,
+            coverage_rewards:  coverage_rate,
+            retrieval_rewards: retrieval_rate,
         },
         pending_rewards: pending,
         session_started,

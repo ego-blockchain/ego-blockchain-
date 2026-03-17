@@ -1,6 +1,7 @@
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
 use crate::ledger::{load_chain, save_chain, tx_signing_bytes, Ledger, LedgerTx};
+use crate::tokenomics::{STAKING_APR_BPS, staking_pool_remaining_uegoc};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -25,8 +26,33 @@ pub async fn get_staking_info() -> Result<StakingInfo, EgoDesktopError> {
     let now    = chrono::Utc::now().timestamp();
     let is_locked = ledger.staked_amount > 0
         && ledger.unstake_at.map(|u| u > now).unwrap_or(false);
-    let projected_interest = if ledger.staked_amount > 0 {
-        ledger.staked_amount * 125 * (ledger.stake_lock_days as u64) / (1000 * 365)
+
+    // APR interest accrued so far since stake started (from the staking pool).
+    let staked_since_secs = ledger.staked_at
+        .map(|t| (now - t).max(0) as u64)
+        .unwrap_or(0);
+    // interest = principal × APR_BPS / 10000 × elapsed_secs / 31_536_000
+    let pending_rewards = if ledger.staked_amount > 0 && staked_since_secs > 0 {
+        let chain = load_chain();
+        let pool_left = staking_pool_remaining_uegoc(&chain);
+        if pool_left > 0 {
+            (ledger.staked_amount as u128
+                * STAKING_APR_BPS as u128
+                * staked_since_secs as u128
+                / (10_000 * 31_536_000)) as u64
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    // Full projected interest over the entire lock period.
+    let projected_interest = if ledger.staked_amount > 0 && ledger.stake_lock_days > 0 {
+        (ledger.staked_amount as u128
+            * STAKING_APR_BPS as u128
+            * ledger.stake_lock_days as u128
+            / (10_000 * 365)) as u64
     } else {
         0
     };
@@ -35,8 +61,8 @@ pub async fn get_staking_info() -> Result<StakingInfo, EgoDesktopError> {
     Ok(StakingInfo {
         staked_amount:     ledger.staked_amount,
         lock_period_days:  ledger.stake_lock_days,
-        apr:               12.5,
-        pending_rewards:   0,
+        apr:               STAKING_APR_BPS as f64 / 100.0, // 1250 bps → 12.5%
+        pending_rewards,
         unlock_date:       ledger.unstake_at,
         staked_at:         ledger.staked_at,
         is_locked,

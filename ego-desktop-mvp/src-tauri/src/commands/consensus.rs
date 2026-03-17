@@ -291,40 +291,58 @@ pub async fn get_combined_drs() -> Result<CombinedDrsScore, EgoDesktopError> {
 /// Returns tokenomics data shaped to match the frontend Tokenomics interface.
 #[tauri::command]
 pub async fn get_tokenomics() -> Result<serde_json::Value, EgoDesktopError> {
+    use crate::tokenomics::{
+        TOTAL_SUPPLY_EGOC, HALVING_INTERVAL, INITIAL_BLOCK_REWARD_UEGOC, UEGOC_PER_EGOC,
+        BLOCK_EMISSION_EGOC, NODE_POOL_EGOC, STAKING_POOL_EGOC, ECOSYSTEM_EGOC, FOUNDATION_EGOC,
+        STAKING_APR_BPS, block_reward_at, staking_pool_remaining_uegoc, node_pool_remaining_uegoc,
+    };
+
     let chain = crate::ledger::load_chain();
     let total_blocks = chain.blocks.len() as u64;
 
-    const TOTAL_SUPPLY: u64   = 1_000_000_000;
-    const HALVING_INTERVAL: u64 = 2_100_000;
-    const INITIAL_REWARD: f64   = 50.0;
-
     let era: u64 = total_blocks / HALVING_INTERVAL;
-    let current_reward = INITIAL_REWARD / (2u64.pow(era as u32) as f64);
+    let current_reward = block_reward_at(total_blocks) as f64 / UEGOC_PER_EGOC as f64;
     let blocks_to_next = HALVING_INTERVAL - (total_blocks % HALVING_INTERVAL);
 
     // Circulating = sum of all confirmed coinbase rewards
     let circulating_uegoc: u64 = chain.blocks.iter()
         .map(|b| b.reward)
         .sum();
-    let circulating_egoc = circulating_uegoc / 1_000_000;
-    let circulating_pct  = if TOTAL_SUPPLY > 0 {
-        ((circulating_egoc as f64 / TOTAL_SUPPLY as f64) * 100.0 * 100.0).round() / 100.0
+    let circulating_egoc = circulating_uegoc / UEGOC_PER_EGOC;
+    let circulating_pct  = if TOTAL_SUPPLY_EGOC > 0 {
+        ((circulating_egoc as f64 / TOTAL_SUPPLY_EGOC as f64) * 100.0 * 100.0).round() / 100.0
     } else { 0.0 };
+
+    // Pool balances
+    let node_pool_remaining  = node_pool_remaining_uegoc(&chain) / UEGOC_PER_EGOC;
+    let staking_pool_remaining = staking_pool_remaining_uegoc(&chain) / UEGOC_PER_EGOC;
 
     // Staking totals from ledger
     let ledger = crate::ledger::Ledger::load();
-    let total_staked_egoc = ledger.staked_amount / 1_000_000;
+    let total_staked_egoc = ledger.staked_amount / UEGOC_PER_EGOC;
 
     Ok(serde_json::json!({
-        "total_supply_egoc":  TOTAL_SUPPLY,
+        "total_supply_egoc":  TOTAL_SUPPLY_EGOC,
         "circulating_egoc":   circulating_egoc,
         "circulating_pct":    circulating_pct,
+        "allocation": {
+            "block_emission_egoc": BLOCK_EMISSION_EGOC,
+            "node_pool_egoc":      NODE_POOL_EGOC,
+            "staking_pool_egoc":   STAKING_POOL_EGOC,
+            "ecosystem_egoc":      ECOSYSTEM_EGOC,
+            "foundation_egoc":     FOUNDATION_EGOC,
+        },
+        "pools": {
+            "node_pool_remaining_egoc":    node_pool_remaining,
+            "staking_pool_remaining_egoc": staking_pool_remaining,
+        },
         "halving": {
             "era":                    era,
             "current_reward_egoc":    current_reward,
             "blocks_to_next_halving": blocks_to_next
         },
         "staking": {
+            "apr_pct":           STAKING_APR_BPS as f64 / 100.0,
             "total_staked_egoc": total_staked_egoc,
             "active_stakers":    if ledger.staked_amount > 0 { 1u64 } else { 0u64 }
         }
