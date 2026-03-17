@@ -1,0 +1,25 @@
+{
+  "name": "ego-wallet-extension",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite build --watch",
+    "build": "vite build",
+    "build:dev": "vite build --mode development"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "tweetnacl": "^1.0.3",
+    "qrcode-generator": "^1.4.4"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.260",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+
+    "@vitejs/plugin-react": "^4.0.0",
+    "typescript": "^5.0.0",
+    "vite": "^5.0.0"
+  }
+}

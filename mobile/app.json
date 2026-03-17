@@ -1,0 +1,38 @@
+{
+  "expo": {
+    "name": "Ego Wallet",
+    "slug": "ego-mobile-wallet",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0d0d0d"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.egoblockchain.wallet"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0d0d0d"
+      },
+      "package": "com.egoblockchain.wallet"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Ego Wallet to access your camera to scan QR codes."
+        }
+      ],
+      "expo-secure-store"
+    ]
+  }
+}
