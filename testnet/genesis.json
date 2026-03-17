@@ -1,106 +1,197 @@
 {
   "chain_id": 1399,
   "chain_name": "Ego Testnet",
-  "genesis_time": "2026-03-15T00:00:00Z",
-  "network_version": "0.1.0",
-  "bft": {
-    "validator_count": 4,
-    "quorum_threshold": 3,
-    "micro_slot_ms": 100,
-    "max_ru_per_block": 10000000,
-    "target_ru_per_block": 5000000
-  },
+  "genesis_time": "2026-03-14T00:00:00Z",
+  "network_version": "1.0.0",
+
   "token": {
     "symbol": "EGOC",
-    "decimals": 8,
-    "max_supply_egoc": 100000000,
+    "name": "Ego Coin",
+    "decimals": 6,
+    "uegoc_per_egoc": 1000000,
+    "total_supply_egoc": 1000000000,
     "faucet_amount_egoc": 100,
     "faucet_cooldown_seconds": 86400
   },
+
+  "consensus": {
+    "algorithm": "HotStuff-BFT",
+    "validator_count_initial": 4,
+    "quorum_threshold_pct": 67,
+    "target_block_secs": 6,
+    "halving_interval_blocks": 2100000,
+    "initial_block_reward_egoc": 50,
+    "max_txs_per_block": 32000,
+    "shard_count": 16
+  },
+
+  "supply_allocation": {
+    "block_emission_egoc":  210000000,
+    "node_rewards_egoc":    300000000,
+    "staking_rewards_egoc": 140000000,
+    "ecosystem_dao_egoc":   200000000,
+    "foundation_egoc":      150000000,
+    "total_egoc":           1000000000
+  },
+
+  "staking": {
+    "apr_bps": 1250,
+    "min_stake_egoc": 1000,
+    "early_unstake_fee_pct": 10
+  },
+
   "p2p": {
     "default_port": 9000,
     "rpc_port": 8545,
+    "indexer_port": 8546,
+    "oracle_port": 8547,
     "max_peers": 50,
     "bootstrap_peers": [
-      "/ip4/testnet.ego-blockchain.io/tcp/9000/p2p/QmEgoBootstrap1",
-      "/ip4/testnet2.ego-blockchain.io/tcp/9000/p2p/QmEgoBootstrap2"
+      "/ip4/testnet.egoblockchain.com/tcp/9000/p2p/12D3KooWEgoBootstrap1FoundationNode",
+      "/ip4/testnet2.egoblockchain.com/tcp/9000/p2p/12D3KooWEgoBootstrap2FoundationNode"
     ]
   },
+
   "initial_validators": [
     {
-      "address": "egot1qegovalidator00000000000000000000001",
-      "pubkey_ed25519": "0000000000000000000000000000000000000000000000000000000000000001",
-      "pubkey_bls": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001",
-      "stake_egoc": 10000,
-      "name": "Ego Foundation Node 1"
+      "id": 1,
+      "name": "Ego Foundation Node 1",
+      "address": "0x0000000000000000000000000000000000000011",
+      "pubkey_ed25519": "generate_at_launch",
+      "pubkey_dilithium": "generate_at_launch",
+      "stake_egoc": 100000,
+      "endpoint": "testnet.egoblockchain.com:9000"
     },
     {
-      "address": "egot1qegovalidator00000000000000000000002",
-      "pubkey_ed25519": "0000000000000000000000000000000000000000000000000000000000000002",
-      "pubkey_bls": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002",
-      "stake_egoc": 10000,
-      "name": "Ego Foundation Node 2"
+      "id": 2,
+      "name": "Ego Foundation Node 2",
+      "address": "0x0000000000000000000000000000000000000012",
+      "pubkey_ed25519": "generate_at_launch",
+      "pubkey_dilithium": "generate_at_launch",
+      "stake_egoc": 100000,
+      "endpoint": "testnet2.egoblockchain.com:9000"
     },
     {
-      "address": "egot1qegovalidator00000000000000000000003",
-      "pubkey_ed25519": "0000000000000000000000000000000000000000000000000000000000000003",
-      "pubkey_bls": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003",
-      "stake_egoc": 10000,
-      "name": "Ego Foundation Node 3"
+      "id": 3,
+      "name": "Ego Foundation Node 3",
+      "address": "0x0000000000000000000000000000000000000013",
+      "pubkey_ed25519": "generate_at_launch",
+      "pubkey_dilithium": "generate_at_launch",
+      "stake_egoc": 100000,
+      "endpoint": "testnet3.egoblockchain.com:9000"
     },
     {
-      "address": "egot1qegovalidator00000000000000000000004",
-      "pubkey_ed25519": "0000000000000000000000000000000000000000000000000000000000000004",
-      "pubkey_bls": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004",
-      "stake_egoc": 10000,
-      "name": "Ego Foundation Node 4"
+      "id": 4,
+      "name": "Ego Foundation Node 4",
+      "address": "0x0000000000000000000000000000000000000014",
+      "pubkey_ed25519": "generate_at_launch",
+      "pubkey_dilithium": "generate_at_launch",
+      "stake_egoc": 100000,
+      "endpoint": "testnet4.egoblockchain.com:9000"
     }
   ],
+
   "initial_balances": [
     {
-      "address": "egot1qfaucet0000000000000000000000000000001",
-      "balance_egoc": 10000000,
-      "note": "Testnet faucet — distributes 100 EGOC per request per 24h"
+      "address": "0x000000000000000000000000000000000000F001",
+      "balance_egoc": 100000000,
+      "label": "faucet",
+      "note": "Testnet faucet — 100 EGOC per address per 24h"
     },
     {
-      "address": "egot1qtreasury000000000000000000000000001",
-      "balance_egoc": 50000000,
-      "note": "DAO treasury — controlled by EGO-8 governance contract"
+      "address": "0x000000000000000000000000000000000000D001",
+      "balance_egoc": 200000000,
+      "label": "ecosystem_dao",
+      "note": "Ecosystem / grants — controlled by EgoDAO governance contract (EGO-8)"
     },
     {
-      "address": "egot1qdevelopment00000000000000000000001",
-      "balance_egoc": 20000000,
-      "note": "Development fund — vested over 4 years"
+      "address": "0x000000000000000000000000000000000000F002",
+      "balance_egoc": 150000000,
+      "label": "foundation_vesting",
+      "note": "Foundation / team — 4-year linear vesting via EgoVesting contract"
+    },
+    {
+      "address": "0x000000000000000000000000000000000000N001",
+      "balance_egoc": 300000000,
+      "label": "node_rewards_pool",
+      "note": "Node operations pool — storage, consensus, coverage, retrieval rewards"
+    },
+    {
+      "address": "0x000000000000000000000000000000000000S001",
+      "balance_egoc": 140000000,
+      "label": "staking_rewards_pool",
+      "note": "Staking APR interest payments (12.5% APR, 1250 bps)"
     }
   ],
+
   "genesis_contracts": [
     {
-      "address": "egot1qdao000000000000000000000000000000001",
+      "address": "0x000000000000000000000000000000000000C001",
       "name": "EgoDAO",
       "eip": "EGO-8",
-      "note": "On-chain governance contract"
+      "source": "contracts/governance/dao.urego",
+      "note": "On-chain governance — proposals, voting, execution"
     },
     {
-      "address": "egot1qoracle00000000000000000000000000001",
+      "address": "0x000000000000000000000000000000000000C002",
       "name": "EgoPriceFeed",
       "eip": "EGO-9",
-      "note": "Official price oracle"
+      "source": "contracts/oracle/price_feed.urego",
+      "note": "Official price oracle — fed by services/oracle"
     },
     {
-      "address": "egot1qbridge00000000000000000000000000001",
+      "address": "0x000000000000000000000000000000000000C003",
       "name": "EgoBridge",
       "eip": "EGO-10",
-      "note": "Cross-chain bridge"
+      "source": "contracts/bridge/bridge.urego",
+      "note": "Lock-and-mint bridge to Ethereum / BNB Chain"
     },
     {
-      "address": "egot1qegusd000000000000000000000000000001",
+      "address": "0x000000000000000000000000000000000000C004",
       "name": "EGUSD",
       "eip": "EGO-11",
-      "note": "Bridge-backed USD stablecoin (USDC/USDT collateral)"
+      "source": "contracts/stable/egusd.urego",
+      "note": "Bridge-backed USD stablecoin — 1:1 USDC/USDT collateral"
+    },
+    {
+      "address": "0x000000000000000000000000000000000000C005",
+      "name": "EgoDEX",
+      "eip": "EGO-4",
+      "source": "contracts/dex/amm.urego",
+      "note": "Constant-product AMM (x*y=k) — EGOC/EGUSD/WBTC/WETH pools"
+    },
+    {
+      "address": "0x000000000000000000000000000000000000C006",
+      "name": "EgoNFT",
+      "eip": "EGO-721",
+      "source": "contracts/nft/marketplace.urego",
+      "note": "NFT marketplace — fixed-price, auctions, offers"
+    },
+    {
+      "address": "0x000000000000000000000000000000000000C007",
+      "name": "EgoVesting",
+      "eip": "EGO-12",
+      "source": "contracts/utils/vesting.urego",
+      "note": "Foundation / team token vesting — 4-year linear"
     }
   ],
+
+  "evm_compatibility": {
+    "enabled": true,
+    "chain_id_evm": 1399,
+    "rpc_port": 8545,
+    "note": "EVM-compatible via ego-evm (revm). Solidity contracts deployable at the same RPC."
+  },
+
   "light_client": {
-    "checkpoint_interval": 50000,
+    "checkpoint_interval_blocks": 50000,
     "genesis_hash": "0000000000000000000000000000000000000000000000000000000000000000"
-  }
+  },
+
+  "bridge_supported_chains": [
+    { "chain_id": 1,     "name": "Ethereum Mainnet",  "lock_contract": "deploy_and_fill" },
+    { "chain_id": 56,    "name": "BNB Smart Chain",   "lock_contract": "deploy_and_fill" },
+    { "chain_id": 137,   "name": "Polygon",           "lock_contract": "deploy_and_fill" },
+    { "chain_id": 43114, "name": "Avalanche C-Chain", "lock_contract": "deploy_and_fill" }
+  ]
 }
