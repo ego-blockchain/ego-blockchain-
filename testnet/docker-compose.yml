@@ -1,0 +1,189 @@
+version: "3.8"
+
+# ─── Networks ─────────────────────────────────────────────────────────────────
+networks:
+  ego-testnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# ─── Named Volumes ────────────────────────────────────────────────────────────
+volumes:
+  relay-data:
+  validator1-data:
+  validator2-data:
+  validator3-data:
+  validator4-data:
+
+# ─── Services ─────────────────────────────────────────────────────────────────
+services:
+
+  # ── Bootstrap / Relay ───────────────────────────────────────────────────────
+  relay:
+    build:
+      context: ..
+      dockerfile: testnet/Dockerfile
+    image: ego-node
+    hostname: egorelay
+    command: >
+      ego-node
+      --type seed
+      --port 4001
+      --shards 0
+    ports:
+      - "4001:4001"
+      - "8540:8545"
+    volumes:
+      - relay-data:/data
+      - ./data/relay:/data/local
+    environment:
+      EGO_DATA_DIR: /data
+      RUST_LOG: info
+      EGO_CHAIN_ID: "1399"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8545/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - ego-testnet
+
+  # ── Validator 1: shards 0–7 ─────────────────────────────────────────────────
+  validator1:
+    image: ego-node
+    hostname: validator1
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node
+      --type validator
+      --port 9001
+      --shards 0,1,2,3,4,5,6,7
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/EgoBootstrapPeerId
+      --storage 500
+      --bandwidth 1000
+      --metrics
+    ports:
+      - "9001:9001"
+      - "8541:8545"
+    volumes:
+      - validator1-data:/data
+      - ./data/validator1:/data/local
+    environment:
+      EGO_DATA_DIR: /data
+      RUST_LOG: info
+      EGO_CHAIN_ID: "1399"
+    restart: unless-stopped
+    networks:
+      - ego-testnet
+
+  # ── Validator 2: shards 8–15 ────────────────────────────────────────────────
+  validator2:
+    image: ego-node
+    hostname: validator2
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node
+      --type validator
+      --port 9002
+      --shards 8,9,10,11,12,13,14,15
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/EgoBootstrapPeerId
+      --storage 500
+      --bandwidth 1000
+      --metrics
+    ports:
+      - "9002:9002"
+      - "8542:8545"
+    volumes:
+      - validator2-data:/data
+      - ./data/validator2:/data/local
+    environment:
+      EGO_DATA_DIR: /data
+      RUST_LOG: info
+      EGO_CHAIN_ID: "1399"
+    restart: unless-stopped
+    networks:
+      - ego-testnet
+
+  # ── Validator 3: shards 0–3, 8–11 ───────────────────────────────────────────
+  validator3:
+    image: ego-node
+    hostname: validator3
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node
+      --type validator
+      --port 9003
+      --shards 0,1,2,3,8,9,10,11
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/EgoBootstrapPeerId
+      --storage 500
+      --bandwidth 1000
+      --metrics
+    ports:
+      - "9003:9003"
+      - "8543:8545"
+    volumes:
+      - validator3-data:/data
+      - ./data/validator3:/data/local
+    environment:
+      EGO_DATA_DIR: /data
+      RUST_LOG: info
+      EGO_CHAIN_ID: "1399"
+    restart: unless-stopped
+    networks:
+      - ego-testnet
+
+  # ── Validator 4: shards 4–7, 12–15 ──────────────────────────────────────────
+  validator4:
+    image: ego-node
+    hostname: validator4
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node
+      --type validator
+      --port 9004
+      --shards 4,5,6,7,12,13,14,15
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/EgoBootstrapPeerId
+      --storage 500
+      --bandwidth 1000
+      --metrics
+    ports:
+      - "9004:9004"
+      - "8544:8545"
+    volumes:
+      - validator4-data:/data
+      - ./data/validator4:/data/local
+    environment:
+      EGO_DATA_DIR: /data
+      RUST_LOG: info
+      EGO_CHAIN_ID: "1399"
+    restart: unless-stopped
+    networks:
+      - ego-testnet
+
+  # ── Explorer / Nginx Load Balancer ──────────────────────────────────────────
+  explorer:
+    image: nginx:alpine
+    depends_on:
+      - validator1
+      - validator2
+      - validator3
+      - validator4
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
+    networks:
+      - ego-testnet
