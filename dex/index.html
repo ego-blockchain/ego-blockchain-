@@ -1,0 +1,1059 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ego DEX</title>
+  <!-- React + Babel via CDN (no build step) -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    /* =====================================================================
+       Ego DEX — Global Styles
+       Dark palette: #0d0d0d base, #7c3aed / #2563eb accents
+    ===================================================================== */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:         #0d0d0d;
+      --surface:    #161616;
+      --surface2:   #1e1e2e;
+      --border:     #2a2a3d;
+      --purple:     #7c3aed;
+      --purple-lt:  #9f5fff;
+      --blue:       #2563eb;
+      --blue-lt:    #60a5fa;
+      --text:       #e2e8f0;
+      --text-muted: #64748b;
+      --green:      #22c55e;
+      --red:        #ef4444;
+      --yellow:     #eab308;
+    }
+
+    html, body { height: 100%; background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 15px; }
+
+    #root { min-height: 100vh; display: flex; flex-direction: column; }
+
+    /* scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* ── Header ── */
+    .header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 2rem; height: 64px;
+      background: var(--surface); border-bottom: 1px solid var(--border);
+      position: sticky; top: 0; z-index: 100;
+    }
+    .header-logo { display: flex; align-items: center; gap: 10px; font-size: 1.25rem; font-weight: 700; }
+    .header-logo svg { width: 32px; height: 32px; }
+    .header-nav { display: flex; gap: 8px; }
+    .nav-btn {
+      background: none; border: none; color: var(--text-muted); cursor: pointer;
+      padding: 6px 14px; border-radius: 8px; font-size: 0.9rem; transition: all .15s;
+    }
+    .nav-btn:hover { background: var(--surface2); color: var(--text); }
+    .nav-btn.active { background: rgba(124,58,237,.18); color: var(--purple-lt); }
+    .connect-btn {
+      padding: 8px 18px; border-radius: 10px; border: none; cursor: pointer; font-size: 0.875rem; font-weight: 600;
+      background: linear-gradient(135deg, var(--purple), var(--blue));
+      color: #fff; transition: opacity .15s;
+    }
+    .connect-btn:hover { opacity: .85; }
+    .connect-btn.connected { background: var(--surface2); border: 1px solid var(--border); color: var(--text); font-weight: 400; }
+
+    /* ── Stats bar ── */
+    .stats-bar {
+      display: flex; gap: 2rem; align-items: center;
+      padding: 10px 2rem; background: var(--surface); border-bottom: 1px solid var(--border);
+      font-size: 0.8rem; overflow-x: auto; white-space: nowrap;
+    }
+    .stat-item { display: flex; gap: 6px; align-items: center; }
+    .stat-label { color: var(--text-muted); }
+    .stat-value { color: var(--text); font-weight: 600; }
+    .stat-value.green { color: var(--green); }
+    .stat-sep { color: var(--border); user-select: none; }
+
+    /* ── Main layout ── */
+    .main { flex: 1; display: flex; gap: 0; }
+    .center-col { flex: 1; display: flex; flex-direction: column; align-items: center; padding: 2rem 1rem; gap: 1.5rem; }
+    .side-col { width: 340px; padding: 1.5rem 1rem 1.5rem 0; display: flex; flex-direction: column; gap: 1.2rem; }
+
+    /* ── Cards ── */
+    .card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 16px; padding: 1.25rem;
+    }
+    .card-title { font-size: 0.8rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 1rem; }
+
+    /* ── Swap card ── */
+    .swap-card { width: 100%; max-width: 460px; }
+    .swap-tabs { display: flex; gap: 4px; margin-bottom: 1.2rem; }
+    .swap-tab {
+      flex: 1; padding: 8px; border-radius: 8px; border: none; cursor: pointer; font-size: 0.875rem; font-weight: 600;
+      background: var(--surface2); color: var(--text-muted); transition: all .15s;
+    }
+    .swap-tab.active { background: rgba(124,58,237,.2); color: var(--purple-lt); }
+
+    /* token input row */
+    .token-row {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 12px; padding: .9rem 1rem;
+      display: flex; flex-direction: column; gap: 6px;
+    }
+    .token-row:focus-within { border-color: var(--purple); }
+    .token-row-top { display: flex; justify-content: space-between; font-size: 0.78rem; color: var(--text-muted); }
+    .token-row-mid { display: flex; align-items: center; gap: 10px; }
+    .token-select {
+      display: flex; align-items: center; gap: 6px;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; padding: 6px 10px; cursor: pointer;
+      font-size: 0.95rem; font-weight: 700; color: var(--text);
+      min-width: 110px; user-select: none; transition: border-color .15s;
+    }
+    .token-select:hover { border-color: var(--purple); }
+    .token-dot { width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 0.65rem; font-weight: 800; }
+    .token-amount {
+      flex: 1; background: none; border: none; color: var(--text); font-size: 1.4rem; font-weight: 600;
+      text-align: right; outline: none; min-width: 0;
+    }
+    .token-amount::placeholder { color: var(--border); }
+    .balance-text { font-size: 0.75rem; color: var(--text-muted); text-align: right; cursor: pointer; }
+    .balance-text span { color: var(--blue-lt); text-decoration: underline; }
+
+    .swap-arrow-row { display: flex; justify-content: center; margin: -4px 0; position: relative; z-index: 1; }
+    .swap-arrow-btn {
+      width: 36px; height: 36px; border-radius: 10px; border: 2px solid var(--border);
+      background: var(--surface); color: var(--text-muted); cursor: pointer;
+      display: flex; align-items: center; justify-content: center; font-size: 1.1rem;
+      transition: all .15s;
+    }
+    .swap-arrow-btn:hover { border-color: var(--purple); color: var(--purple-lt); transform: rotate(180deg); }
+
+    /* details */
+    .swap-details { background: var(--surface2); border-radius: 10px; padding: .75rem 1rem; font-size: 0.8rem; display: flex; flex-direction: column; gap: 5px; margin-top: .75rem; }
+    .detail-row { display: flex; justify-content: space-between; color: var(--text-muted); }
+    .detail-row .val { color: var(--text); }
+    .detail-row .impact-hi { color: var(--red); font-weight: 700; }
+    .detail-row .impact-mid { color: var(--yellow); }
+    .detail-row .impact-lo { color: var(--green); }
+
+    /* main swap button */
+    .swap-btn {
+      width: 100%; padding: 14px; margin-top: 1rem; border-radius: 12px; border: none;
+      font-size: 1rem; font-weight: 700; cursor: pointer; transition: all .15s;
+      background: linear-gradient(135deg, var(--purple), var(--blue));
+      color: #fff;
+    }
+    .swap-btn:hover:not(:disabled) { opacity: .88; transform: translateY(-1px); }
+    .swap-btn:disabled { opacity: .4; cursor: not-allowed; transform: none; }
+    .swap-btn.warn { background: linear-gradient(135deg, #b45309, #92400e); }
+
+    /* token dropdown */
+    .token-dropdown {
+      position: absolute; background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 6px; min-width: 180px; z-index: 200;
+      box-shadow: 0 8px 32px rgba(0,0,0,.6);
+    }
+    .token-option {
+      display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px;
+      cursor: pointer; font-size: 0.875rem; transition: background .1s;
+    }
+    .token-option:hover { background: var(--surface2); }
+    .token-option .sym { font-weight: 700; color: var(--text); }
+    .token-option .name { font-size: 0.75rem; color: var(--text-muted); }
+
+    /* ── Pool card ── */
+    .pool-card { width: 100%; max-width: 460px; }
+    .pool-tabs { display: flex; gap: 4px; margin-bottom: 1rem; }
+    .pool-tab {
+      flex: 1; padding: 7px; border-radius: 8px; border: none; cursor: pointer; font-size: 0.8rem; font-weight: 600;
+      background: var(--surface2); color: var(--text-muted); transition: all .15s;
+    }
+    .pool-tab.active { background: rgba(37,99,235,.2); color: var(--blue-lt); }
+    .lp-position {
+      display: flex; justify-content: space-between; align-items: center;
+      background: var(--surface2); border-radius: 10px; padding: .7rem 1rem;
+      margin-bottom: 6px; font-size: 0.85rem;
+    }
+    .lp-pair { font-weight: 700; color: var(--text); }
+    .lp-amount { color: var(--blue-lt); font-weight: 600; }
+    .lp-value { color: var(--text-muted); font-size: 0.78rem; }
+    .lp-empty { color: var(--text-muted); font-size: 0.85rem; text-align: center; padding: 1.5rem 0; }
+    .pool-input-row { display: flex; gap: 8px; margin-bottom: 8px; }
+    .pool-input {
+      flex: 1; background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 10px; padding: 8px 12px; color: var(--text); font-size: 0.95rem;
+      outline: none;
+    }
+    .pool-input:focus { border-color: var(--blue); }
+    .pool-btn {
+      width: 100%; padding: 11px; border-radius: 10px; border: none; cursor: pointer;
+      font-size: 0.9rem; font-weight: 700; margin-top: 6px;
+      background: linear-gradient(135deg, var(--blue), #1d4ed8); color: #fff; transition: opacity .15s;
+    }
+    .pool-btn:hover { opacity: .85; }
+
+    /* ── Price chart ── */
+    .chart-card { padding: 1rem 1.25rem; }
+    .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: .5rem; }
+    .chart-title { font-size: 0.85rem; font-weight: 700; color: var(--text); }
+    .chart-symbol-tabs { display: flex; gap: 4px; }
+    .chart-sym-btn {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 6px; padding: 3px 10px; font-size: 0.75rem; color: var(--text-muted);
+      cursor: pointer; transition: all .1s;
+    }
+    .chart-sym-btn.active { background: rgba(124,58,237,.2); border-color: var(--purple); color: var(--purple-lt); }
+    canvas { display: block; width: 100%; border-radius: 8px; }
+
+    /* ── Toast notifications ── */
+    .toast-container { position: fixed; bottom: 1.5rem; right: 1.5rem; z-index: 1000; display: flex; flex-direction: column; gap: 8px; }
+    .toast {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 10px; padding: 10px 16px; font-size: 0.85rem;
+      min-width: 260px; max-width: 360px; box-shadow: 0 4px 16px rgba(0,0,0,.4);
+      animation: slideIn .2s ease;
+    }
+    .toast.success { border-left: 3px solid var(--green); }
+    .toast.error   { border-left: 3px solid var(--red); }
+    .toast.info    { border-left: 3px solid var(--blue-lt); }
+    @keyframes slideIn { from { transform: translateX(20px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+    /* ── Misc util ── */
+    .gradient-text {
+      background: linear-gradient(135deg, var(--purple-lt), var(--blue-lt));
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+    }
+    .section-toggle { display: flex; justify-content: center; gap: 12px; margin-bottom: -.5rem; }
+    .section-toggle-btn {
+      padding: 7px 20px; border-radius: 20px; border: 1px solid var(--border);
+      background: var(--surface2); color: var(--text-muted); cursor: pointer; font-size: 0.85rem; font-weight: 600;
+      transition: all .15s;
+    }
+    .section-toggle-btn.active { border-color: var(--purple); color: var(--purple-lt); background: rgba(124,58,237,.12); }
+    .section-toggle-btn:hover:not(.active) { border-color: var(--text-muted); color: var(--text); }
+
+    @media (max-width: 900px) {
+      .main { flex-direction: column; }
+      .side-col { width: 100%; padding: 0 1rem 2rem; }
+    }
+    @media (max-width: 540px) {
+      .header { padding: 0 1rem; }
+      .header-nav { display: none; }
+      .stats-bar { padding: 8px 1rem; }
+    }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+// ===========================================================================
+// Constants & helpers
+// ===========================================================================
+const RPC_URL    = 'http://127.0.0.1:8545';
+const ORACLE_URL = 'http://127.0.0.1:8547';
+
+const TOKENS = [
+  { symbol: 'EGOC',  name: 'Ego Coin',    address: '0x0000000000000000000000000000000000000000', decimals: 6,  color: '#7c3aed', bg: 'rgba(124,58,237,.2)' },
+  { symbol: 'EGUSD', name: 'Ego USD',     address: '0x0000000000000000000000000000000000000001', decimals: 6,  color: '#22c55e', bg: 'rgba(34,197,94,.2)'  },
+  { symbol: 'WBTC',  name: 'Wrapped BTC', address: '0x0000000000000000000000000000000000000002', decimals: 8,  color: '#f59e0b', bg: 'rgba(245,158,11,.2)' },
+  { symbol: 'WETH',  name: 'Wrapped ETH', address: '0x0000000000000000000000000000000000000003', decimals: 6,  color: '#60a5fa', bg: 'rgba(96,165,250,.2)' },
+];
+
+const TOKEN_MAP = Object.fromEntries(TOKENS.map(t => [t.symbol, t]));
+
+// Simulated AMM liquidity (constant-product). In production these come from on-chain reads.
+// Prices anchored to oracle; these reserves just drive the AMM math.
+const MOCK_RESERVES = {
+  'EGOC/EGUSD':  { r0: 10_000_000, r1: 100_000   },  // 10M EGOC : 100K EGUSD → $0.01/EGOC
+  'EGOC/WETH':   { r0: 5_000_000,  r1: 15.625    },   // 5M EGOC : 15.625 WETH  (~$3200/WETH)
+  'EGOC/WBTC':   { r0: 10_000_000, r1: 1.5625    },   // 10M EGOC : ~1.56 WBTC  (~$64000/BTC)
+  'EGUSD/WETH':  { r0: 50_000,     r1: 15.625    },
+  'EGUSD/WBTC':  { r0: 100_000,    r1: 1.5625    },
+  'WETH/WBTC':   { r0: 31.25,      r1: 1.5625    },
+};
+
+function getReserves(symA, symB) {
+  const key1 = `${symA}/${symB}`;
+  const key2 = `${symB}/${symA}`;
+  if (MOCK_RESERVES[key1]) return { ...MOCK_RESERVES[key1], flipped: false };
+  if (MOCK_RESERVES[key2]) return { r0: MOCK_RESERVES[key2].r1, r1: MOCK_RESERVES[key2].r0, flipped: true };
+  // Fallback default
+  return { r0: 1_000_000, r1: 1_000_000, flipped: false };
+}
+
+// AMM constant-product quote  (fee = 0.3%)
+function ammQuote(amountIn, reserveIn, reserveOut) {
+  if (!amountIn || amountIn <= 0 || reserveIn <= 0 || reserveOut <= 0) return { out: 0, impact: 0 };
+  const fee = 0.003;
+  const amtInWithFee = amountIn * (1 - fee);
+  const out = (amtInWithFee * reserveOut) / (reserveIn + amtInWithFee);
+  const midPrice = reserveOut / reserveIn;
+  const execPrice = out / amountIn;
+  const impact = Math.abs((midPrice - execPrice) / midPrice) * 100;
+  return { out, impact };
+}
+
+function fmtNum(n, decimals = 4) {
+  if (n === null || n === undefined || isNaN(n)) return '—';
+  if (n >= 1e9)  return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6)  return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1000) return n.toLocaleString('en-US', { maximumFractionDigits: 2 });
+  return n.toFixed(decimals);
+}
+
+function fmtUsd(n) {
+  if (!n) return '$—';
+  if (n >= 1e9) return '$' + (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return '$' + (n / 1e6).toFixed(2) + 'M';
+  return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function shortAddr(addr) {
+  if (!addr) return '';
+  return addr.slice(0, 8) + '…' + addr.slice(-6);
+}
+
+async function rpcCall(method, params = []) {
+  const res = await fetch(RPC_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+  return data.result;
+}
+
+// ===========================================================================
+// TokenIcon
+// ===========================================================================
+function TokenIcon({ symbol, size = 22 }) {
+  const t = TOKEN_MAP[symbol] || { color: '#888', bg: 'rgba(128,128,128,.2)', symbol: '?' };
+  return (
+    <div className="token-dot" style={{
+      width: size, height: size, background: t.bg, color: t.color,
+      border: `1.5px solid ${t.color}`, fontSize: size * 0.42,
+    }}>
+      {symbol ? symbol[0] : '?'}
+    </div>
+  );
+}
+
+// ===========================================================================
+// TokenDropdown
+// ===========================================================================
+function TokenDropdown({ current, exclude, onSelect, onClose }) {
+  return (
+    <div className="token-dropdown">
+      {TOKENS.filter(t => t.symbol !== exclude).map(t => (
+        <div key={t.symbol} className="token-option" onClick={() => { onSelect(t.symbol); onClose(); }}>
+          <TokenIcon symbol={t.symbol} size={28} />
+          <div>
+            <div className="sym">{t.symbol}</div>
+            <div className="name">{t.name}</div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ===========================================================================
+// PriceChart  (sparkline via Canvas)
+// ===========================================================================
+function PriceChart({ history }) {
+  const canvasRef = React.useRef(null);
+
+  React.useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !history || history.length < 2) return;
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.offsetWidth, H = canvas.offsetHeight || 120;
+    canvas.width  = W * dpr;
+    canvas.height = H * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, W, H);
+
+    const vals = history.map(h => h.price);
+    const min  = Math.min(...vals) * 0.998;
+    const max  = Math.max(...vals) * 1.002;
+    const range = max - min || 1;
+    const pad = { l: 8, r: 8, t: 10, b: 24 };
+    const chartW = W - pad.l - pad.r;
+    const chartH = H - pad.t - pad.b;
+
+    const x = (i) => pad.l + (i / (vals.length - 1)) * chartW;
+    const y = (v) => pad.t + chartH - ((v - min) / range) * chartH;
+
+    // Gradient fill
+    const grad = ctx.createLinearGradient(0, pad.t, 0, pad.t + chartH);
+    grad.addColorStop(0, 'rgba(124,58,237,.35)');
+    grad.addColorStop(1, 'rgba(124,58,237,.02)');
+
+    ctx.beginPath();
+    ctx.moveTo(x(0), y(vals[0]));
+    for (let i = 1; i < vals.length; i++) {
+      const cpx = (x(i - 1) + x(i)) / 2;
+      ctx.bezierCurveTo(cpx, y(vals[i - 1]), cpx, y(vals[i]), x(i), y(vals[i]));
+    }
+    ctx.lineTo(x(vals.length - 1), H - pad.b);
+    ctx.lineTo(x(0), H - pad.b);
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Line
+    ctx.beginPath();
+    ctx.moveTo(x(0), y(vals[0]));
+    for (let i = 1; i < vals.length; i++) {
+      const cpx = (x(i - 1) + x(i)) / 2;
+      ctx.bezierCurveTo(cpx, y(vals[i - 1]), cpx, y(vals[i]), x(i), y(vals[i]));
+    }
+    ctx.strokeStyle = '#9f5fff';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // End dot
+    const lx = x(vals.length - 1), ly = y(vals[vals.length - 1]);
+    ctx.beginPath();
+    ctx.arc(lx, ly, 4, 0, Math.PI * 2);
+    ctx.fillStyle = '#9f5fff';
+    ctx.fill();
+
+    // X-axis time labels (show 4 evenly spaced)
+    ctx.fillStyle = 'rgba(100,116,139,.8)';
+    ctx.font = '10px system-ui';
+    ctx.textAlign = 'center';
+    const labelCount = Math.min(4, vals.length);
+    for (let k = 0; k < labelCount; k++) {
+      const idx = Math.round((k / (labelCount - 1)) * (vals.length - 1));
+      const ts  = history[idx]?.ts;
+      if (ts) {
+        const d = new Date(ts * 1000);
+        const label = d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+        ctx.fillText(label, x(idx), H - 6);
+      }
+    }
+  }, [history]);
+
+  return <canvas ref={canvasRef} style={{ height: 120, background: 'transparent' }} />;
+}
+
+// ===========================================================================
+// Toast
+// ===========================================================================
+function Toast({ toasts }) {
+  return (
+    <div className="toast-container">
+      {toasts.map(t => (
+        <div key={t.id} className={`toast ${t.type}`}>{t.msg}</div>
+      ))}
+    </div>
+  );
+}
+
+// ===========================================================================
+// SwapCard
+// ===========================================================================
+function SwapCard({ prices, walletAddress, addToast }) {
+  const [fromSym, setFromSym]   = React.useState('EGOC');
+  const [toSym,   setToSym]     = React.useState('WETH');
+  const [fromAmt, setFromAmt]   = React.useState('');
+  const [toAmt,   setToAmt]     = React.useState('');
+  const [ddFrom,  setDdFrom]    = React.useState(false);
+  const [ddTo,    setDdTo]      = React.useState(false);
+  const [slippage, setSlippage] = React.useState(0.5);
+  const [pending,  setPending]  = React.useState(false);
+
+  // Close dropdowns on outside click
+  React.useEffect(() => {
+    const handler = () => { setDdFrom(false); setDdTo(false); };
+    document.addEventListener('click', handler);
+    return () => document.removeEventListener('click', handler);
+  }, []);
+
+  const { r0, r1 } = getReserves(fromSym, toSym);
+  const parsedFrom  = parseFloat(fromAmt) || 0;
+  const { out: rawOut, impact } = ammQuote(parsedFrom, r0, r1);
+
+  const minReceived = rawOut * (1 - slippage / 100);
+  const fee         = parsedFrom * 0.003;
+
+  // USD values
+  const fromUsd = parsedFrom * (prices[fromSym]?.usd || 0);
+  const toUsd   = rawOut     * (prices[toSym]?.usd   || 0);
+
+  const impactClass = impact > 5 ? 'impact-hi' : impact > 2 ? 'impact-mid' : 'impact-lo';
+
+  function handleFromChange(v) {
+    setFromAmt(v);
+    const n = parseFloat(v) || 0;
+    const { out } = ammQuote(n, r0, r1);
+    setToAmt(out > 0 ? out.toFixed(6) : '');
+  }
+
+  function handleToChange(v) {
+    setToAmt(v);
+    // Reverse AMM: given amountOut, find amountIn
+    const n = parseFloat(v) || 0;
+    if (n > 0 && r0 > 0 && r1 > 0) {
+      const fee = 0.003;
+      const numerator   = r0 * n;
+      const denominator = (r1 - n) * (1 - fee);
+      const amtIn = denominator > 0 ? numerator / denominator : 0;
+      setFromAmt(amtIn > 0 ? amtIn.toFixed(6) : '');
+    } else {
+      setFromAmt('');
+    }
+  }
+
+  function flipTokens() {
+    setFromSym(toSym); setToSym(fromSym);
+    setFromAmt(toAmt); setToAmt(fromAmt);
+  }
+
+  async function handleSwap() {
+    if (!walletAddress) { addToast('Connect your wallet first', 'error'); return; }
+    if (!parsedFrom || parsedFrom <= 0) { addToast('Enter an amount', 'error'); return; }
+    if (impact > 15) { addToast('Price impact too high (>15%). Reduce amount.', 'error'); return; }
+
+    setPending(true);
+    try {
+      // Encode a minimal DEX swap call: selector + from token + to token + amount
+      const selector  = '0x38ed1739'; // swapExactTokensForTokens (Uniswap v2 ABI)
+      const amountHex = '0x' + Math.floor(parsedFrom * 1e6).toString(16).padStart(64, '0');
+      const data = selector + amountHex;
+
+      const DEX_CONTRACT = '0x000000000000000000000000000000000000DEF1';
+      const txHash = await rpcCall('eth_sendTransaction', [{
+        from:  walletAddress,
+        to:    DEX_CONTRACT,
+        value: '0x0',
+        data,
+        gas:   '0x' + (200000).toString(16),
+      }]);
+      addToast(`Swap submitted! TX: ${txHash ? shortAddr(txHash) : 'pending'}`, 'success');
+      setFromAmt(''); setToAmt('');
+    } catch (e) {
+      // In testnet the node may not support this call yet — show useful message
+      addToast(`Swap: ${e.message}`, 'info');
+    } finally {
+      setPending(false);
+    }
+  }
+
+  const btnLabel  = !walletAddress ? 'Connect Wallet' :
+                    !parsedFrom    ? 'Enter Amount'   :
+                    impact > 15    ? 'Price Impact Too High' :
+                    pending        ? 'Swapping…'      : `Swap ${fromSym} → ${toSym}`;
+  const btnClass  = impact > 15 ? 'swap-btn warn' : 'swap-btn';
+  const btnDisabled = pending || !parsedFrom || !walletAddress || impact > 15;
+
+  return (
+    <div className="card swap-card">
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:'1rem' }}>
+        <span style={{ fontWeight: 700, fontSize: '1rem' }}>Swap</span>
+        <div style={{ display:'flex', gap:6, alignItems:'center' }}>
+          <span style={{ fontSize:'0.75rem', color:'var(--text-muted)' }}>Slippage:</span>
+          {[0.1,0.5,1.0].map(s => (
+            <button key={s} onClick={() => setSlippage(s)} style={{
+              padding:'2px 8px', borderRadius:6, border:'1px solid', fontSize:'0.75rem', cursor:'pointer',
+              background: slippage === s ? 'rgba(124,58,237,.2)' : 'var(--surface2)',
+              borderColor: slippage === s ? 'var(--purple)' : 'var(--border)',
+              color: slippage === s ? 'var(--purple-lt)' : 'var(--text-muted)',
+            }}>
+              {s}%
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* FROM */}
+      <div className="token-row" style={{ marginBottom: 4 }}>
+        <div className="token-row-top">
+          <span>You pay</span>
+          {fromUsd > 0 && <span>{fmtUsd(fromUsd)}</span>}
+        </div>
+        <div className="token-row-mid">
+          <div style={{ position:'relative' }} onClick={e => { e.stopPropagation(); setDdFrom(!ddFrom); setDdTo(false); }}>
+            <div className="token-select">
+              <TokenIcon symbol={fromSym} />
+              {fromSym}
+              <span style={{ color:'var(--text-muted)', fontSize:'.7rem', marginLeft:2 }}>▼</span>
+            </div>
+            {ddFrom && (
+              <TokenDropdown current={fromSym} exclude={toSym}
+                onSelect={setFromSym} onClose={() => setDdFrom(false)} />
+            )}
+          </div>
+          <input className="token-amount" type="number" min="0" placeholder="0.0"
+            value={fromAmt} onChange={e => handleFromChange(e.target.value)} />
+        </div>
+        <div className="balance-text">
+          Balance: <span>—</span>
+          &nbsp;&nbsp;
+          <span style={{ cursor:'pointer', color:'var(--text-muted)' }} onClick={() => {}}>MAX</span>
+        </div>
+      </div>
+
+      {/* Flip arrow */}
+      <div className="swap-arrow-row">
+        <button className="swap-arrow-btn" onClick={flipTokens}>⇅</button>
+      </div>
+
+      {/* TO */}
+      <div className="token-row" style={{ marginTop: 4 }}>
+        <div className="token-row-top">
+          <span>You receive</span>
+          {toUsd > 0 && <span>{fmtUsd(toUsd)}</span>}
+        </div>
+        <div className="token-row-mid">
+          <div style={{ position:'relative' }} onClick={e => { e.stopPropagation(); setDdTo(!ddTo); setDdFrom(false); }}>
+            <div className="token-select">
+              <TokenIcon symbol={toSym} />
+              {toSym}
+              <span style={{ color:'var(--text-muted)', fontSize:'.7rem', marginLeft:2 }}>▼</span>
+            </div>
+            {ddTo && (
+              <TokenDropdown current={toSym} exclude={fromSym}
+                onSelect={setToSym} onClose={() => setDdTo(false)} />
+            )}
+          </div>
+          <input className="token-amount" type="number" min="0" placeholder="0.0"
+            value={toAmt} onChange={e => handleToChange(e.target.value)} />
+        </div>
+        <div className="balance-text">Balance: <span>—</span></div>
+      </div>
+
+      {/* Details */}
+      {parsedFrom > 0 && rawOut > 0 && (
+        <div className="swap-details">
+          <div className="detail-row">
+            <span>Rate</span>
+            <span className="val">1 {fromSym} = {(rawOut / parsedFrom).toFixed(6)} {toSym}</span>
+          </div>
+          <div className="detail-row">
+            <span>Price Impact</span>
+            <span className={`val ${impactClass}`}>{impact.toFixed(2)}%</span>
+          </div>
+          <div className="detail-row">
+            <span>Min. Received ({slippage}% slip.)</span>
+            <span className="val">{fmtNum(minReceived)} {toSym}</span>
+          </div>
+          <div className="detail-row">
+            <span>Fee (0.3%)</span>
+            <span className="val">{fmtNum(fee)} {fromSym}</span>
+          </div>
+          <div className="detail-row">
+            <span>Route</span>
+            <span className="val">{fromSym} → {toSym}</span>
+          </div>
+        </div>
+      )}
+
+      <button className={btnClass} disabled={btnDisabled} onClick={handleSwap}>
+        {btnLabel}
+      </button>
+    </div>
+  );
+}
+
+// ===========================================================================
+// PoolCard
+// ===========================================================================
+function PoolCard({ walletAddress, addToast }) {
+  const [tab, setTab]       = React.useState('add');
+  const [tokenA, setTokenA] = React.useState('EGOC');
+  const [tokenB, setTokenB] = React.useState('EGUSD');
+  const [amtA,   setAmtA]   = React.useState('');
+  const [amtB,   setAmtB]   = React.useState('');
+
+  // Mock LP positions — in production these come from on-chain reads
+  const positions = walletAddress ? [
+    { pair: 'EGOC/EGUSD', lp: '1000.00', value: '$12.40', share: '0.01%' },
+    { pair: 'EGOC/WETH',  lp: '0.234',   value: '$7.50',  share: '0.00%' },
+  ] : [];
+
+  async function handleAdd() {
+    if (!walletAddress) { addToast('Connect wallet first', 'error'); return; }
+    addToast('Add liquidity submitted (testnet stub)', 'info');
+    setAmtA(''); setAmtB('');
+  }
+
+  async function handleRemove() {
+    if (!walletAddress) { addToast('Connect wallet first', 'error'); return; }
+    addToast('Remove liquidity submitted (testnet stub)', 'info');
+  }
+
+  return (
+    <div className="card pool-card">
+      <div className="pool-tabs">
+        {['add','remove','positions'].map(t => (
+          <button key={t} className={`pool-tab${tab===t?' active':''}`} onClick={() => setTab(t)}>
+            {t === 'add' ? '+ Add Liquidity' : t === 'remove' ? '− Remove' : 'My Positions'}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'add' && (
+        <>
+          <div className="pool-input-row">
+            <select className="pool-input" value={tokenA} onChange={e => setTokenA(e.target.value)}
+              style={{ cursor:'pointer' }}>
+              {TOKENS.map(t => <option key={t.symbol} value={t.symbol}>{t.symbol}</option>)}
+            </select>
+            <input className="pool-input" type="number" placeholder="Amount" value={amtA} onChange={e => setAmtA(e.target.value)} />
+          </div>
+          <div className="pool-input-row">
+            <select className="pool-input" value={tokenB} onChange={e => setTokenB(e.target.value)}
+              style={{ cursor:'pointer' }}>
+              {TOKENS.filter(t => t.symbol !== tokenA).map(t => <option key={t.symbol} value={t.symbol}>{t.symbol}</option>)}
+            </select>
+            <input className="pool-input" type="number" placeholder="Amount" value={amtB} onChange={e => setAmtB(e.target.value)} />
+          </div>
+          {amtA && amtB && (
+            <div style={{ fontSize:'0.78rem', color:'var(--text-muted)', margin:'6px 0', padding:'6px 10px', background:'var(--surface2)', borderRadius:8 }}>
+              LP Tokens received: ~{(parseFloat(amtA || 0) * parseFloat(amtB || 0) * 0.001).toFixed(4)}
+            </div>
+          )}
+          <button className="pool-btn" onClick={handleAdd}>Add Liquidity</button>
+        </>
+      )}
+
+      {tab === 'remove' && (
+        <>
+          <div style={{ fontSize:'0.85rem', color:'var(--text-muted)', marginBottom:'0.75rem' }}>
+            Enter the amount of LP tokens to burn:
+          </div>
+          <div className="pool-input-row">
+            <input className="pool-input" type="text" placeholder="LP token amount" style={{ flex:1 }} />
+          </div>
+          <div style={{ display:'flex', gap:6, margin:'6px 0' }}>
+            {[25,50,75,100].map(p => (
+              <button key={p} style={{
+                flex:1, padding:'5px 0', borderRadius:6, border:'1px solid var(--border)',
+                background:'var(--surface2)', color:'var(--text-muted)', cursor:'pointer', fontSize:'0.78rem',
+              }}>
+                {p}%
+              </button>
+            ))}
+          </div>
+          <button className="pool-btn" style={{ background:'linear-gradient(135deg,#7f1d1d,#ef4444)' }} onClick={handleRemove}>
+            Remove Liquidity
+          </button>
+        </>
+      )}
+
+      {tab === 'positions' && (
+        positions.length === 0
+          ? <div className="lp-empty">No LP positions found.<br />Add liquidity to earn fees.</div>
+          : positions.map(p => (
+            <div key={p.pair} className="lp-position">
+              <div>
+                <div className="lp-pair">{p.pair}</div>
+                <div className="lp-value">{p.share} of pool</div>
+              </div>
+              <div style={{ textAlign:'right' }}>
+                <div className="lp-amount">{p.lp} LP</div>
+                <div className="lp-value">{p.value}</div>
+              </div>
+            </div>
+          ))
+      )}
+    </div>
+  );
+}
+
+// ===========================================================================
+// ChartSideCard
+// ===========================================================================
+function ChartSideCard({ prices, chartHistory, chartSym, setChartSym }) {
+  const p = prices[chartSym];
+  return (
+    <div className="card chart-card">
+      <div className="chart-header">
+        <div>
+          <div className="chart-title">{chartSym}/USD</div>
+          <div style={{ fontSize:'1.1rem', fontWeight:700, color:'var(--text)', marginTop:2 }}>
+            {p ? fmtUsd(p.usd) : '—'}
+            {p?.stale && <span style={{ marginLeft:6, fontSize:'0.7rem', color:'var(--yellow)' }}>[stale]</span>}
+          </div>
+        </div>
+        <div className="chart-symbol-tabs">
+          {['EGOC','ETH','BTC','BNB'].map(s => (
+            <button key={s} className={`chart-sym-btn${chartSym===s?' active':''}`} onClick={() => setChartSym(s)}>
+              {s}
+            </button>
+          ))}
+        </div>
+      </div>
+      <PriceChart history={chartHistory[chartSym] || []} />
+    </div>
+  );
+}
+
+// ===========================================================================
+// MarketStats side card
+// ===========================================================================
+function MarketStatsCard({ prices }) {
+  const rows = TOKENS.map(t => {
+    const p = prices[t.symbol];
+    return { ...t, usd: p?.usd, stale: p?.stale };
+  });
+  return (
+    <div className="card">
+      <div className="card-title">Market Prices</div>
+      {rows.map(r => (
+        <div key={r.symbol} style={{ display:'flex', justifyContent:'space-between', alignItems:'center', padding:'6px 0', borderBottom:'1px solid var(--border)' }}>
+          <div style={{ display:'flex', gap:8, alignItems:'center' }}>
+            <TokenIcon symbol={r.symbol} size={24} />
+            <div>
+              <div style={{ fontSize:'0.875rem', fontWeight:700 }}>{r.symbol}</div>
+              <div style={{ fontSize:'0.72rem', color:'var(--text-muted)' }}>{r.name}</div>
+            </div>
+          </div>
+          <div style={{ textAlign:'right' }}>
+            <div style={{ fontSize:'0.875rem', fontWeight:700, color: r.stale ? 'var(--yellow)' : 'var(--text)' }}>
+              {r.usd ? fmtUsd(r.usd) : '—'}
+            </div>
+            {r.stale && <div style={{ fontSize:'0.65rem', color:'var(--yellow)' }}>stale</div>}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ===========================================================================
+// App (root)
+// ===========================================================================
+function App() {
+  const [section,    setSection]    = React.useState('swap');   // 'swap' | 'pool'
+  const [wallet,     setWallet]     = React.useState(null);
+  const [prices,     setPrices]     = React.useState({});
+  const [stats,      setStats]      = React.useState({ tvl: 0, vol24: 0 });
+  const [toasts,     setToasts]     = React.useState([]);
+  const [chartSym,   setChartSym]   = React.useState('EGOC');
+  const [chartHist,  setChartHist]  = React.useState({});
+
+  function addToast(msg, type = 'info', duration = 4000) {
+    const id = Date.now() + Math.random();
+    setToasts(prev => [...prev, { id, msg, type }]);
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), duration);
+  }
+
+  // ---- Wallet connect ----
+  async function connectWallet() {
+    const ego = window.ego || window.ethereum;
+    if (ego) {
+      try {
+        const accounts = await ego.request({ method: 'eth_requestAccounts' });
+        setWallet(accounts[0]);
+        addToast(`Connected: ${shortAddr(accounts[0])}`, 'success');
+      } catch (e) {
+        addToast('Wallet connection rejected', 'error');
+      }
+    } else {
+      // Fallback: use ego-node RPC to get the first account
+      try {
+        const accounts = await rpcCall('eth_accounts');
+        if (accounts && accounts.length > 0) {
+          setWallet(accounts[0]);
+          addToast(`Connected via ego-node: ${shortAddr(accounts[0])}`, 'success');
+        } else {
+          addToast('No wallet provider found. Install Ego Extension or open ego-node.', 'error');
+        }
+      } catch {
+        addToast('No wallet found. Start ego-node or install Ego Extension.', 'error');
+      }
+    }
+  }
+
+  // ---- Fetch oracle prices ----
+  async function fetchPrices() {
+    try {
+      const data = await fetch(`${ORACLE_URL}/prices`).then(r => r.json());
+      // Oracle returns symbol-keyed map; also pull major symbols by alias
+      const merged = { ...data };
+      // Map oracle keys to our token symbols
+      if (data['BTC'])   merged['WBTC'] = { ...data['BTC'],   symbol:'WBTC'  };
+      if (data['ETH'])   merged['WETH'] = { ...data['ETH'],   symbol:'WETH'  };
+      if (data['EGOC'])  merged['EGUSD']= { usd: 1.0, updated_at: data['EGOC'].updated_at, stale: false };
+      setPrices(merged);
+
+      // Update chart history (keep last 24 points)
+      const now = Math.floor(Date.now() / 1000);
+      setChartHist(prev => {
+        const next = { ...prev };
+        const symKeys = { 'EGOC':'EGOC', 'ETH':'ETH', 'BTC':'BTC', 'BNB':'BNB' };
+        for (const [sym, oKey] of Object.entries(symKeys)) {
+          const p = data[oKey];
+          if (!p) continue;
+          const arr = [...(prev[sym] || []), { ts: now, price: p.usd }];
+          next[sym] = arr.slice(-24);
+        }
+        return next;
+      });
+
+      // Fake TVL / vol stats from prices
+      const egocPrice = data['EGOC']?.usd || 0.01;
+      setStats({
+        tvl:   egocPrice * 50_000_000 + (data['ETH']?.usd || 0) * 50,
+        vol24: egocPrice * 2_500_000  + (data['ETH']?.usd || 0) * 8,
+      });
+    } catch {
+      // Oracle might not be running; use fallback prices for display
+      const fallback = {
+        EGOC:  { usd: 0.01,   updated_at: Math.floor(Date.now()/1000), stale: true },
+        EGUSD: { usd: 1.0,    updated_at: Math.floor(Date.now()/1000), stale: true },
+        WBTC:  { usd: 65000,  updated_at: Math.floor(Date.now()/1000), stale: true },
+        WETH:  { usd: 3200,   updated_at: Math.floor(Date.now()/1000), stale: true },
+        ETH:   { usd: 3200,   updated_at: Math.floor(Date.now()/1000), stale: true },
+        BTC:   { usd: 65000,  updated_at: Math.floor(Date.now()/1000), stale: true },
+        BNB:   { usd: 420,    updated_at: Math.floor(Date.now()/1000), stale: true },
+      };
+      setPrices(fallback);
+    }
+  }
+
+  React.useEffect(() => {
+    fetchPrices();
+    const iv = setInterval(fetchPrices, 30_000);
+    return () => clearInterval(iv);
+  }, []);
+
+  const egocPrice  = prices['EGOC']?.usd || 0.01;
+  const egocStale  = prices['EGOC']?.stale;
+
+  return (
+    <>
+      {/* HEADER */}
+      <header className="header">
+        <div className="header-logo">
+          <svg viewBox="0 0 32 32" fill="none">
+            <defs>
+              <linearGradient id="lg" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stopColor="#7c3aed"/>
+                <stop offset="100%" stopColor="#2563eb"/>
+              </linearGradient>
+            </defs>
+            <circle cx="16" cy="16" r="15" fill="url(#lg)" opacity=".15" stroke="url(#lg)" strokeWidth="1.5"/>
+            <path d="M10 16 L16 8 L22 16 L16 24 Z" fill="url(#lg)" opacity=".8"/>
+            <circle cx="16" cy="16" r="3" fill="url(#lg)"/>
+          </svg>
+          <span className="gradient-text">Ego DEX</span>
+        </div>
+        <nav className="header-nav">
+          <button className={`nav-btn${section==='swap'?' active':''}`} onClick={() => setSection('swap')}>Swap</button>
+          <button className={`nav-btn${section==='pool'?' active':''}`} onClick={() => setSection('pool')}>Pool</button>
+        </nav>
+        <button
+          className={`connect-btn${wallet ? ' connected' : ''}`}
+          onClick={wallet ? () => { setWallet(null); addToast('Disconnected', 'info'); } : connectWallet}
+        >
+          {wallet ? shortAddr(wallet) : 'Connect Wallet'}
+        </button>
+      </header>
+
+      {/* STATS BAR */}
+      <div className="stats-bar">
+        <div className="stat-item">
+          <span className="stat-label">EGOC</span>
+          <span className={`stat-value${egocStale ? '' : ' green'}`}>
+            {fmtUsd(egocPrice)}
+          </span>
+          {egocStale && <span style={{ fontSize:'0.7rem', color:'var(--yellow)' }}>[stale]</span>}
+        </div>
+        <span className="stat-sep">|</span>
+        <div className="stat-item">
+          <span className="stat-label">TVL</span>
+          <span className="stat-value">{fmtUsd(stats.tvl)}</span>
+        </div>
+        <span className="stat-sep">|</span>
+        <div className="stat-item">
+          <span className="stat-label">24h Vol</span>
+          <span className="stat-value">{fmtUsd(stats.vol24)}</span>
+        </div>
+        <span className="stat-sep">|</span>
+        <div className="stat-item">
+          <span className="stat-label">Pairs</span>
+          <span className="stat-value">6</span>
+        </div>
+        <span className="stat-sep">|</span>
+        <div className="stat-item">
+          <span className="stat-label">Fee</span>
+          <span className="stat-value">0.3%</span>
+        </div>
+        <span className="stat-sep">|</span>
+        <div className="stat-item">
+          <span className="stat-label">Network</span>
+          <span className="stat-value" style={{ color:'var(--purple-lt)' }}>Ego Testnet</span>
+        </div>
+        {prices['ETH']?.usd && (
+          <>
+            <span className="stat-sep">|</span>
+            <div className="stat-item">
+              <span className="stat-label">ETH</span>
+              <span className="stat-value">{fmtUsd(prices['ETH'].usd)}</span>
+            </div>
+          </>
+        )}
+        {prices['BTC']?.usd && (
+          <>
+            <span className="stat-sep">|</span>
+            <div className="stat-item">
+              <span className="stat-label">BTC</span>
+              <span className="stat-value">{fmtUsd(prices['BTC'].usd)}</span>
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* MAIN */}
+      <div className="main">
+        <div className="center-col">
+          {/* Section toggle */}
+          <div className="section-toggle">
+            <button className={`section-toggle-btn${section==='swap'?' active':''}`} onClick={() => setSection('swap')}>
+              ⇄ Swap
+            </button>
+            <button className={`section-toggle-btn${section==='pool'?' active':''}`} onClick={() => setSection('pool')}>
+              + Pool
+            </button>
+          </div>
+
+          {section === 'swap' && (
+            <SwapCard prices={prices} walletAddress={wallet} addToast={addToast} />
+          )}
+          {section === 'pool' && (
+            <PoolCard walletAddress={wallet} addToast={addToast} />
+          )}
+        </div>
+
+        {/* SIDE COLUMN */}
+        <div className="side-col">
+          <ChartSideCard
+            prices={prices}
+            chartHistory={chartHist}
+            chartSym={chartSym}
+            setChartSym={setChartSym}
+          />
+          <MarketStatsCard prices={prices} />
+        </div>
+      </div>
+
+      <Toast toasts={toasts} />
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

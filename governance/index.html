@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ego Governance</title>
+<style>
+  :root {
+    --bg:          #0d0d0d;
+    --bg2:         #111118;
+    --bg3:         #18181f;
+    --bg4:         #1e1e28;
+    --border:      #2a2a3a;
+    --border2:     #3a3a50;
+    --purple:      #7c3aed;
+    --purple-l:    #9d63f5;
+    --purple-d:    #5b21b6;
+    --purple-bg:   rgba(124,58,237,0.10);
+    --purple-glow: rgba(124,58,237,0.30);
+    --blue:        #3b82f6;
+    --blue-l:      #60a5fa;
+    --blue-bg:     rgba(59,130,246,0.10);
+    --green:       #10b981;
+    --green-bg:    rgba(16,185,129,0.12);
+    --red:         #ef4444;
+    --red-bg:      rgba(239,68,68,0.12);
+    --yellow:      #f59e0b;
+    --yellow-bg:   rgba(245,158,11,0.12);
+    --text:        #e8e8f0;
+    --text-muted:  #8888aa;
+    --text-dim:    #55556a;
+    --radius:      12px;
+    --radius-sm:   8px;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    font-size: 14px;
+    line-height: 1.6;
+  }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--purple); }
+
+  /* ── NAVBAR ── */
+  #navbar {
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(13,13,13,0.92);
+    backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--border);
+    padding: 0 28px;
+    height: 62px;
+    display: flex; align-items: center; gap: 0;
+  }
+  .nav-logo {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 18px; font-weight: 800; letter-spacing: -0.4px;
+    color: var(--text); text-decoration: none; margin-right: auto;
+    flex-shrink: 0;
+  }
+  .nav-logo-icon {
+    width: 32px; height: 32px; border-radius: 8px;
+    background: linear-gradient(135deg, var(--purple), var(--blue));
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px; font-weight: 900; color: #fff;
+    box-shadow: 0 0 12px var(--purple-glow);
+  }
+  .nav-badge {
+    font-size: 11px; font-weight: 600; padding: 2px 8px;
+    background: var(--purple-bg); color: var(--purple-l);
+    border: 1px solid rgba(124,58,237,0.25); border-radius: 20px;
+  }
+  .nav-links { display: flex; gap: 4px; margin: 0 24px; }
+  .nav-link {
+    padding: 6px 14px; border-radius: var(--radius-sm);
+    font-size: 13px; font-weight: 500; color: var(--text-muted);
+    cursor: pointer; transition: all 0.15s; border: none; background: none;
+    text-decoration: none;
+  }
+  .nav-link:hover, .nav-link.active { color: var(--text); background: var(--bg3); }
+  .nav-link.active { color: var(--purple-l); }
+  .nav-right { display: flex; align-items: center; gap: 12px; }
+  .wallet-info {
+    display: none; align-items: center; gap: 8px;
+    padding: 6px 12px; background: var(--bg3);
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+  }
+  .wallet-info.visible { display: flex; }
+  .wallet-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
+  .wallet-addr { font-size: 12px; font-family: monospace; color: var(--text-muted); }
+  .wallet-bal { font-size: 12px; font-weight: 600; color: var(--text); }
+  .wallet-staked { font-size: 11px; color: var(--purple-l); }
+  .btn-connect {
+    padding: 8px 18px; border-radius: var(--radius-sm);
+    background: linear-gradient(135deg, var(--purple), var(--blue));
+    color: #fff; font-size: 13px; font-weight: 600;
+    border: none; cursor: pointer;
+    box-shadow: 0 2px 12px rgba(124,58,237,0.35);
+    transition: all 0.15s;
+  }
+  .btn-connect:hover { filter: brightness(1.1); transform: translateY(-1px); }
+  .btn-connect:active { transform: translateY(0); }
+  .btn-connect.connected { background: var(--bg3); border: 1px solid var(--border); color: var(--text-muted); box-shadow: none; }
+
+  /* ── LAYOUT ── */
+  .page-wrap { max-width: 1100px; margin: 0 auto; padding: 32px 24px 80px; }
+
+  /* ── STATS BAR ── */
+  .stats-row {
+    display: grid; grid-template-columns: repeat(4,1fr); gap: 16px;
+    margin-bottom: 32px;
+  }
+  .stat-card {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px 20px;
+  }
+  .stat-label { font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
+  .stat-value { font-size: 22px; font-weight: 700; color: var(--text); }
+  .stat-sub { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+  /* ── SECTION HEADER ── */
+  .section-head {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 16px;
+  }
+  .section-title {
+    font-size: 18px; font-weight: 700; color: var(--text);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .section-title svg { color: var(--purple-l); }
+
+  /* ── TABS ── */
+  .tabs { display: flex; gap: 6px; margin-bottom: 24px; border-bottom: 1px solid var(--border); padding-bottom: 0; }
+  .tab {
+    padding: 8px 18px; border: none; background: none; color: var(--text-muted);
+    font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.15s;
+    border-bottom: 2px solid transparent; margin-bottom: -1px;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--purple-l); border-bottom-color: var(--purple); }
+
+  /* ── FILTER ROW ── */
+  .filter-row { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; align-items: center; }
+  .filter-btn {
+    padding: 5px 14px; border-radius: 20px; font-size: 12px; font-weight: 500;
+    border: 1px solid var(--border); background: transparent; color: var(--text-muted);
+    cursor: pointer; transition: all 0.15s;
+  }
+  .filter-btn:hover { border-color: var(--purple); color: var(--purple-l); }
+  .filter-btn.active { background: var(--purple-bg); border-color: var(--purple); color: var(--purple-l); }
+  .filter-right { margin-left: auto; }
+
+  /* ── PROPOSAL CARD ── */
+  .proposals-list { display: flex; flex-direction: column; gap: 14px; }
+  .proposal-card {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 22px 24px;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    cursor: pointer;
+  }
+  .proposal-card:hover { border-color: var(--border2); box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+  .proposal-card.executed { opacity: 0.75; }
+  .proposal-head { display: flex; align-items: flex-start; gap: 16px; margin-bottom: 14px; }
+  .proposal-id { font-size: 12px; color: var(--text-dim); font-family: monospace; flex-shrink: 0; margin-top: 2px; }
+  .proposal-title-wrap { flex: 1; }
+  .proposal-title { font-size: 16px; font-weight: 600; color: var(--text); margin-bottom: 4px; line-height: 1.4; }
+  .proposal-desc { font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+  .proposal-meta { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+  .badge {
+    font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 20px;
+    letter-spacing: 0.02em;
+  }
+  .badge-active { background: var(--green-bg); color: var(--green); border: 1px solid rgba(16,185,129,0.2); }
+  .badge-passed { background: var(--purple-bg); color: var(--purple-l); border: 1px solid rgba(124,58,237,0.2); }
+  .badge-failed { background: var(--red-bg); color: var(--red); border: 1px solid rgba(239,68,68,0.2); }
+  .badge-pending { background: var(--yellow-bg); color: var(--yellow); border: 1px solid rgba(245,158,11,0.2); }
+  .badge-executed { background: rgba(16,185,129,0.06); color: #34d399; border: 1px solid rgba(16,185,129,0.15); }
+  .meta-item { font-size: 12px; color: var(--text-muted); display: flex; align-items: center; gap: 4px; }
+  .meta-item svg { color: var(--text-dim); flex-shrink: 0; }
+
+  /* ── VOTE BAR ── */
+  .vote-section { margin-bottom: 16px; }
+  .vote-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+  .vote-label { font-size: 12px; font-weight: 500; }
+  .vote-label.yes { color: var(--green); }
+  .vote-label.no  { color: var(--red); }
+  .vote-pct { font-size: 13px; font-weight: 700; }
+  .vote-bar-bg {
+    height: 8px; border-radius: 4px; background: var(--bg4);
+    overflow: hidden; position: relative; margin-bottom: 10px;
+  }
+  .vote-bar-yes { height: 100%; border-radius: 4px; background: linear-gradient(90deg, var(--green), #34d399); transition: width 0.6s ease; }
+  .vote-bar-no  { position: absolute; right: 0; top: 0; height: 100%; border-radius: 4px; background: var(--red); transition: width 0.6s ease; }
+  .quorum-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
+  .quorum-label { font-size: 11px; color: var(--text-dim); }
+  .quorum-pct   { font-size: 11px; color: var(--text-muted); }
+  .quorum-bar-bg { height: 4px; border-radius: 2px; background: var(--bg4); overflow: hidden; }
+  .quorum-bar-fill { height: 100%; border-radius: 2px; background: linear-gradient(90deg, var(--purple), var(--blue)); transition: width 0.6s ease; }
+
+  /* ── VOTE BUTTONS ── */
+  .vote-actions { display: flex; gap: 10px; margin-top: 16px; align-items: center; }
+  .btn-yes {
+    padding: 8px 20px; border-radius: var(--radius-sm); border: 1px solid var(--green);
+    background: var(--green-bg); color: var(--green); font-size: 13px; font-weight: 600;
+    cursor: pointer; transition: all 0.15s; display: flex; align-items: center; gap: 6px;
+  }
+  .btn-yes:hover { background: rgba(16,185,129,0.2); }
+  .btn-yes.voted { background: var(--green); color: #fff; }
+  .btn-no {
+    padding: 8px 20px; border-radius: var(--radius-sm); border: 1px solid var(--red);
+    background: var(--red-bg); color: var(--red); font-size: 13px; font-weight: 600;
+    cursor: pointer; transition: all 0.15s; display: flex; align-items: center; gap: 6px;
+  }
+  .btn-no:hover { background: rgba(239,68,68,0.2); }
+  .btn-no.voted { background: var(--red); color: #fff; }
+  .vote-status { font-size: 12px; color: var(--text-muted); margin-left: auto; }
+  .btn-disabled { opacity: 0.45; cursor: default !important; pointer-events: none; }
+
+  /* ── VOTE TOTALS ── */
+  .vote-totals { display: flex; gap: 20px; font-size: 12px; color: var(--text-dim); }
+  .vote-totals span { color: var(--text-muted); }
+
+  /* ── CREATE PROPOSAL ── */
+  .create-card {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 28px;
+  }
+  .form-group { margin-bottom: 20px; }
+  .form-label { display: block; font-size: 13px; font-weight: 500; color: var(--text-muted); margin-bottom: 8px; }
+  .form-label span { color: var(--text-dim); font-weight: 400; }
+  .form-input, .form-textarea {
+    width: 100%; padding: 10px 14px;
+    background: var(--bg3); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); color: var(--text);
+    font-size: 14px; font-family: inherit; outline: none;
+    transition: border-color 0.15s;
+    resize: vertical;
+  }
+  .form-input:focus, .form-textarea:focus { border-color: var(--purple); }
+  .form-input::placeholder, .form-textarea::placeholder { color: var(--text-dim); }
+  .form-textarea { min-height: 100px; line-height: 1.6; }
+  .form-code {
+    font-family: 'Courier New', monospace; font-size: 13px;
+    min-height: 72px;
+  }
+  .form-hint { font-size: 11px; color: var(--text-dim); margin-top: 5px; }
+  .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .btn-submit {
+    padding: 11px 28px; border-radius: var(--radius-sm);
+    background: linear-gradient(135deg, var(--purple), var(--blue));
+    color: #fff; font-size: 14px; font-weight: 600;
+    border: none; cursor: pointer;
+    box-shadow: 0 2px 14px rgba(124,58,237,0.35);
+    transition: all 0.15s; display: flex; align-items: center; gap: 8px;
+  }
+  .btn-submit:hover { filter: brightness(1.1); transform: translateY(-1px); }
+  .btn-submit:active { transform: translateY(0); }
+  .btn-submit:disabled { opacity: 0.5; cursor: default; transform: none; }
+
+  /* ── MY VOTES ── */
+  .myvotes-empty {
+    text-align: center; padding: 48px 24px;
+    color: var(--text-dim); font-size: 14px;
+  }
+  .myvote-row {
+    display: flex; align-items: center; gap: 14px;
+    padding: 14px 18px; background: var(--bg2);
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+    margin-bottom: 10px;
+  }
+  .myvote-prop { flex: 1; }
+  .myvote-id { font-size: 11px; color: var(--text-dim); margin-bottom: 2px; }
+  .myvote-title { font-size: 13px; font-weight: 500; color: var(--text); }
+  .myvote-choice { font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 20px; }
+  .myvote-yes { background: var(--green-bg); color: var(--green); }
+  .myvote-no  { background: var(--red-bg); color: var(--red); }
+  .myvote-weight { font-size: 12px; color: var(--text-muted); }
+
+  /* ── TOAST ── */
+  #toast {
+    position: fixed; bottom: 28px; right: 28px; z-index: 999;
+    padding: 12px 20px; border-radius: var(--radius-sm);
+    background: var(--bg3); border: 1px solid var(--border2);
+    color: var(--text); font-size: 13px; font-weight: 500;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+    transform: translateY(80px); opacity: 0;
+    transition: all 0.25s ease;
+    display: flex; align-items: center; gap: 8px; min-width: 220px;
+  }
+  #toast.show { transform: translateY(0); opacity: 1; }
+  #toast.success { border-color: rgba(16,185,129,0.4); }
+  #toast.error   { border-color: rgba(239,68,68,0.4); }
+  .toast-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .toast-dot.success { background: var(--green); }
+  .toast-dot.error   { background: var(--red); }
+  .toast-dot.info    { background: var(--blue); }
+
+  /* ── MODAL ── */
+  .modal-overlay {
+    display: none; position: fixed; inset: 0; z-index: 200;
+    background: rgba(0,0,0,0.7); backdrop-filter: blur(4px);
+    align-items: center; justify-content: center;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    background: var(--bg2); border: 1px solid var(--border2);
+    border-radius: var(--radius); padding: 28px; width: 480px; max-width: 95vw;
+    position: relative;
+  }
+  .modal-title { font-size: 16px; font-weight: 700; color: var(--text); margin-bottom: 16px; }
+  .modal-close {
+    position: absolute; top: 16px; right: 16px;
+    background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 18px;
+    line-height: 1; padding: 4px;
+  }
+  .modal-close:hover { color: var(--text); }
+  .modal-btn-row { display: flex; gap: 10px; margin-top: 20px; justify-content: flex-end; }
+  .btn-ghost {
+    padding: 8px 18px; border-radius: var(--radius-sm);
+    border: 1px solid var(--border); background: transparent; color: var(--text-muted);
+    font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.15s;
+  }
+  .btn-ghost:hover { border-color: var(--border2); color: var(--text); }
+
+  /* ── SECTION VISIBILITY ── */
+  .section { display: none; }
+  .section.active { display: block; }
+
+  @media (max-width: 700px) {
+    .stats-row { grid-template-columns: 1fr 1fr; }
+    .form-row { grid-template-columns: 1fr; }
+    .nav-links { display: none; }
+    .wallet-info .wallet-staked { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ── NAVBAR ── -->
+<nav id="navbar">
+  <a class="nav-logo" href="#">
+    <div class="nav-logo-icon">E</div>
+    Ego Governance
+    <span class="nav-badge">Testnet</span>
+  </a>
+  <nav class="nav-links">
+    <button class="nav-link active" onclick="showTab('proposals')">Proposals</button>
+    <button class="nav-link" onclick="showTab('create')">Create</button>
+    <button class="nav-link" onclick="showTab('myvotes')">My Votes</button>
+  </nav>
+  <div class="nav-right">
+    <div class="wallet-info" id="walletInfo">
+      <div class="wallet-dot"></div>
+      <span class="wallet-addr" id="walletAddr">egot1…</span>
+      <span class="wallet-bal" id="walletBal">— EGOC</span>
+      <span class="wallet-staked" id="walletStaked">Staked: — EGOC</span>
+    </div>
+    <button class="btn-connect" id="btnConnect" onclick="connectWallet()">Connect Wallet</button>
+  </div>
+</nav>
+
+<!-- ── PAGE ── -->
+<div class="page-wrap">
+
+  <!-- STATS -->
+  <div class="stats-row">
+    <div class="stat-card">
+      <div class="stat-label">Total Proposals</div>
+      <div class="stat-value">4</div>
+      <div class="stat-sub">2 active · 2 passed</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Participation Rate</div>
+      <div class="stat-value">71.4%</div>
+      <div class="stat-sub">Avg across all proposals</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Total Voting Power</div>
+      <div class="stat-value" id="statVotingPower">12.4M</div>
+      <div class="stat-sub">EGOC staked on-chain</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Quorum Threshold</div>
+      <div class="stat-value">20%</div>
+      <div class="stat-sub">of total staked supply</div>
+    </div>
+  </div>
+
+  <!-- TABS -->
+  <div class="tabs">
+    <button class="tab active" id="tab-proposals" onclick="showTab('proposals')">Proposals</button>
+    <button class="tab" id="tab-create"    onclick="showTab('create')">Create Proposal</button>
+    <button class="tab" id="tab-myvotes"   onclick="showTab('myvotes')">My Votes</button>
+  </div>
+
+  <!-- ═══ SECTION: PROPOSALS ═══ -->
+  <div class="section active" id="sec-proposals">
+    <div class="filter-row">
+      <button class="filter-btn active" onclick="filterProposals('all', this)">All</button>
+      <button class="filter-btn" onclick="filterProposals('active', this)">Active</button>
+      <button class="filter-btn" onclick="filterProposals('passed', this)">Passed</button>
+      <button class="filter-btn" onclick="filterProposals('failed', this)">Failed</button>
+      <span class="filter-right" style="font-size:12px;color:var(--text-dim);" id="propCount">4 proposals</span>
+    </div>
+    <div class="proposals-list" id="proposalsList"></div>
+  </div>
+
+  <!-- ═══ SECTION: CREATE ═══ -->
+  <div class="section" id="sec-create">
+    <div class="create-card">
+      <div class="section-title" style="margin-bottom:22px;">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+        Submit New Proposal
+      </div>
+      <div class="form-group">
+        <label class="form-label">Title <span>*</span></label>
+        <input class="form-input" id="propTitle" placeholder="Short descriptive title for your proposal…" maxlength="120">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Description <span>*</span></label>
+        <textarea class="form-textarea" id="propDesc" placeholder="Explain the motivation, expected impact, and any relevant details…"></textarea>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">Voting Period <span>(days)</span></label>
+          <input class="form-input" id="propDays" type="number" min="1" max="30" value="7" placeholder="7">
+        </div>
+        <div class="form-group">
+          <label class="form-label">EIP / Reference <span>(optional)</span></label>
+          <input class="form-input" id="propEip" placeholder="EGO-XX or link…">
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Execution Calldata <span>(optional — for on-chain execution)</span></label>
+        <textarea class="form-textarea form-code" id="propCalldata" placeholder="0x… hex-encoded calldata, or leave blank for signalling-only proposal"></textarea>
+        <div class="form-hint">Leave blank for a signalling-only proposal. Provide contract calldata for on-chain execution after passing.</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:14px;margin-top:4px;">
+        <button class="btn-submit" id="btnSubmit" onclick="submitProposal()">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+          Submit Proposal
+        </button>
+        <span style="font-size:12px;color:var(--text-dim);">Requires 100 EGOC to submit</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ SECTION: MY VOTES ═══ -->
+  <div class="section" id="sec-myvotes">
+    <div id="myVotesList">
+      <div class="myvotes-empty" id="myVotesEmpty">
+        <div style="font-size:32px;margin-bottom:12px;">🗳️</div>
+        Connect your wallet to see your voting history.
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── VOTE CONFIRM MODAL ── -->
+<div class="modal-overlay" id="voteModal">
+  <div class="modal">
+    <button class="modal-close" onclick="closeVoteModal()">✕</button>
+    <div class="modal-title" id="modalTitle">Confirm Vote</div>
+    <div id="modalBody" style="font-size:13px;color:var(--text-muted);line-height:1.6;"></div>
+    <div class="modal-btn-row">
+      <button class="btn-ghost" onclick="closeVoteModal()">Cancel</button>
+      <button class="btn-submit" id="modalConfirmBtn" onclick="confirmVote()">Confirm Vote</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── TOAST ── -->
+<div id="toast"><span class="toast-dot info" id="toastDot"></span><span id="toastMsg"></span></div>
+
+<script>
+// ─────────────────────────────────────────────
+// STATE
+// ─────────────────────────────────────────────
+const RPC = 'http://127.0.0.1:8545';
+
+let connectedAddress = null;
+let connectedBalance = 0;
+let connectedStaked  = 0;
+let myVotes = {}; // proposalId → 'yes' | 'no'
+let pendingVote = null; // { id, support }
+let currentFilter = 'all';
+
+const PROPOSALS = [
+  {
+    id: 1,
+    title: 'Increase block reward to 75 EGOC',
+    description: 'This proposal increases the base block reward from 50 EGOC to 75 EGOC to incentivize more validators and improve network security. The change would be activated at epoch 1000.',
+    status: 'active',
+    endsIn: '3 days',
+    yesVotes: 8_450_000,
+    noVotes:  4_550_000,
+    quorumReached: 0.72,
+    totalVoters: 1847,
+    eip: 'EGO-48',
+  },
+  {
+    id: 2,
+    title: 'Add USDT bridge support',
+    description: 'Deploy a trustless USDT/ERC-20 bridge using the EGO-Light-Client proof system, enabling stablecoin liquidity on the Ego chain. Bridge contract code: github.com/ego-blockchain/bridge.',
+    status: 'active',
+    endsIn: '5 days',
+    yesVotes: 9_800_000,
+    noVotes:  2_760_000,
+    quorumReached: 0.84,
+    totalVoters: 2203,
+    eip: 'EGO-51',
+  },
+  {
+    id: 3,
+    title: 'Reduce storage fee to 0.3 EGOC/GB',
+    description: 'Lower the base storage pricing from 0.5 EGOC/GB/day to 0.3 EGOC/GB/day to make Ego storage more competitive with centralised providers. Node rewards are maintained through increased volume.',
+    status: 'passed',
+    endsIn: 'Ended',
+    yesVotes: 11_200_000,
+    noVotes:  1_400_000,
+    quorumReached: 1.0,
+    totalVoters: 3100,
+    eip: 'EGO-47',
+    executed: true,
+  },
+  {
+    id: 4,
+    title: 'EGO-52 Governance Framework',
+    description: 'Formally adopt the EGO-52 on-chain governance specification as the canonical governance process for all future protocol upgrades, parameter changes, and treasury expenditures.',
+    status: 'passed',
+    endsIn: 'Ended',
+    yesVotes: 10_500_000,
+    noVotes:  1_800_000,
+    quorumReached: 1.0,
+    totalVoters: 2890,
+    eip: 'EGO-52',
+    executed: true,
+  },
+];
+
+// ─────────────────────────────────────────────
+// WALLET
+// ─────────────────────────────────────────────
+async function connectWallet() {
+  if (connectedAddress) { disconnectWallet(); return; }
+  try {
+    if (window.ego && window.ego.request) {
+      const accounts = await window.ego.request({ method: 'ego_requestAccounts' });
+      connectedAddress = accounts[0];
+      await fetchBalance();
+    } else {
+      // Demo mode: fake wallet
+      connectedAddress = 'egot1q2w3e4r5t6y7u8i9o0p1a2s3d4f5g6h7j8k9';
+      connectedBalance  = 1250;
+      connectedStaked   = 500;
+    }
+    onWalletConnected();
+  } catch(e) {
+    showToast('Wallet connection failed: ' + e.message, 'error');
+  }
+}
+
+async function fetchBalance() {
+  try {
+    const r = await fetch(RPC, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'ego_getBalance', params:[connectedAddress] })
+    });
+    const j = await r.json();
+    connectedBalance = j.result ? parseInt(j.result) / 1_000_000 : 0;
+    connectedStaked  = connectedBalance * 0.4; // mock staked ratio
+  } catch { connectedBalance = 1250; connectedStaked = 500; }
+}
+
+function onWalletConnected() {
+  const addrEl   = document.getElementById('walletAddr');
+  const balEl    = document.getElementById('walletBal');
+  const stakedEl = document.getElementById('walletStaked');
+  const infoEl   = document.getElementById('walletInfo');
+  const btn      = document.getElementById('btnConnect');
+
+  const short = connectedAddress.slice(0,8) + '…' + connectedAddress.slice(-4);
+  addrEl.textContent   = short;
+  balEl.textContent    = formatNum(connectedBalance) + ' EGOC';
+  stakedEl.textContent = 'Staked: ' + formatNum(connectedStaked) + ' EGOC';
+  infoEl.classList.add('visible');
+  btn.textContent = 'Disconnect';
+  btn.classList.add('connected');
+  renderProposals();
+  renderMyVotes();
+  showToast('Wallet connected: ' + short, 'success');
+}
+
+function disconnectWallet() {
+  connectedAddress = null; connectedBalance = 0; connectedStaked = 0;
+  document.getElementById('walletInfo').classList.remove('visible');
+  const btn = document.getElementById('btnConnect');
+  btn.textContent = 'Connect Wallet'; btn.classList.remove('connected');
+  renderProposals(); renderMyVotes();
+  showToast('Wallet disconnected', 'info');
+}
+
+// ─────────────────────────────────────────────
+// TABS
+// ─────────────────────────────────────────────
+function showTab(name) {
+  ['proposals','create','myvotes'].forEach(t => {
+    document.getElementById('sec-' + t).classList.toggle('active', t === name);
+    document.getElementById('tab-' + t).classList.toggle('active', t === name);
+  });
+  document.querySelectorAll('.nav-link').forEach(l => {
+    l.classList.toggle('active', l.getAttribute('onclick') === `showTab('${name}')`);
+  });
+  if (name === 'myvotes') renderMyVotes();
+}
+
+// ─────────────────────────────────────────────
+// PROPOSALS
+// ─────────────────────────────────────────────
+function filterProposals(f, btn) {
+  currentFilter = f;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderProposals();
+}
+
+function renderProposals() {
+  const list = document.getElementById('proposalsList');
+  const countEl = document.getElementById('propCount');
+  const filtered = currentFilter === 'all' ? PROPOSALS : PROPOSALS.filter(p => p.status === currentFilter);
+  countEl.textContent = filtered.length + ' proposal' + (filtered.length !== 1 ? 's' : '');
+
+  list.innerHTML = filtered.map(p => {
+    const total = p.yesVotes + p.noVotes;
+    const yesPct = total > 0 ? Math.round(p.yesVotes / total * 100) : 0;
+    const noPct  = 100 - yesPct;
+    const quorumPct = Math.min(Math.round(p.quorumReached * 100), 100);
+    const isActive  = p.status === 'active';
+    const myVote    = myVotes[p.id];
+    const canVote   = isActive && connectedAddress;
+
+    let statusBadge;
+    if (p.executed) statusBadge = `<span class="badge badge-executed">✓ Executed</span>`;
+    else if (p.status === 'passed') statusBadge = `<span class="badge badge-passed">Passed</span>`;
+    else if (p.status === 'failed') statusBadge = `<span class="badge badge-failed">Failed</span>`;
+    else statusBadge = `<span class="badge badge-active">● Active</span>`;
+
+    const votedYes = myVote === 'yes';
+    const votedNo  = myVote === 'no';
+
+    return `
+    <div class="proposal-card ${p.executed ? 'executed' : ''}">
+      <div class="proposal-head">
+        <div class="proposal-id">#${p.id}</div>
+        <div class="proposal-title-wrap">
+          <div class="proposal-title">${p.title}</div>
+          <div class="proposal-desc">${p.description}</div>
+        </div>
+      </div>
+      <div class="proposal-meta">
+        ${statusBadge}
+        ${p.eip ? `<span class="meta-item">${p.eip}</span>` : ''}
+        <span class="meta-item">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          ${p.endsIn}
+        </span>
+        <span class="meta-item">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          ${p.totalVoters.toLocaleString()} voters
+        </span>
+      </div>
+
+      <div class="vote-section">
+        <div class="vote-row">
+          <span class="vote-label yes">Yes</span>
+          <div class="vote-totals"><span>${formatNum(p.yesVotes / 1_000_000)}M EGOC</span></div>
+          <span class="vote-pct" style="color:var(--green)">${yesPct}%</span>
+        </div>
+        <div class="vote-bar-bg">
+          <div class="vote-bar-yes" style="width:${yesPct}%"></div>
+          <div class="vote-bar-no"  style="width:${noPct}%"></div>
+        </div>
+        <div class="vote-row" style="margin-top:4px;">
+          <span class="vote-label no">No</span>
+          <div class="vote-totals"><span>${formatNum(p.noVotes / 1_000_000)}M EGOC</span></div>
+          <span class="vote-pct" style="color:var(--red)">${noPct}%</span>
+        </div>
+
+        <div style="margin-top:12px;">
+          <div class="quorum-row">
+            <span class="quorum-label">Quorum progress</span>
+            <span class="quorum-pct">${quorumPct}% of 20% threshold</span>
+          </div>
+          <div class="quorum-bar-bg">
+            <div class="quorum-bar-fill" style="width:${quorumPct}%"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="vote-actions">
+        ${isActive ? `
+          <button class="btn-yes ${votedYes ? 'voted' : ''} ${!canVote ? 'btn-disabled' : ''}"
+            onclick="event.stopPropagation();openVoteModal(${p.id},'yes')">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+            ${votedYes ? 'Voted Yes' : 'Vote Yes'}
+          </button>
+          <button class="btn-no ${votedNo ? 'voted' : ''} ${!canVote ? 'btn-disabled' : ''}"
+            onclick="event.stopPropagation();openVoteModal(${p.id},'no')">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            ${votedNo ? 'Voted No' : 'Vote No'}
+          </button>
+          ${!connectedAddress ? '<span class="vote-status">Connect wallet to vote</span>' : ''}
+          ${myVote ? `<span class="vote-status">Your vote: <strong style="color:${myVote==='yes'?'var(--green)':'var(--red)'};">${myVote.toUpperCase()}</strong></span>` : ''}
+        ` : `<span class="vote-status" style="font-size:12px;color:var(--text-dim);">${p.executed ? 'Proposal executed on-chain' : 'Voting closed'}</span>`}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ─────────────────────────────────────────────
+// VOTING
+// ─────────────────────────────────────────────
+function openVoteModal(propId, support) {
+  if (!connectedAddress) { showToast('Connect your wallet first', 'error'); return; }
+  const prop = PROPOSALS.find(p => p.id === propId);
+  if (!prop) return;
+  pendingVote = { id: propId, support };
+  document.getElementById('modalTitle').textContent = `Vote on Proposal #${propId}`;
+  const power = formatNum(connectedStaked);
+  document.getElementById('modalBody').innerHTML = `
+    <p style="margin-bottom:12px;font-weight:500;color:var(--text);">${prop.title}</p>
+    <p style="margin-bottom:16px;">You are about to vote <strong style="color:${support==='yes'?'var(--green)':'var(--red)'};">${support.toUpperCase()}</strong> on this proposal.</p>
+    <div style="background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px 14px;font-size:12px;">
+      <div style="display:flex;justify-content:space-between;margin-bottom:4px;"><span style="color:var(--text-dim);">Voting power</span><span>${power} EGOC</span></div>
+      <div style="display:flex;justify-content:space-between;"><span style="color:var(--text-dim);">Wallet</span><span style="font-family:monospace;">${connectedAddress.slice(0,12)}…</span></div>
+    </div>
+    <p style="margin-top:12px;font-size:11px;color:var(--text-dim);">This action will call <code>ego_vote</code> on the Ego node and cannot be undone.</p>`;
+  document.getElementById('voteModal').classList.add('open');
+}
+
+function closeVoteModal() {
+  document.getElementById('voteModal').classList.remove('open');
+  pendingVote = null;
+}
+
+async function confirmVote() {
+  if (!pendingVote) return;
+  const btn = document.getElementById('modalConfirmBtn');
+  btn.disabled = true; btn.textContent = 'Submitting…';
+
+  try {
+    let txHash;
+    if (window.ego && window.ego.request) {
+      txHash = await window.ego.request({ method: 'ego_vote', params: [pendingVote.id, pendingVote.support === 'yes'] });
+    } else {
+      // Demo: simulate
+      await new Promise(r => setTimeout(r, 900));
+      txHash = '0x' + Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b=>b.toString(16).padStart(2,'0')).join('');
+    }
+
+    const prop = PROPOSALS.find(p => p.id === pendingVote.id);
+    if (prop && !myVotes[pendingVote.id]) {
+      const power = connectedStaked * 1_000_000;
+      if (pendingVote.support === 'yes') prop.yesVotes += power;
+      else prop.noVotes += power;
+      prop.totalVoters++;
+    }
+    myVotes[pendingVote.id] = pendingVote.support;
+
+    closeVoteModal();
+    renderProposals();
+    renderMyVotes();
+    showToast('Vote cast! Tx: ' + txHash.slice(0,14) + '…', 'success');
+  } catch(e) {
+    showToast('Vote failed: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Confirm Vote';
+  }
+}
+
+// ─────────────────────────────────────────────
+// CREATE PROPOSAL
+// ─────────────────────────────────────────────
+async function submitProposal() {
+  if (!connectedAddress) { showToast('Connect your wallet first', 'error'); showTab('proposals'); return; }
+  const title    = document.getElementById('propTitle').value.trim();
+  const desc     = document.getElementById('propDesc').value.trim();
+  const days     = parseInt(document.getElementById('propDays').value) || 7;
+  const calldata = document.getElementById('propCalldata').value.trim();
+
+  if (!title) { showToast('Title is required', 'error'); return; }
+  if (!desc)  { showToast('Description is required', 'error'); return; }
+  if (connectedBalance < 100) { showToast('Insufficient balance (need 100 EGOC)', 'error'); return; }
+
+  const btn = document.getElementById('btnSubmit');
+  btn.disabled = true; btn.innerHTML = '<span>Submitting…</span>';
+
+  try {
+    let txHash;
+    if (window.ego && window.ego.request) {
+      txHash = await window.ego.request({ method: 'ego_submitProposal', params: [{ title, description: desc, votingPeriodDays: days, calldata: calldata || null }] });
+    } else {
+      await new Promise(r => setTimeout(r, 1100));
+      txHash = '0x' + Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b=>b.toString(16).padStart(2,'0')).join('');
+      const newId = PROPOSALS.length + 1;
+      PROPOSALS.unshift({ id: newId, title, description: desc, status: 'active', endsIn: days + ' days', yesVotes: 0, noVotes: 0, quorumReached: 0, totalVoters: 0 });
+    }
+    document.getElementById('propTitle').value = '';
+    document.getElementById('propDesc').value  = '';
+    document.getElementById('propCalldata').value = '';
+    showToast('Proposal submitted! Tx: ' + txHash.slice(0,14) + '…', 'success');
+    showTab('proposals');
+  } catch(e) {
+    showToast('Submit failed: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> Submit Proposal';
+  }
+}
+
+// ─────────────────────────────────────────────
+// MY VOTES
+// ─────────────────────────────────────────────
+function renderMyVotes() {
+  const container = document.getElementById('myVotesList');
+  const empty     = document.getElementById('myVotesEmpty');
+  const keys = Object.keys(myVotes);
+
+  if (!connectedAddress) {
+    container.innerHTML = `<div class="myvotes-empty"><div style="font-size:32px;margin-bottom:12px;">🗳️</div>Connect your wallet to see your voting history.</div>`;
+    return;
+  }
+  if (keys.length === 0) {
+    container.innerHTML = `<div class="myvotes-empty"><div style="font-size:32px;margin-bottom:12px;">🗳️</div>You haven't voted on any proposals yet.</div>`;
+    return;
+  }
+
+  container.innerHTML = keys.map(id => {
+    const prop = PROPOSALS.find(p => p.id === parseInt(id));
+    if (!prop) return '';
+    const vote = myVotes[id];
+    return `
+    <div class="myvote-row">
+      <div class="myvote-prop">
+        <div class="myvote-id">Proposal #${id}</div>
+        <div class="myvote-title">${prop.title}</div>
+      </div>
+      <span class="myvote-choice ${vote === 'yes' ? 'myvote-yes' : 'myvote-no'}">${vote.toUpperCase()}</span>
+      <span class="myvote-weight">${formatNum(connectedStaked)} EGOC</span>
+    </div>`;
+  }).join('');
+}
+
+// ─────────────────────────────────────────────
+// TOAST
+// ─────────────────────────────────────────────
+let toastTimer;
+function showToast(msg, type = 'info') {
+  const el   = document.getElementById('toast');
+  const dot  = document.getElementById('toastDot');
+  const msgEl = document.getElementById('toastMsg');
+  el.className = 'show ' + type;
+  dot.className = 'toast-dot ' + type;
+  msgEl.textContent = msg;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.className = type; }, 3500);
+}
+
+// ─────────────────────────────────────────────
+// UTILS
+// ─────────────────────────────────────────────
+function formatNum(n) {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
+  if (n >= 1_000)     return (n / 1_000).toFixed(1) + 'K';
+  return Math.round(n).toString();
+}
+
+// ─────────────────────────────────────────────
+// INIT
+// ─────────────────────────────────────────────
+renderProposals();
+renderMyVotes();
+
+// Auto-connect if window.ego already injected
+if (window.ego && window.ego.selectedAddress) {
+  connectedAddress = window.ego.selectedAddress;
+  fetchBalance().then(onWalletConnected);
+}
+</script>
+</body>
+</html>

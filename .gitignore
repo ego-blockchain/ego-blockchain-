@@ -58,3 +58,12 @@ services/erlang/erl_bridge/_build
 /*.exe
 /simple_*.rs
 /test_*.rs
+
+# Node artifacts
+extension/node_modules/
+extension/dist/
+mobile/node_modules/
+dex/node_modules/
+governance/node_modules/
+services/oracle/target/
+services/bridge-relayer/target/
