@@ -16,7 +16,7 @@
 //!   = 50 EGOC × 2 × 2,100,000 = 210,000,000 EGOC  ✓
 //!
 //! Era duration:
-//!   2,100,000 blocks × TARGET_BLOCK_SECS (6s) ÷ 86,400 = ~145 days (~5 months)
+//!   126,000,000 blocks × SLOT_INTERVAL_MS (100ms) ÷ 86,400,000 = ~145 days (~5 months)
 
 // ── Precision ─────────────────────────────────────────────────────────────────
 
@@ -47,17 +47,22 @@ pub const FOUNDATION_EGOC: u64 = 150_000_000;
 
 // ── Block reward schedule ─────────────────────────────────────────────────────
 
-/// Initial block reward in uEGOC (50 EGOC).
-pub const INITIAL_BLOCK_REWARD_UEGOC: u64 = 50 * UEGOC_PER_EGOC;
+/// Initial block reward in uEGOC.
+/// Scaled for 100 ms blocks: 50 EGOC × (100ms / 6000ms) ≈ 0.8333 EGOC/block
+/// Total emission check: 833_334 × 2 × 126_000_000 = 210,000,168,000,000 uEGOC ≈ 210M EGOC ✓
+pub const INITIAL_BLOCK_REWARD_UEGOC: u64 = 833_334;
 
 /// Number of blocks between halvings.
-/// At TARGET_BLOCK_SECS = 6 s/block → era ≈ 145.8 days.
-pub const HALVING_INTERVAL: u64 = 2_100_000;
+/// At SLOT_INTERVAL_MS = 100 ms/block → 10 blocks/s → 864,000 blocks/day
+/// → era = 126,000,000 blocks ≈ 145.8 days  (same calendar duration as before)
+pub const HALVING_INTERVAL: u64 = 126_000_000;
 
-/// Target seconds between blocks. Prevents era exhaustion at high TPS.
-/// The batch loop only mines a block when there are transactions AND
-/// at least TARGET_BLOCK_SECS have elapsed since the last block.
-pub const TARGET_BLOCK_SECS: u64 = 6;
+/// Micro-slot interval in milliseconds — one block every 100 ms = 10 blocks/second.
+pub const SLOT_INTERVAL_MS: u64 = 100;
+
+/// Kept for staking/tokenomics math that thinks in "seconds per block".
+/// At 100 ms/block this equals 0.1.
+pub const TARGET_BLOCK_SECS: f64 = 0.1;
 
 /// Reward for block `height` (in uEGOC). Halves every HALVING_INTERVAL blocks.
 pub fn block_reward_at(height: u64) -> u64 {

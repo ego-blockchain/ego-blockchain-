@@ -22,9 +22,12 @@ use std::sync::{
     Arc, Mutex,
 };
 
-pub const SHARD_COUNT:       u32  = 16;
-pub const BATCH_SIZE:        usize = 2_000;  // TXs per batch per shard
-pub const BATCH_INTERVAL_MS: u64  = 50;      // flush every 50 ms
+pub const SHARD_COUNT:       u32   = 16;
+/// TXs per shard per 100-ms micro-slot.
+/// 625 × 16 shards × 10 slots/s = 100,000 TPS target.
+pub const BATCH_SIZE:        usize = 625;
+/// Micro-slot interval: one block every 100 ms = 10 blocks/second.
+pub const BATCH_INTERVAL_MS: u64   = 100;
 
 // ── Shard routing ─────────────────────────────────────────────────────────────
 
@@ -128,53 +131,61 @@ pub fn get_mempool() -> Arc<ShardedMempool> {
 
 // ── Batch loop (runs forever as a background task) ────────────────────────────
 
-/// Spawned once from main.rs — drains the mempool on every tick and mines a
-/// batch block if there are pending TXs.
+/// Hot-path batch loop: mines one micro-slot block every 100 ms.
+///
+/// Uses `chain_db::mine_batch_db()` for O(1) block insertion — no chain.json
+/// read/write, no full-chain serialization. Target: 100,000 TPS.
 pub async fn run_batch_loop() {
-    eprintln!("[Rollup] Batch loop started — {} shards, {}ms interval, {} TX/batch",
-              SHARD_COUNT, BATCH_INTERVAL_MS, BATCH_SIZE);
+    eprintln!(
+        "[Rollup] Micro-slot loop started — {} shards, {}ms slot, {} TX/shard/slot  →  target {}k TPS",
+        SHARD_COUNT,
+        BATCH_INTERVAL_MS,
+        BATCH_SIZE,
+        (SHARD_COUNT as usize * BATCH_SIZE * (1000 / BATCH_INTERVAL_MS as usize)) / 1000,
+    );
+
+    // Warm up the DB connection (migration runs here if needed).
+    let _ = crate::chain_db::get_db();
 
     let mut ticker = tokio::time::interval(
         std::time::Duration::from_millis(BATCH_INTERVAL_MS)
     );
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Track unix timestamp of the last mined block to enforce minimum block time.
-    let mut last_block_ts: i64 = 0;
-
     loop {
         ticker.tick().await;
 
         let pool = get_mempool();
-
-        // Skip tick if nothing is pending and no shard is full.
-        if pool.pending_count() == 0 { continue; }
-
-        // Enforce minimum block interval: only mine once per TARGET_BLOCK_SECS.
-        let now_ts = chrono::Utc::now().timestamp();
-        if now_ts - last_block_ts < crate::tokenomics::TARGET_BLOCK_SECS as i64 {
+        if pool.pending_count() == 0 {
             continue;
         }
 
         let txs = pool.drain_all();
-        if txs.is_empty() { continue; }
-
-        let ledger = crate::ledger::Ledger::load();
-        let miner  = ledger.address.clone();
-        if miner.is_empty() { continue; }
-
-        let mut chain = crate::ledger::load_chain();
-        let block     = chain.mine_batch(&txs, &miner);
-
-        if let Err(e) = crate::ledger::save_chain(&chain) {
-            eprintln!("[Rollup] Save error: {e}");
+        if txs.is_empty() {
             continue;
         }
 
-        last_block_ts = now_ts;
-        eprintln!("[Rollup] Block #{} — {} TXs confirmed ({} TPS theoretical)",
-                  block.height, txs.len(),
-                  (txs.len() as u64 * 1000) / BATCH_INTERVAL_MS);
+        let miner = {
+            let ledger = crate::ledger::Ledger::load();
+            ledger.address.clone()
+        };
+        if miner.is_empty() {
+            continue;
+        }
+
+        // O(1) block insert — no chain.json load/save
+        let block = crate::chain_db::mine_batch_db(&txs, &miner);
+
+        eprintln!(
+            "[Rollup] Block #{} — {} TXs in {}ms slot  ({} TPS instantaneous)",
+            block.height,
+            txs.len(),
+            BATCH_INTERVAL_MS,
+            (txs.len() as u64 * 1000) / BATCH_INTERVAL_MS,
+        );
+
+        // BFT pipeline: finalize blocks 2 slots behind the tip
+        crate::chain_db::pipeline_commit(block.height);
 
         // Broadcast batch to P2P peers (fire-and-forget)
         tokio::spawn(async move {

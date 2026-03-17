@@ -297,14 +297,14 @@ pub async fn get_tokenomics() -> Result<serde_json::Value, EgoDesktopError> {
         STAKING_APR_BPS, block_reward_at, staking_pool_remaining_uegoc, node_pool_remaining_uegoc,
     };
 
-    let chain = crate::ledger::load_chain();
-    let total_blocks = chain.blocks.len() as u64;
+    let total_blocks = crate::chain_db::block_count();
 
     let era: u64 = total_blocks / HALVING_INTERVAL;
     let current_reward = block_reward_at(total_blocks) as f64 / UEGOC_PER_EGOC as f64;
     let blocks_to_next = HALVING_INTERVAL - (total_blocks % HALVING_INTERVAL);
 
-    // Circulating = sum of all confirmed coinbase rewards
+    // Circulating = sum of all confirmed coinbase rewards (from recent 2000 blocks via shared chain)
+    let chain = crate::ledger::load_chain();
     let circulating_uegoc: u64 = chain.blocks.iter()
         .map(|b| b.reward)
         .sum();
