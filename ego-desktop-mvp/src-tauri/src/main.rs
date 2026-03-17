@@ -14,6 +14,7 @@ mod p2p;
 mod proof;
 mod services;
 mod sharding;
+mod tokenomics;
 mod utils;
 
 use tauri::{Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem};

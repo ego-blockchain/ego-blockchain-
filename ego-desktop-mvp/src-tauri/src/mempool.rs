@@ -139,6 +139,9 @@ pub async fn run_batch_loop() {
     );
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Track unix timestamp of the last mined block to enforce minimum block time.
+    let mut last_block_ts: i64 = 0;
+
     loop {
         ticker.tick().await;
 
@@ -146,6 +149,12 @@ pub async fn run_batch_loop() {
 
         // Skip tick if nothing is pending and no shard is full.
         if pool.pending_count() == 0 { continue; }
+
+        // Enforce minimum block interval: only mine once per TARGET_BLOCK_SECS.
+        let now_ts = chrono::Utc::now().timestamp();
+        if now_ts - last_block_ts < crate::tokenomics::TARGET_BLOCK_SECS as i64 {
+            continue;
+        }
 
         let txs = pool.drain_all();
         if txs.is_empty() { continue; }
@@ -162,6 +171,7 @@ pub async fn run_batch_loop() {
             continue;
         }
 
+        last_block_ts = now_ts;
         eprintln!("[Rollup] Block #{} — {} TXs confirmed ({} TPS theoretical)",
                   block.height, txs.len(),
                   (txs.len() as u64 * 1000) / BATCH_INTERVAL_MS);
