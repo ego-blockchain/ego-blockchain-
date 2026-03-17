@@ -334,42 +334,22 @@ pub fn genesis_block() -> LedgerBlock {
 }
 
 pub fn load_chain() -> SharedChain {
-    let path = chain_path();
-    if let Ok(data) = fs::read_to_string(&path) {
-        if let Ok(chain) = serde_json::from_str::<SharedChain>(&data) {
-            if !chain.blocks.is_empty() {
-                return chain;
-            }
-        }
-    }
-    let mut chain = SharedChain::default();
-    chain.blocks.push(genesis_block());
-    let _ = save_chain(&chain);
-    chain
+    crate::chain_db::load_shared_chain()
 }
 
-pub fn save_chain(chain: &SharedChain) -> Result<(), String> {
-    let data = serde_json::to_string_pretty(chain).map_err(|e| e.to_string())?;
-    fs::write(chain_path(), data).map_err(|e| e.to_string())
+/// No-op: chain is now persisted by chain_db (SQLite WAL).
+/// Kept for backward-compat call sites that still call save_chain().
+pub fn save_chain(_chain: &SharedChain) -> Result<(), String> {
+    // Chain is persisted directly by chain_db::mine_batch_db().
+    // This stub exists so existing callers compile without changes.
+    Ok(())
 }
 
 impl SharedChain {
     /// Compute the confirmed balance of an address from the chain.
     /// balance = Σ incoming confirmed txs − Σ outgoing confirmed txs
     pub fn balance_of(&self, address: &str) -> u64 {
-        let incoming: u64 = self
-            .transactions
-            .iter()
-            .filter(|tx| tx.to.trim() == address.trim() && tx.status == "Confirmed")
-            .map(|tx| tx.amount)
-            .sum();
-        let outgoing: u64 = self
-            .transactions
-            .iter()
-            .filter(|tx| tx.from.trim() == address.trim() && tx.status == "Confirmed")
-            .map(|tx| tx.amount)
-            .sum();
-        incoming.saturating_sub(outgoing)
+        crate::chain_db::balance_of(address)
     }
 
     /// Mine a new block on the shared chain, confirming the given tx and

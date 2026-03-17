@@ -32,10 +32,9 @@ pub struct NetworkStats {
 
 #[tauri::command]
 pub async fn get_network_stats() -> Result<NetworkStats, EgoDesktopError> {
-    let chain    = load_chain();
     let registry = load_registry();
 
-    let latest_block = chain.blocks.iter().map(|b| b.height).max().unwrap_or(0);
+    let (latest_height, _) = crate::chain_db::latest_block_info();
 
     let node_count = registry
         .wallets
@@ -57,8 +56,8 @@ pub async fn get_network_stats() -> Result<NetworkStats, EgoDesktopError> {
     }
 
     Ok(NetworkStats {
-        latest_block,
-        total_transactions: chain.transactions.len(),
+        latest_block: latest_height,
+        total_transactions: crate::chain_db::tx_count() as usize,
         total_files_stored: seen_cids.len(),
         node_count: node_count.max(1),
         network: "Ego Testnet".into(),
@@ -105,18 +104,15 @@ pub async fn get_p2p_status(state: tauri::State<'_, crate::app::AppState>) -> Re
 
 #[tauri::command]
 pub async fn get_blocks() -> Result<Vec<LedgerBlock>, EgoDesktopError> {
-    let mut blocks = load_chain().blocks;
-    blocks.sort_by(|a, b| b.height.cmp(&a.height));
-    blocks.truncate(200); // show last 200 blocks only
+    let mut blocks = crate::chain_db::recent_blocks(200);
+    // recent_blocks already returns DESC order; sort ascending for display
+    blocks.sort_by_key(|b| b.height);
     Ok(blocks)
 }
 
 #[tauri::command]
 pub async fn get_all_transactions() -> Result<Vec<LedgerTx>, EgoDesktopError> {
-    let mut txs = load_chain().transactions;
-    txs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-    txs.truncate(200); // show last 200 txs only
-    Ok(txs)
+    Ok(crate::chain_db::recent_transactions(200))
 }
 
 
