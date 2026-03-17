@@ -119,18 +119,6 @@ pub async fn get_all_transactions() -> Result<Vec<LedgerTx>, EgoDesktopError> {
     Ok(txs)
 }
 
-/// Wipes chain.json so the node starts fresh from block 0.
-/// Old test blocks (with wrong timestamps or inflated height) are removed.
-#[tauri::command]
-pub async fn reset_chain() -> Result<(), EgoDesktopError> {
-    use crate::ledger::{chain_path, SharedChain};
-    let empty = SharedChain::default();
-    let data  = serde_json::to_string_pretty(&empty)
-        .map_err(|e| EgoDesktopError::WalletError(e.to_string()))?;
-    std::fs::write(chain_path(), data)
-        .map_err(|e| EgoDesktopError::FileSystemError(e.to_string()))?;
-    Ok(())
-}
 
 #[tauri::command]
 pub async fn get_block_info(height: u64) -> Result<LedgerBlock, EgoDesktopError> {

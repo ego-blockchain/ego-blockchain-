@@ -169,7 +169,6 @@ fn main() {
             commands::explorer::get_block_info,
             commands::explorer::get_transaction_info,
             commands::explorer::get_file_events,
-            commands::explorer::reset_chain,
             commands::notifications::import_shared_file,
             commands::messenger::get_my_contact_bundle,
             commands::messenger::import_contact,

@@ -116,7 +116,6 @@ const ExplorerPage: React.FC = () => {
   const [selectedFile, setSelectedFile] = useState<FileEvent | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(true);
-  const [resetting, setResetting] = useState(false);
 
   useEffect(() => {
     loadData();
@@ -143,19 +142,6 @@ const ExplorerPage: React.FC = () => {
       setLoading(false);
     }
     invoke<Tokenomics>('get_tokenomics').then(setTokenomics).catch(() => {});
-  }
-
-  async function handleResetChain() {
-    if (!window.confirm('Reset all chain data? This clears all blocks and transactions. Your wallet balance and files are not affected.')) return;
-    setResetting(true);
-    try {
-      await invoke('reset_chain');
-      await loadData();
-    } catch (e) {
-      console.error('Reset failed:', e);
-    } finally {
-      setResetting(false);
-    }
   }
 
   async function handleSearch() {
@@ -227,14 +213,6 @@ const ExplorerPage: React.FC = () => {
           title="Refresh"
         >
           ↻
-        </button>
-        <button
-          onClick={handleResetChain}
-          disabled={resetting}
-          className="bg-red-900/60 hover:bg-red-800/60 disabled:opacity-40 transition px-4 py-3 rounded-xl text-sm text-red-400"
-          title="Reset chain data (clears old test blocks)"
-        >
-          {resetting ? '…' : '🗑 Reset Chain'}
         </button>
       </div>
 
