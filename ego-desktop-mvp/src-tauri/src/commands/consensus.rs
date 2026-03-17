@@ -321,30 +321,53 @@ pub async fn get_tokenomics() -> Result<serde_json::Value, EgoDesktopError> {
     let ledger = crate::ledger::Ledger::load();
     let total_staked_egoc = ledger.staked_amount / UEGOC_PER_EGOC;
 
+    let next_halving_at = (era + 1) * HALVING_INTERVAL;
+    // uEGOC caps for the 5 explorer emission-pool bars
+    let foundation_uegoc  = FOUNDATION_EGOC  * UEGOC_PER_EGOC;
+    let emission_uegoc    = BLOCK_EMISSION_EGOC * UEGOC_PER_EGOC;
+    let node_pool_uegoc   = NODE_POOL_EGOC   * UEGOC_PER_EGOC;
+    let staking_uegoc     = STAKING_POOL_EGOC * UEGOC_PER_EGOC;
+    let ecosystem_uegoc   = ECOSYSTEM_EGOC   * UEGOC_PER_EGOC;
+
     Ok(serde_json::json!({
-        "total_supply_egoc":  TOTAL_SUPPLY_EGOC,
-        "circulating_egoc":   circulating_egoc,
-        "circulating_pct":    circulating_pct,
-        "allocation": {
-            "block_emission_egoc": BLOCK_EMISSION_EGOC,
-            "node_pool_egoc":      NODE_POOL_EGOC,
-            "staking_pool_egoc":   STAKING_POOL_EGOC,
-            "ecosystem_egoc":      ECOSYSTEM_EGOC,
-            "foundation_egoc":     FOUNDATION_EGOC,
+        "total_supply_egoc":          TOTAL_SUPPLY_EGOC,
+        "circulating_egoc":           circulating_egoc,
+        "circulating_pct":            circulating_pct,
+        "block_rewards_issued_uegoc": circulating_uegoc,
+
+        // 5 emission pools expected by ExplorerPage
+        "emission_pools": {
+            "genesis":       { "cap_uegoc": foundation_uegoc,  "pct": 15 },
+            "block_rewards": { "cap_uegoc": emission_uegoc,    "pct": 21 },
+            "storage":       { "cap_uegoc": node_pool_uegoc,   "pct": 30 },
+            "coverage":      { "cap_uegoc": staking_uegoc,     "pct": 14 },
+            "ecosystem":     { "cap_uegoc": ecosystem_uegoc,   "pct": 20 },
         },
+
         "pools": {
             "node_pool_remaining_egoc":    node_pool_remaining,
             "staking_pool_remaining_egoc": staking_pool_remaining,
         },
+
         "halving": {
             "era":                    era,
+            "interval_blocks":        HALVING_INTERVAL,
             "current_reward_egoc":    current_reward,
-            "blocks_to_next_halving": blocks_to_next
+            "blocks_to_next_halving": blocks_to_next,
+            "next_halving_at_block":  next_halving_at,
+            "max_block_height":       total_blocks,
         },
+
         "staking": {
             "apr_pct":           STAKING_APR_BPS as f64 / 100.0,
             "total_staked_egoc": total_staked_egoc,
             "active_stakers":    if ledger.staked_amount > 0 { 1u64 } else { 0u64 }
+        },
+
+        // DRS gate constants
+        "drs": {
+            "min_drs_to_mine": 0.5,
+            "weights": { "poc": 0.6, "post": 0.4, "stake": 0.0 }
         }
     }))
 }

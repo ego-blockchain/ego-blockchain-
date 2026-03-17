@@ -71,18 +71,19 @@ function timeAgo(ts: number) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
+interface EmissionPool { cap_uegoc: number; pct: number; }
 interface Tokenomics {
-  total_supply_egoc:  number;
-  circulating_egoc:   number;
-  circulating_pct:    number;
-  emission_pools: {
-    genesis:       { cap_uegoc: number; pct: number };
-    block_rewards: { cap_uegoc: number; pct: number };
-    storage:       { cap_uegoc: number; pct: number };
-    coverage:      { cap_uegoc: number; pct: number };
-    ecosystem:     { cap_uegoc: number; pct: number };
-  };
+  total_supply_egoc:          number;
+  circulating_egoc:           number;
+  circulating_pct:            number;
   block_rewards_issued_uegoc: number;
+  emission_pools: {
+    genesis:       EmissionPool;
+    block_rewards: EmissionPool;
+    storage:       EmissionPool;
+    coverage:      EmissionPool;
+    ecosystem:     EmissionPool;
+  };
   halving: {
     era:                    number;
     interval_blocks:        number;
@@ -115,6 +116,7 @@ const ExplorerPage: React.FC = () => {
   const [selectedFile, setSelectedFile] = useState<FileEvent | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(true);
+  const [resetting, setResetting] = useState(false);
 
   useEffect(() => {
     loadData();
@@ -141,6 +143,19 @@ const ExplorerPage: React.FC = () => {
       setLoading(false);
     }
     invoke<Tokenomics>('get_tokenomics').then(setTokenomics).catch(() => {});
+  }
+
+  async function handleResetChain() {
+    if (!window.confirm('Reset all chain data? This clears all blocks and transactions. Your wallet balance and files are not affected.')) return;
+    setResetting(true);
+    try {
+      await invoke('reset_chain');
+      await loadData();
+    } catch (e) {
+      console.error('Reset failed:', e);
+    } finally {
+      setResetting(false);
+    }
   }
 
   async function handleSearch() {
@@ -212,6 +227,14 @@ const ExplorerPage: React.FC = () => {
           title="Refresh"
         >
           ↻
+        </button>
+        <button
+          onClick={handleResetChain}
+          disabled={resetting}
+          className="bg-red-900/60 hover:bg-red-800/60 disabled:opacity-40 transition px-4 py-3 rounded-xl text-sm text-red-400"
+          title="Reset chain data (clears old test blocks)"
+        >
+          {resetting ? '…' : '🗑 Reset Chain'}
         </button>
       </div>
 
