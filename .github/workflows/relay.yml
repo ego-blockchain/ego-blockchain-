@@ -41,6 +41,6 @@ jobs:
           echo "$SSH_KEY" > /tmp/relay_key && chmod 600 /tmp/relay_key
           scp -i /tmp/relay_key -o StrictHostKeyChecking=no \
             target/x86_64-unknown-linux-musl/release/ego-relay \
-            $RELAY_USER@$RELAY_HOST:/usr/local/bin/ego-relay
+            $RELAY_USER@$RELAY_HOST:/tmp/ego-relay
           ssh -i /tmp/relay_key -o StrictHostKeyChecking=no $RELAY_USER@$RELAY_HOST \
-            'chmod +x /usr/local/bin/ego-relay && systemctl restart ego-relay || true'
+            'sudo mv /tmp/ego-relay /usr/local/bin/ego-relay && sudo chmod +x /usr/local/bin/ego-relay && sudo systemctl restart ego-relay || true'
