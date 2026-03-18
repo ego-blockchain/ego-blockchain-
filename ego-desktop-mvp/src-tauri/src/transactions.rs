@@ -107,6 +107,7 @@ pub async fn send_transaction(
         status:       "Pending".into(),
         block_height: None,
         nonce,
+        ..LedgerTx::default()
     });
 
     // ── 4. Mine block → Confirmed ─────────────────────────────────────────

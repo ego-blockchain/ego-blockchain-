@@ -257,6 +257,7 @@ pub fn recent_transactions(limit: usize) -> Vec<LedgerTx> {
             contract_addr:       r.get(15)?,
             entrypoint:          r.get(16)?,
             call_args:           r.get(17)?,
+            fee_uegoc:           0,
         })
     })
     .unwrap()
