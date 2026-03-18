@@ -282,6 +282,11 @@ fn main() {
                     crate::p2p::oracle_sync_chain().await;
                     crate::p2p::broadcast_peer_announce(&handle_startup).await;
                     crate::p2p::sync_chain_from_peers().await;
+                    // Poll DHT inbox for offline messenger messages
+                    let my_addr = crate::ledger::Ledger::load().address;
+                    if !my_addr.is_empty() {
+                        crate::p2p::dht_fetch_inbox(&my_addr).await;
+                    }
                     let shard_peers = crate::p2p::get_known_peers();
                     let ledger_for_shard = crate::ledger::Ledger::load();
                     let endpoint = crate::p2p::get_public_endpoint().await;

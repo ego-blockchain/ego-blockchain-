@@ -156,6 +156,10 @@ pub enum P2PMessage {
         endpoint:  String,
         #[serde(default)]
         endpoints: Vec<String>,
+        #[serde(default)]
+        city:    Option<String>,
+        #[serde(default)]
+        country: Option<String>,
     },
     ChatMessage {
         bundle: String,
@@ -622,6 +626,18 @@ pub async fn broadcast_peer_announce(app: &tauri::AppHandle) {
         .find(|w| w.id == active_id)
         .map(|w| w.name.clone())
         .unwrap_or_else(|| "Ego Node".to_string());
+
+    // Include our own geolocation so remote peers can display us on their map
+    let (my_city, my_country) = {
+        let state = app.state::<crate::app::AppState>();
+        let cache = state.cache.lock().unwrap();
+        if let Some(ref cs) = cache.coverage_status {
+            if let Some(ref loc) = cs.location {
+                (loc.city.clone(), loc.country.clone())
+            } else { (None, None) }
+        } else { (None, None) }
+    };
+
     {
         let state = app.state::<crate::app::AppState>();
         state.upsert_peer(crate::app::PeerInfo {
@@ -629,8 +645,8 @@ pub async fn broadcast_peer_announce(app: &tauri::AppHandle) {
             name:      name.clone(),
             endpoint:  my_endpoint.clone(),
             last_seen: Utc::now().timestamp(),
-            city:      None,
-            country:   None,
+            city:      my_city.clone(),
+            country:   my_country.clone(),
         });
     }
     // Collect all local IPs as additional endpoints so peers can try direct connection
@@ -653,6 +669,8 @@ pub async fn broadcast_peer_announce(app: &tauri::AppHandle) {
         address, name,
         endpoint:  my_endpoint,
         endpoints: all_endpoints,
+        city:      my_city,
+        country:   my_country,
     };
     // Send to approved contacts only — pending contacts haven't confirmed
     // protocol compatibility yet.
@@ -1266,13 +1284,20 @@ fn inject_circuit(
     state.set_upnp_status(Ok(()));
     let _ = app.emit_all("ego://p2p-status-changed", ());
 
-    // Announce to contacts after circuit is confirmed (async, non-blocking)
+    // Announce to contacts + poll DHT inbox after circuit is confirmed
     let app_clone = app.clone();
     tokio::spawn(async move {
         // Small delay so contacts have time to connect too before we announce
         tokio::time::sleep(Duration::from_millis(300)).await;
         broadcast_peer_announce(&app_clone).await;
         eprintln!("[P2P] Re-announced after relay circuit confirmed");
+
+        // Poll DHT inbox for offline messages deposited while we were offline
+        let addr = crate::ledger::Ledger::load().address;
+        if !addr.is_empty() {
+            dht_fetch_inbox(&addr).await;
+            eprintln!("[Messenger] DHT inbox polled for {}", &addr[..addr.len().min(20)]);
+        }
     });
 }
 
@@ -1801,7 +1826,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
             }
         }
 
-        P2PMessage::PeerAnnounce { address, name, endpoint, endpoints } => {
+        P2PMessage::PeerAnnounce { address, name, endpoint, endpoints, city, country } => {
             register_known_validator(&address);
             if !endpoint.is_empty() {
                 let mut contacts = load_contacts();
@@ -1825,8 +1850,8 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                 name,
                 endpoint:  endpoint.clone(),
                 last_seen: Utc::now().timestamp(),
-                city:      None,
-                country:   None,
+                city,
+                country,
             });
             upsert_peer_cache(PeerEntry {
                 address:   address.clone(),

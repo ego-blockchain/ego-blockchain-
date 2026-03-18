@@ -237,13 +237,21 @@ async fn load_active_wallet(
         }
     }
 
+    // Credit testnet faucet for any wallet that still has zero balance.
+    credit_testnet_faucet(&keys.address);
+
+    // Re-read balance after potential faucet credit
+    let chain2 = load_chain();
+    let balance_uegoc2 = chain2.balance_of(&keys.address);
+    let balance_formatted2 = format!("{:.2} EGOC", balance_uegoc2 as f64 / 1_000_000.0);
+
     Ok(WalletInfo {
         address:              keys.address,
         public_key_ed25519:   keys.ed25519_hex,
         public_key_dilithium: keys.dilithium_hex,
         public_key_kyber:     keys.kyber_hex,
-        balance_uegoc:        keys.balance_uegoc,
-        balance_formatted:    keys.balance_formatted,
+        balance_uegoc:        balance_uegoc2,
+        balance_formatted:    balance_formatted2,
         is_new_wallet:        is_new,
     })
 }
@@ -567,29 +575,28 @@ pub async fn rename_wallet(
 // ── generate_keypair (legacy) ─────────────────────────────────────────────────
 
 /// Credit 1,000 EGOC testnet faucet to a new address if it has no balance yet.
+/// Writes directly to chain_db (SQLite) — save_chain() is a no-op.
 fn credit_testnet_faucet(address: &str) {
     const FAUCET_AMOUNT: u64 = 1_000 * 1_000_000; // 1,000 EGOC in uEGOC
     const FAUCET_ADDR:   &str = "egot1faucet000000000000000000000000000000000";
 
-    let mut chain = load_chain();
-    if chain.balance_of(address) > 0 { return; } // already funded
+    if crate::chain_db::balance_of(address) > 0 { return; } // already funded
 
     let ts   = chrono::Utc::now().timestamp();
-    let hash = format!("0xfaucet{:x}", ts as u64 ^ address.len() as u64);
+    let hash = format!("faucet{:x}{}", ts, address.len());
 
-    chain.transactions.push(LedgerTx {
-        hash:      hash.clone(),
+    let tx = LedgerTx {
+        hash,
         from:      FAUCET_ADDR.into(),
         to:        address.into(),
         amount:    FAUCET_AMOUNT,
-        memo:      Some("Testnet faucet — 1,000 EGOC".into()),
+        memo:      Some("1000 EGOC TEST".into()),
         timestamp: ts,
         status:    "Confirmed".into(),
-        block_height: Some(chain.blocks.len() as u64 + 1),
         ..LedgerTx::default()
-    });
-    chain.mine_block(&hash, FAUCET_ADDR);
-    let _ = save_chain(&chain);
+    };
+    crate::chain_db::mine_batch_db(&[tx], FAUCET_ADDR);
+    eprintln!("[Faucet] Credited 1,000 EGOC to {}", address);
 }
 
 #[tauri::command]

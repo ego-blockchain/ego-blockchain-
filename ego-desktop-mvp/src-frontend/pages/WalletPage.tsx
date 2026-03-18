@@ -605,7 +605,10 @@ const WalletPage: React.FC = () => {
         <div className="flex justify-between items-start mb-4">
           <div>
             <div className="text-blue-200 text-xs mb-1">Total Balance</div>
-            <div className="text-4xl font-black tracking-tight">{formatted}</div>
+            <div className="flex items-baseline gap-2">
+              <div className="text-4xl font-black tracking-tight">{formatted}</div>
+              <span className="text-yellow-300 text-sm font-bold bg-yellow-400/20 px-2 py-0.5 rounded-full">TEST</span>
+            </div>
             <div className="text-blue-300 text-sm mt-1">≈ {fiatBal} USD</div>
           </div>
           <div className="text-right">
@@ -667,12 +670,15 @@ const WalletPage: React.FC = () => {
                           <img src="/egoc.png" alt="EGOC" className="w-6 h-6 rounded-full object-cover" />
                         </div>
                         <div className="min-w-0">
-                          <div className="text-sm font-semibold">EGOC</div>
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-sm font-semibold">EGOC</span>
+                            <span className="text-yellow-400 text-[9px] font-bold bg-yellow-400/15 px-1 py-px rounded">TEST</span>
+                          </div>
                           <div className="text-xs font-mono text-gray-400 truncate">{myAddress}</div>
                         </div>
                       </div>
                       <div className="flex items-center gap-2 shrink-0">
-                        <span className="text-xs px-2 py-1 rounded-lg bg-gray-700/60">{formatted}</span>
+                        <span className="text-xs px-2 py-1 rounded-lg bg-gray-700/60">{formatted} <span className="text-yellow-400/70">Test</span></span>
                         <button
                           onClick={() => copyChainAddress('EGOC', myAddress)}
                           className={`text-xs px-2 py-1 rounded-lg transition ${copiedChain === 'EGOC' ? 'bg-green-500/20 text-green-400' : 'bg-gray-700/60 hover:bg-gray-700'}`}
