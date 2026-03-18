@@ -8,6 +8,7 @@ name = "ego-relay"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1"
 tokio  = { version = "1", features = ["full"] }
 libp2p = { version = "0.56", features = [
     "noise", "yamux", "tcp", "dns",
