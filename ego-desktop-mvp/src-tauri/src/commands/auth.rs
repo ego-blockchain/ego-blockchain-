@@ -566,7 +566,6 @@ pub async fn rename_wallet(
 
 // ── generate_keypair (legacy) ─────────────────────────────────────────────────
 
-#[tauri::command]
 /// Credit 1,000 EGOC testnet faucet to a new address if it has no balance yet.
 fn credit_testnet_faucet(address: &str) {
     const FAUCET_AMOUNT: u64 = 1_000 * 1_000_000; // 1,000 EGOC in uEGOC
