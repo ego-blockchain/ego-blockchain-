@@ -1288,3 +1288,34 @@ fn get_bip39_wordlist() -> &'static [&'static str] {
         "besiege","bestow","betide","beware","bountiful","brazen","brisk","brooch",
     ]
 }
+
+// ── Email verification (OTP via SMTP) ────────────────────────────────────────
+
+/// Generate a 6-digit OTP, store it, and send it to the given email address.
+#[tauri::command]
+pub async fn send_verification_email(email: String, name: String) -> Result<(), String> {
+    if email.trim().is_empty() {
+        return Err("Email address is required.".into());
+    }
+    // Generate 6-digit OTP
+    use rand::Rng;
+    let code = format!("{:06}", rand::thread_rng().gen_range(100_000u32..=999_999u32));
+    crate::email::store_otp(&email, &code);
+    crate::email::send_otp_email(email.trim(), name.trim(), &code).await
+}
+
+/// Check a submitted OTP code.  Returns true on success and consumes the code.
+#[tauri::command]
+pub async fn verify_email_code(email: String, code: String) -> Result<bool, String> {
+    Ok(crate::email::verify_otp(email.trim(), code.trim()))
+}
+
+/// Persist the user's name and email in the active wallet's ledger.
+/// Call this once OTP verification succeeds.
+#[tauri::command]
+pub async fn save_registration_info(name: String, email: String) -> Result<(), String> {
+    let mut ledger = Ledger::load();
+    ledger.registered_name  = name.trim().to_string();
+    ledger.registered_email = email.trim().to_lowercase();
+    ledger.save()
+}

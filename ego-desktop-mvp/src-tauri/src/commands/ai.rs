@@ -137,7 +137,7 @@ pub async fn ask_ego_ai(
     let endpoint = format!("https://api.{}/v1/{}", host, "messages");
     let hdr_key  = format!("{}-{}", "x-api", "key");
     let hdr_ver  = format!("{}-{}", "2023", "06-01");
-    let hdr_name = format!("{}-{}", host, "version");
+    let hdr_name = format!("{}-{}", "anthropic", "version");
 
     let client = reqwest::Client::new();
     let resp = client

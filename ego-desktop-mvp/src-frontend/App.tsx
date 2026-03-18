@@ -245,7 +245,10 @@ function App() {
       setWallet(info);
       await loadRegistry();
       // Check if this address already completed registration
-      const done = localStorage.getItem(`ego-registered-${info.address}`) === 'true';
+      const done = localStorage.getItem('ego-registered-account') === 'true'
+        || Object.keys(localStorage).some(k => k.startsWith('ego-registered-') && localStorage.getItem(k) === 'true');
+      // Promote to account-wide key so future wallets skip immediately
+      if (done) localStorage.setItem('ego-registered-account', 'true');
       setRegistered(done);
     } catch (e) {
       console.error('init_wallet failed:', e);

@@ -7,6 +7,7 @@ mod commands;
 mod config;
 mod crypto;
 mod database;
+mod email;
 mod error;
 mod ledger;
 mod mempool;
@@ -199,9 +200,20 @@ fn main() {
             commands::rollup::get_shard_stats,
             commands::rollup::get_shard_map_status,
             commands::wallet::query_remote_node,
+            commands::wallet::fetch_swap_rates,
+            commands::multichain::get_external_addresses,
+            commands::multichain::fetch_chain_balance,
+            commands::multichain::fetch_chain_transactions,
+            commands::multichain::lookup_token_info,
+            commands::multichain::add_custom_token,
+            commands::multichain::get_custom_tokens,
+            commands::multichain::remove_custom_token,
             commands::ai::ask_ego_ai,
             commands::ai::save_ai_key,
-            commands::ai::get_ai_key_status
+            commands::ai::get_ai_key_status,
+            commands::auth::send_verification_email,
+            commands::auth::verify_email_code,
+            commands::auth::save_registration_info
         ])
         .setup(|app| {
             // Show the window only after the frontend signals it's ready,

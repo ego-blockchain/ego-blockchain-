@@ -1,65 +1,61 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
-import { fetch as tauriFetch, Body } from '@tauri-apps/api/http';
-import { RELAY_HTTP as RELAY } from '../config';
 
 interface Props {
   address: string;
   onComplete: () => void;
 }
 
-type Step = 'form' | 'verify_pending' | 'recovery' | 'confirm_written';
+type Step = 'form' | 'otp' | 'recovery';
 
 const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
   const [step, setStep]         = useState<Step>('form');
   const [name, setName]         = useState('');
   const [email, setEmail]       = useState('');
+  const [otp, setOtp]           = useState(['', '', '', '', '', '']);
   const [loading, setLoading]   = useState(false);
   const [error, setError]       = useState('');
   const [recovery, setRecovery] = useState<string[]>([]);
   const [seedHex, setSeedHex]   = useState('');
   const [showSeed, setShowSeed] = useState(false);
   const [checked, setChecked]   = useState(false);
-  const [polling, setPolling]   = useState(false);
+  const otpRefs = useRef<(HTMLInputElement | null)[]>([]);
 
-  async function handleRegister() {
+  // ── Step 1: Send OTP ─────────────────────────────────────────────────────
+  async function handleSendOtp() {
     if (!name.trim() || !email.trim()) { setError('Please enter your name and email.'); return; }
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { setError('Please enter a valid email address.'); return; }
     setLoading(true); setError('');
     try {
-      const res = await tauriFetch<{ success: boolean; message: string }>(
-        `${RELAY}/users/register`,
-        { method: 'POST', body: Body.json({ address, name: name.trim(), email: email.trim() }) }
-      );
-      const data = res.data;
-      if (!data.success) { setError(data.message); return; }
-      setStep('verify_pending');
-      startPollingVerification();
+      await invoke('send_verification_email', { email: email.trim(), name: name.trim() });
+      setStep('otp');
     } catch (e) {
-      setError('Error: ' + String(e));
+      setError('Failed to send verification email: ' + String(e));
     } finally {
       setLoading(false);
     }
   }
 
-  function startPollingVerification() {
-    setPolling(true);
-    const interval = setInterval(async () => {
-      try {
-        const res  = await tauriFetch<{ email_verified: boolean }>(`${RELAY}/users/${address}`);
-        const data = res.data;
-        if (data.email_verified) {
-          clearInterval(interval);
-          setPolling(false);
-          await loadRecovery();
-        }
-      } catch {}
-    }, 3000);
-    // Stop polling after 15 min
-    setTimeout(() => { clearInterval(interval); setPolling(false); }, 15 * 60 * 1000);
+  // ── Step 2: Verify OTP ───────────────────────────────────────────────────
+  async function handleVerifyOtp() {
+    const code = otp.join('');
+    if (code.length !== 6) { setError('Please enter the full 6-digit code.'); return; }
+    setLoading(true); setError('');
+    try {
+      const ok = await invoke<boolean>('verify_email_code', { email: email.trim(), code });
+      if (!ok) { setError('Incorrect or expired code. Please try again.'); setLoading(false); return; }
+      // Save registration info to ledger
+      await invoke('save_registration_info', { name: name.trim(), email: email.trim() });
+      // Load recovery phrase
+      await loadRecovery();
+    } catch (e) {
+      setError('Verification failed: ' + String(e));
+    } finally {
+      setLoading(false);
+    }
   }
 
-async function loadRecovery() {
+  async function loadRecovery() {
     try {
       let info: { recovery_phrase: string[]; seed_hex: string };
       try {
@@ -76,14 +72,37 @@ async function loadRecovery() {
     }
   }
 
+  function handleOtpInput(i: number, val: string) {
+    const v = val.replace(/\D/g, '').slice(-1);
+    const next = [...otp]; next[i] = v; setOtp(next);
+    if (v && i < 5) otpRefs.current[i + 1]?.focus();
+  }
+
+  function handleOtpKeyDown(i: number, e: React.KeyboardEvent) {
+    if (e.key === 'Backspace' && !otp[i] && i > 0) otpRefs.current[i - 1]?.focus();
+    if (e.key === 'Enter') handleVerifyOtp();
+  }
+
+  async function handleResend() {
+    setLoading(true); setError(''); setOtp(['', '', '', '', '', '']);
+    try {
+      await invoke('send_verification_email', { email: email.trim(), name: name.trim() });
+      setError('');
+    } catch (e) {
+      setError('Failed to resend: ' + String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
   function handleConfirm() {
     if (!checked) { setError('Please confirm you have written down your recovery phrase.'); return; }
-    // Mark registration complete locally
+    localStorage.setItem('ego-registered-account', 'true');
     localStorage.setItem(`ego-registered-${address}`, 'true');
     onComplete();
   }
 
-  // ── Step: Form ──────────────────────────────────────────────────────────────
+  // ── Step: Form ───────────────────────────────────────────────────────────
   if (step === 'form') return (
     <div className="min-h-screen bg-gray-900 flex items-center justify-center p-6">
       <div className="w-full max-w-md bg-gray-800 rounded-2xl shadow-2xl overflow-hidden border border-gray-700">
@@ -94,7 +113,7 @@ async function loadRecovery() {
         </div>
         <div className="px-8 py-6 space-y-5">
           <p className="text-sm text-gray-300 leading-relaxed">
-            Enter your name and email address. We'll send you a verification email, then show you your recovery phrase.
+            Enter your name and email. We'll send a verification code to confirm your address.
           </p>
           <div className="space-y-3">
             <div>
@@ -115,20 +134,20 @@ async function loadRecovery() {
                 onChange={e => setEmail(e.target.value)}
                 placeholder="e.g. john@example.com"
                 className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition text-white"
-                onKeyDown={e => e.key === 'Enter' && handleRegister()}
+                onKeyDown={e => e.key === 'Enter' && handleSendOtp()}
               />
             </div>
           </div>
           <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl px-4 py-3 text-xs text-blue-300">
-            📧 We use your email only for transaction confirmations and account recovery. We never share it.
+            📧 We use your email for verification and transaction confirmations only. We never share it.
           </div>
           {error && <div className="bg-red-500/20 text-red-400 text-xs px-3 py-2 rounded-lg">{error}</div>}
           <button
-            onClick={handleRegister}
+            onClick={handleSendOtp}
             disabled={loading || !name || !email}
             className="w-full py-3 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 rounded-xl font-semibold text-sm transition"
           >
-            {loading ? 'Sending verification…' : 'Continue →'}
+            {loading ? 'Sending code…' : 'Send Verification Code →'}
           </button>
           <div className="font-mono text-xs text-gray-600 text-center break-all">{address}</div>
         </div>
@@ -136,8 +155,8 @@ async function loadRecovery() {
     </div>
   );
 
-  // ── Step: Email verification pending ───────────────────────────────────────
-  if (step === 'verify_pending') return (
+  // ── Step: OTP entry ──────────────────────────────────────────────────────
+  if (step === 'otp') return (
     <div className="min-h-screen bg-gray-900 flex items-center justify-center p-6">
       <div className="w-full max-w-md bg-gray-800 rounded-2xl shadow-2xl overflow-hidden border border-gray-700">
         <div className="px-8 py-6 border-b border-gray-700 bg-gradient-to-br from-blue-900/40 to-purple-900/40">
@@ -147,37 +166,63 @@ async function loadRecovery() {
         </div>
         <div className="px-8 py-6 space-y-5">
           <p className="text-sm text-gray-300 leading-relaxed">
-            We sent a verification link to <strong className="text-white">{email}</strong>.
-            Click the link in that email to continue.
+            We sent a 6-digit code to <strong className="text-white">{email}</strong>.
+            Enter it below to continue.
           </p>
-          <div className="bg-gray-900 rounded-xl p-4 space-y-2">
-            {polling ? (
-              <div className="flex items-center gap-3 text-sm text-gray-400">
-                <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin shrink-0" />
-                Waiting for verification…
-              </div>
-            ) : (
-              <div className="text-sm text-yellow-400">Verification timed out. Please try again.</div>
-            )}
+
+          {/* OTP boxes */}
+          <div className="flex justify-center gap-3">
+            {otp.map((digit, i) => (
+              <input
+                key={i}
+                ref={el => { otpRefs.current[i] = el; }}
+                type="text"
+                inputMode="numeric"
+                maxLength={1}
+                value={digit}
+                onChange={e => handleOtpInput(i, e.target.value)}
+                onKeyDown={e => handleOtpKeyDown(i, e)}
+                className="w-12 h-14 text-center text-xl font-bold bg-gray-900 border-2 border-gray-700 focus:border-blue-500 rounded-xl outline-none transition text-white"
+              />
+            ))}
           </div>
+
           <div className="text-xs text-gray-500 space-y-1">
             <p>• Check your spam/junk folder if you don't see it</p>
-            <p>• The link expires in 24 hours</p>
-            <p>• Make sure to click the link on any device — the app will detect it automatically</p>
+            <p>• The code expires in 10 minutes</p>
           </div>
+
           {error && <div className="bg-red-500/20 text-red-400 text-xs px-3 py-2 rounded-lg">{error}</div>}
+
           <button
-            onClick={() => { setStep('form'); setError(''); }}
-            className="w-full py-3 bg-gray-700 hover:bg-gray-600 rounded-xl font-semibold text-sm transition text-gray-300"
+            onClick={handleVerifyOtp}
+            disabled={loading || otp.join('').length !== 6}
+            className="w-full py-3 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 rounded-xl font-semibold text-sm transition"
           >
-            ← Back (change email)
+            {loading ? 'Verifying…' : 'Verify Code →'}
           </button>
+
+          <div className="flex items-center justify-between text-xs">
+            <button
+              onClick={() => { setStep('form'); setError(''); setOtp(['','','','','','']); }}
+              className="text-gray-400 hover:text-white transition"
+            >
+              ← Change email
+            </button>
+            <button
+              onClick={handleResend}
+              disabled={loading}
+              className="text-blue-400 hover:text-blue-300 transition disabled:opacity-40"
+            >
+              Resend code
+            </button>
+          </div>
         </div>
       </div>
     </div>
   );
 
-  // ── Step: Recovery phrase ──────────────────────────────────────────────────
+  // ── Step: Recovery phrase ────────────────────────────────────────────────
   if (step === 'recovery') return (
     <div className="min-h-screen bg-gray-900 flex items-center justify-center p-6">
       <div className="w-full max-w-lg bg-gray-800 rounded-2xl shadow-2xl overflow-hidden border border-gray-700">
@@ -192,7 +237,6 @@ async function loadRecovery() {
             Anyone with these words can access your wallet. Never store them digitally or share them.
           </div>
 
-          {/* 24 words grid */}
           <div>
             <div className="text-sm font-semibold mb-3 text-white">24-Word Recovery Phrase</div>
             <div className="grid grid-cols-4 gap-2">
@@ -205,7 +249,6 @@ async function loadRecovery() {
             </div>
           </div>
 
-          {/* Seed hex */}
           <div>
             <div className="flex items-center justify-between mb-2">
               <div className="text-sm font-semibold text-white">Raw Seed (hex)</div>
@@ -224,7 +267,6 @@ async function loadRecovery() {
             )}
           </div>
 
-          {/* Confirm written */}
           <label className="flex items-start gap-3 cursor-pointer group">
             <div className="relative shrink-0 mt-0.5">
               <input type="checkbox" checked={checked} onChange={e => setChecked(e.target.checked)} className="sr-only" />
