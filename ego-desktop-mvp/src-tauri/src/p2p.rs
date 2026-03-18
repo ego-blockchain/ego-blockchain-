@@ -45,7 +45,7 @@ pub const P2P_PORT: u16 = 47393;
 /// The network remains functional as long as at least one of these is reachable.
 pub const RELAY_NODES: &[&str] = &[
     // Official Ego seed node
-    "/dns4/EgoRelay.egoblockchain.com/tcp/4001/p2p/12D3KooWPj6m7jzmVyMh1zWrsoux3YiVs9j2HwsjrFXzDcqAGGz4",
+    "/dns4/EgoRelay.egoblockchain.com/tcp/4001/p2p/12D3KooWBPZwpo6b5Npvg1gVU5w5qbQWT4iuivvvtJZQpqs17cBs",
     // Community relay 1 — placeholder, replace with real peer when available
     // "/dns4/relay2.egoblockchain.com/tcp/4001/p2p/12D3KooW...",
     // Community relay 2 — placeholder
