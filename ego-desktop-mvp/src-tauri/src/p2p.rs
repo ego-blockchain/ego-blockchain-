@@ -118,6 +118,18 @@ fn bft_threshold() -> usize {
 static PEER_RELAY_NODES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
     std::sync::OnceLock::new();
 
+/// Keys of DHT inbox messages already dispatched this session.
+/// Prevents re-notifying the user every 30 s when the same DHT record is polled.
+static DHT_SEEN_MSGS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn dht_seen() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+    DHT_SEEN_MSGS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap()
+}
+
 fn peer_relay_nodes() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
     PEER_RELAY_NODES
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
@@ -579,18 +591,34 @@ pub async fn broadcast_tx(tx: LedgerTx, block: LedgerBlock) {
     // Register ourselves as a known validator
     register_known_validator(&my_addr);
 
-    // ── Direct P2P to approved contacts (fast path for known peers) ───────────
+    // ── Direct P2P to ALL known peers (contacts + peer cache) ────────────────
+    // Gossipsub needs the mesh to be formed first (heartbeat latency).
+    // Direct request-response is immediate and works even before the mesh
+    // is fully established. We deduplicate by endpoint so we don't double-send.
+    let mut seen_eps: std::collections::HashSet<String> = Default::default();
+    let mut endpoints: Vec<String> = Vec::new();
+
     let contacts = load_contacts();
-    for contact in contacts.iter().filter(|c| c.status == "approved" && !c.endpoint.is_empty()) {
-        let endpoint  = contact.endpoint.clone();
-        let all_eps   = contact.all_endpoints.clone();
+    for c in contacts.iter().filter(|c| c.status == "approved" && !c.endpoint.is_empty()) {
+        if seen_eps.insert(c.endpoint.clone()) {
+            endpoints.push(c.endpoint.clone());
+        }
+        for ep in &c.all_endpoints {
+            if seen_eps.insert(ep.clone()) { endpoints.push(ep.clone()); }
+        }
+    }
+    for p in load_peer_cache().iter().filter(|p| !p.endpoint.is_empty()) {
+        if seen_eps.insert(p.endpoint.clone()) {
+            endpoints.push(p.endpoint.clone());
+        }
+    }
+
+    for endpoint in endpoints {
         let msg_clone = msg.clone();
         tokio::spawn(async move {
-            let mut eps = if all_eps.is_empty() { vec![endpoint.clone()] } else { all_eps };
-            if !eps.contains(&endpoint) { eps.push(endpoint.clone()); }
-            if let Err(e) = send_message_any(&eps, &msg_clone).await {
+            if let Err(e) = send_message(&endpoint, &msg_clone).await {
                 if !e.contains("none of the requested protocols") {
-                    eprintln!("[P2P] broadcast_tx to {}: {}", endpoint, e);
+                    eprintln!("[P2P] broadcast_tx direct to {}: {}", endpoint, e);
                 }
             }
         });
@@ -1678,10 +1706,16 @@ async fn handle_event(
                         }
                     } else if key_str.starts_with("ego-inbox:") {
                         // Actual message payload — dispatch to handle_incoming.
-                        if let Ok(msg) = serde_json::from_slice::<P2PMessage>(&rec.record.value) {
-                            let app2 = app.clone();
-                            tokio::spawn(async move { handle_incoming(msg, &app2).await; });
-                            eprintln!("[DHT] Dispatched inbox message from DHT");
+                        // Deduplicate: same DHT record is polled every 30 s; only
+                        // dispatch each unique key once per session.
+                        if dht_seen().insert(key_str.clone()) {
+                            if let Ok(msg) = serde_json::from_slice::<P2PMessage>(&rec.record.value) {
+                                let app2 = app.clone();
+                                tokio::spawn(async move { handle_incoming(msg, &app2).await; });
+                                eprintln!("[DHT] Dispatched inbox message from DHT: {}", &key_str[..key_str.len().min(50)]);
+                            }
+                        } else {
+                            eprintln!("[DHT] Skipping already-seen inbox message: {}", &key_str[..key_str.len().min(50)]);
                         }
                     } else {
                         // Peer discovery record: { address, endpoint, name, ts }
