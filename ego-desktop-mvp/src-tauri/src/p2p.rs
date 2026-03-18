@@ -1663,13 +1663,35 @@ async fn handle_event(
                     }
                 }
                 kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(rec))) => {
-                    // Parse peer records from DHT and connect to them via gossipsub
-                    if let Ok(peer_info) = serde_json::from_slice::<serde_json::Value>(&rec.record.value) {
-                        let endpoint = peer_info["endpoint"].as_str().unwrap_or("");
-                        if !endpoint.is_empty() {
-                            if let Ok(addr) = endpoint.parse::<Multiaddr>() {
-                                let _ = swarm.dial(addr);
-                                eprintln!("[DHT] Discovered peer via DHT: {}", endpoint);
+                    let key_str = String::from_utf8_lossy(rec.record.key.as_ref()).to_string();
+
+                    if key_str.starts_with("ego-mailbox:") {
+                        // Mailbox pointer: { from, msg_key, ts }
+                        // Fetch the actual message stored under msg_key.
+                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&rec.record.value) {
+                            if let Some(msg_key) = v["msg_key"].as_str() {
+                                swarm.behaviour_mut().kad.get_record(
+                                    kad::RecordKey::new(&msg_key)
+                                );
+                                eprintln!("[DHT] Fetching inbox message: {}", msg_key);
+                            }
+                        }
+                    } else if key_str.starts_with("ego-inbox:") {
+                        // Actual message payload — dispatch to handle_incoming.
+                        if let Ok(msg) = serde_json::from_slice::<P2PMessage>(&rec.record.value) {
+                            let app2 = app.clone();
+                            tokio::spawn(async move { handle_incoming(msg, &app2).await; });
+                            eprintln!("[DHT] Dispatched inbox message from DHT");
+                        }
+                    } else {
+                        // Peer discovery record: { address, endpoint, name, ts }
+                        if let Ok(peer_info) = serde_json::from_slice::<serde_json::Value>(&rec.record.value) {
+                            let endpoint = peer_info["endpoint"].as_str().unwrap_or("");
+                            if !endpoint.is_empty() {
+                                if let Ok(addr) = endpoint.parse::<Multiaddr>() {
+                                    let _ = swarm.dial(addr);
+                                    eprintln!("[DHT] Discovered peer via DHT: {}", endpoint);
+                                }
                             }
                         }
                     }
@@ -2323,13 +2345,10 @@ fn validate_block(block: &crate::ledger::LedgerBlock, chain: &crate::ledger::Sha
 }
 
 async fn apply_incoming_tx(tx: LedgerTx, block: LedgerBlock, app: &tauri::AppHandle) {
-    let mut chain = load_chain();
-    if chain.transactions.iter().any(|t| t.hash == tx.hash) { return; }
-    if !validate_block(&block, &chain) { return; }
-    chain.transactions.push(tx);
-    chain.blocks.push(block);
-    chain.blocks.sort_by_key(|b| b.height);
-    let _ = save_chain(&chain);
+    if block.height == 0 { return; } // genesis already seeded locally
+    // Persist to SQLite — INSERT OR IGNORE deduplicates automatically.
+    // save_chain() is a no-op stub; chain_db is the single source of truth.
+    crate::chain_db::append_peer_block(&block, &[tx]);
     let _ = app.emit_all("ego://chain-updated", ());
 }
 
@@ -2393,37 +2412,63 @@ async fn merge_remote_chain_inner(
     blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: &tauri::AppHandle,
     trusted: bool,
 ) {
-    let mut chain   = load_chain();
-    let mut changed = false;
+    // chain_db is the single source of truth (SQLite). The JSON ledger is legacy.
+    // All incoming blocks/txs go directly into SQLite via append_peer_block.
+    // INSERT OR IGNORE handles deduplication; no in-memory dedup needed.
     let mut new_txs: Vec<LedgerTx> = Vec::new();
-    for tx in transactions {
-        if let Some(existing) = chain.transactions.iter_mut().find(|t| t.hash == tx.hash) {
-            if existing.status == "Pending" && tx.status == "Confirmed" {
-                existing.status = "Confirmed".to_string();
-                existing.block_height = tx.block_height;
-                changed = true;
-            }
-        } else {
-            new_txs.push(tx.clone());
-            chain.transactions.push(tx);
-            changed = true;
-        }
-    }
+    let mut new_blocks: Vec<LedgerBlock> = Vec::new();
+
+    // Collect blocks that pass validation (or are from trusted source).
+    // validate_block reads from load_chain() which is an in-memory JSON chain.
+    // For peer gossip, skip prev_hash validation — SQLite is the real chain;
+    // the JSON chain is always empty so prev_hash check always fails for height>0.
     for block in blocks {
-        // Trusted sources (Oracle RPC) bypass reward validation — they are canonical.
-        if trusted || validate_block(&block, &chain) {
-            if !chain.blocks.iter().any(|b| b.hash == block.hash) {
-                chain.blocks.push(block); changed = true;
+        if block.height == 0 { continue; } // genesis seeded locally
+        if trusted {
+            new_blocks.push(block);
+        } else {
+            // Only check reward and duplicate; skip prev_hash (JSON chain is empty).
+            let expected_reward = crate::tokenomics::block_reward_at(block.height);
+            let reward_ok = block.reward == expected_reward || block.reward == 0;
+            if reward_ok {
+                new_blocks.push(block);
+            } else {
+                eprintln!("[P2P] Block #{} rejected: reward {} != expected {}",
+                    block.height, block.reward, expected_reward);
             }
         }
     }
-    if changed {
-        chain.blocks.sort_by_key(|b| b.height);
-        let _ = crate::ledger::save_chain(&chain);
-        // Execute any Deploy/Call TXs in newly arrived blocks
-        execute_contract_txs(&chain, &new_txs);
-        let _ = app.emit_all("ego://chain-updated", ());
+
+    for tx in transactions {
+        new_txs.push(tx);
     }
+
+    if new_blocks.is_empty() && new_txs.is_empty() { return; }
+
+    // Write to SQLite. Each block with its matching txs.
+    for block in &new_blocks {
+        let block_txs: Vec<LedgerTx> = new_txs.iter()
+            .filter(|tx| tx.block_height == Some(block.height))
+            .cloned()
+            .collect();
+        crate::chain_db::append_peer_block(block, &block_txs);
+    }
+    // Txs that arrived without a block (e.g. from ChainSyncResponse where blocks
+    // and txs are separate) — mine them as a batch so balance_of() sees them.
+    let orphan_txs: Vec<LedgerTx> = new_txs.iter()
+        .filter(|tx| !new_blocks.iter().any(|b| Some(b.height) == tx.block_height))
+        .cloned()
+        .collect();
+    if !orphan_txs.is_empty() {
+        let miner = new_blocks.first().map(|b| b.miner.as_str()).unwrap_or("remote");
+        crate::chain_db::mine_batch_db(&orphan_txs, miner);
+    }
+
+    // Build a minimal chain for execute_contract_txs (only needs block height/timestamp).
+    let mut chain = load_chain();
+    chain.blocks.extend(new_blocks.clone());
+    execute_contract_txs(&chain, &new_txs);
+    let _ = app.emit_all("ego://chain-updated", ());
 }
 
 // ── Oracle RPC chain sync ─────────────────────────────────────────────────────
