@@ -167,7 +167,7 @@ const CoveragePage: React.FC = () => {
     ? extractPeerId(p2pStatus.public_endpoint)
     : '';
 
-  // Only show peers that have location data (city or country)
+  // Only show peers that have shared their location
   const visiblePeers = peers.filter(p => p.city || p.country);
 
   const nowTs      = Math.floor(Date.now() / 1000);
@@ -370,7 +370,7 @@ const CoveragePage: React.FC = () => {
               </div>
             </div>
           )}
-          {/* Other nodes — only shown if they have location data */}
+          {/* Other nodes — only shown if they shared location data */}
           {visiblePeers.length === 0 && !myPeerId ? (
             <div className="px-5 py-6 text-center text-gray-500 text-sm">
               No other nodes detected.
@@ -378,7 +378,7 @@ const CoveragePage: React.FC = () => {
             </div>
           ) : visiblePeers.map(p => {
             const peerId   = extractPeerId(p.endpoint);
-            const location = [p.city, p.country].filter(Boolean).join(', ');
+            const location = [p.city, p.country].filter(Boolean).join(', ') || p.name || '—';
             return (
               <div key={p.address} className="flex items-center gap-4 px-5 py-3">
                 <div className="w-2 h-2 rounded-full bg-green-400 shrink-0" />

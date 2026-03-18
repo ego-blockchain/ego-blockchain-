@@ -393,6 +393,8 @@ pub async fn approve_contact_request(
                 name:      my_name_str,
                 endpoint:  my_endpoint.clone(),
                 endpoints: vec![my_endpoint.clone()],
+                city:      None,
+                country:   None,
             };
             if let Err(e) = p2p::send_message(&resolved_peer_ep, &announce).await {
                 eprintln!("[P2P] Could not send PeerAnnounce after approval: {}", e);

@@ -115,7 +115,10 @@ const WalletSwitcher: React.FC = () => {
           {displayName.charAt(0).toUpperCase()}
         </div>
         <div className="min-w-0 flex-1">
-          <div className="text-xs font-semibold text-white leading-tight truncate">{displayName}</div>
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs font-semibold text-white leading-tight truncate">{displayName}</span>
+            <span className="text-yellow-400 text-[9px] font-bold bg-yellow-400/15 px-1 py-px rounded shrink-0">TEST</span>
+          </div>
           <div className="text-xs text-gray-500 font-mono leading-tight">{truncAddr(displayAddr)}</div>
         </div>
         <span className="text-gray-500 text-xs">{open ? '▲' : '▼'}</span>
@@ -177,7 +180,10 @@ const WalletSwitcher: React.FC = () => {
                       {w.name.charAt(0).toUpperCase()}
                     </div>
                     <div className="min-w-0 flex-1">
-                      <div className={`text-xs font-medium leading-tight truncate ${isActive ? 'text-blue-300' : 'text-gray-200'}`}>{w.name}</div>
+                      <div className="flex items-center gap-1.5">
+                        <span className={`text-xs font-medium leading-tight truncate ${isActive ? 'text-blue-300' : 'text-gray-200'}`}>{w.name}</span>
+                        <span className="text-yellow-400 text-[9px] font-bold bg-yellow-400/15 px-1 py-px rounded shrink-0">TEST</span>
+                      </div>
                       <div className="text-xs text-gray-500 font-mono leading-tight">{truncAddr(w.address)}</div>
                     </div>
                     {isActive && <span className="text-blue-400 text-xs shrink-0">✓</span>}
