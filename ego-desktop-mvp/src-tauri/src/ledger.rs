@@ -140,6 +140,9 @@ pub struct LedgerTx {
     /// TX type: "transfer" | "deploy" | "call"
     #[serde(default = "default_tx_type")]
     pub tx_type: String,
+    /// Fee paid in uEGOC. 100% burned (removed from supply permanently).
+    #[serde(default)]
+    pub fee_uegoc: u64,
     /// For deploy TXs: hex-encoded WASM bytecode
     #[serde(default)]
     pub wasm_code: String,
@@ -238,6 +241,18 @@ pub struct Ledger {
     /// Registered email (set during onboarding, used for TX confirmations).
     #[serde(default)]
     pub registered_email: String,
+    /// Total uEGOC burned as tx fees by this wallet (lifetime).
+    #[serde(default)]
+    pub total_burned_uegoc: u64,
+    /// Validator slash strike count (0 = clean). Resets after 30 clean days.
+    #[serde(default)]
+    pub slash_strikes: u32,
+    /// Unix timestamp of last slash event (for 30-day reset window).
+    #[serde(default)]
+    pub last_slash_ts: Option<i64>,
+    /// Whether this validator has been permanently banned via slashing.
+    #[serde(default)]
+    pub slash_banned: bool,
 }
 
 impl Ledger {
@@ -269,13 +284,17 @@ impl Ledger {
         let block_data = format!("{prev_hash}{tx_hash}{height}{timestamp}");
         let hash = ego_core::hash_data(block_data.as_bytes()).to_hex();
 
+        // Burn any fees from transactions being confirmed in this block
         for tx in self.transactions.iter_mut() {
             if tx.hash == tx_hash && tx.status == "Pending" {
                 tx.status = "Confirmed".to_string();
                 tx.block_height = Some(height);
+                // Accumulate burned fees (100% of tx fee is destroyed)
+                self.total_burned_uegoc = self.total_burned_uegoc.saturating_add(tx.fee_uegoc);
             }
         }
 
+        let reward = crate::tokenomics::block_reward_at(height);
         self.blocks.push(LedgerBlock {
             height,
             hash,
@@ -284,7 +303,7 @@ impl Ledger {
             miner: miner.to_string(),
             tx_count: 1,
             size_bytes: 512,
-            reward: 50_000_000,
+            reward,
             coinbase_tx: None,
         });
     }
