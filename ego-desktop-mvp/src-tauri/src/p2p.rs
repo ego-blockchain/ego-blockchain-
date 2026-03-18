@@ -155,12 +155,14 @@ pub enum P2PMessage {
         from_endpoint:   String,
     },
     ContactResponse {
-        from_addr:    String,
-        from_name:    String,
-        from_ed25519: String,
-        from_kyber:   String,
-        approved:     bool,
-        shared_key:   String,
+        from_addr:     String,
+        from_name:     String,
+        from_ed25519:  String,
+        from_kyber:    String,
+        approved:      bool,
+        shared_key:    String,
+        #[serde(default)]
+        from_endpoint: String,
     },
     PeerAnnounce {
         address:   String,
@@ -1035,6 +1037,13 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     kad_discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     kad_discovery.tick().await;
 
+    // Periodic DHT inbox poll (every 30 s) so offline-deposited ContactResponses
+    // and chat messages are delivered even when the relay circuit was ready before
+    // the sender deposited their message.
+    let mut dht_inbox_poll = tokio::time::interval(Duration::from_secs(30));
+    dht_inbox_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    dht_inbox_poll.tick().await; // skip first immediate tick
+
     loop {
         tokio::select! {
             // ── Gossip publish (from broadcast_tx / publish_gossip) ───────────
@@ -1124,6 +1133,17 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                 let _ = swarm.behaviour_mut().kad.bootstrap();
                 // Also query rendezvous key to pick up any new peers
                 swarm.behaviour_mut().kad.get_record(kad::RecordKey::new(&"ego-peers-v1"));
+            }
+
+            // ── Periodic DHT inbox poll (ContactResponse + offline messages) ──
+            _ = dht_inbox_poll.tick() => {
+                let addr = crate::ledger::Ledger::load().address;
+                if !addr.is_empty() && RELAY_CIRCUIT_READY.load(Ordering::Relaxed) {
+                    if let Some(tx) = DHT_CMD_TX.get() {
+                        let mailbox_key = format!("ego-mailbox:{}", addr);
+                        let _ = tx.send(DhtCommand::GetPeers { key: mailbox_key });
+                    }
+                }
             }
         }
     }
@@ -1847,27 +1867,34 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
         }
 
         P2PMessage::ContactResponse {
-            from_addr, from_name, from_ed25519, from_kyber, approved, shared_key,
+            from_addr, from_name, from_ed25519, from_kyber, approved, shared_key, from_endpoint,
         } => {
             let mut contacts = load_contacts();
             if approved {
                 if let Some(p) = contacts.iter_mut()
-                    .find(|c| c.status == "pending_out" && c.shared_key_hex == shared_key)
+                    .find(|c| c.shared_key_hex == shared_key
+                           && (c.status == "pending_out" || c.status == "approved"))
                 {
+                    let already_approved = p.status == "approved";
                     p.address        = from_addr.clone();
                     p.name           = from_name.clone();
                     p.ed25519_pubkey = from_ed25519;
                     p.kyber_pubkey   = from_kyber;
                     p.status         = "approved".to_string();
+                    if !from_endpoint.is_empty() {
+                        p.endpoint = from_endpoint;
+                    }
                     let contact = p.clone();
                     let _ = save_contacts(&contacts);
-                    let _ = tauri::api::notification::Notification::new(
-                        &app.config().tauri.bundle.identifier,
-                    )
-                    .title("Contact Request Accepted!")
-                    .body(&format!("{} accepted your request", from_name))
-                    .show();
-                    let _ = app.emit_all("ego://contact-approved", &contact);
+                    if !already_approved {
+                        let _ = tauri::api::notification::Notification::new(
+                            &app.config().tauri.bundle.identifier,
+                        )
+                        .title("Contact Request Accepted!")
+                        .body(&format!("{} accepted your request", from_name))
+                        .show();
+                        let _ = app.emit_all("ego://contact-approved", &contact);
+                    }
                 }
             } else {
                 contacts.retain(|c| !(c.status == "pending_out" && c.shared_key_hex == shared_key));
@@ -1928,7 +1955,11 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
         }
 P2PMessage::ChatMessage { bundle } => {
     match crate::commands::messenger::receive_message_inner(&bundle) {
-        Ok(msg) => {
+        Ok((msg, is_new)) => {
+            if !is_new {
+                // Duplicate delivery (DHT re-poll or multi-path) — skip notification
+                return;
+            }
             if msg.message_type == "file_bundle" {
                 use base64::Engine as _;
                 let parts: Vec<&str> = msg.content.splitn(5, ':').collect();

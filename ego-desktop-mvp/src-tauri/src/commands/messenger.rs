@@ -157,7 +157,8 @@ async fn resolve_endpoint(contact_addr: &str, stored_endpoint: &str) -> String {
 
 // ── Core receive logic ────────────────────────────────────────────────────────
 
-pub(crate) fn receive_message_inner(bundle: &str) -> Result<Message, String> {
+/// Returns `(message, is_new)` — `is_new` is false if this message was already stored (duplicate).
+pub(crate) fn receive_message_inner(bundle: &str) -> Result<(Message, bool), String> {
     let (from, to, ts, mtype, nonce_hex, ct_hex) = parse_msg_bundle(bundle)
         .ok_or_else(|| "Invalid message bundle — must start with egomsg1:".to_string())?;
 
@@ -201,11 +202,12 @@ pub(crate) fn receive_message_inner(bundle: &str) -> Result<Message, String> {
     };
 
     let mut msgs = load_messages();
-    if !msgs.iter().any(|m| m.id == msg.id) {
+    let is_new = !msgs.iter().any(|m| m.id == msg.id);
+    if is_new {
         msgs.push(msg.clone());
         save_messages(&msgs).map_err(|e| e.to_string())?;
     }
-    Ok(msg)
+    Ok((msg, is_new))
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -367,20 +369,21 @@ pub async fn approve_contact_request(
     if !peer_endpoint.is_empty() {
         let resolved_peer_ep = resolve_endpoint(&contact_addr, &peer_endpoint).await;
 
+        let my_endpoint = p2p::get_public_endpoint().await;
         let response = p2p::P2PMessage::ContactResponse {
-            from_addr:    my_addr.clone(),
-            from_name:    my_name.trim().to_string(),
-            from_ed25519: ed25519_hex,
-            from_kyber:   kyber_hex,
-            approved:     true,
-            shared_key:   shared_key_hex,
+            from_addr:     my_addr.clone(),
+            from_name:     my_name.trim().to_string(),
+            from_ed25519:  ed25519_hex,
+            from_kyber:    kyber_hex,
+            approved:      true,
+            shared_key:    shared_key_hex,
+            from_endpoint: my_endpoint.clone(),
         };
         if let Err(e) = p2p::send_message(&resolved_peer_ep, &response).await {
             eprintln!("[P2P] Could not notify requester of approval: {}", e);
             deposit_in_relay_inbox(&contact_addr, &my_addr, &response).await;
         }
 
-        let my_endpoint = p2p::get_public_endpoint().await;
         if !my_endpoint.is_empty() {
             let registry  = crate::ledger::load_registry();
             let active_id = crate::ledger::get_active_wallet_id();
@@ -432,12 +435,13 @@ pub async fn decline_contact_request(
 
     if !peer_endpoint.is_empty() {
         let response = p2p::P2PMessage::ContactResponse {
-            from_addr:    my_addr,
-            from_name:    my_name.trim().to_string(),
-            from_ed25519: ed25519_hex,
-            from_kyber:   kyber_hex,
-            approved:     false,
-            shared_key:   shared_key_hex,
+            from_addr:     my_addr,
+            from_name:     my_name.trim().to_string(),
+            from_ed25519:  ed25519_hex,
+            from_kyber:    kyber_hex,
+            approved:      false,
+            shared_key:    shared_key_hex,
+            from_endpoint: String::new(),
         };
         if let Err(e) = p2p::send_message(&peer_endpoint, &response).await {
             eprintln!("[P2P] Could not send decline notice: {}", e);
@@ -529,7 +533,9 @@ pub async fn receive_message(
     _state: State<'_, AppState>,
     bundle: String,
 ) -> Result<Message, EgoDesktopError> {
-    receive_message_inner(&bundle).map_err(EgoDesktopError::InvalidInput)
+    receive_message_inner(&bundle)
+        .map(|(msg, _)| msg)
+        .map_err(EgoDesktopError::InvalidInput)
 }
 
 #[tauri::command]
