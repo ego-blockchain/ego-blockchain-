@@ -167,11 +167,6 @@ const MessengerPage: React.FC = () => {
     return [];
   });
   const [aiThinking, setAiThinking]       = useState(false);
-  const [aiKeySet, setAiKeySet]           = useState(false);
-  const [showAiKeyModal, setShowAiKeyModal] = useState(false);
-  const [aiKeyInput, setAiKeyInput]       = useState('');
-  const [savingKey, setSavingKey]         = useState(false);
-  const [aiKeyError, setAiKeyError]       = useState('');
 
   // "Share My Card" modal
   const [showMyCard, setShowMyCard]         = useState(false);
@@ -253,7 +248,6 @@ const MessengerPage: React.FC = () => {
 
   useEffect(() => {
     invoke<P2pStatus>('get_p2p_status').then(setP2pStatus).catch(() => {});
-    invoke<boolean>('get_ai_key_status').then(setAiKeySet).catch(() => {});
     const unlistenP2p = listen('ego://p2p-status-changed', () => {
       invoke<P2pStatus>('get_p2p_status').then(setP2pStatus).catch(() => {});
     });
@@ -430,7 +424,6 @@ useEffect(() => {
   async function handleAiSend() {
     const text = msgInput.trim();
     if (!text) return;
-    if (!aiKeySet) { setShowAiKeyModal(true); return; }
     setMsgInput('');
     const userMsg: AiMsg = { role: 'user', content: text, ts: Date.now() / 1000 };
     setAiMessages(prev => [...prev, userMsg]);
@@ -440,32 +433,11 @@ useEffect(() => {
       const reply = await invoke<string>('ask_ego_ai', { question: text, history });
       setAiMessages(prev => [...prev, { role: 'assistant', content: reply, ts: Date.now() / 1000 }]);
     } catch (e: any) {
-      const err = String(e);
-      if (err === 'NO_API_KEY') {
-        setAiMessages(prev => prev.slice(0, -1));
-        setMsgInput(text);
-        setShowAiKeyModal(true);
-      } else {
-        setAiMessages(prev => [...prev, { role: 'assistant', content: `⚠️ ${err}`, ts: Date.now() / 1000 }]);
+      {
+        setAiMessages(prev => [...prev, { role: 'assistant', content: `⚠️ ${String(e)}`, ts: Date.now() / 1000 }]);
       }
     } finally {
       setAiThinking(false);
-    }
-  }
-
-  async function handleSaveAiKey() {
-    if (!aiKeyInput.trim()) return;
-    setSavingKey(true);
-    setAiKeyError('');
-    try {
-      await invoke('save_ai_key', { key: aiKeyInput.trim() });
-      setAiKeySet(true);
-      setShowAiKeyModal(false);
-      setAiKeyInput('');
-    } catch (e: any) {
-      setAiKeyError(String(e));
-    } finally {
-      setSavingKey(false);
     }
   }
 
@@ -1036,13 +1008,6 @@ useEffect(() => {
 
             {/* Input area */}
             <div className="px-5 py-4 border-t border-gray-700 shrink-0 space-y-2">
-              {/* API key prompt only shown if no built-in key is available */}
-              {selected.address === EGO_AI_ADDRESS && !aiKeySet && (
-                <div className="text-xs text-yellow-400/80 bg-yellow-500/10 rounded-xl px-3 py-2 flex items-center gap-2">
-                  <span>⚠️</span>
-                  <span>Ego AI is not configured. Contact support.</span>
-                </div>
-              )}
               <div className="flex gap-2">
                 <input
                   value={msgInput}
@@ -1106,49 +1071,6 @@ useEffect(() => {
       </div>
 
       </div>{/* end flex-1 row */}
-
-      {/* ── Ego AI service key modal (internal/admin use only) ── */}
-      {showAiKeyModal && (
-        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
-          <div className="bg-gray-800 rounded-2xl w-full max-w-md shadow-2xl">
-            <div className="px-6 py-4 border-b border-gray-700 flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <span className="text-xl">🤖</span>
-                <h3 className="font-bold">Ego AI — Configuration</h3>
-              </div>
-              <button onClick={() => setShowAiKeyModal(false)} className="text-gray-400 hover:text-white text-xl leading-none">✕</button>
-            </div>
-            <div className="p-6 space-y-4">
-              <p className="text-sm text-gray-400 leading-relaxed">
-                Enter your Ego AI service key to activate the assistant.
-                The key is stored locally on this device.
-              </p>
-              <div>
-                <label className="text-xs text-gray-400 mb-1.5 block">Service Key</label>
-                <input
-                  type="password"
-                  value={aiKeyInput}
-                  onChange={e => setAiKeyInput(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter') handleSaveAiKey(); }}
-                  placeholder="ego-ai-…"
-                  autoFocus
-                  className="w-full bg-gray-700 border border-gray-600 rounded-xl px-4 py-2.5 text-sm font-mono focus:outline-none focus:border-yellow-400"
-                />
-              </div>
-              {aiKeyError && (
-                <div className="text-xs text-red-400 bg-red-500/10 rounded-lg px-3 py-2">{aiKeyError}</div>
-              )}
-              <button
-                onClick={handleSaveAiKey}
-                disabled={!aiKeyInput.trim() || savingKey}
-                className="w-full bg-yellow-500 hover:bg-yellow-400 disabled:opacity-50 text-black py-2.5 rounded-xl text-sm font-semibold transition-colors"
-              >
-                {savingKey ? 'Saving…' : 'Save & Start Chatting'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* ── Share My Card modal ── */}
       {showMyCard && (
