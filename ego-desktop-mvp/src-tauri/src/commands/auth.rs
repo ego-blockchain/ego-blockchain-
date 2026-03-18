@@ -567,6 +567,32 @@ pub async fn rename_wallet(
 // ── generate_keypair (legacy) ─────────────────────────────────────────────────
 
 #[tauri::command]
+/// Credit 1,000 EGOC testnet faucet to a new address if it has no balance yet.
+fn credit_testnet_faucet(address: &str) {
+    const FAUCET_AMOUNT: u64 = 1_000 * 1_000_000; // 1,000 EGOC in uEGOC
+    const FAUCET_ADDR:   &str = "egot1faucet000000000000000000000000000000000";
+
+    let mut chain = load_chain();
+    if chain.balance_of(address) > 0 { return; } // already funded
+
+    let ts   = chrono::Utc::now().timestamp();
+    let hash = format!("0xfaucet{:x}", ts as u64 ^ address.len() as u64);
+
+    chain.transactions.push(LedgerTx {
+        hash:      hash.clone(),
+        from:      FAUCET_ADDR.into(),
+        to:        address.into(),
+        amount:    FAUCET_AMOUNT,
+        memo:      Some("Testnet faucet — 1,000 EGOC".into()),
+        timestamp: ts,
+        status:    "Confirmed".into(),
+        block_height: Some(chain.blocks.len() as u64 + 1),
+        ..LedgerTx::default()
+    });
+    chain.mine_block(&hash, FAUCET_ADDR);
+    let _ = save_chain(&chain);
+}
+
 pub async fn generate_keypair(state: State<'_, AppState>) -> Result<KeypairInfo, EgoDesktopError> {
     let keypair  = KeyPair::generate();
     let address  = keypair
@@ -579,6 +605,8 @@ pub async fn generate_keypair(state: State<'_, AppState>) -> Result<KeypairInfo,
     let dilithium_pk = hex::encode(keypair.dilithium_public_key().as_bytes());
     let kyber_pk     = hex::encode(keypair.kyber_public_key().as_bytes());
     let qr_code      = generate_address_qr(&address)?;
+
+    credit_testnet_faucet(&address);
 
     state
         .initialize_wallet(keypair)
@@ -610,6 +638,8 @@ pub async fn import_keypair(
     let dilithium_pk = hex::encode(keypair.dilithium_public_key().as_bytes());
     let kyber_pk     = hex::encode(keypair.kyber_public_key().as_bytes());
     let qr_code      = generate_address_qr(&address)?;
+
+    credit_testnet_faucet(&address);
 
     state
         .initialize_wallet(keypair)

@@ -2355,12 +2355,24 @@ fn execute_contract_txs(chain: &crate::ledger::SharedChain, txs: &[crate::ledger
 async fn merge_remote_chain(
     blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: &tauri::AppHandle,
 ) {
+    merge_remote_chain_inner(blocks, transactions, app, false).await;
+}
+
+async fn merge_remote_chain_trusted(
+    blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: &tauri::AppHandle,
+) {
+    merge_remote_chain_inner(blocks, transactions, app, true).await;
+}
+
+async fn merge_remote_chain_inner(
+    blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: &tauri::AppHandle,
+    trusted: bool,
+) {
     let mut chain   = load_chain();
     let mut changed = false;
     let mut new_txs: Vec<LedgerTx> = Vec::new();
     for tx in transactions {
         if let Some(existing) = chain.transactions.iter_mut().find(|t| t.hash == tx.hash) {
-            // Upgrade a locally-pending tx to confirmed if the relay has confirmed it.
             if existing.status == "Pending" && tx.status == "Confirmed" {
                 existing.status = "Confirmed".to_string();
                 existing.block_height = tx.block_height;
@@ -2373,8 +2385,11 @@ async fn merge_remote_chain(
         }
     }
     for block in blocks {
-        if validate_block(&block, &chain) {
-            chain.blocks.push(block); changed = true;
+        // Trusted sources (Oracle RPC) bypass reward validation — they are canonical.
+        if trusted || validate_block(&block, &chain) {
+            if !chain.blocks.iter().any(|b| b.hash == block.hash) {
+                chain.blocks.push(block); changed = true;
+            }
         }
     }
     if changed {
@@ -2441,8 +2456,8 @@ pub async fn fetch_chain_from_oracle(app: &tauri::AppHandle) {
         return;
     }
 
-    merge_remote_chain(blocks, transactions, app).await;
-    eprintln!("[Oracle] Chain merged from Oracle RPC");
+    merge_remote_chain_trusted(blocks, transactions, app).await;
+    eprintln!("[Oracle] Chain merged from Oracle RPC (trusted)");
 }
 
 // ── BFT voting round ─────────────────────────────────────────────────────────
