@@ -232,6 +232,12 @@ pub struct Ledger {
     pub stake_lock_days: u32,
     #[serde(default)]
     pub unstake_at: Option<i64>,
+    /// Registered user name (set during onboarding).
+    #[serde(default)]
+    pub registered_name: String,
+    /// Registered email (set during onboarding, used for TX confirmations).
+    #[serde(default)]
+    pub registered_email: String,
 }
 
 impl Ledger {

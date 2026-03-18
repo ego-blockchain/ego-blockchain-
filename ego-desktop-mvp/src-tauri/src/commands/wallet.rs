@@ -136,6 +136,23 @@ pub async fn send_transaction(
     ledger.nonce = nonce;
     let _ = ledger.save();
 
+    // ── 5. Send email confirmation (fire-and-forget) ─────────────────────
+    {
+        let to_email = ledger.registered_email.clone();
+        let amount_egoc = format!("{:.6} EGOC", request.amount as f64 / 1_000_000.0);
+        let recipient = request.to_address.clone();
+        let hash_copy = tx_hash.clone();
+        if !to_email.is_empty() {
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = crate::email::send_tx_confirmation(
+                    &to_email, &amount_egoc, &recipient, &hash_copy,
+                ).await {
+                    eprintln!("[Email] TX confirmation failed: {e}");
+                }
+            });
+        }
+    }
+
     Ok(TransactionResponse {
         hash:         tx_hash,
         success:      true,
@@ -296,6 +313,35 @@ pub async fn get_transaction_history(
 
     txs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     Ok(txs)
+}
+
+// ── fetch_swap_rates ──────────────────────────────────────────────────────────
+
+/// Fetch live USD prices for swap assets from CoinGecko (no API key needed).
+#[tauri::command]
+pub async fn fetch_swap_rates() -> Result<std::collections::HashMap<String, f64>, EgoDesktopError> {
+    let url = "https://api.coingecko.com/api/v3/simple/price\
+        ?ids=bitcoin,ethereum,binancecoin,cardano,solana,ripple,tron,polkadot,chainlink,shiba-inu,tether,usd-coin\
+        &vs_currencies=usd";
+    let json: serde_json::Value = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default()
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+
+    let mut rates = std::collections::HashMap::new();
+    for (id, data) in json.as_object().into_iter().flatten() {
+        if let Some(price) = data["usd"].as_f64() {
+            rates.insert(id.clone(), price);
+        }
+    }
+    Ok(rates)
 }
 
 // ── query_remote_node ─────────────────────────────────────────────────────────

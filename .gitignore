@@ -67,3 +67,4 @@ dex/node_modules/
 governance/node_modules/
 services/oracle/target/
 services/bridge-relayer/target/
+ego-desktop-mvp/src-tauri/.cargo/config.toml

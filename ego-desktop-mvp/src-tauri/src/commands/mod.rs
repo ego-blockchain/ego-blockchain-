@@ -12,3 +12,4 @@ pub mod messenger;
 pub mod consensus;
 pub mod contracts;
 pub mod rollup;
+pub mod multichain;
