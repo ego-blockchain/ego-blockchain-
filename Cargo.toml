@@ -12,6 +12,7 @@ members = [
   "bins/urego",
   "crates/ego-zk",
   "bins/ego-cli",
+  "bins/ego-relay",
   "crates/ego-typed-signing",
 ]
 

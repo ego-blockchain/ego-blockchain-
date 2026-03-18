@@ -1,0 +1,15 @@
+[Unit]
+Description=Ego Relay — libp2p circuit relay + DHT bootstrap
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/ego-relay
+ExecStart=/usr/local/bin/ego-relay
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
