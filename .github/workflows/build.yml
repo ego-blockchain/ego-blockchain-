@@ -140,6 +140,19 @@ jobs:
         working-directory: ego-desktop-mvp
         run: npm install
 
+      - name: Fetch Rust deps + patch wry for webkit2gtk 0.18.2
+        working-directory: ego-desktop-mvp/src-tauri
+        run: |
+          cargo fetch
+          # wry 0.24.x calls webkit2gtk::Settings methods without importing
+          # SettingsExt, which moved those methods in webkit2gtk 0.18.2.
+          # Patch the extracted source in the registry cache directly.
+          WRY=$(find ~/.cargo/registry/src -path "*/wry-*/src/webview/webkitgtk/mod.rs" 2>/dev/null | head -1)
+          if [ -n "$WRY" ]; then
+            sed -i 's/use webkit2gtk::{/use webkit2gtk::{SettingsExt, /' "$WRY"
+            echo "Patched $WRY"
+          fi
+
       - name: Build (Linux)
         uses: tauri-apps/tauri-action@v0
         env:
