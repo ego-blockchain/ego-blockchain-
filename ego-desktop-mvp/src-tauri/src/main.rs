@@ -140,6 +140,8 @@ fn main() {
             commands::wallet::send_transaction,
             commands::wallet::prepare_transaction,
             commands::wallet::commit_transaction,
+            commands::wallet::request_tx_code,
+            commands::wallet::confirm_tx_code,
             commands::wallet::get_transaction_history,
             commands::storage::store_file,
             commands::storage::get_file_metadata,

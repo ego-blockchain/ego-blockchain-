@@ -262,11 +262,14 @@ const WalletPage: React.FC = () => {
   const [remoteLoading, setRemoteLoading]   = useState(false);
   const [remoteError, setRemoteError]       = useState('');
 
-  // Email confirmation
-  type EmailStep = 'idle' | 'waiting' | 'confirmed' | 'cancelled' | 'expired';
-  const [emailStep, setEmailStep]   = useState<EmailStep>('idle');
-  const [emailToken, setEmailToken] = useState('');
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Email 2FA confirmation
+  type EmailStep = 'idle' | 'code_entry' | 'confirmed' | 'expired';
+  const [emailStep, setEmailStep]     = useState<EmailStep>('idle');
+  const [txId, setTxId]               = useState('');
+  const [maskedEmail, setMaskedEmail] = useState('');
+  const [codeInput, setCodeInput]     = useState('');
+  const [codeError, setCodeError]     = useState('');
+  const [codeLoading, setCodeLoading] = useState(false);
 
   // ── Swap state ────────────────────────────────────────────────────────────
   const [showSwap, setShowSwap]       = useState(false);
@@ -340,69 +343,30 @@ const WalletPage: React.FC = () => {
     if (!sendForm.to || !sendForm.amount) return;
     setSending(true);
     try {
-      const amount = Math.floor(parseFloat(sendForm.amount) * 1_000_000);
+      const amount  = Math.floor(parseFloat(sendForm.amount) * 1_000_000);
       const request = { to_address: sendForm.to, amount, memo: sendForm.memo || null };
 
-      let hasEmail = false;
       try {
-        const r = await tauriFetch<{ registered: boolean; email_verified: boolean }>(
-          `${RELAY}/users/${myAddress}`,
-          { timeout: { secs: 5, nanos: 0 } }
+        // Try email 2FA first — request_tx_code fails if no email is on file
+        const res = await invoke<{ tx_id: string; masked_email: string }>(
+          'request_tx_code', { request }
         );
-        hasEmail = r.data.registered && r.data.email_verified;
-      } catch {
-        // Relay unreachable — skip email confirmation, send directly
-        hasEmail = false;
-      }
-
-      if (hasEmail) {
-        const prepared = await invoke<{
-          tx_json: string; block_json: string; tx_hash: string; amount: number; from: string; to: string;
-        }>('prepare_transaction', { request });
-
-        const res = await tauriFetch<{ success: boolean; message: string }>(
-          `${RELAY}/tx/pending`,
-          { method: 'POST', body: Body.json({
-            address:    prepared.from,
-            tx_json:    prepared.tx_json,
-            block_json: prepared.block_json,
-            tx_type:    'send',
-            amount:     prepared.amount,
-            to:         prepared.to,
-          })}
-        );
-        if (!res.data.success) throw new Error(res.data.message);
-        const token = res.data.message;
-        setEmailToken(token);
-        setEmailStep('waiting');
+        setTxId(res.tx_id);
+        setMaskedEmail(res.masked_email);
+        setCodeInput('');
+        setCodeError('');
+        setEmailStep('code_entry');
         setSending(false);
-
-        pollRef.current = setInterval(async () => {
-          try {
-            const s = await tauriFetch<{ status: string }>(`${RELAY}/tx/status/${token}`);
-            if (s.data.status === 'confirmed') {
-              clearInterval(pollRef.current!);
-              setEmailStep('confirmed');
-              const result = await invoke<TxResult>('commit_transaction', {
-                txJson: prepared.tx_json, blockJson: prepared.block_json,
-              });
-              setTxResult(result);
-              await load(); reloadWallet();
-            } else if (s.data.status === 'cancelled') {
-              clearInterval(pollRef.current!); setEmailStep('cancelled');
-            } else if (s.data.status === 'expired') {
-              clearInterval(pollRef.current!); setEmailStep('expired');
-            }
-          } catch {}
-        }, 3000);
-
-        setTimeout(() => {
-          if (pollRef.current) { clearInterval(pollRef.current); setEmailStep('expired'); }
-        }, 31 * 60 * 1000);
-      } else {
-        const res = await invoke<TxResult>('send_transaction', { request });
-        setTxResult(res);
-        await load(); reloadWallet();
+      } catch (e: any) {
+        const msg = String(e);
+        if (msg.includes('No email on file')) {
+          // No email configured — send directly without 2FA
+          const res = await invoke<TxResult>('send_transaction', { request });
+          setTxResult(res);
+          await load(); reloadWallet();
+        } else {
+          throw e;
+        }
       }
     } catch (e: any) {
       setTxResult({ hash: '', success: false, message: String(e) });
@@ -411,13 +375,34 @@ const WalletPage: React.FC = () => {
     }
   }
 
+  // ── Confirm code ───────────────────────────────────────────────────────────
+  async function handleConfirmCode() {
+    if (!codeInput.trim()) return;
+    setCodeLoading(true);
+    setCodeError('');
+    try {
+      const res = await invoke<TxResult>('confirm_tx_code', {
+        txId: txId, code: codeInput.trim(),
+      });
+      setEmailStep('confirmed');
+      setTxResult(res);
+      await load(); reloadWallet();
+    } catch (e: any) {
+      setCodeError(String(e).replace(/^.*Error:/, '').trim());
+    } finally {
+      setCodeLoading(false);
+    }
+  }
+
   function resetSend() {
-    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
     setShowSend(false);
     setSendForm({ to: '', amount: '', memo: '' });
     setTxResult(null);
     setEmailStep('idle');
-    setEmailToken('');
+    setTxId('');
+    setMaskedEmail('');
+    setCodeInput('');
+    setCodeError('');
   }
 
   async function copyAddr() {
@@ -1260,28 +1245,48 @@ const WalletPage: React.FC = () => {
       {showSend && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
           <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-md border border-gray-700 shadow-2xl">
-            {emailStep === 'waiting' ? (
-              <div className="text-center space-y-4">
-                <div className="text-5xl">📧</div>
-                <div className="text-xl font-bold">Check Your Email</div>
-                <p className="text-sm text-gray-400">
-                  A confirmation email was sent to your registered address.<br />
-                  Click <strong className="text-white">Confirm</strong> in the email to complete the transaction.
-                </p>
-                <div className="flex items-center justify-center gap-2 text-sm text-gray-400">
-                  <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
-                  Waiting for confirmation…
+            {emailStep === 'code_entry' ? (
+              <div className="space-y-5">
+                <div className="flex justify-between items-center">
+                  <h3 className="text-lg font-bold">Confirm Transaction</h3>
+                  <button onClick={resetSend} className="text-gray-400 hover:text-white text-xl">✕</button>
                 </div>
-                <button onClick={resetSend} className="w-full bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition">
-                  Cancel
-                </button>
-              </div>
-            ) : emailStep === 'cancelled' ? (
-              <div className="text-center space-y-4">
-                <div className="text-5xl">❌</div>
-                <div className="text-xl font-bold">Transaction Cancelled</div>
-                <p className="text-sm text-gray-400">You cancelled this transaction via email. No funds were moved.</p>
-                <button onClick={resetSend} className="w-full bg-blue-600 hover:bg-blue-500 py-3 rounded-xl font-semibold transition">Close</button>
+                <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl p-4 text-sm text-center space-y-1">
+                  <div className="text-blue-300 font-semibold">Verification code sent</div>
+                  <div className="text-gray-400">
+                    Check <span className="text-white font-mono">{maskedEmail}</span> for a 6-digit code.
+                  </div>
+                </div>
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1.5">Enter 6-digit code</label>
+                  <input
+                    autoFocus
+                    value={codeInput}
+                    onChange={e => { setCodeInput(e.target.value.replace(/\D/g, '').slice(0, 6)); setCodeError(''); }}
+                    onKeyDown={e => e.key === 'Enter' && codeInput.length === 6 && handleConfirmCode()}
+                    className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-xl font-mono text-center tracking-widest outline-none transition"
+                    placeholder="000000"
+                    maxLength={6}
+                  />
+                  {codeError && <p className="text-red-400 text-xs mt-1.5">{codeError}</p>}
+                </div>
+                <div className="flex gap-3">
+                  <button
+                    onClick={resetSend}
+                    className="flex-1 bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleConfirmCode}
+                    disabled={codeInput.length !== 6 || codeLoading}
+                    className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 py-3 rounded-xl font-semibold text-sm transition flex items-center justify-center gap-2"
+                  >
+                    {codeLoading
+                      ? <><div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />Verifying…</>
+                      : 'Confirm Send'}
+                  </button>
+                </div>
               </div>
             ) : emailStep === 'expired' ? (
               <div className="text-center space-y-4">
