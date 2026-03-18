@@ -2264,10 +2264,7 @@ fn validate_block(block: &crate::ledger::LedgerBlock, chain: &crate::ledger::Sha
     }
 
     // 4. Reward must match halving schedule (or be zero for non-coinbase blocks).
-    const INITIAL_BLOCK_REWARD: u64 = 50_000_000;
-    const HALVING_INTERVAL: u64 = 2_100_000;
-    let era = block.height / HALVING_INTERVAL;
-    let expected_reward = INITIAL_BLOCK_REWARD >> era.min(63);
+    let expected_reward = crate::tokenomics::block_reward_at(block.height);
     if block.reward != expected_reward && block.reward != 0 {
         eprintln!("[Validate] Block #{} rejected: reward {} != expected {}",
             block.height, block.reward, expected_reward);
