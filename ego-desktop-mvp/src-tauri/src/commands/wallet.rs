@@ -83,10 +83,12 @@ pub async fn send_transaction(
     if request.amount == 0 {
         return Err(EgoDesktopError::InvalidInput("Amount must be > 0".into()));
     }
-    if request.amount > balance {
+    let fee = crate::tokenomics::fee_for_tx_type("transfer");
+    let total_needed = request.amount.saturating_add(fee);
+    if total_needed > balance {
         return Err(EgoDesktopError::InvalidInput(format!(
-            "Insufficient balance: have {} uEGOC, need {}",
-            balance, request.amount
+            "Insufficient balance: have {} uEGOC, need {} (amount {} + fee {})",
+            balance, total_needed, request.amount, fee
         )));
     }
 
@@ -124,6 +126,7 @@ pub async fn send_transaction(
         public_key_ed25519:  pubkey_hex,
         dilithium_pubkey:    dil_pubkey_hex,
         dilithium_signature: dil_sig_hex,
+        fee_uegoc:           fee,
         ..LedgerTx::default()
     };
 

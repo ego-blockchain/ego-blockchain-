@@ -144,3 +144,84 @@ pub fn foundation_vested_egoc(now_secs: i64) -> u64 {
     let vested_frac = (elapsed as f64 / VEST_SECS as f64).min(1.0);
     (FOUNDATION_EGOC as f64 * vested_frac) as u64
 }
+
+// ── Transaction Fees (100% burned — deflationary) ─────────────────────────────
+
+/// Standard transfer fee in uEGOC (0.01 EGOC).
+pub const STANDARD_TX_FEE_UEGOC: u64 = 10_000;
+
+/// Contract deploy fee in uEGOC (0.1 EGOC).
+pub const DEPLOY_FEE_UEGOC: u64 = 100_000;
+
+/// Contract call fee in uEGOC (0.05 EGOC).
+pub const CALL_FEE_UEGOC: u64 = 50_000;
+
+/// Minimum accepted fee (spam guard).
+pub const MIN_TX_FEE_UEGOC: u64 = 1_000;
+
+/// Returns the fee in uEGOC for the given tx type.
+/// All fees are burned — sent to the zero address, not to any validator.
+pub fn fee_for_tx_type(tx_type: &str) -> u64 {
+    match tx_type {
+        "deploy" => DEPLOY_FEE_UEGOC,
+        "call"   => CALL_FEE_UEGOC,
+        _        => STANDARD_TX_FEE_UEGOC,
+    }
+}
+
+// ── EGUSD Stablecoin ──────────────────────────────────────────────────────────
+//
+// EGUSD is pegged 1:1 to USDT.
+// Minting: only when USDT is deposited into the Ego Bridge contract.
+// Burning: EGUSD is burned when USDT is withdrawn from the bridge.
+// Invariant: circulating_EGUSD ≤ USDT_locked_in_bridge at all times.
+
+pub const EGUSD_USDT_RATIO: f64 = 1.0; // 1 EGUSD = 1 USDT, always
+
+// ── Slashing Rules ────────────────────────────────────────────────────────────
+//
+// Validators that misbehave (double-sign, invalid block, >15 min downtime)
+// receive strikes. Strikes reset after 30 clean days.
+//
+//   Strike 1 → Warning: logged on-chain, no stake impact.
+//   Strike 2 → Ejected: removed from validator set, stake locked 7 days.
+//   Strike 3 → Permanent ban: ejected + 10% of stake burned.
+
+/// Days after which strike history clears (clean record resets counter).
+pub const SLASH_RESET_DAYS: u64 = 30;
+
+/// Stake lock duration (days) after Strike 2.
+pub const SLASH_LOCK_DAYS: u64 = 7;
+
+/// Percentage of stake burned on Strike 3, in basis points (1 000 = 10%).
+pub const SLASH_BURN_BPS: u64 = 1_000;
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum SlashOutcome {
+    Warning,
+    EjectAndLock { lock_days: u64 },
+    PermanentBan { burn_bps: u64 },
+}
+
+/// Compute slash outcome from the validator's current strike count (0 = clean).
+pub fn slash_outcome(strikes: u32) -> SlashOutcome {
+    match strikes {
+        0 => SlashOutcome::Warning,
+        1 => SlashOutcome::EjectAndLock { lock_days: SLASH_LOCK_DAYS },
+        _ => SlashOutcome::PermanentBan { burn_bps: SLASH_BURN_BPS },
+    }
+}
+
+// ── Developer Vesting — Arvand Azadvar ───────────────────────────────────────
+//
+// 1,000,000 EGOC — 3-year vest, 1-year cliff.
+//   Cliff  (month 12): 250,000 EGOC — distributed pre-launch.
+//   Months 13–36:      31,250 EGOC/month (750,000 ÷ 24).
+//   Profit share:      8% of Net Profit, paid annually after positive net profit.
+//   Abandonment:       3 months inactive → terminated for cause, unvested reverts.
+
+pub const DEV_ARVAND_TOTAL_EGOC:    u64 = 1_000_000;
+pub const DEV_ARVAND_CLIFF_EGOC:    u64 = 250_000;   // vests at month 12
+pub const DEV_ARVAND_MONTHLY_EGOC:  u64 = 31_250;    // months 13-36
+pub const DEV_ARVAND_VEST_MONTHS:   u32 = 24;        // post-cliff months
+pub const DEV_ARVAND_PROFIT_BPS:    u64 = 800;       // 8% of net profit
