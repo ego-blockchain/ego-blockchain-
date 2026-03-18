@@ -32,11 +32,11 @@ jobs:
           path: target/x86_64-unknown-linux-musl/release/ego-relay
 
       - name: Deploy to relay server
-        if: ${{ secrets.RELAY_SSH_KEY != '' }}
         env:
           SSH_KEY:     ${{ secrets.RELAY_SSH_KEY }}
           RELAY_HOST:  ${{ secrets.RELAY_HOST }}
           RELAY_USER:  ${{ secrets.RELAY_USER }}
+        if: ${{ env.SSH_KEY != '' }}
         run: |
           echo "$SSH_KEY" > /tmp/relay_key && chmod 600 /tmp/relay_key
           scp -i /tmp/relay_key -o StrictHostKeyChecking=no \
