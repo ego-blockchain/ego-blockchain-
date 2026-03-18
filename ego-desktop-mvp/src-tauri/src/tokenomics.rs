@@ -212,16 +212,5 @@ pub fn slash_outcome(strikes: u32) -> SlashOutcome {
     }
 }
 
-// ── Developer Vesting — Arvand Azadvar ───────────────────────────────────────
-//
-// 1,000,000 EGOC — 3-year vest, 1-year cliff.
-//   Cliff  (month 12): 250,000 EGOC — distributed pre-launch.
-//   Months 13–36:      31,250 EGOC/month (750,000 ÷ 24).
-//   Profit share:      8% of Net Profit, paid annually after positive net profit.
-//   Abandonment:       3 months inactive → terminated for cause, unvested reverts.
-
-pub const DEV_ARVAND_TOTAL_EGOC:    u64 = 1_000_000;
-pub const DEV_ARVAND_CLIFF_EGOC:    u64 = 250_000;   // vests at month 12
-pub const DEV_ARVAND_MONTHLY_EGOC:  u64 = 31_250;    // months 13-36
-pub const DEV_ARVAND_VEST_MONTHS:   u32 = 24;        // post-cliff months
-pub const DEV_ARVAND_PROFIT_BPS:    u64 = 800;       // 8% of net profit
+// ── Genesis Allocation ────────────────────────────────────────────────────────
+// TODO: to be defined before mainnet launch.
