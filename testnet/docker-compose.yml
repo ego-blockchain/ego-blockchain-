@@ -63,7 +63,7 @@ services:
       --type validator
       --port 9001
       --shards 0,1,2,3,4,5,6,7
-      --bootstrap /dns4/egorelay/tcp/4001/p2p/EgoBootstrapPeerId
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWBPZwpo6b5Npvg1gVU5w5qbQWT4iuivvvtJZQpqs17cBs
       --storage 500
       --bandwidth 1000
       --metrics
@@ -93,7 +93,7 @@ services:
       --type validator
       --port 9002
       --shards 8,9,10,11,12,13,14,15
-      --bootstrap /dns4/egorelay/tcp/4001/p2p/EgoBootstrapPeerId
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWBPZwpo6b5Npvg1gVU5w5qbQWT4iuivvvtJZQpqs17cBs
       --storage 500
       --bandwidth 1000
       --metrics
@@ -123,7 +123,7 @@ services:
       --type validator
       --port 9003
       --shards 0,1,2,3,8,9,10,11
-      --bootstrap /dns4/egorelay/tcp/4001/p2p/EgoBootstrapPeerId
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWBPZwpo6b5Npvg1gVU5w5qbQWT4iuivvvtJZQpqs17cBs
       --storage 500
       --bandwidth 1000
       --metrics
@@ -153,7 +153,7 @@ services:
       --type validator
       --port 9004
       --shards 4,5,6,7,12,13,14,15
-      --bootstrap /dns4/egorelay/tcp/4001/p2p/EgoBootstrapPeerId
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWBPZwpo6b5Npvg1gVU5w5qbQWT4iuivvvtJZQpqs17cBs
       --storage 500
       --bandwidth 1000
       --metrics
