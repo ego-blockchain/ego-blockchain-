@@ -56,7 +56,9 @@ rand = "0.8"
 zeroize = { version = "1.6", features = ["derive"] }
 hex = "0.4"
 blake3 = "1"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled"] }  # kept for one-time SQLite→RocksDB migration
+rocksdb  = "0.22.0"
+bincode  = { version = "2.0.1", features = ["serde"] }
 dirs = "5.0"
 opener = "0.6"
 local-ip-address = "0.6"

@@ -165,14 +165,15 @@ fn maybe_record_poc_event(status: &CoverageStatus) {
 
     if !should_record { return; }
 
-    let quality      = quality_str(&status.network_quality);
-    let reward_uegoc: u64 = match quality {
-        "Excellent" => 22_222,
-        "Good"      => 18_518,
-        "Fair"      => 14_814,
-        _           => 11_111,
-    };
+    let quality = quality_str(&status.network_quality);
     let peers   = status.coverage_synced_count;
+    // Continuous reward: 11,111 base + 1,500 per witnessed peer, cap 44,444 (~22 peers).
+    // This makes every additional peer genuinely worth more reward rather than
+    // jumping between a few fixed tiers.
+    const BASE:       u64 = 11_111;
+    const PER_PEER:   u64 = 1_500;
+    const MAX_REWARD: u64 = 44_444;
+    let reward_uegoc: u64 = (BASE + (peers as u64) * PER_PEER).min(MAX_REWARD);
     let h3_cell = status.location.as_ref()
         .map(|loc| derive_h3_cell(loc.latitude, loc.longitude));
     let next_id = events.last().map(|e| e.id + 1).unwrap_or(0);
@@ -258,8 +259,13 @@ async fn tick_coverage(
         probe_peers_from_relay(app).await;
     }
 
+    // ── Step 1b: re-announce ourselves so peers keep us in their active window
+    if is_online {
+        crate::p2p::broadcast_peer_announce(app).await;
+    }
+
     // ── Step 2: count live peers ───────────────────────────────────────────
-    let active_peers = state.get_active_peers(300);
+    let active_peers = state.get_active_peers(600); // 10-min window
     let peer_count   = active_peers.len();
 
     let contact_count = {
@@ -395,7 +401,7 @@ pub fn get_poc_events() -> Vec<crate::ledger::PocEvent> {
 pub async fn get_network_peers(
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::app::PeerInfo>, EgoDesktopError> {
-    Ok(state.get_active_peers(300))
+    Ok(state.get_active_peers(600))
 }
 
 // ── IP geolocation (called once on startup, cached) ──────────────────────────

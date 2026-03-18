@@ -226,6 +226,9 @@ const CoveragePage: React.FC = () => {
         <div className="text-right">
           <div className="text-3xl font-black text-green-400">{synced}</div>
           <div className="text-xs text-gray-400">witnesses synced</div>
+          <div className="text-xs text-green-500 mt-0.5">
+            {((11111 + synced * 1500) / 1_000_000).toFixed(4)} EGOC/event
+          </div>
         </div>
       </div>
 
@@ -413,7 +416,10 @@ const CoveragePage: React.FC = () => {
                   </span>
                   <div>
                     <div className="text-xs text-gray-300">
-                      {ev.peers > 0 ? `${ev.peers} peers witnessed` : 'Self-attested (solo node)'}
+                      {ev.peers > 0 ? `${ev.peers} peer${ev.peers > 1 ? 's' : ''} witnessed` : 'Self-attested (solo node)'}
+                    </div>
+                    <div className="text-xs text-gray-500">
+                      base 0.011 + {ev.peers} × 0.0015 EGOC
                     </div>
                     {ev.h3_cell && <div className="text-xs text-gray-500 font-mono">H3: {ev.h3_cell}</div>}
                   </div>
