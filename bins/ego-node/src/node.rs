@@ -123,7 +123,14 @@ impl Node {
 
 impl Node {
     pub async fn new(roles: Vec<NodeRole>, shard_ids: Vec<u32>) -> anyhow::Result<Self> {
-        let keystore = SecureKeystore::new();
+        Self::new_with_keystore(roles, shard_ids, SecureKeystore::new()).await
+    }
+
+    pub async fn new_with_keystore(
+        roles: Vec<NodeRole>,
+        shard_ids: Vec<u32>,
+        keystore: SecureKeystore,
+    ) -> anyhow::Result<Self> {
         let peer_id = keystore.peer_id();
 
         let transport = tcp::tokio::Transport::default()
@@ -483,7 +490,32 @@ impl Node {
     }
 
     pub async fn new_seed_node() -> anyhow::Result<Self> {
-        let mut node = Self::new(vec![NodeRole::Gateway], vec![]).await?;
+        // Load or create a stable keypair so the peer ID survives container restarts.
+        let seed_path = std::path::PathBuf::from(
+            std::env::var("EGO_DATA_DIR").unwrap_or_else(|_| "/data".into())
+        ).join("node_seed.bin");
+
+        let keystore = if seed_path.exists() {
+            let bytes = std::fs::read(&seed_path)?;
+            if bytes.len() == 32 {
+                let mut seed = [0u8; 32];
+                seed.copy_from_slice(&bytes);
+                SecureKeystore::from_seed(seed)?
+            } else {
+                SecureKeystore::new()
+            }
+        } else {
+            let ks = SecureKeystore::new();
+            let seed = ks.keypair().to_bytes();
+            if let Some(parent) = seed_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&seed_path, seed)?;
+            tracing::info!("[seed-node] Keypair saved to {}", seed_path.display());
+            ks
+        };
+
+        let mut node = Self::new_with_keystore(vec![NodeRole::Gateway], vec![], keystore).await?;
         node.node_type = "seed".to_string();
         node.is_bootstrap = true;
         node.max_peers_per_shard = 1000;
