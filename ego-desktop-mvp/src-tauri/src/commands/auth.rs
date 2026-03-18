@@ -592,6 +592,7 @@ fn credit_testnet_faucet(address: &str) {
     let _ = save_chain(&chain);
 }
 
+#[tauri::command]
 pub async fn generate_keypair(state: State<'_, AppState>) -> Result<KeypairInfo, EgoDesktopError> {
     let keypair  = KeyPair::generate();
     let address  = keypair
