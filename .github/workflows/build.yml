@@ -19,6 +19,8 @@ env:
     | **Windows** (alt) | `Ego Desktop_*_x64-setup.exe` |
     | **macOS** (M1/M2/M3/M4) | `Ego Desktop_*_aarch64.dmg` |
     | **macOS** (Intel) | `Ego Desktop_*_x64.dmg` |
+    | **Linux** (Debian/Ubuntu) | `Ego Desktop_*_amd64.deb` |
+    | **Linux** (universal) | `Ego Desktop_*_amd64.AppImage` |
 
     ### Windows
     1. Download the `.msi` file and run it — follow the installer wizard.
@@ -27,6 +29,10 @@ env:
     1. Download the `.dmg` file.
     2. Open it and drag **Ego Desktop** into your Applications folder.
     3. First launch: **right-click the app → Open → Open** (required once since the app is not yet notarized).
+
+    ### Linux
+    1. **Debian/Ubuntu**: `sudo dpkg -i Ego.Desktop_*_amd64.deb`
+    2. **AppImage**: `chmod +x Ego.Desktop_*_amd64.AppImage && ./Ego.Desktop_*_amd64.AppImage`
 
 jobs:
   # ── Windows (x64) ─────────────────────────────────────────────────────────
@@ -93,6 +99,52 @@ jobs:
           EGO_AI_KEY: ${{ secrets.EGO_AI_KEY }}
           MACOSX_DEPLOYMENT_TARGET: '11.0'
           RUSTFLAGS: '-C target-cpu=apple-m1'
+        with:
+          projectPath: ego-desktop-mvp
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: 'Ego Desktop ${{ github.ref_name }}'
+          releaseBody: ${{ env.RELEASE_BODY }}
+          releaseDraft: true
+          prerelease: false
+
+  # ── Linux (x64 — .deb + .AppImage) ───────────────────────────────────────
+  build-linux:
+    name: Linux x64
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ego-desktop-mvp/src-tauri -> target
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.0-dev \
+            libssl-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install frontend dependencies
+        working-directory: ego-desktop-mvp
+        run: npm install
+
+      - name: Build (Linux)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EGO_AI_KEY: ${{ secrets.EGO_AI_KEY }}
         with:
           projectPath: ego-desktop-mvp
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
