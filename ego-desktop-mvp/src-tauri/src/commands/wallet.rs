@@ -1,8 +1,18 @@
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
 use crate::ledger::{load_chain, save_chain, tx_signing_bytes, Ledger, LedgerBlock, LedgerTx};
+use once_cell::sync::Lazy;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use tauri::State;
+
+// ── Pending TX 2FA store ──────────────────────────────────────────────────────
+// tx_id → (LedgerTx, expires_unix_ts)
+
+static PENDING_TXS: Lazy<Mutex<HashMap<String, (LedgerTx, i64)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Balance {
@@ -410,5 +420,186 @@ pub async fn query_remote_node(
         formatted: format!("{:.2} EGOC", balance_uegoc as f64 / 1_000_000.0),
         block_height,
         rpc_url: url,
+    })
+}
+
+// ── request_tx_code ───────────────────────────────────────────────────────────
+//
+// Step 1 of email 2FA: validate + sign the tx, store it pending, email a code.
+// Returns { tx_id, masked_email } — frontend shows the code-entry modal.
+
+#[derive(Debug, Serialize)]
+pub struct TxCodeRequest {
+    pub tx_id:        String,
+    pub masked_email: String,
+}
+
+#[tauri::command]
+pub async fn request_tx_code(
+    request: SendTransactionRequest,
+    state: State<'_, AppState>,
+) -> Result<TxCodeRequest, EgoDesktopError> {
+    let ledger  = Ledger::load();
+    let from    = ledger.address.clone();
+    let email   = ledger.registered_email.clone();
+
+    if from.is_empty() {
+        return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
+    }
+    if email.is_empty() {
+        return Err(EgoDesktopError::InvalidInput(
+            "No email on file. Set an email in Settings to use 2FA.".into(),
+        ));
+    }
+
+    // Validate balance
+    let chain   = load_chain();
+    let balance = chain.balance_of(&from);
+    if request.amount == 0 {
+        return Err(EgoDesktopError::InvalidInput("Amount must be > 0".into()));
+    }
+    let fee          = crate::tokenomics::fee_for_tx_type("transfer");
+    let total_needed = request.amount.saturating_add(fee);
+    if total_needed > balance {
+        return Err(EgoDesktopError::InvalidInput(format!(
+            "Insufficient balance: have {} uEGOC, need {} (amount {} + fee {})",
+            balance, total_needed, request.amount, fee
+        )));
+    }
+
+    // Build + sign the transaction (same as send_transaction)
+    let nonce      = ledger.nonce + 1;
+    let ts         = chrono::Utc::now().timestamp();
+    let sign_bytes = tx_signing_bytes(&from, &request.to_address, request.amount, nonce, ts);
+
+    let (sig_hex, pk_hex, dil_sig_hex, dil_pk_hex) = if let Some(kp) = state.get_keypair() {
+        let ed_sig  = kp.sign_ed25519(&sign_bytes);
+        let dil_sig = kp.sign_dilithium(&sign_bytes);
+        (
+            hex::encode(ed_sig.as_bytes()),
+            hex::encode(kp.ed25519_public_key().as_bytes()),
+            hex::encode(&dil_sig.signature_data),
+            hex::encode(&kp.dilithium_public_key().key_data),
+        )
+    } else {
+        return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
+    };
+
+    let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+    let tx = LedgerTx {
+        hash:                tx_hash.clone(),
+        from:                from.clone(),
+        to:                  request.to_address.clone(),
+        amount:              request.amount,
+        memo:                request.memo.clone(),
+        timestamp:           ts,
+        signature:           sig_hex,
+        status:              "Pending".into(),
+        block_height:        None,
+        nonce,
+        public_key_ed25519:  pk_hex,
+        dilithium_pubkey:    dil_pk_hex,
+        dilithium_signature: dil_sig_hex,
+        fee_uegoc:           fee,
+        ..LedgerTx::default()
+    };
+
+    // Generate 6-digit code and store OTP + pending tx (10 min expiry)
+    let code  = format!("{:06}", rand::thread_rng().gen_range(0u32..1_000_000));
+    let tx_id = tx_hash.clone(); // use tx hash as the pending-tx key
+    let expiry = ts + 600;
+
+    crate::email::store_otp(&format!("tx:{}", tx_id), &code);
+    {
+        let mut map = PENDING_TXS.lock().unwrap();
+        // Evict any expired entries while we're here
+        map.retain(|_, (_, exp)| *exp > ts);
+        map.insert(tx_id.clone(), (tx.clone(), expiry));
+    }
+
+    // Email the code (async, but we await so the frontend knows if it failed)
+    let amount_str = format!("{:.6} EGOC", request.amount as f64 / 1_000_000.0);
+    crate::email::send_tx_code_email(&email, &code, &amount_str, &request.to_address)
+        .await
+        .map_err(|e| EgoDesktopError::NetworkError(format!("Failed to send code: {e}")))?;
+
+    // Mask the email for display: abc***@domain.com
+    let masked = if let Some(at) = email.find('@') {
+        let local = &email[..at];
+        let domain = &email[at..];
+        if local.len() > 3 {
+            format!("{}***{}", &local[..2], domain)
+        } else {
+            format!("{}***{}", &local[..1], domain)
+        }
+    } else {
+        "***".to_string()
+    };
+
+    Ok(TxCodeRequest { tx_id, masked_email: masked })
+}
+
+// ── confirm_tx_code ───────────────────────────────────────────────────────────
+//
+// Step 2 of email 2FA: verify the code and execute the pending transaction.
+
+#[tauri::command]
+pub async fn confirm_tx_code(
+    tx_id:  String,
+    code:   String,
+) -> Result<TransactionResponse, EgoDesktopError> {
+    // Verify OTP
+    let valid = crate::email::verify_otp(&format!("tx:{}", tx_id), code.trim());
+    if !valid {
+        return Err(EgoDesktopError::InvalidInput(
+            "Incorrect or expired code. Please check your email and try again.".into(),
+        ));
+    }
+
+    // Retrieve the pending tx
+    let tx = {
+        let mut map = PENDING_TXS.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        match map.remove(&tx_id) {
+            Some((tx, exp)) if exp > now => tx,
+            Some(_) => return Err(EgoDesktopError::InvalidInput(
+                "Transaction request expired. Please start over.".into(),
+            )),
+            None => return Err(EgoDesktopError::InvalidInput(
+                "Transaction not found. It may have already been submitted or expired.".into(),
+            )),
+        }
+    };
+
+    // Persist nonce update
+    let mut ledger = Ledger::load();
+    if tx.nonce > ledger.nonce {
+        ledger.nonce = tx.nonce;
+        let _ = ledger.save();
+    }
+
+    // Push to mempool (batch loop mines + broadcasts)
+    crate::mempool::get_mempool().push(tx.clone());
+
+    // Fire confirmation email (non-blocking)
+    let to_email = ledger.registered_email.clone();
+    if !to_email.is_empty() {
+        let amount_str = format!("{:.6} EGOC", tx.amount as f64 / 1_000_000.0);
+        let recipient  = tx.to.clone();
+        let hash_copy  = tx.hash.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = crate::email::send_tx_confirmation(
+                &to_email, &amount_str, &recipient, &hash_copy,
+            ).await {
+                eprintln!("[Email] TX receipt failed: {e}");
+            }
+        });
+    }
+
+    Ok(TransactionResponse {
+        hash:         tx.hash,
+        success:      true,
+        message:      "Transaction confirmed and queued".into(),
+        block_height: None,
     })
 }

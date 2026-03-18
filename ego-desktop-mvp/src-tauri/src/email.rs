@@ -107,6 +107,28 @@ pub async fn send_otp_email(to: &str, name: &str, code: &str) -> Result<(), Stri
     send_smtp(to, "Your Ego Blockchain Verification Code", &body).await
 }
 
+pub async fn send_tx_code_email(
+    to: &str,
+    code: &str,
+    amount_egoc: &str,
+    recipient: &str,
+) -> Result<(), String> {
+    let short_addr = if recipient.len() > 12 {
+        format!("{}…{}", &recipient[..8], &recipient[recipient.len()-4..])
+    } else {
+        recipient.to_string()
+    };
+    let body = format!(
+        "You requested to send {amount_egoc} to {short_addr}.\n\n\
+        Your transaction confirmation code is:\n\n\
+        \t{code}\n\n\
+        This code expires in 10 minutes. Enter it in the Ego Desktop app to complete the transaction.\n\
+        If you did not initiate this, ignore this email — the transaction will not be processed.\n\n\
+        — Ego Blockchain Team"
+    );
+    send_smtp(to, "Ego Blockchain — Confirm Your Transaction", &body).await
+}
+
 pub async fn send_tx_confirmation(
     to: &str,
     amount_egoc: &str,
