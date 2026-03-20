@@ -100,6 +100,14 @@ async fn main() -> anyhow::Result<()> {
     let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", LISTEN_PORT).parse()?;
     swarm.listen_on(listen_addr)?;
 
+    // Tell the relay behaviour its public DNS address so it includes it in
+    // reservation responses.  Without this the relay only knows its private
+    // container IPs (10.x, 172.x) and sends empty addrs → clients get
+    // NoAddressesInReservation and the circuit listener closes immediately.
+    let public_addr: Multiaddr =
+        format!("/dns4/EgoRelay.egoblockchain.com/tcp/{}", LISTEN_PORT).parse()?;
+    swarm.add_external_address(public_addr);
+
     // ── 4. Event loop ─────────────────────────────────────────────────────────
     loop {
         match swarm.select_next_some().await {
