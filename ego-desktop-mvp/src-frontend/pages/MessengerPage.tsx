@@ -65,6 +65,49 @@ function msgTypeLabel(t: string): string {
   return '';
 }
 
+function isImageName(name: string): boolean {
+  const ext = name.split('.').pop()?.toLowerCase() ?? '';
+  return ['jpg','jpeg','png','gif','webp','bmp','svg'].includes(ext);
+}
+
+// Lazily loads and displays a file preview from the local encrypted store.
+// Only renders when the CID is already available locally.
+function InlineFilePreview({ cid, name }: { cid: string; name: string }) {
+  const [src, setSrc] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<{ mime_type: string; data_base64: string; previewable: boolean }>(
+      'retrieve_file_preview', { cid }
+    ).then(p => {
+      if (!cancelled && p.previewable) {
+        setSrc(`data:${p.mime_type};base64,${p.data_base64}`);
+      } else if (!cancelled) {
+        setFailed(true);
+      }
+    }).catch(() => { if (!cancelled) setFailed(true); });
+    return () => { cancelled = true; };
+  }, [cid]);
+
+  if (failed || (!src && !isImageName(name))) return null;
+  if (!src) {
+    return (
+      <div className="w-full h-24 rounded-xl bg-black/30 animate-pulse flex items-center justify-center">
+        <span className="text-gray-500 text-xs">Loading…</span>
+      </div>
+    );
+  }
+  return (
+    <img
+      src={src}
+      alt={name}
+      className="w-full max-h-64 rounded-xl object-contain bg-black/20 cursor-pointer"
+      onClick={() => { const w = window.open(); w?.document.write(`<img src="${src}" style="max-width:100%;background:#000"/>`); }}
+    />
+  );
+}
+
 // ── AI message renderer (markdown code blocks → syntax-highlighted) ───────────
 
 // Map non-standard or Ego-specific language names to Prism-supported ones
@@ -197,6 +240,8 @@ const MessengerPage: React.FC = () => {
   type FileImportStatus = 'idle' | 'importing' | 'done' | 'error';
   const [fileImportStates, setFileImportStates] = useState<Record<string, { status: FileImportStatus; error?: string }>>({});
   const importTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  // Maps cid → msgId so file-downloaded events can mark the right message as done
+  const cidToMsgId = useRef<Record<string, string>>({});
 
   // Inline rename state
   const [editingName, setEditingName] = useState(false);
@@ -219,11 +264,16 @@ const MessengerPage: React.FC = () => {
   }
 
   async function loadKnownCids() {
-  try {
-    const files = await invoke<{ cid: string; status: string }[]>('get_stored_files');
-    setKnownCids(new Set(files.map(f => f.cid)));
-  } catch {}
-}
+    try {
+      const files = await invoke<{ cid: string; local_path: string }[]>('get_stored_files');
+      // Only include files with actual data on disk (not placeholder "sender:..." entries)
+      setKnownCids(new Set(
+        files
+          .filter(f => f.local_path && !f.local_path.startsWith('sender:'))
+          .map(f => f.cid)
+      ));
+    } catch {}
+  }
 
   async function loadMessages(addr: string) {
     try {
@@ -271,13 +321,31 @@ const MessengerPage: React.FC = () => {
 
       // A receives B's decline
       listen('ego://contact-declined', () => { loadContacts(); }),
-      listen('ego://file-downloaded', () => { loadKnownCids(); }),
+      listen<{ cid?: string }>('ego://file-downloaded', (event) => {
+        loadKnownCids();
+        const cid = event.payload?.cid;
+        if (cid) {
+          const msgId = cidToMsgId.current[cid];
+          if (msgId) {
+            clearTimeout(importTimers.current[msgId]);
+            setFileImportStates(s => ({ ...s, [msgId]: { status: 'done' } }));
+            delete cidToMsgId.current[cid];
+          }
+        }
+      }),
       // Incoming chat message delivered by P2P server
       listen<Message>('ego://message-received', (event) => {
         const msg = event.payload;
         // Refresh messages if the chat with the sender (or recipient) is open
         const cur = selectedRef.current;
         if (cur && (msg.from === cur.address || msg.to === cur.address)) {
+          loadMessages(cur.address);
+        }
+      }),
+      // Outgoing message saved (e.g. sent from EgoSafe) — refresh open chat
+      listen<{ to: string }>('ego://message-sent', (event) => {
+        const cur = selectedRef.current;
+        if (cur && cur.address === event.payload.to) {
           loadMessages(cur.address);
         }
       }),
@@ -495,14 +563,15 @@ useEffect(() => {
       await invoke('import_shared_file', {
         bundle: { cid, key_nonce_hex, display_name, from_address },
       });
+      // Register cid→msgId so the file-downloaded event can complete this import
+      cidToMsgId.current[cid] = msgId;
       await invoke('request_file_from_contact', {
         cid,
         fromAddr: from_address,
         content,
       });
-      clearTimeout(importTimers.current[msgId]);
-      setFileImportStates(s => ({ ...s, [msgId]: { status: 'done' } }));
-      await loadKnownCids();
+      // Stay in 'importing' state — the file-downloaded event will set 'done'
+      // once the encrypted file data actually arrives and is written to disk.
     } catch (e: any) {
       clearTimeout(importTimers.current[msgId]);
       setFileImportStates(s => ({
@@ -922,10 +991,17 @@ useEffect(() => {
                         const isDone = alreadyKnown || importState?.status === 'done';
                         const isImporting = !isDone && importState?.status === 'importing';
                         const isError = !isDone && importState?.status === 'error';
+                        const fileAvailable = alreadyKnown || importState?.status === 'done';
+                        const isImage = isImageName(display_name);
                         return (
-                          <div className="space-y-2 min-w-[200px]">
+                          <div className="space-y-2 min-w-[200px] max-w-xs">
+                            {/* Inline image preview when file is available locally */}
+                            {fileAvailable && isImage && (
+                              <InlineFilePreview cid={cid} name={display_name} />
+                            )}
+                            {/* File info row */}
                             <div className="flex items-center gap-2 bg-black/20 rounded-xl px-3 py-2">
-                              <span className="text-2xl shrink-0">📎</span>
+                              <span className="text-2xl shrink-0">{isImage ? '🖼️' : '📎'}</span>
                               <div className="min-w-0">
                                 <div className="text-sm font-medium truncate">{display_name}</div>
                                 <div className="text-xs text-gray-400 font-mono">{cid.slice(0, 14)}…</div>
@@ -935,11 +1011,11 @@ useEffect(() => {
                               <>
                                 {isDone ? (
                                   <div className="w-full text-xs py-1.5 rounded-lg font-medium text-center bg-green-700/50 text-green-300">
-                                    ✓ Importing… check EgoSafe
+                                    ✓ Saved to EgoSafe
                                   </div>
                                 ) : isImporting ? (
                                   <div className="w-full text-xs py-1.5 rounded-lg font-medium text-center bg-gray-600/60 text-gray-300 cursor-default">
-                                    <span className="animate-pulse">Importing…</span>
+                                    <span className="animate-pulse">Receiving…</span>
                                   </div>
                                 ) : isError ? (
                                   <div className="space-y-1">
@@ -958,15 +1034,17 @@ useEffect(() => {
                                     onClick={() => handleImportFile(m.id, cid, key_nonce_hex, display_name, from_address, m.content)}
                                     className="w-full text-xs py-1.5 rounded-lg font-medium bg-purple-600 hover:bg-purple-500 text-white transition"
                                   >
-                                    📥 Import File
+                                    {isImage ? '🖼️ View Image' : '📥 Save File'}
                                   </button>
                                 )}
                               </>
                             )}
                             {m.outgoing && (
-                              <div className="text-xs text-center text-gray-400 py-0.5">
-                                Sent — waiting for recipient to import
-                              </div>
+                              fileAvailable && isImage ? null : (
+                                <div className="text-xs text-center text-gray-400 py-0.5">
+                                  Sent · waiting for recipient
+                                </div>
+                              )
                             )}
                           </div>
                         );

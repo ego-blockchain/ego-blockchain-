@@ -70,7 +70,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
 dependencies = [
  "cfg-if",
- "const-random",
  "once_cell",
  "version_check",
  "zerocopy",
@@ -1142,16 +1141,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "clap-verbosity-flag"
-version = "2.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34c77f67047557f62582784fd7482884697731b2932c7d37ced54bce2312e1e2"
-dependencies = [
- "clap",
- "log",
-]
-
-[[package]]
 name = "clap_builder"
 version = "4.5.51"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1232,26 +1221,6 @@ name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
-
-[[package]]
-name = "const-random"
-version = "0.1.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87e00182fe74b066627d63b85fd550ac2998d4b0bd86bfed477a0ae4c7c71359"
-dependencies = [
- "const-random-macro",
-]
-
-[[package]]
-name = "const-random-macro"
-version = "0.1.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9d839f2a20b0aee515dc581a6172f2321f96cab76c1a38a4c584a194955390e"
-dependencies = [
- "getrandom 0.2.16",
- "once_cell",
- "tiny-keccak",
-]
 
 [[package]]
 name = "const-str"
@@ -1764,27 +1733,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dirs"
-version = "5.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44c45a9d03d6676652bcb5e724c7e988de1acad23a711b5217ab9cbecbec2225"
-dependencies = [
- "dirs-sys",
-]
-
-[[package]]
-name = "dirs-sys"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
-dependencies = [
- "libc",
- "option-ext",
- "redox_users",
- "windows-sys 0.48.0",
-]
-
-[[package]]
 name = "dirs-sys-next"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1913,11 +1861,8 @@ dependencies = [
  "dashmap 6.1.0",
  "ed25519-dalek",
  "ego-core",
- "flate2",
  "futures",
  "geo",
- "geodesy",
- "h3o",
  "libp2p 0.56.0",
  "lru 0.16.2",
  "lz4",
@@ -2037,6 +1982,18 @@ dependencies = [
  "thiserror 2.0.17",
  "tokio",
  "tokio-test",
+ "tracing",
+ "tracing-subscriber 0.3.20",
+]
+
+[[package]]
+name = "ego-relay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "libp2p 0.56.0",
+ "tokio",
  "tracing",
  "tracing-subscriber 0.3.20",
 ]
@@ -2354,12 +2311,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "float_eq"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28a80e3145d8ad11ba0995949bbcf48b9df2be62772b3d351ef017dff6ecb853"
-
-[[package]]
 name = "float_next_after"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2605,24 +2556,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "geodesy"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c1778eaef1f258c89d8d3f0fadb42ef70f4c714d237714fede0936285661c20"
-dependencies = [
- "anyhow",
- "clap",
- "clap-verbosity-flag",
- "dirs",
- "env_logger",
- "float_eq",
- "log",
- "thiserror 1.0.69",
- "uuid",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "geographiclib-rs"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2733,25 +2666,6 @@ dependencies = [
  "tokio-util",
  "tracing",
 ]
-
-[[package]]
-name = "h3o"
-version = "0.9.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a78209b5ec22ba72456c935d8822a035d5f36f50f5bd5b289640dc93afa4965"
-dependencies = [
- "ahash 0.8.12",
- "either",
- "float_eq",
- "h3o-bit",
- "libm",
-]
-
-[[package]]
-name = "h3o-bit"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b42eb4efef1f96510ae1a33b2682562a677d504641e9903a77bf5c666b9013e"
 
 [[package]]
 name = "half"
@@ -4741,12 +4655,6 @@ dependencies = [
  "pkg-config",
  "vcpkg",
 ]
-
-[[package]]
-name = "option-ext"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "parity-scale-codec"

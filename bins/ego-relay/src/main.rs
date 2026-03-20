@@ -1,12 +1,15 @@
-//! Ego Relay — minimal libp2p circuit-relay + DHT bootstrap server.
+//! Ego Relay — minimal libp2p circuit-relay server.
 //!
-//! Listens on port 4001 (TCP + QUIC).
+//! Listens on port 4001 (TCP).
 //! Saves its keypair to `ego-relay.key` so the peer ID is stable across restarts.
 //! Prints the peer ID on startup — copy it into RELAY_NODES in p2p.rs.
+//!
+//! This relay does NOT participate in the DHT — peers are full DHT nodes.
+//! The relay only connects peers to each other via circuit relay v2.
 
 use futures::StreamExt;
 use libp2p::{
-    identify, kad, noise, relay,
+    identify, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId,
 };
@@ -16,13 +19,14 @@ use tracing::info;
 const LISTEN_PORT: u16 = 4001;
 const KEY_FILE: &str   = "ego-relay.key";
 
-// ── Behaviour ────────────────────────────────────────────────────────────────
+// ── Behaviour ─────────────────────────────────────────────────────────────────
+// No Kademlia — peers are full DHT nodes, relay just routes connections.
 
 #[derive(NetworkBehaviour)]
 struct RelayBehaviour {
     relay:    relay::Behaviour,
     identify: identify::Behaviour,
-    kad:      kad::Behaviour<kad::store::MemoryStore>,
+    ping:     ping::Behaviour,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -60,13 +64,19 @@ async fn main() -> anyhow::Result<()> {
             relay: relay::Behaviour::new(
                 local_peer_id,
                 relay::Config {
-                    max_reservations:             512,
-                    max_reservations_per_peer:     8,
-                    reservation_duration:          Duration::from_secs(3600),
-                    max_circuits:                  512,
-                    max_circuits_per_peer:         8,
-                    max_circuit_duration:          Duration::from_secs(3600),
-                    max_circuit_bytes:             0,  // unlimited
+                    // How many peers can reserve a relay slot simultaneously.
+                    // Each connected peer takes one slot when they call listen_on circuit.
+                    max_reservations:          1024,
+                    max_reservations_per_peer: 16,
+                    reservation_duration:      Duration::from_secs(3600),
+                    // How many simultaneous circuit connections the relay will forward.
+                    // Each file block transfer or message exchange uses one circuit.
+                    // 4096 allows ~2000 concurrent peer pairs transferring data.
+                    max_circuits:              4096,
+                    max_circuits_per_peer:     64,
+                    max_circuit_duration:      Duration::from_secs(7200),
+                    // 0 = no byte limit per circuit — peers transfer blocks directly.
+                    max_circuit_bytes:         0,
                     ..Default::default()
                 },
             ),
@@ -74,23 +84,22 @@ async fn main() -> anyhow::Result<()> {
                 "/ego/relay/1.0.0".into(),
                 key.public(),
             )),
-            kad: {
-                let mut k = kad::Behaviour::new(
-                    local_peer_id,
-                    kad::store::MemoryStore::new(local_peer_id),
-                );
-                k.set_mode(Some(kad::Mode::Server));
-                k
-            },
+            ping: ping::Behaviour::new(
+                ping::Config::new()
+                    .with_interval(Duration::from_secs(30))
+                    .with_timeout(Duration::from_secs(20)),
+            ),
         })?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        // Keep connections alive for 2 hours — clients ping every 30s so the
+        // idle timer never fires under normal operation.
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(7200)))
         .build();
 
     // ── 3. Listen on TCP 0.0.0.0:4001 ───────────────────────────────────────
     let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", LISTEN_PORT).parse()?;
     swarm.listen_on(listen_addr)?;
 
-    // ── 4. Event loop ────────────────────────────────────────────────────────
+    // ── 4. Event loop ─────────────────────────────────────────────────────────
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {
@@ -102,17 +111,29 @@ async fn main() -> anyhow::Result<()> {
             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                 info!("[Relay] Peer disconnected: {} ({:?})", peer_id, cause);
             }
-            SwarmEvent::Behaviour(event) => {
-                match event {
-                    RelayBehaviourEvent::Relay(relay::Event::ReservationReqAccepted { src_peer_id, .. }) => {
-                        info!("[Relay] Circuit reservation accepted for {}", src_peer_id);
-                    }
-                    RelayBehaviourEvent::Relay(relay::Event::CircuitReqAccepted { src_peer_id, .. }) => {
-                        info!("[Relay] Circuit opened for {}", src_peer_id);
-                    }
-                    _ => {}
+            SwarmEvent::Behaviour(event) => match event {
+                RelayBehaviourEvent::Relay(
+                    relay::Event::ReservationReqAccepted { src_peer_id, .. }
+                ) => {
+                    info!("[Relay] Reservation accepted for {}", src_peer_id);
                 }
-            }
+                RelayBehaviourEvent::Relay(
+                    relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id, .. }
+                ) => {
+                    info!("[Relay] Circuit opened: {} → {}", src_peer_id, dst_peer_id);
+                }
+                RelayBehaviourEvent::Relay(
+                    relay::Event::ReservationReqDenied { src_peer_id, .. }
+                ) => {
+                    info!("[Relay] Reservation DENIED for {} — check max_reservations", src_peer_id);
+                }
+                RelayBehaviourEvent::Relay(
+                    relay::Event::CircuitReqDenied { src_peer_id, dst_peer_id, .. }
+                ) => {
+                    info!("[Relay] Circuit DENIED: {} → {} — check max_circuits", src_peer_id, dst_peer_id);
+                }
+                _ => {}
+            },
             _ => {}
         }
     }

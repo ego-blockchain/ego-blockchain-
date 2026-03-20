@@ -212,6 +212,16 @@ pub struct StoredFile {
     /// Unix timestamp of the most recent successful PoST proof.
     #[serde(default)]
     pub last_proved: Option<i64>,
+    // ── Block-storage fields (IPFS-style, set for egomfd1 files) ─────────────
+    /// Manifest CID (`egomfd1…`). Empty for legacy single-blob files.
+    #[serde(default)]
+    pub manifest_cid: String,
+    /// Total 256 KB blocks in this file's manifest.  0 = legacy.
+    #[serde(default)]
+    pub blocks_total: u32,
+    /// How many blocks have been downloaded to disk so far.
+    #[serde(default)]
+    pub blocks_received: u32,
 }
 
 /// The complete local wallet state, persisted to JSON.

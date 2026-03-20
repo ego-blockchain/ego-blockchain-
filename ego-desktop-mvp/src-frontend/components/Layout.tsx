@@ -241,9 +241,7 @@ const Layout: React.FC = () => {
         {/* Logo */}
         <div className="p-4 border-b border-gray-700">
           <div className="flex items-center gap-2.5">
-            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-sm font-black">
-              E
-            </div>
+            <img src="/ego_logo.png" alt="Ego" className="w-9 h-9 rounded-full object-cover" />
             <div>
               <div className="font-bold text-sm leading-tight">Ego Wallet</div>
               <div className="text-xs text-gray-400">Testnet v0.1.0</div>

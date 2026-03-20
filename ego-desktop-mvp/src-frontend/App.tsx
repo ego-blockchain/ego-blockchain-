@@ -231,7 +231,7 @@ function App() {
   }
 
   async function initWallet() {
-    setLoading(true);
+    if (!wallet) setLoading(true); // only show full loading screen on first init
     setInitError(null);
     try {
       const timeout = new Promise<never>((_, reject) =>

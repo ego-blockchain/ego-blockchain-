@@ -12,8 +12,8 @@ anyhow = "1"
 tokio  = { version = "1", features = ["full"] }
 libp2p = { version = "0.56", features = [
     "noise", "yamux", "tcp", "dns",
-    "relay", "identify", "kad",
-    "macros",
+    "relay", "identify", "kad", "ping",
+    "tokio", "macros",
 ] }
 futures      = "0.3"
 tracing      = "0.1"

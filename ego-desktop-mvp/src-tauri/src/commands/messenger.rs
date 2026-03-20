@@ -10,7 +10,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 // ── Storage paths ─────────────────────────────────────────────────────────────
 
@@ -366,22 +366,21 @@ pub async fn approve_contact_request(
     let contact = contacts[pos].clone();
     save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
 
+    let my_endpoint = p2p::get_public_endpoint().await;
+    let response = p2p::P2PMessage::ContactResponse {
+        from_addr:     my_addr.clone(),
+        from_name:     my_name.trim().to_string(),
+        from_ed25519:  ed25519_hex,
+        from_kyber:    kyber_hex,
+        approved:      true,
+        shared_key:    shared_key_hex,
+        from_endpoint: my_endpoint.clone(),
+    };
+
     if !peer_endpoint.is_empty() {
         let resolved_peer_ep = resolve_endpoint(&contact_addr, &peer_endpoint).await;
-
-        let my_endpoint = p2p::get_public_endpoint().await;
-        let response = p2p::P2PMessage::ContactResponse {
-            from_addr:     my_addr.clone(),
-            from_name:     my_name.trim().to_string(),
-            from_ed25519:  ed25519_hex,
-            from_kyber:    kyber_hex,
-            approved:      true,
-            shared_key:    shared_key_hex,
-            from_endpoint: my_endpoint.clone(),
-        };
         if let Err(e) = p2p::send_message(&resolved_peer_ep, &response).await {
-            eprintln!("[P2P] Could not notify requester of approval: {}", e);
-            deposit_in_relay_inbox(&contact_addr, &my_addr, &response).await;
+            eprintln!("[P2P] Could not notify requester of approval directly: {}", e);
         }
 
         if !my_endpoint.is_empty() {
@@ -401,10 +400,13 @@ pub async fn approve_contact_request(
             };
             if let Err(e) = p2p::send_message(&resolved_peer_ep, &announce).await {
                 eprintln!("[P2P] Could not send PeerAnnounce after approval: {}", e);
-                deposit_in_relay_inbox(&contact_addr, &my_addr, &announce).await;
             }
         }
     }
+
+    // Always deposit to DHT so the requester receives the approval even if they
+    // were offline, their endpoint changed, or direct delivery was unreliable.
+    deposit_in_relay_inbox(&contact_addr, &my_addr, &response).await;
 
     Ok(contact)
 }
@@ -461,6 +463,7 @@ pub async fn get_contacts() -> Result<Vec<Contact>, EgoDesktopError> {
 /// sending so stale stored endpoints don't cause silent delivery failures.
 #[tauri::command]
 pub async fn send_message(
+    app: AppHandle,
     state: State<'_, AppState>,
     contact_addr: String,
     content: String,
@@ -494,6 +497,10 @@ pub async fn send_message(
         my_addr, contact_addr, ts, message_type, nonce_hex, ct_hex
     );
 
+    // Capture before content/message_type are moved into Message
+    let is_file_bundle  = message_type == "file_bundle";
+    let raw_content     = content.clone();
+
     let mut msgs = load_messages();
     msgs.push(Message {
         id:           format!("{}-{}", ts, &nonce_hex[..8]),
@@ -505,15 +512,74 @@ pub async fn send_message(
         outgoing:     true,
     });
     save_messages(&msgs).map_err(EgoDesktopError::FileSystemError)?;
-
-    // FIX: resolve endpoint from relay cache before sending.
-    // contact.endpoint may be a stale raw IP from when the contact was first
-    // added. The relay cache has their latest /p2p-circuit address.
+    // Notify MessengerPage (open in any tab) so it refreshes immediately.
+    let _ = app.emit_all("ego://message-sent", serde_json::json!({ "to": contact_addr }));
     let stored_endpoint  = contact.endpoint.clone();
     let contact_addr_key = contact_addr.clone();
     tokio::spawn(async move {
+        // ── File bundles: proactively push FileData to DHT before anything else ──
+        // This guarantees the file is available in the receiver's DHT inbox even
+        // if the direct connection or relay is down.  Direct delivery below is
+        // then just an optimistic fast-path.
+        if is_file_bundle {
+            let parts: Vec<&str> = raw_content.splitn(5, ':').collect();
+            if parts.len() >= 2 {
+                let cid    = parts[1].to_string();
+                let ledger = crate::ledger::Ledger::load();
+                if let Some(file) = ledger.stored_files.iter().find(|f| f.cid == cid).cloned() {
+
+                    if cid.starts_with("egomfd1") {
+                        // ── Block-based: pre-deposit ManifestData in receiver's inbox ──
+                        // Blocks are already in the DHT global store (put during store_file).
+                        // We just need to deliver the manifest + key so the receiver can
+                        // reconstruct the block list and fetch any blocks they're missing.
+                        if let Ok(manifest) = crate::blocks::load_manifest(&cid) {
+                            if let Ok(manifest_json) = serde_json::to_string(&manifest) {
+                                let manifest_msg = p2p::P2PMessage::ManifestData {
+                                    manifest_cid:  cid.clone(),
+                                    manifest_json,
+                                    key_hex64:     file.key_nonce_hex.clone(),
+                                    file_name:     file.name.clone(),
+                                    from_addr:     my_addr.clone(),
+                                };
+                                deposit_in_relay_inbox(&contact_addr_key, &my_addr, &manifest_msg).await;
+                                eprintln!("[EgoSafe] ManifestData pre-deposited in DHT for {} ({} blocks)",
+                                    contact_addr_key, manifest.blocks.len());
+                            }
+                        }
+                    } else if !file.local_path.is_empty() && !file.local_path.starts_with("sender:") {
+                        // ── Legacy single-file: pre-deposit FileData in receiver's inbox ──
+                        match std::fs::read(&file.local_path) {
+                            Ok(enc_bytes) => {
+                                use base64::Engine as _;
+                                let enc_data_b64 = base64::engine::general_purpose::STANDARD
+                                    .encode(&enc_bytes);
+                                let file_data = p2p::P2PMessage::FileData {
+                                    cid:           cid.clone(),
+                                    enc_data_b64,
+                                    file_name:     file.name.clone(),
+                                    key_nonce_hex: file.key_nonce_hex.clone(),
+                                };
+                                const DHT_FILE_LIMIT: usize = 3 * 1024 * 1024;
+                                if enc_bytes.len() <= DHT_FILE_LIMIT {
+                                    deposit_in_relay_inbox(&contact_addr_key, &my_addr, &file_data).await;
+                                    eprintln!("[EgoSafe] FileData pre-deposited in DHT for {} ({} bytes)", contact_addr_key, enc_bytes.len());
+                                } else {
+                                    eprintln!("[EgoSafe] File too large for DHT ({} bytes) — relying on direct delivery + FileRequest pull", enc_bytes.len());
+                                }
+                            }
+                            Err(e) => eprintln!("[EgoSafe] Cannot read file for push: {}", e),
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Deliver ChatMessage (direct or DHT) ──────────────────────────────
         if stored_endpoint.is_empty() {
-            eprintln!("[Messenger] No endpoint for {} — cannot deliver", contact_addr_key);
+            eprintln!("[Messenger] No endpoint for {} — DHT only", contact_addr_key);
+            let p2p_msg = p2p::P2PMessage::ChatMessage { bundle };
+            deposit_in_relay_inbox(&contact_addr_key, &my_addr, &p2p_msg).await;
             return;
         }
         let endpoint = resolve_endpoint(&contact_addr_key, &stored_endpoint).await;
@@ -521,6 +587,47 @@ pub async fn send_message(
         if let Err(e) = p2p::send_message(&endpoint, &p2p_msg).await {
             eprintln!("[Messenger] deliver to {}: {} — depositing in relay inbox", endpoint, e);
             deposit_in_relay_inbox(&contact_addr_key, &my_addr, &p2p_msg).await;
+        }
+
+        // ── Also try direct ManifestData/FileData delivery as a fast-path ────
+        if is_file_bundle {
+            let parts: Vec<&str> = raw_content.splitn(5, ':').collect();
+            if parts.len() >= 2 {
+                let cid    = parts[1].to_string();
+                let ledger = crate::ledger::Ledger::load();
+                if let Some(file) = ledger.stored_files.iter().find(|f| f.cid == cid).cloned() {
+                    if cid.starts_with("egomfd1") {
+                        if let Ok(manifest) = crate::blocks::load_manifest(&cid) {
+                            if let Ok(manifest_json) = serde_json::to_string(&manifest) {
+                                let manifest_msg = p2p::P2PMessage::ManifestData {
+                                    manifest_cid:  cid.clone(),
+                                    manifest_json,
+                                    key_hex64:     file.key_nonce_hex.clone(),
+                                    file_name:     file.name.clone(),
+                                    from_addr:     my_addr.clone(),
+                                };
+                                if let Ok(()) = p2p::send_message(&endpoint, &manifest_msg).await {
+                                    eprintln!("[EgoSafe] ManifestData sent directly to {}", contact_addr_key);
+                                }
+                            }
+                        }
+                    } else if !file.local_path.is_empty() && !file.local_path.starts_with("sender:") {
+                        if let Ok(enc_bytes) = std::fs::read(&file.local_path) {
+                            use base64::Engine as _;
+                            let enc_data_b64 = base64::engine::general_purpose::STANDARD.encode(&enc_bytes);
+                            let file_data = p2p::P2PMessage::FileData {
+                                cid:           cid.clone(),
+                                enc_data_b64,
+                                file_name:     file.name.clone(),
+                                key_nonce_hex: file.key_nonce_hex.clone(),
+                            };
+                            if let Ok(()) = p2p::send_message(&endpoint, &file_data).await {
+                                eprintln!("[EgoSafe] FileData sent directly to {} ({} bytes)", contact_addr_key, enc_bytes.len());
+                            }
+                        }
+                    }
+                }
+            }
         }
     });
 

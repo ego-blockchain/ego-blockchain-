@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod blocks;
 mod chain_db;
 mod commands;
 mod config;

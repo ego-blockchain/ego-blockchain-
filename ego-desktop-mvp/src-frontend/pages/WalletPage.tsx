@@ -388,7 +388,13 @@ const WalletPage: React.FC = () => {
       setTxResult(res);
       await load(); reloadWallet();
     } catch (e: any) {
-      setCodeError(String(e).replace(/^.*Error:/, '').trim());
+      const msg = String(e).replace(/^.*Error:/, '').trim();
+      if (msg.includes('cancelled')) {
+        setEmailStep('expired');
+        setCodeError(msg);
+      } else {
+        setCodeError(msg);
+      }
     } finally {
       setCodeLoading(false);
     }

@@ -87,8 +87,12 @@ pub async fn try_auto_import(app: &AppHandle, content: &str, from_addr: &str) {
         return; // already imported — skip
     }
 
+    // For block-based files (egomfd1), we don't know block count until manifest arrives.
+    // blocks_total=0 signals "manifest not yet received"; will be updated by ManifestData handler.
+    let is_block_based = cid.starts_with("egomfd1");
     let stored = StoredFile {
         cid:             cid.to_string(),
+        manifest_cid:    if is_block_based { cid.to_string() } else { String::new() },
         name:            display_name.clone(),
         original_size:   0,
         encrypted_size:  0,
@@ -99,8 +103,23 @@ pub async fn try_auto_import(app: &AppHandle, content: &str, from_addr: &str) {
         key_nonce_hex:   key_nonce_hex.to_string(),
         local_path:      format!("sender:{}", from_addr),
         owner:           ledger.address.clone(),
+        blocks_total:    0,   // unknown until manifest arrives
+        blocks_received: 0,
         ..Default::default()
     };
+
+    // For block-based files, kick off a DHT manifest fetch immediately
+    if is_block_based {
+        let cid_str = cid.to_string();
+        tokio::spawn(async move {
+            if let Some(tx) = crate::p2p::DHT_CMD_TX.get() {
+                let _ = tx.send(crate::p2p::DhtCommand::GetPeers {
+                    key: format!("ego-manifest:{}", cid_str),
+                });
+                eprintln!("[EgoSafe] Kicked off DHT manifest fetch for {}", &cid_str[..16.min(cid_str.len())]);
+            }
+        });
+    }
     ledger.stored_files.insert(0, stored);
     if let Ok(()) = ledger.save() {
         let from_short = if from_addr.len() > 12 {
