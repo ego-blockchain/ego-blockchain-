@@ -1285,7 +1285,7 @@ async fn build_swarm(
                         max_circuits:              256,
                         max_circuits_per_peer:     8,
                         max_circuit_duration:      Duration::from_secs(7200),
-                        max_circuit_bytes:         0,
+                        max_circuit_bytes:         u64::MAX,
                         ..Default::default()
                     },
                 ),
@@ -1521,15 +1521,23 @@ async fn handle_event(
             }
         }
 
-        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+        SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
             if relay_addrs.contains_key(&peer_id) {
-                eprintln!("[P2P] Relay {} disconnected — clearing circuit", peer_id);
-                RELAY_CIRCUIT_READY.store(false, Ordering::Relaxed);
-                external_addrs.retain(|a| !a.to_string().contains("/p2p-circuit"));
-                // Remove the stale circuit listener so listen_on can re-register
-                // a fresh reservation when we reconnect.
-                if let Some(id) = circuit_listener.take() {
-                    swarm.remove_listener(id);
+                eprintln!("[P2P] Relay {} connection closed ({} remaining)", peer_id, num_established);
+                if num_established == 0 {
+                    // All connections to relay are gone — clear the circuit.
+                    // If we cleared on every ConnectionClosed (even when another
+                    // relay connection is still open), we would call remove_listener
+                    // prematurely: the Receiver side of the handler's to_listener
+                    // channel gets dropped, the handler's Reservation state flips to
+                    // None, and the next circuit request is denied with NO_RESERVATION
+                    // which the relay logs as UNEXPECTED_MESSAGE.
+                    eprintln!("[P2P] All relay connections gone — clearing circuit");
+                    RELAY_CIRCUIT_READY.store(false, Ordering::Relaxed);
+                    external_addrs.retain(|a| !a.to_string().contains("/p2p-circuit"));
+                    if let Some(id) = circuit_listener.take() {
+                        swarm.remove_listener(id);
+                    }
                 }
                 // Do NOT dial here — the relay_retry timer (every 15 s) will
                 // reconnect. Dialling immediately AND from the timer causes two
