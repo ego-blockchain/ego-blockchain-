@@ -1136,10 +1136,24 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                 if !has_circuit_addr(&external_addrs) {
                     for relay_str in RELAY_NODES {
                         if let Ok(addr) = relay_str.parse::<Multiaddr>() {
-                            let already = peer_id_from_multiaddr(&addr)
+                            let relay_pid = peer_id_from_multiaddr(&addr);
+                            let connected = relay_pid
                                 .map(|p| swarm.is_connected(&p))
                                 .unwrap_or(false);
-                            if !already {
+                            if connected && circuit_listener.is_none() {
+                                // Relay is connected but circuit listener closed —
+                                // re-register without re-dialling.
+                                let circuit_str = format!("{}/p2p-circuit", relay_str);
+                                if let Ok(caddr) = circuit_str.parse::<Multiaddr>() {
+                                    match swarm.listen_on(caddr) {
+                                        Ok(lid) => {
+                                            circuit_listener = Some(lid);
+                                            eprintln!("[P2P] Re-registering relay circuit");
+                                        }
+                                        Err(e) => eprintln!("[P2P] Re-register failed: {}", e),
+                                    }
+                                }
+                            } else if !connected {
                                 eprintln!("[P2P] Relay not connected — redialling {}", relay_str);
                                 let _ = swarm.dial(addr);
                             }
@@ -1180,7 +1194,7 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
             // ── Periodic DHT inbox poll (ContactResponse + offline messages) ──
             _ = dht_inbox_poll.tick() => {
                 let addr = crate::ledger::Ledger::load().address;
-                if !addr.is_empty() && RELAY_CIRCUIT_READY.load(Ordering::Relaxed) {
+                if !addr.is_empty() {
                     if let Some(tx) = DHT_CMD_TX.get() {
                         // Poll our mailbox for new messages
                         let mailbox_key = format!("ego-mailbox:{}", addr);
