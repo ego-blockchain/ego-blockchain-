@@ -285,8 +285,8 @@ const StoragePage: React.FC = () => {
                 The more you allocate, the more you earn.
               </p>
               <div className="bg-black/30 rounded-xl p-3 text-xs text-gray-400 mb-4">
-                Reward rate: <span className="text-green-400 font-semibold">0.5 EGOC / GB / day</span>
-                &nbsp;· Files stored by others are AES-256-GCM encrypted and you cannot read their contents.
+                Max reward rate: <span className="text-green-400 font-semibold">0.5 EGOC / GB / day</span> — earned only when your allocated space is actively used by the network.
+                &nbsp;Files stored by others are AES-256-GCM encrypted and you cannot read their contents.
               </div>
               <button
                 onClick={() => setShowProvConfig(true)}
@@ -318,10 +318,10 @@ const StoragePage: React.FC = () => {
           </div>
 
           <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
-            <div className="text-xs text-gray-400 mb-1">Daily Earnings</div>
+            <div className="text-xs text-gray-400 mb-1">Max Potential Rate</div>
             <div className="text-xl font-bold text-green-400">{earningsPerDay.toFixed(2)}</div>
             <div className="text-xs text-gray-500">EGOC / day</div>
-            <div className="text-xs text-green-500/70 mt-1">from {fmtBytes(allocated)} provision</div>
+            <div className="text-xs text-yellow-500/70 mt-1">if space is fully utilized</div>
           </div>
 
           <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
@@ -536,9 +536,12 @@ const StoragePage: React.FC = () => {
               </div>
               <div className="bg-gray-900 rounded-xl p-4 space-y-2 text-sm">
                 <div className="flex justify-between"><span className="text-gray-400">Allocation</span><span>{allocGb} GB</span></div>
-                <div className="flex justify-between"><span className="text-gray-400">Daily earnings</span><span className="text-green-400 font-bold">{(allocGb * 0.5).toFixed(2)} EGOC/day</span></div>
-                <div className="flex justify-between"><span className="text-gray-400">Monthly earnings</span><span className="text-green-400">{(allocGb * 0.5 * 30).toFixed(0)} EGOC/month</span></div>
-                <div className="flex justify-between"><span className="text-gray-400">Annual estimate</span><span className="text-green-400">{(allocGb * 0.5 * 365).toFixed(0)} EGOC/year</span></div>
+                <div className="flex justify-between"><span className="text-gray-400">Max daily rate</span><span className="text-green-400 font-bold">{(allocGb * 0.5).toFixed(2)} EGOC/day</span></div>
+                <div className="flex justify-between"><span className="text-gray-400">Max monthly rate</span><span className="text-green-400">{(allocGb * 0.5 * 30).toFixed(0)} EGOC/month</span></div>
+                <div className="flex justify-between"><span className="text-gray-400">Max annual rate</span><span className="text-green-400">{(allocGb * 0.5 * 365).toFixed(0)} EGOC/year</span></div>
+              </div>
+              <div className="text-xs text-yellow-600/80 bg-yellow-500/10 rounded-lg px-3 py-2">
+                ⚠️ These are maximum potential rates. Actual rewards are paid only when your allocated space is used by the network.
               </div>
               <div className="text-xs text-gray-500">
                 Files stored are encrypted by the uploader. You cannot read their contents.

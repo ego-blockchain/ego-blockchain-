@@ -69,42 +69,37 @@ pub async fn store_file(
         .unwrap_or("unknown")
         .to_string();
 
-    // CID = BLAKE2 hash of plaintext
-    let hash = ego_core::hash_data(&file_bytes);
-    let cid  = format!("egocid1{}", hash.to_hex());
-
-    // Encrypt with AES-256-GCM
-    let mut key_bytes   = [0u8; 32];
-    let mut nonce_bytes = [0u8; 12];
+    // ── IPFS-style block storage ──────────────────────────────────────────────
+    // Generate a single 32-byte AES key for this file.
+    // Each 256 KB block gets its own random nonce (stored in the manifest).
+    let mut key_bytes = [0u8; 32];
     OsRng.fill_bytes(&mut key_bytes);
-    OsRng.fill_bytes(&mut nonce_bytes);
 
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Key init: {e}")))?;
-    let nonce      = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher
-        .encrypt(nonce, file_bytes.as_ref())
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Encrypt: {e}")))?;
+    let (manifest, blocks_data) = crate::blocks::split_into_blocks(
+        &file_bytes, &file_name, &key_bytes,
+    ).map_err(|e| EgoDesktopError::CryptoError(e))?;
 
-    // Stored format: nonce (12 bytes) || ciphertext
-    let mut on_disk = Vec::with_capacity(12 + ciphertext.len());
-    on_disk.extend_from_slice(&nonce_bytes);
-    on_disk.extend_from_slice(&ciphertext);
-    let encrypted_size = on_disk.len() as u64;
+    // Save every block to disk
+    let mut encrypted_size: u64 = 0;
+    for (block_cid, enc_bytes) in &blocks_data {
+        crate::blocks::save_block(block_cid, enc_bytes)
+            .map_err(|e| EgoDesktopError::FileSystemError(e))?;
+        encrypted_size += enc_bytes.len() as u64;
+    }
 
-    let storage_path = storage_dir().join(format!("{}.enc", &cid[7..15]));
-    fs::write(&storage_path, &on_disk)
-        .map_err(|e| EgoDesktopError::FileSystemError(format!("Write enc: {e}")))?;
+    // Save the manifest (.mfd file)
+    let manifest_path = crate::blocks::save_manifest(&manifest)
+        .map_err(|e| EgoDesktopError::FileSystemError(e))?;
 
-    // key_nonce_hex = hex(key || nonce)
-    let mut key_nonce = Vec::with_capacity(44);
-    key_nonce.extend_from_slice(&key_bytes);
-    key_nonce.extend_from_slice(&nonce_bytes);
-    let key_nonce_hex = hex::encode(&key_nonce);
+    // CID is the manifest CID (content-addressed)
+    let cid = manifest.manifest_cid.clone();
+    // key_nonce_hex = just the 32-byte key (nonces live in the manifest)
+    let key_nonce_hex = hex::encode(key_bytes);
+    let blocks_total  = manifest.blocks.len() as u32;
 
     // Cost: 0.01 EGOC per MB per month
-    let mb        = (original_size as f64) / 1_000_000.0;
-    let cost_egoc = (mb * 0.01 * request.duration_months as f64).max(0.0001);
+    let mb         = (original_size as f64) / 1_000_000.0;
+    let cost_egoc  = (mb * 0.01 * request.duration_months as f64).max(0.0001);
     let cost_uegoc = (cost_egoc * 1_000_000.0) as u64;
 
     let now    = chrono::Utc::now().timestamp();
@@ -112,41 +107,27 @@ pub async fn store_file(
 
     let mut ledger = Ledger::load();
 
-    // Compute PoRep commitment over the encrypted bytes (what's on disk).
-    // This is the cryptographic proof that the file was replicated, binding
-    // the prover's address and CID to the actual stored data.
-    let porep = crate::proof::compute_porep_commitment(&on_disk, &ledger.address, &cid);
-
-    // Assign a monotonically-increasing sector ID from the ledger.
-    let sector_id = ledger.stored_files
-        .iter()
-        .filter_map(|f| if f.sector_id > 0 { Some(f.sector_id) } else { None })
-        .max()
-        .unwrap_or(0) + 1;
-
     let stored = StoredFile {
-        cid:              cid.clone(),
-        name:             file_name.clone(),
+        cid:             cid.clone(),
+        name:            file_name.clone(),
         original_size,
         encrypted_size,
-        duration_months:  request.duration_months,
-        stored_at:        now,
+        duration_months: request.duration_months,
+        stored_at:       now,
         expiry,
-        status:           "Active".into(),
-        key_nonce_hex:    key_nonce_hex.clone(),
-        local_path:       storage_path.to_string_lossy().into(),
-        owner:            ledger.address.clone(),
-        comm_d:           hex::encode(porep.comm_d),
-        comm_r:           hex::encode(porep.comm_r),
-        sector_id,
-        n_real_leaves:    porep.n_real_leaves,
-        n_padded_leaves:  porep.n_padded_leaves,
-        post_status:      String::new(), // will become "registered" after relay ACKs
-        last_proved:      None,
+        status:          "Active".into(),
+        key_nonce_hex:   key_nonce_hex.clone(),
+        local_path:      manifest_path.to_string_lossy().into(),
+        owner:           ledger.address.clone(),
+        manifest_cid:    cid.clone(),
+        blocks_total,
+        blocks_received: blocks_total, // we own all blocks
+        ..Default::default()
     };
-    // Deduct storage cost from the shared chain (authoritative balance).
-    let mut chain = load_chain();
-    let balance   = chain.balance_of(&ledger.address);
+
+    // Deduct storage cost
+    let mut chain   = load_chain();
+    let balance     = chain.balance_of(&ledger.address);
     if cost_uegoc > balance {
         return Err(EgoDesktopError::InvalidInput(format!(
             "Insufficient balance: have {} uEGOC, need {} uEGOC for storage",
@@ -164,42 +145,55 @@ pub async fn store_file(
         from:               ledger.address.clone(),
         to:                 "egot1storage0000000000000000000000000000000000".into(),
         amount:             cost_uegoc,
-        memo:               Some(format!("Storage: {file_name}")),
+        memo:               Some(format!("Storage: {file_name} ({} blocks)", blocks_total)),
         timestamp:          now,
         signature:          "storage".into(),
         status:             "Confirmed".into(),
         block_height:       None,
         nonce:              0,
-        public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
+        public_key_ed25519: String::new(),
+        dilithium_pubkey:   String::new(),
+        dilithium_signature: String::new(),
         ..LedgerTx::default()
     });
     save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save chain: {e}")))?;
 
-    // Store file metadata in per-wallet ledger (files are wallet-local).
     ledger.stored_files.insert(0, stored);
     ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save ledger: {e}")))?;
 
-    // Register this CID on the relay shard so any peer can discover us as a holder.
-    // Also register the PoRep commitment so the relay can issue PoST challenges.
+    // Publish manifest + all blocks to the DHT global store so any peer can
+    // fetch them by CID without a direct connection to us.
     {
-        let cid2    = cid.clone();
-        let addr2   = ledger.address.clone();
-        let comm_d2 = hex::encode(porep.comm_d);
-        let comm_r2 = hex::encode(porep.comm_r);
-        let n_real2   = porep.n_real_leaves;
-        let n_padded2 = porep.n_padded_leaves;
-        let sec_id2   = sector_id;
+        let cid2      = cid.clone();
+        let addr2     = ledger.address.clone();
+        let manifest2 = manifest.clone();
         let expiry2   = expiry;
-        let file_size2 = encrypted_size;
         tokio::spawn(async move {
             let endpoint = crate::p2p::get_public_endpoint().await;
             if !endpoint.is_empty() {
                 crate::p2p::register_cid_on_relay(&cid2, &addr2, &endpoint).await;
             }
-            // Register PoRep commitment — enables relay to issue PoST challenges.
+            // Put manifest in global DHT
+            if let Ok(mfd_bytes) = serde_json::to_vec(&manifest2) {
+                if let Some(tx) = crate::p2p::DHT_CMD_TX.get() {
+                    let key = format!("ego-manifest:{}", cid2);
+                    let _ = tx.send(crate::p2p::DhtCommand::PutPeer { key, value: mfd_bytes });
+                    eprintln!("[Blocks] Manifest {} published to DHT ({} blocks)", &cid2[..16], manifest2.blocks.len());
+                }
+            }
+            // Put each block in global DHT
+            for entry in &manifest2.blocks {
+                if let Ok(enc_bytes) = crate::blocks::load_block(&entry.block_cid) {
+                    if let Some(tx) = crate::p2p::DHT_CMD_TX.get() {
+                        let key = format!("ego-block:{}", entry.block_cid);
+                        let _ = tx.send(crate::p2p::DhtCommand::PutPeer { key, value: enc_bytes });
+                    }
+                }
+            }
+            eprintln!("[Blocks] {} blocks published to DHT for {}", manifest2.blocks.len(), &cid2[..16]);
+            // Keep relay TTL alive for this file's expiry
             crate::p2p::register_porep_commitment(
-                &cid2, &addr2, &comm_d2, &comm_r2,
-                n_real2, n_padded2, sec_id2, file_size2, expiry2,
+                &cid2, &addr2, "", "", 0, 0, 0, expiry2 as u64, expiry2,
             ).await;
         });
     }
@@ -329,30 +323,49 @@ pub async fn retrieve_file_preview(
         });
     }
 
-    let on_disk = fs::read(&file.local_path)
-        .map_err(|e| EgoDesktopError::FileSystemError(format!("Read enc: {e}")))?;
-
-    if on_disk.len() < 13 {
-        return Err(EgoDesktopError::FileSystemError("Encrypted file too short".into()));
-    }
-
-    // Stored format: nonce(12) || ciphertext
-    let nonce_bytes = &on_disk[..12];
-    let ciphertext  = &on_disk[12..];
-
-    let key_nonce = hex::decode(&file.key_nonce_hex)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Decode key: {e}")))?;
-    if key_nonce.len() < 32 {
-        return Err(EgoDesktopError::CryptoError("Key too short".into()));
-    }
-    let key_bytes = &key_nonce[..32];
-
-    let cipher = Aes256Gcm::new_from_slice(key_bytes)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Key init: {e}")))?;
-    let nonce = Nonce::from_slice(nonce_bytes);
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Decrypt: {e}")))?;
+    // ── Decrypt: block-based (egomfd1) or legacy single-file ─────────────────
+    let plaintext: Vec<u8> = if file.cid.starts_with("egomfd1") {
+        let manifest = crate::blocks::load_manifest(&file.cid)
+            .map_err(|e| EgoDesktopError::FileSystemError(e))?;
+        if !crate::blocks::have_all_blocks(&manifest) {
+            let got   = crate::blocks::blocks_received_count(&manifest);
+            let total = manifest.blocks.len() as u32;
+            return Ok(FilePreview {
+                name:        file.name,
+                mime_type:   "application/octet-stream".into(),
+                data_base64: String::new(),
+                size_bytes:  file.original_size,
+                previewable: false,
+            });
+        }
+        let key_vec = hex::decode(&file.key_nonce_hex)
+            .map_err(|e| EgoDesktopError::CryptoError(format!("Decode key: {e}")))?;
+        if key_vec.len() < 32 {
+            return Err(EgoDesktopError::CryptoError("Key too short".into()));
+        }
+        let key_arr: &[u8; 32] = key_vec[..32].try_into()
+            .map_err(|_| EgoDesktopError::CryptoError("Key slice error".into()))?;
+        crate::blocks::reassemble_blocks(&manifest, key_arr)
+            .map_err(|e| EgoDesktopError::CryptoError(e))?
+    } else {
+        let on_disk = fs::read(&file.local_path)
+            .map_err(|e| EgoDesktopError::FileSystemError(format!("Read enc: {e}")))?;
+        if on_disk.len() < 13 {
+            return Err(EgoDesktopError::FileSystemError("Encrypted file too short".into()));
+        }
+        let nonce_bytes = &on_disk[..12];
+        let ciphertext  = &on_disk[12..];
+        let key_nonce = hex::decode(&file.key_nonce_hex)
+            .map_err(|e| EgoDesktopError::CryptoError(format!("Decode key: {e}")))?;
+        if key_nonce.len() < 32 {
+            return Err(EgoDesktopError::CryptoError("Key too short".into()));
+        }
+        let cipher = Aes256Gcm::new_from_slice(&key_nonce[..32])
+            .map_err(|e| EgoDesktopError::CryptoError(format!("Key init: {e}")))?;
+        let nonce = Nonce::from_slice(nonce_bytes);
+        cipher.decrypt(nonce, ciphertext)
+            .map_err(|e| EgoDesktopError::CryptoError(format!("Decrypt: {e}")))?
+    };
 
     // Detect MIME type from extension
     let ext = file.name.rsplit('.').next().unwrap_or("").to_lowercase();
@@ -408,23 +421,42 @@ pub async fn save_file_to_disk(
     if file.local_path.is_empty() || file.local_path.starts_with("sender:") {
         return Err(EgoDesktopError::FileSystemError("No local encrypted copy".into()));
     }
-    let on_disk = fs::read(&file.local_path)
-        .map_err(|e| EgoDesktopError::FileSystemError(format!("Read enc: {e}")))?;
-    if on_disk.len() < 13 {
-        return Err(EgoDesktopError::FileSystemError("Encrypted file too short".into()));
-    }
-    let nonce_bytes = &on_disk[..12];
-    let ciphertext  = &on_disk[12..];
-    let key_nonce = hex::decode(&file.key_nonce_hex)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Decode key: {e}")))?;
-    if key_nonce.len() < 32 {
-        return Err(EgoDesktopError::CryptoError("Key too short".into()));
-    }
-    let cipher = Aes256Gcm::new_from_slice(&key_nonce[..32])
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Key init: {e}")))?;
-    let nonce = Nonce::from_slice(nonce_bytes);
-    let plaintext = cipher.decrypt(nonce, ciphertext)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Decrypt: {e}")))?;
+    let plaintext: Vec<u8> = if file.cid.starts_with("egomfd1") {
+        let manifest = crate::blocks::load_manifest(&file.cid)
+            .map_err(|e| EgoDesktopError::FileSystemError(e))?;
+        if !crate::blocks::have_all_blocks(&manifest) {
+            return Err(EgoDesktopError::FileSystemError(
+                "File blocks not fully received yet".into(),
+            ));
+        }
+        let key_vec = hex::decode(&file.key_nonce_hex)
+            .map_err(|e| EgoDesktopError::CryptoError(format!("Decode key: {e}")))?;
+        if key_vec.len() < 32 {
+            return Err(EgoDesktopError::CryptoError("Key too short".into()));
+        }
+        let key_arr: &[u8; 32] = key_vec[..32].try_into()
+            .map_err(|_| EgoDesktopError::CryptoError("Key slice error".into()))?;
+        crate::blocks::reassemble_blocks(&manifest, key_arr)
+            .map_err(|e| EgoDesktopError::CryptoError(e))?
+    } else {
+        let on_disk = fs::read(&file.local_path)
+            .map_err(|e| EgoDesktopError::FileSystemError(format!("Read enc: {e}")))?;
+        if on_disk.len() < 13 {
+            return Err(EgoDesktopError::FileSystemError("Encrypted file too short".into()));
+        }
+        let nonce_bytes = &on_disk[..12];
+        let ciphertext  = &on_disk[12..];
+        let key_nonce = hex::decode(&file.key_nonce_hex)
+            .map_err(|e| EgoDesktopError::CryptoError(format!("Decode key: {e}")))?;
+        if key_nonce.len() < 32 {
+            return Err(EgoDesktopError::CryptoError("Key too short".into()));
+        }
+        let cipher = Aes256Gcm::new_from_slice(&key_nonce[..32])
+            .map_err(|e| EgoDesktopError::CryptoError(format!("Key init: {e}")))?;
+        let nonce = Nonce::from_slice(nonce_bytes);
+        cipher.decrypt(nonce, ciphertext)
+            .map_err(|e| EgoDesktopError::CryptoError(format!("Decrypt: {e}")))?
+    };
     fs::write(&dest_path, &plaintext)
         .map_err(|e| EgoDesktopError::FileSystemError(format!("Write: {e}")))?;
     Ok(())
@@ -454,14 +486,24 @@ pub async fn request_file_from_contact(
 ) -> Result<(), EgoDesktopError> {
     use crate::commands::messenger::load_contacts;
 
-    // 1. Import into ledger so EgoSafe shows it immediately (as "pending download")
+    // 1. Import into ledger so EgoSafe shows it immediately (as "pending download").
+    //    If the file was previously marked "Failed" (timeout), reset it to "Received"
+    //    so the timeout watcher restarts and the UI shows it as pending again.
     crate::commands::notifications::try_auto_import(&app, &content, &from_addr).await;
+    {
+        let mut ledger = crate::ledger::Ledger::load();
+        if let Some(f) = ledger.stored_files.iter_mut().find(|f| f.cid == cid) {
+            if f.status == "Failed" {
+                f.status = "Received".to_string();
+                f.local_path = format!("sender:{}", from_addr);
+                let _ = ledger.save();
+            }
+        }
+    }
 
-    // 2. Find contact and build endpoint list
+    // 2. Find any stored contact info (approved or not) for endpoint hints
     let contacts = load_contacts();
-    let contact = contacts.iter()
-        .find(|c| c.address == from_addr && c.status == "approved")
-        .ok_or_else(|| EgoDesktopError::NotFound("Contact not found".into()))?;
+    let contact_info = contacts.iter().find(|c| c.address == from_addr);
 
     let my_addr     = crate::ledger::Ledger::load().address.clone();
     let my_endpoint = crate::p2p::get_public_endpoint().await;
@@ -471,17 +513,18 @@ pub async fn request_file_from_contact(
         requester_endpoint: my_endpoint,
     };
 
-    // 3. Build multi-path endpoint list: all_endpoints first, fallback to relay lookup
-    let mut eps = contact.all_endpoints.clone();
-    if eps.is_empty() {
-        let relay_ep = crate::p2p::get_relay_endpoint(&from_addr).await
-            .unwrap_or_else(|| contact.endpoint.clone());
-        if !relay_ep.is_empty() {
-            eps.push(relay_ep);
+    // 3. Build multi-path endpoint list: contact endpoints, relay lookup, shard registry
+    let mut eps: Vec<String> = Vec::new();
+    if let Some(c) = contact_info {
+        eps.extend(c.all_endpoints.clone());
+        if !c.endpoint.is_empty() && !eps.contains(&c.endpoint) {
+            eps.push(c.endpoint.clone());
         }
     }
-    if !eps.contains(&contact.endpoint) && !contact.endpoint.is_empty() {
-        eps.push(contact.endpoint.clone());
+    if eps.is_empty() {
+        if let Some(relay_ep) = crate::p2p::get_relay_endpoint(&from_addr).await {
+            if !relay_ep.is_empty() { eps.push(relay_ep); }
+        }
     }
 
     // 4. Shard registry fallback — query relay to discover holders we don't have as contacts.
@@ -540,26 +583,44 @@ pub async fn download_stored_file(
         ));
     }
 
-    let on_disk = fs::read(&file.local_path)
-        .map_err(|e| EgoDesktopError::FileSystemError(format!("Read enc: {e}")))?;
-    if on_disk.len() < 13 {
-        return Err(EgoDesktopError::FileSystemError("Encrypted file too short".into()));
-    }
-
-    let nonce_bytes = &on_disk[..12];
-    let ciphertext  = &on_disk[12..];
-
-    let key_nonce = hex::decode(&file.key_nonce_hex)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Decode key: {e}")))?;
-    if key_nonce.len() < 32 {
-        return Err(EgoDesktopError::CryptoError("Key too short".into()));
-    }
-
-    let cipher = Aes256Gcm::new_from_slice(&key_nonce[..32])
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Key init: {e}")))?;
-    let nonce     = Nonce::from_slice(nonce_bytes);
-    let plaintext = cipher.decrypt(nonce, ciphertext)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Decrypt: {e}")))?;
+    let plaintext: Vec<u8> = if file.cid.starts_with("egomfd1") {
+        let manifest = crate::blocks::load_manifest(&file.cid)
+            .map_err(|e| EgoDesktopError::FileSystemError(e))?;
+        if !crate::blocks::have_all_blocks(&manifest) {
+            let got   = crate::blocks::blocks_received_count(&manifest);
+            let total = manifest.blocks.len() as u32;
+            return Err(EgoDesktopError::FileSystemError(format!(
+                "File not fully received yet ({got}/{total} blocks)",
+            )));
+        }
+        let key_vec = hex::decode(&file.key_nonce_hex)
+            .map_err(|e| EgoDesktopError::CryptoError(format!("Decode key: {e}")))?;
+        if key_vec.len() < 32 {
+            return Err(EgoDesktopError::CryptoError("Key too short".into()));
+        }
+        let key_arr: &[u8; 32] = key_vec[..32].try_into()
+            .map_err(|_| EgoDesktopError::CryptoError("Key slice error".into()))?;
+        crate::blocks::reassemble_blocks(&manifest, key_arr)
+            .map_err(|e| EgoDesktopError::CryptoError(e))?
+    } else {
+        let on_disk = fs::read(&file.local_path)
+            .map_err(|e| EgoDesktopError::FileSystemError(format!("Read enc: {e}")))?;
+        if on_disk.len() < 13 {
+            return Err(EgoDesktopError::FileSystemError("Encrypted file too short".into()));
+        }
+        let nonce_bytes = &on_disk[..12];
+        let ciphertext  = &on_disk[12..];
+        let key_nonce = hex::decode(&file.key_nonce_hex)
+            .map_err(|e| EgoDesktopError::CryptoError(format!("Decode key: {e}")))?;
+        if key_nonce.len() < 32 {
+            return Err(EgoDesktopError::CryptoError("Key too short".into()));
+        }
+        let cipher = Aes256Gcm::new_from_slice(&key_nonce[..32])
+            .map_err(|e| EgoDesktopError::CryptoError(format!("Key init: {e}")))?;
+        let nonce = Nonce::from_slice(nonce_bytes);
+        cipher.decrypt(nonce, ciphertext)
+            .map_err(|e| EgoDesktopError::CryptoError(format!("Decrypt: {e}")))?
+    };
 
     // Resolve Downloads folder
     let downloads_dir = dirs::download_dir()

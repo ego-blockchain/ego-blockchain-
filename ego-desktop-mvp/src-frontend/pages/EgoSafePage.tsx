@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { open as openDialog } from '@tauri-apps/api/dialog';
 import { listen } from '@tauri-apps/api/event';
+import { useNavigate } from 'react-router-dom';
 import { useWallet } from '../App';
 import { useConfirm } from '../hooks/useConfirm';
 
@@ -25,6 +26,8 @@ interface StoredFile {
   status: string;
   key_nonce_hex: string;
   local_path: string;
+  blocks_total: number;
+  blocks_received: number;
 }
 
 interface SharedFile {
@@ -79,6 +82,7 @@ const EgoSafePage: React.FC = () => {
   const { wallet } = useWallet();
   const myAddress  = wallet?.address ?? '';
   const { confirm, ConfirmDialog } = useConfirm();
+  const navigate   = useNavigate();
 
   // ── Share-new-file flow state ──────────────────────────────────────────────
   const [shared, setShared]           = useState<SharedFile[]>([]);
@@ -101,6 +105,7 @@ const EgoSafePage: React.FC = () => {
   const [sendTarget, setSendTarget]         = useState<StoredFile | null>(null);
   const [sending, setSending]               = useState(false);
   const [sendMsg, setSendMsg]               = useState('');
+  const [sentToContact, setSentToContact]   = useState<Contact | null>(null);
 
   // ── Import shared file state ───────────────────────────────────────────────
   const [showImport, setShowImport]   = useState(false);
@@ -119,13 +124,15 @@ useEffect(() => {
   invoke<Contact[]>('get_contacts')
     .then(cs => setContacts(cs.filter(c => c.status === 'approved')))
     .catch(() => {});
-  const unlistenMsg    = listen('ego://message-received', () => { loadStoredFiles(); });
-  const unlistenDl     = listen('ego://file-downloaded',  () => { loadStoredFiles(); });
-  const unlistenFailed = listen('ego://file-failed',      () => { loadStoredFiles(); });
+  const unlistenMsg      = listen('ego://message-received',  () => { loadStoredFiles(); });
+  const unlistenDl       = listen('ego://file-downloaded',   () => { loadStoredFiles(); });
+  const unlistenFailed   = listen('ego://file-failed',       () => { loadStoredFiles(); });
+  const unlistenProgress = listen('ego://block-progress',    () => { loadStoredFiles(); });
   return () => {
     unlistenMsg.then(fn => fn());
     unlistenDl.then(fn => fn());
     unlistenFailed.then(fn => fn());
+    unlistenProgress.then(fn => fn());
   };
 }, []);
 
@@ -140,7 +147,8 @@ useEffect(() => {
   // ── Import handler ─────────────────────────────────────────────────────────
 
   async function handleImport() {
-    const parts = importBundle.trim().split(':');
+    const trimmed = importBundle.trim();
+    const parts = trimmed.split(':');
     if (parts.length < 5 || parts[0] !== 'egoshare1') {
       setImportMsg('Invalid bundle. Expected: egoshare1:cid:key:name64:from_address');
       return;
@@ -154,7 +162,14 @@ useEffect(() => {
       await invoke('import_shared_file', {
         bundle: { cid, key_nonce_hex, display_name, from_address },
       });
-      setImportMsg('File imported successfully!');
+      // Trigger FileRequest so the sender delivers the actual file data.
+      // Fire-and-forget — ignore errors (sender may be offline, will retry later).
+      invoke('request_file_from_contact', {
+        cid,
+        fromAddr: from_address,
+        content: trimmed,
+      }).catch(() => {});
+      setImportMsg('File imported — requesting from sender…');
       await loadStoredFiles();
       setTimeout(() => { setShowImport(false); setImportBundle(''); setImportMsg(''); }, 2000);
     } catch (e: any) {
@@ -176,6 +191,7 @@ useEffect(() => {
     if (!sendTarget) return;
     setSending(true);
     setSendMsg('');
+    setSentToContact(null);
     const bundle = buildShareBundle(sendTarget, myAddress);
     try {
       await invoke('send_message', {
@@ -183,8 +199,8 @@ useEffect(() => {
         content: bundle,
         messageType: 'file_bundle',
       });
+      setSentToContact(contact);
       setSendMsg(`✓ Sent to ${contact.name}!`);
-      setTimeout(() => { setSendTarget(null); setSendMsg(''); }, 1800);
     } catch (e: any) {
       setSendMsg('✕ ' + String(e));
     } finally {
@@ -252,9 +268,9 @@ useEffect(() => {
           </div>
         </div>
         <div className="flex gap-6 text-sm text-purple-200 mt-3">
-          <span>🔒 XChaCha20-Poly1305</span>
-          <span>🔑 Kyber ML-KEM-768 keys</span>
-          <span>🗄️ RS 8+4 erasure coded</span>
+          <span>🔒 AES-256-GCM</span>
+          <span>🔑 Ed25519 signed</span>
+          <span>🗄️ Local encrypted storage</span>
         </div>
       </div>
 
@@ -564,8 +580,12 @@ useEffect(() => {
     </div>
     <div className="divide-y divide-gray-700/50">
       {receivedFiles.map(file => {
-        const isFailed = file.status === 'Failed';
-        const isReady  = !!file.local_path && !file.local_path.startsWith('sender:') && !isFailed;
+        const isFailed   = file.status === 'Failed';
+        const isBlocks   = file.blocks_total > 0;
+        const blocksReady = isBlocks && file.blocks_received >= file.blocks_total;
+        const isReady    = (!isBlocks && !!file.local_path && !file.local_path.startsWith('sender:') && !isFailed)
+                        || blocksReady;
+        const blockPct   = isBlocks ? Math.round((file.blocks_received / file.blocks_total) * 100) : 0;
         return (
           <div key={file.cid} className="px-5 py-4">
             <div className="flex items-center gap-4">
@@ -573,6 +593,20 @@ useEffect(() => {
               <div className="min-w-0 flex-1">
                 <div className="text-sm font-medium truncate">{file.name}</div>
                 <div className="font-mono text-xs text-green-400 truncate mt-0.5">{file.cid.slice(0, 20)}…</div>
+                {isBlocks && !isReady && !isFailed && (
+                  <div className="mt-1.5">
+                    <div className="flex justify-between text-xs text-gray-400 mb-0.5">
+                      <span>Blocks: {file.blocks_received}/{file.blocks_total}</span>
+                      <span>{blockPct}%</span>
+                    </div>
+                    <div className="w-full bg-gray-700 rounded-full h-1.5">
+                      <div
+                        className="bg-blue-500 h-1.5 rounded-full transition-all duration-300"
+                        style={{ width: `${blockPct}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
                 {isVideoFile(file.name) && (
                   <div className="text-xs text-blue-400 mt-0.5">🎬 Video — delivered in chunks</div>
                 )}
@@ -619,12 +653,31 @@ useEffect(() => {
                 ) : isFailed ? (
                   <button
                     onClick={async () => {
-                      try {
-                        await invoke('delete_stored_file', { cid: file.cid });
-                        await loadStoredFiles();
-                      } catch {}
+                      // Extract sender address from local_path ("sender:{addr}") if available
+                      const fromAddr = file.local_path.startsWith('sender:')
+                        ? file.local_path.slice(7)
+                        : '';
+                      if (fromAddr) {
+                        const name64 = btoa(unescape(encodeURIComponent(file.name)));
+                        const bundle = `egoshare1:${file.cid}:${file.key_nonce_hex}:${name64}:${fromAddr}`;
+                        // Reset status to Received so it shows "Incoming…" again
+                        try {
+                          await invoke('request_file_from_contact', {
+                            cid: file.cid,
+                            fromAddr,
+                            content: bundle,
+                          });
+                          await loadStoredFiles();
+                        } catch (e: any) { alert('Retry failed: ' + String(e)); }
+                      } else {
+                        // No sender info — just remove the failed entry
+                        try {
+                          await invoke('delete_stored_file', { cid: file.cid });
+                          await loadStoredFiles();
+                        } catch {}
+                      }
                     }}
-                    className="text-xs bg-red-600/20 hover:bg-red-600/40 text-red-400 px-3 py-1.5 rounded-lg transition font-medium"
+                    className="text-xs bg-yellow-600/20 hover:bg-yellow-600/40 text-yellow-400 px-3 py-1.5 rounded-lg transition font-medium"
                   >
                     🔄 Retry
                   </button>
@@ -782,7 +835,7 @@ useEffect(() => {
           <div className="bg-gray-800 rounded-2xl w-full max-w-sm border border-gray-700 shadow-2xl">
             <div className="px-5 py-4 border-b border-gray-700 flex items-center justify-between">
               <h3 className="font-bold">Send File to Contact</h3>
-              <button onClick={() => { setSendTarget(null); setSendMsg(''); }} className="text-gray-400 hover:text-white text-xl">✕</button>
+              <button onClick={() => { setSendTarget(null); setSendMsg(''); setSentToContact(null); }} className="text-gray-400 hover:text-white text-xl">✕</button>
             </div>
             <div className="p-5 space-y-3">
               <div className="bg-gray-900 rounded-xl px-4 py-3 text-sm">
@@ -823,6 +876,14 @@ useEffect(() => {
                 }`}>
                   {sendMsg}
                 </div>
+              )}
+              {sentToContact && (
+                <button
+                  onClick={() => navigate('/messenger')}
+                  className="w-full py-2.5 bg-purple-600 hover:bg-purple-500 rounded-xl text-sm font-semibold transition"
+                >
+                  💬 View in Messenger →
+                </button>
               )}
             </div>
           </div>

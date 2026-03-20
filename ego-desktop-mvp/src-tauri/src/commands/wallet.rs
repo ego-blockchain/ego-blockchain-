@@ -14,6 +14,10 @@ use tauri::State;
 static PENDING_TXS: Lazy<Mutex<HashMap<String, (LedgerTx, i64)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+// tx_id → failed attempt count
+static TX_ATTEMPTS: Lazy<Mutex<HashMap<String, u32>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Balance {
     pub egoc: u64,
@@ -548,13 +552,32 @@ pub async fn confirm_tx_code(
     tx_id:  String,
     code:   String,
 ) -> Result<TransactionResponse, EgoDesktopError> {
-    // Verify OTP
+    // Verify OTP — cancel transaction after 3 failed attempts
     let valid = crate::email::verify_otp(&format!("tx:{}", tx_id), code.trim());
     if !valid {
+        let attempts = {
+            let mut map = TX_ATTEMPTS.lock().unwrap();
+            let count = map.entry(tx_id.clone()).or_insert(0);
+            *count += 1;
+            *count
+        };
+        if attempts >= 3 {
+            // Cancel: remove pending tx and reset attempt counter
+            PENDING_TXS.lock().unwrap().remove(&tx_id);
+            TX_ATTEMPTS.lock().unwrap().remove(&tx_id);
+            return Err(EgoDesktopError::InvalidInput(
+                "Too many failed attempts. Transaction has been cancelled.".into(),
+            ));
+        }
         return Err(EgoDesktopError::InvalidInput(
-            "Incorrect or expired code. Please check your email and try again.".into(),
+            format!("Incorrect code. {} attempt{} remaining.",
+                3 - attempts,
+                if 3 - attempts == 1 { "" } else { "s" }
+            ),
         ));
     }
+    // Clear attempt counter on success
+    TX_ATTEMPTS.lock().unwrap().remove(&tx_id);
 
     // Retrieve the pending tx
     let tx = {

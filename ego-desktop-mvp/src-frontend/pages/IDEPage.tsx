@@ -1,7 +1,15 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { RPC_URL } from '../config';
-import Editor from '@monaco-editor/react';
+import Editor, { loader } from '@monaco-editor/react';
+import * as monaco from 'monaco-editor';
+import editorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
 import { invoke } from '@tauri-apps/api/tauri';
+
+// Configure Monaco to use locally bundled workers (no CDN needed in Tauri).
+(self as any).MonacoEnvironment = {
+  getWorker() { return new editorWorker(); },
+};
+loader.config({ monaco });
 import { open as dialogOpen } from '@tauri-apps/api/dialog';
 import { readDir, readTextFile, writeTextFile, createDir, type FileEntry } from '@tauri-apps/api/fs';
 
@@ -1758,7 +1766,7 @@ export default function IDEPage() {
           <div className="flex-1 min-h-0">
             {currentFile ? (
               <Editor
-                key={activeFile}
+                key={`${activeProject}::${activeFile}`}
                 height="100%"
                 theme="vs-dark"
                 language={currentFile.language}

@@ -20,7 +20,7 @@ use libp2p::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{collections::HashMap, io, sync::OnceLock, time::Duration};
+use std::{collections::HashMap, io, sync::{Mutex, OnceLock}, time::Duration};
 use tauri::Manager;
 use tokio::sync::{mpsc, oneshot};
 
@@ -30,10 +30,17 @@ use tokio::sync::{mpsc, oneshot};
 static GOSSIP_TX: OnceLock<mpsc::UnboundedSender<(String, Vec<u8>)>> = OnceLock::new();
 
 /// DHT command channel: send put/get requests into the swarm loop.
-static DHT_CMD_TX: OnceLock<mpsc::UnboundedSender<DhtCommand>> = OnceLock::new();
+pub static DHT_CMD_TX: OnceLock<mpsc::UnboundedSender<DhtCommand>> = OnceLock::new();
+
+/// Pending mailbox appends: addr → list of msg_hash strings waiting to be merged
+/// into the DHT `ego-mailbox:{addr}` list record.
+static PENDING_MAILBOX_APPENDS: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+fn pending_appends() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    PENDING_MAILBOX_APPENDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug)]
-enum DhtCommand {
+pub enum DhtCommand {
     PutPeer { key: String, value: Vec<u8> },
     GetPeers { key: String },
 }
@@ -129,6 +136,7 @@ fn dht_seen() -> std::sync::MutexGuard<'static, std::collections::HashSet<String
         .lock()
         .unwrap()
 }
+
 
 fn peer_relay_nodes() -> std::sync::MutexGuard<'static, HashMap<String, String>> {
     PEER_RELAY_NODES
@@ -315,6 +323,35 @@ pub enum P2PMessage {
         shard_id:           u32,
         volunteer_address:  String,
         volunteer_endpoint: String,
+    },
+    // ── IPFS-style block transfer ──────────────────────────────────────────────
+    /// Request a file manifest by its CID (`egomfd1…`).
+    ManifestRequest {
+        manifest_cid:       String,
+        requester_addr:     String,
+        requester_endpoint: String,
+    },
+    /// Response carrying the full manifest JSON.
+    ManifestData {
+        manifest_cid:  String,
+        manifest_json: String,   // serde_json of blocks::FileManifest
+        key_hex64:     String,   // 32-byte AES key as 64-char hex
+        file_name:     String,
+        from_addr:     String,
+    },
+    /// Request one 256 KB encrypted block by its CID (`egoblk1…`).
+    BlockRequest {
+        block_cid:          String,
+        manifest_cid:       String,   // context for progress tracking
+        requester_addr:     String,
+        requester_endpoint: String,
+    },
+    /// Response carrying one encrypted block.
+    BlockData {
+        block_cid:    String,
+        manifest_cid: String,
+        enc_b64:      String,   // base64 of the encrypted 256 KB chunk
+        from_addr:    String,
     },
 }
 
@@ -702,8 +739,15 @@ pub async fn broadcast_peer_announce(app: &tauri::AppHandle) {
         city:      my_city,
         country:   my_country,
     };
-    // Send to approved contacts only — pending contacts haven't confirmed
-    // protocol compatibility yet.
+
+    // Publish over gossipsub so that peers whose stored endpoint for us is stale
+    // (e.g. after a WiFi/LAN change) still learn our new relay circuit address once
+    // the gossipsub mesh reforms through the relay.
+    if let Ok(data) = serde_json::to_vec(&msg) {
+        publish_gossip("ego-peers-v1", data).await;
+    }
+
+    // Also send directly to approved contacts — faster delivery when endpoints are fresh.
     for contact in load_contacts().iter().filter(|c| c.status == "approved" && !c.endpoint.is_empty()) {
         let endpoint  = contact.endpoint.clone();
         let msg_clone = msg.clone();
@@ -1007,6 +1051,13 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     let shard_topic = gossipsub::IdentTopic::new("ego-shards-v1");
     swarm.behaviour_mut().gossipsub.subscribe(&shard_topic).ok();
 
+    // Peer presence / endpoint updates — critical for surviving network changes.
+    // When a peer changes WiFi/LAN their relay circuit address changes; publishing
+    // here lets all mesh subscribers learn the new endpoint even if our stored
+    // address for them is stale.
+    let peers_topic = gossipsub::IdentTopic::new("ego-peers-v1");
+    swarm.behaviour_mut().gossipsub.subscribe(&peers_topic).ok();
+
     // ── Kademlia bootstrap ────────────────────────────────────────────────────
     // Contacts the seeded relay nodes and discovers the rest of the DHT network.
     let _ = swarm.behaviour_mut().kad.bootstrap();
@@ -1140,8 +1191,27 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                 let addr = crate::ledger::Ledger::load().address;
                 if !addr.is_empty() && RELAY_CIRCUIT_READY.load(Ordering::Relaxed) {
                     if let Some(tx) = DHT_CMD_TX.get() {
+                        // Poll our mailbox for new messages
                         let mailbox_key = format!("ego-mailbox:{}", addr);
                         let _ = tx.send(DhtCommand::GetPeers { key: mailbox_key });
+                        // Re-issue DHT gets for any blocks we're still missing.
+                        // The sender may have published them to the DHT global store
+                        // since our last attempt.
+                        let ledger = crate::ledger::Ledger::load();
+                        for file in &ledger.stored_files {
+                            if file.cid.starts_with("egomfd1")
+                                && file.blocks_total > 0
+                                && file.blocks_received < file.blocks_total
+                            {
+                                if let Ok(manifest) = crate::blocks::load_manifest(&file.cid) {
+                                    for block_cid in crate::blocks::missing_blocks(&manifest) {
+                                        let _ = tx.send(DhtCommand::GetPeers {
+                                            key: format!("ego-block:{}", block_cid),
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1179,7 +1249,12 @@ async fn build_swarm(
             .expect("gossipsub::Behaviour");
 
             // ── Kademlia DHT ──────────────────────────────────────────────────
-            let store = kad::store::MemoryStore::new(peer_id);
+            // Increase max_value_bytes from the default 64 KB to 4 MB so that
+            // small-to-medium file payloads (images, documents) can be stored
+            // in the DHT inbox as a fallback when direct P2P is unavailable.
+            let mut kad_store_cfg = kad::store::MemoryStoreConfig::default();
+            kad_store_cfg.max_value_bytes = 4 * 1024 * 1024; // 4 MB
+            let store = kad::store::MemoryStore::with_config(peer_id, kad_store_cfg);
             let mut kad_behaviour = kad::Behaviour::new(peer_id, store);
             // Seed the routing table with all known relay nodes so we can
             // bootstrap even if we've never connected to any peer before.
@@ -1223,14 +1298,16 @@ async fn build_swarm(
                         .with_request_timeout(Duration::from_secs(120)),
                 ),
                 autonat: autonat::Behaviour::new(peer_id, autonat::Config::default()),
-                ping:    ping::Behaviour::new(
-                    ping::Config::new().with_interval(Duration::from_secs(30)),
-                ),
+                    ping: ping::Behaviour::new(
+                        ping::Config::new()
+                            .with_interval(Duration::from_secs(15))  // was 30s — halve it
+                            .with_timeout(Duration::from_secs(10)),
+                    ),
                 gossipsub: gossipsub_behaviour,
                 kad:       kad_behaviour,
             }
         })?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(86400)))
         .build();
     Ok(swarm)
 }
@@ -1414,9 +1491,19 @@ async fn handle_event(
             // Force identify exchange so remote learns our protocols immediately.
             swarm.behaviour_mut().identify.push(std::iter::once(peer_id));
 
-            // Do NOT flush pending_sends here — wait for ReservationReqAccepted
-            // which guarantees the relay has an active slot for us before we
-            // attempt to dial any peer through it.
+            // If the relay is already reserved, flush any pending sends to this
+            // peer immediately. ReservationReqAccepted fires only once at startup
+            // so messages queued after that would otherwise be lost.
+            if RELAY_CIRCUIT_READY.load(Ordering::Relaxed) {
+                if let Some(pending) = pending_sends.remove(&peer_id) {
+                    eprintln!("[P2P] Flushing {} queued message(s) to {} on connect", pending.len(), peer_id);
+                    for (msg, reply) in pending {
+                        let req_id = swarm.behaviour_mut()
+                            .request_response.send_request(&peer_id, msg);
+                        in_flight.insert(req_id, reply);
+                    }
+                }
+            }
         }
 
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
@@ -1620,6 +1707,16 @@ async fn handle_event(
                         handle_block_vote(block_hash, height, voter, signature, timestamp, &app2).await;
                     });
                 }
+            } else if topic == "ego-peers-v1" {
+                // Peer presence / endpoint update broadcast.
+                // When a peer changes WiFi/LAN their relay circuit changes; this
+                // lets us update the peer cache without a direct connection.
+                if let Ok(msg @ P2PMessage::PeerAnnounce { .. }) =
+                    serde_json::from_slice::<P2PMessage>(&message.data)
+                {
+                    let app2 = app.clone();
+                    tokio::spawn(async move { handle_incoming(msg, &app2).await; });
+                }
             } else if topic == "ego-shards-v1" {
                 match serde_json::from_slice::<P2PMessage>(&message.data) {
                     Ok(P2PMessage::ShardAnnounce { from_addr, from_endpoint, held_shards, uptime_secs, network_node_count, shard_count }) => {
@@ -1714,14 +1811,52 @@ async fn handle_event(
                     let key_str = String::from_utf8_lossy(rec.record.key.as_ref()).to_string();
 
                     if key_str.starts_with("ego-mailbox:") {
-                        // Mailbox pointer: { from, msg_key, ts }
-                        // Fetch the actual message stored under msg_key.
-                        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&rec.record.value) {
-                            if let Some(msg_key) = v["msg_key"].as_str() {
-                                swarm.behaviour_mut().kad.get_record(
-                                    kad::RecordKey::new(&msg_key)
+                        // Mailbox list: JSON array of msg_hash strings.
+                        // On each GetRecord we: (a) merge any pending appends and write
+                        // back the enlarged list, then (b) issue a GetRecord for every
+                        // ego-inbox:{addr}:{hash} entry so the payload is dispatched.
+                        let addr = key_str.trim_start_matches("ego-mailbox:");
+                        let mut hashes: Vec<String> = serde_json::from_slice::<Vec<String>>(
+                            &rec.record.value
+                        ).unwrap_or_default();
+
+                        // Drain pending appends for this address.
+                        let pending: Vec<String> = {
+                            let mut map = pending_appends().lock().unwrap();
+                            map.remove(addr).unwrap_or_default()
+                        };
+                        if !pending.is_empty() {
+                            for h in &pending {
+                                if !hashes.contains(h) {
+                                    hashes.push(h.clone());
+                                }
+                            }
+                            if let Ok(v) = serde_json::to_vec(&hashes) {
+                                let _ = swarm.behaviour_mut().kad.put_record(
+                                    kad::Record {
+                                        key:       rec.record.key.clone(),
+                                        value:     v,
+                                        publisher: None,
+                                        expires:   None,
+                                    },
+                                    kad::Quorum::One,
                                 );
-                                eprintln!("[DHT] Fetching inbox message: {}", msg_key);
+                                eprintln!("[DHT] Updated mailbox list for {} ({} entries)", addr, hashes.len());
+                            }
+                        }
+
+                        // Only fetch and dispatch messages when this mailbox belongs to us.
+                        // During a deposit (append cycle) we read a *foreign* mailbox to
+                        // do the read-modify-write; we must NOT dispatch those messages here
+                        // — the actual owner's node will pick them up on their own poll.
+                        let my_addr_check = crate::ledger::Ledger::load().address;
+                        if addr == my_addr_check {
+                            for hash in &hashes {
+                                let msg_key = format!("ego-inbox:{}:{}", addr, hash);
+                                swarm.behaviour_mut().kad.get_record(kad::RecordKey::new(&msg_key));
+                            }
+                            if !hashes.is_empty() {
+                                eprintln!("[DHT] Polling {} inbox message(s) for {}", hashes.len(), addr);
                             }
                         }
                     } else if key_str.starts_with("ego-inbox:") {
@@ -1737,6 +1872,32 @@ async fn handle_event(
                         } else {
                             eprintln!("[DHT] Skipping already-seen inbox message: {}", &key_str[..key_str.len().min(50)]);
                         }
+                    } else if key_str.starts_with("ego-manifest:") {
+                        // File manifest from DHT global store — save and process.
+                        let manifest_cid = key_str.trim_start_matches("ego-manifest:").to_string();
+                        if let Ok(manifest) = serde_json::from_slice::<crate::blocks::FileManifest>(&rec.record.value) {
+                            // Save to disk
+                            let _ = crate::blocks::save_manifest(&manifest);
+                            eprintln!("[DHT] Manifest {} received from DHT ({} blocks)", &manifest_cid[..16.min(manifest_cid.len())], manifest.blocks.len());
+                            // Update ledger entry if we're waiting for this file
+                            let app2 = app.clone();
+                            let mcid = manifest_cid.clone();
+                            tokio::spawn(async move {
+                                process_received_manifest(&mcid, &app2).await;
+                            });
+                        }
+                    } else if key_str.starts_with("ego-block:") {
+                        // Encrypted block from DHT global store — save to disk.
+                        let block_cid = key_str.trim_start_matches("ego-block:").to_string();
+                        if !crate::blocks::have_block(&block_cid) {
+                            let _ = crate::blocks::save_block(&block_cid, &rec.record.value);
+                            eprintln!("[DHT] Block {} received from DHT ({} bytes)", &block_cid[..16.min(block_cid.len())], rec.record.value.len());
+                            // Check if this completes any pending manifest
+                            let app2 = app.clone();
+                            tokio::spawn(async move {
+                                check_block_completes_manifests(&block_cid, &app2).await;
+                            });
+                        }
                     } else {
                         // Peer discovery record: { address, endpoint, name, ts }
                         if let Ok(peer_info) = serde_json::from_slice::<serde_json::Value>(&rec.record.value) {
@@ -1746,6 +1907,32 @@ async fn handle_event(
                                     let _ = swarm.dial(addr);
                                     eprintln!("[DHT] Discovered peer via DHT: {}", endpoint);
                                 }
+                            }
+                        }
+                    }
+                }
+                // Mailbox key not found in DHT yet — write a fresh list if there
+                // are pending appends (first message ever deposited for this addr).
+                kad::QueryResult::GetRecord(Err(kad::GetRecordError::NotFound { key, .. })) => {
+                    let key_str = String::from_utf8_lossy(key.as_ref()).to_string();
+                    if key_str.starts_with("ego-mailbox:") {
+                        let addr = key_str.trim_start_matches("ego-mailbox:");
+                        let pending: Vec<String> = {
+                            let mut map = pending_appends().lock().unwrap();
+                            map.remove(addr).unwrap_or_default()
+                        };
+                        if !pending.is_empty() {
+                            if let Ok(v) = serde_json::to_vec(&pending) {
+                                let _ = swarm.behaviour_mut().kad.put_record(
+                                    kad::Record {
+                                        key:       kad::RecordKey::new(&key_str),
+                                        value:     v,
+                                        publisher: None,
+                                        expires:   None,
+                                    },
+                                    kad::Quorum::One,
+                                );
+                                eprintln!("[DHT] Created new mailbox list for {} ({} entries)", addr, pending.len());
                             }
                         }
                     }
@@ -1943,15 +2130,10 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                 city:      None,
                 country:   None,
             });
-            // Phase 2: immediately request their chain when a new peer announces
-            if !endpoint.is_empty() {
-                let my_ep = get_public_endpoint().await;
-                let req   = P2PMessage::ChainSyncRequest { requester_endpoint: my_ep };
-                let ep2   = endpoint.clone();
-                tokio::spawn(async move {
-                    let _ = send_message_any(&[ep2], &req).await;
-                });
-            }
+            // Chain sync is handled by the dedicated sync_chain_from_peers() loop
+            // (runs every 30 s in the keep-alive loop).  Do NOT send a ChainSyncRequest
+            // here — PeerAnnounce fires every 60 s per peer, so doing it here was
+            // triggering a merge on every tick and inflating the block count.
         }
 P2PMessage::ChatMessage { bundle } => {
     match crate::commands::messenger::receive_message_inner(&bundle) {
@@ -1967,12 +2149,19 @@ P2PMessage::ChatMessage { bundle } => {
                     .and_then(|n| base64::engine::general_purpose::STANDARD.decode(n).ok())
                     .and_then(|b| String::from_utf8(b).ok())
                     .unwrap_or_else(|| "File".to_string());
-                let _ = tauri::api::notification::Notification::new(
-                    &app.config().tauri.bundle.identifier,
-                )
-                .title("File Received")
-                .body(&format!("You received a file: {}", file_name))
-                .show();
+                // Auto-import into ledger immediately so EgoSafe shows "Received Files"
+                // even before the actual FileData arrives from the sender.
+                // try_auto_import also shows the "File Received!" notification.
+                {
+                    let content_clone = msg.content.clone();
+                    let from_for_import = msg.from.clone();
+                    let app_import = app.clone();
+                    tokio::spawn(async move {
+                        crate::commands::notifications::try_auto_import(
+                            &app_import, &content_clone, &from_for_import,
+                        ).await;
+                    });
+                }
                 if parts.len() >= 2 {
                     let cid       = parts[1].to_string();
                     let from_addr = msg.from.clone();
@@ -1980,17 +2169,34 @@ P2PMessage::ChatMessage { bundle } => {
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         let contacts = load_contacts();
+                        let my_ep   = get_public_endpoint().await;
+                        let my_addr = crate::ledger::Ledger::load().address;
+
+                        // Choose the right request type based on CID prefix
+                        let file_req: P2PMessage = if cid.starts_with("egomfd1") {
+                            // Block-based: try DHT manifest first, then ManifestRequest
+                            if let Some(tx) = DHT_CMD_TX.get() {
+                                let _ = tx.send(DhtCommand::GetPeers {
+                                    key: format!("ego-manifest:{}", cid),
+                                });
+                            }
+                            P2PMessage::ManifestRequest {
+                                manifest_cid:       cid.clone(),
+                                requester_addr:     my_addr.clone(),
+                                requester_endpoint: my_ep,
+                            }
+                        } else {
+                            P2PMessage::FileRequest {
+                                cid:                cid.clone(),
+                                requester_addr:     my_addr.clone(),
+                                requester_endpoint: my_ep,
+                            }
+                        };
+
                         if let Some(contact) = contacts.iter().find(|c| {
                             c.address == from_addr && !c.endpoint.is_empty()
                         }) {
                             let endpoint = contact.endpoint.clone();
-                            let my_ep    = get_public_endpoint().await;
-                            let my_addr  = crate::ledger::Ledger::load().address;
-                            let file_req = P2PMessage::FileRequest {
-                                cid:                cid.clone(),
-                                requester_addr:     my_addr.clone(),
-                                requester_endpoint: my_ep,
-                            };
                             if let Err(e) = send_message(&endpoint, &file_req).await {
                                 eprintln!("[P2P] Auto file request failed: {} — depositing in sender inbox", e);
                                 crate::commands::messenger::deposit_in_relay_inbox(
@@ -1999,6 +2205,12 @@ P2PMessage::ChatMessage { bundle } => {
                             } else {
                                 eprintln!("[P2P] Auto-requested file {} from {}", cid, endpoint);
                             }
+                        } else {
+                            // Sender not in contacts or no endpoint — go straight to relay inbox
+                            eprintln!("[P2P] No direct endpoint for {} — depositing request in relay inbox", from_addr);
+                            crate::commands::messenger::deposit_in_relay_inbox(
+                                &from_addr, &my_addr, &file_req,
+                            ).await;
                         }
 
                         // ── Timeout watcher: poll every 10s for up to 3 minutes ──
@@ -2006,15 +2218,19 @@ P2PMessage::ChatMessage { bundle } => {
                         let app_watch = app_clone.clone();
                         tokio::spawn(async move {
                             const POLL_INTERVAL: u64 = 10;
-                            const TIMEOUT_SECS:  u64 = 60;
+                            const TIMEOUT_SECS:  u64 = 300; // 5 min: enough for 10× DHT polls
                             let mut elapsed = 0u64;
                             loop {
                                 tokio::time::sleep(Duration::from_secs(POLL_INTERVAL)).await;
                                 elapsed += POLL_INTERVAL;
                                 let ledger = crate::ledger::Ledger::load();
                                 if let Some(f) = ledger.stored_files.iter().find(|f| f.cid == cid_watch) {
-                                    if f.status == "Received" && !f.local_path.is_empty()
-                                        && !f.local_path.starts_with("sender:") {
+                                    let is_block_complete = f.blocks_total > 0
+                                        && f.blocks_received >= f.blocks_total;
+                                    let is_legacy_complete = f.status == "Received"
+                                        && !f.local_path.is_empty()
+                                        && !f.local_path.starts_with("sender:");
+                                    if is_block_complete || is_legacy_complete {
                                         eprintln!("[P2P] File {} received OK within {}s", cid_watch, elapsed);
                                         return;
                                     }
@@ -2023,7 +2239,11 @@ P2PMessage::ChatMessage { bundle } => {
                                     eprintln!("[P2P] File {} timed out after {}s — marking failed", cid_watch, elapsed);
                                     let mut ledger = crate::ledger::Ledger::load();
                                     if let Some(f) = ledger.stored_files.iter_mut().find(|f| f.cid == cid_watch) {
-                                        if f.status != "Received" {
+                                        // Mark failed only if still waiting (no real data yet)
+                                        let still_pending = f.local_path.is_empty()
+                                            || f.local_path.starts_with("sender:")
+                                            || (f.blocks_total > 0 && f.blocks_received < f.blocks_total);
+                                        if still_pending {
                                             f.status = "Failed".to_string();
                                             let _ = ledger.save();
                                             let _ = app_watch.emit_all("ego://file-failed", serde_json::json!({
@@ -2225,6 +2445,45 @@ P2PMessage::FileRequest { cid, requester_addr, requester_endpoint } => {
             eprintln!("[P2P] FileRequest: we don't have the data for {}", cid);
             return;
         }
+
+        // Block-based file: respond with ManifestData so receiver can fetch blocks
+        if cid.starts_with("egomfd1") {
+            let ep = requester_endpoint.clone();
+            let addr = requester_addr.clone();
+            let key_hex64 = file.key_nonce_hex.clone();
+            let file_name = file.name.clone();
+            tokio::spawn(async move {
+                match crate::blocks::load_manifest(&cid) {
+                    Err(e) => eprintln!("[P2P] ManifestData: load failed: {}", e),
+                    Ok(manifest) => {
+                        match serde_json::to_string(&manifest) {
+                            Err(e) => eprintln!("[P2P] ManifestData: serialize failed: {}", e),
+                            Ok(manifest_json) => {
+                                let response = P2PMessage::ManifestData {
+                                    manifest_cid: cid.clone(),
+                                    manifest_json,
+                                    key_hex64,
+                                    file_name,
+                                    from_addr: my_addr.clone(),
+                                };
+                                let eps = vec![ep.clone()];
+                                if let Err(e) = send_message_any(&eps, &response).await {
+                                    eprintln!("[P2P] ManifestData direct failed: {} — relay inbox", e);
+                                    crate::commands::messenger::deposit_in_relay_inbox(
+                                        &addr, &my_addr, &response,
+                                    ).await;
+                                } else {
+                                    eprintln!("[P2P] ManifestData sent for {} ({} blocks)", &cid[..16], manifest.blocks.len());
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            return;
+        }
+
+        // Legacy single-file: send FileData
         match std::fs::read(&file.local_path) {
             Err(e) => eprintln!("[P2P] FileRequest: read failed {}: {}", file.local_path, e),
             Ok(enc_bytes) => {
@@ -2235,12 +2494,11 @@ P2PMessage::FileRequest { cid, requester_addr, requester_endpoint } => {
                 let ep            = requester_endpoint.clone();
                 let addr          = requester_addr.clone();
 
-                const DIRECT_LIMIT: usize = 4 * 1024 * 1024;  // 4 MB — direct P2P
-                const RELAY_LIMIT:  usize = 50 * 1024 * 1024; // 50 MB — hard cap
+                const RELAY_LIMIT: usize = 50 * 1024 * 1024; // 50 MB — relay cap
 
                 tokio::spawn(async move {
                     if enc_bytes.len() > RELAY_LIMIT {
-                        eprintln!("[P2P] File too large ({} bytes) — 50MB max, rejecting", enc_bytes.len());
+                        eprintln!("[P2P] File too large ({} bytes) — 50 MB max", enc_bytes.len());
                         return;
                     }
 
@@ -2252,23 +2510,15 @@ P2PMessage::FileRequest { cid, requester_addr, requester_endpoint } => {
                         key_nonce_hex,
                     };
 
-                    if enc_bytes.len() <= DIRECT_LIMIT {
-                        // Small — try direct P2P first, relay fallback
-                        let eps = vec![ep.clone()];
-                        if let Err(e) = send_message_any(&eps, &response).await {
-                            eprintln!("[P2P] FileData direct failed: {} — using relay inbox", e);
-                            crate::commands::messenger::deposit_in_relay_inbox(
-                                &addr, &my_addr, &response,
-                            ).await;
-                        } else {
-                            eprintln!("[P2P] FileData sent OK for {}", cid2);
-                        }
-                    } else {
-                        // Medium (4–50 MB) — relay inbox only
-                        eprintln!("[P2P] File ({} bytes) — sending via relay inbox", enc_bytes.len());
+                    // Try direct P2P; fall back to DHT relay inbox
+                    let eps = vec![ep.clone()];
+                    if let Err(e) = send_message_any(&eps, &response).await {
+                        eprintln!("[P2P] FileData direct failed: {} — relay inbox", e);
                         crate::commands::messenger::deposit_in_relay_inbox(
                             &addr, &my_addr, &response,
                         ).await;
+                    } else {
+                        eprintln!("[P2P] FileData sent OK for {}", cid2);
                     }
                 });
             }
@@ -2349,9 +2599,295 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
         }
     }
 }
+
+        // ── Block-based file transfer (IPFS-style) ────────────────────────────
+
+        P2PMessage::ManifestRequest { manifest_cid, requester_addr, requester_endpoint } => {
+            eprintln!("[Blocks] ManifestRequest for {} from {}", &manifest_cid[..16.min(manifest_cid.len())], requester_addr);
+            let ledger  = crate::ledger::Ledger::load();
+            let my_addr = ledger.address.clone();
+            if let Some(file) = ledger.stored_files.iter().find(|f| f.cid == manifest_cid).cloned() {
+                let ep      = requester_endpoint.clone();
+                let addr    = requester_addr.clone();
+                tokio::spawn(async move {
+                    match crate::blocks::load_manifest(&manifest_cid) {
+                        Err(e) => eprintln!("[Blocks] ManifestRequest: load failed: {}", e),
+                        Ok(manifest) => {
+                            match serde_json::to_string(&manifest) {
+                                Err(e) => eprintln!("[Blocks] ManifestRequest: serialize: {}", e),
+                                Ok(manifest_json) => {
+                                    let response = P2PMessage::ManifestData {
+                                        manifest_cid: manifest_cid.clone(),
+                                        manifest_json,
+                                        key_hex64:   file.key_nonce_hex,
+                                        file_name:   file.name,
+                                        from_addr:   my_addr.clone(),
+                                    };
+                                    let eps = vec![ep.clone()];
+                                    if let Err(e) = send_message_any(&eps, &response).await {
+                                        eprintln!("[Blocks] ManifestData direct failed: {} — inbox", e);
+                                        crate::commands::messenger::deposit_in_relay_inbox(&addr, &my_addr, &response).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        P2PMessage::ManifestData { manifest_cid, manifest_json, key_hex64, file_name, from_addr } => {
+            eprintln!("[Blocks] ManifestData received for {}", &manifest_cid[..16.min(manifest_cid.len())]);
+            match serde_json::from_str::<crate::blocks::FileManifest>(&manifest_json) {
+                Err(e) => eprintln!("[Blocks] ManifestData parse error: {}", e),
+                Ok(manifest) => {
+                    // Persist the manifest to disk
+                    let _ = crate::blocks::save_manifest(&manifest);
+                    let blocks_total = manifest.blocks.len() as u32;
+                    // Update ledger entry
+                    {
+                        let mut ledger = crate::ledger::Ledger::load();
+                        let my_addr    = ledger.address.clone();
+                        if let Some(f) = ledger.stored_files.iter_mut().find(|f| f.cid == manifest_cid) {
+                            f.key_nonce_hex  = key_hex64.clone();
+                            f.blocks_total   = blocks_total;
+                            f.blocks_received = crate::blocks::blocks_received_count(&manifest);
+                            f.manifest_cid   = manifest_cid.clone();
+                            if f.name.is_empty() { f.name = file_name.clone(); }
+                            let _ = ledger.save();
+                        }
+                    }
+                    // Request each missing block directly from the sender
+                    let missing = crate::blocks::missing_blocks(&manifest);
+                    eprintln!("[Blocks] Need {}/{} blocks for {}", missing.len(), blocks_total, &manifest_cid[..16.min(manifest_cid.len())]);
+                    let my_addr    = crate::ledger::Ledger::load().address;
+                    let my_ep      = get_public_endpoint().await;
+                    // Try to find sender endpoint
+                    let sender_ep = {
+                        let contacts = load_contacts();
+                        contacts.iter().find(|c| c.address == from_addr)
+                            .map(|c| c.endpoint.clone())
+                            .unwrap_or_default()
+                    };
+                    for block_cid in missing {
+                        let req = P2PMessage::BlockRequest {
+                            block_cid:          block_cid.clone(),
+                            manifest_cid:       manifest_cid.clone(),
+                            requester_addr:     my_addr.clone(),
+                            requester_endpoint: my_ep.clone(),
+                        };
+                        // 1. Try DHT global store (PutPeer'd by sender on upload)
+                        if let Some(tx) = crate::p2p::DHT_CMD_TX.get() {
+                            let dht_key = format!("ego-block:{}", block_cid);
+                            let _ = tx.send(crate::p2p::DhtCommand::GetPeers { key: dht_key });
+                        }
+                        // 2. Try direct P2P if we have sender's endpoint
+                        if !sender_ep.is_empty() {
+                            let ep2  = sender_ep.clone();
+                            let req2 = req.clone();
+                            tokio::spawn(async move {
+                                let _ = send_message_any(&[ep2], &req2).await;
+                            });
+                        }
+                        // 3. ALWAYS deposit BlockRequest in sender's DHT inbox.
+                        //    This guarantees delivery even when sender is offline or
+                        //    block was uploaded before DHT publishing was added.
+                        //    Sender will respond with BlockData via receiver's inbox.
+                        {
+                            let from2   = from_addr.clone();
+                            let myaddr2 = my_addr.clone();
+                            let req3    = req.clone();
+                            tokio::spawn(async move {
+                                crate::commands::messenger::deposit_in_relay_inbox(
+                                    &from2, &myaddr2, &req3,
+                                ).await;
+                                eprintln!("[Blocks] BlockRequest deposited in sender inbox for {}",
+                                    &block_cid[..16.min(block_cid.len())]);
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        P2PMessage::BlockRequest { block_cid, manifest_cid, requester_addr, requester_endpoint } => {
+            eprintln!("[Blocks] BlockRequest for {} from {}", &block_cid[..16.min(block_cid.len())], requester_addr);
+            if crate::blocks::have_block(&block_cid) {
+                use base64::Engine as _;
+                match crate::blocks::load_block(&block_cid) {
+                    Err(e) => eprintln!("[Blocks] BlockRequest: load failed: {}", e),
+                    Ok(enc_bytes) => {
+                        // Also publish to DHT global store so receiver can fetch directly
+                        // without depending on the inbox relay completing.
+                        if let Some(tx) = DHT_CMD_TX.get() {
+                            let dht_key = format!("ego-block:{}", block_cid);
+                            let _ = tx.send(DhtCommand::PutPeer { key: dht_key, value: enc_bytes.clone() });
+                            eprintln!("[Blocks] Block {} published to DHT global store", &block_cid[..16.min(block_cid.len())]);
+                        }
+                        let enc_b64    = base64::engine::general_purpose::STANDARD.encode(&enc_bytes);
+                        let my_addr    = crate::ledger::Ledger::load().address;
+                        let ep         = requester_endpoint.clone();
+                        let addr       = requester_addr.clone();
+                        let response = P2PMessage::BlockData {
+                            block_cid:    block_cid.clone(),
+                            manifest_cid: manifest_cid.clone(),
+                            enc_b64,
+                            from_addr:    my_addr.clone(),
+                        };
+                        tokio::spawn(async move {
+                            if let Err(e) = send_message_any(&[ep.clone()], &response).await {
+                                eprintln!("[Blocks] BlockData direct failed: {} — inbox", e);
+                                crate::commands::messenger::deposit_in_relay_inbox(&addr, &my_addr, &response).await;
+                            } else {
+                                eprintln!("[Blocks] BlockData sent: {}", &block_cid[..16.min(block_cid.len())]);
+                            }
+                        });
+                    }
+                }
+            } else {
+                eprintln!("[Blocks] BlockRequest: block {} not found", &block_cid[..16.min(block_cid.len())]);
+            }
+        }
+
+        P2PMessage::BlockData { block_cid, manifest_cid, enc_b64, from_addr: _ } => {
+            use base64::Engine as _;
+            eprintln!("[Blocks] BlockData received: {}", &block_cid[..16.min(block_cid.len())]);
+            match base64::engine::general_purpose::STANDARD.decode(&enc_b64) {
+                Err(e) => eprintln!("[Blocks] BlockData decode failed: {}", e),
+                Ok(enc_bytes) => {
+                    if !crate::blocks::have_block(&block_cid) {
+                        let _ = crate::blocks::save_block(&block_cid, &enc_bytes);
+                    }
+                    // Update blocks_received counter and emit progress
+                    let app2 = app.clone();
+                    let mcid = manifest_cid.clone();
+                    tokio::spawn(async move {
+                        update_ledger_for_block(&mcid, &app2).await;
+                    });
+                }
+            }
+        }
     }
 }
 
+
+// ── Block storage helpers ─────────────────────────────────────────────────────
+
+/// Called after saving a new block to disk.  Updates `blocks_received` in the
+/// ledger and emits `ego://file-downloaded` when all blocks are present.
+async fn update_ledger_for_block(manifest_cid: &str, app: &tauri::AppHandle) {
+    let Ok(manifest) = crate::blocks::load_manifest(manifest_cid) else { return; };
+    let received = crate::blocks::blocks_received_count(&manifest);
+    let total    = manifest.blocks.len() as u32;
+
+    let mut ledger = crate::ledger::Ledger::load();
+    if let Some(f) = ledger.stored_files.iter_mut().find(|f| f.cid == manifest_cid) {
+        f.blocks_received = received;
+        if received >= total {
+            f.status     = "Received".to_string();
+            f.local_path = crate::blocks::manifest_path(manifest_cid)
+                .to_string_lossy().to_string();
+        }
+        let _ = ledger.save();
+    }
+
+    let _ = app.emit_all("ego://block-progress", serde_json::json!({
+        "manifest_cid": manifest_cid,
+        "blocks_received": received,
+        "blocks_total": total,
+    }));
+
+    if received >= total {
+        eprintln!("[Blocks] All {} blocks received for {}", total, &manifest_cid[..16.min(manifest_cid.len())]);
+        let _ = app.emit_all("ego://file-downloaded", serde_json::json!({ "cid": manifest_cid }));
+    }
+}
+
+/// Called when a manifest arrives (from DHT or ManifestData message).
+/// Kicks off requests for any missing blocks.
+async fn process_received_manifest(manifest_cid: &str, app: &tauri::AppHandle) {
+    let Ok(manifest) = crate::blocks::load_manifest(manifest_cid) else { return; };
+    let total    = manifest.blocks.len() as u32;
+    let received = crate::blocks::blocks_received_count(&manifest);
+
+    // Update ledger
+    {
+        let mut ledger = crate::ledger::Ledger::load();
+        if let Some(f) = ledger.stored_files.iter_mut().find(|f| f.cid == manifest_cid) {
+            f.blocks_total    = total;
+            f.blocks_received = received;
+            f.manifest_cid    = manifest_cid.to_string();
+            let _ = ledger.save();
+        }
+    }
+
+    // Emit progress
+    let _ = app.emit_all("ego://block-progress", serde_json::json!({
+        "manifest_cid": manifest_cid,
+        "blocks_received": received,
+        "blocks_total": total,
+    }));
+
+    if received >= total {
+        let _ = app.emit_all("ego://file-downloaded", serde_json::json!({ "cid": manifest_cid }));
+        return;
+    }
+
+    // Get sender address from ledger (local_path = "sender:{addr}")
+    let sender_addr = {
+        let ledger = crate::ledger::Ledger::load();
+        ledger.stored_files.iter()
+            .find(|f| f.cid == manifest_cid)
+            .and_then(|f| f.local_path.strip_prefix("sender:"))
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    };
+    let my_addr = crate::ledger::Ledger::load().address;
+    let my_ep   = get_public_endpoint().await;
+
+    for block_cid in crate::blocks::missing_blocks(&manifest) {
+        // 1. DHT global store
+        if let Some(tx) = DHT_CMD_TX.get() {
+            let _ = tx.send(DhtCommand::GetPeers { key: format!("ego-block:{}", block_cid) });
+        }
+        // 2. BlockRequest in sender's DHT inbox (works even if sender offline or
+        //    block was never published to DHT)
+        if !sender_addr.is_empty() {
+            let req = P2PMessage::BlockRequest {
+                block_cid:          block_cid.clone(),
+                manifest_cid:       manifest_cid.to_string(),
+                requester_addr:     my_addr.clone(),
+                requester_endpoint: my_ep.clone(),
+            };
+            let sender2 = sender_addr.clone();
+            let my2     = my_addr.clone();
+            let bcid    = block_cid.clone();
+            tokio::spawn(async move {
+                crate::commands::messenger::deposit_in_relay_inbox(&sender2, &my2, &req).await;
+                eprintln!("[Blocks] BlockRequest→inbox for {}", &bcid[..16.min(bcid.len())]);
+            });
+        }
+    }
+}
+
+/// After a block is saved, check if it completes any manifest we're waiting on.
+async fn check_block_completes_manifests(block_cid: &str, app: &tauri::AppHandle) {
+    let ledger = crate::ledger::Ledger::load();
+    for file in &ledger.stored_files {
+        if file.cid.starts_with("egomfd1") && file.blocks_received < file.blocks_total {
+            if let Ok(manifest) = crate::blocks::load_manifest(&file.cid) {
+                let has_this = manifest.blocks.iter().any(|b| b.block_cid == block_cid);
+                if has_this {
+                    let mcid = file.cid.clone();
+                    let app2 = app.clone();
+                    tokio::spawn(async move {
+                        update_ledger_for_block(&mcid, &app2).await;
+                    });
+                }
+            }
+        }
+    }
+}
 
 // ── Chain helpers ─────────────────────────────────────────────────────────────
 
@@ -2518,10 +3054,16 @@ async fn merge_remote_chain_inner(
             .collect();
         crate::chain_db::append_peer_block(block, &block_txs);
     }
-    // Txs that arrived without a block (e.g. from ChainSyncResponse where blocks
-    // and txs are separate) — mine them as a batch so balance_of() sees them.
+    // Txs that arrived without a matching block (e.g. staking TXs whose block lives
+    // only in the sender's in-memory chain) — mine them locally so balance_of() sees
+    // them.  But skip any TX already present in RocksDB to avoid inflating the block
+    // count on every sync (was the main driver of the ~155-block explosion).
     let orphan_txs: Vec<LedgerTx> = new_txs.iter()
-        .filter(|tx| !new_blocks.iter().any(|b| Some(b.height) == tx.block_height))
+        .filter(|tx| {
+            !new_blocks.iter().any(|b| Some(b.height) == tx.block_height)
+                && tx.hash.len() > 0
+                && crate::chain_db::get_tx_by_hash(&tx.hash).is_none()
+        })
         .cloned()
         .collect();
     if !orphan_txs.is_empty() {
@@ -2835,25 +3377,20 @@ pub async fn dht_deposit_message(to_addr: &str, from_addr: &str, msg: &P2PMessag
         });
     }
 
-    // 2. Update the mailbox pointer: read current list, append, write back.
-    //    We optimistically append without a read-modify-write cycle (Kademlia
-    //    doesn't support atomic updates). Duplicates are handled at fetch time.
+    // 2. Append this msg_hash to the mailbox list via a read-then-write cycle:
+    //    queue the hash in PENDING_MAILBOX_APPENDS, then trigger a GetRecord on
+    //    the mailbox key.  The GetRecord handler will merge pending hashes and
+    //    write back the enlarged list (or create a fresh list if key not found).
+    {
+        let mut map = pending_appends().lock().unwrap();
+        map.entry(to_addr.to_string()).or_default().push(msg_hash.clone());
+    }
     let mailbox_key = format!("ego-mailbox:{}", to_addr);
-    let mailbox_val = serde_json::json!({
-        "from":    from_addr,
-        "msg_key": msg_key.clone(),
-        "ts":      chrono::Utc::now().timestamp(),
-    });
-    if let Ok(v) = serde_json::to_vec(&mailbox_val) {
-        if let Some(tx) = DHT_CMD_TX.get() {
-            let _ = tx.send(DhtCommand::PutPeer {
-                key:   mailbox_key,
-                value: v,
-            });
-        }
+    if let Some(tx) = DHT_CMD_TX.get() {
+        let _ = tx.send(DhtCommand::GetPeers { key: mailbox_key });
     }
     let display_len = msg_key.len().min(40);
-    eprintln!("[DHT] Deposited offline message for {} (key={})", to_addr, &msg_key[..display_len]);
+    eprintln!("[DHT] Queued mailbox append for {} (hash={})", to_addr, &msg_hash[..8.min(msg_hash.len())]);
 }
 
 /// Query the DHT for offline messages addressed to our address.

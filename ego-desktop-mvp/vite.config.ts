@@ -3,6 +3,9 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
+  optimizeDeps: {
+    include: ['monaco-editor/esm/vs/editor/editor.worker'],
+  },
   clearScreen: false,
   server: {
     port: 1420,

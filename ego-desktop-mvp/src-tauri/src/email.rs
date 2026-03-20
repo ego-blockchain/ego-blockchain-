@@ -10,6 +10,12 @@ use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+// Ego logo embedded at compile time — avoids needing a hosted image URL.
+static LOGO_B64: Lazy<String> = Lazy::new(|| {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    STANDARD.encode(include_bytes!("../icons/ego_square.png"))
+});
+
 // ── XOR obfuscation ───────────────────────────────────────────────────────────
 
 fn xd(data: &[u8]) -> String {
@@ -56,9 +62,62 @@ pub fn verify_otp(email: &str, code: &str) -> bool {
     false
 }
 
+// ── HTML email template ───────────────────────────────────────────────────────
+
+fn html_template(title: &str, body_html: &str) -> String {
+    let logo_src = format!("data:image/png;base64,{}", &*LOGO_B64);
+    format!(r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>{title}</title>
+</head>
+<body style="margin:0;padding:0;background-color:#0f1117;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#0f1117;padding:40px 20px;">
+    <tr>
+      <td align="center">
+        <table width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background-color:#1a1d27;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.4);">
+
+          <!-- Header / Logo -->
+          <tr>
+            <td align="center" style="padding:36px 40px 28px;border-bottom:1px solid #2a2d3a;">
+              <img src="{logo_src}" alt="Ego Blockchain" width="80" height="80" style="display:block;margin:0 auto;border-radius:50%;"/>
+              <div style="margin-top:16px;font-size:20px;font-weight:700;color:#ffffff;letter-spacing:0.3px;">Ego Blockchain</div>
+              <div style="margin-top:4px;font-size:12px;color:#6b7280;">Quantum-Safe Blockchain Network</div>
+            </td>
+          </tr>
+
+          <!-- Body -->
+          <tr>
+            <td style="padding:36px 40px;">
+              {body_html}
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td align="center" style="padding:24px 40px 32px;border-top:1px solid #2a2d3a;">
+              <p style="margin:0 0 8px;font-size:13px;color:#6b7280;">
+                This email was sent by <strong style="color:#9ca3af;">Ego Blockchain</strong>.
+              </p>
+              <a href="https://www.egoblockchain.com" style="display:inline-block;margin-top:4px;font-size:13px;color:#3b82f6;text-decoration:none;font-weight:500;">
+                www.egoblockchain.com
+              </a>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"#, title = title, body_html = body_html, logo_src = logo_src)
+}
+
 // ── Core SMTP sender ──────────────────────────────────────────────────────────
 
-async fn send_smtp(to: &str, subject: &str, body: &str) -> Result<(), String> {
+async fn send_smtp(to: &str, subject: &str, html: &str) -> Result<(), String> {
     let host = xd(SH);
     let user = xd(SU);
     let pass = xd(SP);
@@ -75,8 +134,8 @@ async fn send_smtp(to: &str, subject: &str, body: &str) -> Result<(), String> {
         .reply_to(from_addr)
         .to(to_addr)
         .subject(subject)
-        .header(ContentType::TEXT_PLAIN)
-        .body(body.to_string())
+        .header(ContentType::TEXT_HTML)
+        .body(html.to_string())
         .map_err(|e| format!("Email build error: {e}"))?;
 
     let tls = TlsParameters::new(host.clone())
@@ -97,14 +156,16 @@ async fn send_smtp(to: &str, subject: &str, body: &str) -> Result<(), String> {
 // ── Public helpers ────────────────────────────────────────────────────────────
 
 pub async fn send_otp_email(to: &str, name: &str, code: &str) -> Result<(), String> {
-    let body = format!(
-        "Hello {name},\n\n\
-        Your Ego Blockchain verification code is:\n\n\
-        \t{code}\n\n\
-        This code expires in 10 minutes. Do not share it with anyone.\n\n\
-        — Ego Blockchain Team"
-    );
-    send_smtp(to, "Your Ego Blockchain Verification Code", &body).await
+    let body_html = format!(r#"
+      <p style="margin:0 0 20px;font-size:16px;color:#d1d5db;">Hello <strong style="color:#ffffff;">{name}</strong>,</p>
+      <p style="margin:0 0 24px;font-size:15px;color:#9ca3af;line-height:1.6;">Your Ego Blockchain verification code is:</p>
+      <div style="text-align:center;margin:0 0 28px;">
+        <span style="display:inline-block;padding:16px 40px;background-color:#111827;border:2px solid #3b82f6;border-radius:12px;font-size:32px;font-weight:700;letter-spacing:10px;color:#ffffff;font-family:'Courier New',Courier,monospace;">{code}</span>
+      </div>
+      <p style="margin:0;font-size:13px;color:#6b7280;line-height:1.6;">This code expires in <strong style="color:#9ca3af;">10 minutes</strong>. Do not share it with anyone.</p>
+    "#, name = name, code = code);
+    let html = html_template("Your Ego Blockchain Verification Code", &body_html);
+    send_smtp(to, "Your Ego Blockchain Verification Code", &html).await
 }
 
 pub async fn send_tx_code_email(
@@ -114,19 +175,32 @@ pub async fn send_tx_code_email(
     recipient: &str,
 ) -> Result<(), String> {
     let short_addr = if recipient.len() > 12 {
-        format!("{}…{}", &recipient[..8], &recipient[recipient.len()-4..])
+        format!("{}&#8230;{}", &recipient[..8], &recipient[recipient.len()-4..])
     } else {
         recipient.to_string()
     };
-    let body = format!(
-        "You requested to send {amount_egoc} to {short_addr}.\n\n\
-        Your transaction confirmation code is:\n\n\
-        \t{code}\n\n\
-        This code expires in 10 minutes. Enter it in the Ego Desktop app to complete the transaction.\n\
-        If you did not initiate this, ignore this email — the transaction will not be processed.\n\n\
-        — Ego Blockchain Team"
-    );
-    send_smtp(to, "Ego Blockchain — Confirm Your Transaction", &body).await
+    let body_html = format!(r#"
+      <p style="margin:0 0 20px;font-size:15px;color:#9ca3af;line-height:1.6;">You requested to send:</p>
+      <div style="background-color:#111827;border-radius:12px;padding:20px 24px;margin:0 0 24px;">
+        <table width="100%" cellpadding="0" cellspacing="0">
+          <tr>
+            <td style="font-size:13px;color:#6b7280;padding-bottom:10px;">Amount</td>
+            <td align="right" style="font-size:15px;font-weight:700;color:#ffffff;padding-bottom:10px;">{amount_egoc}</td>
+          </tr>
+          <tr>
+            <td style="font-size:13px;color:#6b7280;">Recipient</td>
+            <td align="right" style="font-size:13px;color:#d1d5db;font-family:'Courier New',Courier,monospace;">{short_addr}</td>
+          </tr>
+        </table>
+      </div>
+      <p style="margin:0 0 16px;font-size:15px;color:#9ca3af;">Your confirmation code is:</p>
+      <div style="text-align:center;margin:0 0 28px;">
+        <span style="display:inline-block;padding:16px 40px;background-color:#111827;border:2px solid #3b82f6;border-radius:12px;font-size:32px;font-weight:700;letter-spacing:10px;color:#ffffff;font-family:'Courier New',Courier,monospace;">{code}</span>
+      </div>
+      <p style="margin:0;font-size:13px;color:#6b7280;line-height:1.6;">Enter this code in the Ego Desktop app to complete the transaction. It expires in <strong style="color:#9ca3af;">10 minutes</strong>.<br/>If you did not initiate this, ignore this email — the transaction will not be processed.</p>
+    "#, amount_egoc = amount_egoc, short_addr = short_addr, code = code);
+    let html = html_template("Confirm Your Transaction", &body_html);
+    send_smtp(to, "Ego Blockchain — Confirm Your Transaction", &html).await
 }
 
 pub async fn send_tx_confirmation(
@@ -135,13 +209,32 @@ pub async fn send_tx_confirmation(
     recipient: &str,
     tx_hash: &str,
 ) -> Result<(), String> {
-    let body = format!(
-        "Your transaction has been submitted to the Ego Blockchain network.\n\n\
-        Amount:    {amount_egoc}\n\
-        Recipient: {recipient}\n\
-        TX Hash:   {tx_hash}\n\n\
-        If you did not authorize this transaction, contact support immediately.\n\n\
-        — Ego Blockchain Team"
-    );
-    send_smtp(to, "Ego Blockchain — Transaction Sent", &body).await
+    let short_hash = if tx_hash.len() > 16 {
+        format!("{}&#8230;{}", &tx_hash[..8], &tx_hash[tx_hash.len()-8..])
+    } else {
+        tx_hash.to_string()
+    };
+    let body_html = format!(r#"
+      <p style="margin:0 0 8px;font-size:18px;font-weight:700;color:#ffffff;">Transaction Submitted</p>
+      <p style="margin:0 0 24px;font-size:14px;color:#9ca3af;">Your transaction has been submitted to the Ego Blockchain network.</p>
+      <div style="background-color:#111827;border-radius:12px;padding:20px 24px;margin:0 0 24px;">
+        <table width="100%" cellpadding="0" cellspacing="0">
+          <tr>
+            <td style="font-size:13px;color:#6b7280;padding-bottom:12px;">Amount</td>
+            <td align="right" style="font-size:15px;font-weight:700;color:#ffffff;padding-bottom:12px;">{amount_egoc}</td>
+          </tr>
+          <tr>
+            <td style="font-size:13px;color:#6b7280;padding-bottom:12px;">Recipient</td>
+            <td align="right" style="font-size:13px;color:#d1d5db;font-family:'Courier New',Courier,monospace;padding-bottom:12px;">{recipient}</td>
+          </tr>
+          <tr>
+            <td style="font-size:13px;color:#6b7280;">TX Hash</td>
+            <td align="right" style="font-size:12px;color:#6b7280;font-family:'Courier New',Courier,monospace;">{short_hash}</td>
+          </tr>
+        </table>
+      </div>
+      <p style="margin:0;font-size:13px;color:#6b7280;line-height:1.6;">You can track this transaction in the Explorer section of the Ego Desktop app.</p>
+    "#, amount_egoc = amount_egoc, recipient = recipient, short_hash = short_hash);
+    let html = html_template("Transaction Sent", &body_html);
+    send_smtp(to, "Ego Blockchain — Transaction Sent", &html).await
 }

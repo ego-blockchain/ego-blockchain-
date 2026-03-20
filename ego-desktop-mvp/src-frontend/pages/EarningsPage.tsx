@@ -167,10 +167,10 @@ const EarningsPage: React.FC = () => {
     : 1;
 
   const buckets = bd ? [
-    { label: 'Storage',   val: bd.storage_rewards,   color: 'bg-blue-500',   text: 'text-blue-400',   desc: `${allocatedGb.toFixed(1)} GB × 0.5 EGOC/day`      },
-    { label: 'Consensus', val: bd.consensus_rewards,  color: 'bg-purple-500', text: 'text-purple-400', desc: 'Block validation — active while app runs'           },
-    { label: 'Coverage',  val: bd.coverage_rewards,   color: 'bg-green-500',  text: 'text-green-400',  desc: earnings?.coverage_online ? 'PoC beacon active' : 'Offline — no coverage reward' },
-    { label: 'Retrieval', val: bd.retrieval_rewards,  color: 'bg-orange-500', text: 'text-orange-400', desc: 'Per-GB retrieval fees served'                       },
+    { label: 'Storage',   val: bd.storage_rewards,   color: 'bg-blue-500',   text: 'text-blue-400',   desc: `Up to ${allocatedGb.toFixed(1)} GB × 0.5 EGOC/day when utilized`      },
+    { label: 'Consensus', val: bd.consensus_rewards,  color: 'bg-purple-500', text: 'text-purple-400', desc: 'Requires active node participation in BFT rounds'   },
+    { label: 'Coverage',  val: bd.coverage_rewards,   color: 'bg-green-500',  text: 'text-green-400',  desc: earnings?.coverage_online ? 'PoC beacon active — reward eligible' : 'Offline — criteria not met' },
+    { label: 'Retrieval', val: bd.retrieval_rewards,  color: 'bg-orange-500', text: 'text-orange-400', desc: 'Paid per-GB only when others fetch your stored data' },
   ] : [];
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -200,7 +200,7 @@ const EarningsPage: React.FC = () => {
           <div>
             <div className="font-semibold mb-1">Storage rewards are zero — configure storage first</div>
             <div className="text-sm text-gray-400">
-              Share disk space and earn <span className="text-green-400 font-semibold">0.5 EGOC / GB / day</span>
+              Share disk space to qualify for up to <span className="text-green-400 font-semibold">0.5 EGOC / GB / day</span> — paid when your space is actually used
             </div>
           </div>
           <button
@@ -219,7 +219,7 @@ const EarningsPage: React.FC = () => {
             <div>
               <div className="text-sm font-semibold text-green-400">Storage Provider Active</div>
               <div className="text-xs text-gray-400">
-                {allocatedGb.toFixed(1)} GB · earning <span className="text-green-300 font-semibold">{(allocatedGb * 0.5).toFixed(3)} EGOC/day</span>
+                {allocatedGb.toFixed(1)} GB · max potential <span className="text-green-300 font-semibold">{(allocatedGb * 0.5).toFixed(3)} EGOC/day</span> (if fully utilized)
               </div>
             </div>
           </div>
@@ -234,17 +234,17 @@ const EarningsPage: React.FC = () => {
           {fmtEgoc(sessionEarned, 6)} <span className="text-lg text-green-600">EGOC</span>
         </div>
         <div className="text-xs text-gray-500 mt-1">
-          ≈ {fmtEgoc(earnings?.daily_rewards ?? 0, 2)} EGOC/day · {fmtEgoc((earnings?.daily_rewards ?? 0) / 86_400, 8)} EGOC/sec
+          Max rate: {fmtEgoc(earnings?.daily_rewards ?? 0, 2)} EGOC/day — actual payout depends on utilisation &amp; criteria
         </div>
       </div>
 
       {/* ── Summary cards ───────────────────────────────────────────────── */}
       <div className="grid grid-cols-4 gap-3">
         {[
-          { label: 'Today (rate)',  val: earnings ? fmtEgoc(earnings.daily_rewards) : '—',   unit: 'EGOC/day', color: 'text-green-400',  bg: 'bg-green-500/10'  },
-          { label: 'Per Epoch',    val: earnings ? fmtEgoc(earnings.epoch_rewards)  : '—',   unit: '7 days',   color: 'text-blue-400',   bg: 'bg-blue-500/10'   },
-          { label: 'Pending',      val: earnings ? fmtEgoc(earnings.pending_rewards): '—',   unit: 'EGOC',     color: 'text-yellow-400', bg: 'bg-yellow-500/10' },
-          { label: 'Total Earned', val: earnings ? fmtEgoc(earnings.total_earned)   : '—',   unit: 'EGOC',     color: 'text-purple-400', bg: 'bg-purple-500/10' },
+          { label: 'Max Rate',     val: earnings ? fmtEgoc(earnings.daily_rewards) : '—',   unit: 'EGOC/day (potential)', color: 'text-green-400',  bg: 'bg-green-500/10'  },
+          { label: 'Max / Epoch',  val: earnings ? fmtEgoc(earnings.epoch_rewards)  : '—',   unit: '7 days (potential)',   color: 'text-blue-400',   bg: 'bg-blue-500/10'   },
+          { label: 'Pending',      val: earnings ? fmtEgoc(earnings.pending_rewards): '—',   unit: 'EGOC',                 color: 'text-yellow-400', bg: 'bg-yellow-500/10' },
+          { label: 'Total Earned', val: earnings ? fmtEgoc(earnings.total_earned)   : '—',   unit: 'EGOC',                 color: 'text-purple-400', bg: 'bg-purple-500/10' },
         ].map(c => (
           <div key={c.label} className={`${c.bg} rounded-2xl p-4 border border-white/5`}>
             <div className="text-xs text-gray-400 mb-1">{c.label}</div>
@@ -258,7 +258,8 @@ const EarningsPage: React.FC = () => {
 
         {/* ── Reward breakdown ──────────────────────────────────────────── */}
         <div className="col-span-3 bg-gray-800 rounded-2xl p-5 border border-gray-700">
-          <h3 className="font-semibold mb-5">Live Reward Breakdown</h3>
+          <h3 className="font-semibold mb-1">Potential Reward Breakdown</h3>
+          <p className="text-xs text-gray-500 mb-4">Maximum rates — actual payouts require meeting each category's criteria</p>
           <div className="space-y-4">
             {buckets.map(bucket => {
               const pct = Math.round((bucket.val / totalBuckets) * 100);
@@ -286,13 +287,13 @@ const EarningsPage: React.FC = () => {
           </div>
 
           <div className="mt-5 pt-5 border-t border-gray-700">
-            <div className="text-xs text-gray-400 mb-3">How rewards are earned</div>
+            <div className="text-xs text-gray-400 mb-3">Criteria to qualify for each reward</div>
             <div className="grid grid-cols-2 gap-2 text-xs">
               {[
-                { label: 'Storage bucket',   desc: 'Prove stored sectors on demand (PoSt)' },
-                { label: 'Consensus bucket', desc: 'Validate blocks — stay online for BFT rounds' },
-                { label: 'Coverage bucket',  desc: 'PoC radio beacon — geographic proof' },
-                { label: 'Retrieval fees',   desc: 'Paid per-GB when nodes fetch your data' },
+                { label: 'Storage',   desc: 'Allocate space AND have it used by network peers storing data on your node' },
+                { label: 'Consensus', desc: 'Node must be online and actively participating in block validation rounds' },
+                { label: 'Coverage',  desc: 'PoC beacon must be online and pass geographic proof challenges' },
+                { label: 'Retrieval', desc: 'Only paid when other nodes actually request and download data from you' },
               ].map(e => (
                 <div key={e.label} className="bg-gray-900 rounded-lg p-2.5">
                   <div className="font-medium text-gray-200">{e.label}</div>
