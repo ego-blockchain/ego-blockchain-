@@ -124,14 +124,14 @@ async fn main() -> anyhow::Result<()> {
                     info!("[Relay] Circuit opened: {} → {}", src_peer_id, dst_peer_id);
                 }
                 RelayBehaviourEvent::Relay(
-                    relay::Event::ReservationReqDenied { src_peer_id, .. }
+                    relay::Event::ReservationReqDenied { src_peer_id, status }
                 ) => {
-                    info!("[Relay] Reservation DENIED for {} — check max_reservations", src_peer_id);
+                    info!("[Relay] Reservation DENIED for {} — status: {:?}", src_peer_id, status);
                 }
                 RelayBehaviourEvent::Relay(
-                    relay::Event::CircuitReqDenied { src_peer_id, dst_peer_id, .. }
+                    relay::Event::CircuitReqDenied { src_peer_id, dst_peer_id, status }
                 ) => {
-                    info!("[Relay] Circuit DENIED: {} → {} — check max_circuits", src_peer_id, dst_peer_id);
+                    info!("[Relay] Circuit DENIED: {} → {} — status: {:?}", src_peer_id, dst_peer_id, status);
                 }
                 _ => {}
             },
