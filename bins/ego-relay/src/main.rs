@@ -75,8 +75,9 @@ async fn main() -> anyhow::Result<()> {
                     max_circuits:              4096,
                     max_circuits_per_peer:     64,
                     max_circuit_duration:      Duration::from_secs(7200),
-                    // 0 = no byte limit per circuit — peers transfer blocks directly.
-                    max_circuit_bytes:         0,
+                    // u64::MAX = no byte limit per circuit.
+                    // 0 would be interpreted as "0 bytes allowed" and deny all circuits.
+                    max_circuit_bytes:         u64::MAX,
                     ..Default::default()
                 },
             ),
