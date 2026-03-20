@@ -1074,9 +1074,10 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     let (tx, mut rx) = mpsc::channel::<SwarmCmd>(64);
     let _ = SWARM_TX.set(tx);
 
-    let mut external_addrs: Vec<Multiaddr> = Vec::new();
-    let mut pending_sends:  HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>> = HashMap::new();
-    let mut in_flight:      HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>> = HashMap::new();
+    let mut external_addrs:   Vec<Multiaddr> = Vec::new();
+    let mut pending_sends:    HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>> = HashMap::new();
+    let mut in_flight:        HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>> = HashMap::new();
+    let mut circuit_listener: Option<libp2p::swarm::ListenerId> = None;
 
     // Retry relay connection every 15 s when circuit is not confirmed.
     let mut relay_retry = tokio::time::interval(Duration::from_secs(15));
@@ -1137,6 +1138,7 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                     event, &app,
                     &mut external_addrs, &mut pending_sends, &mut in_flight,
                     &mut swarm, &relay_addrs,
+                    &mut circuit_listener,
                 ).await;
             }
 
@@ -1429,13 +1431,14 @@ fn inject_circuit(
 // ── Swarm event handler ───────────────────────────────────────────────────────
 
 async fn handle_event(
-    event:          SwarmEvent<EgoBehaviourEvent>,
-    app:            &tauri::AppHandle,
-    external_addrs: &mut Vec<Multiaddr>,
-    pending_sends:  &mut HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>>,
-    in_flight:      &mut HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>>,
-    swarm:          &mut libp2p::Swarm<EgoBehaviour>,
-    relay_addrs:    &HashMap<PeerId, Multiaddr>,
+    event:            SwarmEvent<EgoBehaviourEvent>,
+    app:              &tauri::AppHandle,
+    external_addrs:   &mut Vec<Multiaddr>,
+    pending_sends:    &mut HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>>,
+    in_flight:        &mut HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>>,
+    swarm:            &mut libp2p::Swarm<EgoBehaviour>,
+    relay_addrs:      &HashMap<PeerId, Multiaddr>,
+    circuit_listener: &mut Option<libp2p::swarm::ListenerId>,
 ) {
     match event {
 
@@ -1472,8 +1475,14 @@ async fn handle_event(
                 match circuit_str.parse::<Multiaddr>() {
                     Ok(circuit_addr) => {
                         eprintln!("[P2P] Reserving relay slot: {}", circuit_str);
+                        // Remove any stale listener from a previous connection so
+                        // listen_on succeeds and a fresh reservation is sent.
+                        if let Some(id) = circuit_listener.take() {
+                            swarm.remove_listener(id);
+                        }
                         match swarm.listen_on(circuit_addr) {
-                            Ok(_)  => {
+                            Ok(lid) => {
+                                *circuit_listener = Some(lid);
                                 eprintln!("[P2P] Relay reservation requested ✓");
                                 if let Some(full_circuit) = build_circuit_addr(
                                     relay_base, &peer_id, &our_peer_id,
@@ -1511,6 +1520,11 @@ async fn handle_event(
                 eprintln!("[P2P] Relay {} disconnected — clearing circuit, redialling", peer_id);
                 RELAY_CIRCUIT_READY.store(false, Ordering::Relaxed);
                 external_addrs.retain(|a| !a.to_string().contains("/p2p-circuit"));
+                // Remove the stale circuit listener so listen_on can re-register
+                // a fresh reservation when we reconnect.
+                if let Some(id) = circuit_listener.take() {
+                    swarm.remove_listener(id);
+                }
                 for relay_str in RELAY_NODES {
                     if let Ok(addr) = relay_str.parse::<Multiaddr>() {
                         let _ = swarm.dial(addr);
