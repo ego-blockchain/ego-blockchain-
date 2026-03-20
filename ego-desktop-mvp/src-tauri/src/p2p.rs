@@ -458,10 +458,6 @@ impl request_response::Codec for EgoCodec {
 #[derive(NetworkBehaviour)]
 struct EgoBehaviour {
     relay_client:     relay::client::Behaviour,
-    /// Server-side relay — active on all nodes but only useful when AutoNAT
-    /// reports Public.  Peers that discover us via Identify will see we support
-    /// the relay server protocol and can use us as a hop.
-    relay_server:     relay::Behaviour,
     dcutr:            dcutr::Behaviour,
     identify:         identify::Behaviour,
     request_response: request_response::Behaviour<EgoCodec>,
@@ -949,13 +945,6 @@ pub async fn request_file_pinning(cids: Vec<String>) {
     }
 }
 
-/// Called when AutoNAT confirms public IP — broadcast manifest + peer announce.
-async fn announce_as_relay(app: &tauri::AppHandle) {
-    // Let all contacts know we're a relay node
-    broadcast_data_manifest().await;
-    broadcast_peer_announce(app).await;
-    eprintln!("[relay-server] Announced as community relay node");
-}
 
 // ── Peer cache ────────────────────────────────────────────────────────────────
 
@@ -1273,22 +1262,6 @@ async fn build_swarm(
 
             EgoBehaviour {
                 relay_client,
-                // Desktop relay server: runs on every node, becomes useful when
-                // AutoNAT reports Public.  Limits are ~1/4 of the central relay's
-                // to avoid overloading consumer hardware.
-                relay_server: relay::Behaviour::new(
-                    peer_id,
-                    relay::Config {
-                        max_reservations:          128,
-                        max_reservations_per_peer: 2,
-                        reservation_duration:      Duration::from_secs(3600),
-                        max_circuits:              256,
-                        max_circuits_per_peer:     8,
-                        max_circuit_duration:      Duration::from_secs(7200),
-                        max_circuit_bytes:         u64::MAX,
-                        ..Default::default()
-                    },
-                ),
                 dcutr:    dcutr::Behaviour::new(peer_id),
                 identify: identify::Behaviour::new(
                     identify::Config::new("/ego/identify/1.0.0".to_string(), key.public())
@@ -1441,6 +1414,22 @@ async fn handle_event(
     circuit_listener: &mut Option<libp2p_core::transport::ListenerId>,
 ) {
     match event {
+
+        // ─── ListenerClosed ───────────────────────────────────────────────────
+        // If the relay circuit listener closes for any reason (e.g., the relay
+        // cancelled the reservation or the transport layer closed it), clear our
+        // circuit_listener so relay_retry can re-register a fresh reservation.
+        SwarmEvent::ListenerClosed { listener_id, reason, .. } => {
+            let is_circuit = circuit_listener.as_ref()
+                .map(|id| *id == listener_id)
+                .unwrap_or(false);
+            if is_circuit {
+                eprintln!("[P2P] Circuit listener closed ({:?}) — will re-register", reason);
+                *circuit_listener = None;
+                RELAY_CIRCUIT_READY.store(false, Ordering::Relaxed);
+                external_addrs.retain(|a| !a.to_string().contains("/p2p-circuit"));
+            }
+        }
 
         // ─── NewListenAddr ────────────────────────────────────────────────────
         // When the relay accepts our reservation it assigns a circuit listen
@@ -1608,19 +1597,6 @@ async fn handle_event(
             eprintln!("[P2P] Relay event: {:?}", event);
         }
 
-        // ─── Relay server events (this node relaying for others) ──────────
-        SwarmEvent::Behaviour(EgoBehaviourEvent::RelayServer(
-            relay::Event::ReservationReqAccepted { src_peer_id, .. },
-        )) => {
-            eprintln!("[relay-server] Reservation accepted for {}", src_peer_id);
-        }
-        SwarmEvent::Behaviour(EgoBehaviourEvent::RelayServer(
-            relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id, .. },
-        )) => {
-            eprintln!("[relay-server] Circuit opened: {} → {}", src_peer_id, dst_peer_id);
-        }
-        SwarmEvent::Behaviour(EgoBehaviourEvent::RelayServer(_)) => {}
-
         // ─── AutoNAT ──────────────────────────────────────────────────────────
         SwarmEvent::Behaviour(EgoBehaviourEvent::Autonat(
             autonat::Event::StatusChanged { new, .. },
@@ -1637,14 +1613,6 @@ async fn handle_event(
                         let peer_id = *swarm.local_peer_id();
                         state.set_public_endpoint(best_endpoint(external_addrs, &peer_id));
                         let _ = app.emit_all("ego://p2p-status-changed", ());
-                    }
-                    // Enable relay server mode — this node can now relay for NAT peers.
-                    if !IS_RELAY_SERVER.load(Ordering::Relaxed) {
-                        IS_RELAY_SERVER.store(true, Ordering::Relaxed);
-                        eprintln!("[relay-server] Public IP confirmed — relay server ACTIVE");
-                        let _ = app.emit_all("ego://relay-server-enabled", ());
-                        let app_clone = app.clone();
-                        tokio::spawn(async move { announce_as_relay(&app_clone).await; });
                     }
                 }
                 autonat::NatStatus::Private => {
