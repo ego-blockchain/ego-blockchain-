@@ -1474,12 +1474,17 @@ async fn handle_event(
                 let circuit_str = format!("{}/p2p/{}/p2p-circuit", relay_base, peer_id);
                 match circuit_str.parse::<Multiaddr>() {
                     Ok(circuit_addr) => {
+                        // Only register a new circuit listener if we don't already have
+                        // one active. TCP and QUIC both connect to the relay at startup,
+                        // firing ConnectionEstablished twice for the same peer. Without
+                        // this guard, two listen_on calls produce two simultaneous
+                        // reservation requests — the relay drops one with a WARN and the
+                        // surviving reservation ends up on the wrong connection, causing
+                        // every subsequent circuit to be denied.
+                        if circuit_listener.is_some() {
+                            eprintln!("[P2P] Relay already reserved — skipping duplicate ConnectionEstablished for {}", peer_id);
+                        } else {
                         eprintln!("[P2P] Reserving relay slot: {}", circuit_str);
-                        // Remove any stale listener from a previous connection so
-                        // listen_on succeeds and a fresh reservation is sent.
-                        if let Some(id) = circuit_listener.take() {
-                            swarm.remove_listener(id);
-                        }
                         match swarm.listen_on(circuit_addr) {
                             Ok(lid) => {
                                 *circuit_listener = Some(lid);
@@ -1492,6 +1497,7 @@ async fn handle_event(
                             }
                             Err(e) => eprintln!("[P2P] Relay listen error: {}", e),
                         }
+                        } // end else (circuit_listener.is_none())
                     }
                     Err(e) => eprintln!("[P2P] Bad circuit addr '{}': {}", circuit_str, e),
                 }
