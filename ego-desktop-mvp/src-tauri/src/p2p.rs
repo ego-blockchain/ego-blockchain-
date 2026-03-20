@@ -1077,7 +1077,7 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     let mut external_addrs:   Vec<Multiaddr> = Vec::new();
     let mut pending_sends:    HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>> = HashMap::new();
     let mut in_flight:        HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>> = HashMap::new();
-    let mut circuit_listener: Option<libp2p::swarm::ListenerId> = None;
+    let mut circuit_listener: Option<libp2p_core::transport::ListenerId> = None;
 
     // Retry relay connection every 15 s when circuit is not confirmed.
     let mut relay_retry = tokio::time::interval(Duration::from_secs(15));
@@ -1438,7 +1438,7 @@ async fn handle_event(
     in_flight:        &mut HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>>,
     swarm:            &mut libp2p::Swarm<EgoBehaviour>,
     relay_addrs:      &HashMap<PeerId, Multiaddr>,
-    circuit_listener: &mut Option<libp2p::swarm::ListenerId>,
+    circuit_listener: &mut Option<libp2p_core::transport::ListenerId>,
 ) {
     match event {
 
@@ -1517,7 +1517,7 @@ async fn handle_event(
 
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
             if relay_addrs.contains_key(&peer_id) {
-                eprintln!("[P2P] Relay {} disconnected — clearing circuit, redialling", peer_id);
+                eprintln!("[P2P] Relay {} disconnected — clearing circuit", peer_id);
                 RELAY_CIRCUIT_READY.store(false, Ordering::Relaxed);
                 external_addrs.retain(|a| !a.to_string().contains("/p2p-circuit"));
                 // Remove the stale circuit listener so listen_on can re-register
@@ -1525,11 +1525,11 @@ async fn handle_event(
                 if let Some(id) = circuit_listener.take() {
                     swarm.remove_listener(id);
                 }
-                for relay_str in RELAY_NODES {
-                    if let Ok(addr) = relay_str.parse::<Multiaddr>() {
-                        let _ = swarm.dial(addr);
-                    }
-                }
+                // Do NOT dial here — the relay_retry timer (every 15 s) will
+                // reconnect. Dialling immediately AND from the timer causes two
+                // simultaneous connections to the relay; the relay then has two
+                // handlers for our peer ID, routes incoming circuits to the one
+                // without a reservation, and denies every circuit.
             }
             if let Some(pending) = pending_sends.remove(&peer_id) {
                 for (_, reply) in pending {
