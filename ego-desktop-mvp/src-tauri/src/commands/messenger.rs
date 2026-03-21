@@ -404,8 +404,8 @@ pub async fn approve_contact_request(
         }
     }
 
-    // Always deposit to DHT so the requester receives the approval even if they
-    // were offline, their endpoint changed, or direct delivery was unreliable.
+    // Always deposit to relay mailbox so the requester receives the approval
+    // even if they were offline or direct delivery was unreliable.
     deposit_in_relay_inbox(&contact_addr, &my_addr, &response).await;
 
     Ok(contact)
@@ -543,7 +543,7 @@ pub async fn send_message(
                                     from_addr:     my_addr.clone(),
                                 };
                                 deposit_in_relay_inbox(&contact_addr_key, &my_addr, &manifest_msg).await;
-                                eprintln!("[EgoSafe] ManifestData pre-deposited in DHT for {} ({} blocks)",
+                                eprintln!("[EgoSafe] ManifestData deposited in relay mailbox for {} ({} blocks)",
                                     contact_addr_key, manifest.blocks.len());
                             }
                         }
@@ -560,12 +560,12 @@ pub async fn send_message(
                                     file_name:     file.name.clone(),
                                     key_nonce_hex: file.key_nonce_hex.clone(),
                                 };
-                                const DHT_FILE_LIMIT: usize = 3 * 1024 * 1024;
-                                if enc_bytes.len() <= DHT_FILE_LIMIT {
+                                const RELAY_FILE_LIMIT: usize = 3 * 1024 * 1024;
+                                if enc_bytes.len() <= RELAY_FILE_LIMIT {
                                     deposit_in_relay_inbox(&contact_addr_key, &my_addr, &file_data).await;
-                                    eprintln!("[EgoSafe] FileData pre-deposited in DHT for {} ({} bytes)", contact_addr_key, enc_bytes.len());
+                                    eprintln!("[EgoSafe] FileData deposited in relay mailbox for {} ({} bytes)", contact_addr_key, enc_bytes.len());
                                 } else {
-                                    eprintln!("[EgoSafe] File too large for DHT ({} bytes) — relying on direct delivery + FileRequest pull", enc_bytes.len());
+                                    eprintln!("[EgoSafe] File too large for relay mailbox ({} bytes) — relying on direct delivery + FileRequest pull", enc_bytes.len());
                                 }
                             }
                             Err(e) => eprintln!("[EgoSafe] Cannot read file for push: {}", e),
@@ -575,9 +575,9 @@ pub async fn send_message(
             }
         }
 
-        // ── Deliver ChatMessage (direct or DHT) ──────────────────────────────
+        // ── Deliver ChatMessage (direct or relay mailbox) ─────────────────────
         if stored_endpoint.is_empty() {
-            eprintln!("[Messenger] No endpoint for {} — DHT only", contact_addr_key);
+            eprintln!("[Messenger] No endpoint for {} — relay mailbox only", contact_addr_key);
             let p2p_msg = p2p::P2PMessage::ChatMessage { bundle };
             deposit_in_relay_inbox(&contact_addr_key, &my_addr, &p2p_msg).await;
             return;
