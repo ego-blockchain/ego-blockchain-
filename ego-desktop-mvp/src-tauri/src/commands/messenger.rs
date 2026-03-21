@@ -700,9 +700,37 @@ pub async fn rename_contact(
     save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)
 }
 
-/// Deposit a P2PMessage in the DHT inbox for offline delivery.
-/// HTTP relay inbox removed — relay decommissioned.
-pub async fn deposit_in_relay_inbox(to_addr: &str, from_addr: &str, msg: &crate::p2p::P2PMessage) {
-    crate::p2p::dht_deposit_message(to_addr, from_addr, msg).await;
+/// Deposit an encrypted P2PMessage blob in the relay HTTP mailbox for offline delivery.
+/// The relay stores opaque bytes; it never sees plaintext.
+pub async fn deposit_in_relay_inbox(_from_addr: &str, to_addr: &str, msg: &crate::p2p::P2PMessage) {
+    match serde_json::to_vec(msg) {
+        Ok(bytes) => {
+            if crate::relay_inbox::deposit(to_addr, bytes).await {
+                eprintln!("[RelayInbox] Deposited message for {}", to_addr);
+            } else {
+                eprintln!("[RelayInbox] Relay deposit failed for {} — message may be lost", to_addr);
+            }
+        }
+        Err(e) => eprintln!("[RelayInbox] Serialization failed: {}", e),
+    }
+}
+
+/// Poll the relay HTTP mailbox for messages addressed to `my_addr` and
+/// dispatch each one through the normal incoming-message handler.
+pub async fn poll_relay_inbox(my_addr: &str, app: &tauri::AppHandle) {
+    let entries = crate::relay_inbox::fetch(my_addr).await;
+    for (msg_id, bytes) in entries {
+        match serde_json::from_slice::<crate::p2p::P2PMessage>(&bytes) {
+            Ok(msg) => {
+                crate::p2p::handle_incoming(msg, app).await;
+                crate::relay_inbox::delete(my_addr, &msg_id).await;
+            }
+            Err(e) => {
+                eprintln!("[RelayInbox] Failed to parse message {}: {}", msg_id, e);
+                // Delete malformed messages so they don't clog the inbox
+                crate::relay_inbox::delete(my_addr, &msg_id).await;
+            }
+        }
+    }
 }
 

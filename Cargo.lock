@@ -1991,8 +1991,12 @@ name = "ego-relay"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "blake3",
  "futures",
  "libp2p 0.56.0",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.20",

@@ -1796,6 +1796,7 @@ dependencies = [
  "k256",
  "lettre",
  "libp2p 0.56.0",
+ "libp2p-core 0.43.2",
  "local-ip-address",
  "once_cell",
  "opener",

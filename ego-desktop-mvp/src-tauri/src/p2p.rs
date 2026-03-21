@@ -32,12 +32,6 @@ static GOSSIP_TX: OnceLock<mpsc::UnboundedSender<(String, Vec<u8>)>> = OnceLock:
 /// DHT command channel: send put/get requests into the swarm loop.
 pub static DHT_CMD_TX: OnceLock<mpsc::UnboundedSender<DhtCommand>> = OnceLock::new();
 
-/// Pending mailbox appends: addr → list of msg_hash strings waiting to be merged
-/// into the DHT `ego-mailbox:{addr}` list record.
-static PENDING_MAILBOX_APPENDS: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
-fn pending_appends() -> &'static Mutex<HashMap<String, Vec<String>>> {
-    PENDING_MAILBOX_APPENDS.get_or_init(|| Mutex::new(HashMap::new()))
-}
 
 #[derive(Debug)]
 pub enum DhtCommand {
@@ -1191,29 +1185,20 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                 swarm.behaviour_mut().kad.get_record(kad::RecordKey::new(&"ego-peers-v1"));
             }
 
-            // ── Periodic DHT inbox poll (ContactResponse + offline messages) ──
+            // ── Periodic DHT block retry (re-fetch missing file blocks) ─────────
             _ = dht_inbox_poll.tick() => {
-                let addr = crate::ledger::Ledger::load().address;
-                if !addr.is_empty() {
-                    if let Some(tx) = DHT_CMD_TX.get() {
-                        // Poll our mailbox for new messages
-                        let mailbox_key = format!("ego-mailbox:{}", addr);
-                        let _ = tx.send(DhtCommand::GetPeers { key: mailbox_key });
-                        // Re-issue DHT gets for any blocks we're still missing.
-                        // The sender may have published them to the DHT global store
-                        // since our last attempt.
-                        let ledger = crate::ledger::Ledger::load();
-                        for file in &ledger.stored_files {
-                            if file.cid.starts_with("egomfd1")
-                                && file.blocks_total > 0
-                                && file.blocks_received < file.blocks_total
-                            {
-                                if let Ok(manifest) = crate::blocks::load_manifest(&file.cid) {
-                                    for block_cid in crate::blocks::missing_blocks(&manifest) {
-                                        let _ = tx.send(DhtCommand::GetPeers {
-                                            key: format!("ego-block:{}", block_cid),
-                                        });
-                                    }
+                if let Some(tx) = DHT_CMD_TX.get() {
+                    let ledger = crate::ledger::Ledger::load();
+                    for file in &ledger.stored_files {
+                        if file.cid.starts_with("egomfd1")
+                            && file.blocks_total > 0
+                            && file.blocks_received < file.blocks_total
+                        {
+                            if let Ok(manifest) = crate::blocks::load_manifest(&file.cid) {
+                                for block_cid in crate::blocks::missing_blocks(&manifest) {
+                                    let _ = tx.send(DhtCommand::GetPeers {
+                                        key: format!("ego-block:{}", block_cid),
+                                    });
                                 }
                             }
                         }
@@ -1406,11 +1391,10 @@ fn inject_circuit(
         broadcast_peer_announce(&app_clone).await;
         eprintln!("[P2P] Re-announced after relay circuit confirmed");
 
-        // Poll DHT inbox for offline messages deposited while we were offline
+        // Poll relay HTTP mailbox for offline messages
         let addr = crate::ledger::Ledger::load().address;
         if !addr.is_empty() {
-            dht_fetch_inbox(&addr).await;
-            eprintln!("[Messenger] DHT inbox polled for {}", &addr[..addr.len().min(20)]);
+            eprintln!("[Messenger] Relay inbox polling for {}", &addr[..addr.len().min(20)]);
         }
     });
 }
@@ -1820,69 +1804,7 @@ async fn handle_event(
                 kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(rec))) => {
                     let key_str = String::from_utf8_lossy(rec.record.key.as_ref()).to_string();
 
-                    if key_str.starts_with("ego-mailbox:") {
-                        // Mailbox list: JSON array of msg_hash strings.
-                        // On each GetRecord we: (a) merge any pending appends and write
-                        // back the enlarged list, then (b) issue a GetRecord for every
-                        // ego-inbox:{addr}:{hash} entry so the payload is dispatched.
-                        let addr = key_str.trim_start_matches("ego-mailbox:");
-                        let mut hashes: Vec<String> = serde_json::from_slice::<Vec<String>>(
-                            &rec.record.value
-                        ).unwrap_or_default();
-
-                        // Drain pending appends for this address.
-                        let pending: Vec<String> = {
-                            let mut map = pending_appends().lock().unwrap();
-                            map.remove(addr).unwrap_or_default()
-                        };
-                        if !pending.is_empty() {
-                            for h in &pending {
-                                if !hashes.contains(h) {
-                                    hashes.push(h.clone());
-                                }
-                            }
-                            if let Ok(v) = serde_json::to_vec(&hashes) {
-                                let _ = swarm.behaviour_mut().kad.put_record(
-                                    kad::Record {
-                                        key:       rec.record.key.clone(),
-                                        value:     v,
-                                        publisher: None,
-                                        expires:   None,
-                                    },
-                                    kad::Quorum::One,
-                                );
-                                eprintln!("[DHT] Updated mailbox list for {} ({} entries)", addr, hashes.len());
-                            }
-                        }
-
-                        // Only fetch and dispatch messages when this mailbox belongs to us.
-                        // During a deposit (append cycle) we read a *foreign* mailbox to
-                        // do the read-modify-write; we must NOT dispatch those messages here
-                        // — the actual owner's node will pick them up on their own poll.
-                        let my_addr_check = crate::ledger::Ledger::load().address;
-                        if addr == my_addr_check {
-                            for hash in &hashes {
-                                let msg_key = format!("ego-inbox:{}:{}", addr, hash);
-                                swarm.behaviour_mut().kad.get_record(kad::RecordKey::new(&msg_key));
-                            }
-                            if !hashes.is_empty() {
-                                eprintln!("[DHT] Polling {} inbox message(s) for {}", hashes.len(), addr);
-                            }
-                        }
-                    } else if key_str.starts_with("ego-inbox:") {
-                        // Actual message payload — dispatch to handle_incoming.
-                        // Deduplicate: same DHT record is polled every 30 s; only
-                        // dispatch each unique key once per session.
-                        if dht_seen().insert(key_str.clone()) {
-                            if let Ok(msg) = serde_json::from_slice::<P2PMessage>(&rec.record.value) {
-                                let app2 = app.clone();
-                                tokio::spawn(async move { handle_incoming(msg, &app2).await; });
-                                eprintln!("[DHT] Dispatched inbox message from DHT: {}", &key_str[..key_str.len().min(50)]);
-                            }
-                        } else {
-                            eprintln!("[DHT] Skipping already-seen inbox message: {}", &key_str[..key_str.len().min(50)]);
-                        }
-                    } else if key_str.starts_with("ego-manifest:") {
+                    if key_str.starts_with("ego-manifest:") {
                         // File manifest from DHT global store — save and process.
                         let manifest_cid = key_str.trim_start_matches("ego-manifest:").to_string();
                         if let Ok(manifest) = serde_json::from_slice::<crate::blocks::FileManifest>(&rec.record.value) {
@@ -1921,32 +1843,7 @@ async fn handle_event(
                         }
                     }
                 }
-                // Mailbox key not found in DHT yet — write a fresh list if there
-                // are pending appends (first message ever deposited for this addr).
-                kad::QueryResult::GetRecord(Err(kad::GetRecordError::NotFound { key, .. })) => {
-                    let key_str = String::from_utf8_lossy(key.as_ref()).to_string();
-                    if key_str.starts_with("ego-mailbox:") {
-                        let addr = key_str.trim_start_matches("ego-mailbox:");
-                        let pending: Vec<String> = {
-                            let mut map = pending_appends().lock().unwrap();
-                            map.remove(addr).unwrap_or_default()
-                        };
-                        if !pending.is_empty() {
-                            if let Ok(v) = serde_json::to_vec(&pending) {
-                                let _ = swarm.behaviour_mut().kad.put_record(
-                                    kad::Record {
-                                        key:       kad::RecordKey::new(&key_str),
-                                        value:     v,
-                                        publisher: None,
-                                        expires:   None,
-                                    },
-                                    kad::Quorum::One,
-                                );
-                                eprintln!("[DHT] Created new mailbox list for {} ({} entries)", addr, pending.len());
-                            }
-                        }
-                    }
-                }
+                kad::QueryResult::GetRecord(Err(_)) => {}
                 _ => {}
             }
         }
@@ -3371,45 +3268,6 @@ pub async fn dht_find_cid(cid: &str) {
 
 /// Store an offline message in the DHT for a recipient who is not reachable right now.
 /// The message will be retrievable when they come online and call dht_fetch_inbox.
-pub async fn dht_deposit_message(to_addr: &str, from_addr: &str, msg: &P2PMessage) {
-    let payload = match serde_json::to_vec(msg) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let msg_hash = hex::encode(ego_core::hash_data(&payload).as_bytes());
-    let msg_key  = format!("ego-inbox:{}:{}", to_addr, msg_hash);
-
-    // 1. Store the message itself
-    if let Some(tx) = DHT_CMD_TX.get() {
-        let _ = tx.send(DhtCommand::PutPeer {
-            key:   msg_key.clone(),
-            value: payload,
-        });
-    }
-
-    // 2. Append this msg_hash to the mailbox list via a read-then-write cycle:
-    //    queue the hash in PENDING_MAILBOX_APPENDS, then trigger a GetRecord on
-    //    the mailbox key.  The GetRecord handler will merge pending hashes and
-    //    write back the enlarged list (or create a fresh list if key not found).
-    {
-        let mut map = pending_appends().lock().unwrap();
-        map.entry(to_addr.to_string()).or_default().push(msg_hash.clone());
-    }
-    let mailbox_key = format!("ego-mailbox:{}", to_addr);
-    if let Some(tx) = DHT_CMD_TX.get() {
-        let _ = tx.send(DhtCommand::GetPeers { key: mailbox_key });
-    }
-    let display_len = msg_key.len().min(40);
-    eprintln!("[DHT] Queued mailbox append for {} (hash={})", to_addr, &msg_hash[..8.min(msg_hash.len())]);
-}
-
-/// Query the DHT for offline messages addressed to our address.
-pub async fn dht_fetch_inbox(my_addr: &str) {
-    let mailbox_key = format!("ego-mailbox:{}", my_addr);
-    if let Some(tx) = DHT_CMD_TX.get() {
-        let _ = tx.send(DhtCommand::GetPeers { key: mailbox_key });
-    }
-}
 
 /// Discover peers via DHT only (HTTP relay decommissioned).
 pub async fn fetch_peers_from_relay(_app: &tauri::AppHandle) {

@@ -75,10 +75,7 @@ pub struct DAConfig {
     pub anchor_window_hours: u64,
     pub response_window_blocks: u64,
     pub chunk_serve_timeout_ms: u64,
-    pub enable_ipfs: bool,
-    pub ipfs_gateway: Option<String>,
     pub enable_car_snapshots: bool,
-    pub enable_ipns: bool,
     pub max_evidence_bundle_size: usize,
     pub daily_anchor_enabled: bool,
     pub sampling_failure_threshold: f64,
@@ -302,7 +299,6 @@ pub struct StorageConfig {
     pub archival_replication_factor: u8,
     pub keep_headers_forever: bool,
     pub keep_qcs_forever: bool,
-    pub ipfs_overlay_enabled: bool,
     pub prune_old_bodies: bool,
     pub prune_old_receipts: bool,
     pub prune_old_events: bool,
@@ -702,10 +698,7 @@ impl Default for DAConfig {
             anchor_window_hours: 24,
             response_window_blocks: 100,
             chunk_serve_timeout_ms: 300,
-            enable_ipfs: true,
-            ipfs_gateway: None,
             enable_car_snapshots: true,
-            enable_ipns: true,
             max_evidence_bundle_size: 50 * 1024 * 1024,
             daily_anchor_enabled: true,
             sampling_failure_threshold: 0.6,
@@ -939,7 +932,6 @@ impl Default for StorageConfig {
             archival_replication_factor: 3,
             keep_headers_forever: true,
             keep_qcs_forever: true,
-            ipfs_overlay_enabled: true,
             prune_old_bodies: true,
             prune_old_receipts: true,
             prune_old_events: true,
@@ -2248,10 +2240,8 @@ impl RollupConfig {
             topics.push("ego/poc/witnesses".to_string());
         }
 
-        if self.da.enable_ipfs {
-            topics.push("ego/storage/placement".to_string());
-            topics.push("ego/storage/repair".to_string());
-        }
+        topics.push("ego/storage/placement".to_string());
+        topics.push("ego/storage/repair".to_string());
 
         topics
     }
@@ -2567,10 +2557,6 @@ impl RollupConfig {
 
     pub fn get_compression_algorithm(&self) -> CompressionAlgorithm {
         self.da.compression_algorithm
-    }
-
-    pub fn is_ipfs_overlay_enabled(&self) -> bool {
-        self.storage.ipfs_overlay_enabled
     }
 
     pub fn should_keep_headers_forever(&self) -> bool {
