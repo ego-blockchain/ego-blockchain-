@@ -1,4 +1,4 @@
-//! IPFS-style content-addressed block storage.
+//! Content-addressed block storage.
 //!
 //! Files are split into 256 KB plaintext chunks.  Each chunk is:
 //!  1. Hashed with BLAKE2 → block CID (`egoblk1{hex}`)  — content-addressed

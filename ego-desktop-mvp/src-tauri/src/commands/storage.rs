@@ -69,7 +69,7 @@ pub async fn store_file(
         .unwrap_or("unknown")
         .to_string();
 
-    // ── IPFS-style block storage ──────────────────────────────────────────────
+    // ── Content-addressed block storage ──────────────────────────────────────
     // Generate a single 32-byte AES key for this file.
     // Each 256 KB block gets its own random nonce (stored in the manifest).
     let mut key_bytes = [0u8; 32];
