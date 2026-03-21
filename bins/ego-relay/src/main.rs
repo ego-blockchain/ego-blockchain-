@@ -1,11 +1,11 @@
-//! Ego Relay — minimal libp2p circuit-relay server.
+//! Ego Relay — libp2p circuit-relay server + HTTP store-and-forward mailbox.
 //!
-//! Listens on port 4001 (TCP).
+//! Port 4001 (TCP) — libp2p circuit relay v2.
+//! Port 4002 (TCP) — HTTP mailbox (POST/GET/DELETE /inbox/{hash}).
+//!
 //! Saves its keypair to `ego-relay.key` so the peer ID is stable across restarts.
-//! Prints the peer ID on startup — copy it into RELAY_NODES in p2p.rs.
-//!
-//! This relay does NOT participate in the DHT — peers are full DHT nodes.
-//! The relay only connects peers to each other via circuit relay v2.
+
+mod mailbox;
 
 use futures::StreamExt;
 use libp2p::{
@@ -16,11 +16,11 @@ use libp2p::{
 use std::{fs, path::Path, time::Duration};
 use tracing::info;
 
-const LISTEN_PORT: u16 = 4001;
-const KEY_FILE: &str   = "ego-relay.key";
+const LISTEN_PORT: u16      = 4001;
+const MAILBOX_PORT: u16     = 4002;
+const KEY_FILE: &str        = "ego-relay.key";
 
 // ── Behaviour ─────────────────────────────────────────────────────────────────
-// No Kademlia — peers are full DHT nodes, relay just routes connections.
 
 #[derive(NetworkBehaviour)]
 struct RelayBehaviour {
@@ -49,10 +49,21 @@ async fn main() -> anyhow::Result<()> {
     info!("╔══════════════════════════════════════════════════════╗");
     info!("║  Ego Relay started                                   ║");
     info!("║  Peer ID: {:<42} ║", local_peer_id);
-    info!("║  Copy the Peer ID above into RELAY_NODES in p2p.rs  ║");
+    info!("║  P2P  port: {}                                    ║", LISTEN_PORT);
+    info!("║  HTTP port: {}                                    ║", MAILBOX_PORT);
     info!("╚══════════════════════════════════════════════════════╝");
 
-    // ── 2. Build transport + behaviour ───────────────────────────────────────
+    // ── 2. HTTP mailbox server ────────────────────────────────────────────────
+    let store      = mailbox::new_store();
+    let http_app   = mailbox::router(store);
+    let http_bind  = format!("0.0.0.0:{}", MAILBOX_PORT);
+    let http_listener = tokio::net::TcpListener::bind(&http_bind).await?;
+    info!("[Mailbox] HTTP listening on {}", http_bind);
+    tokio::spawn(async move {
+        axum::serve(http_listener, http_app).await.unwrap();
+    });
+
+    // ── 3. Build libp2p transport + behaviour ─────────────────────────────────
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -64,19 +75,12 @@ async fn main() -> anyhow::Result<()> {
             relay: relay::Behaviour::new(
                 local_peer_id,
                 relay::Config {
-                    // How many peers can reserve a relay slot simultaneously.
-                    // Each connected peer takes one slot when they call listen_on circuit.
                     max_reservations:          1024,
-                    max_reservations_per_peer: 16,
+                    max_reservations_per_peer: 4,
                     reservation_duration:      Duration::from_secs(3600),
-                    // How many simultaneous circuit connections the relay will forward.
-                    // Each file block transfer or message exchange uses one circuit.
-                    // 4096 allows ~2000 concurrent peer pairs transferring data.
                     max_circuits:              4096,
                     max_circuits_per_peer:     64,
                     max_circuit_duration:      Duration::from_secs(7200),
-                    // u64::MAX = no byte limit per circuit.
-                    // 0 would be interpreted as "0 bytes allowed" and deny all circuits.
                     max_circuit_bytes:         u64::MAX,
                     ..Default::default()
                 },
@@ -91,24 +95,21 @@ async fn main() -> anyhow::Result<()> {
                     .with_timeout(Duration::from_secs(20)),
             ),
         })?
-        // Keep connections alive for 2 hours — clients ping every 30s so the
-        // idle timer never fires under normal operation.
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(7200)))
         .build();
 
-    // ── 3. Listen on TCP 0.0.0.0:4001 ───────────────────────────────────────
+    // ── 4. Listen on TCP 0.0.0.0:4001 ────────────────────────────────────────
     let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", LISTEN_PORT).parse()?;
     swarm.listen_on(listen_addr)?;
 
-    // Tell the relay behaviour its public DNS address so it includes it in
-    // reservation responses.  Without this the relay only knows its private
-    // container IPs (10.x, 172.x) and sends empty addrs → clients get
-    // NoAddressesInReservation and the circuit listener closes immediately.
+    // Tell the relay its public DNS address so reservation responses include
+    // a routable address.  Without this the relay only knows its private
+    // container IPs and clients get NoAddressesInReservation.
     let public_addr: Multiaddr =
         format!("/dns4/EgoRelay.egoblockchain.com/tcp/{}", LISTEN_PORT).parse()?;
     swarm.add_external_address(public_addr);
 
-    // ── 4. Event loop ─────────────────────────────────────────────────────────
+    // ── 5. libp2p event loop ──────────────────────────────────────────────────
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {

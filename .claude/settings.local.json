@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(git:*)",
+      "Bash(cd:*)",
+      "Bash(wmic logicaldisk:*)",
+      "Bash(powershell -Command \"Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{N='Used\\(GB\\)';E={[math]::Round\\($_.Used/1GB,1\\)}}, @{N='Free\\(GB\\)';E={[math]::Round\\($_.Free/1GB,1\\)}}\")",
+      "Bash(echo:*)",
+      "Bash(curl:*)",
+      "Bash(mkdir:*)",
+      "Bash(cat:*)",
+      "Bash(grep:*)",
+      "Bash(sleep:*)",
+      "Bash(where gh:*)",
+      "Bash(winget install:*)",
+      "Bash(python3:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo check:*)",
+      "Bash(npm run:*)"
+    ]
+  }
+}
