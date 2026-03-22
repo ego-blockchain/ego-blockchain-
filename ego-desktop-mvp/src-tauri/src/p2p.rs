@@ -195,6 +195,27 @@ static IS_RELAY_SERVER: AtomicBool = AtomicBool::new(false);
 
 pub fn relay_mode_active() -> bool { IS_RELAY_SERVER.load(Ordering::Relaxed) }
 
+/// Number of direct (non-relay) peer connections currently open.
+/// Once this reaches MIN_DIRECT_PEERS_RELAY_OPTIONAL the relay is no longer
+/// required for bootstrap — new nodes can discover the network from peers alone.
+static DIRECT_PEER_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Minimum direct connections before relay retry is throttled.
+const MIN_DIRECT_PEERS_RELAY_OPTIONAL: usize = 10;
+
+/// Minimum cached peers needed to attempt relay-free startup.
+const MIN_CACHED_PEERS_FOR_DIRECT_BOOT: usize = 5;
+
+/// Per-multiaddr vote counts from incoming PeerSeedGossip messages.
+/// When an addr appears in ≥50 % of the last SEED_VOTE_WINDOW messages it is
+/// majority-confirmed and dialled automatically.
+static PEER_SEED_VOTES: OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> =
+    OnceLock::new();
+static PEER_SEED_MSG_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+const SEED_VOTE_WINDOW: usize = 20;
+
 /// Pending BFT votes: block_hash → list of voter addresses that have voted.
 /// Once >2/3 of KNOWN_VALIDATORS have voted for a hash, the block is finalized.
 static PENDING_VOTES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Vec<String>>>> =
@@ -505,6 +526,15 @@ pub enum P2PMessage {
     },
     PeerListResponse {
         peers: Vec<PeerEntry>,
+    },
+    /// Periodic broadcast of up to 20 known peer multiaddrs.
+    /// Recipients vote-count each addr; majority-confirmed addrs are dialled
+    /// and cached — enabling relay-free bootstrap once the network matures.
+    PeerSeedGossip {
+        /// libp2p multiaddrs (direct or relay-circuit) this node has seen.
+        multiaddrs: Vec<String>,
+        /// Total peers known — lets new nodes judge network size.
+        known_count: u32,
     },
     FileRequest {
         cid: String,
@@ -1398,6 +1428,21 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
         }
     }
 
+    // ── Bootstrap from peer cache (relay-free after network matures) ─────────
+    // Dial all cached peers in parallel with the relay.  Once ≥MIN_CACHED_PEERS
+    // are present a new node can join without the central relay at all.
+    {
+        let cached = load_peer_cache();
+        if cached.len() >= MIN_CACHED_PEERS_FOR_DIRECT_BOOT {
+            eprintln!("[P2P] {} cached peers — attempting relay-free bootstrap", cached.len());
+        }
+        for peer in cached.iter().filter(|p| !p.endpoint.is_empty()).take(30) {
+            if let Ok(addr) = peer.endpoint.parse::<Multiaddr>() {
+                let _ = swarm.dial(addr);
+            }
+        }
+    }
+
     // ── Gossipsub subscriptions ───────────────────────────────────────────────
     let tx_topic       = gossipsub::IdentTopic::new("ego-txs-v1");
     let block_topic    = gossipsub::IdentTopic::new("ego-blocks-v1");
@@ -1457,6 +1502,12 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     let mut kad_discovery = tokio::time::interval(Duration::from_secs(300));
     kad_discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     kad_discovery.tick().await;
+
+    // Periodic peer-seed broadcast (every 5 minutes).
+    // Shares our known peer list so others can bootstrap without the relay.
+    let mut peer_seed_bcast = tokio::time::interval(Duration::from_secs(300));
+    peer_seed_bcast.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    peer_seed_bcast.tick().await;
 
     // Periodic DHT inbox poll (every 30 s) so offline-deposited ContactResponses
     // and chat messages are delivered even when the relay circuit was ready before
@@ -1525,7 +1576,33 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
             }
 
             // ── Relay circuit retry ───────────────────────────────────────────
+            _ = peer_seed_bcast.tick() => {
+                // Broadcast top-20 known peers so new nodes can bootstrap without relay.
+                let peers = load_peer_cache();
+                let multiaddrs: Vec<String> = peers.iter()
+                    .filter(|p| !p.endpoint.is_empty())
+                    .take(20)
+                    .map(|p| p.endpoint.clone())
+                    .collect();
+                if !multiaddrs.is_empty() {
+                    if let Ok(data) = serde_json::to_vec(&P2PMessage::PeerSeedGossip {
+                        multiaddrs,
+                        known_count: peers.len() as u32,
+                    }) {
+                        publish_gossip("ego-peers-v1", data).await;
+                    }
+                }
+            }
+
             _ = relay_retry.tick() => {
+                // Skip relay retry once we have enough direct peer connections.
+                if DIRECT_PEER_COUNT.load(Ordering::Relaxed) >= MIN_DIRECT_PEERS_RELAY_OPTIONAL
+                    && has_circuit_addr(&external_addrs)
+                {
+                    // Network is mature — relay is optional. Keep the existing
+                    // circuit alive for NAT peers but don't chase reconnects.
+                    continue;
+                }
                 if !has_circuit_addr(&external_addrs) {
                     for relay_str in RELAY_NODES {
                         if let Ok(addr) = relay_str.parse::<Multiaddr>() {
@@ -1909,6 +1986,14 @@ async fn handle_event(
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             eprintln!("[P2P] Connected to {}", peer_id);
 
+            // Track direct (non-relay) connections for relay-bypass threshold.
+            if !relay_addrs.contains_key(&peer_id) {
+                let n = DIRECT_PEER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == MIN_DIRECT_PEERS_RELAY_OPTIONAL {
+                    eprintln!("[P2P] {} direct peers — relay no longer required for bootstrap", n);
+                }
+            }
+
             if let Some(relay_base) = relay_addrs.get(&peer_id) {
                 let our_peer_id = *swarm.local_peer_id();
                 let circuit_str = format!("{}/p2p/{}/p2p-circuit", relay_base, peer_id);
@@ -1962,6 +2047,13 @@ async fn handle_event(
         }
 
         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+            if !relay_addrs.contains_key(&peer_id) && num_established == 0 {
+                // Decrement direct peer count (saturating to avoid underflow).
+                let _ = DIRECT_PEER_COUNT.fetch_update(
+                    Ordering::Relaxed, Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(1)),
+                );
+            }
             if relay_addrs.contains_key(&peer_id) {
                 eprintln!("[P2P] Relay {} connection closed ({} remaining)", peer_id, num_established);
                 if num_established == 0 {
@@ -2205,11 +2297,55 @@ async fn handle_event(
                 // Peer presence / endpoint update broadcast.
                 // When a peer changes WiFi/LAN their relay circuit changes; this
                 // lets us update the peer cache without a direct connection.
-                if let Ok(msg @ P2PMessage::PeerAnnounce { .. }) =
-                    serde_json::from_slice::<P2PMessage>(&message.data)
-                {
-                    let app2 = app.clone();
-                    tokio::spawn(async move { handle_incoming(msg, &app2).await; });
+                match serde_json::from_slice::<P2PMessage>(&message.data) {
+                    Ok(msg @ P2PMessage::PeerAnnounce { .. }) => {
+                        let app2 = app.clone();
+                        tokio::spawn(async move { handle_incoming(msg, &app2).await; });
+                    }
+                    Ok(P2PMessage::PeerSeedGossip { multiaddrs, known_count }) => {
+                        // Majority-vote bootstrap: accumulate votes per multiaddr.
+                        // Once an addr is seen in ≥50 % of the last SEED_VOTE_WINDOW
+                        // messages it is dialled and cached — no relay required.
+                        let msg_n = PEER_SEED_MSG_COUNT
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let reset = msg_n % SEED_VOTE_WINDOW == 0;
+                        let window_pos = if reset { SEED_VOTE_WINDOW } else { msg_n % SEED_VOTE_WINDOW };
+                        let majority = ((window_pos as f32) * 0.5).ceil() as u32;
+
+                        let mut to_dial: Vec<String> = Vec::new();
+                        {
+                            let mut votes = PEER_SEED_VOTES
+                                .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+                                .lock().unwrap();
+                            if reset { votes.clear(); }
+                            for addr in &multiaddrs {
+                                let cnt = votes.entry(addr.clone()).or_insert(0);
+                                *cnt += 1;
+                                // Only trust once we have ≥2 independent sources AND ≥50 %.
+                                if *cnt >= majority && majority >= 2 {
+                                    to_dial.push(addr.clone());
+                                }
+                            }
+                        }
+                        // Dial majority-confirmed addrs we haven't seen before.
+                        let known: std::collections::HashSet<String> =
+                            load_peer_cache().into_iter().map(|p| p.endpoint).collect();
+                        for addr_str in to_dial {
+                            if !known.contains(&addr_str) {
+                                if let Some(tx) = DHT_CMD_TX.get() {
+                                    let _ = tx.send(DhtCommand::DialPeer { addr: addr_str });
+                                }
+                            }
+                        }
+                        if known_count >= 100 {
+                            // Network maturity: log once so operators can see the relay is optional.
+                            static MATURITY_LOGGED: AtomicBool = AtomicBool::new(false);
+                            if !MATURITY_LOGGED.swap(true, Ordering::Relaxed) {
+                                eprintln!("[P2P] Network maturity reached ({} known peers) — relay is fully optional", known_count);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             } else if topic == "ego-shards-v1" {
                 match serde_json::from_slice::<P2PMessage>(&message.data) {
@@ -2930,6 +3066,9 @@ P2PMessage::ChatMessage { bundle, seq } => {
                 });
             }
         }
+
+        // Handled in the gossip dispatcher — no-op here.
+        P2PMessage::PeerSeedGossip { .. } => {}
 
 P2PMessage::FileRequest { cid, requester_addr, requester_endpoint } => {
     eprintln!("[P2P] FileRequest for {} from {} at {}", cid, requester_addr, requester_endpoint);
