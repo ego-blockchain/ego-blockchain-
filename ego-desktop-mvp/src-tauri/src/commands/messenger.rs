@@ -679,10 +679,9 @@ pub async fn send_message(
                 if let Some(file) = ledger.stored_files.iter().find(|f| f.cid == cid).cloned() {
 
                     if cid.starts_with("egomfd1") {
-                        // ── Block-based: pre-deposit ManifestData in receiver's inbox ──
-                        // Blocks are already in the DHT global store (put during store_file).
-                        // We just need to deliver the manifest + key so the receiver can
-                        // reconstruct the block list and fetch any blocks they're missing.
+                        // ── Block-based: queue ManifestData in local outbox ──────────
+                        // Relay is concierge-only; file metadata goes P2P or outbox.
+                        // Blocks are in the DHT global store — receiver fetches them.
                         if let Ok(manifest) = crate::blocks::load_manifest(&cid) {
                             if let Ok(manifest_json) = serde_json::to_string(&manifest) {
                                 let manifest_msg = p2p::P2PMessage::ManifestData {
@@ -692,51 +691,59 @@ pub async fn send_message(
                                     file_name:     file.name.clone(),
                                     from_addr:     my_addr.clone(),
                                 };
-                                deposit_in_relay_inbox(&contact_addr_key, &my_addr, &manifest_msg).await;
-                                eprintln!("[EgoSafe] ManifestData deposited in relay mailbox for {} ({} blocks)",
+                                crate::commands::outbox::enqueue(
+                                    &contact_addr_key, &stored_endpoint, &manifest_msg
+                                );
+                                eprintln!("[EgoSafe] ManifestData queued in outbox for {} ({} blocks)",
                                     contact_addr_key, manifest.blocks.len());
                             }
                         }
                     } else if !file.local_path.is_empty() && !file.local_path.starts_with("sender:") {
-                        // ── Legacy single-file: pre-deposit FileData in receiver's inbox ──
+                        // ── Legacy single-file: queue small FileData in local outbox ──
                         match std::fs::read(&file.local_path) {
                             Ok(enc_bytes) => {
-                                use base64::Engine as _;
-                                let enc_data_b64 = base64::engine::general_purpose::STANDARD
-                                    .encode(&enc_bytes);
-                                let file_data = p2p::P2PMessage::FileData {
-                                    cid:           cid.clone(),
-                                    enc_data_b64,
-                                    file_name:     file.name.clone(),
-                                    key_nonce_hex: file.key_nonce_hex.clone(),
-                                };
-                                const RELAY_FILE_LIMIT: usize = 3 * 1024 * 1024;
-                                if enc_bytes.len() <= RELAY_FILE_LIMIT {
-                                    deposit_in_relay_inbox(&contact_addr_key, &my_addr, &file_data).await;
-                                    eprintln!("[EgoSafe] FileData deposited in relay mailbox for {} ({} bytes)", contact_addr_key, enc_bytes.len());
+                                const OUTBOX_FILE_LIMIT: usize = 3 * 1024 * 1024;
+                                if enc_bytes.len() <= OUTBOX_FILE_LIMIT {
+                                    use base64::Engine as _;
+                                    let enc_data_b64 = base64::engine::general_purpose::STANDARD
+                                        .encode(&enc_bytes);
+                                    let file_data = p2p::P2PMessage::FileData {
+                                        cid:           cid.clone(),
+                                        enc_data_b64,
+                                        file_name:     file.name.clone(),
+                                        key_nonce_hex: file.key_nonce_hex.clone(),
+                                    };
+                                    crate::commands::outbox::enqueue(
+                                        &contact_addr_key, &stored_endpoint, &file_data
+                                    );
+                                    eprintln!("[EgoSafe] FileData ({} bytes) queued in outbox for {}",
+                                        enc_bytes.len(), contact_addr_key);
                                 } else {
-                                    eprintln!("[EgoSafe] File too large for relay mailbox ({} bytes) — relying on direct delivery + FileRequest pull", enc_bytes.len());
+                                    eprintln!("[EgoSafe] File too large for outbox ({} bytes) — direct delivery + FileRequest pull only",
+                                        enc_bytes.len());
                                 }
                             }
-                            Err(e) => eprintln!("[EgoSafe] Cannot read file for push: {}", e),
+                            Err(e) => eprintln!("[EgoSafe] Cannot read file for outbox: {}", e),
                         }
                     }
                 }
             }
         }
 
-        // ── Deliver ChatMessage (direct or relay mailbox) ─────────────────────
+        // ── Deliver ChatMessage (P2P direct → local outbox fallback) ─────────
+        // The relay is a concierge for discovery only — chat goes P2P.
+        // If direct delivery fails we queue in the LOCAL outbox and retry
+        // when the peer next announces online (PeerAnnounce or 30s poll).
+        let p2p_msg = p2p::P2PMessage::ChatMessage { bundle, seq: send_seq };
         if stored_endpoint.is_empty() {
-            eprintln!("[Messenger] No endpoint for {} — relay mailbox only", contact_addr_key);
-            let p2p_msg = p2p::P2PMessage::ChatMessage { bundle, seq: send_seq };
-            deposit_in_relay_inbox(&contact_addr_key, &my_addr, &p2p_msg).await;
+            eprintln!("[Messenger] No endpoint for {} — queued in local outbox", contact_addr_key);
+            crate::commands::outbox::enqueue(&contact_addr_key, "", &p2p_msg);
             return;
         }
         let endpoint = resolve_endpoint(&contact_addr_key, &stored_endpoint).await;
-        let p2p_msg  = p2p::P2PMessage::ChatMessage { bundle, seq: send_seq };
         if let Err(e) = p2p::send_message(&endpoint, &p2p_msg).await {
-            eprintln!("[Messenger] deliver to {}: {} — depositing in relay inbox", endpoint, e);
-            deposit_in_relay_inbox(&contact_addr_key, &my_addr, &p2p_msg).await;
+            eprintln!("[Messenger] direct delivery to {} failed: {} — queuing outbox", contact_addr_key, e);
+            crate::commands::outbox::enqueue(&contact_addr_key, &endpoint, &p2p_msg);
         }
 
         // ── Also try direct ManifestData/FileData delivery as a fast-path ────
