@@ -432,6 +432,20 @@ pub async fn query_remote_node(
 
 // ── request_tx_code ───────────────────────────────────────────────────────────
 //
+/// Return the email stored in the local ledger, masked for display.
+/// e.g. "abc***@domain.com". Returns empty string if no email is set.
+#[tauri::command]
+pub fn get_account_email() -> String {
+    let email = Ledger::load().registered_email;
+    if email.is_empty() { return String::new(); }
+    if let Some(at) = email.find('@') {
+        let visible = email[..at.min(3)].to_string();
+        format!("{}***{}", visible, &email[at..])
+    } else {
+        "***".to_string()
+    }
+}
+
 // Step 1 of email 2FA: validate + sign the tx, store it pending, email a code.
 // Returns { tx_id, masked_email } — frontend shows the code-entry modal.
 

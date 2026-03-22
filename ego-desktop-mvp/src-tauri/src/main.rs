@@ -144,6 +144,7 @@ fn main() {
             commands::wallet::send_transaction,
             commands::wallet::prepare_transaction,
             commands::wallet::commit_transaction,
+            commands::wallet::get_account_email,
             commands::wallet::request_tx_code,
             commands::wallet::confirm_tx_code,
             commands::wallet::get_transaction_history,
