@@ -364,6 +364,11 @@ const WalletPage: React.FC = () => {
           const res = await invoke<TxResult>('send_transaction', { request });
           setTxResult(res);
           await load(); reloadWallet();
+        } else if (msg.toLowerCase().includes('too many')) {
+          setTxResult({
+            hash: '', success: false,
+            message: 'Too many code requests for this email. Please update your email address in Settings or try again in 1 hour.',
+          });
         } else {
           throw e;
         }
@@ -1260,18 +1265,18 @@ const WalletPage: React.FC = () => {
                 <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl p-4 text-sm text-center space-y-1">
                   <div className="text-blue-300 font-semibold">Verification code sent</div>
                   <div className="text-gray-400">
-                    Check <span className="text-white font-mono">{maskedEmail}</span> for a 6-digit code.
+                    Check <span className="text-white font-mono">{maskedEmail}</span> for a confirmation code (4 digits + 2 letters).
                   </div>
                 </div>
                 <div>
-                  <label className="text-xs text-gray-400 block mb-1.5">Enter 6-digit code</label>
+                  <label className="text-xs text-gray-400 block mb-1.5">Enter confirmation code <span className="text-gray-600">(e.g. 3A8S97)</span></label>
                   <input
                     autoFocus
                     value={codeInput}
-                    onChange={e => { setCodeInput(e.target.value.replace(/\D/g, '').slice(0, 6)); setCodeError(''); }}
+                    onChange={e => { setCodeInput(e.target.value.replace(/[^0-9a-zA-Z]/g, '').toUpperCase().slice(0, 6)); setCodeError(''); }}
                     onKeyDown={e => e.key === 'Enter' && codeInput.length === 6 && handleConfirmCode()}
                     className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-xl font-mono text-center tracking-widest outline-none transition"
-                    placeholder="000000"
+                    placeholder="3A8S97"
                     maxLength={6}
                   />
                   {codeError && <p className="text-red-400 text-xs mt-1.5">{codeError}</p>}

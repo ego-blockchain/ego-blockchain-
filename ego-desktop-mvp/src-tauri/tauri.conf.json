@@ -85,7 +85,7 @@
       "copyright": "",
       "category": "DeveloperTool",
       "shortDescription": "Quantum-Safe Blockchain Desktop App",
-      "longDescription": "EGO Desktop MVP - Experience quantum-safe blockchain technology with secure key generation, feeless transactions, encrypted file sharing, and blockchain earnings.",
+      "longDescription": "Ego Desktop - Experience quantum-safe blockchain technology with secure key generation, feeless transactions, encrypted file sharing, and blockchain earnings.",
       "deb": {
         "depends": []
       },

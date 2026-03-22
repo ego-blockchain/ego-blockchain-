@@ -75,10 +75,18 @@ impl ShardedMempool {
     }
 
     /// Drain up to BATCH_SIZE TXs from one shard for batch processing.
+    /// TXs are sorted by total fee (base + priority) descending so high-tip
+    /// transactions are always included first — EIP-1559-style ordering.
     pub fn drain_shard(&self, shard_id: u32) -> Vec<LedgerTx> {
         let mut s = self.shards[shard_id as usize].lock().unwrap();
+        if s.is_empty() { return vec![]; }
+        // Sort: highest (fee_uegoc + priority_fee_uegoc) first.
+        s.sort_unstable_by(|a, b| {
+            let fa = a.fee_uegoc + a.priority_fee_uegoc;
+            let fb = b.fee_uegoc + b.priority_fee_uegoc;
+            fb.cmp(&fa)
+        });
         let n = s.len().min(BATCH_SIZE);
-        if n == 0 { return vec![]; }
         let drained: Vec<LedgerTx> = s.drain(..n).collect();
         let count = drained.len() as u64;
         self.pending_total.fetch_sub(count, Ordering::Relaxed);
@@ -160,11 +168,6 @@ pub async fn run_batch_loop() {
             continue;
         }
 
-        let txs = pool.drain_all();
-        if txs.is_empty() {
-            continue;
-        }
-
         let miner = {
             let ledger = crate::ledger::Ledger::load();
             ledger.address.clone()
@@ -173,8 +176,30 @@ pub async fn run_batch_loop() {
             continue;
         }
 
+        // ── Proof of Coverage lottery ─────────────────────────────────────
+        // Each node signs the slot seed with its Ed25519 key.  Only the node
+        // whose ticket falls below the coverage-weighted threshold wins this
+        // slot and is allowed to mine.  This makes block production:
+        //   • Unpredictable — no node knows in advance if it will win.
+        //   • Coverage-weighted — more storage/uptime/relay = higher chance.
+        //   • Manipulation-resistant — TX value does not affect who mines;
+        //     fees are burned so there's nothing to gain by stuffing blocks.
+        let prev_hash = crate::chain_db::get_tip_hash();
+        let (poc_ticket, _poc_sig) = match crate::poc::check_slot_winner(&prev_hash) {
+            Some(t) => t,
+            None    => continue, // didn't win this slot — TXs stay in pool
+        };
+        let poc_slot = crate::poc::current_slot();
+
+        let txs = pool.drain_all();
+        if txs.is_empty() {
+            continue;
+        }
+
+        // Embed both ticket hash and sig in the block field: "ticket_hex:sig_hex"
+        let combined_ticket = format!("{}:{}", poc_ticket, _poc_sig);
         // O(1) block insert — no chain.json load/save
-        let block = crate::chain_db::mine_batch_db(&txs, &miner);
+        let block = crate::chain_db::mine_batch_db_with_ticket(&txs, &miner, &combined_ticket, poc_slot);
 
         eprintln!(
             "[Rollup] Block #{} — {} TXs in {}ms slot  ({} TPS instantaneous)",

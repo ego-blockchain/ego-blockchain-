@@ -94,6 +94,33 @@ pub async fn deploy_contract(args: DeployContractArgs) -> Result<DeployResult, E
     let tx_data    = format!("deploy:{}:{}:{}", ledger.address, result.contract_address, nonce);
     let tx_hash    = hex::encode(ego_core::hash_data(tx_data.as_bytes()).as_bytes());
 
+    // Deploy fee: free for stakers, DEPLOY_FEE_UEGOC for everyone else.
+    let is_staker   = ledger.staked_amount > 0;
+    let deploy_fee  = crate::tokenomics::deploy_fee_with_staking(is_staker);
+    if deploy_fee > 0 {
+        let bal = chain2.balance_of(&ledger.address);
+        if deploy_fee > bal {
+            return Err(EgoDesktopError::WalletError(format!(
+                "Insufficient balance for deploy fee: need {} uEGOC, have {}",
+                deploy_fee, bal
+            )));
+        }
+        let fee_hash = format!("0x{}", ego_core::hash_data(
+            format!("deployfee:{}:{}:{}", ledger.address, result.contract_address, nonce).as_bytes()
+        ).to_hex());
+        chain2.transactions.push(LedgerTx {
+            hash:      fee_hash,
+            from:      ledger.address.clone(),
+            to:        "egot1burn000000000000000000000000000000000000000".into(),
+            amount:    deploy_fee,
+            memo:      Some(format!("Deploy fee: {} [burned]", result.contract_address)),
+            timestamp: ts,
+            status:    "Confirmed".into(),
+            fee_uegoc: deploy_fee,
+            ..LedgerTx::default()
+        });
+    }
+
     let tx = LedgerTx {
         hash:          tx_hash,
         from:          ledger.address.clone(),

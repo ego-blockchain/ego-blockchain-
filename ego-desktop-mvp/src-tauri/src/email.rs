@@ -38,10 +38,79 @@ const SU: &[u8] = &[
 // Artit18+
 const SP: &[u8] = &[0x04,0x15,0x1B,0x27,0x11,0x45,0x7D,0x4C];
 
+// ── Send-attempt limiter (email → (count, window_start_unix_ts)) ─────────────
+// Max 3 sends per email per hour.  Resets automatically after the window passes.
+
+const MAX_SEND_ATTEMPTS: u32 = 3;
+const ATTEMPT_WINDOW_SECS: i64 = 3600; // 1 hour
+
+static SEND_ATTEMPTS: Lazy<Mutex<HashMap<String, (u32, i64)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Returns Ok(()) if the email is within the send limit, or a user-facing
+/// error string if the limit has been reached.
+pub fn check_send_limit(email: &str) -> Result<(), String> {
+    let key = email.to_lowercase();
+    let now = chrono::Utc::now().timestamp();
+    let mut map = SEND_ATTEMPTS.lock().unwrap();
+    if let Some((count, window_start)) = map.get(&key) {
+        if now - window_start < ATTEMPT_WINDOW_SECS && *count >= MAX_SEND_ATTEMPTS {
+            return Err(
+                "Too many code requests. Please check your inbox, change your email address, or try again later.".into()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Record a successful send attempt.  Call this only after the email is sent.
+pub fn record_send_attempt(email: &str) {
+    let key = email.to_lowercase();
+    let now = chrono::Utc::now().timestamp();
+    let mut map = SEND_ATTEMPTS.lock().unwrap();
+    let entry = map.entry(key).or_insert((0, now));
+    // Reset window if the previous window has expired
+    if now - entry.1 >= ATTEMPT_WINDOW_SECS {
+        *entry = (0, now);
+    }
+    entry.0 += 1;
+}
+
+/// Reset the send counter for an email (called on successful verification
+/// so the user isn't blocked after confirming their code).
+pub fn reset_send_attempts(email: &str) {
+    SEND_ATTEMPTS.lock().unwrap().remove(&email.to_lowercase());
+}
+
 // ── OTP store (email → (code, expiry unix ts)) ────────────────────────────────
 
 static OTP_STORE: Lazy<Mutex<HashMap<String, (String, i64)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Generate a confirmation code: 4 digits + 2 uppercase letters at random positions.
+/// Example: "3A8S97", "4E9Q72", "7K2395" — letters can appear anywhere in the 6 chars.
+/// Entropy: 10^4 × 26^2 × C(6,2) = 101,400,000 combinations.
+pub fn gen_otp_code() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+
+    // Pick 2 distinct positions (0..6) for the letters
+    let pos1 = rng.gen_range(0usize..6);
+    let pos2 = loop {
+        let p = rng.gen_range(0usize..6);
+        if p != pos1 { break p; }
+    };
+
+    let mut chars = ['0'; 6];
+    for (i, c) in chars.iter_mut().enumerate() {
+        if i == pos1 || i == pos2 {
+            *c = (b'A' + rng.gen_range(0u8..26)) as char;
+        } else {
+            *c = (b'0' + rng.gen_range(0u8..10)) as char;
+        }
+    }
+    chars.iter().collect()
+}
 
 pub fn store_otp(email: &str, code: &str) {
     let expiry = chrono::Utc::now().timestamp() + 600; // 10 minutes

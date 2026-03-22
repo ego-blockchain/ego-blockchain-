@@ -97,12 +97,14 @@ pub async fn send_transaction(
     if request.amount == 0 {
         return Err(EgoDesktopError::InvalidInput("Amount must be > 0".into()));
     }
-    let fee = crate::tokenomics::fee_for_tx_type("transfer");
+    let is_staker = ledger.staked_amount > 0;
+    let fee = crate::tokenomics::fee_for_tx_with_staking("transfer", is_staker);
     let total_needed = request.amount.saturating_add(fee);
     if total_needed > balance {
         return Err(EgoDesktopError::InvalidInput(format!(
-            "Insufficient balance: have {} uEGOC, need {} (amount {} + fee {})",
-            balance, total_needed, request.amount, fee
+            "Insufficient balance: have {} uEGOC, need {} (amount {} + fee {}{})",
+            balance, total_needed, request.amount, fee,
+            if is_staker { " — staker rate" } else { "" }
         )));
     }
 
@@ -285,14 +287,15 @@ pub async fn commit_transaction(
     let tx4 = tx.clone();
     let blk4 = block.clone();
     tokio::spawn(async move {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
         if let Ok(body) = serde_json::to_value(&tx4) {
-            let _ = client.post("https://rpc.egoblockchain.com/tx/broadcast")
-                .json(&body).timeout(std::time::Duration::from_secs(5)).send().await;
+            crate::p2p::oracle_post_pub(&client, "/tx/broadcast", &body).await;
         }
         if let Ok(body) = serde_json::to_value(&blk4) {
-            let _ = client.post("https://rpc.egoblockchain.com/block/broadcast")
-                .json(&body).timeout(std::time::Duration::from_secs(5)).send().await;
+            crate::p2p::oracle_post_pub(&client, "/block/broadcast", &body).await;
         }
     });
     Ok(TransactionResponse {
@@ -462,7 +465,8 @@ pub async fn request_tx_code(
     if request.amount == 0 {
         return Err(EgoDesktopError::InvalidInput("Amount must be > 0".into()));
     }
-    let fee          = crate::tokenomics::fee_for_tx_type("transfer");
+    let is_staker2   = ledger.staked_amount > 0;
+    let fee          = crate::tokenomics::fee_for_tx_with_staking("transfer", is_staker2);
     let total_needed = request.amount.saturating_add(fee);
     if total_needed > balance {
         return Err(EgoDesktopError::InvalidInput(format!(
@@ -508,24 +512,30 @@ pub async fn request_tx_code(
         ..LedgerTx::default()
     };
 
-    // Generate 6-digit code and store OTP + pending tx (10 min expiry)
-    let code  = format!("{:06}", rand::thread_rng().gen_range(0u32..1_000_000));
-    let tx_id = tx_hash.clone(); // use tx hash as the pending-tx key
+    // Check send limit before generating / storing anything
+    crate::email::check_send_limit(&email)
+        .map_err(|e| EgoDesktopError::InvalidInput(e))?;
+
+    // Generate 4-digit + 2-letter code and store OTP + pending tx (10 min expiry)
+    let code  = crate::email::gen_otp_code();
+    let tx_id = tx_hash.clone();
     let expiry = ts + 600;
 
     crate::email::store_otp(&format!("tx:{}", tx_id), &code);
     {
         let mut map = PENDING_TXS.lock().unwrap();
-        // Evict any expired entries while we're here
         map.retain(|_, (_, exp)| *exp > ts);
         map.insert(tx_id.clone(), (tx.clone(), expiry));
     }
 
-    // Email the code (async, but we await so the frontend knows if it failed)
+    // Email the code
     let amount_str = format!("{:.6} EGOC", request.amount as f64 / 1_000_000.0);
     crate::email::send_tx_code_email(&email, &code, &amount_str, &request.to_address)
         .await
         .map_err(|e| EgoDesktopError::NetworkError(format!("Failed to send code: {e}")))?;
+
+    // Only count the attempt after confirmed delivery
+    crate::email::record_send_attempt(&email);
 
     // Mask the email for display: abc***@domain.com
     let masked = if let Some(at) = email.find('@') {
@@ -576,8 +586,10 @@ pub async fn confirm_tx_code(
             ),
         ));
     }
-    // Clear attempt counter on success
+    // Clear attempt counter on success and reset email send limit
     TX_ATTEMPTS.lock().unwrap().remove(&tx_id);
+    let email = crate::ledger::Ledger::load().registered_email;
+    if !email.is_empty() { crate::email::reset_send_attempts(&email); }
 
     // Retrieve the pending tx
     let tx = {

@@ -91,7 +91,7 @@ pub fn load_registry() -> WalletRegistry {
 
 pub fn save_registry(registry: &WalletRegistry) -> Result<(), String> {
     let data = serde_json::to_string_pretty(registry).map_err(|e| e.to_string())?;
-    fs::write(registry_path(), data).map_err(|e| e.to_string())
+    crate::utils::atomic_write(&registry_path(), data.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// Returns the next wallet id string (e.g. "wallet_3" after "wallet_0","wallet_2").
@@ -140,9 +140,13 @@ pub struct LedgerTx {
     /// TX type: "transfer" | "deploy" | "call"
     #[serde(default = "default_tx_type")]
     pub tx_type: String,
-    /// Fee paid in uEGOC. 100% burned (removed from supply permanently).
+    /// Base fee paid in uEGOC. 100% burned (removed from supply permanently).
     #[serde(default)]
     pub fee_uegoc: u64,
+    /// Priority (tip) fee in uEGOC — goes to the miner, not burned.
+    /// Higher tip = earlier inclusion in next block (EIP-1559-style ordering).
+    #[serde(default)]
+    pub priority_fee_uegoc: u64,
     /// For deploy TXs: hex-encoded WASM bytecode
     #[serde(default)]
     pub wasm_code: String,
@@ -160,7 +164,7 @@ pub struct LedgerTx {
 fn default_tx_type() -> String { "transfer".to_string() }
 
 /// A local "block" produced whenever a transaction is confirmed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LedgerBlock {
     pub height: u64,
     pub hash: String,
@@ -173,6 +177,22 @@ pub struct LedgerBlock {
     /// Coinbase TX hash — miner self-issues their block reward.
     #[serde(default)]
     pub coinbase_tx: Option<String>,
+    /// Number of BFT validator votes this block collected.
+    /// Fork choice: higher vote count wins when two blocks compete at the same height.
+    #[serde(default)]
+    pub vote_count: u32,
+    /// Blake3 Merkle root of all TX hashes in this block.
+    /// Light clients use this to verify TX inclusion without downloading full blocks.
+    #[serde(default)]
+    pub tx_merkle_root: String,
+    /// Proof of Coverage VRF ticket — blake3(ed25519_sign(slot_seed)).
+    /// Proves the miner won the slot lottery for this block.
+    /// Empty on legacy blocks (accepted during transition).
+    #[serde(default)]
+    pub poc_ticket: String,
+    /// Slot number this block was mined in (now_ms / BATCH_INTERVAL_MS).
+    #[serde(default)]
+    pub poc_slot: u64,
 }
 
 /// Metadata for an encrypted file stored on disk.
@@ -222,6 +242,10 @@ pub struct StoredFile {
     /// How many blocks have been downloaded to disk so far.
     #[serde(default)]
     pub blocks_received: u32,
+    /// Addresses of peers that have confirmed pinning this file (replication tracking).
+    /// Populated when a PinAck { accepted: true } is received for this CID.
+    #[serde(default)]
+    pub replica_peers: Vec<String>,
 }
 
 /// The complete local wallet state, persisted to JSON.
@@ -278,7 +302,7 @@ impl Ledger {
 
     pub fn save(&self) -> Result<(), String> {
         let data = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        fs::write(ledger_path(), data).map_err(|e| e.to_string())
+        crate::utils::atomic_write(&ledger_path(), data.as_bytes()).map_err(|e| e.to_string())
     }
 
     pub fn mine_block(&mut self, tx_hash: &str, miner: &str) {
@@ -315,6 +339,10 @@ impl Ledger {
             size_bytes: 512,
             reward,
             coinbase_tx: None,
+            vote_count: 0,
+            tx_merkle_root: String::new(),
+            poc_ticket: String::new(),
+            poc_slot: 0,
         });
     }
 
@@ -365,6 +393,10 @@ pub fn genesis_block() -> LedgerBlock {
         size_bytes: 0,
         reward:     0,
         coinbase_tx: None,
+        vote_count: 0,
+        tx_merkle_root: String::new(),
+        poc_ticket: String::new(),
+        poc_slot: 0,
     }
 }
 
@@ -443,6 +475,10 @@ impl SharedChain {
             size_bytes: 512,
             reward: block_reward,
             coinbase_tx: Some(cb_hash),
+            vote_count: 0,
+            tx_merkle_root: String::new(),
+            poc_ticket: String::new(),
+            poc_slot: 0,
         });
     }
 
@@ -507,6 +543,10 @@ impl SharedChain {
             size_bytes: txs.iter().map(|t| t.hash.len() as u64 + 512).sum(),
             reward:     block_reward,
             coinbase_tx: Some(cb_hash),
+            vote_count: 0,
+            tx_merkle_root: String::new(),
+            poc_ticket: String::new(),
+            poc_slot: 0,
         };
         self.blocks.push(block.clone());
         block
@@ -550,7 +590,7 @@ pub fn load_poc_events() -> Vec<PocEvent> {
 
 pub fn save_poc_events(events: &[PocEvent]) -> Result<(), String> {
     let data = serde_json::to_string_pretty(events).map_err(|e| e.to_string())?;
-    fs::write(poc_events_path(), data).map_err(|e| e.to_string())
+    crate::utils::atomic_write(&poc_events_path(), data.as_bytes()).map_err(|e| e.to_string())
 }
 
 // ── Canonical signing helpers ─────────────────────────────────────────────────
@@ -569,6 +609,120 @@ pub fn poc_signing_bytes(address: &str, quality: &str, peers: u32, h3_cell: &str
     v.extend_from_slice(b":");
     v.extend_from_slice(&timestamp.to_le_bytes());
     v
+}
+
+// ── Per-address nonce store ───────────────────────────────────────────────────
+// Tracks the highest confirmed nonce seen per sender address.
+// Incoming TXs with nonce ≤ last_nonce are replays and are rejected.
+
+use std::sync::Mutex;
+use once_cell::sync::OnceCell;
+use std::collections::HashMap;
+
+static NONCE_STORE: OnceCell<Mutex<HashMap<String, u64>>> = OnceCell::new();
+
+fn nonce_store() -> std::sync::MutexGuard<'static, HashMap<String, u64>> {
+    NONCE_STORE.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
+}
+
+/// Record a confirmed nonce for a sender.  Called after a TX is written to chain.
+pub fn record_confirmed_nonce(address: &str, nonce: u64) {
+    let mut store = nonce_store();
+    let entry = store.entry(address.to_string()).or_insert(0);
+    if nonce > *entry { *entry = nonce; }
+}
+
+/// Returns the highest confirmed nonce for an address (0 = never sent).
+pub fn last_confirmed_nonce(address: &str) -> u64 {
+    *nonce_store().get(address).unwrap_or(&0)
+}
+
+// ── Validator stake tracker ────────────────────────────────────────────────────
+// Populated from confirmed stake/unstake TXs in write_block_batch.
+// Used by p2p to gate validator registration (minimum stake required).
+
+static STAKE_STORE: OnceCell<Mutex<HashMap<String, u64>>> = OnceCell::new();
+
+fn stake_store() -> std::sync::MutexGuard<'static, HashMap<String, u64>> {
+    STAKE_STORE.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
+}
+
+/// Record a staking or unstaking TX being confirmed.
+/// `is_stake=true` adds to staked balance; `false` subtracts.
+pub fn record_validator_stake(addr: &str, amount: u64, is_stake: bool) {
+    if addr.is_empty() { return; }
+    let mut store = stake_store();
+    let cur = store.entry(addr.to_string()).or_insert(0);
+    if is_stake { *cur = cur.saturating_add(amount); }
+    else        { *cur = cur.saturating_sub(amount); }
+}
+
+/// Returns the tracked staked balance (uEGOC) for an address.
+pub fn get_validator_stake(addr: &str) -> u64 {
+    *stake_store().get(addr).unwrap_or(&0)
+}
+
+// ── Incoming TX validation ────────────────────────────────────────────────────
+
+/// Validate an incoming peer transaction.
+///
+/// Checks (in order):
+///   1. System / faucet TXs are accepted without a signature.
+///   2. Nonce must be strictly greater than the last confirmed nonce for `from`
+///      (prevents replay attacks).
+///   3. Ed25519 signature over canonical tx bytes must verify against the
+///      sender's public key embedded in the TX.
+///
+/// Returns `Ok(())` on success, `Err(reason)` on rejection.
+pub fn verify_incoming_tx(tx: &LedgerTx) -> Result<(), String> {
+    const SYSTEM_ADDRS: &[&str] = &[
+        "egot1faucet000000000000000000000000000000000000",
+        "ego1genesis000000000000000000000000000000000000",
+        "egot1staking00000000000000000000000000000000000",
+        "egot1system000000000000000000000000000000000000",
+        "egot1coverage0000000000000000000000000000000000",
+        "egot1nodereward000000000000000000000000000000000",
+    ];
+
+    // System / coinbase TXs have no signature — always accept.
+    if SYSTEM_ADDRS.iter().any(|a| *a == tx.from) || tx.from.is_empty() {
+        return Ok(());
+    }
+
+    // 1. Nonce replay check.
+    let last = last_confirmed_nonce(&tx.from);
+    if tx.nonce <= last {
+        return Err(format!(
+            "replay: nonce {} <= last confirmed {} for {}",
+            tx.nonce, last, tx.from
+        ));
+    }
+
+    // 2. Ed25519 signature check.
+    if tx.public_key_ed25519.is_empty() || tx.signature.is_empty() {
+        return Err(format!("missing signature or pubkey in TX from {}", tx.from));
+    }
+
+    let pk_bytes = hex::decode(&tx.public_key_ed25519)
+        .map_err(|_| "invalid pubkey hex".to_string())?;
+    let sig_bytes = hex::decode(&tx.signature)
+        .map_err(|_| "invalid signature hex".to_string())?;
+
+    let pk_arr: [u8; 32] = pk_bytes.try_into()
+        .map_err(|_| "pubkey must be 32 bytes".to_string())?;
+    let sig_arr: [u8; 64] = sig_bytes.try_into()
+        .map_err(|_| "signature must be 64 bytes".to_string())?;
+
+    use ed25519_dalek::{Signature as DalekSig, VerifyingKey, Verifier};
+    let vk  = VerifyingKey::from_bytes(&pk_arr)
+        .map_err(|e| format!("invalid pubkey: {e}"))?;
+    let sig = DalekSig::from_bytes(&sig_arr);
+
+    let msg = tx_signing_bytes(&tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp);
+    vk.verify(&msg, &sig)
+        .map_err(|_| format!("signature verification failed for TX from {}", tx.from))?;
+
+    Ok(())
 }
 
 /// Canonical bytes to sign for a transaction.

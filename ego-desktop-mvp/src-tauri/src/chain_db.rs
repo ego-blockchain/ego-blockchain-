@@ -173,7 +173,36 @@ fn init_db(db: &DB) {
     eprintln!("[ChainDB] Seeded genesis block");
 }
 
+/// Genesis addresses for pre-minted supply pools.
+/// These hold the non-circulating allocations defined in tokenomics.rs.
+pub const ECOSYSTEM_ADDR:   &str = "egot1ecosystem00000000000000000000000000000000";
+pub const FOUNDATION_ADDR:  &str = "egot1foundation00000000000000000000000000000000";
+pub const NODE_POOL_ADDR:   &str = "egot1nodepool000000000000000000000000000000000";
+pub const STAKING_POOL_ADDR:&str = "egot1stakingpool0000000000000000000000000000000";
+pub const FAUCET_ADDR_FULL: &str = "egot1faucet000000000000000000000000000000000000";
+
 fn seed_genesis(db: &DB) {
+    use crate::tokenomics::*;
+
+    // ── Genesis allocations ────────────────────────────────────────────────
+    // Mint each non-circulating pool directly into the balance cache.
+    // These are pre-mined at height 0 — no TXs needed, just balance records.
+    let cf_balances = db.cf_handle(CF_BALANCES).unwrap();
+    let mut batch = WriteBatch::default();
+
+    let allocs: &[(&str, u64)] = &[
+        (ECOSYSTEM_ADDR,    ECOSYSTEM_EGOC  * UEGOC_PER_EGOC),
+        (FOUNDATION_ADDR,   FOUNDATION_EGOC * UEGOC_PER_EGOC),
+        (NODE_POOL_ADDR,    NODE_POOL_UEGOC),
+        (STAKING_POOL_ADDR, STAKING_POOL_UEGOC),
+        // Faucet seeded with 10M EGOC for testnet distribution
+        (FAUCET_ADDR_FULL,  10_000_000 * UEGOC_PER_EGOC),
+    ];
+    for (addr, amount) in allocs {
+        batch.put_cf(cf_balances, addr.as_bytes(), u64_le(*amount));
+    }
+    db.write(batch).expect("genesis balance batch");
+
     let genesis = LedgerBlock {
         height:     0,
         hash:       GENESIS_HASH.to_string(),
@@ -184,8 +213,15 @@ fn seed_genesis(db: &DB) {
         size_bytes: 0,
         reward:     0,
         coinbase_tx: None,
+        vote_count: 0,
+        tx_merkle_root: String::new(),
+        poc_ticket: String::new(),
+        poc_slot: 0,
     };
     write_block_batch(db, &genesis, &[]);
+
+    eprintln!("[Genesis] Seeded supply pools: ecosystem={} EGOC, foundation={} EGOC, node_pool={} EGOC, staking_pool={} EGOC, faucet=10M EGOC",
+        ECOSYSTEM_EGOC, FOUNDATION_EGOC, NODE_POOL_EGOC, STAKING_POOL_EGOC);
 }
 
 fn migrate_from_sqlite(db: &DB, path: &std::path::Path) -> bool {
@@ -214,6 +250,10 @@ fn migrate_from_sqlite(db: &DB, path: &std::path::Path) -> bool {
             size_bytes: r.get::<_, i64>(6)? as u64,
             reward:     r.get::<_, i64>(7)? as u64,
             coinbase_tx: r.get(8)?,
+            vote_count: 0,
+            tx_merkle_root: String::new(),
+            poc_ticket: String::new(),
+            poc_slot: 0,
         })
     }).unwrap().filter_map(|r| r.ok()).collect();
 
@@ -247,6 +287,7 @@ fn migrate_from_sqlite(db: &DB, path: &std::path::Path) -> bool {
             entrypoint:          r.get(16)?,
             call_args:           r.get(17)?,
             fee_uegoc:           0,
+            priority_fee_uegoc:  0,
         })
     }).unwrap().filter_map(|r| r.ok()).collect();
 
@@ -305,9 +346,19 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
 
     let height_k = height_key(block.height);
 
-    // Skip if block already exists.
-    if db.get_cf(cf_blocks, height_k).ok().flatten().is_some() {
-        return;
+    // Fork choice: if a block already exists at this height, only replace it
+    // if the incoming block has strictly more validator votes (heavier chain).
+    // This is the canonical rule: the block that collects the most BFT votes wins.
+    if let Some(existing_bytes) = db.get_cf(cf_blocks, height_k).ok().flatten() {
+        let existing_votes = decode::<LedgerBlock>(&existing_bytes)
+            .map(|b| b.vote_count)
+            .unwrap_or(0);
+        if block.vote_count <= existing_votes {
+            return; // existing block is at least as well-attested — keep it
+        }
+        // New block has more votes: fall through and overwrite.
+        eprintln!("[ForkChoice] Replacing block #{} ({} votes → {} votes)",
+            block.height, existing_votes, block.vote_count);
     }
 
     // Pre-read balances for all addresses involved (read-before-batch).
@@ -383,6 +434,24 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
     batch.put_cf(cf_meta, META_TX_COUNT, u64_le(cur_tx_count + new_tx_count));
 
     db.write(batch).expect("RocksDB write batch");
+
+    // Update the in-memory nonce store so replay detection stays current.
+    for tx in &confirmed_txs {
+        if !tx.from.is_empty() {
+            crate::ledger::record_confirmed_nonce(&tx.from, tx.nonce);
+        }
+    }
+
+    // Update validator stake tracker for staking/unstaking TXs.
+    // This is what gates validator registration (minimum stake required).
+    const STAKING_ADDR_STR: &str = "egot1staking000000000000000000000000000000000";
+    for tx in &confirmed_txs {
+        if tx.to == STAKING_ADDR_STR && !tx.from.is_empty() {
+            crate::ledger::record_validator_stake(&tx.from, tx.amount, true);
+        } else if tx.from == STAKING_ADDR_STR && !tx.to.is_empty() {
+            crate::ledger::record_validator_stake(&tx.to, tx.amount, false);
+        }
+    }
 }
 
 // ── Public read API ───────────────────────────────────────────────────────────
@@ -414,6 +483,20 @@ pub fn tx_count() -> u64 {
     let cf_meta = db.cf_handle(CF_META).unwrap();
     db.get_cf(cf_meta, META_TX_COUNT)
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
+}
+
+/// Burn tokens from the staking pool (slash penalty — tokens are permanently destroyed).
+pub fn burn_from_staking_pool(amount_uegoc: u64) {
+    const STAKING_ADDR_STR: &str = "egot1staking000000000000000000000000000000000";
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_BALANCES).unwrap();
+    let cur = db.get_cf(cf, STAKING_ADDR_STR.as_bytes())
+        .ok().flatten()
+        .map(|v| read_u64_le(&v))
+        .unwrap_or(0);
+    let new_bal = cur.saturating_sub(amount_uegoc);
+    db.put_cf(cf, STAKING_ADDR_STR.as_bytes(), u64_le(new_bal))
+        .expect("RocksDB burn_from_staking_pool");
 }
 
 /// O(1) balance lookup via cached balances CF.
@@ -489,6 +572,30 @@ pub fn get_tx_by_hash(hash: &str) -> Option<LedgerTx> {
         .and_then(|v| decode(&v))
 }
 
+/// Return all transactions confirmed in block `height`, in insertion order.
+/// Used by the light-client Merkle proof generator.
+pub fn get_txs_for_block(height: u64) -> Vec<LedgerTx> {
+    let db           = get_db().lock().unwrap();
+    let cf_block_txs = db.cf_handle(CF_BLOCK_TXS).unwrap();
+    let cf_txs       = db.cf_handle(CF_TXS).unwrap();
+    let prefix       = height_key(height);
+
+    let mut out = Vec::new();
+    let iter = db.prefix_iterator_cf(cf_block_txs, prefix);
+    for item in iter {
+        let Ok((key, _)) = item else { continue };
+        if key.len() <= 8 { continue; }
+        let tx_hash = std::str::from_utf8(&key[8..]).unwrap_or("");
+        if tx_hash.is_empty() { continue; }
+        if let Some(tx) = db.get_cf(cf_txs, tx_hash.as_bytes()).ok().flatten()
+            .and_then(|v| decode::<LedgerTx>(&v))
+        {
+            out.push(tx);
+        }
+    }
+    out
+}
+
 /// Full transaction history for an address, ordered by timestamp ascending.
 pub fn get_tx_history_for_addr(address: &str) -> Vec<LedgerTx> {
     let db = get_db().lock().unwrap();
@@ -520,7 +627,13 @@ pub fn get_tx_history_for_addr(address: &str) -> Vec<LedgerTx> {
 // ── Public write API ──────────────────────────────────────────────────────────
 
 /// Mine a new block directly into RocksDB. O(1) per block, no chain.json.
+/// `poc_ticket` is the VRF ticket hex proving the miner won the slot lottery.
+/// Pass empty string for genesis / faucet / remote blocks (accepted transitionally).
 pub fn mine_batch_db(txs: &[LedgerTx], miner: &str) -> LedgerBlock {
+    mine_batch_db_with_ticket(txs, miner, "", 0)
+}
+
+pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc_slot: u64) -> LedgerBlock {
     let db = get_db().lock().unwrap();
 
     let (latest_height, prev_hash) = {
@@ -550,6 +663,9 @@ pub fn mine_batch_db(txs: &[LedgerTx], miner: &str) -> LedgerBlock {
         t
     }).collect();
 
+    let tx_hashes: Vec<&str> = stamped.iter().map(|t| t.hash.as_str()).collect();
+    let tx_merkle_root = compute_merkle_root(&tx_hashes);
+
     let block = LedgerBlock {
         height,
         hash,
@@ -560,6 +676,10 @@ pub fn mine_batch_db(txs: &[LedgerTx], miner: &str) -> LedgerBlock {
         size_bytes: txs.len() as u64 * 256,
         reward,
         coinbase_tx: None,
+        vote_count: 0,
+        tx_merkle_root,
+        poc_ticket: poc_ticket.to_string(),
+        poc_slot,
     };
 
     write_block_batch(&db, &block, &stamped);
@@ -567,10 +687,155 @@ pub fn mine_batch_db(txs: &[LedgerTx], miner: &str) -> LedgerBlock {
 }
 
 /// Append a block received from a peer (gossip / sync path).
-/// INSERT-OR-IGNORE: silently skips if block or tx already exists.
+/// Fork choice: replaces existing block at the same height only if the new
+/// block carries more BFT votes (heavier chain wins).
 pub fn append_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) {
     let db = get_db().lock().unwrap();
     write_block_batch(&db, block, txs);
+}
+
+/// Same as `append_peer_block` but stamps `vote_count` before writing.
+/// Used by the BFT finalization path to record how many votes the block got.
+pub fn append_peer_block_with_votes(block: &LedgerBlock, txs: &[LedgerTx], votes: u32) {
+    let mut b = block.clone();
+    b.vote_count = votes;
+    let db = get_db().lock().unwrap();
+    write_block_batch(&db, &b, txs);
+}
+
+// ── Merkle tree (Blake3) ───────────────────────────────────────────────────────
+//
+// Standard binary Merkle tree. Leaf = blake3(tx_hash). Internal nodes:
+// blake3(left_child_hex ++ right_child_hex). Odd levels: duplicate last leaf.
+// This allows any light client to verify TX inclusion with O(log N) hashes.
+
+fn blake3_hex(data: &[u8]) -> String {
+    blake3::hash(data).to_hex().to_string()
+}
+
+/// Compute the Merkle root of a list of transaction hashes.
+/// Returns 64 zero chars for an empty block.
+pub fn compute_merkle_root(tx_hashes: &[&str]) -> String {
+    if tx_hashes.is_empty() {
+        return "0".repeat(64);
+    }
+    let mut layer: Vec<String> = tx_hashes.iter()
+        .map(|h| blake3_hex(h.as_bytes()))
+        .collect();
+    while layer.len() > 1 {
+        if layer.len() % 2 == 1 {
+            let last = layer.last().unwrap().clone();
+            layer.push(last);
+        }
+        layer = layer.chunks(2)
+            .map(|pair| blake3_hex(format!("{}{}", pair[0], pair[1]).as_bytes()))
+            .collect();
+    }
+    layer.into_iter().next().unwrap_or_else(|| "0".repeat(64))
+}
+
+/// Merkle inclusion proof: sibling hashes from leaf to root.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MerkleProof {
+    /// The transaction hash being proved.
+    pub tx_hash: String,
+    /// Merkle root stored in the block header.
+    pub root:    String,
+    /// Sibling hashes, bottom-up (leaf level first).
+    pub path:    Vec<String>,
+    /// For each sibling: false = sibling is on the right, true = sibling is on the left.
+    pub indices: Vec<bool>,
+}
+
+/// Generate a Merkle inclusion proof for `target_tx` in a list of TX hashes.
+pub fn prove_tx_inclusion(tx_hashes: &[&str], target_tx: &str) -> Option<MerkleProof> {
+    if tx_hashes.is_empty() { return None; }
+    let mut pos = tx_hashes.iter().position(|h| *h == target_tx)?;
+    let root = compute_merkle_root(tx_hashes);
+
+    let mut layer: Vec<String> = tx_hashes.iter()
+        .map(|h| blake3_hex(h.as_bytes()))
+        .collect();
+    let mut path    = Vec::new();
+    let mut indices = Vec::new();
+
+    while layer.len() > 1 {
+        if layer.len() % 2 == 1 {
+            let last = layer.last().unwrap().clone();
+            layer.push(last);
+        }
+        let sibling_pos = if pos % 2 == 0 { pos + 1 } else { pos - 1 };
+        path.push(layer[sibling_pos].clone());
+        indices.push(pos % 2 == 1); // true = we are on the right, sibling is left
+        pos /= 2;
+        layer = layer.chunks(2)
+            .map(|pair| blake3_hex(format!("{}{}", pair[0], pair[1]).as_bytes()))
+            .collect();
+    }
+    Some(MerkleProof { tx_hash: target_tx.to_string(), root, path, indices })
+}
+
+/// Verify a Merkle inclusion proof. Returns true if the proof is valid.
+pub fn verify_merkle_proof(proof: &MerkleProof) -> bool {
+    if proof.path.len() != proof.indices.len() { return false; }
+    let mut current = blake3_hex(proof.tx_hash.as_bytes());
+    for (sibling, is_right) in proof.path.iter().zip(proof.indices.iter()) {
+        current = if *is_right {
+            blake3_hex(format!("{}{}", sibling, current).as_bytes())
+        } else {
+            blake3_hex(format!("{}{}", current, sibling).as_bytes())
+        };
+    }
+    current == proof.root
+}
+
+/// Light block header — only what a light client needs to track the chain.
+/// No TX data; use `prove_tx_inclusion` for inclusion proofs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LightBlockHeader {
+    pub height:         u64,
+    pub hash:           String,
+    pub prev_hash:      String,
+    pub miner:          String,
+    pub timestamp:      i64,
+    pub tx_count:       u32,
+    pub reward:         u64,
+    pub vote_count:     u32,
+    pub tx_merkle_root: String,
+}
+
+impl From<&LedgerBlock> for LightBlockHeader {
+    fn from(b: &LedgerBlock) -> Self {
+        LightBlockHeader {
+            height:         b.height,
+            hash:           b.hash.clone(),
+            prev_hash:      b.prev_hash.clone(),
+            miner:          b.miner.clone(),
+            timestamp:      b.timestamp,
+            tx_count:       b.tx_count,
+            reward:         b.reward,
+            vote_count:     b.vote_count,
+            tx_merkle_root: b.tx_merkle_root.clone(),
+        }
+    }
+}
+
+/// Fetch block headers from `from_height` up to `limit` (max 10_000).
+pub fn get_block_headers(from_height: u64, limit: u32) -> Vec<LightBlockHeader> {
+    let db    = get_db().lock().unwrap();
+    let cf    = db.cf_handle(CF_BLOCKS).unwrap();
+    let limit = (limit as usize).min(10_000);
+    let mut out = Vec::with_capacity(limit);
+    for h in from_height.. {
+        if out.len() >= limit { break; }
+        match db.get_cf(cf, height_key(h)).ok().flatten()
+            .and_then(|v| decode::<LedgerBlock>(&v))
+        {
+            Some(b) => out.push(LightBlockHeader::from(&b)),
+            None    => break,
+        }
+    }
+    out
 }
 
 // ── BFT finality ──────────────────────────────────────────────────────────────
@@ -595,6 +860,66 @@ pub fn finalized_height() -> u64 {
     let cf = db.cf_handle(CF_META).unwrap();
     db.get_cf(cf, META_FINALIZED)
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
+}
+
+/// Returns the hash of the current chain tip (latest mined block).
+/// Used by the PoC lottery to compute slot seeds.
+pub fn get_tip_hash() -> String {
+    let db = get_db().lock().unwrap();
+    let cf_meta   = db.cf_handle(CF_META).unwrap();
+    let cf_blocks = db.cf_handle(CF_BLOCKS).unwrap();
+    let h = db.get_cf(cf_meta, META_LATEST_HEIGHT)
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    db.get_cf(cf_blocks, height_key(h))
+        .ok().flatten()
+        .and_then(|v| decode::<LedgerBlock>(&v))
+        .map(|b| b.hash)
+        .unwrap_or_else(|| GENESIS_HASH.to_string())
+}
+
+// ── RPC helpers ───────────────────────────────────────────────────────────────
+
+/// Return up to `limit` transactions for `address`, newest first.
+pub fn get_address_txs(address: &str, limit: usize) -> Vec<LedgerTx> {
+    let mut txs = get_tx_history_for_addr(address);
+    txs.sort_unstable_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    txs.truncate(limit);
+    txs
+}
+
+/// Return full blocks starting at `from_height`, up to `limit` (max 1_000).
+pub fn get_blocks_range(from_height: u64, limit: u32) -> Vec<LedgerBlock> {
+    let db    = get_db().lock().unwrap();
+    let cf    = db.cf_handle(CF_BLOCKS).unwrap();
+    let limit = (limit as usize).min(1_000);
+    let mut out = Vec::with_capacity(limit);
+    for h in from_height.. {
+        if out.len() >= limit { break; }
+        match db.get_cf(cf, height_key(h)).ok().flatten()
+            .and_then(|v| decode::<LedgerBlock>(&v))
+        {
+            Some(b) => out.push(b),
+            None    => break,
+        }
+    }
+    out
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct NetworkStats {
+    pub block_count: u64,
+    pub tx_count:    u64,
+}
+
+/// Lightweight network statistics from meta column family.
+pub fn get_network_stats_db() -> NetworkStats {
+    let db      = get_db().lock().unwrap();
+    let cf_meta = db.cf_handle(CF_META).unwrap();
+    let block_count = db.get_cf(cf_meta, META_LATEST_HEIGHT)
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    let tx_count = db.get_cf(cf_meta, META_TX_COUNT)
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    NetworkStats { block_count, tx_count }
 }
 
 // ── Kept for API compatibility ────────────────────────────────────────────────

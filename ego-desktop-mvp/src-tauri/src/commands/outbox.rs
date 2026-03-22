@@ -46,7 +46,7 @@ fn load_outbox() -> Vec<OutboxEntry> {
 
 fn save_outbox(entries: &[OutboxEntry]) {
     if let Ok(data) = serde_json::to_string_pretty(entries) {
-        let _ = fs::write(outbox_path(), data);
+        let _ = crate::utils::atomic_write(&outbox_path(), data.as_bytes());
     }
 }
 

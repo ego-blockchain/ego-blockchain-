@@ -145,28 +145,84 @@ pub fn foundation_vested_egoc(now_secs: i64) -> u64 {
     (FOUNDATION_EGOC as f64 * vested_frac) as u64
 }
 
-// ── Transaction Fees (100% burned — deflationary) ─────────────────────────────
+// ── Dynamic Fee Pricing (USD-pegged, 100% burned — deflationary) ───────────────
+//
+// Fee targets are expressed in USD cents so they stay affordable regardless of
+// EGOC price.  The runtime converts to uEGOC using the live EGOC/USD rate fetched
+// from the oracle.  Hard floors and ceilings prevent extreme edge cases.
+//
+// Target (non-staker):
+//   Transfer  : $0.003  (0.3¢)
+//   Call      : $0.004  (0.4¢)
+//   Deploy    : $0.006  (0.6¢)
+//   Storage   : $0.001 per MB per month
+//
+// Staker: 90% discount on transfers/calls/deploys (pays ~0.03¢ — enough to deter
+// spam but nearly free as a staking reward).
+// Storage & deploy: completely free for stakers.
 
-/// Standard transfer fee in uEGOC (0.01 EGOC).
+/// USD target for a standard transfer (~$0.30).
+pub const TRANSFER_TARGET_USD: f64 = 0.30;
+/// USD target for a contract call (~$0.40).
+pub const CALL_TARGET_USD:     f64 = 0.40;
+/// USD target for a contract deploy (~$0.60).
+pub const DEPLOY_TARGET_USD:   f64 = 0.60;
+/// USD rate for storage: $0.20 per GB per month = $0.0002 per MB per month.
+pub const STORAGE_USD_PER_MB_MONTH: f64 = 0.0002;
+
+/// Hard floor in uEGOC — never charge less than this (anti-dust).
+pub const FEE_FLOOR_UEGOC: u64 = 10;
+/// Hard ceiling in uEGOC — never charge more than 5 EGOC even if EGOC = $0.000001.
+pub const FEE_CEILING_UEGOC: u64 = 5_000_000;
+/// Minimum accepted fee (spam guard for mempool).
+pub const MIN_TX_FEE_UEGOC: u64 = 10;
+
+// Legacy constants kept for backward compatibility with callers that haven't
+// been updated yet.  Will be removed once all call sites use dynamic pricing.
 pub const STANDARD_TX_FEE_UEGOC: u64 = 10_000;
+pub const DEPLOY_FEE_UEGOC:      u64 = 100_000;
+pub const CALL_FEE_UEGOC:        u64 = 50_000;
 
-/// Contract deploy fee in uEGOC (0.1 EGOC).
-pub const DEPLOY_FEE_UEGOC: u64 = 100_000;
+/// Convert a USD target amount to uEGOC using the live EGOC price.
+/// Always clamps to [FEE_FLOOR_UEGOC, FEE_CEILING_UEGOC].
+pub fn usd_to_uegoc(target_usd: f64, egoc_price_usd: f64) -> u64 {
+    let price = egoc_price_usd.max(1e-9); // prevent division by zero
+    let fee_egoc  = target_usd / price;
+    let fee_uegoc = (fee_egoc * 1_000_000.0).round() as u64;
+    fee_uegoc.clamp(FEE_FLOOR_UEGOC, FEE_CEILING_UEGOC)
+}
 
-/// Contract call fee in uEGOC (0.05 EGOC).
-pub const CALL_FEE_UEGOC: u64 = 50_000;
+/// Returns the fee in uEGOC for the given tx type, priced dynamically in USD.
+/// Stakers pay 10% of the base fee (minimum FEE_FLOOR_UEGOC).
+pub fn fee_for_tx_with_staking(tx_type: &str, is_staker: bool) -> u64 {
+    let egoc_price = crate::p2p::get_egoc_price_usd();
+    let target_usd = match tx_type {
+        "deploy" => DEPLOY_TARGET_USD,
+        "call"   => CALL_TARGET_USD,
+        _        => TRANSFER_TARGET_USD,
+    };
+    let base = usd_to_uegoc(target_usd, egoc_price);
+    if is_staker { (base / 10).max(FEE_FLOOR_UEGOC) } else { base }
+}
 
-/// Minimum accepted fee (spam guard).
-pub const MIN_TX_FEE_UEGOC: u64 = 1_000;
-
-/// Returns the fee in uEGOC for the given tx type.
-/// All fees are burned — sent to the zero address, not to any validator.
+/// Legacy wrapper — returns full (non-staker) fee.  Prefer fee_for_tx_with_staking.
 pub fn fee_for_tx_type(tx_type: &str) -> u64 {
-    match tx_type {
-        "deploy" => DEPLOY_FEE_UEGOC,
-        "call"   => CALL_FEE_UEGOC,
-        _        => STANDARD_TX_FEE_UEGOC,
-    }
+    fee_for_tx_with_staking(tx_type, false)
+}
+
+/// Storage cost in uEGOC for `size_mb` MB stored for `months` months.
+/// Free for stakers, USD-pegged for everyone else.
+pub fn storage_cost_with_staking(size_mb: f64, months: u32, is_staker: bool) -> u64 {
+    if is_staker { return 0; }
+    let egoc_price = crate::p2p::get_egoc_price_usd();
+    // Minimum storage charge = $0.20 (same as transfer floor) regardless of file size
+    let target_usd = (STORAGE_USD_PER_MB_MONTH * size_mb * months as f64).max(0.20);
+    usd_to_uegoc(target_usd, egoc_price)
+}
+
+/// Smart contract deploy fee: free for stakers, dynamically priced otherwise.
+pub fn deploy_fee_with_staking(is_staker: bool) -> u64 {
+    if is_staker { 0 } else { fee_for_tx_with_staking("deploy", false) }
 }
 
 // ── EGUSD Stablecoin ──────────────────────────────────────────────────────────
