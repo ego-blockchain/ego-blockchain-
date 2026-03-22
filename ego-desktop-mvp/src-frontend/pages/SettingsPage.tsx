@@ -68,14 +68,9 @@ const SettingsPage: React.FC = () => {
     invoke<{ has_pin: boolean }>('get_pin_status')
       .then(s => { console.log('[Settings] pin status:', s); setHasPin(s.has_pin); })
       .catch((e) => console.error('[Settings] pin status error:', e));
-    if (wallet?.address) {
-      tauriFetch<{ email_masked?: string }>(`${RELAY}/users/${wallet.address}`)
-        .then(r => { 
-          console.log('[Settings] user data:', r.data);
-          if (r.data.email_masked) setMaskedEmail(r.data.email_masked); 
-        })
-        .catch((e) => console.error('[Settings] fetch error:', e));
-    }
+    invoke<string>('get_account_email')
+      .then(e => { if (e) setMaskedEmail(e); })
+      .catch(() => {});
   }, [wallet?.address]);
 
 useEffect(() => {
