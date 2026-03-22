@@ -178,7 +178,7 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
         <div className="px-8 py-6 space-y-5">
           <p className="text-sm text-gray-300 leading-relaxed">
             We sent a confirmation code to <strong className="text-white">{email}</strong>.
-            Enter the 4 digits + 2 letters below to continue.
+            Enter it below to continue.
           </p>
 
           {/* OTP boxes: any position can be digit or letter */}
@@ -197,7 +197,6 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
               />
             ))}
           </div>
-          <p className="text-[11px] text-gray-600 text-center -mt-1">4 digits + 2 letters, mixed  e.g. 3A8S97</p>
 
           <div className="text-xs text-gray-500 space-y-1">
             <p>• Check your spam/junk folder if you don't see it</p>
