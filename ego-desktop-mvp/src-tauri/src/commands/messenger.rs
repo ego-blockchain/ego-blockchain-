@@ -31,6 +31,19 @@ pub struct Contact {
     pub endpoint:       String,
     #[serde(default)]
     pub all_endpoints:  Vec<String>,
+    // ── Phase 4: KDF ratchet (forward secrecy) ────────────────────────────────
+    /// Hex-encoded 32-byte chain key for outgoing messages; empty = uninitialized.
+    #[serde(default)]
+    pub ratchet_send_chain: String,
+    /// Hex-encoded 32-byte chain key for incoming messages; empty = uninitialized.
+    #[serde(default)]
+    pub ratchet_recv_chain: String,
+    /// Monotonically-increasing send counter (advances each message sent).
+    #[serde(default)]
+    pub ratchet_send_count: u64,
+    /// Highest received sequence number seen so far from this contact.
+    #[serde(default)]
+    pub ratchet_recv_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +140,97 @@ fn parse_msg_bundle(
         parts[5].to_string(),
     ))
 }
+// ── Phase 4: KDF ratchet helpers ──────────────────────────────────────────────
+//
+// Symmetric KDF chain with per-message key derivation:
+//
+//   For a contact pair (addr_A, addr_B) sharing `shared_key`:
+//     - Lexicographically lower address uses chain-1 for send, chain-2 for recv.
+//     - Lexicographically higher address uses chain-2 for send, chain-1 for recv.
+//   This ensures A's send chain == B's recv chain (both derive from same root).
+//
+//   Each message: msg_key = BLAKE3("ego msg key v1", chain); new_chain = BLAKE3("ego chain next v1", chain)
+//   Key derivation erases old chain keys → forward secrecy for in-order delivery.
+
+fn init_ratchet_chain(shared_key: &[u8], for_send: bool, my_addr: &str, peer_addr: &str) -> [u8; 32] {
+    let lower_is_mine = my_addr < peer_addr;
+    // If lower: send=chain-1, recv=chain-2.  If higher: send=chain-2, recv=chain-1.
+    let use_chain_1 = lower_is_mine == for_send;
+    if use_chain_1 {
+        blake3::derive_key("ego ratchet chain-1 v1", shared_key)
+    } else {
+        blake3::derive_key("ego ratchet chain-2 v1", shared_key)
+    }
+}
+
+fn ratchet_advance(chain: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let msg_key   = blake3::derive_key("ego msg key v1", chain);
+    let new_chain = blake3::derive_key("ego chain next v1", chain);
+    (msg_key, new_chain)
+}
+
+/// Derive the encryption key for the next outgoing message.
+/// Initializes the ratchet chain on first call, then advances it.
+/// Returns `(enc_key_bytes, current_send_seq)`.
+fn derive_send_key_and_seq(contact: &mut Contact, my_addr: &str) -> Result<([u8; 32], u64), String> {
+    let shared_bytes = hex::decode(&contact.shared_key_hex)
+        .map_err(|_| "Invalid shared key".to_string())?;
+
+    if contact.ratchet_send_chain.is_empty() {
+        let chain = init_ratchet_chain(&shared_bytes, true, my_addr, &contact.address);
+        contact.ratchet_send_chain = hex::encode(chain);
+    }
+
+    let chain_bytes: [u8; 32] = hex::decode(&contact.ratchet_send_chain)
+        .map_err(|_| "Bad send chain".to_string())?
+        .try_into()
+        .map_err(|_| "Bad send chain length".to_string())?;
+
+    let (msg_key, next_chain) = ratchet_advance(&chain_bytes);
+    contact.ratchet_send_chain  = hex::encode(next_chain);
+    contact.ratchet_send_count += 1;
+    let seq = contact.ratchet_send_count;
+    Ok((msg_key, seq))
+}
+
+/// Try to decrypt `ct` using the ratchet recv chain with a skip window of up to
+/// SKIP_WINDOW steps (handles mild out-of-order delivery).
+/// On success, advances the recv chain and updates `contact`.
+/// Returns `Some(plaintext)` on success, `None` if all ratchet attempts fail.
+fn try_decrypt_ratchet(
+    contact:   &mut Contact,
+    my_addr:   &str,
+    nonce:     &[u8],
+    ct:        &[u8],
+) -> Option<Vec<u8>> {
+    use aes_gcm::aead::Aead;
+
+    let shared_bytes = hex::decode(&contact.shared_key_hex).ok()?;
+
+    if contact.ratchet_recv_chain.is_empty() {
+        let chain = init_ratchet_chain(&shared_bytes, false, my_addr, &contact.address);
+        contact.ratchet_recv_chain = hex::encode(chain);
+    }
+
+    let chain_bytes: [u8; 32] = hex::decode(&contact.ratchet_recv_chain)
+        .ok()?.try_into().ok()?;
+
+    const SKIP_WINDOW: u32 = 20;
+    let mut chain = chain_bytes;
+    for _ in 0..=SKIP_WINDOW {
+        let (msg_key, next_chain) = ratchet_advance(&chain);
+        let cipher = Aes256Gcm::new_from_slice(&msg_key).ok()?;
+        let nonce_obj = Nonce::from_slice(nonce);
+        if let Ok(pt) = cipher.decrypt(nonce_obj, ct) {
+            contact.ratchet_recv_chain  = hex::encode(next_chain);
+            contact.ratchet_recv_count += 1;
+            return Some(pt);
+        }
+        chain = next_chain;
+    }
+    None
+}
+
 // ── resolve_endpoint ──────────────────────────────────────────────────────────
 // Falls back to local peer cache (populated by DHT discovery and PeerAnnounce).
 // HTTP relay lookup removed — relay decommissioned.
@@ -158,7 +262,8 @@ async fn resolve_endpoint(contact_addr: &str, stored_endpoint: &str) -> String {
 // ── Core receive logic ────────────────────────────────────────────────────────
 
 /// Returns `(message, is_new)` — `is_new` is false if this message was already stored (duplicate).
-pub(crate) fn receive_message_inner(bundle: &str) -> Result<(Message, bool), String> {
+/// `seq` is the sender's sequence number (0 = unknown / old client).
+pub(crate) fn receive_message_inner(bundle: &str, seq: u64) -> Result<(Message, bool), String> {
     let (from, to, ts, mtype, nonce_hex, ct_hex) = parse_msg_bundle(bundle)
         .ok_or_else(|| "Invalid message bundle — must start with egomsg1:".to_string())?;
 
@@ -173,23 +278,56 @@ pub(crate) fn receive_message_inner(bundle: &str) -> Result<(Message, bool), Str
         return Err("Message is older than 24 hours and has been rejected".into());
     }
 
-    let contacts = load_contacts();
-    let contact  = contacts.iter().find(|c| c.address == from)
-        .ok_or_else(|| "Sender not found in contacts".to_string())?;
-
-    let key_bytes = hex::decode(&contact.shared_key_hex)
-        .map_err(|_| "Invalid shared key".to_string())?;
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
-        .map_err(|_| "Bad key length".to_string())?;
-
     let nonce_bytes = hex::decode(&nonce_hex).map_err(|_| "Bad nonce".to_string())?;
-    let nonce       = Nonce::from_slice(&nonce_bytes);
     let ct_bytes    = hex::decode(&ct_hex).map_err(|_| "Bad ciphertext".to_string())?;
 
-    let plaintext = cipher.decrypt(nonce, ct_bytes.as_slice())
-        .map_err(|_| "Decryption failed".to_string())?;
-    let content = String::from_utf8(plaintext)
-        .map_err(|_| "Decrypted bytes are not valid UTF-8".to_string())?;
+    // Load my own address for ratchet key direction
+    let my_addr = crate::ledger::Ledger::load().address;
+
+    // ── Phase 4: try ratchet decrypt first, then fall back to static key ──────
+    let mut contacts = load_contacts();
+    let contact_pos = contacts.iter().position(|c| c.address == from)
+        .ok_or_else(|| "Sender not found in contacts".to_string())?;
+
+    let (content, ratchet_ok) = {
+        let contact = &mut contacts[contact_pos];
+
+        // Attempt ratchet decryption (with skip window for mild reordering)
+        if let Some(pt) = try_decrypt_ratchet(contact, &my_addr, &nonce_bytes, &ct_bytes) {
+            // Phase 5: track received seq for gap detection
+            if seq > 0 && seq > contact.ratchet_recv_count {
+                if seq > contact.ratchet_recv_count + 1 {
+                    eprintln!(
+                        "[Messenger] Seq gap from {}: expected ≤{}, got {}",
+                        &from[..from.len().min(12)],
+                        contact.ratchet_recv_count + 1,
+                        seq
+                    );
+                }
+                contact.ratchet_recv_count = seq;
+            }
+            let text = String::from_utf8(pt)
+                .map_err(|_| "Decrypted bytes are not valid UTF-8".to_string())?;
+            (text, true)
+        } else {
+            // Ratchet failed — fall back to static shared key (old sender or chain diverged)
+            let key_bytes = hex::decode(&contact.shared_key_hex)
+                .map_err(|_| "Invalid shared key".to_string())?;
+            let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+                .map_err(|_| "Bad key length".to_string())?;
+            let nonce_obj = Nonce::from_slice(&nonce_bytes);
+            let pt = cipher.decrypt(nonce_obj, ct_bytes.as_slice())
+                .map_err(|_| "Decryption failed (ratchet and static key both failed)".to_string())?;
+            let text = String::from_utf8(pt)
+                .map_err(|_| "Decrypted bytes are not valid UTF-8".to_string())?;
+            (text, false)
+        }
+    };
+
+    if ratchet_ok {
+        // Persist advanced ratchet chain state
+        let _ = save_contacts(&contacts);
+    }
 
     let msg = Message {
         id:           format!("{}-{}", ts, &nonce_hex[..8]),
@@ -310,15 +448,19 @@ pub async fn import_contact(
     // Save the contact FIRST — so it persists even if P2P delivery fails.
     // The peer will receive the request once they are reachable.
     let contact = Contact {
-        address:        addr.clone(),
+        address:            addr.clone(),
         name,
-        ed25519_pubkey: ed25519,
-        kyber_pubkey:   kyber,
-        shared_key_hex: shared_key_hex.clone(),
-        status:         "pending_out".to_string(),
-        added_at:       chrono::Utc::now().timestamp(),
-        endpoint:       endpoint.clone(),
-        all_endpoints:  Vec::new(),
+        ed25519_pubkey:     ed25519,
+        kyber_pubkey:       kyber,
+        shared_key_hex:     shared_key_hex.clone(),
+        status:             "pending_out".to_string(),
+        added_at:           chrono::Utc::now().timestamp(),
+        endpoint:           endpoint.clone(),
+        all_endpoints:      Vec::new(),
+        ratchet_send_chain: String::new(),
+        ratchet_recv_chain: String::new(),
+        ratchet_send_count: 0,
+        ratchet_recv_count: 0,
     };
     contacts.push(contact.clone());
     save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
@@ -471,15 +613,17 @@ pub async fn send_message(
 ) -> Result<(), EgoDesktopError> {
     let ledger   = Ledger::load();
     let my_addr  = ledger.address.clone();
-    let contacts = load_contacts();
 
-    let contact = contacts.iter()
-        .find(|c| c.address == contact_addr && c.status == "approved")
+    // ── Phase 4: ratchet — load contacts mutably to advance the send chain ────
+    let mut contacts = load_contacts();
+    let contact_pos = contacts.iter().position(|c| c.address == contact_addr && c.status == "approved")
         .ok_or_else(|| EgoDesktopError::NotFound("Contact not found or not approved".into()))?;
 
-    let key_bytes = hex::decode(&contact.shared_key_hex)
-        .map_err(|_| EgoDesktopError::CryptoError("Invalid shared key".into()))?;
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+    // Derive per-message encryption key from KDF chain (advances chain state).
+    let (enc_key_bytes, send_seq) = derive_send_key_and_seq(&mut contacts[contact_pos], &my_addr)
+        .map_err(EgoDesktopError::CryptoError)?;
+
+    let cipher = Aes256Gcm::new_from_slice(&enc_key_bytes)
         .map_err(|_| EgoDesktopError::CryptoError("Bad key length".into()))?;
 
     let mut nonce_bytes = [0u8; 12];
@@ -496,6 +640,13 @@ pub async fn send_message(
         "egomsg1:{}:{}:{}:{}:{}:{}",
         my_addr, contact_addr, ts, message_type, nonce_hex, ct_hex
     );
+
+    // Clone endpoint data from contact before saving contacts
+    let stored_endpoint = contacts[contact_pos].endpoint.clone();
+    let all_endpoints   = contacts[contact_pos].all_endpoints.clone();
+
+    // Persist the advanced ratchet chain state immediately
+    save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
 
     // Capture before content/message_type are moved into Message
     let is_file_bundle  = message_type == "file_bundle";
@@ -514,7 +665,6 @@ pub async fn send_message(
     save_messages(&msgs).map_err(EgoDesktopError::FileSystemError)?;
     // Notify MessengerPage (open in any tab) so it refreshes immediately.
     let _ = app.emit_all("ego://message-sent", serde_json::json!({ "to": contact_addr }));
-    let stored_endpoint  = contact.endpoint.clone();
     let contact_addr_key = contact_addr.clone();
     tokio::spawn(async move {
         // ── File bundles: proactively push FileData to DHT before anything else ──
@@ -578,12 +728,12 @@ pub async fn send_message(
         // ── Deliver ChatMessage (direct or relay mailbox) ─────────────────────
         if stored_endpoint.is_empty() {
             eprintln!("[Messenger] No endpoint for {} — relay mailbox only", contact_addr_key);
-            let p2p_msg = p2p::P2PMessage::ChatMessage { bundle };
+            let p2p_msg = p2p::P2PMessage::ChatMessage { bundle, seq: send_seq };
             deposit_in_relay_inbox(&contact_addr_key, &my_addr, &p2p_msg).await;
             return;
         }
         let endpoint = resolve_endpoint(&contact_addr_key, &stored_endpoint).await;
-        let p2p_msg  = p2p::P2PMessage::ChatMessage { bundle };
+        let p2p_msg  = p2p::P2PMessage::ChatMessage { bundle, seq: send_seq };
         if let Err(e) = p2p::send_message(&endpoint, &p2p_msg).await {
             eprintln!("[Messenger] deliver to {}: {} — depositing in relay inbox", endpoint, e);
             deposit_in_relay_inbox(&contact_addr_key, &my_addr, &p2p_msg).await;
@@ -640,7 +790,7 @@ pub async fn receive_message(
     _state: State<'_, AppState>,
     bundle: String,
 ) -> Result<Message, EgoDesktopError> {
-    receive_message_inner(&bundle)
+    receive_message_inner(&bundle, 0) // seq=0: called from frontend, no seq context
         .map(|(msg, _)| msg)
         .map_err(EgoDesktopError::InvalidInput)
 }
