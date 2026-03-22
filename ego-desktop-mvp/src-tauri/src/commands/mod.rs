@@ -9,6 +9,7 @@ pub mod staking;
 pub mod explorer;
 pub mod notifications;
 pub mod messenger;
+pub mod outbox;
 pub mod consensus;
 pub mod contracts;
 pub mod rollup;

@@ -20,13 +20,26 @@ use axum::{
 use rocksdb::{Options, DB};
 use serde::{Deserialize, Serialize};
 use std::{
-    sync::Arc,
+    collections::HashMap,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const MAX_MSG_SIZE:   usize = 64 * 1024;    // 64 KB per message
-const MAX_INBOX_MSGS: usize = 500;           // max queued messages per inbox
-const TTL_SECS:       u64   = 7 * 24 * 3600; // 7 days
+// Per-inbox rate limit: at most MAX_POSTS_PER_WINDOW deposits in RATE_WINDOW_SECS.
+// Prevents a spammer from filling the inbox of a popular address.
+const RATE_WINDOW_SECS: u64 = 3600; // 1 hour
+const MAX_POSTS_PER_WINDOW: usize = 20;
+
+// ── Concierge limits ──────────────────────────────────────────────────────────
+// The relay is a lightweight concierge: it holds contact-pairing events
+// (ContactRequest / ContactResponse) only — NOT ongoing chat.
+// Chat messages are delivered P2P direct or queued in the sender's local outbox.
+//
+// At 1 M users the active-pairing traffic is tiny:
+//   1 000 pairings/day × 4 KB = 4 MB/day inbox writes — trivially small.
+const MAX_MSG_SIZE:   usize = 16 * 1024;  // 16 KB per message (enough for contact bundles)
+const MAX_INBOX_MSGS: usize = 20;          // max queued messages per inbox
+const TTL_SECS:       u64   = 48 * 3600;  // 48-hour TTL: discovery events, not archives
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -37,14 +50,30 @@ pub struct MailboxEntry {
     pub stored_at:  u64,
 }
 
-pub type MailboxStore = Arc<DB>;
+/// In-memory rate-limit counters: inbox hash → (window_start, post_count).
+/// Cheap to keep in RAM; never persisted (resets on relay restart is fine).
+type RateMap = Arc<Mutex<HashMap<String, (u64, usize)>>>;
+
+pub struct MailboxStore {
+    pub db:   Arc<DB>,
+    pub rate: RateMap,
+}
+
+impl Clone for MailboxStore {
+    fn clone(&self) -> Self {
+        MailboxStore { db: self.db.clone(), rate: self.rate.clone() }
+    }
+}
 
 pub fn new_store() -> MailboxStore {
     let mut opts = Options::default();
     opts.create_if_missing(true);
     let db = DB::open_with_ttl(&opts, "mailbox.db", Duration::from_secs(TTL_SECS))
         .expect("Failed to open mailbox RocksDB — check write permissions");
-    Arc::new(db)
+    MailboxStore {
+        db:   Arc::new(db),
+        rate: Arc::new(Mutex::new(HashMap::new())),
+    }
 }
 
 // ── Key/value encoding ────────────────────────────────────────────────────────
@@ -94,13 +123,27 @@ async fn post_message(
     }
 
     let now = now_secs();
-    let id  = blake3::hash(&[body.as_ref(), &now.to_le_bytes()].concat())
+
+    // ── Per-inbox rate limiting ───────────────────────────────────────────────
+    {
+        let mut rate = store.rate.lock().unwrap();
+        let entry = rate.entry(hash.clone()).or_insert((now, 0));
+        if now.saturating_sub(entry.0) > RATE_WINDOW_SECS {
+            *entry = (now, 0); // reset window
+        }
+        if entry.1 >= MAX_POSTS_PER_WINDOW {
+            return StatusCode::TOO_MANY_REQUESTS;
+        }
+        entry.1 += 1;
+    }
+
+    let id = blake3::hash(&[body.as_ref(), &now.to_le_bytes()].concat())
         .to_hex()
         .to_string();
 
     // Count existing messages for this inbox before inserting
     let prefix = inbox_prefix(&hash);
-    let count = store
+    let count = store.db
         .prefix_iterator(&prefix)
         .take_while(|r| r.as_ref().ok().map(|(k, _)| k.starts_with(&prefix)).unwrap_or(false))
         .count();
@@ -110,7 +153,7 @@ async fn post_message(
 
     let key   = db_key(&hash, &id);
     let value = encode_value(now, &body);
-    match store.put(&key, &value) {
+    match store.db.put(&key, &value) {
         Ok(_)  => StatusCode::CREATED,
         Err(e) => {
             eprintln!("[Mailbox] DB write error: {}", e);
@@ -127,14 +170,12 @@ async fn get_messages(
     let now    = now_secs();
     let mut msgs = Vec::new();
 
-    for item in store.prefix_iterator(&prefix) {
+    for item in store.db.prefix_iterator(&prefix) {
         let Ok((key, val)) = item else { continue };
         if !key.starts_with(&prefix) { break; }
 
-        // Extract id from key by stripping the "{hash}:" prefix
         let id = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
         if let Some(entry) = decode_value(&id, &val) {
-            // Belt-and-suspenders TTL check alongside RocksDB compaction
             if now.saturating_sub(entry.stored_at) < TTL_SECS {
                 msgs.push(entry);
             }
@@ -149,7 +190,7 @@ async fn delete_message(
     State(store):     State<MailboxStore>,
 ) -> StatusCode {
     let key = db_key(&hash, &id);
-    let _ = store.delete(&key); // idempotent: ignore "not found"
+    let _ = store.db.delete(&key); // idempotent
     StatusCode::NO_CONTENT
 }
 

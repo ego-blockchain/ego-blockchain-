@@ -286,11 +286,13 @@ fn main() {
                     crate::p2p::oracle_sync_chain().await;
                     crate::p2p::broadcast_peer_announce(&handle_startup).await;
                     crate::p2p::sync_chain_from_peers().await;
-                    // Poll relay HTTP mailbox for offline messenger messages
+                    // Poll relay HTTP mailbox (contact-pairing events only)
                     let my_addr = crate::ledger::Ledger::load().address;
                     if !my_addr.is_empty() {
                         crate::commands::messenger::poll_relay_inbox(&my_addr, &handle_startup).await;
                     }
+                    // Flush local outbox — retry P2P delivery for any queued messages
+                    crate::commands::outbox::flush_pending().await;
                     let shard_peers = crate::p2p::get_known_peers();
                     let ledger_for_shard = crate::ledger::Ledger::load();
                     let endpoint = crate::p2p::get_public_endpoint().await;

@@ -2063,6 +2063,14 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                 city:      None,
                 country:   None,
             });
+            // Flush local outbox for this peer — they just came online.
+            // No relay involved: outbox retries P2P direct delivery.
+            if !endpoint.is_empty() {
+                let ep = endpoint.clone();
+                tokio::spawn(async move {
+                    crate::commands::outbox::flush_for(&address, Some(&ep)).await;
+                });
+            }
             // Chain sync is handled by the dedicated sync_chain_from_peers() loop
             // (runs every 30 s in the keep-alive loop).  Do NOT send a ChainSyncRequest
             // here — PeerAnnounce fires every 60 s per peer, so doing it here was
