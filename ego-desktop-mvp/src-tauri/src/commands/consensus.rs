@@ -191,6 +191,43 @@ pub async fn respond_to_challenges() -> Result<PostChallengeResult, EgoDesktopEr
         }
     }
 
+    // Gap: storage rewards on-chain.
+    // For every successfully proved sector, issue a reward TX from the node pool
+    // address to our own address.  This makes storage earnings visible on-chain
+    // and auditable by anyone running the explorer.
+    if submitted > 0 {
+        let ledger = Ledger::load();
+        if !ledger.address.is_empty() {
+            // Storage reward: 500_000 uEGOC / GB / day ÷ 48 (window interval = 30 min)
+            // = 10_417 uEGOC per sector per window (≈ 0.01 EGOC).
+            const REWARD_PER_SECTOR_WINDOW: u64 = 10_417;
+            let reward_uegoc = REWARD_PER_SECTOR_WINDOW * submitted as u64;
+            let ts2 = chrono::Utc::now().timestamp();
+            let reward_data = format!("post_reward:{}:{}:{}", ledger.address, submitted, ts2);
+            let reward_hash = format!("0x{}", ego_core::hash_data(reward_data.as_bytes()).to_hex());
+            let mut chain = crate::ledger::load_chain();
+            // Check node pool has balance
+            let pool_addr = "egot1nodepool0000000000000000000000000000000000";
+            chain.transactions.push(crate::ledger::LedgerTx {
+                hash:      reward_hash,
+                from:      pool_addr.into(),
+                to:        ledger.address.clone(),
+                amount:    reward_uegoc,
+                memo:      Some(format!("PoST reward: {} sector(s) proved", submitted)),
+                timestamp: ts2,
+                signature: "system_post_reward".into(),
+                status:    "Confirmed".into(),
+                tx_type:   "reward".into(),
+                ..crate::ledger::LedgerTx::default()
+            });
+            if let Err(e) = crate::ledger::save_chain(&chain) {
+                eprintln!("[PoST] Failed to record reward TX: {e}");
+            } else {
+                eprintln!("[PoST] Issued {} uEGOC reward for {} proved sector(s)", reward_uegoc, submitted);
+            }
+        }
+    }
+
     Ok(PostChallengeResult {
         challenges_found: n_found,
         proofs_submitted: submitted,

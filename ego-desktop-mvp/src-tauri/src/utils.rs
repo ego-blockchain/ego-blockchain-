@@ -1,5 +1,16 @@
 use crate::error::{EgoDesktopError, EgoResult};
 
+/// Atomically write `data` to `path`.
+///
+/// Writes to `{path}.tmp` first, then renames — the rename is atomic on
+/// NTFS (Windows) and all POSIX file-systems, so the target is never
+/// partially written even if the process crashes mid-write.
+pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)
+}
+
 pub fn format_balance(amount: u64) -> String {
     let egoc = amount as f64 / 1_000_000.0;
     format!("{:.6} EGOC", egoc)

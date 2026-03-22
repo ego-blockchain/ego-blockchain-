@@ -14,8 +14,10 @@ mod ledger;
 mod mempool;
 mod models;
 mod p2p;
+mod poc;
 mod proof;
 mod relay_inbox;
+mod rpc;
 mod services;
 mod sharding;
 mod tokenomics;
@@ -217,7 +219,11 @@ fn main() {
             commands::ai::get_ai_key_status,
             commands::auth::send_verification_email,
             commands::auth::verify_email_code,
-            commands::auth::save_registration_info
+            commands::auth::save_registration_info,
+            commands::light_client::get_block_headers,
+            commands::light_client::get_tx_proof,
+            commands::light_client::verify_tx_proof,
+            commands::light_client::request_headers_from_peer
         ])
         .setup(|app| {
             // Show the window only after the frontend signals it's ready,
@@ -227,6 +233,10 @@ fn main() {
                 window.show().unwrap();
                 window.set_focus().unwrap();
             });
+
+            // ── PoC session start ─────────────────────────────────────────
+            // Records app start time for uptime-based coverage scoring.
+            crate::poc::init_session_start();
 
             // ── Task 1: libp2p swarm ───────────────────────────────────────
             // Connects to relay, handles all P2P traffic.
@@ -250,6 +260,8 @@ fn main() {
                     eprintln!("[Startup] ✗ No endpoint — check network");
                 }
 
+                // Fetch live EGOC/USD price before first tx so fees are USD-stable
+                crate::p2p::fetch_and_cache_egoc_price().await;
                 crate::p2p::fetch_chain_from_oracle(&handle_startup).await;
                 eprintln!("[Startup] Oracle chain sync complete");
 
@@ -260,10 +272,16 @@ fn main() {
                 eprintln!("[Startup] Peer announce sent (endpoint: {})", my_endpoint);
 
                 // Publish to DHT so peers can find us without the central relay
+                // Restore cached DHT records before re-publishing so we can
+                // serve queries immediately (Gap #3 DHT persistence).
+                crate::p2p::restore_dht_cache().await;
+
                 crate::p2p::dht_publish_self(&{
                     let l = crate::ledger::Ledger::load(); l.address
                 }, &my_endpoint, "Ego Node").await;
                 crate::p2p::dht_discover_peers().await;
+                // Discover community relay nodes published by other public-IP peers
+                crate::p2p::dht_discover_relays().await;
 
                 // Initialize shard map
                 let peers = crate::p2p::get_known_peers();
@@ -286,13 +304,18 @@ fn main() {
                     crate::p2p::oracle_sync_chain().await;
                     crate::p2p::broadcast_peer_announce(&handle_startup).await;
                     crate::p2p::sync_chain_from_peers().await;
+                    crate::p2p::dht_discover_relays().await;
                     // Poll relay HTTP mailbox (contact-pairing events only)
                     let my_addr = crate::ledger::Ledger::load().address;
                     if !my_addr.is_empty() {
                         crate::commands::messenger::poll_relay_inbox(&my_addr, &handle_startup).await;
                     }
+                    // Refresh EGOC/USD price so fees stay USD-stable
+                    crate::p2p::fetch_and_cache_egoc_price().await;
                     // Flush local outbox — retry P2P delivery for any queued messages
                     crate::commands::outbox::flush_pending().await;
+                    // Gap #5: heal under-replicated files (every 5th loop = ~2.5 min)
+                    crate::p2p::check_file_replication().await;
                     let shard_peers = crate::p2p::get_known_peers();
                     let ledger_for_shard = crate::ledger::Ledger::load();
                     let endpoint = crate::p2p::get_public_endpoint().await;
@@ -331,6 +354,19 @@ fn main() {
             let handle_coverage = app.handle();
             tauri::async_runtime::spawn(async move {
                 crate::commands::coverage::run_background_coverage_loop(handle_coverage).await;
+            });
+
+            // ── Task 6: JSON-RPC 2.0 + WebSocket server ───────────────────
+            // Listens on 127.0.0.1:47395 — JS SDK and dApp connections.
+            tauri::async_runtime::spawn(async move {
+                crate::rpc::start_rpc_server().await;
+            });
+
+            // ── Task 7: HotStuff view-change monitor ──────────────────────
+            // Fires a ViewChange gossip message when no proposal is seen
+            // within VIEW_CHANGE_TIMEOUT_SECS, advancing the consensus view.
+            tauri::async_runtime::spawn(async move {
+                crate::p2p::run_view_change_monitor().await;
             });
 
             #[cfg(debug_assertions)]

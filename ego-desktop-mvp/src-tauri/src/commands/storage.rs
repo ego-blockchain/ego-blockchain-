@@ -97,15 +97,14 @@ pub async fn store_file(
     let key_nonce_hex = hex::encode(key_bytes);
     let blocks_total  = manifest.blocks.len() as u32;
 
-    // Cost: 0.01 EGOC per MB per month
-    let mb         = (original_size as f64) / 1_000_000.0;
-    let cost_egoc  = (mb * 0.01 * request.duration_months as f64).max(0.0001);
-    let cost_uegoc = (cost_egoc * 1_000_000.0) as u64;
-
     let now    = chrono::Utc::now().timestamp();
     let expiry = now + (request.duration_months as i64) * 30 * 86_400;
 
     let mut ledger = Ledger::load();
+    let is_staker  = ledger.staked_amount > 0;
+    // USD-pegged storage cost: $0.001/MB/month — free for stakers
+    let mb         = (original_size as f64) / 1_000_000.0;
+    let cost_uegoc = crate::tokenomics::storage_cost_with_staking(mb, request.duration_months, is_staker);
 
     let stored = StoredFile {
         cid:             cid.clone(),
@@ -125,38 +124,40 @@ pub async fn store_file(
         ..Default::default()
     };
 
-    // Deduct storage cost
-    let mut chain   = load_chain();
-    let balance     = chain.balance_of(&ledger.address);
-    if cost_uegoc > balance {
-        return Err(EgoDesktopError::InvalidInput(format!(
-            "Insufficient balance: have {} uEGOC, need {} uEGOC for storage",
-            balance, cost_uegoc
-        )));
+    // Deduct storage cost (free for stakers)
+    let mut chain = load_chain();
+    if cost_uegoc > 0 {
+        let balance = chain.balance_of(&ledger.address);
+        if cost_uegoc > balance {
+            return Err(EgoDesktopError::InvalidInput(format!(
+                "Insufficient balance: have {} uEGOC, need {} uEGOC for storage",
+                balance, cost_uegoc
+            )));
+        }
+        let cost_hash = format!(
+            "0x{}",
+            ego_core::hash_data(
+                format!("storage:{}:{}:{}", ledger.address, cid, now).as_bytes()
+            ).to_hex()
+        );
+        chain.transactions.push(LedgerTx {
+            hash:               cost_hash,
+            from:               ledger.address.clone(),
+            to:                 "egot1storage0000000000000000000000000000000000".into(),
+            amount:             cost_uegoc,
+            memo:               Some(format!("Storage: {file_name} ({blocks_total} blocks) [burned]")),
+            timestamp:          now,
+            signature:          "storage".into(),
+            status:             "Confirmed".into(),
+            block_height:       None,
+            nonce:              0,
+            public_key_ed25519: String::new(),
+            dilithium_pubkey:   String::new(),
+            dilithium_signature: String::new(),
+            ..LedgerTx::default()
+        });
+        save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save chain: {e}")))?;
     }
-    let cost_hash = format!(
-        "0x{}",
-        ego_core::hash_data(
-            format!("storage:{}:{}:{}", ledger.address, cid, now).as_bytes()
-        ).to_hex()
-    );
-    chain.transactions.push(LedgerTx {
-        hash:               cost_hash,
-        from:               ledger.address.clone(),
-        to:                 "egot1storage0000000000000000000000000000000000".into(),
-        amount:             cost_uegoc,
-        memo:               Some(format!("Storage: {file_name} ({} blocks)", blocks_total)),
-        timestamp:          now,
-        signature:          "storage".into(),
-        status:             "Confirmed".into(),
-        block_height:       None,
-        nonce:              0,
-        public_key_ed25519: String::new(),
-        dilithium_pubkey:   String::new(),
-        dilithium_signature: String::new(),
-        ..LedgerTx::default()
-    });
-    save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save chain: {e}")))?;
 
     ledger.stored_files.insert(0, stored);
     ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save ledger: {e}")))?;

@@ -14,3 +14,4 @@ pub mod consensus;
 pub mod contracts;
 pub mod rollup;
 pub mod multichain;
+pub mod light_client;

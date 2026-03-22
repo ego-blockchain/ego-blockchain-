@@ -44,6 +44,7 @@ interface ConsoleLog {
 }
 
 type RightTab = 'build' | 'deploy' | 'abi' | 'preview';
+type DeployNetwork = 'testnet' | 'mainnet';
 
 // ─── Templates ───────────────────────────────────────────────────────────────
 
@@ -771,21 +772,27 @@ interface RightPanelProps {
   compiling: boolean;
   compileResult: CompileResult | null;
   deployResult: DeployResult | null;
+  dryRunResult: string | null;
   deploying: boolean;
+  deployNetwork: DeployNetwork;
   nodeUrl: string;
   initArgs: string;
   activeFile: string | null;
   currentContent: string;
   onCompile: () => void;
   onDeploy: () => void;
+  onDryRun: () => void;
+  onNetworkChange: (n: DeployNetwork) => void;
   onNodeUrlChange: (v: string) => void;
   onInitArgsChange: (v: string) => void;
 }
 
+const TESTNET_RPC = 'https://rpc.egoblockchain.com';
+
 function RightPanel({
-  tab, onTabChange, compiling, compileResult, deployResult, deploying,
-  nodeUrl, initArgs, activeFile, currentContent,
-  onCompile, onDeploy, onNodeUrlChange, onInitArgsChange,
+  tab, onTabChange, compiling, compileResult, deployResult, dryRunResult, deploying,
+  deployNetwork, nodeUrl, initArgs, activeFile, currentContent,
+  onCompile, onDeploy, onDryRun, onNetworkChange, onNodeUrlChange, onInitArgsChange,
 }: RightPanelProps) {
   const tabs: { key: RightTab; label: string }[] = [
     { key: 'build', label: 'Build' },
@@ -875,26 +882,69 @@ function RightPanel({
         {/* DEPLOY TAB */}
         {tab === 'deploy' && (
           <div className="space-y-3">
-            <div className="text-xs text-gray-400 font-semibold uppercase tracking-wider">
-              WASM Status
+            {/* Network selector */}
+            <div>
+              <div className="text-xs text-gray-400 font-semibold uppercase tracking-wider mb-1.5">Network</div>
+              <div className="flex rounded-lg overflow-hidden border border-gray-600">
+                <button
+                  onClick={() => onNetworkChange('testnet')}
+                  className={`flex-1 py-2 text-xs font-semibold transition-colors ${
+                    deployNetwork === 'testnet'
+                      ? 'bg-green-700/60 text-green-200 border-r border-green-600'
+                      : 'bg-gray-700/40 text-gray-400 hover:text-gray-200 border-r border-gray-600'
+                  }`}
+                >
+                  🧪 Testnet
+                </button>
+                <button
+                  onClick={() => onNetworkChange('mainnet')}
+                  className={`flex-1 py-2 text-xs font-semibold transition-colors ${
+                    deployNetwork === 'mainnet'
+                      ? 'bg-purple-700/60 text-purple-200'
+                      : 'bg-gray-700/40 text-gray-400 hover:text-gray-200'
+                  }`}
+                >
+                  🌐 Mainnet
+                </button>
+              </div>
             </div>
-            <div className={`text-sm rounded px-2 py-1 ${compileResult?.success ? 'text-green-400 bg-green-900/20' : 'text-gray-500 bg-gray-700/30'}`}>
+
+            {/* Network info banner */}
+            {deployNetwork === 'testnet' ? (
+              <div className="bg-green-900/20 border border-green-700/50 rounded-lg px-3 py-2 space-y-0.5">
+                <div className="text-xs text-green-400 font-semibold">✓ Testnet — Free deployment</div>
+                <div className="text-[11px] text-green-700">No EGOC spent. Use this to test your contract before going live.</div>
+                <div className="text-[10px] text-gray-500 font-mono mt-0.5">{TESTNET_RPC}</div>
+              </div>
+            ) : (
+              <div className="bg-yellow-900/20 border border-yellow-700/50 rounded-lg px-3 py-2 space-y-0.5">
+                <div className="text-xs text-yellow-400 font-semibold">⚠ Mainnet — Costs EGOC</div>
+                <div className="text-[11px] text-yellow-700">Estimated fee: ~0.01 EGOC. This deploys a real contract on-chain.</div>
+              </div>
+            )}
+
+            {/* WASM status */}
+            <div className={`text-xs rounded px-2 py-1.5 ${compileResult?.success ? 'text-green-400 bg-green-900/20' : 'text-gray-500 bg-gray-700/30'}`}>
               {compileResult?.success
-                ? `Ready — ${((compileResult.size ?? 0) / 1024).toFixed(1)} KB`
-                : 'Compile first'}
+                ? `✓ WASM ready — ${((compileResult.size ?? 0) / 1024).toFixed(1)} KB`
+                : '⚙ Compile first before deploying'}
             </div>
 
-            <div>
-              <label className="text-xs text-gray-400 block mb-1">Node URL</label>
-              <input
-                value={nodeUrl}
-                onChange={(e) => onNodeUrlChange(e.target.value)}
-                className="w-full bg-gray-700 text-white text-xs px-2 py-1.5 rounded border border-gray-600 focus:outline-none focus:border-blue-500"
-              />
-            </div>
+            {/* Node URL (mainnet only) */}
+            {deployNetwork === 'mainnet' && (
+              <div>
+                <label className="text-xs text-gray-400 block mb-1">Node URL</label>
+                <input
+                  value={nodeUrl}
+                  onChange={(e) => onNodeUrlChange(e.target.value)}
+                  className="w-full bg-gray-700 text-white text-xs px-2 py-1.5 rounded border border-gray-600 focus:outline-none focus:border-blue-500"
+                />
+              </div>
+            )}
 
+            {/* Init args */}
             <div>
-              <label className="text-xs text-gray-400 block mb-1">Init Args (decimal u64 or 0x hex, optional)</label>
+              <label className="text-xs text-gray-400 block mb-1">Init Args <span className="text-gray-600">(optional)</span></label>
               <input
                 value={initArgs}
                 onChange={(e) => onInitArgsChange(e.target.value)}
@@ -903,24 +953,59 @@ function RightPanel({
               />
             </div>
 
+            {/* Dry run button */}
+            <button
+              onClick={onDryRun}
+              disabled={!compileResult?.success}
+              className="w-full py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-700/40 disabled:text-gray-600 text-gray-300 rounded-lg text-xs font-medium flex items-center justify-center gap-2 transition-colors border border-gray-600"
+            >
+              🔬 Dry Run <span className="text-gray-500">(local simulation, no network)</span>
+            </button>
+
+            {/* Deploy button */}
             <button
               onClick={onDeploy}
               disabled={deploying || !compileResult?.success}
-              className="w-full py-3 bg-purple-600 hover:bg-purple-500 disabled:bg-gray-600 text-white rounded-lg font-semibold text-sm flex items-center justify-center gap-2 transition-colors"
+              className={`w-full py-3 disabled:bg-gray-600 text-white rounded-lg font-semibold text-sm flex items-center justify-center gap-2 transition-colors ${
+                deployNetwork === 'testnet'
+                  ? 'bg-green-700 hover:bg-green-600'
+                  : 'bg-purple-600 hover:bg-purple-500'
+              }`}
             >
               {deploying ? (
-                <>
-                  <span className="animate-spin">🚀</span>
-                  Deploying...
-                </>
+                <><span className="animate-spin">🚀</span> Deploying...</>
+              ) : deployNetwork === 'testnet' ? (
+                '🧪 Deploy to Testnet (Free)'
               ) : (
-                '🚀 Deploy to Node'
+                '🚀 Deploy to Mainnet'
               )}
             </button>
 
+            {/* Dry run result */}
+            {dryRunResult && (
+              <div className="bg-blue-900/20 border border-blue-700/50 rounded-lg p-3 space-y-1">
+                <div className="text-xs text-blue-400 font-semibold">🔬 Dry Run — Simulated</div>
+                <div className="text-[11px] text-gray-400">Simulated address (no real deployment):</div>
+                <button
+                  onClick={() => copyToClipboard(dryRunResult)}
+                  className="w-full text-left font-mono text-xs bg-gray-900 rounded px-2 py-1 text-blue-300 hover:bg-gray-700 transition-colors break-all"
+                  title="Click to copy"
+                >
+                  {dryRunResult}
+                </button>
+                <div className="text-[10px] text-gray-500">No EGOC spent · No on-chain state · Click to copy</div>
+              </div>
+            )}
+
+            {/* Deploy result */}
             {deployResult && (
-              <div className="bg-green-900/30 border border-green-700 rounded-lg p-3 space-y-1">
-                <div className="text-xs text-green-400 font-semibold">✓ Deployed!</div>
+              <div className={`border rounded-lg p-3 space-y-1 ${deployNetwork === 'testnet' ? 'bg-green-900/20 border-green-700/60' : 'bg-purple-900/20 border-purple-700/60'}`}>
+                <div className="flex items-center gap-2">
+                  <div className={`text-xs font-semibold ${deployNetwork === 'testnet' ? 'text-green-400' : 'text-purple-300'}`}>✓ Deployed!</div>
+                  {deployNetwork === 'testnet' && (
+                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-green-800/60 text-green-300 border border-green-700/50">TESTNET</span>
+                  )}
+                </div>
                 <div className="text-xs text-gray-300">Contract Address:</div>
                 <button
                   onClick={() => copyToClipboard(deployResult.contract_address)}
@@ -929,6 +1014,9 @@ function RightPanel({
                 >
                   {deployResult.contract_address}
                 </button>
+                {deployNetwork === 'testnet' && (
+                  <div className="text-[10px] text-green-700">Testnet contract — 0 EGOC spent</div>
+                )}
                 <div className="text-[10px] text-gray-500">Click to copy</div>
               </div>
             )}
@@ -1089,7 +1177,9 @@ export default function IDEPage() {
   const [compiling, setCompiling] = useState(false);
   const [compileResult, setCompileResult] = useState<CompileResult | null>(null);
   const [deployResult, setDeployResult] = useState<DeployResult | null>(null);
+  const [dryRunResult, setDryRunResult] = useState<string | null>(null);
   const [deploying, setDeploying] = useState(false);
+  const [deployNetwork, setDeployNetwork] = useState<DeployNetwork>('testnet');
   const [consoleLogs, setConsoleLogs] = useState<ConsoleLog[]>([]);
   const [rightTab, setRightTab] = useState<RightTab>('build');
   const [showTemplates, setShowTemplates] = useState(false);
@@ -1469,15 +1559,33 @@ export default function IDEPage() {
     }
   }
 
+  function dryRun() {
+    if (!compileResult?.success || !compileResult.wasm_hex) {
+      addLog('error', 'Compile successfully before dry run');
+      return;
+    }
+    // Deterministic simulated address: hash the wasm hex + project name locally.
+    const seed = (compileResult.wasm_hex.slice(0, 32) + (activeProject ?? '')).split('').reduce(
+      (acc, c) => (acc * 31 + c.charCodeAt(0)) >>> 0, 0x5EED
+    );
+    const hex = seed.toString(16).padStart(8, '0') + compileResult.wasm_hex.slice(-24);
+    const simAddr = `egot1sim${hex}`;
+    setDryRunResult(simAddr);
+    setDeployResult(null);
+    addLog('info', `🔬 Dry run complete — simulated address: ${simAddr}`);
+    addLog('info', `   No network call made, no EGOC spent.`);
+  }
+
   async function deploy() {
     if (!compileResult?.success || !compileResult.wasm_hex) {
       addLog('error', 'Compile successfully before deploying');
       return;
     }
+    const targetUrl = deployNetwork === 'testnet' ? TESTNET_RPC : nodeUrl;
     setDeploying(true);
-    addLog('info', `Deploying to ${nodeUrl}...`);
+    setDryRunResult(null);
+    addLog('info', `Deploying to ${deployNetwork === 'testnet' ? 'Testnet' : 'Mainnet'} (${targetUrl})...`);
     try {
-      // Derive ABI from the main .urego source in this project
       let abiSource = currentContent;
       if (!activeFile?.endsWith('.urego') && currentProject) {
         const mainFile = currentProject.files['src/main.urego'];
@@ -1489,10 +1597,11 @@ export default function IDEPage() {
           init_args_hex: encodeInitArgs(initArgs),
           name:          activeProject || '',
           abi:           extractABI(abiSource),
+          node_url:      targetUrl,
         },
       });
       setDeployResult(result);
-      addLog('success', `✓ Deployed at ${result.contract_address}`);
+      addLog('success', `✓ Deployed on ${deployNetwork === 'testnet' ? 'Testnet (free)' : 'Mainnet'}: ${result.contract_address}`);
     } catch (e: unknown) {
       addLog('error', `✗ Deploy failed: ${String(e)}`);
     } finally {
@@ -1807,13 +1916,17 @@ export default function IDEPage() {
           compiling={compiling}
           compileResult={compileResult}
           deployResult={deployResult}
+          dryRunResult={dryRunResult}
           deploying={deploying}
+          deployNetwork={deployNetwork}
           nodeUrl={nodeUrl}
           initArgs={initArgs}
           activeFile={activeFile}
           currentContent={currentContent}
           onCompile={compile}
           onDeploy={deploy}
+          onDryRun={dryRun}
+          onNetworkChange={setDeployNetwork}
           onNodeUrlChange={setNodeUrl}
           onInitArgsChange={setInitArgs}
         />

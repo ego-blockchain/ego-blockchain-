@@ -399,6 +399,7 @@ useEffect(() => {
         myName: myCardName.trim(),
       });
       setMyCard(card);
+      localStorage.setItem('ego-my-display-name', myCardName.trim());
     } catch (e: any) {
       console.error(e);
     } finally {
@@ -437,8 +438,10 @@ useEffect(() => {
         contactAddr: pendingAction.contact.address,
         myName: actionName.trim(),
       });
+      localStorage.setItem('ego-my-display-name', actionName.trim());
       setActionDone(true);
       await loadContacts();
+      setTimeout(() => closePendingAction(), 1500);
     } catch (e: any) {
       console.error('approve_contact_request', e);
     } finally {
@@ -456,7 +459,7 @@ useEffect(() => {
       });
       setActionDone(true);
       await loadContacts();
-      setTimeout(() => closePendingAction(), 1200);
+      setTimeout(() => closePendingAction(), 1500);
     } catch (e: any) {
       console.error('decline_contact_request', e);
     } finally {
@@ -694,7 +697,7 @@ useEffect(() => {
                     <button
                       onClick={() => {
                         setPendingAction({ contact: c, action: 'approve' });
-                        setActionName('');
+                        setActionName(localStorage.getItem('ego-my-display-name') ?? '');
                         setActionDone(false);
                       }}
                       className="flex-1 py-1 bg-green-600 hover:bg-green-500 rounded-lg text-xs font-medium transition-colors"
@@ -1306,9 +1309,10 @@ useEffect(() => {
               ) : pendingAction.action === 'approve' ? (
                 <>
                   <p className="text-sm text-gray-400">
-                    Enter your display name so{' '}
-                    <strong className="text-white">{pendingAction.contact.name}</strong>{' '}
-                    knows who accepted.
+                    {actionName
+                      ? <>You'll appear as <strong className="text-white">{actionName}</strong> to{' '}<strong className="text-white">{pendingAction.contact.name}</strong>.</>
+                      : <>Enter your display name so{' '}<strong className="text-white">{pendingAction.contact.name}</strong>{' '}knows who accepted.</>
+                    }
                   </p>
                   <div>
                     <label className="text-xs text-gray-400 mb-1.5 block">Your display name</label>
@@ -1317,7 +1321,7 @@ useEffect(() => {
                       onChange={e => setActionName(e.target.value)}
                       onKeyDown={e => { if (e.key === 'Enter') handleApprove(); }}
                       placeholder="e.g. Bob"
-                      autoFocus
+                      autoFocus={!actionName}
                       className="w-full bg-gray-700 border border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-green-500"
                     />
                   </div>

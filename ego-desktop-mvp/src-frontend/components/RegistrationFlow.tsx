@@ -30,7 +30,12 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
       await invoke('send_verification_email', { email: email.trim(), name: name.trim() });
       setStep('otp');
     } catch (e) {
-      setError('Failed to send verification email: ' + String(e));
+      const msg = String(e);
+      if (msg.toLowerCase().includes('too many')) {
+        setError('Too many attempts for this email. Please use a different email address or try again in 1 hour.');
+      } else {
+        setError('Failed to send verification email: ' + msg);
+      }
     } finally {
       setLoading(false);
     }
@@ -39,7 +44,7 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
   // ── Step 2: Verify OTP ───────────────────────────────────────────────────
   async function handleVerifyOtp() {
     const code = otp.join('');
-    if (code.length !== 6) { setError('Please enter the full 6-digit code.'); return; }
+    if (code.length !== 6) { setError('Please enter the full code (4 digits + 2 letters).'); return; }
     setLoading(true); setError('');
     try {
       const ok = await invoke<boolean>('verify_email_code', { email: email.trim(), code });
@@ -73,7 +78,8 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
   }
 
   function handleOtpInput(i: number, val: string) {
-    const v = val.replace(/\D/g, '').slice(-1);
+    // Any position can be a digit or letter — auto-uppercase letters.
+    const v = val.replace(/[^0-9a-zA-Z]/g, '').slice(-1).toUpperCase();
     const next = [...otp]; next[i] = v; setOtp(next);
     if (v && i < 5) otpRefs.current[i + 1]?.focus();
   }
@@ -87,9 +93,13 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
     setLoading(true); setError(''); setOtp(['', '', '', '', '', '']);
     try {
       await invoke('send_verification_email', { email: email.trim(), name: name.trim() });
-      setError('');
     } catch (e) {
-      setError('Failed to resend: ' + String(e));
+      const msg = String(e);
+      if (msg.toLowerCase().includes('too many')) {
+        setError('You have reached the 3-attempt limit. Please use a different email address or try again in 1 hour.');
+      } else {
+        setError('Failed to resend: ' + msg);
+      }
     } finally {
       setLoading(false);
     }
@@ -99,6 +109,7 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
     if (!checked) { setError('Please confirm you have written down your recovery phrase.'); return; }
     localStorage.setItem('ego-registered-account', 'true');
     localStorage.setItem(`ego-registered-${address}`, 'true');
+    if (name.trim()) localStorage.setItem('ego-my-display-name', name.trim());
     onComplete();
   }
 
@@ -166,26 +177,27 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
         </div>
         <div className="px-8 py-6 space-y-5">
           <p className="text-sm text-gray-300 leading-relaxed">
-            We sent a 6-digit code to <strong className="text-white">{email}</strong>.
-            Enter it below to continue.
+            We sent a confirmation code to <strong className="text-white">{email}</strong>.
+            Enter the 4 digits + 2 letters below to continue.
           </p>
 
-          {/* OTP boxes */}
-          <div className="flex justify-center gap-3">
-            {otp.map((digit, i) => (
+          {/* OTP boxes: any position can be digit or letter */}
+          <div className="flex justify-center gap-2">
+            {otp.map((char, i) => (
               <input
                 key={i}
                 ref={el => { otpRefs.current[i] = el; }}
                 type="text"
-                inputMode="numeric"
+                inputMode="text"
                 maxLength={1}
-                value={digit}
+                value={char}
                 onChange={e => handleOtpInput(i, e.target.value)}
                 onKeyDown={e => handleOtpKeyDown(i, e)}
-                className="w-12 h-14 text-center text-xl font-bold bg-gray-900 border-2 border-gray-700 focus:border-blue-500 rounded-xl outline-none transition text-white"
+                className="w-11 h-14 text-center text-xl font-bold bg-gray-900 border-2 border-gray-700 focus:border-blue-500 rounded-xl outline-none transition text-white"
               />
             ))}
           </div>
+          <p className="text-[11px] text-gray-600 text-center -mt-1">4 digits + 2 letters, mixed  e.g. 3A8S97</p>
 
           <div className="text-xs text-gray-500 space-y-1">
             <p>• Check your spam/junk folder if you don't see it</p>

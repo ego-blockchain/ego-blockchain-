@@ -1,0 +1,16 @@
+{
+  "name": "@ego-blockchain/sdk",
+  "version": "1.0.0",
+  "description": "Ego Blockchain JavaScript/TypeScript SDK",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "keywords": ["ego", "blockchain", "sdk", "web3"],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

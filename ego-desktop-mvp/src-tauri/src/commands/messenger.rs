@@ -71,7 +71,7 @@ pub(crate) fn load_contacts() -> Vec<Contact> {
 
 pub(crate) fn save_contacts(contacts: &[Contact]) -> Result<(), String> {
     let data = serde_json::to_string_pretty(contacts).map_err(|e| e.to_string())?;
-    fs::write(contacts_path(), data).map_err(|e| e.to_string())
+    crate::utils::atomic_write(&contacts_path(), data.as_bytes()).map_err(|e| e.to_string())
 }
 
 fn load_messages() -> Vec<Message> {
@@ -86,7 +86,7 @@ fn load_messages() -> Vec<Message> {
 
 fn save_messages(msgs: &[Message]) -> Result<(), String> {
     let data = serde_json::to_string_pretty(msgs).map_err(|e| e.to_string())?;
-    fs::write(messages_path(), data).map_err(|e| e.to_string())
+    crate::utils::atomic_write(&messages_path(), data.as_bytes()).map_err(|e| e.to_string())
 }
 
 // ── Bundle parsers ────────────────────────────────────────────────────────────
@@ -539,6 +539,8 @@ pub async fn approve_contact_request(
                 endpoints: vec![my_endpoint.clone()],
                 city:      None,
                 country:   None,
+                coverage_score: 0,
+                ed25519_pubkey: String::new(),
             };
             if let Err(e) = p2p::send_message(&resolved_peer_ep, &announce).await {
                 eprintln!("[P2P] Could not send PeerAnnounce after approval: {}", e);
@@ -819,7 +821,7 @@ pub async fn get_messages(contact_addr: String) -> Result<Vec<Message>, EgoDeskt
 
 #[tauri::command]
 pub async fn clear_messages() -> Result<(), EgoDesktopError> {
-    std::fs::write(messages_path(), "[]")
+    crate::utils::atomic_write(&messages_path(), b"[]")
         .map_err(|e| EgoDesktopError::FileSystemError(e.to_string()))
 }
 
@@ -857,37 +859,15 @@ pub async fn rename_contact(
     save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)
 }
 
-/// Deposit an encrypted P2PMessage blob in the relay HTTP mailbox for offline delivery.
-/// The relay stores opaque bytes; it never sees plaintext.
-pub async fn deposit_in_relay_inbox(_from_addr: &str, to_addr: &str, msg: &crate::p2p::P2PMessage) {
-    match serde_json::to_vec(msg) {
-        Ok(bytes) => {
-            if crate::relay_inbox::deposit(to_addr, bytes).await {
-                eprintln!("[RelayInbox] Deposited message for {}", to_addr);
-            } else {
-                eprintln!("[RelayInbox] Relay deposit failed for {} — message may be lost", to_addr);
-            }
-        }
-        Err(e) => eprintln!("[RelayInbox] Serialization failed: {}", e),
-    }
+/// Deposit a P2PMessage into the DHT inbox for offline delivery.
+/// Fully P2P — no central relay server.
+pub async fn deposit_in_relay_inbox(from_addr: &str, to_addr: &str, msg: &crate::p2p::P2PMessage) {
+    crate::p2p::dht_inbox_deposit(from_addr, to_addr, msg).await;
 }
 
-/// Poll the relay HTTP mailbox for messages addressed to `my_addr` and
+/// Poll the DHT inbox for messages addressed to `my_addr` and
 /// dispatch each one through the normal incoming-message handler.
-pub async fn poll_relay_inbox(my_addr: &str, app: &tauri::AppHandle) {
-    let entries = crate::relay_inbox::fetch(my_addr).await;
-    for (msg_id, bytes) in entries {
-        match serde_json::from_slice::<crate::p2p::P2PMessage>(&bytes) {
-            Ok(msg) => {
-                crate::p2p::handle_incoming(msg, app).await;
-                crate::relay_inbox::delete(my_addr, &msg_id).await;
-            }
-            Err(e) => {
-                eprintln!("[RelayInbox] Failed to parse message {}: {}", msg_id, e);
-                // Delete malformed messages so they don't clog the inbox
-                crate::relay_inbox::delete(my_addr, &msg_id).await;
-            }
-        }
-    }
+pub async fn poll_relay_inbox(my_addr: &str, _app: &tauri::AppHandle) {
+    crate::p2p::dht_inbox_poll(my_addr).await;
 }
 

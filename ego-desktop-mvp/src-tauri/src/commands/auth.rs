@@ -313,6 +313,10 @@ fn create_wallet_files(address_override: Option<&str>) -> Result<String, EgoDesk
             size_bytes: 256,
             reward:     10_000 * 1_000_000,
             coinbase_tx: None,
+            vote_count: 0,
+            tx_merkle_root: String::new(),
+        poc_ticket: String::new(),
+        poc_slot: 0,
         });
         save_chain(&chain).map_err(EgoDesktopError::WalletError)?;
     }
@@ -1328,23 +1332,29 @@ fn get_bip39_wordlist() -> &'static [&'static str] {
 
 // ── Email verification (OTP via SMTP) ────────────────────────────────────────
 
-/// Generate a 6-digit OTP, store it, and send it to the given email address.
+/// Generate an OTP, store it, and send it to the given email address.
+/// Capped at 3 sends per hour — returns an error on the 4th attempt.
 #[tauri::command]
 pub async fn send_verification_email(email: String, name: String) -> Result<(), String> {
     if email.trim().is_empty() {
         return Err("Email address is required.".into());
     }
-    // Generate 6-digit OTP
-    use rand::Rng;
-    let code = format!("{:06}", rand::thread_rng().gen_range(100_000u32..=999_999u32));
+    crate::email::check_send_limit(email.trim())?;
+    let code = crate::email::gen_otp_code();
     crate::email::store_otp(&email, &code);
-    crate::email::send_otp_email(email.trim(), name.trim(), &code).await
+    let result = crate::email::send_otp_email(email.trim(), name.trim(), &code).await;
+    if result.is_ok() {
+        crate::email::record_send_attempt(email.trim());
+    }
+    result
 }
 
 /// Check a submitted OTP code.  Returns true on success and consumes the code.
 #[tauri::command]
 pub async fn verify_email_code(email: String, code: String) -> Result<bool, String> {
-    Ok(crate::email::verify_otp(email.trim(), code.trim()))
+    let ok = crate::email::verify_otp(email.trim(), code.trim());
+    if ok { crate::email::reset_send_attempts(email.trim()); }
+    Ok(ok)
 }
 
 /// Persist the user's name and email in the active wallet's ledger.
