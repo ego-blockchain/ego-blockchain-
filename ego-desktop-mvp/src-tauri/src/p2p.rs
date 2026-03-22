@@ -179,6 +179,11 @@ pub enum P2PMessage {
     },
     ChatMessage {
         bundle: String,
+        /// Per-contact monotonically-increasing sequence number.
+        /// Allows receiver to detect gaps and order messages from multiple paths.
+        /// Old clients send seq = 0 (field absent in JSON, defaults to 0).
+        #[serde(default)]
+        seq: u64,
     },
     TxBroadcast {
         tx:    LedgerTx,
@@ -1153,6 +1158,23 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                             }
                         }
                     }
+
+                    // ── Phase 2: relay federation ─────────────────────────────
+                    // Try community relays discovered via DataManifest gossipsub.
+                    // When a peer broadcasts DataManifest { is_relay: true, endpoint },
+                    // their endpoint is stored in PEER_RELAY_NODES. We dial it here
+                    // and add it to relay_addrs so ConnectionEstablished registers a circuit.
+                    for endpoint in get_discovered_relay_nodes() {
+                        if let Ok(addr) = endpoint.parse::<Multiaddr>() {
+                            if let Some(relay_pid) = peer_id_from_multiaddr(&addr) {
+                                if !relay_addrs.contains_key(&relay_pid) {
+                                    relay_addrs.insert(relay_pid, strip_p2p_suffix(&addr));
+                                    let _ = swarm.dial(addr);
+                                    eprintln!("[P2P] Phase 2: dialing community relay {}", endpoint);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1870,15 +1892,19 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                 return;
             }
             let contact = Contact {
-                address:        from_addr.clone(),
-                name:           from_name.clone(),
-                ed25519_pubkey: from_ed25519,
-                kyber_pubkey:   from_kyber,
-                shared_key_hex: from_shared_key,
-                status:         "pending_in".to_string(),
-                added_at:       Utc::now().timestamp(),
-                endpoint:       from_endpoint,
-                all_endpoints:  Vec::new(),
+                address:            from_addr.clone(),
+                name:               from_name.clone(),
+                ed25519_pubkey:     from_ed25519,
+                kyber_pubkey:       from_kyber,
+                shared_key_hex:     from_shared_key,
+                status:             "pending_in".to_string(),
+                added_at:           Utc::now().timestamp(),
+                endpoint:           from_endpoint,
+                all_endpoints:      Vec::new(),
+                ratchet_send_chain: String::new(),
+                ratchet_recv_chain: String::new(),
+                ratchet_send_count: 0,
+                ratchet_recv_count: 0,
             };
             contacts.push(contact.clone());
             let _ = save_contacts(&contacts);
@@ -2042,8 +2068,8 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
             // here — PeerAnnounce fires every 60 s per peer, so doing it here was
             // triggering a merge on every tick and inflating the block count.
         }
-P2PMessage::ChatMessage { bundle } => {
-    match crate::commands::messenger::receive_message_inner(&bundle) {
+P2PMessage::ChatMessage { bundle, seq } => {
+    match crate::commands::messenger::receive_message_inner(&bundle, seq) {
         Ok((msg, is_new)) => {
             if !is_new {
                 // Duplicate delivery (DHT re-poll or multi-path) — skip notification
