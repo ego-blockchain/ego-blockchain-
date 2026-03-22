@@ -2031,17 +2031,17 @@ async fn handle_event(
             // Force identify exchange so remote learns our protocols immediately.
             swarm.behaviour_mut().identify.push(std::iter::once(peer_id));
 
-            // If the relay is already reserved, flush any pending sends to this
-            // peer immediately. ReservationReqAccepted fires only once at startup
-            // so messages queued after that would otherwise be lost.
-            if RELAY_CIRCUIT_READY.load(Ordering::Relaxed) {
-                if let Some(pending) = pending_sends.remove(&peer_id) {
-                    eprintln!("[P2P] Flushing {} queued message(s) to {} on connect", pending.len(), peer_id);
-                    for (msg, reply) in pending {
-                        let req_id = swarm.behaviour_mut()
-                            .request_response.send_request(&peer_id, msg);
-                        in_flight.insert(req_id, reply);
-                    }
+            // Flush pending sends to this peer as soon as any connection is
+            // established — relay circuit OR direct.  The old guard
+            // (RELAY_CIRCUIT_READY) caused messages to a directly-connected
+            // peer to sit in pending_sends until the relay circuit was ready,
+            // which could be never if the relay was temporarily down.
+            if let Some(pending) = pending_sends.remove(&peer_id) {
+                eprintln!("[P2P] Flushing {} queued message(s) to {} on connect", pending.len(), peer_id);
+                for (msg, reply) in pending {
+                    let req_id = swarm.behaviour_mut()
+                        .request_response.send_request(&peer_id, msg);
+                    in_flight.insert(req_id, reply);
                 }
             }
         }
