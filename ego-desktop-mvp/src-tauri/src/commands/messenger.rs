@@ -504,7 +504,8 @@ pub async fn import_contact(
     };
     if let Err(e) = p2p::send_message(&endpoint, &request).await {
         eprintln!("[Messenger] ContactRequest delivery deferred for {}: {}", addr, e);
-        deposit_in_relay_inbox(&addr, &my_addr, &request).await;
+        // Deposit in SOVRAN's inbox (addr = recipient), not our own.
+        deposit_in_relay_inbox(&my_addr, &addr, &request).await;
     }
 
     Ok(contact)
@@ -582,7 +583,8 @@ pub async fn approve_contact_request(
 
     // Always deposit to relay mailbox so the requester receives the approval
     // even if they were offline or direct delivery was unreliable.
-    deposit_in_relay_inbox(&contact_addr, &my_addr, &response).await;
+    // Deposit in CONTACT's inbox (contact_addr = recipient), not our own.
+    deposit_in_relay_inbox(&my_addr, &contact_addr, &response).await;
 
     Ok(contact)
 }
