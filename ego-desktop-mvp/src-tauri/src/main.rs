@@ -27,10 +27,11 @@ use tauri::{Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenu
 use tauri::{CustomMenuItem, Menu, MenuItem, Submenu};
 
 fn acquire_single_instance_lock() -> Option<std::net::TcpListener> {
-    match std::net::TcpListener::bind("127.0.0.1:47391") {
+    let port: u16 = std::env::var("EGO_LOCK_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(47391);
+    match std::net::TcpListener::bind(format!("127.0.0.1:{}", port)) {
         Ok(l) => Some(l),
         Err(_) => {
-            eprintln!("[Ego Desktop] Another instance may already be running.");
+            eprintln!("[Ego Desktop] Another instance may already be running on port {}.", port);
             None
         }
     }

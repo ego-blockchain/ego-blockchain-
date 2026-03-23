@@ -76,7 +76,8 @@ pub async fn start_rpc_server() {
         .route("/health", get(health))
         .with_state(subs);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 47395));
+    let rpc_port: u16 = std::env::var("EGO_RPC_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(47395);
+    let addr = SocketAddr::from(([0, 0, 0, 0], rpc_port));
     eprintln!("[RPC] JSON-RPC server listening on http://{}", addr);
 
     axum::Server::bind(&addr)
