@@ -41,6 +41,12 @@ pub enum DhtCommand {
     DialPeer { addr: String },
 }
 
+pub fn p2p_port() -> u16 {
+    std::env::var("EGO_P2P_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(47393)
+}
 pub const P2P_PORT: u16 = 47393;
 
 /// Bootstrap / relay nodes. The first entry is the official Ego seed node.
@@ -943,7 +949,7 @@ pub fn get_local_ip() -> String {
 }
 
 pub fn get_local_endpoint() -> String {
-    format!("/ip4/{}/tcp/{}", get_local_ip(), P2P_PORT)
+    format!("/ip4/{}/tcp/{}", get_local_ip(), p2p_port())
 }
 
 // No-ops kept for API compatibility
@@ -1081,7 +1087,7 @@ pub async fn broadcast_peer_announce(app: &tauri::AppHandle) {
     if let Ok(ifaces) = local_ip_address::list_afinet_netifas() {
         for (_name, ip) in ifaces {
             if ip.is_ipv4() && !ip.is_loopback() {
-                let ep = format!("/ip4/{}/tcp/{}/p2p/{}", ip, P2P_PORT, local_peer_id);
+                let ep = format!("/ip4/{}/tcp/{}/p2p/{}", ip, p2p_port(), local_peer_id);
                 if !all_endpoints.contains(&ep) {
                     all_endpoints.push(ep);
                 }
@@ -1408,10 +1414,10 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
         Err(e) => { eprintln!("[P2P] Failed to build swarm: {}", e); return; }
     };
 
-    if let Err(e) = swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", P2P_PORT).parse().unwrap()) {
+    if let Err(e) = swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", p2p_port()).parse().unwrap()) {
         eprintln!("[P2P] TCP listen: {}", e);
     }
-    if let Err(e) = swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", P2P_PORT).parse().unwrap()) {
+    if let Err(e) = swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", p2p_port()).parse().unwrap()) {
         eprintln!("[P2P] QUIC listen: {}", e);
     }
 
@@ -1871,7 +1877,7 @@ fn best_endpoint(external_addrs: &[Multiaddr], peer_id: &PeerId) -> String {
     let base = external_addrs.iter().find(|a| is_public(a))
         .or_else(|| external_addrs.first())
         .map(|a| a.to_string())
-        .unwrap_or_else(|| format!("/ip4/{}/tcp/{}", get_local_ip(), P2P_PORT));
+        .unwrap_or_else(|| format!("/ip4/{}/tcp/{}", get_local_ip(), p2p_port()));
     if base.contains("/p2p/") { base } else { format!("{}/p2p/{}", base, pid_str) }
 }
 
@@ -4510,8 +4516,8 @@ fn ensure_firewall_rule() {
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
     for (name, proto, port) in [
-        (format!("Ego Desktop P2P TCP {}", P2P_PORT), "TCP", P2P_PORT),
-        (format!("Ego Desktop P2P UDP {}", P2P_PORT), "UDP", P2P_PORT),
+        (format!("Ego Desktop P2P TCP {}", p2p_port()), "TCP", p2p_port()),
+        (format!("Ego Desktop P2P UDP {}", p2p_port()), "UDP", p2p_port()),
     ] {
         let check = std::process::Command::new("netsh")
             .args(["advfirewall", "firewall", "show", "rule", &format!("name={}", name)])

@@ -5,10 +5,15 @@ use std::path::PathBuf;
 // ── Directory helpers ─────────────────────────────────────────────────────────
 
 /// Top-level EgoDesktop directory (not wallet-specific).
+/// Override with `EGO_DATA_DIR` env var for multi-instance testing.
 pub fn base_data_dir() -> PathBuf {
-    let dir = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("EgoDesktop");
+    let dir = if let Ok(v) = std::env::var("EGO_DATA_DIR") {
+        PathBuf::from(v)
+    } else {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("EgoDesktop")
+    };
     let _ = fs::create_dir_all(&dir);
     dir
 }
