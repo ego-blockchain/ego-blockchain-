@@ -433,17 +433,20 @@ pub async fn import_contact(
     let my_ed25519_hex = hex::encode(keypair.ed25519_public_key().as_bytes());
     let my_kyber_hex   = hex::encode(keypair.kyber_public_key().as_bytes());
 
-    let mut contacts = load_contacts();
-    if let Some(existing) = contacts.iter().find(|c| c.address == addr) {
-        if existing.status == "pending_out" {
-            return Err(EgoDesktopError::InvalidInput(
-                "A contact request to this address is already pending.".into(),
-            ));
-        }
-        if existing.status == "approved" {
-            return Err(EgoDesktopError::InvalidInput(
-                "This contact is already in your list.".into(),
-            ));
+    // Duplicate check (pre-lock, fast path)
+    {
+        let contacts = load_contacts();
+        if let Some(existing) = contacts.iter().find(|c| c.address == addr) {
+            if existing.status == "pending_out" {
+                return Err(EgoDesktopError::InvalidInput(
+                    "A contact request to this address is already pending.".into(),
+                ));
+            }
+            if existing.status == "approved" {
+                return Err(EgoDesktopError::InvalidInput(
+                    "This contact is already in your list.".into(),
+                ));
+            }
         }
     }
 
@@ -451,7 +454,7 @@ pub async fn import_contact(
     OsRng.fill_bytes(&mut key_bytes);
     let shared_key_hex = hex::encode(key_bytes);
 
-    // Use relay circuit if already confirmed, otherwise short wait only.
+    // Await outside the lock — no I/O while holding CONTACTS_LOCK.
     let current     = p2p::get_public_endpoint().await;
     let my_endpoint = if current.contains("/p2p-circuit") {
         current
@@ -460,24 +463,36 @@ pub async fn import_contact(
     };
 
     // Save the contact FIRST — so it persists even if P2P delivery fails.
-    // The peer will receive the request once they are reachable.
-    let contact = Contact {
-        address:            addr.clone(),
-        name,
-        ed25519_pubkey:     ed25519,
-        kyber_pubkey:       kyber,
-        shared_key_hex:     shared_key_hex.clone(),
-        status:             "pending_out".to_string(),
-        added_at:           chrono::Utc::now().timestamp(),
-        endpoint:           endpoint.clone(),
-        all_endpoints:      Vec::new(),
-        ratchet_send_chain: String::new(),
-        ratchet_recv_chain: String::new(),
-        ratchet_send_count: 0,
-        ratchet_recv_count: 0,
+    // Re-check for duplicates inside the lock to close the TOCTOU window.
+    let contact = {
+        let _cg = CONTACTS_LOCK.lock().unwrap();
+        let mut contacts = load_contacts();
+        if let Some(existing) = contacts.iter().find(|c| c.address == addr) {
+            if existing.status == "pending_out" || existing.status == "approved" {
+                return Err(EgoDesktopError::InvalidInput(
+                    "This contact is already in your list.".into(),
+                ));
+            }
+        }
+        let contact = Contact {
+            address:            addr.clone(),
+            name,
+            ed25519_pubkey:     ed25519,
+            kyber_pubkey:       kyber,
+            shared_key_hex:     shared_key_hex.clone(),
+            status:             "pending_out".to_string(),
+            added_at:           chrono::Utc::now().timestamp(),
+            endpoint:           endpoint.clone(),
+            all_endpoints:      Vec::new(),
+            ratchet_send_chain: String::new(),
+            ratchet_recv_chain: String::new(),
+            ratchet_send_count: 0,
+            ratchet_recv_count: 0,
+        };
+        contacts.push(contact.clone());
+        save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
+        contact
     };
-    contacts.push(contact.clone());
-    save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
 
     let request = p2p::P2PMessage::ContactRequest {
         from_addr:       my_addr.clone(),
@@ -512,15 +527,18 @@ pub async fn approve_contact_request(
     let ed25519_hex = hex::encode(keypair.ed25519_public_key().as_bytes());
     let kyber_hex   = hex::encode(keypair.kyber_public_key().as_bytes());
 
-    let mut contacts = load_contacts();
-    let pos = contacts.iter().position(|c| c.address == contact_addr && c.status == "pending_in")
-        .ok_or_else(|| EgoDesktopError::NotFound("No pending request from this address".into()))?;
-
-    let shared_key_hex = contacts[pos].shared_key_hex.clone();
-    let peer_endpoint  = contacts[pos].endpoint.clone();
-    contacts[pos].status = "approved".to_string();
-    let contact = contacts[pos].clone();
-    save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
+    let (shared_key_hex, peer_endpoint, contact) = {
+        let _cg = CONTACTS_LOCK.lock().unwrap();
+        let mut contacts = load_contacts();
+        let pos = contacts.iter().position(|c| c.address == contact_addr && c.status == "pending_in")
+            .ok_or_else(|| EgoDesktopError::NotFound("No pending request from this address".into()))?;
+        let shared_key_hex = contacts[pos].shared_key_hex.clone();
+        let peer_endpoint  = contacts[pos].endpoint.clone();
+        contacts[pos].status = "approved".to_string();
+        let contact = contacts[pos].clone();
+        save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
+        (shared_key_hex, peer_endpoint, contact)
+    };
 
     let my_endpoint = p2p::get_public_endpoint().await;
     let response = p2p::P2PMessage::ContactResponse {
@@ -584,14 +602,17 @@ pub async fn decline_contact_request(
     let ed25519_hex = hex::encode(keypair.ed25519_public_key().as_bytes());
     let kyber_hex   = hex::encode(keypair.kyber_public_key().as_bytes());
 
-    let mut contacts = load_contacts();
-    let pos = contacts.iter().position(|c| c.address == contact_addr && c.status == "pending_in")
-        .ok_or_else(|| EgoDesktopError::NotFound("No pending request from this address".into()))?;
-
-    let shared_key_hex = contacts[pos].shared_key_hex.clone();
-    let peer_endpoint  = contacts[pos].endpoint.clone();
-    contacts.remove(pos);
-    save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
+    let (shared_key_hex, peer_endpoint) = {
+        let _cg = CONTACTS_LOCK.lock().unwrap();
+        let mut contacts = load_contacts();
+        let pos = contacts.iter().position(|c| c.address == contact_addr && c.status == "pending_in")
+            .ok_or_else(|| EgoDesktopError::NotFound("No pending request from this address".into()))?;
+        let shared_key_hex = contacts[pos].shared_key_hex.clone();
+        let peer_endpoint  = contacts[pos].endpoint.clone();
+        contacts.remove(pos);
+        save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
+        (shared_key_hex, peer_endpoint)
+    };
 
     if !peer_endpoint.is_empty() {
         let response = p2p::P2PMessage::ContactResponse {
@@ -860,9 +881,12 @@ pub async fn delete_contact(
     _state: State<'_, AppState>,
     contact_addr: String,
 ) -> Result<(), EgoDesktopError> {
-    let mut contacts = load_contacts();
-    contacts.retain(|c| c.address != contact_addr);
-    save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
+    {
+        let _cg = CONTACTS_LOCK.lock().unwrap();
+        let mut contacts = load_contacts();
+        contacts.retain(|c| c.address != contact_addr);
+        save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
+    }
     Ok(())
 }
 
@@ -875,6 +899,7 @@ pub async fn rename_contact(
     if new_name.is_empty() {
         return Err(EgoDesktopError::InvalidInput("Name cannot be empty".into()));
     }
+    let _cg = CONTACTS_LOCK.lock().unwrap();
     let mut contacts = load_contacts();
     let contact = contacts.iter_mut().find(|c| c.address == contact_addr)
         .ok_or_else(|| EgoDesktopError::NotFound("Contact not found".into()))?;
