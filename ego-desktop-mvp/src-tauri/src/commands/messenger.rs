@@ -7,10 +7,17 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use once_cell::sync::Lazy;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
+
+/// Serialises all contacts read-modify-write operations to prevent ratchet
+/// chain corruption when PeerAnnounce events race with receive_message_inner.
+/// Must NOT be held across `.await` points.
+pub(crate) static CONTACTS_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 // ── Storage paths ─────────────────────────────────────────────────────────────
 
@@ -246,12 +253,16 @@ async fn resolve_endpoint(contact_addr: &str, stored_endpoint: &str) -> String {
                     "[Messenger] Cache: fresher endpoint for {}: {}",
                     contact_addr, entry.endpoint
                 );
-                let mut contacts = load_contacts();
-                if let Some(c) = contacts.iter_mut().find(|c| c.address == contact_addr) {
-                    c.endpoint = entry.endpoint.clone();
-                    let _ = save_contacts(&contacts);
+                let fresh = entry.endpoint.clone();
+                {
+                    let _cg = CONTACTS_LOCK.lock().unwrap();
+                    let mut contacts = load_contacts();
+                    if let Some(c) = contacts.iter_mut().find(|c| c.address == contact_addr) {
+                        c.endpoint = fresh.clone();
+                        let _ = save_contacts(&contacts);
+                    }
                 }
-                return entry.endpoint.clone();
+                return fresh;
             }
         }
     }
@@ -285,6 +296,9 @@ pub(crate) fn receive_message_inner(bundle: &str, seq: u64) -> Result<(Message, 
     let my_addr = crate::ledger::Ledger::load().address;
 
     // ── Phase 4: try ratchet decrypt first, then fall back to static key ──────
+    // Hold CONTACTS_LOCK for the entire load→decrypt→save region to prevent
+    // PeerAnnounce handlers from overwriting ratchet chain state concurrently.
+    let _cg = CONTACTS_LOCK.lock().unwrap();
     let mut contacts = load_contacts();
     let contact_pos = contacts.iter().position(|c| c.address == from)
         .ok_or_else(|| "Sender not found in contacts".to_string())?;
@@ -617,6 +631,9 @@ pub async fn send_message(
     let my_addr  = ledger.address.clone();
 
     // ── Phase 4: ratchet — load contacts mutably to advance the send chain ────
+    // Hold CONTACTS_LOCK so ratchet send-chain advance doesn't race with
+    // concurrent PeerAnnounce or receive_message_inner saves.
+    let _cg = CONTACTS_LOCK.lock().unwrap();
     let mut contacts = load_contacts();
     let contact_pos = contacts.iter().position(|c| c.address == contact_addr && c.status == "approved")
         .ok_or_else(|| EgoDesktopError::NotFound("Contact not found or not approved".into()))?;
@@ -647,8 +664,10 @@ pub async fn send_message(
     let stored_endpoint = contacts[contact_pos].endpoint.clone();
     let all_endpoints   = contacts[contact_pos].all_endpoints.clone();
 
-    // Persist the advanced ratchet chain state immediately
+    // Persist the advanced ratchet chain state immediately, then release lock
+    // so delivery (spawn below) doesn't hold CONTACTS_LOCK while doing I/O.
     save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
+    drop(_cg);
 
     // Capture before content/message_type are moved into Message
     let is_file_bundle  = message_type == "file_bundle";
@@ -738,14 +757,18 @@ pub async fn send_message(
         // when the peer next announces online (PeerAnnounce or 30s poll).
         let p2p_msg = p2p::P2PMessage::ChatMessage { bundle, seq: send_seq };
         if stored_endpoint.is_empty() {
-            eprintln!("[Messenger] No endpoint for {} — queued in local outbox", contact_addr_key);
+            eprintln!("[Messenger] No endpoint for {} — queued in outbox + DHT inbox", contact_addr_key);
             crate::commands::outbox::enqueue(&contact_addr_key, "", &p2p_msg);
+            deposit_in_relay_inbox(&my_addr, &contact_addr_key, &p2p_msg).await;
             return;
         }
         let endpoint = resolve_endpoint(&contact_addr_key, &stored_endpoint).await;
         if let Err(e) = p2p::send_message(&endpoint, &p2p_msg).await {
-            eprintln!("[Messenger] direct delivery to {} failed: {} — queuing outbox", contact_addr_key, e);
+            eprintln!("[Messenger] direct delivery to {} failed: {} — queuing outbox + DHT inbox", contact_addr_key, e);
             crate::commands::outbox::enqueue(&contact_addr_key, &endpoint, &p2p_msg);
+            // DHT inbox ensures delivery even when the stored endpoint is stale
+            // and PeerAnnounce hasn't propagated the peer's new relay circuit yet.
+            deposit_in_relay_inbox(&my_addr, &contact_addr_key, &p2p_msg).await;
         }
 
         // ── Also try direct ManifestData/FileData delivery as a fast-path ────

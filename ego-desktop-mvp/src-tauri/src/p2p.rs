@@ -2532,6 +2532,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
         P2PMessage::ContactRequest {
             from_addr, from_name, from_ed25519, from_kyber, from_shared_key, from_endpoint,
         } => {
+            let _cg = crate::commands::messenger::CONTACTS_LOCK.lock().unwrap();
             let mut contacts = load_contacts();
             if let Some(existing) = contacts.iter_mut().find(|c| c.address == from_addr) {
                 if !from_endpoint.is_empty() && existing.endpoint != from_endpoint {
@@ -2658,6 +2659,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
         P2PMessage::ContactResponse {
             from_addr, from_name, from_ed25519, from_kyber, approved, shared_key, from_endpoint,
         } => {
+            let _cg = crate::commands::messenger::CONTACTS_LOCK.lock().unwrap();
             let mut contacts = load_contacts();
             if approved {
                 if let Some(p) = contacts.iter_mut()
@@ -2704,6 +2706,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
             if coverage_score > 0 { crate::poc::record_peer_score(&address, coverage_score); }
             if !ed25519_pubkey.is_empty() { record_peer_ed25519(&address, &ed25519_pubkey); }
             if !endpoint.is_empty() {
+                let _cg = crate::commands::messenger::CONTACTS_LOCK.lock().unwrap();
                 let mut contacts = load_contacts();
                 if let Some(c) = contacts.iter_mut().find(|c| c.address == address) {
                     let relay_in   = endpoint.contains("/p2p-circuit");
@@ -3601,7 +3604,19 @@ async fn apply_incoming_tx(tx: LedgerTx, block: LedgerBlock, app: &tauri::AppHan
         return;
     }
 
-    crate::chain_db::append_peer_block(&block, &[tx]);
+    // Idempotency: skip if this TX is already in our chain.
+    if crate::chain_db::get_tx_by_hash(&tx.hash).is_some() {
+        return;
+    }
+
+    // Height-collision guard: if our chain already has a block at this height
+    // (independently mined), absorb the incoming TX at our current tip instead
+    // of silently dropping it.
+    if crate::chain_db::get_block_by_height(block.height).is_some() {
+        crate::chain_db::mine_batch_db(&[tx], &block.miner);
+    } else {
+        crate::chain_db::append_peer_block(&block, &[tx]);
+    }
     let _ = app.emit_all("ego://chain-updated", ());
 }
 

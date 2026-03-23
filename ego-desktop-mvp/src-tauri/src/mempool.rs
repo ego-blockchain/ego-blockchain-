@@ -212,9 +212,18 @@ pub async fn run_batch_loop() {
         // BFT pipeline: finalize blocks 2 slots behind the tip
         crate::chain_db::pipeline_commit(block.height);
 
-        // Broadcast batch to P2P peers (fire-and-forget)
+        // Broadcast batch to P2P peers (fire-and-forget).
+        // Stamp "Confirmed" + block_height so receivers' write_block_batch
+        // doesn't filter them out (it skips status="Pending").
+        let height = block.height;
+        let confirmed: Vec<crate::ledger::LedgerTx> = txs.iter().map(|tx| {
+            let mut t = tx.clone();
+            t.status       = "Confirmed".to_string();
+            t.block_height = Some(height);
+            t
+        }).collect();
         tokio::spawn(async move {
-            for tx in &txs {
+            for tx in &confirmed {
                 crate::p2p::broadcast_tx(tx.clone(), block.clone()).await;
             }
         });
