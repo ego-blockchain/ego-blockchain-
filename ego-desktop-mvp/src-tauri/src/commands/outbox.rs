@@ -128,7 +128,16 @@ pub async fn flush_pending() {
         .collect();
 
     for addr in addrs {
-        flush_for(&addr, None).await;
+        // Look up the peer's latest known endpoint from the peer cache so that
+        // outbox retries succeed even after the stored contact endpoint goes stale
+        // (e.g. after a relay circuit renewal or reconnect).
+        let fresh_ep = {
+            let cache = crate::p2p::load_peer_cache();
+            cache.into_iter()
+                .find(|p| p.address == addr && !p.endpoint.is_empty())
+                .map(|p| p.endpoint)
+        };
+        flush_for(&addr, fresh_ep.as_deref()).await;
     }
 }
 
