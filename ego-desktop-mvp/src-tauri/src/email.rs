@@ -11,24 +11,9 @@ static LOGO_B64: Lazy<String> = Lazy::new(|| {
     STANDARD.encode(include_bytes!("../icons/ego_square.png"))
 });
 
-fn xd(data: &[u8]) -> String {
-    let k = b"EgoNet";
-    String::from_utf8(
-        data.iter().enumerate().map(|(i, &b)| b ^ k[i % k.len()]).collect(),
-    ).unwrap_or_default()
-}
-
-const SH: &[u8] = &[
-    0x28,0x06,0x06,0x22,0x4B,0x11,0x22,0x08,0x0D,0x22,0x0A,0x17,
-    0x2E,0x04,0x07,0x2F,0x0C,0x1A,0x6B,0x04,0x00,0x23,
-];
-
-const SU: &[u8] = &[
-    0x2B,0x08,0x1D,0x2B,0x15,0x18,0x3C,0x27,0x0A,0x29,0x0A,0x16,
-    0x29,0x08,0x0C,0x25,0x06,0x1C,0x24,0x0E,0x01,0x60,0x06,0x1B,0x28,
-];
-
-const SP: &[u8] = &[0x04,0x15,0x1B,0x27,0x11,0x45,0x7D,0x4C];
+const SH: &str = option_env!("EGO_SMTP_HOST").unwrap_or("");
+const SU: &str = option_env!("EGO_SMTP_USER").unwrap_or("");
+const SP: &str = option_env!("EGO_SMTP_PASS").unwrap_or("");
 
 const MAX_SEND_ATTEMPTS: u32 = 3;
 const ATTEMPT_WINDOW_SECS: i64 = 3600;
@@ -161,9 +146,9 @@ fn html_template(title: &str, body_html: &str) -> String {
 }
 
 async fn send_smtp(to: &str, subject: &str, html: &str) -> Result<(), String> {
-    let host = xd(SH);
-    let user = xd(SU);
-    let pass = xd(SP);
+    let host = SH.to_string();
+    let user = SU.to_string();
+    let pass = SP.to_string();
 
     let from_addr = format!("Ego Blockchain <{}>", user)
         .parse::<lettre::message::Mailbox>()
