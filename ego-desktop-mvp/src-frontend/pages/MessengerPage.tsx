@@ -110,20 +110,83 @@ function normalizeLang(lang: string): string {
   return map[lang.toLowerCase()] ?? lang;
 }
 
+function parseInline(text: string): React.ReactNode[] {
+  const parts: React.ReactNode[] = [];
+  const regex = /(\*\*[^*]+\*\*|`[^`]+`)/g;
+  let last = 0; let key = 0; let match: RegExpExecArray | null;
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > last) parts.push(text.slice(last, match.index));
+    const tok = match[0];
+    if (tok.startsWith('**'))
+      parts.push(<strong key={key++} className="font-semibold text-white">{tok.slice(2, -2)}</strong>);
+    else
+      parts.push(<code key={key++} className="bg-white/10 text-blue-200 rounded px-1 py-0.5 text-xs font-mono">{tok.slice(1, -1)}</code>);
+    last = match.index + tok.length;
+  }
+  if (last < text.length) parts.push(text.slice(last));
+  return parts;
+}
+
 function AiMessageContent({ content }: { content: string }) {
   const [copied, setCopied] = useState<number | null>(null);
 
   const segments = content.split('```');
 
+  function renderText(text: string, segIdx: number): React.ReactNode {
+    const lines = text.split('\n');
+    const nodes: React.ReactNode[] = [];
+    const listItems: React.ReactNode[] = [];
+    let listType: 'ul' | 'ol' | null = null;
+    let listKey = 0;
+
+    function flushList() {
+      if (!listItems.length) return;
+      nodes.push(listType === 'ul'
+        ? <ul key={`ul-${listKey++}`} className="space-y-0.5 pl-4 list-disc">{[...listItems]}</ul>
+        : <ol key={`ol-${listKey++}`} className="space-y-0.5 pl-4 list-decimal">{[...listItems]}</ol>
+      );
+      listItems.length = 0; listType = null;
+    }
+
+    lines.forEach((line, li) => {
+      const hMatch = line.match(/^(#{1,3})\s+(.+)/);
+      if (hMatch) {
+        flushList();
+        nodes.push(
+          <div key={`h-${li}`} className="bg-white/10 rounded-lg px-3 py-1.5 my-1">
+            <span className="font-semibold text-white text-sm">{parseInline(hMatch[2])}</span>
+          </div>
+        );
+        return;
+      }
+      const ulMatch = line.match(/^[-*]\s+(.+)/);
+      if (ulMatch) {
+        if (listType !== 'ul') { flushList(); listType = 'ul'; }
+        listItems.push(<li key={li} className="text-sm text-gray-200">{parseInline(ulMatch[1])}</li>);
+        return;
+      }
+      const olMatch = line.match(/^\d+\.\s+(.+)/);
+      if (olMatch) {
+        if (listType !== 'ol') { flushList(); listType = 'ol'; }
+        listItems.push(<li key={li} className="text-sm text-gray-200">{parseInline(olMatch[1])}</li>);
+        return;
+      }
+      if (line.trim() === '') { flushList(); return; }
+      flushList();
+      nodes.push(
+        <p key={`p-${li}`} className="text-sm leading-relaxed text-gray-100 break-words">
+          {parseInline(line)}
+        </p>
+      );
+    });
+    flushList();
+    return <div key={`seg-${segIdx}`} className="space-y-1.5">{nodes}</div>;
+  }
+
   return (
     <div className="text-sm space-y-2">
       {segments.map((seg, i) => {
-        if (i % 2 === 0) {
-
-          return seg ? (
-            <p key={i} className="whitespace-pre-wrap break-words leading-relaxed">{seg}</p>
-          ) : null;
-        }
+        if (i % 2 === 0) return seg.trim() ? renderText(seg, i) : null;
 
         const newline = seg.indexOf('\n');
         const lang = newline > -1 ? seg.slice(0, newline).trim() : '';
@@ -135,7 +198,6 @@ function AiMessageContent({ content }: { content: string }) {
         };
         return (
           <div key={i} className="rounded-xl overflow-hidden border border-white/10 my-1">
-            {}
             <div className="flex items-center justify-between bg-[#1e1e1e] px-3 py-1.5 border-b border-white/5">
               <span className="text-xs text-gray-400 font-mono">{lang || 'code'}</span>
               <button
