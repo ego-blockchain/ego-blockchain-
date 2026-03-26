@@ -1,6 +1,6 @@
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
-use crate::ledger::{load_chain, save_chain, tx_signing_bytes, Ledger, LedgerTx};
+use crate::ledger::{load_chain, tx_signing_bytes, Ledger, LedgerTx};
 use crate::tokenomics::{STAKING_APR_BPS, staking_pool_remaining_uegoc};
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -27,11 +27,10 @@ pub async fn get_staking_info() -> Result<StakingInfo, EgoDesktopError> {
     let is_locked = ledger.staked_amount > 0
         && ledger.unstake_at.map(|u| u > now).unwrap_or(false);
 
-    // APR interest accrued so far since stake started (from the staking pool).
     let staked_since_secs = ledger.staked_at
         .map(|t| (now - t).max(0) as u64)
         .unwrap_or(0);
-    // interest = principal × APR_BPS / 10000 × elapsed_secs / 31_536_000
+
     let pending_rewards = if ledger.staked_amount > 0 && staked_since_secs > 0 {
         let chain = load_chain();
         let pool_left = staking_pool_remaining_uegoc(&chain);
@@ -47,7 +46,6 @@ pub async fn get_staking_info() -> Result<StakingInfo, EgoDesktopError> {
         0
     };
 
-    // Full projected interest over the entire lock period.
     let projected_interest = if ledger.staked_amount > 0 && ledger.stake_lock_days > 0 {
         (ledger.staked_amount as u128
             * STAKING_APR_BPS as u128
@@ -61,7 +59,7 @@ pub async fn get_staking_info() -> Result<StakingInfo, EgoDesktopError> {
     Ok(StakingInfo {
         staked_amount:     ledger.staked_amount,
         lock_period_days:  ledger.stake_lock_days,
-        apr:               STAKING_APR_BPS as f64 / 100.0, // 1250 bps → 12.5%
+        apr:               STAKING_APR_BPS as f64 / 100.0,
         pending_rewards,
         unlock_date:       ledger.unstake_at,
         staked_at:         ledger.staked_at,
@@ -95,8 +93,8 @@ pub async fn stake_coins(
         ));
     }
 
-    let mut chain   = load_chain();
-    let balance     = chain.balance_of(&from);
+    let chain   = load_chain();
+    let balance = chain.balance_of(&from);
     if amount_uegoc > balance {
         return Err(EgoDesktopError::InvalidInput(format!(
             "Insufficient balance: have {} uEGOC, need {}",
@@ -114,7 +112,7 @@ pub async fn stake_coins(
     };
     let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
 
-    chain.transactions.push(LedgerTx {
+    crate::mempool::get_mempool().push(LedgerTx {
         hash:               tx_hash.clone(),
         from:               from.clone(),
         to:                 STAKING_ADDR.to_string(),
@@ -128,15 +126,6 @@ pub async fn stake_coins(
         public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
         ..LedgerTx::default()
     });
-    chain.mine_block(&tx_hash, &from);
-    save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save chain: {e}")))?;
-
-    if let (Some(tx_b), Some(blk_b)) = (
-        chain.transactions.iter().find(|t| t.hash == tx_hash).cloned(),
-        chain.blocks.last().cloned(),
-    ) {
-        tokio::spawn(async move { crate::p2p::broadcast_tx(tx_b, blk_b).await; });
-    }
 
     ledger.staked_amount    = amount_uegoc;
     ledger.staked_at        = Some(ts);
@@ -175,7 +164,6 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
     }
 
     let staked_amount = ledger.staked_amount;
-    let mut chain     = load_chain();
     let ts            = now;
 
     if is_locked && early {
@@ -193,7 +181,7 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
         let unstake_sig_hex    = hex::encode(kp.sign_ed25519(&unstake_sign_bytes).as_bytes());
         let unstake_hash       = format!("0x{}", ego_core::hash_data(&unstake_sign_bytes).to_hex());
 
-        chain.transactions.push(LedgerTx {
+        crate::mempool::get_mempool().push(LedgerTx {
             hash:               unstake_hash.clone(),
             from:               from.clone(),
             to:                 STAKING_ADDR.to_string(),
@@ -214,7 +202,7 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
         let fee_sig_hex    = hex::encode(kp.sign_ed25519(&fee_sign_bytes).as_bytes());
         let fee_hash       = format!("0x{}", ego_core::hash_data(&fee_sign_bytes).to_hex());
 
-        chain.transactions.push(LedgerTx {
+        crate::mempool::get_mempool().push(LedgerTx {
             hash:               fee_hash.clone(),
             from:               from.clone(),
             to:                 STAKING_ADDR.to_string(),
@@ -234,7 +222,7 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
         let ret_sign_bytes = tx_signing_bytes(STAKING_ADDR, &from, return_amount, ret_nonce, ts);
         let ret_hash       = format!("0x{}", ego_core::hash_data(&ret_sign_bytes).to_hex());
 
-        chain.transactions.push(LedgerTx {
+        crate::mempool::get_mempool().push(LedgerTx {
             hash:               ret_hash.clone(),
             from:               STAKING_ADDR.to_string(),
             to:                 from.clone(),
@@ -248,22 +236,6 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
             public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
             ..LedgerTx::default()
         });
-        chain.mine_block(&ret_hash, &from);
-        save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save chain: {e}")))?;
-
-        if let (Some(unstake_tx), Some(fee_tx), Some(ret_tx), Some(blk)) = (
-            chain.transactions.iter().find(|t| t.hash == unstake_hash).cloned(),
-            chain.transactions.iter().find(|t| t.hash == fee_hash).cloned(),
-            chain.transactions.iter().find(|t| t.hash == ret_hash).cloned(),
-            chain.blocks.last().cloned(),
-        ) {
-            let blk_b = blk.clone();
-            let blk_d = blk.clone();
-            let blk_f = blk;
-            tokio::spawn(async move { crate::p2p::broadcast_tx(unstake_tx, blk_b).await; });
-            tokio::spawn(async move { crate::p2p::broadcast_tx(fee_tx, blk_d).await; });
-            tokio::spawn(async move { crate::p2p::broadcast_tx(ret_tx, blk_f).await; });
-        }
 
         ledger.staked_amount   = 0;
         ledger.staked_at       = None;
@@ -285,7 +257,7 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
         let unstake_sig_hex    = hex::encode(kp.sign_ed25519(&unstake_sign_bytes).as_bytes());
         let unstake_hash       = format!("0x{}", ego_core::hash_data(&unstake_sign_bytes).to_hex());
 
-        chain.transactions.push(LedgerTx {
+        crate::mempool::get_mempool().push(LedgerTx {
             hash:               unstake_hash.clone(),
             from:               from.clone(),
             to:                 STAKING_ADDR.to_string(),
@@ -305,7 +277,7 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
         let ret_sign_bytes = tx_signing_bytes(STAKING_ADDR, &from, staked_amount, ret_nonce, ts);
         let ret_hash       = format!("0x{}", ego_core::hash_data(&ret_sign_bytes).to_hex());
 
-        chain.transactions.push(LedgerTx {
+        crate::mempool::get_mempool().push(LedgerTx {
             hash:               ret_hash.clone(),
             from:               STAKING_ADDR.to_string(),
             to:                 from.clone(),
@@ -319,20 +291,6 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
             public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
             ..LedgerTx::default()
         });
-        chain.mine_block(&ret_hash, &from);
-        save_chain(&chain).map_err(|e| EgoDesktopError::WalletError(format!("Save chain: {e}")))?;
-
-        if let (Some(unstake_tx), Some(ret_tx), Some(blk)) = (
-            chain.transactions.iter().find(|t| t.hash == unstake_hash).cloned(),
-            chain.transactions.iter().find(|t| t.hash == ret_hash).cloned(),
-            chain.blocks.last().cloned(),
-        ) {
-            let blk_b = blk.clone();
-            let blk_d = blk;
-            tokio::spawn(async move { crate::p2p::broadcast_tx(unstake_tx, blk_b).await; });
-            tokio::spawn(async move { crate::p2p::broadcast_tx(ret_tx, blk_d).await; });
-        }
-
         ledger.staked_amount   = 0;
         ledger.staked_at       = None;
         ledger.stake_lock_days = 0;

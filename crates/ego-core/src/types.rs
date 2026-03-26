@@ -1157,7 +1157,6 @@ impl fmt::Display for PeerId {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeId(pub PeerId);
 

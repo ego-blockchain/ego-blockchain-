@@ -1,28 +1,14 @@
-/**
- * SecureStore wrapper for the Ego Mobile Wallet.
- *
- * All sensitive data (seed, private keys) is stored via expo-secure-store
- * which uses the platform Keychain (iOS) / Android Keystore.
- *
- * Non-sensitive preferences are stored as JSON in SecureStore as well
- * for simplicity; large read-only data (transactions) could move to AsyncStorage.
- */
-
 import * as SecureStore from 'expo-secure-store';
-
-// ── Keys ───────────────────────────────────────────────────────────────────
 
 const KEY_WALLET   = 'ego_wallet_v1';
 const KEY_SETTINGS = 'ego_settings_v1';
 const KEY_TXS      = 'ego_txs_v1';
 
-// ── Types ──────────────────────────────────────────────────────────────────
-
 export interface StoredWallet {
   address:      string;
   publicKeyHex: string;
-  seedHex:      string;  // 32-byte seed stored as hex (protected by OS keychain)
-  createdAt:    number;  // unix timestamp
+  seedHex:      string;
+  createdAt:    number;
   network:      'testnet' | 'mainnet';
 }
 
@@ -30,7 +16,7 @@ export interface StoredSettings {
   rpcUrl:       string;
   network:      'testnet' | 'mainnet';
   pinEnabled:   boolean;
-  pinHash:      string;   // sha-256 hex of user's PIN (empty if no PIN)
+  pinHash:      string;
   biometrics:   boolean;
   currency:     'EGOC' | 'USD';
 }
@@ -39,13 +25,11 @@ export interface StoredTransaction {
   hash:      string;
   from:      string;
   to:        string;
-  value:     string;  // uEGOC decimal
+  value:     string;
   status:    'confirmed' | 'pending' | 'failed';
   timestamp: number;
   note?:     string;
 }
-
-// ── Wallet ─────────────────────────────────────────────────────────────────
 
 export async function saveWallet(wallet: StoredWallet): Promise<void> {
   await SecureStore.setItemAsync(KEY_WALLET, JSON.stringify(wallet));
@@ -61,8 +45,6 @@ export async function loadWallet(): Promise<StoredWallet | null> {
 export async function deleteWallet(): Promise<void> {
   await SecureStore.deleteItemAsync(KEY_WALLET);
 }
-
-// ── Settings ───────────────────────────────────────────────────────────────
 
 const DEFAULT_SETTINGS: StoredSettings = {
   rpcUrl:     'http://127.0.0.1:8545',
@@ -85,8 +67,6 @@ export async function saveSettings(settings: Partial<StoredSettings>): Promise<v
   await SecureStore.setItemAsync(KEY_SETTINGS, JSON.stringify({ ...current, ...settings }));
 }
 
-// ── Local transactions cache ───────────────────────────────────────────────
-
 export async function loadLocalTransactions(): Promise<StoredTransaction[]> {
   const raw = await SecureStore.getItemAsync(KEY_TXS);
   if (!raw) return [];
@@ -96,7 +76,7 @@ export async function loadLocalTransactions(): Promise<StoredTransaction[]> {
 
 export async function appendTransaction(tx: StoredTransaction): Promise<void> {
   const txs = await loadLocalTransactions();
-  // Keep latest 200
+
   const updated = [tx, ...txs].slice(0, 200);
   await SecureStore.setItemAsync(KEY_TXS, JSON.stringify(updated));
 }

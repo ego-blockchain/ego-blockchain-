@@ -1,17 +1,3 @@
-//! Fork choice rule for Ego's sharded BFT (HotStuff-style).
-//!
-//! Design
-//! ------
-//!   - Canonical chain  = chain ending at the block referenced by the highest *locked* QC.
-//!   - Safety rule      : vote for B only if B.round > locked_qc.round  OR
-//!                        B's prev_hash extends the locked_qc block.
-//!   - View change      : on timeout, broadcast ViewChangeMsg carrying the node's high_qc.
-//!                        New leader waits for 2f+1 ViewChangeMsgs, picks the highest QC,
-//!                        and proposes a block that extends it.
-//!   - Fork resolution  : if two blocks exist at the same height (network partition edge case),
-//!                        prefer the one with a QC; if both have QCs (equivocation), prefer
-//!                        the one with more votes then lex-smaller block hash.
-
 use crate::consensus::bft::{BlockHeader, QuorumCertificate};
 use crate::error::{PoCError, PoCResult};
 use ego_core::{Address, Hash, KeyPair, Signature, Timestamp};
@@ -19,18 +5,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
-// ── View-change message ───────────────────────────────────────────────────────
-
-/// Sent by a validator when the current round times out.
-/// The new leader collects 2f+1 of these to start round `new_round`.
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct ViewChangeMsg {
-    /// The round the sender is requesting a move to.
+
     pub new_round: u32,
     pub height: u64,
     pub epoch: u64,
-    /// Highest QC this node has seen — carried into the new view so the
-    /// new leader can extend the right branch.
+
     pub high_qc: Option<QuorumCertificate>,
     pub sender: Address,
     pub sender_pk: ego_core::PublicKey,
@@ -78,26 +59,19 @@ impl ViewChangeMsg {
     }
 }
 
-// ── Fork-choice store ─────────────────────────────────────────────────────────
-
-/// Tracks all known blocks/QCs and implements the canonical-chain rule.
 #[derive(Debug, Clone)]
 pub struct ForkChoiceStore {
-    /// height → block_hash → header (all proposed blocks, not just finalized)
+
     pub blocks: HashMap<u64, HashMap<Hash, BlockHeader>>,
-    /// block_hash → QC
+
     pub qcs: HashMap<Hash, QuorumCertificate>,
 
-    /// Highest QC seen in any round — used by new leaders after view change.
     pub high_qc: Option<QuorumCertificate>,
-    /// Locked QC — the latest QC whose block is *committed* (2-chain rule).
-    /// Safety: we never vote for a block that conflicts with locked_qc.
+
     pub locked_qc: Option<QuorumCertificate>,
 
-    /// View-change messages buffered per new_round.
     pub view_changes: HashMap<u32, Vec<ViewChangeMsg>>,
 
-    /// The block hash of the current canonical head (highest locked block).
     pub canonical_head: Option<Hash>,
 }
 
@@ -119,8 +93,6 @@ impl ForkChoiceStore {
         }
     }
 
-    // ── Block / QC insertion ──────────────────────────────────────────────────
-
     pub fn add_block(&mut self, header: BlockHeader) {
         self.blocks
             .entry(header.height)
@@ -128,7 +100,6 @@ impl ForkChoiceStore {
             .insert(header.block_hash(), header);
     }
 
-    /// Record a QC and update `high_qc` if this one is for a higher round.
     pub fn add_qc(&mut self, qc: QuorumCertificate) {
         let higher = self.high_qc.as_ref().map_or(true, |hq| {
             qc.epoch > hq.epoch || (qc.epoch == hq.epoch && qc.round > hq.round)
@@ -145,7 +116,6 @@ impl ForkChoiceStore {
         self.qcs.insert(qc.block_hash, qc);
     }
 
-    /// Advance `locked_qc` when a block is finalized (commit phase).
     pub fn update_locked_qc(&mut self, qc: QuorumCertificate) {
         let higher = self.locked_qc.as_ref().map_or(true, |lq| {
             qc.epoch > lq.epoch || (qc.epoch == lq.epoch && qc.round > lq.round)
@@ -162,32 +132,20 @@ impl ForkChoiceStore {
         }
     }
 
-    // ── Safety rule ───────────────────────────────────────────────────────────
-
-    /// Returns `true` if it is safe to vote for `block`.
-    ///
-    /// HotStuff safety rule:
-    ///   - No locked QC yet  → always safe.
-    ///   - block.epoch > locked.epoch             → safe (higher epoch = newer view).
-    ///   - block.epoch == locked.epoch && block extends locked block → safe.
-    ///   - Otherwise → unsafe (would break safety guarantee).
     pub fn is_safe_to_vote(&self, block: &BlockHeader) -> bool {
         let locked = match &self.locked_qc {
             None => return true,
             Some(l) => l,
         };
 
-        // Higher epoch always safe (new leader carried high_qc forward correctly)
         if block.epoch > locked.epoch {
             return true;
         }
 
-        // Same epoch: block must extend the locked block (prev_hash chain)
         if block.epoch == locked.epoch {
             return self.extends_locked(block, locked.block_hash);
         }
 
-        // Older epoch — unsafe
         warn!(
             "⚠️  Unsafe vote: block epoch {} < locked epoch {}",
             block.epoch, locked.epoch
@@ -195,8 +153,6 @@ impl ForkChoiceStore {
         false
     }
 
-    /// Walk prev_hash pointers to check if `block` descends from `ancestor_hash`.
-    /// Searches up to 64 hops (prevents unbounded traversal on adversarial chains).
     fn extends_locked(&self, block: &BlockHeader, ancestor_hash: Hash) -> bool {
         if block.block_hash() == ancestor_hash {
             return true;
@@ -206,7 +162,7 @@ impl ForkChoiceStore {
             if current_hash == ancestor_hash {
                 return true;
             }
-            // Walk back through known blocks
+
             let found = self
                 .blocks
                 .values()
@@ -219,15 +175,6 @@ impl ForkChoiceStore {
         false
     }
 
-    // ── Fork resolution ───────────────────────────────────────────────────────
-
-    /// Canonical head block at `height`.
-    ///
-    /// Priority:
-    ///   1. Only one candidate → trivially canonical.
-    ///   2. One has a QC, others don't → QC'd block wins.
-    ///   3. Multiple QCs (byzantine equivocation) → most votes, then lex-smaller hash.
-    ///   4. No QCs yet → lex-smaller hash (deterministic placeholder until QC arrives).
     pub fn resolve_fork(&self, height: u64) -> Option<Hash> {
         let candidates = self.blocks.get(&height)?;
 
@@ -245,12 +192,11 @@ impl ForkChoiceStore {
         }
 
         if with_qc.is_empty() {
-            // No QCs yet — deterministic tie-break
+
             warn!("⚠️  Fork at height {} with no QCs — picking lex-smallest hash", height);
             return candidates.keys().min_by_key(|h| h.as_bytes()).copied();
         }
 
-        // Multiple QCs at same height: equivocation evidence — pick by votes then hash.
         warn!(
             "🚨 Byzantine equivocation detected at height {}: {} QCs",
             height,
@@ -264,7 +210,6 @@ impl ForkChoiceStore {
         Some(*with_qc[0].0)
     }
 
-    /// Return the canonical head `BlockHeader` (the block pointed to by `locked_qc`).
     pub fn get_canonical_head(&self) -> Option<&BlockHeader> {
         let head_hash = self.canonical_head?;
         self.blocks
@@ -272,11 +217,6 @@ impl ForkChoiceStore {
             .find_map(|m| m.get(&head_hash))
     }
 
-    // ── View change ───────────────────────────────────────────────────────────
-
-    /// Buffer a view-change message.
-    /// Returns `Some(best_high_qc)` once a quorum (`quorum` messages) is reached
-    /// for `msg.new_round` — the caller should start that round with `best_high_qc`.
     pub fn add_view_change(
         &mut self,
         msg: ViewChangeMsg,
@@ -290,7 +230,6 @@ impl ForkChoiceStore {
 
         let msgs = self.view_changes.entry(msg.new_round).or_default();
 
-        // Deduplicate by sender
         if msgs.iter().any(|m| m.sender == msg.sender) {
             return Ok(None);
         }
@@ -306,7 +245,7 @@ impl ForkChoiceStore {
 
         if msgs.len() >= quorum {
             let new_round = msgs[0].new_round;
-            // Highest QC carried by any view-change message for this round
+
             let best_qc = msgs
                 .iter()
                 .filter_map(|m| m.high_qc.as_ref())
@@ -319,7 +258,6 @@ impl ForkChoiceStore {
                 best_qc.as_ref().map(|q| (q.epoch, q.round))
             );
 
-            // Promote best_qc to high_qc
             if let Some(ref qc) = best_qc {
                 self.add_qc(qc.clone());
             }
@@ -330,18 +268,14 @@ impl ForkChoiceStore {
         Ok(None)
     }
 
-    /// Clean up view-change messages for rounds older than `current_round`.
     pub fn prune_view_changes(&mut self, current_round: u32) {
         self.view_changes.retain(|&r, _| r >= current_round);
     }
 
-    /// Prune blocks older than `keep_from_height` to bound memory usage.
     pub fn prune_blocks(&mut self, keep_from_height: u64) {
         self.blocks.retain(|&h, _| h >= keep_from_height);
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -387,11 +321,9 @@ mod tests {
         let qc = make_qc(h1.block_hash(), 1, 2, 0, 3);
         store.update_locked_qc(qc);
 
-        // Higher epoch block — safe
         let h2 = make_header(2, 3, 0, h1.block_hash());
         assert!(store.is_safe_to_vote(&h2));
 
-        // Same epoch but different branch — unsafe
         let h3 = make_header(2, 2, 0, Hash::new([9u8; 32]));
         assert!(!store.is_safe_to_vote(&h3));
     }
@@ -404,7 +336,6 @@ mod tests {
         store.add_block(h1.clone());
         store.add_block(h2.clone());
 
-        // Give h1 a QC
         let qc = make_qc(h1.block_hash(), 5, 1, 0, 3);
         store.add_qc(qc);
 

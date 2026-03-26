@@ -1,17 +1,15 @@
-// ── Wallet State ──────────────────────────────────────────────────────────────
-
 export interface WalletData {
-  /** Encrypted seed: base64(iv(12) || ciphertext) */
+
   encryptedSeed: string;
-  /** hex-encoded 20-byte address with 0x prefix */
+
   address: string;
-  /** hex-encoded Ed25519 public key */
+
   publicKeyHex: string;
-  /** Whether the wallet is currently locked */
+
   locked: boolean;
-  /** Approved dApp origins */
+
   approvedOrigins: string[];
-  /** Selected network */
+
   network: 'testnet' | 'mainnet';
 }
 
@@ -21,8 +19,6 @@ export interface DecryptedWallet {
   publicKey: Uint8Array;
   address: string;
 }
-
-// ── RPC / Balance ─────────────────────────────────────────────────────────────
 
 export interface BalanceResponse {
   address: string;
@@ -66,8 +62,6 @@ export interface FaucetResponse {
   tx_hash: string;
 }
 
-// ── Message Protocol (popup ↔ background) ────────────────────────────────────
-
 export type MessageType =
   | 'EGO_GENERATE_WALLET'
   | 'EGO_IMPORT_WALLET'
@@ -101,8 +95,6 @@ export interface ExtResponse<T = unknown> {
   error?: string;
 }
 
-// ── dApp Connection ───────────────────────────────────────────────────────────
-
 export interface PendingConnection {
   origin: string;
   favicon?: string;
@@ -110,15 +102,11 @@ export interface PendingConnection {
   requestId: string;
 }
 
-// ── Transaction ───────────────────────────────────────────────────────────────
-
 export interface SendTxParams {
   to: string;
   amount_egoc: number;
   memo?: string;
 }
-
-// ── Networks ──────────────────────────────────────────────────────────────────
 
 export const NETWORKS = {
   testnet: {

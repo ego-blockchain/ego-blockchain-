@@ -1,7 +1,6 @@
 pub mod ai;
 pub mod auth;
 pub mod wallet;
-pub mod files;
 pub mod coverage;
 pub mod storage;
 pub mod earnings;
@@ -15,3 +14,4 @@ pub mod contracts;
 pub mod rollup;
 pub mod multichain;
 pub mod light_client;
+pub mod governance;

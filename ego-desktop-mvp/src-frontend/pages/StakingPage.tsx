@@ -151,7 +151,7 @@ const StakingPage: React.FC = () => {
   return (
     <div className="p-6 space-y-5 max-w-4xl mx-auto">
       {ConfirmDialog}
-      {/* Summary cards */}
+      {}
       <div className="grid grid-cols-5 gap-3">
         {[
           { label: 'Staked',              val: `${fmtEgoc(info?.staked_amount ?? 0)} EGOC`,                                  color: 'text-blue-400'   },
@@ -168,7 +168,7 @@ const StakingPage: React.FC = () => {
       </div>
 
       <div className="grid grid-cols-5 gap-4">
-        {/* Form */}
+        {}
         <div className="col-span-3 bg-gray-800 rounded-2xl p-5 border border-gray-700">
           {result ? (
             <div className="text-center py-8 space-y-4">
@@ -245,6 +245,9 @@ const StakingPage: React.FC = () => {
                         </button>
                       ))}
                     </div>
+                    <div className="mt-2 text-xs text-red-400/80 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
+                      ⚠️ Early unstaking before the lock expires incurs a <span className="font-semibold text-red-400">10% penalty</span> on your staked amount. The fee is distributed to network nodes.
+                    </div>
                   </div>
 
                   {stakeAmount && (
@@ -266,6 +269,12 @@ const StakingPage: React.FC = () => {
                         <span>Unlock date</span>
                         <span>{fmtDate(Math.floor(Date.now() / 1000) + lockDays * 86400)}</span>
                       </div>
+                      <div className="flex justify-between text-xs text-gray-500 border-t border-gray-700 pt-2">
+                        <span>Early unstake penalty</span>
+                        <span className="text-red-400 font-semibold">
+                          −{((parseFloat(stakeAmount) || 0) * 0.10).toFixed(2)} EGOC (10%)
+                        </span>
+                      </div>
                     </div>
                   )}
 
@@ -284,11 +293,11 @@ const StakingPage: React.FC = () => {
                   </button>
                 </div>
               ) : (
-                /* ── Unstake panel ── */
+
                 <div className="space-y-4">
                   {hasStake ? (
                     <>
-                      {/* Current stake details */}
+                      {}
                       <div className="bg-gray-900 rounded-xl p-4 space-y-3">
                         <div className="text-sm font-semibold text-gray-200 mb-1">Current Stake</div>
                         <div className="grid grid-cols-2 gap-3 text-sm">
@@ -359,14 +368,14 @@ const StakingPage: React.FC = () => {
           )}
         </div>
 
-        {/* Right-column cards */}
+        {}
         <div className="col-span-2 space-y-4">
 
-          {/* Mining eligibility */}
+          {}
           <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
             <h3 className="font-semibold mb-4">Mining Eligibility</h3>
             <div className="space-y-3">
-              {/* DRS score */}
+              {}
               <div>
                 <div className="flex justify-between text-xs text-gray-400 mb-1">
                   <span>Combined DRS</span>
@@ -381,7 +390,7 @@ const StakingPage: React.FC = () => {
                   />
                 </div>
               </div>
-              {/* Stake — optional boost */}
+              {}
               <div>
                 <div className="flex justify-between text-xs text-gray-400 mb-1">
                   <span>Stake <span className="text-purple-400">(boosts DRS +20%)</span></span>
@@ -397,7 +406,7 @@ const StakingPage: React.FC = () => {
                 </div>
                 <p className="text-xs text-gray-500 mt-1">Staking is optional — more stake = higher DRS = larger reward share</p>
               </div>
-              {/* Result pill */}
+              {}
               <div className={`mt-1 rounded-xl p-3 text-center text-sm font-semibold ${
                 drs?.is_eligible
                   ? 'bg-green-500/15 border border-green-500/30 text-green-400'
@@ -413,7 +422,7 @@ const StakingPage: React.FC = () => {
             </div>
           </div>
 
-          {/* Tokenomics snapshot */}
+          {}
           <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
             <h3 className="font-semibold mb-4">EGOC Tokenomics</h3>
             {tokenomics ? (

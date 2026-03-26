@@ -1,13 +1,3 @@
-/**
- * SendScreen — send EGOC to another address.
- *
- * Workflow:
- *   1. Enter or scan recipient address (QR via expo-camera)
- *   2. Enter amount in EGOC
- *   3. Confirm modal showing fee estimate
- *   4. Sign tx locally with stored seed → sendRawTransaction
- */
-
 import React, { useState, useRef } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, TextInput, Modal,
@@ -24,7 +14,7 @@ import { appendTransaction } from '../lib/storage';
 
 type Nav = StackNavigationProp<RootStackParamList, 'Send'>;
 
-const FEE_UEGOC = 1000n; // 0.001 EGOC base fee (testnet)
+const FEE_UEGOC = 1000n;
 
 export function SendScreen({ navigation }: { navigation: Nav }) {
   const [toAddress, setToAddress]   = useState('');
@@ -35,8 +25,6 @@ export function SendScreen({ navigation }: { navigation: Nav }) {
   const [txHash, setTxHash]         = useState<string | null>(null);
   const [permission, requestPerm]   = useCameraPermissions();
   const scanned = useRef(false);
-
-  // ── QR scan ──────────────────────────────────────────────────────────────
 
   async function openScanner() {
     if (!permission?.granted) {
@@ -51,19 +39,17 @@ export function SendScreen({ navigation }: { navigation: Nav }) {
     if (scanned.current) return;
     scanned.current = true;
     setShowScanner(false);
-    // Address may come as plain "egot1…" or as a URI "ego:egot1…?amount=…"
+
     let addr = data;
     let amt  = '';
     if (data.startsWith('ego:')) {
       const url = new URL(data.replace('ego:', 'ego://'));
-      addr = url.pathname.replace(/^\/\//, '');
+      addr = url.pathname.replace(/^\/\
       amt  = url.searchParams.get('amount') ?? '';
     }
     setToAddress(addr);
     if (amt) setAmount(amt);
   }
-
-  // ── Validation ───────────────────────────────────────────────────────────
 
   function validate(): string | null {
     if (!toAddress.startsWith('egot1')) return 'Invalid address (must start with egot1)';
@@ -71,8 +57,6 @@ export function SendScreen({ navigation }: { navigation: Nav }) {
     if (isNaN(amtNum) || amtNum <= 0) return 'Enter a valid amount';
     return null;
   }
-
-  // ── Confirm + send ───────────────────────────────────────────────────────
 
   function openConfirm() {
     const err = validate();
@@ -114,8 +98,6 @@ export function SendScreen({ navigation }: { navigation: Nav }) {
       setSending(false);
     }
   }
-
-  // ── Success view ─────────────────────────────────────────────────────────
 
   if (txHash) {
     return (
@@ -186,7 +168,7 @@ export function SendScreen({ navigation }: { navigation: Nav }) {
           </TouchableOpacity>
         </ScrollView>
 
-        {/* QR Scanner Modal */}
+        {}
         <Modal visible={showScanner} animationType="slide" onRequestClose={() => setShowScanner(false)}>
           <SafeAreaView style={{ flex: 1, backgroundColor: '#000' }}>
             <CameraView
@@ -201,7 +183,7 @@ export function SendScreen({ navigation }: { navigation: Nav }) {
           </SafeAreaView>
         </Modal>
 
-        {/* Confirm Modal */}
+        {}
         <Modal visible={showConfirm} transparent animationType="fade" onRequestClose={() => setShowConfirm(false)}>
           <View style={s.modalOverlay}>
             <View style={s.modal}>

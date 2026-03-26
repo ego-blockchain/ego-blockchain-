@@ -1,11 +1,7 @@
-//! Urego smart contract commands — compile, deploy, call, query state, event log.
-
 use crate::error::EgoDesktopError;
 use crate::ledger::{contracts_dir, load_chain, save_chain, Ledger, LedgerTx};
 use ego_vm::{CallResult, DeployResult, Executor};
 use serde::{Deserialize, Serialize};
-
-// ── compile_urego ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CompileResult {
@@ -26,18 +22,16 @@ fn vm() -> Result<Executor, EgoDesktopError> {
         .map_err(|e| EgoDesktopError::WalletError(e.to_string()))
 }
 
-// ── deploy_contract ───────────────────────────────────────────────────────────
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeployContractArgs {
-    /// Hex-encoded WASM bytecode.
+
     pub wasm_hex: String,
-    /// Hex-encoded ABI-encoded init() arguments (empty = "").
+
     pub init_args_hex: String,
-    /// Human-readable name (from IDE project name or ego.toml). Optional.
+
     #[serde(default)]
     pub name: String,
-    /// Public function signatures extracted from Urego source. Optional.
+
     #[serde(default)]
     pub abi: Vec<String>,
 }
@@ -62,7 +56,6 @@ pub async fn deploy_contract(args: DeployContractArgs) -> Result<DeployResult, E
                              ego_vm::types::DEFAULT_DEPLOY_FUEL)
         .map_err(|e| EgoDesktopError::WalletError(e.to_string()))?;
 
-    // Patch manifest name with the provided project name
     if !args.name.is_empty() {
         let manifest_path = contracts_dir()
             .join("contracts")
@@ -79,7 +72,6 @@ pub async fn deploy_contract(args: DeployContractArgs) -> Result<DeployResult, E
         }
     }
 
-    // Save ABI JSON alongside the contract
     if !args.abi.is_empty() {
         let abi_path = contracts_dir()
             .join("contracts")
@@ -88,13 +80,11 @@ pub async fn deploy_contract(args: DeployContractArgs) -> Result<DeployResult, E
         let _ = std::fs::write(&abi_path, serde_json::to_string(&args.abi).unwrap_or_default());
     }
 
-    // Build a Deploy TX and broadcast it so all nodes replicate the contract
     let mut chain2 = load_chain();
     let nonce      = chain2.last_nonce(&ledger.address) + 1;
     let tx_data    = format!("deploy:{}:{}:{}", ledger.address, result.contract_address, nonce);
     let tx_hash    = hex::encode(ego_core::hash_data(tx_data.as_bytes()).as_bytes());
 
-    // Deploy fee: free for stakers, DEPLOY_FEE_UEGOC for everyone else.
     let is_staker   = ledger.staked_amount > 0;
     let deploy_fee  = crate::tokenomics::deploy_fee_with_staking(is_staker);
     if deploy_fee > 0 {
@@ -144,8 +134,6 @@ pub async fn deploy_contract(args: DeployContractArgs) -> Result<DeployResult, E
     Ok(result)
 }
 
-// ── call_contract ─────────────────────────────────────────────────────────────
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CallContractArgs {
     pub contract_addr: String,
@@ -172,7 +160,7 @@ pub async fn call_contract(args: CallContractArgs) -> Result<CallResult, EgoDesk
         .map_err(|e| EgoDesktopError::WalletError(e.to_string()))?;
 
     if result.success {
-        // Persist emitted events to the per-contract event log (newest at end, capped at 500)
+
         if !result.events.is_empty() {
             let events_path = contracts_dir()
                 .join("contracts")
@@ -201,7 +189,6 @@ pub async fn call_contract(args: CallContractArgs) -> Result<CallResult, EgoDesk
             );
         }
 
-        // Build a Call TX and broadcast it
         let mut chain2 = load_chain();
         let nonce      = chain2.last_nonce(&ledger.address) + 1;
         let tx_data    = format!("call:{}:{}:{}:{}", ledger.address,
@@ -232,8 +219,6 @@ pub async fn call_contract(args: CallContractArgs) -> Result<CallResult, EgoDesk
     Ok(result)
 }
 
-// ── get_contract_state ────────────────────────────────────────────────────────
-
 #[tauri::command]
 pub async fn get_contract_state(
     contract_addr: String,
@@ -246,8 +231,6 @@ pub async fn get_contract_state(
     Ok(val)
 }
 
-// ── list_deployed_contracts ───────────────────────────────────────────────────
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ContractInfo {
     pub address:     String,
@@ -255,7 +238,7 @@ pub struct ContractInfo {
     pub deployer:    String,
     pub deployed_at: i64,
     pub code_hash:   String,
-    /// Public function signatures saved at deploy time.
+
     pub abi:         Vec<String>,
 }
 
@@ -292,8 +275,6 @@ pub async fn list_deployed_contracts() -> Result<Vec<ContractInfo>, EgoDesktopEr
     Ok(out)
 }
 
-// ── get_contract_events ───────────────────────────────────────────────────────
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StoredEvent {
     pub topic:        String,
@@ -303,8 +284,6 @@ pub struct StoredEvent {
     pub entrypoint:   String,
 }
 
-/// Returns up to `limit` events for a contract, newest first.
-/// Pass limit = 0 for all events (capped at 500 stored).
 #[tauri::command]
 pub async fn get_contract_events(
     contract_addr: String,
@@ -318,7 +297,7 @@ pub async fn get_contract_events(
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    events.reverse(); // newest first
+    events.reverse();
     if limit > 0 {
         events.truncate(limit as usize);
     }

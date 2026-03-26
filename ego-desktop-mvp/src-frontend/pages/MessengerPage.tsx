@@ -1,22 +1,19 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { listen } from '@tauri-apps/api/event';
+import { useLocation } from 'react-router-dom';
 import { writeText } from '@tauri-apps/api/clipboard';
 import { useConfirm } from '../hooks/useConfirm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
-// @ts-ignore — vscDarkPlus style typings live in a subpath not covered by @types
+
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
-
-
-// ── Types ─────────────────────────────────────────────────────────────────────
 
 interface Contact {
   address: string;
   name: string;
   ed25519_pubkey: string;
-  kyber_pubkey: string;
   shared_key_hex: string;
-  status: string;     // "pending_out" | "pending_in" | "approved"
+  status: string;
   added_at: number;
   endpoint: string;
 }
@@ -26,12 +23,10 @@ interface Message {
   from: string;
   to: string;
   content: string;
-  message_type: string;  // "text" | "file_bundle" | "decrypt_key"
+  message_type: string;
   timestamp: number;
   outgoing: boolean;
 }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function fmtTime(ts: number): string {
   return new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -70,8 +65,6 @@ function isImageName(name: string): boolean {
   return ['jpg','jpeg','png','gif','webp','bmp','svg'].includes(ext);
 }
 
-// Lazily loads and displays a file preview from the local encrypted store.
-// Only renders when the CID is already available locally.
 function InlineFilePreview({ cid, name }: { cid: string; name: string }) {
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
@@ -108,9 +101,6 @@ function InlineFilePreview({ cid, name }: { cid: string; name: string }) {
   );
 }
 
-// ── AI message renderer (markdown code blocks → syntax-highlighted) ───────────
-
-// Map non-standard or Ego-specific language names to Prism-supported ones
 function normalizeLang(lang: string): string {
   const map: Record<string, string> = {
     urego: 'rust', ego: 'rust', solidity: 'javascript',
@@ -123,20 +113,18 @@ function normalizeLang(lang: string): string {
 function AiMessageContent({ content }: { content: string }) {
   const [copied, setCopied] = useState<number | null>(null);
 
-  // Split on triple-backtick boundaries.
-  // Even indices → plain text, odd indices → "lang\ncode" (open or unclosed block).
   const segments = content.split('```');
 
   return (
     <div className="text-sm space-y-2">
       {segments.map((seg, i) => {
         if (i % 2 === 0) {
-          // Plain text
+
           return seg ? (
             <p key={i} className="whitespace-pre-wrap break-words leading-relaxed">{seg}</p>
           ) : null;
         }
-        // Code block: first line is the language identifier, rest is code
+
         const newline = seg.indexOf('\n');
         const lang = newline > -1 ? seg.slice(0, newline).trim() : '';
         const code = newline > -1 ? seg.slice(newline + 1) : seg;
@@ -147,7 +135,7 @@ function AiMessageContent({ content }: { content: string }) {
         };
         return (
           <div key={i} className="rounded-xl overflow-hidden border border-white/10 my-1">
-            {/* Title bar */}
+            {}
             <div className="flex items-center justify-between bg-[#1e1e1e] px-3 py-1.5 border-b border-white/5">
               <span className="text-xs text-gray-400 font-mono">{lang || 'code'}</span>
               <button
@@ -172,15 +160,13 @@ function AiMessageContent({ content }: { content: string }) {
   );
 }
 
-// ── Ego AI constants ──────────────────────────────────────────────────────────
-
 const EGO_AI_ADDRESS = 'ego_ai_assistant';
 
 const EGO_AI_CONTACT: Contact = {
   address:        EGO_AI_ADDRESS,
   name:           'Ego AI',
   ed25519_pubkey: '',
-  kyber_pubkey:   '',
+
   shared_key_hex: '',
   status:         'approved',
   added_at:       0,
@@ -189,11 +175,10 @@ const EGO_AI_CONTACT: Contact = {
 
 interface AiMsg { role: 'user' | 'assistant'; content: string; ts: number; }
 
-// ── Main page ─────────────────────────────────────────────────────────────────
-
 const MessengerPage: React.FC = () => {
   const { confirm, ConfirmDialog } = useConfirm();
-  // Core state
+  const location = useLocation();
+
   const [contacts, setContacts]     = useState<Contact[]>([]);
   const [selected, setSelected]     = useState<Contact | null>(null);
   const [messages, setMessages]     = useState<Message[]>([]);
@@ -201,7 +186,6 @@ const MessengerPage: React.FC = () => {
   const [sending, setSending]       = useState(false);
   const [sendError, setSendError]   = useState('');
 
-  // Ego AI state
   const [aiMessages, setAiMessages]       = useState<AiMsg[]>(() => {
     try {
       const saved = localStorage.getItem('ego-ai-messages');
@@ -211,22 +195,22 @@ const MessengerPage: React.FC = () => {
   });
   const [aiThinking, setAiThinking]       = useState(false);
 
-  // "Share My Card" modal
   const [showMyCard, setShowMyCard]         = useState(false);
   const [myCardName, setMyCardName]         = useState('');
   const [myCard, setMyCard]                 = useState('');
   const [generatingCard, setGeneratingCard] = useState(false);
   const [copied, setCopied]                 = useState(false);
+  const [revoking, setRevoking]             = useState(false);
+  const [revokeConfirm, setRevokeConfirm]   = useState(false);
 
   const [knownCids, setKnownCids] = useState<Set<string>>(new Set());
-  // "Add Contact" modal
+
   const [showAdd, setShowAdd]     = useState(false);
   const [addBundle, setAddBundle] = useState('');
   const [addMyName, setAddMyName] = useState('');
   const [addMsg, setAddMsg]       = useState('');
   const [adding, setAdding]       = useState(false);
 
-  // Approve / Decline flow
   const [pendingAction, setPendingAction] = useState<{
     contact: Contact;
     action: 'approve' | 'decline';
@@ -240,19 +224,15 @@ const MessengerPage: React.FC = () => {
   type FileImportStatus = 'idle' | 'importing' | 'done' | 'error';
   const [fileImportStates, setFileImportStates] = useState<Record<string, { status: FileImportStatus; error?: string }>>({});
   const importTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
-  // Maps cid → msgId so file-downloaded events can mark the right message as done
+
   const cidToMsgId = useRef<Record<string, string>>({});
 
-  // Inline rename state
   const [editingName, setEditingName] = useState(false);
   const [nameInput, setNameInput]     = useState('');
   const nameInputRef = useRef<HTMLInputElement>(null);
 
-  // P2P connectivity status
   interface P2pStatus { upnp: string; upnp_error: string | null; public_endpoint: string; p2p_port: number; }
   const [p2pStatus, setP2pStatus] = useState<P2pStatus | null>(null);
-
-  // ── Data loaders ─────────────────────────────────────────────────────────
 
   async function loadContacts() {
     try {
@@ -263,10 +243,21 @@ const MessengerPage: React.FC = () => {
     }
   }
 
+  // Open the right chat when navigated here from a notification click
+  useEffect(() => {
+    const addr = (location.state as any)?.openChat as string | undefined;
+    if (!addr) return;
+    invoke<Contact[]>('get_contacts').then(cs => {
+      setContacts(cs);
+      const contact = cs.find(c => c.address === addr && c.status === 'approved');
+      if (contact) setSelected(contact);
+    }).catch(() => {});
+  }, [location.state]);
+
   async function loadKnownCids() {
     try {
       const files = await invoke<{ cid: string; local_path: string }[]>('get_stored_files');
-      // Only include files with actual data on disk (not placeholder "sender:..." entries)
+
       setKnownCids(new Set(
         files
           .filter(f => f.local_path && !f.local_path.startsWith('sender:'))
@@ -284,14 +275,9 @@ const MessengerPage: React.FC = () => {
     }
   }
 
-  // ── Real-time P2P event listeners ─────────────────────────────────────────
-
-  // Keep a ref to `selected` so the event handlers inside useEffect can see the
-  // latest value without stale closure issues.
   const selectedRef = useRef<Contact | null>(null);
   useEffect(() => { selectedRef.current = selected; }, [selected]);
 
-  // Persist AI conversation whenever it changes
   useEffect(() => {
     try { localStorage.setItem('ego-ai-messages', JSON.stringify(aiMessages)); } catch {}
   }, [aiMessages]);
@@ -308,10 +294,9 @@ const MessengerPage: React.FC = () => {
     loadContacts();
      loadKnownCids();
     const unlisteners: Promise<() => void>[] = [
-      // B receives A's contact request
+
       listen<Contact>('ego://contact-request', () => { loadContacts(); }),
 
-      // A receives B's approval
       listen<Contact>('ego://contact-approved', (event) => {
         loadContacts();
         if (event.payload.address === selectedRef.current?.address) {
@@ -319,7 +304,6 @@ const MessengerPage: React.FC = () => {
         }
       }),
 
-      // A receives B's decline
       listen('ego://contact-declined', () => { loadContacts(); }),
       listen<{ cid?: string }>('ego://file-downloaded', (event) => {
         loadKnownCids();
@@ -333,16 +317,16 @@ const MessengerPage: React.FC = () => {
           }
         }
       }),
-      // Incoming chat message delivered by P2P server
+
       listen<Message>('ego://message-received', (event) => {
         const msg = event.payload;
-        // Refresh messages if the chat with the sender (or recipient) is open
+
         const cur = selectedRef.current;
         if (cur && (msg.from === cur.address || msg.to === cur.address)) {
           loadMessages(cur.address);
         }
       }),
-      // Outgoing message saved (e.g. sent from EgoSafe) — refresh open chat
+
       listen<{ to: string }>('ego://message-sent', (event) => {
         const cur = selectedRef.current;
         if (cur && cur.address === event.payload.to) {
@@ -350,29 +334,14 @@ const MessengerPage: React.FC = () => {
         }
       }),
 
-      // Window focused after a notification: open the relevant chat
-      listen<{ address: string }>('ego://open-chat', (event) => {
-        const addr = event.payload.address;
-        invoke<Contact[]>('get_contacts').then(cs => {
-          setContacts(cs);
-          const contact = cs.find(c => c.address === addr && c.status === 'approved');
-          if (contact) setSelected(contact);
-        }).catch(() => {
-          setContacts(prev => {
-            const contact = prev.find(c => c.address === addr && c.status === 'approved');
-            if (contact) setSelected(contact);
-            return prev;
-          });
-        });
-      }),
     ];
 
     return () => {
       unlisteners.forEach(p => p.then(fn => fn()));
-      // Clear all pending import timers
+
       Object.values(importTimers.current).forEach(clearTimeout);
     };
-  }, []);  // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
 useEffect(() => {
   if (selected) {
@@ -384,10 +353,25 @@ useEffect(() => {
 }, [selected]);
 
   useEffect(() => {
-    msgEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const id = requestAnimationFrame(() => {
+      msgEndRef.current?.scrollIntoView({ behavior: 'auto' });
+    });
+    return () => cancelAnimationFrame(id);
   }, [messages, aiMessages, aiThinking]);
 
-  // ── Handlers ─────────────────────────────────────────────────────────────
+  async function handleRevokeBundle() {
+    setRevoking(true);
+    try {
+      await invoke('revoke_contact_bundle');
+      setMyCard('');
+      setCopied(false);
+      setRevokeConfirm(false);
+    } catch (e: any) {
+      console.error(e);
+    } finally {
+      setRevoking(false);
+    }
+  }
 
   async function handleGenerateCard() {
     if (!myCardName.trim()) return;
@@ -469,7 +453,7 @@ useEffect(() => {
 
   async function handleSend(msgType: string = 'text') {
     if (!selected) return;
-    // Route AI messages separately
+
     if (selected.address === EGO_AI_ADDRESS) { await handleAiSend(); return; }
     if (!msgInput.trim()) return;
     setSending(true);
@@ -482,11 +466,11 @@ useEffect(() => {
         content:     text,
         messageType: msgType,
       });
-      // Reload local outgoing message immediately
+
       await loadMessages(selected.address);
     } catch (e: any) {
       setSendError(String(e));
-      setMsgInput(text); // restore input on error
+      setMsgInput(text);
     } finally {
       setSending(false);
     }
@@ -521,6 +505,14 @@ useEffect(() => {
     } catch (e) { console.error(e); }
   }
 
+  async function handleClearChat(addr: string) {
+    if (!await confirm('Clear all messages?', { detail: 'This removes all messages with this contact from your device.', confirmLabel: 'Clear' })) return;
+    try {
+      await invoke('clear_messages', { contactAddr: addr });
+      if (selected?.address === addr) setMessages([]);
+    } catch (e) { console.error(e); }
+  }
+
   async function handleRenameContact(addr: string, newName: string) {
     const trimmed = newName.trim();
     if (!trimmed) { setEditingName(false); return; }
@@ -539,48 +531,34 @@ useEffect(() => {
     } catch (e) { console.error(e); }
   }
 
-  // ── File import with 1-minute timeout ────────────────────────────────────
-
-  async function handleImportFile(
-    msgId: string,
-    cid: string,
-    key_nonce_hex: string,
-    display_name: string,
-    from_address: string,
-    content: string,
-  ) {
+  async function handleImportFile(msgId: string, content: string) {
     setFileImportStates(s => ({ ...s, [msgId]: { status: 'importing' } }));
-    // Clear any existing timer for this message
+
     if (importTimers.current[msgId]) clearTimeout(importTimers.current[msgId]);
-    // Start 60-second timeout
     importTimers.current[msgId] = setTimeout(() => {
       setFileImportStates(s => {
-        if (s[msgId]?.status === 'importing') {
+        if (s[msgId]?.status === 'importing')
           return { ...s, [msgId]: { status: 'error', error: 'Download timed out. Tap Retry.' } };
-        }
         return s;
       });
     }, 60_000);
 
+    const parts        = content.trim().split(':');
+    const cid          = parts[1] ?? '';
+    const key_nonce_hex = parts[2] ?? '';
+    const name64       = parts[3] ?? '';
+    const from_address = parts[4] ?? '';
+    let display_name   = cid.slice(0, 12);
+    try { display_name = decodeURIComponent(escape(atob(name64))); } catch {}
+
     try {
-      await invoke('import_shared_file', {
-        bundle: { cid, key_nonce_hex, display_name, from_address },
-      });
-      // Register cid→msgId so the file-downloaded event can complete this import
+      await invoke('import_shared_file', { bundle: { cid, key_nonce_hex, display_name, from_address } });
+
       cidToMsgId.current[cid] = msgId;
-      await invoke('request_file_from_contact', {
-        cid,
-        fromAddr: from_address,
-        content,
-      });
-      // Stay in 'importing' state — the file-downloaded event will set 'done'
-      // once the encrypted file data actually arrives and is written to disk.
+      await invoke('request_file_from_contact', { cid, fromAddr: from_address, content: content.trim() });
     } catch (e: any) {
       clearTimeout(importTimers.current[msgId]);
-      setFileImportStates(s => ({
-        ...s,
-        [msgId]: { status: 'error', error: 'Import failed. Tap Retry.' },
-      }));
+      setFileImportStates(s => ({ ...s, [msgId]: { status: 'error', error: 'Import failed. Tap Retry.' } }));
     }
   }
 
@@ -591,19 +569,15 @@ useEffect(() => {
     setActionDone(false);
   }
 
-  // ── Partitioned contacts ──────────────────────────────────────────────────
-
   const approvedContacts   = contacts.filter(c => c.status === 'approved');
   const pendingInContacts  = contacts.filter(c => c.status === 'pending_in');
   const pendingOutContacts = contacts.filter(c => c.status === 'pending_out');
-
-  // ── Render ────────────────────────────────────────────────────────────────
 
   return (
     <div className="flex flex-col h-full bg-gray-900 text-white overflow-hidden">
       {ConfirmDialog}
 
-      {/* ── P2P connectivity banner ── */}
+      {}
       {p2pStatus?.upnp === 'failed' && (
         <div className="bg-yellow-900/80 border-b border-yellow-600/40 px-4 py-2 flex items-start gap-2 shrink-0">
           <span className="text-yellow-400 shrink-0 mt-0.5">⚠️</span>
@@ -633,7 +607,7 @@ useEffect(() => {
           </div>
           <div className="flex gap-1.5">
             <button
-              onClick={() => { setShowMyCard(true); setMyCard(''); setMyCardName(''); }}
+              onClick={() => { setShowMyCard(true); setMyCard(''); setMyCardName(''); setRevokeConfirm(false); }}
               className="w-7 h-7 bg-gray-600 hover:bg-gray-500 rounded-lg flex items-center justify-center text-sm transition-colors"
               title="Share my contact card"
             >
@@ -834,7 +808,7 @@ useEffect(() => {
                       <span className="font-semibold text-sm truncate">{selected.name}</span>
                       <button
                         onClick={() => { setNameInput(selected.name); setEditingName(true); setTimeout(() => nameInputRef.current?.select(), 0); }}
-                        className="opacity-0 group-hover/name:opacity-100 transition-opacity text-gray-500 hover:text-gray-300 text-xs px-1"
+                        className="text-gray-500 hover:text-gray-300 text-xs px-1"
                         title="Edit name"
                       >
                         ✏️
@@ -843,6 +817,13 @@ useEffect(() => {
                   )}
                   <div className="text-xs text-gray-400 font-mono">{truncAddr(selected.address)}</div>
                 </div>
+                <button
+                  onClick={() => handleClearChat(selected.address)}
+                  className="shrink-0 px-3 py-1.5 text-xs text-gray-400 hover:text-gray-300 hover:bg-gray-500/10 rounded-lg transition-colors"
+                  title="Clear chat"
+                >
+                  Clear
+                </button>
                 <button
                   onClick={() => handleDeleteContact(selected.address)}
                   className="shrink-0 px-3 py-1.5 text-xs text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-lg transition-colors"
@@ -981,12 +962,10 @@ useEffect(() => {
                         </div>
                       )}
                       {isFileBundle ? (() => {
-                        const parts = m.content.trim().split(':');
-                        const cid           = parts[1] ?? '';
-                        const key_nonce_hex = parts[2] ?? '';
-                        const name64        = parts[3] ?? '';
-                        const from_address  = parts[4] ?? '';
-                        let display_name    = cid.slice(0, 12);
+                        const parts  = m.content.trim().split(':');
+                        const cid    = parts[1] ?? '';
+                        const name64 = parts[3] ?? '';
+                        let display_name = cid.slice(0, 12);
                         try { display_name = decodeURIComponent(escape(atob(name64))); } catch {}
 
                         const alreadyKnown = knownCids.has(cid);
@@ -1006,7 +985,9 @@ useEffect(() => {
                             <div className="flex items-center gap-2 bg-black/20 rounded-xl px-3 py-2">
                               <span className="text-2xl shrink-0">{isImage ? '🖼️' : '📎'}</span>
                               <div className="min-w-0">
-                                <div className="text-sm font-medium truncate">{display_name}</div>
+                                <div className="flex items-center gap-1">
+                                  <span className="text-sm font-medium truncate">{display_name}</span>
+                                </div>
                                 <div className="text-xs text-gray-400 font-mono">{cid.slice(0, 14)}…</div>
                               </div>
                             </div>
@@ -1026,7 +1007,7 @@ useEffect(() => {
                                       ✕ {importState?.error}
                                     </div>
                                     <button
-                                      onClick={() => handleImportFile(m.id, cid, key_nonce_hex, display_name, from_address, m.content)}
+                                      onClick={() => handleImportFile(m.id, m.content)}
                                       className="w-full text-xs py-1.5 rounded-lg font-medium bg-yellow-600 hover:bg-yellow-500 text-white transition"
                                     >
                                       ↺ Retry
@@ -1034,7 +1015,7 @@ useEffect(() => {
                                   </div>
                                 ) : (
                                   <button
-                                    onClick={() => handleImportFile(m.id, cid, key_nonce_hex, display_name, from_address, m.content)}
+                                    onClick={() => handleImportFile(m.id, m.content)}
                                     className="w-full text-xs py-1.5 rounded-lg font-medium bg-purple-600 hover:bg-purple-500 text-white transition"
                                   >
                                     {isImage ? '🖼️ View Image' : '📥 Save File'}
@@ -1134,7 +1115,7 @@ useEffect(() => {
               </div>
               <div className="flex gap-2 mt-6 justify-center">
                 <button
-                  onClick={() => { setShowMyCard(true); setMyCard(''); setMyCardName(''); }}
+                  onClick={() => { setShowMyCard(true); setMyCard(''); setMyCardName(''); setRevokeConfirm(false); }}
                   className="px-4 py-2.5 bg-gray-700 hover:bg-gray-600 text-white rounded-xl text-sm font-medium transition-colors"
                 >
                   📤 My Card
@@ -1151,11 +1132,11 @@ useEffect(() => {
         )}
       </div>
 
-      </div>{/* end flex-1 row */}
+      </div>{}
 
-      {/* ── Share My Card modal ── */}
+      {}
       {showMyCard && (
-        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={e => { if (e.target === e.currentTarget) setShowMyCard(false); }}>
           <div className="bg-gray-800 rounded-2xl w-full max-w-md shadow-2xl">
             <div className="px-6 py-4 border-b border-gray-700 flex items-center justify-between">
               <h3 className="font-bold text-lg">My Contact Card</h3>
@@ -1167,6 +1148,35 @@ useEffect(() => {
                 When they paste it in <strong className="text-white">Add Contact</strong>, you'll get
                 a live notification on this device to approve or decline.
               </p>
+              <div className="bg-yellow-900/20 border border-yellow-700/40 rounded-xl px-4 py-3">
+                <div className="text-xs text-yellow-400 font-semibold mb-1">🔑 Bundle exposed?</div>
+                <p className="text-xs text-gray-400 mb-2">Revoking invalidates your current card. Anyone with the old bundle can no longer send you pairing requests. All existing approved contacts keep their connection and can still message you normally.</p>
+                {!revokeConfirm ? (
+                  <button
+                    onClick={() => setRevokeConfirm(true)}
+                    className="text-xs text-yellow-400 hover:text-yellow-300 underline transition-colors"
+                  >
+                    Revoke &amp; Regenerate Bundle
+                  </button>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-yellow-300">Are you sure?</span>
+                    <button
+                      onClick={handleRevokeBundle}
+                      disabled={revoking}
+                      className="text-xs bg-red-600 hover:bg-red-500 disabled:opacity-50 px-3 py-1 rounded-lg font-semibold transition-colors"
+                    >
+                      {revoking ? 'Revoking…' : 'Yes, Revoke'}
+                    </button>
+                    <button
+                      onClick={() => setRevokeConfirm(false)}
+                      className="text-xs text-gray-400 hover:text-white transition-colors"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                )}
+              </div>
               <div>
                 <label className="text-xs text-gray-400 mb-1.5 block">Your display name</label>
                 <input
@@ -1224,7 +1234,7 @@ useEffect(() => {
 
       {/* ── Add Contact modal ── */}
       {showAdd && (
-        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={e => { if (e.target === e.currentTarget) setShowAdd(false); }}>
           <div className="bg-gray-800 rounded-2xl w-full max-w-md shadow-2xl">
             <div className="px-6 py-4 border-b border-gray-700 flex items-center justify-between">
               <h3 className="font-bold text-lg">Add Contact</h3>
@@ -1277,9 +1287,9 @@ useEffect(() => {
         </div>
       )}
 
-      {/* ── Approve / Decline modal ── */}
+      {}
       {pendingAction && (
-        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={e => { if (e.target === e.currentTarget) { setPendingAction(null); setActionDone(false); } }}>
           <div className="bg-gray-800 rounded-2xl w-full max-w-md shadow-2xl">
             <div className="px-6 py-4 border-b border-gray-700 flex items-center justify-between">
               <h3 className="font-bold">

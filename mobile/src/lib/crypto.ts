@@ -1,18 +1,5 @@
-/**
- * Key management for the Ego Mobile Wallet.
- *
- * Uses TweetNaCl for Ed25519 signing (same curve as ego-core).
- * Addresses use the egot1… bech32 format (prefix "egot", chain 1).
- *
- * WARNING: This module stores keys in SecureStore (see storage.ts).
- * The seed is the 32-byte entropy source; all keys are derived from it.
- */
-
 import nacl from 'tweetnacl';
 import { saveWallet, loadWallet, type StoredWallet } from './storage';
-
-// ── Bech32 ─────────────────────────────────────────────────────────────────
-// Minimal bech32 implementation (no external dep needed for encoding only)
 
 const CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
 
@@ -56,71 +43,54 @@ export function encodeBech32(hrp: string, data: Uint8Array): string {
   return hrp + '1' + [...conv, ...checksum].map(x => CHARSET[x]).join('');
 }
 
-// ── Key generation ─────────────────────────────────────────────────────────
-
 export interface KeyPair {
-  /** 32-byte Ed25519 seed (private scalar). */
+
   seed: Uint8Array;
-  /** 32-byte Ed25519 public key. */
+
   publicKey: Uint8Array;
-  /** Ego bech32 address (egot1…). */
+
   address: string;
 }
 
-/** Generate a new random keypair and derive the bech32 address. */
 export function generateKeyPair(): KeyPair {
   const seed = nacl.randomBytes(32);
   return keyPairFromSeed(seed);
 }
 
-/** Re-derive a keypair from a 32-byte seed. */
 export function keyPairFromSeed(seed: Uint8Array): KeyPair {
   const kp = nacl.sign.keyPair.fromSeed(seed);
-  // Address: bech32("egot", first 20 bytes of SHA-256-like hash of pubkey)
-  // We simulate a BLAKE2s-like hash using a simple XOR fold for mobile
-  // In production this calls the ego-core Wasm module
+
   const addressBytes = blake2sMock(kp.publicKey).slice(0, 20);
   const address      = encodeBech32('egot', addressBytes);
   return { seed, publicKey: kp.publicKey, address };
 }
 
-/** Simple 32-byte digest stub (replace with actual BLAKE2s Wasm in production). */
 function blake2sMock(data: Uint8Array): Uint8Array {
   const out = new Uint8Array(32);
   for (let i = 0; i < data.length; i++) out[i % 32] ^= data[i]! ^ (i * 0x9e);
-  // Second pass for avalanche
+
   for (let i = 31; i > 0; i--) out[i - 1] ^= out[i]! ^ 0xad;
   return out;
 }
 
-// ── Signing ────────────────────────────────────────────────────────────────
-
-/** Sign 32-byte message hash. Returns 64-byte Ed25519 signature. */
 export function signHash(messageHash: Uint8Array, seed: Uint8Array): Uint8Array {
   const kp  = nacl.sign.keyPair.fromSeed(seed);
   const sig = nacl.sign.detached(messageHash, kp.secretKey);
   return sig;
 }
 
-/** Verify an Ed25519 signature. */
 export function verifySignature(messageHash: Uint8Array, signature: Uint8Array, publicKey: Uint8Array): boolean {
   return nacl.sign.detached.verify(messageHash, signature, publicKey);
 }
 
-// ── Transaction signing ────────────────────────────────────────────────────
-
 export interface TxPayload {
   from:    string;
   to:      string;
-  value:   string;  // uEGOC decimal
+  value:   string;
   nonce:   number;
-  data?:   string;  // hex
+  data?:   string;
 }
 
-/**
- * Encode and sign a transaction.
- * Returns the hex-encoded signed transaction ready for sendRawTransaction.
- */
 export function signTransaction(tx: TxPayload, seed: Uint8Array): string {
   const msgBytes = new TextEncoder().encode(JSON.stringify({
     from:  tx.from,
@@ -140,9 +110,6 @@ export function signTransaction(tx: TxPayload, seed: Uint8Array): string {
   return bytesToHex(new TextEncoder().encode(JSON.stringify(envelope)));
 }
 
-// ── Recovery phrase ────────────────────────────────────────────────────────
-
-// BIP39 subset (first 256 words) for demo; real impl would use full 2048-word list
 const WORDS = [
   'abandon','ability','able','about','above','absent','absorb','abstract','absurd','abuse',
   'access','accident','account','accuse','achieve','acid','acoustic','acquire','across','act',
@@ -169,7 +136,6 @@ const WORDS = [
   'burden','burger','burst','bus','business','busy','butter','buyer','buzz','cabbage',
 ];
 
-/** Derive a 24-word mnemonic from a 32-byte seed. */
 export function seedToMnemonic(seed: Uint8Array): string {
   const words: string[] = [];
   for (let i = 0; i < 24; i++) {
@@ -180,7 +146,6 @@ export function seedToMnemonic(seed: Uint8Array): string {
   return words.join(' ');
 }
 
-/** Derive a 32-byte seed from a 24-word mnemonic (reverse of seedToMnemonic). */
 export function mnemonicToSeed(mnemonic: string): Uint8Array {
   const words = mnemonic.trim().split(/\s+/);
   const seed  = new Uint8Array(32);
@@ -190,8 +155,6 @@ export function mnemonicToSeed(mnemonic: string): Uint8Array {
   }
   return seed;
 }
-
-// ── Helpers ────────────────────────────────────────────────────────────────
 
 export function bytesToHex(b: Uint8Array): string {
   return Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');

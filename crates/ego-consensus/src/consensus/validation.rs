@@ -340,9 +340,9 @@ mod tests {
     #[test]
     fn test_geometry_coherence_validation() {
         let mut config = ValidationConfig::default();
-        config.rf_validation.path_loss_tolerance_db = 100.0;  // Very permissive for test
+        config.rf_validation.path_loss_tolerance_db = 100.0;
         let validator = PoCValidator::new(config);
-    
+
         let beacon_location = LocationData {
             latitude: 37.7749,
             longitude: -122.4194,
@@ -351,7 +351,7 @@ mod tests {
             timestamp: Timestamp::now().as_millis(),
             h3_index: "872834720ffffff".to_string(),
         };
-    
+
         let witness_location = LocationData {
             latitude: 37.7750,
             longitude: -122.4195,
@@ -360,7 +360,7 @@ mod tests {
             timestamp: Timestamp::now().as_millis(),
             h3_index: "872834720ffffff".to_string(),
         };
-    
+
         let rf_metrics = RFMetrics {
             rsrp: -70,
             rsrq: -10,
@@ -371,8 +371,7 @@ mod tests {
             frequency: 3500,
             rx_timestamp: Timestamp::now().as_millis(),
         };
-    
-        // Test that the function runs without crashing
+
         let _ = validator.validate_geometry_coherence(&beacon_location, &witness_location, &rf_metrics, 23);
     }
 }

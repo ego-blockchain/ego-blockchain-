@@ -1,9 +1,3 @@
-//! Ego Oracle — Real-time crypto price feed service
-//!
-//! Fetches prices from CoinGecko and Binance, averages them, and serves
-//! them via a REST API on port 8547. Refreshes every 30 seconds.
-//! If one source fails, the other is used. If both fail, cached (stale) prices are served.
-
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -25,15 +19,11 @@ use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PriceEntry {
     pub usd: f64,
     pub updated_at: i64,
-    /// True when both live sources failed and this is a cached value.
+
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub stale: bool,
 }
@@ -46,16 +36,10 @@ pub struct AppState {
     pub client: Client,
 }
 
-// ---------------------------------------------------------------------------
-// Static / constant data
-// ---------------------------------------------------------------------------
-
-/// EGOC is a testnet token with a fixed price of $0.01.
 const EGOC_USD: f64 = 0.01;
 const EGOC_SUPPLY: u64 = 1_000_000_000;
 const EGOC_MARKET_CAP: f64 = EGOC_USD * EGOC_SUPPLY as f64;
 
-/// Symbol → CoinGecko id mapping.
 #[allow(dead_code)]
 static COINGECKO_IDS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
@@ -67,7 +51,6 @@ static COINGECKO_IDS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     m
 });
 
-/// Symbol → Binance ticker symbol mapping.
 static BINANCE_SYMBOLS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
     let mut m = HashMap::new();
     m.insert("BTC", "BTCUSDT");
@@ -78,12 +61,6 @@ static BINANCE_SYMBOLS: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(||
     m
 });
 
-// ---------------------------------------------------------------------------
-// Price fetchers
-// ---------------------------------------------------------------------------
-
-/// Fetch prices from CoinGecko public API.
-/// Returns a map of symbol → USD price on success.
 async fn fetch_coingecko(client: &Client) -> anyhow::Result<HashMap<String, f64>> {
     let url = "https://api.coingecko.com/api/v3/simple/price\
                ?ids=ethereum,bitcoin,solana,binancecoin,matic-network\
@@ -114,8 +91,6 @@ async fn fetch_coingecko(client: &Client) -> anyhow::Result<HashMap<String, f64>
     Ok(out)
 }
 
-/// Fetch prices from Binance public ticker API.
-/// Returns a map of symbol → USD price on success.
 async fn fetch_binance(client: &Client) -> anyhow::Result<HashMap<String, f64>> {
     #[derive(Deserialize)]
     struct Ticker {
@@ -132,7 +107,6 @@ async fn fetch_binance(client: &Client) -> anyhow::Result<HashMap<String, f64>> 
         .json()
         .await?;
 
-    // Build a lookup map from Binance ticker → our symbol
     let reverse: HashMap<&str, &str> = BINANCE_SYMBOLS
         .iter()
         .map(|(sym, ticker)| (*ticker, *sym))
@@ -149,12 +123,6 @@ async fn fetch_binance(client: &Client) -> anyhow::Result<HashMap<String, f64>> 
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------
-// Price refresh loop
-// ---------------------------------------------------------------------------
-
-/// Merges two price maps by averaging values present in both, or falling back
-/// to a single source when one is missing.
 fn average_maps(
     a: HashMap<String, f64>,
     b: HashMap<String, f64>,
@@ -194,7 +162,7 @@ async fn refresh_prices(state: AppState) {
         }
         (Err(e1), Err(e2)) => {
             error!("Both price sources failed: CoinGecko={} Binance={}", e1, e2);
-            // Return empty — caller will mark existing entries stale
+
             (HashMap::new(), true)
         }
     };
@@ -202,14 +170,13 @@ async fn refresh_prices(state: AppState) {
     let mut prices = state.prices.write().await;
 
     if stale {
-        // Mark all existing entries stale; do not update USD values.
+
         for entry in prices.values_mut() {
             entry.stale = true;
         }
         return;
     }
 
-    // Upsert live prices (stale=false).
     for (sym, usd) in merged {
         prices.insert(
             sym,
@@ -221,7 +188,6 @@ async fn refresh_prices(state: AppState) {
         );
     }
 
-    // Always keep EGOC at its fixed testnet price.
     prices.insert(
         "EGOC".to_string(),
         PriceEntry {
@@ -233,24 +199,18 @@ async fn refresh_prices(state: AppState) {
 }
 
 async fn price_refresh_task(state: AppState) {
-    // Fetch immediately on startup, then every 30 seconds.
+
     loop {
         refresh_prices(state.clone()).await;
         tokio::time::sleep(Duration::from_secs(30)).await;
     }
 }
 
-// ---------------------------------------------------------------------------
-// Route handlers
-// ---------------------------------------------------------------------------
-
-/// GET /prices — full price map
 async fn handle_prices(State(state): State<AppState>) -> impl IntoResponse {
     let prices = state.prices.read().await;
     Json(prices.clone())
 }
 
-/// GET /price/:symbol — single symbol
 async fn handle_price(
     State(state): State<AppState>,
     Path(symbol): Path<String>,
@@ -272,7 +232,6 @@ async fn handle_price(
     }
 }
 
-/// GET /health
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     let prices = state.prices.read().await;
     let last_update = prices
@@ -287,7 +246,6 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
-/// GET /egoc — EGOC-specific stats
 async fn handle_egoc(State(state): State<AppState>) -> impl IntoResponse {
     let prices = state.prices.read().await;
     let updated_at = prices
@@ -303,10 +261,6 @@ async fn handle_egoc(State(state): State<AppState>) -> impl IntoResponse {
         "updated_at":  updated_at,
     }))
 }
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() {
@@ -330,7 +284,6 @@ async fn main() {
         client,
     };
 
-    // Seed EGOC immediately so the map is never empty.
     {
         let mut p = state.prices.write().await;
         p.insert(
@@ -343,10 +296,8 @@ async fn main() {
         );
     }
 
-    // Spawn background refresh task.
     tokio::spawn(price_refresh_task(state.clone()));
 
-    // CORS: allow all origins (browser dApps need this).
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)

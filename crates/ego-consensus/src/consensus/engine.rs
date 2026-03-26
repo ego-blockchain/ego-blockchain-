@@ -1,8 +1,3 @@
-// consensus/engine.rs
-//
-// Wires BFT engine and DRS scorer.
-// Method signatures match the actual bft.rs and drs.rs in this repo.
-
 use crate::aggregator::PoCEvent;
 use crate::challenge::{ChallengeService, ChallengeConfig};
 use crate::config::epoch::EpochConfig;
@@ -16,8 +11,6 @@ use std::collections::{HashMap, VecDeque};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 
-/// Engine-local validation result.
-/// (validation::ValidationResult is a type alias for Result<(), ValidationError> — not a struct)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventValidationResult {
     pub event_hash: Hash,
@@ -53,27 +46,27 @@ pub struct ConsensusEngine {
     config: ConsensusConfig,
     validators: Vec<Address>,
     pending_events: RwLock<VecDeque<PoCEvent>>,
-    /// DRS scorer — stateless, holds only weights version + params digest
+
     drs_scorer: DRSScorer,
-    /// Keypair used by the DRS scorer to sign score events
+
     scorer_keypair: KeyPair,
     bft: BftEngine,
     validated_events: RwLock<HashMap<Hash, EventValidationResult>>,
-    /// Latest DRS score per node — keyed by node_addr
+
     drs_scores: RwLock<HashMap<Address, DRSScoreEvent>>,
-    /// Epoch-based configuration for dynamic thresholds
+
     epoch_config: EpochConfig,
-    /// Challenge generation service
+
     challenge_service: Option<ChallengeService>,
-    /// Block finalization event sender for challenge generation
+
     block_finalization_sender: Option<mpsc::UnboundedSender<(BlockHeader, QuorumCertificate)>>,
 }
 
 impl ConsensusEngine {
     pub fn new(config: ConsensusConfig, validators: Vec<Address>, keypair: KeyPair) -> Self {
-        // DRSScorer::new() takes no args
+
         let drs_scorer = DRSScorer::new();
-        // Keep a separate keypair for signing score events
+
         let scorer_keypair = KeyPair::generate();
         let bft = BftEngine::new(keypair, validators.clone());
 
@@ -133,7 +126,6 @@ impl ConsensusEngine {
         };
         let is_valid = confidence >= self.config.min_consensus_threshold;
 
-        // Use epoch-based thresholds for validation
         let current_epoch = Timestamp::now().as_secs() / 3600;
         let thresholds = self.epoch_config.get_config(current_epoch);
 
@@ -158,9 +150,8 @@ impl ConsensusEngine {
         })
     }
 
-    /// DRS-aware vote — uses cached raw_score (f64 field on DRSScoreEvent).
     async fn drs_weighted_vote(&self, event: &PoCEvent, validator: &Address) -> bool {
-        // Get epoch-based thresholds
+
         let current_epoch = Timestamp::now().as_secs() / 3600;
         let thresholds = self.epoch_config.get_config(current_epoch);
 
@@ -187,15 +178,11 @@ impl ConsensusEngine {
         score >= threshold
     }
 
-    /// Cache an externally-produced DRS score event.
     pub async fn update_drs_score(&self, event: DRSScoreEvent) {
-        // node_addr is the correct field name (not node_id)
+
         self.drs_scores.write().await.insert(event.node_addr, event);
     }
 
-    /// Score a batch of nodes for one epoch.
-    /// DRSScorer::score_event takes (&DRSInputs, &KeyPair) — node_addr and epoch
-    /// are embedded in DRSInputs, not separate args.
     pub async fn score_epoch(
         &self,
         inputs_batch: Vec<DRSInputs>,
@@ -212,27 +199,22 @@ impl ConsensusEngine {
         Ok(events)
     }
 
-    /// Propose a block — sync, takes only roots (BftEngine manages height/epoch internally).
     pub fn propose_block(&self, roots: BlockRoots) -> PoCResult<BlockHeader> {
         self.bft.propose_block(roots)
     }
 
-    /// Process an incoming proposal — returns a Vote if this node accepts it.
     pub fn receive_proposal(&self, header: &BlockHeader) -> PoCResult<Option<Vote>> {
         self.bft.receive_proposal(header)
     }
 
-    /// Receive a vote — sync, takes &Vote.
     pub fn receive_vote(&self, vote: &Vote) -> PoCResult<Option<QuorumCertificate>> {
         self.bft.receive_vote(vote)
     }
 
-    /// Commit a finalized block (was commit_block — actual method is finalize_block).
     pub fn finalize_block(&self, header: BlockHeader, qc: QuorumCertificate) -> PoCResult<()> {
-        // Finalize block in BFT engine
+
         self.bft.finalize_block(header.clone(), qc.clone())?;
 
-        // Emit block finalization event for challenge generation
         if let Some(ref sender) = self.block_finalization_sender {
             if let Err(e) = sender.send((header.clone(), qc)) {
                 warn!("Failed to send block finalization event for challenge generation: {}", e);
@@ -245,7 +227,6 @@ impl ConsensusEngine {
         Ok(())
     }
 
-    /// VRF output for beacon challenge randomness.
     pub fn get_vrf_output(&self, epoch: u64) -> Option<Hash> {
         self.bft.get_vrf_output(epoch)
     }
@@ -253,22 +234,18 @@ impl ConsensusEngine {
     pub fn get_current_height(&self) -> u64 { self.bft.get_current_height() }
     pub fn get_current_epoch(&self) -> u64   { self.bft.get_current_epoch() }
 
-    /// Update epoch configuration with new thresholds
     pub fn update_epoch_config(&mut self, config: EpochConfig) {
         self.epoch_config = config;
     }
 
-    /// Get current epoch configuration
     pub fn get_epoch_config(&self) -> &EpochConfig {
         &self.epoch_config
     }
 
-    /// Enable challenge generation from finalized blocks
     pub async fn enable_challenge_generation(&mut self, challenge_config: ChallengeConfig) -> PoCResult<()> {
         let (block_sender, block_receiver) = mpsc::unbounded_channel();
         let mut challenge_service = ChallengeService::new(challenge_config);
 
-        // Start the challenge service
         challenge_service.start(block_receiver).await?;
 
         self.challenge_service = Some(challenge_service);
@@ -278,7 +255,6 @@ impl ConsensusEngine {
         Ok(())
     }
 
-    /// Subscribe a beacon node to receive challenges for specific regions
     pub fn subscribe_to_challenges(
         &mut self,
         node_id: Address,
@@ -292,14 +268,12 @@ impl ConsensusEngine {
         }
     }
 
-    /// Update regional beacon mapping for challenge generation
     pub fn update_region_beacons(&self, region_id: String, beacons: Vec<Address>) {
         if let Some(ref challenge_service) = self.challenge_service {
             challenge_service.update_region_beacons(region_id, beacons);
         }
     }
 
-    /// Get challenge generation statistics
     pub fn get_challenge_stats(&self) -> Option<crate::challenge::GeneratorStats> {
         self.challenge_service.as_ref().map(|service| service.get_stats())
     }

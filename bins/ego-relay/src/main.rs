@@ -1,10 +1,3 @@
-//! Ego Relay — libp2p circuit-relay server + HTTP store-and-forward mailbox.
-//!
-//! Port 4001 (TCP) — libp2p circuit relay v2.
-//! Port 4002 (TCP) — HTTP mailbox (POST/GET/DELETE /inbox/{hash}).
-//!
-//! Saves its keypair to `ego-relay.key` so the peer ID is stable across restarts.
-
 mod mailbox;
 
 use futures::StreamExt;
@@ -20,8 +13,6 @@ const LISTEN_PORT: u16      = 4001;
 const MAILBOX_PORT: u16     = 4002;
 const KEY_FILE: &str        = "ego-relay.key";
 
-// ── Behaviour ─────────────────────────────────────────────────────────────────
-
 #[derive(NetworkBehaviour)]
 struct RelayBehaviour {
     relay:    relay::Behaviour,
@@ -29,13 +20,10 @@ struct RelayBehaviour {
     ping:     ping::Behaviour,
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
 
-    // ── 1. Load or generate a stable keypair ─────────────────────────────────
     let keypair = if Path::new(KEY_FILE).exists() {
         let bytes = fs::read(KEY_FILE)?;
         libp2p::identity::Keypair::from_protobuf_encoding(&bytes)?
@@ -53,7 +41,6 @@ async fn main() -> anyhow::Result<()> {
     info!("║  HTTP port: {}                                    ║", MAILBOX_PORT);
     info!("╚══════════════════════════════════════════════════════╝");
 
-    // ── 2. HTTP mailbox server ────────────────────────────────────────────────
     let store      = mailbox::new_store();
     let http_app   = mailbox::router(store);
     let http_bind  = format!("0.0.0.0:{}", MAILBOX_PORT);
@@ -63,7 +50,6 @@ async fn main() -> anyhow::Result<()> {
         axum::serve(http_listener, http_app).await.unwrap();
     });
 
-    // ── 3. Build libp2p transport + behaviour ─────────────────────────────────
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -98,18 +84,13 @@ async fn main() -> anyhow::Result<()> {
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(7200)))
         .build();
 
-    // ── 4. Listen on TCP 0.0.0.0:4001 ────────────────────────────────────────
     let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", LISTEN_PORT).parse()?;
     swarm.listen_on(listen_addr)?;
 
-    // Tell the relay its public DNS address so reservation responses include
-    // a routable address.  Without this the relay only knows its private
-    // container IPs and clients get NoAddressesInReservation.
     let public_addr: Multiaddr =
         format!("/dns4/EgoRelay.egoblockchain.com/tcp/{}", LISTEN_PORT).parse()?;
     swarm.add_external_address(public_addr);
 
-    // ── 5. libp2p event loop ──────────────────────────────────────────────────
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {

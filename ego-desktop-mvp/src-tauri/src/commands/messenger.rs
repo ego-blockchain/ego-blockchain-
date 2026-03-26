@@ -14,17 +14,10 @@ use std::fs;
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager, State};
 
-/// Serialises all contacts read-modify-write operations to prevent ratchet
-/// chain corruption when PeerAnnounce events race with receive_message_inner.
-/// Must NOT be held across `.await` points.
 pub(crate) static CONTACTS_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-
-// ── Storage paths ─────────────────────────────────────────────────────────────
 
 fn contacts_path() -> std::path::PathBuf { data_dir().join("contacts.json") }
 fn messages_path() -> std::path::PathBuf { data_dir().join("messages.json") }
-
-// ── Types ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contact {
@@ -38,17 +31,16 @@ pub struct Contact {
     pub endpoint:       String,
     #[serde(default)]
     pub all_endpoints:  Vec<String>,
-    // ── Phase 4: KDF ratchet (forward secrecy) ────────────────────────────────
-    /// Hex-encoded 32-byte chain key for outgoing messages; empty = uninitialized.
+
     #[serde(default)]
     pub ratchet_send_chain: String,
-    /// Hex-encoded 32-byte chain key for incoming messages; empty = uninitialized.
+
     #[serde(default)]
     pub ratchet_recv_chain: String,
-    /// Monotonically-increasing send counter (advances each message sent).
+
     #[serde(default)]
     pub ratchet_send_count: u64,
-    /// Highest received sequence number seen so far from this contact.
+
     #[serde(default)]
     pub ratchet_recv_count: u64,
 }
@@ -63,8 +55,6 @@ pub struct Message {
     pub timestamp:    i64,
     pub outgoing:     bool,
 }
-
-// ── Storage helpers ───────────────────────────────────────────────────────────
 
 pub(crate) fn load_contacts() -> Vec<Contact> {
     let path = contacts_path();
@@ -96,8 +86,6 @@ fn save_messages(msgs: &[Message]) -> Result<(), String> {
     crate::utils::atomic_write(&messages_path(), data.as_bytes()).map_err(|e| e.to_string())
 }
 
-// ── Bundle parsers ────────────────────────────────────────────────────────────
-
 fn parse_contact_bundle(
     bundle: &str,
 ) -> Option<(String, String, String, String, String, Option<String>)> {
@@ -105,7 +93,7 @@ fn parse_contact_bundle(
     let parts: Vec<&str> = s.splitn(6, ':').collect();
 
     if parts.len() >= 5 {
-        // Legacy v1: addr:ed25519hex:kyberhex:nameb64:sharedkey[:endpointb64]
+
         let addr       = parts[0].to_string();
         let ed25519    = parts[1].to_string();
         let kyber      = parts[2].to_string();
@@ -118,7 +106,7 @@ fn parse_contact_bundle(
             .and_then(|b| String::from_utf8(b).ok());
         Some((addr, ed25519, kyber, name, shared_key, endpoint))
     } else if parts.len() == 4 {
-        // Current v2: addr:ed25519_b64:name_b64:endpoint_b64
+
         let addr     = parts[0].to_string();
         let ed25519  = hex::encode(STANDARD.decode(parts[1]).unwrap_or_default());
         let name     = STANDARD.decode(parts[2]).ok()
@@ -147,21 +135,10 @@ fn parse_msg_bundle(
         parts[5].to_string(),
     ))
 }
-// ── Phase 4: KDF ratchet helpers ──────────────────────────────────────────────
-//
-// Symmetric KDF chain with per-message key derivation:
-//
-//   For a contact pair (addr_A, addr_B) sharing `shared_key`:
-//     - Lexicographically lower address uses chain-1 for send, chain-2 for recv.
-//     - Lexicographically higher address uses chain-2 for send, chain-1 for recv.
-//   This ensures A's send chain == B's recv chain (both derive from same root).
-//
-//   Each message: msg_key = BLAKE3("ego msg key v1", chain); new_chain = BLAKE3("ego chain next v1", chain)
-//   Key derivation erases old chain keys → forward secrecy for in-order delivery.
 
 fn init_ratchet_chain(shared_key: &[u8], for_send: bool, my_addr: &str, peer_addr: &str) -> [u8; 32] {
     let lower_is_mine = my_addr < peer_addr;
-    // If lower: send=chain-1, recv=chain-2.  If higher: send=chain-2, recv=chain-1.
+
     let use_chain_1 = lower_is_mine == for_send;
     if use_chain_1 {
         blake3::derive_key("ego ratchet chain-1 v1", shared_key)
@@ -176,9 +153,6 @@ fn ratchet_advance(chain: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     (msg_key, new_chain)
 }
 
-/// Derive the encryption key for the next outgoing message.
-/// Initializes the ratchet chain on first call, then advances it.
-/// Returns `(enc_key_bytes, current_send_seq)`.
 fn derive_send_key_and_seq(contact: &mut Contact, my_addr: &str) -> Result<([u8; 32], u64), String> {
     let shared_bytes = hex::decode(&contact.shared_key_hex)
         .map_err(|_| "Invalid shared key".to_string())?;
@@ -200,10 +174,6 @@ fn derive_send_key_and_seq(contact: &mut Contact, my_addr: &str) -> Result<([u8;
     Ok((msg_key, seq))
 }
 
-/// Try to decrypt `ct` using the ratchet recv chain with a skip window of up to
-/// SKIP_WINDOW steps (handles mild out-of-order delivery).
-/// On success, advances the recv chain and updates `contact`.
-/// Returns `Some(plaintext)` on success, `None` if all ratchet attempts fail.
 fn try_decrypt_ratchet(
     contact:   &mut Contact,
     my_addr:   &str,
@@ -238,11 +208,8 @@ fn try_decrypt_ratchet(
     None
 }
 
-// ── resolve_endpoint ──────────────────────────────────────────────────────────
-// Falls back to local peer cache (populated by DHT discovery and PeerAnnounce).
-// HTTP relay lookup removed — relay decommissioned.
 async fn resolve_endpoint(contact_addr: &str, stored_endpoint: &str) -> String {
-    // Check local peer cache (populated by PeerAnnounce + DHT)
+
     let cache = crate::p2p::load_peer_cache();
     if let Some(entry) = cache.iter().find(|p| p.address == contact_addr) {
         if !entry.endpoint.is_empty() {
@@ -270,10 +237,6 @@ async fn resolve_endpoint(contact_addr: &str, stored_endpoint: &str) -> String {
     stored_endpoint.to_string()
 }
 
-// ── Core receive logic ────────────────────────────────────────────────────────
-
-/// Returns `(message, is_new)` — `is_new` is false if this message was already stored (duplicate).
-/// `seq` is the sender's sequence number (0 = unknown / old client).
 pub(crate) fn receive_message_inner(bundle: &str, seq: u64) -> Result<(Message, bool), String> {
     let (from, to, ts, mtype, nonce_hex, ct_hex) = parse_msg_bundle(bundle)
         .ok_or_else(|| "Invalid message bundle — must start with egomsg1:".to_string())?;
@@ -292,12 +255,8 @@ pub(crate) fn receive_message_inner(bundle: &str, seq: u64) -> Result<(Message, 
     let nonce_bytes = hex::decode(&nonce_hex).map_err(|_| "Bad nonce".to_string())?;
     let ct_bytes    = hex::decode(&ct_hex).map_err(|_| "Bad ciphertext".to_string())?;
 
-    // Load my own address for ratchet key direction
     let my_addr = crate::ledger::Ledger::load().address;
 
-    // ── Phase 4: try ratchet decrypt first, then fall back to static key ──────
-    // Hold CONTACTS_LOCK for the entire load→decrypt→save region to prevent
-    // PeerAnnounce handlers from overwriting ratchet chain state concurrently.
     let _cg = CONTACTS_LOCK.lock().unwrap();
     let mut contacts = load_contacts();
     let contact_pos = contacts.iter().position(|c| c.address == from)
@@ -306,9 +265,8 @@ pub(crate) fn receive_message_inner(bundle: &str, seq: u64) -> Result<(Message, 
     let (content, ratchet_ok) = {
         let contact = &mut contacts[contact_pos];
 
-        // Attempt ratchet decryption (with skip window for mild reordering)
         if let Some(pt) = try_decrypt_ratchet(contact, &my_addr, &nonce_bytes, &ct_bytes) {
-            // Phase 5: track received seq for gap detection
+
             if seq > 0 && seq > contact.ratchet_recv_count {
                 if seq > contact.ratchet_recv_count + 1 {
                     eprintln!(
@@ -324,7 +282,7 @@ pub(crate) fn receive_message_inner(bundle: &str, seq: u64) -> Result<(Message, 
                 .map_err(|_| "Decrypted bytes are not valid UTF-8".to_string())?;
             (text, true)
         } else {
-            // Ratchet failed — fall back to static shared key (old sender or chain diverged)
+
             let key_bytes = hex::decode(&contact.shared_key_hex)
                 .map_err(|_| "Invalid shared key".to_string())?;
             let cipher = Aes256Gcm::new_from_slice(&key_bytes)
@@ -339,7 +297,7 @@ pub(crate) fn receive_message_inner(bundle: &str, seq: u64) -> Result<(Message, 
     };
 
     if ratchet_ok {
-        // Persist advanced ratchet chain state
+
         let _ = save_contacts(&contacts);
     }
 
@@ -362,11 +320,6 @@ pub(crate) fn receive_message_inner(bundle: &str, seq: u64) -> Result<(Message, 
     Ok((msg, is_new))
 }
 
-// ── Commands ──────────────────────────────────────────────────────────────────
-
-/// Generate a shareable contact card.
-/// Always waits for relay circuit so the card contains an address that works
-/// cross-internet, not a raw LAN IP.
 #[tauri::command]
 pub async fn get_my_contact_bundle(
     state: State<'_, AppState>,
@@ -382,23 +335,55 @@ pub async fn get_my_contact_bundle(
 
     // Return immediately if we already have a relay circuit (the common case —
     // circuit is ready within 3-5 s of startup, well before the user opens
-    // the contact card screen). Only block if we genuinely don't have it yet,
-    // and cap the wait at 3 s so the UI never freezes for 10+ seconds.
+    // the contact card screen). Only block if we genuinely don't have it yet.
     let current = p2p::get_public_endpoint().await;
     let public_endpoint = if current.contains("/p2p-circuit") {
-        current  // already confirmed — return instantly
+        current
     } else {
-        p2p::wait_for_public_endpoint(3).await  // not yet ready — short wait only
+        p2p::wait_for_public_endpoint(3).await
     };
-    let endpoint_b64    = STANDARD.encode(public_endpoint.as_bytes());
+    let endpoint_b64 = STANDARD.encode(public_endpoint.as_bytes());
 
+    // Ensure a bundle token exists in the ledger
+    let token = {
+        let mut l = Ledger::load();
+        if l.bundle_token.is_empty() {
+            let mut bytes = [0u8; 16];
+            OsRng.fill_bytes(&mut bytes);
+            l.bundle_token = hex::encode(bytes);
+            let _ = l.save();
+        }
+        l.bundle_token.clone()
+    };
+
+    // Format: egocontact1:{addr}:{ed25519_b64}:{name_b64}:{endpoint_b64}:{token}
     Ok(format!(
-        "egocontact1:{}:{}:{}:{}",
-        my_addr, ed25519_b64, name_b64, endpoint_b64
+        "egocontact1:{}:{}:{}:{}:{}",
+        my_addr, ed25519_b64, name_b64, endpoint_b64, token
     ))
 }
 
-/// Import a contact bundle and send a contact request.
+/// Revoke the current contact bundle by rotating the token.
+/// All pending-in requests are cleared. Existing approved contacts are unaffected.
+#[tauri::command]
+pub async fn revoke_contact_bundle() -> Result<String, EgoDesktopError> {
+    let mut ledger = Ledger::load();
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    ledger.bundle_token = hex::encode(bytes);
+    ledger.save().map_err(EgoDesktopError::FileSystemError)?;
+
+    // Clear all pending_in requests — they used the old bundle
+    {
+        let _cg = CONTACTS_LOCK.lock().unwrap();
+        let mut contacts = load_contacts();
+        contacts.retain(|c| c.status != "pending_in");
+        let _ = save_contacts(&contacts);
+    }
+
+    Ok(ledger.bundle_token)
+}
+
 #[tauri::command]
 pub async fn import_contact(
     _app: AppHandle,
@@ -412,6 +397,13 @@ pub async fn import_contact(
                 "Invalid contact bundle — must start with egocontact1:".into(),
             )
         })?;
+
+    // Extract bundle token from 5th field (if present) to forward in ContactRequest
+    let bundle_token: Option<String> = bundle.trim()
+        .strip_prefix("egocontact1:")
+        .and_then(|s| s.splitn(6, ':').nth(4))
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
 
     let ledger  = Ledger::load();
     let my_addr = ledger.address.clone();
@@ -501,6 +493,7 @@ pub async fn import_contact(
         from_kyber:      my_kyber_hex,
         from_shared_key: shared_key_hex,
         from_endpoint:   my_endpoint,
+        bundle_token,
     };
     if let Err(e) = p2p::send_message(&endpoint, &request).await {
         eprintln!("[Messenger] ContactRequest delivery deferred for {}: {}", addr, e);
@@ -511,9 +504,6 @@ pub async fn import_contact(
     Ok(contact)
 }
 
-/// Approve an incoming contact request.
-/// FIX: includes our relay circuit endpoint in the approval response so the
-/// requester learns our current address even if our contact card is stale.
 #[tauri::command]
 pub async fn approve_contact_request(
     state: State<'_, AppState>,
@@ -573,7 +563,7 @@ pub async fn approve_contact_request(
                 city:      None,
                 country:   None,
                 coverage_score: 0,
-                ed25519_pubkey: String::new(),
+                dilithium_pubkey: String::new(),
             };
             if let Err(e) = p2p::send_message(&resolved_peer_ep, &announce).await {
                 eprintln!("[P2P] Could not send PeerAnnounce after approval: {}", e);
@@ -589,7 +579,6 @@ pub async fn approve_contact_request(
     Ok(contact)
 }
 
-/// Decline an incoming contact request.
 #[tauri::command]
 pub async fn decline_contact_request(
     state: State<'_, AppState>,
@@ -641,7 +630,7 @@ pub async fn get_contacts() -> Result<Vec<Contact>, EgoDesktopError> {
 
 /// Encrypt and deliver a chat message.
 /// FIX: resolves the peer's latest endpoint from the relay cache before
-/// sending so stale stored endpoints don't cause silent delivery failures.
+
 #[tauri::command]
 pub async fn send_message(
     app: AppHandle,
@@ -655,13 +644,12 @@ pub async fn send_message(
 
     // ── Phase 4: ratchet — load contacts mutably to advance the send chain ────
     // Hold CONTACTS_LOCK so ratchet send-chain advance doesn't race with
-    // concurrent PeerAnnounce or receive_message_inner saves.
+
     let _cg = CONTACTS_LOCK.lock().unwrap();
     let mut contacts = load_contacts();
     let contact_pos = contacts.iter().position(|c| c.address == contact_addr && c.status == "approved")
         .ok_or_else(|| EgoDesktopError::NotFound("Contact not found or not approved".into()))?;
 
-    // Derive per-message encryption key from KDF chain (advances chain state).
     let (enc_key_bytes, send_seq) = derive_send_key_and_seq(&mut contacts[contact_pos], &my_addr)
         .map_err(EgoDesktopError::CryptoError)?;
 
@@ -683,16 +671,12 @@ pub async fn send_message(
         my_addr, contact_addr, ts, message_type, nonce_hex, ct_hex
     );
 
-    // Clone endpoint data from contact before saving contacts
     let stored_endpoint = contacts[contact_pos].endpoint.clone();
     let all_endpoints   = contacts[contact_pos].all_endpoints.clone();
 
-    // Persist the advanced ratchet chain state immediately, then release lock
-    // so delivery (spawn below) doesn't hold CONTACTS_LOCK while doing I/O.
     save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
     drop(_cg);
 
-    // Capture before content/message_type are moved into Message
     let is_file_bundle  = message_type == "file_bundle";
     let raw_content     = content.clone();
 
@@ -707,14 +691,11 @@ pub async fn send_message(
         outgoing:     true,
     });
     save_messages(&msgs).map_err(EgoDesktopError::FileSystemError)?;
-    // Notify MessengerPage (open in any tab) so it refreshes immediately.
+
     let _ = app.emit_all("ego://message-sent", serde_json::json!({ "to": contact_addr }));
     let contact_addr_key = contact_addr.clone();
     tokio::spawn(async move {
-        // ── File bundles: proactively push FileData to DHT before anything else ──
-        // This guarantees the file is available in the receiver's DHT inbox even
-        // if the direct connection or relay is down.  Direct delivery below is
-        // then just an optimistic fast-path.
+
         if is_file_bundle {
             let parts: Vec<&str> = raw_content.splitn(5, ':').collect();
             if parts.len() >= 2 {
@@ -723,15 +704,13 @@ pub async fn send_message(
                 if let Some(file) = ledger.stored_files.iter().find(|f| f.cid == cid).cloned() {
 
                     if cid.starts_with("egomfd1") {
-                        // ── Block-based: queue ManifestData in local outbox ──────────
-                        // Relay is concierge-only; file metadata goes P2P or outbox.
-                        // Blocks are in the DHT global store — receiver fetches them.
+
                         if let Ok(manifest) = crate::blocks::load_manifest(&cid) {
                             if let Ok(manifest_json) = serde_json::to_string(&manifest) {
                                 let manifest_msg = p2p::P2PMessage::ManifestData {
                                     manifest_cid:  cid.clone(),
                                     manifest_json,
-                                    key_hex64:     file.key_nonce_hex.clone(),
+                                    key_hex64:     hex::encode(crate::ledger::unprotect_key_bytes(&file.key_nonce_hex)),
                                     file_name:     file.name.clone(),
                                     from_addr:     my_addr.clone(),
                                 };
@@ -743,7 +722,7 @@ pub async fn send_message(
                             }
                         }
                     } else if !file.local_path.is_empty() && !file.local_path.starts_with("sender:") {
-                        // ── Legacy single-file: queue small FileData in local outbox ──
+
                         match std::fs::read(&file.local_path) {
                             Ok(enc_bytes) => {
                                 const OUTBOX_FILE_LIMIT: usize = 3 * 1024 * 1024;
@@ -755,7 +734,7 @@ pub async fn send_message(
                                         cid:           cid.clone(),
                                         enc_data_b64,
                                         file_name:     file.name.clone(),
-                                        key_nonce_hex: file.key_nonce_hex.clone(),
+                                        key_nonce_hex: hex::encode(crate::ledger::unprotect_key_bytes(&file.key_nonce_hex)),
                                     };
                                     crate::commands::outbox::enqueue(
                                         &contact_addr_key, &stored_endpoint, &file_data
@@ -774,10 +753,6 @@ pub async fn send_message(
             }
         }
 
-        // ── Deliver ChatMessage (P2P direct → local outbox fallback) ─────────
-        // The relay is a concierge for discovery only — chat goes P2P.
-        // If direct delivery fails we queue in the LOCAL outbox and retry
-        // when the peer next announces online (PeerAnnounce or 30s poll).
         let p2p_msg = p2p::P2PMessage::ChatMessage { bundle, seq: send_seq };
         if stored_endpoint.is_empty() {
             eprintln!("[Messenger] No endpoint for {} — queued in outbox + DHT inbox", contact_addr_key);
@@ -789,12 +764,10 @@ pub async fn send_message(
         if let Err(e) = p2p::send_message(&endpoint, &p2p_msg).await {
             eprintln!("[Messenger] direct delivery to {} failed: {} — queuing outbox + DHT inbox", contact_addr_key, e);
             crate::commands::outbox::enqueue(&contact_addr_key, &endpoint, &p2p_msg);
-            // DHT inbox ensures delivery even when the stored endpoint is stale
-            // and PeerAnnounce hasn't propagated the peer's new relay circuit yet.
+
             deposit_in_relay_inbox(&my_addr, &contact_addr_key, &p2p_msg).await;
         }
 
-        // ── Also try direct ManifestData/FileData delivery as a fast-path ────
         if is_file_bundle {
             let parts: Vec<&str> = raw_content.splitn(5, ':').collect();
             if parts.len() >= 2 {
@@ -807,7 +780,7 @@ pub async fn send_message(
                                 let manifest_msg = p2p::P2PMessage::ManifestData {
                                     manifest_cid:  cid.clone(),
                                     manifest_json,
-                                    key_hex64:     file.key_nonce_hex.clone(),
+                                    key_hex64:     hex::encode(crate::ledger::unprotect_key_bytes(&file.key_nonce_hex)),
                                     file_name:     file.name.clone(),
                                     from_addr:     my_addr.clone(),
                                 };
@@ -824,7 +797,7 @@ pub async fn send_message(
                                 cid:           cid.clone(),
                                 enc_data_b64,
                                 file_name:     file.name.clone(),
-                                key_nonce_hex: file.key_nonce_hex.clone(),
+                                key_nonce_hex: hex::encode(crate::ledger::unprotect_key_bytes(&file.key_nonce_hex)),
                             };
                             if let Ok(()) = p2p::send_message(&endpoint, &file_data).await {
                                 eprintln!("[EgoSafe] FileData sent directly to {} ({} bytes)", contact_addr_key, enc_bytes.len());
@@ -909,15 +882,10 @@ pub async fn rename_contact(
     save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)
 }
 
-/// Deposit a P2PMessage into the DHT inbox for offline delivery.
-/// Fully P2P — no central relay server.
 pub async fn deposit_in_relay_inbox(from_addr: &str, to_addr: &str, msg: &crate::p2p::P2PMessage) {
     crate::p2p::dht_inbox_deposit(from_addr, to_addr, msg).await;
 }
 
-/// Poll the DHT inbox for messages addressed to `my_addr` and
-/// dispatch each one through the normal incoming-message handler.
 pub async fn poll_relay_inbox(my_addr: &str, _app: &tauri::AppHandle) {
     crate::p2p::dht_inbox_poll(my_addr).await;
 }
-

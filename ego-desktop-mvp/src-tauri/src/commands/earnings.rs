@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::tokenomics::{
-    STORAGE_RATE_UEGOC_PER_GB_DAY, CONSENSUS_DAILY_UEGOC, RETRIEVAL_DAILY_UEGOC,
-    COVERAGE_DAILY_UEGOC, node_reward_scale,
+    storage_reward_uegoc, consensus_daily_uegoc, coverage_daily_uegoc,
+    retrieval_reward_uegoc, node_reward_scale,
 };
 
 #[tauri::command]
@@ -18,15 +18,30 @@ pub async fn get_earnings_data(
 
     // ── Reward rates ─────────────────────────────────────────────────────────
 
-    let allocated_gb = ledger.storage_allocated_bytes as f64 / 1_000_000_000.0;
+    // Only count bytes from files that are actively passing PoSt challenges.
+    // Files with proof_suspended_until > now are withheld from the reward base.
+    let provable_bytes: u64 = ledger.stored_files.iter()
+        .filter(|f| {
+            f.status == "Active"
+                && (f.owner.is_empty() || f.owner == ledger.address)
+                && f.proof_suspended_until <= now
+                && !f.local_path.is_empty()
+                && !f.local_path.starts_with("sender:")
+        })
+        .map(|f| f.encrypted_size)
+        .sum();
+    // Use the smaller of: allocated capacity vs. sum of bytes we can actually prove.
+    // This prevents claiming rewards for space you declare but don't fill.
+    let allocated_gb = (ledger.storage_allocated_bytes as f64 / 1_000_000_000.0)
+        .min(provable_bytes as f64 / 1_000_000_000.0 + 0.001);
 
     // Scale all node-pool rewards by the depletion factor (full until 80% used, tapers to 0).
     let chain = load_chain();
     let scale = node_reward_scale(&chain);
 
-    let daily_storage  = (allocated_gb * STORAGE_RATE_UEGOC_PER_GB_DAY * scale) as u64;
-    let consensus_rate = (CONSENSUS_DAILY_UEGOC as f64 * scale) as u64;
-    let retrieval_rate = (RETRIEVAL_DAILY_UEGOC as f64 * scale) as u64;
+    let daily_storage  = (storage_reward_uegoc(allocated_gb) as f64 * scale) as u64;
+    let consensus_rate = (consensus_daily_uegoc() as f64 * scale) as u64;
+    let retrieval_rate = (retrieval_reward_uegoc(1.0) as f64 * scale) as u64; // per GB served
 
     // Coverage reward is only earned while the node is online.
     let coverage_online = state
@@ -38,24 +53,18 @@ pub async fn get_earnings_data(
         .map(|s| s.is_online)
         .unwrap_or(true); // default true when coverage hasn't been checked yet
 
-    let coverage_rate  = if coverage_online { (COVERAGE_DAILY_UEGOC as f64 * scale) as u64 } else { 0 };
+    let coverage_rate  = if coverage_online { (coverage_daily_uegoc() as f64 * scale) as u64 } else { 0 };
 
     let daily_total = daily_storage
         .saturating_add(consensus_rate)
         .saturating_add(coverage_rate)
         .saturating_add(retrieval_rate);
 
-    // ── Credit elapsed earnings to the real ledger balance ───────────────────
-    // This makes the balance actually grow while the app is open.
-    // Time the app is closed does NOT earn (last_earnings_credit resets on
-    // init_wallet → set_session_start).
-
     let last_credit = state.get_last_earnings_credit();
     if last_credit > 0 && now > last_credit {
         let elapsed_secs = (now - last_credit) as f64;
         let credit = (daily_total as f64 * elapsed_secs / 86_400.0) as u64;
-        // Only write to chain when at least 1000 uEGOC (0.001 EGOC) has accrued
-        // to avoid spamming the chain with sub-second micro-rewards.
+
         if credit >= 1_000 {
             let mut chain_w = load_chain();
             let reward_hash = format!(
@@ -85,9 +94,6 @@ pub async fn get_earnings_data(
     }
     state.set_last_earnings_credit(now);
 
-    // ── Derived stats ─────────────────────────────────────────────────────────
-
-    // Reload chain to capture any reward TX just written above.
     let chain = load_chain();
     let total_earned: u64 = chain
         .transactions
@@ -99,13 +105,13 @@ pub async fn get_earnings_data(
         })
         .map(|tx| tx.amount)
         .sum();
-    let pending      = daily_storage / 24; // ~1 hour of storage reward
+    let pending      = daily_storage / 24;
 
     let session_started = state.get_session_started();
 
     let earnings = EarningsData {
         daily_rewards:  daily_total,
-        epoch_rewards:  daily_total.saturating_mul(7), // 7-day epoch
+        epoch_rewards:  daily_total.saturating_mul(7),
         total_earned,
         drs_multiplier: 1.5,
         reward_breakdown: RewardBreakdown {
@@ -122,14 +128,6 @@ pub async fn get_earnings_data(
     state.update_earnings_data(earnings.clone());
     Ok(earnings)
 }
-
-// ── submit_poc_event ──────────────────────────────────────────────────────────
-//
-// Signs a Proof of Coverage event with the wallet's Ed25519 key and submits
-// it to the relay. The relay verifies the signature, records the event, updates
-// the DRS score for this address, and emits a coverage reward transaction.
-//
-// Called from the frontend EarningsPage whenever a PoC beacon fires.
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PocEventResult {
@@ -251,7 +249,7 @@ pub async fn get_poc_score(
             last_event: None, is_validator: false, validator_rank: None,
         });
     }
-    let _ = state; // AppState not needed for HTTP fetch
+    let _ = state;
     let url = format!("{}/poc/score/{}", crate::p2p::ORACLE_RPC, address);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))

@@ -7,18 +7,17 @@ use ego_core::Address;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-// Whitepaper constants
 pub const MIN_DIVERSITY_H3_CELLS: usize = 2;
 pub const MIN_DIVERSITY_ACCOUNTS: usize = 2;
-pub const MIN_NONCE_BINDING_FRACTION: f64 = 0.6; // 60%
-pub const RMSE_THRESHOLD_UMA: f64 = 10.0; // dB
-pub const RMSE_THRESHOLD_UMI: f64 = 10.0; // dB
-pub const RMSE_THRESHOLD_RURAL: f64 = 8.0; // dB
-pub const DENSITY_THRESHOLD_METERS: f32 = 1.0; // Horizontal co-location
-pub const DENSITY_THRESHOLD_VERTICAL: f32 = 2.0; // Vertical co-location
-pub const DENSITY_PENALTY_PER_DEVICE: f64 = 0.10; // -10% per extra device
-pub const DENSITY_PENALTY_FLOOR: f64 = 0.40; // Floor at 40%
-pub const MIN_QUALITY_SCORE: f64 = 0.5; // Default q_min
+pub const MIN_NONCE_BINDING_FRACTION: f64 = 0.6;
+pub const RMSE_THRESHOLD_UMA: f64 = 10.0;
+pub const RMSE_THRESHOLD_UMI: f64 = 10.0;
+pub const RMSE_THRESHOLD_RURAL: f64 = 8.0;
+pub const DENSITY_THRESHOLD_METERS: f32 = 1.0;
+pub const DENSITY_THRESHOLD_VERTICAL: f32 = 2.0;
+pub const DENSITY_PENALTY_PER_DEVICE: f64 = 0.10;
+pub const DENSITY_PENALTY_FLOOR: f64 = 0.40;
+pub const MIN_QUALITY_SCORE: f64 = 0.5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationResult {
@@ -52,10 +51,10 @@ pub struct PathLossCheck {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum PathLossModel {
-    UMa,       // Urban Macro
-    UMi,       // Urban Micro
-    Rural,     // Rural/Suburban
-    FreeSpace, // Fallback
+    UMa,
+    UMi,
+    Rural,
+    FreeSpace,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,7 +67,6 @@ pub struct NonceCheck {
     pub nonce_score: f64,
 }
 
-/// Whitepaper: Verify witness diversity (≥2 H3 cells and ≥2 accounts)
 pub fn verify_witness_diversity(
     witness_reports: &[WitnessReport],
 ) -> PoCResult<DiversityCheck> {
@@ -88,7 +86,6 @@ pub fn verify_witness_diversity(
     let min_h3_cells_met = unique_h3_count >= MIN_DIVERSITY_H3_CELLS;
     let min_accounts_met = unique_account_count >= MIN_DIVERSITY_ACCOUNTS;
 
-    // Diversity score: normalize to [0, 1]
     let h3_diversity = (unique_h3_count as f64 / MIN_DIVERSITY_H3_CELLS as f64).min(1.0);
     let account_diversity = (unique_account_count as f64 / MIN_DIVERSITY_ACCOUNTS as f64).min(1.0);
     let diversity_score = (h3_diversity + account_diversity) / 2.0;
@@ -112,7 +109,7 @@ fn calculate_haversine_distance(loc1: &LocationData, loc2: &LocationData) -> f32
         + lat1.cos() * lat2.cos() * (delta_lon / 2.0).sin().powi(2);
     let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
 
-    6371.0 * c as f32 // Earth radius in km
+    6371.0 * c as f32
 }
 
 fn calculate_path_loss_error(
@@ -121,8 +118,7 @@ fn calculate_path_loss_error(
 ) -> f32 {
     let beacon_location = &beacon_announcement.location;
     let witness_location = &witness_report.witness_location;
-    
-    // FIXED: Use local function instead of ego_core::geo
+
     let distance_km = calculate_haversine_distance(witness_location, beacon_location);
     let distance_m = (distance_km * 1000.0).max(1.0) as f32;
 
@@ -155,11 +151,10 @@ fn calculate_path_loss_error(
     let expected_rsrp = tx_power_dbm - path_loss;
     let actual_rsrp = witness_report.rf_metrics.rsrp;
     let error = (expected_rsrp - actual_rsrp as f32).abs();
-    
+
     error
 }
 
-/// Whitepaper: Calculate path-loss RMSE across all witnesses
 pub fn calculate_path_loss_rmse(
     beacon_announcement: &BeaconAnnouncement,
     witness_reports: &[WitnessReport],
@@ -179,7 +174,6 @@ pub fn calculate_path_loss_rmse(
     mse.sqrt() as f32
 }
 
-/// Whitepaper: Verify 3GPP path-loss fitting
 pub fn verify_3gpp_path_loss(
     witness_reports: &[WitnessReport],
     beacon_announcement: &BeaconAnnouncement,
@@ -195,7 +189,6 @@ pub fn verify_3gpp_path_loss(
         });
     }
 
-    // Determine model type based on average distance
     let beacon_location = &beacon_announcement.location;
     let avg_distance: f32 = witness_reports
         .iter()
@@ -223,7 +216,6 @@ pub fn verify_3gpp_path_loss(
     let fit_score = (1.0 - (rmse / threshold_db)).max(0.0).min(1.0);
     let acceptable = rmse <= threshold_db;
 
-    // Count outliers (errors > 25 dB)
     let outlier_count = witness_reports
         .iter()
         .filter(|r| {
@@ -242,7 +234,6 @@ pub fn verify_3gpp_path_loss(
     })
 }
 
-/// Whitepaper: Co-beacon nonce binding verification with custom threshold
 pub fn verify_nonce_binding_with_threshold(
     witness_reports: &[WitnessReport],
     min_binding_fraction: f64,
@@ -266,7 +257,6 @@ pub fn verify_nonce_binding_with_threshold(
 
     let min_fraction_met = binding_fraction >= min_binding_fraction;
 
-    // Detect replay attacks: check for duplicate nonces
     let mut nonce_map: HashMap<Vec<u8>, Vec<Address>> = HashMap::new();
     for report in witness_reports {
         if let Some(ref co_beacon) = report.co_beacon_verification {
@@ -281,7 +271,6 @@ pub fn verify_nonce_binding_with_threshold(
 
     let replay_detected = nonce_map.values().any(|addresses| addresses.len() > 1);
 
-    // Nonce score: normalize to [0, 1]
     let nonce_score = (binding_fraction / min_binding_fraction).min(1.0);
 
     Ok(NonceCheck {
@@ -294,13 +283,10 @@ pub fn verify_nonce_binding_with_threshold(
     })
 }
 
-/// Whitepaper: Co-beacon nonce binding verification (legacy version)
 pub fn verify_nonce_binding(witness_reports: &[WitnessReport]) -> PoCResult<NonceCheck> {
     verify_nonce_binding_with_threshold(witness_reports, MIN_NONCE_BINDING_FRACTION)
 }
 
-/// Whitepaper: Deterministic quality score calculation
-/// q = 0.4·fit + 0.2·diversity + 0.2·radius + 0.2·nonce − penalties
 pub fn calculate_deterministic_quality_score(
     path_loss_check: &PathLossCheck,
     diversity_check: &DiversityCheck,
@@ -322,8 +308,6 @@ pub fn calculate_deterministic_quality_score(
     raw_quality.clamp(0.0, 1.0)
 }
 
-/// Whitepaper: LDM density penalty calculation
-/// For n devices in ~1m² (time-weighted): LDM = max(1 − 0.10·(n−1), 0.40)
 pub fn apply_density_penalty(witness_reports: &[WitnessReport]) -> f64 {
     if witness_reports.len() < 2 {
         return 0.0;
@@ -375,7 +359,6 @@ pub fn apply_density_penalty(witness_reports: &[WitnessReport]) -> f64 {
     1.0 - ldm
 }
 
-/// Complete validation check per whitepaper with epoch-aware thresholds
 pub fn validate_poc_bundle_with_epoch_config(
     witness_reports: &[WitnessReport],
     beacon_announcement: &BeaconAnnouncement,
@@ -391,8 +374,6 @@ pub fn validate_poc_bundle_with_epoch_config(
     )
 }
 
-/// Complete validation check per whitepaper
-/// DEPRECATED: Use validate_poc_bundle_with_epoch_config for new code
 pub fn validate_poc_bundle(
     witness_reports: &[WitnessReport],
     beacon_announcement: &BeaconAnnouncement,
@@ -401,7 +382,6 @@ pub fn validate_poc_bundle(
     validate_poc_bundle_impl(witness_reports, beacon_announcement, quality_threshold, None)
 }
 
-/// Internal implementation with optional epoch config
 fn validate_poc_bundle_impl(
     witness_reports: &[WitnessReport],
     beacon_announcement: &BeaconAnnouncement,
@@ -432,7 +412,6 @@ fn validate_poc_bundle_impl(
         ));
     }
 
-    // Use epoch-based nonce binding threshold if available
     let min_nonce_binding = epoch_config
         .map(|cfg| cfg.quality_thresholds.min_nonce_binding_fraction)
         .unwrap_or(MIN_NONCE_BINDING_FRACTION);
@@ -494,17 +473,16 @@ fn validate_poc_bundle_impl(
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ego_core::{Hash, KeyPair, Timestamp};
-    use crate::witness::report::{CoBeaconVerification, TimeSyncData}; // Remove ReportMetadata
+    use crate::witness::report::{CoBeaconVerification, TimeSyncData};
 
     fn create_test_witness(lat: f64, lon: f64, valid_nonce: bool) -> WitnessReport {
         let keypair = KeyPair::generate();
         let witness_id = ego_core::Address::from_public_key(&keypair.public_key());
-        
+
         let rf_metrics = RFMetrics {
             rsrp: -85,
             rsrq: -10,
@@ -515,7 +493,7 @@ mod tests {
             frequency: 3500,
             rx_timestamp: Timestamp::now().as_millis(),
         };
-    
+
         let witness_location = LocationData {
             latitude: lat,
             longitude: lon,
@@ -524,7 +502,7 @@ mod tests {
             timestamp: Timestamp::now().as_millis(),
             h3_index: format!("8728347{}ffffff", (lat * 100.0) as i32 % 10),
         };
-    
+
         let beacon_location = LocationData {
             latitude: 37.7749,
             longitude: -122.4194,
@@ -533,16 +511,16 @@ mod tests {
             timestamp: Timestamp::now().as_millis(),
             h3_index: "87283472bffffff".to_string(),
         };
-    
+
         let time_sync = TimeSyncData {
             rx_timestamp_ms: Timestamp::now().as_millis(),
             tx_timestamp_ms: Timestamp::now().as_millis(),
             time_of_flight_ns: 0,
             clock_offset_ms: 0,
             gps_timestamp: Some(Timestamp::now().as_millis()),
-            ntp_synced: true,  // ADDED
+            ntp_synced: true,
         };
-    
+
         let mut report = WitnessReport {
             witness_id,
             beacon_id: Address::new([1u8; 20]),
@@ -556,10 +534,10 @@ mod tests {
             signature: keypair.sign(b"test"),
             public_key: keypair.public_key(),
             co_beacon_verification: None,
-            metadata: Vec::new(),  // CHANGED
+            metadata: Vec::new(),
             slice_context: None,
         };
-    
+
         if valid_nonce {
             report.co_beacon_verification = Some(CoBeaconVerification {
                 received_nonce: vec![3u8; 16],
@@ -569,7 +547,7 @@ mod tests {
                 side_channel_rssi: Some(-45),
             });
         }
-    
+
         report
     }
 
@@ -641,14 +619,12 @@ mod tests {
         ));
     }
 
-
 #[test]
 fn test_nonce_binding_sufficient() {
     let mut witness1 = create_test_witness(37.7749, -122.4194, true);
     let mut witness2 = create_test_witness(37.7849, -122.4094, true);
     let mut witness3 = create_test_witness(37.7649, -122.4294, true);
 
-    // Give each witness a UNIQUE nonce
     if let Some(ref mut co_beacon) = witness1.co_beacon_verification {
         co_beacon.received_nonce = vec![1u8; 16];
     }
@@ -664,7 +640,7 @@ fn test_nonce_binding_sufficient() {
     let result = verify_nonce_binding(&witnesses).unwrap();
     assert!(result.min_fraction_met);
     assert_eq!(result.binding_fraction, 1.0);
-    assert!(!result.replay_detected); // Now should pass
+    assert!(!result.replay_detected);
 }
 
     #[test]
@@ -685,7 +661,6 @@ fn test_nonce_binding_sufficient() {
         let mut witness1 = create_test_witness(37.7749, -122.4194, true);
         let mut witness2 = create_test_witness(37.7849, -122.4094, true);
 
-        // Set same nonce (replay)
         let duplicate_nonce = vec![99u8; 16];
         if let Some(ref mut co_beacon) = witness1.co_beacon_verification {
             co_beacon.received_nonce = duplicate_nonce.clone();
@@ -798,7 +773,7 @@ fn test_nonce_binding_sufficient() {
         ];
 
         let result = validate_poc_bundle(&witnesses, &beacon, MIN_QUALITY_SCORE).unwrap();
-        
+
         if !result.valid {
             println!("Validation errors: {:?}", result.errors);
         }

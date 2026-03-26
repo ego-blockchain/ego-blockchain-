@@ -7,14 +7,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use tauri::State;
-
-// ── Pending TX 2FA store ──────────────────────────────────────────────────────
-// tx_id → (LedgerTx, expires_unix_ts)
+use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Key, Nonce};
+use crate::ledger::PresaleIouRecord;
 
 static PENDING_TXS: Lazy<Mutex<HashMap<String, (LedgerTx, i64)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-// tx_id → failed attempt count
 static TX_ATTEMPTS: Lazy<Mutex<HashMap<String, u32>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -23,12 +21,14 @@ pub struct Balance {
     pub egoc: u64,
     pub uegoc: u64,
     pub formatted: String,
+    pub egusd: u64,
+    pub uegusd: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SendTransactionRequest {
     pub to_address: String,
-    pub amount: u64, // in uEGOC
+    pub amount: u64,
     pub memo: Option<String>,
 }
 
@@ -40,31 +40,28 @@ pub struct TransactionResponse {
     pub block_height: Option<u64>,
 }
 
-// ── get_balance ───────────────────────────────────────────────────────────────
-//
-// Balance is derived entirely from the shared chain:
-//   balance = Σ confirmed incoming txs − Σ confirmed outgoing txs
-//
-// This mirrors how Bitcoin nodes compute a wallet's balance by replaying the
-// chain — no per-wallet "balance" field that can get out of sync.
-
 #[tauri::command]
 pub async fn get_balance(_state: State<'_, AppState>) -> Result<Balance, EgoDesktopError> {
     let ledger  = Ledger::load();
     let my_addr = ledger.address.clone();
 
     if my_addr.is_empty() {
-        return Ok(Balance { egoc: 0, uegoc: 0, formatted: "0.00 EGOC".into() });
+        return Ok(Balance { egoc: 0, uegoc: 0, formatted: "0.00 EGOC".into(), egusd: 0, uegusd: 0 });
     }
 
     let chain = load_chain();
     let uegoc = chain.balance_of(&my_addr);
     let egoc  = uegoc / 1_000_000;
 
+    let uegusd = ledger.balance_uegusd;
+    let egusd  = uegusd / 1_000_000;
+
     Ok(Balance {
         egoc,
         uegoc,
         formatted: format!("{:.2} EGOC", uegoc as f64 / 1_000_000.0),
+        egusd,
+        uegusd,
     })
 }
 
@@ -90,7 +87,6 @@ pub async fn send_transaction(
         ));
     }
 
-    // ── 1. Validate balance from shared chain ─────────────────────────────
     let chain   = load_chain();
     let balance = chain.balance_of(&from);
 
@@ -108,7 +104,6 @@ pub async fn send_transaction(
         )));
     }
 
-    // ── 2. Sign the transaction ───────────────────────────────────────────
     let nonce      = ledger.nonce + 1;
     let ts         = chrono::Utc::now().timestamp();
     let sign_bytes = tx_signing_bytes(&from, &request.to_address, request.amount, nonce, ts);
@@ -146,16 +141,11 @@ pub async fn send_transaction(
         ..LedgerTx::default()
     };
 
-    // ── 3. Route to mempool (batch loop will mine + broadcast) ───────────
-    // The TX is confirmed inside the next batch window (≤ BATCH_INTERVAL_MS).
-    // This decouples signing from disk I/O — enabling 100k TPS throughput.
     crate::mempool::get_mempool().push(tx);
 
-    // ── 4. Persist updated nonce in per-wallet ledger ─────────────────────
     ledger.nonce = nonce;
     let _ = ledger.save();
 
-    // ── 5. Send email confirmation (fire-and-forget) ─────────────────────
     {
         let to_email = ledger.registered_email.clone();
         let amount_egoc = format!("{:.6} EGOC", request.amount as f64 / 1_000_000.0);
@@ -176,13 +166,9 @@ pub async fn send_transaction(
         hash:         tx_hash,
         success:      true,
         message:      "Transaction queued — confirms within the next batch window".into(),
-        block_height: None, // assigned by batch loop
+        block_height: None,
     })
 }
-
-// ── prepare_transaction ───────────────────────────────────────────────────────
-// Builds and signs a tx+block but does NOT save anything.
-// Returns JSON strings so the frontend can POST them to the relay for email confirmation.
 
 #[derive(Debug, Serialize)]
 pub struct PreparedTransaction {
@@ -268,7 +254,7 @@ pub async fn commit_transaction(
     if tx.block_height.is_none() { tx.block_height = Some(block.height); }
     let mut chain = load_chain();
     if let Some(existing) = chain.transactions.iter_mut().find(|t| t.hash == tx.hash) {
-        // Upgrade status if previously saved as Pending.
+
         existing.status = "Confirmed".to_string();
         existing.block_height = tx.block_height;
     } else {
@@ -283,7 +269,7 @@ pub async fn commit_transaction(
     let tx_hash = tx.hash.clone();
     let tx3 = tx.clone(); let blk3 = block.clone();
     tokio::spawn(async move { crate::p2p::broadcast_tx(tx3, blk3).await; });
-    // Forward tx + block to Oracle node so the public explorer can show them.
+
     let tx4 = tx.clone();
     let blk4 = block.clone();
     tokio::spawn(async move {
@@ -303,12 +289,6 @@ pub async fn commit_transaction(
         message: "Transaction confirmed and broadcast".into(), block_height,
     })
 }
-
-// ── get_transaction_history ───────────────────────────────────────────────────
-//
-// Returns all chain txs that involve this wallet address (sent or received).
-// Because the chain is shared, incoming txs from ANY other local wallet appear
-// here automatically — no per-wallet scanning or credit step needed.
 
 #[tauri::command]
 pub async fn get_transaction_history(
@@ -337,22 +317,66 @@ pub async fn get_transaction_history(
 
 // ── fetch_swap_rates ──────────────────────────────────────────────────────────
 
-/// Fetch live USD prices for swap assets from CoinGecko (no API key needed).
+fn binance_sym_to_cg_id(sym: &str) -> Option<&'static str> {
+    match sym {
+        "BTCUSDT"   => Some("bitcoin"),
+        "ETHUSDT"   => Some("ethereum"),
+        "BNBUSDT"   => Some("binancecoin"),
+        "SOLUSDT"   => Some("solana"),
+        "ADAUSDT"   => Some("cardano"),
+        "XRPUSDT"   => Some("ripple"),
+        "TRXUSDT"   => Some("tron"),
+        "LTCUSDT"   => Some("litecoin"),
+        "DOGEUSDT"  => Some("dogecoin"),
+        "MATICUSDT" => Some("matic-network"),
+        "AVAXUSDT"  => Some("avalanche-2"),
+        "ARBUSDT"   => Some("arbitrum"),
+        "OPUSDT"    => Some("optimism"),
+        "DOTUSDT"   => Some("polkadot"),
+        "LINKUSDT"  => Some("chainlink"),
+        "SHIBUSDT"  => Some("shiba-inu"),
+        _ => None,
+    }
+}
+
+/// Fetch live USD prices using Binance public API (free, 1200 req/min, no key).
+/// Falls back to CoinGecko if Binance fails. Returns HashMap keyed by CoinGecko ID.
 #[tauri::command]
 pub async fn fetch_swap_rates() -> Result<std::collections::HashMap<String, f64>, EgoDesktopError> {
-    let url = "https://api.coingecko.com/api/v3/simple/price\
-        ?ids=bitcoin,ethereum,binancecoin,cardano,solana,ripple,tron,polkadot,chainlink,shiba-inu,tether,usd-coin\
-        &vs_currencies=usd";
-    let json: serde_json::Value = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .unwrap_or_default()
-        .get(url)
-        .send()
-        .await
+        .unwrap_or_default();
+
+    // Try Binance first (high rate limits, no API key)
+    let binance_symbols = r#"["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","ADAUSDT","XRPUSDT","TRXUSDT","LTCUSDT","DOGEUSDT","MATICUSDT","AVAXUSDT","ARBUSDT","OPUSDT","DOTUSDT","LINKUSDT","SHIBUSDT"]"#;
+    let binance_url = format!("https://api.binance.com/api/v3/ticker/price?symbols={}", binance_symbols);
+
+    if let Ok(resp) = client.get(&binance_url).send().await {
+        if let Ok(json) = resp.json::<serde_json::Value>().await {
+            if let Some(arr) = json.as_array() {
+                let mut rates = std::collections::HashMap::new();
+                for item in arr {
+                    if let (Some(sym), Some(price_str)) = (item["symbol"].as_str(), item["price"].as_str()) {
+                        if let (Some(id), Ok(price)) = (binance_sym_to_cg_id(sym), price_str.parse::<f64>()) {
+                            rates.insert(id.to_string(), price);
+                        }
+                    }
+                }
+                if !rates.is_empty() {
+                    rates.insert("tether".into(), 1.0);
+                    rates.insert("usd-coin".into(), 1.0);
+                    return Ok(rates);
+                }
+            }
+        }
+    }
+
+    // Fallback: CoinGecko
+    let cg_url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,binancecoin,cardano,solana,ripple,tron,polkadot,chainlink,shiba-inu,tether,usd-coin,litecoin,dogecoin,matic-network,avalanche-2,arbitrum,optimism&vs_currencies=usd";
+    let json: serde_json::Value = client.get(cg_url).send().await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?
-        .json()
-        .await
+        .json().await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
 
     let mut rates = std::collections::HashMap::new();
@@ -367,7 +391,6 @@ pub async fn fetch_swap_rates() -> Result<std::collections::HashMap<String, f64>
 // ── query_remote_node ─────────────────────────────────────────────────────────
 //
 // Queries a headless ego-node's HTTP RPC and returns its identity + balance.
-// This lets desktop wallet holders monitor server nodes they operate.
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RemoteNodeInfo {
@@ -434,6 +457,25 @@ pub async fn query_remote_node(
 //
 /// Return the email stored in the local ledger, masked for display.
 /// e.g. "abc***@domain.com". Returns empty string if no email is set.
+#[derive(serde::Serialize)]
+pub struct TxFeeInfo {
+    pub fee_uegoc: u64,
+    pub fee_usd:   f64,
+}
+
+#[tauri::command]
+pub fn get_tx_fee(tx_type: Option<String>) -> TxFeeInfo {
+    let ledger    = Ledger::load();
+    let is_staker = ledger.staked_amount > 0;
+    let fee_uegoc = crate::tokenomics::fee_for_tx_with_staking(
+        tx_type.as_deref().unwrap_or("transfer"),
+        is_staker,
+    );
+    let price   = crate::p2p::get_egoc_price_usd().max(1e-9);
+    let fee_usd = (fee_uegoc as f64 / 1_000_000.0) * price;
+    TxFeeInfo { fee_uegoc, fee_usd }
+}
+
 #[tauri::command]
 pub fn get_account_email() -> String {
     let email = Ledger::load().registered_email;
@@ -473,7 +515,6 @@ pub async fn request_tx_code(
         ));
     }
 
-    // Validate balance
     let chain   = load_chain();
     let balance = chain.balance_of(&from);
     if request.amount == 0 {
@@ -489,7 +530,6 @@ pub async fn request_tx_code(
         )));
     }
 
-    // Build + sign the transaction (same as send_transaction)
     let nonce      = ledger.nonce + 1;
     let ts         = chrono::Utc::now().timestamp();
     let sign_bytes = tx_signing_bytes(&from, &request.to_address, request.amount, nonce, ts);
@@ -526,11 +566,9 @@ pub async fn request_tx_code(
         ..LedgerTx::default()
     };
 
-    // Check send limit before generating / storing anything
     crate::email::check_send_limit(&email)
         .map_err(|e| EgoDesktopError::InvalidInput(e))?;
 
-    // Generate 4-digit + 2-letter code and store OTP + pending tx (10 min expiry)
     let code  = crate::email::gen_otp_code();
     let tx_id = tx_hash.clone();
     let expiry = ts + 600;
@@ -542,16 +580,13 @@ pub async fn request_tx_code(
         map.insert(tx_id.clone(), (tx.clone(), expiry));
     }
 
-    // Email the code
     let amount_str = format!("{:.6} EGOC", request.amount as f64 / 1_000_000.0);
     crate::email::send_tx_code_email(&email, &code, &amount_str, &request.to_address)
         .await
         .map_err(|e| EgoDesktopError::NetworkError(format!("Failed to send code: {e}")))?;
 
-    // Only count the attempt after confirmed delivery
     crate::email::record_send_attempt(&email);
 
-    // Mask the email for display: abc***@domain.com
     let masked = if let Some(at) = email.find('@') {
         let local = &email[..at];
         let domain = &email[at..];
@@ -567,16 +602,12 @@ pub async fn request_tx_code(
     Ok(TxCodeRequest { tx_id, masked_email: masked })
 }
 
-// ── confirm_tx_code ───────────────────────────────────────────────────────────
-//
-// Step 2 of email 2FA: verify the code and execute the pending transaction.
-
 #[tauri::command]
 pub async fn confirm_tx_code(
     tx_id:  String,
     code:   String,
 ) -> Result<TransactionResponse, EgoDesktopError> {
-    // Verify OTP — cancel transaction after 3 failed attempts
+
     let valid = crate::email::verify_otp(&format!("tx:{}", tx_id), code.trim());
     if !valid {
         let attempts = {
@@ -586,7 +617,7 @@ pub async fn confirm_tx_code(
             *count
         };
         if attempts >= 3 {
-            // Cancel: remove pending tx and reset attempt counter
+
             PENDING_TXS.lock().unwrap().remove(&tx_id);
             TX_ATTEMPTS.lock().unwrap().remove(&tx_id);
             return Err(EgoDesktopError::InvalidInput(
@@ -600,12 +631,11 @@ pub async fn confirm_tx_code(
             ),
         ));
     }
-    // Clear attempt counter on success and reset email send limit
+
     TX_ATTEMPTS.lock().unwrap().remove(&tx_id);
     let email = crate::ledger::Ledger::load().registered_email;
     if !email.is_empty() { crate::email::reset_send_attempts(&email); }
 
-    // Retrieve the pending tx
     let tx = {
         let mut map = PENDING_TXS.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
@@ -620,17 +650,14 @@ pub async fn confirm_tx_code(
         }
     };
 
-    // Persist nonce update
     let mut ledger = Ledger::load();
     if tx.nonce > ledger.nonce {
         ledger.nonce = tx.nonce;
         let _ = ledger.save();
     }
 
-    // Push to mempool (batch loop mines + broadcasts)
     crate::mempool::get_mempool().push(tx.clone());
 
-    // Fire confirmation email (non-blocking)
     let to_email = ledger.registered_email.clone();
     if !to_email.is_empty() {
         let amount_str = format!("{:.6} EGOC", tx.amount as f64 / 1_000_000.0);
@@ -651,4 +678,537 @@ pub async fn confirm_tx_code(
         message:      "Transaction confirmed and queued".into(),
         block_height: None,
     })
+}
+
+// ── ChangeNow real swap integration ───────────────────────────────────────────
+
+// Key is injected at compile time via: set CHANGENOW_API_KEY=<key> && cargo build
+// Never hardcode the real key here — this file is open source.
+const CHANGENOW_KEY: &str = match option_env!("CHANGENOW_API_KEY") {
+    Some(k) => k,
+    None    => "",
+};
+const CHANGENOW_BASE: &str = "https://api.changenow.io/v2";
+
+fn changenow_key() -> Result<&'static str, EgoDesktopError> {
+    if CHANGENOW_KEY.is_empty() {
+        return Err(EgoDesktopError::NetworkError(
+            "Swap service not available in this build. Set CHANGENOW_API_KEY at compile time.".into(),
+        ));
+    }
+    Ok(CHANGENOW_KEY)
+}
+
+/// Map a coin symbol to its ChangeNow network string.
+fn cn_network(sym: &str) -> &'static str {
+    match sym {
+        "BTC"  => "btc",
+        "ETH"  => "eth",
+        "BNB"  => "bsc",
+        "SOL"  => "sol",
+        "XRP"  => "xrp",
+        "ADA"  => "ada",
+        "TRX"  => "trx",
+        "DOT"  => "dot",
+        "LINK" => "eth",
+        "SHIB" => "eth",
+        "USDT" => "eth",
+        "USDC" => "eth",
+        _      => "eth",
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CnEstimate {
+    pub to_amount:       f64,
+    pub min_amount:      f64,
+    pub network_fee:     f64,   // in destination currency
+    pub network_fee_usd: f64,
+}
+
+/// Get estimated output amount from ChangeNow for an external↔external pair.
+#[tauri::command]
+pub async fn changenow_estimate(
+    from_symbol: String,
+    to_symbol:   String,
+    from_amount: f64,
+) -> Result<CnEstimate, EgoDesktopError> {
+    let cn_key = changenow_key()?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build().unwrap_or_default();
+
+    let from_cur     = from_symbol.to_lowercase();
+    let to_cur       = to_symbol.to_lowercase();
+    let from_network = cn_network(&from_symbol);
+    let to_network   = cn_network(&to_symbol);
+
+    // Fetch min-amount and estimate in parallel
+    let min_url = format!(
+        "{CHANGENOW_BASE}/exchange/min-amount?fromCurrency={from_cur}&toCurrency={to_cur}&fromNetwork={from_network}&toNetwork={to_network}&flow=standard"
+    );
+    let est_url = format!(
+        "{CHANGENOW_BASE}/exchange/estimated-amount?fromCurrency={from_cur}&toCurrency={to_cur}&fromAmount={from_amount}&fromNetwork={from_network}&toNetwork={to_network}&flow=standard&type=direct"
+    );
+
+    let (min_result, est_result) = tokio::join!(
+        async {
+            let r = client.get(&min_url).header("x-changenow-api-key", cn_key).send().await.ok()?;
+            let v: serde_json::Value = r.json().await.ok()?;
+            v["minAmount"].as_f64()
+        },
+        client.get(&est_url).header("x-changenow-api-key", cn_key).send(),
+    );
+
+    let min_amount = min_result.unwrap_or(0.0);
+
+    let est: serde_json::Value = est_result
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?
+        .json().await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+
+    if let Some(err) = est["error"].as_str() {
+        return Err(EgoDesktopError::NetworkError(
+            est["message"].as_str().unwrap_or(err).to_string()
+        ));
+    }
+
+    let to_amount       = est["toAmount"].as_f64()
+        .ok_or_else(|| EgoDesktopError::NetworkError("Invalid response from ChangeNow".into()))?;
+    let network_fee     = est["networkFee"].as_f64().unwrap_or(0.0);
+    let network_fee_usd = est["networkFeeUSD"].as_f64().unwrap_or(0.0);
+
+    Ok(CnEstimate { to_amount, min_amount, network_fee, network_fee_usd })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CnExchange {
+    pub id:               String,
+    pub deposit_address:  String,
+    pub deposit_extra_id: Option<String>,
+    pub to_amount:        f64,
+}
+
+/// Create a real ChangeNow exchange. Returns the deposit address the user must send to.
+#[tauri::command]
+pub async fn changenow_create_exchange(
+    from_symbol: String,
+    to_symbol:   String,
+    from_amount: f64,
+    to_address:  String,
+) -> Result<CnExchange, EgoDesktopError> {
+    let cn_key = changenow_key()?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build().unwrap_or_default();
+
+    let body = serde_json::json!({
+        "fromCurrency":  from_symbol.to_lowercase(),
+        "toCurrency":    to_symbol.to_lowercase(),
+        "fromAmount":    from_amount.to_string(),
+        "toAddress":     to_address,
+        "fromNetwork":   cn_network(&from_symbol),
+        "toNetwork":     cn_network(&to_symbol),
+        "flow":          "standard",
+        "type":          "direct",
+    });
+
+    let resp: serde_json::Value = client
+        .post(&format!("{CHANGENOW_BASE}/exchange"))
+        .header("x-changenow-api-key", cn_key)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send().await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?
+        .json().await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+
+    if let Some(err) = resp["error"].as_str() {
+        return Err(EgoDesktopError::NetworkError(
+            resp["message"].as_str().unwrap_or(err).to_string()
+        ));
+    }
+
+    Ok(CnExchange {
+        id:               resp["id"].as_str().unwrap_or("").to_string(),
+        deposit_address:  resp["payinAddress"].as_str().unwrap_or("").to_string(),
+        deposit_extra_id: resp["payinExtraId"].as_str().map(|s| s.to_string()),
+        to_amount:        resp["toAmount"].as_f64().unwrap_or(0.0),
+    })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CnStatus {
+    pub status:    String,
+    pub to_amount: Option<f64>,
+    pub hash_out:  Option<String>,
+}
+
+/// Poll the status of a ChangeNow exchange by ID.
+#[tauri::command]
+pub async fn changenow_get_status(
+    exchange_id: String,
+) -> Result<CnStatus, EgoDesktopError> {
+    let cn_key = changenow_key()?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build().unwrap_or_default();
+
+    let resp: serde_json::Value = client
+        .get(&format!("{CHANGENOW_BASE}/exchange/{exchange_id}"))
+        .header("x-changenow-api-key", cn_key)
+        .send().await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?
+        .json().await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+
+    Ok(CnStatus {
+        status:    resp["status"].as_str().unwrap_or("unknown").to_string(),
+        to_amount: resp["amountTo"].as_f64(),
+        hash_out:  resp["payoutHash"].as_str().map(|s| s.to_string()),
+    })
+}
+
+// ── Pre-sale IOU system ────────────────────────────────────────────────────────
+// No tokens exist yet. Buyers receive an encrypted IOU wallet file as proof of
+// purchase. All allocations are written into the Ego Chain Genesis Block when
+// mainnet launches.
+
+const PRESALE_EGOC_USD: f64 = 2.00; // seed-round price ($2.45 market → 18% off)
+
+/// Returns the Ego team's treasury address for the given payment coin.
+/// Funds sent here go directly to the presale treasury wallet.
+fn presale_deposit_addr(pay_symbol: &str) -> String {
+    match pay_symbol {
+        "BTC"  => "bc1qaqx0xf9sv0ktmtcxlzzh7t7kf59nwu8c0vlqhg",
+        "ETH"  => "0xD4f2B1fA44668B806290A4c3CB758ABb7EF35C64",
+        "USDT" => "0xD4f2B1fA44668B806290A4c3CB758ABb7EF35C64",
+        "USDC" => "0xD4f2B1fA44668B806290A4c3CB758ABb7EF35C64",
+        "BNB"  => "0xD4f2B1fA44668B806290A4c3CB758ABb7EF35C64",
+        "ADA"  => "addr1qyp35j52jw8tmg85wvll3p5krsgkpttxa65kxav4mc56g73fmcra587acj9n8zsqm8u55zvumpff3mrkt9865jswu4gql452dd",
+        "SOL"  => "9PZzHQYohiR9fTKTJXUaRYKv6doM4NQPJZKcrVvTJbbW",
+        "TRX"  => "TSZnnQGN8idN6vEU66NX1ek1AtwmHbYLRx",
+        _      => "— contact support@egoblockchain.com —",
+    }.to_string()
+}
+
+/// Create an encrypted IOU file (Ethereum-style) for a pre-sale purchase.
+/// Returns the IOU as a JSON string ready for the user to download and keep.
+/// The plaintext allocation data is only readable by the buyer (password-protected).
+#[tauri::command]
+pub async fn presale_create_iou(
+    pay_symbol:    String,
+    pay_amount:    f64,
+    pay_usd_price: f64,
+    password:      String,
+) -> Result<String, EgoDesktopError> {
+    let ledger = Ledger::load();
+    if ledger.mainnet_address.is_empty() {
+        return Err(EgoDesktopError::WalletError(
+            "Wallet not initialised — mainnet address missing".into(),
+        ));
+    }
+    if password.trim().is_empty() {
+        return Err(EgoDesktopError::WalletError("Password cannot be empty".into()));
+    }
+
+    let usd_value   = pay_amount * pay_usd_price;
+    let egoc_amount = usd_value / PRESALE_EGOC_USD;
+    let deposit_addr = presale_deposit_addr(&pay_symbol);
+    let id  = uuid::Uuid::new_v4().to_string();
+    let ts  = chrono::Utc::now().timestamp();
+
+    // ── Plaintext record (encrypted inside the IOU file) ─────────────────────
+    let plain = serde_json::json!({
+        "id":                id,
+        "mainnet_address":   ledger.mainnet_address,
+        "testnet_address":   ledger.address,
+        "egoc_amount":       egoc_amount,
+        "usd_value":         usd_value,
+        "price_per_egoc":    PRESALE_EGOC_USD,
+        "pay_coin":          pay_symbol,
+        "pay_amount":        pay_amount,
+        "deposit_address":   deposit_addr,
+        "timestamp":         ts,
+        "round":             "Seed Round",
+    });
+    let plain_bytes = serde_json::to_vec(&plain)
+        .map_err(|e| EgoDesktopError::WalletError(e.to_string()))?;
+
+    // ── Key derivation: BLAKE3(password_bytes ‖ salt) → 32-byte key ──────────
+    let mut salt        = [0u8; 32];
+    let mut nonce_bytes = [0u8; 12];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce_bytes);
+
+    let kdf_input: Vec<u8> = password.as_bytes().iter().chain(&salt).copied().collect();
+    let derived   = blake3::hash(&kdf_input);
+
+    let key    = Key::<Aes256Gcm>::from_slice(derived.as_bytes());
+    let cipher = Aes256Gcm::new(key);
+    let nonce  = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, plain_bytes.as_slice())
+        .map_err(|e| EgoDesktopError::CryptoError(e.to_string()))?;
+
+    // ── Outer IOU file (public metadata + encrypted seed) ────────────────────
+    let iou = serde_json::json!({
+        "version":     1,
+        "id":          id,
+        "ego_presale": true,
+        "network":     "ego-mainnet",
+        "issued_at":   ts,
+        "round":       "Seed Round",
+        "payment": {
+            "coin":            pay_symbol,
+            "deposit_address": deposit_addr,
+            "amount":          pay_amount
+        },
+        "allocation": {
+            "egoc_amount":        egoc_amount,
+            "usd_value":          usd_value,
+            "price_per_egoc_usd": PRESALE_EGOC_USD
+        },
+        "genesis_note": "This allocation will be credited in the Ego Chain Genesis Block upon mainnet launch. Keep this file and your password — they are your proof of purchase.",
+        "crypto": {
+            "cipher":     "aes-256-gcm",
+            "kdf":        "blake3",
+            "salt":       hex::encode(&salt),
+            "nonce":      hex::encode(&nonce_bytes),
+            "ciphertext": hex::encode(&ciphertext)
+        }
+    });
+
+    // ── Persist record locally ────────────────────────────────────────────────
+    let record = PresaleIouRecord {
+        id:              id.clone(),
+        mainnet_address: ledger.mainnet_address.clone(),
+        egoc_amount,
+        usd_value,
+        pay_symbol,
+        pay_amount,
+        deposit_address: deposit_addr,
+        timestamp:       ts,
+        status:          "pending_payment".into(),
+    };
+    let mut ledger2 = Ledger::load();
+    ledger2.presale_records.push(record);
+    let _ = ledger2.save();
+
+    serde_json::to_string_pretty(&iou)
+        .map_err(|e| EgoDesktopError::WalletError(e.to_string()))
+}
+
+/// Verify + decrypt an IOU file with the buyer's password.
+#[tauri::command]
+pub async fn presale_verify_iou(
+    iou_json: String,
+    password: String,
+) -> Result<serde_json::Value, EgoDesktopError> {
+    let iou: serde_json::Value = serde_json::from_str(&iou_json)
+        .map_err(|e| EgoDesktopError::WalletError(format!("Invalid IOU file: {e}")))?;
+
+    let crypto = &iou["crypto"];
+    let salt   = hex::decode(crypto["salt"].as_str().unwrap_or(""))
+        .map_err(|_| EgoDesktopError::CryptoError("Bad salt".into()))?;
+    let nonce_bytes = hex::decode(crypto["nonce"].as_str().unwrap_or(""))
+        .map_err(|_| EgoDesktopError::CryptoError("Bad nonce".into()))?;
+    let ciphertext = hex::decode(crypto["ciphertext"].as_str().unwrap_or(""))
+        .map_err(|_| EgoDesktopError::CryptoError("Bad ciphertext".into()))?;
+
+    let kdf_input: Vec<u8> = password.as_bytes().iter().chain(&salt[..]).copied().collect();
+    let derived = blake3::hash(&kdf_input);
+
+    let key    = Key::<Aes256Gcm>::from_slice(derived.as_bytes());
+    let cipher = Aes256Gcm::new(key);
+    let nonce  = Nonce::from_slice(&nonce_bytes);
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext.as_slice())
+        .map_err(|_| EgoDesktopError::CryptoError("Wrong password or corrupted IOU file".into()))?;
+
+    serde_json::from_slice(&plaintext)
+        .map_err(|e| EgoDesktopError::WalletError(format!("Corrupted record: {e}")))
+}
+
+/// List all pre-sale IOU records for this wallet.
+#[tauri::command]
+pub async fn presale_list_iou() -> Result<Vec<PresaleIouRecord>, EgoDesktopError> {
+    Ok(Ledger::load().presale_records)
+}
+
+/// Get pre-sale pricing info.
+#[tauri::command]
+pub async fn presale_info() -> Result<serde_json::Value, EgoDesktopError> {
+    Ok(serde_json::json!({
+        "egoc_price_usd": PRESALE_EGOC_USD,
+        "round":          1,
+        "round_name":     "Seed Round",
+        "market_price":   2.45,
+        "discount_pct":   18,
+    }))
+}
+
+// ── Stripe card / Apple Pay payments ──────────────────────────────────────────
+// The app calls a proxy on your server — Stripe secret key never enters the binary.
+// Deploy services/presale-proxy/ to any Node.js host and set PRESALE_API_URL.
+const PRESALE_API_URL: &str = match option_env!("PRESALE_API_URL") {
+    Some(u) => u,
+    None    => "http://localhost:3031/presale",
+};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StripeSession {
+    pub session_id:   String,
+    pub checkout_url: String,
+    pub egoc_amount:  f64,
+    pub usd_amount:   f64,
+}
+
+/// Create a Stripe Checkout Session via the presale proxy.
+/// The proxy holds the Stripe secret key — never the app.
+#[tauri::command]
+pub async fn presale_stripe_checkout(
+    egoc_amount: f64,
+    usd_amount:  f64,
+) -> Result<StripeSession, EgoDesktopError> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build().unwrap_or_default();
+
+    let resp = client
+        .post(format!("{PRESALE_API_URL}/checkout"))
+        .json(&serde_json::json!({ "egoc_amount": egoc_amount, "usd_amount": usd_amount }))
+        .send()
+        .await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+
+    let json: serde_json::Value = resp.json().await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+
+    if let Some(err) = json["error"].as_str() {
+        return Err(EgoDesktopError::NetworkError(format!("Presale API: {err}")));
+    }
+
+    let session_id   = json["session_id"].as_str().unwrap_or("").to_string();
+    let checkout_url = json["checkout_url"].as_str().unwrap_or("").to_string();
+
+    if session_id.is_empty() || checkout_url.is_empty() {
+        return Err(EgoDesktopError::NetworkError("No checkout URL returned from presale API".into()));
+    }
+
+    Ok(StripeSession { session_id, checkout_url, egoc_amount, usd_amount })
+}
+
+/// Verify a Stripe Checkout Session via the presale proxy.
+#[tauri::command]
+pub async fn presale_stripe_verify(session_id: String) -> Result<serde_json::Value, EgoDesktopError> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build().unwrap_or_default();
+
+    let resp = client
+        .get(format!("{PRESALE_API_URL}/verify/{session_id}"))
+        .send()
+        .await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+
+    let json: serde_json::Value = resp.json().await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+
+    if let Some(err) = json["error"].as_str() {
+        return Err(EgoDesktopError::NetworkError(format!("Presale API: {err}")));
+    }
+
+    Ok(json)
+}
+
+/// After a verified Stripe payment, create the encrypted IOU file.
+#[tauri::command]
+pub async fn presale_stripe_create_iou(
+    session_id:  String,
+    egoc_amount: f64,
+    usd_amount:  f64,
+    password:    String,
+) -> Result<String, EgoDesktopError> {
+    let ledger = Ledger::load();
+    if password.trim().is_empty() {
+        return Err(EgoDesktopError::WalletError("Password cannot be empty".into()));
+    }
+
+    let id  = uuid::Uuid::new_v4().to_string();
+    let ts  = chrono::Utc::now().timestamp();
+
+    let plain = serde_json::json!({
+        "id":              id,
+        "mainnet_address": ledger.mainnet_address,
+        "testnet_address": ledger.address,
+        "egoc_amount":     egoc_amount,
+        "usd_value":       usd_amount,
+        "price_per_egoc":  PRESALE_EGOC_USD,
+        "pay_method":      "stripe",
+        "stripe_session":  session_id,
+        "timestamp":       ts,
+        "round":           "Seed Round",
+    });
+    let plain_bytes = serde_json::to_vec(&plain)
+        .map_err(|e| EgoDesktopError::WalletError(e.to_string()))?;
+
+    let mut salt        = [0u8; 32];
+    let mut nonce_bytes = [0u8; 12];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut salt);
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce_bytes);
+
+    let kdf_input: Vec<u8> = password.as_bytes().iter().chain(&salt).copied().collect();
+    let derived   = blake3::hash(&kdf_input);
+    let key    = Key::<Aes256Gcm>::from_slice(derived.as_bytes());
+    let cipher = Aes256Gcm::new(key);
+    let nonce  = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, plain_bytes.as_slice())
+        .map_err(|e| EgoDesktopError::CryptoError(e.to_string()))?;
+
+    let iou = serde_json::json!({
+        "version":     1,
+        "id":          id,
+        "ego_presale": true,
+        "network":     "ego-mainnet",
+        "issued_at":   ts,
+        "round":       "Seed Round",
+        "payment": {
+            "method":         "stripe",
+            "stripe_session": session_id,
+            "status":         "paid"
+        },
+        "allocation": {
+            "egoc_amount":        egoc_amount,
+            "usd_value":          usd_amount,
+            "price_per_egoc_usd": PRESALE_EGOC_USD
+        },
+        "genesis_note": "This allocation will be credited in the Ego Chain Genesis Block upon mainnet launch. Keep this file and your password — they are your proof of purchase.",
+        "crypto": {
+            "cipher":     "aes-256-gcm",
+            "kdf":        "blake3",
+            "salt":       hex::encode(&salt),
+            "nonce":      hex::encode(&nonce_bytes),
+            "ciphertext": hex::encode(&ciphertext)
+        }
+    });
+
+    let record = PresaleIouRecord {
+        id:              id.clone(),
+        mainnet_address: ledger.mainnet_address.clone(),
+        egoc_amount,
+        usd_value:       usd_amount,
+        pay_symbol:      "USD".into(),
+        pay_amount:      usd_amount,
+        deposit_address: format!("stripe:{session_id}"),
+        timestamp:       ts,
+        status:          "paid".into(),
+    };
+    let mut ledger2 = Ledger::load();
+    ledger2.presale_records.push(record);
+    let _ = ledger2.save();
+
+    serde_json::to_string_pretty(&iou)
+        .map_err(|e| EgoDesktopError::WalletError(e.to_string()))
 }

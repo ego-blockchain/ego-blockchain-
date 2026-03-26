@@ -75,9 +75,9 @@ pub struct PathLossFitQuality {
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub enum PathLossModel {
-    UMa,  // Urban Macro (3GPP TR 38.901)
-    UMi,  // Urban Micro (3GPP TR 38.901)
-    FreeSpace, // Fallback for testing
+    UMa,
+    UMi,
+    FreeSpace,
 }
 
 #[derive(Debug, Clone)]
@@ -145,24 +145,23 @@ pub struct PoCEvent {
     pub cid_hint: Option<String>,
     pub timestamp: Timestamp,
     pub aggregator_signature: Signature,
-    // Whitepaper additions
+
     pub path_loss_rmse: f64,
     pub diversity_score: f64,
     pub nonce_binding_fraction: f64,
     pub ldm_penalty: f64,
 }
 
-
-const UMA_BASE_LOSS: f64 = 32.4; // dB at 1m
+const UMA_BASE_LOSS: f64 = 32.4;
 const UMI_BASE_LOSS: f64 = 32.4;
-const RMSE_THRESHOLD_URBAN: f64 = 10.0; // Max acceptable RMSE in dB
+const RMSE_THRESHOLD_URBAN: f64 = 10.0;
 const RMSE_THRESHOLD_RURAL: f64 = 8.0;
 const MIN_DIVERSITY_H3_CELLS: usize = 2;
 const MIN_DIVERSITY_ACCOUNTS: usize = 2;
-const MIN_NONCE_BINDING_FRACTION: f64 = 0.6; // 60% of witnesses must see valid nonce
-const DENSITY_THRESHOLD_METERS: f32 = 1.0; // Co-location threshold
-const DENSITY_PENALTY_PER_DEVICE: f64 = 0.10; // -10% per extra device
-const DENSITY_PENALTY_FLOOR: f64 = 0.40; // Floor at 40%
+const MIN_NONCE_BINDING_FRACTION: f64 = 0.6;
+const DENSITY_THRESHOLD_METERS: f32 = 1.0;
+const DENSITY_PENALTY_PER_DEVICE: f64 = 0.10;
+const DENSITY_PENALTY_FLOOR: f64 = 0.40;
 
 impl PoCBundle {
     pub fn new(
@@ -246,7 +245,7 @@ impl PoCBundle {
     }
 
     pub fn validate(&self) -> PoCResult<()> {
-        // Basic witness count checks
+
         if self.witness_reports.len() < crate::POC_MIN_WITNESSES {
             return Err(PoCError::InsufficientWitnesses {
                 got: self.witness_reports.len(),
@@ -261,7 +260,6 @@ impl PoCBundle {
             });
         }
 
-        // Validate individual witness reports
         for report in &self.witness_reports {
             report.validate()?;
 
@@ -271,7 +269,6 @@ impl PoCBundle {
                 ));
             }
         }
-
 
         if self.statistics.unique_h3_cells < MIN_DIVERSITY_H3_CELLS as u32 {
             return Err(PoCError::ValidationFailed(format!(
@@ -287,7 +284,6 @@ impl PoCBundle {
             )));
         }
 
-
         if !self.coherence_analysis.path_loss_fit_quality.acceptable {
             return Err(PoCError::ValidationFailed(format!(
                 "Path-loss fit RMSE {} dB exceeds threshold (model: {:?})",
@@ -295,7 +291,6 @@ impl PoCBundle {
                 self.coherence_analysis.path_loss_fit_quality.model_type
             )));
         }
-
 
         if self.statistics.nonce_binding_fraction < MIN_NONCE_BINDING_FRACTION {
             return Err(PoCError::ValidationFailed(format!(
@@ -305,14 +300,12 @@ impl PoCBundle {
             )));
         }
 
-
         if self.coherence_analysis.overall_coherence_score < 0.5 {
             return Err(PoCError::ValidationFailed(format!(
                 "Low coherence score: {}",
                 self.coherence_analysis.overall_coherence_score
             )));
         }
-
 
         if self.coherence_analysis.fraud_likelihood > 0.8 {
             return Err(PoCError::FraudDetected {
@@ -324,7 +317,6 @@ impl PoCBundle {
             });
         }
 
-        // Replay detection
         if self.coherence_analysis.nonce_verification.replay_detected {
             return Err(PoCError::FraudDetected {
                 fraud_type: crate::FraudType::ReplayAttack,
@@ -453,7 +445,6 @@ impl PoCBundle {
             .collect::<HashSet<_>>()
             .len() as u32;
 
-
         let witnesses_with_nonce = witness_reports
             .iter()
             .filter(|r| {
@@ -468,7 +459,6 @@ impl PoCBundle {
             0.0
         };
 
-        // Placeholder for path_loss_rmse (calculated in coherence analysis)
         let path_loss_rmse = 0.0;
 
         BundleStatistics {
@@ -494,13 +484,11 @@ impl PoCBundle {
     ) -> CoherenceAnalysis {
         let mut suspicious_patterns = Vec::new();
 
-
         let path_loss_fit_quality = Self::fit_3gpp_path_loss(
             witness_reports,
             beacon_announcement,
             &mut suspicious_patterns,
         );
-
 
         let diversity_metrics = Self::calculate_diversity_metrics(
             witness_reports,
@@ -514,7 +502,6 @@ impl PoCBundle {
             &mut suspicious_patterns,
         );
 
-
         let timing_coherence = Self::analyze_timing_coherence(
             witness_reports,
             beacon_announcement,
@@ -524,9 +511,7 @@ impl PoCBundle {
         let signal_coherence =
             Self::analyze_signal_coherence(witness_reports, &mut suspicious_patterns);
 
-
         let geometry_coherence = path_loss_fit_quality.fit_score;
-
 
         let overall_coherence_score = geometry_coherence * 0.4
             + diversity_metrics.diversity_score * 0.2
@@ -559,7 +544,6 @@ impl PoCBundle {
         }
     }
 
-
 fn fit_3gpp_path_loss(
     witness_reports: &[WitnessReport],
     beacon_announcement: &BeaconAnnouncement,
@@ -576,7 +560,6 @@ fn fit_3gpp_path_loss(
     }
 
     let beacon_location = &beacon_announcement.location;
-    
 
     let avg_distance: f32 = witness_reports
         .iter()
@@ -595,10 +578,9 @@ fn fit_3gpp_path_loss(
 
     for report in witness_reports {
         let distance_km = Self::calculate_distance(&report.witness_location, beacon_location);
-        let distance_m = (distance_km * 1000.0).max(1.0); // Avoid log(0)
+        let distance_m = (distance_km * 1000.0).max(1.0);
 
         let frequency_ghz = report.rf_metrics.frequency as f64 / 1_000_000.0;
-        
 
         let scenario = if distance_m < 1000.0 {
             "UMi"
@@ -608,7 +590,6 @@ fn fit_3gpp_path_loss(
             "RMa"
         };
 
-        // FIXED: Calculate expected path-loss with proper type casting
         let expected_path_loss = match scenario {
             "UMa" => {
                 13.54 + 39.08 * distance_m.log10() + 20.0 * (frequency_ghz.log10() as f32)
@@ -620,19 +601,17 @@ fn fit_3gpp_path_loss(
                 20.0 * distance_m.log10() + 20.0 * (frequency_ghz.log10() as f32) + 32.44
             }
             _ => {
-                // Free space path loss as fallback
+
                 20.0 * distance_m.log10() + 20.0 * (frequency_ghz.log10() as f32) + 32.44
             }
         };
 
-        // Assume beacon Tx power ≈ 23 dBm (typical for small cell)
         let expected_rsrp = 23.0 - expected_path_loss;
         let actual_rsrp = report.rf_metrics.rsrp;
         let error = (expected_rsrp - actual_rsrp as f32).abs();
 
         errors.push(error);
 
-        // Flag outliers (error > 25 dB is suspicious)
         if error > 25.0 {
             outliers += 1;
             let pattern_type = if actual_rsrp as f32 > expected_rsrp {
@@ -653,11 +632,9 @@ fn fit_3gpp_path_loss(
         }
     }
 
-    // Calculate RMSE
     let mse = errors.iter().map(|&e| (e as f64).powi(2)).sum::<f64>() / errors.len() as f64;
     let rmse_db = mse.sqrt();
 
-    // Fit score: normalize RMSE to [0, 1], where 0 dB error = 1.0, threshold = 0.0
     let threshold = if matches!(model_type, PathLossModel::UMa | PathLossModel::UMi) {
         RMSE_THRESHOLD_URBAN
     } else {
@@ -687,7 +664,6 @@ fn fit_3gpp_path_loss(
         acceptable,
     }
 }
-
 
     fn calculate_diversity_metrics(
         witness_reports: &[WitnessReport],
@@ -720,7 +696,6 @@ fn fit_3gpp_path_loss(
             0.0
         };
 
-        // Diversity score: normalize to [0, 1]
         let h3_diversity = (unique_h3_cells as f64 / MIN_DIVERSITY_H3_CELLS as f64).min(1.0);
         let account_diversity = (unique_accounts as f64 / MIN_DIVERSITY_ACCOUNTS as f64).min(1.0);
         let diversity_score = (h3_diversity + account_diversity) / 2.0;
@@ -757,7 +732,6 @@ fn fit_3gpp_path_loss(
         }
     }
 
-
     fn verify_nonce_binding(
         witness_reports: &[WitnessReport],
         _beacon_announcement: &BeaconAnnouncement,
@@ -778,10 +752,9 @@ fn fit_3gpp_path_loss(
         } else {
             0.0
         };
-        // Nonce score: normalize to [0, 1], where MIN_NONCE_BINDING_FRACTION = 1.0
+
         let nonce_score = (nonce_binding_fraction / MIN_NONCE_BINDING_FRACTION).min(1.0);
 
-        // Detect replay attacks: check for duplicate nonces
         let mut nonce_map: HashMap<Vec<u8>, Vec<Address>> = HashMap::new();
         for report in witness_reports {
             if let Some(ref co_beacon) = report.co_beacon_verification {
@@ -794,7 +767,6 @@ fn fit_3gpp_path_loss(
             }
         }
 
-        // Replay detected if any nonce appears more than once
         let replay_detected = nonce_map.values().any(|witnesses| witnesses.len() > 1);
 
         if replay_detected {
@@ -898,7 +870,6 @@ fn fit_3gpp_path_loss(
         coherence
     }
 
-
     fn detect_clustering(witness_reports: &[WitnessReport]) -> bool {
         if witness_reports.len() < 3 {
             return false;
@@ -914,13 +885,11 @@ fn fit_3gpp_path_loss(
                     &witness_reports[j].witness_location,
                 );
 
-
                 let vertical_distance = {
                     let alt1 = witness_reports[i].witness_location.altitude.unwrap_or(0.0);
                     let alt2 = witness_reports[j].witness_location.altitude.unwrap_or(0.0);
                     (alt1 - alt2).abs()
                 };
-
 
                 let horizontal_m = horizontal_distance * 1000.0;
                 let is_clustered = horizontal_m <= DENSITY_THRESHOLD_METERS && vertical_distance <= 2.0;
@@ -931,10 +900,8 @@ fn fit_3gpp_path_loss(
             }
         }
 
-        // Clustering detected if >50% of pairs are co-located
         (close_pairs as f32 / total_pairs as f32) > 0.5
     }
-
 
     fn assess_coverage_quality(
         witness_reports: &[WitnessReport],
@@ -975,12 +942,10 @@ fn fit_3gpp_path_loss(
             .sum::<f32>()
             / witness_count.max(1) as f32;
 
-
         let fit_score = coherence_analysis.path_loss_fit_quality.fit_score;
         let diversity_score = coherence_analysis.diversity_metrics.diversity_score;
         let radius_score = (coverage_radius_km / 20.0).min(1.0) as f64;
         let nonce_score = coherence_analysis.nonce_verification.nonce_score;
-
 
         let path_loss_penalty = if coherence_analysis.path_loss_fit_quality.outlier_count > 0 {
             0.05 * coherence_analysis.path_loss_fit_quality.outlier_count as f64
@@ -999,10 +964,8 @@ fn fit_3gpp_path_loss(
             - total_penalties)
             .clamp(0.0, 1.0);
 
-
         let density_penalty = Self::calculate_ldm_penalty(witness_reports, beacon_announcement);
 
-        // Apply LDM multiplier
         let final_quality = raw_quality * (1.0 - density_penalty);
 
         CoverageQuality {
@@ -1015,23 +978,21 @@ fn fit_3gpp_path_loss(
         }
     }
 
-
     fn calculate_ldm_penalty(
         witness_reports: &[WitnessReport],
         _beacon_announcement: &BeaconAnnouncement,
     ) -> f64 {
         if witness_reports.len() < 2 {
-            return 0.0; // No penalty for single device
+            return 0.0;
         }
 
-        // Group devices by proximity (within DENSITY_THRESHOLD_METERS)
         let mut clusters: Vec<Vec<usize>> = Vec::new();
 
         for i in 0..witness_reports.len() {
             let mut found_cluster = false;
 
             for cluster in clusters.iter_mut() {
-                // Check if witness i is close to any device in this cluster
+
                 let is_close_to_cluster = cluster.iter().any(|&j| {
                     let horizontal_distance = Self::calculate_distance(
                         &witness_reports[i].witness_location,
@@ -1060,18 +1021,15 @@ fn fit_3gpp_path_loss(
             }
         }
 
-        // Find largest cluster
         let max_cluster_size = clusters.iter().map(|c| c.len()).max().unwrap_or(1);
 
-        // Calculate LDM penalty
         if max_cluster_size == 1 {
-            return 0.0; // No co-location
+            return 0.0;
         }
 
         let n = max_cluster_size as f64;
         let ldm_penalty = (1.0 - DENSITY_PENALTY_PER_DEVICE * (n - 1.0)).max(DENSITY_PENALTY_FLOOR);
 
-        // Return penalty as fraction (1.0 - LDM)
         1.0 - ldm_penalty
     }
 
@@ -1109,7 +1067,6 @@ fn fit_3gpp_path_loss(
                 .to_le_bytes(),
         );
 
-    
         data.extend_from_slice(&self.statistics.path_loss_rmse.to_le_bytes());
         data.extend_from_slice(&self.statistics.nonce_binding_fraction.to_le_bytes());
         data.extend_from_slice(&self.coverage_quality.density_penalty.to_le_bytes());
@@ -1158,26 +1115,21 @@ fn fit_3gpp_path_loss(
         ])
     }
 
-
     pub fn get_ldm_penalty(&self) -> f64 {
         self.coverage_quality.density_penalty
     }
 
-    /// Get path-loss RMSE for metrics export
     pub fn get_path_loss_rmse(&self) -> f64 {
         self.coherence_analysis.path_loss_fit_quality.rmse_db
     }
-
 
     pub fn get_diversity_score(&self) -> f64 {
         self.coherence_analysis.diversity_metrics.diversity_score
     }
 
-    /// Get nonce binding fraction for metrics export
     pub fn get_nonce_binding_fraction(&self) -> f64 {
         self.statistics.nonce_binding_fraction
     }
-
 
     pub fn meets_quality_threshold(&self, q_min: f64) -> bool {
         self.coverage_quality.quality_score >= q_min
@@ -1306,7 +1258,6 @@ mod tests {
             None,
         );
 
-        // Add co-beacon verification if requested
         if valid_nonce {
             report.co_beacon_verification = Some(CoBeaconVerification {
                 received_nonce: vec![3u8; 16],
@@ -1377,7 +1328,6 @@ mod tests {
     #[test]
     fn test_whitepaper_diversity_validation() {
         let beacon_announcement = create_test_beacon_announcement();
-        
 
         let witness_reports = vec![
             create_test_witness_report(37.7749, -122.4194, true),
@@ -1389,15 +1339,13 @@ mod tests {
             witness_reports,
         );
 
-        // Should fail diversity check
         assert!(bundle.validate().is_err());
     }
 
     #[test]
     fn test_whitepaper_nonce_binding() {
         let beacon_announcement = create_test_beacon_announcement();
-        
-        // Test: insufficient nonce binding (no valid nonces)
+
         let witness_reports = vec![
             create_test_witness_report(37.7849, -122.4094, false),
             create_test_witness_report(37.7750, -122.4294, false),
@@ -1410,14 +1358,13 @@ mod tests {
             witness_reports,
         );
 
-        // Should fail nonce binding check
         assert!(bundle.validate().is_err());
     }
 
     #[test]
     fn test_3gpp_path_loss_fitting() {
         let bundle = create_test_bundle();
-        
+
         assert!(bundle.coherence_analysis.path_loss_fit_quality.rmse_db >= 0.0);
         assert!(matches!(
             bundle.coherence_analysis.path_loss_fit_quality.model_type,
@@ -1428,7 +1375,7 @@ mod tests {
     #[test]
     fn test_ldm_density_penalty() {
         let bundle = create_test_bundle();
-        
+
         let ldm_penalty = bundle.get_ldm_penalty();
         assert!(ldm_penalty >= 0.0);
         assert!(ldm_penalty <= 1.0);
@@ -1437,24 +1384,20 @@ mod tests {
     #[test]
     fn test_quality_threshold() {
         let bundle = create_test_bundle();
-        
-        // Default q_min = 0.5 per whitepaper
+
         let meets_threshold = bundle.meets_quality_threshold(0.5);
-        
-        // Should pass with valid diverse witnesses and nonces
+
         assert!(meets_threshold || bundle.coverage_quality.quality_score < 0.5);
     }
 
     #[test]
     fn test_replay_detection() {
         let beacon_announcement = create_test_beacon_announcement();
-        
-        // Create witnesses with duplicate nonces
+
         let mut witness1 = create_test_witness_report(37.7849, -122.4094, true);
         let mut witness2 = create_test_witness_report(37.7750, -122.4294, true);
         let mut witness3 = create_test_witness_report(37.7650, -122.4394, true);
 
-        // Set same nonce for witness1 and witness2 (replay attack)
         let duplicate_nonce = vec![99u8; 16];
         if let Some(ref mut co_beacon) = witness1.co_beacon_verification {
             co_beacon.received_nonce = duplicate_nonce.clone();
@@ -1471,7 +1414,6 @@ mod tests {
             witness_reports,
         );
 
-        // Should detect replay
         assert!(bundle.coherence_analysis.nonce_verification.replay_detected);
         assert!(bundle.validate().is_err());
     }

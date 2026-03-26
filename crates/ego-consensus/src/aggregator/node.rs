@@ -43,7 +43,7 @@ pub struct AggregatorNode {
     compression_threshold: usize,
     cellular_safe_mode: bool,
     quality_threshold: f64,
-    epoch_config: Arc<RwLock<EpochConfig>>, 
+    epoch_config: Arc<RwLock<EpochConfig>>,
 }
 
 impl AggregatorNode {
@@ -63,9 +63,8 @@ impl AggregatorNode {
             last_anchor_time: None,
         };
 
-
         let rate_limit_config = RateLimitConfig {
-            cellular_safe_mode: false, 
+            cellular_safe_mode: false,
             ..Default::default()
         };
 
@@ -91,7 +90,7 @@ impl AggregatorNode {
             compression_enabled: config.compression_threshold_bytes > 0,
             compression_threshold: config.compression_threshold_bytes,
             cellular_safe_mode: false,
-            quality_threshold: MIN_QUALITY_SCORE, // Use whitepaper default
+            quality_threshold: MIN_QUALITY_SCORE,
             epoch_config: Arc::new(RwLock::new(EpochConfig::new())),
         }
     }
@@ -108,7 +107,6 @@ impl AggregatorNode {
         let (_witness_sender, witness_receiver) = mpsc::unbounded_channel::<WitnessReport>();
         let (fraud_sender, _fraud_receiver) = mpsc::unbounded_channel();
 
-        // Create BFT bridge connection to Erlang consensus layer
         let erlang_endpoint = format!("{}:{}",
             self.config.erlang_bridge_host.as_deref().unwrap_or("localhost"),
             self.config.erlang_bridge_port.unwrap_or(25010)
@@ -118,10 +116,8 @@ impl AggregatorNode {
 
         info!("🔗 BFT bridge connected to Erlang consensus layer at {}", erlang_endpoint);
 
-        // Create witness receiver channel
         let (witness_sender, witness_receiver) = mpsc::unbounded_channel();
 
-        // Register this aggregator with witness bridge for its coverage regions
         register_global_aggregator(self.coverage_region.clone(), witness_sender);
         info!("📍 Registered aggregator for regions: {:?}", self.coverage_region);
 
@@ -136,7 +132,7 @@ impl AggregatorNode {
         self.start_bundle_creator().await?;
         self.start_daily_anchor_generator().await?;
         self.start_density_monitor().await?;
-        self.start_cleanup_task().await?; // NEW: Cleanup old rate limit buckets
+        self.start_cleanup_task().await?;
 
         {
             let mut status = self.status.write().unwrap();
@@ -152,7 +148,6 @@ impl AggregatorNode {
 
         self.process_all_witness_sets().await?;
         self.submit_pending_bundles().await?;
-        
 
         self.flush_buffered_data().await?;
 
@@ -183,10 +178,10 @@ impl AggregatorNode {
     pub fn set_cellular_safe_mode(&mut self, enabled: bool) {
         self.cellular_safe_mode = enabled;
         self.cellular_safe_mode_manager.set_enabled(enabled);
-        
+
         let mut metrics = self.metrics.write().unwrap();
         metrics.cellular_safe_mode_active = enabled;
-        
+
         if enabled {
             info!("📱 Cellular safe mode enabled for aggregator {}", self.address);
         } else {
@@ -202,17 +197,14 @@ impl AggregatorNode {
         );
     }
 
-
     pub fn update_node_drs_score(&self, node_id: Address, drs_score: f64) {
         self.drs_quota_manager.update_quota(node_id, drs_score);
         debug!("Updated DRS quota for node {} (score: {:.2})", node_id, drs_score);
     }
 
-
     pub fn get_rate_limit_stats(&self) -> super::dos_limits::RateLimitStats {
         self.rate_limiter.get_stats()
     }
-
 
     pub fn get_cellular_stats(&self) -> super::dos_limits::CellularStats {
         self.cellular_safe_mode_manager.get_stats()
@@ -310,32 +302,29 @@ impl AggregatorNode {
                         continue;
                     }
 
-                    // Whitepaper: validate with strict checks
                     match bundle.validate() {
                         Ok(_) => {
-                            // Check quality threshold
+
                             if !bundle.meets_quality_threshold(quality_threshold) {
                                 warn!(
                                     "Bundle quality {:.3} below threshold {:.3}, rejecting",
                                     bundle.coverage_quality.quality_score,
                                     quality_threshold
                                 );
-                                
+
                                 let mut m = metrics.write().unwrap();
                                 m.coherence_check_failures += 1;
                                 continue;
                             }
 
-
                             {
                                 let mut m = metrics.write().unwrap();
-                                
-                                // Rolling averages for DRS inputs
+
                                 let n = m.bundles_created as f64;
                                 m.avg_path_loss_rmse = (m.avg_path_loss_rmse * n + bundle.get_path_loss_rmse()) / (n + 1.0);
                                 m.avg_diversity_score = (m.avg_diversity_score * n + bundle.get_diversity_score()) / (n + 1.0);
                                 m.avg_nonce_binding_fraction = (m.avg_nonce_binding_fraction * n + bundle.get_nonce_binding_fraction()) / (n + 1.0);
-                                
+
                                 if bundle.get_ldm_penalty() > 0.0 {
                                     m.density_penalties_applied += 1;
                                 }
@@ -351,7 +340,6 @@ impl AggregatorNode {
                         }
                         Err(e) => {
                             warn!("Bundle validation failed: {}", e);
-                            
 
                             if let Some(ref sender) = fraud_sender {
                                 let fraud_type = Self::classify_validation_error(&e);
@@ -361,15 +349,15 @@ impl AggregatorNode {
                                     bundle.bundle_id,
                                     address,
                                     witness_set.epoch,
-                                    vec![], 
-                                    address, 
+                                    vec![],
+                                    address,
                                 );
-                                
+
                                 if let Err(send_err) = sender.send(evidence) {
                                     error!("Failed to emit fraud evidence: {}", send_err);
                                 }
                             }
-                            
+
                             let mut m = metrics.write().unwrap();
                             if e.to_string().contains("Path-loss") {
                                 m.path_loss_fit_failures += 1;
@@ -378,7 +366,7 @@ impl AggregatorNode {
                                 m.nonce_binding_failures += 1;
                             }
                             m.coherence_check_failures += 1;
-                            
+
                             continue;
                         }
                     }
@@ -443,7 +431,6 @@ impl AggregatorNode {
                     let merkle_tree = ego_core::crypto::MerkleTree::build(bundle_hashes);
                     let evidence_root = merkle_tree.root_hash().unwrap_or(Hash::new([0u8; 32]));
 
-
                     let mut daily_root = DailyEvidenceRoot::new(
                         evidence_root,
                         bundles.len() as u32,
@@ -456,7 +443,6 @@ impl AggregatorNode {
                         error!("Failed to sign daily evidence root: {}", e);
                         continue;
                     }
-
 
                     if let Some(ref sender) = daily_anchor_sender {
                         if let Err(e) = sender.send(daily_root.clone()) {
@@ -480,14 +466,13 @@ impl AggregatorNode {
         Ok(())
     }
 
-  
     async fn start_density_monitor(&self) -> PoCResult<()> {
         let daily_bundles = self.daily_bundles.clone();
         let density_event_sender = self.density_event_sender.clone();
         let address = self.address;
 
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(3600)); // Check hourly
+            let mut interval = interval(Duration::from_secs(3600));
 
             loop {
                 interval.tick().await;
@@ -504,15 +489,13 @@ impl AggregatorNode {
                     continue;
                 }
 
-                // Group bundles by H3 cell and check for co-location
                 let mut h3_device_counts: HashMap<String, Vec<Address>> = HashMap::new();
 
                 for bundle in &bundles {
                     let h3_cell = bundle.beacon_event.h3_cell.clone();
-                    
-                    // Check if witnesses are co-located (using LDM penalty as proxy)
+
                     if bundle.get_ldm_penalty() > 0.1 {
-                        // Significant density penalty detected
+
                         for report in &bundle.witness_reports {
                             h3_device_counts
                                 .entry(h3_cell.clone())
@@ -522,14 +505,12 @@ impl AggregatorNode {
                     }
                 }
 
-                // Emit DensityEvents for cells with clustering
                 for (h3_cell, devices) in h3_device_counts {
                     let device_count = devices.len() as u32;
-                    
+
                     if device_count > 1 {
 
                         let ldm = (1.0 - 0.10 * (device_count as f64 - 1.0)).max(0.40);
-                        
 
                         let device_hashes: Vec<Vec<u8>> = devices
                             .iter()
@@ -567,40 +548,37 @@ impl AggregatorNode {
         Ok(())
     }
 
-    // NEW: Periodic cleanup of old rate limit buckets
     async fn start_cleanup_task(&self) -> PoCResult<()> {
         let rate_limiter = self.rate_limiter.clone();
-        
+
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(300)); // 5 minutes
-            
+            let mut interval = interval(Duration::from_secs(300));
+
             loop {
                 interval.tick().await;
-                rate_limiter.cleanup_old_buckets(600); // Clean buckets older than 10 minutes
+                rate_limiter.cleanup_old_buckets(600);
                 debug!("Cleaned up old rate limit buckets");
             }
         });
-        
+
         Ok(())
     }
 
-
     async fn flush_buffered_data(&self) -> PoCResult<()> {
         let buffered = self.cellular_safe_mode_manager.get_buffered_data();
-        
+
         if buffered.is_empty() {
             return Ok(());
         }
 
         info!("Flushing {} buffered items over Wi-Fi", buffered.len());
-        
+
         let total_bytes: usize = buffered.iter().map(|d| d.len()).sum();
-        
 
         self.cellular_safe_mode_manager.record_wifi_usage(total_bytes, buffered.len());
-        
+
         info!("✅ Flushed {} bytes in {} items over Wi-Fi", total_bytes, buffered.len());
-        
+
         Ok(())
     }
 
@@ -714,7 +692,6 @@ impl AggregatorNode {
             metrics.compression_ratio = total_ratio / metrics.bundles_created as f32;
         }
 
-        // Whitepaper metrics
         let n = metrics.bundles_created as f64;
         metrics.avg_path_loss_rmse = (metrics.avg_path_loss_rmse * (n - 1.0) + bundle.get_path_loss_rmse()) / n;
         metrics.avg_diversity_score = (metrics.avg_diversity_score * (n - 1.0) + bundle.get_diversity_score()) / n;
@@ -727,10 +704,9 @@ impl AggregatorNode {
         metrics.last_updated = Timestamp::now();
     }
 
-    /// Classify validation error for fraud evidence
     fn classify_validation_error(error: &PoCError) -> PoCFraudType {
         let error_str = error.to_string();
-        
+
         if error_str.contains("Path-loss") || error_str.contains("RMSE") {
             PoCFraudType::PathLossMismatch
         } else if error_str.contains("diversity") || error_str.contains("H3 cell") || error_str.contains("account") {
@@ -769,7 +745,6 @@ impl Aggregator for AggregatorNode {
             announcement.beacon_id, self.address
         );
 
-        // NEW: Check rate limit for beacon announcements
         let announcement_size = std::mem::size_of_val(&announcement);
         if !self.rate_limiter.check_rate_limit(announcement.beacon_id, announcement_size) {
             let mut metrics = self.metrics.write().unwrap();
@@ -821,7 +796,6 @@ impl Aggregator for AggregatorNode {
             report.witness_id, report.beacon_id, self.address
         );
 
-        // NEW: Check rate limit for witness reports
         let report_size = std::mem::size_of_val(&report);
         if !self.rate_limiter.check_rate_limit(report.witness_id, report_size) {
             let mut metrics = self.metrics.write().unwrap();
@@ -830,7 +804,6 @@ impl Aggregator for AggregatorNode {
             return Err(PoCError::NetworkError("Rate limit exceeded".to_string()));
         }
 
-        // NEW: Check DRS quota
         if !self.drs_quota_manager.can_publish(report.witness_id) {
             warn!("Witness {} failed DRS quota check", report.witness_id);
             return Err(PoCError::NetworkError("Quota exceeded".to_string()));
@@ -917,8 +890,6 @@ impl Aggregator for AggregatorNode {
             });
         }
 
-
-        // Use epoch-based validation with current epoch
         let current_epoch = self.get_current_epoch();
         let epoch_config = self.get_epoch_config_guard();
         let validation_result = validate_poc_bundle_with_epoch_config(
@@ -927,15 +898,14 @@ impl Aggregator for AggregatorNode {
             &epoch_config,
             current_epoch,
         )?;
-        drop(epoch_config); // Release read lock early
+        drop(epoch_config);
 
         if !validation_result.valid {
             warn!(
                 "Bundle validation failed: {}",
                 validation_result.errors.join("; ")
             );
-            
-            // Update metrics based on validation errors
+
             let mut metrics = self.metrics.write().unwrap();
             for error in &validation_result.errors {
                 if error.contains("Path-loss") {
@@ -960,7 +930,6 @@ impl Aggregator for AggregatorNode {
         bundle.sign(&self.keypair)?;
         bundle.validate()?;
 
-
         if !bundle.meets_quality_threshold(self.quality_threshold) {
             return Err(PoCError::ValidationFailed(format!(
                 "Bundle quality {:.3} below threshold {:.3}",
@@ -968,7 +937,6 @@ impl Aggregator for AggregatorNode {
             )));
         }
 
-        // NEW: Check bundle size before compression
         let bundle_size = std::mem::size_of_val(&bundle);
         if !self.rate_limiter.check_bundle_size(bundle_size) {
             warn!("Bundle size {} exceeds limit", bundle_size);
@@ -1007,26 +975,23 @@ impl Aggregator for AggregatorNode {
             event.beacon_hash, self.address
         );
 
-        // NEW: Cellular-safe mode check with buffering
         let event_size = std::mem::size_of_val(&event);
         if !self.cellular_safe_mode_manager.can_send_over_cellular(event_size) {
             debug!("Buffering PoC event for Wi-Fi upload (size: {} bytes)", event_size);
-            
-            // Serialize and buffer
+
             let event_bytes = bincode::encode_to_vec(&event, bincode::config::standard())
                 .map_err(|e| PoCError::NetworkError(format!("Serialization failed: {}", e)))?;
-            
+
             self.cellular_safe_mode_manager.buffer_for_wifi(event_bytes);
-            
+
             info!(
                 "📱 Buffered PoC event for beacon {} ({} bytes) - waiting for Wi-Fi",
                 event.beacon_hash, event_size
             );
-            
+
             return Ok(());
         }
 
-        // Record cellular usage for meta events
         if self.cellular_safe_mode_manager.is_enabled() {
             self.cellular_safe_mode_manager.record_cellular_usage(event_size);
         }
@@ -1077,7 +1042,6 @@ impl Aggregator for AggregatorNode {
         let merkle_tree = ego_core::crypto::MerkleTree::build(bundle_hashes);
         let evidence_root = merkle_tree.root_hash().unwrap_or(Hash::new([0u8; 32]));
 
-
         let mut daily_root = DailyEvidenceRoot::new(
             evidence_root,
             bundles.len() as u32,
@@ -1087,7 +1051,6 @@ impl Aggregator for AggregatorNode {
         );
 
         daily_root.sign(&self.keypair)?;
-
 
         if let Some(ref sender) = self.daily_anchor_sender {
             sender.send(daily_root).map_err(|e| {
@@ -1114,14 +1077,13 @@ impl Aggregator for AggregatorNode {
 
 impl EpochConfigProvider for AggregatorNode {
     fn get_epoch_config(&self) -> &EpochConfig {
-        // This is a bit of a hack since we need &EpochConfig but have Arc<RwLock<EpochConfig>>
-        // In practice, we'll use the methods that don't require this trait
+
         unimplemented!("Use get_epoch_config_guard() method instead")
     }
 }
 
 impl AggregatorNode {
-    /// Get epoch configuration (thread-safe access)
+
     pub fn get_epoch_config_guard(&self) -> std::sync::RwLockReadGuard<'_, EpochConfig> {
         self.epoch_config.read().unwrap()
     }
@@ -1181,15 +1143,15 @@ mod tests {
     #[test]
     fn test_cellular_safe_mode() {
         let mut aggregator = create_test_aggregator();
-        
+
         assert!(!aggregator.cellular_safe_mode);
         assert!(!aggregator.cellular_safe_mode_manager.is_enabled());
-        
+
         aggregator.set_cellular_safe_mode(true);
         assert!(aggregator.cellular_safe_mode);
         assert!(aggregator.cellular_safe_mode_manager.is_enabled());
         assert!(aggregator.get_metrics().cellular_safe_mode_active);
-        
+
         aggregator.set_cellular_safe_mode(false);
         assert!(!aggregator.cellular_safe_mode);
         assert!(!aggregator.cellular_safe_mode_manager.is_enabled());
@@ -1199,14 +1161,14 @@ mod tests {
     #[test]
     fn test_quality_threshold() {
         let mut aggregator = create_test_aggregator();
-        
+
         aggregator.set_quality_threshold(0.7);
         assert_eq!(aggregator.quality_threshold, 0.7);
-        
+
         // Test clamping
         aggregator.set_quality_threshold(1.5);
         assert_eq!(aggregator.quality_threshold, 1.0);
-        
+
         aggregator.set_quality_threshold(-0.5);
         assert_eq!(aggregator.quality_threshold, 0.0);
     }
@@ -1215,10 +1177,10 @@ mod tests {
     fn test_drs_quota_management() {
         let aggregator = create_test_aggregator();
         let node = Address::new([1u8; 20]);
-        
+
         // Update quota
         aggregator.update_node_drs_score(node, 0.9);
-        
+
         // Check quota was updated
         let quota = aggregator.drs_quota_manager.get_quota(node);
         assert!(quota.is_some());
@@ -1231,16 +1193,16 @@ mod tests {
     fn test_rate_limiter_integration() {
         let aggregator = create_test_aggregator();
         let peer = Address::new([1u8; 20]);
-        
+
         // Check initial state
         let stats = aggregator.get_rate_limit_stats();
         assert_eq!(stats.total_messages, 0);
-        
+
         // Simulate rate limiting
         for _ in 0..10 {
             aggregator.rate_limiter.check_rate_limit(peer, 1000);
         }
-        
+
         let stats = aggregator.get_rate_limit_stats();
         assert!(stats.total_messages > 0);
     }
@@ -1248,11 +1210,11 @@ mod tests {
     #[test]
     fn test_cellular_stats() {
         let aggregator = create_test_aggregator();
-        
+
         // Record usage
         aggregator.cellular_safe_mode_manager.record_cellular_usage(1000);
         aggregator.cellular_safe_mode_manager.record_wifi_usage(50_000, 5);
-        
+
         let stats = aggregator.get_cellular_stats();
         assert_eq!(stats.cellular_bytes_used, 1_000);
         assert_eq!(stats.wifi_bytes_used, 50_000);
@@ -1262,25 +1224,25 @@ mod tests {
     #[test]
     fn test_classify_validation_error() {
         use crate::FraudType;
-        
+
         let error1 = PoCError::ValidationFailed("Path-loss RMSE exceeds threshold".to_string());
         assert!(matches!(
             AggregatorNode::classify_validation_error(&error1),
             PoCFraudType::PathLossMismatch
         ));
-        
+
         let error2 = PoCError::ValidationFailed("Insufficient H3 cell diversity".to_string());
         assert!(matches!(
             AggregatorNode::classify_validation_error(&error2),
             PoCFraudType::InsufficientDiversity
         ));
-        
+
         let error3 = PoCError::ValidationFailed("Insufficient nonce binding".to_string());
         assert!(matches!(
             AggregatorNode::classify_validation_error(&error3),
             PoCFraudType::NonceBindingFailure
         ));
-        
+
         let error4 = PoCError::FraudDetected {
             fraud_type: FraudType::ReplayAttack,
             details: "Nonce replay detected".to_string(),
@@ -1295,7 +1257,7 @@ mod tests {
     fn test_whitepaper_metrics_initialization() {
         let aggregator = create_test_aggregator();
         let metrics = aggregator.get_metrics();
-        
+
         assert_eq!(metrics.path_loss_fit_failures, 0);
         assert_eq!(metrics.nonce_binding_failures, 0);
         assert_eq!(metrics.density_penalties_applied, 0);

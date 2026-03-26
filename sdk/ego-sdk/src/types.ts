@@ -1,7 +1,5 @@
-/** 20-byte hex address, e.g. "0xabc...def" */
 export type Address = string;
 
-/** Raw uEGOC amount (1 EGOC = 1_000_000 uEGOC) */
 export type Balance = bigint;
 
 export interface BlockSummary {
@@ -13,7 +11,7 @@ export interface BlockSummary {
 
 export interface BalanceResult {
   address:       Address;
-  balance_uegoc: string;   // bigint as string (JSON)
+  balance_uegoc: string;
   balance_egoc:  string;
 }
 
@@ -44,18 +42,17 @@ export interface HealthResult {
   peer_id:      string;
 }
 
-/** Minimal transaction envelope for submission */
 export interface TxEnvelope {
   from:      Address;
   to:        Address;
-  amount:    string;    // uEGOC as decimal string
+  amount:    string;
   nonce:     number;
   payload?:  unknown;
 }
 
 export interface EgoClientOptions {
-  /** Base URL of the ego-node RPC, default http://localhost:8545 */
+
   rpcUrl?: string;
-  /** Request timeout in ms, default 10_000 */
+
   timeout?: number;
 }

@@ -1,20 +1,3 @@
-//! Content-addressed block storage.
-//!
-//! Files are split into 256 KB plaintext chunks.  Each chunk is:
-//!  1. Hashed with BLAKE2 → block CID (`egoblk1{hex}`)  — content-addressed
-//!  2. Encrypted with AES-256-GCM (same file key, unique random nonce per block)
-//!  3. Stored as `{storage_dir}/{last16_of_cid}.blk`
-//!
-//! A manifest (`egomfd1{hex}`) records the ordered list of blocks and is
-//! stored as `{storage_dir}/{last16_of_manifest_cid}.mfd`.
-//!
-//! Every block fits inside a DHT record (256 KB raw < our 4 MB limit).
-//! The manifest is tiny (~100 B + 100 B/block).
-//!
-//! Share bundle format (same egoshare1 envelope, new CID prefix):
-//!   `egoshare1:{manifest_cid}:{key_hex64}:{base64_name}:{from_addr}`
-//!   where `key_hex64` = hex of the 32-byte AES key (no global nonce).
-
 use crate::ledger::storage_dir;
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -24,33 +7,61 @@ use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Plaintext block size: 256 KB.
 pub const BLOCK_SIZE: usize = 256 * 1024;
 
-// ── Types ─────────────────────────────────────────────────────────────────────
-
-/// One block's metadata as stored in the manifest.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlockEntry {
-    /// `egoblk1{BLAKE2(plaintext_chunk)}` — content-addressed.
-    pub block_cid: String,
-    /// Hex-encoded 12-byte AES-GCM nonce, unique to this block.
-    pub nonce_hex: String,
-    /// Plaintext byte count (≤ BLOCK_SIZE).
-    pub size: u64,
+/// Blake3 hash over all block CIDs in order — used as the on-chain storage commitment.
+/// Anyone with the manifest can recompute this and verify it matches the chain record.
+pub fn compute_commitment(blocks: &[BlockEntry]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for b in blocks {
+        hasher.update(b.block_cid.as_bytes());
+    }
+    format!("egocmt1{}", hasher.finalize().to_hex())
 }
 
-/// The manifest describing all blocks of a file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockEntry {
+    pub block_cid: String,
+    pub nonce_hex: String,
+    pub size: u64,
+    /// PoRep replica commitment: blake3(POREP_TAG || enc_bytes || prover_addr || block_cid).
+    /// Binds the encrypted content to a specific prover — different nodes produce different
+    /// comm_r for the same data, so you can't fake storage by fetching on demand.
+    #[serde(default)]
+    pub comm_r: String,
+}
+
+/// Compute the per-block replica commitment.
+/// `enc_bytes`   = the encrypted block as stored on disk.
+/// `prover_addr` = the storing node's address (makes it replica-unique).
+/// `block_cid`   = the block's content CID (prevents cross-block substitution).
+pub fn compute_block_comm_r(enc_bytes: &[u8], prover_addr: &str, block_cid: &str) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(crate::proof::POREP_TAG);
+    h.update(enc_bytes);
+    h.update(prover_addr.as_bytes());
+    h.update(block_cid.as_bytes());
+    hex::encode(h.finalize().as_bytes())
+}
+
+/// Aggregate all per-block comm_r values into a single file-level PoRep commitment.
+/// Stored in `StoredFile.comm_r` and registered with the relay so peers can slash-verify.
+pub fn compute_porep_root(blocks: &[BlockEntry]) -> String {
+    let mut h = blake3::Hasher::new();
+    for b in blocks {
+        h.update(b.comm_r.as_bytes());
+    }
+    format!("egoporep1{}", h.finalize().to_hex())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileManifest {
-    /// `egomfd1{BLAKE2(stable_content)}` — deterministic CID.
+
     pub manifest_cid: String,
     pub file_name: String,
     pub total_size: u64,
     pub blocks: Vec<BlockEntry>,
 }
-
-// ── Path helpers ──────────────────────────────────────────────────────────────
 
 pub fn manifest_path(manifest_cid: &str) -> PathBuf {
     let short = &manifest_cid[manifest_cid.len().saturating_sub(16)..];
@@ -61,8 +72,6 @@ pub fn block_path(block_cid: &str) -> PathBuf {
     let short = &block_cid[block_cid.len().saturating_sub(16)..];
     storage_dir().join(format!("{}.blk", short))
 }
-
-// ── Persistence ───────────────────────────────────────────────────────────────
 
 pub fn save_manifest(manifest: &FileManifest) -> Result<PathBuf, String> {
     let path = manifest_path(&manifest.manifest_cid);
@@ -111,11 +120,6 @@ pub fn blocks_received_count(manifest: &FileManifest) -> u32 {
     manifest.blocks.iter().filter(|b| have_block(&b.block_cid)).count() as u32
 }
 
-// ── Split ─────────────────────────────────────────────────────────────────────
-
-/// Split `plaintext` into 256 KB blocks, encrypt each with `key_bytes`
-/// (unique random nonce per block), and return
-/// `(manifest, Vec<(block_cid, encrypted_bytes)>)`.
 pub fn split_into_blocks(
     plaintext: &[u8],
     file_name: &str,
@@ -125,11 +129,10 @@ pub fn split_into_blocks(
     let mut blocks_data:   Vec<(String, Vec<u8>)> = Vec::new();
 
     for chunk in plaintext.chunks(BLOCK_SIZE) {
-        // Content-addressed: CID = BLAKE2 of plaintext chunk
+
         let hash      = ego_core::hash_data(chunk);
         let block_cid = format!("egoblk1{}", hash.to_hex());
 
-        // Unique random 12-byte nonce per block
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
 
@@ -144,11 +147,11 @@ pub fn split_into_blocks(
             block_cid: block_cid.clone(),
             nonce_hex: hex::encode(nonce_bytes),
             size:      chunk.len() as u64,
+            comm_r:    String::new(),  // filled in by store_file after encryption
         });
         blocks_data.push((block_cid, encrypted));
     }
 
-    // Manifest CID = BLAKE2 of the stable block-list JSON (deterministic)
     let content       = serde_json::json!({
         "file_name":  file_name,
         "total_size": plaintext.len() as u64,
@@ -168,10 +171,6 @@ pub fn split_into_blocks(
     Ok((manifest, blocks_data))
 }
 
-// ── Reassemble ────────────────────────────────────────────────────────────────
-
-/// Decrypt and concatenate all blocks from disk in order.
-/// `key_bytes` is the 32-byte AES key stored in `StoredFile.key_nonce_hex`.
 pub fn reassemble_blocks(
     manifest:  &FileManifest,
     key_bytes: &[u8; 32],

@@ -29,6 +29,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zeroize = { version = "1.7.0", features = ["zeroize_derive"] }
+rocksdb = "0.22"
 
 [dev-dependencies]
 tempfile = "3.21.0"

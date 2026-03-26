@@ -1,8 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
+import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/api/dialog';
 import { useWallet } from '../App';
 import { useConfirm } from '../hooks/useConfirm';
+import Pagination from '../components/Pagination';
 
 interface StorageMetrics {
   storage_allocated_bytes: number;
@@ -12,6 +14,8 @@ interface StorageMetrics {
   last_post_latency_ms?: number;
   last_post_timestamp?: number;
   encrypted_files_count: number;
+  peer_bytes_hosted: number;
+  disk_free_bytes: number;
 }
 
 interface StoredFile {
@@ -25,15 +29,15 @@ interface StoredFile {
   status: string;
   key_nonce_hex: string;
   local_path: string;
-  // PoRep / PoST fields
+
   comm_d?: string;
   sector_id?: number;
-  post_status?: string;   // "" | "registered" | "challenged" | "proved" | "faulted"
+  post_status?: string;
   last_proved?: number | null;
 }
 
 function postBadge(f: StoredFile) {
-  if (!f.comm_d) return null; // no PoRep commitment yet
+  if (!f.comm_d) return null;
   const s = f.post_status ?? '';
   if (s === 'proved')     return <span className="text-xs px-1.5 py-0.5 rounded bg-green-500/15 text-green-400 font-medium">✓ Proved</span>;
   if (s === 'faulted')    return <span className="text-xs px-1.5 py-0.5 rounded bg-red-500/15 text-red-400 font-medium">⚠ Faulted</span>;
@@ -83,16 +87,19 @@ function fmtExpiry(ts: number) {
   const days = Math.floor(diff / 86400);
   return `${days}d left`;
 }
-// Earnings rate: 0.5 EGOC per GB per day
-function storageEarningsPerDay(allocatedBytes: number) {
+
+function storageEarningsPerDay(peerBytesHosted: number) {
+  return (peerBytesHosted / 1e9) * 0.5;
+}
+function maxEarningsPerDay(allocatedBytes: number) {
   return (allocatedBytes / 1e9) * 0.5;
 }
 
 const PROCESS_STAGES: { key: ProcessStage; label: string; detail: string; ms: number }[] = [
   { key: 'encrypting', label: 'AES-256-GCM Encryption',   detail: 'Encrypting file with random key + nonce',        ms: 1200 },
   { key: 'coding',     label: 'Content Addressing (CID)',  detail: 'Computing BLAKE2 hash → egocid1… identifier',   ms: 800  },
-  { key: 'placing',    label: 'Writing to Local Storage',  detail: 'Persisting encrypted blob to disk',              ms: 1000 },
-  { key: 'anchoring',  label: 'Ledger Commitment',         detail: 'Recording CID + expiry in local testnet ledger', ms: 700  },
+  { key: 'placing',    label: 'Distributing to P2P Network', detail: 'Replicating encrypted blob across storage nodes', ms: 1000 },
+  { key: 'anchoring',  label: 'Ledger Commitment',          detail: 'Recording CID + expiry in on-chain ledger',       ms: 700  },
 ];
 
 const StoragePage: React.FC = () => {
@@ -103,7 +110,6 @@ const StoragePage: React.FC = () => {
   const [metrics, setMetrics] = useState<StorageMetrics | null>(null);
   const [files, setFiles] = useState<StoredFile[]>([]);
 
-  // Upload flow
   const [step, setStep] = useState<UploadStep>('idle');
   const [filePath, setFilePath] = useState('');
   const [fileName, setFileName] = useState('');
@@ -114,15 +120,18 @@ const StoragePage: React.FC = () => {
   const [storeResult, setStoreResult] = useState<StoreFileResult | null>(null);
   const [storeError, setStoreError] = useState('');
 
-  // Storage provision config
   const [showProvConfig, setShowProvConfig] = useState(false);
   const [allocGb, setAllocGb] = useState(50);
   const [configuring, setConfiguring] = useState(false);
+  const [selectedDrive, setSelectedDrive] = useState('');
+  const [availDrives, setAvailDrives] = useState<{ letter: string; free_gb: number }[]>([]);
 
-  // File detail / preview
   const [selectedFile, setSelectedFile] = useState<StoredFile | null>(null);
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+
+  const [filePage, setFilePage] = useState(1);
+  const [filePageSize, setFilePageSize] = useState(25);
 
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const storeResultRef = useRef<StoreFileResult | null>(null);
@@ -130,6 +139,16 @@ const StoragePage: React.FC = () => {
 
   useEffect(() => { loadData(); }, []);
   useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current); }, []);
+
+  // Refresh file list when a file is received via Messenger or downloaded from a peer.
+  useEffect(() => {
+    const unlistenReceived  = listen('ego://file-received',   () => { loadData(); });
+    const unlistenDownloaded = listen('ego://file-downloaded', () => { loadData(); });
+    return () => {
+      unlistenReceived.then(f => f());
+      unlistenDownloaded.then(f => f());
+    };
+  }, []);
 
   async function loadData() {
     try {
@@ -142,12 +161,19 @@ const StoragePage: React.FC = () => {
     } catch (e) { console.error(e); }
   }
 
-  // ── Storage provision config ──────────────────────────────────────────────
+  async function openProvConfig() {
+    try {
+      const drives = await invoke<{ letter: string; free_gb: number }[]>('get_available_drives');
+      setAvailDrives(drives);
+      if (drives.length > 0 && !selectedDrive) setSelectedDrive(drives[0].letter);
+    } catch { }
+    setShowProvConfig(true);
+  }
 
   async function handleConfigureStorage() {
     setConfiguring(true);
     try {
-      await invoke('configure_storage', { gb: allocGb });
+      await invoke('configure_storage', { gb: allocGb, drive: selectedDrive });
       await loadData();
       setShowProvConfig(false);
     } catch (e: any) {
@@ -156,8 +182,6 @@ const StoragePage: React.FC = () => {
       setConfiguring(false);
     }
   }
-
-  // ── File upload flow ──────────────────────────────────────────────────────
 
   async function pickFile() {
     try {
@@ -235,8 +259,6 @@ const StoragePage: React.FC = () => {
     storeResultRef.current = null; storeErrorRef.current = '';
   }
 
-  // ── Delete file ───────────────────────────────────────────────────────────
-
   async function handleDelete(cid: string) {
     if (!await confirm('Permanently delete this file?', { detail: 'This also removes the encryption key. This cannot be undone.', confirmLabel: 'Delete' })) return;
     try {
@@ -246,8 +268,6 @@ const StoragePage: React.FC = () => {
       invoke<StorageMetrics>('get_storage_metrics').then(m => setMetrics(m)).catch(() => {});
     } catch (e: any) { alert('Delete failed: ' + String(e)); }
   }
-
-  // ── File preview ──────────────────────────────────────────────────────────
 
   async function loadPreview(file: StoredFile) {
     setSelectedFile(file);
@@ -260,20 +280,20 @@ const StoragePage: React.FC = () => {
     finally { setPreviewLoading(false); }
   }
 
-  // ── Metrics ───────────────────────────────────────────────────────────────
-
-  const isConfigured = (metrics?.storage_allocated_bytes ?? 0) > 0;
-  const allocated    = metrics?.storage_allocated_bytes ?? 0;
-  const used         = metrics?.space_used_bytes ?? 0;
-  const available    = metrics?.space_available_bytes ?? 0;
-  const usedPct      = allocated > 0 ? Math.min(100, Math.round((used / allocated) * 100)) : 0;
-  const earningsPerDay = storageEarningsPerDay(allocated);
+  const isConfigured   = (metrics?.storage_allocated_bytes ?? 0) > 0;
+  const allocated      = metrics?.storage_allocated_bytes ?? 0;
+  const used           = metrics?.space_used_bytes ?? 0;
+  const available      = metrics?.space_available_bytes ?? 0;
+  const peerHosted     = metrics?.peer_bytes_hosted ?? 0;
+  const peerUsedPct    = allocated > 0 ? Math.min(100, Math.round((peerHosted / allocated) * 100)) : 0;
+  const earningsPerDay = storageEarningsPerDay(peerHosted);
+  const maxPerDay      = maxEarningsPerDay(allocated);
 
   return (
     <div className="p-6 space-y-5 max-w-4xl mx-auto">
       {ConfirmDialog}
 
-      {/* ── Storage Provider Configuration ─────────────────────────────── */}
+      {}
       {!isConfigured ? (
         <div className="bg-gradient-to-br from-purple-900/60 to-blue-900/60 rounded-2xl border border-purple-500/30 p-6">
           <div className="flex items-start gap-4">
@@ -289,7 +309,7 @@ const StoragePage: React.FC = () => {
                 &nbsp;Files stored by others are AES-256-GCM encrypted and you cannot read their contents.
               </div>
               <button
-                onClick={() => setShowProvConfig(true)}
+                onClick={openProvConfig}
                 className="bg-purple-600 hover:bg-purple-500 transition px-5 py-2.5 rounded-xl font-semibold text-sm"
               >
                 Configure Storage →
@@ -298,42 +318,66 @@ const StoragePage: React.FC = () => {
           </div>
         </div>
       ) : (
-        /* ── Header stats (configured) ─────────────────────────────────── */
+
         <div className="grid grid-cols-4 gap-3">
+          {/* Card 1: Peer usage of your space */}
           <div className="col-span-2 bg-gray-800 rounded-2xl p-5 border border-gray-700">
             <div className="flex justify-between items-start mb-3">
               <div>
-                <div className="text-xs text-gray-400">Storage Used / Allocated</div>
-                <div className="text-2xl font-bold">{fmtBytes(used)}</div>
+                <div className="text-xs text-gray-400">Network Using Your Space</div>
+                <div className="text-2xl font-bold">{fmtBytes(peerHosted)}</div>
                 <div className="text-xs text-gray-500">of {fmtBytes(allocated)} allocated</div>
               </div>
               <div className="text-right">
-                <div className="bg-blue-500/20 text-blue-400 rounded-lg px-2 py-1 text-xs font-medium">{usedPct}% used</div>
-                <button onClick={() => setShowProvConfig(true)} className="text-xs text-gray-500 hover:text-gray-300 mt-1 block">change</button>
+                <div className={`rounded-lg px-2 py-1 text-xs font-medium ${peerUsedPct > 0 ? 'bg-green-500/20 text-green-400' : 'bg-gray-600/40 text-gray-400'}`}>
+                  {peerUsedPct}% utilized
+                </div>
+                <button onClick={openProvConfig} className="text-xs text-gray-500 hover:text-gray-300 mt-1 block">change</button>
+                <button
+                  onClick={async () => {
+                    if (!confirm('Reset all storage? This deletes all stored files and block data from your drive and cannot be undone.')) return;
+                    try {
+                      await invoke('reset_storage');
+                      await loadData();
+                    } catch (e: any) { alert(String(e)); }
+                  }}
+                  className="text-xs text-red-500 hover:text-red-400 mt-1 block"
+                >
+                  reset
+                </button>
               </div>
             </div>
             <div className="bg-gray-700 rounded-full h-2">
-              <div className="bg-gradient-to-r from-blue-500 to-purple-500 h-2 rounded-full transition-all" style={{ width: `${usedPct}%` }} />
+              <div className="bg-gradient-to-r from-green-500 to-blue-500 h-2 rounded-full transition-all" style={{ width: `${peerUsedPct}%` }} />
+            </div>
+            <div className="text-xs text-gray-600 mt-2">
+              You cannot see whose data is stored — only encrypted blocks with no metadata.
             </div>
           </div>
 
+          {/* Card 2: Actual earning rate (based on real peer usage) */}
           <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
-            <div className="text-xs text-gray-400 mb-1">Max Potential Rate</div>
-            <div className="text-xl font-bold text-green-400">{earningsPerDay.toFixed(2)}</div>
+            <div className="text-xs text-gray-400 mb-1">Earning Rate</div>
+            <div className={`text-xl font-bold ${earningsPerDay > 0 ? 'text-green-400' : 'text-gray-500'}`}>
+              {earningsPerDay.toFixed(4)}
+            </div>
             <div className="text-xs text-gray-500">EGOC / day</div>
-            <div className="text-xs text-yellow-500/70 mt-1">if space is fully utilized</div>
+            <div className="text-xs text-gray-600 mt-1">
+              Max: {maxPerDay.toFixed(2)} EGOC/day
+            </div>
           </div>
 
+          {/* Card 3: Available space for peers */}
           <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
-            <div className="text-xs text-gray-400 mb-1">Files Stored</div>
-            <div className="text-xl font-bold">{metrics?.encrypted_files_count ?? 0}</div>
+            <div className="text-xs text-gray-400 mb-1">Available for Network</div>
+            <div className="text-xl font-bold">{fmtBytes(allocated - peerHosted)}</div>
+            <div className="text-xs text-gray-500">free to allocate</div>
             <div className="text-xs text-green-400 mt-1">🔐 AES-256-GCM</div>
-            <div className="text-xs text-gray-500">Available: {fmtBytes(available)}</div>
           </div>
         </div>
       )}
 
-      {/* ── Upload section ──────────────────────────────────────────────── */}
+      {}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-700">
           <h3 className="font-semibold">Store Your Files</h3>
@@ -346,12 +390,12 @@ const StoragePage: React.FC = () => {
           {step === 'idle' && (
             <div className="text-center py-8">
               <div className="text-5xl mb-4">🗄️</div>
-              <div className="text-lg font-semibold mb-1">Encrypted Local Storage</div>
+              <div className="text-lg font-semibold mb-1">P2P Decentralized Storage</div>
               <div className="text-xs text-gray-400 mb-1 max-w-xs mx-auto">
-                AES-256-GCM encryption · BLAKE2 content addressing · ledger commitment
+                AES-256-GCM encryption · BLAKE2 content addressing · on-chain commitment
               </div>
               <div className="text-xs text-gray-500 mb-6">
-                Your file name stays private — nodes only see the CID hash.
+                Your file name stays private — storage nodes only see the CID hash.
               </div>
               <button onClick={pickFile} className="bg-blue-600 hover:bg-blue-500 transition px-6 py-3 rounded-xl font-semibold">
                 + Pick File to Store
@@ -370,17 +414,34 @@ const StoragePage: React.FC = () => {
                 </div>
               </div>
               <div>
-                <div className="flex justify-between text-sm mb-2">
-                  <span className="text-gray-400">Storage Duration</span>
-                  <span className="font-bold">{duration} month{duration > 1 ? 's' : ''}</span>
+                <div className="text-sm text-gray-400 mb-2">Storage Duration</div>
+                <div className="grid grid-cols-4 gap-2 mb-3">
+                  {[1, 3, 12, 0].map(mo => (
+                    <button
+                      key={mo}
+                      onClick={() => setDuration(mo)}
+                      className={`py-2 rounded-xl text-sm font-semibold border transition ${duration === mo ? 'border-blue-500 bg-blue-500/20 text-blue-300' : 'border-gray-600 bg-gray-900 text-gray-400 hover:border-gray-500'}`}
+                    >
+                      {mo === 0 ? '♾ Perm.' : mo === 1 ? '1 mo' : mo === 12 ? '1 yr' : `${mo} mo`}
+                    </button>
+                  ))}
                 </div>
-                <input type="range" min="1" max="24" value={duration} onChange={e => setDuration(+e.target.value)} className="w-full accent-blue-500" />
-                <div className="flex justify-between text-xs text-gray-500 mt-1"><span>1 month</span><span>24 months</span></div>
+                {duration > 0 && (
+                  <div className="space-y-1">
+                    <input type="range" min="1" max="24" value={duration} onChange={e => setDuration(+e.target.value)} className="w-full accent-blue-500" />
+                    <div className="flex justify-between text-xs text-gray-500"><span>1 month</span><span className="font-semibold text-white">{duration} month{duration > 1 ? 's' : ''}</span><span>24 months</span></div>
+                  </div>
+                )}
+                {duration === 0 && (
+                  <div className="text-xs text-purple-400 bg-purple-500/10 border border-purple-500/20 rounded-lg px-3 py-2">
+                    ♾ Permanent storage — 50% discount vs 10-year equivalent. File never expires.
+                  </div>
+                )}
               </div>
               <div className="bg-gray-900 rounded-xl p-4 text-sm space-y-2">
                 <div className="flex justify-between"><span className="text-gray-400">Encryption</span><span>AES-256-GCM</span></div>
                 <div className="flex justify-between"><span className="text-gray-400">Content ID</span><span>BLAKE2s-256</span></div>
-                <div className="flex justify-between"><span className="text-gray-400">Cost rate</span><span>0.01 EGOC / MB / month</span></div>
+                <div className="flex justify-between"><span className="text-gray-400">Cost rate</span><span>$0.005 / GB / month — paid to providers</span></div>
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <button onClick={resetUpload} className="bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition">← Back</button>
@@ -440,14 +501,10 @@ const StoragePage: React.FC = () => {
                 <div className="border-t border-gray-700 pt-3 space-y-2 text-xs">
                   <div className="flex justify-between"><span className="text-gray-400">Original size</span><span>{fmtBytes(storeResult.original_size)}</span></div>
                   <div className="flex justify-between"><span className="text-gray-400">Encrypted size</span><span>{fmtBytes(storeResult.encrypted_size)}</span></div>
-                  <div className="flex justify-between"><span className="text-gray-400">Duration</span><span>{storeResult.duration_months} months</span></div>
-                  <div className="flex justify-between"><span className="text-gray-400">Expires</span><span>{new Date(storeResult.expiry_timestamp * 1000).toLocaleDateString()}</span></div>
-                  <div className="flex justify-between"><span className="text-gray-400">Cost burned</span><span className="text-yellow-400">{(storeResult.cost_uegoc / 1_000_000).toFixed(4)} EGOC</span></div>
+                  <div className="flex justify-between"><span className="text-gray-400">Duration</span><span>{storeResult.duration_months === 0 ? '♾ Permanent' : `${storeResult.duration_months} month${storeResult.duration_months > 1 ? 's' : ''}`}</span></div>
+                  <div className="flex justify-between"><span className="text-gray-400">Expires</span><span>{storeResult.expiry_timestamp > 1e14 ? 'Never' : new Date(storeResult.expiry_timestamp * 1000).toLocaleDateString()}</span></div>
+                  <div className="flex justify-between"><span className="text-gray-400">Storage fee (to providers)</span><span className="text-yellow-400">{(storeResult.cost_uegoc / 1_000_000).toFixed(4)} EGOC</span></div>
                   <div className="flex justify-between"><span className="text-gray-400">Commitment</span><span className="text-green-400">Ledger anchored ✓</span></div>
-                </div>
-                <div className="border-t border-gray-700 pt-3">
-                  <div className="text-xs text-yellow-400 mb-1">⚠️ Encryption Key (keep this safe!)</div>
-                  <div className="font-mono text-xs text-yellow-300 break-all">{storeResult.key_nonce_hex.slice(0, 32)}…</div>
                 </div>
               </div>
               <button onClick={resetUpload} className="w-full bg-blue-600 hover:bg-blue-500 py-3 rounded-xl font-semibold transition">Store Another File</button>
@@ -465,21 +522,26 @@ const StoragePage: React.FC = () => {
         </div>
       </div>
 
-      {/* ── Stored files list ───────────────────────────────────────────── */}
+      {}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-700">
-          <h3 className="font-semibold">Stored Files ({files.filter(f => f.status === 'Active' || f.status === 'Received').length})</h3>
+          <h3 className="font-semibold">Your Files on the Network ({files.filter(f => f.status === 'Active').length})</h3>
           <button onClick={loadData} className="text-xs text-gray-400 hover:text-white transition">↻ Refresh</button>
         </div>
-        {files.length === 0 ? (
-          <div className="py-12 text-center text-gray-500">
-            <div className="text-4xl mb-3">📂</div>
-            <div className="text-sm">No files stored yet</div>
-            <div className="text-xs mt-1 text-gray-600">Pick a file above to get started</div>
-          </div>
-        ) : (
-          <div className="divide-y divide-gray-700/50">
-            {files.map(file => (
+        {(() => {
+          const activeFiles = files.filter(f => f.status === 'Active');
+          if (activeFiles.length === 0) return (
+            <div className="py-12 text-center text-gray-500">
+              <div className="text-4xl mb-3">📂</div>
+              <div className="text-sm">No files stored yet</div>
+              <div className="text-xs mt-1 text-gray-600">Pick a file above to get started</div>
+            </div>
+          );
+          const pageFiles = activeFiles.slice((filePage - 1) * filePageSize, filePage * filePageSize);
+          return (
+            <>
+              <div className="divide-y divide-gray-700/50">
+                {pageFiles.map(file => (
               <div key={file.cid} className="px-5 py-4">
                 <div className="flex items-start justify-between gap-4">
                   <div className="min-w-0 flex-1">
@@ -492,15 +554,15 @@ const StoragePage: React.FC = () => {
                       }`}>{file.status}</span>
                       {postBadge(file)}
                     </div>
-                    {/* Network ID = CID (node sees only this, not the name) */}
+                    {}
                     <div className="text-xs text-gray-600 mb-1">
                       🔒 Network ID: <span className="font-mono text-gray-500">{file.cid.slice(0, 20)}…</span>
                     </div>
                     <div className="flex gap-4 text-xs text-gray-500 flex-wrap">
                       {file.original_size > 0 && <span>{fmtBytes(file.original_size)}</span>}
                       <span>🔐 AES-256-GCM</span>
-                      <span>{file.duration_months}mo</span>
-                      <span className={file.status !== 'Active' && file.status !== 'Received' ? 'text-red-400' : ''}>{fmtExpiry(file.expiry)}</span>
+                      <span>{file.duration_months === 0 ? '♾ Permanent' : `${file.duration_months}mo`}</span>
+                      <span className={file.status !== 'Active' && file.status !== 'Received' ? 'text-red-400' : ''}>{file.expiry > 1e14 ? 'Never expires' : fmtExpiry(file.expiry)}</span>
                     </div>
                   </div>
                   <div className="flex gap-2 shrink-0">
@@ -509,72 +571,132 @@ const StoragePage: React.FC = () => {
                   </div>
                 </div>
               </div>
-            ))}
-          </div>
-        )}
+                ))}
+              </div>
+              <Pagination total={activeFiles.length} page={filePage} pageSize={filePageSize} onPage={setFilePage} onPageSize={ps => { setFilePageSize(ps); setFilePage(1); }} />
+            </>
+          );
+        })()}
       </div>
 
-      {/* ── Storage Provision Config Modal ──────────────────────────────── */}
+      {}
       {showProvConfig && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm" onClick={e => { if (e.target === e.currentTarget) setShowProvConfig(false); }}>
           <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-md border border-gray-700 shadow-2xl">
             <div className="flex justify-between items-center mb-5">
               <h3 className="text-lg font-bold">Configure Storage Provision</h3>
               <button onClick={() => setShowProvConfig(false)} className="text-gray-400 hover:text-white text-xl">✕</button>
             </div>
-            <div className="space-y-5">
-              <div className="text-sm text-gray-400">
-                Choose how much disk space to share with the Ego Network. You can change this anytime.
-              </div>
-              <div>
-                <div className="flex justify-between text-sm mb-2">
-                  <span className="text-gray-400">Allocation</span>
-                  <span className="font-bold text-blue-400">{allocGb} GB</span>
+            {(() => {
+              const RESERVE_GB = 5;
+              const selectedDriveInfo = availDrives.find(d => d.letter === selectedDrive);
+              const diskFreeGb  = selectedDriveInfo?.free_gb ?? (metrics?.disk_free_bytes ?? 0) / 1e9;
+              const maxUsableGb = Math.max(1, Math.floor(diskFreeGb - RESERVE_GB));
+              const overLimit    = allocGb > maxUsableGb;
+              return (
+                <div className="space-y-5">
+                  <div className="text-sm text-gray-400">
+                    Choose which local drive and how much space to share with the Ego Network.
+                    Only your local drive (C:, D:, etc.) is used — not cloud or network storage.
+                  </div>
+
+                  {/* Drive selector */}
+                  <div>
+                    <label className="text-xs text-gray-400 block mb-2">Storage Drive</label>
+                    <div className="grid grid-cols-3 gap-2">
+                      {availDrives.map(d => (
+                        <button
+                          key={d.letter}
+                          onClick={() => setSelectedDrive(d.letter)}
+                          className={`rounded-xl py-3 px-2 text-sm font-medium border transition ${
+                            selectedDrive === d.letter
+                              ? 'bg-blue-600 border-blue-500 text-white'
+                              : 'bg-gray-900 border-gray-700 text-gray-300 hover:border-gray-500'
+                          }`}
+                        >
+                          <div className="text-base font-bold">{d.letter}:</div>
+                          <div className="text-xs mt-0.5 opacity-70">{d.free_gb.toFixed(0)} GB free</div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Disk space info for selected drive */}
+                  <div className="bg-gray-900 rounded-xl p-3 flex justify-between text-sm">
+                    <span className="text-gray-400">Free on {selectedDrive || '?'}:</span>
+                    <span className={`font-semibold ${diskFreeGb < 10 ? 'text-red-400' : 'text-green-400'}`}>
+                      {diskFreeGb.toFixed(1)} GB
+                    </span>
+                  </div>
+                  <div className="bg-gray-900 rounded-xl p-3 flex justify-between text-sm -mt-3">
+                    <span className="text-gray-400">Max allocatable <span className="text-gray-600">(5 GB reserved)</span></span>
+                    <span className="font-semibold text-blue-400">{maxUsableGb} GB</span>
+                  </div>
+
+                  <div>
+                    <div className="flex justify-between text-sm mb-2">
+                      <span className="text-gray-400">Allocation</span>
+                      <span className={`font-bold ${overLimit ? 'text-red-400' : 'text-blue-400'}`}>{allocGb} GB</span>
+                    </div>
+                    <input
+                      type="range" min="1" max={maxUsableGb} step="1"
+                      value={Math.min(allocGb, maxUsableGb)}
+                      onChange={e => setAllocGb(+e.target.value)}
+                      className="w-full accent-blue-500"
+                    />
+                    <div className="flex justify-between text-xs text-gray-500 mt-1">
+                      <span>1 GB</span><span>{maxUsableGb} GB (max)</span>
+                    </div>
+                  </div>
+
+                  {overLimit && (
+                    <div className="text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">
+                      ⛔ Not enough disk space. Maximum you can allocate is {maxUsableGb} GB.
+                    </div>
+                  )}
+
+                  <div className="bg-gray-900 rounded-xl p-4 space-y-2 text-sm">
+                    <div className="flex justify-between"><span className="text-gray-400">Allocation</span><span>{allocGb} GB</span></div>
+                    <div className="flex justify-between"><span className="text-gray-400">Storage reward target</span><span className="text-green-400 font-bold">~${(allocGb * 0.002).toFixed(3)}/day in EGOC</span></div>
+                  </div>
+
+                  <div className="text-xs text-yellow-600/80 bg-yellow-500/10 rounded-lg px-3 py-2">
+                    ⚠️ Actual rewards are paid only when your space is used by other peers. Rate adjusts with EGOC price.
+                  </div>
+                  <div className="text-xs text-gray-500">
+                    Files are encrypted by the uploader — you cannot read their contents.
+                    Data is stored in your local app data directory.
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <button onClick={() => setShowProvConfig(false)} className="bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition">Cancel</button>
+                    <button onClick={handleConfigureStorage} disabled={configuring || overLimit} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition">
+                      {configuring ? 'Saving…' : `Allocate ${allocGb} GB`}
+                    </button>
+                  </div>
                 </div>
-                <input type="range" min="1" max="1000" step="1" value={allocGb} onChange={e => setAllocGb(+e.target.value)} className="w-full accent-blue-500" />
-                <div className="flex justify-between text-xs text-gray-500 mt-1"><span>1 GB</span><span>1000 GB</span></div>
-              </div>
-              <div className="bg-gray-900 rounded-xl p-4 space-y-2 text-sm">
-                <div className="flex justify-between"><span className="text-gray-400">Allocation</span><span>{allocGb} GB</span></div>
-                <div className="flex justify-between"><span className="text-gray-400">Max daily rate</span><span className="text-green-400 font-bold">{(allocGb * 0.5).toFixed(2)} EGOC/day</span></div>
-                <div className="flex justify-between"><span className="text-gray-400">Max monthly rate</span><span className="text-green-400">{(allocGb * 0.5 * 30).toFixed(0)} EGOC/month</span></div>
-                <div className="flex justify-between"><span className="text-gray-400">Max annual rate</span><span className="text-green-400">{(allocGb * 0.5 * 365).toFixed(0)} EGOC/year</span></div>
-              </div>
-              <div className="text-xs text-yellow-600/80 bg-yellow-500/10 rounded-lg px-3 py-2">
-                ⚠️ These are maximum potential rates. Actual rewards are paid only when your allocated space is used by the network.
-              </div>
-              <div className="text-xs text-gray-500">
-                Files stored are encrypted by the uploader. You cannot read their contents.
-                All data persists in your local app data directory.
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                <button onClick={() => setShowProvConfig(false)} className="bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition">Cancel</button>
-                <button onClick={handleConfigureStorage} disabled={configuring} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition">
-                  {configuring ? 'Saving…' : `Allocate ${allocGb} GB`}
-                </button>
-              </div>
-            </div>
+              );
+            })()}
           </div>
         </div>
       )}
 
-      {/* ── File Detail / Preview Modal ─────────────────────────────────── */}
+      {}
       {selectedFile && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm" onClick={e => { if (e.target === e.currentTarget) { setSelectedFile(null); setPreview(null); } }}>
           <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-lg border border-gray-700 shadow-2xl max-h-[90vh] overflow-y-auto">
             <div className="flex justify-between items-center mb-5">
               <h3 className="text-lg font-bold">File Details</h3>
               <button onClick={() => { setSelectedFile(null); setPreview(null); }} className="text-gray-400 hover:text-white text-xl">✕</button>
             </div>
 
-            {/* Real name (only you can see this) */}
+            {}
             <div className="bg-gray-900 rounded-xl p-3 mb-4">
               <div className="text-xs text-gray-400 mb-0.5">Your file name (private, only stored locally)</div>
               <div className="font-medium">{selectedFile.name}</div>
               <div className="text-xs text-gray-600 mt-1">🔒 Nodes only see the CID below, not this name</div>
             </div>
 
-            {/* Preview area */}
+            {}
             {previewLoading && (
               <div className="bg-gray-900 rounded-xl p-8 text-center mb-4">
                 <div className="text-2xl animate-spin mb-2">⏳</div>
@@ -601,11 +723,10 @@ const StoragePage: React.FC = () => {
               <div className="bg-gray-900 rounded-xl p-4 text-center mb-4 text-sm text-gray-400">
                 <div className="text-3xl mb-2">📁</div>
                 Preview not available for this file type.
-                {selectedFile.status === 'Received' && ' (Remote file — not yet downloaded)'}
               </div>
             )}
 
-            {/* Metadata */}
+            {}
             <div className="grid grid-cols-2 gap-3 text-sm mb-4">
               {[
                 { label: 'Original Size',  val: selectedFile.original_size > 0 ? fmtBytes(selectedFile.original_size) : '—' },
@@ -624,7 +745,7 @@ const StoragePage: React.FC = () => {
               ))}
             </div>
 
-            {/* PoRep / PoST proof status */}
+            {}
             {selectedFile.comm_d && (
               <div className="mb-4 bg-gray-900 rounded-xl p-4 space-y-2">
                 <div className="text-xs font-semibold text-gray-300 mb-2">Proof of Replication / Space-Time</div>

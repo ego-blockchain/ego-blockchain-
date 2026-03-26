@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
+import { listen } from '@tauri-apps/api/event';
+import Pagination from '../components/Pagination';
 
 interface Location {
   latitude: number;
@@ -31,14 +33,11 @@ interface PeerInfo {
   country?: string;
 }
 
-// Extract the libp2p peer ID from a multiaddr endpoint string.
-// e.g. ".../p2p/12D3KooWAbc..." → "12D3KooWAbc..."
 function extractPeerId(endpoint: string): string {
   const m = endpoint.match(/\/p2p\/([A-Za-z0-9]+)$/);
   return m ? m[1] : endpoint;
 }
 
-// Short display: first 8 + last 6 chars of peer ID
 function shortPeerId(id: string): string {
   if (id.length <= 16) return id;
   return id.slice(0, 8) + '…' + id.slice(-6);
@@ -73,7 +72,6 @@ function fmtCoord(lat: number, lon: number): string {
   return `${Math.abs(lat).toFixed(4)}°${latDir}, ${Math.abs(lon).toFixed(4)}°${lonDir}`;
 }
 
-// Derive a deterministic pseudo-H3 cell id from coordinates
 function deriveH3Cell(lat: number, lon: number): string {
   const a = Math.abs(Math.round(lat * 1000));
   const b = Math.abs(Math.round(lon * 1000));
@@ -118,38 +116,52 @@ const CoveragePage: React.FC = () => {
   const [drs,        setDrs]        = useState<CombinedDrs | null>(null);
   const [loading,    setLoading]    = useState(true);
 
+  const [peerPage, setPeerPage]       = useState(1);
+  const [peerPageSize, setPeerPageSize] = useState(25);
+
+  function refreshCoverage() {
+    invoke<CoverageStatus>('get_coverage_status').then(setCoverage).catch(() => {});
+    invoke<PocEvent[]>('get_poc_events').then(setEvents).catch(() => {});
+  }
+
   useEffect(() => {
     invoke<CoverageStatus>('get_coverage_status')
       .then(setCoverage)
       .catch(() => {})
       .finally(() => setLoading(false));
-    invoke<PocEvent[]>('get_poc_events')
-      .then(setEvents)
-      .catch(() => {});
-    invoke<PeerInfo[]>('get_network_peers')
-      .then(setPeers)
-      .catch(() => {});
-    invoke<P2pStatus>('get_p2p_status')
-      .then(setP2pStatus)
-      .catch(() => {});
-    invoke<CombinedDrs>('get_combined_drs')
-      .then(setDrs)
-      .catch(() => {});
-    // Refresh peers + DRS every 60 s
-    const t = setInterval(() => {
+    invoke<PocEvent[]>('get_poc_events').then(setEvents).catch(() => {});
+    invoke<PeerInfo[]>('get_network_peers').then(setPeers).catch(() => {});
+    invoke<P2pStatus>('get_p2p_status').then(setP2pStatus).catch(() => {});
+    invoke<CombinedDrs>('get_combined_drs').then(setDrs).catch(() => {});
+
+    // Re-fetch coverage + events on every background tick (60 s).
+    const unlistenCoverage = listen('ego://coverage-updated', refreshCoverage);
+
+    // Re-fetch immediately when VPN status changes (user enabled/changed/disabled VPN).
+    const unlistenVpn = listen('ego://vpn-status-changed', refreshCoverage);
+
+    const tPeers = setInterval(() => {
       invoke<PeerInfo[]>('get_network_peers').then(setPeers).catch(() => {});
+    }, 10_000);
+
+    const tDrs = setInterval(() => {
       invoke<CombinedDrs>('get_combined_drs').then(setDrs).catch(() => {});
     }, 60_000);
-    return () => clearInterval(t);
+
+    return () => {
+      clearInterval(tPeers);
+      clearInterval(tDrs);
+      unlistenCoverage.then(fn => fn());
+      unlistenVpn.then(fn => fn());
+    };
   }, []);
 
-  // Auto-scroll event log to bottom whenever new events arrive
   useEffect(() => {
-    if (eventLogRef.current) {
-      eventLogRef.current.scrollTop = eventLogRef.current.scrollHeight;
+    const el = eventLogRef.current;
+    if (el) {
+      setTimeout(() => { el.scrollTop = el.scrollHeight; }, 0);
     }
   }, [events]);
-
 
   const quality    = coverage?.network_quality ?? 'Excellent';
   const synced     = coverage?.coverage_synced_count ?? 0;
@@ -162,13 +174,13 @@ const CoveragePage: React.FC = () => {
   const coordStr   = loc ? fmtCoord(loc.latitude, loc.longitude) : null;
   const cityStr    = loc ? locationLabel(loc) : null;
 
-  // My own peer ID derived from my relay circuit endpoint
   const myPeerId = p2pStatus?.public_endpoint
     ? extractPeerId(p2pStatus.public_endpoint)
     : '';
 
-  // Only show peers that have shared their location
-  const visiblePeers = peers.filter(p => p.city || p.country);
+  const visiblePeers = peers.filter(p =>
+    (p.city || p.country) && extractPeerId(p.endpoint) !== myPeerId
+  );
 
   const nowTs      = Math.floor(Date.now() / 1000);
   const todayStart = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
@@ -183,7 +195,7 @@ const CoveragePage: React.FC = () => {
   return (
     <div className="p-6 space-y-5 max-w-4xl mx-auto">
 
-      {/* VPN / proxy warning — shown above everything else */}
+      {}
       {vpn && (
         <div className="rounded-2xl p-4 border border-red-500/50 bg-red-500/10 flex items-start gap-3">
           <div className="text-2xl shrink-0">🚫</div>
@@ -200,13 +212,13 @@ const CoveragePage: React.FC = () => {
               </div>
             )}
             <div className="mt-2 text-xs text-red-300/60">
-              Disable your VPN and restart the app to resume earning coverage rewards.
+              Disable your VPN to resume earning. Your connection is re-checked every 5 minutes automatically.
             </div>
           </div>
         </div>
       )}
 
-      {/* Status banner */}
+      {}
       <div className={`rounded-2xl p-5 border flex items-center justify-between ${
         online ? 'bg-green-500/10 border-green-500/30' : 'bg-red-500/10 border-red-500/30'
       }`}>
@@ -232,12 +244,12 @@ const CoveragePage: React.FC = () => {
         </div>
       </div>
 
-      {/* Stats */}
+      {}
       <div className="grid grid-cols-4 gap-3">
         {[
           { label: 'Today PoC Rewards', val: todayRewardsStr,                                       color: 'text-green-400'  },
           { label: 'Events (24h)',       val: `${events24h.length}`,                                 color: 'text-blue-400'   },
-          { label: 'Active Nodes',       val: `${peers.length}`,                                     color: 'text-purple-400' },
+          { label: 'Active Nodes',       val: `${visiblePeers.length + (myPeerId ? 1 : 0)}`,         color: 'text-purple-400' },
           { label: 'H3 Cell',            val: h3Cell ? h3Cell.slice(0, 8) + '…' : '—',              color: 'text-orange-400' },
         ].map(c => (
           <div key={c.label} className="bg-gray-800 rounded-2xl p-4 border border-gray-700">
@@ -247,7 +259,7 @@ const CoveragePage: React.FC = () => {
         ))}
       </div>
 
-      {/* DRS Breakdown */}
+      {}
       <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
         <div className="flex items-center justify-between mb-4">
           <h3 className="font-semibold">Deterministic Reward Scoring</h3>
@@ -270,7 +282,7 @@ const CoveragePage: React.FC = () => {
         </div>
 
         <div className="grid grid-cols-4 gap-4">
-          {/* Big score */}
+          {}
           <div className="col-span-1 flex flex-col justify-center">
             <div className={`text-5xl font-black tabular-nums ${drsColor(drs?.combined_score ?? 0)}`}>
               {(drs?.combined_score ?? 0).toFixed(2)}
@@ -285,9 +297,9 @@ const CoveragePage: React.FC = () => {
             <div className="text-xs text-gray-600 mt-1">0 — 5+ scale</div>
           </div>
 
-          {/* Three signal columns */}
+          {}
           <div className="col-span-3 grid grid-cols-3 gap-3">
-            {/* PoC */}
+            {}
             <div className="bg-gray-900 rounded-xl p-4 border border-gray-700/50">
               <div className="text-xs text-gray-400 mb-2 flex items-center gap-1.5">
                 <span className="w-2 h-2 rounded-full bg-blue-500 inline-block"/>
@@ -299,7 +311,7 @@ const CoveragePage: React.FC = () => {
                 {drs?.poc_total ?? 0} total events
               </div>
             </div>
-            {/* PoST */}
+            {}
             <div className="bg-gray-900 rounded-xl p-4 border border-gray-700/50">
               <div className="text-xs text-gray-400 mb-2 flex items-center gap-1.5">
                 <span className="w-2 h-2 rounded-full bg-purple-500 inline-block"/>
@@ -314,7 +326,7 @@ const CoveragePage: React.FC = () => {
                 )}
               </div>
             </div>
-            {/* Stake */}
+            {}
             <div className="bg-gray-900 rounded-xl p-4 border border-gray-700/50">
               <div className="text-xs text-gray-400 mb-2 flex items-center gap-1.5">
                 <span className="w-2 h-2 rounded-full bg-orange-500 inline-block"/>
@@ -349,7 +361,7 @@ const CoveragePage: React.FC = () => {
         )}
       </div>
 
-      {/* Live network peers */}
+      {}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="px-5 py-4 border-b border-gray-700 flex items-center justify-between">
           <h3 className="font-semibold">Live Network Nodes</h3>
@@ -358,52 +370,42 @@ const CoveragePage: React.FC = () => {
           </span>
         </div>
         <div className="divide-y divide-gray-700/50">
-          {/* Own node — always shown at the top */}
           {myPeerId && (
             <div className="flex items-center gap-4 px-5 py-3">
               <div className="w-2 h-2 rounded-full bg-blue-400 shrink-0" />
-              <div className="font-mono text-sm text-gray-200">
-                {shortPeerId(myPeerId)}
-              </div>
-              <span className="text-xs bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded-full font-medium">
-                me
-              </span>
-              <div className="text-xs text-gray-400 ml-auto">
-                {cityStr ?? '—'}
-              </div>
+              <div className="font-mono text-sm text-gray-200">{shortPeerId(myPeerId)}</div>
+              <span className="text-xs bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded-full font-medium">me</span>
+              <div className="text-xs text-gray-400 ml-auto">{cityStr ?? '—'}</div>
             </div>
           )}
-          {/* Other nodes — only shown if they shared location data */}
           {visiblePeers.length === 0 && !myPeerId ? (
             <div className="px-5 py-6 text-center text-gray-500 text-sm">
-              No other nodes detected.
-              Nodes appear here after they send a heartbeat.
+              No other nodes detected. Nodes appear here after they send a heartbeat.
             </div>
-          ) : visiblePeers.map(p => {
+          ) : visiblePeers.slice((peerPage - 1) * peerPageSize, peerPage * peerPageSize).map(p => {
             const peerId   = extractPeerId(p.endpoint);
             const location = [p.city, p.country].filter(Boolean).join(', ') || p.name || '—';
             return (
               <div key={p.address} className="flex items-center gap-4 px-5 py-3">
                 <div className="w-2 h-2 rounded-full bg-green-400 shrink-0" />
-                <div className="font-mono text-sm text-gray-200">
-                  {shortPeerId(peerId)}
-                </div>
-                <div className="text-xs text-gray-400 ml-auto">
-                  {location}
-                </div>
+                <div className="font-mono text-sm text-gray-200">{shortPeerId(peerId)}</div>
+                <div className="text-xs text-gray-400 ml-auto">{location}</div>
               </div>
             );
           })}
         </div>
+        {visiblePeers.length > 0 && (
+          <Pagination total={visiblePeers.length} page={peerPage} pageSize={peerPageSize} onPage={setPeerPage} onPageSize={ps => { setPeerPageSize(ps); setPeerPage(1); }} />
+        )}
       </div>
 
       <div className="grid grid-cols-5 gap-4">
-        {/* PoC event log */}
-        <div className="col-span-3 bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
+        {}
+        <div className="col-span-3 bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden self-start">
           <div className="px-5 py-4 border-b border-gray-700">
             <h3 className="font-semibold">PoC Event Log</h3>
           </div>
-          <div ref={eventLogRef} className="divide-y divide-gray-700/50 max-h-96 overflow-y-auto">
+          <div ref={eventLogRef} className="divide-y divide-gray-700/50 max-h-[570px] overflow-y-auto">
             {events.length === 0 ? (
               <div className="px-5 py-8 text-center text-gray-500 text-sm">
                 {online ? 'First event will appear in ~4 minutes…' : 'No events — coverage is offline'}
@@ -435,7 +437,7 @@ const CoveragePage: React.FC = () => {
           </div>
         </div>
 
-        {/* Right column */}
+        {}
         <div className="col-span-2 space-y-4">
           <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
             <h3 className="font-semibold mb-4">Location</h3>

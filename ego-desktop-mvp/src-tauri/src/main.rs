@@ -1,4 +1,3 @@
-// Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
@@ -6,19 +5,14 @@ mod blocks;
 mod chain_db;
 mod commands;
 mod config;
-mod crypto;
-mod database;
 mod email;
 mod error;
 mod ledger;
 mod mempool;
-mod models;
 mod p2p;
 mod poc;
 mod proof;
-mod relay_inbox;
 mod rpc;
-mod services;
 mod sharding;
 mod tokenomics;
 mod utils;
@@ -26,19 +20,92 @@ mod utils;
 use tauri::{Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem};
 use tauri::{CustomMenuItem, Menu, MenuItem, Submenu};
 
-fn acquire_single_instance_lock() -> Option<std::net::TcpListener> {
+#[cfg(target_os = "windows")]
+fn register_windows_notifications() {
+    use std::os::windows::process::CommandExt;
+    let aumid = "com.ego.desktop";
+    let key = format!(r"HKCU\SOFTWARE\Classes\AppUserModelId\{}", aumid);
+
+    // WinRT toast notifications require a PNG for IconUri — .ico silently fails to render.
+    // Try next to the exe first (production), fall back to src-tauri/icons/ (dev build).
+    let icon_path = std::env::current_exe().ok()
+        .and_then(|p| p.parent().map(|d| d.join("icons").join("icon.png")))
+        .filter(|p| p.exists())
+        .or_else(|| {
+            let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("icons")
+                .join("icon.png");
+            if dev.exists() { Some(dev) } else { None }
+        })
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    // Register the AUMID so Windows trusts this process for toast notifications.
+    // Must happen before Tauri's notification subsystem initialises.
+    let _ = std::process::Command::new("reg")
+        .args(["add", &key, "/v", "DisplayName", "/t", "REG_EXPAND_SZ", "/d", "Ego Desktop", "/f"])
+        .creation_flags(0x08000000)
+        .output();
+
+    if !icon_path.is_empty() {
+        let _ = std::process::Command::new("reg")
+            .args(["add", &key, "/v", "IconUri", "/t", "REG_EXPAND_SZ", "/d", &icon_path, "/f"])
+            .creation_flags(0x08000000)
+            .output();
+    }
+
+    // Create a Start Menu shortcut the first time the app runs on this machine.
+    // Windows 10/11 requires either an installed shortcut or the registry key above;
+    // having both guarantees notifications work without admin rights on any machine.
+    let exe_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let lnk = format!(r"{}\Microsoft\Windows\Start Menu\Programs\Ego Desktop.lnk", appdata);
+        if !exe_path.is_empty() && !std::path::Path::new(&lnk).exists() {
+            let script = format!(
+                "$ws=New-Object -ComObject WScript.Shell;\
+                 $s=$ws.CreateShortcut('{lnk}');\
+                 $s.TargetPath='{exe}';\
+                 $s.Description='Ego Desktop';\
+                 $s.Save()",
+                lnk = lnk.replace('\'', "''"),
+                exe = exe_path.replace('\'', "''"),
+            );
+            let _ = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
+                .creation_flags(0x08000000)
+                .output();
+        }
+    }
+}
+
+static INSTANCE_LOCK: once_cell::sync::OnceCell<std::net::TcpListener> =
+    once_cell::sync::OnceCell::new();
+
+fn acquire_single_instance_lock() -> bool {
     let port: u16 = std::env::var("EGO_LOCK_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(47391);
     match std::net::TcpListener::bind(format!("127.0.0.1:{}", port)) {
-        Ok(l) => Some(l),
+        Ok(l) => {
+            let _ = INSTANCE_LOCK.set(l);
+            true
+        }
         Err(_) => {
-            eprintln!("[Ego Desktop] Another instance may already be running on port {}.", port);
-            None
+            // Another instance is running — poke it to show its window, then exit.
+            let _ = std::net::TcpStream::connect(format!("127.0.0.1:{}", port));
+            false
         }
     }
 }
 
 fn main() {
-    let _instance_lock = acquire_single_instance_lock();
+    #[cfg(target_os = "windows")]
+    register_windows_notifications();
+
+    if !acquire_single_instance_lock() {
+        std::process::exit(0);
+    }
 
     let quit = CustomMenuItem::new("quit".to_string(), "Quit");
     let hide = CustomMenuItem::new("hide".to_string(), "Hide");
@@ -87,10 +154,7 @@ fn main() {
         .manage(app::AppState::new())
         .system_tray(tray)
         .menu(menu)
-        // Intercept window close (Alt+F4, red button fallback) — hide to tray
-        // instead of destroying the window.  Destroying the window stops P2P/
-        // coverage background tasks; hiding keeps them alive.
-        // The only way to actually quit is via the tray "Quit" menu item.
+
         .on_window_event(|event| {
             match event.event() {
                 tauri::WindowEvent::CloseRequested { api, .. } => {
@@ -99,11 +163,16 @@ fn main() {
                 }
                 tauri::WindowEvent::Focused(true) => {
                     use tauri::Manager;
-                    let app_handle = event.window().app_handle();
+                    let win = event.window();
+                    let app_handle = win.app_handle();
                     let state = app_handle.state::<app::AppState>();
                     let maybe_addr = state.pending_chat_address.lock().unwrap().take();
                     if let Some(addr) = maybe_addr {
-                        let _ = event.window().emit("ego://open-chat", serde_json::json!({ "address": addr }));
+                        // Ensure window is visible (may have been hidden to tray)
+                        if !win.is_visible().unwrap_or(true) {
+                            let _ = win.show();
+                        }
+                        let _ = win.emit("ego://open-chat", serde_json::json!({ "address": addr }));
                     }
                 }
                 _ => {}
@@ -149,18 +218,22 @@ fn main() {
             commands::wallet::request_tx_code,
             commands::wallet::confirm_tx_code,
             commands::wallet::get_transaction_history,
+            commands::wallet::get_tx_fee,
             commands::storage::store_file,
             commands::storage::get_file_metadata,
             commands::storage::get_stored_files,
             commands::storage::get_storage_metrics,
             commands::storage::configure_storage,
+            commands::storage::get_available_drives,
+            commands::storage::reset_storage,
+            commands::storage::create_public_share,
+            commands::storage::create_secure_share,
+            commands::storage::import_secure_share,
             commands::storage::delete_stored_file,
             commands::storage::retrieve_file_preview,
             commands::storage::save_file_to_disk,
             commands::storage::download_stored_file,
             commands::storage::request_file_from_contact,
-            commands::files::encrypt_file,
-            commands::files::decrypt_file,
             commands::coverage::get_coverage_status,
             commands::coverage::get_poc_events,
             commands::coverage::get_network_peers,
@@ -181,6 +254,7 @@ fn main() {
             commands::explorer::get_file_events,
             commands::notifications::import_shared_file,
             commands::messenger::get_my_contact_bundle,
+            commands::messenger::revoke_contact_bundle,
             commands::messenger::import_contact,
             commands::messenger::approve_contact_request,
             commands::messenger::decline_contact_request,
@@ -209,6 +283,16 @@ fn main() {
             commands::rollup::get_shard_map_status,
             commands::wallet::query_remote_node,
             commands::wallet::fetch_swap_rates,
+            commands::wallet::changenow_estimate,
+            commands::wallet::changenow_create_exchange,
+            commands::wallet::changenow_get_status,
+            commands::wallet::presale_create_iou,
+            commands::wallet::presale_verify_iou,
+            commands::wallet::presale_list_iou,
+            commands::wallet::presale_info,
+            commands::wallet::presale_stripe_checkout,
+            commands::wallet::presale_stripe_verify,
+            commands::wallet::presale_stripe_create_iou,
             commands::multichain::get_external_addresses,
             commands::multichain::fetch_chain_balance,
             commands::multichain::fetch_chain_transactions,
@@ -216,40 +300,94 @@ fn main() {
             commands::multichain::add_custom_token,
             commands::multichain::get_custom_tokens,
             commands::multichain::remove_custom_token,
+            commands::multichain::send_external_tx,
+            commands::multichain::estimate_external_fee,
+            commands::multichain::fetch_coin_chart,
+            commands::multichain::fetch_single_price,
+            commands::multichain::fetch_coin_candles,
+            commands::multichain::request_ext_tx_code,
+            commands::multichain::confirm_ext_tx,
             commands::ai::ask_ego_ai,
             commands::ai::save_ai_key,
             commands::ai::get_ai_key_status,
             commands::auth::send_verification_email,
             commands::auth::verify_email_code,
             commands::auth::save_registration_info,
+            commands::auth::get_mainnet_address,
             commands::light_client::get_block_headers,
             commands::light_client::get_tx_proof,
             commands::light_client::verify_tx_proof,
-            commands::light_client::request_headers_from_peer
+            commands::light_client::request_headers_from_peer,
+            commands::governance::submit_governance_vote,
+            commands::governance::get_governance_proposals,
+            commands::governance::is_feature_active,
+            commands::governance::create_dao_proposal,
+            commands::governance::get_dao_proposals,
+            commands::governance::get_dao_proposal,
+            commands::governance::cast_stake_vote,
+            commands::governance::grade_knowledge_test,
+            commands::governance::cast_knowledge_vote,
+            commands::governance::get_proposal_results
         ])
         .setup(|app| {
-            // Show the window only after the frontend signals it's ready,
-            // preventing the white-flash / multi-render flicker on startup.
+
             let window = app.get_window("main").unwrap();
+
+            // Set window icon explicitly so the taskbar always shows the
+            // correct high-res icon regardless of embedded EXE resources.
+            let _ = window.set_icon(tauri::Icon::Raw(
+                include_bytes!("../icons/icon.png").to_vec(),
+            ));
+
+            // Ask Windows 11 DWM to apply OS-level rounded corners.
+            // DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2
+            // Safe no-op on Windows 10 (attribute is silently ignored).
+            #[cfg(target_os = "windows")]
+            if let Ok(hwnd_ptr) = window.hwnd() {
+                use winapi::shared::minwindef::DWORD;
+                use winapi::shared::windef::HWND;
+                use winapi::um::dwmapi::DwmSetWindowAttribute;
+                // hwnd_ptr.0 is isize; cast through usize to get a *mut HWND__
+                let hwnd = hwnd_ptr.0 as usize as HWND;
+                let preference: DWORD = 2; // DWMWCP_ROUND
+                unsafe {
+                    DwmSetWindowAttribute(
+                        hwnd,
+                        33, // DWMWA_WINDOW_CORNER_PREFERENCE
+                        &preference as *const DWORD as *const winapi::ctypes::c_void,
+                        std::mem::size_of::<DWORD>() as DWORD,
+                    );
+                }
+            }
+
             app.listen_global("frontend-ready", move |_| {
                 window.show().unwrap();
                 window.set_focus().unwrap();
             });
 
-            // ── PoC session start ─────────────────────────────────────────
-            // Records app start time for uptime-based coverage scoring.
+            // When another launch connects to our lock port, bring the window to front.
+            {
+                let win = app.get_window("main").unwrap();
+                std::thread::spawn(move || {
+                    if let Some(listener) = INSTANCE_LOCK.get() {
+                        loop {
+                            if listener.accept().is_ok() {
+                                let _ = win.show();
+                                let _ = win.unminimize();
+                                let _ = win.set_focus();
+                            }
+                        }
+                    }
+                });
+            }
+
             crate::poc::init_session_start();
 
-            // ── Task 1: libp2p swarm ───────────────────────────────────────
-            // Connects to relay, handles all P2P traffic.
             let handle_p2p = app.handle();
             tauri::async_runtime::spawn(async move {
                 crate::p2p::start_p2p_server(handle_p2p).await;
             });
 
-            // ── Task 2: startup announce + chain sync ──────────────────────
-            // Waits for relay circuit before announcing so peers receive our
-            // real circuit address (not the raw public IP which is firewalled).
             let handle_startup = app.handle();
             tauri::async_runtime::spawn(async move {
                 let my_endpoint = crate::p2p::wait_for_public_endpoint(60).await;
@@ -262,71 +400,89 @@ fn main() {
                     eprintln!("[Startup] ✗ No endpoint — check network");
                 }
 
-                // Fetch live EGOC/USD price before first tx so fees are USD-stable
                 crate::p2p::fetch_and_cache_egoc_price().await;
-                crate::p2p::fetch_chain_from_oracle(&handle_startup).await;
-                eprintln!("[Startup] Oracle chain sync complete");
 
-                // Push local chain to Oracle so explorer shows existing data.
-                crate::p2p::oracle_sync_chain().await;
+                // Bootstrap from oracle only while the P2P network is small
+                let startup_peers = crate::p2p::get_known_peers().len();
+                if startup_peers < 50 {
+                    crate::p2p::fetch_chain_from_oracle(&handle_startup).await;
+                    eprintln!("[Startup] Oracle chain sync complete ({} peers, oracle active)", startup_peers);
+                    crate::p2p::oracle_sync_chain().await;
+                } else {
+                    eprintln!("[Startup] {} peers — skipping oracle, using P2P only", startup_peers);
+                }
 
                 crate::p2p::broadcast_peer_announce(&handle_startup).await;
                 eprintln!("[Startup] Peer announce sent (endpoint: {})", my_endpoint);
 
-                // Publish to DHT so peers can find us without the central relay
-                // Restore cached DHT records before re-publishing so we can
-                // serve queries immediately (Gap #3 DHT persistence).
                 crate::p2p::restore_dht_cache().await;
 
                 crate::p2p::dht_publish_self(&{
                     let l = crate::ledger::Ledger::load(); l.address
                 }, &my_endpoint, "Ego Node").await;
                 crate::p2p::dht_discover_peers().await;
-                // Discover community relay nodes published by other public-IP peers
+
                 crate::p2p::dht_discover_relays().await;
 
-                // Initialize shard map
                 let peers = crate::p2p::get_known_peers();
                 let ledger_addr = { let l = crate::ledger::Ledger::load(); l.address };
                 crate::sharding::run_shard_startup(&ledger_addr, &my_endpoint, &peers, 0).await;
                 crate::p2p::broadcast_shard_announce().await;
                 eprintln!("[Startup] Shard announce sent");
 
-                // Phase 3: publish shard assignments to DHT
                 crate::p2p::dht_publish_shard_assignments(&ledger_addr, &my_endpoint).await;
 
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 crate::p2p::sync_chain_from_peers().await;
                 eprintln!("[Startup] Chain sync requested");
 
-                // Keep-alive: Oracle sync + peer announce + direct P2P sync every 30 s.
+                // PoSt check runs every 6 h — track iteration count (30s × 720 = 6h).
+                let mut loop_tick: u32 = 0;
+                const POST_EVERY_N_TICKS: u32 = 720;  // 720 × 30s = 6 h
+                // Once the network has enough independent nodes the RPC oracle
+                // is no longer needed — pure P2P gossip takes over.
+                const P2P_SELF_SUFFICIENT_PEERS: usize = 50;
+
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    crate::p2p::fetch_chain_from_oracle(&handle_startup).await;
-                    crate::p2p::oracle_sync_chain().await;
+                    loop_tick = loop_tick.wrapping_add(1);
+
+                    let peer_count = crate::p2p::get_known_peers().len();
+                    let use_oracle = peer_count < P2P_SELF_SUFFICIENT_PEERS;
+
+                    if use_oracle {
+                        crate::p2p::fetch_chain_from_oracle(&handle_startup).await;
+                        crate::p2p::oracle_sync_chain().await;
+                    }
                     crate::p2p::broadcast_peer_announce(&handle_startup).await;
                     crate::p2p::sync_chain_from_peers().await;
                     crate::p2p::dht_discover_relays().await;
-                    // Poll relay HTTP mailbox (contact-pairing events only)
+
                     let my_addr = crate::ledger::Ledger::load().address;
                     if !my_addr.is_empty() {
                         crate::commands::messenger::poll_relay_inbox(&my_addr, &handle_startup).await;
                     }
-                    // Refresh EGOC/USD price so fees stay USD-stable
+
                     crate::p2p::fetch_and_cache_egoc_price().await;
-                    // Flush local outbox — retry P2P delivery for any queued messages
+
                     crate::commands::outbox::flush_pending().await;
-                    // Gap #5: heal under-replicated files (every 5th loop = ~2.5 min)
+
                     crate::p2p::check_file_replication().await;
+
+                    // PoSt: challenge stored files every 6 h; slash rewards on failure.
+                    if loop_tick % POST_EVERY_N_TICKS == 1 {
+                        crate::proof::run_post_checks(&handle_startup).await;
+                    }
+
                     let shard_peers = crate::p2p::get_known_peers();
                     let ledger_for_shard = crate::ledger::Ledger::load();
                     let endpoint = crate::p2p::get_public_endpoint().await;
                     crate::sharding::run_shard_startup(&ledger_for_shard.address, &endpoint, &shard_peers, 0).await;
                     crate::p2p::broadcast_shard_announce().await;
                     crate::sharding::check_master_health(&ledger_for_shard.address, &endpoint, 0).await;
-                    // Phase 2: push shard data to slaves (no-op in Phase 1)
+
                     crate::p2p::push_shard_data_to_slaves().await;
-                    // Phase 3: DHT shard registry + vacancy detection + pruning
+
                     let ep3 = crate::p2p::get_public_endpoint().await;
                     crate::p2p::dht_publish_shard_assignments(&ledger_for_shard.address, &ep3).await;
                     crate::p2p::broadcast_vacancy_notices().await;
@@ -334,39 +490,23 @@ fn main() {
                 }
             });
 
-            // ── Task 3: PoST proof loop ────────────────────────────────────
-            // Polls the relay for pending PoST challenges every 30 minutes and
-            // automatically responds with Merkle proofs over stored files.
             tauri::async_runtime::spawn(async move {
                 crate::commands::consensus::run_post_loop().await;
             });
 
-            // ── Task 4: rollup batch loop ──────────────────────────────
-            // Drains the shard-partitioned mempool every 50 ms and mines
-            // one block per batch (up to 2,000 TXs × 16 shards = 32,000
-            // TXs per tick → ~100,000 TPS target).
             tauri::async_runtime::spawn(async move {
                 crate::mempool::run_batch_loop().await;
             });
 
-            // ── Task 5: background coverage loop ──────────────────────────
-            // Runs every 60 s regardless of window visibility.
-            // Handles: peer probing, PoC event recording, coverage status.
-            // Keeps working when app is minimized or in system tray.
             let handle_coverage = app.handle();
             tauri::async_runtime::spawn(async move {
                 crate::commands::coverage::run_background_coverage_loop(handle_coverage).await;
             });
 
-            // ── Task 6: JSON-RPC 2.0 + WebSocket server ───────────────────
-            // Listens on 127.0.0.1:47395 — JS SDK and dApp connections.
             tauri::async_runtime::spawn(async move {
                 crate::rpc::start_rpc_server().await;
             });
 
-            // ── Task 7: HotStuff view-change monitor ──────────────────────
-            // Fires a ViewChange gossip message when no proposal is seen
-            // within VIEW_CHANGE_TIMEOUT_SECS, advancing the consensus view.
             tauri::async_runtime::spawn(async move {
                 crate::p2p::run_view_change_monitor().await;
             });

@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn test_h3_coverage_map() {
-        let mut coverage_map = H3CoverageMap::new(8);  // Changed from 9 to 8
+        let mut coverage_map = H3CoverageMap::new(8);
         coverage_map.add_coverage("872834720ffffff".to_string(), 0.8);
 
         assert_eq!(coverage_map.covered_hexes.len(), 1);
@@ -157,22 +157,22 @@ mod tests {
 
     #[test]
     fn test_h3_validation() {
-        // "872834720ffffff" is 15 chars = resolution 8
-        assert!(validate_h3_index("872834720ffffff", Some(8)).is_ok());  // Changed from 9 to 8
+
+        assert!(validate_h3_index("872834720ffffff", Some(8)).is_ok());
         assert!(validate_h3_index("", None).is_err());
         assert!(validate_h3_index("invalid", None).is_err());
     }
 
     #[test]
     fn test_h3_resolution_estimation() {
-        // "872834720ffffff" is 15 chars = resolution 8
-        assert_eq!(estimate_h3_resolution("872834720ffffff"), 8);  // Changed from 9 to 8
+
+        assert_eq!(estimate_h3_resolution("872834720ffffff"), 8);
         assert_eq!(estimate_h3_resolution("872834"), 0);
     }
 
     #[test]
     fn test_clustering_detection() {
-        let mut coverage_map = H3CoverageMap::new(8);  // Changed from 9 to 8
+        let mut coverage_map = H3CoverageMap::new(8);
         let h3_index = "872834720ffffff";
 
         for _ in 0..5 {

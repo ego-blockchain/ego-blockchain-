@@ -16,24 +16,24 @@ pub struct BeaconAnnouncement {
     pub public_key: PublicKey,
     pub slice_context: Option<SliceContext>,
     pub time_window: TimeWindow,
-    // NEW: Whitepaper additions
+
     pub epoch: u64,
-    pub randomness_seed: Option<Hash>, // vrf_output from finalized block
+    pub randomness_seed: Option<Hash>,
     pub challenge_binding: Option<ChallengeBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct BeaconTxParams {
-    pub frequency: u32,           // MHz
+    pub frequency: u32,
     pub tx_power_dbm: i16,
     pub pci: u16,
     pub beam_config: Option<BeamConfig>,
     pub duration_ms: u32,
     pub mcs: Option<u8>,
-    // NEW: Whitepaper NR band info
-    pub nr_arfcn: Option<u32>,    // NR Absolute Radio Frequency Channel Number
-    pub nr_band: Option<u8>,      // 3GPP NR band number (e.g., n78, n77)
-    pub ssb_index: Option<u8>,    // SSB (Synchronization Signal Block) index
+
+    pub nr_arfcn: Option<u32>,
+    pub nr_band: Option<u8>,
+    pub ssb_index: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -52,15 +52,14 @@ pub enum Polarization {
     Dual,
 }
 
-/// Whitepaper: Co-beacon side-channel nonce binding
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct CoBeaconInfo {
     pub method: CoBeaconMethod,
-    pub side_channel_nonce: Vec<u8>,        // nonce16 from whitepaper
-    pub side_channel_signature: Signature,  // Signed {nonce16, time32, beacon_id}
+    pub side_channel_nonce: Vec<u8>,
+    pub side_channel_signature: Signature,
     pub metadata: Vec<u8>,
-    // NEW: Whitepaper additions
-    pub nonce_commitment: Hash,             // H(nonce16 || beacon_id || epoch)
+
+    pub nonce_commitment: Hash,
     pub broadcast_start: Timestamp,
     pub broadcast_end: Timestamp,
 }
@@ -83,13 +82,12 @@ pub enum CoBeaconMethod {
     },
 }
 
-/// Whitepaper: Challenge binding to prevent replay
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct ChallengeBinding {
-    pub region_id: String,          // H3 cell or region
+    pub region_id: String,
     pub window_start: Timestamp,
     pub window_end: Timestamp,
-    pub randomness_hash: Hash,      // H(vrf_output || region_id || epoch || slot)
+    pub randomness_hash: Hash,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
@@ -108,12 +106,11 @@ impl BeaconAnnouncement {
     ) -> Self {
         let nonce = Self::generate_nonce(&challenge);
         let timestamp = Timestamp::now();
-        let epoch = timestamp.as_secs() / 3600; // 1-hour epochs
-        
-        // Whitepaper: challenge window W=10s
+        let epoch = timestamp.as_secs() / 3600;
+
         let time_window = TimeWindow {
             start_time: timestamp,
-            end_time: Timestamp::from_millis(timestamp.as_millis() + 10_000), // 10s window
+            end_time: Timestamp::from_millis(timestamp.as_millis() + 10_000),
             duration_ms: 10_000,
         };
 
@@ -125,7 +122,7 @@ impl BeaconAnnouncement {
             tx_params,
             co_beacon: None,
             timestamp,
-            signature: Signature::ed25519([0u8; 64]), // TODO: Switch to Dilithium-2
+            signature: Signature::ed25519([0u8; 64]),
             public_key: PublicKey::ed25519([0u8; 32]),
             slice_context: None,
             time_window,
@@ -135,7 +132,6 @@ impl BeaconAnnouncement {
         }
     }
 
-    /// Whitepaper: Create beacon with challenge randomness from consensus
     pub fn new_with_randomness(
         beacon_id: Address,
         challenge: Challenge,
@@ -147,12 +143,11 @@ impl BeaconAnnouncement {
         slot: u64,
     ) -> Self {
         let timestamp = Timestamp::now();
-        
-        // Whitepaper: R_e = H(vrf_output || region_id || epoch || slot)
+
         let randomness_hash = Self::compute_challenge_randomness(&vrf_output, &region_id, epoch, slot);
-        
+
         let nonce = Self::generate_nonce_from_randomness(&challenge, &randomness_hash);
-        
+
         let time_window = TimeWindow {
             start_time: timestamp,
             end_time: Timestamp::from_millis(timestamp.as_millis() + 10_000),
@@ -219,8 +214,7 @@ impl BeaconAnnouncement {
 
     pub fn validate(&self) -> PoCResult<()> {
         let now = Timestamp::now();
-        
-        // Whitepaper: Strict timing bounds
+
         if self.timestamp.as_millis() > now.as_millis() + 60_000 {
             return Err(PoCError::TimeWindowViolation(
                 "Announcement timestamp too far in future".to_string(),
@@ -233,7 +227,6 @@ impl BeaconAnnouncement {
             ));
         }
 
-        // Whitepaper: Reject if outside challenge window
         if now < self.time_window.start_time {
             return Err(PoCError::TimeWindowViolation(
                 "Transmission window has not started yet".to_string(),
@@ -249,8 +242,7 @@ impl BeaconAnnouncement {
         self.validate_location()?;
         self.validate_rf_params()?;
         self.validate_nonce()?;
-        
-        // NEW: Whitepaper validations
+
         self.validate_challenge_binding()?;
         self.validate_co_beacon()?;
 
@@ -284,7 +276,6 @@ impl BeaconAnnouncement {
             }
         }
 
-        // Whitepaper: Location must match challenge region
         if let Some(ref binding) = self.challenge_binding {
             if !self.location.h3_index.starts_with(&binding.region_id) {
                 return Err(PoCError::ValidationFailed(
@@ -297,7 +288,7 @@ impl BeaconAnnouncement {
     }
 
     fn validate_rf_params(&self) -> PoCResult<()> {
-        // Whitepaper: Typical small cell Tx power ~23 dBm
+
         if self.tx_params.tx_power_dbm < -50 || self.tx_params.tx_power_dbm > 50 {
             return Err(PoCError::InvalidRFMetrics(format!(
                 "Invalid TX power: {} dBm",
@@ -311,7 +302,6 @@ impl BeaconAnnouncement {
             ));
         }
 
-        // Whitepaper: Challenge window W=10s, announcement 1-2s before start
         if self.tx_params.duration_ms == 0 || self.tx_params.duration_ms > 10_000 {
             return Err(PoCError::InvalidRFMetrics(format!(
                 "Invalid duration: {} ms (max 10s)",
@@ -319,7 +309,6 @@ impl BeaconAnnouncement {
             )));
         }
 
-        // Validate NR band if provided
         if let Some(nr_band) = self.tx_params.nr_band {
             if nr_band == 0 || nr_band > 255 {
                 return Err(PoCError::InvalidRFMetrics(format!(
@@ -337,7 +326,6 @@ impl BeaconAnnouncement {
             return Err(PoCError::InvalidBeacon("Empty nonce".to_string()));
         }
 
-        // Whitepaper: nonce16 = 16 bytes
         if self.nonce.len() != 16 {
             return Err(PoCError::InvalidBeacon(format!(
                 "Invalid nonce length: {} (expected 16)",
@@ -345,7 +333,6 @@ impl BeaconAnnouncement {
             )));
         }
 
-        // Verify nonce matches challenge
         let expected_nonce = if let Some(ref seed) = self.randomness_seed {
             if let Some(ref binding) = self.challenge_binding {
                 Self::generate_nonce_from_randomness(&self.challenge, &binding.randomness_hash)
@@ -365,27 +352,24 @@ impl BeaconAnnouncement {
         Ok(())
     }
 
-    // NEW: Whitepaper challenge binding validation
     fn validate_challenge_binding(&self) -> PoCResult<()> {
         if let Some(ref binding) = self.challenge_binding {
             let now = Timestamp::now();
-            
-            // Check time window
+
             if now < binding.window_start || now > binding.window_end {
                 return Err(PoCError::TimeWindowViolation(
                     "Outside challenge binding window".to_string(),
                 ));
             }
 
-            // Verify randomness hash if vrf_output available
             if let Some(ref vrf_output) = self.randomness_seed {
                 let expected_hash = Self::compute_challenge_randomness(
                     vrf_output,
                     &binding.region_id,
                     self.epoch,
-                    0, // slot (would come from challenge)
+                    0,
                 );
-                
+
                 if binding.randomness_hash != expected_hash {
                     return Err(PoCError::ValidationFailed(
                         "Challenge randomness mismatch".to_string(),
@@ -397,10 +381,9 @@ impl BeaconAnnouncement {
         Ok(())
     }
 
-    // NEW: Whitepaper co-beacon validation
     fn validate_co_beacon(&self) -> PoCResult<()> {
         if let Some(ref co_beacon) = self.co_beacon {
-            // Validate nonce length (whitepaper: nonce16 = 16 bytes)
+
             if co_beacon.side_channel_nonce.len() != 16 {
                 return Err(PoCError::ValidationFailed(format!(
                     "Invalid co-beacon nonce length: {} (expected 16)",
@@ -408,26 +391,24 @@ impl BeaconAnnouncement {
                 )));
             }
 
-            // Verify nonce commitment
             let expected_commitment = Self::compute_nonce_commitment(
                 &co_beacon.side_channel_nonce,
                 &self.beacon_id,
                 self.epoch,
             );
-            
+
             if co_beacon.nonce_commitment != expected_commitment {
                 return Err(PoCError::ValidationFailed(
                     "Co-beacon nonce commitment mismatch".to_string(),
                 ));
             }
 
-            // Verify co-beacon signature (signed: {nonce16, time32, beacon_id})
             let signing_data = Self::create_co_beacon_signing_data(
                 &co_beacon.side_channel_nonce,
                 &self.timestamp,
                 &self.beacon_id,
             )?;
-            
+
             match ego_core::verify_signature(
                 &self.public_key,
                 &signing_data,
@@ -448,7 +429,6 @@ impl BeaconAnnouncement {
                 }
             }
 
-            // Validate broadcast window
             if co_beacon.broadcast_start > co_beacon.broadcast_end {
                 return Err(PoCError::ValidationFailed(
                     "Invalid co-beacon broadcast window".to_string(),
@@ -460,10 +440,7 @@ impl BeaconAnnouncement {
     }
 
     fn create_signing_data(&self) -> PoCResult<Vec<u8>> {
-        
 
-        // Whitepaper: Domain-separated deterministic hashing
-        // H = blake2s("ego/ctx:beacon/v1" || canonical(data))
         let mut data = Vec::new();
 
         data.extend_from_slice(b"ego/ctx:beacon/v1");
@@ -480,8 +457,7 @@ impl BeaconAnnouncement {
         data.extend_from_slice(&self.tx_params.frequency.to_le_bytes());
         data.extend_from_slice(&self.tx_params.tx_power_dbm.to_le_bytes());
         data.extend_from_slice(&self.tx_params.pci.to_le_bytes());
-        
-        // Include NR params if present
+
         if let Some(nr_arfcn) = self.tx_params.nr_arfcn {
             data.extend_from_slice(&nr_arfcn.to_le_bytes());
         }
@@ -489,7 +465,6 @@ impl BeaconAnnouncement {
             data.extend_from_slice(&[nr_band]);
         }
 
-        // Include challenge binding if present
         if let Some(ref binding) = self.challenge_binding {
             data.extend_from_slice(binding.randomness_hash.as_bytes());
         }
@@ -497,7 +472,6 @@ impl BeaconAnnouncement {
         Ok(data)
     }
 
-    // Whitepaper: Generate nonce from challenge (basic version)
     fn generate_nonce(challenge: &Challenge) -> Vec<u8> {
         use ego_core::crypto::hash_multiple;
 
@@ -510,7 +484,6 @@ impl BeaconAnnouncement {
         hash.as_bytes()[..16].to_vec()
     }
 
-    // Whitepaper: Generate nonce from randomness seed
     fn generate_nonce_from_randomness(challenge: &Challenge, randomness_hash: &Hash) -> Vec<u8> {
         use ego_core::crypto::hash_multiple;
 
@@ -523,7 +496,6 @@ impl BeaconAnnouncement {
         hash.as_bytes()[..16].to_vec()
     }
 
-    // Whitepaper: R_e = H(vrf_output || region_id || epoch || slot)
     fn compute_challenge_randomness(
         vrf_output: &Hash,
         region_id: &str,
@@ -540,7 +512,6 @@ impl BeaconAnnouncement {
         ])
     }
 
-    // Whitepaper: Nonce commitment = H(nonce16 || beacon_id || epoch)
     fn compute_nonce_commitment(nonce: &[u8], beacon_id: &Address, epoch: u64) -> Hash {
         use ego_core::crypto::hash_multiple;
 
@@ -551,19 +522,18 @@ impl BeaconAnnouncement {
         ])
     }
 
-    // Whitepaper: Co-beacon signing data {nonce16, time32, beacon_id}
     fn create_co_beacon_signing_data(
         nonce: &[u8],
         timestamp: &Timestamp,
         beacon_id: &Address,
     ) -> PoCResult<Vec<u8>> {
         let mut data = Vec::new();
-        
+
         data.extend_from_slice(b"ego/ctx:cobeacon/v1");
         data.extend_from_slice(nonce);
-        data.extend_from_slice(&(timestamp.as_millis() as u32).to_le_bytes()); // time32
+        data.extend_from_slice(&(timestamp.as_millis() as u32).to_le_bytes());
         data.extend_from_slice(beacon_id.as_bytes());
-        
+
         Ok(data)
     }
 
@@ -572,19 +542,16 @@ impl BeaconAnnouncement {
         now >= self.time_window.start_time && now <= self.time_window.end_time
     }
 
-    /// Whitepaper: Add co-beacon with proper nonce binding
     pub fn add_co_beacon(&mut self, method: CoBeaconMethod, keypair: &KeyPair) -> PoCResult<()> {
-        // Generate nonce16
+
         let side_channel_nonce = Self::generate_co_beacon_nonce(&self.challenge, &self.beacon_id);
-        
-        // Compute nonce commitment
+
         let nonce_commitment = Self::compute_nonce_commitment(
             &side_channel_nonce,
             &self.beacon_id,
             self.epoch,
         );
 
-        // Sign {nonce16, time32, beacon_id}
         let signing_data = Self::create_co_beacon_signing_data(
             &side_channel_nonce,
             &self.timestamp,
@@ -623,31 +590,24 @@ impl BeaconAnnouncement {
         self.slice_context = Some(slice_context);
     }
 
-    /// Whitepaper: Estimate coverage radius using 3GPP-based path-loss
     pub fn estimated_coverage_radius_km(&self) -> f32 {
         let tx_power = self.tx_params.tx_power_dbm as f32;
         let frequency_ghz = self.tx_params.frequency as f32 / 1000.0;
 
-        // Simplified UMi model for estimation
-        // Actual path-loss: PL = 22.4 + 35.3·log10(d) + 21.3·log10(fc)
-        // Assume RSRP threshold of -100 dBm for coverage edge
         let rsrp_threshold = -100.0;
         let max_path_loss = tx_power - rsrp_threshold;
 
-        // Solve for distance: d = 10^((PL - 22.4 - 21.3·log10(fc)) / 35.3)
         let range_km = 10.0_f32.powf(
             (max_path_loss - 22.4 - 21.3 * frequency_ghz.log10()) / 35.3
-        ) / 1000.0; // Convert m to km
+        ) / 1000.0;
 
         range_km.min(50.0).max(0.1)
     }
 
-    /// Get epoch from timestamp
     pub fn get_epoch(&self) -> u64 {
         self.epoch
     }
 
-    /// Check if announcement has valid randomness seed
     pub fn has_randomness_seed(&self) -> bool {
         self.randomness_seed.is_some()
     }
@@ -780,14 +740,14 @@ impl Eq for Polarization {}
 impl Default for BeaconTxParams {
     fn default() -> Self {
         Self {
-            frequency: 3500, // 3.5 GHz (typical n78 band)
-            tx_power_dbm: 23, // Whitepaper: typical small cell
+            frequency: 3500,
+            tx_power_dbm: 23,
             pci: 1,
             beam_config: None,
             duration_ms: 1000,
             mcs: Some(16),
-            nr_arfcn: Some(646656), // Example: 3.5 GHz NR ARFCN
-            nr_band: Some(78),      // n78 (3.3-3.8 GHz)
+            nr_arfcn: Some(646656),
+            nr_band: Some(78),
             ssb_index: Some(0),
         }
     }
@@ -833,9 +793,9 @@ mod tests {
         let announcement = BeaconAnnouncement::new(beacon_id, challenge, location, tx_params);
 
         assert_eq!(announcement.beacon_id, beacon_id);
-        assert_eq!(announcement.nonce.len(), 16); // Whitepaper: nonce16
+        assert_eq!(announcement.nonce.len(), 16);
         assert!(announcement.is_in_transmission_window());
-        assert_eq!(announcement.time_window.duration_ms, 10_000); // Whitepaper: 10s window
+        assert_eq!(announcement.time_window.duration_ms, 10_000);
     }
 
     #[test]
@@ -932,7 +892,6 @@ mod tests {
         let tx_params = BeaconTxParams::default();
         let mut announcement = BeaconAnnouncement::new(beacon_id, challenge, location, tx_params);
 
-        // Add co-beacon with BLE method
         let co_beacon_method = CoBeaconMethod::BLE {
             service_uuid: "0000180a-0000-1000-8000-00805f9b34fb".to_string(),
             characteristic_uuid: "00002a29-0000-1000-8000-00805f9b34fb".to_string(),
@@ -943,9 +902,8 @@ mod tests {
         assert!(announcement.co_beacon.is_some());
 
         let co_beacon = announcement.co_beacon.as_ref().unwrap();
-        assert_eq!(co_beacon.side_channel_nonce.len(), 16); // Whitepaper: nonce16
-        
-        // Sign and validate with co-beacon
+        assert_eq!(co_beacon.side_channel_nonce.len(), 16);
+
         assert!(announcement.sign(&keypair).is_ok());
         assert!(announcement.validate().is_ok());
     }
@@ -976,10 +934,9 @@ mod tests {
         let radius = announcement.estimated_coverage_radius_km();
         assert!(radius > 0.0);
         assert!(radius <= 50.0);
-        
-        // Whitepaper: UMi model should give reasonable range for small cell
-        assert!(radius >= 0.1); // At least 100m
-        assert!(radius <= 10.0); // Typically < 10km for small cell
+
+        assert!(radius >= 0.1);
+        assert!(radius <= 10.0);
     }
 
     #[test]
@@ -1004,13 +961,12 @@ mod tests {
         let tx_params = BeaconTxParams::default();
 
         let announcement = BeaconAnnouncement::new(beacon_id, challenge, location, tx_params);
-        
-        // Validation should pass with correct nonce
+
         assert!(announcement.validate().is_ok());
     }
 
     #[test]
-    #[ignore] 
+    #[ignore]
     fn test_challenge_binding_validation() {
         let beacon_id = Address::new([1u8; 20]);
         let challenge = Challenge {
@@ -1043,7 +999,6 @@ mod tests {
             1,
         );
 
-        // Should have valid challenge binding
         assert!(announcement.challenge_binding.is_some());
         assert!(announcement.validate().is_ok());
     }
@@ -1070,21 +1025,18 @@ mod tests {
         let tx_params = BeaconTxParams::default();
 
         let announcement = BeaconAnnouncement::new(beacon_id, challenge, location, tx_params);
-        
-        // Should be in transmission window initially
+
         assert!(announcement.is_in_transmission_window());
-        
-        // Whitepaper: window should be 10s
+
         assert_eq!(announcement.time_window.duration_ms, 10_000);
     }
 
     #[test]
     fn test_nr_params_validation() {
         let mut tx_params = BeaconTxParams::default();
-        
-        // Test invalid NR band
+
         tx_params.nr_band = Some(0);
-        
+
         let beacon_id = Address::new([1u8; 20]);
         let challenge = Challenge {
             challenge_hash: Hash::new([2u8; 32]),
@@ -1104,8 +1056,7 @@ mod tests {
         };
 
         let announcement = BeaconAnnouncement::new(beacon_id, challenge, location, tx_params);
-        
-        // Should fail validation with invalid NR band
+
         assert!(announcement.validate().is_err());
     }
 
@@ -1133,13 +1084,11 @@ mod tests {
         let tx_params = BeaconTxParams::default();
 
         let mut announcement = BeaconAnnouncement::new(beacon_id, challenge, location, tx_params);
-        
-        // Signing should use domain-separated hash
+
         assert!(announcement.sign(&keypair).is_ok());
-        
+
         let signing_data = announcement.create_signing_data().unwrap();
-        
-        // Should start with domain separator
+
         assert!(signing_data.starts_with(b"ego/ctx:beacon/v1"));
     }
 
@@ -1165,8 +1114,7 @@ mod tests {
         let tx_params = BeaconTxParams::default();
 
         let announcement = BeaconAnnouncement::new(beacon_id, challenge, location, tx_params);
-        
-        // Epoch should be calculated from timestamp
+
         let expected_epoch = Timestamp::now().as_secs() / 3600;
         assert_eq!(announcement.get_epoch(), expected_epoch);
     }

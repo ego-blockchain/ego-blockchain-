@@ -81,7 +81,7 @@ pub struct AggregatorMetrics {
     pub avg_witnesses_per_beacon: f32,
     pub fraud_reports_generated: u32,
     pub last_updated: Timestamp,
-    // Whitepaper additions for DRS metrics
+
     pub path_loss_fit_failures: u32,
     pub nonce_binding_failures: u32,
     pub density_penalties_applied: u32,
@@ -124,7 +124,7 @@ impl Default for AggregatorMetrics {
             avg_witnesses_per_beacon: 0.0,
             fraud_reports_generated: 0,
             last_updated: Timestamp::now(),
-            // Whitepaper metrics
+
             path_loss_fit_failures: 0,
             nonce_binding_failures: 0,
             density_penalties_applied: 0,
@@ -213,7 +213,6 @@ impl WitnessSet {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct DensityEvent {
     pub node_id: Address,
@@ -246,7 +245,6 @@ impl DensityEvent {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct DailyEvidenceRoot {
     pub evidence_root: Hash,
@@ -272,7 +270,7 @@ impl DailyEvidenceRoot {
             date,
             epoch,
             aggregator_id,
-            aggregator_signature: ego_core::Signature::ed25519([0u8; 64]), // Placeholder, sign later
+            aggregator_signature: ego_core::Signature::ed25519([0u8; 64]),
             timestamp: Timestamp::now(),
         }
     }
@@ -305,7 +303,6 @@ impl DailyEvidenceRoot {
         Ok(data)
     }
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoCFraudEvidence {

@@ -345,7 +345,7 @@ impl Default for ErasureCodingConfig {
         Self {
             data_chunks: 64,
             parity_chunks: 32,
-            chunk_size: 1024 * 1024, // 1 MB
+            chunk_size: 1024 * 1024,
             codec: "ReedSolomon".to_string(),
         }
     }

@@ -1,8 +1,3 @@
-/**
- * WelcomeScreen — shown when no wallet exists yet.
- * Options: Create new wallet  |  Import via mnemonic
- */
-
 import React, { useState } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, TextInput,
@@ -21,8 +16,6 @@ export function WelcomeScreen({ navigation }: { navigation: Nav }) {
   const [mnemonic, setMnemonic] = useState('');
   const [newPhrase, setNewPhrase] = useState<string | null>(null);
   const [loading, setLoading]   = useState(false);
-
-  // ── Create new wallet ────────────────────────────────────────────────────
 
   async function handleCreate() {
     setLoading(true);
@@ -49,8 +42,6 @@ export function WelcomeScreen({ navigation }: { navigation: Nav }) {
     navigation.replace('MainTabs');
   }
 
-  // ── Import wallet ────────────────────────────────────────────────────────
-
   async function handleImport() {
     const words = mnemonic.trim().split(/\s+/);
     if (words.length !== 24) {
@@ -75,8 +66,6 @@ export function WelcomeScreen({ navigation }: { navigation: Nav }) {
       setLoading(false);
     }
   }
-
-  // ── Home ─────────────────────────────────────────────────────────────────
 
   if (mode === 'home') {
     return (
@@ -111,8 +100,6 @@ export function WelcomeScreen({ navigation }: { navigation: Nav }) {
       </SafeAreaView>
     );
   }
-
-  // ── Show new recovery phrase ─────────────────────────────────────────────
 
   if (mode === 'create' && newPhrase) {
     const words = newPhrase.split(' ');

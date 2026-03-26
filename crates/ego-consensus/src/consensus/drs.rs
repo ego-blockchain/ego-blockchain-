@@ -1,25 +1,3 @@
-// consensus/drs.rs — Deterministic Reward Scoring
-//
-// Computes the DRS score and reward multiplier for each node per epoch.
-// All inputs are observable on-chain; computation is fully deterministic.
-//
-// Whitepaper §6 weight table:
-//   uptime        0.20
-//   post_pass     0.40  (most weight — storage is core obligation)
-//   inv_latency   0.10  (reward fast provers)
-//   poc_quality   0.20  (coverage contribution)
-//   serve_ratio   0.10  (data retrieval SLA)
-//
-// Multiplier: m = clamp(1.0 + 0.6 * (score − 0.5), 0.70, 1.30)
-//   score 1.0 → m 1.30  (maximum bonus)
-//   score 0.5 → m 1.00  (neutral)
-//   score 0.0 → m 0.70  (maximum penalty)
-//
-// Penalties (additive deductions before final clamp):
-//   equivocation   −0.30
-//   replay_attack  −0.15 each (capped at −0.30)
-//   consecutive_post_miss  −0.10 each (capped at −0.40)
-
 use crate::error::{PoCError, PoCResult};
 use ego_core::{Address, Hash, KeyPair, Signature, Timestamp};
 use ego_core::crypto::hash_multiple;
@@ -27,57 +5,44 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
-// ── Weights ───────────────────────────────────────────────────────────────────
-
 pub const W_UPTIME: f64        = 0.20;
 pub const W_POST_PASS: f64     = 0.40;
 pub const W_INV_LATENCY: f64   = 0.10;
 pub const W_POC_QUALITY: f64   = 0.20;
 pub const W_SERVE_RATIO: f64   = 0.10;
 
-/// Reference latency (ms) that maps to full inv_latency score.
 pub const LATENCY_REF_MS: f64  = 5_000.0;
-/// Above this latency the inv_latency component is 0.
+
 pub const LATENCY_MAX_MS: f64  = 60_000.0;
 
 pub const MULTIPLIER_MIN: f64  = 0.70;
 pub const MULTIPLIER_MAX: f64  = 1.30;
 pub const MULTIPLIER_SLOPE: f64 = 0.60;
 
-// ── Input set ─────────────────────────────────────────────────────────────────
-
-/// All observable inputs required to compute a node's epoch DRS score.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DRSInputs {
     pub node_addr: Address,
     pub epoch: u64,
 
-    // Uptime (0.0–1.0 fraction of epoch slots online)
     pub uptime_fraction: f64,
 
-    // PoSt component
     pub post_windows_assigned: u32,
     pub post_windows_passed: u32,
-    /// P50 latency of submitted proofs in ms
+
     pub post_latency_p50_ms: u64,
-    /// Number of consecutive misses ending the epoch
+
     pub consecutive_post_misses: u32,
 
-    // PoC component
-    /// Average quality score of PoCEvents submitted this epoch (0.0–1.0)
     pub avg_poc_quality: f64,
-    /// Number of PoCEvents contributed
+
     pub poc_event_count: u32,
 
-    // Serve ratio
     pub data_requests_received: u64,
     pub data_requests_served: u64,
 
-    // Fraud/penalty counts
     pub equivocations: u32,
     pub replay_attacks: u32,
 
-    /// Hash of the evidence root that produced these inputs
     pub evidence_root: Hash,
 }
 
@@ -100,25 +65,20 @@ impl DRSInputs {
     }
 }
 
-// ── Score event ───────────────────────────────────────────────────────────────
-
-/// On-chain DRS score record emitted once per epoch per node.
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct DRSScoreEvent {
     pub event_id: Hash,
     pub node_addr: Address,
     pub epoch: u64,
 
-    /// Raw score ∈ [0.0, 1.0] before multiplier
     pub raw_score: f64,
-    /// Fixed-point u32: raw_score × 2^32
+
     pub score_u32: u32,
-    /// Reward multiplier ∈ [0.70, 1.30]
+
     pub multiplier: f64,
-    /// Fixed-point u16: multiplier × 1000 (3 decimal places)
+
     pub multiplier_fp16: u16,
 
-    // Component breakdown for transparency
     pub uptime_component: f64,
     pub post_component: f64,
     pub latency_component: f64,
@@ -126,9 +86,8 @@ pub struct DRSScoreEvent {
     pub serve_component: f64,
     pub total_penalty: f64,
 
-    /// Version of the DRS weights table used
     pub weights_version: u8,
-    /// Hash of the DRS params (weights + penalty table)
+
     pub params_digest: Hash,
 
     pub evidence_root: Hash,
@@ -137,15 +96,11 @@ pub struct DRSScoreEvent {
 }
 
 impl DRSScoreEvent {
-    /// True if this node is eligible to publish PoC events.
-    /// Whitepaper: minimum DRS ≥ 0.5 to participate.
+
     pub fn is_eligible(&self) -> bool { self.raw_score >= 0.5 }
 
-    /// True if this node qualifies for the high-bandwidth quota band.
     pub fn is_high_quota(&self) -> bool { self.raw_score >= 0.8 }
 }
-
-// ── Scorer ────────────────────────────────────────────────────────────────────
 
 pub struct DRSScorer {
     weights_version: u8,
@@ -158,20 +113,14 @@ impl DRSScorer {
         Self { weights_version: 1, params_digest }
     }
 
-    /// Compute the DRS score and multiplier from raw inputs.
-    ///
-    /// Returns `(raw_score, multiplier)` where:
-    ///   raw_score  ∈ [0.0, 1.0]
-    ///   multiplier ∈ [0.70, 1.30]
     pub fn compute(&self, inputs: &DRSInputs) -> (f64, f64) {
-        // ── Component scores ──────────────────────────────────────────────────
+
         let uptime     = inputs.uptime_fraction.clamp(0.0, 1.0);
         let post_pass  = inputs.post_pass_rate().clamp(0.0, 1.0);
         let inv_lat    = inputs.inv_latency_score();
         let poc_qual   = inputs.avg_poc_quality.clamp(0.0, 1.0);
         let serve      = inputs.serve_ratio().clamp(0.0, 1.0);
 
-        // If no PoC events contributed, poc_qual defaults to 0 — don't reward absence
         let poc_adj = if inputs.poc_event_count == 0 { 0.0 } else { poc_qual };
 
         let base_score = W_UPTIME       * uptime
@@ -180,7 +129,6 @@ impl DRSScorer {
                        + W_POC_QUALITY  * poc_adj
                        + W_SERVE_RATIO  * serve;
 
-        // ── Penalties ────────────────────────────────────────────────────────
         let equivocation_penalty = if inputs.equivocations > 0 { 0.30 } else { 0.0 };
 
         let replay_penalty = (inputs.replay_attacks as f64 * 0.15).min(0.30);
@@ -191,7 +139,6 @@ impl DRSScorer {
 
         let raw_score = (base_score - total_penalty).clamp(0.0, 1.0);
 
-        // ── Multiplier ───────────────────────────────────────────────────────
         let multiplier = (1.0 + MULTIPLIER_SLOPE * (raw_score - 0.5))
             .clamp(MULTIPLIER_MIN, MULTIPLIER_MAX);
 
@@ -203,7 +150,6 @@ impl DRSScorer {
         (raw_score, multiplier)
     }
 
-    /// Build and sign a DRSScoreEvent for on-chain emission.
     pub fn score_event(
         &self,
         inputs: &DRSInputs,
@@ -230,7 +176,6 @@ impl DRSScorer {
         let miss_pen            = (inputs.consecutive_post_misses as f64 * 0.10).min(0.40);
         let total_penalty       = (equivocation_pen + replay_pen + miss_pen).min(1.0);
 
-        // Sign: domain-separated hash of the key fields
         let signing_msg = hash_multiple(&[
             b"ego/drs/v1:",
             inputs.node_addr.as_bytes(),
@@ -286,9 +231,6 @@ impl Default for DRSScorer {
     fn default() -> Self { Self::new() }
 }
 
-// ── Epoch aggregator ──────────────────────────────────────────────────────────
-
-/// Aggregates per-node inputs collected over an epoch, then scores all nodes.
 pub struct EpochDRSAggregator {
     epoch: u64,
     scorer: DRSScorer,
@@ -314,15 +256,13 @@ impl EpochDRSAggregator {
             let event = self.scorer.score_event(inputs, keypair)?;
             events.push(event);
         }
-        // Sort deterministically by node address for consistent ordering
+
         events.sort_by_key(|e| e.node_addr.as_bytes().to_vec());
         Ok(events)
     }
 
     pub fn node_count(&self) -> usize { self.pending_inputs.len() }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -388,7 +328,7 @@ mod tests {
     #[test]
     fn test_neutral_score_neutral_multiplier() {
         let scorer = DRSScorer::new();
-        // Build an input set that should produce score ≈ 0.5
+
         let addr = Address::new([3u8; 20]);
         let inputs = DRSInputs {
             node_addr: addr,
@@ -396,7 +336,7 @@ mod tests {
             uptime_fraction: 0.5,
             post_windows_assigned: 48,
             post_windows_passed: 24,
-            post_latency_p50_ms: 32_500, // midpoint → ~0.5 inv_latency
+            post_latency_p50_ms: 32_500,
             consecutive_post_misses: 0,
             avg_poc_quality: 0.5,
             poc_event_count: 5,
@@ -407,7 +347,7 @@ mod tests {
             evidence_root: Hash::new([0u8; 32]),
         };
         let (score, mult) = scorer.compute(&inputs);
-        // Score should be within 0.1 of 0.5
+
         assert!((score - 0.5).abs() < 0.1, "score={}", score);
         assert!((mult - 1.0).abs() < 0.1, "mult={}", mult);
     }
@@ -430,7 +370,7 @@ mod tests {
         let mut inputs = perfect_inputs(addr);
         inputs.poc_event_count = 0;
         let (score, _) = scorer.compute(&inputs);
-        // poc_quality (0.20) should contribute 0 — score ≈ 0.80
+
         assert!((score - 0.80).abs() < 0.01, "score={}", score);
     }
 
@@ -457,9 +397,9 @@ mod tests {
         assert_eq!(agg.node_count(), 5);
         let events = agg.score_all(&kp).unwrap();
         assert_eq!(events.len(), 5);
-        // All should be eligible (score >= 0.5)
+
         assert!(events.iter().all(|e| e.is_eligible()));
-        // Sorted deterministically
+
         let addrs: Vec<_> = events.iter().map(|e| e.node_addr).collect();
         let mut sorted = addrs.clone();
         sorted.sort_by_key(|a| a.as_bytes().to_vec());

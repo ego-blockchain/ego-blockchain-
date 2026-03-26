@@ -307,9 +307,6 @@ impl PoStProver {
         Ok(responses)
     }
 
-    // FIX: collect temporaries before building the &[u8] slice —
-    // to_le_bytes() returns [u8; N] which is a temporary; we must keep
-    // the owned arrays alive for the duration of the hash_multiple call.
     async fn compute_challenge_response(sector_ids: &[u64], challenge: u64) -> PoCResult<[u8; 32]> {
         use ego_core::crypto::hash_multiple;
 
@@ -338,7 +335,7 @@ impl PoStProver {
         let mut sector_cursor = 0u32;
 
         for partition_idx in 0..windows_per_day {
-            // Distribute remainder sectors one each to the first `remainder` partitions
+
             let count = base + if partition_idx < remainder { 1 } else { 0 };
             let sector_ids: Vec<u64> = (sector_cursor..sector_cursor + count).map(|i| i as u64).collect();
             partitions.insert(partition_idx as u64, sector_ids);
@@ -498,7 +495,6 @@ impl PoStProver {
         Ok(event)
     }
 
-    // FIX: same temporaries pattern — collect partition_id bytes before slicing.
     fn compute_challenges_root(&self, window: &PoStWindow) -> Hash {
         use ego_core::crypto::hash_multiple;
 

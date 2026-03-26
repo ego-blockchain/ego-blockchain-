@@ -5,6 +5,7 @@ pub mod keystore;
 pub mod network_manager;
 pub mod node;
 pub mod rpc;
+pub mod store;
 pub mod supervisor;
 
 pub use bandwidth_sharing::*;

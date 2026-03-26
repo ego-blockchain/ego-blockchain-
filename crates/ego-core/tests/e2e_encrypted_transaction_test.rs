@@ -19,7 +19,6 @@ mod e2e_transaction_tests {
         println!("║  E2E Encrypted & Sharded Data Transaction Test              ║");
         println!("╚══════════════════════════════════════════════════════════════╝\n");
 
-        // ========== STEP 1: Generate Keypairs ==========
         println!("📋 STEP 1: Generating keypairs for Alice and Bob...");
         let alice_keypair = crypto::KeyPair::generate_with_transition();
         let bob_keypair = crypto::KeyPair::generate_with_transition();
@@ -30,7 +29,6 @@ mod e2e_transaction_tests {
         println!("  ✓ Alice address: {}", hex::encode(alice_addr.as_bytes()));
         println!("  ✓ Bob address:   {}", hex::encode(bob_addr.as_bytes()));
 
-        // Create accounts
         let mut alice_account = Account::new_eoa(
             alice_addr,
             alice_keypair.dilithium_public_key().key_data.clone(),
@@ -49,7 +47,6 @@ mod e2e_transaction_tests {
         println!("  ✓ Alice balance: {} EGOC", alice_account.balance.as_u128() / 1_000_000_000);
         println!("  ✓ Alice storage credits: {}\n", alice_account.storage_credits);
 
-        // ========== STEP 2: Establish Hybrid Session ==========
         println!("📋 STEP 2: Establishing hybrid KEM session (X25519 + Kyber-768)...");
         let (session_record, session_key) = alice_keypair
             .create_hybrid_session(
@@ -70,13 +67,11 @@ mod e2e_transaction_tests {
         assert_eq!(session_record.alg_kem_id, AlgorithmId::MlKem768.as_u16());
         assert_eq!(session_key.len(), 32);
 
-        // ========== STEP 3: Prepare Data for Encryption ==========
         println!("\n📋 STEP 3: Preparing data payload...");
         let data = b"Hello Bob! This is Alice sending you encrypted data across the EGO blockchain. This message will be encrypted with post-quantum cryptography, sharded across multiple nodes, and stored with geographic diversity.";
         println!("  ✓ Data size: {} bytes", data.len());
         println!("  ✓ Data preview: {}...", String::from_utf8_lossy(&data[..50]));
 
-        // ========== STEP 4: Encrypt Data in Shards ==========
         println!("\n📋 STEP 4: Encrypting data with XChaCha20-Poly1305...");
         let session_key_array: [u8; 32] = session_key.try_into().unwrap();
         let alg_ids = (
@@ -100,12 +95,10 @@ mod e2e_transaction_tests {
             alg_ids,
         ).expect("Failed to create decryption cipher");
 
-        // Shard the data
-        let shard_size = 64; // Small shards for demonstration
+        let shard_size = 64;
         let chunks = chunk_bytes(data, shard_size);
         println!("  ✓ Data split into {} shards", chunks.len());
 
-        // Encrypt each shard
         let mut encrypted_frames: Vec<Vec<u8>> = Vec::new();
         let mut total_encrypted_size = 0usize;
 
@@ -121,7 +114,6 @@ mod e2e_transaction_tests {
         println!("  ✓ Total encrypted size: {} bytes", total_encrypted_size);
         println!("  ✓ Overhead: {} bytes", total_encrypted_size - data.len());
 
-        // ========== STEP 5: Create Merkle Commitment ==========
         println!("\n📋 STEP 5: Creating Merkle tree commitment...");
         let mut leaves: Vec<Vec<u8>> = Vec::new();
         for frame in &encrypted_frames {
@@ -130,11 +122,10 @@ mod e2e_transaction_tests {
 
         let merkle = crypto::MerkleTree::build(leaves.clone());
         let merkle_root = merkle.root_hash().expect("Failed to get merkle root");
-        
+
         println!("  ✓ Merkle tree created with {} leaves", leaves.len());
         println!("  ✓ Merkle root: {}", hex::encode(merkle_root.as_bytes()));
 
-        // ========== STEP 6: Simulate Shard Distribution ==========
         println!("\n📋 STEP 6: Distributing shards across nodes...");
         let n_shards = 4;
         let mut shard_distribution: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -151,7 +142,6 @@ mod e2e_transaction_tests {
             println!("    - Shard {} → {} frames", shard_id, count);
         }
 
-        // ========== STEP 7: Create Encryption Envelope ==========
         println!("\n📋 STEP 7: Creating encryption envelope for Bob...");
         let (kyber_ciphertext, shared_secret) = alice_keypair
             .encapsulate_kyber(&bob_keypair.kyber_public_key().key_data)
@@ -168,7 +158,6 @@ mod e2e_transaction_tests {
         println!("  ✓ Shared secret: {}...", hex::encode(&shared_secret[..16]));
         println!("  ✓ Envelope created for {} recipient(s)", envelope.recipient_addresses.len());
 
-        // ========== STEP 8: Create Triad Placement ==========
         println!("\n📋 STEP 8: Creating triad placement (3 replicas)...");
         let triad = TriadPlacement {
             primary: NodeLocation {
@@ -202,14 +191,12 @@ mod e2e_transaction_tests {
         println!("  ✓ Replica B:  {} ({})", triad.replica_b.region, triad.replica_b.h3_cell);
         println!("  ✓ Diversity score: {}", triad.diversity_score);
 
-        // ========== STEP 9: Create StoreData Transaction ==========
         println!("\n📋 STEP 9: Creating StoreData transaction...");
-        // Convert merkle root (Hash type) bytes to fixed array for chunk_id
+
         let mut chunk_id_bytes = [0u8; 32];
         chunk_id_bytes.copy_from_slice(merkle_root.as_bytes());
         let chunk_id = Hash::new(chunk_id_bytes);
-        
-        // Convert first leaf hash to fixed array for data_hash
+
         let mut data_hash_bytes = [0u8; 32];
         data_hash_bytes.copy_from_slice(&leaves[0][..32]);
         let data_hash = Hash::new(data_hash_bytes);
@@ -237,7 +224,7 @@ mod e2e_transaction_tests {
             payload,
             ShardId::new(0).unwrap(),
             Some(SliceId::new("alice_personal".to_string())),
-            1, // chain_id
+            1,
         );
 
         println!("  ✓ Transaction created");
@@ -246,21 +233,18 @@ mod e2e_transaction_tests {
         println!("  ✓ Storage credits: 5000");
         println!("  ✓ Replication factor: 3");
 
-        // ========== STEP 10: Sign Transaction ==========
         println!("\n📋 STEP 10: Signing transaction (hybrid mode)...");
         tx.sign(&alice_keypair, true).expect("Transaction signing failed");
-        
-        // Set public keys for verification (required for transition mode)
+
         tx.public_keys.dilithium_pk = alice_keypair.dilithium_public_key();
         tx.public_keys.ed25519_pk = Some(alice_keypair.ed25519_public_key());
 
         println!("  ✓ Transaction signed with:");
-        println!("    - Dilithium-2 signature ({} bytes)", 
+        println!("    - Dilithium-2 signature ({} bytes)",
             tx.signature.dilithium_sig.as_ref().map(|s| s.signature_data.len()).unwrap_or(0));
-        println!("    - Ed25519 signature ({} bytes)", 
+        println!("    - Ed25519 signature ({} bytes)",
             tx.signature.ed25519_sig.as_ref().map(|s| s.signature_data.len()).unwrap_or(0));
 
-        // ========== STEP 11: Calculate Transaction Hash ==========
         println!("\n📋 STEP 11: Computing transaction hash...");
         let tx_hash = crypto::blake2s_hash_domain(&[
             b"EGO-TX-STORE",
@@ -278,35 +262,30 @@ mod e2e_transaction_tests {
         let datetime: DateTime<Utc> = DateTime::from(
             std::time::UNIX_EPOCH + std::time::Duration::from_millis(timestamp_millis)
         );
-        println!("  ✓ Timestamp: {} (epoch: {}ms)", 
-            datetime.format("%Y/%m/%d %H:%M:%S"), 
+        println!("  ✓ Timestamp: {} (epoch: {}ms)",
+            datetime.format("%Y/%m/%d %H:%M:%S"),
             timestamp_millis);
         println!("  ✓ Block time: {}", datetime);
 
-        // ========== STEP 12: Verify Transaction Signature ==========
         println!("\n📋 STEP 12: Verifying transaction signature...");
         let sig_valid = tx.verify_signature().expect("Signature verification failed");
         assert!(sig_valid, "Signature should be valid");
         println!("  ✓ Signature verification: PASSED");
 
-        // Validate against account
         alice_account.authorized_slices = vec![SliceId::new("alice_personal".to_string())];
         let validation = tx.validate_against_account(&alice_account);
         assert!(validation.is_ok(), "Transaction validation failed: {:?}", validation.err());
         println!("  ✓ Account validation: PASSED");
 
-        // ========== STEP 13: Verify Decryption (Bob's Side) ==========
         println!("\n📋 STEP 13: Verifying Bob can decrypt the data...");
-        
-        // Bob decapsulates the shared secret
+
         let bob_shared_secret = bob_keypair
             .decapsulate_kyber(&kyber_ciphertext)
             .expect("Kyber decapsulation failed");
-        
+
         assert_eq!(shared_secret, bob_shared_secret);
         println!("  ✓ Bob successfully decapsulated shared secret");
 
-        // Decrypt all frames
         let mut decrypted_data: Vec<u8> = Vec::new();
         for (i, frame) in encrypted_frames.iter().enumerate() {
             let seq = (i as u8) + 1;
@@ -317,10 +296,9 @@ mod e2e_transaction_tests {
 
         assert_eq!(decrypted_data, data);
         println!("  ✓ All {} frames decrypted successfully", encrypted_frames.len());
-        println!("  ✓ Decrypted data matches original: {}", 
+        println!("  ✓ Decrypted data matches original: {}",
             decrypted_data == data);
 
-        // ========== STEP 14: Verify Merkle Commitment ==========
         println!("\n📋 STEP 14: Verifying Merkle commitment integrity...");
         let mut verification_leaves: Vec<Vec<u8>> = Vec::new();
         for frame in &encrypted_frames {
@@ -334,7 +312,6 @@ mod e2e_transaction_tests {
         println!("  ✓ Merkle root verification: PASSED");
         println!("  ✓ Data integrity confirmed");
 
-        // ========== STEP 15: Transaction Summary ==========
         println!("\n╔══════════════════════════════════════════════════════════════╗");
         println!("║  Transaction Summary                                         ║");
         println!("╚══════════════════════════════════════════════════════════════╝");
@@ -397,16 +374,14 @@ mod e2e_transaction_tests {
         println!("║  Testing Bidirectional Encrypted Communication              ║");
         println!("╚══════════════════════════════════════════════════════════════╝\n");
 
-        // Setup
         let alice_keypair = crypto::KeyPair::generate_with_transition();
         let bob_keypair = crypto::KeyPair::generate_with_transition();
-        
+
         let alice_addr = Address::from_public_key(&alice_keypair.dilithium_public_key());
         let bob_addr = Address::from_public_key(&bob_keypair.dilithium_public_key());
 
         println!("✓ Alice and Bob keypairs generated");
 
-        // Bob sends message to Alice
         let (session_record, session_key) = bob_keypair
             .create_hybrid_session(
                 &alice_keypair.x25519_public_key(),
@@ -442,7 +417,6 @@ mod e2e_transaction_tests {
 
         println!("✓ Bob's message encrypted: {} bytes", encrypted.len());
 
-        // Create transaction
         let tx_hash = crypto::blake2s_hash_domain(&[
             b"EGO-TX-RESPONSE",
             &msg_hash,
@@ -463,7 +437,6 @@ mod e2e_transaction_tests {
         println!("  • To:        {} (Alice)", hex::encode(alice_addr.as_bytes())[..16].to_string());
         println!("  • Size:      {} bytes", encrypted.len());
 
-        // Alice decrypts
         let mut dec = crypto::StreamCipher::new(
             &session_key_array,
             b"bob_response".to_vec(),

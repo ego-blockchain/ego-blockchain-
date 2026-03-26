@@ -2,10 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-// ── Directory helpers ─────────────────────────────────────────────────────────
-
-/// Top-level EgoDesktop directory (not wallet-specific).
-/// Override with `EGO_DATA_DIR` env var for multi-instance testing.
 pub fn base_data_dir() -> PathBuf {
     let dir = if let Ok(v) = std::env::var("EGO_DATA_DIR") {
         PathBuf::from(v)
@@ -18,7 +14,6 @@ pub fn base_data_dir() -> PathBuf {
     dir
 }
 
-/// Per-wallet directory: base / wallet_id.
 pub fn wallet_dir(wallet_id: &str) -> PathBuf {
     let dir = base_data_dir().join(wallet_id);
     let _ = fs::create_dir_all(&dir);
@@ -29,46 +24,97 @@ pub fn registry_path() -> PathBuf {
     base_data_dir().join("wallets.json")
 }
 
-/// Returns the current active wallet ID, defaulting to "wallet_0".
 pub fn get_active_wallet_id() -> String {
     let id = load_registry().active_id;
     if id.trim().is_empty() { "wallet_0".to_string() } else { id }
 }
 
-/// Returns the data directory for the currently active wallet.
-/// This makes ALL other path helpers (seed_path, ledger_path, storage_dir)
-/// automatically scope to the right wallet.
 pub fn data_dir() -> PathBuf {
     wallet_dir(&get_active_wallet_id())
 }
 
 pub fn storage_dir() -> PathBuf {
-    let dir = data_dir().join("storage");
-    let _ = fs::create_dir_all(&dir);
-    dir
+    // If the user chose a specific drive (e.g. "D"), store under
+    // {drive}:\EgoDesktop\{wallet_id}\storage  — wallet-scoped, less exposed.
+    // Otherwise fall back to the default data_dir()/storage.
+    let ledger = Ledger::load();
+    let drive = ledger.storage_drive.trim().to_uppercase();
+    let base = if !drive.is_empty() && drive.len() == 1 {
+        #[cfg(target_os = "windows")]
+        let p = PathBuf::from(format!(
+            "{}:\\EgoDesktop\\{}\\storage",
+            drive,
+            get_active_wallet_id()
+        ));
+        #[cfg(not(target_os = "windows"))]
+        let p = data_dir().join("storage");
+        p
+    } else {
+        data_dir().join("storage")
+    };
+    let _ = fs::create_dir_all(&base);
+    base
 }
+
 
 pub fn seed_path() -> PathBuf {
     data_dir().join("wallet.seed")
+}
+
+/// Load the wallet seed, decrypting it with OS DPAPI if it was previously protected.
+pub fn load_seed() -> Option<Vec<u8>> {
+    let raw = fs::read(seed_path()).ok()?;
+    let bytes = crate::utils::os_unprotect(&raw);
+    if bytes.len() == 32 { Some(bytes) } else { None }
+}
+
+/// Save the wallet seed, encrypting it with OS DPAPI before writing.
+pub fn save_seed(seed: &[u8]) -> std::io::Result<()> {
+    let protected = crate::utils::os_protect(seed);
+    crate::utils::atomic_write(&seed_path(), &protected)
+}
+
+/// Encode a raw AES key (as hex) for at-rest storage using OS DPAPI.
+/// Stored format: `"prot:{base64_of_dpapi_blob}"`.
+/// On non-Windows, returns the plain hex unchanged (os_protect is a passthrough).
+pub fn protect_key_hex(raw_hex: &str) -> String {
+    match hex::decode(raw_hex) {
+        Ok(bytes) => {
+            let blob = crate::utils::os_protect(&bytes);
+            use base64::Engine as _;
+            format!("prot:{}", base64::engine::general_purpose::STANDARD.encode(&blob))
+        }
+        Err(_) => raw_hex.to_string(),
+    }
+}
+
+/// Decode a stored key back to raw bytes.
+/// Handles both the `"prot:{base64}"` format written by `protect_key_hex`
+/// and legacy plaintext hex (for wallets created before this change).
+pub fn unprotect_key_bytes(stored: &str) -> Vec<u8> {
+    if let Some(b64) = stored.strip_prefix("prot:") {
+        use base64::Engine as _;
+        if let Ok(blob) = base64::engine::general_purpose::STANDARD.decode(b64) {
+            return crate::utils::os_unprotect(&blob);
+        }
+    }
+    // Legacy: plain hex — still works for old ledger.json files
+    hex::decode(stored).unwrap_or_default()
 }
 
 pub fn ledger_path() -> PathBuf {
     data_dir().join("ledger.json")
 }
 
-// ── Wallet registry ───────────────────────────────────────────────────────────
-
-/// Metadata for one wallet, stored in wallets.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletEntry {
     pub id: String,
     pub name: String,
-    /// Bech32 address — cached here so the switcher UI doesn't need to load every ledger.
+
     pub address: String,
     pub created_at: i64,
 }
 
-/// The wallets.json registry — one per installation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletRegistry {
     pub active_id: String,
@@ -99,7 +145,6 @@ pub fn save_registry(registry: &WalletRegistry) -> Result<(), String> {
     crate::utils::atomic_write(&registry_path(), data.as_bytes()).map_err(|e| e.to_string())
 }
 
-/// Returns the next wallet id string (e.g. "wallet_3" after "wallet_0","wallet_2").
 pub fn next_wallet_id(registry: &WalletRegistry) -> String {
     let max_n = registry
         .wallets
@@ -114,9 +159,6 @@ pub fn next_wallet_id(registry: &WalletRegistry) -> String {
     }
 }
 
-// ── Ledger structs ────────────────────────────────────────────────────────────
-
-/// A single signed transaction in the local ledger.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LedgerTx {
     pub hash: String,
@@ -125,50 +167,54 @@ pub struct LedgerTx {
     pub amount: u64,
     pub memo: Option<String>,
     pub timestamp: i64,
-    /// Hex-encoded Ed25519 signature over canonical tx bytes.
+
     pub signature: String,
     pub status: String,
     pub block_height: Option<u64>,
     #[serde(default)]
     pub nonce: u64,
-    /// Hex-encoded Ed25519 public key of the sender — required for relay-side verification.
+
     #[serde(default)]
     pub public_key_ed25519: String,
-    /// Hex-encoded Dilithium2 public key (1312 bytes = 2624 hex chars).
-    /// Derives the egot1 address — proves quantum-safe ownership of the from address.
+
     #[serde(default)]
     pub dilithium_pubkey: String,
-    /// Hex-encoded Dilithium2 detached signature (2420 bytes = 4840 hex chars).
-    /// Signs the same canonical bytes as `signature` — quantum-safe proof of intent.
+
     #[serde(default)]
     pub dilithium_signature: String,
-    /// TX type: "transfer" | "deploy" | "call"
+
     #[serde(default = "default_tx_type")]
     pub tx_type: String,
-    /// Base fee paid in uEGOC. 100% burned (removed from supply permanently).
+
     #[serde(default)]
     pub fee_uegoc: u64,
-    /// Priority (tip) fee in uEGOC — goes to the miner, not burned.
-    /// Higher tip = earlier inclusion in next block (EIP-1559-style ordering).
+
     #[serde(default)]
     pub priority_fee_uegoc: u64,
-    /// For deploy TXs: hex-encoded WASM bytecode
+
     #[serde(default)]
     pub wasm_code: String,
-    /// For call TXs: target contract address (hex)
+
     #[serde(default)]
     pub contract_addr: String,
-    /// For call TXs: entrypoint name
+
     #[serde(default)]
     pub entrypoint: String,
-    /// For deploy/call TXs: ABI-encoded arguments (hex)
+
     #[serde(default)]
     pub call_args: String,
+
+    /// For tx_type="store_data" and "retrieve_file": the file's content-addressed CID.
+    #[serde(default)]
+    pub cid: String,
+
+    /// Blake3 merkle commitment over all block CIDs — proves the file existed at this height.
+    #[serde(default)]
+    pub commitment_hash: String,
 }
 
 fn default_tx_type() -> String { "transfer".to_string() }
 
-/// A local "block" produced whenever a transaction is confirmed.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LedgerBlock {
     pub height: u64,
@@ -179,28 +225,23 @@ pub struct LedgerBlock {
     pub tx_count: u32,
     pub size_bytes: u64,
     pub reward: u64,
-    /// Coinbase TX hash — miner self-issues their block reward.
+
     #[serde(default)]
     pub coinbase_tx: Option<String>,
-    /// Number of BFT validator votes this block collected.
-    /// Fork choice: higher vote count wins when two blocks compete at the same height.
+
     #[serde(default)]
     pub vote_count: u32,
-    /// Blake3 Merkle root of all TX hashes in this block.
-    /// Light clients use this to verify TX inclusion without downloading full blocks.
+
     #[serde(default)]
     pub tx_merkle_root: String,
-    /// Proof of Coverage VRF ticket — blake3(ed25519_sign(slot_seed)).
-    /// Proves the miner won the slot lottery for this block.
-    /// Empty on legacy blocks (accepted during transition).
+
     #[serde(default)]
     pub poc_ticket: String,
-    /// Slot number this block was mined in (now_ms / BATCH_INTERVAL_MS).
+
     #[serde(default)]
     pub poc_slot: u64,
 }
 
-/// Metadata for an encrypted file stored on disk.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StoredFile {
     pub cid: String,
@@ -210,54 +251,94 @@ pub struct StoredFile {
     pub duration_months: u32,
     pub stored_at: i64,
     pub expiry: i64,
-    pub status: String, // "Active" | "Expired" | "Received"
+    pub status: String,
     pub key_nonce_hex: String,
     pub local_path: String,
     #[serde(default)]
     pub owner: String,
-    // ── PoRep commitment fields (set at store_file time) ──────────────────────
-    /// Merkle root of the encrypted file (hex). Empty for pre-PoRep files.
+
     #[serde(default)]
     pub comm_d: String,
-    /// H(comm_d ‖ replica_id ‖ "ego/porep/v1") (hex).
+
     #[serde(default)]
     pub comm_r: String,
-    /// Monotonically-increasing sector ID within this wallet.
+
     #[serde(default)]
     pub sector_id: u64,
-    /// Number of real (non-padding) 1 KB leaves in the Merkle tree.
+
     #[serde(default)]
     pub n_real_leaves: usize,
-    /// Next-power-of-two leaf count used by the tree builder.
+
     #[serde(default)]
     pub n_padded_leaves: usize,
-    /// PoST status: "" | "registered" | "challenged" | "proved" | "faulted"
+
     #[serde(default)]
     pub post_status: String,
-    /// Unix timestamp of the most recent successful PoST proof.
+
     #[serde(default)]
     pub last_proved: Option<i64>,
-    // ── Block-storage fields (IPFS-style, set for egomfd1 files) ─────────────
-    /// Manifest CID (`egomfd1…`). Empty for legacy single-blob files.
+
     #[serde(default)]
     pub manifest_cid: String,
-    /// Total 256 KB blocks in this file's manifest.  0 = legacy.
+
     #[serde(default)]
     pub blocks_total: u32,
-    /// How many blocks have been downloaded to disk so far.
+
     #[serde(default)]
     pub blocks_received: u32,
-    /// Addresses of peers that have confirmed pinning this file (replication tracking).
-    /// Populated when a PinAck { accepted: true } is received for this CID.
+
+    /// Unix timestamp of the last block received (or manifest arrival).
+    /// Used to detect stalled transfers: if no progress for 10 min → "Failed".
+    /// Reset to 0 on retry.
+    #[serde(default)]
+    pub last_block_at: i64,
+
     #[serde(default)]
     pub replica_peers: Vec<String>,
+
+    /// Total fee paid by the uploader for this file (uEGOC).
+    /// Split equally among storage providers (master + slaves) as they confirm.
+    #[serde(default)]
+    pub storage_fee_uegoc: u64,
+
+    /// "master" = this node is responsible for re-replicating when a slave drops.
+    /// "slave"  = this node holds a replica; watches master liveness.
+    /// ""       = role not yet assigned (legacy / in-flight).
+    #[serde(default)]
+    pub replication_role: String,
+
+    /// Address of the current master node (set on slave nodes).
+    #[serde(default)]
+    pub replica_master: String,
+
+    /// Unix timestamp of last confirmed heartbeat from master (slave nodes only).
+    #[serde(default)]
+    pub master_last_seen: i64,
+
+    /// Collateral locked by this node when it accepted a hosting deal (slave role).
+    /// Returned when deal expires in good standing; burned on slash or early delete.
+    #[serde(default)]
+    pub collateral_locked_uegoc: u64,
+
+    /// Consecutive PoSt challenges this file has failed.
+    /// Resets to 0 on a successful proof.
+    #[serde(default)]
+    pub proof_strikes: u32,
+
+    /// Unix timestamp until which storage rewards for this file are withheld.
+    /// 0 = not suspended.  Set on strike ≥ 2.
+    #[serde(default)]
+    pub proof_suspended_until: i64,
 }
 
-/// The complete local wallet state, persisted to JSON.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Ledger {
     pub address: String,
+    #[serde(default)]
+    pub mainnet_address: String,
     pub balance_uegoc: u64,
+    #[serde(default)]
+    pub balance_uegusd: u64,
     pub nonce: u64,
     pub transactions: Vec<LedgerTx>,
     pub blocks: Vec<LedgerBlock>,
@@ -274,24 +355,52 @@ pub struct Ledger {
     pub stake_lock_days: u32,
     #[serde(default)]
     pub unstake_at: Option<i64>,
-    /// Registered user name (set during onboarding).
+
+    /// Drive letter chosen by the user for the storage folder, e.g. "C" or "D".
+    /// Empty string = use default data_dir() (same drive as the rest of the app).
+    #[serde(default)]
+    pub storage_drive: String,
+
     #[serde(default)]
     pub registered_name: String,
-    /// Registered email (set during onboarding, used for TX confirmations).
+
     #[serde(default)]
     pub registered_email: String,
-    /// Total uEGOC burned as tx fees by this wallet (lifetime).
+
     #[serde(default)]
     pub total_burned_uegoc: u64,
-    /// Validator slash strike count (0 = clean). Resets after 30 clean days.
+
     #[serde(default)]
     pub slash_strikes: u32,
-    /// Unix timestamp of last slash event (for 30-day reset window).
+
     #[serde(default)]
     pub last_slash_ts: Option<i64>,
-    /// Whether this validator has been permanently banned via slashing.
+
     #[serde(default)]
     pub slash_banned: bool,
+
+    #[serde(default)]
+    pub presale_records: Vec<PresaleIouRecord>,
+
+    /// Random hex token included in contact bundles. Requests using an old
+    /// token are auto-dropped. Rotate with `revoke_contact_bundle`.
+    #[serde(default)]
+    pub bundle_token: String,
+}
+
+/// One pre-sale IOU record — stored locally and included in Genesis Block on mainnet launch.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct PresaleIouRecord {
+    pub id: String,
+    pub mainnet_address: String,
+    pub egoc_amount: f64,
+    pub usd_value: f64,
+    pub pay_symbol: String,
+    pub pay_amount: f64,
+    pub deposit_address: String,
+    pub timestamp: i64,
+    /// "pending_payment" → "confirmed" (updated by bridge relayer)
+    pub status: String,
 }
 
 impl Ledger {
@@ -323,12 +432,11 @@ impl Ledger {
         let block_data = format!("{prev_hash}{tx_hash}{height}{timestamp}");
         let hash = ego_core::hash_data(block_data.as_bytes()).to_hex();
 
-        // Burn any fees from transactions being confirmed in this block
         for tx in self.transactions.iter_mut() {
             if tx.hash == tx_hash && tx.status == "Pending" {
                 tx.status = "Confirmed".to_string();
                 tx.block_height = Some(height);
-                // Accumulate burned fees (100% of tx fee is destroyed)
+
                 self.total_burned_uegoc = self.total_burned_uegoc.saturating_add(tx.fee_uegoc);
             }
         }
@@ -357,15 +465,8 @@ impl Ledger {
     }
 }
 
-const INITIAL_BLOCK_REWARD_UEGOC: u64 = 50_000_000;
-const HALVING_INTERVAL:           u64 = 2_100_000;
-const FAUCET_ADDRESS: &str            = "egot1faucet000000000000000000000000000000000000";
+const FAUCET_ADDRESS: &str = "egot1faucet000000000000000000000000000000000000";
 
-// ── Shared chain (P2P broadcast ledger) ──────────────────────────────────────
-
-/// The single shared blockchain — lives at `EgoDesktop/chain.json`.
-/// Every local wallet reads from and writes to this file, simulating the
-/// "broadcast to all nodes" step in a real P2P network.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SharedChain {
     pub blocks: Vec<LedgerBlock>,
@@ -376,7 +477,6 @@ pub fn chain_path() -> PathBuf {
     base_data_dir().join("chain.json")
 }
 
-/// Directory where contract WASM code and state are stored.
 pub fn contracts_dir() -> PathBuf {
     let dir = base_data_dir().join("contracts");
     let _ = fs::create_dir_all(&dir);
@@ -385,7 +485,7 @@ pub fn contracts_dir() -> PathBuf {
 
 pub const GENESIS_HASH: &str  = "ego00000000000000000000000000000000000000000000000000000000genesis1";
 pub const GENESIS_MINER: &str = "ego1genesis000000000000000000000000000000000000";
-pub const GENESIS_TS: i64     = 1_741_910_400; // 2026-03-14 00:00:00 UTC
+pub const GENESIS_TS: i64     = 1_741_910_400;
 
 pub fn genesis_block() -> LedgerBlock {
     LedgerBlock {
@@ -409,23 +509,29 @@ pub fn load_chain() -> SharedChain {
     crate::chain_db::load_shared_chain()
 }
 
-/// No-op: chain is now persisted by chain_db (SQLite WAL).
-/// Kept for backward-compat call sites that still call save_chain().
-pub fn save_chain(_chain: &SharedChain) -> Result<(), String> {
-    // Chain is persisted directly by chain_db::mine_batch_db().
-    // This stub exists so existing callers compile without changes.
+/// Persist any blocks (and their transactions) that are in `chain` but not yet in chain_db.
+/// Idempotent: blocks already in the DB are skipped.
+pub fn save_chain(chain: &SharedChain) -> Result<(), String> {
+    for block in &chain.blocks {
+        if block.height == 0 { continue; } // genesis is seeded by chain_db init
+        if crate::chain_db::get_block_by_height(block.height).is_some() { continue; }
+        let block_txs: Vec<LedgerTx> = chain
+            .transactions
+            .iter()
+            .filter(|tx| tx.block_height == Some(block.height))
+            .cloned()
+            .collect();
+        crate::chain_db::append_peer_block(block, &block_txs);
+    }
     Ok(())
 }
 
 impl SharedChain {
-    /// Compute the confirmed balance of an address from the chain.
-    /// balance = Σ incoming confirmed txs − Σ outgoing confirmed txs
+
     pub fn balance_of(&self, address: &str) -> u64 {
         crate::chain_db::balance_of(address)
     }
 
-    /// Mine a new block on the shared chain, confirming the given tx and
-    /// "broadcasting" the result to all wallets that read chain.json.
     pub fn mine_block(&mut self, tx_hash: &str, miner: &str) {
         let prev_hash = self
             .blocks
@@ -435,30 +541,6 @@ impl SharedChain {
 
         let height = self.blocks.len() as u64;
         let timestamp = chrono::Utc::now().timestamp();
-
-        // Coinbase TX — miner self-issues the block reward (halving schedule)
-        let era = height / HALVING_INTERVAL;
-        let block_reward = INITIAL_BLOCK_REWARD_UEGOC >> era.min(63);
-        let cb_nonce = self.last_nonce(miner) + 1;
-        let cb_data = format!("coinbase:{miner}:{height}:{block_reward}:{timestamp}");
-        let cb_hash = ego_core::hash_data(cb_data.as_bytes()).to_hex();
-        let coinbase = LedgerTx {
-            hash:                cb_hash.clone(),
-            from:                FAUCET_ADDRESS.into(),
-            to:                  miner.into(),
-            amount:              block_reward,
-            memo:                Some(format!("block reward height={height} era={era}")),
-            timestamp,
-            signature:           String::new(),
-            status:              "Confirmed".to_string(),
-            nonce:               cb_nonce,
-            block_height:        Some(height),
-            public_key_ed25519:  String::new(),
-            dilithium_pubkey:    String::new(),
-            dilithium_signature: String::new(),
-            ..LedgerTx::default()
-        };
-        self.transactions.push(coinbase);
 
         let block_data = format!("{prev_hash}{tx_hash}{height}{timestamp}");
         let hash = ego_core::hash_data(block_data.as_bytes()).to_hex();
@@ -476,10 +558,10 @@ impl SharedChain {
             prev_hash,
             timestamp,
             miner: miner.to_string(),
-            tx_count: 2, // coinbase + user tx
+            tx_count: 1,
             size_bytes: 512,
-            reward: block_reward,
-            coinbase_tx: Some(cb_hash),
+            reward: 0,
+            coinbase_tx: None,
             vote_count: 0,
             tx_merkle_root: String::new(),
             poc_ticket: String::new(),
@@ -487,11 +569,6 @@ impl SharedChain {
         });
     }
 
-    /// Mine one block containing an entire batch of transactions.
-    ///
-    /// This is the high-throughput path used by the mempool batch loop.
-    /// Instead of one block per TX (legacy path), we pack up to 2,000 TXs
-    /// into a single block → one disk write per batch → ~100k TPS.
     pub fn mine_batch(&mut self, txs: &[LedgerTx], miner: &str) -> LedgerBlock {
         let prev_hash  = self.blocks.last()
             .map(|b| b.hash.clone())
@@ -499,14 +576,12 @@ impl SharedChain {
         let height    = self.blocks.len() as u64;
         let timestamp = chrono::Utc::now().timestamp();
 
-        // Block hash = H(prev_hash ‖ all_tx_hashes ‖ height ‖ ts)
         let tx_root: String = txs.iter().map(|t| t.hash.as_str()).collect::<Vec<_>>().join(":");
         let block_data = format!("{prev_hash}:{tx_root}:{height}:{timestamp}");
         let hash = ego_core::hash_data(block_data.as_bytes()).to_hex();
 
-        // Coinbase TX — halving-aware block reward
-        let era          = height / HALVING_INTERVAL;
-        let block_reward = INITIAL_BLOCK_REWARD_UEGOC >> era.min(63);
+        let block_reward = crate::tokenomics::block_reward_at(height);
+        let era          = height / crate::tokenomics::HALVING_INTERVAL;
         let cb_nonce     = self.last_nonce(miner) + 1;
         let cb_data      = format!("coinbase:{miner}:{height}:{block_reward}:{timestamp}");
         let cb_hash      = ego_core::hash_data(cb_data.as_bytes()).to_hex();
@@ -523,10 +598,9 @@ impl SharedChain {
             ..LedgerTx::default()
         });
 
-        // Confirm all TXs in this batch
         let tx_count = txs.len() as u32;
         for tx in txs {
-            // If already in chain (re-broadcast), upgrade status; otherwise insert.
+
             if let Some(existing) = self.transactions.iter_mut().find(|t| t.hash == tx.hash) {
                 existing.status       = "Confirmed".to_string();
                 existing.block_height = Some(height);
@@ -544,7 +618,7 @@ impl SharedChain {
             prev_hash,
             timestamp,
             miner:      miner.to_string(),
-            tx_count:   tx_count + 1, // +1 for coinbase
+            tx_count:   tx_count + 1,
             size_bytes: txs.iter().map(|t| t.hash.len() as u64 + 512).sum(),
             reward:     block_reward,
             coinbase_tx: Some(cb_hash),
@@ -566,16 +640,13 @@ impl SharedChain {
     }
 }
 
-// ── PoC Event log ─────────────────────────────────────────────────────────────
-
-/// A single Proof-of-Coverage beacon event, persisted to poc_events.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PocEvent {
     pub id: u64,
     pub timestamp: i64,
-    pub quality: String,   // "Excellent" | "Good" | "Fair" | "Poor"
-    pub peers: u32,        // witness count
-    pub reward_uegoc: u64, // per-event reward (22_222 ≈ 0.022 EGOC)
+    pub quality: String,
+    pub peers: u32,
+    pub reward_uegoc: u64,
     pub h3_cell: Option<String>,
 }
 
@@ -598,9 +669,6 @@ pub fn save_poc_events(events: &[PocEvent]) -> Result<(), String> {
     crate::utils::atomic_write(&poc_events_path(), data.as_bytes()).map_err(|e| e.to_string())
 }
 
-// ── Canonical signing helpers ─────────────────────────────────────────────────
-
-/// Canonical bytes to sign for a PoC coverage event (must match relay exactly).
 pub fn poc_signing_bytes(address: &str, quality: &str, peers: u32, h3_cell: &str, timestamp: i64) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(b"ego/poc/v1:");
@@ -615,10 +683,6 @@ pub fn poc_signing_bytes(address: &str, quality: &str, peers: u32, h3_cell: &str
     v.extend_from_slice(&timestamp.to_le_bytes());
     v
 }
-
-// ── Per-address nonce store ───────────────────────────────────────────────────
-// Tracks the highest confirmed nonce seen per sender address.
-// Incoming TXs with nonce ≤ last_nonce are replays and are rejected.
 
 use std::sync::Mutex;
 use once_cell::sync::OnceCell;
@@ -652,8 +716,6 @@ fn stake_store() -> std::sync::MutexGuard<'static, HashMap<String, u64>> {
     STAKE_STORE.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
 }
 
-/// Record a staking or unstaking TX being confirmed.
-/// `is_stake=true` adds to staked balance; `false` subtracts.
 pub fn record_validator_stake(addr: &str, amount: u64, is_stake: bool) {
     if addr.is_empty() { return; }
     let mut store = stake_store();
@@ -662,24 +724,18 @@ pub fn record_validator_stake(addr: &str, amount: u64, is_stake: bool) {
     else        { *cur = cur.saturating_sub(amount); }
 }
 
-/// Returns the tracked staked balance (uEGOC) for an address.
 pub fn get_validator_stake(addr: &str) -> u64 {
     *stake_store().get(addr).unwrap_or(&0)
 }
 
-// ── Incoming TX validation ────────────────────────────────────────────────────
-
-/// Validate an incoming peer transaction.
-///
-/// Checks (in order):
-///   1. System / faucet TXs are accepted without a signature.
-///   2. Nonce must be strictly greater than the last confirmed nonce for `from`
-///      (prevents replay attacks).
-///   3. Ed25519 signature over canonical tx bytes must verify against the
-///      sender's public key embedded in the TX.
-///
-/// Returns `Ok(())` on success, `Err(reason)` on rejection.
 pub fn verify_incoming_tx(tx: &LedgerTx) -> Result<(), String> {
+    verify_incoming_tx_with_miner(tx, "")
+}
+
+/// Full verification. When `block_miner` is non-empty, system-address transactions
+/// are only accepted if they are crediting the miner (protocol rewards to self).
+/// This closes the free-mint exploit where any node crafts `from=faucet → to=self`.
+pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result<(), String> {
     const SYSTEM_ADDRS: &[&str] = &[
         "egot1faucet000000000000000000000000000000000000",
         "ego1genesis000000000000000000000000000000000000",
@@ -687,14 +743,48 @@ pub fn verify_incoming_tx(tx: &LedgerTx) -> Result<(), String> {
         "egot1system000000000000000000000000000000000000",
         "egot1coverage0000000000000000000000000000000000",
         "egot1nodereward000000000000000000000000000000000",
+        "egot1collateral000000000000000000000000000000",
+        "egot1slashpool0000000000000000000000000000000",
+        "egot1storagefees000000000000000000000000000000",
+        "egot1burn0000000000000000000000000000000000000",
     ];
 
-    // System / coinbase TXs have no signature — always accept.
-    if SYSTEM_ADDRS.iter().any(|a| *a == tx.from) || tx.from.is_empty() {
+    if tx.from.is_empty() {
         return Ok(());
     }
 
-    // 1. Nonce replay check.
+    if SYSTEM_ADDRS.iter().any(|a| *a == tx.from) {
+        // System-to-system is always fine (e.g. staking contract returning funds).
+        if SYSTEM_ADDRS.iter().any(|a| *a == tx.to) {
+            return Ok(());
+        }
+        // System → user: only accept if the recipient is the block miner (protocol reward).
+        if !block_miner.is_empty() && tx.to != block_miner {
+            return Err(format!(
+                "system tx from {} to {} rejected — recipient is not block miner {}",
+                tx.from, tx.to, block_miner
+            ));
+        }
+        return Ok(());
+    }
+
+    // ── Fee floor ─────────────────────────────────────────────────────────
+    // Reject zero-fee transactions from accounts that haven't staked.
+    // Stakers (≥ MIN_STAKE_FREE_TX_UEGOC) get free transactions as a reward
+    // for securing the network. Everyone else must pay the minimum fee.
+    // This prevents mempool spam: flooding with free txs now costs real money.
+    let staked = get_validator_stake(&tx.from);
+    if staked < crate::tokenomics::MIN_STAKE_FREE_TX_UEGOC
+        && tx.fee_uegoc < crate::tokenomics::FEE_FLOOR_UEGOC
+    {
+        return Err(format!(
+            "tx from {} rejected: fee {} uEGOC below floor {} uEGOC (stake {} to send free)",
+            tx.from, tx.fee_uegoc,
+            crate::tokenomics::FEE_FLOOR_UEGOC,
+            crate::tokenomics::MIN_STAKE_FREE_TX_UEGOC,
+        ));
+    }
+
     let last = last_confirmed_nonce(&tx.from);
     if tx.nonce <= last {
         return Err(format!(
@@ -703,7 +793,6 @@ pub fn verify_incoming_tx(tx: &LedgerTx) -> Result<(), String> {
         ));
     }
 
-    // 2. Ed25519 signature check.
     if tx.public_key_ed25519.is_empty() || tx.signature.is_empty() {
         return Err(format!("missing signature or pubkey in TX from {}", tx.from));
     }
@@ -725,12 +814,51 @@ pub fn verify_incoming_tx(tx: &LedgerTx) -> Result<(), String> {
 
     let msg = tx_signing_bytes(&tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp);
     vk.verify(&msg, &sig)
-        .map_err(|_| format!("signature verification failed for TX from {}", tx.from))?;
+        .map_err(|_| format!("Ed25519 signature verification failed for TX from {}", tx.from))?;
+
+    // ── ML-DSA-44 verification (governance-controlled) ────────────────────
+    // Three states, set by on-chain validator governance votes:
+    //
+    //  1. Default (no vote): verify Dilithium if present, skip if absent.
+    //     Allows old wallets (Ed25519-only) to coexist with new hybrid wallets.
+    //
+    //  2. FEATURE_DILITHIUM_REQUIRED enabled: ALL txs must carry Dilithium.
+    //     Enforced once the network has fully migrated.
+    //
+    //  3. FEATURE_DILITHIUM_DISABLED enabled: skip Dilithium entirely.
+    //     Emergency switch if a vulnerability is found in ML-DSA-44.
+    //     Validators vote → passes threshold → activates at specified block height.
+    let dilithium_disabled = crate::chain_db::is_feature_disabled(
+        crate::chain_db::FEATURE_DILITHIUM_DISABLED,
+    );
+    let dilithium_required = crate::chain_db::is_feature_enabled(
+        crate::chain_db::FEATURE_DILITHIUM_REQUIRED,
+    );
+
+    if dilithium_required && (tx.dilithium_pubkey.is_empty() || tx.dilithium_signature.is_empty()) {
+        return Err(format!(
+            "TX from {} rejected: ML-DSA-44 signature required by network governance",
+            tx.from
+        ));
+    }
+
+    if !dilithium_disabled && !tx.dilithium_pubkey.is_empty() && !tx.dilithium_signature.is_empty() {
+        let dil_pk  = hex::decode(&tx.dilithium_pubkey)
+            .map_err(|_| "invalid dilithium pubkey hex".to_string())?;
+        let dil_sig = hex::decode(&tx.dilithium_signature)
+            .map_err(|_| "invalid dilithium signature hex".to_string())?;
+        let pk  = ego_core::PublicKey::dilithium2(dil_pk);
+        let sig = ego_core::Signature::dilithium2(dil_sig);
+        let valid = ego_core::verify_signature(&pk, &msg, &sig)
+            .map_err(|e| format!("ML-DSA-44 error for TX from {}: {}", tx.from, e))?;
+        if !valid {
+            return Err(format!("ML-DSA-44 signature invalid for TX from {}", tx.from));
+        }
+    }
 
     Ok(())
 }
 
-/// Canonical bytes to sign for a transaction.
 pub fn tx_signing_bytes(from: &str, to: &str, amount: u64, nonce: u64, timestamp: i64) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(b"ego/tx/v1:");

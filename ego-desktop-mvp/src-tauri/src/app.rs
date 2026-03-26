@@ -4,13 +4,12 @@ use std::sync::{Arc, Mutex};
 use ego_core::{Address, KeyPair};
 use std::collections::HashMap;
 
-/// Info about an active peer node seen via P2P PeerAnnounce.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PeerInfo {
     pub address:   String,
     pub name:      String,
     pub endpoint:  String,
-    pub last_seen: i64,   // Unix timestamp
+    pub last_seen: i64,
     #[serde(default)]
     pub city:    Option<String>,
     #[serde(default)]
@@ -24,17 +23,17 @@ pub struct AppState {
     pub is_initialized: Arc<Mutex<bool>>,
     pub settings: Arc<Mutex<AppSettings>>,
     pub cache: Arc<Mutex<AppCache>>,
-    /// Unix timestamp when the current session started (init_wallet was called).
+
     pub session_started: Arc<Mutex<i64>>,
-    /// Unix timestamp of the last time we credited accumulated earnings to the ledger.
+
     pub last_earnings_credit: Arc<Mutex<i64>>,
-    /// Live peers seen via PeerAnnounce P2P messages (keyed by address).
+
     pub peers: Arc<Mutex<HashMap<String, PeerInfo>>>,
-    /// Result of UPnP port mapping attempt: None = pending, Some(Ok) = success, Some(Err) = failed.
+
     pub upnp_status: Arc<Mutex<Option<Result<(), String>>>>,
-    /// Our detected public endpoint (ip:port), set after UPnP attempt.
+
     pub public_endpoint: Arc<Mutex<String>>,
-    /// Contact address whose chat triggered the last notification; consumed on window focus.
+
     pub pending_chat_address: Arc<Mutex<Option<String>>>,
 }
 
@@ -85,14 +84,13 @@ pub struct CoverageStatus {
     pub last_coverage_event: Option<i64>,
     pub is_online: bool,
     pub network_quality: NetworkQuality,
-    /// True when a VPN, proxy, or datacenter IP is detected.
-    /// Coverage rewards are suppressed while this is true.
+
     #[serde(default)]
     pub vpn_detected: bool,
-    /// Reason string shown in the UI when vpn_detected is true.
+
     #[serde(default)]
     pub vpn_reason: String,
-    /// Stable hardware identifier for this machine.
+
     #[serde(default)]
     pub machine_id: String,
 }
@@ -150,10 +148,9 @@ pub struct EarningsData {
     pub drs_multiplier: f64,
     pub reward_breakdown: RewardBreakdown,
     pub pending_rewards: u64,
-    /// When this node session started (unix timestamp). Frontend uses this
-    /// to seed the live per-second earnings counter.
+
     pub session_started: i64,
-    /// Whether coverage (PoC beacon) is active this session.
+
     pub coverage_online: bool,
 }
 
@@ -234,7 +231,6 @@ impl AppState {
         peers.insert(info.address.clone(), info);
     }
 
-
     pub fn get_active_peers(&self, window_secs: i64) -> Vec<PeerInfo> {
         let peers  = self.peers.lock().unwrap();
         let cutoff = chrono::Utc::now().timestamp() - window_secs;
@@ -244,11 +240,6 @@ impl AppState {
             .collect()
     }
 
-    /// Remove peers from the in-memory map that are:
-    ///   - NOT in `active_addresses` (i.e. not currently registered on the relay)
-    ///   - AND whose last direct P2P contact was more than `p2p_cutoff` seconds ago
-    ///
-    /// Called after every relay fetch so ghost peers vanish quickly.
     pub fn cleanup_stale_peers(
         &self,
         active_addresses: &std::collections::HashSet<String>,
@@ -260,7 +251,6 @@ impl AppState {
         });
     }
 
-    /// Record the session start time and reset the earnings credit clock.
     pub fn set_session_start(&self, ts: i64) {
         *self.session_started.lock().unwrap() = ts;
         *self.last_earnings_credit.lock().unwrap() = ts;
@@ -308,7 +298,6 @@ impl AppState {
         let mut cache = self.cache.lock().unwrap();
         cache.transaction_history.insert(0, transaction);
 
-        // Keep only the last 100 transactions in memory
         if cache.transaction_history.len() > 100 {
             cache.transaction_history.truncate(100);
         }

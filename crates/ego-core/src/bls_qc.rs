@@ -1,47 +1,29 @@
-//! Compact BLS-based Quorum Certificate for ego-blockchain validator votes.
-//!
-//! ## Size comparison
-//! | Scheme     | Per-validator | 100 validators |
-//! |------------|---------------|----------------|
-//! | Dilithium-2 | 2420 B       | 242,000 B      |
-//! | BLS (this) | 48 B pubkey   | 4,896 B total  |
-//!
-//! The `agg_signature` field is always 96 bytes regardless of quorum size.
-//! Total QC size: 48*n + 96 + ceil(n/8) + 48 (fixed fields) bytes.
-
 use crate::bls::{BlsAggregateSignature, BlsError, BlsKeypair, BlsSignature};
 use blst::min_pk::PublicKey;
 use chrono::Utc;
 
-/// Compact Quorum Certificate using BLS12-381 signature aggregation.
-///
-/// Replaces the Dilithium-based `QuorumCertificate` for validator votes.
-/// The `agg_signature` covers `vote_msg(block_hash, height, epoch, round)`.
 #[derive(Debug, Clone)]
 pub struct BlsQuorumCertificate {
-    /// Hash of the block being certified (32 bytes).
+
     pub block_hash: [u8; 32],
-    /// Block height.
+
     pub height: u64,
-    /// Epoch number.
+
     pub epoch: u64,
-    /// Round within the epoch.
+
     pub round: u32,
-    /// BLS public keys of the validators who voted (48 bytes each).
+
     pub voter_pubkeys: Vec<[u8; 48]>,
-    /// Compact bitmap: bit `i` is 1 iff validator[i] voted.
-    /// Length = ceil(total_validators / 8).
+
     pub voter_bitmap: Vec<u8>,
-    /// Aggregated BLS signature over `vote_msg()` — always 96 bytes.
+
     pub agg_signature: [u8; 96],
-    /// Wall-clock time when the QC was formed (milliseconds since UNIX epoch).
+
     pub formed_at_ms: i64,
 }
 
 impl BlsQuorumCertificate {
-    /// Canonical message that every voter signs.
-    ///
-    /// Format: `"ego/bls/vote/v1:" || block_hash || height_le || epoch_le || round_le`
+
     pub fn vote_msg(block_hash: &[u8; 32], height: u64, epoch: u64, round: u32) -> Vec<u8> {
         let mut msg = b"ego/bls/vote/v1:".to_vec();
         msg.extend_from_slice(block_hash);
@@ -51,12 +33,6 @@ impl BlsQuorumCertificate {
         msg
     }
 
-    /// Form a QC from a set of validator keypairs.
-    ///
-    /// `keypairs` is a slice of `(&BlsKeypair, validator_index)` tuples.
-    /// `total_validators` is the full committee size (used to size `voter_bitmap`).
-    ///
-    /// Returns `Err` if `keypairs` is empty or aggregation fails.
     pub fn form(
         block_hash: [u8; 32],
         height: u64,
@@ -71,11 +47,9 @@ impl BlsQuorumCertificate {
 
         let msg = Self::vote_msg(&block_hash, height, epoch, round);
 
-        // Collect per-voter signatures and public key bytes
         let mut sigs: Vec<BlsSignature> = Vec::with_capacity(keypairs.len());
         let mut voter_pubkeys: Vec<[u8; 48]> = Vec::with_capacity(keypairs.len());
 
-        // Build bitmap
         let bitmap_len = total_validators.div_ceil(8);
         let mut voter_bitmap = vec![0u8; bitmap_len];
 
@@ -88,7 +62,7 @@ impl BlsQuorumCertificate {
             }
             sigs.push(kp.sign(&msg));
             voter_pubkeys.push(kp.public_key_bytes());
-            // Set the bit for this validator
+
             voter_bitmap[idx / 8] |= 1 << (idx % 8);
         }
 
@@ -106,20 +80,16 @@ impl BlsQuorumCertificate {
         })
     }
 
-    /// Verify the QC: deserialize the aggregate signature and check it against
-    /// all `voter_pubkeys` over `vote_msg()`.
     pub fn verify(&self) -> bool {
         if self.voter_pubkeys.is_empty() {
             return false;
         }
 
-        // Deserialize aggregate signature
         let agg_sig = match BlsSignature::from_bytes(&self.agg_signature) {
             Ok(s) => s,
             Err(_) => return false,
         };
 
-        // Deserialize all public keys
         let mut pubkeys: Vec<PublicKey> = Vec::with_capacity(self.voter_pubkeys.len());
         for pk_bytes in &self.voter_pubkeys {
             match PublicKey::uncompress(pk_bytes) {
@@ -132,23 +102,15 @@ impl BlsQuorumCertificate {
         BlsAggregateSignature::verify_aggregate(&agg_sig, &pubkeys, &msg)
     }
 
-    /// Number of validators who voted (count of set bits in the bitmap).
     pub fn voter_count(&self) -> usize {
         self.voter_pubkeys.len()
     }
 
-    /// Estimated serialized size in bytes.
-    ///
-    /// = 32 (block_hash) + 8 (height) + 8 (epoch) + 4 (round)
-    ///   + 48 * n (voter_pubkeys) + ceil(n/8) (bitmap)
-    ///   + 96 (agg_signature) + 8 (formed_at_ms)
     pub fn byte_size(&self) -> usize {
         let n = self.voter_pubkeys.len();
         32 + 8 + 8 + 4 + 48 * n + self.voter_bitmap.len() + 96 + 8
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -215,7 +177,7 @@ mod tests {
 
     #[test]
     fn test_qc_bitmap_correctness() {
-        // Only validators 0, 2, 4 vote in a 5-validator set
+
         let block_hash = [0x11u8; 32];
         let keypairs: Vec<BlsKeypair> = (0..5u8)
             .map(|i| {
@@ -230,7 +192,7 @@ mod tests {
             (&keypairs[4], 4),
         ];
         let qc = BlsQuorumCertificate::form(block_hash, 1, 0, 0, &pairs, 5).unwrap();
-        // Bit 0, 2, 4 should be set; bits 1, 3 should be 0
+
         assert_eq!(qc.voter_bitmap[0] & 0b00000001, 0b00000001, "bit 0");
         assert_eq!(qc.voter_bitmap[0] & 0b00000010, 0b00000000, "bit 1 must be 0");
         assert_eq!(qc.voter_bitmap[0] & 0b00000100, 0b00000100, "bit 2");
@@ -242,7 +204,7 @@ mod tests {
     #[test]
     fn test_qc_tampered_block_hash_fails() {
         let (mut qc, _) = make_qc(5);
-        qc.block_hash[0] ^= 0xff; // flip byte
+        qc.block_hash[0] ^= 0xff;
         assert!(!qc.verify(), "tampered block_hash must fail verification");
     }
 
@@ -256,9 +218,9 @@ mod tests {
     #[test]
     fn test_qc_tampered_agg_signature_fails() {
         let (mut qc, _) = make_qc(5);
-        // Corrupt the aggregate signature
+
         qc.agg_signature[0] ^= 0x01;
-        // The deserialization may or may not succeed, but verify() must return false
+
         let result = qc.verify();
         assert!(!result, "corrupted agg_signature must fail");
     }
@@ -266,7 +228,7 @@ mod tests {
     #[test]
     fn test_qc_wrong_pubkey_fails() {
         let (mut qc, _) = make_qc(5);
-        // Replace first pubkey with a random one
+
         let interloper = {
             let mut s = [0xffu8; 32];
             s[0] = 0x77;
@@ -278,12 +240,11 @@ mod tests {
 
     #[test]
     fn test_qc_vote_msg_domain_separation() {
-        // Two different QCs for different block hashes must produce different messages
+
         let msg1 = BlsQuorumCertificate::vote_msg(&[0u8; 32], 1, 0, 0);
         let msg2 = BlsQuorumCertificate::vote_msg(&[1u8; 32], 1, 0, 0);
         assert_ne!(msg1, msg2);
 
-        // Different heights
         let msg3 = BlsQuorumCertificate::vote_msg(&[0u8; 32], 2, 0, 0);
         assert_ne!(msg1, msg3);
     }
@@ -293,7 +254,7 @@ mod tests {
         let mut s = [0u8; 32];
         s[0] = 7;
         let kp = BlsKeypair::from_seed(&s);
-        let pairs = vec![(&kp, 10usize)]; // index 10 with total_validators=5
+        let pairs = vec![(&kp, 10usize)];
         let result = BlsQuorumCertificate::form([0u8; 32], 0, 0, 0, &pairs, 5);
         assert!(result.is_err());
     }

@@ -999,7 +999,7 @@ impl FraudProofVerifier {
                 pre_state,
                 post_state,
                 expected_post_state,
-                execution_trace: _, // Add this line
+                execution_trace: _,
                 transaction_batch,
                 intermediate_states,
                 account_proofs,

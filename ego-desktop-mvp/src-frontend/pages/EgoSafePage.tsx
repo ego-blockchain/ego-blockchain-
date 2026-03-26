@@ -5,6 +5,7 @@ import { listen } from '@tauri-apps/api/event';
 import { useNavigate } from 'react-router-dom';
 import { useWallet } from '../App';
 import { useConfirm } from '../hooks/useConfirm';
+import Pagination from '../components/Pagination';
 
 interface Contact {
   address: string;
@@ -12,8 +13,6 @@ interface Contact {
   status: string;
   endpoint: string;
 }
-
-// ── Types ─────────────────────────────────────────────────────────────────────
 
 interface StoredFile {
   cid: string;
@@ -50,8 +49,6 @@ interface SelectedContact {
   name: string;
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
 function fmtBytes(b: number) {
   if (b >= 1e9) return (b / 1e9).toFixed(1) + ' GB';
   if (b >= 1e6) return (b / 1e6).toFixed(1) + ' MB';
@@ -59,10 +56,8 @@ function fmtBytes(b: number) {
   return b + ' B';
 }
 
-function buildShareBundle(file: StoredFile, ownerAddress: string): string {
-  const name64 = btoa(unescape(encodeURIComponent(file.name)));
-  return `egoshare1:${file.cid}:${file.key_nonce_hex}:${name64}:${ownerAddress}`;
-}
+// buildShareBundle removed — key is DPAPI-protected server-side.
+// Use create_public_share (egoshare1) or create_secure_share (egoshare2) commands instead.
 
 const VIDEO_EXTS = ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.m4v', '.flv', '.wmv', '.ts', '.mpg', '.mpeg'];
 
@@ -71,12 +66,7 @@ function isVideoFile(name: string): boolean {
   return VIDEO_EXTS.some(ext => lower.endsWith(ext));
 }
 
-// ── EgoSafe share-new-file flow ───────────────────────────────────────────────
-
 type ShareStep = 'idle' | 'select' | 'recipients' | 'sharing' | 'done';
-
-
-// ── Component ─────────────────────────────────────────────────────────────────
 
 const EgoSafePage: React.FC = () => {
   const { wallet } = useWallet();
@@ -84,8 +74,14 @@ const EgoSafePage: React.FC = () => {
   const { confirm, ConfirmDialog } = useConfirm();
   const navigate   = useNavigate();
 
-  // ── Share-new-file flow state ──────────────────────────────────────────────
   const [shared, setShared]           = useState<SharedFile[]>([]);
+
+  const [storedPage, setStoredPage]   = useState(1);
+  const [storedPageSize, setStoredPageSize] = useState(25);
+  const [recvPage, setRecvPage]       = useState(1);
+  const [recvPageSize, setRecvPageSize] = useState(25);
+  const [sharedPage, setSharedPage]   = useState(1);
+  const [sharedPageSize, setSharedPageSize] = useState(25);
   const [step, setStep]               = useState<ShareStep>('idle');
   const [fileName, setFileName]       = useState('');
   const [filePath, setFilePath]       = useState('');
@@ -94,30 +90,27 @@ const EgoSafePage: React.FC = () => {
   const [resultCid, setResultCid]     = useState('');
   const [shareError, setShareError]   = useState('');
 
-  // ── Share stored file state ────────────────────────────────────────────────
   const [storedFiles, setStoredFiles]       = useState<StoredFile[]>([]);
   const [receivedFiles, setReceivedFiles]   = useState<StoredFile[]>([]);
   const [shareTarget, setShareTarget]       = useState<StoredFile | null>(null);
-  const [copiedCid, setCopiedCid]           = useState<string | null>(null);
-
-  // ── Send to contact state ──────────────────────────────────────────────────
   const [contacts, setContacts]             = useState<Contact[]>([]);
   const [sendTarget, setSendTarget]         = useState<StoredFile | null>(null);
   const [sending, setSending]               = useState(false);
   const [sendMsg, setSendMsg]               = useState('');
   const [sentToContact, setSentToContact]   = useState<Contact | null>(null);
 
-  // ── Import shared file state ───────────────────────────────────────────────
   const [showImport, setShowImport]   = useState(false);
   const [importBundle, setImportBundle] = useState('');
   const [importing, setImporting]     = useState(false);
   const [importMsg, setImportMsg]     = useState('');
 
-  // ── Preview modal state ────────────────────────────────────────────────────
   const [previewFile, setPreviewFile] = useState<StoredFile | null>(null);
   const [preview, setPreview]         = useState<{ name: string; mime_type: string; data_base64: string; size_bytes: number; previewable: boolean } | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
 
+  // CIDs currently being transferred — force ⏳ even if backend already flipped local_path
+  // (guards against React 18 batching collapsing file-receiving + file-downloaded into one render)
+  const [pendingCids, setPendingCids] = useState<Set<string>>(new Set());
 
 useEffect(() => {
   loadStoredFiles();
@@ -125,14 +118,42 @@ useEffect(() => {
     .then(cs => setContacts(cs.filter(c => c.status === 'approved')))
     .catch(() => {});
   const unlistenMsg      = listen('ego://message-received',  () => { loadStoredFiles(); });
-  const unlistenDl       = listen('ego://file-downloaded',   () => { loadStoredFiles(); });
-  const unlistenFailed   = listen('ego://file-failed',       () => { loadStoredFiles(); });
+const unlistenDl = listen<{ cid?: string }>('ego://file-downloaded', async (e) => {
+  const cid = e.payload?.cid;
+  if (cid) {
+    // Re-fetch to check if truly ready before clearing pending state
+    try {
+      const files = await invoke<StoredFile[]>('get_stored_files');
+      const f = files.find(x => x.cid === cid);
+      const blocksDone = f && f.cid.startsWith('egomfd1')
+        ? f.blocks_total > 0 && f.blocks_received >= f.blocks_total
+        : true;
+      if (blocksDone) {
+        setPendingCids(prev => { const s = new Set(prev); s.delete(cid); return s; });
+      }
+    } catch {
+      setPendingCids(prev => { const s = new Set(prev); s.delete(cid); return s; });
+    }
+  }
+  loadStoredFiles();
+});
+  const unlistenFailed   = listen<{ cid?: string }>('ego://file-failed', (e) => {
+    const cid = e.payload?.cid;
+    if (cid) setPendingCids(prev => { const s = new Set(prev); s.delete(cid); return s; });
+    loadStoredFiles();
+  });
   const unlistenProgress = listen('ego://block-progress',    () => { loadStoredFiles(); });
+  const unlistenRecv     = listen<{ cid?: string }>('ego://file-receiving', (e) => {
+    const cid = e.payload?.cid;
+    if (cid) setPendingCids(prev => new Set([...prev, cid]));
+    loadStoredFiles();
+  });
   return () => {
     unlistenMsg.then(fn => fn());
     unlistenDl.then(fn => fn());
     unlistenFailed.then(fn => fn());
     unlistenProgress.then(fn => fn());
+    unlistenRecv.then(fn => fn());
   };
 }, []);
 
@@ -140,35 +161,30 @@ useEffect(() => {
     try {
       const files = await invoke<StoredFile[]>('get_stored_files');
       setStoredFiles(files.filter(f => f.status === 'Active'));
-      setReceivedFiles(files.filter(f => f.status === 'Received' || f.status === 'Failed'));
+      setReceivedFiles(files.filter(f => f.status === 'Pending' || f.status === 'Failed' || f.status === 'Received'));
     } catch {}
   }
 
-  // ── Import handler ─────────────────────────────────────────────────────────
-
   async function handleImport() {
     const trimmed = importBundle.trim();
-    const parts = trimmed.split(':');
-    if (parts.length < 5 || parts[0] !== 'egoshare1') {
-      setImportMsg('Invalid bundle. Expected: egoshare1:cid:key:name64:from_address');
+    const parts   = trimmed.split(':');
+
+    if (parts[0] !== 'egoshare1' || parts.length < 5) {
+      setImportMsg('Invalid bundle. Expected egoshare1:…');
       return;
     }
-    const [, cid, key_nonce_hex, name64, from_address] = parts;
-    let display_name = cid.slice(0, 12);
-    try { display_name = decodeURIComponent(escape(atob(name64))); } catch {}
+
     setImporting(true);
     setImportMsg('');
+
     try {
-      await invoke('import_shared_file', {
-        bundle: { cid, key_nonce_hex, display_name, from_address },
-      });
-      // Trigger FileRequest so the sender delivers the actual file data.
-      // Fire-and-forget — ignore errors (sender may be offline, will retry later).
-      invoke('request_file_from_contact', {
-        cid,
-        fromAddr: from_address,
-        content: trimmed,
-      }).catch(() => {});
+      const [, cid, key_nonce_hex, name64, from_address] = parts;
+      let display_name = cid.slice(0, 12);
+      try { display_name = decodeURIComponent(escape(atob(name64))); } catch {}
+      setPendingCids(prev => new Set([...prev, cid]));
+      await invoke('import_shared_file', { bundle: { cid, key_nonce_hex, display_name, from_address } });
+
+      invoke('request_file_from_contact', { cid, fromAddr: from_address, content: trimmed }).catch(() => {});
       setImportMsg('File imported — requesting from sender…');
       await loadStoredFiles();
       setTimeout(() => { setShowImport(false); setImportBundle(''); setImportMsg(''); }, 2000);
@@ -179,36 +195,26 @@ useEffect(() => {
     }
   }
 
-  // ── Copy bundle helper ─────────────────────────────────────────────────────
-
-  function copyBundle(file: StoredFile) {
-    navigator.clipboard.writeText(buildShareBundle(file, myAddress));
-    setCopiedCid(file.cid);
-    setTimeout(() => setCopiedCid(null), 2000);
-  }
-
   async function sendToContact(contact: Contact) {
     if (!sendTarget) return;
     setSending(true);
     setSendMsg('');
     setSentToContact(null);
-    const bundle = buildShareBundle(sendTarget, myAddress);
     try {
+      const bundle = await invoke<string>('create_public_share', { cid: sendTarget.cid });
       await invoke('send_message', {
         contactAddr: contact.address,
         content: bundle,
         messageType: 'file_bundle',
       });
       setSentToContact(contact);
-      setSendMsg(`✓ Sent to ${contact.name}!`);
+      setSendMsg(`✓ Sent to ${contact.name}`);
     } catch (e: any) {
       setSendMsg('✕ ' + String(e));
     } finally {
       setSending(false);
     }
   }
-
-  // ── Share-new-file flow helpers ────────────────────────────────────────────
 
   async function startShare() {
     if (!filePath || selectedContacts.length === 0) return;
@@ -218,8 +224,7 @@ useEffect(() => {
       const result = await invoke<StoreFileResult>('store_file', {
         request: { file_path: filePath, duration_months: 1 },
       });
-      const name64 = btoa(unescape(encodeURIComponent(result.name)));
-      const bundle = `egoshare1:${result.cid}:${result.key_nonce_hex}:${name64}:${myAddress}`;
+      const bundle = await invoke<string>('create_public_share', { cid: result.cid });
       for (const c of selectedContacts) {
         await invoke('send_message', {
           contactAddr: c.address,
@@ -252,13 +257,11 @@ useEffect(() => {
     setShareError('');
   }
 
-  // ── Render ─────────────────────────────────────────────────────────────────
-
   return (
     <div className="p-6 space-y-5 max-w-4xl mx-auto">
       {ConfirmDialog}
 
-      {/* Header */}
+      {}
       <div className="bg-gradient-to-br from-purple-700 to-blue-700 rounded-2xl p-5">
         <div className="flex items-center gap-3 mb-2">
           <div className="text-3xl">🔐</div>
@@ -274,7 +277,7 @@ useEffect(() => {
         </div>
       </div>
 
-      {/* ── Share a new file (encrypt + per-recipient envelopes) ─────────── */}
+      {}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="flex justify-between items-center px-5 py-4 border-b border-gray-700">
           <h3 className="font-semibold">Share a New File</h3>
@@ -306,12 +309,12 @@ useEffect(() => {
                     if (typeof p === 'string') {
                       try {
                         const { size } = await invoke<{ size: number }>('get_file_metadata', { path: p });
-                        if (size > 50 * 1024 * 1024) {
-                          alert(`This file is ${(size / 1024 / 1024).toFixed(1)}MB. Maximum file size is 50MB.`);
+                        if (size > 250 * 1024 * 1024) {
+                          alert(`This file is ${(size / 1024 / 1024).toFixed(1)} MB. Maximum file size is 250 MB.`);
                           return;
                         }
                       } catch (_) {
-                        // Can't check size — proceed and let backend enforce
+
                       }
                       setFilePath(p);
                       setFileName(p.split(/[/\\]/).pop() ?? p);
@@ -340,13 +343,13 @@ useEffect(() => {
                 >
                   <span className="text-4xl">📂</span>
                   <span className="text-sm text-gray-400 group-hover:text-white transition">Click to choose a file</span>
-                  <span className="text-xs text-gray-600">Any file type supported</span>
+                  <span className="text-xs text-gray-600">Any file type · max 250 MB</span>
                 </button>
               )}
               <div className="flex items-start gap-2 bg-gray-700/50 border border-gray-600 rounded-xl px-4 py-3">
                 <span className="text-gray-400 shrink-0 mt-0.5">ℹ️</span>
                 <div className="text-xs text-gray-300 leading-relaxed">
-                  Maximum file size is <strong>50MB</strong>. Files larger than 50MB cannot be shared.
+                  Maximum file size is <strong>250 MB</strong>. Larger files cannot be shared.
                 </div>
               </div>
               <button
@@ -354,12 +357,12 @@ useEffect(() => {
                 onClick={async () => {
                   try {
                     const stat = await invoke<{ size: number }>('get_file_metadata', { path: filePath });
-                    if (stat.size > 50 * 1024 * 1024) {
-                      alert(`This file is ${(stat.size / 1024 / 1024).toFixed(1)}MB. Maximum file size is 50MB.`);
+                    if (stat.size > 250 * 1024 * 1024) {
+                      alert(`This file is ${(stat.size / 1024 / 1024).toFixed(1)} MB. Maximum file size is 250 MB.`);
                       return;
                     }
                   } catch (_) {
-                    // Can't check size — proceed and let backend enforce
+
                   }
                   setStep('recipients');
 }}
@@ -465,7 +468,7 @@ useEffect(() => {
         </div>
       </div>
 
-      {/* ── Share a stored file (bundle from Storage) ────────────────────── */}
+      {}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-700">
           <div>
@@ -482,12 +485,9 @@ useEffect(() => {
             <div className="text-xs mt-1 text-gray-600">Store a file in the Storage tab first</div>
           </div>
         ) : (
+          <>
           <div className="divide-y divide-gray-700/50">
-            {storedFiles.map(file => {
-              const bundle  = buildShareBundle(file, myAddress);
-              const isOpen  = shareTarget?.cid === file.cid;
-              const isCopied = copiedCid === file.cid;
-              return (
+            {storedFiles.slice((storedPage - 1) * storedPageSize, storedPage * storedPageSize).map(file => (
                 <div key={file.cid} className="px-5 py-4">
                   <div className="flex items-center justify-between gap-4">
                     <div className="min-w-0 flex-1">
@@ -514,22 +514,6 @@ useEffect(() => {
                         👁 View
                       </button>
                       <button
-                        onClick={() => setShareTarget(isOpen ? null : file)}
-                        className="text-xs bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded-lg transition"
-                      >
-                        {isOpen ? 'Hide' : 'Show'}
-                      </button>
-                      <button
-                        onClick={() => copyBundle(file)}
-                        className={`text-xs px-3 py-1.5 rounded-lg transition font-medium ${
-                          isCopied
-                            ? 'bg-green-600 text-white'
-                            : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
-                        }`}
-                      >
-                        {isCopied ? '✓ Copied' : '📋 Copy'}
-                      </button>
-                      <button
                         onClick={() => { setSendTarget(file); setSendMsg(''); }}
                         className="text-xs bg-purple-600/20 hover:bg-purple-600/40 text-purple-400 px-3 py-1.5 rounded-lg transition font-medium"
                       >
@@ -550,25 +534,15 @@ useEffect(() => {
                     </div>
                   </div>
 
-                  {isOpen && (
-                    <div className="mt-3 space-y-2">
-                      <div className="bg-gray-900 rounded-xl p-3 font-mono text-xs text-blue-300 break-all select-all">
-                        {bundle}
-                      </div>
-                      <div className="text-xs text-yellow-400">
-                        ⚠️ This bundle contains the decryption key. Only share with trusted users.
-                      </div>
-                    </div>
-                  )}
                 </div>
-              );
-            })}
+            ))}
           </div>
+          <Pagination total={storedFiles.length} page={storedPage} pageSize={storedPageSize} onPage={setStoredPage} onPageSize={ps => { setStoredPageSize(ps); setStoredPage(1); }} />
+          </>
         )}
       </div>
 
-
-{/* ── Received Files ───────────────────────────────────────────────── */}
+{}
 {receivedFiles.length > 0 && (
   <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
     <div className="flex items-center justify-between px-5 py-4 border-b border-gray-700">
@@ -579,13 +553,18 @@ useEffect(() => {
       <button onClick={loadStoredFiles} className="text-xs text-gray-400 hover:text-white transition">↻ Refresh</button>
     </div>
     <div className="divide-y divide-gray-700/50">
-      {receivedFiles.map(file => {
-        const isFailed   = file.status === 'Failed';
-        const isBlocks   = file.blocks_total > 0;
-        const blocksReady = isBlocks && file.blocks_received >= file.blocks_total;
-        const isReady    = (!isBlocks && !!file.local_path && !file.local_path.startsWith('sender:') && !isFailed)
-                        || blocksReady;
-        const blockPct   = isBlocks ? Math.round((file.blocks_received / file.blocks_total) * 100) : 0;
+      {receivedFiles.slice((recvPage - 1) * recvPageSize, recvPage * recvPageSize).map(file => {
+        const isFailed  = file.status === 'Failed';
+        const isPending = file.status === 'Pending';
+
+        const isBlocks    = file.cid.startsWith('egomfd1');
+        const blocksReady = isBlocks && file.blocks_total > 0 && file.blocks_received >= file.blocks_total;
+        const backendReady = !isPending && !isFailed && (
+          (!isBlocks && !!file.local_path && !file.local_path.startsWith('sender:'))
+          || blocksReady
+        );
+        const isReady = backendReady && !pendingCids.has(file.cid);
+        const blockPct = isBlocks && file.blocks_total > 0 ? Math.round((file.blocks_received / file.blocks_total) * 100) : 0;
         return (
           <div key={file.cid} className="px-5 py-4">
             <div className="flex items-center gap-4">
@@ -628,7 +607,7 @@ useEffect(() => {
                     <button
                       onClick={async () => {
                         const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
-                        const isLarge = file.encrypted_size > 50 * 1024 * 1024;
+                        const isLarge = file.encrypted_size > 4 * 1024 * 1024 * 1024;
                         if (isLarge || ['mp4','mkv','avi','mov','webm','pdf','wav','mp3'].includes(ext)) {
                           try {
                             const path = await invoke<string>('download_stored_file', { cid: file.cid });
@@ -653,14 +632,14 @@ useEffect(() => {
                 ) : isFailed ? (
                   <button
                     onClick={async () => {
-                      // Extract sender address from local_path ("sender:{addr}") if available
+
                       const fromAddr = file.local_path.startsWith('sender:')
                         ? file.local_path.slice(7)
                         : '';
                       if (fromAddr) {
                         const name64 = btoa(unescape(encodeURIComponent(file.name)));
                         const bundle = `egoshare1:${file.cid}:${file.key_nonce_hex}:${name64}:${fromAddr}`;
-                        // Reset status to Received so it shows "Incoming…" again
+
                         try {
                           await invoke('request_file_from_contact', {
                             cid: file.cid,
@@ -670,7 +649,7 @@ useEffect(() => {
                           await loadStoredFiles();
                         } catch (e: any) { alert('Retry failed: ' + String(e)); }
                       } else {
-                        // No sender info — just remove the failed entry
+
                         try {
                           await invoke('delete_stored_file', { cid: file.cid });
                           await loadStoredFiles();
@@ -710,10 +689,11 @@ useEffect(() => {
         );
       })}
     </div>
+    <Pagination total={receivedFiles.length} page={recvPage} pageSize={recvPageSize} onPage={setRecvPage} onPageSize={ps => { setRecvPageSize(ps); setRecvPage(1); }} />
   </div>
 )}
 
-      {/* ── Import Shared File ───────────────────────────────────────────── */}
+      {}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-700">
           <div>
@@ -731,14 +711,14 @@ useEffect(() => {
         {showImport && (
           <div className="p-5 space-y-4">
             <div className="text-sm text-gray-400">
-              Paste the <span className="font-mono text-blue-400">egoshare1:…</span> bundle you received. The file will be added to your Storage with the decryption key.
+              Paste the <span className="font-mono text-blue-400">egoshare1:…</span> or <span className="font-mono text-purple-400">egoshare2:…</span> bundle you received. <span className="text-purple-400">egoshare2</span> bundles are Kyber-encrypted — only you can open them.
             </div>
             <textarea
               value={importBundle}
               onChange={e => setImportBundle(e.target.value)}
               rows={3}
               className="w-full bg-gray-900 border border-gray-700 focus:border-purple-500 rounded-xl px-4 py-3 text-xs font-mono outline-none transition resize-none"
-              placeholder="egoshare1:egocid1…:key…:name…:ego1from…"
+              placeholder="egoshare1:… or egoshare2:…"
             />
             {importMsg && (
               <div className={`text-xs px-3 py-2 rounded-lg ${
@@ -765,13 +745,13 @@ useEffect(() => {
         )}
       </div>
 
-    {/* ── Recently shared (EgoSafe encrypt+share) ─────────────────────── */}
+    {}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="px-5 py-4 border-b border-gray-700">
           <h3 className="font-semibold">Recently Shared ({shared.length})</h3>
         </div>
         <div className="divide-y divide-gray-700/50">
-          {shared.map(file => (
+          {shared.slice((sharedPage - 1) * sharedPageSize, sharedPage * sharedPageSize).map(file => (
             <div key={file.id} className="px-5 py-4">
               <div className="flex items-start justify-between">
                 <div className="min-w-0">
@@ -789,9 +769,10 @@ useEffect(() => {
             </div>
           ))}
         </div>
+        <Pagination total={shared.length} page={sharedPage} pageSize={sharedPageSize} onPage={setSharedPage} onPageSize={ps => { setSharedPageSize(ps); setSharedPage(1); }} />
       </div>
 
-      {/* ── File Preview Modal ───────────────────────────────────────── */}
+      {}
       {previewFile && (
         <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
           <div className="bg-gray-800 rounded-2xl w-full max-w-2xl border border-gray-700 shadow-2xl max-h-[90vh] flex flex-col">
@@ -829,7 +810,6 @@ useEffect(() => {
         </div>
       )}
 
-      {/* ── Send to Contact modal ─────────────────────────────────────── */}
       {sendTarget && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
           <div className="bg-gray-800 rounded-2xl w-full max-w-sm border border-gray-700 shadow-2xl">

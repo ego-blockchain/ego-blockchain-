@@ -14,12 +14,12 @@ import EarningsPage from './pages/EarningsPage';
 import StakingPage from './pages/StakingPage';
 import ExplorerPage from './pages/ExplorerPage';
 import SettingsPage from './pages/SettingsPage';
+import MarketPage from './pages/MarketPage';
 import MessengerPage from './pages/MessengerPage';
 import ContractsPage from './pages/ContractsPage';
 import IDEPage from './pages/IDEPage';
+import GovernancePage from './pages/GovernancePage';
 import RegistrationFlow from './components/RegistrationFlow';
-
-// ── Theme context ─────────────────────────────────────────────────────────────
 
 type Theme = 'dark' | 'light';
 
@@ -36,8 +36,6 @@ export const ThemeContext = createContext<ThemeCtx>({
 export function useTheme() {
   return useContext(ThemeContext);
 }
-
-// ── Wallet context ────────────────────────────────────────────────────────────
 
 export interface WalletInfo {
   address: string;
@@ -81,8 +79,6 @@ export function useWallet() {
   return useContext(WalletContext);
 }
 
-// ── Terms consent gate ────────────────────────────────────────────────────────
-
 const CONSENT_KEY = 'ego-terms-agreed-v1';
 
 const ConsentGate: React.FC<{ onAccept: () => void }> = ({ onAccept }) => {
@@ -91,23 +87,21 @@ const ConsentGate: React.FC<{ onAccept: () => void }> = ({ onAccept }) => {
   return (
     <div className="min-h-screen bg-gray-900 flex items-center justify-center p-6">
       <div className="w-full max-w-md bg-gray-800 rounded-2xl shadow-2xl overflow-hidden">
-        {/* Header */}
+        {}
         <div className="px-8 py-6 border-b border-gray-700 text-center">
-          <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-2xl font-black mx-auto mb-3">
-            E
-          </div>
+          <img src="/ego_logo.png" alt="Ego" className="w-20 h-20 mx-auto mb-3 select-none rounded-full" draggable={false} />
           <h1 className="text-xl font-bold text-white">Welcome to Ego Desktop</h1>
           <p className="text-sm text-gray-400 mt-1">Quantum-Safe Blockchain Node</p>
         </div>
 
-        {/* Body */}
+        {}
         <div className="px-8 py-6 space-y-5">
           <p className="text-sm text-gray-300 leading-relaxed">
             Before continuing, please read and agree to the Ego Blockchain legal documents below.
             By installing and using this software you agree to be bound by these terms.
           </p>
 
-          {/* Links */}
+          {}
           <div className="space-y-2">
             <button
               onClick={() => openUrl('https://egoblockchain.com/terms')}
@@ -117,7 +111,7 @@ const ConsentGate: React.FC<{ onAccept: () => void }> = ({ onAccept }) => {
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium text-white">Terms of Service</div>
                 <div className="text-xs text-blue-400 group-hover:underline truncate">
-                  https://egoblockchain.com/terms
+                  https:
                 </div>
               </div>
               <span className="text-gray-500 text-xs shrink-0">↗</span>
@@ -131,14 +125,14 @@ const ConsentGate: React.FC<{ onAccept: () => void }> = ({ onAccept }) => {
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium text-white">Privacy Policy</div>
                 <div className="text-xs text-blue-400 group-hover:underline truncate">
-                  https://egoblockchain.com/privacy
+                  https:
                 </div>
               </div>
               <span className="text-gray-500 text-xs shrink-0">↗</span>
             </button>
           </div>
 
-          {/* Checkbox */}
+          {}
           <label className="flex items-start gap-3 cursor-pointer group">
             <div className="relative shrink-0 mt-0.5">
               <input
@@ -178,7 +172,7 @@ const ConsentGate: React.FC<{ onAccept: () => void }> = ({ onAccept }) => {
             </span>
           </label>
 
-          {/* Accept button */}
+          {}
           <button
             onClick={onAccept}
             disabled={!checked}
@@ -196,8 +190,6 @@ const ConsentGate: React.FC<{ onAccept: () => void }> = ({ onAccept }) => {
   );
 };
 
-// ── App ───────────────────────────────────────────────────────────────────────
-
 function App() {
   const [termsAgreed, setTermsAgreed] = useState<boolean>(
     () => localStorage.getItem(CONSENT_KEY) === 'true'
@@ -210,7 +202,6 @@ function App() {
     (localStorage.getItem('ego-theme') as Theme) ?? 'dark'
   );
 
-  // ── new: tracks whether this address completed the registration flow ───────
   const [registered, setRegistered] = useState(false);
 
   function toggleTheme() {
@@ -231,7 +222,7 @@ function App() {
   }
 
   async function initWallet() {
-    if (!wallet) setLoading(true); // only show full loading screen on first init
+    if (!wallet) setLoading(true);
     setInitError(null);
     try {
       const timeout = new Promise<never>((_, reject) =>
@@ -244,10 +235,10 @@ function App() {
       const info = await Promise.race([invoke<WalletInfo>('init_wallet'), timeout]);
       setWallet(info);
       await loadRegistry();
-      // Check if this address already completed registration
+
       const done = localStorage.getItem('ego-registered-account') === 'true'
         || Object.keys(localStorage).some(k => k.startsWith('ego-registered-') && localStorage.getItem(k) === 'true');
-      // Promote to account-wide key so future wallets skip immediately
+
       if (done) localStorage.setItem('ego-registered-account', 'true');
       setRegistered(done);
     } catch (e) {
@@ -263,10 +254,9 @@ function App() {
     initWallet();
   }, []);
 
-  // 1. Terms gate — unchanged
   if (!termsAgreed) {
     return (
-      <div data-theme={theme} className="flex flex-col h-screen bg-gray-900">
+      <div data-theme={theme} className="App flex flex-col h-screen bg-gray-900">
         <TitleBar />
         <div className="flex-1 overflow-auto">
           <ConsentGate
@@ -280,10 +270,9 @@ function App() {
     );
   }
 
-  // 2. Loading — unchanged
   if (loading) {
     return (
-      <div data-theme={theme} className="flex flex-col h-screen bg-gray-900">
+      <div data-theme={theme} className="App flex flex-col h-screen bg-gray-900">
         <TitleBar />
         <div className="flex-1 flex items-center justify-center">
           <div className="text-center space-y-4">
@@ -296,10 +285,9 @@ function App() {
     );
   }
 
-  // 3. Init error — unchanged
   if (initError) {
     return (
-      <div data-theme={theme} className="flex flex-col h-screen bg-gray-900">
+      <div data-theme={theme} className="App flex flex-col h-screen bg-gray-900">
         <TitleBar />
         <div className="flex-1 flex items-center justify-center p-6">
           <div className="w-full max-w-md bg-gray-800 rounded-2xl border border-red-500/40 p-8 text-center space-y-5">
@@ -320,14 +308,13 @@ function App() {
     );
   }
 
-  // 4. Registration flow — shown once after terms + wallet init, before main app
   if (!registered && wallet) {
     return (
       <ThemeContext.Provider value={{ theme, toggleTheme }}>
         <WalletContext.Provider
           value={{ wallet, registry, loading, reload: initWallet, reloadRegistry: loadRegistry }}
         >
-          <div data-theme={theme} className="flex flex-col h-screen bg-gray-900">
+          <div data-theme={theme} className="App flex flex-col h-screen bg-gray-900">
             <TitleBar />
             <div className="flex-1 overflow-auto">
               <RegistrationFlow
@@ -341,7 +328,6 @@ function App() {
     );
   }
 
-  // 5. Main app — unchanged
   return (
     <ThemeContext.Provider value={{ theme, toggleTheme }}>
       <WalletContext.Provider
@@ -360,10 +346,12 @@ function App() {
                 <Route path="earnings" element={<EarningsPage />} />
                 <Route path="staking"  element={<StakingPage />} />
                 <Route path="explorer" element={<ExplorerPage />} />
+                <Route path="market"    element={<MarketPage />} />
                 <Route path="settings"   element={<SettingsPage />} />
                 <Route path="messenger"  element={<MessengerPage />} />
                 <Route path="contracts" element={<ContractsPage />} />
-                <Route path="ide"       element={<IDEPage />} />
+                <Route path="ide"        element={<IDEPage />} />
+                <Route path="governance" element={<GovernancePage />} />
               </Route>
             </Routes>
           </div>

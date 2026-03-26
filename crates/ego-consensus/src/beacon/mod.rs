@@ -24,7 +24,6 @@ pub trait Beacon: Send + Sync {
         challenge: Challenge,
     ) -> impl Future<Output = PoCResult<BeaconAnnouncement>> + Send;
 
-    // NEW: Whitepaper - prepare with consensus randomness
     fn prepare_announcement_with_randomness(
         &mut self,
         challenge: Challenge,
@@ -39,20 +38,17 @@ pub trait Beacon: Send + Sync {
         announcement: &BeaconAnnouncement,
     ) -> impl Future<Output = PoCResult<BeaconTxLog>> + Send;
 
-    // NEW: Whitepaper - start co-beacon broadcast
     fn start_co_beacon_broadcast(
         &mut self,
         announcement: &BeaconAnnouncement,
     ) -> impl Future<Output = PoCResult<()>> + Send;
 
-    // NEW: Whitepaper - stop co-beacon broadcast
     fn stop_co_beacon_broadcast(&mut self) -> impl Future<Output = PoCResult<()>> + Send;
 
     fn get_tx_log(&self) -> Option<BeaconTxLog>;
 
     fn is_cellular_safe(&self) -> bool;
-    
-    // NEW: Get current epoch
+
     fn get_current_epoch(&self) -> u64;
 }
 
@@ -67,11 +63,11 @@ pub struct BeaconStatus {
     pub authorized_frequencies: Vec<u32>,
     pub current_h3_cell: Option<String>,
     pub drs_score: Option<f64>,
-    // NEW: Whitepaper additions
+
     pub co_beacon_active: bool,
     pub last_challenge_epoch: Option<u64>,
     pub randomness_source: RandomnessSource,
-    pub nr_bands: Vec<u8>, // Authorized NR bands
+    pub nr_bands: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,7 +79,7 @@ pub struct BeaconMetrics {
     pub fraud_detections: u32,
     pub cellular_violations: u32,
     pub last_updated: Timestamp,
-    // NEW: Whitepaper additions
+
     pub co_beacon_broadcasts: u64,
     pub nonce_binding_successes: u64,
     pub nonce_binding_failures: u64,
@@ -91,16 +87,14 @@ pub struct BeaconMetrics {
     pub avg_window_duration_ms: u64,
 }
 
-/// Whitepaper: Randomness source for challenge generation
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RandomnessSource {
-    None,           // No randomness (basic mode)
-    VRF,            // Threshold VRF (whitepaper preferred)
-    RANDAO,         // RANDAO + VDF
-    Beacon,         // Beacon chain randomness
+    None,
+    VRF,
+    RANDAO,
+    Beacon,
 }
 
-/// Whitepaper: Co-beacon broadcast status
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoBeaconStatus {
     pub method: CoBeaconMethod,
@@ -112,7 +106,6 @@ pub struct CoBeaconStatus {
     pub witnesses_detected: u32,
 }
 
-/// Whitepaper: Challenge schedule for PoC
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChallengeSchedule {
     pub region_id: String,
@@ -125,8 +118,7 @@ pub struct ChallengeSchedule {
 }
 
 impl ChallengeSchedule {
-    /// Whitepaper: Schedule challenge windows per epoch randomness
-    /// R_e = H(vrf_output || region_id || epoch || slot)
+
     pub fn new(
         region_id: String,
         epoch: u64,
@@ -135,8 +127,7 @@ impl ChallengeSchedule {
         selected_beacon: Address,
     ) -> Self {
         let now = Timestamp::now();
-        
-        // Whitepaper: W=10s challenge window
+
         Self {
             region_id,
             epoch,
@@ -148,13 +139,11 @@ impl ChallengeSchedule {
         }
     }
 
-    /// Check if currently in challenge window
     pub fn is_active(&self) -> bool {
         let now = Timestamp::now();
         now >= self.window_start && now <= self.window_end
     }
 
-    /// Get remaining time in window (ms)
     pub fn remaining_time_ms(&self) -> i64 {
         let now = Timestamp::now();
         (self.window_end.as_millis() as i64) - (now.as_millis() as i64)
@@ -176,7 +165,7 @@ impl Default for BeaconStatus {
             co_beacon_active: false,
             last_challenge_epoch: None,
             randomness_source: RandomnessSource::None,
-            nr_bands: vec![78], // Default to n78 (3.3-3.8 GHz)
+            nr_bands: vec![78],
         }
     }
 }
@@ -195,7 +184,7 @@ impl Default for BeaconMetrics {
             nonce_binding_successes: 0,
             nonce_binding_failures: 0,
             challenge_binding_failures: 0,
-            avg_window_duration_ms: 10_000, // Whitepaper: W=10s
+            avg_window_duration_ms: 10_000,
         }
     }
 }
@@ -246,7 +235,7 @@ mod tests {
     fn test_challenge_schedule() {
         let vrf_output = Hash::new([1u8; 32]);
         let beacon = Address::new([2u8; 20]);
-        
+
         let schedule = ChallengeSchedule::new(
             "872834".to_string(),
             100,
@@ -280,7 +269,7 @@ mod tests {
     fn test_challenge_schedule_expiry() {
         let vrf_output = Hash::new([1u8; 32]);
         let beacon = Address::new([2u8; 20]);
-        
+
         let mut schedule = ChallengeSchedule::new(
             "872834".to_string(),
             100,
@@ -289,15 +278,12 @@ mod tests {
             beacon,
         );
 
-        // Should be active initially
         assert!(schedule.is_active());
 
-        // Manually set window to past
         let past = Timestamp::from_millis(Timestamp::now().as_millis() - 20_000);
         schedule.window_start = past;
         schedule.window_end = Timestamp::from_millis(past.as_millis() + 10_000);
 
-        // Should no longer be active
         assert!(!schedule.is_active());
         assert!(schedule.remaining_time_ms() < 0);
     }

@@ -1,33 +1,23 @@
 use crate::error::ZkError;
 
-// ---------------------------------------------------------------------------
-// BridgeClaim
-// ---------------------------------------------------------------------------
-
-/// A cross-chain bridge claim: at block `height` on chain `chain_id`, address
-/// `sender` locked `amount` units of `token`.  The `nonce` prevents replay.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BridgeClaim {
-    /// Source chain identifier (e.g. 1 = Ethereum mainnet, 0 = Ego testnet).
+
     pub chain_id: u64,
-    /// Block height at which the lock transaction was included.
+
     pub height: u64,
-    /// Sender address on the source chain (bech32 or 0x hex, chain-agnostic).
+
     pub sender: String,
-    /// Amount locked, in the smallest denomination of `token`.
+
     pub amount: u128,
-    /// Token symbol or contract address (e.g. "USDC", "0xA0b86…").
+
     pub token: String,
-    /// Monotonically increasing nonce for this (sender, chain_id) pair.
+
     pub nonce: u64,
 }
 
 impl BridgeClaim {
-    /// Canonical byte encoding used as input to the ZK circuit witness.
-    ///
-    /// Layout (little-endian where applicable):
-    ///   chain_id (8) | height (8) | nonce (8) | amount (16)
-    ///   | sender_len (4) | sender_bytes | token_len (4) | token_bytes
+
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
         let sender_b = self.sender.as_bytes();
         let token_b = self.token.as_bytes();
@@ -44,28 +34,18 @@ impl BridgeClaim {
     }
 }
 
-// ---------------------------------------------------------------------------
-// BridgeProof
-// ---------------------------------------------------------------------------
-
-/// A verified bridge proof: bundles the claim, the state root it was proven
-/// against, and the serialized Groth16 proof bytes.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BridgeProof {
-    /// The cross-chain lock claim being proven.
+
     pub claim: BridgeClaim,
-    /// The source-chain state root at `claim.height`.
+
     pub state_root: [u8; 32],
-    /// Canonical-serialized `ark_groth16::Proof<Bn254>` (see `ZkProof`).
+
     pub proof_bytes: Vec<u8>,
 }
 
 impl BridgeProof {
-    /// BLAKE2s-256 hash of the claim's canonical byte encoding.
-    ///
-    /// This hash is used as the ZK circuit witness for the claim, so that the
-    /// circuit can be parameterized by a single 32-byte value rather than a
-    /// variable-length input.
+
     pub fn claim_hash(&self) -> [u8; 32] {
         use blake2::{Blake2s256, Digest};
         let bytes = self.claim.to_canonical_bytes();
@@ -75,14 +55,10 @@ impl BridgeProof {
         out
     }
 
-    /// Encode the full `BridgeProof` as a hex string for RPC transport.
-    ///
-    /// Format: hex( serde_json::to_vec(self) )
     pub fn to_hex(&self) -> String {
         hex::encode(serde_json::to_vec(self).expect("BridgeProof serialization is infallible"))
     }
 
-    /// Decode a `BridgeProof` from the hex format produced by `to_hex`.
     pub fn from_hex(s: &str) -> Result<Self, ZkError> {
         let bytes = hex::decode(s)
             .map_err(|e| ZkError::SerializationError(format!("hex decode: {e}")))?;
@@ -90,10 +66,6 @@ impl BridgeProof {
             .map_err(|e| ZkError::SerializationError(format!("json decode: {e}")))
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

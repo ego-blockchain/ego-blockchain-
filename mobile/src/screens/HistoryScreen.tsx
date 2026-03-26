@@ -1,7 +1,3 @@
-/**
- * HistoryScreen — full transaction history with filtering.
- */
-
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   View, Text, StyleSheet, FlatList, TouchableOpacity,
@@ -135,7 +131,7 @@ export function HistoryScreen() {
         }
       />
 
-      {/* Detail modal */}
+      {}
       <Modal visible={!!selected} transparent animationType="slide" onRequestClose={() => setSelected(null)}>
         <View style={s.modalOverlay}>
           <View style={s.modal}>

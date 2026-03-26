@@ -4,3 +4,7 @@ target/
 src-tauri/target/
 .DS_Store
 *.log
+src-tauri/src/commands/.ai_rules
+.env
+.env.local
+*.env

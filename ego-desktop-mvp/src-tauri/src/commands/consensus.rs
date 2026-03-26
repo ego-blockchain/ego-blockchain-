@@ -1,14 +1,6 @@
-//! Tauri commands for PoRep / PoST consensus.
-//!
-//! - `get_porep_status`   — list sectors with their commitment + PoST state
-//! - `respond_to_challenges` — fetch pending challenges from relay and submit Merkle proofs
-//! - `get_post_score`     — fetch DRS score contributed by PoST from relay
-
 use crate::error::EgoDesktopError;
 use crate::ledger::Ledger;
 use serde::{Deserialize, Serialize};
-
-// ── Response types ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
 pub struct SectorStatus {
@@ -27,18 +19,15 @@ pub struct SectorStatus {
 
 #[derive(Debug, Serialize)]
 pub struct PostChallengeResult {
-    /// Number of challenges found.
+
     pub challenges_found: usize,
-    /// Number of proofs successfully submitted.
+
     pub proofs_submitted: usize,
-    /// Number of proofs that were rejected or errored.
+
     pub failures: usize,
     pub details: Vec<String>,
 }
 
-// ── get_porep_status ──────────────────────────────────────────────────────────
-
-/// Return the PoRep/PoST status of every locally stored file.
 #[tauri::command]
 pub async fn get_porep_status() -> Result<Vec<SectorStatus>, EgoDesktopError> {
     let ledger = Ledger::load();
@@ -64,14 +53,6 @@ pub async fn get_porep_status() -> Result<Vec<SectorStatus>, EgoDesktopError> {
     Ok(statuses)
 }
 
-// ── respond_to_challenges ─────────────────────────────────────────────────────
-
-/// Fetch all pending PoST challenges from the relay and respond with Merkle proofs.
-///
-/// For each challenge the relay provides: { challenge_id, cid, challenge_seed (hex),
-/// n_real_leaves, n_padded_leaves, comm_d (hex) }.
-/// The desktop loads the matching .enc file, rebuilds the Merkle tree, and
-/// submits 8 proofs back to the relay.  The relay verifies and issues a reward TX.
 #[tauri::command]
 pub async fn respond_to_challenges() -> Result<PostChallengeResult, EgoDesktopError> {
     let ledger     = Ledger::load();
@@ -96,8 +77,7 @@ pub async fn respond_to_challenges() -> Result<PostChallengeResult, EgoDesktopEr
         let n_real             = ch["n_real_leaves"].as_u64().unwrap_or(0) as usize;
         let n_padded           = ch["n_padded_leaves"].as_u64().unwrap_or(0) as usize;
         let comm_d_hex         = ch["comm_d"].as_str().unwrap_or("").to_string();
-        // challenge_block_hash is the block hash used to derive the challenge seed
-        // deterministically — included for auditability; proofs are generated from seed_hex.
+
         let _challenge_block_hash = ch["challenge_block_hash"].as_str().unwrap_or("").to_string();
 
         if cid.is_empty() || seed_hex.is_empty() || n_real == 0 {
@@ -106,7 +86,6 @@ pub async fn respond_to_challenges() -> Result<PostChallengeResult, EgoDesktopEr
             continue;
         }
 
-        // Find the locally stored file matching this CID.
         let file_meta = ledger.stored_files.iter().find(|f| f.cid == cid);
         let local_path = match file_meta {
             Some(f) => f.local_path.clone(),
@@ -117,7 +96,6 @@ pub async fn respond_to_challenges() -> Result<PostChallengeResult, EgoDesktopEr
             }
         };
 
-        // Load the encrypted file bytes.
         let enc_bytes = match std::fs::read(&local_path) {
             Ok(b)  => b,
             Err(e) => {
@@ -127,7 +105,6 @@ pub async fn respond_to_challenges() -> Result<PostChallengeResult, EgoDesktopEr
             }
         };
 
-        // Parse the 32-byte challenge seed.
         let seed_bytes = match hex::decode(&seed_hex)
             .ok()
             .and_then(|b| if b.len() == 32 { Some(b) } else { None })
@@ -140,10 +117,8 @@ pub async fn respond_to_challenges() -> Result<PostChallengeResult, EgoDesktopEr
             }
         };
 
-        // Generate Merkle proofs.
         let proofs = crate::proof::generate_post_proofs(&enc_bytes, &seed_bytes, n_real);
 
-        // Serialize proofs: leaf and path as hex strings for the JSON API.
         let proofs_json: Vec<serde_json::Value> = proofs.iter().map(|p| {
             serde_json::json!({
                 "leaf_index": p.leaf_index,
@@ -153,7 +128,7 @@ pub async fn respond_to_challenges() -> Result<PostChallengeResult, EgoDesktopEr
         }).collect();
 
         let timestamp = chrono::Utc::now().timestamp();
-        // Sign challenge_id:cid:timestamp with Ed25519 to prove identity.
+
         let sign_bytes = format!("{}:{}:{}", challenge_id, cid, timestamp).into_bytes();
         let (sig_hex, pubkey_hex) = match sign_payload(&sign_bytes) {
             Some(pair) => pair,
@@ -185,28 +160,22 @@ pub async fn respond_to_challenges() -> Result<PostChallengeResult, EgoDesktopEr
             details.push(format!("✗ Proof rejected for {}", &cid[..16.min(cid.len())]));
         }
 
-        // Update post_status + last_proved in the local ledger.
         if failures == 0 || submitted > 0 {
             update_post_status(&cid, "proved", Some(timestamp));
         }
     }
 
-    // Gap: storage rewards on-chain.
-    // For every successfully proved sector, issue a reward TX from the node pool
-    // address to our own address.  This makes storage earnings visible on-chain
-    // and auditable by anyone running the explorer.
     if submitted > 0 {
         let ledger = Ledger::load();
         if !ledger.address.is_empty() {
-            // Storage reward: 500_000 uEGOC / GB / day ÷ 48 (window interval = 30 min)
-            // = 10_417 uEGOC per sector per window (≈ 0.01 EGOC).
+
             const REWARD_PER_SECTOR_WINDOW: u64 = 10_417;
             let reward_uegoc = REWARD_PER_SECTOR_WINDOW * submitted as u64;
             let ts2 = chrono::Utc::now().timestamp();
             let reward_data = format!("post_reward:{}:{}:{}", ledger.address, submitted, ts2);
             let reward_hash = format!("0x{}", ego_core::hash_data(reward_data.as_bytes()).to_hex());
             let mut chain = crate::ledger::load_chain();
-            // Check node pool has balance
+
             let pool_addr = "egot1nodepool0000000000000000000000000000000000";
             chain.transactions.push(crate::ledger::LedgerTx {
                 hash:      reward_hash,
@@ -236,8 +205,6 @@ pub async fn respond_to_challenges() -> Result<PostChallengeResult, EgoDesktopEr
     })
 }
 
-// ── get_post_score ────────────────────────────────────────────────────────────
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PostScore {
     pub address:        String,
@@ -247,7 +214,6 @@ pub struct PostScore {
     pub last_proved:    Option<i64>,
 }
 
-/// Returns local PoST score derived from ledger (relay decommissioned).
 #[tauri::command]
 pub async fn get_post_score() -> Result<PostScore, EgoDesktopError> {
     let ledger = Ledger::load();
@@ -264,28 +230,24 @@ pub async fn get_post_score() -> Result<PostScore, EgoDesktopError> {
     })
 }
 
-// ── get_combined_drs ──────────────────────────────────────────────────────────
-
-/// Full DRS picture: combined score + all three raw signals.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CombinedDrsScore {
     pub address:        String,
     pub combined_score: f64,
-    /// PoC events submitted in the last 24 h.
+
     pub poc_events_24h: u32,
     pub poc_total:      u64,
-    /// Active PoST sectors on the relay.
+
     pub post_sectors:   u32,
     pub post_windows:   u64,
     pub post_faults:    u64,
-    /// Local staked amount (uEGOC) — from ledger, not relay.
+
     pub staked_uegoc:   u64,
     pub validator_rank: Option<usize>,
-    /// True when combined_score ≥ 0.5 (PoC + PoST performance). Staking is not required.
+
     pub is_eligible:    bool,
 }
 
-/// Returns combined DRS score derived from local ledger (relay decommissioned).
 #[tauri::command]
 pub async fn get_combined_drs() -> Result<CombinedDrsScore, EgoDesktopError> {
     let ledger = Ledger::load();
@@ -297,15 +259,13 @@ pub async fn get_combined_drs() -> Result<CombinedDrsScore, EgoDesktopError> {
     let post_sectors = ledger.stored_files.iter()
         .filter(|f| f.status == "Active").count() as u32;
 
-    // PoC events from local ledger
     let poc_events = crate::ledger::load_poc_events();
     let now = chrono::Utc::now().timestamp();
     let poc_events_24h = poc_events.iter()
         .filter(|e| now - e.timestamp <= 86_400).count() as u32;
     let poc_total = poc_events.len() as u64;
 
-    // Simple combined score: PoC weight 0.6, PoST weight 0.4
-    let poc_score  = (poc_events_24h as f64 / 360.0_f64).min(1.0); // 360 events/day max
+    let poc_score  = (poc_events_24h as f64 / 360.0_f64).min(1.0);
     let post_score = if post_sectors > 0 { 1.0 } else { 0.0 };
     let combined_score = poc_score * 0.6 + post_score * 0.4;
 
@@ -323,9 +283,6 @@ pub async fn get_combined_drs() -> Result<CombinedDrsScore, EgoDesktopError> {
     })
 }
 
-// ── get_tokenomics ────────────────────────────────────────────────────────────
-
-/// Returns tokenomics data shaped to match the frontend Tokenomics interface.
 #[tauri::command]
 pub async fn get_tokenomics() -> Result<serde_json::Value, EgoDesktopError> {
     use crate::tokenomics::{
@@ -340,7 +297,6 @@ pub async fn get_tokenomics() -> Result<serde_json::Value, EgoDesktopError> {
     let current_reward = block_reward_at(total_blocks) as f64 / UEGOC_PER_EGOC as f64;
     let blocks_to_next = HALVING_INTERVAL - (total_blocks % HALVING_INTERVAL);
 
-    // Circulating = sum of all confirmed coinbase rewards (from recent 2000 blocks via shared chain)
     let chain = crate::ledger::load_chain();
     let circulating_uegoc: u64 = chain.blocks.iter()
         .map(|b| b.reward)
@@ -350,16 +306,14 @@ pub async fn get_tokenomics() -> Result<serde_json::Value, EgoDesktopError> {
         ((circulating_egoc as f64 / TOTAL_SUPPLY_EGOC as f64) * 100.0 * 100.0).round() / 100.0
     } else { 0.0 };
 
-    // Pool balances
     let node_pool_remaining  = node_pool_remaining_uegoc(&chain) / UEGOC_PER_EGOC;
     let staking_pool_remaining = staking_pool_remaining_uegoc(&chain) / UEGOC_PER_EGOC;
 
-    // Staking totals from ledger
     let ledger = crate::ledger::Ledger::load();
     let total_staked_egoc = ledger.staked_amount / UEGOC_PER_EGOC;
 
     let next_halving_at = (era + 1) * HALVING_INTERVAL;
-    // uEGOC caps for the 5 explorer emission-pool bars
+
     let foundation_uegoc  = FOUNDATION_EGOC  * UEGOC_PER_EGOC;
     let emission_uegoc    = BLOCK_EMISSION_EGOC * UEGOC_PER_EGOC;
     let node_pool_uegoc   = NODE_POOL_EGOC   * UEGOC_PER_EGOC;
@@ -372,7 +326,6 @@ pub async fn get_tokenomics() -> Result<serde_json::Value, EgoDesktopError> {
         "circulating_pct":            circulating_pct,
         "block_rewards_issued_uegoc": circulating_uegoc,
 
-        // 5 emission pools expected by ExplorerPage
         "emission_pools": {
             "genesis":       { "cap_uegoc": foundation_uegoc,  "pct": 15 },
             "block_rewards": { "cap_uegoc": emission_uegoc,    "pct": 21 },
@@ -401,7 +354,6 @@ pub async fn get_tokenomics() -> Result<serde_json::Value, EgoDesktopError> {
             "active_stakers":    if ledger.staked_amount > 0 { 1u64 } else { 0u64 }
         },
 
-        // DRS gate constants
         "drs": {
             "min_drs_to_mine": 0.5,
             "weights": { "poc": 0.6, "post": 0.4, "stake": 0.0 }
@@ -409,11 +361,8 @@ pub async fn get_tokenomics() -> Result<serde_json::Value, EgoDesktopError> {
     }))
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
-
 fn sign_payload(data: &[u8]) -> Option<(String, String)> {
-    let seed_bytes = std::fs::read(crate::ledger::seed_path()).ok()
-        .filter(|b| b.len() == 32)?;
+    let seed_bytes = crate::ledger::load_seed()?;
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&seed_bytes);
     let kp  = ego_core::KeyPair::from_bytes(&seed).ok()?;
@@ -431,10 +380,6 @@ fn update_post_status(cid: &str, status: &str, proved_at: Option<i64>) {
     let _ = ledger.save();
 }
 
-// ── background task ───────────────────────────────────────────────────────────
-
-/// Run forever: respond to PoST challenges every POST_WINDOW_SECS seconds.
-/// Called from main.rs setup as a background tokio task.
 pub async fn run_post_loop() {
     let interval = std::time::Duration::from_secs(
         crate::proof::POST_WINDOW_SECS as u64
@@ -448,7 +393,7 @@ pub async fn run_post_loop() {
                     r.challenges_found, r.proofs_submitted, r.failures
                 );
             }
-            Ok(_)  => {} // nothing pending
+            Ok(_)  => {}
             Err(e) => eprintln!("[PoST] loop error: {e}"),
         }
     }

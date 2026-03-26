@@ -1,7 +1,3 @@
-/**
- * SettingsScreen — wallet settings: recovery phrase, lock, network toggle.
- */
-
 import React, { useEffect, useState } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, Switch,
@@ -48,8 +44,7 @@ export function SettingsScreen({ navigation }: { navigation: Nav }) {
   }
 
   function handlePinConfirm() {
-    // In production: hash pinInput and compare with stored pinHash
-    // For demo, any input reveals the phrase
+
     setShowPinModal(false);
     setPinInput('');
     if (pinTarget === 'reveal') {
@@ -115,7 +110,7 @@ export function SettingsScreen({ navigation }: { navigation: Nav }) {
       <ScrollView contentContainerStyle={s.scroll}>
         <Text style={s.pageTitle}>Settings</Text>
 
-        {/* Wallet info */}
+        {}
         <View style={s.section}>
           <View style={s.walletCard}>
             <View style={s.walletIcon}><Text style={{ fontSize: 22 }}>👛</Text></View>
@@ -131,7 +126,7 @@ export function SettingsScreen({ navigation }: { navigation: Nav }) {
           </View>
         </View>
 
-        {/* Security */}
+        {}
         <Text style={s.sectionLabel}>Security</Text>
         <View style={s.section}>
           <SettingRow
@@ -150,7 +145,7 @@ export function SettingsScreen({ navigation }: { navigation: Nav }) {
           />
         </View>
 
-        {/* Network */}
+        {}
         <Text style={s.sectionLabel}>Network</Text>
         <View style={s.section}>
           <SettingRow
@@ -174,7 +169,7 @@ export function SettingsScreen({ navigation }: { navigation: Nav }) {
           />
         </View>
 
-        {/* About */}
+        {}
         <Text style={s.sectionLabel}>About</Text>
         <View style={s.section}>
           <SettingRow icon="ℹ️" title="Version"    subtitle="1.0.0 (testnet)" />
@@ -186,7 +181,7 @@ export function SettingsScreen({ navigation }: { navigation: Nav }) {
 
       </ScrollView>
 
-      {/* PIN modal */}
+      {}
       <Modal visible={showPinModal} transparent animationType="fade" onRequestClose={() => setShowPinModal(false)}>
         <View style={s.modalOverlay}>
           <View style={s.modal}>
@@ -214,7 +209,7 @@ export function SettingsScreen({ navigation }: { navigation: Nav }) {
         </View>
       </Modal>
 
-      {/* Recovery phrase modal */}
+      {}
       <Modal visible={showPhrase} transparent animationType="slide" onRequestClose={() => setShowPhrase(false)}>
         <View style={s.phraseOverlay}>
           <View style={s.phraseModal}>

@@ -11,8 +11,6 @@ use tracing::{debug, error, info, warn};
 
 pub type BridgeResult<T> = Result<T, PoCError>;
 
-/// Bridge for connecting Rust consensus components to Erlang BFT layer
-/// Handles TCP communication with sbft_rust_bridge module
 #[derive(Debug)]
 pub struct BftBridge {
     erlang_endpoint: String,
@@ -54,7 +52,7 @@ pub enum ConnectionStatus {
 }
 
 impl BftBridge {
-    /// Create new BFT bridge connection to Erlang consensus layer
+
     pub fn new(erlang_endpoint: String) -> Self {
         Self {
             erlang_endpoint,
@@ -67,7 +65,6 @@ impl BftBridge {
         }
     }
 
-    /// Start the BFT bridge with event channel connections
     pub async fn start(
         &mut self,
         mut poc_receiver: mpsc::UnboundedReceiver<PoCEvent>,
@@ -78,10 +75,8 @@ impl BftBridge {
     ) -> BridgeResult<()> {
         info!("Starting BFT bridge to {}", self.erlang_endpoint);
 
-        // Start connection management
         self.start_connection_manager().await;
 
-        // Start message forwarding tasks
         let bridge_clone = self.clone_for_task();
         tokio::spawn(async move {
             bridge_clone.handle_poc_events(poc_receiver).await;
@@ -110,7 +105,6 @@ impl BftBridge {
         Ok(())
     }
 
-    /// Handle PoC events from aggregator
     async fn handle_poc_events(&self, mut receiver: mpsc::UnboundedReceiver<PoCEvent>) {
         while let Some(event) = receiver.recv().await {
             if let Err(e) = self.send_poc_event(event).await {
@@ -119,7 +113,6 @@ impl BftBridge {
         }
     }
 
-    /// Handle density events for slashing
     async fn handle_density_events(&self, mut receiver: mpsc::UnboundedReceiver<DensityEvent>) {
         while let Some(event) = receiver.recv().await {
             if let Err(e) = self.send_density_event(event).await {
@@ -128,7 +121,6 @@ impl BftBridge {
         }
     }
 
-    /// Handle daily anchor submissions
     async fn handle_anchor_events(&self, mut receiver: mpsc::UnboundedReceiver<DailyEvidenceRoot>) {
         while let Some(anchor) = receiver.recv().await {
             if let Err(e) = self.send_daily_anchor(anchor).await {
@@ -137,7 +129,6 @@ impl BftBridge {
         }
     }
 
-    /// Handle PoRep events from storage providers
     async fn handle_porep_events(&self, mut receiver: mpsc::UnboundedReceiver<PoRepEvent>) {
         while let Some(event) = receiver.recv().await {
             if let Err(e) = self.send_porep_event(event).await {
@@ -146,7 +137,6 @@ impl BftBridge {
         }
     }
 
-    /// Handle validator votes
     async fn handle_validator_votes(&self, mut receiver: mpsc::UnboundedReceiver<ValidatorVote>) {
         while let Some(vote) = receiver.recv().await {
             if let Err(e) = self.send_validator_vote(vote).await {
@@ -155,7 +145,6 @@ impl BftBridge {
         }
     }
 
-    /// Send PoC event to Erlang consensus layer
     async fn send_poc_event(&self, event: PoCEvent) -> BridgeResult<()> {
         let payload = bincode::encode_to_vec(&event, bincode::config::standard())
             .map_err(|e| PoCError::SerializationError(format!("Failed to serialize PoC event: {}", e)))?;
@@ -168,10 +157,7 @@ impl BftBridge {
         Ok(())
     }
 
-    /// Send density event for slashing pipeline
     async fn send_density_event(&self, event: DensityEvent) -> BridgeResult<()> {
-        // TODO: Get slashing engine instance and call report_invalid_poc
-        // For now, just forward to BFT layer
 
         let payload = bincode::encode_to_vec(&event, bincode::config::standard())
             .map_err(|e| PoCError::SerializationError(format!("Failed to serialize density event: {}", e)))?;
@@ -179,15 +165,11 @@ impl BftBridge {
         let message = self.create_bridge_message(MessageType::DensityEvent, payload);
         self.send_message(message).await?;
 
-        // This is where we would call:
-        // slashing_engine.report_invalid_poc(&event, reporter_address)?;
-
         info!("Sent density event for slashing: node {} detected co-location (LDM: {:.3})",
               event.node_id, event.ldm);
         Ok(())
     }
 
-    /// Send daily anchor to chain
     async fn send_daily_anchor(&self, anchor: DailyEvidenceRoot) -> BridgeResult<()> {
         let payload = bincode::encode_to_vec(&anchor, bincode::config::standard())
             .map_err(|e| PoCError::SerializationError(format!("Failed to serialize daily anchor: {}", e)))?;
@@ -200,7 +182,6 @@ impl BftBridge {
         Ok(())
     }
 
-    /// Send PoRep event to consensus layer
     async fn send_porep_event(&self, event: PoRepEvent) -> BridgeResult<()> {
         let payload = bincode::encode_to_vec(&event, bincode::config::standard())
             .map_err(|e| PoCError::SerializationError(format!("Failed to serialize PoRep event: {}", e)))?;
@@ -212,7 +193,6 @@ impl BftBridge {
         Ok(())
     }
 
-    /// Send validator vote to consensus
     async fn send_validator_vote(&self, vote: ValidatorVote) -> BridgeResult<()> {
         let payload = bincode::encode_to_vec(&vote, bincode::config::standard())
             .map_err(|e| PoCError::SerializationError(format!("Failed to serialize validator vote: {}", e)))?;
@@ -225,7 +205,6 @@ impl BftBridge {
         Ok(())
     }
 
-    /// Create bridge message with unique ID
     fn create_bridge_message(&self, msg_type: MessageType, payload: Vec<u8>) -> BridgeMessage {
         BridgeMessage {
             id: self.next_message_id(),
@@ -235,29 +214,23 @@ impl BftBridge {
         }
     }
 
-    /// Get next unique message ID
     fn next_message_id(&self) -> u64 {
-        // In a real implementation, this would be atomic
-        // For now, using timestamp + random for uniqueness
+
         ego_core::current_timestamp().0 + (rand::random::<u16>() as u64)
     }
 
-    /// Send message to Erlang BFT layer
     async fn send_message(&self, message: BridgeMessage) -> BridgeResult<()> {
         if self.connection_status != ConnectionStatus::Connected {
             warn!("BFT bridge not connected, queueing message {}", message.id);
-            // In real implementation, would queue the message
+
             return Err(PoCError::NetworkError("Bridge not connected".to_string()));
         }
 
-        // TODO: Implement actual TCP message sending to sbft_rust_bridge
-        // For now, simulate successful send
         debug!("Simulating send of message {} to BFT layer", message.id);
 
         Ok(())
     }
 
-    /// Start connection manager task
     async fn start_connection_manager(&mut self) {
         let endpoint = self.erlang_endpoint.clone();
         let reconnect_interval = self.reconnect_interval;
@@ -268,17 +241,13 @@ impl BftBridge {
             loop {
                 interval.tick().await;
 
-                // TODO: Implement actual TCP connection to Erlang node
-                // For now, simulate connection status
                 debug!("Connection manager: checking connection to {}", endpoint);
 
-                // Simulate successful connection after some attempts
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         });
     }
 
-    /// Clone bridge for async task usage
     fn clone_for_task(&self) -> BftBridgeHandle {
         BftBridgeHandle {
             endpoint: self.erlang_endpoint.clone(),
@@ -286,7 +255,6 @@ impl BftBridge {
     }
 }
 
-/// Handle for bridge operations in async tasks
 #[derive(Clone)]
 struct BftBridgeHandle {
     endpoint: String,
@@ -297,40 +265,39 @@ impl BftBridgeHandle {
         while let Some(event) = receiver.recv().await {
             debug!("Bridge handle processing PoC event for beacon {}",
                    event.quality_score);
-            // Forward to actual bridge implementation
+
         }
     }
 
     async fn handle_density_events(&self, mut receiver: mpsc::UnboundedReceiver<DensityEvent>) {
         while let Some(event) = receiver.recv().await {
             info!("Bridge handle processing density event for node {}", event.node_id);
-            // Forward to slashing pipeline
+
         }
     }
 
     async fn handle_anchor_events(&self, mut receiver: mpsc::UnboundedReceiver<DailyEvidenceRoot>) {
         while let Some(anchor) = receiver.recv().await {
             info!("Bridge handle processing daily anchor with {} bundles", anchor.bundle_count);
-            // Submit to chain
+
         }
     }
 
     async fn handle_porep_events(&self, mut receiver: mpsc::UnboundedReceiver<PoRepEvent>) {
         while let Some(event) = receiver.recv().await {
             debug!("Bridge handle processing PoRep event for sector {}", event.sector_id);
-            // Forward to consensus
+
         }
     }
 
     async fn handle_validator_votes(&self, mut receiver: mpsc::UnboundedReceiver<ValidatorVote>) {
         while let Some(vote) = receiver.recv().await {
             debug!("Bridge handle processing validator vote {:?}", vote.vote);
-            // Forward to BFT consensus
+
         }
     }
 }
 
-/// Factory function to create connected bridges for aggregators
 pub fn create_aggregator_bridge(
     erlang_endpoint: String,
 ) -> (
@@ -346,7 +313,6 @@ pub fn create_aggregator_bridge(
     let (porep_tx, porep_rx) = mpsc::unbounded_channel();
     let (vote_tx, vote_rx) = mpsc::unbounded_channel();
 
-    // Start the bridge with receivers
     tokio::spawn(async move {
         if let Err(e) = bridge.start(poc_rx, density_rx, anchor_rx, porep_rx, vote_rx).await {
             error!("BFT bridge failed: {}", e);

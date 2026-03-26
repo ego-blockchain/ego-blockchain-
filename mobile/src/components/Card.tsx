@@ -1,7 +1,3 @@
-/**
- * Card — container component with Ego dark-theme styling.
- */
-
 import React from 'react';
 import { View, StyleSheet, ViewStyle } from 'react-native';
 

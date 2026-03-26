@@ -6,9 +6,6 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-/// Validator for independently verifying PoC bundles from other aggregators
-/// This component re-validates all fraud checks and aggregator signatures
-/// before casting validator votes to the BFT consensus layer
 #[derive(Debug)]
 pub struct PoCValidator {
     validator_id: Address,
@@ -57,17 +54,15 @@ impl PoCValidator {
             validator_key,
             vote_sender,
             processed_bundles: HashMap::new(),
-            fraud_threshold: 0.3, // 30% fraud threshold
+            fraud_threshold: 0.3,
             min_witness_count: 3,
-            max_bundle_age_ms: 300_000, // 5 minutes
+            max_bundle_age_ms: 300_000,
         }
     }
 
-    /// Validate an incoming PoC bundle from another aggregator
     pub async fn validate_bundle(&mut self, bundle: &PoCBundle) -> PoCResult<ValidationResult> {
         let bundle_hash = self.compute_bundle_hash(bundle);
 
-        // Skip if already processed
         if let Some(cached_result) = self.processed_bundles.get(&bundle_hash) {
             debug!("Bundle {} already validated: {:?}",
                    format!("{:?}", bundle_hash), cached_result.is_valid);
@@ -80,21 +75,18 @@ impl PoCValidator {
         let mut validation_errors = Vec::new();
         let mut is_valid = true;
 
-        // 1. Check bundle age
         let current_time = ego_core::current_timestamp();
         if current_time.0 - bundle.created_at.0 > self.max_bundle_age_ms {
             validation_errors.push("Bundle too old".to_string());
             is_valid = false;
         }
 
-        // 2. Verify aggregator signature
         let signature_valid = self.verify_aggregator_signature(bundle)?;
         if !signature_valid {
             validation_errors.push("Invalid aggregator signature".to_string());
             is_valid = false;
         }
 
-        // 3. Re-validate witness reports for fraud
         let (fraud_score, witness_count) = self.revalidate_witness_reports(&bundle.witness_reports)?;
 
         if fraud_score > self.fraud_threshold {
@@ -107,7 +99,6 @@ impl PoCValidator {
             is_valid = false;
         }
 
-        // 4. Verify bundle statistics consistency
         if !self.verify_bundle_consistency(bundle)? {
             validation_errors.push("Bundle statistics inconsistent".to_string());
             is_valid = false;
@@ -121,10 +112,8 @@ impl PoCValidator {
             validation_errors: validation_errors.clone(),
         };
 
-        // Cache result
         self.processed_bundles.insert(bundle_hash.clone(), result.clone());
 
-        // Cast validator vote
         let vote = if is_valid { VoteType::Accept } else { VoteType::Reject };
         let reason = if !validation_errors.is_empty() {
             Some(validation_errors.join("; "))
@@ -140,7 +129,6 @@ impl PoCValidator {
         Ok(result)
     }
 
-    /// Re-run fraud detection on all witness reports in the bundle
     fn revalidate_witness_reports(&self, reports: &[crate::witness::WitnessReport]) -> PoCResult<(f64, u32)> {
         if reports.is_empty() {
             return Ok((0.0, 0));
@@ -150,28 +138,23 @@ impl PoCValidator {
         let witness_count = reports.len() as u32;
 
         for report in reports {
-            // Re-validate beacon transmission parameters
-            // TX power validation would be done against beacon announcement data
 
-            // Re-validate timing constraints
             if report.rf_metrics.timing_advance > 1000 {
-                total_fraud_score += 0.3; // Suspicious timing
+                total_fraud_score += 0.3;
             }
 
-            // Re-validate geographic constraints
             if let (Some(lat), Some(lon)) = (Some(report.witness_location.latitude), Some(report.witness_location.longitude)) {
                 if lat.abs() > 90.0 || lon.abs() > 180.0 {
-                    total_fraud_score += 0.8; // Invalid coordinates
+                    total_fraud_score += 0.8;
                 }
             }
 
-            // Re-validate RSRP/RSRQ values
             if report.rf_metrics.rsrp > -30 || report.rf_metrics.rsrp < -140 {
-                total_fraud_score += 0.4; // Invalid RSRP
+                total_fraud_score += 0.4;
             }
 
             if report.rf_metrics.rsrq > 20 || report.rf_metrics.rsrq < -40 {
-                total_fraud_score += 0.4; // Invalid RSRQ
+                total_fraud_score += 0.4;
             }
         }
 
@@ -179,13 +162,10 @@ impl PoCValidator {
         Ok((avg_fraud_score, witness_count))
     }
 
-    /// Verify the aggregator's signature on the bundle
     fn verify_aggregator_signature(&self, bundle: &PoCBundle) -> PoCResult<bool> {
-        // Create the message that should have been signed
+
         let message = self.create_signature_message(bundle);
 
-        // TODO: Implement actual signature verification with aggregator's public key
-        // For now, perform basic format validation
         if bundle.signature.as_bytes().len() != 64 {
             warn!("Invalid signature length for bundle from {}", bundle.aggregator_id);
             return Ok(false);
@@ -195,9 +175,8 @@ impl PoCValidator {
         Ok(true)
     }
 
-    /// Verify bundle statistics consistency
     fn verify_bundle_consistency(&self, bundle: &PoCBundle) -> PoCResult<bool> {
-        // Verify that witness count matches statistics
+
         let reported_count = bundle.statistics.witness_count;
         let actual_count = bundle.witness_reports.len();
 
@@ -206,19 +185,17 @@ impl PoCValidator {
             return Ok(false);
         }
 
-        // Empty bundles are allowed - witness count validation is handled separately
         debug!("Bundle consistency verification passed");
         Ok(true)
     }
 
-    /// Cast a validator vote to the BFT consensus layer
     async fn cast_vote(&self, bundle_hash: Hash, vote: VoteType, reason: Option<String>) -> PoCResult<()> {
         let vote_message = ValidatorVote {
             bundle_hash: bundle_hash.clone(),
             validator_id: self.validator_id,
             vote,
             timestamp: ego_core::current_timestamp(),
-            signature: Signature::ed25519([0u8; 64]), // TODO: Sign with validator key
+            signature: Signature::ed25519([0u8; 64]),
             reason,
         };
 
@@ -233,7 +210,7 @@ impl PoCValidator {
     }
 
     fn compute_bundle_hash(&self, bundle: &PoCBundle) -> Hash {
-        // Use the existing bundle_id as the hash
+
         bundle.bundle_id
     }
 
@@ -246,14 +223,12 @@ impl PoCValidator {
         message
     }
 
-    /// Clean up old processed bundles to prevent memory growth
     pub fn cleanup_old_bundles(&mut self, max_age_ms: u64) {
         let current_time = ego_core::current_timestamp();
         let mut to_remove = Vec::new();
 
-        // This is a simplified cleanup - in production would track bundle timestamps
         if self.processed_bundles.len() > 10000 {
-            // Remove oldest 25% of entries
+
             let remove_count = self.processed_bundles.len() / 4;
             for (i, key) in self.processed_bundles.keys().enumerate() {
                 if i < remove_count {
@@ -272,7 +247,6 @@ impl PoCValidator {
         }
     }
 
-    /// Update validation parameters from consensus layer
     pub fn update_parameters(&mut self, fraud_threshold: f64, min_witnesses: u32, max_age_ms: u64) {
         self.fraud_threshold = fraud_threshold;
         self.min_witness_count = min_witnesses;
@@ -310,10 +284,8 @@ mod tests {
             vote_tx,
         );
 
-        // Allow empty bundles for this test
         validator.min_witness_count = 0;
 
-        // Create a minimal test bundle using the real PoCBundle::new constructor
         use crate::beacon::BeaconAnnouncement;
         use crate::types::{Challenge, LocationData};
 
@@ -346,15 +318,13 @@ mod tests {
         let bundle = PoCBundle::new(
             Address::default(),
             beacon_announcement,
-            vec![], // Empty witness reports for test
+            vec![],
         );
 
         let result = validator.validate_bundle(&bundle).await.unwrap();
 
-        // Should accept empty bundle with valid signature
         assert!(result.is_valid);
 
-        // Should have cast a vote
         let vote = vote_rx.try_recv().unwrap();
         assert!(matches!(vote.vote, VoteType::Accept));
     }

@@ -2,8 +2,6 @@ import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { useNavigate } from 'react-router-dom';
 
-// ── Types ─────────────────────────────────────────────────────────────────────
-
 interface EarningsData {
   daily_rewards: number;
   epoch_rewards: number;
@@ -16,7 +14,7 @@ interface EarningsData {
     retrieval_rewards: number;
   };
   pending_rewards: number;
-  session_started: number;   // unix timestamp
+  session_started: number;
   coverage_online: boolean;
 }
 
@@ -41,8 +39,6 @@ interface P2pStatus {
   storage_used_bytes:   number;
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
 function fmtEgoc(uegoc: number, decimals = 4) {
   return (uegoc / 1_000_000).toLocaleString('en-US', {
     minimumFractionDigits: decimals,
@@ -58,8 +54,6 @@ function fmtDuration(secs: number): string {
   return `${h}h ${m}m`;
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
-
 const EarningsPage: React.FC = () => {
   const navigate = useNavigate();
 
@@ -68,9 +62,9 @@ const EarningsPage: React.FC = () => {
   const [pocScore, setPocScore]           = useState<PocScoreResult | null>(null);
   const [p2pStatus, setP2pStatus]         = useState<P2pStatus | null>(null);
   const [lastPocMsg, setLastPocMsg]       = useState<string>('');
-  // Live session-earnings counter (in uEGOC, fractional)
+
   const [sessionEarned, setSessionEarned] = useState(0);
-  // Seconds the node has been running this session
+
   const [uptime, setUptime]               = useState(0);
   const tickRef    = useRef<ReturnType<typeof setInterval> | null>(null);
   const pocTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -79,19 +73,16 @@ const EarningsPage: React.FC = () => {
     loadAll();
     loadPocScore();
     loadP2pStatus();
-    // Refresh from backend every 30 s (also credits elapsed earnings)
+
     const refresh = setInterval(loadAll, 30_000);
-    // Refresh DRS score every 5 minutes
     const scoreRefresh = setInterval(loadPocScore, 5 * 60_000);
-    // Refresh P2P status every 60 s
     const p2pRefresh = setInterval(loadP2pStatus, 60_000);
     return () => { clearInterval(refresh); clearInterval(scoreRefresh); clearInterval(p2pRefresh); };
   }, []);
 
-  // PoC beacon: fire once on mount, then every 10 minutes while coverage is online
   useEffect(() => {
     if (!earnings?.coverage_online) return;
-    submitPocBeacon(); // fire immediately on first online detection
+    submitPocBeacon();
     if (pocTimerRef.current) clearInterval(pocTimerRef.current);
     pocTimerRef.current = setInterval(submitPocBeacon, 10 * 60_000);
     return () => { if (pocTimerRef.current) clearInterval(pocTimerRef.current); };
@@ -105,25 +96,23 @@ const EarningsPage: React.FC = () => {
       );
       if (result.success) {
         setLastPocMsg(`+${(result.reward_uegoc / 1_000_000).toFixed(6)} EGOC PoC reward`);
-        loadPocScore(); // refresh DRS after new event
+        loadPocScore();
       }
-    } catch {
-      // relay unreachable — silent fail (still earns locally)
-    }
+    } catch { }
   }
 
   async function loadPocScore() {
     try {
       const score = await invoke<PocScoreResult>('get_poc_score');
       setPocScore(score);
-    } catch { /* ignore */ }
+    } catch { }
   }
 
   async function loadP2pStatus() {
     try {
       const s = await invoke<P2pStatus>('get_p2p_status');
       setP2pStatus(s);
-    } catch { /* ignore */ }
+    } catch { }
   }
 
   async function loadAll() {
@@ -135,7 +124,6 @@ const EarningsPage: React.FC = () => {
       setEarnings(e);
       setStorageMeta(m);
 
-      // Seed the live counter from the already-elapsed session time
       const elapsed = Math.floor(Date.now() / 1000) - e.session_started;
       const perSec  = e.daily_rewards / 86_400;
       setSessionEarned(elapsed * perSec);
@@ -145,7 +133,6 @@ const EarningsPage: React.FC = () => {
     }
   }
 
-  // 1-second ticker — increments both the session counter and the uptime
   useEffect(() => {
     if (!earnings) return;
     const perSec = earnings.daily_rewards / 86_400;
@@ -157,8 +144,6 @@ const EarningsPage: React.FC = () => {
     return () => { if (tickRef.current) clearInterval(tickRef.current); };
   }, [earnings?.daily_rewards]);
 
-  // ── Derived values ─────────────────────────────────────────────────────────
-
   const allocatedGb    = (storageMeta?.storage_allocated_bytes ?? 0) / 1e9;
   const isStorageSetup = allocatedGb > 0;
   const bd             = earnings?.reward_breakdown;
@@ -166,19 +151,66 @@ const EarningsPage: React.FC = () => {
     ? (bd.storage_rewards + bd.consensus_rewards + bd.coverage_rewards + bd.retrieval_rewards) || 1
     : 1;
 
+  // USD targets (must match tokenomics.rs constants)
+  const STORAGE_USD_PER_GB_DAY = 0.002;
+  const CONSENSUS_USD_PER_DAY  = 0.20;
+  const COVERAGE_USD_PER_DAY   = 0.15;
+  const RETRIEVAL_USD_PER_GB   = 0.003;
+
+  // Derive implied EGOC price from backend reward (storage is clearest proxy when allocated > 0)
+  // If we can't derive it, we fall back to showing only EGOC amounts
+  const impliedEgocPrice: number | null = (() => {
+    if (!bd || allocatedGb <= 0 || bd.storage_rewards <= 0) return null;
+    const usdTarget = STORAGE_USD_PER_GB_DAY * allocatedGb;
+    return usdTarget / (bd.storage_rewards / 1_000_000);
+  })();
+
+  const priceStr = impliedEgocPrice !== null
+    ? `~$${impliedEgocPrice < 0.01
+        ? impliedEgocPrice.toExponential(2)
+        : impliedEgocPrice.toFixed(4)}/EGOC`
+    : 'live price';
+
   const buckets = bd ? [
-    { label: 'Storage',   val: bd.storage_rewards,   color: 'bg-blue-500',   text: 'text-blue-400',   desc: `Up to ${allocatedGb.toFixed(1)} GB × 0.5 EGOC/day when utilized`      },
-    { label: 'Consensus', val: bd.consensus_rewards,  color: 'bg-purple-500', text: 'text-purple-400', desc: 'Requires active node participation in BFT rounds'   },
-    { label: 'Coverage',  val: bd.coverage_rewards,   color: 'bg-green-500',  text: 'text-green-400',  desc: earnings?.coverage_online ? 'PoC beacon active — reward eligible' : 'Offline — criteria not met' },
-    { label: 'Retrieval', val: bd.retrieval_rewards,  color: 'bg-orange-500', text: 'text-orange-400', desc: 'Paid per-GB only when others fetch your stored data' },
+    {
+      label: 'Storage',
+      val: bd.storage_rewards,
+      color: 'bg-blue-500',
+      text: 'text-blue-400',
+      desc: `~$${STORAGE_USD_PER_GB_DAY}/GB/day → converted to EGOC at ${priceStr}`,
+    },
+    {
+      label: 'Consensus',
+      val: bd.consensus_rewards,
+      color: 'bg-purple-500',
+      text: 'text-purple-400',
+      desc: `~$${CONSENSUS_USD_PER_DAY}/day → EGOC at ${priceStr}`,
+    },
+    {
+      label: 'Coverage',
+      val: bd.coverage_rewards,
+      color: 'bg-green-500',
+      text: 'text-green-400',
+      desc: earnings?.coverage_online
+        ? `~$${COVERAGE_USD_PER_DAY}/day → EGOC at ${priceStr}`
+        : 'Offline — criteria not met',
+    },
+    {
+      label: 'Retrieval',
+      val: bd.retrieval_rewards,
+      color: 'bg-orange-500',
+      text: 'text-orange-400',
+      desc: `~$${RETRIEVAL_USD_PER_GB}/GB served → EGOC at ${priceStr}`,
+    },
   ] : [];
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+  // Current daily storage potential in EGOC (from backend, not hardcoded)
+  const maxStorageEgocPerDay = bd ? bd.storage_rewards / 1_000_000 : 0;
 
   return (
     <div className="p-6 space-y-5 max-w-4xl mx-auto">
 
-      {/* ── "Keep app open" banner ───────────────────────────────────────── */}
+      {/* ── Keep app open warning ──────────────────────────────────────────── */}
       <div className="bg-yellow-500/10 border border-yellow-500/40 rounded-2xl px-5 py-4 flex items-start gap-3">
         <span className="text-2xl shrink-0 mt-0.5">⚠️</span>
         <div>
@@ -194,13 +226,39 @@ const EarningsPage: React.FC = () => {
         </div>
       </div>
 
-      {/* ── Storage setup prompt ────────────────────────────────────────── */}
+      {/* ── Price & reward model explanation ──────────────────────────────── */}
+      <div className="bg-cyan-900/20 border border-cyan-500/30 rounded-2xl px-5 py-4 flex items-start gap-3">
+        <span className="text-xl shrink-0 mt-0.5">📊</span>
+        <div className="text-xs text-cyan-200/80 space-y-1.5">
+          <div className="font-semibold text-cyan-300 text-sm">How rewards are calculated</div>
+          <div>
+            All rewards are <span className="text-cyan-300 font-medium">USD-pegged targets</span> converted
+            to EGOC at the live market price. If EGOC rises in value you receive <em>fewer</em> coins for the
+            same USD income — if it falls you receive <em>more</em>.
+          </div>
+          <div>
+            Rates also scale down as the <span className="text-cyan-300 font-medium">300M EGOC node pool</span> depletes
+            (full-speed until 80% is paid out, then tapers to zero), and block rewards
+            <span className="text-cyan-300 font-medium"> halve every ~4 years</span> over a 120-year emission schedule.
+          </div>
+          {impliedEgocPrice !== null && (
+            <div>
+              Current implied EGOC price used for your rewards:{' '}
+              <span className="text-cyan-300 font-semibold">{priceStr}</span>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Storage setup prompt ───────────────────────────────────────────── */}
       {!isStorageSetup && (
         <div className="bg-gradient-to-r from-purple-900/50 to-blue-900/50 rounded-2xl border border-purple-500/30 p-5 flex items-center justify-between gap-4">
           <div>
             <div className="font-semibold mb-1">Storage rewards are zero — configure storage first</div>
             <div className="text-sm text-gray-400">
-              Share disk space to qualify for up to <span className="text-green-400 font-semibold">0.5 EGOC / GB / day</span> — paid when your space is actually used
+              Share disk space to earn{' '}
+              <span className="text-green-400 font-semibold">~${STORAGE_USD_PER_GB_DAY}/GB/day in EGOC</span>
+              {' '}— paid when your space is actually used by other peers
             </div>
           </div>
           <button
@@ -219,7 +277,12 @@ const EarningsPage: React.FC = () => {
             <div>
               <div className="text-sm font-semibold text-green-400">Storage Provider Active</div>
               <div className="text-xs text-gray-400">
-                {allocatedGb.toFixed(1)} GB · max potential <span className="text-green-300 font-semibold">{(allocatedGb * 0.5).toFixed(3)} EGOC/day</span> (if fully utilized)
+                {allocatedGb.toFixed(1)} GB · max potential{' '}
+                <span className="text-green-300 font-semibold">
+                  {maxStorageEgocPerDay.toFixed(4)} EGOC/day
+                </span>{' '}
+                ≈ <span className="text-gray-500">${(STORAGE_USD_PER_GB_DAY * allocatedGb).toFixed(4)}/day</span>
+                {' '}(if fully utilized by peers)
               </div>
             </div>
           </div>
@@ -227,7 +290,7 @@ const EarningsPage: React.FC = () => {
         </div>
       )}
 
-      {/* ── Live session earnings ────────────────────────────────────────── */}
+      {/* ── Session earned counter ─────────────────────────────────────────── */}
       <div className="bg-gradient-to-br from-green-900/40 to-blue-900/40 border border-green-500/30 rounded-2xl p-5">
         <div className="text-xs text-gray-400 mb-1">Earned this session</div>
         <div className="text-4xl font-black text-green-400 font-mono tabular-nums">
@@ -238,13 +301,13 @@ const EarningsPage: React.FC = () => {
         </div>
       </div>
 
-      {/* ── Summary cards ───────────────────────────────────────────────── */}
+      {/* ── Summary cards ─────────────────────────────────────────────────── */}
       <div className="grid grid-cols-4 gap-3">
         {[
-          { label: 'Max Rate',     val: earnings ? fmtEgoc(earnings.daily_rewards) : '—',   unit: 'EGOC/day (potential)', color: 'text-green-400',  bg: 'bg-green-500/10'  },
-          { label: 'Max / Epoch',  val: earnings ? fmtEgoc(earnings.epoch_rewards)  : '—',   unit: '7 days (potential)',   color: 'text-blue-400',   bg: 'bg-blue-500/10'   },
-          { label: 'Pending',      val: earnings ? fmtEgoc(earnings.pending_rewards): '—',   unit: 'EGOC',                 color: 'text-yellow-400', bg: 'bg-yellow-500/10' },
-          { label: 'Total Earned', val: earnings ? fmtEgoc(earnings.total_earned)   : '—',   unit: 'EGOC',                 color: 'text-purple-400', bg: 'bg-purple-500/10' },
+          { label: 'Max Rate',     val: earnings ? fmtEgoc(earnings.daily_rewards) : '—',    unit: 'EGOC/day (potential)', color: 'text-green-400',  bg: 'bg-green-500/10'  },
+          { label: 'Max / Epoch',  val: earnings ? fmtEgoc(earnings.epoch_rewards)  : '—',    unit: '7 days (potential)',   color: 'text-blue-400',   bg: 'bg-blue-500/10'   },
+          { label: 'Pending',      val: earnings ? fmtEgoc(earnings.pending_rewards): '—',    unit: 'EGOC',                 color: 'text-yellow-400', bg: 'bg-yellow-500/10' },
+          { label: 'Total Earned', val: earnings ? fmtEgoc(earnings.total_earned)   : '—',    unit: 'EGOC',                 color: 'text-purple-400', bg: 'bg-purple-500/10' },
         ].map(c => (
           <div key={c.label} className={`${c.bg} rounded-2xl p-4 border border-white/5`}>
             <div className="text-xs text-gray-400 mb-1">{c.label}</div>
@@ -256,10 +319,12 @@ const EarningsPage: React.FC = () => {
 
       <div className="grid grid-cols-5 gap-4">
 
-        {/* ── Reward breakdown ──────────────────────────────────────────── */}
+        {/* ── Reward breakdown ────────────────────────────────────────────── */}
         <div className="col-span-3 bg-gray-800 rounded-2xl p-5 border border-gray-700">
           <h3 className="font-semibold mb-1">Potential Reward Breakdown</h3>
-          <p className="text-xs text-gray-500 mb-4">Maximum rates — actual payouts require meeting each category's criteria</p>
+          <p className="text-xs text-gray-500 mb-4">
+            Maximum rates at current price — amounts change as EGOC price moves or node pool depletes
+          </p>
           <div className="space-y-4">
             {buckets.map(bucket => {
               const pct = Math.round((bucket.val / totalBuckets) * 100);
@@ -290,9 +355,9 @@ const EarningsPage: React.FC = () => {
             <div className="text-xs text-gray-400 mb-3">Criteria to qualify for each reward</div>
             <div className="grid grid-cols-2 gap-2 text-xs">
               {[
-                { label: 'Storage',   desc: 'Allocate space AND have it used by network peers storing data on your node' },
+                { label: 'Storage',   desc: 'Allocate space AND have it used by network peers — reward tracks USD value, not a fixed EGOC amount' },
                 { label: 'Consensus', desc: 'Node must be online and actively participating in block validation rounds' },
-                { label: 'Coverage',  desc: 'PoC beacon must be online and pass geographic proof challenges' },
+                { label: 'Coverage',  desc: 'PoC beacon must be online without VPN and pass geographic proof challenges' },
                 { label: 'Retrieval', desc: 'Only paid when other nodes actually request and download data from you' },
               ].map(e => (
                 <div key={e.label} className="bg-gray-900 rounded-lg p-2.5">
@@ -304,7 +369,7 @@ const EarningsPage: React.FC = () => {
           </div>
         </div>
 
-        {/* ── Right column: node status + options ──────────────────────── */}
+        {/* ── Right column: node status + options ─────────────────────────── */}
         <div className="col-span-2 space-y-4">
 
           {/* Node status */}
@@ -399,20 +464,28 @@ const EarningsPage: React.FC = () => {
             </button>
           </div>
 
-          {/* Create blocks */}
+          {/* Block production */}
           <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
             <h3 className="font-semibold mb-2">Block Production</h3>
             <p className="text-xs text-gray-400 mb-3">
-              Every transaction you send mines a new block and earns a block reward.
-              Staying online increases your chance of being selected as a BFT validator.
+              Every transaction mines a new block. BFT validators earn block rewards that halve every
+              ~4 years over a 120-year emission schedule.
             </p>
             <div className="flex justify-between text-sm mb-1">
-              <span className="text-gray-400">Block reward</span>
-              <span className="text-green-400 font-bold">50 EGOC</span>
+              <span className="text-gray-400">Era-0 block reward</span>
+              <span className="text-green-400 font-bold">0.0832 EGOC</span>
             </div>
-            <div className="flex justify-between text-sm">
+            <div className="flex justify-between text-sm mb-1">
+              <span className="text-gray-400">Halving interval</span>
+              <span className="text-gray-300">~4 years</span>
+            </div>
+            <div className="flex justify-between text-sm mb-3">
               <span className="text-gray-400">Consensus</span>
               <span className="text-gray-300">sBFT validator</span>
+            </div>
+            <div className="text-xs text-gray-500 bg-gray-900 rounded-lg p-2.5">
+              Block rewards are fixed in EGOC (not USD). As EGOC appreciates, each block reward
+              becomes more valuable — the 120-year schedule ensures long-term miner incentives.
             </div>
           </div>
 

@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { listen } from '@tauri-apps/api/event';
+import Pagination from '../components/Pagination';
 
-// Matches src/ledger.rs LedgerBlock
 interface LedgerBlock {
   height: number;
   hash: string;
@@ -14,7 +14,6 @@ interface LedgerBlock {
   reward: number;
 }
 
-// Matches src/ledger.rs LedgerTx
 interface LedgerTx {
   hash: string;
   from: string;
@@ -28,11 +27,10 @@ interface LedgerTx {
   nonce: number;
 }
 
-// Matches src/commands/explorer.rs FileEvent
 interface FileEvent {
   cid: string;
   owner: string;
-  event_type: string;  // "Stored" | "Received"
+  event_type: string;
   original_size: number;
   encrypted_size: number;
   timestamp: number;
@@ -40,7 +38,6 @@ interface FileEvent {
   status: string;
 }
 
-// Matches src/commands/explorer.rs NetworkStats
 interface NetworkStats {
   latest_block: number;
   total_transactions: number;
@@ -52,8 +49,8 @@ interface NetworkStats {
 function shortHash(h: string) { return h.length > 18 ? h.slice(0, 10) + '…' + h.slice(-8) : h; }
 function shortAddr(a: string) { return a.length > 16 ? a.slice(0, 10) + '…' + a.slice(-4) : a; }
 function shortCid(cid: string) {
-  // Show egocid1 prefix + first 6 chars of hash + … + last 6
-  const body = cid.slice(7); // strip "egocid1"
+
+  const body = cid.slice(7);
   return body.length > 16 ? `egocid1${body.slice(0, 6)}…${body.slice(-6)}` : cid;
 }
 function fmtBytes(b: number) {
@@ -117,6 +114,29 @@ const ExplorerPage: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(true);
 
+  const [blockPage, setBlockPage] = useState(1);
+  const [txPage, setTxPage] = useState(1);
+  const [filePage, setFilePage] = useState(1);
+  const [pageSize] = useState(25);
+
+  useEffect(() => { setBlockPage(1); setTxPage(1); setFilePage(1); }, [tab]);
+
+  // Reload blocks when block page changes
+  useEffect(() => {
+    if (!netStats) return;
+    const offset = (blockPage - 1) * pageSize;
+    invoke<LedgerBlock[]>('get_blocks', { offset, limit: pageSize })
+      .then(setBlocks).catch(() => {});
+  }, [blockPage, pageSize, netStats]);
+
+  // Reload txs when tx page changes
+  useEffect(() => {
+    if (!netStats) return;
+    const offset = (txPage - 1) * pageSize;
+    invoke<LedgerTx[]>('get_all_transactions', { offset, limit: pageSize })
+      .then(setTxs).catch(() => {});
+  }, [txPage, pageSize, netStats]);
+
   useEffect(() => {
     loadData();
     const unsub = listen('ego://chain-updated', () => { loadData(); });
@@ -127,8 +147,8 @@ const ExplorerPage: React.FC = () => {
     setLoading(true);
     try {
       const [b, t, n, fe] = await Promise.all([
-        invoke<LedgerBlock[]>('get_blocks'),
-        invoke<LedgerTx[]>('get_all_transactions'),
+        invoke<LedgerBlock[]>('get_blocks', { offset: 0, limit: pageSize }),
+        invoke<LedgerTx[]>('get_all_transactions', { offset: 0, limit: pageSize }),
         invoke<NetworkStats>('get_network_stats'),
         invoke<FileEvent[]>('get_file_events'),
       ]);
@@ -147,7 +167,7 @@ const ExplorerPage: React.FC = () => {
   async function handleSearch() {
     const q = searchQuery.trim();
     if (!q) return;
-    // CID search
+
     if (q.startsWith('egocid1')) {
       const ev = fileEvents.find(e => e.cid.startsWith(q));
       if (ev) { setSelectedFile(ev); setTab('files'); return; }
@@ -165,9 +185,12 @@ const ExplorerPage: React.FC = () => {
     }
   }
 
+  const totalBlocks = netStats?.latest_block ?? blocks.length;
+  const totalTxs    = netStats?.total_transactions ?? txs.length;
+
   const tabs: { key: Tab; label: string; count: number }[] = [
-    { key: 'blocks',     label: '🧱 Blocks',       count: blocks.length      },
-    { key: 'txs',        label: '↔️ Transactions', count: txs.length         },
+    { key: 'blocks',     label: '🧱 Blocks',       count: totalBlocks        },
+    { key: 'txs',        label: '↔️ Transactions', count: totalTxs           },
     { key: 'files',      label: '📁 Files',         count: fileEvents.length  },
     { key: 'tokenomics', label: '💰 Tokenomics',    count: 0                  },
   ];
@@ -182,7 +205,7 @@ const ExplorerPage: React.FC = () => {
 
   return (
     <div className="p-6 space-y-5 max-w-5xl mx-auto">
-      {/* Network stats */}
+      {}
       <div className="grid grid-cols-5 gap-3">
         {statsCards.map(c => (
           <div key={c.label} className={`rounded-xl p-4 border ${'highlight' in c && c.highlight ? 'bg-green-500/10 border-green-500/30' : 'bg-gray-800 border-gray-700'}`}>
@@ -192,7 +215,7 @@ const ExplorerPage: React.FC = () => {
         ))}
       </div>
 
-      {/* Search */}
+      {}
       <div className="flex gap-3">
         <input
           value={searchQuery}
@@ -216,7 +239,7 @@ const ExplorerPage: React.FC = () => {
         </button>
       </div>
 
-      {/* Tabs + table */}
+      {}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="flex border-b border-gray-700">
           {tabs.map(t => (
@@ -249,36 +272,39 @@ const ExplorerPage: React.FC = () => {
               <div className="text-xs mt-1 text-gray-600">Send a transaction to mine the first block</div>
             </div>
           ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-gray-700 text-xs text-gray-400">
-                    <th className="px-5 py-3 text-left">Block</th>
-                    <th className="px-5 py-3 text-left">Hash</th>
-                    <th className="px-5 py-3 text-left">Miner</th>
-                    <th className="px-5 py-3 text-right">Txs</th>
-                    <th className="px-5 py-3 text-right">Reward</th>
-                    <th className="px-5 py-3 text-right">Age</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-700/50">
-                  {blocks.map(block => (
-                    <tr
-                      key={block.height}
-                      onClick={() => setSelectedBlock(block)}
-                      className="hover:bg-gray-700/40 cursor-pointer transition"
-                    >
-                      <td className="px-5 py-3 font-mono text-blue-400">#{block.height.toLocaleString()}</td>
-                      <td className="px-5 py-3 font-mono text-xs text-gray-300">{shortHash(block.hash)}</td>
-                      <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(block.miner)}</td>
-                      <td className="px-5 py-3 text-right text-gray-300">{block.tx_count}</td>
-                      <td className="px-5 py-3 text-right text-green-400">{(block.reward / 1_000_000).toFixed(0)} EGOC</td>
-                      <td className="px-5 py-3 text-right text-gray-500 text-xs">{timeAgo(block.timestamp)}</td>
+            <>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-gray-700 text-xs text-gray-400">
+                      <th className="px-5 py-3 text-left">Block</th>
+                      <th className="px-5 py-3 text-left">Hash</th>
+                      <th className="px-5 py-3 text-left">Miner</th>
+                      <th className="px-5 py-3 text-right">Txs</th>
+                      <th className="px-5 py-3 text-right">Reward</th>
+                      <th className="px-5 py-3 text-right">Age</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                  </thead>
+                  <tbody className="divide-y divide-gray-700/50">
+                    {blocks.map(block => (
+                      <tr
+                        key={block.height}
+                        onClick={() => setSelectedBlock(block)}
+                        className="hover:bg-gray-700/40 cursor-pointer transition"
+                      >
+                        <td className="px-5 py-3 font-mono text-blue-400">#{block.height.toLocaleString()}</td>
+                        <td className="px-5 py-3 font-mono text-xs text-gray-300">{shortHash(block.hash)}</td>
+                        <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(block.miner)}</td>
+                        <td className="px-5 py-3 text-right text-gray-300">{block.tx_count}</td>
+                        <td className="px-5 py-3 text-right text-green-400">{(block.reward / 1_000_000).toFixed(0)} EGOC</td>
+                        <td className="px-5 py-3 text-right text-gray-500 text-xs">{timeAgo(block.timestamp)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <Pagination total={totalBlocks} page={blockPage} pageSize={pageSize} onPage={setBlockPage} onPageSize={() => {}} />
+            </>
           )
 
         ) : tab === 'txs' ? (
@@ -289,48 +315,51 @@ const ExplorerPage: React.FC = () => {
               <div className="text-xs mt-1 text-gray-600">Use the Wallet tab to send EGOC</div>
             </div>
           ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-gray-700 text-xs text-gray-400">
-                    <th className="px-5 py-3 text-left">Hash</th>
-                    <th className="px-5 py-3 text-left">Block</th>
-                    <th className="px-5 py-3 text-left">From</th>
-                    <th className="px-5 py-3 text-left">To</th>
-                    <th className="px-5 py-3 text-right">Amount</th>
-                    <th className="px-5 py-3 text-right">Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-700/50">
-                  {txs.map(tx => (
-                    <tr
-                      key={tx.hash}
-                      onClick={() => setSelectedTx(tx)}
-                      className="hover:bg-gray-700/40 cursor-pointer transition"
-                    >
-                      <td className="px-5 py-3 font-mono text-xs text-blue-400">{shortHash(tx.hash)}</td>
-                      <td className="px-5 py-3 font-mono text-xs text-gray-400">
-                        {tx.block_height != null ? `#${tx.block_height.toLocaleString()}` : '—'}
-                      </td>
-                      <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(tx.from)}</td>
-                      <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(tx.to)}</td>
-                      <td className="px-5 py-3 text-right text-gray-200">{(tx.amount / 1_000_000).toFixed(2)} EGOC</td>
-                      <td className="px-5 py-3 text-right">
-                        <span className={`text-xs px-2 py-0.5 rounded-full ${
-                          tx.status === 'Confirmed' ? 'bg-green-500/20 text-green-400' :
-                          tx.status === 'Pending'   ? 'bg-yellow-500/20 text-yellow-400' :
-                                                      'bg-red-500/20 text-red-400'
-                        }`}>{tx.status}</span>
-                      </td>
+            <>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-gray-700 text-xs text-gray-400">
+                      <th className="px-5 py-3 text-left">Hash</th>
+                      <th className="px-5 py-3 text-left">Block</th>
+                      <th className="px-5 py-3 text-left">From</th>
+                      <th className="px-5 py-3 text-left">To</th>
+                      <th className="px-5 py-3 text-right">Amount</th>
+                      <th className="px-5 py-3 text-right">Status</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                  </thead>
+                  <tbody className="divide-y divide-gray-700/50">
+                    {txs.map(tx => (
+                      <tr
+                        key={tx.hash}
+                        onClick={() => setSelectedTx(tx)}
+                        className="hover:bg-gray-700/40 cursor-pointer transition"
+                      >
+                        <td className="px-5 py-3 font-mono text-xs text-blue-400">{shortHash(tx.hash)}</td>
+                        <td className="px-5 py-3 font-mono text-xs text-gray-400">
+                          {tx.block_height != null ? `#${tx.block_height.toLocaleString()}` : '—'}
+                        </td>
+                        <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(tx.from)}</td>
+                        <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(tx.to)}</td>
+                        <td className="px-5 py-3 text-right text-gray-200">{(tx.amount / 1_000_000).toFixed(2)} EGOC</td>
+                        <td className="px-5 py-3 text-right">
+                          <span className={`text-xs px-2 py-0.5 rounded-full ${
+                            tx.status === 'Confirmed' ? 'bg-green-500/20 text-green-400' :
+                            tx.status === 'Pending'   ? 'bg-yellow-500/20 text-yellow-400' :
+                                                        'bg-red-500/20 text-red-400'
+                          }`}>{tx.status}</span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <Pagination total={totalTxs} page={txPage} pageSize={pageSize} onPage={setTxPage} onPageSize={() => {}} />
+            </>
           )
 
         ) : tab === 'tokenomics' ? (
-          /* ── Tokenomics tab ── */
+
           !tokenomics ? (
             <div className="py-16 text-center text-gray-500">
               <div className="text-3xl mb-3 animate-pulse">💰</div>
@@ -339,7 +368,7 @@ const ExplorerPage: React.FC = () => {
             </div>
           ) : (
             <div className="p-5 space-y-5">
-              {/* Supply overview */}
+              {}
               <div className="grid grid-cols-3 gap-3">
                 {[
                   { label: 'Total Supply',   val: `${tokenomics.total_supply_egoc.toLocaleString()} EGOC`, color: 'text-white' },
@@ -353,7 +382,7 @@ const ExplorerPage: React.FC = () => {
                 ))}
               </div>
 
-              {/* Emission pools */}
+              {}
               <div>
                 <div className="text-xs text-gray-400 mb-3 font-semibold uppercase tracking-wide">Emission Pools</div>
                 <div className="space-y-2">
@@ -378,7 +407,7 @@ const ExplorerPage: React.FC = () => {
                 </div>
               </div>
 
-              {/* Halving schedule */}
+              {}
               <div className="bg-gray-900 rounded-xl p-4 border border-gray-700/50">
                 <div className="text-xs font-semibold text-gray-300 mb-3">Halving Schedule</div>
                 <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
@@ -398,7 +427,7 @@ const ExplorerPage: React.FC = () => {
                 </div>
               </div>
 
-              {/* Staking + DRS */}
+              {}
               <div className="grid grid-cols-2 gap-3">
                 <div className="bg-gray-900 rounded-xl p-4 border border-gray-700/50">
                   <div className="text-xs font-semibold text-gray-300 mb-3">Network Staking</div>
@@ -422,7 +451,7 @@ const ExplorerPage: React.FC = () => {
           )
 
         ) : (
-          /* ── Files tab ── */
+
           fileEvents.length === 0 ? (
             <div className="py-16 text-center text-gray-500">
               <div className="text-4xl mb-3">📁</div>
@@ -430,52 +459,55 @@ const ExplorerPage: React.FC = () => {
               <div className="text-xs mt-1 text-gray-600">Store a file in the Storage tab to see it here</div>
             </div>
           ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-gray-700 text-xs text-gray-400">
-                    <th className="px-5 py-3 text-left">CID Hash</th>
-                    <th className="px-5 py-3 text-left">Type</th>
-                    <th className="px-5 py-3 text-left">Owner</th>
-                    <th className="px-5 py-3 text-right">Size</th>
-                    <th className="px-5 py-3 text-right">Status</th>
-                    <th className="px-5 py-3 text-right">Age</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-700/50">
-                  {fileEvents.map(ev => (
-                    <tr
-                      key={ev.cid}
-                      onClick={() => setSelectedFile(ev)}
-                      className="hover:bg-gray-700/40 cursor-pointer transition"
-                    >
-                      <td className="px-5 py-3 font-mono text-xs text-blue-400">{shortCid(ev.cid)}</td>
-                      <td className="px-5 py-3">
-                        <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                          ev.event_type === 'Stored'   ? 'bg-purple-500/20 text-purple-400' :
-                                                         'bg-blue-500/20 text-blue-400'
-                        }`}>{ev.event_type}</span>
-                      </td>
-                      <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(ev.owner)}</td>
-                      <td className="px-5 py-3 text-right text-gray-300 text-xs">{fmtBytes(ev.original_size)}</td>
-                      <td className="px-5 py-3 text-right">
-                        <span className={`text-xs px-2 py-0.5 rounded-full ${
-                          ev.status === 'Active'   ? 'bg-green-500/20 text-green-400' :
-                          ev.status === 'Received' ? 'bg-blue-500/20 text-blue-400' :
-                                                     'bg-red-500/20 text-red-400'
-                        }`}>{ev.status}</span>
-                      </td>
-                      <td className="px-5 py-3 text-right text-gray-500 text-xs">{timeAgo(ev.timestamp)}</td>
+            <>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-gray-700 text-xs text-gray-400">
+                      <th className="px-5 py-3 text-left">CID Hash</th>
+                      <th className="px-5 py-3 text-left">Type</th>
+                      <th className="px-5 py-3 text-left">Owner</th>
+                      <th className="px-5 py-3 text-right">Size</th>
+                      <th className="px-5 py-3 text-right">Status</th>
+                      <th className="px-5 py-3 text-right">Age</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                  </thead>
+                  <tbody className="divide-y divide-gray-700/50">
+                    {fileEvents.slice((filePage - 1) * pageSize, filePage * pageSize).map(ev => (
+                      <tr
+                        key={ev.cid}
+                        onClick={() => setSelectedFile(ev)}
+                        className="hover:bg-gray-700/40 cursor-pointer transition"
+                      >
+                        <td className="px-5 py-3 font-mono text-xs text-blue-400">{shortCid(ev.cid)}</td>
+                        <td className="px-5 py-3">
+                          <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                            ev.event_type === 'Stored'   ? 'bg-purple-500/20 text-purple-400' :
+                                                           'bg-blue-500/20 text-blue-400'
+                          }`}>{ev.event_type}</span>
+                        </td>
+                        <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(ev.owner)}</td>
+                        <td className="px-5 py-3 text-right text-gray-300 text-xs">{fmtBytes(ev.original_size)}</td>
+                        <td className="px-5 py-3 text-right">
+                          <span className={`text-xs px-2 py-0.5 rounded-full ${
+                            ev.status === 'Active'   ? 'bg-green-500/20 text-green-400' :
+                            ev.status === 'Received' ? 'bg-blue-500/20 text-blue-400' :
+                                                       'bg-red-500/20 text-red-400'
+                          }`}>{ev.status}</span>
+                        </td>
+                        <td className="px-5 py-3 text-right text-gray-500 text-xs">{timeAgo(ev.timestamp)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <Pagination total={fileEvents.length} page={filePage} pageSize={pageSize} onPage={setFilePage} onPageSize={ps => { setPageSize(ps); setFilePage(1); }} />
+            </>
           )
         )}
       </div>
 
-      {/* Block detail modal */}
+      {}
       {selectedBlock && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
           <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-lg border border-gray-700 shadow-2xl">
@@ -505,7 +537,7 @@ const ExplorerPage: React.FC = () => {
         </div>
       )}
 
-      {/* TX detail modal */}
+      {}
       {selectedTx && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
           <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-lg border border-gray-700 shadow-2xl">
@@ -552,7 +584,7 @@ const ExplorerPage: React.FC = () => {
         </div>
       )}
 
-      {/* File event detail modal */}
+      {}
       {selectedFile && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
           <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-lg border border-gray-700 shadow-2xl">

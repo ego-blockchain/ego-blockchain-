@@ -1,0 +1,10 @@
+{
+  "name": "ego-presale-proxy",
+  "version": "1.0.0",
+  "description": "Proxy that holds the Stripe secret key server-side for Ego presale card payments",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": { "node": ">=18" }
+}

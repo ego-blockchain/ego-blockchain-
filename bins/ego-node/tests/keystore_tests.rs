@@ -353,7 +353,6 @@ fn test_keystore_touch() {
     let mut keystore = SecureKeystore::new();
     let initial_time = keystore.metadata().last_accessed;
 
-    // Wait longer to ensure time difference on all systems
     std::thread::sleep(std::time::Duration::from_secs(1));
     keystore.touch();
 

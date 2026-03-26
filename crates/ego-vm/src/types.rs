@@ -1,13 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-/// Resource Units — CPU + memory + IO metering.
-/// 1 RU ≈ 1 Wasmtime fuel unit.
-pub const DEFAULT_CALL_FUEL:   u64 = 10_000_000;  // 10M RU per call
-pub const DEFAULT_DEPLOY_FUEL: u64 = 50_000_000;  // 50M RU for init
-pub const MAX_MEMORY_PAGES:    u32 = 256;          // 256 × 64 KB = 16 MB max per contract
-pub const MAX_CODE_SIZE:       usize = 512 * 1024; // 512 KB max WASM binary
+pub const DEFAULT_CALL_FUEL:   u64 = 10_000_000;
+pub const DEFAULT_DEPLOY_FUEL: u64 = 50_000_000;
+pub const MAX_MEMORY_PAGES:    u32 = 256;
+pub const MAX_CODE_SIZE:       usize = 512 * 1024;
 
-/// A 20-byte contract address derived from blake2s(deployer_pubkey)[0..20].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ContractAddress(pub [u8; 20]);
 

@@ -3,19 +3,16 @@ import react from '@vitejs/plugin-react';
 import { resolve } from 'path';
 import { copyFileSync, mkdirSync, existsSync, readFileSync, writeFileSync, rmSync } from 'fs';
 
-// Post-build plugin: copy manifest + icons, fix HTML location
 const copyStaticPlugin = {
   name: 'copy-static',
   closeBundle() {
     const distDir = resolve(__dirname, 'dist');
 
-    // Copy manifest.json
     copyFileSync(
       resolve(__dirname, 'manifest.json'),
       resolve(distDir, 'manifest.json'),
     );
 
-    // Copy icons
     const iconsDir = resolve(distDir, 'icons');
     if (!existsSync(iconsDir)) mkdirSync(iconsDir, { recursive: true });
     for (const size of [16, 48, 128]) {
@@ -25,18 +22,16 @@ const copyStaticPlugin = {
       }
     }
 
-    // Move popup HTML from dist/src/popup/index.html → dist/popup/index.html
-    // (Vite preserves dir structure relative to project root for HTML inputs)
     const htmlSrc = resolve(distDir, 'src/popup/index.html');
     const htmlDst = resolve(distDir, 'popup/index.html');
     if (existsSync(htmlSrc)) {
       let html = readFileSync(htmlSrc, 'utf-8');
-      // Fix script src: ensure it's just "popup.js" (no leading path)
+
       html = html.replace(/src="[^"]*popup\.js"/g, 'src="popup.js"');
       // Fix modulepreload absolute paths → relative (prepend ../ since popup/ is one level in)
-      html = html.replace(/href="\/chunks\//g, 'href="../chunks/');
+      html = html.replace(/href="\/chunks\
       writeFileSync(htmlDst, html);
-      // Remove leftover src/ directory
+
       rmSync(resolve(distDir, 'src'), { recursive: true, force: true });
     }
   },
