@@ -26,7 +26,10 @@ Be direct, casual, concise. No filler phrases. Short sentences. Answer first, ex
 ## Ego Blockchain
 - Quantum-safe Layer-1 in Rust. Tokens: EGOC (native, 1 EGOC = 1,000,000 uEGOC) and EGUSD (native USD-pegged stablecoin, 1 EGUSD = 1 USD). Target: 100k+ TPS, 16 shards.
 - Consensus: HotStuff BFT with pipelined view-change (2f+1 quorum, 10s timeout, automatic leader rotation).
-- Crypto: Ed25519 + Dilithium + Kyber (post-quantum). Address prefix: `egot` (testnet, bech32).
+- Crypto: Ed25519 (classical signing) + Dilithium2 (post-quantum signing, NIST PQC standard) + Kyber768 (post-quantum key encapsulation). Address prefix: `egot` (testnet, bech32).
+- **Key generation**: 32-byte seed from OS secure RNG → Ed25519 signing key derived from seed; Dilithium2 and Kyber768 key pairs derived from the same seed. Address = bech32(blake2(dilithium_public_key)).
+- **Transaction signing**: Dilithium2 by default (quantum-safe). Ed25519 available for legacy/compat. All signatures verified on-chain before a TX is accepted.
+- **Key encapsulation (Kyber768)**: used for Messenger shared-key establishment and future cross-chain bridging. Keys zeroized (wiped from memory) on drop.
 - Crates: ego-core, ego-vm (WASM via wasmtime, fuel metering), ego-rollup, urego-compiler, ego-p2p (libp2p 0.56 + Kademlia DHT).
 - JSON-RPC 2.0 server: http://127.0.0.1:47395 (POST /, WS /ws, GET /health). Used by JS SDK and dApps.
 
@@ -119,14 +122,18 @@ Advanced: EGO-50 MEV Protection, EGO-51 Fee Market, EGO-52 Governance, EGO-53 DI
 
 ## Swap / Bridge
 - Swap between EGOC, EGUSD, BTC, ETH, BNB, ADA, USDT, USDC and other listed assets directly in the Wallet page.
-- Bridge fee: 0.5% on swap output. 3-step flow: get quote → send to bridge deposit address → done.
-- Rates fetched live from the oracle network.
+- **External swaps** (non-EGOC pairs) use ChangeNow API v2. Flow: estimate quote → create exchange → ChangeNow returns a deposit address → user sends the from-coin there → ChangeNow delivers the to-coin to the user's address → poll status until complete.
+- **EGOC↔EGUSD** swaps are on-chain using the local oracle price. No third party.
+- EGOC live price comes from the decentralized oracle gossip network (21-sample median). Other coin prices from CoinGecko.
+- Bridge fee: 0.5% on swap output for external pairs. Rates shown before confirmation.
 
 ## Staking
 - Stake EGOC to earn rewards and boost DRS. Minimum stake to register as validator: 1,000 EGOC.
-- Base APR: 12.5%. Lock bonuses: 30d = 0%, 90d = +2%, 180d = +5%, 365d = +10%.
+- APR: Node staking ~40%, General staking ~20% (DAO-tunable). New block rewards locked 30 days, earn 20% simple interest over the lock period (~0.0548%/day on the locked tranche).
+- Lock bonuses: 30d = 0%, 90d = +2%, 180d = +5%, 365d = +10%.
 - Early unstake penalty: 10% of staked amount (distributed to active nodes).
-- Staking boosts DRS score by +20%. Does not block other earnings (storage, coverage, etc.).
+- Staking boosts DRS score. Does not block other earnings (storage, coverage, etc.).
+- Market tax: 1% buy/sell tax on AMM/CEX trades — 50% to Staking Rewards Pool, 50% to Treasury/Liquidity (DAO-tunable). Wallet-to-wallet transfers are fee-free.
 - Staking address: `egot1staking000000000000000000000000000000000`.
 
 ## Deterministic Reward Scoring (DRS)
@@ -149,11 +156,22 @@ Advanced: EGO-50 MEV Protection, EGO-51 Fee Market, EGO-52 Governance, EGO-53 DI
 - `respond_to_challenges` Tauri command generates Merkle proofs over stored files.
 
 ## Tokenomics
-- **Total supply**: 1,000,000,000 EGOC. Distribution: block emission 21%, node ops 30%, staking 14%, ecosystem/DAO 20%, foundation/team (4yr vest) 15%.
-- **Block reward**: starts at ~0.833 EGOC/block. Halving every 126,000,000 blocks (~145 days). Block time: 100ms (10 blocks/sec).
+- **Total supply**: 100,000,000 EGOC (100 million). Distribution: 40M block emissions (node rewards over ~20 years), 20M liquidity & treasury, 20M investors/seed, 10M team (4yr vest, 1yr cliff), 10M marketing & ecosystem.
+- **Block reward**: 0.03172 EGOC/block at launch. Halving every 2 years (~630,000,000 blocks at 0.1s block time). Block time: 100ms (10 blocks/sec).
+- **Reward split per block**: Storage 55%, Consensus/Proposer 25%, Coverage 20% (all DAO-tunable via governance vote).
 - **Daily node rates**: Storage 0.5 EGOC/GB/day, Consensus 10 EGOC/day, Coverage 8 EGOC/day, Retrieval 2 EGOC/day. Faucet: 100 EGOC/24h.
 - **Fee structure**: priced in USD, converted to uEGOC via oracle. Transfer $0.003, Call $0.004, Deploy $0.006, Storage $0.0002/MB/month. Stakers get 90% discount; storage/deploy free for stakers. Hard floor: 10 uEGOC. Hard ceiling: 5 EGOC. 100% of fees burned (deflationary).
-- Node reward pool tapers linearly when remaining pool < 20% of NODE_POOL (300M EGOC).
+- Node reward pool tapers linearly when remaining pool < 20% of the 40M emissions pool.
+
+## Pre-Sale (Seed Round)
+- **Price**: $2.00 per EGOC (seed round, ~18% discount vs. $2.45 launch price).
+- **Payment methods**: BTC, ETH, USDT, USDC, BNB, ADA, SOL, TRX — or credit/debit card via Stripe.
+- **Crypto flow**: user picks coin and amount → app shows the exact deposit address (Ego team treasury wallet) + EGOC allocation → user sends crypto manually → receives an encrypted IOU file as proof of purchase.
+- **Card flow (Stripe)**: Stripe Checkout session created via a secure server-side proxy (STRIPE_SECRET_KEY never in the app) → user pays on Stripe hosted page → payment verified → encrypted IOU file issued.
+- **IOU file**: JSON file containing public metadata (coin, amount, deposit address, EGOC allocation) + AES-256-GCM encrypted allocation details (key derived via BLAKE3(password ‖ salt)). User keeps the file + password — this is their on-chain claim at mainnet launch. Genesis block credits all IOU holders.
+- **Mainnet address**: the IOU is tied to the user's mainnet address (derived alongside testnet keys). EGOC will be airdropped to that address at genesis.
+- Pre-sale history viewable in the Wallet page under "Pre-Sale Records".
+- Crypto treasury deposit addresses: BTC `bc1qaqx0xf9sv0ktmtcxlzzh7t7kf59nwu8c0vlqhg`, ETH/USDT/USDC/BNB `0xD4f2B1fA44668B806290A4c3CB758ABb7EF35C64`, ADA (long bech32), SOL `9PZzHQYohiR9fTKTJXUaRYKv6doM4NQPJZKcrVvTJbbW`, TRX `TSZnnQGN8idN6vEU66NX1ek1AtwmHbYLRx`.
 
 ## Email 2FA — Confirmation Codes
 - All confirmation codes (registration + transactions) are 4 digits + 2 uppercase letters at random positions (e.g. `3A8S97`, `4E9Q72`). Not 6 digits. This gives ~101 million combinations — more secure than pure digits.
@@ -168,8 +186,19 @@ Advanced: EGO-50 MEV Protection, EGO-51 Fee Market, EGO-52 Governance, EGO-53 DI
 - **Tokens tab**: Shows native EGOC stats (supply, holders, price, market cap) with a "TEST" badge. "EGO-20 tokens — Coming Soon" section below.
 - Auto-refresh every 10s preserves current page.
 
+## DAO Governance
+- Ego DAO is fully decentralized — community-submitted proposals, community-submitted knowledge tests, no admin override.
+- **Two-type voting per proposal** (both required to reach quorum):
+  1. **Stake Vote**: power = your_staked_egoc / total_staked_egoc. Reflects economic stake.
+  2. **Knowledge Vote**: voter answers an attached multiple-choice test; score = correct/total × 10 knowledge points. Combined = (stake_power + knowledge_power) / 2. Rewards informed participation over pure capital.
+- **Proposal types**: ParameterChange (e.g. APR, block reward split), FeatureFlag (enable/disable a protocol feature), TextResolution (signal/DAO statement).
+- **Proposal flow**: Any community member creates proposal → optional knowledge test attached → 7-day voting period (default) → 5% quorum required → passes if combined winning option > 50%.
+- **Knowledge test**: 1–10 questions, each with 2–4 options. Creator marks correct answers (stored server-side, not revealed to voters until after voting ends).
+- **Results**: per-option stake_power, knowledge_power, and combined_power shown after voting closes. Results stored on-chain in RocksDB CF_DAO.
+- Governance page: proposal list (Active/All/Passed/Failed/Expired tabs), create proposal modal, proposal detail modal with stake vote + knowledge test + results bars.
+
 ## App pages
-Wallet (send/receive/QR), Storage (AES-256-GCM upload/download), EgoSafe (encrypt+share egoshare1 bundles), Explorer (live blocks/txs from RocksDB), Earnings (rewards + session counter), Messenger (P2P E2E encrypted chat via DHT inbox), Settings (PIN/recovery/QR keys), Contracts (deploy/call Urego with testnet/mainnet selector + dry run), Coverage, Staking.
+Wallet (send/receive/QR), Storage (AES-256-GCM upload/download), EgoSafe (encrypt+share egoshare1 bundles), Explorer (live blocks/txs from RocksDB), Earnings (rewards + session counter), Messenger (P2P E2E encrypted chat via DHT inbox), Settings (PIN/recovery/QR keys), Contracts (deploy/call Urego with testnet/mainnet selector + dry run), Coverage, Staking, Market (live prices & charts), Governance (DAO proposals + two-type voting).
 
 ## Messenger
 - Bundle: `egocontact1:{addr}:{ed25519_hex}:{kyber_hex}:{name_b64}:{shared_key_hex}`. Encryption: AES-256-GCM.
@@ -191,9 +220,13 @@ Wallet (send/receive/QR), Storage (AES-256-GCM upload/download), EgoSafe (encryp
 - Filter by: all / sent / received. Paginated with 25/50/100 rows. Explorer shows Action labels: Transfer, Stake, Unstake, Slash, Faucet, System, Memo.
 
 ## File Storage Details
-- Duration: 1–24 months (configurable). CID: `egocid1{blake2_hex_of_plaintext}`. On-disk: `nonce(12) || ciphertext` (AES-256-GCM).
+- Duration: 1–24 months (configurable). CID: `egocid1{blake2_hex_of_plaintext}`. On-disk: `nonce(12) || ciphertext` (AES-256-GCM, 256-bit key).
 - Files received via Messenger (egoshare1 bundles) are saved locally only — not pushed to decentralized storage or counted toward your storage quota.
 - Block-based files (large files, prefix `egomfd1`) are split into chunks and delivered via DHT manifest.
+- Minimum 2 replicas per file enforced network-wide every 30 seconds. `replica_peers` tracked per file; `PinAck` records which peers hold a copy.
+- Storage rewards: 0.5 EGOC/GB/day. Sector commitment uses `comm_d` (data commitment). PoST challenges verify data is still held — faults reduce DRS score.
+- The **Storage page** lets you configure how much disk space to share with the network, upload/download files (AES-256-GCM encrypted), and manage stored files.
+- The **EgoSafe page** is for encrypting personal files and sharing them securely via `egoshare1` bundles.
 
 ## Settings
 - PIN management: set/change/reset via email link. PIN gates recovery phrase access.

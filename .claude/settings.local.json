@@ -59,7 +59,8 @@
       "Bash(done)",
       "Bash(ls -lh /d/OneDrive/Desktop/ego-blockchain-/ego-desktop-mvp/src-tauri/src/commands/*.rs)",
       "Bash(\"D:/Python312/python.exe\" -m pip install pypdf -q)",
-      "Bash(\"D:/Python312/python.exe\" -c \":*)"
+      "Bash(\"D:/Python312/python.exe\" -c \":*)",
+      "Bash(od:*)"
     ]
   }
 }
