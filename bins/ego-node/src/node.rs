@@ -215,7 +215,6 @@ impl Node {
         let data_optimizer = DataOptimizer::new();
         let state_manager = StateManager::new(1, 1);
 
-        // Initialize PoRep components
         let porep_prover = if roles_set.contains(&NodeRole::StorageProvider) {
             let keypair = keystore.keypair().clone();
             let config = ProverConfig::default();
@@ -490,7 +489,7 @@ impl Node {
     }
 
     pub async fn new_seed_node() -> anyhow::Result<Self> {
-        // Load or create a stable keypair so the peer ID survives container restarts.
+
         let seed_path = std::path::PathBuf::from(
             std::env::var("EGO_DATA_DIR").unwrap_or_else(|_| "/data".into())
         ).join("node_seed.bin");

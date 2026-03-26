@@ -1,17 +1,3 @@
-/**
- * Ego Wallet — Content Script
- *
- * Injects the window.ego provider into every page by appending
- * an inline <script> tag. This avoids CSP issues with external scripts
- * while still running in the page's JS context (not isolated world).
- *
- * Communication path:
- *   page ↔ CustomEvents (EGO_REQUEST / EGO_RESPONSE)
- *   content ↔ chrome.runtime.sendMessage ↔ background
- */
-
-// ── Bridge: page → background via postMessage relay ──────────────────────────
-
 window.addEventListener('EGO_REQUEST', async (event: Event) => {
   const e = event as CustomEvent<{
     method: string;
@@ -86,8 +72,6 @@ window.addEventListener('EGO_REQUEST', async (event: Event) => {
     }));
   }
 });
-
-// ── Inject window.ego provider into page context ──────────────────────────────
 
 const scriptContent = `
 (function() {

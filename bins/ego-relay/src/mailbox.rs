@@ -1,15 +1,3 @@
-//! Relay-side store-and-forward mailbox backed by RocksDB.
-//!
-//! Peers POST encrypted message blobs to `/inbox/{hash}` where `hash =
-//! blake3(recipient_address)`.  The relay never sees plaintext — it only
-//! stores opaque bytes and returns them on GET.  Messages auto-expire after
-//! TTL_SECS (7 days) via RocksDB's built-in TTL compaction filter.
-//!
-//! Listening on port 4002 alongside the libp2p relay on port 4001.
-//!
-//! Key format:   `{hash}:{id}`
-//! Value format: `{8-byte LE stored_at}{ciphertext}`
-
 use axum::{
     body::Bytes,
     extract::{Path, State},
@@ -25,23 +13,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-// Per-inbox rate limit: at most MAX_POSTS_PER_WINDOW deposits in RATE_WINDOW_SECS.
-// Prevents a spammer from filling the inbox of a popular address.
-const RATE_WINDOW_SECS: u64 = 3600; // 1 hour
+const RATE_WINDOW_SECS: u64 = 3600;
 const MAX_POSTS_PER_WINDOW: usize = 20;
 
-// ── Concierge limits ──────────────────────────────────────────────────────────
-// The relay is a lightweight concierge: it holds contact-pairing events
-// (ContactRequest / ContactResponse) only — NOT ongoing chat.
-// Chat messages are delivered P2P direct or queued in the sender's local outbox.
-//
-// At 1 M users the active-pairing traffic is tiny:
-//   1 000 pairings/day × 4 KB = 4 MB/day inbox writes — trivially small.
-const MAX_MSG_SIZE:   usize = 16 * 1024;  // 16 KB per message (enough for contact bundles)
-const MAX_INBOX_MSGS: usize = 20;          // max queued messages per inbox
-const TTL_SECS:       u64   = 48 * 3600;  // 48-hour TTL: discovery events, not archives
-
-// ── Types ─────────────────────────────────────────────────────────────────────
+const MAX_MSG_SIZE:   usize = 16 * 1024;
+const MAX_INBOX_MSGS: usize = 20;
+const TTL_SECS:       u64   = 48 * 3600;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct MailboxEntry {
@@ -50,8 +27,6 @@ pub struct MailboxEntry {
     pub stored_at:  u64,
 }
 
-/// In-memory rate-limit counters: inbox hash → (window_start, post_count).
-/// Cheap to keep in RAM; never persisted (resets on relay restart is fine).
 type RateMap = Arc<Mutex<HashMap<String, (u64, usize)>>>;
 
 pub struct MailboxStore {
@@ -76,14 +51,10 @@ pub fn new_store() -> MailboxStore {
     }
 }
 
-// ── Key/value encoding ────────────────────────────────────────────────────────
-
-/// RocksDB key: `{hash}:{id}` (both ASCII-safe hex strings)
 fn db_key(hash: &str, id: &str) -> Vec<u8> {
     format!("{}:{}", hash, id).into_bytes()
 }
 
-/// RocksDB value: first 8 bytes = stored_at as u64 LE, remainder = ciphertext
 fn encode_value(stored_at: u64, ct: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(8 + ct.len());
     v.extend_from_slice(&stored_at.to_le_bytes());
@@ -97,12 +68,9 @@ fn decode_value(id: &str, raw: &[u8]) -> Option<MailboxEntry> {
     Some(MailboxEntry { id: id.to_string(), ciphertext: raw[8..].to_vec(), stored_at })
 }
 
-/// Byte prefix used to scope iteration to one inbox: `{hash}:`
 fn inbox_prefix(hash: &str) -> Vec<u8> {
     format!("{}:", hash).into_bytes()
 }
-
-// ── Router ────────────────────────────────────────────────────────────────────
 
 pub fn router(store: MailboxStore) -> Router {
     Router::new()
@@ -110,8 +78,6 @@ pub fn router(store: MailboxStore) -> Router {
         .route("/inbox/{hash}/{id}", delete(delete_message))
         .with_state(store)
 }
-
-// ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn post_message(
     Path(hash):   Path<String>,
@@ -124,12 +90,11 @@ async fn post_message(
 
     let now = now_secs();
 
-    // ── Per-inbox rate limiting ───────────────────────────────────────────────
     {
         let mut rate = store.rate.lock().unwrap();
         let entry = rate.entry(hash.clone()).or_insert((now, 0));
         if now.saturating_sub(entry.0) > RATE_WINDOW_SECS {
-            *entry = (now, 0); // reset window
+            *entry = (now, 0);
         }
         if entry.1 >= MAX_POSTS_PER_WINDOW {
             return StatusCode::TOO_MANY_REQUESTS;
@@ -141,7 +106,6 @@ async fn post_message(
         .to_hex()
         .to_string();
 
-    // Count existing messages for this inbox before inserting
     let prefix = inbox_prefix(&hash);
     let count = store.db
         .prefix_iterator(&prefix)
@@ -190,7 +154,7 @@ async fn delete_message(
     State(store):     State<MailboxStore>,
 ) -> StatusCode {
     let key = db_key(&hash, &id);
-    let _ = store.db.delete(&key); // idempotent
+    let _ = store.db.delete(&key);
     StatusCode::NO_CONTENT
 }
 

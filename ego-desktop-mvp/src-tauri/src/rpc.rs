@@ -1,14 +1,3 @@
-//! JSON-RPC 2.0 + WebSocket server — exposes all Ego chain functions to
-//! external applications (JS SDK, dApps, explorer, mobile clients).
-//!
-//! Listens on 127.0.0.1:47395.
-//!   POST /          — JSON-RPC 2.0 (single + batch)
-//!   GET  /ws        — WebSocket subscriptions
-//!   GET  /health    — "ok" liveness probe
-//!
-//! This is the gateway for the @ego-blockchain/sdk TypeScript package and
-//! any third-party dApp that wants to talk to a local Ego node.
-
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     extract::State,
@@ -20,8 +9,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{net::SocketAddr, sync::Arc};
-
-// ── JSON-RPC types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -90,13 +77,11 @@ pub async fn start_rpc_server() {
 
 async fn health() -> &'static str { "ok" }
 
-// ── JSON-RPC handler ───────────────────────────────────────────────────────────
-
 async fn rpc_handler(
     State(_subs): State<Subscribers>,
     Json(body): Json<Value>,
 ) -> Response {
-    // Support both single requests and batch arrays
+
     if body.is_array() {
         let batch: Vec<Value> = body.as_array().unwrap()
             .iter()
@@ -128,7 +113,6 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
     let p = &req.params;
     match req.method.as_str() {
 
-        // ── Wallet ──────────────────────────────────────────────────────────
         "wallet.getBalance" => {
             let addr = p["address"].as_str().unwrap_or_default();
             let bal  = crate::chain_db::balance_of(addr);
@@ -148,7 +132,6 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
             RpcResponse::ok(req.id, json!(tx))
         }
 
-        // ── Chain ────────────────────────────────────────────────────────────
         "chain.getBlocks" => {
             let from  = p["fromHeight"].as_u64().unwrap_or(0);
             let limit = p["limit"].as_u64().unwrap_or(50) as u32;
@@ -205,7 +188,6 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
             RpcResponse::ok(req.id, json!({ "height": crate::chain_db::finalized_height() }))
         }
 
-        // ── Contracts ────────────────────────────────────────────────────────
         "contract.getState" => {
             let addr   = p["contractAddr"].as_str().unwrap_or_default();
             let prefix = p["prefix"].as_str().unwrap_or_default();
@@ -240,7 +222,6 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
             RpcResponse::ok(req.id, json!(out))
         }
 
-        // ── P2P ──────────────────────────────────────────────────────────────
         "p2p.getPeers" => {
             let peers = crate::p2p::get_known_peers();
             RpcResponse::ok(req.id, json!(peers))
@@ -253,12 +234,9 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
             }))
         }
 
-        // ── Unknown method ────────────────────────────────────────────────────
         _ => RpcResponse::err(req.id, -32601, &format!("Method not found: {}", req.method)),
     }
 }
-
-// ── WebSocket subscription handler ────────────────────────────────────────────
 
 async fn ws_handler(
     ws:           WebSocketUpgrade,
@@ -271,19 +249,19 @@ async fn handle_ws(mut socket: WebSocket, subs: Subscribers) {
     let mut rx = subs.subscribe();
     loop {
         tokio::select! {
-            // Forward chain events to the connected client
+
             Ok(event) = rx.recv() => {
                 let msg = Message::Text(event.to_string());
                 if socket.send(msg).await.is_err() { break; }
             }
-            // Receive subscription requests from the client
+
             Some(Ok(msg)) = socket.recv() => {
                 if let Message::Text(text) = msg {
                     if let Ok(req) = serde_json::from_str::<Value>(&text) {
                         let method = req["method"].as_str().unwrap_or("");
                         match method {
                             "subscribe" | "unsubscribe" => {
-                                // Acknowledge subscription
+
                                 let ack = json!({ "type": "subscribed", "topic": req["topic"] });
                                 let _ = socket.send(Message::Text(ack.to_string())).await;
                             }
@@ -299,10 +277,6 @@ async fn handle_ws(mut socket: WebSocket, subs: Subscribers) {
     }
 }
 
-// ── Block / TX event broadcaster (called from chain update path) ───────────────
-
-/// Broadcast a new block header to all WebSocket subscribers.
-/// Call this from `merge_remote_chain_inner` and `mine_batch_db`.
 pub fn broadcast_block_header(block: &crate::ledger::LedgerBlock) {
     if let Some(tx) = BROADCAST_TX.get() {
         let header = crate::chain_db::LightBlockHeader::from(block);
@@ -311,7 +285,6 @@ pub fn broadcast_block_header(block: &crate::ledger::LedgerBlock) {
     }
 }
 
-/// Broadcast a confirmed transaction to all WebSocket subscribers.
 pub fn broadcast_tx_event(tx: &crate::ledger::LedgerTx) {
     if let Some(sender) = BROADCAST_TX.get() {
         let event = json!({ "type": "transaction", "data": tx });
@@ -322,7 +295,6 @@ pub fn broadcast_tx_event(tx: &crate::ledger::LedgerTx) {
 static BROADCAST_TX: std::sync::OnceLock<tokio::sync::broadcast::Sender<Value>> =
     std::sync::OnceLock::new();
 
-/// Called once at startup to wire the broadcast channel into the global.
 pub fn init_broadcast(tx: tokio::sync::broadcast::Sender<Value>) {
     let _ = BROADCAST_TX.set(tx);
 }

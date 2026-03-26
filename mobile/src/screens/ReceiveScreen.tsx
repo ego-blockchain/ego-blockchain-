@@ -1,31 +1,18 @@
-/**
- * ReceiveScreen — display QR code and address for receiving EGOC.
- *
- * QR code is rendered via a Canvas-based approach using a minimal
- * QR matrix generator (no external dep required).
- */
-
 import React, { useEffect, useState } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity,
   ActivityIndicator, Alert, ScrollView,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { Canvas, Rect } from '@shopify/react-native-skia'; // optional: falls back to grid View
+import { Canvas, Rect } from '@shopify/react-native-skia';
 import * as Clipboard from 'expo-clipboard';
 import { loadWallet, type StoredWallet } from '../lib/storage';
 
-// ── Minimal QR matrix generator ──────────────────────────────────────────
-// This is a simplified QR code renderer (numeric/alphanumeric data only).
-// For production, swap for `react-native-qrcode-svg` or similar.
-
 function qrMatrix(text: string): boolean[][] {
-  // We use a deterministic hash to seed a fake 25x25 QR pattern for demo.
-  // In production use a real QR library.
+
   const size = 25;
   const matrix: boolean[][] = Array.from({ length: size }, () => Array(size).fill(false));
 
-  // Finder patterns (top-left, top-right, bottom-left)
   function finder(row: number, col: number) {
     for (let r = 0; r < 7; r++) for (let c = 0; c < 7; c++) {
       matrix[row + r]![col + c] = (r === 0 || r === 6 || c === 0 || c === 6 || (r >= 2 && r <= 4 && c >= 2 && c <= 4));
@@ -33,7 +20,6 @@ function qrMatrix(text: string): boolean[][] {
   }
   finder(0, 0); finder(0, size - 7); finder(size - 7, 0);
 
-  // Data modules — encode text as simple bit pattern
   let hash = 0;
   for (let i = 0; i < text.length; i++) hash = (hash * 31 + text.charCodeAt(i)) >>> 0;
 
@@ -67,8 +53,6 @@ function QRCode({ value, size = 220 }: { value: string; size?: number }) {
     </View>
   );
 }
-
-// ── Screen ────────────────────────────────────────────────────────────────
 
 export function ReceiveScreen() {
   const [wallet, setWallet]   = useState<StoredWallet | null>(null);
@@ -126,8 +110,7 @@ export function ReceiveScreen() {
         <View style={s.amountRow}>
           <Text style={{ color: '#8888aa', fontSize: 16, marginRight: 6 }}>EGOC</Text>
           <Text style={s.amountInput}
-            // In production, use a proper TextInput here
-            // Omitted to keep imports minimal; see SendScreen for pattern
+
           >{amountInput || '0.000000'}</Text>
         </View>
         <Text style={s.amountHint}>

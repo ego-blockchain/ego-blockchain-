@@ -1,33 +1,12 @@
-//! Cryptographic proofs for storage verification.
-//!
-//! Implements a Merkle-tree-based PoRep/PoST protocol:
-//!
-//! **PoRep (Proof of Replication)**
-//!   At store-time the prover computes a Merkle tree over the encrypted file
-//!   (1 KB leaves, blake3 hashing) and derives:
-//!     comm_d  = Merkle root of the encrypted file chunks
-//!     replica_id = blake3(prover_addr ‖ cid)
-//!     comm_r  = blake3(comm_d ‖ replica_id ‖ "ego/porep/v1")
-//!   These are registered on the relay together with the leaf counts.
-//!
-//! **PoST (Proof of Space-Time)**
-//!   Every 30 minutes the relay issues a random challenge_seed.
-//!   The prover derives 8 leaf indices deterministically from the seed and
-//!   supplies one Merkle proof per challenged leaf. The relay verifies each
-//!   proof against the registered comm_d. No file content is revealed.
-
 use serde::{Deserialize, Serialize};
 
-/// Leaf size in bytes (1 KB).
 pub const CHUNK_SIZE: usize = 1024;
-/// Number of Merkle proofs per PoST window.
-pub const POST_N_CHALLENGES: usize = 8;
-/// Domain-separation tag for comm_r derivation.
-pub const POREP_TAG: &[u8] = b"ego/porep/v1";
-/// PoST window duration in seconds (30 minutes).
-pub const POST_WINDOW_SECS: i64 = 30 * 60;
 
-// ── Internal helpers ─────────────────────────────────────────────────────────
+pub const POST_N_CHALLENGES: usize = 8;
+
+pub const POREP_TAG: &[u8] = b"ego/porep/v1";
+
+pub const POST_WINDOW_SECS: i64 = 30 * 60;
 
 fn hash_bytes(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
@@ -40,14 +19,6 @@ fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-// ── Merkle tree ───────────────────────────────────────────────────────────────
-
-/// An in-memory Merkle tree built over fixed-size file chunks.
-///
-/// Layout (1-indexed):
-///   Root   →  nodes[1]
-///   Leaves →  nodes[n_padded .. 2*n_padded]  (0-indexed among leaves: leaf i at nodes[n_padded + i])
-///   Padding leaves are all zeros.
 pub struct MerkleTree {
     pub root: [u8; 32],
     nodes: Vec<[u8; 32]>,
@@ -56,7 +27,7 @@ pub struct MerkleTree {
 }
 
 impl MerkleTree {
-    /// Build a Merkle tree from the raw data bytes.
+
     pub fn build(data: &[u8]) -> Self {
         let leaves: Vec<[u8; 32]> = data
             .chunks(CHUNK_SIZE)
@@ -66,13 +37,11 @@ impl MerkleTree {
         let n_real   = leaves.len().max(1);
         let n_padded = n_real.next_power_of_two();
 
-        // 1-indexed: node[0] unused, node[1] = root, leaves at n_padded..2*n_padded
         let mut nodes = vec![[0u8; 32]; 2 * n_padded + 1];
 
         for (i, leaf) in leaves.iter().enumerate() {
             nodes[n_padded + i] = *leaf;
         }
-        // Padding leaves stay [0u8;32].
 
         for i in (1..n_padded).rev() {
             nodes[i] = hash_pair(&nodes[2 * i], &nodes[2 * i + 1]);
@@ -81,14 +50,13 @@ impl MerkleTree {
         MerkleTree { root: nodes[1], nodes, n_padded, n_real }
     }
 
-    /// Generate a Merkle proof for the leaf at `leaf_idx` (0-based, must be < n_real).
     pub fn proof(&self, leaf_idx: usize) -> MerkleProof {
         let mut path = Vec::new();
         let mut pos  = self.n_padded + leaf_idx;
         let leaf     = self.nodes[pos];
 
         while pos > 1 {
-            // Sibling: flip the last bit of pos.
+
             let sibling = if pos % 2 == 0 { pos + 1 } else { pos - 1 };
             path.push(self.nodes[sibling]);
             pos /= 2;
@@ -98,30 +66,27 @@ impl MerkleTree {
     }
 }
 
-// ── MerkleProof ───────────────────────────────────────────────────────────────
-
-/// A Merkle inclusion proof for one leaf.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MerkleProof {
-    /// 0-based leaf index within the real leaf set.
+
     pub leaf_index: u64,
-    /// Hash of the challenged leaf (blake3 of 1 KB chunk).
+
     pub leaf: [u8; 32],
-    /// Sibling hashes from leaf up to (but not including) the root.
+
     pub path: Vec<[u8; 32]>,
 }
 
 impl MerkleProof {
-    /// Verify this proof against `root`, using `n_padded` as the padded leaf count.
+
     pub fn verify(&self, root: &[u8; 32], n_padded: usize) -> bool {
         let mut current = self.leaf;
         let mut pos     = n_padded as u64 + self.leaf_index;
 
         for sibling in &self.path {
             current = if pos % 2 == 0 {
-                hash_pair(&current, sibling) // current is left child
+                hash_pair(&current, sibling)
             } else {
-                hash_pair(sibling, &current) // current is right child
+                hash_pair(sibling, &current)
             };
             pos /= 2;
         }
@@ -130,28 +95,20 @@ impl MerkleProof {
     }
 }
 
-// ── PoRep commitment ──────────────────────────────────────────────────────────
-
-/// The commitment registered on the relay after a file is sealed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoRepCommitment {
-    /// Merkle root of encrypted file chunks.
+
     pub comm_d: [u8; 32],
-    /// H(comm_d ‖ replica_id ‖ POREP_TAG).
+
     pub comm_r: [u8; 32],
-    /// H(prover_addr ‖ cid).
+
     pub replica_id: [u8; 32],
-    /// Number of real (non-padding) leaves.
+
     pub n_real_leaves: usize,
-    /// Next power-of-two ≥ n_real_leaves.
+
     pub n_padded_leaves: usize,
 }
 
-/// Compute the PoRep commitment for an encrypted file.
-///
-/// `enc_bytes` — the bytes that will be written to disk (nonce ‖ ciphertext).
-/// `prover_addr` — the wallet's egot1 address.
-/// `cid` — the content identifier of the *plaintext* (egocid1…).
 pub fn compute_porep_commitment(
     enc_bytes:   &[u8],
     prover_addr: &str,
@@ -185,11 +142,6 @@ pub fn compute_porep_commitment(
     }
 }
 
-// ── PoST challenge/proof ─────────────────────────────────────────────────────
-
-/// Derive the `POST_N_CHALLENGES` leaf indices for a given challenge seed.
-///
-/// Both prover and verifier call this — they must produce identical indices.
 pub fn derive_challenge_indices(
     challenge_seed: &[u8; 32],
     n_real_leaves:  usize,
@@ -207,7 +159,6 @@ pub fn derive_challenge_indices(
         .collect()
 }
 
-/// Generate PoST proofs for all challenged leaf positions over an encrypted file.
 pub fn generate_post_proofs(
     enc_bytes:      &[u8],
     challenge_seed: &[u8; 32],
@@ -218,12 +169,6 @@ pub fn generate_post_proofs(
     indices.iter().map(|&idx| tree.proof(idx)).collect()
 }
 
-/// Verify a set of PoST proofs against a registered commitment.
-///
-/// Returns true only if:
-///   - exactly POST_N_CHALLENGES proofs are present
-///   - each proof targets the expected leaf index (derived from seed)
-///   - each Merkle proof is valid against `comm_d`
 pub fn verify_post_proofs(
     proofs:          &[MerkleProof],
     comm_d:          &[u8; 32],
@@ -240,6 +185,339 @@ pub fn verify_post_proofs(
     true
 }
 
+// ── PoSt enforcement loop ─────────────────────────────────────────────────────
+//
+// Every POST_CHECK_INTERVAL_SECS (6 h) we challenge each locally-owned active file:
+//   1. Pick a deterministic random block: blake3(cid || time_slot)[0..8] % n_blocks
+//   2. Load the encrypted block from disk.
+//   3. Decrypt with the per-file AES-256-GCM key stored in the ledger.
+//   4. Hash the plaintext and compare against the block_cid  (egoblk1{blake3_hex}).
+//      This is a cryptographic proof — faking it requires the actual data.
+//
+// On failure:
+//   strike 1 — warning only (grace period: file may be re-downloading)
+//   strike 2+ — storage rewards for this file withheld for POST_SUSPEND_SECS
+//              — slash_storage tx written on-chain
+
+pub const POST_CHECK_INTERVAL_SECS: i64 = 6 * 3600;
+pub const POST_SUSPEND_SECS:        i64 = 7 * 24 * 3600;
+
+/// Called from the background 30-second loop; runs the full check every 6 h.
+/// Pass in the Tauri app handle so we can fire a desktop notification on slash.
+pub async fn run_post_checks(app: &tauri::AppHandle) {
+    let now = chrono::Utc::now().timestamp();
+    let mut ledger = crate::ledger::Ledger::load();
+    let my_addr = ledger.address.clone();
+    if my_addr.is_empty() { return; }
+
+    let mut need_save = false;
+
+    // Collect slash info: (cid, name, strikes, collateral, block_cid, comm_r, challenge_slot)
+    let mut to_slash: Vec<(String, String, u32, u64, String, String, i64)> = Vec::new();
+    let mut to_return_collateral: Vec<(String, u64)> = Vec::new();
+
+    for file in ledger.stored_files.iter_mut() {
+        // Only prove active files we locally own (master or unassigned role).
+        if file.status != "Active" { continue; }
+        if file.replication_role == "slave" { continue; }
+        if file.local_path.is_empty() || file.local_path.starts_with("sender:") { continue; }
+
+        // Not time for another challenge yet?
+        let last = file.last_proved.unwrap_or(0);
+        if now - last < POST_CHECK_INTERVAL_SECS { continue; }
+
+        let proof_ok = challenge_file(file, now);
+
+        if proof_ok {
+            file.last_proved           = Some(now);
+            file.proof_strikes         = 0;
+            file.proof_suspended_until = 0;
+            need_save = true;
+            eprintln!("[PoSt] ✓  {} proved at slot {}", &file.cid[..16.min(file.cid.len())], now / POST_CHECK_INTERVAL_SECS);
+
+            // Deal expiry: if slave's hosting deal has ended and file is still good,
+            // return locked collateral in full.
+            let is_slave_deal = file.replication_role == "slave"
+                && file.collateral_locked_uegoc > 0
+                && file.expiry > 0
+                && file.expiry <= now;
+            if is_slave_deal {
+                to_return_collateral.push((file.cid.clone(), file.collateral_locked_uegoc));
+                file.collateral_locked_uegoc = 0;
+            }
+        } else {
+            file.proof_strikes += 1;
+            need_save = true;
+            eprintln!("[PoSt] ✗  {} FAILED — strike {} of 2", &file.cid[..16.min(file.cid.len())], file.proof_strikes);
+
+            if file.proof_strikes >= 2 {
+                file.proof_suspended_until = now + POST_SUSPEND_SECS;
+
+                // Re-derive which block was challenged so we can include it in the broadcast.
+                let slot = now / POST_CHECK_INTERVAL_SECS;
+                let (challenged_block_cid, challenged_comm_r) = if file.cid.starts_with("egomfd1") {
+                    if let Ok(manifest) = crate::blocks::load_manifest(&file.cid) {
+                        if !manifest.blocks.is_empty() {
+                            let mut h = blake3::Hasher::new();
+                            h.update(file.cid.as_bytes());
+                            h.update(&slot.to_le_bytes());
+                            let digest = h.finalize();
+                            let idx = u64::from_le_bytes(
+                                digest.as_bytes()[..8].try_into().unwrap_or([0; 8]),
+                            ) as usize % manifest.blocks.len();
+                            let entry = &manifest.blocks[idx];
+                            (entry.block_cid.clone(), entry.comm_r.clone())
+                        } else { (String::new(), String::new()) }
+                    } else { (String::new(), String::new()) }
+                } else { (String::new(), String::new()) };
+
+                to_slash.push((
+                    file.cid.clone(), file.name.clone(), file.proof_strikes,
+                    file.collateral_locked_uegoc, challenged_block_cid, challenged_comm_r, slot,
+                ));
+                file.collateral_locked_uegoc = 0; // collateral consumed
+            }
+        }
+    }
+
+    if need_save {
+        let _ = ledger.save();
+    }
+
+    for (cid, name, strikes, collateral, block_cid, comm_r, slot) in to_slash {
+        record_slash_tx(&my_addr, &cid, strikes).await;
+        burn_collateral(&my_addr, &cid, collateral).await;
+
+        // Broadcast SlashChallenge so all peers independently verify and record the slash.
+        if !block_cid.is_empty() {
+            let sign_input = format!("slash:{}:{}:{}:{}", my_addr, cid, block_cid, slot);
+            let reporter_sig = crate::ledger::load_seed()
+                .and_then(|s| {
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&s[..32]);
+                    ego_core::KeyPair::from_bytes(&a).ok()
+                })
+                .map(|kp| hex::encode(kp.sign_ed25519(sign_input.as_bytes()).as_bytes()))
+                .unwrap_or_default();
+
+            let msg = crate::p2p::P2PMessage::SlashChallenge {
+                accused_addr:   my_addr.clone(),
+                cid:            cid.clone(),
+                block_cid:      block_cid.clone(),
+                challenge_slot: slot,
+                comm_r:         comm_r.clone(),
+                reporter_addr:  my_addr.clone(),
+                reporter_sig,
+            };
+            let peers = crate::p2p::get_known_peers();
+            for ep in peers.into_iter().filter(|p| !p.is_empty()).take(50) {
+                let msg2 = msg.clone();
+                tokio::spawn(async move {
+                    let _ = crate::p2p::send_message(&ep, &msg2).await;
+                });
+            }
+            eprintln!("[PoSt] SlashChallenge broadcast to peers: cid={} block={}", &cid[..16.min(cid.len())], &block_cid[..16.min(block_cid.len())]);
+        }
+
+        crate::commands::notifications::notify(
+            app,
+            "Storage Proof Failed",
+            &format!("\"{}\" — rewards suspended 7 days (strike {}). Check your storage folder.", name, strikes),
+        );
+    }
+    for (cid, collateral) in to_return_collateral {
+        return_collateral(&my_addr, &cid, collateral).await;
+    }
+}
+
+/// Sample one block from `file` using a deterministic challenge and verify it.
+/// Returns true if the file passes, false if data is missing or corrupt.
+fn challenge_file(file: &crate::ledger::StoredFile, now: i64) -> bool {
+    if !file.cid.starts_with("egomfd1") {
+        // Legacy single-file format: just check the file exists on disk.
+        return std::path::Path::new(&file.local_path).exists();
+    }
+
+    let manifest = match crate::blocks::load_manifest(&file.cid) {
+        Ok(m) => m,
+        Err(_) => return false,  // manifest gone — fail
+    };
+    if manifest.blocks.is_empty() { return true; }
+
+    // Deterministic block selection: blake3(cid || slot)
+    let slot = now / POST_CHECK_INTERVAL_SECS;
+    let mut h = blake3::Hasher::new();
+    h.update(file.cid.as_bytes());
+    h.update(&slot.to_le_bytes());
+    let digest = h.finalize();
+    let idx = u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap_or([0; 8]))
+        as usize % manifest.blocks.len();
+
+    let entry = &manifest.blocks[idx];
+
+    // Load encrypted block from disk.
+    let enc_bytes = match crate::blocks::load_block(&entry.block_cid) {
+        Ok(b) => b,
+        Err(_) => return false,  // block file missing — fail
+    };
+
+    // ── PoRep verification ────────────────────────────────────────────────────
+    // If the block has a stored comm_r, verify it matches what we'd compute from
+    // the enc_bytes on disk.  This proves the bytes are the SAME ones we sealed
+    // at upload time and are bound to our address — a node can't fake this by
+    // fetching blocks on demand unless they also have the exact enc_bytes.
+    if !entry.comm_r.is_empty() {
+        let my_addr = crate::ledger::Ledger::load().address;
+        let expected_comm_r = crate::blocks::compute_block_comm_r(&enc_bytes, &my_addr, &entry.block_cid);
+        if expected_comm_r != entry.comm_r {
+            return false;  // replica commitment mismatch — data replaced or corrupted
+        }
+        return true;  // comm_r verified — data is intact and bound to this prover
+    }
+
+    // ── Legacy fallback: decrypt + hash verify (no comm_r stored) ────────────
+    let key_vec = crate::ledger::unprotect_key_bytes(&file.key_nonce_hex);
+    if key_vec.len() < 32 { return false; }
+
+    use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
+    let key_arr: [u8; 32] = match key_vec[..32].try_into() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let nonce_bytes = match hex::decode(&entry.nonce_hex) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    if nonce_bytes.len() != 12 { return false; }
+
+    let cipher = match Aes256Gcm::new_from_slice(&key_arr) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let plaintext = match cipher.decrypt(nonce, enc_bytes.as_ref()) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    let expected_hash = match entry.block_cid.strip_prefix("egoblk1") {
+        Some(h) => h,
+        None     => return false,
+    };
+    let actual_hash = ego_core::hash_data(&plaintext).to_hex();
+    actual_hash.as_str() == expected_hash
+}
+
+/// Burn collateral for a file that failed PoSt or was early-deleted.
+/// Burns `SLASH_BURN_BPS` (10%) of locked collateral; returns the rest.
+pub async fn burn_collateral(addr: &str, cid: &str, collateral: u64) {
+    if collateral == 0 { return; }
+    use crate::ledger::LedgerTx;
+    const SLASH_BURN_BPS: u64 = 1_000; // 10%
+    let burn_amount   = collateral * SLASH_BURN_BPS / 10_000;
+    let return_amount = collateral.saturating_sub(burn_amount);
+    let now   = chrono::Utc::now().timestamp();
+    let mut ledger = crate::ledger::Ledger::load();
+    let nonce = ledger.nonce + 1;
+
+    let sign_input  = format!("burn_collateral:{}:{}:{}", addr, cid, nonce);
+    let sig_hex     = crate::ledger::load_seed()
+        .and_then(|s| { let mut a = [0u8;32]; a.copy_from_slice(&s[..32]); ego_core::KeyPair::from_bytes(&a).ok() })
+        .map(|kp| hex::encode(kp.sign_ed25519(sign_input.as_bytes()).as_bytes()))
+        .unwrap_or_default();
+    let burn_hash   = format!("0x{}", ego_core::hash_data(sign_input.as_bytes()).to_hex());
+    let return_hash = format!("0x{}", ego_core::hash_data(format!("return_collateral:{}:{}:{}", addr, cid, nonce).as_bytes()).to_hex());
+
+    // Burn portion → null address
+    crate::mempool::get_mempool().push(LedgerTx {
+        hash: burn_hash.clone(), from: "egot1collateral000000000000000000000000000000".into(),
+        to:   "egot1burn0000000000000000000000000000000000000".into(),
+        amount: burn_amount,
+        memo:   Some(format!("slash_burn 10%: cid {}", &cid[..16.min(cid.len())])),
+        timestamp: now, signature: sig_hex.clone(), status: "Pending".into(),
+        block_height: None, nonce, tx_type: "burn_collateral".into(),
+        cid: cid.to_string(), ..LedgerTx::default()
+    });
+    // Return remainder to node
+    if return_amount > 0 {
+        crate::mempool::get_mempool().push(LedgerTx {
+            hash: return_hash, from: "egot1collateral000000000000000000000000000000".into(),
+            to:   addr.to_string(), amount: return_amount,
+            memo: Some(format!("collateral_return 90%: cid {}", &cid[..16.min(cid.len())])),
+            timestamp: now, signature: sig_hex, status: "Pending".into(),
+            block_height: None, nonce, tx_type: "unlock_collateral".into(),
+            cid: cid.to_string(), ..LedgerTx::default()
+        });
+    }
+    ledger.nonce = nonce;
+    let _ = ledger.save();
+    eprintln!("[Collateral] Burned {} uEGOC, returned {} uEGOC for cid={}", burn_amount, return_amount, &cid[..16.min(cid.len())]);
+}
+
+/// Return full collateral when a hosting deal expires in good standing.
+pub async fn return_collateral(addr: &str, cid: &str, collateral: u64) {
+    if collateral == 0 { return; }
+    use crate::ledger::LedgerTx;
+    let now   = chrono::Utc::now().timestamp();
+    let mut ledger = crate::ledger::Ledger::load();
+    let nonce = ledger.nonce + 1;
+    let sign_input = format!("return_collateral:{}:{}:{}", addr, cid, nonce);
+    let sig_hex    = crate::ledger::load_seed()
+        .and_then(|s| { let mut a = [0u8;32]; a.copy_from_slice(&s[..32]); ego_core::KeyPair::from_bytes(&a).ok() })
+        .map(|kp| hex::encode(kp.sign_ed25519(sign_input.as_bytes()).as_bytes()))
+        .unwrap_or_default();
+    let tx_hash = format!("0x{}", ego_core::hash_data(sign_input.as_bytes()).to_hex());
+    crate::mempool::get_mempool().push(LedgerTx {
+        hash: tx_hash.clone(), from: "egot1collateral000000000000000000000000000000".into(),
+        to: addr.to_string(), amount: collateral,
+        memo: Some(format!("collateral_return full: cid {}", &cid[..16.min(cid.len())])),
+        timestamp: now, signature: sig_hex, status: "Pending".into(),
+        block_height: None, nonce, tx_type: "unlock_collateral".into(),
+        cid: cid.to_string(), ..LedgerTx::default()
+    });
+    ledger.nonce = nonce;
+    let _ = ledger.save();
+    eprintln!("[Collateral] Returned {} uEGOC (deal complete) for cid={}", collateral, &cid[..16.min(cid.len())]);
+}
+
+/// Write a `slash_storage` tx on-chain so the penalty is public and verifiable.
+async fn record_slash_tx(addr: &str, cid: &str, strikes: u32) {
+    use crate::ledger::LedgerTx;
+    let now   = chrono::Utc::now().timestamp();
+    let mut ledger = crate::ledger::Ledger::load();
+    let nonce = ledger.nonce + 1;
+    let sign_input = format!("slash_storage:{}:{}:{}", addr, cid, nonce);
+    let signature_hex = crate::ledger::load_seed()
+        .and_then(|s| {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&s[..32]);
+            ego_core::KeyPair::from_bytes(&arr).ok()
+        })
+        .map(|kp| hex::encode(kp.sign_ed25519(sign_input.as_bytes()).as_bytes()))
+        .unwrap_or_default();
+    let tx_hash = format!("0x{}", ego_core::hash_data(sign_input.as_bytes()).to_hex());
+
+    crate::mempool::get_mempool().push(LedgerTx {
+        hash:            tx_hash.clone(),
+        from:            addr.to_string(),
+        to:              "egot1slashpool0000000000000000000000000000000".into(),
+        amount:          0,  // no token burn yet — rewards just withheld
+        memo:            Some(format!("slash_storage: strike {} | cid {}", strikes, &cid[..16.min(cid.len())])),
+        timestamp:       now,
+        signature:       signature_hex,
+        status:          "Pending".into(),
+        block_height:    None,
+        nonce,
+        tx_type:         "slash_storage".into(),
+        cid:             cid.to_string(),
+        commitment_hash: String::new(),
+        ..LedgerTx::default()
+    });
+    ledger.nonce = nonce;
+    let _ = ledger.save();
+    eprintln!("[PoSt] slash_storage tx {} | cid={} | strike={}", &tx_hash[..18], &cid[..16.min(cid.len())], strikes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,7 +525,7 @@ mod tests {
 
     #[test]
     fn roundtrip_merkle_proof() {
-        let mut data = vec![0u8; 4096]; // 4 chunks
+        let mut data = vec![0u8; 4096];
         OsRng.fill_bytes(&mut data);
         let tree = MerkleTree::build(&data);
         for idx in 0..tree.n_real {
@@ -258,7 +536,7 @@ mod tests {
 
     #[test]
     fn post_proof_roundtrip() {
-        let mut data = vec![0u8; 32 * 1024]; // 32 chunks
+        let mut data = vec![0u8; 32 * 1024];
         OsRng.fill_bytes(&mut data);
         let mut seed = [0u8; 32];
         OsRng.fill_bytes(&mut seed);
@@ -275,7 +553,7 @@ mod tests {
         OsRng.fill_bytes(&mut seed);
         let tree   = MerkleTree::build(&data);
         let mut proofs = generate_post_proofs(&data, &seed, tree.n_real);
-        // Corrupt the first leaf hash
+
         proofs[0].leaf[0] ^= 0xFF;
         assert!(!verify_post_proofs(&proofs, &tree.root, &seed, tree.n_real, tree.n_padded));
     }

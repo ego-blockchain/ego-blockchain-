@@ -46,7 +46,7 @@ mod account_tests {
     fn test_new_validator_account() {
         let address = test_address(2);
         let validator_pubkey = test_public_key(3);
-        let commission_rate = 1000; // 10%
+        let commission_rate = 1000;
         let initial_stake = Balance::new(1_000_000_000);
         let dilithium_pk = vec![4u8; 1312];
         let mlkem_pk = vec![5u8; 1184];

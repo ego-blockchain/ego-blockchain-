@@ -1,12 +1,3 @@
-/**
- * Generates PNG icons for the Ego Wallet Chrome extension.
- * Run with: node generate-icons.js
- * Requires: npm install canvas (or run via the build script which uses a simpler approach)
- *
- * This script creates minimal valid PNG icons using raw binary.
- * No external dependencies required.
- */
-
 const fs = require('fs');
 const path = require('path');
 const { createCanvas } = require('canvas');
@@ -17,18 +8,15 @@ for (const size of sizes) {
   const canvas = createCanvas(size, size);
   const ctx = canvas.getContext('2d');
 
-  // Background gradient: blue to purple
   const gradient = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
   gradient.addColorStop(0, '#3b82f6');
   gradient.addColorStop(1, '#7c3aed');
 
-  // Circle background
   ctx.beginPath();
   ctx.arc(size/2, size/2, size/2, 0, Math.PI * 2);
   ctx.fillStyle = gradient;
   ctx.fill();
 
-  // Letter "E"
   ctx.fillStyle = '#ffffff';
   ctx.font = `bold ${Math.floor(size * 0.6)}px Arial`;
   ctx.textAlign = 'center';

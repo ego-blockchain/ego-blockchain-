@@ -3,7 +3,6 @@ use crate::error::VmError;
 use crate::types::CallResult;
 use std::collections::HashSet;
 
-/// A pending transaction to execute.
 #[derive(Debug, Clone)]
 pub struct PendingTx {
     pub tx_id:         [u8; 32],
@@ -16,11 +15,10 @@ pub struct PendingTx {
     pub fuel:          u64,
 }
 
-/// Access set declared by a transaction (used for scheduling).
 #[derive(Debug, Clone, Default)]
 pub struct AccessSet {
-    pub reads:  HashSet<String>,  // "contract_addr:storage_prefix:key"
-    pub writes: HashSet<String>,  // same format
+    pub reads:  HashSet<String>,
+    pub writes: HashSet<String>,
 }
 
 impl AccessSet {
@@ -34,24 +32,19 @@ impl AccessSet {
         self.writes.insert(format!("{}:{}:{}", contract, prefix, key));
     }
 
-    /// Returns true if this access set conflicts with another.
-    /// Conflict = any write-write or read-write overlap.
     pub fn conflicts_with(&self, other: &AccessSet) -> bool {
-        // write-write
+
         if self.writes.intersection(&other.writes).next().is_some() { return true; }
-        // read-write (self reads, other writes)
+
         if self.reads.intersection(&other.writes).next().is_some() { return true; }
-        // write-read (self writes, other reads)
+
         if self.writes.intersection(&other.reads).next().is_some() { return true; }
         false
     }
 }
 
-/// Schedule a batch of transactions into non-conflicting groups.
-/// Each group can be executed in parallel; groups execute sequentially.
-/// Uses a greedy coloring algorithm: O(n^2) but fine for batch sizes <= 512.
 pub fn schedule_batch(txs: &[PendingTx], access_sets: &[AccessSet]) -> Vec<Vec<usize>> {
-    // access_sets[i] is the access set for txs[i]
+
     let n = txs.len();
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut assigned = vec![false; n];
@@ -64,7 +57,7 @@ pub fn schedule_batch(txs: &[PendingTx], access_sets: &[AccessSet]) -> Vec<Vec<u
             if assigned[i] { continue; }
             if !group_access.conflicts_with(&access_sets[i]) {
                 group.push(i);
-                // merge access sets
+
                 group_access.reads.extend(access_sets[i].reads.iter().cloned());
                 group_access.writes.extend(access_sets[i].writes.iter().cloned());
                 assigned[i] = true;
@@ -77,23 +70,20 @@ pub fn schedule_batch(txs: &[PendingTx], access_sets: &[AccessSet]) -> Vec<Vec<u
     groups
 }
 
-/// Result of a batch execution.
 #[derive(Debug)]
 pub struct BatchResult {
-    /// One entry per input tx, in the same order.
+
     pub results: Vec<Result<CallResult, VmError>>,
-    /// Total RU used across all txs.
+
     pub total_ru: u64,
-    /// Number of parallel groups executed.
+
     pub parallel_groups: usize,
-    /// Average group size.
+
     pub avg_group_size: f64,
 }
 
 impl Executor {
-    /// Execute a batch of transactions with automatic parallelism.
-    /// Transactions that touch different storage slots execute in parallel.
-    /// Conflicting transactions execute sequentially.
+
     pub fn execute_batch(
         &self,
         txs: &[PendingTx],
@@ -108,7 +98,7 @@ impl Executor {
         let avg_group_size = if groups.is_empty() { 0.0 } else { n as f64 / groups.len() as f64 };
 
         for group in &groups {
-            // Execute group in parallel
+
             let group_results: Vec<(usize, Result<CallResult, VmError>)> = group
                 .par_iter()
                 .map(|&idx| {

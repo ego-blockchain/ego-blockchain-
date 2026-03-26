@@ -12,8 +12,6 @@ pub const PROPOSE_TIMEOUT_MS: u64 = 500;
 pub const VOTE_TIMEOUT_MS: u64 = 1_000;
 pub const COMMIT_TIMEOUT_MS: u64 = 1_500;
 
-// ── Seven-root BlockHeader ───────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct BlockHeader {
     pub height: u64,
@@ -98,12 +96,10 @@ impl BlockHeader {
             .map_err(|e| PoCError::SignatureVerificationFailed(e.to_string()))
     }
 
-    /// R_e = H(vrf_output || region_id || epoch || slot)  (whitepaper §5.3)
     pub fn epoch_randomness(&self, region_id: &str) -> Hash {
         hash_multiple(&[self.vrf_output.as_bytes(), region_id.as_bytes(), &self.epoch.to_le_bytes(), &self.slot.to_le_bytes()])
     }
 
-    /// Keyed-hash VRF placeholder — replace with RFC 9381 before mainnet.
     pub fn compute_vrf_output(kp: &KeyPair, epoch: u64, slot: u64) -> (Hash, Vec<u8>) {
         let input = hash_multiple(&[kp.public_key().as_bytes(), &epoch.to_le_bytes(), &slot.to_le_bytes()]);
         let output = hash_multiple(&[b"ego/vrf/v1:", kp.public_key().as_bytes(), input.as_bytes()]);
@@ -111,8 +107,6 @@ impl BlockHeader {
         (output, proof)
     }
 }
-
-// ── Vote ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct Vote {
@@ -151,8 +145,6 @@ impl Vote {
     }
 }
 
-// ── Quorum Certificate ───────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct QuorumCertificate {
     pub block_hash: Hash,
@@ -176,8 +168,6 @@ impl QuorumCertificate {
     }
     pub fn voter_count(&self) -> usize { self.voters_bitmap.iter().filter(|&&v| v).count() }
 }
-
-// ── Round state ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoundPhase { Propose, Vote, Commit, Finalized, ViewChange }
@@ -206,8 +196,6 @@ impl RoundState {
     pub fn advance_phase(&mut self, next: RoundPhase) { self.phase = next; self.phase_started_at = Timestamp::now(); }
 }
 
-// ── BFT Engine ────────────────────────────────────────────────────────────────
-
 pub struct BftEngine {
     keypair: Arc<KeyPair>,
     address: Address,
@@ -217,7 +205,7 @@ pub struct BftEngine {
     current_epoch: Arc<RwLock<u64>>,
     current_height: Arc<RwLock<u64>>,
     vrf_outputs: Arc<RwLock<HashMap<u64, Hash>>>,
-    /// Fork choice: tracks all proposed blocks, QCs, locked QC, and canonical head.
+
     fork_choice: Arc<RwLock<ForkChoiceStore>>,
 }
 
@@ -235,7 +223,6 @@ impl BftEngine {
         }
     }
 
-    /// 2f+1 quorum threshold
     pub fn quorum_size(&self) -> usize { (2 * self.validator_set.len()) / 3 + 1 }
 
     pub fn is_proposer(&self) -> bool {
@@ -250,7 +237,6 @@ impl BftEngine {
         let height = *self.current_height.read().unwrap();
         let slot = Timestamp::now().as_millis() / MICRO_SLOT_MS;
 
-        // Fork choice: extend the canonical head if one exists, otherwise genesis.
         let prev_hash = {
             let fc = self.fork_choice.read().unwrap();
             fc.get_canonical_head()
@@ -268,7 +254,6 @@ impl BftEngine {
         let mut header = BlockHeader::new(height, epoch, slot, prev_hash, self.address, roots, vrf_output, vrf_proof);
         header.sign(&self.keypair)?;
 
-        // Register block in fork choice store
         self.fork_choice.write().unwrap().add_block(header.clone());
 
         {
@@ -293,7 +278,6 @@ impl BftEngine {
         if !header.verify_signature()? { return Ok(None); }
         if Timestamp::now().as_millis().saturating_sub(header.timestamp.as_millis()) > 30_000 { return Ok(None); }
 
-        // Fork-choice safety check: refuse to vote for unsafe blocks
         {
             let mut fc = self.fork_choice.write().unwrap();
             fc.add_block(header.clone());
@@ -332,7 +316,7 @@ impl BftEngine {
             s.qc = Some(qc.clone());
             s.advance_phase(RoundPhase::Commit);
             info!("🏆 QC formed h={} {}/{} votes", vote.height, qc.voter_count(), self.validator_set.len());
-            // Register QC in fork choice store
+
             self.fork_choice.write().unwrap().add_qc(qc.clone());
             return Ok(Some(qc));
         }
@@ -353,11 +337,11 @@ impl BftEngine {
             f.push((header.clone(), qc.clone()));
             if f.len() > 1024 { f.remove(0); }
         }
-        // Advance locked QC (two-chain rule: finalization locks the previous QC)
+
         {
             let mut fc = self.fork_choice.write().unwrap();
             fc.update_locked_qc(qc.clone());
-            // Prune blocks older than 64 heights to keep memory bounded
+
             fc.prune_blocks(header.height.saturating_sub(64));
             fc.prune_view_changes(0);
         }
@@ -369,8 +353,6 @@ impl BftEngine {
         Ok(())
     }
 
-    /// Trigger a view change when the current round times out.
-    /// Broadcasts a ViewChangeMsg and, if 2f+1 messages are collected, starts the new round.
     pub fn trigger_view_change(&self) -> PoCResult<ViewChangeMsg> {
         let (new_round, height, epoch, high_qc) = {
             let s = self.current_round.read().unwrap();
@@ -382,22 +364,20 @@ impl BftEngine {
         Ok(msg)
     }
 
-    /// Process an incoming ViewChangeMsg from another validator.
-    /// Returns Some(new_round) if this node should now start proposing in the new round.
     pub fn receive_view_change(&self, msg: ViewChangeMsg) -> PoCResult<Option<u32>> {
         let quorum = self.quorum_size();
         let new_round = msg.new_round;
         let result = self.fork_choice.write().unwrap().add_view_change(msg, quorum)?;
 
         if let Some(best_high_qc) = result {
-            // Start new round: if best_high_qc is Some, the new leader must extend that block
+
             {
                 let mut s = self.current_round.write().unwrap();
                 let height = s.height;
                 let epoch = s.epoch;
                 *s = RoundState::new(height, epoch, new_round);
             }
-            // If a high_qc came with the view change, register it
+
             if let Some(qc) = best_high_qc {
                 self.fork_choice.write().unwrap().add_qc(qc);
             }
@@ -407,12 +387,10 @@ impl BftEngine {
         Ok(None)
     }
 
-    /// Return the canonical head according to the fork choice rule.
     pub fn get_canonical_head(&self) -> Option<BlockHeader> {
         self.fork_choice.read().unwrap().get_canonical_head().cloned()
     }
 
-    /// Resolve a fork at a specific height — returns the canonical block hash.
     pub fn resolve_fork(&self, height: u64) -> Option<Hash> {
         self.fork_choice.read().unwrap().resolve_fork(height)
     }
@@ -422,8 +400,6 @@ impl BftEngine {
     pub fn get_current_epoch(&self) -> u64 { *self.current_epoch.read().unwrap() }
     pub fn get_latest_finalized_block(&self) -> Option<(BlockHeader, QuorumCertificate)> { self.finalized_blocks.read().unwrap().last().cloned() }
 }
-
-// ── Merkle root ───────────────────────────────────────────────────────────────
 
 pub fn merkle_root(hashes: &[Hash]) -> Hash {
     if hashes.is_empty() { return Hash::new([0u8; 32]); }
@@ -442,8 +418,6 @@ pub fn merkle_root(hashes: &[Hash]) -> Hash {
     }
     layer[0]
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

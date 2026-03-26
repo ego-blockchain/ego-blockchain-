@@ -60,7 +60,10 @@
       "http": {
         "all": false,
         "request": true,
-        "scope": ["http://EgoRelay.egoblockchain.com:8080/**"]
+        "scope": [
+          "http://EgoRelay.egoblockchain.com:8080/**",
+          "https://api.coingecko.com/**"
+        ]
       },
       "process": {
         "all": false,
@@ -80,7 +83,7 @@
         "icons/icon.ico",
         "icons/icon.png"
       ],
-      "resources": [],
+      "resources": ["icons/ego_square.png"],
       "externalBin": [],
       "copyright": "",
       "category": "DeveloperTool",
@@ -114,7 +117,7 @@
       }
     },
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' http://EgoRelay.egoblockchain.com:8080 ws://EgoRelay.egoblockchain.com:8080; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://assets.coingecko.com https://coin-images.coingecko.com"
+      "csp": "default-src 'self'; connect-src 'self' http://EgoRelay.egoblockchain.com:8080 ws://EgoRelay.egoblockchain.com:8080 https://api.coingecko.com; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://assets.coingecko.com https://coin-images.coingecko.com"
     },
     "updater": {
       "active": false
@@ -125,11 +128,12 @@
         "resizable": true,
         "title": "Ego Desktop",
         "width": 1200,
-        "height": 800,
+        "height": 805,
         "minWidth": 900,
-        "minHeight": 600,
+        "minHeight": 605,
         "center": true,
         "decorations": false,
+        "transparent": true,
         "alwaysOnTop": false,
         "skipTaskbar": false,
         "visible": false

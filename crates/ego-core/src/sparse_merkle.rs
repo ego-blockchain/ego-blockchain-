@@ -1,52 +1,23 @@
-//! Sparse Merkle Trie (SMT) with O(log n) updates and inclusion/exclusion proofs.
-//!
-//! Key space: 256-bit (keyed by the blake2s hash of an address or any 32-byte input).
-//!
-//! Domain-separated hashing:
-//!   - Empty leaf :  blake2s("ego/smt/empty/v1")
-//!   - Internal   :  blake2s("ego/smt/node/v1" || left_hash || right_hash)
-//!   - Leaf value :  blake2s("ego/smt/leaf/v1" || key || value)
-//!
-//! The trie is a full binary tree of depth 256.  Every leaf sits at exactly
-//! depth 256.  For efficient operation we cache the hash of every internal
-//! node that has at least one populated descendant; uncached nodes are treated
-//! as empty (pre-computed tower).  All operations are iterative.
-
 use crate::crypto::{hash_data, hash_multiple};
 use crate::types::Hash;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-// ---------------------------------------------------------------------------
-// Domain-tag constants & hash helpers
-// ---------------------------------------------------------------------------
-
 const TAG_EMPTY: &[u8] = b"ego/smt/empty/v1";
 const TAG_NODE: &[u8] = b"ego/smt/node/v1";
 const TAG_LEAF: &[u8] = b"ego/smt/leaf/v1";
 
-/// Empty leaf hash: `blake2s(TAG_EMPTY)`.
 fn empty_leaf_hash() -> Hash {
     hash_data(TAG_EMPTY)
 }
 
-/// Internal node hash: `blake2s(TAG_NODE || left || right)`.
 fn node_hash(left: &Hash, right: &Hash) -> Hash {
     hash_multiple(&[TAG_NODE, left.as_bytes(), right.as_bytes()])
 }
 
-/// Leaf-value hash: `blake2s(TAG_LEAF || key || value)`.
 fn leaf_hash(key: &[u8; 32], value: &[u8]) -> Hash {
     hash_multiple(&[TAG_LEAF, key, value])
 }
-
-// ---------------------------------------------------------------------------
-// Pre-computed empty subtree hashes
-//
-// EMPTY[0] = hash of an empty leaf (depth 256).
-// EMPTY[h] = hash of an empty subtree of height h (spans 2^h leaves).
-// The root-level empty hash for a depth-256 tree is EMPTY[256].
-// ---------------------------------------------------------------------------
 
 fn build_empty_tower() -> [Hash; 257] {
     let mut h = [Hash::new([0u8; 32]); 257];
@@ -57,7 +28,6 @@ fn build_empty_tower() -> [Hash; 257] {
     h
 }
 
-/// `empty_tower()[h]` = hash of an empty subtree of height `h`.
 fn empty_tower() -> &'static [Hash; 257] {
     use std::sync::OnceLock;
     static T: OnceLock<[Hash; 257]> = OnceLock::new();

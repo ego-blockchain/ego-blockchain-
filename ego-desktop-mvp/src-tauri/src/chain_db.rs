@@ -1,27 +1,3 @@
-//! RocksDB-backed chain storage — production-grade, designed for millions of blocks/txs.
-//!
-//! Column families
-//! ───────────────
-//!   blocks     key: height (8 B big-endian u64)           value: bincode(LedgerBlock)
-//!   txs        key: tx_hash (hex string bytes)            value: bincode(LedgerTx)
-//!   block_txs  key: height_be8 ++ tx_hash                value: [] (block→tx index)
-//!   addr_txs   key: addr ++ ts_be8 ++ tx_hash            value: i64_le8 signed amount delta
-//!   balances   key: address bytes                         value: u64_le8 cached balance
-//!   recent_txs key: ts_be8 ++ tx_hash                    value: [] (global recency index)
-//!   meta       key: string bytes                          value: raw bytes
-//!
-//! Balance invariant
-//! ─────────────────
-//! balances[addr] == Σ confirmed_incoming − Σ confirmed_outgoing at all times.
-//! Updated atomically in every WriteBatch that writes transactions.
-//!
-//! Migration
-//! ─────────
-//! On first boot (RocksDB dir missing or empty):
-//!   1. Import from chain.db (SQLite) if present.
-//!   2. Import from chain.json if present.
-//!   3. Seed genesis block.
-
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, Options,
     WriteBatch, DB,
@@ -32,8 +8,6 @@ use crate::ledger::{
     base_data_dir, LedgerBlock, LedgerTx, SharedChain, GENESIS_HASH, GENESIS_MINER, GENESIS_TS,
 };
 
-// ── Column family names ───────────────────────────────────────────────────────
-
 const CF_BLOCKS:     &str = "blocks";
 const CF_TXS:        &str = "txs";
 const CF_BLOCK_TXS:  &str = "block_txs";
@@ -41,24 +15,37 @@ const CF_ADDR_TXS:   &str = "addr_txs";
 const CF_BALANCES:   &str = "balances";
 const CF_RECENT_TXS: &str = "recent_txs";
 const CF_META:       &str = "meta";
+const CF_HEADERS:    &str = "headers";    // light block headers — kept longer than full blocks
+const CF_GOVERNANCE: &str = "governance"; // on-chain feature flag votes
+const CF_DAO:        &str = "dao";        // DAO proposals (stake + knowledge voting)
 
 const ALL_CFS: &[&str] = &[
-    CF_BLOCKS, CF_TXS, CF_BLOCK_TXS, CF_ADDR_TXS, CF_BALANCES, CF_RECENT_TXS, CF_META,
+    CF_BLOCKS, CF_TXS, CF_BLOCK_TXS, CF_ADDR_TXS, CF_BALANCES,
+    CF_RECENT_TXS, CF_META, CF_HEADERS, CF_GOVERNANCE, CF_DAO,
 ];
 
-// ── Bincode config ────────────────────────────────────────────────────────────
+// ── Well-known governance feature names ───────────────────────────────────────
+/// Emergency: skip ML-DSA-44 verification if a vulnerability is found.
+pub const FEATURE_DILITHIUM_DISABLED: &str = "dilithium_disabled";
+/// Enforce ML-DSA-44 on every transaction (migration complete).
+pub const FEATURE_DILITHIUM_REQUIRED: &str = "dilithium_required";
 
-fn bc() -> impl bincode::config::Config { bincode::config::standard() }
+/// Desktop wallet keeps last N full blocks on disk.
+/// Full block JSON + tx data is large; old data is only needed for archive nodes.
+const FULL_BLOCK_CAP: u64 = 2_000;
+/// Light headers are tiny (~300 bytes). Keep a much longer window for chain verification.
+const HEADER_CAP: u64 = 100_000;
+
+const META_PRUNE_BELOW:         &[u8] = b"prune_below";
+const META_PRUNE_HEADERS_BELOW: &[u8] = b"prune_headers_below";
 
 fn encode<T: serde::Serialize>(val: &T) -> Vec<u8> {
-    bincode::serde::encode_to_vec(val, bc()).expect("bincode encode")
+    serde_json::to_vec(val).expect("json encode")
 }
 
 fn decode<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8]) -> Option<T> {
-    bincode::serde::decode_from_slice(bytes, bc()).ok().map(|(v, _)| v)
+    serde_json::from_slice(bytes).ok()
 }
-
-// ── Key helpers ───────────────────────────────────────────────────────────────
 
 #[inline] fn height_key(h: u64)  -> [u8; 8] { h.to_be_bytes() }
 #[inline] fn ts_key(ts: i64)     -> [u8; 8] { (ts as u64).to_be_bytes() }
@@ -85,14 +72,10 @@ fn recent_txs_key(ts: i64, tx_hash: &str) -> Vec<u8> {
     k
 }
 
-// ── Meta keys ─────────────────────────────────────────────────────────────────
-
 const META_LATEST_HEIGHT:   &[u8] = b"latest_height";
 const META_TX_COUNT:        &[u8] = b"tx_count";
 const META_FINALIZED:       &[u8] = b"finalized_height";
 const META_MIGRATION_DONE:  &[u8] = b"migration_done";
-
-// ── Global DB handle ──────────────────────────────────────────────────────────
 
 static CHAIN_DB: OnceLock<Mutex<DB>> = OnceLock::new();
 
@@ -117,7 +100,7 @@ pub fn get_db() -> &'static Mutex<DB> {
             cf_opts.set_compression_type(DBCompressionType::Lz4);
 
             // Bloom filter + cache on point-get heavy CFs.
-            if [CF_BLOCKS, CF_TXS, CF_BALANCES].contains(name) {
+            if [CF_BLOCKS, CF_TXS, CF_BALANCES, CF_HEADERS].contains(name) {
                 let mut bbo = BlockBasedOptions::default();
                 bbo.set_block_cache(&block_cache);
                 bbo.set_bloom_filter(10.0, false);
@@ -288,6 +271,8 @@ fn migrate_from_sqlite(db: &DB, path: &std::path::Path) -> bool {
             call_args:           r.get(17)?,
             fee_uegoc:           0,
             priority_fee_uegoc:  0,
+            cid:                 String::new(),
+            commitment_hash:     String::new(),
         })
     }).unwrap().filter_map(|r| r.ok()).collect();
 
@@ -328,6 +313,40 @@ fn migrate_from_json(db: &DB, path: &std::path::Path) -> bool {
     true
 }
 
+// ── Checkpoint anchors (long-range attack protection) ─────────────────────────
+//
+// A long-range attack: attacker obtains old private keys and rewrites history
+// from block 0, building a longer chain that appears valid. Without checkpoints
+// any chain with valid signatures is accepted, even one forked at genesis.
+//
+// Defense: hardcode well-known block hashes. Any peer-supplied chain that
+// contradicts a checkpoint is rejected outright, even if its signatures are valid.
+// Checkpoints are chosen at finalized, widely-gossiped heights.
+//
+// Add new checkpoints after each major milestone (mainnet launch, hard forks).
+// A checkpoint can never be rolled back — that is the guarantee.
+pub const CHECKPOINTS: &[(u64, &str)] = &[
+    // (height, expected_block_hash)
+    // Genesis is always checkpoint 0 — immovable anchor.
+    (0, "ego00000000000000000000000000000000000000000000000000000000genesis1"),
+    // Add production checkpoints here as the chain grows, e.g.:
+    // (100_000, "abc123..."),
+    // (500_000, "def456..."),
+];
+
+/// Returns Err if `block` contradicts a known checkpoint.
+pub fn check_checkpoint(block: &LedgerBlock) -> Result<(), String> {
+    for &(cp_height, cp_hash) in CHECKPOINTS {
+        if block.height == cp_height && block.hash != cp_hash {
+            return Err(format!(
+                "checkpoint violation at height {}: expected {} got {}",
+                cp_height, cp_hash, block.hash
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ── Core write primitive ──────────────────────────────────────────────────────
 
 const FAUCET_ADDR: &str = "egot1faucet000000000000000000000000000000000";
@@ -345,6 +364,12 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
     let cf_meta       = db.cf_handle(CF_META).unwrap();
 
     let height_k = height_key(block.height);
+
+    // Checkpoint guard: reject blocks that contradict hardcoded anchors.
+    if let Err(e) = check_checkpoint(block) {
+        eprintln!("[ChainDB] CHECKPOINT VIOLATION — rejecting block: {}", e);
+        return;
+    }
 
     // Fork choice: if a block already exists at this height, only replace it
     // if the incoming block has strictly more validator votes (heavier chain).
@@ -376,7 +401,8 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
         }
         *balance_delta.entry(tx.to.clone()).or_insert(0) += tx.amount as i128;
         if tx.from != FAUCET_ADDR && !tx.from.is_empty() {
-            *balance_delta.entry(tx.from.clone()).or_insert(0) -= tx.amount as i128;
+            let total_out = tx.amount as i128 + tx.fee_uegoc as i128;
+            *balance_delta.entry(tx.from.clone()).or_insert(0) -= total_out;
         }
         new_tx_count += 1;
     }
@@ -435,6 +461,14 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
 
     db.write(batch).expect("RocksDB write batch");
 
+    // Write light header to CF_HEADERS (kept for a larger window than full block data).
+    let cf_hdrs = db.cf_handle(CF_HEADERS).unwrap();
+    let hdr = LightBlockHeader::from(block);
+    db.put_cf(cf_hdrs, height_key(block.height), encode(&hdr)).ok();
+
+    // Prune old data to keep disk bounded.
+    prune_if_needed(db);
+
     // Update the in-memory nonce store so replay detection stays current.
     for tx in &confirmed_txs {
         if !tx.from.is_empty() {
@@ -450,6 +484,59 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
             crate::ledger::record_validator_stake(&tx.from, tx.amount, true);
         } else if tx.from == STAKING_ADDR_STR && !tx.to.is_empty() {
             crate::ledger::record_validator_stake(&tx.to, tx.amount, false);
+        }
+    }
+}
+
+// ── Pruning ───────────────────────────────────────────────────────────────────
+//
+// Desktop wallet = light client.  We keep:
+//   • Last FULL_BLOCK_CAP full blocks (CF_BLOCKS + CF_BLOCK_TXS).
+//   • Last HEADER_CAP light headers (CF_HEADERS).
+//   • All transactions in CF_TXS / CF_ADDR_TXS — user's own history is never pruned.
+//
+// RocksDB's delete_range_cf is O(log N) — it writes a range tombstone, not N deletes.
+
+fn prune_if_needed(db: &DB) {
+    let cf_meta = db.cf_handle(CF_META).unwrap();
+    let latest = db.get_cf(cf_meta, META_LATEST_HEIGHT)
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+
+    // Only prune every 50 blocks to amortise overhead.
+    if latest % 50 != 0 { return; }
+
+    // ── Full blocks ────────────────────────────────────────────────────────
+    if latest > FULL_BLOCK_CAP {
+        let keep_from = latest - FULL_BLOCK_CAP;
+        let pruned_below = db.get_cf(cf_meta, META_PRUNE_BELOW)
+            .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(1); // skip genesis
+        if pruned_below < keep_from {
+            let cf_blocks    = db.cf_handle(CF_BLOCKS).unwrap();
+            let cf_block_txs = db.cf_handle(CF_BLOCK_TXS).unwrap();
+            let mut batch = WriteBatch::default();
+            // Range tombstone: delete all keys in [pruned_below, keep_from).
+            // CF_BLOCK_TXS keys are height(8) ++ tx_hash, so the height prefix
+            // range covers all index entries for those blocks.
+            batch.delete_range_cf(cf_blocks,    height_key(pruned_below), height_key(keep_from));
+            batch.delete_range_cf(cf_block_txs, height_key(pruned_below), height_key(keep_from));
+            batch.put_cf(cf_meta, META_PRUNE_BELOW, u64_le(keep_from));
+            let _ = db.write(batch);
+            eprintln!("[ChainDB] Pruned full blocks {}..{} (keeping last {})",
+                pruned_below, keep_from, FULL_BLOCK_CAP);
+        }
+    }
+
+    // ── Light headers ──────────────────────────────────────────────────────
+    if latest > HEADER_CAP {
+        let keep_from = latest - HEADER_CAP;
+        let pruned_below = db.get_cf(cf_meta, META_PRUNE_HEADERS_BELOW)
+            .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(1);
+        if pruned_below < keep_from {
+            let cf_hdrs = db.cf_handle(CF_HEADERS).unwrap();
+            let mut batch = WriteBatch::default();
+            batch.delete_range_cf(cf_hdrs, height_key(pruned_below), height_key(keep_from));
+            batch.put_cf(cf_meta, META_PRUNE_HEADERS_BELOW, u64_le(keep_from));
+            let _ = db.write(batch);
         }
     }
 }
@@ -510,15 +597,21 @@ pub fn balance_of(address: &str) -> u64 {
 }
 
 pub fn recent_blocks(limit: usize) -> Vec<LedgerBlock> {
+    paged_blocks(0, limit)
+}
+
+pub fn paged_blocks(offset: usize, limit: usize) -> Vec<LedgerBlock> {
     let db = get_db().lock().unwrap();
     let cf = db.cf_handle(CF_BLOCKS).unwrap();
     let mut iter = db.raw_iterator_cf(cf);
     iter.seek_to_last();
+    let mut skipped = 0usize;
     let mut out = Vec::with_capacity(limit);
     while iter.valid() && out.len() < limit {
         if let Some(v) = iter.value() {
             if let Some(b) = decode::<LedgerBlock>(v) {
-                out.push(b);
+                if skipped < offset { skipped += 1; }
+                else { out.push(b); }
             }
         }
         iter.prev();
@@ -527,16 +620,23 @@ pub fn recent_blocks(limit: usize) -> Vec<LedgerBlock> {
 }
 
 pub fn recent_transactions(limit: usize) -> Vec<LedgerTx> {
+    paged_transactions(0, limit)
+}
+
+pub fn paged_transactions(offset: usize, limit: usize) -> Vec<LedgerTx> {
     let db = get_db().lock().unwrap();
     let cf_recent = db.cf_handle(CF_RECENT_TXS).unwrap();
     let cf_txs    = db.cf_handle(CF_TXS).unwrap();
     let mut iter = db.raw_iterator_cf(cf_recent);
     iter.seek_to_last();
+    let mut skipped = 0usize;
     let mut hashes: Vec<Vec<u8>> = Vec::with_capacity(limit);
     while iter.valid() && hashes.len() < limit {
         if let Some(k) = iter.key() {
-            // Key = ts_be8 ++ tx_hash; tx_hash starts at byte 8.
-            if k.len() > 8 { hashes.push(k[8..].to_vec()); }
+            if k.len() > 8 {
+                if skipped < offset { skipped += 1; }
+                else { hashes.push(k[8..].to_vec()); }
+            }
         }
         iter.prev();
     }
@@ -549,10 +649,14 @@ pub fn recent_transactions(limit: usize) -> Vec<LedgerTx> {
 }
 
 /// View of the last 2000 blocks/txs, for legacy callers that use SharedChain.
+/// Max blocks/txs held in the in-memory SharedChain window.
+/// Full history lives in RocksDB; this is just the hot window for the UI.
+pub const CHAIN_WINDOW: usize = 500;
+
 pub fn load_shared_chain() -> SharedChain {
     SharedChain {
-        blocks:       recent_blocks(2000),
-        transactions: recent_transactions(2000),
+        blocks:       recent_blocks(CHAIN_WINDOW),
+        transactions: recent_transactions(CHAIN_WINDOW),
     }
 }
 
@@ -820,6 +924,14 @@ impl From<&LedgerBlock> for LightBlockHeader {
     }
 }
 
+/// Look up a single light header. Available even after the full block is pruned.
+pub fn get_light_header(height: u64) -> Option<LightBlockHeader> {
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_HEADERS).unwrap();
+    db.get_cf(cf, height_key(height)).ok().flatten()
+        .and_then(|v| decode(&v))
+}
+
 /// Fetch block headers from `from_height` up to `limit` (max 10_000).
 pub fn get_block_headers(from_height: u64, limit: u32) -> Vec<LightBlockHeader> {
     let db    = get_db().lock().unwrap();
@@ -927,3 +1039,416 @@ pub fn get_network_stats_db() -> NetworkStats {
 /// No-op: DB handle is a global singleton, not caller-managed.
 #[allow(dead_code)]
 pub fn get_db_handle() -> &'static Mutex<DB> { get_db() }
+
+// ── On-chain governance ───────────────────────────────────────────────────────
+//
+// Validators submit governance transactions (tx_type = "governance") to vote on
+// enabling or disabling named feature flags. When ⅔+1 stake-weighted validators
+// agree, the feature activates at the specified block height.
+//
+// This allows emergency changes (e.g. disabling a broken crypto primitive) to be
+// deployed without a hard fork or code rollout — just validator votes on-chain.
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GovernanceProposal {
+    /// The feature being voted on (e.g. FEATURE_DILITHIUM_DISABLED).
+    pub feature:     String,
+    /// "enable" or "disable".
+    pub action:      String,
+    /// Block height at which the feature takes effect once approved.
+    pub activate_at: u64,
+    /// Validator addresses that have voted yes.
+    pub votes:       Vec<String>,
+    /// True once the proposal passed and is recorded as active.
+    pub activated:   bool,
+}
+
+fn governance_key(feature: &str, action: &str) -> Vec<u8> {
+    format!("{}:{}", action, feature).into_bytes()
+}
+
+/// Record one validator vote. Returns the updated proposal so the caller
+/// (p2p layer) can check if threshold is now reached.
+pub fn record_governance_vote(
+    feature:     &str,
+    action:      &str,
+    activate_at: u64,
+    voter:       &str,
+) -> GovernanceProposal {
+    let db  = get_db().lock().unwrap();
+    let cf  = db.cf_handle(CF_GOVERNANCE).unwrap();
+    let key = governance_key(feature, action);
+
+    let mut proposal: GovernanceProposal = db.get_cf(cf, &key)
+        .ok().flatten()
+        .and_then(|v| decode(&v))
+        .unwrap_or(GovernanceProposal {
+            feature:     feature.to_string(),
+            action:      action.to_string(),
+            activate_at,
+            votes:       Vec::new(),
+            activated:   false,
+        });
+
+    if !proposal.activated && !proposal.votes.contains(&voter.to_string()) {
+        proposal.votes.push(voter.to_string());
+        db.put_cf(cf, &key, encode(&proposal)).ok();
+    }
+    proposal
+}
+
+/// Mark a proposal as activated. Called by the p2p layer after threshold reached.
+pub fn activate_feature(feature: &str, action: &str) {
+    let db  = get_db().lock().unwrap();
+    let cf  = db.cf_handle(CF_GOVERNANCE).unwrap();
+    let key = governance_key(feature, action);
+
+    if let Some(mut p) = db.get_cf(cf, &key).ok().flatten()
+        .and_then(|v| decode::<GovernanceProposal>(&v))
+    {
+        p.activated = true;
+        db.put_cf(cf, &key, encode(&p)).ok();
+        eprintln!("[Governance] '{}' {} — activates at block {}", feature, action, p.activate_at);
+    }
+}
+
+/// Returns true if feature's "disable" vote passed AND current height ≥ activate_at.
+pub fn is_feature_disabled(feature: &str) -> bool {
+    feature_state(feature, "disable")
+}
+
+/// Returns true if feature's "enable" vote passed AND current height ≥ activate_at.
+pub fn is_feature_enabled(feature: &str) -> bool {
+    feature_state(feature, "enable")
+}
+
+fn feature_state(feature: &str, action: &str) -> bool {
+    let db  = get_db().lock().unwrap();
+    let cf  = db.cf_handle(CF_GOVERNANCE).unwrap();
+    let key = governance_key(feature, action);
+    let cf_meta = db.cf_handle(CF_META).unwrap();
+    let height  = db.get_cf(cf_meta, META_LATEST_HEIGHT)
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+
+    db.get_cf(cf, &key).ok().flatten()
+        .and_then(|v| decode::<GovernanceProposal>(&v))
+        .map(|p| p.activated && height >= p.activate_at)
+        .unwrap_or(false)
+}
+
+/// Return all proposals for display in the UI.
+pub fn get_all_governance_proposals() -> Vec<GovernanceProposal> {
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_GOVERNANCE).unwrap();
+    db.iterator_cf(cf, rocksdb::IteratorMode::Start)
+        .filter_map(|r| r.ok())
+        .filter_map(|(_, v)| decode::<GovernanceProposal>(&v))
+        .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ── DAO Proposal System ───────────────────────────────────────────────────────
+//
+// Two-type voting per the Ego whitepaper:
+//   Stake power(opt)     = Σ stake_i_for_opt / Σ stake_all
+//   Knowledge power(opt) = Σ (score_i × BASE) for_opt / Σ (score_all × BASE)
+//   Combined             = (stake_power + knowledge_power) / 2
+//
+// Proposals are community-submitted; knowledge tests are community-submitted.
+// Correct answers are stored server-side only — never sent to the frontend.
+
+pub const DAO_BASE_KNOWLEDGE_POWER: f64 = 10.0;
+const DAO_DEFAULT_DURATION_SECS:    i64 = 7 * 24 * 3600; // 7 days
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+// ── Stored types (server-side, include correct answers) ───────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DaoTestQuestion {
+    pub id:            String,
+    pub question:      String,
+    pub options:       Vec<String>,
+    pub correct_index: usize,   // NOT exposed to frontend
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DaoKnowledgeTest {
+    pub questions:  Vec<DaoTestQuestion>,
+    pub created_by: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DaoStakeVote {
+    pub voter:        String,
+    pub option_index: usize,
+    pub stake_amount: u64,
+    pub timestamp:    i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DaoKnowledgeVote {
+    pub voter:        String,
+    pub option_index: usize,
+    pub test_score:   f64,
+    pub timestamp:    i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DaoProposal {
+    pub id:              String,
+    pub title:           String,
+    pub description:     String,
+    pub proposal_type:   String,
+    pub options:         Vec<String>,
+    pub creator:         String,
+    pub created_at:      i64,
+    pub voting_ends_at:  i64,
+    pub status:          String,  // "active" | "passed" | "failed" | "expired"
+    pub knowledge_test:  Option<DaoKnowledgeTest>,
+    pub stake_votes:     std::collections::HashMap<String, DaoStakeVote>,
+    pub knowledge_votes: std::collections::HashMap<String, DaoKnowledgeVote>,
+}
+
+// ── Frontend-safe types (no correct answers) ──────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DaoTestQuestionPublic {
+    pub id:       String,
+    pub question: String,
+    pub options:  Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DaoProposalPublic {
+    pub id:                   String,
+    pub title:                String,
+    pub description:          String,
+    pub proposal_type:        String,
+    pub options:              Vec<String>,
+    pub creator:              String,
+    pub created_at:           i64,
+    pub voting_ends_at:       i64,
+    pub status:               String,
+    pub has_knowledge_test:   bool,
+    pub question_count:       usize,
+    pub stake_vote_count:     usize,
+    pub knowledge_vote_count: usize,
+    pub questions:            Option<Vec<DaoTestQuestionPublic>>,
+    pub my_stake_vote:        Option<usize>,
+    pub my_knowledge_vote:    Option<usize>,
+    pub my_test_score:        Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DaoOptionResult {
+    pub option:          String,
+    pub stake_power:     f64,
+    pub knowledge_power: f64,
+    pub combined_power:  f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DaoProposalResults {
+    pub proposal_id:            String,
+    pub title:                  String,
+    pub options:                Vec<DaoOptionResult>,
+    pub winning_option_index:   Option<usize>,
+    pub total_stake_voters:     usize,
+    pub total_knowledge_voters: usize,
+    pub total_staked_in_votes:  u64,
+    pub quorum_reached:         bool,
+    pub status:                 String,
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn dao_key(id: &str) -> Vec<u8> { id.as_bytes().to_vec() }
+
+fn resolved_status(p: &DaoProposal) -> String {
+    if p.status == "active" && now_secs() > p.voting_ends_at {
+        "expired".to_string()
+    } else {
+        p.status.clone()
+    }
+}
+
+fn proposal_to_public(p: &DaoProposal, voter: Option<&str>) -> DaoProposalPublic {
+    let questions = p.knowledge_test.as_ref().map(|kt| {
+        kt.questions.iter().map(|q| DaoTestQuestionPublic {
+            id:       q.id.clone(),
+            question: q.question.clone(),
+            options:  q.options.clone(),
+        }).collect()
+    });
+    DaoProposalPublic {
+        id:                   p.id.clone(),
+        title:                p.title.clone(),
+        description:          p.description.clone(),
+        proposal_type:        p.proposal_type.clone(),
+        options:              p.options.clone(),
+        creator:              p.creator.clone(),
+        created_at:           p.created_at,
+        voting_ends_at:       p.voting_ends_at,
+        status:               resolved_status(p),
+        has_knowledge_test:   p.knowledge_test.is_some(),
+        question_count:       p.knowledge_test.as_ref().map(|k| k.questions.len()).unwrap_or(0),
+        stake_vote_count:     p.stake_votes.len(),
+        knowledge_vote_count: p.knowledge_votes.len(),
+        questions,
+        my_stake_vote:    voter.and_then(|v| p.stake_votes.get(v).map(|sv| sv.option_index)),
+        my_knowledge_vote:voter.and_then(|v| p.knowledge_votes.get(v).map(|kv| kv.option_index)),
+        my_test_score:    voter.and_then(|v| p.knowledge_votes.get(v).map(|kv| kv.test_score)),
+    }
+}
+
+fn grade_answers(kt: &DaoKnowledgeTest, answers: &[usize]) -> Result<f64, String> {
+    if answers.len() != kt.questions.len() {
+        return Err(format!("Expected {} answers, got {}", kt.questions.len(), answers.len()));
+    }
+    let correct = kt.questions.iter().zip(answers.iter())
+        .filter(|(q, &a)| q.correct_index == a)
+        .count();
+    Ok(correct as f64 / kt.questions.len() as f64)
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
+pub fn store_dao_proposal(proposal: DaoProposal) -> Result<(), String> {
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_DAO).ok_or("CF_DAO missing")?;
+    db.put_cf(cf, dao_key(&proposal.id), encode(&proposal))
+        .map_err(|e| e.to_string())
+}
+
+pub fn get_dao_proposal_public(id: &str, voter: Option<&str>) -> Option<DaoProposalPublic> {
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_DAO)?;
+    let bytes = db.get_cf(cf, dao_key(id)).ok()??;
+    let p: DaoProposal = decode(&bytes)?;
+    Some(proposal_to_public(&p, voter))
+}
+
+pub fn list_dao_proposals(status_filter: Option<&str>, voter: Option<&str>) -> Vec<DaoProposalPublic> {
+    let db = get_db().lock().unwrap();
+    let cf = match db.cf_handle(CF_DAO) { Some(c) => c, None => return vec![] };
+    let now = now_secs();
+    db.iterator_cf(cf, rocksdb::IteratorMode::Start)
+        .filter_map(|r| r.ok())
+        .filter_map(|(_, v)| decode::<DaoProposal>(&v))
+        .filter(|p| match status_filter {
+            None | Some("all") => true,
+            Some("active")  => p.status == "active" && now <= p.voting_ends_at,
+            Some("expired") => (p.status == "active" && now > p.voting_ends_at) || p.status == "expired",
+            Some(s)         => p.status == s,
+        })
+        .map(|p| proposal_to_public(&p, voter))
+        .collect()
+}
+
+pub fn cast_dao_stake_vote(
+    proposal_id: &str,
+    option_index: usize,
+    voter: &str,
+    stake_amount: u64,
+) -> Result<(), String> {
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_DAO).ok_or("CF_DAO missing")?;
+    let bytes = db.get_cf(cf, dao_key(proposal_id)).map_err(|e| e.to_string())?.ok_or("Proposal not found")?;
+    let mut p: DaoProposal = decode(&bytes).ok_or("Decode error")?;
+    let now = now_secs();
+    if p.status != "active" || now > p.voting_ends_at { return Err("Voting period has ended".into()); }
+    if option_index >= p.options.len() { return Err("Invalid option index".into()); }
+    if stake_amount == 0 { return Err("You must hold EGOC to cast a stake vote".into()); }
+    p.stake_votes.insert(voter.to_string(), DaoStakeVote {
+        voter: voter.to_string(), option_index, stake_amount, timestamp: now,
+    });
+    db.put_cf(cf, dao_key(proposal_id), encode(&p)).map_err(|e| e.to_string())
+}
+
+pub fn grade_dao_knowledge_test(proposal_id: &str, answers: &[usize]) -> Result<f64, String> {
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_DAO).ok_or("CF_DAO missing")?;
+    let bytes = db.get_cf(cf, dao_key(proposal_id)).map_err(|e| e.to_string())?.ok_or("Proposal not found")?;
+    let p: DaoProposal = decode(&bytes).ok_or("Decode error")?;
+    let kt = p.knowledge_test.ok_or("No knowledge test on this proposal")?;
+    grade_answers(&kt, answers)
+}
+
+pub fn cast_dao_knowledge_vote(
+    proposal_id: &str,
+    option_index: usize,
+    voter: &str,
+    answers: &[usize],
+) -> Result<f64, String> {
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_DAO).ok_or("CF_DAO missing")?;
+    let bytes = db.get_cf(cf, dao_key(proposal_id)).map_err(|e| e.to_string())?.ok_or("Proposal not found")?;
+    let mut p: DaoProposal = decode(&bytes).ok_or("Decode error")?;
+    let now = now_secs();
+    if p.status != "active" || now > p.voting_ends_at { return Err("Voting period has ended".into()); }
+    if option_index >= p.options.len() { return Err("Invalid option index".into()); }
+    let kt = p.knowledge_test.as_ref().ok_or("No knowledge test on this proposal")?;
+    let score = grade_answers(kt, answers)?;
+    p.knowledge_votes.insert(voter.to_string(), DaoKnowledgeVote {
+        voter: voter.to_string(), option_index, test_score: score, timestamp: now,
+    });
+    db.put_cf(cf, dao_key(proposal_id), encode(&p)).map_err(|e| e.to_string())?;
+    Ok(score)
+}
+
+pub fn get_dao_results(proposal_id: &str) -> Option<DaoProposalResults> {
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_DAO)?;
+    let bytes = db.get_cf(cf, dao_key(proposal_id)).ok()??;
+    let p: DaoProposal = decode(&bytes)?;
+    let n = p.options.len();
+
+    let total_stake: u64 = p.stake_votes.values().map(|v| v.stake_amount).sum();
+    let mut stake_by_opt = vec![0u64; n];
+    for v in p.stake_votes.values() {
+        if v.option_index < n { stake_by_opt[v.option_index] += v.stake_amount; }
+    }
+
+    let total_knowledge: f64 = p.knowledge_votes.values()
+        .map(|v| v.test_score * DAO_BASE_KNOWLEDGE_POWER).sum();
+    let mut know_by_opt = vec![0f64; n];
+    for v in p.knowledge_votes.values() {
+        if v.option_index < n { know_by_opt[v.option_index] += v.test_score * DAO_BASE_KNOWLEDGE_POWER; }
+    }
+
+    let options: Vec<DaoOptionResult> = p.options.iter().enumerate().map(|(i, opt)| {
+        let sp = if total_stake > 0 { stake_by_opt[i] as f64 / total_stake as f64 } else { 0.0 };
+        let kp = if total_knowledge > 0.0 { know_by_opt[i] / total_knowledge } else { 0.0 };
+        let cp = match (total_stake > 0, total_knowledge > 0.0) {
+            (true,  true)  => (sp + kp) / 2.0,
+            (true,  false) => sp,
+            (false, true)  => kp,
+            (false, false) => 0.0,
+        };
+        DaoOptionResult { option: opt.clone(), stake_power: sp, knowledge_power: kp, combined_power: cp }
+    }).collect();
+
+    let winning_option_index = options.iter().enumerate()
+        .max_by(|(_, a), (_, b)| a.combined_power.partial_cmp(&b.combined_power)
+            .unwrap_or(std::cmp::Ordering::Equal))
+        .filter(|(_, o)| o.combined_power > 0.0)
+        .map(|(i, _)| i);
+
+    Some(DaoProposalResults {
+        proposal_id:            proposal_id.to_string(),
+        title:                  p.title.clone(),
+        options,
+        winning_option_index,
+        total_stake_voters:     p.stake_votes.len(),
+        total_knowledge_voters: p.knowledge_votes.len(),
+        total_staked_in_votes:  total_stake,
+        quorum_reached:         p.stake_votes.len() >= 1,
+        status:                 resolved_status(&p),
+    })
+}

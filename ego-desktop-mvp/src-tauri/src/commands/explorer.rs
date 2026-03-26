@@ -4,13 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 
-/// A file storage / sharing event shown in the explorer.
-/// Name and key are intentionally omitted — only the public CID hash is exposed.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileEvent {
     pub cid: String,
     pub owner: String,
-    pub event_type: String, // "Stored" | "Received"
+    pub event_type: String,
     pub original_size: u64,
     pub encrypted_size: u64,
     pub timestamp: i64,
@@ -23,12 +21,10 @@ pub struct NetworkStats {
     pub latest_block: u64,
     pub total_transactions: usize,
     pub total_files_stored: usize,
-    /// Number of local wallets (each is its own node on the testnet).
+
     pub node_count: u32,
     pub network: String,
 }
-
-// ── Commands ──────────────────────────────────────────────────────────────────
 
 #[tauri::command]
 pub async fn get_network_stats() -> Result<NetworkStats, EgoDesktopError> {
@@ -42,7 +38,6 @@ pub async fn get_network_stats() -> Result<NetworkStats, EgoDesktopError> {
         .filter(|w| !w.address.is_empty())
         .count() as u32;
 
-    // File CIDs still live in per-wallet ledgers.
     let mut seen_cids: HashSet<String> = HashSet::new();
     for entry in &registry.wallets {
         let path = wallet_dir(&entry.id).join("ledger.json");
@@ -66,18 +61,18 @@ pub async fn get_network_stats() -> Result<NetworkStats, EgoDesktopError> {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct P2pStatus {
-    /// "ok" | "failed" | "pending"
+
     pub upnp: String,
     pub upnp_error: Option<String>,
     pub public_endpoint: String,
     pub p2p_port: u16,
-    /// True when this node is acting as a relay server for NAT peers.
+
     pub relay_server_active: bool,
-    /// Community relay nodes discovered via DataManifest.
+
     pub community_relays: Vec<String>,
-    /// Storage quota this node offers to the network (bytes).
+
     pub storage_quota_bytes: u64,
-    /// Storage currently used (bytes).
+
     pub storage_used_bytes: u64,
 }
 
@@ -103,18 +98,20 @@ pub async fn get_p2p_status(state: tauri::State<'_, crate::app::AppState>) -> Re
 }
 
 #[tauri::command]
-pub async fn get_blocks() -> Result<Vec<LedgerBlock>, EgoDesktopError> {
-    let mut blocks = crate::chain_db::recent_blocks(200);
-    // recent_blocks already returns DESC order; sort ascending for display
-    blocks.sort_by_key(|b| b.height);
-    Ok(blocks)
+pub async fn get_blocks(offset: Option<u32>, limit: Option<u32>) -> Result<Vec<LedgerBlock>, EgoDesktopError> {
+    Ok(crate::chain_db::paged_blocks(
+        offset.unwrap_or(0) as usize,
+        limit.unwrap_or(25) as usize,
+    ))
 }
 
 #[tauri::command]
-pub async fn get_all_transactions() -> Result<Vec<LedgerTx>, EgoDesktopError> {
-    Ok(crate::chain_db::recent_transactions(200))
+pub async fn get_all_transactions(offset: Option<u32>, limit: Option<u32>) -> Result<Vec<LedgerTx>, EgoDesktopError> {
+    Ok(crate::chain_db::paged_transactions(
+        offset.unwrap_or(0) as usize,
+        limit.unwrap_or(25) as usize,
+    ))
 }
-
 
 #[tauri::command]
 pub async fn get_block_info(height: u64) -> Result<LedgerBlock, EgoDesktopError> {

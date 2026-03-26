@@ -3,11 +3,12 @@ use crate::error::EgoDesktopError;
 use serde::Deserialize;
 use tauri::{Manager, State};
 
-// ── ip-api.com extended response ──────────────────────────────────────────────
-
 #[derive(Deserialize)]
 struct IpApiResponse {
     status: String,
+    /// The public IP address — used to detect network/VPN changes between ticks.
+    #[serde(rename = "query")]
+    query: Option<String>,
     lat: Option<f64>,
     lon: Option<f64>,
     city: Option<String>,
@@ -19,8 +20,6 @@ struct IpApiResponse {
     proxy: Option<bool>,
     hosting: Option<bool>,
 }
-
-// ── VPN / proxy keyword blocklist ─────────────────────────────────────────────
 
 const VPN_KEYWORDS: &[&str] = &[
     "nordvpn", "expressvpn", "mullvad", "surfshark", "privatevpn",
@@ -63,8 +62,6 @@ fn detect_vpn(resp: &IpApiResponse) -> Option<String> {
     }
     vpn_keyword_match(resp)
 }
-
-// ── Machine fingerprint ───────────────────────────────────────────────────────
 
 fn get_machine_id() -> String {
     #[cfg(target_os = "windows")]
@@ -124,8 +121,6 @@ fn get_machine_id() -> String {
     hex::encode(&hash_bytes.as_bytes()[..8])
 }
 
-// ── Network quality from peer count ──────────────────────────────────────────
-
 fn quality_from_peers(peer_count: usize, base_online: bool) -> NetworkQuality {
     if !base_online { return NetworkQuality::Offline; }
     match peer_count {
@@ -135,8 +130,6 @@ fn quality_from_peers(peer_count: usize, base_online: bool) -> NetworkQuality {
         _     => NetworkQuality::Excellent,
     }
 }
-
-// ── PoC event recording ───────────────────────────────────────────────────────
 
 fn quality_str(q: &NetworkQuality) -> &'static str {
     match q {
@@ -205,13 +198,16 @@ fn maybe_record_poc_event(status: &CoverageStatus) {
 // 4 checks per window — enough resolution without hammering the relay.
 pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
     // Wait for relay circuit to be confirmed before first probe.
-    // This prevents a flood of failed dials on startup.
     tokio::time::sleep(std::time::Duration::from_secs(8)).await;
 
-    // Fetch IP data once — it changes rarely, no need to re-fetch every tick.
-    let (location, vpn_detected, vpn_reason) = fetch_ip_data().await;
+    // Initial IP/VPN fetch.
+    let (init_loc, init_vpn, init_reason, init_ip) = fetch_ip_data().await;
+    let mut location     = init_loc;
+    let mut vpn_detected = init_vpn;
+    let mut vpn_reason   = init_reason;
+    let mut last_ip      = init_ip;
 
-    // Store in AppState so UI polls can use it without an HTTP call.
+    // Store initial state in AppState.
     {
         let state = app.state::<AppState>();
         let machine_id  = get_machine_id();
@@ -231,9 +227,37 @@ pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
         state.update_coverage_status(placeholder);
     }
 
+    // Re-check VPN every tick (60 s). Catches enabling/disabling VPN while the app is open.
+    let mut tick: u32 = 0;
     loop {
+        let recheck = tick > 0;
+        if recheck {
+            let (new_loc, new_vpn, new_reason, new_ip) = fetch_ip_data().await;
+
+            let ip_changed  = !new_ip.is_empty() && new_ip != last_ip;
+            let vpn_changed = new_vpn != vpn_detected;
+
+            if new_loc.is_some() { location = new_loc; }
+            vpn_detected = new_vpn;
+            vpn_reason   = new_reason;
+            if !new_ip.is_empty() { last_ip = new_ip; }
+
+            if ip_changed || vpn_changed {
+                eprintln!(
+                    "[Coverage] Network change detected — IP changed: {}, VPN: {} ({})",
+                    ip_changed, vpn_detected, vpn_reason
+                );
+                // Emit immediately so the UI updates without waiting for the next tick.
+                let _ = app.emit_all("ego://vpn-status-changed", serde_json::json!({
+                    "vpn_detected": vpn_detected,
+                    "vpn_reason":   &vpn_reason,
+                }));
+            }
+        }
+
         tick_coverage(&app, &location, vpn_detected, &vpn_reason).await;
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        tick += 1;
     }
 }
 
@@ -259,25 +283,15 @@ async fn tick_coverage(
         probe_peers_from_relay(app).await;
     }
 
-    // ── Step 1b: re-announce ourselves so peers keep us in their active window
     if is_online {
         crate::p2p::broadcast_peer_announce(app).await;
     }
 
-    // ── Step 2: count live peers ───────────────────────────────────────────
-    let active_peers = state.get_active_peers(600); // 10-min window
+    let active_peers = state.get_active_peers(600);
     let peer_count   = active_peers.len();
 
-    let contact_count = {
-        let contacts = crate::commands::messenger::load_contacts();
-        contacts.iter()
-            .filter(|c| c.status == "approved" && !c.endpoint.is_empty())
-            .count()
-    };
-    let visible_peers = peer_count.max(contact_count);
-
-    let coverage_synced_count = if is_online { visible_peers as u32 } else { 0 };
-    let network_quality       = quality_from_peers(visible_peers, is_online);
+    let coverage_synced_count = if is_online { peer_count as u32 } else { 0 };
+    let network_quality       = quality_from_peers(peer_count, is_online);
     let network_quality_str   = quality_str(&network_quality);
 
     let status = CoverageStatus {
@@ -291,25 +305,21 @@ async fn tick_coverage(
         machine_id,
     };
 
-    // ── Step 3: update AppState so UI reads fresh data ─────────────────────
     state.update_coverage_status(status.clone());
     let _ = app.emit_all("ego://coverage-updated", ());
 
-    // ── Step 4: record PoC event (rate-limited to 1 per 240 s internally) ──
     if is_online {
         maybe_record_poc_event(&status);
         eprintln!(
             "[Coverage] tick — peers: {}, quality: {}, PoC eligible",
-            visible_peers,
+            peer_count,
             network_quality_str
         );
     }
 }
 
-/// Probe peers discovered via DHT + contacts.
-/// HTTP relay directory removed — relay decommissioned.
 async fn probe_peers_from_relay(app: &tauri::AppHandle) {
-    // Trigger DHT peer discovery
+
     crate::p2p::dht_discover_peers().await;
 
     let state        = app.state::<AppState>();
@@ -320,7 +330,6 @@ async fn probe_peers_from_relay(app: &tauri::AppHandle) {
 
     let contacts = crate::commands::messenger::load_contacts();
 
-    // Build candidate list from peer cache + contacts
     let mut candidates: Vec<String> = Vec::new();
     for p in &crate::p2p::load_peer_cache() {
         if !p.endpoint.is_empty() && p.endpoint != my_endpoint {
@@ -353,11 +362,6 @@ async fn probe_peers_from_relay(app: &tauri::AppHandle) {
     }
 }
 
-// ── Commands (called by UI) ───────────────────────────────────────────────────
-//
-// These now just READ from the AppState cache that the background loop keeps
-// fresh. No blocking HTTP calls, no peer counting inline — just a cache read.
-
 #[tauri::command]
 pub async fn get_coverage_status(
     state: State<'_, AppState>,
@@ -373,8 +377,6 @@ pub async fn get_coverage_status(
         return Ok(status);
     }
 
-    // First-call fallback: background loop hasn't ticked yet.
-    // Return a minimal status so the UI isn't blank.
     let ledger     = crate::ledger::Ledger::load();
     let machine_id = get_machine_id();
     Ok(CoverageStatus {
@@ -404,21 +406,23 @@ pub async fn get_network_peers(
     Ok(state.get_active_peers(600))
 }
 
-// ── IP geolocation (called once on startup, cached) ──────────────────────────
+// ── IP geolocation — called on startup and re-checked every 5 min ─────────────
 
-async fn fetch_ip_data() -> (Option<Location>, bool, String) {
-    let url = "http://ip-api.com/json?fields=status,lat,lon,city,regionName,country,isp,org,proxy,hosting";
+/// Returns (location, vpn_detected, vpn_reason, public_ip).
+async fn fetch_ip_data() -> (Option<Location>, bool, String, String) {
+    let url = "http://ip-api.com/json?fields=status,query,lat,lon,city,regionName,country,isp,org,proxy,hosting";
     let resp = match reqwest::get(url).await {
         Ok(r)  => r,
-        Err(_) => return (None, false, String::new()),
+        Err(_) => return (None, false, String::new(), String::new()),
     };
     let data = match resp.json::<IpApiResponse>().await {
         Ok(d)  => d,
-        Err(_) => return (None, false, String::new()),
+        Err(_) => return (None, false, String::new(), String::new()),
     };
     if data.status != "success" {
-        return (None, false, String::new());
+        return (None, false, String::new(), String::new());
     }
+    let public_ip = data.query.clone().unwrap_or_default();
     let location = match (data.lat, data.lon) {
         (Some(lat), Some(lon)) => Some(Location {
             latitude:  lat,
@@ -435,5 +439,5 @@ async fn fetch_ip_data() -> (Option<Location>, bool, String) {
         Some(reason) => (true, reason),
         None         => (false, String::new()),
     };
-    (location, vpn_detected, vpn_reason)
+    (location, vpn_detected, vpn_reason, public_ip)
 }

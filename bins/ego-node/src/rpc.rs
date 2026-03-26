@@ -1,17 +1,3 @@
-//! Ego-Node HTTP JSON-RPC layer.
-//!
-//! Endpoints
-//! ---------
-//! GET  /health                → { status, block_height, peer_id }
-//! GET  /chain/blocks          → [{ height, hash, tx_count, timestamp }]  (last 50)
-//! GET  /block/:height         → { height, hash, tx_count, timestamp }
-//! GET  /balance/:address      → { address, balance_uegoc, balance_egoc }
-//! POST /tx/submit             → { tx_hash }   (body: JSON Transaction)
-//! GET  /chain/transactions    → [Transaction]  (last 50 pending)
-//! GET  /node/stats            → NodeStats JSON
-//! GET  /node/identity         → { address, public_key_hex, peer_id, payout_address }
-//! GET  /faucet?to=<address>   → { success, amount_egoc, tx_hash }  (testnet only, 100 EGOC/24h)
-
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -26,33 +12,28 @@ use tower_http::cors::CorsLayer;
 
 use crate::supervisor::NodeSupervisor;
 
-// ── Shared state ─────────────────────────────────────────────────────────────
-
 pub struct RpcState {
     pub state_manager:  StateManager,
     pub peer_id:        String,
-    /// Bech32 ego address of this node (rewards accumulate here).
+
     pub node_address:   String,
-    /// Hex-encoded Ed25519 public key of the node keypair.
+
     pub node_pubkey:    String,
-    /// Node keypair — used to sign auto-payout transactions.
+
     pub node_keypair:   KeyPair,
-    /// Optional external address to auto-forward earned rewards.
+
     pub payout_address: Option<String>,
     pub pending_txs:    Mutex<Vec<Transaction>>,
-    /// Simple recent-block ring buffer (height, hash, tx_count, ts)
+
     pub recent_blocks:  Mutex<Vec<BlockSummary>>,
     pub node_stats:     Mutex<NodeStats>,
-    /// Monotonic nonce for outgoing TXs from this node.
+
     pub nonce:          Mutex<u64>,
-    /// Supervisor — tracks component health for the /health endpoint.
+
     pub supervisor:     Arc<NodeSupervisor>,
-    /// Faucet: last claim time per address (unix timestamp seconds).
+
     pub faucet_claims:  Mutex<std::collections::HashMap<String, u64>>,
-    /// Transactions broadcast from desktop clients (LedgerTx JSON, last 500).
-    pub broadcast_txs:  Mutex<Vec<serde_json::Value>>,
-    /// Blocks broadcast from desktop clients (LedgerBlock JSON, last 500).
-    pub broadcast_blocks: Mutex<Vec<serde_json::Value>>,
+
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,8 +56,6 @@ pub struct NodeStats {
     pub shard_count:                  usize,
 }
 
-// ── Router ────────────────────────────────────────────────────────────────────
-
 pub fn make_router(state: Arc<RpcState>) -> Router {
     Router::new()
         .route("/",                   get(root))
@@ -94,8 +73,6 @@ pub fn make_router(state: Arc<RpcState>) -> Router {
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
-
-// ── Handlers ──────────────────────────────────────────────────────────────────
 
 async fn root() -> impl IntoResponse {
     Json(serde_json::json!({
@@ -117,38 +94,21 @@ async fn health(State(s): State<Arc<RpcState>>) -> impl IntoResponse {
     }))
 }
 
-async fn chain_blocks(State(s): State<Arc<RpcState>>) -> impl IntoResponse {
-    let node_blocks: Vec<serde_json::Value> = s.recent_blocks.lock().unwrap().iter()
-        .map(|b| serde_json::to_value(b).unwrap_or_default())
-        .collect();
-    let broadcast: Vec<serde_json::Value> = s.broadcast_blocks.lock().unwrap().clone();
-    // Merge, deduplicate by height, sort descending.
-    let mut all: Vec<serde_json::Value> = node_blocks;
-    for b in broadcast {
-        let h = b.get("height").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
-        if !all.iter().any(|x| x.get("height").and_then(|v| v.as_u64()) == Some(h)) {
-            all.push(b);
-        }
-    }
-    all.sort_by(|a, b| {
-        let ha = a.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
-        let hb = b.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
-        hb.cmp(&ha)
-    });
-    Json(all)
+async fn chain_blocks(_s: State<Arc<RpcState>>) -> impl IntoResponse {
+    // Serve newest 500 blocks from the persistent store — no memory pressure.
+    let blocks = crate::store::get_blocks(500);
+    Json(blocks)
 }
 
 async fn block_broadcast(
-    State(s):   State<Arc<RpcState>>,
+    _s:         State<Arc<RpcState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let mut blocks = s.broadcast_blocks.lock().unwrap();
     let height = body.get("height").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
-    if blocks.iter().any(|b| b.get("height").and_then(|v| v.as_u64()) == Some(height)) {
+    if crate::store::block_exists(height) {
         return (StatusCode::OK, Json(serde_json::json!({ "status": "already known" }))).into_response();
     }
-    blocks.push(body);
-    if blocks.len() > 500 { let excess = blocks.len() - 500; blocks.drain(0..excess); }
+    crate::store::insert_block(height, &body);
     (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "accepted" }))).into_response()
 }
 
@@ -156,21 +116,16 @@ async fn block_by_height(
     Path(height): Path<u64>,
     State(s):     State<Arc<RpcState>>,
 ) -> impl IntoResponse {
-    // Check node blocks first
+
     {
         let blocks = s.recent_blocks.lock().unwrap();
         if let Some(b) = blocks.iter().find(|b| b.height == height) {
             return (StatusCode::OK, Json(serde_json::to_value(b).unwrap())).into_response();
         }
     }
-    // Fall back to broadcast blocks from desktop clients
-    {
-        let broadcast = s.broadcast_blocks.lock().unwrap();
-        if let Some(b) = broadcast.iter().find(|b| {
-            b.get("height").and_then(|v| v.as_u64()) == Some(height)
-        }) {
-            return (StatusCode::OK, Json(b.clone())).into_response();
-        }
+
+    if let Some(b) = crate::store::get_block_by_height(height) {
+        return (StatusCode::OK, Json(b)).into_response();
     }
     (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "block not found" }))).into_response()
 }
@@ -229,44 +184,20 @@ async fn tx_submit(
     }
 }
 
-async fn chain_transactions(State(s): State<Arc<RpcState>>) -> impl IntoResponse {
-    let mut result: Vec<serde_json::Value> = {
-        let txs = s.pending_txs.lock().unwrap();
-        let start = txs.len().saturating_sub(50);
-        txs[start..].iter()
-            .map(|tx| serde_json::json!({
-                "hash":  hex::encode(tx.hash.as_bytes()),
-                "nonce": tx.nonce,
-                "from":  format!("0x{}", hex::encode(tx.from.as_bytes())),
-            }))
-            .collect()
-    };
-    // Append broadcast transactions from desktop clients (newest first).
-    let broadcast = s.broadcast_txs.lock().unwrap();
-    let bstart = broadcast.len().saturating_sub(50);
-    result.extend_from_slice(&broadcast[bstart..]);
-    result.sort_by(|a, b| {
-        let ta = a.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
-        let tb = b.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
-        tb.cmp(&ta)
-    });
-    Json(result)
+async fn chain_transactions(_s: State<Arc<RpcState>>) -> impl IntoResponse {
+    Json(crate::store::get_txs(100))
 }
 
-/// Accept a raw LedgerTx JSON from desktop clients and store it for the explorer.
 async fn tx_broadcast(
-    State(s):   State<Arc<RpcState>>,
+    _s:         State<Arc<RpcState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let mut txs = s.broadcast_txs.lock().unwrap();
-    // Avoid duplicates by hash.
     let hash = body.get("hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    if !hash.is_empty() && txs.iter().any(|t| t.get("hash").and_then(|v| v.as_str()) == Some(&hash)) {
+    if !hash.is_empty() && crate::store::tx_exists(&hash) {
         return (StatusCode::OK, Json(serde_json::json!({ "status": "already known" }))).into_response();
     }
-    txs.push(body);
-    // Keep last 500 only.
-    if txs.len() > 500 { let excess = txs.len() - 500; txs.drain(0..excess); }
+    let ts = body.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
+    crate::store::insert_tx(&hash, ts, &body);
     (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "accepted" }))).into_response()
 }
 
@@ -278,7 +209,7 @@ async fn node_stats(State(s): State<Arc<RpcState>>) -> impl IntoResponse {
 
 async fn node_identity(State(s): State<Arc<RpcState>>) -> impl IntoResponse {
     let balance_raw = {
-        // Parse bech32 / hex address to get the on-chain balance
+
         let addr_hex = s.node_address.trim_start_matches("0x");
         if let Ok(bytes) = hex::decode(addr_hex) {
             if bytes.len() == 20 {
@@ -300,8 +231,6 @@ async fn node_identity(State(s): State<Arc<RpcState>>) -> impl IntoResponse {
     }))
 }
 
-// ── Faucet ────────────────────────────────────────────────────────────────────
-
 #[derive(Deserialize)]
 struct FaucetQuery {
     to: String,
@@ -311,15 +240,14 @@ async fn faucet(
     State(s): State<Arc<RpcState>>,
     axum::extract::Query(q): axum::extract::Query<FaucetQuery>,
 ) -> impl IntoResponse {
-    const FAUCET_AMOUNT_UEGOC: u64 = 100 * 1_000_000; // 100 EGOC
-    const COOLDOWN_SECS: u64 = 86400; // 24 hours
+    const FAUCET_AMOUNT_UEGOC: u64 = 100 * 1_000_000;
+    const COOLDOWN_SECS: u64 = 86400;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
-    // Check cooldown
     {
         let mut claims = s.faucet_claims.lock().unwrap();
         if let Some(&last) = claims.get(&q.to) {
@@ -335,7 +263,6 @@ async fn faucet(
         claims.insert(q.to.clone(), now);
     }
 
-    // Credit the balance: parse address, get-or-create account, then credit it.
     let addr_bytes = match hex::decode(q.to.trim_start_matches("0x")) {
         Ok(b) if b.len() == 20 => {
             let mut arr = [0u8; 20];
@@ -366,9 +293,6 @@ async fn faucet(
     }))).into_response()
 }
 
-// ── Startup helper ────────────────────────────────────────────────────────────
-
-/// Spawn the HTTP server on `addr` (e.g. "0.0.0.0:8545").
 pub async fn serve(addr: &str, state: Arc<RpcState>) -> anyhow::Result<()> {
     let app = make_router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;

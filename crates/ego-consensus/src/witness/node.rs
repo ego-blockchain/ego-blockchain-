@@ -242,7 +242,6 @@ impl WitnessNode {
                         address
                     );
 
-                    // Send each report to aggregator via bridge
                     if let Some(ref sender) = report_sender {
                         let mut sent_count = 0;
                         for report in &processor.current_batch {

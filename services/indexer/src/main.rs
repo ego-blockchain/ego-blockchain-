@@ -1,22 +1,3 @@
-//! Ego Blockchain Event Indexer (EGO-14)
-//!
-//! Subscribes to the ego-node block stream, extracts contract events from
-//! transaction data, stores them in SQLite, and serves a query REST API.
-//!
-//! Ports
-//! -----
-//!   ego-node  →  8545  (source)
-//!   ego-indexer → 8546 (query API, this binary)
-//!
-//! Endpoints
-//! ---------
-//!   GET  /events             → filtered event query (ascending)
-//!   GET  /events/latest      → filtered event query (descending, default limit 10)
-//!   GET  /status             → { indexed_height, node_url, event_count }
-//!   GET  /subscriptions      → list active webhooks
-//!   POST /subscriptions      → register webhook
-//!   DELETE /subscriptions/:id → remove webhook
-
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
@@ -38,31 +19,23 @@ use tokio::time::interval;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 
-// ── CLI config ────────────────────────────────────────────────────────────────
-
 #[derive(Parser, Debug, Clone)]
 #[command(name = "ego-indexer", about = "Ego Blockchain event indexer (EGO-14)")]
 struct Config {
-    /// ego-node RPC base URL
+
     #[arg(long, env = "EGO_INDEXER_NODE_URL", default_value = "http://localhost:8545")]
     node_url: String,
 
-    /// Bind address for the query API
     #[arg(long, env = "EGO_INDEXER_LISTEN", default_value = "0.0.0.0:8546")]
     listen: String,
 
-    /// SQLite database file path
     #[arg(long, env = "EGO_INDEXER_DB", default_value = "./ego-indexer.db")]
     db: String,
 
-    /// Block polling interval in milliseconds
     #[arg(long, env = "EGO_INDEXER_POLL_MS", default_value_t = 200)]
     poll_interval_ms: u64,
 }
 
-// ── Domain types ──────────────────────────────────────────────────────────────
-
-/// A fully-hydrated event record as stored in SQLite and returned by the API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexedEvent {
     pub id:               i64,
@@ -76,7 +49,6 @@ pub struct IndexedEvent {
     pub timestamp:        u64,
 }
 
-/// Raw event as embedded in a transaction's `data.events[]` array by a contract.
 #[derive(Debug, Deserialize)]
 struct RawEvent {
     event_name: String,
@@ -87,7 +59,6 @@ struct RawEvent {
     data:       Value,
 }
 
-/// Minimal block summary returned by GET /chain/blocks.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct BlockSummary {
@@ -96,7 +67,6 @@ struct BlockSummary {
     timestamp: u64,
 }
 
-/// Minimal transaction as returned by the node (we only need the data field).
 #[derive(Debug, Deserialize)]
 struct RawTx {
     #[serde(default)]
@@ -105,7 +75,6 @@ struct RawTx {
     data: Value,
 }
 
-/// Block detail response from GET /block/:height.
 #[derive(Debug, Deserialize)]
 struct BlockDetail {
     height:    u64,
@@ -113,8 +82,6 @@ struct BlockDetail {
     #[serde(default)]
     txs:       Vec<RawTx>,
 }
-
-// ── Subscription types ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscription {
@@ -132,15 +99,11 @@ struct SubscriptionRequest {
     event_name: Option<String>,
 }
 
-// ── Shared application state ──────────────────────────────────────────────────
-
 struct AppState {
     db:            Arc<Mutex<Connection>>,
     node_url:      String,
     subscriptions: Arc<Mutex<HashMap<String, Subscription>>>,
 }
-
-// ── Database setup ────────────────────────────────────────────────────────────
 
 fn setup_db(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -170,16 +133,12 @@ fn setup_db(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-// ── Helper: current unix timestamp ───────────────────────────────────────────
-
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
-
-// ── Indexer loop ──────────────────────────────────────────────────────────────
 
 async fn run_indexer(
     db:            Arc<Mutex<Connection>>,
@@ -209,7 +168,7 @@ async fn index_once(
     node_url:      &str,
     subscriptions: &Arc<Mutex<HashMap<String, Subscription>>>,
 ) -> Result<()> {
-    // 1. Fetch the current indexed height from SQLite.
+
     let last_height: u64 = {
         let conn = db.lock().unwrap();
         conn.query_row(
@@ -220,7 +179,6 @@ async fn index_once(
         .unwrap_or(0) as u64
     };
 
-    // 2. Fetch the recent blocks list from the node.
     let blocks_url = format!("{node_url}/chain/blocks");
     let resp = client
         .get(&blocks_url)
@@ -229,7 +187,7 @@ async fn index_once(
         .context("GET /chain/blocks failed")?;
 
     if !resp.status().is_success() {
-        return Ok(()); // node not ready yet — skip silently
+        return Ok(());
     }
 
     let blocks: Vec<BlockSummary> = resp
@@ -237,7 +195,6 @@ async fn index_once(
         .await
         .context("failed to parse /chain/blocks JSON")?;
 
-    // 3. Find new blocks (height > last_height), sorted ascending.
     let mut new_blocks: Vec<&BlockSummary> = blocks
         .iter()
         .filter(|b| b.height > last_height)
@@ -255,7 +212,6 @@ async fn index_once(
         new_blocks.last().map(|b| b.height).unwrap_or(0),
     );
 
-    // 4. For each new block, fetch details and index events.
     for block in new_blocks {
         let events = fetch_and_parse_block(client, node_url, block).await;
         match events {
@@ -277,7 +233,7 @@ async fn index_once(
                             Err(e) => warn!("failed to insert event: {e:#}"),
                         }
                     }
-                    // Advance the indexed height.
+
                     if let Err(e) = conn.execute(
                         "UPDATE indexed_height SET height = ?1 WHERE id = 1",
                         params![block.height as i64],
@@ -287,7 +243,6 @@ async fn index_once(
                     inserted
                 };
 
-                // 5. Fire webhooks for matching subscriptions (non-blocking).
                 if !fired.is_empty() {
                     let subs: Vec<Subscription> = {
                         subscriptions
@@ -312,7 +267,7 @@ async fn index_once(
             }
             Err(e) => {
                 warn!("failed to process block {}: {e:#}", block.height);
-                // Still advance height so we don't retry permanently bad blocks.
+
                 let conn = db.lock().unwrap();
                 let _ = conn.execute(
                     "UPDATE indexed_height SET height = ?1 WHERE id = 1",
@@ -325,7 +280,6 @@ async fn index_once(
     Ok(())
 }
 
-/// Fetch block details and extract all contract events from transactions.
 async fn fetch_and_parse_block(
     client:   &reqwest::Client,
     node_url: &str,
@@ -339,18 +293,16 @@ async fn fetch_and_parse_block(
         .context("GET /block/{height} failed")?;
 
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        // Block not yet available — return empty, will retry next tick.
+
         return Ok(vec![]);
     }
 
     let body = resp.text().await.context("failed to read block body")?;
 
-    // The node may return just the BlockSummary (no txs field) for recent blocks.
-    // Attempt to parse as BlockDetail; fall back gracefully.
     let detail: BlockDetail = match serde_json::from_str(&body) {
         Ok(d) => d,
         Err(_) => {
-            // Possibly the /chain/blocks format — no transaction data available.
+
             return Ok(vec![]);
         }
     };
@@ -358,7 +310,7 @@ async fn fetch_and_parse_block(
     let mut events = Vec::new();
 
     for tx in &detail.txs {
-        // Parse events embedded in tx.data.events (EGO-14 Section 2).
+
         if let Some(raw_events) = tx.data.get("events").and_then(|v| v.as_array()) {
             for raw in raw_events {
                 match serde_json::from_value::<RawEvent>(raw.clone()) {
@@ -366,7 +318,7 @@ async fn fetch_and_parse_block(
                         let topic0 = re.topics.first().cloned();
                         let topic1 = re.topics.get(1).cloned();
                         events.push(IndexedEvent {
-                            id:               0, // filled after INSERT
+                            id:               0,
                             block_height:     detail.height,
                             tx_hash:          tx.hash.clone(),
                             contract_address: re.contract,
@@ -408,8 +360,6 @@ fn insert_event(conn: &Connection, evt: &IndexedEvent) -> Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
-// ── Webhook delivery ──────────────────────────────────────────────────────────
-
 fn subscription_matches(sub: &Subscription, evt: &IndexedEvent) -> bool {
     if let Some(ref c) = sub.contract {
         if *c != evt.contract_address {
@@ -444,7 +394,7 @@ async fn deliver_webhook(sub: &Subscription, evt: &IndexedEvent) {
         }
     };
 
-    let delays = [1u64, 2, 4]; // seconds — exponential backoff (3 retries)
+    let delays = [1u64, 2, 4];
     for (attempt, &delay_secs) in delays.iter().enumerate() {
         match client
             .post(&sub.url)
@@ -455,7 +405,7 @@ async fn deliver_webhook(sub: &Subscription, evt: &IndexedEvent) {
             .await
         {
             Ok(resp) if resp.status().is_success() => {
-                return; // delivered
+                return;
             }
             Ok(resp) => {
                 warn!(
@@ -476,8 +426,6 @@ async fn deliver_webhook(sub: &Subscription, evt: &IndexedEvent) {
     warn!("webhook {} failed after 3 attempts; dropping delivery for event {}", sub.url, evt.event_name);
 }
 
-// ── Query API handlers ────────────────────────────────────────────────────────
-
 #[derive(Debug, Deserialize)]
 struct EventQuery {
     contract:   Option<String>,
@@ -488,8 +436,6 @@ struct EventQuery {
     offset:     Option<u64>,
 }
 
-/// Build a list of rows from a prepared statement with dynamic WHERE clauses.
-/// Returns events ordered by block_height ASC, id ASC.
 async fn query_events(
     State(state): State<Arc<AppState>>,
     Query(params): Query<EventQuery>,
@@ -506,7 +452,6 @@ async fn query_events(
     }
 }
 
-/// Same as query_events but ordered DESC (latest first). Default limit 10.
 async fn query_latest_events(
     State(state): State<Arc<AppState>>,
     Query(mut params): Query<EventQuery>,
@@ -533,7 +478,6 @@ fn query_events_inner(
 ) -> Result<Vec<IndexedEvent>> {
     let conn = db.lock().unwrap();
 
-    // Build WHERE clauses and positional parameter list dynamically.
     let mut conditions: Vec<String> = Vec::new();
     let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
@@ -639,8 +583,6 @@ async fn indexer_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
     }))
 }
 
-// ── Subscription handlers ─────────────────────────────────────────────────────
-
 async fn list_subscriptions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let subs: Vec<Subscription> = state
         .subscriptions
@@ -697,8 +639,6 @@ async fn remove_subscription(
     }
 }
 
-// ── Router ────────────────────────────────────────────────────────────────────
-
 fn make_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/events",              get(query_events))
@@ -710,8 +650,6 @@ fn make_router(state: Arc<AppState>) -> Router {
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
-
-// ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -728,7 +666,6 @@ async fn main() -> Result<()> {
     info!("  db path        : {}", cfg.db);
     info!("  poll interval  : {}ms", cfg.poll_interval_ms);
 
-    // Open and initialise the SQLite database.
     let conn = Connection::open(&cfg.db)
         .with_context(|| format!("failed to open database at {}", cfg.db))?;
     setup_db(&conn).context("database setup failed")?;
@@ -743,7 +680,6 @@ async fn main() -> Result<()> {
         subscriptions: Arc::clone(&subscriptions),
     });
 
-    // Spawn the background indexer loop.
     let indexer_db   = Arc::clone(&db);
     let indexer_node = cfg.node_url.clone();
     let indexer_subs = Arc::clone(&subscriptions);
@@ -753,7 +689,6 @@ async fn main() -> Result<()> {
         run_indexer(indexer_db, indexer_node, poll_ms, indexer_subs).await;
     });
 
-    // Start the HTTP API server.
     let router   = make_router(state);
     let listener = tokio::net::TcpListener::bind(&cfg.listen)
         .await

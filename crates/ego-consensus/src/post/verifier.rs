@@ -1,4 +1,3 @@
-// post/verifier.rs
 use super::{PartitionProof, PoStEvent, PoStMetrics, PoStProof, PoStResult, PoStWindow};
 use crate::error::{PoCError, PoCResult};
 use ego_core::{Address, Hash, Timestamp};
@@ -55,7 +54,6 @@ impl PoStVerifier {
         Ok(())
     }
 
-    /// Verify a PoStEvent emitted by a prover node.
     pub async fn verify_post_event(&self, event: &PoStEvent) -> PoCResult<bool> {
         debug!("Verifying PoSt event for window {} (verifier {})",
                event.window_id, self.verifier_id);
@@ -65,10 +63,10 @@ impl PoStVerifier {
         match &event.result {
             PoStResult::Pass => self.verify_successful_post(event).await,
             PoStResult::Miss => {
-                // A miss has no proof to verify — record as confirmed miss
+
                 debug!("PoSt miss recorded for window {} node {}",
                        event.window_id, event.node_addr);
-                Ok(true) // Miss is a valid (if penalised) outcome
+                Ok(true)
             }
             PoStResult::Fault => self.verify_faulted_post(event).await,
         }
@@ -83,7 +81,6 @@ impl PoStVerifier {
             return Ok(false);
         }
 
-        // Verify latency is plausible
         if event.latency_ms > 3_600_000 {
             warn!("PoSt proof latency implausibly high: {} ms", event.latency_ms);
             return Ok(false);
@@ -93,13 +90,12 @@ impl PoStVerifier {
     }
 
     async fn verify_faulted_post(&self, event: &PoStEvent) -> PoCResult<bool> {
-        // A fault means proof was submitted but invalid — record confirmed fault
+
         debug!("PoSt fault recorded for window {} node {}",
                event.window_id, event.node_addr);
         Ok(true)
     }
 
-    /// Verify a full PoStProof object (used by the proving pipeline).
     pub async fn verify_post_proof(&self, proof: &PoStProof) -> PoCResult<bool> {
         debug!("Verifying PoSt proof for window {} (verifier {})",
                proof.window_id, self.verifier_id);
@@ -108,7 +104,6 @@ impl PoStVerifier {
 
         let proof_hash = self.compute_proof_hash(proof);
 
-        // Check cache
         {
             let cache = self.verification_cache.read().unwrap();
             if let Some(cached) = cache.get(&proof_hash) {
@@ -120,7 +115,6 @@ impl PoStVerifier {
         let is_valid = self.perform_proof_verification(proof).await?;
         let verification_time_ms = Timestamp::now().as_millis() - start_time.as_millis();
 
-        // Cache result
         {
             let mut cache = self.verification_cache.write().unwrap();
             cache.insert(proof_hash, VerificationResult {
@@ -338,12 +332,12 @@ mod tests {
             3,
             vec![0, 1],
             Hash::new([5u8; 32]),
-            Hash::new([0u8; 32]), // zero hash for miss
+            Hash::new([0u8; 32]),
             PoStResult::Miss,
             0,
         );
 
         let result = verifier.verify_post_event(&event).await.unwrap();
-        assert!(result); // miss is valid outcome, just penalised
+        assert!(result);
     }
 }

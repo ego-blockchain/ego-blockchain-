@@ -1,10 +1,3 @@
-/**
- * HomeScreen — main wallet dashboard.
- *
- * Shows: address (tap to copy), EGOC balance, Send/Receive buttons,
- * and a live list of recent transactions fetched from ego-node.
- */
-
 import React, { useCallback, useEffect, useState } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, FlatList,
@@ -78,8 +71,6 @@ export function HomeScreen({ navigation }: { navigation: Nav }) {
     setTimeout(() => setCopied(false), 2000);
   }
 
-  // ── Render helpers ───────────────────────────────────────────────────────
-
   function TxItem({ item }: { item: RpcTransaction }) {
     const isOut = wallet && item.from === wallet.address;
     const other  = isOut ? item.to : item.from;
@@ -136,13 +127,13 @@ export function HomeScreen({ navigation }: { navigation: Nav }) {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#3b82f6" />}
         ListHeaderComponent={
           <View style={s.header}>
-            {/* Address bar */}
+            {}
             <TouchableOpacity style={s.addressBar} onPress={copyAddress} activeOpacity={0.7}>
               <Text style={s.addressText}>{shortAddr}</Text>
               <Text style={s.copyBtn}>{copied ? '✓ Copied' : 'Copy'}</Text>
             </TouchableOpacity>
 
-            {/* Balance card */}
+            {}
             <View style={s.balanceCard}>
               <Text style={s.balanceLabel}>Total Balance</Text>
               <Text style={s.balanceValue}>{egocStr}</Text>
@@ -150,7 +141,7 @@ export function HomeScreen({ navigation }: { navigation: Nav }) {
               <Text style={s.networkBadge}>Testnet</Text>
             </View>
 
-            {/* Action buttons */}
+            {}
             <View style={s.actionRow}>
               <TouchableOpacity style={s.actionBtn} onPress={() => navigation.navigate('Send')}>
                 <Text style={s.actionIcon}>↑</Text>
@@ -162,7 +153,7 @@ export function HomeScreen({ navigation }: { navigation: Nav }) {
               </TouchableOpacity>
             </View>
 
-            {/* Tx list header */}
+            {}
             <View style={s.sectionHead}>
               <Text style={s.sectionTitle}>Recent Transactions</Text>
               <Text style={s.sectionCount}>{txs.length}</Text>

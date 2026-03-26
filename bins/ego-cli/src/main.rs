@@ -3,8 +3,6 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use std::path::PathBuf;
 
-// ── CLI definition ─────────────────────────────────────────────────────────
-
 #[derive(Parser)]
 #[command(
     name = "ego",
@@ -19,79 +17,71 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Compile a Urego source file to WASM
+
     Compile {
-        /// Path to the .urego source file
+
         file: PathBuf,
     },
 
-    /// Deploy a compiled WASM contract to the network
     Deploy {
-        /// Path to the .wasm file
+
         file: PathBuf,
-        /// RPC node URL
+
         #[arg(long, default_value = "http://localhost:8545")]
         node: String,
-        /// Private key seed as 32-byte hex string
+
         #[arg(long)]
         key: Option<String>,
     },
 
-    /// Call a contract function
     Call {
-        /// Contract address
+
         address: String,
-        /// Function name to call
+
         function: String,
-        /// Arguments to pass to the function
+
         args: Vec<String>,
-        /// RPC node URL
+
         #[arg(long, default_value = "http://localhost:8545")]
         node: String,
-        /// Private key seed as 32-byte hex string (for signed calls)
+
         #[arg(long)]
         key: Option<String>,
     },
 
-    /// Get the EGOC balance of an address
     Balance {
-        /// The address to query
+
         address: String,
-        /// RPC node URL
+
         #[arg(long, default_value = "http://localhost:8545")]
         node: String,
     },
 
-    /// Request testnet tokens from the faucet
     Faucet {
-        /// The address to send tokens to
+
         address: String,
-        /// RPC node URL
+
         #[arg(long, default_value = "http://localhost:8545")]
         node: String,
     },
 
-    /// Get the status of a transaction by hash
     Tx {
-        /// Transaction hash (hex)
+
         hash: String,
-        /// RPC node URL
+
         #[arg(long, default_value = "http://localhost:8545")]
         node: String,
     },
 
-    /// Check the status of a node
     Node {
         #[command(subcommand)]
         subcommand: NodeCommands,
     },
 
-    /// Generate a new keypair and print address + keys
     Keygen,
 
-    /// Scaffold a new Urego project
     Init {
-        /// Project name (also used as directory name)
+
         #[arg(long, default_value = "my-contract")]
         name: String,
     },
@@ -99,15 +89,13 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum NodeCommands {
-    /// Check node health and display status
+
     Status {
-        /// RPC node URL
+
         #[arg(long, default_value = "http://localhost:8545")]
         node: String,
     },
 }
-
-// ── Entry point ────────────────────────────────────────────────────────────
 
 fn main() {
     let cli = Cli::parse();
@@ -133,8 +121,6 @@ fn main() {
         std::process::exit(1);
     }
 }
-
-// ── compile ────────────────────────────────────────────────────────────────
 
 fn cmd_compile(file: PathBuf) -> Result<()> {
     let source = std::fs::read_to_string(&file)
@@ -162,26 +148,20 @@ fn cmd_compile(file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-// ── deploy ─────────────────────────────────────────────────────────────────
-
 fn cmd_deploy(file: PathBuf, node: &str, key_hex: Option<&str>) -> Result<()> {
     let wasm_bytes = std::fs::read(&file)
         .with_context(|| format!("Failed to read '{}'", file.display()))?;
 
     let keypair = resolve_keypair(key_hex)?;
 
-    // Get nonce from node (fall back to 0 if node unavailable)
     let nonce = fetch_nonce(node, &keypair).unwrap_or(0);
 
-    // Derive the deployer address string (bech32 testnet)
     let address = keypair
         .derive_bech32_address(1, ego_core::AddressType::EOA, "egot")
         .map_err(|e| anyhow!("Address derivation failed: {}", e))?;
 
-    // Contract address = first 20 bytes of blake2s(deployer_address || nonce)
     let contract_address = derive_contract_address(&address, nonce);
 
-    // Build the transaction payload
     let tx = serde_json::json!({
         "kind": "deploy",
         "from": address,
@@ -211,8 +191,6 @@ fn cmd_deploy(file: PathBuf, node: &str, key_hex: Option<&str>) -> Result<()> {
 
     Ok(())
 }
-
-// ── call ───────────────────────────────────────────────────────────────────
 
 fn cmd_call(
     address: &str,
@@ -264,8 +242,6 @@ fn cmd_call(
     Ok(())
 }
 
-// ── balance ────────────────────────────────────────────────────────────────
-
 fn cmd_balance(address: &str, node: &str) -> Result<()> {
     let client = reqwest::blocking::Client::new();
     let resp = client
@@ -295,8 +271,6 @@ fn cmd_balance(address: &str, node: &str) -> Result<()> {
 
     Ok(())
 }
-
-// ── faucet ─────────────────────────────────────────────────────────────────
 
 fn cmd_faucet(address: &str, node: &str) -> Result<()> {
     let client = reqwest::blocking::Client::new();
@@ -348,10 +322,8 @@ fn cmd_faucet(address: &str, node: &str) -> Result<()> {
     Ok(())
 }
 
-// ── tx ─────────────────────────────────────────────────────────────────────
-
 fn cmd_tx(hash: &str, node: &str) -> Result<()> {
-    // Try the pending transactions endpoint and search by hash
+
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get(format!("{}/chain/transactions", node))
@@ -390,8 +362,6 @@ fn cmd_tx(hash: &str, node: &str) -> Result<()> {
 
     Ok(())
 }
-
-// ── node status ────────────────────────────────────────────────────────────
 
 fn cmd_node_status(node: &str) -> Result<()> {
     let client = reqwest::blocking::Client::new();
@@ -437,7 +407,6 @@ fn cmd_node_status(node: &str) -> Result<()> {
         println!("  │  Peer ID     : {}", peer_id.dimmed());
         println!("  └─────────────────────────────────────────");
 
-        // Also fetch stats if available
         if let Ok(stats_resp) = client.get(format!("{}/node/stats", node)).send() {
             if stats_resp.status().is_success() {
                 if let Ok(stats) = stats_resp.json::<serde_json::Value>() {
@@ -471,8 +440,6 @@ fn cmd_node_status(node: &str) -> Result<()> {
     Ok(())
 }
 
-// ── keygen ─────────────────────────────────────────────────────────────────
-
 fn cmd_keygen() -> Result<()> {
     let keypair = ego_core::KeyPair::generate();
 
@@ -505,8 +472,6 @@ fn cmd_keygen() -> Result<()> {
     Ok(())
 }
 
-// ── init ───────────────────────────────────────────────────────────────────
-
 fn cmd_init(name: &str) -> Result<()> {
     let project_dir = PathBuf::from(name);
 
@@ -517,12 +482,10 @@ fn cmd_init(name: &str) -> Result<()> {
         ));
     }
 
-    // Create directory structure
     let src_dir = project_dir.join("src");
     std::fs::create_dir_all(&src_dir)
         .with_context(|| format!("Failed to create directory '{}'", src_dir.display()))?;
 
-    // Write main.urego
     let main_urego = r#"// Hello World contract on Ego Blockchain
 contract HelloWorld {
     pub fn greet(name: String) -> String {
@@ -542,7 +505,6 @@ contract HelloWorld {
     std::fs::write(&main_path, main_urego)
         .with_context(|| format!("Failed to write '{}'", main_path.display()))?;
 
-    // Write ego.toml
     let ego_toml = format!(
         r#"[project]
 name = "{}"
@@ -572,9 +534,6 @@ mainnet = "https://rpc.ego-blockchain.io"
     Ok(())
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-/// Load a keypair from an optional 32-byte hex seed, or generate a fresh one.
 fn resolve_keypair(key_hex: Option<&str>) -> Result<ego_core::KeyPair> {
     if let Some(hex_str) = key_hex {
         let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
@@ -599,8 +558,6 @@ fn resolve_keypair(key_hex: Option<&str>) -> Result<ego_core::KeyPair> {
     }
 }
 
-/// Fetch the current nonce for this keypair's address from the node.
-/// Returns 0 on any error rather than failing the deploy.
 fn fetch_nonce(node: &str, keypair: &ego_core::KeyPair) -> Result<u64> {
     let address = keypair
         .derive_bech32_address(1, ego_core::AddressType::EOA, "egot")
@@ -619,8 +576,6 @@ fn fetch_nonce(node: &str, keypair: &ego_core::KeyPair) -> Result<u64> {
     }
 }
 
-/// Derive contract address from deployer address + nonce.
-/// First 20 bytes of blake2s(deployer_address_bytes || nonce_le_bytes), hex-encoded with "0x" prefix.
 fn derive_contract_address(deployer_address: &str, nonce: u64) -> String {
     use blake2::{Blake2s256, Digest};
 

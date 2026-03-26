@@ -5,8 +5,6 @@ use ego_core::{Address, KeyPair};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-/// Bridge that connects DensityEvents from aggregator to slashing engine
-/// This is what actually triggers slashing when co-location is detected
 #[derive(Debug)]
 pub struct SlashingBridge {
     slash_engine: SlashingEngine,
@@ -14,7 +12,7 @@ pub struct SlashingBridge {
 }
 
 impl SlashingBridge {
-    /// Create new slashing bridge with the engine and reporter identity
+
     pub fn new(slash_engine: SlashingEngine, reporter_address: Address) -> Self {
         Self {
             slash_engine,
@@ -22,7 +20,6 @@ impl SlashingBridge {
         }
     }
 
-    /// Start the slashing bridge to process density events from aggregator
     pub async fn start_density_processor(
         &self,
         mut density_receiver: mpsc::UnboundedReceiver<DensityEvent>,
@@ -38,12 +35,10 @@ impl SlashingBridge {
         warn!("Slashing bridge density processor stopped");
     }
 
-    /// Process a density violation and potentially trigger slashing
     async fn process_density_violation(&self, density_event: DensityEvent) -> PoCResult<()> {
         debug!("Processing density violation for node {} in cell {} (LDM: {:.3}, devices: {})",
                density_event.node_id, density_event.h3_cell, density_event.ldm, density_event.device_count);
 
-        // Only process violations that meet minimum thresholds
         if density_event.ldm < 0.3 || density_event.device_count < 2 {
             debug!("Density violation below threshold, ignoring");
             return Ok(());
@@ -54,7 +49,6 @@ impl SlashingBridge {
                 warn!("⚡ Slashing executed for density violation: node {} slashed {} tokens",
                       density_event.node_id, slash_event.slash_amount);
 
-                // TODO: Emit slash event to chain via BFT bridge
                 info!("Slash event {} created for node {} (confidence: {:.2})",
                       format!("{:?}", slash_event.event_id), slash_event.slashed_node, slash_event.confidence);
 
@@ -72,7 +66,6 @@ impl SlashingBridge {
     }
 }
 
-/// Factory function to create slashing bridge with density event processing
 pub fn create_slashing_bridge(
     slash_engine: SlashingEngine,
     reporter_address: Address,
@@ -80,9 +73,8 @@ pub fn create_slashing_bridge(
     let bridge = SlashingBridge::new(slash_engine, reporter_address);
     let (density_tx, density_rx) = mpsc::unbounded_channel();
 
-    // Start the density processor in background
     let bridge_clone = SlashingBridge::new(
-        SlashingEngine::new(KeyPair::generate()), // TODO: Use proper keypair
+        SlashingEngine::new(KeyPair::generate()),
         reporter_address,
     );
 
@@ -109,13 +101,12 @@ mod tests {
             node_id: Address::new([2u8; 20]),
             h3_cell: "8c2a1e0d0b5ffff".to_string(),
             device_count: 5,
-            ldm: 0.85, // High LDM indicates clear co-location
+            ldm: 0.85,
             evidence_root: Hash::new([3u8; 32]),
             epoch: 100,
             timestamp: Timestamp::now(),
         };
 
-        // Should process without error
         assert!(bridge.process_density_violation(density_event).await.is_ok());
     }
 
@@ -129,14 +120,13 @@ mod tests {
         let density_event = DensityEvent {
             node_id: Address::new([2u8; 20]),
             h3_cell: "8c2a1e0d0b5ffff".to_string(),
-            device_count: 1, // Below threshold
-            ldm: 0.2, // Below threshold
+            device_count: 1,
+            ldm: 0.2,
             evidence_root: Hash::new([3u8; 32]),
             epoch: 100,
             timestamp: Timestamp::now(),
         };
 
-        // Should be ignored
         assert!(bridge.process_density_violation(density_event).await.is_ok());
     }
 }

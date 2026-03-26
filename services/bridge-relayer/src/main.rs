@@ -1,20 +1,3 @@
-//! EGO-10 Bridge Relayer
-//!
-//! Watches source chains (Ethereum, BNB, Polygon) for Lock events emitted by
-//! the EgoLock Solidity contract, then calls `verify_and_mint` on the Ego
-//! bridge contract for each confirmed lock.
-//!
-//! Also watches the Ego bridge for BridgeOut events and submits `unlock`
-//! transactions on the destination chain.
-//!
-//! REST API on port 8548:
-//!   GET  /health           → { status, processed_locks, processed_burns, uptime_secs }
-//!   GET  /pending          → [ PendingEvent ]
-//!   GET  /processed        → last 100 processed events
-//!   POST /retry/:event_id  → manually re-queue a failed event
-//!
-//! Phase 1: trusted relayer model (see bridge.urego for Phase 2 ZK upgrade path).
-
 use axum::{Json, Router, extract::State, routing::get};
 use chrono::Utc;
 use once_cell::sync::Lazy;
@@ -27,34 +10,25 @@ use std::{
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 
-// ── Config ────────────────────────────────────────────────────────────────────
-
-/// Ego node RPC endpoint.
 const EGO_RPC: &str = "http://127.0.0.1:8545";
 
-/// Ego bridge contract address (from genesis.json).
 const EGO_BRIDGE_ADDR: &str = "0x000000000000000000000000000000000000C003";
 
-/// Block confirmations required before processing a lock event.
 const CONFIRMATIONS_REQUIRED: u64 = 12;
 
-/// How often to poll source chains for new lock events (seconds).
 const POLL_INTERVAL_SECS: u64 = 15;
 
-/// Port for the relayer's own REST API.
 const RELAYER_API_PORT: u16 = 8548;
-
-// ── Supported chains ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainConfig {
     pub chain_id:      u64,
     pub name:          String,
-    /// Public RPC endpoint for this chain (set via env: ETH_RPC, BSC_RPC, etc.)
+
     pub rpc_url:       String,
-    /// Address of the EgoLock contract deployed on this chain.
+
     pub lock_contract: String,
-    /// Block number to start scanning from (set to deploy block of lock contract).
+
     pub start_block:   u64,
 }
 
@@ -84,21 +58,19 @@ static SUPPORTED_CHAINS: Lazy<Vec<ChainConfig>> = Lazy::new(|| {
     ]
 });
 
-// ── State ─────────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeEvent {
-    pub id:           String,   // blake2s(chain_id:tx_hash:log_index)
-    pub direction:    String,   // "in" (lock→mint) or "out" (burn→unlock)
+    pub id:           String,
+    pub direction:    String,
     pub chain_id:     u64,
     pub tx_hash:      String,
     pub block_number: u64,
-    pub sender:       String,   // source chain address
-    pub ego_dest:     String,   // Ego address
+    pub sender:       String,
+    pub ego_dest:     String,
     pub token:        String,
-    pub amount:       u64,      // uEGOC / uToken (low 64 bits for Phase 1)
-    pub claim_hash:   String,   // blake3 hex
-    pub status:       String,   // "pending" | "submitted" | "confirmed" | "failed"
+    pub amount:       u64,
+    pub claim_hash:   String,
+    pub status:       String,
     pub retries:      u32,
     pub last_attempt: i64,
     pub error:        Option<String>,
@@ -126,9 +98,6 @@ impl RelayerState {
     }
 }
 
-// ── Ethereum JSON-RPC helpers ─────────────────────────────────────────────────
-
-/// eth_getBlockNumber — returns the latest block number on a chain.
 async fn eth_block_number(rpc: &str, client: &reqwest::Client) -> anyhow::Result<u64> {
     let body = serde_json::json!({
         "jsonrpc": "2.0", "id": 1,
@@ -139,17 +108,6 @@ async fn eth_block_number(rpc: &str, client: &reqwest::Client) -> anyhow::Result
     Ok(u64::from_str_radix(hex, 16).unwrap_or(0))
 }
 
-/// eth_getLogs — scan for EgoLock events from a contract.
-///
-/// EgoLock event topic0: keccak256("Locked(address,uint256,address,uint256,address)")
-/// = 0x... (computed below as a constant)
-///
-/// Log data layout (ABI-encoded):
-///   [0..32]   sender (address, left-padded)
-///   [32..64]  amount (uint256)
-///   [64..96]  token  (address, left-padded)
-///   [96..128] nonce  (uint256)
-///   [128..160] ego_dest (bytes32, right-padded UTF-8)
 async fn eth_get_lock_logs(
     rpc:      &str,
     contract: &str,
@@ -160,8 +118,7 @@ async fn eth_get_lock_logs(
     if contract.is_empty() {
         return Ok(vec![]);
     }
-    // EgoLock event: Locked(address indexed sender, uint256 amount, address token, uint64 nonce, string ego_dest)
-    // Topic0 = keccak256("Locked(address,uint256,address,uint64,string)")
+
     const LOCKED_TOPIC: &str =
         "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
@@ -179,18 +136,12 @@ async fn eth_get_lock_logs(
     Ok(resp["result"].as_array().cloned().unwrap_or_default())
 }
 
-// ── Claim hash ────────────────────────────────────────────────────────────────
-
-/// Compute the claim hash as blake2 of chain_id:block_number:tx_hash:log_index.
-/// On-chain (bridge.urego) this is documented as blake3 — relayer matches it.
 fn compute_claim_hash(chain_id: u64, block: u64, tx_hash: &str, log_index: u64) -> String {
     use sha2::{Digest, Sha256};
     let input = format!("{chain_id}:{block}:{tx_hash}:{log_index}");
     let hash = Sha256::digest(input.as_bytes());
     hex::encode(hash)
 }
-
-// ── Parse lock log ────────────────────────────────────────────────────────────
 
 fn parse_lock_log(log: &serde_json::Value, chain_id: u64) -> Option<BridgeEvent> {
     let tx_hash    = log["transactionHash"].as_str()?.to_string();
@@ -199,19 +150,16 @@ fn parse_lock_log(log: &serde_json::Value, chain_id: u64) -> Option<BridgeEvent>
     let li_hex     = log["logIndex"].as_str()?.trim_start_matches("0x");
     let log_index  = u64::from_str_radix(li_hex, 16).unwrap_or(0);
 
-    // Decode data field (hex, 5 × 32-byte slots)
     let data_hex = log["data"].as_str()?.trim_start_matches("0x");
     let data     = hex::decode(data_hex).ok()?;
     if data.len() < 160 { return None; }
 
-    // Slot 0: sender (last 20 bytes of slot)
     let sender = format!("0x{}", hex::encode(&data[12..32]));
-    // Slot 1: amount (u256 → take low 8 bytes as u64 for Phase 1)
+
     let amount = u64::from_be_bytes(data[56..64].try_into().ok()?);
-    // Slot 2: token address
+
     let token  = format!("0x{}", hex::encode(&data[76..96]));
-    // Slot 3: nonce (ignored — claim_hash is the replay key)
-    // Slot 4: ego_dest — UTF-8 string in first non-zero bytes
+
     let ego_dest_raw = &data[128..160];
     let ego_dest = String::from_utf8_lossy(
         ego_dest_raw.iter().take_while(|&&b| b != 0).cloned().collect::<Vec<_>>().as_slice()
@@ -238,14 +186,11 @@ fn parse_lock_log(log: &serde_json::Value, chain_id: u64) -> Option<BridgeEvent>
     })
 }
 
-// ── Submit verify_and_mint to Ego ─────────────────────────────────────────────
-
 async fn submit_verify_and_mint(
     event:  &BridgeEvent,
     client: &reqwest::Client,
 ) -> anyhow::Result<String> {
-    // Call ego-node RPC to submit a contract call transaction.
-    // The relayer's signing key should be set via RELAYER_PRIVATE_KEY env var.
+
     let relayer_key = std::env::var("RELAYER_PRIVATE_KEY")
         .unwrap_or_else(|_| "0000000000000000000000000000000000000000000000000000000000000001".into());
 
@@ -285,7 +230,6 @@ async fn submit_verify_and_mint(
     }
 }
 
-/// Derive a deterministic 20-byte hex address from a private key (placeholder).
 fn derive_address_from_key(key_hex: &str) -> String {
     use sha2::{Digest, Sha256};
     let key_bytes = hex::decode(key_hex.trim_start_matches("0x")).unwrap_or_default();
@@ -293,11 +237,9 @@ fn derive_address_from_key(key_hex: &str) -> String {
     format!("0x{}", hex::encode(&hash[12..]))
 }
 
-// ── Poll loop ─────────────────────────────────────────────────────────────────
-
 async fn poll_chain(chain: &ChainConfig, state: &RelayerState) {
     if chain.lock_contract.is_empty() {
-        return; // not configured yet
+        return;
     }
 
     let latest = match eth_block_number(&chain.rpc_url, &state.client).await {
@@ -305,7 +247,6 @@ async fn poll_chain(chain: &ChainConfig, state: &RelayerState) {
         Err(e) => { warn!("[{}] block_number failed: {e}", chain.name); return; }
     };
 
-    // Load the last scanned block from in-memory state (simplified: start fresh each run).
     let from = chain.start_block.max(latest.saturating_sub(100));
     let to   = latest.saturating_sub(CONFIRMATIONS_REQUIRED);
 
@@ -322,7 +263,7 @@ async fn poll_chain(chain: &ChainConfig, state: &RelayerState) {
 
         {
             let mut events = state.events.lock().unwrap();
-            if events.contains_key(&id) { continue; } // already queued
+            if events.contains_key(&id) { continue; }
             events.insert(id.clone(), event);
         }
 
@@ -359,8 +300,6 @@ async fn process_pending(state: &RelayerState) {
     }
 }
 
-// ── REST API ──────────────────────────────────────────────────────────────────
-
 async fn health(State(s): State<Arc<RelayerState>>) -> Json<serde_json::Value> {
     let processed = *s.processed_count.lock().unwrap();
     let pending   = s.events.lock().unwrap().values().filter(|e| e.status == "pending").count();
@@ -396,8 +335,6 @@ async fn processed_events(State(s): State<Arc<RelayerState>>) -> Json<Vec<Bridge
     Json(v)
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -418,7 +355,6 @@ async fn main() {
 
     let state = Arc::new(RelayerState::new());
 
-    // Spawn poll + process loop
     let poll_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
@@ -431,7 +367,6 @@ async fn main() {
         }
     });
 
-    // Start REST API
     let app = Router::new()
         .route("/health",    get(health))
         .route("/pending",   get(pending_events))

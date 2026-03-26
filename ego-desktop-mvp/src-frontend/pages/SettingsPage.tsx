@@ -31,7 +31,6 @@ const SettingsPage: React.FC = () => {
   const [minimizeToTray, setMinimizeToTray]   = useState(true);
   const [saved, setSaved]                     = useState(false);
 
-  // PIN state
   const [hasPin, setHasPin]                   = useState(false);
   const [showSetPin, setShowSetPin]           = useState(false);
   const [pinInput, setPinInput]               = useState('');
@@ -40,20 +39,21 @@ const SettingsPage: React.FC = () => {
   const [settingPin, setSettingPin]           = useState(false);
   const [biometricLoading, setBiometricLoading] = useState(false);
 
-  // PIN reset via email
   const [resetSent, setResetSent]             = useState(false);
   const [resetLoading, setResetLoading]       = useState(false);
   const [resetMsg, setResetMsg]               = useState('');
   const [maskedEmail, setMaskedEmail]         = useState('');
 
-  // Change email
   const [showChangeEmail, setShowChangeEmail] = useState(false);
+  const [emailStep, setEmailStep]             = useState<'send_code' | 'enter_code' | 'new_email' | 'done'>('send_code');
+  const [emailCode, setEmailCode]             = useState('');
+  const [emailVerifyToken, setEmailVerifyToken] = useState('');
   const [newEmail, setNewEmail]               = useState('');
   const [changeEmailMsg, setChangeEmailMsg]   = useState('');
+  const [sendingEmailCode, setSendingEmailCode] = useState(false);
+  const [verifyingCode, setVerifyingCode]     = useState(false);
   const [changingEmail, setChangingEmail]     = useState(false);
-  const [changeEmailSent, setChangeEmailSent] = useState(false);
 
-  // Recovery info (PIN-gated)
   const [showRecovery, setShowRecovery]       = useState(false);
   const [recoveryPin, setRecoveryPin]         = useState('');
   const [recoveryInfo, setRecoveryInfo]       = useState<RecoveryInfo | null>(null);
@@ -82,13 +82,13 @@ useEffect(() => {
       );
       if (res.data.confirmed && res.data.new_pin) {
         clearInterval(interval);
-        // Apply the new PIN directly — no need to ask again
+
         await invoke('set_security_pin', { pin: res.data.new_pin });
         setHasPin(true);
         setResetSent(false);
         setResetMsg('');
         setShowSetPin(false);
-        // Show success briefly
+
         setPinMsg('✅ PIN updated successfully from email!');
         setTimeout(() => setPinMsg(''), 3000);
       }
@@ -143,16 +143,57 @@ useEffect(() => {
     }
   }
 
+  async function handleSendEmailCode() {
+    if (!wallet?.address) return;
+    setSendingEmailCode(true); setChangeEmailMsg('');
+    try {
+      const res = await tauriFetch<{ success: boolean; message: string }>(
+        `${RELAY}/users/send-email-code`,
+        { method: 'POST', body: Body.json({ address: wallet.address }) }
+      );
+      if (res.data.success) {
+        setEmailStep('enter_code');
+      } else {
+        setChangeEmailMsg('Error: ' + res.data.message);
+      }
+    } catch {
+      setChangeEmailMsg('Network error. Please try again.');
+    } finally {
+      setSendingEmailCode(false);
+    }
+  }
+
+  async function handleVerifyEmailCode() {
+    if (!wallet?.address || !emailCode.trim()) return;
+    setVerifyingCode(true); setChangeEmailMsg('');
+    try {
+      const res = await tauriFetch<{ success: boolean; token: string; message: string }>(
+        `${RELAY}/users/verify-email-code`,
+        { method: 'POST', body: Body.json({ address: wallet.address, code: emailCode.trim() }) }
+      );
+      if (res.data.success) {
+        setEmailVerifyToken(res.data.token ?? '');
+        setEmailStep('new_email');
+      } else {
+        setChangeEmailMsg('Incorrect code. ' + (res.data.message ?? 'Try again.'));
+      }
+    } catch {
+      setChangeEmailMsg('Network error. Please try again.');
+    } finally {
+      setVerifyingCode(false);
+    }
+  }
+
   async function handleChangeEmail() {
     if (!wallet?.address || !newEmail.trim()) return;
     setChangingEmail(true); setChangeEmailMsg('');
     try {
       const res = await tauriFetch<{ success: boolean; message: string }>(
         `${RELAY}/users/change-email`,
-        { method: 'POST', body: Body.json({ address: wallet.address, new_email: newEmail.trim() }) }
+        { method: 'POST', body: Body.json({ address: wallet.address, new_email: newEmail.trim(), verify_token: emailVerifyToken }) }
       );
       if (res.data.success) {
-        setChangeEmailSent(true);
+        setEmailStep('done');
         setChangeEmailMsg(`Verification link sent to ${newEmail.trim()}. Click it to confirm the change.`);
       } else {
         setChangeEmailMsg('Error: ' + res.data.message);
@@ -178,7 +219,7 @@ useEffect(() => {
   return (
     <div className="p-6 max-w-2xl mx-auto space-y-5">
 
-      {/* General */}
+      {}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="px-5 py-4 border-b border-gray-700"><h3 className="font-semibold">General</h3></div>
         <div className="divide-y divide-gray-700/50">
@@ -198,14 +239,14 @@ useEffect(() => {
         </div>
       </div>
 
-      {/* Security & Keys */}
+      {}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="px-5 py-4 border-b border-gray-700">
           <h3 className="font-semibold">Security & Keys</h3>
           <div className="text-xs text-gray-400 mt-0.5">Quantum-safe cryptography — Dilithium-3 + Ed25519 + Kyber ML-KEM-768</div>
         </div>
 
-        {/* Wallet address + QR */}
+        {}
         <div className="px-5 py-4 border-b border-gray-700/50">
           <div className="text-xs text-gray-400 mb-2">Wallet Address</div>
           <div className="flex items-center gap-3">
@@ -220,7 +261,7 @@ useEffect(() => {
           </div>
         </div>
 
-       {/* Security PIN */}
+       {}
 <div className="px-5 py-4 border-b border-gray-700/50">
   <div className="flex items-center justify-between">
     <div>
@@ -260,7 +301,7 @@ useEffect(() => {
   {pinMsg && !showSetPin && (
     <div className="mt-2 text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{pinMsg}</div>
   )}
-  {/* Forgot PIN — only shown when PIN is set and email is linked */}
+  {}
   {hasPin && maskedEmail && (
     <div className="mt-3 pt-3 border-t border-gray-700/50">
       <div className="text-xs text-gray-500 mb-2">
@@ -268,7 +309,7 @@ useEffect(() => {
       </div>
       {resetSent ? (
         <div className="bg-green-500/10 border border-green-500/30 rounded-xl px-3 py-2.5 text-xs text-green-300">
-          ✅ Reset link sent to <strong>{maskedEmail}</strong>. 
+          ✅ Reset link sent to <strong>{maskedEmail}</strong>.
           Click it in your email — the app will automatically open the PIN setup once confirmed.
           <div className="flex items-center gap-2 mt-2 text-green-400">
             <div className="w-3 h-3 border-2 border-green-400 border-t-transparent rounded-full animate-spin" />
@@ -291,7 +332,7 @@ useEffect(() => {
   )}
 </div>
 
-        {/* Change email */}
+        {}
         <div className="px-5 py-4 border-b border-gray-700/50 flex items-center justify-between">
           <div>
             <div className="text-sm font-medium">Account Email</div>
@@ -300,14 +341,14 @@ useEffect(() => {
             </div>
           </div>
           <button
-            onClick={() => { setShowChangeEmail(true); setNewEmail(''); setChangeEmailMsg(''); setChangeEmailSent(false); }}
+            onClick={() => { setShowChangeEmail(true); setEmailStep('send_code'); setEmailCode(''); setEmailVerifyToken(''); setNewEmail(''); setChangeEmailMsg(''); }}
             className="text-xs bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 px-3 py-1.5 rounded-lg transition"
           >
             Change Email
           </button>
         </div>
 
-        {/* View recovery keys */}
+        {}
         <div className="px-5 py-4 flex items-center justify-between">
           <div>
             <div className="text-sm font-medium">Recovery Phrase & Seed</div>
@@ -322,13 +363,13 @@ useEffect(() => {
         </div>
       </div>
 
-      {/* About */}
+      {}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 p-5">
         <h3 className="font-semibold mb-4">About</h3>
         <div className="space-y-2 text-sm">
           {[
-            { label: 'Version', val: 'Testnet v0.1.0' },
-            { label: 'Network', val: 'Ego Testnet' },
+            { label: 'Version', val: 'v0.1.0' },
+            { label: 'Network', val: 'Ego Network' },
             { label: 'Node ID', val: wallet?.address ? wallet.address.slice(0, 26) + '…' : '—' },
             { label: 'Crypto',  val: 'Dilithium-3 + Ed25519 + Kyber + AES-256-GCM' },
           ].map(row => (
@@ -346,6 +387,15 @@ useEffect(() => {
               www.egoblockchain.com ↗
             </button>
           </div>
+          <div className="flex justify-between pt-1 border-t border-gray-700/50">
+            <span className="text-gray-400">Discord</span>
+            <button
+              onClick={() => openUrl('https://discord.gg/D2bEHUYz').catch(() => {})}
+              className="text-indigo-400 hover:text-indigo-300 text-xs transition"
+            >
+              Join our community ↗
+            </button>
+          </div>
         </div>
       </div>
 
@@ -356,7 +406,7 @@ useEffect(() => {
         {saved ? '✓ Saved' : 'Save Settings'}
       </button>
 
-{/* ── Change PIN Modal ─────────────────────────────────────────── */}
+{}
 {showSetPin && (
   <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
     <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-sm border border-gray-700 shadow-2xl">
@@ -365,7 +415,7 @@ useEffect(() => {
         <button onClick={() => { setShowSetPin(false); setResetSent(false); setResetMsg(''); }} className="text-gray-400 hover:text-white text-xl">✕</button>
       </div>
 
-      {/* If PIN already set — require email verification first */}
+      {}
       {hasPin ? (
         <div className="space-y-4">
           <div className="flex items-start gap-2 bg-blue-500/10 border border-blue-500/30 rounded-xl px-3 py-3">
@@ -406,7 +456,7 @@ useEffect(() => {
           )}
         </div>
       ) : (
-        /* No PIN yet — allow setting directly */
+
         <div className="space-y-4">
           <div className="flex items-start gap-2 bg-yellow-500/10 border border-yellow-500/30 rounded-xl px-3 py-2.5">
             <span className="text-yellow-400 shrink-0">🔒</span>
@@ -447,8 +497,6 @@ useEffect(() => {
     </div>
   </div>
 )}
-
-
 
       {/* ── View Recovery Info Modal ───────────────────────────────────────── */}
       {showRecovery && (
@@ -544,42 +592,113 @@ useEffect(() => {
               <h3 className="text-lg font-bold">Change Email Address</h3>
               <button onClick={() => setShowChangeEmail(false)} className="text-gray-400 hover:text-white text-xl">✕</button>
             </div>
-            {changeEmailSent ? (
+
+            {/* Step indicator */}
+            <div className="flex items-center gap-2 mb-5">
+              {(['send_code', 'enter_code', 'new_email'] as const).map((s, i) => (
+                <React.Fragment key={s}>
+                  <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${
+                    emailStep === 'done' || ['send_code','enter_code','new_email'].indexOf(emailStep) > i
+                      ? 'bg-blue-600 text-white'
+                      : emailStep === s
+                      ? 'bg-blue-600 text-white ring-2 ring-blue-400/40'
+                      : 'bg-gray-700 text-gray-500'
+                  }`}>{i + 1}</div>
+                  {i < 2 && <div className={`flex-1 h-px ${['send_code','enter_code','new_email'].indexOf(emailStep) > i || emailStep === 'done' ? 'bg-blue-600' : 'bg-gray-700'}`} />}
+                </React.Fragment>
+              ))}
+            </div>
+
+            {/* Step 1 — send code to current email */}
+            {emailStep === 'send_code' && (
               <div className="space-y-4">
-                <div className="bg-green-500/10 border border-green-500/30 rounded-xl p-4 text-sm text-green-300">
-                  ✅ {changeEmailMsg}
+                <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl px-4 py-3 text-sm text-blue-200">
+                  To protect your account, we'll send a 6-digit verification code to your current email:
+                  <div className="font-semibold text-white mt-1">{maskedEmail || '(no email on file)'}</div>
                 </div>
-                <p className="text-xs text-gray-400">Once you click the link in the email, your address will be updated automatically.</p>
+                {changeEmailMsg && <div className="text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{changeEmailMsg}</div>}
                 <button
-                  onClick={() => setShowChangeEmail(false)}
-                  className="w-full bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition"
+                  onClick={handleSendEmailCode}
+                  disabled={sendingEmailCode || !maskedEmail}
+                  className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
                 >
-                  Close
+                  {sendingEmailCode ? '📧 Sending…' : '📧 Send Verification Code'}
                 </button>
               </div>
-            ) : (
+            )}
+
+            {/* Step 2 — enter the code */}
+            {emailStep === 'enter_code' && (
               <div className="space-y-4">
-                <p className="text-sm text-gray-400">Enter your new email. A verification link will be sent to it — your address only changes after you click the link.</p>
-                {maskedEmail && (
-                  <div className="text-xs text-gray-500">Current: <span className="text-gray-400">{maskedEmail}</span></div>
-                )}
+                <div className="bg-green-500/10 border border-green-500/30 rounded-xl px-4 py-3 text-sm text-green-300">
+                  Code sent to <strong>{maskedEmail}</strong>. Check your inbox and enter the 6-digit code below.
+                </div>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={6}
+                  value={emailCode}
+                  onChange={e => setEmailCode(e.target.value.replace(/\D/g, ''))}
+                  onKeyDown={e => e.key === 'Enter' && handleVerifyEmailCode()}
+                  placeholder="6-digit code"
+                  className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition tracking-[0.3em] text-center font-mono text-lg"
+                  autoFocus
+                />
+                {changeEmailMsg && <div className="text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{changeEmailMsg}</div>}
+                <button
+                  onClick={handleVerifyEmailCode}
+                  disabled={verifyingCode || emailCode.length < 6}
+                  className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
+                >
+                  {verifyingCode ? 'Verifying…' : 'Verify Code'}
+                </button>
+                <button
+                  onClick={() => { setEmailStep('send_code'); setEmailCode(''); setChangeEmailMsg(''); }}
+                  className="w-full text-xs text-gray-400 hover:text-gray-200 transition"
+                >
+                  Didn't receive it? Send again
+                </button>
+              </div>
+            )}
+
+            {/* Step 3 — enter new email */}
+            {emailStep === 'new_email' && (
+              <div className="space-y-4">
+                <div className="bg-green-500/10 border border-green-500/30 rounded-xl px-4 py-3 text-sm text-green-300">
+                  ✅ Current email verified. Enter your new email address below.
+                </div>
                 <input
                   type="email"
                   value={newEmail}
                   onChange={e => setNewEmail(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && handleChangeEmail()}
                   placeholder="New email address"
                   className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition"
-                  onKeyDown={e => e.key === 'Enter' && handleChangeEmail()}
+                  autoFocus
                 />
-                {changeEmailMsg && (
-                  <div className="text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{changeEmailMsg}</div>
-                )}
+                {changeEmailMsg && <div className="text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{changeEmailMsg}</div>}
                 <button
                   onClick={handleChangeEmail}
                   disabled={changingEmail || !newEmail.trim()}
                   className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
                 >
-                  {changingEmail ? 'Sending…' : 'Send Verification Email'}
+                  {changingEmail ? 'Sending…' : 'Update Email'}
+                </button>
+              </div>
+            )}
+
+            {/* Done */}
+            {emailStep === 'done' && (
+              <div className="space-y-4">
+                <div className="bg-green-500/10 border border-green-500/30 rounded-xl p-4 text-sm text-green-300">
+                  ✅ {changeEmailMsg}
+                </div>
+                <p className="text-xs text-gray-400">Once you click the link in the new email, your address will be updated automatically.</p>
+                <button
+                  onClick={() => setShowChangeEmail(false)}
+                  className="w-full bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition"
+                >
+                  Close
                 </button>
               </div>
             )}

@@ -1,17 +1,3 @@
-/**
- * Ego Mobile Wallet — Root Navigator
- *
- * Stack structure:
- *   WelcomeScreen  (no wallet found)
- *     └─> CreateWalletScreen / ImportWalletScreen
- *   MainTabs  (wallet loaded)
- *     ├── HomeScreen
- *     ├── HistoryScreen
- *     └── SettingsScreen
- *   Modal screens pushed from MainTabs:
- *     SendScreen, ReceiveScreen
- */
-
 import React, { useEffect, useState } from 'react';
 import { NavigationContainer, DefaultTheme } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
@@ -29,8 +15,6 @@ import { HistoryScreen }  from './src/screens/HistoryScreen';
 import { SettingsScreen } from './src/screens/SettingsScreen';
 import { loadWallet }     from './src/lib/storage';
 
-// ── Types ──────────────────────────────────────────────────────────────────
-
 export type RootStackParamList = {
   Welcome:  undefined;
   MainTabs: undefined;
@@ -44,8 +28,6 @@ export type TabParamList = {
   Settings: undefined;
 };
 
-// ── Theme ──────────────────────────────────────────────────────────────────
-
 const EgoDarkTheme = {
   ...DefaultTheme,
   colors: {
@@ -58,8 +40,6 @@ const EgoDarkTheme = {
     primary:      '#3b82f6',
   },
 };
-
-// ── Navigators ─────────────────────────────────────────────────────────────
 
 const Stack = createStackNavigator<RootStackParamList>();
 const Tab   = createBottomTabNavigator<TabParamList>();
@@ -97,8 +77,6 @@ function MainTabs() {
     </Tab.Navigator>
   );
 }
-
-// ── Root ───────────────────────────────────────────────────────────────────
 
 export default function App() {
   const [loading, setLoading]       = useState(true);

@@ -41,7 +41,7 @@ pub mod h3 {
             8..=9 => 5,
             10..=11 => 6,
             12..=13 => 7,
-            14..=15 => 8,   
+            14..=15 => 8,
             16..=18 => 9,
             _ => 0,
         }
@@ -446,7 +446,7 @@ mod tests {
 
     #[test]
     fn test_h3_validation() {
-        assert!(h3::validate_h3_index("872834720ffffff", Some(8)).is_ok());  
+        assert!(h3::validate_h3_index("872834720ffffff", Some(8)).is_ok());
         assert!(h3::validate_h3_index("", None).is_err());
         assert!(h3::validate_h3_index("invalid", None).is_err());
     }
@@ -476,19 +476,16 @@ mod tests {
 
     #[test]
     fn test_path_loss_38901() {
-        // Test Urban Macro at different distances
+
         let path_loss_100m = rf::calculate_path_loss_38901(0.1, 3.5, rf::Environment::UrbanMacro);
         let path_loss_1km = rf::calculate_path_loss_38901(1.0, 3.5, rf::Environment::UrbanMacro);
-        
+
         println!("Path loss at 100m: {:.2} dB", path_loss_100m);
         println!("Path loss at 1km: {:.2} dB", path_loss_1km);
-        
-        // 3GPP 38.901 Urban Macro gives high path loss values
-        // At 100m: ~160 dB, At 1km: ~200 dB
+
         assert!(path_loss_100m > 140.0 && path_loss_100m < 180.0);
         assert!(path_loss_1km > 180.0 && path_loss_1km < 230.0);
-        
-        // Verify path loss increases with distance
+
         assert!(path_loss_1km > path_loss_100m);
     }
 
@@ -508,20 +505,20 @@ mod tests {
 
     #[test]
     fn test_compression() {
-        // Create test data with some pattern
+
         let data: Vec<u8> = (0..200).map(|i| (i % 10) as u8).collect();
-        
+
         match compression::compress_lz4(&data) {
             Ok(compressed) => {
                 println!("Original: {} bytes, Compressed: {} bytes", data.len(), compressed.len());
-                
+
                 match compression::decompress_lz4(&compressed, data.len()) {
                     Ok(decompressed) => {
                         assert_eq!(data.len(), decompressed.len());
                         assert_eq!(data, decompressed);
                     }
                     Err(e) => {
-                        // If decompression fails, at least verify compression worked
+
                         println!("Decompression failed (may be LZ4 version issue): {}", e);
                         assert!(compressed.len() > 0);
                     }

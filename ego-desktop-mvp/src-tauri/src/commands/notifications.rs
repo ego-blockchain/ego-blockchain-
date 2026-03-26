@@ -1,11 +1,35 @@
 use crate::error::EgoDesktopError;
-use crate::ledger::{Ledger, StoredFile};
+use crate::ledger::{Ledger, LedgerTx, StoredFile};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
-/// A bundle produced by "Share File" that can be sent to another user.
+pub fn notify(app: &AppHandle, title: &str, body: &str) {
+    let mut n = tauri::api::notification::Notification::new(&app.config().tauri.bundle.identifier)
+        .title(title)
+        .body(body);
+    // On non-Windows we can set an icon path; on Windows the icon comes from the
+    // AUMID registry entry set at startup — setting it here causes silent failures.
+    #[cfg(not(target_os = "windows"))]
+    if let Some(p) = app
+        .path_resolver()
+        .resource_dir()
+        .map(|d| d.join("icons").join("icon.png"))
+        .filter(|p| p.exists())
+    {
+        n = n.icon(&p.to_string_lossy());
+    }
+    if let Err(e) = n.show() {
+        eprintln!("[notify] {e}");
+    }
+}
+
+// Removed PowerShell balloon-tip fallback — it doesn't work on Windows 10/11
+// (ShowBalloonTip is deprecated and silently ignored).
+// Tauri's WinRT notification + AUMID registry registration (main.rs) is the correct path.
+
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ShareBundle {
     pub cid: String,
@@ -14,8 +38,6 @@ pub struct ShareBundle {
     pub from_address: String,
 }
 
-/// Import a file shared by another user.
-/// Creates a ledger entry (status "Received") and triggers a desktop notification.
 #[tauri::command]
 pub async fn import_shared_file(
     app: AppHandle,
@@ -28,18 +50,18 @@ pub async fn import_shared_file(
     let stored = StoredFile {
         cid:             bundle.cid.clone(),
         name:            bundle.display_name.clone(),
-        original_size:   0,   // unknown until fetched from network
+        original_size:   0,
         encrypted_size:  0,
         duration_months: 1,
         stored_at:       now,
         expiry:          now + 30 * 86_400,
         status:          "Received".into(),
         key_nonce_hex:   bundle.key_nonce_hex.clone(),
-        local_path:      String::new(), // no local .enc yet
+        local_path:      String::new(),
         owner:           ledger.address.clone(),
         ..Default::default()
     };
-    // Avoid duplicates
+
     if !ledger.stored_files.iter().any(|f| f.cid == bundle.cid) {
         ledger.stored_files.insert(0, stored.clone());
         ledger
@@ -47,92 +69,115 @@ pub async fn import_shared_file(
             .map_err(|e| EgoDesktopError::WalletError(format!("Save: {e}")))?;
     }
 
-    // Trigger local desktop notification
+    // Record a retrieve_file tx on-chain so the import is verifiable.
+    {
+        let now = chrono::Utc::now().timestamp();
+        let cid = bundle.cid.clone();
+        let recipient_addr = ledger.address.clone();
+        let sender_addr = if bundle.from_address.is_empty() {
+            "unknown".to_string()
+        } else {
+            bundle.from_address.clone()
+        };
+        let nonce = ledger.nonce + 1;
+        let sign_input = format!("retrieve_file:{}:{}:{}", recipient_addr, cid, nonce);
+        let signature_hex = crate::ledger::load_seed()
+            .and_then(|s| {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&s[..32]);
+                ego_core::KeyPair::from_bytes(&arr).ok()
+            })
+            .map(|kp| hex::encode(kp.sign_ed25519(sign_input.as_bytes()).as_bytes()))
+            .unwrap_or_default();
+        let tx_hash = format!("0x{}", ego_core::hash_data(sign_input.as_bytes()).to_hex());
+
+        crate::mempool::get_mempool().push(LedgerTx {
+            hash:            tx_hash.clone(),
+            from:            recipient_addr.clone(),
+            to:              sender_addr.clone(),
+            amount:          0,
+            memo:            Some(format!("retrieve_file: {}", bundle.display_name)),
+            timestamp:       now,
+            signature:       signature_hex,
+            status:          "Pending".into(),
+            block_height:    None,
+            nonce,
+            tx_type:         "retrieve_file".into(),
+            cid:             cid.clone(),
+            commitment_hash: String::new(),
+            ..LedgerTx::default()
+        });
+        ledger.nonce = nonce;
+
+        eprintln!("[Storage] retrieve_file tx {} | cid={} | from={}",
+            &tx_hash[..18], &cid[..cid.len().min(16)], &sender_addr[..sender_addr.len().min(16)]);
+
+        // Persist the incremented nonce.
+        let _ = ledger.save();
+    }
+
     let from_short = if bundle.from_address.len() > 12 {
         format!("{}…", &bundle.from_address[..12])
     } else {
         bundle.from_address.clone()
     };
-    let _ = tauri::api::notification::Notification::new(
-        &app.config().tauri.bundle.identifier,
-    )
-    .title("File Received!")
-    .body(&format!(
-        "\"{}\" shared by {}",
-        bundle.display_name, from_short
-    ))
-    .show();
+    notify(&app, "File Received!", &format!("\"{}\" shared by {}", bundle.display_name, from_short));
 
     Ok(stored)
 }
 
-/// Called from p2p::handle_incoming when a ChatMessage with message_type
-/// "file_bundle" arrives. Parses the egoshare1: bundle and auto-imports it
-/// into the ledger so it appears in EgoSafe without manual paste.
 pub async fn try_auto_import(app: &AppHandle, content: &str, from_addr: &str) {
-    if !content.starts_with("egoshare1:") { return; }
-    let parts: Vec<&str> = content.splitn(5, ':').collect();
-    if parts.len() < 5 { return; }
-    let cid           = parts[1];
-    let key_nonce_hex = parts[2];
-    let name_b64      = parts[3];
-    let display_name  = STANDARD.decode(name_b64).ok()
+    // egoshare1:{cid}:{key_nonce_hex}:{name_b64}:{from}  — 5 parts
+    // egoshare2:{cid}:{kem_ct}:{enc_key}:{name_b64}:{from}  — 6 parts
+    let (prefix, cid, key_nonce_hex, name_field) = if content.starts_with("egoshare1:") {
+        let parts: Vec<&str> = content.splitn(5, ':').collect();
+        if parts.len() < 5 { return; }
+        ("egoshare1", parts[1], parts[2].to_string(), parts[3])
+    } else if content.starts_with("egoshare2:") {
+        let parts: Vec<&str> = content.splitn(6, ':').collect();
+        if parts.len() < 6 { return; }
+        // key is KEM-encrypted; store empty for now — EgoSafe page decrypts on demand
+        ("egoshare2", parts[1], String::new(), parts[4])
+    } else {
+        return;
+    };
+
+    let display_name = STANDARD.decode(name_field).ok()
         .and_then(|b| String::from_utf8(b).ok())
         .unwrap_or_else(|| cid[..cid.len().min(12)].to_string());
 
-    let now = chrono::Utc::now().timestamp();
-    let mut ledger = Ledger::load();
-
-    if ledger.stored_files.iter().any(|f| f.cid == cid) {
-        return; // already imported — skip
+    // ── Save to stored_files so the file appears in the Storage tab immediately ──
+    {
+        let now = chrono::Utc::now().timestamp();
+        let mut ledger = Ledger::load();
+        if !ledger.stored_files.iter().any(|f| f.cid == cid) {
+            let stored = StoredFile {
+                cid:             cid.to_string(),
+                name:            display_name.clone(),
+                original_size:   0,
+                encrypted_size:  0,
+                duration_months: 0,
+                stored_at:       now,
+                expiry:          0,
+                status:          "Received".into(),
+                // key_nonce_hex is raw hex from sender; unprotect_key_bytes handles legacy hex
+                key_nonce_hex,
+                local_path:      format!("sender:{}", from_addr),
+                owner:           ledger.address.clone(),
+                ..Default::default()
+            };
+            ledger.stored_files.insert(0, stored);
+            let _ = ledger.save();
+        }
+        let _ = app.emit_all("ego://file-received", serde_json::json!({ "cid": cid }));
     }
 
-    // For block-based files (egomfd1), we don't know block count until manifest arrives.
-    // blocks_total=0 signals "manifest not yet received"; will be updated by ManifestData handler.
-    let is_block_based = cid.starts_with("egomfd1");
-    let stored = StoredFile {
-        cid:             cid.to_string(),
-        manifest_cid:    if is_block_based { cid.to_string() } else { String::new() },
-        name:            display_name.clone(),
-        original_size:   0,
-        encrypted_size:  0,
-        duration_months: 1,
-        stored_at:       now,
-        expiry:          now + 30 * 86_400,
-        status:          "Received".into(),
-        key_nonce_hex:   key_nonce_hex.to_string(),
-        local_path:      format!("sender:{}", from_addr),
-        owner:           ledger.address.clone(),
-        blocks_total:    0,   // unknown until manifest arrives
-        blocks_received: 0,
-        ..Default::default()
+    let from_short = if from_addr.len() > 12 {
+        format!("{}…", &from_addr[..12])
+    } else {
+        from_addr.to_string()
     };
 
-    // For block-based files, kick off a DHT manifest fetch immediately
-    if is_block_based {
-        let cid_str = cid.to_string();
-        tokio::spawn(async move {
-            if let Some(tx) = crate::p2p::DHT_CMD_TX.get() {
-                let _ = tx.send(crate::p2p::DhtCommand::GetPeers {
-                    key: format!("ego-manifest:{}", cid_str),
-                });
-                eprintln!("[EgoSafe] Kicked off DHT manifest fetch for {}", &cid_str[..16.min(cid_str.len())]);
-            }
-        });
-    }
-    ledger.stored_files.insert(0, stored);
-    if let Ok(()) = ledger.save() {
-        let from_short = if from_addr.len() > 12 {
-            format!("{}…", &from_addr[..12])
-        } else {
-            from_addr.to_string()
-        };
-        let _ = tauri::api::notification::Notification::new(
-            &app.config().tauri.bundle.identifier,
-        )
-        .title("File Received!")
-        .body(&format!("\"{}\" shared by {}", display_name, from_short))
-        .show();
-        eprintln!("[EgoSafe] Auto-imported: {} from {}", display_name, from_addr);
-    }
+    let security = if prefix == "egoshare2" { " (encrypted for you)" } else { "" };
+    notify(app, "File Received!", &format!("\"{}\" from {}{}", display_name, from_short, security));
 }

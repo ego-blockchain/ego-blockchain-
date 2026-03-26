@@ -4,8 +4,6 @@ use crate::host::{HostCtx, ru_cost};
 use crate::state::{ContractState, StateStore};
 use crate::types::*;
 
-/// The VM executor. One instance per relay/node process.
-/// Holds the Wasmtime Engine (compilation cache shared across calls).
 pub struct Executor {
     engine: Engine,
     pub store: StateStore,
@@ -15,7 +13,7 @@ impl Executor {
     pub fn new(data_dir: std::path::PathBuf) -> Result<Self, VmError> {
         let mut config = Config::new();
         config.consume_fuel(true);
-        config.max_wasm_stack(512 * 1024); // 512 KB stack
+        config.max_wasm_stack(512 * 1024);
         let engine = Engine::new(&config)
             .map_err(|e| VmError::CompileError(e.to_string()))?;
         Ok(Self {
@@ -24,35 +22,29 @@ impl Executor {
         })
     }
 
-    /// Deploy a new contract.
-    /// 1. Validate WASM size
-    /// 2. Compile module (checks WASM validity)
-    /// 3. Run init() entrypoint with args
-    /// 4. Store code + initial state
     pub fn deploy(
         &self,
         wasm_bytes:    &[u8],
         deployer_addr: &str,
-        init_args:     &[u8],    // raw bytes passed to init()
+        init_args:     &[u8],
         block_height:  u64,
         timestamp:     i64,
         fuel:          u64,
     ) -> Result<DeployResult, VmError> {
-        // Size check
+
         if wasm_bytes.len() > MAX_CODE_SIZE {
             return Err(VmError::InvalidAbi(format!(
                 "Code too large: {} bytes (max {})", wasm_bytes.len(), MAX_CODE_SIZE
             )));
         }
 
-        // Derive contract address: blake3(deployer_addr + code)[0..20]
         let hash_input = format!("{}{}", deployer_addr, hex::encode(wasm_bytes));
         let code_hash_bytes = blake3::hash(hash_input.as_bytes());
         let code_hash = hex::encode(code_hash_bytes.as_bytes());
         let contract_addr = hex::encode(&code_hash_bytes.as_bytes()[..20]);
 
         if self.store.contract_exists(&contract_addr) {
-            // Identical code already deployed — return existing address
+
             return Ok(DeployResult {
                 contract_address: contract_addr,
                 code_hash,
@@ -61,11 +53,9 @@ impl Executor {
             });
         }
 
-        // Compile WASM
         let module = Module::new(&self.engine, wasm_bytes)
             .map_err(|e| VmError::CompileError(e.to_string()))?;
 
-        // Run init()
         let ctx = HostCtx::new(
             contract_addr.clone(),
             deployer_addr.to_string(),
@@ -78,7 +68,6 @@ impl Executor {
             &module, ctx, "init", init_args, fuel
         )?;
 
-        // Persist code + state + manifest
         self.store.store_code(&contract_addr, wasm_bytes)?;
         self.store.save_state(&contract_addr, &ctx_out.state)?;
         self.store.store_manifest(&contract_addr, &ContractManifest {
@@ -98,7 +87,6 @@ impl Executor {
         })
     }
 
-    /// Call an entrypoint on an already-deployed contract.
     pub fn call(
         &self,
         contract_addr: &str,
@@ -109,12 +97,11 @@ impl Executor {
         timestamp:     i64,
         fuel:          u64,
     ) -> Result<CallResult, VmError> {
-        // Load code
+
         let wasm_bytes = self.store.load_code(contract_addr)?;
         let module = Module::new(&self.engine, &wasm_bytes)
             .map_err(|e| VmError::CompileError(e.to_string()))?;
 
-        // Load state
         let state = self.store.load_state(contract_addr);
         let ctx = HostCtx::new(
             contract_addr.to_string(),
@@ -126,10 +113,9 @@ impl Executor {
 
         match self.run_entrypoint(&module, ctx, entrypoint, args, fuel) {
             Ok((ctx_out, ru_used)) => {
-                // Persist updated state for the top-level contract
+
                 self.store.save_state(contract_addr, &ctx_out.state)?;
 
-                // Dispatch pending cross-contract calls (breadth-first, depth-limited to 8)
                 let mut all_events = ctx_out.events.clone();
                 let mut all_ru = ru_used;
                 let mut pending = ctx_out.pending_cross_calls.clone();
@@ -148,7 +134,7 @@ impl Executor {
                             let cross_state = self.store.load_state(&cross_req.contract_addr);
                             let mut cross_ctx = HostCtx::new(
                                 cross_req.contract_addr.clone(),
-                                contract_addr.to_string(), // caller = original contract
+                                contract_addr.to_string(),
                                 block_height,
                                 timestamp,
                                 cross_state,
@@ -197,7 +183,6 @@ impl Executor {
         }
     }
 
-    /// Internal: instantiate module, wire host functions, run one entrypoint.
     fn run_entrypoint(
         &self,
         module:     &Module,
@@ -210,16 +195,13 @@ impl Executor {
         store.set_fuel(fuel)
             .map_err(|e| VmError::ExecutionError(e.to_string()))?;
 
-        // Wire memory limiter — HostCtx holds a StoreLimits field
         store.limiter(|ctx| &mut ctx.limiter);
 
-        // Build linker with host functions
         let linker = build_linker(&self.engine)?;
 
         let instance = linker.instantiate(&mut store, module)
             .map_err(|e| VmError::InstantiationError(e.to_string()))?;
 
-        // Write args into contract memory via __set_args if it exists
         if let Ok(set_args) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "__set_args") {
             let mem = instance.get_memory(&mut store, "memory")
                 .ok_or_else(|| VmError::ExecutionError("No memory export".into()))?;
@@ -231,13 +213,9 @@ impl Executor {
                 .map_err(|e| VmError::ExecutionError(e.to_string()))?;
         }
 
-        // Call the entrypoint
         let func = instance.get_func(&mut store, entrypoint)
             .ok_or_else(|| VmError::InvalidAbi(format!("Entrypoint '{}' not found", entrypoint)))?;
 
-        // Decode init_args bytes into typed WASM values based on the function's
-        // parameter types. This fixes the arity-mismatch when init() takes
-        // explicit params (e.g. `init(max_supply: u64)` → WASM `(param i64)`).
         let param_types: Vec<wasmtime::ValType> = func.ty(&store).params().collect();
         let wasm_args: Vec<wasmtime::Val> = if param_types.is_empty() {
             vec![]
@@ -266,17 +244,16 @@ impl Executor {
                     decoded.push(wasmtime::Val::F64(bits));
                     off += 8;
                 } else {
-                    decoded.push(wasmtime::Val::I32(0)); // unsupported type: pass zero
+                    decoded.push(wasmtime::Val::I32(0));
                 }
             }
-            // Pad any unmatched params with zeros (args too short)
+
             while decoded.len() < param_types.len() {
                 decoded.push(wasmtime::Val::I32(0));
             }
             decoded
         };
 
-        // Allocate result slots matching the function's return arity
         let result_count = func.ty(&store).results().count();
         let mut results = vec![wasmtime::Val::I32(0); result_count];
 
@@ -291,7 +268,7 @@ impl Executor {
                 Ok((ctx_out, ru_used))
             }
             Err(ref e) => {
-                // Detect OutOfFuel trap via downcast_ref on the anyhow::Error
+
                 if e.downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
                     return Err(VmError::FuelExhausted);
                 }
@@ -301,11 +278,9 @@ impl Executor {
     }
 }
 
-/// Build a Wasmtime Linker with all Urego host functions.
 fn build_linker(engine: &Engine) -> Result<Linker<HostCtx>, VmError> {
     let mut linker = Linker::<HostCtx>::new(engine);
 
-    // ── storage.get(prefix_ptr, prefix_len, key_ptr, key_len, out_ptr) → i32 (value_len) ──
     linker.func_wrap("env", "storage_get", |mut caller: Caller<'_, HostCtx>,
         prefix_ptr: i32, prefix_len: i32,
         key_ptr: i32, key_len: i32,
@@ -350,7 +325,6 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostCtx>, VmError> {
         caller.data_mut().state.set(&prefix, &key, val);
     }).map_err(|e| VmError::ExecutionError(e.to_string()))?;
 
-    // ── storage.del(prefix_ptr, prefix_len, key_ptr, key_len) ──
     linker.func_wrap("env", "storage_del", |mut caller: Caller<'_, HostCtx>,
         prefix_ptr: i32, prefix_len: i32,
         key_ptr: i32, key_len: i32|
@@ -387,7 +361,6 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostCtx>, VmError> {
         });
     }).map_err(|e| VmError::ExecutionError(e.to_string()))?;
 
-    // ── blake3(data_ptr, data_len, out_ptr) — writes 32 bytes ──
     linker.func_wrap("env", "blake3_hash", |mut caller: Caller<'_, HostCtx>,
         data_ptr: i32, data_len: i32, out_ptr: i32|
     {
@@ -413,7 +386,6 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostCtx>, VmError> {
         len
     }).map_err(|e| VmError::ExecutionError(e.to_string()))?;
 
-    // ── sys.block_height() → i64 ──
     linker.func_wrap("env", "sys_block_height", |caller: Caller<'_, HostCtx>| -> i64 {
         caller.data().block_height as i64
     }).map_err(|e| VmError::ExecutionError(e.to_string()))?;
@@ -423,7 +395,6 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostCtx>, VmError> {
         caller.data().timestamp
     }).map_err(|e| VmError::ExecutionError(e.to_string()))?;
 
-    // ── sys.contract_addr(out_ptr) → i32 (len) ──
     linker.func_wrap("env", "sys_contract_addr", |mut caller: Caller<'_, HostCtx>, out_ptr: i32| -> i32 {
         caller.data_mut().host_ru += ru_cost::SYSVAR;
         let addr = caller.data().contract_addr.clone();
@@ -449,7 +420,6 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostCtx>, VmError> {
         }
     }).map_err(|e| VmError::ExecutionError(e.to_string()))?;
 
-    // ── assert(cond) — traps if cond == 0 ──
     linker.func_wrap("env", "urego_assert", |_caller: Caller<'_, HostCtx>, cond: i32| {
         if cond == 0 {
             panic!("assertion failed");
@@ -490,8 +460,6 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostCtx>, VmError> {
         });
     }).map_err(|e| VmError::ExecutionError(e.to_string()))?;
 
-    // ── ego20.emit_approval(owner_ptr, owner_len, spender_ptr, spender_len, amount_lo, amount_hi) ──
-    // Emits topic "EGO20:Approval" with payload "<owner>:<spender>:<amount_u128>"
     linker.func_wrap("env", "ego20_emit_approval", |mut caller: Caller<'_, HostCtx>,
         owner_ptr:   i32, owner_len:   i32,
         spender_ptr: i32, spender_len: i32,
@@ -538,7 +506,6 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostCtx>, VmError> {
         }
     }).map_err(|e| VmError::ExecutionError(e.to_string()))?;
 
-    // ── ego20.balance_get_hi(addr_ptr, addr_len) → i64 (high 64 bits of u128) ──
     linker.func_wrap("env", "ego20_balance_get_hi", |mut caller: Caller<'_, HostCtx>,
         addr_ptr: i32, addr_len: i32|
     -> i64 {
@@ -577,7 +544,6 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostCtx>, VmError> {
         caller.data_mut().state.set("ego20:bal", &addr, bytes.to_vec());
     }).map_err(|e| VmError::ExecutionError(e.to_string()))?;
 
-    // ── ego20.allowance_get(owner_ptr, owner_len, spender_ptr, spender_len) → i64 (lo) ──
     linker.func_wrap("env", "ego20_allowance_get", |mut caller: Caller<'_, HostCtx>,
         owner_ptr: i32, owner_len: i32,
         spender_ptr: i32, spender_len: i32|
@@ -621,11 +587,6 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostCtx>, VmError> {
         caller.data_mut().state.set("ego20:alw", &key, bytes.to_vec());
     }).map_err(|e| VmError::ExecutionError(e.to_string()))?;
 
-    // ── ego_cross_call(contract_ptr, contract_len, fn_ptr, fn_len, args_ptr, args_len, fuel) → i32 ──
-    // Queues a cross-contract call. Returns 1 if queued, 0 if depth limit exceeded or invalid args.
-    // The actual execution happens after the current WASM frame returns (post-execution dispatch).
-    // Note: ego_cross_call_sync (inline return value) is not supported by wasmtime's re-entrancy
-    // model; all cross-contract calls are deferred and executed breadth-first after the caller frame.
     linker.func_wrap("env", "ego_cross_call", |mut caller: Caller<'_, HostCtx>,
         contract_ptr: i32, contract_len: i32,
         fn_ptr: i32, fn_len: i32,

@@ -1,24 +1,5 @@
-//! Ego-VM ABI — compact little-endian encoder/decoder for contract call arguments.
-//!
-//! # Encoding rules (Ego ABI — NOT Ethereum ABI)
-//! - All integers are little-endian, exact byte width.
-//! - `Bool`        → 1 byte (0x00 = false, 0x01 = true).
-//! - `Address`     → 20 bytes, verbatim.
-//! - `FixedBytes`  → exactly N bytes (1–32), verbatim.
-//! - `Bytes`       → 4-byte LE length prefix followed by raw bytes.
-//! - `String`      → 4-byte LE length prefix followed by UTF-8 bytes.
-//! - Multiple values are concatenated with no alignment padding.
-//!
-//! # Function selector
-//! ```text
-//! selector = blake2s("fn_name(type1,type2,...)")[0..4]
-//! call_data = selector(4 bytes) || AbiEncoder::encode(args)
-//! ```
-
 use blake2::{Blake2s256, Digest};
 use thiserror::Error;
-
-// ─── Error ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AbiError {
@@ -47,9 +28,6 @@ pub enum AbiError {
     TrailingBytes { trailing: usize },
 }
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-/// Canonical Ego-ABI types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AbiType {
     Uint8,
@@ -62,18 +40,18 @@ pub enum AbiType {
     Int32,
     Int64,
     Bool,
-    /// 20-byte account address.
+
     Address,
-    /// Variable-length byte array (4-byte LE length prefix).
+
     Bytes,
-    /// UTF-8 string (4-byte LE length prefix).
+
     String,
-    /// Fixed-width byte array: 1–32 bytes.
+
     FixedBytes(u8),
 }
 
 impl AbiType {
-    /// Canonical string representation used in selector computation.
+
     pub fn canonical(&self) -> std::string::String {
         match self {
             AbiType::Uint8    => "uint8".into(),
@@ -93,7 +71,6 @@ impl AbiType {
         }
     }
 
-    /// Fixed encoded size in bytes, or `None` for dynamically-sized types.
     pub fn fixed_size(&self) -> Option<usize> {
         match self {
             AbiType::Uint8    => Some(1),
@@ -324,27 +301,21 @@ impl AbiDecoder {
     }
 }
 
-// ─── Function Selector ────────────────────────────────────────────────────────
-
 pub struct FunctionSelector;
 
 impl FunctionSelector {
-    /// Build the canonical signature string: `"fn_name(type1,type2,...)"`.
+
     pub fn signature(fn_name: &str, param_types: &[AbiType]) -> std::string::String {
         let params: Vec<_> = param_types.iter().map(|t| t.canonical()).collect();
         format!("{}({})", fn_name, params.join(","))
     }
 
-    /// First 4 bytes of `blake2s(signature)`.
     pub fn compute(fn_name: &str, param_types: &[AbiType]) -> [u8; 4] {
         let sig = Self::signature(fn_name, param_types);
         let hash = Blake2s256::digest(sig.as_bytes());
         [hash[0], hash[1], hash[2], hash[3]]
     }
 
-    /// `selector(4) || AbiEncoder::encode(args)`
-    ///
-    /// Panics if `param_types.len() != args.len()` — callers must ensure these match.
     pub fn encode_call(fn_name: &str, param_types: &[AbiType], args: &[AbiValue]) -> Vec<u8> {
         assert_eq!(
             param_types.len(),
@@ -356,9 +327,6 @@ impl FunctionSelector {
         buf
     }
 
-    /// Decode call data that starts with a 4-byte selector.
-    ///
-    /// Returns `(selector_bytes, decoded_args)`.
     pub fn decode_call(
         param_types: &[AbiType],
         data: &[u8],
@@ -373,13 +341,9 @@ impl FunctionSelector {
     }
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── helpers ────────────────────────────────────────────────────────────────
 
     fn rt(value: AbiValue) {
         let encoded = AbiEncoder::encode_one(&value);
@@ -390,36 +354,31 @@ mod tests {
         assert_eq!(off, encoded.len(), "offset not fully consumed");
     }
 
-    // ── 1. uint8 round-trip ────────────────────────────────────────────────────
     #[test]
     fn test_uint8_rt() {
         rt(AbiValue::Uint8(255));
         rt(AbiValue::Uint8(0));
     }
 
-    // ── 2. uint16 round-trip ───────────────────────────────────────────────────
     #[test]
     fn test_uint16_rt() {
         rt(AbiValue::Uint16(0x1234));
-        // check LE encoding directly
+
         let enc = AbiEncoder::encode_one(&AbiValue::Uint16(0x0102));
         assert_eq!(enc, vec![0x02, 0x01]);
     }
 
-    // ── 3. uint32 round-trip ───────────────────────────────────────────────────
     #[test]
     fn test_uint32_rt() {
         rt(AbiValue::Uint32(u32::MAX));
         rt(AbiValue::Uint32(0));
     }
 
-    // ── 4. uint64 round-trip ───────────────────────────────────────────────────
     #[test]
     fn test_uint64_rt() {
         rt(AbiValue::Uint64(u64::MAX));
     }
 
-    // ── 5. uint128 round-trip ──────────────────────────────────────────────────
     #[test]
     fn test_uint128_rt() {
         rt(AbiValue::Uint128(u128::MAX));
@@ -429,7 +388,6 @@ mod tests {
         assert!(enc[1..].iter().all(|&b| b == 0));
     }
 
-    // ── 6. signed integer round-trips ─────────────────────────────────────────
     #[test]
     fn test_signed_ints_rt() {
         rt(AbiValue::Int8(-1));
@@ -439,7 +397,6 @@ mod tests {
         rt(AbiValue::Int64(-9999999999i64));
     }
 
-    // ── 7. bool round-trip ────────────────────────────────────────────────────
     #[test]
     fn test_bool_rt() {
         rt(AbiValue::Bool(true));
@@ -448,7 +405,6 @@ mod tests {
         assert_eq!(enc, vec![1u8]);
     }
 
-    // ── 8. bool invalid byte ──────────────────────────────────────────────────
     #[test]
     fn test_bool_invalid() {
         let data = vec![0x02u8];
@@ -457,7 +413,6 @@ mod tests {
         assert!(matches!(err, AbiError::InvalidBool { byte: 0x02, .. }));
     }
 
-    // ── 9. address round-trip ─────────────────────────────────────────────────
     #[test]
     fn test_address_rt() {
         let addr = [0xabu8; 20];
@@ -467,30 +422,26 @@ mod tests {
         assert!(enc.iter().all(|&b| b == 0xab));
     }
 
-    // ── 10. bytes round-trip + length prefix ──────────────────────────────────
     #[test]
     fn test_bytes_rt() {
         let payload = vec![0xde, 0xad, 0xbe, 0xef];
         rt(AbiValue::Bytes(payload.clone()));
         let enc = AbiEncoder::encode_one(&AbiValue::Bytes(payload.clone()));
-        // first 4 bytes: length in LE
+
         assert_eq!(&enc[..4], &4u32.to_le_bytes());
         assert_eq!(&enc[4..], payload.as_slice());
 
-        // empty bytes
         rt(AbiValue::Bytes(vec![]));
     }
 
-    // ── 11. string round-trip ─────────────────────────────────────────────────
     #[test]
     fn test_string_rt() {
         rt(AbiValue::String("hello, ego!".into()));
         rt(AbiValue::String(String::new()));
-        // Unicode
+
         rt(AbiValue::String("ego💎chain".into()));
     }
 
-    // ── 12. fixed bytes round-trip ────────────────────────────────────────────
     #[test]
     fn test_fixed_bytes_rt() {
         let fb = AbiValue::FixedBytes(vec![0x01, 0x02, 0x03, 0x04]);
@@ -499,7 +450,6 @@ mod tests {
         assert_eq!(enc, vec![0x01, 0x02, 0x03, 0x04]);
     }
 
-    // ── 13. multi-value encode/decode ─────────────────────────────────────────
     #[test]
     fn test_multi_value_rt() {
         let values = vec![
@@ -514,39 +464,35 @@ mod tests {
         assert_eq!(values, decoded);
     }
 
-    // ── 14. buffer underflow error ────────────────────────────────────────────
     #[test]
     fn test_buffer_underflow() {
-        let truncated = vec![0x01u8]; // only 1 byte, uint32 needs 4
+        let truncated = vec![0x01u8];
         let mut off = 0;
         let err = AbiDecoder::decode_one(&AbiType::Uint32, &truncated, &mut off).unwrap_err();
         assert!(matches!(err, AbiError::BufferUnderflow { need: 4, .. }));
     }
 
-    // ── 15. trailing bytes error ───────────────────────────────────────────────
     #[test]
     fn test_trailing_bytes() {
         let mut data = AbiEncoder::encode_one(&AbiValue::Uint8(7));
-        data.push(0xFF); // extra trailing byte
+        data.push(0xFF);
         let err = AbiDecoder::decode(&[AbiType::Uint8], &data).unwrap_err();
         assert!(matches!(err, AbiError::TrailingBytes { trailing: 1 }));
     }
 
-    // ── 16. function selector determinism ─────────────────────────────────────
     #[test]
     fn test_selector_determinism() {
         let s1 = FunctionSelector::compute("transfer", &[AbiType::Address, AbiType::Uint64]);
         let s2 = FunctionSelector::compute("transfer", &[AbiType::Address, AbiType::Uint64]);
         assert_eq!(s1, s2);
-        // different name → different selector
+
         let s3 = FunctionSelector::compute("send", &[AbiType::Address, AbiType::Uint64]);
         assert_ne!(s1, s3);
-        // different types → different selector
+
         let s4 = FunctionSelector::compute("transfer", &[AbiType::Address, AbiType::Uint32]);
         assert_ne!(s1, s4);
     }
 
-    // ── 17. selector signature string ─────────────────────────────────────────
     #[test]
     fn test_selector_signature_string() {
         let sig = FunctionSelector::signature(
@@ -559,7 +505,6 @@ mod tests {
         assert_eq!(no_args, "init()");
     }
 
-    // ── 18. encode_call / decode_call round-trip ──────────────────────────────
     #[test]
     fn test_encode_decode_call_rt() {
         let fn_name = "transfer";
@@ -570,7 +515,7 @@ mod tests {
         ];
 
         let call_data = FunctionSelector::encode_call(fn_name, &param_types, &args);
-        assert_eq!(call_data.len(), 4 + 20 + 8); // selector + address + u64
+        assert_eq!(call_data.len(), 4 + 20 + 8);
 
         let (sel, decoded_args) =
             FunctionSelector::decode_call(&param_types, &call_data).expect("decode_call failed");
@@ -580,24 +525,21 @@ mod tests {
         assert_eq!(decoded_args, args);
     }
 
-    // ── 19. decode_call missing selector error ────────────────────────────────
     #[test]
     fn test_decode_call_missing_selector() {
         let err = FunctionSelector::decode_call(&[], &[0x01, 0x02]).unwrap_err();
         assert!(matches!(err, AbiError::MissingSelector { have: 2 }));
     }
 
-    // ── 20. encode_call with no args ──────────────────────────────────────────
     #[test]
     fn test_encode_call_no_args() {
         let call = FunctionSelector::encode_call("pause", &[], &[]);
-        assert_eq!(call.len(), 4); // only selector
+        assert_eq!(call.len(), 4);
         let (sel, args) = FunctionSelector::decode_call(&[], &call).unwrap();
         assert_eq!(sel, FunctionSelector::compute("pause", &[]));
         assert!(args.is_empty());
     }
 
-    // ── 21. abi_type() helper ─────────────────────────────────────────────────
     #[test]
     fn test_abi_type_helper() {
         assert_eq!(AbiValue::Uint8(0).abi_type(),   AbiType::Uint8);
@@ -606,7 +548,6 @@ mod tests {
         assert_eq!(fb.abi_type(), AbiType::FixedBytes(16));
     }
 
-    // ── 22. canonical type strings ────────────────────────────────────────────
     #[test]
     fn test_canonical_strings() {
         assert_eq!(AbiType::Uint8.canonical(),       "uint8");
@@ -620,19 +561,16 @@ mod tests {
         assert_eq!(AbiType::FixedBytes(32).canonical(), "bytes32");
     }
 
-    // ── 23. little-endian encoding spot-checks ────────────────────────────────
     #[test]
     fn test_le_encoding() {
-        // 0x0102_0304_u32 → [04, 03, 02, 01]
+
         let enc = AbiEncoder::encode_one(&AbiValue::Uint32(0x0102_0304));
         assert_eq!(enc, vec![0x04, 0x03, 0x02, 0x01]);
 
-        // i64 -1 → all 0xFF bytes (two's complement LE)
         let enc = AbiEncoder::encode_one(&AbiValue::Int64(-1));
         assert_eq!(enc, vec![0xFF; 8]);
     }
 
-    // ── 24. mixed complex call encode/decode ──────────────────────────────────
     #[test]
     fn test_complex_call_rt() {
         let fn_name = "store";

@@ -1,16 +1,8 @@
-//! BLS12-381 signature aggregation for ego-blockchain validator committee voting.
-//!
-//! Uses the `min_pk` variant: 48-byte public keys, 96-byte signatures.
-//! Domain-separation tag: `ego/bls/validator/v1`
-
 use blst::min_pk::{PublicKey, SecretKey, Signature};
 use blst::BLST_ERROR;
 use thiserror::Error;
 
-/// Domain separation tag used for all validator BLS signatures.
 pub const BLS_DST: &[u8] = b"ego/bls/validator/v1";
-
-// ── Error ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum BlsError {
@@ -34,16 +26,13 @@ fn blst_err_to_string(e: BLST_ERROR) -> String {
     format!("{:?}", e)
 }
 
-// ── BlsKeypair ────────────────────────────────────────────────────────────────
-
-/// A BLS12-381 keypair (min_pk variant: 48-byte pubkey, 96-byte signature).
 pub struct BlsKeypair {
     pub secret: SecretKey,
     pub public: PublicKey,
 }
 
 impl BlsKeypair {
-    /// Generate a random keypair using OS entropy.
+
     pub fn generate() -> Self {
         use rand::RngCore;
         let mut ikm = [0u8; 32];
@@ -51,66 +40,51 @@ impl BlsKeypair {
         Self::from_seed(&ikm)
     }
 
-    /// Derive a keypair deterministically from a 32-byte seed.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
-        // blst key_gen requires IKM >= 32 bytes; pass seed directly as IKM.
+
         let secret = SecretKey::key_gen(seed, &[]).expect("BLS key_gen failed with valid 32-byte IKM");
         let public = secret.sk_to_pk();
         Self { secret, public }
     }
 
-    /// Serialize the public key to 48 bytes (compressed G1 point).
     pub fn public_key_bytes(&self) -> [u8; 48] {
         self.public.compress()
     }
 
-    /// Serialize the secret key to 32 bytes.
     pub fn secret_key_bytes(&self) -> [u8; 32] {
         self.secret.to_bytes()
     }
 
-    /// Sign a message with this keypair using `BLS_DST`.
     pub fn sign(&self, msg: &[u8]) -> BlsSignature {
         let sig = self.secret.sign(msg, BLS_DST, &[]);
         BlsSignature(sig)
     }
 }
 
-// ── BlsSignature ──────────────────────────────────────────────────────────────
-
-/// A BLS12-381 signature (96 bytes, compressed G2 point in min_pk variant).
 pub struct BlsSignature(pub Signature);
 
 impl BlsSignature {
-    /// Serialize to 96 bytes.
+
     pub fn to_bytes(&self) -> [u8; 96] {
         self.0.compress()
     }
 
-    /// Deserialize from 96 bytes; validates the point is on the curve.
     pub fn from_bytes(b: &[u8; 96]) -> Result<Self, BlsError> {
         Signature::uncompress(b)
             .map(BlsSignature)
             .map_err(|e| BlsError::InvalidSignature(blst_err_to_string(e)))
     }
 
-    /// Verify this signature against a single public key and message.
     pub fn verify(&self, pubkey: &PublicKey, msg: &[u8]) -> bool {
         let err = self.0.verify(true, msg, BLS_DST, &[], pubkey, true);
         err == BLST_ERROR::BLST_SUCCESS
     }
 }
 
-// ── BlsAggregateSignature ─────────────────────────────────────────────────────
-
-/// Utilities for BLS signature aggregation and batch verification.
 pub struct BlsAggregateSignature;
 
 impl BlsAggregateSignature {
-    /// Aggregate `n` signatures into one ~96-byte signature.
-    ///
-    /// All input signatures must have been produced with `BLS_DST`.
-    /// Returns `Err` if the input slice is empty.
+
     pub fn aggregate(sigs: &[BlsSignature]) -> Result<BlsSignature, BlsError> {
         if sigs.is_empty() {
             return Err(BlsError::EmptyInputs("aggregate requires at least one signature".into()));
@@ -121,9 +95,6 @@ impl BlsAggregateSignature {
         Ok(BlsSignature(agg.to_signature()))
     }
 
-    /// Verify an aggregated signature where **all** signers signed the **same** message.
-    ///
-    /// This is the efficient n-of-n fast path (one pairing per unique message).
     pub fn verify_aggregate(
         agg_sig: &BlsSignature,
         pubkeys: &[PublicKey],
@@ -132,7 +103,7 @@ impl BlsAggregateSignature {
         if pubkeys.is_empty() {
             return false;
         }
-        // Aggregate the public keys
+
         let pk_refs: Vec<&PublicKey> = pubkeys.iter().collect();
         let agg_pk = match blst::min_pk::AggregatePublicKey::aggregate(&pk_refs, true) {
             Ok(apk) => apk.to_public_key(),
@@ -142,10 +113,6 @@ impl BlsAggregateSignature {
         err == BLST_ERROR::BLST_SUCCESS
     }
 
-    /// Verify a batch where each signer signed a **different** message (general case).
-    ///
-    /// Uses the multi-message aggregate verification API. `sigs`, `pubkeys`, and `msgs`
-    /// must all have the same length.
     pub fn verify_batch(
         sigs: &[BlsSignature],
         pubkeys: &[PublicKey],
@@ -154,9 +121,7 @@ impl BlsAggregateSignature {
         if sigs.is_empty() || pubkeys.len() != sigs.len() || msgs.len() != sigs.len() {
             return false;
         }
-        // Verify each (sig, pk, msg) triple individually and AND the results.
-        // blst does not expose a single multi-pair verify in the safe Rust API for min_pk,
-        // so we use the straightforward per-pair approach which is still correct.
+
         sigs.iter()
             .zip(pubkeys.iter())
             .zip(msgs.iter())
@@ -167,13 +132,10 @@ impl BlsAggregateSignature {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Fixed seed for deterministic tests
     fn seed(n: u8) -> [u8; 32] {
         let mut s = [0u8; 32];
         s[0] = n;
@@ -200,7 +162,7 @@ mod tests {
     #[test]
     fn test_keypair_random_generates() {
         let kp = BlsKeypair::generate();
-        // Public key must be non-zero
+
         assert_ne!(kp.public_key_bytes(), [0u8; 48]);
     }
 
@@ -239,7 +201,7 @@ mod tests {
     #[test]
     fn test_invalid_signature_bytes_rejected() {
         let bad = [0xffu8; 96];
-        // All-0xFF is not a valid compressed G2 point
+
         let result = BlsSignature::from_bytes(&bad);
         assert!(result.is_err(), "all-0xFF is not a valid BLS signature");
     }
@@ -259,7 +221,6 @@ mod tests {
             "100-validator aggregate must verify"
         );
 
-        // Size check: aggregated sig is always 96 bytes regardless of n
         let agg_bytes = agg.to_bytes();
         assert_eq!(agg_bytes.len(), 96);
         println!(
@@ -308,7 +269,6 @@ mod tests {
         let mut sigs: Vec<BlsSignature> = keypairs.iter().zip(msgs.iter()).map(|(kp, m)| kp.sign(m)).collect();
         let pubkeys: Vec<PublicKey> = keypairs.iter().map(|kp| kp.public.clone()).collect();
 
-        // Corrupt one signature by substituting another validator's sig for wrong message
         sigs[2] = keypairs[0].sign(b"tampered");
 
         assert!(!BlsAggregateSignature::verify_batch(&sigs, &pubkeys, &msgs));

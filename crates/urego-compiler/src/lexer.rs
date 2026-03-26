@@ -2,34 +2,34 @@ use crate::error::{CompileError, Result};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
-    // Keywords
+
     Contract, Fn, Let, Return, If, Else, While, True, False,
-    // New keywords
+
     Struct, For, In, Match, Emit, Import, Pub, Mut, Break, Continue, As,
-    // Types
+
     TyU64, TyI64, TyU32, TyBool, TyAddress, TyString, TyBytes,
-    // New types
+
     TyU8, TyU16, TyU128, TyVec, TyMap,
-    // Literals
+
     IntLit(u64),
     StrLit(String),
-    // Operators
+
     Plus, Minus, Star, Slash, Percent,
     EqEq, NotEq, Lt, Gt, LtEq, GtEq,
     And, Or, Bang,
     Assign,
-    Arrow,    // ->
-    // New operators
-    PlusEq,   // +=
-    MinusEq,  // -=
-    DotDot,   // ..
-    FatArrow, // =>
-    // Punctuation
+    Arrow,
+
+    PlusEq,
+    MinusEq,
+    DotDot,
+    FatArrow,
+
     LBrace, RBrace, LParen, RParen, LBracket, RBracket,
     Comma, Semi, Colon, Dot,
-    // Identifier
+
     Ident(String),
-    // EOF
+
     Eof,
 }
 
@@ -50,7 +50,6 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>> {
             '\n' => { line += 1; }
             ' ' | '\t' | '\r' => {}
 
-            // Line comments: // or #
             '#' => {
                 while let Some((_, c)) = chars.next() {
                     if c == '\n' { line += 1; break; }
@@ -99,13 +98,13 @@ pub fn lex(src: &str) -> Result<Vec<Spanned>> {
                         if c != '_' { num.push(c); }
                     } else { break; }
                 }
-                // swallow optional type suffix: u64, i64, u32, u8, u16, u128
+
                 if chars.peek().map(|&(_, c)| c.is_alphabetic()) == Some(true) {
                     while let Some(&(_, c)) = chars.peek() {
                         if c.is_alphanumeric() { chars.next(); }
                         else { break; }
                     }
-                    // ignore suffix — treat all int literals as u64
+
                 }
                 let v: u64 = num.parse().map_err(|_| CompileError::LexError {
                     line, msg: format!("invalid integer: {num}")

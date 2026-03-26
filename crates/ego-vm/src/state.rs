@@ -3,12 +3,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use crate::error::VmError;
 
-/// Per-contract key-value state.
-/// Stored as JSON files: {data_dir}/contracts/{contract_addr}/state.json
-/// In production this would be a proper DB; JSON is fine for Phase 1.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ContractState {
-    /// prefix → key → value (all hex-encoded bytes)
+
     pub data: HashMap<String, HashMap<String, String>>,
 }
 
@@ -32,7 +29,6 @@ impl ContractState {
     }
 }
 
-/// Manages on-disk contract state + WASM code storage.
 pub struct StateStore {
     pub base_dir: PathBuf,
 }

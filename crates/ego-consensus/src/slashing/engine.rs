@@ -1,10 +1,3 @@
-// slashing/engine.rs — Evidence-based slashing execution
-//
-// Connects fraud evidence (from aggregator/beacon layers) to SlashEvent
-// and RepairEvent emission.  Works with the existing slashing/mod.rs types.
-//
-// Whitepaper §7 — slash conditions, cooldown periods, whistleblower rewards
-
 use crate::error::{PoCError, PoCResult};
 use crate::slashing::{PayoutReceipt, PayoutType, SlashEvent, SlashType, SlashingMetrics, SlashingRule};
 use crate::repair::{RepairEvent, RepairJob, RepairPriority, RepairType};
@@ -15,39 +8,36 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info, warn};
 
-// ── Evidence types ────────────────────────────────────────────────────────────
-
-/// Unified fraud / failure evidence fed to the slashing engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlashEvidence {
     pub evidence_id: Hash,
     pub accused: Address,
     pub reporter: Address,
     pub evidence_type: EvidenceType,
-    /// Serialised proof bytes (PoC fraud proof, PoSt miss record, etc.)
+
     pub proof_bytes: Vec<u8>,
-    /// Confidence level from the source module (0.0–1.0)
+
     pub confidence: f64,
-    /// Epoch in which the infraction occurred
+
     pub epoch: u64,
-    /// Affected sector/deal IDs, if applicable
+
     pub affected_sectors: Vec<u64>,
     pub submitted_at: Timestamp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EvidenceType {
-    /// PoC fraud: invalid geometry, replay, insufficient diversity
+
     PoCFraud,
-    /// PoSt consecutive misses beyond threshold
+
     StorageFailure,
-    /// PoRep proof verification failure
+
     ProofFailure,
-    /// Node offline for too long
+
     NodeOffline,
-    /// On-chain data corruption detected
+
     DataCorruption,
-    /// BFT equivocation (double-vote)
+
     ConsensusViolation,
 }
 
@@ -67,8 +57,6 @@ impl EvidenceType {
     }
 }
 
-// ── Pending slash proposal ────────────────────────────────────────────────────
-
 #[derive(Debug, Clone)]
 pub struct PendingSlash {
     pub slash_id: Hash,
@@ -87,8 +75,6 @@ pub enum PendingSlashStatus {
     Expired,
 }
 
-// ── Engine ────────────────────────────────────────────────────────────────────
-
 #[derive(Debug)]
 pub struct SlashingEngine {
     keypair: Arc<KeyPair>,
@@ -98,7 +84,7 @@ pub struct SlashingEngine {
     slash_history: Arc<RwLock<HashMap<Address, Vec<SlashEvent>>>>,
     repair_queue: Arc<RwLock<Vec<RepairJob>>>,
     metrics: Arc<RwLock<SlashingMetrics>>,
-    /// Cooldown tracking: last slash time per (node, slash_type)
+
     cooldowns: Arc<RwLock<HashMap<(Address, String), Timestamp>>>,
 }
 
@@ -118,12 +104,8 @@ impl SlashingEngine {
         }
     }
 
-    // ── Public API ────────────────────────────────────────────────────────────
-
-    /// Validate evidence and queue a slash proposal.
-    /// Returns None if confidence is below threshold or cooldown is active.
     pub fn propose_slash(&self, evidence: SlashEvidence) -> PoCResult<Option<Hash>> {
-        // Minimum confidence gate
+
         if evidence.confidence < 0.8 {
             debug!("Evidence confidence {:.2} below 0.80 threshold, skipping", evidence.confidence);
             return Ok(None);
@@ -132,7 +114,6 @@ impl SlashingEngine {
         let slash_type = evidence.evidence_type.to_slash_type();
         let type_key = format!("{:?}", slash_type);
 
-        // Cooldown check
         if self.is_in_cooldown(&evidence.accused, &type_key) {
             debug!("Node {} in cooldown for {:?}", evidence.accused, slash_type);
             return Ok(None);
@@ -169,7 +150,6 @@ impl SlashingEngine {
         Ok(Some(slash_id))
     }
 
-    /// Execute an approved pending slash, emit SlashEvent and optional RepairEvent.
     pub fn execute_slash(&self, slash_id: Hash) -> PoCResult<(SlashEvent, Option<RepairJob>)> {
         let pending = {
             let mut slashes = self.pending_slashes.write().unwrap();
@@ -195,19 +175,16 @@ impl SlashingEngine {
             pending.evidence.confidence,
         );
 
-        // Update cooldown
         {
             let key = (pending.evidence.accused, format!("{:?}", slash_type));
             self.cooldowns.write().unwrap().insert(key, Timestamp::now());
         }
 
-        // Record in history
         {
             let mut history = self.slash_history.write().unwrap();
             history.entry(pending.evidence.accused).or_default().push(slash_event.clone());
         }
 
-        // Update metrics
         {
             let mut m = self.metrics.write().unwrap();
             m.total_slashes += 1;
@@ -218,7 +195,6 @@ impl SlashingEngine {
             m.last_updated = Timestamp::now();
         }
 
-        // Schedule repair if needed
         let repair_job = if pending.evidence.evidence_type.needs_repair() && !pending.evidence.affected_sectors.is_empty() {
             let priority = match pending.evidence.evidence_type {
                 EvidenceType::DataCorruption   => RepairPriority::Critical,
@@ -237,7 +213,6 @@ impl SlashingEngine {
         Ok((slash_event, repair_job))
     }
 
-    /// Process a PoC fraud proof directly — propose + auto-execute if confidence ≥ 0.95.
     pub fn process_poc_fraud(
         &self,
         accused: Address,
@@ -260,7 +235,7 @@ impl SlashingEngine {
 
         if let Some(slash_id) = self.propose_slash(evidence)? {
             if confidence >= 0.95 {
-                // Auto-execute high-confidence PoC fraud
+
                 let (event, _) = self.execute_slash(slash_id)?;
                 return Ok(Some(event));
             }
@@ -268,9 +243,6 @@ impl SlashingEngine {
         Ok(None)
     }
 
-
-    /// Report invalid PoC event for slashing - connects DensityEvent to slashing pipeline
-    /// This is called when aggregator detects co-location or other density violations
     pub fn report_invalid_poc(
         &self,
         density_event: &crate::aggregator::DensityEvent,
@@ -279,37 +251,32 @@ impl SlashingEngine {
         info!("Processing density violation for node {} in cell {} (LDM: {:.3})",
               density_event.node_id, density_event.h3_cell, density_event.ldm);
 
-        // Calculate confidence based on LDM (Local Density Measurement)
-        // Higher LDM = more co-located devices = higher confidence of violation
         let confidence = if density_event.ldm > 0.8 {
-            0.95 // Very high confidence for clear co-location
+            0.95
         } else if density_event.ldm > 0.6 {
-            0.85 // High confidence
+            0.85
         } else if density_event.ldm > 0.4 {
-            0.75 // Medium confidence
+            0.75
         } else {
-            0.65 // Lower confidence, but still actionable
+            0.65
         };
 
-        // Create evidence for the density violation
         let evidence = SlashEvidence {
             evidence_id: density_event.evidence_root,
             accused: density_event.node_id,
             reporter,
-            evidence_type: EvidenceType::PoCFraud, // Co-location is PoC fraud
+            evidence_type: EvidenceType::PoCFraud,
             proof_bytes: self.serialize_density_evidence(density_event)?,
             confidence,
             epoch: density_event.epoch,
-            affected_sectors: vec![], // Density violations don't affect specific sectors
+            affected_sectors: vec![],
             submitted_at: density_event.timestamp,
         };
 
-        // Propose slash for review
         if let Some(slash_id) = self.propose_slash(evidence)? {
             info!("Proposed slash {} for density violation by {} (confidence: {:.2})",
                   format!("{:?}", slash_id), density_event.node_id, confidence);
 
-            // Auto-execute high-confidence density violations
             if confidence >= 0.90 {
                 warn!("Auto-executing high-confidence density violation slash for {}",
                       density_event.node_id);
@@ -321,9 +288,8 @@ impl SlashingEngine {
         Ok(None)
     }
 
-    /// Serialize density event evidence for slash proof
     fn serialize_density_evidence(&self, density_event: &crate::aggregator::DensityEvent) -> PoCResult<Vec<u8>> {
-        // For now, create a simple serialized representation
+
         let mut evidence_bytes = Vec::new();
         evidence_bytes.extend_from_slice(density_event.node_id.as_bytes());
         evidence_bytes.extend_from_slice(density_event.h3_cell.as_bytes());
@@ -336,7 +302,6 @@ impl SlashingEngine {
         Ok(evidence_bytes)
     }
 
-    /// Process consecutive PoSt misses — auto-execute if misses ≥ threshold.
     pub fn process_post_failure(
         &self,
         node: Address,
@@ -374,9 +339,8 @@ impl SlashingEngine {
         Ok(None)
     }
 
-    /// Calculate payout receipt for a node in a given epoch.
     pub fn calculate_payout(&self, recipient: Address, epoch: u64, proof_quality: f64) -> PayoutReceipt {
-        // Base reward: 1000 EGOC micro-units × quality score (stub — real impl queries deal table)
+
         let base_amount = 1_000u128;
         let amount = (base_amount as f64 * proof_quality).max(0.0) as u128;
 
@@ -406,8 +370,6 @@ impl SlashingEngine {
         self.pending_slashes.read().unwrap().len()
     }
 
-    // ── Private helpers ───────────────────────────────────────────────────────
-
     fn is_in_cooldown(&self, node: &Address, type_key: &str) -> bool {
         let cooldowns = self.cooldowns.read().unwrap();
         if let Some(last) = cooldowns.get(&(*node, type_key.to_string())) {
@@ -436,8 +398,6 @@ impl SlashingEngine {
         rules
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {

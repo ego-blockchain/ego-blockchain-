@@ -33,9 +33,8 @@ pub struct BeaconNode {
     challenge_schedule: Arc<RwLock<Option<ChallengeSchedule>>>,
     vrf_receiver: Option<mpsc::UnboundedReceiver<(Hash, u64, u64)>>,
     pub authorized: bool,
-    pub drs_score: f64,  // KEEP ONLY THIS ONE
+    pub drs_score: f64,
 }
-
 
 #[derive(Debug, Clone)]
 struct RateLimiter {
@@ -68,7 +67,7 @@ impl BeaconNode {
             co_beacon_active: false,
             last_challenge_epoch: None,
             randomness_source: RandomnessSource::None,
-            nr_bands: vec![78], // Default to n78 (3.3-3.8 GHz)
+            nr_bands: vec![78],
         };
 
         let h3_cell = Some(location.h3_index.clone());
@@ -93,12 +92,11 @@ impl BeaconNode {
             authorized_nr_bands: vec![78],
             challenge_schedule: Arc::new(RwLock::new(None)),
             vrf_receiver: None,
-            authorized: true,  // ADD THIS
-            drs_score: 0.9,    // ADD THIS (note: duplicate field name with Arc<RwLock> above!)
+            authorized: true,
+            drs_score: 0.9,
         }
     }
 
-    /// NEW: Create beacon with randomness source
     pub fn new_with_randomness(
         config: BeaconConfig,
         keypair: KeyPair,
@@ -108,12 +106,12 @@ impl BeaconNode {
     ) -> Self {
         let mut node = Self::new(config, keypair, location, authorized_frequencies);
         node.randomness_source = randomness_source;
-        
+
         {
             let mut status = node.status.write().unwrap();
             status.randomness_source = randomness_source;
         }
-        
+
         node
     }
 
@@ -121,9 +119,8 @@ impl BeaconNode {
         self.authorized && !self.authorized_frequencies.is_empty()
     }
 
-
     pub async fn start(&mut self) -> PoCResult<()> {
-        info!("Starting beacon node {} with randomness source: {:?}", 
+        info!("Starting beacon node {} with randomness source: {:?}",
             self.address, self.randomness_source);
 
         self.validate_config()?;
@@ -136,7 +133,6 @@ impl BeaconNode {
         self.announcement_sender = Some(announcement_sender);
         self.vrf_receiver = Some(vrf_receiver);
 
-        // NEW: Start co-beacon monitor task
         self.start_co_beacon_monitor().await?;
 
         {
@@ -151,7 +147,6 @@ impl BeaconNode {
     pub async fn stop(&mut self) -> PoCResult<()> {
         info!("Stopping beacon node {}", self.address);
 
-        // NEW: Stop co-beacon if active
         self.stop_co_beacon_broadcast().await?;
 
         {
@@ -195,27 +190,25 @@ impl BeaconNode {
         Ok(())
     }
 
-    /// NEW: Authorize NR bands for PoC
     pub fn authorize_nr_band(&mut self, nr_band: u8) -> PoCResult<()> {
         if !self.authorized_nr_bands.contains(&nr_band) {
             self.authorized_nr_bands.push(nr_band);
-            
+
             let mut status = self.status.write().unwrap();
             status.nr_bands.push(nr_band);
-            
+
             info!("Authorized NR band n{} for beacon {}", nr_band, self.address);
         }
         Ok(())
     }
 
     pub fn update_drs_score(&mut self, score: f64) {
-        self.drs_score = score.clamp(0.0, 1.0);  // Direct assignment, no Arc/RwLock
-        
+        self.drs_score = score.clamp(0.0, 1.0);
+
         let mut status = self.status.write().unwrap();
         status.drs_score = Some(score);
     }
 
-    /// NEW: Set randomness source
     pub fn set_randomness_source(&mut self, source: RandomnessSource) {
         self.randomness_source = source;
         let mut status = self.status.write().unwrap();
@@ -231,12 +224,10 @@ impl BeaconNode {
         self.metrics.read().unwrap().clone()
     }
 
-    /// NEW: Get co-beacon status
     pub fn get_co_beacon_status(&self) -> Option<CoBeaconStatus> {
         self.co_beacon_status.read().unwrap().clone()
     }
 
-    /// NEW: Get current challenge schedule
     pub fn get_challenge_schedule(&self) -> Option<ChallengeSchedule> {
         self.challenge_schedule.read().unwrap().clone()
     }
@@ -254,7 +245,6 @@ impl BeaconNode {
         let epoch = Timestamp::now().as_secs() / 3600;
         let key = (self.address, challenge.nonce.clone(), epoch);
 
-        // Anti-replay protection
         {
             let mut recent = self.recent_transmissions.write().unwrap();
             let cutoff = Timestamp::now().as_millis().saturating_sub(3_600_000);
@@ -268,7 +258,6 @@ impl BeaconNode {
             recent.insert(key, Timestamp::now());
         }
 
-        // Rate limiting
         if !self.check_rate_limit()? {
             return Err(PoCError::RateLimitExceeded {
                 operation: "beacon_announcement".to_string(),
@@ -276,7 +265,6 @@ impl BeaconNode {
             });
         }
 
-        // DRS score check
         if self.drs_score < 0.7 {
             return Err(PoCError::ValidationFailed(format!(
                 "DRS score {} below threshold 0.7",
@@ -284,24 +272,19 @@ impl BeaconNode {
             )));
         }
 
-
-        // H3 cell check
         let current_cell = self.h3_cell.read().unwrap().clone();
         if current_cell != Some(challenge.h3_cell.clone()) {
             debug!("Skipping challenge - not in target H3 cell");
             return Ok(());
         }
 
-        // Prepare announcement (basic or with randomness)
         let announcement = self.prepare_announcement(challenge.clone()).await?;
         announcement.validate()?;
 
-        // Start co-beacon if configured
         if self.config.use_side_channel {
             self.start_co_beacon_broadcast(&announcement).await?;
         }
 
-        // Transmit beacon
         let tx_log = self.transmit_beacon(&announcement).await?;
 
         {
@@ -314,13 +297,11 @@ impl BeaconNode {
 
         self.update_metrics_after_transmission(true);
 
-        // Update last challenge epoch
         {
             let mut status = self.status.write().unwrap();
             status.last_challenge_epoch = Some(epoch);
         }
 
-        // Publish announcement
         if let Some(ref sender) = self.announcement_sender {
             if let Err(e) = sender.send(announcement) {
                 warn!("Failed to publish beacon announcement: {}", e);
@@ -334,7 +315,6 @@ impl BeaconNode {
         Ok(())
     }
 
-    /// NEW: Process challenge with VRF randomness
     pub async fn process_challenge_with_randomness(
         &mut self,
         challenge: Challenge,
@@ -347,7 +327,6 @@ impl BeaconNode {
             challenge.challenge_hash, self.address, epoch, slot
         );
 
-        // Create challenge schedule
         let region_id = self.h3_cell.read().unwrap().clone()
             .ok_or_else(|| PoCError::InvalidLocation("No H3 cell set".to_string()))?;
 
@@ -364,7 +343,6 @@ impl BeaconNode {
             *sched = Some(schedule.clone());
         }
 
-        // Check if in challenge window
         if !schedule.is_active() {
             warn!("Challenge window not active for beacon {}", self.address);
             return Err(PoCError::TimeWindowViolation(
@@ -372,7 +350,6 @@ impl BeaconNode {
             ));
         }
 
-        // Prepare announcement with randomness
         let announcement = self.prepare_announcement_with_randomness(
             challenge,
             vrf_output,
@@ -383,12 +360,10 @@ impl BeaconNode {
 
         announcement.validate()?;
 
-        // Start co-beacon if configured
         if self.config.use_side_channel {
             self.start_co_beacon_broadcast(&announcement).await?;
         }
 
-        // Transmit beacon
         let tx_log = self.transmit_beacon(&announcement).await?;
 
         {
@@ -401,19 +376,16 @@ impl BeaconNode {
 
         self.update_metrics_after_transmission(true);
 
-        // Update metrics for challenge binding
         {
             let mut metrics = self.metrics.write().unwrap();
             metrics.avg_window_duration_ms = schedule.window_end.as_millis() - schedule.window_start.as_millis();
         }
 
-        // Update status
         {
             let mut status = self.status.write().unwrap();
             status.last_challenge_epoch = Some(epoch);
         }
 
-        // Publish announcement
         if let Some(ref sender) = self.announcement_sender {
             if let Err(e) = sender.send(announcement) {
                 warn!("Failed to publish beacon announcement: {}", e);
@@ -427,7 +399,6 @@ impl BeaconNode {
         Ok(())
     }
 
-    /// NEW: Start co-beacon monitor task
     async fn start_co_beacon_monitor(&self) -> PoCResult<()> {
         let co_beacon_status = self.co_beacon_status.clone();
         let metrics = self.metrics.clone();
@@ -440,22 +411,21 @@ impl BeaconNode {
                 interval.tick().await;
 
                 let co_beacon = co_beacon_status.read().unwrap().clone();
-                
+
                 if let Some(ref beacon) = co_beacon {
                     if beacon.is_broadcasting {
                         let now = Timestamp::now();
-                        
-                        // Check if broadcast window expired
+
                         if now > beacon.end_time {
-                            // Stop broadcasting
+
                             let mut co_status = co_beacon_status.write().unwrap();
                             if let Some(ref mut status) = *co_status {
                                 status.is_broadcasting = false;
                             }
-                            
+
                             let mut st = status.write().unwrap();
                             st.co_beacon_active = false;
-                            
+
                             debug!("Co-beacon broadcast window expired, stopping");
                         }
                     }
@@ -479,7 +449,6 @@ impl BeaconNode {
             ));
         }
 
-        // Whitepaper: Beacon interval should align with challenge windows (10s)
         if self.config.beacon_interval_ms < 10_000 {
             return Err(PoCError::CellularSafetyViolation(
                 "Beacon interval too short for cellular safety".to_string(),
@@ -528,7 +497,6 @@ impl BeaconNode {
         status.last_transmission = Some(Timestamp::now());
     }
 
-    /// NEW: Update co-beacon metrics
     fn update_co_beacon_metrics(&self, success: bool) {
         let mut metrics = self.metrics.write().unwrap();
         metrics.co_beacon_broadcasts += 1;
@@ -571,20 +539,19 @@ impl Beacon for BeaconNode {
 
         let frequency = self.authorized_frequencies.get(0).copied().unwrap_or(3500);
 
-        // NEW: Include NR band information
         let nr_band = self.authorized_nr_bands.first().copied();
         let nr_arfcn = if frequency == 3500 {
-            Some(646656) // Example NR-ARFCN for 3.5 GHz
+            Some(646656)
         } else {
             None
         };
 
         let tx_params = super::announcement::BeaconTxParams {
             frequency,
-            tx_power_dbm: self.config.max_tx_power_dbm.min(23), // Whitepaper: typical small cell
+            tx_power_dbm: self.config.max_tx_power_dbm.min(23),
             pci: 1,
             beam_config: None,
-            duration_ms: 1000, // Whitepaper: within 10s window
+            duration_ms: 1000,
             mcs: Some(16),
             nr_arfcn,
             nr_band,
@@ -594,14 +561,13 @@ impl Beacon for BeaconNode {
         let mut announcement =
             BeaconAnnouncement::new(self.address, challenge, location, tx_params);
 
-        // NEW: Add co-beacon with proper nonce binding (whitepaper compliant)
         if self.config.use_side_channel {
             let co_beacon_method = CoBeaconMethod::BLE {
                 service_uuid: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E".to_string(),
                 characteristic_uuid: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E".to_string(),
-                tx_power_dbm: -10, // Low power for side-channel
+                tx_power_dbm: -10,
             };
-            
+
             announcement.add_co_beacon(co_beacon_method, &self.keypair)?;
         }
 
@@ -610,7 +576,6 @@ impl Beacon for BeaconNode {
         Ok(announcement)
     }
 
-    /// NEW: Whitepaper - prepare announcement with consensus randomness
     async fn prepare_announcement_with_randomness(
         &mut self,
         challenge: Challenge,
@@ -646,7 +611,6 @@ impl Beacon for BeaconNode {
             ssb_index: Some(0),
         };
 
-        // Whitepaper: Create announcement with randomness binding
         let mut announcement = BeaconAnnouncement::new_with_randomness(
             self.address,
             challenge,
@@ -658,14 +622,13 @@ impl Beacon for BeaconNode {
             slot,
         );
 
-        // Add co-beacon with proper nonce binding
         if self.config.use_side_channel {
             let co_beacon_method = CoBeaconMethod::BLE {
                 service_uuid: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E".to_string(),
                 characteristic_uuid: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E".to_string(),
                 tx_power_dbm: -10,
             };
-            
+
             announcement.add_co_beacon(co_beacon_method, &self.keypair)?;
         }
 
@@ -699,7 +662,6 @@ impl Beacon for BeaconNode {
         Ok(tx_log)
     }
 
-    /// NEW: Whitepaper - start co-beacon broadcast
     async fn start_co_beacon_broadcast(
         &mut self,
         announcement: &BeaconAnnouncement,
@@ -738,7 +700,6 @@ impl Beacon for BeaconNode {
         Ok(())
     }
 
-    /// NEW: Whitepaper - stop co-beacon broadcast
     async fn stop_co_beacon_broadcast(&mut self) -> PoCResult<()> {
         let is_broadcasting = self.co_beacon_status.read().unwrap()
             .as_ref()
@@ -813,7 +774,6 @@ mod tests {
             vec![3500, 3600, 3700],
         );
 
-        // Ensure beacon is authorized and has good DRS score
         beacon.authorized = true;
         beacon.drs_score = 0.9;
 
@@ -839,7 +799,6 @@ mod tests {
             RandomnessSource::VRF,
         );
 
-        // Ensure beacon is authorized and has good DRS score
         beacon.authorized = true;
         beacon.drs_score = 0.9;
 
@@ -858,7 +817,7 @@ mod tests {
     async fn test_beacon_with_randomness() {
         let beacon = create_test_beacon_with_randomness();
         assert_eq!(beacon.randomness_source, RandomnessSource::VRF);
-        
+
         let status = beacon.get_status();
         assert_eq!(status.randomness_source, RandomnessSource::VRF);
     }
@@ -923,7 +882,7 @@ mod tests {
 
         let metrics = beacon.get_metrics();
         assert_eq!(metrics.total_transmissions, 1);
-        assert_eq!(metrics.avg_window_duration_ms, 10_000); // Whitepaper: W=10s
+        assert_eq!(metrics.avg_window_duration_ms, 10_000);
 
         let status = beacon.get_status();
         assert_eq!(status.last_challenge_epoch, Some(epoch));
@@ -945,7 +904,6 @@ mod tests {
 
         assert!(beacon.process_challenge(challenge.clone()).await.is_ok());
 
-        // Second attempt with same nonce should fail
         assert!(beacon.process_challenge(challenge).await.is_err());
     }
 
@@ -976,7 +934,6 @@ mod tests {
 
         let announcement = beacon.prepare_announcement(challenge).await.unwrap();
 
-        // Start co-beacon broadcast
         assert!(beacon.start_co_beacon_broadcast(&announcement).await.is_ok());
 
         let status = beacon.get_status();
@@ -986,7 +943,6 @@ mod tests {
         assert!(co_beacon_status.is_some());
         assert!(co_beacon_status.unwrap().is_broadcasting);
 
-        // Stop co-beacon broadcast
         assert!(beacon.stop_co_beacon_broadcast().await.is_ok());
 
         let status = beacon.get_status();
@@ -997,8 +953,8 @@ mod tests {
     fn test_nr_band_authorization() {
         let mut beacon = create_test_beacon();
 
-        assert!(beacon.authorize_nr_band(77).is_ok()); // n77
-        assert!(beacon.authorize_nr_band(78).is_ok()); // n78
+        assert!(beacon.authorize_nr_band(77).is_ok());
+        assert!(beacon.authorize_nr_band(78).is_ok());
 
         let status = beacon.get_status();
         assert!(status.nr_bands.contains(&77));
@@ -1019,7 +975,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] 
+    #[ignore]
     async fn test_challenge_schedule() {
         let mut beacon = create_test_beacon_with_randomness();
         beacon.start().await.unwrap();
@@ -1078,7 +1034,7 @@ mod tests {
     fn test_epoch_calculation() {
         let beacon = create_test_beacon();
         let epoch = beacon.get_current_epoch();
-        
+
         let expected_epoch = Timestamp::now().as_secs() / 3600;
         assert_eq!(epoch, expected_epoch);
     }
@@ -1103,14 +1059,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] 
+    #[ignore]
     async fn test_drs_score_threshold() {
         let mut beacon = create_test_beacon();
         beacon.start().await.unwrap();
-    
-        // Set DRS score below threshold
-        beacon.drs_score = 0.5;  // Direct assignment now
-    
+
+        beacon.drs_score = 0.5;
+
         let challenge = Challenge {
             challenge_hash: Hash::new([1u8; 32]),
             h3_cell: "872834720ffffff".to_string(),
@@ -1119,14 +1074,11 @@ mod tests {
             difficulty: 1,
             reward_scale: 1.0,
         };
-    
-        // Should fail due to insufficient DRS score
+
         assert!(beacon.process_challenge(challenge.clone()).await.is_err());
-    
-        // Update to acceptable score
-        beacon.drs_score = 0.9;  // Direct assignment
-    
-        // Should now succeed
+
+        beacon.drs_score = 0.9;
+
         assert!(beacon.process_challenge(challenge).await.is_ok());
     }
 
@@ -1155,20 +1107,18 @@ mod tests {
 
         let announcement = beacon.prepare_announcement(challenge).await.unwrap();
 
-        // Verify co-beacon has nonce commitment if side-channel enabled
         if beacon.config.use_side_channel {
             assert!(announcement.co_beacon.is_some());
-            
+
             let co_beacon = announcement.co_beacon.as_ref().unwrap();
-            assert_eq!(co_beacon.side_channel_nonce.len(), 16); // Whitepaper: nonce16
-            
-            // Nonce commitment should be non-zero
+            assert_eq!(co_beacon.side_channel_nonce.len(), 16);
+
             assert_ne!(co_beacon.nonce_commitment, Hash::new([0u8; 32]));
         }
     }
 
     #[tokio::test]
-    #[ignore] 
+    #[ignore]
     async fn test_window_duration() {
         let mut beacon = create_test_beacon_with_randomness();
         beacon.start().await.unwrap();
@@ -1193,8 +1143,7 @@ mod tests {
         ).await.unwrap();
 
         let schedule = beacon.get_challenge_schedule().unwrap();
-        
-        // Whitepaper: W=10s challenge window
+
         let window_duration = schedule.window_end.as_millis() - schedule.window_start.as_millis();
         assert_eq!(window_duration, 10_000);
     }

@@ -3,8 +3,6 @@ import qrcode from 'qrcode-generator';
 import { generateSeed, seedToMnemonic } from '../shared/crypto';
 import type { ExtMessage, ExtResponse, PendingConnection } from '../shared/types';
 
-// ── Utilities ─────────────────────────────────────────────────────────────────
-
 function sendMsg<T = unknown>(
   type: ExtMessage['type'],
   payload: Record<string, unknown> = {},
@@ -25,8 +23,6 @@ function cls(...args: (string | boolean | undefined | null)[]): string {
   return args.filter(Boolean).join(' ');
 }
 
-// ── Style constants ───────────────────────────────────────────────────────────
-
 const S = {
   page: 'flex flex-col h-full bg-gray-900 text-white',
   header: 'flex items-center justify-between px-4 py-3 bg-gray-800 border-b border-gray-700',
@@ -43,10 +39,6 @@ const S = {
   success: 'text-green-400 text-sm mt-1',
   section: 'flex-1 overflow-y-auto px-4 py-4 flex flex-col gap-4',
 };
-
-// ── Inline styles for elements that can't use Tailwind (popup constraints) ────
-// We use a single CSS string injected via <style> instead of Tailwind CDN
-// to keep the extension self-contained and avoid network requests.
 
 const STYLES = `
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -226,13 +218,9 @@ const STYLES = `
   .nav-btn svg { width: 20px; height: 20px; }
 `;
 
-// ── Inline style tag ──────────────────────────────────────────────────────────
-
 function StyleTag() {
   return <style dangerouslySetInnerHTML={{ __html: STYLES }} />;
 }
-
-// ── Types ─────────────────────────────────────────────────────────────────────
 
 type Screen =
   | 'welcome'
@@ -299,8 +287,6 @@ const INIT: AppState = {
   recentTxs: [],
 };
 
-// ── Icons ─────────────────────────────────────────────────────────────────────
-
 const Icons = {
   Home: () => (
     <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -356,8 +342,6 @@ const Icons = {
   ),
 };
 
-// ── QR Code component ─────────────────────────────────────────────────────────
-
 function QRCode({ data, size = 200 }: { data: string; size?: number }) {
   const canvasRef = useRef<HTMLDivElement>(null);
 
@@ -387,8 +371,6 @@ function QRCode({ data, size = 200 }: { data: string; size?: number }) {
     />
   );
 }
-
-// ── Shared UI components ──────────────────────────────────────────────────────
 
 function Input({
   label,
@@ -524,8 +506,6 @@ function SuccessBox({ message }: { message: string }) {
   );
 }
 
-// ── Navbar ────────────────────────────────────────────────────────────────────
-
 function Navbar({
   screen,
   onNavigate,
@@ -557,9 +537,6 @@ function Navbar({
   );
 }
 
-// ── Screens ───────────────────────────────────────────────────────────────────
-
-// Welcome
 function WelcomeScreen({ onNavigate }: { onNavigate: (s: Screen) => void }) {
   return (
     <div className="flex flex-col h-full">
@@ -596,7 +573,6 @@ function WelcomeScreen({ onNavigate }: { onNavigate: (s: Screen) => void }) {
   );
 }
 
-// Create wallet — generate seed
 function CreateScreen({
   onBack,
   onDone,
@@ -609,7 +585,7 @@ function CreateScreen({
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    // Generate a temporary mnemonic to display before password is set
+
     (async () => {
       const seed = generateSeed();
       const words = await seedToMnemonic(seed);
@@ -666,7 +642,6 @@ function CreateScreen({
   );
 }
 
-// Import wallet
 function ImportScreen({
   onBack,
   onDone,
@@ -698,7 +673,6 @@ function ImportScreen({
   );
 }
 
-// Set password
 function SetPasswordScreen({
   onBack,
   onDone,
@@ -726,7 +700,7 @@ function SetPasswordScreen({
 
     let resp: ExtResponse;
     if (createMode && mnemonic) {
-      // Create using the displayed mnemonic words
+
       resp = await sendMsg('EGO_IMPORT_WALLET', { input: mnemonic.join(' '), password });
     } else if (!createMode && importInput) {
       resp = await sendMsg('EGO_IMPORT_WALLET', { input: importInput, password });
@@ -775,7 +749,6 @@ function SetPasswordScreen({
   );
 }
 
-// Unlock
 function UnlockScreen({ onUnlocked }: { onUnlocked: () => void }) {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -830,7 +803,6 @@ function UnlockScreen({ onUnlocked }: { onUnlocked: () => void }) {
   );
 }
 
-// Home
 function HomeScreen({
   state,
   onRefresh,
@@ -869,7 +841,7 @@ function HomeScreen({
 
   return (
     <div className="flex flex-col h-full min-h-0">
-      {/* Network badge + node status */}
+      {}
       <div className="flex items-center justify-between px-4 py-2 bg-gray-800 border-b border-gray-700">
         <span className="text-xs font-medium" style={{ color: nodeOnline ? '#4ade80' : '#f87171' }}>
           {nodeOnline ? '● ' : '○ '}{networkLabel}
@@ -880,7 +852,7 @@ function HomeScreen({
       </div>
 
       <div className="flex-1 overflow-y-auto">
-        {/* Balance card */}
+        {}
         <div className="mx-4 mt-4 rounded-xl p-5 text-center" style={{
           background: 'linear-gradient(135deg, #1e3a8a, #1e1b4b)',
           border: '1px solid #2563eb',
@@ -891,7 +863,7 @@ function HomeScreen({
           <p className="text-xs text-gray-500 mt-1">{state.balanceUegoc.toLocaleString()} uEGOC</p>
         </div>
 
-        {/* Address */}
+        {}
         <div className="mx-4 mt-3 rounded-xl p-3" style={{ background: '#1f2937', border: '1px solid #374151' }}>
           <div className="flex items-center justify-between">
             <div>
@@ -908,7 +880,7 @@ function HomeScreen({
           </div>
         </div>
 
-        {/* Faucet (testnet only) */}
+        {}
         {state.network === 'testnet' && (
           <div className="mx-4 mt-2">
             <button
@@ -941,7 +913,7 @@ function HomeScreen({
           </div>
         )}
 
-        {/* Recent transactions */}
+        {}
         <div className="mx-4 mt-4 mb-4">
           <div className="flex items-center justify-between mb-2">
             <p className="text-sm font-semibold text-gray-300">Recent Transactions</p>
@@ -977,7 +949,6 @@ function HomeScreen({
   );
 }
 
-// Send
 function SendScreen({
   address,
   onBack,
@@ -1048,7 +1019,6 @@ function SendScreen({
   );
 }
 
-// Receive
 function ReceiveScreen({ address, onBack }: { address: string; onBack: () => void }) {
   const [copied, setCopied] = useState(false);
 
@@ -1080,7 +1050,6 @@ function ReceiveScreen({ address, onBack }: { address: string; onBack: () => voi
   );
 }
 
-// Activity
 function ActivityScreen({ txs, onRefresh }: { txs: AppState['recentTxs']; onRefresh: () => void }) {
   return (
     <div className="flex flex-col h-full">
@@ -1122,7 +1091,6 @@ function ActivityScreen({ txs, onRefresh }: { txs: AppState['recentTxs']; onRefr
   );
 }
 
-// Settings
 function SettingsScreen({
   state,
   onLock,
@@ -1163,7 +1131,7 @@ function SettingsScreen({
     <div className="flex flex-col h-full">
       <Header title="Settings" />
       <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4">
-        {/* Network */}
+        {}
         <div className="rounded-xl p-4" style={{ background: '#1f2937', border: '1px solid #374151' }}>
           <p className="text-sm font-semibold text-gray-200 mb-3">Network</p>
           <div className="flex gap-2">
@@ -1190,7 +1158,7 @@ function SettingsScreen({
           </div>
         </div>
 
-        {/* Address */}
+        {}
         <div className="rounded-xl p-4" style={{ background: '#1f2937', border: '1px solid #374151' }}>
           <div className="flex items-center justify-between mb-1">
             <p className="text-sm font-semibold text-gray-200">Your Address</p>
@@ -1204,7 +1172,7 @@ function SettingsScreen({
           <p className="font-mono text-xs text-gray-400 break-all">{state.address}</p>
         </div>
 
-        {/* Recovery phrase */}
+        {}
         <div className="rounded-xl p-4" style={{ background: '#1f2937', border: '1px solid #374151' }}>
           <p className="text-sm font-semibold text-gray-200 mb-2">Recovery Phrase</p>
           {!showPhrase ? (
@@ -1242,19 +1210,18 @@ function SettingsScreen({
           )}
         </div>
 
-        {/* Lock */}
+        {}
         <Button variant="danger" onClick={onLock}>
           Lock Wallet
         </Button>
 
-        {/* Version */}
+        {}
         <p className="text-xs text-gray-600 text-center">Ego Wallet v1.0.0 · MV3</p>
       </div>
     </div>
   );
 }
 
-// dApp Connect
 function DAppConnectScreen({
   conn,
   onApprove,
@@ -1295,17 +1262,12 @@ function DAppConnectScreen({
   );
 }
 
-// ── Root App ──────────────────────────────────────────────────────────────────
-
 export default function App() {
   const [state, dispatch] = useReducer(reducer, INIT);
 
-  // Wizard state
   const [wizardMnemonic, setWizardMnemonic] = useState<string[]>([]);
   const [importInput, setImportInput] = useState('');
   const [wizardMode, setWizardMode] = useState<'create' | 'import'>('create');
-
-  // ── On mount: check wallet state ──────────────────────────────────────────
 
   const loadState = useCallback(async () => {
     const resp = await sendMsg<{
@@ -1347,8 +1309,6 @@ export default function App() {
 
   useEffect(() => { loadState(); }, [loadState]);
 
-  // ── Data loaders ──────────────────────────────────────────────────────────
-
   async function loadBalance(addr?: string, net?: 'testnet' | 'mainnet') {
     const resp = await sendMsg<{ balance_egoc: number; balance_uegoc: number }>('EGO_GET_BALANCE');
     if (resp.success && resp.data) {
@@ -1376,14 +1336,10 @@ export default function App() {
     loadNodeHealth();
   }
 
-  // ── Navigation ────────────────────────────────────────────────────────────
-
   function navigate(screen: Screen) {
     dispatch({ type: 'SET_SCREEN', screen });
     if (screen === 'home') refreshAll();
   }
-
-  // ── Lock / Unlock ─────────────────────────────────────────────────────────
 
   async function handleLock() {
     await sendMsg('EGO_LOCK');
@@ -1394,14 +1350,10 @@ export default function App() {
     await loadState();
   }
 
-  // ── Network change ────────────────────────────────────────────────────────
-
   async function handleNetworkChange(network: 'testnet' | 'mainnet') {
     await sendMsg('EGO_SET_NETWORK', { network });
     dispatch({ type: 'SET_WALLET', address: state.address, network });
   }
-
-  // ── dApp connect ──────────────────────────────────────────────────────────
 
   async function handleApproveConn() {
     if (!state.pendingConnection) return;
@@ -1417,13 +1369,9 @@ export default function App() {
     navigate('home');
   }
 
-  // ── Wizard callbacks ──────────────────────────────────────────────────────
-
   function handleWizardDone() {
     loadState();
   }
-
-  // ── Loading splash ────────────────────────────────────────────────────────
 
   if (state.loading) {
     return (
@@ -1437,20 +1385,18 @@ export default function App() {
     );
   }
 
-  // ── Main render ───────────────────────────────────────────────────────────
-
   const isWalletScreen = ['home', 'send', 'receive', 'activity', 'settings', 'dappConnect'].includes(state.screen);
 
   return (
     <>
       <StyleTag />
       <div className="flex flex-col h-full bg-gray-900 text-white overflow-hidden">
-        {/* Header for wallet screens */}
+        {}
         {isWalletScreen && state.screen !== 'send' && state.screen !== 'receive' && state.screen !== 'dappConnect' && state.screen !== 'settings' && state.screen !== 'activity' && (
           <Header title="Ego Wallet" onLock={handleLock} />
         )}
 
-        {/* Screen content */}
+        {}
         <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
           {state.screen === 'welcome' && (
             <WelcomeScreen onNavigate={s => dispatch({ type: 'SET_SCREEN', screen: s })} />
@@ -1533,7 +1479,7 @@ export default function App() {
           )}
         </div>
 
-        {/* Bottom navbar — only on main wallet screens */}
+        {}
         {['home', 'send', 'receive', 'activity', 'settings'].includes(state.screen) && (
           <Navbar screen={state.screen} onNavigate={navigate} />
         )}

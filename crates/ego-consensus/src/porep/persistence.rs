@@ -1,10 +1,3 @@
-// porep/persistence.rs — Persistent storage for PoRep sector lifecycle states
-//
-// This module provides persistence for sector states, sealing jobs, and commitments
-// to ensure that PoRep operations can survive node restarts and recover gracefully.
-//
-// Storage Format: RocksDB with separate column families for different data types
-
 use super::{SealingJob, SealingStatus, SectorCommitment};
 use crate::error::{PoCError, PoCResult};
 use super::prover::SectorState;
@@ -16,21 +9,18 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info, warn, error};
 
-// Column family names for different data types
 const CF_SECTORS: &str = "sectors";
 const CF_SEALING_JOBS: &str = "sealing_jobs";
 const CF_COMMITMENTS: &str = "commitments";
 const CF_SUBMITTED_PROOFS: &str = "submitted_proofs";
 const CF_METADATA: &str = "metadata";
 
-/// Persistent storage manager for PoRep sector states
 #[derive(Debug)]
 pub struct PoRepPersistence {
     db: Arc<DB>,
     prover_id: Address,
 }
 
-/// Serializable sector state for persistence
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct PersistentSectorState {
     pub sector_id: u64,
@@ -79,7 +69,6 @@ impl From<PersistentSectorState> for SectorState {
     }
 }
 
-/// Metadata for recovery and validation
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct PoRepMetadata {
     pub prover_id: Address,
@@ -90,19 +79,17 @@ pub struct PoRepMetadata {
 }
 
 impl PoRepPersistence {
-    /// Create new persistence manager with RocksDB backend
+
     pub fn new<P: AsRef<Path>>(db_path: P, prover_id: Address) -> PoCResult<Self> {
         info!("Initializing PoRep persistence at path: {:?}", db_path.as_ref());
 
-        // Configure RocksDB options
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
         db_opts.set_max_open_files(1000);
-        db_opts.set_use_fsync(false); // Better performance
-        db_opts.set_bytes_per_sync(1048576); // 1MB
+        db_opts.set_use_fsync(false);
+        db_opts.set_bytes_per_sync(1048576);
 
-        // Define column families
         let cfs = vec![
             ColumnFamilyDescriptor::new(CF_SECTORS, Options::default()),
             ColumnFamilyDescriptor::new(CF_SEALING_JOBS, Options::default()),
@@ -119,21 +106,19 @@ impl PoRepPersistence {
             prover_id,
         };
 
-        // Initialize metadata if not exists
         persistence.initialize_metadata()?;
 
         info!("✅ PoRep persistence initialized successfully");
         Ok(persistence)
     }
 
-    /// Initialize or update metadata
     fn initialize_metadata(&self) -> PoCResult<()> {
         let cf = self.get_cf(CF_METADATA)?;
         let key = b"metadata";
 
         let metadata = match self.db.get_cf(cf, key) {
             Ok(Some(data)) => {
-                // Existing metadata - validate prover ID
+
                 let existing: PoRepMetadata = bincode::decode_from_slice(&data, bincode::config::standard()).map(|(v, _)| v)
                     .map_err(|e| PoCError::SerializationError(format!("Failed to decode metadata: {}", e)))?;
 
@@ -144,7 +129,7 @@ impl PoRepPersistence {
                 existing
             }
             Ok(None) => {
-                // New database
+
                 PoRepMetadata {
                     prover_id: self.prover_id,
                     last_backup: Timestamp::now(),
@@ -158,7 +143,6 @@ impl PoRepPersistence {
             }
         };
 
-        // Update backup timestamp
         let updated_metadata = PoRepMetadata {
             last_backup: Timestamp::now(),
             ..metadata
@@ -175,7 +159,6 @@ impl PoRepPersistence {
         Ok(())
     }
 
-    /// Get column family handle
     fn get_cf(&self, cf_name: &str) -> PoCResult<&ColumnFamily> {
         self.db.cf_handle(cf_name)
             .ok_or_else(|| PoCError::EvidenceStorageFailed(
@@ -183,7 +166,6 @@ impl PoRepPersistence {
             ))
     }
 
-    /// Save sector state to persistent storage
     pub fn save_sector_state(&self, sector_state: &SectorState) -> PoCResult<()> {
         let cf = self.get_cf(CF_SECTORS)?;
         let key = sector_state.sector_id.to_le_bytes();
@@ -199,7 +181,6 @@ impl PoRepPersistence {
         Ok(())
     }
 
-    /// Load sector state from persistent storage
     pub fn load_sector_state(&self, sector_id: u64) -> PoCResult<Option<SectorState>> {
         let cf = self.get_cf(CF_SECTORS)?;
         let key = sector_id.to_le_bytes();
@@ -217,7 +198,6 @@ impl PoRepPersistence {
         }
     }
 
-    /// Remove sector state from storage
     pub fn delete_sector_state(&self, sector_id: u64) -> PoCResult<()> {
         let cf = self.get_cf(CF_SECTORS)?;
         let key = sector_id.to_le_bytes();
@@ -229,7 +209,6 @@ impl PoRepPersistence {
         Ok(())
     }
 
-    /// Load all sector states from storage
     pub fn load_all_sector_states(&self) -> PoCResult<HashMap<u64, SectorState>> {
         let cf = self.get_cf(CF_SECTORS)?;
         let mut sectors = HashMap::new();
@@ -254,7 +233,6 @@ impl PoRepPersistence {
         Ok(sectors)
     }
 
-    /// Save sealing job queue to storage
     pub fn save_sealing_queue(&self, queue: &VecDeque<SealingJob>) -> PoCResult<()> {
         let cf = self.get_cf(CF_SEALING_JOBS)?;
         let key = b"sealing_queue";
@@ -270,7 +248,6 @@ impl PoRepPersistence {
         Ok(())
     }
 
-    /// Load sealing job queue from storage
     pub fn load_sealing_queue(&self) -> PoCResult<VecDeque<SealingJob>> {
         let cf = self.get_cf(CF_SEALING_JOBS)?;
         let key = b"sealing_queue";
@@ -292,7 +269,6 @@ impl PoRepPersistence {
         }
     }
 
-    /// Save sector commitments to storage
     pub fn save_commitment(&self, sector_id: u64, commitment: &SectorCommitment) -> PoCResult<()> {
         let cf = self.get_cf(CF_COMMITMENTS)?;
         let key = sector_id.to_le_bytes();
@@ -307,7 +283,6 @@ impl PoRepPersistence {
         Ok(())
     }
 
-    /// Load all sector commitments from storage
     pub fn load_all_commitments(&self) -> PoCResult<HashMap<u64, SectorCommitment>> {
         let cf = self.get_cf(CF_COMMITMENTS)?;
         let mut commitments = HashMap::new();
@@ -332,7 +307,6 @@ impl PoRepPersistence {
         Ok(commitments)
     }
 
-    /// Save submitted proofs hash set
     pub fn save_submitted_proofs(&self, submitted: &HashSet<Hash>) -> PoCResult<()> {
         let cf = self.get_cf(CF_SUBMITTED_PROOFS)?;
         let key = b"submitted_proofs";
@@ -348,7 +322,6 @@ impl PoRepPersistence {
         Ok(())
     }
 
-    /// Load submitted proofs hash set
     pub fn load_submitted_proofs(&self) -> PoCResult<HashSet<Hash>> {
         let cf = self.get_cf(CF_SUBMITTED_PROOFS)?;
         let key = b"submitted_proofs";
@@ -370,7 +343,6 @@ impl PoRepPersistence {
         }
     }
 
-    /// Periodic backup of in-memory state to disk
     pub fn backup_state(
         &self,
         active_sectors: &HashMap<u64, SectorState>,
@@ -380,38 +352,32 @@ impl PoRepPersistence {
     ) -> PoCResult<()> {
         info!("🔄 Starting periodic state backup...");
 
-        // Save all active sectors
         for (sector_id, sector_state) in active_sectors {
             if let Err(e) = self.save_sector_state(sector_state) {
                 error!("Failed to backup sector {}: {}", sector_id, e);
             }
         }
 
-        // Save sealing queue
         if let Err(e) = self.save_sealing_queue(sealing_queue) {
             error!("Failed to backup sealing queue: {}", e);
         }
 
-        // Save commitments
         for (sector_id, commitment) in commitments {
             if let Err(e) = self.save_commitment(*sector_id, commitment) {
                 error!("Failed to backup commitment for sector {}: {}", sector_id, e);
             }
         }
 
-        // Save submitted proofs
         if let Err(e) = self.save_submitted_proofs(submitted_proofs) {
             error!("Failed to backup submitted proofs: {}", e);
         }
 
-        // Update metadata
         self.update_backup_metadata(active_sectors.len() as u64)?;
 
         info!("✅ State backup completed successfully");
         Ok(())
     }
 
-    /// Update backup metadata
     fn update_backup_metadata(&self, active_sectors: u64) -> PoCResult<()> {
         let cf = self.get_cf(CF_METADATA)?;
         let key = b"metadata";
@@ -420,7 +386,7 @@ impl PoRepPersistence {
             prover_id: self.prover_id,
             last_backup: Timestamp::now(),
             version: 1,
-            total_sectors: active_sectors, // Simplified for this implementation
+            total_sectors: active_sectors,
             active_sectors,
         };
 
@@ -433,7 +399,6 @@ impl PoRepPersistence {
         Ok(())
     }
 
-    /// Restore complete state from storage
     pub fn restore_state(&self) -> PoCResult<PoRepRestoredState> {
         info!("🔄 Restoring PoRep state from persistent storage...");
 
@@ -458,7 +423,6 @@ impl PoRepPersistence {
         Ok(restored_state)
     }
 
-    /// Clean up old completed sectors (retention policy)
     pub fn cleanup_completed_sectors(&self, older_than: Timestamp) -> PoCResult<u32> {
         info!("🧹 Cleaning up completed sectors older than {}", older_than);
         let cf = self.get_cf(CF_SECTORS)?;
@@ -479,13 +443,11 @@ impl PoRepPersistence {
             let persistent: PersistentSectorState = bincode::decode_from_slice(&value_bytes, bincode::config::standard()).map(|(v, _)| v)
                 .map_err(|e| PoCError::SerializationError(format!("Failed to decode sector during cleanup: {}", e)))?;
 
-            // Check if sector is old enough and completed (high proof count indicates completion)
             if persistent.created_at < older_than && persistent.proof_count > 100 {
                 sectors_to_delete.push(sector_id);
             }
         }
 
-        // Delete the identified sectors
         for sector_id in sectors_to_delete {
             if let Err(e) = self.delete_sector_state(sector_id) {
                 warn!("Failed to delete old sector {}: {}", sector_id, e);
@@ -498,7 +460,6 @@ impl PoRepPersistence {
         Ok(deleted_count)
     }
 
-    /// Get storage statistics
     pub fn get_stats(&self) -> PoCResult<PoRepStorageStats> {
         let sectors_cf = self.get_cf(CF_SECTORS)?;
         let commitments_cf = self.get_cf(CF_COMMITMENTS)?;
@@ -510,7 +471,6 @@ impl PoRepPersistence {
             last_backup: Timestamp::now(),
         };
 
-        // Count sectors
         let sectors_iter = self.db.iterator_cf(&sectors_cf, rocksdb::IteratorMode::Start);
         for item in sectors_iter {
             if item.is_ok() {
@@ -518,7 +478,6 @@ impl PoRepPersistence {
             }
         }
 
-        // Count commitments
         let commitments_iter = self.db.iterator_cf(&commitments_cf, rocksdb::IteratorMode::Start);
         for item in commitments_iter {
             if item.is_ok() {
@@ -526,7 +485,6 @@ impl PoRepPersistence {
             }
         }
 
-        // Get metadata for last backup time
         if let Ok(cf) = self.get_cf(CF_METADATA) {
             if let Ok(Some(data)) = self.db.get_cf(cf, b"metadata") {
                 if let Ok((metadata, _)) = bincode::decode_from_slice::<PoRepMetadata, _>(&data, bincode::config::standard()) {
@@ -539,7 +497,6 @@ impl PoRepPersistence {
     }
 }
 
-/// Complete restored state from persistence
 #[derive(Debug)]
 pub struct PoRepRestoredState {
     pub active_sectors: HashMap<u64, SectorState>,
@@ -548,7 +505,6 @@ pub struct PoRepRestoredState {
     pub submitted_proofs: HashSet<Hash>,
 }
 
-/// Storage statistics for monitoring
 #[derive(Debug, Clone)]
 pub struct PoRepStorageStats {
     pub total_sectors: u64,
@@ -593,7 +549,6 @@ mod tests {
             last_challenged_at: Some(Timestamp::now()),
         };
 
-        // Save and load
         persistence.save_sector_state(&sector_state).unwrap();
         let loaded = persistence.load_sector_state(12345).unwrap().unwrap();
 

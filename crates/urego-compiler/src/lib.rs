@@ -1,27 +1,3 @@
-//! Urego smart contract compiler.
-//!
-//! Compiles Urego source code to WebAssembly bytecode (.wasm) compatible
-//! with the ego-vm Wasmtime executor.
-//!
-//! # Example
-//! ```rust
-//! let wasm = urego_compiler::compile(r#"
-//!     contract Counter {
-//!         fn init(start: u64) {
-//!             storage.set("count", start);
-//!         }
-//!         fn increment() {
-//!             let v: u64 = storage.get_u64("count");
-//!             storage.set("count", v + 1);
-//!         }
-//!         fn get() -> u64 {
-//!             return storage.get_u64("count");
-//!         }
-//!     }
-//! "#).unwrap();
-//! assert!(!wasm.is_empty());
-//! ```
-
 pub mod ast;
 pub mod codegen;
 pub mod error;
@@ -33,7 +9,6 @@ use error::Result;
 use lexer::lex;
 use parser::Parser;
 
-/// Compile Urego source to WASM bytes.
 pub fn compile(source: &str) -> Result<Vec<u8>> {
     let tokens   = lex(source)?;
     let mut p    = Parser::new(tokens);
@@ -43,7 +18,6 @@ pub fn compile(source: &str) -> Result<Vec<u8>> {
     wat::parse_str(&wat).map_err(|e| error::CompileError::WatError(e.to_string()))
 }
 
-/// Compile to WAT text (useful for debugging).
 pub fn compile_to_wat(source: &str) -> Result<String> {
     let tokens   = lex(source)?;
     let mut p    = Parser::new(tokens);
@@ -94,7 +68,7 @@ mod tests {
     fn test_counter_compiles() {
         let wasm = compile(COUNTER).expect("counter should compile");
         assert!(!wasm.is_empty());
-        // WASM magic bytes
+
         assert_eq!(&wasm[0..4], b"\0asm");
     }
 

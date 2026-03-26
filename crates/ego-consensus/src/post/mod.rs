@@ -10,41 +10,34 @@ use ego_core::crypto::hash_multiple;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 
-// ─── PoSt result ─────────────────────────────────────────────────────────────
-
-/// Outcome of a single WindowPoSt window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub enum PoStResult {
-    /// Proof submitted on time and verified
+
     Pass,
-    /// Window deadline missed — no proof submitted
+
     Miss,
-    /// Proof submitted but failed verification
+
     Fault,
 }
 
-// ─── PoSt event (on-chain record) ────────────────────────────────────────────
-
-/// Emitted once per WindowPoSt window per node.
-/// Consumed by the DRS scorer and the slashing engine.
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct PoStEvent {
     pub event_id: Hash,
     pub node_addr: Address,
     pub epoch: u64,
     pub window_id: u64,
-    /// Partition IDs proven in this window
+
     pub partition_ids: Vec<u64>,
-    /// Merkle root of the challenge set
+
     pub challenges_root: Hash,
-    /// Hash of the proof submitted (or zero-hash on Miss)
+
     pub proof_hash: Hash,
     pub result: PoStResult,
-    /// Proof submission latency in ms (0 on Miss/Fault)
+
     pub latency_ms: u64,
-    /// Optional IPFS CID for proof archival
+
     pub cid_hint: Option<String>,
-    /// Algorithm ID: 1 = Ed25519 placeholder, 2 = Dilithium-2
+
     pub alg_sig_id: u8,
     pub node_sig: Signature,
     pub ts_ms: u64,
@@ -145,20 +138,17 @@ impl PoStEvent {
     }
 }
 
-// ─── WindowPoSt window ───────────────────────────────────────────────────────
-
-/// A single assigned proving window for a storage node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoStWindow {
     pub window_id: u64,
     pub epoch: u64,
-    /// Partitions (sector groups) that must be proven in this window
+
     pub required_partitions: Vec<u64>,
-    /// VRF-derived challenge seed: R_e = H(vrf_output || deal_id || epoch)
+
     pub challenge_seed: Hash,
     pub open_at_ms: u64,
     pub close_at_ms: u64,
-    /// Proof hashes submitted for this window
+
     pub submitted_proofs: Vec<Hash>,
 }
 
@@ -200,8 +190,6 @@ impl PoStWindow {
         !self.submitted_proofs.is_empty()
     }
 
-    /// Derive partition-specific challenge indices from the window seed.
-    /// challenge_i = H(challenge_seed || partition_id || i) mod sector_count
     pub fn generate_partition_challenges(
         &self,
         partition_id: u64,
@@ -227,9 +215,6 @@ impl PoStWindow {
     }
 }
 
-// ─── Window schedule ─────────────────────────────────────────────────────────
-
-/// Full set of windows assigned to one node for one epoch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowSchedule {
     pub node_addr: Address,
@@ -239,8 +224,7 @@ pub struct WindowSchedule {
 }
 
 impl WindowSchedule {
-    /// Deterministic schedule derived from node address, epoch, and sector count.
-    /// Each node gets `windows_per_day` windows spread evenly across the epoch.
+
     pub fn generate_deterministic_schedule(
         node_addr: Address,
         epoch: u64,
@@ -263,7 +247,6 @@ impl WindowSchedule {
                 b"ego/post/window/v1",
             ]);
 
-            // Distribute remainder one-per-window to first `remainder` windows
             let count = base + if idx < remainder { 1 } else { 0 };
             let partitions: Vec<u64> = (sector_cursor..sector_cursor + count).map(|s| s as u64).collect();
             sector_cursor += count;
@@ -291,9 +274,6 @@ impl WindowSchedule {
     }
 }
 
-// ─── Partition proof ─────────────────────────────────────────────────────────
-
-/// Proof for one partition within a WindowPoSt window.
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct PartitionProof {
     pub partition_id: u64,
@@ -318,9 +298,6 @@ impl PartitionProof {
     }
 }
 
-// ─── PoSt proof ──────────────────────────────────────────────────────────────
-
-/// Aggregated proof for a full WindowPoSt window.
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct PoStProof {
     pub proof_id: Hash,
@@ -388,21 +365,18 @@ impl PoStProof {
     }
 }
 
-// ─── Metrics ─────────────────────────────────────────────────────────────────
-
-/// Accumulated PoSt proving metrics — fed into DRS scorer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoStMetrics {
     pub windows_proven: u64,
     pub windows_missed: u64,
     pub windows_faulted: u64,
-    /// Rolling average latency
+
     pub avg_latency_ms: f64,
-    /// P50 latency (updated periodically)
+
     pub p50_latency_ms: u64,
-    /// P95 latency
+
     pub p95_latency_ms: u64,
-    /// Pass rate = proven / (proven + missed + faulted)
+
     pub pass_rate: f64,
     pub last_updated: Timestamp,
 }
@@ -433,8 +407,6 @@ impl Default for PoStMetrics {
     }
 }
 
-// ─── Provider trait ──────────────────────────────────────────────────────────
-
 pub trait PoStProvider: Send + Sync {
     fn provider_id(&self) -> Address;
 
@@ -456,9 +428,6 @@ pub trait PoStProvider: Send + Sync {
     fn get_proving_metrics(&self) -> PoStMetrics;
 }
 
-// ─── Triad health ─────────────────────────────────────────────────────────────
-
-/// RF=3 replica set health — all three nodes must be healthy for a deal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TriadHealth {
     pub deal_id: Hash,
@@ -483,13 +452,12 @@ impl TriadHealth {
         }
     }
 
-    /// Update health after a PoSt event from one of the triad members.
     pub fn record_post_event(&mut self, node_addr: Address, result: &PoStResult) {
         for (i, &node) in self.nodes.iter().enumerate() {
             if node == node_addr {
                 match result {
                     PoStResult::Pass => {
-                        // Exponential moving average
+
                         self.node_pass_rates[i] =
                             self.node_pass_rates[i] * 0.9 + 0.1;
                     }
@@ -508,8 +476,6 @@ impl TriadHealth {
         self.last_updated = Timestamp::now();
     }
 }
-
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -542,7 +508,6 @@ mod tests {
         assert_eq!(schedule.assigned_windows.len(), 48);
         assert_eq!(schedule.epoch, 100);
 
-        // All windows should cover distinct partitions summing to 1000
         let total: usize = schedule
             .assigned_windows
             .iter()
@@ -595,7 +560,6 @@ mod tests {
         let mut health = TriadHealth::new(deal_id, nodes);
         assert!(health.is_healthy);
 
-        // Record many misses for node 0
         for _ in 0..20 {
             health.record_post_event(nodes[0], &PoStResult::Miss);
         }

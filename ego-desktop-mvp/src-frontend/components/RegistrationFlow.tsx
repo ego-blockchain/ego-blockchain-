@@ -21,7 +21,6 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
   const [checked, setChecked]   = useState(false);
   const otpRefs = useRef<(HTMLInputElement | null)[]>([]);
 
-  // ── Step 1: Send OTP ─────────────────────────────────────────────────────
   async function handleSendOtp() {
     if (!name.trim() || !email.trim()) { setError('Please enter your name and email.'); return; }
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { setError('Please enter a valid email address.'); return; }
@@ -41,7 +40,6 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
     }
   }
 
-  // ── Step 2: Verify OTP ───────────────────────────────────────────────────
   async function handleVerifyOtp() {
     const code = otp.join('');
     if (code.length !== 6) { setError('Please enter the full code (4 digits + 2 letters).'); return; }
@@ -49,9 +47,9 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
     try {
       const ok = await invoke<boolean>('verify_email_code', { email: email.trim(), code });
       if (!ok) { setError('Incorrect or expired code. Please try again.'); setLoading(false); return; }
-      // Save registration info to ledger
+
       await invoke('save_registration_info', { name: name.trim(), email: email.trim() });
-      // Load recovery phrase
+
       await loadRecovery();
     } catch (e) {
       setError('Verification failed: ' + String(e));
@@ -78,7 +76,7 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
   }
 
   function handleOtpInput(i: number, val: string) {
-    // Any position can be a digit or letter — auto-uppercase letters.
+
     const v = val.replace(/[^0-9a-zA-Z]/g, '').slice(-1).toUpperCase();
     const next = [...otp]; next[i] = v; setOtp(next);
     if (v && i < 5) otpRefs.current[i + 1]?.focus();
@@ -113,12 +111,11 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
     onComplete();
   }
 
-  // ── Step: Form ───────────────────────────────────────────────────────────
   if (step === 'form') return (
     <div className="min-h-screen bg-gray-900 flex items-center justify-center p-6">
       <div className="w-full max-w-md bg-gray-800 rounded-2xl shadow-2xl overflow-hidden border border-gray-700">
         <div className="px-8 py-6 border-b border-gray-700 bg-gradient-to-br from-blue-900/40 to-purple-900/40">
-          <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-2xl font-black mx-auto mb-3 select-none">E</div>
+          <img src="/ego_logo.png" alt="Ego" className="w-20 h-20 mx-auto mb-3 select-none rounded-full" draggable={false} />
           <h1 className="text-xl font-bold text-white text-center">Welcome to Ego Blockchain</h1>
           <p className="text-sm text-gray-400 mt-1 text-center">Step 1 of 3 — Create Your Account</p>
         </div>
@@ -233,7 +230,6 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
     </div>
   );
 
-  // ── Step: Recovery phrase ────────────────────────────────────────────────
   if (step === 'recovery') return (
     <div className="min-h-screen bg-gray-900 flex items-center justify-center p-6">
       <div className="w-full max-w-lg bg-gray-800 rounded-2xl shadow-2xl overflow-hidden border border-gray-700">

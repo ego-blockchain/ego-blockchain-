@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Outlet, NavLink } from 'react-router-dom';
+import { Outlet, NavLink, useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/tauri';
+import { listen } from '@tauri-apps/api/event';
 import { useWallet, useTheme } from '../App';
 import TitleBar from './TitleBar';
 
@@ -15,7 +16,9 @@ const NAV_ITEMS = [
   { path: '/explorer',  label: 'Explorer',  icon: '🔍', desc: 'Blocks & txs' },
   { path: '/contracts', label: 'Contracts', icon: '📜', desc: 'Deploy & interact' },
   { path: '/ide',       label: 'dApp IDE',  icon: '🧑‍💻', desc: 'Write & deploy contracts' },
-  { path: '/settings',  label: 'Settings',  icon: '⚙️',  desc: 'Preferences' },
+  { path: '/market',      label: 'Market',      icon: '📊', desc: 'Prices & charts' },
+  { path: '/governance',  label: 'Governance',  icon: '🗳️', desc: 'DAO voting' },
+  { path: '/settings',    label: 'Settings',    icon: '⚙️',  desc: 'Preferences' },
 ];
 
 function truncAddr(addr: string): string {
@@ -32,7 +35,6 @@ const WalletSwitcher: React.FC = () => {
   const [error, setError]       = useState('');
   const dropRef = useRef<HTMLDivElement>(null);
 
-  // Close dropdown when clicking outside
   useEffect(() => {
     if (!open) return;
     function handle(e: MouseEvent) {
@@ -106,7 +108,7 @@ const WalletSwitcher: React.FC = () => {
 
   return (
     <div className="relative px-3 py-2 border-b border-gray-700" ref={dropRef}>
-      {/* Trigger button */}
+      {}
       <button
         onClick={() => { setOpen(o => !o); setCreating(false); setError(''); }}
         className="w-full flex items-center gap-2.5 px-2 py-2 rounded-xl hover:bg-gray-700 transition-colors text-left group"
@@ -117,17 +119,16 @@ const WalletSwitcher: React.FC = () => {
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5">
             <span className="text-xs font-semibold text-white leading-tight truncate">{displayName}</span>
-            <span className="text-yellow-400 text-[9px] font-bold bg-yellow-400/15 px-1 py-px rounded shrink-0">TEST</span>
           </div>
           <div className="text-xs text-gray-500 font-mono leading-tight">{truncAddr(displayAddr)}</div>
         </div>
         <span className="text-gray-500 text-xs">{open ? '▲' : '▼'}</span>
       </button>
 
-      {/* Dropdown */}
+      {}
       {open && (
         <div className="absolute left-2 right-2 top-full mt-1 bg-gray-800 border border-gray-600 rounded-xl shadow-2xl z-50 overflow-hidden">
-          {/* Header */}
+          {}
           <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between">
             <span className="text-xs text-gray-400 font-medium">{walletCount} / 6 wallets</span>
             {walletCount < 6 && (
@@ -140,7 +141,7 @@ const WalletSwitcher: React.FC = () => {
             )}
           </div>
 
-          {/* Create form */}
+          {}
           {creating && (
             <div className="px-3 py-2 border-b border-gray-700 space-y-2">
               <input
@@ -161,7 +162,7 @@ const WalletSwitcher: React.FC = () => {
             </div>
           )}
 
-          {/* Wallet list */}
+          {}
           <div className="max-h-56 overflow-y-auto">
             {registry?.wallets.map(w => {
               const isActive = w.id === registry.active_id;
@@ -170,7 +171,7 @@ const WalletSwitcher: React.FC = () => {
                   key={w.id}
                   className={`flex items-center gap-2 px-3 py-2.5 group hover:bg-gray-700/50 transition-colors ${isActive ? 'bg-blue-600/10' : ''}`}
                 >
-                  {/* Switch on row click */}
+                  {}
                   <button
                     className="flex items-center gap-2 flex-1 min-w-0 text-left"
                     onClick={() => switchTo(w.id)}
@@ -182,14 +183,13 @@ const WalletSwitcher: React.FC = () => {
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-1.5">
                         <span className={`text-xs font-medium leading-tight truncate ${isActive ? 'text-blue-300' : 'text-gray-200'}`}>{w.name}</span>
-                        <span className="text-yellow-400 text-[9px] font-bold bg-yellow-400/15 px-1 py-px rounded shrink-0">TEST</span>
                       </div>
                       <div className="text-xs text-gray-500 font-mono leading-tight">{truncAddr(w.address)}</div>
                     </div>
                     {isActive && <span className="text-blue-400 text-xs shrink-0">✓</span>}
                   </button>
 
-                  {/* Delete (only for non-active) */}
+                  {}
                   {!isActive && walletCount > 1 && (
                     <button
                       onClick={() => deleteWallet(w.id)}
@@ -205,7 +205,7 @@ const WalletSwitcher: React.FC = () => {
             })}
           </div>
 
-          {/* Error */}
+          {}
           {error && (
             <div className="px-3 py-2 border-t border-gray-700 text-xs text-red-400 bg-red-500/10">
               {error}
@@ -219,6 +219,7 @@ const WalletSwitcher: React.FC = () => {
 
 const Layout: React.FC = () => {
   const { theme, toggleTheme } = useTheme();
+  const navigate = useNavigate();
   const [chainStats, setChainStats] = useState<{ latest_block: number; total_transactions: number } | null>(null);
 
   useEffect(() => {
@@ -232,27 +233,35 @@ const Layout: React.FC = () => {
     return () => clearInterval(t);
   }, []);
 
+  // Global handler: notification click → navigate to Messenger and open that chat
+  useEffect(() => {
+    const unlisten = listen<{ address: string }>('ego://open-chat', (event) => {
+      navigate('/messenger', { state: { openChat: event.payload.address } });
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, [navigate]);
+
   return (
     <div className="flex flex-col h-screen bg-gray-900 text-white overflow-hidden">
       <TitleBar />
       <div className="flex flex-1 min-h-0">
-      {/* Sidebar */}
+      {}
       <aside className="w-52 bg-gray-800 border-r border-gray-700 flex flex-col shrink-0">
-        {/* Logo */}
+        {}
         <div className="p-4 border-b border-gray-700">
           <div className="flex items-center gap-2.5">
             <img src="/ego_logo.png" alt="Ego" className="w-9 h-9 rounded-full object-cover" />
             <div>
               <div className="font-bold text-sm leading-tight">Ego Wallet</div>
-              <div className="text-xs text-gray-400">Testnet v0.1.0</div>
+              <div className="text-xs text-gray-400">v0.1.0</div>
             </div>
           </div>
         </div>
 
-        {/* Wallet switcher */}
+        {}
         <WalletSwitcher />
 
-        {/* Nav */}
+        {}
         <nav className="flex-1 p-2 space-y-0.5 overflow-y-auto">
           {NAV_ITEMS.map(item => (
             <NavLink
@@ -274,14 +283,14 @@ const Layout: React.FC = () => {
           ))}
         </nav>
 
-        {/* Status bar */}
+        {}
         <div className="p-3 border-t border-gray-700 space-y-2">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
-              <span className="text-xs text-gray-400">Testnet • Synced</span>
+              <span className="text-xs text-gray-400">Synced</span>
             </div>
-            {/* Theme toggle */}
+            {}
             <button
               onClick={toggleTheme}
               title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
@@ -307,7 +316,7 @@ const Layout: React.FC = () => {
         </div>
       </aside>
 
-      {/* Main content */}
+      {}
       <main className="flex-1 overflow-auto min-w-0">
         <Outlet />
       </main>

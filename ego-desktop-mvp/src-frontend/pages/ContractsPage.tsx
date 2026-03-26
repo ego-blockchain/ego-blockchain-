@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
+import { useLocation } from 'react-router-dom';
 import { useWallet } from '../App';
-
-// ── Types ─────────────────────────────────────────────────────────────────────
 
 interface ContractInfo {
   address:     string;
@@ -35,8 +34,6 @@ interface StoredEvent {
   entrypoint:   string;
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
 function fmtDate(ts: number): string {
   return new Date(ts * 1000).toLocaleDateString(undefined, {
     year: 'numeric', month: 'short', day: 'numeric',
@@ -52,13 +49,11 @@ function bytesToHex(bytes: number[]): string {
   return bytes.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-/** Encode a plain-text string to hex (UTF-8 bytes). */
 function textToHex(s: string): string {
   const enc = new TextEncoder();
   return bytesToHex(Array.from(enc.encode(s)));
 }
 
-/** Decode a hex string to readable text when possible, else show raw hex. */
 function hexToDisplay(hex: string): string {
   if (!hex) return '';
   try {
@@ -71,7 +66,6 @@ function hexToDisplay(hex: string): string {
   }
 }
 
-/** Detect what kind of contract this is from its ABI signatures. */
 function detectContractType(abi: string[]): { label: string; color: string } | null {
   const names = abi.map(s => s.split('(')[0].toLowerCase());
   if (names.includes('transfer') && (names.includes('total_supply') || names.includes('balance_of'))) {
@@ -91,8 +85,6 @@ function detectContractType(abi: string[]): { label: string; color: string } | n
   }
   return null;
 }
-
-// ── Deploy tab ────────────────────────────────────────────────────────────────
 
 const DeployTab: React.FC<{ onDeployed: () => void }> = ({ onDeployed }) => {
   const fileRef     = useRef<HTMLInputElement>(null);
@@ -171,7 +163,7 @@ const DeployTab: React.FC<{ onDeployed: () => void }> = ({ onDeployed }) => {
 
   return (
     <div className="space-y-5 max-w-lg">
-      {/* File picker */}
+      {}
       <div>
         <label className="text-xs text-gray-400 block mb-1.5">WASM Bytecode (.wasm file)</label>
         <div
@@ -195,7 +187,7 @@ const DeployTab: React.FC<{ onDeployed: () => void }> = ({ onDeployed }) => {
         <input ref={fileRef} type="file" accept=".wasm" className="hidden" onChange={handleFile} />
       </div>
 
-      {/* Init args */}
+      {}
       <div>
         <div className="flex items-center justify-between mb-1.5">
           <label className="text-xs text-gray-400">Init Arguments (optional)</label>
@@ -239,8 +231,6 @@ const DeployTab: React.FC<{ onDeployed: () => void }> = ({ onDeployed }) => {
   );
 };
 
-// ── Genesis / well-known contracts ────────────────────────────────────────────
-
 const GENESIS_CONTRACTS = [
   { name: 'EgoDAO',        address: 'egot1qdao000000000000000000000000000000001', standard: 'EGO-8',  icon: '🗳️' },
   { name: 'EgoPriceFeed',  address: 'egot1qoracle00000000000000000000000000001', standard: 'EGO-9',  icon: '📊' },
@@ -248,10 +238,8 @@ const GENESIS_CONTRACTS = [
   { name: 'EGUSD',         address: 'egot1qegusd000000000000000000000000000001', standard: 'EGO-11', icon: '💵' },
 ];
 
-// ── Interact tab ──────────────────────────────────────────────────────────────
-
-const InteractTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => {
-  const [addr,       setAddr]       = useState('');
+const InteractTab: React.FC<{ contracts: ContractInfo[]; initialAddr?: string }> = ({ contracts, initialAddr }) => {
+  const [addr,       setAddr]       = useState(initialAddr ?? '');
   const [entrypoint, setEntrypoint] = useState('');
   const [callArgs,   setCallArgs]   = useState('');
   const [rawHex,     setRawHex]     = useState(false);
@@ -259,9 +247,8 @@ const InteractTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => 
   const [result,     setResult]     = useState<CallResult | null>(null);
   const [error,      setError]      = useState('');
 
-  // ABI of the currently selected deployed contract
   const selectedAbi = contracts.find(c => c.address === addr)?.abi ?? [];
-  // Filter out init — not callable post-deploy
+
   const callableFns = selectedAbi.filter(s => !s.startsWith('init'));
 
   async function handleCall() {
@@ -285,9 +272,9 @@ const InteractTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => 
 
   return (
     <div className="space-y-5 max-w-lg">
-      {/* Genesis contracts quick-select */}
+      {}
       <div>
-        <div className="text-xs text-gray-500 font-medium mb-2">Testnet Genesis Contracts</div>
+        <div className="text-xs text-gray-500 font-medium mb-2">Genesis Contracts</div>
         <div className="grid grid-cols-2 gap-2">
           {GENESIS_CONTRACTS.map(gc => (
             <button
@@ -309,7 +296,7 @@ const InteractTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => 
         </div>
       </div>
 
-      {/* Contract address */}
+      {}
       <div>
         <label className="text-xs text-gray-400 block mb-1.5">Contract Address</label>
         <input
@@ -319,7 +306,7 @@ const InteractTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => 
           placeholder="egot1…"
           className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none font-mono transition"
         />
-        {/* Quick-select from deployed contracts */}
+        {}
         {contracts.length > 0 && (
           <div className="mt-2 flex flex-wrap gap-1.5">
             {contracts.map(c => (
@@ -339,7 +326,7 @@ const InteractTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => 
         )}
       </div>
 
-      {/* ABI quick-call buttons — shown when the selected contract has a known ABI */}
+      {}
       {callableFns.length > 0 && (
         <div>
           <div className="text-xs text-gray-500 font-medium mb-2">Contract Functions</div>
@@ -365,7 +352,7 @@ const InteractTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => 
         </div>
       )}
 
-      {/* Entrypoint */}
+      {}
       <div>
         <label className="text-xs text-gray-400 block mb-1.5">Entrypoint</label>
         <input
@@ -377,7 +364,7 @@ const InteractTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => 
         />
       </div>
 
-      {/* Args */}
+      {}
       <div>
         <div className="flex items-center justify-between mb-1.5">
           <label className="text-xs text-gray-400">Arguments (optional)</label>
@@ -414,7 +401,7 @@ const InteractTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => 
         {busy ? '⏳ Calling…' : '⚡ Call Contract'}
       </button>
 
-      {/* Result */}
+      {}
       {result && (
         <div className={`rounded-2xl border p-5 space-y-3 text-sm ${
           result.success
@@ -462,8 +449,6 @@ const InteractTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => 
   );
 };
 
-// ── State Query tab ───────────────────────────────────────────────────────────
-
 const StateTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => {
   const [addr,   setAddr]   = useState('');
   const [prefix, setPrefix] = useState('');
@@ -493,7 +478,7 @@ const StateTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => {
 
   return (
     <div className="space-y-5 max-w-lg">
-      {/* Contract address */}
+      {}
       <div>
         <label className="text-xs text-gray-400 block mb-1.5">Contract Address</label>
         <input
@@ -575,8 +560,6 @@ const StateTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => {
     </div>
   );
 };
-
-// ── Events tab ────────────────────────────────────────────────────────────────
 
 const EventsTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => {
   const [addr,   setAddr]   = useState('');
@@ -672,8 +655,6 @@ const EventsTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => {
     </div>
   );
 };
-
-// ── Example contracts ─────────────────────────────────────────────────────────
 
 const EXAMPLES = [
   {
@@ -827,8 +808,6 @@ const ExamplesSection: React.FC = () => {
   );
 };
 
-// ── Contracts list ────────────────────────────────────────────────────────────
-
 const ContractsList: React.FC<{ contracts: ContractInfo[]; loading: boolean }> = ({ contracts, loading }) => {
   if (loading) {
     return (
@@ -877,7 +856,7 @@ const ContractsList: React.FC<{ contracts: ContractInfo[]; loading: boolean }> =
                     <div className="font-mono text-gray-300">{c.code_hash.slice(0, 20)}…</div>
                   </div>
                 </div>
-                {/* ABI preview */}
+                {}
                 {c.abi.length > 0 && (
                   <div className="mt-3">
                     <div className="text-gray-500 text-xs mb-1.5">Functions ({c.abi.length})</div>
@@ -899,8 +878,6 @@ const ContractsList: React.FC<{ contracts: ContractInfo[]; loading: boolean }> =
     </div>
   );
 };
-
-// ── Rollup status bar ─────────────────────────────────────────────────────────
 
 interface RollupStatus {
   shard_count:         number;
@@ -964,7 +941,7 @@ const RollupBar: React.FC = () => {
         </div>
       </div>
 
-      {/* Shard load bars */}
+      {}
       <div className="space-y-1">
         <div className="text-xs text-gray-500 mb-1.5">Shard load ({status.shard_count} shards)</div>
         <div className="grid gap-1" style={{ gridTemplateColumns: `repeat(${status.shard_count}, 1fr)` }}>
@@ -983,7 +960,7 @@ const RollupBar: React.FC = () => {
         </div>
       </div>
 
-      {/* Overall mempool fill */}
+      {}
       <div className="mt-2">
         <div className="h-1 bg-gray-700 rounded-full overflow-hidden">
           <div className="h-full bg-gradient-to-r from-blue-500 to-purple-500 transition-all"
@@ -998,13 +975,13 @@ const RollupBar: React.FC = () => {
   );
 };
 
-// ── ContractsPage ─────────────────────────────────────────────────────────────
-
 type Tab = 'contracts' | 'deploy' | 'interact' | 'state' | 'events';
 
 const ContractsPage: React.FC = () => {
   const { wallet }                     = useWallet();
-  const [tab,       setTab]            = useState<Tab>('contracts');
+  const location                       = useLocation();
+  const fromIDE                        = location.state as { address?: string; abi?: string[] } | null;
+  const [tab,       setTab]            = useState<Tab>(fromIDE?.address ? 'interact' : 'contracts');
   const [contracts, setContracts]      = useState<ContractInfo[]>([]);
   const [loadingList, setLoadingList]  = useState(true);
 
@@ -1029,7 +1006,7 @@ const ContractsPage: React.FC = () => {
 
   return (
     <div className="p-6 space-y-5 max-w-4xl mx-auto">
-      {/* Header */}
+      {}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-xl font-bold">Smart Contracts</h1>
@@ -1041,10 +1018,10 @@ const ContractsPage: React.FC = () => {
         </div>
       </div>
 
-      {/* Rollup engine status */}
+      {}
       <RollupBar />
 
-      {/* Tabs */}
+      {}
       <div className="flex gap-1 bg-gray-800 border border-gray-700 rounded-2xl p-1">
         {TABS.map(t => (
           <button
@@ -1062,7 +1039,7 @@ const ContractsPage: React.FC = () => {
         ))}
       </div>
 
-      {/* Tab content */}
+      {}
       {tab === 'contracts' && (
         <ContractsList contracts={contracts} loading={loadingList} />
       )}
@@ -1070,7 +1047,7 @@ const ContractsPage: React.FC = () => {
         <DeployTab onDeployed={() => { loadContracts(); setTab('contracts'); }} />
       )}
       {tab === 'interact' && (
-        <InteractTab contracts={contracts} />
+        <InteractTab contracts={contracts} initialAddr={fromIDE?.address} />
       )}
       {tab === 'state' && (
         <StateTab contracts={contracts} />

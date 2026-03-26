@@ -1,16 +1,3 @@
-/**
- * Ego Wallet — Background Service Worker (Manifest V3)
- *
- * Handles all messages from popup and content scripts:
- *   EGO_GENERATE_WALLET, EGO_IMPORT_WALLET, EGO_GET_ADDRESS,
- *   EGO_GET_BALANCE, EGO_SEND_TX, EGO_SIGN_MESSAGE,
- *   EGO_CONNECT_DAPP, EGO_GET_ACCOUNTS,
- *   EGO_APPROVE_CONNECTION, EGO_REJECT_CONNECTION,
- *   EGO_LOCK, EGO_UNLOCK, EGO_GET_STATE, EGO_SET_NETWORK,
- *   EGO_GET_MNEMONIC, EGO_GET_HEALTH, EGO_GET_BLOCKS,
- *   EGO_GET_TXS, EGO_FAUCET, EGO_HAS_WALLET
- */
-
 import {
   decryptSeed,
   encryptSeed,
@@ -41,18 +28,12 @@ import type {
 } from '../shared/types';
 import { NETWORKS } from '../shared/types';
 
-// ── In-memory unlocked seed (cleared on lock) ─────────────────────────────────
-
 let unlockedSeed: Uint8Array | null = null;
-
-// ── Pending dApp connection requests ─────────────────────────────────────────
 
 const pendingConnections: Map<string, {
   resolve: (approved: boolean) => void;
   info: PendingConnection;
 }> = new Map();
-
-// ── Storage helpers ───────────────────────────────────────────────────────────
 
 async function loadWalletData(): Promise<WalletData | null> {
   return new Promise(resolve => {
@@ -67,8 +48,6 @@ async function saveWalletData(data: WalletData): Promise<void> {
     chrome.storage.local.set({ walletData: data }, resolve);
   });
 }
-
-// ── Nonce tracking ────────────────────────────────────────────────────────────
 
 async function getNextNonce(): Promise<number> {
   return new Promise(resolve => {
@@ -85,14 +64,10 @@ async function incrementNonce(): Promise<void> {
   });
 }
 
-// ── RPC URL from network setting ──────────────────────────────────────────────
-
 function getRpcUrl(network?: 'testnet' | 'mainnet'): string {
   if (!network) return DEFAULT_RPC_URL;
   return NETWORKS[network]?.rpcUrl ?? DEFAULT_RPC_URL;
 }
-
-// ── Core wallet operations ────────────────────────────────────────────────────
 
 async function generateWallet(password: string): Promise<ExtResponse<{ address: string; mnemonic: string[] }>> {
   const seed = generateSeed();
@@ -293,7 +268,6 @@ async function handleConnectDapp(info: PendingConnection): Promise<ExtResponse<{
       info,
     });
 
-    // Open popup to show connection request
     chrome.action.openPopup?.();
   });
 }
@@ -338,8 +312,6 @@ async function hasWallet(): Promise<ExtResponse<{ hasWallet: boolean }>> {
   const walletData = await loadWalletData();
   return { success: true, data: { hasWallet: walletData !== null } };
 }
-
-// ── Message dispatcher ────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener(
   (message: ExtMessage, sender, sendResponse) => {
@@ -452,18 +424,15 @@ chrome.runtime.onMessage.addListener(
       sendResponse({ success: false, error: String(err) });
     });
 
-    // Return true to indicate async response
     return true;
   },
 );
-
-// ── Install / startup ─────────────────────────────────────────────────────────
 
 chrome.runtime.onInstalled.addListener(() => {
   console.log('[Ego Wallet] Extension installed.');
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  // Clear unlocked state on browser startup
+
   unlockedSeed = null;
 });

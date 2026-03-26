@@ -1,7 +1,3 @@
-//! SMTP email helpers.
-//! Credentials are stored as XOR-encoded byte arrays so they do not appear
-//! as plain text in the compiled binary.
-
 use lettre::message::header::ContentType;
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::client::{Tls, TlsParameters};
@@ -10,13 +6,10 @@ use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-// Ego logo embedded at compile time — avoids needing a hosted image URL.
 static LOGO_B64: Lazy<String> = Lazy::new(|| {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     STANDARD.encode(include_bytes!("../icons/ego_square.png"))
 });
-
-// ── XOR obfuscation ───────────────────────────────────────────────────────────
 
 fn xd(data: &[u8]) -> String {
     let k = b"EgoNet";
@@ -25,30 +18,24 @@ fn xd(data: &[u8]) -> String {
     ).unwrap_or_default()
 }
 
-// mail.egoblockchain.com
 const SH: &[u8] = &[
     0x28,0x06,0x06,0x22,0x4B,0x11,0x22,0x08,0x0D,0x22,0x0A,0x17,
     0x2E,0x04,0x07,0x2F,0x0C,0x1A,0x6B,0x04,0x00,0x23,
 ];
-// noreply@egoblockchain.com
+
 const SU: &[u8] = &[
     0x2B,0x08,0x1D,0x2B,0x15,0x18,0x3C,0x27,0x0A,0x29,0x0A,0x16,
     0x29,0x08,0x0C,0x25,0x06,0x1C,0x24,0x0E,0x01,0x60,0x06,0x1B,0x28,
 ];
-// Artit18+
+
 const SP: &[u8] = &[0x04,0x15,0x1B,0x27,0x11,0x45,0x7D,0x4C];
 
-// ── Send-attempt limiter (email → (count, window_start_unix_ts)) ─────────────
-// Max 3 sends per email per hour.  Resets automatically after the window passes.
-
 const MAX_SEND_ATTEMPTS: u32 = 3;
-const ATTEMPT_WINDOW_SECS: i64 = 3600; // 1 hour
+const ATTEMPT_WINDOW_SECS: i64 = 3600;
 
 static SEND_ATTEMPTS: Lazy<Mutex<HashMap<String, (u32, i64)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// Returns Ok(()) if the email is within the send limit, or a user-facing
-/// error string if the limit has been reached.
 pub fn check_send_limit(email: &str) -> Result<(), String> {
     let key = email.to_lowercase();
     let now = chrono::Utc::now().timestamp();
@@ -63,38 +50,29 @@ pub fn check_send_limit(email: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Record a successful send attempt.  Call this only after the email is sent.
 pub fn record_send_attempt(email: &str) {
     let key = email.to_lowercase();
     let now = chrono::Utc::now().timestamp();
     let mut map = SEND_ATTEMPTS.lock().unwrap();
     let entry = map.entry(key).or_insert((0, now));
-    // Reset window if the previous window has expired
+
     if now - entry.1 >= ATTEMPT_WINDOW_SECS {
         *entry = (0, now);
     }
     entry.0 += 1;
 }
 
-/// Reset the send counter for an email (called on successful verification
-/// so the user isn't blocked after confirming their code).
 pub fn reset_send_attempts(email: &str) {
     SEND_ATTEMPTS.lock().unwrap().remove(&email.to_lowercase());
 }
 
-// ── OTP store (email → (code, expiry unix ts)) ────────────────────────────────
-
 static OTP_STORE: Lazy<Mutex<HashMap<String, (String, i64)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// Generate a confirmation code: 4 digits + 2 uppercase letters at random positions.
-/// Example: "3A8S97", "4E9Q72", "7K2395" — letters can appear anywhere in the 6 chars.
-/// Entropy: 10^4 × 26^2 × C(6,2) = 101,400,000 combinations.
 pub fn gen_otp_code() -> String {
     use rand::Rng;
     let mut rng = rand::thread_rng();
 
-    // Pick 2 distinct positions (0..6) for the letters
     let pos1 = rng.gen_range(0usize..6);
     let pos2 = loop {
         let p = rng.gen_range(0usize..6);
@@ -113,7 +91,7 @@ pub fn gen_otp_code() -> String {
 }
 
 pub fn store_otp(email: &str, code: &str) {
-    let expiry = chrono::Utc::now().timestamp() + 600; // 10 minutes
+    let expiry = chrono::Utc::now().timestamp() + 600;
     let mut map = OTP_STORE.lock().unwrap();
     map.insert(email.to_lowercase(), (code.to_string(), expiry));
 }
@@ -130,8 +108,6 @@ pub fn verify_otp(email: &str, code: &str) -> bool {
     }
     false
 }
-
-// ── HTML email template ───────────────────────────────────────────────────────
 
 fn html_template(title: &str, body_html: &str) -> String {
     let logo_src = format!("data:image/png;base64,{}", &*LOGO_B64);
@@ -184,8 +160,6 @@ fn html_template(title: &str, body_html: &str) -> String {
 </html>"#, title = title, body_html = body_html, logo_src = logo_src)
 }
 
-// ── Core SMTP sender ──────────────────────────────────────────────────────────
-
 async fn send_smtp(to: &str, subject: &str, html: &str) -> Result<(), String> {
     let host = xd(SH);
     let user = xd(SU);
@@ -221,8 +195,6 @@ async fn send_smtp(to: &str, subject: &str, html: &str) -> Result<(), String> {
     mailer.send(email).await.map_err(|e| format!("SMTP send error: {e}"))?;
     Ok(())
 }
-
-// ── Public helpers ────────────────────────────────────────────────────────────
 
 pub async fn send_otp_email(to: &str, name: &str, code: &str) -> Result<(), String> {
     let body_html = format!(r#"

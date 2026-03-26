@@ -15,7 +15,6 @@ pub enum ConnectionStatus {
     Error(String),
 }
 
-/// TCP bridge for communicating with Erlang sbft_rust_bridge
 #[derive(Debug)]
 pub struct TcpBridge {
     local_addr: SocketAddr,
@@ -35,7 +34,7 @@ pub struct TcpMessage {
 }
 
 impl TcpBridge {
-    /// Create new TCP bridge
+
     pub fn new(local_addr: SocketAddr, erlang_addr: SocketAddr) -> Self {
         Self {
             local_addr,
@@ -48,7 +47,6 @@ impl TcpBridge {
         }
     }
 
-    /// Start TCP bridge as client (connect to Erlang)
     pub async fn start_client(&mut self) -> PoCResult<()> {
         info!("Starting TCP bridge client to {}", self.erlang_addr);
 
@@ -80,7 +78,6 @@ impl TcpBridge {
         Ok(())
     }
 
-    /// Start TCP bridge as server (listen for Erlang connections)
     pub async fn start_server(&mut self) -> PoCResult<()> {
         info!("Starting TCP bridge server on {}", self.local_addr);
 
@@ -94,7 +91,6 @@ impl TcpBridge {
         Ok(())
     }
 
-    /// Accept incoming connection from Erlang
     pub async fn accept_connection(&mut self) -> PoCResult<()> {
         if let Some(ref listener) = self.listener {
             match listener.accept().await {
@@ -114,7 +110,6 @@ impl TcpBridge {
         }
     }
 
-    /// Send message to Erlang
     pub async fn send_message(&mut self, message: &TcpMessage) -> PoCResult<()> {
         if let Some(ref mut stream) = self.connection {
             let serialized = Self::serialize_message(message)?;
@@ -132,25 +127,22 @@ impl TcpBridge {
         }
     }
 
-    /// Receive message from Erlang
     pub async fn receive_message(&mut self) -> PoCResult<TcpMessage> {
         if let Some(ref mut stream) = self.connection {
-            // Read message length first (4 bytes)
+
             let mut length_bytes = [0u8; 4];
             stream.read_exact(&mut length_bytes).await
                 .map_err(|e| PoCError::NetworkError(format!("Read length failed: {}", e)))?;
 
             let length = u32::from_be_bytes(length_bytes);
-            if length > 10_000_000 {  // 10MB limit
+            if length > 10_000_000 {
                 return Err(PoCError::NetworkError("Message too large".to_string()));
             }
 
-            // Read message type (1 byte)
             let mut type_byte = [0u8; 1];
             stream.read_exact(&mut type_byte).await
                 .map_err(|e| PoCError::NetworkError(format!("Read type failed: {}", e)))?;
 
-            // Read payload
             let mut payload = vec![0u8; (length - 1) as usize];
             stream.read_exact(&mut payload).await
                 .map_err(|e| PoCError::NetworkError(format!("Read payload failed: {}", e)))?;
@@ -168,14 +160,12 @@ impl TcpBridge {
         }
     }
 
-    /// Try to establish connection
     async fn try_connect(&mut self) -> PoCResult<TcpStream> {
         self.status = ConnectionStatus::Connecting;
 
         let stream = TcpStream::connect(self.erlang_addr).await
             .map_err(|e| PoCError::NetworkError(format!("Connect failed: {}", e)))?;
 
-        // Configure socket options
         if let Err(e) = stream.set_nodelay(true) {
             warn!("Failed to set TCP_NODELAY: {}", e);
         }
@@ -183,7 +173,6 @@ impl TcpBridge {
         Ok(stream)
     }
 
-    /// Start periodic heartbeat
     async fn start_heartbeat(&self) {
         let addr = self.erlang_addr;
         tokio::spawn(async move {
@@ -194,38 +183,32 @@ impl TcpBridge {
 
                 let heartbeat = TcpMessage {
                     length: 1,
-                    message_type: 0, // Heartbeat type
+                    message_type: 0,
                     payload: vec![],
                 };
 
                 debug!("Sending heartbeat to {}", addr);
-                // TODO: Send actual heartbeat message
+
             }
         });
     }
 
-    /// Serialize message for wire protocol
     fn serialize_message(message: &TcpMessage) -> PoCResult<Vec<u8>> {
         let mut buffer = Vec::new();
 
-        // Length (4 bytes, big-endian)
         buffer.extend_from_slice(&message.length.to_be_bytes());
 
-        // Message type (1 byte)
         buffer.push(message.message_type);
 
-        // Payload
         buffer.extend_from_slice(&message.payload);
 
         Ok(buffer)
     }
 
-    /// Get current connection status
     pub fn status(&self) -> ConnectionStatus {
         self.status.clone()
     }
 
-    /// Close connection
     pub async fn close(&mut self) {
         if let Some(stream) = self.connection.take() {
             drop(stream);
@@ -241,7 +224,6 @@ impl TcpBridge {
     }
 }
 
-/// Message types for Erlang communication
 pub mod message_types {
     pub const HEARTBEAT: u8 = 0;
     pub const POC_EVENT: u8 = 1;

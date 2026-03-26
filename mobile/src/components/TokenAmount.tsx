@@ -1,21 +1,17 @@
-/**
- * TokenAmount — displays a formatted EGOC amount with optional USD equivalent.
- */
-
 import React from 'react';
 import { View, Text, StyleSheet } from 'react-native';
 import { uEgocToEgoc } from '../lib/rpc';
 
 interface TokenAmountProps {
-  /** Amount in uEGOC (as bigint or decimal string). */
+
   uEgoc: bigint | string;
-  /** Display size: 'sm' | 'md' | 'lg' | 'xl' */
+
   size?: 'sm' | 'md' | 'lg' | 'xl';
-  /** Colour hint for positive/negative display. */
+
   direction?: 'in' | 'out' | 'neutral';
-  /** Show unit label ("EGOC"). Default true. */
+
   showUnit?: boolean;
-  /** Optional USD price per EGOC for fiat conversion. */
+
   egocUsdPrice?: number;
 }
 

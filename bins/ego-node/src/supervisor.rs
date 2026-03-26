@@ -1,12 +1,3 @@
-//! Node supervisor — restarts the node process on crash (single-client resilience).
-//!
-//! Single-client resilience means the network can survive even if one client
-//! implementation has a bug. The supervisor:
-//! 1. Tracks component health via heartbeat channels
-//! 2. Restarts failed components without full process restart
-//! 3. Reports health status via the /health endpoint
-//! 4. Implements exponential backoff to avoid restart storms
-
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Instant;
@@ -29,7 +20,6 @@ pub struct ComponentHealth {
     pub error:     Option<String>,
 }
 
-/// Heartbeat sender — components call this to signal they're alive.
 #[derive(Clone)]
 pub struct Heartbeat {
     tx: mpsc::Sender<String>,
@@ -41,7 +31,6 @@ impl Heartbeat {
     }
 }
 
-/// The node supervisor. Monitors all components and handles restarts.
 pub struct NodeSupervisor {
     components:   RwLock<Vec<ComponentHealth>>,
     #[allow(dead_code)]
@@ -94,7 +83,6 @@ impl NodeSupervisor {
             start_time:   Instant::now(),
         });
 
-        // Spawn heartbeat listener
         let sup_clone = supervisor.clone();
         tokio::spawn(async move {
             while let Some(component_name) = rx.recv().await {
@@ -110,7 +98,6 @@ impl NodeSupervisor {
         (supervisor, heartbeat)
     }
 
-    /// Report a component failure.
     pub async fn report_failure(&self, component: &str, error: String) {
         let mut components = self.components.write().await;
         if let Some(c) = components.iter_mut().find(|c| c.name == component) {
@@ -120,7 +107,6 @@ impl NodeSupervisor {
         }
     }
 
-    /// Get overall node health.
     pub async fn health(&self) -> NodeHealth {
         let components   = self.components.read().await;
         let any_failed   = components.iter().any(|c| c.status == ComponentStatus::Failed);

@@ -1,19 +1,18 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useTheme } from '../App';
 import { RPC_URL } from '../config';
 import Editor, { loader } from '@monaco-editor/react';
 import * as monaco from 'monaco-editor';
 import editorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
 import { invoke } from '@tauri-apps/api/tauri';
 
-// Configure Monaco to use locally bundled workers (no CDN needed in Tauri).
 (self as any).MonacoEnvironment = {
   getWorker() { return new editorWorker(); },
 };
 loader.config({ monaco });
 import { open as dialogOpen } from '@tauri-apps/api/dialog';
 import { readDir, readTextFile, writeTextFile, createDir, type FileEntry } from '@tauri-apps/api/fs';
-
-// ─── Types ───────────────────────────────────────────────────────────────────
 
 interface ProjectFile {
   name: string;
@@ -45,8 +44,6 @@ interface ConsoleLog {
 
 type RightTab = 'build' | 'deploy' | 'abi' | 'preview';
 type DeployNetwork = 'testnet' | 'mainnet';
-
-// ─── Templates ───────────────────────────────────────────────────────────────
 
 const TEMPLATES = [
   {
@@ -89,8 +86,6 @@ const TEMPLATES = [
   },
 ];
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
 function getLanguage(filename: string): string {
   const ext = filename.split('.').pop()?.toLowerCase() ?? '';
   switch (ext) {
@@ -119,23 +114,14 @@ function nowTs(): string {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
 }
 
-/**
- * Encode init() arguments for deploy_contract.
- * Accepts:
- *   ""            → "" (no args)
- *   "0x1a2b..."   → strip 0x prefix, pass as-is
- *   "deadbeef"    → all hex chars, pass as-is
- *   "1000000"     → decimal u64 → 8-byte LE hex
- *   "100 200"     → space-separated u64 values → concatenated LE hex
- */
 function encodeInitArgs(raw: string): string {
   const s = raw.trim();
   if (!s) return '';
-  // Explicit hex: starts with 0x
+
   if (s.startsWith('0x') || s.startsWith('0X')) return s.slice(2);
-  // All hex characters with no spaces → treat as raw hex
+
   if (/^[0-9a-fA-F]+$/.test(s) && s.length % 2 === 0) return s;
-  // Space-separated decimal numbers → encode each as LE i64
+
   const parts = s.split(/\s+/);
   if (parts.every(p => /^\d+$/.test(p))) {
     return parts.map(p => {
@@ -146,7 +132,7 @@ function encodeInitArgs(raw: string): string {
       return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
     }).join('');
   }
-  return s; // fallback: pass as-is
+  return s;
 }
 
 function extractABI(source: string): string[] {
@@ -174,7 +160,7 @@ function loadProjects(): Record<string, Project> {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) return JSON.parse(raw) as Record<string, Project>;
   } catch {
-    // ignore
+
   }
   return {};
 }
@@ -183,11 +169,9 @@ function saveProjects(projects: Record<string, Project>): void {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(projects));
   } catch {
-    // ignore
+
   }
 }
-
-// ─── Delete Confirm Overlay ───────────────────────────────────────────────────
 
 interface DeleteConfirmProps {
   path: string;
@@ -223,8 +207,6 @@ function DeleteConfirm({ path, onConfirm, onCancel }: DeleteConfirmProps) {
   );
 }
 
-// ─── File Tree ────────────────────────────────────────────────────────────────
-
 interface FileTreeProps {
   project: Project;
   activeFile: string | null;
@@ -244,7 +226,7 @@ interface FileTreeProps {
 interface ClipboardItem { path: string; isFolder: boolean; op: 'cut' | 'copy' }
 
 interface CtxMenu { x: number; y: number; path: string }
-// target: null = creating a new folder; '' = file at root; 'src' = file inside src/
+
 interface InlineState { mode: 'file' | 'folder'; target: string | null; val: string }
 
 function IconNewFile({ size = 14 }: { size?: number }) {
@@ -265,7 +247,8 @@ function IconNewFolder({ size = 14 }: { size?: number }) {
 }
 
 function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onNewFile, onNewFolder, onMoveFile, onMoveFolder, onCopyFile, onCopyFolder, onRenameFile, onRenameFolder }: FileTreeProps) {
-  // open/closed per folder — all start expanded (true by default)
+  const { theme } = useTheme();
+  const L = theme === 'light';
   const [openFolders, setOpenFolders] = useState<Record<string, boolean>>({});
   const [inline,   setInline]  = useState<InlineState | null>(null);
   const [ctxMenu,  setCtxMenu] = useState<CtxMenu | null>(null);
@@ -279,7 +262,6 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
   const renameRef = useRef<HTMLInputElement>(null);
   const ctxRef    = useRef<HTMLDivElement>(null);
 
-  // ── Group by first path segment ───────────────────────────────────────────
   const grouped: Record<string, string[]> = {};
   for (const path of Object.keys(project.files)) {
     const folder = path.includes('/') ? path.split('/')[0] : '';
@@ -289,7 +271,6 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
   const folderKeys = Object.keys(grouped).filter(f => f !== '').sort();
   const rootFiles  = grouped[''] ?? [];
 
-  // Auto-expand folders the moment they appear in the project
   useEffect(() => {
     setOpenFolders(prev => {
       const next = { ...prev };
@@ -299,21 +280,17 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
       }
       return changed ? next : prev;
     });
-  // project.files is the real dependency
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [project.files]);
 
-  // Auto-focus inline input when opened
   useEffect(() => {
     if (inline) setTimeout(() => inlineRef.current?.focus(), 30);
   }, [inline?.mode, inline?.target]);
 
-  // Auto-focus rename input when opened
   useEffect(() => {
     if (renaming) setTimeout(() => renameRef.current?.focus(), 30);
   }, [renaming?.path]);
 
-  // Close context menu on outside click
   useEffect(() => {
     if (!ctxMenu) return;
     function handle(e: MouseEvent) {
@@ -322,8 +299,6 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
     document.addEventListener('mousedown', handle);
     return () => document.removeEventListener('mousedown', handle);
   }, [ctxMenu]);
-
-  // ── Inline creation helpers ───────────────────────────────────────────────
 
   function openFileInline(targetFolder: string) {
     setCtxMenu(null);
@@ -343,7 +318,7 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
       if (inline.mode === 'file') {
         onNewFile(val);
       } else {
-        // folder mode: user types just the folder name, no slashes
+
         const name = val.replace(/[/\\]/g, '').trim();
         if (name) onNewFolder(`${name}/main.urego`);
       }
@@ -352,8 +327,6 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
   }
 
   function cancelInline() { setInline(null); }
-
-  // ── Rename helpers ────────────────────────────────────────────────────────
 
   function startRename(path: string, isFolder: boolean) {
     setCtxMenu(null);
@@ -377,15 +350,13 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
 
   function cancelRename() { setRenaming(null); }
 
-  // ── Drag & drop (mouse events — works in Tauri/WebView2) ────────────────
-
   useEffect(() => {
     function onMove(e: MouseEvent) {
       const d = dragRef.current;
       if (!d) return;
       if (!d.active && Math.hypot(e.clientX - d.startX, e.clientY - d.startY) < 5) return;
       d.active = true;
-      // find drop zone under cursor via data attribute
+
       const el = document.elementFromPoint(e.clientX, e.clientY);
       const zone = el?.closest('[data-drop-zone]') as HTMLElement | null;
       const target = zone ? (zone.dataset.dropZone ?? null) : null;
@@ -418,15 +389,13 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup',   onUp);
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
   function startDrag(e: React.MouseEvent, path: string, isFolder: boolean) {
     if ((e.target as HTMLElement).tagName === 'INPUT') return;
     e.preventDefault();
     dragRef.current = { path, isFolder, startX: e.clientX, startY: e.clientY, active: false };
   }
-
-  // ── Clipboard (cut / copy / paste) ───────────────────────────────────────
 
   function cutItem(path: string, isFolder: boolean) {
     setClipboard({ path, isFolder, op: 'cut' });
@@ -452,8 +421,6 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
       else              { onCopyFile(path, to); }
     }
   }
-
-  // ── Inline input row (rendered in-tree at the right position) ────────────
 
   function InlineRow({ indented }: { indented: boolean }) {
     if (!inline) return null;
@@ -484,30 +451,30 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
   }
 
   return (
-    <div className="w-48 bg-gray-900 border-r border-gray-700 flex flex-col text-xs select-none shrink-0">
+    <div className={`w-48 border-r flex flex-col text-xs select-none shrink-0 ${L ? 'bg-gray-50 border-gray-300' : 'bg-gray-900 border-gray-700'}`}>
 
-      {/* ── Header: project name + hover toolbar icons ── */}
-      <div className="group flex items-center gap-0.5 px-2 border-b border-gray-700 h-8 shrink-0">
-        <span className="text-gray-400 uppercase tracking-wider text-[10px] font-semibold truncate flex-1 pl-1">
+      {}
+      <div className={`group flex items-center gap-0.5 px-2 border-b h-8 shrink-0 ${L ? 'border-gray-300' : 'border-gray-700'}`}>
+        <span className={`uppercase tracking-wider text-[10px] font-semibold truncate flex-1 pl-1 ${L ? 'text-gray-600' : 'text-gray-400'}`}>
           {project.name}
         </span>
         <div className="opacity-0 group-hover:opacity-100 flex items-center transition-opacity shrink-0">
-          <button onClick={() => openFileInline('')}  className="p-1 text-gray-400 hover:text-white hover:bg-gray-700 rounded" title="New File"><IconNewFile /></button>
-          <button onClick={openFolderInline}           className="p-1 text-gray-400 hover:text-white hover:bg-gray-700 rounded" title="New Folder"><IconNewFolder /></button>
+          <button onClick={() => openFileInline('')}  className={`p-1 rounded ${L ? 'text-gray-500 hover:text-gray-900 hover:bg-gray-200' : 'text-gray-400 hover:text-white hover:bg-gray-700'}`} title="New File"><IconNewFile /></button>
+          <button onClick={openFolderInline}           className={`p-1 rounded ${L ? 'text-gray-500 hover:text-gray-900 hover:bg-gray-200' : 'text-gray-400 hover:text-white hover:bg-gray-700'}`} title="New Folder"><IconNewFolder /></button>
         </div>
       </div>
 
-      {/* ── Tree body ── */}
+      {}
       <div
         className="flex-1 overflow-y-auto pb-2"
         data-drop-zone=""
       >
-        {/* "New Folder" inline — always renders at the very top */}
+        {}
         {inline?.mode === 'folder' && InlineRow({ indented: false })}
 
-        {/* ── Folders (alphabetical) ── */}
+        {}
         {folderKeys.map(folder => {
-          const isOpen = openFolders[folder] !== false; // default true
+          const isOpen = openFolders[folder] !== false;
           const isDrop = dropTarget === folder && dragRef.current?.path !== folder;
 
           return (
@@ -515,24 +482,24 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
               key={folder}
               data-drop-zone={folder}
             >
-              {/* Folder header — click to collapse/expand, mousedown to drag */}
+              {}
               <div
                 role="button"
                 onMouseDown={e => startDrag(e, folder, true)}
                 onClick={() => { if (!dragGhost) setOpenFolders(prev => ({ ...prev, [folder]: !isOpen })); }}
                 onContextMenu={e => { e.preventDefault(); setCtxMenu({ x: e.clientX, y: e.clientY, path: `${folder}/` }); }}
                 className={`flex items-center gap-1.5 px-2 py-[4px] cursor-grab transition-colors ${
-                  isDrop ? 'bg-blue-500/20 text-blue-200 ring-1 ring-blue-400/50' : 'text-gray-300 hover:bg-gray-700/50'
+                  isDrop ? 'bg-blue-500/20 text-blue-200 ring-1 ring-blue-400/50' : L ? 'text-gray-700 hover:bg-gray-200' : 'text-gray-300 hover:bg-gray-700/50'
                 } ${clipboard?.path === folder && clipboard.isFolder && clipboard.op === 'cut' ? 'opacity-40' : ''}`}
               >
-                {/* Chevron rotates when open */}
+                {}
                 <svg
                   width="9" height="9" viewBox="0 0 9 9" fill="currentColor"
                   className={`shrink-0 text-gray-500 transition-transform duration-150 ${isOpen ? 'rotate-90' : 'rotate-0'}`}
                 >
                   <path d="M2.5 1.5l4 3-4 3z"/>
                 </svg>
-                {/* Folder icon */}
+                {}
                 <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor"
                   className={`shrink-0 transition-colors ${isDrop ? 'text-blue-400' : 'text-yellow-400/80'}`}
                 >
@@ -557,10 +524,10 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
                 {isDrop && <span className="shrink-0 text-[9px] text-blue-400 bg-blue-900/50 rounded px-1">drop</span>}
               </div>
 
-              {/* Folder contents — only when open */}
+              {}
               {isOpen && (
                 <>
-                  {/* "New File Here" inline appears inside this folder */}
+                  {}
                   {inline?.mode === 'file' && inline.target === folder && InlineRow({ indented: true })}
 
                   {grouped[folder]?.map(path => {
@@ -573,7 +540,7 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
                         onClick={() => { if (!dragGhost) onSelect(path); }}
                         onContextMenu={e => { e.preventDefault(); e.stopPropagation(); setCtxMenu({ x: e.clientX, y: e.clientY, path }); }}
                         className={`flex items-center gap-1.5 pl-6 py-[3px] pr-2 cursor-grab transition-colors ${
-                          isActive ? 'bg-blue-600/25 text-blue-300' : 'text-gray-300 hover:bg-gray-700/40'
+                          isActive ? 'bg-blue-600/25 text-blue-300' : L ? 'text-gray-700 hover:bg-gray-200' : 'text-gray-300 hover:bg-gray-700/40'
                         } ${clipboard?.path === path && clipboard.op === 'cut' ? 'opacity-40' : ''}`}
                         title={path}
                       >
@@ -603,7 +570,7 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
           );
         })}
 
-        {/* ── Root-level files (no folder) ── */}
+        {}
         {(rootFiles.length > 0 || (inline?.mode === 'file' && inline.target === '')) && (
           <div className={dropTarget === '' && dragRef.current ? 'bg-blue-600/10 rounded mx-0.5' : ''}>
             {inline?.mode === 'file' && inline.target === '' && InlineRow({ indented: false })}
@@ -616,7 +583,7 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
                   onClick={() => { if (!dragGhost) onSelect(path); }}
                   onContextMenu={e => { e.preventDefault(); e.stopPropagation(); setCtxMenu({ x: e.clientX, y: e.clientY, path }); }}
                   className={`flex items-center gap-1.5 pl-3 py-[3px] pr-2 cursor-grab transition-colors ${
-                    isActive ? 'bg-blue-600/25 text-blue-300' : 'text-gray-300 hover:bg-gray-700/40'
+                    isActive ? 'bg-blue-600/25 text-blue-300' : L ? 'text-gray-700 hover:bg-gray-200' : 'text-gray-300 hover:bg-gray-700/40'
                   } ${clipboard?.path === path && clipboard.op === 'cut' ? 'opacity-40' : ''}`}
                   title={path}
                 >
@@ -644,7 +611,7 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
         )}
       </div>
 
-      {/* ── Drag ghost ── */}
+      {}
       {dragGhost && (
         <div
           style={{ position: 'fixed', left: dragGhost.x + 14, top: dragGhost.y + 4, pointerEvents: 'none', zIndex: 9999 }}
@@ -655,14 +622,14 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
         </div>
       )}
 
-      {/* ── Context menu ── */}
+      {}
       {ctxMenu && (
         <div
           ref={ctxRef}
           className="fixed z-50 bg-gray-800 border border-gray-600 rounded-lg shadow-2xl py-1 min-w-[172px] text-xs"
           style={{ top: ctxMenu.y, left: ctxMenu.x }}
         >
-          {/* FILE */}
+          {}
           {!ctxMenu.path.endsWith('/') && (
             <>
               <button className="w-full text-left px-3 py-1.5 text-gray-200 hover:bg-gray-700 flex items-center gap-2.5"
@@ -699,7 +666,7 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
             </>
           )}
 
-          {/* FOLDER */}
+          {}
           {ctxMenu.path.endsWith('/') && (() => {
             const f = ctxMenu.path.slice(0, -1);
             const isOpen = openFolders[f] !== false;
@@ -764,8 +731,6 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
   );
 }
 
-// ─── Right Panel ──────────────────────────────────────────────────────────────
-
 interface RightPanelProps {
   tab: RightTab;
   onTabChange: (t: RightTab) => void;
@@ -785,6 +750,7 @@ interface RightPanelProps {
   onNetworkChange: (n: DeployNetwork) => void;
   onNodeUrlChange: (v: string) => void;
   onInitArgsChange: (v: string) => void;
+  onNavigate: (path: string, state?: any) => void;
 }
 
 const TESTNET_RPC = 'https://rpc.egoblockchain.com';
@@ -792,8 +758,10 @@ const TESTNET_RPC = 'https://rpc.egoblockchain.com';
 function RightPanel({
   tab, onTabChange, compiling, compileResult, deployResult, dryRunResult, deploying,
   deployNetwork, nodeUrl, initArgs, activeFile, currentContent,
-  onCompile, onDeploy, onDryRun, onNetworkChange, onNodeUrlChange, onInitArgsChange,
+  onCompile, onDeploy, onDryRun, onNetworkChange, onNodeUrlChange, onInitArgsChange, onNavigate,
 }: RightPanelProps) {
+  const { theme } = useTheme();
+  const L = theme === 'light';
   const tabs: { key: RightTab; label: string }[] = [
     { key: 'build', label: 'Build' },
     { key: 'deploy', label: 'Deploy' },
@@ -809,17 +777,17 @@ function RightPanel({
   };
 
   return (
-    <div className="w-72 bg-gray-800 border-l border-gray-700 flex flex-col shrink-0">
-      {/* Tab bar */}
-      <div className="flex border-b border-gray-700 shrink-0">
+    <div className={`w-72 border-l flex flex-col shrink-0 ${L ? 'bg-gray-100 border-gray-300' : 'bg-gray-800 border-gray-700'}`}>
+      {}
+      <div className={`flex border-b shrink-0 ${L ? 'border-gray-300' : 'border-gray-700'}`}>
         {tabs.map((t) => (
           <button
             key={t.key}
             onClick={() => onTabChange(t.key)}
             className={`flex-1 py-2 text-xs font-medium transition-colors ${
               tab === t.key
-                ? 'text-white border-b-2 border-blue-500 bg-gray-750'
-                : 'text-gray-400 hover:text-gray-200'
+                ? L ? 'text-gray-900 border-b-2 border-blue-500 bg-white' : 'text-white border-b-2 border-blue-500 bg-gray-750'
+                : L ? 'text-gray-500 hover:text-gray-800' : 'text-gray-400 hover:text-gray-200'
             }`}
           >
             {t.label}
@@ -828,7 +796,7 @@ function RightPanel({
       </div>
 
       <div className={`flex-1 min-h-0 ${tab === 'preview' ? 'overflow-hidden p-0' : 'overflow-y-auto p-3'}`}>
-        {/* BUILD TAB */}
+        {}
         {tab === 'build' && (
           <div className="space-y-4">
             <button
@@ -879,10 +847,10 @@ function RightPanel({
           </div>
         )}
 
-        {/* DEPLOY TAB */}
+        {}
         {tab === 'deploy' && (
           <div className="space-y-3">
-            {/* Network selector */}
+            {}
             <div>
               <div className="text-xs text-gray-400 font-semibold uppercase tracking-wider mb-1.5">Network</div>
               <div className="flex rounded-lg overflow-hidden border border-gray-600">
@@ -909,7 +877,7 @@ function RightPanel({
               </div>
             </div>
 
-            {/* Network info banner */}
+            {}
             {deployNetwork === 'testnet' ? (
               <div className="bg-green-900/20 border border-green-700/50 rounded-lg px-3 py-2 space-y-0.5">
                 <div className="text-xs text-green-400 font-semibold">✓ Testnet — Free deployment</div>
@@ -923,14 +891,14 @@ function RightPanel({
               </div>
             )}
 
-            {/* WASM status */}
+            {}
             <div className={`text-xs rounded px-2 py-1.5 ${compileResult?.success ? 'text-green-400 bg-green-900/20' : 'text-gray-500 bg-gray-700/30'}`}>
               {compileResult?.success
                 ? `✓ WASM ready — ${((compileResult.size ?? 0) / 1024).toFixed(1)} KB`
                 : '⚙ Compile first before deploying'}
             </div>
 
-            {/* Node URL (mainnet only) */}
+            {}
             {deployNetwork === 'mainnet' && (
               <div>
                 <label className="text-xs text-gray-400 block mb-1">Node URL</label>
@@ -942,7 +910,7 @@ function RightPanel({
               </div>
             )}
 
-            {/* Init args */}
+            {}
             <div>
               <label className="text-xs text-gray-400 block mb-1">Init Args <span className="text-gray-600">(optional)</span></label>
               <input
@@ -953,7 +921,7 @@ function RightPanel({
               />
             </div>
 
-            {/* Dry run button */}
+            {}
             <button
               onClick={onDryRun}
               disabled={!compileResult?.success}
@@ -962,7 +930,7 @@ function RightPanel({
               🔬 Dry Run <span className="text-gray-500">(local simulation, no network)</span>
             </button>
 
-            {/* Deploy button */}
+            {}
             <button
               onClick={onDeploy}
               disabled={deploying || !compileResult?.success}
@@ -981,7 +949,7 @@ function RightPanel({
               )}
             </button>
 
-            {/* Dry run result */}
+            {}
             {dryRunResult && (
               <div className="bg-blue-900/20 border border-blue-700/50 rounded-lg p-3 space-y-1">
                 <div className="text-xs text-blue-400 font-semibold">🔬 Dry Run — Simulated</div>
@@ -997,33 +965,77 @@ function RightPanel({
               </div>
             )}
 
-            {/* Deploy result */}
+            {}
             {deployResult && (
-              <div className={`border rounded-lg p-3 space-y-1 ${deployNetwork === 'testnet' ? 'bg-green-900/20 border-green-700/60' : 'bg-purple-900/20 border-purple-700/60'}`}>
+              <div className={`border rounded-xl p-3 space-y-3 ${deployNetwork === 'testnet' ? 'bg-green-900/20 border-green-700/60' : 'bg-purple-900/20 border-purple-700/60'}`}>
+                {/* Header */}
                 <div className="flex items-center gap-2">
                   <div className={`text-xs font-semibold ${deployNetwork === 'testnet' ? 'text-green-400' : 'text-purple-300'}`}>✓ Deployed!</div>
                   {deployNetwork === 'testnet' && (
                     <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-green-800/60 text-green-300 border border-green-700/50">TESTNET</span>
                   )}
                 </div>
-                <div className="text-xs text-gray-300">Contract Address:</div>
-                <button
-                  onClick={() => copyToClipboard(deployResult.contract_address)}
-                  className="w-full text-left font-mono text-xs bg-gray-900 rounded px-2 py-1 text-green-300 hover:bg-gray-700 transition-colors break-all"
-                  title="Click to copy"
-                >
-                  {deployResult.contract_address}
-                </button>
-                {deployNetwork === 'testnet' && (
-                  <div className="text-[10px] text-green-700">Testnet contract — 0 EGOC spent</div>
-                )}
-                <div className="text-[10px] text-gray-500">Click to copy</div>
+
+                {/* Address */}
+                <div>
+                  <div className="text-[10px] text-gray-400 mb-1">Contract Address</div>
+                  <button
+                    onClick={() => copyToClipboard(deployResult.contract_address)}
+                    className="w-full text-left font-mono text-xs bg-gray-900 rounded-lg px-2 py-1.5 text-green-300 hover:bg-gray-700 transition-colors break-all"
+                    title="Click to copy"
+                  >
+                    {deployResult.contract_address}
+                  </button>
+                  <div className="text-[10px] text-gray-600 mt-0.5">Click address to copy</div>
+                </div>
+
+                {/* What can I do now? */}
+                <div className="border-t border-gray-700/50 pt-2 space-y-1.5">
+                  <div className="text-[10px] text-gray-400 font-semibold uppercase tracking-wide">What's next?</div>
+
+                  <button
+                    onClick={() => onNavigate('/contracts', { address: deployResult.contract_address, abi: abiFunctions })}
+                    className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg bg-blue-600/20 hover:bg-blue-600/40 border border-blue-600/40 transition text-left"
+                  >
+                    <span className="text-sm">⚡</span>
+                    <div>
+                      <div className="text-xs font-semibold text-blue-300">Interact with Contract</div>
+                      <div className="text-[10px] text-gray-400">Call functions, read state</div>
+                    </div>
+                    <span className="ml-auto text-blue-400 text-xs">→</span>
+                  </button>
+
+                  <button
+                    onClick={() => onNavigate('/explorer', { search: deployResult.contract_address })}
+                    className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg bg-gray-700/40 hover:bg-gray-700/70 border border-gray-600/40 transition text-left"
+                  >
+                    <span className="text-sm">🔍</span>
+                    <div>
+                      <div className="text-xs font-semibold text-gray-200">View in Explorer</div>
+                      <div className="text-[10px] text-gray-400">See transactions & events</div>
+                    </div>
+                    <span className="ml-auto text-gray-400 text-xs">→</span>
+                  </button>
+
+                  {abiFunctions.length > 0 && (
+                    <div className="mt-1">
+                      <div className="text-[10px] text-gray-500 mb-1">Available functions:</div>
+                      <div className="space-y-0.5 max-h-28 overflow-y-auto">
+                        {abiFunctions.map((fn, i) => (
+                          <div key={i} className="font-mono text-[10px] text-purple-300 bg-gray-900/60 rounded px-2 py-0.5 truncate">
+                            {fn}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
               </div>
             )}
           </div>
         )}
 
-        {/* ABI TAB */}
+        {}
         {tab === 'abi' && (
           <div className="space-y-2">
             <div className="text-xs text-gray-400 font-semibold uppercase tracking-wider mb-3">
@@ -1054,7 +1066,7 @@ function RightPanel({
           </div>
         )}
 
-        {/* PREVIEW TAB */}
+        {}
         {tab === 'preview' && (
           <div className="h-full flex flex-col">
             {isHtml ? (
@@ -1078,8 +1090,6 @@ function RightPanel({
     </div>
   );
 }
-
-// ─── Template Modal ───────────────────────────────────────────────────────────
 
 interface TemplateModalProps {
   onClose: () => void;
@@ -1111,8 +1121,6 @@ function TemplateModal({ onClose, onSelect }: TemplateModalProps) {
     </div>
   );
 }
-
-// ─── New Project Modal ────────────────────────────────────────────────────────
 
 interface NewProjectModalProps {
   onConfirm: (name: string) => void;
@@ -1167,13 +1175,26 @@ function NewProjectModal({ onConfirm, onCancel }: NewProjectModalProps) {
   );
 }
 
-// ─── Main Component ───────────────────────────────────────────────────────────
-
 export default function IDEPage() {
+  const navigate = useNavigate();
+  const { theme } = useTheme();
+  const L = theme === 'light'; // shorthand: L = light mode
   const [projects, setProjects] = useState<Record<string, Project>>({});
   const [activeProject, setActiveProject] = useState<string | null>(null);
   const [activeFile, setActiveFile] = useState<string | null>(null);
   const [openTabs, setOpenTabs] = useState<string[]>([]);
+  const MAX_TABS = 3;
+  function addTab(path: string, active?: string) {
+    setOpenTabs(prev => {
+      if (prev.includes(path)) return prev;
+      if (prev.length < MAX_TABS) return [...prev, path];
+      // evict oldest tab that isn't currently active
+      const evictIdx = prev.findIndex(t => t !== (active ?? path));
+      const next = [...prev];
+      next.splice(evictIdx === -1 ? 0 : evictIdx, 1);
+      return [...next, path];
+    });
+  }
   const [compiling, setCompiling] = useState(false);
   const [compileResult, setCompileResult] = useState<CompileResult | null>(null);
   const [deployResult, setDeployResult] = useState<DeployResult | null>(null);
@@ -1190,13 +1211,14 @@ export default function IDEPage() {
   const [consoleOpen,   setConsoleOpen]   = useState(true);
   const [consoleHeight, setConsoleHeight] = useState(140);
   const [sidebarOpen,   setSidebarOpen]   = useState(true);
+  const [fileMenuOpen,  setFileMenuOpen]  = useState(false);
+  const fileMenuRef = useRef<HTMLDivElement>(null);
   const consoleRef      = useRef<HTMLDivElement>(null);
   const saveTimerRef    = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
   const editorRef       = useRef<any>(null);
   const consoleResizeRef = useRef<{ startY: number; startH: number } | null>(null);
 
-  // Load from localStorage on mount
   useEffect(() => {
     let loaded = loadProjects();
     if (Object.keys(loaded).length === 0) {
@@ -1205,8 +1227,7 @@ export default function IDEPage() {
       loaded = { [proj.name]: proj };
       saveProjects(loaded);
     } else {
-      // Migrate projects whose .urego files still use unsupported legacy syntax
-      // (old templates used storage_set_str, emit Name(...), caller(), etc.)
+
       const legacyMarkers = ['storage_set_str', 'storage_get_str', 'emit MessageSet(', 'emit Transfer(', 'emit EscrowCreated(', 'emit Proposed(', 'address_to_str(', 'u64_to_str(', 'caller()', 'require(', 'zero_address('];
       let migrated = false;
       for (const tpl of TEMPLATES) {
@@ -1231,14 +1252,12 @@ export default function IDEPage() {
     if (firstFile) setOpenTabs([firstFile]);
   }, []);
 
-  // Auto-scroll console
   useEffect(() => {
     if (consoleRef.current) {
       consoleRef.current.scrollTop = consoleRef.current.scrollHeight;
     }
   }, [consoleLogs]);
 
-  // Console drag-to-resize
   useEffect(() => {
     function onMove(e: MouseEvent) {
       const r = consoleResizeRef.current;
@@ -1255,6 +1274,17 @@ export default function IDEPage() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!fileMenuOpen) return;
+    function handleClickOutside(e: MouseEvent) {
+      if (fileMenuRef.current && !fileMenuRef.current.contains(e.target as Node)) {
+        setFileMenuOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [fileMenuOpen]);
+
   const addLog = useCallback((level: ConsoleLog['level'], msg: string) => {
     setConsoleLogs((prev) => [...prev, { ts: nowTs(), level, msg }]);
   }, []);
@@ -1263,7 +1293,6 @@ export default function IDEPage() {
   const currentFile = currentProject && activeFile ? currentProject.files[activeFile] : null;
   const currentContent = currentFile?.content ?? '';
 
-  // Debounced save
   const handleEditorChange = useCallback(
     (value: string | undefined) => {
       if (!activeProject || !activeFile || value === undefined) return;
@@ -1358,7 +1387,7 @@ export default function IDEPage() {
       return updated;
     });
     setActiveFile(filename);
-    setOpenTabs(prev => prev.includes(filename) ? prev : [...prev, filename]);
+    addTab(filename, activeFile ?? undefined);
     addLog('info', `Created file "${filename}"`);
   }
 
@@ -1440,7 +1469,7 @@ export default function IDEPage() {
       const files = { ...prev[activeProject].files };
       const file = files[from];
       if (!file) return prev;
-      // avoid collision: append _copy before extension
+
       let dest = to;
       if (files[dest]) {
         const dot = dest.lastIndexOf('.');
@@ -1564,7 +1593,7 @@ export default function IDEPage() {
       addLog('error', 'Compile successfully before dry run');
       return;
     }
-    // Deterministic simulated address: hash the wasm hex + project name locally.
+
     const seed = (compileResult.wasm_hex.slice(0, 32) + (activeProject ?? '')).split('').reduce(
       (acc, c) => (acc * 31 + c.charCodeAt(0)) >>> 0, 0x5EED
     );
@@ -1609,7 +1638,6 @@ export default function IDEPage() {
     }
   }
 
-  // ── Flatten a recursive FileEntry tree into [path, fullPath] pairs ──────────
   async function flattenEntries(
     entries: FileEntry[],
     rootPath: string,
@@ -1620,7 +1648,7 @@ export default function IDEPage() {
         const nested = await flattenEntries(entry.children, rootPath);
         result.push(...nested);
       } else if (entry.path) {
-        // Normalise Windows backslashes → forward slashes for consistent rel-paths
+
         const norm = entry.path.replace(/\\/g, '/');
         const base = rootPath.replace(/\\/g, '/').replace(/\/$/, '');
         const rel  = norm.startsWith(base + '/') ? norm.slice(base.length + 1) : norm.split('/').pop()!;
@@ -1630,7 +1658,6 @@ export default function IDEPage() {
     return result;
   }
 
-  // ── Upload a project folder from disk ─────────────────────────────────────
   async function handleOpenProjectFromDisk() {
     const chosen = await dialogOpen({ directory: true, multiple: false, title: 'Open Project Folder' });
     if (!chosen || typeof chosen !== 'string') return;
@@ -1642,14 +1669,16 @@ export default function IDEPage() {
       const entries = await readDir(chosen, { recursive: true });
       const flat    = await flattenEntries(entries, chosen);
 
+      const results = await Promise.all(
+        flat.map(({ rel, full }) =>
+          readTextFile(full)
+            .then(content => ({ rel, content }))
+            .catch(() => null)
+        )
+      );
       const files: Record<string, ProjectFile> = {};
-      for (const { rel, full } of flat) {
-        try {
-          const content = await readTextFile(full);
-          files[rel] = { name: rel.split('/').pop()!, content, language: getLanguage(rel) };
-        } catch {
-          // skip unreadable / binary files silently
-        }
+      for (const r of results) {
+        if (r) files[r.rel] = { name: r.rel.split('/').pop()!, content: r.content, language: getLanguage(r.rel) };
       }
 
       if (Object.keys(files).length === 0) {
@@ -1674,7 +1703,6 @@ export default function IDEPage() {
     }
   }
 
-  // ── Save current project to a folder on disk ──────────────────────────────
   async function handleSaveProjectToDisk() {
     if (!currentProject) return;
 
@@ -1698,7 +1726,6 @@ export default function IDEPage() {
     }
   }
 
-  // ── Export a single file to disk ──────────────────────────────────────────
   async function handleSaveCurrentFile() {
     if (!currentFile || !activeFile) return;
     const destDir = await dialogOpen({ directory: true, multiple: false, title: 'Save File To…' });
@@ -1714,23 +1741,23 @@ export default function IDEPage() {
   }
 
   return (
-    <div className="h-full flex flex-col bg-gray-900 overflow-hidden">
-      {/* Header */}
-      <div className="shrink-0 flex items-center gap-2 px-3 py-2 bg-gray-800 border-b border-gray-700">
-        {/* Sidebar toggle */}
+    <div className={`h-full flex flex-col overflow-hidden ${L ? 'bg-white' : 'bg-gray-900'}`}>
+      {}
+      <div className={`shrink-0 flex items-center gap-2 px-3 py-2 border-b ${L ? 'bg-gray-100 border-gray-300' : 'bg-gray-800 border-gray-700'}`}>
+        {}
         <button
           onClick={() => setSidebarOpen(v => !v)}
           title={sidebarOpen ? 'Hide file tree' : 'Show file tree'}
-          className="p-1 text-gray-400 hover:text-white hover:bg-gray-700 rounded transition-colors"
+          className={`p-1 rounded transition-colors ${L ? 'text-gray-500 hover:text-gray-900 hover:bg-gray-200' : 'text-gray-400 hover:text-white hover:bg-gray-700'}`}
         >
           <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
             <path d="M1 2h14v1H1zm0 5h10v1H1zm0 5h14v1H1z"/>
             {sidebarOpen && <path d="M13 5l3 3-3 3V5z" className="text-blue-400" fill="currentColor"/>}
           </svg>
         </button>
-        <span className="text-white font-semibold text-sm">dApp IDE</span>
-        <span className="text-gray-600">|</span>
-        {/* Project selector */}
+        <span className={`font-semibold text-sm ${L ? 'text-gray-900' : 'text-white'}`}>dApp IDE</span>
+        <span className={L ? 'text-gray-400' : 'text-gray-600'}>|</span>
+        {}
         <select
           value={activeProject ?? ''}
           onChange={(e) => {
@@ -1742,57 +1769,71 @@ export default function IDEPage() {
             setCompileResult(null);
             setDeployResult(null);
           }}
-          className="bg-gray-700 text-white text-xs px-2 py-1 rounded border border-gray-600 focus:outline-none focus:border-blue-500"
+          className={`text-xs px-2 py-1 rounded border focus:outline-none focus:border-blue-500 ${L ? 'bg-white text-gray-800 border-gray-300' : 'bg-gray-700 text-white border-gray-600'}`}
         >
           {Object.keys(projects).map((k) => (
             <option key={k} value={k}>{k}</option>
           ))}
         </select>
         <div className="flex gap-2 ml-auto items-center">
-          {/* Undo */}
+          {}
           <button
             onClick={() => editorRef.current?.trigger('kbd', 'undo', null)}
             title="Undo (Ctrl+Z)"
-            className="px-2 py-1 bg-gray-700 hover:bg-gray-600 text-white text-xs rounded border border-gray-600 transition-colors flex items-center gap-1"
+            className={`px-2 py-1 text-xs rounded border transition-colors flex items-center gap-1 ${L ? 'bg-white hover:bg-gray-100 text-gray-700 border-gray-300' : 'bg-gray-700 hover:bg-gray-600 text-white border-gray-600'}`}
           >
             <svg width="11" height="11" viewBox="0 0 16 16" fill="currentColor"><path d="M2.5 6H9a4 4 0 0 1 0 8H5v-1.5h4a2.5 2.5 0 0 0 0-5H2.5l2 2-1 1L0 8l3.5-3.5 1 1-2 .5z"/></svg>
             Undo
           </button>
-          <button
-            onClick={() => setShowNewProject(true)}
-            className="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-white text-xs rounded border border-gray-600 transition-colors"
-          >
-            New Project
-          </button>
-          <button
-            onClick={handleOpenProjectFromDisk}
-            title="Open a project folder from your computer"
-            className="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-white text-xs rounded border border-gray-600 transition-colors flex items-center gap-1"
-          >
-            📁 Open
-          </button>
-          <button
-            onClick={() => setShowTemplates(true)}
-            className="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-white text-xs rounded border border-gray-600 transition-colors"
-          >
-            Templates
-          </button>
-          <button
-            onClick={handleSaveProjectToDisk}
-            disabled={!currentProject}
-            title="Export entire project to a folder on disk"
-            className="px-3 py-1 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white text-xs rounded border border-gray-600 transition-colors flex items-center gap-1"
-          >
-            💾 Save Project
-          </button>
-          <button
-            onClick={handleSaveCurrentFile}
-            disabled={!currentFile}
-            title="Save current file to disk"
-            className="px-3 py-1 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-white text-xs rounded border border-gray-600 transition-colors flex items-center gap-1"
-          >
-            ⬇ Save File
-          </button>
+          {/* File menu dropdown */}
+          <div className="relative" ref={fileMenuRef}>
+            <button
+              onClick={() => setFileMenuOpen(v => !v)}
+              className={`px-3 py-1 text-xs rounded border transition-colors flex items-center gap-1 ${L ? 'bg-white hover:bg-gray-100 text-gray-700 border-gray-300' : 'bg-gray-700 hover:bg-gray-600 text-white border-gray-600'}`}
+            >
+              File
+              <svg width="9" height="9" viewBox="0 0 9 9" fill="currentColor" className={`transition-transform ${fileMenuOpen ? 'rotate-180' : ''}`}>
+                <path d="M1 2.5l3.5 4 3.5-4z"/>
+              </svg>
+            </button>
+            {fileMenuOpen && (
+              <div className={`absolute right-0 top-full mt-1 z-50 rounded-lg border shadow-xl py-1 min-w-[170px] ${L ? 'bg-white border-gray-300' : 'bg-gray-800 border-gray-600'}`}>
+                <button
+                  onClick={() => { setFileMenuOpen(false); setShowNewProject(true); }}
+                  className={`w-full text-left px-3 py-2 text-xs flex items-center gap-2.5 transition-colors ${L ? 'text-gray-700 hover:bg-gray-100' : 'text-gray-200 hover:bg-gray-700'}`}
+                >
+                  <span>📄</span> New Project
+                </button>
+                <button
+                  onClick={() => { setFileMenuOpen(false); handleOpenProjectFromDisk(); }}
+                  className={`w-full text-left px-3 py-2 text-xs flex items-center gap-2.5 transition-colors ${L ? 'text-gray-700 hover:bg-gray-100' : 'text-gray-200 hover:bg-gray-700'}`}
+                >
+                  <span>📁</span> Open Folder…
+                </button>
+                <button
+                  onClick={() => { setFileMenuOpen(false); setShowTemplates(true); }}
+                  className={`w-full text-left px-3 py-2 text-xs flex items-center gap-2.5 transition-colors ${L ? 'text-gray-700 hover:bg-gray-100' : 'text-gray-200 hover:bg-gray-700'}`}
+                >
+                  <span>🧩</span> Templates
+                </button>
+                <div className={`my-1 border-t ${L ? 'border-gray-200' : 'border-gray-700'}`} />
+                <button
+                  onClick={() => { setFileMenuOpen(false); handleSaveProjectToDisk(); }}
+                  disabled={!currentProject}
+                  className={`w-full text-left px-3 py-2 text-xs flex items-center gap-2.5 transition-colors disabled:opacity-40 ${L ? 'text-gray-700 hover:bg-gray-100' : 'text-gray-200 hover:bg-gray-700'}`}
+                >
+                  <span>💾</span> Save Project…
+                </button>
+                <button
+                  onClick={() => { setFileMenuOpen(false); handleSaveCurrentFile(); }}
+                  disabled={!currentFile}
+                  className={`w-full text-left px-3 py-2 text-xs flex items-center gap-2.5 transition-colors disabled:opacity-40 ${L ? 'text-gray-700 hover:bg-gray-100' : 'text-gray-200 hover:bg-gray-700'}`}
+                >
+                  <span>⬇</span> Save File…
+                </button>
+              </div>
+            )}
+          </div>
           <button
             onClick={compile}
             disabled={compiling}
@@ -1810,16 +1851,16 @@ export default function IDEPage() {
         </div>
       </div>
 
-      {/* Main area */}
+      {}
       <div className="flex-1 flex min-h-0">
-        {/* File tree */}
+        {}
         {currentProject && sidebarOpen && (
           <FileTree
             project={currentProject}
             activeFile={activeFile}
             onSelect={(path) => {
               setActiveFile(path);
-              setOpenTabs(prev => prev.includes(path) ? prev : [...prev, path]);
+              addTab(path, activeFile ?? undefined);
               setCompileResult(null);
             }}
             onDelete={handleDeleteFile}
@@ -1835,10 +1876,10 @@ export default function IDEPage() {
           />
         )}
 
-        {/* Editor */}
+        {}
         <div className="flex-1 min-w-0 flex flex-col">
-          {/* Multi-file tab bar */}
-          <div className="shrink-0 flex items-center bg-gray-900 border-b border-gray-700 overflow-x-auto min-h-[32px]">
+          {}
+          <div className={`shrink-0 flex items-center border-b overflow-x-auto min-h-[32px] ${L ? 'bg-gray-50 border-gray-300' : 'bg-gray-900 border-gray-700'}`}>
             {openTabs.map(tabPath => {
               const label    = tabPath.split('/').pop()!;
               const isActive = tabPath === activeFile;
@@ -1846,10 +1887,10 @@ export default function IDEPage() {
                 <div
                   key={tabPath}
                   onClick={() => { setActiveFile(tabPath); setCompileResult(null); }}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 border-r border-gray-700 cursor-pointer shrink-0 group transition-colors ${
+                  className={`flex items-center gap-1.5 px-3 py-1.5 border-r cursor-pointer shrink-0 group transition-colors ${L ? 'border-gray-300' : 'border-gray-700'} ${
                     isActive
-                      ? 'bg-gray-800 text-white border-t-2 border-t-blue-500'
-                      : 'text-gray-400 hover:bg-gray-800/60 hover:text-gray-200'
+                      ? L ? 'bg-white text-gray-900 border-t-2 border-t-blue-500' : 'bg-gray-800 text-white border-t-2 border-t-blue-500'
+                      : L ? 'text-gray-500 hover:bg-white hover:text-gray-800' : 'text-gray-400 hover:bg-gray-800/60 hover:text-gray-200'
                   }`}
                 >
                   <span className="text-[11px]">{getFileIcon(label)}</span>
@@ -1877,7 +1918,7 @@ export default function IDEPage() {
               <Editor
                 key={`${activeProject}::${activeFile}`}
                 height="100%"
-                theme="vs-dark"
+                theme={L ? 'vs' : 'vs-dark'}
                 language={currentFile.language}
                 value={currentFile.content}
                 onChange={handleEditorChange}
@@ -1893,7 +1934,7 @@ export default function IDEPage() {
                 }}
               />
             ) : (
-              <div className="h-full flex items-center justify-center text-gray-500 text-sm">
+              <div className={`h-full flex items-center justify-center text-sm ${L ? 'bg-white text-gray-400' : 'text-gray-500'}`}>
                 <div className="text-center space-y-2">
                   <div className="text-4xl">📄</div>
                   <div>Select a file or create a new project</div>
@@ -1909,7 +1950,7 @@ export default function IDEPage() {
           </div>
         </div>
 
-        {/* Right panel */}
+        {}
         <RightPanel
           tab={rightTab}
           onTabChange={setRightTab}
@@ -1929,39 +1970,40 @@ export default function IDEPage() {
           onNetworkChange={setDeployNetwork}
           onNodeUrlChange={setNodeUrl}
           onInitArgsChange={setInitArgs}
+          onNavigate={navigate}
         />
       </div>
 
-      {/* Console */}
+      {}
       <div
-        className="shrink-0 bg-black flex flex-col"
+        className={`shrink-0 flex flex-col ${L ? 'bg-gray-50' : 'bg-black'}`}
         style={{ height: consoleOpen ? consoleHeight : 28 }}
       >
-        {/* Resize handle */}
+        {}
         {consoleOpen && (
           <div
             onMouseDown={e => { e.preventDefault(); consoleResizeRef.current = { startY: e.clientY, startH: consoleHeight }; }}
-            className="h-1 bg-gray-700 hover:bg-blue-500 cursor-ns-resize shrink-0 transition-colors"
+            className={`h-1 cursor-ns-resize shrink-0 transition-colors ${L ? 'bg-gray-300 hover:bg-blue-400' : 'bg-gray-700 hover:bg-blue-500'}`}
             title="Drag to resize"
           />
         )}
-        <div className="flex items-center justify-between px-3 py-1 border-b border-gray-800 shrink-0">
+        <div className={`flex items-center justify-between px-3 py-1 border-b shrink-0 ${L ? 'border-gray-300' : 'border-gray-800'}`}>
           <button
             onClick={() => setConsoleOpen((v) => !v)}
-            className="text-gray-400 hover:text-white text-xs font-mono flex items-center gap-1"
+            className={`text-xs font-mono flex items-center gap-1 ${L ? 'text-gray-600 hover:text-gray-900' : 'text-gray-400 hover:text-white'}`}
           >
             <span>{consoleOpen ? '▼' : '▶'}</span>
             <span>Console</span>
             {consoleLogs.length > 0 && (
-              <span className="bg-gray-700 text-gray-300 rounded px-1 ml-1">{consoleLogs.length}</span>
+              <span className={`rounded px-1 ml-1 ${L ? 'bg-gray-200 text-gray-600' : 'bg-gray-700 text-gray-300'}`}>{consoleLogs.length}</span>
             )}
           </button>
           {consoleOpen && (
             <div className="flex items-center gap-3">
-              <span className="text-gray-600 text-[10px]">drag top edge to resize</span>
+              <span className={`text-[10px] ${L ? 'text-gray-400' : 'text-gray-600'}`}>drag top edge to resize</span>
               <button
                 onClick={() => setConsoleLogs([])}
-                className="text-gray-500 hover:text-white text-xs"
+                className={`text-xs ${L ? 'text-gray-500 hover:text-gray-900' : 'text-gray-500 hover:text-white'}`}
               >
                 Clear
               </button>
@@ -1971,20 +2013,20 @@ export default function IDEPage() {
         {consoleOpen && (
           <div ref={consoleRef} className="flex-1 overflow-y-auto">
             {consoleLogs.length === 0 ? (
-              <div className="px-3 py-1 text-gray-600 font-mono text-xs">Ready.</div>
+              <div className={`px-3 py-1 font-mono text-xs ${L ? 'text-gray-400' : 'text-gray-600'}`}>Ready.</div>
             ) : (
               consoleLogs.map((log, i) => (
                 <div
                   key={i}
                   className={`px-3 py-0.5 font-mono text-xs ${
                     log.level === 'error'
-                      ? 'text-red-400'
+                      ? 'text-red-500'
                       : log.level === 'success'
-                      ? 'text-green-400'
-                      : 'text-gray-400'
+                      ? 'text-green-600'
+                      : L ? 'text-gray-600' : 'text-gray-400'
                   }`}
                 >
-                  <span className="text-gray-600">[{log.ts}]</span> {log.msg}
+                  <span className={L ? 'text-gray-400' : 'text-gray-600'}>[{log.ts}]</span> {log.msg}
                 </div>
               ))
             )}
@@ -1992,7 +2034,7 @@ export default function IDEPage() {
         )}
       </div>
 
-      {/* Modals & overlays */}
+      {}
       {showTemplates && (
         <TemplateModal onClose={() => setShowTemplates(false)} onSelect={loadTemplate} />
       )}

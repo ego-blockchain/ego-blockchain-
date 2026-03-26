@@ -1,9 +1,3 @@
-/**
- * Creates minimal valid PNG icons without external dependencies.
- * Uses raw PNG binary construction (zlib deflate via zlib module).
- * Run with: node create-icons.js
- */
-
 'use strict';
 
 const fs = require('fs');
@@ -36,7 +30,7 @@ function chunk(type, data) {
 }
 
 function makePNG(size, r, g, b) {
-  // RGBA pixels: draw a circle with letter E approximation using solid color
+
   const pixels = [];
   const cx = size / 2;
   const cy = size / 2;
@@ -50,20 +44,19 @@ function makePNG(size, r, g, b) {
       const dist = Math.sqrt(dx*dx + dy*dy);
 
       if (dist <= radius) {
-        // Inside circle: blend blue (#2563eb = 37,99,235) to purple (#7c3aed = 124,58,237)
+
         const t = dist / radius;
         const pr = Math.round(37 + t * (124 - 37));
         const pg = Math.round(99 + t * (58 - 99));
         const pb = Math.round(235 + t * (237 - 235));
         row.push(pr, pg, pb, 255);
       } else {
-        row.push(0, 0, 0, 0); // transparent outside
+        row.push(0, 0, 0, 0);
       }
     }
     pixels.push(row);
   }
 
-  // Overlay a simple white "E" glyph
   const s = size;
   const margin = Math.round(s * 0.25);
   const mid = Math.round(s * 0.45);
@@ -79,36 +72,34 @@ function makePNG(size, r, g, b) {
     pixels[y][x * 4 + 3] = 255;
   }
 
-  // Draw E: vertical stroke + 3 horizontal bars
   for (let y = margin; y < s - margin; y++) {
     for (let bx = 0; bx < barH; bx++) {
       setWhite(margin + bx, y);
     }
   }
-  // Top bar
+
   for (let x = margin; x < right; x++) {
     for (let by = 0; by < barH; by++) {
       setWhite(x, margin + by);
     }
   }
-  // Middle bar (shorter)
+
   for (let x = margin; x < Math.round(s * 0.65); x++) {
     for (let by = 0; by < barH; by++) {
       setWhite(x, mid + by);
     }
   }
-  // Bottom bar
+
   for (let x = margin; x < right; x++) {
     for (let by = 0; by < barH; by++) {
       setWhite(x, s - margin - barH + by);
     }
   }
 
-  // Build raw image data (filter byte = 0 for each row)
   const rawRows = [];
   for (let y = 0; y < size; y++) {
     const row = Buffer.alloc(1 + size * 4);
-    row[0] = 0; // filter type None
+    row[0] = 0;
     for (let x = 0; x < size; x++) {
       row[1 + x * 4] = pixels[y][x * 4];
       row[1 + x * 4 + 1] = pixels[y][x * 4 + 1];
@@ -123,7 +114,7 @@ function makePNG(size, r, g, b) {
   const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
   const ihdr = chunk('IHDR', Buffer.concat([
     u32(size), u32(size),
-    Buffer.from([8, 6, 0, 0, 0]), // 8-bit RGBA
+    Buffer.from([8, 6, 0, 0, 0]),
   ]));
   const idat = chunk('IDAT', compressed);
   const iend = chunk('IEND', Buffer.alloc(0));

@@ -31,9 +31,8 @@ struct NodeConfig {
     pub enable_metrics: bool,
     pub enable_interactive: bool,
 
-    /// Forward earned rewards to this external address every `payout_interval_blocks` blocks.
     pub payout_address: Option<String>,
-    /// How often (in blocks) to sweep rewards to payout_address. Default: 100.
+
     pub payout_interval_blocks: u64,
 
     pub enable_bandwidth_sharing: bool,
@@ -121,16 +120,13 @@ async fn main() -> anyhow::Result<()> {
 
     print_node_info(&node, &config);
 
-    // Derive node identity from its keystore
     let node_address = format!("0x{}", hex::encode(node.get_address().as_bytes()));
     let node_pubkey  = hex::encode(&node.get_keypair().ed25519_public_key().key_data);
     let node_keypair = node.get_keypair().clone();
 
-    // Instantiate the execution engine and supervisor (single-client resilience).
     let _engine = EgoExecutionEngine::new();
     let (supervisor, _heartbeat) = NodeSupervisor::new();
 
-    // Start HTTP RPC server on port 8545
     let rpc_state = Arc::new(RpcState {
         state_manager:  node.state_manager.clone(),
         peer_id:        node.peer_id.to_string(),
@@ -144,8 +140,6 @@ async fn main() -> anyhow::Result<()> {
         nonce:          Mutex::new(0),
         supervisor,
         faucet_claims:  Mutex::new(std::collections::HashMap::new()),
-        broadcast_txs:    Mutex::new(Vec::new()),
-        broadcast_blocks: Mutex::new(Vec::new()),
     });
     let rpc_addr = format!("0.0.0.0:{}", 8545u16);
     let rpc_state_clone = Arc::clone(&rpc_state);
@@ -156,7 +150,6 @@ async fn main() -> anyhow::Result<()> {
     });
     info!("🌐 HTTP RPC listening on 0.0.0.0:8545");
 
-    // Auto-payout loop: sweep earned EGOC to payout_address every N blocks
     if let Some(payout_to) = config.payout_address.clone() {
         let payout_state  = Arc::clone(&rpc_state);
         let interval_blks = config.payout_interval_blocks;
@@ -170,7 +163,6 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // Parse the node's own address
                 let addr_hex = payout_state.node_address.trim_start_matches("0x").to_string();
                 let from_addr = match hex::decode(&addr_hex) {
                     Ok(b) if b.len() == 20 => {
@@ -181,7 +173,6 @@ async fn main() -> anyhow::Result<()> {
                     _ => continue,
                 };
 
-                // Check balance
                 let balance_raw = payout_state.state_manager
                     .get_account(&from_addr)
                     .map(|a| a.balance.0)
@@ -190,7 +181,6 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // Parse payout destination
                 let to_hex = payout_to.trim_start_matches("0x");
                 let to_addr = match hex::decode(to_hex) {
                     Ok(b) if b.len() == 20 => {
@@ -201,7 +191,6 @@ async fn main() -> anyhow::Result<()> {
                     _ => { warn!("Invalid payout address: {}", payout_to); continue; }
                 };
 
-                // Build and sign the transfer TX
                 let nonce = {
                     let mut n = payout_state.nonce.lock().unwrap();
                     let v = *n;
@@ -219,7 +208,7 @@ async fn main() -> anyhow::Result<()> {
                     },
                     ShardId::from_u32(0),
                     None,
-                    1, // chain_id testnet
+                    1,
                 );
                 if let Err(e) = tx.sign(&payout_state.node_keypair, false) {
                     warn!("Auto-payout sign error: {e}");
@@ -782,7 +771,6 @@ async fn run_daemon_mode(mut node: Node, config: NodeConfig) -> anyhow::Result<(
                     warn!("Error processing optimization events: {}", e);
                 }
 
-                // Process PoRep events
                 node.handle_porep_events().await;
             },
 
@@ -1045,7 +1033,6 @@ async fn run_interactive_mode(mut node: Node, config: NodeConfig) -> anyhow::Res
                     warn!("Error processing optimization events: {}", e);
                 }
 
-                // Process PoRep events
                 node.handle_porep_events().await;
             },
 
@@ -3154,7 +3141,6 @@ async fn handle_interactive_command(
                     println!("  Quantum-Safe: YES");
                     println!("  Downgrade Protection: Active");
 
-                    // Show which algorithms are actually supported
                     let has_ed25519 = pq_info.supported_algorithms.contains(&0);
                     let has_dilithium = pq_info.supported_algorithms.contains(&1);
                     let has_kyber = pq_info.supported_algorithms.contains(&2);

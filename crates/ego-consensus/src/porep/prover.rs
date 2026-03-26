@@ -103,7 +103,6 @@ impl PoRepProver {
             params_version: config.params_version,
         };
 
-        // Create temporary persistence with unique directory (for backwards compatibility)
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -131,7 +130,6 @@ impl PoRepProver {
         }
     }
 
-    /// Create new PoRepProver with persistent storage
     pub fn new_with_persistence<P: AsRef<Path>>(
         keypair: KeyPair,
         config: ProverConfig,
@@ -149,10 +147,8 @@ impl PoRepProver {
             params_version: config.params_version,
         };
 
-        // Initialize persistence layer
         let persistence = PoRepPersistence::new(db_path, address)?;
 
-        // Try to restore state from persistence
         let restored_state = persistence.restore_state()?;
 
         info!("🔄 Restored PoRep state: {} sectors, {} jobs, {} commitments",
@@ -544,11 +540,9 @@ impl PoRepProver {
             comm.deal_ids = deal_ids;
         }
 
-        // Drop locks before persistence to avoid deadlock
         drop(sectors);
         drop(comms);
 
-        // Persist the updated state
         self.persist_sector_state(sector_id)?;
         self.persist_commitment(sector_id)?;
 
@@ -796,12 +790,10 @@ impl PoRepProvider for PoRepProver {
             submitted.insert(proof_hash);
         }
 
-        // Persist the sector state and submitted proofs after sealing completion
         if let Err(e) = self.persist_sector_state(sector_id) {
             warn!("Failed to persist sector state after sealing {}: {}", sector_id, e);
         }
 
-        // Update sector proof count
         {
             let mut sectors = self.active_sectors.write().unwrap();
             if let Some(sector_state) = sectors.get_mut(&sector_id) {
@@ -810,7 +802,6 @@ impl PoRepProvider for PoRepProver {
             }
         }
 
-        // Persist the updated proof count
         if let Err(e) = self.persist_sector_state(sector_id) {
             warn!("Failed to persist sector state after proof count update {}: {}", sector_id, e);
         }
@@ -947,7 +938,7 @@ impl PoRepProvider for PoRepProver {
 }
 
 impl PoRepProver {
-    /// Persist a sector state immediately after change
+
     fn persist_sector_state(&self, sector_id: u64) -> PoCResult<()> {
         let sectors = self.active_sectors.read().unwrap();
         if let Some(sector_state) = sectors.get(&sector_id) {
@@ -959,7 +950,6 @@ impl PoRepProver {
         Ok(())
     }
 
-    /// Persist sector commitment immediately after change
     fn persist_commitment(&self, sector_id: u64) -> PoCResult<()> {
         let commitments = self.commitments.read().unwrap();
         if let Some(commitment) = commitments.get(&sector_id) {
@@ -971,7 +961,6 @@ impl PoRepProver {
         Ok(())
     }
 
-    /// Start periodic backup task to ensure data is persisted regularly
     pub fn start_periodic_backup(&self) -> mpsc::UnboundedSender<()> {
         let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
 
@@ -982,19 +971,17 @@ impl PoRepProver {
         let persistence = Arc::clone(&self.persistence);
 
         tokio::spawn(async move {
-            let mut backup_interval = interval(Duration::from_secs(300)); // Every 5 minutes
+            let mut backup_interval = interval(Duration::from_secs(300));
             loop {
                 tokio::select! {
                     _ = backup_interval.tick() => {
                         info!("🔄 Starting periodic PoRep state backup...");
 
-                        // Read all state data
                         let sectors_snapshot = active_sectors.read().unwrap().clone();
                         let queue_snapshot = sealing_queue.read().unwrap().clone();
                         let commitments_snapshot = commitments.read().unwrap().clone();
                         let proofs_snapshot = submitted_proofs.read().unwrap().clone();
 
-                        // Perform backup
                         if let Err(e) = persistence.backup_state(
                             &sectors_snapshot,
                             &queue_snapshot,
@@ -1017,7 +1004,6 @@ impl PoRepProver {
         shutdown_tx
     }
 
-    /// Perform immediate backup of current state
     pub fn backup_current_state(&self) -> PoCResult<()> {
         info!("💾 Performing immediate state backup...");
 
@@ -1037,14 +1023,12 @@ impl PoRepProver {
         Ok(())
     }
 
-    /// Clean up old sectors from persistence
     pub fn cleanup_old_sectors(&self, retention_days: u64) -> PoCResult<u32> {
         let retention_ms = retention_days * 24 * 60 * 60 * 1000;
         let cutoff_time = Timestamp::from_millis(Timestamp::now().as_millis().saturating_sub(retention_ms));
         self.persistence.cleanup_completed_sectors(cutoff_time)
     }
 
-    /// Get persistence statistics
     pub fn get_persistence_stats(&self) -> PoCResult<super::persistence::PoRepStorageStats> {
         self.persistence.get_stats()
     }
