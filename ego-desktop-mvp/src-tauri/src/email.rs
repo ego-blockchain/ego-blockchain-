@@ -11,9 +11,13 @@ static LOGO_B64: Lazy<String> = Lazy::new(|| {
     STANDARD.encode(include_bytes!("../icons/ego_square.png"))
 });
 
-const SH: &str = option_env!("EGO_SMTP_HOST").unwrap_or("");
-const SU: &str = option_env!("EGO_SMTP_USER").unwrap_or("");
-const SP: &str = option_env!("EGO_SMTP_PASS").unwrap_or("");
+macro_rules! env_or_empty {
+    ($key:literal) => { match option_env!($key) { Some(v) => v, None => "" } };
+}
+
+const SH: &str = env_or_empty!("EGO_SMTP_HOST");
+const SU: &str = env_or_empty!("EGO_SMTP_USER");
+const SP: &str = env_or_empty!("EGO_SMTP_PASS");
 
 const MAX_SEND_ATTEMPTS: u32 = 3;
 const ATTEMPT_WINDOW_SECS: i64 = 3600;
