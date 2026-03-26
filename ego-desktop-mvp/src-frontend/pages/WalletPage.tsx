@@ -297,6 +297,8 @@ const WalletPage: React.FC = () => {
   const [isLiveMode, setIsLiveMode]         = useState(false);
   const [mainnetAddress, setMainnetAddress] = useState('');
   const [showPresale, setShowPresale]           = useState(false);
+  const [presaleRecords, setPresaleRecords]     = useState<any[]>([]);
+  const [showPresaleRecords, setShowPresaleRecords] = useState(false);
   const [presalePayAsset, setPresalePayAsset]   = useState(SWAP_ASSETS[2]); // BTC default
   const [presalePayAmount, setPresalePayAmount] = useState('');
   const [presaleOutput, setPresaleOutput]       = useState(0);
@@ -391,6 +393,7 @@ const WalletPage: React.FC = () => {
 
   useEffect(() => {
     invoke<Record<string, number>>('fetch_swap_rates').then(setSwapRates).catch(() => {});
+    invoke<any[]>('presale_list_iou').then(setPresaleRecords).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -1380,6 +1383,59 @@ const WalletPage: React.FC = () => {
           </>
         )}
       </div>
+
+      {presaleRecords.length > 0 && (
+        <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
+          <button
+            onClick={() => setShowPresaleRecords(o => !o)}
+            className="w-full flex items-center justify-between px-5 py-4 hover:bg-gray-700/40 transition"
+          >
+            <div className="flex items-center gap-3">
+              <div className="w-9 h-9 rounded-xl bg-purple-500/15 flex items-center justify-center text-lg">🪙</div>
+              <div className="text-left">
+                <div className="text-sm font-semibold">Pre-Sale Records</div>
+                <div className="text-xs text-gray-400">{presaleRecords.length} purchase{presaleRecords.length !== 1 ? 's' : ''}</div>
+              </div>
+            </div>
+            <span className="text-gray-500 text-xs">{showPresaleRecords ? '▲' : '▼'}</span>
+          </button>
+          {showPresaleRecords && (
+            <div className="divide-y divide-gray-700/50 border-t border-gray-700/50">
+              {presaleRecords.map((r: any) => (
+                <div key={r.id} className="px-5 py-4 flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="w-9 h-9 rounded-xl bg-blue-500/10 flex items-center justify-center text-sm font-bold text-blue-300 shrink-0">
+                      {r.pay_symbol}
+                    </div>
+                    <div className="min-w-0">
+                      <div className="text-sm font-semibold text-white">
+                        {r.egoc_amount.toLocaleString(undefined, { maximumFractionDigits: 2 })} EGOC
+                      </div>
+                      <div className="text-xs text-gray-400">
+                        Paid {r.pay_amount} {r.pay_symbol} · ${r.usd_value.toFixed(2)} USD
+                      </div>
+                      <div className="text-xs text-gray-500 font-mono truncate mt-0.5">{r.deposit_address}</div>
+                    </div>
+                  </div>
+                  <div className="shrink-0 text-right">
+                    <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold ${
+                      r.status === 'confirmed'
+                        ? 'bg-green-500/15 text-green-400'
+                        : 'bg-yellow-500/15 text-yellow-400'
+                    }`}>
+                      <span className={`w-1.5 h-1.5 rounded-full ${r.status === 'confirmed' ? 'bg-green-400' : 'bg-yellow-400'}`}></span>
+                      {r.status === 'confirmed' ? 'Confirmed' : 'Pending'}
+                    </span>
+                    <div className="text-xs text-gray-600 mt-1">
+                      {new Date(r.timestamp * 1000).toLocaleDateString()}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {showPresale && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm" onClick={e => { if (e.target === e.currentTarget) setShowPresale(false); }}>
