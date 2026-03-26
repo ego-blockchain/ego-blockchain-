@@ -30,6 +30,10 @@ const WalletSwitcher: React.FC = () => {
   const { wallet, registry, reload, reloadRegistry } = useWallet();
   const [open, setOpen]         = useState(false);
   const [creating, setCreating] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [importName, setImportName]     = useState('');
+  const [importMethod, setImportMethod] = useState<'phrase' | 'seed'>('phrase');
+  const [importValue, setImportValue]   = useState('');
   const [newName, setNewName]   = useState('');
   const [busy, setBusy]         = useState(false);
   const [error, setError]       = useState('');
@@ -39,9 +43,8 @@ const WalletSwitcher: React.FC = () => {
     if (!open) return;
     function handle(e: MouseEvent) {
       if (dropRef.current && !dropRef.current.contains(e.target as Node)) {
-        setOpen(false);
-        setCreating(false);
-        setError('');
+        setOpen(false); setCreating(false); setImporting(false);
+        setImportValue(''); setImportName(''); setError('');
       }
     }
     document.addEventListener('mousedown', handle);
@@ -92,18 +95,27 @@ const WalletSwitcher: React.FC = () => {
 
   async function createWallet() {
     const name = newName.trim() || `Wallet ${walletCount + 1}`;
-    setBusy(true);
-    setError('');
+    setBusy(true); setError('');
     try {
       await invoke('create_wallet', { name });
       await reloadRegistry();
-      setCreating(false);
-      setNewName('');
-    } catch (e: any) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
+      setCreating(false); setNewName('');
+    } catch (e: any) { setError(String(e)); }
+    finally { setBusy(false); }
+  }
+
+  async function importWallet() {
+    const v = importValue.trim();
+    if (!v) { setError('Please enter your recovery phrase or seed hex.'); return; }
+    const name = importName.trim() || `Wallet ${walletCount + 1}`;
+    setBusy(true); setError('');
+    try {
+      await invoke('import_wallet', { name, method: importMethod, value: v });
+      await reload();
+      await reloadRegistry();
+      setImporting(false); setImportValue(''); setImportName(''); setOpen(false);
+    } catch (e: any) { setError(String(e)); }
+    finally { setBusy(false); }
   }
 
   return (
@@ -132,14 +144,65 @@ const WalletSwitcher: React.FC = () => {
           <div className="px-3 py-2 border-b border-gray-700 flex items-center justify-between">
             <span className="text-xs text-gray-400 font-medium">{walletCount} / 6 wallets</span>
             {walletCount < 6 && (
-              <button
-                onClick={() => { setCreating(c => !c); setError(''); }}
-                className="text-xs text-blue-400 hover:text-blue-300 font-medium"
-              >
-                {creating ? 'Cancel' : '+ New'}
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => { setImporting(i => !i); setCreating(false); setError(''); }}
+                  className="text-xs text-purple-400 hover:text-purple-300 font-medium"
+                >
+                  {importing ? 'Cancel' : '↓ Import'}
+                </button>
+                <button
+                  onClick={() => { setCreating(c => !c); setImporting(false); setError(''); }}
+                  className="text-xs text-blue-400 hover:text-blue-300 font-medium"
+                >
+                  {creating ? 'Cancel' : '+ New'}
+                </button>
+              </div>
             )}
           </div>
+
+          {}
+          {importing && (
+            <div className="px-3 py-2 border-b border-gray-700 space-y-2">
+              <div className="flex rounded-lg overflow-hidden border border-gray-600 text-xs">
+                <button
+                  onClick={() => setImportMethod('phrase')}
+                  className={`flex-1 py-1.5 font-medium transition-colors ${importMethod === 'phrase' ? 'bg-purple-600 text-white' : 'bg-gray-700 text-gray-400 hover:text-white'}`}
+                >
+                  24-Word Phrase
+                </button>
+                <button
+                  onClick={() => setImportMethod('seed')}
+                  className={`flex-1 py-1.5 font-medium transition-colors ${importMethod === 'seed' ? 'bg-purple-600 text-white' : 'bg-gray-700 text-gray-400 hover:text-white'}`}
+                >
+                  Seed Hex
+                </button>
+              </div>
+              <input
+                value={importName}
+                onChange={e => setImportName(e.target.value)}
+                placeholder={`Wallet ${walletCount + 1}`}
+                className="w-full bg-gray-900 border border-gray-600 rounded-lg px-2 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-purple-500"
+              />
+              <textarea
+                autoFocus
+                value={importValue}
+                onChange={e => setImportValue(e.target.value)}
+                placeholder={importMethod === 'phrase'
+                  ? 'Enter your 24 words separated by spaces…'
+                  : 'Enter 64-character hex seed…'}
+                rows={importMethod === 'phrase' ? 3 : 2}
+                className="w-full bg-gray-900 border border-gray-600 rounded-lg px-2 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-purple-500 resize-none font-mono"
+              />
+              <button
+                onClick={importWallet}
+                disabled={busy}
+                className="w-full bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white text-xs font-semibold py-1.5 rounded-lg transition-colors"
+              >
+                {busy ? 'Importing…' : 'Import Wallet'}
+              </button>
+            </div>
+          )}
 
           {}
           {creating && (

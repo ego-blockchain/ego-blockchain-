@@ -470,6 +470,92 @@ pub async fn create_wallet(
     load_active_wallet(&state, true).await
 }
 
+// ── import_wallet ─────────────────────────────────────────────────────────────
+// Import an existing wallet by 24-word phrase or 64-char hex seed as a NEW
+// wallet entry (does not replace the current active wallet).
+
+#[tauri::command]
+pub async fn import_wallet(
+    name:   String,
+    method: String, // "phrase" | "seed"
+    value:  String,
+    state:  State<'_, AppState>,
+) -> Result<WalletInfo, EgoDesktopError> {
+    let mut registry = load_registry();
+    if registry.wallets.len() >= 6 {
+        return Err(EgoDesktopError::InvalidInput("Maximum 6 wallets allowed".into()));
+    }
+
+    // Derive seed bytes from phrase or hex
+    let seed: [u8; 32] = if method == "phrase" {
+        let words: Vec<String> = value.split_whitespace().map(|w| w.to_lowercase()).collect();
+        let kp = restore_keypair_from_phrase(&words)?;
+        let raw = kp.to_bytes();
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&raw[..32]);
+        s
+    } else if method == "seed" {
+        let bytes = hex::decode(value.trim())
+            .map_err(|_| EgoDesktopError::InvalidInput("Invalid seed hex — must be 64 hex characters".into()))?;
+        if bytes.len() != 32 {
+            return Err(EgoDesktopError::InvalidInput(
+                format!("Seed must be exactly 32 bytes (64 hex chars), got {}", bytes.len())
+            ));
+        }
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&bytes);
+        s
+    } else {
+        return Err(EgoDesktopError::InvalidInput("method must be 'phrase' or 'seed'".into()));
+    };
+
+    let wallet_id = next_wallet_id(&registry);
+    let wallet_name = {
+        let n = name.trim();
+        if n.is_empty() { format!("Wallet {}", registry.wallets.len() + 1) } else { n.to_string() }
+    };
+
+    // Switch active dir so wallet files are written to the new slot
+    registry.active_id = wallet_id.clone();
+    save_registry(&registry).map_err(EgoDesktopError::WalletError)?;
+
+    let address = tokio::task::spawn_blocking(move || {
+        use crate::ledger::{save_seed, data_dir};
+        fs::create_dir_all(data_dir())
+            .map_err(|e| EgoDesktopError::FileSystemError(format!("Create dir: {e}")))?;
+        save_seed(&seed)
+            .map_err(|e| EgoDesktopError::FileSystemError(format!("Write seed: {e}")))?;
+
+        let keypair = KeyPair::from_bytes(&seed)
+            .map_err(|e| EgoDesktopError::CryptoError(format!("Keypair: {e}")))?;
+        let address = keypair
+            .derive_bech32_address(1, AddressType::EOA, "egot")
+            .map_err(|e| EgoDesktopError::CryptoError(format!("Address: {e}")))?;
+        let mainnet_addr = keypair
+            .derive_bech32_address(0, AddressType::EOA, "ego")
+            .unwrap_or_default();
+
+        let mut ledger = crate::ledger::Ledger::default();
+        ledger.address = address.clone();
+        ledger.mainnet_address = mainnet_addr;
+        ledger.save().map_err(EgoDesktopError::WalletError)?;
+
+        Ok::<String, EgoDesktopError>(address)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::CryptoError(format!("Import panicked: {e}")))??;
+
+    registry.wallets.push(WalletEntry {
+        id:         wallet_id,
+        name:       wallet_name,
+        address,
+        created_at: chrono::Utc::now().timestamp(),
+    });
+    save_registry(&registry).map_err(EgoDesktopError::WalletError)?;
+
+    load_active_wallet(&state, false).await
+}
+
 // ── switch_wallet ─────────────────────────────────────────────────────────────
 
 #[tauri::command]
