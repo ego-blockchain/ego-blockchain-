@@ -1383,7 +1383,7 @@ const WalletPage: React.FC = () => {
 
       {showPresale && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm" onClick={e => { if (e.target === e.currentTarget) setShowPresale(false); }}>
-          <div className="bg-gray-800 rounded-2xl w-full max-w-2xl border border-gray-700 shadow-2xl overflow-hidden">
+          <div className="bg-gray-800 rounded-2xl w-full max-w-4xl border border-gray-700 shadow-2xl overflow-hidden">
 
             {/* Header */}
             <div className="bg-gradient-to-r from-blue-900/60 to-purple-900/60 px-6 py-4 border-b border-gray-700/50 flex items-center justify-between gap-6">
