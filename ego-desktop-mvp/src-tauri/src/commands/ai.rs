@@ -173,7 +173,6 @@ Advanced: EGO-50 MEV Protection, EGO-51 Fee Market, EGO-52 Governance, EGO-53 DI
 - **Card flow (Stripe)**: Stripe Checkout session created via a secure server-side proxy (STRIPE_SECRET_KEY never in the app) → user pays on Stripe hosted page → payment verified → encrypted IOU file issued.
 - **IOU file**: JSON file containing public metadata (coin, amount, deposit address, EGOC allocation) + AES-256-GCM encrypted allocation details (key derived via BLAKE3(password ‖ salt)). User keeps the file + password — this is their on-chain claim at mainnet launch. Genesis block credits all IOU holders.
 - **Mainnet address**: the IOU is tied to the user's mainnet address (derived alongside testnet keys). EGOC will be airdropped to that address at genesis.
-- Pre-sale history viewable in the Wallet page under "Pre-Sale Records".
 - Crypto treasury deposit addresses: BTC `bc1qaqx0xf9sv0ktmtcxlzzh7t7kf59nwu8c0vlqhg`, ETH/USDT/USDC/BNB `0xD4f2B1fA44668B806290A4c3CB758ABb7EF35C64`, ADA (long bech32), SOL `9PZzHQYohiR9fTKTJXUaRYKv6doM4NQPJZKcrVvTJbbW`, TRX `TSZnnQGN8idN6vEU66NX1ek1AtwmHbYLRx`.
 
 ## Email 2FA — Confirmation Codes
