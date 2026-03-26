@@ -202,6 +202,7 @@ fn main() {
             commands::auth::get_address,
             commands::auth::list_wallets,
             commands::auth::create_wallet,
+            commands::auth::import_wallet,
             commands::auth::switch_wallet,
             commands::auth::delete_wallet,
             commands::auth::rename_wallet,
