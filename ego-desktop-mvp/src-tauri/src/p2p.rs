@@ -1828,10 +1828,10 @@ async fn build_swarm(
                 .build()
                 .expect("gossipsub config");
             let gossipsub_behaviour = gossipsub::Behaviour::new(
-                // Author mode: libp2p signs every gossip message with the node's
+                // Signed mode: libp2p signs every gossip message with the node's
                 // private key and verifies peer signatures on receive.
                 // This prevents message spoofing at the transport layer.
-                gossipsub::MessageAuthenticity::Author(peer_id),
+                gossipsub::MessageAuthenticity::Signed(key.clone()),
                 gossipsub_config,
             )
             .expect("gossipsub::Behaviour");
