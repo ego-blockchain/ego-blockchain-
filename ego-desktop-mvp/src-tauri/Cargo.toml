@@ -64,8 +64,6 @@ bincode  = { version = "2.0.1", features = ["serde"] }
 dirs = "5.0"
 fs2  = "0.4"
 
-[target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["dpapi", "wincrypt", "winbase", "dwmapi", "windef"] }
 opener = "0.6"
 local-ip-address = "0.6"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
@@ -81,6 +79,9 @@ libp2p = { version = "0.56", features = [
     "request-response", "ping", "macros", "ed25519",
     "gossipsub", "kad",
 ] }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["dpapi", "wincrypt", "winbase", "dwmapi", "windef"] }
 
 
 [features]

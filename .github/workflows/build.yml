@@ -134,7 +134,10 @@ jobs:
             libgtk-3-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            patchelf
+            patchelf \
+            musl-tools \
+            clang \
+            llvm
 
       - name: Install frontend dependencies
         working-directory: ego-desktop-mvp
@@ -158,6 +161,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EGO_AI_KEY: ${{ secrets.EGO_AI_KEY }}
+          CC_x86_64_unknown_linux_musl: clang
+          CXX_x86_64_unknown_linux_musl: clang++
+          AR_x86_64_unknown_linux_musl: llvm-ar
         with:
           projectPath: ego-desktop-mvp
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
