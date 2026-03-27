@@ -161,11 +161,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EGO_AI_KEY: ${{ secrets.EGO_AI_KEY }}
-          CC_x86_64_unknown_linux_musl: clang
-          CXX_x86_64_unknown_linux_musl: clang++
-          AR_x86_64_unknown_linux_musl: llvm-ar
         with:
           projectPath: ego-desktop-mvp
+          args: --target x86_64-unknown-linux-gnu
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: 'Ego Desktop ${{ github.ref_name }}'
           releaseBody: ${{ env.RELEASE_BODY }}
