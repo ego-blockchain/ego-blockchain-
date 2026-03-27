@@ -93,27 +93,44 @@ fn parse_contact_bundle(
     let parts: Vec<&str> = s.splitn(6, ':').collect();
 
     if parts.len() >= 5 {
+        let addr = parts[0].to_string();
 
-        let addr       = parts[0].to_string();
-        let ed25519    = parts[1].to_string();
-        let kyber      = parts[2].to_string();
-        let name       = STANDARD.decode(parts[3]).ok()
-            .and_then(|b| String::from_utf8(b).ok())
-            .unwrap_or_else(|| "Unknown".to_string());
-        let shared_key = parts[4].to_string();
-        let endpoint   = parts.get(5)
-            .and_then(|e| STANDARD.decode(e.trim()).ok())
-            .and_then(|b| String::from_utf8(b).ok());
-        Some((addr, ed25519, kyber, name, shared_key, endpoint))
+        // New format (v2): addr:ed25519_b64:name_b64:endpoint_b64:token
+        // Old format:      addr:ed25519_hex:kyber_hex:name_b64:shared_key_hex[:endpoint_b64]
+        // Distinguish by whether parts[1] is valid hex (old) or base64 (new).
+        let is_new_format = hex::decode(parts[1]).is_err();
+
+        if is_new_format {
+            let ed25519  = parts[1].to_string();
+            let name     = STANDARD.decode(parts[2]).ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or_else(|| "Unknown".to_string());
+            let endpoint = STANDARD.decode(parts[3]).ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .filter(|e| !e.is_empty());
+            Some((addr, ed25519, String::new(), name, String::new(), endpoint))
+        } else {
+            let ed25519    = parts[1].to_string();
+            let kyber      = parts[2].to_string();
+            let name       = STANDARD.decode(parts[3]).ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or_else(|| "Unknown".to_string());
+            let shared_key = parts[4].to_string();
+            let endpoint   = parts.get(5)
+                .and_then(|e| STANDARD.decode(e.trim()).ok())
+                .and_then(|b| String::from_utf8(b).ok())
+                .filter(|e| !e.is_empty());
+            Some((addr, ed25519, kyber, name, shared_key, endpoint))
+        }
     } else if parts.len() == 4 {
-
         let addr     = parts[0].to_string();
         let ed25519  = hex::encode(STANDARD.decode(parts[1]).unwrap_or_default());
         let name     = STANDARD.decode(parts[2]).ok()
             .and_then(|b| String::from_utf8(b).ok())
             .unwrap_or_else(|| "Unknown".to_string());
         let endpoint = STANDARD.decode(parts[3].trim()).ok()
-            .and_then(|b| String::from_utf8(b).ok());
+            .and_then(|b| String::from_utf8(b).ok())
+            .filter(|e| !e.is_empty());
         Some((addr, ed25519, String::new(), name, String::new(), endpoint))
     } else {
         None
@@ -333,15 +350,23 @@ pub async fn get_my_contact_bundle(
     let ed25519_b64 = STANDARD.encode(keypair.ed25519_public_key().as_bytes());
     let name_b64    = STANDARD.encode(my_name.trim().as_bytes());
 
-    // Return immediately if we already have a relay circuit (the common case —
-    // circuit is ready within 3-5 s of startup, well before the user opens
-    // the contact card screen). Only block if we genuinely don't have it yet.
+    // Prefer a relay circuit (works across NAT); fall back to whatever the swarm
+    // has (public IP or LAN IP). Both are valid endpoints — LAN works fine for
+    // same-machine / local-network testing. Only block if the swarm isn't
+    // running at all (truly empty endpoint).
     let current = p2p::get_public_endpoint().await;
     let public_endpoint = if current.contains("/p2p-circuit") {
         current
+    } else if !current.is_empty() {
+        current
     } else {
-        p2p::wait_for_public_endpoint(3).await
+        p2p::wait_for_public_endpoint(5).await
     };
+    if public_endpoint.is_empty() {
+        return Err(EgoDesktopError::InvalidInput(
+            "P2P network not started yet — please wait a few seconds and try again.".into(),
+        ));
+    }
     let endpoint_b64 = STANDARD.encode(public_endpoint.as_bytes());
 
     // Ensure a bundle token exists in the ledger
@@ -415,8 +440,8 @@ pub async fn import_contact(
     let endpoint = endpoint_opt.unwrap_or_default();
     if endpoint.is_empty() {
         return Err(EgoDesktopError::InvalidInput(
-            "This contact bundle is from an older version and does not include a network endpoint. \
-             Ask the contact to regenerate their card with the latest Ego Desktop.".into(),
+            "This contact card has no network endpoint — it was likely generated before the P2P relay connected. \
+             Ask the contact to wait for P2P to connect and regenerate their card.".into(),
         ));
     }
 
