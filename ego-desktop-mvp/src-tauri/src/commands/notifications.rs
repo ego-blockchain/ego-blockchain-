@@ -18,7 +18,7 @@ pub fn notify(app: &AppHandle, title: &str, body: &str) {
         .map(|d| d.join("icons").join("icon.png"))
         .filter(|p| p.exists())
     {
-        n = n.icon(&p.to_string_lossy());
+        n = n.icon(p.to_string_lossy().as_ref());
     }
     if let Err(e) = n.show() {
         eprintln!("[notify] {e}");
