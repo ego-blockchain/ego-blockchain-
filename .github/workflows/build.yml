@@ -155,10 +155,10 @@ jobs:
         run: npm run build
 
       - name: Build Tauri app (gnu — avoids musl RocksDB compile failure)
-        working-directory: ego-desktop-mvp/src-tauri
+        working-directory: ego-desktop-mvp
         env:
           EGO_AI_KEY: ${{ secrets.EGO_AI_KEY }}
-        run: cargo tauri build --target x86_64-unknown-linux-gnu
+        run: npx tauri build --target x86_64-unknown-linux-gnu
 
       - name: Upload Linux artifacts to release
         if: github.ref_type == 'tag'
