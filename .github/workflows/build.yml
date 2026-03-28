@@ -134,7 +134,33 @@ jobs:
             libgtk-3-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            patchelf
+            patchelf \
+            clang \
+            lld \
+            llvm \
+            musl-dev \
+            musl-tools
+
+          # @tauri-apps/cli v1 forces x86_64-unknown-linux-musl for AppImage builds.
+          # cc-rs needs a C++ compiler named exactly "x86_64-linux-musl-g++".
+          # Provide clang++ as a wrapper — it supports the musl target natively.
+          sudo tee /usr/local/bin/x86_64-linux-musl-g++ > /dev/null << 'WRAPPER'
+          #!/bin/sh
+          exec clang++ --target=x86_64-linux-musl -isystem /usr/include/x86_64-linux-musl "$@"
+          WRAPPER
+          sudo chmod +x /usr/local/bin/x86_64-linux-musl-g++
+
+          sudo tee /usr/local/bin/x86_64-linux-musl-gcc > /dev/null << 'WRAPPER'
+          #!/bin/sh
+          exec clang --target=x86_64-linux-musl -isystem /usr/include/x86_64-linux-musl "$@"
+          WRAPPER
+          sudo chmod +x /usr/local/bin/x86_64-linux-musl-gcc
+
+          # Also provide llvm-ar as the archiver for musl builds
+          sudo ln -sf /usr/bin/llvm-ar /usr/local/bin/x86_64-linux-musl-ar 2>/dev/null || true
+
+      - name: Add musl Rust target
+        run: rustup target add x86_64-unknown-linux-musl
 
       - name: Install frontend dependencies
         working-directory: ego-desktop-mvp
@@ -154,11 +180,11 @@ jobs:
         working-directory: ego-desktop-mvp
         run: npm run build
 
-      - name: Build Tauri app (gnu — avoids musl RocksDB compile failure)
+      - name: Build Tauri app
         working-directory: ego-desktop-mvp
         env:
           EGO_AI_KEY: ${{ secrets.EGO_AI_KEY }}
-        run: npx tauri build --target x86_64-unknown-linux-gnu
+        run: npx tauri build
 
       - name: Upload Linux artifacts to release
         if: github.ref_type == 'tag'
@@ -168,5 +194,5 @@ jobs:
           name: Ego Desktop ${{ github.ref_name }}
           body: ${{ env.RELEASE_BODY }}
           files: |
-            ego-desktop-mvp/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
-            ego-desktop-mvp/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+            ego-desktop-mvp/src-tauri/target/x86_64-unknown-linux-musl/release/bundle/appimage/*.AppImage
+            ego-desktop-mvp/src-tauri/target/x86_64-unknown-linux-musl/release/bundle/deb/*.deb
