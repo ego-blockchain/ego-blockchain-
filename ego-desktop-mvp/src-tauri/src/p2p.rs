@@ -4118,9 +4118,9 @@ pub async fn oracle_sync_chain() {
         // Forward block metadata to relay for block-spike detection.
         let relay_block_url = format!("{}/block/alert", RELAY_RPC);
         let relay_block_body = serde_json::json!({
-            "height":   block.index,
+            "height":   block.height,
             "hash":     block.hash,
-            "tx_count": block.transactions.len() as u32,
+            "tx_count": block.tx_count,
             "timestamp": block.timestamp,
             "miner":    block.miner,
         });

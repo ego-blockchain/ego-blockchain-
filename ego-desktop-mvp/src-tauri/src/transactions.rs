@@ -1,6 +1,6 @@
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
-use crate::ledger::{load_chain, tx_signing_bytes, Ledger, LedgerTx};
+use crate::ledger::{load_chain, tx_signing_bytes, tx_signing_bytes_v2, tx_human_summary, Ledger, LedgerTx};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -20,12 +20,12 @@ pub struct SendTransactionRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TransactionResponse {
-    pub hash:         String,
-    pub success:      bool,
-    pub message:      String,
-    pub block_height: Option<u64>,
-
-    pub peers_reached: usize,
+    pub hash:           String,
+    pub success:        bool,
+    pub message:        String,
+    pub block_height:   Option<u64>,
+    pub peers_reached:  usize,
+    pub signed_summary: Option<String>,
 }
 
 #[tauri::command]
@@ -82,7 +82,11 @@ pub async fn send_transaction(
 
     let nonce      = ledger.nonce + 1;
     let ts         = chrono::Utc::now().timestamp();
-    let sign_bytes = tx_signing_bytes(&from, &request.to_address, request.amount, nonce, ts);
+    let memo_str   = request.memo.as_deref().unwrap_or("");
+    const CHAIN_ID: u8 = 1; // testnet
+    let sign_bytes = tx_signing_bytes_v2(
+        &from, &request.to_address, request.amount, nonce, ts, CHAIN_ID, memo_str,
+    );
 
     // Hybrid signing: Ed25519 (classical) + ML-DSA-44 (post-quantum).
     // Both signatures must verify — attacker needs to break BOTH schemes.
@@ -99,6 +103,9 @@ pub async fn send_transaction(
         };
 
     let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+    let summary = tx_human_summary(
+        &from, &request.to_address, request.amount, memo_str, CHAIN_ID, nonce, 0,
+    );
 
     crate::mempool::get_mempool().push(LedgerTx {
         hash:                tx_hash.clone(),
@@ -113,6 +120,9 @@ pub async fn send_transaction(
         status:              "Pending".into(),
         block_height:        None,
         nonce,
+        tx_version:          2,
+        chain_id:            CHAIN_ID,
+        signed_summary:      summary.clone(),
         ..LedgerTx::default()
     });
 
@@ -120,11 +130,12 @@ pub async fn send_transaction(
     let _ = ledger.save();
 
     Ok(TransactionResponse {
-        hash:          tx_hash,
-        success:       true,
-        message:       "Transaction queued — confirms within the next batch window".into(),
-        block_height:  None,
-        peers_reached: 0,
+        hash:           tx_hash,
+        success:        true,
+        message:        "Transaction queued — confirms within the next batch window".into(),
+        block_height:   None,
+        peers_reached:  0,
+        signed_summary: Some(summary),
     })
 }
 
