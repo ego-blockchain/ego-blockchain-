@@ -1,4 +1,5 @@
 mod mailbox;
+mod alerts;
 
 use futures::StreamExt;
 use libp2p::{
@@ -41,8 +42,10 @@ async fn main() -> anyhow::Result<()> {
     info!("║  HTTP port: {}                                    ║", MAILBOX_PORT);
     info!("╚══════════════════════════════════════════════════════╝");
 
-    let store      = mailbox::new_store();
-    let http_app   = mailbox::router(store);
+    let store        = mailbox::new_store();
+    let alert_store  = alerts::new_alert_store();
+    let http_app     = mailbox::router(store)
+        .merge(alerts::alert_router(alert_store));
     let http_bind  = format!("0.0.0.0:{}", MAILBOX_PORT);
     let http_listener = tokio::net::TcpListener::bind(&http_bind).await?;
     info!("[Mailbox] HTTP listening on {}", http_bind);

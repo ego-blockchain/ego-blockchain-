@@ -149,6 +149,9 @@ pub const ORACLE_RPCS: &[&str] = &[
 
 pub const ORACLE_RPC: &str = ORACLE_RPCS[0];
 
+/// Ego Relay HTTP endpoint — alert system (port 4002)
+pub const RELAY_RPC: &str = "https://relay.egoblockchain.com:4002";
+
 
 async fn oracle_get(client: &reqwest::Client, path: &str) -> Option<reqwest::Response> {
     for base in ORACLE_RPCS {
@@ -4112,13 +4115,26 @@ pub async fn oracle_sync_chain() {
         if let Ok(body) = serde_json::to_value(block) {
             oracle_post(&client, "/block/broadcast", &body).await;
         }
+        // Forward block metadata to relay for block-spike detection.
+        let relay_block_url = format!("{}/block/alert", RELAY_RPC);
+        let relay_block_body = serde_json::json!({
+            "height":   block.index,
+            "hash":     block.hash,
+            "tx_count": block.transactions.len() as u32,
+            "timestamp": block.timestamp,
+            "miner":    block.miner,
+        });
+        let _ = client.post(&relay_block_url).json(&relay_block_body).send().await;
     }
     for tx in &chain.transactions {
         if let Ok(body) = serde_json::to_value(tx) {
             oracle_post(&client, "/tx/broadcast", &body).await;
+            // Also forward to relay alert system for anomaly detection.
+            let relay_tx_url = format!("{}/tx/broadcast", RELAY_RPC);
+            let _ = client.post(&relay_tx_url).json(&body).send().await;
         }
     }
-    eprintln!("[Oracle] Synced {} blocks, {} txs to Oracle explorer",
+    eprintln!("[Oracle] Synced {} blocks, {} txs to Oracle + Relay",
         chain.blocks.len(), chain.transactions.len());
 }
 
