@@ -36,9 +36,11 @@ pub fn p2p_port() -> u16 {
 pub const P2P_PORT: u16 = 47393;
 
 pub const RELAY_NODES: &[&str] = &[
+    // Primary oracle relay (egoblockchain.com VPS)
     "/dns4/EgoRelay.egoblockchain.com/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz",
-    "/dns4/relay2.egoblockchain.com/tcp/4001/p2p/12D3KooWQmPfBcVfJNRhc8xBYU4P5NqiEv8LxAmcMMXRbExVyDmP",
-    "/dns4/relay3.egoblockchain.com/tcp/4001/p2p/12D3KooWGt8YmaNRQkHQ2Voytw5JBjNEJiRJmkT2MUwcBVyFfmrN",
+    // Founder home node — DuckDNS fallback (port 47393 forwarded, auto-updated every 5min)
+    "/dns4/ego-discreet.duckdns.org/tcp/47393/p2p/12D3KooWCgHu8eV41nL7xdw9UKXSi6ayzEJf2W5iGmq6VMUdpyaz",
+    // ^ uncomment after: 1) port-forward 47393 on Telus router, 2) get PeerID from app logs
 ];
 
 static EGOC_PRICE_USD: std::sync::OnceLock<std::sync::Mutex<f64>> = std::sync::OnceLock::new();
@@ -55,6 +57,9 @@ fn price_samples() -> std::sync::MutexGuard<'static, std::collections::VecDeque<
         .unwrap()
 }
 
+/// Current market price of EGOC in USD. Used as default until oracle/CoinGecko overrides it.
+pub const EGOC_DEFAULT_PRICE_USD: f64 = 2.45;
+
 pub fn get_egoc_price_usd() -> f64 {
     let samples = price_samples();
     if samples.len() >= 3 {
@@ -62,13 +67,13 @@ pub fn get_egoc_price_usd() -> f64 {
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         sorted[sorted.len() / 2]
     } else {
-        *EGOC_PRICE_USD.get_or_init(|| std::sync::Mutex::new(0.01)).lock().unwrap()
+        *EGOC_PRICE_USD.get_or_init(|| std::sync::Mutex::new(EGOC_DEFAULT_PRICE_USD)).lock().unwrap()
     }
 }
 
 fn set_egoc_price_usd(price: f64) {
     if price <= 0.0 { return; }
-    *EGOC_PRICE_USD.get_or_init(|| std::sync::Mutex::new(0.01)).lock().unwrap() = price;
+    *EGOC_PRICE_USD.get_or_init(|| std::sync::Mutex::new(EGOC_DEFAULT_PRICE_USD)).lock().unwrap() = price;
     let mut samples = price_samples();
     samples.push_back(price);
     if samples.len() > PRICE_WINDOW { samples.pop_front(); }
@@ -83,20 +88,25 @@ pub fn record_gossip_price(price: f64) {
 }
 
 
+// CoinGecko coin IDs to try in order.
+const COINGECKO_IDS: &[&str] = &["ego-coin", "egocoin", "egoc"];
+
 pub async fn fetch_and_cache_egoc_price() {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(8))
+        .user_agent("EgoDesktop/1.0")
         .build()
         .unwrap_or_default();
+
+    // ── 1. Try oracle first ───────────────────────────────────────────────────
     if let Some(resp) = oracle_get(&client, "/price/egoc").await {
         if let Ok(json) = resp.json::<serde_json::Value>().await {
             if let Some(price) = json["price_usd"].as_f64().filter(|&p| p > 0.0) {
                 let old = get_egoc_price_usd();
                 set_egoc_price_usd(price);
                 if (price - old).abs() / old > 0.05 {
-                    eprintln!("[Price] EGOC/USD updated: ${:.6} → ${:.6}", old, price);
+                    eprintln!("[Price] EGOC/USD (oracle): ${:.6} → ${:.6}", old, price);
                 }
-
                 if let Ok(data) = serde_json::to_vec(&serde_json::json!({ "price": price })) {
                     publish_gossip("ego-price-v1", data).await;
                 }
@@ -104,6 +114,29 @@ pub async fn fetch_and_cache_egoc_price() {
             }
         }
     }
+
+    // ── 2. Fallback: CoinGecko free API ──────────────────────────────────────
+    for coin_id in COINGECKO_IDS {
+        let url = format!(
+            "https://api.coingecko.com/api/v3/simple/price?ids={}&vs_currencies=usd",
+            coin_id
+        );
+        if let Ok(resp) = client.get(&url).send().await {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(price) = json[coin_id]["usd"].as_f64().filter(|&p| p > 0.0) {
+                    let old = get_egoc_price_usd();
+                    set_egoc_price_usd(price);
+                    eprintln!("[Price] EGOC/USD (coingecko/{coin_id}): ${:.6} → ${:.6}", old, price);
+                    if let Ok(data) = serde_json::to_vec(&serde_json::json!({ "price": price })) {
+                        publish_gossip("ego-price-v1", data).await;
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    eprintln!("[Price] All price sources failed — keeping ${:.6}", get_egoc_price_usd());
 }
 
 
@@ -174,6 +207,35 @@ fn pending_votes() -> std::sync::MutexGuard<'static, HashMap<String, Vec<String>
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
         .lock()
         .unwrap()
+}
+
+// Per-peer available storage advertised via DataManifest gossip.
+static PEER_STORAGE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, f64>>> =
+    std::sync::OnceLock::new();
+
+fn peer_storage() -> std::sync::MutexGuard<'static, HashMap<String, f64>> {
+    PEER_STORAGE
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+}
+
+/// Returns (total_allocated_gb, total_available_gb, node_count) across all known peers + self.
+pub fn get_network_capacity() -> (f64, f64, usize) {
+    let ledger     = crate::ledger::Ledger::load();
+    let self_addr  = ledger.address.clone();
+    let self_used  = ledger.stored_files.iter().map(|f| f.encrypted_size as f64).sum::<f64>() / 1_000_000_000.0;
+    let self_alloc = ledger.storage_allocated_bytes as f64 / 1_000_000_000.0;
+    let self_avail = (self_alloc - self_used).max(0.0);
+
+    let peers      = peer_storage();
+    let peer_avail: f64 = peers.values().sum();
+    let peer_count = peers.len();
+
+    let total_avail = self_avail + peer_avail;
+    let total_alloc = (total_avail / 0.85).max(self_alloc); // 85% headroom assumption
+    let node_count  = peer_count + if self_addr.is_empty() { 0 } else { 1 };
+    (total_alloc, total_avail, node_count)
 }
 
 static KNOWN_VALIDATORS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
@@ -1221,6 +1283,12 @@ pub fn get_known_peers() -> Vec<String> {
         .collect()
 }
 
+/// Returns true if we have at least one direct P2P connection.
+/// Used to gate operations that require network (e.g. DHT publish).
+pub fn has_connectivity() -> bool {
+    DIRECT_PEER_COUNT.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
 pub async fn broadcast_shard_announce() {
     let ledger = crate::ledger::Ledger::load();
     let my_addr = ledger.address.clone();
@@ -1354,6 +1422,10 @@ pub async fn check_file_replication() {
 
     let mut need_save   = false;
     let mut pin_needed: Vec<String> = Vec::new();
+
+    // ── Re-publish under-distributed Active files when connectivity returns ───
+    // Files stored while offline have replication_role="" and replica_peers=[].
+    // The master/slave logic below will pick them up on the next tick once connected.
 
     for file in ledger.stored_files.iter_mut() {
         if file.status != "Active" { continue; }
@@ -2616,6 +2688,11 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
         P2PMessage::DataManifest { from_addr, cids, available_gb, is_relay, endpoint } => {
             eprintln!("[P2P] DataManifest from {} — {} CIDs, {:.1}GB free, relay={}",
                 from_addr, cids.len(), available_gb, is_relay);
+
+            // Track per-peer available storage for network capacity calculation.
+            if !from_addr.is_empty() {
+                peer_storage().insert(from_addr.clone(), available_gb);
+            }
 
             if is_relay && !endpoint.is_empty() {
                 peer_relay_nodes().insert(from_addr.clone(), endpoint.clone());
@@ -3926,6 +4003,32 @@ async fn merge_remote_chain_inner(
 
     for block in blocks {
         if block.height == 0 { continue; }
+
+        // ── Chain continuity check ────────────────────────────────────────────
+        // Reject blocks that belong to a different fork: if we already have the
+        // parent block (height - 1), the incoming block's prev_hash must match
+        // its hash. This stops old-chain blocks from foreign peers being absorbed.
+        if block.height > 0 {
+            let parent_height = block.height - 1;
+            let expected_prev = if parent_height == 0 {
+                crate::ledger::GENESIS_HASH.to_string()
+            } else if let Some(parent) = crate::chain_db::get_block_by_height(parent_height) {
+                parent.hash.clone()
+            } else {
+                // We don't have the parent yet — accept tentatively (gap fill).
+                block.prev_hash.clone()
+            };
+            if block.prev_hash != expected_prev {
+                eprintln!(
+                    "[P2P] Block #{} rejected: prev_hash mismatch (got {} expected {})",
+                    block.height,
+                    &block.prev_hash[..8.min(block.prev_hash.len())],
+                    &expected_prev[..8.min(expected_prev.len())]
+                );
+                continue;
+            }
+        }
+
         if trusted {
             new_blocks.push(block);
         } else {
@@ -4324,7 +4427,9 @@ pub async fn propose_block_as_leader() {
     if miner.is_empty() { return; }
 
     let pool = crate::mempool::get_mempool();
+    if pool.pending_count() == 0 { return; }  // No-op: don't produce empty blocks
     let txs  = pool.drain_all();
+    if txs.is_empty() { return; }
 
     let prev_hash = crate::chain_db::get_tip_hash();
     let (poc_ticket, poc_sig) = crate::poc::check_slot_winner(&prev_hash)

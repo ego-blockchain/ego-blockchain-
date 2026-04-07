@@ -67,6 +67,9 @@ pub async fn send_transaction(
     let mut chain   = load_chain();
     let balance     = chain.balance_of(&from);
 
+    if request.to_address.trim() == from.trim() {
+        return Err(EgoDesktopError::InvalidInput("Cannot send to your own address".into()));
+    }
     if request.amount == 0 {
         return Err(EgoDesktopError::InvalidInput("Amount must be > 0".into()));
     }

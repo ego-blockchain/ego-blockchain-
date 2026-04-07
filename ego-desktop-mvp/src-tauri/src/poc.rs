@@ -21,14 +21,24 @@ fn uptime_hours() -> u64 {
 
 static PEER_SCORES: OnceCell<Mutex<HashMap<String, u64>>> = OnceCell::new();
 
+const MAX_PEER_SCORES: usize = 50_000;
+
 fn peer_scores() -> std::sync::MutexGuard<'static, HashMap<String, u64>> {
     PEER_SCORES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
 }
 
 /// Store a coverage score received from a peer via PeerAnnounce.
+/// Capped at MAX_PEER_SCORES entries to prevent unbounded memory growth.
 pub fn record_peer_score(address: &str, score: u64) {
     if address.is_empty() || score == 0 { return; }
-    peer_scores().insert(address.to_string(), score);
+    let mut map = peer_scores();
+    if map.len() >= MAX_PEER_SCORES && !map.contains_key(address) {
+        // Evict the lowest-scoring peer to make room.
+        if let Some(min_key) = map.iter().min_by_key(|(_, v)| *v).map(|(k, _)| k.clone()) {
+            map.remove(&min_key);
+        }
+    }
+    map.insert(address.to_string(), score);
 }
 
 /// Estimated total network coverage = sum of all known peer scores + this node.
@@ -145,7 +155,16 @@ pub fn verify_ticket(
 
     let ed25519_pk = crate::p2p::get_peer_ed25519_pubkey(proposer);
     match ed25519_pk {
-        None => true,
+        None => {
+            // Pubkey not yet in peer cache.
+            // Below enforcement height we allow it (bootstrap phase).
+            // Above it we reject — an unknown proposer could be an attacker.
+            if block_height < POC_ENFORCE_HEIGHT {
+                return true;
+            }
+            eprintln!("[PoC] Block #{} rejected — unknown proposer {} (pubkey not in peer cache)", block_height, proposer);
+            return false;
+        }
         Some(pk_bytes) => {
             use ed25519_dalek::{Signature as DalekSig, VerifyingKey, Verifier};
             let vk = match VerifyingKey::from_bytes(&pk_bytes) {

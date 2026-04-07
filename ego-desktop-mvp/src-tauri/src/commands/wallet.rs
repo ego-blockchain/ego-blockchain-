@@ -13,8 +13,42 @@ use crate::ledger::PresaleIouRecord;
 static PENDING_TXS: Lazy<Mutex<HashMap<String, (LedgerTx, i64)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-static TX_ATTEMPTS: Lazy<Mutex<HashMap<String, u32>>> =
+/// Validate an Ego bech32 address.
+///
+/// Rules:
+/// - Must start with `egot1` (testnet EOA) or one of the known system prefixes.
+/// - Must not be empty or exceed 100 characters (prevents DoS / garbage-in).
+/// - Must be ASCII alphanumeric only (bech32 charset).
+fn validate_ego_address(addr: &str) -> Result<(), EgoDesktopError> {
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return Err(EgoDesktopError::InvalidInput("Recipient address is empty".into()));
+    }
+    if addr.len() > 100 {
+        return Err(EgoDesktopError::InvalidInput(
+            "Address too long (max 100 characters)".into(),
+        ));
+    }
+    // Accept egot1… (user EOA) and egot1staking…/egot1rewards…/egot1faucet… (system)
+    if !addr.starts_with("egot1") && !addr.starts_with("ego1") {
+        return Err(EgoDesktopError::InvalidInput(
+            "Invalid address: must start with 'egot1' (testnet) or 'ego1' (mainnet)".into(),
+        ));
+    }
+    // bech32 charset: a-z 0-9, no uppercase, no special characters
+    if !addr.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Err(EgoDesktopError::InvalidInput(
+            "Invalid address: contains non-bech32 characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+// Tracks (attempt_count, expiry_ts) — entries expire 1 hour after first attempt.
+static TX_ATTEMPTS: Lazy<Mutex<HashMap<String, (u32, i64)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+const MAX_PENDING_TXS: usize = 1_000;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Balance {
@@ -49,8 +83,8 @@ pub async fn get_balance(_state: State<'_, AppState>) -> Result<Balance, EgoDesk
         return Ok(Balance { egoc: 0, uegoc: 0, formatted: "0.00 EGOC".into(), egusd: 0, uegusd: 0 });
     }
 
-    let chain = load_chain();
-    let uegoc = chain.balance_of(&my_addr);
+    // Direct O(1) RocksDB CF_BALANCES lookup — no need to deserialise 500 blocks.
+    let uegoc = crate::chain_db::balance_of(&my_addr);
     let egoc  = uegoc / 1_000_000;
 
     let uegusd = ledger.balance_uegusd;
@@ -92,6 +126,15 @@ pub async fn send_transaction(
 
     if request.amount == 0 {
         return Err(EgoDesktopError::InvalidInput("Amount must be > 0".into()));
+    }
+    validate_ego_address(&request.to_address)?;
+    if request.to_address.trim() == from.trim() {
+        return Err(EgoDesktopError::InvalidInput("Cannot send to your own address".into()));
+    }
+    if let Some(ref memo) = request.memo {
+        if memo.len() > 256 {
+            return Err(EgoDesktopError::InvalidInput("Memo too long (max 256 chars)".into()));
+        }
     }
     let is_staker = ledger.staked_amount > 0;
     let fee = crate::tokenomics::fee_for_tx_with_staking("transfer", is_staker);
@@ -141,7 +184,8 @@ pub async fn send_transaction(
         ..LedgerTx::default()
     };
 
-    crate::mempool::get_mempool().push(tx);
+    crate::mempool::get_mempool().push(tx.clone());
+    crate::commands::tx_pending::add(&tx);
 
     ledger.nonce = nonce;
     let _ = ledger.save();
@@ -194,6 +238,15 @@ pub async fn prepare_transaction(
     let balance   = chain.balance_of(&from);
     if request.amount == 0 {
         return Err(EgoDesktopError::InvalidInput("Amount must be > 0".into()));
+    }
+    validate_ego_address(&request.to_address)?;
+    if request.to_address.trim() == from.trim() {
+        return Err(EgoDesktopError::InvalidInput("Cannot send to your own address".into()));
+    }
+    if let Some(ref memo) = request.memo {
+        if memo.len() > 256 {
+            return Err(EgoDesktopError::InvalidInput("Memo too long (max 256 chars)".into()));
+        }
     }
     if request.amount > balance {
         return Err(EgoDesktopError::InvalidInput(format!(
@@ -312,6 +365,7 @@ pub async fn get_transaction_history(
         .collect();
 
     txs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    txs.truncate(500); // Cap at 500 most-recent — prevents OOM with millions of TXs
     Ok(txs)
 }
 
@@ -509,6 +563,15 @@ pub async fn request_tx_code(
     if from.is_empty() {
         return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
     }
+    validate_ego_address(&request.to_address)?;
+    if request.to_address.trim() == from.trim() {
+        return Err(EgoDesktopError::InvalidInput("Cannot send to your own address".into()));
+    }
+    if let Some(ref memo) = request.memo {
+        if memo.len() > 256 {
+            return Err(EgoDesktopError::InvalidInput("Memo too long (max 256 chars)".into()));
+        }
+    }
     if email.is_empty() {
         return Err(EgoDesktopError::InvalidInput(
             "No email on file. Set an email in Settings to use 2FA.".into(),
@@ -576,7 +639,12 @@ pub async fn request_tx_code(
     crate::email::store_otp(&format!("tx:{}", tx_id), &code);
     {
         let mut map = PENDING_TXS.lock().unwrap();
-        map.retain(|_, (_, exp)| *exp > ts);
+        map.retain(|_, (_, exp)| *exp > ts); // prune expired
+        if map.len() >= MAX_PENDING_TXS {
+            return Err(EgoDesktopError::InvalidInput(
+                "Too many pending transactions. Please wait and try again.".into(),
+            ));
+        }
         map.insert(tx_id.clone(), (tx.clone(), expiry));
     }
 
@@ -610,14 +678,16 @@ pub async fn confirm_tx_code(
 
     let valid = crate::email::verify_otp(&format!("tx:{}", tx_id), code.trim());
     if !valid {
+        let now_ts = chrono::Utc::now().timestamp();
         let attempts = {
             let mut map = TX_ATTEMPTS.lock().unwrap();
-            let count = map.entry(tx_id.clone()).or_insert(0);
-            *count += 1;
-            *count
+            // Purge expired attempt records to keep map bounded.
+            map.retain(|_, (_, exp)| *exp > now_ts);
+            let entry = map.entry(tx_id.clone()).or_insert((0, now_ts + 3_600));
+            entry.0 += 1;
+            entry.0
         };
         if attempts >= 3 {
-
             PENDING_TXS.lock().unwrap().remove(&tx_id);
             TX_ATTEMPTS.lock().unwrap().remove(&tx_id);
             return Err(EgoDesktopError::InvalidInput(

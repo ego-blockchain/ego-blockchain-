@@ -436,6 +436,10 @@ const WalletPage: React.FC = () => {
 
   async function handleSend() {
     if (!sendForm.to || !sendForm.amount) return;
+    if (sendForm.to.trim() === myAddress.trim()) {
+      setTxResult({ hash: '', success: false, message: 'Cannot send to your own address' });
+      return;
+    }
     setSending(true);
     try {
       const amount  = Math.floor(parseFloat(sendForm.amount) * 1_000_000);
@@ -2124,6 +2128,11 @@ const WalletPage: React.FC = () => {
                   You will receive <strong>{swapOutput.toFixed(useChangenow ? 8 : 6)} {swapTo.symbol}</strong>.
                 </div>
 
+                {!useChangenow && (
+                  <div className="bg-red-500/10 border border-red-500/40 rounded-xl px-4 py-3 text-xs text-red-300">
+                    ⚠️ <span className="font-semibold">Bridge not live yet.</span> Do NOT send real crypto to the address below — it is a placeholder. The Ego bridge launches at mainnet. Testnet only.
+                  </div>
+                )}
                 <div className="bg-gray-900 rounded-xl p-4 space-y-2">
                   <div className="text-xs text-gray-400">
                     {useChangenow ? 'ChangeNow Deposit Address' : 'Bridge Deposit Address'} ({swapFrom.symbol})
@@ -2347,7 +2356,7 @@ const WalletPage: React.FC = () => {
 
       {}
       {showSend && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm" onClick={e => { if (e.target === e.currentTarget) setShowSend(false); }}>
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
           <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-md border border-gray-700 shadow-2xl">
             {emailStep === 'code_entry' ? (
               <div className="space-y-5">

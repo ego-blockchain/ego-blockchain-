@@ -16,6 +16,7 @@ interface EarningsData {
   pending_rewards: number;
   session_started: number;
   coverage_online: boolean;
+  reward_suspended_until: number | null;
 }
 
 interface StorageMetrics {
@@ -62,6 +63,8 @@ const EarningsPage: React.FC = () => {
   const [pocScore, setPocScore]           = useState<PocScoreResult | null>(null);
   const [p2pStatus, setP2pStatus]         = useState<P2pStatus | null>(null);
   const [lastPocMsg, setLastPocMsg]       = useState<string>('');
+  const [coverageQuality, setCoverageQuality] = useState<string>('Good');
+  const [coveragePeers, setCoveragePeers]     = useState<number>(0);
 
   const [sessionEarned, setSessionEarned] = useState(0);
 
@@ -92,7 +95,7 @@ const EarningsPage: React.FC = () => {
     try {
       const result = await invoke<{ success: boolean; message: string; reward_uegoc: number }>(
         'submit_poc_event',
-        { quality: 'Good', peers: 3, h3Cell: null }
+        { quality: coverageQuality, peers: coveragePeers, h3Cell: null }
       );
       if (result.success) {
         setLastPocMsg(`+${(result.reward_uegoc / 1_000_000).toFixed(6)} EGOC PoC reward`);
@@ -117,12 +120,17 @@ const EarningsPage: React.FC = () => {
 
   async function loadAll() {
     try {
-      const [e, m] = await Promise.all([
+      const [e, m, cov] = await Promise.all([
         invoke<EarningsData>('get_earnings_data'),
         invoke<StorageMetrics>('get_storage_metrics'),
+        invoke<{ network_quality: string; coverage_synced_count: number }>('get_coverage_status').catch(() => null),
       ]);
       setEarnings(e);
       setStorageMeta(m);
+      if (cov) {
+        setCoverageQuality(cov.network_quality);
+        setCoveragePeers(cov.coverage_synced_count);
+      }
 
       const elapsed = Math.floor(Date.now() / 1000) - e.session_started;
       const perSec  = e.daily_rewards / 86_400;
@@ -210,6 +218,16 @@ const EarningsPage: React.FC = () => {
   return (
     <div className="p-6 space-y-5 max-w-4xl mx-auto">
 
+      {/* ── Testnet notice ─────────────────────────────────────────────────── */}
+      <div className="bg-blue-500/10 border border-blue-500/40 rounded-2xl px-5 py-3 flex items-center gap-3">
+        <span className="text-lg shrink-0">🧪</span>
+        <div className="text-xs text-blue-200/80">
+          <span className="font-semibold text-blue-300">Testnet — </span>
+          All earnings, DRS scores, and rewards shown here are testnet profits and will be
+          converted to real EGOC at mainnet launch based on your accumulated balance.
+        </div>
+      </div>
+
       {/* ── Keep app open warning ──────────────────────────────────────────── */}
       <div className="bg-yellow-500/10 border border-yellow-500/40 rounded-2xl px-5 py-4 flex items-start gap-3">
         <span className="text-2xl shrink-0 mt-0.5">⚠️</span>
@@ -225,6 +243,20 @@ const EarningsPage: React.FC = () => {
           <div className="font-mono text-sm font-bold text-yellow-300">{fmtDuration(uptime)}</div>
         </div>
       </div>
+
+      {/* ── Reward suspension warning ──────────────────────────────────────── */}
+      {earnings?.reward_suspended_until != null && earnings.reward_suspended_until > Math.floor(Date.now() / 1000) && (
+        <div className="bg-red-500/10 border border-red-500/40 rounded-2xl px-5 py-4 flex items-start gap-3">
+          <span className="text-2xl shrink-0 mt-0.5">🚫</span>
+          <div>
+            <div className="font-semibold text-red-400 text-sm">Rewards Suspended — Storage Reduction Penalty</div>
+            <div className="text-xs text-red-300/80 mt-0.5">
+              You reduced your storage allocation. All rewards are suspended for 14 days as a network penalty.
+              Resumes on <span className="font-semibold text-red-300">{new Date(earnings.reward_suspended_until * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}</span>.
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Price & reward model explanation ──────────────────────────────── */}
       <div className="bg-cyan-900/20 border border-cyan-500/30 rounded-2xl px-5 py-4 flex items-start gap-3">
@@ -411,7 +443,7 @@ const EarningsPage: React.FC = () => {
                 )}
               </div>
               <div className="flex justify-between items-center">
-                <span className="text-gray-400">DRS score (relay)</span>
+                <span className="text-gray-400">DRS score (relay) <span className="text-blue-400/70 text-xs font-normal">testnet</span></span>
                 {pocScore ? (
                   <span className={`font-semibold ${pocScore.drs_score > 0 ? 'text-green-400' : 'text-gray-500'}`}>
                     {pocScore.drs_score.toFixed(2)}

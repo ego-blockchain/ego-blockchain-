@@ -62,6 +62,12 @@ fn sync_reservation(allocated_bytes: u64) {
 pub struct StoreFileRequest {
     pub file_path: String,
     pub duration_months: u32,
+    /// When true the storage fee is waived (used for file sharing between users).
+    #[serde(default)]
+    pub free: bool,
+    /// When true the file was sent/received via EgoSafe — excluded from Storage tab.
+    #[serde(default)]
+    pub from_egosafe: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -90,6 +96,8 @@ pub struct StorageMetrics {
     pub peer_bytes_hosted: u64,
     /// Free bytes remaining on the local drive (for configure modal).
     pub disk_free_bytes: u64,
+    /// Unix timestamp when storage was last configured. Locked for 60 days from this point.
+    pub storage_configured_at: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -110,13 +118,19 @@ pub async fn store_file(
     use std::io::Read as _;
     use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
 
-    let file_name = std::path::Path::new(&request.file_path)
+    // Canonicalize the path to prevent directory traversal attacks.
+    // `canonicalize` resolves symlinks and `../` components, so we always
+    // operate on the real absolute path the user selected.
+    let canonical_path = std::fs::canonicalize(&request.file_path)
+        .map_err(|e| EgoDesktopError::FileSystemError(format!("Cannot resolve file path: {e}")))?;
+
+    let file_name = canonical_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
 
-    let original_size = fs::metadata(&request.file_path)
+    let original_size = fs::metadata(&canonical_path)
         .map_err(|e| EgoDesktopError::FileSystemError(format!("Cannot stat file: {e}")))?
         .len();
 
@@ -128,13 +142,70 @@ pub async fn store_file(
         )));
     }
 
+    // ── Subscription quota enforcement (backend gate) ─────────────────────────
+    // Reads the on-chain subscription tx to determine the user's quota.
+    // Falls back to FREE_GB (5 GB) if no valid subscription exists.
+    // Grace period: 30 days after expiry, the quota is still honoured.
+    {
+        let now_quota           = chrono::Utc::now().timestamp();
+        const FREE_BYTES:       u64 = 5  * 1_000_000_000;
+        const GRACE_SECS:       i64 = 30 * 86_400;
+
+        let ledger_quota = Ledger::load();
+        // Sum all active/pending-sync files owned by this user.
+        let used_bytes: u64 = ledger_quota.stored_files.iter()
+            .filter(|f| (f.status == "Active" || f.status == "PendingSync")
+                && (f.owner.is_empty() || f.owner == ledger_quota.address))
+            .map(|f| f.original_size)
+            .sum();
+
+        // Derive quota from the most recent valid subscription tx on chain.
+        let chain_quota_bytes: u64 = {
+            let chain = load_chain();
+            let sub_tx = chain.transactions.iter()
+                .filter(|tx| tx.from == ledger_quota.address
+                    && tx.tx_type == "transfer"
+                    && tx.to == "egot1storagefees000000000000000000000000000000"
+                    && tx.status == "Confirmed")
+                .max_by_key(|tx| tx.timestamp);
+
+            // Map memo to GB — memo format: "Ego Storage <Plan> – <billing> ($<usd>)"
+            match sub_tx {
+                Some(tx) => {
+                    let memo = tx.memo.as_deref().unwrap_or("");
+                    let gb: u64 = if memo.contains("Max")   { 1024 }
+                               else if memo.contains("Pro")   {  200 }
+                               else if memo.contains("Basic") {   50 }
+                               else                            {    5 };
+                    // Check expiry: monthly = 30 days, annual = 365 days from tx timestamp.
+                    let period_secs: i64 = if memo.contains("annual") { 365 * 86_400 } else { 30 * 86_400 };
+                    let expires_at  = tx.timestamp + period_secs;
+                    let in_grace    = now_quota < expires_at + GRACE_SECS;
+                    if in_grace { gb * 1_000_000_000 } else { FREE_BYTES }
+                }
+                None => FREE_BYTES,
+            }
+        };
+
+        let quota = chain_quota_bytes.max(FREE_BYTES);
+        if used_bytes + original_size > quota {
+            let quota_gb  = quota as f64 / 1_000_000_000.0;
+            let used_gb   = used_bytes as f64 / 1_000_000_000.0;
+            let file_mb   = original_size as f64 / 1_000_000.0;
+            return Err(EgoDesktopError::InvalidInput(format!(
+                "Storage quota exceeded: {used_gb:.2} GB used of {quota_gb:.0} GB plan. \
+                 This file is {file_mb:.1} MB. Upgrade your plan to store more files."
+            )));
+        }
+    }
+
     // ── Streaming block storage (one 256 KB chunk at a time) ──────────────────
     let mut key_bytes = [0u8; 32];
     OsRng.fill_bytes(&mut key_bytes);
     let cipher = Aes256Gcm::new_from_slice(&key_bytes)
         .map_err(|e| EgoDesktopError::CryptoError(format!("Key init: {e}")))?;
 
-    let mut file = std::fs::File::open(&request.file_path)
+    let mut file = std::fs::File::open(&canonical_path)
         .map_err(|e| EgoDesktopError::FileSystemError(format!("Cannot open file: {e}")))?;
 
     // Prover address needed for PoRep commitment — binds enc_bytes to this specific node.
@@ -222,7 +293,8 @@ pub async fn store_file(
     let mut ledger = Ledger::load();
     let is_staker  = ledger.staked_amount > 0;
     let mb         = (original_size as f64) / 1_000_000.0;
-    let cost_uegoc = crate::tokenomics::storage_cost_with_staking(mb, request.duration_months, is_staker);
+    let cost_uegoc = if request.free { 0 }
+                     else { crate::tokenomics::storage_cost_with_staking(mb, request.duration_months, is_staker) };
 
     let mut stored = StoredFile {
         cid:             cid.clone(),
@@ -240,6 +312,7 @@ pub async fn store_file(
         blocks_total,
         blocks_received: blocks_total, // we own all blocks
         comm_r:          porep_root.clone(),  // PoRep aggregate commitment
+        from_egosafe:    request.from_egosafe,
         ..Default::default()
     };
 
@@ -309,6 +382,12 @@ pub async fn store_file(
         let expiry2    = expiry;
         let porep_root2 = porep_root.clone();
         tokio::spawn(async move {
+            // Fire-and-forget: publish to DHT if connected. If offline, check_file_replication()
+            // retries every 30s. The file is already Active locally regardless.
+            if !crate::p2p::has_connectivity() {
+                eprintln!("[Storage] Offline — DHT publish for {} deferred until reconnect", &cid2[..16]);
+                return;
+            }
             let endpoint = crate::p2p::get_public_endpoint().await;
             if !endpoint.is_empty() {
                 crate::p2p::register_cid_on_relay(&cid2, &addr2, &endpoint).await;
@@ -332,7 +411,6 @@ pub async fn store_file(
             }
             eprintln!("[Blocks] {} blocks published to DHT for {}", manifest2.blocks.len(), &cid2[..16]);
             // Register PoRep commitment with relay so peers can slash-verify.
-            // comm_r is the aggregate replica commitment computed at upload time.
             let n_blocks = manifest2.blocks.len();
             crate::p2p::register_porep_commitment(
                 &cid2, &addr2, "", &porep_root2, n_blocks, n_blocks, 0, expiry2 as u64, expiry2,
@@ -359,10 +437,28 @@ pub async fn get_stored_files(
     let ledger = Ledger::load();
     let my_address = ledger.address.clone();
     // Only return files owned by this wallet (empty owner = legacy record, belongs here too).
+    // Exclude EgoSafe-received files — those belong to EgoSafe, not Storage.
     Ok(ledger
         .stored_files
         .into_iter()
-        .filter(|f| f.owner.is_empty() || f.owner == my_address)
+        .filter(|f| (f.owner.is_empty() || f.owner == my_address) && !f.from_egosafe)
+        .collect())
+}
+
+// ── get_egosafe_files ─────────────────────────────────────────────────────────
+
+/// Returns only files received via EgoSafe (import_shared_file / import_secure_share).
+/// These are intentionally excluded from get_stored_files so they don't pollute Storage tab.
+#[tauri::command]
+pub async fn get_egosafe_files(
+    _state: State<'_, AppState>,
+) -> Result<Vec<StoredFile>, EgoDesktopError> {
+    let ledger = Ledger::load();
+    let my_address = ledger.address.clone();
+    Ok(ledger
+        .stored_files
+        .into_iter()
+        .filter(|f| (f.owner.is_empty() || f.owner == my_address) && f.from_egosafe)
         .collect())
 }
 
@@ -378,7 +474,8 @@ pub async fn get_storage_metrics(
     let my_files: Vec<_> = ledger
         .stored_files
         .iter()
-        .filter(|f| (f.owner.is_empty() || f.owner == *my_address) && f.status == "Active")
+        .filter(|f| (f.owner.is_empty() || f.owner == *my_address)
+            && (f.status == "Active" || f.status == "PendingSync"))
         .collect();
 
     let used: u64 = my_files.iter().map(|f| f.encrypted_size).sum();
@@ -434,6 +531,7 @@ pub async fn get_storage_metrics(
         encrypted_files_count:   active_count,
         peer_bytes_hosted,
         disk_free_bytes,
+        storage_configured_at:   ledger.storage_configured_at,
     })
 }
 
@@ -518,7 +616,39 @@ pub async fn configure_storage(
     }
 
     let mut ledger = Ledger::load();
+
+    // Enforce 60-day lock: once a node commits storage it cannot reduce or change
+    // allocation until the lock period expires, so subscribers keep their guarantee.
+    const LOCK_SECS: i64 = 60 * 24 * 3600;
+    let now = chrono::Utc::now().timestamp();
+    if ledger.storage_allocated_bytes > 0 {
+        if let Some(cfg_at) = ledger.storage_configured_at {
+            let unlock_at = cfg_at + LOCK_SECS;
+            if now < unlock_at {
+                let days_left = ((unlock_at - now) as f64 / 86400.0).ceil() as i64;
+                return Err(EgoDesktopError::InvalidInput(format!(
+                    "Storage allocation is locked for {days_left} more day{}. \
+                     Nodes must keep their committed space for 60 days to protect active subscribers.",
+                    if days_left == 1 { "" } else { "s" }
+                )));
+            }
+        }
+    }
+
+    // Penalty: lowering allocation suspends all rewards for 14 days and adds a slash strike.
+    if ledger.storage_allocated_bytes > 0 && requested_bytes < ledger.storage_allocated_bytes {
+        const PENALTY_SECS: i64 = 14 * 86_400;
+        ledger.reward_suspended_until = Some(now + PENALTY_SECS);
+        ledger.slash_strikes = ledger.slash_strikes.saturating_add(1);
+        ledger.last_slash_ts = Some(now);
+        eprintln!(
+            "[Storage] Reduction penalty: {} bytes → {} bytes; rewards suspended 14 days; strikes={}",
+            ledger.storage_allocated_bytes, requested_bytes, ledger.slash_strikes
+        );
+    }
+
     ledger.storage_allocated_bytes = requested_bytes;
+    ledger.storage_configured_at   = Some(now);
     ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save: {e}")))?;
 
     // Physically lock the allocated space on disk.
@@ -856,6 +986,7 @@ pub async fn request_file_from_contact(
                 key_nonce_hex,
                 local_path:      format!("sender:{}", from_addr),
                 owner:           owner_addr,
+                from_egosafe:    true,
                 ..Default::default()
             });
         }
@@ -1156,6 +1287,7 @@ pub async fn import_secure_share(
         key_nonce_hex:   protected_key,
         local_path:      String::new(),
         owner:           ledger.address.clone(),
+        from_egosafe:    true,
         ..Default::default()
     };
 
@@ -1182,6 +1314,26 @@ pub async fn import_secure_share(
 
 #[tauri::command]
 pub async fn reset_storage(_state: State<'_, AppState>) -> Result<(), EgoDesktopError> {
+    // Block reset while the 60-day lock is active.
+    {
+        let ledger = Ledger::load();
+        const LOCK_SECS: i64 = 60 * 24 * 3600;
+        let now = chrono::Utc::now().timestamp();
+        if ledger.storage_allocated_bytes > 0 {
+            if let Some(cfg_at) = ledger.storage_configured_at {
+                let unlock_at = cfg_at + LOCK_SECS;
+                if now < unlock_at {
+                    let days_left = ((unlock_at - now) as f64 / 86400.0).ceil() as i64;
+                    return Err(EgoDesktopError::InvalidInput(format!(
+                        "Storage is locked for {days_left} more day{}. \
+                         Cannot reset while active subscribers may be using your node.",
+                        if days_left == 1 { "" } else { "s" }
+                    )));
+                }
+            }
+        }
+    }
+
     // 1. Delete every file in storage_dir() (blocks, manifests, encrypted files)
     let dir = crate::ledger::storage_dir();
     if dir.exists() {

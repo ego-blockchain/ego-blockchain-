@@ -9,6 +9,36 @@ pub const DOMAINTAG_TX_V1: &[u8] = b"ego/tx/v1";
 pub const DOMAINTAG_HEADER_V1: &[u8] = b"ego/header/v1";
 pub const DOMAINTAG_EVENT_V1: &[u8] = b"ego/event/v1";
 
+/// Typed payload carried inside a `CrossShard` transaction's `message` field.
+///
+/// Serialized with `serde_json` so it is human-readable in explorers and
+/// relay logs.  The receiving shard deserializes this to know what state
+/// change to apply.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CrossShardMessage {
+    /// Move `amount` uEGOC from the sender (on the source shard) to `to` (on the dest shard).
+    Transfer { to: Address, amount: Balance },
+    /// Invoke a contract on the destination shard on behalf of the original sender.
+    ContractCall {
+        contract: Address,
+        method: String,
+        args: Vec<u8>,
+        value: Balance,
+        /// Original sender address (on the source shard) — used for access control in the contract.
+        original_sender: Address,
+    },
+}
+
+impl CrossShardMessage {
+    pub fn encode(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap_or_default()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        serde_json::from_slice(bytes).ok()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct Transaction {
     pub hash: Hash,
@@ -218,6 +248,7 @@ pub enum TransactionPayload {
     },
 
     DeployContract {
+        wasm_bytes: Vec<u8>,
         contract_code_hash: Hash,
         constructor_args: Vec<u8>,
         deploy_credits: u64,

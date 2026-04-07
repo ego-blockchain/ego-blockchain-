@@ -50,6 +50,7 @@ impl Executor {
                 code_hash,
                 ru_used: 0,
                 events: vec![],
+                transfers: vec![],
             });
         }
 
@@ -84,6 +85,7 @@ impl Executor {
             code_hash,
             ru_used,
             events: ctx_out.events,
+            transfers: ctx_out.transfers,
         })
     }
 
@@ -117,6 +119,7 @@ impl Executor {
                 self.store.save_state(contract_addr, &ctx_out.state)?;
 
                 let mut all_events = ctx_out.events.clone();
+                let mut all_transfers = ctx_out.transfers.clone();
                 let mut all_ru = ru_used;
                 let mut pending = ctx_out.pending_cross_calls.clone();
                 let mut depth = 1u32;
@@ -149,6 +152,7 @@ impl Executor {
                                 cross_req.fuel,
                             ) {
                                 all_events.extend(cross_out.events);
+                                all_transfers.extend(cross_out.transfers.clone());
                                 all_ru += cross_ru;
                                 let _ = self.store.save_state(&cross_req.contract_addr, &cross_out.state);
                                 pending.extend(cross_out.pending_cross_calls);
@@ -164,6 +168,7 @@ impl Executor {
                     ru_used:    all_ru,
                     events:     all_events,
                     error:      None,
+                    transfers:  all_transfers,
                 })
             }
             Err(VmError::FuelExhausted) => Ok(CallResult {
@@ -172,6 +177,7 @@ impl Executor {
                 ru_used:    fuel,
                 events:     vec![],
                 error:      Some("Fuel exhausted".into()),
+                transfers:  vec![],
             }),
             Err(e) => Ok(CallResult {
                 success:    false,
@@ -179,6 +185,7 @@ impl Executor {
                 ru_used:    0,
                 events:     vec![],
                 error:      Some(e.to_string()),
+                transfers:  vec![],
             }),
         }
     }

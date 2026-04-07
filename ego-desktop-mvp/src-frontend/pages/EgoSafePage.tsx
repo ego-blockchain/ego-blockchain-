@@ -29,15 +29,6 @@ interface StoredFile {
   blocks_received: number;
 }
 
-interface SharedFile {
-  id: string;
-  name: string;
-  cid: string;
-  size: number;
-  recipients: string[];
-  shared: number;
-}
-
 interface StoreFileResult {
   cid: string;
   name: string;
@@ -74,14 +65,10 @@ const EgoSafePage: React.FC = () => {
   const { confirm, ConfirmDialog } = useConfirm();
   const navigate   = useNavigate();
 
-  const [shared, setShared]           = useState<SharedFile[]>([]);
-
   const [storedPage, setStoredPage]   = useState(1);
   const [storedPageSize, setStoredPageSize] = useState(25);
   const [recvPage, setRecvPage]       = useState(1);
   const [recvPageSize, setRecvPageSize] = useState(25);
-  const [sharedPage, setSharedPage]   = useState(1);
-  const [sharedPageSize, setSharedPageSize] = useState(25);
   const [step, setStep]               = useState<ShareStep>('idle');
   const [fileName, setFileName]       = useState('');
   const [filePath, setFilePath]       = useState('');
@@ -92,17 +79,11 @@ const EgoSafePage: React.FC = () => {
 
   const [storedFiles, setStoredFiles]       = useState<StoredFile[]>([]);
   const [receivedFiles, setReceivedFiles]   = useState<StoredFile[]>([]);
-  const [shareTarget, setShareTarget]       = useState<StoredFile | null>(null);
   const [contacts, setContacts]             = useState<Contact[]>([]);
   const [sendTarget, setSendTarget]         = useState<StoredFile | null>(null);
   const [sending, setSending]               = useState(false);
   const [sendMsg, setSendMsg]               = useState('');
   const [sentToContact, setSentToContact]   = useState<Contact | null>(null);
-
-  const [showImport, setShowImport]   = useState(false);
-  const [importBundle, setImportBundle] = useState('');
-  const [importing, setImporting]     = useState(false);
-  const [importMsg, setImportMsg]     = useState('');
 
   const [previewFile, setPreviewFile] = useState<StoredFile | null>(null);
   const [preview, setPreview]         = useState<{ name: string; mime_type: string; data_base64: string; size_bytes: number; previewable: boolean } | null>(null);
@@ -123,7 +104,7 @@ const unlistenDl = listen<{ cid?: string }>('ego://file-downloaded', async (e) =
   if (cid) {
     // Re-fetch to check if truly ready before clearing pending state
     try {
-      const files = await invoke<StoredFile[]>('get_stored_files');
+      const files = await invoke<StoredFile[]>('get_egosafe_files');
       const f = files.find(x => x.cid === cid);
       const blocksDone = f && f.cid.startsWith('egomfd1')
         ? f.blocks_total > 0 && f.blocks_received >= f.blocks_total
@@ -159,40 +140,20 @@ const unlistenDl = listen<{ cid?: string }>('ego://file-downloaded', async (e) =
 
   async function loadStoredFiles() {
     try {
-      const files = await invoke<StoredFile[]>('get_stored_files');
-      setStoredFiles(files.filter(f => f.status === 'Active'));
-      setReceivedFiles(files.filter(f => f.status === 'Pending' || f.status === 'Failed' || f.status === 'Received'));
+      const egosafeFiles = await invoke<StoredFile[]>('get_egosafe_files');
+      // Sent files: Active + local_path is a real path (not a sender: placeholder)
+      setStoredFiles(egosafeFiles.filter(f =>
+        f.status === 'Active' &&
+        f.local_path.length > 0 &&
+        !f.local_path.startsWith('sender:')
+      ));
+      // Received files: everything else (Pending, Failed, Received, or Active-but-from-sender)
+      setReceivedFiles(egosafeFiles.filter(f =>
+        f.status !== 'Active' ||
+        f.local_path.startsWith('sender:') ||
+        f.local_path.length === 0
+      ));
     } catch {}
-  }
-
-  async function handleImport() {
-    const trimmed = importBundle.trim();
-    const parts   = trimmed.split(':');
-
-    if (parts[0] !== 'egoshare1' || parts.length < 5) {
-      setImportMsg('Invalid bundle. Expected egoshare1:…');
-      return;
-    }
-
-    setImporting(true);
-    setImportMsg('');
-
-    try {
-      const [, cid, key_nonce_hex, name64, from_address] = parts;
-      let display_name = cid.slice(0, 12);
-      try { display_name = decodeURIComponent(escape(atob(name64))); } catch {}
-      setPendingCids(prev => new Set([...prev, cid]));
-      await invoke('import_shared_file', { bundle: { cid, key_nonce_hex, display_name, from_address } });
-
-      invoke('request_file_from_contact', { cid, fromAddr: from_address, content: trimmed }).catch(() => {});
-      setImportMsg('File imported — requesting from sender…');
-      await loadStoredFiles();
-      setTimeout(() => { setShowImport(false); setImportBundle(''); setImportMsg(''); }, 2000);
-    } catch (e: any) {
-      setImportMsg('Import failed: ' + String(e));
-    } finally {
-      setImporting(false);
-    }
   }
 
   async function sendToContact(contact: Contact) {
@@ -222,7 +183,7 @@ const unlistenDl = listen<{ cid?: string }>('ego://file-downloaded', async (e) =
     setShareError('');
     try {
       const result = await invoke<StoreFileResult>('store_file', {
-        request: { file_path: filePath, duration_months: 1 },
+        request: { file_path: filePath, duration_months: 1, free: true, from_egosafe: true },
       });
       const bundle = await invoke<string>('create_public_share', { cid: result.cid });
       for (const c of selectedContacts) {
@@ -233,13 +194,7 @@ const unlistenDl = listen<{ cid?: string }>('ego://file-downloaded', async (e) =
         });
       }
       setResultCid(result.cid);
-      setShared(prev => [{
-        id: Date.now().toString(),
-        name: fileName, cid: result.cid,
-        size: fileSize,
-        recipients: selectedContacts.map(c => c.address),
-        shared: Date.now() / 1000,
-      }, ...prev]);
+      await loadStoredFiles();
       setStep('done');
     } catch (e: any) {
       setShareError(String(e));
@@ -472,17 +427,17 @@ const unlistenDl = listen<{ cid?: string }>('ego://file-downloaded', async (e) =
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-700">
           <div>
-            <h3 className="font-semibold">Share Stored File</h3>
-            <p className="text-xs text-gray-400 mt-0.5">Generate a share bundle for a file already in your Storage</p>
+            <h3 className="font-semibold">Files You've Shared</h3>
+            <p className="text-xs text-gray-400 mt-0.5">Files you encrypted and sent via EgoSafe</p>
           </div>
           <button onClick={loadStoredFiles} className="text-xs text-gray-400 hover:text-white transition">↻ Refresh</button>
         </div>
 
         {storedFiles.length === 0 ? (
           <div className="py-10 text-center text-gray-500">
-            <div className="text-4xl mb-3">🗄️</div>
-            <div className="text-sm">No active stored files</div>
-            <div className="text-xs mt-1 text-gray-600">Store a file in the Storage tab first</div>
+            <div className="text-4xl mb-3">📤</div>
+            <div className="text-sm">No files shared yet</div>
+            <div className="text-xs mt-1 text-gray-600">Use "Share a New File" above to send a file securely</div>
           </div>
         ) : (
           <>
@@ -517,11 +472,11 @@ const unlistenDl = listen<{ cid?: string }>('ego://file-downloaded', async (e) =
                         onClick={() => { setSendTarget(file); setSendMsg(''); }}
                         className="text-xs bg-purple-600/20 hover:bg-purple-600/40 text-purple-400 px-3 py-1.5 rounded-lg transition font-medium"
                       >
-                        📤 Send
+                        📤 Resend
                       </button>
                       <button
                         onClick={async () => {
-                          if (!await confirm(`Delete "${file.name}"?`, { detail: 'This removes the encrypted copy from your storage and cannot be undone.', confirmLabel: 'Delete' })) return;
+                          if (!await confirm(`Delete "${file.name}"?`, { detail: 'This removes the encrypted copy and cannot be undone.', confirmLabel: 'Delete' })) return;
                           try {
                             await invoke('delete_stored_file', { cid: file.cid });
                             await loadStoredFiles();
@@ -533,7 +488,6 @@ const unlistenDl = listen<{ cid?: string }>('ego://file-downloaded', async (e) =
                       </button>
                     </div>
                   </div>
-
                 </div>
             ))}
           </div>
@@ -543,17 +497,23 @@ const unlistenDl = listen<{ cid?: string }>('ego://file-downloaded', async (e) =
       </div>
 
 {}
-{receivedFiles.length > 0 && (
-  <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
-    <div className="flex items-center justify-between px-5 py-4 border-b border-gray-700">
-      <div>
-        <h3 className="font-semibold">Received Files ({receivedFiles.length})</h3>
-        <p className="text-xs text-gray-400 mt-0.5">Files shared with you</p>
-      </div>
-      <button onClick={loadStoredFiles} className="text-xs text-gray-400 hover:text-white transition">↻ Refresh</button>
-    </div>
-    <div className="divide-y divide-gray-700/50">
-      {receivedFiles.slice((recvPage - 1) * recvPageSize, recvPage * recvPageSize).map(file => {
+      <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-700">
+          <div>
+            <h3 className="font-semibold">Received Files ({receivedFiles.length})</h3>
+            <p className="text-xs text-gray-400 mt-0.5">Files shared with you via EgoSafe</p>
+          </div>
+          <button onClick={loadStoredFiles} className="text-xs text-gray-400 hover:text-white transition">↻ Refresh</button>
+        </div>
+        {receivedFiles.length === 0 ? (
+          <div className="py-10 text-center text-gray-500">
+            <div className="text-4xl mb-3">📥</div>
+            <div className="text-sm">No received files yet</div>
+            <div className="text-xs mt-1 text-gray-600">Files sent to you via EgoSafe will appear here</div>
+          </div>
+        ) : (
+        <div className="divide-y divide-gray-700/50">
+          {receivedFiles.slice((recvPage - 1) * recvPageSize, recvPage * recvPageSize).map(file => {
         const isFailed  = file.status === 'Failed';
         const isPending = file.status === 'Pending';
 
@@ -687,90 +647,14 @@ const unlistenDl = listen<{ cid?: string }>('ego://file-downloaded', async (e) =
             )}
           </div>
         );
-      })}
-    </div>
-    <Pagination total={receivedFiles.length} page={recvPage} pageSize={recvPageSize} onPage={setRecvPage} onPageSize={ps => { setRecvPageSize(ps); setRecvPage(1); }} />
-  </div>
-)}
-
-      {}
-      <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
-        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-700">
-          <div>
-            <h3 className="font-semibold">Import Shared File</h3>
-            <p className="text-xs text-gray-400 mt-0.5">Paste a share bundle from another Ego user</p>
-          </div>
-          <button
-            onClick={() => { setShowImport(v => !v); setImportBundle(''); setImportMsg(''); }}
-            className="text-xs bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded-lg transition"
-          >
-            {showImport ? 'Cancel' : '↓ Import'}
-          </button>
+          })}
         </div>
-
-        {showImport && (
-          <div className="p-5 space-y-4">
-            <div className="text-sm text-gray-400">
-              Paste the <span className="font-mono text-blue-400">egoshare1:…</span> or <span className="font-mono text-purple-400">egoshare2:…</span> bundle you received. <span className="text-purple-400">egoshare2</span> bundles are Kyber-encrypted — only you can open them.
-            </div>
-            <textarea
-              value={importBundle}
-              onChange={e => setImportBundle(e.target.value)}
-              rows={3}
-              className="w-full bg-gray-900 border border-gray-700 focus:border-purple-500 rounded-xl px-4 py-3 text-xs font-mono outline-none transition resize-none"
-              placeholder="egoshare1:… or egoshare2:…"
-            />
-            {importMsg && (
-              <div className={`text-xs px-3 py-2 rounded-lg ${
-                importMsg.includes('success') ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
-              }`}>
-                {importMsg}
-              </div>
-            )}
-            <button
-              onClick={handleImport}
-              disabled={!importBundle.trim() || importing}
-              className="w-full bg-purple-600 hover:bg-purple-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
-            >
-              {importing ? 'Importing…' : '↓ Import File'}
-            </button>
-          </div>
         )}
-
-        {!showImport && (
-          <div className="px-5 py-8 text-center text-gray-500">
-            <div className="text-3xl mb-2">📥</div>
-            <div className="text-sm">Click Import above to paste a share bundle</div>
-          </div>
+        {receivedFiles.length > 0 && (
+          <Pagination total={receivedFiles.length} page={recvPage} pageSize={recvPageSize} onPage={setRecvPage} onPageSize={ps => { setRecvPageSize(ps); setRecvPage(1); }} />
         )}
       </div>
 
-    {}
-      <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
-        <div className="px-5 py-4 border-b border-gray-700">
-          <h3 className="font-semibold">Recently Shared ({shared.length})</h3>
-        </div>
-        <div className="divide-y divide-gray-700/50">
-          {shared.slice((sharedPage - 1) * sharedPageSize, sharedPage * sharedPageSize).map(file => (
-            <div key={file.id} className="px-5 py-4">
-              <div className="flex items-start justify-between">
-                <div className="min-w-0">
-                  <div className="font-medium text-sm mb-1">{file.name}</div>
-                  <div className="font-mono text-xs text-green-400 truncate mb-2">{file.cid}</div>
-                  <div className="flex gap-3 text-xs text-gray-500">
-                    <span>{fmtBytes(file.size)}</span>
-                    <span>{file.recipients.length} recipient{file.recipients.length > 1 ? 's' : ''}</span>
-                  </div>
-                </div>
-                <button className="text-xs bg-purple-600/20 hover:bg-purple-600/40 text-purple-400 px-3 py-1.5 rounded-lg transition shrink-0">
-                  + Recipient
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-        <Pagination total={shared.length} page={sharedPage} pageSize={sharedPageSize} onPage={setSharedPage} onPageSize={ps => { setSharedPageSize(ps); setSharedPage(1); }} />
-      </div>
 
       {}
       {previewFile && (

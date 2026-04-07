@@ -973,7 +973,7 @@ impl Account {
             .earnings
             .pending_payouts
             .saturating_sub(amount);
-        self.credit(amount);
+        self.credit(amount)?;
 
         Ok(())
     }
@@ -1048,7 +1048,7 @@ impl Account {
         }
 
         provider_info.collateral_locked = provider_info.collateral_locked.saturating_sub(amount);
-        self.credit(amount);
+        self.credit(amount)?;
 
         Ok(())
     }
@@ -1166,12 +1166,13 @@ impl Account {
         Ok(())
     }
 
-    pub fn credit(&mut self, amount: Balance) {
+    pub fn credit(&mut self, amount: Balance) -> EgoResult<()> {
         self.balance = self
             .balance
             .checked_add(amount)
-            .unwrap_or(Balance::new(u128::MAX));
+            .ok_or_else(|| EgoError::InternalError("balance overflow".into()))?;
         self.last_activity = Timestamp::now();
+        Ok(())
     }
 
     pub fn increment_nonce(&mut self) {

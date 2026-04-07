@@ -28,7 +28,18 @@ dashmap = "6.1.0"
 lru = "0.16.1"
 lz4 = "1.28.1"
 geo = "0.31.0"
+h3o = "0.6"
 rocksdb = "0.22.0"
+
+# ZK-SNARK PoRep — Groth16 over BN254
+ark-ff          = { version = "0.4", default-features = false, features = ["std"] }
+ark-bn254       = { version = "0.4", default-features = false, features = ["std", "curve"] }
+ark-r1cs-std    = { version = "0.4", default-features = false, features = ["std"] }
+ark-relations   = { version = "0.4", default-features = false, features = ["std"] }
+ark-groth16     = { version = "0.4", default-features = false, features = ["r1cs", "std"] }
+ark-serialize   = { version = "0.4", default-features = false, features = ["std", "derive"] }
+ark-snark       = { version = "0.4", default-features = false }
+ark-std         = { version = "0.4", features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3.22.0"

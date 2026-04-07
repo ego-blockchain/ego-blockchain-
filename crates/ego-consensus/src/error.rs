@@ -98,6 +98,9 @@ pub enum PoCError {
 
     #[error("Internal error: {0}")]
     InternalError(String),
+
+    #[error("Storage I/O error: {0}")]
+    StorageError(String),
 }
 
 impl From<EgoError> for PoCError {

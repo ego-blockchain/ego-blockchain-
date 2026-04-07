@@ -57,8 +57,9 @@ pub async fn import_shared_file(
         expiry:          now + 30 * 86_400,
         status:          "Received".into(),
         key_nonce_hex:   bundle.key_nonce_hex.clone(),
-        local_path:      String::new(),
+        local_path:      format!("sender:{}", bundle.from_address),
         owner:           ledger.address.clone(),
+        from_egosafe:    true,
         ..Default::default()
     };
 
@@ -123,6 +124,8 @@ pub async fn import_shared_file(
     };
     notify(&app, "File Received!", &format!("\"{}\" shared by {}", bundle.display_name, from_short));
 
+    let _ = app.emit_all("ego://file-receiving", serde_json::json!({ "cid": bundle.cid }));
+
     Ok(stored)
 }
 
@@ -146,31 +149,14 @@ pub async fn try_auto_import(app: &AppHandle, content: &str, from_addr: &str) {
         .and_then(|b| String::from_utf8(b).ok())
         .unwrap_or_else(|| cid[..cid.len().min(12)].to_string());
 
-    // ── Save to stored_files so the file appears in the Storage tab immediately ──
-    {
-        let now = chrono::Utc::now().timestamp();
-        let mut ledger = Ledger::load();
-        if !ledger.stored_files.iter().any(|f| f.cid == cid) {
-            let stored = StoredFile {
-                cid:             cid.to_string(),
-                name:            display_name.clone(),
-                original_size:   0,
-                encrypted_size:  0,
-                duration_months: 0,
-                stored_at:       now,
-                expiry:          0,
-                status:          "Received".into(),
-                // key_nonce_hex is raw hex from sender; unprotect_key_bytes handles legacy hex
-                key_nonce_hex,
-                local_path:      format!("sender:{}", from_addr),
-                owner:           ledger.address.clone(),
-                ..Default::default()
-            };
-            ledger.stored_files.insert(0, stored);
-            let _ = ledger.save();
-        }
-        let _ = app.emit_all("ego://file-received", serde_json::json!({ "cid": cid }));
-    }
+    // Notify the frontend that a file bundle arrived — user must click "Save to EgoSafe"
+    // to actually import it. Do NOT auto-save here.
+    let _ = app.emit_all("ego://file-received", serde_json::json!({
+        "cid":           cid,
+        "name":          display_name.clone(),
+        "key_nonce_hex": key_nonce_hex,
+        "from_address":  from_addr,
+    }));
 
     let from_short = if from_addr.len() > 12 {
         format!("{}…", &from_addr[..12])

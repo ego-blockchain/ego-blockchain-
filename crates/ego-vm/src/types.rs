@@ -35,6 +35,7 @@ pub struct DeployResult {
     pub code_hash:        String,
     pub ru_used:          u64,
     pub events:           Vec<ContractEvent>,
+    pub transfers:        Vec<(String, u64)>,
 }
 
 /// Result of calling a contract entrypoint.
@@ -45,6 +46,7 @@ pub struct CallResult {
     pub ru_used:    u64,
     pub events:     Vec<ContractEvent>,
     pub error:      Option<String>,
+    pub transfers:  Vec<(String, u64)>,
 }
 
 /// An event emitted by a contract via `events.emit`.

@@ -28,6 +28,10 @@ pub struct AppState {
 
     pub last_earnings_credit: Arc<Mutex<i64>>,
 
+    /// Running total of confirmed reward TXs — updated only when a new credit is issued,
+    /// avoiding an O(n) full-chain scan on every 30-second poll.
+    pub cached_total_earned: Arc<Mutex<u64>>,
+
     pub peers: Arc<Mutex<HashMap<String, PeerInfo>>>,
 
     pub upnp_status: Arc<Mutex<Option<Result<(), String>>>>,
@@ -152,6 +156,10 @@ pub struct EarningsData {
     pub session_started: i64,
 
     pub coverage_online: bool,
+
+    /// Unix timestamp until which rewards are suspended due to a storage reduction penalty.
+    /// None = no penalty active.
+    pub reward_suspended_until: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +211,7 @@ impl AppState {
             cache: Arc::new(Mutex::new(AppCache::default())),
             session_started: Arc::new(Mutex::new(0)),
             last_earnings_credit: Arc::new(Mutex::new(0)),
+            cached_total_earned:  Arc::new(Mutex::new(0)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             upnp_status: Arc::new(Mutex::new(None)),
             public_endpoint: Arc::new(Mutex::new(String::new())),
@@ -268,12 +277,42 @@ impl AppState {
         *self.last_earnings_credit.lock().unwrap() = ts;
     }
 
-    pub fn initialize_wallet(&self, keypair: KeyPair) -> EgoResult<Address> {
+    pub fn get_cached_total_earned(&self) -> u64 {
+        *self.cached_total_earned.lock().unwrap()
+    }
+
+    pub fn add_to_cached_total_earned(&self, amount: u64) {
+        let mut v = self.cached_total_earned.lock().unwrap();
+        *v = v.saturating_add(amount);
+    }
+
+    pub fn set_cached_total_earned(&self, amount: u64) {
+        *self.cached_total_earned.lock().unwrap() = amount;
+    }
+
+    /// Initialize the in-memory wallet state.
+    ///
+    /// `force` must be `true` when the caller intentionally switches keypairs
+    /// (e.g., `import_keypair` or wallet-slot switching).  Plain loading
+    /// (`load_active_wallet`) passes `false` so it silently skips reinit if a
+    /// different wallet is already live — preventing a race where two concurrent
+    /// Tauri calls could swap the keypair mid-session.
+    pub fn initialize_wallet(&self, keypair: KeyPair, force: bool) -> EgoResult<Address> {
         let address = Address::from_public_key(&keypair.ed25519_public_key());
 
-        *self.keypair.lock().unwrap() = Some(keypair);
-        *self.wallet_address.lock().unwrap() = Some(address);
-        *self.is_initialized.lock().unwrap() = true;
+        let mut kp_guard   = self.keypair.lock().unwrap();
+        let mut addr_guard = self.wallet_address.lock().unwrap();
+        let mut init_guard = self.is_initialized.lock().unwrap();
+
+        if *init_guard && !force {
+            // Already initialized with a different keypair — do not overwrite.
+            // Return the currently active address so callers can detect the mismatch.
+            return Ok(addr_guard.unwrap_or(address));
+        }
+
+        *kp_guard   = Some(keypair);
+        *addr_guard = Some(address);
+        *init_guard = true;
 
         Ok(address)
     }

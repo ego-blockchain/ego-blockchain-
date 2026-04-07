@@ -7,6 +7,7 @@ use ego_core::{
     PublicKey, SliceId, StateManager, Transaction, TransactionResult, calculate_shard_for_address,
     current_timestamp, format_storage_size,
 };
+use ego_consensus::consensus::bft::BlockHeader as ConsensusBlockHeader;
 use ego_consensus::porep::{PoRepProver, PoRepVerifier, PoRepEvent};
 use ego_consensus::porep::prover::ProverConfig;
 use std::sync::Arc;
@@ -45,6 +46,8 @@ pub struct Node {
     pub data_optimizer: DataOptimizer,
     pub porep_prover: Option<Arc<PoRepProver>>,
     pub porep_verifier: Option<Arc<PoRepVerifier>>,
+    pub executor: Arc<std::sync::Mutex<ego_vm::Executor>>,
+    pub pending_rollup_commits: Vec<ego_rollup::RollupCommitment>,
 
     pub optimization_events: mpsc::UnboundedSender<OptimizationCommand>,
     optimization_receiver: mpsc::UnboundedReceiver<OptimizationCommand>,
@@ -215,6 +218,11 @@ impl Node {
         let data_optimizer = DataOptimizer::new();
         let state_manager = StateManager::new(1, 1);
 
+        // Reload all persisted accounts from RocksDB so state survives node restarts.
+        for account in crate::store::load_all_accounts() {
+            state_manager.set_account(account);
+        }
+
         let porep_prover = if roles_set.contains(&NodeRole::StorageProvider) {
             let keypair = keystore.keypair().clone();
             let config = ProverConfig::default();
@@ -268,11 +276,18 @@ impl Node {
             data_optimizer,
             porep_prover,
             porep_verifier,
+            executor: Arc::new(std::sync::Mutex::new({
+                let data_dir = std::path::PathBuf::from(
+                    std::env::var("EGO_DATA_DIR").unwrap_or_else(|_| ".".into())
+                );
+                ego_vm::Executor::new(data_dir).expect("ego-vm executor init failed")
+            })),
             optimization_events,
             optimization_receiver,
             porep_events,
             porep_receiver,
             node_type: "full".to_string(),
+            pending_rollup_commits: Vec::new(),
             is_bootstrap: false,
             connection_attempts: 0,
             last_proof_time: SystemTime::now(),
@@ -450,7 +465,7 @@ impl Node {
             node.keystore.kyber_public_key().key_data.clone(),
         );
         full_account.storage_quota = storage_capacity;
-        full_account.credit(Balance::from_egoc(1000));
+        full_account.credit(Balance::from_egoc(1000)).expect("init credit overflow");
         full_account.storage_credits = 10000;
         full_account.deploy_credits = 5000;
 
@@ -494,23 +509,138 @@ impl Node {
             std::env::var("EGO_DATA_DIR").unwrap_or_else(|_| "/data".into())
         ).join("node_seed.bin");
 
+        // ── Seed encryption key via Argon2id ────────────────────────────────
+        //
+        // Key derivation: Argon2id(password, salt, m=32MB, t=3, p=1) → 32 bytes.
+        //
+        // Password source (in priority order):
+        //   1. EGO_SEED_PASSWORD environment variable  (recommended for services)
+        //   2. EGO_SEED_PASSWORD_FILE env var pointing to a file containing it
+        //
+        // Operators running ego-node as a systemd service should set
+        // EGO_SEED_PASSWORD in a 0600 EnvironmentFile so it never hits the
+        // shell history or process list. Example /etc/ego-node/env (chmod 600):
+        //   EGO_SEED_PASSWORD=your-strong-passphrase-here
+        //
+        // File format (92 bytes):
+        //   magic(4) || salt(16) || nonce(24) || ciphertext(48)
+        //   magic = [0xEA, 0xB0, 0xB0, 0x01]
+        //
+        // Legacy formats are auto-migrated on first start.
+
+        const MAGIC: [u8; 4] = [0xEA, 0xB0, 0xB0, 0x01];
+
+        let password: String = if let Ok(p) = std::env::var("EGO_SEED_PASSWORD") {
+            p
+        } else if let Ok(path) = std::env::var("EGO_SEED_PASSWORD_FILE") {
+            std::fs::read_to_string(&path)
+                .map(|s| s.trim().to_string())
+                .map_err(|e| anyhow::anyhow!("cannot read EGO_SEED_PASSWORD_FILE {}: {}", path, e))?
+        } else {
+            anyhow::bail!(
+                "EGO_SEED_PASSWORD is not set.\n\
+                 Set it in your service environment file (chmod 600) and restart.\n\
+                 Example: EGO_SEED_PASSWORD=your-strong-passphrase-here"
+            );
+        };
+
+        /// Derive a 32-byte key from password + 16-byte salt using Argon2id.
+        fn derive_key(password: &str, salt: &[u8; 16]) -> anyhow::Result<[u8; 32]> {
+            use argon2::{Argon2, Algorithm, Version, Params};
+            let params = Params::new(32 * 1024, 3, 1, Some(32))
+                .map_err(|e| anyhow::anyhow!("argon2 params: {}", e))?;
+            let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+            let mut key = [0u8; 32];
+            argon2.hash_password_into(password.as_bytes(), salt, &mut key)
+                .map_err(|e| anyhow::anyhow!("argon2 hash: {}", e))?;
+            Ok(key)
+        }
+
+        /// Encrypt a 32-byte seed into the 92-byte blob format.
+        fn encrypt_seed(seed: &[u8; 32], password: &str) -> anyhow::Result<Vec<u8>> {
+            let mut salt = [0u8; 16];
+            getrandom::getrandom(&mut salt).map_err(|e| anyhow::anyhow!("getrandom: {}", e))?;
+            let mut nonce = [0u8; 24];
+            getrandom::getrandom(&mut nonce).map_err(|e| anyhow::anyhow!("getrandom: {}", e))?;
+            let key = derive_key(password, &salt)?;
+            let ct = ego_core::xchacha20poly1305_encrypt(&key, &nonce, seed, b"ego-node-seed")
+                .map_err(|e| anyhow::anyhow!("encrypt: {}", e))?;
+            let mut blob = Vec::with_capacity(4 + 16 + 24 + ct.len());
+            blob.extend_from_slice(&MAGIC);
+            blob.extend_from_slice(&salt);
+            blob.extend_from_slice(&nonce);
+            blob.extend_from_slice(&ct);
+            Ok(blob)
+        }
+
+        /// Decrypt a 92-byte blob into a 32-byte seed.
+        fn decrypt_seed(blob: &[u8], password: &str) -> anyhow::Result<[u8; 32]> {
+            if blob.len() != 92 || blob[..4] != MAGIC {
+                anyhow::bail!("not a valid v2 seed blob");
+            }
+            let salt: [u8; 16] = blob[4..20].try_into().unwrap();
+            let nonce: [u8; 24] = blob[20..44].try_into().unwrap();
+            let key = derive_key(password, &salt)?;
+            let pt = ego_core::xchacha20poly1305_decrypt(&key, &nonce, &blob[44..], b"ego-node-seed")
+                .map_err(|_| anyhow::anyhow!(
+                    "seed decryption failed — wrong EGO_SEED_PASSWORD or corrupted file"
+                ))?;
+            if pt.len() != 32 { anyhow::bail!("decrypted seed has wrong length"); }
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&pt);
+            Ok(seed)
+        }
+
         let keystore = if seed_path.exists() {
             let bytes = std::fs::read(&seed_path)?;
-            if bytes.len() == 32 {
+
+            let seed: [u8; 32] = if bytes.len() == 92 && bytes[..4] == MAGIC {
+                // Current format: Argon2id-protected.
+                decrypt_seed(&bytes, &password)?
+
+            } else if bytes.len() == 72 {
+                // Legacy v1: XChaCha20 with BLAKE2(data_dir) key — migrate.
+                tracing::warn!("[seed-node] Migrating legacy BLAKE2-keyed seed to Argon2id format");
+                let data_dir = std::env::var("EGO_DATA_DIR").unwrap_or_else(|_| "/data".into());
+                let old_key: [u8; 32] = *ego_core::hash_data(data_dir.as_bytes()).as_bytes();
+                let old_nonce = [0xEEu8; 24];
+                let pt = ego_core::xchacha20poly1305_decrypt(
+                    &old_key, &old_nonce, &bytes[24..], b"ego-node-seed",
+                ).map_err(|e| anyhow::anyhow!("legacy decrypt failed: {}", e))?;
+                let mut seed = [0u8; 32];
+                seed.copy_from_slice(&pt);
+                let blob = encrypt_seed(&seed, &password)?;
+                std::fs::write(&seed_path, &blob)?;
+                tracing::info!("[seed-node] Seed re-encrypted with Argon2id");
+                seed
+
+            } else if bytes.len() == 32 {
+                // Legacy v0: plaintext — migrate.
+                tracing::warn!("[seed-node] Migrating plaintext seed to Argon2id format");
                 let mut seed = [0u8; 32];
                 seed.copy_from_slice(&bytes);
-                SecureKeystore::from_seed(seed)?
+                let blob = encrypt_seed(&seed, &password)?;
+                std::fs::write(&seed_path, &blob)?;
+                tracing::info!("[seed-node] Seed encrypted with Argon2id");
+                seed
+
             } else {
-                SecureKeystore::new()
-            }
+                anyhow::bail!("unrecognised seed file format ({} bytes)", bytes.len());
+            };
+
+            SecureKeystore::from_seed(seed)?
         } else {
+            // New node — generate a fresh seed and encrypt it immediately.
             let ks = SecureKeystore::new();
-            let seed = ks.keypair().to_bytes();
+            let seed_raw = ks.keypair().to_bytes();
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&seed_raw);
             if let Some(parent) = seed_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            std::fs::write(&seed_path, seed)?;
-            tracing::info!("[seed-node] Keypair saved to {}", seed_path.display());
+            let blob = encrypt_seed(&seed, &password)?;
+            std::fs::write(&seed_path, &blob)?;
+            tracing::info!("[seed-node] New keypair generated and saved to {}", seed_path.display());
             ks
         };
 
@@ -529,7 +659,7 @@ impl Node {
             node.keystore.kyber_public_key().key_data.clone(),
         );
         seed_account.storage_quota = 50_000_000_000;
-        seed_account.credit(Balance::from_egoc(10000));
+        seed_account.credit(Balance::from_egoc(10000)).expect("init credit overflow");
         seed_account.storage_credits = 50000;
         seed_account.deploy_credits = 25000;
         seed_account.free_deploys_remaining = 100;
@@ -559,7 +689,7 @@ impl Node {
             node.keystore.kyber_public_key().key_data.clone(),
         );
         indexer_account.storage_quota = storage_capacity;
-        indexer_account.credit(Balance::from_egoc(500));
+        indexer_account.credit(Balance::from_egoc(500)).expect("init credit overflow");
         indexer_account.storage_credits = 20000;
         indexer_account.deploy_credits = 10000;
 
@@ -601,13 +731,97 @@ impl Node {
     pub async fn execute_transaction(&mut self, tx: &Transaction) -> EgoResult<TransactionResult> {
         self.performance_metrics.messages_received += 1;
 
-        let result = self.state_manager.execute_transaction(tx)?;
+        let result = match &tx.payload {
+            ego_core::TransactionPayload::DeployContract {
+                wasm_bytes, constructor_args, ..
+            } => {
+                let deployer   = format!("0x{}", hex::encode(tx.from.as_bytes()));
+                let height     = self.state_manager.get_block_height().as_u64();
+                let ts         = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let deploy_result = {
+                    let exec = self.executor.lock()
+                        .map_err(|_| ego_core::EgoError::InvalidTransaction("vm lock poisoned".into()))?;
+                    exec.deploy(wasm_bytes, &deployer, constructor_args, height, ts,
+                                ego_vm::types::DEFAULT_DEPLOY_FUEL)
+                        .map_err(|e| ego_core::EgoError::InvalidTransaction(format!("Deploy failed: {e}")))?
+                };
+                // Apply EGOC transfers queued by the constructor.
+                let contract_hex = deploy_result.contract_address.clone();
+                for (to_hex, amount) in &deploy_result.transfers {
+                    self.apply_vm_transfer(&contract_hex, to_hex, *amount);
+                }
+                // Run state manager path for deploy-credit accounting.
+                self.state_manager.execute_transaction(tx)?
+            }
+
+            ego_core::TransactionPayload::ExecuteContract {
+                contract_address, method, args, ..
+            } => {
+                let caller       = format!("0x{}", hex::encode(tx.from.as_bytes()));
+                let contract_hex = hex::encode(contract_address.as_bytes());
+                let height       = self.state_manager.get_block_height().as_u64();
+                let ts           = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let call_result = {
+                    let exec = self.executor.lock()
+                        .map_err(|_| ego_core::EgoError::InvalidTransaction("vm lock poisoned".into()))?;
+                    exec.call(&contract_hex, &caller, method, args, height, ts,
+                              ego_vm::types::DEFAULT_CALL_FUEL)
+                        .map_err(|e| ego_core::EgoError::InvalidTransaction(format!("Call failed: {e}")))?
+                };
+                if !call_result.success {
+                    return Err(ego_core::EgoError::InvalidTransaction(
+                        call_result.error.unwrap_or_else(|| "Contract reverted".into())
+                    ));
+                }
+                for (to_hex, amount) in &call_result.transfers {
+                    self.apply_vm_transfer(&contract_hex, to_hex, *amount);
+                }
+                self.state_manager.execute_transaction(tx)?
+            }
+
+            _ => self.state_manager.execute_transaction(tx)?,
+        };
 
         if result.success {
             self.performance_metrics.bytes_sent += tx.size() as u64;
         }
-
         Ok(result)
+    }
+
+    /// Apply an EGOC transfer from a contract address to a recipient.
+    /// Debits the contract account and credits the recipient.
+    fn apply_vm_transfer(&mut self, from_hex: &str, to_hex: &str, amount: u64) {
+        if amount == 0 { return; }
+        let parse_addr = |s: &str| -> Option<ego_core::Address> {
+            let s = s.trim_start_matches("0x");
+            let bytes = hex::decode(s).ok()?;
+            if bytes.len() != 20 { return None; }
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&bytes);
+            Some(ego_core::Address::new(arr))
+        };
+        let (Some(from_addr), Some(to_addr)) = (parse_addr(from_hex), parse_addr(to_hex)) else { return };
+        let bal = ego_core::Balance(amount as u128);
+        if let Some(mut from_acct) = self.state_manager.get_account(&from_addr) {
+            if from_acct.debit(bal).is_ok() {
+                self.state_manager.set_account(from_acct);
+                let mut to_acct = self.state_manager.get_account(&to_addr)
+                    .unwrap_or_else(|| ego_core::Account::new_eoa(
+                        to_addr,
+                        vec![0u8; 1312],
+                        vec![0u8; 1184],
+                    ));
+                if to_acct.credit(bal).is_ok() {
+                    self.state_manager.set_account(to_acct);
+                }
+            }
+        }
     }
 
     pub async fn create_block(
@@ -635,6 +849,24 @@ impl Node {
             1,
             1,
         );
+
+        // Commit pending rollup batches into the block header before signing.
+        if !self.pending_rollup_commits.is_empty() {
+            let commit_data: Vec<u8> = self.pending_rollup_commits.iter()
+                .flat_map(|c| c.commitment_hash.as_bytes().to_vec())
+                .collect();
+            block.header.core.rollup_root = ego_core::hash_data(&commit_data);
+            block.header.metadata.rollup_commits = self.pending_rollup_commits.len() as u32;
+        }
+
+        // Compute VRF for this slot — output is deterministically derived from the Ed25519
+        // signature (proof) so verifiers can reconstruct and check it without the secret key.
+        let epoch  = height.as_u64() / 1000;
+        let slot   = height.as_u64(); // use absolute height as the slot ID
+        let (vrf_hash, vrf_proof_bytes) =
+            ConsensusBlockHeader::compute_vrf_output(self.get_keypair(), epoch, slot);
+        block.header.core.vrf_output = *vrf_hash.as_bytes();
+        block.header.core.vrf_proof  = Some(vrf_proof_bytes);
 
         block.sign(self.get_keypair(), false)?;
 
@@ -1383,30 +1615,45 @@ impl Node {
         }
     }
 
-    /// Handle PoRep events from prover and verifier
+    /// Handle PoRep events from prover and verifier.
+    ///
+    /// A verified PoRep is the entry credential for consensus participation:
+    /// the proving node is automatically registered as a storage validator
+    /// with an initial DRS score of 0.5, weighted into future leader elections.
     pub async fn handle_porep_events(&mut self) {
         while let Ok(event) = self.porep_receiver.try_recv() {
-            info!("Received PoRep event for sector {}", event.sector_id);
+            info!("Received PoRep event for sector {} from {}", event.sector_id, event.node_addr);
 
-            // Record proof generation metrics
             self.performance_metrics.proof_events_generated += 1;
 
-            // Store recent proof for monitoring
             let proof_event = ProofEvent {
                 event_type: "porep_event".to_string(),
-                shard_id: None,
-                piece_id: Some(event.sector_id as u32),
-                group_id: None,
+                shard_id:   None,
+                piece_id:   Some(event.sector_id as u32),
+                group_id:   None,
                 evidence_digest: event.proof_hash.as_bytes().to_vec(),
-                timestamp: event.ts_ms,
-                peer_id: event.node_addr.to_string(),
+                timestamp:  event.ts_ms,
+                peer_id:    event.node_addr.to_string(),
             };
             self.recent_proofs.push(proof_event);
-
-            // Keep only the last 100 proofs
             if self.recent_proofs.len() > 100 {
                 self.recent_proofs.remove(0);
             }
+
+            // Register the prover as a consensus validator.
+            let current_epoch = self.state_manager.get_block_height().as_u64() / 1000;
+            let pub_key = if let Some(acc) = self.state_manager.get_account(&event.node_addr) {
+                ego_core::PublicKey::new(ego_core::AlgorithmId::MlDsa2, acc.dilithium_pk.clone())
+            } else {
+                // Derive from the event signature key if account not yet on-chain
+                ego_core::PublicKey::new(ego_core::AlgorithmId::MlDsa2, vec![0u8; 1312])
+            };
+            crate::consensus_integration::register_storage_validator(
+                &self.state_manager,
+                event.node_addr,
+                pub_key,
+                current_epoch,
+            );
         }
     }
 

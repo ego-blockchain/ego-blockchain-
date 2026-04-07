@@ -91,7 +91,6 @@ custom-protocol = ["tauri/custom-protocol"]
 # Use FASTLINK PDB mode to avoid MSVC LNK1318 type-record limit on large binaries.
 [profile.dev]
 debug = false
-split-debuginfo = "unpacked"
 
 # Prevent src-tauri from joining the parent ego-blockchain workspace.
 [workspace]

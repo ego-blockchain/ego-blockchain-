@@ -223,6 +223,7 @@ fn main() {
             commands::storage::store_file,
             commands::storage::get_file_metadata,
             commands::storage::get_stored_files,
+            commands::storage::get_egosafe_files,
             commands::storage::get_storage_metrics,
             commands::storage::configure_storage,
             commands::storage::get_available_drives,
@@ -247,6 +248,8 @@ fn main() {
             commands::auth::save_app_settings,
             commands::staking::unstake_coins,
             commands::explorer::get_network_stats,
+            commands::explorer::get_egoc_price_usd,
+            commands::explorer::get_network_capacity,
             commands::explorer::get_p2p_status,
             commands::explorer::get_blocks,
             commands::explorer::get_all_transactions,
@@ -494,6 +497,9 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 crate::commands::consensus::run_post_loop().await;
             });
+
+            // Restore any txs that were pending when the app last closed.
+            crate::commands::tx_pending::restore_to_mempool();
 
             tauri::async_runtime::spawn(async move {
                 crate::mempool::run_batch_loop().await;

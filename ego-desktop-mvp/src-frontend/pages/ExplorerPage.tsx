@@ -25,6 +25,8 @@ interface LedgerTx {
   status: string;
   block_height?: number;
   nonce: number;
+  tx_type?: string;
+  cid?: string;
 }
 
 interface FileEvent {
@@ -296,7 +298,7 @@ const ExplorerPage: React.FC = () => {
                         <td className="px-5 py-3 font-mono text-xs text-gray-300">{shortHash(block.hash)}</td>
                         <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(block.miner)}</td>
                         <td className="px-5 py-3 text-right text-gray-300">{block.tx_count}</td>
-                        <td className="px-5 py-3 text-right text-green-400">{(block.reward / 1_000_000).toFixed(0)} EGOC</td>
+                        <td className="px-5 py-3 text-right text-green-400">{(block.reward / 1_000_000).toFixed(3)} EGOC</td>
                         <td className="px-5 py-3 text-right text-gray-500 text-xs">{timeAgo(block.timestamp)}</td>
                       </tr>
                     ))}
@@ -321,6 +323,7 @@ const ExplorerPage: React.FC = () => {
                   <thead>
                     <tr className="border-b border-gray-700 text-xs text-gray-400">
                       <th className="px-5 py-3 text-left">Hash</th>
+                      <th className="px-5 py-3 text-left">Type</th>
                       <th className="px-5 py-3 text-left">Block</th>
                       <th className="px-5 py-3 text-left">From</th>
                       <th className="px-5 py-3 text-left">To</th>
@@ -329,17 +332,31 @@ const ExplorerPage: React.FC = () => {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-700/50">
-                    {txs.map(tx => (
+                    {txs.map(tx => {
+                      const txTypeLabel = tx.tx_type === 'reward'        ? '🏆 Reward'
+                                        : tx.tx_type === 'store_data'    ? '📦 Store'
+                                        : tx.tx_type === 'store_file'    ? '📦 Store'
+                                        : tx.tx_type === 'retrieve_file' ? '📥 Retrieve'
+                                        : tx.tx_type === 'slash_storage' ? '⚡ Slash'
+                                        : tx.tx_type === 'transfer'      ? '↔️ Transfer'
+                                        : tx.tx_type                     ? tx.tx_type
+                                        : tx.from.startsWith('egot1faucet') ? '🚰 Faucet'
+                                        : '↔️ Transfer';
+                      const fromLabel = tx.from.startsWith('egot1rewards') ? 'Rewards Pool'
+                                      : tx.from.startsWith('egot1faucet')  ? 'Faucet'
+                                      : shortAddr(tx.from);
+                      return (
                       <tr
                         key={tx.hash}
                         onClick={() => setSelectedTx(tx)}
                         className="hover:bg-gray-700/40 cursor-pointer transition"
                       >
                         <td className="px-5 py-3 font-mono text-xs text-blue-400">{shortHash(tx.hash)}</td>
+                        <td className="px-5 py-3 text-xs text-gray-300">{txTypeLabel}</td>
                         <td className="px-5 py-3 font-mono text-xs text-gray-400">
                           {tx.block_height != null ? `#${tx.block_height.toLocaleString()}` : '—'}
                         </td>
-                        <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(tx.from)}</td>
+                        <td className="px-5 py-3 font-mono text-xs text-gray-400">{fromLabel}</td>
                         <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(tx.to)}</td>
                         <td className="px-5 py-3 text-right text-gray-200">{(tx.amount / 1_000_000).toFixed(2)} EGOC</td>
                         <td className="px-5 py-3 text-right">
@@ -350,7 +367,8 @@ const ExplorerPage: React.FC = () => {
                           }`}>{tx.status}</span>
                         </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -522,7 +540,7 @@ const ExplorerPage: React.FC = () => {
                 { label: 'Prev Hash',    val: selectedBlock.prev_hash, mono: true },
                 { label: 'Timestamp',    val: new Date(selectedBlock.timestamp * 1000).toLocaleString() },
                 { label: 'Miner',        val: selectedBlock.miner,     mono: true },
-                { label: 'Reward',       val: `${(selectedBlock.reward / 1_000_000).toFixed(2)} EGOC` },
+                { label: 'Reward',       val: `${(selectedBlock.reward / 1_000_000).toFixed(3)} EGOC` },
                 { label: 'Transactions', val: String(selectedBlock.tx_count) },
                 { label: 'Size',         val: `${(selectedBlock.size_bytes / 1024).toFixed(1)} KB` },
                 { label: 'Finality',     val: 'Dilithium QC verified ✓' },

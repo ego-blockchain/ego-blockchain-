@@ -25,18 +25,20 @@ impl Codegen {
         }
     }
 
-    fn intern_str(&mut self, s: &str) -> (u32, u32) {
+    fn intern_str(&mut self, s: &str) -> Result<(u32, u32)> {
         if let Some(&pair) = self.str_offsets.get(s) {
-            return pair;
+            return Ok(pair);
         }
         let offset = self.data_ptr;
         let len    = s.len() as u32;
         if offset + len >= DATA_LIMIT {
-            panic!("string literal data section overflow — max 4 KB of string literals");
+            return Err(CompileError::CodegenError(
+                "string literal data section overflow — max 4 KB of string literals".into()
+            ));
         }
         self.str_offsets.insert(s.to_string(), (offset, len));
         self.data_ptr += len + 1;
-        (offset, len)
+        Ok((offset, len))
     }
 
     fn intern_str_get(&self, s: &str) -> Result<(u32, u32)> {
@@ -45,120 +47,123 @@ impl Codegen {
         })
     }
 
-    fn collect_strings(&mut self, contract: &Contract) {
+    fn collect_strings(&mut self, contract: &Contract) -> Result<()> {
         for f in &contract.functions {
-            self.collect_strings_stmts(&f.body);
+            self.collect_strings_stmts(&f.body)?;
         }
-
         for f in &contract.functions {
-            self.collect_emit_names(&f.body);
+            self.collect_emit_names(&f.body)?;
         }
+        Ok(())
     }
 
-    fn collect_emit_names(&mut self, stmts: &[Stmt]) {
+    fn collect_emit_names(&mut self, stmts: &[Stmt]) -> Result<()> {
         for s in stmts {
             match s {
                 Stmt::Emit { event, fields } => {
-                    self.intern_str(event);
-                    for (_, e) in fields { self.collect_strings_expr(e); }
+                    self.intern_str(event)?;
+                    for (_, e) in fields { self.collect_strings_expr(e)?; }
                 }
                 Stmt::For { body, iter, .. } => {
-                    self.collect_strings_expr(iter);
-                    self.collect_emit_names(body);
+                    self.collect_strings_expr(iter)?;
+                    self.collect_emit_names(body)?;
                 }
                 Stmt::While { cond, body } => {
-                    self.collect_strings_expr(cond);
-                    self.collect_emit_names(body);
+                    self.collect_strings_expr(cond)?;
+                    self.collect_emit_names(body)?;
                 }
                 Stmt::If { cond, then, else_ } => {
-                    self.collect_strings_expr(cond);
-                    self.collect_emit_names(then);
-                    if let Some(b) = else_ { self.collect_emit_names(b); }
+                    self.collect_strings_expr(cond)?;
+                    self.collect_emit_names(then)?;
+                    if let Some(b) = else_ { self.collect_emit_names(b)?; }
                 }
                 Stmt::Match { expr, arms } => {
-                    self.collect_strings_expr(expr);
-                    for arm in arms { self.collect_emit_names(&arm.body); }
+                    self.collect_strings_expr(expr)?;
+                    for arm in arms { self.collect_emit_names(&arm.body)?; }
                 }
                 _ => {}
             }
         }
+        Ok(())
     }
 
-    fn collect_strings_stmts(&mut self, stmts: &[Stmt]) {
+    fn collect_strings_stmts(&mut self, stmts: &[Stmt]) -> Result<()> {
         for s in stmts {
             match s {
-                Stmt::Let { init, .. }    => self.collect_strings_expr(init),
-                Stmt::Assign { value, .. } => self.collect_strings_expr(value),
-                Stmt::Return(Some(e))     => self.collect_strings_expr(e),
+                Stmt::Let { init, .. }     => self.collect_strings_expr(init)?,
+                Stmt::Assign { value, .. } => self.collect_strings_expr(value)?,
+                Stmt::Return(Some(e))      => self.collect_strings_expr(e)?,
                 Stmt::If { cond, then, else_ } => {
-                    self.collect_strings_expr(cond);
-                    self.collect_strings_stmts(then);
-                    if let Some(b) = else_ { self.collect_strings_stmts(b); }
+                    self.collect_strings_expr(cond)?;
+                    self.collect_strings_stmts(then)?;
+                    if let Some(b) = else_ { self.collect_strings_stmts(b)?; }
                 }
                 Stmt::While { cond, body } => {
-                    self.collect_strings_expr(cond);
-                    self.collect_strings_stmts(body);
+                    self.collect_strings_expr(cond)?;
+                    self.collect_strings_stmts(body)?;
                 }
                 Stmt::For { iter, body, .. } => {
-                    self.collect_strings_expr(iter);
-                    self.collect_strings_stmts(body);
+                    self.collect_strings_expr(iter)?;
+                    self.collect_strings_stmts(body)?;
                 }
-                Stmt::CompoundAssign { value, .. } => self.collect_strings_expr(value),
+                Stmt::CompoundAssign { value, .. } => self.collect_strings_expr(value)?,
                 Stmt::Match { expr, arms } => {
-                    self.collect_strings_expr(expr);
-                    for arm in arms { self.collect_strings_stmts(&arm.body); }
+                    self.collect_strings_expr(expr)?;
+                    for arm in arms { self.collect_strings_stmts(&arm.body)?; }
                 }
                 Stmt::Emit { fields, .. } => {
-                    for (_, e) in fields { self.collect_strings_expr(e); }
+                    for (_, e) in fields { self.collect_strings_expr(e)?; }
                 }
-                Stmt::Expr(e) => self.collect_strings_expr(e),
+                Stmt::Expr(e) => self.collect_strings_expr(e)?,
                 _ => {}
             }
         }
+        Ok(())
     }
 
-    fn collect_strings_expr(&mut self, expr: &Expr) {
+    fn collect_strings_expr(&mut self, expr: &Expr) -> Result<()> {
         match expr {
-            Expr::StrLit(s)                  => { self.intern_str(s); }
+            Expr::StrLit(s)                  => { self.intern_str(s)?; }
             Expr::BinOp { left, right, .. }  => {
-                self.collect_strings_expr(left);
-                self.collect_strings_expr(right);
+                self.collect_strings_expr(left)?;
+                self.collect_strings_expr(right)?;
             }
-            Expr::UnOp { expr, .. }          => self.collect_strings_expr(expr),
-            Expr::StorageCall { args, .. }   => args.iter().for_each(|a| self.collect_strings_expr(a)),
-            Expr::EventsCall  { args, .. }   => args.iter().for_each(|a| self.collect_strings_expr(a)),
+            Expr::UnOp { expr, .. }          => self.collect_strings_expr(expr)?,
+            Expr::StorageCall { args, .. }   => { for a in args { self.collect_strings_expr(a)?; } }
+            Expr::EventsCall  { args, .. }   => { for a in args { self.collect_strings_expr(a)?; } }
             Expr::Assert { cond, msg }       => {
-                self.collect_strings_expr(cond);
-                self.intern_str(msg);
+                self.collect_strings_expr(cond)?;
+                self.intern_str(msg)?;
             }
             Expr::EgocTransfer { to, amount } => {
-                self.collect_strings_expr(to);
-                self.collect_strings_expr(amount);
+                self.collect_strings_expr(to)?;
+                self.collect_strings_expr(amount)?;
             }
-            Expr::Call { args, .. }          => args.iter().for_each(|a| self.collect_strings_expr(a)),
-            Expr::Blake3Hash { data }        => self.collect_strings_expr(data),
-            Expr::ArrayLit(elems)            => elems.iter().for_each(|e| self.collect_strings_expr(e)),
+            Expr::Call { args, .. }          => { for a in args { self.collect_strings_expr(a)?; } }
+            Expr::Blake3Hash { data }        => self.collect_strings_expr(data)?,
+            Expr::ArrayLit(elems)            => { for e in elems { self.collect_strings_expr(e)?; } }
             Expr::Index { base, index }      => {
-                self.collect_strings_expr(base);
-                self.collect_strings_expr(index);
+                self.collect_strings_expr(base)?;
+                self.collect_strings_expr(index)?;
             }
             Expr::StructLit { fields, .. }   => {
-                for (_, e) in fields { self.collect_strings_expr(e); }
+                for (_, e) in fields { self.collect_strings_expr(e)?; }
             }
-            Expr::FieldAccess { base, .. }   => self.collect_strings_expr(base),
-            Expr::Cast { expr, .. }          => self.collect_strings_expr(expr),
+            Expr::FieldAccess { base, .. }   => self.collect_strings_expr(base)?,
+            Expr::Cast { expr, .. }          => self.collect_strings_expr(expr)?,
             Expr::Range { start, end }       => {
-                self.collect_strings_expr(start);
-                self.collect_strings_expr(end);
+                self.collect_strings_expr(start)?;
+                self.collect_strings_expr(end)?;
             }
-            Expr::Tuple(elems)               => elems.iter().for_each(|e| self.collect_strings_expr(e)),
+            Expr::Tuple(elems)               => { for e in elems { self.collect_strings_expr(e)?; } }
             _ => {}
         }
+        Ok(())
     }
 
     pub fn generate(&mut self, contract: &Contract) -> Result<String> {
 
-        self.collect_strings(contract);
+        self.collect_strings(contract)?;
 
         let mut wat = String::new();
         wat.push_str("(module\n");

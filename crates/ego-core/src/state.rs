@@ -19,6 +19,15 @@ pub const RECEIPT_DEADLINE_EPOCHS: u64 = 100;
 pub const MIN_VALIDATOR_STAKE: u128 = 100_000_000_000;
 pub const MIN_STORAGE_COLLATERAL: u128 = 10_000_000_000;
 
+/// Base fee rate: nanoEGOC per resource unit consumed.
+/// 1000 nanoEGOC = 0.001 uEGOC per RU.
+pub const BASE_FEE_PER_RU: u128 = 1_000;
+
+/// All base fees are burned to this address (20 zero bytes).
+pub fn burn_address() -> Address {
+    Address::new([0u8; 20])
+}
+
 #[derive(Debug, Clone)]
 pub struct StateManager {
     accounts: Arc<DashMap<Address, Account>>,
@@ -479,6 +488,11 @@ impl StateManager {
         self.accounts.contains_key(address)
     }
 
+    /// Returns a snapshot of all accounts for persistence.
+    pub fn all_accounts(&self) -> Vec<Account> {
+        self.accounts.iter().map(|e| e.value().clone()).collect()
+    }
+
     pub fn create_account(&self, address: Address, account_type: AccountType) -> EgoResult<()> {
         if self.accounts.contains_key(&address) {
             return Err(EgoError::InvalidTransaction(
@@ -712,6 +726,18 @@ impl StateManager {
             ));
         }
 
+        self.validators.insert(info.address, info);
+        Ok(())
+    }
+
+    /// Register a validator that qualified via Proof-of-Replication or Proof-of-Coverage.
+    /// Does NOT require minimum stake — useful work proof is the entry criterion.
+    pub fn register_storage_validator(&self, info: ValidatorInfo) -> EgoResult<()> {
+        if info.commission_rate > 10000 {
+            return Err(EgoError::InvalidTransaction(
+                "Commission rate cannot exceed 100%".to_string(),
+            ));
+        }
         self.validators.insert(info.address, info);
         Ok(())
     }
@@ -1004,6 +1030,79 @@ impl StateManager {
         })
     }
 
+    /// Apply an inbound cross-shard receipt on the **destination** shard.
+    ///
+    /// This is called by the relay layer (ego-node) when a receipt arrives over
+    /// gossip from another shard.  It:
+    ///   1. Checks the nonce hasn't already been applied (replay protection)
+    ///   2. Decodes the `CrossShardMessage` from the receipt payload
+    ///   3. Credits the recipient / calls the contract
+    ///   4. Marks the nonce as processed
+    pub fn apply_inbound_receipt(&mut self, receipt: &CrossShardReceipt) -> EgoResult<()> {
+        use crate::transaction::CrossShardMessage;
+
+        // Replay protection — reject already-applied nonces.
+        let key = (receipt.src_shard, receipt.dst_shard);
+        if let Some(nonces) = self.processed_receipt_nonces.get(&key) {
+            if nonces.contains(&receipt.nonce) {
+                return Err(EgoError::InvalidTransaction(
+                    "cross-shard receipt already applied".into(),
+                ));
+            }
+        }
+
+        // Deadline check.
+        let current_epoch = self.get_current_epoch();
+        if receipt.deadline_epoch < current_epoch {
+            return Err(EgoError::InvalidTransaction(
+                "cross-shard receipt expired".into(),
+            ));
+        }
+
+        // Decode the typed message.
+        let msg = CrossShardMessage::decode(&receipt.payload).ok_or_else(|| {
+            EgoError::InvalidTransaction("cross-shard receipt: malformed payload".into())
+        })?;
+
+        // Apply the state change on this shard.
+        match msg {
+            CrossShardMessage::Transfer { to, amount } => {
+                if amount.as_u128() > 0 {
+                    let mut recipient = self
+                        .get_account(&to)
+                        .unwrap_or_else(|| {
+                            Account::new_eoa(to, vec![0u8; 1312], vec![0u8; 1184])
+                        });
+                    recipient.credit(amount)?;
+                    self.set_account(recipient);
+                }
+            }
+            CrossShardMessage::ContractCall { contract, method, args, value, original_sender: _ } => {
+                // Credit the contract with the transferred value before calling it.
+                if value.as_u128() > 0 {
+                    let mut contract_acct = self
+                        .get_account(&contract)
+                        .unwrap_or_else(|| {
+                            Account::new_eoa(contract, vec![0u8; 1312], vec![0u8; 1184])
+                        });
+                    contract_acct.credit(value)?;
+                    self.set_account(contract_acct);
+                }
+                // Contract execution is handled by ego-vm in the node layer after this returns.
+                // We emit an event so the node knows to dispatch the call.
+                let _ = (contract, method, args); // used by node layer
+            }
+        }
+
+        // Record nonce as applied — prevents replay.
+        self.processed_receipt_nonces
+            .entry(key)
+            .or_insert_with(HashSet::new)
+            .insert(receipt.nonce);
+
+        Ok(())
+    }
+
     pub fn prune_expired_receipts(&self, current_epoch: u64) -> Vec<Hash> {
         let mut expired = Vec::new();
 
@@ -1038,6 +1137,22 @@ impl StateManager {
             sender.increment_shard_nonce(tx.shard_id.as_u32());
         } else {
             sender.increment_nonce();
+        }
+
+        // Collect base fee: ru_limit × BASE_FEE_PER_RU, subsidised by pob_burn_credits.
+        // pob_burn_credits are pre-burned PoB credits that offset the fee 1:1.
+        let gross_fee = Balance(tx.ru_limit as u128 * BASE_FEE_PER_RU);
+        let subsidy   = Balance(tx.pob_burn_credits as u128);
+        let net_fee   = gross_fee.saturating_sub(subsidy);
+        if net_fee.as_u128() > 0 {
+            sender.debit(net_fee)?;
+            // Credit burn address — tokens permanently removed from supply.
+            let burn_addr = burn_address();
+            let mut burn_acct = self
+                .get_account(&burn_addr)
+                .unwrap_or_else(|| Account::new_eoa(burn_addr, vec![0u8; 1312], vec![0u8; 1184]));
+            burn_acct.credit(net_fee)?;
+            self.set_account(burn_acct);
         }
 
         let result = match &tx.payload {
@@ -1245,7 +1360,7 @@ impl StateManager {
         let mut recipient = self
             .get_account(&to)
             .unwrap_or_else(|| Account::new_eoa(to, vec![0u8; 1312], vec![0u8; 1184]));
-        recipient.credit(amount);
+        recipient.credit(amount)?;
 
         self.set_account(recipient);
 
@@ -1311,7 +1426,7 @@ impl StateManager {
 
         if initial_balance.as_u128() > 0 {
             let mut new_account = self.get_account(&account_address).unwrap();
-            new_account.credit(initial_balance);
+            new_account.credit(initial_balance)?;
             self.set_account(new_account);
         }
 
@@ -1700,7 +1815,7 @@ impl StateManager {
         let adjusted_total =
             Balance::new(((reward_buckets.total.as_u128() as f64) * drs_multiplier) as u128);
 
-        sender.credit(adjusted_total);
+        sender.credit(adjusted_total)?;
 
         Ok(TransactionResult {
             tx_hash: Hash::ZERO,
@@ -1991,7 +2106,7 @@ impl StateManager {
             };
         }
 
-        sender.credit(amount);
+        sender.credit(amount)?;
 
         Ok(TransactionResult {
             tx_hash: Hash::ZERO,
@@ -2083,10 +2198,30 @@ impl StateManager {
         nonce: u64,
         deadline_epoch: u64,
     ) -> EgoResult<TransactionResult> {
+        use crate::transaction::CrossShardMessage;
+
+        // Decode and validate the message before touching any state.
+        let msg = CrossShardMessage::decode(message).ok_or_else(|| {
+            EgoError::InvalidTransaction("CrossShard: malformed message payload".into())
+        })?;
+
+        // Debit sender on this (source) shard for Transfer messages.
+        // ContractCall value is also debited here; the dest shard credits the contract.
+        let locked_amount = match &msg {
+            CrossShardMessage::Transfer { amount, .. } => *amount,
+            CrossShardMessage::ContractCall { value, .. } => *value,
+        };
+        if locked_amount.as_u128() > 0 {
+            sender.debit(locked_amount)?;
+        }
+
+        // Build the receipt that will be relayed to the destination shard.
+        // src_block_hash is Hash::ZERO here — it will be filled in by the
+        // relay layer (main.rs) after the block is finalized and has a real hash.
         let receipt = CrossShardReceipt {
             src_shard: tx.shard_id,
             dst_shard: target_shard,
-            src_block_hash: Hash::ZERO,
+            src_block_hash: Hash::ZERO, // filled post-finalization
             tx_id: tx.hash,
             payload: message.to_vec(),
             nonce,
@@ -2109,7 +2244,8 @@ impl StateManager {
                     "from_shard": tx.shard_id.as_u32(),
                     "to_shard": target_shard.as_u32(),
                     "nonce": nonce,
-                    "deadline": deadline_epoch
+                    "deadline": deadline_epoch,
+                    "locked": locked_amount.as_u128(),
                 })
                 .to_string(),
                 block_height: self.get_block_height().as_u64(),

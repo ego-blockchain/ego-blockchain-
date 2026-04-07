@@ -154,6 +154,15 @@ function buildProjectFromTemplate(tpl: (typeof TEMPLATES)[number]): Project {
 }
 
 const STORAGE_KEY = 'ego-ide-projects';
+const MAX_IMPORT_FILES = 200;
+
+/** Strip path-traversal segments so user input can't escape the project root. */
+function sanitizeFilePath(p: string): string {
+  return p
+    .split('/')
+    .filter(seg => seg !== '..' && seg !== '.' && seg.trim() !== '')
+    .join('/');
+}
 
 function loadProjects(): Record<string, Project> {
   try {
@@ -168,8 +177,8 @@ function loadProjects(): Record<string, Project> {
 function saveProjects(projects: Record<string, Project>): void {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(projects));
-  } catch {
-
+  } catch (e) {
+    console.error('[IDE] Failed to save projects to localStorage:', e);
   }
 }
 
@@ -1286,7 +1295,10 @@ export default function IDEPage() {
   }, [fileMenuOpen]);
 
   const addLog = useCallback((level: ConsoleLog['level'], msg: string) => {
-    setConsoleLogs((prev) => [...prev, { ts: nowTs(), level, msg }]);
+    setConsoleLogs((prev) => {
+      const next = [...prev, { ts: nowTs(), level, msg }];
+      return next.length > 500 ? next.slice(next.length - 500) : next;
+    });
   }, []);
 
   const currentProject = activeProject ? projects[activeProject] : null;
@@ -1368,6 +1380,8 @@ export default function IDEPage() {
 
   function handleNewFile(filename: string) {
     if (!activeProject) return;
+    const safe = sanitizeFilePath(filename);
+    if (!safe) return;
     setProjects((prev) => {
       const updated = {
         ...prev,
@@ -1375,10 +1389,10 @@ export default function IDEPage() {
           ...prev[activeProject],
           files: {
             ...prev[activeProject].files,
-            [filename]: {
-              name: filename.split('/').pop()!,
+            [safe]: {
+              name: safe.split('/').pop()!,
               content: '',
-              language: getLanguage(filename),
+              language: getLanguage(safe),
             },
           },
         },
@@ -1386,9 +1400,9 @@ export default function IDEPage() {
       saveProjects(updated);
       return updated;
     });
-    setActiveFile(filename);
-    addTab(filename, activeFile ?? undefined);
-    addLog('info', `Created file "${filename}"`);
+    setActiveFile(safe);
+    addTab(safe, activeFile ?? undefined);
+    addLog('info', `Created file "${safe}"`);
   }
 
   function handleNewFolder(firstFilePath: string) {
@@ -1502,19 +1516,21 @@ export default function IDEPage() {
 
   function handleRenameFile(oldPath: string, newPath: string) {
     if (!activeProject || oldPath === newPath) return;
+    const safeNew = sanitizeFilePath(newPath);
+    if (!safeNew) return;
     setProjects((prev) => {
       const files = { ...prev[activeProject].files };
       const file = files[oldPath];
       if (!file) return prev;
       delete files[oldPath];
-      files[newPath] = { ...file, name: newPath.split('/').pop()! };
+      files[safeNew] = { ...file, name: safeNew.split('/').pop()! };
       const updated = { ...prev, [activeProject]: { ...prev[activeProject], files } };
       saveProjects(updated);
       return updated;
     });
-    if (activeFile === oldPath) setActiveFile(newPath);
-    setOpenTabs(prev => prev.map(t => t === oldPath ? newPath : t));
-    addLog('info', `Renamed "${oldPath}" → "${newPath}"`);
+    if (activeFile === oldPath) setActiveFile(safeNew);
+    setOpenTabs(prev => prev.map(t => t === oldPath ? safeNew : t));
+    addLog('info', `Renamed "${oldPath}" → "${safeNew}"`);
   }
 
   function handleRenameFolder(oldFolder: string, newFolder: string) {
@@ -1669,16 +1685,20 @@ export default function IDEPage() {
       const entries = await readDir(chosen, { recursive: true });
       const flat    = await flattenEntries(entries, chosen);
 
-      const results = await Promise.all(
-        flat.map(({ rel, full }) =>
-          readTextFile(full)
-            .then(content => ({ rel, content }))
-            .catch(() => null)
-        )
-      );
+      if (flat.length > MAX_IMPORT_FILES) {
+        addLog('error', `Project has ${flat.length} files — import is capped at ${MAX_IMPORT_FILES}. Open a smaller folder.`);
+        return;
+      }
+
       const files: Record<string, ProjectFile> = {};
-      for (const r of results) {
-        if (r) files[r.rel] = { name: r.rel.split('/').pop()!, content: r.content, language: getLanguage(r.rel) };
+      for (const { rel, full } of flat) {
+        try {
+          const content = await readTextFile(full);
+          const safeRel = sanitizeFilePath(rel);
+          if (safeRel) files[safeRel] = { name: safeRel.split('/').pop()!, content, language: getLanguage(safeRel) };
+        } catch {
+          // skip unreadable / binary files silently
+        }
       }
 
       if (Object.keys(files).length === 0) {

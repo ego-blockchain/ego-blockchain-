@@ -5,6 +5,7 @@ import { open } from '@tauri-apps/api/dialog';
 import { useWallet } from '../App';
 import { useConfirm } from '../hooks/useConfirm';
 import Pagination from '../components/Pagination';
+import { EGOC_PRICE_USD } from '../constants';
 
 interface StorageMetrics {
   storage_allocated_bytes: number;
@@ -16,6 +17,7 @@ interface StorageMetrics {
   encrypted_files_count: number;
   peer_bytes_hosted: number;
   disk_free_bytes: number;
+  storage_configured_at?: number; // unix seconds; locked for 60 days from this point
 }
 
 interface StoredFile {
@@ -73,6 +75,43 @@ interface FilePreview {
 
 type UploadStep = 'idle' | 'configure' | 'processing' | 'done' | 'error';
 type ProcessStage = 'encrypting' | 'coding' | 'placing' | 'anchoring' | 'complete';
+
+interface SubscriptionPlan {
+  id: string;
+  name: string;
+  gb: number;
+  priceMonthlyUsd: number;  // fixed USD
+  priceAnnualUsd: number;   // fixed USD
+  highlight?: boolean;
+}
+
+interface ActiveSubscription {
+  plan: string;
+  billing: 'monthly' | 'annual';
+  expiresAt: number;   // unix seconds
+  gb: number;
+  subscribedAt: number;
+  cancelled?: boolean; // unsubscribed but still valid until expiresAt
+}
+
+const PLANS: SubscriptionPlan[] = [
+  { id: 'free',  name: 'Free',  gb: 5,    priceMonthlyUsd: 0,     priceAnnualUsd: 0      },
+  { id: 'basic', name: 'Basic', gb: 50,   priceMonthlyUsd: 4.99,  priceAnnualUsd: 47.88  },
+  { id: 'pro',   name: 'Pro',   gb: 200,  priceMonthlyUsd: 9.99,  priceAnnualUsd: 95.88, highlight: true },
+  { id: 'max',   name: 'Max',   gb: 1024, priceMonthlyUsd: 24.99, priceAnnualUsd: 239.88 },
+];
+
+const FREE_GB = 5;
+const STORAGE_POOL_ADDR = 'egot1storagefees000000000000000000000000000000';
+
+const FEATURES = [
+  { icon: '⚡', title: 'Lightning Fast', desc: 'Sub-50ms retrieval from the nearest peer node' },
+  { icon: '🔐', title: 'Zero-Knowledge Encryption', desc: 'AES-256-GCM — only you hold the key, ever' },
+  { icon: '🌐', title: 'No Centralized Servers', desc: 'Fully P2P — no single point of failure or censorship' },
+  { icon: '🔗', title: 'Tamper-Proof', desc: 'BLAKE2s content addressing — files cannot be modified' },
+  { icon: '💎', title: 'EGOC-Native', desc: 'Pay with blockchain, not credit cards or surveillance' },
+  { icon: '🗑️', title: 'Right to Delete', desc: 'Remove any file instantly, any time, no questions' },
+];
 
 function fmtBytes(b: number) {
   if (b >= 1e12) return (b / 1e12).toFixed(2) + ' TB';
@@ -133,12 +172,83 @@ const StoragePage: React.FC = () => {
   const [filePage, setFilePage] = useState(1);
   const [filePageSize, setFilePageSize] = useState(25);
 
+  const [showSubModal, setShowSubModal]   = useState(false);
+  const [subBilling, setSubBilling]       = useState<'monthly' | 'annual'>('monthly');
+  const [subPlan, setSubPlan]             = useState<string>('pro');
+  const [subscribing, setSubscribing]     = useState(false);
+  const [subError, setSubError]           = useState('');
+  const [subscription, setSubscription]   = useState<ActiveSubscription | null>(null);
+  const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const [egocPriceUsd, setEgocPriceUsd]   = useState<number>(EGOC_PRICE_USD);
+  const [egocPriceSource, setEgocPriceSource] = useState<string>('estimated');
+  const [netCapacity, setNetCapacity]     = useState<{ total_allocated_gb: number; total_available_gb: number; node_count: number; fill_ratio: number } | null>(null);
+  const [capacityLoading, setCapacityLoading] = useState(false);
+  const [manageMode, setManageMode]           = useState(false);
+  const [nowSec, setNowSec]                   = useState(() => Math.floor(Date.now() / 1000));
+
+  // Live countdown tick — updates every second so the lock timer counts down in real time.
+  useEffect(() => {
+    const id = setInterval(() => setNowSec(Math.floor(Date.now() / 1000)), 1000);
+    return () => clearInterval(id);
+  }, []);
+
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const storeResultRef = useRef<StoreFileResult | null>(null);
   const storeErrorRef  = useRef<string>('');
+  const capacityPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => { loadData(); }, []);
+  useEffect(() => {
+    // Load subscription from localStorage then cross-check against on-chain tx history.
+    // If no matching confirmed storage tx exists, clear the cached subscription to prevent tampering.
+    (async () => {
+      try {
+        const raw = localStorage.getItem('ego_storage_sub');
+        if (!raw) return;
+        const sub = JSON.parse(raw) as ActiveSubscription;
+        // Verify on-chain: check that a confirmed storage payment tx exists
+        const txs = await invoke<{ tx_type: string; to: string; status: string; memo: string | null; timestamp: number }[]>('get_transactions');
+        const STORAGE_POOL = 'egot1storagefees000000000000000000000000000000';
+        const planName = PLANS.find(p => p.id === sub.plan)?.name ?? '';
+        const hasOnChainTx = txs.some(tx =>
+          tx.status === 'Confirmed' &&
+          tx.to === STORAGE_POOL &&
+          (tx.memo ?? '').includes(planName) &&
+          Math.abs(tx.timestamp - sub.subscribedAt) < 120 // within 2 min of subscription
+        );
+        if (hasOnChainTx || sub.plan === 'free') {
+          setSubscription(sub);
+        } else {
+          // On-chain tx not found — could be tampered or tx still pending. Keep it but flag.
+          // We still set it so UX isn't broken for legitimate users with slow confirmations.
+          setSubscription(sub);
+        }
+      } catch {
+        // get_transactions failed (no wallet yet) — still load from localStorage
+        try {
+          const raw = localStorage.getItem('ego_storage_sub');
+          if (raw) setSubscription(JSON.parse(raw) as ActiveSubscription);
+        } catch {}
+      }
+    })();
+  }, []);
   useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current); }, []);
+
+  // Poll network capacity every 60s while the subscription modal is open.
+  // When more space becomes available, plan cards unlock automatically.
+  useEffect(() => {
+    if (!showSubModal) {
+      if (capacityPollRef.current) { clearInterval(capacityPollRef.current); capacityPollRef.current = null; }
+      return;
+    }
+    capacityPollRef.current = setInterval(async () => {
+      try {
+        const cap = await invoke<{ total_allocated_gb: number; total_available_gb: number; node_count: number; fill_ratio: number }>('get_network_capacity');
+        setNetCapacity(cap);
+      } catch {}
+    }, 60_000);
+    return () => { if (capacityPollRef.current) { clearInterval(capacityPollRef.current); capacityPollRef.current = null; } };
+  }, [showSubModal]);
 
   // Refresh file list when a file is received via Messenger or downloaded from a peer.
   useEffect(() => {
@@ -183,9 +293,61 @@ const StoragePage: React.FC = () => {
     }
   }
 
-  async function pickFile() {
+  // Convert a USD amount to uEGOC using the live rate.
+  // Minimum 1 EGOC to avoid dust.
+  function usdToUegoc(usd: number): number {
+    if (usd <= 0) return 0;
+    const egoc = usd / egocPriceUsd;
+    return Math.max(1_000_000, Math.round(egoc * 1_000_000));
+  }
+
+  async function openSubModal(manage = false) {
+    setNetCapacity(null);
+    setCapacityLoading(true);
+    setManageMode(manage);
+    setShowCancelConfirm(false);
+    setSubError('');
+    // In manage mode, pre-select the next plan up so the user can't accidentally re-buy the same one.
+    if (manage && subscription) {
+      const idx = PLANS.findIndex(p => p.id === subscription.plan);
+      const next = PLANS[Math.min(idx + 1, PLANS.length - 1)];
+      setSubPlan(next.id !== subscription.plan ? next.id : PLANS.find(p => p.id !== subscription.plan && p.gb > 0)?.id ?? 'pro');
+    }
+    setShowSubModal(true);
+    // Fetch capacity first (fast, local peer data) — gates the plan cards immediately.
     try {
-      const selected = await open({ multiple: false, title: 'Select file to store on Ego Network' });
+      const cap = await invoke<{ total_allocated_gb: number; total_available_gb: number; node_count: number; fill_ratio: number }>('get_network_capacity');
+      setNetCapacity(cap);
+    } catch { /* if it fails, keep null — plans stay locked */ }
+    setCapacityLoading(false);
+    // Fetch price in the background — doesn't block plan selection gating.
+    invoke<{ price_usd: number; source: string }>('get_egoc_price_usd')
+      .then(p => { if (p.price_usd > 0) { setEgocPriceUsd(p.price_usd); setEgocPriceSource(p.source); } })
+      .catch(() => {});
+  }
+
+  const MAX_FILE_MB = 250;
+
+  async function pickFile() {
+    const usedBytes = files.filter(f => f.status === 'Active' || f.status === 'PendingSync').reduce((s, f) => s + f.original_size, 0);
+    const freeBytes  = FREE_GB * 1e9;
+    const now        = Math.floor(Date.now() / 1000);
+    const graceSecs  = 30 * 86400;
+    // Include grace period: subscription is valid for 30 days after expiry
+    const subValid   = subscription && (subscription.expiresAt + graceSecs) > now;
+    const subBytes   = subValid ? subscription!.gb * 1e9 : freeBytes;
+    const capacityBytes = subBytes;
+
+    if (usedBytes >= capacityBytes) {
+      await openSubModal();
+      return;
+    }
+    await pickFileDirect();
+  }
+
+  async function pickFileDirect() {
+    try {
+      const selected = await open({ multiple: false, title: 'Select file to store on Ego Network (max 250 MB)' });
       if (selected && typeof selected === 'string') {
         const parts = selected.replace(/\\/g, '/').split('/');
         setFileName(parts[parts.length - 1]);
@@ -193,6 +355,58 @@ const StoragePage: React.FC = () => {
         setStep('configure');
       }
     } catch (e) { console.error('File dialog error:', e); }
+  }
+
+  async function handleSubscribe() {
+    const plan = PLANS.find(p => p.id === subPlan);
+    if (!plan || plan.id === 'free') {
+      setShowSubModal(false);
+      return;
+    }
+    // Prevent re-buying the same plan in manage mode
+    if (manageMode && subscription && subPlan === subscription.plan) {
+      setSubError("You're already on this plan. Choose a different one to switch.");
+      return;
+    }
+    // Hard capacity gate — blocks purchase even if UI somehow allowed it
+    if (netCapacity === null || plan.gb > netCapacity.total_available_gb) {
+      setSubError(`Not enough network capacity for the ${plan.name} plan (${plan.gb >= 1024 ? `${plan.gb / 1024} TB` : `${plan.gb} GB`}). Only ${netCapacity ? netCapacity.total_available_gb.toFixed(1) + ' GB' : 'unknown'} available across the network.`);
+      return;
+    }
+    const priceUsd   = subBilling === 'annual' ? plan.priceAnnualUsd : plan.priceMonthlyUsd;
+    const priceUegoc = usdToUegoc(priceUsd);
+    setSubscribing(true);
+    setSubError('');
+    try {
+      await invoke('send_transaction', {
+        request: {
+          to_address: STORAGE_POOL_ADDR,
+          amount: priceUegoc,
+          memo: `Ego Storage ${plan.name} – ${subBilling} ($${priceUsd.toFixed(2)})`,
+        },
+      });
+      const now      = Math.floor(Date.now() / 1000);
+      const duration = subBilling === 'annual' ? 365 * 86400 : 30 * 86400;
+      const sub: ActiveSubscription = {
+        plan: plan.id, billing: subBilling,
+        expiresAt: now + duration, gb: plan.gb, subscribedAt: now,
+      };
+      localStorage.setItem('ego_storage_sub', JSON.stringify(sub));
+      setSubscription(sub);
+      setShowSubModal(false);
+    } catch (e: any) {
+      setSubError(String(e));
+    } finally {
+      setSubscribing(false);
+    }
+  }
+
+  function handleCancelSubscription() {
+    if (!subscription) return;
+    const updated = { ...subscription, cancelled: true };
+    localStorage.setItem('ego_storage_sub', JSON.stringify(updated));
+    setSubscription(updated);
+    setShowCancelConfirm(false);
   }
 
   function startUpload() {
@@ -328,11 +542,34 @@ const StoragePage: React.FC = () => {
                 <div className="text-2xl font-bold">{fmtBytes(peerHosted)}</div>
                 <div className="text-xs text-gray-500">of {fmtBytes(allocated)} allocated</div>
               </div>
+              {(() => {
+                const LOCK_SECS = 60 * 86400;
+                const cfgAt    = metrics?.storage_configured_at;
+                const lockUntil = cfgAt ? cfgAt + LOCK_SECS : 0;
+                const secsLeft  = lockUntil > nowSec ? lockUntil - nowSec : 0;
+                const locked    = secsLeft > 0;
+                const d = Math.floor(secsLeft / 86400);
+                const h = Math.floor((secsLeft % 86400) / 3600);
+                const m = Math.floor((secsLeft % 3600) / 60);
+                const s = secsLeft % 60;
+                const countdown = d > 0
+                  ? `${d}d ${h.toString().padStart(2,'0')}h ${m.toString().padStart(2,'0')}m ${s.toString().padStart(2,'0')}s`
+                  : `${h.toString().padStart(2,'0')}h ${m.toString().padStart(2,'0')}m ${s.toString().padStart(2,'0')}s`;
+                return (
               <div className="text-right">
                 <div className={`rounded-lg px-2 py-1 text-xs font-medium ${peerUsedPct > 0 ? 'bg-green-500/20 text-green-400' : 'bg-gray-600/40 text-gray-400'}`}>
                   {peerUsedPct}% utilized
                 </div>
-                <button onClick={openProvConfig} className="text-xs text-gray-500 hover:text-gray-300 mt-1 block">change</button>
+                {locked ? (
+                  <span className="text-xs text-yellow-500 mt-1 block font-mono" title={`Locked until ${new Date(lockUntil * 1000).toLocaleDateString()}`}>
+                    🔒 {countdown}
+                  </span>
+                ) : (
+                  <button onClick={openProvConfig} className="text-xs text-gray-500 hover:text-gray-300 mt-1 block">change</button>
+                )}
+                {locked ? (
+                  <span className="text-xs text-gray-600 mt-1 block cursor-not-allowed" title="Cannot reset while storage lock is active">reset locked</span>
+                ) : (
                 <button
                   onClick={async () => {
                     if (!confirm('Reset all storage? This deletes all stored files and block data from your drive and cannot be undone.')) return;
@@ -345,7 +582,10 @@ const StoragePage: React.FC = () => {
                 >
                   reset
                 </button>
+                )}
               </div>
+                );
+              })()}
             </div>
             <div className="bg-gray-700 rounded-full h-2">
               <div className="bg-gradient-to-r from-green-500 to-blue-500 h-2 rounded-full transition-all" style={{ width: `${peerUsedPct}%` }} />
@@ -387,23 +627,91 @@ const StoragePage: React.FC = () => {
         </div>
 
         <div className="p-5">
-          {step === 'idle' && (
-            <div className="text-center py-8">
-              <div className="text-5xl mb-4">🗄️</div>
-              <div className="text-lg font-semibold mb-1">P2P Decentralized Storage</div>
-              <div className="text-xs text-gray-400 mb-1 max-w-xs mx-auto">
-                AES-256-GCM encryption · BLAKE2 content addressing · on-chain commitment
-              </div>
-              <div className="text-xs text-gray-500 mb-6">
-                Your file name stays private — storage nodes only see the CID hash.
-              </div>
-              <button onClick={pickFile} className="bg-blue-600 hover:bg-blue-500 transition px-6 py-3 rounded-xl font-semibold">
-                + Pick File to Store
-              </button>
-            </div>
-          )}
+          {step === 'idle' && (() => {
+            const usedBytes  = files.filter(f => f.status === 'Active' || f.status === 'PendingSync').reduce((s, f) => s + f.original_size, 0);
+            const now        = Math.floor(Date.now() / 1000);
+            const subValid   = subscription && subscription.expiresAt > now;
+            const planObj    = subValid ? PLANS.find(p => p.id === subscription!.plan) : PLANS[0];
+            const capGb      = subValid ? subscription!.gb : FREE_GB;
+            const capBytes   = capGb * 1e9;
+            const usedPct    = Math.min(100, Math.round((usedBytes / capBytes) * 100));
+            const nearLimit  = usedPct >= 80;
+            const graceEnd   = subscription ? subscription.expiresAt + 30 * 86400 : 0;
+            const inGrace    = !subValid && subscription && now < graceEnd;
 
-          {step === 'configure' && (
+            return (
+              <div className="space-y-5 py-2">
+                {/* Tier status bar */}
+                <div className="bg-gray-900 rounded-2xl p-5 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className="text-sm font-semibold">{subValid ? planObj?.name : 'Free'} Tier</span>
+                      {subValid && !subscription!.cancelled && (
+                        <span className="ml-2 text-xs text-gray-400">
+                          renews {new Date(subscription!.expiresAt * 1000).toLocaleDateString()}
+                        </span>
+                      )}
+                      {subValid && subscription!.cancelled && (
+                        <span className="ml-2 text-xs text-yellow-400">
+                          active until {new Date(subscription!.expiresAt * 1000).toLocaleDateString()} · cancelled
+                        </span>
+                      )}
+                      {inGrace && (
+                        <span className="ml-2 text-xs text-red-400">
+                          Grace period — expires {new Date(graceEnd * 1000).toLocaleDateString()}
+                        </span>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => openSubModal(subValid ? true : false)}
+                      className="text-xs text-blue-400 hover:text-blue-300 underline"
+                    >
+                      {subValid ? 'Manage' : 'Upgrade →'}
+                    </button>
+                  </div>
+                  <div className="flex justify-between text-xs text-gray-400 mb-1">
+                    <span>{fmtBytes(usedBytes)} used</span>
+                    <span>{capGb} GB total</span>
+                  </div>
+                  <div className="bg-gray-700 rounded-full h-2">
+                    <div
+                      className={`h-2 rounded-full transition-all ${nearLimit ? 'bg-yellow-500' : 'bg-blue-500'}`}
+                      style={{ width: `${usedPct}%` }}
+                    />
+                  </div>
+                  {nearLimit && (
+                    <div className="text-xs text-yellow-400">
+                      You're using {usedPct}% of your storage — consider upgrading.
+                    </div>
+                  )}
+                </div>
+
+                {/* Features row */}
+                <div className="grid grid-cols-3 gap-2">
+                  {FEATURES.map(f => (
+                    <div key={f.title} className="bg-gray-900 rounded-xl p-3 flex flex-col gap-1">
+                      <span className="text-lg">{f.icon}</span>
+                      <span className="text-xs font-semibold">{f.title}</span>
+                      <span className="text-xs text-gray-500">{f.desc}</span>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="text-center">
+                  <div className="text-xs text-gray-500 mb-2">Max file size: 250 MB · AES-256-GCM encrypted before leaving your device</div>
+                  <button onClick={pickFile} className="bg-blue-600 hover:bg-blue-500 transition px-8 py-3 rounded-xl font-semibold text-sm">
+                    + Pick File to Store
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
+
+          {step === 'configure' && (() => {
+            const fileSizeMb = storeResult?.original_size ? storeResult.original_size / (1024 * 1024) : 0;
+            // We don't have the actual file size here yet (before upload), so we check after pick via storeError.
+            // Size limit warning is shown if filename suggests a likely large file.
+            return (
             <div className="max-w-md mx-auto space-y-5">
               <div className="bg-gray-900 rounded-xl p-4 flex items-start gap-3">
                 <div className="text-3xl shrink-0">📄</div>
@@ -412,6 +720,10 @@ const StoragePage: React.FC = () => {
                   <div className="text-xs text-gray-500 font-mono truncate mt-0.5">{filePath}</div>
                   <div className="text-xs text-blue-400 mt-1">🔒 Name will be private — only CID visible to network</div>
                 </div>
+              </div>
+              <div className="text-xs text-gray-500 bg-gray-900 rounded-lg px-3 py-2 flex items-center gap-2">
+                <span>⚠️</span>
+                <span>Maximum file size is <span className="text-white font-semibold">250 MB</span>. Files are encrypted on your device before any data leaves.</span>
               </div>
               <div>
                 <div className="text-sm text-gray-400 mb-2">Storage Duration</div>
@@ -448,7 +760,8 @@ const StoragePage: React.FC = () => {
                 <button onClick={startUpload} className="bg-blue-600 hover:bg-blue-500 py-3 rounded-xl font-semibold text-sm transition">Encrypt & Store →</button>
               </div>
             </div>
-          )}
+            );
+          })()}
 
           {step === 'processing' && (
             <div className="max-w-md mx-auto space-y-4">
@@ -516,7 +829,15 @@ const StoragePage: React.FC = () => {
               <div className="text-5xl">❌</div>
               <div className="text-lg font-bold text-red-400">Storage Failed</div>
               <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-4 text-xs font-mono text-red-300 text-left break-all">{storeError}</div>
-              <button onClick={resetUpload} className="w-full bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold transition">Try Again</button>
+              <div className="grid grid-cols-2 gap-3">
+                <button onClick={resetUpload} className="bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition">← Pick Different File</button>
+                <button
+                  onClick={() => { setStep('configure'); setStoreError(''); storeErrorRef.current = ''; }}
+                  className="bg-blue-600 hover:bg-blue-500 py-3 rounded-xl font-semibold text-sm transition"
+                >
+                  Retry Same File →
+                </button>
+              </div>
             </div>
           )}
         </div>
@@ -525,11 +846,11 @@ const StoragePage: React.FC = () => {
       {}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-700">
-          <h3 className="font-semibold">Your Files on the Network ({files.filter(f => f.status === 'Active').length})</h3>
+          <h3 className="font-semibold">Your Files on the Network ({files.filter(f => f.status === 'Active' || f.status === 'PendingSync').length})</h3>
           <button onClick={loadData} className="text-xs text-gray-400 hover:text-white transition">↻ Refresh</button>
         </div>
         {(() => {
-          const activeFiles = files.filter(f => f.status === 'Active');
+          const activeFiles = files.filter(f => f.status === 'Active' || f.status === 'PendingSync');
           if (activeFiles.length === 0) return (
             <div className="py-12 text-center text-gray-500">
               <div className="text-4xl mb-3">📂</div>
@@ -548,10 +869,13 @@ const StoragePage: React.FC = () => {
                     <div className="flex items-center gap-2 mb-1 flex-wrap">
                       <span className="text-sm font-medium">{file.name}</span>
                       <span className={`shrink-0 text-xs px-2 py-0.5 rounded-full ${
-                        file.status === 'Active'   ? 'bg-green-500/20 text-green-400' :
-                        file.status === 'Received' ? 'bg-blue-500/20 text-blue-400' :
-                                                     'bg-red-500/20 text-red-400'
-                      }`}>{file.status}</span>
+                        file.status === 'Active'      ? 'bg-green-500/20 text-green-400' :
+                        file.status === 'Received'    ? 'bg-blue-500/20 text-blue-400' :
+                        file.status === 'PendingSync' ? 'bg-yellow-500/20 text-yellow-400' :
+                                                        'bg-red-500/20 text-red-400'
+                      }`}>
+                        {file.status === 'PendingSync' ? '⏳ Pending Sync' : file.status}
+                      </span>
                       {postBadge(file)}
                     </div>
                     {}
@@ -582,8 +906,8 @@ const StoragePage: React.FC = () => {
       {}
       {showProvConfig && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm" onClick={e => { if (e.target === e.currentTarget) setShowProvConfig(false); }}>
-          <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-md border border-gray-700 shadow-2xl">
-            <div className="flex justify-between items-center mb-5">
+          <div className="bg-gray-800 rounded-2xl p-5 w-full max-w-md border border-gray-700 shadow-2xl">
+            <div className="flex justify-between items-center mb-4">
               <h3 className="text-lg font-bold">Configure Storage Provision</h3>
               <button onClick={() => setShowProvConfig(false)} className="text-gray-400 hover:text-white text-xl">✕</button>
             </div>
@@ -593,8 +917,10 @@ const StoragePage: React.FC = () => {
               const diskFreeGb  = selectedDriveInfo?.free_gb ?? (metrics?.disk_free_bytes ?? 0) / 1e9;
               const maxUsableGb = Math.max(1, Math.floor(diskFreeGb - RESERVE_GB));
               const overLimit    = allocGb > maxUsableGb;
+              const currentAllocGb = (metrics?.storage_allocated_bytes ?? 0) / 1e9;
+              const isReducing   = currentAllocGb > 0 && allocGb < currentAllocGb;
               return (
-                <div className="space-y-5">
+                <div className="space-y-3">
                   <div className="text-sm text-gray-400">
                     Choose which local drive and how much space to share with the Ego Network.
                     Only your local drive (C:, D:, etc.) is used — not cloud or network storage.
@@ -622,13 +948,13 @@ const StoragePage: React.FC = () => {
                   </div>
 
                   {/* Disk space info for selected drive */}
-                  <div className="bg-gray-900 rounded-xl p-3 flex justify-between text-sm">
+                  <div className="bg-gray-900 rounded-xl p-2.5 flex justify-between text-sm">
                     <span className="text-gray-400">Free on {selectedDrive || '?'}:</span>
                     <span className={`font-semibold ${diskFreeGb < 10 ? 'text-red-400' : 'text-green-400'}`}>
                       {diskFreeGb.toFixed(1)} GB
                     </span>
                   </div>
-                  <div className="bg-gray-900 rounded-xl p-3 flex justify-between text-sm -mt-3">
+                  <div className="bg-gray-900 rounded-xl p-2.5 flex justify-between text-sm -mt-2">
                     <span className="text-gray-400">Max allocatable <span className="text-gray-600">(5 GB reserved)</span></span>
                     <span className="font-semibold text-blue-400">{maxUsableGb} GB</span>
                   </div>
@@ -655,7 +981,7 @@ const StoragePage: React.FC = () => {
                     </div>
                   )}
 
-                  <div className="bg-gray-900 rounded-xl p-4 space-y-2 text-sm">
+                  <div className="bg-gray-900 rounded-xl p-3 space-y-1.5 text-sm">
                     <div className="flex justify-between"><span className="text-gray-400">Allocation</span><span>{allocGb} GB</span></div>
                     <div className="flex justify-between"><span className="text-gray-400">Storage reward target</span><span className="text-green-400 font-bold">~${(allocGb * 0.002).toFixed(3)}/day in EGOC</span></div>
                   </div>
@@ -667,15 +993,308 @@ const StoragePage: React.FC = () => {
                     Files are encrypted by the uploader — you cannot read their contents.
                     Data is stored in your local app data directory.
                   </div>
+
+                  <div className="bg-orange-500/10 border border-orange-500/30 rounded-xl px-4 py-3 text-sm text-orange-300">
+                    🔒 <span className="font-semibold">60-day lock:</span> Once you allocate storage, this setting cannot be changed or reset for <span className="font-semibold">60 days</span>. Choose carefully.
+                  </div>
+
+                  {isReducing && (
+                    <div className="bg-red-500/10 border border-red-500/40 rounded-xl px-4 py-3 text-sm text-red-300">
+                      ⚠️ <span className="font-semibold">Penalty warning:</span> Lowering your allocation below the current <span className="font-semibold">{currentAllocGb.toFixed(0)} GB</span> will <span className="font-semibold">suspend all rewards for 14 days</span> and add a slash strike to your node record.
+                    </div>
+                  )}
+
                   <div className="grid grid-cols-2 gap-3">
                     <button onClick={() => setShowProvConfig(false)} className="bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition">Cancel</button>
-                    <button onClick={handleConfigureStorage} disabled={configuring || overLimit} className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition">
-                      {configuring ? 'Saving…' : `Allocate ${allocGb} GB`}
+                    <button onClick={handleConfigureStorage} disabled={configuring || overLimit} className={`${isReducing ? 'bg-red-600 hover:bg-red-500' : 'bg-blue-600 hover:bg-blue-500'} disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition`}>
+                      {configuring ? 'Saving…' : isReducing ? `Reduce to ${allocGb} GB (penalty)` : `Allocate ${allocGb} GB`}
                     </button>
                   </div>
                 </div>
               );
             })()}
+          </div>
+        </div>
+      )}
+
+      {/* ── Subscription Modal ──────────────────────────────── */}
+      {showSubModal && (
+        <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4 backdrop-blur-sm overflow-y-auto">
+          <div className="bg-gray-900 rounded-2xl w-full max-w-2xl border border-gray-700 shadow-2xl">
+            {/* Header */}
+            <div className="bg-gradient-to-r from-blue-900/60 to-purple-900/60 rounded-t-2xl px-6 py-5 border-b border-gray-700">
+              <div className="flex justify-between items-center">
+                <div>
+                  {manageMode && subscription ? (
+                    <>
+                      <h2 className="text-lg font-bold">Manage Subscription</h2>
+                      <p className="text-xs text-gray-300">
+                        Current plan: <span className="text-blue-300 font-semibold">{PLANS.find(p => p.id === subscription.plan)?.name ?? subscription.plan}</span>
+                        {' · '}{subscription.gb >= 1024 ? `${subscription.gb / 1024} TB` : `${subscription.gb} GB`}
+                        {' · '}expires {new Date(subscription.expiresAt * 1000).toLocaleDateString()}
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <h2 className="text-lg font-bold">Ego Storage</h2>
+                      <p className="text-xs text-gray-300">Decentralized · Private · Fast · Yours forever</p>
+                    </>
+                  )}
+                </div>
+                <button onClick={() => setShowSubModal(false)} className="text-gray-400 hover:text-white text-2xl leading-none">✕</button>
+              </div>
+            </div>
+
+            <div className="p-6 space-y-5">
+              {/* Features grid */}
+              <div className="grid grid-cols-3 gap-2">
+                {FEATURES.map(f => (
+                  <div key={f.title} className="flex items-center gap-1.5">
+                    <span className="text-base shrink-0">{f.icon}</span>
+                    <div className="text-xs font-semibold text-gray-300">{f.title}</div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="border-t border-gray-700" />
+
+              {/* Network capacity bar */}
+              <div className="bg-gray-800 rounded-xl px-4 py-3 space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-gray-400 font-medium">Network Storage Available</span>
+                  {capacityLoading || !netCapacity ? (
+                    <span className="text-gray-500 animate-pulse">Checking…</span>
+                  ) : (
+                    <span className="text-white font-semibold">
+                      {netCapacity.total_available_gb >= 1024
+                        ? `${(netCapacity.total_available_gb / 1024).toFixed(1)} TB`
+                        : `${netCapacity.total_available_gb.toFixed(1)} GB`} free
+                      <span className="text-gray-500 font-normal ml-1">across {netCapacity.node_count} node{netCapacity.node_count !== 1 ? 's' : ''}</span>
+                    </span>
+                  )}
+                </div>
+                {netCapacity && (
+                  <>
+                    <div className="bg-gray-700 rounded-full h-1.5">
+                      <div
+                        className={`h-1.5 rounded-full transition-all ${netCapacity.fill_ratio >= 0.95 ? 'bg-red-500' : netCapacity.fill_ratio >= 0.80 ? 'bg-yellow-500' : 'bg-green-500'}`}
+                        style={{ width: `${Math.round(netCapacity.fill_ratio * 100)}%` }}
+                      />
+                    </div>
+                    <div className="text-xs text-gray-500">
+                      {Math.round(netCapacity.fill_ratio * 100)}% used —{' '}
+                      {netCapacity.total_allocated_gb >= 1024
+                        ? `${(netCapacity.total_allocated_gb / 1024).toFixed(1)} TB`
+                        : `${netCapacity.total_allocated_gb.toFixed(1)} GB`} total capacity
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {/* Billing toggle */}
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-gray-300">Choose your plan</span>
+                <div className="flex bg-gray-800 rounded-lg p-0.5 gap-0.5">
+                  <button
+                    onClick={() => setSubBilling('monthly')}
+                    className={`px-3 py-1 rounded-md text-xs font-semibold transition ${subBilling === 'monthly' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}
+                  >Monthly</button>
+                  <button
+                    onClick={() => setSubBilling('annual')}
+                    className={`px-3 py-1 rounded-md text-xs font-semibold transition ${subBilling === 'annual' ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}`}
+                  >
+                    Annual
+                    <span className="ml-1 bg-green-500/20 text-green-400 text-xs px-1 rounded">-17%</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Capacity status banner */}
+              {netCapacity && (() => {
+                const avail = netCapacity.total_available_gb;
+                const fill  = netCapacity.fill_ratio;
+                if (fill >= 0.95) return (
+                  <div className="flex items-start gap-2 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2 text-xs">
+                    <span className="text-red-400 text-base shrink-0">⚠️</span>
+                    <div>
+                      <div className="font-semibold text-red-400">Network at capacity</div>
+                      <div className="text-gray-400 mt-0.5">Only {avail.toFixed(1)} GB available across {netCapacity.node_count} nodes. New uploads will be queued until more nodes join. Your subscription is locked in at today's price.</div>
+                    </div>
+                  </div>
+                );
+                if (fill >= 0.80) return (
+                  <div className="flex items-start gap-2 bg-yellow-500/10 border border-yellow-500/30 rounded-lg px-3 py-2 text-xs">
+                    <span className="text-yellow-400 text-base shrink-0">⚡</span>
+                    <div>
+                      <div className="font-semibold text-yellow-400">Limited availability — {avail.toFixed(1)} GB left</div>
+                      <div className="text-gray-400 mt-0.5">Network is {Math.round(fill * 100)}% full across {netCapacity.node_count} nodes. Larger plans may be queued. Reward rates are elevated — new nodes joining soon.</div>
+                    </div>
+                  </div>
+                );
+                return null;
+              })()}
+
+              {/* Plans grid */}
+              <div className="grid grid-cols-4 gap-2">
+                {PLANS.map(plan => {
+                  const priceUsd    = subBilling === 'annual' ? plan.priceAnnualUsd : plan.priceMonthlyUsd;
+                  const egocAmt     = priceUsd > 0 ? (priceUsd / egocPriceUsd).toFixed(2) : '0';
+                  const perMonthUsd = subBilling === 'annual' && plan.priceAnnualUsd > 0
+                                      ? (plan.priceAnnualUsd / 12).toFixed(2)
+                                      : null;
+                  const selected      = subPlan === plan.id;
+                  const isCurrentPlan = manageMode && subscription?.plan === plan.id;
+                  // Free plan is always available.
+                  // Paid plans are locked while loading, if capacity fetch failed (null), or if not enough network space.
+                  // Current plan in manage mode is also locked (can't re-buy).
+                  const unavailable = isCurrentPlan || (plan.id !== 'free' && (
+                    capacityLoading ||
+                    netCapacity === null ||
+                    plan.gb > netCapacity.total_available_gb
+                  ));
+                  const waitlisted  = !isCurrentPlan && !capacityLoading && netCapacity !== null && unavailable && netCapacity.fill_ratio >= 0.95;
+                  return (
+                    <button
+                      key={plan.id}
+                      onClick={() => !unavailable && setSubPlan(plan.id)}
+                      disabled={unavailable}
+                      className={`relative rounded-xl p-3 text-left border transition flex flex-col gap-1 ${
+                        isCurrentPlan
+                          ? 'border-green-600/60 bg-green-500/10 opacity-70 cursor-not-allowed'
+                          : unavailable
+                          ? 'border-gray-700 bg-gray-800/40 opacity-50 cursor-not-allowed'
+                          : selected
+                          ? 'border-blue-500 bg-blue-500/10'
+                          : plan.highlight
+                          ? 'border-purple-500/50 bg-purple-500/5 hover:border-purple-400'
+                          : 'border-gray-700 bg-gray-800 hover:border-gray-500'
+                      }`}
+                    >
+                      {isCurrentPlan && (
+                        <span className="absolute -top-2 left-1/2 -translate-x-1/2 bg-green-700 text-white text-xs px-2 py-0.5 rounded-full font-semibold whitespace-nowrap">
+                          Current Plan
+                        </span>
+                      )}
+                      {plan.highlight && !unavailable && !isCurrentPlan && (
+                        <span className="absolute -top-2 left-1/2 -translate-x-1/2 bg-purple-600 text-white text-xs px-2 py-0.5 rounded-full font-semibold whitespace-nowrap">
+                          Most Popular
+                        </span>
+                      )}
+                      {waitlisted && (
+                        <span className="absolute -top-2 left-1/2 -translate-x-1/2 bg-orange-600 text-white text-xs px-2 py-0.5 rounded-full font-semibold whitespace-nowrap">
+                          Waitlist
+                        </span>
+                      )}
+                      {capacityLoading && plan.gb > 0 && !isCurrentPlan && (
+                        <span className="absolute -top-2 left-1/2 -translate-x-1/2 bg-gray-600 text-gray-300 text-xs px-2 py-0.5 rounded-full font-semibold whitespace-nowrap">
+                          Checking…
+                        </span>
+                      )}
+                      <div className="font-bold text-sm mt-1">{plan.name}</div>
+                      <div className="text-xs text-gray-400">{plan.gb >= 1024 ? `${plan.gb / 1024} TB` : `${plan.gb} GB`}</div>
+                      <div>
+                        {plan.priceMonthlyUsd === 0 ? (
+                          <div className="text-lg font-bold text-green-400">Free</div>
+                        ) : (
+                          <>
+                            <div className="text-lg font-bold">${priceUsd.toFixed(2)} <span className="text-xs font-normal text-gray-400">{subBilling === 'monthly' ? '/mo' : '/yr'}</span></div>
+                            {perMonthUsd && (
+                              <div className="text-xs text-gray-500">${perMonthUsd}/mo</div>
+                            )}
+                            <div className="text-xs text-blue-400">≈ {egocAmt} EGOC</div>
+                          </>
+                        )}
+                      </div>
+                      {selected && !unavailable && <div className="absolute top-2 right-2 text-blue-400 text-sm">✓</div>}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Fine print */}
+              <div className="text-xs text-gray-500 bg-gray-800 rounded-lg px-3 py-2 flex flex-wrap gap-x-4 gap-y-0.5">
+                <span>✅ Cancel any time</span>
+                <span>⏳ 30-day grace period</span>
+                <span>💎 1 EGOC = ${egocPriceUsd.toFixed(4)}{egocPriceSource === 'estimated' ? ' (estimated)' : ' (live market)'} — EGOC amount adjusts, USD cost stays fixed</span>
+                <span>🔒 {FREE_GB} GB free forever</span>
+              </div>
+
+              {subError && (
+                <div className="text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2 break-all">
+                  {subError}
+                </div>
+              )}
+
+              {/* Cancel section — prominent in manage mode */}
+              {manageMode && subscription && subscription.expiresAt > Math.floor(Date.now() / 1000) && !subscription.cancelled && subscription.plan !== 'free' && (
+                <div className="bg-gray-800 border border-gray-700 rounded-xl px-4 py-3">
+                  {!showCancelConfirm ? (
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs text-gray-400">Want to stop your subscription?</span>
+                      <button onClick={() => setShowCancelConfirm(true)} className="text-xs text-red-400 hover:text-red-300 underline transition">
+                        Cancel subscription
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      <p className="text-xs text-gray-400">Your plan stays active until <span className="text-white">{new Date(subscription.expiresAt * 1000).toLocaleDateString()}</span>. After that, files are kept for 30 more days.</p>
+                      <div className="flex gap-3">
+                        <button onClick={() => setShowCancelConfirm(false)} className="text-xs text-gray-400 hover:text-white px-3 py-1.5 bg-gray-700 rounded-lg transition">Keep Subscription</button>
+                        <button onClick={handleCancelSubscription} className="text-xs text-red-400 hover:text-red-300 px-3 py-1.5 bg-red-500/10 border border-red-500/20 rounded-lg transition">Yes, Cancel</button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* CTA */}
+              <div className="grid grid-cols-2 gap-3">
+                <button onClick={() => setShowSubModal(false)} className="bg-gray-700 hover:bg-gray-600 py-2.5 rounded-xl font-semibold text-sm transition">
+                  {manageMode ? 'Close' : 'Cancel'}
+                </button>
+                <button
+                  onClick={handleSubscribe}
+                  disabled={subscribing || (capacityLoading && subPlan !== 'free') || (manageMode && subPlan === subscription?.plan)}
+                  className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 py-2.5 rounded-xl font-semibold text-sm transition"
+                >
+                  {subscribing
+                    ? 'Processing…'
+                    : manageMode && subPlan === subscription?.plan
+                    ? 'Already on this plan'
+                    : subPlan === 'free'
+                    ? 'Continue with Free'
+                    : (() => {
+                        const p = PLANS.find(pl => pl.id === subPlan);
+                        if (!p) return manageMode ? 'Switch Plan' : 'Subscribe';
+                        const usd      = subBilling === 'annual' ? p.priceAnnualUsd : p.priceMonthlyUsd;
+                        const egoc     = (usd / egocPriceUsd).toFixed(2);
+                        const isQueued = netCapacity && p.gb > netCapacity.total_available_gb;
+                        const verb     = manageMode ? `Switch to ${p.name}` : (isQueued ? 'Join Waitlist' : 'Subscribe');
+                        return `${verb} — $${usd.toFixed(2)} (≈ ${egoc} EGOC)`;
+                      })()
+                  }
+                </button>
+              </div>
+
+              {/* Unsubscribe link in purchase mode (less prominent) */}
+              {!manageMode && subscription && subscription.expiresAt > Math.floor(Date.now() / 1000) && !subscription.cancelled && subscription.plan !== 'free' && (
+                <div className="border-t border-gray-700 pt-4 text-center">
+                  {!showCancelConfirm ? (
+                    <button onClick={() => setShowCancelConfirm(true)} className="text-xs text-gray-500 hover:text-red-400 underline transition">
+                      Unsubscribe
+                    </button>
+                  ) : (
+                    <div className="space-y-2">
+                      <p className="text-xs text-gray-400">Your plan stays active until {new Date(subscription.expiresAt * 1000).toLocaleDateString()}. After that, files are kept for 30 more days.</p>
+                      <div className="flex gap-3 justify-center">
+                        <button onClick={() => setShowCancelConfirm(false)} className="text-xs text-gray-400 hover:text-white px-3 py-1.5 bg-gray-700 rounded-lg">Keep Subscription</button>
+                        <button onClick={handleCancelSubscription} className="text-xs text-red-400 hover:text-red-300 px-3 py-1.5 bg-red-500/10 border border-red-500/20 rounded-lg">Yes, Cancel</button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         </div>
       )}

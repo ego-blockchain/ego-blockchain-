@@ -1,12 +1,5 @@
 use crate::error::{EgoDesktopError, EgoResult};
 
-// ── OS-level data protection (Windows DPAPI / passthrough on others) ─────────
-//
-// `os_protect`  — encrypts bytes so only the same Windows user account can
-//                 decrypt them.  On non-Windows the bytes are returned as-is.
-// `os_unprotect` — reverses the above.  If decryption fails (e.g. the blob is
-//                  from a different machine) the raw bytes are returned so that
-//                  legacy plaintext values keep working.
 
 pub fn os_protect(data: &[u8]) -> Vec<u8> {
     #[cfg(windows)]

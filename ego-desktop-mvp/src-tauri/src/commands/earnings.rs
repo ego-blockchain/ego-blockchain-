@@ -1,6 +1,6 @@
 use crate::app::{AppState, EarningsData, RewardBreakdown};
 use crate::error::EgoDesktopError;
-use crate::ledger::{load_chain, poc_signing_bytes, save_chain, Ledger, LedgerTx};
+use crate::ledger::{load_chain, poc_signing_bytes, Ledger, LedgerTx};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -14,7 +14,7 @@ pub async fn get_earnings_data(
     state: State<'_, AppState>,
 ) -> Result<EarningsData, EgoDesktopError> {
     let now = chrono::Utc::now().timestamp();
-    let mut ledger = Ledger::load();
+    let ledger = Ledger::load();
 
     // ── Reward rates ─────────────────────────────────────────────────────────
 
@@ -39,9 +39,14 @@ pub async fn get_earnings_data(
     let chain = load_chain();
     let scale = node_reward_scale(&chain);
 
-    let daily_storage  = (storage_reward_uegoc(allocated_gb) as f64 * scale) as u64;
-    let consensus_rate = (consensus_daily_uegoc() as f64 * scale) as u64;
-    let retrieval_rate = (retrieval_reward_uegoc(1.0) as f64 * scale) as u64; // per GB served
+    // If the node lowered its allocation it receives a 14-day reward suspension.
+    let reward_suspended = ledger.reward_suspended_until
+        .map(|until| now < until)
+        .unwrap_or(false);
+
+    let daily_storage  = if reward_suspended { 0 } else { (storage_reward_uegoc(allocated_gb) as f64 * scale) as u64 };
+    let consensus_rate = if reward_suspended { 0 } else { (consensus_daily_uegoc() as f64 * scale) as u64 };
+    let retrieval_rate = if reward_suspended { 0 } else { (retrieval_reward_uegoc(1.0) as f64 * scale) as u64 };
 
     // Coverage reward is only earned while the node is online.
     let coverage_online = state
@@ -53,58 +58,95 @@ pub async fn get_earnings_data(
         .map(|s| s.is_online)
         .unwrap_or(true); // default true when coverage hasn't been checked yet
 
-    let coverage_rate  = if coverage_online { (coverage_daily_uegoc() as f64 * scale) as u64 } else { 0 };
+    let coverage_rate = if reward_suspended || !coverage_online { 0 }
+                        else { (coverage_daily_uegoc() as f64 * scale) as u64 };
 
-    let daily_total = daily_storage
+    let daily_total_base = daily_storage
         .saturating_add(consensus_rate)
         .saturating_add(coverage_rate)
         .saturating_add(retrieval_rate);
 
+    // ── DRS multiplier ────────────────────────────────────────────────────────
+    // Fetch live DRS score from relay (0–100). Multiplier: 0.5 at score 0, 1.5 at score 100.
+    // Falls back to 1.0 (neutral) if the relay is unreachable so rewards still accrue.
+    let drs_score: f64 = {
+        let address = ledger.address.clone();
+        if address.is_empty() {
+            50.0 // no wallet yet → neutral
+        } else {
+            let url = format!("{}/poc/score/{}", crate::p2p::ORACLE_RPC, address);
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .ok()
+                .and_then(|c| {
+                    // block_in_place is safe here because get_earnings_data runs on a Tokio thread
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            c.get(&url).send().await.ok()?.json::<PocScoreResult>().await.ok()
+                        })
+                    })
+                })
+                .map(|r| r.drs_score.clamp(0.0, 100.0))
+                .unwrap_or(50.0) // relay down → neutral (1.0×)
+        }
+    };
+    let drs_multiplier = 0.5 + (drs_score / 100.0); // 0.5× … 1.5×
+    let daily_total = (daily_total_base as f64 * drs_multiplier) as u64;
+
+    // Minimum 1-hour gap between reward credits. Earnings page may be polled every
+    // few seconds — without this gate every poll would push a tx and create a block.
+    const MIN_CREDIT_INTERVAL_SECS: i64 = 3_600;
+
     let last_credit = state.get_last_earnings_credit();
-    if last_credit > 0 && now > last_credit {
+    if last_credit == 0 {
+        // First call — prime the total_earned cache from chain history once,
+        // then initialise the clock (no credit issued yet).
+        let historical: u64 = crate::chain_db::get_tx_history_for_addr(&ledger.address)
+            .into_iter()
+            .filter(|tx| tx.from.starts_with("egot1rewards") && tx.status == "Confirmed")
+            .map(|tx| tx.amount)
+            .sum();
+        state.set_cached_total_earned(historical);
+        state.set_last_earnings_credit(now);
+    } else if (now - last_credit) >= MIN_CREDIT_INTERVAL_SECS {
         let elapsed_secs = (now - last_credit) as f64;
         let credit = (daily_total as f64 * elapsed_secs / 86_400.0) as u64;
 
-        if credit >= 1_000 {
-            let mut chain_w = load_chain();
+        // Credit at least 1 EGOC (1_000_000 uEGOC) at a time.
+        if credit >= 1_000_000 {
             let reward_hash = format!(
                 "0x{}",
                 ego_core::hash_data(
                     format!("reward:{}:{}", ledger.address, now).as_bytes()
                 ).to_hex()
             );
-            if !chain_w.transactions.iter().any(|t| t.hash == reward_hash) {
-                chain_w.transactions.push(LedgerTx {
-                    hash:               reward_hash,
-                    from:               "egot1rewards00000000000000000000000000000000000".into(),
-                    to:                 ledger.address.clone(),
-                    amount:             credit,
-                    memo:               Some("Block & storage rewards".into()),
-                    timestamp:          now,
-                    signature:          "rewards".into(),
-                    status:             "Confirmed".into(),
-                    block_height:       None,
-                    nonce:              0,
-                    public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
+            if crate::chain_db::get_tx_by_hash(&reward_hash).is_none() {
+                crate::mempool::get_mempool().push(LedgerTx {
+                    hash:                reward_hash,
+                    from:                "egot1rewards00000000000000000000000000000000000".into(),
+                    to:                  ledger.address.clone(),
+                    amount:              credit,
+                    memo:                Some("Block & storage rewards".into()),
+                    timestamp:           now,
+                    signature:           "rewards".into(),
+                    status:              "Pending".into(),
+                    nonce:               0,
+                    tx_type:             "reward".into(),
+                    public_key_ed25519:  String::new(),
+                    dilithium_pubkey:    String::new(),
+                    dilithium_signature: String::new(),
                     ..LedgerTx::default()
                 });
-                let _ = save_chain(&chain_w);
+                // Update cache so we don't rescan the full chain on next poll.
+                state.add_to_cached_total_earned(credit);
             }
         }
+        // Advance the clock only after attempting a credit — not on every poll.
+        state.set_last_earnings_credit(now);
     }
-    state.set_last_earnings_credit(now);
 
-    let chain = load_chain();
-    let total_earned: u64 = chain
-        .transactions
-        .iter()
-        .filter(|tx| {
-            tx.to.trim() == ledger.address.trim()
-                && tx.from.starts_with("egot1rewards")
-                && tx.status == "Confirmed"
-        })
-        .map(|tx| tx.amount)
-        .sum();
+    let total_earned: u64 = state.get_cached_total_earned();
     let pending      = daily_storage / 24;
 
     let session_started = state.get_session_started();
@@ -113,7 +155,7 @@ pub async fn get_earnings_data(
         daily_rewards:  daily_total,
         epoch_rewards:  daily_total.saturating_mul(7),
         total_earned,
-        drs_multiplier: 1.5,
+        drs_multiplier,
         reward_breakdown: RewardBreakdown {
             storage_rewards:   daily_storage,
             consensus_rewards: consensus_rate,
@@ -123,6 +165,7 @@ pub async fn get_earnings_data(
         pending_rewards: pending,
         session_started,
         coverage_online,
+        reward_suspended_until: ledger.reward_suspended_until,
     };
 
     state.update_earnings_data(earnings.clone());

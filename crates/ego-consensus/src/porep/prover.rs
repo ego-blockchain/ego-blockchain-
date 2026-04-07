@@ -4,6 +4,7 @@ use super::{
     persistence::{PoRepPersistence, PoRepRestoredState},
 };
 use crate::error::{PoCError, PoCResult};
+use crate::porep::zk_circuit as zk;
 use ego_core::{
     Address, Hash, Timestamp,
     block::{ProofEvent, ProofEventType},
@@ -11,11 +12,146 @@ use ego_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{Read as IoRead, Seek, SeekFrom, Write as IoWrite};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
 use tracing::{debug, info, warn, error};
+
+// ── Merkle tree constants ─────────────────────────────────────────────────────
+
+/// Bytes per Merkle leaf (one Fr field element serialised as LE bytes).
+const LEAF_SIZE: u64 = 32;
+
+/// Maximum leaves when building a synthetic sector (sealed file absent).
+/// Keeps tests fast: depth = log2(1024) = 10, ~10 ms to build.
+const MAX_SYNTHETIC_LEAVES: u64 = 1024;
+
+// ── Merkle tree helpers ───────────────────────────────────────────────────────
+
+/// Returns `(tree_depth, n_leaves)`.
+/// When `synthetic` is true, `n_leaves` is capped at `MAX_SYNTHETIC_LEAVES`.
+fn tree_geometry(sector_size: u64, synthetic: bool) -> (usize, u64) {
+    let raw = (sector_size / LEAF_SIZE).max(2);
+    let n_leaves = if synthetic {
+        raw.min(MAX_SYNTHETIC_LEAVES).next_power_of_two()
+    } else {
+        raw.next_power_of_two()
+    };
+    (n_leaves.trailing_zeros() as usize, n_leaves)
+}
+
+fn tree_root_path(cache_dir: &str) -> String { format!("{}/tree_root.bin", cache_dir) }
+fn tree_level_path(cache_dir: &str, level: usize) -> String {
+    format!("{}/tree_level_{}.bin", cache_dir, level)
+}
+
+/// Build (or load) the MiMC-7 Merkle tree for a sector, caching all levels
+/// to `cache_dir`.
+///
+/// If `sealed_path` does not exist on disk, a deterministic synthetic sector
+/// is generated from the path string as a seed.
+///
+/// Returns the Merkle root as a field element.
+fn build_sector_merkle_tree(
+    sealed_path: &str,
+    cache_dir: &str,
+    sector_size: u64,
+) -> PoCResult<zk::Fr> {
+    std::fs::create_dir_all(cache_dir)
+        .map_err(|e| PoCError::StorageError(format!("mkdir {cache_dir}: {e}")))?;
+
+    // Fast path: tree already cached.
+    let rpath = tree_root_path(cache_dir);
+    if let Ok(bytes) = std::fs::read(&rpath) {
+        if bytes.len() == 32 {
+            let arr: [u8; 32] = bytes.try_into().unwrap();
+            return Ok(zk::bytes_to_fr(&arr));
+        }
+    }
+
+    let file_exists = std::path::Path::new(sealed_path).exists();
+    let (depth, n_leaves) = tree_geometry(sector_size, !file_exists);
+
+    // ── Level 0: leaf hashes ─────────────────────────────────────────────────
+    {
+        let l0 = tree_level_path(cache_dir, 0);
+        let mut out = std::fs::File::create(&l0)
+            .map_err(|e| PoCError::StorageError(format!("create l0: {e}")))?;
+
+        if file_exists {
+            let mut f_in = std::fs::File::open(sealed_path)
+                .map_err(|e| PoCError::StorageError(format!("open {sealed_path}: {e}")))?;
+            let mut buf = [0u8; 32];
+            for _ in 0..n_leaves {
+                let n = f_in.read(&mut buf).unwrap_or(0);
+                if n < 32 { buf[n..].fill(0); }
+                out.write_all(&zk::fr_to_bytes(zk::hash_leaf(&buf)))
+                    .map_err(|e| PoCError::StorageError(e.to_string()))?;
+            }
+        } else {
+            // Synthetic sector: deterministic from sealed_path as key.
+            for i in 0u64..n_leaves {
+                let seed = [sealed_path.as_bytes(), b"/", &i.to_le_bytes()].concat();
+                let fr = zk::hash_leaf(&seed);
+                out.write_all(&zk::fr_to_bytes(fr))
+                    .map_err(|e| PoCError::StorageError(e.to_string()))?;
+            }
+        }
+    }
+
+    // ── Levels 1 .. depth ────────────────────────────────────────────────────
+    let mut prev_count = n_leaves;
+    for level in 1..=depth {
+        let prev = tree_level_path(cache_dir, level - 1);
+        let curr = if level == depth { rpath.clone() } else { tree_level_path(cache_dir, level) };
+        let c    = zk::mimc_constant(level - 1);
+        let curr_count = prev_count / 2;
+
+        let mut pf = std::fs::File::open(&prev)
+            .map_err(|e| PoCError::StorageError(format!("open level {}: {e}", level - 1)))?;
+        let mut cf = std::fs::File::create(&curr)
+            .map_err(|e| PoCError::StorageError(format!("create level {level}: {e}")))?;
+
+        let mut lb = [0u8; 32];
+        let mut rb = [0u8; 32];
+        for _ in 0..curr_count {
+            pf.read_exact(&mut lb).map_err(|e| PoCError::StorageError(e.to_string()))?;
+            pf.read_exact(&mut rb).map_err(|e| PoCError::StorageError(e.to_string()))?;
+            let parent = zk::mimc7_compress(zk::bytes_to_fr(&lb), zk::bytes_to_fr(&rb), c);
+            cf.write_all(&zk::fr_to_bytes(parent))
+                .map_err(|e| PoCError::StorageError(e.to_string()))?;
+        }
+        prev_count = curr_count;
+    }
+
+    let root_bytes = std::fs::read(&rpath)
+        .map_err(|e| PoCError::StorageError(format!("read root: {e}")))?;
+    let arr: [u8; 32] = root_bytes.try_into().unwrap();
+    Ok(zk::bytes_to_fr(&arr))
+}
+
+/// Read the sibling path for `leaf_index` from the cached tree levels.
+/// Returns `siblings[0..depth]` where `siblings[d]` is the sibling hash at
+/// level `d` (level 0 = leaves, level `depth-1` = children of root).
+fn read_merkle_path(cache_dir: &str, leaf_index: u64, depth: usize) -> PoCResult<Vec<zk::Fr>> {
+    let mut siblings = Vec::with_capacity(depth);
+    let mut idx = leaf_index;
+    for level in 0..depth {
+        let sib_idx = idx ^ 1;
+        let lpath = tree_level_path(cache_dir, level);
+        let mut f = std::fs::File::open(&lpath)
+            .map_err(|e| PoCError::StorageError(format!("cache level {level}: {e}")))?;
+        f.seek(SeekFrom::Start(sib_idx * 32))
+            .map_err(|e| PoCError::StorageError(e.to_string()))?;
+        let mut buf = [0u8; 32];
+        f.read_exact(&mut buf).map_err(|e| PoCError::StorageError(e.to_string()))?;
+        siblings.push(zk::bytes_to_fr(&buf));
+        idx >>= 1;
+    }
+    Ok(siblings)
+}
 
 pub struct PoRepProver {
     keypair: Arc<KeyPair>,
@@ -325,7 +461,23 @@ impl PoRepProver {
 
         let prover_addr = Address::from_public_key(&keypair.public_key());
         let replica_id = Self::derive_replica_id(&prover_addr, job.sector_id, &job.data_cid);
-        let comm_d = Self::compute_comm_d(&job.data_cid);
+
+        let sealed_path = format!("{}/sealed/sector-{}", "/sealed", job.sector_id);
+        let cache_path  = format!("{}/cache/sector-{}", "/cache", job.sector_id);
+
+        // Build the MiMC-7 Merkle tree over the sealed data; comm_d = root.
+        // When the sealed file does not yet exist (simulated sealing in dev/test),
+        // a deterministic synthetic sector is used.
+        let comm_d = match build_sector_merkle_tree(&sealed_path, &cache_path, params.sector_size) {
+            Ok(root) => {
+                let arr = zk::fr_to_bytes(root);
+                Hash::new(arr)
+            }
+            Err(e) => {
+                warn!("⚠ Merkle tree build failed for sector {} — using hash fallback: {e}", job.sector_id);
+                Self::compute_comm_d(&job.data_cid)
+            }
+        };
         let comm_r = Self::compute_comm_r(&comm_d, &replica_id);
 
         let state = SectorState {
@@ -333,8 +485,8 @@ impl PoRepProver {
             replica_id,
             comm_d,
             comm_r,
-            sealed_path: format!("{}/sealed/sector-{}", "/sealed", job.sector_id),
-            cache_path: format!("{}/cache/sector-{}", "/cache", job.sector_id),
+            sealed_path,
+            cache_path,
             deal_ids: vec![],
             created_at: start_time,
             proof_count: 0,
@@ -384,7 +536,7 @@ impl PoRepProver {
         hash_data(data_cid.as_bytes())
     }
 
-    fn compute_comm_r(comm_d: &Hash, replica_id: &Hash) -> Hash {
+    pub fn compute_comm_r(comm_d: &Hash, replica_id: &Hash) -> Hash {
         hash_multiple(&[
             comm_d.as_bytes(),
             replica_id.as_bytes(),
@@ -454,42 +606,60 @@ impl PoRepProver {
         Ok(duration)
     }
 
+    /// Produce a ZK-SNARK PoRep proof blob for the given challenges.
+    ///
+    /// Blob layout: `"ZKPR" || depth(u32 LE) || n(u32 LE) || [leaf_index(8) || leaf_hash(32) || proof(128)] × n`
+    ///
+    /// 1. Builds (or loads) the MiMC-7 Merkle tree for the sector, caching
+    ///    all levels to `state.cache_path`.
+    /// 2. For each challenge, reads the leaf hash and sibling path from cache.
+    /// 3. Generates a Groth16 proof via `zk::prove`.
     async fn compute_proof_for_sector(
         &self,
         state: &SectorState,
         challenges: &[u64],
     ) -> PoCResult<Vec<u8>> {
-        let mut proof_elements: Vec<u8> = Vec::new();
+        let root = build_sector_merkle_tree(
+            &state.sealed_path,
+            &state.cache_path,
+            self.proving_params.sector_size,
+        )?;
+
+        let synthetic = !std::path::Path::new(&state.sealed_path).exists();
+        let (depth, n_leaves) = tree_geometry(self.proving_params.sector_size, synthetic);
+        let keys = zk::get_keys(depth);
+
+        // Header: 4 magic + 4 depth + 4 count = 12 bytes
+        let mut blob = Vec::with_capacity(12 + challenges.len() * 168);
+        blob.extend_from_slice(zk::ZK_MAGIC);
+        blob.extend_from_slice(&(depth as u32).to_le_bytes());
+        blob.extend_from_slice(&(challenges.len() as u32).to_le_bytes());
 
         for &challenge in challenges {
-            let element = self.compute_challenge_response(state, challenge).await?;
-            proof_elements.extend_from_slice(&element);
+            let leaf_index = challenge % n_leaves;
+            let l0_path = tree_level_path(&state.cache_path, 0);
+
+            // Read leaf hash from cached level-0.
+            let leaf_hash = {
+                let mut f = std::fs::File::open(&l0_path)
+                    .map_err(|e| PoCError::StorageError(format!("leaf cache: {e}")))?;
+                f.seek(SeekFrom::Start(leaf_index * 32))
+                    .map_err(|e| PoCError::StorageError(e.to_string()))?;
+                let mut buf = [0u8; 32];
+                f.read_exact(&mut buf).map_err(|e| PoCError::StorageError(e.to_string()))?;
+                zk::bytes_to_fr(&buf)
+            };
+
+            let siblings = read_merkle_path(&state.cache_path, leaf_index, depth)?;
+            let proof_bytes = zk::prove(&keys, root, leaf_hash, leaf_index, siblings)
+                .map_err(|e| PoCError::ValidationFailed(format!("zk::prove: {e}")))?;
+
+            blob.extend_from_slice(&leaf_index.to_le_bytes()); // 8 bytes
+            blob.extend_from_slice(&zk::fr_to_bytes(leaf_hash)); // 32 bytes
+            blob.extend_from_slice(&proof_bytes);                 // 128 bytes
         }
 
-        Ok(proof_elements)
-    }
-
-    async fn compute_challenge_response(
-        &self,
-        state: &SectorState,
-        challenge: u64,
-    ) -> PoCResult<[u8; 32]> {
-        let leaf_index = challenge % self.proving_params.sector_size.max(1);
-
-        let response = hash_multiple(&[
-            state.replica_id.as_bytes(),
-            &challenge.to_le_bytes(),
-            &leaf_index.to_le_bytes(),
-            state.comm_r.as_bytes(),
-            self.proving_params.porep_id.as_slice(),
-        ]);
-
-        let delay_ms = if self.gpu_available { 5 } else { 20 };
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-
-        let mut result = [0u8; 32];
-        result.copy_from_slice(response.as_bytes());
-        Ok(result)
+        Ok(blob)
     }
 
     async fn verify_proof_data_internal(
@@ -497,21 +667,48 @@ impl PoRepProver {
         proof_data: &[u8],
         state: &SectorState,
     ) -> PoCResult<bool> {
-        let expected_len = self.proving_params.challenge_count as usize * 32;
-        if proof_data.len() != expected_len {
-            return Ok(false);
-        }
+        // ── ZK path ───────────────────────────────────────────────────────────
+        if proof_data.starts_with(zk::ZK_MAGIC) {
+            if proof_data.len() < 12 { return Ok(false); }
+            let proof_depth     = u32::from_le_bytes(proof_data[4..8].try_into().unwrap()) as usize;
+            let challenge_count = u32::from_le_bytes(proof_data[8..12].try_into().unwrap()) as usize;
+            let expected_len    = 12 + challenge_count * 168;
+            if proof_data.len() != expected_len { return Ok(false); }
 
-        let expected_comm_r = Self::compute_comm_r(&state.comm_d, &state.replica_id);
-        if expected_comm_r != state.comm_r {
-            return Ok(false);
-        }
+            // Load cached Merkle root — must have been built during prove.
+            let rpath = tree_root_path(&state.cache_path);
+            let root = match std::fs::read(&rpath) {
+                Ok(b) if b.len() == 32 => zk::bytes_to_fr(&b.try_into().unwrap()),
+                _ => return Ok(false),
+            };
 
-        let chunk_size = 32;
-        for (i, chunk) in proof_data.chunks(chunk_size).enumerate() {
-            if chunk.len() < 32 {
-                return Ok(false);
+            // comm_r consistency.
+            let expected_comm_r = Self::compute_comm_r(&state.comm_d, &state.replica_id);
+            if expected_comm_r != state.comm_r { return Ok(false); }
+
+            let keys = zk::get_keys(proof_depth);
+
+            for i in 0..challenge_count {
+                let off        = 12 + i * 168;
+                let leaf_index = u64::from_le_bytes(proof_data[off..off + 8].try_into().unwrap());
+                let lh_arr: [u8; 32] = proof_data[off + 8..off + 40].try_into().unwrap();
+                let leaf_hash  = zk::bytes_to_fr(&lh_arr);
+                let prf        = &proof_data[off + 40..off + 168];
+                match zk::verify(&keys.pvk, root, leaf_hash, leaf_index, prf) {
+                    Ok(true) => {}
+                    _        => return Ok(false),
+                }
             }
+            return Ok(true);
+        }
+
+        // ── Legacy hash-based path (backwards compatibility) ──────────────────
+        let expected_len = self.proving_params.challenge_count as usize * 32;
+        if proof_data.len() != expected_len { return Ok(false); }
+        let expected_comm_r = Self::compute_comm_r(&state.comm_d, &state.replica_id);
+        if expected_comm_r != state.comm_r { return Ok(false); }
+        for (i, chunk) in proof_data.chunks(32).enumerate() {
+            if chunk.len() < 32 { return Ok(false); }
             let challenge = i as u64;
             let expected = hash_multiple(&[
                 state.replica_id.as_bytes(),
@@ -520,11 +717,8 @@ impl PoRepProver {
                 state.comm_r.as_bytes(),
                 self.proving_params.porep_id.as_slice(),
             ]);
-            if chunk != expected.as_bytes() {
-                return Ok(false);
-            }
+            if chunk != expected.as_bytes() { return Ok(false); }
         }
-
         Ok(true)
     }
 
@@ -1156,44 +1350,64 @@ mod tests {
         assert!(gpu_ms < cpu_ms);
     }
 
-    #[tokio::test]
-    async fn test_challenge_response_deterministic() {
-        let prover = make_prover(false);
-        let state = SectorState {
+    /// Helper: make a SectorState with a temp dir for cache.
+    fn make_sector_state(tmp: &tempfile::TempDir) -> SectorState {
+        let cache_path = tmp.path().to_str().unwrap().to_string();
+        // Compute comm_r using the hash fallback (no real file).
+        let replica_id = Hash::new([1u8; 32]);
+        let comm_d     = Hash::new([2u8; 32]);
+        let comm_r     = PoRepProver::compute_comm_r(&comm_d, &replica_id);
+        SectorState {
             sector_id: 1,
-            replica_id: Hash::new([1u8; 32]),
-            comm_d: Hash::new([2u8; 32]),
-            comm_r: Hash::new([3u8; 32]),
-            sealed_path: "/sealed/sector-1".to_string(),
-            cache_path: "/cache/sector-1".to_string(),
+            replica_id,
+            comm_d,
+            comm_r,
+            sealed_path: "/nonexistent/sector-test".to_string(),
+            cache_path,
             deal_ids: vec![],
             created_at: Timestamp::now(),
             proof_count: 0,
             last_challenged_at: None,
-        };
-        let r1 = prover.compute_challenge_response(&state, 42).await.unwrap();
-        let r2 = prover.compute_challenge_response(&state, 42).await.unwrap();
-        assert_eq!(r1, r2);
+        }
     }
 
     #[tokio::test]
-    async fn test_challenge_response_different_challenges() {
+    async fn test_zk_two_proofs_both_verify() {
+        // Groth16 proofs use random blinding — two proofs of the same witness will
+        // have different bytes.  Both must still verify against the same public inputs.
+        let tmp = tempfile::TempDir::new().unwrap();
         let prover = make_prover(false);
-        let state = SectorState {
-            sector_id: 1,
-            replica_id: Hash::new([1u8; 32]),
-            comm_d: Hash::new([2u8; 32]),
-            comm_r: Hash::new([3u8; 32]),
-            sealed_path: "/sealed/sector-1".to_string(),
-            cache_path: "/cache/sector-1".to_string(),
-            deal_ids: vec![],
-            created_at: Timestamp::now(),
-            proof_count: 0,
-            last_challenged_at: None,
-        };
-        let r1 = prover.compute_challenge_response(&state, 1).await.unwrap();
-        let r2 = prover.compute_challenge_response(&state, 2).await.unwrap();
-        assert_ne!(r1, r2);
+        let state = make_sector_state(&tmp);
+        let b1 = prover.compute_proof_for_sector(&state, &[42]).await.unwrap();
+        let b2 = prover.compute_proof_for_sector(&state, &[42]).await.unwrap();
+        let ok1 = prover.verify_proof_data_internal(&b1, &state).await.unwrap();
+        let ok2 = prover.verify_proof_data_internal(&b2, &state).await.unwrap();
+        assert!(ok1, "first proof must verify");
+        assert!(ok2, "second proof must verify");
+        // Header (magic + depth + count) and leaf metadata are deterministic.
+        assert_eq!(&b1[..12], &b2[..12], "ZK blob header must be identical");
+        assert_eq!(&b1[12..40], &b2[12..40], "leaf_index bytes must match");
+    }
+
+    #[tokio::test]
+    async fn test_zk_proof_different_challenges() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prover = make_prover(false);
+        let state = make_sector_state(&tmp);
+        let b1 = prover.compute_proof_for_sector(&state, &[1]).await.unwrap();
+        let b2 = prover.compute_proof_for_sector(&state, &[2]).await.unwrap();
+        // Different leaf_index → different leaf_hash → different ZK proof bytes.
+        assert_ne!(b1, b2, "Different challenges must produce different blobs");
+    }
+
+    #[tokio::test]
+    async fn test_zk_proof_verifies() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prover = make_prover(false);
+        let state = make_sector_state(&tmp);
+        let blob = prover.compute_proof_for_sector(&state, &[5, 7]).await.unwrap();
+        let ok = prover.verify_proof_data_internal(&blob, &state).await.unwrap();
+        assert!(ok, "self-generated ZK proof must verify");
     }
 
     #[test]

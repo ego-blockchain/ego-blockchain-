@@ -318,8 +318,7 @@ const MessengerPage: React.FC = () => {
 
   async function loadKnownCids() {
     try {
-      const files = await invoke<{ cid: string; local_path: string }[]>('get_stored_files');
-
+      const files = await invoke<{ cid: string; local_path: string }[]>('get_egosafe_files');
       setKnownCids(new Set(
         files
           .filter(f => f.local_path && !f.local_path.startsWith('sender:'))
@@ -618,6 +617,7 @@ useEffect(() => {
 
       cidToMsgId.current[cid] = msgId;
       await invoke('request_file_from_contact', { cid, fromAddr: from_address, content: content.trim() });
+      await loadKnownCids();
     } catch (e: any) {
       clearTimeout(importTimers.current[msgId]);
       setFileImportStates(s => ({ ...s, [msgId]: { status: 'error', error: 'Import failed. Tap Retry.' } }));

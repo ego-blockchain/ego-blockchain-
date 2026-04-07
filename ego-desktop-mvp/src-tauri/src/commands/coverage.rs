@@ -1,7 +1,14 @@
 use crate::app::{AppState, CoverageStatus, Location, NetworkQuality};
 use crate::error::EgoDesktopError;
+use once_cell::sync::OnceCell;
 use serde::Deserialize;
 use tauri::{Manager, State};
+
+static MACHINE_ID: OnceCell<String> = OnceCell::new();
+
+fn cached_machine_id() -> String {
+    MACHINE_ID.get_or_init(get_machine_id).clone()
+}
 
 #[derive(Deserialize)]
 struct IpApiResponse {
@@ -210,7 +217,7 @@ pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
     // Store initial state in AppState.
     {
         let state = app.state::<AppState>();
-        let machine_id  = get_machine_id();
+        let machine_id  = cached_machine_id();
         let ledger      = crate::ledger::Ledger::load();
         let node_active = !ledger.address.is_empty();
         let is_online   = node_active && !vpn_detected;
@@ -272,7 +279,7 @@ async fn tick_coverage(
 
     let ledger      = crate::ledger::Ledger::load();
     let node_active = !ledger.address.is_empty();
-    let machine_id  = get_machine_id();
+    let machine_id  = cached_machine_id();
     let is_online   = node_active && !vpn_detected;
 
     // ── Step 1: probe known peers from relay directory ─────────────────────
@@ -344,14 +351,20 @@ async fn probe_peers_from_relay(app: &tauri::AppHandle) {
         }
     }
 
+    // Cap probe concurrency — prevent spawning one task per node at millions-of-nodes scale.
+    const MAX_PROBE_CONCURRENT: usize = 32;
     let requester_endpoint = my_endpoint.clone();
-    for endpoint in candidates {
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_PROBE_CONCURRENT));
+
+    for endpoint in candidates.into_iter().take(256) {
         if active_eps.contains(&endpoint) { continue; }
-        let ep  = endpoint.clone();
-        let req = crate::p2p::P2PMessage::PeerListRequest {
+        let ep   = endpoint.clone();
+        let req  = crate::p2p::P2PMessage::PeerListRequest {
             requester_endpoint: requester_endpoint.clone(),
         };
+        let sem2 = sem.clone();
         tokio::spawn(async move {
+            let _permit = sem2.acquire().await;
             if let Err(e) = crate::p2p::send_message(&ep, &req).await {
                 let msg = e.to_string();
                 if !msg.contains("none of the requested protocols") {
@@ -378,7 +391,7 @@ pub async fn get_coverage_status(
     }
 
     let ledger     = crate::ledger::Ledger::load();
-    let machine_id = get_machine_id();
+    let machine_id = cached_machine_id();
     Ok(CoverageStatus {
         location:              None,
         coverage_synced_count: 0,
