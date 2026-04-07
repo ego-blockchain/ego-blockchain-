@@ -1549,14 +1549,25 @@ pub fn upsert_peer_cache(entry: PeerEntry) {
 
 fn load_or_create_identity() -> libp2p::identity::Keypair {
     let path = base_data_dir().join("p2p_identity.bin");
-    if let Ok(bytes) = std::fs::read(&path) {
+    if let Ok(raw) = std::fs::read(&path) {
+        // Decrypt with DPAPI (no-op on non-Windows). Handles both legacy
+        // plaintext protobuf and the new DPAPI-protected format.
+        let bytes = crate::utils::os_unprotect(&raw);
         if let Ok(kp) = libp2p::identity::Keypair::from_protobuf_encoding(&bytes) {
+            // Re-save with DPAPI protection if it was stored as plaintext.
+            if raw == bytes {
+                if let Ok(pb) = kp.to_protobuf_encoding() {
+                    let protected = crate::utils::os_protect(&pb);
+                    let _ = crate::utils::atomic_write(&path, &protected);
+                }
+            }
             return kp;
         }
     }
     let kp = libp2p::identity::Keypair::generate_ed25519();
-    if let Ok(bytes) = kp.to_protobuf_encoding() {
-        let _ = std::fs::write(&path, bytes);
+    if let Ok(pb) = kp.to_protobuf_encoding() {
+        let protected = crate::utils::os_protect(&pb);
+        let _ = crate::utils::atomic_write(&path, &protected);
     }
     kp
 }
