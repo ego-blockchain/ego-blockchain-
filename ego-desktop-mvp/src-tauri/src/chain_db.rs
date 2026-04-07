@@ -24,16 +24,13 @@ const ALL_CFS: &[&str] = &[
     CF_RECENT_TXS, CF_META, CF_HEADERS, CF_GOVERNANCE, CF_DAO,
 ];
 
-// ── Well-known governance feature names ───────────────────────────────────────
-/// Emergency: skip ML-DSA-44 verification if a vulnerability is found.
 pub const FEATURE_DILITHIUM_DISABLED: &str = "dilithium_disabled";
 /// Enforce ML-DSA-44 on every transaction (migration complete).
 pub const FEATURE_DILITHIUM_REQUIRED: &str = "dilithium_required";
 
-/// Desktop wallet keeps last N full blocks on disk.
-/// Full block JSON + tx data is large; old data is only needed for archive nodes.
+
 const FULL_BLOCK_CAP: u64 = 2_000;
-/// Light headers are tiny (~300 bytes). Keep a much longer window for chain verification.
+
 const HEADER_CAP: u64 = 100_000;
 
 const META_PRUNE_BELOW:         &[u8] = b"prune_below";
@@ -400,7 +397,10 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
             continue;
         }
         *balance_delta.entry(tx.to.clone()).or_insert(0) += tx.amount as i128;
-        if tx.from != FAUCET_ADDR && !tx.from.is_empty() {
+        let is_system_source = tx.from == FAUCET_ADDR
+            || tx.from == NODE_POOL_ADDR
+            || tx.from.is_empty();
+        if !is_system_source {
             let total_out = tx.amount as i128 + tx.fee_uegoc as i128;
             *balance_delta.entry(tx.from.clone()).or_insert(0) -= total_out;
         }
@@ -438,7 +438,10 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
         // Per-address history with signed delta.
         let incoming_k = addr_txs_key(&tx.to, tx.timestamp, &tx.hash);
         batch.put_cf(cf_addr_txs, incoming_k, (tx.amount as i64).to_le_bytes());
-        if tx.from != FAUCET_ADDR && !tx.from.is_empty() {
+        let is_system_source = tx.from == FAUCET_ADDR
+            || tx.from == NODE_POOL_ADDR
+            || tx.from.is_empty();
+        if !is_system_source {
             let outgoing_k = addr_txs_key(&tx.from, tx.timestamp, &tx.hash);
             batch.put_cf(cf_addr_txs, outgoing_k, (-(tx.amount as i64)).to_le_bytes());
         }
@@ -759,13 +762,32 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
     let hash_input = format!("{prev_hash}{height}{miner}{timestamp}");
     let hash = blake3::hash(hash_input.as_bytes()).to_hex().to_string();
 
+    // Coinbase transaction: credit the block reward to the miner.
+    let coinbase_hash = format!("0x{}", blake3::hash(
+        format!("coinbase:{height}:{miner}:{reward}:{timestamp}").as_bytes()
+    ).to_hex());
+    let coinbase = LedgerTx {
+        hash:         coinbase_hash.clone(),
+        from:         NODE_POOL_ADDR.to_string(),
+        to:           miner.to_string(),
+        amount:       reward,
+        memo:         Some(format!("Block #{height} reward")),
+        timestamp,
+        status:       "Confirmed".to_string(),
+        block_height: Some(height),
+        tx_type:      "reward".to_string(),
+        signature:    "coinbase".to_string(),
+        ..LedgerTx::default()
+    };
+
     // Stamp block_height on each tx before writing.
-    let stamped: Vec<LedgerTx> = txs.iter().map(|tx| {
+    let mut stamped: Vec<LedgerTx> = txs.iter().map(|tx| {
         let mut t = tx.clone();
         t.block_height = Some(height);
         t.status = "Confirmed".to_string();
         t
     }).collect();
+    stamped.push(coinbase);
 
     let tx_hashes: Vec<&str> = stamped.iter().map(|t| t.hash.as_str()).collect();
     let tx_merkle_root = compute_merkle_root(&tx_hashes);
@@ -776,10 +798,10 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
         prev_hash,
         miner: miner.to_string(),
         timestamp,
-        tx_count:   txs.len() as u32,
-        size_bytes: txs.len() as u64 * 256,
+        tx_count:   stamped.len() as u32,
+        size_bytes: stamped.len() as u64 * 256,
         reward,
-        coinbase_tx: None,
+        coinbase_tx: Some(coinbase_hash),
         vote_count: 0,
         tx_merkle_root,
         poc_ticket: poc_ticket.to_string(),

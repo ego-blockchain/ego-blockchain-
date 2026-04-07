@@ -1,6 +1,7 @@
 pub mod persistence;
 pub mod prover;
 pub mod verifier;
+pub mod zk_circuit;
 
 #[cfg(feature = "testing")]
 pub mod integration_example;

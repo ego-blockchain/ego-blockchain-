@@ -1,4 +1,5 @@
 use crate::error::{PoCError, PoCResult};
+use h3o::CellIndex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -58,20 +59,19 @@ impl H3CoverageMap {
     }
 
     fn calculate_neighbors(&self, h3_index: &str) -> PoCResult<Vec<String>> {
-        let mut neighbors = Vec::new();
+        // Parse the standard H3 hex string into a typed CellIndex.
+        let cell: CellIndex = h3_index
+            .parse()
+            .map_err(|e| PoCError::H3Error(format!("Invalid H3 index '{h3_index}': {e}")))?;
 
-        for i in 0..6 {
-            let mut neighbor = h3_index.to_string();
-            if let Some(last_char) = neighbor.pop() {
-                let new_char = match last_char {
-                    '0'..='9' => char::from(b'0' + ((last_char as u8 - b'0' + i) % 10)),
-                    'a'..='f' => char::from(b'a' + ((last_char as u8 - b'a' + i) % 6)),
-                    _ => last_char,
-                };
-                neighbor.push(new_char);
-                neighbors.push(neighbor);
-            }
-        }
+        // grid_disk(1) returns the cell itself plus its (up to 6) geographic neighbors.
+        // Filter out the center cell so we return only the surrounding ring.
+        let neighbors: Vec<String> = cell
+            .grid_disk::<Vec<_>>(1)
+            .into_iter()
+            .filter(|&c| c != cell)
+            .map(|c| c.to_string())
+            .collect();
 
         Ok(neighbors)
     }

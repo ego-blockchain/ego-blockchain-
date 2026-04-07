@@ -1,4 +1,6 @@
 pub mod bandwidth_sharing;
+pub mod consensus_integration;
+pub mod mempool;
 pub mod data_optimizer;
 pub mod engine;
 pub mod keystore;
@@ -26,6 +28,11 @@ pub struct NodeBehaviour {
     pub mdns: mdns::tokio::Behaviour,
     pub ping: ping::Behaviour,
 }
+
+/// Concrete swarm event type for ego-node — avoids generic T in event handlers.
+pub type EgoSwarmEvent = libp2p::swarm::SwarmEvent<
+    <NodeBehaviour as libp2p::swarm::NetworkBehaviour>::ToSwarm,
+>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ReplicaRole {

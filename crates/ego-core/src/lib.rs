@@ -28,6 +28,9 @@ pub use shard::*;
 pub use sparse_merkle::{SmtProof, SparseMerkleTrie};
 pub use state::*;
 pub use transaction::*;
+// Explicit re-export resolves the ambiguity between transaction::CrossShardReceipt
+// and block::CrossShardReceipt (both pulled in via glob re-exports above).
+pub use transaction::CrossShardReceipt;
 pub use types::*;
 pub use utils::*;
 

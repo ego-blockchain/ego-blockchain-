@@ -211,7 +211,7 @@ async fn load_active_wallet(
         .map_err(|e| EgoDesktopError::CryptoError(format!("Key generation panicked: {e}")))??;
 
     state
-        .initialize_wallet(keys.keypair)
+        .initialize_wallet(keys.keypair, false)  // false = don't overwrite if already live
         .map_err(|e| EgoDesktopError::WalletError(format!("{e}")))?;
     state.set_session_start(chrono::Utc::now().timestamp());
 
@@ -679,7 +679,7 @@ pub async fn generate_keypair(state: State<'_, AppState>) -> Result<KeypairInfo,
     credit_testnet_faucet(&address);
 
     state
-        .initialize_wallet(keypair)
+        .initialize_wallet(keypair, true)  // true = explicit user action, force switch
         .map_err(|e| EgoDesktopError::WalletError(format!("Init wallet: {e}")))?;
 
     Ok(KeypairInfo {
@@ -710,7 +710,7 @@ pub async fn import_keypair(
     credit_testnet_faucet(&address);
 
     state
-        .initialize_wallet(keypair)
+        .initialize_wallet(keypair, true)  // true = explicit user action, force switch
         .map_err(|e| EgoDesktopError::WalletError(format!("Init wallet: {e}")))?;
 
     Ok(KeypairInfo {
@@ -727,9 +727,16 @@ pub async fn import_keypair(
 
 #[tauri::command]
 pub async fn set_security_pin(pin: String) -> Result<(), EgoDesktopError> {
+    // Trim first so "    " (four spaces) is correctly rejected.
+    let pin = pin.trim().to_string();
     if pin.len() < 4 {
         return Err(EgoDesktopError::InvalidInput(
-            "PIN must be at least 4 characters".into(),
+            "PIN must be at least 4 characters (excluding leading/trailing spaces)".into(),
+        ));
+    }
+    if pin.len() > 128 {
+        return Err(EgoDesktopError::InvalidInput(
+            "PIN must be at most 128 characters".into(),
         ));
     }
     let pin_hash = ego_core::hash_data(pin.as_bytes()).to_hex();
@@ -746,6 +753,9 @@ pub async fn verify_pin(pin: String) -> Result<bool, EgoDesktopError> {
     if ledger.security_pin_hash.is_empty() {
         return Ok(false);
     }
+    // Trim to match how set_security_pin stores the hash.
+    let pin = pin.trim().to_string();
+    if pin.len() > 128 { return Ok(false); }
     let hash = ego_core::hash_data(pin.as_bytes()).to_hex();
     Ok(hash == ledger.security_pin_hash)
 }

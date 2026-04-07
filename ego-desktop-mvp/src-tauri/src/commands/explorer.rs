@@ -1,5 +1,5 @@
 use crate::error::EgoDesktopError;
-use crate::ledger::{load_chain, load_registry, wallet_dir, Ledger, LedgerBlock, LedgerTx};
+use crate::ledger::{load_registry, wallet_dir, Ledger, LedgerBlock, LedgerTx};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
@@ -107,27 +107,31 @@ pub async fn get_blocks(offset: Option<u32>, limit: Option<u32>) -> Result<Vec<L
 
 #[tauri::command]
 pub async fn get_all_transactions(offset: Option<u32>, limit: Option<u32>) -> Result<Vec<LedgerTx>, EgoDesktopError> {
-    Ok(crate::chain_db::paged_transactions(
-        offset.unwrap_or(0) as usize,
-        limit.unwrap_or(25) as usize,
-    ))
+    let offset = offset.unwrap_or(0) as usize;
+    let limit  = limit.unwrap_or(25) as usize;
+
+    // Page 1: prepend pending mempool txs so they appear immediately before a block is mined.
+    if offset == 0 {
+        let pending = crate::mempool::get_mempool().peek_all();
+        let confirmed_limit = limit.saturating_sub(pending.len());
+        let confirmed = crate::chain_db::paged_transactions(0, confirmed_limit);
+        let mut out: Vec<LedgerTx> = pending.into_iter().chain(confirmed).collect();
+        out.truncate(limit);
+        return Ok(out);
+    }
+
+    Ok(crate::chain_db::paged_transactions(offset, limit))
 }
 
 #[tauri::command]
 pub async fn get_block_info(height: u64) -> Result<LedgerBlock, EgoDesktopError> {
-    load_chain()
-        .blocks
-        .into_iter()
-        .find(|b| b.height == height)
+    crate::chain_db::get_block_by_height(height)
         .ok_or_else(|| EgoDesktopError::NotFound(format!("Block #{height} not found")))
 }
 
 #[tauri::command]
 pub async fn get_transaction_info(hash: String) -> Result<LedgerTx, EgoDesktopError> {
-    load_chain()
-        .transactions
-        .into_iter()
-        .find(|tx| tx.hash == hash)
+    crate::chain_db::get_tx_by_hash(&hash)
         .ok_or_else(|| EgoDesktopError::NotFound(format!("TX {hash} not found")))
 }
 
@@ -169,4 +173,42 @@ pub async fn get_file_events() -> Result<Vec<FileEvent>, EgoDesktopError> {
 
     events.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     Ok(events)
+}
+
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EgocPrice {
+    pub price_usd: f64,
+    /// "oracle", "coingecko", or "estimated"
+    pub source: String,
+}
+
+#[tauri::command]
+pub async fn get_egoc_price_usd() -> EgocPrice {
+    // Trigger a fresh fetch so we always return up-to-date data.
+    crate::p2p::fetch_and_cache_egoc_price().await;
+    let price = crate::p2p::get_egoc_price_usd();
+    // "market" for oracle/exchange data, "default" only if price fetch somehow returned 0
+    let source = if price > 0.0 { "market".into() } else { "estimated".into() };
+    EgocPrice { price_usd: price, source }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NetworkCapacity {
+    pub total_allocated_gb: f64,
+    pub total_available_gb: f64,
+    pub node_count: usize,
+    /// 0.0–1.0 fill ratio (allocated / total)
+    pub fill_ratio: f64,
+}
+
+#[tauri::command]
+pub async fn get_network_capacity() -> NetworkCapacity {
+    let (total_alloc, total_avail, node_count) = crate::p2p::get_network_capacity();
+    let fill_ratio = if total_alloc > 0.0 {
+        ((total_alloc - total_avail) / total_alloc).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    NetworkCapacity { total_allocated_gb: total_alloc, total_available_gb: total_avail, node_count, fill_ratio }
 }

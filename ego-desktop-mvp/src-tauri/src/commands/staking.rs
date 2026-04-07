@@ -7,6 +7,22 @@ use tauri::State;
 
 const STAKING_ADDR: &str = "egot1staking000000000000000000000000000000000";
 
+/// Returns effective APR in basis points including lock-period bonus.
+/// Matches the LOCK_OPTIONS bonuses shown in the frontend.
+///   30 days  →  0 bp bonus → 12.50%
+///   90 days  → +200 bp     → 14.50%
+///  180 days  → +500 bp     → 17.50%
+///  365 days  → +1000 bp    → 22.50%
+fn effective_apr_bps(lock_days: u32) -> u64 {
+    let bonus: u64 = match lock_days {
+        d if d >= 365 => 1_000,
+        d if d >= 180 =>   500,
+        d if d >=  90 =>   200,
+        _             =>     0,
+    };
+    STAKING_APR_BPS + bonus
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StakingInfo {
     pub staked_amount:     u64,
@@ -31,12 +47,14 @@ pub async fn get_staking_info() -> Result<StakingInfo, EgoDesktopError> {
         .map(|t| (now - t).max(0) as u64)
         .unwrap_or(0);
 
+    let apr_bps = effective_apr_bps(ledger.stake_lock_days);
+
     let pending_rewards = if ledger.staked_amount > 0 && staked_since_secs > 0 {
         let chain = load_chain();
         let pool_left = staking_pool_remaining_uegoc(&chain);
         if pool_left > 0 {
             (ledger.staked_amount as u128
-                * STAKING_APR_BPS as u128
+                * apr_bps as u128
                 * staked_since_secs as u128
                 / (10_000 * 31_536_000)) as u64
         } else {
@@ -48,7 +66,7 @@ pub async fn get_staking_info() -> Result<StakingInfo, EgoDesktopError> {
 
     let projected_interest = if ledger.staked_amount > 0 && ledger.stake_lock_days > 0 {
         (ledger.staked_amount as u128
-            * STAKING_APR_BPS as u128
+            * apr_bps as u128
             * ledger.stake_lock_days as u128
             / (10_000 * 365)) as u64
     } else {
@@ -59,7 +77,7 @@ pub async fn get_staking_info() -> Result<StakingInfo, EgoDesktopError> {
     Ok(StakingInfo {
         staked_amount:     ledger.staked_amount,
         lock_period_days:  ledger.stake_lock_days,
-        apr:               STAKING_APR_BPS as f64 / 100.0,
+        apr:               apr_bps as f64 / 100.0,
         pending_rewards,
         unlock_date:       ledger.unstake_at,
         staked_at:         ledger.staked_at,
@@ -80,6 +98,12 @@ pub async fn stake_coins(
     }
     if lock_days == 0 {
         return Err(EgoDesktopError::InvalidInput("Lock period must be > 0 days".into()));
+    }
+    if lock_days > 1825 {
+        // 5 years maximum — prevents u64 overflow in reward calculations.
+        return Err(EgoDesktopError::InvalidInput(
+            "Lock period too long (max 1825 days / 5 years)".into(),
+        ));
     }
 
     let mut ledger = Ledger::load();
@@ -166,10 +190,25 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
     let staked_amount = ledger.staked_amount;
     let ts            = now;
 
+    // Accrue rewards up to now (same formula as get_staking_info).
+    let staked_since_secs = ledger.staked_at.map(|t| (now - t).max(0) as u64).unwrap_or(0);
+    let apr_bps = effective_apr_bps(ledger.stake_lock_days);
+    let accrued_rewards: u64 = {
+        let chain     = load_chain();
+        let pool_left = staking_pool_remaining_uegoc(&chain);
+        if pool_left > 0 && staked_since_secs > 0 {
+            let raw = (staked_amount as u128
+                * apr_bps as u128
+                * staked_since_secs as u128
+                / (10_000 * 31_536_000)) as u64;
+            raw.min(pool_left)
+        } else { 0 }
+    };
+
     if is_locked && early {
-        // Early unstake: charge 10% fee
+        // Early unstake: charge 10% fee on principal only; rewards still paid in full.
         let fee           = staked_amount / 10;
-        let return_amount = staked_amount - fee;
+        let return_amount = (staked_amount - fee) + accrued_rewards;
         let kp = match state.get_keypair() {
             Some(k) => k,
             None    => return Err(EgoDesktopError::WalletError("Wallet not initialized".into())),
@@ -227,7 +266,7 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
             from:               STAKING_ADDR.to_string(),
             to:                 from.clone(),
             amount:             return_amount,
-            memo:               Some("Early unstake return".to_string()),
+            memo:               Some(format!("Early unstake return (+{} uEGOC rewards)", accrued_rewards)),
             timestamp:          ts,
             signature:          "staking_system".to_string(),
             status:             "Pending".into(),
@@ -272,17 +311,18 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
             ..LedgerTx::default()
         });
 
-        // Return tx: staking contract → user
+        // Return tx: staking contract → user (principal + accrued rewards)
+        let total_return   = staked_amount + accrued_rewards;
         let ret_nonce      = unstake_nonce + 1;
-        let ret_sign_bytes = tx_signing_bytes(STAKING_ADDR, &from, staked_amount, ret_nonce, ts);
+        let ret_sign_bytes = tx_signing_bytes(STAKING_ADDR, &from, total_return, ret_nonce, ts);
         let ret_hash       = format!("0x{}", ego_core::hash_data(&ret_sign_bytes).to_hex());
 
         crate::mempool::get_mempool().push(LedgerTx {
             hash:               ret_hash.clone(),
             from:               STAKING_ADDR.to_string(),
             to:                 from.clone(),
-            amount:             staked_amount,
-            memo:               Some("Unstake return".to_string()),
+            amount:             total_return,
+            memo:               Some(format!("Unstake return (+{} uEGOC rewards)", accrued_rewards)),
             timestamp:          ts,
             signature:          "staking_system".to_string(),
             status:             "Pending".into(),

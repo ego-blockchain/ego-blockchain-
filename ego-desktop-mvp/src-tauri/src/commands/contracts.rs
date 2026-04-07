@@ -47,9 +47,9 @@ pub async fn deploy_contract(args: DeployContractArgs) -> Result<DeployResult, E
         .map_err(|e| EgoDesktopError::WalletError(format!("Invalid wasm hex: {e}")))?;
     let init_args = hex::decode(&args.init_args_hex).unwrap_or_default();
 
-    let chain  = load_chain();
-    let height = chain.blocks.last().map(|b| b.height).unwrap_or(0);
-    let ts     = chrono::Utc::now().timestamp();
+    let mut chain = load_chain();
+    let height    = chain.blocks.last().map(|b| b.height).unwrap_or(0);
+    let ts        = chrono::Utc::now().timestamp();
 
     let exec   = vm()?;
     let result = exec.deploy(&wasm_bytes, &ledger.address, &init_args, height, ts,
@@ -80,15 +80,14 @@ pub async fn deploy_contract(args: DeployContractArgs) -> Result<DeployResult, E
         let _ = std::fs::write(&abi_path, serde_json::to_string(&args.abi).unwrap_or_default());
     }
 
-    let mut chain2 = load_chain();
-    let nonce      = chain2.last_nonce(&ledger.address) + 1;
-    let tx_data    = format!("deploy:{}:{}:{}", ledger.address, result.contract_address, nonce);
-    let tx_hash    = hex::encode(ego_core::hash_data(tx_data.as_bytes()).as_bytes());
-
     let is_staker   = ledger.staked_amount > 0;
     let deploy_fee  = crate::tokenomics::deploy_fee_with_staking(is_staker);
+    let nonce       = chain.last_nonce(&ledger.address) + 1;
+    let tx_data     = format!("deploy:{}:{}:{}", ledger.address, result.contract_address, nonce);
+    let tx_hash     = hex::encode(ego_core::hash_data(tx_data.as_bytes()).as_bytes());
+
     if deploy_fee > 0 {
-        let bal = chain2.balance_of(&ledger.address);
+        let bal = chain.balance_of(&ledger.address);
         if deploy_fee > bal {
             return Err(EgoDesktopError::WalletError(format!(
                 "Insufficient balance for deploy fee: need {} uEGOC, have {}",
@@ -98,7 +97,7 @@ pub async fn deploy_contract(args: DeployContractArgs) -> Result<DeployResult, E
         let fee_hash = format!("0x{}", ego_core::hash_data(
             format!("deployfee:{}:{}:{}", ledger.address, result.contract_address, nonce).as_bytes()
         ).to_hex());
-        chain2.transactions.push(LedgerTx {
+        chain.transactions.push(LedgerTx {
             hash:      fee_hash,
             from:      ledger.address.clone(),
             to:        "egot1burn000000000000000000000000000000000000000".into(),
@@ -128,8 +127,8 @@ pub async fn deploy_contract(args: DeployContractArgs) -> Result<DeployResult, E
         ..LedgerTx::default()
     };
 
-    chain2.transactions.push(tx.clone());
-    let _ = save_chain(&chain2);
+    chain.transactions.push(tx.clone());
+    let _ = save_chain(&chain);
 
     Ok(result)
 }
@@ -143,13 +142,23 @@ pub struct CallContractArgs {
 
 #[tauri::command]
 pub async fn call_contract(args: CallContractArgs) -> Result<CallResult, EgoDesktopError> {
+    if !args.contract_addr.starts_with("egot1") || args.contract_addr.len() > 100 {
+        return Err(EgoDesktopError::WalletError("Invalid contract address".into()));
+    }
+    if args.entrypoint.is_empty()
+        || args.entrypoint.len() > 64
+        || !args.entrypoint.chars().all(|c| c.is_alphanumeric() || c == '_')
+    {
+        return Err(EgoDesktopError::WalletError("Invalid entrypoint name".into()));
+    }
+
     let ledger = Ledger::load();
     if ledger.address.is_empty() {
         return Err(EgoDesktopError::WalletError("No wallet".into()));
     }
 
     let call_args = hex::decode(&args.args_hex).unwrap_or_default();
-    let chain     = load_chain();
+    let mut chain = load_chain();
     let height    = chain.blocks.last().map(|b| b.height).unwrap_or(0);
     let ts        = chrono::Utc::now().timestamp();
 
@@ -160,7 +169,6 @@ pub async fn call_contract(args: CallContractArgs) -> Result<CallResult, EgoDesk
         .map_err(|e| EgoDesktopError::WalletError(e.to_string()))?;
 
     if result.success {
-
         if !result.events.is_empty() {
             let events_path = contracts_dir()
                 .join("contracts")
@@ -189,11 +197,10 @@ pub async fn call_contract(args: CallContractArgs) -> Result<CallResult, EgoDesk
             );
         }
 
-        let mut chain2 = load_chain();
-        let nonce      = chain2.last_nonce(&ledger.address) + 1;
-        let tx_data    = format!("call:{}:{}:{}:{}", ledger.address,
-                                 args.contract_addr, args.entrypoint, nonce);
-        let tx_hash    = hex::encode(ego_core::hash_data(tx_data.as_bytes()).as_bytes());
+        let nonce   = chain.last_nonce(&ledger.address) + 1;
+        let tx_data = format!("call:{}:{}:{}:{}", ledger.address,
+                              args.contract_addr, args.entrypoint, nonce);
+        let tx_hash = hex::encode(ego_core::hash_data(tx_data.as_bytes()).as_bytes());
 
         let tx = LedgerTx {
             hash:          tx_hash,
@@ -211,9 +218,8 @@ pub async fn call_contract(args: CallContractArgs) -> Result<CallResult, EgoDesk
             ..LedgerTx::default()
         };
 
-        chain2.transactions.push(tx.clone());
-        let _ = save_chain(&chain2);
-
+        chain.transactions.push(tx.clone());
+        let _ = save_chain(&chain);
     }
 
     Ok(result)
@@ -225,6 +231,9 @@ pub async fn get_contract_state(
     prefix: String,
     key: String,
 ) -> Result<Option<String>, EgoDesktopError> {
+    if !contract_addr.starts_with("egot1") || contract_addr.len() > 100 {
+        return Err(EgoDesktopError::WalletError("Invalid contract address".into()));
+    }
     let exec  = vm()?;
     let state = exec.store.load_state(&contract_addr);
     let val   = state.get(&prefix, &key).map(hex::encode);
@@ -247,11 +256,11 @@ pub async fn list_deployed_contracts() -> Result<Vec<ContractInfo>, EgoDesktopEr
     let contracts_path = contracts_dir().join("contracts");
     if !contracts_path.exists() { return Ok(vec![]); }
 
+    let exec = vm()?;
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&contracts_path) {
         for entry in entries.flatten() {
             let addr = entry.file_name().to_string_lossy().to_string();
-            let exec = vm()?;
             if let Some(manifest) = exec.store.load_manifest(&addr) {
                 let abi_path = contracts_dir()
                     .join("contracts")
@@ -289,6 +298,9 @@ pub async fn get_contract_events(
     contract_addr: String,
     limit: u32,
 ) -> Result<Vec<StoredEvent>, EgoDesktopError> {
+    if !contract_addr.starts_with("egot1") || contract_addr.len() > 100 {
+        return Err(EgoDesktopError::WalletError("Invalid contract address".into()));
+    }
     let events_path = contracts_dir()
         .join("contracts")
         .join(&contract_addr)

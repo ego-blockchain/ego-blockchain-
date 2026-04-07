@@ -100,11 +100,48 @@ impl BlockHeader {
         hash_multiple(&[self.vrf_output.as_bytes(), region_id.as_bytes(), &self.epoch.to_le_bytes(), &self.slot.to_le_bytes()])
     }
 
+    /// Compute a verifiable VRF output for `(epoch, slot)`.
+    ///
+    /// Construction:
+    ///   input  = BLAKE2s(dilithium_pk || epoch_le || slot_le)
+    ///   proof  = Ed25519_sign(SK, input)          ← deterministic per RFC 8032
+    ///   output = BLAKE2s("ego/vrf/v1:" || proof)  ← uniquely derived from proof
+    ///
+    /// Properties guaranteed:
+    ///   • **Uniqueness** — same SK + (epoch, slot) always produces the same proof
+    ///     and therefore the same output (Ed25519 signing is deterministic).
+    ///   • **Pseudorandomness** — without the secret key, output is indistinguishable
+    ///     from random (depends on Ed25519 unforgeability).
+    ///   • **Verifiability** — verifier reconstructs input from PK + (epoch, slot),
+    ///     checks the Ed25519 signature, then recomputes BLAKE2s(proof) and compares.
     pub fn compute_vrf_output(kp: &KeyPair, epoch: u64, slot: u64) -> (Hash, Vec<u8>) {
         let input = hash_multiple(&[kp.public_key().as_bytes(), &epoch.to_le_bytes(), &slot.to_le_bytes()]);
-        let output = hash_multiple(&[b"ego/vrf/v1:", kp.public_key().as_bytes(), input.as_bytes()]);
-        let proof = kp.sign(input.as_bytes()).as_bytes().to_vec();
+        // Ed25519 signature is the proof — deterministic for the same SK + input.
+        let proof = kp.sign_ed25519(input.as_bytes()).as_bytes().to_vec();
+        // Output is derived solely from the proof so it is uniquely bound to it.
+        let output = hash_multiple(&[b"ego/vrf/v1:", &proof]);
         (output, proof)
+    }
+
+    /// Verify a VRF proof produced by [`compute_vrf_output`].
+    ///
+    /// Returns the expected `vrf_output` hash if the proof is valid, `None` otherwise.
+    /// The caller should compare the returned hash against the block's `vrf_output` field.
+    pub fn verify_vrf_output(
+        pk: &PublicKey,
+        epoch: u64,
+        slot: u64,
+        proof_bytes: &[u8],
+    ) -> Option<Hash> {
+        if proof_bytes.len() != 64 { return None; }
+        let sig_arr: [u8; 64] = proof_bytes.try_into().ok()?;
+        let sig = ego_core::Signature::ed25519(sig_arr);
+        let input = hash_multiple(&[pk.as_bytes(), &epoch.to_le_bytes(), &slot.to_le_bytes()]);
+        // Verify Ed25519 signature over the VRF input.
+        ego_core::verify_signature(pk, input.as_bytes(), &sig)
+            .ok()
+            .filter(|&ok| ok)
+            .map(|_| hash_multiple(&[b"ego/vrf/v1:", proof_bytes]))
     }
 }
 

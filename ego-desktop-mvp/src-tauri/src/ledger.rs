@@ -329,6 +329,12 @@ pub struct StoredFile {
     /// 0 = not suspended.  Set on strike ≥ 2.
     #[serde(default)]
     pub proof_suspended_until: i64,
+
+    /// true = this file was received via EgoSafe share (egoshare1/egoshare2 bundle).
+    /// false (default) = file the user explicitly uploaded through the Storage tab.
+    /// Used to filter Storage tab so EgoSafe-received files don't appear there.
+    #[serde(default)]
+    pub from_egosafe: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -386,6 +392,16 @@ pub struct Ledger {
     /// token are auto-dropped. Rotate with `revoke_contact_bundle`.
     #[serde(default)]
     pub bundle_token: String,
+
+    /// Unix timestamp (seconds) when storage allocation was last configured.
+    /// Nodes are locked from changing their allocation for 60 days after this.
+    #[serde(default)]
+    pub storage_configured_at: Option<i64>,
+
+    /// If set, all storage/consensus/coverage rewards are suspended until this timestamp.
+    /// Applied when a node lowers its committed storage allocation after the 60-day lock expires.
+    #[serde(default)]
+    pub reward_suspended_until: Option<i64>,
 }
 
 /// One pre-sale IOU record — stored locally and included in Genesis Block on mainnet launch.

@@ -326,6 +326,45 @@ async fn fetch_ada_balance(address: &str) -> Result<BalanceResult, String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Cardano transaction history (Koios API)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn fetch_ada_txs(address: &str) -> Result<Vec<ExternalTx>, String> {
+    let url = format!(
+        "https://api.koios.rest/api/v1/address_txs?_address={address}&_after_block_height=0"
+    );
+    let json: serde_json::Value = http_client()
+        .get(&url)
+        .header("accept", "application/json")
+        .send().await
+        .map_err(|e| e.to_string())?
+        .json().await
+        .map_err(|e| e.to_string())?;
+
+    let items = json.as_array().cloned().unwrap_or_default();
+    let mut txs = Vec::new();
+    for item in items.iter().take(10) {
+        let hash       = item["tx_hash"].as_str().unwrap_or("").to_string();
+        let block_height = item["block_height"].as_u64().unwrap_or(0);
+        let epoch_no   = item["epoch_no"].as_u64().unwrap_or(0);
+        // Koios address_txs returns minimal info; we record what's available.
+        // Direction is unknown without a full tx lookup, so we show as received.
+        txs.push(ExternalTx {
+            hash:         hash.clone(),
+            from:         String::new(),
+            to:           address.to_string(),
+            value:        format!("block {block_height} / epoch {epoch_no}"),
+            symbol:       "ADA".into(),
+            timestamp:    0,
+            block:        block_height,
+            status:       "Confirmed".into(),
+            explorer_url: format!("https://cardanoscan.io/transaction/{hash}"),
+        });
+    }
+    Ok(txs)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // EVM transaction history — Scan API primary, Blockchair fallback
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1091,7 +1130,7 @@ pub async fn fetch_chain_transactions(
         "LTC"  => fetch_blockcypher_txs("ltc",  &address).await,
         "DOGE" => fetch_blockcypher_txs("doge", &address).await,
         "SOL"  => fetch_sol_txs(&address).await,
-        "ADA"  => Ok(vec![]),
+        "ADA"  => fetch_ada_txs(&address).await,
         "XRP"  => fetch_xrp_txs(&address).await,
         "TRX"  => fetch_trx_txs(&address).await,
         _      => Err(format!("Unsupported chain: {chain_symbol}")),

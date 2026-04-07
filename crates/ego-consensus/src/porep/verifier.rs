@@ -386,17 +386,35 @@ impl PoRepVerifier {
         params: &VerificationParams,
         commitment: Option<&SectorCommitment>,
     ) -> PoCResult<bool> {
+        // Empty proof_data is never valid.
         if proof.proof_data.is_empty() {
-            return Ok(true);
+            return Ok(false);
         }
-        let expected_len = params.challenge_count as usize * 32;
+
+        // Dispatch: ZK-SNARK PoRep or legacy Merkle-path PoRep.
+        if proof.proof_data.starts_with(super::zk_circuit::ZK_MAGIC) {
+            return self.verify_zk_porep(proof, params, commitment).await;
+        }
+
+        // ── Legacy Merkle-path PoRep ───────────────────────────────────────────
+        // Each challenge response is: 32-byte leaf hash || (tree_depth × 32-byte sibling hashes).
+        // Tree depth = ceil(log2(sector_size / 32)) where 32 bytes is the leaf size.
+        let leaf_size: u64 = 32;
+        let num_leaves = params.sector_size / leaf_size;
+        let tree_depth = (num_leaves as f64).log2().ceil() as usize;
+        // proof_data layout: challenge_count × (1 + tree_depth) × 32 bytes
+        let expected_len = params.challenge_count as usize * (1 + tree_depth) * 32;
         if proof.proof_data.len() != expected_len {
             return Ok(false);
         }
+
+        // Verify the replica commitment chain: comm_r must be derivable from comm_d.
         let expected_comm_r = self.compute_expected_comm_r(&proof.comm_d, &proof.replica_id);
         if expected_comm_r != proof.comm_r {
             return Ok(false);
         }
+
+        // Validate against stored commitment if available.
         if let Some(comm) = commitment {
             if comm.is_expired() {
                 return Ok(false);
@@ -405,12 +423,134 @@ impl PoRepVerifier {
                 return Ok(false);
             }
         }
-        let verification_delay_ms = match params.sector_size {
-            s if s == 64 * 1024 * 1024 * 1024 => 4000u64,
-            s if s == 32 * 1024 * 1024 * 1024 => 2000u64,
-            _ => 500u64,
-        };
-        tokio::time::sleep(Duration::from_millis(verification_delay_ms.min(50))).await;
+
+        // Verify each challenge's Merkle inclusion path against comm_d.
+        let chunk = (1 + tree_depth) * 32;
+        for i in 0..params.challenge_count as usize {
+            let path_bytes = &proof.proof_data[i * chunk..(i + 1) * chunk];
+            let leaf_hash = &path_bytes[..32];
+            // Walk the sibling path and recompute the root.
+            let mut node = <[u8; 32]>::try_from(leaf_hash).unwrap_or([0u8; 32]);
+            for depth in 0..tree_depth {
+                let sibling = &path_bytes[32 + depth * 32..32 + (depth + 1) * 32];
+                // Canonical ordering: smaller hash goes left.
+                if node <= sibling.try_into().unwrap_or([0xffu8; 32]) {
+                    node = *blake3::hash(&[node.as_slice(), sibling].concat()).as_bytes();
+                } else {
+                    node = *blake3::hash(&[sibling, node.as_slice()].concat()).as_bytes();
+                }
+            }
+            // The recomputed root must match comm_d.
+            if node != *proof.comm_d.as_bytes() {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Verify a ZK-SNARK PoRep proof (Groth16 over BN254 with MiMC-7 Merkle tree).
+    ///
+    /// # proof_data layout
+    /// ```text
+    /// [0..4]   b"ZKPR"               magic
+    /// [4..8]   tree_depth  : u32 LE
+    /// [8..12]  challenge_count: u32 LE
+    /// per challenge (168 bytes each):
+    ///   [+0..+8]   leaf_index : u64 LE
+    ///   [+8..+40]  leaf_hash  : Fr (32 bytes LE)   — MiMC-7 hash of the leaf data
+    ///   [+40..+168] groth16   : 128-byte compressed Groth16 proof (A‖B‖C)
+    /// ```
+    async fn verify_zk_porep(
+        &self,
+        proof: &PoRepProof,
+        params: &VerificationParams,
+        commitment: Option<&SectorCommitment>,
+    ) -> PoCResult<bool> {
+        use super::zk_circuit as zk;
+
+        let data = &proof.proof_data;
+
+        // Parse header.
+        if data.len() < 12 {
+            return Ok(false);
+        }
+        let tree_depth     = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+        let challenge_count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+
+        // challenge_count must match the registered params for this sector size.
+        if challenge_count != params.challenge_count as usize {
+            warn!(
+                "ZK PoRep: challenge_count mismatch (got {} expected {})",
+                challenge_count, params.challenge_count
+            );
+            return Ok(false);
+        }
+
+        // Validate total proof blob length.
+        const PER_CHALLENGE: usize = 8 + 32 + zk::GROTH16_PROOF_BYTES; // 168 bytes
+        let expected_len = 12 + challenge_count * PER_CHALLENGE;
+        if data.len() != expected_len {
+            warn!(
+                "ZK PoRep: proof_data length {} != expected {}",
+                data.len(), expected_len
+            );
+            return Ok(false);
+        }
+
+        // Validate commitment if available.
+        if let Some(comm) = commitment {
+            if comm.is_expired() {
+                return Ok(false);
+            }
+            if !proof.matches_commitment(comm) {
+                return Ok(false);
+            }
+        }
+
+        // Verify comm_r derivation: comm_r = H(comm_d ‖ replica_id).
+        let expected_comm_r = self.compute_expected_comm_r(&proof.comm_d, &proof.replica_id);
+        if expected_comm_r != proof.comm_r {
+            warn!("ZK PoRep: comm_r mismatch");
+            return Ok(false);
+        }
+
+        // Get (or lazily generate) the Groth16 verifying key for this tree depth.
+        // First use per (process, tree_depth) triggers setup (~100–500 ms for small circuits).
+        let keys = zk::get_keys(tree_depth);
+
+        // Public input: MiMC-7 Merkle root (= comm_d reduced into BN254 Fr).
+        let root = zk::bytes_to_fr(proof.comm_d.as_bytes());
+
+        // Verify each challenge's Groth16 proof.
+        for i in 0..challenge_count {
+            let base = 12 + i * PER_CHALLENGE;
+
+            let leaf_index_bytes: [u8; 8] = data[base..base + 8].try_into().unwrap();
+            let leaf_index = u64::from_le_bytes(leaf_index_bytes);
+
+            let leaf_hash_bytes: [u8; 32] = data[base + 8..base + 40].try_into().unwrap();
+            let leaf_hash = zk::bytes_to_fr(&leaf_hash_bytes);
+
+            let proof_bytes = &data[base + 40..base + PER_CHALLENGE];
+
+            match zk::verify(&keys.pvk, root, leaf_hash, leaf_index, proof_bytes) {
+                Ok(true)  => {}
+                Ok(false) => {
+                    warn!("ZK PoRep: challenge {} failed Groth16 verification", i);
+                    return Ok(false);
+                }
+                Err(e) => {
+                    warn!("ZK PoRep: challenge {} verify error: {}", i, e);
+                    return Ok(false);
+                }
+            }
+        }
+
+        info!(
+            "✅ ZK PoRep verified: {} Groth16 proofs, tree_depth={}, sector={}",
+            challenge_count, tree_depth, proof.sector_id
+        );
         Ok(true)
     }
 

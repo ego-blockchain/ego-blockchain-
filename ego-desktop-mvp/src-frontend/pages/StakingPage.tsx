@@ -42,12 +42,12 @@ interface Tokenomics {
   };
 }
 
-const APR = 12.5;
+const BASE_APR = 12.5;
 const LOCK_OPTIONS = [
-  { days: 30,  bonus: '0%',   label: '30 days'  },
-  { days: 90,  bonus: '+2%',  label: '90 days'  },
-  { days: 180, bonus: '+5%',  label: '6 months' },
-  { days: 365, bonus: '+10%', label: '1 year'   },
+  { days: 30,  bonusPct: 0,   bonus: '0%',   label: '30 days'  },
+  { days: 90,  bonusPct: 2,   bonus: '+2%',  label: '90 days'  },
+  { days: 180, bonusPct: 5,   bonus: '+5%',  label: '6 months' },
+  { days: 365, bonusPct: 10,  bonus: '+10%', label: '1 year'   },
 ];
 
 function fmtDate(ts: number | null): string {
@@ -101,9 +101,11 @@ const StakingPage: React.FC = () => {
 
   useEffect(() => { load(); }, [load, wallet?.address]);
 
-  const lockBonus = LOCK_OPTIONS.find(o => o.days === lockDays)!.bonus;
+  const selectedLock   = LOCK_OPTIONS.find(o => o.days === lockDays)!;
+  const lockBonus      = selectedLock.bonus;
+  const effectiveApr   = BASE_APR + selectedLock.bonusPct;
   const projectedYield = stakeAmount
-    ? ((parseFloat(stakeAmount) || 0) * (APR / 100) * (lockDays / 365)).toFixed(2)
+    ? ((parseFloat(stakeAmount) || 0) * (effectiveApr / 100) * (lockDays / 365)).toFixed(2)
     : '0.00';
 
   async function handleStake() {
@@ -155,7 +157,7 @@ const StakingPage: React.FC = () => {
       <div className="grid grid-cols-5 gap-3">
         {[
           { label: 'Staked',              val: `${fmtEgoc(info?.staked_amount ?? 0)} EGOC`,                                  color: 'text-blue-400'   },
-          { label: 'APR',                 val: `${info?.apr ?? APR}%`,                                                        color: 'text-green-400'  },
+          { label: 'APR',                 val: `${info?.apr ?? BASE_APR}%`,                                                        color: 'text-green-400'  },
           { label: 'Projected Interest',  val: hasStake ? `${((info?.projected_interest ?? 0) / 1_000_000).toFixed(4)} EGOC` : '—', color: 'text-cyan-400'   },
           { label: 'Pending Rewards',     val: `${pendingRew.toFixed(2)} EGOC`,                                               color: 'text-yellow-400' },
           { label: 'Lock Remaining',      val: hasStake ? `${lockLeft} days` : '—',                                          color: 'text-purple-400' },
@@ -255,7 +257,7 @@ const StakingPage: React.FC = () => {
                       <div className="font-semibold text-gray-200 mb-2">Projection</div>
                       <div className="flex justify-between">
                         <span className="text-gray-400">Staking APR</span>
-                        <span className="text-green-400">{APR}%</span>
+                        <span className="text-green-400">{effectiveApr}%</span>
                       </div>
                       <div className="flex justify-between">
                         <span className="text-gray-400">Lock bonus</span>

@@ -1,8 +1,8 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
+import { EGOC_PRICE_USD, EGOC_SUPPLY } from '../constants';
 
-const EGOC_PRICE = 2.45;
-const EGOC_SUPPLY = 1_000_000_000;
+const EGOC_PRICE = EGOC_PRICE_USD;
 
 function generateEgocHistory(n: number): number[] {
   const seed = [0.3,0.7,0.2,0.9,0.4,0.6,0.1,0.8,0.5,0.3,0.7,0.9,0.2,0.6,0.4,
