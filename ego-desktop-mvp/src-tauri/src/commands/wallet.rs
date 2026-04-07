@@ -1,6 +1,6 @@
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
-use crate::ledger::{load_chain, save_chain, tx_signing_bytes, Ledger, LedgerBlock, LedgerTx};
+use crate::ledger::{load_chain, save_chain, tx_signing_bytes, tx_signing_bytes_v2, tx_human_summary, Ledger, LedgerBlock, LedgerTx};
 use once_cell::sync::Lazy;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,8 @@ pub struct TransactionResponse {
     pub success: bool,
     pub message: String,
     pub block_height: Option<u64>,
+    /// EGO-712: human-readable summary of what was actually signed.
+    pub signed_summary: Option<String>,
 }
 
 #[tauri::command]
@@ -149,7 +151,11 @@ pub async fn send_transaction(
 
     let nonce      = ledger.nonce + 1;
     let ts         = chrono::Utc::now().timestamp();
-    let sign_bytes = tx_signing_bytes(&from, &request.to_address, request.amount, nonce, ts);
+    let memo_str   = request.memo.as_deref().unwrap_or("");
+    const CHAIN_ID: u8 = 1; // testnet
+    let sign_bytes = tx_signing_bytes_v2(
+        &from, &request.to_address, request.amount, nonce, ts, CHAIN_ID, memo_str,
+    );
 
     let (signature_hex, pubkey_hex, dil_sig_hex, dil_pubkey_hex) = if let Some(kp) = state.get_keypair() {
         let ed_sig  = kp.sign_ed25519(&sign_bytes);
@@ -164,7 +170,10 @@ pub async fn send_transaction(
         ));
     };
 
-    let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+    let tx_hash     = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+    let summary     = tx_human_summary(
+        &from, &request.to_address, request.amount, memo_str, CHAIN_ID, nonce, fee,
+    );
 
     let tx = LedgerTx {
         hash:                tx_hash.clone(),
@@ -181,6 +190,9 @@ pub async fn send_transaction(
         dilithium_pubkey:    dil_pubkey_hex,
         dilithium_signature: dil_sig_hex,
         fee_uegoc:           fee,
+        tx_version:          2,
+        chain_id:            CHAIN_ID,
+        signed_summary:      summary.clone(),
         ..LedgerTx::default()
     };
 
@@ -207,10 +219,11 @@ pub async fn send_transaction(
     }
 
     Ok(TransactionResponse {
-        hash:         tx_hash,
-        success:      true,
-        message:      "Transaction queued — confirms within the next batch window".into(),
-        block_height: None,
+        hash:           tx_hash,
+        success:        true,
+        message:        "Transaction queued — confirms within the next batch window".into(),
+        block_height:   None,
+        signed_summary: Some(summary),
     })
 }
 
@@ -340,6 +353,7 @@ pub async fn commit_transaction(
     Ok(TransactionResponse {
         hash: tx_hash, success: true,
         message: "Transaction confirmed and broadcast".into(), block_height,
+        signed_summary: None,
     })
 }
 
@@ -743,10 +757,11 @@ pub async fn confirm_tx_code(
     }
 
     Ok(TransactionResponse {
-        hash:         tx.hash,
-        success:      true,
-        message:      "Transaction confirmed and queued".into(),
-        block_height: None,
+        hash:           tx.hash,
+        success:        true,
+        message:        "Transaction confirmed and queued".into(),
+        block_height:   None,
+        signed_summary: None,
     })
 }
 

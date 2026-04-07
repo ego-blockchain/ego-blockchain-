@@ -270,6 +270,9 @@ fn migrate_from_sqlite(db: &DB, path: &std::path::Path) -> bool {
             priority_fee_uegoc:  0,
             cid:                 String::new(),
             commitment_hash:     String::new(),
+            tx_version:          0,
+            chain_id:            0,
+            signed_summary:      String::new(),
         })
     }).unwrap().filter_map(|r| r.ok()).collect();
 

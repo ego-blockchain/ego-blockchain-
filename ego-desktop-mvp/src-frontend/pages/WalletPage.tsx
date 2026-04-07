@@ -284,7 +284,7 @@ const WalletPage: React.FC = () => {
   const [remoteLoading, setRemoteLoading]   = useState(false);
   const [remoteError, setRemoteError]       = useState('');
 
-  type EmailStep = 'idle' | 'code_entry' | 'confirmed' | 'expired';
+  type EmailStep = 'idle' | 'review' | 'code_entry' | 'confirmed' | 'expired';
   const [emailStep, setEmailStep]     = useState<EmailStep>('idle');
   const [txId, setTxId]               = useState('');
   const [maskedEmail, setMaskedEmail] = useState('');
@@ -2358,7 +2358,68 @@ const WalletPage: React.FC = () => {
       {showSend && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
           <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-md border border-gray-700 shadow-2xl">
-            {emailStep === 'code_entry' ? (
+            {emailStep === 'review' ? (
+              <div className="space-y-4">
+                <div className="flex justify-between items-center">
+                  <h3 className="text-lg font-bold">Review Transaction</h3>
+                  <button onClick={() => setEmailStep('idle')} className="text-gray-400 hover:text-white text-xl">✕</button>
+                </div>
+                {/* Security notice */}
+                <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-3 text-xs text-yellow-200/80">
+                  Verify every field below. This is exactly what will be signed — your wallet commits to these values cryptographically. Once signed, the transaction cannot be altered.
+                </div>
+                {/* Structured breakdown — same fields that go into signing bytes */}
+                <div className="bg-gray-900 rounded-xl p-4 space-y-3 text-sm font-mono">
+                  <div>
+                    <div className="text-gray-500 text-xs mb-0.5">From</div>
+                    <div className="text-green-400 break-all">{myAddress}</div>
+                  </div>
+                  <div className="border-t border-gray-700/50" />
+                  <div>
+                    <div className="text-gray-500 text-xs mb-0.5">To</div>
+                    <div className="text-white break-all">{sendForm.to}</div>
+                  </div>
+                  <div className="border-t border-gray-700/50" />
+                  <div className="flex justify-between items-center">
+                    <div>
+                      <div className="text-gray-500 text-xs mb-0.5">Amount</div>
+                      <div className="text-white text-base font-bold">{parseFloat(sendForm.amount || '0').toFixed(6)} EGOC</div>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-gray-500 text-xs mb-0.5">Fee</div>
+                      <div className="text-yellow-400">{txFee ? (txFee.fee_uegoc / 1_000_000).toFixed(4) : '…'} EGOC</div>
+                    </div>
+                  </div>
+                  <div className="border-t border-gray-700/50" />
+                  <div>
+                    <div className="text-gray-500 text-xs mb-0.5">Memo</div>
+                    <div className="text-gray-300 italic">{sendForm.memo || '(none)'}</div>
+                  </div>
+                  <div className="border-t border-gray-700/50" />
+                  <div className="flex justify-between text-xs">
+                    <div><span className="text-gray-500">Signature</span> <span className="text-gray-300">Ed25519 + Dilithium-3</span></div>
+                    <div><span className="text-gray-500">Network</span> <span className="text-blue-300">Testnet (chain_id=1)</span></div>
+                  </div>
+                </div>
+                <div className="flex gap-3">
+                  <button
+                    onClick={() => setEmailStep('idle')}
+                    className="flex-1 bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition"
+                  >
+                    Back
+                  </button>
+                  <button
+                    onClick={() => { setEmailStep('idle'); handleSend(); }}
+                    disabled={sending}
+                    className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 py-3 rounded-xl font-semibold text-sm transition flex items-center justify-center gap-2"
+                  >
+                    {sending
+                      ? <><div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />Signing…</>
+                      : 'Confirm & Sign'}
+                  </button>
+                </div>
+              </div>
+            ) : emailStep === 'code_entry' ? (
               <div className="space-y-5">
                 <div className="flex justify-between items-center">
                   <h3 className="text-lg font-bold">Confirm Transaction</h3>
@@ -2515,11 +2576,11 @@ const WalletPage: React.FC = () => {
                     </div>
                   </div>
                   <button
-                    onClick={handleSend}
+                    onClick={() => { if (sendForm.to && sendForm.amount) setEmailStep('review'); }}
                     disabled={!sendForm.to || !sendForm.amount || sending}
                     className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed py-3 rounded-xl font-semibold transition"
                   >
-                    {sending ? '⏳ Signing & Broadcasting…' : 'Send EGOC'}
+                    Review & Sign
                   </button>
                 </div>
               </>
