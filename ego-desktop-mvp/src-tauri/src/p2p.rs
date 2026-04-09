@@ -3863,13 +3863,35 @@ fn validate_block(block: &crate::ledger::LedgerBlock, chain: &crate::ledger::Sha
                 }
             }
             None => {
-
                 if block.reward != 0 {
                     eprintln!("[Validate] Block #{} rejected: coinbase TX {} not found",
                         block.height, cb_hash);
                     return false;
                 }
             }
+        }
+    }
+
+    // ── Block hash integrity check ─────────────────────────────────────────
+    // Recompute the block hash from its fields and reject if it doesn't match.
+    // This prevents peers from sending blocks with fake hashes, and ensures
+    // the tx_merkle_root is correctly committed into the block hash (v2 format).
+    if !block.tx_merkle_root.is_empty() {
+        let expected_hash = crate::chain_db::block_hash_for(
+            &block.prev_hash, block.height, &block.miner,
+            block.timestamp, &block.tx_merkle_root, &block.poc_ticket,
+        );
+        // Also accept the legacy v1 hash (blocks mined before this fix).
+        let v1_hash = {
+            let v1_input = format!("{}{}{}{}", block.prev_hash, block.height, block.miner, block.timestamp);
+            blake3::hash(v1_input.as_bytes()).to_hex().to_string()
+        };
+        if block.hash != expected_hash && block.hash != v1_hash {
+            eprintln!(
+                "[Validate] Block #{} rejected: hash mismatch (stored={:.8}… expected={:.8}…)",
+                block.height, block.hash, expected_hash
+            );
+            return false;
         }
     }
 

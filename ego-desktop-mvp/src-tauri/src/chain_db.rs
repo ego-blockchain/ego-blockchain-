@@ -743,6 +743,27 @@ pub fn mine_batch_db(txs: &[LedgerTx], miner: &str) -> LedgerBlock {
     mine_batch_db_with_ticket(txs, miner, "", 0)
 }
 
+/// Canonical block hash function.  Every field that defines "what this block
+/// contains" is committed: prev_hash chains blocks, tx_merkle_root commits to
+/// all transactions, poc_ticket commits to the slot winner proof.
+///
+/// Changing any transaction → merkle root changes → block hash changes →
+/// every subsequent block's prev_hash is wrong → the whole chain from that
+/// point forward is invalid.  Same domino-effect as Bitcoin's PoW chain.
+pub fn block_hash_for(
+    prev_hash:       &str,
+    height:          u64,
+    miner:           &str,
+    timestamp:       i64,
+    tx_merkle_root:  &str,
+    poc_ticket:      &str,
+) -> String {
+    let input = format!(
+        "ego/block/v2:{prev_hash}:{height}:{miner}:{timestamp}:{tx_merkle_root}:{poc_ticket}"
+    );
+    blake3::hash(input.as_bytes()).to_hex().to_string()
+}
+
 pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc_slot: u64) -> LedgerBlock {
     let db = get_db().lock().unwrap();
 
@@ -762,10 +783,9 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
     let height    = latest_height + 1;
     let timestamp = chrono::Utc::now().timestamp();
     let reward    = crate::tokenomics::block_reward_at(height);
-    let hash_input = format!("{prev_hash}{height}{miner}{timestamp}");
-    let hash = blake3::hash(hash_input.as_bytes()).to_hex().to_string();
 
-    // Coinbase transaction: credit the block reward to the miner.
+    // ── 1. Build all transactions first — merkle root must be computed
+    //       BEFORE the block hash so the hash commits to tx content.
     let coinbase_hash = format!("0x{}", blake3::hash(
         format!("coinbase:{height}:{miner}:{reward}:{timestamp}").as_bytes()
     ).to_hex());
@@ -783,7 +803,6 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
         ..LedgerTx::default()
     };
 
-    // Stamp block_height on each tx before writing.
     let mut stamped: Vec<LedgerTx> = txs.iter().map(|tx| {
         let mut t = tx.clone();
         t.block_height = Some(height);
@@ -792,8 +811,14 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
     }).collect();
     stamped.push(coinbase);
 
+    // ── 2. Merkle root over all txs in this block.
     let tx_hashes: Vec<&str> = stamped.iter().map(|t| t.hash.as_str()).collect();
     let tx_merkle_root = compute_merkle_root(&tx_hashes);
+
+    // ── 3. Block hash now commits to prev_hash + tx_merkle_root + poc_ticket.
+    //       Any change to any transaction breaks the merkle root, which breaks
+    //       this block's hash, which breaks every subsequent block's prev_hash.
+    let hash = block_hash_for(&prev_hash, height, miner, timestamp, &tx_merkle_root, poc_ticket);
 
     let block = LedgerBlock {
         height,
@@ -813,6 +838,46 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
 
     write_block_batch(&db, &block, &stamped);
     block
+}
+
+/// Verify that a block's hash field matches its contents.
+/// Returns false if the block was tampered with after production.
+pub fn verify_block_hash(block: &LedgerBlock, txs: &[crate::ledger::LedgerTx]) -> bool {
+    // Recompute merkle root from the actual txs.
+    let tx_hashes: Vec<&str> = txs.iter().map(|t| t.hash.as_str()).collect();
+    let expected_merkle = compute_merkle_root(&tx_hashes);
+
+    if !block.tx_merkle_root.is_empty() && block.tx_merkle_root != expected_merkle {
+        eprintln!(
+            "[ChainDB] Block #{} merkle root mismatch: stored={} computed={}",
+            block.height, &block.tx_merkle_root[..8], &expected_merkle[..8]
+        );
+        return false;
+    }
+
+    // Recompute block hash.
+    let expected_hash = block_hash_for(
+        &block.prev_hash, block.height, &block.miner,
+        block.timestamp, &expected_merkle, &block.poc_ticket,
+    );
+
+    // Accept v1 hashes (blocks mined before this fix) — they have no domain tag.
+    // A v1 hash won't start with the new format so we fall back gracefully.
+    let is_v2 = block.hash.len() == 64 && {
+        let v1_input = format!("{}{}{}{}", block.prev_hash, block.height, block.miner, block.timestamp);
+        let v1_hash  = blake3::hash(v1_input.as_bytes()).to_hex().to_string();
+        block.hash != v1_hash // if it doesn't match v1, it must be v2 or fake
+    };
+
+    if is_v2 && block.hash != expected_hash {
+        eprintln!(
+            "[ChainDB] Block #{} hash mismatch: stored={} expected={}",
+            block.height, &block.hash[..8], &expected_hash[..8]
+        );
+        return false;
+    }
+
+    true
 }
 
 /// Append a block received from a peer (gossip / sync path).
