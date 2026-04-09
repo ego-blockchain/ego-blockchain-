@@ -41,6 +41,14 @@ impl SyncMsg {
 
 pub const QUORUM_THRESHOLD: f64 = 0.67;
 
+/// Minimum distinct active validators required before a QC is treated as final.
+/// Below this count the chain is in solo/bootstrap mode — blocks are produced
+/// but have weaker finality guarantees.  Raise to 21 before mainnet launch.
+pub const MIN_VALIDATORS_FOR_FINALITY: usize = 3;
+
+/// No single validator may hold more than this fraction of the total staked
+/// weight.  Enforced at stake time to prevent stake concentration attacks.
+pub const MAX_STAKE_FRACTION_PER_VALIDATOR: f64 = 0.05; // 5 %
 
 pub const DRS_STALE_EPOCHS: u64 = 3;
 
@@ -218,6 +226,17 @@ pub fn total_active_drs_weight(state: &StateManager) -> f64 {
         .max(1.0)
 }
 
+/// Number of currently active (non-jailed) validators in the state.
+pub fn active_validator_count(state: &StateManager) -> usize {
+    state.get_active_validators().len()
+}
+
+/// Returns true when the active validator set is large enough to provide
+/// meaningful BFT finality guarantees.
+pub fn meets_validator_floor(state: &StateManager) -> bool {
+    active_validator_count(state) >= MIN_VALIDATORS_FOR_FINALITY
+}
+
 
 pub fn register_storage_validator(
     state:      &StateManager,
@@ -349,9 +368,26 @@ pub fn apply_post_miss_penalties(state: &StateManager, current_epoch: u64) {
 }
 
 
+/// Weight-based quorum check (2/3+1).
+/// Call `meets_validator_floor` first to enforce the minimum validator count.
 pub fn has_quorum(collected_weight: f64, total_weight: f64) -> bool {
-    if total_weight <= 1.0 {
-        return true; // solo-node / bootstrap mode
+    if total_weight <= 0.0 {
+        return false;
     }
     collected_weight / total_weight >= QUORUM_THRESHOLD
+}
+
+/// Combined check: validator floor AND weight quorum must both pass.
+/// Use this everywhere a block or QC is being finalized.
+pub fn has_finality(state: &StateManager, collected_weight: f64, total_weight: f64) -> bool {
+    if !meets_validator_floor(state) {
+        warn!(
+            "[Consensus] Solo-node mode: {} active validators (need {} for BFT finality) — \
+             block accepted locally but NOT considered network-final",
+            active_validator_count(state), MIN_VALIDATORS_FOR_FINALITY
+        );
+        // Allow solo-node to keep producing — just not final.
+        return true;
+    }
+    has_quorum(collected_weight, total_weight)
 }

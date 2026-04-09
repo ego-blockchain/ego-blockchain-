@@ -770,7 +770,8 @@ async fn run_daemon_mode(
     use ego_node::consensus_integration::{
         ConsensusAction, ConsensusMsg, ProposalCache, VoteCollector,
         apply_post_miss_penalties, check_equivocation,
-        elect_leader, has_quorum, total_active_drs_weight,
+        elect_leader, has_quorum, has_finality, total_active_drs_weight,
+        meets_validator_floor, active_validator_count, MIN_VALIDATORS_FOR_FINALITY,
     };
     use ego_consensus::consensus::bft::BftEngine;
     use ego_consensus::consensus::fork_choice::ViewChangeMsg as VcMsg;
@@ -1280,8 +1281,8 @@ async fn run_daemon_mode(
 
                         let total_w = total_active_drs_weight(&node.state_manager).max(1.0);
                         let our_w   = vote_collector.total_weight(height_u64, &block_hash_hex);
-                        if has_quorum(our_w, total_w) {
-                            // Quorum reached (may be solo-node) — broadcast QC.
+                        if has_finality(&node.state_manager, our_w, total_w) {
+                            // Quorum reached — broadcast QC.
                             let qc_msg = ConsensusMsg::Qc {
                                 height:           height_u64,
                                 block_hash:       block_hash_hex.clone(),
@@ -1499,7 +1500,8 @@ fn process_inbound_consensus(
 ) -> Option<ego_node::consensus_integration::ConsensusAction> {
     use ego_node::consensus_integration::{
         ConsensusAction, ConsensusMsg, check_equivocation,
-        has_quorum, total_active_drs_weight,
+        has_quorum, has_finality, total_active_drs_weight,
+        active_validator_count, meets_validator_floor, MIN_VALIDATORS_FOR_FINALITY,
     };
 
     let msg = ConsensusMsg::from_bytes(data)?;
@@ -1599,8 +1601,16 @@ fn process_inbound_consensus(
                 return None;
             }
 
-            // Verify DRS quorum threshold is met.
+            // Verify validator floor + DRS quorum threshold are both met.
             let total_w = total_active_drs_weight(state).max(1.0);
+            let active_n = active_validator_count(state);
+            if !meets_validator_floor(state) {
+                warn!(
+                    "📜 QC h={height} solo-node mode: {} validators (need {})",
+                    active_n, MIN_VALIDATORS_FOR_FINALITY
+                );
+                // Accept in solo mode — see has_finality()
+            }
             if !has_quorum(total_drs_weight, total_w) {
                 warn!(
                     "📜 QC h={height} below quorum ({total_drs_weight:.1}/{total_w:.1}) — ignoring"

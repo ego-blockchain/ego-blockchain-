@@ -10,6 +10,10 @@ use tokio::sync::Notify;
 pub const SHARD_COUNT: u32   = 16;
 pub const BATCH_SIZE:  usize = 625;
 
+/// Minimum stakers (validators) required before the chain has BFT finality.
+/// Below this count blocks are produced in solo mode.
+pub const MIN_VALIDATORS_FOR_FINALITY: usize = 3;
+
 /// After the first tx lands, wait this long to collect more before sealing.
 pub const BATCH_WINDOW_MS: u64 = 3_000;
 
@@ -269,6 +273,18 @@ pub async fn run_batch_loop() {
             Some(a) => a,
             None    => continue,
         };
+
+        // Log a warning when producing blocks without enough validators for
+        // BFT finality — operators should see this until real validators join.
+        let active_validators = crate::ledger::active_validator_count();
+        if active_validators < MIN_VALIDATORS_FOR_FINALITY {
+            eprintln!(
+                "[Consensus] ⚠ Solo-node mode: {} active validator(s) \
+                 (need {} for BFT finality) — block will be accepted locally \
+                 but chain is not Byzantine-fault-tolerant yet",
+                active_validators, MIN_VALIDATORS_FOR_FINALITY
+            );
+        }
 
         let txs = pool.drain_all();
         try_mine(txs, &miner).await;
