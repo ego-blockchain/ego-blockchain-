@@ -757,6 +757,16 @@ pub fn get_validator_stake(addr: &str) -> u64 {
     *stake_store().get(addr).unwrap_or(&0)
 }
 
+/// Sum of all active stake across all known validators.
+pub fn total_network_stake() -> u64 {
+    stake_store().values().sum()
+}
+
+/// Number of addresses with non-zero stake (each is a potential validator).
+pub fn active_validator_count() -> usize {
+    stake_store().values().filter(|&&s| s > 0).count()
+}
+
 pub fn verify_incoming_tx(tx: &LedgerTx) -> Result<(), String> {
     verify_incoming_tx_with_miner(tx, "")
 }

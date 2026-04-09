@@ -7,6 +7,16 @@ use tauri::State;
 
 const STAKING_ADDR: &str = "egot1staking000000000000000000000000000000000";
 
+/// Maximum share of total network stake any single validator may hold (5%).
+/// Prevents stake concentration attacks — an attacker controlling >33% of
+/// stake could halt the chain; >67% could corrupt it.
+const MAX_STAKE_FRACTION: f64 = 0.05;
+
+/// Minimum number of validators before the concentration cap is enforced.
+/// Below this floor we want MORE validators to join, not fewer — so we
+/// skip the cap entirely to allow the network to bootstrap.
+const MIN_VALIDATORS_BEFORE_CAP: usize = 3;
+
 /// Returns effective APR in basis points including lock-period bonus.
 /// Matches the LOCK_OPTIONS bonuses shown in the frontend.
 ///   30 days  →  0 bp bonus → 12.50%
@@ -124,6 +134,39 @@ pub async fn stake_coins(
             "Insufficient balance: have {} uEGOC, need {}",
             balance, amount_uegoc
         )));
+    }
+
+    // ── Per-validator stake concentration cap ─────────────────────────────
+    // Once the network has MIN_VALIDATORS_BEFORE_CAP active stakers, no
+    // single validator may hold more than MAX_STAKE_FRACTION of total stake.
+    // This means an attacker always needs to compromise many independent
+    // parties to reach the 33% halt threshold.
+    {
+        let active_count = crate::ledger::active_validator_count();
+        if active_count >= MIN_VALIDATORS_BEFORE_CAP {
+            let total_staked = crate::ledger::total_network_stake();
+            let existing_stake = crate::ledger::get_validator_stake(&from);
+            // What the network total will be after this stake is added.
+            let new_network_total = total_staked
+                .saturating_add(amount_uegoc)
+                .saturating_sub(existing_stake); // don't double-count own existing stake
+            let new_this_stake = existing_stake.saturating_add(amount_uegoc);
+            let max_allowed = (new_network_total as f64 * MAX_STAKE_FRACTION) as u64;
+            if new_this_stake > max_allowed {
+                return Err(EgoDesktopError::InvalidInput(format!(
+                    "Stake would exceed the per-validator cap of {}% of total network stake. \
+                     Your stake: {:.4} EGOC → max allowed: {:.4} EGOC \
+                     ({}% of {:.2} EGOC total). \
+                     This limit prevents any single validator from controlling \
+                     enough stake to attack the network.",
+                    (MAX_STAKE_FRACTION * 100.0) as u32,
+                    new_this_stake as f64 / 1_000_000.0,
+                    max_allowed as f64 / 1_000_000.0,
+                    (MAX_STAKE_FRACTION * 100.0) as u32,
+                    new_network_total as f64 / 1_000_000.0,
+                )));
+            }
+        }
     }
 
     let nonce      = ledger.nonce + 1;
@@ -341,4 +384,36 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
     }
 
     Ok(())
+}
+
+// ── Consensus health ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct ConsensusHealth {
+    pub active_validators:       usize,
+    pub min_validators_required: usize,
+    pub is_bft_ready:            bool,
+    pub total_staked_uegoc:      u64,
+    pub max_stake_fraction_pct:  u32,
+    pub my_stake_uegoc:          u64,
+    pub my_stake_pct:            f64,
+}
+
+#[tauri::command]
+pub async fn get_consensus_health() -> Result<ConsensusHealth, EgoDesktopError> {
+    let ledger   = crate::ledger::Ledger::load();
+    let active   = crate::ledger::active_validator_count();
+    let total    = crate::ledger::total_network_stake();
+    let my_stake = crate::ledger::get_validator_stake(&ledger.address);
+    let my_pct   = if total > 0 { my_stake as f64 / total as f64 * 100.0 } else { 0.0 };
+
+    Ok(ConsensusHealth {
+        active_validators:       active,
+        min_validators_required: crate::mempool::MIN_VALIDATORS_FOR_FINALITY,
+        is_bft_ready:            active >= crate::mempool::MIN_VALIDATORS_FOR_FINALITY,
+        total_staked_uegoc:      total,
+        max_stake_fraction_pct:  (MAX_STAKE_FRACTION * 100.0) as u32,
+        my_stake_uegoc:          my_stake,
+        my_stake_pct:            my_pct,
+    })
 }
