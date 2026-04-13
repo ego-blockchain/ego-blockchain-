@@ -194,11 +194,13 @@ pub async fn stake_coins(
         ..LedgerTx::default()
     });
 
-    ledger.staked_amount    = amount_uegoc;
-    ledger.staked_at        = Some(ts);
-    ledger.stake_lock_days  = lock_days;
-    ledger.unstake_at       = Some(ts + (lock_days as i64 * 24 * 3600));
-    ledger.nonce            = nonce;
+    ledger.staked_amount         = amount_uegoc;
+    ledger.staked_at             = Some(ts);
+    ledger.stake_lock_days       = lock_days;
+    ledger.unstake_at            = Some(ts + (lock_days as i64 * 24 * 3600));
+    ledger.nonce                 = nonce;
+    // Record the TX hash so startup reconciliation can verify it was actually mined.
+    ledger.pending_stake_tx_hash = tx_hash.clone();
     ledger.save().map_err(EgoDesktopError::FileSystemError)?;
 
     // The on-chain stake TX (already pushed above) is the source of truth for
@@ -319,11 +321,12 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
             ..LedgerTx::default()
         });
 
-        ledger.staked_amount   = 0;
-        ledger.staked_at       = None;
-        ledger.stake_lock_days = 0;
-        ledger.unstake_at      = None;
-        ledger.nonce           = ledger.nonce + 3;
+        ledger.staked_amount         = 0;
+        ledger.staked_at             = None;
+        ledger.stake_lock_days       = 0;
+        ledger.unstake_at            = None;
+        ledger.pending_stake_tx_hash = String::new();
+        ledger.nonce                 = ledger.nonce + 3;
         ledger.save().map_err(EgoDesktopError::FileSystemError)?;
         // On-chain unstake TX (memo="unstake") is the source of truth for the relay.
     } else {
@@ -374,11 +377,12 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
             public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
             ..LedgerTx::default()
         });
-        ledger.staked_amount   = 0;
-        ledger.staked_at       = None;
-        ledger.stake_lock_days = 0;
-        ledger.unstake_at      = None;
-        ledger.nonce           = unstake_nonce + 1;
+        ledger.staked_amount         = 0;
+        ledger.staked_at             = None;
+        ledger.stake_lock_days       = 0;
+        ledger.unstake_at            = None;
+        ledger.pending_stake_tx_hash = String::new();
+        ledger.nonce                 = unstake_nonce + 1;
         ledger.save().map_err(EgoDesktopError::FileSystemError)?;
         // On-chain unstake TX (memo="unstake") is the source of truth for the relay.
     }

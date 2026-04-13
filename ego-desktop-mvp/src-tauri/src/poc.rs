@@ -24,21 +24,26 @@ static PEER_SCORES: OnceCell<Mutex<HashMap<String, u64>>> = OnceCell::new();
 const MAX_PEER_SCORES: usize = 50_000;
 
 fn peer_scores() -> std::sync::MutexGuard<'static, HashMap<String, u64>> {
-    PEER_SCORES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
+    PEER_SCORES.get_or_init(|| Mutex::new(HashMap::new())).lock().expect("peer_scores lock poisoned")
 }
 
-/// Store a coverage score received from a peer via PeerAnnounce.
-/// Capped at MAX_PEER_SCORES entries to prevent unbounded memory growth.
+/// Get the last known coverage score for a peer address.
+pub fn get_peer_score(addr: &str) -> u64 {
+    peer_scores().get(addr).copied().unwrap_or(0)
+}
+
+pub const MAX_COVERAGE_SCORE: u64 = 3_220; // 2000 storage + 720 uptime + 500 relay
+
 pub fn record_peer_score(address: &str, score: u64) {
     if address.is_empty() || score == 0 { return; }
+    let capped = score.min(MAX_COVERAGE_SCORE);
     let mut map = peer_scores();
     if map.len() >= MAX_PEER_SCORES && !map.contains_key(address) {
-        // Evict the lowest-scoring peer to make room.
         if let Some(min_key) = map.iter().min_by_key(|(_, v)| *v).map(|(k, _)| k.clone()) {
             map.remove(&min_key);
         }
     }
-    map.insert(address.to_string(), score);
+    map.insert(address.to_string(), capped);
 }
 
 /// Estimated total network coverage = sum of all known peer scores + this node.
@@ -102,18 +107,30 @@ pub fn check_slot_winner(prev_hash: &str) -> Option<(String, String)> {
     let ledger = crate::ledger::Ledger::load();
     if ledger.address.is_empty() { return None; }
 
-    let slot  = current_slot();
-    let seed  = slot_seed(prev_hash, slot);
+    let slot = current_slot();
+    let seed = slot_seed(prev_hash, slot);
     let (ticket, sig_hex) = compute_ticket(&seed)?;
 
-    let my_score  = my_coverage_score();
-    let net_score = network_coverage_score(my_score);
+    // ── DRS-weighted lottery (same metric as BFT proposer election) ──────────
+    // Previously used coverage-only weights, which diverged from the BFT VRF
+    // (which uses DRS = stake + coverage).  Using DRS here ensures the PoC
+    // ticket lottery and the BFT consensus lottery agree on who is eligible.
+    let all_validators = crate::p2p::get_known_validators_snapshot();
+    let my_drs    = crate::bft_committee::compute_drs_weight(&ledger.address);
+    let total_drs = if all_validators.is_empty() {
+        // No peers known yet (bootstrap) — use coverage-only fallback so
+        // the genesis node can still produce blocks.
+        let my_score = my_coverage_score();
+        my_score as f64 / 10.0 // same COVERAGE_PER_WEIGHT as bft_committee
+    } else {
+        crate::bft_committee::total_drs_weight(&all_validators)
+    };
 
-    if ticket_wins(&ticket, my_score, net_score) {
+    if crate::bft_committee::qualifies_proposer(&ticket, my_drs, total_drs) {
         let ticket_hex = hex::encode(ticket);
         eprintln!(
-            "[PoC] Won slot {} — coverage {}/{} — ticket {}…",
-            slot, my_score, net_score, &ticket_hex[..16]
+            "[PoC] Won slot {} — DRS {:.2}/{:.2} — ticket {}…",
+            slot, my_drs, total_drs, &ticket_hex[..16]
         );
         Some((ticket_hex, sig_hex))
     } else {
@@ -121,7 +138,10 @@ pub fn check_slot_winner(prev_hash: &str) -> Option<(String, String)> {
     }
 }
 
-const POC_ENFORCE_HEIGHT: u64 = 500;
+// Enforce PoC tickets from block 1 onward — zero bootstrap window.
+// Any block produced without a valid PoC ticket (and without being the genesis
+// block 0) is rejected.  Validators must be live before proposing.
+const POC_ENFORCE_HEIGHT: u64 = 1;
 
 pub fn verify_ticket(
     ticket_hex:   &str,
@@ -156,9 +176,7 @@ pub fn verify_ticket(
     let ed25519_pk = crate::p2p::get_peer_ed25519_pubkey(proposer);
     match ed25519_pk {
         None => {
-            // Pubkey not yet in peer cache.
-            // Below enforcement height we allow it (bootstrap phase).
-            // Above it we reject — an unknown proposer could be an attacker.
+
             if block_height < POC_ENFORCE_HEIGHT {
                 return true;
             }

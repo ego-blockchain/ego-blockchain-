@@ -3,6 +3,7 @@ use crate::{
     Account, Address, AlgorithmId, Balance, BlockHeight, DualSignature, EgoError, EgoResult,
     EpochNumber, Hash, PublicKey, ShardId, StateManager, Timestamp, Transaction, TransactionResult,
 };
+use crate::types::{hex_bytes, hex_bytes32, opt_hex_bytes};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -41,7 +42,9 @@ pub struct BlockHeaderCore {
     pub chain_id: u32,
     pub network_id: u32,
     pub pq_signature_count: PQSignatureCount,
+    #[serde(with = "hex_bytes32")]
     pub vrf_output: [u8; 32],
+    #[serde(with = "opt_hex_bytes")]
     pub vrf_proof: Option<Vec<u8>>,
 }
 
@@ -70,12 +73,14 @@ pub struct QuorumCert {
     pub height: BlockHeight,
     pub block_hash: Hash,
     pub signatures: Vec<ValidatorSignature>,
+    #[serde(with = "opt_hex_bytes")]
     pub aggregated_signature: Option<Vec<u8>>,
     pub voting_power: u64,
     pub timestamp: Timestamp,
     pub pq_compliant: bool,
     pub validator_set_id: u64,
     pub round: u64,
+    #[serde(with = "hex_bytes")]
     pub bitmap: Vec<u8>,
     pub signatures_root: Hash,
 }
@@ -230,8 +235,10 @@ pub struct RollupCommitment {
     pub operator_signature: DualSignature,
     pub operator: Address,
     pub timestamp: Timestamp,
+    #[serde(with = "hex_bytes")]
     pub proof_data: Vec<u8>,
     pub fraud_proof_window: u64,
+    #[serde(with = "hex_bytes")]
     pub min_validity_proof: Vec<u8>,
     pub epoch: u64,
 }
@@ -241,6 +248,7 @@ pub struct CrossShardReceipt {
     pub from_shard: ShardId,
     pub to_shard: ShardId,
     pub nonce: u64,
+    #[serde(with = "hex_bytes")]
     pub payload: Vec<u8>,
     pub source_tx_hash: Hash,
     pub timestamp: Timestamp,
@@ -341,6 +349,7 @@ pub struct DensityEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct FraudProof {
     pub claim_hash: Hash,
+    #[serde(with = "hex_bytes")]
     pub proof_data: Vec<u8>,
     pub challenge_period_epochs: u64,
     pub fraud_type: FraudType,

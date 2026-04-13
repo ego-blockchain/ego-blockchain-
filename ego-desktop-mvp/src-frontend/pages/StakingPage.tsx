@@ -153,7 +153,12 @@ const StakingPage: React.FC = () => {
   return (
     <div className="p-6 space-y-5 max-w-4xl mx-auto">
       {ConfirmDialog}
-      {}
+
+      <div className="flex items-center gap-2">
+        <h1 className="text-xl font-bold">Staking</h1>
+        <span className="text-yellow-400 text-[10px] font-bold bg-yellow-400/15 px-1.5 py-px rounded">TEST</span>
+      </div>
+
       <div className="grid grid-cols-5 gap-3">
         {[
           { label: 'Staked',              val: `${fmtEgoc(info?.staked_amount ?? 0)} EGOC`,                                  color: 'text-blue-400'   },
@@ -426,7 +431,9 @@ const StakingPage: React.FC = () => {
 
           {}
           <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
-            <h3 className="font-semibold mb-4">EGOC Tokenomics</h3>
+            <h3 className="font-semibold mb-4 flex items-center gap-2">EGOC Tokenomics
+              <span className="text-yellow-400 text-[9px] font-bold bg-yellow-400/15 px-1.5 py-px rounded">TEST</span>
+            </h3>
             {tokenomics ? (
               <div className="space-y-3 text-sm">
                 <div className="flex justify-between">

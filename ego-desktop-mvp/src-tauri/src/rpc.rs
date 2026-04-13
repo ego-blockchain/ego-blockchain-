@@ -234,6 +234,87 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
             }))
         }
 
+        // ── Ethereum-compatible JSON-RPC (EIP-1474 subset) ────────────────────
+        // Allows standard Ethereum tooling (MetaMask, ethers.js, cast, etc.)
+        // to connect to the Ego network via chain ID 1399.
+
+        "net_version" => RpcResponse::ok(req.id, json!("1399")),
+
+        "eth_chainId" => RpcResponse::ok(req.id, json!("0x577")), // 1399
+
+        "eth_blockNumber" => {
+            let h = crate::chain_db::get_network_stats_db().block_count;
+            RpcResponse::ok(req.id, json!(format!("0x{:x}", h)))
+        }
+
+        "eth_getBalance" => {
+            // params: [address, block_tag]
+            let addr = p[0].as_str().unwrap_or_default();
+            let bal  = crate::chain_db::balance_of(addr);
+            // Return balance as hex wei (1 uEGOC = 1e12 wei to fit ERC-20 18-decimal convention)
+            RpcResponse::ok(req.id, json!(format!("0x{:x}", bal as u128 * 1_000_000_000_000u128)))
+        }
+
+        "eth_getTransactionCount" => {
+            // Return nonce from ledger if it matches our wallet, else 0.
+            let ledger = crate::ledger::Ledger::load();
+            let nonce = if p[0].as_str().unwrap_or_default() == ledger.address {
+                ledger.nonce
+            } else { 0 };
+            RpcResponse::ok(req.id, json!(format!("0x{:x}", nonce)))
+        }
+
+        "eth_gasPrice" => {
+            // Ego uses RU (resource units), not gas. Return 1 Gwei as a convention.
+            RpcResponse::ok(req.id, json!("0x3b9aca00")) // 1 Gwei
+        }
+
+        "eth_estimateGas" => {
+            // Stub: return standard ETH transfer gas (21 000).
+            RpcResponse::ok(req.id, json!("0x5208"))
+        }
+
+        "eth_getBlockByNumber" | "eth_getBlockByHash" => {
+            let stats = crate::chain_db::get_network_stats_db();
+            let h = stats.block_count.saturating_sub(1);
+            RpcResponse::ok(req.id, json!({
+                "number":           format!("0x{:x}", h),
+                "hash":             format!("0x{:064x}", h),
+                "parentHash":       format!("0x{:064x}", h.saturating_sub(1)),
+                "transactionsRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "transactions":     [],
+                "gasLimit":         "0x1c9c380",
+                "gasUsed":          "0x0",
+                "timestamp":        format!("0x{:x}", chrono::Utc::now().timestamp()),
+            }))
+        }
+
+        "eth_sendRawTransaction" => {
+            // EVM-encoded transactions are not yet supported; use wallet.send instead.
+            RpcResponse::err(req.id, -32003,
+                "EVM raw transactions not supported. Use the Ego native wallet.send method.")
+        }
+
+        "eth_call" => {
+            // Read-only contract state query via ego_vm.
+            let to     = p["to"].as_str().unwrap_or_default();
+            let prefix = p["data"].as_str().unwrap_or("state");
+            if to.is_empty() {
+                return RpcResponse::err(req.id, -32602, "Missing 'to' field");
+            }
+            let exec = ego_vm::Executor::new(crate::ledger::contracts_dir());
+            let val  = exec.ok().and_then(|e| {
+                let state = e.store.load_state(to);
+                state.get(prefix, "value").map(hex::encode)
+            });
+            RpcResponse::ok(req.id, json!(val.unwrap_or_else(|| "0x".into())))
+        }
+
+        "eth_getLogs" => {
+            // Return an empty log set; full log indexing is on the roadmap.
+            RpcResponse::ok(req.id, json!([]))
+        }
+
         _ => RpcResponse::err(req.id, -32601, &format!("Method not found: {}", req.method)),
     }
 }

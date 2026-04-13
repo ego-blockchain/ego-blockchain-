@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod bft_committee;
 mod blocks;
 mod chain_db;
 mod commands;
@@ -100,6 +101,21 @@ fn acquire_single_instance_lock() -> bool {
 }
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    {
+        extern "system" {
+            fn SetStdHandle(nStdHandle: u32, hHandle: isize) -> i32;
+        }
+        const STD_ERROR_HANDLE: u32 = 0xFFFFFFF4;
+        let log_path = crate::ledger::base_data_dir().join("ego.log");
+        let _ = std::fs::create_dir_all(log_path.parent().unwrap_or(std::path::Path::new(".")));
+        if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            use std::os::windows::io::IntoRawHandle;
+            let handle = file.into_raw_handle() as isize;
+            unsafe { SetStdHandle(STD_ERROR_HANDLE, handle); }
+        }
+    }
+
     #[cfg(target_os = "windows")]
     register_windows_notifications();
 
@@ -332,7 +348,10 @@ fn main() {
             commands::governance::cast_stake_vote,
             commands::governance::grade_knowledge_test,
             commands::governance::cast_knowledge_vote,
-            commands::governance::get_proposal_results
+            commands::governance::get_proposal_results,
+            commands::governance::vote_ban_proposer,
+            commands::governance::get_ban_status,
+            commands::governance::get_proposal_rate_limit
         ])
         .setup(|app| {
 
@@ -404,6 +423,10 @@ fn main() {
                 } else {
                     eprintln!("[Startup] ✗ No endpoint — check network");
                 }
+
+                // Restore in-memory nonce + stake stores from RocksDB so replay
+                // protection and validator stake tracking survive node restarts.
+                crate::chain_db::restore_in_memory_state_from_db();
 
                 crate::p2p::fetch_and_cache_egoc_price().await;
 
@@ -517,6 +540,10 @@ fn main() {
 
             tauri::async_runtime::spawn(async move {
                 crate::p2p::run_view_change_monitor().await;
+            });
+
+            tauri::async_runtime::spawn(async move {
+                crate::p2p::run_porep_challenge_loop().await;
             });
 
             #[cfg(debug_assertions)]

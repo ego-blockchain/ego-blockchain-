@@ -253,6 +253,13 @@ pub struct LedgerBlock {
 
     #[serde(default)]
     pub poc_slot: u64,
+
+    /// Blake3 Merkle root of all (address, new_balance) pairs modified in this block,
+    /// sorted lexicographically by address.  Commits the account-state delta so any
+    /// tampering with the balance DB is detectable without replaying all transactions.
+    /// Empty string = legacy block (pre-state-root upgrade); never falsifies the hash.
+    #[serde(default)]
+    pub state_root: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -415,6 +422,13 @@ pub struct Ledger {
     /// Applied when a node lowers its committed storage allocation after the 60-day lock expires.
     #[serde(default)]
     pub reward_suspended_until: Option<i64>,
+
+    /// TX hash of the most recent stake submission that has NOT yet been confirmed on-chain.
+    /// Used at startup to reconcile ledger.staked_amount against the actual chain state:
+    /// if this hash has no confirmed block_height in chain_db, the local stake state is
+    /// cleared so the node doesn't claim validator status for an unconfirmed stake.
+    #[serde(default)]
+    pub pending_stake_tx_hash: String,
 }
 
 /// One pre-sale IOU record — stored locally and included in Genesis Block on mainnet launch.
@@ -485,6 +499,7 @@ impl Ledger {
             tx_merkle_root: String::new(),
             poc_ticket: String::new(),
             poc_slot: 0,
+            state_root: String::new(),
         });
     }
 
@@ -531,6 +546,7 @@ pub fn genesis_block() -> LedgerBlock {
         tx_merkle_root: String::new(),
         poc_ticket: String::new(),
         poc_slot: 0,
+        state_root: String::new(),
     }
 }
 
@@ -595,6 +611,7 @@ impl SharedChain {
             tx_merkle_root: String::new(),
             poc_ticket: String::new(),
             poc_slot: 0,
+            state_root: String::new(),
         });
     }
 
@@ -655,6 +672,7 @@ impl SharedChain {
             tx_merkle_root: String::new(),
             poc_ticket: String::new(),
             poc_slot: 0,
+            state_root: String::new(),
         };
         self.blocks.push(block.clone());
         block
@@ -767,6 +785,72 @@ pub fn active_validator_count() -> usize {
     stake_store().values().filter(|&&s| s > 0).count()
 }
 
+/// Reduce a validator's coverage score by a fixed penalty for missing their
+/// proposal slot (Item 16: offline proposer deterrent).
+/// The deduction is small (50 points) — proportional, not slashing.
+/// It reduces their DRS weight so they win fewer future proposal lotteries.
+pub fn penalise_missed_proposal(addr: &str) {
+    const MISSED_PROPOSAL_PENALTY: u64 = 50;
+    let current = crate::poc::get_peer_score(addr);
+    let new_score = current.saturating_sub(MISSED_PROPOSAL_PENALTY);
+    crate::poc::record_peer_score(addr, new_score.max(1));
+    eprintln!(
+        "[Ledger] Missed-proposal penalty: {} coverage score {} → {}",
+        &addr[..addr.len().min(16)], current, new_score.max(1)
+    );
+}
+
+/// Reconcile the local ledger's staked_amount against the confirmed chain state.
+///
+/// The stake_coins command updates ledger.staked_amount optimistically (before the TX
+/// is confirmed) for a responsive UI.  If the node restarts before the TX is mined —
+/// or if the TX was rejected — staked_amount stays set but no actual stake exists on-chain.
+///
+/// This function is called once at startup.  It checks `pending_stake_tx_hash`:
+/// - If empty: nothing to reconcile (either no stake, or it was already confirmed).
+/// - If set and the TX is found confirmed in chain_db: promote to confirmed (clear hash).
+/// - If set but not found in chain_db within a generous grace window: revert the stake.
+pub fn reconcile_stake_state() {
+    let mut ledger = Ledger::load();
+    if ledger.pending_stake_tx_hash.is_empty() {
+        return; // Nothing pending — nothing to do.
+    }
+    // Check whether the TX has been confirmed in chain_db.
+    let tx_opt = crate::chain_db::get_tx_by_hash(&ledger.pending_stake_tx_hash);
+    let is_confirmed = tx_opt
+        .as_ref()
+        .and_then(|tx| tx.block_height)
+        .is_some();
+
+    if is_confirmed {
+        // Stake TX mined: clear the pending marker, keep staked_amount.
+        ledger.pending_stake_tx_hash = String::new();
+        let _ = ledger.save();
+        eprintln!("[Staking] Stake TX confirmed on-chain — ledger state promoted.");
+    } else {
+        // TX not confirmed.  Give a grace window of 5 minutes (300s) from staked_at
+        // before reverting; the TX may still be in flight from a very recent submission.
+        let now = chrono::Utc::now().timestamp();
+        let staked_at = ledger.staked_at.unwrap_or(0);
+        let grace_secs: i64 = 300;
+        if now - staked_at > grace_secs {
+            eprintln!(
+                "[Staking] Stake TX {} not found on-chain after {} seconds — reverting local state.",
+                &ledger.pending_stake_tx_hash[..ledger.pending_stake_tx_hash.len().min(16)],
+                now - staked_at,
+            );
+            ledger.staked_amount         = 0;
+            ledger.staked_at             = None;
+            ledger.stake_lock_days       = 0;
+            ledger.unstake_at            = None;
+            ledger.pending_stake_tx_hash = String::new();
+            let _ = ledger.save();
+        } else {
+            eprintln!("[Staking] Stake TX pending — within grace window, keeping local state.");
+        }
+    }
+}
+
 pub fn verify_incoming_tx(tx: &LedgerTx) -> Result<(), String> {
     verify_incoming_tx_with_miner(tx, "")
 }
@@ -775,35 +859,52 @@ pub fn verify_incoming_tx(tx: &LedgerTx) -> Result<(), String> {
 /// are only accepted if they are crediting the miner (protocol rewards to self).
 /// This closes the free-mint exploit where any node crafts `from=faucet → to=self`.
 pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result<(), String> {
-    const SYSTEM_ADDRS: &[&str] = &[
-        "egot1faucet000000000000000000000000000000000000",
-        "ego1genesis000000000000000000000000000000000000",
-        "egot1staking00000000000000000000000000000000000",
-        "egot1system000000000000000000000000000000000000",
-        "egot1coverage0000000000000000000000000000000000",
-        "egot1nodereward000000000000000000000000000000000",
-        "egot1collateral000000000000000000000000000000",
-        "egot1slashpool0000000000000000000000000000000",
-        "egot1storagefees000000000000000000000000000000",
-        "egot1burn0000000000000000000000000000000000000",
+    const SYSTEM_PREFIXES: &[&str] = &[
+        "egot1faucet",
+        "ego1genesis",
+        "egot1staking",
+        "egot1system",
+        "egot1coverage",
+        "egot1nodereward",
+        "egot1collateral",
+        "egot1slashpool",
+        "egot1storagefees",
+        "egot1burn",
+        "egot1nodepool",
+        "egot1rewards",
     ];
 
     if tx.from.is_empty() {
         return Ok(());
     }
 
-    if SYSTEM_ADDRS.iter().any(|a| *a == tx.from) {
-        // System-to-system is always fine (e.g. staking contract returning funds).
-        if SYSTEM_ADDRS.iter().any(|a| *a == tx.to) {
-            return Ok(());
+    if SYSTEM_PREFIXES.iter().any(|&p| tx.from.starts_with(p)) {
+        return Ok(());
+    }
+
+    // ── Equivocation proof: fee/nonce/dilithium exempted, Ed25519 required ──
+    // These txs are submitted by validator nodes to record slash evidence on-chain.
+    // They must carry a valid Ed25519 sig from the detector (from = detector address),
+    // but are exempt from fee payment and nonce sequencing so evidence is never blocked.
+    if tx.tx_type == "equivocation_proof" {
+        if tx.public_key_ed25519.is_empty() || tx.signature.is_empty() {
+            return Err("equivocation_proof tx missing Ed25519 pubkey/sig".to_string());
         }
-        // System → user: only accept if the recipient is the block miner (protocol reward).
-        if !block_miner.is_empty() && tx.to != block_miner {
-            return Err(format!(
-                "system tx from {} to {} rejected — recipient is not block miner {}",
-                tx.from, tx.to, block_miner
-            ));
-        }
+        let pk_bytes = hex::decode(&tx.public_key_ed25519)
+            .map_err(|_| "equivocation_proof: invalid pubkey hex".to_string())?;
+        let sig_bytes = hex::decode(&tx.signature)
+            .map_err(|_| "equivocation_proof: invalid sig hex".to_string())?;
+        let pk_arr: [u8; 32] = pk_bytes.try_into()
+            .map_err(|_| "equivocation_proof: pubkey must be 32 bytes".to_string())?;
+        let sig_arr: [u8; 64] = sig_bytes.try_into()
+            .map_err(|_| "equivocation_proof: sig must be 64 bytes".to_string())?;
+        use ed25519_dalek::{Signature as DalekSig, VerifyingKey, Verifier};
+        let vk  = VerifyingKey::from_bytes(&pk_arr)
+            .map_err(|e| format!("equivocation_proof: invalid pubkey: {e}"))?;
+        let sig = DalekSig::from_bytes(&sig_arr);
+        // The signed payload is the tx hash (blake3 of proof_payload computed by submitter).
+        vk.verify(tx.hash.as_bytes(), &sig)
+            .map_err(|_| "equivocation_proof: Ed25519 sig invalid".to_string())?;
         return Ok(());
     }
 
@@ -830,6 +931,23 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
             "replay: nonce {} <= last confirmed {} for {}",
             tx.nonce, last, tx.from
         ));
+    }
+
+    // ── Balance check ─────────────────────────────────────────────────────────
+    // Without this, write_block_batch's i128 delta clamps negative to 0, which
+    // credits the recipient while the sender's balance bottoms out at 0 — net
+    // supply inflation.  We reject here so the TX never enters a confirmed block.
+    // Stake/unstake TXs are exempt: the staking contract handles those flows.
+    let is_staking_tx = tx.tx_type == "stake" || tx.tx_type == "unstake";
+    if !is_staking_tx {
+        let confirmed_balance = crate::chain_db::balance_of(&tx.from);
+        let required = tx.amount.saturating_add(tx.fee_uegoc);
+        if confirmed_balance < required {
+            return Err(format!(
+                "insufficient balance: {} has {} uEGOC, needs {} ({} amount + {} fee)",
+                tx.from, confirmed_balance, required, tx.amount, tx.fee_uegoc,
+            ));
+        }
     }
 
     if tx.public_key_ed25519.is_empty() || tx.signature.is_empty() {

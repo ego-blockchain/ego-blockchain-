@@ -3,9 +3,10 @@ use crate::app::AppState;
 use crate::error::EgoDesktopError;
 use crate::chain_db::{
     GovernanceProposal, FEATURE_DILITHIUM_DISABLED, FEATURE_DILITHIUM_REQUIRED,
-    DaoProposalPublic, DaoProposalResults,
+    DaoProposalPublic, DaoProposalResults, ProposerBanStatus,
     store_dao_proposal, get_dao_proposal_public, list_dao_proposals,
     cast_dao_stake_vote, grade_dao_knowledge_test, cast_dao_knowledge_vote, get_dao_results,
+    vote_remove_proposer, get_proposer_ban_status, is_proposer_banned,
     DaoProposal, DaoKnowledgeTest, DaoTestQuestion,
 };
 use crate::ledger::{tx_signing_bytes, LedgerTx, Ledger};
@@ -94,6 +95,9 @@ fn now_ts() -> i64 {
         .as_secs() as i64
 }
 
+const MAX_PROPOSALS_PER_WINDOW: usize = 5;
+const WINDOW_SECS: i64 = 4 * 3600; // 4 hours
+
 /// Create a new community DAO proposal. Any wallet holder can submit.
 #[tauri::command]
 pub async fn create_dao_proposal(
@@ -114,6 +118,32 @@ pub async fn create_dao_proposal(
     }
     if options.len() < 2 {
         return Err(EgoDesktopError::InvalidInput("At least 2 options required".into()));
+    }
+
+    // Enforce 4-hour sliding window rate limit (max 5 proposals per window)
+    let now_ts_val = now_ts();
+    let window_start = now_ts_val - WINDOW_SECS;
+    let all = list_dao_proposals(Some("all"), None);
+    let recent_times: Vec<i64> = all.iter()
+        .filter(|p| p.creator == creator && p.created_at >= window_start)
+        .map(|p| p.created_at)
+        .collect();
+    if recent_times.len() >= MAX_PROPOSALS_PER_WINDOW {
+        let oldest = recent_times.iter().copied().min().unwrap_or(now_ts_val);
+        let resets_in = (oldest + WINDOW_SECS) - now_ts_val;
+        let h = resets_in / 3600;
+        let m = (resets_in % 3600) / 60;
+        return Err(EgoDesktopError::InvalidInput(format!(
+            "Rate limit: {} proposals per 4 hours. Next slot opens in {}h {}m.",
+            MAX_PROPOSALS_PER_WINDOW, h, m
+        )));
+    }
+
+    // Enforce proposer ban
+    if is_proposer_banned(&creator) {
+        return Err(EgoDesktopError::InvalidInput(
+            "Your address has been banned from submitting proposals by community vote.".into()
+        ));
     }
     let known_types = ["protocol", "resource", "feature", "parameter", "tender"];
     if !known_types.contains(&proposal_type.as_str()) {
@@ -231,4 +261,56 @@ pub async fn cast_knowledge_vote(
 pub fn get_proposal_results(proposal_id: String) -> Result<DaoProposalResults, EgoDesktopError> {
     get_dao_results(&proposal_id)
         .ok_or(EgoDesktopError::WalletError("Proposal not found".into()))
+}
+
+/// Cast a removal vote against a proposer's address (max 1 per voter).
+/// Once 10 unique voters flag an address, it is banned from creating proposals.
+#[tauri::command]
+pub fn vote_ban_proposer(target_address: String) -> Result<ProposerBanStatus, EgoDesktopError> {
+    let ledger = Ledger::load();
+    let voter = ledger.address.clone();
+    if voter.is_empty() {
+        return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
+    }
+    vote_remove_proposer(&target_address, &voter)
+        .map_err(EgoDesktopError::InvalidInput)
+}
+
+/// Get the ban status for a proposer address (vote count, threshold, whether banned).
+#[tauri::command]
+pub fn get_ban_status(target_address: String) -> ProposerBanStatus {
+    let ledger = Ledger::load();
+    let viewer = if ledger.address.is_empty() { None } else { Some(ledger.address) };
+    get_proposer_ban_status(&target_address, viewer.as_deref())
+}
+
+#[derive(serde::Serialize)]
+pub struct ProposalRateLimit {
+    pub used:          usize,
+    pub max:           usize,
+    pub window_hours:  u32,
+    pub resets_in_secs: i64, // seconds until oldest submission leaves the window; 0 if not at limit
+}
+
+/// Returns the current user's proposal rate-limit status for the 4-hour window.
+#[tauri::command]
+pub fn get_proposal_rate_limit() -> ProposalRateLimit {
+    let ledger = Ledger::load();
+    if ledger.address.is_empty() {
+        return ProposalRateLimit { used: 0, max: MAX_PROPOSALS_PER_WINDOW, window_hours: 4, resets_in_secs: 0 };
+    }
+    let creator = &ledger.address;
+    let now      = now_ts();
+    let window_start = now - WINDOW_SECS;
+    let all = list_dao_proposals(Some("all"), None);
+    let recent_times: Vec<i64> = all.iter()
+        .filter(|p| &p.creator == creator && p.created_at >= window_start)
+        .map(|p| p.created_at)
+        .collect();
+    let used = recent_times.len();
+    let resets_in = if used >= MAX_PROPOSALS_PER_WINDOW {
+        let oldest = recent_times.iter().copied().min().unwrap_or(now);
+        ((oldest + WINDOW_SECS) - now).max(0)
+    } else { 0 };
+    ProposalRateLimit { used, max: MAX_PROPOSALS_PER_WINDOW, window_hours: 4, resets_in_secs: resets_in }
 }

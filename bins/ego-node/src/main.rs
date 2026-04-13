@@ -60,8 +60,8 @@ struct NodeConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            node_type: "full".to_string(),
-            roles: vec![NodeRole::Validator, NodeRole::StorageProvider],
+            node_type: "seed".to_string(),
+            roles: vec![NodeRole::Gateway],
             shard_ids: vec![0],
             listen_port: 9000,
             rpc_port: 8545,
@@ -544,16 +544,15 @@ fn parse_cli_args() -> NodeConfig {
 }
 
 fn determine_roles(node_type: &str) -> Vec<NodeRole> {
+    // The Oracle node is a peer-discovery concierge only.
+    // "validator" and "full" roles are reserved for desktop app instances —
+    // the Oracle never proposes or votes on blocks.
     match node_type {
-        "validator" => vec![NodeRole::Validator],
         "storage" => vec![NodeRole::StorageProvider],
-        "gateway" => vec![NodeRole::Gateway],
-        "seed" => vec![NodeRole::Gateway],
-        "indexer" => vec![NodeRole::StorageProvider],
-        "full" => vec![NodeRole::Validator, NodeRole::StorageProvider],
+        "gateway" | "seed" | "oracle" | "validator" | "full" | "indexer" => vec![NodeRole::Gateway],
         _ => {
-            warn!("Unknown node type '{}', defaulting to full node", node_type);
-            vec![NodeRole::Validator, NodeRole::StorageProvider]
+            warn!("Unknown node type '{}', running as peer-discovery relay", node_type);
+            vec![NodeRole::Gateway]
         }
     }
 }
@@ -767,26 +766,24 @@ async fn run_daemon_mode(
     rpc_state: Arc<RpcState>,
     mut mempool_gossip_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
 ) -> anyhow::Result<()> {
-    use ego_node::consensus_integration::{
-        ConsensusAction, ConsensusMsg, ProposalCache, VoteCollector,
-        apply_post_miss_penalties, check_equivocation,
-        elect_leader, has_quorum, has_finality, total_active_drs_weight,
-        meets_validator_floor, active_validator_count, MIN_VALIDATORS_FOR_FINALITY,
-    };
-    use ego_consensus::consensus::bft::BftEngine;
-    use ego_consensus::consensus::fork_choice::ViewChangeMsg as VcMsg;
+    // ── Peer-discovery / relay mode ─────────────────────────────────────────
+    // The Oracle node is a CONCIERGE: it maintains the P2P mesh so desktop
+    // nodes can discover each other, but it NEVER proposes, votes, or
+    // finalizes blocks.  All consensus and block production happens
+    // exclusively on desktop app instances.
+    // ────────────────────────────────────────────────────────────────────────
 
-    info!("🔄 Running in daemon mode. Press Ctrl+C to stop.");
+    info!("🔄 Running in peer-discovery relay mode. Press Ctrl+C to stop.");
     info!(
-        "📊 Node Type: {} | Roles: {:?} | Port: {}",
-        config.node_type, config.roles, config.listen_port
+        "📡 Oracle concierge | Port: {} | RPC: {}",
+        config.listen_port, config.rpc_port
     );
 
-    // Subscribe to consensus gossip topic.
+    // Subscribe to gossip topics — the oracle relays messages between desktop
+    // nodes but does NOT process consensus or produce blocks itself.
     let consensus_topic = libp2p::gossipsub::IdentTopic::new(
         ego_node::consensus_integration::CONSENSUS_TOPIC
     );
-    let consensus_topic_hash = consensus_topic.hash();
     let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&consensus_topic);
 
     let mempool_topic = libp2p::gossipsub::IdentTopic::new(ego_node::consensus_integration::MEMPOOL_TOPIC);
@@ -798,260 +795,48 @@ async fn run_daemon_mode(
     let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&sync_topic);
 
     let rollup_topic = libp2p::gossipsub::IdentTopic::new("ego/rollup/commits");
-    let rollup_topic_hash = rollup_topic.hash();
     let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&rollup_topic);
 
-    // Subscribe to the inbound cross-shard receipts topic for this node's shard(s).
-    // Other shards publish to ego/shard/{dst}/receipts; we consume our own shard's queue.
     let my_shard_id = node.shard_ids.first().copied().unwrap_or(0);
     let receipts_topic = libp2p::gossipsub::IdentTopic::new(
         format!("ego/shard/{}/receipts", my_shard_id)
     );
-    let receipts_topic_hash = receipts_topic.hash();
     let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&receipts_topic);
-
-    // Consensus state local to this daemon instance.
-    let mut vote_collector  = VoteCollector::new();
-    let mut proposal_cache  = ProposalCache::new();
-    let seen_proposals      = std::sync::Mutex::new(std::collections::HashMap::<(u64, String), String>::new());
-    let node_address        = format!("0x{}", hex::encode(node.get_address().as_bytes()));
-
-    // BFT engine for view-change tracking and fork-choice safety rules.
-    let validator_addrs: Vec<_> = node.state_manager.get_active_validators()
-        .into_iter().map(|v| v.address).collect();
-    let bft_engine = std::sync::Arc::new(
-        BftEngine::new(node.get_keypair().clone(), validator_addrs)
-    );
-
-    // View-change tracking: detect chain stall and trigger round rotation.
-    let mut last_finalized_height: u64 = node.state_manager.get_block_height().as_u64();
-    let mut last_progress_ts = std::time::Instant::now();
-    let mut view_change_round: u32 = 0;
 
     let mut status_interval       = interval(Duration::from_secs(30));
     let mut metrics_interval      = interval(Duration::from_secs(60));
-    let mut proof_interval        = interval(Duration::from_secs(300));
     let mut optimization_interval = interval(Duration::from_secs(10));
     let mut daily_reset_interval  = interval(Duration::from_secs(86400));
     let mut uptime_interval       = interval(Duration::from_secs(1));
-    let mut block_interval        = interval(Duration::from_secs(12));
-    // Epoch timer: ~10 minutes per epoch (1000 blocks × 6s / 60 ≈ 100s, use 600s as epoch)
-    let mut epoch_interval        = interval(Duration::from_secs(600));
-    // View-change timer: fire every 30s to check for chain stall.
-    let mut view_change_interval  = interval(Duration::from_secs(30));
-
-    // Timestamp of the last block we finalized — prevents empty-block spam.
-    let mut last_block_ts: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    // Minimum gap between empty blocks (60 s). Blocks with txs are never suppressed.
-    const EMPTY_BLOCK_MIN_INTERVAL: u64 = 60;
 
     print_status(&node);
 
     loop {
         tokio::select! {
             event = node.swarm.select_next_some() => {
-                // Handle inbound consensus gossip messages before generic dispatch.
-                // Immutable borrow of event ends before we need &mut node.swarm below.
-                let consensus_action = if let libp2p::swarm::SwarmEvent::Behaviour(
-                    ego_node::NodeBehaviourEvent::Gossipsub(
-                        libp2p::gossipsub::Event::Message { message, .. }
-                    )
-                ) = &event {
-                    if message.topic == consensus_topic_hash {
-                        let my_drs = node.state_manager
-                            .get_validator(&node.get_address())
-                            .map(|v| v.drs_score)
-                            .unwrap_or(1.0);
-                        process_inbound_consensus(
-                            &message.data,
-                            &node.state_manager,
-                            &mut vote_collector,
-                            &seen_proposals,
-                            &mut proposal_cache,
-                            &node_address,
-                            my_drs,
-                            node.get_keypair(),
-                            &bft_engine,
-                        )
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                // Handle the consensus action.
-                match consensus_action {
-                    Some(ConsensusAction::Vote(vote_msg)) => {
-                        let topic = libp2p::gossipsub::IdentTopic::new(
-                            ego_node::consensus_integration::CONSENSUS_TOPIC
-                        );
-                        let _ = node.swarm.behaviour_mut().gossipsub.publish(topic, vote_msg.to_bytes());
-                    }
-                    Some(ConsensusAction::FinalizeBlock { height, block_json }) => {
-                        // A peer's QC reached quorum — validate then apply the block.
-                        match serde_json::from_value::<ego_core::Block>(block_json.clone()) {
-                            Err(e) => warn!("FinalizeBlock h={height}: deserialize failed: {e}"),
-                            Ok(block) => {
-                                // Full structural + signature + VRF validation.
-                                // Rejects malicious peers that construct invalid blocks.
-                                match node.validate_block(&block).await {
-                                    Err(e) => {
-                                        warn!(
-                                            "🚫 Peer block h={height} failed validation — rejecting: {e}"
-                                        );
-                                    }
-                                    Ok(false) => {
-                                        warn!("🚫 Peer block h={height} validate_block returned false — rejecting");
-                                    }
-                                    Ok(true) => {
-                                        let hash_hex = block.hash.to_string();
-                                        // Execute transactions against local state.
-                                        for tx in &block.body.transactions {
-                                            if let Err(e) = node.execute_transaction(tx).await {
-                                                warn!("Peer block h={height} tx exec failed: {e}");
-                                            }
-                                        }
-                                        // Remove included txs from the local mempool.
-                                        for tx in &block.body.transactions {
-                                            let tx_hex = hex::encode(tx.hash.as_bytes());
-                                            rpc_state.pending_txs.remove(&tx_hex);
-                                        }
-                                        // Persist touched accounts (batched).
-                                        let mut touched = std::collections::HashSet::new();
-                                        for tx in &block.body.transactions {
-                                            touched.insert(*tx.from.as_bytes());
-                                            if let ego_core::TransactionPayload::Transfer { ref to, .. } = tx.payload {
-                                                touched.insert(*to.as_bytes());
-                                            }
-                                        }
-                                        let accts_to_save: Vec<([u8; 20], ego_core::Account)> = touched
-                                            .iter()
-                                            .filter_map(|a| {
-                                                let addr = ego_core::Address::new(*a);
-                                                node.state_manager.get_account(&addr).map(|ac| (*a, ac))
-                                            })
-                                            .collect();
-                                        let pairs: Vec<(&[u8; 20], &ego_core::Account)> =
-                                            accts_to_save.iter().map(|(k, v)| (k, v)).collect();
-                                        ego_node::store::save_accounts_batch(&pairs);
-
-                                        // Relay cross-shard receipts from this peer block.
-                                        for tx in &block.body.transactions {
-                                            if let ego_core::TransactionPayload::CrossShard {
-                                                target_shard, message, nonce, deadline_epoch, ..
-                                            } = &tx.payload {
-                                                let receipt = ego_core::CrossShardReceipt {
-                                                    src_shard:      tx.shard_id,
-                                                    dst_shard:      *target_shard,
-                                                    src_block_hash: block.hash,
-                                                    tx_id:          tx.hash,
-                                                    payload:        message.clone(),
-                                                    nonce:          *nonce,
-                                                    deadline_epoch: *deadline_epoch,
-                                                    merkle_proof:   Vec::new(),
-                                                };
-                                                if let Ok(bytes) = serde_json::to_vec(&receipt) {
-                                                    let dst = libp2p::gossipsub::IdentTopic::new(
-                                                        format!("ego/shard/{}/receipts", target_shard.as_u32())
-                                                    );
-                                                    let _ = node.swarm.behaviour_mut().gossipsub.publish(dst, bytes);
-                                                }
-                                            }
-                                        }
-
-                                        // Persist block and update finality state.
-                                        ego_node::store::insert_block(height, &block_json);
-                                        last_finalized_height = height;
-                                        last_progress_ts = std::time::Instant::now();
-                                        view_change_round = 0;
-                                        proposal_cache.prune(height);
-                                        vote_collector.prune(height);
-                                        info!(
-                                            "✅ Applied peer block h={height} hash={}… ({} txs)",
-                                            &hash_hex[..8.min(hash_hex.len())],
-                                            block.body.transactions.len()
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    None => {}
-                }
-                // Handle inbound mempool transactions and sync messages from peers.
+                // Gossipsub automatically relays messages to all subscribed peers in
+                // the mesh — no manual forwarding needed.  We only peek at sync
+                // messages so we can track peer RPC addresses for the /peers RPC
+                // endpoint used by desktop nodes for bootstrapping.
                 if let libp2p::swarm::SwarmEvent::Behaviour(
                     ego_node::NodeBehaviourEvent::Gossipsub(
                         libp2p::gossipsub::Event::Message { message, .. }
                     )
                 ) = &event {
-                    if message.topic == mempool_topic_hash {
-                        // Inbound tx from peer — add to mempool if valid.
-                        if let Ok(tx) = serde_json::from_slice::<ego_core::Transaction>(&message.data) {
-                            if let Ok(true) = tx.verify_signature() {
-                                let _ = rpc_state.pending_txs.insert(tx);
-                            }
-                        }
-                    } else if message.topic == rollup_topic_hash {
-                        if let Ok(commit) = serde_json::from_slice::<ego_rollup::RollupCommitment>(&message.data) {
-                            // Deduplicate by commitment_hash.
-                            let hash = commit.commitment_hash;
-                            if !node.pending_rollup_commits.iter().any(|c| c.commitment_hash == hash) {
-                                node.pending_rollup_commits.push(commit);
-                                // Cap at 100 pending commitments.
-                                if node.pending_rollup_commits.len() > 100 {
-                                    node.pending_rollup_commits.drain(0..node.pending_rollup_commits.len() - 100);
-                                }
-                                tracing::info!("Received rollup commit {}, {} pending", hash, node.pending_rollup_commits.len());
-                            }
-                        }
-                    } else if message.topic == receipts_topic_hash {
-                        // Inbound cross-shard receipt — apply the state change on this shard.
-                        if let Ok(receipt) = serde_json::from_slice::<ego_core::CrossShardReceipt>(&message.data) {
-                            match node.state_manager.apply_inbound_receipt(&receipt) {
-                                Ok(()) => {
-                                    info!(
-                                        "✅ Applied cross-shard receipt nonce={} from shard {} → {}",
-                                        receipt.nonce,
-                                        receipt.src_shard.as_u32(),
-                                        receipt.dst_shard.as_u32(),
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!("Cross-shard receipt rejected: {e}");
-                                }
-                            }
-                        }
-                    } else if message.topic == sync_topic_hash {
+                    if message.topic == sync_topic_hash {
                         use ego_node::consensus_integration::SyncMsg;
-                        if let Some(SyncMsg::ChainTip { height: peer_height, rpc_addr, .. }) = SyncMsg::from_bytes(&message.data) {
-                            // Store the peer's RPC address.
-                            rpc_state.peer_rpc_addrs.lock().unwrap().insert(rpc_addr.clone(), rpc_addr.clone());
-                            // If we're behind, fetch missing blocks asynchronously.
-                            let our_height = node.state_manager.get_block_height().as_u64();
-                            if peer_height > our_height + 1 {
-                                let rpc_addr_c = rpc_addr.clone();
-                                let from = our_height + 1;
-                                let count = (peer_height - our_height).min(100);
-                                tokio::spawn(async move {
-                                    if let Ok(client) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build() {
-                                        let url = format!("{}/blocks/range?from={}&count={}", rpc_addr_c, from, count);
-                                        if let Ok(resp) = client.get(&url).send().await {
-                                            if let Ok(blocks) = resp.json::<Vec<serde_json::Value>>().await {
-                                                for block_json in blocks {
-                                                    ego_node::store::insert_block(
-                                                        block_json["header"]["core"]["height"].as_u64().unwrap_or(0),
-                                                        &block_json
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                });
-                            }
+                        if let Some(SyncMsg::ChainTip { rpc_addr, .. }) = SyncMsg::from_bytes(&message.data) {
+                            // Index the peer's advertised RPC address so the
+                            // /peers endpoint can hand it to new desktop joiners.
+                            rpc_state.peer_rpc_addrs.lock().unwrap()
+                                .insert(rpc_addr.clone(), rpc_addr);
                         }
+                    } else if message.topic == mempool_topic_hash {
+                        // Count for stats only — relay handled by gossipsub mesh.
+                        debug!("Relayed mempool tx ({} bytes)", message.data.len());
                     }
                 }
+
                 if let Err(e) = handle_network_event(&mut node, event).await {
                     warn!("Error handling network event: {}", e);
                 }
@@ -1068,407 +853,32 @@ async fn run_daemon_mode(
                 }
             },
 
-            _ = proof_interval.tick() => {
-                if let Err(e) = generate_proofs(&mut node).await {
-                    warn!("Error generating proofs: {}", e);
-                }
-            },
-
             _ = optimization_interval.tick() => {
                 if let Err(e) = node.process_optimization_events().await {
                     warn!("Error processing optimization events: {}", e);
                 }
-
                 node.handle_porep_events().await;
             },
 
             _ = daily_reset_interval.tick() => {
                 node.network_manager.reset_monthly_stats();
                 node.bandwidth_sharing.reset_daily_stats();
-                info!("🔄 Daily stats reset completed");
+                info!("Daily stats reset");
             },
 
             _ = uptime_interval.tick() => {
                 node.update_uptime();
             },
 
-            _ = block_interval.tick() => {
-                let height    = node.get_block_height().next();
-                let height_u64 = height.as_u64();
-                let my_addr   = node.get_address();
-
-                // VRF leader election: only the elected validator produces this block.
-                let elected = elect_leader(&node.state_manager, height_u64, &my_addr);
-                if elected != my_addr {
-                    // Not our slot. Still check if chain is stalled (no block in 2 slots)
-                    // and act as fallback proposer if needed.
-                    let tip = node.state_manager.get_block_height().as_u64();
-                    if height_u64 > tip + 2 {
-                        // Chain is stalled — try next slot as fallback
-                        let fallback = elect_leader(&node.state_manager, height_u64 + 1, &my_addr);
-                        if fallback != my_addr {
-                            continue; // still not our turn
-                        }
-                    } else {
-                        continue; // elected leader should produce this block
-                    }
-                }
-
-                // This node is the elected proposer for this slot.
-                const MAX_TXS_PER_BLOCK: usize = 1_000;
-                // ShardedMempool already deduplicates by hash, so no extra seen_hashes pass needed.
-                let candidates = rpc_state.pending_txs.drain_n(MAX_TXS_PER_BLOCK);
-
-                // Parallel signature verification — each CPU core verifies a subset.
-                // Dilithium verification is ~300µs; parallelising over 1000 txs saves ~250ms/block.
-                use rayon::prelude::*;
-                let accounts: Vec<Option<ego_core::Account>> = candidates
-                    .par_iter()
-                    .map(|tx| node.state_manager.get_account(&tx.from))
-                    .collect();
-
-                let validated: Vec<ego_core::Transaction> = candidates
-                    .into_iter()
-                    .zip(accounts)
-                    .filter_map(|(tx, acct)| {
-                        let Some(account) = acct else {
-                            warn!("Dropping pending tx — sender account not found: {:?}", tx.from);
-                            return None;
-                        };
-                        match tx.validate_against_account(&account) {
-                            Ok(_)  => Some(tx),
-                            Err(_) => {
-                                warn!("Dropping invalid pending tx from {:?}", tx.from);
-                                None
-                            }
-                        }
-                    })
-                    .take(MAX_TXS_PER_BLOCK)
-                    .collect();
-
-                // Skip empty blocks unless enough time has elapsed since the last block.
-                if validated.is_empty() {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                    if now.saturating_sub(last_block_ts) < EMPTY_BLOCK_MIN_INTERVAL {
-                        continue;
-                    }
-                }
-
-                let previous_hash = node.get_state_root();
-                match node.create_block(validated.clone(), previous_hash, height).await {
-                    Ok(block) => {
-                        let block_hash_hex = block.hash.to_string();
-
-                        // Double-sign check on our own output (sanity guard).
-                        let equivocation = check_equivocation(
-                            &seen_proposals,
-                            &node.state_manager,
-                            height_u64,
-                            &node_address,
-                            &block_hash_hex,
-                        );
-                        if equivocation {
-                            warn!("BUG: local node produced equivocating block — dropping");
-                            continue;
-                        }
-
-                        // Execute transactions against state.
-                        for tx in &validated {
-                            if let Err(e) = node.execute_transaction(tx).await {
-                                warn!("Failed to execute tx in new block: {e}");
-                            }
-                        }
-
-                        // Collect all accounts touched by this block's transactions.
-                        let mut touched: std::collections::HashSet<[u8; 20]> = std::collections::HashSet::new();
-                        for tx in &validated {
-                            touched.insert(*tx.from.as_bytes());
-                            if let ego_core::TransactionPayload::Transfer { ref to, .. } = tx.payload {
-                                touched.insert(*to.as_bytes());
-                            }
-                        }
-                        // Always persist the burn address (fees credited there).
-                        touched.insert([0u8; 20]);
-
-                        // One WriteBatch for all touched accounts (~10× faster than individual puts).
-                        let accounts_to_save: Vec<([u8; 20], ego_core::Account)> = touched
-                            .iter()
-                            .filter_map(|addr_arr| {
-                                let addr = ego_core::Address::new(*addr_arr);
-                                node.state_manager.get_account(&addr).map(|a| (*addr_arr, a))
-                            })
-                            .collect();
-                        let pairs: Vec<(&[u8; 20], &ego_core::Account)> =
-                            accounts_to_save.iter().map(|(k, v)| (k, v)).collect();
-                        ego_node::store::save_accounts_batch(&pairs);
-                        if let Ok(block_json) = serde_json::to_value(&block) {
-                            ego_node::store::insert_block(height_u64, &block_json);
-
-                            // Relay cross-shard receipts produced by this block.
-                            // For each CrossShard tx, publish the receipt to the destination
-                            // shard's gossip topic so that shard can apply the state change.
-                            for tx in &validated {
-                                if let ego_core::TransactionPayload::CrossShard {
-                                    target_shard, message, nonce, deadline_epoch, ..
-                                } = &tx.payload {
-                                    let receipt = ego_core::CrossShardReceipt {
-                                        src_shard:      tx.shard_id,
-                                        dst_shard:      *target_shard,
-                                        src_block_hash: block.hash, // real block hash
-                                        tx_id:          tx.hash,
-                                        payload:        message.clone(),
-                                        nonce:          *nonce,
-                                        deadline_epoch: *deadline_epoch,
-                                        merkle_proof:   Vec::new(),
-                                    };
-                                    if let Ok(bytes) = serde_json::to_vec(&receipt) {
-                                        let dst = libp2p::gossipsub::IdentTopic::new(
-                                            format!("ego/shard/{}/receipts", target_shard.as_u32())
-                                        );
-                                        let _ = node.swarm.behaviour_mut().gossipsub.publish(dst, bytes);
-                                    }
-                                }
-                            }
-
-                            // Announce our tip so lagging peers can sync.
-                            {
-                                use ego_node::consensus_integration::SyncMsg;
-                                let tip_msg = SyncMsg::ChainTip {
-                                    height:     height_u64,
-                                    block_hash: block_hash_hex.clone(),
-                                    rpc_addr:   config.rpc_advertise_addr.clone(),
-                                };
-                                let sync_t = libp2p::gossipsub::IdentTopic::new(ego_node::consensus_integration::SYNC_TOPIC);
-                                let _ = node.swarm.behaviour_mut().gossipsub.publish(sync_t, tip_msg.to_bytes());
-                            }
-
-                            // Gossip proposal to peers.
-                            let msg = ConsensusMsg::Proposal {
-                                height:     height_u64,
-                                block_hash: block_hash_hex.clone(),
-                                proposer:   node_address.clone(),
-                                block_json: block_json.clone(),
-                            };
-                            let topic = libp2p::gossipsub::IdentTopic::new(
-                                ego_node::consensus_integration::CONSENSUS_TOPIC
-                            );
-                            let _ = node.swarm.behaviour_mut().gossipsub
-                                .publish(topic, msg.to_bytes());
-                        }
-
-                        // Count our own vote (self-attest).
-                        let my_drs = node.state_manager
-                            .get_validator(&my_addr)
-                            .map(|v| v.drs_score)
-                            .unwrap_or(1.0);
-                        vote_collector.add_vote(height_u64, &block_hash_hex, &node_address, my_drs);
-
-                        // Gossip our signed vote to peers.
-                        {
-                            let msg_data = format!("{}:{}", height_u64, block_hash_hex);
-                            let dil_sig = node.get_keypair().sign_dilithium(msg_data.as_bytes());
-                            let dil_sig_hex = hex::encode(dil_sig.as_bytes());
-                            let vote_msg_bytes = ConsensusMsg::Vote {
-                                height:     height_u64,
-                                block_hash: block_hash_hex.clone(),
-                                voter:      node_address.clone(),
-                                dil_sig_hex,
-                            }.to_bytes();
-                            let vote_topic = libp2p::gossipsub::IdentTopic::new(ego_node::consensus_integration::CONSENSUS_TOPIC);
-                            let _ = node.swarm.behaviour_mut().gossipsub.publish(vote_topic, vote_msg_bytes);
-                        }
-
-                        let total_w = total_active_drs_weight(&node.state_manager).max(1.0);
-                        let our_w   = vote_collector.total_weight(height_u64, &block_hash_hex);
-                        if has_finality(&node.state_manager, our_w, total_w) {
-                            // Quorum reached — broadcast QC.
-                            let qc_msg = ConsensusMsg::Qc {
-                                height:           height_u64,
-                                block_hash:       block_hash_hex.clone(),
-                                voter_count:      vote_collector.voter_count(height_u64, &block_hash_hex),
-                                total_drs_weight: our_w,
-                            };
-                            let topic = libp2p::gossipsub::IdentTopic::new(
-                                ego_node::consensus_integration::CONSENSUS_TOPIC
-                            );
-                            let _ = node.swarm.behaviour_mut().gossipsub
-                                .publish(topic, qc_msg.to_bytes());
-                            info!(
-                                "✅ Block {} finalized at height {} ({}/{:.1} DRS weight, {} voters)",
-                                &block_hash_hex[..8], height_u64, our_w, total_w,
-                                vote_collector.voter_count(height_u64, &block_hash_hex)
-                            );
-                            // Mark progress — resets view-change stall timer.
-                            last_finalized_height = height_u64;
-                            last_progress_ts = std::time::Instant::now();
-                            view_change_round = 0;
-                        }
-
-                        // Update recent_blocks in RPC state.
-                        let summary = ego_node::rpc::BlockSummary {
-                            height:    height_u64,
-                            hash:      block_hash_hex,
-                            tx_count:  block.body.transactions.len(),
-                            timestamp: block.header.core.timestamp.as_secs(),
-                        };
-                        let mut recent = rpc_state.recent_blocks.lock().unwrap();
-                        recent.push(summary);
-                        if recent.len() > 500 {
-                            let drop = recent.len() - 500;
-                            recent.drain(0..drop);
-                        }
-                        info!(
-                            "⛏  Block produced at height {} with {} txs (proposer: self)",
-                            height_u64, block.body.transactions.len()
-                        );
-
-                        vote_collector.prune(height_u64);
-                        node.pending_rollup_commits.clear();
-                        last_block_ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                    }
-                    Err(e) => warn!("Block production failed: {e}"),
-                }
-            },
-
-            _ = epoch_interval.tick() => {
-                let current_epoch = node.state_manager.get_block_height().as_u64() / 1000;
-
-                // Apply DRS decay penalties for validators with stale PoSt updates.
-                apply_post_miss_penalties(&node.state_manager, current_epoch);
-
-                // Distribute consensus epoch rewards proportional to DRS score.
-                // Rate: 10 EGOC/day ÷ 144 epochs/day = 69,444 uEGOC per epoch for the pool.
-                const CONSENSUS_EPOCH_POOL_UEGOC: u128 = 69_444;
-                let validators = node.state_manager.get_active_validators();
-                let total_drs: f64 = validators.iter().map(|v| v.drs_score).sum::<f64>().max(1.0);
-                for v in &validators {
-                    let share = (v.drs_score / total_drs * CONSENSUS_EPOCH_POOL_UEGOC as f64) as u128;
-                    if share == 0 { continue; }
-                    let reward = ego_core::Balance(share);
-                    let mut acct = node.state_manager.get_account(&v.address)
-                        .unwrap_or_else(|| {
-                            // Validator hasn't sent any tx yet — create a minimal account.
-                            ego_core::Account::new_eoa(v.address, vec![0u8; 1312], vec![0u8; 1184])
-                        });
-                    if acct.credit(reward).is_err() {
-                        tracing::warn!("balance overflow crediting reward to {:?}, skipping", v.address);
-                        continue;
-                    }
-                    node.state_manager.set_account(acct.clone());
-                    ego_node::store::save_account(v.address.as_bytes(), &acct);
-                }
-                if !validators.is_empty() {
-                    info!(
-                        "💰 Epoch {} rewards: {} validators shared {} uEGOC",
-                        current_epoch, validators.len(), CONSENSUS_EPOCH_POOL_UEGOC
-                    );
-                }
-
-                // Persist updated validator states.
-                for v in &validators {
-                    if let Ok(json) = serde_json::to_value(v) {
-                        ego_node::store::save_validator_json(v.address.as_bytes(), &json);
-                    }
-                }
-
-                // Retrieval rewards for StorageProvider accounts (2 EGOC/day ÷ 144 = 13,888 uEGOC/epoch pool).
-                const RETRIEVAL_EPOCH_POOL: u128 = 13_888;
-                // Coverage rewards for Gateway/Device accounts (8 EGOC/day ÷ 144 = 55,555 uEGOC/epoch pool).
-                const COVERAGE_EPOCH_POOL: u128 = 55_555;
-
-                let all_accts = node.state_manager.all_accounts();
-
-                // Retrieval pool — StorageProvider accounts.
-                let storage_accts: Vec<_> = all_accts.iter()
-                    .filter(|a| a.is_storage_provider())
-                    .collect();
-                if !storage_accts.is_empty() {
-                    let per_acct = RETRIEVAL_EPOCH_POOL / storage_accts.len() as u128;
-                    if per_acct > 0 {
-                        for acct_ref in &storage_accts {
-                            let mut acct = (*acct_ref).clone();
-                            if acct.credit(ego_core::Balance(per_acct)).is_err() {
-                                tracing::warn!("balance overflow on storage reward for {:?}", acct.address);
-                                continue;
-                            }
-                            node.state_manager.set_account(acct.clone());
-                            ego_node::store::save_account(acct.address.as_bytes(), &acct);
-                        }
-                    }
-                }
-
-                // Coverage pool — Device accounts.
-                let gateway_accts: Vec<_> = all_accts.iter()
-                    .filter(|a| a.is_device())
-                    .collect();
-                if !gateway_accts.is_empty() {
-                    let per_acct = COVERAGE_EPOCH_POOL / gateway_accts.len() as u128;
-                    if per_acct > 0 {
-                        for acct_ref in &gateway_accts {
-                            let mut acct = (*acct_ref).clone();
-                            if acct.credit(ego_core::Balance(per_acct)).is_err() {
-                                tracing::warn!("balance overflow on coverage reward for {:?}", acct.address);
-                                continue;
-                            }
-                            node.state_manager.set_account(acct.clone());
-                            ego_node::store::save_account(acct.address.as_bytes(), &acct);
-                        }
-                    }
-                }
-            },
-
-            _ = view_change_interval.tick() => {
-                let current_height = node.state_manager.get_block_height().as_u64();
-                if current_height > last_finalized_height {
-                    // Progress detected — reset stall timer.
-                    last_finalized_height = current_height;
-                    last_progress_ts = std::time::Instant::now();
-                    view_change_round = 0;
-                } else if last_progress_ts.elapsed() >= Duration::from_secs(30) {
-                    // Chain stalled: no new finalized block in ≥30s.
-                    let is_validator = node.state_manager
-                        .get_validator(&node.get_address())
-                        .map(|v| matches!(v.status, ego_core::state::ValidatorStatus::Active))
-                        .unwrap_or(false);
-                    if is_validator {
-                        view_change_round = view_change_round.saturating_add(1);
-                        let epoch = current_height / 1000;
-                        if let Ok(vc) = VcMsg::new(view_change_round, current_height, epoch, None, node.get_keypair()) {
-                            if let Ok(payload) = serde_json::to_value(&vc) {
-                                let gossip = ConsensusMsg::ViewChange {
-                                    height:    current_height,
-                                    epoch,
-                                    new_round: view_change_round,
-                                    voter:     node_address.clone(),
-                                    payload,
-                                };
-                                let t = libp2p::gossipsub::IdentTopic::new(
-                                    ego_node::consensus_integration::CONSENSUS_TOPIC
-                                );
-                                let _ = node.swarm.behaviour_mut().gossipsub.publish(t, gossip.to_bytes());
-                                warn!(
-                                    "⏱️  Chain stalled {}s — view change r={} broadcast at h={}",
-                                    last_progress_ts.elapsed().as_secs(), view_change_round, current_height
-                                );
-                            }
-                            // Count our own view-change locally.
-                            let _ = bft_engine.receive_view_change(vc);
-                        }
-                        // Back off to prevent view-change spam: reset timer after each trigger.
-                        last_progress_ts = std::time::Instant::now();
-                    }
-                }
-            },
-
+            // Forward any tx bytes submitted via RPC into the gossip mesh so
+            // connected desktop nodes receive them (pure relay — no validation).
             Some(tx_bytes) = mempool_gossip_rx.recv() => {
                 let topic = libp2p::gossipsub::IdentTopic::new(ego_node::consensus_integration::MEMPOOL_TOPIC);
                 let _ = node.swarm.behaviour_mut().gossipsub.publish(topic, tx_bytes);
             },
 
             _ = tokio::signal::ctrl_c() => {
-                info!("🛑 Received shutdown signal");
+                info!("Received shutdown signal");
                 break;
             }
         }
@@ -1477,190 +887,6 @@ async fn run_daemon_mode(
     info!("👋 Ego blockchain node shutting down gracefully");
     print_final_stats(&node);
     Ok(())
-}
-
-/// Process a raw gossipsub payload received on the consensus topic.
-///
-/// Returns a `ConsensusMsg::Vote` to broadcast if the local node should
-/// attest the received proposal (i.e. the proposal is valid and not ours).
-///
-/// - `Proposal` → equivocation check; if clean, return a vote to broadcast
-/// - `Vote`     → add to VoteCollector weighted by voter's DRS score
-/// - `Qc`       → log finality signal from another proposer
-fn process_inbound_consensus(
-    data:             &[u8],
-    state:            &ego_core::StateManager,
-    votes:            &mut ego_node::consensus_integration::VoteCollector,
-    seen:             &std::sync::Mutex<std::collections::HashMap<(u64, String), String>>,
-    proposal_cache:   &mut ego_node::consensus_integration::ProposalCache,
-    my_address:       &str,
-    my_drs_score:     f64,
-    keypair:          &ego_core::KeyPair,
-    bft_engine:       &ego_consensus::consensus::bft::BftEngine,
-) -> Option<ego_node::consensus_integration::ConsensusAction> {
-    use ego_node::consensus_integration::{
-        ConsensusAction, ConsensusMsg, check_equivocation,
-        has_quorum, has_finality, total_active_drs_weight,
-        active_validator_count, meets_validator_floor, MIN_VALIDATORS_FOR_FINALITY,
-    };
-
-    let msg = ConsensusMsg::from_bytes(data)?;
-
-    match msg {
-        ConsensusMsg::Proposal { height, block_hash, proposer, block_json } => {
-            // Ignore our own re-broadcast proposals.
-            if proposer == my_address {
-                return None;
-            }
-            if check_equivocation(seen, state, height, &proposer, &block_hash) {
-                warn!(
-                    "🚫 Equivocation detected from {} at height {} — proposal rejected",
-                    proposer, height
-                );
-                return None;
-            }
-            // Cache the block so we can commit it when the QC arrives.
-            proposal_cache.insert(height, block_hash.clone(), block_json);
-
-            // Sign our attestation vote with Dilithium before broadcasting.
-            let msg_data = format!("{}:{}", height, block_hash);
-            let dil_sig = keypair.sign_dilithium(msg_data.as_bytes());
-            let dil_sig_hex = hex::encode(dil_sig.as_bytes());
-            Some(ConsensusAction::Vote(ConsensusMsg::Vote {
-                height,
-                block_hash,
-                voter: my_address.to_string(),
-                dil_sig_hex,
-            }))
-        }
-
-        ConsensusMsg::Vote { height, block_hash, voter, dil_sig_hex } => {
-            // Ignore votes from ourselves (already added in block production arm).
-            if voter == my_address {
-                return None;
-            }
-            // All votes must carry a valid Dilithium signature from a known on-chain account.
-            // Bootstrap loophole removed: unknown accounts are rejected, not silently allowed.
-            if let Ok(sig_bytes) = hex::decode(&dil_sig_hex) {
-                let valid = if let Ok(addr_bytes) = hex::decode(voter.trim_start_matches("0x")) {
-                    if addr_bytes.len() == 20 {
-                        let mut arr = [0u8; 20];
-                        arr.copy_from_slice(&addr_bytes);
-                        let addr = ego_core::Address::new(arr);
-                        match state.get_account(&addr) {
-                            Some(acct) => {
-                                let msg_data = format!("{}:{}", height, block_hash);
-                                ego_core::dilithium_verify(
-                                    &acct.dilithium_pk,
-                                    msg_data.as_bytes(),
-                                    &sig_bytes,
-                                ).unwrap_or(false)
-                            }
-                            None => {
-                                warn!("Vote from {} rejected — account not found on chain", voter);
-                                false
-                            }
-                        }
-                    } else { false }
-                } else { false };
-                if !valid {
-                    warn!("Vote from {} rejected: invalid dilithium signature", voter);
-                    return None;
-                }
-            } else {
-                // Missing or malformed signature — reject.
-                warn!("Vote from {} rejected: missing or malformed dil_sig_hex", voter);
-                return None;
-            }
-            let weight = if let Ok(bytes) = hex::decode(voter.trim_start_matches("0x")) {
-                if bytes.len() == 20 {
-                    let mut arr = [0u8; 20];
-                    arr.copy_from_slice(&bytes);
-                    let addr = ego_core::Address::new(arr);
-                    state.get_validator(&addr).map(|v| v.drs_score).unwrap_or(my_drs_score)
-                } else {
-                    my_drs_score
-                }
-            } else {
-                my_drs_score
-            };
-
-            votes.add_vote(height, &block_hash, &voter, weight);
-            debug!(
-                "📥 Vote from {} for {}…@{} (drs={:.2})",
-                voter, &block_hash[..8.min(block_hash.len())], height, weight
-            );
-            None
-        }
-
-        ConsensusMsg::Qc { height, block_hash, voter_count, total_drs_weight } => {
-            // Only apply peer QCs for heights ahead of what we already have.
-            let our_height = state.get_block_height().as_u64();
-            if height <= our_height {
-                debug!("📜 QC h={height} already at/behind our tip ({our_height}) — skip");
-                return None;
-            }
-
-            // Verify validator floor + DRS quorum threshold are both met.
-            let total_w = total_active_drs_weight(state).max(1.0);
-            let active_n = active_validator_count(state);
-            if !meets_validator_floor(state) {
-                warn!(
-                    "📜 QC h={height} solo-node mode: {} validators (need {})",
-                    active_n, MIN_VALIDATORS_FOR_FINALITY
-                );
-                // Accept in solo mode — see has_finality()
-            }
-            if !has_quorum(total_drs_weight, total_w) {
-                warn!(
-                    "📜 QC h={height} below quorum ({total_drs_weight:.1}/{total_w:.1}) — ignoring"
-                );
-                return None;
-            }
-
-            info!(
-                "📜 QC h={height} hash={}… voters={voter_count} drs={total_drs_weight:.1}/{total_w:.1}",
-                &block_hash[..8.min(block_hash.len())]
-            );
-
-            // Look up the cached proposal block.
-            match proposal_cache.get(height, &block_hash) {
-                Some(block_json) => Some(ConsensusAction::FinalizeBlock {
-                    height,
-                    block_json: block_json.clone(),
-                }),
-                None => {
-                    warn!("📜 QC h={height} — block not in proposal cache, cannot finalize (need sync)");
-                    None
-                }
-            }
-        }
-
-        ConsensusMsg::ViewChange { height, epoch, new_round, voter, payload } => {
-            if voter == my_address {
-                return None; // ignore our own re-broadcast
-            }
-            match serde_json::from_value::<ego_consensus::consensus::fork_choice::ViewChangeMsg>(payload) {
-                Ok(vc_msg) => match vc_msg.verify() {
-                    Ok(true) => {
-                        match bft_engine.receive_view_change(vc_msg) {
-                            Ok(Some(r)) => info!(
-                                "🔄 View-change quorum at h={height} — advancing to round {r}"
-                            ),
-                            Ok(None) => debug!(
-                                "📩 View-change from {voter} h={height} r={new_round} (collecting)"
-                            ),
-                            Err(e) => warn!("View-change error from {voter}: {e}"),
-                        }
-                    }
-                    Ok(false) => warn!("View-change from {voter} h={height} — bad signature"),
-                    Err(e)    => warn!("View-change verify error from {voter}: {e}"),
-                },
-                Err(e) => warn!("Malformed ViewChange payload from {voter} h={height}: {e}"),
-            }
-            None
-        }
-    }
 }
 
 async fn handle_network_event<T>(
@@ -1824,6 +1050,7 @@ fn print_final_stats(node: &Node) {
     println!("  Block height: {}", node.get_block_height());
 }
 
+#[allow(dead_code)]
 async fn generate_proofs(node: &mut Node) -> anyhow::Result<()> {
     if node.has_role(NodeRole::StorageProvider) && !node.shard_ids.is_empty() {
         let shard_id = node.shard_ids[0];

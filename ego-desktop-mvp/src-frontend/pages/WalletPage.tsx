@@ -408,6 +408,12 @@ const WalletPage: React.FC = () => {
     return () => { unsub.then(fn => fn()); };
   }, [myAddress]);
 
+  // Poll balance/TX every 5s to prevent stale UI if event missed
+  useEffect(() => {
+    const id = setInterval(load, 5000);
+    return () => clearInterval(id);
+  }, []);
+
   async function load() {
     try {
       const bal = await invoke<Balance>('get_balance');

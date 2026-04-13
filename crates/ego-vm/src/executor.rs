@@ -4,20 +4,54 @@ use crate::host::{HostCtx, ru_cost};
 use crate::state::{ContractState, StateStore};
 use crate::types::*;
 
+// ── Constants ─────────────────────────────────────────────────────────────────
+/// Max bytes for a storage key prefix or key string.
+const MAX_STORAGE_KEY_LEN: i32   = 256;
+/// Max bytes for a single storage value.
+const MAX_STORAGE_VAL_LEN: i32   = 65_536; // 64 KB
+/// Cross-calls cannot request more fuel than a full top-level call.
+const MAX_CROSS_CALL_FUEL: u64   = DEFAULT_CALL_FUEL;
+
+// ── Shared WASM engine + compiled-module cache ────────────────────────────────
+static WASM_ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
+static MODULE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Module>>
+> = std::sync::OnceLock::new();
+
+fn get_engine() -> &'static Engine {
+    WASM_ENGINE.get_or_init(|| {
+        let mut config = Config::new();
+        config.consume_fuel(true);
+        config.max_wasm_stack(512 * 1024);
+        Engine::new(&config).expect("Wasmtime engine init failed")
+    })
+}
+
+/// Returns a compiled Module for the given WASM bytes, reusing a cached
+/// version when the blake3 code-hash matches (avoids re-JIT per call).
+fn get_or_compile(wasm_bytes: &[u8]) -> Result<Module, VmError> {
+    let code_hash = hex::encode(blake3::hash(wasm_bytes).as_bytes());
+    let cache = MODULE_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    {
+        if let Some(m) = cache.lock().unwrap().get(&code_hash) {
+            return Ok(m.clone());
+        }
+    }
+    let module = Module::new(get_engine(), wasm_bytes)
+        .map_err(|e| VmError::CompileError(e.to_string()))?;
+    cache.lock().unwrap().insert(code_hash, module.clone());
+    Ok(module)
+}
+
 pub struct Executor {
-    engine: Engine,
     pub store: StateStore,
 }
 
 impl Executor {
     pub fn new(data_dir: std::path::PathBuf) -> Result<Self, VmError> {
-        let mut config = Config::new();
-        config.consume_fuel(true);
-        config.max_wasm_stack(512 * 1024);
-        let engine = Engine::new(&config)
-            .map_err(|e| VmError::CompileError(e.to_string()))?;
+        let _ = get_engine(); // ensure static engine is initialized
         Ok(Self {
-            engine,
             store: StateStore::new(data_dir),
         })
     }
@@ -54,8 +88,7 @@ impl Executor {
             });
         }
 
-        let module = Module::new(&self.engine, wasm_bytes)
-            .map_err(|e| VmError::CompileError(e.to_string()))?;
+        let module = get_or_compile(wasm_bytes)?;
 
         let ctx = HostCtx::new(
             contract_addr.clone(),
@@ -101,8 +134,7 @@ impl Executor {
     ) -> Result<CallResult, VmError> {
 
         let wasm_bytes = self.store.load_code(contract_addr)?;
-        let module = Module::new(&self.engine, &wasm_bytes)
-            .map_err(|e| VmError::CompileError(e.to_string()))?;
+        let module = get_or_compile(&wasm_bytes)?;
 
         let state = self.store.load_state(contract_addr);
         let ctx = HostCtx::new(
@@ -115,8 +147,8 @@ impl Executor {
 
         match self.run_entrypoint(&module, ctx, entrypoint, args, fuel) {
             Ok((ctx_out, ru_used)) => {
-
-                self.store.save_state(contract_addr, &ctx_out.state)?;
+                // Collect primary state — do NOT commit yet (prevents reentrancy window).
+                let primary_state = ctx_out.state.clone();
 
                 let mut all_events = ctx_out.events.clone();
                 let mut all_transfers = ctx_out.transfers.clone();
@@ -131,7 +163,7 @@ impl Executor {
                             let cross_wasm = match self.store.load_code(&cross_req.contract_addr) {
                                 Ok(w) => w, Err(_) => continue,
                             };
-                            let cross_module = match Module::new(&self.engine, &cross_wasm) {
+                            let cross_module = match get_or_compile(&cross_wasm) {
                                 Ok(m) => m, Err(_) => continue,
                             };
                             let cross_state = self.store.load_state(&cross_req.contract_addr);
@@ -143,13 +175,15 @@ impl Executor {
                                 cross_state,
                             );
                             cross_ctx.call_depth = depth;
+                            // Cap cross-call fuel to prevent unbounded resource use.
+                            let cross_fuel = cross_req.fuel.min(MAX_CROSS_CALL_FUEL);
 
                             if let Ok((cross_out, cross_ru)) = self.run_entrypoint(
                                 &cross_module,
                                 cross_ctx,
                                 &cross_req.entrypoint,
                                 &cross_req.args,
-                                cross_req.fuel,
+                                cross_fuel,
                             ) {
                                 all_events.extend(cross_out.events);
                                 all_transfers.extend(cross_out.transfers.clone());
@@ -161,6 +195,11 @@ impl Executor {
                     }
                     depth += 1;
                 }
+
+                // Commit primary contract state only after all cross-calls complete,
+                // eliminating the reentrancy window where a cross-call could read
+                // a partially-written primary state.
+                self.store.save_state(contract_addr, &primary_state)?;
 
                 Ok(CallResult {
                     success:    true,
@@ -198,13 +237,13 @@ impl Executor {
         args:       &[u8],
         fuel:       u64,
     ) -> Result<(HostCtx, u64), VmError> {
-        let mut store = Store::new(&self.engine, ctx);
+        let mut store = Store::new(get_engine(), ctx);
         store.set_fuel(fuel)
             .map_err(|e| VmError::ExecutionError(e.to_string()))?;
 
         store.limiter(|ctx| &mut ctx.limiter);
 
-        let linker = build_linker(&self.engine)?;
+        let linker = build_linker(get_engine())?;
 
         let instance = linker.instantiate(&mut store, module)
             .map_err(|e| VmError::InstantiationError(e.to_string()))?;
@@ -286,7 +325,8 @@ impl Executor {
 }
 
 fn build_linker(engine: &Engine) -> Result<Linker<HostCtx>, VmError> {
-    let mut linker = Linker::<HostCtx>::new(engine);
+    let _ = engine; // use static engine
+    let mut linker = Linker::<HostCtx>::new(get_engine());
 
     linker.func_wrap("env", "storage_get", |mut caller: Caller<'_, HostCtx>,
         prefix_ptr: i32, prefix_len: i32,
@@ -321,6 +361,10 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostCtx>, VmError> {
         key_ptr: i32, key_len: i32,
         val_ptr: i32, val_len: i32|
     {
+        // Enforce key and value size limits to prevent DoS via state bloat.
+        if prefix_len < 0 || prefix_len > MAX_STORAGE_KEY_LEN { return; }
+        if key_len    < 0 || key_len    > MAX_STORAGE_KEY_LEN { return; }
+        if val_len    < 0 || val_len    > MAX_STORAGE_VAL_LEN { return; }
         caller.data_mut().host_ru += ru_cost::STORAGE_SET;
         let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) {
             Some(m) => m, None => return,
@@ -427,10 +471,15 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostCtx>, VmError> {
         }
     }).map_err(|e| VmError::ExecutionError(e.to_string()))?;
 
-    linker.func_wrap("env", "urego_assert", |_caller: Caller<'_, HostCtx>, cond: i32| {
+    // Returns Result so a failing assertion raises a Wasmtime trap instead of
+    // panicking the host process.
+    linker.func_wrap("env", "urego_assert", |_caller: Caller<'_, HostCtx>, cond: i32|
+        -> Result<(), anyhow::Error>
+    {
         if cond == 0 {
-            panic!("assertion failed");
+            anyhow::bail!("urego assertion failed");
         }
+        Ok(())
     }).map_err(|e| VmError::ExecutionError(e.to_string()))?;
 
     // ════════════════════════════════════════════════════════════════════════
@@ -611,11 +660,13 @@ fn build_linker(engine: &Engine) -> Result<Linker<HostCtx>, VmError> {
         let contract = match read_str(&data, contract_ptr, contract_len) { Some(s) => s, None => return 0 };
         let entrypoint = match read_str(&data, fn_ptr, fn_len) { Some(s) => s, None => return 0 };
         let args = read_bytes(&data, args_ptr, args_len).unwrap_or_default();
+        // Cap fuel to prevent contracts from injecting unlimited compute budgets.
+        let capped_fuel = (fuel as u64).min(MAX_CROSS_CALL_FUEL);
         caller.data_mut().pending_cross_calls.push(crate::host::CrossCallRequest {
             contract_addr: contract,
             entrypoint,
             args,
-            fuel: fuel as u64,
+            fuel: capped_fuel,
         });
         1
     }).map_err(|e| VmError::ExecutionError(e.to_string()))?;
@@ -633,7 +684,7 @@ fn read_str(mem: &[u8], ptr: i32, len: i32) -> Option<String> {
 fn read_bytes(mem: &[u8], ptr: i32, len: i32) -> Option<Vec<u8>> {
     if ptr < 0 || len < 0 { return None; }
     let start = ptr as usize;
-    let end   = start + len as usize;
+    let end   = start.checked_add(len as usize)?; // overflow-safe
     if end > mem.len() { return None; }
     Some(mem[start..end].to_vec())
 }

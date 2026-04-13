@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use crate::error::VmError;
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ContractState {
 
     pub data: HashMap<String, HashMap<String, String>>,
@@ -69,7 +69,12 @@ impl StateStore {
             .map_err(|e| VmError::StorageError(e.to_string()))?;
         let data = serde_json::to_string_pretty(state)
             .map_err(|e| VmError::StorageError(e.to_string()))?;
-        std::fs::write(dir.join("state.json"), data)
+        // Atomic write: write to a temp file then rename to avoid partial-write corruption.
+        let final_path = dir.join("state.json");
+        let tmp_path   = dir.join("state.json.tmp");
+        std::fs::write(&tmp_path, &data)
+            .map_err(|e| VmError::StorageError(e.to_string()))?;
+        std::fs::rename(&tmp_path, &final_path)
             .map_err(|e| VmError::StorageError(e.to_string()))
     }
 
