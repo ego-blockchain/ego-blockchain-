@@ -80,7 +80,7 @@ pub const P2P_PORT: u16 = 47393;
 
 pub const RELAY_NODES: &[&str] = &[
     // Primary oracle relay (egoblockchain.com VPS)
-    "/dns4/EgoRelay.egoblockchain.com/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz",
+    "/dns4/EgoRelay.egoblockchain.com/tcp/4001/p2p/12D3KooWPj6m7jzmVyMh1zWrsoux3YiVs9j2HwsjrFXzDcqAGGz4",
     // Founder home node — DuckDNS fallback (port 47393 forwarded, auto-updated every 5min)
     "/dns4/ego-discreet.duckdns.org/tcp/47393/p2p/12D3KooWCgHu8eV41nL7xdw9UKXSi6ayzEJf2W5iGmq6VMUdpyaz",
     // ^ uncomment after: 1) port-forward 47393 on Telus router, 2) get PeerID from app logs
