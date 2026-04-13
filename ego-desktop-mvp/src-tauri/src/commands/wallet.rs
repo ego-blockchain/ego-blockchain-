@@ -203,6 +203,13 @@ pub async fn send_transaction(
     let _ = ledger.save();
 
     {
+        let tx_gossip = tx.clone();
+        tauri::async_runtime::spawn(async move {
+            crate::p2p::broadcast_pending_tx(tx_gossip).await;
+        });
+    }
+
+    {
         let to_email = ledger.registered_email.clone();
         let amount_egoc = format!("{:.6} EGOC", request.amount as f64 / 1_000_000.0);
         let recipient = request.to_address.clone();

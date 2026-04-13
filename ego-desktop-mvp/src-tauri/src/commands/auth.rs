@@ -304,6 +304,7 @@ fn create_wallet_files(address_override: Option<&str>) -> Result<String, EgoDesk
             tx_merkle_root: String::new(),
         poc_ticket: String::new(),
         poc_slot: 0,
+        state_root: String::new(),
         });
         save_chain(&chain).map_err(EgoDesktopError::WalletError)?;
     }
@@ -811,17 +812,28 @@ pub async fn get_address(_state: State<'_, AppState>) -> Result<Option<String>, 
     }
 }
 
-fn generate_recovery_phrase(keypair: &KeyPair) -> EgoResult<Vec<String>> {
+/// Encode the wallet's 32-byte seed as a 24-word BIP39-compatible mnemonic.
+///
+/// The seed (NOT the keypair serialization) is the source of truth — this
+/// ensures `restore_keypair_from_phrase` is the true inverse and actually
+/// recovers the original wallet.
+///
+/// Encoding: seed[32] + SHA256(seed)[0] (checksum) → 264 bits → 24 × 11-bit
+/// word indices → BIP39 English wordlist.  Same bit-packing as BIP39 spec.
+fn generate_recovery_phrase(_keypair: &KeyPair) -> EgoResult<Vec<String>> {
     let wordlist = get_bip39_wordlist();
 
-    let keypair_bytes = keypair.to_bytes();
-    let seed_bytes    = &keypair_bytes[..keypair_bytes.len().min(32)];
-    let checksum_hash = ego_core::hash_data(seed_bytes);
-    let checksum_byte = checksum_hash.as_bytes()[0];
+    // Use the raw 32-byte seed from disk — NOT keypair.to_bytes().
+    // This guarantees the phrase encodes exactly what is needed to restore.
+    let seed_bytes = crate::ledger::load_seed()
+        .ok_or_else(|| EgoDesktopError::CryptoError("Seed unavailable for phrase generation".into()))?;
+
+    // BIP39 checksum: first byte of SHA256(entropy).
+    // We use BLAKE3 (our canonical hash) for the checksum byte.
+    let checksum_byte = ego_core::hash_data(&seed_bytes).as_bytes()[0];
 
     let mut buf = [0u8; 33];
-    let copy_len = seed_bytes.len().min(32);
-    buf[..copy_len].copy_from_slice(&seed_bytes[..copy_len]);
+    buf[..32].copy_from_slice(&seed_bytes);
     buf[32] = checksum_byte;
 
     let mut words = Vec::with_capacity(24);
@@ -841,15 +853,69 @@ fn generate_recovery_phrase(keypair: &KeyPair) -> EgoResult<Vec<String>> {
     Ok(words)
 }
 
+/// Decode a 24-word mnemonic back to the original 32-byte seed and restore the keypair.
+///
+/// This is the true inverse of `generate_recovery_phrase`.  It verifies the
+/// checksum so invalid phrases are rejected before any key material is written.
 fn restore_keypair_from_phrase(phrase: &[String]) -> EgoResult<KeyPair> {
     if phrase.len() != 24 {
         return Err(EgoDesktopError::InvalidInput(
-            "Recovery phrase must be 24 words".into(),
+            "Recovery phrase must be exactly 24 words".into(),
         ));
     }
-    let phrase_string = phrase.join(" ");
-    let phrase_hash   = ego_core::hash_data(phrase_string.as_bytes());
-    KeyPair::from_bytes(phrase_hash.as_bytes())
+
+    let wordlist = get_bip39_wordlist();
+
+    // Build word → index map for O(1) lookup.
+    let word_to_idx: std::collections::HashMap<&str, u32> = wordlist.iter()
+        .enumerate()
+        .map(|(i, &w)| (w, i as u32))
+        .collect();
+
+    // Decode each word to its 11-bit index.
+    let mut indices = Vec::with_capacity(24);
+    for word in phrase {
+        let idx = word_to_idx.get(word.as_str())
+            .copied()
+            .ok_or_else(|| EgoDesktopError::InvalidInput(
+                format!("Unknown word in recovery phrase: '{}'", word)
+            ))?;
+        indices.push(idx);
+    }
+
+    // Unpack 24 × 11-bit indices back into a 33-byte buffer (264 bits).
+    // This is the exact inverse of the encoding bit-shifts above.
+    let mut buf = [0u8; 33];
+    for (i, &idx) in indices.iter().enumerate() {
+        let bit_offset = i * 11;
+        let byte_idx   = bit_offset / 8;
+        let bit_shift  = bit_offset % 8;
+
+        let raw = (idx & 0x7FF) << (13 - bit_shift as u32);
+        buf[byte_idx]                                    |= ((raw >> 16) & 0xFF) as u8;
+        if byte_idx + 1 < 33 { buf[byte_idx + 1]        |= ((raw >>  8) & 0xFF) as u8; }
+        if byte_idx + 2 < 33 { buf[byte_idx + 2]        |= ( raw        & 0xFF) as u8; }
+    }
+
+    // First 32 bytes = seed; last byte = checksum.
+    let seed      = &buf[..32];
+    let stored_cs = buf[32];
+    let expected_cs = ego_core::hash_data(seed).as_bytes()[0];
+
+    if stored_cs != expected_cs {
+        return Err(EgoDesktopError::InvalidInput(
+            "Invalid recovery phrase: checksum mismatch. Please check every word.".into()
+        ));
+    }
+
+    let mut seed_arr = [0u8; 32];
+    seed_arr.copy_from_slice(seed);
+
+    // Persist the recovered seed so subsequent app launches work without phrase.
+    crate::ledger::save_seed(&seed_arr)
+        .map_err(|e| EgoDesktopError::CryptoError(format!("Save seed: {e}")))?;
+
+    KeyPair::from_bytes(&seed_arr)
         .map_err(|e| EgoDesktopError::CryptoError(format!("{e}")))
 }
 

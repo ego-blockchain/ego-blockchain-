@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { EGOC_PRICE_USD, EGOC_SUPPLY } from '../constants';
+import { useWallet } from '../App';
 
 const EGOC_PRICE = EGOC_PRICE_USD;
 
@@ -251,19 +252,38 @@ function RangeDropdown({ value, onChange }: { value: RangeKey; onChange: (k: Ran
   );
 }
 
+interface ExternalAddress {
+  chain: string; symbol: string; address: string;
+  network: string; address_type: string; explorer_prefix: string;
+  color: string; icon: string; contract: string | null;
+}
+interface BalanceResult { raw: string; formatted: string; usd: number; }
+
+function fmtUsd(v: number): string {
+  if (v >= 1e9)  return '$' + (v / 1e9).toFixed(2) + 'B';
+  if (v >= 1e6)  return '$' + (v / 1e6).toFixed(2) + 'M';
+  if (v >= 1000) return '$' + v.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  if (v >= 1)    return '$' + v.toFixed(2);
+  return '$' + v.toFixed(4);
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 const MarketPage: React.FC = () => {
-  const [rates, setRates]               = useState<Record<string, number>>({});
-  const [ratesLoading, setRatesLoading] = useState(true);
-  const [selected, setSelected]         = useState<typeof COIN_MAP[0] | null>(null);
-  const [rangeKey, setRangeKey]         = useState<RangeKey>('3M');
-  const [chartType, setChartType]       = useState<ChartType>('line');
+  const { wallet }                        = useWallet();
+  const [rates, setRates]                 = useState<Record<string, number>>({});
+  const [ratesLoading, setRatesLoading]   = useState(true);
+  const [selected, setSelected]           = useState<typeof COIN_MAP[0] | null>(null);
+  const [rangeKey, setRangeKey]           = useState<RangeKey>('3M');
+  const [chartType, setChartType]         = useState<ChartType>('line');
+  const [autoBalances, setAutoBalances]   = useState<Record<string, number>>({}); // cgId → qty
+  const [balancesLoading, setBalancesLoading] = useState(false);
 
   // Line data (close prices)
   const [lineData, setLineData]         = useState<number[]>([]);
   // Candle data [o,h,l,c]
   const [candleData, setCandleData]     = useState<[number,number,number,number][]>([]);
 
+  const [chartStartPrices, setChartStartPrices] = useState<Record<string,number>>({});
   const [chartLoading, setChartLoading] = useState(false);
   const [chartError, setChartError]     = useState('');
   const liveRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -343,6 +363,42 @@ const MarketPage: React.FC = () => {
   }, []);
 
   useEffect(() => { fetchChart(null, rangeKey, chartType); }, []);
+
+  // Record the period-open price for each coin as chart data arrives
+  useEffect(() => {
+    if (lineData.length < 2) return;
+    const key = selected ? selected.cgId : 'egoc';
+    setChartStartPrices(prev => ({ ...prev, [key]: lineData[0] }));
+  }, [lineData, selected]);
+
+  // Fetch real balances from multi-chain wallet
+  const fetchWalletBalances = useCallback(async () => {
+    setBalancesLoading(true);
+    try {
+      const addrs = await invoke<ExternalAddress[]>('get_external_addresses');
+      const results: Record<string, number> = {};
+      await Promise.all(COIN_MAP.map(async coin => {
+        // USDT/USDC: chain field = token symbol; native coins: symbol field = chain symbol
+        const ext = (coin.symbol === 'USDT' || coin.symbol === 'USDC')
+          ? addrs.find(a => a.chain === coin.symbol)
+          : addrs.find(a => a.symbol === coin.symbol && !a.contract);
+        if (!ext || ext.address.startsWith('Error:')) return;
+        try {
+          const bal = await invoke<BalanceResult>('fetch_chain_balance', {
+            chainSymbol: ext.symbol,
+            address:     ext.address,
+            contract:    ext.contract ?? null,
+          });
+          const qty = parseFloat(bal.formatted);
+          if (qty > 0) results[coin.cgId] = qty;
+        } catch {}
+      }));
+      setAutoBalances(results);
+    } catch {}
+    setBalancesLoading(false);
+  }, []);
+
+  useEffect(() => { fetchWalletBalances(); }, [fetchWalletBalances]);
 
   function selectCoin(coin: typeof COIN_MAP[0] | null) { setSelected(coin); fetchChart(coin, rangeKey, chartType); }
   function changeRange(rk: RangeKey) { setRangeKey(rk); fetchChart(selected, rk, chartType); }
@@ -432,6 +488,96 @@ const MarketPage: React.FC = () => {
         </div>
       </div>
 
+      {/* Portfolio Card */}
+      {(() => {
+        const egocBalance  = (wallet?.balance_uegoc ?? 0) / 1_000_000;
+        const egocValueUsd = egocBalance * EGOC_PRICE;
+        const egocStart    = chartStartPrices['egoc'];
+        const egocPl       = egocStart ? (EGOC_PRICE - egocStart) / egocStart * 100 : null;
+
+        const heldCoins    = COIN_MAP.filter(c => (autoBalances[c.cgId] ?? 0) > 0);
+        const heldTotal    = heldCoins.reduce((s, c) => s + (autoBalances[c.cgId] ?? 0) * (rates[c.cgId] ?? 0), 0);
+        const totalUsd     = egocValueUsd + heldTotal;
+
+        return (
+          <div className="bg-gray-800 border border-gray-700 rounded-2xl overflow-hidden">
+            {/* Header */}
+            <div className="px-5 py-4 border-b border-gray-700/60 flex items-center justify-between">
+              <div>
+                <h2 className="text-sm font-semibold">My Portfolio</h2>
+                <p className="text-[11px] text-gray-500 mt-0.5">Live balances from multi-chain wallet · P&amp;L vs {currentRange.label} open</p>
+              </div>
+              <div className="flex items-center gap-3">
+                <button onClick={fetchWalletBalances} disabled={balancesLoading}
+                  className="text-[10px] text-gray-400 hover:text-gray-200 transition disabled:opacity-40">
+                  {balancesLoading ? '⟳' : '⟳ Sync'}
+                </button>
+                <div className="text-right">
+                  <div className="text-[10px] text-gray-500 uppercase tracking-wide">Total Value</div>
+                  <div className="text-base font-bold">{fmtUsd(totalUsd)}</div>
+                </div>
+              </div>
+            </div>
+
+            {/* EGOC — from Ego wallet */}
+            <div className="px-5 py-3 flex items-center gap-3 border-b border-gray-700/30">
+              <img src="/egoc.png" alt="EGOC" className="w-7 h-7 rounded-full object-contain shrink-0" style={{ background: '#0a0f1e' }} />
+              <div className="flex-1 min-w-0">
+                <div className="text-xs font-semibold flex items-center gap-1.5">EGOC
+                  <span className="text-yellow-400 text-[9px] font-bold bg-yellow-400/15 px-1 py-px rounded">TEST</span>
+                </div>
+                <div className="text-[11px] text-gray-500">
+                  {egocBalance.toLocaleString(undefined, { maximumFractionDigits: 4 })} EGOC
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="text-xs font-semibold">{fmtUsd(egocValueUsd)}</div>
+                {egocPl !== null
+                  ? <div className={`text-[11px] font-medium ${egocPl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      {egocPl >= 0 ? '+' : ''}{egocPl.toFixed(2)}%
+                    </div>
+                  : <div className="text-[11px] text-gray-600">select EGOC ↓</div>
+                }
+              </div>
+            </div>
+
+            {/* Multi-chain wallet balances */}
+            {balancesLoading && heldCoins.length === 0 ? (
+              <div className="px-5 py-4 text-[11px] text-gray-500 text-center">Syncing wallet balances…</div>
+            ) : heldCoins.length === 0 ? (
+              <div className="px-5 py-4 text-[11px] text-gray-600 text-center">No other coin balances found in multi-chain wallet</div>
+            ) : heldCoins.map(coin => {
+              const qty        = autoBalances[coin.cgId] ?? 0;
+              const price      = rates[coin.cgId] ?? 0;
+              const valueUsd   = qty * price;
+              const startPrice = chartStartPrices[coin.cgId];
+              const coinPl     = startPrice && price ? (price - startPrice) / startPrice * 100 : null;
+              return (
+                <div key={coin.cgId} className="px-5 py-3 flex items-center gap-3 border-b border-gray-700/30">
+                  <div className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold shrink-0"
+                    style={{ background: coin.color + '22', color: coin.color }}>{coin.icon}</div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs font-semibold">{coin.symbol}</div>
+                    <div className="text-[11px] text-gray-500">
+                      {qty.toLocaleString(undefined, { maximumFractionDigits: 8 })}
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-xs font-semibold">{fmtUsd(valueUsd)}</div>
+                    {coinPl !== null
+                      ? <div className={`text-[11px] font-medium ${coinPl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                          {coinPl >= 0 ? '+' : ''}{coinPl.toFixed(2)}%
+                        </div>
+                      : <div className="text-[11px] text-gray-600">select coin ↓</div>
+                    }
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        );
+      })()}
+
       {/* Coin list */}
       <div>
         <div className="flex items-center justify-between mb-2">
@@ -459,18 +605,29 @@ const MarketPage: React.FC = () => {
 
         <div className="space-y-1">
           {COIN_MAP.map(coin => {
-            const price = rates[coin.cgId] ?? 0;
+            const price    = rates[coin.cgId] ?? 0;
             const isActive = selected?.id === coin.id;
+            const heldQty  = autoBalances[coin.cgId] ?? 0;
             return (
               <button key={coin.id} onClick={() => selectCoin(coin)}
-                className={`w-full flex items-center justify-between rounded-xl px-4 py-3 transition border ${isActive?'bg-blue-600/10 border-blue-600/40':'bg-gray-800 border-gray-700/50 hover:border-gray-600'}`}>
+                className={`w-full flex items-center justify-between rounded-xl px-4 py-3 transition border ${isActive ? 'bg-blue-600/10 border-blue-600/40' : 'bg-gray-800 border-gray-700/50 hover:border-gray-600'}`}>
                 <div className="flex items-center gap-3">
                   <div className="w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold shrink-0"
-                    style={{ background: coin.color+'22', color: coin.color }}>{coin.icon}</div>
-                  <div className="text-left"><div className="text-sm font-semibold">{coin.symbol}</div><div className="text-xs text-gray-500">{coin.name}</div></div>
+                    style={{ background: coin.color + '22', color: coin.color }}>{coin.icon}</div>
+                  <div className="text-left">
+                    <div className="text-sm font-semibold">{coin.symbol}</div>
+                    <div className="text-xs text-gray-500">{coin.name}</div>
+                  </div>
                 </div>
-                <div className="text-sm font-semibold">
-                  {ratesLoading && !price ? <span className="text-gray-500 text-xs">Loading…</span> : fmtPrice(price)}
+                <div className="flex items-center gap-3">
+                  {heldQty > 0 && (
+                    <div className="text-[10px] text-gray-500">
+                      {heldQty.toLocaleString(undefined, { maximumFractionDigits: 6 })} held
+                    </div>
+                  )}
+                  <div className="text-sm font-semibold">
+                    {ratesLoading && !price ? <span className="text-gray-500 text-xs">Loading…</span> : fmtPrice(price)}
+                  </div>
                 </div>
               </button>
             );

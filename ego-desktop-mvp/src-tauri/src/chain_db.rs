@@ -197,6 +197,7 @@ fn seed_genesis(db: &DB) {
         tx_merkle_root: String::new(),
         poc_ticket: String::new(),
         poc_slot: 0,
+        state_root: String::new(),
     };
     write_block_batch(db, &genesis, &[]);
 
@@ -234,6 +235,7 @@ fn migrate_from_sqlite(db: &DB, path: &std::path::Path) -> bool {
             tx_merkle_root: String::new(),
             poc_ticket: String::new(),
             poc_slot: 0,
+            state_root: String::new(),
         })
     }).unwrap().filter_map(|r| r.ok()).collect();
 
@@ -329,19 +331,67 @@ pub const CHECKPOINTS: &[(u64, &str)] = &[
     // (height, expected_block_hash)
     // Genesis is always checkpoint 0 — immovable anchor.
     (0, "ego00000000000000000000000000000000000000000000000000000000genesis1"),
-    // Add production checkpoints here as the chain grows, e.g.:
-    // (100_000, "abc123..."),
-    // (500_000, "def456..."),
+    // Production checkpoints added here after each major milestone.
+    // Dynamic checkpoints are also stored in RocksDB (see below).
 ];
 
-/// Returns Err if `block` contradicts a known checkpoint.
+/// How often (in blocks) a dynamic checkpoint is automatically written.
+/// Every 10,000 blocks (~8.3 hours at 3s/block) the block hash is stored in
+/// RocksDB and used to reject any peer-supplied chain that forks before it.
+pub const CHECKPOINT_INTERVAL: u64 = 10_000;
+
+const META_CHECKPOINT_PREFIX: &[u8] = b"ckpt:";
+
+fn checkpoint_meta_key(height: u64) -> Vec<u8> {
+    let mut k = META_CHECKPOINT_PREFIX.to_vec();
+    k.extend_from_slice(&height.to_be_bytes());
+    k
+}
+
+/// Store a dynamic checkpoint for `block` in RocksDB.
+/// Called automatically in write_block_batch every CHECKPOINT_INTERVAL blocks.
+fn store_dynamic_checkpoint(db: &DB, block: &LedgerBlock) {
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return };
+    let key = checkpoint_meta_key(block.height);
+    // Only store if not already set (first finalized block at this height wins).
+    if db.get_cf(cf, &key).ok().flatten().is_none() {
+        let _ = db.put_cf(cf, key, block.hash.as_bytes());
+        eprintln!("[Checkpoint] Stored dynamic checkpoint at height {} ({}…)",
+            block.height, &block.hash[..16.min(block.hash.len())]);
+    }
+}
+
+/// Load the dynamic checkpoint hash for `height` from RocksDB.
+/// Returns None if no checkpoint has been stored at that height yet.
+pub fn get_dynamic_checkpoint(height: u64) -> Option<String> {
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_META)?;
+    db.get_cf(cf, checkpoint_meta_key(height)).ok().flatten()
+        .and_then(|b| String::from_utf8(b.to_vec()).ok())
+}
+
+/// Returns Err if `block` contradicts a known checkpoint (hardcoded or dynamic).
 pub fn check_checkpoint(block: &LedgerBlock) -> Result<(), String> {
+    // 1. Hardcoded checkpoints (genesis + post-launch milestones).
     for &(cp_height, cp_hash) in CHECKPOINTS {
         if block.height == cp_height && block.hash != cp_hash {
             return Err(format!(
-                "checkpoint violation at height {}: expected {} got {}",
+                "hardcoded checkpoint violation at height {}: expected {} got {}",
                 cp_height, cp_hash, block.hash
             ));
+        }
+    }
+    // 2. Dynamic checkpoints stored in RocksDB.
+    if block.height > 0 && block.height % CHECKPOINT_INTERVAL == 0 {
+        if let Some(stored_hash) = get_dynamic_checkpoint(block.height) {
+            if stored_hash != block.hash {
+                return Err(format!(
+                    "dynamic checkpoint violation at height {}: expected {}… got {}…",
+                    block.height,
+                    &stored_hash[..16.min(stored_hash.len())],
+                    &block.hash[..16.min(block.hash.len())]
+                ));
+            }
         }
     }
     Ok(())
@@ -399,13 +449,39 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
         if db.get_cf(cf_txs, tx.hash.as_bytes()).ok().flatten().is_some() {
             continue;
         }
-        *balance_delta.entry(tx.to.clone()).or_insert(0) += tx.amount as i128;
+
+        // ── Max supply enforcement ────────────────────────────────────────────
+        // When the node pool is the source (coinbase), cap the outgoing amount to
+        // the pool's current balance. This prevents any block — local or peer —
+        // from inflating supply past the genesis-allocated NODE_POOL_UEGOC.
+        let credited_amount = if tx.from == NODE_POOL_ADDR && tx.amount > 0 {
+            let pool_bal: u64 = db.get_cf(cf_balances, NODE_POOL_ADDR.as_bytes())
+                .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+            // Apply any earlier delta for NODE_POOL_ADDR in this same batch
+            let pending_delta = *balance_delta.get(NODE_POOL_ADDR).unwrap_or(&0);
+            let effective_pool = (pool_bal as i128 + pending_delta).max(0) as u64;
+            let capped = tx.amount.min(effective_pool);
+            if capped < tx.amount {
+                eprintln!(
+                    "[ChainDB] Max supply cap: coinbase {} capped from {} to {} uEGOC (pool={})",
+                    &tx.hash[..tx.hash.len().min(12)], tx.amount, capped, effective_pool
+                );
+            }
+            capped
+        } else {
+            tx.amount
+        };
+
+        *balance_delta.entry(tx.to.clone()).or_insert(0) += credited_amount as i128;
         let is_system_source = tx.from == FAUCET_ADDR
             || tx.from == NODE_POOL_ADDR
             || tx.from.is_empty();
         if !is_system_source {
             let total_out = tx.amount as i128 + tx.fee_uegoc as i128;
             *balance_delta.entry(tx.from.clone()).or_insert(0) -= total_out;
+        } else if tx.from == NODE_POOL_ADDR {
+            // Debit the node pool so it actually decreases — enforces hard supply cap.
+            *balance_delta.entry(NODE_POOL_ADDR.to_string()).or_insert(0) -= credited_amount as i128;
         }
         new_tx_count += 1;
     }
@@ -465,12 +541,27 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
     batch.put_cf(cf_meta, META_TX_COUNT, u64_le(cur_tx_count + new_tx_count));
 
+    // Persist confirmed nonces atomically with the block write so replay
+    // protection survives node restarts.  Only non-system senders have nonces.
+    for tx in &confirmed_txs {
+        let is_system = tx.from == FAUCET_ADDR || tx.from == NODE_POOL_ADDR || tx.from.is_empty();
+        if !is_system && tx.nonce > 0 {
+            persist_nonce_in_batch(&mut batch, &db, &tx.from, tx.nonce);
+        }
+    }
+
     db.write(batch).expect("RocksDB write batch");
 
     // Write light header to CF_HEADERS (kept for a larger window than full block data).
     let cf_hdrs = db.cf_handle(CF_HEADERS).unwrap();
     let hdr = LightBlockHeader::from(block);
     db.put_cf(cf_hdrs, height_key(block.height), encode(&hdr)).ok();
+
+    // Dynamic checkpoint: every CHECKPOINT_INTERVAL blocks store the hash in CF_META.
+    // This protects against long-range attacks on intervals not covered by hardcoded checkpoints.
+    if block.height > 0 && block.height % CHECKPOINT_INTERVAL == 0 {
+        store_dynamic_checkpoint(db, block);
+    }
 
     // Prune old data to keep disk bounded.
     prune_if_needed(db);
@@ -758,10 +849,52 @@ pub fn block_hash_for(
     tx_merkle_root:  &str,
     poc_ticket:      &str,
 ) -> String {
+    // v2 format — kept for backwards compatibility with existing blocks.
     let input = format!(
         "ego/block/v2:{prev_hash}:{height}:{miner}:{timestamp}:{tx_merkle_root}:{poc_ticket}"
     );
     blake3::hash(input.as_bytes()).to_hex().to_string()
+}
+
+/// v3 block hash — includes the state delta root so any tampering with account
+/// balances changes the block hash and breaks every subsequent block's prev_hash.
+/// All new blocks are produced with this format.
+pub fn block_hash_v3(
+    prev_hash:       &str,
+    height:          u64,
+    miner:           &str,
+    timestamp:       i64,
+    tx_merkle_root:  &str,
+    poc_ticket:      &str,
+    state_root:      &str,
+) -> String {
+    let input = format!(
+        "ego/block/v3:{prev_hash}:{height}:{miner}:{timestamp}:{tx_merkle_root}:{poc_ticket}:{state_root}"
+    );
+    blake3::hash(input.as_bytes()).to_hex().to_string()
+}
+
+/// Compute the state delta root from a balance-change map.
+/// Sorts entries by address (lexicographic) then hashes each as `"addr:balance_u64_le"`.
+/// Returns a 64-char hex string.  Empty map → 64 zeros (empty-state sentinel).
+pub fn compute_state_delta_root(balance_delta: &std::collections::HashMap<String, u64>) -> String {
+    if balance_delta.is_empty() {
+        return "0".repeat(64);
+    }
+    let mut entries: Vec<(&String, &u64)> = balance_delta.iter().collect();
+    entries.sort_by_key(|(addr, _)| addr.as_str());
+    let leaf_hashes: Vec<&str>;
+    let leaf_strings: Vec<String> = entries.iter()
+        .map(|(addr, bal)| {
+            let mut leaf = Vec::with_capacity(addr.len() + 9);
+            leaf.extend_from_slice(addr.as_bytes());
+            leaf.push(b':');
+            leaf.extend_from_slice(&bal.to_le_bytes());
+            blake3::hash(&leaf).to_hex().to_string()
+        })
+        .collect();
+    let refs: Vec<&str> = leaf_strings.iter().map(|s| s.as_str()).collect();
+    compute_merkle_root(&refs)
 }
 
 pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc_slot: u64) -> LedgerBlock {
@@ -815,10 +948,46 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
     let tx_hashes: Vec<&str> = stamped.iter().map(|t| t.hash.as_str()).collect();
     let tx_merkle_root = compute_merkle_root(&tx_hashes);
 
-    // ── 3. Block hash now commits to prev_hash + tx_merkle_root + poc_ticket.
-    //       Any change to any transaction breaks the merkle root, which breaks
-    //       this block's hash, which breaks every subsequent block's prev_hash.
-    let hash = block_hash_for(&prev_hash, height, miner, timestamp, &tx_merkle_root, poc_ticket);
+    // ── 3. Compute balance-delta state root BEFORE hashing the block.
+    //       This commits the account-state changes so any DB tampering is
+    //       detectable: changing a balance changes state_root → changes block hash.
+    //
+    //       IMPORTANT: accumulate signed i128 deltas first, then apply once per
+    //       address.  The naive insert() approach overwrites earlier entries for
+    //       the same address when multiple TXs touch it in one block, producing a
+    //       state_root that disagrees with what write_block_batch actually commits.
+    let balance_delta_for_root = {
+        let cf_bal = db.cf_handle(CF_BALANCES).unwrap();
+        // Phase 1: accumulate signed deltas — same logic as write_block_batch.
+        let mut deltas: std::collections::HashMap<String, i128> = Default::default();
+        for tx in &stamped {
+            if !tx.to.is_empty() {
+                *deltas.entry(tx.to.clone()).or_insert(0) += tx.amount as i128;
+            }
+            let is_system = tx.from.is_empty()
+                || tx.from == NODE_POOL_ADDR
+                || tx.from.starts_with("egot1faucet")
+                || tx.from.starts_with("ego1genesis");
+            if !is_system {
+                let out = tx.amount as i128 + tx.fee_uegoc as i128;
+                *deltas.entry(tx.from.clone()).or_insert(0) -= out;
+            }
+        }
+        // Phase 2: apply each delta to the current DB balance, clamp to 0.
+        let mut result: std::collections::HashMap<String, u64> = Default::default();
+        for (addr, delta) in &deltas {
+            let old: u64 = db.get_cf(cf_bal, addr.as_bytes())
+                .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+            result.insert(addr.clone(), (old as i128 + delta).max(0) as u64);
+        }
+        result
+    };
+    let state_root = compute_state_delta_root(&balance_delta_for_root);
+
+    // ── 4. Block hash (v3) commits to prev_hash + tx_merkle_root + poc_ticket + state_root.
+    //       Any tampering with transactions OR balances breaks this hash, which
+    //       breaks every subsequent block's prev_hash (Bitcoin domino effect).
+    let hash = block_hash_v3(&prev_hash, height, miner, timestamp, &tx_merkle_root, poc_ticket, &state_root);
 
     let block = LedgerBlock {
         height,
@@ -834,13 +1003,128 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
         tx_merkle_root,
         poc_ticket: poc_ticket.to_string(),
         poc_slot,
+        state_root,
     };
 
     write_block_batch(&db, &block, &stamped);
     block
 }
 
+pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc_slot: u64) -> (LedgerBlock, Vec<LedgerTx>) {
+    let db = get_db().lock().expect("chain_db lock poisoned");
+
+    let (latest_height, prev_hash) = {
+        let cf_meta = db.cf_handle(CF_META).expect("CF_META missing");
+        let h = db.get_cf(cf_meta, META_LATEST_HEIGHT)
+            .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+        let cf_blocks = db.cf_handle(CF_BLOCKS).expect("CF_BLOCKS missing");
+        let hash = db.get_cf(cf_blocks, height_key(h))
+            .ok().flatten()
+            .and_then(|v| decode::<LedgerBlock>(&v))
+            .map(|b| b.hash)
+            .unwrap_or_else(|| GENESIS_HASH.to_string());
+        (h, hash)
+    };
+
+    let height    = latest_height + 1;
+    let timestamp = chrono::Utc::now().timestamp();
+    let reward    = crate::tokenomics::block_reward_at(height);
+
+    let coinbase_hash = format!("0x{}", blake3::hash(
+        format!("coinbase:{height}:{miner}:{reward}:{timestamp}").as_bytes()
+    ).to_hex());
+    let coinbase = LedgerTx {
+        hash:         coinbase_hash.clone(),
+        from:         NODE_POOL_ADDR.to_string(),
+        to:           miner.to_string(),
+        amount:       reward,
+        memo:         Some(format!("Block #{height} reward")),
+        timestamp,
+        status:       "Confirmed".to_string(),
+        block_height: Some(height),
+        tx_type:      "reward".to_string(),
+        signature:    "coinbase".to_string(),
+        ..LedgerTx::default()
+    };
+
+    let mut stamped: Vec<LedgerTx> = txs.iter().map(|tx| {
+        let mut t = tx.clone();
+        t.block_height = Some(height);
+        t.status = "Confirmed".to_string();
+        t
+    }).collect();
+    stamped.push(coinbase);
+
+    let tx_hashes: Vec<&str> = stamped.iter().map(|t| t.hash.as_str()).collect();
+    let tx_merkle_root = compute_merkle_root(&tx_hashes);
+
+    let balance_delta_for_root = {
+        let cf_bal = db.cf_handle(CF_BALANCES).expect("CF_BALANCES missing");
+        let mut deltas: std::collections::HashMap<String, i128> = Default::default();
+        for tx in &stamped {
+            if !tx.to.is_empty() {
+                *deltas.entry(tx.to.clone()).or_insert(0) += tx.amount as i128;
+            }
+            let is_system = tx.from.is_empty()
+                || tx.from == NODE_POOL_ADDR
+                || tx.from.starts_with("egot1faucet")
+                || tx.from.starts_with("ego1genesis");
+            if !is_system {
+                let out = tx.amount as i128 + tx.fee_uegoc as i128;
+                *deltas.entry(tx.from.clone()).or_insert(0) -= out;
+            }
+        }
+        let mut result: std::collections::HashMap<String, u64> = Default::default();
+        for (addr, delta) in &deltas {
+            let old: u64 = db.get_cf(cf_bal, addr.as_bytes())
+                .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+            result.insert(addr.clone(), (old as i128 + delta).max(0) as u64);
+        }
+        result
+    };
+    let state_root = compute_state_delta_root(&balance_delta_for_root);
+
+    let hash = block_hash_v3(&prev_hash, height, miner, timestamp, &tx_merkle_root, poc_ticket, &state_root);
+
+    let block = LedgerBlock {
+        height,
+        hash,
+        prev_hash,
+        miner: miner.to_string(),
+        timestamp,
+        tx_count:   stamped.len() as u32,
+        size_bytes: stamped.len() as u64 * 256,
+        reward,
+        coinbase_tx: Some(coinbase_hash),
+        vote_count: 0,
+        tx_merkle_root,
+        poc_ticket: poc_ticket.to_string(),
+        poc_slot,
+        state_root,
+    };
+
+    (block, stamped)
+}
+
+pub fn commit_staged_block(block: &LedgerBlock, stamped: &[LedgerTx]) {
+    let db = get_db().lock().expect("chain_db lock poisoned");
+    let current_tip = {
+        let cf_meta = db.cf_handle(CF_META).expect("CF_META missing");
+        db.get_cf(cf_meta, META_LATEST_HEIGHT)
+            .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
+    };
+    if block.height != current_tip + 1 {
+        eprintln!(
+            "[ChainDB] commit_staged_block: block #{} rejected — tip is #{} (already committed or stale)",
+            block.height, current_tip
+        );
+        return;
+    }
+    write_block_batch(&db, block, stamped);
+}
+
 /// Verify that a block's hash field matches its contents.
+/// Accepts v1 (legacy), v2 (tx_merkle_root), and v3 (+ state_root) formats.
 /// Returns false if the block was tampered with after production.
 pub fn verify_block_hash(block: &LedgerBlock, txs: &[crate::ledger::LedgerTx]) -> bool {
     // Recompute merkle root from the actual txs.
@@ -850,34 +1134,43 @@ pub fn verify_block_hash(block: &LedgerBlock, txs: &[crate::ledger::LedgerTx]) -
     if !block.tx_merkle_root.is_empty() && block.tx_merkle_root != expected_merkle {
         eprintln!(
             "[ChainDB] Block #{} merkle root mismatch: stored={} computed={}",
-            block.height, &block.tx_merkle_root[..8], &expected_merkle[..8]
+            block.height, &block.tx_merkle_root[..8.min(block.tx_merkle_root.len())], &expected_merkle[..8]
         );
         return false;
     }
 
-    // Recompute block hash.
-    let expected_hash = block_hash_for(
+    // v1 hash (no domain tag, no merkle root) — legacy acceptance.
+    let v1_input = format!("{}{}{}{}", block.prev_hash, block.height, block.miner, block.timestamp);
+    let v1_hash  = blake3::hash(v1_input.as_bytes()).to_hex().to_string();
+    if block.hash == v1_hash { return true; }
+
+    // v2 hash (tx_merkle_root + poc_ticket, no state_root).
+    let v2_hash = block_hash_for(
         &block.prev_hash, block.height, &block.miner,
         block.timestamp, &expected_merkle, &block.poc_ticket,
     );
+    if block.hash == v2_hash { return true; }
 
-    // Accept v1 hashes (blocks mined before this fix) — they have no domain tag.
-    // A v1 hash won't start with the new format so we fall back gracefully.
-    let is_v2 = block.hash.len() == 64 && {
-        let v1_input = format!("{}{}{}{}", block.prev_hash, block.height, block.miner, block.timestamp);
-        let v1_hash  = blake3::hash(v1_input.as_bytes()).to_hex().to_string();
-        block.hash != v1_hash // if it doesn't match v1, it must be v2 or fake
-    };
-
-    if is_v2 && block.hash != expected_hash {
+    // v3 hash (+ state_root) — all new blocks use this format.
+    if !block.state_root.is_empty() {
+        let v3_hash = block_hash_v3(
+            &block.prev_hash, block.height, &block.miner,
+            block.timestamp, &expected_merkle, &block.poc_ticket,
+            &block.state_root,
+        );
+        if block.hash == v3_hash { return true; }
         eprintln!(
-            "[ChainDB] Block #{} hash mismatch: stored={} expected={}",
-            block.height, &block.hash[..8], &expected_hash[..8]
+            "[ChainDB] Block #{} v3 hash mismatch: stored={:.8} expected={:.8}",
+            block.height, block.hash, v3_hash
         );
         return false;
     }
 
-    true
+    eprintln!(
+        "[ChainDB] Block #{} hash mismatch: stored={:.8} v2={:.8}",
+        block.height, block.hash, v2_hash
+    );
+    false
 }
 
 /// Append a block received from a peer (gossip / sync path).
@@ -1124,6 +1417,58 @@ pub fn get_network_stats_db() -> NetworkStats {
     NetworkStats { block_count, tx_count }
 }
 
+// ── Startup state restoration ─────────────────────────────────────────────────
+//
+// NONCE_STORE and STAKE_STORE are in-memory maps populated incrementally as new
+// blocks arrive.  On restart they are empty, which would allow replay attacks and
+// strip validators of their minimum-stake registration.  Restoring from the full
+// TX history in RocksDB at startup fixes both problems in a single O(n) scan.
+
+const STAKING_ADDR_RESTORE: &str = "egot1staking000000000000000000000000000000000";
+
+/// Rebuild the in-memory nonce store and stake store by scanning every confirmed
+/// transaction stored in RocksDB.  Call once at startup before accepting any
+/// incoming P2P messages or local transactions.
+pub fn restore_in_memory_state_from_db() {
+    let db = get_db().lock().unwrap();
+    let cf_txs = match db.cf_handle(CF_TXS) { Some(c) => c, None => return };
+
+    let iter = db.full_iterator_cf(cf_txs, rocksdb::IteratorMode::Start);
+    let mut nonce_max: std::collections::HashMap<String, u64> = Default::default();
+    let mut stake_map: std::collections::HashMap<String, u64> = Default::default();
+
+    for item in iter {
+        let Ok((_, v)) = item else { continue };
+        let tx: LedgerTx = match serde_json::from_slice(&v) { Ok(t) => t, Err(_) => continue };
+
+        // ── Nonce store: track highest confirmed nonce per sender.
+        if !tx.from.is_empty() && tx.nonce > 0 {
+            let entry = nonce_max.entry(tx.from.clone()).or_insert(0);
+            if tx.nonce > *entry { *entry = tx.nonce; }
+        }
+
+        // ── Stake store: replay stake/unstake transactions.
+        if tx.to == STAKING_ADDR_RESTORE && !tx.from.is_empty() {
+            *stake_map.entry(tx.from.clone()).or_insert(0) =
+                stake_map.get(&tx.from).unwrap_or(&0).saturating_add(tx.amount);
+        } else if tx.from == STAKING_ADDR_RESTORE && !tx.to.is_empty() {
+            *stake_map.entry(tx.to.clone()).or_insert(0) =
+                stake_map.get(&tx.to).unwrap_or(&0).saturating_sub(tx.amount);
+        }
+    }
+
+    // Push into ledger stores.
+    for (addr, nonce) in nonce_max {
+        crate::ledger::record_confirmed_nonce(&addr, nonce);
+    }
+    for (addr, amount) in stake_map {
+        if amount > 0 {
+            crate::ledger::record_validator_stake(&addr, amount, true);
+        }
+    }
+    eprintln!("[ChainDB] In-memory nonce + stake stores restored from RocksDB");
+}
+
 // ── Kept for API compatibility ────────────────────────────────────────────────
 
 /// No-op: DB handle is a global singleton, not caller-managed.
@@ -1249,6 +1594,28 @@ pub fn get_all_governance_proposals() -> Vec<GovernanceProposal> {
 
 pub const DAO_BASE_KNOWLEDGE_POWER: f64 = 10.0;
 const DAO_DEFAULT_DURATION_SECS:    i64 = 7 * 24 * 3600; // 7 days
+
+/// Minimum number of unique stake-voters for quorum.
+const DAO_MIN_UNIQUE_VOTERS: usize = 3;
+/// Minimum fraction of total network stake that must participate (1%).
+const DAO_MIN_STAKE_FRACTION: f64 = 0.01;
+
+/// True if the proposal has met quorum: at least DAO_MIN_UNIQUE_VOTERS distinct
+/// addresses voted AND their combined stake ≥ 1% of total network stake.
+/// This prevents a single whale or a handful of colluding nodes from unilaterally
+/// passing governance decisions on an otherwise quiet network.
+fn dao_quorum_reached(p: &DaoProposal, staked_in_votes: u64) -> bool {
+    if p.stake_votes.len() < DAO_MIN_UNIQUE_VOTERS {
+        return false;
+    }
+    let total_network = crate::ledger::total_network_stake();
+    if total_network == 0 {
+        // No validators staked yet (early testnet) — fall back to voter-count only.
+        return p.stake_votes.len() >= DAO_MIN_UNIQUE_VOTERS;
+    }
+    let fraction = staked_in_votes as f64 / total_network as f64;
+    fraction >= DAO_MIN_STAKE_FRACTION
+}
 
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
@@ -1538,7 +1905,250 @@ pub fn get_dao_results(proposal_id: &str) -> Option<DaoProposalResults> {
         total_stake_voters:     p.stake_votes.len(),
         total_knowledge_voters: p.knowledge_votes.len(),
         total_staked_in_votes:  total_stake,
-        quorum_reached:         p.stake_votes.len() >= 1,
+        quorum_reached:         dao_quorum_reached(&p, total_stake),
         status:                 resolved_status(&p),
     })
+}
+
+// ── Proposer Ban System ───────────────────────────────────────────────────────
+
+pub const PROPOSER_BAN_THRESHOLD: usize = 10;
+
+fn ban_key(address: &str) -> Vec<u8> {
+    let mut k = b"ban:".to_vec();
+    k.extend_from_slice(address.as_bytes());
+    k
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct ProposerBanRecord {
+    pub target:   String,
+    pub voters:   std::collections::HashSet<String>,
+    pub banned:   bool,
+    pub banned_at: Option<i64>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct ProposerBanStatus {
+    pub target:     String,
+    pub vote_count: usize,
+    pub threshold:  usize,
+    pub banned:     bool,
+    pub my_vote:    bool,
+}
+
+/// Cast a removal vote against `target`. Returns updated status.
+/// Returns Err if the voter tries to vote against themselves.
+pub fn vote_remove_proposer(target: &str, voter: &str) -> Result<ProposerBanStatus, String> {
+    if target == voter {
+        return Err("You cannot vote to remove yourself".into());
+    }
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_DAO).ok_or("CF_DAO missing")?;
+    let key = ban_key(target);
+
+    let mut rec: ProposerBanRecord = db.get_cf(cf, &key)
+        .ok().flatten()
+        .and_then(|b| decode(&b))
+        .unwrap_or_else(|| ProposerBanRecord {
+            target:    target.to_string(),
+            voters:    std::collections::HashSet::new(),
+            banned:    false,
+            banned_at: None,
+        });
+
+    if rec.voters.contains(voter) {
+        return Err("You have already voted to remove this proposer".into());
+    }
+
+    rec.voters.insert(voter.to_string());
+    if rec.voters.len() >= PROPOSER_BAN_THRESHOLD && !rec.banned {
+        rec.banned    = true;
+        rec.banned_at = Some(now_secs());
+    }
+
+    db.put_cf(cf, &key, encode(&rec)).map_err(|e| e.to_string())?;
+    Ok(ProposerBanStatus {
+        target:     rec.target,
+        vote_count: rec.voters.len(),
+        threshold:  PROPOSER_BAN_THRESHOLD,
+        banned:     rec.banned,
+        my_vote:    true,
+    })
+}
+
+pub fn get_proposer_ban_status(target: &str, viewer: Option<&str>) -> ProposerBanStatus {
+    let db = get_db().lock().unwrap();
+    let cf = match db.cf_handle(CF_DAO) { Some(c) => c, None => {
+        return ProposerBanStatus { target: target.to_string(), vote_count: 0, threshold: PROPOSER_BAN_THRESHOLD, banned: false, my_vote: false };
+    }};
+    let rec: Option<ProposerBanRecord> = db.get_cf(cf, ban_key(target))
+        .ok().flatten().and_then(|b| decode(&b));
+    match rec {
+        None => ProposerBanStatus { target: target.to_string(), vote_count: 0, threshold: PROPOSER_BAN_THRESHOLD, banned: false, my_vote: false },
+        Some(r) => {
+            let my_vote = viewer.map(|v| r.voters.contains(v)).unwrap_or(false);
+            ProposerBanStatus { target: r.target, vote_count: r.voters.len(), threshold: PROPOSER_BAN_THRESHOLD, banned: r.banned, my_vote }
+        }
+    }
+}
+
+pub fn is_proposer_banned(address: &str) -> bool {
+    let db = get_db().lock().unwrap();
+    let cf = match db.cf_handle(CF_DAO) { Some(c) => c, None => return false };
+    db.get_cf(cf, ban_key(address))
+        .ok().flatten()
+        .and_then(|b| decode::<ProposerBanRecord>(&b))
+        .map(|r| r.banned)
+        .unwrap_or(false)
+}
+
+// ── Slashing persistence ───────────────────────────────────────────────────────
+// Slashed-validator records survive node restarts via the CF_META column family.
+
+const META_SLASHED: &[u8] = b"slashed_validators";
+
+/// Persist a slashed validator address to RocksDB so the ban survives restarts.
+pub fn persist_slashed_validator(addr: &str) {
+    let db = get_db().lock().unwrap();
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return };
+    let mut set: Vec<String> = db.get_cf(cf, META_SLASHED)
+        .ok().flatten()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    if !set.contains(&addr.to_string()) {
+        set.push(addr.to_string());
+        let _ = db.put_cf(cf, META_SLASHED,
+            serde_json::to_vec(&set).unwrap_or_default());
+    }
+}
+
+/// Load the full set of slashed validator addresses from RocksDB.
+/// Called once at startup to restore the in-memory set.
+pub fn load_slashed_validators() -> Vec<String> {
+    let db = get_db().lock().unwrap();
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return vec![] };
+    db.get_cf(cf, META_SLASHED)
+        .ok().flatten()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+// ── Pending-vote persistence (Item 6: BFT votes survive restart) ──────────────
+
+const META_PENDING_VOTES_PREFIX: &[u8] = b"pvotes:";
+
+/// Persist one pending (unfinalized) vote to RocksDB.
+/// Key: `pvotes:{block_hash}:{voter_addr}` → empty value (presence = voted).
+/// Called immediately after adding the vote to the in-memory map.
+pub fn persist_pending_vote(block_hash: &str, voter: &str) {
+    let db = get_db().lock().unwrap();
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return };
+    let key = format!("pvotes:{}:{}", block_hash, voter);
+    let _ = db.put_cf(cf, key.as_bytes(), b"1");
+}
+
+/// Remove one persisted pending vote (called after the block is finalized
+/// or the round is abandoned so stale entries don't accumulate).
+pub fn clear_pending_vote(block_hash: &str, voter: &str) {
+    let db = get_db().lock().unwrap();
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return };
+    let key = format!("pvotes:{}:{}", block_hash, voter);
+    let _ = db.delete_cf(cf, key.as_bytes());
+}
+
+/// Remove ALL pending votes for a given block hash (called when a block
+/// reaches quorum and is committed, or when the view times out).
+pub fn clear_pending_votes_for_block(block_hash: &str) {
+    let db = get_db().lock().unwrap();
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return };
+    let prefix = format!("pvotes:{}:", block_hash);
+    // Collect all matching keys, then delete them.
+    let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
+    {
+        let iter = db.prefix_iterator_cf(cf, prefix.as_bytes());
+        for item in iter {
+            if let Ok((k, _)) = item {
+                if k.starts_with(prefix.as_bytes()) {
+                    keys_to_delete.push(k.to_vec());
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    let mut batch = WriteBatch::default();
+    for k in &keys_to_delete {
+        batch.delete_cf(cf, k);
+    }
+    let _ = db.write(batch);
+}
+
+// ── Nonce persistence ─────────────────────────────────────────────────────────
+// Confirmed sender nonces are written into CF_META so they survive node restarts.
+// Without persistence the in-memory NONCE_STORE resets to 0 on restart, making
+// replay attacks trivial (resend any past signed TX).
+
+const NONCE_KEY_PREFIX: &[u8] = b"nonce:";
+
+/// Persist a confirmed nonce for an address.
+/// Called from write_block_batch (in the same WriteBatch for atomicity).
+pub fn persist_nonce_in_batch(batch: &mut WriteBatch, db: &DB, address: &str, nonce: u64) {
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return };
+    let mut key = NONCE_KEY_PREFIX.to_vec();
+    key.extend_from_slice(address.as_bytes());
+    // Only advance — never go backwards.
+    let existing = db.get_cf(cf, &key).ok().flatten()
+        .map(|v| read_u64_le(&v)).unwrap_or(0);
+    if nonce > existing {
+        batch.put_cf(cf, &key, u64_le(nonce));
+    }
+}
+
+/// Restore all confirmed nonces from CF_META into the in-memory NONCE_STORE.
+/// Must be called once at startup before accepting any transactions.
+pub fn restore_nonces_from_db() {
+    let db = get_db().lock().unwrap();
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return };
+    let iter = db.prefix_iterator_cf(cf, NONCE_KEY_PREFIX);
+    for item in iter {
+        if let Ok((k, v)) = item {
+            let key_str = match std::str::from_utf8(&k) { Ok(s) => s, Err(_) => continue };
+            if !key_str.starts_with("nonce:") { break; }
+            let address = &key_str["nonce:".len()..];
+            if address.is_empty() { continue; }
+            let nonce = read_u64_le(&v);
+            if nonce > 0 {
+                crate::ledger::record_confirmed_nonce(address, nonce);
+            }
+        }
+    }
+}
+
+/// Restore all pending votes from RocksDB into an in-memory map.
+/// Returns `HashMap<block_hash, Vec<voter_addr>>`.
+/// Called once at node startup so in-flight consensus rounds survive restarts.
+pub fn restore_pending_votes_from_db() -> std::collections::HashMap<String, Vec<String>> {
+    let db = get_db().lock().unwrap();
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return Default::default() };
+    let mut out: std::collections::HashMap<String, Vec<String>> = Default::default();
+    let iter = db.prefix_iterator_cf(cf, META_PENDING_VOTES_PREFIX);
+    for item in iter {
+        if let Ok((k, _)) = item {
+            let s = match std::str::from_utf8(&k) { Ok(s) => s, Err(_) => continue };
+            if !s.starts_with("pvotes:") { break; }
+            // key format: pvotes:{block_hash}:{voter}
+            // block_hash itself may contain colons (hex is fine, but be safe)
+            let without_prefix = &s["pvotes:".len()..];
+            // voter is last 63 chars (bech32 addr), split from the right
+            if let Some(colon_pos) = without_prefix.rfind(':') {
+                let block_hash = &without_prefix[..colon_pos];
+                let voter      = &without_prefix[colon_pos + 1..];
+                if !block_hash.is_empty() && !voter.is_empty() {
+                    out.entry(block_hash.to_string()).or_default().push(voter.to_string());
+                }
+            }
+        }
+    }
+    out
 }

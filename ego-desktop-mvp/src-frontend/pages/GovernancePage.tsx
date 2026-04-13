@@ -26,6 +26,10 @@ interface ProposalResults {
 
 interface NewQuestion { question: string; options: string[]; correct_index: number; }
 
+interface BanStatus {
+  target: string; vote_count: number; threshold: number; banned: boolean; my_vote: boolean;
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 const TYPE_LABELS: Record<string, { label: string; color: string }> = {
@@ -244,8 +248,8 @@ function CreateProposalModal({ onClose, onCreated }: { onClose: () => void; onCr
 
 // ── Proposal Detail Modal ──────────────────────────────────────────────────────
 
-function ProposalDetailModal({ proposal, onClose, onVoted }: {
-  proposal: DaoProposal; onClose: () => void; onVoted: () => void;
+function ProposalDetailModal({ proposal, onClose, onVoted, myAddress }: {
+  proposal: DaoProposal; onClose: () => void; onVoted: () => void; myAddress: string;
 }) {
   const [results, setResults]         = useState<ProposalResults | null>(null);
   const [stakeOption, setStakeOption] = useState<number | null>(proposal.my_stake_vote ?? null);
@@ -255,15 +259,31 @@ function ProposalDetailModal({ proposal, onClose, onVoted }: {
   );
   const [testScore, setTestScore]     = useState<number | null>(proposal.my_test_score ?? null);
   const [testSubmitted, setTestSubmitted] = useState(proposal.my_knowledge_vote !== null);
+  const [banStatus, setBanStatus]     = useState<BanStatus | null>(null);
+  const [banBusy, setBanBusy]         = useState(false);
+  const [banConfirm, setBanConfirm]   = useState(false);
   const [busy, setBusy]   = useState('');
   const [error, setError] = useState('');
 
   const isActive = proposal.status === 'active' && Math.floor(Date.now() / 1000) <= proposal.voting_ends_at;
+  const isOwnProposal = proposal.creator === myAddress;
 
   useEffect(() => {
     invoke<ProposalResults>('get_proposal_results', { proposalId: proposal.id })
       .then(setResults).catch(() => {});
-  }, [proposal.id]);
+    invoke<BanStatus>('get_ban_status', { targetAddress: proposal.creator })
+      .then(setBanStatus).catch(() => {});
+  }, [proposal.id, proposal.creator]);
+
+  async function castBanVote() {
+    setBanBusy(true);
+    try {
+      const updated = await invoke<BanStatus>('vote_ban_proposer', { targetAddress: proposal.creator });
+      setBanStatus(updated);
+      setBanConfirm(false);
+    } catch (e: any) { setError(String(e)); }
+    finally { setBanBusy(false); }
+  }
 
   async function submitStakeVote() {
     if (stakeOption === null) return;
@@ -323,6 +343,42 @@ function ProposalDetailModal({ proposal, onClose, onVoted }: {
               by {truncAddr(proposal.creator)} · {formatDate(proposal.created_at)} ·{' '}
               {isActive ? <span className="text-green-400">{timeLeft(proposal.voting_ends_at)}</span> : 'Voting ended'}
             </p>
+            {/* Ban status / report button */}
+            {banStatus && (
+              <div className="mt-2 flex items-center gap-2 flex-wrap">
+                {banStatus.banned ? (
+                  <span className="text-[10px] px-2 py-0.5 rounded-md border bg-red-500/20 text-red-400 border-red-500/30 font-medium">
+                    ⛔ Proposer banned by community ({banStatus.vote_count}/{banStatus.threshold} votes)
+                  </span>
+                ) : (
+                  <>
+                    <span className="text-[10px] text-gray-600">
+                      {banStatus.vote_count}/{banStatus.threshold} removal votes
+                    </span>
+                    {!isOwnProposal && !banStatus.my_vote && (
+                      banConfirm ? (
+                        <span className="flex items-center gap-1.5">
+                          <span className="text-[10px] text-yellow-400">Report this proposer?</span>
+                          <button onClick={castBanVote} disabled={banBusy}
+                            className="text-[10px] px-2 py-0.5 rounded bg-red-600 hover:bg-red-500 text-white disabled:opacity-50 transition">
+                            {banBusy ? '…' : 'Confirm'}
+                          </button>
+                          <button onClick={() => setBanConfirm(false)} className="text-[10px] text-gray-500 hover:text-gray-300">Cancel</button>
+                        </span>
+                      ) : (
+                        <button onClick={() => setBanConfirm(true)}
+                          className="text-[10px] text-gray-600 hover:text-red-400 transition underline underline-offset-2">
+                          Report proposer
+                        </button>
+                      )
+                    )}
+                    {banStatus.my_vote && (
+                      <span className="text-[10px] text-yellow-500">You reported this proposer</span>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
           </div>
           <button onClick={onClose} className="text-gray-400 hover:text-white text-xl leading-none shrink-0">×</button>
         </div>
@@ -427,29 +483,84 @@ function ProposalDetailModal({ proposal, onClose, onVoted }: {
           {/* Results */}
           {results && results.options.length > 0 && (
             <div className="border border-gray-700 rounded-xl p-4 space-y-3">
-              <div className="flex items-center justify-between">
+              {/* Results header */}
+              <div className="flex items-center justify-between flex-wrap gap-2">
                 <span className="text-sm font-medium text-white">Results</span>
-                <span className="text-xs text-gray-500">
-                  {results.total_stake_voters} stake · {results.total_knowledge_voters} knowledge votes
-                </span>
-              </div>
-              {results.options.map((opt, i) => (
-                <div key={i} className={`space-y-1 p-3 rounded-xl ${
-                  results.winning_option_index === i ? 'bg-purple-600/10 border border-purple-500/30' : 'bg-gray-800/40'
-                }`}>
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-sm text-white">{opt.option}</span>
-                    {results.winning_option_index === i && (
-                      <span className="text-xs text-purple-400 font-medium">Leading</span>
-                    )}
-                  </div>
-                  <PowerBar label="Stake"     power={opt.stake_power}     color="bg-purple-500" />
-                  <PowerBar label="Knowledge" power={opt.knowledge_power} color="bg-blue-500" />
-                  <PowerBar label="Combined"  power={opt.combined_power}  color="bg-gradient-to-r from-purple-500 to-blue-500" />
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className={`text-[10px] px-2 py-0.5 rounded-md border font-medium ${
+                    results.quorum_reached
+                      ? 'bg-green-500/15 text-green-400 border-green-500/30'
+                      : 'bg-yellow-500/15 text-yellow-400 border-yellow-500/30'
+                  }`}>
+                    {results.quorum_reached ? '✓ Quorum reached' : '⏳ Quorum needed'}
+                  </span>
+                  <span className="text-[10px] text-gray-500">
+                    {results.total_stake_voters} stake · {results.total_knowledge_voters} knowledge voters
+                  </span>
                 </div>
-              ))}
-              <p className="text-xs text-gray-500 text-center">
-                Combined = (Stake + Knowledge) / 2 · whitepaper formula
+              </div>
+
+              {/* EGOC participation */}
+              {results.total_staked_in_votes > 0 && (
+                <div className="text-[10px] text-gray-500 bg-gray-800/60 rounded-lg px-3 py-1.5 flex items-center justify-between">
+                  <span>Total EGOC weight in vote</span>
+                  <span className="text-purple-300 font-medium">
+                    {(results.total_staked_in_votes / 1_000_000).toLocaleString(undefined, { maximumFractionDigits: 0 })} EGOC
+                  </span>
+                </div>
+              )}
+
+              {/* Winner banner — only when voting ended */}
+              {!isActive && results.winning_option_index !== null && results.quorum_reached && (
+                <div className="flex items-center gap-2 bg-green-500/10 border border-green-500/30 rounded-xl px-4 py-2.5">
+                  <span className="text-green-400 text-base">✓</span>
+                  <div>
+                    <div className="text-xs text-gray-400 leading-none mb-0.5">Winner</div>
+                    <div className="text-sm font-semibold text-green-300">
+                      {results.options[results.winning_option_index]?.option}
+                    </div>
+                  </div>
+                  <span className={`ml-auto text-xs px-2 py-0.5 rounded-md border ${
+                    results.status === 'passed'
+                      ? 'bg-blue-500/20 text-blue-300 border-blue-500/30'
+                      : 'bg-gray-500/20 text-gray-400 border-gray-500/30'
+                  }`}>{results.status}</span>
+                </div>
+              )}
+              {!isActive && !results.quorum_reached && (
+                <div className="flex items-center gap-2 bg-red-500/10 border border-red-500/30 rounded-xl px-4 py-2.5">
+                  <span className="text-red-400 text-base">✗</span>
+                  <span className="text-sm text-red-300">Failed — quorum not reached</span>
+                </div>
+              )}
+
+              {/* Per-option bars */}
+              {results.options.map((opt, i) => {
+                const isWinner = results.winning_option_index === i;
+                return (
+                  <div key={i} className={`space-y-1.5 p-3 rounded-xl ${
+                    isWinner ? 'bg-purple-600/10 border border-purple-500/30' : 'bg-gray-800/40'
+                  }`}>
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-sm text-white font-medium">{opt.option}</span>
+                      <div className="flex items-center gap-2">
+                        {isWinner && isActive && (
+                          <span className="text-[10px] text-purple-400 font-medium bg-purple-500/10 px-1.5 py-0.5 rounded">Leading</span>
+                        )}
+                        <span className="text-[11px] text-gray-400 font-mono">
+                          {(opt.combined_power * 100).toFixed(1)}%
+                        </span>
+                      </div>
+                    </div>
+                    <PowerBar label="Stake"     power={opt.stake_power}     color="bg-purple-500" />
+                    <PowerBar label="Knowledge" power={opt.knowledge_power} color="bg-blue-500" />
+                    <PowerBar label="Combined"  power={opt.combined_power}  color="bg-gradient-to-r from-purple-500 to-blue-500" />
+                  </div>
+                );
+              })}
+
+              <p className="text-[10px] text-gray-600 text-center">
+                Combined = (Stake weight + Knowledge score) ÷ 2
               </p>
             </div>
           )}
@@ -493,7 +604,9 @@ function ProposalCard({ proposal, onClick }: { proposal: DaoProposal; onClick: (
       <p className="text-xs text-gray-400 line-clamp-2 mb-3">{proposal.description}</p>
 
       <div className="flex items-center justify-between text-xs text-gray-500">
-        <span>by {truncAddr(proposal.creator)}</span>
+        <span className="flex items-center gap-1.5">
+          by {truncAddr(proposal.creator)}
+        </span>
         <span className="flex items-center gap-3">
           <span>🗳 {proposal.stake_vote_count}</span>
           {proposal.has_knowledge_test && <span>🧠 {proposal.knowledge_vote_count}</span>}
@@ -517,13 +630,22 @@ const TABS = [
   { key: 'expired', label: 'Expired' },
 ];
 
+interface RateLimit { used: number; max: number; window_hours: number; resets_in_secs: number; }
+
+function fmtCountdown(secs: number): string {
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
 export default function GovernancePage() {
   const { wallet } = useWallet();
-  const [proposals, setProposals]       = useState<DaoProposal[]>([]);
-  const [tab, setTab]                   = useState('active');
-  const [selected, setSelected]         = useState<DaoProposal | null>(null);
-  const [showCreate, setShowCreate]     = useState(false);
-  const [loading, setLoading]           = useState(true);
+  const [proposals, setProposals]   = useState<DaoProposal[]>([]);
+  const [rateLimit, setRateLimit]   = useState<RateLimit | null>(null);
+  const [tab, setTab]               = useState('active');
+  const [selected, setSelected]     = useState<DaoProposal | null>(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const [loading, setLoading]       = useState(true);
 
   const loadProposals = useCallback(async (statusFilter?: string) => {
     setLoading(true);
@@ -534,7 +656,12 @@ export default function GovernancePage() {
     finally { setLoading(false); }
   }, [tab]);
 
+  const refreshRateLimit = useCallback(async () => {
+    try { setRateLimit(await invoke<RateLimit>('get_proposal_rate_limit')); } catch {}
+  }, []);
+
   useEffect(() => { loadProposals(tab); }, [tab]);
+  useEffect(() => { refreshRateLimit(); }, [refreshRateLimit]);
 
   async function refreshSelected() {
     if (!selected) return;
@@ -542,11 +669,14 @@ export default function GovernancePage() {
       const p = await invoke<DaoProposal>('get_dao_proposal', { proposalId: selected.id });
       setSelected(p);
       loadProposals(tab);
+      refreshRateLimit();
     } catch {}
   }
 
-  const activeCount  = proposals.filter(p => p.status === 'active').length;
-  const myVoteCount  = proposals.filter(p => p.my_stake_vote !== null || p.my_knowledge_vote !== null).length;
+  const activeCount = proposals.filter(p => p.status === 'active').length;
+  const myVoteCount = proposals.filter(p => p.my_stake_vote !== null || p.my_knowledge_vote !== null).length;
+  const atLimit     = rateLimit ? rateLimit.used >= rateLimit.max : false;
+  const slotsLeft   = rateLimit ? rateLimit.max - rateLimit.used : rateLimit === null ? '…' : rateLimit!.max;
 
   return (
     <div className="h-full flex flex-col bg-gray-900 overflow-hidden">
@@ -556,10 +686,20 @@ export default function GovernancePage() {
           <h1 className="text-xl font-bold text-white">DAO Governance</h1>
           <p className="text-xs text-gray-500 mt-0.5">Decentralized community decision-making</p>
         </div>
-        <button onClick={() => setShowCreate(true)}
-          className="flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded-xl text-sm font-medium text-white transition-colors">
-          <span>+</span> New Proposal
-        </button>
+        <div className="flex flex-col items-end gap-1">
+          <button onClick={() => !atLimit && setShowCreate(true)} disabled={atLimit}
+            title={atLimit ? `Rate limit: 5 proposals per 4 hours` : 'Submit a new proposal'}
+            className="flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-500 disabled:opacity-40 disabled:cursor-not-allowed rounded-xl text-sm font-medium text-white transition-colors">
+            <span>+</span> New Proposal
+          </button>
+          {rateLimit && (
+            <span className={`text-[10px] ${atLimit ? 'text-red-400' : 'text-gray-500'}`}>
+              {atLimit
+                ? `Rate limited — resets in ${fmtCountdown(rateLimit.resets_in_secs)}`
+                : `${rateLimit.used}/${rateLimit.max} used · resets every ${rateLimit.window_hours}h`}
+            </span>
+          )}
+        </div>
       </div>
 
       {/* Stats */}
@@ -569,8 +709,16 @@ export default function GovernancePage() {
           <span className="text-gray-400">Active:</span>
           <span className="text-white font-medium">{activeCount}</span>
         </div>
+        {rateLimit && (
+          <div className="flex items-center gap-2">
+            <span className="text-gray-400">My proposals (4h):</span>
+            <span className={`font-medium ${atLimit ? 'text-red-400' : 'text-white'}`}>
+              {rateLimit.used}/{rateLimit.max}
+            </span>
+          </div>
+        )}
         <div className="flex items-center gap-2">
-          <span className="text-gray-400">Your votes:</span>
+          <span className="text-gray-400">My votes:</span>
           <span className="text-white font-medium">{myVoteCount}</span>
         </div>
         <div className="ml-auto flex items-center gap-2 text-xs text-gray-500">
@@ -622,12 +770,13 @@ export default function GovernancePage() {
       {showCreate && (
         <CreateProposalModal
           onClose={() => setShowCreate(false)}
-          onCreated={() => loadProposals(tab)}
+          onCreated={() => { loadProposals(tab); refreshRateLimit(); }}
         />
       )}
       {selected && (
         <ProposalDetailModal
           proposal={selected}
+          myAddress={wallet?.address ?? ''}
           onClose={() => setSelected(null)}
           onVoted={refreshSelected}
         />

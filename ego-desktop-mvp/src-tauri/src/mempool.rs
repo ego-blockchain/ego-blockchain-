@@ -7,28 +7,30 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-pub const SHARD_COUNT: u32   = 16;
+pub const SHARD_COUNT: u32   = 256;
 pub const BATCH_SIZE:  usize = 625;
 
-/// Minimum stakers (validators) required before the chain has BFT finality.
-/// Below this count blocks are produced in solo mode.
-pub const MIN_VALIDATORS_FOR_FINALITY: usize = 3;
 
-/// After the first tx lands, wait this long to collect more before sealing.
+pub const MIN_VALIDATORS_FOR_FINALITY: usize = 21;
+
+
 pub const BATCH_WINDOW_MS: u64 = 3_000;
 
-/// Kept for PoC slot calculation and rollup stats — represents the effective
-/// average block time when the network is active (batch window duration).
+
 pub const BATCH_INTERVAL_MS: u64 = BATCH_WINDOW_MS;
 
-/// If the mempool reaches this many pending txs, seal immediately — don't wait.
 pub const TX_THRESHOLD: u64 = 50;
 
-/// Maximum time to hold pending txs before sealing a block (even if under threshold).
 pub const MAX_BLOCK_INTERVAL_S: u64 = 30;
 
-/// Minimum gap between reward-only (empty tx) blocks when the network is quiet.
+
 pub const EMPTY_BLOCK_INTERVAL_S: u64 = 60;
+
+
+pub const MAX_MEMPOOL_SIZE: usize = 500_000;
+
+
+pub const MAX_TX_AGE_SECS: i64 = 300;
 
 pub fn shard_for_address(addr: &str) -> u32 {
     let mut h: u32 = 0xcbf29ce4;
@@ -41,10 +43,12 @@ pub fn shard_for_address(addr: &str) -> u32 {
 
 pub struct ShardedMempool {
     shards:        Vec<Mutex<Vec<LedgerTx>>>,
+
+    seen_hashes:   Mutex<std::collections::HashSet<String>>,
     pending_total: AtomicU64,
     submitted:     AtomicU64,
     confirmed:     AtomicU64,
-    /// Fires whenever a new tx is pushed — wakes the batch loop.
+
     pub tx_notify: Arc<Notify>,
 }
 
@@ -55,6 +59,7 @@ impl ShardedMempool {
             .collect();
         Arc::new(Self {
             shards,
+            seen_hashes:   Mutex::new(std::collections::HashSet::new()),
             pending_total: AtomicU64::new(0),
             submitted:     AtomicU64::new(0),
             confirmed:     AtomicU64::new(0),
@@ -62,28 +67,118 @@ impl ShardedMempool {
         })
     }
 
+
     pub fn push(&self, tx: LedgerTx) {
+        // 1. Dedup: reject if the same tx hash is already pending.
+        {
+            let mut seen = self.seen_hashes.lock().expect("lock poisoned");
+            if !seen.insert(tx.hash.clone()) {
+                return; // already in mempool
+            }
+        }
+
+        // 2. Hard cap: if at capacity, evict the cheapest pending tx to free a slot.
+        if self.pending_total.load(Ordering::Relaxed) as usize >= MAX_MEMPOOL_SIZE {
+            self.evict_one_cheapest();
+        }
+
         let shard = shard_for_address(&tx.from) as usize;
-        self.shards[shard].lock().unwrap().push(tx);
+        self.shards[shard].lock().expect("lock poisoned").push(tx);
         self.pending_total.fetch_add(1, Ordering::Relaxed);
         self.submitted.fetch_add(1, Ordering::Relaxed);
         self.tx_notify.notify_one();
     }
 
-    pub fn drain_shard(&self, shard_id: u32) -> Vec<LedgerTx> {
-        let mut s = self.shards[shard_id as usize].lock().unwrap();
-        if s.is_empty() { return vec![]; }
 
-        s.sort_unstable_by(|a, b| {
-            let fa = a.fee_uegoc + a.priority_fee_uegoc;
-            let fb = b.fee_uegoc + b.priority_fee_uegoc;
-            fb.cmp(&fa)
-        });
-        let n = s.len().min(BATCH_SIZE);
-        let drained: Vec<LedgerTx> = s.drain(..n).collect();
-        let count = drained.len() as u64;
-        self.pending_total.fetch_sub(count, Ordering::Relaxed);
-        self.confirmed.fetch_add(count, Ordering::Relaxed);
+    fn evict_one_cheapest(&self) {
+        let mut worst_shard = 0usize;
+        let mut worst_fee   = u64::MAX;
+        let mut worst_idx   = 0usize;
+        let mut worst_hash  = String::new();
+
+
+        for (i, shard) in self.shards.iter().enumerate() {
+            let s = shard.lock().expect("lock poisoned");
+            for (j, tx) in s.iter().enumerate() {
+                let fee = tx.fee_uegoc.saturating_add(tx.priority_fee_uegoc);
+                if fee < worst_fee {
+                    worst_fee   = fee;
+                    worst_shard = i;
+                    worst_idx   = j;
+                    worst_hash  = tx.hash.clone();
+                }
+            }
+        }
+
+        if worst_hash.is_empty() { return; }
+
+        // Remove from shard (verify slot still holds the same tx to avoid races).
+        {
+            let mut s = self.shards[worst_shard].lock().expect("lock poisoned");
+            if worst_idx < s.len() && s[worst_idx].hash == worst_hash {
+                s.remove(worst_idx);
+                self.pending_total.fetch_sub(1, Ordering::Relaxed);
+            } else {
+                // tx moved (concurrent drain) — give up on this eviction
+                self.seen_hashes.lock().expect("lock poisoned").remove(&worst_hash);
+                return;
+            }
+        }
+
+        self.seen_hashes.lock().expect("lock poisoned").remove(&worst_hash);
+        eprintln!(
+            "[Mempool] Evicted lowest-fee tx {} (fee={} uEGOC) — mempool at capacity",
+            &worst_hash[..worst_hash.len().min(12)], worst_fee
+        );
+    }
+
+
+    pub fn drain_shard(&self, shard_id: u32) -> Vec<LedgerTx> {
+        let mut expired_hashes: Vec<String> = Vec::new();
+
+        let drained = {
+            let mut s = self.shards[shard_id as usize].lock().expect("lock poisoned");
+            if s.is_empty() { return vec![]; }
+
+            // TTL eviction: remove stale txs that have been waiting too long.
+            let now = chrono::Utc::now().timestamp();
+            s.retain(|tx| {
+                let stale = tx.timestamp > 0 && (now - tx.timestamp) >= MAX_TX_AGE_SECS;
+                if stale { expired_hashes.push(tx.hash.clone()); }
+                !stale
+            });
+            if !expired_hashes.is_empty() {
+                let n = expired_hashes.len() as u64;
+                self.pending_total.fetch_sub(n, Ordering::Relaxed);
+                eprintln!(
+                    "[Mempool] Evicted {} stale txs (>{}s old) from shard {}",
+                    n, MAX_TX_AGE_SECS, shard_id
+                );
+            }
+
+            if s.is_empty() { return vec![]; }
+
+            // Sort by total fee descending (base + priority) to maximise miner revenue.
+            s.sort_unstable_by(|a, b| {
+                let fa = a.fee_uegoc + a.priority_fee_uegoc;
+                let fb = b.fee_uegoc + b.priority_fee_uegoc;
+                fb.cmp(&fa)
+            });
+            let n = s.len().min(BATCH_SIZE);
+            let batch: Vec<LedgerTx> = s.drain(..n).collect();
+            let count = batch.len() as u64;
+            self.pending_total.fetch_sub(count, Ordering::Relaxed);
+            self.confirmed.fetch_add(count, Ordering::Relaxed);
+            batch
+        };
+
+        // Clean up seen_hashes for expired + drained txs (shard lock already released).
+        if !expired_hashes.is_empty() || !drained.is_empty() {
+            let mut seen = self.seen_hashes.lock().expect("lock poisoned");
+            for h in &expired_hashes { seen.remove(h); }
+            for tx in &drained        { seen.remove(&tx.hash); }
+        }
+
         drained
     }
 
@@ -98,7 +193,7 @@ impl ShardedMempool {
     /// Returns a snapshot of all pending txs without draining — for the explorer.
     pub fn peek_all(&self) -> Vec<LedgerTx> {
         self.shards.iter()
-            .flat_map(|s| s.lock().unwrap().clone())
+            .flat_map(|s| s.lock().expect("lock poisoned").clone())
             .collect()
     }
 
@@ -116,13 +211,13 @@ impl ShardedMempool {
 
     pub fn shard_sizes(&self) -> Vec<usize> {
         self.shards.iter()
-            .map(|s| s.lock().unwrap().len())
+            .map(|s| s.lock().expect("lock poisoned").len())
             .collect()
     }
 
     pub fn any_shard_full(&self) -> bool {
         self.shards.iter()
-            .any(|s| s.lock().unwrap().len() >= BATCH_SIZE)
+            .any(|s| s.lock().expect("lock poisoned").len() >= BATCH_SIZE)
     }
 }
 
@@ -140,6 +235,10 @@ fn get_miner_address() -> Option<String> {
 }
 
 async fn try_mine(txs: Vec<LedgerTx>, miner: &str) {
+    if !crate::p2p::get_known_validators_snapshot().is_empty() {
+        return;
+    }
+
     let prev_hash = crate::chain_db::get_tip_hash();
     let (poc_ticket, _poc_sig) = match crate::poc::check_slot_winner(&prev_hash) {
         Some(t) => t,
@@ -152,7 +251,7 @@ async fn try_mine(txs: Vec<LedgerTx>, miner: &str) {
     let block = crate::chain_db::mine_batch_db_with_ticket(&txs, miner, &combined_ticket, poc_slot);
 
     eprintln!(
-        "[Mempool] Block #{} sealed — {} user txs + 1 coinbase",
+        "[Mempool] Solo block #{} sealed — {} user txs + 1 coinbase",
         block.height, tx_count,
     );
 
@@ -166,8 +265,6 @@ async fn try_mine(txs: Vec<LedgerTx>, miner: &str) {
         t
     }).collect();
 
-    // Remove confirmed txs from the on-disk pending store so they're not
-    // re-injected on next startup.
     for tx in &txs {
         crate::commands::tx_pending::remove(&tx.hash);
     }
@@ -179,43 +276,32 @@ async fn try_mine(txs: Vec<LedgerTx>, miner: &str) {
 }
 
 // ── Reactive batch loop ────────────────────────────────────────────────────────
-//
-// State machine:
-//   Idle          → waiting for first tx (or empty-block timeout)
-//   Batching      → first tx arrived; drains after BATCH_WINDOW_MS or TX_THRESHOLD
-//   MaxWaitForced → txs pending > MAX_BLOCK_INTERVAL_S — seal regardless of window
-//
-// Empty blocks (coinbase only) are produced at most every EMPTY_BLOCK_INTERVAL_S
-// so the miner still earns rewards during quiet periods without flooding the chain.
 
 pub async fn run_batch_loop() {
     eprintln!(
         "[Mempool] Reactive batch loop started — \
-         batch_window={}ms  threshold={}txs  max_wait={}s  empty_min={}s",
+         batch_window={}ms  threshold={}txs  max_wait={}s  empty_min={}s  \
+         max_pending={}  tx_ttl={}s",
         BATCH_WINDOW_MS, TX_THRESHOLD, MAX_BLOCK_INTERVAL_S, EMPTY_BLOCK_INTERVAL_S,
+        MAX_MEMPOOL_SIZE, MAX_TX_AGE_SECS,
     );
 
     let _ = crate::chain_db::get_db();
 
     let pool = get_mempool();
 
-    // When we last sealed a block (for empty-block suppression).
-    let mut last_block_at   = Instant::now();
-    // When the batch window started (first tx after an idle period).
+    let mut last_block_at    = Instant::now();
     let mut batch_started_at: Option<Instant> = None;
 
     loop {
         let notify  = pool.tx_notify.clone();
         let pending = pool.pending_count();
 
-        // ── Determine how long to sleep before checking again ─────────────────
         let sleep_dur = if pending == 0 {
-            // Idle: wake on new tx or when the empty-block timer fires.
             let since_block = last_block_at.elapsed().as_secs();
             let until_empty = EMPTY_BLOCK_INTERVAL_S.saturating_sub(since_block);
             Duration::from_secs(until_empty.max(1))
         } else {
-            // Batching: wake at the earlier of batch-window end or max-wait end.
             let batch_remaining = batch_started_at
                 .map(|t| {
                     let elapsed = t.elapsed().as_millis() as u64;
@@ -223,59 +309,48 @@ pub async fn run_batch_loop() {
                 })
                 .unwrap_or(Duration::from_millis(BATCH_WINDOW_MS));
 
-            let since_block    = last_block_at.elapsed().as_secs();
-            let max_remaining  = Duration::from_secs(
+            let since_block   = last_block_at.elapsed().as_secs();
+            let max_remaining = Duration::from_secs(
                 MAX_BLOCK_INTERVAL_S.saturating_sub(since_block).max(1)
             );
 
             batch_remaining.min(max_remaining)
         };
 
-        // ── Wait for a tx notification OR the computed timeout ─────────────────
         tokio::select! {
             _ = notify.notified() => {
-                // New tx pushed. Record when batching started.
                 if batch_started_at.is_none() {
                     batch_started_at = Some(Instant::now());
                 }
-                // If threshold reached, fall through immediately to produce.
                 if pool.pending_count() < TX_THRESHOLD {
-                    continue; // keep collecting
+                    continue;
                 }
                 eprintln!("[Mempool] TX_THRESHOLD ({}) reached — sealing immediately", TX_THRESHOLD);
             }
-            _ = tokio::time::sleep(sleep_dur) => {
-                // Timer fired.
-            }
+            _ = tokio::time::sleep(sleep_dur) => {}
         }
 
-        // ── Check if we should produce a block ────────────────────────────────
-        let pending = pool.pending_count();
+        let pending     = pool.pending_count();
         let since_block = last_block_at.elapsed().as_secs();
 
         let should_seal = if pending >= TX_THRESHOLD {
-            true // threshold
+            true
         } else if pending > 0 {
             let batch_age = batch_started_at
                 .map(|t| t.elapsed().as_millis() as u64)
                 .unwrap_or(0);
             batch_age >= BATCH_WINDOW_MS || since_block >= MAX_BLOCK_INTERVAL_S
         } else {
-            // No user txs — only produce a reward block if enough time passed.
             since_block >= EMPTY_BLOCK_INTERVAL_S
         };
 
-        if !should_seal {
-            continue;
-        }
+        if !should_seal { continue; }
 
         let miner = match get_miner_address() {
             Some(a) => a,
             None    => continue,
         };
 
-        // Log a warning when producing blocks without enough validators for
-        // BFT finality — operators should see this until real validators join.
         let active_validators = crate::ledger::active_validator_count();
         if active_validators < MIN_VALIDATORS_FOR_FINALITY {
             eprintln!(
@@ -289,7 +364,7 @@ pub async fn run_batch_loop() {
         let txs = pool.drain_all();
         try_mine(txs, &miner).await;
 
-        last_block_at   = Instant::now();
+        last_block_at    = Instant::now();
         batch_started_at = None;
     }
 }

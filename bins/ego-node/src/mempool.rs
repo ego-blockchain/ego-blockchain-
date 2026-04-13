@@ -7,10 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const SHARD_COUNT: usize = 64;
 pub const MAX_TOTAL:   usize = 50_000;
 
-/// Effective fee for ordering: gross fee from ru_limit minus pob subsidy, then
-/// priority_hint added as a 0–255 uEGOC bonus so senders can tip the block producer.
-///
-/// BASE_FEE_PER_RU matches the constant in ego-core's state.rs (10 uEGOC per RU).
+
 const BASE_FEE_PER_RU: u128 = 10;
 
 fn effective_fee(tx: &Transaction) -> u128 {
@@ -19,10 +16,10 @@ fn effective_fee(tx: &Transaction) -> u128 {
     net + tx.priority_hint as u128
 }
 
-/// Wrapper so Transaction can live in a max-BinaryHeap ordered by fee then age.
+
 struct HeapEntry {
     fee:       u128,
-    /// Timestamp as seconds — smaller = older = higher priority on ties.
+
     ts_secs:   u64,
     hash_hex:  String,
     tx:        Transaction,
@@ -45,7 +42,7 @@ impl Ord for HeapEntry {
     }
 }
 
-/// Per-shard state: BinaryHeap for O(log n) insert/pop + HashMap for O(1) remove-by-hash.
+
 struct Shard {
     heap: BinaryHeap<HeapEntry>,
     map:  HashMap<String, ()>,   // tracks which hashes are in the heap
@@ -63,8 +60,7 @@ impl Shard {
         self.heap.push(HeapEntry { fee, ts_secs, hash_hex, tx });
     }
 
-    /// Pop the highest-priority tx still present in `map`.
-    /// Stale entries (removed via `remove_by_hash`) are skipped lazily.
+
     fn pop_best(&mut self) -> Option<Transaction> {
         loop {
             let entry = self.heap.pop()?;
@@ -75,9 +71,8 @@ impl Shard {
         }
     }
 
-    /// Returns true if the entry existed and was tombstoned.
     fn remove_by_hash(&mut self, hash_hex: &str) -> bool {
-        // Mark as removed in O(1); the BinaryHeap entry will be skipped lazily in pop_best.
+
         self.map.remove(hash_hex).is_some()
     }
 }
@@ -85,8 +80,7 @@ impl Shard {
 pub struct ShardedMempool {
     shards: Vec<Mutex<Shard>>,
     total:  AtomicU64,
-    /// (sender_bytes, nonce) → tx_hash_hex: prevents two pending txs with the same
-    /// (from, nonce), which would cause a silent failure when the second is executed.
+ 
     nonce_index: Mutex<HashMap<([u8; 20], u64), String>>,
 }
 
@@ -116,17 +110,9 @@ impl ShardedMempool {
         self.shards[Self::shard_idx(hash_hex)].lock().unwrap()
     }
 
-    /// Maximum age of a transaction in seconds before it is rejected on insert.
-    /// Prevents replay of old signed transactions after nonce gaps are filled.
+
     pub const MAX_TX_AGE_SECS: i64 = 3_600; // 1 hour
 
-    /// Insert a transaction.
-    ///
-    /// Rejected with an error if:
-    /// - The tx timestamp is more than 1 hour in the past or more than 30s in the future (`"expired"`)
-    /// - The tx hash is already in the pool (`"duplicate"`)
-    /// - Another pending tx from the same sender already occupies this nonce (`"nonce conflict"`)
-    /// - The pool is full (`"full"`)
     pub fn insert(&self, tx: Transaction) -> Result<(), &'static str> {
         // Reject stale or far-future transactions.
         let now_secs = std::time::SystemTime::now()
@@ -166,9 +152,7 @@ impl ShardedMempool {
         self.lock_shard(hash_hex).contains(hash_hex)
     }
 
-    /// Drain up to `n` transactions, highest effective fee first.
-    ///
-    /// O(k log n) where k = txs drained — no full sort, just heap pops.
+
     pub fn drain_n(&self, n: usize) -> Vec<Transaction> {
         let mut out = Vec::with_capacity(n);
         let per_shard = ((n + SHARD_COUNT - 1) / SHARD_COUNT).max(1);
@@ -193,9 +177,7 @@ impl ShardedMempool {
         out
     }
 
-    /// Remove a specific tx (e.g. after it was included in a peer block).
-    ///
-    /// Lock ordering: nonce_index → shard (same as `insert`/`drain_n`).
+
     pub fn remove(&self, hash_hex: &str) {
         let mut ni = self.nonce_index.lock().unwrap();
         let mut s  = self.lock_shard(hash_hex);

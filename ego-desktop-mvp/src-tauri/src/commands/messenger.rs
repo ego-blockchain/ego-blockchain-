@@ -589,6 +589,7 @@ pub async fn approve_contact_request(
                 country:   None,
                 coverage_score: 0,
                 dilithium_pubkey: String::new(),
+                vrf_pubkey: String::new(),
             };
             if let Err(e) = p2p::send_message(&resolved_peer_ep, &announce).await {
                 eprintln!("[P2P] Could not send PeerAnnounce after approval: {}", e);

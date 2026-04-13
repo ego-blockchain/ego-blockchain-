@@ -1,5 +1,45 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
+
+pub(crate) mod hex_bytes {
+    use serde::{Deserializer, Serializer, de::Error as _};
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(bytes))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s: &str = serde::de::Deserialize::deserialize(d)?;
+        hex::decode(s).map_err(D::Error::custom)
+    }
+}
+
+pub(crate) mod hex_bytes32 {
+    use serde::{Deserializer, Serializer, de::Error as _};
+    pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(bytes))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let s: &str = serde::de::Deserialize::deserialize(d)?;
+        let v = hex::decode(s).map_err(D::Error::custom)?;
+        v.try_into().map_err(|_| D::Error::custom("expected 32-byte hex"))
+    }
+}
+
+pub(crate) mod opt_hex_bytes {
+    use serde::{Deserializer, Serializer, de::Error as _};
+    pub fn serialize<S: Serializer>(opt: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match opt {
+            Some(b) => s.serialize_some(&hex::encode(b)),
+            None    => s.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        let opt: Option<&str> = serde::de::Deserialize::deserialize(d)?;
+        match opt {
+            Some(s) => hex::decode(s).map(Some).map_err(D::Error::custom),
+            None    => Ok(None),
+        }
+    }
+}
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_SHARD_COUNT: u32 = 256;
 pub const EGOC_BASE_UNIT: u128 = 1_000_000_000;
@@ -78,19 +118,24 @@ impl fmt::Display for AlgorithmId {
     }
 }
 
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    Serialize,
-    Deserialize,
-    bincode::Encode,
-    bincode::Decode,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, bincode::Encode, bincode::Decode)]
 pub struct Hash([u8; 32]);
+
+impl Serialize for Hash {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Hash {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let s: &str = serde::de::Deserialize::deserialize(d)?;
+        let v = hex::decode(s).map_err(D::Error::custom)?;
+        let arr: [u8; 32] = v.try_into().map_err(|_| D::Error::custom("expected 32-byte hex"))?;
+        Ok(Hash(arr))
+    }
+}
 
 impl Hash {
     pub const ZERO: Self = Hash([0u8; 32]);
@@ -176,7 +221,7 @@ impl Serialize for PublicKey {
         use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("PublicKey", 2)?;
         state.serialize_field("algorithm", &self.algorithm)?;
-        state.serialize_field("key_data", &self.key_data)?;
+        state.serialize_field("key_data", &hex::encode(&self.key_data))?;
         state.end()
     }
 }
@@ -186,16 +231,18 @@ impl<'de> Deserialize<'de> for PublicKey {
     where
         D: serde::Deserializer<'de>,
     {
+        use serde::de::Error as _;
         #[derive(Deserialize)]
         struct PublicKeyHelper {
             algorithm: AlgorithmId,
-            key_data: Vec<u8>,
+            key_data: String,
         }
 
         let helper = PublicKeyHelper::deserialize(deserializer)?;
+        let key_data = hex::decode(&helper.key_data).map_err(D::Error::custom)?;
         Ok(PublicKey {
             algorithm: helper.algorithm,
-            key_data: helper.key_data,
+            key_data,
         })
     }
 }
@@ -332,6 +379,7 @@ impl Default for PublicKey {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct Signature {
     pub algorithm: AlgorithmId,
+    #[serde(with = "hex_bytes")]
     pub signature_data: Vec<u8>,
 }
 
@@ -647,19 +695,24 @@ impl Default for PeerCapabilities {
     }
 }
 
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    Serialize,
-    Deserialize,
-    bincode::Encode,
-    bincode::Decode,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, bincode::Encode, bincode::Decode)]
 pub struct Address([u8; 20]);
+
+impl Serialize for Address {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Address {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let s: &str = serde::de::Deserialize::deserialize(d)?;
+        let v = hex::decode(s).map_err(D::Error::custom)?;
+        let arr: [u8; 20] = v.try_into().map_err(|_| D::Error::custom("expected 20-byte hex"))?;
+        Ok(Address(arr))
+    }
+}
 
 impl Address {
     pub fn new(bytes: [u8; 20]) -> Self {
