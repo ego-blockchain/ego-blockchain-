@@ -6,66 +6,67 @@ use axum::{
 };
 use rocksdb::{Options, DB};
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-const CF_BLOCKS: &str = "blocks";
-const CF_TXS:   &str  = "txs";
+static CHAIN_BLOCKS_DB: OnceLock<Arc<Mutex<DB>>> = OnceLock::new();
+static CHAIN_TXS_DB:    OnceLock<Arc<Mutex<DB>>> = OnceLock::new();
 
-pub struct ChainStore {
-    blocks_db: Arc<Mutex<DB>>,
-    txs_db:    Arc<Mutex<DB>>,
+fn blocks_db() -> Arc<Mutex<DB>> {
+    CHAIN_BLOCKS_DB.get_or_init(|| {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        Arc::new(Mutex::new(DB::open(&opts, "chain_blocks.db").expect("open chain_blocks.db")))
+    }).clone()
 }
 
-impl Clone for ChainStore {
-    fn clone(&self) -> Self {
-        ChainStore { blocks_db: self.blocks_db.clone(), txs_db: self.txs_db.clone() }
+fn txs_db() -> Arc<Mutex<DB>> {
+    CHAIN_TXS_DB.get_or_init(|| {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        Arc::new(Mutex::new(DB::open(&opts, "chain_txs.db").expect("open chain_txs.db")))
+    }).clone()
+}
+
+pub fn store_tx(tx: &Value) {
+    let hash = tx.get("hash").and_then(|h| h.as_str()).unwrap_or("").to_string();
+    if hash.is_empty() { return; }
+    if let Ok(val) = serde_json::to_vec(tx) {
+        let _ = txs_db().lock().unwrap().put(hash.as_bytes(), val);
     }
 }
+
+#[derive(Clone)]
+pub struct ChainStore;
 
 pub fn new_chain_store() -> ChainStore {
-    let mut opts = Options::default();
-    opts.create_if_missing(true);
-    let blocks_db = DB::open(&opts, "chain_blocks.db").expect("open chain_blocks.db");
-    let txs_db    = DB::open(&opts, "chain_txs.db").expect("open chain_txs.db");
-    ChainStore {
-        blocks_db: Arc::new(Mutex::new(blocks_db)),
-        txs_db:    Arc::new(Mutex::new(txs_db)),
-    }
+    blocks_db();
+    txs_db();
+    ChainStore
 }
 
 pub fn chain_router(store: ChainStore) -> Router {
     Router::new()
-        .route("/block/broadcast",      post(post_block))
-        .route("/tx/broadcast",         post(post_tx))
-        .route("/chain/blocks",         get(get_blocks))
-        .route("/chain/transactions",   get(get_transactions))
+        .route("/block/broadcast",    post(post_block))
+        .route("/chain/blocks",       get(get_blocks))
+        .route("/chain/transactions", get(get_transactions))
         .with_state(store)
 }
 
 async fn post_block(
-    State(store): State<ChainStore>,
+    State(_): State<ChainStore>,
     Json(block): Json<Value>,
 ) -> StatusCode {
     let height = block.get("height").and_then(|h| h.as_u64()).unwrap_or(u64::MAX);
     let key = height.to_be_bytes();
-    let val = serde_json::to_vec(&block).unwrap_or_default();
-    let _ = store.blocks_db.lock().unwrap().put(key, val);
+    if let Ok(val) = serde_json::to_vec(&block) {
+        let _ = blocks_db().lock().unwrap().put(key, val);
+    }
     StatusCode::OK
 }
 
-async fn post_tx(
-    State(store): State<ChainStore>,
-    Json(tx): Json<Value>,
-) -> StatusCode {
-    let hash = tx.get("hash").and_then(|h| h.as_str()).unwrap_or("").to_string();
-    if hash.is_empty() { return StatusCode::BAD_REQUEST; }
-    let val = serde_json::to_vec(&tx).unwrap_or_default();
-    let _ = store.txs_db.lock().unwrap().put(hash.as_bytes(), val);
-    StatusCode::OK
-}
-
-async fn get_blocks(State(store): State<ChainStore>) -> (StatusCode, Json<Vec<Value>>) {
-    let db = store.blocks_db.lock().unwrap();
+async fn get_blocks(State(_): State<ChainStore>) -> (StatusCode, Json<Vec<Value>>) {
+    let db = blocks_db();
+    let db = db.lock().unwrap();
     let mut blocks: Vec<Value> = db
         .iterator(rocksdb::IteratorMode::Start)
         .filter_map(|r| r.ok())
@@ -75,8 +76,9 @@ async fn get_blocks(State(store): State<ChainStore>) -> (StatusCode, Json<Vec<Va
     (StatusCode::OK, Json(blocks))
 }
 
-async fn get_transactions(State(store): State<ChainStore>) -> (StatusCode, Json<Vec<Value>>) {
-    let db = store.txs_db.lock().unwrap();
+async fn get_transactions(State(_): State<ChainStore>) -> (StatusCode, Json<Vec<Value>>) {
+    let db = txs_db();
+    let db = db.lock().unwrap();
     let txs: Vec<Value> = db
         .iterator(rocksdb::IteratorMode::Start)
         .filter_map(|r| r.ok())
