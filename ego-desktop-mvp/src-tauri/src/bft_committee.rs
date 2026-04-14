@@ -1,5 +1,5 @@
 pub const COMMITTEE_SIZE: usize = 21;
-pub const MIN_COMMITTEE_NET: usize = 3;
+pub const MIN_COMMITTEE_NET: usize = 1;
 pub const VRF_ROLE_PROPOSER:  u8 = 0x50;
 pub const VRF_ROLE_COMMITTEE: u8 = 0x43;
 
