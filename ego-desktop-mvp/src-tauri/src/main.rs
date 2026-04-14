@@ -435,7 +435,6 @@ fn main() {
                 if startup_peers < 50 {
                     crate::p2p::fetch_chain_from_oracle(&handle_startup).await;
                     eprintln!("[Startup] Oracle chain sync complete ({} peers, oracle active)", startup_peers);
-                    crate::p2p::oracle_sync_chain().await;
                 } else {
                     eprintln!("[Startup] {} peers — skipping oracle, using P2P only", startup_peers);
                 }
@@ -480,7 +479,6 @@ fn main() {
 
                     if use_oracle {
                         crate::p2p::fetch_chain_from_oracle(&handle_startup).await;
-                        crate::p2p::oracle_sync_chain().await;
                     }
                     crate::p2p::broadcast_peer_announce(&handle_startup).await;
                     crate::p2p::sync_chain_from_peers().await;
