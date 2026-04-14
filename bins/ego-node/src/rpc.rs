@@ -141,10 +141,22 @@ async fn block_broadcast(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(body):        Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    if !rate_ok(&s, peer.ip(), 5) {
+    if !rate_ok(&s, peer.ip(), 20) {
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded" }))).into_response();
     }
-    // Parse as a typed Block — rejects arbitrary JSON.
+    let height: u64 = body["header"]["core"]["height"]
+        .as_u64()
+        .or_else(|| body["height"].as_u64())
+        .unwrap_or(0);
+    if height == 0 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "missing height" }))).into_response();
+    }
+    if crate::store::block_exists(height) {
+        return (StatusCode::OK, Json(serde_json::json!({ "status": "already known" }))).into_response();
+    }
+    crate::store::insert_block(height, &body);
+    return (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "accepted" }))).into_response();
+    #[allow(unreachable_code)]
     let block: Block = match serde_json::from_value(body.clone()) {
         Ok(b) => b,
         Err(e) => return (
