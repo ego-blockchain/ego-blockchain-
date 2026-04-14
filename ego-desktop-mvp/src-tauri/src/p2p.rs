@@ -1964,6 +1964,27 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     dht_inbox_poll.tick().await; // skip first immediate tick
 
 
+    if std::env::var("EGO_DATA_DIR").is_ok() && crate::ledger::load_seed().is_none() {
+        let _ = std::fs::create_dir_all(crate::ledger::data_dir());
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+        if let Ok(_) = crate::ledger::save_seed(&seed) {
+            if let Ok(kp) = ego_core::KeyPair::from_bytes(&seed) {
+                if let Ok(addr) = kp.derive_bech32_address(1, ego_core::AddressType::EOA, "egot") {
+                    let mut ledger = crate::ledger::Ledger::load();
+                    if ledger.address.is_empty() {
+                        ledger.address = addr.clone();
+                        let mn = kp.derive_bech32_address(0, ego_core::AddressType::EOA, "ego").unwrap_or_default();
+                        ledger.mainnet_address = mn;
+                        ledger.staked_amount = 1_000_000;
+                        let _ = ledger.save();
+                        eprintln!("[P2P] Auto-generated node identity: {}", addr);
+                    }
+                }
+            }
+        }
+    }
+
     {
         let ledger = crate::ledger::Ledger::load();
         if ledger.staked_amount > 0 && !ledger.address.is_empty() {
