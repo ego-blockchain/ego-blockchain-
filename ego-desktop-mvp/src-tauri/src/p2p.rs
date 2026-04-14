@@ -79,7 +79,7 @@ pub fn p2p_port() -> u16 {
 pub const P2P_PORT: u16 = 47393;
 
 pub const RELAY_NODES: &[&str] = &[
-    "/dns4/EgoRelay.egoblockchain.com/tcp/4001/p2p/12D3KooWPj6m7jzmVyMh1zWrsoux3YiVs9j2HwsjrFXzDcqAGGz4",
+    "/dns4/EgoRelay.egoblockchain.com/tcp/4001/p2p/12D3KooWFFjZdk4nhpsXKxa44eUsggQ9rAzELeVv34Eav8qA5t9y",
 ];
 
 static EGOC_PRICE_USD: std::sync::OnceLock<std::sync::Mutex<f64>> = std::sync::OnceLock::new();
