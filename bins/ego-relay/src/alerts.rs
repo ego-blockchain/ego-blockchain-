@@ -311,9 +311,12 @@ pub struct AlertsQuery {
 
 async fn handle_tx_broadcast(
     State(store): State<AlertStore>,
-    Json(tx):     Json<InboundTx>,
+    Json(tx):     Json<serde_json::Value>,
 ) -> StatusCode {
-    store.process_tx(&tx);
+    if let Ok(inbound) = serde_json::from_value::<InboundTx>(tx.clone()) {
+        store.process_tx(&inbound);
+    }
+    crate::chain::store_tx(&tx);
     StatusCode::OK
 }
 
