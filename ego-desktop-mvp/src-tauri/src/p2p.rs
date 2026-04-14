@@ -5549,13 +5549,7 @@ pub async fn run_view_change_monitor() {
             publish_gossip("ego-viewchange-v1", data).await;
         }
 
-        {
-            let mut votes = view_change_votes();
-            let voters = votes.entry(next_view).or_default();
-            if !voters.contains(&my_addr) {
-                voters.push(my_addr.clone());
-            }
-        }
+        handle_view_change_msg(next_view, my_addr).await;
 
         touch_proposal_timestamp();
     }
