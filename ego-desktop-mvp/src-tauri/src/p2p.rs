@@ -4532,6 +4532,11 @@ async fn merge_remote_chain_inner(
                 block.prev_hash.clone()
             };
             if block.prev_hash != expected_prev {
+                if trusted {
+                    crate::chain_db::truncate_from(block.height);
+                    new_blocks.push(block);
+                    continue;
+                }
                 let our_tip = crate::chain_db::block_count();
                 if block.height > our_tip {
                     eprintln!(

@@ -1181,6 +1181,24 @@ pub fn append_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) {
     write_block_batch(&db, block, txs);
 }
 
+pub fn truncate_from(height: u64) {
+    if height == 0 { return; }
+    let db = get_db().lock().unwrap();
+    let cf_blocks = db.cf_handle(CF_BLOCKS).unwrap();
+    let cf_meta   = db.cf_handle(CF_META).unwrap();
+    let tip = db.get_cf(cf_meta, META_LATEST_HEIGHT)
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    if height > tip { return; }
+    let mut batch = WriteBatch::default();
+    for h in height..=tip {
+        batch.delete_cf(cf_blocks, height_key(h));
+    }
+    let new_tip = height - 1;
+    batch.put_cf(cf_meta, META_LATEST_HEIGHT, u64_le(new_tip));
+    db.write(batch).expect("truncate write");
+    eprintln!("[ChainDB] Reorg: truncated heights {}..={} (new tip: {})", height, tip, new_tip);
+}
+
 /// Same as `append_peer_block` but stamps `vote_count` before writing.
 /// Used by the BFT finalization path to record how many votes the block got.
 pub fn append_peer_block_with_votes(block: &LedgerBlock, txs: &[LedgerTx], votes: u32) {
