@@ -5198,6 +5198,7 @@ pub fn touch_proposal_timestamp() {
 }
 
 async fn handle_view_change_msg(view: u64, voter: String) {
+    register_known_validator(&voter);
     let threshold = bft_threshold().max(1);
 
     let should_advance = {
@@ -5374,7 +5375,7 @@ pub async fn propose_block_as_leader() {
         }
     }
 
-    if known_validators().len() <= 1 {
+    if is_solo {
         bft_solo_commit(&block.hash, block.height);
         eprintln!("[BFT] Solo block #{} committed", block.height);
     } else {
@@ -5424,6 +5425,7 @@ pub async fn propose_block_as_leader_forced() {
     let mut seed_32 = [0u8; 32];
     seed_32.copy_from_slice(&seed_bytes);
 
+    let is_solo = known_validators().len() <= 1;
     let pool = crate::mempool::get_mempool();
     let txs  = pool.drain_all();
 
@@ -5483,7 +5485,7 @@ pub async fn propose_block_as_leader_forced() {
         }
     }
 
-    if known_validators().len() <= 1 {
+    if is_solo {
         bft_solo_commit(&block.hash, block.height);
         eprintln!("[BFT] Solo fallback block #{} committed", block.height);
     } else {
@@ -5526,7 +5528,13 @@ pub async fn run_view_change_monitor() {
             publish_gossip("ego-viewchange-v1", data).await;
         }
 
-        handle_view_change_msg(next_view, my_addr).await;
+        {
+            let mut votes = view_change_votes();
+            let voters = votes.entry(next_view).or_default();
+            if !voters.contains(&my_addr) {
+                voters.push(my_addr.clone());
+            }
+        }
 
         touch_proposal_timestamp();
     }
