@@ -4515,12 +4515,37 @@ async fn merge_remote_chain_trusted(
 }
 
 async fn merge_remote_chain_inner(
-    blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: &tauri::AppHandle,
+    mut blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: &tauri::AppHandle,
     trusted: bool,
 ) {
 
     let mut new_txs: Vec<LedgerTx> = Vec::new();
     let mut new_blocks: Vec<LedgerBlock> = Vec::new();
+
+    if trusted {
+        blocks.sort_unstable_by_key(|b| b.height);
+
+        let diverge_height: Option<u64> = blocks.iter()
+            .filter(|b| b.height > 0)
+            .find(|b| {
+                crate::chain_db::get_block_by_height(b.height)
+                    .map(|local| local.hash != b.hash)
+                    .unwrap_or(false)
+            })
+            .map(|b| b.height);
+
+        if let Some(dh) = diverge_height {
+            eprintln!("[Oracle] Reorg: local chain diverges at height {} — truncating and adopting oracle chain", dh);
+            crate::chain_db::truncate_from(dh);
+        }
+
+        for block in blocks {
+            if block.height == 0 { continue; }
+            if crate::chain_db::get_block_by_height(block.height).is_none() {
+                new_blocks.push(block);
+            }
+        }
+    } else {
 
     for block in blocks {
         if block.height == 0 { continue; }
@@ -4533,15 +4558,9 @@ async fn merge_remote_chain_inner(
             } else if let Some(parent) = crate::chain_db::get_block_by_height(parent_height) {
                 parent.hash.clone()
             } else {
-                // We don't have the parent yet — accept tentatively (gap fill).
                 block.prev_hash.clone()
             };
             if block.prev_hash != expected_prev {
-                if trusted {
-                    crate::chain_db::truncate_from(block.height);
-                    new_blocks.push(block);
-                    continue;
-                }
                 let our_tip = crate::chain_db::block_count();
                 if block.height > our_tip {
                     eprintln!(
@@ -4560,9 +4579,7 @@ async fn merge_remote_chain_inner(
             }
         }
 
-        if trusted {
-            new_blocks.push(block);
-        } else {
+        {
 
             let expected_reward = crate::tokenomics::block_reward_at(block.height);
             let reward_ok = block.reward == expected_reward || block.reward == 0;
@@ -4585,6 +4602,8 @@ async fn merge_remote_chain_inner(
             new_blocks.push(block);
         }
     }
+
+    } // end else (untrusted path)
 
     for tx in transactions {
 
