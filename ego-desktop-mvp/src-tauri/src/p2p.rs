@@ -1889,6 +1889,15 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
         }
     }
 
+    if let Ok(peers_env) = std::env::var("EGO_DIRECT_PEERS") {
+        for addr_str in peers_env.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+                eprintln!("[P2P] Dialling direct peer: {}", addr);
+                let _ = swarm.dial(addr);
+            }
+        }
+    }
+
     // ── Gossipsub subscriptions ───────────────────────────────────────────────
     let tx_topic       = gossipsub::IdentTopic::new("ego-txs-v1");
     let block_topic    = gossipsub::IdentTopic::new("ego-blocks-v1");

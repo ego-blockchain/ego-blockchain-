@@ -101,7 +101,7 @@ fn acquire_single_instance_lock() -> bool {
 }
 
 fn main() {
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
     {
         extern "system" {
             fn SetStdHandle(nStdHandle: u32, hHandle: isize) -> i32;
