@@ -5243,7 +5243,7 @@ async fn handle_view_change_msg(view: u64, voter: String) {
     let my_addr = crate::ledger::Ledger::load().address;
     if my_addr.is_empty() { return; }
 
-    if get_known_peers().len() < 50 {
+    if known_validators().len() < crate::bft_committee::MIN_COMMITTEE_NET {
         return;
     }
 
@@ -5286,7 +5286,7 @@ async fn handle_view_change_msg(view: u64, voter: String) {
 }
 
 pub async fn propose_block_as_leader() {
-    if get_known_peers().len() < 50 { return; }
+    if known_validators().len() < crate::bft_committee::MIN_COMMITTEE_NET { return; }
     let miner = crate::ledger::Ledger::load().address;
     if miner.is_empty() { return; }
 
@@ -5410,7 +5410,7 @@ fn bft_solo_commit(block_hash: &str, height: u64) {
 /// Called by the deterministic liveness fallback after FALLBACK_AFTER_EMPTY_VIEWS
 /// consecutive view changes with no block — prevents chain death.
 pub async fn propose_block_as_leader_forced() {
-    if get_known_peers().len() < 50 { return; }
+    if known_validators().len() < crate::bft_committee::MIN_COMMITTEE_NET { return; }
     let miner = crate::ledger::Ledger::load().address;
     if miner.is_empty() { return; }
 
