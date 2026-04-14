@@ -11,7 +11,7 @@ pub const SHARD_COUNT: u32   = 256;
 pub const BATCH_SIZE:  usize = 625;
 
 
-pub const MIN_VALIDATORS_FOR_FINALITY: usize = 21;
+pub const MIN_VALIDATORS_FOR_FINALITY: usize = 1;
 
 
 pub const BATCH_WINDOW_MS: u64 = 3_000;
