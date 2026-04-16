@@ -590,6 +590,8 @@ pub async fn approve_contact_request(
                 coverage_score: 0,
                 dilithium_pubkey: String::new(),
                 vrf_pubkey: String::new(),
+                staked_amount: 0,
+                genesis_hash: crate::ledger::GENESIS_HASH.to_string(),
             };
             if let Err(e) = p2p::send_message(&resolved_peer_ep, &announce).await {
                 eprintln!("[P2P] Could not send PeerAnnounce after approval: {}", e);

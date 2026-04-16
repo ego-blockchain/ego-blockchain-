@@ -484,7 +484,11 @@ impl Ledger {
             }
         }
 
-        let reward = crate::tokenomics::block_reward_at(height);
+        let tx_fee = self.transactions.iter()
+            .find(|t| t.hash == tx_hash)
+            .map(|t| t.fee_uegoc)
+            .unwrap_or(0);
+        let reward = crate::tokenomics::compute_block_reward(height, tx_fee, &prev_hash);
         self.blocks.push(LedgerBlock {
             height,
             hash,
@@ -527,9 +531,9 @@ pub fn contracts_dir() -> PathBuf {
     dir
 }
 
-pub const GENESIS_HASH: &str  = "ego00000000000000000000000000000000000000000000000000000000genesis1";
-pub const GENESIS_MINER: &str = "ego1genesis000000000000000000000000000000000000";
-pub const GENESIS_TS: i64     = 1_741_910_400;
+pub const GENESIS_HASH: &str  = "ego00000000000000000000000000000000000000000000000000000000genesis2";
+pub const GENESIS_MINER: &str = "egot1genesis0000000000000000000000000000000000";
+pub const GENESIS_TS: i64     = 1_744_588_800;
 
 pub fn genesis_block() -> LedgerBlock {
     LedgerBlock {
@@ -626,8 +630,9 @@ impl SharedChain {
         let block_data = format!("{prev_hash}:{tx_root}:{height}:{timestamp}");
         let hash = ego_core::hash_data(block_data.as_bytes()).to_hex();
 
-        let block_reward = crate::tokenomics::block_reward_at(height);
         let era          = height / crate::tokenomics::HALVING_INTERVAL;
+        let tx_fees_sum: u64 = txs.iter().map(|t| t.fee_uegoc).sum();
+        let block_reward = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash);
         let cb_nonce     = self.last_nonce(miner) + 1;
         let cb_data      = format!("coinbase:{miner}:{height}:{block_reward}:{timestamp}");
         let cb_hash      = ego_core::hash_data(cb_data.as_bytes()).to_hex();
@@ -812,8 +817,22 @@ pub fn penalise_missed_proposal(addr: &str) {
 /// - If set but not found in chain_db within a generous grace window: revert the stake.
 pub fn reconcile_stake_state() {
     let mut ledger = Ledger::load();
+
+    if ledger.staked_amount > 0
+        && ledger.pending_stake_tx_hash.is_empty()
+        && ledger.staked_at.is_none()
+    {
+        eprintln!("[Staking] Clearing phantom stake ({} uEGOC) — no TX hash and no staked_at timestamp",
+            ledger.staked_amount);
+        ledger.staked_amount   = 0;
+        ledger.stake_lock_days = 0;
+        ledger.unstake_at      = None;
+        let _ = ledger.save();
+        return;
+    }
+
     if ledger.pending_stake_tx_hash.is_empty() {
-        return; // Nothing pending — nothing to do.
+        return;
     }
     // Check whether the TX has been confirmed in chain_db.
     let tx_opt = crate::chain_db::get_tx_by_hash(&ledger.pending_stake_tx_hash);
@@ -855,13 +874,38 @@ pub fn verify_incoming_tx(tx: &LedgerTx) -> Result<(), String> {
     verify_incoming_tx_with_miner(tx, "")
 }
 
+pub fn verify_confirmed_tx_sig(tx: &LedgerTx) -> Result<(), String> {
+    if tx.public_key_ed25519.is_empty() || tx.signature.is_empty() {
+        return Ok(());
+    }
+    let pk_bytes = hex::decode(&tx.public_key_ed25519)
+        .map_err(|_| "invalid pubkey hex".to_string())?;
+    let sig_bytes = hex::decode(&tx.signature)
+        .map_err(|_| "invalid signature hex".to_string())?;
+    let pk_arr: [u8; 32] = pk_bytes.try_into()
+        .map_err(|_| "pubkey must be 32 bytes".to_string())?;
+    let sig_arr: [u8; 64] = sig_bytes.try_into()
+        .map_err(|_| "signature must be 64 bytes".to_string())?;
+    use ed25519_dalek::{Signature as DalekSig, VerifyingKey, Verifier};
+    let vk  = VerifyingKey::from_bytes(&pk_arr)
+        .map_err(|e| format!("invalid pubkey: {e}"))?;
+    let sig = DalekSig::from_bytes(&sig_arr);
+    let msg = if tx.tx_version >= 2 {
+        tx_signing_bytes_v2(&tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp,
+            tx.chain_id, tx.memo.as_deref().unwrap_or(""))
+    } else {
+        tx_signing_bytes(&tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp)
+    };
+    vk.verify(&msg, &sig).map_err(|_| "Ed25519 signature invalid".to_string())
+}
+
 /// Full verification. When `block_miner` is non-empty, system-address transactions
 /// are only accepted if they are crediting the miner (protocol rewards to self).
 /// This closes the free-mint exploit where any node crafts `from=faucet → to=self`.
 pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result<(), String> {
     const SYSTEM_PREFIXES: &[&str] = &[
         "egot1faucet",
-        "ego1genesis",
+        "egot1genesis",
         "egot1staking",
         "egot1system",
         "egot1coverage",

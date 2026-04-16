@@ -27,6 +27,8 @@ interface LedgerTx {
   nonce: number;
   tx_type?: string;
   cid?: string;
+  fee_uegoc?: number;
+  priority_fee_uegoc?: number;
 }
 
 interface FileEvent {
@@ -586,7 +588,7 @@ const ExplorerPage: React.FC = () => {
                 { label: 'From',      val: selectedTx.from,                    mono: true },
                 { label: 'To',        val: selectedTx.to,                      mono: true },
                 { label: 'Amount',    val: `${(selectedTx.amount / 1_000_000).toFixed(6)} EGOC` },
-                { label: 'Fee',       val: 'Free (wallet-to-wallet)' },
+                { label: 'Fee',       val: selectedTx.fee_uegoc && selectedTx.fee_uegoc > 0 ? `${(selectedTx.fee_uegoc / 1_000_000).toFixed(6)} EGOC` : '0 EGOC' },
                 { label: 'Nonce',     val: String(selectedTx.nonce) },
                 { label: 'Timestamp', val: new Date(selectedTx.timestamp * 1000).toLocaleString() },
                 { label: 'Signature', val: selectedTx.signature.slice(0, 32) + '…', mono: true },

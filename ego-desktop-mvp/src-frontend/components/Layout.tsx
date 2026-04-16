@@ -17,6 +17,7 @@ const NAV_ITEMS = [
   { path: '/contracts', label: 'Contracts', icon: '📜', desc: 'Deploy & interact' },
   { path: '/ide',       label: 'dApp IDE',  icon: '🧑‍💻', desc: 'Write & deploy contracts' },
   { path: '/market',      label: 'Market',      icon: '📊', desc: 'Prices & charts' },
+  { path: '/hosting',     label: 'Hosting',     icon: '🌐', desc: 'Web3 sites' },
   { path: '/governance',  label: 'Governance',  icon: '🗳️', desc: 'DAO voting' },
   { path: '/settings',    label: 'Settings',    icon: '⚙️',  desc: 'Preferences' },
 ];

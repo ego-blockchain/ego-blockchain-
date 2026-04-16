@@ -19,6 +19,7 @@ import MessengerPage from './pages/MessengerPage';
 import ContractsPage from './pages/ContractsPage';
 import IDEPage from './pages/IDEPage';
 import GovernancePage from './pages/GovernancePage';
+import HostingPage from './pages/HostingPage';
 import RegistrationFlow from './components/RegistrationFlow';
 
 type Theme = 'dark' | 'light';
@@ -352,6 +353,7 @@ function App() {
                 <Route path="contracts" element={<ContractsPage />} />
                 <Route path="ide"        element={<IDEPage />} />
                 <Route path="governance" element={<GovernancePage />} />
+                <Route path="hosting"    element={<HostingPage />} />
               </Route>
             </Routes>
           </div>

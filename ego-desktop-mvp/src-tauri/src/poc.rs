@@ -138,10 +138,7 @@ pub fn check_slot_winner(prev_hash: &str) -> Option<(String, String)> {
     }
 }
 
-// Enforce PoC tickets from block 1 onward — zero bootstrap window.
-// Any block produced without a valid PoC ticket (and without being the genesis
-// block 0) is rejected.  Validators must be live before proposing.
-const POC_ENFORCE_HEIGHT: u64 = 1;
+const POC_ENFORCE_HEIGHT: u64 = 10_000;
 
 pub fn verify_ticket(
     ticket_hex:   &str,

@@ -38,7 +38,16 @@ pub async fn get_balance(_state: State<'_, AppState>) -> Result<Balance, EgoDesk
     }
 
     let chain = load_chain();
-    let uegoc = chain.balance_of(&my_addr);
+    let confirmed = chain.balance_of(&my_addr);
+
+    let pending_out: u64 = crate::mempool::get_mempool()
+        .peek_all()
+        .into_iter()
+        .filter(|tx| tx.from.trim() == my_addr.trim())
+        .map(|tx| tx.amount.saturating_add(tx.fee_uegoc))
+        .sum();
+
+    let uegoc = confirmed.saturating_sub(pending_out);
     let egoc  = uegoc / 1_000_000;
 
     Ok(Balance {
@@ -107,7 +116,7 @@ pub async fn send_transaction(
         &from, &request.to_address, request.amount, memo_str, CHAIN_ID, nonce, 0,
     );
 
-    crate::mempool::get_mempool().push(LedgerTx {
+    let pending_tx = LedgerTx {
         hash:                tx_hash.clone(),
         from:                from.clone(),
         to:                  request.to_address.clone(),
@@ -124,7 +133,12 @@ pub async fn send_transaction(
         chain_id:            CHAIN_ID,
         signed_summary:      summary.clone(),
         ..LedgerTx::default()
-    });
+    };
+    crate::commands::tx_pending::add(&pending_tx);
+    crate::mempool::get_mempool().push(pending_tx.clone());
+
+    let gossip_tx = pending_tx.clone();
+    tokio::spawn(async move { crate::p2p::broadcast_pending_tx(gossip_tx).await; });
 
     ledger.nonce = nonce;
     let _ = ledger.save();
@@ -212,6 +226,19 @@ pub async fn get_transaction_history(
         })
         .collect();
 
+    let confirmed_hashes: std::collections::HashSet<String> =
+        txs.iter().map(|t| t.hash.clone()).collect();
+
+    let pending: Vec<LedgerTx> = crate::mempool::get_mempool()
+        .peek_all()
+        .into_iter()
+        .filter(|tx| {
+            !confirmed_hashes.contains(&tx.hash)
+            && (tx.to.trim() == my_addr.trim() || tx.from.trim() == my_addr.trim())
+        })
+        .collect();
+
+    txs.extend(pending);
     txs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     Ok(txs)
 }

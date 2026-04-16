@@ -16,6 +16,7 @@ mod proof;
 mod rpc;
 mod sharding;
 mod tokenomics;
+mod tls;
 mod utils;
 
 use tauri::{Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem};
@@ -119,6 +120,20 @@ fn main() {
     #[cfg(target_os = "windows")]
     register_windows_notifications();
 
+    #[cfg(target_os = "windows")]
+    {
+        extern "system" {
+            fn SetThreadExecutionState(esFlags: u32) -> u32;
+        }
+        const ES_CONTINUOUS: u32          = 0x80000000;
+        const ES_SYSTEM_REQUIRED: u32     = 0x00000001;
+        const ES_AWAYMODE_REQUIRED: u32   = 0x00000040;
+        unsafe {
+            SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED);
+        }
+        eprintln!("[Node] Sleep prevention active — system will not suspend while Ego is running");
+    }
+
     if !acquire_single_instance_lock() {
         std::process::exit(0);
     }
@@ -201,7 +216,14 @@ fn main() {
                 else { window.show().unwrap(); window.set_focus().unwrap(); }
             }
             SystemTrayEvent::MenuItemClick { id, .. } => match id.as_str() {
-                "quit" => std::process::exit(0),
+                "quit" => {
+                    #[cfg(target_os = "windows")]
+                    unsafe {
+                        extern "system" { fn SetThreadExecutionState(esFlags: u32) -> u32; }
+                        SetThreadExecutionState(0x80000000u32); // ES_CONTINUOUS only = release lock
+                    }
+                    std::process::exit(0);
+                }
                 "hide" => app.get_window("main").unwrap().hide().unwrap(),
                 "show" => {
                     let w = app.get_window("main").unwrap();
@@ -351,7 +373,18 @@ fn main() {
             commands::governance::get_proposal_results,
             commands::governance::vote_ban_proposer,
             commands::governance::get_ban_status,
-            commands::governance::get_proposal_rate_limit
+            commands::governance::get_proposal_rate_limit,
+            commands::hosting::deploy_site,
+            commands::hosting::deploy_site_begin,
+            commands::hosting::deploy_site_file,
+            commands::hosting::finalize_deploy,
+            commands::hosting::get_hosted_sites,
+            commands::hosting::undeploy_site,
+            commands::hosting::set_custom_domain,
+            commands::hosting::hosting_heartbeat,
+            commands::hosting::get_hosting_nodes,
+            commands::hosting::check_domain_available,
+            commands::hosting::setup_eo_certificates
         ])
         .setup(|app| {
 
@@ -463,6 +496,8 @@ fn main() {
                 crate::p2p::sync_chain_from_peers().await;
                 eprintln!("[Startup] Chain sync requested");
 
+                crate::p2p::register_with_relay_as_ego_node().await;
+
                 // PoSt check runs every 6 h — track iteration count (30s × 720 = 6h).
                 let mut loop_tick: u32 = 0;
                 const POST_EVERY_N_TICKS: u32 = 720;  // 720 × 30s = 6 h
@@ -534,6 +569,11 @@ fn main() {
 
             tauri::async_runtime::spawn(async move {
                 crate::rpc::start_rpc_server().await;
+            });
+
+            tauri::async_runtime::spawn(async move {
+                let _ = crate::tls::ensure_tls_certs();
+                crate::rpc::start_https_server().await;
             });
 
             tauri::async_runtime::spawn(async move {
