@@ -255,6 +255,15 @@ function App() {
     initWallet();
   }, []);
 
+  useEffect(() => {
+    if (!wallet) return;
+    invoke('hosting_heartbeat').catch(() => {});
+    const id = setInterval(() => {
+      invoke('hosting_heartbeat').catch(() => {});
+    }, 60_000);
+    return () => clearInterval(id);
+  }, [wallet?.address]);
+
   if (!termsAgreed) {
     return (
       <div data-theme={theme} className="App flex flex-col h-screen bg-gray-900">
