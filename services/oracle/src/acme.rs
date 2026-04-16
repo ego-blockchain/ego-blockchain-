@@ -125,8 +125,7 @@ async fn issue_cert(domain: &str, challenges: &ChallengeMap) -> anyhow::Result<(
     }
 
     let key_pair = KeyPair::generate().context("generate key pair")?;
-    let mut params = rcgen::CertificateParams::new(vec![domain.to_string()])
-        .context("cert params")?;
+    let mut params = rcgen::CertificateParams::new(vec![domain.to_string()]);
     params.distinguished_name = rcgen::DistinguishedName::new();
     let csr     = params.serialize_request(&key_pair).context("serialize CSR")?;
     let csr_der = csr.der();
