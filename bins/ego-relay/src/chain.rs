@@ -6,10 +6,26 @@ use axum::{
 };
 use rocksdb::{Options, DB};
 use serde_json::Value;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-static CHAIN_BLOCKS_DB: OnceLock<Arc<Mutex<DB>>> = OnceLock::new();
-static CHAIN_TXS_DB:    OnceLock<Arc<Mutex<DB>>> = OnceLock::new();
+static CHAIN_BLOCKS_DB: OnceLock<Arc<Mutex<DB>>>    = OnceLock::new();
+static CHAIN_TXS_DB:    OnceLock<Arc<Mutex<DB>>>    = OnceLock::new();
+static KNOWN_EGO_NODES: OnceLock<RwLock<Vec<String>>> = OnceLock::new();
+
+fn node_store() -> &'static RwLock<Vec<String>> {
+    KNOWN_EGO_NODES.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+pub fn register_ego_node(url: &str) {
+    let url = url.trim_end_matches('/').to_string();
+    if let Ok(mut w) = node_store().write() {
+        if !w.contains(&url) { w.push(url); }
+    }
+}
+
+pub fn get_known_ego_nodes() -> Vec<String> {
+    node_store().read().map(|r| r.clone()).unwrap_or_default()
+}
 
 fn blocks_db() -> Arc<Mutex<DB>> {
     CHAIN_BLOCKS_DB.get_or_init(|| {
@@ -49,7 +65,16 @@ pub fn chain_router(store: ChainStore) -> Router {
         .route("/block/broadcast",    post(post_block))
         .route("/chain/blocks",       get(get_blocks))
         .route("/chain/transactions", get(get_transactions))
+        .route("/nodes/register",     post(register_node))
         .with_state(store)
+}
+
+async fn register_node(Json(body): Json<Value>) -> StatusCode {
+    if let Some(url) = body.get("endpoint").and_then(|v| v.as_str()) {
+        register_ego_node(url);
+        tracing::info!("[Chain] Ego node registered: {}", url);
+    }
+    StatusCode::OK
 }
 
 async fn post_block(

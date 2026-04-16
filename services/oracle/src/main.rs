@@ -1,3 +1,5 @@
+mod dns;
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -18,6 +20,17 @@ use std::{
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HostingNodeRecord {
+    pub node_id:   String,
+    pub endpoint:  String,
+    pub sites:     Vec<String>,
+    pub domains:   Vec<String>,
+    pub last_seen: i64,
+}
+
+type HostingNodes = HashMap<String, HostingNodeRecord>;
 
 // ── Price types ────────────────────────────────────────────────────────────────
 
@@ -91,9 +104,11 @@ impl ChainState {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub prices: Arc<RwLock<PriceMap>>,
-    pub chain:  Arc<RwLock<ChainState>>,
-    pub client: Client,
+    pub prices:        Arc<RwLock<PriceMap>>,
+    pub chain:         Arc<RwLock<ChainState>>,
+    pub client:        Client,
+    pub hosting_nodes: Arc<RwLock<HostingNodes>>,
+    pub ego_nodes:     Arc<RwLock<Vec<String>>>,
 }
 
 const EGOC_USD: f64 = 0.01;
@@ -236,6 +251,45 @@ async fn handle_chain_submit(
     (StatusCode::OK, Json(json!({ "ok": true, "blocks": chain.blocks.len(), "txs": chain.transactions.len() })))
 }
 
+// ── Handlers: hosting node registry ──────────────────────────────────────
+
+async fn handle_hosting_announce(
+    State(state): State<AppState>,
+    Json(record): Json<HostingNodeRecord>,
+) -> impl IntoResponse {
+    let mut nodes = state.hosting_nodes.write().await;
+    nodes.insert(record.node_id.clone(), record);
+    StatusCode::OK
+}
+
+async fn handle_hosting_nodes(
+    State(state): State<AppState>,
+    Path(domain): Path<String>,
+) -> impl IntoResponse {
+    let now = Utc::now().timestamp();
+    let nodes = state.hosting_nodes.read().await;
+    let matching: Vec<&HostingNodeRecord> = nodes.values()
+        .filter(|n| n.last_seen > now - 300)
+        .filter(|n| n.domains.iter().any(|d| d == &domain) || n.sites.iter().any(|s| s == &domain))
+        .collect();
+    Json(json!({ "domain": domain, "nodes": matching }))
+}
+
+async fn handle_nodes_register(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if let Some(endpoint) = body["endpoint"].as_str() {
+        let ep = endpoint.trim_end_matches('/').to_string();
+        let mut nodes = state.ego_nodes.write().await;
+        if !nodes.contains(&ep) {
+            info!("[Registry] Ego node registered: {}", ep);
+            nodes.push(ep);
+        }
+    }
+    StatusCode::OK
+}
+
 // ── Handler: health ───────────────────────────────────────────────────────────
 
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
@@ -273,23 +327,40 @@ async fn main() {
     initial_prices.insert("EGOC".to_string(), PriceEntry { usd: EGOC_USD, updated_at: Utc::now().timestamp(), stale: false });
 
     let state = AppState {
-        prices: Arc::new(RwLock::new(initial_prices)),
-        chain:  Arc::new(RwLock::new(ChainState::default())),
+        prices:        Arc::new(RwLock::new(initial_prices)),
+        chain:         Arc::new(RwLock::new(ChainState::default())),
         client,
+        hosting_nodes: Arc::new(RwLock::new(HashMap::new())),
+        ego_nodes:     Arc::new(RwLock::new(Vec::new())),
     };
 
     tokio::spawn(price_refresh_task(state.clone()));
 
+    let relay_ip_str = std::env::var("RELAY_PUBLIC_IP").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let dns_upstream  = std::env::var("DNS_UPSTREAM").unwrap_or_else(|_| "8.8.8.8:53".to_string());
+    let relay_ip: [u8; 4] = relay_ip_str.split('.')
+        .map(|p| p.parse::<u8>().unwrap_or(0))
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap_or([127, 0, 0, 1]);
+    let dns_nodes = state.hosting_nodes.clone();
+    tokio::spawn(async move {
+        dns::run_dns_server(relay_ip, dns_upstream, dns_nodes).await;
+    });
+
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
 
     let app = Router::new()
-        .route("/health",              get(handle_health))
-        .route("/prices",              get(handle_prices))
-        .route("/price/:symbol",       get(handle_price))
-        .route("/egoc",                get(handle_egoc))
-        .route("/chain/blocks",        get(handle_chain_blocks))
-        .route("/chain/transactions",  get(handle_chain_transactions))
-        .route("/chain/submit",        post(handle_chain_submit))
+        .route("/health",                   get(handle_health))
+        .route("/prices",                   get(handle_prices))
+        .route("/price/:symbol",            get(handle_price))
+        .route("/egoc",                     get(handle_egoc))
+        .route("/chain/blocks",             get(handle_chain_blocks))
+        .route("/chain/transactions",       get(handle_chain_transactions))
+        .route("/chain/submit",             post(handle_chain_submit))
+        .route("/hosting/announce",         post(handle_hosting_announce))
+        .route("/hosting/nodes/:domain",    get(handle_hosting_nodes))
+        .route("/nodes/register",           post(handle_nodes_register))
         .layer(cors)
         .with_state(state);
 

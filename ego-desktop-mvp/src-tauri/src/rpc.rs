@@ -1,7 +1,8 @@
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::State,
-    http::StatusCode,
+    extract::{Path, State},
+    http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -51,17 +52,73 @@ type Subscribers = Arc<tokio::sync::broadcast::Sender<Value>>;
 
 // ── Router ─────────────────────────────────────────────────────────────────────
 
+async fn cors_layer<B>(req: Request<B>, next: Next<B>) -> Response {
+    if req.method() == Method::OPTIONS {
+        return (
+            StatusCode::OK,
+            [
+                (header::ACCESS_CONTROL_ALLOW_ORIGIN,  HeaderValue::from_static("*")),
+                (header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS")),
+                (header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Content-Type")),
+            ],
+        ).into_response();
+    }
+    let mut resp = next.run(req).await;
+    resp.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    resp
+}
+
+async fn resolve_site(Path(name): Path<String>) -> Response {
+    let name = name.trim().to_lowercase();
+    match crate::chain_db::get_hosted_site_raw(&name) {
+        Some(raw) => Json(raw).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(json!({"error": "site not found"}))).into_response(),
+    }
+}
+
+async fn list_nodes() -> Response {
+    let rpc_port: u16 = std::env::var("EGO_RPC_PORT")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(47395);
+    let mut urls = vec![format!("http://localhost:{}", rpc_port)];
+    if let Ok(ip) = local_ip_address::local_ip() {
+        let s = ip.to_string();
+        if s != "127.0.0.1" {
+            urls.push(format!("http://{}:{}", s, rpc_port));
+        }
+    }
+    urls.extend(crate::p2p::get_known_node_urls());
+    Json(json!({ "nodes": urls })).into_response()
+}
+
+async fn hosting_nodes(Path(domain): Path<String>) -> Response {
+    let nodes = crate::chain_db::get_nodes_for_domain(&domain);
+    Json(json!({ "domain": domain, "nodes": nodes })).into_response()
+}
+
+async fn hosting_announce(Json(record): Json<crate::chain_db::HostingNodeRecord>) -> Response {
+    crate::chain_db::upsert_hosting_node(&record);
+    StatusCode::OK.into_response()
+}
+
 pub async fn start_rpc_server() {
     let (broadcast_tx, _) = tokio::sync::broadcast::channel::<Value>(1024);
-    // Wire the sender into the global so broadcast_block_header / broadcast_tx_event work.
     init_broadcast(broadcast_tx.clone());
     let subs: Subscribers = Arc::new(broadcast_tx);
 
     let app = Router::new()
-        .route("/",       post(rpc_handler))
-        .route("/ws",     get(ws_handler))
-        .route("/health", get(health))
-        .with_state(subs);
+        .route("/",                       post(rpc_handler))
+        .route("/ws",                     get(ws_handler))
+        .route("/health",                 get(health))
+        .route("/site/:name",             get(gateway_index))
+        .route("/site/:name/*file_path",  get(gateway_file))
+        .route("/cid/:cid",               get(gateway_cid))
+        .route("/file/:cid",              get(gateway_cid))
+        .route("/resolve/:name",          get(resolve_site))
+        .route("/nodes",                  get(list_nodes))
+        .route("/hosting/nodes/:domain",  get(hosting_nodes))
+        .route("/hosting/announce",       post(hosting_announce))
+        .with_state(subs)
+        .layer(middleware::from_fn(cors_layer));
 
     let rpc_port: u16 = std::env::var("EGO_RPC_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(47395);
     let addr = SocketAddr::from(([0, 0, 0, 0], rpc_port));
@@ -356,6 +413,223 @@ async fn handle_ws(mut socket: WebSocket, subs: Subscribers) {
             else => break,
         }
     }
+}
+
+// ── Web3 Hosting Gateway ──────────────────────────────────────────────────────
+
+fn mime_from_path(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css"          => "text/css; charset=utf-8",
+        "js" | "mjs"   => "application/javascript; charset=utf-8",
+        "json"         => "application/json",
+        "png"          => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif"          => "image/gif",
+        "svg"          => "image/svg+xml",
+        "ico"          => "image/x-icon",
+        "webp"         => "image/webp",
+        "woff"         => "font/woff",
+        "woff2"        => "font/woff2",
+        "ttf"          => "font/ttf",
+        "wasm"         => "application/wasm",
+        "txt"          => "text/plain; charset=utf-8",
+        "xml"          => "application/xml",
+        "pdf"          => "application/pdf",
+        _              => "application/octet-stream",
+    }
+}
+
+fn serve_disk_file(path: &std::path::Path) -> Response {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let mime = mime_from_path(path);
+            (StatusCode::OK, [(header::CONTENT_TYPE, mime)], bytes).into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "404 Not Found").into_response(),
+    }
+}
+
+fn serve_html_injected(path: &std::path::Path, site_name: &str) -> Response {
+    match std::fs::read_to_string(path) {
+        Ok(html) => {
+            let base_tag = format!("<base href=\"/site/{}/\">", site_name);
+            let html_lower = html.to_lowercase();
+            let patched = if html_lower.contains("<base ") || html_lower.contains("<base>") {
+                html
+            } else if let Some(pos) = html_lower.find("<head>") {
+                let insert = pos + "<head>".len();
+                format!("{}{}{}", &html[..insert], base_tag, &html[insert..])
+            } else if let Some(pos) = html_lower.find("<html") {
+                let end = html[pos..].find('>').map(|i| pos + i + 1).unwrap_or(pos + 5);
+                format!("{}{}{}", &html[..end], base_tag, &html[end..])
+            } else {
+                format!("{}{}", base_tag, html)
+            };
+            (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], patched.into_bytes()).into_response()
+        }
+        Err(_) => serve_disk_file(path),
+    }
+}
+
+fn resolve_site_base(name: &str) -> Option<std::path::PathBuf> {
+    let raw = crate::chain_db::get_hosted_site_raw(name)?;
+    let owner = raw["owner"].as_str()?.to_string();
+    let base = crate::commands::hosting::site_dir(&owner, name);
+    if base.exists() { Some(base) } else { None }
+}
+
+async fn gateway_index(Path(name): Path<String>) -> Response {
+    let base = match resolve_site_base(&name) {
+        Some(b) => b,
+        None    => return (StatusCode::NOT_FOUND, "Site not found").into_response(),
+    };
+    let index = base.join("index.html");
+    if index.exists() {
+        return serve_html_injected(&index, &name);
+    }
+    if let Ok(mut rd) = std::fs::read_dir(&base) {
+        if let Some(Ok(entry)) = rd.next() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("html") {
+                return serve_html_injected(&path, &name);
+            }
+            return serve_disk_file(&path);
+        }
+    }
+    (StatusCode::NOT_FOUND, "Site not found").into_response()
+}
+
+async fn gateway_file(Path((name, file_path)): Path<(String, String)>) -> Response {
+    let base = match resolve_site_base(&name) {
+        Some(b) => b,
+        None    => return (StatusCode::NOT_FOUND, "Site not found").into_response(),
+    };
+    let rel  = file_path.trim_start_matches('/');
+    let full = base.join(rel);
+
+    if !full.starts_with(&base) {
+        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+    }
+    if full.exists() {
+        if full.extension().and_then(|e| e.to_str()) == Some("html") {
+            return serve_html_injected(&full, &name);
+        }
+        return serve_disk_file(&full);
+    }
+    // SPA fallback
+    let index = base.join("index.html");
+    if index.exists() {
+        return serve_html_injected(&index, &name);
+    }
+    (StatusCode::NOT_FOUND, "Not Found").into_response()
+}
+
+async fn gateway_cid(Path(cid): Path<String>) -> Response {
+    // 1. Search all locally deployed sites
+    let hosting_dir = crate::commands::hosting::hosting_base_dir();
+    if let Ok(owners) = std::fs::read_dir(&hosting_dir) {
+        for owner_entry in owners.flatten() {
+            if let Ok(sites) = std::fs::read_dir(owner_entry.path()) {
+                for site in sites.flatten() {
+                    let site_name = site.file_name().to_string_lossy().to_string();
+                    if let Some(raw) = crate::chain_db::get_hosted_site_raw(&site_name) {
+                        if let Some(files) = raw["files"].as_array() {
+                            for f in files {
+                                if f["cid"].as_str() == Some(cid.as_str()) {
+                                    let rel = f["path"].as_str().unwrap_or("").trim_start_matches('/');
+                                    return serve_disk_file(&site.path().join(rel));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 2. Check storage_dir for replicated public files received from peers
+    let short    = &cid[cid.len().saturating_sub(16)..];
+    let pub_path = crate::ledger::storage_dir().join(format!("{}.pub", short));
+    if pub_path.exists() {
+        return serve_disk_file(&pub_path);
+    }
+    (StatusCode::NOT_FOUND, "CID not found").into_response()
+}
+
+// ── HTTPS .eo Gateway ──────────────────────────────────────────────────────────
+
+pub async fn start_https_server() {
+    if !crate::tls::certs_exist() {
+        eprintln!("[HTTPS] No TLS certs — skipping HTTPS server");
+        return;
+    }
+    let (cert_pem, key_pem) = match crate::tls::get_tls_pem() {
+        Some(p) => p,
+        None    => { eprintln!("[HTTPS] Failed to load TLS certs"); return; }
+    };
+
+    let tls_config = match axum_server::tls_rustls::RustlsConfig::from_pem(
+        cert_pem.into_bytes(),
+        key_pem.into_bytes(),
+    ).await {
+        Ok(c)  => c,
+        Err(e) => { eprintln!("[HTTPS] TLS config error: {}", e); return; }
+    };
+
+    let app = Router::new().fallback(https_eo_handler);
+
+    let port: u16 = if std::net::TcpListener::bind("0.0.0.0:443").is_ok() { 443 } else { 47396 };
+    let _ = crate::tls::HTTPS_PORT.set(port);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    eprintln!("[HTTPS] .eo gateway listening on https://0.0.0.0:{}", port);
+
+    axum_server::bind_rustls(addr, tls_config)
+        .serve(app.into_make_service())
+        .await
+        .unwrap_or_else(|e| eprintln!("[HTTPS] Server error: {}", e));
+}
+
+async fn https_eo_handler(headers: HeaderMap, uri: Uri) -> Response {
+    let host = headers.get("host")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+
+    let host_no_port = host.split(':').next().unwrap_or("");
+    let name = host_no_port
+        .strip_suffix(".eo")
+        .map(|n| n.strip_prefix("www.").unwrap_or(n))
+        .unwrap_or("");
+
+    if name.is_empty() {
+        return (StatusCode::NOT_FOUND, "Unknown .eo domain").into_response();
+    }
+
+    let base = match resolve_site_base(name) {
+        Some(b) => b,
+        None    => return (StatusCode::NOT_FOUND, "Site not found").into_response(),
+    };
+
+    let path = uri.path().trim_start_matches('/');
+
+    if path.is_empty() {
+        let index = base.join("index.html");
+        if index.exists() { return serve_disk_file(&index); }
+        if let Ok(mut rd) = std::fs::read_dir(&base) {
+            if let Some(Ok(e)) = rd.next() { return serve_disk_file(&e.path()); }
+        }
+        return (StatusCode::NOT_FOUND, "Site not found").into_response();
+    }
+
+    let full = base.join(path);
+    if !full.starts_with(&base) {
+        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+    }
+    if full.exists() {
+        return serve_disk_file(&full);
+    }
+    let index = base.join("index.html");
+    if index.exists() { return serve_disk_file(&index); }
+    (StatusCode::NOT_FOUND, "Not Found").into_response()
 }
 
 pub fn broadcast_block_header(block: &crate::ledger::LedgerBlock) {

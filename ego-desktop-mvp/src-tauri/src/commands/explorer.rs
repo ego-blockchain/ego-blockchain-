@@ -109,17 +109,6 @@ pub async fn get_blocks(offset: Option<u32>, limit: Option<u32>) -> Result<Vec<L
 pub async fn get_all_transactions(offset: Option<u32>, limit: Option<u32>) -> Result<Vec<LedgerTx>, EgoDesktopError> {
     let offset = offset.unwrap_or(0) as usize;
     let limit  = limit.unwrap_or(25) as usize;
-
-    // Page 1: prepend pending mempool txs so they appear immediately before a block is mined.
-    if offset == 0 {
-        let pending = crate::mempool::get_mempool().peek_all();
-        let confirmed_limit = limit.saturating_sub(pending.len());
-        let confirmed = crate::chain_db::paged_transactions(0, confirmed_limit);
-        let mut out: Vec<LedgerTx> = pending.into_iter().chain(confirmed).collect();
-        out.truncate(limit);
-        return Ok(out);
-    }
-
     Ok(crate::chain_db::paged_transactions(offset, limit))
 }
 

@@ -216,6 +216,21 @@ pub async fn oracle_post_pub(client: &reqwest::Client, path: &str, body: &serde_
     oracle_post(client, path, body).await;
 }
 
+pub async fn push_block_to_oracle(block: &crate::ledger::LedgerBlock, txs: &[crate::ledger::LedgerTx]) {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let body = serde_json::json!({
+        "block":        block,
+        "transactions": txs,
+    });
+    oracle_post(&client, "/chain/submit", &body).await;
+}
+
 static RELAY_CIRCUIT_READY: AtomicBool = AtomicBool::new(false);
 
 
@@ -326,6 +341,16 @@ fn finalized_at_height() -> std::sync::MutexGuard<'static, HashMap<u64, String>>
         .unwrap()
 }
 
+static HARD_FINALIZED_HEIGHTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+    std::sync::OnceLock::new();
+
+fn hard_finalized_heights() -> std::sync::MutexGuard<'static, std::collections::HashSet<u64>> {
+    HARD_FINALIZED_HEIGHTS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap()
+}
+
 // Maps (validator_address, block_height) → (first_block_hash, first_signature).
 // If they vote a different hash at the same height = equivocation → slash + on-chain proof.
 static VOTES_CAST: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, u64), (String, String)>>> =
@@ -360,24 +385,21 @@ pub fn register_validator_pubkey(address: &str, dilithium_pubkey_hex: &str) {
 
 /// Verify an ML-DSA-44 BFT signature. Fail-closed: unknown validator → reject.
 fn verify_bft_sig(address: &str, data: &str, sig_hex: &str) -> bool {
-    let pubkey_hex = match validator_pubkeys().get(address).cloned() {
+    use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+    let pubkey = match get_peer_ed25519_pubkey(address) {
         Some(k) => k,
         None    => {
-            eprintln!("[BFT] Unknown ML-DSA-44 pubkey for {} — rejecting vote", address);
+            eprintln!("[BFT] Unknown Ed25519 pubkey for {} — rejecting vote", address);
             return false;
         }
     };
-    let pubkey_bytes = match hex::decode(&pubkey_hex) {
-        Ok(b) if !b.is_empty() => b,
-        _ => return false,
-    };
     let sig_bytes = match hex::decode(sig_hex) {
-        Ok(b) if !b.is_empty() => b,
+        Ok(b) if b.len() == 64 => b,
         _ => return false,
     };
-    let pk  = ego_core::PublicKey::dilithium2(pubkey_bytes);
-    let sig = ego_core::Signature::dilithium2(sig_bytes);
-    ego_core::verify_signature(&pk, data.as_bytes(), &sig).unwrap_or(false)
+    let Ok(vk)  = VerifyingKey::from_bytes(&pubkey) else { return false; };
+    let Ok(sig) = Signature::from_slice(&sig_bytes)  else { return false; };
+    vk.verify(data.as_bytes(), &sig).is_ok()
 }
 
 // ── Per-peer gossip rate limiter ───────────────────────────────────────────────
@@ -426,6 +448,12 @@ static LAST_PROPOSAL_TS: std::sync::atomic::AtomicI64 =
 /// FALLBACK_AFTER_EMPTY_VIEWS.
 static CONSECUTIVE_EMPTY_VIEWS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
+
+static LAST_BLOCK_FINALIZED_TS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+static LAST_FORK_SYNC_TS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
 
 /// Maps block_height → proposer_address for in-flight proposals.
 /// Populated when a BlockProposal is accepted by the committee (after structural
@@ -653,23 +681,10 @@ pub fn register_known_validator(address: &str) {
     if slashed_validators().contains(address) { return; }
 
 
-    {
-        let set = known_validators();
-        if set.len() >= 3 && !set.contains(address) {
-            let staked = crate::ledger::get_validator_stake(address);
-            if staked < crate::tokenomics::MIN_STAKE_PROGRAM_UEGOC {
-
-                let ledger = crate::ledger::Ledger::load();
-                let is_self = ledger.address == address;
-                let local_staked = ledger.staked_amount;
-                if !is_self || local_staked < crate::tokenomics::MIN_STAKE_PROGRAM_UEGOC {
-                    eprintln!("[BFT] Rejected validator {} — stake {} uEGOC < minimum {} uEGOC",
-                        address, staked, crate::tokenomics::MIN_STAKE_PROGRAM_UEGOC);
-                    return;
-                }
-            }
-        }
-    } // release lock before re-acquiring below
+    // DRS weighting is handled inside qualifies_committee / qualifies_proposer.
+    // known_validators is a registry of who exists on the network — gating it on
+    // DRS causes new nodes with zero coverage to be excluded from threshold math,
+    // allowing blocks to finalize with a single vote until coverage accumulates.
 
     let mut set = known_validators();
     if set.len() >= MAX_VALIDATORS {
@@ -786,6 +801,10 @@ pub enum P2PMessage {
         dilithium_pubkey: String,
         #[serde(default)]
         vrf_pubkey: String,
+        #[serde(default)]
+        staked_amount: u64,
+        #[serde(default)]
+        genesis_hash: String,
     },
     ChatMessage {
         bundle: String,
@@ -1442,6 +1461,7 @@ pub async fn broadcast_peer_announce(app: &tauri::AppHandle) {
             })
             .unwrap_or_default()
     };
+    let staked_amount = crate::ledger::Ledger::load().staked_amount;
     let msg = P2PMessage::PeerAnnounce {
         address, name,
         endpoint:  my_endpoint,
@@ -1451,6 +1471,8 @@ pub async fn broadcast_peer_announce(app: &tauri::AppHandle) {
         coverage_score,
         dilithium_pubkey: dilithium_pubkey_hex,
         vrf_pubkey: vrf_pubkey_hex,
+        staked_amount,
+        genesis_hash: crate::ledger::GENESIS_HASH.to_string(),
     };
 
 
@@ -1540,6 +1562,66 @@ pub fn get_known_peers() -> Vec<String> {
         .map(|p| p.address)
         .filter(|a| !a.is_empty())
         .collect()
+}
+
+static KNOWN_NODE_URLS: std::sync::OnceLock<std::sync::RwLock<Vec<String>>> =
+    std::sync::OnceLock::new();
+
+fn node_url_store() -> &'static std::sync::RwLock<Vec<String>> {
+    KNOWN_NODE_URLS.get_or_init(|| std::sync::RwLock::new(Vec::new()))
+}
+
+pub fn register_node_url(url: &str) {
+    if let Ok(mut w) = node_url_store().write() {
+        let url = url.trim_end_matches('/').to_string();
+        if !w.contains(&url) {
+            w.push(url);
+        }
+    }
+}
+
+pub fn get_known_node_urls() -> Vec<String> {
+    node_url_store().read().map(|r| r.clone()).unwrap_or_default()
+}
+
+pub async fn register_with_relay_as_ego_node() {
+    let port = std::env::var("EGO_RPC_PORT").ok()
+        .and_then(|v| v.parse::<u16>().ok()).unwrap_or(47395);
+    let public_ip = get_public_endpoint().await;
+    let endpoint = if public_ip.contains('/') || public_ip.is_empty() {
+        format!("http://localhost:{}", port)
+    } else {
+        let ip = public_ip.split(':').next().unwrap_or("localhost");
+        format!("http://{}:{}", ip, port)
+    };
+
+    let oracles = crate::p2p::ORACLE_RPCS;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+    for base in oracles {
+        let url = format!("{}/nodes/register", base);
+        let _ = client.post(&url)
+            .json(&serde_json::json!({ "endpoint": endpoint }))
+            .send().await;
+    }
+    eprintln!("[Hosting] Registered with relay as Ego node: {}", endpoint);
+}
+
+pub fn gossip_hosting_node(record: &crate::chain_db::HostingNodeRecord) {
+    let record = record.clone();
+    let peers  = get_known_node_urls();
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        for peer in peers {
+            let url = format!("{}/hosting/announce", peer.trim_end_matches('/'));
+            let _ = client.post(&url).json(&record).send().await;
+        }
+    });
 }
 
 /// Snapshot of currently known validator addresses.
@@ -1972,13 +2054,23 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
             if let Ok(kp) = ego_core::KeyPair::from_bytes(&seed) {
                 if let Ok(addr) = kp.derive_bech32_address(1, ego_core::AddressType::EOA, "egot") {
                     let mut ledger = crate::ledger::Ledger::load();
-                    if ledger.address.is_empty() {
-                        ledger.address = addr.clone();
-                        let mn = kp.derive_bech32_address(0, ego_core::AddressType::EOA, "ego").unwrap_or_default();
-                        ledger.mainnet_address = mn;
-                        ledger.staked_amount = 1_000_000;
-                        let _ = ledger.save();
-                        eprintln!("[P2P] Auto-generated node identity: {}", addr);
+                    ledger.address = addr.clone();
+                    let mn = kp.derive_bech32_address(0, ego_core::AddressType::EOA, "ego").unwrap_or_default();
+                    ledger.mainnet_address = mn;
+                    let _ = ledger.save();
+                    eprintln!("[P2P] Auto-generated node identity: {}", addr);
+
+                    // Write wallets.json so init_wallet doesn't overwrite this identity.
+                    let mut reg = crate::ledger::load_registry();
+                    if reg.wallets.is_empty() {
+                        reg.active_id = "wallet_0".to_string();
+                        reg.wallets.push(crate::ledger::WalletEntry {
+                            id:         "wallet_0".to_string(),
+                            name:       "Node Wallet".to_string(),
+                            address:    addr.clone(),
+                            created_at: chrono::Utc::now().timestamp(),
+                        });
+                        let _ = crate::ledger::save_registry(&reg);
                     }
                 }
             }
@@ -1992,6 +2084,17 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
         }
         if !ledger.address.is_empty() {
             register_known_validator(&ledger.address);
+            if let Some(seed_bytes) = crate::ledger::load_seed() {
+                if seed_bytes.len() == 32 {
+                    let mut seed = [0u8; 32];
+                    seed.copy_from_slice(&seed_bytes);
+                    let vk_hex = {
+                        use ed25519_dalek::SigningKey;
+                        hex::encode(SigningKey::from_bytes(&seed).verifying_key().as_bytes())
+                    };
+                    record_peer_ed25519(&ledger.address, &vk_hex);
+                }
+            }
         }
         // Restore persisted slash records so bans survive node restarts.
         for addr in crate::chain_db::load_slashed_validators() {
@@ -3347,7 +3450,15 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
             }
         }
 
-        P2PMessage::PeerAnnounce { address, name, endpoint, endpoints, city, country, coverage_score, dilithium_pubkey, vrf_pubkey } => {
+        P2PMessage::PeerAnnounce { address, name, endpoint, endpoints, city, country, coverage_score, dilithium_pubkey, vrf_pubkey, staked_amount, genesis_hash } => {
+            if genesis_hash != crate::ledger::GENESIS_HASH {
+                eprintln!("[P2P] Rejected peer {} — genesis mismatch (got '{}', want '{}')",
+                    address, genesis_hash, crate::ledger::GENESIS_HASH);
+                return;
+            }
+            if staked_amount > 0 {
+                crate::ledger::record_validator_stake(&address, staked_amount, true);
+            }
             register_known_validator(&address);
 
             if coverage_score > 0 { crate::poc::record_peer_score(&address, coverage_score); }
@@ -3509,7 +3620,7 @@ P2PMessage::ChatMessage { bundle, seq } => {
         }
 
         P2PMessage::ChainSyncResponse { blocks, transactions } => {
-            merge_remote_chain(blocks, transactions, app).await;
+            merge_remote_chain_trusted(blocks, transactions, app).await;
         }
 
         P2PMessage::ShardDataRequest { shard_id, from_height, requester_address: _, requester_endpoint } => {
@@ -3685,7 +3796,7 @@ P2PMessage::FileRequest { cid, requester_addr, requester_endpoint } => {
                 let ep            = requester_endpoint.clone();
                 let addr          = requester_addr.clone();
 
-                const RELAY_LIMIT: usize = 50 * 1024 * 1024;
+                const RELAY_LIMIT: usize = 2 * 1024 * 1024 * 1024;
 
                 tokio::spawn(async move {
                     if enc_bytes.len() > RELAY_LIMIT {
@@ -3753,6 +3864,44 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
         Ok(enc_bytes) => {
             let storage  = crate::ledger::storage_dir();
             let short    = &cid[cid.len().saturating_sub(16)..];
+
+            // Public (unencrypted) hosting files — store as .pub, skip decrypt
+            if key_nonce_hex == "public" {
+                let pub_path = storage.join(format!("{}.pub", short));
+                if let Err(e) = std::fs::write(&pub_path, &enc_bytes) {
+                    eprintln!("[P2P] Public FileData write failed: {}", e);
+                    return;
+                }
+                let pub_str = pub_path.to_string_lossy().to_string();
+                let now2    = chrono::Utc::now().timestamp();
+                let mut ledger2 = crate::ledger::Ledger::load();
+                if let Some(f) = ledger2.stored_files.iter_mut().find(|f| f.cid == cid) {
+                    f.local_path      = pub_str.clone();
+                    f.key_nonce_hex   = "public".to_string();
+                    f.status          = "Active".to_string();
+                } else {
+                    let my_addr = ledger2.address.clone();
+                    ledger2.stored_files.push(crate::ledger::StoredFile {
+                        cid:              cid.clone(),
+                        name:             file_name.clone(),
+                        original_size:    enc_bytes.len() as u64,
+                        encrypted_size:   enc_bytes.len() as u64,
+                        stored_at:        now2,
+                        expiry:           now2 + 365 * 86_400,
+                        status:           "Active".to_string(),
+                        key_nonce_hex:    "public".to_string(),
+                        local_path:       pub_str,
+                        owner:            my_addr,
+                        replication_role: "slave".to_string(),
+                        ..Default::default()
+                    });
+                }
+                let _ = ledger2.save();
+                eprintln!("[P2P] Public FileData saved for {}", cid);
+                let _ = app.emit_all("ego://file-downloaded", serde_json::json!({ "cid": cid }));
+                return;
+            }
+
             let enc_path = storage.join(format!("{}.enc", short));
             if let Err(e) = std::fs::write(&enc_path, &enc_bytes) {
                 eprintln!("[P2P] FileData write failed: {}", e);
@@ -4332,36 +4481,16 @@ fn validate_block(block: &crate::ledger::LedgerBlock, chain: &crate::ledger::Sha
     }
 
     if chain.blocks.iter().any(|b| b.hash == block.hash) {
+        eprintln!("[Validate] Block #{} rejected: hash {:.8} already in chain", block.height, block.hash);
         return false;
     }
 
-    let expected_reward = crate::tokenomics::block_reward_at(block.height);
-    if block.reward != expected_reward && block.reward != 0 {
-        eprintln!("[Validate] Block #{} rejected: reward {} != expected {}",
-            block.height, block.reward, expected_reward);
+    let base_reward = crate::tokenomics::block_reward_at(block.height);
+    if block.reward != 0 && block.reward < base_reward {
+        eprintln!("[Validate] Block #{} rejected: reward {} below base {}",
+            block.height, block.reward, base_reward);
         return false;
     }
-
-    if let Some(ref cb_hash) = block.coinbase_tx {
-        let cb_tx = chain.transactions.iter().find(|t| &t.hash == cb_hash);
-        match cb_tx {
-            Some(tx) => {
-                if tx.to != block.miner || tx.amount != expected_reward {
-                    eprintln!("[Validate] Block #{} rejected: invalid coinbase tx (to={}, amount={}, miner={}, expected={})",
-                        block.height, tx.to, tx.amount, block.miner, expected_reward);
-                    return false;
-                }
-            }
-            None => {
-                if block.reward != 0 {
-                    eprintln!("[Validate] Block #{} rejected: coinbase TX {} not found",
-                        block.height, cb_hash);
-                    return false;
-                }
-            }
-        }
-    }
-
 
     if !block.tx_merkle_root.is_empty() {
         let expected_v2_hash = crate::chain_db::block_hash_for(
@@ -4408,10 +4537,10 @@ async fn apply_incoming_tx(tx: LedgerTx, block: LedgerBlock, app: &tauri::AppHan
         return;
     }
 
-    let expected_reward = crate::tokenomics::block_reward_at(block.height);
-    if block.reward != expected_reward && block.reward != 0 {
-        eprintln!("[P2P] TxBroadcast: block #{} rejected — reward {} != expected {}",
-            block.height, block.reward, expected_reward);
+    let base_reward = crate::tokenomics::block_reward_at(block.height);
+    if block.reward != 0 && block.reward < base_reward {
+        eprintln!("[P2P] TxBroadcast: block #{} rejected — reward {} below base {}",
+            block.height, block.reward, base_reward);
         return;
     }
 
@@ -4556,8 +4685,38 @@ async fn merge_remote_chain_inner(
             .map(|b| b.height);
 
         if let Some(dh) = diverge_height {
-            eprintln!("[Oracle] Reorg: local chain diverges at height {} — truncating and adopting oracle chain", dh);
-            crate::chain_db::truncate_from(dh);
+            let last_hard = {
+                let hard_final = hard_finalized_heights();
+                hard_final.iter().max().copied().unwrap_or(0)
+            };
+            if dh <= last_hard {
+                let now = chrono::Utc::now().timestamp();
+                let last_fin = LAST_BLOCK_FINALIZED_TS.load(Ordering::Relaxed);
+                let stuck_secs = now - last_fin;
+                if last_fin > 0 && stuck_secs > 120 {
+                    eprintln!(
+                        "[Oracle] Chain stuck for {}s — overriding hard-finality at height {} to adopt oracle fork",
+                        stuck_secs, dh
+                    );
+                    {
+                        let mut hf = hard_finalized_heights();
+                        hf.retain(|&h| h < dh);
+                    }
+                    {
+                        let mut fa = finalized_at_height();
+                        fa.retain(|&h, _| h < dh);
+                    }
+                    crate::chain_db::truncate_from(dh);
+                } else {
+                    eprintln!(
+                        "[Oracle] Reorg blocked at height {} — multi-validator BFT finalized up to height {} (protecting local chain)",
+                        dh, last_hard
+                    );
+                }
+            } else {
+                eprintln!("[Oracle] Reorg: local chain diverges at height {} — truncating and adopting oracle chain", dh);
+                crate::chain_db::truncate_from(dh);
+            }
         }
 
         for block in blocks {
@@ -4602,11 +4761,11 @@ async fn merge_remote_chain_inner(
 
         {
 
-            let expected_reward = crate::tokenomics::block_reward_at(block.height);
-            let reward_ok = block.reward == expected_reward || block.reward == 0;
+            let base_reward = crate::tokenomics::block_reward_at(block.height);
+            let reward_ok = block.reward == 0 || block.reward >= base_reward;
             if !reward_ok {
-                eprintln!("[P2P] Block #{} rejected: reward {} != expected {}",
-                    block.height, block.reward, expected_reward);
+                eprintln!("[P2P] Block #{} rejected: reward {} below base {}",
+                    block.height, block.reward, base_reward);
                 continue;
             }
 
@@ -4627,8 +4786,12 @@ async fn merge_remote_chain_inner(
     } // end else (untrusted path)
 
     for tx in transactions {
-
-        match crate::ledger::verify_incoming_tx(&tx) {
+        let verify_result = if tx.block_height.is_some() {
+            crate::ledger::verify_confirmed_tx_sig(&tx)
+        } else {
+            crate::ledger::verify_incoming_tx(&tx)
+        };
+        match verify_result {
             Ok(())       => new_txs.push(tx),
             Err(reason)  => eprintln!("[P2P] Sync TX {} rejected — {}", tx.hash, reason),
         }
@@ -4642,6 +4805,14 @@ async fn merge_remote_chain_inner(
             .cloned()
             .collect();
         crate::chain_db::append_peer_block(block, &block_txs);
+    }
+
+    if let Some(max_height) = new_blocks.iter().map(|b| b.height).max() {
+        let synced_view = max_height + 1;
+        if synced_view > current_view() {
+            advance_view(synced_view);
+            eprintln!("[Sync] View advanced to {} after syncing to block #{}", synced_view, max_height);
+        }
     }
 
     let pool = crate::mempool::get_mempool();
@@ -4729,13 +4900,12 @@ pub async fn fetch_chain_from_oracle(app: &tauri::AppHandle) {
 }
 
 fn bft_sign(data: &str) -> Option<String> {
+    use ed25519_dalek::{SigningKey, Signer};
     let seed_bytes = crate::ledger::load_seed()?;
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&seed_bytes);
-    let kp = ego_core::KeyPair::from_bytes(&seed).ok()?;
-
-    let sig = kp.sign_dilithium(data.as_bytes());
-    Some(hex::encode(sig.as_bytes()))
+    let sig = SigningKey::from_bytes(&seed).sign(data.as_bytes());
+    Some(hex::encode(sig.to_bytes()))
 }
 
 async fn handle_block_proposal(
@@ -4746,7 +4916,6 @@ async fn handle_block_proposal(
 ) {
     let my_addr = crate::ledger::Ledger::load().address;
     if my_addr.is_empty() { return; }
-
 
     if my_addr == proposer { return; }
 
@@ -4763,12 +4932,27 @@ async fn handle_block_proposal(
     let my_drs    = crate::bft_committee::compute_drs_weight(&my_addr);
     let total_drs = crate::bft_committee::total_drs_weight(&all_validators);
 
-    if !crate::bft_committee::qualifies_committee(&ticket, my_drs, total_drs) {
+    if !crate::bft_committee::qualifies_committee(&ticket, my_drs, total_drs, all_validators.len()) {
+        eprintln!("[BFT] Proposal #{} — VRF committee disqualified (my_drs={:.4} total_drs={:.4} n={})", block.height, my_drs, total_drs, all_validators.len());
         return;
     }
 
     // ── 2. Block-level structural validation ─────────────────────────────────
     let chain = load_chain();
+    {
+        let prev_exists = chain.blocks.iter().any(|b| b.hash == block.prev_hash);
+        if !prev_exists && block.height > 0 {
+            eprintln!("[BFT] Fork detected — block #{} from {} references unknown prev_hash {:.16}… (we may be on wrong fork)",
+                block.height, proposer, block.prev_hash);
+            let now = chrono::Utc::now().timestamp();
+            let last_sync = LAST_FORK_SYNC_TS.load(Ordering::Relaxed);
+            if now - last_sync > 15 {
+                LAST_FORK_SYNC_TS.store(now, Ordering::Relaxed);
+                sync_chain_from_peers().await;
+            }
+            return;
+        }
+    }
     if !validate_block(&block, &chain) {
         eprintln!("[BFT] Committee: rejected proposal for block #{} from {} — structural validation failed",
             block.height, proposer);
@@ -4796,6 +4980,8 @@ async fn handle_block_proposal(
         // Skip coinbase (system reward tx) — its amount is validated below.
         if Some(&tx.hash) == block.coinbase_tx.as_ref() { continue; }
         if let Err(reason) = crate::ledger::verify_incoming_tx_with_miner(tx, &proposer) {
+            eprintln!("[TX] {:.12} Rejected — {} (in proposal #{} from {:.16})",
+                tx.hash, reason, block.height, proposer);
             eprintln!("[BFT] Committee: rejected proposal #{} from {} — tx {} invalid: {}",
                 block.height, proposer, tx.hash, reason);
             return;
@@ -4803,7 +4989,16 @@ async fn handle_block_proposal(
     }
 
 
-    let expected_reward = crate::tokenomics::block_reward_at(block.height);
+    let tx_fees_sum: u64 = transactions.iter()
+        .filter(|t| Some(&t.hash) != block.coinbase_tx.as_ref()
+                 && t.tx_type != "fee_distribution")
+        .map(|t| t.fee_uegoc)
+        .sum();
+    let expected_reward = crate::tokenomics::compute_block_reward(
+        block.height, tx_fees_sum, &block.prev_hash,
+    );
+    let expected_staking_fee = crate::tokenomics::staking_fee_share(tx_fees_sum);
+
     if let Some(ref cb_hash) = block.coinbase_tx {
         match transactions.iter().find(|t| &t.hash == cb_hash) {
             Some(cb) => {
@@ -4825,7 +5020,34 @@ async fn handle_block_proposal(
         }
     }
 
-    // ── 6. Dedup: skip if we already voted for this block ────────────────────
+    if expected_staking_fee > 0 {
+        let sf_tx = transactions.iter().find(|t| t.tx_type == "fee_distribution");
+        match sf_tx {
+            Some(sf) if sf.amount == expected_staking_fee
+                     && sf.to == crate::chain_db::STAKING_POOL_ADDR => {}
+            Some(sf) => {
+                eprintln!(
+                    "[BFT] Committee: rejected proposal #{} — invalid staking fee tx \
+                     (amount={} expected={}, to={})",
+                    block.height, sf.amount, expected_staking_fee, sf.to
+                );
+                return;
+            }
+            None => {
+                eprintln!(
+                    "[BFT] Committee: rejected proposal #{} — staking fee tx missing (expected {})",
+                    block.height, expected_staking_fee
+                );
+                return;
+            }
+        }
+    }
+
+    // ── 6. Dedup: skip if we already voted at this height (avoids equivocation) ─
+    {
+        let cast = votes_cast();
+        if cast.contains_key(&(my_addr.clone(), block.height)) { return; }
+    }
     {
         let votes = pending_votes();
         if let Some(voters) = votes.get(&block.hash) {
@@ -4890,50 +5112,56 @@ async fn handle_block_vote(
         return;
     }
 
+    let my_addr_local = crate::ledger::Ledger::load().address;
+    let is_self_vote  = voter == my_addr_local;
 
     const VRF_ENFORCE_HEIGHT: u64 = 10;
-    if vrf_ticket.is_empty() || prev_hash.is_empty() {
-        if height >= VRF_ENFORCE_HEIGHT {
-            eprintln!("[BFT] Vote from {} at #{} rejected — VRF ticket required above height {}",
-                voter, height, VRF_ENFORCE_HEIGHT);
-            return;
-        }
-    } else {
-        let ticket_bytes = match hex::decode(&vrf_ticket) {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("[BFT] Malformed vrf_ticket from {}", voter);
+    if !is_self_vote {
+        if vrf_ticket.is_empty() || prev_hash.is_empty() {
+            if height >= VRF_ENFORCE_HEIGHT {
+                eprintln!("[BFT] Vote from {} at #{} rejected — VRF ticket required above height {}",
+                    voter, height, VRF_ENFORCE_HEIGHT);
                 return;
             }
-        };
-        let pubkey_opt = get_peer_ed25519_pubkey(&voter);
-        match pubkey_opt {
-            None => {
-                if height >= VRF_ENFORCE_HEIGHT {
-                    eprintln!("[BFT] Unknown Ed25519 pubkey for {} at #{} — dropping vote", voter, height);
+        } else {
+            let ticket_bytes = match hex::decode(&vrf_ticket) {
+                Ok(b) => b,
+                Err(_) => {
+                    eprintln!("[BFT] Malformed vrf_ticket from {}", voter);
                     return;
                 }
-            }
-            Some(pubkey) => {
-                let vrf_in = crate::bft_committee::vrf_input(&prev_hash, height, crate::bft_committee::VRF_ROLE_COMMITTEE);
-                if !crate::bft_committee::verify_vrf_ticket(&pubkey, &vrf_in, &ticket_bytes) {
-                    eprintln!("[BFT] Invalid VRF ticket from {} at height {}", voter, height);
-                    return;
+            };
+            let pubkey_opt = get_peer_ed25519_pubkey(&voter);
+            match pubkey_opt {
+                None => {
+                    if height >= VRF_ENFORCE_HEIGHT {
+                        eprintln!("[BFT] Unknown Ed25519 pubkey for {} at #{} — dropping vote", voter, height);
+                        return;
+                    }
                 }
-                let all_validators: Vec<String> = known_validators().iter().cloned().collect();
-                let voter_drs = crate::bft_committee::compute_drs_weight(&voter);
-                let total_drs = crate::bft_committee::total_drs_weight(&all_validators);
-                if !crate::bft_committee::qualifies_committee(&ticket_bytes, voter_drs, total_drs) {
-                    eprintln!("[BFT] Vote from {} rejected — VRF ticket below committee threshold", voter);
-                    return;
+                Some(pubkey) => {
+                    let vrf_in = crate::bft_committee::vrf_input(&prev_hash, height, crate::bft_committee::VRF_ROLE_COMMITTEE);
+                    if !crate::bft_committee::verify_vrf_ticket(&pubkey, &vrf_in, &ticket_bytes) {
+                        eprintln!("[BFT] Invalid VRF ticket from {} at height {}", voter, height);
+                        return;
+                    }
+                    let all_validators: Vec<String> = known_validators().iter().cloned().collect();
+                    let voter_drs = crate::bft_committee::compute_drs_weight(&voter);
+                    let total_drs = crate::bft_committee::total_drs_weight(&all_validators);
+                    if !crate::bft_committee::qualifies_committee(&ticket_bytes, voter_drs, total_drs, all_validators.len()) {
+                        eprintln!("[BFT] Vote from {} rejected — VRF ticket below committee threshold", voter);
+                        return;
+                    }
                 }
             }
         }
     }
 
-    // ── Dilithium vote signature verification ──────────────────────────────
+    // ── BFT vote signature verification ───────────────────────────────────
     let vote_data = crate::bft_committee::vote_signing_data(&block_hash, height, &voter);
-    if !voter.is_empty() && !signature.is_empty() && !verify_bft_sig(&voter, &vote_data, &signature) {
+    if !is_self_vote && !voter.is_empty() && !signature.is_empty()
+        && !verify_bft_sig(&voter, &vote_data, &signature)
+    {
         eprintln!("[BFT] Invalid vote signature from {} at height {} — dropping", voter, height);
         return;
     }
@@ -4942,69 +5170,11 @@ async fn handle_block_vote(
     {
         let mut cast = votes_cast();
         let key = (voter.clone(), height);
-        if let Some((prior_hash, prior_sig)) = cast.get(&key) {
-            if *prior_hash != block_hash {
-                let reason = format!(
-                    "equivocation at height {}: voted {} and {}",
-                    height, &prior_hash[..8.min(prior_hash.len())], &block_hash[..8.min(block_hash.len())]
-                );
-                // Clone before dropping the lock guard to avoid borrow-after-move.
-                let prior_hash_c = prior_hash.clone();
-                let prior_sig_c  = prior_sig.clone();
-                let proof_payload = format!(
-                    "equivocation:{}:h{}:sig1={}:sig2={}",
-                    voter, height, prior_sig_c, signature
-                );
-                drop(cast);
-                eprintln!("[BFT] EQUIVOCATION detected: {} — {}", voter, reason);
-                slash_validator(&voter, &reason);
-                // Submit a signed on-chain evidence tx so every full node can verify
-                // the slash independently.  Signed by the detector (us), not the equivocator.
-                {
-                    let tx_hash = blake3::hash(proof_payload.as_bytes()).to_hex().to_string();
-                    let my_ledger   = crate::ledger::Ledger::load();
-                    let my_addr_det = my_ledger.address.clone();
-                    // Sign tx_hash with local Ed25519 key.
-                    let (det_sig_hex, det_pubkey_hex): (String, String) = crate::ledger::load_seed()
-                        .and_then(|s| {
-                            let mut arr = [0u8; 32];
-                            arr.copy_from_slice(&s[..32.min(s.len())]);
-                            ego_core::KeyPair::from_bytes(&arr).ok()
-                        })
-                        .map(|kp| (
-                            hex::encode(kp.sign_ed25519(tx_hash.as_bytes()).as_bytes()),
-                            hex::encode(kp.ed25519_public_key().as_bytes()),
-                        ))
-                        .unwrap_or_else(|| (String::new(), String::new()));
-
-                    if !det_sig_hex.is_empty() {
-                        let proof_tx = crate::ledger::LedgerTx {
-                            hash:                 tx_hash,
-                            from:                 my_addr_det,
-                            to:                   "egot1slashpool0000000000000000000000000000000".to_string(),
-                            amount:               0,
-                            fee_uegoc:            0,
-                            priority_fee_uegoc:   0,
-                            timestamp:            chrono::Utc::now().timestamp(),
-                            status:               "Pending".to_string(),
-                            tx_type:              "equivocation_proof".to_string(),
-                            signature:            det_sig_hex,
-                            public_key_ed25519:   det_pubkey_hex,
-                            memo:                 Some(format!(
-                                "{{\"equivocator\":\"{}\",\"height\":{},\
-                                 \"hash_a\":\"{}\",\"hash_b\":\"{}\",\
-                                 \"sig_a\":\"{}\",\"sig_b\":\"{}\"}}",
-                                voter, height,
-                                prior_hash_c, block_hash,
-                                prior_sig_c,  signature
-                            )),
-                            ..Default::default()
-                        };
-                        crate::mempool::get_mempool().push(proof_tx);
-                    }
-                }
+        if let Some((prior_hash, _)) = cast.get(&key) {
+            if *prior_hash == block_hash {
                 return;
             }
+            cast.insert(key, (block_hash.clone(), signature.clone()));
         } else {
             cast.insert(key, (block_hash.clone(), signature.clone()));
         }
@@ -5014,19 +5184,16 @@ async fn handle_block_vote(
         let finalized = finalized_at_height();
         if let Some(canonical) = finalized.get(&height) {
             if *canonical != block_hash {
-                let mut counts = wrong_vote_counts();
-                let count = counts.entry(voter.clone()).or_insert(0);
-                *count += 1;
-                eprintln!("[BFT] Wrong vote #{} from {} at height {} (voted {} expected {})",
-                    count, voter, height, &block_hash[..8.min(block_hash.len())],
-                    &canonical[..8.min(canonical.len())]);
-                if *count >= WRONG_VOTE_THRESHOLD {
-                    let reason = format!("{} wrong votes at height {}", count, height);
-                    drop(counts);
-                    slash_validator(&voter, &reason);
-                }
+                let reason = format!(
+                    "equivocation at height {}: finalized {} but voted {}",
+                    height, &canonical[..8.min(canonical.len())], &block_hash[..8.min(block_hash.len())]
+                );
+                drop(finalized);
+                eprintln!("[BFT] EQUIVOCATION detected: {} — {}", voter, reason);
+                slash_validator(&voter, &reason);
                 return;
             }
+            return;
         }
     }
 
@@ -5058,6 +5225,10 @@ async fn handle_block_vote(
         height, final_vote_count, threshold);
 
     finalized_at_height().insert(height, block_hash.clone());
+    if final_vote_count >= threshold {
+        hard_finalized_heights().insert(height);
+    }
+    LAST_BLOCK_FINALIZED_TS.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
 
 
     CONSECUTIVE_EMPTY_VIEWS.store(0, Ordering::Relaxed);
@@ -5090,7 +5261,13 @@ async fn handle_block_vote(
 
     let (block, block_txs) = match staged_opt {
         Some((b, txs)) => {
-            crate::chain_db::commit_staged_block(&b, &txs);
+            if !crate::chain_db::commit_staged_block(&b, &txs) {
+                let pool = crate::mempool::get_mempool();
+                for tx in txs.iter().filter(|t| t.tx_type != "reward" && t.tx_type != "coinbase") {
+                    pool.push(tx.clone());
+                }
+                return;
+            }
             crate::chain_db::pipeline_commit(height);
             (b, txs)
         }
@@ -5108,6 +5285,11 @@ async fn handle_block_vote(
             }
         }
     };
+
+    for tx in block_txs.iter().filter(|t| t.tx_type != "reward" && t.tx_type != "coinbase") {
+        eprintln!("[TX] {:.12} Confirmed — block #{}", tx.hash, height);
+        crate::commands::tx_pending::remove(&tx.hash);
+    }
 
     let votes_json: Vec<serde_json::Value> = {
         let cast = votes_cast();
@@ -5127,12 +5309,18 @@ async fn handle_block_vote(
 
     let finalized = P2PMessage::BlockFinalized {
         block:        block.clone(),
-        transactions: block_txs,
+        transactions: block_txs.clone(),
         votes:        votes_json,
     };
 
     if let Ok(data) = serde_json::to_vec(&finalized) {
         publish_gossip("ego-blocks-v1", data).await;
+    }
+
+    {
+        let b   = block.clone();
+        let txs = block_txs.clone();
+        tokio::spawn(async move { push_block_to_oracle(&b, &txs).await; });
     }
 
     let _ = app.emit_all("ego://chain-updated", ());
@@ -5199,6 +5387,7 @@ fn process_inbound_qc_finalization(block_hash: &str, height: u64, votes: &[serde
 
     // ── Update consensus state ────────────────────────────────────────────────
     finalized_at_height().insert(height, block_hash.to_string());
+    hard_finalized_heights().insert(height);
     pending_proposals().remove(&height);
 
     {
@@ -5220,7 +5409,40 @@ pub fn touch_proposal_timestamp() {
 
 async fn handle_view_change_msg(view: u64, voter: String) {
     register_known_validator(&voter);
+    if !known_validators().contains(&voter) { return; }
     let threshold = bft_threshold().max(1);
+
+    {
+        let my_view = current_view();
+        if view > my_view {
+            let my_addr = crate::ledger::Ledger::load().address;
+            if !my_addr.is_empty() && voter != my_addr {
+                advance_view(view.saturating_sub(1));
+                eprintln!(
+                    "[HotStuff] View sync: jumped {} → {} (peer {} is ahead)",
+                    my_view, view.saturating_sub(1), &voter[..voter.len().min(20)]
+                );
+                {
+                    let mut votes = view_change_votes();
+                    let voters = votes.entry(view).or_default();
+                    if !voters.contains(&my_addr) {
+                        voters.push(my_addr.clone());
+                    }
+                }
+                let vote_data = format!("viewchange:{}:{}", view, my_addr);
+                let sig = bft_sign(&vote_data).unwrap_or_default();
+                let ts  = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let msg = P2PMessage::ViewChange { view, voter: my_addr.clone(), signature: sig, timestamp: ts };
+                if let Ok(data) = serde_json::to_vec(&msg) {
+                    publish_gossip("ego-viewchange-v1", data).await;
+                }
+                touch_proposal_timestamp();
+            }
+        }
+    }
 
     let should_advance = {
         let mut votes = view_change_votes();
@@ -5269,6 +5491,14 @@ async fn handle_view_change_msg(view: u64, voter: String) {
         return;
     }
 
+    // On each view advance, clear votes_cast for heights that haven't been
+    // finalized yet.  This allows the node to vote for new proposals at those
+    // heights in the new view without triggering the equivocation guard.
+    {
+        let committed_tip = crate::chain_db::block_count();
+        votes_cast().retain(|(_, h), _| *h <= committed_tip);
+    }
+
     // ── Liveness: VRF self-selection + deterministic fallback ─────────────
     // Increment the empty-view counter.  If it hits FALLBACK_AFTER_EMPTY_VIEWS,
     // fall back to the highest-DRS node so the chain never permanently stalls.
@@ -5283,16 +5513,15 @@ async fn handle_view_change_msg(view: u64, voter: String) {
             "[HotStuff] {} consecutive empty views — activating deterministic fallback for view {}",
             empty_views, view
         );
-        let validators: Vec<String> = known_validators().iter().cloned().collect();
-        if let Some(fallback_leader) = validators.iter().max_by(|a, b| {
-            let da = crate::bft_committee::compute_drs_weight(a);
-            let db = crate::bft_committee::compute_drs_weight(b);
-            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-        }) {
-            if fallback_leader == &my_addr {
-                eprintln!("[HotStuff] Fallback: we are highest-DRS node — proposing for view {}", view);
-                tokio::spawn(async move { propose_block_as_leader_forced().await; });
-            }
+        let mut validators: Vec<String> = known_validators().iter().cloned().collect();
+        validators.sort();
+        let fallback_idx    = (view as usize).wrapping_rem(validators.len().max(1));
+        let fallback_leader = validators.get(fallback_idx).cloned().unwrap_or_default();
+        if fallback_leader == my_addr {
+            eprintln!("[HotStuff] Fallback: round-robin elected us for view {} — proposing", view);
+            tokio::spawn(async move { propose_block_as_leader_forced().await; });
+        } else {
+            eprintln!("[HotStuff] Fallback: round-robin elected {} for view {}", &fallback_leader[..12.min(fallback_leader.len())], view);
         }
     } else {
         // Normal path: VRF self-selection.
@@ -5334,9 +5563,8 @@ pub async fn propose_block_as_leader() {
     }
     eprintln!("[BFT] VRF election won — proposer for block #{}", next_height);
 
-    let pool = crate::mempool::get_mempool();
     let is_solo = known_validators().len() <= 1;
-    if pool.pending_count() == 0 && !is_solo { return; }
+    let pool = crate::mempool::get_mempool();
     let txs = pool.drain_all();
 
     let (poc_ticket, poc_sig) = crate::poc::check_slot_winner(&prev_hash)
@@ -5350,7 +5578,7 @@ pub async fn propose_block_as_leader() {
 
     {
         let mut staged = staged_block();
-        *staged = Some((block.clone(), stamped));
+        *staged = Some((block.clone(), stamped.clone()));
     }
 
     let sig_data  = format!("proposal:{}:{}", block.hash, block.height);
@@ -5358,7 +5586,7 @@ pub async fn propose_block_as_leader() {
 
     let proposal = P2PMessage::BlockProposal {
         block:        block.clone(),
-        transactions: txs,
+        transactions: stamped.clone(),
         proposer:     miner.clone(),
         signature,
         vrf_ticket:   hex::encode(&vrf_ticket),
@@ -5416,15 +5644,25 @@ fn bft_solo_commit(block_hash: &str, height: u64) {
         }
     };
     if let Some((b, stamped)) = staged_opt {
-        crate::chain_db::commit_staged_block(&b, &stamped);
+        if !crate::chain_db::commit_staged_block(&b, &stamped) {
+            let pool = crate::mempool::get_mempool();
+            for tx in stamped.iter().filter(|t| t.tx_type != "reward" && t.tx_type != "coinbase") {
+                pool.push(tx.clone());
+            }
+            return;
+        }
         crate::chain_db::pipeline_commit(height);
         finalized_at_height().insert(height, block_hash.to_string());
         CONSECUTIVE_EMPTY_VIEWS.store(0, Ordering::Relaxed);
         pending_proposals().remove(&height);
         pending_votes().remove(block_hash);
         for tx in stamped.iter().filter(|t| t.tx_type != "reward" && t.tx_type != "coinbase") {
+            eprintln!("[TX] {:.12} Confirmed — block #{}", tx.hash, height);
             crate::commands::tx_pending::remove(&tx.hash);
         }
+        let b2  = b.clone();
+        let s2  = stamped.clone();
+        tokio::spawn(async move { push_block_to_oracle(&b2, &s2).await; });
     }
 }
 
@@ -5460,7 +5698,7 @@ pub async fn propose_block_as_leader_forced() {
 
     {
         let mut staged = staged_block();
-        *staged = Some((block.clone(), stamped));
+        *staged = Some((block.clone(), stamped.clone()));
     }
 
     let sig_data  = format!("proposal:{}:{}", block.hash, block.height);
@@ -5468,7 +5706,7 @@ pub async fn propose_block_as_leader_forced() {
 
     let proposal = P2PMessage::BlockProposal {
         block:        block.clone(),
-        transactions: txs,
+        transactions: stamped.clone(),
         proposer:     miner.clone(),
         signature,
         vrf_ticket:   String::new(),
@@ -5534,7 +5772,10 @@ pub async fn run_view_change_monitor() {
         let last = LAST_PROPOSAL_TS.load(Ordering::Relaxed);
         if last == 0 || now - last < VIEW_CHANGE_TIMEOUT_SECS { continue; }
 
-        let next_view = current_view() + 1;
+        let next_view = {
+            let chain_next = crate::chain_db::block_count() as u64 + 1;
+            chain_next.max(current_view() + 1)
+        };
         let my_addr   = crate::ledger::Ledger::load().address;
         if my_addr.is_empty() { continue; }
 

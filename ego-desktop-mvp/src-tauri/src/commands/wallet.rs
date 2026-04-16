@@ -85,8 +85,14 @@ pub async fn get_balance(_state: State<'_, AppState>) -> Result<Balance, EgoDesk
         return Ok(Balance { egoc: 0, uegoc: 0, formatted: "0.00 EGOC".into(), egusd: 0, uegusd: 0 });
     }
 
-    // Direct O(1) RocksDB CF_BALANCES lookup — no need to deserialise 500 blocks.
-    let uegoc = crate::chain_db::balance_of(&my_addr);
+    let confirmed = crate::chain_db::balance_of(&my_addr);
+    let pending_out: u64 = crate::mempool::get_mempool()
+        .peek_all()
+        .into_iter()
+        .filter(|tx| tx.from.trim() == my_addr.trim())
+        .map(|tx| tx.amount.saturating_add(tx.fee_uegoc))
+        .sum();
+    let uegoc = confirmed.saturating_sub(pending_out);
     let egoc  = uegoc / 1_000_000;
 
     let uegusd = ledger.balance_uegusd;
@@ -123,8 +129,7 @@ pub async fn send_transaction(
         ));
     }
 
-    let chain   = load_chain();
-    let balance = chain.balance_of(&from);
+    let balance = crate::chain_db::balance_of(&from);
 
     if request.amount == 0 {
         return Err(EgoDesktopError::InvalidInput("Amount must be > 0".into()));
@@ -196,6 +201,8 @@ pub async fn send_transaction(
         ..LedgerTx::default()
     };
 
+    eprintln!("[TX] {:.12} Pending — {:.16} → {:.16} {} uEGOC nonce={}",
+        tx.hash, from, request.to_address, request.amount, nonce);
     crate::mempool::get_mempool().push(tx.clone());
     crate::commands::tx_pending::add(&tx);
 
@@ -375,18 +382,28 @@ pub async fn get_transaction_history(
         return Ok(vec![]);
     }
 
-    let chain = load_chain();
-    let mut txs: Vec<LedgerTx> = chain
-        .transactions
+    let mut txs: Vec<LedgerTx> = crate::chain_db::get_tx_history_for_addr(&my_addr);
+    for tx in txs.iter_mut() {
+        if tx.status.is_empty() || tx.status == "Pending" {
+            tx.status = "Confirmed".into();
+        }
+    }
+
+    let confirmed_hashes: std::collections::HashSet<String> =
+        txs.iter().map(|t| t.hash.clone()).collect();
+
+    let pending: Vec<LedgerTx> = crate::mempool::get_mempool()
+        .peek_all()
         .into_iter()
         .filter(|tx| {
-            tx.to.trim()   == my_addr.trim()
-            || tx.from.trim() == my_addr.trim()
+            !confirmed_hashes.contains(&tx.hash)
+            && tx.from.trim() == my_addr.trim()
         })
         .collect();
 
+    txs.extend(pending);
     txs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-    txs.truncate(500); // Cap at 500 most-recent — prevents OOM with millions of TXs
+    txs.truncate(500);
     Ok(txs)
 }
 

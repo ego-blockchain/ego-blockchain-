@@ -16,3 +16,4 @@ pub mod rollup;
 pub mod multichain;
 pub mod light_client;
 pub mod governance;
+pub mod hosting;

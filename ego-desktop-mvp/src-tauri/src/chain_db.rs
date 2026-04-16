@@ -18,10 +18,13 @@ const CF_META:       &str = "meta";
 const CF_HEADERS:    &str = "headers";    // light block headers — kept longer than full blocks
 const CF_GOVERNANCE: &str = "governance"; // on-chain feature flag votes
 const CF_DAO:        &str = "dao";        // DAO proposals (stake + knowledge voting)
+const CF_HOSTING:       &str = "hosting";       // Web3 hosted sites (name → HostedSite JSON)
+const CF_HOSTING_NODES: &str = "hosting_nodes"; // node_id → HostingNodeRecord JSON
 
 const ALL_CFS: &[&str] = &[
     CF_BLOCKS, CF_TXS, CF_BLOCK_TXS, CF_ADDR_TXS, CF_BALANCES,
     CF_RECENT_TXS, CF_META, CF_HEADERS, CF_GOVERNANCE, CF_DAO,
+    CF_HOSTING, CF_HOSTING_NODES,
 ];
 
 pub const FEATURE_DILITHIUM_DISABLED: &str = "dilithium_disabled";
@@ -330,7 +333,7 @@ fn migrate_from_json(db: &DB, path: &std::path::Path) -> bool {
 pub const CHECKPOINTS: &[(u64, &str)] = &[
     // (height, expected_block_hash)
     // Genesis is always checkpoint 0 — immovable anchor.
-    (0, "ego00000000000000000000000000000000000000000000000000000000genesis1"),
+    (0, "ego00000000000000000000000000000000000000000000000000000000genesis2"),
     // Production checkpoints added here after each major milestone.
     // Dynamic checkpoints are also stored in RocksDB (see below).
 ];
@@ -915,7 +918,8 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
 
     let height    = latest_height + 1;
     let timestamp = chrono::Utc::now().timestamp();
-    let reward    = crate::tokenomics::block_reward_at(height);
+    let tx_fees_sum: u64 = txs.iter().map(|t| t.fee_uegoc).sum();
+    let reward    = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash);
 
     // ── 1. Build all transactions first — merkle root must be computed
     //       BEFORE the block hash so the hash commits to tx content.
@@ -944,6 +948,26 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
     }).collect();
     stamped.push(coinbase);
 
+    let staking_fee = crate::tokenomics::staking_fee_share(tx_fees_sum);
+    if staking_fee > 0 {
+        let sf_hash = format!("0x{}", blake3::hash(
+            format!("stakingfee:{height}:{staking_fee}:{timestamp}").as_bytes()
+        ).to_hex());
+        stamped.push(LedgerTx {
+            hash:         sf_hash,
+            from:         NODE_POOL_ADDR.to_string(),
+            to:           STAKING_POOL_ADDR.to_string(),
+            amount:       staking_fee,
+            memo:         Some(format!("Block #{height} staking fee share")),
+            timestamp,
+            status:       "Confirmed".to_string(),
+            block_height: Some(height),
+            tx_type:      "fee_distribution".to_string(),
+            signature:    "coinbase".to_string(),
+            ..LedgerTx::default()
+        });
+    }
+
     // ── 2. Merkle root over all txs in this block.
     let tx_hashes: Vec<&str> = stamped.iter().map(|t| t.hash.as_str()).collect();
     let tx_merkle_root = compute_merkle_root(&tx_hashes);
@@ -967,7 +991,7 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
             let is_system = tx.from.is_empty()
                 || tx.from == NODE_POOL_ADDR
                 || tx.from.starts_with("egot1faucet")
-                || tx.from.starts_with("ego1genesis");
+                || tx.from.starts_with("egot1genesis");
             if !is_system {
                 let out = tx.amount as i128 + tx.fee_uegoc as i128;
                 *deltas.entry(tx.from.clone()).or_insert(0) -= out;
@@ -1028,7 +1052,8 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
 
     let height    = latest_height + 1;
     let timestamp = chrono::Utc::now().timestamp();
-    let reward    = crate::tokenomics::block_reward_at(height);
+    let tx_fees_sum: u64 = txs.iter().map(|t| t.fee_uegoc).sum();
+    let reward    = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash);
 
     let coinbase_hash = format!("0x{}", blake3::hash(
         format!("coinbase:{height}:{miner}:{reward}:{timestamp}").as_bytes()
@@ -1047,13 +1072,46 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         ..LedgerTx::default()
     };
 
-    let mut stamped: Vec<LedgerTx> = txs.iter().map(|tx| {
-        let mut t = tx.clone();
+    let valid_txs: Vec<&LedgerTx> = txs.iter().filter(|tx| {
+        if tx.nonce == 0 { return true; }
+        let last = crate::ledger::last_confirmed_nonce(&tx.from);
+        if tx.nonce <= last {
+            eprintln!(
+                "[TX] {:.12} Rejected — stale nonce {} <= confirmed {} for {:.16}",
+                tx.hash, tx.nonce, last, tx.from
+            );
+            return false;
+        }
+        true
+    }).collect();
+
+    let mut stamped: Vec<LedgerTx> = valid_txs.iter().map(|tx| {
+        let mut t = (*tx).clone();
         t.block_height = Some(height);
         t.status = "Confirmed".to_string();
         t
     }).collect();
     stamped.push(coinbase);
+
+    let staking_fee = crate::tokenomics::staking_fee_share(tx_fees_sum);
+    if staking_fee > 0 {
+        let sf_hash = format!("0x{}", blake3::hash(
+            format!("stakingfee:{height}:{staking_fee}:{timestamp}").as_bytes()
+        ).to_hex());
+        stamped.push(LedgerTx {
+            hash:         sf_hash,
+            from:         NODE_POOL_ADDR.to_string(),
+            to:           STAKING_POOL_ADDR.to_string(),
+            amount:       staking_fee,
+            memo:         Some(format!("Block #{height} staking fee share")),
+            timestamp,
+            status:       "Confirmed".to_string(),
+            block_height: Some(height),
+            tx_type:      "fee_distribution".to_string(),
+            signature:    "coinbase".to_string(),
+            ..LedgerTx::default()
+        });
+    }
 
     let tx_hashes: Vec<&str> = stamped.iter().map(|t| t.hash.as_str()).collect();
     let tx_merkle_root = compute_merkle_root(&tx_hashes);
@@ -1068,7 +1126,7 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
             let is_system = tx.from.is_empty()
                 || tx.from == NODE_POOL_ADDR
                 || tx.from.starts_with("egot1faucet")
-                || tx.from.starts_with("ego1genesis");
+                || tx.from.starts_with("egot1genesis");
             if !is_system {
                 let out = tx.amount as i128 + tx.fee_uegoc as i128;
                 *deltas.entry(tx.from.clone()).or_insert(0) -= out;
@@ -1106,7 +1164,7 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
     (block, stamped)
 }
 
-pub fn commit_staged_block(block: &LedgerBlock, stamped: &[LedgerTx]) {
+pub fn commit_staged_block(block: &LedgerBlock, stamped: &[LedgerTx]) -> bool {
     let db = get_db().lock().expect("chain_db lock poisoned");
     let current_tip = {
         let cf_meta = db.cf_handle(CF_META).expect("CF_META missing");
@@ -1118,9 +1176,10 @@ pub fn commit_staged_block(block: &LedgerBlock, stamped: &[LedgerTx]) {
             "[ChainDB] commit_staged_block: block #{} rejected — tip is #{} (already committed or stale)",
             block.height, current_tip
         );
-        return;
+        return false;
     }
     write_block_batch(&db, block, stamped);
+    true
 }
 
 /// Verify that a block's hash field matches its contents.
@@ -2170,3 +2229,90 @@ pub fn restore_pending_votes_from_db() -> std::collections::HashMap<String, Vec<
     }
     out
 }
+
+// ── Web3 Hosting registry ─────────────────────────────────────────────────────
+
+pub fn save_hosted_site(name: &str, data: &serde_json::Value) {
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_HOSTING).unwrap();
+    let _ = db.put_cf(&cf, name.as_bytes(), encode(data));
+}
+
+pub fn get_hosted_site_raw(name: &str) -> Option<serde_json::Value> {
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_HOSTING).unwrap();
+    db.get_cf(&cf, name.as_bytes()).ok()?.and_then(|b| decode(&b))
+}
+
+pub fn list_hosted_sites_raw(owner: &str) -> Vec<serde_json::Value> {
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_HOSTING).unwrap();
+    db.iterator_cf(&cf, rocksdb::IteratorMode::Start)
+        .flatten()
+        .filter_map(|(_, v)| decode::<serde_json::Value>(&v))
+        .filter(|s| s["owner"].as_str() == Some(owner))
+        .collect()
+}
+
+pub fn delete_hosted_site(name: &str) {
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_HOSTING).unwrap();
+    let _ = db.delete_cf(&cf, name.as_bytes());
+}
+
+// ── Hosting node registry ─────────────────────────────────────────────────────
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct HostingNodeRecord {
+    pub node_id:   String,
+    pub endpoint:  String,
+    pub sites:     Vec<String>,
+    pub domains:   Vec<String>,
+    pub last_seen: i64,
+}
+
+pub fn upsert_hosting_node(record: &HostingNodeRecord) {
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_HOSTING_NODES).unwrap();
+    let _ = db.put_cf(&cf, record.node_id.as_bytes(), encode(record));
+}
+
+pub fn get_hosting_node(node_id: &str) -> Option<HostingNodeRecord> {
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_HOSTING_NODES).unwrap();
+    db.get_cf(&cf, node_id.as_bytes()).ok()?.and_then(|b| decode(&b))
+}
+
+pub fn list_hosting_nodes() -> Vec<HostingNodeRecord> {
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_HOSTING_NODES).unwrap();
+    db.iterator_cf(&cf, rocksdb::IteratorMode::Start)
+        .flatten()
+        .filter_map(|(_, v)| decode::<HostingNodeRecord>(&v))
+        .collect()
+}
+
+pub fn get_nodes_for_domain(domain_or_slug: &str) -> Vec<HostingNodeRecord> {
+    let target = domain_or_slug.to_lowercase();
+    let cutoff  = chrono::Utc::now().timestamp() - 300;
+    list_hosting_nodes()
+        .into_iter()
+        .filter(|n| n.last_seen >= cutoff)
+        .filter(|n| n.sites.contains(&target) || n.domains.contains(&target))
+        .collect()
+}
+
+pub fn prune_stale_hosting_nodes() {
+    let cutoff = chrono::Utc::now().timestamp() - 600;
+    let stale: Vec<String> = list_hosting_nodes()
+        .into_iter()
+        .filter(|n| n.last_seen < cutoff)
+        .map(|n| n.node_id)
+        .collect();
+    let db = get_db().lock().unwrap();
+    let cf = db.cf_handle(CF_HOSTING_NODES).unwrap();
+    for id in stale {
+        let _ = db.delete_cf(&cf, id.as_bytes());
+    }
+}
+

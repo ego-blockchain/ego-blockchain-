@@ -346,6 +346,12 @@ pub async fn run_batch_loop() {
 
         if !should_seal { continue; }
 
+        if !crate::p2p::get_known_validators_snapshot().is_empty() {
+            last_block_at    = Instant::now();
+            batch_started_at = None;
+            continue;
+        }
+
         let miner = match get_miner_address() {
             Some(a) => a,
             None    => continue,
