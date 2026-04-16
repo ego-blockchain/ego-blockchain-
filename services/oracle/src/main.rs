@@ -1,3 +1,4 @@
+mod acme;
 mod dns;
 
 use axum::{
@@ -109,6 +110,7 @@ pub struct AppState {
     pub client:        Client,
     pub hosting_nodes: Arc<RwLock<HostingNodes>>,
     pub ego_nodes:     Arc<RwLock<Vec<String>>>,
+    pub acme:          Arc<acme::AcmeState>,
 }
 
 const EGOC_USD: f64 = 0.01;
@@ -290,6 +292,33 @@ async fn handle_nodes_register(
     StatusCode::OK
 }
 
+// ── Handlers: TLS cert automation (Let's Encrypt DNS-01) ─────────────────
+
+#[derive(serde::Deserialize)]
+struct CertRequest { domain: String }
+
+async fn handle_cert_request(
+    State(state): State<AppState>,
+    Json(body): Json<CertRequest>,
+) -> impl IntoResponse {
+    let domain = body.domain.trim().to_lowercase();
+    if domain.is_empty() || !domain.contains('.') {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid domain" })));
+    }
+    state.acme.request(domain.clone()).await;
+    (StatusCode::ACCEPTED, Json(json!({ "domain": domain, "status": "pending" })))
+}
+
+async fn handle_cert_status(
+    State(state): State<AppState>,
+    Path(domain): Path<String>,
+) -> impl IntoResponse {
+    match state.acme.status(&domain).await {
+        Some(status) => (StatusCode::OK, Json(serde_json::to_value(&status).unwrap_or_default())),
+        None         => (StatusCode::NOT_FOUND, Json(json!({ "error": "no cert request found" }))),
+    }
+}
+
 // ── Handler: health ───────────────────────────────────────────────────────────
 
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
@@ -326,12 +355,15 @@ async fn main() {
     let mut initial_prices: PriceMap = HashMap::new();
     initial_prices.insert("EGOC".to_string(), PriceEntry { usd: EGOC_USD, updated_at: Utc::now().timestamp(), stale: false });
 
+    let acme_state = acme::AcmeState::new();
+
     let state = AppState {
         prices:        Arc::new(RwLock::new(initial_prices)),
         chain:         Arc::new(RwLock::new(ChainState::default())),
         client,
         hosting_nodes: Arc::new(RwLock::new(HashMap::new())),
         ego_nodes:     Arc::new(RwLock::new(Vec::new())),
+        acme:          acme_state,
     };
 
     tokio::spawn(price_refresh_task(state.clone()));
@@ -343,9 +375,10 @@ async fn main() {
         .collect::<Vec<_>>()
         .try_into()
         .unwrap_or([127, 0, 0, 1]);
-    let dns_nodes = state.hosting_nodes.clone();
+    let dns_nodes      = state.hosting_nodes.clone();
+    let dns_challenges = state.acme.challenges.clone();
     tokio::spawn(async move {
-        dns::run_dns_server(relay_ip, dns_upstream, dns_nodes).await;
+        dns::run_dns_server(relay_ip, dns_upstream, dns_nodes, dns_challenges).await;
     });
 
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
@@ -361,6 +394,8 @@ async fn main() {
         .route("/hosting/announce",         post(handle_hosting_announce))
         .route("/hosting/nodes/:domain",    get(handle_hosting_nodes))
         .route("/nodes/register",           post(handle_nodes_register))
+        .route("/cert/request",             post(handle_cert_request))
+        .route("/cert/status/:domain",      get(handle_cert_status))
         .layer(cors)
         .with_state(state);
 
