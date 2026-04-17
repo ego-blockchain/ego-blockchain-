@@ -473,16 +473,30 @@ fn serve_html_injected(path: &std::path::Path, site_name: &str) -> Response {
 }
 
 fn resolve_site_base(name: &str) -> Option<std::path::PathBuf> {
-    let raw = crate::chain_db::get_hosted_site_raw(name)?;
+    let raw   = crate::chain_db::get_hosted_site_raw(name)?;
     let owner = raw["owner"].as_str()?.to_string();
-    let base = crate::commands::hosting::site_dir(&owner, name);
-    if base.exists() { Some(base) } else { None }
+    let base  = crate::commands::hosting::hosting_base_dir()
+        .join(&owner)
+        .join(name);
+    if base.is_dir() && std::fs::read_dir(&base).map(|mut d| d.next().is_some()).unwrap_or(false) {
+        Some(base)
+    } else {
+        None
+    }
 }
 
 async fn gateway_index(Path(name): Path<String>) -> Response {
     let base = match resolve_site_base(&name) {
         Some(b) => b,
-        None    => return (StatusCode::NOT_FOUND, "Site not found").into_response(),
+        None => {
+            let in_db = crate::chain_db::get_hosted_site_raw(&name).is_some();
+            let msg = if in_db {
+                format!("Site '{}' is registered but has no files on disk. Please re-deploy it.", name)
+            } else {
+                format!("Site '{}' not found.", name)
+            };
+            return (StatusCode::NOT_FOUND, msg).into_response();
+        }
     };
     let index = base.join("index.html");
     if index.exists() {
