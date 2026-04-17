@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { open as shellOpen } from '@tauri-apps/api/shell';
-import { open as dialogOpen } from '@tauri-apps/api/dialog';
+import { open as dialogOpen, confirm as dialogConfirm } from '@tauri-apps/api/dialog';
 import { readDir, readBinaryFile } from '@tauri-apps/api/fs';
 
 interface SiteFile {
@@ -250,7 +250,11 @@ const HostingPage: React.FC = () => {
   }
 
   async function undeploy(site: HostedSite) {
-    if (!confirm(`Remove "${site.custom_domain ?? site.name}"? This cannot be undone.`)) return;
+    const ok = await dialogConfirm(
+      `Remove "${site.custom_domain ?? site.name}"? This cannot be undone.`,
+      { title: 'Remove Site', type: 'warning' }
+    );
+    if (!ok) return;
     try {
       await invoke('undeploy_site', { name: site.name });
       if (justDeployed?.name === site.name) setJustDeployed(null);
