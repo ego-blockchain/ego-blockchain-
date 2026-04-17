@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { open as shellOpen } from '@tauri-apps/api/shell';
+import { open as dialogOpen } from '@tauri-apps/api/dialog';
+import { readDir, readBinaryFile } from '@tauri-apps/api/fs';
 
 interface SiteFile {
   path: string;
@@ -27,6 +29,12 @@ interface FinalizeFileEntry {
   cid: string;
   mime_type: string;
   size: number;
+}
+
+interface FlatFile {
+  absolutePath: string;
+  relativePath: string;
+  name: string;
 }
 
 const NS1 = 'ns1.egoblockchain.com';
@@ -72,13 +80,31 @@ function mimeForFile(name: string): string {
   return map[ext] ?? 'application/octet-stream';
 }
 
-async function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve((reader.result as string).split(',')[1]);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function flattenDir(entries: any[], folderPath: string, base: string): FlatFile[] {
+  const sep = folderPath.includes('\\') ? '\\' : '/';
+  const result: FlatFile[] = [];
+  for (const entry of entries) {
+    if (entry.children) {
+      result.push(...flattenDir(entry.children, folderPath, base));
+    } else if (entry.path) {
+      const rel = entry.path.replace(base, '').replace(/\\/g, '/');
+      result.push({
+        absolutePath: entry.path,
+        relativePath: rel.startsWith('/') ? rel : '/' + rel,
+        name: entry.name ?? entry.path.split(sep).pop() ?? '',
+      });
+    }
+  }
+  return result;
 }
 
 const MAX_SITE_SIZE = 2 * 1024 * 1024 * 1024;
@@ -97,12 +123,10 @@ function NsCard({ domain }: { domain: string }) {
       <div className="font-semibold text-blue-300">
         One step — change your nameservers
       </div>
-
       <div className="text-xs text-gray-400 leading-relaxed">
         Log in to wherever you bought <span className="text-white font-mono">{domain}</span> (GoDaddy, Namecheap, etc.),
         find <strong className="text-white">Nameservers</strong> or <strong className="text-white">NS records</strong>, and replace them with:
       </div>
-
       <div className="space-y-1.5">
         {[NS1, NS2].map((ns, i) => (
           <div key={ns} className="bg-gray-900 rounded-lg flex items-center overflow-hidden font-mono text-xs">
@@ -117,13 +141,11 @@ function NsCard({ domain }: { domain: string }) {
           </div>
         ))}
       </div>
-
       <div className="text-xs text-gray-500 leading-relaxed">
         That's it. Ego's network resolves your domain — files are stored and served
         by Ego nodes across the network, not from any single server.
         DNS changes take a few minutes to 48h to propagate.
       </div>
-
       <div className="text-xs text-gray-600">
         Once done, <span className="text-white font-mono">https://{domain}</span> goes live.
       </div>
@@ -138,51 +160,44 @@ const HostingPage: React.FC = () => {
   const [deployProgress, setDeployProgress] = useState('');
   const [error, setError]         = useState('');
   const [domainInput, setDomainInput] = useState('');
-  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
-  const [pendingSize, setPendingSize]   = useState(0);
+  const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
+  const [folderName, setFolderName]         = useState('');
+  const [folderFileCount, setFolderFileCount] = useState(0);
   const [expandedSite, setExpandedSite] = useState<string | null>(null);
   const [justDeployed, setJustDeployed] = useState<{ domain: string; name: string } | null>(null);
   const [copiedUrl, setCopiedUrl] = useState('');
-  const dirInputRef  = useRef<HTMLInputElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const load = () => {
     invoke<HostedSite[]>('get_hosted_sites')
       .then(setSites).catch(() => {}).finally(() => setLoading(false));
   };
 
-  useEffect(() => {
-    load();
-    if (dirInputRef.current) {
-      dirInputRef.current.setAttribute('webkitdirectory', '');
-      dirInputRef.current.setAttribute('directory', '');
-      dirInputRef.current.setAttribute('multiple', '');
+  useEffect(() => { load(); }, []);
+
+  async function pickFolder() {
+    try {
+      const result = await dialogOpen({ directory: true, multiple: false, title: 'Select website folder' });
+      if (!result || Array.isArray(result)) return;
+      const folder = result as string;
+      setSelectedFolder(folder);
+      setFolderName(folder.replace(/\\/g, '/').split('/').pop() || folder);
+      setError('');
+      const entries = await readDir(folder, { recursive: true });
+      const files = flattenDir(entries, folder, folder);
+      setFolderFileCount(files.length);
+    } catch (e: any) {
+      setError(String(e));
     }
-  }, []);
-
-  function stageFiles(fileList: FileList) {
-    const files = Array.from(fileList);
-    if (!files.length) return;
-    const totalSize = files.reduce((s, f) => s + f.size, 0);
-    if (totalSize > MAX_SITE_SIZE) { setError('Total site size exceeds 2 GB.'); return; }
-    setPendingFiles(files);
-    setPendingSize(totalSize);
-    setError('');
-  }
-
-  function handleFileInput(e: React.ChangeEvent<HTMLInputElement>) {
-    if (e.target.files?.length) stageFiles(e.target.files);
-    e.target.value = '';
   }
 
   const domain = domainInput.trim().toLowerCase()
     .replace(/^https?:\/\//, '').replace(/\/$/, '');
   const isValidDomain = domain.length >= 3 && domain.includes('.');
   const slug = isValidDomain ? slugFromDomain(domain) : '';
-  const canDeploy = !deploying && isValidDomain && pendingFiles.length > 0;
+  const canDeploy = !deploying && isValidDomain && selectedFolder !== null;
 
   async function deploy() {
-    if (!canDeploy) return;
+    if (!canDeploy || !selectedFolder) return;
     setDeploying(true);
     setError('');
 
@@ -190,32 +205,41 @@ const HostingPage: React.FC = () => {
       setDeployProgress('Preparing…');
       await invoke('deploy_site_begin', { name: slug });
 
-      const entries: FinalizeFileEntry[] = [];
+      const entries = await readDir(selectedFolder, { recursive: true });
+      const files   = flattenDir(entries, selectedFolder, selectedFolder);
 
-      for (let i = 0; i < pendingFiles.length; i++) {
-        const file = pendingFiles[i];
+      if (files.length === 0) { throw new Error('No files found in selected folder.'); }
+
+      const finalized: FinalizeFileEntry[] = [];
+      let totalSize = 0;
+
+      for (let i = 0; i < files.length; i++) {
+        const file  = files[i];
         const label = file.name.length > 30 ? '…' + file.name.slice(-27) : file.name;
-        setDeployProgress(`Uploading ${i + 1} / ${pendingFiles.length} — ${label}`);
+        setDeployProgress(`Uploading ${i + 1} / ${files.length} — ${label}`);
 
-        const content_base64 = await fileToBase64(file);
-        const rel  = (file as any).webkitRelativePath || file.name;
-        const path = rel.includes('/') ? '/' + rel.split('/').slice(1).join('/') : '/' + rel;
+        const bytes          = await readBinaryFile(file.absolutePath);
+        const content_base64 = bytesToBase64(bytes);
+        totalSize += bytes.length;
+
+        if (totalSize > MAX_SITE_SIZE) { throw new Error('Total site size exceeds 2 GB.'); }
 
         const result = await invoke<{ cid: string; size: number }>('deploy_site_file', {
           name: slug,
-          file: { path, content_base64, mime_type: mimeForFile(file.name) },
+          file: { path: file.relativePath, content_base64, mime_type: mimeForFile(file.name) },
         });
-        entries.push({ path, cid: result.cid, mime_type: mimeForFile(file.name), size: result.size });
+        finalized.push({ path: file.relativePath, cid: result.cid, mime_type: mimeForFile(file.name), size: result.size });
       }
 
       setDeployProgress('Publishing to network…');
-      await invoke<HostedSite>('finalize_deploy', { name: slug, files: entries });
+      await invoke<HostedSite>('finalize_deploy', { name: slug, files: finalized });
       await invoke('set_custom_domain', { name: slug, domain });
 
       setJustDeployed({ domain, name: slug });
       setDomainInput('');
-      setPendingFiles([]);
-      setPendingSize(0);
+      setSelectedFolder(null);
+      setFolderName('');
+      setFolderFileCount(0);
       load();
     } catch (e: any) {
       setError(String(e));
@@ -282,59 +306,38 @@ const HostingPage: React.FC = () => {
 
         <div>
           <label className="text-xs font-medium text-gray-400 block mb-1.5">Website folder</label>
-          <div
-            className={`border-2 border-dashed rounded-xl transition-colors ${
-              deploying ? 'border-blue-500/40 cursor-default' : 'border-gray-600 hover:border-blue-500/50 cursor-pointer'
-            }`}
-            onClick={() => !deploying && dirInputRef.current?.click()}
-            onDragOver={e => e.preventDefault()}
-            onDrop={e => { e.preventDefault(); if (!deploying && e.dataTransfer.files.length) stageFiles(e.dataTransfer.files); }}
-          >
-            <input ref={dirInputRef} type="file" className="hidden" onChange={handleFileInput} />
-            <input ref={fileInputRef} type="file" className="hidden" multiple onChange={handleFileInput} />
 
-            {deploying ? (
-              <div className="py-8 text-center space-y-3">
-                <div className="text-2xl animate-pulse">🚀</div>
-                <div className="text-sm text-blue-400 font-medium">{deployProgress}</div>
-                <div className="w-48 mx-auto bg-gray-700 rounded-full h-1">
-                  <div className="bg-blue-500 h-1 rounded-full animate-pulse w-full" />
-                </div>
+          {deploying ? (
+            <div className="border-2 border-dashed border-blue-500/40 rounded-xl py-8 text-center space-y-3">
+              <div className="text-2xl animate-pulse">🚀</div>
+              <div className="text-sm text-blue-400 font-medium">{deployProgress}</div>
+              <div className="w-48 mx-auto bg-gray-700 rounded-full h-1">
+                <div className="bg-blue-500 h-1 rounded-full animate-pulse w-full" />
               </div>
-            ) : pendingFiles.length > 0 ? (
-              <div className="py-5 px-4 text-center">
-                <div className="text-green-400 font-semibold text-sm mb-1">
-                  {pendingFiles.length} file{pendingFiles.length !== 1 ? 's' : ''} · {fmtBytes(pendingSize)}
-                </div>
-                <div className="text-xs text-gray-500 space-y-0.5 max-h-20 overflow-hidden">
-                  {pendingFiles.slice(0, 5).map((f, i) => {
-                    const rel  = (f as any).webkitRelativePath || f.name;
-                    const path = rel.includes('/') ? rel.split('/').slice(1).join('/') : rel;
-                    return <div key={i} className="font-mono truncate">{path}</div>;
-                  })}
-                  {pendingFiles.length > 5 && <div className="text-gray-600">+{pendingFiles.length - 5} more files</div>}
-                </div>
-                <button
-                  className="mt-2 text-xs text-gray-500 underline"
-                  onClick={e => { e.stopPropagation(); setPendingFiles([]); setPendingSize(0); }}
-                >
-                  Change folder
-                </button>
+            </div>
+          ) : selectedFolder ? (
+            <div className="border-2 border-dashed border-green-500/40 rounded-xl py-5 px-4 text-center space-y-2">
+              <div className="text-green-400 font-semibold text-sm">{folderName}</div>
+              <div className="text-xs text-gray-500">
+                {folderFileCount > 0 ? `${folderFileCount} file${folderFileCount !== 1 ? 's' : ''}` : 'Reading…'}
               </div>
-            ) : (
-              <div className="py-10 text-center">
-                <div className="text-4xl mb-3">📂</div>
-                <div className="text-sm text-gray-300 font-medium">Drop your website folder here</div>
-                <div className="text-xs text-gray-500 mt-1">HTML, CSS, JS, images — up to 2 GB</div>
-                <button
-                  className="mt-3 text-xs text-blue-400 underline"
-                  onClick={e => { e.stopPropagation(); fileInputRef.current?.click(); }}
-                >
-                  or select individual files
-                </button>
-              </div>
-            )}
-          </div>
+              <button
+                className="text-xs text-gray-500 underline"
+                onClick={() => { setSelectedFolder(null); setFolderName(''); setFolderFileCount(0); }}
+              >
+                Change folder
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={pickFolder}
+              className="w-full border-2 border-dashed border-gray-600 hover:border-blue-500/50 rounded-xl py-10 text-center transition-colors"
+            >
+              <div className="text-4xl mb-3">📂</div>
+              <div className="text-sm text-gray-300 font-medium">Click to select your website folder</div>
+              <div className="text-xs text-gray-500 mt-1">HTML, CSS, JS, images — up to 2 GB</div>
+            </button>
+          )}
         </div>
 
         {error && (
@@ -350,8 +353,8 @@ const HostingPage: React.FC = () => {
             ? deployProgress || 'Deploying…'
             : !isValidDomain
               ? 'Enter your domain to continue'
-              : pendingFiles.length === 0
-                ? 'Add your website folder'
+              : selectedFolder === null
+                ? 'Select your website folder'
                 : `Publish ${domain}`}
         </button>
       </div>
@@ -413,9 +416,7 @@ const HostingPage: React.FC = () => {
 
                     {expandedSite === site.name && (
                       <div className="px-5 pb-4 space-y-3">
-                        {site.custom_domain && (
-                          <NsCard domain={site.custom_domain} />
-                        )}
+                        {site.custom_domain && <NsCard domain={site.custom_domain} />}
                         <div className="bg-gray-900 rounded-xl overflow-hidden">
                           <div className="max-h-36 overflow-y-auto divide-y divide-gray-700/30">
                             {site.files.map(f => (
