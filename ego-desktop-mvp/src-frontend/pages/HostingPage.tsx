@@ -89,18 +89,21 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-function flattenDir(entries: any[], folderPath: string, base: string): FlatFile[] {
-  const sep = folderPath.includes('\\') ? '\\' : '/';
+function flattenDir(entries: any[], _folderPath: string, base: string): FlatFile[] {
+  const normBase = base.replace(/\\/g, '/').replace(/\/+$/, '');
   const result: FlatFile[] = [];
   for (const entry of entries) {
     if (entry.children) {
-      result.push(...flattenDir(entry.children, folderPath, base));
+      result.push(...flattenDir(entry.children, _folderPath, base));
     } else if (entry.path) {
-      const rel = entry.path.replace(base, '').replace(/\\/g, '/');
+      const normPath = entry.path.replace(/\\/g, '/');
+      const rel = normPath.startsWith(normBase)
+        ? normPath.slice(normBase.length)
+        : '/' + normPath.split('/').pop();
       result.push({
         absolutePath: entry.path,
         relativePath: rel.startsWith('/') ? rel : '/' + rel,
-        name: entry.name ?? entry.path.split(sep).pop() ?? '',
+        name: entry.name ?? normPath.split('/').pop() ?? '',
       });
     }
   }
@@ -273,6 +276,7 @@ const HostingPage: React.FC = () => {
       const files   = flattenDir(entries, selectedFolder, selectedFolder);
 
       if (files.length === 0) { throw new Error('No files found in selected folder.'); }
+      console.log('[deploy] files:', files.map(f => f.relativePath));
 
       const finalized: FinalizeFileEntry[] = [];
       let totalSize = 0;
