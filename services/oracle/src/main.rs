@@ -271,7 +271,7 @@ async fn handle_hosting_nodes(
     let now = Utc::now().timestamp();
     let nodes = state.hosting_nodes.read().await;
     let matching: Vec<&HostingNodeRecord> = nodes.values()
-        .filter(|n| n.last_seen > now - 300)
+        .filter(|n| n.last_seen > now - 900)
         .filter(|n| n.domains.iter().any(|d| d == &domain) || n.sites.iter().any(|s| s == &domain))
         .collect();
     Json(json!({ "domain": domain, "nodes": matching }))
