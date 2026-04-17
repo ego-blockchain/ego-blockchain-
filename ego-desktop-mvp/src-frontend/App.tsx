@@ -260,7 +260,7 @@ function App() {
     invoke('hosting_heartbeat').catch(() => {});
     const id = setInterval(() => {
       invoke('hosting_heartbeat').catch(() => {});
-    }, 60_000);
+    }, 300_000);
     return () => clearInterval(id);
   }, [wallet?.address]);
 

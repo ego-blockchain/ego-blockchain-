@@ -74,7 +74,7 @@ async fn resolve_hosting(domain: &str, hosting_nodes: &Arc<RwLock<HostingNodes>>
     let nodes = hosting_nodes.read().await;
     let mut ips = Vec::new();
     for node in nodes.values() {
-        if node.last_seen < now - 300 { continue; }
+        if node.last_seen < now - 900 { continue; }
         let serves = node.domains.iter().any(|d| d == domain)
             || node.sites.iter().any(|s| s == domain);
         if serves {
@@ -135,7 +135,7 @@ fn build_multi_a_response(query: &[u8], ips: &[[u8; 4]]) -> Vec<u8> {
         r.extend_from_slice(&[0xC0, 0x0C]);
         r.extend_from_slice(&[0x00, 0x01]);
         r.extend_from_slice(&[0x00, 0x01]);
-        r.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]);
+        r.extend_from_slice(&[0x00, 0x00, 0x01, 0x2C]);
         r.extend_from_slice(&[0x00, 0x04]);
         r.extend_from_slice(ip);
     }
@@ -156,7 +156,7 @@ fn build_txt_response(query: &[u8], txt: &str) -> Vec<u8> {
     r.extend_from_slice(&[0xC0, 0x0C]);
     r.extend_from_slice(&[0x00, 0x10]);
     r.extend_from_slice(&[0x00, 0x01]);
-    r.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]);
+    r.extend_from_slice(&[0x00, 0x00, 0x01, 0x2C]);
     r.extend_from_slice(&rdlength.to_be_bytes());
     r.push(txt_bytes.len() as u8);
     r.extend_from_slice(txt_bytes);
