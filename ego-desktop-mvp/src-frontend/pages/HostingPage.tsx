@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { open as shellOpen } from '@tauri-apps/api/shell';
-import { open as dialogOpen, confirm as dialogConfirm } from '@tauri-apps/api/dialog';
+import { open as dialogOpen } from '@tauri-apps/api/dialog';
 import { readDir, readBinaryFile } from '@tauri-apps/api/fs';
 
 interface SiteFile {
@@ -153,6 +153,69 @@ function NsCard({ domain }: { domain: string }) {
   );
 }
 
+function RemoveModal({ site, onConfirm, onCancel }: {
+  site: HostedSite;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const label = site.custom_domain ?? site.name;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onClick={onCancel}>
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
+      <div
+        className="relative w-full max-w-sm bg-gray-800 border border-gray-700 rounded-2xl shadow-2xl p-6 space-y-5"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-start gap-4">
+          <div className="w-10 h-10 rounded-xl bg-red-500/15 border border-red-500/30 flex items-center justify-center shrink-0">
+            <svg className="w-5 h-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+            </svg>
+          </div>
+          <div>
+            <div className="font-semibold text-white">Remove site</div>
+            <div className="text-sm text-gray-400 mt-1">
+              This will permanently remove <span className="text-white font-mono">{label}</span> and all its files from the network.
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-gray-900 rounded-xl px-4 py-3 text-xs text-gray-500 space-y-1">
+          <div className="flex justify-between">
+            <span>Files</span>
+            <span className="text-gray-300">{site.file_count}</span>
+          </div>
+          <div className="flex justify-between">
+            <span>Size</span>
+            <span className="text-gray-300">{fmtBytes(site.total_size)}</span>
+          </div>
+          {site.custom_domain && (
+            <div className="flex justify-between">
+              <span>Domain</span>
+              <span className="text-gray-300 font-mono">{site.custom_domain}</span>
+            </div>
+          )}
+        </div>
+
+        <div className="flex gap-3">
+          <button
+            onClick={onCancel}
+            className="flex-1 py-2.5 bg-gray-700 hover:bg-gray-600 rounded-xl text-sm font-medium transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            className="flex-1 py-2.5 bg-red-600 hover:bg-red-500 rounded-xl text-sm font-semibold transition-colors"
+          >
+            Remove
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const HostingPage: React.FC = () => {
   const [sites, setSites]         = useState<HostedSite[]>([]);
   const [loading, setLoading]     = useState(true);
@@ -166,6 +229,7 @@ const HostingPage: React.FC = () => {
   const [expandedSite, setExpandedSite] = useState<string | null>(null);
   const [justDeployed, setJustDeployed] = useState<{ domain: string; name: string } | null>(null);
   const [copiedUrl, setCopiedUrl] = useState('');
+  const [removingSite, setRemovingSite] = useState<HostedSite | null>(null);
 
   const load = () => {
     invoke<HostedSite[]>('get_hosted_sites')
@@ -250,11 +314,13 @@ const HostingPage: React.FC = () => {
   }
 
   async function undeploy(site: HostedSite) {
-    const ok = await dialogConfirm(
-      `Remove "${site.custom_domain ?? site.name}"? This cannot be undone.`,
-      { title: 'Remove Site', type: 'warning' }
-    );
-    if (!ok) return;
+    setRemovingSite(site);
+  }
+
+  async function confirmUndeploy() {
+    if (!removingSite) return;
+    const site = removingSite;
+    setRemovingSite(null);
     try {
       await invoke('undeploy_site', { name: site.name });
       if (justDeployed?.name === site.name) setJustDeployed(null);
@@ -272,6 +338,14 @@ const HostingPage: React.FC = () => {
 
   return (
     <div className="p-6 space-y-5 max-w-2xl mx-auto">
+
+      {removingSite && (
+        <RemoveModal
+          site={removingSite}
+          onConfirm={confirmUndeploy}
+          onCancel={() => setRemovingSite(null)}
+        />
+      )}
 
       <div>
         <h2 className="text-xl font-bold">Web Hosting</h2>
