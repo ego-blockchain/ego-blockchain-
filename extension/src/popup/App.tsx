@@ -963,7 +963,7 @@ function SendScreen({
     if (!to || !amount) { setError('Fill in all fields'); return; }
     const amtNum = parseFloat(amount);
     if (isNaN(amtNum) || amtNum <= 0) { setError('Invalid amount'); return; }
-    if (!to.startsWith('0x') || to.length !== 42) { setError('Invalid address (must be 0x + 40 hex chars)'); return; }
+    if (!to.startsWith('egot1')) { setError('Invalid address (must start with egot1)'); return; }
 
     setLoading(true);
     setError('');
@@ -1001,7 +1001,7 @@ function SendScreen({
           <p className="text-xs text-gray-400">From</p>
           <p className="font-mono text-sm text-gray-200">{shortAddress(address)}</p>
         </div>
-        <Input label="Recipient Address" value={to} onChange={setTo} placeholder="0x…" />
+        <Input label="Recipient Address" value={to} onChange={setTo} placeholder="egot1…" />
         <Input label="Amount (EGOC)" type="number" value={amount} onChange={setAmount} placeholder="0.00" />
         <Input label="Memo (optional)" value={memo} onChange={setMemo} placeholder="Optional note" />
         <ErrorBox message={error} />

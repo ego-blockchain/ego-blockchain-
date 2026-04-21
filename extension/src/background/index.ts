@@ -72,7 +72,7 @@ function getRpcUrl(network?: 'testnet' | 'mainnet'): string {
 async function generateWallet(password: string): Promise<ExtResponse<{ address: string; mnemonic: string[] }>> {
   const seed = generateSeed();
   const { publicKey } = seedToKeypair(seed);
-  const address = await publicKeyToAddress(publicKey);
+  const address = publicKeyToAddress(publicKey);
   const mnemonic = await seedToMnemonic(seed);
   const encryptedSeed = await encryptSeed(seed, password);
   const publicKeyHex = Array.from(publicKey).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -110,7 +110,7 @@ async function importWallet(
   }
 
   const { publicKey } = seedToKeypair(seed);
-  const address = await publicKeyToAddress(publicKey);
+  const address = publicKeyToAddress(publicKey);
   const encryptedSeed = await encryptSeed(seed, password);
   const publicKeyHex = Array.from(publicKey).map(b => b.toString(16).padStart(2, '0')).join('');
 

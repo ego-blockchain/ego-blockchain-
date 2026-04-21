@@ -1,4 +1,6 @@
 import nacl from 'tweetnacl';
+import { blake2s } from 'blakejs';
+import { bech32 } from 'bech32';
 
 const WORDLIST: string[] = [
   'abandon','ability','able','about','above','absent','absorb','abstract',
@@ -122,11 +124,10 @@ export function seedToKeypair(seed: Uint8Array): { privateKey: Uint8Array; publi
   };
 }
 
-export async function publicKeyToAddress(pubkey: Uint8Array): Promise<string> {
-  const hashBuf = await crypto.subtle.digest('SHA-256', pubkey);
-  const hashBytes = new Uint8Array(hashBuf);
-  const last20 = hashBytes.slice(12);
-  return '0x' + Array.from(last20).map(b => b.toString(16).padStart(2, '0')).join('');
+export function publicKeyToAddress(pubkey: Uint8Array): string {
+  const hash = blake2s(pubkey, undefined, 20);
+  const words = bech32.toWords(hash);
+  return bech32.encode('egot', words);
 }
 
 export interface TxPayload {
