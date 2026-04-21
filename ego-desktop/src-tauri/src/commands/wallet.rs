@@ -218,17 +218,11 @@ pub async fn send_transaction(
 
     {
         let to_email = ledger.registered_email.clone();
-        let amount_egoc = format!("{:.6} EGOC", request.amount as f64 / 1_000_000.0);
-        let recipient = request.to_address.clone();
-        let hash_copy = tx_hash.clone();
         if !to_email.is_empty() {
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = crate::email::send_tx_confirmation(
-                    &to_email, &amount_egoc, &recipient, &hash_copy,
-                ).await {
-                    eprintln!("[Email] TX confirmation failed: {e}");
-                }
-            });
+            let amount_egoc = format!("{:.6} EGOC", request.amount as f64 / 1_000_000.0);
+            crate::email::send_tx_confirmation_when_mined(
+                to_email, amount_egoc, request.to_address.clone(), tx_hash.clone(),
+            );
         }
     }
 
@@ -818,15 +812,9 @@ pub async fn confirm_tx_code(
     let to_email = ledger.registered_email.clone();
     if !to_email.is_empty() {
         let amount_str = format!("{:.6} EGOC", tx.amount as f64 / 1_000_000.0);
-        let recipient  = tx.to.clone();
-        let hash_copy  = tx.hash.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(e) = crate::email::send_tx_confirmation(
-                &to_email, &amount_str, &recipient, &hash_copy,
-            ).await {
-                eprintln!("[Email] TX receipt failed: {e}");
-            }
-        });
+        crate::email::send_tx_confirmation_when_mined(
+            to_email, amount_str, tx.to.clone(), tx.hash.clone(),
+        );
     }
 
     Ok(TransactionResponse {
