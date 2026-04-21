@@ -7,7 +7,7 @@ import type {
   TxRecord,
 } from './types';
 
-export const DEFAULT_RPC_URL = 'http://127.0.0.1:8545';
+export const DEFAULT_RPC_URL = 'http://127.0.0.1:47395';
 
 async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(url, {

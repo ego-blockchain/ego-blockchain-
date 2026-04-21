@@ -1,6 +1,6 @@
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -82,6 +82,8 @@ fn is_allowed_cors_origin(origin: &str) -> bool {
         || origin.starts_with("https://localhost:")
         || origin.starts_with("http://127.0.0.1:")
         || origin.starts_with("https://127.0.0.1:")
+        || origin.starts_with("chrome-extension://")
+        || origin.starts_with("moz-extension://")
 }
 
 fn apply_cors_headers(resp: &mut Response, origin: Option<&str>) {
@@ -189,6 +191,7 @@ pub async fn start_rpc_server() {
         .route("/nodes",                  get(list_nodes))
         .route("/hosting/nodes/:domain",  get(hosting_nodes))
         .route("/hosting/announce",       post(hosting_announce))
+        .route("/faucet",                 get(faucet_handler))
         .fallback(vhost_handler)
         .with_state(subs)
         .layer(middleware::from_fn(cors_layer));
@@ -206,6 +209,46 @@ pub async fn start_rpc_server() {
 // ── Health ─────────────────────────────────────────────────────────────────────
 
 async fn health() -> &'static str { "ok" }
+
+// ── Faucet ─────────────────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct FaucetQuery {
+    to: String,
+}
+
+async fn faucet_handler(Query(q): Query<FaucetQuery>) -> Response {
+    const FAUCET_AMOUNT: u64 = 100 * 1_000_000;
+    const FAUCET_ADDR: &str = "egot1faucet000000000000000000000000000000000";
+
+    let address = q.to.trim().to_string();
+    if !address.starts_with("egot1") {
+        return Json(json!({ "success": false, "error": "invalid address: must start with egot1" })).into_response();
+    }
+
+    let ts   = chrono::Utc::now().timestamp();
+    let hash = format!("faucet{:x}{}", ts, address.len());
+
+    let tx = crate::ledger::LedgerTx {
+        hash:      hash.clone(),
+        from:      FAUCET_ADDR.into(),
+        to:        address.clone(),
+        amount:    FAUCET_AMOUNT,
+        memo:      Some("Extension faucet – 100 EGOC".into()),
+        timestamp: ts,
+        status:    "Confirmed".into(),
+        ..crate::ledger::LedgerTx::default()
+    };
+    crate::chain_db::mine_batch_db(&[tx], FAUCET_ADDR);
+
+    Json(json!({
+        "success":      true,
+        "to":           address,
+        "amount_egoc":  100,
+        "amount_uegoc": FAUCET_AMOUNT,
+        "tx_hash":      hash,
+    })).into_response()
+}
 
 async fn rpc_handler(
     State(_subs): State<Subscribers>,
