@@ -1,9 +1,9 @@
-name: Build & Deploy Ego Relay
+name: Build & Deploy Ego Oracle
 
 on:
   push:
     paths:
-      - 'bins/ego-relay/**'
+      - 'services/oracle/**'
       - '.github/workflows/relay.yml'
   workflow_dispatch:
 
@@ -23,29 +23,28 @@ jobs:
           targets: x86_64-unknown-linux-musl
 
       - name: Install musl tools
-        run: sudo apt-get install -y musl-tools perl make
+        run: sudo apt-get install -y musl-tools
 
-      - name: Build ego-relay (static Linux binary)
-        env:
-          OPENSSL_VENDORED: "1"
-        run: cargo build --release --bin ego-relay --target x86_64-unknown-linux-musl
+      - name: Build ego-oracle (static Linux binary)
+        working-directory: services/oracle
+        run: cargo build --release --target x86_64-unknown-linux-musl
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ego-relay-linux
-          path: target/x86_64-unknown-linux-musl/release/ego-relay
+          name: ego-oracle-linux
+          path: services/oracle/target/x86_64-unknown-linux-musl/release/ego-oracle
 
-      - name: Deploy to relay server
+      - name: Deploy to oracle server
         env:
           SSH_KEY:     ${{ secrets.RELAY_SSH_KEY }}
           RELAY_HOST:  ${{ secrets.RELAY_HOST }}
           RELAY_USER:  ${{ secrets.RELAY_USER }}
         if: ${{ env.SSH_KEY != '' }}
         run: |
-          echo "$SSH_KEY" > /tmp/relay_key && chmod 600 /tmp/relay_key
-          scp -i /tmp/relay_key -o StrictHostKeyChecking=no \
-            target/x86_64-unknown-linux-musl/release/ego-relay \
-            $RELAY_USER@$RELAY_HOST:/tmp/ego-relay
-          ssh -i /tmp/relay_key -o StrictHostKeyChecking=no $RELAY_USER@$RELAY_HOST \
-            'sudo mv /tmp/ego-relay /usr/local/bin/ego-relay && sudo chmod +x /usr/local/bin/ego-relay && sudo systemctl restart ego-relay || true'
+          echo "$SSH_KEY" > /tmp/oracle_key && chmod 600 /tmp/oracle_key
+          scp -i /tmp/oracle_key -o StrictHostKeyChecking=no \
+            services/oracle/target/x86_64-unknown-linux-musl/release/ego-oracle \
+            $RELAY_USER@$RELAY_HOST:/tmp/ego-oracle
+          ssh -i /tmp/oracle_key -o StrictHostKeyChecking=no $RELAY_USER@$RELAY_HOST \
+            'sudo mv /tmp/ego-oracle /usr/local/bin/ego-oracle && sudo chmod +x /usr/local/bin/ego-oracle && sudo systemctl restart ego-oracle || true'
