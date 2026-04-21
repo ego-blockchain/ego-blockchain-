@@ -2523,8 +2523,8 @@ async fn build_swarm(
                 autonat: autonat::Behaviour::new(peer_id, autonat::Config::default()),
                     ping: ping::Behaviour::new(
                         ping::Config::new()
-                            .with_interval(Duration::from_secs(15))  
-                            .with_timeout(Duration::from_secs(10)),
+                            .with_interval(Duration::from_secs(5))
+                            .with_timeout(Duration::from_secs(8)),
                     ),
                 gossipsub: gossipsub_behaviour,
                 kad:       kad_behaviour,
@@ -2742,15 +2742,20 @@ async fn handle_event(
             if relay_addrs.contains_key(&peer_id) {
                 eprintln!("[P2P] Relay {} connection closed ({} remaining)", peer_id, num_established);
                 if num_established == 0 {
-
                     eprintln!("[P2P] All relay connections gone — clearing circuit");
                     RELAY_CIRCUIT_READY.store(false, Ordering::Relaxed);
                     external_addrs.retain(|a| !a.to_string().contains("/p2p-circuit"));
                     if let Some(id) = circuit_listener.take() {
                         swarm.remove_listener(id);
                     }
+                    if let Some(base_addr) = relay_addrs.get(&peer_id) {
+                        let dial_str = format!("{}/p2p/{}", base_addr, peer_id);
+                        if let Ok(ma) = dial_str.parse::<Multiaddr>() {
+                            eprintln!("[P2P] Relay gone — immediate redial");
+                            let _ = swarm.dial(ma);
+                        }
+                    }
                 }
-
             }
             if let Some(pending) = pending_sends.remove(&peer_id) {
                 for (_, reply) in pending {
