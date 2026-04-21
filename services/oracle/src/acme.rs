@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context};
 use instant_acme::{
     Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus,
 };
-use rcgen::KeyPair;
+use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 
@@ -124,8 +124,8 @@ async fn issue_cert(domain: &str, challenges: &ChallengeMap) -> anyhow::Result<(
         return Err(anyhow!("validation timed out after 120s"));
     }
 
-    let key_pair = KeyPair::generate().context("generate key pair")?;
-    let mut params = rcgen::CertificateParams::new(vec![domain.to_string()]);
+    let key_pair = KeyPair::generate(&PKCS_ECDSA_P256_SHA256).context("generate key pair")?;
+    let mut params = rcgen::CertificateParams::new(vec![domain.to_string()]).context("cert params")?;
     params.distinguished_name = rcgen::DistinguishedName::new();
     let csr     = params.serialize_request(&key_pair).context("serialize CSR")?;
     let csr_der = csr.der();
