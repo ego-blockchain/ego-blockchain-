@@ -72,6 +72,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EGO_AI_KEY: ${{ secrets.EGO_AI_KEY }}
+          EGO_SMTP_HOST: ${{ secrets.EGO_SMTP_HOST }}
+          EGO_SMTP_USER: ${{ secrets.EGO_SMTP_USER }}
+          EGO_SMTP_PASS: ${{ secrets.EGO_SMTP_PASS }}
         with:
           projectPath: ego-desktop
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
@@ -109,6 +112,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EGO_AI_KEY: ${{ secrets.EGO_AI_KEY }}
+          EGO_SMTP_HOST: ${{ secrets.EGO_SMTP_HOST }}
+          EGO_SMTP_USER: ${{ secrets.EGO_SMTP_USER }}
+          EGO_SMTP_PASS: ${{ secrets.EGO_SMTP_PASS }}
           MACOSX_DEPLOYMENT_TARGET: '11.0'
           RUSTFLAGS: '-C target-cpu=apple-m1'
         with:
@@ -151,6 +157,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EGO_AI_KEY: ${{ secrets.EGO_AI_KEY }}
+          EGO_SMTP_HOST: ${{ secrets.EGO_SMTP_HOST }}
+          EGO_SMTP_USER: ${{ secrets.EGO_SMTP_USER }}
+          EGO_SMTP_PASS: ${{ secrets.EGO_SMTP_PASS }}
           MACOSX_DEPLOYMENT_TARGET: '10.13'
         with:
           projectPath: ego-desktop
@@ -240,6 +249,9 @@ jobs:
         working-directory: ego-desktop
         env:
           EGO_AI_KEY: ${{ secrets.EGO_AI_KEY }}
+          EGO_SMTP_HOST: ${{ secrets.EGO_SMTP_HOST }}
+          EGO_SMTP_USER: ${{ secrets.EGO_SMTP_USER }}
+          EGO_SMTP_PASS: ${{ secrets.EGO_SMTP_PASS }}
         run: npx tauri build
 
       - name: Upload Linux artifacts to release
