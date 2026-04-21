@@ -44,6 +44,7 @@ export default defineConfig({
   },
   build: {
     target: 'es2020',
+    modulePreload: { polyfill: false },
     rollupOptions: {
       input: {
         popup: resolve(__dirname, 'src/popup/index.html'),
