@@ -8,16 +8,17 @@
     "build:dev": "vite build --mode development"
   },
   "dependencies": {
+    "bech32": "^2.0.0",
+    "blakejs": "^1.2.1",
+    "qrcode-generator": "^1.4.4",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "tweetnacl": "^1.0.3",
-    "qrcode-generator": "^1.4.4"
+    "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.260",
     "@types/react": "^18.2.0",
     "@types/react-dom": "^18.2.0",
-
     "@vitejs/plugin-react": "^4.0.0",
     "typescript": "^5.0.0",
     "vite": "^5.0.0"
