@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Ego Network",
+  "version": "1.0.0",
+  "description": "Browse decentralized .ego websites on the Ego Network. No servers, no corporations.",
+  "permissions": [
+    "webNavigation",
+    "tabs",
+    "storage"
+  ],
+  "host_permissions": [
+    "*://*.ego/*",
+    "*://*.eo/*",
+    "http://localhost:47395/*",
+    "http://*/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Ego Network"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["not-found.html"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
