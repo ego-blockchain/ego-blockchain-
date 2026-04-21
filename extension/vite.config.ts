@@ -29,7 +29,7 @@ const copyStaticPlugin = {
 
       html = html.replace(/src="[^"]*popup\.js"/g, 'src="popup.js"');
       // Fix modulepreload absolute paths → relative (prepend ../ since popup/ is one level in)
-      html = html.replace(/href="\/chunks\
+      html = html.replace(/href="\/chunks\//g, 'href="../chunks/');
       writeFileSync(htmlDst, html);
 
       rmSync(resolve(distDir, 'src'), { recursive: true, force: true });
