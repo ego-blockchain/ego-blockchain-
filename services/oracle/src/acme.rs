@@ -127,8 +127,9 @@ async fn issue_cert(domain: &str, challenges: &ChallengeMap) -> anyhow::Result<(
     let key_pair = KeyPair::generate(&PKCS_ECDSA_P256_SHA256).context("generate key pair")?;
     let mut params = CertificateParams::new(vec![domain.to_string()]);
     params.distinguished_name = rcgen::DistinguishedName::new();
-    params.key_pair = Some(key_pair.clone());
+    params.key_pair = Some(key_pair);
     let cert    = Certificate::from_params(params).context("build cert params")?;
+    let key_pem = cert.serialize_private_key_pem();
     let csr_der = cert.serialize_request_der().context("serialize CSR")?;
 
     order.finalize(&csr_der).await.context("finalize order")?;
@@ -145,5 +146,5 @@ async fn issue_cert(domain: &str, challenges: &ChallengeMap) -> anyhow::Result<(
         .await
         .remove(&format!("_acme-challenge.{}", domain));
 
-    Ok((cert_chain_pem, key_pair.serialize_pem()))
+    Ok((cert_chain_pem, key_pem))
 }
