@@ -104,10 +104,13 @@ pub struct EgoExecutionEngine {
 
 impl EgoExecutionEngine {
     pub fn new() -> Arc<Self> {
+        let initial_head = crate::store::load_fork_choice()
+            .map(|s| s.head_block_hash)
+            .unwrap_or_default();
         Arc::new(Self {
             pending_payloads: Mutex::new(std::collections::HashMap::new()),
             next_payload_id:  Mutex::new(1),
-            head_hash:        Mutex::new(String::new()),
+            head_hash:        Mutex::new(initial_head),
         })
     }
 }
@@ -121,6 +124,7 @@ impl EngineApi for EgoExecutionEngine {
     ) -> Result<ForkChoiceUpdatedResult, EngineError> {
 
         *self.head_hash.lock().await = state.head_block_hash.clone();
+        crate::store::save_fork_choice(&state);
 
         let payload_id = if let Some(attrs) = attributes {
 

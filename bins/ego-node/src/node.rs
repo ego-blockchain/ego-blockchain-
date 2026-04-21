@@ -222,6 +222,7 @@ impl Node {
         for account in crate::store::load_all_accounts() {
             state_manager.set_account(account);
         }
+        state_manager.set_reward_pool_uegoc(crate::store::load_reward_pool());
 
         let porep_prover = if roles_set.contains(&NodeRole::StorageProvider) {
             let keypair = keystore.keypair().clone();
@@ -1096,6 +1097,23 @@ impl Node {
             shard_id, piece_id
         );
         Ok(())
+    }
+
+    pub fn evict_expired_placements(&mut self, current_height: u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let before = self.placements.len();
+        self.placements.retain(|p| p.lease_expiry > now);
+        let after = self.placements.len();
+
+        if before > after {
+            tracing::info!("GC: evicted {} expired placements at height {}", before - after, current_height);
+        }
+
+        let _ = self.state_manager.prune_expired_storage(ego_core::BlockHeight(current_height));
     }
 
     pub fn subscribe_to_topics(&mut self) -> anyhow::Result<()> {

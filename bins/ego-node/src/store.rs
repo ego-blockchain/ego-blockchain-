@@ -1,8 +1,7 @@
-
 use ego_core::Account;
 use rocksdb::{ColumnFamilyDescriptor, DBCompressionType, IteratorMode, Options, WriteBatch, DB};
 use serde_json::Value;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 const BLOCK_CAP: u64 = 10_000;
 const TX_CAP:    u64 = 50_000;
@@ -10,12 +9,17 @@ const DB_PATH:   &str = "ego-node-chain.db";
 
 const CF_BLOCKS:     &str = "blocks";
 const CF_TXS:        &str = "txs";
+const CF_TX_INDEX:   &str = "tx_index";
 const CF_ACCOUNTS:   &str = "accounts";
 const CF_VALIDATORS: &str = "validators";
+const CF_META:       &str = "meta";
 
-static STORE: OnceLock<Mutex<DB>> = OnceLock::new();
+const REWARD_POOL_KEY: &[u8] = b"\x00__reward_pool__";
+const TOTAL_EMISSION_UEGOC_DEFAULT: u64 = 40_000_000 * 1_000_000;
 
-fn store() -> std::sync::MutexGuard<'static, DB> {
+static STORE: OnceLock<DB> = OnceLock::new();
+
+fn store() -> &'static DB {
     STORE.get_or_init(|| {
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -23,32 +27,36 @@ fn store() -> std::sync::MutexGuard<'static, DB> {
         opts.set_compression_type(DBCompressionType::Lz4);
 
         let cf_descs = vec![
-            ColumnFamilyDescriptor::new(CF_BLOCKS,     Options::default()),
-            ColumnFamilyDescriptor::new(CF_TXS,        Options::default()),
-            ColumnFamilyDescriptor::new(CF_ACCOUNTS,   Options::default()),
+            ColumnFamilyDescriptor::new(CF_BLOCKS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_TXS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_TX_INDEX, Options::default()),
+            ColumnFamilyDescriptor::new(CF_ACCOUNTS, Options::default()),
             ColumnFamilyDescriptor::new(CF_VALIDATORS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_META, Options::default()),
         ];
 
-        let db = DB::open_cf_descriptors(&opts, DB_PATH, cf_descs)
-            .expect("open ego-node chain store");
-        Mutex::new(db)
-    }).lock().unwrap()
+        DB::open_cf_descriptors(&opts, DB_PATH, cf_descs)
+            .expect("open ego-node chain store")
+    })
 }
 
-#[inline] fn height_key(h: u64) -> [u8; 8] { h.to_be_bytes() }
-#[inline] fn ts_hash_key(ts: i64, hash: &str) -> Vec<u8> {
+#[inline]
+fn height_key(h: u64) -> [u8; 8] {
+    h.to_be_bytes()
+}
+
+#[inline]
+fn ts_hash_key(ts: i64, hash: &str) -> Vec<u8> {
     let mut k = (ts as u64).to_be_bytes().to_vec();
     k.extend_from_slice(hash.as_bytes());
     k
 }
-
 
 pub fn insert_block(height: u64, body: &Value) {
     let db = store();
     let cf = db.cf_handle(CF_BLOCKS).unwrap();
     let _ = db.put_cf(cf, height_key(height), body.to_string().as_bytes());
 
-    // Evict oldest blocks beyond cap.
     let count = {
         let iter = db.iterator_cf(cf, IteratorMode::Start);
         iter.count() as u64
@@ -58,8 +66,12 @@ pub fn insert_block(height: u64, body: &Value) {
         let to_delete = count - BLOCK_CAP;
         let iter = db.iterator_cf(cf, IteratorMode::Start);
         for (i, item) in iter.enumerate() {
-            if i as u64 >= to_delete { break; }
-            if let Ok((k, _)) = item { batch.delete_cf(cf, k); }
+            if i as u64 >= to_delete {
+                break;
+            }
+            if let Ok((k, _)) = item {
+                batch.delete_cf(cf, k);
+            }
         }
         let _ = db.write(batch);
     }
@@ -84,7 +96,9 @@ pub fn block_exists(height: u64) -> bool {
 pub fn get_block_by_height(height: u64) -> Option<Value> {
     let db = store();
     let cf = db.cf_handle(CF_BLOCKS).unwrap();
-    db.get_cf(cf, height_key(height)).ok().flatten()
+    db.get_cf(cf, height_key(height))
+        .ok()
+        .flatten()
         .and_then(|v| serde_json::from_slice(&v).ok())
 }
 
@@ -106,29 +120,41 @@ pub fn get_blocks_range(from_height: u64, count: u64) -> Vec<Value> {
     result
 }
 
-
 pub fn insert_tx(hash: &str, ts: i64, body: &Value) {
-    if hash.is_empty() { return; }
+    if hash.is_empty() {
+        return;
+    }
+
     let db = store();
     let cf = db.cf_handle(CF_TXS).unwrap();
+    let cf_index = db.cf_handle(CF_TX_INDEX).unwrap();
     let key = ts_hash_key(ts, hash);
-    let _ = db.put_cf(cf, &key, body.to_string().as_bytes());
 
-    // Evict oldest txs beyond cap.
+    let mut batch = WriteBatch::default();
+    batch.put_cf(cf, &key, body.to_string().as_bytes());
+    batch.put_cf(cf_index, hash.as_bytes(), &key);
+
     let count = {
         let iter = db.iterator_cf(cf, IteratorMode::Start);
         iter.count() as u64
     };
     if count > TX_CAP {
-        let mut batch = WriteBatch::default();
         let to_delete = count - TX_CAP;
         let iter = db.iterator_cf(cf, IteratorMode::Start);
         for (i, item) in iter.enumerate() {
-            if i as u64 >= to_delete { break; }
-            if let Ok((k, _)) = item { batch.delete_cf(cf, k); }
+            if i as u64 >= to_delete {
+                break;
+            }
+            if let Ok((k, _)) = item {
+                if k.len() > 8 {
+                    batch.delete_cf(cf_index, &k[8..]);
+                }
+                batch.delete_cf(cf, k);
+            }
         }
-        let _ = db.write(batch);
     }
+
+    let _ = db.write(batch);
 }
 
 pub fn get_txs(limit: usize) -> Vec<Value> {
@@ -142,37 +168,27 @@ pub fn get_txs(limit: usize) -> Vec<Value> {
 }
 
 pub fn tx_exists(hash: &str) -> bool {
-    if hash.is_empty() { return false; }
-    let db = store();
-    let cf = db.cf_handle(CF_TXS).unwrap();
-    // Scan recent txs — hash is embedded in the key after the timestamp bytes.
-    let iter = db.iterator_cf(cf, IteratorMode::End);
-    for item in iter.take(1000) {
-        if let Ok((k, _)) = item {
-            if k.len() > 8 && std::str::from_utf8(&k[8..]).ok() == Some(hash) {
-                return true;
-            }
-        }
+    if hash.is_empty() {
+        return false;
     }
-    false
+    let db = store();
+    let cf_index = db.cf_handle(CF_TX_INDEX).unwrap();
+    db.get_cf(cf_index, hash.as_bytes()).ok().flatten().is_some()
 }
 
 pub fn get_tx_by_hash(hash: &str) -> Option<Value> {
-    if hash.is_empty() { return None; }
+    if hash.is_empty() {
+        return None;
+    }
     let db = store();
     let cf = db.cf_handle(CF_TXS).unwrap();
-    let iter = db.iterator_cf(cf, IteratorMode::End);
-    for item in iter.take(TX_CAP as usize) {
-        if let Ok((k, v)) = item {
-            if k.len() > 8 && std::str::from_utf8(&k[8..]).ok() == Some(hash) {
-                return serde_json::from_slice(&v).ok();
-            }
-        }
-    }
-    None
+    let cf_index = db.cf_handle(CF_TX_INDEX).unwrap();
+    let key = db.get_cf(cf_index, hash.as_bytes()).ok().flatten()?;
+    db.get_cf(cf, key)
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_slice(&v).ok())
 }
-
-// ── accounts (persisted state) ────────────────────────────────────────────────
 
 pub fn save_account(addr: &[u8; 20], account: &Account) {
     let db = store();
@@ -182,10 +198,10 @@ pub fn save_account(addr: &[u8; 20], account: &Account) {
     }
 }
 
-/// Persist multiple accounts in a single RocksDB WriteBatch.
-/// ~10× faster than individual put_cf calls for block-level flushes.
 pub fn save_accounts_batch(accounts: &[(&[u8; 20], &Account)]) {
-    if accounts.is_empty() { return; }
+    if accounts.is_empty() {
+        return;
+    }
     let db = store();
     let cf = db.cf_handle(CF_ACCOUNTS).unwrap();
     let mut batch = WriteBatch::default();
@@ -200,7 +216,9 @@ pub fn save_accounts_batch(accounts: &[(&[u8; 20], &Account)]) {
 pub fn load_account(addr: &[u8; 20]) -> Option<Account> {
     let db = store();
     let cf = db.cf_handle(CF_ACCOUNTS).unwrap();
-    db.get_cf(cf, addr as &[u8]).ok().flatten()
+    db.get_cf(cf, addr as &[u8])
+        .ok()
+        .flatten()
         .and_then(|v| serde_json::from_slice(&v).ok())
 }
 
@@ -212,8 +230,6 @@ pub fn load_all_accounts() -> Vec<Account> {
         .filter_map(|(_, v)| serde_json::from_slice(&v).ok())
         .collect()
 }
-
-// ── validators (persisted state) ──────────────────────────────────────────────
 
 pub fn save_validator_json(addr: &[u8; 20], info: &Value) {
     let db = store();
@@ -228,4 +244,39 @@ pub fn load_all_validators() -> Vec<Value> {
         .filter_map(|r| r.ok())
         .filter_map(|(_, v)| serde_json::from_slice(&v).ok())
         .collect()
+}
+
+pub fn save_reward_pool(remaining_uegoc: u64) {
+    let db = store();
+    let cf = db.cf_handle(CF_VALIDATORS).unwrap();
+    let _ = db.put_cf(cf, REWARD_POOL_KEY, remaining_uegoc.to_le_bytes());
+}
+
+pub fn load_reward_pool() -> u64 {
+    let db = store();
+    let cf = match db.cf_handle(CF_VALIDATORS) {
+        Some(cf) => cf,
+        None => return TOTAL_EMISSION_UEGOC_DEFAULT,
+    };
+    match db.get_cf(cf, REWARD_POOL_KEY) {
+        Ok(Some(ref bytes)) if bytes.len() == 8 => {
+            u64::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0; 8]))
+        }
+        _ => TOTAL_EMISSION_UEGOC_DEFAULT,
+    }
+}
+
+pub fn save_fork_choice(state: &crate::engine::ForkChoiceState) {
+    let db = store();
+    if let Some(cf) = db.cf_handle(CF_META) {
+        if let Ok(json) = serde_json::to_vec(state) {
+            let _ = db.put_cf(cf, b"fork_choice_state", json);
+        }
+    }
+}
+
+pub fn load_fork_choice() -> Option<crate::engine::ForkChoiceState> {
+    let db = store();
+    let cf = db.cf_handle(CF_META)?;
+    db.get_cf(cf, b"fork_choice_state").ok().flatten().and_then(|b| serde_json::from_slice(&b).ok())
 }

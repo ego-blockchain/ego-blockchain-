@@ -261,24 +261,11 @@ impl SecureKeystore {
         mnemonic: &str,
         transition_mode: bool,
     ) -> Result<Self, KeystoreError> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        mnemonic.hash(&mut hasher);
-        let hash = hasher.finish();
+        // Use cryptographic hash (BLAKE2s) instead of std::collections::DefaultHasher
+        let hash_output = ego_core::crypto::blake2s_hash(mnemonic.as_bytes());
 
         let mut seed = [0u8; 32];
-        seed[..8].copy_from_slice(&hash.to_be_bytes());
-        for i in 1..4 {
-            let mut hasher = DefaultHasher::new();
-            (hash.wrapping_mul(i as u64)).hash(&mut hasher);
-            let chunk = hasher.finish().to_be_bytes();
-            let start = i * 8;
-            if start + 8 <= 32 {
-                seed[start..start + 8].copy_from_slice(&chunk);
-            }
-        }
+        seed.copy_from_slice(&hash_output[..32]);
 
         Self::from_seed_with_transition_mode(seed, transition_mode)
     }

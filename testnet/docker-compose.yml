@@ -1,6 +1,5 @@
 version: "3.8"
 
-# ─── Networks ─────────────────────────────────────────────────────────────────
 networks:
   ego-testnet:
     driver: bridge
@@ -8,18 +7,44 @@ networks:
       config:
         - subnet: 172.20.0.0/16
 
-# ─── Named Volumes ────────────────────────────────────────────────────────────
 volumes:
   relay-data:
-  validator1-data:
-  validator2-data:
-  validator3-data:
-  validator4-data:
+  v1-data:
+  v2-data:
+  v3-data:
+  v4-data:
+  v5-data:
+  v6-data:
+  v7-data:
+  v8-data:
+  v9-data:
+  v10-data:
+  v11-data:
+  v12-data:
+  v13-data:
+  v14-data:
+  v15-data:
+  v16-data:
+  v17-data:
+  v18-data:
+  v19-data:
+  v20-data:
+  v21-data:
 
-# ─── Services ─────────────────────────────────────────────────────────────────
+x-validator-base: &validator-base
+  image: ego-node
+  restart: unless-stopped
+  networks:
+    - ego-testnet
+  environment:
+    EGO_DATA_DIR: /data
+    EGO_CHAIN_ID: "1399"
+    EGO_MIN_COMMITTEE: "21"
+    EGO_MIN_VALIDATORS: "21"
+    RUST_LOG: "ego_node=info,ego_consensus=debug,libp2p=warn"
+
 services:
 
-  # ── Bootstrap / Relay ───────────────────────────────────────────────────────
   relay:
     build:
       context: ..
@@ -36,7 +61,6 @@ services:
       - "8540:8545"
     volumes:
       - relay-data:/data
-      - ./data/relay:/data/local
     environment:
       EGO_DATA_DIR: /data
       RUST_LOG: info
@@ -45,140 +69,312 @@ services:
       test: ["CMD", "curl", "-f", "http://localhost:8545/health"]
       interval: 10s
       timeout: 5s
-      retries: 6
-      start_period: 15s
+      retries: 12
+      start_period: 20s
     restart: unless-stopped
     networks:
       - ego-testnet
 
-  # ── Validator 1: shards 0–7 ─────────────────────────────────────────────────
   validator1:
-    image: ego-node
+    <<: *validator-base
     hostname: validator1
     depends_on:
       relay:
         condition: service_healthy
     command: >
-      ego-node
-      --type validator
-      --port 9001
-      --shards 0,1,2,3,4,5,6,7
+      ego-node --type validator --port 9001
+      --shards 0,1,2,3,4,5,6,7,8,9,10,11
       --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
-      --storage 500
-      --bandwidth 1000
-      --metrics
-    ports:
-      - "9001:9001"
-      - "8541:8545"
-    volumes:
-      - validator1-data:/data
-      - ./data/validator1:/data/local
-    environment:
-      EGO_DATA_DIR: /data
-      RUST_LOG: info
-      EGO_CHAIN_ID: "1399"
-    restart: unless-stopped
-    networks:
-      - ego-testnet
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9001:9001", "8541:8545"]
+    volumes: ["v1-data:/data"]
 
-  # ── Validator 2: shards 8–15 ────────────────────────────────────────────────
   validator2:
-    image: ego-node
+    <<: *validator-base
     hostname: validator2
     depends_on:
       relay:
         condition: service_healthy
     command: >
-      ego-node
-      --type validator
-      --port 9002
-      --shards 8,9,10,11,12,13,14,15
+      ego-node --type validator --port 9002
+      --shards 12,13,14,15,16,17,18,19,20,21,22,23
       --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
-      --storage 500
-      --bandwidth 1000
-      --metrics
-    ports:
-      - "9002:9002"
-      - "8542:8545"
-    volumes:
-      - validator2-data:/data
-      - ./data/validator2:/data/local
-    environment:
-      EGO_DATA_DIR: /data
-      RUST_LOG: info
-      EGO_CHAIN_ID: "1399"
-    restart: unless-stopped
-    networks:
-      - ego-testnet
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9002:9002", "8542:8545"]
+    volumes: ["v2-data:/data"]
 
-  # ── Validator 3: shards 0–3, 8–11 ───────────────────────────────────────────
   validator3:
-    image: ego-node
+    <<: *validator-base
     hostname: validator3
     depends_on:
       relay:
         condition: service_healthy
     command: >
-      ego-node
-      --type validator
-      --port 9003
-      --shards 0,1,2,3,8,9,10,11
+      ego-node --type validator --port 9003
+      --shards 24,25,26,27,28,29,30,31,32,33,34,35
       --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
-      --storage 500
-      --bandwidth 1000
-      --metrics
-    ports:
-      - "9003:9003"
-      - "8543:8545"
-    volumes:
-      - validator3-data:/data
-      - ./data/validator3:/data/local
-    environment:
-      EGO_DATA_DIR: /data
-      RUST_LOG: info
-      EGO_CHAIN_ID: "1399"
-    restart: unless-stopped
-    networks:
-      - ego-testnet
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9003:9003", "8543:8545"]
+    volumes: ["v3-data:/data"]
 
-  # ── Validator 4: shards 4–7, 12–15 ──────────────────────────────────────────
   validator4:
-    image: ego-node
+    <<: *validator-base
     hostname: validator4
     depends_on:
       relay:
         condition: service_healthy
     command: >
-      ego-node
-      --type validator
-      --port 9004
-      --shards 4,5,6,7,12,13,14,15
+      ego-node --type validator --port 9004
+      --shards 36,37,38,39,40,41,42,43,44,45,46,47
       --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
-      --storage 500
-      --bandwidth 1000
-      --metrics
-    ports:
-      - "9004:9004"
-      - "8544:8545"
-    volumes:
-      - validator4-data:/data
-      - ./data/validator4:/data/local
-    environment:
-      EGO_DATA_DIR: /data
-      RUST_LOG: info
-      EGO_CHAIN_ID: "1399"
-    restart: unless-stopped
-    networks:
-      - ego-testnet
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9004:9004", "8544:8545"]
+    volumes: ["v4-data:/data"]
 
-  # ── Explorer / Nginx Load Balancer ──────────────────────────────────────────
+  validator5:
+    <<: *validator-base
+    hostname: validator5
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node --type validator --port 9005
+      --shards 48,49,50,51,52,53,54,55,56,57,58,59
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9005:9005", "8545:8545"]
+    volumes: ["v5-data:/data"]
+
+  validator6:
+    <<: *validator-base
+    hostname: validator6
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node --type validator --port 9006
+      --shards 60,61,62,63,64,65,66,67,68,69,70,71
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9006:9006", "8546:8545"]
+    volumes: ["v6-data:/data"]
+
+  validator7:
+    <<: *validator-base
+    hostname: validator7
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node --type validator --port 9007
+      --shards 72,73,74,75,76,77,78,79,80,81,82,83
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9007:9007", "8547:8545"]
+    volumes: ["v7-data:/data"]
+
+  validator8:
+    <<: *validator-base
+    hostname: validator8
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node --type validator --port 9008
+      --shards 84,85,86,87,88,89,90,91,92,93,94,95
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9008:9008", "8548:8545"]
+    volumes: ["v8-data:/data"]
+
+  validator9:
+    <<: *validator-base
+    hostname: validator9
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node --type validator --port 9009
+      --shards 96,97,98,99,100,101,102,103,104,105,106,107
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9009:9009", "8549:8545"]
+    volumes: ["v9-data:/data"]
+
+  validator10:
+    <<: *validator-base
+    hostname: validator10
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node --type validator --port 9010
+      --shards 108,109,110,111,112,113,114,115,116,117,118,119
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9010:9010", "8550:8545"]
+    volumes: ["v10-data:/data"]
+
+  validator11:
+    <<: *validator-base
+    hostname: validator11
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node --type validator --port 9011
+      --shards 120,121,122,123,124,125,126,127,128,129,130,131
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9011:9011", "8551:8545"]
+    volumes: ["v11-data:/data"]
+
+  validator12:
+    <<: *validator-base
+    hostname: validator12
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node --type validator --port 9012
+      --shards 132,133,134,135,136,137,138,139,140,141,142,143
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9012:9012", "8552:8545"]
+    volumes: ["v12-data:/data"]
+
+  validator13:
+    <<: *validator-base
+    hostname: validator13
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node --type validator --port 9013
+      --shards 144,145,146,147,148,149,150,151,152,153,154,155
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9013:9013", "8553:8545"]
+    volumes: ["v13-data:/data"]
+
+  validator14:
+    <<: *validator-base
+    hostname: validator14
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node --type validator --port 9014
+      --shards 156,157,158,159,160,161,162,163,164,165,166,167
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9014:9014", "8554:8545"]
+    volumes: ["v14-data:/data"]
+
+  validator15:
+    <<: *validator-base
+    hostname: validator15
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node --type validator --port 9015
+      --shards 168,169,170,171,172,173,174,175,176,177,178,179
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9015:9015", "8555:8545"]
+    volumes: ["v15-data:/data"]
+
+  validator16:
+    <<: *validator-base
+    hostname: validator16
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node --type validator --port 9016
+      --shards 180,181,182,183,184,185,186,187,188,189,190,191
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9016:9016", "8556:8545"]
+    volumes: ["v16-data:/data"]
+
+  validator17:
+    <<: *validator-base
+    hostname: validator17
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node --type validator --port 9017
+      --shards 192,193,194,195,196,197,198,199,200,201,202,203
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9017:9017", "8557:8545"]
+    volumes: ["v17-data:/data"]
+
+  validator18:
+    <<: *validator-base
+    hostname: validator18
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node --type validator --port 9018
+      --shards 204,205,206,207,208,209,210,211,212,213,214,215
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9018:9018", "8558:8545"]
+    volumes: ["v18-data:/data"]
+
+  validator19:
+    <<: *validator-base
+    hostname: validator19
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node --type validator --port 9019
+      --shards 216,217,218,219,220,221,222,223,224,225,226,227
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9019:9019", "8559:8545"]
+    volumes: ["v19-data:/data"]
+
+  validator20:
+    <<: *validator-base
+    hostname: validator20
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node --type validator --port 9020
+      --shards 228,229,230,231,232,233,234,235,236,237,238,239
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9020:9020", "8560:8545"]
+    volumes: ["v20-data:/data"]
+
+  validator21:
+    <<: *validator-base
+    hostname: validator21
+    depends_on:
+      relay:
+        condition: service_healthy
+    command: >
+      ego-node --type validator --port 9021
+      --shards 240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255
+      --bootstrap /dns4/egorelay/tcp/4001/p2p/12D3KooWLBwV9rP8iT1iTDrjWRLs2wQQCw9AhVzFbPfRu9iE8Uvz
+      --storage 500 --bandwidth 1000 --metrics
+    ports: ["9021:9021", "8561:8545"]
+    volumes: ["v21-data:/data"]
+
   explorer:
     image: nginx:alpine
     depends_on:
       - validator1
-      - validator2
-      - validator3
-      - validator4
+      - validator11
+      - validator21
     ports:
       - "80:80"
       - "443:443"

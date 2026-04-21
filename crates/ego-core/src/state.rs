@@ -28,6 +28,8 @@ pub fn burn_address() -> Address {
     Address::new([0u8; 20])
 }
 
+const TOTAL_EMISSION_POOL_UEGOC: u64 = 40_000_000 * 1_000_000;
+
 #[derive(Debug, Clone)]
 pub struct StateManager {
     accounts: Arc<DashMap<Address, Account>>,
@@ -56,6 +58,8 @@ pub struct StateManager {
     stats: Arc<Mutex<StateStats>>,
 
     pruning_config: PruningConfig,
+
+    reward_pool_uegoc: Arc<Mutex<u64>>,
 
     chain_id: u32,
     network_id: u32,
@@ -465,9 +469,18 @@ impl StateManager {
             da_root: Arc::new(Mutex::new(Hash::ZERO)),
             stats: Arc::new(Mutex::new(StateStats::default())),
             pruning_config: PruningConfig::default(),
+            reward_pool_uegoc: Arc::new(Mutex::new(TOTAL_EMISSION_POOL_UEGOC)),
             chain_id,
             network_id,
         }
+    }
+
+    pub fn get_reward_pool_remaining(&self) -> u64 {
+        *self.reward_pool_uegoc.lock().unwrap()
+    }
+
+    pub fn set_reward_pool_uegoc(&self, val: u64) {
+        *self.reward_pool_uegoc.lock().unwrap() = val;
     }
 
     pub fn with_pruning_config(mut self, config: PruningConfig) -> Self {
@@ -1118,7 +1131,7 @@ impl StateManager {
         expired
     }
 
-    pub fn execute_transaction(&mut self, tx: &Transaction) -> EgoResult<TransactionResult> {
+    pub fn execute_transaction(&self, tx: &Transaction) -> EgoResult<TransactionResult> {
         let mut sender = self
             .get_account(&tx.from)
             .ok_or(EgoError::AccountNotFound {
@@ -1348,7 +1361,7 @@ impl StateManager {
     }
 
     fn execute_transfer(
-        &mut self,
+        &self,
         sender: &mut Account,
         to: Address,
         amount: Balance,
@@ -1414,7 +1427,7 @@ impl StateManager {
     }
 
     fn execute_create_account(
-        &mut self,
+        &self,
         sender: &mut Account,
         account_address: Address,
         account_type: AccountType,
@@ -1460,7 +1473,7 @@ impl StateManager {
     }
 
     fn execute_update_account(
-        &mut self,
+        &self,
         sender: &mut Account,
         account_address: Address,
         updates: &crate::transaction::AccountUpdates,
@@ -1499,7 +1512,7 @@ impl StateManager {
     }
 
     fn execute_store_data(
-        &mut self,
+        &self,
         sender: &mut Account,
         chunk_id: Hash,
         data_size: u64,
@@ -1652,7 +1665,7 @@ impl StateManager {
     }
 
     fn execute_update_triad(
-        &mut self,
+        &self,
         _sender: &mut Account,
         chunk_id: Hash,
         new_placement: &crate::transaction::TriadPlacement,
@@ -1682,7 +1695,7 @@ impl StateManager {
     }
 
     fn execute_proof_batch(
-        &mut self,
+        &self,
         sender: &mut Account,
         proof_type: &ProofType,
         proofs: &[crate::transaction::ProofSubmission],
@@ -1746,7 +1759,7 @@ impl StateManager {
     }
 
     fn execute_post_response(
-        &mut self,
+        &self,
         sender: &mut Account,
         challenge_hash: Hash,
         proofs: &[crate::transaction::PoStProof],
@@ -1799,7 +1812,7 @@ impl StateManager {
     }
 
     fn execute_claim_rewards(
-        &mut self,
+        &self,
         sender: &mut Account,
         node_id: Address,
         epoch: u64,
@@ -1812,8 +1825,21 @@ impl StateManager {
             ));
         }
 
-        let adjusted_total =
-            Balance::new(((reward_buckets.total.as_u128() as f64) * drs_multiplier) as u128);
+        let raw_total = ((reward_buckets.total.as_u128() as f64) * drs_multiplier) as u64;
+
+        let payout_uegoc = {
+            let mut pool = self.reward_pool_uegoc.lock().unwrap();
+            if *pool == 0 {
+                return Err(EgoError::InvalidTransaction(
+                    "Emission pool exhausted; no block rewards remain".to_string(),
+                ));
+            }
+            let capped = raw_total.min(*pool);
+            *pool -= capped;
+            capped
+        };
+
+        let adjusted_total = Balance::new(payout_uegoc as u128);
 
         sender.credit(adjusted_total)?;
 
@@ -1859,7 +1885,7 @@ impl StateManager {
     }
 
     fn execute_buy_storage_credits(
-        &mut self,
+        &self,
         sender: &mut Account,
         amount: Balance,
         credits_byte_months: u64,
@@ -1901,7 +1927,7 @@ impl StateManager {
     }
 
     fn execute_buy_deploy_credits(
-        &mut self,
+        &self,
         sender: &mut Account,
         amount: Balance,
         credits: u64,
@@ -1939,7 +1965,7 @@ impl StateManager {
     }
 
     fn execute_stake(
-        &mut self,
+        &self,
         sender: &mut Account,
         amount: Balance,
         validator_pubkey: PublicKey,
@@ -2058,7 +2084,7 @@ impl StateManager {
     }
 
     fn execute_unstake(
-        &mut self,
+        &self,
         sender: &mut Account,
         amount: Balance,
         validator_pubkey: PublicKey,
@@ -2134,7 +2160,7 @@ impl StateManager {
     }
 
     fn execute_delegate(
-        &mut self,
+        &self,
         sender: &mut Account,
         amount: Balance,
         validator_pubkey: PublicKey,
@@ -2190,7 +2216,7 @@ impl StateManager {
     }
 
     fn execute_cross_shard(
-        &mut self,
+        &self,
         sender: &mut Account,
         tx: &Transaction,
         target_shard: ShardId,
@@ -2258,7 +2284,7 @@ impl StateManager {
     }
 
     fn execute_slice_operation(
-        &mut self,
+        &self,
         sender: &mut Account,
         operation: &crate::transaction::SliceOperationType,
         slice_id: &SliceId,
@@ -2468,7 +2494,7 @@ impl StateManager {
         *self.da_root.lock().unwrap()
     }
 
-    pub fn set_block_height(&mut self, height: BlockHeight) {
+    pub fn set_block_height(&self, height: BlockHeight) {
         *self.block_height.lock().unwrap() = height;
     }
 
@@ -2480,7 +2506,7 @@ impl StateManager {
         self.get_block_height().as_u64() / 12000
     }
 
-    pub fn increment_block_height(&mut self) {
+    pub fn increment_block_height(&self) {
         let mut height = self.block_height.lock().unwrap();
         *height = BlockHeight::new(height.as_u64() + 1);
     }
@@ -2808,6 +2834,43 @@ impl StateManager {
 
     pub fn get_network_id(&self) -> u32 {
         self.network_id
+    }
+
+    pub fn flush_to_disk(&self, dir: &std::path::Path) -> anyhow::Result<()> {
+        std::fs::create_dir_all(dir)?;
+
+        let accounts: Vec<Account> = self.accounts.iter().map(|e| e.value().clone()).collect();
+        let validators: Vec<ValidatorInfo> = self.validators.iter().map(|e| e.value().clone()).collect();
+
+        let acc_json = serde_json::to_vec(&accounts)?;
+        std::fs::write(dir.join("accounts.json"), &acc_json)?;
+
+        let val_json = serde_json::to_vec(&validators)?;
+        std::fs::write(dir.join("validators.json"), &val_json)?;
+
+        Ok(())
+    }
+
+    pub fn load_from_disk(&self, dir: &std::path::Path) -> anyhow::Result<()> {
+        let acc_path = dir.join("accounts.json");
+        if acc_path.exists() {
+            let data = std::fs::read(&acc_path)?;
+            let accounts: Vec<Account> = serde_json::from_slice(&data)?;
+            for acct in accounts {
+                self.accounts.insert(acct.address, acct);
+            }
+        }
+
+        let val_path = dir.join("validators.json");
+        if val_path.exists() {
+            let data = std::fs::read(&val_path)?;
+            let validators: Vec<ValidatorInfo> = serde_json::from_slice(&data)?;
+            for vi in validators {
+                self.validators.insert(vi.address, vi);
+            }
+        }
+
+        Ok(())
     }
 }
 

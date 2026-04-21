@@ -4,6 +4,7 @@ use ego_node::{
     NetworkType, Node, NodeRole,
     engine::EgoExecutionEngine,
     rpc::{RpcState, serve as rpc_serve},
+    store,
     supervisor::NodeSupervisor,
 };
 use reqwest;
@@ -803,11 +804,16 @@ async fn run_daemon_mode(
     );
     let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&receipts_topic);
 
+    let oracle_topic = libp2p::gossipsub::IdentTopic::new("ego/oracle/price");
+    let oracle_topic_hash = oracle_topic.hash();
+    let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&oracle_topic);
+
     let mut status_interval       = interval(Duration::from_secs(30));
     let mut metrics_interval      = interval(Duration::from_secs(60));
     let mut optimization_interval = interval(Duration::from_secs(10));
     let mut daily_reset_interval  = interval(Duration::from_secs(86400));
     let mut uptime_interval       = interval(Duration::from_secs(1));
+    let mut gc_interval           = interval(Duration::from_secs(600));
 
     print_status(&node);
 
@@ -834,6 +840,28 @@ async fn run_daemon_mode(
                     } else if message.topic == mempool_topic_hash {
                         // Count for stats only — relay handled by gossipsub mesh.
                         debug!("Relayed mempool tx ({} bytes)", message.data.len());
+                    } else if message.topic == oracle_topic_hash {
+                        // Basic Stake-Weighted Oracle verification
+                        if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&message.data) {
+                            if let (Some(validator_hex), Some(price)) = (
+                                payload.get("validator").and_then(|v| v.as_str()),
+                                payload.get("price_usd").and_then(|p| p.as_f64()),
+                            ) {
+                                let addr_bytes = hex::decode(validator_hex.trim_start_matches("0x")).unwrap_or_default();
+                                if addr_bytes.len() == 20 {
+                                    let mut arr = [0u8; 20];
+                                    arr.copy_from_slice(&addr_bytes);
+                                    let addr = Address::new(arr);
+                                    if let Some(validator) = node.state_manager.get_validator(&addr) {
+                                        if validator.total_stake.0 >= 1_000_000_000 { // Minimum 1,000 EGOC
+                                            debug!("Received valid Oracle price update: ${} from {}", price, validator_hex);
+                                        } else {
+                                            warn!("Rejected oracle price from low-stake validator: {}", validator_hex);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -858,6 +886,11 @@ async fn run_daemon_mode(
                     warn!("Error processing optimization events: {}", e);
                 }
                 node.handle_porep_events().await;
+            },
+
+            _ = gc_interval.tick() => {
+                let height = node.state_manager.get_block_height().0;
+                node.evict_expired_placements(height);
             },
 
             _ = daily_reset_interval.tick() => {
