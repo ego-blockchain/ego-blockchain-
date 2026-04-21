@@ -106,6 +106,7 @@ pub fn make_router(state: Arc<RpcState>) -> Router {
         .route("/tx/broadcast",       post(tx_broadcast))
         .route("/block/broadcast",    post(block_broadcast))
         .route("/blocks/range",       get(blocks_range))
+        .route("/rpc",                post(json_rpc))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -154,9 +155,7 @@ async fn block_broadcast(
     if crate::store::block_exists(height) {
         return (StatusCode::OK, Json(serde_json::json!({ "status": "already known" }))).into_response();
     }
-    crate::store::insert_block(height, &body);
-    return (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "accepted" }))).into_response();
-    #[allow(unreachable_code)]
+
     let block: Block = match serde_json::from_value(body.clone()) {
         Ok(b) => b,
         Err(e) => return (
@@ -309,10 +308,44 @@ async fn block_broadcast(
         ).into_response(),
     }
 
+    // ── Consensus gate #4: Quorum Certificate (QC) check ──────────────────────
+    let qc_weight = block.header.qc.voting_power as f64;
+    let total_weight = crate::consensus_integration::total_active_drs_weight(&s.state_manager);
+    if !crate::consensus_integration::has_finality(&s.state_manager, qc_weight, total_weight) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "insufficient quorum certificate weight" }))).into_response();
+    }
+
     let height = block.header.core.height.as_u64();
     if crate::store::block_exists(height) {
         return (StatusCode::OK, Json(serde_json::json!({ "status": "already known" }))).into_response();
     }
+
+    // ── Execute Block & Distribute Rewards ────────────────────────────────────
+    let mut touched: std::collections::HashSet<Address> = std::collections::HashSet::new();
+    for tx in &block.body.transactions {
+        touched.insert(tx.from.clone());
+        if let ego_core::TransactionPayload::Transfer { to, .. } = &tx.payload {
+            touched.insert(to.clone());
+        }
+        let _ = s.state_manager.execute_transaction(tx);
+        s.pending_txs.remove(&hex::encode(tx.hash.as_bytes()));
+    }
+    s.state_manager.increment_block_height();
+    let _ = s.state_manager.compute_state_root();
+
+    // Persist all accounts touched by this block so state survives restarts.
+    let acct_pairs: Vec<([u8; 20], ego_core::Account)> = touched.iter()
+        .filter_map(|addr| {
+            s.state_manager.get_account(addr).map(|acc| (*addr.as_bytes(), acc))
+        })
+        .collect();
+    let batch: Vec<(&[u8; 20], &ego_core::Account)> = acct_pairs.iter()
+        .map(|(k, v)| (k, v))
+        .collect();
+    if !batch.is_empty() {
+        crate::store::save_accounts_batch(&batch);
+    }
+    crate::store::save_reward_pool(s.state_manager.get_reward_pool_remaining());
     crate::store::insert_block(height, &body);
     (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "accepted" }))).into_response()
 }
@@ -593,9 +626,20 @@ async fn tx_broadcast(
     if crate::store::tx_exists(&hash) {
         return (StatusCode::OK, Json(serde_json::json!({ "status": "already known" }))).into_response();
     }
-    let ts = tx.timestamp.as_secs() as i64;
-    crate::store::insert_tx(&hash, ts, &body);
-    (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "accepted" }))).into_response()
+    let tx_bytes = serde_json::to_vec(&tx).unwrap_or_default();
+    match s.pending_txs.insert(tx) {
+        Err("duplicate") => {
+            return (StatusCode::ACCEPTED, Json(serde_json::json!({ "tx_hash": hash, "status": "duplicate" }))).into_response();
+        }
+        Err("full") => {
+            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "mempool full" }))).into_response();
+        }
+        _ => {}
+    }
+    if !tx_bytes.is_empty() {
+        let _ = s.mempool_gossip_tx.send(tx_bytes);
+    }
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "accepted", "tx_hash": hash }))).into_response()
 }
 
 async fn node_stats(State(s): State<Arc<RpcState>>) -> impl IntoResponse {
@@ -705,6 +749,122 @@ async fn blocks_range(
     let count = q.count.unwrap_or(100).min(200);
     let blocks = crate::store::get_blocks_range(q.from, count);
     Json(blocks)
+}
+
+#[derive(Deserialize)]
+struct JsonRpcRequest {
+    jsonrpc: String,
+    method:  String,
+    #[serde(default)]
+    params:  serde_json::Value,
+    id:      serde_json::Value,
+}
+
+async fn json_rpc(
+    State(s):          State<Arc<RpcState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(req):         Json<JsonRpcRequest>,
+) -> impl IntoResponse {
+    macro_rules! rpc_err {
+        ($code:expr, $msg:expr) => {
+            Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "error": { "code": $code, "message": $msg },
+                "id": req.id,
+            })).into_response()
+        };
+    }
+    if req.jsonrpc != "2.0" {
+        return rpc_err!(-32600i32, "Invalid Request: jsonrpc must be \"2.0\"");
+    }
+    let p = &req.params;
+    let result: serde_json::Value = match req.method.as_str() {
+        "ego_blockNumber" => {
+            serde_json::json!(format!("0x{:x}", s.state_manager.get_block_height().0))
+        }
+        "ego_chainId" => serde_json::json!("0x1"),
+        "ego_getBalance" => {
+            let addr_str = p[0].as_str().unwrap_or_default();
+            let bytes = match hex::decode(addr_str.trim_start_matches("0x")) {
+                Ok(b) if b.len() == 20 => { let mut a = [0u8; 20]; a.copy_from_slice(&b); a }
+                _ => return rpc_err!(-32602i32, "Invalid address"),
+            };
+            let addr = Address::new(bytes);
+            let bal = s.state_manager.get_account(&addr).map(|a| a.balance.0).unwrap_or(0u128);
+            serde_json::json!(format!("0x{:x}", bal))
+        }
+        "ego_getNonce" => {
+            let addr_str = p[0].as_str().unwrap_or_default();
+            let bytes = match hex::decode(addr_str.trim_start_matches("0x")) {
+                Ok(b) if b.len() == 20 => { let mut a = [0u8; 20]; a.copy_from_slice(&b); a }
+                _ => return rpc_err!(-32602i32, "Invalid address"),
+            };
+            let addr = Address::new(bytes);
+            let nonce = s.state_manager.get_account(&addr).map(|a| a.nonce).unwrap_or(0);
+            serde_json::json!(format!("0x{:x}", nonce))
+        }
+        "ego_getTransactionByHash" => {
+            let hash = p[0].as_str().unwrap_or_default();
+            crate::store::get_tx_by_hash(hash).unwrap_or(serde_json::Value::Null)
+        }
+        "ego_getBlockByHeight" => {
+            let height = if let Some(h) = p[0].as_u64() {
+                h
+            } else {
+                u64::from_str_radix(p[0].as_str().unwrap_or("0").trim_start_matches("0x"), 16)
+                    .unwrap_or(0)
+            };
+            crate::store::get_block_by_height(height).unwrap_or(serde_json::Value::Null)
+        }
+        "ego_sendRawTransaction" => {
+            if !rate_ok(&s, peer.ip(), 20) {
+                return rpc_err!(-32005i32, "Rate limit exceeded");
+            }
+            if s.pending_txs.len() as usize >= crate::mempool::MAX_TOTAL {
+                return rpc_err!(-32006i32, "Mempool full");
+            }
+            let tx: Transaction = match serde_json::from_value(p[0].clone()) {
+                Ok(t) => t,
+                Err(e) => return rpc_err!(-32602i32, format!("Invalid tx: {e}")),
+            };
+            match tx.verify_signature() {
+                Ok(true) => {}
+                Ok(false) => return rpc_err!(-32003i32, "Invalid signature"),
+                Err(e)    => return rpc_err!(-32003i32, format!("Signature error: {e}")),
+            }
+            if let Some(account) = s.state_manager.get_account(&tx.from) {
+                let expected_nonce = account.nonce + 1;
+                if tx.nonce != expected_nonce {
+                    return rpc_err!(-32007i32,
+                        format!("Invalid nonce: expected {expected_nonce}, got {}", tx.nonce));
+                }
+                if let ego_core::TransactionPayload::Transfer { amount, .. } = &tx.payload {
+                    if account.balance.as_u128() < amount.as_u128() {
+                        return rpc_err!(-32008i32, "Insufficient balance");
+                    }
+                }
+            } else {
+                return rpc_err!(-32009i32, "Sender account not found");
+            }
+            let hash = hex::encode(tx.hash.as_bytes());
+            let tx_bytes = serde_json::to_vec(&tx).unwrap_or_default();
+            match s.pending_txs.insert(tx) {
+                Err("duplicate") => return rpc_err!(-32010i32, "Duplicate transaction"),
+                Err("full")      => return rpc_err!(-32006i32, "Mempool full"),
+                Err(e)           => return rpc_err!(-32011i32, format!("Mempool error: {e}")),
+                Ok(_) => {}
+            }
+            if !tx_bytes.is_empty() { let _ = s.mempool_gossip_tx.send(tx_bytes); }
+            serde_json::json!(format!("0x{}", hash))
+        }
+        "ego_getNodeInfo" => serde_json::json!({
+            "peer_id":    &s.peer_id,
+            "address":    &s.node_address,
+            "public_key": &s.node_pubkey,
+        }),
+        other => return rpc_err!(-32601i32, format!("Method not found: {other}")),
+    };
+    Json(serde_json::json!({ "jsonrpc": "2.0", "result": result, "id": req.id })).into_response()
 }
 
 pub async fn serve(addr: &str, state: Arc<RpcState>) -> anyhow::Result<()> {
