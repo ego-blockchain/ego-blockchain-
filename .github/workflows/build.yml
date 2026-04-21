@@ -49,12 +49,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Install llvm-tools (rust-lld linker)
+        run: rustup component add llvm-tools-preview
+
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: ego-desktop-mvp/src-tauri -> target
+          workspaces: ego-desktop/src-tauri -> target
 
       - name: Install frontend dependencies
-        working-directory: ego-desktop-mvp
+        working-directory: ego-desktop
         run: npm install
 
       - name: Build (Windows)
@@ -63,7 +66,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EGO_AI_KEY: ${{ secrets.EGO_AI_KEY }}
         with:
-          projectPath: ego-desktop-mvp
+          projectPath: ego-desktop
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: 'Ego Desktop ${{ github.ref_name }}'
           releaseBody: ${{ env.RELEASE_BODY }}
@@ -86,10 +89,10 @@ jobs:
 
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: ego-desktop-mvp/src-tauri -> target
+          workspaces: ego-desktop/src-tauri -> target
 
       - name: Install frontend dependencies
-        working-directory: ego-desktop-mvp
+        working-directory: ego-desktop
         run: npm install
 
       - name: Build (macOS Apple Silicon)
@@ -100,7 +103,7 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: '11.0'
           RUSTFLAGS: '-C target-cpu=apple-m1'
         with:
-          projectPath: ego-desktop-mvp
+          projectPath: ego-desktop
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: 'Ego Desktop ${{ github.ref_name }}'
           releaseBody: ${{ env.RELEASE_BODY }}
@@ -123,7 +126,7 @@ jobs:
 
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: ego-desktop-mvp/src-tauri -> target
+          workspaces: ego-desktop/src-tauri -> target
 
       - name: Install Linux dependencies
         run: |
@@ -163,11 +166,11 @@ jobs:
         run: rustup target add x86_64-unknown-linux-musl
 
       - name: Install frontend dependencies
-        working-directory: ego-desktop-mvp
+        working-directory: ego-desktop
         run: npm install
 
       - name: Fetch Rust deps + patch wry for webkit2gtk 0.18.2
-        working-directory: ego-desktop-mvp/src-tauri
+        working-directory: ego-desktop/src-tauri
         run: |
           cargo fetch
           WRY=$(find ~/.cargo/registry/src -path "*/wry-*/src/webview/webkitgtk/mod.rs" 2>/dev/null | head -1)
@@ -177,11 +180,11 @@ jobs:
           fi
 
       - name: Build frontend
-        working-directory: ego-desktop-mvp
+        working-directory: ego-desktop
         run: npm run build
 
       - name: Build Tauri app
-        working-directory: ego-desktop-mvp
+        working-directory: ego-desktop
         env:
           EGO_AI_KEY: ${{ secrets.EGO_AI_KEY }}
         run: npx tauri build
@@ -194,5 +197,5 @@ jobs:
           name: Ego Desktop ${{ github.ref_name }}
           body: ${{ env.RELEASE_BODY }}
           files: |
-            ego-desktop-mvp/src-tauri/target/x86_64-unknown-linux-musl/release/bundle/appimage/*.AppImage
-            ego-desktop-mvp/src-tauri/target/x86_64-unknown-linux-musl/release/bundle/deb/*.deb
+            ego-desktop/src-tauri/target/x86_64-unknown-linux-musl/release/bundle/appimage/*.AppImage
+            ego-desktop/src-tauri/target/x86_64-unknown-linux-musl/release/bundle/deb/*.deb
