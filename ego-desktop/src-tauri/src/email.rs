@@ -245,8 +245,8 @@ pub async fn send_tx_confirmation(
         tx_hash.to_string()
     };
     let body_html = format!(r#"
-      <p style="margin:0 0 8px;font-size:18px;font-weight:700;color:#ffffff;">Transaction Submitted</p>
-      <p style="margin:0 0 24px;font-size:14px;color:#9ca3af;">Your transaction has been submitted to the Ego Blockchain network.</p>
+      <p style="margin:0 0 8px;font-size:18px;font-weight:700;color:#ffffff;">Transaction Confirmed</p>
+      <p style="margin:0 0 24px;font-size:14px;color:#9ca3af;">Your transaction has been confirmed on the Ego Blockchain — the recipient has received the coins.</p>
       <div style="background-color:#111827;border-radius:12px;padding:20px 24px;margin:0 0 24px;">
         <table width="100%" cellpadding="0" cellspacing="0">
           <tr>
@@ -265,6 +265,28 @@ pub async fn send_tx_confirmation(
       </div>
       <p style="margin:0;font-size:13px;color:#6b7280;line-height:1.6;">You can track this transaction in the Explorer section of the Ego Desktop app.</p>
     "#, amount_egoc = amount_egoc, recipient = recipient, short_hash = short_hash);
-    let html = html_template("Transaction Sent", &body_html);
-    send_smtp(to, "Ego Blockchain — Transaction Sent", &html).await
+    let html = html_template("Transaction Confirmed", &body_html);
+    send_smtp(to, "Ego Blockchain — Transaction Confirmed", &html).await
+}
+
+pub fn send_tx_confirmation_when_mined(
+    to: String,
+    amount_egoc: String,
+    recipient: String,
+    tx_hash: String,
+) {
+    tauri::async_runtime::spawn(async move {
+        for _ in 0..24u8 {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if let Some(tx) = crate::chain_db::get_tx_by_hash(&tx_hash) {
+                if tx.status == "Confirmed" {
+                    if let Err(e) = send_tx_confirmation(&to, &amount_egoc, &recipient, &tx_hash).await {
+                        eprintln!("[Email] TX confirmation failed: {e}");
+                    }
+                    return;
+                }
+            }
+        }
+        eprintln!("[Email] TX {} not confirmed within 120s — skipping confirmation email", &tx_hash[..12.min(tx_hash.len())]);
+    });
 }
