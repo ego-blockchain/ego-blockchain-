@@ -115,10 +115,10 @@ jobs:
           releaseDraft: true
           prerelease: false
 
-  # ── macOS Intel (x64) ────────────────────────────────────────────────────
+  # ── macOS Intel (x64 cross-compiled from Apple Silicon) ──────────────────
   build-macos-intel:
     name: macOS Intel
-    runs-on: macos-13
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -128,6 +128,9 @@ jobs:
           node-version: '22'
 
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Add Intel Rust target
+        run: rustup target add x86_64-apple-darwin
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -145,6 +148,7 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: '10.13'
         with:
           projectPath: ego-desktop
+          args: --target x86_64-apple-darwin
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
           releaseName: Ego Desktop ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
           releaseBody: ${{ env.RELEASE_BODY }}
