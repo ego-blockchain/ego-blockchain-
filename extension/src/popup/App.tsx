@@ -40,11 +40,13 @@ const S = {
   section: 'flex-1 overflow-y-auto px-4 py-4 flex flex-col gap-4',
 };
 
+const LOGO_URL = chrome.runtime.getURL('icons/icon128.png');
+
 const STYLES = `
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+  body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: #0a0a0f; }
 
   .flex { display: flex; }
   .flex-col { flex-direction: column; }
@@ -84,9 +86,9 @@ const STYLES = `
   .border-gray-600 { border-color: #4b5563; }
   .border-gray-700 { border-color: #374151; }
   .border-blue-500 { border-color: #3b82f6; }
-  .bg-gray-900 { background-color: #111827; }
-  .bg-gray-800 { background-color: #1f2937; }
-  .bg-gray-700 { background-color: #374151; }
+  .bg-gray-900 { background-color: #0a0a0f; }
+  .bg-gray-800 { background-color: #13131a; }
+  .bg-gray-700 { background-color: #1e1e2e; }
   .bg-blue-600 { background-color: #2563eb; }
   .bg-blue-900 { background-color: #1e3a8a; }
   .bg-green-900 { background-color: #14532d; }
@@ -170,10 +172,33 @@ const STYLES = `
   .hover\\:text-white:hover { color: #ffffff; }
   .hover\\:border-blue-500:hover { border-color: #3b82f6; }
 
+  /* Glassmorphism cards */
+  .glass {
+    background: rgba(255,255,255,0.04);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 16px;
+  }
+  .glow-blue { box-shadow: 0 0 30px rgba(37,99,235,0.25); }
+  .glow-ring { box-shadow: 0 0 0 1px rgba(99,102,241,0.4), 0 0 40px rgba(99,102,241,0.15); }
+
+  /* Gradient text */
+  .grad-text {
+    background: linear-gradient(135deg, #60a5fa, #a78bfa);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  /* Logo glow */
+  .logo-glow {
+    filter: drop-shadow(0 0 12px rgba(99,102,241,0.6));
+  }
+
   /* Scrollbar */
   ::-webkit-scrollbar { width: 4px; }
-  ::-webkit-scrollbar-track { background: #1f2937; }
-  ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 2px; }
+  ::-webkit-scrollbar-track { background: #0a0a0f; }
+  ::-webkit-scrollbar-thumb { background: #2d2d3d; border-radius: 2px; }
 
   /* Focus */
   input:focus, textarea:focus { border-color: #3b82f6 !important; }
@@ -197,7 +222,7 @@ const STYLES = `
   }
 
   /* Navbar */
-  .navbar { display: flex; background: #1f2937; border-top: 1px solid #374151; }
+  .navbar { display: flex; background: #0d0d14; border-top: 1px solid rgba(255,255,255,0.06); }
   .nav-btn {
     flex: 1;
     display: flex;
@@ -457,22 +482,7 @@ function Header({
           <Icons.Back />
         </button>
       ) : (
-        <span
-          style={{
-            width: 28,
-            height: 28,
-            borderRadius: '50%',
-            background: 'linear-gradient(135deg, #2563eb, #7c3aed)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            fontSize: 14,
-            fontWeight: 700,
-            marginRight: 8,
-          }}
-        >
-          E
-        </span>
+        <img src={LOGO_URL} alt="Ego" className="logo-glow" style={{ width: 28, height: 28, borderRadius: '50%', marginRight: 8 }} />
       )}
       <span className="text-lg font-bold text-blue-400 flex-1">{title}</span>
       {onLock && (
@@ -540,33 +550,29 @@ function Navbar({
 function WelcomeScreen({ onNavigate }: { onNavigate: (s: Screen) => void }) {
   return (
     <div className="flex flex-col h-full">
-      <div className="flex-1 flex flex-col items-center justify-center p-6 gap-6">
-        <div style={{
-          width: 80,
-          height: 80,
-          borderRadius: '50%',
-          background: 'linear-gradient(135deg, #2563eb, #7c3aed)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          fontSize: 36,
-          fontWeight: 900,
-          boxShadow: '0 0 40px rgba(37,99,235,0.4)',
-        }}>
-          E
+      <div className="flex-1 flex flex-col items-center justify-center p-6 gap-6" style={{ background: 'radial-gradient(ellipse at 50% 0%, rgba(99,102,241,0.12) 0%, transparent 70%)' }}>
+        <div style={{ position: 'relative' }}>
+          <div style={{
+            position: 'absolute', inset: -8,
+            borderRadius: '50%',
+            background: 'conic-gradient(from 0deg, #6366f1, #2563eb, #7c3aed, #6366f1)',
+            animation: 'spin 4s linear infinite',
+            opacity: 0.6,
+          }} />
+          <img src={LOGO_URL} alt="Ego" className="logo-glow" style={{ width: 88, height: 88, borderRadius: '50%', position: 'relative', zIndex: 1 }} />
         </div>
         <div className="text-center">
-          <h1 className="text-2xl font-bold text-white mb-2">Ego Wallet</h1>
+          <h1 className="text-2xl font-bold grad-text mb-2">Ego Wallet</h1>
           <p className="text-gray-400 text-sm leading-relaxed">
-            Quantum-safe wallet for the Ego Blockchain ecosystem
+            Quantum-safe wallet for the Ego Blockchain
           </p>
         </div>
-        <div className="w-full flex flex-col gap-3 mt-4">
+        <div className="w-full flex flex-col gap-3 mt-2">
           <Button onClick={() => onNavigate('create')}>Create New Wallet</Button>
           <Button variant="secondary" onClick={() => onNavigate('import')}>Import Existing Wallet</Button>
         </div>
         <p className="text-xs text-gray-500 text-center">
-          Ed25519 · AES-256-GCM · Ego Blockchain
+          Ed25519 · Dilithium-2 · AES-256-GCM
         </p>
       </div>
     </div>
@@ -769,21 +775,9 @@ function UnlockScreen({ onUnlocked }: { onUnlocked: () => void }) {
 
   return (
     <div className="flex flex-col h-full">
-      <div className="flex-1 flex flex-col items-center justify-center p-6 gap-6">
-        <div style={{
-          width: 64,
-          height: 64,
-          borderRadius: '50%',
-          background: 'linear-gradient(135deg, #2563eb, #7c3aed)',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          fontSize: 28,
-          fontWeight: 900,
-        }}>
-          E
-        </div>
-        <h1 className="text-xl font-bold text-white">Ego Wallet</h1>
+      <div className="flex-1 flex flex-col items-center justify-center p-6 gap-6" style={{ background: 'radial-gradient(ellipse at 50% 0%, rgba(99,102,241,0.10) 0%, transparent 70%)' }}>
+        <img src={LOGO_URL} alt="Ego" className="logo-glow" style={{ width: 64, height: 64, borderRadius: '50%' }} />
+        <h1 className="text-xl font-bold grad-text">Ego Wallet</h1>
         <div className="w-full flex flex-col gap-3">
           <Input
             label="Password"
@@ -853,9 +847,9 @@ function HomeScreen({
 
       <div className="flex-1 overflow-y-auto">
         {}
-        <div className="mx-4 mt-4 rounded-xl p-5 text-center" style={{
-          background: 'linear-gradient(135deg, #1e3a8a, #1e1b4b)',
-          border: '1px solid #2563eb',
+        <div className="mx-4 mt-4 rounded-xl p-5 text-center glow-blue" style={{
+          background: 'linear-gradient(135deg, rgba(37,99,235,0.2), rgba(99,102,241,0.15))',
+          border: '1px solid rgba(99,102,241,0.35)',
         }}>
           <p className="text-xs text-gray-400 mb-1">Total Balance</p>
           <p className="text-3xl font-bold text-white">{state.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}</p>
