@@ -115,6 +115,42 @@ jobs:
           releaseDraft: true
           prerelease: false
 
+  # ── macOS Intel (x64) ────────────────────────────────────────────────────
+  build-macos-intel:
+    name: macOS Intel
+    runs-on: macos-13
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ego-desktop/src-tauri -> target
+
+      - name: Install frontend dependencies
+        working-directory: ego-desktop
+        run: npm install
+
+      - name: Build (macOS Intel)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EGO_AI_KEY: ${{ secrets.EGO_AI_KEY }}
+          MACOSX_DEPLOYMENT_TARGET: '10.13'
+        with:
+          projectPath: ego-desktop
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
+          releaseName: Ego Desktop ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
+          releaseBody: ${{ env.RELEASE_BODY }}
+          releaseDraft: true
+          prerelease: false
+
   # ── Linux (x64 — .deb + .AppImage) ───────────────────────────────────────
   build-linux:
     name: Linux x64
@@ -195,11 +231,12 @@ jobs:
         run: npx tauri build
 
       - name: Upload Linux artifacts to release
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' || inputs.version != ''
         uses: softprops/action-gh-release@v2
         with:
           draft: true
-          name: Ego Desktop ${{ github.ref_name }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
+          name: Ego Desktop ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
           body: ${{ env.RELEASE_BODY }}
           files: |
             ego-desktop/src-tauri/target/x86_64-unknown-linux-musl/release/bundle/appimage/*.AppImage
