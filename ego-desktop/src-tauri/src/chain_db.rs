@@ -698,10 +698,10 @@ fn prune_if_needed(db: &DB) {
 
 pub fn latest_block_info() -> (u64, String) {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let cf_meta = db.cf_handle(CF_META).unwrap();
+    let Some(cf_meta) = db.cf_handle(CF_META) else { return (0, GENESIS_HASH.to_string()); };
     let height = db.get_cf(cf_meta, META_LATEST_HEIGHT)
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-    let cf_blocks = db.cf_handle(CF_BLOCKS).unwrap();
+    let Some(cf_blocks) = db.cf_handle(CF_BLOCKS) else { return (0, GENESIS_HASH.to_string()); };
     let hash = db.get_cf(cf_blocks, height_key(height))
         .ok().flatten()
         .and_then(|v| decode::<LedgerBlock>(&v))
@@ -720,7 +720,7 @@ pub fn block_count() -> u64 {
 
 pub fn tx_count() -> u64 {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let cf_meta = db.cf_handle(CF_META).unwrap();
+    let Some(cf_meta) = db.cf_handle(CF_META) else { return 0; };
     db.get_cf(cf_meta, META_TX_COUNT)
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
 }
@@ -769,7 +769,7 @@ pub fn recent_blocks(limit: usize) -> Vec<LedgerBlock> {
 
 pub fn paged_blocks(offset: usize, limit: usize) -> Vec<LedgerBlock> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let cf = db.cf_handle(CF_BLOCKS).unwrap();
+    let Some(cf) = db.cf_handle(CF_BLOCKS) else { return vec![]; };
     let mut iter = db.raw_iterator_cf(cf);
     iter.seek_to_last();
     let mut skipped = 0usize;
@@ -792,8 +792,8 @@ pub fn recent_transactions(limit: usize) -> Vec<LedgerTx> {
 
 pub fn paged_transactions(offset: usize, limit: usize) -> Vec<LedgerTx> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let cf_recent = db.cf_handle(CF_RECENT_TXS).unwrap();
-    let cf_txs    = db.cf_handle(CF_TXS).unwrap();
+    let Some(cf_recent) = db.cf_handle(CF_RECENT_TXS) else { return vec![]; };
+    let Some(cf_txs)    = db.cf_handle(CF_TXS) else { return vec![]; };
     let mut iter = db.raw_iterator_cf(cf_recent);
     iter.seek_to_last();
     let mut skipped = 0usize;
