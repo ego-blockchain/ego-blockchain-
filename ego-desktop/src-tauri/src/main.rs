@@ -601,6 +601,24 @@ fn main() {
                 // protection and validator stake tracking survive node restarts.
                 crate::chain_db::restore_in_memory_state_from_db();
 
+                // Pre-populate known_validators from recent block miners so the
+                // BFT threshold is correct immediately on reconnect, before
+                // PeerAnnounce gossip round-trips complete.
+                {
+                    let miners: std::collections::HashSet<String> = crate::chain_db::recent_blocks(500)
+                        .into_iter()
+                        .filter(|b| !b.miner.is_empty())
+                        .map(|b| b.miner)
+                        .collect();
+                    let n = miners.len();
+                    for m in miners {
+                        crate::p2p::register_known_validator(&m);
+                    }
+                    if n > 0 {
+                        eprintln!("[Startup] Pre-registered {} validator(s) from chain history", n);
+                    }
+                }
+
                 crate::p2p::fetch_and_cache_egoc_price().await;
 
                 let no_oracle = std::env::var("EGO_NO_ORACLE").is_ok();

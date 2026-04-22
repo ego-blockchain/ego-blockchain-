@@ -3831,15 +3831,19 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                     crate::commands::outbox::flush_for(&addr_clone, Some(&ep)).await;
                 });
 
+                // Proactive chain push: send only the blocks the peer is missing.
+                // (Old code used load_chain() = last-500 window regardless of peer height.)
                 let tip = crate::chain_db::block_count();
                 if tip > 0 {
                     let ep2 = endpoint.clone();
                     tokio::spawn(async move {
-                        let chain = crate::ledger::load_chain();
-                        let response = P2PMessage::ChainSyncResponse {
-                            blocks:       chain.blocks,
-                            transactions: chain.transactions,
-                        };
+                        // We don't know the peer's height here, so start from block 1.
+                        // get_blocks_range caps at 1000; the peer's 30s sync loop covers larger gaps.
+                        let blocks = crate::chain_db::get_blocks_range(1, 1_000);
+                        let transactions: Vec<crate::ledger::LedgerTx> = blocks.iter()
+                            .flat_map(|b| crate::chain_db::get_txs_for_block(b.height))
+                            .collect();
+                        let response = P2PMessage::ChainSyncResponse { blocks, transactions };
                         if let Err(e) = send_message_any(&[ep2.clone()], &response).await {
                             if !e.contains("none of the requested protocols") {
                                 eprintln!("[P2P] proactive chain push to {}: {}", ep2, e);
@@ -3847,6 +3851,53 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                         }
                     });
                 }
+
+                // Reply with our own PeerAnnounce so the sender immediately
+                // learns about us as a validator — without waiting for the
+                // next 30-second broadcast heartbeat.
+                let ep3       = endpoint.clone();
+                let app_reply = app.clone();
+                tokio::spawn(async move {
+                    broadcast_peer_announce(&app_reply).await;
+                    // Also send directly in case gossip mesh hasn't formed yet.
+                    let my_addr = crate::ledger::Ledger::load().address;
+                    if my_addr.is_empty() { return; }
+                    let my_ep   = get_public_endpoint().await;
+                    if my_ep.is_empty() { return; }
+                    let coverage_score = crate::poc::my_coverage_score();
+                    let staked_amount  = crate::ledger::Ledger::load().staked_amount;
+                    let (dil_hex, vrf_hex) = crate::ledger::load_seed()
+                        .ok().flatten()
+                        .and_then(|b| {
+                            if b.len() != 32 { return None; }
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(&b);
+                            let kp = ego_core::KeyPair::from_bytes(&arr).ok()?;
+                            let dil = hex::encode(kp.dilithium_public_key().key_data);
+                            let vk  = { use ed25519_dalek::SigningKey;
+                                hex::encode(SigningKey::from_bytes(&arr).verifying_key().as_bytes()) };
+                            Some((dil, vk))
+                        })
+                        .unwrap_or_default();
+                    let announce = P2PMessage::PeerAnnounce {
+                        address:          my_addr,
+                        name:             "Ego Node".to_string(),
+                        endpoint:         my_ep.clone(),
+                        endpoints:        vec![my_ep],
+                        city:             None,
+                        country:          None,
+                        coverage_score,
+                        dilithium_pubkey: dil_hex,
+                        vrf_pubkey:       vrf_hex,
+                        staked_amount,
+                        genesis_hash:     crate::ledger::GENESIS_HASH.to_string(),
+                    };
+                    if let Err(e) = send_message_any(&[ep3.clone()], &announce).await {
+                        if !e.contains("none of the requested protocols") {
+                            eprintln!("[P2P] PeerAnnounce reply to {}: {}", ep3, e);
+                        }
+                    }
+                });
             }
 
         }
