@@ -22,6 +22,23 @@ static GOSSIP_TX: OnceLock<mpsc::Sender<(String, Vec<u8>)>> = OnceLock::new();
 static DEAD_PEER_CACHE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
 const DEAD_PEER_SILENCE_SECS: i64 = 300;
 
+static RELAY_LAST_DIALED: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+const RELAY_DIAL_COOLDOWN_SECS: i64 = 30;
+
+fn relay_dial_cooldown() -> std::sync::MutexGuard<'static, HashMap<String, i64>> {
+    RELAY_LAST_DIALED.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
+}
+
+fn can_dial_relay(addr: &str) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    let mut map = relay_dial_cooldown();
+    if let Some(&last) = map.get(addr) {
+        if now - last < RELAY_DIAL_COOLDOWN_SECS { return false; }
+    }
+    map.insert(addr.to_string(), now);
+    true
+}
+
 fn is_peer_silenced(ep: &str) -> bool {
     let now = chrono::Utc::now().timestamp();
     let mut map = DEAD_PEER_CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
@@ -80,11 +97,6 @@ pub const P2P_PORT: u16 = 47393;
 
 pub const RELAY_NODES: &[&str] = &[
     "/dns4/egorelay.egoblockchain.com/tcp/4001/p2p/12D3KooWFFjZdk4nhpsXKxa44eUsggQ9rAzELeVv34Eav8qA5t9y",
-    // Add production relay IPs before mainnet
-    "/dns4/egorelay2.egoblockchain.com/tcp/4001/p2p/12D3KooWBnmsQMBHFXgwAyiJiHkDGTtqepfPx1UPJqAWMWfKkDT7",
-    "/dns4/egorelay3.egoblockchain.com/tcp/4001/p2p/12D3KooWDtGNVrXcQ69DBwbq2FGpGYdoXuXRtAQdKvVJhHcmm5cS",
-    "/dns4/egorelay4.egoblockchain.com/tcp/4001/p2p/12D3KooWPgaMxRpFGRbn7JV8HpZzMWuSAo5jJPmBqPksMYPY1nKj",
-    "/dns4/egorelay5.egoblockchain.com/tcp/4001/p2p/12D3KooWQwK2VpmfKTx1GFxGkjWqk8JqJqBFUZeK4rABWHXqZhJK",
 ];
 
 fn shuffled_relay_nodes() -> Vec<&'static str> {
@@ -2252,8 +2264,10 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
             if let Some(pid) = peer_id_from_multiaddr(&addr) {
                 relay_addrs.insert(pid, strip_p2p_suffix(&addr));
             }
-            eprintln!("[P2P] Dialling relay {} (attempt {}/{})", relay_str, relay_connected_count + 1, RELAY_NODES.len());
-            let _ = swarm.dial(addr);
+            if can_dial_relay(relay_str) {
+                eprintln!("[P2P] Dialling relay {} (attempt {}/{})", relay_str, relay_connected_count + 1, RELAY_NODES.len());
+                let _ = swarm.dial(addr);
+            }
             relay_connected_count += 1;
         }
     }
@@ -2538,8 +2552,10 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                                     }
                                 }
                             } else if !connected {
-                                eprintln!("[P2P] Relay {} not connected — redialling", relay_str);
-                                let _ = swarm.dial(addr);
+                                if can_dial_relay(relay_str) {
+                                    eprintln!("[P2P] Relay {} not connected — redialling", relay_str);
+                                    let _ = swarm.dial(addr);
+                                }
                             }
                         }
                     }
