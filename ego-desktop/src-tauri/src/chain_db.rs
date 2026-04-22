@@ -1346,6 +1346,92 @@ pub fn append_peer_block_with_votes(block: &LedgerBlock, txs: &[LedgerTx], votes
     write_block_batch(&db, &b, txs);
 }
 
+/// Applies a single TX to a block that is already in the chain.
+/// Called when multiple TxBroadcast messages share the same block — the first
+/// message creates the block, but subsequent TXs in that block must still be
+/// credited.  The fork-choice guard inside write_block_batch would silently
+/// drop equal-vote-count re-writes, so we bypass it here and only touch the
+/// TX and balance columns, never the block record.
+pub fn apply_missing_tx(block_height: u64, tx: &LedgerTx) {
+    if tx.hash.is_empty() { return; }
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+
+    let cf_txs        = db.cf_handle(CF_TXS).unwrap();
+    let cf_block_txs  = db.cf_handle(CF_BLOCK_TXS).unwrap();
+    let cf_addr_txs   = db.cf_handle(CF_ADDR_TXS).unwrap();
+    let cf_balances   = db.cf_handle(CF_BALANCES).unwrap();
+    let cf_recent_txs = db.cf_handle(CF_RECENT_TXS).unwrap();
+    let cf_meta       = db.cf_handle(CF_META).unwrap();
+
+    if db.get_cf(cf_txs, tx.hash.as_bytes()).ok().flatten().is_some() {
+        return;
+    }
+    if tx.status != "Confirmed" && !tx.status.is_empty() {
+        return;
+    }
+
+    let is_system_source = tx.from == FAUCET_ADDR
+        || tx.from == NODE_POOL_ADDR
+        || tx.from.is_empty();
+
+    let credited_amount = if tx.from == NODE_POOL_ADDR && tx.amount > 0 {
+        let pool_bal: u64 = db.get_cf(cf_balances, NODE_POOL_ADDR.as_bytes())
+            .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+        tx.amount.min(pool_bal)
+    } else {
+        tx.amount
+    };
+
+    let mut balance_delta: std::collections::HashMap<String, i128> = Default::default();
+    *balance_delta.entry(tx.to.clone()).or_insert(0) += credited_amount as i128;
+    if !is_system_source {
+        *balance_delta.entry(tx.from.clone()).or_insert(0) -=
+            tx.amount as i128 + tx.fee_uegoc as i128;
+    } else if tx.from == NODE_POOL_ADDR {
+        *balance_delta.entry(NODE_POOL_ADDR.to_string()).or_insert(0) -= credited_amount as i128;
+    }
+
+    let mut new_balances: std::collections::HashMap<String, u64> = Default::default();
+    for addr in balance_delta.keys() {
+        let cur = db.get_cf(cf_balances, addr.as_bytes())
+            .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+        new_balances.insert(addr.clone(), cur);
+    }
+    for (addr, delta) in &balance_delta {
+        let cur = *new_balances.get(addr).unwrap_or(&0) as i128;
+        new_balances.insert(addr.clone(), (cur + delta).max(0) as u64);
+    }
+
+    let mut batch = WriteBatch::default();
+
+    batch.put_cf(cf_txs,        tx.hash.as_bytes(), encode(tx));
+    batch.put_cf(cf_block_txs,  block_txs_key(block_height, &tx.hash), b"");
+    batch.put_cf(cf_recent_txs, recent_txs_key(tx.timestamp, &tx.hash), b"");
+
+    let incoming_k = addr_txs_key(&tx.to, tx.timestamp, &tx.hash);
+    batch.put_cf(cf_addr_txs, incoming_k, (tx.amount as i64).to_le_bytes());
+    if !is_system_source {
+        let outgoing_k = addr_txs_key(&tx.from, tx.timestamp, &tx.hash);
+        batch.put_cf(cf_addr_txs, outgoing_k, (-(tx.amount as i64)).to_le_bytes());
+    }
+
+    for (addr, bal) in &new_balances {
+        batch.put_cf(cf_balances, addr.as_bytes(), u64_le(*bal));
+    }
+
+    let cur_tx_count = db.get_cf(cf_meta, META_TX_COUNT)
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    batch.put_cf(cf_meta, META_TX_COUNT, u64_le(cur_tx_count + 1));
+
+    if !is_system_source && tx.nonce > 0 {
+        persist_nonce_in_batch(&mut batch, &db, &tx.from, tx.nonce);
+    }
+
+    if let Err(e) = db.write(batch) {
+        eprintln!("[ChainDB] apply_missing_tx write failed: {e}");
+    }
+}
+
 // ── Merkle tree (Blake3) ───────────────────────────────────────────────────────
 //
 // Standard binary Merkle tree. Leaf = blake3(tx_hash). Internal nodes:

@@ -4896,10 +4896,15 @@ async fn apply_incoming_tx(tx: LedgerTx, block: LedgerBlock, app: &tauri::AppHan
 
     if crate::chain_db::get_block_by_height(block.height).is_none() {
         crate::chain_db::append_peer_block(&block, &[tx]);
-        let _ = app.emit_all("ego://chain-updated", ());
     } else {
-        crate::mempool::get_mempool().push(tx);
+        // Block already exists — apply only this TX's balance without touching
+        // the block record.  The old code pushed to mempool here, which caused
+        // TXs beyond the first in a shared block to be silently dropped after
+        // the 300 s TTL (fork-choice guard in write_block_batch rejects equal
+        // vote-count re-writes, so append_peer_block would not work here).
+        crate::chain_db::apply_missing_tx(block.height, &tx);
     }
+    let _ = app.emit_all("ego://chain-updated", ());
 }
 
 fn execute_contract_txs(chain: &crate::ledger::SharedChain, txs: &[crate::ledger::LedgerTx]) {
