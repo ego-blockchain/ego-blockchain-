@@ -217,16 +217,16 @@ fn get_miner_address() -> Option<String> {
     if addr.is_empty() { None } else { Some(addr) }
 }
 
-async fn try_mine(txs: Vec<LedgerTx>, miner: &str) {
+async fn try_mine(txs: Vec<LedgerTx>, miner: &str) -> Vec<LedgerTx> {
     let known = crate::p2p::get_known_validators_snapshot();
     if known.len() >= min_validators_for_finality() {
-        return;
+        return txs;
     }
 
     let prev_hash = crate::chain_db::get_tip_hash();
     let (poc_ticket, _poc_sig) = match crate::poc::check_slot_winner(&prev_hash) {
         Some(t) => t,
-        None    => return,
+        None    => return txs,
     };
     let poc_slot = crate::poc::current_slot();
     let combined_ticket = format!("{}:{}", poc_ticket, _poc_sig);
@@ -257,6 +257,7 @@ async fn try_mine(txs: Vec<LedgerTx>, miner: &str) {
             crate::p2p::broadcast_tx(tx.clone(), block.clone()).await;
         }
     });
+    vec![]
 }
 
 // ── Reactive batch loop ────────────────────────────────────────────────────────
@@ -352,7 +353,10 @@ pub async fn run_batch_loop() {
         );
 
         let txs = pool.drain_all();
-        try_mine(txs, &miner).await;
+        let unprocessed = try_mine(txs, &miner).await;
+        for tx in unprocessed {
+            pool.push(tx);
+        }
 
         last_block_at    = Instant::now();
         batch_started_at = None;

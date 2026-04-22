@@ -116,15 +116,15 @@ pub fn check_slot_winner(prev_hash: &str) -> Option<(String, String)> {
     // (which uses DRS = stake + coverage).  Using DRS here ensures the PoC
     // ticket lottery and the BFT consensus lottery agree on who is eligible.
     let all_validators = crate::p2p::get_known_validators_snapshot();
+
+    if all_validators.is_empty() {
+        let ticket_hex = hex::encode(ticket);
+        eprintln!("[PoC] Solo slot {} — ticket {}…", slot, &ticket_hex[..16]);
+        return Some((ticket_hex, sig_hex));
+    }
+
     let my_drs    = crate::bft_committee::compute_drs_weight(&ledger.address);
-    let total_drs = if all_validators.is_empty() {
-        // No peers known yet (bootstrap) — use coverage-only fallback so
-        // the genesis node can still produce blocks.
-        let my_score = my_coverage_score();
-        my_score as f64 / 10.0 // same COVERAGE_PER_WEIGHT as bft_committee
-    } else {
-        crate::bft_committee::total_drs_weight(&all_validators)
-    };
+    let total_drs = crate::bft_committee::total_drs_weight(&all_validators);
 
     if crate::bft_committee::qualifies_proposer(&ticket, my_drs, total_drs) {
         let ticket_hex = hex::encode(ticket);
