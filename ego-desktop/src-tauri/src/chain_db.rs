@@ -28,6 +28,9 @@ const CF_COMPUTE_RESERVATIONS: &str = "compute_reservations";
 const CF_STORAGE_DEALS:        &str = "storage_deals";
 const CF_CLUSTER_BOOKINGS:     &str = "cluster_bookings";
 const CF_CONTRACT_STATE:       &str = "contract_state";
+const CF_L2_CHANNELS:          &str = "cf_l2_channels";
+const CF_L2_BATCHES:           &str = "cf_l2_batches";
+const CF_L2_STATE:             &str = "cf_l2_state";
 
 const ALL_CFS: &[&str] = &[
     CF_BLOCKS, CF_TXS, CF_BLOCK_TXS, CF_ADDR_TXS, CF_BALANCES,
@@ -35,6 +38,7 @@ const ALL_CFS: &[&str] = &[
     CF_HOSTING, CF_HOSTING_NODES, CF_HOSTING_PLANS,
     CF_COMPUTE_NODES, CF_COMPUTE_JOBS, CF_COMPUTE_OFFERS, CF_COMPUTE_RESERVATIONS,
     CF_STORAGE_DEALS, CF_CLUSTER_BOOKINGS, CF_CONTRACT_STATE,
+    CF_L2_CHANNELS, CF_L2_BATCHES, CF_L2_STATE,
 ];
 
 pub const FEATURE_DILITHIUM_DISABLED: &str = "dilithium_disabled";
@@ -211,6 +215,7 @@ fn seed_genesis(db: &DB) {
         poc_ticket: String::new(),
         poc_slot: 0,
         state_root: String::new(),
+        base_fee_uegoc: 1_000,
     };
     write_block_batch(db, &genesis, &[]);
 
@@ -249,6 +254,7 @@ fn migrate_from_sqlite(db: &DB, path: &std::path::Path) -> bool {
             poc_ticket: String::new(),
             poc_slot: 0,
             state_root: String::new(),
+            base_fee_uegoc: 1_000,
         })
     }).unwrap().filter_map(|r| r.ok()).collect();
 
@@ -539,9 +545,12 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
         }
     }
 
-    // Balance cache.
     for (addr, bal) in &new_balances {
-        batch.put_cf(cf_balances, addr.as_bytes(), u64_le(*bal));
+        if *bal == 0 {
+            batch.delete_cf(cf_balances, addr.as_bytes());
+        } else {
+            batch.put_cf(cf_balances, addr.as_bytes(), u64_le(*bal));
+        }
     }
 
     // Meta: latest_height and tx_count.
@@ -610,10 +619,41 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
 //
 // RocksDB's delete_range_cf is O(log N) — it writes a range tombstone, not N deletes.
 
+fn prune_zero_balance_accounts(db: &DB) -> u64 {
+    let cf = match db.cf_handle(CF_BALANCES) { Some(c) => c, None => return 0 };
+    let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
+    {
+        let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            if let Ok((k, v)) = item {
+                if read_u64_le(&v) == 0 {
+                    keys_to_delete.push(k.to_vec());
+                }
+            }
+        }
+    }
+    let count = keys_to_delete.len() as u64;
+    if count > 0 {
+        let mut batch = WriteBatch::default();
+        for k in &keys_to_delete {
+            batch.delete_cf(cf, k);
+        }
+        let _ = db.write(batch);
+    }
+    count
+}
+
 fn prune_if_needed(db: &DB) {
     let cf_meta = db.cf_handle(CF_META).unwrap();
     let latest = db.get_cf(cf_meta, META_LATEST_HEIGHT)
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+
+    if latest % 10_000 == 0 && latest > 0 {
+        let pruned = prune_zero_balance_accounts(db);
+        if pruned > 0 {
+            eprintln!("[ChainDB] Pruned {} zero-balance accounts from state trie", pruned);
+        }
+    }
 
     // Only prune every 50 blocks to amortise overhead.
     if latest % 50 != 0 { return; }
@@ -981,8 +1021,12 @@ pub fn compute_full_state_root() -> String {
         return "0".repeat(64);
     }
     let leaf_strings: Vec<String> = entries.iter()
+        .filter(|(_, bal)| *bal > 0)
         .map(|(k, bal)| balance_leaf(k, *bal))
         .collect();
+    if leaf_strings.is_empty() {
+        return "0".repeat(64);
+    }
     let refs: Vec<&str> = leaf_strings.iter().map(|s| s.as_str()).collect();
     compute_merkle_root(&refs)
 }
@@ -1024,26 +1068,31 @@ pub fn get_state_merkle_proof(address: &str) -> Vec<String> {
 pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc_slot: u64) -> LedgerBlock {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
 
-    let (latest_height, prev_hash) = {
+    let (latest_height, prev_hash, prev_base_fee) = {
         let cf_meta = db.cf_handle(CF_META).unwrap();
         let h = db.get_cf(cf_meta, META_LATEST_HEIGHT)
             .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
         let cf_blocks = db.cf_handle(CF_BLOCKS).unwrap();
-        let hash = db.get_cf(cf_blocks, height_key(h))
+        let prev_block = db.get_cf(cf_blocks, height_key(h))
             .ok().flatten()
-            .and_then(|v| decode::<LedgerBlock>(&v))
-            .map(|b| b.hash)
-            .unwrap_or_else(|| GENESIS_HASH.to_string());
-        (h, hash)
+            .and_then(|v| decode::<LedgerBlock>(&v));
+        let hash = prev_block.as_ref().map(|b| b.hash.clone()).unwrap_or_else(|| GENESIS_HASH.to_string());
+        let base_fee = prev_block.map(|b| b.base_fee_uegoc).unwrap_or(0);
+        let base_fee = if base_fee == 0 { 1_000 } else { base_fee };
+        (h, hash, base_fee)
     };
 
     let height    = latest_height + 1;
     let timestamp = chrono::Utc::now().timestamp();
+
+    let user_tx_count = txs.iter().filter(|t| {
+        !t.from.is_empty() && t.tx_type != "reward" && t.tx_type != "coinbase"
+    }).count();
+    let new_base_fee = compute_next_base_fee(prev_base_fee, user_tx_count);
+
     let tx_fees_sum: u64 = txs.iter().map(|t| t.fee_uegoc).sum();
     let reward    = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash);
 
-    // ── 1. Build all transactions first — merkle root must be computed
-    //       BEFORE the block hash so the hash commits to tx content.
     let coinbase_hash = format!("0x{}", blake3::hash(
         format!("coinbase:{height}:{miner}:{reward}:{timestamp}").as_bytes()
     ).to_hex());
@@ -1169,30 +1218,70 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
         poc_ticket: poc_ticket.to_string(),
         poc_slot,
         state_root,
+        base_fee_uegoc: new_base_fee,
     };
 
     write_block_batch(&db, &block, &stamped);
+
+    {
+        let cf_bal = db.cf_handle(CF_BALANCES).unwrap();
+        let mut burn_batch = WriteBatch::default();
+        let mut total_burned: u64 = 0;
+        for tx in txs {
+            let is_system = tx.from.is_empty()
+                || tx.from == NODE_POOL_ADDR
+                || tx.from.starts_with("egot1faucet")
+                || tx.from.starts_with("egot1genesis")
+                || tx.tx_type == "reward"
+                || tx.tx_type == "coinbase";
+            if !is_system {
+                let cur = db.get_cf(cf_bal, tx.from.as_bytes())
+                    .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+                let burned = cur.min(new_base_fee);
+                if burned > 0 {
+                    burn_batch.put_cf(cf_bal, tx.from.as_bytes(), u64_le(cur - burned));
+                    total_burned = total_burned.saturating_add(burned);
+                }
+            }
+        }
+        if total_burned > 0 {
+            if let Err(e) = db.write(burn_batch) {
+                eprintln!("[BaseFee] burn write failed: {e}");
+            } else {
+                eprintln!("[BaseFee] Block #{height} burned {} uEGOC base fees ({} user txs, {} uEGOC each)",
+                    total_burned, user_tx_count, new_base_fee);
+            }
+        }
+    }
+
     block
 }
 
 pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc_slot: u64) -> (LedgerBlock, Vec<LedgerTx>) {
     let db = get_db().lock().expect("chain_db lock poisoned");
 
-    let (latest_height, prev_hash) = {
+    let (latest_height, prev_hash, prev_base_fee) = {
         let cf_meta = db.cf_handle(CF_META).expect("CF_META missing");
         let h = db.get_cf(cf_meta, META_LATEST_HEIGHT)
             .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
         let cf_blocks = db.cf_handle(CF_BLOCKS).expect("CF_BLOCKS missing");
-        let hash = db.get_cf(cf_blocks, height_key(h))
+        let prev_block = db.get_cf(cf_blocks, height_key(h))
             .ok().flatten()
-            .and_then(|v| decode::<LedgerBlock>(&v))
-            .map(|b| b.hash)
-            .unwrap_or_else(|| GENESIS_HASH.to_string());
-        (h, hash)
+            .and_then(|v| decode::<LedgerBlock>(&v));
+        let hash = prev_block.as_ref().map(|b| b.hash.clone()).unwrap_or_else(|| GENESIS_HASH.to_string());
+        let base_fee = prev_block.map(|b| b.base_fee_uegoc).unwrap_or(0);
+        let base_fee = if base_fee == 0 { 1_000 } else { base_fee };
+        (h, hash, base_fee)
     };
 
     let height    = latest_height + 1;
     let timestamp = chrono::Utc::now().timestamp();
+
+    let user_tx_count = txs.iter().filter(|t| {
+        !t.from.is_empty() && t.tx_type != "reward" && t.tx_type != "coinbase"
+    }).count();
+    let new_base_fee = compute_next_base_fee(prev_base_fee, user_tx_count);
+
     let tx_fees_sum: u64 = txs.iter().map(|t| t.fee_uegoc).sum();
     let reward    = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash);
 
@@ -1338,6 +1427,7 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         poc_ticket: poc_ticket.to_string(),
         poc_slot,
         state_root,
+        base_fee_uegoc: new_base_fee,
     };
 
     (block, stamped)
@@ -1563,7 +1653,11 @@ pub fn apply_missing_tx(block_height: u64, tx: &LedgerTx) {
     }
 
     for (addr, bal) in &new_balances {
-        batch.put_cf(cf_balances, addr.as_bytes(), u64_le(*bal));
+        if *bal == 0 {
+            batch.delete_cf(cf_balances, addr.as_bytes());
+        } else {
+            batch.put_cf(cf_balances, addr.as_bytes(), u64_le(*bal));
+        }
     }
 
     let cur_tx_count = db.get_cf(cf_meta, META_TX_COUNT)
@@ -1761,6 +1855,41 @@ pub fn get_tip_hash() -> String {
         .unwrap_or_else(|| GENESIS_HASH.to_string())
 }
 
+pub fn compute_next_base_fee(prev_base_fee: u64, tx_count: usize) -> u64 {
+    const TARGET_TX_COUNT: usize = 5_000;
+    const MAX_CHANGE_DENOMINATOR: u64 = 8;
+    const FLOOR: u64 = 1_000;
+
+    let prev = prev_base_fee.max(FLOOR);
+    if tx_count == TARGET_TX_COUNT {
+        return prev;
+    }
+    let delta = if tx_count > TARGET_TX_COUNT {
+        let excess = (tx_count - TARGET_TX_COUNT) as u64;
+        let change = prev.saturating_mul(excess) / (TARGET_TX_COUNT as u64 * MAX_CHANGE_DENOMINATOR);
+        prev.saturating_add(change.max(1))
+    } else {
+        let deficit = (TARGET_TX_COUNT - tx_count) as u64;
+        let change = prev.saturating_mul(deficit) / (TARGET_TX_COUNT as u64 * MAX_CHANGE_DENOMINATOR);
+        prev.saturating_sub(change).max(FLOOR)
+    };
+    delta.max(FLOOR)
+}
+
+pub fn get_current_base_fee() -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf_meta   = db.cf_handle(CF_META).unwrap();
+    let cf_blocks = db.cf_handle(CF_BLOCKS).unwrap();
+    let h = db.get_cf(cf_meta, META_LATEST_HEIGHT)
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    let fee = db.get_cf(cf_blocks, height_key(h))
+        .ok().flatten()
+        .and_then(|v| decode::<LedgerBlock>(&v))
+        .map(|b| b.base_fee_uegoc)
+        .unwrap_or(0);
+    if fee == 0 { 1_000 } else { fee }
+}
+
 // ── RPC helpers ───────────────────────────────────────────────────────────────
 
 /// Return up to `limit` transactions for `address`, newest first.
@@ -1787,6 +1916,37 @@ pub fn get_blocks_range(from_height: u64, limit: u32) -> Vec<LedgerBlock> {
         }
     }
     out
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StateStats {
+    pub total_accounts:       u64,
+    pub total_supply_uegoc:   u64,
+    pub db_size_estimate_mb:  f64,
+}
+
+pub fn get_state_stats() -> StateStats {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_BALANCES) {
+        Some(c) => c,
+        None => return StateStats { total_accounts: 0, total_supply_uegoc: 0, db_size_estimate_mb: 0.0 },
+    };
+    let mut total_accounts: u64 = 0;
+    let mut total_supply:   u64 = 0;
+    let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+    for item in iter {
+        if let Ok((_, v)) = item {
+            let bal = read_u64_le(&v);
+            if bal > 0 {
+                total_accounts += 1;
+                total_supply = total_supply.saturating_add(bal);
+            }
+        }
+    }
+    let db_size_bytes = db.property_int_value("rocksdb.estimate-live-data-size")
+        .ok().flatten().unwrap_or(0);
+    let db_size_mb = db_size_bytes as f64 / (1024.0 * 1024.0);
+    StateStats { total_accounts, total_supply_uegoc: total_supply, db_size_estimate_mb: db_size_mb }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -3063,4 +3223,106 @@ pub fn load_contract_state(addr: &str) -> Option<String> {
     let cf = db.cf_handle(CF_CONTRACT_STATE)?;
     db.get_cf(&cf, addr.as_bytes()).ok().flatten()
         .and_then(|v| String::from_utf8(v.to_vec()).ok())
+}
+
+pub fn apply_balance_delta(addr: &str, delta: i64) {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_BALANCES).unwrap();
+    let cur = db.get_cf(cf, addr.as_bytes())
+        .ok().flatten()
+        .map(|v| read_u64_le(&v))
+        .unwrap_or(0);
+    let new_bal = (cur as i128 + delta as i128).max(0) as u64;
+    let _ = db.put_cf(cf, addr.as_bytes(), u64_le(new_bal));
+}
+
+pub fn save_state_channel(ch: &crate::l2::state_channel::StateChannel) -> Result<(), String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_L2_CHANNELS).ok_or("CF_L2_CHANNELS missing")?;
+    db.put_cf(cf, ch.channel_id.as_bytes(), encode(ch))
+        .map_err(|e| e.to_string())
+}
+
+pub fn get_state_channel(id: &str) -> Option<crate::l2::state_channel::StateChannel> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_L2_CHANNELS)?;
+    db.get_cf(cf, id.as_bytes()).ok().flatten().and_then(|v| decode(&v))
+}
+
+pub fn get_channels_for_address(addr: &str) -> Vec<crate::l2::state_channel::StateChannel> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_L2_CHANNELS) { Some(c) => c, None => return vec![] };
+    db.iterator_cf(cf, rocksdb::IteratorMode::Start)
+        .flatten()
+        .filter_map(|(_, v)| decode::<crate::l2::state_channel::StateChannel>(&v))
+        .filter(|ch| ch.party_a == addr || ch.party_b == addr)
+        .collect()
+}
+
+pub fn save_l2_batch(batch: &crate::l2::rollup::RollupBatch) -> Result<(), String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_L2_BATCHES).ok_or("CF_L2_BATCHES missing")?;
+    db.put_cf(cf, batch.batch_id.as_bytes(), encode(batch))
+        .map_err(|e| e.to_string())
+}
+
+pub fn get_l2_batch(id: &str) -> Option<crate::l2::rollup::RollupBatch> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_L2_BATCHES)?;
+    db.get_cf(cf, id.as_bytes()).ok().flatten().and_then(|v| decode(&v))
+}
+
+pub fn get_l2_batches_from(from_height: u64) -> Vec<crate::l2::rollup::RollupBatch> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_L2_BATCHES) { Some(c) => c, None => return vec![] };
+    db.iterator_cf(cf, rocksdb::IteratorMode::Start)
+        .flatten()
+        .filter_map(|(_, v)| decode::<crate::l2::rollup::RollupBatch>(&v))
+        .filter(|b| b.l1_height >= from_height)
+        .collect()
+}
+
+const L2_BALANCES_KEY: &[u8] = b"l2_current_balances";
+
+pub fn get_l2_balances() -> std::collections::HashMap<String, u64> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_L2_STATE) { Some(c) => c, None => return Default::default() };
+    db.get_cf(cf, L2_BALANCES_KEY).ok().flatten()
+        .and_then(|v| serde_json::from_slice(&v).ok())
+        .unwrap_or_default()
+}
+
+pub fn set_l2_balances(bal: &std::collections::HashMap<String, u64>) -> Result<(), String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_L2_STATE).ok_or("CF_L2_STATE missing")?;
+    let bytes = serde_json::to_vec(bal).map_err(|e| e.to_string())?;
+    db.put_cf(cf, L2_BALANCES_KEY, bytes).map_err(|e| e.to_string())
+}
+
+pub fn get_l2_balances_at(l1_height: u64) -> std::collections::HashMap<String, u64> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_L2_BATCHES) { Some(c) => c, None => return Default::default() };
+    let mut balances: std::collections::HashMap<String, u64> = Default::default();
+    let batches: Vec<crate::l2::rollup::RollupBatch> = db
+        .iterator_cf(cf, rocksdb::IteratorMode::Start)
+        .flatten()
+        .filter_map(|(_, v)| decode::<crate::l2::rollup::RollupBatch>(&v))
+        .filter(|b| {
+            b.l1_height <= l1_height
+                && b.status == crate::l2::rollup::BatchStatus::Finalized
+        })
+        .collect();
+    let mut sorted = batches;
+    sorted.sort_by_key(|b| b.l1_height);
+    for batch in &sorted {
+        for tx in &batch.l2_txs {
+            let from_bal = *balances.get(&tx.from).unwrap_or(&0);
+            let cost = tx.amount.saturating_add(tx.fee_l2);
+            if from_bal >= cost {
+                *balances.entry(tx.from.clone()).or_insert(0) -= cost;
+                *balances.entry(tx.to.clone()).or_insert(0) += tx.amount;
+            }
+        }
+    }
+    balances
 }

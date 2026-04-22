@@ -9,6 +9,7 @@ mod commands;
 mod config;
 mod email;
 mod error;
+mod l2;
 mod ledger;
 mod mempool;
 mod p2p;
@@ -389,6 +390,7 @@ fn main() {
             commands::auth::get_app_settings,
             commands::auth::save_app_settings,
             commands::explorer::get_network_stats,
+            commands::explorer::get_state_stats,
             commands::explorer::get_egoc_price_usd,
             commands::explorer::get_network_capacity,
             commands::explorer::get_p2p_status,
@@ -397,6 +399,7 @@ fn main() {
             commands::explorer::get_block_info,
             commands::explorer::get_transaction_info,
             commands::explorer::get_file_events,
+            commands::explorer::get_base_fee,
             commands::notifications::import_shared_file,
             commands::messenger::get_my_contact_bundle,
             commands::messenger::revoke_contact_bundle,
@@ -526,7 +529,14 @@ fn main() {
             commands::cluster::get_cluster_wg_config,
             commands::cluster::get_node_wg_config,
             commands::cluster::get_cluster_connect_info,
-            commands::cluster::send_cluster_node_heartbeat
+            commands::cluster::send_cluster_node_heartbeat,
+            commands::l2::open_state_channel,
+            commands::l2::get_my_channels,
+            commands::l2::close_state_channel,
+            commands::l2::finalize_state_channel,
+            commands::l2::submit_l2_batch,
+            commands::l2::get_rollup_batches,
+            commands::l2::challenge_rollup_batch
         ])
         .setup(|app| {
 

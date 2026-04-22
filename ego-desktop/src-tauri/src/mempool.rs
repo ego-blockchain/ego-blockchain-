@@ -130,6 +130,14 @@ impl ShardedMempool {
                 );
                 return;
             }
+            let current_base_fee = crate::chain_db::get_current_base_fee();
+            if tx.fee_uegoc < current_base_fee {
+                eprintln!(
+                    "[Mempool] Rejected {} — fee {} uEGOC below current base fee {}",
+                    &tx.hash[..12.min(tx.hash.len())], tx.fee_uegoc, current_base_fee
+                );
+                return;
+            }
 
             if tx.nonce > 0 {
                 let confirmed_nonce = crate::ledger::last_confirmed_nonce(&tx.from);
