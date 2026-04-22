@@ -1931,6 +1931,32 @@ pub fn get_blocks_range(from_height: u64, limit: u32) -> Vec<LedgerBlock> {
     out
 }
 
+pub fn get_block_hash_at(height: u64) -> Option<String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_BLOCKS).unwrap();
+    db.get_cf(cf, height_key(height)).ok().flatten()
+        .and_then(|v| decode::<LedgerBlock>(&v))
+        .map(|b| b.hash)
+}
+
+pub fn record_local_proof(prover: &str, cid: &str, _seed: &str, proof_json: &str) {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return };
+    let h = db.get_cf(cf, META_LATEST_HEIGHT)
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    let epoch = h / 100;
+    let key = format!("proof:{}:{}:{}", prover, cid, epoch);
+    let _ = db.put_cf(cf, key.as_bytes(), proof_json.as_bytes());
+}
+
+pub fn get_local_proof(prover: &str, cid: &str, epoch: u64) -> Option<String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return None };
+    let key = format!("proof:{}:{}:{}", prover, cid, epoch);
+    db.get_cf(cf, key.as_bytes()).ok().flatten()
+        .and_then(|v| std::str::from_utf8(&v).ok().map(|s| s.to_string()))
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StateStats {
     pub total_accounts:       u64,
@@ -3364,4 +3390,18 @@ pub fn get_l2_balances_at(l1_height: u64) -> std::collections::HashMap<String, u
         }
     }
     balances
+}
+
+pub fn get_meta_u64(key: &[u8]) -> Option<u64> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_META)?;
+    let bytes = db.get_cf(cf, key).ok()??;
+    if bytes.len() == 8 { Some(u64::from_le_bytes(<[u8; 8]>::try_from(bytes.as_ref()).ok()?)) } else { None }
+}
+
+pub fn set_meta_u64(key: &[u8], val: u64) {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cf) = db.cf_handle(CF_META) {
+        let _ = db.put_cf(cf, key, &val.to_le_bytes());
+    }
 }

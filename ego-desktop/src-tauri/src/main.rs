@@ -122,6 +122,7 @@ fn headless_main() {
     rt.block_on(async {
         crate::ledger::reconcile_stake_state();
         crate::chain_db::restore_in_memory_state_from_db();
+        crate::sharding::load_agreed_shard_count_from_db();
 
         tokio::spawn(async {
             crate::p2p::start_p2p_server(None).await;
@@ -142,6 +143,10 @@ fn headless_main() {
 
         tokio::spawn(async {
             crate::commands::consensus::run_post_loop().await;
+        });
+
+        tokio::spawn(async {
+            crate::p2p::run_shard_rebalance_monitor().await;
         });
 
         eprintln!("[Headless] All services started. RPC on port 47395. P2P on port {}",
@@ -619,6 +624,7 @@ fn main() {
                 // Restore in-memory nonce + stake stores from RocksDB so replay
                 // protection and validator stake tracking survive node restarts.
                 crate::chain_db::restore_in_memory_state_from_db();
+                crate::sharding::load_agreed_shard_count_from_db();
 
                 // Pre-populate known_validators from recent block miners so the
                 // BFT threshold is correct immediately on reconnect, before
@@ -746,6 +752,10 @@ fn main() {
 
             tauri::async_runtime::spawn(async move {
                 crate::commands::consensus::run_post_loop().await;
+            });
+
+            tauri::async_runtime::spawn(async move {
+                crate::p2p::run_shard_rebalance_monitor().await;
             });
 
             // Restore any txs that were pending when the app last closed.
