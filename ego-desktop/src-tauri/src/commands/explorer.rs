@@ -213,3 +213,22 @@ pub async fn get_network_capacity() -> NetworkCapacity {
 pub async fn get_state_stats() -> crate::chain_db::StateStats {
     crate::chain_db::get_state_stats()
 }
+
+#[derive(serde::Serialize)]
+pub struct SupplyInfo {
+    pub total_supply_uegoc: u64,
+    pub circulating_uegoc: u64,
+    pub remaining_mintable_uegoc: u64,
+    pub current_block_reward_uegoc: u64,
+}
+
+#[tauri::command]
+pub async fn get_supply_info() -> SupplyInfo {
+    let (height, _) = crate::chain_db::latest_block_info();
+    SupplyInfo {
+        total_supply_uegoc: crate::tokenomics::TOTAL_SUPPLY_UEGOC,
+        circulating_uegoc: crate::chain_db::get_total_circulating_supply(),
+        remaining_mintable_uegoc: crate::chain_db::remaining_mintable(),
+        current_block_reward_uegoc: crate::chain_db::block_reward_at_height(height),
+    }
+}

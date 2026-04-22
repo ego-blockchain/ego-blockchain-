@@ -308,6 +308,70 @@ pub fn get_mempool() -> Arc<ShardedMempool> {
     MEMPOOL.get_or_init(ShardedMempool::new).clone()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ledger::LedgerTx;
+
+    fn sys_tx(hash: &str) -> LedgerTx {
+        LedgerTx { hash: hash.to_string(), from: String::new(), to: "egot1recv".to_string(),
+            amount: 0, fee_uegoc: 0, tx_type: "coinbase".to_string(),
+            timestamp: 0, status: "Pending".to_string(), ..LedgerTx::default() }
+    }
+
+    #[test]
+    fn shard_is_deterministic() {
+        assert_eq!(shard_for_address("egot1abc"), shard_for_address("egot1abc"));
+        assert!(shard_for_address("egot1abc") < SHARD_COUNT);
+    }
+
+    #[test]
+    fn duplicate_hash_rejected() {
+        let pool = ShardedMempool::new();
+        let tx = sys_tx("0xdup");
+        pool.push(tx.clone());
+        pool.push(tx);
+        assert_eq!(pool.pending_count(), 1);
+    }
+
+    #[test]
+    fn system_tx_bypasses_fee_check() {
+        let pool = ShardedMempool::new();
+        pool.push(sys_tx("0xcb1"));
+        assert_eq!(pool.pending_count(), 1);
+    }
+
+    #[test]
+    fn drain_empties_pool() {
+        let pool = ShardedMempool::new();
+        for i in 0..4u64 {
+            pool.push(sys_tx(&format!("0xd{i}")));
+        }
+        let got = pool.drain_all();
+        assert_eq!(got.len(), 4);
+        assert_eq!(pool.pending_count(), 0);
+    }
+
+    #[test]
+    fn user_tx_below_fee_floor_rejected() {
+        let pool = ShardedMempool::new();
+        let tx = LedgerTx {
+            hash: "0xlow".to_string(),
+            from: "egot1sender0000000000000000000000000000000000".to_string(),
+            to: "egot1recv".to_string(),
+            amount: 1000,
+            fee_uegoc: MIN_FEE_UEGOC - 1,
+            nonce: 1,
+            tx_type: "transfer".to_string(),
+            timestamp: chrono::Utc::now().timestamp(),
+            status: "Pending".to_string(),
+            ..LedgerTx::default()
+        };
+        pool.push(tx);
+        assert_eq!(pool.pending_count(), 0);
+    }
+}
+
 // ── Block production helpers ───────────────────────────────────────────────────
 
 fn get_miner_address() -> Option<String> {

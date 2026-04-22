@@ -914,6 +914,6 @@ pub async fn deposit_in_relay_inbox(from_addr: &str, to_addr: &str, msg: &crate:
     crate::p2p::dht_inbox_deposit(from_addr, to_addr, msg).await;
 }
 
-pub async fn poll_relay_inbox(my_addr: &str, _app: &tauri::AppHandle) {
+pub async fn poll_relay_inbox(my_addr: &str, _app: Option<&tauri::AppHandle<tauri::Wry>>) {
     crate::p2p::dht_inbox_poll(my_addr).await;
 }

@@ -1,8 +1,19 @@
 use crate::error::EgoResult;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+use std::sync::OnceLock;
 use ego_core::{Address, KeyPair};
 use std::collections::HashMap;
+
+static GLOBAL_APP_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
+
+pub fn global_app_state() -> Arc<AppState> {
+    GLOBAL_APP_STATE.get_or_init(|| Arc::new(AppState::new())).clone()
+}
+
+pub fn init_global_app_state(state: Arc<AppState>) {
+    let _ = GLOBAL_APP_STATE.set(state);
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PeerInfo {

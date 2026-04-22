@@ -131,7 +131,7 @@ pub async fn import_shared_file(
     Ok(stored)
 }
 
-pub async fn try_auto_import(app: &AppHandle, content: &str, from_addr: &str) {
+pub async fn try_auto_import(app: Option<&AppHandle<tauri::Wry>>, content: &str, from_addr: &str) {
     // egoshare1:{cid}:{key_nonce_hex}:{name_b64}:{from}  — 5 parts
     // egoshare2:{cid}:{kem_ct}:{enc_key}:{name_b64}:{from}  — 6 parts
     let (prefix, cid, key_nonce_hex, name_field) = if content.starts_with("egoshare1:") {
@@ -153,19 +153,21 @@ pub async fn try_auto_import(app: &AppHandle, content: &str, from_addr: &str) {
 
     // Notify the frontend that a file bundle arrived — user must click "Save to EgoSafe"
     // to actually import it. Do NOT auto-save here.
-    let _ = app.emit_all("ego://file-received", serde_json::json!({
-        "cid":           cid,
-        "name":          display_name.clone(),
-        "key_nonce_hex": key_nonce_hex,
-        "from_address":  from_addr,
-    }));
+    if let Some(h) = app {
+        let _ = h.emit_all("ego://file-received", serde_json::json!({
+            "cid":           cid,
+            "name":          display_name.clone(),
+            "key_nonce_hex": key_nonce_hex,
+            "from_address":  from_addr,
+        }));
 
-    let from_short = if from_addr.len() > 12 {
-        format!("{}…", &from_addr[..12])
-    } else {
-        from_addr.to_string()
-    };
+        let from_short = if from_addr.len() > 12 {
+            format!("{}…", &from_addr[..12])
+        } else {
+            from_addr.to_string()
+        };
 
-    let security = if prefix == "egoshare2" { " (encrypted for you)" } else { "" };
-    notify(app, "File Received!", &format!("\"{}\" from {}{}", display_name, from_short, security));
+        let security = if prefix == "egoshare2" { " (encrypted for you)" } else { "" };
+        notify(h, "File Received!", &format!("\"{}\" from {}{}", display_name, from_short, security));
+    }
 }

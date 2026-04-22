@@ -239,7 +239,7 @@ pub const POST_SUSPEND_SECS:        i64 = 7 * 24 * 3600;
 
 /// Called from the background 30-second loop; runs the full check every 6 h.
 /// Pass in the Tauri app handle so we can fire a desktop notification on slash.
-pub async fn run_post_checks(app: &tauri::AppHandle) {
+pub async fn run_post_checks(app: Option<&tauri::AppHandle<tauri::Wry>>) {
     let now = chrono::Utc::now().timestamp();
     let mut ledger = crate::ledger::Ledger::load();
     let my_addr = ledger.address.clone();
@@ -355,11 +355,13 @@ pub async fn run_post_checks(app: &tauri::AppHandle) {
             eprintln!("[PoSt] SlashChallenge broadcast to peers: cid={} block={}", &cid[..16.min(cid.len())], &block_cid[..16.min(block_cid.len())]);
         }
 
-        crate::commands::notifications::notify(
-            app,
-            "Storage Proof Failed",
-            &format!("\"{}\" — rewards suspended 7 days (strike {}). Check your storage folder.", name, strikes),
-        );
+        if let Some(h) = app {
+            crate::commands::notifications::notify(
+                h,
+                "Storage Proof Failed",
+                &format!("\"{}\" — rewards suspended 7 days (strike {}). Check your storage folder.", name, strikes),
+            );
+        }
     }
     for (cid, collateral) in to_return_collateral {
         return_collateral(&my_addr, &cid, collateral).await;

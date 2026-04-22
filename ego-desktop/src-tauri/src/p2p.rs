@@ -1613,7 +1613,7 @@ pub async fn sync_chain_from_peers() {
     }
 }
 
-pub async fn broadcast_peer_announce(app: &tauri::AppHandle) {
+pub async fn broadcast_peer_announce(app: Option<&tauri::AppHandle<tauri::Wry>>) {
     let address = crate::ledger::Ledger::load().address.clone();
     if address.is_empty() { return; }
     let my_endpoint = get_public_endpoint().await;
@@ -1624,9 +1624,9 @@ pub async fn broadcast_peer_announce(app: &tauri::AppHandle) {
         .map(|w| w.name.clone())
         .unwrap_or_else(|| "Ego Node".to_string());
 
+    let state = crate::app::global_app_state();
 
     let (my_city, my_country) = {
-        let state = app.state::<crate::app::AppState>();
         let cache = state.cache.lock().unwrap();
         if let Some(ref cs) = cache.coverage_status {
             if let Some(ref loc) = cs.location {
@@ -1636,7 +1636,6 @@ pub async fn broadcast_peer_announce(app: &tauri::AppHandle) {
     };
 
     {
-        let state = app.state::<crate::app::AppState>();
         state.upsert_peer(crate::app::PeerInfo {
             address:   address.clone(),
             name:      name.clone(),
@@ -2191,7 +2190,7 @@ fn load_or_create_identity() -> libp2p::identity::Keypair {
 
 // ── Swarm entry point ─────────────────────────────────────────────────────────
 
-pub async fn start_p2p_server(app: tauri::AppHandle) {
+pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     #[cfg(target_os = "windows")]
     ensure_firewall_rule();
 
@@ -2448,7 +2447,7 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
 
             event = swarm.select_next_some() => {
                 handle_event(
-                    event, &app,
+                    event, app.as_ref(),
                     &mut external_addrs, &mut pending_sends, &mut in_flight,
                     &mut swarm, &relay_addrs,
                     &mut circuit_listener,
@@ -2598,8 +2597,10 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                         }
                     }
                     let _ = ledger.save();
-                    for cid in &timed_out {
-                        let _ = app.emit_all("ego://file-failed", serde_json::json!({ "cid": cid }));
+                    if let Some(ref h) = app {
+                        for cid in &timed_out {
+                            let _ = h.emit_all("ego://file-failed", serde_json::json!({ "cid": cid }));
+                        }
                     }
                 }
             }
@@ -2792,7 +2793,7 @@ fn build_circuit_addr(
 fn inject_circuit(
     circuit:        Multiaddr,
     external_addrs: &mut Vec<Multiaddr>,
-    app:            &tauri::AppHandle,
+    app:            Option<&tauri::AppHandle<tauri::Wry>>,
     local_peer_id:  &PeerId,
 ) {
     if !external_addrs.contains(&circuit) {
@@ -2801,16 +2802,18 @@ fn inject_circuit(
     }
     RELAY_CIRCUIT_READY.store(true, Ordering::Relaxed);
     let ep    = best_endpoint(external_addrs, local_peer_id);
-    let state = app.state::<crate::app::AppState>();
+    let state = crate::app::global_app_state();
     state.set_public_endpoint(ep.clone());
     state.set_upnp_status(Ok(()));
-    let _ = app.emit_all("ego://p2p-status-changed", ());
+    if let Some(h) = app {
+        let _ = h.emit_all("ego://p2p-status-changed", ());
+    }
 
-    let app_clone = app.clone();
+    let app_clone = app.cloned();
     tokio::spawn(async move {
 
         tokio::time::sleep(Duration::from_millis(300)).await;
-        broadcast_peer_announce(&app_clone).await;
+        broadcast_peer_announce(app_clone.as_ref()).await;
         eprintln!("[P2P] Re-announced after relay circuit confirmed");
 
         let addr = crate::ledger::Ledger::load().address;
@@ -2822,7 +2825,7 @@ fn inject_circuit(
 
 async fn handle_event(
     event:            SwarmEvent<EgoBehaviourEvent>,
-    app:              &tauri::AppHandle,
+    app:              Option<&tauri::AppHandle<tauri::Wry>>,
     external_addrs:   &mut Vec<Multiaddr>,
     pending_sends:    &mut HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>>,
     in_flight:        &mut HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>>,
@@ -2969,9 +2972,10 @@ async fn handle_event(
             }
             if !RELAY_CIRCUIT_READY.load(Ordering::Relaxed) {
                 let peer_id = *swarm.local_peer_id();
-                let state   = app.state::<crate::app::AppState>();
-                state.set_public_endpoint(best_endpoint(external_addrs, &peer_id));
-                let _ = app.emit_all("ego://p2p-status-changed", ());
+                crate::app::global_app_state().set_public_endpoint(best_endpoint(external_addrs, &peer_id));
+                if let Some(h) = app {
+                    let _ = h.emit_all("ego://p2p-status-changed", ());
+                }
             }
         }
 
@@ -3015,7 +3019,7 @@ async fn handle_event(
         SwarmEvent::Behaviour(EgoBehaviourEvent::Autonat(
             autonat::Event::StatusChanged { new, .. },
         )) => {
-            let state = app.state::<crate::app::AppState>();
+            let state = crate::app::global_app_state();
             match new {
                 autonat::NatStatus::Public(addr) => {
                     eprintln!("[P2P] AutoNAT: public at {}", addr);
@@ -3026,7 +3030,9 @@ async fn handle_event(
                     if !RELAY_CIRCUIT_READY.load(Ordering::Relaxed) {
                         let peer_id = *swarm.local_peer_id();
                         state.set_public_endpoint(best_endpoint(external_addrs, &peer_id));
-                        let _ = app.emit_all("ego://p2p-status-changed", ());
+                        if let Some(h) = app {
+                            let _ = h.emit_all("ego://p2p-status-changed", ());
+                        }
                     }
 
                     let peer_id = *swarm.local_peer_id();
@@ -3042,7 +3048,9 @@ async fn handle_event(
                 autonat::NatStatus::Private => {
                     eprintln!("[P2P] AutoNAT: behind NAT — relay required");
                     state.set_upnp_status(Err("Behind NAT — using relay".into()));
-                    let _ = app.emit_all("ego://p2p-status-changed", ());
+                    if let Some(h) = app {
+                        let _ = h.emit_all("ego://p2p-status-changed", ());
+                    }
                 }
                 autonat::NatStatus::Unknown => {}
             }
@@ -3054,8 +3062,8 @@ async fn handle_event(
             },
         )) => {
             let _ = swarm.behaviour_mut().request_response.send_response(channel, ());
-            let app = app.clone();
-            tokio::spawn(async move { handle_incoming(request, &app).await; });
+            let app2 = app.cloned();
+            tokio::spawn(async move { handle_incoming(request, app2.as_ref()).await; });
         }
 
         SwarmEvent::Behaviour(EgoBehaviourEvent::RequestResponse(
@@ -3098,21 +3106,21 @@ async fn handle_event(
                 if let Ok(P2PMessage::TxBroadcast { tx, block }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
-                    let app2 = app.clone();
-                    tokio::spawn(async move { apply_incoming_tx(tx, block, &app2).await; });
+                    let app2 = app.cloned();
+                    tokio::spawn(async move { apply_incoming_tx(tx, block, app2.as_ref()).await; });
                 }
             } else if topic == "ego-blocks-v1" {
                 match serde_json::from_slice::<P2PMessage>(&message.data) {
                     Ok(P2PMessage::ChainSyncResponse { blocks, transactions }) => {
-                        let app2 = app.clone();
-                        tokio::spawn(async move { merge_remote_chain(blocks, transactions, &app2).await; });
+                        let app2 = app.cloned();
+                        tokio::spawn(async move { merge_remote_chain(blocks, transactions, app2.as_ref()).await; });
                     }
                     Ok(P2PMessage::BlockFinalized { block, transactions, votes, agg_bls_sig, bls_pubkeys }) => {
                         let block_hash = block.hash.clone();
                         let height     = block.height;
-                        let app2 = app.clone();
+                        let app2 = app.cloned();
                         tokio::spawn(async move {
-                            merge_remote_chain(vec![block], transactions, &app2).await;
+                            merge_remote_chain(vec![block], transactions, app2.as_ref()).await;
                             process_inbound_qc_finalization(&block_hash, height, &votes, &agg_bls_sig, &bls_pubkeys);
                         });
                     }
@@ -3137,9 +3145,9 @@ async fn handle_event(
                 {
 
                     register_known_validator(&proposer);
-                    let app2 = app.clone();
+                    let app2 = app.cloned();
                     tokio::spawn(async move {
-                        handle_block_proposal(block, transactions, proposer, &app2).await;
+                        handle_block_proposal(block, transactions, proposer, app2.as_ref()).await;
                     });
                 }
             } else if topic == "ego-votes-v1" {
@@ -3147,9 +3155,9 @@ async fn handle_event(
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
                     register_known_validator(&voter);
-                    let app2 = app.clone();
+                    let app2 = app.cloned();
                     tokio::spawn(async move {
-                        handle_block_vote(block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, &app2).await;
+                        handle_block_vote(block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, app2.as_ref()).await;
                     });
                 }
             } else if topic == "ego-sync-v1" {
@@ -3198,10 +3206,12 @@ async fn handle_event(
                 {
 
                     if !slashed_validators().contains(&voter) {
-                        let app2 = app.clone();
+                        let app2 = app.cloned();
                         tokio::spawn(async move {
                             handle_view_change_msg(view, voter).await;
-                            let _ = app2.emit_all("ego://view-changed", serde_json::json!({ "view": view }));
+                            if let Some(ref h) = app2 {
+                                let _ = h.emit_all("ego://view-changed", serde_json::json!({ "view": view }));
+                            }
                         });
                     }
                 }
@@ -3209,8 +3219,8 @@ async fn handle_event(
 
                 match serde_json::from_slice::<P2PMessage>(&message.data) {
                     Ok(msg @ P2PMessage::PeerAnnounce { .. }) => {
-                        let app2 = app.clone();
-                        tokio::spawn(async move { handle_incoming(msg, &app2).await; });
+                        let app2 = app.cloned();
+                        tokio::spawn(async move { handle_incoming(msg, app2.as_ref()).await; });
                     }
                     Ok(P2PMessage::PeerSeedGossip { multiaddrs, known_count }) => {
 
@@ -3338,10 +3348,12 @@ async fn handle_event(
                         if crate::chain_db::get_cluster_booking(&booking.cluster_id).is_none() {
                             crate::chain_db::upsert_cluster_booking(&booking);
                             let cluster_id = booking.cluster_id.clone();
-                            let app2 = app.clone();
-                            tokio::spawn(async move {
-                                crate::commands::cluster::auto_join_cluster(cluster_id, app2).await;
-                            });
+                            let app2 = app.cloned();
+                            if let Some(h) = app2 {
+                                tokio::spawn(async move {
+                                    crate::commands::cluster::auto_join_cluster(cluster_id, h).await;
+                                });
+                            }
                         }
                     }
                     Ok(P2PMessage::ClusterNodeJoined { cluster_id, provider_address, wg_pubkey, endpoint }) => {
@@ -3553,10 +3565,10 @@ async fn handle_event(
                             let _ = crate::blocks::save_manifest(&manifest);
                             eprintln!("[DHT] Manifest {} received from DHT ({} blocks)", &manifest_cid[..16.min(manifest_cid.len())], manifest.blocks.len());
 
-                            let app2 = app.clone();
+                            let app2 = app.cloned();
                             let mcid = manifest_cid.clone();
                             tokio::spawn(async move {
-                                process_received_manifest(&mcid, &app2).await;
+                                process_received_manifest(&mcid, app2.as_ref()).await;
                             });
                         }
                     } else if key_str.starts_with("ego-block:") {
@@ -3566,9 +3578,9 @@ async fn handle_event(
                             let _ = crate::blocks::save_block(&block_cid, &rec.record.value);
                             eprintln!("[DHT] Block {} received from DHT ({} bytes)", &block_cid[..16.min(block_cid.len())], rec.record.value.len());
 
-                            let app2 = app.clone();
+                            let app2 = app.cloned();
                             tokio::spawn(async move {
-                                check_block_completes_manifests(&block_cid, &app2).await;
+                                check_block_completes_manifests(&block_cid, app2.as_ref()).await;
                             });
                         }
                     } else if key_str.starts_with("ego-relay:") {
@@ -3590,10 +3602,10 @@ async fn handle_event(
                         let value = rec.record.value.clone();
                         if !value.is_empty() {
                             if let Ok(msg) = serde_json::from_slice::<P2PMessage>(&value) {
-                                let app2 = app.clone();
+                                let app2 = app.cloned();
                                 let key2 = key_str.clone();
                                 eprintln!("[DHT-Inbox] Processing message from {}", key2);
-                                tokio::spawn(async move { handle_incoming(msg, &app2).await; });
+                                tokio::spawn(async move { handle_incoming(msg, app2.as_ref()).await; });
 
                                 if let Some(tx) = DHT_CMD_TX.get() {
                                     let _ = tx.send(DhtCommand::PutPeer {
@@ -3627,7 +3639,7 @@ async fn handle_event(
     }
 }
 
-pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
+pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<tauri::Wry>>) {
     match msg {
         P2PMessage::ContactRequest {
             from_addr, from_name, from_ed25519, from_kyber, from_shared_key, from_endpoint, bundle_token,
@@ -3666,8 +3678,10 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
             };
             contacts.push(contact.clone());
             let _ = save_contacts(&contacts);
-            crate::commands::notifications::notify(&app, "Contact Request", &format!("{} wants to connect with you", from_name));
-            let _ = app.emit_all("ego://contact-request", &contact);
+            if let Some(h) = app {
+                crate::commands::notifications::notify(h, "Contact Request", &format!("{} wants to connect with you", from_name));
+                let _ = h.emit_all("ego://contact-request", &contact);
+            }
         }
 
         P2PMessage::FileChunk { .. } => {
@@ -3691,12 +3705,14 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                 peer_relay_nodes().insert(from_addr.clone(), endpoint.clone());
                 eprintln!("[relay-server] Discovered community relay node at {}", endpoint);
             }
-            let _ = app.emit_all("ego://data-manifest", serde_json::json!({
-                "from_addr":    from_addr,
-                "cid_count":    cids.len(),
-                "available_gb": available_gb,
-                "is_relay":     is_relay,
-            }));
+            if let Some(h) = app {
+                let _ = h.emit_all("ego://data-manifest", serde_json::json!({
+                    "from_addr":    from_addr,
+                    "cid_count":    cids.len(),
+                    "available_gb": available_gb,
+                    "is_relay":     is_relay,
+                }));
+            }
         }
 
         P2PMessage::PinRequest { cid, from_addr, from_endpoint, storage_fee_uegoc, expiry } => {
@@ -3949,15 +3965,19 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                     let contact = p.clone();
                     let _ = save_contacts(&contacts);
                     if !already_approved {
-                        crate::commands::notifications::notify(&app, "Contact Request Accepted!", &format!("{} accepted your request", from_name));
-                        let _ = app.emit_all("ego://contact-approved", &contact);
+                        if let Some(h) = app {
+                            crate::commands::notifications::notify(h, "Contact Request Accepted!", &format!("{} accepted your request", from_name));
+                            let _ = h.emit_all("ego://contact-approved", &contact);
+                        }
                     }
                 }
             } else {
                 contacts.retain(|c| !(c.status == "pending_out" && c.shared_key_hex == shared_key));
                 let _ = save_contacts(&contacts);
-                crate::commands::notifications::notify(&app, "Contact Request Declined", "Your contact request was declined.");
-                let _ = app.emit_all("ego://contact-declined", ());
+                if let Some(h) = app {
+                    crate::commands::notifications::notify(h, "Contact Request Declined", "Your contact request was declined.");
+                    let _ = h.emit_all("ego://contact-declined", ());
+                }
             }
         }
 
@@ -3992,8 +4012,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                     let _ = save_contacts(&contacts);
                 }
             }
-            let state = app.state::<crate::app::AppState>();
-            state.upsert_peer(crate::app::PeerInfo {
+            crate::app::global_app_state().upsert_peer(crate::app::PeerInfo {
                 address:   address.clone(),
                 name,
                 endpoint:  endpoint.clone(),
@@ -4041,9 +4060,9 @@ pub async fn handle_incoming(msg: P2PMessage, app: &tauri::AppHandle) {
                 // learns about us as a validator — without waiting for the
                 // next 30-second broadcast heartbeat.
                 let ep3       = endpoint.clone();
-                let app_reply = app.clone();
+                let app_reply = app.cloned();
                 tokio::spawn(async move {
-                    broadcast_peer_announce(&app_reply).await;
+                    broadcast_peer_announce(app_reply.as_ref()).await;
                     // Also send directly in case gossip mesh hasn't formed yet.
                     let my_addr = crate::ledger::Ledger::load().address;
                     if my_addr.is_empty() { return; }
@@ -4104,27 +4123,30 @@ P2PMessage::ChatMessage { bundle, seq } => {
                 {
                     let content_clone = msg.content.clone();
                     let from_for_import = msg.from.clone();
-                    let app_import = app.clone();
+                    let app_import = app.cloned();
                     tokio::spawn(async move {
                         crate::commands::notifications::try_auto_import(
-                            &app_import, &content_clone, &from_for_import,
+                            app_import.as_ref(), &content_clone, &from_for_import,
                         ).await;
                     });
                 }
             } else {
 
                 {
-                    let state = app.state::<crate::app::AppState>();
-                    *state.pending_chat_address.lock().unwrap() = Some(msg.from.clone());
+                    crate::app::global_app_state().pending_chat_address.lock().unwrap().replace(msg.from.clone());
                 }
                 let preview = if msg.content.len() > 40 {
                     format!("{}…", &msg.content[..40])
                 } else {
                     msg.content.clone()
                 };
-                crate::commands::notifications::notify(&app, "New Message", &preview);
+                if let Some(h) = app {
+                    crate::commands::notifications::notify(h, "New Message", &preview);
+                }
             }
-            let _ = app.emit_all("ego://message-received", &msg);
+            if let Some(h) = app {
+                let _ = h.emit_all("ego://message-received", &msg);
+            }
         }
         Err(e) => eprintln!("[P2P] Decrypt error: {}", e),
     }
@@ -4144,12 +4166,14 @@ P2PMessage::ChatMessage { bundle, seq } => {
             handle_block_vote(block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, app).await;
         }
 
+
         P2PMessage::BlockFinalized { block, transactions, votes, agg_bls_sig, bls_pubkeys } => {
             let block_hash = block.hash.clone();
             let height     = block.height;
             merge_remote_chain(vec![block], transactions, app).await;
             process_inbound_qc_finalization(&block_hash, height, &votes, &agg_bls_sig, &bls_pubkeys);
         }
+
 
         P2PMessage::ChainSyncRequest { requester_endpoint, from_height } => {
             let blocks = crate::chain_db::get_blocks_range(from_height + 1, 1_000);
@@ -4179,8 +4203,9 @@ P2PMessage::ChatMessage { bundle, seq } => {
 
         P2PMessage::HeaderSyncResponse { headers } => {
             eprintln!("[LightClient] Received {} block headers", headers.len());
-
-            let _ = app.emit_all("ego://headers-received", &headers);
+            if let Some(h) = app {
+                let _ = h.emit_all("ego://headers-received", &headers);
+            }
         }
 
         P2PMessage::ChainSyncResponse { blocks, transactions } => {
@@ -4204,6 +4229,7 @@ P2PMessage::ChatMessage { bundle, seq } => {
             merge_remote_chain(blocks, transactions, app).await;
         }
 
+
         P2PMessage::ShardBlockQuery { block_height, requester_address: _, requester_endpoint } => {
             let chain = load_chain();
             let map   = crate::sharding::load_shard_map();
@@ -4218,6 +4244,7 @@ P2PMessage::ChatMessage { bundle, seq } => {
         P2PMessage::ShardBlockResponse { block_height: _, blocks, transactions } => {
             merge_remote_chain(blocks, transactions, app).await;
         }
+
 
         P2PMessage::ShardVacancyNotice { shard_id, current_holders } => {
 
@@ -4461,7 +4488,9 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
                 }
                 let _ = ledger2.save();
                 eprintln!("[P2P] Public FileData saved for {}", cid);
-                let _ = app.emit_all("ego://file-downloaded", serde_json::json!({ "cid": cid }));
+                if let Some(h) = app {
+                    let _ = h.emit_all("ego://file-downloaded", serde_json::json!({ "cid": cid }));
+                }
                 return;
             }
 
@@ -4498,7 +4527,9 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
             }
             let _ = ledger.save();
             eprintln!("[P2P] FileData saved for {}", cid);
-            let _ = app.emit_all("ego://file-downloaded", serde_json::json!({ "cid": cid }));
+            if let Some(h) = app {
+                let _ = h.emit_all("ego://file-downloaded", serde_json::json!({ "cid": cid }));
+            }
         }
     }
 }
@@ -4605,13 +4636,11 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
                         }
                     }
 
-                    // If all blocks are already on disk (from DHT or a previous run),
-                    // update the ledger status and emit file-downloaded now.
                     {
-                        let app2 = app.clone();
+                        let app2 = app.cloned();
                         let mcid = manifest_cid.clone();
                         tokio::spawn(async move {
-                            update_ledger_for_block(&mcid, &app2).await;
+                            update_ledger_for_block(&mcid, app2.as_ref()).await;
                         });
                     }
                 }
@@ -4661,10 +4690,10 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
                         let _ = crate::blocks::save_block(&block_cid, &enc_bytes);
                     }
 
-                    let app2 = app.clone();
+                    let app2 = app.cloned();
                     let mcid = manifest_cid.clone();
                     tokio::spawn(async move {
-                        update_ledger_for_block(&mcid, &app2).await;
+                        update_ledger_for_block(&mcid, app2.as_ref()).await;
                     });
                 }
             }
@@ -4928,7 +4957,7 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
     }
 }
 
-async fn update_ledger_for_block(manifest_cid: &str, app: &tauri::AppHandle) {
+async fn update_ledger_for_block(manifest_cid: &str, app: Option<&tauri::AppHandle<tauri::Wry>>) {
     let Ok(manifest) = crate::blocks::load_manifest(manifest_cid) else { return; };
     let received = crate::blocks::blocks_received_count(&manifest);
     let total    = manifest.blocks.len() as u32;
@@ -4949,15 +4978,19 @@ async fn update_ledger_for_block(manifest_cid: &str, app: &tauri::AppHandle) {
         let _ = ledger.save();
     }
 
-    let _ = app.emit_all("ego://block-progress", serde_json::json!({
-        "manifest_cid": manifest_cid,
-        "blocks_received": received,
-        "blocks_total": total,
-    }));
+    if let Some(h) = app {
+        let _ = h.emit_all("ego://block-progress", serde_json::json!({
+            "manifest_cid": manifest_cid,
+            "blocks_received": received,
+            "blocks_total": total,
+        }));
+    }
 
     if received >= total {
         eprintln!("[Blocks] All {} blocks received for {}", total, &manifest_cid[..16.min(manifest_cid.len())]);
-        let _ = app.emit_all("ego://file-downloaded", serde_json::json!({ "cid": manifest_cid }));
+        if let Some(h) = app {
+            let _ = h.emit_all("ego://file-downloaded", serde_json::json!({ "cid": manifest_cid }));
+        }
 
         // FIX 1: Register self as a CID holder in the relay registry so any peer
         // can discover us and request blocks directly — not just the original uploader.
@@ -4976,7 +5009,7 @@ async fn update_ledger_for_block(manifest_cid: &str, app: &tauri::AppHandle) {
     }
 }
 
-async fn process_received_manifest(manifest_cid: &str, app: &tauri::AppHandle) {
+async fn process_received_manifest(manifest_cid: &str, app: Option<&tauri::AppHandle<tauri::Wry>>) {
     let Ok(manifest) = crate::blocks::load_manifest(manifest_cid) else { return; };
     let total    = manifest.blocks.len() as u32;
     let received = crate::blocks::blocks_received_count(&manifest);
@@ -5004,15 +5037,19 @@ async fn process_received_manifest(manifest_cid: &str, app: &tauri::AppHandle) {
         }
     }
 
-    let _ = app.emit_all("ego://block-progress", serde_json::json!({
-        "manifest_cid": manifest_cid,
-        "blocks_received": received,
-        "blocks_total": total,
-    }));
+    if let Some(h) = app {
+        let _ = h.emit_all("ego://block-progress", serde_json::json!({
+            "manifest_cid": manifest_cid,
+            "blocks_received": received,
+            "blocks_total": total,
+        }));
+    }
 
     if received >= total {
         eprintln!("[Blocks] All {} blocks present at manifest arrival for {}", total, &manifest_cid[..16.min(manifest_cid.len())]);
-        let _ = app.emit_all("ego://file-downloaded", serde_json::json!({ "cid": manifest_cid }));
+        if let Some(h) = app {
+            let _ = h.emit_all("ego://file-downloaded", serde_json::json!({ "cid": manifest_cid }));
+        }
         return;
     }
 
@@ -5051,7 +5088,7 @@ async fn process_received_manifest(manifest_cid: &str, app: &tauri::AppHandle) {
     }
 }
 
-async fn check_block_completes_manifests(block_cid: &str, app: &tauri::AppHandle) {
+async fn check_block_completes_manifests(block_cid: &str, app: Option<&tauri::AppHandle<tauri::Wry>>) {
     let ledger = crate::ledger::Ledger::load();
     for file in &ledger.stored_files {
         if file.cid.starts_with("egomfd1") && file.blocks_received < file.blocks_total {
@@ -5059,9 +5096,9 @@ async fn check_block_completes_manifests(block_cid: &str, app: &tauri::AppHandle
                 let has_this = manifest.blocks.iter().any(|b| b.block_cid == block_cid);
                 if has_this {
                     let mcid = file.cid.clone();
-                    let app2 = app.clone();
+                    let app2 = app.cloned();
                     tokio::spawn(async move {
-                        update_ledger_for_block(&mcid, &app2).await;
+                        update_ledger_for_block(&mcid, app2.as_ref()).await;
                     });
                 }
             }
@@ -5128,7 +5165,7 @@ fn validate_block(block: &crate::ledger::LedgerBlock, chain: &crate::ledger::Sha
     true
 }
 
-async fn apply_incoming_tx(tx: LedgerTx, block: LedgerBlock, app: &tauri::AppHandle) {
+async fn apply_incoming_tx(tx: LedgerTx, block: LedgerBlock, app: Option<&tauri::AppHandle<tauri::Wry>>) {
     if block.height == 0 {
         if crate::chain_db::get_tx_by_hash(&tx.hash).is_none() {
             if let Ok(()) = crate::ledger::verify_incoming_tx(&tx) {
@@ -5170,14 +5207,11 @@ async fn apply_incoming_tx(tx: LedgerTx, block: LedgerBlock, app: &tauri::AppHan
     if crate::chain_db::get_block_by_height(block.height).is_none() {
         crate::chain_db::append_peer_block(&block, &[tx]);
     } else {
-        // Block already exists — apply only this TX's balance without touching
-        // the block record.  The old code pushed to mempool here, which caused
-        // TXs beyond the first in a shared block to be silently dropped after
-        // the 300 s TTL (fork-choice guard in write_block_batch rejects equal
-        // vote-count re-writes, so append_peer_block would not work here).
         crate::chain_db::apply_missing_tx(block.height, &tx);
     }
-    let _ = app.emit_all("ego://chain-updated", ());
+    if let Some(h) = app {
+        let _ = h.emit_all("ego://chain-updated", ());
+    }
 }
 
 fn execute_contract_txs(chain: &crate::ledger::SharedChain, txs: &[crate::ledger::LedgerTx]) {
@@ -5259,19 +5293,19 @@ fn handle_governance_tx(tx: &LedgerTx) {
 }
 
 async fn merge_remote_chain(
-    blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: &tauri::AppHandle,
+    blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: Option<&tauri::AppHandle<tauri::Wry>>,
 ) {
     merge_remote_chain_inner(blocks, transactions, app, false).await;
 }
 
 async fn merge_remote_chain_trusted(
-    blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: &tauri::AppHandle,
+    blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: Option<&tauri::AppHandle<tauri::Wry>>,
 ) {
     merge_remote_chain_inner(blocks, transactions, app, true).await;
 }
 
 async fn merge_remote_chain_inner(
-    mut blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: &tauri::AppHandle,
+    mut blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: Option<&tauri::AppHandle<tauri::Wry>>,
     trusted: bool,
 ) {
 
@@ -5435,7 +5469,9 @@ async fn merge_remote_chain_inner(
     if let Some(tip) = new_blocks.iter().max_by_key(|b| b.height) {
         crate::rpc::notify_new_block(tip);
     }
-    let _ = app.emit_all("ego://chain-updated", ());
+    if let Some(h) = app {
+        let _ = h.emit_all("ego://chain-updated", ());
+    }
 }
 
 pub async fn oracle_sync_chain() {
@@ -5472,7 +5508,7 @@ pub async fn oracle_sync_chain() {
         chain.blocks.len(), chain.transactions.len());
 }
 
-pub async fn fetch_chain_from_oracle(app: &tauri::AppHandle) {
+pub async fn fetch_chain_from_oracle(app: Option<&tauri::AppHandle<tauri::Wry>>) {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -5508,6 +5544,7 @@ pub async fn fetch_chain_from_oracle(app: &tauri::AppHandle) {
     eprintln!("[Oracle] Chain merged from Oracle RPC (trusted)");
 }
 
+
 fn bft_sign(data: &str) -> Option<String> {
     use ed25519_dalek::{SigningKey, Signer};
     let seed_bytes = crate::ledger::load_seed().ok().flatten()?;
@@ -5532,7 +5569,7 @@ async fn handle_block_proposal(
     block: LedgerBlock,
     transactions: Vec<LedgerTx>,
     proposer: String,
-    app: &tauri::AppHandle,
+    app: Option<&tauri::AppHandle<tauri::Wry>>,
 ) {
     let my_addr = crate::ledger::Ledger::load().address;
     if my_addr.is_empty() { return; }
@@ -5737,7 +5774,7 @@ async fn handle_block_vote(
     prev_hash:   String,
     bls_sig:     String,
     bls_pubkey:  String,
-    app:         &tauri::AppHandle,
+    app:         Option<&tauri::AppHandle<tauri::Wry>>,
 ) {
     if slashed_validators().contains(&voter) {
         eprintln!("[BFT] Ignoring vote from slashed validator {}", voter);
@@ -6011,7 +6048,9 @@ async fn handle_block_vote(
     }
 
     crate::rpc::notify_new_block(&block);
-    let _ = app.emit_all("ego://chain-updated", ());
+    if let Some(h) = app {
+        let _ = h.emit_all("ego://chain-updated", ());
+    }
 }
 
 
@@ -6677,7 +6716,7 @@ pub async fn dht_find_cid(cid: &str) {
     }
 }
 
-pub async fn fetch_peers_from_relay(_app: &tauri::AppHandle) {
+pub async fn fetch_peers_from_relay(_app: Option<&tauri::AppHandle<tauri::Wry>>) {
     dht_discover_peers().await;
 }
 

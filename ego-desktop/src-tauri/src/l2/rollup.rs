@@ -111,3 +111,61 @@ pub fn verify_batch(
         Err(_) => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn bals(pairs: &[(&str, u64)]) -> HashMap<String, u64> {
+        pairs.iter().map(|(k,v)| (k.to_string(), *v)).collect()
+    }
+    fn tx(from: &str, to: &str, amt: u64, nonce: u64) -> L2Tx {
+        L2Tx { hash: l2tx_hash(from,to,amt,nonce,0), from: from.into(), to: to.into(),
+               amount: amt, fee_l2: 100, nonce, timestamp: 0, signature: String::new() }
+    }
+
+    #[test]
+    fn transfer_moves_balance() {
+        let pre = bals(&[("alice", 1_000_000)]);
+        let (post, _) = execute_l2_batch(&[tx("alice","bob",100_000,1)], pre).unwrap();
+        assert_eq!(*post.get("alice").unwrap(), 899_900);
+        assert_eq!(*post.get("bob").unwrap(), 100_000);
+    }
+
+    #[test]
+    fn overdraft_fails() {
+        let pre = bals(&[("alice", 50)]);
+        assert!(execute_l2_batch(&[tx("alice","bob",1_000,1)], pre).is_err());
+    }
+
+    #[test]
+    fn state_root_is_deterministic() {
+        let b = bals(&[("alice", 1000), ("bob", 2000)]);
+        assert_eq!(compute_l2_state_root(&b), compute_l2_state_root(&b));
+        assert_eq!(compute_l2_state_root(&b).len(), 64);
+    }
+
+    #[test]
+    fn fraud_proof_catches_wrong_root() {
+        let pre = bals(&[("alice", 1_000_000)]);
+        let txs = vec![tx("alice","bob",500_000,1)];
+        let batch = RollupBatch { batch_id: "t".into(), sequencer: "s".into(),
+            l1_height: 1, l2_txs: txs, pre_state_root: compute_l2_state_root(&pre),
+            post_state_root: "0".repeat(64), submitted_at: 0,
+            status: BatchStatus::Pending, challenge_deadline: 101 };
+        assert!(!verify_batch(&batch, pre));
+    }
+
+    #[test]
+    fn valid_batch_passes_fraud_check() {
+        let pre = bals(&[("alice", 1_000_000), ("bob", 0)]);
+        let txs = vec![tx("alice","bob",100_000,1)];
+        let (_, root) = execute_l2_batch(&txs, pre.clone()).unwrap();
+        let batch = RollupBatch { batch_id: "t".into(), sequencer: "s".into(),
+            l1_height: 1, l2_txs: txs, pre_state_root: compute_l2_state_root(&pre),
+            post_state_root: root, submitted_at: 0,
+            status: BatchStatus::Pending, challenge_deadline: 101 };
+        assert!(verify_batch(&batch, pre));
+    }
+}
