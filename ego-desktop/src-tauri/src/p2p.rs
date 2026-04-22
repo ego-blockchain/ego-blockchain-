@@ -731,7 +731,7 @@ pub fn leader_for_view(_view: u64) -> Option<String> {
 
 
 pub fn slash_validator(address: &str, reason: &str) {
-    eprintln!("[BFT] Slashing validator {} — {}", address, reason);
+    tracing::warn!("Slashing validator {} — {}", address, reason);
     known_validators().remove(address);
     slashed_validators().insert(address.to_string());
     // Persist to RocksDB so slashes survive node restarts.
@@ -744,7 +744,7 @@ pub fn slash_validator(address: &str, reason: &str) {
         const SLASH_POOL: &str = "egot1slashpool0000000000000000000000000000000";
         crate::chain_db::internal_balance_transfer(address, SLASH_POOL, slash_burn);
         crate::ledger::record_validator_stake(address, slash_burn, false);
-        eprintln!("[BFT] Confiscated {} uEGOC from {} → slash pool (10% slash penalty)", slash_burn, address);
+        tracing::warn!("Confiscated {} uEGOC from {} → slash pool (10% slash penalty)", slash_burn, address);
     }
 
 
@@ -857,7 +857,7 @@ fn stake_quorum_reached(voters: &[String]) -> bool {
 
     let ok = voter_stake * 3 > total_stake * 2;
     if !ok {
-        eprintln!("[BFT] Stake quorum not reached: voter_stake={} total_stake={} (need >2/3)",
+        tracing::warn!("Stake quorum not reached: voter_stake={} total_stake={} (need >2/3)",
             voter_stake, total_stake);
     }
     ok
@@ -1837,7 +1837,7 @@ pub async fn register_with_relay_as_ego_node() {
             .json(&serde_json::json!({ "endpoint": endpoint }))
             .send().await;
     }
-    eprintln!("[Hosting] Registered with relay as Ego node: {}", endpoint);
+    tracing::info!("Registered with relay as Ego node: {}", endpoint);
 }
 
 pub fn gossip_hosting_node(record: &crate::chain_db::HostingNodeRecord) {
@@ -1947,7 +1947,7 @@ pub async fn run_shard_rebalance_monitor() {
         let computed = crate::sharding::compute_shard_count(known_count);
         let agreed = crate::sharding::get_agreed_shard_count();
         if computed != agreed {
-            eprintln!("[Shard] Computed shard count {} differs from agreed {}, proposing rebalance", computed, agreed);
+            tracing::info!("Computed shard count {} differs from agreed {}, proposing rebalance", computed, agreed);
             propose_shard_rebalance(computed).await;
         }
     }
@@ -2090,19 +2090,19 @@ pub async fn check_file_replication() {
                     }
                     let under_secs = now - file.under_replicated_since;
                     if under_secs >= UNDER_REPLICATED_CRITICAL_SECS {
-                        eprintln!(
-                            "[Replication] CRITICAL: {} has been under-replicated for {}h — file may be at risk of loss",
+                        tracing::error!(
+                            "CRITICAL: {} under-replicated for {}h — file at risk of loss",
                             &file.cid[..16.min(file.cid.len())],
                             under_secs / 3600
                         );
                     } else if under_secs >= UNDER_REPLICATED_WARN_SECS {
-                        eprintln!(
-                            "[Replication] WARNING: {} under-replicated for {}min — immediate re-replication attempt",
+                        tracing::warn!(
+                            "{} under-replicated for {}min — immediate re-replication attempt",
                             &file.cid[..16.min(file.cid.len())],
                             under_secs / 60
                         );
                     } else {
-                        eprintln!("[Replication] Master: {} has {}/{} replicas — requesting more",
+                        tracing::info!("Replication: {} has {}/{} replicas — requesting more",
                             &file.cid[..16.min(file.cid.len())],
                             file.replica_peers.len(), MIN_REPLICAS);
                     }
@@ -2121,7 +2121,7 @@ pub async fn check_file_replication() {
                 if !master_alive {
                     // Master has not sent a heartbeat within the timeout window.
                     // Promote self to master and broadcast to find a new slave.
-                    eprintln!("[Replication] Slave promoting to master for {} (master {} silent for {}s)",
+                    tracing::warn!("Replication: slave promoting to master for {} (master {} silent for {}s)",
                         &file.cid[..16.min(file.cid.len())],
                         &file.replica_master,
                         now - file.master_last_seen);
@@ -2229,18 +2229,18 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
 
     let identity      = load_or_create_identity();
     let local_peer_id = identity.public().to_peer_id();
-    eprintln!("[P2P] Local peer ID: {}", local_peer_id);
+    tracing::info!("Local peer ID: {}", local_peer_id);
 
     let mut swarm = match build_swarm(identity).await {
         Ok(s)  => s,
-        Err(e) => { eprintln!("[P2P] Failed to build swarm: {}", e); return; }
+        Err(e) => { tracing::error!("Failed to build swarm: {}", e); return; }
     };
 
     if let Err(e) = swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", p2p_port()).parse().unwrap()) {
-        eprintln!("[P2P] TCP listen: {}", e);
+        tracing::error!("TCP listen failed: {}", e);
     }
     if let Err(e) = swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", p2p_port()).parse().unwrap()) {
-        eprintln!("[P2P] QUIC listen: {}", e);
+        tracing::error!("QUIC listen failed: {}", e);
     }
 
     // relay PeerId → base transport addr (no /p2p/<id> suffix)
@@ -2262,7 +2262,7 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     {
         let cached = load_peer_cache();
         if cached.len() >= MIN_CACHED_PEERS_FOR_DIRECT_BOOT {
-            eprintln!("[P2P] {} cached peers — attempting relay-free bootstrap", cached.len());
+            tracing::info!("{} cached peers — attempting relay-free bootstrap", cached.len());
         }
         for peer in cached.iter().filter(|p| !p.endpoint.is_empty()).take(30) {
             if let Ok(addr) = peer.endpoint.parse::<Multiaddr>() {
@@ -2441,7 +2441,7 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                         if !entry.contains(&v) { entry.push(v); }
                     }
                 }
-                eprintln!("[BFT] Restored in-flight votes from DB");
+                tracing::info!("Restored in-flight BFT votes from DB");
             }
         }
     }
@@ -2532,9 +2532,9 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                                         Ok(lid) => {
                                             circuit_listener = Some(lid);
                                             circuit_registered = true;
-                                            eprintln!("[P2P] Relay circuit registered via {}", relay_str);
+                                            tracing::info!("Relay circuit registered via {}", relay_str);
                                         }
-                                        Err(e) => eprintln!("[P2P] Re-register failed on {}: {}", relay_str, e),
+                                        Err(e) => tracing::warn!("Re-register failed on {}: {}", relay_str, e),
                                     }
                                 }
                             } else if !connected {
@@ -2833,7 +2833,7 @@ fn inject_circuit(
     local_peer_id:  &PeerId,
 ) {
     if !external_addrs.contains(&circuit) {
-        eprintln!("[P2P] ✓ Circuit injected: {}", circuit);
+        tracing::info!("Circuit injected: {}", circuit);
         external_addrs.push(circuit);
     }
     RELAY_CIRCUIT_READY.store(true, Ordering::Relaxed);
@@ -2876,7 +2876,7 @@ async fn handle_event(
                 .map(|id| *id == listener_id)
                 .unwrap_or(false);
             if is_circuit {
-                eprintln!("[P2P] Circuit listener closed ({:?}) — will re-register", reason);
+                tracing::warn!("Circuit listener closed ({:?}) — will re-register", reason);
                 *circuit_listener = None;
                 RELAY_CIRCUIT_READY.store(false, Ordering::Relaxed);
                 external_addrs.retain(|a| !a.to_string().contains("/p2p-circuit"));
@@ -2898,7 +2898,7 @@ async fn handle_event(
                         .parse()
                         .unwrap_or(address.clone())
                 };
-                eprintln!("[P2P] ✓ Relay circuit LIVE (NewListenAddr): {}", full);
+                tracing::info!("Relay circuit LIVE (NewListenAddr): {}", full);
                 inject_circuit(full, external_addrs, app, &peer_id);
             }
         }
@@ -2909,7 +2909,7 @@ async fn handle_event(
             if !relay_addrs.contains_key(&peer_id) {
                 let n = DIRECT_PEER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                 if n == MIN_DIRECT_PEERS_RELAY_OPTIONAL {
-                    eprintln!("[P2P] {} direct peers — relay no longer required for bootstrap", n);
+                    tracing::info!("{} direct peers — relay no longer required for bootstrap", n);
                 }
             }
 
@@ -2933,7 +2933,7 @@ async fn handle_event(
                                     inject_circuit(full_circuit, external_addrs, app, &our_peer_id);
                                 }
                             }
-                            Err(e) => eprintln!("[P2P] Relay listen error: {}", e),
+                            Err(e) => tracing::error!("Relay listen error: {}", e),
                         }
                         }
                     }
@@ -2962,9 +2962,9 @@ async fn handle_event(
                 );
             }
             if relay_addrs.contains_key(&peer_id) {
-                eprintln!("[P2P] Relay {} connection closed ({} remaining)", peer_id, num_established);
+                tracing::info!("Relay {} connection closed ({} remaining)", peer_id, num_established);
                 if num_established == 0 {
-                    eprintln!("[P2P] All relay connections gone — clearing circuit");
+                    tracing::warn!("All relay connections gone — clearing circuit");
                     RELAY_CIRCUIT_READY.store(false, Ordering::Relaxed);
                     external_addrs.retain(|a| !a.to_string().contains("/p2p-circuit"));
                     if let Some(id) = circuit_listener.take() {
@@ -3018,7 +3018,7 @@ async fn handle_event(
         SwarmEvent::Behaviour(EgoBehaviourEvent::RelayClient(
             relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
         )) => {
-            eprintln!("[P2P] ✓ Relay reservation ACCEPTED via {}", relay_peer_id);
+            tracing::info!("Relay reservation ACCEPTED via {}", relay_peer_id);
             let our_peer_id = *swarm.local_peer_id();
             if let Some(relay_base) = relay_addrs.get(&relay_peer_id) {
                 if let Some(circuit) = build_circuit_addr(relay_base, &relay_peer_id, &our_peer_id) {
@@ -3168,7 +3168,7 @@ async fn handle_event(
                             let sig_b_valid = !sig_b.is_empty() && verify_bft_sig(&accused, &vote_data_b, &sig_b);
                             if sig_a_valid && sig_b_valid && hash_a != hash_b {
                                 let reason = format!("peer-reported equivocation at height {}: {} vs {}", height, &hash_a[..8.min(hash_a.len())], &hash_b[..8.min(hash_b.len())]);
-                                eprintln!("[BFT] Peer {} reported equivocation by {} — verified, slashing", reporter, accused);
+                                tracing::warn!("Peer {} reported equivocation by {} — verified, slashing", reporter, accused);
                                 slash_validator(&accused, &reason);
                             }
                         }
@@ -3207,13 +3207,13 @@ async fn handle_event(
                             let transactions: Vec<crate::ledger::LedgerTx> = blocks.iter()
                                 .flat_map(|b| crate::chain_db::get_txs_for_block(b.height))
                                 .collect();
-                            eprintln!("[P2P] sync-v1: sending {} blocks ({} txs) from height {} to {}",
+                            tracing::info!("sync-v1: sending {} blocks ({} txs) from height {} to {}",
                                 blocks.len(), transactions.len(), from_height + 1,
                                 blocks.last().map(|b| b.height).unwrap_or(from_height));
                             let response = P2PMessage::ChainSyncResponse { blocks, transactions };
                             if let Err(e) = send_message_any(&[ep.clone()], &response).await {
                                 if !e.contains("none of the requested protocols") {
-                                    eprintln!("[P2P] sync-v1 response to {}: {}", ep, e);
+                                    tracing::warn!("sync-v1 response to {}: {}", ep, e);
                                 }
                             }
                         });
@@ -3295,7 +3295,7 @@ async fn handle_event(
 
                             static MATURITY_LOGGED: AtomicBool = AtomicBool::new(false);
                             if !MATURITY_LOGGED.swap(true, Ordering::Relaxed) {
-                                eprintln!("[P2P] Network maturity reached ({} known peers) — relay is fully optional", known_count);
+                                tracing::info!("Network maturity reached ({} known peers) — relay is fully optional", known_count);
                             }
                         }
                     }
@@ -3488,7 +3488,7 @@ async fn handle_event(
                         crate::sharding::handle_shard_announce_update(&from_addr, &from_endpoint, &held_shards, uptime_secs, network_node_count, shard_count);
                     }
                     Ok(P2PMessage::MasterPromotion { shard_id, new_master, new_endpoint, former_master, timestamp }) => {
-                        eprintln!("[Sharding] MasterPromotion: shard {} → new master {} (was {})", shard_id, new_master, former_master);
+                        tracing::info!("MasterPromotion: shard {} → new master {} (was {})", shard_id, new_master, former_master);
                         let mut map = crate::sharding::load_shard_map();
                         if let Some(old) = map.assignments.iter_mut().find(|a| a.shard_id == shard_id && a.node_address == former_master) {
                             old.role = crate::sharding::ShardRole::Observer;
@@ -3563,7 +3563,7 @@ async fn handle_event(
                 {
                     let current = crate::sharding::get_agreed_shard_count();
                     if proposed_shard_count != current && proposed_shard_count >= 1 {
-                        eprintln!("[Shard] Rebalance proposal: {} shards (from {}), effective at block {}",
+                        tracing::info!("Shard rebalance proposal: {} shards (from {}), effective at block {}",
                             proposed_shard_count, &proposer[..16.min(proposer.len())], effective_at_height);
                         crate::sharding::set_agreed_shard_count(proposed_shard_count, effective_at_height);
                     }

@@ -200,7 +200,7 @@ pub async fn run_shard_startup(my_address: &str, my_endpoint: &str, peer_address
 
     let _ = save_shard_map(&map);
 
-    eprintln!("[Sharding] Phase {} — {} nodes, {} shards, {} blocks",
+    tracing::info!("Sharding phase {} — {} nodes, {} shards, {} blocks",
         if shard_count == 1 { 1 } else if network_node_count < PHASE3_NODE_THRESHOLD { 2 } else { 3 },
         network_node_count, shard_count, total_blocks);
 }
@@ -226,7 +226,7 @@ pub async fn check_master_health(my_address: &str, my_endpoint: &str, uptime_sec
 
                 let responsible = consistent_hash_assign(shard_id, &all_nodes);
                 if responsible.get(1).map(|a| a.as_str()) == Some(my_address) {
-                    eprintln!("[Sharding] Shard {} master {} offline — promoting self to master",
+                    tracing::warn!("Shard {} master {} offline — promoting self to master",
                         shard_id, &m.node_address);
 
                     crate::p2p::broadcast_master_promotion(shard_id, my_address, my_endpoint, &m.node_address).await;

@@ -108,9 +108,9 @@ fn acquire_single_instance_lock() -> bool {
 }
 
 fn headless_main() {
-    eprintln!("[Headless] Ego full node — P2P + BFT + RPC + Mempool");
-    eprintln!("[Node] Starting in headless full-node mode (EGO_HEADLESS=1)");
-    eprintln!("[Node] All GUI components disabled — blockchain services only");
+    tracing::info!("Ego full node — P2P + BFT + RPC + Mempool");
+    tracing::info!("Starting in headless full-node mode (EGO_HEADLESS=1)");
+    tracing::info!("All GUI components disabled — blockchain services only");
 
     crate::app::init_global_app_state(std::sync::Arc::new(crate::app::AppState::new()));
 
@@ -149,17 +149,27 @@ fn headless_main() {
             crate::p2p::run_shard_rebalance_monitor().await;
         });
 
-        eprintln!("[Headless] All services started. RPC on port 47395. P2P on port {}",
-            crate::p2p::P2P_PORT);
-        eprintln!("[Headless] Chain data: {:?}", crate::ledger::base_data_dir());
-        eprintln!("[Headless] Press Ctrl+C to stop.");
+        tracing::info!("All services started. RPC on port 47395. P2P on port {}", crate::p2p::P2P_PORT);
+        tracing::info!("Chain data: {:?}", crate::ledger::base_data_dir());
+        tracing::info!("Press Ctrl+C to stop.");
 
         tokio::signal::ctrl_c().await.ok();
-        eprintln!("[Headless] Shutting down");
+        tracing::info!("Shutting down");
     });
 }
 
 fn main() {
+    {
+        use tracing_subscriber::{fmt, EnvFilter, prelude::*};
+        let filter = EnvFilter::try_from_env("EGO_LOG")
+            .unwrap_or_else(|_| EnvFilter::new("ego_desktop=info,warn"));
+        tracing_subscriber::registry()
+            .with(fmt::layer().with_target(false))
+            .with(filter)
+            .init();
+    }
+    tracing::info!("Ego Desktop starting");
+
     if std::env::var("EGO_HEADLESS").as_deref() == Ok("1") {
         headless_main();
         return;
@@ -412,6 +422,7 @@ fn main() {
             commands::explorer::get_file_events,
             commands::explorer::get_base_fee,
             commands::explorer::get_supply_info,
+            commands::explorer::set_log_level,
             commands::notifications::import_shared_file,
             commands::messenger::get_my_contact_bundle,
             commands::messenger::revoke_contact_bundle,
@@ -614,11 +625,11 @@ fn main() {
                 let my_endpoint = crate::p2p::wait_for_public_endpoint(60).await;
 
                 if my_endpoint.contains("/p2p-circuit") {
-                    eprintln!("[Startup] ✓ Relay circuit confirmed: {}", my_endpoint);
+                    tracing::info!("Relay circuit confirmed: {}", my_endpoint);
                 } else if !my_endpoint.is_empty() {
-                    eprintln!("[Startup] ⚠ Relay not confirmed in 20s — using: {}", my_endpoint);
+                    tracing::warn!("Relay not confirmed in 20s — using: {}", my_endpoint);
                 } else {
-                    eprintln!("[Startup] ✗ No endpoint — check network");
+                    tracing::warn!("No endpoint — check network");
                 }
 
                 // Restore in-memory nonce + stake stores from RocksDB so replay
@@ -640,7 +651,7 @@ fn main() {
                         crate::p2p::register_known_validator(&m);
                     }
                     if n > 0 {
-                        eprintln!("[Startup] Pre-registered {} validator(s) from chain history", n);
+                        tracing::info!("Pre-registered {} validator(s) from chain history", n);
                     }
                 }
 
@@ -652,15 +663,15 @@ fn main() {
                 let startup_peers = crate::p2p::get_known_peers().len();
                 if !no_oracle && startup_peers < 50 {
                     crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)).await;
-                    eprintln!("[Startup] Oracle chain sync complete ({} peers, oracle active)", startup_peers);
+                    tracing::info!("Oracle chain sync complete ({} peers, oracle active)", startup_peers);
                 } else if no_oracle {
-                    eprintln!("[Startup] Oracle disabled via EGO_NO_ORACLE — using pure P2P");
+                    tracing::info!("Oracle disabled via EGO_NO_ORACLE — using pure P2P");
                 } else {
-                    eprintln!("[Startup] {} peers — skipping oracle, using P2P only", startup_peers);
+                    tracing::info!("{} peers — skipping oracle, using P2P only", startup_peers);
                 }
 
                 crate::p2p::broadcast_peer_announce(Some(&handle_startup)).await;
-                eprintln!("[Startup] Peer announce sent (endpoint: {})", my_endpoint);
+                tracing::info!("Peer announce sent (endpoint: {})", my_endpoint);
 
                 crate::p2p::restore_dht_cache().await;
 
@@ -675,13 +686,13 @@ fn main() {
                 let ledger_addr = { let l = crate::ledger::Ledger::load(); l.address };
                 crate::sharding::run_shard_startup(&ledger_addr, &my_endpoint, &peers, 0).await;
                 crate::p2p::broadcast_shard_announce().await;
-                eprintln!("[Startup] Shard announce sent");
+                tracing::info!("Shard announce sent");
 
                 crate::p2p::dht_publish_shard_assignments(&ledger_addr, &my_endpoint).await;
 
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 crate::p2p::sync_chain_from_peers().await;
-                eprintln!("[Startup] Chain sync requested");
+                tracing::info!("Chain sync requested");
 
                 crate::p2p::register_with_relay_as_ego_node().await;
 
@@ -702,7 +713,7 @@ fn main() {
                     let wall_elapsed = now_wall.duration_since(last_tick_wall).unwrap_or_default().as_secs();
                     last_tick_wall = now_wall;
                     if wall_elapsed > 60 {
-                        eprintln!("[Startup] Wake-from-sleep detected ({}s gap) — reconnecting P2P", wall_elapsed);
+                        tracing::info!("Wake-from-sleep detected ({}s gap) — reconnecting P2P", wall_elapsed);
                         crate::p2p::restore_dht_cache().await;
                         crate::p2p::dht_discover_peers().await;
                         crate::p2p::register_with_relay_as_ego_node().await;

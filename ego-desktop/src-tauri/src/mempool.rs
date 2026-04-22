@@ -119,16 +119,16 @@ impl ShardedMempool {
 
         if !is_system {
             if tx.fee_uegoc < MIN_FEE_UEGOC {
-                eprintln!(
-                    "[Mempool] Rejected {} — fee {} uEGOC below floor {}",
+                tracing::warn!(
+                    "Mempool rejected {} — fee {} uEGOC below floor {}",
                     &tx.hash[..12.min(tx.hash.len())], tx.fee_uegoc, MIN_FEE_UEGOC
                 );
                 return;
             }
             let current_base_fee = crate::chain_db::get_current_base_fee();
             if tx.fee_uegoc < current_base_fee {
-                eprintln!(
-                    "[Mempool] Rejected {} — fee {} uEGOC below current base fee {}",
+                tracing::warn!(
+                    "Mempool rejected {} — fee {} uEGOC below current base fee {}",
                     &tx.hash[..12.min(tx.hash.len())], tx.fee_uegoc, current_base_fee
                 );
                 return;
@@ -137,15 +137,15 @@ impl ShardedMempool {
             if tx.nonce > 0 {
                 let confirmed_nonce = crate::ledger::last_confirmed_nonce(&tx.from);
                 if tx.nonce <= confirmed_nonce {
-                    eprintln!(
-                        "[Mempool] Rejected {} — replay nonce {} <= confirmed {}",
+                    tracing::warn!(
+                        "Mempool rejected {} — replay nonce {} <= confirmed {}",
                         &tx.hash[..12.min(tx.hash.len())], tx.nonce, confirmed_nonce
                     );
                     return;
                 }
                 if tx.nonce > confirmed_nonce + 10 {
-                    eprintln!(
-                        "[Mempool] Rejected {} — nonce {} too far ahead of confirmed {}",
+                    tracing::warn!(
+                        "Mempool rejected {} — nonce {} too far ahead of confirmed {}",
                         &tx.hash[..12.min(tx.hash.len())], tx.nonce, confirmed_nonce
                     );
                     return;
@@ -171,8 +171,8 @@ impl ShardedMempool {
                 .fold(0u64, |acc, v| acc.saturating_add(v));
             let required = tx.amount.saturating_add(tx.fee_uegoc).saturating_add(pending_outflow);
             if balance < required {
-                eprintln!(
-                    "[Mempool] Rejected {} — insufficient balance: has {} uEGOC, needs {} (amount {} + fee {} + pending_outflow {})",
+                tracing::warn!(
+                    "Mempool rejected {} — insufficient balance: has {} uEGOC, needs {} (amount {} + fee {} + pending_outflow {})",
                     &tx.hash[..12.min(tx.hash.len())], balance, required,
                     tx.amount, tx.fee_uegoc, pending_outflow
                 );
@@ -196,7 +196,7 @@ impl ShardedMempool {
             let evicted = s.remove(worst_idx);
             self.seen_hashes.lock().expect("lock poisoned").remove(&evicted.hash);
             self.pending_total.fetch_sub(1, Ordering::Relaxed);
-            eprintln!("[Mempool] Evicted lowest-fee tx {} from shard {}", &evicted.hash[..12], shard);
+            tracing::info!("Mempool evicted lowest-fee tx {} from shard {}", &evicted.hash[..12], shard);
         }
 
         let tx_hash_for_notify = tx.hash.clone();
@@ -391,8 +391,8 @@ async fn try_mine(txs: Vec<LedgerTx>, miner: &str) -> Vec<LedgerTx> {
     let tx_count = txs.len();
     let block = crate::chain_db::mine_batch_db_with_ticket(&txs, miner, &combined_ticket, poc_slot);
 
-    eprintln!(
-        "[Mempool] Solo block #{} sealed — {} user txs + 1 coinbase",
+    tracing::info!(
+        "Solo block #{} sealed — {} user txs + 1 coinbase",
         block.height, tx_count,
     );
 
@@ -421,10 +421,8 @@ async fn try_mine(txs: Vec<LedgerTx>, miner: &str) -> Vec<LedgerTx> {
 // ── Reactive batch loop ────────────────────────────────────────────────────────
 
 pub async fn run_batch_loop() {
-    eprintln!(
-        "[Mempool] Reactive batch loop started — \
-         batch_window={}ms  threshold={}txs  max_wait={}s  empty_min={}s  \
-         max_pending={}  tx_ttl={}s",
+    tracing::info!(
+        "Reactive batch loop started — batch_window={}ms threshold={}txs max_wait={}s empty_min={}s max_pending={} tx_ttl={}s",
         BATCH_WINDOW_MS, TX_THRESHOLD, MAX_BLOCK_INTERVAL_S, EMPTY_BLOCK_INTERVAL_S,
         MAX_MEMPOOL_SIZE, MAX_TX_AGE_SECS,
     );
@@ -468,7 +466,7 @@ pub async fn run_batch_loop() {
                 if pool.pending_count() < TX_THRESHOLD {
                     continue;
                 }
-                eprintln!("[Mempool] TX_THRESHOLD ({}) reached — sealing immediately", TX_THRESHOLD);
+                tracing::info!("TX_THRESHOLD ({}) reached — sealing immediately", TX_THRESHOLD);
             }
             _ = tokio::time::sleep(sleep_dur) => {}
         }
@@ -503,10 +501,8 @@ pub async fn run_batch_loop() {
             continue;
         }
 
-        eprintln!(
-            "[Consensus] ⚠ Pre-BFT mode: {} known validator(s) \
-             (need {} for Byzantine-fault-tolerant finality) — \
-             solo mining until quorum is reached",
+        tracing::warn!(
+            "Pre-BFT mode: {} known validator(s) (need {} for Byzantine-fault-tolerant finality) — solo mining until quorum is reached",
             known_count, needed
         );
 
