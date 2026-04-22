@@ -420,6 +420,9 @@ pub struct LedgerBlock {
     /// Empty string = legacy block (pre-state-root upgrade); never falsifies the hash.
     #[serde(default)]
     pub state_root: String,
+
+    #[serde(default)]
+    pub base_fee_uegoc: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -712,6 +715,7 @@ impl Ledger {
             poc_ticket: String::new(),
             poc_slot: 0,
             state_root: String::new(),
+            base_fee_uegoc: 1_000,
         });
     }
 
@@ -759,6 +763,7 @@ pub fn genesis_block() -> LedgerBlock {
         poc_ticket: String::new(),
         poc_slot: 0,
         state_root: String::new(),
+        base_fee_uegoc: 1_000,
     }
 }
 
@@ -824,6 +829,7 @@ impl SharedChain {
             poc_ticket: String::new(),
             poc_slot: 0,
             state_root: String::new(),
+            base_fee_uegoc: 1_000,
         });
     }
 
@@ -886,6 +892,7 @@ impl SharedChain {
             poc_ticket: String::new(),
             poc_slot: 0,
             state_root: String::new(),
+            base_fee_uegoc: 1_000,
         };
         self.blocks.push(block.clone());
         block

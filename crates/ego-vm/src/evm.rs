@@ -15,12 +15,35 @@ pub struct EvmCallResult {
 }
 
 pub struct EvmExecutor {
-    db: InMemoryDB,
+    db:         InMemoryDB,
+    state_path: Option<std::path::PathBuf>,
 }
 
 impl EvmExecutor {
     pub fn new() -> Self {
-        Self { db: InMemoryDB::default() }
+        Self { db: InMemoryDB::default(), state_path: None }
+    }
+
+    pub fn with_state_path(path: std::path::PathBuf) -> Self {
+        let db = Self::load_db(&path);
+        Self { db, state_path: Some(path) }
+    }
+
+    fn load_db(path: &std::path::Path) -> InMemoryDB {
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Ok(db) = serde_json::from_slice::<InMemoryDB>(&bytes) {
+                return db;
+            }
+        }
+        InMemoryDB::default()
+    }
+
+    fn save_db(&self) {
+        if let Some(path) = &self.state_path {
+            if let Ok(bytes) = serde_json::to_vec(&self.db) {
+                let _ = std::fs::write(path, bytes);
+            }
+        }
     }
 
     pub fn deploy_bytecode(&mut self, bytecode: &[u8], deployer: [u8; 20]) -> Result<[u8; 20], String> {
@@ -43,12 +66,15 @@ impl EvmExecutor {
             .transact_commit()
             .map_err(|e| format!("EVM deploy error: {e:?}"))?;
 
-        match result {
+        let addr = match result {
             ExecutionResult::Success { output: Output::Create(_, Some(addr)), .. } => Ok(addr.into()),
             ExecutionResult::Success { .. } => Err("deploy succeeded but no address returned".into()),
             ExecutionResult::Revert { output, .. } => Err(format!("revert: 0x{}", hex::encode(output))),
             ExecutionResult::Halt { reason, .. } => Err(format!("halt: {reason:?}")),
-        }
+        }?;
+
+        self.save_db();
+        Ok(addr)
     }
 
     pub fn call(
@@ -82,7 +108,7 @@ impl EvmExecutor {
             Err(e) => return EvmCallResult { success: false, return_val: vec![], gas_used: 0, error: Some(format!("{e:?}")) },
         };
 
-        match result {
+        let out = match result {
             ExecutionResult::Success { output, gas_used, .. } => {
                 let bytes = match output {
                     Output::Call(b)       => b.to_vec(),
@@ -96,7 +122,12 @@ impl EvmExecutor {
             ExecutionResult::Halt { reason, gas_used } => {
                 EvmCallResult { success: false, return_val: vec![], gas_used, error: Some(format!("{reason:?}")) }
             }
+        };
+
+        if out.success {
+            self.save_db();
         }
+        out
     }
 
     pub fn load_contract(&mut self, address: [u8; 20], deployed_bytecode: &[u8]) {
@@ -108,6 +139,7 @@ impl EvmExecutor {
                 ..Default::default()
             },
         );
+        self.save_db();
     }
 }
 

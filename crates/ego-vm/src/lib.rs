@@ -9,6 +9,10 @@ pub mod types;
 
 pub use abi::{AbiDecoder, AbiEncoder, AbiError, AbiType, AbiValue, FunctionSelector};
 pub use evm::{EvmCallResult, EvmExecutor};
+
+pub fn evm_with_contracts_dir(dir: &std::path::Path) -> EvmExecutor {
+    EvmExecutor::with_state_path(dir.join("evm_state.json"))
+}
 pub use executor::Executor;
 pub use host::CrossCallRequest;
 pub use types::{CallResult, ContractAddress, ContractEvent, ContractManifest, DeployResult};

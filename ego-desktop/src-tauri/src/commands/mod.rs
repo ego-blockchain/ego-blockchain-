@@ -20,3 +20,4 @@ pub mod hosting;
 pub mod compute;
 pub mod storage_deals;
 pub mod cluster;
+pub mod l2;

@@ -307,9 +307,10 @@ fn create_wallet_files(address_override: Option<&str>) -> Result<String, EgoDesk
             coinbase_tx: None,
             vote_count: 0,
             tx_merkle_root: String::new(),
-        poc_ticket: String::new(),
-        poc_slot: 0,
-        state_root: String::new(),
+            poc_ticket: String::new(),
+            poc_slot: 0,
+            state_root: String::new(),
+            base_fee_uegoc: 1_000,
         });
         save_chain(&chain).map_err(EgoDesktopError::WalletError)?;
     }

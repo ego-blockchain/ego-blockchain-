@@ -184,6 +184,11 @@ pub async fn get_egoc_price_usd() -> EgocPrice {
     EgocPrice { price_usd: price, source }
 }
 
+#[tauri::command]
+pub async fn get_base_fee() -> u64 {
+    crate::chain_db::get_current_base_fee()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NetworkCapacity {
     pub total_allocated_gb: f64,
@@ -202,4 +207,9 @@ pub async fn get_network_capacity() -> NetworkCapacity {
         0.0
     };
     NetworkCapacity { total_allocated_gb: total_alloc, total_available_gb: total_avail, node_count, fill_ratio }
+}
+
+#[tauri::command]
+pub async fn get_state_stats() -> crate::chain_db::StateStats {
+    crate::chain_db::get_state_stats()
 }
