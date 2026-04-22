@@ -35,10 +35,7 @@ const VPN_KEYWORDS: &[&str] = &[
     "torguard", "zenmate", "hide.me", "astrill", "ivpn", "ovpn",
     "hidemyass", "hma", "perfect privacy", "strongvpn", "vyprvpn",
     "avast vpn", "avg vpn", "norton vpn", "f-secure vpn", "bitdefender vpn",
-    "vpn", "proxy", "anonymizer", "anonymiser", "tor exit", "tor relay",
-    "socks", "openvpn", "wireguard relay",
-    "datacamp", "m247", "leaseweb", "quadranet", "serverius",
-    "choopa", "vultr", "linode", "akamai", "fastly",
+    "anonymizer", "anonymiser", "tor exit", "tor relay",
 ];
 
 fn vpn_keyword_match(resp: &IpApiResponse) -> Option<String> {
@@ -60,12 +57,6 @@ fn vpn_keyword_match(resp: &IpApiResponse) -> Option<String> {
 fn detect_vpn(resp: &IpApiResponse) -> Option<String> {
     if resp.proxy.unwrap_or(false) {
         return Some("IP flagged as proxy/VPN by ip-api.com".to_string());
-    }
-    if resp.hosting.unwrap_or(false) {
-        return Some(format!(
-            "IP belongs to a datacenter/hosting provider (ISP: {})",
-            resp.isp.as_deref().unwrap_or("unknown")
-        ));
     }
     vpn_keyword_match(resp)
 }

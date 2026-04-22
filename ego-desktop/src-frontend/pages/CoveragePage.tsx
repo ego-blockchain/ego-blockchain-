@@ -553,6 +553,12 @@ const CoveragePage: React.FC = () => {
             <div className="text-sm text-gray-400">
               PoC beacon · Quality: <span className={qualityBadge(quality).split(' ')[0]}>{quality}</span>
             </div>
+            {!online && coverage?.vpn_detected && coverage.vpn_reason && (
+              <div className="text-xs text-red-400 mt-1">VPN/proxy detected: {coverage.vpn_reason}</div>
+            )}
+            {!online && !coverage?.vpn_detected && (
+              <div className="text-xs text-yellow-400 mt-1">Waiting for wallet or network…</div>
+            )}
           </div>
         </div>
         <div className="text-right">
