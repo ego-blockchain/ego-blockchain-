@@ -837,6 +837,8 @@ pub enum P2PMessage {
     },
     ChainSyncRequest {
         requester_endpoint: String,
+        #[serde(default)]
+        from_height: u64,
     },
     ChainSyncResponse {
         blocks:       Vec<LedgerBlock>,
@@ -1458,7 +1460,8 @@ pub async fn broadcast_pending_tx(tx: LedgerTx) {
 
 pub async fn sync_chain_from_peers() {
     let my_endpoint = get_public_endpoint().await;
-    let msg = P2PMessage::ChainSyncRequest { requester_endpoint: my_endpoint.clone() };
+    let my_height   = crate::chain_db::latest_block_info().0;
+    let msg = P2PMessage::ChainSyncRequest { requester_endpoint: my_endpoint.clone(), from_height: my_height };
 
     if let Ok(data) = serde_json::to_vec(&msg) {
         publish_gossip("ego-sync-v1", data).await;
@@ -2985,17 +2988,20 @@ async fn handle_event(
                     });
                 }
             } else if topic == "ego-sync-v1" {
-                if let Ok(P2PMessage::ChainSyncRequest { requester_endpoint }) =
+                if let Ok(P2PMessage::ChainSyncRequest { requester_endpoint, from_height }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
                     if !requester_endpoint.is_empty() && crate::chain_db::block_count() > 0 {
                         let ep = requester_endpoint.clone();
                         tokio::spawn(async move {
-                            let chain = crate::ledger::load_chain();
-                            let response = P2PMessage::ChainSyncResponse {
-                                blocks:       chain.blocks,
-                                transactions: chain.transactions,
-                            };
+                            let blocks = crate::chain_db::get_blocks_range(from_height + 1, 1_000);
+                            let transactions: Vec<crate::ledger::LedgerTx> = blocks.iter()
+                                .flat_map(|b| crate::chain_db::get_txs_for_block(b.height))
+                                .collect();
+                            eprintln!("[P2P] sync-v1: sending {} blocks ({} txs) from height {} to {}",
+                                blocks.len(), transactions.len(), from_height + 1,
+                                blocks.last().map(|b| b.height).unwrap_or(from_height));
+                            let response = P2PMessage::ChainSyncResponse { blocks, transactions };
                             if let Err(e) = send_message_any(&[ep.clone()], &response).await {
                                 if !e.contains("none of the requested protocols") {
                                     eprintln!("[P2P] sync-v1 response to {}: {}", ep, e);
@@ -3909,12 +3915,14 @@ P2PMessage::ChatMessage { bundle, seq } => {
             process_inbound_qc_finalization(&block_hash, height, &votes);
         }
 
-        P2PMessage::ChainSyncRequest { requester_endpoint } => {
-            let chain    = load_chain();
-            let response = P2PMessage::ChainSyncResponse {
-                blocks:       chain.blocks,
-                transactions: chain.transactions,
-            };
+        P2PMessage::ChainSyncRequest { requester_endpoint, from_height } => {
+            let blocks = crate::chain_db::get_blocks_range(from_height + 1, 1_000);
+            let transactions: Vec<crate::ledger::LedgerTx> = blocks.iter()
+                .flat_map(|b| crate::chain_db::get_txs_for_block(b.height))
+                .collect();
+            eprintln!("[P2P] sync reply: {} blocks ({} txs) from height {}",
+                blocks.len(), transactions.len(), from_height + 1);
+            let response = P2PMessage::ChainSyncResponse { blocks, transactions };
             tokio::spawn(async move {
                 let eps = vec![requester_endpoint.clone()];
                 if let Err(e) = send_message_any(&eps, &response).await {
