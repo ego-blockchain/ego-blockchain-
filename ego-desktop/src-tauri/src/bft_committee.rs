@@ -1,4 +1,5 @@
 pub const COMMITTEE_SIZE: usize = 21;
+pub const MAX_COMMITTEE_SIZE: usize = 150;
 
 
 pub fn min_committee_net() -> usize {

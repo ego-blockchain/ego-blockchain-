@@ -43,6 +43,8 @@ pub const MAX_MEMPOOL_SIZE: usize = 2_000_000;
 
 pub const MAX_TX_AGE_SECS: i64 = 300;
 
+pub const MIN_FEE_UEGOC: u64 = 1_000;
+
 pub fn shard_for_address(addr: &str) -> u32 {
     let mut h: u32 = 0xcbf29ce4;
     for b in addr.bytes() {
@@ -80,16 +82,65 @@ impl ShardedMempool {
 
 
     pub fn push(&self, tx: LedgerTx) {
-        // 1. Dedup: reject if the same tx hash is already pending.
+        let is_system = tx.from.is_empty()
+            || tx.tx_type == "reward"
+            || tx.tx_type == "coinbase";
+
+        if !is_system {
+            if tx.fee_uegoc < MIN_FEE_UEGOC {
+                eprintln!(
+                    "[Mempool] Rejected {} — fee {} uEGOC below floor {}",
+                    &tx.hash[..12.min(tx.hash.len())], tx.fee_uegoc, MIN_FEE_UEGOC
+                );
+                return;
+            }
+
+            if tx.nonce > 0 {
+                let confirmed_nonce = crate::ledger::last_confirmed_nonce(&tx.from);
+                if tx.nonce <= confirmed_nonce {
+                    eprintln!(
+                        "[Mempool] Rejected {} — replay nonce {} <= confirmed {}",
+                        &tx.hash[..12.min(tx.hash.len())], tx.nonce, confirmed_nonce
+                    );
+                    return;
+                }
+                if tx.nonce > confirmed_nonce + 10 {
+                    eprintln!(
+                        "[Mempool] Rejected {} — nonce {} too far ahead of confirmed {}",
+                        &tx.hash[..12.min(tx.hash.len())], tx.nonce, confirmed_nonce
+                    );
+                    return;
+                }
+            }
+        }
+
         {
             let mut seen = self.seen_hashes.lock().expect("lock poisoned");
             if !seen.insert(tx.hash.clone()) {
-                return; // already in mempool
+                return;
             }
         }
 
         let shard = shard_for_address(&tx.from) as usize;
         let mut s = self.shards[shard].lock().expect("lock poisoned");
+
+        if !is_system {
+            let balance = crate::chain_db::balance_of(&tx.from);
+            let pending_outflow: u64 = s.iter()
+                .filter(|t| t.from == tx.from)
+                .map(|t| t.amount.saturating_add(t.fee_uegoc))
+                .fold(0u64, |acc, v| acc.saturating_add(v));
+            let required = tx.amount.saturating_add(tx.fee_uegoc).saturating_add(pending_outflow);
+            if balance < required {
+                eprintln!(
+                    "[Mempool] Rejected {} — insufficient balance: has {} uEGOC, needs {} (amount {} + fee {} + pending_outflow {})",
+                    &tx.hash[..12.min(tx.hash.len())], balance, required,
+                    tx.amount, tx.fee_uegoc, pending_outflow
+                );
+                self.seen_hashes.lock().expect("lock poisoned").remove(&tx.hash);
+                return;
+            }
+        }
 
         // Localized O(K) eviction instead of O(N) global scan
         let max_per_shard = MAX_MEMPOOL_SIZE / SHARD_COUNT as usize;
