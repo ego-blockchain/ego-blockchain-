@@ -2,6 +2,7 @@
 
 mod app;
 mod bft_committee;
+mod bls_agg;
 mod blocks;
 mod chain_db;
 mod commands;
@@ -462,6 +463,7 @@ fn main() {
             commands::light_client::get_tx_proof,
             commands::light_client::verify_tx_proof,
             commands::light_client::request_headers_from_peer,
+            commands::light_client::get_account_proof,
             commands::governance::submit_governance_vote,
             commands::governance::get_governance_proposals,
             commands::governance::is_feature_active,

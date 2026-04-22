@@ -3,6 +3,12 @@ use crate::error::EgoDesktopError;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct AccountProofResponse {
+    pub state_root: String,
+    pub proof: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GetBlockHeadersArgs {
 
     #[serde(default)]
@@ -41,6 +47,13 @@ pub async fn get_tx_proof(tx_hash: String) -> Result<Option<MerkleProof>, EgoDes
 #[tauri::command]
 pub async fn verify_tx_proof(proof: MerkleProof) -> Result<bool, EgoDesktopError> {
     Ok(chain_db::verify_merkle_proof(&proof))
+}
+
+#[tauri::command]
+pub async fn get_account_proof(address: String) -> Result<AccountProofResponse, EgoDesktopError> {
+    let state_root = chain_db::compute_full_state_root();
+    let proof = chain_db::get_state_merkle_proof(&address);
+    Ok(AccountProofResponse { state_root, proof })
 }
 
 #[tauri::command]

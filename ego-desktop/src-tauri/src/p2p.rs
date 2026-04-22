@@ -305,6 +305,28 @@ fn pending_votes() -> std::sync::MutexGuard<'static, HashMap<String, Vec<String>
         .unwrap()
 }
 
+static BLS_SECRET_KEY: OnceLock<blst::min_pk::SecretKey> = OnceLock::new();
+
+static PENDING_BLS_SIGS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Vec<Vec<u8>>>>> =
+    std::sync::OnceLock::new();
+
+fn pending_bls_sigs() -> std::sync::MutexGuard<'static, HashMap<String, Vec<Vec<u8>>>> {
+    PENDING_BLS_SIGS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+}
+
+static PEER_BLS_PUBKEYS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Vec<u8>>>> =
+    std::sync::OnceLock::new();
+
+fn peer_bls_pubkeys() -> std::sync::MutexGuard<'static, HashMap<String, Vec<u8>>> {
+    PEER_BLS_PUBKEYS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+}
+
 // Per-peer available storage advertised via DataManifest gossip.
 static PEER_STORAGE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, f64>>> =
     std::sync::OnceLock::new();
@@ -1025,11 +1047,19 @@ pub enum P2PMessage {
         vrf_ticket: String,
         #[serde(default)]
         prev_hash:  String,
+        #[serde(default)]
+        bls_sig:    String,
+        #[serde(default)]
+        bls_pubkey: String,
     },
     BlockFinalized {
         block:        LedgerBlock,
         transactions: Vec<LedgerTx>,
         votes:        Vec<serde_json::Value>,
+        #[serde(default)]
+        agg_bls_sig:  String,
+        #[serde(default)]
+        bls_pubkeys:  Vec<String>,
     },
     ShardAnnounce {
         from_addr:          String,
@@ -1241,6 +1271,10 @@ pub enum P2PMessage {
         hash_b:   String,
         sig_b:    String,
         reporter: String,
+    },
+    ShardTxRoute {
+        shard_id: u32,
+        tx:       LedgerTx,
     },
 }
 
@@ -1876,6 +1910,16 @@ pub async fn broadcast_master_promotion(shard_id: u32, new_master: &str, new_end
     }
 }
 
+pub async fn route_tx_to_shard_master(shard_id: u32, tx: crate::ledger::LedgerTx) {
+    if let Some(endpoint) = crate::sharding::get_shard_master(shard_id) {
+        let msg = P2PMessage::ShardTxRoute { shard_id, tx: tx.clone() };
+        if let Err(_) = send_message_any(&[endpoint], &msg).await {
+            crate::mempool::get_mempool().push(tx);
+        }
+    } else {
+        crate::mempool::get_mempool().push(tx);
+    }
+}
 
 pub async fn push_shard_data_to_slaves() {
     let map = crate::sharding::load_shard_map();
@@ -2241,6 +2285,8 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     let compute_topic = gossipsub::IdentTopic::new("ego-compute-v1");
     swarm.behaviour_mut().gossipsub.subscribe(&compute_topic).ok();
 
+    let shard_tx_topic = gossipsub::IdentTopic::new("ego-shard-txs-v1");
+    swarm.behaviour_mut().gossipsub.subscribe(&shard_tx_topic).ok();
 
     let _ = swarm.behaviour_mut().kad.bootstrap();
 
@@ -2327,6 +2373,11 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                         hex::encode(SigningKey::from_bytes(&seed).verifying_key().as_bytes())
                     };
                     record_peer_ed25519(&ledger.address, &vk_hex);
+
+                    let bls_sk = crate::bls_agg::derive_bls_key(&seed_bytes);
+                    let bls_pk_bytes = crate::bls_agg::bls_pubkey(&bls_sk);
+                    peer_bls_pubkeys().insert(ledger.address.clone(), bls_pk_bytes);
+                    let _ = BLS_SECRET_KEY.set(bls_sk);
                 }
             }
         }
@@ -3056,15 +3107,13 @@ async fn handle_event(
                         let app2 = app.clone();
                         tokio::spawn(async move { merge_remote_chain(blocks, transactions, &app2).await; });
                     }
-                    Ok(P2PMessage::BlockFinalized { block, transactions, votes }) => {
+                    Ok(P2PMessage::BlockFinalized { block, transactions, votes, agg_bls_sig, bls_pubkeys }) => {
                         let block_hash = block.hash.clone();
                         let height     = block.height;
                         let app2 = app.clone();
                         tokio::spawn(async move {
                             merge_remote_chain(vec![block], transactions, &app2).await;
-                            // Verify QC (threshold + ML-DSA-44 sigs) before updating
-                            // consensus state.  Prevents a single peer from forging finality.
-                            process_inbound_qc_finalization(&block_hash, height, &votes);
+                            process_inbound_qc_finalization(&block_hash, height, &votes, &agg_bls_sig, &bls_pubkeys);
                         });
                     }
                     Ok(P2PMessage::EquivocationProof { accused, height, hash_a, sig_a, hash_b, sig_b, reporter }) => {
@@ -3094,13 +3143,13 @@ async fn handle_event(
                     });
                 }
             } else if topic == "ego-votes-v1" {
-                if let Ok(P2PMessage::BlockVote { block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash }) =
+                if let Ok(P2PMessage::BlockVote { block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
                     register_known_validator(&voter);
                     let app2 = app.clone();
                     tokio::spawn(async move {
-                        handle_block_vote(block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, &app2).await;
+                        handle_block_vote(block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, &app2).await;
                     });
                 }
             } else if topic == "ego-sync-v1" {
@@ -3439,6 +3488,26 @@ async fn handle_event(
                         }
                     }
                     _ => {}
+                }
+            } else if topic == "ego-shard-txs-v1" {
+                if let Ok(P2PMessage::ShardTxRoute { shard_id, tx }) =
+                    serde_json::from_slice::<P2PMessage>(&message.data)
+                {
+                    let my_addr = crate::ledger::Ledger::load().address;
+                    let map = crate::sharding::load_shard_map();
+                    let all_nodes: Vec<String> = map.assignments.iter()
+                        .map(|a| a.node_address.clone())
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter().collect();
+                    let my_shard_ids: Vec<u32> = crate::sharding::my_shards(&my_addr, &map, &all_nodes)
+                        .into_iter().map(|(id, _)| id).collect();
+                    if my_shard_ids.contains(&shard_id) {
+                        crate::mempool::get_mempool().push(tx);
+                    } else {
+                        tokio::spawn(async move {
+                            route_tx_to_shard_master(shard_id, tx).await;
+                        });
+                    }
                 }
             }
         }
@@ -4070,16 +4139,16 @@ P2PMessage::ChatMessage { bundle, seq } => {
             handle_block_proposal(block, transactions, proposer, app).await;
         }
 
-        P2PMessage::BlockVote { block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash } => {
+        P2PMessage::BlockVote { block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey } => {
             register_known_validator(&voter);
-            handle_block_vote(block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, app).await;
+            handle_block_vote(block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, app).await;
         }
 
-        P2PMessage::BlockFinalized { block, transactions, votes } => {
+        P2PMessage::BlockFinalized { block, transactions, votes, agg_bls_sig, bls_pubkeys } => {
             let block_hash = block.hash.clone();
             let height     = block.height;
             merge_remote_chain(vec![block], transactions, app).await;
-            process_inbound_qc_finalization(&block_hash, height, &votes);
+            process_inbound_qc_finalization(&block_hash, height, &votes, &agg_bls_sig, &bls_pubkeys);
         }
 
         P2PMessage::ChainSyncRequest { requester_endpoint, from_height } => {
@@ -4793,6 +4862,24 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
         P2PMessage::StorageDealTerminated { .. } => {}
         P2PMessage::EquivocationProof { .. } => {}
 
+        P2PMessage::ShardTxRoute { shard_id, tx } => {
+            let my_addr = crate::ledger::Ledger::load().address;
+            let map = crate::sharding::load_shard_map();
+            let all_nodes: Vec<String> = map.assignments.iter()
+                .map(|a| a.node_address.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter().collect();
+            let my_shard_ids: Vec<u32> = crate::sharding::my_shards(&my_addr, &map, &all_nodes)
+                .into_iter().map(|(id, _)| id).collect();
+            if my_shard_ids.contains(&shard_id) {
+                crate::mempool::get_mempool().push(tx);
+            } else {
+                tokio::spawn(async move {
+                    route_tx_to_shard_master(shard_id, tx).await;
+                });
+            }
+        }
+
         P2PMessage::StorageProofResponse { block_cid, nonce, response_hash, prover } => {
             let key = format!("{}:{}", block_cid, nonce);
             let result = {
@@ -5345,6 +5432,9 @@ async fn merge_remote_chain_inner(
         }
     }
 
+    if let Some(tip) = new_blocks.iter().max_by_key(|b| b.height) {
+        crate::rpc::notify_new_block(tip);
+    }
     let _ = app.emit_all("ego://chain-updated", ());
 }
 
@@ -5425,6 +5515,17 @@ fn bft_sign(data: &str) -> Option<String> {
     seed.copy_from_slice(&seed_bytes);
     let sig = SigningKey::from_bytes(&seed).sign(data.as_bytes());
     Some(hex::encode(sig.to_bytes()))
+}
+
+fn bls_vote_fields(block_hash_bytes: &[u8]) -> (String, String) {
+    match BLS_SECRET_KEY.get() {
+        Some(sk) => {
+            let sig = crate::bls_agg::bls_sign(sk, block_hash_bytes);
+            let pk  = crate::bls_agg::bls_pubkey(sk);
+            (hex::encode(sig), hex::encode(pk))
+        }
+        None => (String::new(), String::new()),
+    }
 }
 
 async fn handle_block_proposal(
@@ -5604,6 +5705,9 @@ async fn handle_block_proposal(
 
     eprintln!("[BFT] Self-selected as committee for block #{} — voting", block.height);
 
+    let block_hash_bytes = hex::decode(&block.hash).unwrap_or_default();
+    let (my_bls_sig, my_bls_pk) = bls_vote_fields(&block_hash_bytes);
+
     let vote = P2PMessage::BlockVote {
         block_hash: block.hash.clone(),
         height:     block.height,
@@ -5612,13 +5716,15 @@ async fn handle_block_proposal(
         timestamp:  chrono::Utc::now().timestamp(),
         vrf_ticket: vrf_ticket_hex.clone(),
         prev_hash:  block.prev_hash.clone(),
+        bls_sig:    my_bls_sig.clone(),
+        bls_pubkey: my_bls_pk.clone(),
     };
 
     if let Ok(data) = serde_json::to_vec(&vote) {
         publish_gossip("ego-votes-v1", data).await;
     }
 
-    handle_block_vote(block.hash, block.height, my_addr, signature, chrono::Utc::now().timestamp(), vrf_ticket_hex, block.prev_hash, app).await;
+    handle_block_vote(block.hash, block.height, my_addr, signature, chrono::Utc::now().timestamp(), vrf_ticket_hex, block.prev_hash, my_bls_sig, my_bls_pk, app).await;
 }
 
 async fn handle_block_vote(
@@ -5629,6 +5735,8 @@ async fn handle_block_vote(
     timestamp:   i64,
     vrf_ticket:  String,
     prev_hash:   String,
+    bls_sig:     String,
+    bls_pubkey:  String,
     app:         &tauri::AppHandle,
 ) {
     if slashed_validators().contains(&voter) {
@@ -5736,6 +5844,20 @@ async fn handle_block_vote(
         }
     }
 
+    if !bls_pubkey.is_empty() {
+        if let Ok(pk_bytes) = hex::decode(&bls_pubkey) {
+            peer_bls_pubkeys().insert(voter.clone(), pk_bytes);
+        }
+    }
+
+    if !bls_sig.is_empty() {
+        if let Ok(sig_bytes) = hex::decode(&bls_sig) {
+            let mut sigs = pending_bls_sigs();
+            let entry = sigs.entry(block_hash.clone()).or_default();
+            entry.push(sig_bytes);
+        }
+    }
+
     let threshold = bft_threshold();
 
     let should_finalize = {
@@ -5743,8 +5865,6 @@ async fn handle_block_vote(
         let voters = votes.entry(block_hash.clone()).or_default();
         if !voters.contains(&voter) {
             voters.push(voter.clone());
-            // Persist the vote to RocksDB so BFT state survives node restarts.
-            // (Item 6: BFT votes are no longer ephemeral.)
             crate::chain_db::persist_pending_vote(&block_hash, &voter);
             eprintln!("[BFT] Vote for block #{} from {} ({}/{} votes)",
                 height, voter, voters.len(), threshold);
@@ -5762,6 +5882,16 @@ async fn handle_block_vote(
     let final_vote_count = pending_votes().get(&block_hash).map(|v| v.len()).unwrap_or(0);
     eprintln!("[BFT] Block #{} FINALIZED with {} votes (threshold={})",
         height, final_vote_count, threshold);
+
+    {
+        let sigs = pending_bls_sigs().get(&block_hash).cloned().unwrap_or_default();
+        if !sigs.is_empty() {
+            match crate::bls_agg::aggregate_signatures(&sigs) {
+                Ok(agg) => eprintln!("[BLS] Aggregated {} signatures into {} bytes for block #{}", sigs.len(), agg.len(), height),
+                Err(e)  => eprintln!("[BLS] Aggregation failed for block #{}: {}", height, e),
+            }
+        }
+    }
 
     finalized_at_height().insert(height, block_hash.clone());
     if final_vote_count >= threshold {
@@ -5846,10 +5976,28 @@ async fn handle_block_vote(
             .collect()
     };
 
+    let (agg_bls_sig, bls_pubkeys) = {
+        let sigs  = pending_bls_sigs().get(&block_hash).cloned().unwrap_or_default();
+        let pks   = peer_bls_pubkeys();
+        let voters = pending_votes().get(&block_hash).cloned().unwrap_or_default();
+        let pk_list: Vec<String> = voters.iter()
+            .filter_map(|v| pks.get(v))
+            .map(|b| hex::encode(b))
+            .collect();
+        let agg = if !sigs.is_empty() {
+            crate::bls_agg::aggregate_signatures(&sigs).map(|a| hex::encode(a)).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        (agg, pk_list)
+    };
+
     let finalized = P2PMessage::BlockFinalized {
         block:        block.clone(),
         transactions: block_txs.clone(),
         votes:        votes_json,
+        agg_bls_sig,
+        bls_pubkeys,
     };
 
     if let Ok(data) = serde_json::to_vec(&finalized) {
@@ -5862,12 +6010,18 @@ async fn handle_block_vote(
         tokio::spawn(async move { push_block_to_oracle(&b, &txs).await; });
     }
 
+    crate::rpc::notify_new_block(&block);
     let _ = app.emit_all("ego://chain-updated", ());
 }
 
 
-fn process_inbound_qc_finalization(block_hash: &str, height: u64, votes: &[serde_json::Value]) {
-    // Guard: already finalized (this node collected 2f+1 votes itself).
+fn process_inbound_qc_finalization(
+    block_hash:  &str,
+    height:      u64,
+    votes:       &[serde_json::Value],
+    agg_bls_sig: &str,
+    bls_pubkeys: &[String],
+) {
     {
         let fin = finalized_at_height();
         if fin.contains_key(&height) {
@@ -5877,7 +6031,6 @@ fn process_inbound_qc_finalization(block_hash: &str, height: u64, votes: &[serde
 
     let threshold = bft_threshold();
 
-    // ── 1. Quorum size check ──────────────────────────────────────────────────
     if votes.len() < threshold {
         eprintln!(
             "[QC] Block #{} ({:.8}…): only {} votes, need {} — ignoring peer finalization claim",
@@ -5886,9 +6039,35 @@ fn process_inbound_qc_finalization(block_hash: &str, height: u64, votes: &[serde
         return;
     }
 
-    // ── 2 & 3. Signature + known-validator verification ──────────────────────
-    // Count votes whose ML-DSA-44 sig is valid and whose voter is a known validator.
-    let vote_data_prefix = crate::bft_committee::vote_signing_data(block_hash, height, "");
+    let block_hash_bytes = hex::decode(block_hash).unwrap_or_default();
+    if !agg_bls_sig.is_empty() && !bls_pubkeys.is_empty() {
+        if let Ok(agg_bytes) = hex::decode(agg_bls_sig) {
+            let pk_bytes: Vec<Vec<u8>> = bls_pubkeys.iter()
+                .filter_map(|h| hex::decode(h).ok())
+                .collect();
+            if crate::bls_agg::verify_aggregate(&agg_bytes, &pk_bytes, &block_hash_bytes) {
+                eprintln!(
+                    "[QC] Block #{} ({:.8}…) BLS aggregate verified ({} signers)",
+                    height, block_hash, bls_pubkeys.len()
+                );
+                finalized_at_height().insert(height, block_hash.to_string());
+                hard_finalized_heights().insert(height);
+                pending_proposals().remove(&height);
+                {
+                    let all_hashes: Vec<String> = pending_votes().keys().cloned().collect();
+                    for h in &all_hashes {
+                        crate::chain_db::clear_pending_votes_for_block(h);
+                    }
+                }
+                pending_votes().clear();
+                CONSECUTIVE_EMPTY_VIEWS.store(0, Ordering::Relaxed);
+                return;
+            } else {
+                eprintln!("[QC] Block #{} BLS aggregate verify FAILED — falling back to per-sig", height);
+            }
+        }
+    }
+
     let known = known_validators();
     let mut verified: usize = 0;
     for v in votes {
@@ -5898,13 +6077,8 @@ fn process_inbound_qc_finalization(block_hash: &str, height: u64, votes: &[serde
         };
         let sig_hex = v.get("signature").and_then(|x| x.as_str()).unwrap_or("");
         if sig_hex.is_empty() { continue; }
-
-        // voter must be a registered committee member
         if !known.contains(voter) { continue; }
-
-        // vote_signing_data includes the voter address — rebuild per-voter
         let vote_data = crate::bft_committee::vote_signing_data(block_hash, height, voter);
-        let _ = vote_data_prefix.as_str(); // silence unused warning
         if verify_bft_sig(voter, &vote_data, sig_hex) {
             verified += 1;
         }
@@ -5924,7 +6098,6 @@ fn process_inbound_qc_finalization(block_hash: &str, height: u64, votes: &[serde
         height, block_hash, verified, threshold
     );
 
-    // ── Update consensus state ────────────────────────────────────────────────
     finalized_at_height().insert(height, block_hash.to_string());
     hard_finalized_heights().insert(height);
     pending_proposals().remove(&height);
@@ -6149,6 +6322,8 @@ pub async fn propose_block_as_leader() {
             }
         }
         votes_cast().insert((miner.clone(), block.height), (block.hash.clone(), self_sig.clone()));
+        let block_hash_bytes = hex::decode(&block.hash).unwrap_or_default();
+        let (self_bls_sig, self_bls_pk) = bls_vote_fields(&block_hash_bytes);
         let self_vote = P2PMessage::BlockVote {
             block_hash: block.hash.clone(),
             height:     block.height,
@@ -6157,6 +6332,8 @@ pub async fn propose_block_as_leader() {
             timestamp:  chrono::Utc::now().timestamp(),
             vrf_ticket: committee_ticket_hex,
             prev_hash:  block.prev_hash.clone(),
+            bls_sig:    self_bls_sig,
+            bls_pubkey: self_bls_pk,
         };
         if let Ok(data) = serde_json::to_vec(&self_vote) {
             publish_gossip("ego-votes-v1", data).await;
@@ -6269,6 +6446,8 @@ pub async fn propose_block_as_leader_forced() {
             }
         }
         votes_cast().insert((miner.clone(), block.height), (block.hash.clone(), self_sig.clone()));
+        let block_hash_bytes = hex::decode(&block.hash).unwrap_or_default();
+        let (fb_bls_sig, fb_bls_pk) = bls_vote_fields(&block_hash_bytes);
         let self_vote = P2PMessage::BlockVote {
             block_hash: block.hash.clone(),
             height:     block.height,
@@ -6277,6 +6456,8 @@ pub async fn propose_block_as_leader_forced() {
             timestamp:  chrono::Utc::now().timestamp(),
             vrf_ticket: committee_ticket_hex,
             prev_hash:  block.prev_hash.clone(),
+            bls_sig:    fb_bls_sig,
+            bls_pubkey: fb_bls_pk,
         };
         if let Ok(data) = serde_json::to_vec(&self_vote) {
             publish_gossip("ego-votes-v1", data).await;

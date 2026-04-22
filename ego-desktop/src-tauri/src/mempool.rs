@@ -87,6 +87,42 @@ impl ShardedMempool {
             || tx.tx_type == "coinbase";
 
         if !is_system {
+            let network_size =
+                crate::p2p::get_known_validators_snapshot().len() as u32 + 1;
+            let total_shards = crate::sharding::compute_shard_count(network_size);
+            if total_shards > 1 {
+                let mut h: u64 = 0xcbf29ce484222325;
+                for b in tx.from.bytes() {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x00000100000001b3);
+                }
+                let tx_blockchain_shard = (h % total_shards as u64) as u32;
+                let my_addr = crate::ledger::Ledger::load().address;
+                let map = crate::sharding::load_shard_map();
+                let all_nodes: Vec<String> = map
+                    .assignments
+                    .iter()
+                    .map(|a| a.node_address.clone())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                let my_shard_ids: Vec<u32> =
+                    crate::sharding::my_shards(&my_addr, &map, &all_nodes)
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect();
+                if !my_shard_ids.contains(&tx_blockchain_shard) {
+                    let shard_id = tx_blockchain_shard;
+                    let tx_clone = tx;
+                    tokio::spawn(async move {
+                        crate::p2p::route_tx_to_shard_master(shard_id, tx_clone).await;
+                    });
+                    return;
+                }
+            }
+        }
+
+        if !is_system {
             if tx.fee_uegoc < MIN_FEE_UEGOC {
                 eprintln!(
                     "[Mempool] Rejected {} — fee {} uEGOC below floor {}",
@@ -160,10 +196,13 @@ impl ShardedMempool {
             eprintln!("[Mempool] Evicted lowest-fee tx {} from shard {}", &evicted.hash[..12], shard);
         }
 
+        let tx_hash_for_notify = tx.hash.clone();
         s.push(tx);
         self.pending_total.fetch_add(1, Ordering::Relaxed);
         self.submitted.fetch_add(1, Ordering::Relaxed);
         self.tx_notify.notify_one();
+        drop(s);
+        crate::rpc::notify_pending_tx(&tx_hash_for_notify);
     }
 
 
@@ -217,16 +256,16 @@ impl ShardedMempool {
     }
 
     pub fn drain_all(&self) -> Vec<LedgerTx> {
-        let mut all = Vec::new();
-        for shard_id in 0..SHARD_COUNT {
-            all.extend(self.drain_shard(shard_id));
-        }
-        all
+        use rayon::prelude::*;
+        (0..SHARD_COUNT)
+            .into_par_iter()
+            .flat_map(|shard_id| self.drain_shard(shard_id))
+            .collect()
     }
 
-    /// Returns a snapshot of all pending txs without draining — for the explorer.
     pub fn peek_all(&self) -> Vec<LedgerTx> {
-        self.shards.iter()
+        use rayon::prelude::*;
+        self.shards.par_iter()
             .flat_map(|s| s.lock().expect("lock poisoned").clone())
             .collect()
     }
@@ -291,6 +330,7 @@ async fn try_mine(txs: Vec<LedgerTx>, miner: &str) -> Vec<LedgerTx> {
     );
 
     crate::chain_db::pipeline_commit(block.height);
+    crate::rpc::notify_new_block(&block);
 
     let height = block.height;
     let confirmed: Vec<LedgerTx> = txs.iter().map(|tx| {
