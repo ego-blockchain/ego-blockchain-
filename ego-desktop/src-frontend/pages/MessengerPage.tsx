@@ -640,11 +640,11 @@ useEffect(() => {
       {ConfirmDialog}
 
       {}
-      {p2pStatus?.upnp === 'failed' && (
+      {p2pStatus?.upnp === 'failed' && !p2pStatus.relay_circuit_ready && (
         <div className="bg-yellow-900/80 border-b border-yellow-600/40 px-4 py-2 flex items-start gap-2 shrink-0">
           <span className="text-yellow-400 shrink-0 mt-0.5">⚠️</span>
           <div className="text-xs text-yellow-200 leading-relaxed">
-            <strong>Cross-network messaging may not work.</strong> UPnP port mapping failed — peers on other networks can't reach you.
+            <strong>Cross-network messaging may not work.</strong> UPnP port mapping failed and relay is not connected — peers on other networks can't reach you.
             Fix: forward <strong>TCP port {p2pStatus.p2p_port}</strong> to your local machine in your router settings.
           </div>
         </div>
