@@ -19,11 +19,14 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
   const [seedHex, setSeedHex]   = useState('');
   const [showSeed, setShowSeed] = useState(false);
   const [checked, setChecked]   = useState(false);
-  const otpRefs = useRef<(HTMLInputElement | null)[]>([]);
+  const otpRefs   = useRef<(HTMLInputElement | null)[]>([]);
+  const sendingRef = useRef(false);
 
   async function handleSendOtp() {
+    if (sendingRef.current) return;
     if (!name.trim() || !email.trim()) { setError('Please enter your name and email.'); return; }
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { setError('Please enter a valid email address.'); return; }
+    sendingRef.current = true;
     setLoading(true); setError('');
     try {
       await invoke('send_verification_email', { email: email.trim(), name: name.trim() });
@@ -37,6 +40,7 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
       }
     } finally {
       setLoading(false);
+      sendingRef.current = false;
     }
   }
 
@@ -88,6 +92,8 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
   }
 
   async function handleResend() {
+    if (sendingRef.current) return;
+    sendingRef.current = true;
     setLoading(true); setError(''); setOtp(['', '', '', '', '', '']);
     try {
       await invoke('send_verification_email', { email: email.trim(), name: name.trim() });
@@ -100,6 +106,7 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
       }
     } finally {
       setLoading(false);
+      sendingRef.current = false;
     }
   }
 
@@ -142,7 +149,7 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
                 onChange={e => setEmail(e.target.value)}
                 placeholder="e.g. john@example.com"
                 className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition text-white"
-                onKeyDown={e => e.key === 'Enter' && handleSendOtp()}
+                onKeyDown={e => e.key === 'Enter' && !sendingRef.current && handleSendOtp()}
               />
             </div>
           </div>
