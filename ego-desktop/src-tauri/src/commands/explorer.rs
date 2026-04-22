@@ -232,3 +232,9 @@ pub async fn get_supply_info() -> SupplyInfo {
         current_block_reward_uegoc: crate::chain_db::block_reward_at_height(height),
     }
 }
+
+#[tauri::command]
+pub async fn set_log_level(level: String) -> Result<String, String> {
+    std::env::set_var("EGO_LOG", &level);
+    Ok(format!("Log level hint set to {} (takes effect on restart)", level))
+}

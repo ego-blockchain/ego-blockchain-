@@ -149,7 +149,7 @@ fn init_db(db: &DB) {
     if sqlite_path.exists() {
         if migrate_from_sqlite(db, &sqlite_path) {
             db.put_cf(meta, META_MIGRATION_DONE, b"1").ok();
-            eprintln!("[ChainDB] Migrated from SQLite → RocksDB");
+            tracing::info!("Migrated from SQLite → RocksDB");
             return;
         }
     }
@@ -159,7 +159,7 @@ fn init_db(db: &DB) {
     if json_path.exists() {
         if migrate_from_json(db, &json_path) {
             db.put_cf(meta, META_MIGRATION_DONE, b"1").ok();
-            eprintln!("[ChainDB] Migrated from chain.json → RocksDB");
+            tracing::info!("Migrated from chain.json → RocksDB");
             return;
         }
     }
@@ -167,7 +167,7 @@ fn init_db(db: &DB) {
     // 3. Seed genesis.
     seed_genesis(db);
     db.put_cf(meta, META_MIGRATION_DONE, b"1").ok();
-    eprintln!("[ChainDB] Seeded genesis block");
+    tracing::info!("Seeded genesis block");
 }
 
 /// Genesis addresses for pre-minted supply pools.
@@ -219,7 +219,7 @@ fn seed_genesis(db: &DB) {
     };
     write_block_batch(db, &genesis, &[]);
 
-    eprintln!("[Genesis] Seeded supply pools: ecosystem={} EGOC, foundation={} EGOC, node_pool={} EGOC, staking_pool={} EGOC, faucet=10M EGOC",
+    tracing::info!("Seeded supply pools: ecosystem={} EGOC, foundation={} EGOC, node_pool={} EGOC, staking_pool={} EGOC, faucet=10M EGOC",
         ECOSYSTEM_EGOC, FOUNDATION_EGOC, NODE_POOL_EGOC, STAKING_POOL_EGOC);
 }
 
@@ -436,7 +436,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
 
     // Checkpoint guard: reject blocks that contradict hardcoded anchors.
     if let Err(e) = check_checkpoint(block) {
-        eprintln!("[ChainDB] CHECKPOINT VIOLATION — rejecting block: {}", e);
+        tracing::error!("CHECKPOINT VIOLATION — rejecting block: {}", e);
         return;
     }
 
@@ -451,7 +451,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
             return; // existing block is at least as well-attested — keep it
         }
         // New block has more votes: fall through and overwrite.
-        eprintln!("[ForkChoice] Replacing block #{} ({} votes → {} votes)",
+        tracing::info!("ForkChoice: replacing block #{} ({} votes → {} votes)",
             block.height, existing_votes, block.vote_count);
     }
 
@@ -573,7 +573,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
     }
 
     if let Err(e) = db.write(batch) {
-        eprintln!("[ChainDB] write batch failed (disk full?): {e}");
+        tracing::error!("write batch failed (disk full?): {e}");
         return;
     }
 
@@ -651,7 +651,7 @@ fn prune_if_needed(db: &DB) {
     if latest % 10_000 == 0 && latest > 0 {
         let pruned = prune_zero_balance_accounts(db);
         if pruned > 0 {
-            eprintln!("[ChainDB] Pruned {} zero-balance accounts from state trie", pruned);
+            tracing::info!("Pruned {} zero-balance accounts from state trie", pruned);
         }
     }
 
@@ -674,7 +674,7 @@ fn prune_if_needed(db: &DB) {
             batch.delete_range_cf(cf_block_txs, height_key(pruned_below), height_key(keep_from));
             batch.put_cf(cf_meta, META_PRUNE_BELOW, u64_le(keep_from));
             let _ = db.write(batch);
-            eprintln!("[ChainDB] Pruned full blocks {}..{} (keeping last {})",
+            tracing::info!("Pruned full blocks {}..{} (keeping last {})",
                 pruned_below, keep_from, FULL_BLOCK_CAP);
         }
     }
@@ -741,15 +741,15 @@ pub fn burn_from_staking_pool(amount_uegoc: u64) {
         .map(|v| read_u64_le(&v))
         .unwrap_or(0);
     if node_pool_bal <= MIN_POOL_RESERVE {
-        eprintln!(
-            "[ChainDB] burn_from_staking_pool refused: node pool at {} uEGOC is at or below MIN_POOL_RESERVE ({} uEGOC)",
+        tracing::warn!(
+            "burn_from_staking_pool refused: node pool at {} uEGOC is at or below MIN_POOL_RESERVE ({} uEGOC)",
             node_pool_bal, MIN_POOL_RESERVE
         );
         return;
     }
     let new_bal = cur.saturating_sub(amount_uegoc);
     if let Err(e) = db.put_cf(cf, STAKING_ADDR_STR.as_bytes(), u64_le(new_bal)) {
-        eprintln!("[ChainDB] burn_from_staking_pool write failed: {e}");
+        tracing::error!("burn_from_staking_pool write failed: {e}");
     }
 }
 
@@ -1094,7 +1094,7 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
     let remaining = remaining_mintable();
     let reward = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash).min(remaining);
     if reward == 0 {
-        eprintln!("[ChainDB] Supply cap reached at block {} — no coinbase reward", height);
+        tracing::warn!("Supply cap reached at block {} — no coinbase reward", height);
     }
 
     let coinbase_hash = format!("0x{}", blake3::hash(
@@ -1253,9 +1253,9 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
         }
         if total_burned > 0 {
             if let Err(e) = db.write(burn_batch) {
-                eprintln!("[BaseFee] burn write failed: {e}");
+                tracing::error!("BaseFee burn write failed: {e}");
             } else {
-                eprintln!("[BaseFee] Block #{height} burned {} uEGOC base fees ({} user txs, {} uEGOC each)",
+                tracing::info!("Block #{height} burned {} uEGOC base fees ({} user txs, {} uEGOC each)",
                     total_burned, user_tx_count, new_base_fee);
             }
         }
@@ -1293,7 +1293,7 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
     let remaining = remaining_mintable();
     let reward = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash).min(remaining);
     if reward == 0 {
-        eprintln!("[ChainDB] Supply cap reached at block {} — no coinbase reward", height);
+        tracing::warn!("Supply cap reached at block {} — no coinbase reward", height);
     }
 
     let coinbase_hash = format!("0x{}", blake3::hash(
@@ -1454,8 +1454,8 @@ pub fn commit_staged_block(block: &LedgerBlock, stamped: &[LedgerTx], vote_count
             .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
     };
     if block.height != current_tip + 1 {
-        eprintln!(
-            "[ChainDB] commit_staged_block: block #{} rejected — tip is #{} (already committed or stale)",
+        tracing::warn!(
+            "commit_staged_block: block #{} rejected — tip is #{} (already committed or stale)",
             block.height, current_tip
         );
         return false;
@@ -1475,8 +1475,8 @@ pub fn verify_block_hash(block: &LedgerBlock, txs: &[crate::ledger::LedgerTx]) -
     let expected_merkle = compute_merkle_root(&tx_hashes);
 
     if !block.tx_merkle_root.is_empty() && block.tx_merkle_root != expected_merkle {
-        eprintln!(
-            "[ChainDB] Block #{} merkle root mismatch: stored={} computed={}",
+        tracing::error!(
+            "Block #{} merkle root mismatch: stored={} computed={}",
             block.height, &block.tx_merkle_root[..8.min(block.tx_merkle_root.len())], &expected_merkle[..8]
         );
         return false;
@@ -1502,15 +1502,15 @@ pub fn verify_block_hash(block: &LedgerBlock, txs: &[crate::ledger::LedgerTx]) -
             &block.state_root,
         );
         if block.hash == v3_hash { return true; }
-        eprintln!(
-            "[ChainDB] Block #{} v3 hash mismatch: stored={:.8} expected={:.8}",
+        tracing::error!(
+            "Block #{} v3 hash mismatch: stored={:.8} expected={:.8}",
             block.height, block.hash, v3_hash
         );
         return false;
     }
 
-    eprintln!(
-        "[ChainDB] Block #{} hash mismatch: stored={:.8} v2={:.8}",
+    tracing::error!(
+        "Block #{} hash mismatch: stored={:.8} v2={:.8}",
         block.height, block.hash, v2_hash
     );
     false
@@ -1566,7 +1566,7 @@ pub fn delete_full_blocks_for_shard(shard_id: u32, shard_count: u32) {
         batch.delete_cf(cf_block_txs, height_key(*h));
     }
     let _ = db.write(batch);
-    eprintln!("[ChainDB] Pruned {} full blocks for shard {} (keeping light headers)", heights_to_delete.len(), shard_id);
+    tracing::info!("Pruned {} full blocks for shard {} (keeping light headers)", heights_to_delete.len(), shard_id);
 }
 
 pub fn truncate_from(height: u64) {
@@ -1584,7 +1584,7 @@ pub fn truncate_from(height: u64) {
     let new_tip = height - 1;
     batch.put_cf(cf_meta, META_LATEST_HEIGHT, u64_le(new_tip));
     db.write(batch).expect("truncate write");
-    eprintln!("[ChainDB] Reorg: truncated heights {}..={} (new tip: {})", height, tip, new_tip);
+    tracing::warn!("Reorg: truncated heights {}..={} (new tip: {})", height, tip, new_tip);
 }
 
 /// Same as `append_peer_block` but stamps `vote_count` before writing.
@@ -2080,7 +2080,7 @@ pub fn restore_in_memory_state_from_db() {
             crate::ledger::record_validator_stake(&addr, amount, true);
         }
     }
-    eprintln!("[ChainDB] In-memory nonce + stake stores restored from RocksDB");
+    tracing::info!("In-memory nonce + stake stores restored from RocksDB");
 }
 
 // ── Kept for API compatibility ────────────────────────────────────────────────
