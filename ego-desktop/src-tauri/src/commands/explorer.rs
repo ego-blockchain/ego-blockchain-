@@ -67,6 +67,7 @@ pub struct P2pStatus {
     pub public_endpoint: String,
     pub p2p_port: u16,
 
+    pub relay_circuit_ready: bool,
     pub relay_server_active: bool,
 
     pub community_relays: Vec<String>,
@@ -90,6 +91,7 @@ pub async fn get_p2p_status(state: tauri::State<'_, crate::app::AppState>) -> Re
         upnp_error,
         public_endpoint:      state.get_public_endpoint(),
         p2p_port:             crate::p2p::P2P_PORT,
+        relay_circuit_ready:  crate::p2p::RELAY_CIRCUIT_READY.load(std::sync::atomic::Ordering::Relaxed),
         relay_server_active:  crate::p2p::relay_mode_active(),
         community_relays:     crate::p2p::get_discovered_relay_nodes(),
         storage_quota_bytes:  ledger.storage_allocated_bytes,
