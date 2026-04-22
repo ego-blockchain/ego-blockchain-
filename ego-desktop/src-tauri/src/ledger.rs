@@ -500,6 +500,12 @@ pub struct StoredFile {
     #[serde(default)]
     pub collateral_locked_uegoc: u64,
 
+    /// Unix timestamp when the file first dropped below MIN_REPLICAS.
+    /// 0 = fully replicated (or not yet observed under-replicated).
+    /// Used to enforce repair deadlines: warn after 1h, critical after 24h.
+    #[serde(default)]
+    pub under_replicated_since: i64,
+
     /// Consecutive PoSt challenges this file has failed.
     /// Resets to 0 on a successful proof.
     #[serde(default)]

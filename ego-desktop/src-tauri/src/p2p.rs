@@ -80,16 +80,41 @@ pub const P2P_PORT: u16 = 47393;
 
 pub const RELAY_NODES: &[&str] = &[
     "/dns4/egorelay.egoblockchain.com/tcp/4001/p2p/12D3KooWFFjZdk4nhpsXKxa44eUsggQ9rAzELeVv34Eav8qA5t9y",
+    // Add production relay IPs before mainnet
+    "/dns4/egorelay2.egoblockchain.com/tcp/4001/p2p/12D3KooWBnmsQMBHFXgwAyiJiHkDGTtqepfPx1UPJqAWMWfKkDT7",
+    "/dns4/egorelay3.egoblockchain.com/tcp/4001/p2p/12D3KooWDtGNVrXcQ69DBwbq2FGpGYdoXuXRtAQdKvVJhHcmm5cS",
+    "/dns4/egorelay4.egoblockchain.com/tcp/4001/p2p/12D3KooWPgaMxRpFGRbn7JV8HpZzMWuSAo5jJPmBqPksMYPY1nKj",
+    "/dns4/egorelay5.egoblockchain.com/tcp/4001/p2p/12D3KooWQwK2VpmfKTx1GFxGkjWqk8JqJqBFUZeK4rABWHXqZhJK",
 ];
+
+fn shuffled_relay_nodes() -> Vec<&'static str> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos()
+        .hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    let seed = hasher.finish() as usize;
+    let mut nodes: Vec<&'static str> = RELAY_NODES.to_vec();
+    let n = nodes.len();
+    for i in (1..n).rev() {
+        let j = (seed.wrapping_add(i * 6364136223846793005)) % (i + 1);
+        nodes.swap(i, j);
+    }
+    nodes
+}
 
 static EGOC_PRICE_USD: std::sync::OnceLock<std::sync::Mutex<f64>> = std::sync::OnceLock::new();
 
 static PRICE_SAMPLES: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<(f64, u64)>>> =
     std::sync::OnceLock::new();
 
-const PRICE_WINDOW: usize = 21;
+const PRICE_WINDOW: usize = 20;
 const ORACLE_STAKE_WEIGHT: u64 = u64::MAX / PRICE_WINDOW as u64;
-const MAX_GOSSIP_DEVIATION: f64 = 0.30;
+const MAX_GOSSIP_DEVIATION: f64 = 0.50;
 
 fn price_samples() -> std::sync::MutexGuard<'static, std::collections::VecDeque<(f64, u64)>> {
     PRICE_SAMPLES
@@ -517,6 +542,57 @@ struct OutstandingChallenge {
     prover:        String,
     /// Unix ms timestamp when the challenge was issued (for timeout detection).
     issued_at_ms:  i64,
+    /// CID of the file this block belongs to (for eviction on failure).
+    manifest_cid:  String,
+}
+
+/// Consecutive PoRep failures per prover address. Resets on any pass.
+/// Key: prover address. Value: consecutive fail count.
+static POREP_CONSECUTIVE_FAILS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<String, u32>>
+> = std::sync::OnceLock::new();
+
+fn porep_consecutive_fails() -> std::sync::MutexGuard<'static, HashMap<String, u32>> {
+    POREP_CONSECUTIVE_FAILS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+}
+
+const POREP_MAX_CONSECUTIVE_FAILS: u32 = 3;
+
+fn porep_record_fail(prover: &str) -> u32 {
+    let mut map = porep_consecutive_fails();
+    let c = map.entry(prover.to_string()).or_insert(0);
+    *c += 1;
+    *c
+}
+
+fn porep_record_pass(prover: &str) {
+    porep_consecutive_fails().remove(prover);
+}
+
+fn porep_evict_peer(prover: &str, manifest_cid: &str) {
+    let mut ledger = crate::ledger::Ledger::load();
+    let mut changed = false;
+    for file in ledger.stored_files.iter_mut() {
+        if file.cid == manifest_cid || manifest_cid.is_empty() {
+            let before = file.replica_peers.len();
+            file.replica_peers.retain(|p| p != prover);
+            if file.replica_peers.len() < before {
+                changed = true;
+                eprintln!(
+                    "[PoRep] Evicted {} from replica_peers of {} after {} consecutive failures — triggering re-replication",
+                    &prover[..prover.len().min(20)],
+                    &file.cid[..file.cid.len().min(16)],
+                    POREP_MAX_CONSECUTIVE_FAILS
+                );
+            }
+        }
+    }
+    if changed {
+        let _ = ledger.save();
+    }
 }
 
 /// Key: `{block_cid}:{nonce_hex}`.
@@ -719,10 +795,12 @@ pub fn register_known_validator(address: &str) {
 
 fn bft_threshold() -> usize {
     let n = known_validators().len();
-    match n {
+    let effective = n.min(crate::bft_committee::MAX_COMMITTEE_SIZE);
+    eprintln!("[BFT] Committee size: {} effective / {} total validators", effective, n);
+    match effective {
         0 | 1 => 1,
         2     => 2,
-        _     => (n * 2 / 3) + 1,
+        _     => (effective * 2 / 3) + 1,
     }
 }
 
@@ -734,6 +812,10 @@ const STAKE_QUORUM_ENFORCE_HEIGHT: u64 = 1;
 
 fn stake_quorum_reached(voters: &[String]) -> bool {
     let current_height = crate::chain_db::block_count();
+
+    if current_height < STAKE_QUORUM_ENFORCE_HEIGHT {
+        return true;
+    }
 
     let validators = known_validators();
     if validators.is_empty() { return true; }
@@ -751,7 +833,12 @@ fn stake_quorum_reached(voters: &[String]) -> bool {
         .map(|addr| crate::ledger::get_validator_stake(addr))
         .sum();
 
-    voter_stake * 3 > total_stake * 2
+    let ok = voter_stake * 3 > total_stake * 2;
+    if !ok {
+        eprintln!("[BFT] Stake quorum not reached: voter_stake={} total_stake={} (need >2/3)",
+            voter_stake, total_stake);
+    }
+    ok
 }
 
 
@@ -1875,6 +1962,8 @@ pub async fn request_file_pinning(cids: Vec<String>) {
 /// How long (seconds) without a heartbeat before a slave declares the master dead.
 const MASTER_TIMEOUT_SECS: i64 = 5 * 60; // 5 minutes
 const MIN_REPLICAS: usize = 2;            // 1 master + 2 slaves
+const UNDER_REPLICATED_WARN_SECS:     i64 = 3_600;      // 1 hour  → warning + immediate retry
+const UNDER_REPLICATED_CRITICAL_SECS: i64 = 86_400;     // 24 hours → critical alert
 
 pub async fn check_file_replication() {
     let mut ledger = crate::ledger::Ledger::load();
@@ -1917,12 +2006,34 @@ pub async fn check_file_replication() {
                     }
                 }
 
-                // If under-replicated, request more slaves
                 if file.replica_peers.len() < MIN_REPLICAS {
-                    eprintln!("[Replication] Master: {} has {}/{} replicas — requesting more",
-                        &file.cid[..16.min(file.cid.len())],
-                        file.replica_peers.len(), MIN_REPLICAS);
+                    // Track how long this file has been under-replicated.
+                    if file.under_replicated_since == 0 {
+                        file.under_replicated_since = now;
+                        need_save = true;
+                    }
+                    let under_secs = now - file.under_replicated_since;
+                    if under_secs >= UNDER_REPLICATED_CRITICAL_SECS {
+                        eprintln!(
+                            "[Replication] CRITICAL: {} has been under-replicated for {}h — file may be at risk of loss",
+                            &file.cid[..16.min(file.cid.len())],
+                            under_secs / 3600
+                        );
+                    } else if under_secs >= UNDER_REPLICATED_WARN_SECS {
+                        eprintln!(
+                            "[Replication] WARNING: {} under-replicated for {}min — immediate re-replication attempt",
+                            &file.cid[..16.min(file.cid.len())],
+                            under_secs / 60
+                        );
+                    } else {
+                        eprintln!("[Replication] Master: {} has {}/{} replicas — requesting more",
+                            &file.cid[..16.min(file.cid.len())],
+                            file.replica_peers.len(), MIN_REPLICAS);
+                    }
                     pin_needed.push(file.cid.clone());
+                } else if file.under_replicated_since != 0 {
+                    file.under_replicated_since = 0;
+                    need_save = true;
                 }
             }
 
@@ -2059,13 +2170,15 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
     // relay PeerId → base transport addr (no /p2p/<id> suffix)
     // e.g.  12D3KooWPj6m... → /ip4/40.233.82.42/tcp/4001
     let mut relay_addrs: HashMap<PeerId, Multiaddr> = HashMap::new();
-    for relay_str in RELAY_NODES {
+    let mut relay_connected_count = 0usize;
+    for relay_str in shuffled_relay_nodes() {
         if let Ok(addr) = relay_str.parse::<Multiaddr>() {
             if let Some(pid) = peer_id_from_multiaddr(&addr) {
                 relay_addrs.insert(pid, strip_p2p_suffix(&addr));
             }
-            eprintln!("[P2P] Dialling relay {}", relay_str);
+            eprintln!("[P2P] Dialling relay {} (attempt {}/{})", relay_str, relay_connected_count + 1, RELAY_NODES.len());
             let _ = swarm.dial(addr);
+            relay_connected_count += 1;
         }
     }
 
@@ -2318,7 +2431,9 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                     continue;
                 }
                 if !has_circuit_addr(&external_addrs) {
-                    for relay_str in RELAY_NODES {
+                    let mut circuit_registered = false;
+                    for relay_str in shuffled_relay_nodes() {
+                        if circuit_registered { break; }
                         if let Ok(addr) = relay_str.parse::<Multiaddr>() {
                             let relay_pid = peer_id_from_multiaddr(&addr);
                             let connected = relay_pid
@@ -2330,13 +2445,14 @@ pub async fn start_p2p_server(app: tauri::AppHandle) {
                                     match swarm.listen_on(caddr) {
                                         Ok(lid) => {
                                             circuit_listener = Some(lid);
-                                            eprintln!("[P2P] Re-registering relay circuit");
+                                            circuit_registered = true;
+                                            eprintln!("[P2P] Relay circuit registered via {}", relay_str);
                                         }
-                                        Err(e) => eprintln!("[P2P] Re-register failed: {}", e),
+                                        Err(e) => eprintln!("[P2P] Re-register failed on {}: {}", relay_str, e),
                                     }
                                 }
                             } else if !connected {
-                                eprintln!("[P2P] Relay not connected — redialling {}", relay_str);
+                                eprintln!("[P2P] Relay {} not connected — redialling", relay_str);
                                 let _ = swarm.dial(addr);
                             }
                         }
@@ -4699,10 +4815,10 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
                             &block_cid[..block_cid.len().min(16)],
                             nonce
                         );
-                        // Proof valid — update coverage score positively (small reward).
                         let current = crate::poc::get_peer_score(&prover);
                         let boosted  = (current + 5).min(crate::poc::MAX_COVERAGE_SCORE);
                         crate::poc::record_peer_score(&prover, boosted);
+                        porep_record_pass(&prover);
                     } else {
                         eprintln!(
                             "[PoRep] FAIL: {} returned wrong hash for block {} (expected={:.8}… got={:.8}…) — penalising",
@@ -4710,10 +4826,14 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
                             &block_cid[..block_cid.len().min(16)],
                             expected.expected_hash, response_hash
                         );
-                        // Wrong hash = corrupted or fake replica → heavy penalty.
                         let current = crate::poc::get_peer_score(&prover);
                         let penalised = current.saturating_sub(500).max(1);
                         crate::poc::record_peer_score(&prover, penalised);
+                        let fails = porep_record_fail(&prover);
+                        if fails >= POREP_MAX_CONSECUTIVE_FAILS {
+                            porep_consecutive_fails().remove(&prover);
+                            porep_evict_peer(&prover, &expected.manifest_cid);
+                        }
                     }
                 }
             }
@@ -5331,10 +5451,15 @@ async fn handle_block_proposal(
     let my_drs    = crate::bft_committee::compute_drs_weight(&my_addr);
     let total_drs = crate::bft_committee::total_drs_weight(&all_validators);
 
-    if !crate::bft_committee::qualifies_committee(&ticket, my_drs, total_drs, all_validators.len()) {
-        eprintln!("[BFT] Proposal #{} — VRF committee disqualified (my_drs={:.4} total_drs={:.4} n={})", block.height, my_drs, total_drs, all_validators.len());
+    let n_validators = all_validators.len();
+    let effective_committee = n_validators.min(crate::bft_committee::MAX_COMMITTEE_SIZE);
+    if !crate::bft_committee::qualifies_committee(&ticket, my_drs, total_drs, n_validators) {
+        eprintln!("[BFT] Proposal #{} — VRF committee disqualified (my_drs={:.4} total_drs={:.4} effective={}/{} validators)",
+            block.height, my_drs, total_drs, effective_committee, n_validators);
         return;
     }
+    eprintln!("[BFT] Proposal #{} — committee qualified (effective={}/{} validators)",
+        block.height, effective_committee, n_validators);
 
     // ── 2. Block-level structural validation ─────────────────────────────────
     let chain = load_chain();
@@ -6688,6 +6813,7 @@ pub async fn run_porep_challenge_loop() {
                 .filter(|(_, c)| (now_ms / 1000) - (c.issued_at_ms / 1000) >= CHALLENGE_TIMEOUT_SECS)
                 .map(|(k, _)| k.clone())
                 .collect();
+            let mut evictions: Vec<(String, String)> = Vec::new();
             for key in expired {
                 if let Some(c) = challenges.remove(&key) {
                     eprintln!(
@@ -6699,7 +6825,16 @@ pub async fn run_porep_challenge_loop() {
                     let current  = crate::poc::get_peer_score(&c.prover);
                     let penalised = current.saturating_sub(MISSED_CHALLENGE_PENALTY).max(1);
                     crate::poc::record_peer_score(&c.prover, penalised);
+                    let fails = porep_record_fail(&c.prover);
+                    if fails >= POREP_MAX_CONSECUTIVE_FAILS {
+                        evictions.push((c.prover.clone(), c.manifest_cid.clone()));
+                        porep_consecutive_fails().remove(&c.prover);
+                    }
                 }
+            }
+            drop(challenges);
+            for (prover, cid) in evictions {
+                porep_evict_peer(&prover, &cid);
             }
         }
 
@@ -6750,6 +6885,7 @@ pub async fn run_porep_challenge_loop() {
                 expected_hash,
                 prover: prover.clone(),
                 issued_at_ms: now_ms,
+                manifest_cid: file.cid.clone(),
             });
 
             let challenge = P2PMessage::StorageProofChallenge {

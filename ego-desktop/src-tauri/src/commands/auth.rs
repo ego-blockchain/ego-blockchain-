@@ -746,49 +746,80 @@ fn normalize_pin(pin: &str) -> Result<String, EgoDesktopError> {
     Ok(pin)
 }
 
-static PIN_ATTEMPTS: std::sync::OnceLock<std::sync::Mutex<(u32, u64)>> = std::sync::OnceLock::new();
+static PIN_ATTEMPTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (u32, i64)>>> =
+    std::sync::OnceLock::new();
 const MAX_PIN_ATTEMPTS: u32 = 5;
-const LOCKOUT_DURATION_SECS: u64 = 300; // 5 minutes
+const LOCKOUT_DURATION_SECS: i64 = 300;
 
-fn enforce_pin_lockout() -> Result<(), EgoDesktopError> {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let attempts_mutex = PIN_ATTEMPTS.get_or_init(|| std::sync::Mutex::new((0, 0)));
-    let mut attempts = attempts_mutex.lock().unwrap();
-    
-    if attempts.0 >= MAX_PIN_ATTEMPTS {
-        if now < attempts.1 {
-            return Err(EgoDesktopError::PermissionDenied(format!(
-                "Too many failed attempts. Please try again in {} seconds.",
-                attempts.1 - now
-            )));
-        } else {
-            attempts.0 = 0;
-            attempts.1 = 0;
+fn pin_attempts_map() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, (u32, i64)>> {
+    PIN_ATTEMPTS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap()
+}
+
+fn now_ts() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn enforce_pin_lockout_for(address: &str) -> Result<(), EgoDesktopError> {
+    let now = now_ts();
+    let mut map = pin_attempts_map();
+    if let Some((attempts, lockout_until)) = map.get_mut(address) {
+        if *attempts >= MAX_PIN_ATTEMPTS {
+            if now < *lockout_until {
+                return Err(EgoDesktopError::PermissionDenied(format!(
+                    "Locked until {} (in {} seconds).",
+                    *lockout_until,
+                    *lockout_until - now
+                )));
+            } else {
+                *attempts = 0;
+                *lockout_until = 0;
+            }
         }
     }
     Ok(())
 }
 
-fn record_failed_pin() -> EgoDesktopError {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let attempts_mutex = PIN_ATTEMPTS.get_or_init(|| std::sync::Mutex::new((0, 0)));
-    let mut attempts = attempts_mutex.lock().unwrap();
-    attempts.0 += 1;
-    if attempts.0 >= MAX_PIN_ATTEMPTS {
-        attempts.1 = now + LOCKOUT_DURATION_SECS;
+fn enforce_pin_lockout() -> Result<(), EgoDesktopError> {
+    let ledger = Ledger::load();
+    enforce_pin_lockout_for(&ledger.address)
+}
+
+fn record_failed_pin_for(address: &str) -> EgoDesktopError {
+    let now = now_ts();
+    let mut map = pin_attempts_map();
+    let entry = map.entry(address.to_string()).or_insert((0, 0));
+    entry.0 += 1;
+    if entry.0 >= MAX_PIN_ATTEMPTS {
+        entry.1 = now + LOCKOUT_DURATION_SECS;
         return EgoDesktopError::PermissionDenied(format!(
-            "Too many failed attempts. Please try again in {} seconds.",
+            "Locked until {} (in {} seconds).",
+            entry.1,
             LOCKOUT_DURATION_SECS
         ));
     }
-    EgoDesktopError::InvalidInput("Incorrect PIN".into())
+    let remaining = MAX_PIN_ATTEMPTS - entry.0;
+    EgoDesktopError::InvalidInput(format!("Incorrect PIN. {} attempt{} remaining.", remaining, if remaining == 1 { "" } else { "s" }))
+}
+
+fn record_failed_pin() -> EgoDesktopError {
+    let ledger = Ledger::load();
+    record_failed_pin_for(&ledger.address)
+}
+
+fn record_successful_pin_for(address: &str) {
+    let mut map = pin_attempts_map();
+    map.remove(address);
 }
 
 fn record_successful_pin() {
-    let attempts_mutex = PIN_ATTEMPTS.get_or_init(|| std::sync::Mutex::new((0, 0)));
-    let mut attempts = attempts_mutex.lock().unwrap();
-    attempts.0 = 0;
-    attempts.1 = 0;
+    let ledger = Ledger::load();
+    record_successful_pin_for(&ledger.address);
 }
 
 fn hash_pin_argon2(pin: &str) -> Result<String, EgoDesktopError> {
@@ -848,27 +879,28 @@ pub async fn set_security_pin(pin: String) -> Result<(), EgoDesktopError> {
 
 #[tauri::command]
 pub async fn verify_pin(pin: String) -> Result<bool, EgoDesktopError> {
-    enforce_pin_lockout()?;
-
     let mut ledger = Ledger::load();
+    let address = ledger.address.clone();
+    enforce_pin_lockout_for(&address)?;
+
     if ledger.security_pin_hash.is_empty() {
         return Ok(false);
     }
     let pin_val = match normalize_pin(&pin) {
         Ok(p) => p,
         Err(_) => {
-            let err = record_failed_pin();
+            let err = record_failed_pin_for(&address);
             if let EgoDesktopError::PermissionDenied(_) = err { return Err(err); }
             return Ok(false);
         }
     };
     if !pin_matches(&ledger, &pin_val) {
-        let err = record_failed_pin();
+        let err = record_failed_pin_for(&address);
         if let EgoDesktopError::PermissionDenied(_) = err { return Err(err); }
         return Ok(false);
     }
 
-    record_successful_pin();
+    record_successful_pin_for(&address);
     upgrade_legacy_pin_hash_if_needed(&mut ledger, &pin_val)?;
     Ok(true)
 }
@@ -885,16 +917,16 @@ pub struct RecoveryInfo {
 
 #[tauri::command]
 pub async fn get_recovery_info(pin: String) -> Result<RecoveryInfo, EgoDesktopError> {
-    enforce_pin_lockout()?;
-
     let mut ledger = Ledger::load();
+    let address = ledger.address.clone();
+    enforce_pin_lockout_for(&address)?;
 
     if !ledger.security_pin_hash.is_empty() {
-        let pin_val = normalize_pin(&pin).map_err(|_| record_failed_pin())?;
+        let pin_val = normalize_pin(&pin).map_err(|_| record_failed_pin_for(&address))?;
         if !pin_matches(&ledger, &pin_val) {
-            return Err(record_failed_pin());
+            return Err(record_failed_pin_for(&address));
         }
-        record_successful_pin();
+        record_successful_pin_for(&address);
         upgrade_legacy_pin_hash_if_needed(&mut ledger, &pin_val)?;
     }
 

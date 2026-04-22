@@ -685,6 +685,8 @@ pub fn tx_count() -> u64 {
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
 }
 
+const MIN_POOL_RESERVE: u64 = 1_000_000_000_000;
+
 /// Burn tokens from the staking pool (slash penalty — tokens are permanently destroyed).
 pub fn burn_from_staking_pool(amount_uegoc: u64) {
     const STAKING_ADDR_STR: &str = "egot1staking000000000000000000000000000000000";
@@ -694,6 +696,17 @@ pub fn burn_from_staking_pool(amount_uegoc: u64) {
         .ok().flatten()
         .map(|v| read_u64_le(&v))
         .unwrap_or(0);
+    let node_pool_bal = db.get_cf(cf, NODE_POOL_ADDR.as_bytes())
+        .ok().flatten()
+        .map(|v| read_u64_le(&v))
+        .unwrap_or(0);
+    if node_pool_bal <= MIN_POOL_RESERVE {
+        eprintln!(
+            "[ChainDB] burn_from_staking_pool refused: node pool at {} uEGOC is at or below MIN_POOL_RESERVE ({} uEGOC)",
+            node_pool_bal, MIN_POOL_RESERVE
+        );
+        return;
+    }
     let new_bal = cur.saturating_sub(amount_uegoc);
     if let Err(e) = db.put_cf(cf, STAKING_ADDR_STR.as_bytes(), u64_le(new_bal)) {
         eprintln!("[ChainDB] burn_from_staking_pool write failed: {e}");
