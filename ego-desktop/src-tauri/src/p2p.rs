@@ -528,6 +528,9 @@ static STUCK_AT_NEXT_VIEW: std::sync::atomic::AtomicU64 =
 static STUCK_VIEWCHANGE_CYCLES: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
+static SOLO_AFTER_EVICTION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 static LAST_BLOCK_FINALIZED_TS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 
@@ -2278,8 +2281,18 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
         if cached.len() >= MIN_CACHED_PEERS_FOR_DIRECT_BOOT {
             tracing::info!("{} cached peers — attempting relay-free bootstrap", cached.len());
         }
+        let active_relay_ids: std::collections::HashSet<String> = RELAY_NODES.iter()
+            .filter_map(|r| r.parse::<Multiaddr>().ok())
+            .filter_map(|m| peer_id_from_multiaddr(&m))
+            .map(|pid| pid.to_string())
+            .collect();
         for peer in cached.iter().filter(|p| !p.endpoint.is_empty()).take(30) {
-            if let Ok(addr) = peer.endpoint.parse::<Multiaddr>() {
+            let ep = &peer.endpoint;
+            let is_old_relay = ep.contains("egorelay2.") || ep.contains("egorelay3.")
+                || ep.contains("egorelay4.") || ep.contains("egorelay5.");
+            let is_active_relay = active_relay_ids.iter().any(|id| ep.contains(id.as_str()));
+            if is_old_relay || is_active_relay { continue; }
+            if let Ok(addr) = ep.parse::<Multiaddr>() {
                 let _ = swarm.dial(addr);
             }
         }
@@ -6504,7 +6517,8 @@ pub async fn propose_block_as_leader_forced() {
     let mut seed_32 = [0u8; 32];
     seed_32.copy_from_slice(&seed_bytes);
 
-    let is_solo = known_validators().len() <= 1;
+    let is_solo = known_validators().len() <= 1
+        || SOLO_AFTER_EVICTION.swap(false, Ordering::Relaxed);
     let pool = crate::mempool::get_mempool();
     let txs  = pool.drain_all();
 
@@ -6616,10 +6630,14 @@ pub async fn run_view_change_monitor() {
                     let my_addr_local = my_addr.clone();
                     let mut validators = known_validators();
                     validators.retain(|v| v == &my_addr_local || participants.contains(v));
+                    let remaining = validators.len();
                     eprintln!(
                         "[HotStuff] ViewChange deadlock at view {} — evicted offline validators, {} active remain",
-                        next_view, validators.len()
+                        next_view, remaining
                     );
+                    if remaining <= 1 {
+                        SOLO_AFTER_EVICTION.store(true, Ordering::Relaxed);
+                    }
                 }
             }
         } else {

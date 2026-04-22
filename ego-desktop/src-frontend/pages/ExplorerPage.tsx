@@ -125,20 +125,16 @@ const ExplorerPage: React.FC = () => {
 
   useEffect(() => { setBlockPage(1); setTxPage(1); setFilePage(1); }, [tab]);
 
-  // Reload blocks when block page changes
   useEffect(() => {
     if (!netStats) return;
     const offset = (blockPage - 1) * pageSize;
-    invoke<LedgerBlock[]>('get_blocks', { offset, limit: pageSize })
-      .then(setBlocks).catch(() => {});
+    invoke<LedgerBlock[]>('get_blocks', { offset, limit: pageSize }).then(setBlocks).catch(() => {});
   }, [blockPage, pageSize, netStats]);
 
-  // Reload txs when tx page changes
   useEffect(() => {
     if (!netStats) return;
     const offset = (txPage - 1) * pageSize;
-    invoke<LedgerTx[]>('get_all_transactions', { offset, limit: pageSize })
-      .then(setTxs).catch(() => {});
+    invoke<LedgerTx[]>('get_all_transactions', { offset, limit: pageSize }).then(setTxs).catch(() => {});
   }, [txPage, pageSize, netStats]);
 
   useEffect(() => {
@@ -149,22 +145,22 @@ const ExplorerPage: React.FC = () => {
 
   async function loadData() {
     setLoading(true);
-    try {
-      const [b, t, n, fe] = await Promise.all([
-        invoke<LedgerBlock[]>('get_blocks', { offset: 0, limit: pageSize }),
-        invoke<LedgerTx[]>('get_all_transactions', { offset: 0, limit: pageSize }),
-        invoke<NetworkStats>('get_network_stats'),
-        invoke<FileEvent[]>('get_file_events'),
-      ]);
-      setBlocks(b);
-      setTxs(t);
-      setNetStats(n);
-      setFileEvents(fe);
-    } catch (e) {
-      console.error('Explorer load failed:', e);
-    } finally {
-      setLoading(false);
-    }
+
+    const withTimeout = <T,>(p: Promise<T>, fallback: T, ms = 12_000): Promise<T> =>
+      Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
+
+    const [b, t, n, fe] = await Promise.all([
+      withTimeout(invoke<LedgerBlock[]>('get_blocks', { offset: 0, limit: pageSize }).catch(() => []), []),
+      withTimeout(invoke<LedgerTx[]>('get_all_transactions', { offset: 0, limit: pageSize }).catch(() => []), []),
+      withTimeout(invoke<NetworkStats>('get_network_stats').catch(() => null), null),
+      withTimeout(invoke<FileEvent[]>('get_file_events').catch(() => []), []),
+    ]);
+
+    setBlocks(b);
+    setTxs(t);
+    if (n) setNetStats(n);
+    setFileEvents(fe);
+    setLoading(false);
     invoke<Tokenomics>('get_tokenomics').then(setTokenomics).catch(() => {});
   }
 

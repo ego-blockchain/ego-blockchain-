@@ -491,12 +491,17 @@ const WalletPage: React.FC = () => {
     setCodeLoading(true);
     setCodeError('');
     try {
-      const res = await invoke<TxResult>('confirm_tx_code', {
-        txId: txId, code: codeInput.trim(),
-      });
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject('Verification timed out. Please check your transaction history to see if it was sent.'), 30_000)
+      );
+      const res = await Promise.race([
+        invoke<TxResult>('confirm_tx_code', { txId: txId, code: codeInput.trim() }),
+        timeout,
+      ]);
       setEmailStep('confirmed');
       setTxResult(res);
-      await load(); reloadWallet();
+      load().catch(() => {});
+      reloadWallet();
     } catch (e: any) {
       const msg = String(e).replace(/^.*Error:/, '').trim();
       if (msg.includes('cancelled')) {
@@ -884,10 +889,13 @@ const WalletPage: React.FC = () => {
     if (extCodeInput.length !== 6) return;
     setExtCodeLoading(true); setExtCodeError('');
     try {
-      const txid = await invoke<string>('confirm_ext_tx', {
-        txId: extTxId,
-        code: extCodeInput,
-      });
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject('Verification timed out. Please check your transaction history.'), 30_000)
+      );
+      const txid = await Promise.race([
+        invoke<string>('confirm_ext_tx', { txId: extTxId, code: extCodeInput }),
+        timeout,
+      ]);
       setExtSendTxid(txid);
       setExtEmailStep('form');
     } catch (e: any) {
@@ -896,8 +904,9 @@ const WalletPage: React.FC = () => {
       if (msg.includes('cancelled') || msg.includes('expired')) {
         setExtEmailStep('form');
       }
+    } finally {
+      setExtCodeLoading(false);
     }
-    setExtCodeLoading(false);
   }
 
   function hideChain(chain: string) {
