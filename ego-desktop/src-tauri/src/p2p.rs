@@ -463,6 +463,12 @@ static LAST_PROPOSAL_TS: std::sync::atomic::AtomicI64 =
 static CONSECUTIVE_EMPTY_VIEWS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
+static STUCK_AT_NEXT_VIEW: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+static STUCK_VIEWCHANGE_CYCLES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
 static LAST_BLOCK_FINALIZED_TS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 
@@ -6115,6 +6121,29 @@ pub async fn run_view_change_monitor() {
         };
         let my_addr   = crate::ledger::Ledger::load().address;
         if my_addr.is_empty() { continue; }
+
+        let prev_stuck = STUCK_AT_NEXT_VIEW.swap(next_view, Ordering::Relaxed);
+        if prev_stuck == next_view {
+            let cycles = STUCK_VIEWCHANGE_CYCLES.fetch_add(1, Ordering::Relaxed) + 1;
+            if cycles >= crate::bft_committee::FALLBACK_AFTER_EMPTY_VIEWS {
+                STUCK_VIEWCHANGE_CYCLES.store(0, Ordering::Relaxed);
+                let participants: std::collections::HashSet<String> = {
+                    let votes = view_change_votes();
+                    votes.get(&next_view).cloned().unwrap_or_default().into_iter().collect()
+                };
+                {
+                    let my_addr_local = my_addr.clone();
+                    let mut validators = known_validators();
+                    validators.retain(|v| v == &my_addr_local || participants.contains(v));
+                    eprintln!(
+                        "[HotStuff] ViewChange deadlock at view {} — evicted offline validators, {} active remain",
+                        next_view, validators.len()
+                    );
+                }
+            }
+        } else {
+            STUCK_VIEWCHANGE_CYCLES.store(1, Ordering::Relaxed);
+        }
 
         eprintln!("[HotStuff] Proposal timeout — broadcasting ViewChange for view {}", next_view);
 
