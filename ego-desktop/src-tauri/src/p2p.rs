@@ -245,7 +245,7 @@ pub async fn push_block_to_oracle(block: &crate::ledger::LedgerBlock, txs: &[cra
     oracle_post(&client, "/chain/submit", &body).await;
 }
 
-static RELAY_CIRCUIT_READY: AtomicBool = AtomicBool::new(false);
+pub static RELAY_CIRCUIT_READY: AtomicBool = AtomicBool::new(false);
 
 
 static IS_RELAY_SERVER: AtomicBool = AtomicBool::new(false);
