@@ -41,6 +41,8 @@ urego-compiler  = { path = "../../crates/urego-compiler" }
 
 # Mempool / rollup
 once_cell = "1.19"
+blst = "0.3"
+rayon = "1.10"
 
 # Multi-chain address derivation
 k256          = { version = "0.13", features = ["ecdsa"] }

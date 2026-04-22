@@ -11,8 +11,9 @@ use hyper::body::to_bytes as body_to_bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 #[derive(Debug, Deserialize)]
@@ -484,8 +485,138 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
         }
 
         "eth_getLogs" => {
-            // Return an empty log set; full log indexing is on the roadmap.
             RpcResponse::ok(req.id, json!([]))
+        }
+
+        "eth_getTransactionByHash" => {
+            let hash = p[0].as_str().unwrap_or_default();
+            let clean = hash.strip_prefix("0x").unwrap_or(hash);
+            match crate::chain_db::get_tx_by_hash(clean)
+                .or_else(|| crate::chain_db::get_tx_by_hash(hash))
+            {
+                Some(tx) => {
+                    let block_hash = tx.block_height.and_then(|h| {
+                        crate::chain_db::get_block_by_height(h).map(|b| format!("0x{}", b.hash))
+                    });
+                    let tx_index = tx.block_height.map(|h| {
+                        let txs = crate::chain_db::get_txs_for_block(h);
+                        txs.iter().position(|t| t.hash == tx.hash).unwrap_or(0)
+                    });
+                    RpcResponse::ok(req.id, json!({
+                        "hash":             format!("0x{}", tx.hash),
+                        "nonce":            format!("0x{:x}", tx.nonce),
+                        "blockHash":        block_hash,
+                        "blockNumber":      tx.block_height.map(|h| format!("0x{:x}", h)),
+                        "transactionIndex": tx_index.map(|i| format!("0x{:x}", i)),
+                        "from":             tx.from,
+                        "to":               tx.to,
+                        "value":            format!("0x{:x}", tx.amount as u128 * 1_000_000_000_000u128),
+                        "gas":              "0x5208",
+                        "gasPrice":         "0x3b9aca00",
+                        "input":            "0x",
+                        "v":                "0x0",
+                        "r":                "0x0",
+                        "s":                "0x0",
+                    }))
+                }
+                None => RpcResponse::ok(req.id, Value::Null),
+            }
+        }
+
+        "eth_getTransactionReceipt" => {
+            let hash = p[0].as_str().unwrap_or_default();
+            let clean = hash.strip_prefix("0x").unwrap_or(hash);
+            match crate::chain_db::get_tx_by_hash(clean)
+                .or_else(|| crate::chain_db::get_tx_by_hash(hash))
+            {
+                Some(tx) => {
+                    let block_hash = tx.block_height.and_then(|h| {
+                        crate::chain_db::get_block_by_height(h).map(|b| format!("0x{}", b.hash))
+                    });
+                    let tx_index = tx.block_height.map(|h| {
+                        let txs = crate::chain_db::get_txs_for_block(h);
+                        txs.iter().position(|t| t.hash == tx.hash).unwrap_or(0)
+                    });
+                    let status = if tx.status == "Failed" { "0x0" } else { "0x1" };
+                    RpcResponse::ok(req.id, json!({
+                        "transactionHash":   format!("0x{}", tx.hash),
+                        "transactionIndex":  tx_index.map(|i| format!("0x{:x}", i)),
+                        "blockHash":         block_hash,
+                        "blockNumber":       tx.block_height.map(|h| format!("0x{:x}", h)),
+                        "from":              tx.from,
+                        "to":                tx.to,
+                        "cumulativeGasUsed": "0x5208",
+                        "gasUsed":           "0x5208",
+                        "logs":              [],
+                        "logsBloom":         "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                        "status":            status,
+                    }))
+                }
+                None => RpcResponse::ok(req.id, Value::Null),
+            }
+        }
+
+        "eth_getBlockTransactionCountByNumber" => {
+            let tag = p[0].as_str().unwrap_or("latest");
+            let height = if tag == "latest" {
+                crate::chain_db::get_network_stats_db().block_count
+            } else {
+                u64::from_str_radix(tag.strip_prefix("0x").unwrap_or(tag), 16).unwrap_or(0)
+            };
+            let count = crate::chain_db::get_txs_for_block(height).len();
+            RpcResponse::ok(req.id, json!(format!("0x{:x}", count)))
+        }
+
+        "eth_getBlockTransactionCountByHash" => {
+            RpcResponse::ok(req.id, json!("0x0"))
+        }
+
+        "eth_getCode" => {
+            let addr = p[0].as_str().unwrap_or_default();
+            if addr.starts_with("egot1") || addr.is_empty() {
+                return RpcResponse::ok(req.id, json!("0x"));
+            }
+            let exec = ego_vm::Executor::new(crate::ledger::contracts_dir());
+            let has_code = exec.ok()
+                .and_then(|e| e.store.load_manifest(addr))
+                .is_some();
+            RpcResponse::ok(req.id, json!(if has_code { "0x01" } else { "0x" }))
+        }
+
+        "ego_getValidators" => {
+            let validators = crate::p2p::get_known_validators_snapshot();
+            RpcResponse::ok(req.id, json!({ "validators": validators, "count": validators.len() }))
+        }
+
+        "ego_getMempoolStats" => {
+            let pool = crate::mempool::get_mempool();
+            RpcResponse::ok(req.id, json!({
+                "pending":   pool.pending_count(),
+                "submitted": pool.submitted_count(),
+                "confirmed": pool.confirmed_count(),
+            }))
+        }
+
+        "eth_subscribe" => {
+            let sub_type = p[0].as_str().unwrap_or("newHeads");
+            let valid = matches!(sub_type, "newHeads" | "newPendingTransactions" | "logs");
+            if !valid {
+                return RpcResponse::err(req.id, -32602, &format!("Unknown subscription type: {}", sub_type));
+            }
+            let sub_id = gen_sub_id();
+            sub_channels().subscriptions.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(sub_id.clone(), sub_type.to_string());
+            RpcResponse::ok(req.id, json!(sub_id))
+        }
+
+        "eth_unsubscribe" => {
+            let sub_id = p[0].as_str().unwrap_or_default();
+            let removed = sub_channels().subscriptions.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(sub_id)
+                .is_some();
+            RpcResponse::ok(req.id, json!(removed))
         }
 
         _ => RpcResponse::err(req.id, -32601, &format!("Method not found: {}", req.method)),
@@ -500,30 +631,76 @@ async fn ws_handler(
 }
 
 async fn handle_ws(mut socket: WebSocket, subs: Subscribers) {
-    let mut rx = subs.subscribe();
+    let mut rx_broadcast    = subs.subscribe();
+    let mut rx_new_heads    = sub_channels().new_heads.subscribe();
+    let mut rx_pending_txs  = sub_channels().new_pending_txs.subscribe();
+
+    let mut ws_sub_type: Option<String> = None;
+
     loop {
         tokio::select! {
 
-            Ok(event) = rx.recv() => {
+            Ok(event) = rx_broadcast.recv() => {
                 let msg = Message::Text(event.to_string());
                 if socket.send(msg).await.is_err() { break; }
             }
 
-            Some(Ok(msg)) = socket.recv() => {
-                if let Message::Text(text) = msg {
-                    if let Ok(req) = serde_json::from_str::<Value>(&text) {
-                        let method = req["method"].as_str().unwrap_or("");
-                        match method {
-                            "subscribe" | "unsubscribe" => {
+            Ok(event) = rx_new_heads.recv() => {
+                if ws_sub_type.as_deref() == Some("newHeads") {
+                    if socket.send(Message::Text(event.to_string())).await.is_err() { break; }
+                }
+            }
 
-                                let ack = json!({ "type": "subscribed", "topic": req["topic"] });
+            Ok(event) = rx_pending_txs.recv() => {
+                if ws_sub_type.as_deref() == Some("newPendingTransactions") {
+                    if socket.send(Message::Text(event.to_string())).await.is_err() { break; }
+                }
+            }
+
+            Some(Ok(msg)) = socket.recv() => {
+                match msg {
+                    Message::Text(text) => {
+                        if let Ok(req) = serde_json::from_str::<RpcRequest>(&text) {
+                            let id = req.id.clone();
+                            let method = req.method.as_str();
+                            match method {
+                                "eth_subscribe" => {
+                                    let sub_type = req.params[0].as_str().unwrap_or("newHeads");
+                                    let valid = matches!(sub_type, "newHeads" | "newPendingTransactions" | "logs");
+                                    if valid {
+                                        let sub_id = gen_sub_id();
+                                        ws_sub_type = Some(sub_type.to_string());
+                                        let resp = RpcResponse::ok(id, json!(sub_id));
+                                        let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap_or_default())).await;
+                                    } else {
+                                        let resp = RpcResponse::err(id, -32602, &format!("Unknown subscription type: {}", sub_type));
+                                        let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap_or_default())).await;
+                                    }
+                                }
+                                "eth_unsubscribe" => {
+                                    ws_sub_type = None;
+                                    let resp = RpcResponse::ok(id, json!(true));
+                                    let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap_or_default())).await;
+                                }
+                                "subscribe" | "unsubscribe" => {
+                                    let ack = json!({ "type": "subscribed", "topic": req.params["topic"] });
+                                    let _ = socket.send(Message::Text(ack.to_string())).await;
+                                }
+                                _ => {
+                                    let resp = handle_method(req);
+                                    let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap_or_default())).await;
+                                }
+                            }
+                        } else if let Ok(val) = serde_json::from_str::<Value>(&text) {
+                            let method = val["method"].as_str().unwrap_or("");
+                            if matches!(method, "subscribe" | "unsubscribe") {
+                                let ack = json!({ "type": "subscribed", "topic": val["topic"] });
                                 let _ = socket.send(Message::Text(ack.to_string())).await;
                             }
-                            _ => {}
                         }
                     }
-                } else if let Message::Close(_) = msg {
-                    break;
+                    Message::Close(_) => break,
+                    _ => {}
                 }
             }
             else => break,
@@ -1297,4 +1474,71 @@ static BROADCAST_TX: std::sync::OnceLock<tokio::sync::broadcast::Sender<Value>> 
 
 pub fn init_broadcast(tx: tokio::sync::broadcast::Sender<Value>) {
     let _ = BROADCAST_TX.set(tx);
+}
+
+struct SubChannels {
+    new_heads:              tokio::sync::broadcast::Sender<Value>,
+    new_pending_txs:        tokio::sync::broadcast::Sender<Value>,
+    subscriptions:          Mutex<HashMap<String, String>>,
+}
+
+static SUB_CHANNELS: std::sync::OnceLock<SubChannels> = std::sync::OnceLock::new();
+
+fn sub_channels() -> &'static SubChannels {
+    SUB_CHANNELS.get_or_init(|| {
+        let (new_heads, _)       = tokio::sync::broadcast::channel(1024);
+        let (new_pending_txs, _) = tokio::sync::broadcast::channel(1024);
+        SubChannels {
+            new_heads,
+            new_pending_txs,
+            subscriptions: Mutex::new(HashMap::new()),
+        }
+    })
+}
+
+pub fn notify_new_block(block: &crate::ledger::LedgerBlock) {
+    let ch = sub_channels();
+    let header = crate::chain_db::LightBlockHeader::from(block);
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "method": "eth_subscription",
+        "params": {
+            "subscription": "newHeads",
+            "result": {
+                "number":           format!("0x{:x}", header.height),
+                "hash":             format!("0x{}", header.hash),
+                "parentHash":       format!("0x{}", header.prev_hash),
+                "miner":            header.miner,
+                "timestamp":        format!("0x{:x}", header.timestamp),
+                "transactionsRoot": format!("0x{}", header.tx_merkle_root),
+                "gasLimit":         "0x1c9c380",
+                "gasUsed":          "0x0",
+            }
+        }
+    });
+    let _ = ch.new_heads.send(payload.clone());
+    broadcast_block_header(block);
+}
+
+pub fn notify_pending_tx(tx_hash: &str) {
+    let ch = sub_channels();
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "method": "eth_subscription",
+        "params": {
+            "subscription": "newPendingTransactions",
+            "result": format!("0x{}", tx_hash)
+        }
+    });
+    let _ = ch.new_pending_txs.send(payload);
+}
+
+fn gen_sub_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let seq = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let raw = format!("{}:{}", t.as_nanos(), seq);
+    let hash = blake3::hash(raw.as_bytes());
+    format!("0x{}", &hash.to_hex()[..16])
 }

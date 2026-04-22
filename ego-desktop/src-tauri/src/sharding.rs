@@ -351,6 +351,39 @@ pub fn prune_observer_shards(my_address: &str) {
     }
 }
 
+pub fn get_shard_master(shard_id: u32) -> Option<String> {
+    let map = load_shard_map();
+    if map.shard_count <= 1 {
+        return None;
+    }
+    let now = chrono::Utc::now().timestamp();
+    if let Some(a) = map.assignments.iter().find(|a| {
+        a.shard_id == shard_id
+            && a.role == ShardRole::Master
+            && now - a.last_seen < 300
+    }) {
+        if !a.node_endpoint.is_empty() {
+            return Some(a.node_endpoint.clone());
+        }
+    }
+    let all_nodes: Vec<String> = map
+        .assignments
+        .iter()
+        .map(|a| a.node_address.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let responsible = consistent_hash_assign(shard_id, &all_nodes);
+    if let Some(master_addr) = responsible.first() {
+        if let Some(a) = map.assignments.iter().find(|a| &a.node_address == master_addr) {
+            if !a.node_endpoint.is_empty() {
+                return Some(a.node_endpoint.clone());
+            }
+        }
+    }
+    None
+}
+
 pub fn get_shard_status() -> serde_json::Value {
     let map = load_shard_map();
     let phase = if map.shard_count == 1 { 1u32 }

@@ -855,6 +855,55 @@ pub fn get_tx_history_for_addr(address: &str) -> Vec<LedgerTx> {
         .collect()
 }
 
+pub fn parallel_apply_txs(txs: &[LedgerTx], db: &DB) -> Vec<(String, u64)> {
+    use rayon::prelude::*;
+    use std::collections::HashMap;
+
+    let mut by_sender: HashMap<&str, Vec<&LedgerTx>> = HashMap::new();
+    for tx in txs {
+        by_sender.entry(tx.from.as_str()).or_default().push(tx);
+    }
+
+    let delta_pairs: Vec<(String, i128)> = by_sender
+        .par_iter()
+        .flat_map(|(_, sender_txs)| {
+            let mut pairs: Vec<(String, i128)> = Vec::new();
+            for tx in sender_txs.iter() {
+                let is_system = tx.from.is_empty()
+                    || tx.from == NODE_POOL_ADDR
+                    || tx.from.starts_with("egot1faucet")
+                    || tx.from.starts_with("egot1genesis");
+                if !tx.to.is_empty() {
+                    pairs.push((tx.to.clone(), tx.amount as i128));
+                }
+                if !is_system {
+                    let out = tx.amount as i128 + tx.fee_uegoc as i128;
+                    pairs.push((tx.from.clone(), -out));
+                }
+            }
+            pairs
+        })
+        .collect();
+
+    let mut deltas: HashMap<String, i128> = HashMap::new();
+    for (addr, delta) in delta_pairs {
+        *deltas.entry(addr).or_insert(0) += delta;
+    }
+
+    let cf = db.cf_handle(CF_BALANCES).unwrap();
+    deltas
+        .into_iter()
+        .map(|(addr, delta)| {
+            let cur = db.get_cf(cf, addr.as_bytes())
+                .ok().flatten()
+                .map(|v| read_u64_le(&v))
+                .unwrap_or(0);
+            let new_bal = (cur as i128 + delta).max(0) as u64;
+            (addr, new_bal)
+        })
+        .collect()
+}
+
 // ── Public write API ──────────────────────────────────────────────────────────
 
 /// Mine a new block directly into RocksDB. O(1) per block, no chain.json.
@@ -904,27 +953,72 @@ pub fn block_hash_v3(
     blake3::hash(input.as_bytes()).to_hex().to_string()
 }
 
-/// Compute the state delta root from a balance-change map.
-/// Sorts entries by address (lexicographic) then hashes each as `"addr:balance_u64_le"`.
-/// Returns a 64-char hex string.  Empty map → 64 zeros (empty-state sentinel).
-pub fn compute_state_delta_root(balance_delta: &std::collections::HashMap<String, u64>) -> String {
-    if balance_delta.is_empty() {
+fn balance_leaf(key_bytes: &[u8], bal: u64) -> String {
+    let mut leaf = Vec::with_capacity(key_bytes.len() + 8);
+    leaf.extend_from_slice(key_bytes);
+    leaf.extend_from_slice(&bal.to_le_bytes());
+    blake3::hash(&leaf).to_hex().to_string()
+}
+
+fn collect_sorted_balances(db: &DB) -> Vec<(Vec<u8>, u64)> {
+    let cf = match db.cf_handle(CF_BALANCES) {
+        Some(c) => c,
+        None => return vec![],
+    };
+    let mut entries: Vec<(Vec<u8>, u64)> = db
+        .iterator_cf(cf, rocksdb::IteratorMode::Start)
+        .filter_map(|r| r.ok())
+        .map(|(k, v)| (k.to_vec(), read_u64_le(&v)))
+        .collect();
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
+pub fn compute_full_state_root() -> String {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let entries = collect_sorted_balances(&db);
+    if entries.is_empty() {
         return "0".repeat(64);
     }
-    let mut entries: Vec<(&String, &u64)> = balance_delta.iter().collect();
-    entries.sort_by_key(|(addr, _)| addr.as_str());
-    let leaf_hashes: Vec<&str>;
     let leaf_strings: Vec<String> = entries.iter()
-        .map(|(addr, bal)| {
-            let mut leaf = Vec::with_capacity(addr.len() + 9);
-            leaf.extend_from_slice(addr.as_bytes());
-            leaf.push(b':');
-            leaf.extend_from_slice(&bal.to_le_bytes());
-            blake3::hash(&leaf).to_hex().to_string()
-        })
+        .map(|(k, bal)| balance_leaf(k, *bal))
         .collect();
     let refs: Vec<&str> = leaf_strings.iter().map(|s| s.as_str()).collect();
     compute_merkle_root(&refs)
+}
+
+pub fn get_state_merkle_proof(address: &str) -> Vec<String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let entries = collect_sorted_balances(&db);
+    if entries.is_empty() {
+        return vec![];
+    }
+    let addr_bytes = address.as_bytes();
+    let idx = match entries.iter().position(|(k, _)| k.as_slice() == addr_bytes) {
+        Some(i) => i,
+        None => return vec![],
+    };
+    let leaf_strings: Vec<String> = entries.iter()
+        .map(|(k, bal)| balance_leaf(k, *bal))
+        .collect();
+    let mut layer: Vec<String> = leaf_strings.iter()
+        .map(|h| blake3_hex(h.as_bytes()))
+        .collect();
+    let mut proof: Vec<String> = Vec::new();
+    let mut pos = idx;
+    while layer.len() > 1 {
+        if layer.len() % 2 == 1 {
+            let last = layer.last().unwrap().clone();
+            layer.push(last);
+        }
+        let sibling = if pos % 2 == 0 { pos + 1 } else { pos - 1 };
+        proof.push(layer[sibling].clone());
+        pos /= 2;
+        layer = layer.chunks(2)
+            .map(|pair| blake3_hex(format!("{}{}", pair[0], pair[1]).as_bytes()))
+            .collect();
+    }
+    proof
 }
 
 pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc_slot: u64) -> LedgerBlock {
@@ -999,45 +1093,65 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
     let tx_hashes: Vec<&str> = stamped.iter().map(|t| t.hash.as_str()).collect();
     let tx_merkle_root = compute_merkle_root(&tx_hashes);
 
-    // ── 3. Compute balance-delta state root BEFORE hashing the block.
-    //       This commits the account-state changes so any DB tampering is
-    //       detectable: changing a balance changes state_root → changes block hash.
-    //
-    //       IMPORTANT: accumulate signed i128 deltas first, then apply once per
-    //       address.  The naive insert() approach overwrites earlier entries for
-    //       the same address when multiple TXs touch it in one block, producing a
-    //       state_root that disagrees with what write_block_batch actually commits.
-    let balance_delta_for_root = {
-        let cf_bal = db.cf_handle(CF_BALANCES).unwrap();
-        // Phase 1: accumulate signed deltas — same logic as write_block_batch.
-        let mut deltas: std::collections::HashMap<String, i128> = Default::default();
-        for tx in &stamped {
-            if !tx.to.is_empty() {
-                *deltas.entry(tx.to.clone()).or_insert(0) += tx.amount as i128;
-            }
-            let is_system = tx.from.is_empty()
-                || tx.from == NODE_POOL_ADDR
-                || tx.from.starts_with("egot1faucet")
-                || tx.from.starts_with("egot1genesis");
-            if !is_system {
-                let out = tx.amount as i128 + tx.fee_uegoc as i128;
-                *deltas.entry(tx.from.clone()).or_insert(0) -= out;
-            }
-        }
-        // Phase 2: apply each delta to the current DB balance, clamp to 0.
-        let mut result: std::collections::HashMap<String, u64> = Default::default();
-        for (addr, delta) in &deltas {
-            let old: u64 = db.get_cf(cf_bal, addr.as_bytes())
-                .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-            result.insert(addr.clone(), (old as i128 + delta).max(0) as u64);
-        }
-        result
-    };
-    let state_root = compute_state_delta_root(&balance_delta_for_root);
+    let state_root = {
+        use rayon::prelude::*;
 
-    // ── 4. Block hash (v3) commits to prev_hash + tx_merkle_root + poc_ticket + state_root.
-    //       Any tampering with transactions OR balances breaks this hash, which
-    //       breaks every subsequent block's prev_hash (Bitcoin domino effect).
+        let raw_pairs: Vec<(Vec<u8>, i128)> = stamped
+            .par_iter()
+            .flat_map(|tx| {
+                let mut pairs: Vec<(Vec<u8>, i128)> = Vec::with_capacity(2);
+                if !tx.to.is_empty() {
+                    pairs.push((tx.to.as_bytes().to_vec(), tx.amount as i128));
+                }
+                let is_system = tx.from.is_empty()
+                    || tx.from == NODE_POOL_ADDR
+                    || tx.from.starts_with("egot1faucet")
+                    || tx.from.starts_with("egot1genesis");
+                if !is_system {
+                    let out = tx.amount as i128 + tx.fee_uegoc as i128;
+                    pairs.push((tx.from.as_bytes().to_vec(), -out));
+                }
+                pairs
+            })
+            .collect();
+
+        let mut deltas: std::collections::HashMap<Vec<u8>, i128> = Default::default();
+        for (k, v) in raw_pairs {
+            *deltas.entry(k).or_insert(0) += v;
+        }
+
+        let cf_bal = db.cf_handle(CF_BALANCES).unwrap();
+        let mut all_entries: Vec<(Vec<u8>, u64)> = db
+            .iterator_cf(cf_bal, rocksdb::IteratorMode::Start)
+            .filter_map(|r| r.ok())
+            .map(|(k, v)| (k.to_vec(), read_u64_le(&v)))
+            .collect();
+        for (addr_bytes, delta) in &deltas {
+            if let Some(entry) = all_entries.iter_mut().find(|(k, _)| k == addr_bytes) {
+                entry.1 = (entry.1 as i128 + delta).max(0) as u64;
+            } else {
+                let new_bal = (*delta).max(0) as u64;
+                all_entries.push((addr_bytes.clone(), new_bal));
+            }
+        }
+        all_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        if all_entries.is_empty() {
+            "0".repeat(64)
+        } else {
+            let leaf_strings: Vec<String> = all_entries
+                .par_iter()
+                .map(|(k, bal)| {
+                    let mut leaf = Vec::with_capacity(k.len() + 8);
+                    leaf.extend_from_slice(k);
+                    leaf.extend_from_slice(&bal.to_le_bytes());
+                    blake3::hash(&leaf).to_hex().to_string()
+                })
+                .collect();
+            let refs: Vec<&str> = leaf_strings.iter().map(|s| s.as_str()).collect();
+            compute_merkle_root(&refs)
+        }
+    };
+
     let hash = block_hash_v3(&prev_hash, height, miner, timestamp, &tx_merkle_root, poc_ticket, &state_root);
 
     let block = LedgerBlock {
@@ -1161,12 +1275,12 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
     let tx_hashes: Vec<&str> = stamped.iter().map(|t| t.hash.as_str()).collect();
     let tx_merkle_root = compute_merkle_root(&tx_hashes);
 
-    let balance_delta_for_root = {
+    let state_root = {
         let cf_bal = db.cf_handle(CF_BALANCES).expect("CF_BALANCES missing");
-        let mut deltas: std::collections::HashMap<String, i128> = Default::default();
+        let mut deltas: std::collections::HashMap<Vec<u8>, i128> = Default::default();
         for tx in &stamped {
             if !tx.to.is_empty() {
-                *deltas.entry(tx.to.clone()).or_insert(0) += tx.amount as i128;
+                *deltas.entry(tx.to.as_bytes().to_vec()).or_insert(0) += tx.amount as i128;
             }
             let is_system = tx.from.is_empty()
                 || tx.from == NODE_POOL_ADDR
@@ -1174,18 +1288,38 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
                 || tx.from.starts_with("egot1genesis");
             if !is_system {
                 let out = tx.amount as i128 + tx.fee_uegoc as i128;
-                *deltas.entry(tx.from.clone()).or_insert(0) -= out;
+                *deltas.entry(tx.from.as_bytes().to_vec()).or_insert(0) -= out;
             }
         }
-        let mut result: std::collections::HashMap<String, u64> = Default::default();
-        for (addr, delta) in &deltas {
-            let old: u64 = db.get_cf(cf_bal, addr.as_bytes())
-                .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-            result.insert(addr.clone(), (old as i128 + delta).max(0) as u64);
+        let mut all_entries: Vec<(Vec<u8>, u64)> = db
+            .iterator_cf(cf_bal, rocksdb::IteratorMode::Start)
+            .filter_map(|r| r.ok())
+            .map(|(k, v)| (k.to_vec(), read_u64_le(&v)))
+            .collect();
+        for (addr_bytes, delta) in &deltas {
+            if let Some(entry) = all_entries.iter_mut().find(|(k, _)| k == addr_bytes) {
+                entry.1 = (entry.1 as i128 + delta).max(0) as u64;
+            } else {
+                let new_bal = (*delta).max(0) as u64;
+                all_entries.push((addr_bytes.clone(), new_bal));
+            }
         }
-        result
+        all_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        if all_entries.is_empty() {
+            "0".repeat(64)
+        } else {
+            let leaf_strings: Vec<String> = all_entries.iter()
+                .map(|(k, bal)| {
+                    let mut leaf = Vec::with_capacity(k.len() + 8);
+                    leaf.extend_from_slice(k);
+                    leaf.extend_from_slice(&bal.to_le_bytes());
+                    blake3::hash(&leaf).to_hex().to_string()
+                })
+                .collect();
+            let refs: Vec<&str> = leaf_strings.iter().map(|s| s.as_str()).collect();
+            compute_merkle_root(&refs)
+        }
     };
-    let state_root = compute_state_delta_root(&balance_delta_for_root);
 
     let hash = block_hash_v3(&prev_hash, height, miner, timestamp, &tx_merkle_root, poc_ticket, &state_root);
 
