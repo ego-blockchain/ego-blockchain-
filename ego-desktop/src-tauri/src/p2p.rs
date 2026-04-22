@@ -1683,13 +1683,20 @@ pub fn get_known_node_urls() -> Vec<String> {
 pub async fn register_with_relay_as_ego_node() {
     let port = std::env::var("EGO_RPC_PORT").ok()
         .and_then(|v| v.parse::<u16>().ok()).unwrap_or(47395);
-    let public_ip = get_public_endpoint().await;
-    let endpoint = if public_ip.contains('/') || public_ip.is_empty() {
-        format!("http://localhost:{}", port)
+    let public_addr = get_public_endpoint().await;
+    // public_addr is a libp2p multiaddr like /ip4/1.2.3.4/tcp/4001/p2p/...
+    // For relay circuits the first IP is the relay's, so fall back to local.
+    let ip = if public_addr.contains("/p2p-circuit") || public_addr.is_empty() {
+        get_local_ip()
     } else {
-        let ip = public_ip.split(':').next().unwrap_or("localhost");
-        format!("http://{}:{}", ip, port)
+        let parts: Vec<&str> = public_addr.split('/').collect();
+        parts.iter()
+            .position(|&s| s == "ip4" || s == "ip6")
+            .and_then(|i| parts.get(i + 1).copied())
+            .unwrap_or("127.0.0.1")
+            .to_string()
     };
+    let endpoint = format!("http://{}:{}", ip, port);
 
     let oracles = crate::p2p::ORACLE_RPCS;
     let client = reqwest::Client::builder()
