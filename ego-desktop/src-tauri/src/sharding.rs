@@ -1,6 +1,46 @@
 use crate::ledger::{base_data_dir, load_chain, SharedChain, LedgerBlock, LedgerTx};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+static AGREED_SHARD_COUNT: AtomicU32 = AtomicU32::new(1);
+static REBALANCE_EFFECTIVE_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+pub const REBALANCE_GRACE_BLOCKS: u64 = 500;
+
+pub fn get_agreed_shard_count() -> u32 {
+    AGREED_SHARD_COUNT.load(Ordering::Relaxed)
+}
+
+pub fn set_agreed_shard_count(count: u32, effective_at: u64) {
+    AGREED_SHARD_COUNT.store(count, Ordering::Relaxed);
+    REBALANCE_EFFECTIVE_HEIGHT.store(effective_at, Ordering::Relaxed);
+    crate::chain_db::set_meta_u64(b"agreed_shard_count", count as u64);
+    crate::chain_db::set_meta_u64(b"shard_effective_height", effective_at);
+}
+
+pub fn load_agreed_shard_count_from_db() {
+    let count = crate::chain_db::get_meta_u64(b"agreed_shard_count").unwrap_or(1) as u32;
+    let height = crate::chain_db::get_meta_u64(b"shard_effective_height").unwrap_or(0);
+    AGREED_SHARD_COUNT.store(count.max(1), Ordering::Relaxed);
+    REBALANCE_EFFECTIVE_HEIGHT.store(height, Ordering::Relaxed);
+}
+
+pub fn is_in_grace_period(current_height: u64) -> bool {
+    let eff = REBALANCE_EFFECTIVE_HEIGHT.load(Ordering::Relaxed);
+    eff > 0 && current_height < eff + REBALANCE_GRACE_BLOCKS
+}
+
+pub fn shard_for_address_agreed(addr: &str) -> u32 {
+    let count = get_agreed_shard_count();
+    if count <= 1 { return 0; }
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in addr.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    (h % count as u64) as u32
+}
 
 pub const REPLICATION_FACTOR: u32 = 3;
 pub const PHASE2_NODE_THRESHOLD: u32 = 10;

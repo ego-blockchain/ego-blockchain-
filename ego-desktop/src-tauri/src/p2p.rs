@@ -1276,6 +1276,11 @@ pub enum P2PMessage {
         shard_id: u32,
         tx:       LedgerTx,
     },
+    ShardRebalance {
+        proposed_shard_count: u32,
+        effective_at_height:  u64,
+        proposer:             String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1920,6 +1925,34 @@ pub async fn route_tx_to_shard_master(shard_id: u32, tx: crate::ledger::LedgerTx
     }
 }
 
+pub async fn propose_shard_rebalance(new_count: u32) {
+    let current_height = crate::chain_db::latest_block_info().0;
+    let effective_at_height = current_height + 100;
+    let own_address = crate::ledger::Ledger::load().address;
+    crate::sharding::set_agreed_shard_count(new_count, effective_at_height);
+    let msg = P2PMessage::ShardRebalance {
+        proposed_shard_count: new_count,
+        effective_at_height,
+        proposer: own_address,
+    };
+    if let Ok(data) = serde_json::to_vec(&msg) {
+        publish_gossip("ego-shard-rebalance-v1", data).await;
+    }
+}
+
+pub async fn run_shard_rebalance_monitor() {
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        let known_count = get_known_validators_snapshot().len() as u32 + 1;
+        let computed = crate::sharding::compute_shard_count(known_count);
+        let agreed = crate::sharding::get_agreed_shard_count();
+        if computed != agreed {
+            eprintln!("[Shard] Computed shard count {} differs from agreed {}, proposing rebalance", computed, agreed);
+            propose_shard_rebalance(computed).await;
+        }
+    }
+}
+
 pub async fn push_shard_data_to_slaves() {
     let map = crate::sharding::load_shard_map();
     if map.shard_count <= 1 { return; }
@@ -2286,6 +2319,9 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
 
     let shard_tx_topic = gossipsub::IdentTopic::new("ego-shard-txs-v1");
     swarm.behaviour_mut().gossipsub.subscribe(&shard_tx_topic).ok();
+
+    let shard_rebalance_topic = gossipsub::IdentTopic::new("ego-shard-rebalance-v1");
+    swarm.behaviour_mut().gossipsub.subscribe(&shard_rebalance_topic).ok();
 
     let _ = swarm.behaviour_mut().kad.bootstrap();
 
@@ -3519,6 +3555,17 @@ async fn handle_event(
                         tokio::spawn(async move {
                             route_tx_to_shard_master(shard_id, tx).await;
                         });
+                    }
+                }
+            } else if topic == "ego-shard-rebalance-v1" {
+                if let Ok(P2PMessage::ShardRebalance { proposed_shard_count, effective_at_height, proposer }) =
+                    serde_json::from_slice::<P2PMessage>(&message.data)
+                {
+                    let current = crate::sharding::get_agreed_shard_count();
+                    if proposed_shard_count != current && proposed_shard_count >= 1 {
+                        eprintln!("[Shard] Rebalance proposal: {} shards (from {}), effective at block {}",
+                            proposed_shard_count, &proposer[..16.min(proposer.len())], effective_at_height);
+                        crate::sharding::set_agreed_shard_count(proposed_shard_count, effective_at_height);
                     }
                 }
             }
@@ -4890,6 +4937,8 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
         P2PMessage::StorageDealProof { .. } => {}
         P2PMessage::StorageDealTerminated { .. } => {}
         P2PMessage::EquivocationProof { .. } => {}
+
+        P2PMessage::ShardRebalance { .. } => {}
 
         P2PMessage::ShardTxRoute { shard_id, tx } => {
             let my_addr = crate::ledger::Ledger::load().address;
@@ -6623,19 +6672,53 @@ pub async fn register_porep_commitment(
     }
 }
 
+pub fn generate_local_challenges(
+    prover_addr: &str,
+    stored_files: &[crate::ledger::StoredFile],
+) -> Vec<serde_json::Value> {
+    if stored_files.is_empty() { return vec![]; }
+
+    let (tip_height, _) = crate::chain_db::latest_block_info();
+    let epoch = tip_height / 100;
+    let block_hash = crate::chain_db::get_block_hash_at((epoch * 100).max(1))
+        .unwrap_or_else(|| crate::chain_db::get_tip_hash());
+
+    stored_files.iter().enumerate().map(|(i, file)| {
+        let seed_input = format!("{}:{}:{}:{}", block_hash, prover_addr, file.cid, epoch);
+        let seed_bytes = blake3::hash(seed_input.as_bytes());
+        let seed_hex = seed_bytes.to_hex().to_string();
+
+        let challenge_id = format!("local-{}-{}-{}", epoch, i, &file.cid[..8.min(file.cid.len())]);
+        let n_real = ((file.original_size / 4096) + 1).min(1024) as u64;
+        let n_padded = n_real.next_power_of_two();
+
+        serde_json::json!({
+            "challenge_id": challenge_id,
+            "cid": file.cid,
+            "challenge_seed": seed_hex,
+            "n_real_leaves": n_real,
+            "n_padded_leaves": n_padded,
+            "comm_d": file.cid,
+            "challenge_block_hash": block_hash,
+            "source": "local",
+        })
+    }).collect()
+}
+
 pub async fn fetch_post_challenges(prover_addr: &str) -> Vec<serde_json::Value> {
-    if prover_addr.trim().is_empty() {
-        return vec![];
+    if prover_addr.trim().is_empty() { return vec![]; }
+
+    let ledger = crate::ledger::Ledger::load();
+    if !ledger.stored_files.is_empty() {
+        let local = generate_local_challenges(prover_addr, &ledger.stored_files);
+        if !local.is_empty() {
+            return local;
+        }
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return vec![],
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(8)).build() {
+        Ok(c) => c, Err(_) => return vec![],
     };
-
     let path = format!("/post/challenges/{}", prover_addr.trim());
     match oracle_get(&client, &path).await {
         Some(resp) => match resp.json::<serde_json::Value>().await {

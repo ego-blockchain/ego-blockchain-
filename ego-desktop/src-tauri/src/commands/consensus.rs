@@ -132,6 +132,10 @@ pub async fn respond_to_challenges() -> Result<PostChallengeResult, EgoDesktopEr
             })
         }).collect();
 
+        if let Ok(proofs_serialized) = serde_json::to_string(&proofs_json) {
+            crate::chain_db::record_local_proof(&prover_addr, &cid, &seed_hex, &proofs_serialized);
+        }
+
         let timestamp = chrono::Utc::now().timestamp();
 
         let sign_bytes = format!("{}:{}:{}", challenge_id, cid, timestamp).into_bytes();
