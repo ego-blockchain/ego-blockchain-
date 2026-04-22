@@ -22,6 +22,9 @@ mod tokenomics;
 mod tls;
 mod utils;
 
+#[cfg(test)]
+mod tests;
+
 use tauri::{Manager, SystemTray, SystemTrayEvent, SystemTrayMenu, SystemTrayMenuItem};
 use tauri::{CustomMenuItem, Menu, MenuItem, Submenu};
 
@@ -105,8 +108,11 @@ fn acquire_single_instance_lock() -> bool {
 }
 
 fn headless_main() {
+    eprintln!("[Headless] Ego full node — P2P + BFT + RPC + Mempool");
     eprintln!("[Node] Starting in headless full-node mode (EGO_HEADLESS=1)");
     eprintln!("[Node] All GUI components disabled — blockchain services only");
+
+    crate::app::init_global_app_state(std::sync::Arc::new(crate::app::AppState::new()));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -117,9 +123,8 @@ fn headless_main() {
         crate::ledger::reconcile_stake_state();
         crate::chain_db::restore_in_memory_state_from_db();
 
-        let p2p_handle = tokio::spawn(async {
-            struct NoopApp;
-            eprintln!("[Headless] P2P: creating stub handle — headless p2p not yet routed through Tauri");
+        tokio::spawn(async {
+            crate::p2p::start_p2p_server(None).await;
         });
 
         tokio::spawn(async {
@@ -144,10 +149,8 @@ fn headless_main() {
         eprintln!("[Headless] Chain data: {:?}", crate::ledger::base_data_dir());
         eprintln!("[Headless] Press Ctrl+C to stop.");
 
-        tokio::signal::ctrl_c().await
-            .expect("failed to install Ctrl+C handler");
-        eprintln!("[Headless] Shutting down.");
-        drop(p2p_handle);
+        tokio::signal::ctrl_c().await.ok();
+        eprintln!("[Headless] Shutting down");
     });
 }
 
@@ -283,8 +286,11 @@ fn main() {
                 .add_native_item(MenuItem::Minimize)
                 .add_native_item(MenuItem::Zoom)));
 
+    let shared_app_state = std::sync::Arc::new(app::AppState::new());
+    crate::app::init_global_app_state(shared_app_state.clone());
+
     tauri::Builder::default()
-        .manage(app::AppState::new())
+        .manage((*shared_app_state).clone())
         .system_tray(tray)
         .menu(menu)
 
@@ -400,6 +406,7 @@ fn main() {
             commands::explorer::get_transaction_info,
             commands::explorer::get_file_events,
             commands::explorer::get_base_fee,
+            commands::explorer::get_supply_info,
             commands::notifications::import_shared_file,
             commands::messenger::get_my_contact_bundle,
             commands::messenger::revoke_contact_bundle,
@@ -594,7 +601,7 @@ fn main() {
 
             let handle_p2p = app.handle();
             tauri::async_runtime::spawn(async move {
-                crate::p2p::start_p2p_server(handle_p2p).await;
+                crate::p2p::start_p2p_server(Some(handle_p2p)).await;
             });
 
             let handle_startup = app.handle();
@@ -638,7 +645,7 @@ fn main() {
                 // Bootstrap from oracle only while the P2P network is small
                 let startup_peers = crate::p2p::get_known_peers().len();
                 if !no_oracle && startup_peers < 50 {
-                    crate::p2p::fetch_chain_from_oracle(&handle_startup).await;
+                    crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)).await;
                     eprintln!("[Startup] Oracle chain sync complete ({} peers, oracle active)", startup_peers);
                 } else if no_oracle {
                     eprintln!("[Startup] Oracle disabled via EGO_NO_ORACLE — using pure P2P");
@@ -646,7 +653,7 @@ fn main() {
                     eprintln!("[Startup] {} peers — skipping oracle, using P2P only", startup_peers);
                 }
 
-                crate::p2p::broadcast_peer_announce(&handle_startup).await;
+                crate::p2p::broadcast_peer_announce(Some(&handle_startup)).await;
                 eprintln!("[Startup] Peer announce sent (endpoint: {})", my_endpoint);
 
                 crate::p2p::restore_dht_cache().await;
@@ -700,15 +707,15 @@ fn main() {
                     let use_oracle = !no_oracle && peer_count < P2P_SELF_SUFFICIENT_PEERS;
 
                     if use_oracle {
-                        crate::p2p::fetch_chain_from_oracle(&handle_startup).await;
+                        crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)).await;
                     }
-                    crate::p2p::broadcast_peer_announce(&handle_startup).await;
+                    crate::p2p::broadcast_peer_announce(Some(&handle_startup)).await;
                     crate::p2p::sync_chain_from_peers().await;
                     crate::p2p::dht_discover_relays().await;
 
                     let my_addr = crate::ledger::Ledger::load().address;
                     if !my_addr.is_empty() {
-                        crate::commands::messenger::poll_relay_inbox(&my_addr, &handle_startup).await;
+                        crate::commands::messenger::poll_relay_inbox(&my_addr, Some(&handle_startup)).await;
                     }
 
                     crate::p2p::fetch_and_cache_egoc_price().await;
@@ -717,9 +724,8 @@ fn main() {
 
                     crate::p2p::check_file_replication().await;
 
-                    // PoSt: challenge stored files every 6 h; slash rewards on failure.
                     if loop_tick % POST_EVERY_N_TICKS == 1 {
-                        crate::proof::run_post_checks(&handle_startup).await;
+                        crate::proof::run_post_checks(Some(&handle_startup)).await;
                     }
 
                     let shard_peers = crate::p2p::get_known_peers();

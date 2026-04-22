@@ -1091,24 +1091,15 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
     let new_base_fee = compute_next_base_fee(prev_base_fee, user_tx_count);
 
     let tx_fees_sum: u64 = txs.iter().map(|t| t.fee_uegoc).sum();
-    let reward    = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash);
+    let remaining = remaining_mintable();
+    let reward = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash).min(remaining);
+    if reward == 0 {
+        eprintln!("[ChainDB] Supply cap reached at block {} — no coinbase reward", height);
+    }
 
     let coinbase_hash = format!("0x{}", blake3::hash(
         format!("coinbase:{height}:{miner}:{reward}:{timestamp}").as_bytes()
     ).to_hex());
-    let coinbase = LedgerTx {
-        hash:         coinbase_hash.clone(),
-        from:         NODE_POOL_ADDR.to_string(),
-        to:           miner.to_string(),
-        amount:       reward,
-        memo:         Some(format!("Block #{height} reward")),
-        timestamp,
-        status:       "Confirmed".to_string(),
-        block_height: Some(height),
-        tx_type:      "reward".to_string(),
-        signature:    "coinbase".to_string(),
-        ..LedgerTx::default()
-    };
 
     let mut stamped: Vec<LedgerTx> = txs.iter().map(|tx| {
         let mut t = tx.clone();
@@ -1116,7 +1107,23 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
         t.status = "Confirmed".to_string();
         t
     }).collect();
-    stamped.push(coinbase);
+
+    if reward > 0 {
+        let coinbase = LedgerTx {
+            hash:         coinbase_hash.clone(),
+            from:         NODE_POOL_ADDR.to_string(),
+            to:           miner.to_string(),
+            amount:       reward,
+            memo:         Some(format!("Block #{height} reward")),
+            timestamp,
+            status:       "Confirmed".to_string(),
+            block_height: Some(height),
+            tx_type:      "reward".to_string(),
+            signature:    "coinbase".to_string(),
+            ..LedgerTx::default()
+        };
+        stamped.push(coinbase);
+    }
 
     let staking_fee = crate::tokenomics::staking_fee_share(tx_fees_sum);
     if staking_fee > 0 {
@@ -1212,7 +1219,7 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
         tx_count:   stamped.len() as u32,
         size_bytes: stamped.len() as u64 * 256,
         reward,
-        coinbase_tx: Some(coinbase_hash),
+        coinbase_tx: if reward > 0 { Some(coinbase_hash) } else { None },
         vote_count: 0,
         tx_merkle_root,
         poc_ticket: poc_ticket.to_string(),
@@ -1283,24 +1290,15 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
     let new_base_fee = compute_next_base_fee(prev_base_fee, user_tx_count);
 
     let tx_fees_sum: u64 = txs.iter().map(|t| t.fee_uegoc).sum();
-    let reward    = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash);
+    let remaining = remaining_mintable();
+    let reward = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash).min(remaining);
+    if reward == 0 {
+        eprintln!("[ChainDB] Supply cap reached at block {} — no coinbase reward", height);
+    }
 
     let coinbase_hash = format!("0x{}", blake3::hash(
         format!("coinbase:{height}:{miner}:{reward}:{timestamp}").as_bytes()
     ).to_hex());
-    let coinbase = LedgerTx {
-        hash:         coinbase_hash.clone(),
-        from:         NODE_POOL_ADDR.to_string(),
-        to:           miner.to_string(),
-        amount:       reward,
-        memo:         Some(format!("Block #{height} reward")),
-        timestamp,
-        status:       "Confirmed".to_string(),
-        block_height: Some(height),
-        tx_type:      "reward".to_string(),
-        signature:    "coinbase".to_string(),
-        ..LedgerTx::default()
-    };
 
     let cf_bal = db.cf_handle(CF_BALANCES).expect("CF_BALANCES missing");
     let mut sim_balances: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
@@ -1315,8 +1313,7 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
             );
             return false;
         }
-        
-        // Simulate running balance to prevent double-spends across multiple txs in the same batch
+
         let is_system = tx.from.is_empty() || tx.from == NODE_POOL_ADDR || tx.from.starts_with("egot1faucet") || tx.from.starts_with("egot1genesis");
         if !is_system {
             let from_bal = sim_balances.get(&tx.from).copied().unwrap_or_else(|| {
@@ -1339,7 +1336,23 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         t.status = "Confirmed".to_string();
         t
     }).collect();
-    stamped.push(coinbase);
+
+    if reward > 0 {
+        let coinbase = LedgerTx {
+            hash:         coinbase_hash.clone(),
+            from:         NODE_POOL_ADDR.to_string(),
+            to:           miner.to_string(),
+            amount:       reward,
+            memo:         Some(format!("Block #{height} reward")),
+            timestamp,
+            status:       "Confirmed".to_string(),
+            block_height: Some(height),
+            tx_type:      "reward".to_string(),
+            signature:    "coinbase".to_string(),
+            ..LedgerTx::default()
+        };
+        stamped.push(coinbase);
+    }
 
     let staking_fee = crate::tokenomics::staking_fee_share(tx_fees_sum);
     if staking_fee > 0 {
@@ -1421,7 +1434,7 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         tx_count:   stamped.len() as u32,
         size_bytes: stamped.len() as u64 * 256,
         reward,
-        coinbase_tx: Some(coinbase_hash),
+        coinbase_tx: if reward > 0 { Some(coinbase_hash) } else { None },
         vote_count: 0,
         tx_merkle_root,
         poc_ticket: poc_ticket.to_string(),
@@ -1947,6 +1960,32 @@ pub fn get_state_stats() -> StateStats {
         .ok().flatten().unwrap_or(0);
     let db_size_mb = db_size_bytes as f64 / (1024.0 * 1024.0);
     StateStats { total_accounts, total_supply_uegoc: total_supply, db_size_estimate_mb: db_size_mb }
+}
+
+pub fn get_total_circulating_supply() -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_BALANCES) {
+        Some(c) => c,
+        None => return 0,
+    };
+    let mut total: u64 = 0;
+    let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+    for item in iter {
+        if let Ok((_, v)) = item {
+            total = total.saturating_add(read_u64_le(&v));
+        }
+    }
+    total
+}
+
+pub fn remaining_mintable() -> u64 {
+    crate::tokenomics::TOTAL_SUPPLY_UEGOC.saturating_sub(get_total_circulating_supply())
+}
+
+pub fn block_reward_at_height(height: u64) -> u64 {
+    let halvings = height / crate::tokenomics::HALVING_INTERVAL;
+    if halvings >= 64 { return 0; }
+    crate::tokenomics::INITIAL_BLOCK_REWARD_UEGOC >> halvings
 }
 
 #[derive(Debug, serde::Serialize)]

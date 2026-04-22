@@ -291,7 +291,7 @@ async fn tick_coverage(
     }
 
     if is_online {
-        crate::p2p::broadcast_peer_announce(app).await;
+        crate::p2p::broadcast_peer_announce(Some(app)).await;
     }
 
     let active_peers = state.get_active_peers(600);

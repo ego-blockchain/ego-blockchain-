@@ -103,4 +103,7 @@ custom-protocol = ["tauri/custom-protocol"]
 debug = false
 
 # Prevent src-tauri from joining the parent ego-blockchain workspace.
+[dev-dependencies]
+tempfile = "3"
+
 [workspace]

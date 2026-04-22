@@ -42,3 +42,38 @@ pub fn verify_aggregate(agg_sig_bytes: &[u8], pubkey_bytes_list: &[Vec<u8>], msg
     let result = agg_sig.fast_aggregate_verify(true, msg, DST, &pk_refs);
     result == BLST_ERROR::BLST_SUCCESS
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seed(n: u8) -> Vec<u8> { vec![n; 32] }
+
+    #[test]
+    fn single_sign_verify() {
+        let sk = derive_bls_key(&seed(1));
+        let msg = b"test-block-hash-00000000000000";
+        let sig = bls_sign(&sk, msg);
+        let pk  = bls_pubkey(&sk);
+        assert!(verify_aggregate(&sig, &[pk], msg));
+    }
+
+    #[test]
+    fn wrong_key_fails() {
+        let sk1 = derive_bls_key(&seed(1));
+        let sk2 = derive_bls_key(&seed(2));
+        let msg = b"block";
+        let sig = bls_sign(&sk1, msg);
+        assert!(!verify_aggregate(&sig, &[bls_pubkey(&sk2)], msg));
+    }
+
+    #[test]
+    fn aggregate_three_validators() {
+        let msg = b"quorum-block-hash-0000000000000";
+        let sks: Vec<_> = (1u8..=3).map(|n| derive_bls_key(&seed(n))).collect();
+        let sigs: Vec<_> = sks.iter().map(|sk| bls_sign(sk, msg)).collect();
+        let pks:  Vec<_> = sks.iter().map(|sk| bls_pubkey(sk)).collect();
+        let agg = aggregate_signatures(&sigs).unwrap();
+        assert!(verify_aggregate(&agg, &pks, msg));
+    }
+}

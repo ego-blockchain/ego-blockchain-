@@ -98,3 +98,53 @@ pub fn finalize_close(channel: &mut StateChannel) -> (u64, u64) {
     channel.status = ChannelStatus::Closed;
     (channel.balance_a, channel.balance_b)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_gives_correct_balances() {
+        let ch = open_channel("egot1a", "egot1b", 1_000_000, 500_000, 10);
+        assert_eq!(ch.balance_a, 1_000_000);
+        assert_eq!(ch.balance_b, 500_000);
+        assert_eq!(ch.status, ChannelStatus::Open);
+    }
+
+    #[test]
+    fn valid_update_accepted() {
+        let mut ch = open_channel("egot1a", "egot1b", 1_000_000, 1_000_000, 10);
+        let upd = ChannelUpdate { channel_id: ch.channel_id.clone(),
+            balance_a: 400_000, balance_b: 1_600_000, nonce: 1,
+            sig_from: "s".into(), signed_by: "egot1a".into() };
+        assert!(apply_update(&mut ch, &upd).is_ok());
+        assert_eq!(ch.balance_a, 400_000);
+    }
+
+    #[test]
+    fn stale_nonce_rejected() {
+        let mut ch = open_channel("egot1a", "egot1b", 1_000_000, 1_000_000, 10);
+        let upd = ChannelUpdate { channel_id: ch.channel_id.clone(),
+            balance_a: 500_000, balance_b: 1_500_000, nonce: 1,
+            sig_from: "s".into(), signed_by: "egot1a".into() };
+        apply_update(&mut ch, &upd.clone()).unwrap();
+        assert!(apply_update(&mut ch, &upd).is_err());
+    }
+
+    #[test]
+    fn broken_sum_rejected() {
+        let mut ch = open_channel("egot1a", "egot1b", 1_000_000, 1_000_000, 10);
+        let upd = ChannelUpdate { channel_id: ch.channel_id.clone(),
+            balance_a: 999_000, balance_b: 999_000, nonce: 1,
+            sig_from: "s".into(), signed_by: "egot1a".into() };
+        assert!(apply_update(&mut ch, &upd).is_err());
+    }
+
+    #[test]
+    fn close_sets_deadline() {
+        let mut ch = open_channel("egot1a", "egot1b", 500_000, 500_000, 50);
+        initiate_close(&mut ch, 200);
+        assert_eq!(ch.status, ChannelStatus::Closing);
+        assert_eq!(ch.dispute_deadline, Some(200 + DISPUTE_WINDOW_BLOCKS));
+    }
+}
