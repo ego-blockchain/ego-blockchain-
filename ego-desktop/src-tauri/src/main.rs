@@ -170,6 +170,11 @@ fn main() {
     }
     tracing::info!("Ego Desktop starting");
 
+    // Pre-generate and cache PQ keys before the window opens so init_wallet
+    // never has to wait for slow unoptimised key generation.  On subsequent
+    // starts the cache file exists and this returns in microseconds.
+    crate::commands::auth::ensure_pq_cache();
+
     if std::env::var("EGO_HEADLESS").as_deref() == Ok("1") {
         headless_main();
         return;
