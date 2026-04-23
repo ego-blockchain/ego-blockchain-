@@ -38,3 +38,15 @@ serde_json = "1.0.143"
 bytes = "1.10.1"
 yamux = "0.13"
 blake2 = "0.10"
+
+[profile.dev.package.pqcrypto-dilithium]
+opt-level = 3
+
+[profile.dev.package.pqcrypto-kyber]
+opt-level = 3
+
+[profile.dev.package.pqcrypto-sphincsplus]
+opt-level = 3
+
+[profile.dev.package.pqcrypto-internals]
+opt-level = 3

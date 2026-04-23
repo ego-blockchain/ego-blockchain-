@@ -166,6 +166,27 @@ struct WalletKeys {
     balance_formatted: String,
 }
 
+fn pq_cache_path() -> std::path::PathBuf {
+    crate::ledger::data_dir().join("pq_keys.bin")
+}
+
+fn load_or_generate_pq_keys(seed: &[u8; 32]) -> Result<KeyPair, EgoDesktopError> {
+    let cache = pq_cache_path();
+    if cache.exists() {
+        if let Ok(bytes) = fs::read(&cache) {
+            if let Ok(kp) = KeyPair::from_pq_cache(&bytes, seed) {
+                return Ok(kp);
+            }
+        }
+    }
+    let kp = KeyPair::from_bytes(seed)
+        .map_err(|e| EgoDesktopError::CryptoError(format!("Keypair: {e}")))?;
+    if let Ok(encoded) = kp.to_pq_cache() {
+        let _ = crate::utils::atomic_write(&cache, &encoded);
+    }
+    Ok(kp)
+}
+
 fn derive_wallet_keys() -> Result<WalletKeys, EgoDesktopError> {
     let seed_bytes = crate::ledger::load_seed()
         .map_err(|e| EgoDesktopError::CryptoError(format!("Failed to load seed: {}", e)))?
@@ -173,8 +194,7 @@ fn derive_wallet_keys() -> Result<WalletKeys, EgoDesktopError> {
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&seed_bytes);
 
-    let keypair = KeyPair::from_bytes(&seed)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("Keypair: {e}")))?;
+    let keypair = load_or_generate_pq_keys(&seed)?;
 
     let mut ledger  = Ledger::load();
     let address = if !ledger.address.is_empty() {
