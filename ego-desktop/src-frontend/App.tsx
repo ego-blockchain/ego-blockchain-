@@ -229,10 +229,10 @@ function App() {
     try {
       const timeout = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error(
-          'Wallet initialisation timed out after 60 s.\n' +
+          'Wallet initialisation timed out after 120 s.\n' +
           'This usually means the post-quantum key generation failed on this device.\n' +
           'Please try again or reinstall the app.'
-        )), 60_000)
+        )), 120_000)
       );
       const info = await Promise.race([invoke<WalletInfo>('init_wallet'), timeout]);
       setWallet(info);
@@ -289,7 +289,7 @@ function App() {
           <div className="text-center space-y-4">
             <div className="text-5xl animate-pulse">🔑</div>
             <div className="text-white font-semibold">Initialising wallet…</div>
-            <div className="text-gray-400 text-sm">Generating quantum-safe keys</div>
+            <div className="text-gray-400 text-sm">Generating quantum-safe keys — this can take up to 60 s on first run</div>
           </div>
         </div>
       </div>
