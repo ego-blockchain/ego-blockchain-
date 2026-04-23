@@ -276,6 +276,53 @@ impl KeyPair {
         Ok(Self::from_seed(*bytes, false))
     }
 
+    pub fn to_pq_cache(&self) -> EgoResult<Vec<u8>> {
+        let dil_pk = &self.dilithium_pk;
+        let dil_sk = &self.dilithium_sk;
+        let kyb_pk = &self.kyber_pk;
+        let kyb_sk = &self.kyber_sk;
+        let mut out = Vec::with_capacity(4 * 4 + dil_pk.len() + dil_sk.len() + kyb_pk.len() + kyb_sk.len());
+        for chunk in &[dil_pk, dil_sk, kyb_pk, kyb_sk] {
+            let len = chunk.len() as u32;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(chunk);
+        }
+        Ok(out)
+    }
+
+    pub fn from_pq_cache(bytes: &[u8], seed: &[u8; 32]) -> EgoResult<Self> {
+        let mut pos = 0usize;
+        let mut read_chunk = |data: &[u8], p: &mut usize| -> Option<Vec<u8>> {
+            if *p + 4 > data.len() { return None; }
+            let len = u32::from_le_bytes(data[*p..*p+4].try_into().ok()?) as usize;
+            *p += 4;
+            if *p + len > data.len() { return None; }
+            let chunk = data[*p..*p+len].to_vec();
+            *p += len;
+            Some(chunk)
+        };
+        let dil_pk = read_chunk(bytes, &mut pos).ok_or_else(|| EgoError::CryptoError("bad pq cache".into()))?;
+        let dil_sk = read_chunk(bytes, &mut pos).ok_or_else(|| EgoError::CryptoError("bad pq cache".into()))?;
+        let kyb_pk = read_chunk(bytes, &mut pos).ok_or_else(|| EgoError::CryptoError("bad pq cache".into()))?;
+        let kyb_sk = read_chunk(bytes, &mut pos).ok_or_else(|| EgoError::CryptoError("bad pq cache".into()))?;
+        let ed25519_signing_key = SigningKey::from_bytes(seed);
+        let ed25519_verifying_key = ed25519_signing_key.verifying_key();
+        Ok(Self {
+            ed25519_signing_key,
+            ed25519_verifying_key,
+            dilithium_pk: dil_pk,
+            dilithium_sk: dil_sk,
+            kyber_pk: kyb_pk,
+            kyber_sk: kyb_sk,
+            x25519_secret: *seed,
+            x25519_public: X25519PublicKey::from(*seed),
+            slh_dsa_pk: None,
+            slh_dsa_sk: None,
+            seed: *seed,
+            transition_mode: false,
+        })
+    }
+
     fn from_seed(seed: [u8; 32], transition_mode: bool) -> Self {
         let ed25519_signing_key = SigningKey::from_bytes(&seed);
         let ed25519_verifying_key = ed25519_signing_key.verifying_key();
