@@ -170,6 +170,27 @@ fn pq_cache_path() -> std::path::PathBuf {
     crate::ledger::data_dir().join("pq_keys.bin")
 }
 
+/// Called from main() before Tauri starts — blocks until PQ keys are cached.
+/// On first run this takes ~30-120s at opt-level=0; every subsequent call
+/// finds the file and returns in microseconds.
+pub fn ensure_pq_cache() {
+    let cache = pq_cache_path();
+    if cache.exists() { return; }
+    let seed_bytes = match crate::ledger::load_seed() {
+        Ok(Some(b)) => b,
+        _ => return, // no seed yet (brand-new wallet) — create_wallet_files handles it
+    };
+    let mut seed = [0u8; 32];
+    if seed_bytes.len() >= 32 { seed.copy_from_slice(&seed_bytes[..32]); }
+    eprintln!("[KeyGen] Generating quantum-safe keys for the first time — please wait…");
+    if let Ok(kp) = KeyPair::from_bytes(&seed) {
+        if let Ok(encoded) = kp.to_pq_cache() {
+            let _ = crate::utils::atomic_write(&cache, &encoded);
+            eprintln!("[KeyGen] Quantum-safe keys cached.");
+        }
+    }
+}
+
 fn load_or_generate_pq_keys(seed: &[u8; 32]) -> Result<KeyPair, EgoDesktopError> {
     let cache = pq_cache_path();
     if cache.exists() {
@@ -279,6 +300,9 @@ fn create_wallet_files(address_override: Option<&str>) -> Result<String, EgoDesk
 
     let keypair = KeyPair::from_bytes(&seed)
         .map_err(|e| EgoDesktopError::CryptoError(format!("Keypair: {e}")))?;
+    if let Ok(encoded) = keypair.to_pq_cache() {
+        let _ = crate::utils::atomic_write(&pq_cache_path(), &encoded);
+    }
     let address = keypair
         .derive_bech32_address(1, AddressType::EOA, "egot")
         .map_err(|e| EgoDesktopError::CryptoError(format!("Address: {e}")))?;
