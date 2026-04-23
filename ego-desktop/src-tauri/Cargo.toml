@@ -109,6 +109,18 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 2
 
+[profile.dev.package.pqcrypto-dilithium]
+opt-level = 3
+
+[profile.dev.package.pqcrypto-kyber]
+opt-level = 3
+
+[profile.dev.package.pqcrypto-sphincsplus]
+opt-level = 3
+
+[profile.dev.package.ego-core]
+opt-level = 3
+
 # Prevent src-tauri from joining the parent ego-blockchain workspace.
 [dev-dependencies]
 tempfile = "3"
