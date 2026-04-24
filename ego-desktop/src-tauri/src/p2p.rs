@@ -6326,10 +6326,18 @@ async fn handle_view_change_msg(view: u64, voter: String) {
     if !known_validators().contains(&voter) { return; }
     let threshold = bft_threshold().max(1);
 
+    let (my_addr, block_count_now) = match tokio::task::spawn_blocking(|| {
+        let addr  = crate::ledger::Ledger::load().address;
+        let count = crate::chain_db::block_count();
+        (addr, count)
+    }).await {
+        Ok(v)  => v,
+        Err(_) => return,
+    };
+
     {
         let my_view = current_view();
         if view > my_view {
-            let my_addr = crate::ledger::Ledger::load().address;
             if !my_addr.is_empty() && voter != my_addr {
                 advance_view(view.saturating_sub(1));
                 eprintln!(
@@ -6385,7 +6393,7 @@ async fn handle_view_change_msg(view: u64, voter: String) {
     // We NEVER penalise based on VRF heuristics — that would punish nodes that
     // legitimately won the lottery but whose proposal just didn't arrive in time.
     {
-        let current_height = crate::chain_db::block_count() + 1;
+        let current_height = block_count_now + 1;
         // Remove the entry atomically so we don't double-penalise.
         if let Some(offline_proposer) = pending_proposals().remove(&current_height) {
             crate::ledger::penalise_missed_proposal(&offline_proposer);
@@ -6398,7 +6406,6 @@ async fn handle_view_change_msg(view: u64, voter: String) {
         // secret until they reveal it, so silence is not provable misconduct.
     }
 
-    let my_addr = crate::ledger::Ledger::load().address;
     if my_addr.is_empty() { return; }
 
     if known_validators().len() < crate::bft_committee::min_committee_net() {
@@ -6409,8 +6416,7 @@ async fn handle_view_change_msg(view: u64, voter: String) {
     // finalized yet.  This allows the node to vote for new proposals at those
     // heights in the new view without triggering the equivocation guard.
     {
-        let committed_tip = crate::chain_db::block_count();
-        votes_cast().retain(|(_, h), _| *h <= committed_tip);
+        votes_cast().retain(|(_, h), _| *h <= block_count_now);
     }
 
     // ── Liveness: VRF self-selection + deterministic fallback ─────────────
@@ -6566,6 +6572,7 @@ pub async fn propose_block_as_leader() {
         let bh      = block.hash.clone();
         let bheight = block.height;
         tokio::task::spawn_blocking(move || bft_solo_commit(&bh, bheight)).await.ok();
+        touch_proposal_timestamp();
         eprintln!("[BFT] Solo block #{} committed", block.height);
     } else {
         touch_proposal_timestamp();
@@ -6714,6 +6721,7 @@ pub async fn propose_block_as_leader_forced() {
         let bh      = block.hash.clone();
         let bheight = block.height;
         tokio::task::spawn_blocking(move || bft_solo_commit(&bh, bheight)).await.ok();
+        touch_proposal_timestamp();
         eprintln!("[BFT] Solo fallback block #{} committed", block.height);
     } else {
         touch_proposal_timestamp();
