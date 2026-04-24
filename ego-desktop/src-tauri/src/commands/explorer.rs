@@ -28,35 +28,35 @@ pub struct NetworkStats {
 
 #[tauri::command]
 pub async fn get_network_stats() -> Result<NetworkStats, EgoDesktopError> {
-    let registry = load_registry();
-
-    let (latest_height, _) = crate::chain_db::latest_block_info();
-
-    let node_count = registry
-        .wallets
-        .iter()
-        .filter(|w| !w.address.is_empty())
-        .count() as u32;
-
-    let mut seen_cids: HashSet<String> = HashSet::new();
-    for entry in &registry.wallets {
-        let path = wallet_dir(&entry.id).join("ledger.json");
-        if let Ok(data) = fs::read_to_string(&path) {
-            if let Ok(l) = serde_json::from_str::<Ledger>(&data) {
-                for f in &l.stored_files {
-                    seen_cids.insert(f.cid.clone());
+    tokio::task::spawn_blocking(|| {
+        let registry = load_registry();
+        let (latest_height, _) = crate::chain_db::latest_block_info();
+        let node_count = registry
+            .wallets
+            .iter()
+            .filter(|w| !w.address.is_empty())
+            .count() as u32;
+        let mut seen_cids: HashSet<String> = HashSet::new();
+        for entry in &registry.wallets {
+            let path = wallet_dir(&entry.id).join("ledger.json");
+            if let Ok(data) = fs::read_to_string(&path) {
+                if let Ok(l) = serde_json::from_str::<Ledger>(&data) {
+                    for f in &l.stored_files {
+                        seen_cids.insert(f.cid.clone());
+                    }
                 }
             }
         }
-    }
-
-    Ok(NetworkStats {
-        latest_block: latest_height,
-        total_transactions: crate::chain_db::tx_count() as usize,
-        total_files_stored: seen_cids.len(),
-        node_count: node_count.max(1),
-        network: "Ego Testnet".into(),
+        Ok(NetworkStats {
+            latest_block: latest_height,
+            total_transactions: crate::chain_db::tx_count() as usize,
+            total_files_stored: seen_cids.len(),
+            node_count: node_count.max(1),
+            network: "Ego Testnet".into(),
+        })
     })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -101,92 +101,104 @@ pub async fn get_p2p_status(state: tauri::State<'_, crate::app::AppState>) -> Re
 
 #[tauri::command]
 pub async fn get_blocks(offset: Option<u32>, limit: Option<u32>) -> Result<Vec<LedgerBlock>, EgoDesktopError> {
-    Ok(crate::chain_db::paged_blocks(
-        offset.unwrap_or(0) as usize,
-        limit.unwrap_or(25) as usize,
-    ))
+    let off = offset.unwrap_or(0) as usize;
+    let lim = limit.unwrap_or(25) as usize;
+    tokio::task::spawn_blocking(move || crate::chain_db::paged_blocks(off, lim))
+        .await
+        .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))
 }
 
 #[tauri::command]
 pub async fn get_all_transactions(offset: Option<u32>, limit: Option<u32>) -> Result<Vec<LedgerTx>, EgoDesktopError> {
-    let offset = offset.unwrap_or(0) as usize;
-    let limit  = limit.unwrap_or(25) as usize;
-    Ok(crate::chain_db::paged_transactions(offset, limit))
+    let off = offset.unwrap_or(0) as usize;
+    let lim = limit.unwrap_or(25) as usize;
+    tokio::task::spawn_blocking(move || crate::chain_db::paged_transactions(off, lim))
+        .await
+        .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))
 }
 
 #[tauri::command]
 pub async fn get_block_info(height: u64) -> Result<LedgerBlock, EgoDesktopError> {
-    crate::chain_db::get_block_by_height(height)
-        .ok_or_else(|| EgoDesktopError::NotFound(format!("Block #{height} not found")))
+    tokio::task::spawn_blocking(move || {
+        crate::chain_db::get_block_by_height(height)
+            .ok_or_else(|| EgoDesktopError::NotFound(format!("Block #{height} not found")))
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 #[tauri::command]
 pub async fn get_transaction_info(hash: String) -> Result<LedgerTx, EgoDesktopError> {
-    crate::chain_db::get_tx_by_hash(&hash)
-        .ok_or_else(|| EgoDesktopError::NotFound(format!("TX {hash} not found")))
+    tokio::task::spawn_blocking(move || {
+        crate::chain_db::get_tx_by_hash(&hash)
+            .ok_or_else(|| EgoDesktopError::NotFound(format!("TX {hash} not found")))
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
-/// Returns all file storage/sharing events across all wallets, newest first.
-/// Names and keys are never included — only the public CID hash is exposed.
 #[tauri::command]
 pub async fn get_file_events() -> Result<Vec<FileEvent>, EgoDesktopError> {
-    let registry = load_registry();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut events: Vec<FileEvent> = Vec::new();
+    tokio::task::spawn_blocking(|| {
+        let registry = load_registry();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut events: Vec<FileEvent> = Vec::new();
 
-    for entry in &registry.wallets {
-        let path = wallet_dir(&entry.id).join("ledger.json");
-        let ledger: Ledger = match fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-        {
-            Some(l) => l,
-            None    => continue,
-        };
+        for entry in &registry.wallets {
+            let path = wallet_dir(&entry.id).join("ledger.json");
+            let ledger: Ledger = match fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+            {
+                Some(l) => l,
+                None    => continue,
+            };
 
-        let owner = ledger.address.clone();
-        for f in &ledger.stored_files {
-            let key = format!("{}:{}", f.cid, owner);
-            if seen.insert(key) {
-                events.push(FileEvent {
-                    cid:            f.cid.clone(),
-                    owner:          if f.owner.is_empty() { owner.clone() } else { f.owner.clone() },
-                    event_type:     if f.status == "Received" { "Received".into() } else { "Stored".into() },
-                    original_size:  f.original_size,
-                    encrypted_size: f.encrypted_size,
-                    timestamp:      f.stored_at,
-                    expiry:         f.expiry,
-                    status:         f.status.clone(),
-                });
+            let owner = ledger.address.clone();
+            for f in &ledger.stored_files {
+                let key = format!("{}:{}", f.cid, owner);
+                if seen.insert(key) {
+                    events.push(FileEvent {
+                        cid:            f.cid.clone(),
+                        owner:          if f.owner.is_empty() { owner.clone() } else { f.owner.clone() },
+                        event_type:     if f.status == "Received" { "Received".into() } else { "Stored".into() },
+                        original_size:  f.original_size,
+                        encrypted_size: f.encrypted_size,
+                        timestamp:      f.stored_at,
+                        expiry:         f.expiry,
+                        status:         f.status.clone(),
+                    });
+                }
             }
         }
-    }
 
-    events.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-    Ok(events)
+        events.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok::<_, EgoDesktopError>(events)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EgocPrice {
     pub price_usd: f64,
-    /// "oracle", "coingecko", or "estimated"
     pub source: String,
 }
 
 #[tauri::command]
 pub async fn get_egoc_price_usd() -> EgocPrice {
-    // Trigger a fresh fetch so we always return up-to-date data.
     crate::p2p::fetch_and_cache_egoc_price().await;
     let price = crate::p2p::get_egoc_price_usd();
-    // "market" for oracle/exchange data, "default" only if price fetch somehow returned 0
     let source = if price > 0.0 { "market".into() } else { "estimated".into() };
     EgocPrice { price_usd: price, source }
 }
 
 #[tauri::command]
 pub async fn get_base_fee() -> u64 {
-    crate::chain_db::get_current_base_fee()
+    tokio::task::spawn_blocking(crate::chain_db::get_current_base_fee)
+        .await
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -194,7 +206,6 @@ pub struct NetworkCapacity {
     pub total_allocated_gb: f64,
     pub total_available_gb: f64,
     pub node_count: usize,
-    /// 0.0–1.0 fill ratio (allocated / total)
     pub fill_ratio: f64,
 }
 
@@ -224,13 +235,22 @@ pub struct SupplyInfo {
 
 #[tauri::command]
 pub async fn get_supply_info() -> SupplyInfo {
-    let (height, _) = crate::chain_db::latest_block_info();
-    SupplyInfo {
+    tokio::task::spawn_blocking(|| {
+        let (height, _) = crate::chain_db::latest_block_info();
+        SupplyInfo {
+            total_supply_uegoc: crate::tokenomics::TOTAL_SUPPLY_UEGOC,
+            circulating_uegoc: crate::chain_db::get_total_circulating_supply(),
+            remaining_mintable_uegoc: crate::chain_db::remaining_mintable(),
+            current_block_reward_uegoc: crate::chain_db::block_reward_at_height(height),
+        }
+    })
+    .await
+    .unwrap_or(SupplyInfo {
         total_supply_uegoc: crate::tokenomics::TOTAL_SUPPLY_UEGOC,
-        circulating_uegoc: crate::chain_db::get_total_circulating_supply(),
-        remaining_mintable_uegoc: crate::chain_db::remaining_mintable(),
-        current_block_reward_uegoc: crate::chain_db::block_reward_at_height(height),
-    }
+        circulating_uegoc: 0,
+        remaining_mintable_uegoc: 0,
+        current_block_reward_uegoc: 0,
+    })
 }
 
 #[tauri::command]

@@ -289,9 +289,11 @@ const MarketPage: React.FC = () => {
   const liveRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
+    const giveUp = setTimeout(() => setRatesLoading(false), 12_000);
     invoke<Record<string, number>>('fetch_swap_rates')
       .then(r => { setRates(r); setRatesLoading(false); })
-      .catch(() => setRatesLoading(false));
+      .catch(() => setRatesLoading(false))
+      .finally(() => clearTimeout(giveUp));
   }, []);
 
   function stopLive() {

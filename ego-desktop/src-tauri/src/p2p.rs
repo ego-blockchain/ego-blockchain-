@@ -904,6 +904,34 @@ pub fn get_discovered_relay_nodes() -> Vec<String> {
     peer_relay_nodes().values().cloned().collect()
 }
 
+fn current_wallet_announce_keys() -> (String, String) {
+    if let Some(kp) = crate::app::global_app_state().get_keypair() {
+        return (
+            hex::encode(kp.dilithium_public_key().key_data),
+            hex::encode(kp.ed25519_public_key().as_bytes()),
+        );
+    }
+
+    let seed_bytes = match crate::ledger::load_seed().ok().flatten() {
+        Some(bytes) if bytes.len() >= 32 => bytes,
+        _ => return (String::new(), String::new()),
+    };
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&seed_bytes[..32]);
+
+    let vrf_hex = {
+        use ed25519_dalek::SigningKey;
+        hex::encode(SigningKey::from_bytes(&seed).verifying_key().as_bytes())
+    };
+    let dilithium_hex = std::fs::read(crate::ledger::data_dir().join("pq_keys.bin"))
+        .ok()
+        .and_then(|bytes| ego_core::KeyPair::from_pq_cache(&bytes, &seed).ok())
+        .map(|kp| hex::encode(kp.dilithium_public_key().key_data))
+        .unwrap_or_default();
+
+    (dilithium_hex, vrf_hex)
+}
+
 // ── Wire protocol ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1440,10 +1468,17 @@ pub async fn send_message(endpoint: &str, msg: &P2PMessage) -> Result<(), String
         .parse()
         .map_err(|e| format!("Invalid multiaddr '{}': {}", endpoint, e))?;
     let (reply_tx, reply_rx) = oneshot::channel();
-    tx.send(SwarmCmd::Send { peer_addr, msg: msg.clone(), reply: reply_tx })
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tx.send(SwarmCmd::Send { peer_addr, msg: msg.clone(), reply: reply_tx }),
+    )
+    .await
+    .map_err(|_| "Swarm channel send timed out".to_string())?
+    .map_err(|_| "Swarm channel closed".to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
         .await
-        .map_err(|_| "Swarm channel closed".to_string())?;
-    reply_rx.await.map_err(|_| "Swarm dropped reply".to_string())?
+        .map_err(|_| "Swarm reply timed out".to_string())?
+        .map_err(|_| "Swarm dropped reply".to_string())?
 }
 
 
@@ -1483,10 +1518,16 @@ pub async fn send_message_any(endpoints: &[String], msg: &P2PMessage) -> Result<
 pub async fn get_public_endpoint() -> String {
     let Some(tx) = SWARM_TX.get() else { return String::new(); };
     let (reply_tx, reply_rx) = oneshot::channel();
-    if tx.send(SwarmCmd::GetEndpoint { reply: reply_tx }).await.is_err() {
-        return String::new();
-    }
-    reply_rx.await.unwrap_or_default()
+    let send = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tx.send(SwarmCmd::GetEndpoint { reply: reply_tx }),
+    ).await;
+    if send.is_err() || send.unwrap().is_err() { return String::new(); }
+    tokio::time::timeout(std::time::Duration::from_secs(3), reply_rx)
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default()
 }
 
 
@@ -1546,20 +1587,12 @@ pub async fn broadcast_tx(tx: LedgerTx, block: LedgerBlock) {
     let my_addr = crate::ledger::Ledger::load().address;
     register_known_validator(&my_addr);
 
-    if let Ok(Some(seed_bytes)) = crate::ledger::load_seed() {
-        if seed_bytes.len() == 32 {
-            let mut seed = [0u8; 32];
-            seed.copy_from_slice(&seed_bytes);
-            if let Ok(kp) = ego_core::KeyPair::from_bytes(&seed) {
-                let dil_pk_hex = hex::encode(kp.dilithium_public_key().key_data);
-                register_validator_pubkey(&my_addr, &dil_pk_hex);
-            }
-            let vk_hex = {
-                use ed25519_dalek::SigningKey;
-                hex::encode(SigningKey::from_bytes(&seed).verifying_key().as_bytes())
-            };
-            record_peer_ed25519(&my_addr, &vk_hex);
-        }
+    let (dil_pk_hex, vk_hex) = current_wallet_announce_keys();
+    if !dil_pk_hex.is_empty() {
+        register_validator_pubkey(&my_addr, &dil_pk_hex);
+    }
+    if !vk_hex.is_empty() {
+        record_peer_ed25519(&my_addr, &vk_hex);
     }
 
     let mut seen_eps: std::collections::HashSet<String> = Default::default();
@@ -1682,24 +1715,7 @@ pub async fn broadcast_peer_announce(app: Option<&tauri::AppHandle<tauri::Wry>>)
     }
 
     let coverage_score = crate::poc::my_coverage_score();
-    let (dilithium_pubkey_hex, vrf_pubkey_hex) = {
-        crate::ledger::load_seed()
-            .ok()
-            .flatten()
-            .and_then(|b| {
-                if b.len() != 32 { return None; }
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&b);
-                let kp = ego_core::KeyPair::from_bytes(&arr).ok()?;
-                let dil = hex::encode(kp.dilithium_public_key().key_data);
-                let vk  = {
-                    use ed25519_dalek::SigningKey;
-                    hex::encode(SigningKey::from_bytes(&arr).verifying_key().as_bytes())
-                };
-                Some((dil, vk))
-            })
-            .unwrap_or_default()
-    };
+    let (dilithium_pubkey_hex, vrf_pubkey_hex) = current_wallet_announce_keys();
     let staked_amount = crate::ledger::Ledger::load().staked_amount;
     let msg = P2PMessage::PeerAnnounce {
         address, name,
@@ -2240,7 +2256,7 @@ fn load_or_create_identity() -> libp2p::identity::Keypair {
 
 pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     #[cfg(target_os = "windows")]
-    ensure_firewall_rule();
+    tokio::task::spawn_blocking(ensure_firewall_rule).await.ok();
 
     let identity      = load_or_create_identity();
     let local_peer_id = identity.public().to_peer_id();
@@ -4146,19 +4162,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                     if my_ep.is_empty() { return; }
                     let coverage_score = crate::poc::my_coverage_score();
                     let staked_amount  = crate::ledger::Ledger::load().staked_amount;
-                    let (dil_hex, vrf_hex) = crate::ledger::load_seed()
-                        .ok().flatten()
-                        .and_then(|b| {
-                            if b.len() != 32 { return None; }
-                            let mut arr = [0u8; 32];
-                            arr.copy_from_slice(&b);
-                            let kp = ego_core::KeyPair::from_bytes(&arr).ok()?;
-                            let dil = hex::encode(kp.dilithium_public_key().key_data);
-                            let vk  = { use ed25519_dalek::SigningKey;
-                                hex::encode(SigningKey::from_bytes(&arr).verifying_key().as_bytes()) };
-                            Some((dil, vk))
-                        })
-                        .unwrap_or_default();
+                    let (dil_hex, vrf_hex) = current_wallet_announce_keys();
                     let announce = P2PMessage::PeerAnnounce {
                         address:          my_addr,
                         name:             "Ego Node".to_string(),
