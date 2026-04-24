@@ -3250,13 +3250,18 @@ async fn handle_event(
                 if let Ok(P2PMessage::ChainSyncRequest { requester_endpoint, from_height }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
-                    if !requester_endpoint.is_empty() && crate::chain_db::block_count() > 0 {
+                    if !requester_endpoint.is_empty() {
                         let ep = requester_endpoint.clone();
                         tokio::spawn(async move {
-                            let blocks = crate::chain_db::get_blocks_range(from_height + 1, 1_000);
-                            let transactions: Vec<crate::ledger::LedgerTx> = blocks.iter()
-                                .flat_map(|b| crate::chain_db::get_txs_for_block(b.height))
-                                .collect();
+                            let (blocks, transactions) = tokio::task::spawn_blocking(move || {
+                                if crate::chain_db::block_count() == 0 { return (vec![], vec![]); }
+                                let blocks = crate::chain_db::get_blocks_range(from_height + 1, 1_000);
+                                let transactions: Vec<crate::ledger::LedgerTx> = blocks.iter()
+                                    .flat_map(|b| crate::chain_db::get_txs_for_block(b.height))
+                                    .collect();
+                                (blocks, transactions)
+                            }).await.unwrap_or_default();
+                            if blocks.is_empty() { return; }
                             tracing::info!("sync-v1: sending {} blocks ({} txs) from height {} to {}",
                                 blocks.len(), transactions.len(), from_height + 1,
                                 blocks.last().map(|b| b.height).unwrap_or(from_height));
@@ -3355,7 +3360,10 @@ async fn handle_event(
                 if let Ok(P2PMessage::HostingAnnounce { record }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
-                    crate::chain_db::upsert_hosting_node(&record);
+                    let r2 = record.clone();
+                    tokio::spawn(async move {
+                        tokio::task::spawn_blocking(move || crate::chain_db::upsert_hosting_node(&r2)).await.ok();
+                    });
                     tokio::spawn(async move {
                         let client = reqwest::Client::builder()
                             .timeout(std::time::Duration::from_secs(5))
@@ -3370,152 +3378,221 @@ async fn handle_event(
             } else if topic == "ego-compute-v1" {
                 match serde_json::from_slice::<P2PMessage>(&message.data) {
                     Ok(P2PMessage::ComputeAnnounce { node }) => {
-                        crate::chain_db::upsert_compute_node(&node);
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || crate::chain_db::upsert_compute_node(&node)).await.ok();
+                        });
                     }
                     Ok(P2PMessage::ComputeJobPost { job }) => {
-                        crate::chain_db::upsert_compute_job(&job);
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || crate::chain_db::upsert_compute_job(&job)).await.ok();
+                        });
                     }
                     Ok(P2PMessage::ComputeJobAccept { job_id, worker_address, .. }) => {
-                        if let Some(mut job) = crate::chain_db::get_compute_job(&job_id) {
-                            if job.status == "posted"
-                                && !worker_address.is_empty()
-                                && job.worker_address.is_empty()
-                            {
-                                job.status         = "accepted".to_string();
-                                job.worker_address = worker_address;
-                                job.accepted_at    = Some(chrono::Utc::now().timestamp());
-                                crate::chain_db::upsert_compute_job(&job);
-                            }
-                        }
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(mut job) = crate::chain_db::get_compute_job(&job_id) {
+                                    if job.status == "posted"
+                                        && !worker_address.is_empty()
+                                        && job.worker_address.is_empty()
+                                    {
+                                        job.status         = "accepted".to_string();
+                                        job.worker_address = worker_address;
+                                        job.accepted_at    = Some(chrono::Utc::now().timestamp());
+                                        crate::chain_db::upsert_compute_job(&job);
+                                    }
+                                }
+                            }).await.ok();
+                        });
                     }
                     Ok(P2PMessage::ComputeJobComplete { job_id, output_cid, .. }) => {
-                        if let Some(mut job) = crate::chain_db::get_compute_job(&job_id) {
-                            if (job.status == "accepted" || job.status == "running")
-                                && !job.worker_address.is_empty()
-                            {
-                                job.status       = "completed".to_string();
-                                job.output_cid   = output_cid;
-                                job.completed_at = Some(chrono::Utc::now().timestamp());
-                                crate::chain_db::upsert_compute_job(&job);
-                            }
-                        }
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(mut job) = crate::chain_db::get_compute_job(&job_id) {
+                                    if (job.status == "accepted" || job.status == "running")
+                                        && !job.worker_address.is_empty()
+                                    {
+                                        job.status       = "completed".to_string();
+                                        job.output_cid   = output_cid;
+                                        job.completed_at = Some(chrono::Utc::now().timestamp());
+                                        crate::chain_db::upsert_compute_job(&job);
+                                    }
+                                }
+                            }).await.ok();
+                        });
                     }
                     Ok(P2PMessage::ComputeJobCancel { job_id, .. }) => {
-                        if let Some(mut job) = crate::chain_db::get_compute_job(&job_id) {
-                            if job.status == "posted" {
-                                job.status = "cancelled".to_string();
-                                crate::chain_db::upsert_compute_job(&job);
-                            }
-                        }
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(mut job) = crate::chain_db::get_compute_job(&job_id) {
+                                    if job.status == "posted" {
+                                        job.status = "cancelled".to_string();
+                                        crate::chain_db::upsert_compute_job(&job);
+                                    }
+                                }
+                            }).await.ok();
+                        });
                     }
                     Ok(P2PMessage::ComputeHeartbeat { job_id, worker, timestamp }) => {
-                        if let Some(mut job) = crate::chain_db::get_compute_job(&job_id) {
-                            if job.worker_address == worker && job.status == "accepted" {
-                                job.status = "running".to_string();
-                                job.accepted_at = Some(timestamp);
-                                crate::chain_db::upsert_compute_job(&job);
-                            }
-                        }
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(mut job) = crate::chain_db::get_compute_job(&job_id) {
+                                    if job.worker_address == worker && job.status == "accepted" {
+                                        job.status = "running".to_string();
+                                        job.accepted_at = Some(timestamp);
+                                        crate::chain_db::upsert_compute_job(&job);
+                                    }
+                                }
+                            }).await.ok();
+                        });
                     }
                     Ok(P2PMessage::CapacityOfferBroadcast { offer }) => {
-                        if crate::chain_db::get_compute_offer(&offer.offer_id).is_none() {
-                            crate::chain_db::upsert_compute_offer(&offer);
-                        }
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                if crate::chain_db::get_compute_offer(&offer.offer_id).is_none() {
+                                    crate::chain_db::upsert_compute_offer(&offer);
+                                }
+                            }).await.ok();
+                        });
                     }
                     Ok(P2PMessage::CapacityOfferCancelled { offer_id }) => {
-                        if let Some(mut offer) = crate::chain_db::get_compute_offer(&offer_id) {
-                            if offer.status == "open" {
-                                offer.status = "cancelled".to_string();
-                                crate::chain_db::upsert_compute_offer(&offer);
-                            }
-                        }
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(mut offer) = crate::chain_db::get_compute_offer(&offer_id) {
+                                    if offer.status == "open" {
+                                        offer.status = "cancelled".to_string();
+                                        crate::chain_db::upsert_compute_offer(&offer);
+                                    }
+                                }
+                            }).await.ok();
+                        });
                     }
                     Ok(P2PMessage::ClusterBookingCreated { booking }) => {
-                        if crate::chain_db::get_cluster_booking(&booking.cluster_id).is_none() {
-                            crate::chain_db::upsert_cluster_booking(&booking);
+                        let app2 = app.cloned();
+                        tokio::spawn(async move {
                             let cluster_id = booking.cluster_id.clone();
-                            let app2 = app.cloned();
-                            if let Some(h) = app2 {
-                                tokio::spawn(async move {
+                            let is_new = tokio::task::spawn_blocking(move || {
+                                if crate::chain_db::get_cluster_booking(&booking.cluster_id).is_none() {
+                                    crate::chain_db::upsert_cluster_booking(&booking);
+                                    true
+                                } else {
+                                    false
+                                }
+                            }).await.unwrap_or(false);
+                            if is_new {
+                                if let Some(h) = app2 {
                                     crate::commands::cluster::auto_join_cluster(cluster_id, h).await;
-                                });
+                                }
                             }
-                        }
+                        });
                     }
                     Ok(P2PMessage::ClusterNodeJoined { cluster_id, provider_address, wg_pubkey, endpoint }) => {
-                        if let Some(mut b) = crate::chain_db::get_cluster_booking(&cluster_id) {
-                            let now = chrono::Utc::now().timestamp();
-                            for node in b.nodes.iter_mut() {
-                                if node.provider_address == provider_address
-                                    && node.wg_pubkey.is_empty()
-                                {
-                                    node.wg_pubkey         = wg_pubkey.clone();
-                                    node.endpoint          = endpoint.clone();
-                                    node.status            = "active".to_string();
-                                    node.joined_at         = now;
-                                    node.last_heartbeat_at = now;
-                                    break;
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(mut b) = crate::chain_db::get_cluster_booking(&cluster_id) {
+                                    let now = chrono::Utc::now().timestamp();
+                                    for node in b.nodes.iter_mut() {
+                                        if node.provider_address == provider_address
+                                            && node.wg_pubkey.is_empty()
+                                        {
+                                            node.wg_pubkey         = wg_pubkey.clone();
+                                            node.endpoint          = endpoint.clone();
+                                            node.status            = "active".to_string();
+                                            node.joined_at         = now;
+                                            node.last_heartbeat_at = now;
+                                            break;
+                                        }
+                                    }
+                                    let all_active = b.nodes.iter().all(|n| n.status == "active");
+                                    if all_active { b.status = "active".to_string(); }
+                                    crate::chain_db::upsert_cluster_booking(&b);
                                 }
-                            }
-                            let all_active = b.nodes.iter().all(|n| n.status == "active");
-                            if all_active { b.status = "active".to_string(); }
-                            crate::chain_db::upsert_cluster_booking(&b);
-                        }
+                            }).await.ok();
+                        });
                     }
                     Ok(P2PMessage::ClusterNodeHeartbeat { cluster_id, provider_address, .. }) => {
-                        if let Some(mut b) = crate::chain_db::get_cluster_booking(&cluster_id) {
-                            let now = chrono::Utc::now().timestamp();
-                            for node in b.nodes.iter_mut() {
-                                if node.provider_address == provider_address {
-                                    node.last_heartbeat_at = now;
-                                    node.status = "active".to_string();
-                                    break;
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(mut b) = crate::chain_db::get_cluster_booking(&cluster_id) {
+                                    let now = chrono::Utc::now().timestamp();
+                                    for node in b.nodes.iter_mut() {
+                                        if node.provider_address == provider_address {
+                                            node.last_heartbeat_at = now;
+                                            node.status = "active".to_string();
+                                            break;
+                                        }
+                                    }
+                                    crate::chain_db::upsert_cluster_booking(&b);
                                 }
-                            }
-                            crate::chain_db::upsert_cluster_booking(&b);
-                        }
+                            }).await.ok();
+                        });
                     }
                     Ok(P2PMessage::ClusterTerminated { cluster_id }) => {
-                        if let Some(mut b) = crate::chain_db::get_cluster_booking(&cluster_id) {
-                            b.status = "terminated".to_string();
-                            crate::chain_db::upsert_cluster_booking(&b);
-                        }
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(mut b) = crate::chain_db::get_cluster_booking(&cluster_id) {
+                                    b.status = "terminated".to_string();
+                                    crate::chain_db::upsert_cluster_booking(&b);
+                                }
+                            }).await.ok();
+                        });
                     }
                     Ok(P2PMessage::ReservationBooked { reservation }) => {
-                        if crate::chain_db::get_compute_reservation(&reservation.reservation_id).is_none() {
-                            crate::chain_db::upsert_compute_reservation(&reservation);
-                        }
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                if crate::chain_db::get_compute_reservation(&reservation.reservation_id).is_none() {
+                                    crate::chain_db::upsert_compute_reservation(&reservation);
+                                }
+                            }).await.ok();
+                        });
                     }
                     Ok(P2PMessage::ReservationHeartbeat { reservation_id, provider, .. }) => {
-                        if let Some(mut res) = crate::chain_db::get_compute_reservation(&reservation_id) {
-                            if res.provider_address == provider && res.status == "active" {
-                                res.last_heartbeat_at = chrono::Utc::now().timestamp();
-                                crate::chain_db::upsert_compute_reservation(&res);
-                            }
-                        }
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(mut res) = crate::chain_db::get_compute_reservation(&reservation_id) {
+                                    if res.provider_address == provider && res.status == "active" {
+                                        res.last_heartbeat_at = chrono::Utc::now().timestamp();
+                                        crate::chain_db::upsert_compute_reservation(&res);
+                                    }
+                                }
+                            }).await.ok();
+                        });
                     }
                     Ok(P2PMessage::ReservationTerminated { reservation_id, .. }) => {
-                        if let Some(mut res) = crate::chain_db::get_compute_reservation(&reservation_id) {
-                            res.status = "terminated".to_string();
-                            crate::chain_db::upsert_compute_reservation(&res);
-                        }
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(mut res) = crate::chain_db::get_compute_reservation(&reservation_id) {
+                                    res.status = "terminated".to_string();
+                                    crate::chain_db::upsert_compute_reservation(&res);
+                                }
+                            }).await.ok();
+                        });
                     }
                     Ok(P2PMessage::StorageDealCreated { deal }) => {
-                        crate::chain_db::upsert_storage_deal(&deal);
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || crate::chain_db::upsert_storage_deal(&deal)).await.ok();
+                        });
                     }
                     Ok(P2PMessage::StorageDealProof { deal_id, provider, timestamp }) => {
-                        if let Some(mut deal) = crate::chain_db::get_storage_deal(&deal_id) {
-                            if deal.provider_address == provider && deal.status == "active" {
-                                deal.last_proof_at = timestamp;
-                                crate::chain_db::upsert_storage_deal(&deal);
-                            }
-                        }
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(mut deal) = crate::chain_db::get_storage_deal(&deal_id) {
+                                    if deal.provider_address == provider && deal.status == "active" {
+                                        deal.last_proof_at = timestamp;
+                                        crate::chain_db::upsert_storage_deal(&deal);
+                                    }
+                                }
+                            }).await.ok();
+                        });
                     }
                     Ok(P2PMessage::StorageDealTerminated { deal_id, .. }) => {
-                        if let Some(mut deal) = crate::chain_db::get_storage_deal(&deal_id) {
-                            deal.status = "terminated".to_string();
-                            crate::chain_db::upsert_storage_deal(&deal);
-                        }
+                        tokio::spawn(async move {
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(mut deal) = crate::chain_db::get_storage_deal(&deal_id) {
+                                    deal.status = "terminated".to_string();
+                                    crate::chain_db::upsert_storage_deal(&deal);
+                                }
+                            }).await.ok();
+                        });
                     }
                     Ok(P2PMessage::EquivocationProof { accused, height, hash_a, sig_a, hash_b, sig_b, reporter }) => {
                         if !slashed_validators().contains(&accused) {
@@ -4133,25 +4210,24 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                 });
 
                 // Proactive chain push: send only the blocks the peer is missing.
-                // (Old code used load_chain() = last-500 window regardless of peer height.)
-                let tip = crate::chain_db::block_count();
-                if tip > 0 {
-                    let ep2 = endpoint.clone();
-                    tokio::spawn(async move {
-                        // We don't know the peer's height here, so start from block 1.
-                        // get_blocks_range caps at 1000; the peer's 30s sync loop covers larger gaps.
+                let ep2 = endpoint.clone();
+                tokio::spawn(async move {
+                    let (blocks, transactions) = tokio::task::spawn_blocking(|| {
+                        if crate::chain_db::block_count() == 0 { return (vec![], vec![]); }
                         let blocks = crate::chain_db::get_blocks_range(1, 1_000);
                         let transactions: Vec<crate::ledger::LedgerTx> = blocks.iter()
                             .flat_map(|b| crate::chain_db::get_txs_for_block(b.height))
                             .collect();
-                        let response = P2PMessage::ChainSyncResponse { blocks, transactions };
-                        if let Err(e) = send_message_any(&[ep2.clone()], &response).await {
-                            if !e.contains("none of the requested protocols") {
-                                eprintln!("[P2P] proactive chain push to {}: {}", ep2, e);
-                            }
+                        (blocks, transactions)
+                    }).await.unwrap_or_default();
+                    if blocks.is_empty() { return; }
+                    let response = P2PMessage::ChainSyncResponse { blocks, transactions };
+                    if let Err(e) = send_message_any(&[ep2.clone()], &response).await {
+                        if !e.contains("none of the requested protocols") {
+                            eprintln!("[P2P] proactive chain push to {}: {}", ep2, e);
                         }
-                    });
-                }
+                    }
+                });
 
                 // Reply with our own PeerAnnounce so the sender immediately
                 // learns about us as a validator — without waiting for the
