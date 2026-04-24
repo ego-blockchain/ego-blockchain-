@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { listen } from '@tauri-apps/api/event';
 import Pagination from '../components/Pagination';
+import { useWallet } from '../App';
 
 interface Location {
   latitude: number;
@@ -421,6 +422,7 @@ const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = 
 };
 
 const CoveragePage: React.FC = () => {
+  const { wallet } = useWallet();
   const [coverage,   setCoverage]   = useState<CoverageStatus | null>(null);
   const [events,     setEvents]     = useState<PocEvent[]>([]);
   const [peers,      setPeers]      = useState<PeerInfo[]>([]);
@@ -428,43 +430,82 @@ const CoveragePage: React.FC = () => {
   const [p2pStatus,  setP2pStatus]  = useState<P2pStatus | null>(null);
   const [loading,    setLoading]    = useState(true);
 
+  const withTimeout = <T,>(promise: Promise<T>, fallback: T, ms = 5_000): Promise<T> =>
+    Promise.race([promise, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
+
+  function fallbackCoverage(): CoverageStatus {
+    const walletReady = Boolean(wallet?.address);
+    return {
+      coverage_synced_count: 0,
+      is_online: walletReady,
+      machine_id: '',
+      network_quality: walletReady ? 'Fair' : 'Offline',
+      vpn_detected: false,
+      vpn_reason: '',
+    };
+  }
+
   function refreshCoverage() {
-    invoke<CoverageStatus>('get_coverage_status').then(setCoverage).catch(() => {});
-    invoke<PocEvent[]>('get_poc_events').then(setEvents).catch(() => {});
+    withTimeout(invoke<CoverageStatus>('get_coverage_status'), fallbackCoverage())
+      .then(setCoverage)
+      .catch(() => setCoverage(fallbackCoverage()));
+    withTimeout(invoke<PocEvent[]>('get_poc_events'), [])
+      .then(setEvents)
+      .catch(() => setEvents([]));
   }
 
   useEffect(() => {
-    invoke<CoverageStatus>('get_coverage_status')
-      .then(setCoverage).catch(() => {}).finally(() => setLoading(false));
-    invoke<PocEvent[]>('get_poc_events').then(setEvents).catch(() => {});
-    invoke<PeerInfo[]>('get_network_peers').then(setPeers).catch(() => {});
-    invoke<P2pStatus>('get_p2p_status').then(setP2pStatus).catch(() => {});
+    let active = true;
+
+    async function loadInitial() {
+      try {
+        const [nextCoverage, nextEvents, nextPeers, nextP2p] = await Promise.all([
+          withTimeout(invoke<CoverageStatus>('get_coverage_status'), fallbackCoverage()),
+          withTimeout(invoke<PocEvent[]>('get_poc_events'), []),
+          withTimeout(invoke<PeerInfo[]>('get_network_peers'), []),
+          withTimeout(invoke<P2pStatus>('get_p2p_status'), { public_endpoint: '' }),
+        ]);
+        if (!active) return;
+        setCoverage(nextCoverage);
+        setEvents(nextEvents);
+        setPeers(nextPeers);
+        setP2pStatus(nextP2p.public_endpoint ? nextP2p : null);
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+
+    void loadInitial();
 
     const unlistenCoverage = listen('ego://coverage-updated', refreshCoverage);
     const unlistenVpn      = listen('ego://vpn-status-changed', refreshCoverage);
     const tPeers = setInterval(() => {
-      invoke<PeerInfo[]>('get_network_peers').then(setPeers).catch(() => {});
+      withTimeout(invoke<PeerInfo[]>('get_network_peers'), [])
+        .then(setPeers)
+        .catch(() => setPeers([]));
     }, 10_000);
 
     return () => {
+      active = false;
       clearInterval(tPeers);
       unlistenCoverage.then(fn => fn());
       unlistenVpn.then(fn => fn());
     };
-  }, []);
+  }, [wallet?.address]);
 
   useEffect(() => {
     const el = eventLogRef.current;
     if (el) setTimeout(() => { el.scrollTop = el.scrollHeight; }, 0);
   }, [events]);
 
-  const quality   = coverage?.network_quality ?? 'Excellent';
-  const synced    = coverage?.coverage_synced_count ?? 0;
-  const online    = coverage?.is_online ?? false;
-  const vpn       = coverage?.vpn_detected ?? false;
-  const vpnReason = coverage?.vpn_reason ?? '';
-  const machineId = coverage?.machine_id ?? '';
-  const loc       = coverage?.location;
+  const coverageState = coverage ?? fallbackCoverage();
+  const quality   = coverageState.network_quality;
+  const synced    = coverageState.coverage_synced_count ?? 0;
+  const online    = coverageState.is_online;
+  const vpn       = coverageState.vpn_detected ?? false;
+  const vpnReason = coverageState.vpn_reason ?? '';
+  const machineId = coverageState.machine_id ?? '';
+  const loc       = coverageState.location;
   const h3Cell    = loc ? deriveH3Cell(loc.latitude, loc.longitude) : null;
   const coordStr  = loc ? fmtCoord(loc.latitude, loc.longitude) : null;
   const cityStr   = loc ? locationLabel(loc) : null;

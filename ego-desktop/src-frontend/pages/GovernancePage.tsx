@@ -63,6 +63,10 @@ function timeLeft(ts: number): string {
   return h > 0 ? `${h}h ${m}m left` : `${m}m left`;
 }
 
+function withTimeout<T>(promise: Promise<T>, fallback: T, ms = 5_000): Promise<T> {
+  return Promise.race([promise, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
+}
+
 function PowerBar({ label, power, color }: { label: string; power: number; color: string }) {
   return (
     <div className="flex items-center gap-2 text-xs">
@@ -269,9 +273,15 @@ function ProposalDetailModal({ proposal, onClose, onVoted, myAddress }: {
   const isOwnProposal = proposal.creator === myAddress;
 
   useEffect(() => {
-    invoke<ProposalResults>('get_proposal_results', { proposalId: proposal.id })
+    withTimeout<ProposalResults | null>(
+      invoke<ProposalResults>('get_proposal_results', { proposalId: proposal.id }),
+      null,
+    )
       .then(setResults).catch(() => {});
-    invoke<BanStatus>('get_ban_status', { targetAddress: proposal.creator })
+    withTimeout<BanStatus | null>(
+      invoke<BanStatus>('get_ban_status', { targetAddress: proposal.creator }),
+      null,
+    )
       .then(setBanStatus).catch(() => {});
   }, [proposal.id, proposal.creator]);
 
@@ -650,14 +660,19 @@ export default function GovernancePage() {
   const loadProposals = useCallback(async (statusFilter?: string) => {
     setLoading(true);
     try {
-      const list = await invoke<DaoProposal[]>('get_dao_proposals', { statusFilter: statusFilter || tab });
+      const list = await withTimeout(
+        invoke<DaoProposal[]>('get_dao_proposals', { statusFilter: statusFilter || tab }),
+        [],
+      );
       setProposals(list);
     } catch { setProposals([]); }
     finally { setLoading(false); }
   }, [tab]);
 
   const refreshRateLimit = useCallback(async () => {
-    try { setRateLimit(await invoke<RateLimit>('get_proposal_rate_limit')); } catch {}
+    try {
+      setRateLimit(await withTimeout<RateLimit | null>(invoke<RateLimit>('get_proposal_rate_limit'), null));
+    } catch {}
   }, []);
 
   useEffect(() => { loadProposals(tab); }, [tab]);
@@ -666,7 +681,11 @@ export default function GovernancePage() {
   async function refreshSelected() {
     if (!selected) return;
     try {
-      const p = await invoke<DaoProposal>('get_dao_proposal', { proposalId: selected.id });
+      const p = await withTimeout<DaoProposal | null>(
+        invoke<DaoProposal>('get_dao_proposal', { proposalId: selected.id }),
+        null,
+      );
+      if (!p) return;
       setSelected(p);
       loadProposals(tab);
       refreshRateLimit();

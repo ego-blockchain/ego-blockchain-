@@ -82,15 +82,26 @@ pub fn slot_seed(prev_hash: &str, slot: u64) -> [u8; 32] {
 }
 
 fn compute_ticket(slot_seed: &[u8; 32]) -> Option<([u8; 32], String)> {
+    if let Some(kp) = crate::app::global_app_state().get_keypair() {
+        let sig = kp.sign_ed25519(slot_seed);
+        let sig_hex = hex::encode(sig.as_bytes());
+        let ticket = *blake3::hash(sig.as_bytes()).as_bytes();
+        return Some((ticket, sig_hex));
+    }
+
     let seed_bytes = crate::ledger::load_seed().ok().flatten()?;
+    if seed_bytes.len() < 32 {
+        return None;
+    }
     let mut seed = [0u8; 32];
-    seed.copy_from_slice(&seed_bytes);
-    let kp = ego_core::KeyPair::from_bytes(&seed).ok()?;
+    seed.copy_from_slice(&seed_bytes[..32]);
 
-    let sig = kp.sign_ed25519(slot_seed);
-    let sig_hex = hex::encode(&sig.signature_data);
-
-    let ticket = *blake3::hash(&sig.signature_data).as_bytes();
+    use ed25519_dalek::{Signer, SigningKey};
+    let signing_key = SigningKey::from_bytes(&seed);
+    let sig = signing_key.sign(slot_seed);
+    let sig_bytes = sig.to_bytes();
+    let sig_hex = hex::encode(sig_bytes);
+    let ticket = *blake3::hash(&sig_bytes).as_bytes();
     Some((ticket, sig_hex))
 }
 
