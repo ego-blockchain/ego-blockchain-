@@ -2642,53 +2642,63 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
             }
 
             _ = dht_inbox_poll.tick() => {
-                const TRANSFER_TIMEOUT_SECS: i64 = 600; // 10 minutes
-                let now = chrono::Utc::now().timestamp();
-                let ledger = crate::ledger::Ledger::load();
-                let mut timed_out: Vec<String> = Vec::new();
+                let app2 = app.cloned();
+                tokio::spawn(async move {
+                    const TRANSFER_TIMEOUT_SECS: i64 = 600;
+                    let now = chrono::Utc::now().timestamp();
+                    let ledger = tokio::task::spawn_blocking(crate::ledger::Ledger::load)
+                        .await.unwrap_or_default();
+                    let mut timed_out: Vec<String> = Vec::new();
+                    let mut missing: Vec<(String, Vec<String>)> = Vec::new();
 
-                for file in &ledger.stored_files {
-                    if !file.cid.starts_with("egomfd1")
-                        || file.status == "Failed"
-                        || file.status == "Received"
-                    { continue; }
+                    for file in &ledger.stored_files {
+                        if !file.cid.starts_with("egomfd1")
+                            || file.status == "Failed"
+                            || file.status == "Received"
+                        { continue; }
 
-                    if file.blocks_total > 0 && file.blocks_received < file.blocks_total {
-                        // Check for stalled transfer
-                        let last = if file.last_block_at > 0 { file.last_block_at } else { file.stored_at };
-                        if last > 0 && now - last > TRANSFER_TIMEOUT_SECS {
-                            timed_out.push(file.cid.clone());
-                            continue;
-                        }
-                        // Re-request missing blocks
-                        if let Some(tx) = DHT_CMD_TX.get() {
+                        if file.blocks_total > 0 && file.blocks_received < file.blocks_total {
+                            let last = if file.last_block_at > 0 { file.last_block_at } else { file.stored_at };
+                            if last > 0 && now - last > TRANSFER_TIMEOUT_SECS {
+                                timed_out.push(file.cid.clone());
+                                continue;
+                            }
                             if let Ok(manifest) = crate::blocks::load_manifest(&file.cid) {
-                                for block_cid in crate::blocks::missing_blocks(&manifest) {
-                                    let _ = tx.send(DhtCommand::GetPeers {
-                                        key: format!("ego-block:{}", block_cid),
-                                    });
+                                let blocks = crate::blocks::missing_blocks(&manifest);
+                                if !blocks.is_empty() {
+                                    missing.push((file.cid.clone(), blocks));
                                 }
                             }
                         }
                     }
-                }
-                drop(ledger);
 
-                if !timed_out.is_empty() {
-                    let mut ledger = crate::ledger::Ledger::load();
-                    for cid in &timed_out {
-                        if let Some(f) = ledger.stored_files.iter_mut().find(|f| &f.cid == cid) {
-                            f.status = "Failed".to_string();
-                            eprintln!("[Blocks] Transfer timed out ({}s): {}", TRANSFER_TIMEOUT_SECS, &cid[..cid.len().min(20)]);
+                    for (_, block_cids) in missing {
+                        if let Some(tx) = DHT_CMD_TX.get() {
+                            for block_cid in block_cids {
+                                let _ = tx.send(DhtCommand::GetPeers {
+                                    key: format!("ego-block:{}", block_cid),
+                                });
+                            }
                         }
                     }
-                    let _ = ledger.save();
-                    if let Some(ref h) = app {
+
+                    if !timed_out.is_empty() {
+                        let mut ledger2 = tokio::task::spawn_blocking(crate::ledger::Ledger::load)
+                            .await.unwrap_or_default();
                         for cid in &timed_out {
-                            let _ = h.emit_all("ego://file-failed", serde_json::json!({ "cid": cid }));
+                            if let Some(f) = ledger2.stored_files.iter_mut().find(|f| &f.cid == cid) {
+                                f.status = "Failed".to_string();
+                                eprintln!("[Blocks] Transfer timed out ({}s): {}", TRANSFER_TIMEOUT_SECS, &cid[..cid.len().min(20)]);
+                            }
+                        }
+                        let _ = tokio::task::spawn_blocking(move || ledger2.save()).await;
+                        if let Some(ref h) = app2 {
+                            for cid in &timed_out {
+                                let _ = h.emit_all("ego://file-failed", serde_json::json!({ "cid": cid }));
+                            }
                         }
                     }
-                }
+                });
             }
         }
     }
@@ -6473,7 +6483,7 @@ pub async fn propose_block_as_leader() {
 
     let (miner, prev_hash, next_height, seed_bytes) = match init {
         Some(v) => v,
-        None    => return,
+        None    => { touch_proposal_timestamp(); return; }
     };
 
     let mut seed_32 = [0u8; 32];
@@ -6633,7 +6643,7 @@ pub async fn propose_block_as_leader_forced() {
 
     let (miner, prev_hash, next_height, seed_bytes) = match init {
         Some(v) => v,
-        None    => return,
+        None    => { touch_proposal_timestamp(); return; }
     };
 
     let mut seed_32 = [0u8; 32];
@@ -6739,6 +6749,7 @@ pub async fn run_view_change_monitor() {
     touch_proposal_timestamp();
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
 
@@ -6752,9 +6763,15 @@ pub async fn run_view_change_monitor() {
             let chain_next = crate::chain_db::block_count() as u64 + 1;
             let my_addr    = crate::ledger::Ledger::load().address;
             if my_addr.is_empty() { return None; }
-            Some((chain_next, my_addr))
+            let seed: [u8; 32] = match crate::ledger::load_seed() {
+                Ok(Some(b)) if b.len() == 32 => {
+                    let mut a = [0u8; 32]; a.copy_from_slice(&b); a
+                }
+                _ => return None,
+            };
+            Some((chain_next, my_addr, seed))
         }).await.unwrap_or(None);
-        let (chain_next, my_addr) = match view_init {
+        let (chain_next, my_addr, seed_32) = match view_init {
             Some(v) => v,
             None    => continue,
         };
@@ -6790,8 +6807,11 @@ pub async fn run_view_change_monitor() {
         eprintln!("[HotStuff] Proposal timeout — broadcasting ViewChange for view {}", next_view);
 
         let vote_data = format!("viewchange:{}:{}", next_view, my_addr);
-        let sig       = bft_sign(&vote_data).unwrap_or_default();
-        let ts        = now;
+        let sig = {
+            use ed25519_dalek::{SigningKey, Signer};
+            hex::encode(SigningKey::from_bytes(&seed_32).sign(vote_data.as_bytes()).to_bytes())
+        };
+        let ts = now;
 
         let msg = P2PMessage::ViewChange { view: next_view, voter: my_addr.clone(), signature: sig, timestamp: ts };
         if let Ok(data) = serde_json::to_vec(&msg) {
