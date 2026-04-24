@@ -2642,7 +2642,7 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
             }
 
             _ = dht_inbox_poll.tick() => {
-                let app2 = app.cloned();
+                let app2: Option<tauri::AppHandle<tauri::Wry>> = app.as_ref().cloned();
                 tokio::spawn(async move {
                     const TRANSFER_TIMEOUT_SECS: i64 = 600;
                     let now = chrono::Utc::now().timestamp();
@@ -2692,7 +2692,7 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                             }
                         }
                         let _ = tokio::task::spawn_blocking(move || ledger2.save()).await;
-                        if let Some(ref h) = app2 {
+                        if let Some(h) = app2.as_ref() {
                             for cid in &timed_out {
                                 let _ = h.emit_all("ego://file-failed", serde_json::json!({ "cid": cid }));
                             }
