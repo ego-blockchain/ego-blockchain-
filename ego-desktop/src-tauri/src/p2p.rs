@@ -5744,17 +5744,19 @@ async fn handle_block_proposal(
     proposer: String,
     app: Option<&tauri::AppHandle<tauri::Wry>>,
 ) {
-    let my_addr = crate::ledger::Ledger::load().address;
+    let (my_addr, seed_arr_opt) = match tokio::task::spawn_blocking(|| {
+        let addr = crate::ledger::Ledger::load().address;
+        let seed: Option<[u8; 32]> = crate::ledger::load_seed().ok().flatten().and_then(|b| {
+            if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) } else { None }
+        });
+        (addr, seed)
+    }).await.unwrap_or_default();
     if my_addr.is_empty() { return; }
-
     if my_addr == proposer { return; }
-
-    let seed_bytes = match crate::ledger::load_seed() {
-        Ok(Some(b)) if b.len() == 32 => b,
-        _ => return,
+    let seed_arr = match seed_arr_opt {
+        Some(s) => s,
+        None    => return,
     };
-    let mut seed_arr = [0u8; 32];
-    seed_arr.copy_from_slice(&seed_bytes);
 
     let vrf_in  = crate::bft_committee::vrf_input(&block.prev_hash, block.height, crate::bft_committee::VRF_ROLE_COMMITTEE);
     let ticket  = crate::bft_committee::sign_vrf_ticket(&seed_arr, &vrf_in);
@@ -5907,9 +5909,9 @@ async fn handle_block_proposal(
 
     // ── 9. Sign and broadcast vote ─────────────────────────────────────────────
     let vote_data = crate::bft_committee::vote_signing_data(&block.hash, block.height, &my_addr);
-    let signature = match bft_sign(&vote_data) {
-        Some(s) => s,
-        None    => { eprintln!("[BFT] Cannot sign vote — no key"); return; }
+    let signature = {
+        use ed25519_dalek::{SigningKey, Signer};
+        hex::encode(SigningKey::from_bytes(&seed_arr).sign(vote_data.as_bytes()).to_bytes())
     };
     let vrf_ticket_hex = hex::encode(&ticket);
 
@@ -6336,10 +6338,13 @@ async fn handle_view_change_msg(view: u64, voter: String) {
     if !known_validators().contains(&voter) { return; }
     let threshold = bft_threshold().max(1);
 
-    let (my_addr, block_count_now) = match tokio::task::spawn_blocking(|| {
+    let (my_addr, block_count_now, seed_32_opt) = match tokio::task::spawn_blocking(|| {
         let addr  = crate::ledger::Ledger::load().address;
         let count = crate::chain_db::block_count();
-        (addr, count)
+        let seed: Option<[u8; 32]> = crate::ledger::load_seed().ok().flatten().and_then(|b| {
+            if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) } else { None }
+        });
+        (addr, count, seed)
     }).await {
         Ok(v)  => v,
         Err(_) => return,
@@ -6362,7 +6367,12 @@ async fn handle_view_change_msg(view: u64, voter: String) {
                     }
                 }
                 let vote_data = format!("viewchange:{}:{}", view, my_addr);
-                let sig = bft_sign(&vote_data).unwrap_or_default();
+                let sig = if let Some(seed_32) = seed_32_opt {
+                    use ed25519_dalek::{SigningKey, Signer};
+                    hex::encode(SigningKey::from_bytes(&seed_32).sign(vote_data.as_bytes()).to_bytes())
+                } else {
+                    String::new()
+                };
                 let ts  = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -6525,7 +6535,10 @@ pub async fn propose_block_as_leader() {
     }
 
     let sig_data  = format!("proposal:{}:{}", block.hash, block.height);
-    let signature = bft_sign(&sig_data).unwrap_or_default();
+    let signature = {
+        use ed25519_dalek::{SigningKey, Signer};
+        hex::encode(SigningKey::from_bytes(&seed_32).sign(sig_data.as_bytes()).to_bytes())
+    };
 
     let proposal = P2PMessage::BlockProposal {
         block:        block.clone(),
@@ -6543,7 +6556,11 @@ pub async fn propose_block_as_leader() {
     let committee_ticket     = crate::bft_committee::sign_vrf_ticket(&seed_32, &committee_vrf_in);
     let committee_ticket_hex = hex::encode(&committee_ticket);
     let self_vote_data       = crate::bft_committee::vote_signing_data(&block.hash, block.height, &miner);
-    if let Some(self_sig) = bft_sign(&self_vote_data) {
+    {
+        let self_sig = {
+            use ed25519_dalek::{SigningKey, Signer};
+            hex::encode(SigningKey::from_bytes(&seed_32).sign(self_vote_data.as_bytes()).to_bytes())
+        };
         let should_persist = {
             let mut pv  = pending_votes();
             let voters  = pv.entry(block.hash.clone()).or_default();
@@ -6674,7 +6691,10 @@ pub async fn propose_block_as_leader_forced() {
     }
 
     let sig_data  = format!("proposal:{}:{}", block.hash, block.height);
-    let signature = bft_sign(&sig_data).unwrap_or_default();
+    let signature = {
+        use ed25519_dalek::{SigningKey, Signer};
+        hex::encode(SigningKey::from_bytes(&seed_32).sign(sig_data.as_bytes()).to_bytes())
+    };
 
     let proposal = P2PMessage::BlockProposal {
         block:        block.clone(),
@@ -6692,7 +6712,11 @@ pub async fn propose_block_as_leader_forced() {
     let committee_ticket     = crate::bft_committee::sign_vrf_ticket(&seed_32, &committee_vrf_in);
     let committee_ticket_hex = hex::encode(&committee_ticket);
     let self_vote_data       = crate::bft_committee::vote_signing_data(&block.hash, block.height, &miner);
-    if let Some(self_sig) = bft_sign(&self_vote_data) {
+    {
+        let self_sig = {
+            use ed25519_dalek::{SigningKey, Signer};
+            hex::encode(SigningKey::from_bytes(&seed_32).sign(self_vote_data.as_bytes()).to_bytes())
+        };
         let should_persist = {
             let mut pv  = pending_votes();
             let voters  = pv.entry(block.hash.clone()).or_default();
