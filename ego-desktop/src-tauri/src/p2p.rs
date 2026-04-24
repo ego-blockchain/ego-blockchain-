@@ -1634,7 +1634,8 @@ pub async fn broadcast_pending_tx(tx: LedgerTx) {
 
 pub async fn sync_chain_from_peers() {
     let my_endpoint = get_public_endpoint().await;
-    let my_height   = crate::chain_db::latest_block_info().0;
+    let my_height = tokio::task::spawn_blocking(|| crate::chain_db::latest_block_info().0)
+        .await.unwrap_or(0);
     let msg = P2PMessage::ChainSyncRequest { requester_endpoint: my_endpoint.clone(), from_height: my_height };
 
     if let Ok(data) = serde_json::to_vec(&msg) {
@@ -1667,11 +1668,15 @@ pub async fn sync_chain_from_peers() {
 }
 
 pub async fn broadcast_peer_announce(app: Option<&tauri::AppHandle<tauri::Wry>>) {
-    let address = crate::ledger::Ledger::load().address.clone();
+    let (address, registry, active_id) = tokio::task::spawn_blocking(|| {
+        (
+            crate::ledger::Ledger::load().address,
+            crate::ledger::load_registry(),
+            crate::ledger::get_active_wallet_id(),
+        )
+    }).await.unwrap_or_default();
     if address.is_empty() { return; }
     let my_endpoint = get_public_endpoint().await;
-    let registry  = crate::ledger::load_registry();
-    let active_id = crate::ledger::get_active_wallet_id();
     let name = registry.wallets.iter()
         .find(|w| w.id == active_id)
         .map(|w| w.name.clone())
@@ -5386,11 +5391,11 @@ async fn merge_remote_chain_trusted(
     merge_remote_chain_inner(blocks, transactions, app, true).await;
 }
 
-async fn merge_remote_chain_inner(
-    mut blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: Option<&tauri::AppHandle<tauri::Wry>>,
+fn merge_remote_chain_blocking(
+    mut blocks: Vec<LedgerBlock>,
+    transactions: Vec<LedgerTx>,
     trusted: bool,
-) {
-
+) -> bool {
     let mut new_txs: Vec<LedgerTx> = Vec::new();
     let mut new_blocks: Vec<LedgerBlock> = Vec::new();
 
@@ -5420,14 +5425,8 @@ async fn merge_remote_chain_inner(
                         "[Oracle] Chain stuck for {}s — overriding hard-finality at height {} to adopt oracle fork",
                         stuck_secs, dh
                     );
-                    {
-                        let mut hf = hard_finalized_heights();
-                        hf.retain(|&h| h < dh);
-                    }
-                    {
-                        let mut fa = finalized_at_height();
-                        fa.retain(|&h, _| h < dh);
-                    }
+                    { hard_finalized_heights().retain(|&h| h < dh); }
+                    { finalized_at_height().retain(|&h, _| h < dh); }
                     crate::chain_db::truncate_from(dh);
                 } else {
                     eprintln!(
@@ -5448,40 +5447,36 @@ async fn merge_remote_chain_inner(
             }
         }
     } else {
+        for block in blocks {
+            if block.height == 0 { continue; }
 
-    for block in blocks {
-        if block.height == 0 { continue; }
-
-
-        if block.height > 0 {
-            let parent_height = block.height - 1;
-            let expected_prev = if parent_height == 0 {
-                crate::ledger::GENESIS_HASH.to_string()
-            } else if let Some(parent) = crate::chain_db::get_block_by_height(parent_height) {
-                parent.hash.clone()
-            } else {
-                block.prev_hash.clone()
-            };
-            if block.prev_hash != expected_prev {
-                let our_tip = crate::chain_db::block_count();
-                if block.height > our_tip {
-                    eprintln!(
-                        "[P2P] Fork detected at #{}: remote is ahead ({} > {}), triggering resync",
-                        block.height, block.height, our_tip
-                    );
+            if block.height > 0 {
+                let parent_height = block.height - 1;
+                let expected_prev = if parent_height == 0 {
+                    crate::ledger::GENESIS_HASH.to_string()
+                } else if let Some(parent) = crate::chain_db::get_block_by_height(parent_height) {
+                    parent.hash.clone()
                 } else {
-                    eprintln!(
-                        "[P2P] Block #{} rejected: prev_hash mismatch (got {} expected {})",
-                        block.height,
-                        &block.prev_hash[..8.min(block.prev_hash.len())],
-                        &expected_prev[..8.min(expected_prev.len())]
-                    );
+                    block.prev_hash.clone()
+                };
+                if block.prev_hash != expected_prev {
+                    let our_tip = crate::chain_db::block_count();
+                    if block.height > our_tip {
+                        eprintln!(
+                            "[P2P] Fork detected at #{}: remote is ahead ({} > {}), triggering resync",
+                            block.height, block.height, our_tip
+                        );
+                    } else {
+                        eprintln!(
+                            "[P2P] Block #{} rejected: prev_hash mismatch (got {} expected {})",
+                            block.height,
+                            &block.prev_hash[..8.min(block.prev_hash.len())],
+                            &expected_prev[..8.min(expected_prev.len())]
+                        );
+                    }
+                    continue;
                 }
-                continue;
             }
-        }
-
-        {
 
             let base_reward = crate::tokenomics::block_reward_at(block.height);
             let reward_ok = block.reward == 0 || block.reward >= base_reward;
@@ -5505,8 +5500,6 @@ async fn merge_remote_chain_inner(
         }
     }
 
-    } // end else (untrusted path)
-
     for tx in transactions {
         let verify_result = if tx.block_height.is_some() {
             crate::ledger::verify_confirmed_tx_sig(&tx)
@@ -5514,12 +5507,12 @@ async fn merge_remote_chain_inner(
             crate::ledger::verify_incoming_tx(&tx)
         };
         match verify_result {
-            Ok(())       => new_txs.push(tx),
-            Err(reason)  => eprintln!("[P2P] Sync TX {} rejected — {}", tx.hash, reason),
+            Ok(())      => new_txs.push(tx),
+            Err(reason) => eprintln!("[P2P] Sync TX {} rejected — {}", tx.hash, reason),
         }
     }
 
-    if new_blocks.is_empty() && new_txs.is_empty() { return; }
+    if new_blocks.is_empty() && new_txs.is_empty() { return false; }
 
     for block in &new_blocks {
         let block_txs: Vec<LedgerTx> = new_txs.iter()
@@ -5543,16 +5536,28 @@ async fn merge_remote_chain_inner(
             && !tx.hash.is_empty()
             && crate::chain_db::get_tx_by_hash(&tx.hash).is_none()
             && !new_blocks.iter().any(|b| Some(b.height) == tx.block_height);
-        if is_user_tx {
-            pool.push(tx.clone());
-        }
+        if is_user_tx { pool.push(tx.clone()); }
     }
 
     if let Some(tip) = new_blocks.iter().max_by_key(|b| b.height) {
         crate::rpc::notify_new_block(tip);
     }
-    if let Some(h) = app {
-        let _ = h.emit_all("ego://chain-updated", ());
+
+    true
+}
+
+async fn merge_remote_chain_inner(
+    blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: Option<&tauri::AppHandle<tauri::Wry>>,
+    trusted: bool,
+) {
+    let any_new = tokio::task::spawn_blocking(move || {
+        merge_remote_chain_blocking(blocks, transactions, trusted)
+    }).await.unwrap_or(false);
+
+    if any_new {
+        if let Some(h) = app {
+            let _ = h.emit_all("ego://chain-updated", ());
+        }
     }
 }
 
