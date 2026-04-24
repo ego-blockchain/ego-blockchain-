@@ -222,7 +222,13 @@ pub async fn get_network_capacity() -> NetworkCapacity {
 
 #[tauri::command]
 pub async fn get_state_stats() -> crate::chain_db::StateStats {
-    crate::chain_db::get_state_stats()
+    tokio::task::spawn_blocking(crate::chain_db::get_state_stats)
+        .await
+        .unwrap_or(crate::chain_db::StateStats {
+            total_accounts: 0,
+            total_supply_uegoc: 0,
+            db_size_estimate_mb: 0.0,
+        })
 }
 
 #[derive(serde::Serialize)]

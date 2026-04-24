@@ -192,6 +192,31 @@ fn maybe_record_poc_event(status: &CoverageStatus) {
 // Why 60 s?  PoC events require 240 s between them, so 60 s gives us
 // 4 checks per window — enough resolution without hammering the relay.
 pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
+    let machine_id = tokio::task::spawn_blocking(cached_machine_id)
+        .await
+        .unwrap_or_default();
+
+    // Publish an immediate placeholder so CoveragePage has something real to
+    // render before relay/IP discovery completes.
+    {
+        let state = app.state::<AppState>();
+        let node_active = tokio::task::spawn_blocking(|| !crate::ledger::Ledger::load().address.is_empty())
+            .await
+            .unwrap_or(false);
+        let placeholder = CoverageStatus {
+            location:              None,
+            coverage_synced_count: 0,
+            last_coverage_event:   None,
+            is_online:             node_active,
+            network_quality:       if node_active { NetworkQuality::Fair } else { NetworkQuality::Offline },
+            vpn_detected:          false,
+            vpn_reason:            String::new(),
+            machine_id:            machine_id.clone(),
+        };
+        state.update_coverage_status(placeholder);
+    }
+    let _ = app.emit_all("ego://coverage-updated", ());
+
     // Wait for relay circuit to be confirmed before first probe.
     tokio::time::sleep(std::time::Duration::from_secs(8)).await;
 
@@ -202,13 +227,12 @@ pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
     let mut vpn_reason   = init_reason;
     let mut last_ip      = init_ip;
 
-    // Store initial state in AppState.
     {
         let state = app.state::<AppState>();
-        let machine_id  = cached_machine_id();
-        let ledger      = crate::ledger::Ledger::load();
-        let node_active = !ledger.address.is_empty();
-        let is_online   = node_active && !vpn_detected;
+        let node_active = tokio::task::spawn_blocking(|| !crate::ledger::Ledger::load().address.is_empty())
+            .await
+            .unwrap_or(false);
+        let is_online = node_active && !vpn_detected;
         let placeholder = CoverageStatus {
             location:              location.clone(),
             coverage_synced_count: 0,
@@ -217,10 +241,11 @@ pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
             network_quality:       if is_online { NetworkQuality::Fair } else { NetworkQuality::Offline },
             vpn_detected,
             vpn_reason:            vpn_reason.clone(),
-            machine_id,
+            machine_id:            machine_id.clone(),
         };
         state.update_coverage_status(placeholder);
     }
+    let _ = app.emit_all("ego://coverage-updated", ());
 
     // Re-check VPN every tick (60 s). Catches enabling/disabling VPN while the app is open.
     let mut tick: u32 = 0;
@@ -265,10 +290,10 @@ async fn tick_coverage(
 ) {
     let state = app.state::<AppState>();
 
-    let ledger      = crate::ledger::Ledger::load();
-    let node_active = !ledger.address.is_empty();
-    let machine_id  = cached_machine_id();
-    let is_online   = node_active && !vpn_detected;
+    let (node_active, machine_id) = tokio::task::spawn_blocking(|| {
+        (!crate::ledger::Ledger::load().address.is_empty(), cached_machine_id())
+    }).await.unwrap_or((false, String::new()));
+    let is_online = node_active && !vpn_detected;
 
     // ── Step 1: probe known peers from relay directory ─────────────────────
     // Fetches latest endpoints from relay HTTP API and sends each peer a
@@ -378,13 +403,14 @@ pub async fn get_coverage_status(
         return Ok(status);
     }
 
-    let ledger     = crate::ledger::Ledger::load();
-    let machine_id = cached_machine_id();
+    let (node_active, machine_id) = tokio::task::spawn_blocking(|| {
+        (!crate::ledger::Ledger::load().address.is_empty(), cached_machine_id())
+    }).await.unwrap_or((false, String::new()));
     Ok(CoverageStatus {
         location:              None,
         coverage_synced_count: 0,
         last_coverage_event:   None,
-        is_online:             !ledger.address.is_empty(),
+        is_online:             node_active,
         network_quality:       NetworkQuality::Fair,
         vpn_detected:          false,
         vpn_reason:            String::new(),
