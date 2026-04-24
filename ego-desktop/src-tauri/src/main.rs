@@ -113,6 +113,7 @@ fn headless_main() {
     tracing::info!("All GUI components disabled — blockchain services only");
 
     crate::app::init_global_app_state(std::sync::Arc::new(crate::app::AppState::new()));
+    crate::p2p::prime_ed25519_seed_cache();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -257,6 +258,8 @@ fn main() {
     if !acquire_single_instance_lock() {
         std::process::exit(0);
     }
+
+    crate::p2p::prime_ed25519_seed_cache();
 
     let quit = CustomMenuItem::new("quit".to_string(), "Quit");
     let hide = CustomMenuItem::new("hide".to_string(), "Hide");

@@ -89,16 +89,10 @@ fn compute_ticket(slot_seed: &[u8; 32]) -> Option<([u8; 32], String)> {
         return Some((ticket, sig_hex));
     }
 
-    let seed_bytes = crate::ledger::load_seed().ok().flatten()?;
-    if seed_bytes.len() < 32 {
-        return None;
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&seed_bytes[..32]);
+    let seed = crate::p2p::get_ed25519_seed()?;
 
     use ed25519_dalek::{Signer, SigningKey};
-    let signing_key = SigningKey::from_bytes(&seed);
-    let sig = signing_key.sign(slot_seed);
+    let sig = SigningKey::from_bytes(&seed).sign(slot_seed);
     let sig_bytes = sig.to_bytes();
     let sig_hex = hex::encode(sig_bytes);
     let ticket = *blake3::hash(&sig_bytes).as_bytes();

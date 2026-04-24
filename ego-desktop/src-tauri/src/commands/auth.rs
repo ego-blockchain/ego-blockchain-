@@ -173,12 +173,10 @@ fn pq_cache_path() -> std::path::PathBuf {
 pub fn ensure_pq_cache() {
     let cache = pq_cache_path();
     if cache.exists() { return; }
-    let seed_bytes = match crate::ledger::load_seed() {
-        Ok(Some(b)) => b,
-        _ => return,
+    let seed = match crate::p2p::get_ed25519_seed() {
+        Some(s) => s,
+        None    => return,
     };
-    let mut seed = [0u8; 32];
-    if seed_bytes.len() >= 32 { seed.copy_from_slice(&seed_bytes[..32]); }
     eprintln!("[KeyGen] Warming PQ key cache…");
     if let Ok(kp) = KeyPair::from_bytes(&seed) {
         if let Ok(encoded) = kp.to_pq_cache() {
