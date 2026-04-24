@@ -294,90 +294,104 @@ pub async fn get_combined_drs() -> Result<CombinedDrsScore, EgoDesktopError> {
 
 #[tauri::command]
 pub async fn get_tokenomics() -> Result<serde_json::Value, EgoDesktopError> {
-    use crate::tokenomics::{
-        TOTAL_SUPPLY_EGOC, HALVING_INTERVAL, INITIAL_BLOCK_REWARD_UEGOC, UEGOC_PER_EGOC,
-        BLOCK_EMISSION_EGOC, NODE_POOL_EGOC, STAKING_POOL_EGOC, ECOSYSTEM_EGOC, FOUNDATION_EGOC,
-        STAKING_APR_BPS, block_reward_at, staking_pool_remaining_uegoc, node_pool_remaining_uegoc,
-    };
+    tokio::task::spawn_blocking(|| {
+        use crate::tokenomics::{
+            TOTAL_SUPPLY_EGOC, HALVING_INTERVAL, UEGOC_PER_EGOC, BLOCK_EMISSION_EGOC,
+            NODE_POOL_EGOC, STAKING_POOL_EGOC, ECOSYSTEM_EGOC, FOUNDATION_EGOC,
+            STAKING_APR_BPS, block_reward_at, staking_pool_remaining_uegoc,
+            node_pool_remaining_uegoc,
+        };
 
-    let total_blocks = crate::chain_db::block_count();
+        let total_blocks = crate::chain_db::block_count();
+        let era: u64 = total_blocks / HALVING_INTERVAL;
+        let current_reward = block_reward_at(total_blocks) as f64 / UEGOC_PER_EGOC as f64;
+        let blocks_to_next = HALVING_INTERVAL - (total_blocks % HALVING_INTERVAL);
 
-    let era: u64 = total_blocks / HALVING_INTERVAL;
-    let current_reward = block_reward_at(total_blocks) as f64 / UEGOC_PER_EGOC as f64;
-    let blocks_to_next = HALVING_INTERVAL - (total_blocks % HALVING_INTERVAL);
+        let chain = crate::ledger::load_chain();
+        let circulating_uegoc: u64 = chain.blocks.iter().map(|b| b.reward).sum();
+        let circulating_egoc = circulating_uegoc / UEGOC_PER_EGOC;
+        let circulating_pct = if TOTAL_SUPPLY_EGOC > 0 {
+            ((circulating_egoc as f64 / TOTAL_SUPPLY_EGOC as f64) * 100.0 * 100.0).round() / 100.0
+        } else {
+            0.0
+        };
 
-    let chain = crate::ledger::load_chain();
-    let circulating_uegoc: u64 = chain.blocks.iter()
-        .map(|b| b.reward)
-        .sum();
-    let circulating_egoc = circulating_uegoc / UEGOC_PER_EGOC;
-    let circulating_pct  = if TOTAL_SUPPLY_EGOC > 0 {
-        ((circulating_egoc as f64 / TOTAL_SUPPLY_EGOC as f64) * 100.0 * 100.0).round() / 100.0
-    } else { 0.0 };
+        let node_pool_remaining = node_pool_remaining_uegoc(&chain) / UEGOC_PER_EGOC;
+        let staking_pool_remaining = staking_pool_remaining_uegoc(&chain) / UEGOC_PER_EGOC;
 
-    let node_pool_remaining  = node_pool_remaining_uegoc(&chain) / UEGOC_PER_EGOC;
-    let staking_pool_remaining = staking_pool_remaining_uegoc(&chain) / UEGOC_PER_EGOC;
+        let ledger = crate::ledger::Ledger::load();
+        let total_staked_egoc = ledger.staked_amount / UEGOC_PER_EGOC;
 
-    let ledger = crate::ledger::Ledger::load();
-    let total_staked_egoc = ledger.staked_amount / UEGOC_PER_EGOC;
+        let next_halving_at = (era + 1) * HALVING_INTERVAL;
+        let foundation_uegoc = FOUNDATION_EGOC * UEGOC_PER_EGOC;
+        let emission_uegoc = BLOCK_EMISSION_EGOC * UEGOC_PER_EGOC;
+        let node_pool_uegoc = NODE_POOL_EGOC * UEGOC_PER_EGOC;
+        let staking_uegoc = STAKING_POOL_EGOC * UEGOC_PER_EGOC;
+        let ecosystem_uegoc = ECOSYSTEM_EGOC * UEGOC_PER_EGOC;
 
-    let next_halving_at = (era + 1) * HALVING_INTERVAL;
+        Ok::<_, EgoDesktopError>(serde_json::json!({
+            "total_supply_egoc":          TOTAL_SUPPLY_EGOC,
+            "circulating_egoc":           circulating_egoc,
+            "circulating_pct":            circulating_pct,
+            "block_rewards_issued_uegoc": circulating_uegoc,
 
-    let foundation_uegoc  = FOUNDATION_EGOC  * UEGOC_PER_EGOC;
-    let emission_uegoc    = BLOCK_EMISSION_EGOC * UEGOC_PER_EGOC;
-    let node_pool_uegoc   = NODE_POOL_EGOC   * UEGOC_PER_EGOC;
-    let staking_uegoc     = STAKING_POOL_EGOC * UEGOC_PER_EGOC;
-    let ecosystem_uegoc   = ECOSYSTEM_EGOC   * UEGOC_PER_EGOC;
+            "emission_pools": {
+                "genesis":       { "cap_uegoc": foundation_uegoc,  "pct": 15 },
+                "block_rewards": { "cap_uegoc": emission_uegoc,    "pct": 21 },
+                "storage":       { "cap_uegoc": node_pool_uegoc,   "pct": 30 },
+                "coverage":      { "cap_uegoc": staking_uegoc,     "pct": 14 },
+                "ecosystem":     { "cap_uegoc": ecosystem_uegoc,   "pct": 20 },
+            },
 
-    Ok(serde_json::json!({
-        "total_supply_egoc":          TOTAL_SUPPLY_EGOC,
-        "circulating_egoc":           circulating_egoc,
-        "circulating_pct":            circulating_pct,
-        "block_rewards_issued_uegoc": circulating_uegoc,
+            "pools": {
+                "node_pool_remaining_egoc":    node_pool_remaining,
+                "staking_pool_remaining_egoc": staking_pool_remaining,
+            },
 
-        "emission_pools": {
-            "genesis":       { "cap_uegoc": foundation_uegoc,  "pct": 15 },
-            "block_rewards": { "cap_uegoc": emission_uegoc,    "pct": 21 },
-            "storage":       { "cap_uegoc": node_pool_uegoc,   "pct": 30 },
-            "coverage":      { "cap_uegoc": staking_uegoc,     "pct": 14 },
-            "ecosystem":     { "cap_uegoc": ecosystem_uegoc,   "pct": 20 },
-        },
+            "halving": {
+                "era":                    era,
+                "interval_blocks":        HALVING_INTERVAL,
+                "current_reward_egoc":    current_reward,
+                "blocks_to_next_halving": blocks_to_next,
+                "next_halving_at_block":  next_halving_at,
+                "max_block_height":       total_blocks,
+            },
 
-        "pools": {
-            "node_pool_remaining_egoc":    node_pool_remaining,
-            "staking_pool_remaining_egoc": staking_pool_remaining,
-        },
+            "staking": {
+                "apr_pct":           STAKING_APR_BPS as f64 / 100.0,
+                "total_staked_egoc": total_staked_egoc,
+                "active_stakers":    if ledger.staked_amount > 0 { 1u64 } else { 0u64 }
+            },
 
-        "halving": {
-            "era":                    era,
-            "interval_blocks":        HALVING_INTERVAL,
-            "current_reward_egoc":    current_reward,
-            "blocks_to_next_halving": blocks_to_next,
-            "next_halving_at_block":  next_halving_at,
-            "max_block_height":       total_blocks,
-        },
-
-        "staking": {
-            "apr_pct":           STAKING_APR_BPS as f64 / 100.0,
-            "total_staked_egoc": total_staked_egoc,
-            "active_stakers":    if ledger.staked_amount > 0 { 1u64 } else { 0u64 }
-        },
-
-        "drs": {
-            "min_drs_to_mine": 0.5,
-            "weights": { "poc": 0.6, "post": 0.4, "stake": 0.0 }
-        }
-    }))
+            "drs": {
+                "min_drs_to_mine": 0.5,
+                "weights": { "poc": 0.6, "post": 0.4, "stake": 0.0 }
+            }
+        }))
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 fn sign_payload(data: &[u8]) -> Option<(String, String)> {
+    if let Some(kp) = crate::app::global_app_state().get_keypair() {
+        let sig = kp.sign_ed25519(data);
+        let pk = hex::encode(kp.ed25519_public_key().as_bytes());
+        return Some((hex::encode(sig.as_bytes()), pk));
+    }
+
     let seed_bytes = crate::ledger::load_seed().ok().flatten()?;
+    if seed_bytes.len() < 32 {
+        return None;
+    }
     let mut seed = [0u8; 32];
-    seed.copy_from_slice(&seed_bytes);
-    let kp  = ego_core::KeyPair::from_bytes(&seed).ok()?;
-    let sig = kp.sign_ed25519(data);
-    let pk  = hex::encode(kp.ed25519_public_key().as_bytes());
-    Some((hex::encode(sig.as_bytes()), pk))
+    seed.copy_from_slice(&seed_bytes[..32]);
+
+    use ed25519_dalek::{Signer, SigningKey};
+    let signing_key = SigningKey::from_bytes(&seed);
+    let sig = signing_key.sign(data);
+    let pk = hex::encode(signing_key.verifying_key().as_bytes());
+    Some((hex::encode(sig.to_bytes()), pk))
 }
 
 fn update_post_status(cid: &str, status: &str, proved_at: Option<i64>) {
