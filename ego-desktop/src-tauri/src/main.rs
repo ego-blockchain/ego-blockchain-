@@ -259,8 +259,6 @@ fn main() {
         std::process::exit(0);
     }
 
-    crate::p2p::prime_ed25519_seed_cache();
-
     let quit = CustomMenuItem::new("quit".to_string(), "Quit");
     let hide = CustomMenuItem::new("hide".to_string(), "Hide");
     let show = CustomMenuItem::new("show".to_string(), "Show");
@@ -576,6 +574,7 @@ fn main() {
             });
 
             std::thread::spawn(|| {
+                crate::p2p::prime_ed25519_seed_cache();
                 crate::commands::auth::ensure_pq_cache();
             });
 
