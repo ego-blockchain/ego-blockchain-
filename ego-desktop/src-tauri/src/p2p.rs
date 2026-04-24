@@ -5521,8 +5521,14 @@ fn merge_remote_chain_blocking(
                     );
                 }
             } else {
-                eprintln!("[Oracle] Reorg: local chain diverges at height {} — truncating and adopting oracle chain", dh);
-                crate::chain_db::truncate_from(dh);
+                let oracle_max = blocks.iter().filter(|b| b.height > 0).map(|b| b.height).max().unwrap_or(0);
+                let local_max  = crate::chain_db::block_count() as u64;
+                if oracle_max > local_max {
+                    eprintln!("[Oracle] Reorg: oracle ahead ({} > {}) — truncating from height {} and adopting oracle chain", oracle_max, local_max, dh);
+                    crate::chain_db::truncate_from(dh);
+                } else {
+                    eprintln!("[Oracle] Reorg skipped at height {} — oracle has {} blocks vs our {} (keeping local chain)", dh, oracle_max, local_max);
+                }
             }
         }
 
@@ -5614,6 +5620,7 @@ fn merge_remote_chain_blocking(
             advance_view(synced_view);
             eprintln!("[Sync] View advanced to {} after syncing to block #{}", synced_view, max_height);
         }
+        touch_proposal_timestamp();
     }
 
     let pool = crate::mempool::get_mempool();
