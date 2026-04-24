@@ -79,6 +79,16 @@ fn record_peer_commitment(cid: &str, prover_addr: &str, comm_r: &str, signature:
 
 pub static DHT_CMD_TX: OnceLock<mpsc::Sender<DhtCommand>> = OnceLock::new();
 
+static SEED_CACHE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
+
+pub fn prime_ed25519_seed_cache() {
+    SEED_CACHE.get_or_init(|| {
+        crate::ledger::load_seed().ok().flatten().and_then(|b| {
+            if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) } else { None }
+        })
+    });
+}
+
 #[derive(Debug)]
 pub enum DhtCommand {
     PutPeer { key: String, value: Vec<u8> },
@@ -5725,7 +5735,7 @@ pub async fn fetch_chain_from_oracle(app: Option<&tauri::AppHandle<tauri::Wry>>)
 }
 
 
-fn get_ed25519_seed() -> Option<[u8; 32]> {
+pub(crate) fn get_ed25519_seed() -> Option<[u8; 32]> {
     if let Some(kp) = crate::app::global_app_state().get_keypair() {
         let sk = kp.get_ed25519_secret_key();
         if sk.len() == 32 {
@@ -5734,9 +5744,10 @@ fn get_ed25519_seed() -> Option<[u8; 32]> {
             return Some(a);
         }
     }
-    crate::ledger::load_seed().ok().flatten().and_then(|b| {
-        if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) } else { None }
-    })
+    if let Some(cached) = SEED_CACHE.get() {
+        return *cached;
+    }
+    None
 }
 
 fn bft_sign(data: &str) -> Option<String> {
@@ -6903,14 +6914,8 @@ pub async fn register_porep_commitment(
     if cid.is_empty() || comm_r.is_empty() || prover_addr.is_empty() { return; }
 
     let sign_input = format!("porep:{}:{}:{}", prover_addr, cid, comm_r);
-    let signature = crate::ledger::load_seed()
-        .ok()
-        .flatten()
-        .and_then(|s| {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&s[..32]);
-            ego_core::KeyPair::from_bytes(&arr).ok()
-        })
+    let signature = get_ed25519_seed()
+        .and_then(|s| ego_core::KeyPair::from_bytes(&s).ok())
         .map(|kp| hex::encode(kp.sign_ed25519(sign_input.as_bytes()).as_bytes()))
         .unwrap_or_default();
 
