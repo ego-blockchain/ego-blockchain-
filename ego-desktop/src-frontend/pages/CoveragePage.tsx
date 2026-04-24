@@ -430,7 +430,7 @@ const CoveragePage: React.FC = () => {
   const [p2pStatus,  setP2pStatus]  = useState<P2pStatus | null>(null);
   const [loading,    setLoading]    = useState(true);
 
-  const withTimeout = <T,>(promise: Promise<T>, fallback: T, ms = 5_000): Promise<T> =>
+  const withTimeout = <T,>(promise: Promise<T>, fallback: T, ms = 15_000): Promise<T> =>
     Promise.race([promise, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
 
   function fallbackCoverage(): CoverageStatus {

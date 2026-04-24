@@ -563,11 +563,15 @@ fn main() {
             commands::l2::challenge_rollup_batch
         ])
         .setup(|app| {
-            // Warm the PQ key cache in background. chain_db is intentionally NOT
-            // opened here — the startup task calls restore_in_memory_state_from_db
-            // on a tokio thread, and opening RocksDB concurrently from a plain
-            // std::thread would block that tokio thread on OnceLock::get_or_init,
-            // starving the runtime and causing "Not Responding" on Windows.
+            // Pre-warm RocksDB so the first frontend commands don't hit the
+            // 2-8s cold-open delay on Windows. All chain_db calls in Tauri
+            // commands are now in spawn_blocking, so this std::thread blocking
+            // on OnceLock::get_or_init is safe — no async tokio worker threads
+            // are involved and the blocking thread pool can wait.
+            std::thread::spawn(|| {
+                let _ = crate::chain_db::get_db();
+            });
+
             std::thread::spawn(|| {
                 crate::commands::auth::ensure_pq_cache();
             });

@@ -153,7 +153,7 @@ const ExplorerPage: React.FC = () => {
     loadingRef.current = true;
     if (!silent) setLoading(true);
 
-    const withTimeout = <T,>(p: Promise<T>, fallback: T, ms = 5_000): Promise<T> =>
+    const withTimeout = <T,>(p: Promise<T>, fallback: T, ms = 15_000): Promise<T> =>
       Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
 
     try {
