@@ -66,17 +66,23 @@ pub async fn submit_governance_vote(
 }
 
 #[tauri::command]
-pub fn get_governance_proposals() -> Result<Vec<GovernanceProposal>, EgoDesktopError> {
-    Ok(crate::chain_db::get_all_governance_proposals())
+pub async fn get_governance_proposals() -> Result<Vec<GovernanceProposal>, EgoDesktopError> {
+    tokio::task::spawn_blocking(|| Ok::<_, EgoDesktopError>(crate::chain_db::get_all_governance_proposals()))
+        .await
+        .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 #[tauri::command]
-pub fn is_feature_active(feature: String, action: String) -> bool {
-    match action.as_str() {
-        "enable"  => crate::chain_db::is_feature_enabled(&feature),
-        "disable" => crate::chain_db::is_feature_disabled(&feature),
-        _         => false,
-    }
+pub async fn is_feature_active(feature: String, action: String) -> Result<bool, EgoDesktopError> {
+    tokio::task::spawn_blocking(move || {
+        Ok::<_, EgoDesktopError>(match action.as_str() {
+            "enable"  => crate::chain_db::is_feature_enabled(&feature),
+            "disable" => crate::chain_db::is_feature_disabled(&feature),
+            _         => false,
+        })
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 // ── DAO Proposal System ────────────────────────────────────────────────────────
@@ -123,11 +129,17 @@ pub async fn create_dao_proposal(
     // Enforce 4-hour sliding window rate limit (max 5 proposals per window)
     let now_ts_val = now_ts();
     let window_start = now_ts_val - WINDOW_SECS;
-    let all = list_dao_proposals(Some("all"), None);
-    let recent_times: Vec<i64> = all.iter()
-        .filter(|p| p.creator == creator && p.created_at >= window_start)
-        .map(|p| p.created_at)
-        .collect();
+    let creator_clone = creator.clone();
+    let (recent_times, banned) = tokio::task::spawn_blocking(move || {
+        let all = list_dao_proposals(Some("all"), None);
+        let times: Vec<i64> = all.iter()
+            .filter(|p| p.creator == creator_clone && p.created_at >= window_start)
+            .map(|p| p.created_at)
+            .collect();
+        let banned = is_proposer_banned(&creator_clone);
+        (times, banned)
+    }).await.map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
+
     if recent_times.len() >= MAX_PROPOSALS_PER_WINDOW {
         let oldest = recent_times.iter().copied().min().unwrap_or(now_ts_val);
         let resets_in = (oldest + WINDOW_SECS) - now_ts_val;
@@ -140,7 +152,7 @@ pub async fn create_dao_proposal(
     }
 
     // Enforce proposer ban
-    if is_proposer_banned(&creator) {
+    if banned {
         return Err(EgoDesktopError::InvalidInput(
             "Your address has been banned from submitting proposals by community vote.".into()
         ));
@@ -188,25 +200,36 @@ pub async fn create_dao_proposal(
         knowledge_votes: Default::default(),
     };
 
-    store_dao_proposal(proposal).map_err(|e| EgoDesktopError::WalletError(e))?;
+    tokio::task::spawn_blocking(move || store_dao_proposal(proposal))
+        .await
+        .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
+        .map_err(EgoDesktopError::WalletError)?;
     Ok(id)
 }
 
 /// List proposals. status_filter: "all" | "active" | "passed" | "failed" | "expired"
 #[tauri::command]
-pub fn get_dao_proposals(status_filter: Option<String>) -> Result<Vec<DaoProposalPublic>, EgoDesktopError> {
-    let ledger = Ledger::load();
-    let voter = if ledger.address.is_empty() { None } else { Some(ledger.address) };
-    Ok(list_dao_proposals(status_filter.as_deref(), voter.as_deref()))
+pub async fn get_dao_proposals(status_filter: Option<String>) -> Result<Vec<DaoProposalPublic>, EgoDesktopError> {
+    tokio::task::spawn_blocking(move || {
+        let ledger = Ledger::load();
+        let voter = if ledger.address.is_empty() { None } else { Some(ledger.address) };
+        Ok::<_, EgoDesktopError>(list_dao_proposals(status_filter.as_deref(), voter.as_deref()))
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 /// Get a single proposal with questions (no correct answers) and your vote status.
 #[tauri::command]
-pub fn get_dao_proposal(proposal_id: String) -> Result<DaoProposalPublic, EgoDesktopError> {
-    let ledger = Ledger::load();
-    let voter = if ledger.address.is_empty() { None } else { Some(ledger.address) };
-    get_dao_proposal_public(&proposal_id, voter.as_deref())
-        .ok_or(EgoDesktopError::WalletError("Proposal not found".into()))
+pub async fn get_dao_proposal(proposal_id: String) -> Result<DaoProposalPublic, EgoDesktopError> {
+    tokio::task::spawn_blocking(move || {
+        let ledger = Ledger::load();
+        let voter = if ledger.address.is_empty() { None } else { Some(ledger.address) };
+        get_dao_proposal_public(&proposal_id, voter.as_deref())
+            .ok_or(EgoDesktopError::WalletError("Proposal not found".into()))
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 /// Cast a stake-weighted vote. Power = your EGOC balance / total voting balance.
@@ -215,29 +238,37 @@ pub async fn cast_stake_vote(
     proposal_id:  String,
     option_index: usize,
 ) -> Result<(), EgoDesktopError> {
-    let ledger = Ledger::load();
-    let voter = ledger.address.clone();
-    if voter.is_empty() {
-        return Err(EgoDesktopError::WalletError("wallet not initialized".into()));
-    }
-    let balance = crate::chain_db::balance_of(&voter);
-    if balance == 0 {
-        return Err(EgoDesktopError::InvalidInput(
-            "You need EGOC balance to participate in stake voting".into()
-        ));
-    }
-    cast_dao_stake_vote(&proposal_id, option_index, &voter, balance)
-        .map_err(|e| EgoDesktopError::InvalidInput(e))
+    tokio::task::spawn_blocking(move || {
+        let ledger = Ledger::load();
+        let voter = ledger.address.clone();
+        if voter.is_empty() {
+            return Err(EgoDesktopError::WalletError("wallet not initialized".into()));
+        }
+        let balance = crate::chain_db::balance_of(&voter);
+        if balance == 0 {
+            return Err(EgoDesktopError::InvalidInput(
+                "You need EGOC balance to participate in stake voting".into()
+            ));
+        }
+        cast_dao_stake_vote(&proposal_id, option_index, &voter, balance)
+            .map_err(EgoDesktopError::InvalidInput)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 /// Grade a knowledge test without casting a vote. Returns score 0.0–1.0.
 #[tauri::command]
-pub fn grade_knowledge_test(
+pub async fn grade_knowledge_test(
     proposal_id: String,
     answers:     Vec<usize>,
 ) -> Result<f64, EgoDesktopError> {
-    grade_dao_knowledge_test(&proposal_id, &answers)
-        .map_err(|e| EgoDesktopError::InvalidInput(e))
+    tokio::task::spawn_blocking(move || {
+        grade_dao_knowledge_test(&proposal_id, &answers)
+            .map_err(EgoDesktopError::InvalidInput)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 /// Submit knowledge test answers and cast a knowledge vote. Returns your score.
@@ -247,20 +278,28 @@ pub async fn cast_knowledge_vote(
     option_index: usize,
     answers:      Vec<usize>,
 ) -> Result<f64, EgoDesktopError> {
-    let ledger = Ledger::load();
-    let voter = ledger.address.clone();
-    if voter.is_empty() {
-        return Err(EgoDesktopError::WalletError("wallet not initialized".into()));
-    }
-    cast_dao_knowledge_vote(&proposal_id, option_index, &voter, &answers)
-        .map_err(|e| EgoDesktopError::InvalidInput(e))
+    tokio::task::spawn_blocking(move || {
+        let ledger = Ledger::load();
+        let voter = ledger.address.clone();
+        if voter.is_empty() {
+            return Err(EgoDesktopError::WalletError("wallet not initialized".into()));
+        }
+        cast_dao_knowledge_vote(&proposal_id, option_index, &voter, &answers)
+            .map_err(EgoDesktopError::InvalidInput)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 /// Get combined stake + knowledge results for a proposal.
 #[tauri::command]
-pub fn get_proposal_results(proposal_id: String) -> Result<DaoProposalResults, EgoDesktopError> {
-    get_dao_results(&proposal_id)
-        .ok_or(EgoDesktopError::WalletError("Proposal not found".into()))
+pub async fn get_proposal_results(proposal_id: String) -> Result<DaoProposalResults, EgoDesktopError> {
+    tokio::task::spawn_blocking(move || {
+        get_dao_results(&proposal_id)
+            .ok_or(EgoDesktopError::WalletError("Proposal not found".into()))
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 /// Cast a removal vote against a proposer's address (max 1 per voter).
@@ -278,10 +317,14 @@ pub fn vote_ban_proposer(target_address: String) -> Result<ProposerBanStatus, Eg
 
 /// Get the ban status for a proposer address (vote count, threshold, whether banned).
 #[tauri::command]
-pub fn get_ban_status(target_address: String) -> ProposerBanStatus {
-    let ledger = Ledger::load();
-    let viewer = if ledger.address.is_empty() { None } else { Some(ledger.address) };
-    get_proposer_ban_status(&target_address, viewer.as_deref())
+pub async fn get_ban_status(target_address: String) -> Result<ProposerBanStatus, EgoDesktopError> {
+    tokio::task::spawn_blocking(move || {
+        let ledger = Ledger::load();
+        let viewer = if ledger.address.is_empty() { None } else { Some(ledger.address) };
+        Ok::<_, EgoDesktopError>(get_proposer_ban_status(&target_address, viewer.as_deref()))
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 #[derive(serde::Serialize)]
@@ -294,23 +337,41 @@ pub struct ProposalRateLimit {
 
 /// Returns the current user's proposal rate-limit status for the 4-hour window.
 #[tauri::command]
-pub fn get_proposal_rate_limit() -> ProposalRateLimit {
-    let ledger = Ledger::load();
-    if ledger.address.is_empty() {
-        return ProposalRateLimit { used: 0, max: MAX_PROPOSALS_PER_WINDOW, window_hours: 4, resets_in_secs: 0 };
-    }
-    let creator = &ledger.address;
-    let now      = now_ts();
-    let window_start = now - WINDOW_SECS;
-    let all = list_dao_proposals(Some("all"), None);
-    let recent_times: Vec<i64> = all.iter()
-        .filter(|p| &p.creator == creator && p.created_at >= window_start)
-        .map(|p| p.created_at)
-        .collect();
-    let used = recent_times.len();
-    let resets_in = if used >= MAX_PROPOSALS_PER_WINDOW {
-        let oldest = recent_times.iter().copied().min().unwrap_or(now);
-        ((oldest + WINDOW_SECS) - now).max(0)
-    } else { 0 };
-    ProposalRateLimit { used, max: MAX_PROPOSALS_PER_WINDOW, window_hours: 4, resets_in_secs: resets_in }
+pub async fn get_proposal_rate_limit() -> Result<ProposalRateLimit, EgoDesktopError> {
+    tokio::task::spawn_blocking(|| {
+        let ledger = Ledger::load();
+        if ledger.address.is_empty() {
+            return Ok::<_, EgoDesktopError>(ProposalRateLimit {
+                used: 0,
+                max: MAX_PROPOSALS_PER_WINDOW,
+                window_hours: 4,
+                resets_in_secs: 0,
+            });
+        }
+
+        let creator = ledger.address;
+        let now = now_ts();
+        let window_start = now - WINDOW_SECS;
+        let all = list_dao_proposals(Some("all"), None);
+        let recent_times: Vec<i64> = all.iter()
+            .filter(|p| p.creator == creator && p.created_at >= window_start)
+            .map(|p| p.created_at)
+            .collect();
+        let used = recent_times.len();
+        let resets_in = if used >= MAX_PROPOSALS_PER_WINDOW {
+            let oldest = recent_times.iter().copied().min().unwrap_or(now);
+            ((oldest + WINDOW_SECS) - now).max(0)
+        } else {
+            0
+        };
+
+        Ok(ProposalRateLimit {
+            used,
+            max: MAX_PROPOSALS_PER_WINDOW,
+            window_hours: 4,
+            resets_in_secs: resets_in,
+        })
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
