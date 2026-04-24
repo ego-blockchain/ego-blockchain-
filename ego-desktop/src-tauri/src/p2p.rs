@@ -6452,16 +6452,24 @@ async fn handle_view_change_msg(view: u64, voter: String) {
 
 pub async fn propose_block_as_leader() {
     if known_validators().len() < crate::bft_committee::min_committee_net() { return; }
-    let miner = crate::ledger::Ledger::load().address;
-    if miner.is_empty() { return; }
 
-    let prev_hash   = crate::chain_db::get_tip_hash();
-    let next_height = crate::chain_db::block_count() + 1;
+    let init = tokio::task::spawn_blocking(|| {
+        let miner = crate::ledger::Ledger::load().address;
+        if miner.is_empty() { return None; }
+        let prev_hash   = crate::chain_db::get_tip_hash();
+        let next_height = crate::chain_db::block_count() + 1;
+        let seed_bytes  = match crate::ledger::load_seed() {
+            Ok(Some(b)) => b,
+            _           => return None,
+        };
+        Some((miner, prev_hash, next_height, seed_bytes))
+    }).await.unwrap_or(None);
 
-    let seed_bytes = match crate::ledger::load_seed() {
-        Ok(Some(b)) => b,
-        _    => return,
+    let (miner, prev_hash, next_height, seed_bytes) = match init {
+        Some(v) => v,
+        None    => return,
     };
+
     let mut seed_32 = [0u8; 32];
     seed_32.copy_from_slice(&seed_bytes);
 
@@ -6469,8 +6477,8 @@ pub async fn propose_block_as_leader() {
     let vrf_ticket = crate::bft_committee::sign_vrf_ticket(&seed_32, &vrf_in);
 
     let validators: Vec<String> = known_validators().iter().cloned().collect();
-    let my_drs     = crate::bft_committee::compute_drs_weight(&miner);
-    let total_drs  = crate::bft_committee::total_drs_weight(&validators);
+    let my_drs    = crate::bft_committee::compute_drs_weight(&miner);
+    let total_drs = crate::bft_committee::total_drs_weight(&validators);
 
     if !crate::bft_committee::qualifies_proposer(&vrf_ticket, my_drs, total_drs) {
         return;
@@ -6478,17 +6486,22 @@ pub async fn propose_block_as_leader() {
     eprintln!("[BFT] VRF election won — proposer for block #{}", next_height);
 
     let is_solo = known_validators().len() <= 1;
-    let pool = crate::mempool::get_mempool();
-    let txs = pool.drain_all();
+    let pool    = crate::mempool::get_mempool();
+    let txs     = pool.drain_all();
 
     let (poc_ticket, poc_sig) = crate::poc::check_slot_winner(&prev_hash)
         .unwrap_or_else(|| (String::new(), String::new()));
-    let poc_slot = crate::poc::current_slot();
-
+    let poc_slot        = crate::poc::current_slot();
     let combined_ticket = if poc_ticket.is_empty() { String::new() }
                           else { format!("{}:{}", poc_ticket, poc_sig) };
 
-    let (block, stamped) = crate::chain_db::build_block_proposal(&txs, &miner, &combined_ticket, poc_slot);
+    let miner_c = miner.clone();
+    let (block, stamped) = match tokio::task::spawn_blocking(move || {
+        crate::chain_db::build_block_proposal(&txs, &miner_c, &combined_ticket, poc_slot)
+    }).await {
+        Ok(v)  => v,
+        Err(_) => return,
+    };
 
     {
         let mut staged = staged_block();
@@ -6510,18 +6523,25 @@ pub async fn propose_block_as_leader() {
         publish_gossip("ego-proposals-v1", data).await;
     }
 
-    let committee_vrf_in = crate::bft_committee::vrf_input(&block.prev_hash, block.height, crate::bft_committee::VRF_ROLE_COMMITTEE);
-    let committee_ticket = crate::bft_committee::sign_vrf_ticket(&seed_32, &committee_vrf_in);
+    let committee_vrf_in     = crate::bft_committee::vrf_input(&block.prev_hash, block.height, crate::bft_committee::VRF_ROLE_COMMITTEE);
+    let committee_ticket     = crate::bft_committee::sign_vrf_ticket(&seed_32, &committee_vrf_in);
     let committee_ticket_hex = hex::encode(&committee_ticket);
-    let self_vote_data = crate::bft_committee::vote_signing_data(&block.hash, block.height, &miner);
+    let self_vote_data       = crate::bft_committee::vote_signing_data(&block.hash, block.height, &miner);
     if let Some(self_sig) = bft_sign(&self_vote_data) {
-        {
-            let mut pv = pending_votes();
-            let voters = pv.entry(block.hash.clone()).or_default();
+        let should_persist = {
+            let mut pv  = pending_votes();
+            let voters  = pv.entry(block.hash.clone()).or_default();
             if !voters.contains(&miner) {
                 voters.push(miner.clone());
-                crate::chain_db::persist_pending_vote(&block.hash, &miner);
+                true
+            } else {
+                false
             }
+        };
+        if should_persist {
+            let bh = block.hash.clone();
+            let mn = miner.clone();
+            tokio::task::spawn_blocking(move || crate::chain_db::persist_pending_vote(&bh, &mn)).await.ok();
         }
         votes_cast().insert((miner.clone(), block.height), (block.hash.clone(), self_sig.clone()));
         let block_hash_bytes = hex::decode(&block.hash).unwrap_or_default();
@@ -6543,7 +6563,9 @@ pub async fn propose_block_as_leader() {
     }
 
     if is_solo {
-        bft_solo_commit(&block.hash, block.height);
+        let bh      = block.hash.clone();
+        let bheight = block.height;
+        tokio::task::spawn_blocking(move || bft_solo_commit(&bh, bheight)).await.ok();
         eprintln!("[BFT] Solo block #{} committed", block.height);
     } else {
         touch_proposal_timestamp();
@@ -6589,16 +6611,24 @@ fn bft_solo_commit(block_hash: &str, height: u64) {
 /// consecutive view changes with no block — prevents chain death.
 pub async fn propose_block_as_leader_forced() {
     if known_validators().len() < crate::bft_committee::min_committee_net() { return; }
-    let miner = crate::ledger::Ledger::load().address;
-    if miner.is_empty() { return; }
 
-    let prev_hash   = crate::chain_db::get_tip_hash();
-    let next_height = crate::chain_db::block_count() + 1;
+    let init = tokio::task::spawn_blocking(|| {
+        let miner = crate::ledger::Ledger::load().address;
+        if miner.is_empty() { return None; }
+        let prev_hash   = crate::chain_db::get_tip_hash();
+        let next_height = crate::chain_db::block_count() + 1;
+        let seed_bytes  = match crate::ledger::load_seed() {
+            Ok(Some(b)) if b.len() == 32 => b,
+            _                            => return None,
+        };
+        Some((miner, prev_hash, next_height, seed_bytes))
+    }).await.unwrap_or(None);
 
-    let seed_bytes = match crate::ledger::load_seed() {
-        Ok(Some(b)) if b.len() == 32 => b,
-        _ => return,
+    let (miner, prev_hash, next_height, seed_bytes) = match init {
+        Some(v) => v,
+        None    => return,
     };
+
     let mut seed_32 = [0u8; 32];
     seed_32.copy_from_slice(&seed_bytes);
 
@@ -6609,11 +6639,17 @@ pub async fn propose_block_as_leader_forced() {
 
     let (poc_ticket, poc_sig) = crate::poc::check_slot_winner(&prev_hash)
         .unwrap_or_else(|| (String::new(), String::new()));
-    let poc_slot      = crate::poc::current_slot();
+    let poc_slot        = crate::poc::current_slot();
     let combined_ticket = if poc_ticket.is_empty() { String::new() }
                           else { format!("{}:{}", poc_ticket, poc_sig) };
 
-    let (block, stamped) = crate::chain_db::build_block_proposal(&txs, &miner, &combined_ticket, poc_slot);
+    let miner_c = miner.clone();
+    let (block, stamped) = match tokio::task::spawn_blocking(move || {
+        crate::chain_db::build_block_proposal(&txs, &miner_c, &combined_ticket, poc_slot)
+    }).await {
+        Ok(v)  => v,
+        Err(_) => return,
+    };
 
     {
         let mut staged = staged_block();
@@ -6635,18 +6671,25 @@ pub async fn propose_block_as_leader_forced() {
         publish_gossip("ego-proposals-v1", data).await;
     }
 
-    let committee_vrf_in = crate::bft_committee::vrf_input(&block.prev_hash, block.height, crate::bft_committee::VRF_ROLE_COMMITTEE);
-    let committee_ticket = crate::bft_committee::sign_vrf_ticket(&seed_32, &committee_vrf_in);
+    let committee_vrf_in     = crate::bft_committee::vrf_input(&block.prev_hash, block.height, crate::bft_committee::VRF_ROLE_COMMITTEE);
+    let committee_ticket     = crate::bft_committee::sign_vrf_ticket(&seed_32, &committee_vrf_in);
     let committee_ticket_hex = hex::encode(&committee_ticket);
-    let self_vote_data = crate::bft_committee::vote_signing_data(&block.hash, block.height, &miner);
+    let self_vote_data       = crate::bft_committee::vote_signing_data(&block.hash, block.height, &miner);
     if let Some(self_sig) = bft_sign(&self_vote_data) {
-        {
-            let mut pv = pending_votes();
-            let voters = pv.entry(block.hash.clone()).or_default();
+        let should_persist = {
+            let mut pv  = pending_votes();
+            let voters  = pv.entry(block.hash.clone()).or_default();
             if !voters.contains(&miner) {
                 voters.push(miner.clone());
-                crate::chain_db::persist_pending_vote(&block.hash, &miner);
+                true
+            } else {
+                false
             }
+        };
+        if should_persist {
+            let bh = block.hash.clone();
+            let mn = miner.clone();
+            tokio::task::spawn_blocking(move || crate::chain_db::persist_pending_vote(&bh, &mn)).await.ok();
         }
         votes_cast().insert((miner.clone(), block.height), (block.hash.clone(), self_sig.clone()));
         let block_hash_bytes = hex::decode(&block.hash).unwrap_or_default();
@@ -6668,7 +6711,9 @@ pub async fn propose_block_as_leader_forced() {
     }
 
     if is_solo {
-        bft_solo_commit(&block.hash, block.height);
+        let bh      = block.hash.clone();
+        let bheight = block.height;
+        tokio::task::spawn_blocking(move || bft_solo_commit(&bh, bheight)).await.ok();
         eprintln!("[BFT] Solo fallback block #{} committed", block.height);
     } else {
         touch_proposal_timestamp();
@@ -6695,12 +6740,17 @@ pub async fn run_view_change_monitor() {
         let last = LAST_PROPOSAL_TS.load(Ordering::Relaxed);
         if last == 0 || now - last < VIEW_CHANGE_TIMEOUT_SECS { continue; }
 
-        let next_view = {
+        let view_init = tokio::task::spawn_blocking(|| {
             let chain_next = crate::chain_db::block_count() as u64 + 1;
-            chain_next.max(current_view() + 1)
+            let my_addr    = crate::ledger::Ledger::load().address;
+            if my_addr.is_empty() { return None; }
+            Some((chain_next, my_addr))
+        }).await.unwrap_or(None);
+        let (chain_next, my_addr) = match view_init {
+            Some(v) => v,
+            None    => continue,
         };
-        let my_addr   = crate::ledger::Ledger::load().address;
-        if my_addr.is_empty() { continue; }
+        let next_view = chain_next.max(current_view() + 1);
 
         let prev_stuck = STUCK_AT_NEXT_VIEW.swap(next_view, Ordering::Relaxed);
         if prev_stuck == next_view {
