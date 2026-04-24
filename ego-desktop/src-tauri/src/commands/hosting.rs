@@ -374,12 +374,15 @@ pub async fn finalize_deploy(name: String, files: Vec<FinalizeFileEntry>) -> Res
         .or_else(|| files.first().map(|f| f.cid.clone()))
         .unwrap_or_default();
 
-    let deployed_at = crate::chain_db::get_hosted_site_raw(&name)
-        .and_then(|r| r["deployed_at"].as_i64())
-        .unwrap_or(now);
-
-    let existing_custom_domain = crate::chain_db::get_hosted_site_raw(&name)
-        .and_then(|r| r["custom_domain"].as_str().map(|s| s.to_string()));
+    let name_clone = name.clone();
+    let (deployed_at, existing_custom_domain, existing_key_hex) = tokio::task::spawn_blocking(move || {
+        let raw = crate::chain_db::get_hosted_site_raw(&name_clone);
+        let deployed_at = raw.as_ref().and_then(|r| r["deployed_at"].as_i64()).unwrap_or(now);
+        let domain = raw.as_ref().and_then(|r| r["custom_domain"].as_str().map(|s| s.to_string()));
+        let key_hex = raw.and_then(|v| v["site_key_hex"].as_str().map(|s| s.to_string()))
+            .filter(|s| !s.is_empty());
+        (deployed_at, domain, key_hex)
+    }).await.map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
 
     let site_files: Vec<SiteFile> = files.into_iter().map(|f| SiteFile {
         path:      f.path,
@@ -392,11 +395,7 @@ pub async fn finalize_deploy(name: String, files: Vec<FinalizeFileEntry>) -> Res
         let mut keys = pending_keys();
         keys.remove(&name)
             .map(|k| hex::encode(k))
-            .or_else(|| {
-                crate::chain_db::get_hosted_site_raw(&name)
-                    .and_then(|v| v["site_key_hex"].as_str().map(|s| s.to_string()))
-                    .filter(|s| !s.is_empty())
-            })
+            .or(existing_key_hex)
             .unwrap_or_default()
     };
 
@@ -414,7 +413,10 @@ pub async fn finalize_deploy(name: String, files: Vec<FinalizeFileEntry>) -> Res
         site_key_hex,
     };
 
-    crate::chain_db::save_hosted_site(&name, &serde_json::to_value(&site).unwrap());
+    let site_val = serde_json::to_value(&site).unwrap();
+    let name_clone2 = name.clone();
+    tokio::task::spawn_blocking(move || crate::chain_db::save_hosted_site(&name_clone2, &site_val))
+        .await.map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
 
     let announce_name   = name.clone();
     let announce_domain = site.custom_domain.clone();
@@ -559,15 +561,25 @@ async fn discover_public_ip() -> Option<String> {
 
 #[tauri::command]
 pub async fn hosting_heartbeat() {
-    let owner = Ledger::load().address;
-    if let Some(mut record) = crate::chain_db::get_hosting_node(&owner) {
+    let (owner, record_opt) = tokio::task::spawn_blocking(|| {
+        let owner = Ledger::load().address;
+        let record = if owner.is_empty() { None } else { crate::chain_db::get_hosting_node(&owner) };
+        (owner, record)
+    }).await.unwrap_or_default();
+
+    if owner.is_empty() {
+        tokio::task::spawn_blocking(crate::chain_db::prune_stale_hosting_nodes).await.ok();
+        return;
+    }
+
+    if let Some(mut record) = record_opt {
         record.last_seen = chrono::Utc::now().timestamp();
         if let Some(ip) = discover_public_ip().await {
-            let port = rpc_port();
-            record.endpoint = format!("http://{}:{}", ip, port);
+            record.endpoint = format!("http://{}:{}", ip, rpc_port());
         }
         record.signature = sign_hosting_record(&record.node_id, &record.endpoint, record.last_seen);
-        crate::chain_db::upsert_hosting_node(&record);
+        let record_clone = record.clone();
+        tokio::task::spawn_blocking(move || crate::chain_db::upsert_hosting_node(&record_clone)).await.ok();
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
@@ -578,7 +590,7 @@ pub async fn hosting_heartbeat() {
         }
         crate::p2p::gossip_hosting_node(&record);
     }
-    crate::chain_db::prune_stale_hosting_nodes();
+    tokio::task::spawn_blocking(crate::chain_db::prune_stale_hosting_nodes).await.ok();
 }
 
 #[tauri::command]

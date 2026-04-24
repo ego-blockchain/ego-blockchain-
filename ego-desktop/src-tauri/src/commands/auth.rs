@@ -1,7 +1,7 @@
 use crate::app::AppState;
 use crate::error::{EgoDesktopError, EgoResult};
 use crate::ledger::{
-    base_data_dir, chain_path, data_dir, get_active_wallet_id, ledger_path, load_chain,
+    base_data_dir, data_dir, get_active_wallet_id, ledger_path, load_chain,
     load_registry, next_wallet_id, registry_path, save_chain, save_registry, seed_path,
     storage_dir, wallet_dir, Ledger, LedgerBlock, LedgerTx, SharedChain, WalletEntry,
     WalletRegistry,
@@ -14,7 +14,7 @@ use ego_core::{AddressType, KeyPair};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
-use tauri::State;
+use tauri::{Manager, State};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WalletInfo {
@@ -170,25 +170,26 @@ fn pq_cache_path() -> std::path::PathBuf {
     crate::ledger::data_dir().join("pq_keys.bin")
 }
 
-/// Called from main() before Tauri starts — blocks until PQ keys are cached.
-/// On first run this takes ~30-120s at opt-level=0; every subsequent call
-/// finds the file and returns in microseconds.
 pub fn ensure_pq_cache() {
     let cache = pq_cache_path();
     if cache.exists() { return; }
     let seed_bytes = match crate::ledger::load_seed() {
         Ok(Some(b)) => b,
-        _ => return, // no seed yet (brand-new wallet) — create_wallet_files handles it
+        _ => return,
     };
     let mut seed = [0u8; 32];
     if seed_bytes.len() >= 32 { seed.copy_from_slice(&seed_bytes[..32]); }
-    eprintln!("[KeyGen] Generating quantum-safe keys for the first time — please wait…");
+    eprintln!("[KeyGen] Warming PQ key cache…");
     if let Ok(kp) = KeyPair::from_bytes(&seed) {
         if let Ok(encoded) = kp.to_pq_cache() {
             let _ = crate::utils::atomic_write(&cache, &encoded);
-            eprintln!("[KeyGen] Quantum-safe keys cached.");
         }
     }
+}
+
+#[tauri::command]
+pub fn pq_cache_ready() -> bool {
+    pq_cache_path().exists()
 }
 
 fn load_or_generate_pq_keys(seed: &[u8; 32]) -> Result<KeyPair, EgoDesktopError> {
@@ -228,7 +229,6 @@ fn derive_wallet_keys() -> Result<WalletKeys, EgoDesktopError> {
         let _ = ledger.save();
         derived
     };
-    // Backfill mainnet address for existing wallets that predate this field
     if ledger.mainnet_address.is_empty() {
         if let Ok(mn) = keypair.derive_bech32_address(0, AddressType::EOA, "ego") {
             ledger.mainnet_address = mn;
@@ -240,8 +240,9 @@ fn derive_wallet_keys() -> Result<WalletKeys, EgoDesktopError> {
     let dilithium_hex = hex::encode(keypair.dilithium_public_key().as_bytes());
     let kyber_hex     = hex::encode(keypair.kyber_public_key().as_bytes());
 
-    let chain         = load_chain();
-    let balance_uegoc = chain.balance_of(&address);
+    // Use ledger-cached balance for instant startup; real balance is fetched
+    // in background to avoid blocking on the RocksDB cold open.
+    let balance_uegoc     = ledger.balance_uegoc;
     let balance_formatted = format!("{:.2} EGOC", balance_uegoc as f64 / 1_000_000.0);
 
     Ok(WalletKeys { keypair, address, ed25519_hex, dilithium_hex, kyber_hex, balance_uegoc, balance_formatted })
@@ -250,6 +251,7 @@ fn derive_wallet_keys() -> Result<WalletKeys, EgoDesktopError> {
 async fn load_active_wallet(
     state: &AppState,
     is_new: bool,
+    handle: Option<tauri::AppHandle>,
 ) -> Result<WalletInfo, EgoDesktopError> {
 
     let keys = tokio::task::spawn_blocking(derive_wallet_keys)
@@ -257,7 +259,7 @@ async fn load_active_wallet(
         .map_err(|e| EgoDesktopError::CryptoError(format!("Key generation panicked: {e}")))??;
 
     state
-        .initialize_wallet(keys.keypair, false)  // false = don't overwrite if already live
+        .initialize_wallet(keys.keypair, false)
         .map_err(|e| EgoDesktopError::WalletError(format!("{e}")))?;
     state.set_session_start(chrono::Utc::now().timestamp());
 
@@ -266,25 +268,43 @@ async fn load_active_wallet(
         if ledger.storage_allocated_bytes == 0 {
             ledger.storage_allocated_bytes = 10 * 1_000_000_000;
             let _ = ledger.save();
-
             let _ = fs::create_dir_all(storage_dir());
             eprintln!("[storage] Auto-provisioned 10 GB storage quota");
         }
     }
 
-    credit_testnet_faucet(&keys.address);
+    // Heavy chain_db work (RocksDB cold open + faucet + real balance) runs in
+    // background so init_wallet returns in ~50 ms instead of 2-8 s.
+    let addr = keys.address.clone();
+    tauri::async_runtime::spawn(async move {
+        let (bal, fmt) = tokio::task::spawn_blocking(move || {
+            credit_testnet_faucet(&addr);
+            let b = crate::chain_db::balance_of(&addr);
+            let f = format!("{:.2} EGOC", b as f64 / 1_000_000.0);
+            // Persist real balance so next launch shows it immediately.
+            let mut ledger = Ledger::load();
+            if b > 0 || ledger.balance_uegoc == 0 {
+                ledger.balance_uegoc = b;
+                let _ = ledger.save();
+            }
+            (b, f)
+        }).await.unwrap_or((0, "0.00 EGOC".into()));
 
-    let chain2 = load_chain();
-    let balance_uegoc2 = chain2.balance_of(&keys.address);
-    let balance_formatted2 = format!("{:.2} EGOC", balance_uegoc2 as f64 / 1_000_000.0);
+        if let Some(h) = handle {
+            let _ = h.emit_all("wallet-balance-updated", serde_json::json!({
+                "balance_uegoc": bal,
+                "balance_formatted": fmt,
+            }));
+        }
+    });
 
     Ok(WalletInfo {
         address:              keys.address,
         public_key_ed25519:   keys.ed25519_hex,
         public_key_dilithium: keys.dilithium_hex,
         public_key_kyber:     keys.kyber_hex,
-        balance_uegoc:        balance_uegoc2,
-        balance_formatted:    balance_formatted2,
+        balance_uegoc:        keys.balance_uegoc,
+        balance_formatted:    keys.balance_formatted,
         is_new_wallet:        is_new,
     })
 }
@@ -363,10 +383,10 @@ fn create_wallet_files(address_override: Option<&str>) -> Result<String, EgoDesk
 }
 
 #[tauri::command]
-pub async fn init_wallet(state: State<'_, AppState>) -> Result<WalletInfo, EgoDesktopError> {
-    // ── Step 1: Legacy migration ──────────────────────────────────────────
-    // If the old flat-layout seed exists and there's no registry yet,
-
+pub async fn init_wallet(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<WalletInfo, EgoDesktopError> {
     let legacy_seed = base_data_dir().join("wallet.seed");
     if legacy_seed.exists() && !registry_path().exists() {
         let w0_dir = wallet_dir("wallet_0");
@@ -411,39 +431,52 @@ pub async fn init_wallet(state: State<'_, AppState>) -> Result<WalletInfo, EgoDe
         save_registry(&reg).map_err(EgoDesktopError::WalletError)?;
     }
 
-    if !chain_path().exists() {
-        let reg = load_registry();
-        let mut chain = SharedChain::default();
-        let mut seen_txs: HashSet<String> = HashSet::new();
-        let mut seen_blocks: HashSet<String> = HashSet::new();
+    // Import any legacy per-wallet ledger history into RocksDB in background.
+    // save_chain() is idempotent, so rerunning this on startup is safe.
+    let migration_handle = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        let migrated = tokio::task::spawn_blocking(|| {
+            let reg = load_registry();
+            let mut chain = SharedChain::default();
+            let mut seen_txs: HashSet<String> = HashSet::new();
+            let mut seen_blocks: HashSet<String> = HashSet::new();
 
-        for entry in &reg.wallets {
-            let lf = wallet_dir(&entry.id).join("ledger.json");
-            if let Ok(data) = fs::read_to_string(&lf) {
-                if let Ok(l) = serde_json::from_str::<Ledger>(&data) {
-                    for tx in &l.transactions {
-                        if seen_txs.insert(tx.hash.clone()) {
-                            chain.transactions.push(tx.clone());
+            for entry in &reg.wallets {
+                let lf = wallet_dir(&entry.id).join("ledger.json");
+                if let Ok(data) = fs::read_to_string(&lf) {
+                    if let Ok(l) = serde_json::from_str::<Ledger>(&data) {
+                        for tx in &l.transactions {
+                            if seen_txs.insert(tx.hash.clone()) {
+                                chain.transactions.push(tx.clone());
+                            }
                         }
-                    }
-                    for block in &l.blocks {
-                        if seen_blocks.insert(block.hash.clone()) {
-                            chain.blocks.push(block.clone());
+                        for block in &l.blocks {
+                            if seen_blocks.insert(block.hash.clone()) {
+                                chain.blocks.push(block.clone());
+                            }
                         }
                     }
                 }
             }
-        }
 
-        chain.blocks.sort_by_key(|b| b.height);
-        chain.transactions.sort_by_key(|tx| tx.timestamp);
-        let _ = save_chain(&chain);
-    }
+            if chain.blocks.is_empty() && chain.transactions.is_empty() {
+                return false;
+            }
+
+            chain.blocks.sort_by_key(|b| b.height);
+            chain.transactions.sort_by_key(|tx| tx.timestamp);
+            let _ = save_chain(&chain);
+            true
+        }).await.unwrap_or(false);
+
+        if migrated {
+            let _ = migration_handle.emit_all("ego://chain-updated", ());
+        }
+    });
 
     let mut registry = load_registry();
 
     if registry.wallets.is_empty() {
-
         let wallet_id = "wallet_0".to_string();
         registry.active_id = wallet_id.clone();
 
@@ -459,18 +492,17 @@ pub async fn init_wallet(state: State<'_, AppState>) -> Result<WalletInfo, EgoDe
         });
         save_registry(&registry).map_err(EgoDesktopError::WalletError)?;
 
-        return load_active_wallet(&state, true).await;
+        return load_active_wallet(&state, true, Some(app_handle)).await;
     }
 
     let is_new = !seed_path().exists();
     if is_new {
-
         tokio::task::spawn_blocking(|| create_wallet_files(None))
             .await
             .map_err(|e| EgoDesktopError::CryptoError(format!("Wallet creation panicked: {e}")))??;
     }
 
-    load_active_wallet(&state, is_new).await
+    load_active_wallet(&state, is_new, Some(app_handle)).await
 }
 
 #[tauri::command]
@@ -482,6 +514,7 @@ pub async fn list_wallets() -> Result<WalletRegistry, EgoDesktopError> {
 pub async fn create_wallet(
     name: String,
     state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
 ) -> Result<WalletInfo, EgoDesktopError> {
     let mut registry = load_registry();
 
@@ -518,7 +551,7 @@ pub async fn create_wallet(
     });
     save_registry(&registry).map_err(EgoDesktopError::WalletError)?;
 
-    load_active_wallet(&state, true).await
+    load_active_wallet(&state, true, Some(app_handle)).await
 }
 
 // ── import_wallet ─────────────────────────────────────────────────────────────
@@ -527,10 +560,11 @@ pub async fn create_wallet(
 
 #[tauri::command]
 pub async fn import_wallet(
-    name:   String,
-    method: String, // "phrase" | "seed"
-    value:  String,
-    state:  State<'_, AppState>,
+    name:       String,
+    method:     String,
+    value:      String,
+    state:      State<'_, AppState>,
+    app_handle: tauri::AppHandle,
 ) -> Result<WalletInfo, EgoDesktopError> {
     let mut registry = load_registry();
     if registry.wallets.len() >= 6 {
@@ -604,15 +638,16 @@ pub async fn import_wallet(
     });
     save_registry(&registry).map_err(EgoDesktopError::WalletError)?;
 
-    load_active_wallet(&state, false).await
+    load_active_wallet(&state, false, Some(app_handle)).await
 }
 
 // ── switch_wallet ─────────────────────────────────────────────────────────────
 
 #[tauri::command]
 pub async fn switch_wallet(
-    wallet_id: String,
-    state: State<'_, AppState>,
+    wallet_id:  String,
+    state:      State<'_, AppState>,
+    app_handle: tauri::AppHandle,
 ) -> Result<WalletInfo, EgoDesktopError> {
     let mut registry = load_registry();
 
@@ -625,7 +660,7 @@ pub async fn switch_wallet(
     registry.active_id = wallet_id;
     save_registry(&registry).map_err(EgoDesktopError::WalletError)?;
 
-    load_active_wallet(&state, false).await
+    load_active_wallet(&state, false, Some(app_handle)).await
 }
 
 #[tauri::command]

@@ -18,6 +18,10 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+
+const GENESIS_HASH:  &str = "ego00000000000000000000000000000000000000000000000000000000genesis2";
+const GENESIS_MINER: &str = "egot1genesis0000000000000000000000000000000000";
+const GENESIS_TS:    i64  = 1_744_588_800;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
@@ -59,7 +63,6 @@ const MAX_TRANSACTIONS: usize = 500_000;
 impl ChainState {
     fn merge_block(&mut self, block: Value) {
         let height = block["height"].as_u64().unwrap_or(0);
-        if height == 0 { return; }
         if let Some(pos) = self.blocks.iter().position(|b| b["height"].as_u64() == Some(height)) {
             self.blocks[pos] = block;
         } else {
@@ -98,6 +101,55 @@ impl ChainState {
             b["timestamp"].as_i64().unwrap_or(0).cmp(&a["timestamp"].as_i64().unwrap_or(0))
         });
         v
+    }
+}
+
+fn chain_data_path() -> std::path::PathBuf {
+    std::env::var("ORACLE_DATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/ego-oracle/chain.json"))
+}
+
+fn genesis_chain_state() -> ChainState {
+    ChainState {
+        blocks: vec![json!({
+            "height":    0,
+            "hash":      GENESIS_HASH,
+            "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "miner":     GENESIS_MINER,
+            "timestamp": GENESIS_TS,
+            "tx_count":  0,
+            "size_bytes": 0,
+            "reward":    0,
+        })],
+        transactions: vec![],
+    }
+}
+
+fn load_chain() -> ChainState {
+    let path = chain_data_path();
+    if let Ok(data) = std::fs::read_to_string(&path) {
+        if let Ok(mut state) = serde_json::from_str::<ChainState>(&data) {
+            if !state.blocks.iter().any(|b| b["height"].as_u64() == Some(0)) {
+                let mut g = genesis_chain_state();
+                state.blocks.push(g.blocks.remove(0));
+            }
+            info!("Loaded chain state from disk: {} blocks, {} txs", state.blocks.len(), state.transactions.len());
+            return state;
+        }
+    }
+    info!("No persisted chain state found, seeding genesis");
+    genesis_chain_state()
+}
+
+fn save_chain(chain: &ChainState) {
+    let path = chain_data_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match serde_json::to_string(chain) {
+        Ok(data) => { let _ = std::fs::write(&path, data); }
+        Err(e) => { error!("Failed to serialize chain state: {}", e); }
     }
 }
 
@@ -250,6 +302,11 @@ async fn handle_chain_submit(
     }
     chain.merge_txs(payload.transactions);
 
+    let snapshot = chain.clone();
+    drop(chain);
+    tokio::task::spawn_blocking(move || save_chain(&snapshot));
+
+    let chain = state.chain.read().await;
     (StatusCode::OK, Json(json!({ "ok": true, "blocks": chain.blocks.len(), "txs": chain.transactions.len() })))
 }
 
@@ -359,7 +416,7 @@ async fn main() {
 
     let state = AppState {
         prices:        Arc::new(RwLock::new(initial_prices)),
-        chain:         Arc::new(RwLock::new(ChainState::default())),
+        chain:         Arc::new(RwLock::new(load_chain())),
         client,
         hosting_nodes: Arc::new(RwLock::new(HashMap::new())),
         ego_nodes:     Arc::new(RwLock::new(Vec::new())),

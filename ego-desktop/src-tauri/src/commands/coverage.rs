@@ -55,9 +55,6 @@ fn vpn_keyword_match(resp: &IpApiResponse) -> Option<String> {
 }
 
 fn detect_vpn(resp: &IpApiResponse) -> Option<String> {
-    if resp.proxy.unwrap_or(false) {
-        return Some("IP flagged as proxy/VPN by ip-api.com".to_string());
-    }
     vpn_keyword_match(resp)
 }
 
@@ -415,7 +412,14 @@ pub async fn get_network_peers(
 /// Returns (location, vpn_detected, vpn_reason, public_ip).
 async fn fetch_ip_data() -> (Option<Location>, bool, String, String) {
     let url = "http://ip-api.com/json?fields=status,query,lat,lon,city,regionName,country,isp,org,proxy,hosting";
-    let resp = match reqwest::get(url).await {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c)  => c,
+        Err(_) => return (None, false, String::new(), String::new()),
+    };
+    let resp = match client.get(url).send().await {
         Ok(r)  => r,
         Err(_) => return (None, false, String::new(), String::new()),
     };

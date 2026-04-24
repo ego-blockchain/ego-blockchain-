@@ -427,7 +427,7 @@ pub async fn run_batch_loop() {
         MAX_MEMPOOL_SIZE, MAX_TX_AGE_SECS,
     );
 
-    let _ = crate::chain_db::get_db();
+    tokio::task::spawn_blocking(|| { let _ = crate::chain_db::get_db(); }).await.ok();
 
     let pool = get_mempool();
 

@@ -170,11 +170,6 @@ fn main() {
     }
     tracing::info!("Ego Desktop starting");
 
-    // Pre-generate and cache PQ keys before the window opens so init_wallet
-    // never has to wait for slow unoptimised key generation.  On subsequent
-    // starts the cache file exists and this returns in microseconds.
-    crate::commands::auth::ensure_pq_cache();
-
     if std::env::var("EGO_HEADLESS").as_deref() == Ok("1") {
         headless_main();
         return;
@@ -413,6 +408,7 @@ fn main() {
             commands::staking::stake_coins,
             commands::staking::unstake_coins,
             commands::staking::get_consensus_health,
+            commands::auth::pq_cache_ready,
             commands::auth::get_app_settings,
             commands::auth::save_app_settings,
             commands::explorer::get_network_stats,
@@ -567,6 +563,14 @@ fn main() {
             commands::l2::challenge_rollup_batch
         ])
         .setup(|app| {
+            // Warm the PQ key cache in background. chain_db is intentionally NOT
+            // opened here — the startup task calls restore_in_memory_state_from_db
+            // on a tokio thread, and opening RocksDB concurrently from a plain
+            // std::thread would block that tokio thread on OnceLock::get_or_init,
+            // starving the runtime and causing "Not Responding" on Windows.
+            std::thread::spawn(|| {
+                crate::commands::auth::ensure_pq_cache();
+            });
 
             let window = app.get_window("main").unwrap();
 
@@ -637,15 +641,10 @@ fn main() {
                     tracing::warn!("No endpoint — check network");
                 }
 
-                // Restore in-memory nonce + stake stores from RocksDB so replay
-                // protection and validator stake tracking survive node restarts.
-                crate::chain_db::restore_in_memory_state_from_db();
-                crate::sharding::load_agreed_shard_count_from_db();
+                tokio::task::spawn_blocking(|| {
+                    crate::chain_db::restore_in_memory_state_from_db();
+                    crate::sharding::load_agreed_shard_count_from_db();
 
-                // Pre-populate known_validators from recent block miners so the
-                // BFT threshold is correct immediately on reconnect, before
-                // PeerAnnounce gossip round-trips complete.
-                {
                     let miners: std::collections::HashSet<String> = crate::chain_db::recent_blocks(500)
                         .into_iter()
                         .filter(|b| !b.miner.is_empty())
@@ -658,7 +657,7 @@ fn main() {
                     if n > 0 {
                         tracing::info!("Pre-registered {} validator(s) from chain history", n);
                     }
-                }
+                }).await.ok();
 
                 crate::p2p::fetch_and_cache_egoc_price().await;
 
@@ -735,7 +734,8 @@ fn main() {
                     crate::p2p::sync_chain_from_peers().await;
                     crate::p2p::dht_discover_relays().await;
 
-                    let my_addr = crate::ledger::Ledger::load().address;
+                    let my_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
+                        .await.unwrap_or_default();
                     if !my_addr.is_empty() {
                         crate::commands::messenger::poll_relay_inbox(&my_addr, Some(&handle_startup)).await;
                     }
@@ -751,18 +751,19 @@ fn main() {
                     }
 
                     let shard_peers = crate::p2p::get_known_peers();
-                    let ledger_for_shard = crate::ledger::Ledger::load();
+                    let ledger_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
+                        .await.unwrap_or_default();
                     let endpoint = crate::p2p::get_public_endpoint().await;
-                    crate::sharding::run_shard_startup(&ledger_for_shard.address, &endpoint, &shard_peers, 0).await;
+                    crate::sharding::run_shard_startup(&ledger_addr, &endpoint, &shard_peers, 0).await;
                     crate::p2p::broadcast_shard_announce().await;
-                    crate::sharding::check_master_health(&ledger_for_shard.address, &endpoint, 0).await;
+                    crate::sharding::check_master_health(&ledger_addr, &endpoint, 0).await;
 
                     crate::p2p::push_shard_data_to_slaves().await;
 
                     let ep3 = crate::p2p::get_public_endpoint().await;
-                    crate::p2p::dht_publish_shard_assignments(&ledger_for_shard.address, &ep3).await;
+                    crate::p2p::dht_publish_shard_assignments(&ledger_addr, &ep3).await;
                     crate::p2p::broadcast_vacancy_notices().await;
-                    crate::sharding::prune_observer_shards(&ledger_for_shard.address);
+                    crate::sharding::prune_observer_shards(&ledger_addr);
                 }
             });
 

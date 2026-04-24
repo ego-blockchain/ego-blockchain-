@@ -2,7 +2,7 @@ import React, { createContext, useContext, useEffect, useState } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/tauri';
 import { open as openUrl } from '@tauri-apps/api/shell';
-import { emit } from '@tauri-apps/api/event';
+import { emit, listen } from '@tauri-apps/api/event';
 import Layout from './components/Layout';
 import TitleBar from './components/TitleBar';
 import WelcomeScreen from './pages/WelcomeScreen';
@@ -205,6 +205,7 @@ function App() {
   );
 
   const [registered, setRegistered] = useState(false);
+  const [generatingKeys, setGeneratingKeys] = useState(false);
 
   function toggleTheme() {
     setTheme(t => {
@@ -227,14 +228,9 @@ function App() {
     if (!wallet) setLoading(true);
     setInitError(null);
     try {
-      const timeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(
-          'Wallet initialisation timed out after 120 s.\n' +
-          'This usually means the post-quantum key generation failed on this device.\n' +
-          'Please try again or reinstall the app.'
-        )), 120_000)
-      );
-      const info = await Promise.race([invoke<WalletInfo>('init_wallet'), timeout]);
+      const cacheReady = await invoke<boolean>('pq_cache_ready').catch(() => true);
+      setGeneratingKeys(!cacheReady);
+      const info = await invoke<WalletInfo>('init_wallet');
       setWallet(info);
       await loadRegistry();
 
@@ -254,6 +250,14 @@ function App() {
   useEffect(() => {
     emit('frontend-ready');
     initWallet();
+
+    const unlisten = listen<{ balance_uegoc: number; balance_formatted: string }>(
+      'wallet-balance-updated',
+      ({ payload }) => {
+        setWallet(w => w ? { ...w, balance_uegoc: payload.balance_uegoc, balance_formatted: payload.balance_formatted } : w);
+      }
+    );
+    return () => { unlisten.then(f => f()); };
   }, []);
 
   useEffect(() => {
@@ -287,9 +291,12 @@ function App() {
         <TitleBar />
         <div className="flex-1 flex items-center justify-center">
           <div className="text-center space-y-4">
-            <div className="text-5xl animate-pulse">🔑</div>
-            <div className="text-white font-semibold">Initialising wallet…</div>
-            <div className="text-gray-400 text-sm">Generating quantum-safe keys — this can take up to 60 s on first run</div>
+            <div className="text-5xl animate-pulse">{generatingKeys ? '🔑' : '⚡'}</div>
+            <div className="text-white font-semibold">Starting Ego Desktop…</div>
+            {generatingKeys
+              ? <div className="text-gray-400 text-sm">Generating quantum-safe keys — one-time setup, this may take a minute. Please do not close the app.</div>
+              : <div className="text-gray-400 text-sm">Loading wallet…</div>
+            }
           </div>
         </div>
       </div>

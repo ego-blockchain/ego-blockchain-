@@ -117,6 +117,8 @@ const ExplorerPage: React.FC = () => {
   const [selectedFile, setSelectedFile] = useState<FileEvent | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(true);
+  const refreshTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const loadingRef = React.useRef(false);
 
   const [blockPage, setBlockPage] = useState(1);
   const [txPage, setTxPage] = useState(1);
@@ -138,30 +140,39 @@ const ExplorerPage: React.FC = () => {
   }, [txPage, pageSize, netStats]);
 
   useEffect(() => {
-    loadData();
-    const unsub = listen('ego://chain-updated', () => { loadData(); });
-    return () => { unsub.then(fn => fn()); };
+    loadData(false);
+    const unsub = listen('ego://chain-updated', () => {
+      if (refreshTimer.current) clearTimeout(refreshTimer.current);
+      refreshTimer.current = setTimeout(() => loadData(true), 5_000);
+    });
+    return () => { unsub.then(fn => fn()); if (refreshTimer.current) clearTimeout(refreshTimer.current); };
   }, []);
 
-  async function loadData() {
-    setLoading(true);
+  async function loadData(silent: boolean) {
+    if (loadingRef.current) return;
+    loadingRef.current = true;
+    if (!silent) setLoading(true);
 
-    const withTimeout = <T,>(p: Promise<T>, fallback: T, ms = 12_000): Promise<T> =>
+    const withTimeout = <T,>(p: Promise<T>, fallback: T, ms = 5_000): Promise<T> =>
       Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
 
-    const [b, t, n, fe] = await Promise.all([
-      withTimeout(invoke<LedgerBlock[]>('get_blocks', { offset: 0, limit: pageSize }).catch(() => []), []),
-      withTimeout(invoke<LedgerTx[]>('get_all_transactions', { offset: 0, limit: pageSize }).catch(() => []), []),
-      withTimeout(invoke<NetworkStats>('get_network_stats').catch(() => null), null),
-      withTimeout(invoke<FileEvent[]>('get_file_events').catch(() => []), []),
-    ]);
+    try {
+      const [b, t, n, fe] = await Promise.all([
+        withTimeout(invoke<LedgerBlock[]>('get_blocks', { offset: 0, limit: pageSize }).catch(() => []), []),
+        withTimeout(invoke<LedgerTx[]>('get_all_transactions', { offset: 0, limit: pageSize }).catch(() => []), []),
+        withTimeout(invoke<NetworkStats>('get_network_stats').catch(() => null), null),
+        withTimeout(invoke<FileEvent[]>('get_file_events').catch(() => []), []),
+      ]);
 
-    setBlocks(b);
-    setTxs(t);
-    if (n) setNetStats(n);
-    setFileEvents(fe);
-    setLoading(false);
-    invoke<Tokenomics>('get_tokenomics').then(setTokenomics).catch(() => {});
+      if (b.length > 0 || !silent) setBlocks(b);
+      if (t.length > 0 || !silent) setTxs(t);
+      if (n) setNetStats(n);
+      if (fe.length > 0 || !silent) setFileEvents(fe);
+      invoke<Tokenomics>('get_tokenomics').then(setTokenomics).catch(() => {});
+    } finally {
+      loadingRef.current = false;
+      setLoading(false);
+    }
   }
 
   async function handleSearch() {
@@ -231,7 +242,7 @@ const ExplorerPage: React.FC = () => {
           🔍 Search
         </button>
         <button
-          onClick={loadData}
+          onClick={() => loadData(false)}
           className="bg-gray-700 hover:bg-gray-600 transition px-4 py-3 rounded-xl text-sm"
           title="Refresh"
         >
