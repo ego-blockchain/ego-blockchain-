@@ -6525,9 +6525,26 @@ pub async fn propose_block_as_leader() {
     let pool    = crate::mempool::get_mempool();
     let txs     = pool.drain_all();
 
-    let (poc_ticket, poc_sig) = crate::poc::check_slot_winner(&prev_hash)
-        .unwrap_or_else(|| (String::new(), String::new()));
-    let poc_slot        = crate::poc::current_slot();
+    let poc_slot = crate::poc::current_slot();
+    let (poc_ticket, poc_sig) = {
+        use ed25519_dalek::{SigningKey, Signer};
+        let slot_seed = crate::poc::slot_seed(&prev_hash, poc_slot);
+        let sig       = SigningKey::from_bytes(&seed_32).sign(&slot_seed);
+        let sig_hex   = hex::encode(sig.to_bytes());
+        let ticket    = *blake3::hash(&sig.to_bytes()).as_bytes();
+        let validators = get_known_validators_snapshot();
+        if validators.is_empty() {
+            (hex::encode(ticket), sig_hex)
+        } else {
+            let my_drs    = crate::bft_committee::compute_drs_weight(&miner);
+            let total_drs = crate::bft_committee::total_drs_weight(&validators);
+            if crate::bft_committee::qualifies_proposer(&ticket, my_drs, total_drs) {
+                (hex::encode(ticket), sig_hex)
+            } else {
+                (String::new(), String::new())
+            }
+        }
+    };
     let combined_ticket = if poc_ticket.is_empty() { String::new() }
                           else { format!("{}:{}", poc_ticket, poc_sig) };
 
@@ -6681,9 +6698,26 @@ pub async fn propose_block_as_leader_forced() {
     let pool = crate::mempool::get_mempool();
     let txs  = pool.drain_all();
 
-    let (poc_ticket, poc_sig) = crate::poc::check_slot_winner(&prev_hash)
-        .unwrap_or_else(|| (String::new(), String::new()));
-    let poc_slot        = crate::poc::current_slot();
+    let poc_slot = crate::poc::current_slot();
+    let (poc_ticket, poc_sig) = {
+        use ed25519_dalek::{SigningKey, Signer};
+        let slot_seed = crate::poc::slot_seed(&prev_hash, poc_slot);
+        let sig       = SigningKey::from_bytes(&seed_32).sign(&slot_seed);
+        let sig_hex   = hex::encode(sig.to_bytes());
+        let ticket    = *blake3::hash(&sig.to_bytes()).as_bytes();
+        let validators = get_known_validators_snapshot();
+        if validators.is_empty() {
+            (hex::encode(ticket), sig_hex)
+        } else {
+            let my_drs    = crate::bft_committee::compute_drs_weight(&miner);
+            let total_drs = crate::bft_committee::total_drs_weight(&validators);
+            if crate::bft_committee::qualifies_proposer(&ticket, my_drs, total_drs) {
+                (hex::encode(ticket), sig_hex)
+            } else {
+                (String::new(), String::new())
+            }
+        }
+    };
     let combined_ticket = if poc_ticket.is_empty() { String::new() }
                           else { format!("{}:{}", poc_ticket, poc_sig) };
 
