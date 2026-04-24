@@ -82,10 +82,13 @@ pub static DHT_CMD_TX: OnceLock<mpsc::Sender<DhtCommand>> = OnceLock::new();
 static SEED_CACHE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
 
 pub fn prime_ed25519_seed_cache() {
+    eprintln!("[Startup] prime_ed25519_seed_cache: calling load_seed (DPAPI)…");
     SEED_CACHE.get_or_init(|| {
-        crate::ledger::load_seed().ok().flatten().and_then(|b| {
+        let result = crate::ledger::load_seed().ok().flatten().and_then(|b| {
             if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) } else { None }
-        })
+        });
+        eprintln!("[Startup] prime_ed25519_seed_cache: seed loaded (found={})", result.is_some());
+        result
     });
 }
 

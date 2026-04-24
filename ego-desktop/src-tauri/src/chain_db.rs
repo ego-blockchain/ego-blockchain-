@@ -96,6 +96,7 @@ static CHAIN_DB: OnceLock<Mutex<DB>> = OnceLock::new();
 pub fn get_db() -> &'static Mutex<DB> {
     CHAIN_DB.get_or_init(|| {
         let db_path = base_data_dir().join("chain_rocksdb");
+        eprintln!("[ChainDB] Opening RocksDB at {:?}", db_path);
 
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
@@ -128,8 +129,10 @@ pub fn get_db() -> &'static Mutex<DB> {
 
         let db = DB::open_cf_descriptors(&db_opts, &db_path, cf_descs)
             .expect("open RocksDB chain store");
+        eprintln!("[ChainDB] RocksDB opened successfully");
 
         init_db(&db);
+        eprintln!("[ChainDB] RocksDB init_db done");
         Mutex::new(db)
     })
 }

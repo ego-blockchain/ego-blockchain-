@@ -443,16 +443,20 @@ pub async fn auto_join_cluster(cluster_id: String, app: tauri::AppHandle) {
 
 #[tauri::command]
 pub async fn get_cluster_bookings() -> Result<Vec<ClusterBooking>, EgoDesktopError> {
-    let my_addr = crate::ledger::Ledger::load().address;
-    let bookings = crate::chain_db::list_cluster_bookings()
-        .into_iter()
-        .filter(|b| {
-            b.status != "terminated"
-                && (b.buyer_address == my_addr
-                    || b.nodes.iter().any(|n| n.provider_address == my_addr))
-        })
-        .collect();
-    Ok(bookings)
+    tokio::task::spawn_blocking(|| {
+        let my_addr = crate::ledger::Ledger::load().address;
+        let bookings = crate::chain_db::list_cluster_bookings()
+            .into_iter()
+            .filter(|b| {
+                b.status != "terminated"
+                    && (b.buyer_address == my_addr
+                        || b.nodes.iter().any(|n| n.provider_address == my_addr))
+            })
+            .collect();
+        Ok::<_, EgoDesktopError>(bookings)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 #[tauri::command]

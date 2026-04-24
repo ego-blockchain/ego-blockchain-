@@ -161,29 +161,33 @@ fn check_and_apply_timeout(job: &mut ComputeJob) -> bool {
 
 #[tauri::command]
 pub async fn detect_hardware() -> Result<HardwareProfile, EgoDesktopError> {
-    use sysinfo::System;
-    let mut sys = System::new_all();
-    sys.refresh_all();
+    tokio::task::spawn_blocking(|| {
+        use sysinfo::System;
+        let mut sys = System::new_all();
+        sys.refresh_all();
 
-    let cpu_cores = sys.cpus().len() as u32;
-    let cpu_model = sys.cpus().first()
-        .map(|c| c.brand().to_string())
-        .unwrap_or_else(|| "Unknown CPU".to_string());
-    let ram_gb = (sys.total_memory() / 1_073_741_824).max(1) as u32;
+        let cpu_cores = sys.cpus().len() as u32;
+        let cpu_model = sys.cpus().first()
+            .map(|c| c.brand().to_string())
+            .unwrap_or_else(|| "Unknown CPU".to_string());
+        let ram_gb = (sys.total_memory() / 1_073_741_824).max(1) as u32;
 
-    let (gpu_name, gpu_vram_gb, gpu_count, has_cuda) = detect_gpu();
-    let score = compute_score(cpu_cores, ram_gb, gpu_vram_gb, gpu_count);
+        let (gpu_name, gpu_vram_gb, gpu_count, has_cuda) = detect_gpu();
+        let score = compute_score(cpu_cores, ram_gb, gpu_vram_gb, gpu_count);
 
-    Ok(HardwareProfile {
-        cpu_cores,
-        cpu_model,
-        ram_gb,
-        gpu_name,
-        gpu_vram_gb,
-        gpu_count,
-        has_cuda,
-        compute_score: score,
+        Ok::<_, EgoDesktopError>(HardwareProfile {
+            cpu_cores,
+            cpu_model,
+            ram_gb,
+            gpu_name,
+            gpu_vram_gb,
+            gpu_count,
+            has_cuda,
+            compute_score: score,
+        })
     })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 #[tauri::command]
@@ -259,7 +263,23 @@ pub async fn configure_compute_node(
 
 #[tauri::command]
 pub async fn get_compute_status() -> Result<ComputeStatus, EgoDesktopError> {
-    let ledger = crate::ledger::Ledger::load();
+    let (ledger, all_jobs, online_nodes) = tokio::task::spawn_blocking(|| {
+        let ledger = crate::ledger::Ledger::load();
+        let mut all_jobs = crate::chain_db::list_compute_jobs();
+        let now = chrono::Utc::now().timestamp();
+        for job in all_jobs.iter_mut() {
+            if check_and_apply_timeout(job) {
+                crate::chain_db::upsert_compute_job(job);
+            }
+        }
+        let online_nodes = crate::chain_db::list_compute_nodes().iter()
+            .filter(|n| now - n.last_seen < 300)
+            .count() as u64;
+        (ledger, all_jobs, online_nodes)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
+
     let hw = if ledger.compute_enabled {
         detect_hardware().await.ok()
     } else {
@@ -267,31 +287,22 @@ pub async fn get_compute_status() -> Result<ComputeStatus, EgoDesktopError> {
     };
 
     let my_addr = &ledger.address;
-    let mut all_jobs = crate::chain_db::list_compute_jobs();
 
-    let mut changed = false;
-    for job in all_jobs.iter_mut() {
-        if check_and_apply_timeout(job) {
-            crate::chain_db::upsert_compute_job(job);
-            changed = true;
-        }
-    }
-
-    if changed {
-        let locked_c: u32 = all_jobs.iter()
-            .filter(|j| j.worker_address == *my_addr && (j.status == "accepted" || j.status == "running"))
-            .map(|j| j.required_cores)
-            .sum();
-        let locked_r: u32 = all_jobs.iter()
-            .filter(|j| j.worker_address == *my_addr && (j.status == "accepted" || j.status == "running"))
-            .map(|j| j.required_vram_gb)
-            .sum();
-        if locked_c != ledger.compute_locked_cores || locked_r != ledger.compute_locked_ram_gb {
+    let locked_c: u32 = all_jobs.iter()
+        .filter(|j| j.worker_address == *my_addr && (j.status == "accepted" || j.status == "running"))
+        .map(|j| j.required_cores)
+        .sum();
+    let locked_r: u32 = all_jobs.iter()
+        .filter(|j| j.worker_address == *my_addr && (j.status == "accepted" || j.status == "running"))
+        .map(|j| j.required_vram_gb)
+        .sum();
+    if locked_c != ledger.compute_locked_cores || locked_r != ledger.compute_locked_ram_gb {
+        tokio::task::spawn_blocking(move || {
             let mut l = crate::ledger::Ledger::load();
             l.compute_locked_cores  = locked_c;
             l.compute_locked_ram_gb = locked_r;
             let _ = l.save();
-        }
+        }).await.ok();
     }
 
     let active_jobs: Vec<ComputeJob> = all_jobs.iter()
@@ -310,18 +321,13 @@ pub async fn get_compute_status() -> Result<ComputeStatus, EgoDesktopError> {
         .filter(|j| j.status == "posted" && j.poster_address != *my_addr)
         .cloned().collect();
 
-    let online_nodes = crate::chain_db::list_compute_nodes().iter()
-        .filter(|n| chrono::Utc::now().timestamp() - n.last_seen < 300)
-        .count() as u64;
-
-    let ledger = crate::ledger::Ledger::load();
     Ok(ComputeStatus {
-        enabled:              ledger.compute_enabled,
-        hardware:             hw,
-        allocated_cores:      ledger.compute_allocated_cores,
-        allocated_ram_gb:     ledger.compute_allocated_ram_gb,
-        locked_cores:              ledger.compute_locked_cores,
-        locked_ram_gb:             ledger.compute_locked_ram_gb,
+        enabled:                   ledger.compute_enabled,
+        hardware:                  hw,
+        allocated_cores:           ledger.compute_allocated_cores,
+        allocated_ram_gb:          ledger.compute_allocated_ram_gb,
+        locked_cores:              locked_c,
+        locked_ram_gb:             locked_r,
         price_per_gpu_hour_uegoc:  ledger.compute_price_per_gpu_hour_uegoc,
         price_per_core_hour_uegoc: ledger.compute_price_per_core_hour_uegoc,
         active_jobs,
@@ -337,12 +343,16 @@ pub async fn get_compute_status() -> Result<ComputeStatus, EgoDesktopError> {
 
 #[tauri::command]
 pub async fn get_compute_nodes() -> Result<Vec<ComputeNodeRecord>, EgoDesktopError> {
-    let now   = chrono::Utc::now().timestamp();
-    let nodes = crate::chain_db::list_compute_nodes()
-        .into_iter()
-        .filter(|n| now - n.last_seen < 600)
-        .collect();
-    Ok(nodes)
+    tokio::task::spawn_blocking(|| {
+        let now   = chrono::Utc::now().timestamp();
+        let nodes = crate::chain_db::list_compute_nodes()
+            .into_iter()
+            .filter(|n| now - n.last_seen < 600)
+            .collect();
+        Ok::<_, EgoDesktopError>(nodes)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 #[tauri::command]
@@ -476,7 +486,9 @@ pub async fn cancel_compute_job(
 
 #[tauri::command]
 pub async fn get_compute_jobs() -> Result<Vec<ComputeJob>, EgoDesktopError> {
-    Ok(crate::chain_db::list_compute_jobs())
+    tokio::task::spawn_blocking(|| Ok::<_, EgoDesktopError>(crate::chain_db::list_compute_jobs()))
+        .await
+        .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 fn compute_min_bid(
@@ -931,11 +943,15 @@ pub async fn cancel_capacity_offer(offer_id: String) -> Result<(), EgoDesktopErr
 
 #[tauri::command]
 pub async fn get_capacity_offers() -> Result<Vec<ComputeCapacityOffer>, EgoDesktopError> {
-    let offers = crate::chain_db::list_compute_offers()
-        .into_iter()
-        .filter(|o| o.status == "open")
-        .collect();
-    Ok(offers)
+    tokio::task::spawn_blocking(|| {
+        let offers = crate::chain_db::list_compute_offers()
+            .into_iter()
+            .filter(|o| o.status == "open")
+            .collect();
+        Ok::<_, EgoDesktopError>(offers)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 #[tauri::command]
@@ -1227,24 +1243,28 @@ fn passive_breach_tick(res: &mut ComputeReservation, bonded: bool) -> bool {
 
 #[tauri::command]
 pub async fn get_reservations() -> Result<Vec<ComputeReservation>, EgoDesktopError> {
-    let ledger  = crate::ledger::Ledger::load();
-    let my_addr = ledger.address.clone();
+    tokio::task::spawn_blocking(|| {
+        let ledger  = crate::ledger::Ledger::load();
+        let my_addr = ledger.address.clone();
 
-    let mut reservations: Vec<ComputeReservation> = crate::chain_db::list_compute_reservations()
-        .into_iter()
-        .filter(|r| r.buyer_address == my_addr || r.provider_address == my_addr)
-        .collect();
+        let mut reservations: Vec<ComputeReservation> = crate::chain_db::list_compute_reservations()
+            .into_iter()
+            .filter(|r| r.buyer_address == my_addr || r.provider_address == my_addr)
+            .collect();
 
-    for res in &mut reservations {
-        let bonded = crate::chain_db::get_compute_offer(&res.offer_id)
-            .map(|o| o.bonded)
-            .unwrap_or(false);
-        if passive_breach_tick(res, bonded) {
-            crate::chain_db::upsert_compute_reservation(res);
+        for res in &mut reservations {
+            let bonded = crate::chain_db::get_compute_offer(&res.offer_id)
+                .map(|o| o.bonded)
+                .unwrap_or(false);
+            if passive_breach_tick(res, bonded) {
+                crate::chain_db::upsert_compute_reservation(res);
+            }
         }
-    }
 
-    Ok(reservations)
+        Ok::<_, EgoDesktopError>(reservations)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 #[tauri::command]
@@ -1324,30 +1344,34 @@ pub async fn terminate_reservation(
 
 #[tauri::command]
 pub async fn get_compute_earnings() -> Result<ComputeEarnings, EgoDesktopError> {
-    let ledger  = crate::ledger::Ledger::load();
-    let jobs    = crate::chain_db::list_compute_jobs();
-    let now     = chrono::Utc::now().timestamp();
-    let day_ago = now - 86_400;
+    tokio::task::spawn_blocking(|| {
+        let ledger  = crate::ledger::Ledger::load();
+        let jobs    = crate::chain_db::list_compute_jobs();
+        let now     = chrono::Utc::now().timestamp();
+        let day_ago = now - 86_400;
 
-    let last_24h_uegoc: u64 = jobs.iter()
-        .filter(|j| {
-            j.worker_address == ledger.address
-                && j.status == "completed"
-                && j.completed_at.map(|t| t > day_ago).unwrap_or(false)
+        let last_24h_uegoc: u64 = jobs.iter()
+            .filter(|j| {
+                j.worker_address == ledger.address
+                    && j.status == "completed"
+                    && j.completed_at.map(|t| t > day_ago).unwrap_or(false)
+            })
+            .map(|j| j.bid_uegoc)
+            .sum();
+
+        let avg = if ledger.compute_jobs_completed > 0 {
+            ledger.compute_earnings_uegoc / ledger.compute_jobs_completed
+        } else {
+            0
+        };
+
+        Ok::<_, EgoDesktopError>(ComputeEarnings {
+            total_uegoc:       ledger.compute_earnings_uegoc,
+            jobs_completed:    ledger.compute_jobs_completed,
+            avg_per_job_uegoc: avg,
+            last_24h_uegoc,
         })
-        .map(|j| j.bid_uegoc)
-        .sum();
-
-    let avg = if ledger.compute_jobs_completed > 0 {
-        ledger.compute_earnings_uegoc / ledger.compute_jobs_completed
-    } else {
-        0
-    };
-
-    Ok(ComputeEarnings {
-        total_uegoc:       ledger.compute_earnings_uegoc,
-        jobs_completed:    ledger.compute_jobs_completed,
-        avg_per_job_uegoc: avg,
-        last_24h_uegoc,
     })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }

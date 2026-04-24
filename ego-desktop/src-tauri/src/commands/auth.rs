@@ -208,9 +208,11 @@ fn load_or_generate_pq_keys(seed: &[u8; 32]) -> Result<KeyPair, EgoDesktopError>
 }
 
 fn derive_wallet_keys() -> Result<WalletKeys, EgoDesktopError> {
+    eprintln!("[init_wallet] derive_wallet_keys: calling load_seed (DPAPI)…");
     let seed_bytes = crate::ledger::load_seed()
         .map_err(|e| EgoDesktopError::CryptoError(format!("Failed to load seed: {}", e)))?
         .ok_or_else(|| EgoDesktopError::CryptoError("Corrupt or missing seed file".into()))?;
+    eprintln!("[init_wallet] derive_wallet_keys: seed loaded OK, deriving keys…");
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&seed_bytes);
 
@@ -243,6 +245,7 @@ fn derive_wallet_keys() -> Result<WalletKeys, EgoDesktopError> {
     let balance_uegoc     = ledger.balance_uegoc;
     let balance_formatted = format!("{:.2} EGOC", balance_uegoc as f64 / 1_000_000.0);
 
+    eprintln!("[init_wallet] derive_wallet_keys done — address={}", &address[..address.len().min(20)]);
     Ok(WalletKeys { keypair, address, ed25519_hex, dilithium_hex, kyber_hex, balance_uegoc, balance_formatted })
 }
 
@@ -251,10 +254,11 @@ async fn load_active_wallet(
     is_new: bool,
     handle: Option<tauri::AppHandle>,
 ) -> Result<WalletInfo, EgoDesktopError> {
-
+    eprintln!("[init_wallet] load_active_wallet: spawn_blocking derive_wallet_keys…");
     let keys = tokio::task::spawn_blocking(derive_wallet_keys)
         .await
         .map_err(|e| EgoDesktopError::CryptoError(format!("Key generation panicked: {e}")))??;
+    eprintln!("[init_wallet] load_active_wallet: keys derived OK");
 
     state
         .initialize_wallet(keys.keypair, false)
@@ -385,6 +389,7 @@ pub async fn init_wallet(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<WalletInfo, EgoDesktopError> {
+    eprintln!("[init_wallet] called");
     let legacy_seed = base_data_dir().join("wallet.seed");
     if legacy_seed.exists() && !registry_path().exists() {
         let w0_dir = wallet_dir("wallet_0");
@@ -500,7 +505,10 @@ pub async fn init_wallet(
             .map_err(|e| EgoDesktopError::CryptoError(format!("Wallet creation panicked: {e}")))??;
     }
 
-    load_active_wallet(&state, is_new, Some(app_handle)).await
+    eprintln!("[init_wallet] calling load_active_wallet…");
+    let result = load_active_wallet(&state, is_new, Some(app_handle)).await;
+    eprintln!("[init_wallet] load_active_wallet returned: {}", if result.is_ok() { "OK" } else { "ERR" });
+    result
 }
 
 #[tauri::command]

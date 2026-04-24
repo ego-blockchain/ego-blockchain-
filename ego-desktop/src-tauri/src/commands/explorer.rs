@@ -28,7 +28,9 @@ pub struct NetworkStats {
 
 #[tauri::command]
 pub async fn get_network_stats() -> Result<NetworkStats, EgoDesktopError> {
-    tokio::task::spawn_blocking(|| {
+    eprintln!("[Explorer] get_network_stats called");
+    let result = tokio::task::spawn_blocking(|| {
+        eprintln!("[Explorer] get_network_stats: inside spawn_blocking");
         let registry = load_registry();
         let (latest_height, _) = crate::chain_db::latest_block_info();
         let node_count = registry
@@ -47,6 +49,7 @@ pub async fn get_network_stats() -> Result<NetworkStats, EgoDesktopError> {
                 }
             }
         }
+        eprintln!("[Explorer] get_network_stats: done (height={})", latest_height);
         Ok(NetworkStats {
             latest_block: latest_height,
             total_transactions: crate::chain_db::tx_count() as usize,
@@ -56,7 +59,9 @@ pub async fn get_network_stats() -> Result<NetworkStats, EgoDesktopError> {
         })
     })
     .await
-    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
+    eprintln!("[Explorer] get_network_stats returning");
+    result
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -103,9 +108,17 @@ pub async fn get_p2p_status(state: tauri::State<'_, crate::app::AppState>) -> Re
 pub async fn get_blocks(offset: Option<u32>, limit: Option<u32>) -> Result<Vec<LedgerBlock>, EgoDesktopError> {
     let off = offset.unwrap_or(0) as usize;
     let lim = limit.unwrap_or(25) as usize;
-    tokio::task::spawn_blocking(move || crate::chain_db::paged_blocks(off, lim))
-        .await
-        .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))
+    eprintln!("[Explorer] get_blocks called (offset={}, limit={})", off, lim);
+    let result = tokio::task::spawn_blocking(move || {
+        eprintln!("[Explorer] get_blocks: inside spawn_blocking");
+        let blocks = crate::chain_db::paged_blocks(off, lim);
+        eprintln!("[Explorer] get_blocks: got {} blocks", blocks.len());
+        blocks
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()));
+    eprintln!("[Explorer] get_blocks returning: {}", if result.is_ok() { "OK" } else { "ERR" });
+    result
 }
 
 #[tauri::command]

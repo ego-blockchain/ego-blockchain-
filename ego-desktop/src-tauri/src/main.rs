@@ -564,18 +564,20 @@ fn main() {
             commands::l2::challenge_rollup_batch
         ])
         .setup(|app| {
-            // Pre-warm RocksDB so the first frontend commands don't hit the
-            // 2-8s cold-open delay on Windows. All chain_db calls in Tauri
-            // commands are now in spawn_blocking, so this std::thread blocking
-            // on OnceLock::get_or_init is safe — no async tokio worker threads
-            // are involved and the blocking thread pool can wait.
+            eprintln!("[Startup] setup() called — spawning background init threads");
+
             std::thread::spawn(|| {
+                eprintln!("[Startup] RocksDB pre-warm thread started");
                 let _ = crate::chain_db::get_db();
+                eprintln!("[Startup] RocksDB pre-warm thread done");
             });
 
             std::thread::spawn(|| {
+                eprintln!("[Startup] Seed+PQ cache thread started");
                 crate::p2p::prime_ed25519_seed_cache();
+                eprintln!("[Startup] Seed cache primed");
                 crate::commands::auth::ensure_pq_cache();
+                eprintln!("[Startup] PQ cache ready");
             });
 
             let window = app.get_window("main").unwrap();
