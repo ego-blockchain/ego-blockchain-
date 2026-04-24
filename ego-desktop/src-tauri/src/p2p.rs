@@ -5725,6 +5725,20 @@ pub async fn fetch_chain_from_oracle(app: Option<&tauri::AppHandle<tauri::Wry>>)
 }
 
 
+fn get_ed25519_seed() -> Option<[u8; 32]> {
+    if let Some(kp) = crate::app::global_app_state().get_keypair() {
+        let sk = kp.get_ed25519_secret_key();
+        if sk.len() == 32 {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(sk);
+            return Some(a);
+        }
+    }
+    crate::ledger::load_seed().ok().flatten().and_then(|b| {
+        if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) } else { None }
+    })
+}
+
 fn bft_sign(data: &str) -> Option<String> {
     use ed25519_dalek::{SigningKey, Signer};
     let seed_bytes = crate::ledger::load_seed().ok().flatten()?;
@@ -5753,9 +5767,7 @@ async fn handle_block_proposal(
 ) {
     let (my_addr, seed_arr_opt) = match tokio::task::spawn_blocking(|| {
         let addr = crate::ledger::Ledger::load().address;
-        let seed: Option<[u8; 32]> = crate::ledger::load_seed().ok().flatten().and_then(|b| {
-            if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) } else { None }
-        });
+        let seed = get_ed25519_seed();
         (addr, seed)
     }).await {
         Ok(v)  => v,
@@ -6351,9 +6363,7 @@ async fn handle_view_change_msg(view: u64, voter: String) {
     let (my_addr, block_count_now, seed_32_opt) = match tokio::task::spawn_blocking(|| {
         let addr  = crate::ledger::Ledger::load().address;
         let count = crate::chain_db::block_count();
-        let seed: Option<[u8; 32]> = crate::ledger::load_seed().ok().flatten().and_then(|b| {
-            if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) } else { None }
-        });
+        let seed  = get_ed25519_seed();
         (addr, count, seed)
     }).await {
         Ok(v)  => v,
@@ -6494,20 +6504,14 @@ pub async fn propose_block_as_leader() {
         if miner.is_empty() { return None; }
         let prev_hash   = crate::chain_db::get_tip_hash();
         let next_height = crate::chain_db::block_count() + 1;
-        let seed_bytes  = match crate::ledger::load_seed() {
-            Ok(Some(b)) => b,
-            _           => return None,
-        };
-        Some((miner, prev_hash, next_height, seed_bytes))
+        let seed_32 = get_ed25519_seed()?;
+        Some((miner, prev_hash, next_height, seed_32))
     }).await.unwrap_or(None);
 
-    let (miner, prev_hash, next_height, seed_bytes) = match init {
+    let (miner, prev_hash, next_height, seed_32) = match init {
         Some(v) => v,
         None    => { touch_proposal_timestamp(); return; }
     };
-
-    let mut seed_32 = [0u8; 32];
-    seed_32.copy_from_slice(&seed_bytes);
 
     let vrf_in     = crate::bft_committee::vrf_input(&prev_hash, next_height, crate::bft_committee::VRF_ROLE_PROPOSER);
     let vrf_ticket = crate::bft_committee::sign_vrf_ticket(&seed_32, &vrf_in);
@@ -6678,20 +6682,14 @@ pub async fn propose_block_as_leader_forced() {
         if miner.is_empty() { return None; }
         let prev_hash   = crate::chain_db::get_tip_hash();
         let next_height = crate::chain_db::block_count() + 1;
-        let seed_bytes  = match crate::ledger::load_seed() {
-            Ok(Some(b)) if b.len() == 32 => b,
-            _                            => return None,
-        };
-        Some((miner, prev_hash, next_height, seed_bytes))
+        let seed_32 = get_ed25519_seed()?;
+        Some((miner, prev_hash, next_height, seed_32))
     }).await.unwrap_or(None);
 
-    let (miner, prev_hash, next_height, seed_bytes) = match init {
+    let (miner, prev_hash, next_height, seed_32) = match init {
         Some(v) => v,
         None    => { touch_proposal_timestamp(); return; }
     };
-
-    let mut seed_32 = [0u8; 32];
-    seed_32.copy_from_slice(&seed_bytes);
 
     let is_solo = known_validators().len() <= 1
         || SOLO_AFTER_EVICTION.swap(false, Ordering::Relaxed);
@@ -6831,12 +6829,7 @@ pub async fn run_view_change_monitor() {
             let chain_next = crate::chain_db::block_count() as u64 + 1;
             let my_addr    = crate::ledger::Ledger::load().address;
             if my_addr.is_empty() { return None; }
-            let seed: [u8; 32] = match crate::ledger::load_seed() {
-                Ok(Some(b)) if b.len() == 32 => {
-                    let mut a = [0u8; 32]; a.copy_from_slice(&b); a
-                }
-                _ => return None,
-            };
+            let seed = get_ed25519_seed()?;
             Some((chain_next, my_addr, seed))
         }).await.unwrap_or(None);
         let (chain_next, my_addr, seed_32) = match view_init {
