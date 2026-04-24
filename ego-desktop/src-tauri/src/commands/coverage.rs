@@ -197,18 +197,18 @@ pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
         .unwrap_or_default();
 
     // Publish an immediate placeholder so CoveragePage has something real to
-    // render before relay/IP discovery completes.
+    // render before relay/IP discovery completes. Always show Fair (not Offline)
+    // here — the real tick at t+8s will determine the true online/offline state.
+    // Showing Offline in the placeholder causes a misleading flash whenever the
+    // wallet file hasn't been read yet at the exact moment this runs.
     {
         let state = app.state::<AppState>();
-        let node_active = tokio::task::spawn_blocking(|| !crate::ledger::Ledger::load().address.is_empty())
-            .await
-            .unwrap_or(false);
         let placeholder = CoverageStatus {
             location:              None,
             coverage_synced_count: 0,
             last_coverage_event:   None,
-            is_online:             node_active,
-            network_quality:       if node_active { NetworkQuality::Fair } else { NetworkQuality::Offline },
+            is_online:             true,
+            network_quality:       NetworkQuality::Fair,
             vpn_detected:          false,
             vpn_reason:            String::new(),
             machine_id:            machine_id.clone(),
@@ -217,7 +217,7 @@ pub async fn run_background_coverage_loop(app: tauri::AppHandle) {
     }
     let _ = app.emit_all("ego://coverage-updated", ());
 
-    // Wait for relay circuit to be confirmed before first probe.
+    // Wait for relay circuit before first real probe.
     tokio::time::sleep(std::time::Duration::from_secs(8)).await;
 
     // Initial IP/VPN fetch.

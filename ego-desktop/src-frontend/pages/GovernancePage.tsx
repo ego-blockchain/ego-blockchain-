@@ -63,7 +63,7 @@ function timeLeft(ts: number): string {
   return h > 0 ? `${h}h ${m}m left` : `${m}m left`;
 }
 
-function withTimeout<T>(promise: Promise<T>, fallback: T, ms = 5_000): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, fallback: T, ms = 15_000): Promise<T> {
   return Promise.race([promise, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
 }
 
