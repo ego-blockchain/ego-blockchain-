@@ -5750,7 +5750,10 @@ async fn handle_block_proposal(
             if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) } else { None }
         });
         (addr, seed)
-    }).await.unwrap_or_default();
+    }).await {
+        Ok(v)  => v,
+        Err(_) => return,
+    };
     if my_addr.is_empty() { return; }
     if my_addr == proposer { return; }
     let seed_arr = match seed_arr_opt {
