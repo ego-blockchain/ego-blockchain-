@@ -649,17 +649,10 @@ fn main() {
                     crate::chain_db::restore_in_memory_state_from_db();
                     crate::sharding::load_agreed_shard_count_from_db();
 
-                    let miners: std::collections::HashSet<String> = crate::chain_db::recent_blocks(500)
-                        .into_iter()
-                        .filter(|b| !b.miner.is_empty())
-                        .map(|b| b.miner)
-                        .collect();
-                    let n = miners.len();
-                    for m in miners {
-                        crate::p2p::register_known_validator(&m);
-                    }
-                    if n > 0 {
-                        tracing::info!("Pre-registered {} validator(s) from chain history", n);
+                    let my_addr = crate::ledger::Ledger::load().address;
+                    if !my_addr.is_empty() {
+                        crate::p2p::register_known_validator(&my_addr);
+                        tracing::info!("Registered local validator: {}", &my_addr[..my_addr.len().min(20)]);
                     }
                 }).await.ok();
 
