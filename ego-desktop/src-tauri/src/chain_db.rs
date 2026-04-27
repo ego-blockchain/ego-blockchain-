@@ -144,8 +144,34 @@ pub fn get_db() -> DbWrapper {
 
         init_db(&db);
         eprintln!("[ChainDB] RocksDB init_db done");
+
+        // Ensure dynamic testnet faucet is funded (handles migrated DBs that skipped seed_genesis)
+        if let Some(cf_balances) = db.cf_handle(CF_BALANCES) {
+            let faucet_addr = get_faucet_address();
+            let cur = db.get_cf(cf_balances, faucet_addr.as_bytes())
+                .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+            if cur == 0 {
+                let _ = db.put_cf(cf_balances, faucet_addr.as_bytes(), u64_le(10_000_000 * 1_000_000));
+            }
+        }
+        
         db
     }))
+}
+
+static FAUCET_KEYPAIR: std::sync::OnceLock<ego_core::KeyPair> = std::sync::OnceLock::new();
+static FAUCET_ADDRESS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn get_faucet_keypair() -> &'static ego_core::KeyPair {
+    FAUCET_KEYPAIR.get_or_init(|| {
+        ego_core::KeyPair::from_bytes(&[0u8; 32]).unwrap()
+    })
+}
+
+pub fn get_faucet_address() -> String {
+    FAUCET_ADDRESS.get_or_init(|| {
+        get_faucet_keypair().derive_bech32_address(1, ego_core::AddressType::EOA, "egot").unwrap_or_default()
+    }).clone()
 }
 
 // ── Initialise / migrate ──────────────────────────────────────────────────────
@@ -396,16 +422,16 @@ fn seed_genesis(db: &DB) {
     let cf_balances = db.cf_handle(CF_BALANCES).unwrap();
     let mut batch = WriteBatch::default();
 
-    let allocs: &[(&str, u64)] = &[
-        (ECOSYSTEM_ADDR,    ECOSYSTEM_EGOC  * UEGOC_PER_EGOC),
-        (FOUNDATION_ADDR,   FOUNDATION_EGOC * UEGOC_PER_EGOC),
-        (NODE_POOL_ADDR,    NODE_POOL_UEGOC),
-        (STAKING_POOL_ADDR, STAKING_POOL_UEGOC),
-        // Faucet seeded with 10M EGOC for testnet distribution
-        (FAUCET_ADDR_FULL,  10_000_000 * UEGOC_PER_EGOC),
+    let faucet_addr = get_faucet_address();
+    let allocs = vec![
+        (ECOSYSTEM_ADDR.to_string(),    ECOSYSTEM_EGOC  * UEGOC_PER_EGOC),
+        (FOUNDATION_ADDR.to_string(),   FOUNDATION_EGOC * UEGOC_PER_EGOC),
+        (NODE_POOL_ADDR.to_string(),    NODE_POOL_UEGOC),
+        (STAKING_POOL_ADDR.to_string(), STAKING_POOL_UEGOC),
+        (faucet_addr,                   10_000_000 * UEGOC_PER_EGOC),
     ];
     for (addr, amount) in allocs {
-        batch.put_cf(cf_balances, addr.as_bytes(), u64_le(*amount));
+        batch.put_cf(cf_balances, addr.as_bytes(), u64_le(amount));
     }
     db.write(batch).expect("genesis balance batch");
 

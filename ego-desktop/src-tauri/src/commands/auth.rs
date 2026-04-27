@@ -727,23 +727,47 @@ pub async fn rename_wallet(
 /// Writes directly to chain_db (SQLite) — save_chain() is a no-op.
 fn credit_testnet_faucet(address: &str) {
     const FAUCET_AMOUNT: u64 = 1_000 * 1_000_000;
-    const FAUCET_ADDR:   &str = "egot1faucet000000000000000000000000000000000";
+    
+    let faucet_kp = crate::chain_db::get_faucet_keypair();
+    let faucet_addr = crate::chain_db::get_faucet_address();
 
     if crate::chain_db::balance_of(address) > 0 { return; }
 
     let ts   = chrono::Utc::now().timestamp();
-    let hash = format!("faucet{:x}{:x}", ts, address.len() ^ (ts as usize));
+    let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+
+    let sign_bytes = crate::ledger::tx_signing_bytes_v2(
+        &faucet_addr,
+        address,
+        FAUCET_AMOUNT,
+        nonce,
+        ts,
+        1,
+        "1000 EGOC testnet"
+    );
+    
+    let signature = hex::encode(faucet_kp.sign_ed25519(&sign_bytes).as_bytes());
+    let hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+    
+    let dilithium_pubkey = hex::encode(faucet_kp.dilithium_public_key().key_data);
+    let dilithium_signature = hex::encode(faucet_kp.sign_dilithium(&sign_bytes).signature_data);
 
     let tx = LedgerTx {
         hash:      hash.clone(),
-        from:      FAUCET_ADDR.into(),
+        from:      faucet_addr,
         to:        address.into(),
         amount:    FAUCET_AMOUNT,
-        fee_uegoc: 0,
-        tx_type:   "faucet".into(),
+        fee_uegoc: 1_000,
+        tx_type:   "transfer".into(),
         memo:      Some("1000 EGOC testnet".into()),
         timestamp: ts,
         status:    "Pending".into(),
+        nonce,
+        public_key_ed25519: hex::encode(faucet_kp.ed25519_public_key().as_bytes()),
+        dilithium_pubkey,
+        dilithium_signature,
+        tx_version: 2,
+        chain_id: 1,
         ..LedgerTx::default()
     };
 
