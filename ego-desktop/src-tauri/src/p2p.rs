@@ -2508,7 +2508,17 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
         for addr_str in peers_env.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             if let Ok(addr) = addr_str.parse::<Multiaddr>() {
                 eprintln!("[P2P] Dialling direct peer: {}", addr);
-                let _ = swarm.dial(addr);
+                let _ = swarm.dial(addr.clone());
+
+                if let Some(pid) = peer_id_from_multiaddr(&addr) {
+                    upsert_peer_cache(PeerEntry {
+                        address:   pid.to_string(),
+                        endpoint:  addr.to_string(),
+                        last_seen: chrono::Utc::now().timestamp(),
+                        city:      None,
+                        country:   None,
+                    });
+                }
             }
         }
     }
