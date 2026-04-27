@@ -59,12 +59,20 @@ fn network_coverage_score(my_score: u64) -> u64 {
 pub fn my_coverage_score() -> u64 {
     let ledger = crate::ledger::Ledger::load();
 
+    // Oracle-reported score for this node takes precedence — it is externally
+    // verified and not self-inflatable. Fall back to local estimate only when
+    // the oracle has never reported a score (e.g. brand-new node).
+    if !ledger.address.is_empty() {
+        let oracle_score = get_peer_score(&ledger.address);
+        if oracle_score > 0 {
+            return oracle_score.min(MAX_COVERAGE_SCORE);
+        }
+    }
+
     let actual_stored: u64 = ledger.stored_files.iter().map(|f| f.encrypted_size).sum();
     let storage_pts = (actual_stored / 1_000_000_000).min(2_000);
-
-    let uptime_pts = uptime_hours();
-
-    let relay_pts = (crate::p2p::get_known_peers().len() as u64 * 5).min(500);
+    let uptime_pts  = uptime_hours();
+    let relay_pts   = (crate::p2p::get_known_peers().len() as u64 * 5).min(500);
 
     (storage_pts + uptime_pts + relay_pts).max(1)
 }
@@ -131,7 +139,12 @@ pub fn check_slot_winner(prev_hash: &str) -> Option<(String, String)> {
     let my_drs    = crate::bft_committee::compute_drs_weight(&ledger.address);
     let total_drs = crate::bft_committee::total_drs_weight(&all_validators);
 
-    if crate::bft_committee::qualifies_proposer(&ticket, my_drs, total_drs) {
+    if crate::bft_committee::qualifies_proposer_for_network(
+        &ticket,
+        my_drs,
+        total_drs,
+        all_validators.len(),
+    ) {
         let ticket_hex = hex::encode(ticket);
         eprintln!(
             "[PoC] Won slot {} — DRS {:.2}/{:.2} — ticket {}…",
@@ -143,7 +156,7 @@ pub fn check_slot_winner(prev_hash: &str) -> Option<(String, String)> {
     }
 }
 
-const POC_ENFORCE_HEIGHT: u64 = 10_000;
+const POC_ENFORCE_HEIGHT: u64 = 1;
 
 pub fn verify_ticket(
     ticket_hex:   &str,
@@ -174,6 +187,10 @@ pub fn verify_ticket(
         eprintln!("[PoC] Ticket mismatch from proposer {}", proposer);
         return false;
     }
+    let ticket_bytes: [u8; 32] = match hex::decode(ticket_hex).ok().and_then(|b| b.try_into().ok()) {
+        Some(bytes) => bytes,
+        None => return false,
+    };
 
     let ed25519_pk = crate::p2p::get_peer_ed25519_pubkey(proposer);
     match ed25519_pk {
@@ -189,14 +206,18 @@ pub fn verify_ticket(
             use ed25519_dalek::{Signature as DalekSig, VerifyingKey, Verifier};
             let vk = match VerifyingKey::from_bytes(&pk_bytes) {
                 Ok(k) => k,
-                Err(_) => return true,
+                Err(_) => return false,
             };
             let sig_arr: [u8; 64] = match sig_bytes.try_into() {
                 Ok(a) => a,
                 Err(_) => return false,
             };
             let dalek_sig = DalekSig::from_bytes(&sig_arr);
-            vk.verify(&seed, &dalek_sig).is_ok()
+            if vk.verify(&seed, &dalek_sig).is_err() {
+                return false;
+            }
+            let _ = ticket_bytes;
+            true
         }
     }
 }

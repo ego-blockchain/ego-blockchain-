@@ -213,6 +213,13 @@ async fn health() -> &'static str { "ok" }
 
 // ── Faucet ─────────────────────────────────────────────────────────────────────
 
+static FAUCET_LAST: std::sync::OnceLock<Mutex<HashMap<String, i64>>> = std::sync::OnceLock::new();
+const FAUCET_COOLDOWN_SECS: i64 = 86_400; // 24 h per address
+
+fn faucet_cooldown() -> std::sync::MutexGuard<'static, HashMap<String, i64>> {
+    FAUCET_LAST.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
+}
+
 #[derive(serde::Deserialize)]
 struct FaucetQuery {
     to: String,
@@ -225,6 +232,20 @@ async fn faucet_handler(Query(q): Query<FaucetQuery>) -> Response {
     let address = q.to.trim().to_string();
     if !address.starts_with("egot1") {
         return Json(json!({ "success": false, "error": "invalid address: must start with egot1" })).into_response();
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    {
+        let mut map = faucet_cooldown();
+        let last = map.entry(address.clone()).or_insert(0);
+        if now - *last < FAUCET_COOLDOWN_SECS {
+            let wait = FAUCET_COOLDOWN_SECS - (now - *last);
+            return (StatusCode::TOO_MANY_REQUESTS, Json(json!({
+                "success": false,
+                "error":   format!("cooldown active — try again in {}s", wait),
+            }))).into_response();
+        }
+        *last = now;
     }
 
     let ts   = chrono::Utc::now().timestamp();

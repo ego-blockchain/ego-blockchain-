@@ -78,33 +78,37 @@ pub struct TransactionResponse {
 
 #[tauri::command]
 pub async fn get_balance(_state: State<'_, AppState>) -> Result<Balance, EgoDesktopError> {
-    let ledger  = Ledger::load();
-    let my_addr = ledger.address.clone();
+    tokio::task::spawn_blocking(|| {
+        let ledger  = Ledger::load();
+        let my_addr = ledger.address.clone();
 
-    if my_addr.is_empty() {
-        return Ok(Balance { egoc: 0, uegoc: 0, formatted: "0.00 EGOC".into(), egusd: 0, uegusd: 0 });
-    }
+        if my_addr.is_empty() {
+            return Ok(Balance { egoc: 0, uegoc: 0, formatted: "0.00 EGOC".into(), egusd: 0, uegusd: 0 });
+        }
 
-    let confirmed = crate::chain_db::balance_of(&my_addr);
-    let pending_out: u64 = crate::mempool::get_mempool()
-        .peek_all()
-        .into_iter()
-        .filter(|tx| tx.from.trim() == my_addr.trim())
-        .map(|tx| tx.amount.saturating_add(tx.fee_uegoc))
-        .sum();
-    let uegoc = confirmed.saturating_sub(pending_out);
-    let egoc  = uegoc / 1_000_000;
+        let confirmed = crate::chain_db::balance_of(&my_addr);
+        let pending_out: u64 = crate::mempool::get_mempool()
+            .peek_all()
+            .into_iter()
+            .filter(|tx| tx.from.trim() == my_addr.trim())
+            .map(|tx| tx.amount.saturating_add(tx.fee_uegoc))
+            .sum();
+        let uegoc = confirmed.saturating_sub(pending_out);
+        let egoc  = uegoc / 1_000_000;
 
-    let uegusd = ledger.balance_uegusd;
-    let egusd  = uegusd / 1_000_000;
+        let uegusd = ledger.balance_uegusd;
+        let egusd  = uegusd / 1_000_000;
 
-    Ok(Balance {
-        egoc,
-        uegoc,
-        formatted: format!("{:.2} EGOC", uegoc as f64 / 1_000_000.0),
-        egusd,
-        uegusd,
+        Ok(Balance {
+            egoc,
+            uegoc,
+            formatted: format!("{:.2} EGOC", uegoc as f64 / 1_000_000.0),
+            egusd,
+            uegusd,
+        })
     })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 // ── send_transaction ──────────────────────────────────────────────────────────
@@ -418,36 +422,40 @@ pub async fn commit_transaction(
 pub async fn get_transaction_history(
     _state: State<'_, AppState>,
 ) -> Result<Vec<LedgerTx>, EgoDesktopError> {
-    let ledger  = Ledger::load();
-    let my_addr = ledger.address.clone();
+    tokio::task::spawn_blocking(|| {
+        let ledger  = Ledger::load();
+        let my_addr = ledger.address.clone();
 
-    if my_addr.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let mut txs: Vec<LedgerTx> = crate::chain_db::get_tx_history_for_addr(&my_addr);
-    for tx in txs.iter_mut() {
-        if tx.status.is_empty() || tx.status == "Pending" {
-            tx.status = "Confirmed".into();
+        if my_addr.is_empty() {
+            return Ok(vec![]);
         }
-    }
 
-    let confirmed_hashes: std::collections::HashSet<String> =
-        txs.iter().map(|t| t.hash.clone()).collect();
+        let mut txs: Vec<LedgerTx> = crate::chain_db::get_tx_history_for_addr(&my_addr);
+        for tx in txs.iter_mut() {
+            if tx.status.is_empty() || tx.status == "Pending" {
+                tx.status = "Confirmed".into();
+            }
+        }
 
-    let pending: Vec<LedgerTx> = crate::mempool::get_mempool()
-        .peek_all()
-        .into_iter()
-        .filter(|tx| {
-            !confirmed_hashes.contains(&tx.hash)
-            && tx.from.trim() == my_addr.trim()
-        })
-        .collect();
+        let confirmed_hashes: std::collections::HashSet<String> =
+            txs.iter().map(|t| t.hash.clone()).collect();
 
-    txs.extend(pending);
-    txs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-    txs.truncate(500);
-    Ok(txs)
+        let pending: Vec<LedgerTx> = crate::mempool::get_mempool()
+            .peek_all()
+            .into_iter()
+            .filter(|tx| {
+                !confirmed_hashes.contains(&tx.hash)
+                && tx.from.trim() == my_addr.trim()
+            })
+            .collect();
+
+        txs.extend(pending);
+        txs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        txs.truncate(500);
+        Ok(txs)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 // ── fetch_swap_rates ──────────────────────────────────────────────────────────

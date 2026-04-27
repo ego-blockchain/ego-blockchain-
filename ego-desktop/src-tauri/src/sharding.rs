@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-static AGREED_SHARD_COUNT: AtomicU32 = AtomicU32::new(1);
+static AGREED_SHARD_COUNT: AtomicU32 = AtomicU32::new(256);
 static REBALANCE_EFFECTIVE_HEIGHT: AtomicU64 = AtomicU64::new(0);
 
 pub const REBALANCE_GRACE_BLOCKS: u64 = 500;
@@ -20,7 +20,7 @@ pub fn set_agreed_shard_count(count: u32, effective_at: u64) {
 }
 
 pub fn load_agreed_shard_count_from_db() {
-    let count = crate::chain_db::get_meta_u64(b"agreed_shard_count").unwrap_or(1) as u32;
+    let count = crate::chain_db::get_meta_u64(b"agreed_shard_count").unwrap_or(256) as u32;
     let height = crate::chain_db::get_meta_u64(b"shard_effective_height").unwrap_or(0);
     AGREED_SHARD_COUNT.store(count.max(1), Ordering::Relaxed);
     REBALANCE_EFFECTIVE_HEIGHT.store(height, Ordering::Relaxed);
@@ -93,11 +93,10 @@ pub fn save_shard_map(map: &ShardMap) -> Result<(), String> {
     fs::write(shard_map_path(), data).map_err(|e| e.to_string())
 }
 
-pub fn compute_shard_count(network_node_count: u32) -> u32 {
-    if network_node_count < PHASE2_NODE_THRESHOLD {
-        return 1;
-    }
-    (network_node_count / REPLICATION_FACTOR).max(1)
+pub fn compute_shard_count(_network_node_count: u32) -> u32 {
+    // Sharding is active by default to scale the chain's state globally.
+    // 256 shards maps cleanly to the 256 mempool shards.
+    256
 }
 
 pub fn blocks_per_shard(total_blocks: u64, shard_count: u32) -> u64 {

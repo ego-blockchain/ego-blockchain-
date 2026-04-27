@@ -30,27 +30,31 @@ pub struct PostChallengeResult {
 
 #[tauri::command]
 pub async fn get_porep_status() -> Result<Vec<SectorStatus>, EgoDesktopError> {
-    let ledger = Ledger::load();
-    let statuses = ledger.stored_files.iter()
-        .filter(|f| f.status == "Active" || f.status == "Expired")
-        .map(|f| SectorStatus {
-            cid:           f.cid.clone(),
-            name:          f.name.clone(),
-            sector_id:     f.sector_id,
-            file_size:     f.encrypted_size,
-            comm_d:        f.comm_d.clone(),
-            comm_r:        f.comm_r.clone(),
-            n_real_leaves: f.n_real_leaves,
-            post_status:   if f.post_status.is_empty() {
-                               if f.comm_d.is_empty() { "no_commitment".into() }
-                               else { "registered".into() }
-                           } else { f.post_status.clone() },
-            last_proved:   f.last_proved,
-            stored_at:     f.stored_at,
-            expiry:        f.expiry,
-        })
-        .collect();
-    Ok(statuses)
+    tokio::task::spawn_blocking(|| {
+        let ledger = Ledger::load();
+        let statuses = ledger.stored_files.iter()
+            .filter(|f| f.status == "Active" || f.status == "Expired")
+            .map(|f| SectorStatus {
+                cid:           f.cid.clone(),
+                name:          f.name.clone(),
+                sector_id:     f.sector_id,
+                file_size:     f.encrypted_size,
+                comm_d:        f.comm_d.clone(),
+                comm_r:        f.comm_r.clone(),
+                n_real_leaves: f.n_real_leaves,
+                post_status:   if f.post_status.is_empty() {
+                                   if f.comm_d.is_empty() { "no_commitment".into() }
+                                   else { "registered".into() }
+                               } else { f.post_status.clone() },
+                last_proved:   f.last_proved,
+                stored_at:     f.stored_at,
+                expiry:        f.expiry,
+            })
+            .collect();
+        Ok::<_, EgoDesktopError>(statuses)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 #[tauri::command]
@@ -175,35 +179,7 @@ pub async fn respond_to_challenges() -> Result<PostChallengeResult, EgoDesktopEr
     }
 
     if submitted > 0 {
-        let ledger = Ledger::load();
-        if !ledger.address.is_empty() {
-
-            const REWARD_PER_SECTOR_WINDOW: u64 = 10_417;
-            let reward_uegoc = REWARD_PER_SECTOR_WINDOW * submitted as u64;
-            let ts2 = chrono::Utc::now().timestamp();
-            let reward_data = format!("post_reward:{}:{}:{}", ledger.address, submitted, ts2);
-            let reward_hash = format!("0x{}", ego_core::hash_data(reward_data.as_bytes()).to_hex());
-            let mut chain = crate::ledger::load_chain();
-
-            let pool_addr = "egot1nodepool0000000000000000000000000000000000";
-            chain.transactions.push(crate::ledger::LedgerTx {
-                hash:      reward_hash,
-                from:      pool_addr.into(),
-                to:        ledger.address.clone(),
-                amount:    reward_uegoc,
-                memo:      Some(format!("PoST reward: {} sector(s) proved", submitted)),
-                timestamp: ts2,
-                signature: "system_post_reward".into(),
-                status:    "Confirmed".into(),
-                tx_type:   "reward".into(),
-                ..crate::ledger::LedgerTx::default()
-            });
-            if let Err(e) = crate::ledger::save_chain(&chain) {
-                eprintln!("[PoST] Failed to record reward TX: {e}");
-            } else {
-                eprintln!("[PoST] Issued {} uEGOC reward for {} proved sector(s)", reward_uegoc, submitted);
-            }
-        }
+        eprintln!("[PoST] {} sector proof(s) accepted by oracle — reward TX will arrive via network gossip", submitted);
     }
 
     Ok(PostChallengeResult {
@@ -225,18 +201,22 @@ pub struct PostScore {
 
 #[tauri::command]
 pub async fn get_post_score() -> Result<PostScore, EgoDesktopError> {
-    let ledger = Ledger::load();
-    let last_proved = ledger.stored_files.iter()
-        .filter_map(|f| f.last_proved)
-        .max();
-    Ok(PostScore {
-        address:        ledger.address,
-        active_sectors: ledger.stored_files.iter()
-            .filter(|f| f.status == "Active").count() as u32,
-        proved_windows: 0,
-        fault_count:    0,
-        last_proved,
+    tokio::task::spawn_blocking(|| {
+        let ledger = Ledger::load();
+        let last_proved = ledger.stored_files.iter()
+            .filter_map(|f| f.last_proved)
+            .max();
+        Ok::<_, EgoDesktopError>(PostScore {
+            address:        ledger.address,
+            active_sectors: ledger.stored_files.iter()
+                .filter(|f| f.status == "Active").count() as u32,
+            proved_windows: 0,
+            fault_count:    0,
+            last_proved,
+        })
     })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -257,39 +237,57 @@ pub struct CombinedDrsScore {
     pub is_eligible:    bool,
 }
 
-#[tauri::command]
-pub async fn get_combined_drs() -> Result<CombinedDrsScore, EgoDesktopError> {
+pub fn drs_eligible() -> bool {
     let ledger = Ledger::load();
-    let addr   = ledger.address.clone();
-    if addr.is_empty() {
-        return Ok(CombinedDrsScore::default());
-    }
-    let staked_uegoc = ledger.staked_amount;
+    if ledger.address.is_empty() { return false; }
     let post_sectors = ledger.stored_files.iter()
         .filter(|f| f.status == "Active").count() as u32;
-
     let poc_events = crate::ledger::load_poc_events();
     let now = chrono::Utc::now().timestamp();
     let poc_events_24h = poc_events.iter()
         .filter(|e| now - e.timestamp <= 86_400).count() as u32;
-    let poc_total = poc_events.len() as u64;
-
     let poc_score  = (poc_events_24h as f64 / 360.0_f64).min(1.0);
     let post_score = if post_sectors > 0 { 1.0 } else { 0.0 };
-    let combined_score = poc_score * 0.6 + post_score * 0.4;
+    (poc_score * 0.6 + post_score * 0.4) >= 0.5
+}
 
-    Ok(CombinedDrsScore {
-        address: addr,
-        combined_score,
-        poc_events_24h,
-        poc_total,
-        post_sectors,
-        post_windows:   0,
-        post_faults:    0,
-        staked_uegoc,
-        validator_rank: None,
-        is_eligible:    combined_score >= 0.5,
+#[tauri::command]
+pub async fn get_combined_drs() -> Result<CombinedDrsScore, EgoDesktopError> {
+    tokio::task::spawn_blocking(|| {
+        let ledger = Ledger::load();
+        let addr   = ledger.address.clone();
+        if addr.is_empty() {
+            return Ok(CombinedDrsScore::default());
+        }
+        let staked_uegoc = ledger.staked_amount;
+        let post_sectors = ledger.stored_files.iter()
+            .filter(|f| f.status == "Active").count() as u32;
+
+        let poc_events = crate::ledger::load_poc_events();
+        let now = chrono::Utc::now().timestamp();
+        let poc_events_24h = poc_events.iter()
+            .filter(|e| now - e.timestamp <= 86_400).count() as u32;
+        let poc_total = poc_events.len() as u64;
+
+        let poc_score  = (poc_events_24h as f64 / 360.0_f64).min(1.0);
+        let post_score = if post_sectors > 0 { 1.0 } else { 0.0 };
+        let combined_score = poc_score * 0.6 + post_score * 0.4;
+
+        Ok::<_, EgoDesktopError>(CombinedDrsScore {
+            address: addr,
+            combined_score,
+            poc_events_24h,
+            poc_total,
+            post_sectors,
+            post_windows:   0,
+            post_faults:    0,
+            staked_uegoc,
+            validator_rank: None,
+            is_eligible:    combined_score >= 0.5,
+        })
     })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 #[tauri::command]

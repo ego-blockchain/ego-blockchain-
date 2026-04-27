@@ -294,9 +294,13 @@ pub async fn run_post_checks(app: Option<&tauri::AppHandle<tauri::Wry>>) {
                 let (challenged_block_cid, challenged_comm_r) = if file.cid.starts_with("egomfd1") {
                     if let Ok(manifest) = crate::blocks::load_manifest(&file.cid) {
                         if !manifest.blocks.is_empty() {
+                            let challenge_epoch = (slot * POST_CHECK_INTERVAL_SECS) as u64 / 100;
+                            let challenge_block_hash = crate::chain_db::get_block_hash_at(challenge_epoch)
+                                .unwrap_or_else(|| crate::chain_db::get_tip_hash());
                             let mut h = blake3::Hasher::new();
                             h.update(file.cid.as_bytes());
                             h.update(&slot.to_le_bytes());
+                            h.update(challenge_block_hash.as_bytes());
                             let digest = h.finalize();
                             let idx = u64::from_le_bytes(
                                 digest.as_bytes()[..8].try_into().unwrap_or([0; 8]),
@@ -372,8 +376,7 @@ pub async fn run_post_checks(app: Option<&tauri::AppHandle<tauri::Wry>>) {
 /// Returns true if the file passes, false if data is missing or corrupt.
 fn challenge_file(file: &crate::ledger::StoredFile, now: i64) -> bool {
     if !file.cid.starts_with("egomfd1") {
-        // Legacy single-file format: just check the file exists on disk.
-        return std::path::Path::new(&file.local_path).exists();
+        return false;
     }
 
     let manifest = match crate::blocks::load_manifest(&file.cid) {
@@ -382,11 +385,16 @@ fn challenge_file(file: &crate::ledger::StoredFile, now: i64) -> bool {
     };
     if manifest.blocks.is_empty() { return true; }
 
-    // Deterministic block selection: blake3(cid || slot)
+    // Unpredictable block selection: blake3(cid || slot || challenge_block_hash)
     let slot = now / POST_CHECK_INTERVAL_SECS;
+    let challenge_epoch = (slot * POST_CHECK_INTERVAL_SECS) as u64 / 100;
+    let challenge_block_hash = crate::chain_db::get_block_hash_at(challenge_epoch)
+        .unwrap_or_else(|| crate::chain_db::get_tip_hash());
+        
     let mut h = blake3::Hasher::new();
     h.update(file.cid.as_bytes());
     h.update(&slot.to_le_bytes());
+    h.update(challenge_block_hash.as_bytes());
     let digest = h.finalize();
     let idx = u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap_or([0; 8]))
         as usize % manifest.blocks.len();
@@ -456,9 +464,10 @@ pub async fn burn_collateral(addr: &str, cid: &str, collateral: u64) {
     let return_amount = collateral.saturating_sub(burn_amount);
     let now   = chrono::Utc::now().timestamp();
     let mut ledger = crate::ledger::Ledger::load();
-    let nonce = ledger.nonce + 1;
+    let burn_nonce   = ledger.nonce + 1;
+    let return_nonce = ledger.nonce + 2;
 
-    let sign_input  = format!("burn_collateral:{}:{}:{}", addr, cid, nonce);
+    let sign_input  = format!("burn_collateral:{}:{}:{}", addr, cid, burn_nonce);
     let sig_hex     = crate::ledger::load_seed()
         .ok()
         .flatten()
@@ -466,30 +475,28 @@ pub async fn burn_collateral(addr: &str, cid: &str, collateral: u64) {
         .map(|kp| hex::encode(kp.sign_ed25519(sign_input.as_bytes()).as_bytes()))
         .unwrap_or_default();
     let burn_hash   = format!("0x{}", ego_core::hash_data(sign_input.as_bytes()).to_hex());
-    let return_hash = format!("0x{}", ego_core::hash_data(format!("return_collateral:{}:{}:{}", addr, cid, nonce).as_bytes()).to_hex());
+    let return_hash = format!("0x{}", ego_core::hash_data(format!("return_collateral:{}:{}:{}", addr, cid, return_nonce).as_bytes()).to_hex());
 
-    // Burn portion → null address
-    crate::mempool::get_mempool().push(LedgerTx {
+    crate::p2p::push_protocol_tx(LedgerTx {
         hash: burn_hash.clone(), from: "egot1collateral000000000000000000000000000000".into(),
         to:   "egot1burn0000000000000000000000000000000000000".into(),
         amount: burn_amount,
         memo:   Some(format!("slash_burn 10%: cid {}", &cid[..16.min(cid.len())])),
-        timestamp: now, signature: sig_hex.clone(), status: "Pending".into(),
-        block_height: None, nonce, tx_type: "burn_collateral".into(),
+        timestamp: now, signature: sig_hex.clone(), status: "Confirmed".into(),
+        block_height: None, nonce: burn_nonce, tx_type: "burn_collateral".into(),
         cid: cid.to_string(), ..LedgerTx::default()
     });
-    // Return remainder to node
     if return_amount > 0 {
-        crate::mempool::get_mempool().push(LedgerTx {
+        crate::p2p::push_protocol_tx(LedgerTx {
             hash: return_hash, from: "egot1collateral000000000000000000000000000000".into(),
             to:   addr.to_string(), amount: return_amount,
             memo: Some(format!("collateral_return 90%: cid {}", &cid[..16.min(cid.len())])),
-            timestamp: now, signature: sig_hex, status: "Pending".into(),
-            block_height: None, nonce, tx_type: "unlock_collateral".into(),
+            timestamp: now, signature: sig_hex, status: "Confirmed".into(),
+            block_height: None, nonce: return_nonce, tx_type: "unlock_collateral".into(),
             cid: cid.to_string(), ..LedgerTx::default()
         });
     }
-    ledger.nonce = nonce;
+    ledger.nonce = return_nonce;
     let _ = ledger.save();
     eprintln!("[Collateral] Burned {} uEGOC, returned {} uEGOC for cid={}", burn_amount, return_amount, &cid[..16.min(cid.len())]);
 }
@@ -541,7 +548,7 @@ async fn record_slash_tx(addr: &str, cid: &str, strikes: u32) {
         .unwrap_or_default();
     let tx_hash = format!("0x{}", ego_core::hash_data(sign_input.as_bytes()).to_hex());
 
-    crate::mempool::get_mempool().push(LedgerTx {
+    crate::p2p::push_protocol_tx(LedgerTx {
         hash:            tx_hash.clone(),
         from:            addr.to_string(),
         to:              "egot1slashpool0000000000000000000000000000000".into(),

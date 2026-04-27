@@ -1,11 +1,12 @@
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
-use crate::ledger::{load_chain, tx_signing_bytes, Ledger, LedgerTx};
+use crate::ledger::{load_chain, tx_signing_bytes, tx_signing_bytes_v2, Ledger, LedgerTx};
 use crate::tokenomics::{STAKING_APR_BPS, staking_pool_remaining_uegoc};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
 const STAKING_ADDR: &str = "egot1staking000000000000000000000000000000000";
+const STAKING_CHAIN_ID: u8 = 1;
 
 /// Maximum share of total network stake any single validator may hold (5%).
 /// Prevents stake concentration attacks — an attacker controlling >33% of
@@ -48,53 +49,57 @@ pub struct StakingInfo {
 
 #[tauri::command]
 pub async fn get_staking_info() -> Result<StakingInfo, EgoDesktopError> {
-    let ledger = Ledger::load();
-    let now    = chrono::Utc::now().timestamp();
-    let is_locked = ledger.staked_amount > 0
-        && ledger.unstake_at.map(|u| u > now).unwrap_or(false);
+    tokio::task::spawn_blocking(|| {
+        let ledger = Ledger::load();
+        let now    = chrono::Utc::now().timestamp();
+        let is_locked = ledger.staked_amount > 0
+            && ledger.unstake_at.map(|u| u > now).unwrap_or(false);
 
-    let staked_since_secs = ledger.staked_at
-        .map(|t| (now - t).max(0) as u64)
-        .unwrap_or(0);
+        let staked_since_secs = ledger.staked_at
+            .map(|t| (now - t).max(0) as u64)
+            .unwrap_or(0);
 
-    let apr_bps = effective_apr_bps(ledger.stake_lock_days);
+        let apr_bps = effective_apr_bps(ledger.stake_lock_days);
 
-    let pending_rewards = if ledger.staked_amount > 0 && staked_since_secs > 0 {
-        let chain = load_chain();
-        let pool_left = staking_pool_remaining_uegoc(&chain);
-        if pool_left > 0 {
-            (ledger.staked_amount as u128
-                * apr_bps as u128
-                * staked_since_secs as u128
-                / (10_000 * 31_536_000)) as u64
+        let pending_rewards = if ledger.staked_amount > 0 && staked_since_secs > 0 {
+            let chain = load_chain();
+            let pool_left = staking_pool_remaining_uegoc(&chain);
+            if pool_left > 0 {
+                (ledger.staked_amount as u128
+                    * apr_bps as u128
+                    * staked_since_secs as u128
+                    / (10_000 * 31_536_000)) as u64
+            } else {
+                0
+            }
         } else {
             0
-        }
-    } else {
-        0
-    };
+        };
 
-    let projected_interest = if ledger.staked_amount > 0 && ledger.stake_lock_days > 0 {
-        (ledger.staked_amount as u128
-            * apr_bps as u128
-            * ledger.stake_lock_days as u128
-            / (10_000 * 365)) as u64
-    } else {
-        0
-    };
-    let early_unstake_fee = ledger.staked_amount / 10;
+        let projected_interest = if ledger.staked_amount > 0 && ledger.stake_lock_days > 0 {
+            (ledger.staked_amount as u128
+                * apr_bps as u128
+                * ledger.stake_lock_days as u128
+                / (10_000 * 365)) as u64
+        } else {
+            0
+        };
+        let early_unstake_fee = ledger.staked_amount / 10;
 
-    Ok(StakingInfo {
-        staked_amount:     ledger.staked_amount,
-        lock_period_days:  ledger.stake_lock_days,
-        apr:               apr_bps as f64 / 100.0,
-        pending_rewards,
-        unlock_date:       ledger.unstake_at,
-        staked_at:         ledger.staked_at,
-        is_locked,
-        projected_interest,
-        early_unstake_fee,
+        Ok::<_, EgoDesktopError>(StakingInfo {
+            staked_amount:     ledger.staked_amount,
+            lock_period_days:  ledger.stake_lock_days,
+            apr:               apr_bps as f64 / 100.0,
+            pending_rewards,
+            unlock_date:       ledger.unstake_at,
+            staked_at:         ledger.staked_at,
+            is_locked,
+            projected_interest,
+            early_unstake_fee,
+        })
     })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 #[tauri::command]
@@ -129,10 +134,12 @@ pub async fn stake_coins(
 
     let chain   = load_chain();
     let balance = chain.balance_of(&from);
-    if amount_uegoc > balance {
+    let fee_uegoc = crate::tokenomics::fee_for_tx_with_staking("stake", false);
+    let total_needed = amount_uegoc.saturating_add(fee_uegoc);
+    if total_needed > balance {
         return Err(EgoDesktopError::InvalidInput(format!(
-            "Insufficient balance: have {} uEGOC, need {}",
-            balance, amount_uegoc
+            "Insufficient balance: have {} uEGOC, need {} (stake {} + fee {})",
+            balance, total_needed, amount_uegoc, fee_uegoc
         )));
     }
 
@@ -171,9 +178,25 @@ pub async fn stake_coins(
 
     let nonce      = ledger.nonce + 1;
     let ts         = chrono::Utc::now().timestamp();
-    let sign_bytes = tx_signing_bytes(&from, STAKING_ADDR, amount_uegoc, nonce, ts);
-    let sig_hex    = if let Some(kp) = state.get_keypair() {
-        hex::encode(kp.sign_ed25519(&sign_bytes).as_bytes())
+    let memo       = format!("stake:{lock_days}");
+    let sign_bytes = tx_signing_bytes_v2(
+        &from,
+        STAKING_ADDR,
+        amount_uegoc,
+        nonce,
+        ts,
+        STAKING_CHAIN_ID,
+        &memo,
+    );
+    let (sig_hex, pubkey_hex, dil_sig_hex, dil_pubkey_hex) = if let Some(kp) = state.get_keypair() {
+        let ed_sig = kp.sign_ed25519(&sign_bytes);
+        let dil_sig = kp.sign_dilithium(&sign_bytes);
+        (
+            hex::encode(ed_sig.as_bytes()),
+            hex::encode(kp.ed25519_public_key().as_bytes()),
+            hex::encode(&dil_sig.signature_data),
+            hex::encode(kp.dilithium_public_key().key_data),
+        )
     } else {
         return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
     };
@@ -184,13 +207,19 @@ pub async fn stake_coins(
         from:               from.clone(),
         to:                 STAKING_ADDR.to_string(),
         amount:             amount_uegoc,
-        memo:               Some("stake".to_string()),
+        memo:               Some(memo),
         timestamp:          ts,
         signature:          sig_hex,
         status:             "Pending".into(),
         block_height:       None,
         nonce,
-        public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
+        public_key_ed25519: pubkey_hex,
+        dilithium_pubkey:   dil_pubkey_hex,
+        dilithium_signature: dil_sig_hex,
+        tx_type:            "stake".to_string(),
+        fee_uegoc,
+        tx_version:         2,
+        chain_id:           STAKING_CHAIN_ID,
         ..LedgerTx::default()
     });
 
@@ -250,6 +279,59 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
         } else { 0 }
     };
 
+    let memo = if is_locked && early { "unstake:early" } else { "unstake" }.to_string();
+    let fee_uegoc = crate::tokenomics::fee_for_tx_with_staking("unstake", true);
+    let kp = match state.get_keypair() {
+        Some(k) => k,
+        None    => return Err(EgoDesktopError::WalletError("Wallet not initialized".into())),
+    };
+
+    let unstake_nonce = ledger.nonce + 1;
+    let sign_bytes = tx_signing_bytes_v2(
+        &from,
+        STAKING_ADDR,
+        staked_amount,
+        unstake_nonce,
+        ts,
+        STAKING_CHAIN_ID,
+        &memo,
+    );
+    let ed_sig = kp.sign_ed25519(&sign_bytes);
+    let dil_sig = kp.sign_dilithium(&sign_bytes);
+    let unstake_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+
+    crate::mempool::get_mempool().push(LedgerTx {
+        hash:                unstake_hash,
+        from:                from.clone(),
+        to:                  STAKING_ADDR.to_string(),
+        amount:              staked_amount,
+        memo:                Some(memo),
+        timestamp:           ts,
+        signature:           hex::encode(ed_sig.as_bytes()),
+        status:              "Pending".into(),
+        block_height:        None,
+        nonce:               unstake_nonce,
+        public_key_ed25519:  hex::encode(kp.ed25519_public_key().as_bytes()),
+        dilithium_pubkey:    hex::encode(kp.dilithium_public_key().key_data),
+        dilithium_signature: hex::encode(&dil_sig.signature_data),
+        tx_type:             "unstake".to_string(),
+        fee_uegoc,
+        tx_version:          2,
+        chain_id:            STAKING_CHAIN_ID,
+        ..LedgerTx::default()
+    });
+
+    let _ = accrued_rewards;
+    ledger.staked_amount         = 0;
+    ledger.staked_at             = None;
+    ledger.stake_lock_days       = 0;
+    ledger.unstake_at            = None;
+    ledger.pending_stake_tx_hash = String::new();
+    ledger.nonce                 = unstake_nonce;
+    ledger.save().map_err(EgoDesktopError::FileSystemError)?;
+    return Ok(());
+
+    #[allow(unreachable_code)]
     if is_locked && early {
         // Early unstake: charge 10% fee on principal only; rewards still paid in full.
         let fee           = staked_amount / 10;
@@ -405,19 +487,23 @@ pub struct ConsensusHealth {
 
 #[tauri::command]
 pub async fn get_consensus_health() -> Result<ConsensusHealth, EgoDesktopError> {
-    let ledger   = crate::ledger::Ledger::load();
-    let active   = crate::ledger::active_validator_count();
-    let total    = crate::ledger::total_network_stake();
-    let my_stake = crate::ledger::get_validator_stake(&ledger.address);
-    let my_pct   = if total > 0 { my_stake as f64 / total as f64 * 100.0 } else { 0.0 };
+    tokio::task::spawn_blocking(|| {
+        let ledger   = crate::ledger::Ledger::load();
+        let active   = crate::ledger::active_validator_count();
+        let total    = crate::ledger::total_network_stake();
+        let my_stake = crate::ledger::get_validator_stake(&ledger.address);
+        let my_pct   = if total > 0 { my_stake as f64 / total as f64 * 100.0 } else { 0.0 };
 
-    Ok(ConsensusHealth {
-        active_validators:       active,
-        min_validators_required: crate::mempool::min_validators_for_finality(),
-        is_bft_ready:            active >= crate::mempool::min_validators_for_finality(),
-        total_staked_uegoc:      total,
-        max_stake_fraction_pct:  (MAX_STAKE_FRACTION * 100.0) as u32,
-        my_stake_uegoc:          my_stake,
-        my_stake_pct:            my_pct,
+        Ok::<_, EgoDesktopError>(ConsensusHealth {
+            active_validators:       active,
+            min_validators_required: crate::mempool::min_validators_for_finality(),
+            is_bft_ready:            active >= crate::mempool::min_validators_for_finality(),
+            total_staked_uegoc:      total,
+            max_stake_fraction_pct:  (MAX_STAKE_FRACTION * 100.0) as u32,
+            my_stake_uegoc:          my_stake,
+            my_stake_pct:            my_pct,
+        })
     })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }

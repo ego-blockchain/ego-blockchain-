@@ -371,6 +371,9 @@ async fn probe_peers_from_relay(app: &tauri::AppHandle) {
 
     for endpoint in candidates.into_iter().take(256) {
         if active_eps.contains(&endpoint) { continue; }
+        // Skip relay-circuit endpoints for coverage probes — coverage measures
+        // direct reachability. Relay probes also exhaust relay stream limits.
+        if endpoint.contains("/p2p-circuit") { continue; }
         let ep   = endpoint.clone();
         let req  = crate::p2p::P2PMessage::PeerListRequest {
             requester_endpoint: requester_endpoint.clone(),
@@ -381,7 +384,7 @@ async fn probe_peers_from_relay(app: &tauri::AppHandle) {
             if let Err(e) = crate::p2p::send_message(&ep, &req).await {
                 let msg = e.to_string();
                 if !msg.contains("none of the requested protocols") {
-                    eprintln!("[Coverage] probe {}: {}", ep, e);
+                    tracing::debug!("[Coverage] probe {}: {}", ep, e);
                 }
             }
         });
@@ -437,41 +440,9 @@ pub async fn get_network_peers(
 
 /// Returns (location, vpn_detected, vpn_reason, public_ip).
 async fn fetch_ip_data() -> (Option<Location>, bool, String, String) {
-    let url = "http://ip-api.com/json?fields=status,query,lat,lon,city,regionName,country,isp,org,proxy,hosting";
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
-        Ok(c)  => c,
-        Err(_) => return (None, false, String::new(), String::new()),
-    };
-    let resp = match client.get(url).send().await {
-        Ok(r)  => r,
-        Err(_) => return (None, false, String::new(), String::new()),
-    };
-    let data = match resp.json::<IpApiResponse>().await {
-        Ok(d)  => d,
-        Err(_) => return (None, false, String::new(), String::new()),
-    };
-    if data.status != "success" {
-        return (None, false, String::new(), String::new());
-    }
-    let public_ip = data.query.clone().unwrap_or_default();
-    let location = match (data.lat, data.lon) {
-        (Some(lat), Some(lon)) => Some(Location {
-            latitude:  lat,
-            longitude: lon,
-            accuracy:  Some(15_000.0),
-            altitude:  None,
-            city:      data.city.clone(),
-            region:    data.region_name.clone(),
-            country:   data.country.clone(),
-        }),
-        _ => None,
-    };
-    let (vpn_detected, vpn_reason) = match detect_vpn(&data) {
-        Some(reason) => (true, reason),
-        None         => (false, String::new()),
-    };
-    (location, vpn_detected, vpn_reason, public_ip)
+    // Deprecated: Web2 IP APIs are gameable via local proxy spoofing.
+    // Coverage is now determined purely by P2P cryptographic mesh reachability.
+    let public_ip = crate::p2p::get_public_endpoint().await;
+    let is_vpn = false; // Trustless VPN detection requires on-chain IP-ASN registry (V2 feature)
+    (None, is_vpn, String::new(), public_ip)
 }
