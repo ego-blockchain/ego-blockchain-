@@ -37,6 +37,21 @@ pub struct HostingNodeRecord {
 
 type HostingNodes = HashMap<String, HostingNodeRecord>;
 
+// ── PoST proof types ───────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PostRewardApproval {
+    pub proof_id:    String,
+    pub prover_addr: String,
+    pub cid:         String,
+    pub reward_uegoc: u64,
+    pub approved_at: i64,
+}
+
+const POST_REWARD_WINDOW_SECS: i64 = 1_800;
+const POST_NODEPOOL_ADDR: &str = "egot1nodepool00000000000000000000000000000000";
+const POST_RATE_LIMIT_CAP: usize = 200_000;
+
 // ── Price types ────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -157,12 +172,14 @@ fn save_chain(chain: &ChainState) {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub prices:        Arc<RwLock<PriceMap>>,
-    pub chain:         Arc<RwLock<ChainState>>,
-    pub client:        Client,
-    pub hosting_nodes: Arc<RwLock<HostingNodes>>,
-    pub ego_nodes:     Arc<RwLock<Vec<String>>>,
-    pub acme:          Arc<acme::AcmeState>,
+    pub prices:         Arc<RwLock<PriceMap>>,
+    pub chain:          Arc<RwLock<ChainState>>,
+    pub client:         Client,
+    pub hosting_nodes:  Arc<RwLock<HostingNodes>>,
+    pub ego_nodes:      Arc<RwLock<Vec<String>>>,
+    pub acme:           Arc<acme::AcmeState>,
+    pub post_approvals: Arc<RwLock<HashMap<String, PostRewardApproval>>>,
+    pub post_rate_limit: Arc<RwLock<HashMap<String, i64>>>,
 }
 
 const EGOC_USD: f64 = 0.01;
@@ -376,6 +393,131 @@ async fn handle_cert_status(
     }
 }
 
+// ── Handlers: PoST proof & rewards ───────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct PostProofPayload {
+    challenge_id:    String,
+    cid:             String,
+    prover_addr:     String,
+    n_real_leaves:   u64,
+    #[allow(dead_code)]
+    n_padded_leaves: u64,
+    timestamp:       i64,
+    signature:       String,
+    public_key:      String,
+}
+
+async fn handle_post_proof(
+    State(state): State<AppState>,
+    Json(body): Json<PostProofPayload>,
+) -> impl IntoResponse {
+    let now = Utc::now().timestamp();
+
+    if body.prover_addr.is_empty() || body.cid.is_empty() || body.signature.is_empty() || body.public_key.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "missing required fields" })));
+    }
+
+    if (now - body.timestamp).abs() > 300 {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "timestamp too old or too far in future" })));
+    }
+
+    let pk_bytes: [u8; 32] = match hex::decode(&body.public_key)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(b) => b,
+        None => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid public key" }))),
+    };
+    let sig_bytes: [u8; 64] = match hex::decode(&body.signature)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(b) => b,
+        None => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid signature" }))),
+    };
+
+    use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+    let vk = match VerifyingKey::from_bytes(&pk_bytes) {
+        Ok(k) => k,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid public key" }))),
+    };
+    let sig = Signature::from_bytes(&sig_bytes);
+    let sign_data = format!("{}:{}:{}", body.challenge_id, body.cid, body.timestamp);
+    if vk.verify(sign_data.as_bytes(), &sig).is_err() {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "signature verification failed" })));
+    }
+
+    let rate_key = format!("{}:{}", body.prover_addr, body.cid);
+    {
+        let mut rl = state.post_rate_limit.write().await;
+        if let Some(&last) = rl.get(&rate_key) {
+            if now - last < POST_REWARD_WINDOW_SECS {
+                return (StatusCode::TOO_MANY_REQUESTS, Json(json!({
+                    "error": format!("already proved — next window in {}s", POST_REWARD_WINDOW_SECS - (now - last))
+                })));
+            }
+        }
+        rl.insert(rate_key, now);
+        if rl.len() > POST_RATE_LIMIT_CAP {
+            if let Some(oldest) = rl.iter().min_by_key(|(_, v)| *v).map(|(k, _)| k.clone()) {
+                rl.remove(&oldest);
+            }
+        }
+    }
+
+    let file_bytes = body.n_real_leaves.saturating_mul(1_024);
+    let reward_uegoc = ((file_bytes as f64 / 1_000_000_000.0) * 10_416.0).max(1_000.0) as u64;
+
+    let proof_id = format!("0x{}", blake3::hash(
+        format!("post_reward:{}:{}:{}", body.prover_addr, body.cid, now).as_bytes()
+    ).to_hex());
+
+    let approval = PostRewardApproval {
+        proof_id:    proof_id.clone(),
+        prover_addr: body.prover_addr.clone(),
+        cid:         body.cid.clone(),
+        reward_uegoc,
+        approved_at: now,
+    };
+
+    {
+        let mut approvals = state.post_approvals.write().await;
+        approvals.insert(proof_id.clone(), approval);
+    }
+
+    info!("[PoST] Approved {} uEGOC → {} for CID {}…", reward_uegoc, body.prover_addr, &body.cid[..body.cid.len().min(16)]);
+    (StatusCode::OK, Json(json!({ "ok": true, "reward_uegoc": reward_uegoc, "proof_id": proof_id })))
+}
+
+async fn handle_post_pending_rewards(State(state): State<AppState>) -> impl IntoResponse {
+    let approvals = state.post_approvals.read().await;
+    let list: Vec<&PostRewardApproval> = approvals.values().collect();
+    Json(json!(list))
+}
+
+#[derive(Deserialize)]
+struct ClaimedPayload {
+    proof_ids: Vec<String>,
+}
+
+async fn handle_post_rewards_claimed(
+    State(state): State<AppState>,
+    Json(body): Json<ClaimedPayload>,
+) -> impl IntoResponse {
+    let mut approvals = state.post_approvals.write().await;
+    let mut removed = 0usize;
+    for id in &body.proof_ids {
+        if approvals.remove(id).is_some() { removed += 1; }
+    }
+    info!("[PoST] Cleared {} claimed rewards ({} remaining)", removed, approvals.len());
+    (StatusCode::OK, Json(json!({ "ok": true, "removed": removed })))
+}
+
+async fn handle_post_challenges(Path(_addr): Path<String>) -> impl IntoResponse {
+    Json(json!([]))
+}
+
 // ── Handler: health ───────────────────────────────────────────────────────────
 
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
@@ -415,12 +557,14 @@ async fn main() {
     let acme_state = acme::AcmeState::new();
 
     let state = AppState {
-        prices:        Arc::new(RwLock::new(initial_prices)),
-        chain:         Arc::new(RwLock::new(load_chain())),
+        prices:          Arc::new(RwLock::new(initial_prices)),
+        chain:           Arc::new(RwLock::new(load_chain())),
         client,
-        hosting_nodes: Arc::new(RwLock::new(HashMap::new())),
-        ego_nodes:     Arc::new(RwLock::new(Vec::new())),
-        acme:          acme_state,
+        hosting_nodes:   Arc::new(RwLock::new(HashMap::new())),
+        ego_nodes:       Arc::new(RwLock::new(Vec::new())),
+        acme:            acme_state,
+        post_approvals:  Arc::new(RwLock::new(HashMap::new())),
+        post_rate_limit: Arc::new(RwLock::new(HashMap::new())),
     };
 
     tokio::spawn(price_refresh_task(state.clone()));
@@ -453,6 +597,10 @@ async fn main() {
         .route("/nodes/register",           post(handle_nodes_register))
         .route("/cert/request",             post(handle_cert_request))
         .route("/cert/status/:domain",      get(handle_cert_status))
+        .route("/post/proof",               post(handle_post_proof))
+        .route("/post/pending_rewards",     get(handle_post_pending_rewards))
+        .route("/post/rewards_claimed",     post(handle_post_rewards_claimed))
+        .route("/post/challenges/:addr",    get(handle_post_challenges))
         .layer(cors)
         .with_state(state);
 

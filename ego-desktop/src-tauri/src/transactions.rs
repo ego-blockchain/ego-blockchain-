@@ -40,12 +40,7 @@ pub async fn get_balance(_state: State<'_, AppState>) -> Result<Balance, EgoDesk
     let chain = load_chain();
     let confirmed = chain.balance_of(&my_addr);
 
-    let pending_out: u64 = crate::mempool::get_mempool()
-        .peek_all()
-        .into_iter()
-        .filter(|tx| tx.from.trim() == my_addr.trim())
-        .map(|tx| tx.amount.saturating_add(tx.fee_uegoc))
-        .sum();
+    let pending_out: u64 = crate::mempool::get_mempool().pending_outflow_for_address(&my_addr);
 
     let uegoc = confirmed.saturating_sub(pending_out);
     let egoc  = uegoc / 1_000_000;
@@ -93,6 +88,8 @@ pub async fn send_transaction(
     let ts         = chrono::Utc::now().timestamp();
     let memo_str   = request.memo.as_deref().unwrap_or("");
     const CHAIN_ID: u8 = 1; // testnet
+    let fee_uegoc  = crate::chain_db::get_current_base_fee()
+        .max(crate::mempool::MIN_FEE_UEGOC);
     let sign_bytes = tx_signing_bytes_v2(
         &from, &request.to_address, request.amount, nonce, ts, CHAIN_ID, memo_str,
     );
@@ -113,8 +110,16 @@ pub async fn send_transaction(
 
     let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
     let summary = tx_human_summary(
-        &from, &request.to_address, request.amount, memo_str, CHAIN_ID, nonce, 0,
+        &from, &request.to_address, request.amount, memo_str, CHAIN_ID, nonce, fee_uegoc,
     );
+
+    let total_required = request.amount.saturating_add(fee_uegoc);
+    if balance < total_required {
+        return Err(EgoDesktopError::InvalidInput(format!(
+            "Insufficient balance: have {} uEGOC, need {} ({} amount + {} fee)",
+            balance, total_required, request.amount, fee_uegoc
+        )));
+    }
 
     let pending_tx = LedgerTx {
         hash:                tx_hash.clone(),
@@ -129,6 +134,7 @@ pub async fn send_transaction(
         status:              "Pending".into(),
         block_height:        None,
         nonce,
+        fee_uegoc,
         tx_version:          2,
         chain_id:            CHAIN_ID,
         signed_summary:      summary.clone(),
@@ -216,29 +222,18 @@ pub async fn get_transaction_history(
         return Ok(vec![]);
     }
 
-    let chain = load_chain();
-    let mut txs: Vec<LedgerTx> = chain
-        .transactions
-        .into_iter()
-        .filter(|tx| {
-            tx.to.trim()   == my_addr.trim()
-            || tx.from.trim() == my_addr.trim()
-        })
-        .collect();
+    let mut txs: Vec<LedgerTx> = crate::chain_db::get_tx_history_for_addr(&my_addr);
 
     let confirmed_hashes: std::collections::HashSet<String> =
         txs.iter().map(|t| t.hash.clone()).collect();
 
-    let pending: Vec<LedgerTx> = crate::mempool::get_mempool()
-        .peek_all()
+    let pending = crate::mempool::get_mempool().pending_txs_for_address(&my_addr);
+    let pending_filtered: Vec<LedgerTx> = pending
         .into_iter()
-        .filter(|tx| {
-            !confirmed_hashes.contains(&tx.hash)
-            && (tx.to.trim() == my_addr.trim() || tx.from.trim() == my_addr.trim())
-        })
+        .filter(|tx| !confirmed_hashes.contains(&tx.hash))
         .collect();
 
-    txs.extend(pending);
+    txs.extend(pending_filtered);
     txs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     Ok(txs)
 }

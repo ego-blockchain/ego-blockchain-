@@ -57,7 +57,8 @@ pub async fn get_rollup_status() -> Result<RollupStatus, EgoDesktopError> {
     let shard_map     = crate::sharding::load_shard_map();
     let network_shards = shard_map.shard_count.max(1);
 
-    let theoretical_tps = network_shards as u64 * BATCH_SIZE as u64 * 1000 / BATCH_INTERVAL_MS;
+    const TPS_PER_SHARD: u64 = 100_000;
+    let theoretical_tps = network_shards as u64 * TPS_PER_SHARD;
 
     let raw_sizes = pool.shard_sizes();
     let bucket = (SHARD_COUNT as usize).max(1);

@@ -150,7 +150,8 @@ fn headless_main() {
             crate::p2p::run_shard_rebalance_monitor().await;
         });
 
-        tracing::info!("All services started. RPC on port 47395. P2P on port {}", crate::p2p::P2P_PORT);
+        let rpc_port: u16 = std::env::var("EGO_RPC_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(47395);
+        tracing::info!("All services started. RPC on port {}. P2P on port {}", rpc_port, crate::p2p::p2p_port());
         tracing::info!("Chain data: {:?}", crate::ledger::base_data_dir());
         tracing::info!("Press Ctrl+C to stop.");
 

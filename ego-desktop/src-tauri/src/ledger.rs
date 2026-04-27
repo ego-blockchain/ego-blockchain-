@@ -423,6 +423,12 @@ pub struct LedgerBlock {
 
     #[serde(default)]
     pub base_fee_uegoc: u64,
+
+    #[serde(default)]
+    pub agg_bls_sig: String,
+
+    #[serde(default)]
+    pub bls_pubkeys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -716,6 +722,8 @@ impl Ledger {
             poc_slot: 0,
             state_root: String::new(),
             base_fee_uegoc: 1_000,
+            agg_bls_sig: String::new(),
+            bls_pubkeys: Vec::new(),
         });
     }
 
@@ -764,6 +772,8 @@ pub fn genesis_block() -> LedgerBlock {
         poc_slot: 0,
         state_root: String::new(),
         base_fee_uegoc: 1_000,
+        agg_bls_sig: String::new(),
+        bls_pubkeys: Vec::new(),
     }
 }
 
@@ -830,6 +840,8 @@ impl SharedChain {
             poc_slot: 0,
             state_root: String::new(),
             base_fee_uegoc: 1_000,
+            agg_bls_sig: String::new(),
+            bls_pubkeys: Vec::new(),
         });
     }
 
@@ -893,6 +905,8 @@ impl SharedChain {
             poc_slot: 0,
             state_root: String::new(),
             base_fee_uegoc: 1_000,
+            agg_bls_sig: String::new(),
+            bls_pubkeys: Vec::new(),
         };
         self.blocks.push(block.clone());
         block
@@ -1089,9 +1103,61 @@ pub fn verify_incoming_tx(tx: &LedgerTx) -> Result<(), String> {
     verify_incoming_tx_with_miner(tx, "")
 }
 
+pub fn is_protocol_system_tx(tx: &LedgerTx) -> bool {
+    tx.from == crate::chain_db::NODE_POOL_ADDR
+        && tx.signature == "coinbase"
+        && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward")
+}
+
+pub fn is_reserved_system_source(addr: &str) -> bool {
+    addr.is_empty()
+        || addr == crate::chain_db::NODE_POOL_ADDR
+        || addr == crate::chain_db::STAKING_POOL_ADDR
+        || addr == crate::chain_db::FAUCET_ADDR_FULL
+        || addr.starts_with("egot1faucet")
+        || addr.starts_with("egot1genesis")
+        || addr.starts_with("egot1staking")
+        || addr.starts_with("egot1system")
+        || addr.starts_with("egot1coverage")
+        || addr.starts_with("egot1nodereward")
+        || addr.starts_with("egot1collateral")
+        || addr.starts_with("egot1slashpool")
+        || addr.starts_with("egot1storagefees")
+        || addr.starts_with("egot1burn")
+        || addr.starts_with("egot1nodepool")
+        || addr.starts_with("egot1rewards")
+}
+
+fn expected_standard_tx_hash(tx: &LedgerTx) -> String {
+    let msg = if tx.tx_version >= 2 {
+        tx_signing_bytes_v2(
+            &tx.from,
+            &tx.to,
+            tx.amount,
+            tx.nonce,
+            tx.timestamp,
+            tx.chain_id,
+            tx.memo.as_deref().unwrap_or(""),
+        )
+    } else {
+        tx_signing_bytes(&tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp)
+    };
+    format!("0x{}", ego_core::hash_data(&msg).to_hex())
+}
+
+fn tx_hash_must_match_standard_signing(tx: &LedgerTx) -> bool {
+    matches!(
+        tx.tx_type.as_str(),
+        "transfer" | "stake" | "unstake" | "governance" | "cluster_escrow" | "storage_escrow" | "hosting_plan"
+    )
+}
+
 pub fn verify_confirmed_tx_sig(tx: &LedgerTx) -> Result<(), String> {
-    if tx.public_key_ed25519.is_empty() || tx.signature.is_empty() {
+    if is_protocol_system_tx(tx) {
         return Ok(());
+    }
+    if tx.public_key_ed25519.is_empty() || tx.signature.is_empty() {
+        return Err(format!("confirmed tx {} missing Ed25519 pubkey/signature", tx.hash));
     }
     let pk_bytes = hex::decode(&tx.public_key_ed25519)
         .map_err(|_| "invalid pubkey hex".to_string())?;
@@ -1111,34 +1177,37 @@ pub fn verify_confirmed_tx_sig(tx: &LedgerTx) -> Result<(), String> {
     } else {
         tx_signing_bytes(&tx.from, &tx.to, tx.amount, tx.nonce, tx.timestamp)
     };
-    vk.verify(&msg, &sig).map_err(|_| "Ed25519 signature invalid".to_string())
+    vk.verify(&msg, &sig).map_err(|_| "Ed25519 signature invalid".to_string())?;
+    if tx_hash_must_match_standard_signing(tx) {
+        let expected_hash = expected_standard_tx_hash(tx);
+        if tx.hash != expected_hash {
+            return Err(format!(
+                "tx hash mismatch: claimed {} expected {}",
+                tx.hash, expected_hash
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Full verification. When `block_miner` is non-empty, system-address transactions
 /// are only accepted if they are crediting the miner (protocol rewards to self).
 /// This closes the free-mint exploit where any node crafts `from=faucet → to=self`.
 pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result<(), String> {
-    const SYSTEM_PREFIXES: &[&str] = &[
-        "egot1faucet",
-        "egot1genesis",
-        "egot1staking",
-        "egot1system",
-        "egot1coverage",
-        "egot1nodereward",
-        "egot1collateral",
-        "egot1slashpool",
-        "egot1storagefees",
-        "egot1burn",
-        "egot1nodepool",
-        "egot1rewards",
-    ];
+    let _ = block_miner;
 
-    if tx.from.is_empty() {
-        return Ok(());
-    }
+    let dilithium_disabled = crate::chain_db::is_feature_disabled(
+        crate::chain_db::FEATURE_DILITHIUM_DISABLED,
+    );
+    let dilithium_required = crate::chain_db::is_feature_enabled(
+        crate::chain_db::FEATURE_DILITHIUM_REQUIRED,
+    );
 
-    if SYSTEM_PREFIXES.iter().any(|&p| tx.from.starts_with(p)) {
-        return Ok(());
+    if is_reserved_system_source(&tx.from) {
+        return Err(format!(
+            "system-source tx {} from {} requires block-context protocol validation",
+            tx.hash, tx.from
+        ));
     }
 
     // ── Equivocation proof: fee/nonce/dilithium exempted, Ed25519 required ──
@@ -1203,10 +1272,33 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
                 tx.from, confirmed_balance, required, tx.amount, tx.fee_uegoc,
             ));
         }
+    } else if tx.tx_type == "stake" {
+        // FIX: Staking TXs must still prove they hold the required balance before entering the mempool!
+        let confirmed_balance = crate::chain_db::balance_of(&tx.from);
+        let required = tx.amount.saturating_add(tx.fee_uegoc);
+        if confirmed_balance < required {
+            return Err(format!("insufficient balance for staking: needs {}", required));
+        }
     }
 
     if tx.public_key_ed25519.is_empty() || tx.signature.is_empty() {
         return Err(format!("missing signature or pubkey in TX from {}", tx.from));
+    }
+
+    let hrp = if tx.chain_id == 1 { "egot" } else { "ego" };
+    
+    if !dilithium_disabled && !tx.dilithium_pubkey.is_empty() {
+        let dil_pk = hex::decode(&tx.dilithium_pubkey).unwrap_or_default();
+        let expected_addr = ego_core::EgoAddress::from_dilithium_pk(&dil_pk, tx.chain_id as u32, ego_core::AddressType::EOA)
+            .to_bech32(hrp).unwrap_or_default();
+        if tx.from != expected_addr {
+            return Err(format!("Spoofing detected: TX from {} does not match dilithium pubkey", tx.from));
+        }
+    } else {
+        let ed_pk = hex::decode(&tx.public_key_ed25519).unwrap_or_default();
+        if ed_pk.len() != 32 {
+            return Err(format!("Spoofing detected: invalid Ed25519 pubkey length"));
+        }
     }
 
     let pk_bytes = hex::decode(&tx.public_key_ed25519)
@@ -1235,6 +1327,16 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
     vk.verify(&msg, &sig)
         .map_err(|_| format!("Ed25519 signature verification failed for TX from {}", tx.from))?;
 
+    if tx_hash_must_match_standard_signing(tx) {
+        let expected_hash = expected_standard_tx_hash(tx);
+        if tx.hash != expected_hash {
+            return Err(format!(
+                "tx hash mismatch: claimed {} expected {}",
+                tx.hash, expected_hash
+            ));
+        }
+    }
+
     // ── ML-DSA-44 verification (governance-controlled) ────────────────────
     // Three states, set by on-chain validator governance votes:
     //
@@ -1247,12 +1349,6 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
     //  3. FEATURE_DILITHIUM_DISABLED enabled: skip Dilithium entirely.
     //     Emergency switch if a vulnerability is found in ML-DSA-44.
     //     Validators vote → passes threshold → activates at specified block height.
-    let dilithium_disabled = crate::chain_db::is_feature_disabled(
-        crate::chain_db::FEATURE_DILITHIUM_DISABLED,
-    );
-    let dilithium_required = crate::chain_db::is_feature_enabled(
-        crate::chain_db::FEATURE_DILITHIUM_REQUIRED,
-    );
 
     if dilithium_required && (tx.dilithium_pubkey.is_empty() || tx.dilithium_signature.is_empty()) {
         return Err(format!(

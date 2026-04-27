@@ -28,9 +28,7 @@ pub struct NetworkStats {
 
 #[tauri::command]
 pub async fn get_network_stats() -> Result<NetworkStats, EgoDesktopError> {
-    eprintln!("[Explorer] get_network_stats called");
     let result = tokio::task::spawn_blocking(|| {
-        eprintln!("[Explorer] get_network_stats: inside spawn_blocking");
         let registry = load_registry();
         let (latest_height, _) = crate::chain_db::latest_block_info();
         let node_count = registry
@@ -49,7 +47,6 @@ pub async fn get_network_stats() -> Result<NetworkStats, EgoDesktopError> {
                 }
             }
         }
-        eprintln!("[Explorer] get_network_stats: done (height={})", latest_height);
         Ok(NetworkStats {
             latest_block: latest_height,
             total_transactions: crate::chain_db::tx_count() as usize,
@@ -60,7 +57,6 @@ pub async fn get_network_stats() -> Result<NetworkStats, EgoDesktopError> {
     })
     .await
     .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
-    eprintln!("[Explorer] get_network_stats returning");
     result
 }
 
@@ -89,17 +85,28 @@ pub async fn get_p2p_status(state: tauri::State<'_, crate::app::AppState>) -> Re
         Some(Ok(())) => ("ok".into(), None),
         Some(Err(e)) => ("failed".into(), Some(e)),
     };
-    let ledger = crate::ledger::Ledger::load();
-    let used: u64 = ledger.stored_files.iter().map(|f| f.encrypted_size).sum();
+    let public_endpoint   = state.get_public_endpoint();
+    let relay_circuit     = crate::p2p::RELAY_CIRCUIT_READY.load(std::sync::atomic::Ordering::Relaxed);
+    let relay_server      = crate::p2p::relay_mode_active();
+    let community_relays  = crate::p2p::get_discovered_relay_nodes();
+
+    let (quota, used) = tokio::task::spawn_blocking(|| {
+        let ledger = crate::ledger::Ledger::load();
+        let used: u64 = ledger.stored_files.iter().map(|f| f.encrypted_size).sum();
+        (ledger.storage_allocated_bytes, used)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
+
     Ok(P2pStatus {
         upnp,
         upnp_error,
-        public_endpoint:      state.get_public_endpoint(),
+        public_endpoint,
         p2p_port:             crate::p2p::P2P_PORT,
-        relay_circuit_ready:  crate::p2p::RELAY_CIRCUIT_READY.load(std::sync::atomic::Ordering::Relaxed),
-        relay_server_active:  crate::p2p::relay_mode_active(),
-        community_relays:     crate::p2p::get_discovered_relay_nodes(),
-        storage_quota_bytes:  ledger.storage_allocated_bytes,
+        relay_circuit_ready:  relay_circuit,
+        relay_server_active:  relay_server,
+        community_relays,
+        storage_quota_bytes:  quota,
         storage_used_bytes:   used,
     })
 }
@@ -108,17 +115,9 @@ pub async fn get_p2p_status(state: tauri::State<'_, crate::app::AppState>) -> Re
 pub async fn get_blocks(offset: Option<u32>, limit: Option<u32>) -> Result<Vec<LedgerBlock>, EgoDesktopError> {
     let off = offset.unwrap_or(0) as usize;
     let lim = limit.unwrap_or(25) as usize;
-    eprintln!("[Explorer] get_blocks called (offset={}, limit={})", off, lim);
-    let result = tokio::task::spawn_blocking(move || {
-        eprintln!("[Explorer] get_blocks: inside spawn_blocking");
-        let blocks = crate::chain_db::paged_blocks(off, lim);
-        eprintln!("[Explorer] get_blocks: got {} blocks", blocks.len());
-        blocks
-    })
-    .await
-    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()));
-    eprintln!("[Explorer] get_blocks returning: {}", if result.is_ok() { "OK" } else { "ERR" });
-    result
+    tokio::task::spawn_blocking(move || crate::chain_db::paged_blocks(off, lim))
+        .await
+        .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))
 }
 
 #[tauri::command]

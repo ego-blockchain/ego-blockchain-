@@ -91,10 +91,21 @@ const META_TX_COUNT:        &[u8] = b"tx_count";
 const META_FINALIZED:       &[u8] = b"finalized_height";
 const META_MIGRATION_DONE:  &[u8] = b"migration_done";
 
-static CHAIN_DB: OnceLock<Mutex<DB>> = OnceLock::new();
+static CHAIN_DB: OnceLock<DB> = OnceLock::new();
 
-pub fn get_db() -> &'static Mutex<DB> {
-    CHAIN_DB.get_or_init(|| {
+#[derive(Debug)]
+pub struct FakeLockError(pub &'static DB);
+impl FakeLockError {
+    pub fn into_inner(self) -> &'static DB { self.0 }
+}
+pub struct DbWrapper(&'static DB);
+impl DbWrapper {
+    pub fn lock(&self) -> Result<&'static DB, FakeLockError> { Ok(self.0) }
+    pub fn expect(&self, _msg: &str) -> &'static DB { self.0 }
+}
+
+pub fn get_db() -> DbWrapper {
+    DbWrapper(CHAIN_DB.get_or_init(|| {
         let db_path = base_data_dir().join("chain_rocksdb");
         eprintln!("[ChainDB] Opening RocksDB at {:?}", db_path);
 
@@ -133,8 +144,8 @@ pub fn get_db() -> &'static Mutex<DB> {
 
         init_db(&db);
         eprintln!("[ChainDB] RocksDB init_db done");
-        Mutex::new(db)
-    })
+        db
+    }))
 }
 
 // ── Initialise / migrate ──────────────────────────────────────────────────────
@@ -178,8 +189,203 @@ fn init_db(db: &DB) {
 pub const ECOSYSTEM_ADDR:   &str = "egot1ecosystem00000000000000000000000000000000";
 pub const FOUNDATION_ADDR:  &str = "egot1foundation00000000000000000000000000000000";
 pub const NODE_POOL_ADDR:   &str = "egot1nodepool000000000000000000000000000000000";
+pub const STAKING_ADDR:     &str = "egot1staking000000000000000000000000000000000";
 pub const STAKING_POOL_ADDR:&str = "egot1stakingpool0000000000000000000000000000000";
+pub const SLASH_POOL_ADDR:  &str = "egot1slashpool0000000000000000000000000000000";
 pub const FAUCET_ADDR_FULL: &str = "egot1faucet000000000000000000000000000000000000";
+pub const SLASH_BPS: u64 = 1_000; // 10%
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EquivocationProofPayload {
+    pub accused: String,
+    pub height: u64,
+    pub hash_a: String,
+    pub sig_a: String,
+    pub hash_b: String,
+    pub sig_b: String,
+    pub accused_ed25519_pubkey: String,
+    pub reporter: String,
+}
+
+fn is_stake_tx(tx: &LedgerTx) -> bool {
+    tx.tx_type == "stake" && tx.to == STAKING_ADDR && !tx.from.is_empty()
+}
+
+fn is_unstake_tx(tx: &LedgerTx) -> bool {
+    tx.tx_type == "unstake" && tx.to == STAKING_ADDR && !tx.from.is_empty()
+}
+
+fn unstake_credit_amount(tx: &LedgerTx) -> u64 {
+    if tx.memo.as_deref() == Some("unstake:early") {
+        tx.amount.saturating_sub(tx.amount / 10)
+    } else {
+        tx.amount
+    }
+}
+
+pub fn equivocation_proof_hash(memo_json: &str) -> String {
+    format!("0x{}", blake3::hash(memo_json.as_bytes()).to_hex())
+}
+
+pub fn encode_equivocation_proof_payload(payload: &EquivocationProofPayload) -> String {
+    serde_json::to_string(payload).unwrap_or_default()
+}
+
+fn parse_equivocation_proof_payload(tx: &LedgerTx) -> Result<EquivocationProofPayload, String> {
+    if tx.tx_type != "equivocation_proof" {
+        return Err("not an equivocation proof tx".to_string());
+    }
+    let memo = tx.memo.as_deref().ok_or_else(|| "equivocation proof missing payload memo".to_string())?;
+    let payload: EquivocationProofPayload = serde_json::from_str(memo)
+        .map_err(|e| format!("equivocation proof payload invalid JSON: {e}"))?;
+    Ok(payload)
+}
+
+fn validator_ed25519_key(addr: &str) -> Vec<u8> {
+    format!("validator_ed25519:{addr}").into_bytes()
+}
+
+fn get_validator_ed25519_pubkey_inner(db: &DB, addr: &str) -> Option<String> {
+    let cf = db.cf_handle(CF_META)?;
+    db.get_cf(cf, validator_ed25519_key(addr))
+        .ok()
+        .flatten()
+        .and_then(|b| String::from_utf8(b.to_vec()).ok())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn get_validator_ed25519_pubkey(addr: &str) -> Option<String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    get_validator_ed25519_pubkey_inner(&db, addr)
+}
+
+fn persist_validator_ed25519_pubkey_in_batch(batch: &mut WriteBatch, db: &DB, addr: &str, pubkey_hex: &str) {
+    if addr.is_empty() || pubkey_hex.len() != 64 || hex::decode(pubkey_hex).map(|b| b.len() != 32).unwrap_or(true) {
+        return;
+    }
+    let Some(cf) = db.cf_handle(CF_META) else { return; };
+    batch.put_cf(cf, validator_ed25519_key(addr), pubkey_hex.as_bytes());
+}
+
+pub fn persist_validator_ed25519_pubkey(addr: &str, pubkey_hex: &str) {
+    if addr.is_empty() || pubkey_hex.len() != 64 || hex::decode(pubkey_hex).map(|b| b.len() != 32).unwrap_or(true) {
+        return;
+    }
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf) = db.cf_handle(CF_META) else { return; };
+    let _ = db.put_cf(cf, validator_ed25519_key(addr), pubkey_hex.as_bytes());
+}
+
+fn load_slashed_set_inner(db: &DB) -> std::collections::HashSet<String> {
+    let Some(cf) = db.cf_handle(CF_META) else { return Default::default(); };
+    db.get_cf(cf, META_SLASHED)
+        .ok()
+        .flatten()
+        .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+fn persist_slashed_set_in_batch(batch: &mut WriteBatch, db: &DB, set: &std::collections::HashSet<String>) {
+    let Some(cf) = db.cf_handle(CF_META) else { return; };
+    let mut ordered: Vec<String> = set.iter().cloned().collect();
+    ordered.sort_unstable();
+    batch.put_cf(cf, META_SLASHED, serde_json::to_vec(&ordered).unwrap_or_default());
+}
+
+pub fn is_slashed_validator(addr: &str) -> bool {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    load_slashed_set_inner(&db).contains(addr)
+}
+
+fn verify_ed25519_hex(pubkey_hex: &str, message: &[u8], sig_hex: &str, context: &str) -> Result<(), String> {
+    let pk_bytes = hex::decode(pubkey_hex)
+        .map_err(|_| format!("{context}: invalid pubkey hex"))?;
+    let sig_bytes = hex::decode(sig_hex)
+        .map_err(|_| format!("{context}: invalid signature hex"))?;
+    let pk_arr: [u8; 32] = pk_bytes.try_into()
+        .map_err(|_| format!("{context}: pubkey must be 32 bytes"))?;
+    let sig_arr: [u8; 64] = sig_bytes.try_into()
+        .map_err(|_| format!("{context}: signature must be 64 bytes"))?;
+    use ed25519_dalek::{Signature as DalekSig, VerifyingKey, Verifier};
+    let vk = VerifyingKey::from_bytes(&pk_arr)
+        .map_err(|e| format!("{context}: invalid pubkey: {e}"))?;
+    let sig = DalekSig::from_bytes(&sig_arr);
+    vk.verify(message, &sig)
+        .map_err(|_| format!("{context}: signature invalid"))
+}
+
+fn validate_equivocation_proof_tx_inner(db: &DB, tx: &LedgerTx) -> Result<EquivocationProofPayload, String> {
+    let payload = parse_equivocation_proof_payload(tx)?;
+    if payload.accused.is_empty() || payload.reporter.is_empty() {
+        return Err("equivocation proof missing accused or reporter".to_string());
+    }
+    if tx.from != payload.reporter || tx.to != payload.accused {
+        return Err("equivocation proof tx endpoints do not match payload".to_string());
+    }
+    if tx.amount != 0 || tx.fee_uegoc != 0 || tx.nonce != 0 {
+        return Err("equivocation proof must have zero amount, fee, and nonce".to_string());
+    }
+    if payload.height == 0 || payload.hash_a.is_empty() || payload.hash_b.is_empty() || payload.hash_a == payload.hash_b {
+        return Err("equivocation proof must contain two distinct non-genesis vote hashes".to_string());
+    }
+    let memo = tx.memo.as_deref().unwrap_or("");
+    let expected_hash = equivocation_proof_hash(memo);
+    if tx.hash != expected_hash {
+        return Err(format!("equivocation proof hash mismatch: got {}, expected {}", tx.hash, expected_hash));
+    }
+    if payload.accused_ed25519_pubkey.len() != 64 {
+        return Err("equivocation proof accused pubkey must be 32-byte hex".to_string());
+    }
+    let expected_accused_pk = get_validator_ed25519_pubkey_inner(db, &payload.accused)
+        .ok_or_else(|| format!("missing on-chain validator Ed25519 key for {}", payload.accused))?;
+    if expected_accused_pk != payload.accused_ed25519_pubkey {
+        return Err("equivocation proof accused pubkey does not match confirmed validator key".to_string());
+    }
+
+    let vote_data_a = crate::bft_committee::vote_signing_data(&payload.hash_a, payload.height, &payload.accused);
+    let vote_data_b = crate::bft_committee::vote_signing_data(&payload.hash_b, payload.height, &payload.accused);
+    verify_ed25519_hex(&payload.accused_ed25519_pubkey, vote_data_a.as_bytes(), &payload.sig_a, "equivocation proof vote A")?;
+    verify_ed25519_hex(&payload.accused_ed25519_pubkey, vote_data_b.as_bytes(), &payload.sig_b, "equivocation proof vote B")?;
+
+    if tx.public_key_ed25519.is_empty() || tx.signature.is_empty() {
+        return Err("equivocation proof missing reporter pubkey/signature".to_string());
+    }
+    verify_ed25519_hex(&tx.public_key_ed25519, tx.hash.as_bytes(), &tx.signature, "equivocation proof reporter")?;
+    Ok(payload)
+}
+
+pub fn validate_equivocation_proof_tx(tx: &LedgerTx) -> Result<EquivocationProofPayload, String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let payload = validate_equivocation_proof_tx_inner(&db, tx)?;
+    if load_slashed_set_inner(&db).contains(&payload.accused) {
+        return Err(format!("validator {} already slashed", payload.accused));
+    }
+    Ok(payload)
+}
+
+fn slash_from_equivocation_tx(
+    db: &DB,
+    tx: &LedgerTx,
+    stake_sim: &mut std::collections::HashMap<String, u64>,
+    slashed_seen: &mut std::collections::HashSet<String>,
+) -> Result<(String, u64), String> {
+    let payload = validate_equivocation_proof_tx_inner(db, tx)?;
+    if slashed_seen.contains(&payload.accused) {
+        return Err(format!("validator {} already slashed", payload.accused));
+    }
+    let stake = stake_sim
+        .entry(payload.accused.clone())
+        .or_insert_with(|| crate::ledger::get_validator_stake(&payload.accused));
+    let slash_amount = stake.saturating_mul(SLASH_BPS) / 10_000;
+    if slash_amount == 0 {
+        return Err(format!("validator {} has no slashable stake", payload.accused));
+    }
+    *stake = stake.saturating_sub(slash_amount);
+    slashed_seen.insert(payload.accused.clone());
+    Ok((payload.accused, slash_amount))
+}
 
 fn seed_genesis(db: &DB) {
     use crate::tokenomics::*;
@@ -219,6 +425,8 @@ fn seed_genesis(db: &DB) {
         poc_slot: 0,
         state_root: String::new(),
         base_fee_uegoc: 1_000,
+        agg_bls_sig: String::new(),
+        bls_pubkeys: Vec::new(),
     };
     write_block_batch(db, &genesis, &[]);
 
@@ -258,6 +466,8 @@ fn migrate_from_sqlite(db: &DB, path: &std::path::Path) -> bool {
             poc_slot: 0,
             state_root: String::new(),
             base_fee_uegoc: 1_000,
+            agg_bls_sig: String::new(),
+            bls_pubkeys: Vec::new(),
         })
     }).unwrap().filter_map(|r| r.ok()).collect();
 
@@ -446,14 +656,16 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
     // Fork choice: if a block already exists at this height, only replace it
     // if the incoming block has strictly more validator votes (heavier chain).
     // This is the canonical rule: the block that collects the most BFT votes wins.
+    let mut replaced_tx_count: u64 = 0;
     if let Some(existing_bytes) = db.get_cf(cf_blocks, height_k).ok().flatten() {
-        let existing_votes = decode::<LedgerBlock>(&existing_bytes)
-            .map(|b| b.vote_count)
-            .unwrap_or(0);
+        let existing = decode::<LedgerBlock>(&existing_bytes);
+        let existing_votes = existing.as_ref().map(|b| b.vote_count).unwrap_or(0);
         if block.vote_count <= existing_votes {
             return; // existing block is at least as well-attested — keep it
         }
         // New block has more votes: fall through and overwrite.
+        // Track how many txs the old block had so we can adjust META_TX_COUNT.
+        replaced_tx_count = existing.map(|b| b.tx_count as u64).unwrap_or(0);
         tracing::info!("ForkChoice: replacing block #{} ({} votes → {} votes)",
             block.height, existing_votes, block.vote_count);
     }
@@ -461,6 +673,9 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
     // Pre-read balances for all addresses involved (read-before-batch).
     let mut balance_delta: std::collections::HashMap<String, i128> = Default::default();
     let mut new_tx_count: u64 = 0;
+    let mut stake_sim: std::collections::HashMap<String, u64> = Default::default();
+    let mut slashed_seen = load_slashed_set_inner(db);
+    let mut newly_slashed: Vec<(String, u64)> = Vec::new();
 
     let confirmed_txs: Vec<&LedgerTx> = txs.iter()
         .filter(|tx| tx.status == "Confirmed" || tx.status.is_empty())
@@ -494,16 +709,38 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
             tx.amount
         };
 
-        *balance_delta.entry(tx.to.clone()).or_insert(0) += credited_amount as i128;
-        let is_system_source = tx.from == FAUCET_ADDR
-            || tx.from == NODE_POOL_ADDR
-            || tx.from.is_empty();
+        if is_unstake_tx(tx) {
+            let credit = unstake_credit_amount(tx);
+            *balance_delta.entry(tx.from.clone()).or_insert(0) += credit as i128 - tx.fee_uegoc as i128;
+            *balance_delta.entry(STAKING_ADDR.to_string()).or_insert(0) -= credit as i128;
+            let stake = stake_sim
+                .entry(tx.from.clone())
+                .or_insert_with(|| crate::ledger::get_validator_stake(&tx.from));
+            *stake = stake.saturating_sub(tx.amount);
+        } else if tx.tx_type == "equivocation_proof" {
+            match slash_from_equivocation_tx(db, tx, &mut stake_sim, &mut slashed_seen) {
+                Ok((accused, slash_amount)) => {
+                    *balance_delta.entry(STAKING_ADDR.to_string()).or_insert(0) -= slash_amount as i128;
+                    newly_slashed.push((accused, slash_amount));
+                }
+                Err(e) => tracing::warn!("Skipping invalid equivocation proof {} during block write: {}", tx.hash, e),
+            }
+        } else {
+            *balance_delta.entry(tx.to.clone()).or_insert(0) += credited_amount as i128;
+        let is_system_source = tx.from == NODE_POOL_ADDR || tx.from.is_empty();
         if !is_system_source {
             let total_out = tx.amount as i128 + tx.fee_uegoc as i128;
             *balance_delta.entry(tx.from.clone()).or_insert(0) -= total_out;
+            if is_stake_tx(tx) {
+                let stake = stake_sim
+                    .entry(tx.from.clone())
+                    .or_insert_with(|| crate::ledger::get_validator_stake(&tx.from));
+                *stake = stake.saturating_add(tx.amount);
+            }
         } else if tx.from == NODE_POOL_ADDR {
             // Debit the node pool so it actually decreases — enforces hard supply cap.
             *balance_delta.entry(NODE_POOL_ADDR.to_string()).or_insert(0) -= credited_amount as i128;
+        }
         }
         new_tx_count += 1;
     }
@@ -537,14 +774,27 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
         batch.put_cf(cf_block_txs,  block_txs_key(block.height, &tx.hash), b"");
         batch.put_cf(cf_recent_txs, recent_txs_key(tx.timestamp, &tx.hash), b"");
         // Per-address history with signed delta.
-        let incoming_k = addr_txs_key(&tx.to, tx.timestamp, &tx.hash);
-        batch.put_cf(cf_addr_txs, incoming_k, (tx.amount as i64).to_le_bytes());
-        let is_system_source = tx.from == FAUCET_ADDR
-            || tx.from == NODE_POOL_ADDR
-            || tx.from.is_empty();
-        if !is_system_source {
-            let outgoing_k = addr_txs_key(&tx.from, tx.timestamp, &tx.hash);
-            batch.put_cf(cf_addr_txs, outgoing_k, (-(tx.amount as i64)).to_le_bytes());
+        if is_unstake_tx(tx) {
+            let credit = unstake_credit_amount(tx);
+            let incoming_k = addr_txs_key(&tx.from, tx.timestamp, &tx.hash);
+            batch.put_cf(cf_addr_txs, incoming_k, (credit as i64).to_le_bytes());
+            let staking_k = addr_txs_key(STAKING_ADDR, tx.timestamp, &tx.hash);
+            batch.put_cf(cf_addr_txs, staking_k, (-(credit as i64)).to_le_bytes());
+        } else if tx.tx_type == "equivocation_proof" {
+            if let Some((_, slash_amount)) = newly_slashed.iter().find(|(addr, _)| addr == &tx.to) {
+                let staking_k = addr_txs_key(STAKING_ADDR, tx.timestamp, &tx.hash);
+                batch.put_cf(cf_addr_txs, staking_k, (-(*slash_amount as i64)).to_le_bytes());
+            }
+            let proof_k = addr_txs_key(&tx.to, tx.timestamp, &tx.hash);
+            batch.put_cf(cf_addr_txs, proof_k, 0i64.to_le_bytes());
+        } else {
+            let incoming_k = addr_txs_key(&tx.to, tx.timestamp, &tx.hash);
+            batch.put_cf(cf_addr_txs, incoming_k, (tx.amount as i64).to_le_bytes());
+            let is_system_source = tx.from == NODE_POOL_ADDR || tx.from.is_empty();
+            if !is_system_source {
+                let outgoing_k = addr_txs_key(&tx.from, tx.timestamp, &tx.hash);
+                batch.put_cf(cf_addr_txs, outgoing_k, (-(tx.amount as i64)).to_le_bytes());
+            }
         }
     }
 
@@ -564,14 +814,37 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
     }
     let cur_tx_count = db.get_cf(cf_meta, META_TX_COUNT)
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-    batch.put_cf(cf_meta, META_TX_COUNT, u64_le(cur_tx_count + new_tx_count));
+    let adjusted = cur_tx_count.saturating_sub(replaced_tx_count) + new_tx_count;
+    batch.put_cf(cf_meta, META_TX_COUNT, u64_le(adjusted));
 
     // Persist confirmed nonces atomically with the block write so replay
     // protection survives node restarts.  Only non-system senders have nonces.
     for tx in &confirmed_txs {
-        let is_system = tx.from == FAUCET_ADDR || tx.from == NODE_POOL_ADDR || tx.from.is_empty();
+        let is_system = tx.from == NODE_POOL_ADDR || tx.from.is_empty();
         if !is_system && tx.nonce > 0 {
             persist_nonce_in_batch(&mut batch, &db, &tx.from, tx.nonce);
+        }
+        if is_stake_tx(tx) && !tx.public_key_ed25519.is_empty() {
+            persist_validator_ed25519_pubkey_in_batch(
+                &mut batch,
+                &db,
+                &tx.from,
+                &tx.public_key_ed25519,
+            );
+        }
+    }
+
+    // Persist validator stakes to CF_META so they survive restarts without O(N) scan
+    for (addr, amount) in &stake_sim {
+        let mut key = b"stake:".to_vec();
+        key.extend_from_slice(addr.as_bytes());
+        batch.put_cf(cf_meta, &key, u64_le(*amount));
+    }
+
+    if !newly_slashed.is_empty() {
+        persist_slashed_set_in_batch(&mut batch, &db, &slashed_seen);
+        for (addr, _) in &newly_slashed {
+            crate::p2p::mark_validator_slashed_local(addr);
         }
     }
 
@@ -585,12 +858,6 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
     let hdr = LightBlockHeader::from(block);
     db.put_cf(cf_hdrs, height_key(block.height), encode(&hdr)).ok();
 
-    // Dynamic checkpoint: every CHECKPOINT_INTERVAL blocks store the hash in CF_META.
-    // This protects against long-range attacks on intervals not covered by hardcoded checkpoints.
-    if block.height > 0 && block.height % CHECKPOINT_INTERVAL == 0 {
-        store_dynamic_checkpoint(db, block);
-    }
-
     // Prune old data to keep disk bounded.
     prune_if_needed(db);
 
@@ -603,12 +870,15 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
 
     // Update validator stake tracker for staking/unstaking TXs.
     // This is what gates validator registration (minimum stake required).
-    const STAKING_ADDR_STR: &str = "egot1staking000000000000000000000000000000000";
     for tx in &confirmed_txs {
-        if tx.to == STAKING_ADDR_STR && !tx.from.is_empty() {
+        if is_stake_tx(tx) {
             crate::ledger::record_validator_stake(&tx.from, tx.amount, true);
-        } else if tx.from == STAKING_ADDR_STR && !tx.to.is_empty() {
-            crate::ledger::record_validator_stake(&tx.to, tx.amount, false);
+        } else if is_unstake_tx(tx) {
+            crate::ledger::record_validator_stake(&tx.from, tx.amount, false);
+        } else if tx.tx_type == "equivocation_proof" {
+            if let Some((accused, slash_amount)) = newly_slashed.iter().find(|(addr, _)| addr == &tx.to) {
+                crate::ledger::record_validator_stake(accused, *slash_amount, false);
+            }
         }
     }
 }
@@ -669,10 +939,45 @@ fn prune_if_needed(db: &DB) {
         if pruned_below < keep_from {
             let cf_blocks    = db.cf_handle(CF_BLOCKS).unwrap();
             let cf_block_txs = db.cf_handle(CF_BLOCK_TXS).unwrap();
+            let cf_txs       = db.cf_handle(CF_TXS).unwrap();
+            let cf_addr_txs  = db.cf_handle(CF_ADDR_TXS).unwrap();
             let mut batch = WriteBatch::default();
+            
+            let my_addr = crate::ledger::Ledger::load().address;
+            
+            // Delete individual transactions from CF_TXS before dropping the index
+            for h in pruned_below..keep_from {
+                let prefix = height_key(h);
+                let iter = db.prefix_iterator_cf(cf_block_txs, prefix);
+                for item in iter {
+                    if let Ok((k, _)) = item {
+                        if k.len() > 8 {
+                            let tx_hash = &k[8..];
+                            if let Some(v) = db.get_cf(cf_txs, tx_hash).ok().flatten() {
+                                if let Some(tx) = decode::<LedgerTx>(&v) {
+                                    // Preserve local wallet history, prune everything else
+                                    if tx.from != my_addr && tx.to != my_addr {
+                                        batch.delete_cf(cf_txs, tx_hash);
+                                        
+                                        // Also prune the address index (CF_ADDR_TXS) to prevent infinite growth
+                                        let tx_hash_str = std::str::from_utf8(tx_hash).unwrap_or("");
+                                        if !tx_hash_str.is_empty() {
+                                            batch.delete_cf(cf_addr_txs, addr_txs_key(&tx.to, tx.timestamp, tx_hash_str));
+                                            if !tx.from.is_empty() && tx.from != NODE_POOL_ADDR {
+                                                batch.delete_cf(cf_addr_txs, addr_txs_key(&tx.from, tx.timestamp, tx_hash_str));
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    batch.delete_cf(cf_txs, tx_hash);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Range tombstone: delete all keys in [pruned_below, keep_from).
-            // CF_BLOCK_TXS keys are height(8) ++ tx_hash, so the height prefix
-            // range covers all index entries for those blocks.
             batch.delete_range_cf(cf_blocks,    height_key(pruned_below), height_key(keep_from));
             batch.delete_range_cf(cf_block_txs, height_key(pruned_below), height_key(keep_from));
             batch.put_cf(cf_meta, META_PRUNE_BELOW, u64_le(keep_from));
@@ -912,16 +1217,21 @@ pub fn parallel_apply_txs(txs: &[LedgerTx], db: &DB) -> Vec<(String, u64)> {
         .flat_map(|(_, sender_txs)| {
             let mut pairs: Vec<(String, i128)> = Vec::new();
             for tx in sender_txs.iter() {
-                let is_system = tx.from.is_empty()
-                    || tx.from == NODE_POOL_ADDR
-                    || tx.from.starts_with("egot1faucet")
-                    || tx.from.starts_with("egot1genesis");
+                if is_unstake_tx(tx) {
+                    let credit = unstake_credit_amount(tx);
+                    pairs.push((tx.from.clone(), credit as i128 - tx.fee_uegoc as i128));
+                    pairs.push((STAKING_ADDR.to_string(), -(credit as i128)));
+                    continue;
+                }
+                let is_system = tx.from.is_empty() || tx.from == NODE_POOL_ADDR;
                 if !tx.to.is_empty() {
                     pairs.push((tx.to.clone(), tx.amount as i128));
                 }
                 if !is_system {
                     let out = tx.amount as i128 + tx.fee_uegoc as i128;
                     pairs.push((tx.from.clone(), -out));
+                } else if tx.from == NODE_POOL_ADDR {
+                    pairs.push((NODE_POOL_ADDR.to_string(), -(tx.amount as i128)));
                 }
             }
             pairs
@@ -1018,60 +1328,19 @@ fn collect_sorted_balances(db: &DB) -> Vec<(Vec<u8>, u64)> {
 }
 
 pub fn compute_full_state_root() -> String {
-    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let entries = collect_sorted_balances(&db);
-    if entries.is_empty() {
-        return "0".repeat(64);
-    }
-    let leaf_strings: Vec<String> = entries.iter()
-        .filter(|(_, bal)| *bal > 0)
-        .map(|(k, bal)| balance_leaf(k, *bal))
-        .collect();
-    if leaf_strings.is_empty() {
-        return "0".repeat(64);
-    }
-    let refs: Vec<&str> = leaf_strings.iter().map(|s| s.as_str()).collect();
-    compute_merkle_root(&refs)
+    let (h, _) = latest_block_info();
+    get_block_by_height(h).map(|b| b.state_root).unwrap_or_else(|| "0".repeat(64))
 }
 
 pub fn get_state_merkle_proof(address: &str) -> Vec<String> {
-    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let entries = collect_sorted_balances(&db);
-    if entries.is_empty() {
-        return vec![];
-    }
-    let addr_bytes = address.as_bytes();
-    let idx = match entries.iter().position(|(k, _)| k.as_slice() == addr_bytes) {
-        Some(i) => i,
-        None => return vec![],
-    };
-    let leaf_strings: Vec<String> = entries.iter()
-        .map(|(k, bal)| balance_leaf(k, *bal))
-        .collect();
-    let mut layer: Vec<String> = leaf_strings.iter()
-        .map(|h| blake3_hex(h.as_bytes()))
-        .collect();
-    let mut proof: Vec<String> = Vec::new();
-    let mut pos = idx;
-    while layer.len() > 1 {
-        if layer.len() % 2 == 1 {
-            let last = layer.last().unwrap().clone();
-            layer.push(last);
-        }
-        let sibling = if pos % 2 == 0 { pos + 1 } else { pos - 1 };
-        proof.push(layer[sibling].clone());
-        pos /= 2;
-        layer = layer.chunks(2)
-            .map(|pair| blake3_hex(format!("{}{}", pair[0], pair[1]).as_bytes()))
-            .collect();
-    }
-    proof
+    // O(N) full state proofs are deprecated in favor of delta roots.
+    vec![]
 }
 
 pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc_slot: u64) -> LedgerBlock {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
 
-    let (latest_height, prev_hash, prev_base_fee) = {
+    let (latest_height, prev_hash, prev_base_fee, prev_state_root) = {
         let cf_meta = db.cf_handle(CF_META).unwrap();
         let h = db.get_cf(cf_meta, META_LATEST_HEIGHT)
             .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
@@ -1080,21 +1349,22 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
             .ok().flatten()
             .and_then(|v| decode::<LedgerBlock>(&v));
         let hash = prev_block.as_ref().map(|b| b.hash.clone()).unwrap_or_else(|| GENESIS_HASH.to_string());
-        let base_fee = prev_block.map(|b| b.base_fee_uegoc).unwrap_or(0);
+        let base_fee = prev_block.as_ref().map(|b| b.base_fee_uegoc).unwrap_or(0);
         let base_fee = if base_fee == 0 { 1_000 } else { base_fee };
-        (h, hash, base_fee)
+        let state_root = prev_block.as_ref().map(|b| b.state_root.clone()).unwrap_or_else(|| "0".repeat(64));
+        (h, hash, base_fee, state_root)
     };
 
     let height    = latest_height + 1;
     let timestamp = chrono::Utc::now().timestamp();
 
     let user_tx_count = txs.iter().filter(|t| {
-        !t.from.is_empty() && t.tx_type != "reward" && t.tx_type != "coinbase"
+        !t.from.is_empty() && t.tx_type != "reward" && t.tx_type != "coinbase" && t.tx_type != "post_reward"
     }).count();
     let new_base_fee = compute_next_base_fee(prev_base_fee, user_tx_count);
 
     let tx_fees_sum: u64 = txs.iter().map(|t| t.fee_uegoc).sum();
-    let remaining = remaining_mintable();
+    let remaining = crate::tokenomics::TOTAL_SUPPLY_UEGOC.saturating_sub(circulating_supply_inner(&db));
     let reward = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash).min(remaining);
     if reward == 0 {
         tracing::warn!("Supply cap reached at block {} — no coinbase reward", height);
@@ -1159,16 +1429,21 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
             .par_iter()
             .flat_map(|tx| {
                 let mut pairs: Vec<(Vec<u8>, i128)> = Vec::with_capacity(2);
+                if is_unstake_tx(tx) {
+                    let credit = unstake_credit_amount(tx);
+                    pairs.push((tx.from.as_bytes().to_vec(), credit as i128 - tx.fee_uegoc as i128));
+                    pairs.push((STAKING_ADDR.as_bytes().to_vec(), -(credit as i128)));
+                    return pairs;
+                }
                 if !tx.to.is_empty() {
                     pairs.push((tx.to.as_bytes().to_vec(), tx.amount as i128));
                 }
-                let is_system = tx.from.is_empty()
-                    || tx.from == NODE_POOL_ADDR
-                    || tx.from.starts_with("egot1faucet")
-                    || tx.from.starts_with("egot1genesis");
+                let is_system = tx.from.is_empty() || tx.from == NODE_POOL_ADDR;
                 if !is_system {
                     let out = tx.amount as i128 + tx.fee_uegoc as i128;
                     pairs.push((tx.from.as_bytes().to_vec(), -out));
+                } else if tx.from == NODE_POOL_ADDR {
+                    pairs.push((NODE_POOL_ADDR.as_bytes().to_vec(), -(tx.amount as i128)));
                 }
                 pairs
             })
@@ -1180,35 +1455,15 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
         }
 
         let cf_bal = db.cf_handle(CF_BALANCES).unwrap();
-        let mut all_entries: Vec<(Vec<u8>, u64)> = db
-            .iterator_cf(cf_bal, rocksdb::IteratorMode::Start)
-            .filter_map(|r| r.ok())
-            .map(|(k, v)| (k.to_vec(), read_u64_le(&v)))
-            .collect();
-        for (addr_bytes, delta) in &deltas {
-            if let Some(entry) = all_entries.iter_mut().find(|(k, _)| k == addr_bytes) {
-                entry.1 = (entry.1 as i128 + delta).max(0) as u64;
-            } else {
-                let new_bal = (*delta).max(0) as u64;
-                all_entries.push((addr_bytes.clone(), new_bal));
-            }
-        }
-        all_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        if all_entries.is_empty() {
-            "0".repeat(64)
-        } else {
-            let leaf_strings: Vec<String> = all_entries
-                .par_iter()
-                .map(|(k, bal)| {
-                    let mut leaf = Vec::with_capacity(k.len() + 8);
-                    leaf.extend_from_slice(k);
-                    leaf.extend_from_slice(&bal.to_le_bytes());
-                    blake3::hash(&leaf).to_hex().to_string()
-                })
-                .collect();
-            let refs: Vec<&str> = leaf_strings.iter().map(|s| s.as_str()).collect();
-            compute_merkle_root(&refs)
-        }
+        let mut changed: Vec<(Vec<u8>, u64)> = deltas.into_iter().map(|(k, delta)| {
+            let cur = db.get_cf(cf_bal, &k).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+            (k, (cur as i128 + delta).max(0) as u64)
+        }).collect();
+        changed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let leaf_strings: Vec<String> = changed.iter().map(|(k, bal)| balance_leaf(k, *bal)).collect();
+        let refs: Vec<&str> = leaf_strings.iter().map(|s| s.as_str()).collect();
+        let delta_root = compute_merkle_root(&refs);
+        blake3_hex(format!("{}{}", prev_state_root, delta_root).as_bytes())
     };
 
     let hash = block_hash_v3(&prev_hash, height, miner, timestamp, &tx_merkle_root, poc_ticket, &state_root);
@@ -1229,6 +1484,8 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
         poc_slot,
         state_root,
         base_fee_uegoc: new_base_fee,
+        agg_bls_sig: String::new(),
+        bls_pubkeys: Vec::new(),
     };
 
     write_block_batch(&db, &block, &stamped);
@@ -1240,8 +1497,6 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
         for tx in txs {
             let is_system = tx.from.is_empty()
                 || tx.from == NODE_POOL_ADDR
-                || tx.from.starts_with("egot1faucet")
-                || tx.from.starts_with("egot1genesis")
                 || tx.tx_type == "reward"
                 || tx.tx_type == "coinbase";
             if !is_system {
@@ -1270,7 +1525,7 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
 pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc_slot: u64) -> (LedgerBlock, Vec<LedgerTx>) {
     let db = get_db().lock().expect("chain_db lock poisoned");
 
-    let (latest_height, prev_hash, prev_base_fee) = {
+    let (latest_height, prev_hash, prev_base_fee, prev_state_root) = {
         let cf_meta = db.cf_handle(CF_META).expect("CF_META missing");
         let h = db.get_cf(cf_meta, META_LATEST_HEIGHT)
             .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
@@ -1279,32 +1534,18 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
             .ok().flatten()
             .and_then(|v| decode::<LedgerBlock>(&v));
         let hash = prev_block.as_ref().map(|b| b.hash.clone()).unwrap_or_else(|| GENESIS_HASH.to_string());
-        let base_fee = prev_block.map(|b| b.base_fee_uegoc).unwrap_or(0);
+        let base_fee = prev_block.as_ref().map(|b| b.base_fee_uegoc).unwrap_or(0);
         let base_fee = if base_fee == 0 { 1_000 } else { base_fee };
-        (h, hash, base_fee)
+        let state_root = prev_block.as_ref().map(|b| b.state_root.clone()).unwrap_or_else(|| "0".repeat(64));
+        (h, hash, base_fee, state_root)
     };
 
     let height    = latest_height + 1;
     let timestamp = chrono::Utc::now().timestamp();
 
-    let user_tx_count = txs.iter().filter(|t| {
-        !t.from.is_empty() && t.tx_type != "reward" && t.tx_type != "coinbase"
-    }).count();
-    let new_base_fee = compute_next_base_fee(prev_base_fee, user_tx_count);
-
-    let tx_fees_sum: u64 = txs.iter().map(|t| t.fee_uegoc).sum();
-    let remaining = remaining_mintable();
-    let reward = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash).min(remaining);
-    if reward == 0 {
-        tracing::warn!("Supply cap reached at block {} — no coinbase reward", height);
-    }
-
-    let coinbase_hash = format!("0x{}", blake3::hash(
-        format!("coinbase:{height}:{miner}:{reward}:{timestamp}").as_bytes()
-    ).to_hex());
-
     let cf_bal = db.cf_handle(CF_BALANCES).expect("CF_BALANCES missing");
     let mut sim_balances: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut sim_stakes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
 
     let valid_txs: Vec<&LedgerTx> = txs.iter().filter(|tx| {
         if tx.nonce == 0 { return true; }
@@ -1317,7 +1558,35 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
             return false;
         }
 
-        let is_system = tx.from.is_empty() || tx.from == NODE_POOL_ADDR || tx.from.starts_with("egot1faucet") || tx.from.starts_with("egot1genesis");
+        if is_unstake_tx(tx) {
+            let stake_left = sim_stakes.entry(tx.from.clone())
+                .or_insert_with(|| crate::ledger::get_validator_stake(&tx.from));
+            if tx.amount == 0 || *stake_left < tx.amount {
+                eprintln!("[TX] {:.12} Rejected - unstake exceeds active stake", tx.hash);
+                return false;
+            }
+            let credit = unstake_credit_amount(tx);
+            if credit < tx.fee_uegoc {
+                eprintln!("[TX] {:.12} Rejected - unstake credit below fee", tx.hash);
+                return false;
+            }
+            let staking_bal = sim_balances.get(STAKING_ADDR).copied().unwrap_or_else(|| {
+                db.get_cf(cf_bal, STAKING_ADDR.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
+            });
+            if staking_bal < credit {
+                eprintln!("[TX] {:.12} Rejected - staking contract balance too low", tx.hash);
+                return false;
+            }
+            *stake_left = stake_left.saturating_sub(tx.amount);
+            let from_bal = sim_balances.get(&tx.from).copied().unwrap_or_else(|| {
+                db.get_cf(cf_bal, tx.from.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
+            });
+            sim_balances.insert(tx.from.clone(), from_bal.saturating_add(credit).saturating_sub(tx.fee_uegoc));
+            sim_balances.insert(STAKING_ADDR.to_string(), staking_bal.saturating_sub(credit));
+            return true;
+        }
+
+        let is_system = tx.from.is_empty() || tx.from == NODE_POOL_ADDR;
         if !is_system {
             let from_bal = sim_balances.get(&tx.from).copied().unwrap_or_else(|| {
                 db.get_cf(cf_bal, tx.from.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
@@ -1332,6 +1601,22 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
 
         true
     }).collect();
+
+    let user_tx_count = valid_txs.iter().filter(|t| {
+        !t.from.is_empty() && t.tx_type != "reward" && t.tx_type != "coinbase" && t.tx_type != "post_reward"
+    }).count();
+    let new_base_fee = compute_next_base_fee(prev_base_fee, user_tx_count);
+
+    let tx_fees_sum: u64 = valid_txs.iter().map(|t| t.fee_uegoc).sum();
+    let remaining = crate::tokenomics::TOTAL_SUPPLY_UEGOC.saturating_sub(circulating_supply_inner(&db));
+    let reward = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash).min(remaining);
+    if reward == 0 {
+        tracing::warn!("Supply cap reached at block {} — no coinbase reward", height);
+    }
+
+    let coinbase_hash = format!("0x{}", blake3::hash(
+        format!("coinbase:{height}:{miner}:{reward}:{timestamp}").as_bytes()
+    ).to_hex());
 
     let mut stamped: Vec<LedgerTx> = valid_txs.iter().map(|tx| {
         let mut t = (*tx).clone();
@@ -1384,46 +1669,32 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         let cf_bal = db.cf_handle(CF_BALANCES).expect("CF_BALANCES missing");
         let mut deltas: std::collections::HashMap<Vec<u8>, i128> = Default::default();
         for tx in &stamped {
+            if is_unstake_tx(tx) {
+                let credit = unstake_credit_amount(tx);
+                *deltas.entry(tx.from.as_bytes().to_vec()).or_insert(0) += credit as i128 - tx.fee_uegoc as i128;
+                *deltas.entry(STAKING_ADDR.as_bytes().to_vec()).or_insert(0) -= credit as i128;
+                continue;
+            }
             if !tx.to.is_empty() {
                 *deltas.entry(tx.to.as_bytes().to_vec()).or_insert(0) += tx.amount as i128;
             }
-            let is_system = tx.from.is_empty()
-                || tx.from == NODE_POOL_ADDR
-                || tx.from.starts_with("egot1faucet")
-                || tx.from.starts_with("egot1genesis");
+            let is_system = tx.from.is_empty() || tx.from == NODE_POOL_ADDR;
             if !is_system {
                 let out = tx.amount as i128 + tx.fee_uegoc as i128;
                 *deltas.entry(tx.from.as_bytes().to_vec()).or_insert(0) -= out;
+            } else if tx.from == NODE_POOL_ADDR {
+                *deltas.entry(NODE_POOL_ADDR.as_bytes().to_vec()).or_insert(0) -= tx.amount as i128;
             }
         }
-        let mut all_entries: Vec<(Vec<u8>, u64)> = db
-            .iterator_cf(cf_bal, rocksdb::IteratorMode::Start)
-            .filter_map(|r| r.ok())
-            .map(|(k, v)| (k.to_vec(), read_u64_le(&v)))
-            .collect();
-        for (addr_bytes, delta) in &deltas {
-            if let Some(entry) = all_entries.iter_mut().find(|(k, _)| k == addr_bytes) {
-                entry.1 = (entry.1 as i128 + delta).max(0) as u64;
-            } else {
-                let new_bal = (*delta).max(0) as u64;
-                all_entries.push((addr_bytes.clone(), new_bal));
-            }
-        }
-        all_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        if all_entries.is_empty() {
-            "0".repeat(64)
-        } else {
-            let leaf_strings: Vec<String> = all_entries.iter()
-                .map(|(k, bal)| {
-                    let mut leaf = Vec::with_capacity(k.len() + 8);
-                    leaf.extend_from_slice(k);
-                    leaf.extend_from_slice(&bal.to_le_bytes());
-                    blake3::hash(&leaf).to_hex().to_string()
-                })
-                .collect();
-            let refs: Vec<&str> = leaf_strings.iter().map(|s| s.as_str()).collect();
-            compute_merkle_root(&refs)
-        }
+        let mut changed: Vec<(Vec<u8>, u64)> = deltas.into_iter().map(|(k, delta)| {
+            let cur = db.get_cf(cf_bal, &k).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+            (k, (cur as i128 + delta).max(0) as u64)
+        }).collect();
+        changed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let leaf_strings: Vec<String> = changed.iter().map(|(k, bal)| balance_leaf(k, *bal)).collect();
+        let refs: Vec<&str> = leaf_strings.iter().map(|s| s.as_str()).collect();
+        let delta_root = compute_merkle_root(&refs);
+        blake3_hex(format!("{}{}", prev_state_root, delta_root).as_bytes())
     };
 
     let hash = block_hash_v3(&prev_hash, height, miner, timestamp, &tx_merkle_root, poc_ticket, &state_root);
@@ -1444,6 +1715,8 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         poc_slot,
         state_root,
         base_fee_uegoc: new_base_fee,
+        agg_bls_sig: String::new(),
+        bls_pubkeys: Vec::new(),
     };
 
     (block, stamped)
@@ -1519,10 +1792,304 @@ pub fn verify_block_hash(block: &LedgerBlock, txs: &[crate::ledger::LedgerTx]) -
     false
 }
 
+fn compute_projected_state_root_inner(db: &DB, txs: &[LedgerTx]) -> String {
+    let cf_bal = match db.cf_handle(CF_BALANCES) {
+        Some(cf) => cf,
+        None => return String::new(),
+    };
+
+    let mut deltas: std::collections::HashMap<Vec<u8>, i128> = Default::default();
+    for tx in txs {
+        if is_unstake_tx(tx) {
+            let credit = unstake_credit_amount(tx);
+            *deltas.entry(tx.from.as_bytes().to_vec()).or_insert(0) += credit as i128 - tx.fee_uegoc as i128;
+            *deltas.entry(STAKING_ADDR.as_bytes().to_vec()).or_insert(0) -= credit as i128;
+            continue;
+        }
+        if !tx.to.is_empty() {
+            *deltas.entry(tx.to.as_bytes().to_vec()).or_insert(0) += tx.amount as i128;
+        }
+        let is_system = tx.from.is_empty() || tx.from == NODE_POOL_ADDR;
+        if !is_system {
+            let out = tx.amount as i128 + tx.fee_uegoc as i128;
+            *deltas.entry(tx.from.as_bytes().to_vec()).or_insert(0) -= out;
+        } else if tx.from == NODE_POOL_ADDR {
+            let pool_bal: u64 = db.get_cf(cf_bal, NODE_POOL_ADDR.as_bytes())
+                .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+            let pending_delta = *deltas.get(NODE_POOL_ADDR.as_bytes()).unwrap_or(&0);
+            let effective_pool = (pool_bal as i128 + pending_delta).max(0) as u64;
+            let credited = tx.amount.min(effective_pool);
+            *deltas.entry(NODE_POOL_ADDR.as_bytes().to_vec()).or_insert(0) -= credited as i128;
+        }
+    }
+
+    let cf_meta = db.cf_handle(CF_META).unwrap();
+    let tip_h = db.get_cf(cf_meta, META_LATEST_HEIGHT).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    let prev_state_root = if tip_h > 0 {
+        let cf_blocks = db.cf_handle(CF_BLOCKS).unwrap();
+        db.get_cf(cf_blocks, height_key(tip_h)).ok().flatten().and_then(|v| decode::<LedgerBlock>(&v)).map(|b| b.state_root).unwrap_or_else(|| "0".repeat(64))
+    } else {
+        "0".repeat(64)
+    };
+
+    let mut changed: Vec<(Vec<u8>, u64)> = deltas.into_iter().map(|(k, delta)| {
+        let cur = db.get_cf(cf_bal, &k).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+        (k, (cur as i128 + delta).max(0) as u64)
+    }).collect();
+    changed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let leaf_strings: Vec<String> = changed.iter().map(|(k, bal)| balance_leaf(k, *bal)).collect();
+    let refs: Vec<&str> = leaf_strings.iter().map(|s| s.as_str()).collect();
+    let delta_root = compute_merkle_root(&refs);
+    blake3_hex(format!("{}{}", prev_state_root, delta_root).as_bytes())
+}
+
+fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), String> {
+    if block.height > 0 && block.tx_count as usize != txs.len() {
+        return Err(format!(
+            "tx_count mismatch: block says {}, received {}",
+            block.tx_count,
+            txs.len()
+        ));
+    }
+    let mut seen_hashes = std::collections::HashSet::new();
+    for tx in txs {
+        if tx.hash.is_empty() || !seen_hashes.insert(tx.hash.clone()) {
+            return Err(format!("duplicate or empty tx hash in block #{}", block.height));
+        }
+    }
+
+    let tx_fees_sum: u64 = txs.iter()
+        .filter(|t| !crate::ledger::is_protocol_system_tx(t))
+        .map(|t| t.fee_uegoc)
+        .sum();
+    let remaining = crate::tokenomics::TOTAL_SUPPLY_UEGOC.saturating_sub(circulating_supply_inner(db));
+    let expected_reward = crate::tokenomics::compute_block_reward(
+        block.height,
+        tx_fees_sum,
+        &block.prev_hash,
+    ).min(remaining);
+    let expected_staking_fee = crate::tokenomics::staking_fee_share(tx_fees_sum);
+
+    if block.reward != expected_reward {
+        return Err(format!(
+            "invalid block reward: got {}, expected {}",
+            block.reward,
+            expected_reward
+        ));
+    }
+
+    let coinbase_txs: Vec<&LedgerTx> = txs.iter()
+        .filter(|t| Some(&t.hash) == block.coinbase_tx.as_ref())
+        .collect();
+    if expected_reward > 0 {
+        let cb = coinbase_txs.first().ok_or_else(|| "coinbase tx missing".to_string())?;
+        let expected_hash = format!("0x{}", blake3::hash(
+            format!("coinbase:{}:{}:{}:{}", block.height, block.miner, expected_reward, block.timestamp).as_bytes()
+        ).to_hex());
+        if cb.from != NODE_POOL_ADDR
+            || cb.to != block.miner
+            || cb.amount != expected_reward
+            || cb.signature != "coinbase"
+            || cb.tx_type != "reward"
+            || cb.hash != expected_hash
+        {
+            return Err("invalid coinbase tx".to_string());
+        }
+    } else if block.coinbase_tx.is_some() || !coinbase_txs.is_empty() {
+        return Err("coinbase present when expected reward is zero".to_string());
+    }
+
+    let fee_txs: Vec<&LedgerTx> = txs.iter()
+        .filter(|t| t.tx_type == "fee_distribution")
+        .collect();
+    if expected_staking_fee > 0 {
+        if fee_txs.len() != 1 {
+            return Err(format!("expected exactly one staking fee tx, got {}", fee_txs.len()));
+        }
+        let sf = fee_txs[0];
+        let expected_hash = format!("0x{}", blake3::hash(
+            format!("stakingfee:{}:{}:{}", block.height, expected_staking_fee, block.timestamp).as_bytes()
+        ).to_hex());
+        if sf.from != NODE_POOL_ADDR
+            || sf.to != STAKING_POOL_ADDR
+            || sf.amount != expected_staking_fee
+            || sf.signature != "coinbase"
+            || sf.hash != expected_hash
+        {
+            return Err("invalid staking fee tx".to_string());
+        }
+    } else if !fee_txs.is_empty() {
+        return Err("unexpected staking fee tx".to_string());
+    }
+
+    for tx in txs {
+        if crate::ledger::is_protocol_system_tx(tx) {
+            let is_coinbase = Some(&tx.hash) == block.coinbase_tx.as_ref();
+            let is_fee = tx.tx_type == "fee_distribution";
+            let is_post_reward = tx.tx_type == "post_reward";
+            if !is_coinbase && !is_fee && !is_post_reward {
+                return Err(format!("unexpected protocol system tx {}", tx.hash));
+            }
+            if is_post_reward && (tx.to.is_empty() || tx.amount == 0) {
+                return Err(format!("malformed post_reward tx {}", tx.hash));
+            }
+        } else if crate::ledger::is_reserved_system_source(&tx.from) {
+            return Err(format!("forbidden system-source tx {}", tx.hash));
+        } else {
+            crate::ledger::verify_confirmed_tx_sig(tx)
+                .map_err(|e| format!("tx {} rejected: {}", tx.hash, e))?;
+        }
+    }
+
+    let cf_bal = db.cf_handle(CF_BALANCES).ok_or_else(|| "balances column family missing".to_string())?;
+    let mut simulated_balances: std::collections::HashMap<String, u64> = Default::default();
+    let mut simulated_nonces: std::collections::HashMap<String, u64> = Default::default();
+    let mut simulated_stakes: std::collections::HashMap<String, u64> = Default::default();
+    for tx in txs {
+        if crate::ledger::is_protocol_system_tx(tx) || crate::ledger::is_reserved_system_source(&tx.from) {
+            continue;
+        }
+        if is_unstake_tx(tx) {
+            let stake_left = simulated_stakes.entry(tx.from.clone())
+                .or_insert_with(|| crate::ledger::get_validator_stake(&tx.from));
+            if tx.amount == 0 || *stake_left < tx.amount {
+                return Err(format!("unstake tx {} exceeds active stake", tx.hash));
+            }
+            let credit = unstake_credit_amount(tx);
+            if credit < tx.fee_uegoc {
+                return Err(format!("unstake tx {} credit below fee", tx.hash));
+            }
+            let staking_balance = simulated_balances.entry(STAKING_ADDR.to_string()).or_insert_with(|| {
+                db.get_cf(cf_bal, STAKING_ADDR.as_bytes())
+                    .ok().flatten()
+                    .map(|v| read_u64_le(&v))
+                    .unwrap_or(0)
+            });
+            if *staking_balance < credit {
+                return Err(format!("unstake tx {} exceeds staking contract balance", tx.hash));
+            }
+            *staking_balance = staking_balance.saturating_sub(credit);
+            *stake_left = stake_left.saturating_sub(tx.amount);
+            let balance = simulated_balances.entry(tx.from.clone()).or_insert_with(|| {
+                db.get_cf(cf_bal, tx.from.as_bytes())
+                    .ok().flatten()
+                    .map(|v| read_u64_le(&v))
+                    .unwrap_or(0)
+            });
+            *balance = balance.saturating_add(credit).saturating_sub(tx.fee_uegoc);
+        } else {
+        let balance = simulated_balances.entry(tx.from.clone()).or_insert_with(|| {
+            db.get_cf(cf_bal, tx.from.as_bytes())
+                .ok().flatten()
+                .map(|v| read_u64_le(&v))
+                .unwrap_or(0)
+        });
+        let required = tx.amount.saturating_add(tx.fee_uegoc);
+        if *balance < required {
+            return Err(format!(
+                "insufficient balance for tx {}: has {}, needs {}",
+                tx.hash, *balance, required
+            ));
+        }
+        *balance = balance.saturating_sub(required);
+        }
+
+        if tx.nonce > 0 {
+            let last = *simulated_nonces.entry(tx.from.clone())
+                .or_insert_with(|| crate::ledger::last_confirmed_nonce(&tx.from));
+            if tx.nonce <= last {
+                return Err(format!(
+                    "stale nonce for tx {}: {} <= {}",
+                    tx.hash, tx.nonce, last
+                ));
+            }
+            simulated_nonces.insert(tx.from.clone(), tx.nonce);
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), String> {
+    if block.height == 0 {
+        return if block.hash == GENESIS_HASH { Ok(()) } else { Err("invalid genesis hash".into()) };
+    }
+    if !verify_block_hash(block, txs) {
+        return Err("block hash/merkle verification failed".into());
+    }
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    if block.height > 1 {
+        let parent = db
+            .cf_handle(CF_BLOCKS)
+            .and_then(|cf| db.get_cf(cf, height_key(block.height - 1)).ok().flatten())
+            .and_then(|v| decode::<LedgerBlock>(&v));
+        match parent {
+            Some(parent) if parent.hash == block.prev_hash => {}
+            Some(_) => return Err("prev_hash mismatch against local parent".into()),
+            None => return Err("missing local parent".into()),
+        }
+    } else if block.prev_hash != GENESIS_HASH {
+        return Err("height-1 block does not point at genesis".into());
+    }
+    if block.state_root.is_empty() {
+        return Err("missing state_root on peer block".into());
+    }
+    let expected_state_root = compute_projected_state_root_inner(&db, txs);
+    if block.state_root != expected_state_root {
+        return Err(format!(
+            "state_root mismatch: got {} expected {}",
+            block.state_root, expected_state_root
+        ));
+    }
+    
+    // Cryptographic Quorum Certificate verification
+    if block.height > 1 && block.vote_count > 0 {
+        let block_hash_bytes = hex::decode(&block.hash).unwrap_or_default();
+        let sig_bytes = hex::decode(&block.agg_bls_sig).unwrap_or_default();
+        let pubkeys: Vec<Vec<u8>> = block.bls_pubkeys.iter().filter_map(|pk| hex::decode(pk).ok()).collect();
+
+        if pubkeys.len() != block.vote_count as usize {
+            return Err("vote_count does not match the number of BLS pubkeys provided".into());
+        }
+
+        let active_validators = crate::p2p::get_known_validators_snapshot();
+        let total_weight = crate::bft_committee::total_drs_weight(&active_validators) as f64;
+        let mut voter_weight = 0f64;
+
+        for val_addr in &active_validators {
+            if let Some(val_bls_pk) = crate::p2p::get_peer_bls_pubkey_hex(val_addr) {
+                if block.bls_pubkeys.contains(&val_bls_pk) {
+                    voter_weight += crate::bft_committee::compute_drs_weight(val_addr) as f64;
+                }
+            }
+        }
+
+        if total_weight > 0.0 && (voter_weight * 3.0) <= (total_weight * 2.0) {
+            return Err("Quorum Certificate rejected: cumulative DRS weight is < 2/3 of network".into());
+        }
+
+        if sig_bytes.is_empty() || pubkeys.is_empty() || !crate::bls_agg::verify_aggregate(&sig_bytes, &pubkeys, &block_hash_bytes) {
+            return Err("Invalid Quorum Certificate (BLS aggregate signature)".into());
+        }
+    }
+
+    validate_block_protocol_txs_inner(&db, block, txs)
+}
+
 /// Append a block received from a peer (gossip / sync path).
 /// Fork choice: replaces existing block at the same height only if the new
 /// block carries more BFT votes (heavier chain wins).
 pub fn append_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) {
+    if let Err(reason) = validate_peer_block(block, txs) {
+        tracing::warn!(
+            "append_peer_block rejected block #{} {}: {}",
+            block.height,
+            block.hash,
+            reason
+        );
+        return;
+    }
+
     let map = crate::sharding::load_shard_map();
     if map.shard_count > 1 {
         let all_nodes: Vec<String> = map.assignments.iter()
@@ -1580,14 +2147,25 @@ pub fn truncate_from(height: u64) {
     let tip = db.get_cf(cf_meta, META_LATEST_HEIGHT)
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
     if height > tip { return; }
+    let mut removed_txs: u64 = 0;
     let mut batch = WriteBatch::default();
     for h in height..=tip {
+        if let Ok(Some(bytes)) = db.get_cf(cf_blocks, height_key(h)) {
+            if let Some(b) = decode::<LedgerBlock>(&bytes) {
+                removed_txs += b.tx_count as u64;
+            }
+        }
         batch.delete_cf(cf_blocks, height_key(h));
     }
     let new_tip = height - 1;
     batch.put_cf(cf_meta, META_LATEST_HEIGHT, u64_le(new_tip));
+    if removed_txs > 0 {
+        let cur = db.get_cf(cf_meta, META_TX_COUNT)
+            .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+        batch.put_cf(cf_meta, META_TX_COUNT, u64_le(cur.saturating_sub(removed_txs)));
+    }
     db.write(batch).expect("truncate write");
-    tracing::warn!("Reorg: truncated heights {}..={} (new tip: {})", height, tip, new_tip);
+    tracing::warn!("Reorg: truncated heights {}..={} (new tip: {}, removed {} txs)", height, tip, new_tip, removed_txs);
 }
 
 /// Same as `append_peer_block` but stamps `vote_count` before writing.
@@ -1607,6 +2185,14 @@ pub fn append_peer_block_with_votes(block: &LedgerBlock, txs: &[LedgerTx], votes
 /// TX and balance columns, never the block record.
 pub fn apply_missing_tx(block_height: u64, tx: &LedgerTx) {
     if tx.hash.is_empty() { return; }
+    tracing::warn!(
+        "Ignoring unauthenticated missing tx {} for block #{}; tx sets must arrive through verified block sync",
+        tx.hash,
+        block_height
+    );
+    return;
+    #[allow(unreachable_code)]
+    {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
 
     let cf_txs        = db.cf_handle(CF_TXS).unwrap();
@@ -1623,9 +2209,7 @@ pub fn apply_missing_tx(block_height: u64, tx: &LedgerTx) {
         return;
     }
 
-    let is_system_source = tx.from == FAUCET_ADDR
-        || tx.from == NODE_POOL_ADDR
-        || tx.from.is_empty();
+    let is_system_source = tx.from == NODE_POOL_ADDR || tx.from.is_empty();
 
     let credited_amount = if tx.from == NODE_POOL_ADDR && tx.amount > 0 {
         let pool_bal: u64 = db.get_cf(cf_balances, NODE_POOL_ADDR.as_bytes())
@@ -1686,6 +2270,7 @@ pub fn apply_missing_tx(block_height: u64, tx: &LedgerTx) {
 
     if let Err(e) = db.write(batch) {
         eprintln!("[ChainDB] apply_missing_tx write failed: {e}");
+    }
     }
 }
 
@@ -1845,6 +2430,13 @@ pub fn pipeline_commit(commit_height: u64) {
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
     if finalized > cur {
         db.put_cf(cf, META_FINALIZED, u64_le(finalized)).ok();
+        
+        // Dynamic checkpoint ONLY on hard-finalized blocks to prevent poisoning
+        if finalized > 0 && finalized % CHECKPOINT_INTERVAL == 0 {
+            if let Some(block) = get_block_by_height(finalized) {
+                store_dynamic_checkpoint(&db, &block);
+            }
+        }
     }
 }
 
@@ -1991,20 +2583,24 @@ pub fn get_state_stats() -> StateStats {
     StateStats { total_accounts, total_supply_uegoc: total_supply, db_size_estimate_mb: db_size_mb }
 }
 
-pub fn get_total_circulating_supply() -> u64 {
-    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let cf = match db.cf_handle(CF_BALANCES) {
+fn circulating_supply_inner(db: &DB) -> u64 {
+    let cf_bal = match db.cf_handle(CF_BALANCES) {
         Some(c) => c,
         None => return 0,
     };
-    let mut total: u64 = 0;
-    let iter = db.iterator_cf(cf, rocksdb::IteratorMode::Start);
-    for item in iter {
-        if let Ok((_, v)) = item {
-            total = total.saturating_add(read_u64_le(&v));
-        }
-    }
-    total
+    let node_pool = db.get_cf(cf_bal, NODE_POOL_ADDR.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    let ecosystem = db.get_cf(cf_bal, ECOSYSTEM_ADDR.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    let foundation = db.get_cf(cf_bal, FOUNDATION_ADDR.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    
+    crate::tokenomics::TOTAL_SUPPLY_UEGOC
+        .saturating_sub(node_pool)
+        .saturating_sub(ecosystem)
+        .saturating_sub(foundation)
+}
+
+pub fn get_total_circulating_supply() -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    circulating_supply_inner(&db)
 }
 
 pub fn remaining_mintable() -> u64 {
@@ -2034,63 +2630,64 @@ pub fn get_network_stats_db() -> NetworkStats {
     NetworkStats { block_count, tx_count }
 }
 
-// ── Startup state restoration ─────────────────────────────────────────────────
-//
-// NONCE_STORE and STAKE_STORE are in-memory maps populated incrementally as new
-// blocks arrive.  On restart they are empty, which would allow replay attacks and
-// strip validators of their minimum-stake registration.  Restoring from the full
-// TX history in RocksDB at startup fixes both problems in a single O(n) scan.
 
-const STAKING_ADDR_RESTORE: &str = "egot1staking000000000000000000000000000000000";
-
-/// Rebuild the in-memory nonce store and stake store by scanning every confirmed
-/// transaction stored in RocksDB.  Call once at startup before accepting any
-/// incoming P2P messages or local transactions.
 pub fn restore_in_memory_state_from_db() {
+    {
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let cf_meta = match db.cf_handle(CF_META) { Some(c) => c, None => return };
+        
+        let mut stake_count = 0;
+        // O(1) Stake Restoration
+        let iter = db.prefix_iterator_cf(cf_meta, b"stake:");
+        for item in iter {
+            if let Ok((k, v)) = item {
+                if let Ok(key_str) = std::str::from_utf8(&k) {
+                    if key_str.starts_with("stake:") {
+                        let addr = &key_str[6..];
+                        let amount = read_u64_le(&v);
+                        if amount > 0 {
+                            crate::ledger::record_validator_stake(addr, amount, true);
+                            stake_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        tracing::info!("In-memory stake store restored from CF_META ({} validators) - no CF_TXS scan needed", stake_count);
+    }
+    restore_nonces_from_db();
+    recalibrate_tx_count();
+}
+
+/// Recompute META_TX_COUNT from block headers so stale counts from past
+/// reorgs or fork-choice replacements don't persist across restarts.
+fn recalibrate_tx_count() {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let cf_txs = match db.cf_handle(CF_TXS) { Some(c) => c, None => return };
-
-    let iter = db.full_iterator_cf(cf_txs, rocksdb::IteratorMode::Start);
-    let mut nonce_max: std::collections::HashMap<String, u64> = Default::default();
-    let mut stake_map: std::collections::HashMap<String, u64> = Default::default();
-
-    for item in iter {
-        let Ok((_, v)) = item else { continue };
-        let tx: LedgerTx = match serde_json::from_slice(&v) { Ok(t) => t, Err(_) => continue };
-
-        // ── Nonce store: track highest confirmed nonce per sender.
-        if !tx.from.is_empty() && tx.nonce > 0 {
-            let entry = nonce_max.entry(tx.from.clone()).or_insert(0);
-            if tx.nonce > *entry { *entry = tx.nonce; }
-        }
-
-        // ── Stake store: replay stake/unstake transactions.
-        if tx.to == STAKING_ADDR_RESTORE && !tx.from.is_empty() {
-            *stake_map.entry(tx.from.clone()).or_insert(0) =
-                stake_map.get(&tx.from).unwrap_or(&0).saturating_add(tx.amount);
-        } else if tx.from == STAKING_ADDR_RESTORE && !tx.to.is_empty() {
-            *stake_map.entry(tx.to.clone()).or_insert(0) =
-                stake_map.get(&tx.to).unwrap_or(&0).saturating_sub(tx.amount);
+    let cf_blocks = match db.cf_handle(CF_BLOCKS) { Some(c) => c, None => return };
+    let cf_meta   = match db.cf_handle(CF_META)   { Some(c) => c, None => return };
+    let tip = db.get_cf(cf_meta, META_LATEST_HEIGHT)
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    let mut canonical: u64 = 0;
+    for h in 0..=tip {
+        if let Ok(Some(bytes)) = db.get_cf(cf_blocks, height_key(h)) {
+            if let Some(b) = decode::<LedgerBlock>(&bytes) {
+                canonical += b.tx_count as u64;
+            }
         }
     }
-
-    // Push into ledger stores.
-    for (addr, nonce) in nonce_max {
-        crate::ledger::record_confirmed_nonce(&addr, nonce);
+    let stored = db.get_cf(cf_meta, META_TX_COUNT)
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    if stored != canonical {
+        tracing::warn!("TX count recalibrated: {} → {} (was inflated by reorgs/fork-choices)", stored, canonical);
+        db.put_cf(cf_meta, META_TX_COUNT, u64_le(canonical)).ok();
     }
-    for (addr, amount) in stake_map {
-        if amount > 0 {
-            crate::ledger::record_validator_stake(&addr, amount, true);
-        }
-    }
-    tracing::info!("In-memory nonce + stake stores restored from RocksDB");
 }
 
 // ── Kept for API compatibility ────────────────────────────────────────────────
 
 /// No-op: DB handle is a global singleton, not caller-managed.
 #[allow(dead_code)]
-pub fn get_db_handle() -> &'static Mutex<DB> { get_db() }
+pub fn get_db_handle() -> DbWrapper { get_db() }
 
 // ── On-chain governance ───────────────────────────────────────────────────────
 //

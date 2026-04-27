@@ -1,3 +1,4 @@
+
 use crate::app::AppState;
 use crate::error::{EgoDesktopError, EgoResult};
 use crate::ledger::{
@@ -208,11 +209,9 @@ fn load_or_generate_pq_keys(seed: &[u8; 32]) -> Result<KeyPair, EgoDesktopError>
 }
 
 fn derive_wallet_keys() -> Result<WalletKeys, EgoDesktopError> {
-    eprintln!("[init_wallet] derive_wallet_keys: calling load_seed (DPAPI)…");
     let seed_bytes = crate::ledger::load_seed()
         .map_err(|e| EgoDesktopError::CryptoError(format!("Failed to load seed: {}", e)))?
         .ok_or_else(|| EgoDesktopError::CryptoError("Corrupt or missing seed file".into()))?;
-    eprintln!("[init_wallet] derive_wallet_keys: seed loaded OK, deriving keys…");
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&seed_bytes);
 
@@ -245,7 +244,6 @@ fn derive_wallet_keys() -> Result<WalletKeys, EgoDesktopError> {
     let balance_uegoc     = ledger.balance_uegoc;
     let balance_formatted = format!("{:.2} EGOC", balance_uegoc as f64 / 1_000_000.0);
 
-    eprintln!("[init_wallet] derive_wallet_keys done — address={}", &address[..address.len().min(20)]);
     Ok(WalletKeys { keypair, address, ed25519_hex, dilithium_hex, kyber_hex, balance_uegoc, balance_formatted })
 }
 
@@ -254,11 +252,9 @@ async fn load_active_wallet(
     is_new: bool,
     handle: Option<tauri::AppHandle>,
 ) -> Result<WalletInfo, EgoDesktopError> {
-    eprintln!("[init_wallet] load_active_wallet: spawn_blocking derive_wallet_keys…");
     let keys = tokio::task::spawn_blocking(derive_wallet_keys)
         .await
         .map_err(|e| EgoDesktopError::CryptoError(format!("Key generation panicked: {e}")))??;
-    eprintln!("[init_wallet] load_active_wallet: keys derived OK");
 
     state
         .initialize_wallet(keys.keypair, false)
@@ -377,6 +373,8 @@ fn create_wallet_files(address_override: Option<&str>) -> Result<String, EgoDesk
             poc_slot: 0,
             state_root: String::new(),
             base_fee_uegoc: 1_000,
+            agg_bls_sig: String::new(),
+            bls_pubkeys: Vec::new(),
         });
         save_chain(&chain).map_err(EgoDesktopError::WalletError)?;
     }
@@ -389,7 +387,6 @@ pub async fn init_wallet(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<WalletInfo, EgoDesktopError> {
-    eprintln!("[init_wallet] called");
     let legacy_seed = base_data_dir().join("wallet.seed");
     if legacy_seed.exists() && !registry_path().exists() {
         let w0_dir = wallet_dir("wallet_0");
@@ -505,10 +502,7 @@ pub async fn init_wallet(
             .map_err(|e| EgoDesktopError::CryptoError(format!("Wallet creation panicked: {e}")))??;
     }
 
-    eprintln!("[init_wallet] calling load_active_wallet…");
-    let result = load_active_wallet(&state, is_new, Some(app_handle)).await;
-    eprintln!("[init_wallet] load_active_wallet returned: {}", if result.is_ok() { "OK" } else { "ERR" });
-    result
+    load_active_wallet(&state, is_new, Some(app_handle)).await
 }
 
 #[tauri::command]
@@ -732,25 +726,39 @@ pub async fn rename_wallet(
 /// Credit 1,000 EGOC testnet faucet to a new address if it has no balance yet.
 /// Writes directly to chain_db (SQLite) — save_chain() is a no-op.
 fn credit_testnet_faucet(address: &str) {
-    const FAUCET_AMOUNT: u64 = 1_000 * 1_000_000; // 1,000 EGOC in uEGOC
+    const FAUCET_AMOUNT: u64 = 1_000 * 1_000_000;
     const FAUCET_ADDR:   &str = "egot1faucet000000000000000000000000000000000";
 
-    if crate::chain_db::balance_of(address) > 0 { return; } // already funded
+    if crate::chain_db::balance_of(address) > 0 { return; }
 
     let ts   = chrono::Utc::now().timestamp();
-    let hash = format!("faucet{:x}{}", ts, address.len());
+    let hash = format!("faucet{:x}{:x}", ts, address.len() ^ (ts as usize));
 
     let tx = LedgerTx {
-        hash,
+        hash:      hash.clone(),
         from:      FAUCET_ADDR.into(),
         to:        address.into(),
         amount:    FAUCET_AMOUNT,
-        memo:      Some("1000 EGOC TEST".into()),
+        fee_uegoc: 0,
+        tx_type:   "faucet".into(),
+        memo:      Some("1000 EGOC testnet".into()),
         timestamp: ts,
-        status:    "Confirmed".into(),
+        status:    "Pending".into(),
         ..LedgerTx::default()
     };
-    crate::chain_db::mine_batch_db(&[tx], FAUCET_ADDR);
+
+    // Push into the shared mempool so it gossips to the current block proposer
+    // and gets confirmed via BFT consensus. This survives chain sync from peers
+    // (unlike mine_batch_db which creates a local-only block that gets overwritten).
+    crate::mempool::get_mempool().push(tx.clone());
+
+    // Also gossip immediately so the proposer picks it up without waiting for
+    // the next mempool broadcast window.
+    let tx2 = tx;
+    tauri::async_runtime::spawn(async move {
+        crate::p2p::broadcast_pending_tx(tx2).await;
+    });
+
     eprintln!("[Faucet] Credited 1,000 EGOC to {}", address);
 }
 
@@ -854,19 +862,23 @@ fn now_ts() -> i64 {
 fn enforce_pin_lockout_for(address: &str) -> Result<(), EgoDesktopError> {
     let now = now_ts();
     let mut map = pin_attempts_map();
-    if let Some((attempts, lockout_until)) = map.get_mut(address) {
-        if *attempts >= MAX_PIN_ATTEMPTS {
-            if now < *lockout_until {
-                return Err(EgoDesktopError::PermissionDenied(format!(
-                    "Locked until {} (in {} seconds).",
-                    *lockout_until,
-                    *lockout_until - now
-                )));
-            } else {
-                *attempts = 0;
-                *lockout_until = 0;
-            }
+    let entry = map.entry(address.to_string()).or_insert((0, 0));
+    if entry.0 >= MAX_PIN_ATTEMPTS {
+        if now < entry.1 {
+            return Err(EgoDesktopError::PermissionDenied(format!(
+                "Locked until {} (in {} seconds).",
+                entry.1,
+                entry.1 - now
+            )));
+        } else {
+            entry.0 = 0;
+            entry.1 = 0;
         }
+    }
+    // Pre-emptively record attempt to prevent race conditions on concurrent requests
+    entry.0 += 1;
+    if entry.0 >= MAX_PIN_ATTEMPTS {
+        entry.1 = now + LOCKOUT_DURATION_SECS;
     }
     Ok(())
 }
@@ -877,16 +889,13 @@ fn enforce_pin_lockout() -> Result<(), EgoDesktopError> {
 }
 
 fn record_failed_pin_for(address: &str) -> EgoDesktopError {
-    let now = now_ts();
     let mut map = pin_attempts_map();
     let entry = map.entry(address.to_string()).or_insert((0, 0));
-    entry.0 += 1;
     if entry.0 >= MAX_PIN_ATTEMPTS {
-        entry.1 = now + LOCKOUT_DURATION_SECS;
         return EgoDesktopError::PermissionDenied(format!(
             "Locked until {} (in {} seconds).",
             entry.1,
-            LOCKOUT_DURATION_SECS
+            entry.1 - now_ts()
         ));
     }
     let remaining = MAX_PIN_ATTEMPTS - entry.0;
@@ -910,7 +919,9 @@ fn record_successful_pin() {
 
 fn hash_pin_argon2(pin: &str) -> Result<String, EgoDesktopError> {
     let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
-    Argon2::default()
+    let params = argon2::Params::new(196608, 3, 2, None).unwrap(); 
+    let argon2_instance = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    argon2_instance
         .hash_password(pin.as_bytes(), &salt)
         .map(|hash| hash.to_string())
         .map_err(|e| EgoDesktopError::CryptoError(format!("PIN hash: {e}")))
@@ -965,11 +976,14 @@ pub async fn set_security_pin(pin: String) -> Result<(), EgoDesktopError> {
 
 #[tauri::command]
 pub async fn verify_pin(pin: String) -> Result<bool, EgoDesktopError> {
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
     let mut ledger = Ledger::load();
     let address = ledger.address.clone();
     enforce_pin_lockout_for(&address)?;
 
     if ledger.security_pin_hash.is_empty() {
+        record_successful_pin_for(&address);
         return Ok(false);
     }
     let pin_val = match normalize_pin(&pin) {

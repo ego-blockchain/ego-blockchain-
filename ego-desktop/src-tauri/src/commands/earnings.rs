@@ -14,12 +14,17 @@ pub async fn get_earnings_data(
     state: State<'_, AppState>,
 ) -> Result<EarningsData, EgoDesktopError> {
     let now = chrono::Utc::now().timestamp();
-    let ledger = Ledger::load();
 
-    // ── Reward rates ─────────────────────────────────────────────────────────
+    // All blocking I/O in one spawn_blocking call.
+    let (ledger, scale) = tokio::task::spawn_blocking(move || {
+        let ledger = Ledger::load();
+        let chain  = load_chain();
+        let scale  = node_reward_scale(&chain);
+        (ledger, scale)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
 
-    // Only count bytes from files that are actively passing PoSt challenges.
-    // Files with proof_suspended_until > now are withheld from the reward base.
     let provable_bytes: u64 = ledger.stored_files.iter()
         .filter(|f| {
             f.status == "Active"
@@ -30,16 +35,9 @@ pub async fn get_earnings_data(
         })
         .map(|f| f.encrypted_size)
         .sum();
-    // Use the smaller of: allocated capacity vs. sum of bytes we can actually prove.
-    // This prevents claiming rewards for space you declare but don't fill.
     let allocated_gb = (ledger.storage_allocated_bytes as f64 / 1_000_000_000.0)
         .min(provable_bytes as f64 / 1_000_000_000.0 + 0.001);
 
-    // Scale all node-pool rewards by the depletion factor (full until 80% used, tapers to 0).
-    let chain = load_chain();
-    let scale = node_reward_scale(&chain);
-
-    // If the node lowered its allocation it receives a 14-day reward suspension.
     let reward_suspended = ledger.reward_suspended_until
         .map(|until| now < until)
         .unwrap_or(false);
@@ -48,7 +46,6 @@ pub async fn get_earnings_data(
     let consensus_rate = if reward_suspended { 0 } else { (consensus_daily_uegoc() as f64 * scale) as u64 };
     let retrieval_rate = if reward_suspended { 0 } else { (retrieval_reward_uegoc(1.0) as f64 * scale) as u64 };
 
-    // Coverage reward is only earned while the node is online.
     let coverage_online = state
         .cache
         .lock()
@@ -56,7 +53,7 @@ pub async fn get_earnings_data(
         .coverage_status
         .as_ref()
         .map(|s| s.is_online)
-        .unwrap_or(true); // default true when coverage hasn't been checked yet
+        .unwrap_or(true);
 
     let coverage_rate = if reward_suspended || !coverage_online { 0 }
                         else { (coverage_daily_uegoc() as f64 * scale) as u64 };
@@ -66,54 +63,34 @@ pub async fn get_earnings_data(
         .saturating_add(coverage_rate)
         .saturating_add(retrieval_rate);
 
-    // ── DRS multiplier ────────────────────────────────────────────────────────
-    // Fetch live DRS score from relay (0–100). Multiplier: 0.5 at score 0, 1.5 at score 100.
-    // Falls back to 1.0 (neutral) if the relay is unreachable so rewards still accrue.
-    let drs_score: f64 = {
-        let address = ledger.address.clone();
-        if address.is_empty() {
-            50.0 // no wallet yet → neutral
-        } else {
-            let url = format!("{}/poc/score/{}", crate::p2p::ORACLE_RPC, address);
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .ok()
-                .and_then(|c| {
-                    // block_in_place is safe here because get_earnings_data runs on a Tokio thread
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            c.get(&url).send().await.ok()?.json::<PocScoreResult>().await.ok()
-                        })
-                    })
-                })
-                .map(|r| r.drs_score.clamp(0.0, 100.0))
-                .unwrap_or(50.0) // relay down → neutral (1.0×)
-        }
+    let drs_score: f64 = if ledger.address.is_empty() {
+        50.0
+    } else {
+        crate::poc::get_peer_score(&ledger.address) as f64
     };
-    let drs_multiplier = 0.5 + (drs_score / 100.0); // 0.5× … 1.5×
+    let drs_multiplier = 0.5 + (drs_score / 100.0);
     let daily_total = (daily_total_base as f64 * drs_multiplier) as u64;
 
-    // Minimum 1-hour gap between reward credits. Earnings page may be polled every
-    // few seconds — without this gate every poll would push a tx and create a block.
     const MIN_CREDIT_INTERVAL_SECS: i64 = 3_600;
 
     let last_credit = state.get_last_earnings_credit();
     if last_credit == 0 {
-        // First call — prime the total_earned cache from chain history once,
-        // then initialise the clock (no credit issued yet).
-        let historical: u64 = crate::chain_db::get_tx_history_for_addr(&ledger.address)
-            .into_iter()
-            .filter(|tx| tx.from.starts_with("egot1rewards") && tx.status == "Confirmed")
-            .map(|tx| tx.amount)
-            .sum();
+        let address = ledger.address.clone();
+        let historical: u64 = tokio::task::spawn_blocking(move || {
+            crate::chain_db::get_tx_history_for_addr(&address)
+                .into_iter()
+                .filter(|tx| tx.from.starts_with("egot1rewards") && tx.status == "Confirmed")
+                .map(|tx| tx.amount)
+                .sum::<u64>()
+        })
+        .await
+        .unwrap_or(0);
         state.set_cached_total_earned(historical);
         state.set_last_earnings_credit(now);
     } else if (now - last_credit) >= MIN_CREDIT_INTERVAL_SECS {
         let elapsed_secs = (now - last_credit) as f64;
         let credit = (daily_total as f64 * elapsed_secs / 86_400.0) as u64;
 
-        // Credit at least 1 EGOC (1_000_000 uEGOC) at a time.
         if credit >= 1_000_000 {
             let reward_hash = format!(
                 "0x{}",
@@ -121,7 +98,14 @@ pub async fn get_earnings_data(
                     format!("reward:{}:{}", ledger.address, now).as_bytes()
                 ).to_hex()
             );
-            if crate::chain_db::get_tx_by_hash(&reward_hash).is_none() {
+            let hash_check = reward_hash.clone();
+            let already_exists = tokio::task::spawn_blocking(move || {
+                crate::chain_db::get_tx_by_hash(&hash_check).is_some()
+            })
+            .await
+            .unwrap_or(false);
+
+            if !already_exists {
                 crate::mempool::get_mempool().push(LedgerTx {
                     hash:                reward_hash,
                     from:                "egot1rewards00000000000000000000000000000000000".into(),
@@ -138,17 +122,14 @@ pub async fn get_earnings_data(
                     dilithium_signature: String::new(),
                     ..LedgerTx::default()
                 });
-                // Update cache so we don't rescan the full chain on next poll.
                 state.add_to_cached_total_earned(credit);
             }
         }
-        // Advance the clock only after attempting a credit — not on every poll.
         state.set_last_earnings_credit(now);
     }
 
-    let total_earned: u64 = state.get_cached_total_earned();
-    let pending      = daily_storage / 24;
-
+    let total_earned    = state.get_cached_total_earned();
+    let pending         = daily_storage / 24;
     let session_started = state.get_session_started();
 
     let earnings = EarningsData {
@@ -233,40 +214,34 @@ pub async fn submit_poc_event(
         public_key: &pubkey_hex,
     };
 
-    let url = format!("{}/poc/event", crate::p2p::ORACLE_RPC);
-    match client.post(&url).json(&payload).send().await {
-        Ok(resp) => {
-            #[derive(Deserialize)]
-            struct RelayResp { success: bool, message: String }
-            let status = resp.status();
-            match resp.json::<RelayResp>().await {
-                Ok(r) => {
-                    // Parse reward from message "PoC event accepted, reward: 22222 uEGOC (DRS updated)"
-                    let reward_uegoc = r.message.split_whitespace()
-                        .find_map(|w| w.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    Ok(PocEventResult {
-                        success: r.success,
-                        message: r.message,
-                        reward_uegoc,
-                        drs_score: None,
-                    })
-                }
-                Err(_) => Ok(PocEventResult {
-                    success: status.is_success(),
-                    message: format!("Relay responded with {}", status),
-                    reward_uegoc: 0,
-                    drs_score: None,
-                }),
-            }
-        }
-        Err(e) => Ok(PocEventResult {
-            success: false,
-            message: format!("Relay unreachable: {}", e),
-            reward_uegoc: 0,
-            drs_score: None,
-        }),
+    // 1. Gossip the event robustly across the P2P mesh
+    let msg = crate::p2p::P2PMessage::PocEventBroadcast {
+        address:   address.clone(),
+        quality:   quality.clone(),
+        peers,
+        timestamp,
+        signature: signature_hex.clone(),
+    };
+    if let Ok(data) = serde_json::to_vec(&msg) {
+        crate::p2p::publish_gossip("ego-poc-v1", data).await;
     }
+
+    // 2. Dispatch HTTP fallback asynchronously across multiple oracle nodes
+    if let Ok(body) = serde_json::to_value(&payload) {
+        tokio::spawn(async move {
+            crate::p2p::oracle_post_pub(&client, "/poc/event", &body).await;
+        });
+    }
+
+    // Calculate expected reward natively (since we don't wait for synchronous HTTP response)
+    let expected_reward = 11_111 + (peers as u64 * 1_500).min(33_333);
+
+    Ok(PocEventResult {
+        success:      true,
+        message:      "PoC event gossiped to network".to_string(),
+        reward_uegoc: expected_reward,
+        drs_score:    None,
+    })
 }
 
 // ── get_poc_score ─────────────────────────────────────────────────────────────
@@ -293,21 +268,10 @@ pub async fn get_poc_score(
         });
     }
     let _ = state;
-    let url = format!("{}/poc/score/{}", crate::p2p::ORACLE_RPC, address);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .map_err(|e| EgoDesktopError::WalletError(e.to_string()))?;
-    match client.get(&url).send().await {
-        Ok(resp) => {
-            resp.json::<PocScoreResult>().await.map_err(|e| {
-                EgoDesktopError::WalletError(format!("Parse error: {e}"))
-            })
-        }
-        Err(e) => Ok(PocScoreResult {
-            drs_score: 0.0, events_24h: 0, total_events: 0,
-            last_event: None, is_validator: false,
-            validator_rank: None,
-        }),
-    }
+    let score = crate::poc::get_peer_score(&address) as f64;
+    Ok(PocScoreResult {
+        drs_score: score, events_24h: 0, total_events: 0,
+        last_event: None, is_validator: crate::ledger::get_validator_stake(&address) > 0,
+        validator_rank: None,
+    })
 }

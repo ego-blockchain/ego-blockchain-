@@ -8,21 +8,25 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 pub const SHARD_COUNT: u32   = 256;
-pub const BATCH_SIZE:  usize = 10_000;
+pub const BATCH_SIZE:  usize = 100_000;
+pub const MAX_BLOCK_TXS: usize = 500_000;
 
 
-/// Solo-mine threshold: once this many validators are online the mempool defers
-/// block production to BFT propose_block_as_leader() instead of mining solo.
-/// Default 1 — disable solo mining as soon as any peer validator exists.
-/// Override with EGO_MIN_VALIDATORS env var (e.g. =21 for strict mainnet gate).
+
 pub fn min_validators_for_finality() -> usize {
     std::env::var("EGO_MIN_VALIDATORS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1)
+        .unwrap_or(crate::bft_committee::MIN_LIVE_VALIDATORS)
 }
 
-pub const MIN_VALIDATORS_FOR_FINALITY: usize = 1;
+pub const MIN_VALIDATORS_FOR_FINALITY: usize = crate::bft_committee::MIN_LIVE_VALIDATORS;
+
+fn allow_pre_bft_solo() -> bool {
+    std::env::var("EGO_ALLOW_PRE_BFT_SOLO")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
 
 
 pub const BATCH_WINDOW_MS: u64 = 1_000;
@@ -57,7 +61,7 @@ pub fn shard_for_address(addr: &str) -> u32 {
 pub struct ShardedMempool {
     shards:        Vec<Mutex<Vec<LedgerTx>>>,
 
-    seen_hashes:   Mutex<std::collections::HashSet<String>>,
+    seen_hashes:   Vec<Mutex<std::collections::HashSet<String>>>,
     pending_total: AtomicU64,
     submitted:     AtomicU64,
     confirmed:     AtomicU64,
@@ -70,9 +74,12 @@ impl ShardedMempool {
         let shards = (0..SHARD_COUNT)
             .map(|_| Mutex::new(Vec::with_capacity(BATCH_SIZE)))
             .collect();
+        let seen_hashes = (0..SHARD_COUNT)
+            .map(|_| Mutex::new(std::collections::HashSet::new()))
+            .collect();
         Arc::new(Self {
             shards,
-            seen_hashes:   Mutex::new(std::collections::HashSet::new()),
+            seen_hashes,
             pending_total: AtomicU64::new(0),
             submitted:     AtomicU64::new(0),
             confirmed:     AtomicU64::new(0),
@@ -84,36 +91,44 @@ impl ShardedMempool {
     pub fn push(&self, tx: LedgerTx) {
         let is_system = tx.from.is_empty()
             || tx.tx_type == "reward"
-            || tx.tx_type == "coinbase";
+            || tx.tx_type == "coinbase"
+            || tx.tx_type == "faucet"
+            || tx.from.starts_with("egot1faucet");
+
+        if is_system {
+            tracing::warn!("Mempool rejected {} - system txs are only valid inside verified blocks", tx.hash);
+            return;
+        }
+        if let Err(reason) = crate::ledger::verify_incoming_tx(&tx) {
+            tracing::warn!("Mempool rejected {} - {}", tx.hash, reason);
+            return;
+        }
 
         if !is_system {
-            let total_shards = crate::sharding::get_agreed_shard_count();
-            if total_shards > 1 {
-                let current_height = crate::chain_db::latest_block_info().0;
-                let tx_shard = crate::sharding::shard_for_address_agreed(&tx.from);
-                let my_addr = crate::ledger::Ledger::load().address;
-                let map = crate::sharding::load_shard_map();
-                let all_nodes: Vec<String> = map
-                    .assignments
-                    .iter()
-                    .map(|a| a.node_address.clone())
-                    .collect::<std::collections::HashSet<_>>()
+            let current_height = crate::chain_db::latest_block_info().0;
+            let tx_shard = shard_for_address(&tx.from);
+            let my_addr = crate::ledger::Ledger::load().address;
+            let map = crate::sharding::load_shard_map();
+            let all_nodes: Vec<String> = map
+                .assignments
+                .iter()
+                .map(|a| a.node_address.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            let my_shard_ids: Vec<u32> =
+                crate::sharding::my_shards(&my_addr, &map, &all_nodes)
                     .into_iter()
+                    .map(|(id, _)| id)
                     .collect();
-                let my_shard_ids: Vec<u32> =
-                    crate::sharding::my_shards(&my_addr, &map, &all_nodes)
-                        .into_iter()
-                        .map(|(id, _)| id)
-                        .collect();
-                let in_grace = crate::sharding::is_in_grace_period(current_height);
-                if !in_grace && !my_shard_ids.contains(&tx_shard) {
-                    let shard_id = tx_shard;
-                    let tx_clone = tx;
-                    tokio::spawn(async move {
-                        crate::p2p::route_tx_to_shard_master(shard_id, tx_clone).await;
-                    });
-                    return;
-                }
+            let in_grace = crate::sharding::is_in_grace_period(current_height);
+            if !in_grace && !my_shard_ids.contains(&tx_shard) {
+                let shard_id = tx_shard;
+                let tx_clone = tx;
+                tokio::spawn(async move {
+                    crate::p2p::route_tx_to_shard_master(shard_id, tx_clone).await;
+                });
+                return;
             }
         }
 
@@ -153,21 +168,50 @@ impl ShardedMempool {
             }
         }
 
+        let shard = shard_for_address(&tx.from) as usize;
         {
-            let mut seen = self.seen_hashes.lock().expect("lock poisoned");
+            let mut seen = self.seen_hashes[shard].lock().expect("lock poisoned");
             if !seen.insert(tx.hash.clone()) {
                 return;
             }
         }
 
-        let shard = shard_for_address(&tx.from) as usize;
         let mut s = self.shards[shard].lock().expect("lock poisoned");
 
         if !is_system {
             let balance = crate::chain_db::balance_of(&tx.from);
+            if tx.tx_type == "unstake" && tx.to == crate::chain_db::STAKING_ADDR {
+                let active_stake = crate::ledger::get_validator_stake(&tx.from);
+                let pending_unstake: u64 = s.iter()
+                    .filter(|t| t.from == tx.from
+                        && t.tx_type == "unstake"
+                        && t.to == crate::chain_db::STAKING_ADDR)
+                    .map(|t| t.amount)
+                    .fold(0u64, |acc, v| acc.saturating_add(v));
+                let requested = tx.amount.saturating_add(pending_unstake);
+                let credit = if tx.memo.as_deref() == Some("unstake:early") {
+                    tx.amount.saturating_sub(tx.amount / 10)
+                } else {
+                    tx.amount
+                };
+                if requested == 0 || requested > active_stake || credit < tx.fee_uegoc {
+                    tracing::warn!(
+                        "Mempool rejected {} - invalid unstake request: active_stake={}, requested={}, credit={}, fee={}",
+                        &tx.hash[..12.min(tx.hash.len())], active_stake, requested, credit, tx.fee_uegoc
+                    );
+                    self.seen_hashes[shard].lock().expect("lock poisoned").remove(&tx.hash);
+                    return;
+                }
+            } else {
             let pending_outflow: u64 = s.iter()
                 .filter(|t| t.from == tx.from)
-                .map(|t| t.amount.saturating_add(t.fee_uegoc))
+                .map(|t| {
+                    if t.tx_type == "unstake" && t.to == crate::chain_db::STAKING_ADDR {
+                        t.fee_uegoc
+                    } else {
+                        t.amount.saturating_add(t.fee_uegoc)
+                    }
+                })
                 .fold(0u64, |acc, v| acc.saturating_add(v));
             let required = tx.amount.saturating_add(tx.fee_uegoc).saturating_add(pending_outflow);
             if balance < required {
@@ -176,8 +220,9 @@ impl ShardedMempool {
                     &tx.hash[..12.min(tx.hash.len())], balance, required,
                     tx.amount, tx.fee_uegoc, pending_outflow
                 );
-                self.seen_hashes.lock().expect("lock poisoned").remove(&tx.hash);
+                self.seen_hashes[shard].lock().expect("lock poisoned").remove(&tx.hash);
                 return;
+            }
             }
         }
 
@@ -193,8 +238,8 @@ impl ShardedMempool {
                     worst_idx = j;
                 }
             }
-            let evicted = s.remove(worst_idx);
-            self.seen_hashes.lock().expect("lock poisoned").remove(&evicted.hash);
+            let evicted = s.swap_remove(worst_idx);
+            self.seen_hashes[shard].lock().expect("lock poisoned").remove(&evicted.hash);
             self.pending_total.fetch_sub(1, Ordering::Relaxed);
             tracing::info!("Mempool evicted lowest-fee tx {} from shard {}", &evicted.hash[..12], shard);
         }
@@ -250,7 +295,7 @@ impl ShardedMempool {
 
         // Clean up seen_hashes for expired + drained txs (shard lock already released).
         if !expired_hashes.is_empty() || !drained.is_empty() {
-            let mut seen = self.seen_hashes.lock().expect("lock poisoned");
+            let mut seen = self.seen_hashes[shard_id as usize].lock().expect("lock poisoned");
             for h in &expired_hashes { seen.remove(h); }
             for tx in &drained        { seen.remove(&tx.hash); }
         }
@@ -259,11 +304,62 @@ impl ShardedMempool {
     }
 
     pub fn drain_all(&self) -> Vec<LedgerTx> {
-        use rayon::prelude::*;
-        (0..SHARD_COUNT)
-            .into_par_iter()
-            .flat_map(|shard_id| self.drain_shard(shard_id))
-            .collect()
+        let current_height = crate::chain_db::latest_block_info().0 + 1;
+        let map = crate::sharding::load_shard_map();
+        let target_chain_shard = if map.shard_count > 1 {
+            Some(crate::sharding::shard_for_height(current_height, map.shard_count))
+        } else {
+            None
+        };
+
+        let mut out = Vec::with_capacity(MAX_BLOCK_TXS.min(BATCH_SIZE * SHARD_COUNT as usize));
+        for shard_id in 0..SHARD_COUNT {
+            if out.len() >= MAX_BLOCK_TXS { break; }
+            let remaining = MAX_BLOCK_TXS - out.len();
+            let mut batch = self.drain_shard(shard_id);
+            
+            if let Some(target) = target_chain_shard {
+                let mut kept = Vec::new();
+                let mut skipped = Vec::new();
+                for tx in batch {
+                    if tx.from.is_empty() || crate::sharding::shard_for_address_agreed(&tx.from) == target {
+                        kept.push(tx);
+                    } else {
+                        skipped.push(tx);
+                    }
+                }
+                
+                if !skipped.is_empty() {
+                    let mut s = self.shards[shard_id as usize].lock().expect("lock poisoned");
+                    for tx in skipped.into_iter().rev() {
+                        s.insert(0, tx);
+                        self.pending_total.fetch_add(1, Ordering::Relaxed);
+                        self.confirmed.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+                batch = kept;
+            }
+            
+            if batch.len() > remaining {
+                let overflow = batch.split_off(remaining);
+                {
+                    let mut seen = self.seen_hashes[shard_id as usize].lock().expect("lock poisoned");
+                    for tx in &overflow {
+                        seen.insert(tx.hash.clone());
+                    }
+                }
+                {
+                    let mut s = self.shards[shard_id as usize].lock().expect("lock poisoned");
+                    for tx in overflow.into_iter().rev() {
+                        s.insert(0, tx);
+                        self.pending_total.fetch_add(1, Ordering::Relaxed);
+                        self.confirmed.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            out.extend(batch);
+        }
+        out
     }
 
     pub fn peek_all(&self) -> Vec<LedgerTx> {
@@ -271,6 +367,30 @@ impl ShardedMempool {
         self.shards.par_iter()
             .flat_map(|s| s.lock().expect("lock poisoned").clone())
             .collect()
+    }
+
+    pub fn pending_outflow_for_address(&self, addr: &str) -> u64 {
+        let shard = shard_for_address(addr) as usize;
+        let s = self.shards[shard].lock().expect("lock poisoned");
+        s.iter()
+            .filter(|tx| tx.from.trim() == addr.trim())
+            .map(|tx| tx.amount.saturating_add(tx.fee_uegoc))
+            .sum()
+    }
+
+    pub fn pending_txs_for_address(&self, addr: &str) -> Vec<LedgerTx> {
+        let mut out = Vec::new();
+        // Since `to` address could be in any shard, we scan all shards.
+        // But we avoid cloning the entire mempool, only matching txs.
+        for shard in &self.shards {
+            let s = shard.lock().expect("lock poisoned");
+            for tx in s.iter() {
+                if tx.from.trim() == addr.trim() || tx.to.trim() == addr.trim() {
+                    out.push(tx.clone());
+                }
+            }
+        }
+        out
     }
 
     pub fn pending_count(&self) -> u64 {
@@ -375,8 +495,16 @@ fn get_miner_address() -> Option<String> {
 }
 
 async fn try_mine(txs: Vec<LedgerTx>, miner: &str) -> Vec<LedgerTx> {
+    if !allow_pre_bft_solo() {
+        return txs;
+    }
     let known = crate::p2p::get_known_validators_snapshot();
     if known.len() >= min_validators_for_finality() {
+        return txs;
+    }
+
+    if !crate::commands::consensus::drs_eligible() {
+        tracing::debug!("[Mine] DRS < 0.5 — not eligible to mine");
         return txs;
     }
 
@@ -388,16 +516,25 @@ async fn try_mine(txs: Vec<LedgerTx>, miner: &str) -> Vec<LedgerTx> {
     let poc_slot = crate::poc::current_slot();
     let combined_ticket = format!("{}:{}", poc_ticket, _poc_sig);
 
+    let oracle_rewards = crate::p2p::fetch_pending_post_rewards().await;
+    let post_proof_ids: Vec<String> = oracle_rewards.iter().map(|t| t.hash.clone()).collect();
+    let mut all_txs = txs.clone();
+    all_txs.extend(oracle_rewards);
+
     let tx_count = txs.len();
-    let block = crate::chain_db::mine_batch_db_with_ticket(&txs, miner, &combined_ticket, poc_slot);
+    let block = crate::chain_db::mine_batch_db_with_ticket(&all_txs, miner, &combined_ticket, poc_slot);
 
     tracing::info!(
-        "Solo block #{} sealed — {} user txs + 1 coinbase",
-        block.height, tx_count,
+        "Solo block #{} sealed — {} user txs + {} PoST rewards + 1 coinbase",
+        block.height, tx_count, post_proof_ids.len(),
     );
 
     crate::chain_db::pipeline_commit(block.height);
     crate::rpc::notify_new_block(&block);
+
+    if !post_proof_ids.is_empty() {
+        tokio::spawn(crate::p2p::notify_post_rewards_claimed(post_proof_ids));
+    }
 
     let height = block.height;
     let confirmed: Vec<LedgerTx> = txs.iter().map(|tx| {
@@ -496,6 +633,16 @@ pub async fn run_batch_loop() {
         let needed = min_validators_for_finality();
         if known_count >= needed {
             // BFT mode: leave txs in mempool for the BFT proposer to drain.
+            last_block_at    = Instant::now();
+            batch_started_at = None;
+            continue;
+        }
+        if !allow_pre_bft_solo() {
+            tracing::warn!(
+                "BFT quorum not ready: {} known validator(s), need {}; leaving txs in mempool",
+                known_count,
+                needed
+            );
             last_block_at    = Instant::now();
             batch_started_at = None;
             continue;

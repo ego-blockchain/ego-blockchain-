@@ -1,12 +1,13 @@
 pub const COMMITTEE_SIZE: usize = 21;
 pub const MAX_COMMITTEE_SIZE: usize = 150;
+pub const MIN_LIVE_VALIDATORS: usize = 2;
 
 
 pub fn min_committee_net() -> usize {
     std::env::var("EGO_MIN_COMMITTEE")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1)
+        .unwrap_or(MIN_LIVE_VALIDATORS)
 }
 pub const VRF_ROLE_PROPOSER:  u8 = 0x50;
 pub const VRF_ROLE_COMMITTEE: u8 = 0x43;
@@ -14,7 +15,7 @@ pub const VRF_ROLE_COMMITTEE: u8 = 0x43;
 const UEGOC_PER_EGOC: f64 = 1_000_000.0;
 const COVERAGE_PER_WEIGHT: f64 = 10.0;
 
-pub const EXPECTED_PROPOSERS_PER_SLOT: f64 = 0.5;
+pub const EXPECTED_PROPOSERS_PER_SLOT: f64 = 1.5;
 pub const FALLBACK_AFTER_EMPTY_VIEWS: u32 = 3;
 
 
@@ -96,6 +97,16 @@ pub fn qualifies_proposer(ticket: &[u8], my_drs: f64, total_drs: f64) -> bool {
     let share     = capped_share(my_drs, total_drs);
     let threshold = (EXPECTED_PROPOSERS_PER_SLOT * share).min(1.0);
     ticket_to_float(ticket) < threshold
+}
+
+pub fn qualifies_proposer_for_network(
+    ticket: &[u8],
+    my_drs: f64,
+    total_drs: f64,
+    n_validators: usize,
+) -> bool {
+    if n_validators <= MIN_LIVE_VALIDATORS { return true; }
+    qualifies_proposer(ticket, my_drs, total_drs)
 }
 
 pub fn vote_signing_data(block_hash: &str, height: u64, voter: &str) -> String {
