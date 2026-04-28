@@ -727,23 +727,20 @@ pub async fn rename_wallet(
 /// Writes directly to chain_db (SQLite) — save_chain() is a no-op.
 fn credit_testnet_faucet(address: &str) {
     const FAUCET_AMOUNT: u64 = 1_000 * 1_000_000;
-    
-    let faucet_kp = crate::chain_db::get_faucet_keypair();
-    let faucet_addr = crate::chain_db::get_faucet_address();
 
     if crate::chain_db::balance_of(address) > 0 { return; }
 
-    let ts   = chrono::Utc::now().timestamp();
+    let ts = chrono::Utc::now().timestamp();
 
     static FAUCET_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut nonce = FAUCET_NONCE.load(std::sync::atomic::Ordering::Relaxed);
     if nonce == 0 {
-        nonce = crate::ledger::last_confirmed_nonce(&faucet_addr) + 1;
+        nonce = crate::ledger::last_confirmed_nonce(crate::chain_db::NODE_POOL_ADDR) + 1;
     }
     FAUCET_NONCE.store(nonce + 1, std::sync::atomic::Ordering::Relaxed);
 
     let sign_bytes = crate::ledger::tx_signing_bytes_v2(
-        &faucet_addr,
+        crate::chain_db::NODE_POOL_ADDR,
         address,
         FAUCET_AMOUNT,
         nonce,
@@ -751,46 +748,33 @@ fn credit_testnet_faucet(address: &str) {
         1,
         "1000 EGOC testnet"
     );
-    
-    let signature = hex::encode(faucet_kp.sign_ed25519(&sign_bytes).as_bytes());
+
     let hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-    
-    let dilithium_pubkey = hex::encode(faucet_kp.dilithium_public_key().key_data);
-    let dilithium_signature = hex::encode(faucet_kp.sign_dilithium(&sign_bytes).signature_data);
 
     let tx = LedgerTx {
         hash:      hash.clone(),
-        from:      faucet_addr.clone(),
+        from:      crate::chain_db::NODE_POOL_ADDR.into(),
         to:        address.into(),
         amount:    FAUCET_AMOUNT,
-        fee_uegoc: 1_000,
-        tx_type:   "transfer".into(),
+        fee_uegoc: 0,
+        tx_type:   "faucet".into(),
         memo:      Some("1000 EGOC testnet".into()),
         timestamp: ts,
         status:    "Pending".into(),
         nonce,
-        signature,
-        public_key_ed25519: hex::encode(faucet_kp.ed25519_public_key().as_bytes()),
-        dilithium_pubkey,
-        dilithium_signature,
+        signature: "coinbase".into(),
         tx_version: 2,
         chain_id: 1,
         ..LedgerTx::default()
     };
 
-    // Instant Airdrop: bypass the mempool and BFT consensus entirely.
-    // Mine the transaction immediately into the local database so the balance appears instantly.
-    let block = crate::chain_db::mine_batch_db(&[tx.clone()], &faucet_addr);
-    
-    let mut tx_confirmed = tx;
-    tx_confirmed.status = "Confirmed".to_string();
-    tx_confirmed.block_height = Some(block.height);
+    crate::mempool::get_mempool().push(tx.clone());
 
+    let address_owned = address.to_string();
     tauri::async_runtime::spawn(async move {
-        crate::p2p::broadcast_tx(tx_confirmed, block).await;
+        crate::p2p::broadcast_pending_tx(tx).await;
+        eprintln!("[Faucet] Broadcast pending faucet TX for {} — will confirm in next consensus block", address_owned);
     });
-
-    eprintln!("[Faucet] Credited 1,000 EGOC to {}", address);
 }
 
 #[tauri::command]

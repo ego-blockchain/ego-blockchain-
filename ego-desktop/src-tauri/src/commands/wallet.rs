@@ -179,6 +179,18 @@ pub async fn send_transaction(
         ));
     };
 
+    let hrp = if CHAIN_ID == 1 { "egot" } else { "ego" };
+    let dil_bytes = hex::decode(&dil_pubkey_hex).unwrap_or_default();
+    let dil_expected_addr = ego_core::EgoAddress::from_dilithium_pk(
+        &dil_bytes, CHAIN_ID as u32, ego_core::AddressType::EOA,
+    ).to_bech32(hrp).unwrap_or_default();
+    let (dil_pubkey_hex, dil_sig_hex) = if dil_expected_addr == from {
+        (dil_pubkey_hex, dil_sig_hex)
+    } else {
+        eprintln!("[TX] dilithium key mismatch for {} (key derives to {}), using Ed25519-only", from, dil_expected_addr);
+        (String::new(), String::new())
+    };
+
     let tx_hash     = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
     let summary     = tx_human_summary(
         &from, &request.to_address, request.amount, memo_str, CHAIN_ID, nonce, fee,

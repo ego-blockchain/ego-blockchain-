@@ -77,15 +77,32 @@ const MAX_TRANSACTIONS: usize = 500_000;
 
 impl ChainState {
     fn merge_block(&mut self, block: Value) {
-        let height = block["height"].as_u64().unwrap_or(0);
+        let height   = block["height"].as_u64().unwrap_or(0);
+        let new_hash = block["hash"].as_str().unwrap_or("").to_string();
+
         if let Some(pos) = self.blocks.iter().position(|b| b["height"].as_u64() == Some(height)) {
+            let old_hash = self.blocks[pos]["hash"].as_str().unwrap_or("").to_string();
             self.blocks[pos] = block;
+            if !old_hash.is_empty() && old_hash != new_hash {
+                self.prune_descendants_of(&old_hash);
+            }
         } else {
             self.blocks.push(block);
             if self.blocks.len() > MAX_BLOCKS {
                 self.blocks.sort_by_key(|b| b["height"].as_u64().unwrap_or(0));
                 self.blocks = self.blocks.split_off(self.blocks.len() - MAX_BLOCKS);
             }
+        }
+    }
+
+    fn prune_descendants_of(&mut self, parent_hash: &str) {
+        let orphaned: Vec<String> = self.blocks.iter()
+            .filter(|b| b["prev_hash"].as_str() == Some(parent_hash))
+            .filter_map(|b| b["hash"].as_str().map(String::from))
+            .collect();
+        self.blocks.retain(|b| b["prev_hash"].as_str() != Some(parent_hash));
+        for hash in orphaned {
+            self.prune_descendants_of(&hash);
         }
     }
 

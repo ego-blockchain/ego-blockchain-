@@ -89,13 +89,16 @@ impl ShardedMempool {
 
 
     pub fn push(&self, tx: LedgerTx) {
+        let is_pool_faucet = tx.tx_type == "faucet"
+            && tx.from == crate::chain_db::NODE_POOL_ADDR;
+
         let is_system = tx.from.is_empty()
             || tx.tx_type == "reward"
             || tx.tx_type == "coinbase"
             || tx.tx_type == "faucet"
             || tx.from.starts_with("egot1faucet");
 
-        if is_system {
+        if is_system && !is_pool_faucet {
             tracing::warn!("Mempool rejected {} - system txs are only valid inside verified blocks", tx.hash);
             return;
         }
@@ -107,9 +110,11 @@ impl ShardedMempool {
             }
         }
 
-        if let Err(reason) = crate::ledger::verify_incoming_tx(&tx) {
-            tracing::warn!("Mempool rejected {} - {}", tx.hash, reason);
-            return;
+        if !is_pool_faucet {
+            if let Err(reason) = crate::ledger::verify_incoming_tx(&tx) {
+                tracing::warn!("Mempool rejected {} - {}", tx.hash, reason);
+                return;
+            }
         }
 
         if !is_system {

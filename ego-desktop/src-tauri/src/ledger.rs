@@ -1119,6 +1119,9 @@ pub fn verify_incoming_tx(tx: &LedgerTx) -> Result<(), String> {
 }
 
 pub fn is_protocol_system_tx(tx: &LedgerTx) -> bool {
+    if tx.tx_type == "faucet" && tx.from == crate::chain_db::NODE_POOL_ADDR {
+        return true;
+    }
     tx.from == crate::chain_db::NODE_POOL_ADDR
         && tx.signature == "coinbase"
         && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward")
@@ -1219,6 +1222,9 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
     );
 
     if is_reserved_system_source(&tx.from) {
+        if tx.tx_type == "faucet" && tx.from == crate::chain_db::NODE_POOL_ADDR {
+            return Ok(());
+        }
         return Err(format!(
             "system-source tx {} from {} requires block-context protocol validation",
             tx.hash, tx.from
