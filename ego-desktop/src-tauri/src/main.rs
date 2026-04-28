@@ -669,6 +669,7 @@ fn main() {
                 let startup_peers = crate::p2p::get_known_peers().len();
                 if !no_oracle && startup_peers < 50 {
                     crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)).await;
+                    crate::p2p::oracle_sync_chain().await;
                     tracing::info!("Oracle chain sync complete ({} peers, oracle active)", startup_peers);
                 } else if no_oracle {
                     tracing::info!("Oracle disabled via EGO_NO_ORACLE — using pure P2P");
