@@ -690,7 +690,7 @@ impl Node {
             node.keystore.kyber_public_key().key_data.clone(),
         );
         indexer_account.storage_quota = storage_capacity;
-        indexer_account.credit(Balance::from_egoc(500)).expect("init credit overflow");
+        indexer_account.credit(Balance::from_egoc(1000)).expect("init credit overflow");
         indexer_account.storage_credits = 20000;
         indexer_account.deploy_credits = 10000;
 

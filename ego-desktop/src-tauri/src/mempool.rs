@@ -99,6 +99,14 @@ impl ShardedMempool {
             tracing::warn!("Mempool rejected {} - system txs are only valid inside verified blocks", tx.hash);
             return;
         }
+
+        {
+            let shard_idx = shard_for_address(&tx.from) as usize;
+            if self.seen_hashes[shard_idx].lock().expect("lock poisoned").contains(&tx.hash) {
+                return;
+            }
+        }
+
         if let Err(reason) = crate::ledger::verify_incoming_tx(&tx) {
             tracing::warn!("Mempool rejected {} - {}", tx.hash, reason);
             return;

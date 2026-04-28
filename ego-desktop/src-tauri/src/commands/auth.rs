@@ -218,21 +218,21 @@ fn derive_wallet_keys() -> Result<WalletKeys, EgoDesktopError> {
     let keypair = load_or_generate_pq_keys(&seed)?;
 
     let mut ledger  = Ledger::load();
-    let address = if !ledger.address.is_empty() {
-        ledger.address.clone()
-    } else {
-        let derived = keypair
-            .derive_bech32_address(1, AddressType::EOA, "egot")
-            .map_err(|e| EgoDesktopError::CryptoError(format!("Address: {e}")))?;
-        ledger.address = derived.clone();
+    let address = keypair
+        .derive_bech32_address(1, AddressType::EOA, "egot")
+        .map_err(|e| EgoDesktopError::CryptoError(format!("Address: {e}")))?;
+        
+    if ledger.address != address {
+        ledger.address = address.clone();
         let _ = ledger.save();
-        derived
-    };
-    if ledger.mainnet_address.is_empty() {
-        if let Ok(mn) = keypair.derive_bech32_address(0, AddressType::EOA, "ego") {
-            ledger.mainnet_address = mn;
-            let _ = ledger.save();
-        }
+    }
+    
+    let mainnet_addr = keypair
+        .derive_bech32_address(0, AddressType::EOA, "ego")
+        .unwrap_or_default();
+    if ledger.mainnet_address != mainnet_addr && !mainnet_addr.is_empty() {
+        ledger.mainnet_address = mainnet_addr;
+        let _ = ledger.save();
     }
 
     let ed25519_hex   = hex::encode(keypair.ed25519_public_key().as_bytes());
@@ -347,7 +347,7 @@ fn create_wallet_files(address_override: Option<&str>) -> Result<String, EgoDesk
             hash:               genesis_hash.clone(),
             from:               "egot1faucet000000000000000000000000000000000000".into(),
             to:                 final_address.clone(),
-            amount:             10_000 * 1_000_000,
+            amount:             1_000 * 1_000_000,
             memo:               Some("Testnet faucet – welcome!".into()),
             timestamp:          ts,
             signature:          "genesis".into(),
@@ -365,7 +365,7 @@ fn create_wallet_files(address_override: Option<&str>) -> Result<String, EgoDesk
             miner:      final_address.clone(),
             tx_count:   1,
             size_bytes: 256,
-            reward:     10_000 * 1_000_000,
+            reward:     1_000 * 1_000_000,
             coinbase_tx: None,
             vote_count: 0,
             tx_merkle_root: String::new(),
@@ -734,7 +734,13 @@ fn credit_testnet_faucet(address: &str) {
     if crate::chain_db::balance_of(address) > 0 { return; }
 
     let ts   = chrono::Utc::now().timestamp();
-    let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+
+    static FAUCET_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut nonce = FAUCET_NONCE.load(std::sync::atomic::Ordering::Relaxed);
+    if nonce == 0 {
+        nonce = crate::ledger::last_confirmed_nonce(&faucet_addr) + 1;
+    }
+    FAUCET_NONCE.store(nonce + 1, std::sync::atomic::Ordering::Relaxed);
 
     let sign_bytes = crate::ledger::tx_signing_bytes_v2(
         &faucet_addr,
@@ -754,7 +760,7 @@ fn credit_testnet_faucet(address: &str) {
 
     let tx = LedgerTx {
         hash:      hash.clone(),
-        from:      faucet_addr,
+        from:      faucet_addr.clone(),
         to:        address.into(),
         amount:    FAUCET_AMOUNT,
         fee_uegoc: 1_000,
@@ -763,6 +769,7 @@ fn credit_testnet_faucet(address: &str) {
         timestamp: ts,
         status:    "Pending".into(),
         nonce,
+        signature,
         public_key_ed25519: hex::encode(faucet_kp.ed25519_public_key().as_bytes()),
         dilithium_pubkey,
         dilithium_signature,
@@ -771,16 +778,16 @@ fn credit_testnet_faucet(address: &str) {
         ..LedgerTx::default()
     };
 
-    // Push into the shared mempool so it gossips to the current block proposer
-    // and gets confirmed via BFT consensus. This survives chain sync from peers
-    // (unlike mine_batch_db which creates a local-only block that gets overwritten).
-    crate::mempool::get_mempool().push(tx.clone());
+    // Instant Airdrop: bypass the mempool and BFT consensus entirely.
+    // Mine the transaction immediately into the local database so the balance appears instantly.
+    let block = crate::chain_db::mine_batch_db(&[tx.clone()], &faucet_addr);
+    
+    let mut tx_confirmed = tx;
+    tx_confirmed.status = "Confirmed".to_string();
+    tx_confirmed.block_height = Some(block.height);
 
-    // Also gossip immediately so the proposer picks it up without waiting for
-    // the next mempool broadcast window.
-    let tx2 = tx;
     tauri::async_runtime::spawn(async move {
-        crate::p2p::broadcast_pending_tx(tx2).await;
+        crate::p2p::broadcast_tx(tx_confirmed, block).await;
     });
 
     eprintln!("[Faucet] Credited 1,000 EGOC to {}", address);

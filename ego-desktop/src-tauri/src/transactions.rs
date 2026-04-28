@@ -96,12 +96,13 @@ pub async fn send_transaction(
 
     // Hybrid signing: Ed25519 (classical) + ML-DSA-44 (post-quantum).
     // Both signatures must verify — attacker needs to break BOTH schemes.
-    let (signature_hex, dilithium_pubkey_hex, dilithium_sig_hex) =
+    let (signature_hex, public_key_ed25519, dilithium_pubkey_hex, dilithium_sig_hex) =
         if let Some(kp) = state.get_keypair() {
             let ed_sig  = hex::encode(kp.sign_ed25519(&sign_bytes).as_bytes());
+            let ed_pk   = hex::encode(kp.ed25519_public_key().as_bytes());
             let dil_sig = hex::encode(kp.sign_dilithium(&sign_bytes).as_bytes());
             let dil_pk  = hex::encode(kp.dilithium_public_key().key_data);
-            (ed_sig, dil_pk, dil_sig)
+            (ed_sig, ed_pk, dil_pk, dil_sig)
         } else {
             return Err(EgoDesktopError::WalletError(
                 "Wallet not initialized – call init_wallet first".into(),
@@ -129,6 +130,7 @@ pub async fn send_transaction(
         memo:                request.memo.clone(),
         timestamp:           ts,
         signature:           signature_hex,
+        public_key_ed25519,
         dilithium_pubkey:    dilithium_pubkey_hex,
         dilithium_signature: dilithium_sig_hex,
         status:              "Pending".into(),

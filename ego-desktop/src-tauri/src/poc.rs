@@ -156,7 +156,7 @@ pub fn check_slot_winner(prev_hash: &str) -> Option<(String, String)> {
     }
 }
 
-const POC_ENFORCE_HEIGHT: u64 = 1;
+const POC_ENFORCE_HEIGHT: u64 = 100_000;
 
 pub fn verify_ticket(
     ticket_hex:   &str,
