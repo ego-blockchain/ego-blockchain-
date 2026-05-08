@@ -38,6 +38,9 @@ const ANNOUNCE_REPLY_COOLDOWN_SECS: i64 = 60;
 static SYNC_REPLY_LAST: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
 const SYNC_REPLY_COOLDOWN_SECS: i64 = 30;
 
+static BLOCK_REJECT_LAST: OnceLock<Mutex<HashMap<(u64, String), i64>>> = OnceLock::new();
+const BLOCK_REJECT_LOG_COOLDOWN_SECS: i64 = 30;
+
 fn chain_push_allowed(endpoint: &str) -> bool {
     let now = Utc::now().timestamp();
     let mut map = PEER_CHAIN_PUSH_LAST.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
@@ -532,10 +535,17 @@ fn verify_bft_sig(address: &str, data: &str, sig_hex: &str) -> bool {
 // This prevents a single peer from flooding the network (DDoS layer 1).
 const MAX_MSGS_PER_SEC: u32 = 500;
 
-static PEER_MSG_RATE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (u32, i64)>>> =
+#[derive(Clone, Copy)]
+struct RateState {
+    count: u32,
+    window_start: i64,
+    logged_this_window: bool,
+}
+
+static PEER_MSG_RATE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, RateState>>> =
     std::sync::OnceLock::new();
 
-fn peer_msg_rate() -> std::sync::MutexGuard<'static, HashMap<String, (u32, i64)>> {
+fn peer_msg_rate() -> std::sync::MutexGuard<'static, HashMap<String, RateState>> {
     PEER_MSG_RATE
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
         .lock()
@@ -546,14 +556,20 @@ fn peer_msg_rate() -> std::sync::MutexGuard<'static, HashMap<String, (u32, i64)>
 fn check_peer_rate(peer_id: &str) -> bool {
     let now = chrono::Utc::now().timestamp();
     let mut rates = peer_msg_rate();
-    let entry = rates.entry(peer_id.to_string()).or_insert((0, now));
-    if now > entry.1 {
-        *entry = (1, now); // new second — reset
+    let entry = rates.entry(peer_id.to_string()).or_insert(RateState {
+        count: 0, window_start: now, logged_this_window: false,
+    });
+    if now > entry.window_start {
+        *entry = RateState { count: 1, window_start: now, logged_this_window: false };
         true
     } else {
-        entry.0 += 1;
-        if entry.0 > MAX_MSGS_PER_SEC {
-            eprintln!("[P2P] Rate-limiting flood from {} ({} msgs/s)", peer_id, entry.0);
+        entry.count += 1;
+        if entry.count > MAX_MSGS_PER_SEC {
+            if !entry.logged_this_window {
+                eprintln!("[P2P] Rate-limiting flood from {} (>{} msgs/s — further drops silenced for this second)",
+                    peer_id, MAX_MSGS_PER_SEC);
+                entry.logged_this_window = true;
+            }
             false
         } else {
             true
@@ -582,6 +598,46 @@ static STUCK_VIEWCHANGE_CYCLES: std::sync::atomic::AtomicU32 =
 
 static SOLO_AFTER_EVICTION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Validators recently evicted via the deadlock-eviction path. Each entry
+/// holds the wall-clock timestamp until which the address should NOT be
+/// re-registered, regardless of incoming gossip echoes. Without this, a
+/// disconnected peer's stale gossip messages keep re-adding it to the
+/// committee within milliseconds of every eviction, causing an infinite
+/// 1↔2 oscillation that prevents view advancement.
+const EVICTION_COOLDOWN_SECS: i64 = 90;
+static EVICTION_COOLDOWN: std::sync::OnceLock<std::sync::Mutex<HashMap<String, i64>>> =
+    std::sync::OnceLock::new();
+fn eviction_cooldown() -> std::sync::MutexGuard<'static, HashMap<String, i64>> {
+    EVICTION_COOLDOWN.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap()
+}
+pub fn is_in_eviction_cooldown(addr: &str) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    let mut map = eviction_cooldown();
+    if let Some(&until) = map.get(addr) {
+        if now < until { return true; }
+        map.remove(addr);
+    }
+    false
+}
+pub fn record_eviction_cooldown(addr: &str) {
+    let until = chrono::Utc::now().timestamp() + EVICTION_COOLDOWN_SECS;
+    eviction_cooldown().insert(addr.to_string(), until);
+}
+
+/// Decides whether the next proposal should be solo-committed.
+/// Returns true ONLY if the current committee has shrunk to a single
+/// validator. The `SOLO_AFTER_EVICTION` flag is cleared regardless so a
+/// stale flag from an earlier eviction can never authorise a fork once
+/// peers rejoin.
+fn should_solo_commit_now() -> bool {
+    let stale_flag = SOLO_AFTER_EVICTION.swap(false, Ordering::Relaxed);
+    let committee_alone = known_validators().len() <= 1;
+    if stale_flag && !committee_alone {
+        tracing::debug!("[BFT] discarding stale SOLO_AFTER_EVICTION — committee grew back to {}", known_validators().len());
+    }
+    committee_alone
+}
 
 static LAST_BLOCK_FINALIZED_TS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
@@ -809,6 +865,7 @@ pub fn slash_validator(address: &str, reason: &str) {
     known_validators().remove(address);
     slashed_validators().insert(address.to_string());
     crate::chain_db::persist_slashed_validator(address);
+    crate::chain_db::remove_persisted_validator(address);
 }
 
 pub fn mark_validator_slashed_local(address: &str) {
@@ -891,9 +948,60 @@ pub fn get_peer_ed25519_pubkey(address: &str) -> Option<[u8; 32]> {
 }
 
 
+static VALIDATOR_LAST_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, i64>>> =
+    std::sync::OnceLock::new();
+
+fn validator_last_seen() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, i64>> {
+    VALIDATOR_LAST_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock().unwrap()
+}
+
+static VALIDATOR_FIRST_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, i64>>> =
+    std::sync::OnceLock::new();
+
+fn validator_first_seen() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, i64>> {
+    VALIDATOR_FIRST_SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock().unwrap()
+}
+
+pub fn evict_stale_validators(ttl_secs: i64) {
+    let now   = chrono::Utc::now().timestamp();
+    let local = local_validator_mutex().lock().unwrap().clone();
+    // Refresh the local node's timestamp so it never evicts itself.
+    if !local.is_empty() {
+        validator_last_seen().insert(local.clone(), now);
+    }
+    let stale: Vec<String> = validator_last_seen()
+        .iter()
+        .filter(|(addr, &ts)| now - ts > ttl_secs && **addr != local)
+        .map(|(addr, _)| addr.clone())
+        .collect();
+    if !stale.is_empty() {
+        let mut seen  = validator_last_seen();
+        let mut first = validator_first_seen();
+        let mut set   = known_validators();
+        for addr in &stale {
+            seen.remove(addr);
+            first.remove(addr);
+            set.remove(addr);
+        }
+        tracing::info!("Evicted {} stale validators (TTL {}s): {:?}", stale.len(), ttl_secs,
+            stale.iter().map(|a| &a[..12.min(a.len())]).collect::<Vec<_>>());
+    }
+}
+
+pub fn known_validator_count() -> usize {
+    known_validators().len()
+}
+
 pub fn register_known_validator(address: &str) {
     if address.is_empty() { return; }
     if slashed_validators().contains(address) { return; }
+    if is_in_eviction_cooldown(address) {
+        // Recently evicted; ignore gossip echoes that would re-add this peer
+        // before the cooldown expires.
+        return;
+    }
     let min_stake: u64 = std::env::var("EGO_MIN_VALIDATOR_STAKE")
         .ok().and_then(|v| v.parse().ok())
         .unwrap_or(0);
@@ -905,11 +1013,9 @@ pub fn register_known_validator(address: &str) {
         }
     }
 
-
-    // DRS weighting is handled inside qualifies_committee / qualifies_proposer.
-    // known_validators is a registry of who exists on the network — gating it on
-    // DRS causes new nodes with zero coverage to be excluded from threshold math,
-    // allowing blocks to finalize with a single vote until coverage accumulates.
+    let now = chrono::Utc::now().timestamp();
+    validator_last_seen().insert(address.to_string(), now);
+    validator_first_seen().entry(address.to_string()).or_insert(now);
 
     let mut set = known_validators();
     if set.len() >= MAX_VALIDATORS {
@@ -918,21 +1024,58 @@ pub fn register_known_validator(address: &str) {
         }
     }
     set.insert(address.to_string());
+    drop(set);
+    crate::chain_db::persist_known_validator(address);
+    crate::poc::seed_peer_score_from_stake(address);
+}
+
+static LOCAL_VALIDATOR_ADDR: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
+
+fn local_validator_mutex() -> &'static std::sync::Mutex<String> {
+    LOCAL_VALIDATOR_ADDR.get_or_init(|| std::sync::Mutex::new(String::new()))
+}
+
+pub fn set_local_validator(address: &str) {
+    if address.is_empty() { return; }
+    let mut local = local_validator_mutex().lock().unwrap();
+    if *local != address {
+        if !local.is_empty() {
+            known_validators().remove(&*local);
+        }
+        *local = address.to_string();
+    }
+    drop(local);
+    register_known_validator(address);
 }
 
 
+const VALIDATOR_WARMUP_SECS: i64 = 10;
+
+fn warmed_validator_count() -> usize {
+    let now   = chrono::Utc::now().timestamp();
+    let first = validator_first_seen();
+    let all   = known_validators();
+    all.iter()
+        .filter(|addr| {
+            first.get(*addr).map(|&t| now - t >= VALIDATOR_WARMUP_SECS).unwrap_or(false)
+        })
+        .count()
+        .max(1)
+}
+
 fn bft_threshold() -> usize {
-    let n = known_validators().len();
+    evict_stale_validators(30);
+    let n_total = known_validators().len();
+    let n = warmed_validator_count();
     let effective = if n <= crate::bft_committee::COMMITTEE_SIZE {
         n
     } else {
         crate::bft_committee::COMMITTEE_SIZE
     };
-    eprintln!("[BFT] Committee size: {} effective / {} total validators", effective, n);
+    eprintln!("[BFT] Committee size: {} effective / {} total validators", effective, n_total);
     match effective {
-        0 | 1 => 1,
-        2     => 2,
-        _     => (effective * 2 / 3) + 1,
+        0 => 1,
+        n => (n * 2 / 3) + 1,
     }
 }
 
@@ -942,10 +1085,17 @@ fn bft_threshold() -> usize {
 /// Both bft_threshold() AND this must pass before a block is finalized.
 const STAKE_QUORUM_ENFORCE_HEIGHT: u64 = 1;
 
+const MIN_VALIDATORS_FOR_STAKE_QUORUM: usize = 10;
+const MIN_STAKE_FOR_QUORUM_UEGOC: u64 = 10_000_000_000_000; // 10M EGOC collectively staked
+
 fn stake_quorum_reached(voters: &[String]) -> bool {
     let current_height = crate::chain_db::block_count();
 
     if current_height < STAKE_QUORUM_ENFORCE_HEIGHT {
+        return true;
+    }
+
+    if warmed_validator_count() < MIN_VALIDATORS_FOR_STAKE_QUORUM {
         return true;
     }
 
@@ -956,7 +1106,7 @@ fn stake_quorum_reached(voters: &[String]) -> bool {
         .map(|addr| crate::ledger::get_validator_stake(addr))
         .sum();
 
-    if total_stake == 0 {
+    if total_stake < MIN_STAKE_FOR_QUORUM_UEGOC {
         return true;
     }
 
@@ -1519,6 +1669,10 @@ pub enum P2PMessage {
         effective_at_height:  u64,
         proposer:             String,
     },
+    TestnetFaucetGrant {
+        address:      String,
+        amount_uegoc: u64,
+    },
     PocEventBroadcast {
         address:   String,
         quality:   String,
@@ -1796,7 +1950,7 @@ pub async fn broadcast_tx(tx: LedgerTx, block: LedgerBlock) {
     }
 
     let my_addr = crate::ledger::Ledger::load().address;
-    register_known_validator(&my_addr);
+    set_local_validator(&my_addr);
 
     let (dil_pk_hex, vk_hex) = current_wallet_announce_keys();
     if !dil_pk_hex.is_empty() {
@@ -1845,6 +1999,13 @@ pub async fn broadcast_tx(tx: LedgerTx, block: LedgerBlock) {
 
 pub async fn broadcast_pending_tx(tx: LedgerTx) {
     let msg = P2PMessage::TxBroadcast { tx, block: LedgerBlock::default() };
+    if let Ok(data) = serde_json::to_vec(&msg) {
+        publish_gossip("ego-txs-v1", data).await;
+    }
+}
+
+pub async fn broadcast_faucet_grant(address: String, amount_uegoc: u64) {
+    let msg = P2PMessage::TestnetFaucetGrant { address, amount_uegoc };
     if let Ok(data) = serde_json::to_vec(&msg) {
         publish_gossip("ego-txs-v1", data).await;
     }
@@ -2298,6 +2459,7 @@ const UNDER_REPLICATED_WARN_SECS:     i64 = 3_600;      // 1 hour  → warning +
 const UNDER_REPLICATED_CRITICAL_SECS: i64 = 86_400;     // 24 hours → critical alert
 
 pub async fn check_file_replication() {
+    if known_validator_count() <= 50 { return; }
     let mut ledger = crate::ledger::Ledger::load();
     if ledger.address.is_empty() { return; }
     let my_addr = ledger.address.clone();
@@ -2718,7 +2880,7 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
         {
             let ledger = crate::ledger::Ledger::load();
             if !ledger.address.is_empty() {
-                register_known_validator(&ledger.address);
+                set_local_validator(&ledger.address);
             }
         }
 
@@ -2736,6 +2898,31 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                     }
                 }
                 tracing::info!("Restored in-flight BFT votes from DB");
+            }
+        }
+
+        // Restore known validators from DB so they are immediately available
+        // after restart without waiting for P2P re-discovery.
+        // Mark them as pre-warmed so they count toward BFT threshold right away.
+        {
+            let slashed = crate::chain_db::load_slashed_validators()
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            let restored = crate::chain_db::load_known_validators();
+            if !restored.is_empty() {
+                let now = chrono::Utc::now().timestamp();
+                let mut first = validator_first_seen();
+                let mut last  = validator_last_seen();
+                let mut set   = known_validators();
+                for addr in &restored {
+                    if addr.is_empty() || slashed.contains(addr) { continue; }
+                    first.insert(addr.clone(), now - VALIDATOR_WARMUP_SECS - 1);
+                    last.insert(addr.clone(), now);
+                    if set.len() < MAX_VALIDATORS {
+                        set.insert(addr.clone());
+                    }
+                }
+                tracing::info!("Restored {} known validators from DB", restored.len());
             }
         }
     }
@@ -2804,6 +2991,20 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
             }
 
             _ = relay_retry.tick() => {
+                if let Ok(peers_env) = std::env::var("EGO_DIRECT_PEERS") {
+                    for addr_str in peers_env.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                        if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+                            if let Some(pid) = peer_id_from_multiaddr(&addr) {
+                                if !swarm.is_connected(&pid) {
+                                    eprintln!("[P2P] Direct peer {} not connected — redialling", addr_str);
+                                    let _ = swarm.dial(addr);
+                                }
+                            } else {
+                                let _ = swarm.dial(addr);
+                            }
+                        }
+                    }
+                }
                 if DIRECT_PEER_COUNT.load(Ordering::Relaxed) >= MIN_DIRECT_PEERS_RELAY_OPTIONAL
                     && has_circuit_addr(&external_addrs)
                 {
@@ -3265,15 +3466,31 @@ async fn handle_event(
                     in_flight.insert(req_id, reply);
                 }
             }
+
+            // Pull any blocks we missed while this peer was unreachable.
+            // 1-second delay lets gossip subscriptions exchange first.
+            if !relay_addrs.contains_key(&peer_id) {
+                tokio::spawn(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    sync_chain_from_peers().await;
+                });
+            }
         }
 
         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
             if !relay_addrs.contains_key(&peer_id) && num_established == 0 {
-
                 let _ = DIRECT_PEER_COUNT.fetch_update(
                     Ordering::Relaxed, Ordering::Relaxed,
                     |v| Some(v.saturating_sub(1)),
                 );
+                if let Ok(peers_env) = std::env::var("EGO_DIRECT_PEERS") {
+                    for addr_str in peers_env.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                        if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+                            eprintln!("[P2P] Direct peer {} disconnected — redialling {}", peer_id, addr_str);
+                            let _ = swarm.dial(addr);
+                        }
+                    }
+                }
             }
             if relay_addrs.contains_key(&peer_id) {
                 tracing::info!("Relay {} connection closed ({} remaining)", peer_id, num_established);
@@ -3507,11 +3724,27 @@ async fn handle_event(
             let topic = message.topic.to_string();
             if topic == "ego-txs-v1" {
 
-                if let Ok(P2PMessage::TxBroadcast { tx, block }) =
-                    serde_json::from_slice::<P2PMessage>(&message.data)
-                {
-                    let app2 = app.cloned();
-                    tokio::spawn(async move { apply_incoming_tx(tx, block, app2.as_ref()).await; });
+                match serde_json::from_slice::<P2PMessage>(&message.data) {
+                    Ok(P2PMessage::TxBroadcast { tx, block }) => {
+                        let app2 = app.cloned();
+                        tokio::spawn(async move { apply_incoming_tx(tx, block, app2.as_ref()).await; });
+                    }
+                    Ok(P2PMessage::TestnetFaucetGrant { address, amount_uegoc }) => {
+                        let addr_for_grant = address.clone();
+                        let granted_now = tokio::task::spawn_blocking(move || {
+                            crate::chain_db::grant_testnet_faucet(&addr_for_grant, amount_uegoc)
+                        }).await.unwrap_or(false);
+                        // Viral retransmission: when WE see a faucet grant for the
+                        // first time (i.e. it actually credited), re-broadcast it
+                        // once so late-joining peers can catch it.
+                        if granted_now {
+                            let addr = address.clone();
+                            tokio::spawn(async move {
+                                broadcast_faucet_grant(addr, amount_uegoc).await;
+                            });
+                        }
+                    }
+                    _ => {}
                 }
             } else if topic == "ego-blocks-v1" {
                 match serde_json::from_slice::<P2PMessage>(&message.data) {
@@ -3525,7 +3758,7 @@ async fn handle_event(
                         let app2 = app.cloned();
                         tokio::spawn(async move {
                             if process_inbound_qc_finalization(&block_hash, height, &votes, &agg_bls_sig, &bls_pubkeys) {
-                                merge_remote_chain(vec![block], transactions, app2.as_ref()).await;
+                                merge_remote_chain_trusted(vec![block], transactions, app2.as_ref()).await;
                             }
                         });
                     }
@@ -3549,8 +3782,15 @@ async fn handle_event(
                 if let Ok(P2PMessage::BlockProposal { block, transactions, proposer, signature, vrf_ticket }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
-
-                    register_known_validator(&proposer);
+                    // Only count validators building on our chain.
+                    // A stranger on a different fork has a prev_hash we don't know.
+                    let our_tip = crate::chain_db::latest_block_info().0;
+                    let prev_known = block.height <= 1
+                        || block.height == our_tip + 1
+                        || crate::chain_db::get_block_hash_at(block.height.saturating_sub(1))
+                            .map(|h| h == block.prev_hash)
+                            .unwrap_or(false);
+                    if prev_known { register_known_validator(&proposer); }
                     let app2 = app.cloned();
                     tokio::spawn(async move {
                         handle_block_proposal(block, transactions, proposer, signature, vrf_ticket, app2.as_ref()).await;
@@ -3560,7 +3800,13 @@ async fn handle_event(
                 if let Ok(P2PMessage::BlockVote { block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
-                    register_known_validator(&voter);
+                    // Only register voter if they're voting on a block on our chain.
+                    let our_height = crate::chain_db::latest_block_info().0;
+                    let vote_on_our_chain = height == our_height + 1
+                        || crate::chain_db::get_block_hash_at(height.saturating_sub(1))
+                            .map(|h| h == prev_hash)
+                            .unwrap_or(false);
+                    if vote_on_our_chain { register_known_validator(&voter); }
                     let app2 = app.cloned();
                     tokio::spawn(async move {
                         handle_block_vote(block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, app2.as_ref()).await;
@@ -4700,7 +4946,7 @@ P2PMessage::ChatMessage { bundle, seq } => {
             let block_hash = block.hash.clone();
             let height     = block.height;
             if process_inbound_qc_finalization(&block_hash, height, &votes, &agg_bls_sig, &bls_pubkeys) {
-                merge_remote_chain(vec![block], transactions, app).await;
+                merge_remote_chain_trusted(vec![block], transactions, app).await;
             }
         }
 
@@ -5452,6 +5698,8 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
 
         P2PMessage::PocEventBroadcast { .. } => {}
 
+        P2PMessage::TestnetFaucetGrant { .. } => {}
+
         P2PMessage::ShardRebalance { .. } => {}
 
         P2PMessage::ShardTxRoute { shard_id, tx } => {
@@ -5731,7 +5979,9 @@ fn validate_block(block: &crate::ledger::LedgerBlock, chain: &crate::ledger::Sha
 async fn apply_incoming_tx(tx: LedgerTx, block: LedgerBlock, app: Option<&tauri::AppHandle<tauri::Wry>>) {
     if block.height == 0 {
         if crate::chain_db::get_tx_by_hash(&tx.hash).is_none() {
-            if let Ok(()) = crate::ledger::verify_incoming_tx(&tx) {
+            let fee_ok = tx.fee_uegoc >= crate::tokenomics::FEE_FLOOR_UEGOC;
+            let sig_ok = crate::ledger::verify_confirmed_tx_sig(&tx).is_ok();
+            if fee_ok && sig_ok {
                 crate::mempool::get_mempool().push(tx);
             }
         }
@@ -5873,9 +6123,10 @@ fn merge_remote_chain_blocking(
     mut blocks: Vec<LedgerBlock>,
     transactions: Vec<LedgerTx>,
     trusted: bool,
-) -> bool {
+) -> (bool, bool) {
     let mut new_txs: Vec<LedgerTx> = Vec::new();
     let mut new_blocks: Vec<LedgerBlock> = Vec::new();
+    let mut peer_ahead = false;
 
     if trusted {
         blocks.sort_unstable_by_key(|b| b.height);
@@ -5915,7 +6166,9 @@ fn merge_remote_chain_blocking(
                         );
                         { hard_finalized_heights().retain(|&h| h < dh); }
                         { finalized_at_height().retain(|&h, _| h < dh); }
-                        crate::chain_db::truncate_from(dh);
+                        for tx in crate::chain_db::truncate_from(dh) {
+                            crate::mempool::get_mempool().push(tx);
+                        }
                     } else {
                         tracing::debug!(
                             "[Oracle] Reorg blocked at height {} — local chain matches BFT-finalized block (oracle is on different fork)",
@@ -5926,7 +6179,7 @@ fn merge_remote_chain_blocking(
                     // Local chain diverges from what BFT actually finalized, or oracle
                     // is offering the finalized block — accept the reorg.
                     let oracle_max = blocks.iter().filter(|b| b.height > 0).map(|b| b.height).max().unwrap_or(0);
-                    let local_max  = crate::chain_db::block_count() as u64;
+                    let local_max  = crate::chain_db::latest_block_info().0;
                     if oracle_max >= local_max || oracle_matches_finalized {
                         tracing::info!(
                             "[Oracle] Reorg: adopting canonical chain at height {} (local was on wrong fork)",
@@ -5934,15 +6187,19 @@ fn merge_remote_chain_blocking(
                         );
                         { hard_finalized_heights().retain(|&h| h < dh); }
                         { finalized_at_height().retain(|&h, _| h < dh); }
-                        crate::chain_db::truncate_from(dh);
+                        for tx in crate::chain_db::truncate_from(dh) {
+                            crate::mempool::get_mempool().push(tx);
+                        }
                     }
                 }
             } else {
                 let oracle_max = blocks.iter().filter(|b| b.height > 0).map(|b| b.height).max().unwrap_or(0);
-                let local_max  = crate::chain_db::block_count() as u64;
+                let local_max  = crate::chain_db::latest_block_info().0;
                 if oracle_max > local_max {
                     eprintln!("[Oracle] Reorg: oracle ahead ({} > {}) — truncating from height {} and adopting oracle chain", oracle_max, local_max, dh);
-                    crate::chain_db::truncate_from(dh);
+                    for tx in crate::chain_db::truncate_from(dh) {
+                        crate::mempool::get_mempool().push(tx);
+                    }
                 } else {
                     tracing::debug!("[Oracle] Reorg skipped at height {} — oracle has {} blocks vs our {} (keeping local chain)", dh, oracle_max, local_max);
                 }
@@ -5959,9 +6216,10 @@ fn merge_remote_chain_blocking(
         blocks.sort_unstable_by_key(|b| b.height);
 
         let remote_tip = blocks.iter().filter(|b| b.height > 0).map(|b| b.height).max().unwrap_or(0);
-        let local_tip  = crate::chain_db::block_count() as u64;
+        let local_tip  = crate::chain_db::latest_block_info().0;
 
         if remote_tip > local_tip {
+            peer_ahead = true;
             let diverge_height: Option<u64> = blocks.iter()
                 .filter(|b| b.height > 0)
                 .find(|b| crate::chain_db::get_block_by_height(b.height)
@@ -5973,7 +6231,9 @@ fn merge_remote_chain_blocking(
                 if dh > last_hard {
                     eprintln!("[P2P] Longest-chain reorg: remote tip {} > local {}, truncating from height {}",
                         remote_tip, local_tip, dh);
-                    crate::chain_db::truncate_from(dh);
+                    for tx in crate::chain_db::truncate_from(dh) {
+                        crate::mempool::get_mempool().push(tx);
+                    }
                 } else {
                     eprintln!("[P2P] Reorg at height {} blocked — hard-finalized at {}", dh, last_hard);
                 }
@@ -6033,19 +6293,39 @@ fn merge_remote_chain_blocking(
                 continue;
             }
 
-            let block_txs: Vec<LedgerTx> = transactions.iter()
-                .filter(|tx| tx.block_height == Some(block.height))
-                .cloned()
-                .collect();
+            let mut block_txs: Vec<LedgerTx> = {
+                let mut seen = std::collections::HashSet::new();
+                transactions.iter()
+                    .filter(|tx| tx.block_height == Some(block.height))
+                    .filter(|tx| seen.insert(tx.hash.clone()))
+                    .cloned()
+                    .collect()
+            };
+            let claimed = block.tx_count as usize;
+            if block_txs.len() > claimed {
+                let cb_hash = block.coinbase_tx.as_deref().unwrap_or("").to_string();
+                block_txs.sort_by_key(|tx| {
+                    if tx.hash == cb_hash { 0u8 }
+                    else if crate::ledger::is_protocol_system_tx(tx) { 1 }
+                    else { 2 }
+                });
+                block_txs.truncate(claimed);
+            }
             if let Err(reason) = crate::chain_db::validate_peer_block(&block, &block_txs) {
-                eprintln!("[P2P] Block #{} rejected: {}", block.height, reason);
+                let now = Utc::now().timestamp();
+                let key = (block.height, reason[..reason.len().min(40)].to_string());
+                let mut last_map = BLOCK_REJECT_LAST.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+                let last = last_map.get(&key).copied().unwrap_or(0);
+                if now - last >= BLOCK_REJECT_LOG_COOLDOWN_SECS {
+                    eprintln!("[P2P] Block #{} rejected: {}", block.height, reason);
+                    last_map.insert(key, now);
+                }
                 continue;
             }
 
             // Write immediately so the next block's parent check finds this block in the DB.
             if !trusted {
-                let block_txs_now: Vec<LedgerTx> = transactions.iter()
-                    .filter(|tx| tx.block_height == Some(block.height))
+                let block_txs_now: Vec<LedgerTx> = block_txs.iter()
                     .filter(|tx| crate::ledger::verify_confirmed_tx_sig(tx).is_ok())
                     .cloned()
                     .collect();
@@ -6074,7 +6354,7 @@ fn merge_remote_chain_blocking(
         }
     }
 
-    if new_blocks.is_empty() && new_txs.is_empty() { return false; }
+    if new_blocks.is_empty() && new_txs.is_empty() { return (false, peer_ahead); }
 
     for block in &new_blocks {
         let block_txs: Vec<LedgerTx> = new_txs.iter()
@@ -6086,14 +6366,14 @@ fn merge_remote_chain_blocking(
         } else {
             crate::chain_db::append_peer_block(block, &block_txs);
         }
+        for tx in block_txs.iter().filter(|t| t.tx_type != "reward" && t.tx_type != "coinbase") {
+            eprintln!("[TX] {:.12} Confirmed — block #{}", tx.hash, block.height);
+            crate::commands::tx_pending::remove(&tx.hash);
+        }
     }
 
     if let Some(max_height) = new_blocks.iter().map(|b| b.height).max() {
-        let synced_view = max_height + 1;
-        if synced_view > current_view() {
-            advance_view(synced_view);
-            eprintln!("[Sync] View advanced to {} after syncing to block #{}", synced_view, max_height);
-        }
+        eprintln!("[Sync] Synced to block #{} — touching proposal timestamp", max_height);
         touch_proposal_timestamp();
     }
 
@@ -6110,21 +6390,39 @@ fn merge_remote_chain_blocking(
         crate::rpc::notify_new_block(tip);
     }
 
-    true
+    (true, false)
 }
 
 async fn merge_remote_chain_inner(
     blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: Option<&tauri::AppHandle<tauri::Wry>>,
     trusted: bool,
 ) {
-    let any_new = tokio::task::spawn_blocking(move || {
+    let (any_new, peer_ahead) = tokio::task::spawn_blocking(move || {
         merge_remote_chain_blocking(blocks, transactions, trusted)
-    }).await.unwrap_or(false);
+    }).await.unwrap_or((false, false));
 
     if any_new {
+        // If the remote chain advanced past our staged block's height, that block
+        // lost fork-choice. Return its TXs to the mempool before it gets discarded.
+        let new_tip = crate::chain_db::latest_block_info().0;
+        {
+            let mut staged = staged_block();
+            if let Some((b, stamped)) = staged.as_ref() {
+                if b.height <= new_tip {
+                    let pool = crate::mempool::get_mempool();
+                    for tx in stamped.iter().filter(|t| t.tx_type != "reward" && t.tx_type != "coinbase") {
+                        eprintln!("[Sync] TX {:.12} returned to mempool — staged block #{} superseded by remote tip #{}", tx.hash, b.height, new_tip);
+                        pool.push(tx.clone());
+                    }
+                    staged.take();
+                }
+            }
+        }
         if let Some(h) = app {
             let _ = h.emit_all("ego://chain-updated", ());
         }
+    } else if peer_ahead {
+        tokio::spawn(sync_chain_from_peers());
     }
 }
 
@@ -6240,37 +6538,44 @@ fn proposal_signing_data(block_hash: &str, height: u64) -> String {
     format!("proposal:{}:{}", block_hash, height)
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum ProposalAuth {
+    Valid,
+    Disqualified,
+    Invalid,
+}
+
 fn verify_block_proposal_auth(
     block: &LedgerBlock,
     proposer: &str,
     signature: &str,
     vrf_ticket: &str,
-) -> bool {
+) -> ProposalAuth {
     if proposer.is_empty() || proposer != block.miner {
         eprintln!("[BFT] Proposal rejected: proposer does not match block miner");
-        return false;
+        return ProposalAuth::Invalid;
     }
     if !known_validators().contains(proposer) {
         eprintln!("[BFT] Proposal rejected: proposer {} is not a confirmed validator", proposer);
-        return false;
+        return ProposalAuth::Invalid;
     }
     let sig_data = proposal_signing_data(&block.hash, block.height);
     if signature.is_empty() || !verify_bft_sig(proposer, &sig_data, signature) {
         eprintln!("[BFT] Proposal #{} rejected: invalid proposer signature from {}", block.height, proposer);
-        return false;
+        return ProposalAuth::Invalid;
     }
     let ticket_bytes = match hex::decode(vrf_ticket) {
         Ok(bytes) => bytes,
         Err(_) => {
             eprintln!("[BFT] Proposal #{} rejected: malformed proposer VRF ticket", block.height);
-            return false;
+            return ProposalAuth::Invalid;
         }
     };
     let pubkey = match get_peer_ed25519_pubkey(proposer) {
         Some(pk) => pk,
         None => {
             tracing::debug!("[BFT] Proposal #{}: Ed25519 key for {} not yet cached — skipping VRF check", block.height, proposer);
-            return true;
+            return ProposalAuth::Valid;
         }
     };
     let vrf_in = crate::bft_committee::vrf_input(
@@ -6280,21 +6585,33 @@ fn verify_block_proposal_auth(
     );
     if !crate::bft_committee::verify_vrf_ticket(&pubkey, &vrf_in, &ticket_bytes) {
         eprintln!("[BFT] Proposal #{} rejected: invalid proposer VRF signature", block.height);
-        return false;
+        return ProposalAuth::Invalid;
     }
-    let all_validators: Vec<String> = known_validators().iter().cloned().collect();
+    // Use only warmed validators for DRS share so newly-discovered relay
+    // nodes don't dilute the share and cause spurious "did not qualify" rejections.
+    let n_warmed = warmed_validator_count();
+    let drs_validators: Vec<String> = {
+        let now   = chrono::Utc::now().timestamp();
+        let first = validator_first_seen();
+        let all   = known_validators();
+        let warmed: Vec<String> = all.iter()
+            .filter(|addr| first.get(*addr).map(|&t| now - t >= VALIDATOR_WARMUP_SECS).unwrap_or(false))
+            .cloned()
+            .collect();
+        if warmed.is_empty() { all.iter().cloned().collect() } else { warmed }
+    };
     let proposer_drs = crate::bft_committee::compute_drs_weight(proposer);
-    let total_drs = crate::bft_committee::total_drs_weight(&all_validators);
+    let total_drs = crate::bft_committee::total_drs_weight(&drs_validators);
     if !crate::bft_committee::qualifies_proposer_for_network(
         &ticket_bytes,
         proposer_drs,
         total_drs,
-        all_validators.len(),
+        n_warmed,
     ) {
         eprintln!("[BFT] Proposal #{} rejected: proposer VRF ticket did not qualify", block.height);
-        return false;
+        return ProposalAuth::Disqualified;
     }
-    true
+    ProposalAuth::Valid
 }
 
 async fn handle_block_proposal(
@@ -6325,12 +6642,13 @@ async fn handle_block_proposal(
         return;
     }
 
-    if !verify_block_proposal_auth(&block, &proposer, &signature, &vrf_ticket) {
-        // Only count as an invalid block when we're caught up.
-        // VRF failures during chain catch-up are expected (peer is ahead) and
-        // should not cause banning.
+    let auth = verify_block_proposal_auth(&block, &proposer, &signature, &vrf_ticket);
+    if auth != ProposalAuth::Valid {
+        // Only ban on cryptographic / structural failure. VRF disqualification
+        // is honest probabilistic behaviour — the proposer was elected via
+        // round-robin or fallback but their ticket fell above threshold.
         let catching_up = block.height > local_tip + 2;
-        if !catching_up {
+        if auth == ProposalAuth::Invalid && !catching_up {
             record_peer_invalid_block(&proposer);
         }
         return;
@@ -6670,6 +6988,10 @@ async fn handle_block_vote(
         if !voters.contains(&voter) {
             voters.push(voter.clone());
             crate::chain_db::persist_pending_vote(&block_hash, &voter);
+            let my_addr = crate::ledger::Ledger::load().address;
+            if voter == my_addr {
+                crate::tokenomics::record_block_participation();
+            }
             eprintln!("[BFT] Vote for block #{} from {} ({}/{} votes)",
                 height, voter, voters.len(), threshold);
         }
@@ -6679,7 +7001,25 @@ async fn handle_block_vote(
 
     if !should_finalize { return; }
 
-    if finalized_at_height().contains_key(&height) {
+    let already_finalized = {
+        let mut fin = finalized_at_height();
+        match fin.entry(height) {
+            std::collections::hash_map::Entry::Occupied(_) => true,
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(block_hash.clone());
+                false
+            }
+        }
+    };
+    if already_finalized {
+        eprintln!("[BFT] Block #{} already finalized by QC/solo path — clearing staged block, touching timer", height);
+        {
+            let mut staged = staged_block();
+            if staged.as_ref().map(|(b, _)| b.hash == block_hash && b.height == height).unwrap_or(false) {
+                staged.take();
+            }
+        }
+        touch_proposal_timestamp();
         return;
     }
 
@@ -6689,25 +7029,13 @@ async fn handle_block_vote(
     eprintln!("[BFT] Block #{} FINALIZED with {} votes (threshold={})",
         height, final_vote_count, threshold);
 
-    {
-        let sigs = finalized_bls_sigs.clone();
-        if !sigs.is_empty() {
-            match crate::bls_agg::aggregate_signatures(&sigs) {
-                Ok(agg) => eprintln!("[BLS] Aggregated {} signatures into {} bytes for block #{}", sigs.len(), agg.len(), height),
-                Err(e)  => eprintln!("[BLS] Aggregation failed for block #{}: {}", height, e),
-            }
-        }
-    }
-
-    finalized_at_height().insert(height, block_hash.clone());
     if final_vote_count >= threshold {
         hard_finalized_heights().insert(height);
     }
     LAST_BLOCK_FINALIZED_TS.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
-
+    crate::tokenomics::record_block_produced();
 
     CONSECUTIVE_EMPTY_VIEWS.store(0, Ordering::Relaxed);
-
 
     pending_proposals().remove(&height);
 
@@ -6731,27 +7059,71 @@ async fn handle_block_vote(
         if staged.as_ref().map(|(b, _)| b.hash == block_hash).unwrap_or(false) {
             staged.take()
         } else {
+            // Our staged block (if any) lost fork-choice — return its TXs to the mempool
+            // so they get picked up by the next block proposal.
+            if let Some((b, stamped)) = staged.as_ref() {
+                if b.height == height {
+                    let pool = crate::mempool::get_mempool();
+                    for tx in stamped.iter().filter(|t| t.tx_type != "reward" && t.tx_type != "coinbase") {
+                        eprintln!("[BFT] TX {:.12} returned to mempool — block #{} fork-choice lost", tx.hash, height);
+                        pool.push(tx.clone());
+                    }
+                    staged.take();
+                }
+            }
             None
         }
     };
 
     let (block, block_txs) = match staged_opt {
-        Some((b, txs)) => {
-            if !crate::chain_db::commit_staged_block(&b, &txs, final_vote_count as u32) {
+        Some((mut b, txs)) => {
+            {
+                let pks = peer_bls_pubkeys();
+                let pk_list: Vec<String> = finalized_voters.iter()
+                    .filter_map(|v| pks.get(v))
+                    .map(|pk| hex::encode(pk))
+                    .collect();
+                drop(pks);
+                if !finalized_bls_sigs.is_empty() {
+                    if let Ok(agg) = crate::bls_agg::aggregate_signatures(&finalized_bls_sigs) {
+                        b.agg_bls_sig = hex::encode(&agg);
+                        b.bls_pubkeys = pk_list;
+                    }
+                }
+            }
+            eprintln!("[BFT] committing block #{} to RocksDB ({} votes)", height, final_vote_count);
+            let vote_count_u32 = final_vote_count as u32;
+            let b_c   = b.clone();
+            let txs_c = txs.clone();
+            let committed = tokio::task::spawn_blocking(move || {
+                crate::chain_db::commit_staged_block(&b_c, &txs_c, vote_count_u32)
+            }).await.unwrap_or(false);
+            eprintln!("[BFT] commit_staged_block done — block #{} ok={}", height, committed);
+            if !committed {
                 let pool = crate::mempool::get_mempool();
                 for tx in txs.iter().filter(|t| t.tx_type != "reward" && t.tx_type != "coinbase") {
                     pool.push(tx.clone());
                 }
+                touch_proposal_timestamp();
                 return;
             }
             crate::chain_db::pipeline_commit(height);
+            touch_proposal_timestamp();
             (b, txs)
         }
         None => {
-            match crate::chain_db::get_block_by_height(height) {
-                Some(b) if b.hash == block_hash => {
-                    let txs = crate::chain_db::get_txs_for_block(height);
+            let bh_c = block_hash.clone();
+            let (opt_b, opt_txs) = tokio::task::spawn_blocking(move || {
+                let b = crate::chain_db::get_block_by_height(height);
+                let txs = b.as_ref()
+                    .filter(|blk| blk.hash == bh_c)
+                    .map(|_| crate::chain_db::get_txs_for_block(height));
+                (b, txs)
+            }).await.unwrap_or((None, None));
+            match (opt_b, opt_txs) {
+                (Some(b), Some(txs)) if b.hash == block_hash => {
                     crate::chain_db::pipeline_commit(height);
+                    touch_proposal_timestamp();
                     (b, txs)
                 }
                 _ => {
@@ -6780,20 +7152,7 @@ async fn handle_block_vote(
             .collect()
     };
 
-    let (agg_bls_sig, bls_pubkeys) = {
-        let sigs  = finalized_bls_sigs.clone();
-        let pks   = peer_bls_pubkeys();
-        let pk_list: Vec<String> = finalized_voters.iter()
-            .filter_map(|v| pks.get(v))
-            .map(|b| hex::encode(b))
-            .collect();
-        let agg = if !sigs.is_empty() {
-            crate::bls_agg::aggregate_signatures(&sigs).map(|a| hex::encode(a)).unwrap_or_default()
-        } else {
-            String::new()
-        };
-        (agg, pk_list)
-    };
+    let (agg_bls_sig, bls_pubkeys) = (block.agg_bls_sig.clone(), block.bls_pubkeys.clone());
 
     let finalized = P2PMessage::BlockFinalized {
         block:        block.clone(),
@@ -6864,6 +7223,8 @@ fn process_inbound_qc_finalization(
                 hard_finalized_heights().insert(height);
                 pending_proposals().remove(&height);
                 LOCKED_QC_HEIGHT.fetch_max(height, Ordering::Relaxed);
+                CONSECUTIVE_EMPTY_VIEWS.store(0, Ordering::Relaxed);
+                touch_proposal_timestamp();
                 return true;
             }
         }
@@ -6924,6 +7285,7 @@ fn process_inbound_qc_finalization(
     pending_bls_sigs().clear();
 
     CONSECUTIVE_EMPTY_VIEWS.store(0, Ordering::Relaxed);
+    touch_proposal_timestamp();
     true
 }
 
@@ -6950,7 +7312,9 @@ async fn handle_view_change_msg(view: u64, voter: String) {
 
     {
         let my_view = current_view();
-        if view > my_view {
+        let our_chain_next = block_count_now;
+        let view_jump_limit = our_chain_next.saturating_add(2);
+        if view > my_view && view <= view_jump_limit {
             if !my_addr.is_empty() && voter != my_addr {
                 advance_view(view.saturating_sub(1));
                 eprintln!(
@@ -6964,23 +7328,29 @@ async fn handle_view_change_msg(view: u64, voter: String) {
                         voters.push(my_addr.clone());
                     }
                 }
-                let vote_data = format!("viewchange:{}:{}", view, my_addr);
-                let sig = if let Some(seed_32) = seed_32_opt {
-                    use ed25519_dalek::{SigningKey, Signer};
-                    hex::encode(SigningKey::from_bytes(&seed_32).sign(vote_data.as_bytes()).to_bytes())
-                } else {
-                    String::new()
-                };
-                let ts  = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                let msg = P2PMessage::ViewChange { view, voter: my_addr.clone(), signature: sig, timestamp: ts };
-                if let Ok(data) = serde_json::to_vec(&msg) {
-                    publish_gossip("ego-viewchange-v1", data).await;
+                if let Some(seed_32) = seed_32_opt {
+                    let vote_data = format!("viewchange:{}:{}", view, my_addr);
+                    let sig = {
+                        use ed25519_dalek::{SigningKey, Signer};
+                        hex::encode(SigningKey::from_bytes(&seed_32).sign(vote_data.as_bytes()).to_bytes())
+                    };
+                    let ts  = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let msg = P2PMessage::ViewChange { view, voter: my_addr.clone(), signature: sig, timestamp: ts };
+                    if let Ok(data) = serde_json::to_vec(&msg) {
+                        publish_gossip("ego-viewchange-v1", data).await;
+                    }
                 }
                 touch_proposal_timestamp();
             }
+        } else if view > view_jump_limit {
+            tracing::debug!(
+                "[HotStuff] Ignoring ViewChange from {} for view {} — too far beyond our chain (next={})",
+                &voter[..voter.len().min(20)], view, our_chain_next
+            );
+            return;
         }
     }
 
@@ -7011,7 +7381,7 @@ async fn handle_view_change_msg(view: u64, voter: String) {
     // We NEVER penalise based on VRF heuristics — that would punish nodes that
     // legitimately won the lottery but whose proposal just didn't arrive in time.
     {
-        let current_height = block_count_now + 1;
+        let current_height = block_count_now;
         // Remove the entry atomically so we don't double-penalise.
         if let Some(offline_proposer) = pending_proposals().remove(&current_height) {
             crate::ledger::penalise_missed_proposal(&offline_proposer);
@@ -7034,7 +7404,7 @@ async fn handle_view_change_msg(view: u64, voter: String) {
     // finalized yet.  This allows the node to vote for new proposals at those
     // heights in the new view without triggering the equivocation guard.
     {
-        votes_cast().retain(|(_, h), _| *h <= block_count_now);
+        votes_cast().retain(|(_, h), _| *h < block_count_now);
     }
 
     // ── Liveness: VRF self-selection + deterministic fallback ─────────────
@@ -7062,13 +7432,21 @@ async fn handle_view_change_msg(view: u64, voter: String) {
             eprintln!("[HotStuff] Fallback: round-robin elected {} for view {}", &fallback_leader[..12.min(fallback_leader.len())], view);
         }
     } else {
-        // Normal path: VRF self-selection.
-        // elect_proposer_for_next_slot() returns Some(my_addr) only if this node
-        // won the VRF lottery (threshold scaled by EXPECTED_PROPOSERS_PER_SLOT).
-        if let Some(ref winner) = elect_proposer_for_next_slot() {
-            if winner == &my_addr {
-                eprintln!("[HotStuff] VRF won — leader for view {} — proposing block", view);
+        let n_validators = known_validators().len();
+        if n_validators <= 10 {
+            let mut vs: Vec<String> = known_validators().iter().cloned().collect();
+            vs.sort();
+            let idx = (view as usize).wrapping_rem(vs.len().max(1));
+            if vs.get(idx).map(|v| v == &my_addr).unwrap_or(false) {
+                eprintln!("[HotStuff] Round-robin elected us for view {} ({}/{}) — proposing block", view, idx + 1, vs.len());
                 tokio::spawn(async move { propose_block_as_leader().await; });
+            }
+        } else {
+            if let Some(ref winner) = elect_proposer_for_next_slot() {
+                if winner == &my_addr {
+                    eprintln!("[HotStuff] VRF won — leader for view {} — proposing block", view);
+                    tokio::spawn(async move { propose_block_as_leader().await; });
+                }
             }
         }
     }
@@ -7108,7 +7486,46 @@ pub async fn propose_block_as_leader() {
     }
     eprintln!("[BFT] VRF election won — proposer for block #{}", next_height);
 
-    let is_solo = known_validators().len() <= 1;
+    // Re-use the staged block if we already proposed for this height.
+    // This prevents draining the mempool empty on subsequent view elections
+    // while the same block height is still awaiting committee votes.
+    let reuse_data: Option<(crate::ledger::LedgerBlock, Vec<LedgerTx>)> = {
+        let staged = staged_block();
+        staged.as_ref()
+            .filter(|(b, _)| b.height == next_height)
+            .map(|(b, t)| (b.clone(), t.clone()))
+    };
+    if let Some((block, stamped)) = reuse_data {
+        if should_solo_commit_now() {
+            let bh      = block.hash.clone();
+            let bheight = block.height;
+            tokio::task::spawn_blocking(move || bft_solo_commit(&bh, bheight)).await.ok();
+            touch_proposal_timestamp();
+            return;
+        }
+        let sig_data  = format!("proposal:{}:{}", block.hash, block.height);
+        let signature = {
+            use ed25519_dalek::{SigningKey, Signer};
+            hex::encode(SigningKey::from_bytes(&seed_32).sign(sig_data.as_bytes()).to_bytes())
+        };
+        let vrf_in2     = crate::bft_committee::vrf_input(&prev_hash, next_height, crate::bft_committee::VRF_ROLE_PROPOSER);
+        let vrf_ticket2 = crate::bft_committee::sign_vrf_ticket(&seed_32, &vrf_in2);
+        let proposal = P2PMessage::BlockProposal {
+            block:        block.clone(),
+            transactions: stamped,
+            proposer:     miner.clone(),
+            signature,
+            vrf_ticket:   hex::encode(&vrf_ticket2),
+        };
+        if let Ok(data) = serde_json::to_vec(&proposal) {
+            publish_gossip("ego-proposals-v1", data).await;
+        }
+        eprintln!("[BFT] Re-broadcasting staged proposal for block #{} (mempool unchanged)", next_height);
+        touch_proposal_timestamp();
+        return;
+    }
+
+    let is_solo = should_solo_commit_now();
     let pool    = crate::mempool::get_mempool();
     let txs     = pool.drain_all();
 
@@ -7140,6 +7557,11 @@ pub async fn propose_block_as_leader() {
 
     if !post_proof_ids.is_empty() {
         tokio::spawn(notify_post_rewards_claimed(post_proof_ids));
+    }
+
+    {
+        let mut seen = std::collections::HashSet::new();
+        all_txs.retain(|tx| !tx.hash.is_empty() && seen.insert(tx.hash.clone()));
     }
 
     let miner_c = miner.clone();
@@ -7251,10 +7673,6 @@ fn bft_solo_commit(block_hash: &str, height: u64) {
         CONSECUTIVE_EMPTY_VIEWS.store(0, Ordering::Relaxed);
         pending_proposals().remove(&height);
         pending_votes().remove(block_hash);
-        for tx in stamped.iter().filter(|t| t.tx_type != "reward" && t.tx_type != "coinbase") {
-            eprintln!("[TX] {:.12} Confirmed — block #{}", tx.hash, height);
-            crate::commands::tx_pending::remove(&tx.hash);
-        }
         crate::rpc::notify_new_block(&b);
         if let Some(h) = APP_HANDLE.get() {
             let _ = h.emit_all("ego://chain-updated", ());
@@ -7268,6 +7686,17 @@ fn bft_solo_commit(block_hash: &str, height: u64) {
         b2.vote_count = 1;
         let s2  = stamped.clone();
         tokio::spawn(async move { push_block_to_oracle(&b2, &s2).await; });
+        let b_broadcast   = b.clone();
+        let txs_broadcast = stamped.clone();
+        tokio::spawn(async move {
+            let msg = P2PMessage::ChainSyncResponse {
+                blocks:       vec![b_broadcast],
+                transactions: txs_broadcast,
+            };
+            if let Ok(data) = serde_json::to_vec(&msg) {
+                publish_gossip("ego-blocks-v1", data).await;
+            }
+        });
     }
 }
 
@@ -7291,8 +7720,45 @@ pub async fn propose_block_as_leader_forced() {
         None    => { touch_proposal_timestamp(); return; }
     };
 
-    let is_solo = known_validators().len() <= 1
-        || SOLO_AFTER_EVICTION.swap(false, Ordering::Relaxed);
+    // Re-use staged block if already proposed for this height (same as propose_block_as_leader).
+    let reuse_data: Option<(crate::ledger::LedgerBlock, Vec<LedgerTx>)> = {
+        let staged = staged_block();
+        staged.as_ref()
+            .filter(|(b, _)| b.height == next_height)
+            .map(|(b, t)| (b.clone(), t.clone()))
+    };
+    if let Some((block, stamped)) = reuse_data {
+        if should_solo_commit_now() {
+            let bh      = block.hash.clone();
+            let bheight = block.height;
+            tokio::task::spawn_blocking(move || bft_solo_commit(&bh, bheight)).await.ok();
+            touch_proposal_timestamp();
+            eprintln!("[BFT] FALLBACK solo commit for staged block #{}", block.height);
+            return;
+        }
+        let sig_data  = format!("proposal:{}:{}", block.hash, block.height);
+        let signature = {
+            use ed25519_dalek::{SigningKey, Signer};
+            hex::encode(SigningKey::from_bytes(&seed_32).sign(sig_data.as_bytes()).to_bytes())
+        };
+        let vrf_in2     = crate::bft_committee::vrf_input(&prev_hash, next_height, crate::bft_committee::VRF_ROLE_PROPOSER);
+        let vrf_ticket2 = crate::bft_committee::sign_vrf_ticket(&seed_32, &vrf_in2);
+        let proposal = P2PMessage::BlockProposal {
+            block:        block.clone(),
+            transactions: stamped,
+            proposer:     miner.clone(),
+            signature,
+            vrf_ticket:   hex::encode(&vrf_ticket2),
+        };
+        if let Ok(data) = serde_json::to_vec(&proposal) {
+            publish_gossip("ego-proposals-v1", data).await;
+        }
+        eprintln!("[BFT] FALLBACK re-broadcasting staged proposal for block #{}", next_height);
+        touch_proposal_timestamp();
+        return;
+    }
+
+    let is_solo = should_solo_commit_now();
     let pool = crate::mempool::get_mempool();
     let txs  = pool.drain_all();
 
@@ -7326,6 +7792,11 @@ pub async fn propose_block_as_leader_forced() {
         tokio::spawn(notify_post_rewards_claimed(post_proof_ids));
     }
 
+    {
+        let mut seen = std::collections::HashSet::new();
+        all_txs.retain(|tx| !tx.hash.is_empty() && seen.insert(tx.hash.clone()));
+    }
+
     let miner_c = miner.clone();
     let (block, stamped) = match tokio::task::spawn_blocking(move || {
         crate::chain_db::build_block_proposal(&all_txs, &miner_c, &combined_ticket, poc_slot)
@@ -7344,13 +7815,15 @@ pub async fn propose_block_as_leader_forced() {
         use ed25519_dalek::{SigningKey, Signer};
         hex::encode(SigningKey::from_bytes(&seed_32).sign(sig_data.as_bytes()).to_bytes())
     };
+    let vrf_in2       = crate::bft_committee::vrf_input(&prev_hash, next_height, crate::bft_committee::VRF_ROLE_PROPOSER);
+    let vrf_ticket2   = crate::bft_committee::sign_vrf_ticket(&seed_32, &vrf_in2);
 
     let proposal = P2PMessage::BlockProposal {
         block:        block.clone(),
         transactions: stamped.clone(),
         proposer:     miner.clone(),
         signature,
-        vrf_ticket:   String::new(),
+        vrf_ticket:   hex::encode(&vrf_ticket2),
     };
 
     if let Ok(data) = serde_json::to_vec(&proposal) {
@@ -7423,8 +7896,16 @@ pub async fn run_view_change_monitor() {
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut _tick_count: u64 = 0;
     loop {
         interval.tick().await;
+        _tick_count += 1;
+
+        evict_stale_validators(30);
+
+        if _tick_count % 10 == 0 {
+            eprintln!("[ViewMon] alive — tick #{} validators={}", _tick_count, known_validators().len());
+        }
 
         if known_validators().is_empty() { continue; }
 
@@ -7433,7 +7914,7 @@ pub async fn run_view_change_monitor() {
         if last == 0 || now - last < VIEW_CHANGE_TIMEOUT_SECS { continue; }
 
         let view_init = tokio::task::spawn_blocking(|| {
-            let chain_next = crate::chain_db::block_count() as u64 + 1;
+            let chain_next = crate::chain_db::latest_block_info().0 + 1;
             let my_addr    = crate::ledger::Ledger::load().address;
             if my_addr.is_empty() { return None; }
             let seed = get_ed25519_seed()?;
@@ -7457,11 +7938,22 @@ pub async fn run_view_change_monitor() {
                 {
                     let my_addr_local = my_addr.clone();
                     let mut validators = known_validators();
+                    let evicted: Vec<String> = validators
+                        .iter()
+                        .filter(|v| **v != my_addr_local && !participants.contains(*v))
+                        .cloned()
+                        .collect();
                     validators.retain(|v| v == &my_addr_local || participants.contains(v));
                     let remaining = validators.len();
+                    drop(validators);
+                    for evicted_addr in &evicted {
+                        record_eviction_cooldown(evicted_addr);
+                        validator_last_seen().remove(evicted_addr);
+                        validator_first_seen().remove(evicted_addr);
+                    }
                     eprintln!(
-                        "[HotStuff] ViewChange deadlock at view {} — evicted offline validators, {} active remain",
-                        next_view, remaining
+                        "[HotStuff] ViewChange deadlock at view {} — evicted {} offline validator(s) for {}s, {} active remain",
+                        next_view, evicted.len(), EVICTION_COOLDOWN_SECS, remaining
                     );
                     if remaining <= 1 {
                         SOLO_AFTER_EVICTION.store(true, Ordering::Relaxed);

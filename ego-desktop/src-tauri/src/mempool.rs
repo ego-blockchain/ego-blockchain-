@@ -45,7 +45,7 @@ pub const EMPTY_BLOCK_INTERVAL_S: u64 = 60;
 pub const MAX_MEMPOOL_SIZE: usize = 2_000_000;
 
 
-pub const MAX_TX_AGE_SECS: i64 = 300;
+pub const MAX_TX_AGE_SECS: i64 = 1800;
 
 pub const MIN_FEE_UEGOC: u64 = 1_000;
 
@@ -72,7 +72,7 @@ pub struct ShardedMempool {
 impl ShardedMempool {
     fn new() -> Arc<Self> {
         let shards = (0..SHARD_COUNT)
-            .map(|_| Mutex::new(Vec::with_capacity(BATCH_SIZE)))
+            .map(|_| Mutex::new(Vec::new()))
             .collect();
         let seen_hashes = (0..SHARD_COUNT)
             .map(|_| Mutex::new(std::collections::HashSet::new()))
@@ -112,70 +112,67 @@ impl ShardedMempool {
 
         if !is_pool_faucet {
             if let Err(reason) = crate::ledger::verify_incoming_tx(&tx) {
-                tracing::warn!("Mempool rejected {} - {}", tx.hash, reason);
+                eprintln!("[Mempool] REJECTED {:.12} — {}", tx.hash, reason);
                 return;
             }
         }
 
         if !is_system {
-            let current_height = crate::chain_db::latest_block_info().0;
-            let tx_shard = shard_for_address(&tx.from);
-            let my_addr = crate::ledger::Ledger::load().address;
-            let map = crate::sharding::load_shard_map();
-            let all_nodes: Vec<String> = map
-                .assignments
-                .iter()
-                .map(|a| a.node_address.clone())
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-            let my_shard_ids: Vec<u32> =
-                crate::sharding::my_shards(&my_addr, &map, &all_nodes)
-                    .into_iter()
-                    .map(|(id, _)| id)
-                    .collect();
-            let in_grace = crate::sharding::is_in_grace_period(current_height);
-            if !in_grace && !my_shard_ids.contains(&tx_shard) {
-                let shard_id = tx_shard;
-                let tx_clone = tx;
-                tokio::spawn(async move {
-                    crate::p2p::route_tx_to_shard_master(shard_id, tx_clone).await;
-                });
-                return;
+            let small_network = crate::p2p::known_validator_count() < 4;
+            if !small_network {
+                let current_height = crate::chain_db::latest_block_info().0;
+                let in_grace = crate::sharding::is_in_grace_period(current_height);
+                if !in_grace {
+                    let tx_shard = shard_for_address(&tx.from);
+                    let my_addr = crate::ledger::Ledger::load().address;
+                    let map = crate::sharding::load_shard_map();
+                    let all_nodes: Vec<String> = map
+                        .assignments
+                        .iter()
+                        .map(|a| a.node_address.clone())
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .collect();
+                    let my_shard_ids: Vec<u32> =
+                        crate::sharding::my_shards(&my_addr, &map, &all_nodes)
+                            .into_iter()
+                            .map(|(id, _)| id)
+                            .collect();
+                    if !my_shard_ids.contains(&tx_shard) {
+                        let shard_id = tx_shard;
+                        let tx_clone = tx;
+                        tokio::spawn(async move {
+                            crate::p2p::route_tx_to_shard_master(shard_id, tx_clone).await;
+                        });
+                        return;
+                    }
+                }
             }
         }
 
         if !is_system {
             if tx.fee_uegoc < MIN_FEE_UEGOC {
-                tracing::warn!(
-                    "Mempool rejected {} — fee {} uEGOC below floor {}",
-                    &tx.hash[..12.min(tx.hash.len())], tx.fee_uegoc, MIN_FEE_UEGOC
-                );
+                eprintln!("[Mempool] REJECTED {:.12} — fee {} uEGOC below floor {}",
+                    &tx.hash[..12.min(tx.hash.len())], tx.fee_uegoc, MIN_FEE_UEGOC);
                 return;
             }
             let current_base_fee = crate::chain_db::get_current_base_fee();
             if tx.fee_uegoc < current_base_fee {
-                tracing::warn!(
-                    "Mempool rejected {} — fee {} uEGOC below current base fee {}",
-                    &tx.hash[..12.min(tx.hash.len())], tx.fee_uegoc, current_base_fee
-                );
+                eprintln!("[Mempool] REJECTED {:.12} — fee {} uEGOC below base fee {}",
+                    &tx.hash[..12.min(tx.hash.len())], tx.fee_uegoc, current_base_fee);
                 return;
             }
 
             if tx.nonce > 0 {
                 let confirmed_nonce = crate::ledger::last_confirmed_nonce(&tx.from);
                 if tx.nonce <= confirmed_nonce {
-                    tracing::warn!(
-                        "Mempool rejected {} — replay nonce {} <= confirmed {}",
-                        &tx.hash[..12.min(tx.hash.len())], tx.nonce, confirmed_nonce
-                    );
+                    eprintln!("[Mempool] REJECTED {:.12} — replay nonce {} <= confirmed {}",
+                        &tx.hash[..12.min(tx.hash.len())], tx.nonce, confirmed_nonce);
                     return;
                 }
                 if tx.nonce > confirmed_nonce + 10 {
-                    tracing::warn!(
-                        "Mempool rejected {} — nonce {} too far ahead of confirmed {}",
-                        &tx.hash[..12.min(tx.hash.len())], tx.nonce, confirmed_nonce
-                    );
+                    eprintln!("[Mempool] REJECTED {:.12} — nonce {} too far ahead of confirmed {}",
+                        &tx.hash[..12.min(tx.hash.len())], tx.nonce, confirmed_nonce);
                     return;
                 }
             }
@@ -228,11 +225,9 @@ impl ShardedMempool {
                 .fold(0u64, |acc, v| acc.saturating_add(v));
             let required = tx.amount.saturating_add(tx.fee_uegoc).saturating_add(pending_outflow);
             if balance < required {
-                tracing::warn!(
-                    "Mempool rejected {} — insufficient balance: has {} uEGOC, needs {} (amount {} + fee {} + pending_outflow {})",
+                eprintln!("[Mempool] REJECTED {:.12} — insufficient balance: has {} uEGOC, needs {} (amount {} + fee {} + pending_outflow {})",
                     &tx.hash[..12.min(tx.hash.len())], balance, required,
-                    tx.amount, tx.fee_uegoc, pending_outflow
-                );
+                    tx.amount, tx.fee_uegoc, pending_outflow);
                 self.seen_hashes[shard].lock().expect("lock poisoned").remove(&tx.hash);
                 return;
             }
@@ -343,12 +338,13 @@ impl ShardedMempool {
                 }
                 
                 if !skipped.is_empty() {
+                    let count = skipped.len() as u64;
                     let mut s = self.shards[shard_id as usize].lock().expect("lock poisoned");
-                    for tx in skipped.into_iter().rev() {
-                        s.insert(0, tx);
-                        self.pending_total.fetch_add(1, Ordering::Relaxed);
-                        self.confirmed.fetch_sub(1, Ordering::Relaxed);
+                    for tx in skipped {
+                        s.push(tx);
                     }
+                    self.pending_total.fetch_add(count, Ordering::Relaxed);
+                    self.confirmed.fetch_sub(count, Ordering::Relaxed);
                 }
                 batch = kept;
             }
@@ -362,12 +358,13 @@ impl ShardedMempool {
                     }
                 }
                 {
+                    let count = overflow.len() as u64;
                     let mut s = self.shards[shard_id as usize].lock().expect("lock poisoned");
-                    for tx in overflow.into_iter().rev() {
-                        s.insert(0, tx);
-                        self.pending_total.fetch_add(1, Ordering::Relaxed);
-                        self.confirmed.fetch_sub(1, Ordering::Relaxed);
+                    for tx in overflow {
+                        s.push(tx);
                     }
+                    self.pending_total.fetch_add(count, Ordering::Relaxed);
+                    self.confirmed.fetch_sub(count, Ordering::Relaxed);
                 }
             }
             out.extend(batch);
@@ -427,6 +424,17 @@ impl ShardedMempool {
     pub fn any_shard_full(&self) -> bool {
         self.shards.iter()
             .any(|s| s.lock().expect("lock poisoned").len() >= BATCH_SIZE)
+    }
+
+    pub fn clear(&self) {
+        let mut total: u64 = 0;
+        for shard_idx in 0..SHARD_COUNT as usize {
+            let mut s = self.shards[shard_idx].lock().expect("lock poisoned");
+            total += s.len() as u64;
+            s.clear();
+            self.seen_hashes[shard_idx].lock().expect("lock poisoned").clear();
+        }
+        self.pending_total.fetch_sub(total, Ordering::Relaxed);
     }
 }
 

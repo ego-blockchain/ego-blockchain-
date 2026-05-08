@@ -52,6 +52,7 @@ interface LedgerTx {
   status: string;
   block_height?: number;
   nonce: number;
+  tx_type?: string;
 }
 
 interface SendForm {
@@ -266,15 +267,17 @@ const WalletPage: React.FC = () => {
 
   const [balance, setBalance]       = useState<Balance | null>(null);
   const [txs, setTxs]               = useState<LedgerTx[]>([]);
-  const [tab, setTab]               = useState<'all' | 'sent' | 'received'>('all');
+  const [tab, setTab]               = useState<'all' | 'sent' | 'received' | 'rewards'>('all');
   const [txPage, setTxPage]         = useState(1);
   const [txPageSize, setTxPageSize] = useState(20);
+  const [clearingPending, setClearingPending] = useState(false);
   const [selectedTx, setSelectedTx] = useState<LedgerTx | null>(null);
   const [showSend, setShowSend]     = useState(false);
   const [showReceive, setShowReceive] = useState(false);
   const [sendForm, setSendForm]     = useState<SendForm>({ to: '', amount: '', memo: '' });
   const [sending, setSending]       = useState(false);
-  const [txResult, setTxResult]     = useState<TxResult | null>(null);
+  const [txResult, setTxResult]         = useState<TxResult | null>(null);
+  const [txConfirmedHeight, setTxConfirmedHeight] = useState<number | null>(null);
   const [txFee, setTxFee]           = useState<{ fee_uegoc: number; fee_usd: number } | null>(null);
   const [copied, setCopied]         = useState(false);
 
@@ -284,15 +287,10 @@ const WalletPage: React.FC = () => {
   const [remoteLoading, setRemoteLoading]   = useState(false);
   const [remoteError, setRemoteError]       = useState('');
 
-  type EmailStep = 'idle' | 'review' | 'code_entry' | 'confirmed' | 'expired';
+  type EmailStep = 'idle' | 'review' | 'pin_entry' | 'code_entry' | 'confirmed' | 'expired';
   const [emailStep, setEmailStep]     = useState<EmailStep>('idle');
-  const [txId, setTxId]               = useState('');
-  const [maskedEmail, setMaskedEmail] = useState('');
-  const [codeInput, setCodeInput]     = useState('');
-  const [codeError, setCodeError]     = useState('');
-  const [codeLoading, setCodeLoading] = useState(false);
-  const [txOtp, setTxOtp]             = useState(['', '', '', '', '', '']);
-  const txOtpRefs = useRef<(HTMLInputElement | null)[]>([]);
+  const [pinInput, setPinInput]       = useState('');
+  const [pinError, setPinError]       = useState('');
 
   const [isLiveMode, setIsLiveMode]         = useState(false);
   const [mainnetAddress, setMainnetAddress] = useState('');
@@ -408,20 +406,36 @@ const WalletPage: React.FC = () => {
     return () => { unsub.then(fn => fn()); };
   }, [myAddress]);
 
-  // Poll balance/TX every 5s to prevent stale UI if event missed
   useEffect(() => {
-    const id = setInterval(load, 5000);
+    const unsub = listen('wallet-balance-updated', () => { load(); reloadWallet(); });
+    return () => { unsub.then(fn => fn()); };
+  }, []);
+
+  useEffect(() => {
+    const id = setInterval(load, 30000);
     return () => clearInterval(id);
   }, []);
 
+  const loadingRef = useRef(false);
+  const lastTxSigRef = useRef<string>('');
   async function load() {
+    if (loadingRef.current) return;
+    loadingRef.current = true;
     try {
       const bal = await invoke<Balance>('get_balance');
       const history = await invoke<LedgerTx[]>('get_transaction_history');
-      setBalance(bal);
-      setTxs(history);
+      setBalance(prev =>
+        prev && prev.uegoc === bal.uegoc && prev.uegusd === bal.uegusd ? prev : bal
+      );
+      const sig = `${history.length}|${history[0]?.hash ?? ''}|${history[0]?.status ?? ''}`;
+      if (sig !== lastTxSigRef.current) {
+        lastTxSigRef.current = sig;
+        setTxs(history);
+      }
     } catch (e) {
       console.error(e);
+    } finally {
+      loadingRef.current = false;
     }
   }
 
@@ -440,6 +454,38 @@ const WalletPage: React.FC = () => {
     }
   }
 
+  async function submitTxWithPin(password: string) {
+    if (!sendForm.to || !sendForm.amount) return;
+    const amount  = Math.floor(parseFloat(sendForm.amount) * 1_000_000);
+    const request = { to_address: sendForm.to, amount, memo: sendForm.memo || null };
+    try {
+      const res = await invoke<TxResult>('send_transaction_with_password', { request, password });
+      setTxResult(res);
+      setEmailStep('confirmed');
+      load().catch(() => {});
+      reloadWallet();
+    } catch (e: any) {
+      const msg = String(e).replace(/^.*Error:/, '').trim();
+      const lower = msg.toLowerCase();
+      if (lower.includes('pin required') || lower.includes('password required')) {
+        setEmailStep('pin_entry');
+        setPinInput('');
+        setPinError('');
+      } else if (lower.includes('pin not set') || lower.includes('password not set')) {
+        setTxResult({
+          hash: '', success: false,
+          message: 'Password not set. Open Settings → Security & Keys → Set Password before sending.',
+        });
+      } else if (lower.includes('incorrect pin') || lower.includes('incorrect password') || lower.includes('locked')) {
+        setEmailStep('pin_entry');
+        setPinError(msg);
+        setPinInput('');
+      } else {
+        setTxResult({ hash: '', success: false, message: msg });
+      }
+    }
+  }
+
   async function handleSend() {
     if (!sendForm.to || !sendForm.amount) return;
     if (sendForm.to.trim() === myAddress.trim()) {
@@ -448,37 +494,10 @@ const WalletPage: React.FC = () => {
     }
     setSending(true);
     try {
-      const amount  = Math.floor(parseFloat(sendForm.amount) * 1_000_000);
-      const request = { to_address: sendForm.to, amount, memo: sendForm.memo || null };
-
-      try {
-
-        const res = await invoke<{ tx_id: string; masked_email: string }>(
-          'request_tx_code', { request }
-        );
-        setTxId(res.tx_id);
-        setMaskedEmail(res.masked_email);
-        setCodeInput('');
-        setTxOtp(['', '', '', '', '', '']);
-        setCodeError('');
-        setEmailStep('code_entry');
-        setSending(false);
-      } catch (e: any) {
-        const msg = String(e);
-        if (msg.includes('No email on file')) {
-
-          const res = await invoke<TxResult>('send_transaction', { request });
-          setTxResult(res);
-          await load(); reloadWallet();
-        } else if (msg.toLowerCase().includes('too many')) {
-          setTxResult({
-            hash: '', success: false,
-            message: 'Too many code requests for this email. Please update your email address in Settings or try again in 1 hour.',
-          });
-        } else {
-          throw e;
-        }
-      }
+      // Try with empty PIN first — succeeds if the in-memory PIN cache (15 min)
+      // is still fresh from app unlock or a recent TX. Otherwise the backend
+      // returns "PIN required" and we route to the PIN entry step.
+      await submitTxWithPin('');
     } catch (e: any) {
       setTxResult({ hash: '', success: false, message: String(e) });
     } finally {
@@ -486,57 +505,41 @@ const WalletPage: React.FC = () => {
     }
   }
 
-  async function handleConfirmCode() {
-    if (!codeInput.trim()) return;
-    setCodeLoading(true);
-    setCodeError('');
+  async function handleSubmitPin() {
+    const pin = pinInput.trim();
+    if (!pin) {
+      setPinError('Enter your PIN.');
+      return;
+    }
+    setSending(true);
+    setPinError('');
     try {
-      const timeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject('Verification timed out. Please check your transaction history to see if it was sent.'), 30_000)
-      );
-      const res = await Promise.race([
-        invoke<TxResult>('confirm_tx_code', { txId: txId, code: codeInput.trim() }),
-        timeout,
-      ]);
-      setEmailStep('confirmed');
-      setTxResult(res);
-      load().catch(() => {});
-      reloadWallet();
-    } catch (e: any) {
-      const msg = String(e).replace(/^.*Error:/, '').trim();
-      if (msg.includes('cancelled')) {
-        setEmailStep('expired');
-        setCodeError(msg);
-      } else {
-        setCodeError(msg);
-      }
+      await submitTxWithPin(pin);
     } finally {
-      setCodeLoading(false);
+      setSending(false);
     }
   }
 
+
   function resetSend() {
     setShowSend(false);
+    setSending(false);
     setSendForm({ to: '', amount: '', memo: '' });
     setTxResult(null);
+    setTxConfirmedHeight(null);
     setEmailStep('idle');
-    setTxId('');
-    setMaskedEmail('');
-    setCodeInput('');
-    setTxOtp(['', '', '', '', '', '']);
-    setCodeError('');
+    setPinInput('');
+    setPinError('');
   }
 
-  function handleTxOtpInput(i: number, val: string) {
-    const v = val.replace(/[^0-9a-zA-Z]/g, '').slice(-1).toUpperCase();
-    const next = [...txOtp]; next[i] = v; setTxOtp(next);
-    setCodeInput(next.join('')); setCodeError('');
-    if (v && i < 5) txOtpRefs.current[i + 1]?.focus();
-  }
-
-  function handleTxOtpKeyDown(i: number, e: React.KeyboardEvent) {
-    if (e.key === 'Backspace' && !txOtp[i] && i > 0) txOtpRefs.current[i - 1]?.focus();
-    if (e.key === 'Enter' && txOtp.join('').length === 6) handleConfirmCode();
+  async function handleClearPending() {
+    setClearingPending(true);
+    try {
+      await invoke('clear_pending_transactions');
+      await load().catch(() => {});
+    } finally {
+      setClearingPending(false);
+    }
   }
 
   async function copyAddr() {
@@ -942,10 +945,16 @@ const WalletPage: React.FC = () => {
     if (showAddresses && extAddresses.length === 0) loadExternalAddresses();
   }, [showAddresses]);
 
+  const isRewardTx = (tx: LedgerTx) =>
+    tx.tx_type === 'reward' || tx.tx_type === 'coinbase' ||
+    tx.from.startsWith('egot1rewards') || tx.from.startsWith('egot1faucet') ||
+    tx.from.startsWith('egot1staking') || tx.from.startsWith('egot1coinbase');
+
   const filteredTxs = txs.filter(tx => {
-    if (tab === 'sent')     return tx.from === myAddress;
-    if (tab === 'received') return tx.to === myAddress;
-    return true;
+    if (tab === 'rewards')  return isRewardTx(tx);
+    if (tab === 'sent')     return tx.from === myAddress && !isRewardTx(tx);
+    if (tab === 'received') return tx.to === myAddress   && !isRewardTx(tx);
+    return !isRewardTx(tx);
   });
   const pagedTxs = filteredTxs.slice((txPage - 1) * txPageSize, txPage * txPageSize);
 
@@ -1330,32 +1339,52 @@ const WalletPage: React.FC = () => {
       <div className="bg-gray-800 rounded-2xl overflow-hidden border border-gray-700">
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-700">
           <h3 className="font-semibold">Transactions</h3>
-          <div className="flex gap-1">
-            {(['all', 'sent', 'received'] as const).map(t => (
+          <div className="flex items-center gap-2">
+            {txs.some(tx => tx.status === 'Pending') && (
               <button
-                key={t}
-                onClick={() => { setTab(t); setTxPage(1); }}
-                className={`px-3 py-1 rounded-lg text-xs capitalize transition ${
-                  tab === t ? 'bg-blue-600 text-white' : 'text-gray-400 hover:bg-gray-700'
-                }`}
+                onClick={handleClearPending}
+                disabled={clearingPending}
+                className="px-3 py-1 rounded-lg text-xs text-yellow-400 border border-yellow-500/30 hover:bg-yellow-500/10 disabled:opacity-40 transition"
               >
-                {t}
+                {clearingPending ? 'Clearing…' : 'Clear Pending'}
               </button>
-            ))}
+            )}
+            <div className="flex gap-1">
+              {(['all', 'sent', 'received', 'rewards'] as const).map(t => (
+                <button
+                  key={t}
+                  onClick={() => { setTab(t); setTxPage(1); }}
+                  className={`px-3 py-1 rounded-lg text-xs capitalize transition ${
+                    tab === t
+                      ? t === 'rewards' ? 'bg-yellow-500/20 text-yellow-300 border border-yellow-500/40' : 'bg-blue-600 text-white'
+                      : 'text-gray-400 hover:bg-gray-700'
+                  }`}
+                >
+                  {t === 'rewards' ? '⚡ Rewards' : t}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 
         {filteredTxs.length === 0 ? (
           <div className="py-12 text-center text-gray-500">
-            <div className="text-4xl mb-3">📋</div>
-            <div className="text-sm">No transactions yet</div>
-            <div className="text-xs mt-1 text-gray-600">Send your first transaction to get started</div>
+            <div className="text-4xl mb-3">{tab === 'rewards' ? '⚡' : '📋'}</div>
+            <div className="text-sm">{tab === 'rewards' ? 'No rewards yet' : 'No transactions yet'}</div>
+            <div className="text-xs mt-1 text-gray-600">
+              {tab === 'rewards' ? 'Mine a block to earn your first reward' : 'Send your first transaction to get started'}
+            </div>
           </div>
         ) : (
           <>
           <div className="divide-y divide-gray-700/50">
             {pagedTxs.map(tx => {
-              const isSent = tx.from === myAddress;
+              const isReward = isRewardTx(tx);
+              const isSent = !isReward && tx.from === myAddress;
+              const rewardLabel = tx.tx_type === 'coinbase' ? 'Block Reward'
+                : tx.from.startsWith('egot1staking') ? 'Staking Reward'
+                : tx.from.startsWith('egot1faucet') ? 'Faucet'
+                : 'Mining Reward';
               return (
                 <button
                   key={tx.hash}
@@ -1364,20 +1393,24 @@ const WalletPage: React.FC = () => {
                 >
                   <div className="flex items-center gap-3 min-w-0">
                     <div className={`w-10 h-10 rounded-xl flex items-center justify-center text-lg shrink-0 ${
-                      isSent ? 'bg-red-500/15' : 'bg-green-500/15'
+                      isReward ? 'bg-yellow-500/15' : isSent ? 'bg-red-500/15' : 'bg-green-500/15'
                     }`}>
-                      {isSent ? '↑' : '↓'}
+                      {isReward ? '⚡' : isSent ? '↑' : '↓'}
                     </div>
                     <div className="min-w-0">
-                      <div className="text-sm font-mono text-gray-300 truncate">{shortHash(tx.hash)}</div>
+                      <div className="text-sm font-mono text-gray-300 truncate">
+                        {isReward ? rewardLabel : shortHash(tx.hash)}
+                      </div>
                       <div className="text-xs text-gray-500">
-                        {isSent ? `To: ${shortAddr(tx.to)}` : `From: ${shortAddr(tx.from)}`}
+                        {isReward
+                          ? `Block #${tx.block_height ?? '—'}`
+                          : isSent ? `To: ${shortAddr(tx.to)}` : `From: ${shortAddr(tx.from)}`}
                         {tx.memo && <span className="ml-2 text-gray-600">• {tx.memo}</span>}
                       </div>
                     </div>
                   </div>
                   <div className="text-right shrink-0 ml-3">
-                    <div className={`text-sm font-semibold ${isSent ? 'text-red-400' : 'text-green-400'}`}>
+                    <div className={`text-sm font-semibold ${isReward ? 'text-yellow-400' : isSent ? 'text-red-400' : 'text-green-400'}`}>
                       {isSent ? '-' : '+'}{(tx.amount / 1_000_000).toFixed(2)} EGOC
                     </div>
                     <div className="flex items-center justify-end gap-1.5 mt-0.5">
@@ -2424,7 +2457,7 @@ const WalletPage: React.FC = () => {
                     Back
                   </button>
                   <button
-                    onClick={() => { setEmailStep('idle'); handleSend(); }}
+                    onClick={() => { handleSend(); }}
                     disabled={sending}
                     className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 py-3 rounded-xl font-semibold text-sm transition flex items-center justify-center gap-2"
                   >
@@ -2434,68 +2467,57 @@ const WalletPage: React.FC = () => {
                   </button>
                 </div>
               </div>
-            ) : emailStep === 'code_entry' ? (
+            ) : emailStep === 'pin_entry' ? (
               <div className="space-y-5">
                 <div className="flex justify-between items-center">
-                  <h3 className="text-lg font-bold">Confirm Transaction</h3>
+                  <h3 className="text-lg font-bold">Enter Your Password</h3>
                   <button onClick={resetSend} className="text-gray-400 hover:text-white text-xl">✕</button>
                 </div>
-                <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl p-4 text-sm text-center space-y-1">
-                  <div className="text-blue-300 font-semibold">Verification code sent</div>
-                  <div className="text-gray-400">
-                    Check <span className="text-white font-mono">{maskedEmail}</span> for your confirmation code.
-                  </div>
+                <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl p-4 text-xs text-blue-300 leading-relaxed">
+                  Enter your wallet password to authorize this transaction.
+                  After a successful entry you can send transactions for the next 15&nbsp;minutes without re-entering it.
                 </div>
                 <div>
-                  <label className="text-xs text-gray-400 block mb-2 text-center">Enter confirmation code</label>
-                  <div className="flex justify-center gap-2">
-                    {txOtp.map((char, i) => (
-                      <input
-                        key={i}
-                        ref={el => { txOtpRefs.current[i] = el; }}
-                        type="text"
-                        inputMode="text"
-                        maxLength={1}
-                        value={char}
-                        autoFocus={i === 0}
-                        onChange={e => handleTxOtpInput(i, e.target.value)}
-                        onKeyDown={e => handleTxOtpKeyDown(i, e)}
-                        className="w-11 h-14 text-center text-xl font-bold bg-gray-900 border-2 border-gray-700 focus:border-blue-500 rounded-xl outline-none transition text-white"
-                      />
-                    ))}
-                  </div>
-                  {codeError && <p className="text-red-400 text-xs mt-2 text-center">{codeError}</p>}
+                  <input
+                    type="password"
+                    autoFocus
+                    value={pinInput}
+                    onChange={e => setPinInput(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter' && !sending) handleSubmitPin(); }}
+                    placeholder="Password"
+                    className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 outline-none transition"
+                  />
+                  {pinError && (
+                    <div className="mt-2 text-xs text-red-400 text-center">{pinError}</div>
+                  )}
                 </div>
                 <div className="flex gap-3">
                   <button
-                    onClick={resetSend}
-                    className="flex-1 bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition"
+                    onClick={() => setEmailStep('review')}
+                    disabled={sending}
+                    className="flex-1 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
                   >
-                    Cancel
+                    Back
                   </button>
                   <button
-                    onClick={handleConfirmCode}
-                    disabled={codeInput.length !== 6 || codeLoading}
+                    onClick={handleSubmitPin}
+                    disabled={sending || !pinInput.trim()}
                     className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 py-3 rounded-xl font-semibold text-sm transition flex items-center justify-center gap-2"
                   >
-                    {codeLoading
-                      ? <><div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />Verifying…</>
-                      : 'Confirm Send'}
+                    {sending
+                      ? <><div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />Sending…</>
+                      : 'Confirm & Send'}
                   </button>
                 </div>
-              </div>
-            ) : emailStep === 'expired' ? (
-              <div className="text-center space-y-4">
-                <div className="text-5xl">⏰</div>
-                <div className="text-xl font-bold">Confirmation Expired</div>
-                <p className="text-sm text-gray-400">The confirmation link expired. Please try sending again.</p>
-                <button onClick={resetSend} className="w-full bg-blue-600 hover:bg-blue-500 py-3 rounded-xl font-semibold transition">Close</button>
+                <div className="text-center text-xs text-gray-500">
+                  Forgot your password? Open Settings → Security &amp; Keys → reset using your 24-word recovery phrase.
+                </div>
               </div>
             ) : txResult ? (
               <div className="text-center space-y-4">
-                <div className="text-5xl">{txResult.success ? '✅' : '❌'}</div>
+                <div className="text-5xl">{txResult.success ? (txConfirmedHeight != null ? '✅' : '⏳') : '❌'}</div>
                 <div className="text-xl font-bold">
-                  {txResult.success ? 'Transaction Sent!' : 'Transaction Failed'}
+                  {txResult.success ? (txConfirmedHeight != null ? 'Transaction Confirmed!' : 'Transaction Submitted') : 'Transaction Failed'}
                 </div>
                 <p className="text-sm text-gray-400">{txResult.message}</p>
                 {txResult.hash && (
@@ -2503,8 +2525,8 @@ const WalletPage: React.FC = () => {
                     <div className="text-xs text-gray-400 mb-1">Transaction Hash</div>
                     <div className="text-xs font-mono text-green-400 break-all">{txResult.hash}</div>
                     <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-gray-400">
-                      <div><span className="text-gray-500">Status</span><br /><span className="text-yellow-400">Pending</span></div>
-                      <div><span className="text-gray-500">Block</span><br /><span>#{txResult.block_height ?? 'pending'}</span></div>
+                      <div><span className="text-gray-500">Status</span><br />{txConfirmedHeight != null ? <span className="text-green-400">Confirmed</span> : <span className="text-yellow-400">Awaiting Block...</span>}</div>
+                      <div><span className="text-gray-500">Block</span><br /><span>#{txConfirmedHeight ?? txResult.block_height ?? '—'}</span></div>
                       <div><span className="text-gray-500">Fee</span><br /><span className="text-yellow-400">{txFee ? `${(txFee.fee_uegoc / 1_000_000).toFixed(4)} EGOC (~$${txFee.fee_usd.toFixed(2)})` : '—'}</span></div>
                       <div><span className="text-gray-500">Network</span><br />Ego Network</div>
                     </div>

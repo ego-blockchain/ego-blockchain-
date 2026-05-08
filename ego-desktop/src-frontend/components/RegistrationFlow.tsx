@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useState } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 
 interface Props {
@@ -6,107 +6,40 @@ interface Props {
   onComplete: () => void;
 }
 
-type Step = 'form' | 'otp' | 'recovery';
+type Step = 'form' | 'recovery';
 
 const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
   const [step, setStep]         = useState<Step>('form');
   const [name, setName]         = useState('');
-  const [email, setEmail]       = useState('');
-  const [otp, setOtp]           = useState(['', '', '', '', '', '']);
+  const [pwd, setPwd]           = useState('');
+  const [pwd2, setPwd2]         = useState('');
   const [loading, setLoading]   = useState(false);
   const [error, setError]       = useState('');
   const [recovery, setRecovery] = useState<string[]>([]);
   const [seedHex, setSeedHex]   = useState('');
   const [showSeed, setShowSeed] = useState(false);
   const [checked, setChecked]   = useState(false);
-  const otpRefs   = useRef<(HTMLInputElement | null)[]>([]);
-  const sendingRef = useRef(false);
 
-  async function handleSendOtp() {
-    if (sendingRef.current) return;
-    if (!name.trim() || !email.trim()) { setError('Please enter your name and email.'); return; }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { setError('Please enter a valid email address.'); return; }
-    sendingRef.current = true;
+  async function handleCreateAccount() {
+    if (!name.trim()) { setError('Please enter your name.'); return; }
+    if (pwd.length < 8) { setError('Password must be at least 8 characters.'); return; }
+    if (pwd !== pwd2)   { setError('Passwords do not match.'); return; }
+
     setLoading(true); setError('');
     try {
-      await invoke('send_verification_email', { email: email.trim(), name: name.trim() });
-      setStep('otp');
-    } catch (e) {
-      const msg = String(e);
-      if (msg.toLowerCase().includes('too many')) {
-        setError('Too many attempts for this email. Please use a different email address or try again in 1 hour.');
-      } else {
-        setError('Failed to send verification email: ' + msg);
-      }
-    } finally {
-      setLoading(false);
-      sendingRef.current = false;
-    }
-  }
+      await invoke('set_password', { password: pwd });
+      if (name.trim()) localStorage.setItem('ego-my-display-name', name.trim());
 
-  async function handleVerifyOtp() {
-    const code = otp.join('');
-    if (code.length !== 6) { setError('Please enter the full code (4 digits + 2 letters).'); return; }
-    setLoading(true); setError('');
-    try {
-      const ok = await invoke<boolean>('verify_email_code', { email: email.trim(), code });
-      if (!ok) { setError('Incorrect or expired code. Please try again.'); setLoading(false); return; }
-
-      await invoke('save_registration_info', { name: name.trim(), email: email.trim() });
-
-      await loadRecovery();
-    } catch (e) {
-      setError('Verification failed: ' + String(e));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function loadRecovery() {
-    try {
-      let info: { recovery_phrase: string[]; seed_hex: string };
-      try {
-        info = await invoke('get_recovery_info', { pin: '' });
-      } catch {
-        const pin = window.prompt('Enter your security PIN to view recovery phrase:') ?? '';
-        info = await invoke('get_recovery_info', { pin });
-      }
+      const info = await invoke<{ recovery_phrase: string[]; seed_hex: string }>(
+        'get_recovery_info', { pin: pwd }
+      );
       setRecovery(info.recovery_phrase);
       setSeedHex(info.seed_hex);
       setStep('recovery');
     } catch (e) {
-      setError('Could not load recovery phrase: ' + String(e));
-    }
-  }
-
-  function handleOtpInput(i: number, val: string) {
-
-    const v = val.replace(/[^0-9a-zA-Z]/g, '').slice(-1).toUpperCase();
-    const next = [...otp]; next[i] = v; setOtp(next);
-    if (v && i < 5) otpRefs.current[i + 1]?.focus();
-  }
-
-  function handleOtpKeyDown(i: number, e: React.KeyboardEvent) {
-    if (e.key === 'Backspace' && !otp[i] && i > 0) otpRefs.current[i - 1]?.focus();
-    if (e.key === 'Enter') handleVerifyOtp();
-  }
-
-  async function handleResend() {
-    if (sendingRef.current) return;
-    sendingRef.current = true;
-    setLoading(true); setError(''); setOtp(['', '', '', '', '', '']);
-    try {
-      await invoke('send_verification_email', { email: email.trim(), name: name.trim() });
-    } catch (e) {
-      const msg = String(e);
-      if (msg.toLowerCase().includes('too many')) {
-        setError('You have reached the 3-attempt limit. Please use a different email address or try again in 1 hour.');
-      } else {
-        setError('Failed to resend: ' + msg);
-      }
+      setError('Failed to create account: ' + String(e));
     } finally {
       setLoading(false);
-      sendingRef.current = false;
     }
   }
 
@@ -124,15 +57,16 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
         <div className="px-8 py-6 border-b border-gray-700 bg-gradient-to-br from-blue-900/40 to-purple-900/40">
           <img src="/ego_logo.png" alt="Ego" className="w-20 h-20 mx-auto mb-3 select-none rounded-full" draggable={false} />
           <h1 className="text-xl font-bold text-white text-center">Welcome to Ego Blockchain</h1>
-          <p className="text-sm text-gray-400 mt-1 text-center">Step 1 of 3 — Create Your Account</p>
+          <p className="text-sm text-gray-400 mt-1 text-center">Step 1 of 2 — Create Your Account</p>
         </div>
         <div className="px-8 py-6 space-y-5">
           <p className="text-sm text-gray-300 leading-relaxed">
-            Enter your name and email. We'll send a verification code to confirm your address.
+            Choose a display name and a password. Your password protects your private keys on this device
+            and confirms transactions. If you forget it, you can reset it using your 24-word recovery phrase.
           </p>
           <div className="space-y-3">
             <div>
-              <label className="text-xs text-gray-400 block mb-1.5">Full Name</label>
+              <label className="text-xs text-gray-400 block mb-1.5">Display Name</label>
               <input
                 type="text"
                 value={name}
@@ -142,96 +76,39 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
               />
             </div>
             <div>
-              <label className="text-xs text-gray-400 block mb-1.5">Email Address</label>
+              <label className="text-xs text-gray-400 block mb-1.5">Password</label>
               <input
-                type="email"
-                value={email}
-                onChange={e => setEmail(e.target.value)}
-                placeholder="e.g. john@example.com"
+                type="password"
+                value={pwd}
+                onChange={e => setPwd(e.target.value)}
+                placeholder="At least 8 characters"
                 className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition text-white"
-                onKeyDown={e => e.key === 'Enter' && !sendingRef.current && handleSendOtp()}
+              />
+            </div>
+            <div>
+              <label className="text-xs text-gray-400 block mb-1.5">Confirm Password</label>
+              <input
+                type="password"
+                value={pwd2}
+                onChange={e => setPwd2(e.target.value)}
+                placeholder="Re-enter the password"
+                className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition text-white"
+                onKeyDown={e => e.key === 'Enter' && !loading && handleCreateAccount()}
               />
             </div>
           </div>
           <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl px-4 py-3 text-xs text-blue-300">
-            📧 We use your email for verification and transaction confirmations only. We never share it.
+            🔒 Your password is hashed with Argon2id and stored only on this device. We never see it.
           </div>
           {error && <div className="bg-red-500/20 text-red-400 text-xs px-3 py-2 rounded-lg">{error}</div>}
           <button
-            onClick={handleSendOtp}
-            disabled={loading || !name || !email}
+            onClick={handleCreateAccount}
+            disabled={loading || !name || !pwd || !pwd2}
             className="w-full py-3 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 rounded-xl font-semibold text-sm transition"
           >
-            {loading ? 'Sending code…' : 'Send Verification Code →'}
+            {loading ? 'Creating account…' : 'Create Account →'}
           </button>
           <div className="font-mono text-xs text-gray-600 text-center break-all">{address}</div>
-        </div>
-      </div>
-    </div>
-  );
-
-  // ── Step: OTP entry ──────────────────────────────────────────────────────
-  if (step === 'otp') return (
-    <div className="min-h-screen bg-gray-900 flex items-center justify-center p-6">
-      <div className="w-full max-w-md bg-gray-800 rounded-2xl shadow-2xl overflow-hidden border border-gray-700">
-        <div className="px-8 py-6 border-b border-gray-700 bg-gradient-to-br from-blue-900/40 to-purple-900/40">
-          <div className="text-5xl text-center mb-3">📧</div>
-          <h1 className="text-xl font-bold text-white text-center">Check Your Email</h1>
-          <p className="text-sm text-gray-400 mt-1 text-center">Step 2 of 3 — Verify Email</p>
-        </div>
-        <div className="px-8 py-6 space-y-5">
-          <p className="text-sm text-gray-300 leading-relaxed">
-            We sent a confirmation code to <strong className="text-white">{email}</strong>.
-            Enter it below to continue.
-          </p>
-
-          {/* OTP boxes: any position can be digit or letter */}
-          <div className="flex justify-center gap-2">
-            {otp.map((char, i) => (
-              <input
-                key={i}
-                ref={el => { otpRefs.current[i] = el; }}
-                type="text"
-                inputMode="text"
-                maxLength={1}
-                value={char}
-                onChange={e => handleOtpInput(i, e.target.value)}
-                onKeyDown={e => handleOtpKeyDown(i, e)}
-                className="w-11 h-14 text-center text-xl font-bold bg-gray-900 border-2 border-gray-700 focus:border-blue-500 rounded-xl outline-none transition text-white"
-              />
-            ))}
-          </div>
-
-          <div className="text-xs text-gray-500 space-y-1">
-            <p>• Check your spam/junk folder if you don't see it</p>
-            <p>• The code expires in 10 minutes</p>
-          </div>
-
-          {error && <div className="bg-red-500/20 text-red-400 text-xs px-3 py-2 rounded-lg">{error}</div>}
-
-          <button
-            onClick={handleVerifyOtp}
-            disabled={loading || otp.join('').length !== 6}
-            className="w-full py-3 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 rounded-xl font-semibold text-sm transition"
-          >
-            {loading ? 'Verifying…' : 'Verify Code →'}
-          </button>
-
-          <div className="flex items-center justify-between text-xs">
-            <button
-              onClick={() => { setStep('form'); setError(''); setOtp(['','','','','','']); }}
-              className="text-gray-400 hover:text-white transition"
-            >
-              ← Change email
-            </button>
-            <button
-              onClick={handleResend}
-              disabled={loading}
-              className="text-blue-400 hover:text-blue-300 transition disabled:opacity-40"
-            >
-              Resend code
-            </button>
-          </div>
         </div>
       </div>
     </div>
@@ -243,12 +120,13 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
         <div className="px-8 py-6 border-b border-gray-700 bg-gradient-to-br from-red-900/40 to-orange-900/40">
           <div className="text-5xl text-center mb-3">🔑</div>
           <h1 className="text-xl font-bold text-white text-center">Your Recovery Phrase</h1>
-          <p className="text-sm text-gray-400 mt-1 text-center">Step 3 of 3 — Back Up Your Wallet</p>
+          <p className="text-sm text-gray-400 mt-1 text-center">Step 2 of 2 — Back Up Your Wallet</p>
         </div>
         <div className="px-8 py-6 space-y-5 max-h-[70vh] overflow-y-auto">
           <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 text-sm text-red-300">
             <strong>⚠️ Critical:</strong> Write these 24 words on paper and store them somewhere safe.
-            Anyone with these words can access your wallet. Never store them digitally or share them.
+            Anyone with these words can access your wallet — and they're also your only way to reset
+            your password if you forget it. Never store them digitally or share them.
           </div>
 
           <div>

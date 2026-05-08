@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+static LEDGER_IO_MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+fn ledger_io_mutex() -> &'static std::sync::Mutex<()> {
+    LEDGER_IO_MUTEX.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 pub fn base_data_dir() -> PathBuf {
     let dir = if let Ok(v) = std::env::var("EGO_DATA_DIR") {
         PathBuf::from(v)
@@ -665,16 +670,56 @@ pub struct PresaleIouRecord {
 
 impl Ledger {
     pub fn load() -> Self {
+        let _guard = ledger_io_mutex().lock().unwrap_or_else(|e| e.into_inner());
         let path = ledger_path();
-        if let Ok(data) = fs::read_to_string(&path) {
-            if let Ok(ledger) = serde_json::from_str::<Self>(&data) {
-                return ledger;
+        if !path.exists() {
+            return Self::default();
+        }
+        for attempt in 0..5 {
+            match fs::read_to_string(&path) {
+                Ok(data) => {
+                    if data.is_empty() {
+                        if attempt < 4 {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            continue;
+                        }
+                        return Self::default();
+                    }
+                    match serde_json::from_str::<Self>(&data) {
+                        Ok(ledger) => return ledger,
+                        Err(e) => {
+                            if attempt < 4 {
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                                continue;
+                            }
+                            eprintln!("[Ledger] WARN: load failed after retries ({}); refusing to overwrite with defaults", e);
+                            return Self::default();
+                        }
+                    }
+                }
+                Err(e) => {
+                    if attempt < 4 {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        continue;
+                    }
+                    eprintln!("[Ledger] WARN: read failed after retries ({}); refusing to overwrite with defaults", e);
+                    return Self::default();
+                }
             }
         }
         Self::default()
     }
 
     pub fn save(&self) -> Result<(), String> {
+        let _guard = ledger_io_mutex().lock().unwrap_or_else(|e| e.into_inner());
+        if self.address.is_empty() && self.registered_email.is_empty()
+            && self.transactions.is_empty() && self.blocks.is_empty()
+        {
+            if ledger_path().exists() {
+                eprintln!("[Ledger] BLOCKED save of empty/default Ledger over existing file — race protection");
+                return Ok(());
+            }
+        }
         let data = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         crate::utils::atomic_write(&ledger_path(), data.as_bytes()).map_err(|e| e.to_string())
     }
@@ -687,7 +732,9 @@ impl Ledger {
             .unwrap_or_else(|| GENESIS_HASH.into());
 
         let height = self.blocks.len() as u64;
-        let timestamp = chrono::Utc::now().timestamp();
+        let timestamp = self.blocks.last()
+            .map(|b| b.timestamp + 1)
+            .unwrap_or(GENESIS_TS);
 
         let block_data = format!("{prev_hash}{tx_hash}{height}{timestamp}");
         let hash = ego_core::hash_data(block_data.as_bytes()).to_hex();
@@ -812,7 +859,9 @@ impl SharedChain {
             .unwrap_or_else(|| GENESIS_HASH.into());
 
         let height = self.blocks.len() as u64;
-        let timestamp = chrono::Utc::now().timestamp();
+        let timestamp = self.blocks.last()
+            .map(|b| b.timestamp + 1)
+            .unwrap_or(GENESIS_TS);
 
         let block_data = format!("{prev_hash}{tx_hash}{height}{timestamp}");
         let hash = ego_core::hash_data(block_data.as_bytes()).to_hex();
@@ -850,7 +899,9 @@ impl SharedChain {
             .map(|b| b.hash.clone())
             .unwrap_or_else(|| GENESIS_HASH.into());
         let height    = self.blocks.len() as u64;
-        let timestamp = chrono::Utc::now().timestamp();
+        let timestamp = self.blocks.last()
+            .map(|b| b.timestamp + 1)
+            .unwrap_or(GENESIS_TS);
 
         let tx_root: String = txs.iter().map(|t| t.hash.as_str()).collect::<Vec<_>>().join(":");
         let block_data = format!("{prev_hash}:{tx_root}:{height}:{timestamp}");
@@ -985,6 +1036,12 @@ pub fn record_confirmed_nonce(address: &str, nonce: u64) {
 /// Returns the highest confirmed nonce for an address (0 = never sent).
 pub fn last_confirmed_nonce(address: &str) -> u64 {
     *nonce_store().get(address).unwrap_or(&0)
+}
+
+/// Unconditionally set the confirmed nonce for an address to `nonce`.
+/// Unlike `record_confirmed_nonce`, this can lower the value — used by reorg rollback.
+pub fn set_confirmed_nonce(address: &str, nonce: u64) {
+    nonce_store().insert(address.to_string(), nonce);
 }
 
 // ── Validator stake tracker ────────────────────────────────────────────────────

@@ -34,6 +34,15 @@ pub fn get_peer_score(addr: &str) -> u64 {
 
 pub const MAX_COVERAGE_SCORE: u64 = 3_220; // 2000 storage + 720 uptime + 500 relay
 
+pub fn seed_peer_score_from_stake(addr: &str) {
+    if addr.is_empty() || get_peer_score(addr) > 0 { return; }
+    let stake = crate::ledger::get_validator_stake(addr);
+    if stake == 0 { return; }
+    let per_10_egoc = stake / (crate::tokenomics::UEGOC_PER_EGOC * 10);
+    let base = per_10_egoc.min(100).max(1);
+    record_peer_score(addr, base);
+}
+
 pub fn record_peer_score(address: &str, score: u64) {
     if address.is_empty() || score == 0 { return; }
     let capped = score.min(MAX_COVERAGE_SCORE);

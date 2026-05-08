@@ -78,6 +78,40 @@ pub async fn get_pin_status(_state: tauri::State<'_, crate::app::AppState>) -> R
     let ledger = Ledger::load();
     Ok(PinStatus { has_pin: !ledger.security_pin_hash.is_empty() })
 }
+
+#[tauri::command]
+pub async fn get_password_status() -> Result<PinStatus, String> {
+    let ledger = Ledger::load();
+    Ok(PinStatus { has_pin: !ledger.security_pin_hash.is_empty() })
+}
+
+#[tauri::command]
+pub async fn set_password(password: String) -> Result<(), EgoDesktopError> {
+    let pwd = normalize_pin(&password)?;
+    let pwd_hash = hash_pin_argon2(&pwd)?;
+    let mut ledger = Ledger::load();
+    ledger.security_pin_hash = pwd_hash;
+    ledger.security_pin_salt.clear();
+    ledger.save().map_err(EgoDesktopError::WalletError)
+}
+
+#[tauri::command]
+pub async fn verify_password(password: String) -> Result<bool, EgoDesktopError> {
+    verify_pin(password).await
+}
+
+#[tauri::command]
+pub async fn reset_password_with_recovery_phrase(
+    recovery_phrase: Vec<String>,
+    new_password: String,
+) -> Result<(), EgoDesktopError> {
+    reset_pin_with_recovery_phrase(recovery_phrase, new_password).await
+}
+
+#[tauri::command]
+pub fn password_cache_status() -> Result<serde_json::Value, EgoDesktopError> {
+    pin_cache_status()
+}
 // ── Platform-specific biometric helpers ──────────────────────────────────────
 
 #[cfg(target_os = "windows")]
@@ -723,58 +757,24 @@ pub async fn rename_wallet(
 
 // ── generate_keypair (legacy) ─────────────────────────────────────────────────
 
-/// Credit 1,000 EGOC testnet faucet to a new address if it has no balance yet.
-/// Writes directly to chain_db (SQLite) — save_chain() is a no-op.
 fn credit_testnet_faucet(address: &str) {
-    const FAUCET_AMOUNT: u64 = 1_000 * 1_000_000;
-
-    if crate::chain_db::balance_of(address) > 0 { return; }
-
-    let ts = chrono::Utc::now().timestamp();
-
-    static FAUCET_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let mut nonce = FAUCET_NONCE.load(std::sync::atomic::Ordering::Relaxed);
-    if nonce == 0 {
-        nonce = crate::ledger::last_confirmed_nonce(crate::chain_db::NODE_POOL_ADDR) + 1;
+    const FAUCET_UEGOC: u64 = 1_000 * 1_000_000;
+    let granted = crate::chain_db::grant_testnet_faucet(address, FAUCET_UEGOC);
+    if granted {
+        let addr = address.to_string();
+        // Rebroadcast multiple times so peers that connect AFTER this node started
+        // also receive the grant. Without this, a peer joining 20+ seconds after
+        // launch would never see our faucet credit and would reject our outgoing
+        // transactions as "insufficient balance".
+        tauri::async_runtime::spawn(async move {
+            for delay_secs in [0u64, 5, 15, 30, 60, 120] {
+                if delay_secs > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                }
+                crate::p2p::broadcast_faucet_grant(addr.clone(), FAUCET_UEGOC).await;
+            }
+        });
     }
-    FAUCET_NONCE.store(nonce + 1, std::sync::atomic::Ordering::Relaxed);
-
-    let sign_bytes = crate::ledger::tx_signing_bytes_v2(
-        crate::chain_db::NODE_POOL_ADDR,
-        address,
-        FAUCET_AMOUNT,
-        nonce,
-        ts,
-        1,
-        "1000 EGOC testnet"
-    );
-
-    let hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-
-    let tx = LedgerTx {
-        hash:      hash.clone(),
-        from:      crate::chain_db::NODE_POOL_ADDR.into(),
-        to:        address.into(),
-        amount:    FAUCET_AMOUNT,
-        fee_uegoc: 0,
-        tx_type:   "faucet".into(),
-        memo:      Some("1000 EGOC testnet".into()),
-        timestamp: ts,
-        status:    "Pending".into(),
-        nonce,
-        signature: "coinbase".into(),
-        tx_version: 2,
-        chain_id: 1,
-        ..LedgerTx::default()
-    };
-
-    crate::mempool::get_mempool().push(tx.clone());
-
-    let address_owned = address.to_string();
-    tauri::async_runtime::spawn(async move {
-        crate::p2p::broadcast_pending_tx(tx).await;
-        eprintln!("[Faucet] Broadcast pending faucet TX for {} — will confirm in next consensus block", address_owned);
-    });
 }
 
 #[tauri::command]
@@ -842,14 +842,14 @@ pub async fn import_keypair(
 
 fn normalize_pin(pin: &str) -> Result<String, EgoDesktopError> {
     let pin = pin.trim().to_string();
-    if pin.len() < 4 {
+    if pin.len() < 8 {
         return Err(EgoDesktopError::InvalidInput(
-            "PIN must be at least 4 characters (excluding leading/trailing spaces)".into(),
+            "Password must be at least 8 characters.".into(),
         ));
     }
     if pin.len() > 128 {
         return Err(EgoDesktopError::InvalidInput(
-            "PIN must be at most 128 characters".into(),
+            "Password must be at most 128 characters.".into(),
         ));
     }
     Ok(pin)
@@ -877,7 +877,9 @@ fn now_ts() -> i64 {
 fn enforce_pin_lockout_for(address: &str) -> Result<(), EgoDesktopError> {
     let now = now_ts();
     let mut map = pin_attempts_map();
-    let entry = map.entry(address.to_string()).or_insert((0, 0));
+    let entry = map.entry(address.to_string()).or_insert_with(|| {
+        crate::chain_db::load_pin_lockout(address)
+    });
     if entry.0 >= MAX_PIN_ATTEMPTS {
         if now < entry.1 {
             return Err(EgoDesktopError::PermissionDenied(format!(
@@ -888,12 +890,13 @@ fn enforce_pin_lockout_for(address: &str) -> Result<(), EgoDesktopError> {
         } else {
             entry.0 = 0;
             entry.1 = 0;
+            crate::chain_db::clear_pin_lockout(address);
         }
     }
-    // Pre-emptively record attempt to prevent race conditions on concurrent requests
     entry.0 += 1;
     if entry.0 >= MAX_PIN_ATTEMPTS {
         entry.1 = now + LOCKOUT_DURATION_SECS;
+        crate::chain_db::persist_pin_lockout(address, entry.0, entry.1);
     }
     Ok(())
 }
@@ -925,6 +928,7 @@ fn record_failed_pin() -> EgoDesktopError {
 fn record_successful_pin_for(address: &str) {
     let mut map = pin_attempts_map();
     map.remove(address);
+    crate::chain_db::clear_pin_lockout(address);
 }
 
 fn record_successful_pin() {
@@ -950,6 +954,71 @@ fn legacy_pin_hash(pin: &str, salt_hex: &str) -> String {
     let mut input = salt;
     input.extend_from_slice(pin.as_bytes());
     ego_core::hash_data(&input).to_hex()
+}
+
+// ── TX-confirm PIN cache (in-memory, per-process) ────────────────────────────
+// After a successful PIN check (TX confirm OR app-unlock verify_pin), record
+// the timestamp. Subsequent TX confirms within the cache window can pass an
+// empty PIN and skip re-entry. Cache is cleared on app close (in-memory only).
+const PIN_CACHE_SECS: i64 = 15 * 60;
+static PIN_CACHE_TS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub(crate) fn pin_cache_is_fresh() -> bool {
+    let ts = PIN_CACHE_TS.load(std::sync::atomic::Ordering::Relaxed);
+    ts > 0 && (now_ts() - ts) < PIN_CACHE_SECS
+}
+
+pub(crate) fn pin_cache_seconds_remaining() -> i64 {
+    let ts = PIN_CACHE_TS.load(std::sync::atomic::Ordering::Relaxed);
+    if ts <= 0 { return 0; }
+    let elapsed = now_ts() - ts;
+    if elapsed >= PIN_CACHE_SECS { 0 } else { PIN_CACHE_SECS - elapsed }
+}
+
+pub(crate) fn refresh_pin_cache() {
+    PIN_CACHE_TS.store(now_ts(), std::sync::atomic::Ordering::Relaxed);
+}
+
+#[tauri::command]
+pub fn pin_cache_status() -> Result<serde_json::Value, EgoDesktopError> {
+    Ok(serde_json::json!({
+        "fresh":             pin_cache_is_fresh(),
+        "seconds_remaining": pin_cache_seconds_remaining(),
+        "cache_window_secs": PIN_CACHE_SECS,
+    }))
+}
+
+/// Quickly verify the user-supplied PIN against the local ledger,
+/// applying the standard lockout. Returns Ok(()) on a valid PIN,
+/// errors on missing/incorrect PIN, and respects the existing
+/// brute-force lockout window. Used by transaction signing flows.
+///
+/// Empty PIN is accepted only if the in-memory PIN cache is still
+/// fresh (a successful PIN was entered within the last 15 minutes).
+pub(crate) fn check_pin_for_tx(pin: &str) -> Result<(), EgoDesktopError> {
+    if pin.is_empty() {
+        if pin_cache_is_fresh() {
+            return Ok(());
+        }
+        return Err(EgoDesktopError::InvalidInput("PIN required".into()));
+    }
+
+    let mut ledger = Ledger::load();
+    let address = ledger.address.clone();
+    enforce_pin_lockout_for(&address)?;
+
+    if ledger.security_pin_hash.is_empty() {
+        return Err(EgoDesktopError::InvalidInput(
+            "PIN not set. Open Settings → Security & Keys → Set PIN before sending.".into(),
+        ));
+    }
+    if !pin_matches(&ledger, pin) {
+        return Err(record_failed_pin_for(&address));
+    }
+    upgrade_legacy_pin_hash_if_needed(&mut ledger, pin)?;
+    record_successful_pin_for(&address);
+    refresh_pin_cache();
+    Ok(())
 }
 
 fn pin_matches(ledger: &Ledger, pin: &str) -> bool {
@@ -1017,7 +1086,76 @@ pub async fn verify_pin(pin: String) -> Result<bool, EgoDesktopError> {
 
     record_successful_pin_for(&address);
     upgrade_legacy_pin_hash_if_needed(&mut ledger, &pin_val)?;
+    refresh_pin_cache();
     Ok(true)
+}
+
+// ── reset_pin_with_recovery_phrase ───────────────────────────────────────────
+// Allows the user to set a fresh PIN by proving ownership of the wallet
+// via the 24-word recovery phrase derived from the on-disk seed. No email
+// dependency — purely local cryptographic proof.
+#[tauri::command]
+pub async fn reset_pin_with_recovery_phrase(
+    recovery_phrase: Vec<String>,
+    new_pin: String,
+) -> Result<(), EgoDesktopError> {
+    let new_pin = normalize_pin(&new_pin)?;
+
+    tokio::task::spawn_blocking(move || -> Result<(), EgoDesktopError> {
+        let provided: Vec<String> = recovery_phrase
+            .iter()
+            .map(|w| w.trim().to_lowercase())
+            .filter(|w| !w.is_empty())
+            .collect();
+        if provided.len() != 24 {
+            return Err(EgoDesktopError::InvalidInput(
+                "Recovery phrase must be exactly 24 words.".into(),
+            ));
+        }
+
+        // Derive the expected phrase from the on-disk seed. No side effects.
+        let seed = match crate::ledger::load_seed() {
+            Ok(Some(s)) => s,
+            _ => return Err(EgoDesktopError::WalletError(
+                "No seed on disk; cannot verify recovery phrase.".into(),
+            )),
+        };
+        let wordlist = get_bip39_wordlist();
+        let checksum_byte = ego_core::hash_data(&seed).as_bytes()[0];
+        let mut buf = [0u8; 33];
+        buf[..32].copy_from_slice(&seed);
+        buf[32] = checksum_byte;
+        let mut expected = Vec::with_capacity(24);
+        for i in 0..24 {
+            let bit_offset = i * 11;
+            let byte_idx   = bit_offset / 8;
+            let bit_shift  = bit_offset % 8;
+            let b0 = buf[byte_idx] as u32;
+            let b1 = if byte_idx + 1 < 33 { buf[byte_idx + 1] as u32 } else { 0 };
+            let b2 = if byte_idx + 2 < 33 { buf[byte_idx + 2] as u32 } else { 0 };
+            let raw   = (b0 << 16) | (b1 << 8) | b2;
+            let index = (((raw >> (13 - bit_shift)) & 0x7FF) as usize) % wordlist.len();
+            expected.push(wordlist[index].to_string().to_lowercase());
+        }
+
+        if provided != expected {
+            return Err(EgoDesktopError::InvalidInput(
+                "Recovery phrase does not match this wallet.".into(),
+            ));
+        }
+
+        let new_hash = hash_pin_argon2(&new_pin)?;
+        let mut ledger = Ledger::load();
+        ledger.security_pin_hash = new_hash;
+        ledger.security_pin_salt.clear();
+        ledger.save().map_err(EgoDesktopError::WalletError)?;
+        let addr = ledger.address.clone();
+        record_successful_pin_for(&addr);
+        refresh_pin_cache();
+        Ok(())
+    })
+    .await
+    .map_err(|e| EgoDesktopError::WalletError(format!("PIN reset task: {e}")))?
 }
 
 // ── get_recovery_info ─────────────────────────────────────────────────────────
@@ -1723,12 +1861,16 @@ pub async fn send_verification_email(email: String, name: String) -> Result<(), 
     }
     crate::email::check_send_limit(email.trim())?;
     let code = crate::email::gen_otp_code();
-    crate::email::store_otp(&email, &code);
-    let result = crate::email::send_otp_email(email.trim(), name.trim(), &code).await;
-    if result.is_ok() {
-        crate::email::record_send_attempt(email.trim());
-    }
-    result
+    let email_trimmed = email.trim().to_string();
+    let name_trimmed  = name.trim().to_string();
+    crate::email::store_otp(&email_trimmed, &code);
+    crate::email::record_send_attempt(&email_trimmed);
+    tokio::spawn(async move {
+        if let Err(e) = crate::email::send_otp_email(&email_trimmed, &name_trimmed, &code).await {
+            eprintln!("[Email] OTP send failed for {}: {}", &email_trimmed, e);
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]

@@ -2489,6 +2489,7 @@ dependencies = [
  "blst",
  "bs58",
  "chrono",
+ "curve25519-dalek",
  "directories",
  "dirs",
  "ed25519-dalek",

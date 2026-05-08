@@ -11,7 +11,13 @@ use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Key, Nonce};
 use crate::ledger::PresaleIouRecord;
 
 static PENDING_TXS: Lazy<Mutex<HashMap<String, (LedgerTx, i64)>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+    Lazy::new(|| {
+        let map: HashMap<String, (LedgerTx, i64)> = crate::chain_db::load_pending_otptxs()
+            .into_iter()
+            .map(|(id, tx, exp)| (id, (tx, exp)))
+            .collect();
+        Mutex::new(map)
+    });
 
 /// Validate an Ego bech32 address.
 ///
@@ -158,7 +164,8 @@ pub async fn send_transaction(
         )));
     }
 
-    let nonce      = ledger.nonce + 1;
+    let confirmed_nonce = crate::ledger::last_confirmed_nonce(&from);
+    let nonce      = (ledger.nonce.max(confirmed_nonce) + 1).min(confirmed_nonce + 9);
     let ts         = chrono::Utc::now().timestamp();
     let memo_str   = request.memo.as_deref().unwrap_or("");
     const CHAIN_ID: u8 = 1; // testnet
@@ -251,6 +258,31 @@ pub async fn send_transaction(
     })
 }
 
+#[tauri::command]
+pub async fn send_transaction_with_pin(
+    request: SendTransactionRequest,
+    pin: String,
+    state: State<'_, AppState>,
+) -> Result<TransactionResponse, EgoDesktopError> {
+    let pin_trimmed = pin.trim().to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::commands::auth::check_pin_for_tx(&pin_trimmed)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::WalletError(format!("PIN check task: {e}")))??;
+
+    send_transaction(request, state).await
+}
+
+#[tauri::command]
+pub async fn send_transaction_with_password(
+    request: SendTransactionRequest,
+    password: String,
+    state: State<'_, AppState>,
+) -> Result<TransactionResponse, EgoDesktopError> {
+    send_transaction_with_pin(request, password, state).await
+}
+
 #[derive(Debug, Serialize)]
 pub struct PreparedTransaction {
     pub tx_json:    String,
@@ -290,7 +322,8 @@ pub async fn prepare_transaction(
             "Insufficient balance: have {} uEGOC, need {}", balance, request.amount
         )));
     }
-    let nonce      = ledger.nonce + 1;
+    let confirmed_nonce_legacy = crate::ledger::last_confirmed_nonce(&from);
+    let nonce      = (ledger.nonce.max(confirmed_nonce_legacy) + 1).min(confirmed_nonce_legacy + 9);
     let ts         = chrono::Utc::now().timestamp();
     let sign_bytes = tx_signing_bytes(&from, &request.to_address, request.amount, nonce, ts);
     let (signature_hex, pubkey_hex, dil_sig_hex, dil_pubkey_hex) = if let Some(kp) = state.get_keypair() {
@@ -452,6 +485,9 @@ pub async fn get_transaction_history(
         let confirmed_hashes: std::collections::HashSet<String> =
             txs.iter().map(|t| t.hash.clone()).collect();
 
+        let mut pending_hashes: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         let pending: Vec<LedgerTx> = crate::mempool::get_mempool()
             .peek_all()
             .into_iter()
@@ -459,9 +495,20 @@ pub async fn get_transaction_history(
                 !confirmed_hashes.contains(&tx.hash)
                 && tx.from.trim() == my_addr.trim()
             })
+            .inspect(|tx| { pending_hashes.insert(tx.hash.clone()); })
             .collect();
-
         txs.extend(pending);
+
+        let from_file: Vec<LedgerTx> = crate::commands::tx_pending::get_all()
+            .into_iter()
+            .filter(|tx| {
+                !confirmed_hashes.contains(&tx.hash)
+                && !pending_hashes.contains(&tx.hash)
+                && tx.from.trim() == my_addr.trim()
+            })
+            .map(|mut tx| { tx.status = "Pending".into(); tx })
+            .collect();
+        txs.extend(from_file);
         txs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         txs.truncate(500);
         Ok(txs)
@@ -632,6 +679,20 @@ pub fn get_tx_fee(tx_type: Option<String>) -> TxFeeInfo {
 }
 
 #[tauri::command]
+pub fn clear_pending_transactions() {
+    crate::commands::tx_pending::clear();
+    crate::mempool::get_mempool().clear();
+    // Also purge Pending-status entries from the legacy JSON ledger so
+    // they stop appearing in the transaction list after a chain reset.
+    let mut chain = crate::ledger::load_chain();
+    let before = chain.transactions.len();
+    chain.transactions.retain(|tx| tx.status != "Pending");
+    if chain.transactions.len() != before {
+        let _ = crate::ledger::save_chain(&chain);
+    }
+}
+
+#[tauri::command]
 pub fn get_account_email() -> String {
     let email = Ledger::load().registered_email;
     if email.is_empty() { return String::new(); }
@@ -657,179 +718,242 @@ pub async fn request_tx_code(
     request: SendTransactionRequest,
     state: State<'_, AppState>,
 ) -> Result<TxCodeRequest, EgoDesktopError> {
-    let ledger  = Ledger::load();
-    let from    = ledger.address.clone();
-    let email   = ledger.registered_email.clone();
-
-    if from.is_empty() {
-        return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
-    }
     validate_ego_address(&request.to_address)?;
-    if request.to_address.trim() == from.trim() {
-        return Err(EgoDesktopError::InvalidInput("Cannot send to your own address".into()));
-    }
     if let Some(ref memo) = request.memo {
         if memo.len() > 256 {
             return Err(EgoDesktopError::InvalidInput("Memo too long (max 256 chars)".into()));
         }
     }
-    if email.is_empty() {
-        return Err(EgoDesktopError::InvalidInput(
-            "No email on file. Set an email in Settings to use 2FA.".into(),
-        ));
-    }
 
-    let chain   = load_chain();
-    let balance = chain.balance_of(&from);
-    if request.amount == 0 {
-        return Err(EgoDesktopError::InvalidInput("Amount must be > 0".into()));
-    }
-    let is_staker2   = ledger.staked_amount > 0;
-    let fee          = crate::tokenomics::fee_for_tx_with_staking("transfer", is_staker2);
-    let total_needed = request.amount.saturating_add(fee);
-    if total_needed > balance {
-        return Err(EgoDesktopError::InvalidInput(format!(
-            "Insufficient balance: have {} uEGOC, need {} (amount {} + fee {})",
-            balance, total_needed, request.amount, fee
-        )));
-    }
-
-    let nonce      = ledger.nonce + 1;
-    let ts         = chrono::Utc::now().timestamp();
-    let sign_bytes = tx_signing_bytes(&from, &request.to_address, request.amount, nonce, ts);
-
-    let (sig_hex, pk_hex, dil_sig_hex, dil_pk_hex) = if let Some(kp) = state.get_keypair() {
-        let ed_sig  = kp.sign_ed25519(&sign_bytes);
-        let dil_sig = kp.sign_dilithium(&sign_bytes);
-        (
-            hex::encode(ed_sig.as_bytes()),
-            hex::encode(kp.ed25519_public_key().as_bytes()),
-            hex::encode(&dil_sig.signature_data),
-            hex::encode(&kp.dilithium_public_key().key_data),
-        )
-    } else {
-        return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
+    let kp = match state.get_keypair() {
+        Some(k) => k,
+        None    => return Err(EgoDesktopError::WalletError("Wallet not initialized".into())),
     };
 
-    let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-    let tx = LedgerTx {
-        hash:                tx_hash.clone(),
-        from:                from.clone(),
-        to:                  request.to_address.clone(),
-        amount:              request.amount,
-        memo:                request.memo.clone(),
-        timestamp:           ts,
-        signature:           sig_hex,
-        status:              "Pending".into(),
-        block_height:        None,
-        nonce,
-        public_key_ed25519:  pk_hex,
-        dilithium_pubkey:    dil_pk_hex,
-        dilithium_signature: dil_sig_hex,
-        fee_uegoc:           fee,
-        ..LedgerTx::default()
-    };
+    let to_address = request.to_address.clone();
+    let amount     = request.amount;
+    let memo_opt   = request.memo.clone();
 
-    crate::email::check_send_limit(&email)
-        .map_err(|e| EgoDesktopError::InvalidInput(e))?;
+    let (tx_id, masked_email, email_bg, code_bg, amount_bg, recipient_bg) =
+        tokio::task::spawn_blocking(move || -> Result<(String, String, String, String, String, String), EgoDesktopError> {
+            const CHAIN_ID_2FA: u8 = 1;
 
-    let code  = crate::email::gen_otp_code();
-    let tx_id = tx_hash.clone();
-    let expiry = ts + 600;
+            let ledger = Ledger::load();
+            let from   = ledger.address.clone();
+            let email  = ledger.registered_email.clone();
 
-    crate::email::store_otp(&format!("tx:{}", tx_id), &code);
-    {
-        let mut map = PENDING_TXS.lock().unwrap();
-        map.retain(|_, (_, exp)| *exp > ts); // prune expired
-        if map.len() >= MAX_PENDING_TXS {
-            return Err(EgoDesktopError::InvalidInput(
-                "Too many pending transactions. Please wait and try again.".into(),
-            ));
+            if from.is_empty() {
+                return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
+            }
+            if to_address.trim() == from.trim() {
+                return Err(EgoDesktopError::InvalidInput("Cannot send to your own address".into()));
+            }
+            if email.is_empty() {
+                return Err(EgoDesktopError::InvalidInput(
+                    "No email on file. Set an email in Settings to use 2FA.".into(),
+                ));
+            }
+            if amount == 0 {
+                return Err(EgoDesktopError::InvalidInput("Amount must be > 0".into()));
+            }
+
+            let balance      = crate::chain_db::balance_of(&from);
+            let is_staker    = ledger.staked_amount > 0;
+            let fee          = crate::tokenomics::fee_for_tx_with_staking("transfer", is_staker);
+            let total_needed = amount.saturating_add(fee);
+            if total_needed > balance {
+                return Err(EgoDesktopError::InvalidInput(format!(
+                    "Insufficient balance: have {} uEGOC, need {} (amount {} + fee {})",
+                    balance, total_needed, amount, fee
+                )));
+            }
+
+            let confirmed_nonce = crate::ledger::last_confirmed_nonce(&from);
+            let ts = chrono::Utc::now().timestamp();
+            let pending_max_nonce: u64 = {
+                let map = PENDING_TXS.lock().unwrap_or_else(|e| e.into_inner());
+                map.values()
+                    .filter(|(pending_tx, exp)| pending_tx.from == from && *exp > ts)
+                    .map(|(pending_tx, _)| pending_tx.nonce)
+                    .max()
+                    .unwrap_or(0)
+            };
+            let memo_str = memo_opt.as_deref().unwrap_or("");
+            let nonce = (ledger.nonce.max(confirmed_nonce).max(pending_max_nonce) + 1)
+                .min(confirmed_nonce + 9);
+            if pending_max_nonce > 0 && nonce <= pending_max_nonce {
+                return Err(EgoDesktopError::InvalidInput(
+                    "Too many pending transactions. Please wait for some to confirm first.".into(),
+                ));
+            }
+            let sign_bytes = tx_signing_bytes_v2(
+                &from, &to_address, amount, nonce, ts, CHAIN_ID_2FA, memo_str,
+            );
+
+            let hrp = if CHAIN_ID_2FA == 1 { "egot" } else { "ego" };
+            let ed_sig      = kp.sign_ed25519(&sign_bytes);
+            let dil_sig     = kp.sign_dilithium(&sign_bytes);
+            let sig_hex     = hex::encode(ed_sig.as_bytes());
+            let pk_hex      = hex::encode(kp.ed25519_public_key().as_bytes());
+            let dil_sig_raw = hex::encode(&dil_sig.signature_data);
+            let dil_pk_raw  = hex::encode(&kp.dilithium_public_key().key_data);
+
+            let dil_bytes    = hex::decode(&dil_pk_raw).unwrap_or_default();
+            let dil_expected = ego_core::EgoAddress::from_dilithium_pk(
+                &dil_bytes, CHAIN_ID_2FA as u32, ego_core::AddressType::EOA,
+            ).to_bech32(hrp).unwrap_or_default();
+            let (dil_pk_hex, dil_sig_hex) = if dil_expected == from {
+                (dil_pk_raw, dil_sig_raw)
+            } else {
+                (String::new(), String::new())
+            };
+
+            let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+            let tx = LedgerTx {
+                hash:                tx_hash.clone(),
+                from:                from.clone(),
+                to:                  to_address.clone(),
+                amount,
+                memo:                memo_opt.clone(),
+                timestamp:           ts,
+                signature:           sig_hex,
+                status:              "Pending".into(),
+                block_height:        None,
+                nonce,
+                public_key_ed25519:  pk_hex,
+                dilithium_pubkey:    dil_pk_hex,
+                dilithium_signature: dil_sig_hex,
+                fee_uegoc:           fee,
+                tx_version:          2,
+                chain_id:            CHAIN_ID_2FA,
+                ..LedgerTx::default()
+            };
+
+            crate::email::check_send_limit(&email).map_err(EgoDesktopError::InvalidInput)?;
+
+            let code   = crate::email::gen_otp_code();
+            let tx_id  = tx_hash.clone();
+            let expiry = ts + 600;
+
+            crate::email::store_otp(&format!("tx:{}", tx_id), &code);
+            {
+                let mut map = PENDING_TXS.lock().unwrap_or_else(|e| e.into_inner());
+                map.retain(|_, (_, exp)| *exp > ts);
+                if map.len() >= MAX_PENDING_TXS {
+                    return Err(EgoDesktopError::InvalidInput(
+                        "Too many pending transactions. Please wait and try again.".into(),
+                    ));
+                }
+                crate::chain_db::persist_pending_otptx(&tx_id, &tx, expiry);
+                map.insert(tx_id.clone(), (tx, expiry));
+            }
+            crate::email::record_send_attempt(&email);
+
+            let masked = if let Some(at) = email.find('@') {
+                let local  = &email[..at];
+                let domain = &email[at..];
+                if local.len() > 3 {
+                    format!("{}***{}", &local[..2], domain)
+                } else {
+                    format!("{}***{}", &local[..1], domain)
+                }
+            } else {
+                "***".to_string()
+            };
+
+            let amount_str = format!("{:.6} EGOC", amount as f64 / 1_000_000.0);
+            Ok((tx_id, masked, email, code, amount_str, to_address))
+        }).await.map_err(|e| EgoDesktopError::WalletError(format!("TX code task: {e}")))??;
+
+    tokio::spawn(async move {
+        if let Err(e) = crate::email::send_tx_code_email(&email_bg, &code_bg, &amount_bg, &recipient_bg).await {
+            eprintln!("[Email] TX code send failed for {}: {}", &email_bg, e);
         }
-        map.insert(tx_id.clone(), (tx.clone(), expiry));
-    }
+    });
 
-    let amount_str = format!("{:.6} EGOC", request.amount as f64 / 1_000_000.0);
-    crate::email::send_tx_code_email(&email, &code, &amount_str, &request.to_address)
-        .await
-        .map_err(|e| EgoDesktopError::NetworkError(format!("Failed to send code: {e}")))?;
-
-    crate::email::record_send_attempt(&email);
-
-    let masked = if let Some(at) = email.find('@') {
-        let local = &email[..at];
-        let domain = &email[at..];
-        if local.len() > 3 {
-            format!("{}***{}", &local[..2], domain)
-        } else {
-            format!("{}***{}", &local[..1], domain)
-        }
-    } else {
-        "***".to_string()
-    };
-
-    Ok(TxCodeRequest { tx_id, masked_email: masked })
+    Ok(TxCodeRequest { tx_id, masked_email })
 }
 
 #[tauri::command]
 pub async fn confirm_tx_code(
-    tx_id:  String,
-    code:   String,
+    tx_id: String,
+    code:  String,
 ) -> Result<TransactionResponse, EgoDesktopError> {
+    let code_trimmed = code.trim().to_string();
 
-    let valid = crate::email::verify_otp(&format!("tx:{}", tx_id), code.trim());
-    if !valid {
-        let now_ts = chrono::Utc::now().timestamp();
-        let attempts = {
-            let mut map = TX_ATTEMPTS.lock().unwrap();
-            // Purge expired attempt records to keep map bounded.
-            map.retain(|_, (_, exp)| *exp > now_ts);
-            let entry = map.entry(tx_id.clone()).or_insert((0, now_ts + 3_600));
-            entry.0 += 1;
-            entry.0
-        };
-        if attempts >= 3 {
-            PENDING_TXS.lock().unwrap().remove(&tx_id);
-            TX_ATTEMPTS.lock().unwrap().remove(&tx_id);
-            return Err(EgoDesktopError::InvalidInput(
-                "Too many failed attempts. Transaction has been cancelled.".into(),
-            ));
-        }
-        return Err(EgoDesktopError::InvalidInput(
-            format!("Incorrect code. {} attempt{} remaining.",
+    let tx_id_for_block = tx_id.clone();
+    let tx = tokio::task::spawn_blocking(move || -> Result<LedgerTx, EgoDesktopError> {
+        let valid = crate::email::verify_otp(&format!("tx:{}", tx_id_for_block), &code_trimmed);
+        if !valid {
+            let now_ts = chrono::Utc::now().timestamp();
+            let attempts = {
+                let mut map = TX_ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner());
+                map.retain(|_, (_, exp)| *exp > now_ts);
+                let entry = map.entry(tx_id_for_block.clone()).or_insert((0, now_ts + 3_600));
+                entry.0 += 1;
+                entry.0
+            };
+            if attempts >= 3 {
+                PENDING_TXS.lock().unwrap_or_else(|e| e.into_inner()).remove(&tx_id_for_block);
+                crate::chain_db::remove_pending_otptx(&tx_id_for_block);
+                TX_ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner()).remove(&tx_id_for_block);
+                return Err(EgoDesktopError::InvalidInput(
+                    "Too many failed attempts. Transaction has been cancelled.".into(),
+                ));
+            }
+            return Err(EgoDesktopError::InvalidInput(format!(
+                "Incorrect code. {} attempt{} remaining.",
                 3 - attempts,
                 if 3 - attempts == 1 { "" } else { "s" }
-            ),
-        ));
-    }
-
-    TX_ATTEMPTS.lock().unwrap().remove(&tx_id);
-    let email = crate::ledger::Ledger::load().registered_email;
-    if !email.is_empty() { crate::email::reset_send_attempts(&email); }
-
-    let tx = {
-        let mut map = PENDING_TXS.lock().unwrap();
-        let now = chrono::Utc::now().timestamp();
-        match map.remove(&tx_id) {
-            Some((tx, exp)) if exp > now => tx,
-            Some(_) => return Err(EgoDesktopError::InvalidInput(
-                "Transaction request expired. Please start over.".into(),
-            )),
-            None => return Err(EgoDesktopError::InvalidInput(
-                "Transaction not found. It may have already been submitted or expired.".into(),
-            )),
+            )));
         }
-    };
 
-    let mut ledger = Ledger::load();
-    if tx.nonce > ledger.nonce {
-        ledger.nonce = tx.nonce;
-        let _ = ledger.save();
-    }
+        TX_ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner()).remove(&tx_id_for_block);
+        let email = Ledger::load().registered_email;
+        if !email.is_empty() { crate::email::reset_send_attempts(&email); }
 
+        let tx = {
+            let mut map = PENDING_TXS.lock().unwrap_or_else(|e| e.into_inner());
+            let now = chrono::Utc::now().timestamp();
+            match map.remove(&tx_id_for_block) {
+                Some((tx, exp)) if exp > now => {
+                    crate::chain_db::remove_pending_otptx(&tx_id_for_block);
+                    tx
+                }
+                Some(_) => {
+                    crate::chain_db::remove_pending_otptx(&tx_id_for_block);
+                    return Err(EgoDesktopError::InvalidInput(
+                        "Transaction request expired. Please start over.".into(),
+                    ));
+                }
+                None => return Err(EgoDesktopError::InvalidInput(
+                    "Transaction not found. It may have already been submitted or expired.".into(),
+                )),
+            }
+        };
+
+        let mut ledger = Ledger::load();
+        if tx.nonce > ledger.nonce {
+            ledger.nonce = tx.nonce;
+            let _ = ledger.save();
+        }
+
+        Ok(tx)
+    }).await.map_err(|e| EgoDesktopError::WalletError(format!("TX confirm task: {e}")))??;
+
+    let tx_hash = tx.hash.clone();
+    let to_addr = tx.to.clone();
+    let amount  = tx.amount;
+    let from_addr = tx.from.clone();
+
+    let bal_before = crate::chain_db::balance_of(&from_addr);
+    eprintln!("[TX] confirm_tx_code: pushing {:.12} to mempool — addr={:.16} bal_before={} nonce={}",
+        tx.hash, from_addr, bal_before, tx.nonce);
     crate::mempool::get_mempool().push(tx.clone());
+    eprintln!("[TX] confirm_tx_code: mempool push done — {:.12}", tx.hash);
+    crate::commands::tx_pending::add(&tx);
 
-    let to_email = ledger.registered_email.clone();
+    let to_email = Ledger::load().registered_email;
     if !to_email.is_empty() {
         let amount_str = format!("{:.6} EGOC", tx.amount as f64 / 1_000_000.0);
         crate::email::send_tx_confirmation_when_mined(
@@ -837,10 +961,15 @@ pub async fn confirm_tx_code(
         );
     }
 
+    let tx_broadcast = tx.clone();
+    tauri::async_runtime::spawn(async move {
+        crate::p2p::broadcast_pending_tx(tx_broadcast).await;
+    });
+
     Ok(TransactionResponse {
-        hash:           tx.hash,
+        hash:           tx_hash,
         success:        true,
-        message:        "Transaction confirmed and queued".into(),
+        message:        format!("Transaction to {} for {:.6} EGOC queued", &to_addr[..12.min(to_addr.len())], amount as f64 / 1_000_000.0),
         block_height:   None,
         signed_summary: None,
     })

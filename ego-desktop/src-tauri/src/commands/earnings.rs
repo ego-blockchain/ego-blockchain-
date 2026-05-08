@@ -79,7 +79,12 @@ pub async fn get_earnings_data(
         let historical: u64 = tokio::task::spawn_blocking(move || {
             crate::chain_db::get_tx_history_for_addr(&address)
                 .into_iter()
-                .filter(|tx| tx.from.starts_with("egot1rewards") && tx.status == "Confirmed")
+                .filter(|tx| {
+                    (tx.from == crate::chain_db::NODE_POOL_ADDR
+                        || tx.from.starts_with("egot1rewards"))
+                        && tx.status == "Confirmed"
+                        && (tx.tx_type == "reward" || tx.tx_type == "coinbase")
+                })
                 .map(|tx| tx.amount)
                 .sum::<u64>()
         })
@@ -108,7 +113,7 @@ pub async fn get_earnings_data(
             if !already_exists {
                 crate::mempool::get_mempool().push(LedgerTx {
                     hash:                reward_hash,
-                    from:                "egot1rewards00000000000000000000000000000000000".into(),
+                    from:                crate::chain_db::NODE_POOL_ADDR.into(),
                     to:                  ledger.address.clone(),
                     amount:              credit,
                     memo:                Some("Block & storage rewards".into()),

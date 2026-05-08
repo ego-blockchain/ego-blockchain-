@@ -59,21 +59,19 @@ static OTP_STORE: Lazy<Mutex<HashMap<String, (String, i64)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 pub fn gen_otp_code() -> String {
+    use rand::seq::SliceRandom;
     use rand::Rng;
+    const LETTERS: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ";
     let mut rng = rand::thread_rng();
-
-    let pos1 = rng.gen_range(0usize..6);
-    let pos2 = loop {
-        let p = rng.gen_range(0usize..6);
-        if p != pos1 { break p; }
-    };
-
-    let mut chars = ['0'; 6];
-    for (i, c) in chars.iter_mut().enumerate() {
-        if i == pos1 || i == pos2 {
-            *c = (b'A' + rng.gen_range(0u8..26)) as char;
+    let mut chars: [char; 6] = ['0'; 6];
+    let mut positions: [usize; 6] = [0, 1, 2, 3, 4, 5];
+    positions.shuffle(&mut rng);
+    let letter_pos = [positions[0], positions[1]];
+    for i in 0..6 {
+        if letter_pos.contains(&i) {
+            chars[i] = LETTERS[rng.gen_range(0..LETTERS.len())] as char;
         } else {
-            *c = (b'0' + rng.gen_range(0u8..10)) as char;
+            chars[i] = (b'0' + rng.gen_range(0u8..10)) as char;
         }
     }
     chars.iter().collect()
@@ -86,11 +84,11 @@ pub fn store_otp(email: &str, code: &str) {
 }
 
 pub fn verify_otp(email: &str, code: &str) -> bool {
-    let mut map = OTP_STORE.lock().unwrap();
+    let mut map = OTP_STORE.lock().unwrap_or_else(|e| e.into_inner());
     let key = email.to_lowercase();
     if let Some((stored_code, expiry)) = map.get(&key) {
         let now = chrono::Utc::now().timestamp();
-        if now <= *expiry && stored_code == code {
+        if now <= *expiry && stored_code.to_uppercase() == code.to_uppercase() {
             map.remove(&key);
             return true;
         }
@@ -181,7 +179,13 @@ async fn send_smtp(to: &str, subject: &str, html: &str) -> Result<(), String> {
         .authentication(vec![Mechanism::Login, Mechanism::Plain])
         .build();
 
-    mailer.send(email).await.map_err(|e| format!("SMTP send error: {e}"))?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        mailer.send(email),
+    )
+    .await
+    .map_err(|_| "SMTP timeout after 15s".to_string())?
+    .map_err(|e| format!("SMTP send error: {e}"))?;
     Ok(())
 }
 
