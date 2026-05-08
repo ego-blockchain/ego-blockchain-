@@ -1,6 +1,7 @@
 {
     "recommendations": [
         "openai.chatgpt",
-        "google.geminicodeassist"
+        "google.geminicodeassist",
+        "anthropic.claude-code"
     ]
 }

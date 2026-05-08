@@ -75,8 +75,33 @@ pub struct ChainState {
 const MAX_BLOCKS: usize       = 50_000;
 const MAX_TRANSACTIONS: usize = 500_000;
 
+/// Fill in any missing block fields with defaults so /chain/blocks returns
+/// the full LedgerBlock schema regardless of when the block was pushed.
+/// This prevents desktop clients from rejecting blocks with "hash mismatch"
+/// because old/incomplete payloads were missing tx_merkle_root/poc_ticket/
+/// state_root/etc. — which are part of the v2/v3 hash.
+fn normalize_block_schema(block: &mut Value) {
+    let obj = match block.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+    if !obj.contains_key("coinbase_tx")    { obj.insert("coinbase_tx".into(),    Value::Null); }
+    if !obj.contains_key("vote_count")     { obj.insert("vote_count".into(),     json!(0u32)); }
+    if !obj.contains_key("tx_merkle_root") { obj.insert("tx_merkle_root".into(), json!("")); }
+    if !obj.contains_key("poc_ticket")     { obj.insert("poc_ticket".into(),     json!("")); }
+    if !obj.contains_key("poc_slot")       { obj.insert("poc_slot".into(),       json!(0u64)); }
+    if !obj.contains_key("state_root")     { obj.insert("state_root".into(),     json!("")); }
+    if !obj.contains_key("base_fee_uegoc") { obj.insert("base_fee_uegoc".into(), json!(0u64)); }
+    if !obj.contains_key("agg_bls_sig")    { obj.insert("agg_bls_sig".into(),    json!("")); }
+    if !obj.contains_key("bls_pubkeys")    { obj.insert("bls_pubkeys".into(),    json!([])); }
+    if !obj.contains_key("tx_count")       { obj.insert("tx_count".into(),       json!(0u32)); }
+    if !obj.contains_key("size_bytes")     { obj.insert("size_bytes".into(),     json!(0u64)); }
+    if !obj.contains_key("reward")         { obj.insert("reward".into(),         json!(0u64)); }
+}
+
 impl ChainState {
-    fn merge_block(&mut self, block: Value) {
+    fn merge_block(&mut self, mut block: Value) {
+        normalize_block_schema(&mut block);
         let height   = block["height"].as_u64().unwrap_or(0);
         let new_hash = block["hash"].as_str().unwrap_or("").to_string();
 
@@ -121,6 +146,9 @@ impl ChainState {
 
     fn sorted_blocks(&self) -> Vec<Value> {
         let mut v = self.blocks.clone();
+        for block in v.iter_mut() {
+            normalize_block_schema(block);
+        }
         v.sort_by(|a, b| {
             b["height"].as_u64().unwrap_or(0).cmp(&a["height"].as_u64().unwrap_or(0))
         });
@@ -143,17 +171,19 @@ fn chain_data_path() -> std::path::PathBuf {
 }
 
 fn genesis_chain_state() -> ChainState {
+    let mut g = json!({
+        "height":    0,
+        "hash":      GENESIS_HASH,
+        "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "miner":     GENESIS_MINER,
+        "timestamp": GENESIS_TS,
+        "tx_count":  0,
+        "size_bytes": 0,
+        "reward":    0,
+    });
+    normalize_block_schema(&mut g);
     ChainState {
-        blocks: vec![json!({
-            "height":    0,
-            "hash":      GENESIS_HASH,
-            "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
-            "miner":     GENESIS_MINER,
-            "timestamp": GENESIS_TS,
-            "tx_count":  0,
-            "size_bytes": 0,
-            "reward":    0,
-        })],
+        blocks: vec![g],
         transactions: vec![],
     }
 }
@@ -165,6 +195,11 @@ fn load_chain() -> ChainState {
             if !state.blocks.iter().any(|b| b["height"].as_u64() == Some(0)) {
                 let mut g = genesis_chain_state();
                 state.blocks.push(g.blocks.remove(0));
+            }
+            // Normalize any blocks that were persisted with an older/stripped
+            // schema so consumers always see the full LedgerBlock shape.
+            for block in state.blocks.iter_mut() {
+                normalize_block_schema(block);
             }
             info!("Loaded chain state from disk: {} blocks, {} txs", state.blocks.len(), state.transactions.len());
             return state;
