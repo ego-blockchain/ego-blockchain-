@@ -1,13 +1,10 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { open as openUrl } from '@tauri-apps/api/shell';
-import { fetch as tauriFetch, Body } from '@tauri-apps/api/http';
 import { save as saveDialog, open as openDialog } from '@tauri-apps/api/dialog';
 import { writeBinaryFile, readBinaryFile } from '@tauri-apps/api/fs';
 import { useWallet } from '../App';
 import qrcode from 'qrcode-generator';
-
-import { RELAY_HTTP as RELAY } from '../config';
 
 function makeQR(text: string): string {
   if (!text) return '';
@@ -35,26 +32,19 @@ const SettingsPage: React.FC = () => {
 
   const [hasPin, setHasPin]                   = useState(false);
   const [showSetPin, setShowSetPin]           = useState(false);
+
+  const [showResetPassword, setShowResetPassword] = useState(false);
+  const [resetPhraseWords, setResetPhraseWords]   = useState<string[]>(Array(24).fill(''));
+  const [resetNewPwd, setResetNewPwd]             = useState('');
+  const [resetNewPwd2, setResetNewPwd2]           = useState('');
+  const [resetPwdError, setResetPwdError]         = useState('');
+  const [resetPwdBusy, setResetPwdBusy]           = useState(false);
   const [pinInput, setPinInput]               = useState('');
   const [pinConfirm, setPinConfirm]           = useState('');
   const [pinMsg, setPinMsg]                   = useState('');
   const [settingPin, setSettingPin]           = useState(false);
   const [biometricLoading, setBiometricLoading] = useState(false);
 
-  const [resetSent, setResetSent]             = useState(false);
-  const [resetLoading, setResetLoading]       = useState(false);
-  const [resetMsg, setResetMsg]               = useState('');
-  const [maskedEmail, setMaskedEmail]         = useState('');
-
-  const [showChangeEmail, setShowChangeEmail] = useState(false);
-  const [emailStep, setEmailStep]             = useState<'send_code' | 'enter_code' | 'new_email' | 'done'>('send_code');
-  const [emailCode, setEmailCode]             = useState('');
-  const [emailVerifyToken, setEmailVerifyToken] = useState('');
-  const [newEmail, setNewEmail]               = useState('');
-  const [changeEmailMsg, setChangeEmailMsg]   = useState('');
-  const [sendingEmailCode, setSendingEmailCode] = useState(false);
-  const [verifyingCode, setVerifyingCode]     = useState(false);
-  const [changingEmail, setChangingEmail]     = useState(false);
 
   const [showRecovery, setShowRecovery]       = useState(false);
   const [recoveryPin, setRecoveryPin]         = useState('');
@@ -72,37 +62,10 @@ const SettingsPage: React.FC = () => {
 
   useEffect(() => {
     console.log('[Settings] wallet address:', wallet?.address);
-    invoke<{ has_pin: boolean }>('get_pin_status')
-      .then(s => { console.log('[Settings] pin status:', s); setHasPin(s.has_pin); })
-      .catch((e) => console.error('[Settings] pin status error:', e));
-    invoke<string>('get_account_email')
-      .then(e => { if (e) setMaskedEmail(e); })
-      .catch(() => {});
+    invoke<{ has_pin: boolean }>('get_password_status')
+      .then(s => { console.log('[Settings] password status:', s); setHasPin(s.has_pin); })
+      .catch((e) => console.error('[Settings] password status error:', e));
   }, [wallet?.address]);
-
-useEffect(() => {
-  if (!resetSent || !wallet?.address) return;
-  const interval = setInterval(async () => {
-    try {
-      const res = await tauriFetch<{ confirmed: boolean; new_pin?: string }>(
-        `${RELAY}/users/pin-reset-status/${wallet.address}`
-      );
-      if (res.data.confirmed && res.data.new_pin) {
-        clearInterval(interval);
-
-        await invoke('set_security_pin', { pin: res.data.new_pin });
-        setHasPin(true);
-        setResetSent(false);
-        setResetMsg('');
-        setShowSetPin(false);
-
-        setPinMsg('✅ PIN updated successfully from email!');
-        setTimeout(() => setPinMsg(''), 3000);
-      }
-    } catch {}
-  }, 3000);
-  return () => clearInterval(interval);
-}, [resetSent, wallet?.address]);
 
   const Toggle: React.FC<{ value: boolean; onChange: (v: boolean) => void }> = ({ value, onChange }) => (
     <button
@@ -114,18 +77,53 @@ useEffect(() => {
   );
 
   async function handleSetPin() {
-    if (pinInput.length < 4) { setPinMsg('PIN must be at least 4 characters.'); return; }
-    if (pinInput !== pinConfirm) { setPinMsg('PINs do not match.'); return; }
+    if (pinInput.length < 8) { setPinMsg('Password must be at least 8 characters.'); return; }
+    if (pinInput !== pinConfirm) { setPinMsg('Passwords do not match.'); return; }
     setSettingPin(true); setPinMsg('');
     try {
-      await invoke('set_security_pin', { pin: pinInput });
+      await invoke('set_password', { password: pinInput });
       setHasPin(true);
-      setPinMsg('PIN set successfully!');
+      setPinMsg('Password set successfully!');
       setTimeout(() => {
         setShowSetPin(false); setPinInput(''); setPinConfirm(''); setPinMsg('');
       }, 1500);
     } catch (e: any) { setPinMsg('Error: ' + String(e)); }
     finally { setSettingPin(false); }
+  }
+
+  async function handleResetPasswordWithRecovery() {
+    setResetPwdError('');
+    const phrase = resetPhraseWords.map(w => w.trim().toLowerCase()).filter(Boolean);
+    if (phrase.length !== 24) {
+      setResetPwdError('Enter all 24 recovery words.');
+      return;
+    }
+    if (resetNewPwd.length < 8) {
+      setResetPwdError('New password must be at least 8 characters.');
+      return;
+    }
+    if (resetNewPwd !== resetNewPwd2) {
+      setResetPwdError('Passwords do not match.');
+      return;
+    }
+    setResetPwdBusy(true);
+    try {
+      await invoke('reset_password_with_recovery_phrase', {
+        recoveryPhrase: phrase,
+        newPassword:    resetNewPwd,
+      });
+      setHasPin(true);
+      setShowResetPassword(false);
+      setResetPhraseWords(Array(24).fill(''));
+      setResetNewPwd('');
+      setResetNewPwd2('');
+      setPinMsg('✅ Password reset successfully via recovery phrase.');
+      setTimeout(() => setPinMsg(''), 3000);
+    } catch (e: any) {
+      setResetPwdError(String(e).replace(/^.*Error:/, '').trim());
+    } finally {
+      setResetPwdBusy(false);
+    }
   }
 
   async function handleExportBackup() {
@@ -162,90 +160,6 @@ useEffect(() => {
     } catch (e: any) {
       setBackupError('Import failed: ' + String(e));
     } finally { setImportingBackup(false); }
-  }
-
-  async function handleForgotPin() {
-    if (!wallet?.address) return;
-    setResetLoading(true); setResetMsg('');
-    try {
-      const res  = await tauriFetch<{ success: boolean; message: string }>(
-        `${RELAY}/users/reset-pin`,
-        { method: 'POST', body: Body.json({ address: wallet.address }) }
-      );
-      const data = res.data;
-      if (data.success) {
-        setResetSent(true);
-        setResetMsg(`PIN reset link sent to ${maskedEmail || 'your email'}.`);
-      } else {
-        setResetMsg('Could not send reset email: ' + data.message);
-      }
-    } catch {
-      setResetMsg('Network error. Please try again.');
-    } finally {
-      setResetLoading(false);
-    }
-  }
-
-  async function handleSendEmailCode() {
-    if (!wallet?.address) return;
-    setSendingEmailCode(true); setChangeEmailMsg('');
-    try {
-      const res = await tauriFetch<{ success: boolean; message: string }>(
-        `${RELAY}/users/send-email-code`,
-        { method: 'POST', body: Body.json({ address: wallet.address }) }
-      );
-      if (res.data.success) {
-        setEmailStep('enter_code');
-      } else {
-        setChangeEmailMsg('Error: ' + res.data.message);
-      }
-    } catch {
-      setChangeEmailMsg('Network error. Please try again.');
-    } finally {
-      setSendingEmailCode(false);
-    }
-  }
-
-  async function handleVerifyEmailCode() {
-    if (!wallet?.address || !emailCode.trim()) return;
-    setVerifyingCode(true); setChangeEmailMsg('');
-    try {
-      const res = await tauriFetch<{ success: boolean; token: string; message: string }>(
-        `${RELAY}/users/verify-email-code`,
-        { method: 'POST', body: Body.json({ address: wallet.address, code: emailCode.trim() }) }
-      );
-      if (res.data.success) {
-        setEmailVerifyToken(res.data.token ?? '');
-        setEmailStep('new_email');
-      } else {
-        setChangeEmailMsg('Incorrect code. ' + (res.data.message ?? 'Try again.'));
-      }
-    } catch {
-      setChangeEmailMsg('Network error. Please try again.');
-    } finally {
-      setVerifyingCode(false);
-    }
-  }
-
-  async function handleChangeEmail() {
-    if (!wallet?.address || !newEmail.trim()) return;
-    setChangingEmail(true); setChangeEmailMsg('');
-    try {
-      const res = await tauriFetch<{ success: boolean; message: string }>(
-        `${RELAY}/users/change-email`,
-        { method: 'POST', body: Body.json({ address: wallet.address, new_email: newEmail.trim(), verify_token: emailVerifyToken }) }
-      );
-      if (res.data.success) {
-        setEmailStep('done');
-        setChangeEmailMsg(`Verification link sent to ${newEmail.trim()}. Click it to confirm the change.`);
-      } else {
-        setChangeEmailMsg('Error: ' + res.data.message);
-      }
-    } catch {
-      setChangeEmailMsg('Network error. Please try again.');
-    } finally {
-      setChangingEmail(false);
-    }
   }
 
   async function handleViewRecovery() {
@@ -323,14 +237,12 @@ useEffect(() => {
           });
           if (ok) {
             setPinInput(''); setPinConfirm(''); setPinMsg('');
-            setResetSent(false); setResetMsg('');
             setShowSetPin(true);
           } else {
             setPinMsg('Biometric verification failed. Please try again.');
           }
         } catch {
           setPinInput(''); setPinConfirm(''); setPinMsg('');
-          setResetSent(false); setResetMsg('');
           setShowSetPin(true);
         } finally {
           setBiometricLoading(false);
@@ -338,58 +250,23 @@ useEffect(() => {
       }}
       className="text-xs bg-yellow-600/20 hover:bg-yellow-600/40 disabled:opacity-50 text-yellow-400 px-3 py-1.5 rounded-lg transition"
     >
-      {biometricLoading ? '🔐 Verifying…' : hasPin ? 'Change PIN' : 'Set PIN'}
+      {biometricLoading ? '🔐 Verifying…' : hasPin ? 'Change Password' : 'Set Password'}
     </button>
   </div>
   {pinMsg && !showSetPin && (
     <div className="mt-2 text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{pinMsg}</div>
   )}
-  {}
-  {hasPin && maskedEmail && (
+  {hasPin && (
     <div className="mt-3 pt-3 border-t border-gray-700/50">
-      <div className="text-xs text-gray-500 mb-2">
-        🔑 Account email: <span className="text-gray-400">{maskedEmail}</span>
-      </div>
-      {resetSent ? (
-        <div className="bg-green-500/10 border border-green-500/30 rounded-xl px-3 py-2.5 text-xs text-green-300">
-          ✅ Reset link sent to <strong>{maskedEmail}</strong>.
-          Click it in your email — the app will automatically open the PIN setup once confirmed.
-          <div className="flex items-center gap-2 mt-2 text-green-400">
-            <div className="w-3 h-3 border-2 border-green-400 border-t-transparent rounded-full animate-spin" />
-            Waiting for confirmation…
-          </div>
-        </div>
-      ) : (
-        <button
-          onClick={handleForgotPin}
-          disabled={resetLoading}
-          className="text-xs text-blue-400 hover:text-blue-300 disabled:opacity-50 transition"
-        >
-          {resetLoading ? '📧 Sending…' : 'Forgot PIN? Send reset link to email'}
-        </button>
-      )}
-      {resetMsg && !resetSent && (
-        <div className="mt-2 text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{resetMsg}</div>
-      )}
+      <button
+        onClick={() => { setShowResetPassword(true); setResetPwdError(''); setResetNewPwd(''); setResetNewPwd2(''); setResetPhraseWords(Array(24).fill('')); }}
+        className="text-xs text-blue-400 hover:text-blue-300 transition"
+      >
+        Forgot password? Reset using your 24-word recovery phrase
+      </button>
     </div>
   )}
 </div>
-
-        {}
-        <div className="px-5 py-4 border-b border-gray-700/50 flex items-center justify-between">
-          <div>
-            <div className="text-sm font-medium">Account Email</div>
-            <div className="text-xs text-gray-400">
-              {maskedEmail ? `Current: ${maskedEmail}` : 'No email linked'}
-            </div>
-          </div>
-          <button
-            onClick={() => { setShowChangeEmail(true); setEmailStep('send_code'); setEmailCode(''); setEmailVerifyToken(''); setNewEmail(''); setChangeEmailMsg(''); }}
-            className="text-xs bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 px-3 py-1.5 rounded-lg transition"
-          >
-            Change Email
-          </button>
-        </div>
 
         {}
         <div className="px-5 py-4 flex items-center justify-between">
@@ -486,89 +363,106 @@ useEffect(() => {
   <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
     <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-sm border border-gray-700 shadow-2xl">
       <div className="flex justify-between items-center mb-5">
-        <h3 className="text-lg font-bold">{hasPin ? 'Change Security PIN' : 'Set Security PIN'}</h3>
-        <button onClick={() => { setShowSetPin(false); setResetSent(false); setResetMsg(''); }} className="text-gray-400 hover:text-white text-xl">✕</button>
+        <h3 className="text-lg font-bold">{hasPin ? 'Change Wallet Password' : 'Set Wallet Password'}</h3>
+        <button onClick={() => setShowSetPin(false)} className="text-gray-400 hover:text-white text-xl">✕</button>
       </div>
 
-      {}
-      {hasPin ? (
-        <div className="space-y-4">
-          <div className="flex items-start gap-2 bg-blue-500/10 border border-blue-500/30 rounded-xl px-3 py-3">
-            <span className="text-blue-400 shrink-0 text-lg">📧</span>
-        <div className="text-sm text-blue-200 leading-relaxed">
-          For security, changing your PIN requires email verification.
-          {maskedEmail ? <> We'll send a confirmation link to <strong>{maskedEmail}</strong>.</> : ' We\'ll send a confirmation link to your registered email.'}
-        </div>
+      <div className="space-y-4">
+        <div className="flex items-start gap-2 bg-yellow-500/10 border border-yellow-500/30 rounded-xl px-3 py-2.5">
+          <span className="text-yellow-400 shrink-0">🔒</span>
+          <div className="text-xs text-yellow-200 leading-relaxed">
+            Stored securely on this device with Argon2id. You'll need it to view your private keys and to confirm transactions.
+            If you forget it, you can reset it using your 24-word recovery phrase.
           </div>
-          {resetSent ? (
-            <div className="space-y-3">
-              <div className="bg-green-500/10 border border-green-500/30 rounded-xl px-4 py-3 text-sm text-green-300">
-                ✅ Reset link sent to <strong>{maskedEmail}</strong>.<br />
-                Click the link in your email to continue.
-              </div>
-              <div className="flex items-center gap-2 text-xs text-gray-400">
-                <div className="w-3 h-3 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
-                Waiting for email confirmation…
-              </div>
-              <button
-                onClick={() => { setResetSent(false); setResetMsg(''); }}
-                className="w-full bg-gray-700 hover:bg-gray-600 py-2.5 rounded-xl text-sm text-gray-300 transition"
-              >
-                ← Resend email
-              </button>
-            </div>
-          ) : (
-            <button
-              onClick={handleForgotPin}
-              disabled={resetLoading || !maskedEmail}
-              className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
-            >
-              {resetLoading ? '📧 Sending…' : '📧 Send PIN Change Link'}
-            </button>
-          )}
-          {resetMsg && !resetSent && (
-            <div className="text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{resetMsg}</div>
-          )}
         </div>
-      ) : (
+        <div className="text-sm text-gray-400">Choose a password (minimum 8 characters).</div>
+        <input
+          type="password"
+          value={pinInput}
+          onChange={e => setPinInput(e.target.value)}
+          placeholder={hasPin ? 'New password' : 'Password'}
+          className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition"
+          autoFocus
+        />
+        <input
+          type="password"
+          value={pinConfirm}
+          onChange={e => setPinConfirm(e.target.value)}
+          placeholder="Confirm password"
+          className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition"
+          onKeyDown={e => e.key === 'Enter' && handleSetPin()}
+        />
+        {pinMsg && (
+          <div className={`text-xs px-3 py-2 rounded-lg ${pinMsg.includes('success') ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
+            {pinMsg}
+          </div>
+        )}
+        <button
+          onClick={handleSetPin}
+          disabled={settingPin || !pinInput || !pinConfirm}
+          className="w-full bg-yellow-600 hover:bg-yellow-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
+        >
+          {settingPin ? 'Saving…' : (hasPin ? 'Change Password' : 'Set Password')}
+        </button>
+      </div>
+    </div>
+  </div>
+)}
 
-        <div className="space-y-4">
-          <div className="flex items-start gap-2 bg-yellow-500/10 border border-yellow-500/30 rounded-xl px-3 py-2.5">
-            <span className="text-yellow-400 shrink-0">🔒</span>
-            <div className="text-xs text-yellow-200 leading-relaxed">
-              Your PIN is saved securely on this device. You'll need it to view your private keys.
-            </div>
+{showResetPassword && (
+  <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
+    <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-2xl border border-gray-700 shadow-2xl max-h-[90vh] overflow-y-auto">
+      <div className="flex justify-between items-center mb-4">
+        <h3 className="text-lg font-bold">Reset Password via Recovery Phrase</h3>
+        <button onClick={() => setShowResetPassword(false)} className="text-gray-400 hover:text-white text-xl">✕</button>
+      </div>
+      <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl px-4 py-3 text-xs text-blue-300 mb-5 leading-relaxed">
+        Enter your 24-word recovery phrase exactly as you wrote it down when you created the wallet.
+        Each word in its own box, lowercase, in order. Then choose a new password.
+      </div>
+      <div className="grid grid-cols-4 gap-2 mb-5">
+        {resetPhraseWords.map((w, i) => (
+          <div key={i} className="relative">
+            <span className="absolute left-2 top-1/2 -translate-y-1/2 text-[10px] text-gray-500">{i + 1}.</span>
+            <input
+              type="text"
+              value={w}
+              onChange={e => {
+                const v = e.target.value.toLowerCase().trim();
+                setResetPhraseWords(prev => prev.map((x, j) => j === i ? v : x));
+              }}
+              className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-lg pl-7 pr-2 py-2 text-xs font-mono outline-none transition"
+            />
           </div>
-          <div className="text-sm text-gray-400">Choose a PIN (minimum 4 characters).</div>
-          <input
-            type="password"
-            value={pinInput}
-            onChange={e => setPinInput(e.target.value)}
-            placeholder="New PIN"
-            className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition"
-          />
-          <input
-            type="password"
-            value={pinConfirm}
-            onChange={e => setPinConfirm(e.target.value)}
-            placeholder="Confirm PIN"
-            className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition"
-            onKeyDown={e => e.key === 'Enter' && handleSetPin()}
-          />
-          {pinMsg && (
-            <div className={`text-xs px-3 py-2 rounded-lg ${pinMsg.includes('success') ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
-              {pinMsg}
-            </div>
-          )}
-          <button
-            onClick={handleSetPin}
-            disabled={settingPin || !pinInput || !pinConfirm}
-            className="w-full bg-yellow-600 hover:bg-yellow-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
-          >
-            {settingPin ? 'Saving…' : 'Set PIN'}
-          </button>
-        </div>
-      )}
+        ))}
+      </div>
+      <div className="space-y-3">
+        <input
+          type="password"
+          value={resetNewPwd}
+          onChange={e => setResetNewPwd(e.target.value)}
+          placeholder="New password (min 8 chars)"
+          className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition"
+        />
+        <input
+          type="password"
+          value={resetNewPwd2}
+          onChange={e => setResetNewPwd2(e.target.value)}
+          placeholder="Confirm new password"
+          className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition"
+          onKeyDown={e => e.key === 'Enter' && !resetPwdBusy && handleResetPasswordWithRecovery()}
+        />
+        {resetPwdError && (
+          <div className="text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{resetPwdError}</div>
+        )}
+        <button
+          onClick={handleResetPasswordWithRecovery}
+          disabled={resetPwdBusy}
+          className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
+        >
+          {resetPwdBusy ? 'Verifying & saving…' : 'Reset Password'}
+        </button>
+      </div>
     </div>
   </div>
 )}
@@ -659,127 +553,6 @@ useEffect(() => {
         </div>
       )}
 
-      {/* ── Change Email Modal ─────────────────────────────────────────────── */}
-      {showChangeEmail && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
-          <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-sm border border-gray-700 shadow-2xl">
-            <div className="flex justify-between items-center mb-5">
-              <h3 className="text-lg font-bold">Change Email Address</h3>
-              <button onClick={() => setShowChangeEmail(false)} className="text-gray-400 hover:text-white text-xl">✕</button>
-            </div>
-
-            {/* Step indicator */}
-            <div className="flex items-center gap-2 mb-5">
-              {(['send_code', 'enter_code', 'new_email'] as const).map((s, i) => (
-                <React.Fragment key={s}>
-                  <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold shrink-0 ${
-                    emailStep === 'done' || ['send_code','enter_code','new_email'].indexOf(emailStep) > i
-                      ? 'bg-blue-600 text-white'
-                      : emailStep === s
-                      ? 'bg-blue-600 text-white ring-2 ring-blue-400/40'
-                      : 'bg-gray-700 text-gray-500'
-                  }`}>{i + 1}</div>
-                  {i < 2 && <div className={`flex-1 h-px ${['send_code','enter_code','new_email'].indexOf(emailStep) > i || emailStep === 'done' ? 'bg-blue-600' : 'bg-gray-700'}`} />}
-                </React.Fragment>
-              ))}
-            </div>
-
-            {/* Step 1 — send code to current email */}
-            {emailStep === 'send_code' && (
-              <div className="space-y-4">
-                <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl px-4 py-3 text-sm text-blue-200">
-                  To protect your account, we'll send a 6-digit verification code to your current email:
-                  <div className="font-semibold text-white mt-1">{maskedEmail || '(no email on file)'}</div>
-                </div>
-                {changeEmailMsg && <div className="text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{changeEmailMsg}</div>}
-                <button
-                  onClick={handleSendEmailCode}
-                  disabled={sendingEmailCode || !maskedEmail}
-                  className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
-                >
-                  {sendingEmailCode ? '📧 Sending…' : '📧 Send Verification Code'}
-                </button>
-              </div>
-            )}
-
-            {/* Step 2 — enter the code */}
-            {emailStep === 'enter_code' && (
-              <div className="space-y-4">
-                <div className="bg-green-500/10 border border-green-500/30 rounded-xl px-4 py-3 text-sm text-green-300">
-                  Code sent to <strong>{maskedEmail}</strong>. Check your inbox and enter the 6-digit code below.
-                </div>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  maxLength={6}
-                  value={emailCode}
-                  onChange={e => setEmailCode(e.target.value.replace(/\D/g, ''))}
-                  onKeyDown={e => e.key === 'Enter' && handleVerifyEmailCode()}
-                  placeholder="6-digit code"
-                  className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition tracking-[0.3em] text-center font-mono text-lg"
-                  autoFocus
-                />
-                {changeEmailMsg && <div className="text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{changeEmailMsg}</div>}
-                <button
-                  onClick={handleVerifyEmailCode}
-                  disabled={verifyingCode || emailCode.length < 6}
-                  className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
-                >
-                  {verifyingCode ? 'Verifying…' : 'Verify Code'}
-                </button>
-                <button
-                  onClick={() => { setEmailStep('send_code'); setEmailCode(''); setChangeEmailMsg(''); }}
-                  className="w-full text-xs text-gray-400 hover:text-gray-200 transition"
-                >
-                  Didn't receive it? Send again
-                </button>
-              </div>
-            )}
-
-            {/* Step 3 — enter new email */}
-            {emailStep === 'new_email' && (
-              <div className="space-y-4">
-                <div className="bg-green-500/10 border border-green-500/30 rounded-xl px-4 py-3 text-sm text-green-300">
-                  ✅ Current email verified. Enter your new email address below.
-                </div>
-                <input
-                  type="email"
-                  value={newEmail}
-                  onChange={e => setNewEmail(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && handleChangeEmail()}
-                  placeholder="New email address"
-                  className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none transition"
-                  autoFocus
-                />
-                {changeEmailMsg && <div className="text-xs px-3 py-2 rounded-lg bg-red-500/20 text-red-400">{changeEmailMsg}</div>}
-                <button
-                  onClick={handleChangeEmail}
-                  disabled={changingEmail || !newEmail.trim()}
-                  className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
-                >
-                  {changingEmail ? 'Sending…' : 'Update Email'}
-                </button>
-              </div>
-            )}
-
-            {/* Done */}
-            {emailStep === 'done' && (
-              <div className="space-y-4">
-                <div className="bg-green-500/10 border border-green-500/30 rounded-xl p-4 text-sm text-green-300">
-                  ✅ {changeEmailMsg}
-                </div>
-                <p className="text-xs text-gray-400">Once you click the link in the new email, your address will be updated automatically.</p>
-                <button
-                  onClick={() => setShowChangeEmail(false)}
-                  className="w-full bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition"
-                >
-                  Close
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
     </div>
   );
 };

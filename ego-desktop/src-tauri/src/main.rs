@@ -4,6 +4,7 @@ mod app;
 mod bft_committee;
 mod bls_agg;
 mod blocks;
+mod ecvrf;
 mod chain_db;
 mod commands;
 mod config;
@@ -372,18 +373,25 @@ fn main() {
             commands::auth::rename_wallet,
             commands::auth::set_security_pin,
             commands::auth::verify_pin,
+            commands::auth::pin_cache_status,
+            commands::auth::reset_pin_with_recovery_phrase,
+            commands::auth::get_password_status,
+            commands::auth::set_password,
+            commands::auth::verify_password,
+            commands::auth::password_cache_status,
+            commands::auth::reset_password_with_recovery_phrase,
             commands::auth::get_recovery_info,
             commands::auth::get_pin_status,
             commands::auth::verify_biometric,
             commands::wallet::get_balance,
             commands::wallet::send_transaction,
+            commands::wallet::send_transaction_with_pin,
+            commands::wallet::send_transaction_with_password,
             commands::wallet::prepare_transaction,
             commands::wallet::commit_transaction,
-            commands::wallet::get_account_email,
-            commands::wallet::request_tx_code,
-            commands::wallet::confirm_tx_code,
             commands::wallet::get_transaction_history,
             commands::wallet::get_tx_fee,
+            commands::wallet::clear_pending_transactions,
             commands::storage::store_file,
             commands::storage::get_file_metadata,
             commands::storage::get_stored_files,
@@ -484,9 +492,6 @@ fn main() {
             commands::ai::ask_ego_ai,
             commands::ai::save_ai_key,
             commands::ai::get_ai_key_status,
-            commands::auth::send_verification_email,
-            commands::auth::verify_email_code,
-            commands::auth::save_registration_info,
             commands::auth::get_mainnet_address,
             commands::light_client::get_block_headers,
             commands::light_client::get_tx_proof,
@@ -656,7 +661,7 @@ fn main() {
 
                     let my_addr = crate::ledger::Ledger::load().address;
                     if !my_addr.is_empty() {
-                        crate::p2p::register_known_validator(&my_addr);
+                        crate::p2p::set_local_validator(&my_addr);
                         tracing::info!("Registered local validator: {}", &my_addr[..my_addr.len().min(20)]);
                     }
                 }).await.ok();

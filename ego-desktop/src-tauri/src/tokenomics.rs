@@ -36,8 +36,12 @@ pub const SLOT_INTERVAL_MS: u64 = 100;
 pub const TARGET_BLOCK_SECS: f64 = 0.1;
 
 pub fn block_reward_at(height: u64) -> u64 {
-    let era = (height / HALVING_INTERVAL).min(63);
-    INITIAL_BLOCK_REWARD_UEGOC >> era
+    let era = height / HALVING_INTERVAL;
+    // Float division so reward never hits zero via integer truncation.
+    // Minimum 1 uEGOC keeps miners incentivised past era 16 (year 68)
+    // while eras 17-29 (years 68-120) each add only ~1,261 EGOC total — negligible vs the 210M pool.
+    let reward_f = INITIAL_BLOCK_REWARD_UEGOC as f64 / 2f64.powi(era.min(63) as i32);
+    (reward_f as u64).max(1)
 }
 
 /// Dynamic block reward: base halving reward + all tx fees collected in the block
@@ -101,9 +105,31 @@ pub fn storage_reward_uegoc(gb: f64) -> u64 {
     reward_usd_to_uegoc(STORAGE_REWARD_USD_PER_GB_DAY * gb)
 }
 
-/// Daily consensus-node reward.
+static VALIDATOR_BLOCKS_VOTED: std::sync::atomic::AtomicU64
+    = std::sync::atomic::AtomicU64::new(0);
+static VALIDATOR_BLOCKS_TOTAL: std::sync::atomic::AtomicU64
+    = std::sync::atomic::AtomicU64::new(0);
+
+pub fn record_block_participation() {
+    VALIDATOR_BLOCKS_VOTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn record_block_produced() {
+    VALIDATOR_BLOCKS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn consensus_participation_fraction() -> f64 {
+    let voted = VALIDATOR_BLOCKS_VOTED.load(std::sync::atomic::Ordering::Relaxed);
+    let total = VALIDATOR_BLOCKS_TOTAL.load(std::sync::atomic::Ordering::Relaxed);
+    if total == 0 { return 1.0; }
+    (voted as f64 / total as f64).clamp(0.0, 1.0)
+}
+
+/// Daily consensus-node reward scaled by recent participation rate.
 pub fn consensus_daily_uegoc() -> u64 {
-    reward_usd_to_uegoc(CONSENSUS_REWARD_USD_PER_DAY)
+    let base = reward_usd_to_uegoc(CONSENSUS_REWARD_USD_PER_DAY);
+    let participation = consensus_participation_fraction();
+    (base as f64 * participation) as u64
 }
 
 /// Daily coverage-node reward.
@@ -116,21 +142,29 @@ pub fn retrieval_reward_uegoc(gb: f64) -> u64 {
     reward_usd_to_uegoc(RETRIEVAL_REWARD_USD_PER_GB * gb)
 }
 
+/// Extra block-reward bonus (in basis points, 100 bps = 1%) earned by stakers.
+/// Returns 0 for unstaked nodes, up to 5000 bps (+50%) for large stakers.
+/// Applied on top of the consensus-agreed coinbase so all validators agree on base reward.
+pub fn staking_mining_bonus_bps(staked_uegoc: u64) -> u64 {
+    if staked_uegoc == 0 { return 0; }
+    let egoc = staked_uegoc as f64 / UEGOC_PER_EGOC as f64;
+    // Logarithmic scale: 1 EGOC → ~1000 bps, 10 → ~3300 bps, 100+ → capped at 5000 bps
+    let bps = ((egoc + 1.0).ln() * 2_000.0).min(5_000.0) as u64;
+    bps
+}
+
 pub const STAKING_APR_BPS: u64 = 1_250;
 
 pub const MIN_STAKE_FREE_TX_UEGOC: u64 = UEGOC_PER_EGOC;
 
 pub const MIN_STAKE_PROGRAM_UEGOC: u64 = 1_000 * UEGOC_PER_EGOC;
 
-pub fn node_pool_paid_uegoc(chain: &crate::ledger::SharedChain) -> u64 {
-    chain.transactions.iter()
-        .filter(|t| t.from.starts_with("egot1rewards") && t.status == "Confirmed")
-        .map(|t| t.amount)
-        .sum()
+pub fn node_pool_paid_uegoc(_chain: &crate::ledger::SharedChain) -> u64 {
+    NODE_POOL_UEGOC.saturating_sub(crate::chain_db::balance_of(crate::chain_db::NODE_POOL_ADDR))
 }
 
-pub fn node_pool_remaining_uegoc(chain: &crate::ledger::SharedChain) -> u64 {
-    NODE_POOL_UEGOC.saturating_sub(node_pool_paid_uegoc(chain))
+pub fn node_pool_remaining_uegoc(_chain: &crate::ledger::SharedChain) -> u64 {
+    crate::chain_db::balance_of(crate::chain_db::NODE_POOL_ADDR)
 }
 
 pub fn node_reward_scale(chain: &crate::ledger::SharedChain) -> f64 {
@@ -140,15 +174,12 @@ pub fn node_reward_scale(chain: &crate::ledger::SharedChain) -> f64 {
     if pct >= 0.20 { 1.0 } else { pct / 0.20 }
 }
 
-pub fn staking_pool_paid_uegoc(chain: &crate::ledger::SharedChain) -> u64 {
-    chain.transactions.iter()
-        .filter(|t| t.from.starts_with("egot1staking") && t.status == "Confirmed")
-        .map(|t| t.amount)
-        .sum()
+pub fn staking_pool_paid_uegoc(_chain: &crate::ledger::SharedChain) -> u64 {
+    STAKING_POOL_UEGOC.saturating_sub(crate::chain_db::balance_of(crate::chain_db::STAKING_POOL_ADDR))
 }
 
-pub fn staking_pool_remaining_uegoc(chain: &crate::ledger::SharedChain) -> u64 {
-    STAKING_POOL_UEGOC.saturating_sub(staking_pool_paid_uegoc(chain))
+pub fn staking_pool_remaining_uegoc(_chain: &crate::ledger::SharedChain) -> u64 {
+    crate::chain_db::balance_of(crate::chain_db::STAKING_POOL_ADDR)
 }
 
 pub fn foundation_vested_egoc(now_secs: i64) -> u64 {

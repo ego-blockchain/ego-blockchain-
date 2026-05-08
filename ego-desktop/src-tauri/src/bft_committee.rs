@@ -16,7 +16,17 @@ const UEGOC_PER_EGOC: f64 = 1_000_000.0;
 const COVERAGE_PER_WEIGHT: f64 = 10.0;
 
 pub const EXPECTED_PROPOSERS_PER_SLOT: f64 = 1.5;
-pub const FALLBACK_AFTER_EMPTY_VIEWS: u32 = 3;
+
+pub fn expected_proposers_for_network(n: usize) -> f64 {
+    // With few nodes blocks must be produced reliably; converges to 1.5 at large scale.
+    // n=3:   1.5 + 2.00 = 3.5  → each node qualifies with ~100% probability
+    // n=10:  1.5 + 0.60 = 2.1  → ~18% each, P(≥1 block) ≈ 91%
+    // n=50:  1.5 + 0.12 = 1.62 → ~3.2% each
+    // n=500: 1.5 + 0.012 ≈ 1.51 → standard competitive
+    let n_f = n.max(1) as f64;
+    (1.5 + 6.0 / n_f).min(n_f)
+}
+pub const FALLBACK_AFTER_EMPTY_VIEWS: u32 = 2;
 
 
 pub const MAX_VALIDATOR_SHARE: f64 = 0.33;
@@ -34,7 +44,9 @@ const NEWCOMER_MULTIPLIER: f64 = 3.0;
 pub fn compute_drs_weight(addr: &str) -> f64 {
     let stake_egoc = crate::ledger::get_validator_stake(addr) as f64 / UEGOC_PER_EGOC;
     let coverage   = crate::poc::get_peer_score(addr) as f64 / COVERAGE_PER_WEIGHT;
-    let raw        = stake_egoc + coverage;
+    // Coverage & storage contribution is the primary signal (3×).
+    // Staking is a secondary optional boost (0.5×).
+    let raw        = coverage * 3.0 + stake_egoc * 0.5;
 
     let log_drs    = (1.0_f64 + raw).ln().max(0.01);
 
@@ -69,20 +81,32 @@ pub fn vrf_input(prev_hash: &str, height: u64, role: u8) -> Vec<u8> {
 }
 
 pub fn sign_vrf_ticket(seed_32: &[u8; 32], input: &[u8]) -> Vec<u8> {
-    use ed25519_dalek::{SigningKey, Signer};
-    SigningKey::from_bytes(seed_32).sign(input).to_bytes().to_vec()
+    crate::ecvrf::ecvrf_prove(seed_32, input)
+        .map(|p| p.to_vec())
+        .unwrap_or_else(|| {
+            use ed25519_dalek::{SigningKey, Signer};
+            SigningKey::from_bytes(seed_32).sign(input).to_bytes().to_vec()
+        })
 }
 
 pub fn verify_vrf_ticket(pubkey_32: &[u8; 32], input: &[u8], ticket: &[u8]) -> bool {
-    use ed25519_dalek::{Signature, VerifyingKey, Verifier};
-    let Ok(vk)  = VerifyingKey::from_bytes(pubkey_32) else { return false; };
-    let Ok(sig) = Signature::from_slice(ticket) else { return false; };
-    vk.verify(input, &sig).is_ok()
+    if ticket.len() == 80 {
+        crate::ecvrf::ecvrf_verify(pubkey_32, input, ticket)
+    } else {
+        use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+        let Ok(vk)  = VerifyingKey::from_bytes(pubkey_32) else { return false; };
+        let Ok(sig) = Signature::from_slice(ticket) else { return false; };
+        vk.verify(input, &sig).is_ok()
+    }
 }
 
 pub fn ticket_to_float(ticket: &[u8]) -> f64 {
-    let h   = blake3::hash(ticket);
-    let raw = u64::from_le_bytes(h.as_bytes()[..8].try_into().expect("blake3 output is always 32 bytes"));
+    let hash_bytes = if ticket.len() == 80 {
+        crate::ecvrf::ecvrf_proof_to_hash(ticket)
+    } else {
+        *blake3::hash(ticket).as_bytes()
+    };
+    let raw = u64::from_le_bytes(hash_bytes[..8].try_into().expect("32-byte hash"));
     raw as f64 / u64::MAX as f64
 }
 
@@ -106,7 +130,15 @@ pub fn qualifies_proposer_for_network(
     n_validators: usize,
 ) -> bool {
     if n_validators <= MIN_LIVE_VALIDATORS { return true; }
-    qualifies_proposer(ticket, my_drs, total_drs)
+    let raw_share = capped_share(my_drs, total_drs);
+    let share = if n_validators <= COMMITTEE_SIZE {
+        raw_share.max(1.0 / n_validators as f64)
+    } else {
+        raw_share
+    };
+    let expected  = expected_proposers_for_network(n_validators);
+    let threshold = (expected * share).min(1.0);
+    ticket_to_float(ticket) < threshold
 }
 
 pub fn vote_signing_data(block_hash: &str, height: u64, voter: &str) -> String {

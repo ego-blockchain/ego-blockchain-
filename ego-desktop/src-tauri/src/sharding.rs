@@ -93,9 +93,8 @@ pub fn save_shard_map(map: &ShardMap) -> Result<(), String> {
     fs::write(shard_map_path(), data).map_err(|e| e.to_string())
 }
 
-pub fn compute_shard_count(_network_node_count: u32) -> u32 {
-    // Sharding is active by default to scale the chain's state globally.
-    // 256 shards maps cleanly to the 256 mempool shards.
+pub fn compute_shard_count(network_node_count: u32) -> u32 {
+    if network_node_count <= 50 { return 1; }
     256
 }
 
@@ -221,12 +220,29 @@ pub async fn check_master_health(my_address: &str, my_endpoint: &str, uptime_sec
             .find(|a| a.shard_id == shard_id && a.role == ShardRole::Master);
 
         if let Some(m) = master {
-            if now - m.last_seen > MASTER_TIMEOUT_SECS {
-
+            let silence = now - m.last_seen;
+            // Require double the base timeout before promoting.  This gives the
+            // master time to reconnect and prevents split-brain caused by a
+            // brief network partition being mistaken for a dead node.
+            if silence > MASTER_TIMEOUT_SECS * 2 {
                 let responsible = consistent_hash_assign(shard_id, &all_nodes);
+                // Only the first-priority slave (index 1) promotes — deterministic
+                // election prevents simultaneous promotions by multiple slaves.
                 if responsible.get(1).map(|a| a.as_str()) == Some(my_address) {
-                    tracing::warn!("Shard {} master {} offline — promoting self to master",
-                        shard_id, &m.node_address);
+                    // Require at least one other live peer to have also seen the
+                    // master as absent (last_seen also expired) before promoting.
+                    let other_slaves_agree = map.assignments.iter().any(|a| {
+                        a.shard_id == shard_id
+                            && a.node_address != my_address
+                            && a.node_address != m.node_address
+                            && now - a.last_seen < 300
+                    });
+                    if !other_slaves_agree && map.network_node_count > 2 {
+                        continue;
+                    }
+
+                    tracing::warn!("Shard {} master {} offline {}s — promoting self to master",
+                        shard_id, &m.node_address, silence);
 
                     crate::p2p::broadcast_master_promotion(shard_id, my_address, my_endpoint, &m.node_address).await;
 
@@ -261,7 +277,7 @@ pub fn handle_shard_announce_update(
 
     if network_node_count > map.network_node_count {
         map.network_node_count = network_node_count;
-        map.shard_count = shard_count;
+        map.shard_count = compute_shard_count(network_node_count);
         map.updated_at = now;
     }
 

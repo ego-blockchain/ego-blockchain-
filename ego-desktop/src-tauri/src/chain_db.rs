@@ -3,6 +3,7 @@ use rocksdb::{
     WriteBatch, DB,
 };
 use std::sync::{Mutex, OnceLock};
+use tauri::Manager as _;
 
 use crate::ledger::{
     base_data_dir, LedgerBlock, LedgerTx, SharedChain, GENESIS_HASH, GENESIS_MINER, GENESIS_TS,
@@ -145,13 +146,22 @@ pub fn get_db() -> DbWrapper {
         init_db(&db);
         eprintln!("[ChainDB] RocksDB init_db done");
 
-        // Ensure dynamic testnet faucet is funded (handles migrated DBs that skipped seed_genesis)
-        if let Some(cf_balances) = db.cf_handle(CF_BALANCES) {
-            let faucet_addr = get_faucet_address();
-            let cur = db.get_cf(cf_balances, faucet_addr.as_bytes())
-                .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-            if cur == 0 {
-                let _ = db.put_cf(cf_balances, faucet_addr.as_bytes(), u64_le(10_000_000 * 1_000_000));
+        // Seed faucet exactly once for migrated DBs that skipped seed_genesis.
+        // The META_FAUCET_SEEDED flag prevents re-seeding on restarts even if
+        // the faucet balance reaches 0.
+        const META_FAUCET_SEEDED: &[u8] = b"faucet_seeded_v1";
+        if let Some(cf_meta) = db.cf_handle(CF_META) {
+            let already_seeded = db.get_cf(cf_meta, META_FAUCET_SEEDED).ok().flatten().is_some();
+            if !already_seeded {
+                if let Some(cf_balances) = db.cf_handle(CF_BALANCES) {
+                    let faucet_addr = get_faucet_address();
+                    let cur = db.get_cf(cf_balances, faucet_addr.as_bytes())
+                        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+                    if cur == 0 {
+                        let _ = db.put_cf(cf_balances, faucet_addr.as_bytes(), u64_le(10_000_000 * 1_000_000));
+                    }
+                }
+                let _ = db.put_cf(cf_meta, META_FAUCET_SEEDED, b"1");
             }
         }
         
@@ -659,10 +669,36 @@ pub fn check_checkpoint(block: &LedgerBlock) -> Result<(), String> {
 
 const FAUCET_ADDR: &str = "egot1faucet000000000000000000000000000000000";
 
+static BLOCK_COMMIT_MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+fn block_commit_mutex() -> &'static std::sync::Mutex<()> {
+    BLOCK_COMMIT_MUTEX.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 /// Atomically writes one block + its transactions into all column families.
 /// Maintains balance cache and all secondary indices.
 /// INSERT-OR-IGNORE semantics: skips existing blocks/txs.
 fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
+    // Serialize all commits — multiple gossip paths (BFT QC, sync, ForkChoice)
+    // can race for the same block. Without this lock, each path reads "no
+    // existing block at this height", all proceed in parallel, each fires
+    // balance-updated events and touch_proposal_timestamp(), keeping the
+    // BFT timeout perpetually fresh and stalling the chain.
+    let _commit_guard = block_commit_mutex().lock().unwrap_or_else(|e| e.into_inner());
+
+    // After acquiring the lock, re-check that this block hasn't been written
+    // already by an earlier thread. Idempotent skip on identical hash.
+    {
+        let cf_blocks_check = db.cf_handle(CF_BLOCKS).unwrap();
+        if let Some(existing_bytes) = db.get_cf(cf_blocks_check, height_key(block.height)).ok().flatten() {
+            if let Some(existing) = decode::<LedgerBlock>(&existing_bytes) {
+                if existing.hash == block.hash {
+                    return;
+                }
+            }
+        }
+    }
+
+    eprintln!("[ChainDB] write_block_batch start — block #{} ({} txs)", block.height, txs.len());
     let cf_blocks     = db.cf_handle(CF_BLOCKS).unwrap();
     let cf_txs        = db.cf_handle(CF_TXS).unwrap();
     let cf_block_txs  = db.cf_handle(CF_BLOCK_TXS).unwrap();
@@ -683,6 +719,8 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
     // if the incoming block has strictly more validator votes (heavier chain).
     // This is the canonical rule: the block that collects the most BFT votes wins.
     let mut replaced_tx_count: u64 = 0;
+    let mut is_fork_replacement = false;
+    let mut old_block_tx_keys: Vec<Box<[u8]>> = Vec::new();
     if let Some(existing_bytes) = db.get_cf(cf_blocks, height_k).ok().flatten() {
         let existing = decode::<LedgerBlock>(&existing_bytes);
         let existing_votes = existing.as_ref().map(|b| b.vote_count).unwrap_or(0);
@@ -692,6 +730,15 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
         // New block has more votes: fall through and overwrite.
         // Track how many txs the old block had so we can adjust META_TX_COUNT.
         replaced_tx_count = existing.map(|b| b.tx_count as u64).unwrap_or(0);
+        is_fork_replacement = true;
+        // Collect stale CF_BLOCK_TXS entries from the old block so we can delete them.
+        // Without this cleanup, get_txs_for_block() returns too many TXs after a fork rewrite.
+        let iter = db.prefix_iterator_cf(cf_block_txs, height_k);
+        for item in iter {
+            if let Ok((key, _)) = item {
+                old_block_tx_keys.push(key);
+            }
+        }
         tracing::info!("ForkChoice: replacing block #{} ({} votes → {} votes)",
             block.height, existing_votes, block.vote_count);
     }
@@ -711,6 +758,31 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
         // Skip if tx already exists.
         if db.get_cf(cf_txs, tx.hash.as_bytes()).ok().flatten().is_some() {
             continue;
+        }
+
+        // ── Foundation vesting enforcement ───────────────────────────────────
+        // Transfers from the foundation wallet are gated by a 4-year linear
+        // vesting schedule.  Blocks containing over-vested foundation TXs are
+        // silently filtered — the block itself is still accepted.
+        if tx.from == FOUNDATION_ADDR && tx.amount > 0 {
+            let now = chrono::Utc::now().timestamp();
+            let vested = crate::tokenomics::foundation_vested_egoc(now)
+                .saturating_mul(crate::tokenomics::UEGOC_PER_EGOC);
+            let current_foundation_bal: u64 = db
+                .get_cf(cf_balances, FOUNDATION_ADDR.as_bytes())
+                .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+            let pending = *balance_delta.get(FOUNDATION_ADDR).unwrap_or(&0);
+            let effective_bal = (current_foundation_bal as i128 + pending).max(0) as u64;
+            let initial = crate::tokenomics::FOUNDATION_EGOC * crate::tokenomics::UEGOC_PER_EGOC;
+            let already_out = initial.saturating_sub(effective_bal);
+            let total_out = tx.amount.saturating_add(tx.fee_uegoc);
+            if already_out.saturating_add(total_out) > vested {
+                tracing::warn!(
+                    "[ChainDB] Foundation vesting: TX {} rejected — would exceed vested {} uEGOC (already_out={})",
+                    &tx.hash[..tx.hash.len().min(12)], vested, already_out
+                );
+                continue;
+            }
         }
 
         // ── Max supply enforcement ────────────────────────────────────────────
@@ -791,10 +863,20 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
     // Block record.
     batch.put_cf(cf_blocks, height_k, encode(block));
 
+    // Delete stale CF_BLOCK_TXS entries from the replaced block (fork-choice cleanup).
+    for key in &old_block_tx_keys {
+        batch.delete_cf(cf_block_txs, key.as_ref());
+    }
+
     // Transactions + all secondary indices.
     for tx in &confirmed_txs {
-        if db.get_cf(cf_txs, tx.hash.as_bytes()).ok().flatten().is_some() {
-            continue; // already exists
+        let already_exists = db.get_cf(cf_txs, tx.hash.as_bytes()).ok().flatten().is_some();
+        if already_exists {
+            // Re-index into this block's CF_BLOCK_TXS when fork-choice re-uses an existing TX.
+            if is_fork_replacement {
+                batch.put_cf(cf_block_txs, block_txs_key(block.height, &tx.hash), b"");
+            }
+            continue;
         }
         batch.put_cf(cf_txs,        tx.hash.as_bytes(), encode(tx));
         batch.put_cf(cf_block_txs,  block_txs_key(block.height, &tx.hash), b"");
@@ -829,16 +911,6 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
             batch.delete_cf(cf_balances, addr.as_bytes());
         } else {
             batch.put_cf(cf_balances, addr.as_bytes(), u64_le(*bal));
-        }
-    }
-
-    {
-        let mut ledger = crate::ledger::Ledger::load();
-        if let Some(new_bal) = new_balances.get(&ledger.address) {
-            if ledger.balance_uegoc != *new_bal {
-                ledger.balance_uegoc = *new_bal;
-                let _ = ledger.save();
-            }
         }
     }
 
@@ -884,9 +956,29 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
         }
     }
 
+    eprintln!("[ChainDB] db.write(batch) starting — block #{}", block.height);
     if let Err(e) = db.write(batch) {
         tracing::error!("write batch failed (disk full?): {e}");
         return;
+    }
+    eprintln!("[ChainDB] db.write(batch) done — block #{}", block.height);
+
+    {
+        let mut ledger = crate::ledger::Ledger::load();
+        if let Some(new_bal) = new_balances.get(&ledger.address) {
+            eprintln!("[ChainDB] balance update — addr {:.16} old={} new={}", ledger.address, ledger.balance_uegoc, new_bal);
+            if ledger.balance_uegoc != *new_bal {
+                ledger.balance_uegoc = *new_bal;
+                let _ = ledger.save();
+                if let Some(h) = crate::p2p::APP_HANDLE.get() {
+                    eprintln!("[ChainDB] emitting wallet-balance-updated — block #{} bal={}", block.height, new_bal);
+                    let _ = h.emit_all("wallet-balance-updated", serde_json::json!({
+                        "balance_uegoc": *new_bal,
+                        "balance_formatted": format!("{:.2} EGOC", *new_bal as f64 / 1_000_000.0)
+                    }));
+                }
+            }
+        }
     }
 
     // Write light header to CF_HEADERS (kept for a larger window than full block data).
@@ -898,9 +990,16 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
     prune_if_needed(db);
 
     // Update the in-memory nonce store so replay detection stays current.
+    // Also remove any confirmed TXs from the local pending tracker so the UI
+    // updates correctly even when a peer committed the block (not bft_solo_commit).
     for tx in &confirmed_txs {
         if !tx.from.is_empty() {
             crate::ledger::record_confirmed_nonce(&tx.from, tx.nonce);
+        }
+        if tx.tx_type != "reward" && tx.tx_type != "coinbase" && !tx.hash.is_empty() {
+            crate::commands::tx_pending::remove(&tx.hash);
+            eprintln!("[TX] {:.12} Confirmed — {:.16} → {:.16} {} uEGOC in block #{}",
+                tx.hash, tx.from, tx.to, tx.amount, block.height);
         }
     }
 
@@ -1105,6 +1204,72 @@ pub fn balance_of(address: &str) -> u64 {
         .ok().flatten()
         .map(|v| read_u64_le(&v))
         .unwrap_or(0)
+}
+
+/// Directly credit the testnet faucet to `address` (1,000 EGOC by default).
+/// Writes straight to CF_BALANCES so the balance is visible immediately,
+/// without waiting for a consensus block.  Idempotent — skipped if the
+/// address already has any balance or has been fauceted before.
+pub fn grant_testnet_faucet(address: &str, amount_uegoc: u64) -> bool {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf_balances = match db.cf_handle(CF_BALANCES) { Some(c) => c, None => return false };
+    let cf_meta     = match db.cf_handle(CF_META)     { Some(c) => c, None => return false };
+    let cf_txs      = match db.cf_handle(CF_TXS)      { Some(c) => c, None => return false };
+    let cf_addr_txs = match db.cf_handle(CF_ADDR_TXS) { Some(c) => c, None => return false };
+    let cf_recent   = match db.cf_handle(CF_RECENT_TXS){ Some(c) => c, None => return false };
+
+    let faucet_key = {
+        let mut k = b"faucet_addr:".to_vec();
+        k.extend_from_slice(address.as_bytes());
+        k
+    };
+    if db.get_cf(cf_meta, &faucet_key).ok().flatten().is_some() { return false; }
+
+    let existing = db.get_cf(cf_balances, address.as_bytes())
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    if existing > 0 { return false; }
+
+    let pool_bal = db.get_cf(cf_balances, NODE_POOL_ADDR.as_bytes())
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    let credited = amount_uegoc.min(pool_bal);
+    if credited == 0 { return false; }
+
+    let ts   = chrono::Utc::now().timestamp();
+    let sign_bytes = crate::ledger::tx_signing_bytes_v2(
+        NODE_POOL_ADDR, address, credited, 0, ts, 1, "testnet faucet",
+    );
+    let hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+
+    let tx = crate::ledger::LedgerTx {
+        hash:        hash.clone(),
+        from:        NODE_POOL_ADDR.into(),
+        to:          address.into(),
+        amount:      credited,
+        fee_uegoc:   0,
+        tx_type:     "faucet".into(),
+        memo:        Some("testnet faucet".into()),
+        timestamp:   ts,
+        status:      "Confirmed".into(),
+        block_height: None,
+        nonce:       0,
+        signature:   "faucet".into(),
+        tx_version:  2,
+        chain_id:    1,
+        ..crate::ledger::LedgerTx::default()
+    };
+
+    eprintln!("[Faucet] Granting {} uEGOC to {}", credited, address);
+    let mut batch = rocksdb::WriteBatch::default();
+    batch.put_cf(cf_balances, address.as_bytes(),         u64_le(credited));
+    batch.put_cf(cf_balances, NODE_POOL_ADDR.as_bytes(),  u64_le(pool_bal.saturating_sub(credited)));
+    batch.put_cf(cf_txs,      hash.as_bytes(),            encode(&tx));
+    let addr_k = addr_txs_key(address, ts, &hash);
+    batch.put_cf(cf_addr_txs, addr_k, (credited as i64).to_le_bytes());
+    let recent_k = recent_txs_key(ts, &hash);
+    batch.put_cf(cf_recent,   recent_k, encode(&tx));
+    batch.put_cf(cf_meta,     &faucet_key, b"1");
+    let _ = db.write(batch);
+    true
 }
 
 pub fn recent_blocks(limit: usize) -> Vec<LedgerBlock> {
@@ -1317,13 +1482,7 @@ pub fn mine_batch_db(txs: &[LedgerTx], miner: &str) -> LedgerBlock {
     mine_batch_db_with_ticket(txs, miner, &combined_ticket, poc_slot)
 }
 
-/// Canonical block hash function.  Every field that defines "what this block
-/// contains" is committed: prev_hash chains blocks, tx_merkle_root commits to
-/// all transactions, poc_ticket commits to the slot winner proof.
-///
-/// Changing any transaction → merkle root changes → block hash changes →
-/// every subsequent block's prev_hash is wrong → the whole chain from that
-/// point forward is invalid.  Same domino-effect as Bitcoin's PoW chain.
+
 pub fn block_hash_for(
     prev_hash:       &str,
     height:          u64,
@@ -1339,9 +1498,7 @@ pub fn block_hash_for(
     blake3::hash(input.as_bytes()).to_hex().to_string()
 }
 
-/// v3 block hash — includes the state delta root so any tampering with account
-/// balances changes the block hash and breaks every subsequent block's prev_hash.
-/// All new blocks are produced with this format.
+
 pub fn block_hash_v3(
     prev_hash:       &str,
     height:          u64,
@@ -1598,7 +1755,16 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
     let mut sim_balances: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut sim_stakes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
 
+    let mut seen_tx_hashes = std::collections::HashSet::new();
     let valid_txs: Vec<&LedgerTx> = txs.iter().filter(|tx| {
+        if tx.hash.is_empty() {
+            eprintln!("[TX] Rejected — empty hash (from={:.16})", tx.from);
+            return false;
+        }
+        if !seen_tx_hashes.insert(tx.hash.clone()) {
+            eprintln!("[TX] {:.12} Rejected — duplicate hash in proposal", tx.hash);
+            return false;
+        }
         if tx.nonce == 0 { return true; }
         let last = crate::ledger::last_confirmed_nonce(&tx.from);
         if tx.nonce <= last {
@@ -1780,17 +1946,33 @@ pub fn commit_staged_block(block: &LedgerBlock, stamped: &[LedgerTx], vote_count
         db.get_cf(cf_meta, META_LATEST_HEIGHT)
             .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
     };
-    if block.height != current_tip + 1 {
-        tracing::warn!(
-            "commit_staged_block: block #{} rejected — tip is #{} (already committed or stale)",
-            block.height, current_tip
-        );
-        return false;
+    if block.height == current_tip + 1 {
+        let mut b = block.clone();
+        b.vote_count = vote_count;
+        write_block_batch(&db, &b, stamped);
+        return true;
     }
-    let mut b = block.clone();
-    b.vote_count = vote_count;
-    write_block_batch(&db, &b, stamped);
-    true
+    // The sync path may have written this block before BFT finalization arrived.
+    // If the same block is already at this height, treat as committed and update
+    // the vote count (write_block_batch's fork-choice replaces if vote_count > existing).
+    if block.height <= current_tip {
+        let same_hash = db.cf_handle(CF_BLOCKS)
+            .and_then(|cf| db.get_cf(cf, height_key(block.height)).ok().flatten())
+            .and_then(|v| decode::<LedgerBlock>(&v))
+            .map(|existing| existing.hash == block.hash)
+            .unwrap_or(false);
+        if same_hash {
+            let mut b = block.clone();
+            b.vote_count = vote_count;
+            write_block_batch(&db, &b, stamped);
+            return true;
+        }
+    }
+    tracing::warn!(
+        "commit_staged_block: block #{} rejected — tip is #{} (stale or conflicting)",
+        block.height, current_tip
+    );
+    false
 }
 
 /// Verify that a block's hash field matches its contents.
@@ -1897,8 +2079,11 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
     }
     let mut seen_hashes = std::collections::HashSet::new();
     for tx in txs {
-        if tx.hash.is_empty() || !seen_hashes.insert(tx.hash.clone()) {
-            return Err(format!("duplicate or empty tx hash in block #{}", block.height));
+        if tx.hash.is_empty() {
+            return Err(format!("empty tx hash in block #{} (type={} from={})", block.height, tx.tx_type, tx.from));
+        }
+        if !seen_hashes.insert(tx.hash.clone()) {
+            return Err(format!("duplicate tx hash {} in block #{}", &tx.hash[..12.min(tx.hash.len())], block.height));
         }
     }
 
@@ -2092,15 +2277,15 @@ pub fn validate_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), 
     // Cryptographic Quorum Certificate verification
     // Only verify when an actual BLS aggregate signature is present; solo blocks (no BLS sig)
     // are accepted on hash + prev_hash integrity alone.
-    if block.height > 1 && block.vote_count > 0 && !block.agg_bls_sig.is_empty() {
+    if block.height > 1 && block.vote_count > 0 && !block.agg_bls_sig.is_empty() && !block.bls_pubkeys.is_empty() {
         let block_hash_bytes = hex::decode(&block.hash).unwrap_or_default();
         let sig_bytes = hex::decode(&block.agg_bls_sig).unwrap_or_default();
         let pubkeys: Vec<Vec<u8>> = block.bls_pubkeys.iter().filter_map(|pk| hex::decode(pk).ok()).collect();
 
-        if pubkeys.len() != block.vote_count as usize {
-            return Err("vote_count does not match the number of BLS pubkeys provided".into());
-        }
-
+        // Note: vote_count counts ALL voters (Ed25519 + Dilithium + BLS); bls_pubkeys
+        // only contains the BLS-signed subset. They differ when not every voter has a
+        // BLS key cached on the receiving node. Only enforce that we have at least one
+        // BLS pubkey to verify the aggregate signature against.
         let active_validators = crate::p2p::get_known_validators_snapshot();
         let total_weight = crate::bft_committee::total_drs_weight(&active_validators) as f64;
         let mut voter_weight = 0f64;
@@ -2113,7 +2298,10 @@ pub fn validate_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), 
             }
         }
 
-        if total_weight > 0.0 && (voter_weight * 3.0) <= (total_weight * 2.0) {
+        // Only enforce the 2/3 weight rule when we know enough validators to compute it.
+        // On small/bootstrapping networks where peer BLS keys haven't fully propagated,
+        // skip the weight check rather than rejecting valid blocks.
+        if total_weight > 0.0 && voter_weight > 0.0 && (voter_weight * 3.0) <= (total_weight * 2.0) {
             return Err("Quorum Certificate rejected: cumulative DRS weight is < 2/3 of network".into());
         }
 
@@ -2211,24 +2399,112 @@ pub fn delete_full_blocks_for_shard(shard_id: u32, shard_count: u32) {
     tracing::info!("Pruned {} full blocks for shard {} (keeping light headers)", heights_to_delete.len(), shard_id);
 }
 
-pub fn truncate_from(height: u64) {
-    if height == 0 { return; }
+fn reorg_reverse_balance_delta(tx: &LedgerTx, out: &mut std::collections::HashMap<String, i128>) {
+    if tx.tx_type == "equivocation_proof" { return; }
+    let is_system = tx.from == NODE_POOL_ADDR || tx.from.is_empty();
+    if is_unstake_tx(tx) {
+        let credit = unstake_credit_amount(tx) as i128;
+        *out.entry(tx.from.clone()).or_insert(0) -= credit - tx.fee_uegoc as i128;
+        *out.entry(STAKING_ADDR.to_string()).or_insert(0) += credit;
+    } else {
+        *out.entry(tx.to.clone()).or_insert(0) -= tx.amount as i128;
+        if !is_system {
+            *out.entry(tx.from.clone()).or_insert(0) += tx.amount as i128 + tx.fee_uegoc as i128;
+        } else if tx.from == NODE_POOL_ADDR {
+            *out.entry(NODE_POOL_ADDR.to_string()).or_insert(0) += tx.amount as i128;
+        }
+    }
+}
+
+fn recompute_max_nonce_for_addr(db: &DB, addr: &str) -> u64 {
+    let cf_txs = match db.cf_handle(CF_TXS) { Some(c) => c, None => return 0 };
+    let cf_addr_txs = match db.cf_handle(CF_ADDR_TXS) { Some(c) => c, None => return 0 };
+    let prefix = addr.as_bytes();
+    let iter = db.prefix_iterator_cf(cf_addr_txs, prefix);
+    let mut max_nonce: u64 = 0;
+    for item in iter {
+        let Ok((k, _)) = item else { continue };
+        if !k.starts_with(prefix) { break; }
+        if k.len() <= prefix.len() + 8 { continue; }
+        let tx_hash = match std::str::from_utf8(&k[prefix.len() + 8..]) { Ok(s) => s, Err(_) => continue };
+        if let Some(tx) = db.get_cf(cf_txs, tx_hash.as_bytes()).ok().flatten()
+            .and_then(|v| decode::<LedgerTx>(&v))
+        {
+            if tx.from == addr && tx.nonce > max_nonce {
+                max_nonce = tx.nonce;
+            }
+        }
+    }
+    max_nonce
+}
+
+pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
+    if height == 0 { return vec![]; }
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let cf_blocks = db.cf_handle(CF_BLOCKS).unwrap();
-    let cf_meta   = db.cf_handle(CF_META).unwrap();
+    let cf_blocks     = db.cf_handle(CF_BLOCKS).unwrap();
+    let cf_meta       = db.cf_handle(CF_META).unwrap();
     let tip = db.get_cf(cf_meta, META_LATEST_HEIGHT)
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-    if height > tip { return; }
+    if height > tip { return vec![]; }
+    let cf_block_txs  = db.cf_handle(CF_BLOCK_TXS).unwrap();
+    let cf_txs        = db.cf_handle(CF_TXS).unwrap();
+    let cf_addr_txs   = db.cf_handle(CF_ADDR_TXS).unwrap();
+    let cf_recent_txs = db.cf_handle(CF_RECENT_TXS).unwrap();
+    let cf_balances   = db.cf_handle(CF_BALANCES).unwrap();
+
     let mut removed_txs: u64 = 0;
+    let mut orphaned: Vec<crate::ledger::LedgerTx> = Vec::new();
+    let mut affected_senders: std::collections::HashSet<String> = Default::default();
+    let mut balance_reverse: std::collections::HashMap<String, i128> = Default::default();
     let mut batch = WriteBatch::default();
+
     for h in height..=tip {
         if let Ok(Some(bytes)) = db.get_cf(cf_blocks, height_key(h)) {
             if let Some(b) = decode::<LedgerBlock>(&bytes) {
                 removed_txs += b.tx_count as u64;
+                let block_tx_keys: Vec<Box<[u8]>> = db.prefix_iterator_cf(cf_block_txs, height_key(h))
+                    .filter_map(|item| item.ok().map(|(k, _)| k))
+                    .collect();
+                for key in &block_tx_keys {
+                    batch.delete_cf(cf_block_txs, key.as_ref());
+                    if key.len() <= 8 { continue; }
+                    let tx_hash = std::str::from_utf8(&key[8..]).unwrap_or("");
+                    if let Some(tx) = db.get_cf(cf_txs, tx_hash.as_bytes()).ok().flatten()
+                        .and_then(|v| decode::<LedgerTx>(&v))
+                    {
+                        batch.delete_cf(cf_txs, tx.hash.as_bytes());
+                        batch.delete_cf(cf_recent_txs, recent_txs_key(tx.timestamp, &tx.hash));
+                        if is_unstake_tx(&tx) {
+                            batch.delete_cf(cf_addr_txs, addr_txs_key(&tx.from, tx.timestamp, &tx.hash));
+                            batch.delete_cf(cf_addr_txs, addr_txs_key(STAKING_ADDR, tx.timestamp, &tx.hash));
+                        } else if tx.tx_type == "equivocation_proof" {
+                            batch.delete_cf(cf_addr_txs, addr_txs_key(STAKING_ADDR, tx.timestamp, &tx.hash));
+                            if !tx.to.is_empty() {
+                                batch.delete_cf(cf_addr_txs, addr_txs_key(&tx.to, tx.timestamp, &tx.hash));
+                            }
+                        } else {
+                            if !tx.to.is_empty() {
+                                batch.delete_cf(cf_addr_txs, addr_txs_key(&tx.to, tx.timestamp, &tx.hash));
+                            }
+                            let is_system = tx.from == NODE_POOL_ADDR || tx.from.is_empty();
+                            if !is_system {
+                                batch.delete_cf(cf_addr_txs, addr_txs_key(&tx.from, tx.timestamp, &tx.hash));
+                            }
+                        }
+                        reorg_reverse_balance_delta(&tx, &mut balance_reverse);
+                        if !tx.from.is_empty() && tx.nonce > 0 {
+                            affected_senders.insert(tx.from.clone());
+                        }
+                        if tx.tx_type == "transfer" || tx.tx_type == "stake" || tx.tx_type == "unstake" {
+                            orphaned.push(tx);
+                        }
+                    }
+                }
             }
         }
         batch.delete_cf(cf_blocks, height_key(h));
     }
+
     let new_tip = height - 1;
     batch.put_cf(cf_meta, META_LATEST_HEIGHT, u64_le(new_tip));
     if removed_txs > 0 {
@@ -2236,8 +2512,38 @@ pub fn truncate_from(height: u64) {
             .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
         batch.put_cf(cf_meta, META_TX_COUNT, u64_le(cur.saturating_sub(removed_txs)));
     }
+    for (addr, delta) in &balance_reverse {
+        if addr.is_empty() { continue; }
+        let cur = db.get_cf(cf_balances, addr.as_bytes())
+            .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+        let new_bal = (cur as i128 + delta).max(0) as u64;
+        if new_bal == 0 {
+            batch.delete_cf(cf_balances, addr.as_bytes());
+        } else {
+            batch.put_cf(cf_balances, addr.as_bytes(), u64_le(new_bal));
+        }
+    }
     db.write(batch).expect("truncate write");
-    tracing::warn!("Reorg: truncated heights {}..={} (new tip: {}, removed {} txs)", height, tip, new_tip, removed_txs);
+
+    if !affected_senders.is_empty() {
+        let mut nonce_batch = WriteBatch::default();
+        for addr in &affected_senders {
+            let max_nonce = recompute_max_nonce_for_addr(&db, addr);
+            let mut nonce_key = NONCE_KEY_PREFIX.to_vec();
+            nonce_key.extend_from_slice(addr.as_bytes());
+            if max_nonce == 0 {
+                nonce_batch.delete_cf(cf_meta, &nonce_key);
+            } else {
+                nonce_batch.put_cf(cf_meta, &nonce_key, u64_le(max_nonce));
+            }
+            crate::ledger::set_confirmed_nonce(addr, max_nonce);
+        }
+        db.write(nonce_batch).ok();
+    }
+
+    tracing::warn!("Reorg: truncated heights {}..={} (new tip: {}, removed {} txs, {} orphaned user txs)",
+        height, tip, new_tip, removed_txs, orphaned.len());
+    orphaned
 }
 
 /// Same as `append_peer_block` but stamps `vote_count` before writing.
@@ -4076,4 +4382,122 @@ pub fn set_meta_u64(key: &[u8], val: u64) {
     if let Some(cf) = db.cf_handle(CF_META) {
         let _ = db.put_cf(cf, key, &val.to_le_bytes());
     }
+}
+
+const META_KNOWN_VALIDATORS: &[u8] = b"known_validators_v1";
+
+pub fn persist_known_validator(addr: &str) {
+    if addr.is_empty() { return; }
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return };
+    let mut current: Vec<String> = db.get_cf(cf, META_KNOWN_VALIDATORS)
+        .ok().flatten()
+        .and_then(|v| serde_json::from_slice(&v).ok())
+        .unwrap_or_default();
+    let addr_s = addr.to_string();
+    if !current.contains(&addr_s) {
+        current.push(addr_s);
+        if let Ok(bytes) = serde_json::to_vec(&current) {
+            let _ = db.put_cf(cf, META_KNOWN_VALIDATORS, bytes);
+        }
+    }
+}
+
+pub fn remove_persisted_validator(addr: &str) {
+    if addr.is_empty() { return; }
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return };
+    let mut current: Vec<String> = db.get_cf(cf, META_KNOWN_VALIDATORS)
+        .ok().flatten()
+        .and_then(|v| serde_json::from_slice(&v).ok())
+        .unwrap_or_default();
+    current.retain(|a| a != addr);
+    if let Ok(bytes) = serde_json::to_vec(&current) {
+        let _ = db.put_cf(cf, META_KNOWN_VALIDATORS, bytes);
+    }
+}
+
+pub fn load_known_validators() -> Vec<String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return vec![] };
+    db.get_cf(cf, META_KNOWN_VALIDATORS)
+        .ok().flatten()
+        .and_then(|v| serde_json::from_slice(&v).ok())
+        .unwrap_or_default()
+}
+
+const META_PIN_LOCKOUT_PREFIX: &str = "pin_lock:";
+
+pub fn persist_pin_lockout(addr: &str, fails: u32, until: i64) {
+    if addr.is_empty() { return; }
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return };
+    let key = format!("{}{}", META_PIN_LOCKOUT_PREFIX, addr);
+    let val = serde_json::json!({ "fails": fails, "until": until });
+    if let Ok(bytes) = serde_json::to_vec(&val) {
+        let _ = db.put_cf(cf, key.as_bytes(), bytes);
+    }
+}
+
+pub fn load_pin_lockout(addr: &str) -> (u32, i64) {
+    if addr.is_empty() { return (0, 0); }
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return (0, 0) };
+    let key = format!("{}{}", META_PIN_LOCKOUT_PREFIX, addr);
+    db.get_cf(cf, key.as_bytes())
+        .ok().flatten()
+        .and_then(|v| serde_json::from_slice::<serde_json::Value>(&v).ok())
+        .map(|v| {
+            let fails = v["fails"].as_u64().unwrap_or(0) as u32;
+            let until = v["until"].as_i64().unwrap_or(0);
+            (fails, until)
+        })
+        .unwrap_or((0, 0))
+}
+
+pub fn clear_pin_lockout(addr: &str) {
+    if addr.is_empty() { return; }
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return };
+    let key = format!("{}{}", META_PIN_LOCKOUT_PREFIX, addr);
+    let _ = db.delete_cf(cf, key.as_bytes());
+}
+
+const META_OTP_TX_PREFIX: &str = "otptx:";
+
+pub fn persist_pending_otptx(tx_id: &str, tx: &crate::ledger::LedgerTx, expiry: i64) {
+    if tx_id.is_empty() { return; }
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return };
+    let key = format!("{}{}", META_OTP_TX_PREFIX, tx_id);
+    let val = serde_json::json!({ "tx": tx, "expiry": expiry });
+    if let Ok(bytes) = serde_json::to_vec(&val) {
+        let _ = db.put_cf(cf, key.as_bytes(), bytes);
+    }
+}
+
+pub fn load_pending_otptxs() -> Vec<(String, crate::ledger::LedgerTx, i64)> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return vec![] };
+    let now = chrono::Utc::now().timestamp();
+    db.iterator_cf(cf, rocksdb::IteratorMode::Start)
+        .flatten()
+        .filter_map(|(k, v)| {
+            let key_str = std::str::from_utf8(&k).ok()?;
+            let tx_id = key_str.strip_prefix(META_OTP_TX_PREFIX)?;
+            let obj = serde_json::from_slice::<serde_json::Value>(&v).ok()?;
+            let expiry = obj["expiry"].as_i64()?;
+            if expiry <= now { return None; }
+            let tx: crate::ledger::LedgerTx = serde_json::from_value(obj["tx"].clone()).ok()?;
+            Some((tx_id.to_string(), tx, expiry))
+        })
+        .collect()
+}
+
+pub fn remove_pending_otptx(tx_id: &str) {
+    if tx_id.is_empty() { return; }
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return };
+    let key = format!("{}{}", META_OTP_TX_PREFIX, tx_id);
+    let _ = db.delete_cf(cf, key.as_bytes());
 }

@@ -118,7 +118,6 @@ const ExplorerPage: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(true);
   const refreshTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
-  const loadingRef = React.useRef(false);
 
   const [blockPage, setBlockPage] = useState(1);
   const [txPage, setTxPage] = useState(1);
@@ -143,34 +142,42 @@ const ExplorerPage: React.FC = () => {
     loadData(false);
     const unsub = listen('ego://chain-updated', () => {
       if (refreshTimer.current) clearTimeout(refreshTimer.current);
-      refreshTimer.current = setTimeout(() => loadData(true), 5_000);
+      refreshTimer.current = setTimeout(() => loadData(true), 2_000);
     });
-    return () => { unsub.then(fn => fn()); if (refreshTimer.current) clearTimeout(refreshTimer.current); };
+    const pollId = setInterval(() => loadData(true), 30_000);
+    return () => {
+      unsub.then(fn => fn());
+      if (refreshTimer.current) clearTimeout(refreshTimer.current);
+      clearInterval(pollId);
+    };
   }, []);
 
   async function loadData(silent: boolean) {
-    if (loadingRef.current) return;
-    loadingRef.current = true;
     if (!silent) setLoading(true);
 
-    const withTimeout = <T,>(p: Promise<T>, fallback: T, ms = 15_000): Promise<T> =>
+    const withTimeout = <T,>(p: Promise<T>, fallback: T, ms = 8_000): Promise<T> =>
       Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
 
     try {
       const [b, t, n, fe] = await Promise.all([
-        withTimeout(invoke<LedgerBlock[]>('get_blocks', { offset: 0, limit: pageSize }).catch(() => []), []),
-        withTimeout(invoke<LedgerTx[]>('get_all_transactions', { offset: 0, limit: pageSize }).catch(() => []), []),
+        withTimeout(invoke<LedgerBlock[]>('get_blocks', { offset: 0, limit: pageSize }).catch(() => [] as LedgerBlock[]), [] as LedgerBlock[]),
+        withTimeout(invoke<LedgerTx[]>('get_all_transactions', { offset: 0, limit: pageSize }).catch(() => [] as LedgerTx[]), [] as LedgerTx[]),
         withTimeout(invoke<NetworkStats>('get_network_stats').catch(() => null), null),
-        withTimeout(invoke<FileEvent[]>('get_file_events').catch(() => []), []),
+        withTimeout(invoke<FileEvent[]>('get_file_events').catch(() => [] as FileEvent[]), [] as FileEvent[]),
       ]);
 
-      if (b.length > 0 || !silent) setBlocks(b);
-      if (t.length > 0 || !silent) setTxs(t);
+      if (!silent) {
+        setBlocks(b);
+        setTxs(t);
+        setFileEvents(fe);
+      } else {
+        if (b.length > 0) setBlocks(prev => b.length >= prev.length ? b : prev);
+        if (t.length > 0) setTxs(prev => t.length >= prev.length ? t : prev);
+        if (fe.length > 0) setFileEvents(fe);
+      }
       if (n) setNetStats(n);
-      if (fe.length > 0 || !silent) setFileEvents(fe);
       invoke<Tokenomics>('get_tokenomics').then(setTokenomics).catch(() => {});
     } finally {
-      loadingRef.current = false;
       setLoading(false);
     }
   }
