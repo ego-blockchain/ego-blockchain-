@@ -76,6 +76,14 @@ fn block_txs_key(height: u64, tx_hash: &str) -> Vec<u8> {
 
 fn addr_txs_key(addr: &str, ts: i64, tx_hash: &str) -> Vec<u8> {
     let mut k = addr.as_bytes().to_vec();
+    k.push(b':');
+    k.extend_from_slice(&ts_key(ts));
+    k.extend_from_slice(tx_hash.as_bytes());
+    k
+}
+
+fn old_addr_txs_key(addr: &str, ts: i64, tx_hash: &str) -> Vec<u8> {
+    let mut k = addr.as_bytes().to_vec();
     k.extend_from_slice(&ts_key(ts));
     k.extend_from_slice(tx_hash.as_bytes());
     k
@@ -139,8 +147,18 @@ pub fn get_db() -> DbWrapper {
             ColumnFamilyDescriptor::new(*name, cf_opts)
         }).collect();
 
-        let db = DB::open_cf_descriptors(&db_opts, &db_path, cf_descs)
-            .expect("open RocksDB chain store");
+        let db = match DB::open_cf_descriptors(&db_opts, &db_path, cf_descs) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("\n[FATAL ERROR] Could not open the blockchain database at:");
+                eprintln!("  {:?}", db_path);
+                eprintln!("Reason: {}", e);
+                eprintln!("\nThis usually happens because another instance of Ego Desktop is already running");
+                eprintln!("and using the same data directory. If you are running multiple nodes on the same");
+                eprintln!("machine, make sure to set a unique EGO_DATA_DIR environment variable for each node.");
+                std::process::exit(1);
+            }
+        };
         eprintln!("[ChainDB] RocksDB opened successfully");
 
         init_db(&db);
@@ -310,6 +328,29 @@ pub fn persist_validator_ed25519_pubkey(addr: &str, pubkey_hex: &str) {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let Some(cf) = db.cf_handle(CF_META) else { return; };
     let _ = db.put_cf(cf, validator_ed25519_key(addr), pubkey_hex.as_bytes());
+}
+
+fn validator_bls_key(addr: &str) -> Vec<u8> {
+    format!("validator_bls:{addr}").into_bytes()
+}
+
+pub fn get_validator_bls_pubkey(addr: &str) -> Option<String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_META)?;
+    db.get_cf(cf, validator_bls_key(addr))
+        .ok()
+        .flatten()
+        .and_then(|b| String::from_utf8(b.to_vec()).ok())
+        .filter(|s| !s.is_empty())
+}
+
+pub fn persist_validator_bls_pubkey(addr: &str, pubkey_hex: &str) {
+    if addr.is_empty() || pubkey_hex.len() != 96 {
+        return;
+    }
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf) = db.cf_handle(CF_META) else { return; };
+    let _ = db.put_cf(cf, validator_bls_key(addr), pubkey_hex.as_bytes());
 }
 
 fn load_slashed_set_inner(db: &DB) -> std::collections::HashSet<String> {
@@ -677,7 +718,7 @@ fn block_commit_mutex() -> &'static std::sync::Mutex<()> {
 /// Atomically writes one block + its transactions into all column families.
 /// Maintains balance cache and all secondary indices.
 /// INSERT-OR-IGNORE semantics: skips existing blocks/txs.
-fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
+fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     // Serialize all commits — multiple gossip paths (BFT QC, sync, ForkChoice)
     // can race for the same block. Without this lock, each path reads "no
     // existing block at this height", all proceed in parallel, each fires
@@ -692,7 +733,10 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
         if let Some(existing_bytes) = db.get_cf(cf_blocks_check, height_key(block.height)).ok().flatten() {
             if let Some(existing) = decode::<LedgerBlock>(&existing_bytes) {
                 if existing.hash == block.hash {
-                    return;
+                    return true;
+                } else {
+                    // Never overwrite in place! Caller must use truncate_from to handle reorgs safely.
+                    return false;
                 }
             }
         }
@@ -712,35 +756,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
     // Checkpoint guard: reject blocks that contradict hardcoded anchors.
     if let Err(e) = check_checkpoint(block) {
         tracing::error!("CHECKPOINT VIOLATION — rejecting block: {}", e);
-        return;
-    }
-
-    // Fork choice: if a block already exists at this height, only replace it
-    // if the incoming block has strictly more validator votes (heavier chain).
-    // This is the canonical rule: the block that collects the most BFT votes wins.
-    let mut replaced_tx_count: u64 = 0;
-    let mut is_fork_replacement = false;
-    let mut old_block_tx_keys: Vec<Box<[u8]>> = Vec::new();
-    if let Some(existing_bytes) = db.get_cf(cf_blocks, height_k).ok().flatten() {
-        let existing = decode::<LedgerBlock>(&existing_bytes);
-        let existing_votes = existing.as_ref().map(|b| b.vote_count).unwrap_or(0);
-        if block.vote_count <= existing_votes {
-            return; // existing block is at least as well-attested — keep it
-        }
-        // New block has more votes: fall through and overwrite.
-        // Track how many txs the old block had so we can adjust META_TX_COUNT.
-        replaced_tx_count = existing.map(|b| b.tx_count as u64).unwrap_or(0);
-        is_fork_replacement = true;
-        // Collect stale CF_BLOCK_TXS entries from the old block so we can delete them.
-        // Without this cleanup, get_txs_for_block() returns too many TXs after a fork rewrite.
-        let iter = db.prefix_iterator_cf(cf_block_txs, height_k);
-        for item in iter {
-            if let Ok((key, _)) = item {
-                old_block_tx_keys.push(key);
-            }
-        }
-        tracing::info!("ForkChoice: replacing block #{} ({} votes → {} votes)",
-            block.height, existing_votes, block.vote_count);
+        return false;
     }
 
     // Pre-read balances for all addresses involved (read-before-batch).
@@ -863,19 +879,10 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
     // Block record.
     batch.put_cf(cf_blocks, height_k, encode(block));
 
-    // Delete stale CF_BLOCK_TXS entries from the replaced block (fork-choice cleanup).
-    for key in &old_block_tx_keys {
-        batch.delete_cf(cf_block_txs, key.as_ref());
-    }
-
     // Transactions + all secondary indices.
     for tx in &confirmed_txs {
         let already_exists = db.get_cf(cf_txs, tx.hash.as_bytes()).ok().flatten().is_some();
         if already_exists {
-            // Re-index into this block's CF_BLOCK_TXS when fork-choice re-uses an existing TX.
-            if is_fork_replacement {
-                batch.put_cf(cf_block_txs, block_txs_key(block.height, &tx.hash), b"");
-            }
             continue;
         }
         batch.put_cf(cf_txs,        tx.hash.as_bytes(), encode(tx));
@@ -922,7 +929,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
     }
     let cur_tx_count = db.get_cf(cf_meta, META_TX_COUNT)
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-    let adjusted = cur_tx_count.saturating_sub(replaced_tx_count) + new_tx_count;
+    let adjusted = cur_tx_count + block.tx_count as u64;
     batch.put_cf(cf_meta, META_TX_COUNT, u64_le(adjusted));
 
     // Persist confirmed nonces atomically with the block write so replay
@@ -959,25 +966,30 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
     eprintln!("[ChainDB] db.write(batch) starting — block #{}", block.height);
     if let Err(e) = db.write(batch) {
         tracing::error!("write batch failed (disk full?): {e}");
-        return;
+        return false;
     }
     eprintln!("[ChainDB] db.write(batch) done — block #{}", block.height);
 
-    {
-        let mut ledger = crate::ledger::Ledger::load();
-        if let Some(new_bal) = new_balances.get(&ledger.address) {
-            eprintln!("[ChainDB] balance update — addr {:.16} old={} new={}", ledger.address, ledger.balance_uegoc, new_bal);
-            if ledger.balance_uegoc != *new_bal {
-                ledger.balance_uegoc = *new_bal;
-                let _ = ledger.save();
-                if let Some(h) = crate::p2p::APP_HANDLE.get() {
-                    eprintln!("[ChainDB] emitting wallet-balance-updated — block #{} bal={}", block.height, new_bal);
-                    let _ = h.emit_all("wallet-balance-updated", serde_json::json!({
-                        "balance_uegoc": *new_bal,
-                        "balance_formatted": format!("{:.2} EGOC", *new_bal as f64 / 1_000_000.0)
-                    }));
+    let block_height = block.height;
+    let addr = crate::ledger::Ledger::load().address;
+    if let Some(&new_bal) = new_balances.get(&addr) {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _guard = crate::ledger::TX_MUTEX.lock().await;
+                let mut ledger = crate::ledger::Ledger::load();
+                if ledger.balance_uegoc != new_bal {
+                    eprintln!("[ChainDB] balance update — addr {:.16} old={} new={}", ledger.address, ledger.balance_uegoc, new_bal);
+                    ledger.balance_uegoc = new_bal;
+                    let _ = ledger.save();
+                    if let Some(h) = crate::p2p::APP_HANDLE.get() {
+                        eprintln!("[ChainDB] emitting wallet-balance-updated — block #{} bal={}", block_height, new_bal);
+                        let _ = h.emit_all("wallet-balance-updated", serde_json::json!({
+                            "balance_uegoc": new_bal,
+                            "balance_formatted": format!("{:.2} EGOC", new_bal as f64 / 1_000_000.0)
+                        }));
+                    }
                 }
-            }
+            });
         }
     }
 
@@ -992,16 +1004,21 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
     // Update the in-memory nonce store so replay detection stays current.
     // Also remove any confirmed TXs from the local pending tracker so the UI
     // updates correctly even when a peer committed the block (not bft_solo_commit).
+    let mut hashes_to_remove = Vec::with_capacity(confirmed_txs.len());
     for tx in &confirmed_txs {
+        hashes_to_remove.push(tx.hash.clone());
         if !tx.from.is_empty() {
             crate::ledger::record_confirmed_nonce(&tx.from, tx.nonce);
         }
-        if tx.tx_type != "reward" && tx.tx_type != "coinbase" && !tx.hash.is_empty() {
+        if !tx.hash.is_empty() {
             crate::commands::tx_pending::remove(&tx.hash);
+        }
+        if !tx.from.is_empty() && tx.from != NODE_POOL_ADDR && !tx.hash.is_empty() {
             eprintln!("[TX] {:.12} Confirmed — {:.16} → {:.16} {} uEGOC in block #{}",
                 tx.hash, tx.from, tx.to, tx.amount, block.height);
         }
     }
+    crate::mempool::get_mempool().remove_txs(&hashes_to_remove);
 
     // Update validator stake tracker for staking/unstaking TXs.
     // This is what gates validator registration (minimum stake required).
@@ -1016,6 +1033,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) {
             }
         }
     }
+    true
 }
 
 // ── Pruning ───────────────────────────────────────────────────────────────────
@@ -1086,6 +1104,7 @@ fn prune_if_needed(db: &DB) {
                 let iter = db.prefix_iterator_cf(cf_block_txs, prefix);
                 for item in iter {
                     if let Ok((k, _)) = item {
+                        if !k.starts_with(&prefix) { break; }
                         if k.len() > 8 {
                             let tx_hash = &k[8..];
                             if let Some(v) = db.get_cf(cf_txs, tx_hash).ok().flatten() {
@@ -1098,8 +1117,10 @@ fn prune_if_needed(db: &DB) {
                                         let tx_hash_str = std::str::from_utf8(tx_hash).unwrap_or("");
                                         if !tx_hash_str.is_empty() {
                                             batch.delete_cf(cf_addr_txs, addr_txs_key(&tx.to, tx.timestamp, tx_hash_str));
+                                    batch.delete_cf(cf_addr_txs, old_addr_txs_key(&tx.to, tx.timestamp, tx_hash_str));
                                             if !tx.from.is_empty() && tx.from != NODE_POOL_ADDR {
                                                 batch.delete_cf(cf_addr_txs, addr_txs_key(&tx.from, tx.timestamp, tx_hash_str));
+                                        batch.delete_cf(cf_addr_txs, old_addr_txs_key(&tx.from, tx.timestamp, tx_hash_str));
                                             }
                                         }
                                     }
@@ -1206,31 +1227,25 @@ pub fn balance_of(address: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Directly credit the testnet faucet to `address` (1,000 EGOC by default).
-/// Writes straight to CF_BALANCES so the balance is visible immediately,
-/// without waiting for a consensus block.  Idempotent — skipped if the
-/// address already has any balance or has been fauceted before.
+
 pub fn grant_testnet_faucet(address: &str, amount_uegoc: u64) -> bool {
-    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let cf_balances = match db.cf_handle(CF_BALANCES) { Some(c) => c, None => return false };
-    let cf_meta     = match db.cf_handle(CF_META)     { Some(c) => c, None => return false };
-    let cf_txs      = match db.cf_handle(CF_TXS)      { Some(c) => c, None => return false };
-    let cf_addr_txs = match db.cf_handle(CF_ADDR_TXS) { Some(c) => c, None => return false };
-    let cf_recent   = match db.cf_handle(CF_RECENT_TXS){ Some(c) => c, None => return false };
+    let pool_bal = {
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let cf_balances = match db.cf_handle(CF_BALANCES) { Some(c) => c, None => return false };
 
-    let faucet_key = {
-        let mut k = b"faucet_addr:".to_vec();
-        k.extend_from_slice(address.as_bytes());
-        k
+        let cur_balance = db.get_cf(cf_balances, address.as_bytes())
+            .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+        if cur_balance > 0 { return false; }
+
+        db.get_cf(cf_balances, NODE_POOL_ADDR.as_bytes())
+            .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
     };
-    if db.get_cf(cf_meta, &faucet_key).ok().flatten().is_some() { return false; }
 
-    let existing = db.get_cf(cf_balances, address.as_bytes())
-        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-    if existing > 0 { return false; }
+    let pool = crate::mempool::get_mempool();
+    if pool.pending_txs_for_address(address).iter().any(|tx| tx.tx_type == "faucet") {
+        return false;
+    }
 
-    let pool_bal = db.get_cf(cf_balances, NODE_POOL_ADDR.as_bytes())
-        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
     let credited = amount_uegoc.min(pool_bal);
     if credited == 0 { return false; }
 
@@ -1249,7 +1264,7 @@ pub fn grant_testnet_faucet(address: &str, amount_uegoc: u64) -> bool {
         tx_type:     "faucet".into(),
         memo:        Some("testnet faucet".into()),
         timestamp:   ts,
-        status:      "Confirmed".into(),
+        status:      "Pending".into(),
         block_height: None,
         nonce:       0,
         signature:   "faucet".into(),
@@ -1258,17 +1273,12 @@ pub fn grant_testnet_faucet(address: &str, amount_uegoc: u64) -> bool {
         ..crate::ledger::LedgerTx::default()
     };
 
-    eprintln!("[Faucet] Granting {} uEGOC to {}", credited, address);
-    let mut batch = rocksdb::WriteBatch::default();
-    batch.put_cf(cf_balances, address.as_bytes(),         u64_le(credited));
-    batch.put_cf(cf_balances, NODE_POOL_ADDR.as_bytes(),  u64_le(pool_bal.saturating_sub(credited)));
-    batch.put_cf(cf_txs,      hash.as_bytes(),            encode(&tx));
-    let addr_k = addr_txs_key(address, ts, &hash);
-    batch.put_cf(cf_addr_txs, addr_k, (credited as i64).to_le_bytes());
-    let recent_k = recent_txs_key(ts, &hash);
-    batch.put_cf(cf_recent,   recent_k, encode(&tx));
-    batch.put_cf(cf_meta,     &faucet_key, b"1");
-    let _ = db.write(batch);
+    eprintln!("[Faucet] Queuing {} uEGOC for {} via Mempool", credited, address);
+    
+    pool.push(tx.clone());
+    tokio::spawn(async move {
+        crate::p2p::broadcast_pending_tx(tx).await;
+    });
     true
 }
 
@@ -1320,6 +1330,10 @@ pub fn paged_transactions(offset: usize, limit: usize) -> Vec<LedgerTx> {
         .filter_map(|h| {
             db.get_cf(cf_txs, h).ok().flatten()
                 .and_then(|v| decode::<LedgerTx>(&v))
+                .map(|mut tx| {
+                    tx.status = "Confirmed".to_string();
+                    tx
+                })
         })
         .collect()
 }
@@ -1350,6 +1364,10 @@ pub fn get_tx_by_hash(hash: &str) -> Option<LedgerTx> {
     let cf = db.cf_handle(CF_TXS).unwrap();
     db.get_cf(cf, hash.as_bytes()).ok().flatten()
         .and_then(|v| decode(&v))
+        .map(|mut tx: LedgerTx| {
+            tx.status = "Confirmed".to_string();
+            tx
+        })
 }
 
 /// Return all transactions confirmed in block `height`, in insertion order.
@@ -1364,12 +1382,14 @@ pub fn get_txs_for_block(height: u64) -> Vec<LedgerTx> {
     let iter = db.prefix_iterator_cf(cf_block_txs, prefix);
     for item in iter {
         let Ok((key, _)) = item else { continue };
+        if !key.starts_with(&prefix) { break; }
         if key.len() <= 8 { continue; }
         let tx_hash = std::str::from_utf8(&key[8..]).unwrap_or("");
         if tx_hash.is_empty() { continue; }
-        if let Some(tx) = db.get_cf(cf_txs, tx_hash.as_bytes()).ok().flatten()
+        if let Some(mut tx) = db.get_cf(cf_txs, tx_hash.as_bytes()).ok().flatten()
             .and_then(|v| decode::<LedgerTx>(&v))
         {
+            tx.status = "Confirmed".to_string();
             out.push(tx);
         }
     }
@@ -1382,15 +1402,16 @@ pub fn get_tx_history_for_addr(address: &str) -> Vec<LedgerTx> {
     let cf_addr = db.cf_handle(CF_ADDR_TXS).unwrap();
     let cf_txs  = db.cf_handle(CF_TXS).unwrap();
 
-    let prefix = address.as_bytes();
-    let iter = db.prefix_iterator_cf(cf_addr, prefix);
+    let mut prefix = address.as_bytes().to_vec();
+    prefix.push(b':');
+    let iter = db.prefix_iterator_cf(cf_addr, &prefix);
     let mut hashes: Vec<Vec<u8>> = Vec::new();
 
     for item in iter {
         let (k, _) = match item { Ok(v) => v, Err(e) => { eprintln!("[ChainDB] iter error: {e}"); break; } };
-        if !k.starts_with(prefix) { break; }
-        // Key = addr ++ ts_be8 ++ tx_hash; tx_hash starts after addr+8.
-        let hash_start = prefix.len() + 8;
+        if !k.starts_with(&prefix) { break; }
+        // Key = addr ++ ':' ++ ts_be8 ++ tx_hash; tx_hash starts after addr+9 (with colon).
+        let hash_start = prefix.len() + 8; // Since prefix already includes the colon
         if k.len() > hash_start {
             hashes.push(k[hash_start..].to_vec());
         }
@@ -1400,6 +1421,10 @@ pub fn get_tx_history_for_addr(address: &str) -> Vec<LedgerTx> {
         .filter_map(|h| {
             db.get_cf(cf_txs, h).ok().flatten()
                 .and_then(|v| decode::<LedgerTx>(&v))
+                .map(|mut tx| {
+                    tx.status = "Confirmed".to_string();
+                    tx
+                })
         })
         .collect()
 }
@@ -1754,9 +1779,14 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
     let cf_bal = db.cf_handle(CF_BALANCES).expect("CF_BALANCES missing");
     let mut sim_balances: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut sim_stakes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut sim_nonces: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+
+    let mut sorted_txs = txs.to_vec();
+    // Ensure strict nonce ordering so validation doesn't reject out-of-order txs
+    sorted_txs.sort_by_key(|t| t.nonce);
 
     let mut seen_tx_hashes = std::collections::HashSet::new();
-    let valid_txs: Vec<&LedgerTx> = txs.iter().filter(|tx| {
+    let valid_txs: Vec<&LedgerTx> = sorted_txs.iter().filter(|tx| {
         if tx.hash.is_empty() {
             eprintln!("[TX] Rejected — empty hash (from={:.16})", tx.from);
             return false;
@@ -1765,15 +1795,18 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
             eprintln!("[TX] {:.12} Rejected — duplicate hash in proposal", tx.hash);
             return false;
         }
+            if get_tx_by_hash(&tx.hash).is_some() {
+            // TX was already confirmed by a peer's block, silently drop from mempool
+                return false;
+            }
         if tx.nonce == 0 { return true; }
-        let last = crate::ledger::last_confirmed_nonce(&tx.from);
+        let last = *sim_nonces.entry(tx.from.clone())
+            .or_insert_with(|| crate::ledger::last_confirmed_nonce(&tx.from));
         if tx.nonce <= last {
-            eprintln!(
-                "[TX] {:.12} Rejected — stale nonce {} <= confirmed {} for {:.16}",
-                tx.hash, tx.nonce, last, tx.from
-            );
+            // Stale nonce means it was already processed, silently drop
             return false;
         }
+        sim_nonces.insert(tx.from.clone(), tx.nonce);
 
         if is_unstake_tx(tx) {
             let stake_left = sim_stakes.entry(tx.from.clone())
@@ -1814,6 +1847,13 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
                 return false;
             }
             sim_balances.insert(tx.from.clone(), from_bal - cost);
+            
+            if !tx.to.is_empty() && !crate::ledger::is_reserved_system_source(&tx.to) {
+                let to_bal = sim_balances.get(&tx.to).copied().unwrap_or_else(|| {
+                    db.get_cf(cf_bal, tx.to.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
+                });
+                sim_balances.insert(tx.to.clone(), to_bal.saturating_add(tx.amount));
+            }
         }
 
         true
@@ -2004,15 +2044,15 @@ pub fn verify_block_hash(block: &LedgerBlock, _txs: &[crate::ledger::LedgerTx]) 
             &block.state_root,
         );
         if block.hash == v3_hash { return true; }
-        tracing::error!(
-            "Block #{} v3 hash mismatch: stored={:.8} expected={:.8}",
+        tracing::debug!(
+            "Block #{} v3 hash mismatch: stored={:.8} expected={:.8} — ignoring foreign block",
             block.height, block.hash, v3_hash
         );
         return false;
     }
 
-    tracing::error!(
-        "Block #{} hash mismatch: stored={:.8} v2={:.8}",
+    tracing::debug!(
+        "Block #{} hash mismatch: stored={:.8} v2={:.8} — ignoring foreign block",
         block.height, block.hash, v2_hash
     );
     false
@@ -2077,8 +2117,13 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
             txs.len()
         ));
     }
+
+    let mut sorted_txs = txs.to_vec();
+    // Sort transactions by nonce to recover the original order if scrambled by CF_BLOCK_TXS
+    sorted_txs.sort_by_key(|t| t.nonce);
+
     let mut seen_hashes = std::collections::HashSet::new();
-    for tx in txs {
+    for tx in &sorted_txs {
         if tx.hash.is_empty() {
             return Err(format!("empty tx hash in block #{} (type={} from={})", block.height, tx.tx_type, tx.from));
         }
@@ -2087,7 +2132,7 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
         }
     }
 
-    let tx_fees_sum: u64 = txs.iter()
+    let tx_fees_sum: u64 = sorted_txs.iter()
         .filter(|t| !crate::ledger::is_protocol_system_tx(t))
         .map(|t| t.fee_uegoc)
         .sum();
@@ -2107,7 +2152,7 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
         ));
     }
 
-    let coinbase_txs: Vec<&LedgerTx> = txs.iter()
+    let coinbase_txs: Vec<&LedgerTx> = sorted_txs.iter()
         .filter(|t| Some(&t.hash) == block.coinbase_tx.as_ref())
         .collect();
     if expected_reward > 0 {
@@ -2128,7 +2173,7 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
         return Err("coinbase present when expected reward is zero".to_string());
     }
 
-    let fee_txs: Vec<&LedgerTx> = txs.iter()
+    let fee_txs: Vec<&LedgerTx> = sorted_txs.iter()
         .filter(|t| t.tx_type == "fee_distribution")
         .collect();
     if expected_staking_fee > 0 {
@@ -2151,7 +2196,7 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
         return Err("unexpected staking fee tx".to_string());
     }
 
-    for tx in txs {
+    for tx in &sorted_txs {
         if crate::ledger::is_protocol_system_tx(tx) {
             let is_coinbase = Some(&tx.hash) == block.coinbase_tx.as_ref();
             let is_fee = tx.tx_type == "fee_distribution";
@@ -2175,7 +2220,7 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
     let mut simulated_balances: std::collections::HashMap<String, u64> = Default::default();
     let mut simulated_nonces: std::collections::HashMap<String, u64> = Default::default();
     let mut simulated_stakes: std::collections::HashMap<String, u64> = Default::default();
-    for tx in txs {
+    for tx in &sorted_txs {
         if crate::ledger::is_protocol_system_tx(tx) || crate::ledger::is_reserved_system_source(&tx.from) {
             continue;
         }
@@ -2270,38 +2315,32 @@ pub fn validate_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), 
     } else if block.prev_hash != GENESIS_HASH {
         return Err("height-1 block does not point at genesis".into());
     }
-    // state_root authenticity is already guaranteed by the block hash (block_hash_v3 includes it).
-    // Local recomputation is skipped here because it depends on current DB state which differs
-    // between nodes and across reorgs, causing false rejections.
-    
-    // Cryptographic Quorum Certificate verification
-    // Only verify when an actual BLS aggregate signature is present; solo blocks (no BLS sig)
-    // are accepted on hash + prev_hash integrity alone.
+
     if block.height > 1 && block.vote_count > 0 && !block.agg_bls_sig.is_empty() && !block.bls_pubkeys.is_empty() {
         let block_hash_bytes = hex::decode(&block.hash).unwrap_or_default();
         let sig_bytes = hex::decode(&block.agg_bls_sig).unwrap_or_default();
         let pubkeys: Vec<Vec<u8>> = block.bls_pubkeys.iter().filter_map(|pk| hex::decode(pk).ok()).collect();
 
-        // Note: vote_count counts ALL voters (Ed25519 + Dilithium + BLS); bls_pubkeys
-        // only contains the BLS-signed subset. They differ when not every voter has a
-        // BLS key cached on the receiving node. Only enforce that we have at least one
-        // BLS pubkey to verify the aggregate signature against.
+
         let active_validators = crate::p2p::get_known_validators_snapshot();
         let total_weight = crate::bft_committee::total_drs_weight(&active_validators) as f64;
         let mut voter_weight = 0f64;
+        let mut max_unknown_weight = 0f64;
 
         for val_addr in &active_validators {
             if let Some(val_bls_pk) = crate::p2p::get_peer_bls_pubkey_hex(val_addr) {
                 if block.bls_pubkeys.contains(&val_bls_pk) {
                     voter_weight += crate::bft_committee::compute_drs_weight(val_addr) as f64;
                 }
+            } else {
+                max_unknown_weight += crate::bft_committee::compute_drs_weight(val_addr) as f64;
             }
         }
 
-        // Only enforce the 2/3 weight rule when we know enough validators to compute it.
-        // On small/bootstrapping networks where peer BLS keys haven't fully propagated,
-        // skip the weight check rather than rejecting valid blocks.
-        if total_weight > 0.0 && voter_weight > 0.0 && (voter_weight * 3.0) <= (total_weight * 2.0) {
+        let max_possible_weight = voter_weight + max_unknown_weight;
+
+        // If we don't have all BLS keys cached locally, we assume the unknown keys *could* belong to the signers.
+        if active_validators.len() >= 10 && total_weight > 0.0 && (max_possible_weight * 3.0) < (total_weight * 2.0) {
             return Err("Quorum Certificate rejected: cumulative DRS weight is < 2/3 of network".into());
         }
 
@@ -2310,11 +2349,7 @@ pub fn validate_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), 
         }
     }
 
-    // Only validate TX balances when our DB state is at block.height-1 (the correct parent
-    // state). If local tip is ahead or behind that point (reorg, bulk sync, or we already
-    // committed a competing block at this height), the CF_BALANCES snapshot is wrong and
-    // would produce false rejections. Chain integrity is already guaranteed by hash + merkle +
-    // prev_hash; TX balance validity was checked by the 2/3 proposer committee at the time.
+
     let local_tip = db.cf_handle(CF_META)
         .and_then(|cf| db.get_cf(cf, META_LATEST_HEIGHT).ok().flatten())
         .map(|v| read_u64_le(&v))
@@ -2325,13 +2360,17 @@ pub fn validate_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), 
     Ok(())
 }
 
-/// Append a block received from a peer (gossip / sync path).
-/// Fork choice: replaces existing block at the same height only if the new
-/// block carries more BFT votes (heavier chain wins).
-pub fn append_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) {
+
+pub fn append_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     if let Some(existing) = get_block_by_height(block.height) {
         if existing.hash == block.hash {
-            return;
+            return true;
+        } else {
+            // Fork detected via gossip. Reject and trigger sync to heal via truncate_from.
+            tokio::spawn(async move {
+                crate::p2p::sync_chain_from_peers().await;
+            });
+            return false;
         }
     }
     if let Err(reason) = validate_peer_block(block, txs) {
@@ -2341,7 +2380,12 @@ pub fn append_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) {
             block.hash,
             reason
         );
-        return;
+        if reason.contains("missing local parent") || reason.contains("prev_hash mismatch") {
+            tokio::spawn(async move {
+                crate::p2p::sync_chain_from_peers().await;
+            });
+        }
+        return false;
     }
 
     let map = crate::sharding::load_shard_map();
@@ -2359,17 +2403,17 @@ pub fn append_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) {
             let cf_hdrs = db.cf_handle(CF_HEADERS).unwrap();
             let hdr = LightBlockHeader::from(block);
             db.put_cf(cf_hdrs, height_key(block.height), encode(&hdr)).ok();
-            return;
+            return false;
         }
     }
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    write_block_batch(&db, block, txs);
+    write_block_batch(&db, block, txs)
 }
 
-pub fn append_trusted_block(block: &LedgerBlock, txs: &[LedgerTx]) {
-    if block.height == 0 { return; }
+pub fn append_trusted_block(block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
+    if block.height == 0 { return false; }
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    write_block_batch(&db, block, txs);
+    write_block_batch(&db, block, txs)
 }
 
 pub fn delete_full_blocks_for_shard(shard_id: u32, shard_count: u32) {
@@ -2419,12 +2463,13 @@ fn reorg_reverse_balance_delta(tx: &LedgerTx, out: &mut std::collections::HashMa
 fn recompute_max_nonce_for_addr(db: &DB, addr: &str) -> u64 {
     let cf_txs = match db.cf_handle(CF_TXS) { Some(c) => c, None => return 0 };
     let cf_addr_txs = match db.cf_handle(CF_ADDR_TXS) { Some(c) => c, None => return 0 };
-    let prefix = addr.as_bytes();
-    let iter = db.prefix_iterator_cf(cf_addr_txs, prefix);
+    let mut prefix = addr.as_bytes().to_vec();
+    prefix.push(b':');
+    let iter = db.prefix_iterator_cf(cf_addr_txs, &prefix);
     let mut max_nonce: u64 = 0;
     for item in iter {
         let Ok((k, _)) = item else { continue };
-        if !k.starts_with(prefix) { break; }
+        if !k.starts_with(&prefix) { break; }
         if k.len() <= prefix.len() + 8 { continue; }
         let tx_hash = match std::str::from_utf8(&k[prefix.len() + 8..]) { Ok(s) => s, Err(_) => continue };
         if let Some(tx) = db.get_cf(cf_txs, tx_hash.as_bytes()).ok().flatten()
@@ -2464,31 +2509,38 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
                 removed_txs += b.tx_count as u64;
                 let block_tx_keys: Vec<Box<[u8]>> = db.prefix_iterator_cf(cf_block_txs, height_key(h))
                     .filter_map(|item| item.ok().map(|(k, _)| k))
+                    .take_while(|k| k.starts_with(&height_key(h)))
                     .collect();
                 for key in &block_tx_keys {
                     batch.delete_cf(cf_block_txs, key.as_ref());
                     if key.len() <= 8 { continue; }
                     let tx_hash = std::str::from_utf8(&key[8..]).unwrap_or("");
-                    if let Some(tx) = db.get_cf(cf_txs, tx_hash.as_bytes()).ok().flatten()
+                    if let Some(mut tx) = db.get_cf(cf_txs, tx_hash.as_bytes()).ok().flatten()
                         .and_then(|v| decode::<LedgerTx>(&v))
                     {
                         batch.delete_cf(cf_txs, tx.hash.as_bytes());
                         batch.delete_cf(cf_recent_txs, recent_txs_key(tx.timestamp, &tx.hash));
                         if is_unstake_tx(&tx) {
                             batch.delete_cf(cf_addr_txs, addr_txs_key(&tx.from, tx.timestamp, &tx.hash));
+                    batch.delete_cf(cf_addr_txs, old_addr_txs_key(&tx.from, tx.timestamp, &tx.hash));
                             batch.delete_cf(cf_addr_txs, addr_txs_key(STAKING_ADDR, tx.timestamp, &tx.hash));
+                    batch.delete_cf(cf_addr_txs, old_addr_txs_key(STAKING_ADDR, tx.timestamp, &tx.hash));
                         } else if tx.tx_type == "equivocation_proof" {
                             batch.delete_cf(cf_addr_txs, addr_txs_key(STAKING_ADDR, tx.timestamp, &tx.hash));
+                    batch.delete_cf(cf_addr_txs, old_addr_txs_key(STAKING_ADDR, tx.timestamp, &tx.hash));
                             if !tx.to.is_empty() {
                                 batch.delete_cf(cf_addr_txs, addr_txs_key(&tx.to, tx.timestamp, &tx.hash));
+                        batch.delete_cf(cf_addr_txs, old_addr_txs_key(&tx.to, tx.timestamp, &tx.hash));
                             }
                         } else {
                             if !tx.to.is_empty() {
                                 batch.delete_cf(cf_addr_txs, addr_txs_key(&tx.to, tx.timestamp, &tx.hash));
+                        batch.delete_cf(cf_addr_txs, old_addr_txs_key(&tx.to, tx.timestamp, &tx.hash));
                             }
                             let is_system = tx.from == NODE_POOL_ADDR || tx.from.is_empty();
                             if !is_system {
                                 batch.delete_cf(cf_addr_txs, addr_txs_key(&tx.from, tx.timestamp, &tx.hash));
+                        batch.delete_cf(cf_addr_txs, old_addr_txs_key(&tx.from, tx.timestamp, &tx.hash));
                             }
                         }
                         reorg_reverse_balance_delta(&tx, &mut balance_reverse);
@@ -2496,6 +2548,8 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
                             affected_senders.insert(tx.from.clone());
                         }
                         if tx.tx_type == "transfer" || tx.tx_type == "stake" || tx.tx_type == "unstake" {
+                    tx.status = "Pending".to_string();
+                    tx.block_height = None;
                             orphaned.push(tx);
                         }
                     }
@@ -2563,14 +2617,6 @@ pub fn append_peer_block_with_votes(block: &LedgerBlock, txs: &[LedgerTx], votes
 /// TX and balance columns, never the block record.
 pub fn apply_missing_tx(block_height: u64, tx: &LedgerTx) {
     if tx.hash.is_empty() { return; }
-    tracing::warn!(
-        "Ignoring unauthenticated missing tx {} for block #{}; tx sets must arrive through verified block sync",
-        tx.hash,
-        block_height
-    );
-    return;
-    #[allow(unreachable_code)]
-    {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
 
     let cf_txs        = db.cf_handle(CF_TXS).unwrap();
@@ -2648,7 +2694,6 @@ pub fn apply_missing_tx(block_height: u64, tx: &LedgerTx) {
 
     if let Err(e) = db.write(batch) {
         eprintln!("[ChainDB] apply_missing_tx write failed: {e}");
-    }
     }
 }
 
@@ -3019,6 +3064,7 @@ pub fn restore_in_memory_state_from_db() {
         let iter = db.prefix_iterator_cf(cf_meta, b"stake:");
         for item in iter {
             if let Ok((k, v)) = item {
+                if !k.starts_with(b"stake:") { break; }
                 if let Ok(key_str) = std::str::from_utf8(&k) {
                     if key_str.starts_with("stake:") {
                         let addr = &key_str[6..];
@@ -3045,14 +3091,39 @@ fn recalibrate_tx_count() {
     let cf_meta   = match db.cf_handle(CF_META)   { Some(c) => c, None => return };
     let tip = db.get_cf(cf_meta, META_LATEST_HEIGHT)
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+        
+        let mut gap_height = None;
     let mut canonical: u64 = 0;
     for h in 0..=tip {
         if let Ok(Some(bytes)) = db.get_cf(cf_blocks, height_key(h)) {
             if let Some(b) = decode::<LedgerBlock>(&bytes) {
                 canonical += b.tx_count as u64;
             }
+            } else if h > 0 && gap_height.is_none() {
+                gap_height = Some(h);
         }
     }
+        
+        drop(db); // Drop lock before mutating
+        
+        if let Some(h) = gap_height {
+            tracing::error!("CRITICAL: Gap detected in blockchain at height {}. Truncating to recover.", h);
+            truncate_from(h);
+            // Re-run recalibration after truncation
+            return recalibrate_tx_count();
+        }
+
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let cf_meta = match db.cf_handle(CF_META) { Some(c) => c, None => return };
+        let pruned_below = db.get_cf(cf_meta, META_PRUNE_BELOW)
+            .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(1);
+
+        // If pruning has occurred, we cannot recalculate the lifetime total transaction count
+        // purely from the remaining blocks on disk. We must trust the stored META_TX_COUNT.
+        if pruned_below > 1 {
+            return;
+        }
+
     let stored = db.get_cf(cf_meta, META_TX_COUNT)
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
     if stored != canonical {
@@ -3994,9 +4065,10 @@ pub fn list_compute_jobs() -> Vec<ComputeJob> {
 
 pub fn prune_stale_compute_nodes() {
     let cutoff = chrono::Utc::now().timestamp() - 600;
+    let my_addr = crate::ledger::Ledger::load().address;
     let stale: Vec<String> = list_compute_nodes()
         .into_iter()
-        .filter(|n| n.last_seen < cutoff)
+        .filter(|n| n.last_seen < cutoff && n.address != my_addr)
         .map(|n| n.address.clone())
         .collect();
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());

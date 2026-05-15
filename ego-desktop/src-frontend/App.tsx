@@ -22,6 +22,7 @@ import GovernancePage from './pages/GovernancePage';
 import HostingPage from './pages/HostingPage';
 import ComputePage from './pages/ComputePage';
 import RegistrationFlow from './components/RegistrationFlow';
+import { GlobalLockScreen } from './components/GlobalLockScreen';
 
 type Theme = 'dark' | 'light';
 
@@ -351,31 +352,33 @@ function App() {
       <WalletContext.Provider
         value={{ wallet, registry, loading, reload: initWallet, reloadRegistry: loadRegistry }}
       >
-        <Router>
-          <div data-theme={theme} className="App min-h-screen bg-gray-900 text-white">
-            <Routes>
-              <Route path="/welcome" element={<WelcomeScreen />} />
-              <Route path="/" element={<Layout />}>
-                <Route index element={<Navigate to="/wallet" replace />} />
-                <Route path="wallet"   element={<WalletPage />} />
-                <Route path="egosafe"  element={<EgoSafePage />} />
-                <Route path="coverage" element={<CoveragePage />} />
-                <Route path="storage"  element={<StoragePage />} />
-                <Route path="earnings" element={<EarningsPage />} />
-                <Route path="staking"  element={<StakingPage />} />
-                <Route path="explorer" element={<ExplorerPage />} />
-                <Route path="market"    element={<MarketPage />} />
-                <Route path="settings"   element={<SettingsPage />} />
-                <Route path="messenger"  element={<MessengerPage />} />
-                <Route path="contracts" element={<ContractsPage />} />
-                <Route path="ide"        element={<IDEPage />} />
-                <Route path="governance" element={<GovernancePage />} />
-                <Route path="hosting"    element={<HostingPage />} />
-                <Route path="compute"    element={<ComputePage />} />
-              </Route>
-            </Routes>
-          </div>
-        </Router>
+        <GlobalLockScreen>
+          <Router>
+            <div data-theme={theme} className="App min-h-screen bg-gray-900 text-white">
+              <Routes>
+                <Route path="/welcome" element={<WelcomeScreen />} />
+                <Route path="/" element={<Layout />}>
+                  <Route index element={<Navigate to="/wallet" replace />} />
+                  <Route path="wallet"   element={<WalletPage />} />
+                  <Route path="egosafe"  element={<EgoSafePage />} />
+                  <Route path="coverage" element={<CoveragePage />} />
+                  <Route path="storage"  element={<StoragePage />} />
+                  <Route path="earnings" element={<EarningsPage />} />
+                  <Route path="staking"  element={<StakingPage />} />
+                  <Route path="explorer" element={<ExplorerPage />} />
+                  <Route path="market"    element={<MarketPage />} />
+                  <Route path="settings"   element={<SettingsPage />} />
+                  <Route path="messenger"  element={<MessengerPage />} />
+                  <Route path="contracts" element={<ContractsPage />} />
+                  <Route path="ide"        element={<IDEPage />} />
+                  <Route path="governance" element={<GovernancePage />} />
+                  <Route path="hosting"    element={<HostingPage />} />
+                  <Route path="compute"    element={<ComputePage />} />
+                </Route>
+              </Routes>
+            </div>
+          </Router>
+        </GlobalLockScreen>
       </WalletContext.Provider>
     </ThemeContext.Provider>
   );

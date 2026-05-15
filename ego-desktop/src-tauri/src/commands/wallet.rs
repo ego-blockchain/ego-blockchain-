@@ -19,12 +19,7 @@ static PENDING_TXS: Lazy<Mutex<HashMap<String, (LedgerTx, i64)>>> =
         Mutex::new(map)
     });
 
-/// Validate an Ego bech32 address.
-///
-/// Rules:
-/// - Must start with `egot1` (testnet EOA) or one of the known system prefixes.
-/// - Must not be empty or exceed 100 characters (prevents DoS / garbage-in).
-/// - Must be ASCII alphanumeric only (bech32 charset).
+
 fn validate_ego_address(addr: &str) -> Result<(), EgoDesktopError> {
     let addr = addr.trim();
     if addr.is_empty() {
@@ -130,6 +125,7 @@ pub async fn send_transaction(
     request: SendTransactionRequest,
     state: State<'_, AppState>,
 ) -> Result<TransactionResponse, EgoDesktopError> {
+    let _guard = crate::ledger::TX_MUTEX.lock().await;
     let mut ledger = Ledger::load();
     let from = ledger.address.clone();
 
@@ -139,7 +135,14 @@ pub async fn send_transaction(
         ));
     }
 
-    let balance = crate::chain_db::balance_of(&from);
+    let confirmed_bal = crate::chain_db::balance_of(&from);
+    let pending_out: u64 = crate::mempool::get_mempool()
+        .peek_all()
+        .into_iter()
+        .filter(|tx| tx.from.trim() == from.trim())
+        .map(|tx| tx.amount.saturating_add(tx.fee_uegoc))
+        .sum();
+    let balance = confirmed_bal.saturating_sub(pending_out);
 
     if request.amount == 0 {
         return Err(EgoDesktopError::InvalidInput("Amount must be > 0".into()));
@@ -165,7 +168,7 @@ pub async fn send_transaction(
     }
 
     let confirmed_nonce = crate::ledger::last_confirmed_nonce(&from);
-    let nonce      = (ledger.nonce.max(confirmed_nonce) + 1).min(confirmed_nonce + 9);
+    let nonce      = ledger.nonce.max(confirmed_nonce) + 1;
     let ts         = chrono::Utc::now().timestamp();
     let memo_str   = request.memo.as_deref().unwrap_or("");
     const CHAIN_ID: u8 = 1; // testnet
@@ -298,13 +301,21 @@ pub async fn prepare_transaction(
     request: SendTransactionRequest,
     state: State<'_, AppState>,
 ) -> Result<PreparedTransaction, EgoDesktopError> {
+    let _guard = crate::ledger::TX_MUTEX.lock().await;
     let mut ledger = Ledger::load();
     let from = ledger.address.clone();
     if from.is_empty() {
         return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
     }
     let mut chain = load_chain();
-    let balance   = chain.balance_of(&from);
+    let confirmed_bal = chain.balance_of(&from);
+    let pending_out: u64 = crate::mempool::get_mempool()
+        .peek_all()
+        .into_iter()
+        .filter(|tx| tx.from.trim() == from.trim())
+        .map(|tx| tx.amount.saturating_add(tx.fee_uegoc))
+        .sum();
+    let balance = confirmed_bal.saturating_sub(pending_out);
     if request.amount == 0 {
         return Err(EgoDesktopError::InvalidInput("Amount must be > 0".into()));
     }
@@ -323,7 +334,7 @@ pub async fn prepare_transaction(
         )));
     }
     let confirmed_nonce_legacy = crate::ledger::last_confirmed_nonce(&from);
-    let nonce      = (ledger.nonce.max(confirmed_nonce_legacy) + 1).min(confirmed_nonce_legacy + 9);
+    let nonce      = ledger.nonce.max(confirmed_nonce_legacy) + 1;
     let ts         = chrono::Utc::now().timestamp();
     let sign_bytes = tx_signing_bytes(&from, &request.to_address, request.amount, nonce, ts);
     let (signature_hex, pubkey_hex, dil_sig_hex, dil_pubkey_hex) = if let Some(kp) = state.get_keypair() {
@@ -368,6 +379,7 @@ pub async fn commit_transaction(
     tx_json: String,
     block_json: String,
 ) -> Result<TransactionResponse, EgoDesktopError> {
+    let _guard = crate::ledger::TX_MUTEX.lock().await;
     let mut tx: LedgerTx = serde_json::from_str(&tx_json)
         .map_err(|e| EgoDesktopError::WalletError(format!("Invalid tx JSON: {e}")))?;
     let block: LedgerBlock = serde_json::from_str(&block_json)
@@ -475,43 +487,60 @@ pub async fn get_transaction_history(
             return Ok(vec![]);
         }
 
-        let mut txs: Vec<LedgerTx> = crate::chain_db::get_tx_history_for_addr(&my_addr);
-        for tx in txs.iter_mut() {
-            if tx.status.is_empty() || tx.status == "Pending" {
-                tx.status = "Confirmed".into();
+        let txs: Vec<LedgerTx> = crate::chain_db::get_tx_history_for_addr(&my_addr);
+        
+        let tip_height = crate::chain_db::latest_block_info().0;
+        let finalized_h = crate::chain_db::finalized_height();
+        let mut confirmed_hashes = std::collections::HashSet::new();
+        let mut final_txs = Vec::with_capacity(txs.len());
+
+        for mut tx in txs.into_iter() {
+            confirmed_hashes.insert(tx.hash.clone());
+            let mut hide_from_receiver = false;
+
+            if let Some(h) = tx.block_height {
+                if h <= finalized_h || h == 0 {
+                    tx.status = "Confirmed".into();
+                } else {
+                    let confs = tip_height.saturating_sub(h) + 1;
+                    if confs >= 3 {
+                        tx.status = "Confirmed".into();
+                    } else {
+                        hide_from_receiver = true;
+                        tx.status = format!("Confirming ({}/3)", confs);
+                    }
+                }
+            } else {
+                hide_from_receiver = true;
+                tx.status = "Pending".into();
+            }
+
+            if hide_from_receiver && tx.from != my_addr {
+                continue;
+            }
+            final_txs.push(tx);
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let pool_txs = crate::mempool::get_mempool().pending_txs_for_address(&my_addr);
+        let file_txs = crate::commands::tx_pending::get_all();
+
+        for mut tx in pool_txs.into_iter().chain(file_txs.into_iter()) {
+            if tx.from == my_addr && !confirmed_hashes.contains(&tx.hash) {
+                confirmed_hashes.insert(tx.hash.clone());
+                if now - tx.timestamp >= 1800 { // 30 mins
+                    tx.status = "Failed".into();
+                } else {
+                    tx.status = "Pending".into();
+                }
+                tx.block_height = None;
+                final_txs.push(tx);
             }
         }
 
-        let confirmed_hashes: std::collections::HashSet<String> =
-            txs.iter().map(|t| t.hash.clone()).collect();
-
-        let mut pending_hashes: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-
-        let pending: Vec<LedgerTx> = crate::mempool::get_mempool()
-            .peek_all()
-            .into_iter()
-            .filter(|tx| {
-                !confirmed_hashes.contains(&tx.hash)
-                && tx.from.trim() == my_addr.trim()
-            })
-            .inspect(|tx| { pending_hashes.insert(tx.hash.clone()); })
-            .collect();
-        txs.extend(pending);
-
-        let from_file: Vec<LedgerTx> = crate::commands::tx_pending::get_all()
-            .into_iter()
-            .filter(|tx| {
-                !confirmed_hashes.contains(&tx.hash)
-                && !pending_hashes.contains(&tx.hash)
-                && tx.from.trim() == my_addr.trim()
-            })
-            .map(|mut tx| { tx.status = "Pending".into(); tx })
-            .collect();
-        txs.extend(from_file);
-        txs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        txs.truncate(500);
-        Ok(txs)
+        final_txs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        final_txs.truncate(500);
+        Ok(final_txs)
     })
     .await
     .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
@@ -718,6 +747,7 @@ pub async fn request_tx_code(
     request: SendTransactionRequest,
     state: State<'_, AppState>,
 ) -> Result<TxCodeRequest, EgoDesktopError> {
+    let _guard = crate::ledger::TX_MUTEX.lock().await;
     validate_ego_address(&request.to_address)?;
     if let Some(ref memo) = request.memo {
         if memo.len() > 256 {
@@ -757,7 +787,14 @@ pub async fn request_tx_code(
                 return Err(EgoDesktopError::InvalidInput("Amount must be > 0".into()));
             }
 
-            let balance      = crate::chain_db::balance_of(&from);
+            let confirmed_bal = crate::chain_db::balance_of(&from);
+            let pending_out: u64 = crate::mempool::get_mempool()
+                .peek_all()
+                .into_iter()
+                .filter(|tx| tx.from.trim() == from.trim())
+                .map(|tx| tx.amount.saturating_add(tx.fee_uegoc))
+                .sum();
+            let balance      = confirmed_bal.saturating_sub(pending_out);
             let is_staker    = ledger.staked_amount > 0;
             let fee          = crate::tokenomics::fee_for_tx_with_staking("transfer", is_staker);
             let total_needed = amount.saturating_add(fee);
@@ -779,8 +816,7 @@ pub async fn request_tx_code(
                     .unwrap_or(0)
             };
             let memo_str = memo_opt.as_deref().unwrap_or("");
-            let nonce = (ledger.nonce.max(confirmed_nonce).max(pending_max_nonce) + 1)
-                .min(confirmed_nonce + 9);
+            let nonce = ledger.nonce.max(confirmed_nonce).max(pending_max_nonce) + 1;
             if pending_max_nonce > 0 && nonce <= pending_max_nonce {
                 return Err(EgoDesktopError::InvalidInput(
                     "Too many pending transactions. Please wait for some to confirm first.".into(),
@@ -879,6 +915,7 @@ pub async fn confirm_tx_code(
     tx_id: String,
     code:  String,
 ) -> Result<TransactionResponse, EgoDesktopError> {
+    let _guard = crate::ledger::TX_MUTEX.lock().await;
     let code_trimmed = code.trim().to_string();
 
     let tx_id_for_block = tx_id.clone();

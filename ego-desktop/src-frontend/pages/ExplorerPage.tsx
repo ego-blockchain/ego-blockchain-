@@ -122,7 +122,7 @@ const ExplorerPage: React.FC = () => {
   const [blockPage, setBlockPage] = useState(1);
   const [txPage, setTxPage] = useState(1);
   const [filePage, setFilePage] = useState(1);
-  const [pageSize] = useState(25);
+  const [pageSize, setPageSize] = useState(25);
 
   useEffect(() => { setBlockPage(1); setTxPage(1); setFilePage(1); }, [tab]);
 
@@ -283,7 +283,7 @@ const ExplorerPage: React.FC = () => {
           </div>
 
         ) : tab === 'blocks' ? (
-          blocks.length === 0 ? (
+          totalBlocks === 0 ? (
             <div className="py-16 text-center text-gray-500">
               <div className="text-4xl mb-3">🧱</div>
               <div className="text-sm">No blocks yet</div>
@@ -304,29 +304,35 @@ const ExplorerPage: React.FC = () => {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-700/50">
-                    {blocks.map(block => (
-                      <tr
-                        key={block.height}
-                        onClick={() => setSelectedBlock(block)}
-                        className="hover:bg-gray-700/40 cursor-pointer transition"
-                      >
-                        <td className="px-5 py-3 font-mono text-blue-400">#{block.height.toLocaleString()}</td>
-                        <td className="px-5 py-3 font-mono text-xs text-gray-300">{shortHash(block.hash)}</td>
-                        <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(block.miner)}</td>
-                        <td className="px-5 py-3 text-right text-gray-300">{block.tx_count}</td>
-                        <td className="px-5 py-3 text-right text-green-400">{(block.reward / 1_000_000).toFixed(3)} EGOC</td>
-                        <td className="px-5 py-3 text-right text-gray-500 text-xs">{timeAgo(block.timestamp)}</td>
+                    {blocks.length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="py-12 text-center text-gray-500">No blocks on this page</td>
                       </tr>
-                    ))}
+                    ) : (
+                      blocks.map(block => (
+                        <tr
+                          key={block.height}
+                          onClick={() => setSelectedBlock(block)}
+                          className="hover:bg-gray-700/40 cursor-pointer transition"
+                        >
+                          <td className="px-5 py-3 font-mono text-blue-400">#{block.height.toLocaleString()}</td>
+                          <td className="px-5 py-3 font-mono text-xs text-gray-300">{shortHash(block.hash)}</td>
+                          <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(block.miner)}</td>
+                          <td className="px-5 py-3 text-right text-gray-300">{block.tx_count}</td>
+                          <td className="px-5 py-3 text-right text-green-400">{(block.reward / 1_000_000).toFixed(3)} EGOC</td>
+                          <td className="px-5 py-3 text-right text-gray-500 text-xs">{timeAgo(block.timestamp)}</td>
+                        </tr>
+                      ))
+                    )}
                   </tbody>
                 </table>
               </div>
-              <Pagination total={totalBlocks} page={blockPage} pageSize={pageSize} onPage={setBlockPage} onPageSize={() => {}} />
+              <Pagination total={totalBlocks} page={blockPage} pageSize={pageSize} onPage={setBlockPage} onPageSize={ps => { setPageSize(ps); setBlockPage(1); }} />
             </>
           )
 
         ) : tab === 'txs' ? (
-          txs.length === 0 ? (
+          totalTxs === 0 ? (
             <div className="py-16 text-center text-gray-500">
               <div className="text-4xl mb-3">↔️</div>
               <div className="text-sm">No transactions yet</div>
@@ -348,47 +354,53 @@ const ExplorerPage: React.FC = () => {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-700/50">
-                    {txs.map(tx => {
-                      const txTypeLabel = tx.tx_type === 'reward'        ? '🏆 Reward'
-                                        : tx.tx_type === 'store_data'    ? '📦 Store'
-                                        : tx.tx_type === 'store_file'    ? '📦 Store'
-                                        : tx.tx_type === 'retrieve_file' ? '📥 Retrieve'
-                                        : tx.tx_type === 'slash_storage' ? '⚡ Slash'
-                                        : tx.tx_type === 'transfer'      ? '↔️ Transfer'
-                                        : tx.tx_type                     ? tx.tx_type
-                                        : tx.from.startsWith('egot1faucet') ? '🚰 Faucet'
-                                        : '↔️ Transfer';
-                      const fromLabel = tx.from.startsWith('egot1rewards') ? 'Rewards Pool'
-                                      : tx.from.startsWith('egot1faucet')  ? 'Faucet'
-                                      : shortAddr(tx.from);
-                      return (
-                      <tr
-                        key={tx.hash}
-                        onClick={() => setSelectedTx(tx)}
-                        className="hover:bg-gray-700/40 cursor-pointer transition"
-                      >
-                        <td className="px-5 py-3 font-mono text-xs text-blue-400">{shortHash(tx.hash)}</td>
-                        <td className="px-5 py-3 text-xs text-gray-300">{txTypeLabel}</td>
-                        <td className="px-5 py-3 font-mono text-xs text-gray-400">
-                          {tx.block_height != null ? `#${tx.block_height.toLocaleString()}` : '—'}
-                        </td>
-                        <td className="px-5 py-3 font-mono text-xs text-gray-400">{fromLabel}</td>
-                        <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(tx.to)}</td>
-                        <td className="px-5 py-3 text-right text-gray-200">{(tx.amount / 1_000_000).toFixed(2)} EGOC</td>
-                        <td className="px-5 py-3 text-right">
-                          <span className={`text-xs px-2 py-0.5 rounded-full ${
-                            tx.status === 'Confirmed' ? 'bg-green-500/20 text-green-400' :
-                            tx.status === 'Pending'   ? 'bg-yellow-500/20 text-yellow-400' :
-                                                        'bg-red-500/20 text-red-400'
-                          }`}>{tx.status}</span>
-                        </td>
+                    {txs.length === 0 ? (
+                      <tr>
+                        <td colSpan={7} className="py-12 text-center text-gray-500">No transactions on this page</td>
                       </tr>
-                      );
-                    })}
+                    ) : (
+                      txs.map(tx => {
+                        const txTypeLabel = tx.tx_type === 'reward'        ? '🏆 Reward'
+                                          : tx.tx_type === 'store_data'    ? '📦 Store'
+                                          : tx.tx_type === 'store_file'    ? '📦 Store'
+                                          : tx.tx_type === 'retrieve_file' ? '📥 Retrieve'
+                                          : tx.tx_type === 'slash_storage' ? '⚡ Slash'
+                                          : tx.tx_type === 'transfer'      ? '↔️ Transfer'
+                                          : tx.tx_type                     ? tx.tx_type
+                                          : tx.from.startsWith('egot1faucet') ? '🚰 Faucet'
+                                          : '↔️ Transfer';
+                        const fromLabel = tx.from.startsWith('egot1rewards') ? 'Rewards Pool'
+                                        : tx.from.startsWith('egot1faucet')  ? 'Faucet'
+                                        : shortAddr(tx.from);
+                        return (
+                        <tr
+                          key={tx.hash}
+                          onClick={() => setSelectedTx(tx)}
+                          className="hover:bg-gray-700/40 cursor-pointer transition"
+                        >
+                          <td className="px-5 py-3 font-mono text-xs text-blue-400">{shortHash(tx.hash)}</td>
+                          <td className="px-5 py-3 text-xs text-gray-300">{txTypeLabel}</td>
+                          <td className="px-5 py-3 font-mono text-xs text-gray-400">
+                            {tx.block_height != null ? `#${tx.block_height.toLocaleString()}` : '—'}
+                          </td>
+                          <td className="px-5 py-3 font-mono text-xs text-gray-400">{fromLabel}</td>
+                          <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(tx.to)}</td>
+                          <td className="px-5 py-3 text-right text-gray-200">{(tx.amount / 1_000_000).toFixed(2)} EGOC</td>
+                          <td className="px-5 py-3 text-right">
+                            <span className={`text-xs px-2 py-0.5 rounded-full ${
+                              tx.status === 'Confirmed' ? 'bg-green-500/20 text-green-400' :
+                              (tx.status === 'Pending' || tx.status.startsWith('Confirming')) ? 'bg-yellow-500/20 text-yellow-400' :
+                                                          'bg-red-500/20 text-red-400'
+                            }`}>{tx.status}</span>
+                          </td>
+                        </tr>
+                        );
+                      })
+                    )}
                   </tbody>
                 </table>
               </div>
-              <Pagination total={totalTxs} page={txPage} pageSize={pageSize} onPage={setTxPage} onPageSize={() => {}} />
+              <Pagination total={totalTxs} page={txPage} pageSize={pageSize} onPage={setTxPage} onPageSize={ps => { setPageSize(ps); setTxPage(1); }} />
             </>
           )
 
@@ -507,31 +519,37 @@ const ExplorerPage: React.FC = () => {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-700/50">
-                    {fileEvents.slice((filePage - 1) * pageSize, filePage * pageSize).map(ev => (
-                      <tr
-                        key={ev.cid}
-                        onClick={() => setSelectedFile(ev)}
-                        className="hover:bg-gray-700/40 cursor-pointer transition"
-                      >
-                        <td className="px-5 py-3 font-mono text-xs text-blue-400">{shortCid(ev.cid)}</td>
-                        <td className="px-5 py-3">
-                          <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                            ev.event_type === 'Stored'   ? 'bg-purple-500/20 text-purple-400' :
-                                                           'bg-blue-500/20 text-blue-400'
-                          }`}>{ev.event_type}</span>
-                        </td>
-                        <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(ev.owner)}</td>
-                        <td className="px-5 py-3 text-right text-gray-300 text-xs">{fmtBytes(ev.original_size)}</td>
-                        <td className="px-5 py-3 text-right">
-                          <span className={`text-xs px-2 py-0.5 rounded-full ${
-                            ev.status === 'Active'   ? 'bg-green-500/20 text-green-400' :
-                            ev.status === 'Received' ? 'bg-blue-500/20 text-blue-400' :
-                                                       'bg-red-500/20 text-red-400'
-                          }`}>{ev.status}</span>
-                        </td>
-                        <td className="px-5 py-3 text-right text-gray-500 text-xs">{timeAgo(ev.timestamp)}</td>
+                    {fileEvents.slice((filePage - 1) * pageSize, filePage * pageSize).length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="py-12 text-center text-gray-500">No files on this page</td>
                       </tr>
-                    ))}
+                    ) : (
+                      fileEvents.slice((filePage - 1) * pageSize, filePage * pageSize).map(ev => (
+                        <tr
+                          key={ev.cid}
+                          onClick={() => setSelectedFile(ev)}
+                          className="hover:bg-gray-700/40 cursor-pointer transition"
+                        >
+                          <td className="px-5 py-3 font-mono text-xs text-blue-400">{shortCid(ev.cid)}</td>
+                          <td className="px-5 py-3">
+                            <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                              ev.event_type === 'Stored'   ? 'bg-purple-500/20 text-purple-400' :
+                                                             'bg-blue-500/20 text-blue-400'
+                            }`}>{ev.event_type}</span>
+                          </td>
+                          <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(ev.owner)}</td>
+                          <td className="px-5 py-3 text-right text-gray-300 text-xs">{fmtBytes(ev.original_size)}</td>
+                          <td className="px-5 py-3 text-right">
+                            <span className={`text-xs px-2 py-0.5 rounded-full ${
+                              ev.status === 'Active'   ? 'bg-green-500/20 text-green-400' :
+                              ev.status === 'Received' ? 'bg-blue-500/20 text-blue-400' :
+                                                         'bg-red-500/20 text-red-400'
+                            }`}>{ev.status}</span>
+                          </td>
+                          <td className="px-5 py-3 text-right text-gray-500 text-xs">{timeAgo(ev.timestamp)}</td>
+                        </tr>
+                      ))
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -581,18 +599,18 @@ const ExplorerPage: React.FC = () => {
             </div>
             <div className={`rounded-xl p-4 text-center mb-5 ${
               selectedTx.status === 'Confirmed' ? 'bg-green-500/10 border border-green-500/20' :
-              selectedTx.status === 'Pending'   ? 'bg-yellow-500/10 border border-yellow-500/20' :
+              (selectedTx.status === 'Pending' || selectedTx.status.startsWith('Confirming')) ? 'bg-yellow-500/10 border border-yellow-500/20' :
                                                   'bg-red-500/10 border border-red-500/20'
             }`}>
               <div className="text-3xl mb-1">
-                {selectedTx.status === 'Confirmed' ? '✅' : selectedTx.status === 'Pending' ? '⏳' : '❌'}
+                {selectedTx.status === 'Confirmed' ? '✅' : (selectedTx.status === 'Pending' || selectedTx.status.startsWith('Confirming')) ? '⏳' : '❌'}
               </div>
               <div className="text-2xl font-black text-white">
                 {(selectedTx.amount / 1_000_000).toFixed(6)} EGOC
               </div>
               <div className={`text-sm ${
                 selectedTx.status === 'Confirmed' ? 'text-green-400' :
-                selectedTx.status === 'Pending'   ? 'text-yellow-400' : 'text-red-400'
+                (selectedTx.status === 'Pending' || selectedTx.status.startsWith('Confirming')) ? 'text-yellow-400' : 'text-red-400'
               }`}>{selectedTx.status}</div>
             </div>
             <div className="space-y-3 text-sm">

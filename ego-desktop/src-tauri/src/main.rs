@@ -316,6 +316,8 @@ fn main() {
             match event.event() {
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     event.window().hide().unwrap();
+                    crate::commands::auth::invalidate_pin_cache();
+                    let _ = event.window().emit("ego://app-locked", ());
                     api.prevent_close();
                 }
                 tauri::WindowEvent::Focused(true) => {
@@ -338,8 +340,14 @@ fn main() {
         .on_system_tray_event(|app, event| match event {
             SystemTrayEvent::LeftClick { .. } => {
                 let window = app.get_window("main").unwrap();
-                if window.is_visible().unwrap() { window.hide().unwrap(); }
-                else { window.show().unwrap(); window.set_focus().unwrap(); }
+                if window.is_visible().unwrap() {
+                    window.hide().unwrap();
+                    crate::commands::auth::invalidate_pin_cache();
+                    let _ = window.emit("ego://app-locked", ());
+                } else {
+                    window.show().unwrap();
+                    window.set_focus().unwrap();
+                }
             }
             SystemTrayEvent::MenuItemClick { id, .. } => match id.as_str() {
                 "quit" => {
@@ -351,7 +359,12 @@ fn main() {
                     }
                     std::process::exit(0);
                 }
-                "hide" => app.get_window("main").unwrap().hide().unwrap(),
+                "hide" => {
+                    let w = app.get_window("main").unwrap();
+                    w.hide().unwrap();
+                    crate::commands::auth::invalidate_pin_cache();
+                    let _ = w.emit("ego://app-locked", ());
+                }
                 "show" => {
                     let w = app.get_window("main").unwrap();
                     w.show().unwrap(); w.set_focus().unwrap();
@@ -543,6 +556,7 @@ fn main() {
             commands::compute::accept_compute_job,
             commands::compute::complete_compute_job,
             commands::compute::get_compute_earnings,
+            commands::compute::compute_node_heartbeat,
             commands::compute::post_capacity_offer,
             commands::compute::cancel_capacity_offer,
             commands::compute::get_capacity_offers,
@@ -616,6 +630,7 @@ fn main() {
             }
 
             app.listen_global("frontend-ready", move |_| {
+                let _ = window.emit("ego://app-locked", ());
                 window.show().unwrap();
                 window.set_focus().unwrap();
             });
@@ -753,6 +768,8 @@ fn main() {
                     crate::commands::outbox::flush_pending().await;
 
                     crate::p2p::check_file_replication().await;
+
+                    crate::commands::compute::compute_node_heartbeat().await;
 
                     if loop_tick % POST_EVERY_N_TICKS == 1 {
                         crate::proof::run_post_checks(Some(&handle_startup)).await;

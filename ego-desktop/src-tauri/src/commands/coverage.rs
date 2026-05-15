@@ -440,9 +440,35 @@ pub async fn get_network_peers(
 
 /// Returns (location, vpn_detected, vpn_reason, public_ip).
 async fn fetch_ip_data() -> (Option<Location>, bool, String, String) {
-    // Deprecated: Web2 IP APIs are gameable via local proxy spoofing.
-    // Coverage is now determined purely by P2P cryptographic mesh reachability.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    if let Ok(resp) = client.get("http://ip-api.com/json/?fields=status,message,country,regionName,city,lat,lon,isp,org,proxy,hosting,query").send().await {
+        if let Ok(data) = resp.json::<IpApiResponse>().await {
+            if data.status == "success" {
+                let loc = Location {
+                    latitude: data.lat.unwrap_or(0.0),
+                    longitude: data.lon.unwrap_or(0.0),
+                    accuracy: None,
+                    altitude: None,
+                    city: data.city.clone(),
+                    region: data.region_name.clone(),
+                    country: data.country.clone(),
+                };
+                let vpn_reason = detect_vpn(&data);
+                let is_vpn = vpn_reason.is_some() || data.proxy.unwrap_or(false) || data.hosting.unwrap_or(false);
+                let reason_str = vpn_reason.unwrap_or_else(|| {
+                    if data.proxy.unwrap_or(false) { "Proxy detected".to_string() }
+                    else if data.hosting.unwrap_or(false) { "Datacenter/Hosting IP".to_string() }
+                    else { String::new() }
+                });
+                return (Some(loc), is_vpn, reason_str, data.query.unwrap_or_default());
+            }
+        }
+    }
+
     let public_ip = crate::p2p::get_public_endpoint().await;
-    let is_vpn = false; // Trustless VPN detection requires on-chain IP-ASN registry (V2 feature)
-    (None, is_vpn, String::new(), public_ip)
+    (None, false, String::new(), public_ip)
 }

@@ -8,6 +8,36 @@ import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 
+function EgoAiIcon({ size = 36, className = "" }: { size?: number | string, className?: string }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 120 120" role="img" xmlns="http://www.w3.org/2000/svg" className={className}>
+      <title>AI chatbot icon</title>
+      <desc>Futuristic AI icon with circuit-inspired face and scan line eyes</desc>
+      <rect fill="#0f1729" width="120" height="120" rx="32"/>
+      <circle fill="none" stroke="#378ADD" strokeWidth="2" cx="60" cy="58" r="36" opacity="0.4"/>
+      <circle fill="none" stroke="#378ADD" strokeWidth="1" cx="60" cy="58" r="30" opacity="0.25"/>
+      <circle fill="#0C447C" cx="60" cy="58" r="26"/>
+      <rect fill="#378ADD" x="36" y="50" width="16" height="5" rx="2.5"/>
+      <rect fill="#378ADD" x="68" y="50" width="16" height="5" rx="2.5"/>
+      <circle fill="#85B7EB" cx="44" cy="52" r="2"/>
+      <circle fill="#85B7EB" cx="76" cy="52" r="2"/>
+      <rect fill="#378ADD" x="42" y="66" width="6"  height="3" rx="1.5" opacity="0.9"/>
+      <rect fill="#378ADD" x="51" y="66" width="18" height="3" rx="1.5"/>
+      <rect fill="#378ADD" x="72" y="66" width="6"  height="3" rx="1.5" opacity="0.9"/>
+      <line x1="60" y1="22" x2="60" y2="10" stroke="#378ADD" strokeWidth="1.5" opacity="0.5"/>
+      <circle fill="#f5c842" cx="60" cy="8" r="4"/>
+      <circle fill="#378ADD" cx="24" cy="44" r="3" opacity="0.6"/>
+      <line x1="24" y1="44" x2="34" y2="44" stroke="#378ADD" strokeWidth="1" opacity="0.4"/>
+      <circle fill="#378ADD" cx="24" cy="68" r="3" opacity="0.6"/>
+      <line x1="24" y1="68" x2="34" y2="68" stroke="#378ADD" strokeWidth="1" opacity="0.4"/>
+      <circle fill="#378ADD" cx="96" cy="44" r="3" opacity="0.6"/>
+      <line x1="86" y1="44" x2="96" y2="44" stroke="#378ADD" strokeWidth="1" opacity="0.4"/>
+      <circle fill="#378ADD" cx="96" cy="68" r="3" opacity="0.6"/>
+      <line x1="86" y1="68" x2="96" y2="68" stroke="#378ADD" strokeWidth="1" opacity="0.4"/>
+    </svg>
+  );
+}
+
 interface Contact {
   address: string;
   name: string;
@@ -293,7 +323,7 @@ const MessengerPage: React.FC = () => {
   const [nameInput, setNameInput]     = useState('');
   const nameInputRef = useRef<HTMLInputElement>(null);
 
-  interface P2pStatus { upnp: string; upnp_error: string | null; public_endpoint: string; p2p_port: number; }
+  interface P2pStatus { upnp: string; upnp_error: string | null; public_endpoint: string; p2p_port: number; relay_circuit_ready: boolean; }
   const [p2pStatus, setP2pStatus] = useState<P2pStatus | null>(null);
 
   async function loadContacts() {
@@ -697,9 +727,7 @@ useEffect(() => {
                 : ''
             }`}
           >
-            <div className="w-9 h-9 rounded-full bg-gradient-to-br from-yellow-400 to-green-500 flex items-center justify-center text-lg shrink-0">
-              🤖
-            </div>
+            <EgoAiIcon size={36} className="shrink-0" />
             <div className="min-w-0 flex-1">
               <div className="text-sm font-semibold text-yellow-300">Ego AI</div>
               <div className="text-xs text-gray-400">Blockchain assistant</div>
@@ -829,9 +857,7 @@ useEffect(() => {
             {/* Chat header */}
             {selected.address === EGO_AI_ADDRESS ? (
               <div className="px-6 py-3 border-b border-gray-700 flex items-center shrink-0 gap-3">
-                <div className="w-9 h-9 rounded-full bg-gradient-to-br from-yellow-400 to-green-500 flex items-center justify-center text-lg shrink-0">
-                  🤖
-                </div>
+                <EgoAiIcon size={36} className="shrink-0" />
                 <div className="flex-1 min-w-0">
                   <div className="font-semibold text-sm text-yellow-300">Ego AI</div>
                   <div className="text-xs text-gray-400">Ask about Ego blockchain, smart contracts, EIPs…</div>
@@ -904,7 +930,7 @@ useEffect(() => {
                 <>
                   {aiMessages.length === 0 && !aiThinking && (
                     <div className="text-center text-gray-500 text-sm py-10">
-                      <div className="text-5xl mb-3">🤖</div>
+                      <div className="flex justify-center mb-3"><EgoAiIcon size={64} /></div>
                       <div className="text-gray-300 font-medium mb-1">Ego AI Assistant</div>
                       <div className="text-xs text-gray-500 max-w-xs mx-auto leading-relaxed">
                         Ask me anything about Ego blockchain — smart contracts, EIPs, tokenomics, how to use this app, or get help writing Urego code.
@@ -937,9 +963,7 @@ useEffect(() => {
                           <p className="text-xs text-gray-500 mb-0.5 px-1">{fmtTime(m.ts)}</p>
                           <div className={`flex items-end gap-2`}>
                             {m.role === 'assistant' && (
-                              <div className="w-7 h-7 rounded-full bg-gradient-to-br from-yellow-400 to-green-500 flex items-center justify-center text-sm shrink-0">
-                                🤖
-                              </div>
+                              <EgoAiIcon size={28} className="shrink-0" />
                             )}
                             <div className={`max-w-xs lg:max-w-md xl:max-w-lg px-4 py-2.5 rounded-2xl ${
                               m.role === 'user'
@@ -958,9 +982,7 @@ useEffect(() => {
                   })}
                   {aiThinking && (
                     <div className="flex items-end gap-2 justify-start">
-                      <div className="w-7 h-7 rounded-full bg-gradient-to-br from-yellow-400 to-green-500 flex items-center justify-center text-sm shrink-0 mb-1">
-                        🤖
-                      </div>
+                      <EgoAiIcon size={28} className="shrink-0 mb-1" />
                       <div className="bg-gray-700 rounded-2xl rounded-bl-sm px-4 py-3">
                         <div className="flex gap-1 items-center">
                           <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />

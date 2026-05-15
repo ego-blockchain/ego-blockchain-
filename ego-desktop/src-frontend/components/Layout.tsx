@@ -28,6 +28,54 @@ function truncAddr(addr: string): string {
   return addr.slice(0, 8) + '…' + addr.slice(-4);
 }
 
+const SunIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+    stroke="#b8860b" strokeWidth="2.5" strokeLinecap="round">
+    <circle cx="12" cy="12" r="4" />
+    <line x1="12" y1="2"  x2="12" y2="5" />
+    <line x1="12" y1="19" x2="12" y2="22" />
+    <line x1="4.22"  y1="4.22"  x2="6.34"  y2="6.34" />
+    <line x1="17.66" y1="17.66" x2="19.78" y2="19.78" />
+    <line x1="2"  y1="12" x2="5"  y2="12" />
+    <line x1="19" y1="12" x2="22" y2="12" />
+    <line x1="4.22"  y1="19.78" x2="6.34"  y2="17.66" />
+    <line x1="17.66" y1="6.34"  x2="19.78" y2="4.22" />
+  </svg>
+);
+
+const MoonIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none"
+    stroke="#534AB7" strokeWidth="2.5" strokeLinecap="round">
+    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+  </svg>
+);
+
+const themeStyles = {
+  track: (dark: boolean): React.CSSProperties => ({
+    width: 72, height: 36, borderRadius: 18, border: "none", cursor: "pointer",
+    padding: 0, position: "relative",
+    background: dark ? "#2d2a4a" : "#e9e4f0", transition: "background 0.3s",
+  }),
+  thumb: (dark: boolean): React.CSSProperties => ({
+    position: "absolute", top: 5, left: 5, width: 26, height: 26,
+    borderRadius: "50%",
+    background: dark ? "#e8e8f0" : "#f5c842",
+    display: "flex", alignItems: "center", justifyContent: "center",
+    transform: dark ? "translateX(36px)" : "translateX(0)",
+    transition: "transform 0.35s cubic-bezier(.34,1.3,.64,1), background 0.3s",
+    pointerEvents: "none",
+  }),
+  icon: (visible: boolean): React.CSSProperties => ({
+    position: "absolute",
+    opacity: visible ? 1 : 0,
+    transform: visible ? "scale(1)" : "scale(0.6)",
+    transition: "opacity 0.2s, transform 0.2s",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+  }),
+};
+
 const WalletSwitcher: React.FC = () => {
   const { wallet, registry, reload, reloadRegistry } = useWallet();
   const [open, setOpen]         = useState(false);
@@ -285,18 +333,6 @@ const WalletSwitcher: React.FC = () => {
 const Layout: React.FC = () => {
   const { theme, toggleTheme } = useTheme();
   const navigate = useNavigate();
-  const [chainStats, setChainStats] = useState<{ latest_block: number; total_transactions: number } | null>(null);
-
-  useEffect(() => {
-    const fetch = () => {
-      invoke<{ latest_block: number; total_transactions: number }>('get_network_stats')
-        .then(s => setChainStats(s))
-        .catch(() => {});
-    };
-    fetch();
-    const t = setInterval(fetch, 15_000);
-    return () => clearInterval(t);
-  }, []);
 
   // Global handler: notification click → navigate to Messenger and open that chat
   useEffect(() => {
@@ -357,26 +393,17 @@ const Layout: React.FC = () => {
             </div>
             {}
             <button
+              style={themeStyles.track(theme === 'dark')}
               onClick={toggleTheme}
               title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-              className={`w-10 h-5 rounded-full transition-colors relative shrink-0 ${theme === 'light' ? 'bg-blue-500' : 'bg-gray-600'}`}
+              aria-label="Toggle theme"
+              aria-pressed={theme === 'dark'}
             >
-              <div className={`w-4 h-4 bg-white rounded-full shadow absolute top-0.5 transition-all ${theme === 'light' ? 'left-5' : 'left-0.5'}`} />
+              <div style={themeStyles.thumb(theme === 'dark')}>
+                <span style={themeStyles.icon(theme !== 'dark')}><SunIcon /></span>
+                <span style={themeStyles.icon(theme === 'dark')}><MoonIcon /></span>
+              </div>
             </button>
-          </div>
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-1.5">
-              <span className="text-xs text-gray-500">Block</span>
-              <span className="text-xs text-gray-300 font-mono">
-                #{chainStats ? chainStats.latest_block.toLocaleString() : '—'}
-              </span>
-            </div>
-            <div className="flex items-center gap-1.5">
-              <span className="text-xs text-gray-500">Txs</span>
-              <span className="text-xs text-blue-400 font-mono">
-                {chainStats ? chainStats.total_transactions.toLocaleString() : '—'}
-              </span>
-            </div>
           </div>
         </div>
       </aside>

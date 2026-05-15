@@ -47,6 +47,7 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
     if (!checked) { setError('Please confirm you have written down your recovery phrase.'); return; }
     localStorage.setItem('ego-registered-account', 'true');
     localStorage.setItem(`ego-registered-${address}`, 'true');
+    sessionStorage.setItem('ego-unlocked', 'true');
     if (name.trim()) localStorage.setItem('ego-my-display-name', name.trim());
     onComplete();
   }
