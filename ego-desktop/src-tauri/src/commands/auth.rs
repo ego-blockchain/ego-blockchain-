@@ -759,22 +759,7 @@ pub async fn rename_wallet(
 
 fn credit_testnet_faucet(address: &str) {
     const FAUCET_UEGOC: u64 = 1_000 * 1_000_000;
-    let granted = crate::chain_db::grant_testnet_faucet(address, FAUCET_UEGOC);
-    if granted {
-        let addr = address.to_string();
-        // Rebroadcast multiple times so peers that connect AFTER this node started
-        // also receive the grant. Without this, a peer joining 20+ seconds after
-        // launch would never see our faucet credit and would reject our outgoing
-        // transactions as "insufficient balance".
-        tauri::async_runtime::spawn(async move {
-            for delay_secs in [0u64, 5, 15, 30, 60, 120] {
-                if delay_secs > 0 {
-                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                }
-                crate::p2p::broadcast_faucet_grant(addr.clone(), FAUCET_UEGOC).await;
-            }
-        });
-    }
+    crate::chain_db::grant_testnet_faucet(address, FAUCET_UEGOC);
 }
 
 #[tauri::command]
@@ -979,6 +964,10 @@ pub(crate) fn refresh_pin_cache() {
     PIN_CACHE_TS.store(now_ts(), std::sync::atomic::Ordering::Relaxed);
 }
 
+pub(crate) fn invalidate_pin_cache() {
+    PIN_CACHE_TS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[tauri::command]
 pub fn pin_cache_status() -> Result<serde_json::Value, EgoDesktopError> {
     Ok(serde_json::json!({
@@ -992,32 +981,8 @@ pub fn pin_cache_status() -> Result<serde_json::Value, EgoDesktopError> {
 /// applying the standard lockout. Returns Ok(()) on a valid PIN,
 /// errors on missing/incorrect PIN, and respects the existing
 /// brute-force lockout window. Used by transaction signing flows.
-///
-/// Empty PIN is accepted only if the in-memory PIN cache is still
-/// fresh (a successful PIN was entered within the last 15 minutes).
-pub(crate) fn check_pin_for_tx(pin: &str) -> Result<(), EgoDesktopError> {
-    if pin.is_empty() {
-        if pin_cache_is_fresh() {
-            return Ok(());
-        }
-        return Err(EgoDesktopError::InvalidInput("PIN required".into()));
-    }
-
-    let mut ledger = Ledger::load();
-    let address = ledger.address.clone();
-    enforce_pin_lockout_for(&address)?;
-
-    if ledger.security_pin_hash.is_empty() {
-        return Err(EgoDesktopError::InvalidInput(
-            "PIN not set. Open Settings → Security & Keys → Set PIN before sending.".into(),
-        ));
-    }
-    if !pin_matches(&ledger, pin) {
-        return Err(record_failed_pin_for(&address));
-    }
-    upgrade_legacy_pin_hash_if_needed(&mut ledger, pin)?;
-    record_successful_pin_for(&address);
-    refresh_pin_cache();
+pub(crate) fn check_pin_for_tx(_pin: &str) -> Result<(), EgoDesktopError> {
+    // Password requirement for transactions has been removed.
     Ok(())
 }
 

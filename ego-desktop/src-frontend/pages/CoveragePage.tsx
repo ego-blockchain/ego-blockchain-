@@ -293,46 +293,74 @@ const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = 
       // Peer nodes
       for (const node of nodes.filter(n => !n.isMe)) {
         const [px, py] = project(node.lon, node.lat, w, h);
+        
+        ctx.save();
+        ctx.translate(px, py);
+        
+        // Draw Pin Marker
         ctx.beginPath();
-        ctx.arc(px, py, 4, 0, Math.PI * 2);
-        ctx.fillStyle   = '#81c784';
+        ctx.arc(0, -14, 6, Math.PI, 0);
+        ctx.bezierCurveTo(6, -6, 2, -2, 0, 0);
+        ctx.bezierCurveTo(-2, -2, -6, -6, -6, -14);
+        ctx.closePath();
+        
+        ctx.fillStyle = '#ef4444'; // Red pin
         ctx.fill();
-        ctx.strokeStyle = 'rgba(150,230,150,0.6)';
+        ctx.strokeStyle = 'rgba(0,0,0,0.5)';
         ctx.lineWidth   = 1;
         ctx.stroke();
-        // Outer ring at higher zoom
-        if (vs.scale > 1.5) {
-          ctx.beginPath();
-          ctx.arc(px, py, 7, 0, Math.PI * 2);
-          ctx.strokeStyle = 'rgba(129,199,132,0.25)';
-          ctx.lineWidth   = 1;
-          ctx.stroke();
-        }
+
+        // Pin Hole
+        ctx.beginPath();
+        ctx.arc(0, -14, 2.5, 0, Math.PI * 2);
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+        
+        ctx.restore();
       }
 
-      // My node — pulsing glow
+      // My node — pulsing glow + pin
       if (me) {
         const [mx, my_y] = project(me.lon, me.lat, w, h);
         const pulse  = 0.5 + 0.5 * Math.sin(t * 2.5);
+        
+        // Base pulse
         const outerR = 10 + pulse * 8;
         const grad   = ctx.createRadialGradient(mx, my_y, 2, mx, my_y, outerR);
         grad.addColorStop(0, 'rgba(79,195,247,0.85)');
         grad.addColorStop(1, 'rgba(79,195,247,0)');
         ctx.beginPath(); ctx.arc(mx, my_y, outerR, 0, Math.PI * 2);
         ctx.fillStyle = grad; ctx.fill();
-        // Second ring
-        const ring2R = 6 + pulse * 4;
-        ctx.beginPath(); ctx.arc(mx, my_y, ring2R, 0, Math.PI * 2);
-        ctx.strokeStyle = 'rgba(79,195,247,0.4)'; ctx.lineWidth = 1; ctx.stroke();
-        // Core dot
-        ctx.beginPath(); ctx.arc(mx, my_y, 5, 0, Math.PI * 2);
-        ctx.fillStyle = '#ffffff'; ctx.fill();
-        ctx.strokeStyle = '#4fc3f7'; ctx.lineWidth = 2; ctx.stroke();
+
+        ctx.save();
+        ctx.translate(mx, my_y);
+
+        // Draw Pin Marker
+        ctx.beginPath();
+        ctx.arc(0, -14, 6, Math.PI, 0);
+        ctx.bezierCurveTo(6, -6, 2, -2, 0, 0);
+        ctx.bezierCurveTo(-2, -2, -6, -6, -6, -14);
+        ctx.closePath();
+        
+        ctx.fillStyle = '#4fc3f7'; // Blue pin
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        // Pin Hole
+        ctx.beginPath();
+        ctx.arc(0, -14, 2.5, 0, Math.PI * 2);
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+        
+        ctx.restore();
+
         // Label
         if (vs.scale > 1.0) {
           ctx.fillStyle = 'rgba(79,195,247,0.9)';
           ctx.font = `bold ${Math.max(8, 9 * vs.scale)}px sans-serif`;
-          ctx.fillText('YOU', mx + 8, my_y - 6);
+          ctx.fillText('YOU', mx + 10, my_y - 14);
         }
       }
 
@@ -379,7 +407,7 @@ const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = 
     let found: MapNode | null = null;
     for (const node of nodesRef.current) {
       const [px, py] = project(node.lon, node.lat, rect.width, rect.height);
-      if (Math.hypot(px - mx, py - my) < 12) { found = node; break; }
+      if (Math.hypot(px - mx, (py - 10) - my) < 14) { found = node; break; }
     }
     setTooltip(found ? { x: mx, y: my, node: found } : null);
   }, [project]);
@@ -399,8 +427,8 @@ const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = 
         style={{ display: 'block', width: '100%', height: '100%' }}
       />
       <div className="absolute bottom-2 right-2 flex gap-3 text-xs text-gray-400 bg-black/50 backdrop-blur-sm rounded-lg px-3 py-1.5 border border-gray-700/40">
-        <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-white inline-block"/>You</span>
-        <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-green-400 inline-block"/>Peers</span>
+        <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-blue-400 inline-block"/>You</span>
+        <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-red-400 inline-block"/>Peers</span>
         <span className="text-gray-600 hidden sm:inline">Scroll=zoom · Drag=pan</span>
       </div>
       {tooltip && (

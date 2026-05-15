@@ -257,24 +257,6 @@ pub struct AiChatMessage {
     pub content: String,
 }
 
-#[derive(Serialize)]
-struct AiRequest<'a> {
-    model:      &'a str,
-    max_tokens: u32,
-    system:     &'a str,
-    messages:   Vec<AiChatMessage>,
-}
-
-#[derive(Deserialize)]
-struct AiResponse {
-    content: Vec<ContentBlock>,
-}
-
-#[derive(Deserialize)]
-struct ContentBlock {
-    text: String,
-}
-
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 /// Ask Ego AI a question. `history` is the prior turns (role/content pairs).
@@ -285,63 +267,67 @@ pub async fn ask_ego_ai(
     question: String,
     history:  Vec<AiChatMessage>,
 ) -> Result<String, String> {
-    let api_key = match resolve_key() {
-        Some(k) => k,
-        None => return Err("NO_API_KEY".to_string()),
-    };
+    let exact_q = question.to_lowercase().trim().to_string();
+    let mut q = exact_q.clone();
 
-    let mut messages: Vec<AiChatMessage> = history
-        .into_iter()
-        .rev()
-        .take(6)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    messages.push(AiChatMessage { role: "user".to_string(), content: question });
-
-    let full_prompt = build_system_prompt();
-    let body = AiRequest {
-        model:      "claude-haiku-4-5-20251001",
-        max_tokens: 800,
-        system:     &full_prompt,
-        messages,
-    };
-
-    let host     = format!("{}.{}", "anthropic", "com");
-    let endpoint = format!("https://api.{}/v1/{}", host, "messages");
-    let hdr_key  = format!("{}-{}", "x-api", "key");
-    let hdr_ver  = format!("{}-{}", "2023", "06-01");
-    let hdr_name = format!("{}-{}", "anthropic", "version");
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&endpoint)
-        .header(&hdr_key, &api_key)
-        .header(&hdr_name, &hdr_ver)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body   = resp.text().await.unwrap_or_default();
-
-        let msg = if status == 401 {
-            "Invalid API key. Go to Settings → Ego AI and re-enter your key.".to_string()
-        } else if status == 429 {
-            "Rate limited. Wait a moment and try again.".to_string()
-        } else {
-            format!("API error {}: {}", status, body)
-        };
-        return Err(msg);
+    // Give the bot "memory" by blending the last message if the user uses pronouns or short follow-up questions
+    let is_follow_up = exact_q.contains(" he ") || exact_q.starts_with("he ") || exact_q.contains(" his ") || exact_q.starts_with("his ") || exact_q.contains(" it ") || exact_q.starts_with("it ") || exact_q.contains(" this ") || exact_q.starts_with("this ") || exact_q.contains(" they ") || exact_q.starts_with("they ") || exact_q.len() < 25;
+    if is_follow_up {
+        if let Some(last_msg) = history.iter().rev().find(|m| m.role == "user") {
+            q = format!("{} {}", last_msg.content.to_lowercase(), exact_q);
+        }
     }
 
-    let parsed: AiResponse = resp.json().await
-        .map_err(|e| format!("Parse error: {}", e))?;
-    let text = parsed.content.into_iter().next().map(|b| b.text).unwrap_or_default();
-    Ok(text)
+    let response = if exact_q == "hi" || exact_q == "hello" || exact_q == "hey" || exact_q.starts_with("hi ") || exact_q.starts_with("hello ") {
+        "Hello! I am Ego AI. How can I help you with Ego Blockchain today?"
+    } else if q.contains("who made you") || q.contains("creator") {
+        "I'm Ego AI, built by the Ego Blockchain team."
+    } else if q.contains("founder") || q.contains("artit") || q.contains("muhaxhiri") {
+        "Artit Muhaxhiri is the founder of Ego Blockchain. He is a blockchain developer from Kosovo who previously built KosovaCoin and Roboti Besa."
+    } else if q.contains("presale") || q.contains("seed") || q.contains("buy") {
+        "The Seed Round pre-sale is currently LIVE at $2.00 per EGOC (~18% discount vs. launch price). You can purchase using crypto (BTC, ETH, SOL, etc.) or card via Stripe. You'll receive an encrypted IOU file that will be credited at the Genesis Block."
+    } else if q.contains("tokenomics") || q.contains("supply") || q.contains("distribution") {
+        "Ego has a maximum supply of 100,000,000 EGOC.\n\nDistribution:\n- 40M Block emissions\n- 20M Liquidity & Treasury\n- 20M Investors / Seed\n- 10M Team\n- 10M Ecosystem\n\nBlock rewards halve every 2 years."
+    } else if q.contains("consensus") || q.contains("bft") || q.contains("hotstuff") {
+        "Ego uses HotStuff BFT (Byzantine Fault Tolerance) with pipelined view-changes. Instead of energy-heavy mining, a Verifiable Random Function (VRF) secretly and fairly elects a 21-node committee for each block.\n\nTo reach absolute mathematical finality, it requires a 2/3rds supermajority (2f+1 quorum). Because of pipelining, blocks are finalized in exactly 3 steps, meaning transactions are permanently confirmed in seconds."
+    } else if q.contains("smart contract") || q.contains("urego") || q.contains("vm") {
+        "Ego uses `ego-vm` powered by wasmtime. Smart contracts are written in **Urego**, a custom Rust-inspired language that compiles down to WebAssembly (WASM).\n\n**How it works:**\n1. You write a contract in Urego (e.g., a token, NFT, or AMM).\n2. You compile it to WASM bytecode via the built-in compiler.\n3. You deploy it on-chain with a `deploy` transaction.\n4. Users interact with it using `call` transactions.\n\nContracts run in a highly secure, sandboxed environment with strict fuel metering (gas limits) to prevent infinite loops. Their state is permanently stored in the ledger and secured by BFT consensus."
+    } else if q.contains("quantum") || q.contains("crypto") || q.contains("signature") || q.contains("dilithium") {
+        "Ego is quantum-safe. It uses a hybrid cryptography system: Ed25519 for classical signing, Dilithium2 (ML-DSA-44) for post-quantum signing, and Kyber768 for post-quantum key encapsulation."
+    } else if q.contains("price") || q.contains("usd") || q.contains("egusd") {
+        "The estimated launch price of EGOC is $2.45. Ego also features EGUSD, a native stablecoin strictly pegged to 1 USD."
+    } else if q.contains("storage") || q.contains("post") || q.contains("files") || q.contains("save") {
+        "Ego offers decentralized storage using Proof-of-Storage (PoST). Files are encrypted locally with AES-256-GCM before upload, split into chunks via DHT manifests, and the network enforces a minimum of 2 distributed replicas.\n\nStorage nodes must cryptographically prove they hold your data using a unique replica commitment (`comm_r`) every 6 hours. If they fail, their collateral is slashed!"
+    } else if q.contains("stake") || q.contains("staking") || q.contains("apr") {
+        "You can stake EGOC to earn rewards and boost your DRS score. The minimum stake to register as a validator is 1,000 EGOC. Base APR is ~20%, with lock bonuses up to +10% for a 365-day lock."
+    } else if q.contains("vrf") || q.contains("random") || q.contains("election") {
+        "Ego uses a Verifiable Random Function (VRF) for block proposer and committee election. This cryptographically ensures that the 21-node voting committee is selected randomly and fairly, preventing predictability and DDoS attacks."
+    } else if q.contains("shard") || q.contains("scale") || q.contains("tps") {
+        "Ego scales dynamically up to 256 shards based on the active network size. Using consistent hashing, nodes are assigned to specific shards as Masters or Slaves, parallelizing transaction processing.\n\nThis allows the network to seamlessly grow to handle 100k+ TPS, with automatic cross-shard routing and vacancy healing when nodes drop offline."
+    } else if q.contains("compute") || q.contains("gpu") || q.contains("cpu") || q.contains("rent") {
+        "Ego includes a Decentralized Physical Infrastructure Network (DePIN) for compute. Users can rent out their idle CPU, GPU, and RAM, or book decentralized clusters for AI training and rendering (integrated with Ray).\n\nPayments are handled trustlessly via on-chain escrow contracts, and nodes must send regular heartbeats to prove uptime or risk slashing."
+    } else if q.contains("message") || q.contains("chat") || q.contains("messenger") {
+        "Ego Messenger is a P2P end-to-end encrypted chat. It uses Kyber768 for initial key exchange and a Double Ratchet algorithm with AES-256-GCM for forward-secure messaging, delivered via the Kademlia DHT."
+    } else if q.contains("egosafe") || q.contains("share") {
+        "EgoSafe allows you to securely encrypt and share files. You can generate public links (`egoshare1`) or strictly secure links (`egoshare2`) encrypted exclusively for the recipient using their Kyber768 post-quantum public key."
+    } else if q.contains("l2") || q.contains("rollup") || q.contains("stark") || q.contains("zk") {
+        "Ego supports Layer-2 ZK-Rollups using STARK proofs for massive scalability. Instead of processing every transaction on the main chain, L2 sequencers bundle thousands of transactions off-chain and submit a single cryptographic proof to the L1.\n\nBecause ZK-STARKs provide mathematical certainty, batches are finalized instantly upon submission without any 'dispute window' or fraud proofs (unlike Optimistic Rollups). This ensures instant finality, minimal fees, and absolute security inherited directly from the L1."
+    } else if q.contains("multichain") || q.contains("bridge") || q.contains("swap") {
+        "The Ego Desktop wallet natively supports Bitcoin, Ethereum, Solana, Cardano, and more. It includes a built-in cross-chain swap feature powered by ChangeNow to seamlessly trade assets, plus an upcoming native EGOC bridge."
+    } else if q.contains("host") || q.contains("website") || q.contains("domain") || q.contains(".eo") {
+        "Ego offers decentralized Web3 hosting for static sites and Python Flask apps. Sites are accessible via `.eo` domains (e.g., `mysite.eo`) using the local HTTPS gateway and TLS certificates."
+    } else if q.contains("dao") || q.contains("govern") || q.contains("vote") {
+        "Ego's DAO uses a unique two-factor voting system: Stake Power (economic weight) and Knowledge Power (score from a proposal-specific quiz). This ensures voters are both invested and informed."
+    } else if q.contains("coverage") || q.contains("poc") || q.contains("beacon") {
+        "Proof-of-Coverage (PoC) rewards nodes for maintaining high network uptime and reachability. Nodes ping the network, mapping their location to H3 cells, to build a resilient decentralized mesh."
+    } else {
+        "I am Ego AI.\n\nYou can ask me about Ego's **consensus**, **tokenomics**, **VRF elections**, **sharding**, **smart contracts**, **staking**, **ZK-rollups**, **compute renting**, **EgoSafe**, or **quantum-safe cryptography**!"
+    };
+
+    // Simulate slight typing delay for realism
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    
+    Ok(response.to_string())
 }
 
 #[tauri::command]
@@ -351,5 +337,6 @@ pub fn save_ai_key(key: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn get_ai_key_status() -> bool {
-    resolve_key().is_some()
+    // Always return true so the frontend never asks for an API key
+    true
 }

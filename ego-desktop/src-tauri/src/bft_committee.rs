@@ -1,5 +1,9 @@
+
 pub const COMMITTEE_SIZE: usize = 21;
+
 pub const MAX_COMMITTEE_SIZE: usize = 150;
+
+
 pub const MIN_LIVE_VALIDATORS: usize = 2;
 
 
@@ -18,11 +22,7 @@ const COVERAGE_PER_WEIGHT: f64 = 10.0;
 pub const EXPECTED_PROPOSERS_PER_SLOT: f64 = 1.5;
 
 pub fn expected_proposers_for_network(n: usize) -> f64 {
-    // With few nodes blocks must be produced reliably; converges to 1.5 at large scale.
-    // n=3:   1.5 + 2.00 = 3.5  → each node qualifies with ~100% probability
-    // n=10:  1.5 + 0.60 = 2.1  → ~18% each, P(≥1 block) ≈ 91%
-    // n=50:  1.5 + 0.12 = 1.62 → ~3.2% each
-    // n=500: 1.5 + 0.012 ≈ 1.51 → standard competitive
+
     let n_f = n.max(1) as f64;
     (1.5 + 6.0 / n_f).min(n_f)
 }
@@ -65,9 +65,7 @@ pub fn total_drs_weight(all_validators: &[String]) -> f64 {
     t.max(0.01)
 }
 
-/// Returns the effective selection share for a validator, hard-capped at
-/// MAX_VALIDATOR_SHARE (33%).  Even if a single entity controls 90% of all
-/// stake, it cannot propose or vote in more than 1/3 of slots.
+
 fn capped_share(my_drs: f64, total_drs: f64) -> f64 {
     (my_drs / total_drs).min(MAX_VALIDATOR_SHARE)
 }

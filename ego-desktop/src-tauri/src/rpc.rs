@@ -261,7 +261,11 @@ async fn faucet_handler(Query(q): Query<FaucetQuery>) -> Response {
         status:    "Confirmed".into(),
         ..crate::ledger::LedgerTx::default()
     };
-    crate::chain_db::mine_batch_db(&[tx], FAUCET_ADDR);
+        
+        let tx_clone = tx.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::chain_db::mine_batch_db(&[tx_clone], FAUCET_ADDR);
+        }).await.unwrap_or_default();
 
     Json(json!({
         "success":      true,

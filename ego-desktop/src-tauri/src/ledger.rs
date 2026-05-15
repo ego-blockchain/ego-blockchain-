@@ -2,9 +2,16 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+pub static TX_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 static LEDGER_IO_MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 fn ledger_io_mutex() -> &'static std::sync::Mutex<()> {
     LEDGER_IO_MUTEX.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+static REGISTRY_IO_MUTEX: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+fn registry_io_mutex() -> &'static std::sync::Mutex<()> {
+    REGISTRY_IO_MUTEX.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 pub fn base_data_dir() -> PathBuf {
@@ -296,16 +303,48 @@ impl Default for WalletRegistry {
 }
 
 pub fn load_registry() -> WalletRegistry {
+    let _guard = registry_io_mutex().lock().unwrap_or_else(|e| e.into_inner());
     let path = registry_path();
-    if let Ok(data) = fs::read_to_string(&path) {
-        if let Ok(reg) = serde_json::from_str::<WalletRegistry>(&data) {
-            return reg;
+    if !path.exists() {
+        return WalletRegistry::default();
+    }
+    for attempt in 0..10 {
+        match fs::read_to_string(&path) {
+            Ok(data) => {
+                if data.is_empty() {
+                    if attempt < 9 {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+                    return WalletRegistry::default();
+                }
+                match serde_json::from_str::<WalletRegistry>(&data) {
+                    Ok(reg) => return reg,
+                    Err(e) => {
+                        if attempt < 9 {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            continue;
+                        }
+                        eprintln!("[Registry] WARN: load failed after retries ({}); refusing to overwrite with defaults", e);
+                        return WalletRegistry::default();
+                    }
+                }
+            }
+            Err(e) => {
+                if attempt < 9 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                eprintln!("[Registry] WARN: read failed after retries ({}); refusing to overwrite with defaults", e);
+                return WalletRegistry::default();
+            }
         }
     }
     WalletRegistry::default()
 }
 
 pub fn save_registry(registry: &WalletRegistry) -> Result<(), String> {
+    let _guard = registry_io_mutex().lock().unwrap_or_else(|e| e.into_inner());
     let data = serde_json::to_string_pretty(registry).map_err(|e| e.to_string())?;
     crate::utils::atomic_write(&registry_path(), data.as_bytes()).map_err(|e| e.to_string())
 }
@@ -675,12 +714,12 @@ impl Ledger {
         if !path.exists() {
             return Self::default();
         }
-        for attempt in 0..5 {
+        for attempt in 0..10 {
             match fs::read_to_string(&path) {
                 Ok(data) => {
                     if data.is_empty() {
-                        if attempt < 4 {
-                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        if attempt < 9 {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
                             continue;
                         }
                         return Self::default();
@@ -688,8 +727,8 @@ impl Ledger {
                     match serde_json::from_str::<Self>(&data) {
                         Ok(ledger) => return ledger,
                         Err(e) => {
-                            if attempt < 4 {
-                                std::thread::sleep(std::time::Duration::from_millis(20));
+                            if attempt < 9 {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
                                 continue;
                             }
                             eprintln!("[Ledger] WARN: load failed after retries ({}); refusing to overwrite with defaults", e);
@@ -698,8 +737,8 @@ impl Ledger {
                     }
                 }
                 Err(e) => {
-                    if attempt < 4 {
-                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    if attempt < 9 {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
                         continue;
                     }
                     eprintln!("[Ledger] WARN: read failed after retries ({}); refusing to overwrite with defaults", e);
@@ -1063,17 +1102,7 @@ pub fn record_validator_stake(addr: &str, amount: u64, is_stake: bool) {
 }
 
 pub fn get_validator_stake(addr: &str) -> u64 {
-    let actual = *stake_store().get(addr).unwrap_or(&0);
-    if actual == 0 {
-        if addr.starts_with("egot1dummy") {
-            return 1_000 * 1_000_000;
-        }
-        let local_addr = Ledger::load().address;
-        if addr == local_addr && stake_store().values().sum::<u64>() == 0 {
-            return 1_000 * 1_000_000;
-        }
-    }
-    actual
+    *stake_store().get(addr).unwrap_or(&0)
 }
 
 /// Sum of all active stake across all known validators.

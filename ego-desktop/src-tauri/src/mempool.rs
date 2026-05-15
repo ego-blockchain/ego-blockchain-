@@ -6,6 +6,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
+use tauri::Manager;
 
 pub const SHARD_COUNT: u32   = 256;
 pub const BATCH_SIZE:  usize = 100_000;
@@ -25,7 +26,7 @@ pub const MIN_VALIDATORS_FOR_FINALITY: usize = crate::bft_committee::MIN_LIVE_VA
 fn allow_pre_bft_solo() -> bool {
     std::env::var("EGO_ALLOW_PRE_BFT_SOLO")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 
@@ -36,7 +37,7 @@ pub const BATCH_INTERVAL_MS: u64 = BATCH_WINDOW_MS;
 
 pub const TX_THRESHOLD: u64 = 50;
 
-pub const MAX_BLOCK_INTERVAL_S: u64 = 30;
+pub const MAX_BLOCK_INTERVAL_S: u64 = 5;
 
 
 pub const EMPTY_BLOCK_INTERVAL_S: u64 = 60;
@@ -117,13 +118,21 @@ impl ShardedMempool {
             }
         }
 
+        let balance = if !is_system {
+            crate::chain_db::balance_of(&tx.from)
+        } else { 0 };
+
+        let active_stake = if !is_system && tx.tx_type == "unstake" && tx.to == crate::chain_db::STAKING_ADDR {
+            crate::ledger::get_validator_stake(&tx.from)
+        } else { 0 };
+
         if !is_system {
             let small_network = crate::p2p::known_validator_count() < 4;
             if !small_network {
                 let current_height = crate::chain_db::latest_block_info().0;
                 let in_grace = crate::sharding::is_in_grace_period(current_height);
                 if !in_grace {
-                    let tx_shard = shard_for_address(&tx.from);
+                    let tx_shard = crate::sharding::shard_for_address_agreed(&tx.from);
                     let my_addr = crate::ledger::Ledger::load().address;
                     let map = crate::sharding::load_shard_map();
                     let all_nodes: Vec<String> = map
@@ -189,9 +198,7 @@ impl ShardedMempool {
         let mut s = self.shards[shard].lock().expect("lock poisoned");
 
         if !is_system {
-            let balance = crate::chain_db::balance_of(&tx.from);
             if tx.tx_type == "unstake" && tx.to == crate::chain_db::STAKING_ADDR {
-                let active_stake = crate::ledger::get_validator_stake(&tx.from);
                 let pending_unstake: u64 = s.iter()
                     .filter(|t| t.from == tx.from
                         && t.tx_type == "unstake"
@@ -250,6 +257,19 @@ impl ShardedMempool {
             self.seen_hashes[shard].lock().expect("lock poisoned").remove(&evicted.hash);
             self.pending_total.fetch_sub(1, Ordering::Relaxed);
             tracing::info!("Mempool evicted lowest-fee tx {} from shard {}", &evicted.hash[..12], shard);
+
+            let my_addr = crate::ledger::Ledger::load().address;
+            if evicted.from == my_addr {
+                crate::commands::tx_pending::remove(&evicted.hash);
+                if let Some(app) = crate::p2p::APP_HANDLE.get() {
+                    crate::commands::notifications::notify(
+                        app,
+                        "Transaction Dropped",
+                        &format!("Your transaction of {:.2} EGOC was dropped (fee too low). Please try again with a higher fee.", evicted.amount as f64 / 1_000_000.0)
+                    );
+                    let _ = app.emit_all("ego://chain-updated", ());
+                }
+            }
         }
 
         let tx_hash_for_notify = tx.hash.clone();
@@ -264,6 +284,7 @@ impl ShardedMempool {
 
     pub fn drain_shard(&self, shard_id: u32) -> Vec<LedgerTx> {
         let mut expired_hashes: Vec<String> = Vec::new();
+        let mut my_expired_txs: Vec<LedgerTx> = Vec::new();
 
         let drained = {
             let mut s = self.shards[shard_id as usize].lock().expect("lock poisoned");
@@ -271,9 +292,13 @@ impl ShardedMempool {
 
             // TTL eviction: remove stale txs that have been waiting too long.
             let now = chrono::Utc::now().timestamp();
+            let my_addr = crate::ledger::Ledger::load().address;
             s.retain(|tx| {
                 let stale = tx.timestamp > 0 && (now - tx.timestamp) >= MAX_TX_AGE_SECS;
-                if stale { expired_hashes.push(tx.hash.clone()); }
+                if stale { 
+                    expired_hashes.push(tx.hash.clone()); 
+                    if tx.from == my_addr { my_expired_txs.push(tx.clone()); }
+                }
                 !stale
             });
             if !expired_hashes.is_empty() {
@@ -306,6 +331,18 @@ impl ShardedMempool {
             let mut seen = self.seen_hashes[shard_id as usize].lock().expect("lock poisoned");
             for h in &expired_hashes { seen.remove(h); }
             for tx in &drained        { seen.remove(&tx.hash); }
+        }
+
+        for tx in my_expired_txs {
+            crate::commands::tx_pending::remove(&tx.hash);
+            if let Some(app) = crate::p2p::APP_HANDLE.get() {
+                crate::commands::notifications::notify(
+                    app,
+                    "Transaction Failed",
+                    &format!("Your transaction of {:.2} EGOC timed out and was cancelled. Please try again.", tx.amount as f64 / 1_000_000.0)
+                );
+                let _ = app.emit_all("ego://chain-updated", ());
+            }
         }
 
         drained
@@ -377,6 +414,26 @@ impl ShardedMempool {
         self.shards.par_iter()
             .flat_map(|s| s.lock().expect("lock poisoned").clone())
             .collect()
+    }
+
+    pub fn remove_txs(&self, tx_hashes: &[String]) {
+        if tx_hashes.is_empty() { return; }
+        let hash_set: std::collections::HashSet<&String> = tx_hashes.iter().collect();
+        
+        for shard_idx in 0..SHARD_COUNT as usize {
+            let mut s = self.shards[shard_idx].lock().expect("lock poisoned");
+            let before = s.len();
+            s.retain(|tx| !hash_set.contains(&tx.hash));
+            let removed = before - s.len();
+            if removed > 0 {
+                self.pending_total.fetch_sub(removed as u64, Ordering::Relaxed);
+                self.confirmed.fetch_add(removed as u64, Ordering::Relaxed);
+                let mut seen = self.seen_hashes[shard_idx].lock().expect("lock poisoned");
+                for h in tx_hashes {
+                    seen.remove(h);
+                }
+            }
+        }
     }
 
     pub fn pending_outflow_for_address(&self, addr: &str) -> u64 {
@@ -519,12 +576,14 @@ async fn try_mine(txs: Vec<LedgerTx>, miner: &str) -> Vec<LedgerTx> {
     if !allow_pre_bft_solo() {
         return txs;
     }
-    let known = crate::p2p::get_known_validators_snapshot();
-    if known.len() >= min_validators_for_finality() {
+    let known_count = crate::p2p::known_validator_count();
+    if known_count >= min_validators_for_finality() {
         return txs;
     }
 
-    if !crate::commands::consensus::drs_eligible() {
+    let is_alone = known_count <= 1;
+
+    if !is_alone && !crate::commands::consensus::drs_eligible() {
         tracing::debug!("[Mine] DRS < 0.5 — not eligible to mine");
         return txs;
     }
@@ -532,47 +591,42 @@ async fn try_mine(txs: Vec<LedgerTx>, miner: &str) -> Vec<LedgerTx> {
     let prev_hash = crate::chain_db::get_tip_hash();
     let (poc_ticket, _poc_sig) = match crate::poc::check_slot_winner(&prev_hash) {
         Some(t) => t,
-        None    => return txs,
+        None    => {
+            if is_alone {
+                (String::new(), String::new())
+            } else {
+                return txs;
+            }
+        }
     };
     let poc_slot = crate::poc::current_slot();
-    let combined_ticket = format!("{}:{}", poc_ticket, _poc_sig);
+    let combined_ticket = if poc_ticket.is_empty() { String::new() } else { format!("{}:{}", poc_ticket, _poc_sig) };
 
     let oracle_rewards = crate::p2p::fetch_pending_post_rewards().await;
     let post_proof_ids: Vec<String> = oracle_rewards.iter().map(|t| t.hash.clone()).collect();
     let mut all_txs = txs.clone();
     all_txs.extend(oracle_rewards);
-
     let tx_count = txs.len();
-    let block = crate::chain_db::mine_batch_db_with_ticket(&all_txs, miner, &combined_ticket, poc_slot);
-
+    
+    let (block, stamped) = crate::chain_db::build_block_proposal(&all_txs, miner, &combined_ticket, poc_slot);
+    
+    {
+        let mut staged = crate::p2p::staged_block();
+        *staged = Some((block.clone(), stamped));
+    }
+    
+    crate::p2p::bft_solo_commit(&block.hash, block.height);
+    
     tracing::info!(
         "Solo block #{} sealed — {} user txs + {} PoST rewards + 1 coinbase",
         block.height, tx_count, post_proof_ids.len(),
     );
-
-    crate::chain_db::pipeline_commit(block.height);
-    crate::rpc::notify_new_block(&block);
-
     if !post_proof_ids.is_empty() {
         tokio::spawn(crate::p2p::notify_post_rewards_claimed(post_proof_ids));
     }
-
-    let height = block.height;
-    let confirmed: Vec<LedgerTx> = txs.iter().map(|tx| {
-        let mut t = tx.clone();
-        t.status       = "Confirmed".to_string();
-        t.block_height = Some(height);
-        t
-    }).collect();
-
     for tx in &txs {
         crate::commands::tx_pending::remove(&tx.hash);
     }
-    tokio::spawn(async move {
-        for tx in &confirmed {
-            crate::p2p::broadcast_tx(tx.clone(), block.clone()).await;
-        }
-    });
     vec![]
 }
 
@@ -591,6 +645,7 @@ pub async fn run_batch_loop() {
 
     let mut last_block_at    = Instant::now();
     let mut batch_started_at: Option<Instant> = None;
+    let startup_time         = Instant::now();
 
     loop {
         let notify  = pool.tx_notify.clone();
@@ -650,7 +705,7 @@ pub async fn run_batch_loop() {
             None    => continue,
         };
 
-        let known_count = crate::p2p::get_known_validators_snapshot().len();
+        let known_count = crate::p2p::known_validator_count();
         let needed = min_validators_for_finality();
         if known_count >= needed {
             // BFT mode: leave txs in mempool for the BFT proposer to drain.
@@ -664,6 +719,14 @@ pub async fn run_batch_loop() {
                 known_count,
                 needed
             );
+            last_block_at    = Instant::now();
+            batch_started_at = None;
+            continue;
+        }
+
+        // Grace period: allow peers to discover each other via DHT before deciding we are alone
+        if known_count <= 1 && startup_time.elapsed().as_secs() < 15 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
             last_block_at    = Instant::now();
             batch_started_at = None;
             continue;

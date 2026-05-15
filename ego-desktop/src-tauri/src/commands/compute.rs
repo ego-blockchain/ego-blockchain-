@@ -160,6 +160,82 @@ fn check_and_apply_timeout(job: &mut ComputeJob) -> bool {
 }
 
 #[tauri::command]
+pub async fn compute_node_heartbeat() {
+    let (owner, node_opt, is_enabled, ledger) = tokio::task::spawn_blocking(|| {
+        let ledger = crate::ledger::Ledger::load();
+        let owner = ledger.address.clone();
+        let node = if owner.is_empty() { None } else { crate::chain_db::get_compute_node(&owner) };
+        (owner, node, ledger.compute_enabled, ledger)
+    }).await.unwrap_or_default();
+
+    if owner.is_empty() {
+        tokio::task::spawn_blocking(crate::chain_db::prune_stale_compute_nodes).await.ok();
+        return;
+    }
+
+    if is_enabled {
+        let mut node = if let Some(n) = node_opt {
+            n
+        } else {
+            // Reconstruct if pruned or on fresh restart
+            if let Ok(hw) = detect_hardware().await {
+                crate::chain_db::ComputeNodeRecord {
+                    address:              owner.clone(),
+                    endpoint:             String::new(),
+                    cpu_cores:            hw.cpu_cores,
+                    cpu_model:            hw.cpu_model,
+                    ram_gb:               hw.ram_gb,
+                    gpu_name:             hw.gpu_name,
+                    gpu_vram_gb:          hw.gpu_vram_gb,
+                    gpu_count:            hw.gpu_count,
+                    has_cuda:             hw.has_cuda,
+                    compute_score:        hw.compute_score,
+                    available_cores:      ledger.compute_allocated_cores,
+                    available_ram_gb:     ledger.compute_allocated_ram_gb,
+                    price_per_gpu_hour_uegoc:  ledger.compute_price_per_gpu_hour_uegoc,
+                    price_per_core_hour_uegoc: ledger.compute_price_per_core_hour_uegoc,
+                    jobs_completed:       ledger.compute_jobs_completed,
+                    reputation_score:     ledger.compute_jobs_completed * 10,
+                    last_seen:            chrono::Utc::now().timestamp(),
+                    status:               "online".to_string(),
+                    locked_cores:         ledger.compute_locked_cores,
+                    locked_ram_gb:        ledger.compute_locked_ram_gb,
+                    slash_count:          0,
+                }
+            } else {
+                return;
+            }
+        };
+
+        node.last_seen = chrono::Utc::now().timestamp();
+        let public_ip = crate::p2p::get_public_endpoint().await;
+        if !public_ip.is_empty() {
+            node.endpoint = public_ip;
+        }
+        
+        let node_clone = node.clone();
+        tokio::task::spawn_blocking(move || crate::chain_db::upsert_compute_node(&node_clone)).await.ok();
+        let msg = crate::p2p::P2PMessage::ComputeAnnounce { node };
+        crate::p2p::broadcast_compute_msg(msg).await;
+        
+        // Re-broadcast active open capacity offers
+        let owner_clone = owner.clone();
+        let my_offers = tokio::task::spawn_blocking(move || {
+            crate::chain_db::list_compute_offers().into_iter()
+                .filter(|o| o.provider_address == owner_clone && o.status == "open")
+                .collect::<Vec<_>>()
+        }).await.unwrap_or_default();
+        
+        for offer in my_offers {
+            let msg = crate::p2p::P2PMessage::CapacityOfferBroadcast { offer };
+            crate::p2p::broadcast_compute_msg(msg).await;
+        }
+    }
+    
+    tokio::task::spawn_blocking(crate::chain_db::prune_stale_compute_nodes).await.ok();
+}
+
+#[tauri::command]
 pub async fn detect_hardware() -> Result<HardwareProfile, EgoDesktopError> {
     tokio::task::spawn_blocking(|| {
         use sysinfo::System;

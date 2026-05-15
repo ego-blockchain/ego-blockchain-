@@ -244,12 +244,12 @@ function shortAddr(a: string) {
 }
 function statusBadge(s: string) {
   if (s === 'Confirmed') return 'bg-green-500/20 text-green-400';
-  if (s === 'Pending')   return 'bg-yellow-500/20 text-yellow-400';
+  if (s === 'Pending' || s.startsWith('Confirming')) return 'bg-yellow-500/20 text-yellow-400';
   return 'bg-red-500/20 text-red-400';
 }
 function statusIcon(s: string) {
   if (s === 'Confirmed') return '✅';
-  if (s === 'Pending')   return '⏳';
+  if (s === 'Pending' || s.startsWith('Confirming')) return '⏳';
   return '❌';
 }
 function formatAgo(ts: number) {
@@ -287,7 +287,7 @@ const WalletPage: React.FC = () => {
   const [remoteLoading, setRemoteLoading]   = useState(false);
   const [remoteError, setRemoteError]       = useState('');
 
-  type EmailStep = 'idle' | 'review' | 'pin_entry' | 'code_entry' | 'confirmed' | 'expired';
+  type EmailStep = 'idle' | 'review' | 'no_password_prompt' | 'set_password_inline' | 'pin_entry' | 'code_entry' | 'confirmed' | 'expired';
   const [emailStep, setEmailStep]     = useState<EmailStep>('idle');
   const [pinInput, setPinInput]       = useState('');
   const [pinError, setPinError]       = useState('');
@@ -454,35 +454,20 @@ const WalletPage: React.FC = () => {
     }
   }
 
-  async function submitTxWithPin(password: string) {
+  async function submitTx() {
     if (!sendForm.to || !sendForm.amount) return;
     const amount  = Math.floor(parseFloat(sendForm.amount) * 1_000_000);
     const request = { to_address: sendForm.to, amount, memo: sendForm.memo || null };
     try {
-      const res = await invoke<TxResult>('send_transaction_with_password', { request, password });
+      const res = await invoke<TxResult>('send_transaction', { request });
+      setEmailStep('idle');
       setTxResult(res);
-      setEmailStep('confirmed');
       load().catch(() => {});
       reloadWallet();
     } catch (e: any) {
       const msg = String(e).replace(/^.*Error:/, '').trim();
-      const lower = msg.toLowerCase();
-      if (lower.includes('pin required') || lower.includes('password required')) {
-        setEmailStep('pin_entry');
-        setPinInput('');
-        setPinError('');
-      } else if (lower.includes('pin not set') || lower.includes('password not set')) {
-        setTxResult({
-          hash: '', success: false,
-          message: 'Password not set. Open Settings → Security & Keys → Set Password before sending.',
-        });
-      } else if (lower.includes('incorrect pin') || lower.includes('incorrect password') || lower.includes('locked')) {
-        setEmailStep('pin_entry');
-        setPinError(msg);
-        setPinInput('');
-      } else {
-        setTxResult({ hash: '', success: false, message: msg });
-      }
+      setEmailStep('idle');
+      setTxResult({ hash: '', success: false, message: msg });
     }
   }
 
@@ -494,27 +479,10 @@ const WalletPage: React.FC = () => {
     }
     setSending(true);
     try {
-      // Try with empty PIN first — succeeds if the in-memory PIN cache (15 min)
-      // is still fresh from app unlock or a recent TX. Otherwise the backend
-      // returns "PIN required" and we route to the PIN entry step.
-      await submitTxWithPin('');
+      await submitTx();
     } catch (e: any) {
+      setEmailStep('idle');
       setTxResult({ hash: '', success: false, message: String(e) });
-    } finally {
-      setSending(false);
-    }
-  }
-
-  async function handleSubmitPin() {
-    const pin = pinInput.trim();
-    if (!pin) {
-      setPinError('Enter your PIN.');
-      return;
-    }
-    setSending(true);
-    setPinError('');
-    try {
-      await submitTxWithPin(pin);
     } finally {
       setSending(false);
     }
@@ -845,35 +813,19 @@ const WalletPage: React.FC = () => {
     if (!extSend || !extSendTo.trim() || !extSendAmount.trim()) return;
     setExtSending(true); setExtSendError(''); setExtSendTxid('');
     try {
-      const res = await invoke<{ tx_id: string; masked_email: string }>('request_ext_tx_code', {
+      const txid = await invoke<string>('send_external_tx', {
         chainSymbol: extSend.symbol,
         toAddress:   extSendTo.trim(),
         amountStr:   extSendAmount.trim(),
         contract:    extSend.contract ?? null,
         decimals:    extSend.decimals ?? null,
       });
-      setExtTxId(res.tx_id);
-      setExtMaskedEmail(res.masked_email);
-      setExtOtp(['', '', '', '', '', '']);
-      setExtCodeInput(''); setExtCodeError('');
-      setExtEmailStep('code_entry');
+      setExtSendTxid(txid);
     } catch (e: any) {
-      const msg = String(e);
-      if (msg.includes('No email on file')) {
-        // No 2FA configured — send directly
-        const txid = await invoke<string>('send_external_tx', {
-          chainSymbol: extSend.symbol,
-          toAddress:   extSendTo.trim(),
-          amountStr:   extSendAmount.trim(),
-          contract:    extSend.contract ?? null,
-          decimals:    extSend.decimals ?? null,
-        });
-        setExtSendTxid(txid);
-      } else {
-        setExtSendError(msg);
-      }
+      setExtSendError(String(e).replace(/^.*Error:/, '').trim());
+    } finally {
+      setExtSending(false);
     }
-    setExtSending(false);
   }
 
   function handleExtOtpInput(i: number, val: string) {
@@ -1416,7 +1368,7 @@ const WalletPage: React.FC = () => {
                     <div className="flex items-center justify-end gap-1.5 mt-0.5">
                       <span className={`inline-block w-1.5 h-1.5 rounded-full ${
                         tx.status === 'Confirmed' ? 'bg-green-400' :
-                        tx.status === 'Pending'   ? 'bg-yellow-400' : 'bg-red-400'
+                        (tx.status === 'Pending' || tx.status.startsWith('Confirming')) ? 'bg-yellow-400' : 'bg-red-400'
                       }`}></span>
                       <span className="text-xs text-gray-500">{formatAgo(tx.timestamp)}</span>
                     </div>
@@ -2457,7 +2409,7 @@ const WalletPage: React.FC = () => {
                     Back
                   </button>
                   <button
-                    onClick={() => { handleSend(); }}
+                onClick={() => handleSend()}
                     disabled={sending}
                     className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 py-3 rounded-xl font-semibold text-sm transition flex items-center justify-center gap-2"
                   >
@@ -2465,52 +2417,6 @@ const WalletPage: React.FC = () => {
                       ? <><div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />Signing…</>
                       : 'Confirm & Sign'}
                   </button>
-                </div>
-              </div>
-            ) : emailStep === 'pin_entry' ? (
-              <div className="space-y-5">
-                <div className="flex justify-between items-center">
-                  <h3 className="text-lg font-bold">Enter Your Password</h3>
-                  <button onClick={resetSend} className="text-gray-400 hover:text-white text-xl">✕</button>
-                </div>
-                <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl p-4 text-xs text-blue-300 leading-relaxed">
-                  Enter your wallet password to authorize this transaction.
-                  After a successful entry you can send transactions for the next 15&nbsp;minutes without re-entering it.
-                </div>
-                <div>
-                  <input
-                    type="password"
-                    autoFocus
-                    value={pinInput}
-                    onChange={e => setPinInput(e.target.value)}
-                    onKeyDown={e => { if (e.key === 'Enter' && !sending) handleSubmitPin(); }}
-                    placeholder="Password"
-                    className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 outline-none transition"
-                  />
-                  {pinError && (
-                    <div className="mt-2 text-xs text-red-400 text-center">{pinError}</div>
-                  )}
-                </div>
-                <div className="flex gap-3">
-                  <button
-                    onClick={() => setEmailStep('review')}
-                    disabled={sending}
-                    className="flex-1 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition"
-                  >
-                    Back
-                  </button>
-                  <button
-                    onClick={handleSubmitPin}
-                    disabled={sending || !pinInput.trim()}
-                    className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 py-3 rounded-xl font-semibold text-sm transition flex items-center justify-center gap-2"
-                  >
-                    {sending
-                      ? <><div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />Sending…</>
-                      : 'Confirm & Send'}
-                  </button>
-                </div>
-                <div className="text-center text-xs text-gray-500">
-                  Forgot your password? Open Settings → Security &amp; Keys → reset using your 24-word recovery phrase.
                 </div>
               </div>
             ) : txResult ? (
@@ -2673,7 +2579,7 @@ const WalletPage: React.FC = () => {
             </div>
             <div className={`rounded-xl p-4 text-center mb-5 ${
               selectedTx.status === 'Confirmed' ? 'bg-green-500/10 border border-green-500/20' :
-              selectedTx.status === 'Pending'   ? 'bg-yellow-500/10 border border-yellow-500/20' :
+              (selectedTx.status === 'Pending' || selectedTx.status.startsWith('Confirming')) ? 'bg-yellow-500/10 border border-yellow-500/20' :
               'bg-red-500/10 border border-red-500/20'
             }`}>
               <div className="text-3xl mb-1">{statusIcon(selectedTx.status)}</div>
@@ -2756,48 +2662,6 @@ const WalletPage: React.FC = () => {
                     className="w-full bg-blue-600 hover:bg-blue-500 py-3 rounded-xl font-semibold transition">
                     Done
                   </button>
-                </div>
-              ) : extEmailStep === 'code_entry' ? (
-                <div className="space-y-5">
-                  <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl p-4 text-sm text-center space-y-1">
-                    <div className="text-blue-300 font-semibold">Verification code sent</div>
-                    <div className="text-gray-400">
-                      Check <span className="text-white font-mono">{extMaskedEmail}</span> for your confirmation code.
-                    </div>
-                  </div>
-                  <div>
-                    <label className="text-xs text-gray-400 block mb-2 text-center">Enter confirmation code</label>
-                    <div className="flex justify-center gap-2">
-                      {extOtp.map((char, i) => (
-                        <input
-                          key={i}
-                          ref={el => { extOtpRefs.current[i] = el; }}
-                          type="text"
-                          inputMode="text"
-                          maxLength={1}
-                          value={char}
-                          autoFocus={i === 0}
-                          onChange={e => handleExtOtpInput(i, e.target.value)}
-                          onKeyDown={e => handleExtOtpKeyDown(i, e)}
-                          className="w-11 h-14 text-center text-xl font-bold bg-gray-900 border-2 border-gray-700 focus:border-blue-500 rounded-xl outline-none transition text-white"
-                        />
-                      ))}
-                    </div>
-                    {extCodeError && <p className="text-red-400 text-xs mt-2 text-center">{extCodeError}</p>}
-                  </div>
-                  <div className="flex gap-3">
-                    <button onClick={() => setExtEmailStep('form')}
-                      className="flex-1 bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition">
-                      Back
-                    </button>
-                    <button onClick={handleExtConfirmCode}
-                      disabled={extCodeInput.length !== 6 || extCodeLoading}
-                      className="flex-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 py-3 rounded-xl font-semibold text-sm transition flex items-center justify-center gap-2">
-                      {extCodeLoading
-                        ? <><div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />Verifying…</>
-                        : 'Confirm Send'}
-                    </button>
-                  </div>
                 </div>
               ) : (
                 <>

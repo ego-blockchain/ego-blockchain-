@@ -290,6 +290,7 @@ pub async fn store_file(
         now + (request.duration_months as i64) * 30 * 86_400
     };
 
+    let _guard = crate::ledger::TX_MUTEX.lock().await;
     let mut ledger = Ledger::load();
     let is_staker  = ledger.staked_amount > 0;
     let mb         = (original_size as f64) / 1_000_000.0;
@@ -665,6 +666,7 @@ pub async fn delete_stored_file(
     cid: String,
     _state: State<'_, AppState>,
 ) -> Result<(), EgoDesktopError> {
+    let _guard = crate::ledger::TX_MUTEX.lock().await;
     let mut ledger = Ledger::load();
     let my_addr = ledger.address.clone();
 
