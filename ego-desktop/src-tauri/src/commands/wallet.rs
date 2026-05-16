@@ -1380,12 +1380,16 @@ pub async fn presale_info() -> Result<serde_json::Value, EgoDesktopError> {
     }))
 }
 
-// ── Stripe card / Apple Pay payments ──────────────────────────────────────────
 
-const STRIPE_SECRET_KEY: &str = match option_env!("STRIPE_SECRET_KEY") {
-    Some(k) => k,
-    None    => "",
-};
+fn get_stripe_key() -> String {
+    if let Ok(k) = std::env::var("STRIPE_SECRET_KEY") {
+        if !k.trim().is_empty() { return k; }
+    }
+    if let Some(k) = option_env!("STRIPE_SECRET_KEY") {
+        if !k.trim().is_empty() { return k.to_string(); }
+    }
+    String::new()
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StripeSession {
@@ -1395,13 +1399,14 @@ pub struct StripeSession {
     pub usd_amount:   f64,
 }
 
-/// Create a Stripe Checkout Session via the API to securely verify payments.
+
 #[tauri::command]
 pub async fn presale_stripe_checkout(
     egoc_amount: f64,
     usd_amount:  f64,
 ) -> Result<StripeSession, EgoDesktopError> {
-    if STRIPE_SECRET_KEY.is_empty() {
+    let stripe_key = get_stripe_key();
+    if stripe_key.is_empty() {
         return Err(EgoDesktopError::NetworkError("Stripe integration is not configured. For local testing, set the STRIPE_SECRET_KEY environment variable.".into()));
     }
 
@@ -1425,7 +1430,7 @@ pub async fn presale_stripe_checkout(
 
     let resp = client
         .post("https://api.stripe.com/v1/checkout/sessions")
-        .bearer_auth(STRIPE_SECRET_KEY)
+        .bearer_auth(&stripe_key)
         .form(&params)
         .send()
         .await
@@ -1450,10 +1455,11 @@ pub async fn presale_stripe_checkout(
     Ok(StripeSession { session_id, checkout_url, egoc_amount, usd_amount })
 }
 
-/// Verify the session directly with Stripe to ensure they actually paid.
+
 #[tauri::command]
 pub async fn presale_stripe_verify(session_id: String) -> Result<serde_json::Value, EgoDesktopError> {
-    if STRIPE_SECRET_KEY.is_empty() {
+    let stripe_key = get_stripe_key();
+    if stripe_key.is_empty() {
         return Err(EgoDesktopError::NetworkError("Stripe API key is missing.".into()));
     }
 
@@ -1464,7 +1470,7 @@ pub async fn presale_stripe_verify(session_id: String) -> Result<serde_json::Val
     let url = format!("https://api.stripe.com/v1/checkout/sessions/{}", session_id);
     let resp = client
         .get(&url)
-        .bearer_auth(STRIPE_SECRET_KEY)
+        .bearer_auth(&stripe_key)
         .send()
         .await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
@@ -1484,7 +1490,7 @@ pub async fn presale_stripe_verify(session_id: String) -> Result<serde_json::Val
     Ok(json)
 }
 
-/// After a verified Stripe payment, create the encrypted IOU file.
+
 #[tauri::command]
 pub async fn presale_stripe_create_iou(
     session_id:  String,
