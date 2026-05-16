@@ -1381,11 +1381,10 @@ pub async fn presale_info() -> Result<serde_json::Value, EgoDesktopError> {
 }
 
 // ── Stripe card / Apple Pay payments ──────────────────────────────────────────
-// The app calls a proxy on your server — Stripe secret key never enters the binary.
-// Deploy services/presale-proxy/ to any Node.js host and set PRESALE_API_URL.
-const PRESALE_API_URL: &str = match option_env!("PRESALE_API_URL") {
-    Some(u) => u,
-    None    => "http://localhost:3031/presale",
+
+const STRIPE_SECRET_KEY: &str = match option_env!("STRIPE_SECRET_KEY") {
+    Some(k) => k,
+    None    => "",
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1396,20 +1395,38 @@ pub struct StripeSession {
     pub usd_amount:   f64,
 }
 
-/// Create a Stripe Checkout Session via the presale proxy.
-/// The proxy holds the Stripe secret key — never the app.
+/// Create a Stripe Checkout Session via the API to securely verify payments.
 #[tauri::command]
 pub async fn presale_stripe_checkout(
     egoc_amount: f64,
     usd_amount:  f64,
 ) -> Result<StripeSession, EgoDesktopError> {
+    if STRIPE_SECRET_KEY.is_empty() {
+        return Err(EgoDesktopError::NetworkError("Stripe integration is not configured. For local testing, set the STRIPE_SECRET_KEY environment variable.".into()));
+    }
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build().unwrap_or_default();
 
+    let unit_amount = (usd_amount * 100.0).round() as u64;
+    let product_name = format!("Ego Blockchain Pre-Sale ({} EGOC)", egoc_amount);
+
+    let params = [
+        ("payment_method_types[0]", "card".to_string()),
+        ("line_items[0][price_data][currency]", "usd".to_string()),
+        ("line_items[0][price_data][product_data][name]", product_name),
+        ("line_items[0][price_data][unit_amount]", unit_amount.to_string()),
+        ("line_items[0][quantity]", "1".to_string()),
+        ("mode", "payment".to_string()),
+        ("success_url", "https://egoblockchain.com/success?session_id={CHECKOUT_SESSION_ID}".to_string()),
+        ("cancel_url", "https://egoblockchain.com/cancel".to_string()),
+    ];
+
     let resp = client
-        .post(format!("{PRESALE_API_URL}/checkout"))
-        .json(&serde_json::json!({ "egoc_amount": egoc_amount, "usd_amount": usd_amount }))
+        .post("https://api.stripe.com/v1/checkout/sessions")
+        .bearer_auth(STRIPE_SECRET_KEY)
+        .form(&params)
         .send()
         .await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
@@ -1417,29 +1434,37 @@ pub async fn presale_stripe_checkout(
     let json: serde_json::Value = resp.json().await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
 
-    if let Some(err) = json["error"].as_str() {
-        return Err(EgoDesktopError::NetworkError(format!("Presale API: {err}")));
+    if let Some(err) = json["error"]["message"].as_str() {
+        return Err(EgoDesktopError::NetworkError(format!("Stripe API: {err}")));
     }
 
-    let session_id   = json["session_id"].as_str().unwrap_or("").to_string();
-    let checkout_url = json["checkout_url"].as_str().unwrap_or("").to_string();
+    let session_id   = json["id"].as_str().unwrap_or("").to_string();
+    let checkout_url = json["url"].as_str().unwrap_or("").to_string();
 
     if session_id.is_empty() || checkout_url.is_empty() {
-        return Err(EgoDesktopError::NetworkError("No checkout URL returned from presale API".into()));
+        return Err(EgoDesktopError::NetworkError("No checkout URL returned from Stripe".into()));
     }
+
+    let _ = opener::open(&checkout_url);
 
     Ok(StripeSession { session_id, checkout_url, egoc_amount, usd_amount })
 }
 
-/// Verify a Stripe Checkout Session via the presale proxy.
+/// Verify the session directly with Stripe to ensure they actually paid.
 #[tauri::command]
 pub async fn presale_stripe_verify(session_id: String) -> Result<serde_json::Value, EgoDesktopError> {
+    if STRIPE_SECRET_KEY.is_empty() {
+        return Err(EgoDesktopError::NetworkError("Stripe API key is missing.".into()));
+    }
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build().unwrap_or_default();
 
+    let url = format!("https://api.stripe.com/v1/checkout/sessions/{}", session_id);
     let resp = client
-        .get(format!("{PRESALE_API_URL}/verify/{session_id}"))
+        .get(&url)
+        .bearer_auth(STRIPE_SECRET_KEY)
         .send()
         .await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
@@ -1447,8 +1472,13 @@ pub async fn presale_stripe_verify(session_id: String) -> Result<serde_json::Val
     let json: serde_json::Value = resp.json().await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
 
-    if let Some(err) = json["error"].as_str() {
-        return Err(EgoDesktopError::NetworkError(format!("Presale API: {err}")));
+    if let Some(err) = json["error"]["message"].as_str() {
+        return Err(EgoDesktopError::NetworkError(format!("Stripe API: {err}")));
+    }
+
+    let payment_status = json["payment_status"].as_str().unwrap_or("");
+    if payment_status != "paid" {
+        return Err(EgoDesktopError::NetworkError("Payment is not confirmed yet. Please complete the checkout in your browser.".into()));
     }
 
     Ok(json)

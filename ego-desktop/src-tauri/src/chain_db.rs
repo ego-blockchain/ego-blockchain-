@@ -887,7 +887,12 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         }
         batch.put_cf(cf_txs,        tx.hash.as_bytes(), encode(tx));
         batch.put_cf(cf_block_txs,  block_txs_key(block.height, &tx.hash), b"");
-        batch.put_cf(cf_recent_txs, recent_txs_key(tx.timestamp, &tx.hash), b"");
+        
+        let is_spammy = tx.from == NODE_POOL_ADDR 
+            && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward");
+        if !is_spammy {
+            batch.put_cf(cf_recent_txs, recent_txs_key(tx.timestamp, &tx.hash), b"");
+        }
         // Per-address history with signed delta.
         if is_unstake_tx(tx) {
             let credit = unstake_credit_amount(tx);
@@ -1316,26 +1321,32 @@ pub fn paged_transactions(offset: usize, limit: usize) -> Vec<LedgerTx> {
     let mut iter = db.raw_iterator_cf(cf_recent);
     iter.seek_to_last();
     let mut skipped = 0usize;
-    let mut hashes: Vec<Vec<u8>> = Vec::with_capacity(limit);
-    while iter.valid() && hashes.len() < limit {
+    let mut out = Vec::with_capacity(limit);
+    
+    while iter.valid() && out.len() < limit {
         if let Some(k) = iter.key() {
             if k.len() > 8 {
-                if skipped < offset { skipped += 1; }
-                else { hashes.push(k[8..].to_vec()); }
+                let tx_hash = &k[8..];
+                if let Some(v) = db.get_cf(cf_txs, tx_hash).ok().flatten() {
+                    if let Some(mut tx) = decode::<LedgerTx>(&v) {
+                        let is_spammy = tx.from == NODE_POOL_ADDR 
+                            && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward");
+                        
+                        if !is_spammy {
+                            if skipped < offset { 
+                                skipped += 1; 
+                            } else { 
+                                tx.status = "Confirmed".to_string();
+                                out.push(tx); 
+                            }
+                        }
+                    }
+                }
             }
         }
         iter.prev();
     }
-    hashes.iter()
-        .filter_map(|h| {
-            db.get_cf(cf_txs, h).ok().flatten()
-                .and_then(|v| decode::<LedgerTx>(&v))
-                .map(|mut tx| {
-                    tx.status = "Confirmed".to_string();
-                    tx
-                })
-        })
-        .collect()
+    out
 }
 
 /// View of the last 2000 blocks/txs, for legacy callers that use SharedChain.
@@ -2667,7 +2678,12 @@ pub fn apply_missing_tx(block_height: u64, tx: &LedgerTx) {
 
     batch.put_cf(cf_txs,        tx.hash.as_bytes(), encode(tx));
     batch.put_cf(cf_block_txs,  block_txs_key(block_height, &tx.hash), b"");
-    batch.put_cf(cf_recent_txs, recent_txs_key(tx.timestamp, &tx.hash), b"");
+    
+    let is_spammy = tx.from == NODE_POOL_ADDR 
+        && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward");
+    if !is_spammy {
+        batch.put_cf(cf_recent_txs, recent_txs_key(tx.timestamp, &tx.hash), b"");
+    }
 
     let incoming_k = addr_txs_key(&tx.to, tx.timestamp, &tx.hash);
     batch.put_cf(cf_addr_txs, incoming_k, (tx.amount as i64).to_le_bytes());
