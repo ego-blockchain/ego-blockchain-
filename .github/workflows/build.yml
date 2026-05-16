@@ -75,7 +75,7 @@ jobs:
           EGO_SMTP_HOST: ${{ secrets.EGO_SMTP_HOST }}
           EGO_SMTP_USER: ${{ secrets.EGO_SMTP_USER }}
           EGO_SMTP_PASS: ${{ secrets.EGO_SMTP_PASS }}
-          STRIPE_SECRET_KEY: ${{ secrets.stripe }}
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
         with:
           projectPath: ego-desktop
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
