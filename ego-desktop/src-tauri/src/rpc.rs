@@ -214,7 +214,7 @@ async fn health() -> &'static str { "ok" }
 // ── Faucet ─────────────────────────────────────────────────────────────────────
 
 static FAUCET_LAST: std::sync::OnceLock<Mutex<HashMap<String, i64>>> = std::sync::OnceLock::new();
-const FAUCET_COOLDOWN_SECS: i64 = 86_400; // 24 h per address
+const FAUCET_COOLDOWN_SECS: i64 = 60; // Increased to 60s to prevent accidental double-clicks
 
 fn faucet_cooldown() -> std::sync::MutexGuard<'static, HashMap<String, i64>> {
     FAUCET_LAST.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
@@ -223,16 +223,29 @@ fn faucet_cooldown() -> std::sync::MutexGuard<'static, HashMap<String, i64>> {
 #[derive(serde::Deserialize)]
 struct FaucetQuery {
     to: String,
+    amount: Option<u64>,
 }
 
 async fn faucet_handler(Query(q): Query<FaucetQuery>) -> Response {
-    const FAUCET_AMOUNT: u64 = 100 * 1_000_000;
-    const FAUCET_ADDR: &str = "egot1faucet000000000000000000000000000000000";
-
     let address = q.to.trim().to_string();
     if !address.starts_with("egot1") {
         return Json(json!({ "success": false, "error": "invalid address: must start with egot1" })).into_response();
     }
+
+    let req_amount = q.amount.unwrap_or(1000).min(1000);
+    if req_amount == 0 {
+        return Json(json!({ "success": false, "error": "amount must be greater than 0" })).into_response();
+    }
+
+    let drops_used = crate::chain_db::get_faucet_drops(&address);
+    if drops_used >= 1 {
+        return Json(json!({
+            "success": false,
+            "error": "Faucet limit reached (1 drop maximum per address)."
+        })).into_response();
+    }
+
+    let faucet_amount = req_amount * 1_000_000;
 
     let now = chrono::Utc::now().timestamp();
     {
@@ -248,32 +261,24 @@ async fn faucet_handler(Query(q): Query<FaucetQuery>) -> Response {
         *last = now;
     }
 
-    let ts   = chrono::Utc::now().timestamp();
-    let hash = format!("faucet{:x}{}", ts, address.len());
-
-    let tx = crate::ledger::LedgerTx {
-        hash:      hash.clone(),
-        from:      FAUCET_ADDR.into(),
-        to:        address.clone(),
-        amount:    FAUCET_AMOUNT,
-        memo:      Some("Extension faucet – 100 EGOC".into()),
-        timestamp: ts,
-        status:    "Confirmed".into(),
-        ..crate::ledger::LedgerTx::default()
-    };
-        
-        let tx_clone = tx.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::chain_db::mine_batch_db(&[tx_clone], FAUCET_ADDR);
-        }).await.unwrap_or_default();
-
-    Json(json!({
-        "success":      true,
-        "to":           address,
-        "amount_egoc":  100,
-        "amount_uegoc": FAUCET_AMOUNT,
-        "tx_hash":      hash,
-    })).into_response()
+    let success = crate::chain_db::grant_testnet_faucet(&address, faucet_amount);
+    
+    let drops_used_now = crate::chain_db::get_faucet_drops(&address);
+    if success {
+        Json(json!({
+            "success":      true,
+            "to":           address,
+            "amount_egoc":  req_amount,
+            "amount_uegoc": faucet_amount,
+            "drops_used":   drops_used_now,
+            "message":      "Faucet request queued. Coins will arrive shortly."
+        })).into_response()
+    } else {
+        Json(json!({
+            "success": false,
+            "error": "Faucet request failed (limit of 10 requests reached, or pool empty)"
+        })).into_response()
+    }
 }
 
 async fn rpc_handler(

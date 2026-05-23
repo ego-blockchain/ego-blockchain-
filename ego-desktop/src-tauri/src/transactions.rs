@@ -42,14 +42,7 @@ pub async fn get_balance(_state: State<'_, AppState>) -> Result<Balance, EgoDesk
     let pool = crate::mempool::get_mempool();
     let pending_out: u64 = pool.pending_outflow_for_address(&my_addr);
 
-    let pending_faucet_in: u64 = pool
-        .pending_txs_for_address(&my_addr)
-        .iter()
-        .filter(|tx| tx.tx_type == "faucet" && tx.to == my_addr)
-        .map(|tx| tx.amount)
-        .sum();
-
-    let uegoc = confirmed.saturating_add(pending_faucet_in).saturating_sub(pending_out);
+    let uegoc = confirmed.saturating_sub(pending_out);
     let egoc  = uegoc / 1_000_000;
 
     Ok(Balance {
@@ -152,7 +145,10 @@ pub async fn send_transaction(
         ..LedgerTx::default()
     };
     crate::commands::tx_pending::add(&pending_tx);
-    crate::mempool::get_mempool().push(pending_tx.clone());
+    if let Err(e) = crate::mempool::get_mempool().push(pending_tx.clone()) {
+        crate::commands::tx_pending::remove(&pending_tx.hash);
+        return Err(EgoDesktopError::InvalidInput(format!("Transaction rejected by mempool: {}", e)));
+    }
 
     let gossip_tx = pending_tx.clone();
     tokio::spawn(async move { crate::p2p::broadcast_pending_tx(gossip_tx).await; });

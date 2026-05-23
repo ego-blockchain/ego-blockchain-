@@ -63,8 +63,12 @@ mod windows_dpapi {
                 0,
                 &mut output,
             );
-            if ok == 0 || output.pbData.is_null() { return Err(()); }
-            let result = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+            if ok == 0 { return Err(()); }
+            let result = if !output.pbData.is_null() && output.cbData > 0 {
+                std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec()
+            } else {
+                Vec::new()
+            };
             LocalFree(output.pbData as *mut _);
             Ok(result)
         }
@@ -86,8 +90,12 @@ mod windows_dpapi {
                 0,
                 &mut output,
             );
-            if ok == 0 || output.pbData.is_null() { return Err(()); }
-            let result = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+            if ok == 0 { return Err(()); }
+            let result = if !output.pbData.is_null() && output.cbData > 0 {
+                std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec()
+            } else {
+                Vec::new()
+            };
             LocalFree(output.pbData as *mut _);
             Ok(result)
         }

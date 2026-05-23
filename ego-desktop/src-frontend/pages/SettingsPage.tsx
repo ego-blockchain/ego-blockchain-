@@ -173,6 +173,15 @@ const SettingsPage: React.FC = () => {
 
   function save() { setSaved(true); setTimeout(() => setSaved(false), 2000); }
 
+  const handlePastePhrase = (e: React.ClipboardEvent<HTMLInputElement>) => {
+    const pastedText = e.clipboardData.getData('text');
+    const words = pastedText.trim().split(/[\s,]+/).filter(Boolean);
+    if (words.length === 24) {
+      e.preventDefault();
+      setResetPhraseWords(words.map(w => w.toLowerCase()));
+    }
+  };
+
   return (
     <div className="p-6 max-w-2xl mx-auto space-y-5">
 
@@ -427,6 +436,7 @@ const SettingsPage: React.FC = () => {
             <input
               type="text"
               value={w}
+                    onPaste={handlePastePhrase}
               onChange={e => {
                 const v = e.target.value.toLowerCase().trim();
                 setResetPhraseWords(prev => prev.map((x, j) => j === i ? v : x));

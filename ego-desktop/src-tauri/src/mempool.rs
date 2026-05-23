@@ -89,7 +89,7 @@ impl ShardedMempool {
     }
 
 
-    pub fn push(&self, tx: LedgerTx) {
+    pub fn push(&self, tx: LedgerTx) -> Result<(), String> {
         let is_pool_faucet = tx.tx_type == "faucet"
             && tx.from == crate::chain_db::NODE_POOL_ADDR;
 
@@ -101,20 +101,20 @@ impl ShardedMempool {
 
         if is_system && !is_pool_faucet {
             tracing::warn!("Mempool rejected {} - system txs are only valid inside verified blocks", tx.hash);
-            return;
+            return Err("System txs are only valid inside verified blocks".into());
         }
 
         {
             let shard_idx = shard_for_address(&tx.from) as usize;
             if self.seen_hashes[shard_idx].lock().expect("lock poisoned").contains(&tx.hash) {
-                return;
+                return Ok(());
             }
         }
 
         if !is_pool_faucet {
             if let Err(reason) = crate::ledger::verify_incoming_tx(&tx) {
                 eprintln!("[Mempool] REJECTED {:.12} — {}", tx.hash, reason);
-                return;
+                return Err(reason);
             }
         }
 
@@ -153,7 +153,7 @@ impl ShardedMempool {
                         tokio::spawn(async move {
                             crate::p2p::route_tx_to_shard_master(shard_id, tx_clone).await;
                         });
-                        return;
+                        return Ok(()); // Routed
                     }
                 }
             }
@@ -161,28 +161,28 @@ impl ShardedMempool {
 
         if !is_system {
             if tx.fee_uegoc < MIN_FEE_UEGOC {
-                eprintln!("[Mempool] REJECTED {:.12} — fee {} uEGOC below floor {}",
-                    &tx.hash[..12.min(tx.hash.len())], tx.fee_uegoc, MIN_FEE_UEGOC);
-                return;
+                let err = format!("fee {} uEGOC below floor {}", tx.fee_uegoc, MIN_FEE_UEGOC);
+                eprintln!("[Mempool] REJECTED {:.12} — {}", &tx.hash[..12.min(tx.hash.len())], err);
+                return Err(err);
             }
             let current_base_fee = crate::chain_db::get_current_base_fee();
             if tx.fee_uegoc < current_base_fee {
-                eprintln!("[Mempool] REJECTED {:.12} — fee {} uEGOC below base fee {}",
-                    &tx.hash[..12.min(tx.hash.len())], tx.fee_uegoc, current_base_fee);
-                return;
+                let err = format!("fee {} uEGOC below base fee {}", tx.fee_uegoc, current_base_fee);
+                eprintln!("[Mempool] REJECTED {:.12} — {}", &tx.hash[..12.min(tx.hash.len())], err);
+                return Err(err);
             }
 
             if tx.nonce > 0 {
                 let confirmed_nonce = crate::ledger::last_confirmed_nonce(&tx.from);
                 if tx.nonce <= confirmed_nonce {
-                    eprintln!("[Mempool] REJECTED {:.12} — replay nonce {} <= confirmed {}",
-                        &tx.hash[..12.min(tx.hash.len())], tx.nonce, confirmed_nonce);
-                    return;
+                    let err = format!("replay nonce {} <= confirmed {}", tx.nonce, confirmed_nonce);
+                    eprintln!("[Mempool] REJECTED {:.12} — {}", &tx.hash[..12.min(tx.hash.len())], err);
+                    return Err(err);
                 }
                 if tx.nonce > confirmed_nonce + 10 {
-                    eprintln!("[Mempool] REJECTED {:.12} — nonce {} too far ahead of confirmed {}",
-                        &tx.hash[..12.min(tx.hash.len())], tx.nonce, confirmed_nonce);
-                    return;
+                    let err = format!("nonce {} too far ahead of confirmed {}", tx.nonce, confirmed_nonce);
+                    eprintln!("[Mempool] REJECTED {:.12} — {}", &tx.hash[..12.min(tx.hash.len())], err);
+                    return Err(err);
                 }
             }
         }
@@ -191,7 +191,7 @@ impl ShardedMempool {
         {
             let mut seen = self.seen_hashes[shard].lock().expect("lock poisoned");
             if !seen.insert(tx.hash.clone()) {
-                return;
+                return Ok(());
             }
         }
 
@@ -217,7 +217,7 @@ impl ShardedMempool {
                         &tx.hash[..12.min(tx.hash.len())], active_stake, requested, credit, tx.fee_uegoc
                     );
                     self.seen_hashes[shard].lock().expect("lock poisoned").remove(&tx.hash);
-                    return;
+                    return Err("invalid unstake request".to_string());
                 }
             } else {
             let pending_outflow: u64 = s.iter()
@@ -232,11 +232,11 @@ impl ShardedMempool {
                 .fold(0u64, |acc, v| acc.saturating_add(v));
             let required = tx.amount.saturating_add(tx.fee_uegoc).saturating_add(pending_outflow);
             if balance < required {
-                eprintln!("[Mempool] REJECTED {:.12} — insufficient balance: has {} uEGOC, needs {} (amount {} + fee {} + pending_outflow {})",
-                    &tx.hash[..12.min(tx.hash.len())], balance, required,
-                    tx.amount, tx.fee_uegoc, pending_outflow);
+                let err = format!("insufficient balance: has {} uEGOC, needs {} (amount {} + fee {} + pending_outflow {})",
+                    balance, required, tx.amount, tx.fee_uegoc, pending_outflow);
+                eprintln!("[Mempool] REJECTED {:.12} — {}", &tx.hash[..12.min(tx.hash.len())], err);
                 self.seen_hashes[shard].lock().expect("lock poisoned").remove(&tx.hash);
-                return;
+                return Err(err);
             }
             }
         }
@@ -259,14 +259,16 @@ impl ShardedMempool {
             tracing::info!("Mempool evicted lowest-fee tx {} from shard {}", &evicted.hash[..12], shard);
 
             let my_addr = crate::ledger::Ledger::load().address;
-            if evicted.from == my_addr {
+            if evicted.from == my_addr || evicted.to == my_addr {
                 crate::commands::tx_pending::remove(&evicted.hash);
                 if let Some(app) = crate::p2p::APP_HANDLE.get() {
-                    crate::commands::notifications::notify(
-                        app,
-                        "Transaction Dropped",
-                        &format!("Your transaction of {:.2} EGOC was dropped (fee too low). Please try again with a higher fee.", evicted.amount as f64 / 1_000_000.0)
-                    );
+                    if evicted.from == my_addr {
+                        crate::commands::notifications::notify(
+                            app,
+                            "Transaction Dropped",
+                            &format!("Your transaction of {:.2} EGOC was dropped (fee too low). Please try again with a higher fee.", evicted.amount as f64 / 1_000_000.0)
+                        );
+                    }
                     let _ = app.emit_all("ego://chain-updated", ());
                 }
             }
@@ -279,12 +281,15 @@ impl ShardedMempool {
         self.tx_notify.notify_one();
         drop(s);
         crate::rpc::notify_pending_tx(&tx_hash_for_notify);
+        
+        Ok(())
     }
 
 
     pub fn drain_shard(&self, shard_id: u32) -> Vec<LedgerTx> {
         let mut expired_hashes: Vec<String> = Vec::new();
         let mut my_expired_txs: Vec<LedgerTx> = Vec::new();
+        let my_addr = crate::ledger::Ledger::load().address;
 
         let drained = {
             let mut s = self.shards[shard_id as usize].lock().expect("lock poisoned");
@@ -292,12 +297,11 @@ impl ShardedMempool {
 
             // TTL eviction: remove stale txs that have been waiting too long.
             let now = chrono::Utc::now().timestamp();
-            let my_addr = crate::ledger::Ledger::load().address;
             s.retain(|tx| {
                 let stale = tx.timestamp > 0 && (now - tx.timestamp) >= MAX_TX_AGE_SECS;
                 if stale { 
                     expired_hashes.push(tx.hash.clone()); 
-                    if tx.from == my_addr { my_expired_txs.push(tx.clone()); }
+                    if tx.from == my_addr || tx.to == my_addr { my_expired_txs.push(tx.clone()); }
                 }
                 !stale
             });
@@ -336,11 +340,13 @@ impl ShardedMempool {
         for tx in my_expired_txs {
             crate::commands::tx_pending::remove(&tx.hash);
             if let Some(app) = crate::p2p::APP_HANDLE.get() {
-                crate::commands::notifications::notify(
-                    app,
-                    "Transaction Failed",
-                    &format!("Your transaction of {:.2} EGOC timed out and was cancelled. Please try again.", tx.amount as f64 / 1_000_000.0)
-                );
+                if tx.from == my_addr {
+                    crate::commands::notifications::notify(
+                        app,
+                        "Transaction Failed",
+                        &format!("Your transaction of {:.2} EGOC timed out and was cancelled. Please try again.", tx.amount as f64 / 1_000_000.0)
+                    );
+                }
                 let _ = app.emit_all("ego://chain-updated", ());
             }
         }
@@ -375,6 +381,12 @@ impl ShardedMempool {
                 }
                 
                 if !skipped.is_empty() {
+                    {
+                        let mut seen = self.seen_hashes[shard_id as usize].lock().expect("lock poisoned");
+                        for tx in &skipped {
+                            seen.insert(tx.hash.clone());
+                        }
+                    }
                     let count = skipped.len() as u64;
                     let mut s = self.shards[shard_id as usize].lock().expect("lock poisoned");
                     for tx in skipped {
@@ -493,6 +505,28 @@ impl ShardedMempool {
         }
         self.pending_total.fetch_sub(total, Ordering::Relaxed);
     }
+
+    pub fn cleanup_stale(&self) {
+        let mut hashes_to_remove = Vec::new();
+        let my_addr = crate::ledger::Ledger::load().address;
+        for shard_idx in 0..SHARD_COUNT as usize {
+            let s = self.shards[shard_idx].lock().expect("lock poisoned");
+            for tx in s.iter() {
+                if tx.nonce > 0 && tx.nonce <= crate::ledger::last_confirmed_nonce(&tx.from) {
+                    hashes_to_remove.push(tx.hash.clone());
+                    if tx.from == my_addr || tx.to == my_addr {
+                        crate::commands::tx_pending::remove(&tx.hash);
+                    }
+                }
+            }
+        }
+        if !hashes_to_remove.is_empty() {
+            self.remove_txs(&hashes_to_remove);
+            if let Some(app) = crate::p2p::APP_HANDLE.get() {
+                let _ = app.emit_all("ego://chain-updated", ());
+            }
+        }
+    }
 }
 
 static MEMPOOL: OnceCell<Arc<ShardedMempool>> = OnceCell::new();
@@ -522,15 +556,15 @@ mod tests {
     fn duplicate_hash_rejected() {
         let pool = ShardedMempool::new();
         let tx = sys_tx("0xdup");
-        pool.push(tx.clone());
-        pool.push(tx);
+        let _ = pool.push(tx.clone());
+        let _ = pool.push(tx);
         assert_eq!(pool.pending_count(), 1);
     }
 
     #[test]
     fn system_tx_bypasses_fee_check() {
         let pool = ShardedMempool::new();
-        pool.push(sys_tx("0xcb1"));
+        let _ = pool.push(sys_tx("0xcb1"));
         assert_eq!(pool.pending_count(), 1);
     }
 
@@ -538,7 +572,7 @@ mod tests {
     fn drain_empties_pool() {
         let pool = ShardedMempool::new();
         for i in 0..4u64 {
-            pool.push(sys_tx(&format!("0xd{i}")));
+            let _ = pool.push(sys_tx(&format!("0xd{i}")));
         }
         let got = pool.drain_all();
         assert_eq!(got.len(), 4);
@@ -560,7 +594,7 @@ mod tests {
             status: "Pending".to_string(),
             ..LedgerTx::default()
         };
-        pool.push(tx);
+        let _ = pool.push(tx);
         assert_eq!(pool.pending_count(), 0);
     }
 }
@@ -578,6 +612,18 @@ async fn try_mine(txs: Vec<LedgerTx>, miner: &str) -> Vec<LedgerTx> {
     }
     let known_count = crate::p2p::known_validator_count();
     if known_count >= min_validators_for_finality() {
+        return txs;
+    }
+    
+    // If we are significantly behind the network, do not attempt to mine.
+    // Catch-up sync must take priority to avoid creating orphaned mini-forks.
+    let (tip_h, _) = crate::chain_db::latest_block_info();
+    let network_view = crate::p2p::current_view();
+    // network_view is 0 at absolute start; only silence if the network is actually ahead.
+    let last_fin = crate::p2p::LAST_BLOCK_FINALIZED_TS.load(Ordering::Relaxed);
+    let stuck_secs = chrono::Utc::now().timestamp() - last_fin;
+
+    if network_view > 0 && tip_h + 10 < network_view && (stuck_secs < 60 || last_fin == 0) {
         return txs;
     }
 
@@ -707,11 +753,20 @@ pub async fn run_batch_loop() {
 
         let known_count = crate::p2p::known_validator_count();
         let needed = min_validators_for_finality();
+        
+        let now_ts = chrono::Utc::now().timestamp();
+        let last_fin = crate::p2p::LAST_BLOCK_FINALIZED_TS.load(Ordering::Relaxed);
+        let stuck_secs = now_ts - last_fin;
+
         if known_count >= needed {
-            // BFT mode: leave txs in mempool for the BFT proposer to drain.
-            last_block_at    = Instant::now();
-            batch_started_at = None;
-            continue;
+            // BFT mode: normally we wait for the proposer.
+            // However, if the chain is stuck for > 30s and we have very few validators,
+            // fall back to solo mining to keep the network alive.
+            if stuck_secs < 30 || known_count > 5 {
+                last_block_at    = Instant::now();
+                batch_started_at = None;
+                continue;
+            }
         }
         if !allow_pre_bft_solo() {
             tracing::warn!(
@@ -725,7 +780,7 @@ pub async fn run_batch_loop() {
         }
 
         // Grace period: allow peers to discover each other via DHT before deciding we are alone
-        if known_count <= 1 && startup_time.elapsed().as_secs() < 15 {
+        if known_count <= 1 && startup_time.elapsed().as_secs() < 30 {
             tokio::time::sleep(Duration::from_secs(2)).await;
             last_block_at    = Instant::now();
             batch_started_at = None;
@@ -740,7 +795,7 @@ pub async fn run_batch_loop() {
         let txs = pool.drain_all();
         let unprocessed = try_mine(txs, &miner).await;
         for tx in unprocessed {
-            pool.push(tx);
+            let _ = pool.push(tx);
         }
 
         last_block_at    = Instant::now();

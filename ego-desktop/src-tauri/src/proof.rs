@@ -516,7 +516,7 @@ pub async fn return_collateral(addr: &str, cid: &str, collateral: u64) {
         .map(|kp| hex::encode(kp.sign_ed25519(sign_input.as_bytes()).as_bytes()))
         .unwrap_or_default();
     let tx_hash = format!("0x{}", ego_core::hash_data(sign_input.as_bytes()).to_hex());
-    crate::mempool::get_mempool().push(LedgerTx {
+    let _ = crate::mempool::get_mempool().push(LedgerTx {
         hash: tx_hash.clone(), from: "egot1collateral000000000000000000000000000000".into(),
         to: addr.to_string(), amount: collateral,
         memo: Some(format!("collateral_return full: cid {}", &cid[..16.min(cid.len())])),
