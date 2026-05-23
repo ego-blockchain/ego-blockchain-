@@ -1280,8 +1280,7 @@ useEffect(() => {
                 {generatingCard ? 'Generating…' : 'Generate Card'}
               </button>
               {myCard && (() => {
-                const addr = myCard.split(':')[1] ?? '';
-                const shortAddr = addr.slice(0, 10) + '…' + addr.slice(-8);
+                const shortBundle = myCard.length > 45 ? myCard.slice(0, 45) + '…' : myCard;
                 return (
                   <div className="space-y-3">
                     <div className="text-xs text-green-400 font-medium">✓ Card ready — click Copy and share it:</div>
@@ -1291,7 +1290,7 @@ useEffect(() => {
                       </div>
                       <div className="min-w-0">
                         <div className="text-sm font-semibold text-white">{myCardName}</div>
-                        <div className="text-xs text-gray-400 font-mono">{shortAddr}</div>
+                        <div className="text-xs text-gray-400 font-mono mt-0.5" title={myCard}>{shortBundle}</div>
                       </div>
                     </div>
                     <button

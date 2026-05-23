@@ -68,6 +68,13 @@ interface ClusterConnectInfo {
     ssh_command: string; note?: string;
   };
 }
+interface ReservationConnectInfo {
+  reservation_id: string;
+  status: string;
+  provider_ip: string;
+  ssh_command: string;
+  note: string;
+}
 
 const u = (egoc: number) => Math.round(egoc * 1_000_000);
 const e = (uegoc: number) => uegoc / 1_000_000;
@@ -176,6 +183,10 @@ export default function ComputePage() {
   const [busyRes,          setBusyRes]          = useState<string | null>(null);
   const [cancellingOffer,  setCancellingOffer]  = useState<string | null>(null);
   const [confirmRemove,    setConfirmRemove]    = useState<string | null>(null);
+  const [confirmTermRes,   setConfirmTermRes]   = useState<string | null>(null);
+  const [confirmTermEarly, setConfirmTermEarly] = useState<{ id: string, penalty: number } | null>(null);
+  const [confirmTermCluster, setConfirmTermCluster] = useState<string | null>(null);
+  const [resConnectInfo,   setResConnectInfo]   = useState<ReservationConnectInfo | null>(null);
 
   const [clusters,            setClusters]            = useState<ClusterBooking[]>([]);
   const [clusterOpen,         setClusterOpen]         = useState(false);
@@ -299,10 +310,29 @@ export default function ComputePage() {
     setBusyRes(null);
   }
 
-  async function terminateReservation(reservationId: string) {
-    if (!confirm('End this reservation and get your unused payment back?')) return;
-    setBusyRes(reservationId);
-    try { await invoke('terminate_reservation', { reservationId }); await load(); }
+  async function executeTerminateReservation() {
+    if (!confirmTermRes) return;
+    const id = confirmTermRes;
+    setConfirmTermRes(null);
+    setBusyRes(id);
+    try { await invoke('terminate_reservation', { reservationId: id }); await load(); }
+    catch (err: any) { alert(String(err)); }
+    setBusyRes(null);
+  }
+
+  async function showResConnectInfo(reservationId: string) {
+    try {
+      const info = await invoke<ReservationConnectInfo>('get_reservation_connect_info', { reservationId });
+      setResConnectInfo(info);
+    } catch (err: any) { alert(String(err)); }
+  }
+
+  async function executeTerminateEarly() {
+    if (!confirmTermEarly) return;
+    const { id } = confirmTermEarly;
+    setConfirmTermEarly(null);
+    setBusyRes(id);
+    try { await invoke('terminate_reservation_early', { reservationId: id }); await load(); }
     catch (err: any) { alert(String(err)); }
     setBusyRes(null);
   }
@@ -343,10 +373,12 @@ export default function ComputePage() {
     } catch (err: any) { alert(String(err)); }
   }
 
-  async function doTerminateCluster(clusterId: string) {
-    if (!confirm('Terminate this cluster? Unused escrow will be refunded.')) return;
-    setTerminatingCluster(clusterId);
-    try { await invoke('terminate_cluster', { clusterId }); await load(); }
+  async function executeTerminateCluster() {
+    if (!confirmTermCluster) return;
+    const id = confirmTermCluster;
+    setConfirmTermCluster(null);
+    setTerminatingCluster(id);
+    try { await invoke('terminate_cluster', { clusterId: id }); await load(); }
     catch (err: any) { alert(String(err)); }
     setTerminatingCluster(null);
   }
@@ -764,20 +796,35 @@ export default function ComputePage() {
                       <p className="text-red-400 text-xs">⚠ Provider missed {r.breach_count} period{r.breach_count > 1 ? 's' : ''}</p>
                     )}
 
-                    {r.status === 'active' && isBuyer && r.breach_count >= 1 && (
-                      <button onClick={() => terminateReservation(r.reservation_id)}
-                        disabled={busyRes === r.reservation_id}
-                        className="w-full py-2 bg-red-700 hover:bg-red-600 text-white text-sm rounded-lg disabled:opacity-60">
-                        {busyRes === r.reservation_id ? 'Processing…'
-                          : r.collateral_uegoc > 0
-                            ? 'End Rental — Get Refund + Security Deposit'
-                            : 'End Rental — Get Unused Escrow Refunded'}
-                      </button>
-                    )}
-                    {r.status === 'active' && isBuyer && r.breach_count === 0 && (
-                      <p className="text-gray-500 text-xs text-center">
-                        Payments release automatically each period. If the provider goes offline you'll be refunded.
-                      </p>
+                    {r.status === 'active' && isBuyer && (
+                      <div className="flex flex-col gap-2 w-full mt-3 pt-3 border-t border-gray-700">
+                        <button onClick={() => showResConnectInfo(r.reservation_id)}
+                          className="w-full py-2 bg-cyan-700 hover:bg-cyan-600 text-white text-sm rounded-lg font-medium shadow-lg">
+                          Connect (SSH)
+                        </button>
+                        
+                        {r.breach_count >= 1 ? (
+                          <button onClick={() => setConfirmTermRes(r.reservation_id)}
+                            disabled={busyRes === r.reservation_id}
+                            className="w-full py-2 bg-red-700 hover:bg-red-600 text-white text-sm rounded-lg disabled:opacity-60">
+                            {busyRes === r.reservation_id ? 'Processing…'
+                              : r.collateral_uegoc > 0
+                                ? 'End Rental — Get Refund + Security Deposit'
+                                : 'End Rental — Get Unused Escrow Refunded'}
+                          </button>
+                        ) : (
+                          <>
+                            <p className="text-gray-500 text-xs text-center mt-1 mb-2">
+                              Payments release automatically each period. If the provider goes offline you'll be refunded.
+                            </p>
+                            <button onClick={() => setConfirmTermEarly({ id: r.reservation_id, penalty: r.period_rate_uegoc })}
+                              disabled={busyRes === r.reservation_id}
+                              className="w-full py-2 bg-gray-700 hover:bg-red-900 text-white hover:text-red-100 text-sm rounded-lg transition-colors disabled:opacity-60 border border-red-900/30">
+                              {busyRes === r.reservation_id ? 'Processing…' : 'Terminate Early (Pay 1 Period Penalty)'}
+                            </button>
+                          </>
+                        )}
+                      </div>
                     )}
                   </div>
                 );
@@ -859,19 +906,21 @@ export default function ComputePage() {
                     </div>
 
                     <div className="flex flex-wrap gap-2 pt-2 border-t border-gray-700">
-                      {c.status === 'active' && (
+                      {(c.status === 'active' || c.status === 'forming' || c.status === 'assembling') && (
                         <>
                           <button onClick={() => showConnectInfo(c.cluster_id)}
-                            className="px-3 py-1.5 bg-cyan-700 hover:bg-cyan-600 text-white text-xs rounded-lg font-medium">
-                            Connect
+                            disabled={c.status !== 'active'}
+                            className="px-3 py-1.5 bg-cyan-700 hover:bg-cyan-600 text-white text-xs rounded-lg font-medium disabled:opacity-50">
+                            {c.status === 'active' ? 'Connect' : 'Waiting for Nodes...'}
                           </button>
                           <button onClick={() => downloadBuyerWgConfig(c.cluster_id)}
-                            className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-300 text-xs rounded-lg">
+                            disabled={c.status !== 'active'}
+                            className="px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-300 text-xs rounded-lg disabled:opacity-50">
                             WireGuard Config
                           </button>
                         </>
                       )}
-                      <button onClick={() => doTerminateCluster(c.cluster_id)}
+                      <button onClick={() => setConfirmTermCluster(c.cluster_id)}
                         disabled={terminatingCluster === c.cluster_id}
                         className="px-3 py-1.5 bg-gray-700 hover:bg-red-900 text-gray-400 hover:text-red-300 text-xs rounded-lg transition-colors disabled:opacity-50 ml-auto">
                         {terminatingCluster === c.cluster_id ? 'Terminating…' : 'Terminate'}
@@ -1149,6 +1198,99 @@ export default function ComputePage() {
         </div>
       )}
 
+      {/* ── Terminate Reservation confirmation modal ── */}
+      {confirmTermRes && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-xl border border-red-800/50 p-6 w-full max-w-sm space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-full bg-red-900/40 flex items-center justify-center shrink-0">
+                <svg className="w-5 h-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                </svg>
+              </div>
+              <div>
+                <h3 className="text-white font-semibold">End this rental?</h3>
+                <p className="text-gray-400 text-sm mt-1">
+                  The provider has breached the SLA. You will get your unused payment back.
+                </p>
+              </div>
+            </div>
+            <div className="flex gap-3 pt-1">
+              <button onClick={executeTerminateReservation}
+                className="flex-1 py-2.5 bg-red-700 hover:bg-red-600 text-white rounded-lg text-sm font-medium transition-colors">
+                Yes, end rental
+              </button>
+              <button onClick={() => setConfirmTermRes(null)}
+                className="flex-1 py-2.5 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm transition-colors">
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Terminate Early confirmation modal ── */}
+      {confirmTermEarly && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-xl border border-red-800/50 p-6 w-full max-w-sm space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-full bg-red-900/40 flex items-center justify-center shrink-0">
+                <svg className="w-5 h-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                </svg>
+              </div>
+              <div>
+                <h3 className="text-white font-semibold">Terminate Early?</h3>
+                <p className="text-gray-400 text-sm mt-1">
+                  You will be charged a penalty of <span className="text-yellow-400 font-bold">{fmt(confirmTermEarly.penalty)} EGOC</span> (1 period). The rest of your unused escrow will be refunded.
+                </p>
+              </div>
+            </div>
+            <div className="flex gap-3 pt-1">
+              <button onClick={executeTerminateEarly}
+                className="flex-1 py-2.5 bg-red-700 hover:bg-red-600 text-white rounded-lg text-sm font-medium transition-colors">
+                Yes, terminate
+              </button>
+              <button onClick={() => setConfirmTermEarly(null)}
+                className="flex-1 py-2.5 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm transition-colors">
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Terminate Cluster confirmation modal ── */}
+      {confirmTermCluster && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-xl border border-red-800/50 p-6 w-full max-w-sm space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-full bg-red-900/40 flex items-center justify-center shrink-0">
+                <svg className="w-5 h-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                </svg>
+              </div>
+              <div>
+                <h3 className="text-white font-semibold">Terminate Cluster?</h3>
+                <p className="text-gray-400 text-sm mt-1">
+                  Are you sure you want to end this cluster? Any unused escrow will be refunded to you.
+                </p>
+              </div>
+            </div>
+            <div className="flex gap-3 pt-1">
+              <button onClick={executeTerminateCluster}
+                className="flex-1 py-2.5 bg-red-700 hover:bg-red-600 text-white rounded-lg text-sm font-medium transition-colors">
+                Yes, terminate
+              </button>
+              <button onClick={() => setConfirmTermCluster(null)}
+                className="flex-1 py-2.5 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm transition-colors">
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Create Cluster modal ── */}
       {clusterOpen && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
@@ -1290,6 +1432,40 @@ export default function ComputePage() {
             )}
             <p className="text-gray-500 text-xs">Subnet: {connectInfo.subnet}.0/24 · Head IP: {connectInfo.connect.head_ip}</p>
             <button onClick={() => setConnectInfo(null)}
+              className="w-full py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm">
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Individual Reservation Connect Info modal ── */}
+      {resConnectInfo && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-xl border border-gray-700 p-6 w-full max-w-lg space-y-4">
+            <h3 className="text-white font-semibold text-lg">Connect to Machine</h3>
+            <div className="grid grid-cols-2 gap-2 text-center">
+              <div className="bg-gray-750 rounded-lg p-2">
+                <p className="text-gray-400 text-xs">Status</p>
+                <p className="text-white font-bold text-sm capitalize">{resConnectInfo.status}</p>
+              </div>
+              <div className="bg-gray-750 rounded-lg p-2">
+                <p className="text-gray-400 text-xs">Provider IP</p>
+                <p className="text-white font-bold text-sm">{resConnectInfo.provider_ip}</p>
+              </div>
+            </div>
+
+            <div>
+              <p className="text-gray-400 text-xs mb-1">SSH command (Direct Access)</p>
+              <pre className="bg-gray-900 rounded-lg p-3 text-yellow-400 text-xs overflow-x-auto">{resConnectInfo.ssh_command}</pre>
+            </div>
+            
+            {resConnectInfo.note && (
+              <div className="bg-blue-900/20 border border-blue-700/30 rounded-lg p-3 text-xs text-blue-300">
+                {resConnectInfo.note}
+              </div>
+            )}
+            <button onClick={() => setResConnectInfo(null)}
               className="w-full py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm">
               Close
             </button>

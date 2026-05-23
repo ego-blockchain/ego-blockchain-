@@ -36,16 +36,16 @@ static PEER_ANNOUNCE_REPLY_LAST: OnceLock<Mutex<HashMap<String, i64>>> = OnceLoc
 const ANNOUNCE_REPLY_COOLDOWN_SECS: i64 = 60;
 
 static SYNC_REPLY_LAST: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
-const SYNC_REPLY_COOLDOWN_SECS: i64 = 30;
+const SYNC_REPLY_COOLDOWN_MS: i64 = 100;
 
 static BLOCK_REJECT_LAST: OnceLock<Mutex<HashMap<(u64, String), i64>>> = OnceLock::new();
 const BLOCK_REJECT_LOG_COOLDOWN_SECS: i64 = 30;
 
 fn chain_push_allowed(endpoint: &str) -> bool {
-    let now = Utc::now().timestamp();
+    let now = Utc::now().timestamp_millis();
     let mut map = PEER_CHAIN_PUSH_LAST.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
     let last = map.entry(endpoint.to_string()).or_insert(0);
-    if now - *last >= CHAIN_PUSH_COOLDOWN_SECS {
+    if now - *last >= SYNC_REPLY_COOLDOWN_MS {
         *last = now;
         true
     } else {
@@ -54,10 +54,10 @@ fn chain_push_allowed(endpoint: &str) -> bool {
 }
 
 fn sync_reply_allowed(endpoint: &str) -> bool {
-    let now = Utc::now().timestamp();
+    let now = Utc::now().timestamp_millis();
     let mut map = SYNC_REPLY_LAST.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
     let last = map.entry(endpoint.to_string()).or_insert(0);
-    if now - *last >= SYNC_REPLY_COOLDOWN_SECS {
+    if now - *last >= SYNC_REPLY_COOLDOWN_MS {
         *last = now;
         true
     } else {
@@ -129,17 +129,15 @@ pub static DHT_CMD_TX: OnceLock<mpsc::Sender<DhtCommand>> = OnceLock::new();
 
 pub static APP_HANDLE: OnceLock<tauri::AppHandle<tauri::Wry>> = OnceLock::new();
 
-static SEED_CACHE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
+static SEED_CACHE: std::sync::RwLock<Option<[u8; 32]>> = std::sync::RwLock::new(None);
 
 pub fn prime_ed25519_seed_cache() {
     eprintln!("[Startup] prime_ed25519_seed_cache: calling load_seed (DPAPI)…");
-    SEED_CACHE.get_or_init(|| {
-        let result = crate::ledger::load_seed().ok().flatten().and_then(|b| {
-            if b.len() == 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b); Some(a) } else { None }
-        });
-        eprintln!("[Startup] prime_ed25519_seed_cache: seed loaded (found={})", result.is_some());
-        result
+    let result = crate::ledger::load_seed().ok().flatten().and_then(|b| {
+        if b.len() >= 32 { let mut a = [0u8; 32]; a.copy_from_slice(&b[..32]); Some(a) } else { None }
     });
+    eprintln!("[Startup] prime_ed25519_seed_cache: seed loaded (found={})", result.is_some());
+    if let Ok(mut cache) = SEED_CACHE.write() { *cache = result; }
 }
 
 #[derive(Debug)]
@@ -155,6 +153,13 @@ pub fn p2p_port() -> u16 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(47393)
+}
+
+pub fn https_port() -> u16 {
+    std::env::var("EGO_HTTPS_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(47396) // Default to 47396 if not set
 }
 pub const P2P_PORT: u16 = 47393;
 
@@ -582,6 +587,32 @@ fn check_peer_rate(peer_id: &str) -> bool {
     }
 }
 
+/// Restores all persisted validator pubkeys from RocksDB into the in-memory
+/// peer key maps. This ensures BFT vote verification works after a node restart.
+pub fn restore_validator_keys_from_db() {
+    let restored_validators = crate::chain_db::load_known_validators();
+    let mut ed_count = 0;
+    let mut bls_count = 0;
+    for addr in restored_validators {
+        if addr.is_empty() { continue; }
+        // Restore Ed25519 (required for BFT vote signature verification)
+        if let Some(ed_pk_hex) = crate::chain_db::get_validator_ed25519_pubkey(&addr) {
+             record_peer_ed25519(&addr, &ed_pk_hex);
+             ed_count += 1;
+        }
+        // Restore BLS (required for Quorum Certificate/Finalization verification)
+        if let Some(bls_pk_hex) = crate::chain_db::get_validator_bls_pubkey(&addr) {
+             if let Ok(bytes) = hex::decode(&bls_pk_hex) {
+                 peer_bls_pubkeys().insert(addr.clone(), bytes);
+                 bls_count += 1;
+             }
+        }
+    }
+    if ed_count > 0 || bls_count > 0 {
+        eprintln!("[BFT] Restored {} Ed25519 and {} BLS validator keys from DB", ed_count, bls_count);
+    }
+}
+
 static CURRENT_VIEW: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -644,7 +675,7 @@ fn should_solo_commit_now() -> bool {
     committee_alone
 }
 
-static LAST_BLOCK_FINALIZED_TS: std::sync::atomic::AtomicI64 =
+pub static LAST_BLOCK_FINALIZED_TS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 
 static LAST_FORK_SYNC_TS: std::sync::atomic::AtomicI64 =
@@ -931,7 +962,7 @@ pub async fn broadcast_equivocation_tx(
         ..crate::ledger::LedgerTx::default()
     };
 
-    crate::mempool::get_mempool().push(tx.clone());
+    let _ = crate::mempool::get_mempool().push(tx.clone());
     broadcast_pending_tx(tx).await;
 }
 
@@ -1007,8 +1038,11 @@ pub fn evict_stale_validators(ttl_secs: i64) {
     }
 
     let mut seen  = validator_last_seen();
+    let mut known = known_validators();
     for addr in &stale {
         seen.remove(addr);
+        known.remove(addr);
+        tracing::warn!("[BFT] Evicted offline validator {}", addr);
     }
 }
 
@@ -1086,19 +1120,17 @@ fn warmed_validator_count() -> usize {
 }
 
 fn bft_threshold() -> usize {
-    evict_stale_validators(30);
+    evict_stale_validators(120);
     let n_total = known_validators().len();
     let n = warmed_validator_count();
-    let effective = if n <= crate::bft_committee::COMMITTEE_SIZE {
-        n
+    let min_validators = crate::mempool::min_validators_for_finality();
+    let effective = if n_total < min_validators {
+        n.max(1)
     } else {
-        crate::bft_committee::COMMITTEE_SIZE
+        n.max(min_validators).min(crate::bft_committee::COMMITTEE_SIZE)
     };
     eprintln!("[BFT] Committee size: {} effective / {} total validators", effective, n_total);
-    match effective {
-        0 => 1,
-        n => (n * 2 + 2) / 3, // Ceil of 2n/3. Tolerates 1 failure in a 3-node network.
-    }
+    (effective * 2 + 2) / 3
 }
 
 /// Returns true if the set of voters represents ≥ ⅔ of total staked EGOC.
@@ -1192,7 +1224,12 @@ fn current_wallet_announce_keys() -> (String, String) {
     };
     let dilithium_hex = std::fs::read(crate::ledger::data_dir().join("pq_keys.bin"))
         .ok()
-        .and_then(|bytes| ego_core::KeyPair::from_pq_cache(&bytes, &seed).ok())
+        .and_then(|bytes| {
+            let unprotected = crate::utils::os_unprotect(&bytes);
+            ego_core::KeyPair::from_pq_cache(&unprotected, &seed)
+                .or_else(|_| ego_core::KeyPair::from_pq_cache(&bytes, &seed))
+                .ok()
+        })
         .map(|kp| hex::encode(kp.dilithium_public_key().key_data))
         .unwrap_or_default();
 
@@ -1849,7 +1886,7 @@ pub async fn send_message(endpoint: &str, msg: &P2PMessage) -> Result<(), String
     .await
     .map_err(|_| "Swarm channel send timed out".to_string())?
     .map_err(|_| "Swarm channel closed".to_string())?;
-    tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+        tokio::time::timeout(std::time::Duration::from_secs(60), reply_rx)
         .await
         .map_err(|_| "Swarm reply timed out".to_string())?
         .map_err(|_| "Swarm dropped reply".to_string())?
@@ -2044,12 +2081,19 @@ pub async fn broadcast_pending_tx(tx: LedgerTx) {
 }
 
 pub async fn sync_chain_from_peers() {
+    static LAST_SYNC_REQ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let now = chrono::Utc::now().timestamp_millis();
+    let last = LAST_SYNC_REQ.load(std::sync::atomic::Ordering::Relaxed);
+    if now - last < 100 { return; } // Prevent self-DDoS (max 10 sync requests per 1s)
+    LAST_SYNC_REQ.store(now, std::sync::atomic::Ordering::Relaxed);
+
     let my_endpoint = get_public_endpoint().await;
     let my_height = tokio::task::spawn_blocking(|| crate::chain_db::latest_block_info().0)
         .await.unwrap_or(0);
-    let from_height = my_height.saturating_sub(20);
+    let from_height = my_height.saturating_sub(1);
     let msg = P2PMessage::ChainSyncRequest { requester_endpoint: my_endpoint.clone(), from_height };
 
+    // Broadcast request over gossip to reach NAT-traversing peers
     if let Ok(data) = serde_json::to_vec(&msg) {
         publish_gossip("ego-sync-v1", data).await;
     }
@@ -2070,12 +2114,14 @@ pub async fn sync_chain_from_peers() {
     use rand::seq::SliceRandom;
     let mut rng = rand::thread_rng();
     endpoints.shuffle(&mut rng);
-    endpoints.truncate(8);
+    endpoints.truncate(5);
+    let local_peer_id = my_endpoint.split("/p2p/").last().unwrap_or("");
 
     for endpoint in endpoints {
+        if !local_peer_id.is_empty() && endpoint.contains(local_peer_id) { continue; }
         let msg_clone = msg.clone();
         tokio::spawn(async move {
-            if let Err(e) = send_message_any(&[endpoint.clone()], &msg_clone).await {
+            if let Err(e) = send_message(&endpoint, &msg_clone).await {
                 if !e.contains("none of the requested protocols") && !is_peer_silenced(&endpoint) {
                     eprintln!("[P2P] sync request to {}: {}", endpoint, e);
                 }
@@ -2356,10 +2402,10 @@ pub async fn route_tx_to_shard_master(shard_id: u32, tx: crate::ledger::LedgerTx
     if let Some(endpoint) = crate::sharding::get_shard_master(shard_id) {
         let msg = P2PMessage::ShardTxRoute { shard_id, tx: tx.clone() };
         if let Err(_) = send_message_any(&[endpoint], &msg).await {
-            crate::mempool::get_mempool().push(tx);
+            let _ = crate::mempool::get_mempool().push(tx);
         }
     } else {
-        crate::mempool::get_mempool().push(tx);
+        let _ = crate::mempool::get_mempool().push(tx);
     }
 }
 
@@ -2702,6 +2748,9 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     let local_peer_id = identity.public().to_peer_id();
     tracing::info!("Local peer ID: {}", local_peer_id);
 
+    // HTTPS gateway for .eo domains
+    eprintln!("[HTTPS] .eo gateway listening on https://127.0.0.1:{}", https_port());
+
     let mut swarm = match build_swarm(identity).await {
         Ok(s)  => s,
         Err(e) => { tracing::error!("Failed to build swarm: {}", e); return; }
@@ -2835,7 +2884,10 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     let mut in_flight:        HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>> = HashMap::new();
     let mut circuit_listener: Option<libp2p_core::transport::ListenerId> = None;
 
-    let mut relay_retry = tokio::time::interval(Duration::from_secs(15));
+    // Restore validator pubkeys from DB so BFT verification works after a node restart
+    restore_validator_keys_from_db();
+
+    let mut relay_retry = tokio::time::interval(Duration::from_secs(60));
     relay_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     relay_retry.tick().await;
 
@@ -2918,6 +2970,23 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
 
 
         crate::chain_db::restore_nonces_from_db();
+
+        {
+            let fin_h = crate::chain_db::finalized_height();
+            if fin_h > 0 {
+                let mut hard = hard_finalized_heights();
+                let mut fin_map = finalized_at_height();
+                let start_h = fin_h.saturating_sub(10_000).max(1);
+                for h in start_h..=fin_h {
+                    if let Some(hash) = crate::chain_db::get_block_hash_at(h) {
+                        hard.insert(h);
+                        fin_map.insert(h, hash);
+                    }
+                }
+                tracing::info!("Restored {} finalized heights from DB", hard.len());
+            }
+            LAST_BLOCK_FINALIZED_TS.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+        }
 
         {
             let ledger = crate::ledger::Ledger::load();
@@ -3205,7 +3274,7 @@ async fn build_swarm(
 ) -> Result<libp2p::Swarm<EgoBehaviour>, Box<dyn std::error::Error>> {
     let peer_id = identity.public().to_peer_id();
     #[cfg(target_os = "windows")]
-    let tcp_cfg = tcp::Config::default().nodelay(true).port_reuse(false);
+    let tcp_cfg = tcp::Config::default().nodelay(true).port_reuse(true);
     #[cfg(not(target_os = "windows"))]
     let tcp_cfg = tcp::Config::default().nodelay(true);
     let swarm = SwarmBuilder::with_existing_identity(identity)
@@ -3276,11 +3345,11 @@ async fn build_swarm(
             EgoBehaviour {
                 relay_client,
                 relay_server: relay::Behaviour::new(peer_id, relay::Config {
-                    max_reservations:          512,
-                    max_reservations_per_peer: 4,
+                    max_reservations:          4096,
+                    max_reservations_per_peer: 64,
                     reservation_duration:      Duration::from_secs(3600),
-                    max_circuits:              1024,
-                    max_circuits_per_peer:     32,
+                    max_circuits:              4096,
+                    max_circuits_per_peer:     256,
                     max_circuit_duration:      Duration::from_secs(7200),
                     max_circuit_bytes:         u64::MAX,
                     ..Default::default()
@@ -3305,7 +3374,12 @@ async fn build_swarm(
                 kad:       kad_behaviour,
             }
         })?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(86400)))
+        .with_swarm_config(|c| {
+            c.with_max_negotiating_inbound_streams(2048)
+             .with_idle_connection_timeout(Duration::from_secs(86400))
+             .with_per_connection_event_buffer_size(128)
+             .with_notify_handler_buffer_size(std::num::NonZeroUsize::new(2048).unwrap())
+        })
         .build();
     Ok(swarm)
 }
@@ -3326,10 +3400,13 @@ fn handle_send(
             return;
         }
     };
-    if &peer_id == swarm.local_peer_id() {
-        let _ = reply.send(Err("Refusing self-dial".to_string()));
+
+    let local_id = swarm.local_peer_id();
+    if &peer_id == local_id {
+        let _ = reply.send(Err("Refusing self-dial (ID match)".to_string()));
         return;
     }
+
     if swarm.is_connected(&peer_id) {
         let req_id = swarm.behaviour_mut().request_response.send_request(&peer_id, msg);
         in_flight.insert(req_id, reply);
@@ -3519,6 +3596,12 @@ async fn handle_event(
                     sync_chain_from_peers().await;
                 });
             }
+
+            // Immediately send a PeerAnnounce to the newly connected peer
+            let app_clone = app.cloned();
+            tokio::spawn(async move {
+                broadcast_peer_announce(app_clone.as_ref()).await;
+            });
         }
 
         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
@@ -3570,7 +3653,7 @@ async fn handle_event(
                 || err_str.contains("Relay has no reservation")
                 || err_str.contains("no reservation for destination");
             if !benign {
-                eprintln!("[P2P] Dial error {:?}: {}", peer_id, error);
+                tracing::debug!("[P2P] Dial error {:?}: {}", peer_id, error);
             }
             if let Some(pid) = peer_id {
                 if err_str.contains("WrongPeerId") || err_str.contains("Unexpected peer") {
@@ -3837,8 +3920,8 @@ async fn handle_event(
                             .unwrap_or(false);
                     if vote_on_our_chain { register_known_validator(&voter); }
                     let app2 = app.cloned();
-                    tokio::spawn(async move {
-                        handle_block_vote(block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, app2.as_ref()).await;
+                        tokio::spawn(async move {
+                            handle_block_vote(block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, app2).await;
                     });
                 }
             } else if topic == "ego-sync-v1" {
@@ -3851,7 +3934,7 @@ async fn handle_event(
                             let (blocks, transactions) = tokio::task::spawn_blocking(move || {
                                 if crate::chain_db::block_count() == 0 { return (vec![], vec![]); }
                                 let start = from_height.max(1);
-                                let blocks = crate::chain_db::get_blocks_range(start, 1_000);
+                                let blocks = crate::chain_db::get_blocks_range(start, 500);
                                 let transactions: Vec<crate::ledger::LedgerTx> = blocks.iter()
                                     .flat_map(|b| crate::chain_db::get_txs_for_block(b.height))
                                     .collect();
@@ -3862,10 +3945,10 @@ async fn handle_event(
                                 blocks.len(), transactions.len(), from_height.max(1),
                                 blocks.last().map(|b| b.height).unwrap_or(from_height));
                             let response = P2PMessage::ChainSyncResponse { blocks, transactions };
-                            if let Err(e) = send_message_any(&[ep.clone()], &response).await {
-                                if !e.contains("none of the requested protocols") {
-                                    tracing::warn!("sync-v1 response to {}: {}", ep, e);
-                                }
+                            
+                            // Send response via gossip to bypass NAT dial-back issues
+                            if let Ok(data) = serde_json::to_vec(&response) {
+                                publish_gossip("ego-blocks-v1", data).await;
                             }
                         });
                     }
@@ -3913,7 +3996,7 @@ async fn handle_event(
                                     let _ = h.emit_all("ego://view-changed", serde_json::json!({ "view": view }));
                                 }
                             } else {
-                                eprintln!("[BFT] Invalid ViewChange signature from {}", voter);
+                                tracing::debug!("[BFT] Invalid ViewChange signature from {}", voter);
                             }
                         });
                     }
@@ -4290,7 +4373,7 @@ async fn handle_event(
                     let my_shard_ids: Vec<u32> = crate::sharding::my_shards(&my_addr, &map, &all_nodes)
                         .into_iter().map(|(id, _)| id).collect();
                     if my_shard_ids.contains(&shard_id) {
-                        crate::mempool::get_mempool().push(tx);
+                        let _ = crate::mempool::get_mempool().push(tx);
                     } else {
                         tokio::spawn(async move {
                             route_tx_to_shard_master(shard_id, tx).await;
@@ -4850,8 +4933,10 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                     let ep2 = endpoint.clone();
                     tokio::spawn(async move {
                         let (blocks, transactions) = tokio::task::spawn_blocking(|| {
-                            if crate::chain_db::block_count() == 0 { return (vec![], vec![]); }
-                            let blocks = crate::chain_db::get_blocks_range(1, 1_000);
+                        let tip = crate::chain_db::latest_block_info().0;
+                        if tip == 0 { return (vec![], vec![]); }
+                        let start = tip.saturating_sub(200).max(1);
+                        let blocks = crate::chain_db::get_blocks_range(start, 200);
                             let transactions: Vec<crate::ledger::LedgerTx> = blocks.iter()
                                 .flat_map(|b| crate::chain_db::get_txs_for_block(b.height))
                                 .collect();
@@ -4971,7 +5056,7 @@ P2PMessage::ChatMessage { bundle, seq } => {
 
         P2PMessage::BlockVote { block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey } => {
             register_known_validator(&voter);
-            handle_block_vote(block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, app).await;
+            handle_block_vote(block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, app.cloned()).await;
         }
 
 
@@ -4988,7 +5073,8 @@ P2PMessage::ChatMessage { bundle, seq } => {
             if !requester_endpoint.is_empty() {
                 tokio::spawn(async move {
                     let (blocks, transactions) = tokio::task::spawn_blocking(move || {
-                        let blocks = crate::chain_db::get_blocks_range(from_height + 1, 1_000);
+                    let start = from_height.max(1);
+                    let blocks = crate::chain_db::get_blocks_range(start, 500); // 500 blocks per jump
                         let transactions: Vec<crate::ledger::LedgerTx> = blocks.iter()
                             .flat_map(|b| crate::chain_db::get_txs_for_block(b.height))
                             .collect();
@@ -4997,8 +5083,8 @@ P2PMessage::ChatMessage { bundle, seq } => {
                     tracing::debug!("[P2P] sync reply: {} blocks ({} txs) from height {}",
                         blocks.len(), transactions.len(), from_height + 1);
                     let response = P2PMessage::ChainSyncResponse { blocks, transactions };
-                    if let Err(e) = send_message_any(&[requester_endpoint.clone()], &response).await {
-                        tracing::debug!("[P2P] chain sync reply to {}: {}", requester_endpoint, e);
+                    if let Ok(data) = serde_json::to_vec(&response) {
+                        publish_gossip("ego-blocks-v1", data).await;
                     }
                 });
             }
@@ -5535,7 +5621,7 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
             if is_valid {
                 handle_view_change_msg(view, voter).await;
             } else {
-                eprintln!("[BFT] Invalid ViewChange signature from {}", voter);
+                tracing::debug!("[BFT] Invalid ViewChange signature from {}", voter);
             }
         }
 
@@ -5651,7 +5737,7 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
                 ledger2.nonce = nonce;
                 let _ = ledger2.save();
                 
-                crate::mempool::get_mempool().push(tx.clone());
+                let _ = crate::mempool::get_mempool().push(tx.clone());
                 tokio::spawn(async move {
                     broadcast_pending_tx(tx).await;
                 });
@@ -5747,7 +5833,7 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
             let my_shard_ids: Vec<u32> = crate::sharding::my_shards(&my_addr, &map, &all_nodes)
                 .into_iter().map(|(id, _)| id).collect();
             if my_shard_ids.contains(&shard_id) {
-                crate::mempool::get_mempool().push(tx);
+                        let _ = crate::mempool::get_mempool().push(tx);
             } else {
                 tokio::spawn(async move {
                     route_tx_to_shard_master(shard_id, tx).await;
@@ -5954,19 +6040,19 @@ async fn check_block_completes_manifests(block_cid: &str, app: Option<&tauri::Ap
     }
 }
 
-fn validate_block(block: &crate::ledger::LedgerBlock, chain: &crate::ledger::SharedChain) -> bool {
+fn validate_block(block: &crate::ledger::LedgerBlock, _chain: &crate::ledger::SharedChain) -> bool {
 
     if block.height == 0 {
         return block.hash == crate::ledger::GENESIS_HASH;
     }
 
-    let prev_exists = chain.blocks.iter().any(|b| b.hash == block.prev_hash);
-    if !prev_exists {
+    let parent = crate::chain_db::get_block_by_height(block.height.saturating_sub(1));
+    if parent.map(|p| p.hash != block.prev_hash).unwrap_or(true) {
         eprintln!("[Validate] Block #{} rejected: unknown prev_hash {}", block.height, block.prev_hash);
         return false;
     }
 
-    if chain.blocks.iter().any(|b| b.hash == block.hash) {
+    if crate::chain_db::get_block_by_height(block.height).map(|b| b.hash == block.hash).unwrap_or(false) {
         eprintln!("[Validate] Block #{} rejected: hash {:.8} already in chain", block.height, block.hash);
         return false;
     }
@@ -6026,7 +6112,7 @@ async fn apply_incoming_tx(tx: LedgerTx, block: LedgerBlock, app: Option<&tauri:
             tracing::debug!("[P2P] Rejected incoming mempool tx {}: {}", tx.hash, e);
             return;
         }
-        crate::mempool::get_mempool().push(tx);
+        let _ = crate::mempool::get_mempool().push(tx);
         tokio::spawn(try_proactive_proposal());
     }
 }
@@ -6126,6 +6212,21 @@ fn merge_remote_chain_blocking(
     transactions: Vec<LedgerTx>,
     trusted: bool,
 ) -> (bool, bool) {
+    // Fork detection at the boundary: if the first block's parent doesn't match our local history.
+    if let Some(first) = blocks.first() {
+        if first.height > 1 {
+            if let Some(lph) = crate::chain_db::get_block_hash_at(first.height - 1) {
+                if lph != first.prev_hash {
+                    // We diverged somewhere BEFORE the first block in this set.
+                    // Trigger a deeper sync to find the common ancestor.
+                    tracing::debug!("[P2P] Fork detected at boundary: block #{} prev_hash {} != local #{} hash {}. Syncing...", 
+                        first.height, first.prev_hash, first.height - 1, lph);
+                    return (false, true);
+                }
+            }
+        }
+    }
+
     let mut unique_txs = Vec::new();
     let mut seen_tx_hashes = std::collections::HashSet::new();
     for tx in transactions {
@@ -6169,7 +6270,12 @@ fn merge_remote_chain_blocking(
                     let now = chrono::Utc::now().timestamp();
                     let last_fin = LAST_BLOCK_FINALIZED_TS.load(Ordering::Relaxed);
                     let stuck_secs = now - last_fin;
-                    if last_fin > 0 && stuck_secs > 120 {
+                
+                // If we have very few validators (solo fork), override local finality 
+                // much faster (30s) so a non-technical user doesn't stay stuck.
+                let override_timeout = if known_validator_count() < 3 { 30 } else { 120 };
+
+                if last_fin > 0 && stuck_secs > override_timeout {
                         eprintln!(
                             "[Oracle] Chain stuck for {}s — overriding hard-finality at height {} to adopt oracle fork",
                             stuck_secs, dh
@@ -6177,7 +6283,7 @@ fn merge_remote_chain_blocking(
                         { hard_finalized_heights().retain(|&h| h < dh); }
                         { finalized_at_height().retain(|&h, _| h < dh); }
                         for tx in crate::chain_db::truncate_from(dh) {
-                            crate::mempool::get_mempool().push(tx);
+                            let _ = crate::mempool::get_mempool().push(tx);
                         }
                     } else {
                         tracing::debug!(
@@ -6188,30 +6294,20 @@ fn merge_remote_chain_blocking(
                 } else {
                     // Local chain diverges from what BFT actually finalized, or oracle
                     // is offering the finalized block — accept the reorg.
-                    let oracle_max = blocks.iter().filter(|b| b.height > 0).map(|b| b.height).max().unwrap_or(0);
-                    let local_max  = crate::chain_db::latest_block_info().0;
-                    if oracle_max >= local_max || oracle_matches_finalized {
-                        tracing::info!(
-                            "[Oracle] Reorg: adopting canonical chain at height {} (local was on wrong fork)",
-                            dh
-                        );
-                        { hard_finalized_heights().retain(|&h| h < dh); }
-                        { finalized_at_height().retain(|&h, _| h < dh); }
-                        for tx in crate::chain_db::truncate_from(dh) {
-                            crate::mempool::get_mempool().push(tx);
-                        }
+                    tracing::info!(
+                        "[BFT/Oracle] Reorg: adopting canonical trusted block at height {} (local was on wrong fork)",
+                        dh
+                    );
+                    { hard_finalized_heights().retain(|&h| h < dh); }
+                    { finalized_at_height().retain(|&h, _| h < dh); }
+                    for tx in crate::chain_db::truncate_from(dh) {
+                        let _ = crate::mempool::get_mempool().push(tx);
                     }
                 }
             } else {
-                let oracle_max = blocks.iter().filter(|b| b.height > 0).map(|b| b.height).max().unwrap_or(0);
-                let local_max  = crate::chain_db::latest_block_info().0;
-                if oracle_max >= local_max {
-                    eprintln!("[Oracle] Reorg: oracle ahead or tied ({} >= {}) — truncating from height {} and adopting oracle chain", oracle_max, local_max, dh);
-                    for tx in crate::chain_db::truncate_from(dh) {
-                        crate::mempool::get_mempool().push(tx);
-                    }
-                } else {
-                    tracing::debug!("[Oracle] Reorg skipped at height {} — oracle has {} blocks vs our {} (keeping local chain)", dh, oracle_max, local_max);
+                eprintln!("[BFT/Oracle] Reorg: trusted blocks diverge from local chain at height {} — truncating to adopt", dh);
+                for tx in crate::chain_db::truncate_from(dh) {
+                    let _ = crate::mempool::get_mempool().push(tx);
                 }
             }
         }
@@ -6238,7 +6334,7 @@ fn merge_remote_chain_blocking(
         blocks.sort_unstable_by_key(|b| b.height);
 
         let remote_tip = blocks.iter().filter(|b| b.height > 0).map(|b| b.height).max().unwrap_or(0);
-        let local_tip  = crate::chain_db::latest_block_info().0;
+        let (local_tip, local_tip_hash) = crate::chain_db::latest_block_info();
 
         let mut should_reorg = false;
         let diverge_height: Option<u64> = blocks.iter()
@@ -6248,7 +6344,8 @@ fn merge_remote_chain_blocking(
             .map(|b| b.height);
 
         if let Some(dh) = diverge_height {
-            if remote_tip > local_tip {
+            let has_bft_quorum = blocks.iter().any(|b| b.height >= dh && b.vote_count >= 2);
+            if remote_tip > local_tip || has_bft_quorum {
                 should_reorg = true;
             } else if remote_tip == local_tip {
                 // Tie-breaker for symmetric forks: compare hashes to guarantee convergence
@@ -6263,12 +6360,24 @@ fn merge_remote_chain_blocking(
 
             if should_reorg {
                 peer_ahead = true;
-                let last_hard = hard_finalized_heights().iter().max().copied().unwrap_or(0);
-                if dh > last_hard {
+                let hard_set = hard_finalized_heights();
+                let last_hard = hard_set.iter().max().copied().unwrap_or(0);
+                drop(hard_set); // release lock before truncate
+
+                let local_is_solo = crate::chain_db::get_block_by_height(dh).map(|b| b.vote_count < 2).unwrap_or(false);
+                let remote_is_heavier = remote_tip > local_tip + 10;
+                let override_hard = dh <= last_hard && (has_bft_quorum || remote_tip > local_tip + 20) && (local_is_solo || remote_is_heavier);
+
+                if dh > last_hard || override_hard {
+                    if override_hard {
+                        eprintln!("[P2P] BFT Override: Remote has quorum, bypassing hard-finality at {}", last_hard);
+                        { hard_finalized_heights().retain(|&h| h < dh); }
+                        { finalized_at_height().retain(|&h, _| h < dh); }
+                    }
                     eprintln!("[P2P] Longest-chain reorg: remote tip {} >= local {}, truncating from height {}",
                         remote_tip, local_tip, dh);
                     for tx in crate::chain_db::truncate_from(dh) {
-                        crate::mempool::get_mempool().push(tx);
+                        let _ = crate::mempool::get_mempool().push(tx);
                     }
                 } else {
                     eprintln!("[P2P] Reorg at height {} blocked — hard-finalized at {}", dh, last_hard);
@@ -6283,21 +6392,34 @@ fn merge_remote_chain_blocking(
         for block in blocks {
             if block.height == 0 { continue; }
 
-            if let Some(existing) = crate::chain_db::get_block_by_height(block.height) {
-                if existing.hash == block.hash { continue; }
-            }
-
             if block.height > 0 {
                 let parent_height = block.height - 1;
+                let has_parent = parent_height == 0 
+                    || crate::chain_db::get_block_by_height(parent_height).is_some() 
+                    || new_blocks.iter().any(|b: &LedgerBlock| b.height == parent_height);
+                
                 let expected_prev = if parent_height == 0 {
                     crate::ledger::GENESIS_HASH.to_string()
+                } else if parent_height == local_tip {
+                    local_tip_hash.clone()
+                } else if let Some(parent) = new_blocks.last() {
+                    parent.hash.clone()
                 } else if let Some(parent) = crate::chain_db::get_block_by_height(parent_height) {
+                    parent.hash.clone()
+                } else if let Some(parent) = new_blocks.iter().find(|b| b.height == parent_height) {
                     parent.hash.clone()
                 } else {
                     block.prev_hash.clone()
                 };
+
+                if !has_parent {
+                    tracing::debug!("[P2P] Untrusted block #{} deferred (missing parent). Sync required.", block.height);
+                    peer_ahead = true;
+                    continue; // Skip appending this block until parent is synced
+                }
+
                 if block.prev_hash != expected_prev {
-                    eprintln!(
+                    tracing::debug!(
                         "[P2P] Block #{} rejected: prev_hash mismatch. Forcing sync to resolve fork.",
                         block.height
                     );
@@ -6306,10 +6428,14 @@ fn merge_remote_chain_blocking(
                 }
             }
 
+            if let Some(existing) = crate::chain_db::get_block_by_height(block.height) {
+                if existing.hash == block.hash { continue; }
+            }
+
             let base_reward = crate::tokenomics::block_reward_at(block.height);
             let reward_ok = block.reward == 0 || block.reward >= base_reward;
             if !reward_ok {
-                eprintln!("[P2P] Block #{} rejected: reward {} below base {}",
+                tracing::debug!("[P2P] Block #{} rejected: reward {} below base {}",
                     block.height, block.reward, base_reward);
                 continue;
             }
@@ -6320,7 +6446,7 @@ fn merge_remote_chain_blocking(
             if !crate::poc::verify_ticket(
                 ticket_hex, sig_hex, &block.miner, &block.prev_hash, block.poc_slot, block.height,
             ) {
-                eprintln!("[P2P] Block #{} rejected: invalid PoC ticket", block.height);
+                tracing::debug!("[P2P] Block #{} rejected: invalid PoC ticket", block.height);
                 continue;
             }
 
@@ -6348,7 +6474,11 @@ fn merge_remote_chain_blocking(
                 let mut last_map = BLOCK_REJECT_LAST.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
                 let last = last_map.get(&key).copied().unwrap_or(0);
                 if now - last >= BLOCK_REJECT_LOG_COOLDOWN_SECS {
-                    eprintln!("[P2P] Block #{} rejected: {}", block.height, reason);
+                    if reason.contains("missing local parent") || reason.contains("invalid PoC ticket") {
+                        tracing::debug!("[P2P] Block #{} rejected: {}", block.height, reason);
+                    } else {
+                        tracing::warn!("[P2P] Block #{} rejected: {}", block.height, reason);
+                    }
                     last_map.insert(key, now);
                 }
                 continue;
@@ -6404,13 +6534,13 @@ fn merge_remote_chain_blocking(
                 crate::commands::tx_pending::remove(&tx.hash);
             }
             if !tx.from.is_empty() && tx.from != crate::chain_db::NODE_POOL_ADDR {
-                eprintln!("[TX] {:.12} Confirmed — block #{}", tx.hash, block.height);
+            tracing::debug!("[TX] {:.12} Confirmed — block #{}", tx.hash, block.height);
             }
         }
     }
 
     if let Some(max_height) = new_blocks.iter().map(|b| b.height).max() {
-        eprintln!("[Sync] Synced to block #{} — touching proposal timestamp", max_height);
+        tracing::info!("[Sync] Synced to block #{} — touching proposal timestamp", max_height);
         touch_proposal_timestamp();
     }
 
@@ -6420,20 +6550,22 @@ fn merge_remote_chain_blocking(
             && !tx.hash.is_empty()
             && crate::chain_db::get_tx_by_hash(&tx.hash).is_none()
             && !new_blocks.iter().any(|b| Some(b.height) == tx.block_height);
-        if is_user_tx { pool.push(tx.clone()); }
+        if is_user_tx { let _ = pool.push(tx.clone()); }
     }
 
     if let Some(tip) = new_blocks.iter().max_by_key(|b| b.height) {
         crate::rpc::notify_new_block(tip);
     }
 
-    (true, false)
+    (true, peer_ahead)
 }
 
 async fn merge_remote_chain_inner(
     blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: Option<&tauri::AppHandle<tauri::Wry>>,
     trusted: bool,
 ) {
+    let received_full_chunk = blocks.len() >= 500;
+
     let (any_new, peer_ahead) = tokio::task::spawn_blocking(move || {
         merge_remote_chain_blocking(blocks, transactions, trusted)
     }).await.unwrap_or((false, false));
@@ -6445,7 +6577,9 @@ async fn merge_remote_chain_inner(
         {
             let mut staged = staged_block();
             if let Some((b, stamped)) = staged.as_ref() {
-                if b.height <= new_tip {
+                // Clear staged block if it's already in the chain OR if it's 
+                // way in the future (lost context due to reorg)
+                if b.height <= new_tip || b.height > new_tip + 1 {
                     let pool = crate::mempool::get_mempool();
                     for tx in stamped.iter().filter(|t| !t.from.is_empty() && t.from != crate::chain_db::NODE_POOL_ADDR) {
                         if crate::chain_db::get_tx_by_hash(&tx.hash).is_none() {
@@ -6453,7 +6587,7 @@ async fn merge_remote_chain_inner(
                             let mut pending_tx = tx.clone();
                             pending_tx.status = "Pending".to_string();
                             pending_tx.block_height = None;
-                            pool.push(pending_tx);
+                            let _ = pool.push(pending_tx);
                         }
                     }
                     staged.take();
@@ -6464,9 +6598,11 @@ async fn merge_remote_chain_inner(
             let _ = h.emit_all("ego://chain-updated", ());
         }
         tokio::spawn(try_proactive_proposal());
-    } else if peer_ahead {
+    }
+    
+    if peer_ahead || received_full_chunk {
         tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             sync_chain_from_peers().await;
         });
     }
@@ -6546,16 +6682,18 @@ pub async fn fetch_chain_from_oracle(app: Option<&tauri::AppHandle<tauri::Wry>>)
 
 
 pub(crate) fn get_ed25519_seed() -> Option<[u8; 32]> {
-    if let Some(kp) = crate::app::global_app_state().get_keypair() {
-        let sk = kp.get_ed25519_secret_key();
-        if sk.len() == 32 {
-            let mut a = [0u8; 32];
-            a.copy_from_slice(sk);
-            return Some(a);
+    if let Ok(cache) = SEED_CACHE.read() {
+        if let Some(seed) = *cache {
+            return Some(seed);
         }
     }
-    if let Some(cached) = SEED_CACHE.get() {
-        return *cached;
+    if let Ok(Some(bytes)) = crate::ledger::load_seed() {
+        if bytes.len() >= 32 {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&bytes[..32]);
+            if let Ok(mut cache) = SEED_CACHE.write() { *cache = Some(a); }
+            return Some(a);
+        }
     }
     None
 }
@@ -6688,6 +6826,14 @@ async fn handle_block_proposal(
     };
 
     let local_tip = crate::chain_db::block_count().saturating_sub(1);
+
+    // If the proposal is for a height we haven't reached yet via sync, 
+    // ignore it and trigger a sync instead.
+    if block.height > local_tip + 1 {
+        tokio::spawn(sync_chain_from_peers());
+        return;
+    }
+
     if block.height <= local_tip {
         return;
     }
@@ -6730,17 +6876,26 @@ async fn handle_block_proposal(
     // ── 2. Block-level structural validation ─────────────────────────────────
     let chain = load_chain();
     {
-        let prev_exists = chain.blocks.iter().any(|b| b.hash == block.prev_hash);
-        if !prev_exists && block.height > 0 {
-            eprintln!("[BFT] Fork detected — block #{} from {} references unknown prev_hash {:.16}… (we may be on wrong fork)",
-                block.height, proposer, block.prev_hash);
-            let now = chrono::Utc::now().timestamp();
-            let last_sync = LAST_FORK_SYNC_TS.load(Ordering::Relaxed);
-                if now - last_sync > 3 {
-                LAST_FORK_SYNC_TS.store(now, Ordering::Relaxed);
-                sync_chain_from_peers().await;
+        let parent_height = block.height.saturating_sub(1);
+        let parent_hash = if parent_height == 0 {
+            Some(crate::ledger::GENESIS_HASH.to_string())
+        } else {
+            crate::chain_db::get_block_by_height(parent_height).map(|b| b.hash)
+        };
+
+        match parent_hash {
+            Some(ph) if ph == block.prev_hash => {} // OK
+            Some(ph) => {
+                eprintln!("[BFT] Fork detected — block #{} from {} references prev_hash {:.16}… (we have {:.16}…)",
+                    block.height, proposer, block.prev_hash, ph);
+                tokio::spawn(sync_chain_from_peers());
+                return;
             }
-            return;
+            None => {
+                tracing::debug!("[BFT] Missing parent for block #{} — requesting sync", block.height);
+                tokio::spawn(sync_chain_from_peers());
+                return;
+            }
         }
     }
     if !validate_block(&block, &chain) {
@@ -6899,7 +7054,7 @@ async fn handle_block_proposal(
         publish_gossip("ego-votes-v1", data).await;
     }
 
-    handle_block_vote(block.hash, block.height, my_addr, signature, chrono::Utc::now().timestamp(), vrf_ticket_hex, block.prev_hash, my_bls_sig, my_bls_pk, app).await;
+    handle_block_vote(block.hash, block.height, my_addr, signature, chrono::Utc::now().timestamp(), vrf_ticket_hex, block.prev_hash, my_bls_sig, my_bls_pk, app.cloned()).await;
 }
 
 async fn handle_block_vote(
@@ -6912,7 +7067,7 @@ async fn handle_block_vote(
     prev_hash:   String,
     bls_sig:     String,
     bls_pubkey:  String,
-    app:         Option<&tauri::AppHandle<tauri::Wry>>,
+    app:         Option<tauri::AppHandle<tauri::Wry>>,
 ) {
     if slashed_validators().contains(&voter) {
         eprintln!("[BFT] Ignoring vote from slashed validator {}", voter);
@@ -6992,20 +7147,22 @@ async fn handle_block_vote(
         prior
     };
 
-    {
+    let finalized_canonical = {
         let finalized = finalized_at_height();
-        if let Some(canonical) = finalized.get(&height) {
-            if *canonical != block_hash {
-                let reason = format!(
-                    "equivocation at height {}: finalized {} but voted {}",
-                    height, &canonical[..8.min(canonical.len())], &block_hash[..8.min(block_hash.len())]
-                );
-                drop(finalized);
-                eprintln!("[BFT] Note: {} voted for alternate block {} at already-finalized height {}", voter, &block_hash[..8.min(block_hash.len())], height);
-                return;
-            }
+        finalized.get(&height).cloned()
+    };
+
+    if let Some(canonical_hash) = finalized_canonical {
+        let block_exists = tokio::task::spawn_blocking(move || {
+            crate::chain_db::get_block_by_height(height).is_some()
+        }).await.unwrap_or(false);
+
+        // Only skip if the block is actually committed to the database
+        if canonical_hash != block_hash && block_exists {
+            eprintln!("[BFT] Note: {} voted for alternate block {} at already-finalized height {}", voter, &block_hash[..8.min(block_hash.len())], height);
             return;
         }
+        return;
     }
 
     if !bls_pubkey.is_empty() {
@@ -7075,7 +7232,14 @@ async fn handle_block_vote(
     let is_solo_bootstrap = known_validator_count() < crate::mempool::min_validators_for_finality();
 
     if final_vote_count >= threshold && !is_solo_bootstrap {
-        hard_finalized_heights().insert(height);
+        let mut hard = hard_finalized_heights();
+        hard.insert(height);
+        LOCKED_QC_HEIGHT.fetch_max(height, Ordering::Relaxed);
+        if height > 0 && height % 10_000 == 0 {
+            let cutoff = height.saturating_sub(20_000);
+            hard.retain(|&h| h >= cutoff);
+            finalized_at_height().retain(|&h, _| h >= cutoff);
+        }
     }
     LAST_BLOCK_FINALIZED_TS.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
     crate::tokenomics::record_block_produced();
@@ -7115,7 +7279,7 @@ async fn handle_block_vote(
                             let mut pending_tx = tx.clone();
                             pending_tx.status = "Pending".to_string();
                             pending_tx.block_height = None;
-                            pool.push(pending_tx);
+                            let _ = pool.push(pending_tx);
                         }
                     }
                     staged.take();
@@ -7125,10 +7289,11 @@ async fn handle_block_vote(
         }
     };
 
+    let app_handle = app.clone();
     let (block, block_txs) = match staged_opt {
         Some((mut b, txs)) => {
             {
-                let pks = peer_bls_pubkeys();
+                let pks = peer_bls_pubkeys(); // Guard is local and no await follows inside this block
                 let mut pk_list: Vec<String> = Vec::new();
                 let mut sig_list: Vec<Vec<u8>> = Vec::new();
                 
@@ -7159,7 +7324,7 @@ async fn handle_block_vote(
                 let pool = crate::mempool::get_mempool();
                 for tx in txs.iter().filter(|t| !t.from.is_empty() && t.from != crate::chain_db::NODE_POOL_ADDR) {
                     if crate::chain_db::get_tx_by_hash(&tx.hash).is_none() {
-                        pool.push(tx.clone());
+                        let _ = pool.push(tx.clone());
                     }
                 }
                 touch_proposal_timestamp();
@@ -7167,6 +7332,8 @@ async fn handle_block_vote(
             }
             if !is_solo_bootstrap {
                 crate::chain_db::pipeline_commit(height);
+            } else {
+                crate::chain_db::pipeline_commit(height + 2);
             }
             touch_proposal_timestamp();
             (b, txs)
@@ -7188,6 +7355,7 @@ async fn handle_block_vote(
                 }
                 _ => {
                     eprintln!("[BFT] Block {} not staged or committed — will arrive via sync", block_hash);
+                    tokio::spawn(sync_chain_from_peers());
                     return;
                 }
             }
@@ -7199,7 +7367,7 @@ async fn handle_block_vote(
             crate::commands::tx_pending::remove(&tx.hash);
         }
         if !tx.from.is_empty() && tx.from != crate::chain_db::NODE_POOL_ADDR {
-            eprintln!("[TX] {:.12} Confirmed — block #{}", tx.hash, height);
+            tracing::debug!("[TX] {:.12} Confirmed — block #{}", tx.hash, height);
         }
     }
 
@@ -7238,7 +7406,7 @@ async fn handle_block_vote(
     }
 
     crate::rpc::notify_new_block(&block);
-    if let Some(h) = app {
+    if let Some(h) = app_handle {
         let _ = h.emit_all("ego://chain-updated", ());
     }
 }
@@ -7297,9 +7465,16 @@ fn process_inbound_qc_finalization(
                 CONSECUTIVE_EMPTY_VIEWS.store(0, Ordering::Relaxed);
                 touch_proposal_timestamp();
                 if !is_solo_bootstrap {
-                    hard_finalized_heights().insert(height);
+                    let mut hard = hard_finalized_heights();
+                    hard.insert(height);
                     LOCKED_QC_HEIGHT.fetch_max(height, Ordering::Relaxed);
+                    if height > 0 && height % 10_000 == 0 {
+                        let cutoff = height.saturating_sub(20_000);
+                        hard.retain(|&h| h >= cutoff);
+                        finalized_at_height().retain(|&h, _| h >= cutoff);
+                    }
                 }
+                LAST_BLOCK_FINALIZED_TS.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
             tokio::spawn(try_proactive_proposal());
                 return true;
             }
@@ -7359,12 +7534,19 @@ fn process_inbound_qc_finalization(
     pending_bls_sigs().clear();
 
     if !is_solo_bootstrap {
-        hard_finalized_heights().insert(height);
+        let mut hard = hard_finalized_heights();
+        hard.insert(height);
         LOCKED_QC_HEIGHT.fetch_max(height, Ordering::Relaxed);
+        if height > 0 && height % 10_000 == 0 {
+            let cutoff = height.saturating_sub(20_000);
+            hard.retain(|&h| h >= cutoff);
+            finalized_at_height().retain(|&h, _| h >= cutoff);
+        }
     }
 
     CONSECUTIVE_EMPTY_VIEWS.store(0, Ordering::Relaxed);
     touch_proposal_timestamp();
+    LAST_BLOCK_FINALIZED_TS.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
     tokio::spawn(try_proactive_proposal());
     true
 }
@@ -7393,10 +7575,13 @@ async fn handle_view_change_msg(view: u64, voter: String) {
     {
         let my_view = current_view();
         let our_chain_next = block_count_now;
-            let view_jump_limit = my_view.max(our_chain_next).saturating_add(50);
-        if view > my_view && view <= view_jump_limit {
+        // Allow substantial jumps to catch up to the network proposers
+        let view_jump_limit = my_view.max(our_chain_next).saturating_add(100_000);
+        if view > my_view + 1 && view <= view_jump_limit {
             if !my_addr.is_empty() && voter != my_addr {
-                advance_view(view.saturating_sub(1));
+                // Peer is ahead: jump to their view to stay in sync with the leader rotation
+                let target_view = view;
+                advance_view(view);
                 eprintln!(
                     "[HotStuff] View sync: jumped {} → {} (peer {} is ahead)",
                     my_view, view.saturating_sub(1), &voter[..voter.len().min(20)]
@@ -7488,6 +7673,15 @@ async fn handle_view_change_msg(view: u64, voter: String) {
     {
         votes_cast().retain(|(_, h), _| *h < block_count_now);
     }
+    
+    {
+        let all_hashes: Vec<String> = pending_votes().keys().cloned().collect();
+        for h in &all_hashes {
+            crate::chain_db::clear_pending_votes_for_block(h);
+        }
+        pending_votes().clear();
+        pending_bls_sigs().clear();
+    }
 
     // ── Liveness: VRF self-selection + deterministic fallback ─────────────
     // Increment the empty-view counter.  If it hits FALLBACK_AFTER_EMPTY_VIEWS,
@@ -7551,15 +7745,6 @@ pub async fn propose_block_as_leader() {
         None    => { touch_proposal_timestamp(); return; }
     };
 
-    {
-        let fin = finalized_at_height();
-        if fin.contains_key(&next_height) {
-            eprintln!("[BFT] Height {} already finalized locally, skipping proposal", next_height);
-            touch_proposal_timestamp();
-            return;
-        }
-    }
-
     let vrf_in     = crate::bft_committee::vrf_input(&prev_hash, next_height, crate::bft_committee::VRF_ROLE_PROPOSER);
     let vrf_ticket = crate::bft_committee::sign_vrf_ticket(&seed_32, &vrf_in);
 
@@ -7616,6 +7801,45 @@ pub async fn propose_block_as_leader() {
             publish_gossip("ego-proposals-v1", data).await;
         }
         eprintln!("[BFT] Re-broadcasting staged proposal for block #{} (mempool unchanged)", next_height);
+        
+        let committee_vrf_in     = crate::bft_committee::vrf_input(&block.prev_hash, block.height, crate::bft_committee::VRF_ROLE_COMMITTEE);
+        let committee_ticket     = crate::bft_committee::sign_vrf_ticket(&seed_32, &committee_vrf_in);
+        let committee_ticket_hex = hex::encode(&committee_ticket);
+        let self_vote_data       = crate::bft_committee::vote_signing_data(&block.hash, block.height, &miner);
+        let self_sig = {
+            use ed25519_dalek::{SigningKey, Signer};
+            hex::encode(SigningKey::from_bytes(&seed_32).sign(self_vote_data.as_bytes()).to_bytes())
+        };
+        let block_hash_bytes = hex::decode(&block.hash).unwrap_or_default();
+        let (self_bls_sig, self_bls_pk) = bls_vote_fields(&block_hash_bytes);
+        let self_vote = P2PMessage::BlockVote {
+            block_hash: block.hash.clone(),
+            height:     block.height,
+            voter:      miner.clone(),
+            signature:  self_sig.clone(),
+            timestamp:  chrono::Utc::now().timestamp(),
+            vrf_ticket: committee_ticket_hex.clone(),
+            prev_hash:  block.prev_hash.clone(),
+            bls_sig:    self_bls_sig.clone(),
+            bls_pubkey: self_bls_pk.clone(),
+        };
+        if let Ok(data) = serde_json::to_vec(&self_vote) {
+            publish_gossip("ego-votes-v1", data).await;
+        }
+        
+        let bh = block.hash.clone();
+        let bhgt = block.height;
+        let m = miner.clone();
+        let ss = self_sig;
+        let ts = chrono::Utc::now().timestamp();
+        let ct = committee_ticket_hex;
+        let ph = block.prev_hash.clone();
+        let bs = self_bls_sig;
+        let bp = self_bls_pk;
+        tokio::spawn(async move {
+            handle_block_vote(bh, bhgt, m, ss, ts, ct, ph, bs, bp, None).await;
+        });
+        
         touch_proposal_timestamp();
         return;
     }
@@ -7626,7 +7850,7 @@ pub async fn propose_block_as_leader() {
 
     let oracle_rewards = fetch_pending_post_rewards().await;
     let post_proof_ids: Vec<String> = oracle_rewards.iter().map(|t| t.hash.clone()).collect();
-    let mut all_txs = txs;
+    let mut all_txs = txs.clone();
     all_txs.extend(oracle_rewards);
 
     // Inject pending protocol transactions (e.g. collateral slashes)
@@ -7672,6 +7896,24 @@ pub async fn propose_block_as_leader() {
         *staged = Some((block.clone(), stamped.clone()));
     }
 
+    let accepted_hashes: std::collections::HashSet<_> = stamped.iter().map(|t| t.hash.clone()).collect();
+    for tx in &txs {
+        if !accepted_hashes.contains(&tx.hash) {
+            crate::commands::tx_pending::remove(&tx.hash);
+            if let Some(app) = APP_HANDLE.get() {
+                let my_addr = crate::ledger::Ledger::load().address;
+                if tx.from == my_addr {
+                    crate::commands::notifications::notify(
+                        app,
+                        "Transaction Failed",
+                        &format!("Your transaction of {:.2} EGOC was rejected (e.g. insufficient balance).", tx.amount as f64 / 1_000_000.0)
+                    );
+                }
+                let _ = app.emit_all("ego://chain-updated", ());
+            }
+        }
+    }
+
     let sig_data  = format!("proposal:{}:{}", block.hash, block.height);
     let signature = {
         use ed25519_dalek::{SigningKey, Signer};
@@ -7699,22 +7941,6 @@ pub async fn propose_block_as_leader() {
             use ed25519_dalek::{SigningKey, Signer};
             hex::encode(SigningKey::from_bytes(&seed_32).sign(self_vote_data.as_bytes()).to_bytes())
         };
-        let should_persist = {
-            let mut pv  = pending_votes();
-            let voters  = pv.entry(block.hash.clone()).or_default();
-            if !voters.contains(&miner) {
-                voters.push(miner.clone());
-                true
-            } else {
-                false
-            }
-        };
-        if should_persist {
-            let bh = block.hash.clone();
-            let mn = miner.clone();
-            tokio::task::spawn_blocking(move || crate::chain_db::persist_pending_vote(&bh, &mn)).await.ok();
-        }
-        votes_cast().insert((miner.clone(), block.height), (block.hash.clone(), self_sig.clone()));
         let block_hash_bytes = hex::decode(&block.hash).unwrap_or_default();
         let (self_bls_sig, self_bls_pk) = bls_vote_fields(&block_hash_bytes);
         let self_vote = P2PMessage::BlockVote {
@@ -7778,7 +8004,7 @@ pub fn bft_solo_commit(block_hash: &str, height: u64) {
                     let mut pending_tx = tx.clone();
                     pending_tx.status = "Pending".to_string();
                     pending_tx.block_height = None;
-                    pool.push(pending_tx);
+                            let _ = pool.push(pending_tx);
                 }
             }
             return;
@@ -7786,6 +8012,7 @@ pub fn bft_solo_commit(block_hash: &str, height: u64) {
         CONSECUTIVE_EMPTY_VIEWS.store(0, Ordering::Relaxed);
         pending_proposals().remove(&height);
         pending_votes().remove(block_hash);
+
         crate::rpc::notify_new_block(&b);
         if let Some(h) = APP_HANDLE.get() {
             let _ = h.emit_all("ego://chain-updated", ());
@@ -7864,15 +8091,6 @@ pub async fn propose_block_as_leader_forced() {
         None    => { touch_proposal_timestamp(); return; }
     };
 
-    {
-        let fin = finalized_at_height();
-        if fin.contains_key(&next_height) {
-            eprintln!("[BFT] Height {} already finalized locally, skipping proposal", next_height);
-            touch_proposal_timestamp();
-            return;
-        }
-    }
-
     // Re-use staged block if already proposed for this height (same as propose_block_as_leader).
     let reuse_data: Option<(crate::ledger::LedgerBlock, Vec<LedgerTx>)> = {
         let staged = staged_block();
@@ -7907,6 +8125,45 @@ pub async fn propose_block_as_leader_forced() {
             publish_gossip("ego-proposals-v1", data).await;
         }
         eprintln!("[BFT] FALLBACK re-broadcasting staged proposal for block #{}", next_height);
+        
+        let committee_vrf_in     = crate::bft_committee::vrf_input(&block.prev_hash, block.height, crate::bft_committee::VRF_ROLE_COMMITTEE);
+        let committee_ticket     = crate::bft_committee::sign_vrf_ticket(&seed_32, &committee_vrf_in);
+        let committee_ticket_hex = hex::encode(&committee_ticket);
+        let self_vote_data       = crate::bft_committee::vote_signing_data(&block.hash, block.height, &miner);
+        let self_sig = {
+            use ed25519_dalek::{SigningKey, Signer};
+            hex::encode(SigningKey::from_bytes(&seed_32).sign(self_vote_data.as_bytes()).to_bytes())
+        };
+        let block_hash_bytes = hex::decode(&block.hash).unwrap_or_default();
+        let (self_bls_sig, self_bls_pk) = bls_vote_fields(&block_hash_bytes);
+        let self_vote = P2PMessage::BlockVote {
+            block_hash: block.hash.clone(),
+            height:     block.height,
+            voter:      miner.clone(),
+            signature:  self_sig.clone(),
+            timestamp:  chrono::Utc::now().timestamp(),
+            vrf_ticket: committee_ticket_hex.clone(),
+            prev_hash:  block.prev_hash.clone(),
+            bls_sig:    self_bls_sig.clone(),
+            bls_pubkey: self_bls_pk.clone(),
+        };
+        if let Ok(data) = serde_json::to_vec(&self_vote) {
+            publish_gossip("ego-votes-v1", data).await;
+        }
+        
+        let bh = block.hash.clone();
+        let bhgt = block.height;
+        let m = miner.clone();
+        let ss = self_sig;
+        let ts = chrono::Utc::now().timestamp();
+        let ct = committee_ticket_hex;
+        let ph = block.prev_hash.clone();
+        let bs = self_bls_sig;
+        let bp = self_bls_pk;
+        tokio::spawn(async move {
+            handle_block_vote(bh, bhgt, m, ss, ts, ct, ph, bs, bp, None).await;
+        });
+        
         touch_proposal_timestamp();
         return;
     }
@@ -7917,7 +8174,7 @@ pub async fn propose_block_as_leader_forced() {
 
     let oracle_rewards = fetch_pending_post_rewards().await;
     let post_proof_ids: Vec<String> = oracle_rewards.iter().map(|t| t.hash.clone()).collect();
-    let mut all_txs = txs;
+    let mut all_txs = txs.clone();
     all_txs.extend(oracle_rewards);
 
     // Inject pending protocol transactions (e.g. collateral slashes)
@@ -7963,6 +8220,24 @@ pub async fn propose_block_as_leader_forced() {
         *staged = Some((block.clone(), stamped.clone()));
     }
 
+    let accepted_hashes: std::collections::HashSet<_> = stamped.iter().map(|t| t.hash.clone()).collect();
+    for tx in &txs {
+        if !accepted_hashes.contains(&tx.hash) {
+            crate::commands::tx_pending::remove(&tx.hash);
+            if let Some(app) = APP_HANDLE.get() {
+                let my_addr = crate::ledger::Ledger::load().address;
+                if tx.from == my_addr {
+                    crate::commands::notifications::notify(
+                        app,
+                        "Transaction Failed",
+                        &format!("Your transaction of {:.2} EGOC was rejected (e.g. insufficient balance).", tx.amount as f64 / 1_000_000.0)
+                    );
+                }
+                let _ = app.emit_all("ego://chain-updated", ());
+            }
+        }
+    }
+
     let sig_data  = format!("proposal:{}:{}", block.hash, block.height);
     let signature = {
         use ed25519_dalek::{SigningKey, Signer};
@@ -7992,22 +8267,6 @@ pub async fn propose_block_as_leader_forced() {
             use ed25519_dalek::{SigningKey, Signer};
             hex::encode(SigningKey::from_bytes(&seed_32).sign(self_vote_data.as_bytes()).to_bytes())
         };
-        let should_persist = {
-            let mut pv  = pending_votes();
-            let voters  = pv.entry(block.hash.clone()).or_default();
-            if !voters.contains(&miner) {
-                voters.push(miner.clone());
-                true
-            } else {
-                false
-            }
-        };
-        if should_persist {
-            let bh = block.hash.clone();
-            let mn = miner.clone();
-            tokio::task::spawn_blocking(move || crate::chain_db::persist_pending_vote(&bh, &mn)).await.ok();
-        }
-        votes_cast().insert((miner.clone(), block.height), (block.hash.clone(), self_sig.clone()));
         let block_hash_bytes = hex::decode(&block.hash).unwrap_or_default();
         let (fb_bls_sig, fb_bls_pk) = bls_vote_fields(&block_hash_bytes);
         let self_vote = P2PMessage::BlockVote {

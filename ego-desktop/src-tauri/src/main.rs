@@ -402,6 +402,8 @@ fn main() {
             commands::wallet::send_transaction_with_password,
             commands::wallet::prepare_transaction,
             commands::wallet::commit_transaction,
+            commands::wallet::get_reservation_connect_info,
+            commands::wallet::terminate_reservation_early,
             commands::wallet::get_transaction_history,
             commands::wallet::get_tx_fee,
             commands::wallet::clear_pending_transactions,
@@ -741,6 +743,12 @@ fn main() {
                     last_tick_wall = now_wall;
                     if wall_elapsed > 60 {
                         tracing::info!("Wake-from-sleep detected ({}s gap) — reconnecting P2P", wall_elapsed);
+                        
+                        if !no_oracle {
+                            tracing::info!("Fetching latest state from Explorer RPC for fast-sync...");
+                            crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)).await;
+                        }
+                        
                         crate::p2p::restore_dht_cache().await;
                         crate::p2p::dht_discover_peers().await;
                         crate::p2p::register_with_relay_as_ego_node().await;

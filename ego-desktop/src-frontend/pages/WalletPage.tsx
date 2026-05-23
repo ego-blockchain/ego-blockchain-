@@ -1292,7 +1292,7 @@ const WalletPage: React.FC = () => {
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-700">
           <h3 className="font-semibold">Transactions</h3>
           <div className="flex items-center gap-2">
-            {txs.some(tx => tx.status === 'Pending') && (
+            {txs.some(tx => tx.status === 'Pending' || tx.status === 'Confirming (0/3)') && (
               <button
                 onClick={handleClearPending}
                 disabled={clearingPending}

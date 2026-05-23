@@ -70,7 +70,7 @@ pub fn restore_to_mempool() {
         }
 
         let confirmed_nonce = crate::ledger::last_confirmed_nonce(&tx.from);
-        if tx.nonce <= confirmed_nonce {
+        if tx.nonce > 0 && tx.nonce <= confirmed_nonce {
             eprintln!("[TxPending] Pruning stale TX {} — nonce {} already used (confirmed={})",
                 &tx.hash[..12.min(tx.hash.len())], tx.nonce, confirmed_nonce);
             remove(&tx.hash);

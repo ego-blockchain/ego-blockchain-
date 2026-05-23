@@ -94,7 +94,15 @@ pub async fn get_balance(_state: State<'_, AppState>) -> Result<Balance, EgoDesk
             .filter(|tx| tx.from.trim() == my_addr.trim())
             .map(|tx| tx.amount.saturating_add(tx.fee_uegoc))
             .sum();
-        let uegoc = confirmed.saturating_sub(pending_out);
+
+        let pending_faucet_in: u64 = crate::mempool::get_mempool()
+            .peek_all()
+            .into_iter()
+            .filter(|tx| tx.tx_type == "faucet" && tx.to.trim() == my_addr.trim())
+            .map(|tx| tx.amount)
+            .sum();
+
+        let uegoc = confirmed.saturating_add(pending_faucet_in).saturating_sub(pending_out);
         let egoc  = uegoc / 1_000_000;
 
         let uegusd = ledger.balance_uegusd;
@@ -495,29 +503,39 @@ pub async fn get_transaction_history(
         let mut final_txs = Vec::with_capacity(txs.len());
 
         for mut tx in txs.into_iter() {
+            // Filter out system spam to prevent burying real user transfers
+            let is_spammy = tx.from == crate::chain_db::NODE_POOL_ADDR 
+                && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward");
+            if is_spammy {
+                continue;
+            }
+
             confirmed_hashes.insert(tx.hash.clone());
-            let mut hide_from_receiver = false;
+            let is_receiver = tx.to == my_addr && tx.from != my_addr;
+            let is_faucet = tx.tx_type == "faucet";
+            let mut is_fully_confirmed = false;
 
             if let Some(h) = tx.block_height {
                 if h <= finalized_h || h == 0 {
                     tx.status = "Confirmed".into();
+                    is_fully_confirmed = true;
                 } else {
                     let confs = tip_height.saturating_sub(h) + 1;
                     if confs >= 3 {
                         tx.status = "Confirmed".into();
+                        is_fully_confirmed = true;
                     } else {
-                        hide_from_receiver = true;
                         tx.status = format!("Confirming ({}/3)", confs);
                     }
                 }
             } else {
-                hide_from_receiver = true;
-                tx.status = "Pending".into();
+                tx.status = "Confirming (0/3)".into();
             }
 
-            if hide_from_receiver && tx.from != my_addr {
-                continue;
+            if is_receiver && !is_faucet && !is_fully_confirmed {
+                continue; // Hide from receiver until fully confirmed
             }
+
             final_txs.push(tx);
         }
 
@@ -526,12 +544,18 @@ pub async fn get_transaction_history(
         let file_txs = crate::commands::tx_pending::get_all();
 
         for mut tx in pool_txs.into_iter().chain(file_txs.into_iter()) {
-            if tx.from == my_addr && !confirmed_hashes.contains(&tx.hash) {
+            if (tx.from == my_addr || tx.to == my_addr) && !confirmed_hashes.contains(&tx.hash) {
+                let is_receiver = tx.to == my_addr && tx.from != my_addr;
+                let is_faucet = tx.tx_type == "faucet";
+                if is_receiver && !is_faucet {
+                    continue; // Hide unconfirmed inbound transfers from the receiver's UI
+                }
+
                 confirmed_hashes.insert(tx.hash.clone());
                 if now - tx.timestamp >= 1800 { // 30 mins
                     tx.status = "Failed".into();
                 } else {
-                    tx.status = "Pending".into();
+                    tx.status = "Confirming (0/3)".into();
                 }
                 tx.block_height = None;
                 final_txs.push(tx);
@@ -1329,6 +1353,130 @@ pub async fn presale_create_iou(
 
     serde_json::to_string_pretty(&iou)
         .map_err(|e| EgoDesktopError::WalletError(e.to_string()))
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReservationConnectInfo {
+    pub reservation_id: String,
+    pub status: String,
+    pub provider_ip: String,
+    pub ssh_command: String,
+    pub note: String,
+}
+
+#[tauri::command]
+pub async fn get_reservation_connect_info(
+    reservation_id: String,
+) -> Result<ReservationConnectInfo, EgoDesktopError> {
+    let res = tokio::task::spawn_blocking(move || {
+        crate::chain_db::get_compute_reservation(&reservation_id)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::WalletError(e.to_string()))?
+    .ok_or_else(|| EgoDesktopError::InvalidInput("Reservation not found".into()))?;
+
+    let provider_addr = res.provider_address.clone();
+    let provider = tokio::task::spawn_blocking(move || {
+        crate::chain_db::get_compute_node(&provider_addr)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::WalletError(e.to_string()))?
+    .ok_or_else(|| EgoDesktopError::InvalidInput("Provider node info not found. The node may be offline.".into()))?;
+
+    let ip = provider.endpoint.split('/').nth(2).unwrap_or("127.0.0.1");
+
+    Ok(ReservationConnectInfo {
+        reservation_id: res.reservation_id,
+        status: res.status,
+        provider_ip: ip.to_string(),
+        ssh_command: format!("ssh root@{}", ip),
+        note: "Note: Direct SSH access requires the provider to have Port 22 open on their router. If the connection times out, the provider might be blocking direct external access.".to_string(),
+    })
+}
+
+#[tauri::command]
+pub async fn terminate_reservation_early(reservation_id: String) -> Result<(), EgoDesktopError> {
+    let my_addr = crate::ledger::Ledger::load().address;
+    let mut res = crate::chain_db::get_compute_reservation(&reservation_id)
+        .ok_or_else(|| EgoDesktopError::NotFound("Reservation not found".into()))?;
+
+    if res.buyer_address != my_addr {
+        return Err(EgoDesktopError::PermissionDenied("Not your reservation".into()));
+    }
+    if res.status != "active" {
+        return Err(EgoDesktopError::InvalidInput(format!("Cannot terminate {} reservation", res.status)));
+    }
+
+    let penalty = res.period_rate_uegoc.min(res.escrow_remaining);
+    let refund = res.escrow_remaining.saturating_sub(penalty);
+    let ts = chrono::Utc::now().timestamp();
+
+    // Pay penalty to provider
+    if penalty > 0 {
+        // crate::chain_db::internal_balance_transfer(crate::chain_db::RESERVATION_ESCROW_ADDR, &res.provider_address, penalty);
+        
+        let memo = format!("early_termination_penalty:{}", reservation_id);
+        let sign_bytes = crate::ledger::tx_signing_bytes_v2(crate::chain_db::RESERVATION_ESCROW_ADDR, &res.provider_address, penalty, 0, ts, 1, &memo);
+        let hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+        let _ = crate::mempool::get_mempool().push(crate::ledger::LedgerTx {
+            hash,
+            from:      crate::chain_db::RESERVATION_ESCROW_ADDR.to_string(),
+            to:        res.provider_address.clone(),
+            amount:    penalty,
+            memo:      Some(memo),
+            timestamp: ts,
+            signature: "system".to_string(),
+            status:    "Pending".into(),
+            nonce:     0,
+            tx_type:   "early_termination_penalty".to_string(),
+            tx_version: 2,
+            chain_id:   1,
+            ..crate::ledger::LedgerTx::default()
+        });
+    }
+
+    // Refund remainder to buyer
+    if refund > 0 {
+        // crate::chain_db::internal_balance_transfer(crate::chain_db::RESERVATION_ESCROW_ADDR, &my_addr, refund);
+        
+        let memo = format!("early_termination_refund:{}", reservation_id);
+        let sign_bytes = crate::ledger::tx_signing_bytes_v2(crate::chain_db::RESERVATION_ESCROW_ADDR, &my_addr, refund, 0, ts, 1, &memo);
+        let hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+        let _ = crate::mempool::get_mempool().push(crate::ledger::LedgerTx {
+            hash,
+            from:      crate::chain_db::RESERVATION_ESCROW_ADDR.to_string(),
+            to:        my_addr.clone(),
+            amount:    refund,
+            memo:      Some(memo),
+            timestamp: ts,
+            signature: "system".to_string(),
+            status:    "Pending".into(),
+            nonce:     0,
+            tx_type:   "early_termination_refund".to_string(),
+            tx_version: 2,
+            chain_id:   1,
+            ..crate::ledger::LedgerTx::default()
+        });
+    }
+
+    res.status = "terminated".to_string();
+    res.escrow_remaining = 0;
+    crate::chain_db::upsert_compute_reservation(&res);
+
+    if let Some(mut node) = crate::chain_db::get_compute_node(&res.provider_address) {
+        node.locked_cores = node.locked_cores.saturating_sub(res.cpu_cores);
+        node.locked_ram_gb = node.locked_ram_gb.saturating_sub(res.ram_gb);
+        crate::chain_db::upsert_compute_node(&node);
+    }
+
+    let msg = crate::p2p::P2PMessage::ReservationTerminated {
+        reservation_id: reservation_id.clone(),
+        by: my_addr.clone(),
+        reason: "early_termination".to_string(),
+    };
+    crate::p2p::broadcast_compute_msg(msg).await;
+
+    Ok(())
 }
 
 /// Verify + decrypt an IOU file with the buyer's password.

@@ -312,14 +312,24 @@ async fn load_active_wallet(
         let (bal, fmt) = tokio::task::spawn_blocking(move || {
             credit_testnet_faucet(&addr);
             let b = crate::chain_db::balance_of(&addr);
-            let f = format!("{:.2} EGOC", b as f64 / 1_000_000.0);
+
+            let pending_faucet_in: u64 = crate::mempool::get_mempool()
+                .pending_txs_for_address(&addr)
+                .into_iter()
+                .filter(|tx| tx.tx_type == "faucet" && tx.to == addr)
+                .map(|tx| tx.amount)
+                .sum();
+
+            let effective_bal = b + pending_faucet_in;
+            let f = format!("{:.2} EGOC", effective_bal as f64 / 1_000_000.0);
+
             // Persist real balance so next launch shows it immediately.
             let mut ledger = Ledger::load();
             if b > 0 || ledger.balance_uegoc == 0 {
                 ledger.balance_uegoc = b;
                 let _ = ledger.save();
             }
-            (b, f)
+            (effective_bal, f)
         }).await.unwrap_or((0, "0.00 EGOC".into()));
 
         if let Some(h) = handle {

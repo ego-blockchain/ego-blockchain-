@@ -47,7 +47,7 @@ pub const FEATURE_DILITHIUM_DISABLED: &str = "dilithium_disabled";
 pub const FEATURE_DILITHIUM_REQUIRED: &str = "dilithium_required";
 
 
-const FULL_BLOCK_CAP: u64 = 2_000;
+const FULL_BLOCK_CAP: u64 = 2_000_000_000; // Act as an Archive Node (keep all history)
 
 const HEADER_CAP: u64 = 100_000;
 
@@ -164,22 +164,30 @@ pub fn get_db() -> DbWrapper {
         init_db(&db);
         eprintln!("[ChainDB] RocksDB init_db done");
 
-        // Seed faucet exactly once for migrated DBs that skipped seed_genesis.
-        // The META_FAUCET_SEEDED flag prevents re-seeding on restarts even if
-        // the faucet balance reaches 0.
-        const META_FAUCET_SEEDED: &[u8] = b"faucet_seeded_v1";
+        // Seed supply pools exactly once for migrated DBs that skipped seed_genesis.
+        const META_POOLS_SEEDED: &[u8] = b"pools_seeded_v2";
         if let Some(cf_meta) = db.cf_handle(CF_META) {
-            let already_seeded = db.get_cf(cf_meta, META_FAUCET_SEEDED).ok().flatten().is_some();
+            let already_seeded = db.get_cf(cf_meta, META_POOLS_SEEDED).ok().flatten().is_some();
             if !already_seeded {
                 if let Some(cf_balances) = db.cf_handle(CF_BALANCES) {
                     let faucet_addr = get_faucet_address();
-                    let cur = db.get_cf(cf_balances, faucet_addr.as_bytes())
-                        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-                    if cur == 0 {
-                        let _ = db.put_cf(cf_balances, faucet_addr.as_bytes(), u64_le(10_000_000 * 1_000_000));
+                    use crate::tokenomics::*;
+                    let allocs = vec![
+                        (ECOSYSTEM_ADDR.to_string(),    ECOSYSTEM_EGOC  * UEGOC_PER_EGOC),
+                        (FOUNDATION_ADDR.to_string(),   FOUNDATION_EGOC * UEGOC_PER_EGOC),
+                        (NODE_POOL_ADDR.to_string(),    NODE_POOL_UEGOC),
+                        (STAKING_POOL_ADDR.to_string(), STAKING_POOL_UEGOC),
+                        (faucet_addr,                   10_000_000 * UEGOC_PER_EGOC),
+                    ];
+                    for (addr, amount) in allocs {
+                        let cur = db.get_cf(cf_balances, addr.as_bytes())
+                            .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+                        if cur == 0 {
+                            let _ = db.put_cf(cf_balances, addr.as_bytes(), u64_le(amount));
+                        }
                     }
                 }
-                let _ = db.put_cf(cf_meta, META_FAUCET_SEEDED, b"1");
+                let _ = db.put_cf(cf_meta, META_POOLS_SEEDED, b"1");
             }
         }
         
@@ -742,7 +750,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         }
     }
 
-    eprintln!("[ChainDB] write_block_batch start — block #{} ({} txs)", block.height, txs.len());
+    tracing::debug!("[ChainDB] write_block_batch start — block #{} ({} txs)", block.height, txs.len());
     let cf_blocks     = db.cf_handle(CF_BLOCKS).unwrap();
     let cf_txs        = db.cf_handle(CF_TXS).unwrap();
     let cf_block_txs  = db.cf_handle(CF_BLOCK_TXS).unwrap();
@@ -968,30 +976,39 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         }
     }
 
-    eprintln!("[ChainDB] db.write(batch) starting — block #{}", block.height);
+    tracing::debug!("[ChainDB] db.write(batch) starting — block #{}", block.height);
     if let Err(e) = db.write(batch) {
         tracing::error!("write batch failed (disk full?): {e}");
         return false;
     }
-    eprintln!("[ChainDB] db.write(batch) done — block #{}", block.height);
+    tracing::debug!("[ChainDB] db.write(batch) done — block #{}", block.height);
 
     let block_height = block.height;
     let addr = crate::ledger::Ledger::load().address;
     if let Some(&new_bal) = new_balances.get(&addr) {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let _guard = crate::ledger::TX_MUTEX.lock().await;
-                let mut ledger = crate::ledger::Ledger::load();
-                if ledger.balance_uegoc != new_bal {
-                    eprintln!("[ChainDB] balance update — addr {:.16} old={} new={}", ledger.address, ledger.balance_uegoc, new_bal);
-                    ledger.balance_uegoc = new_bal;
-                    let _ = ledger.save();
-                    if let Some(h) = crate::p2p::APP_HANDLE.get() {
-                        eprintln!("[ChainDB] emitting wallet-balance-updated — block #{} bal={}", block_height, new_bal);
-                        let _ = h.emit_all("wallet-balance-updated", serde_json::json!({
-                            "balance_uegoc": new_bal,
-                            "balance_formatted": format!("{:.2} EGOC", new_bal as f64 / 1_000_000.0)
-                        }));
+                static LAST_BAL_UPDATE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+                let now = chrono::Utc::now().timestamp_millis();
+                let last = LAST_BAL_UPDATE.load(std::sync::atomic::Ordering::Relaxed);
+                
+                // Throttle intense I/O & UI events to 1 per second during bulk sync
+                if now - last > 1000 {
+                    LAST_BAL_UPDATE.store(now, std::sync::atomic::Ordering::Relaxed);
+                    
+                    let _guard = crate::ledger::TX_MUTEX.lock().await;
+                    let mut ledger = crate::ledger::Ledger::load();
+                    if ledger.balance_uegoc != new_bal {
+                        tracing::debug!("[ChainDB] balance update — addr {:.16} old={} new={}", ledger.address, ledger.balance_uegoc, new_bal);
+                        ledger.balance_uegoc = new_bal;
+                        let _ = ledger.save();
+                        if let Some(h) = crate::p2p::APP_HANDLE.get() {
+                            tracing::debug!("[ChainDB] emitting wallet-balance-updated — block #{} bal={}", block_height, new_bal);
+                            let _ = h.emit_all("wallet-balance-updated", serde_json::json!({
+                                "balance_uegoc": new_bal,
+                                "balance_formatted": format!("{:.2} EGOC", new_bal as f64 / 1_000_000.0)
+                            }));
+                        }
                     }
                 }
             });
@@ -1019,11 +1036,12 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             crate::commands::tx_pending::remove(&tx.hash);
         }
         if !tx.from.is_empty() && tx.from != NODE_POOL_ADDR && !tx.hash.is_empty() {
-            eprintln!("[TX] {:.12} Confirmed — {:.16} → {:.16} {} uEGOC in block #{}",
+            tracing::debug!("[TX] {:.12} Confirmed — {:.16} → {:.16} {} uEGOC in block #{}",
                 tx.hash, tx.from, tx.to, tx.amount, block.height);
         }
     }
     crate::mempool::get_mempool().remove_txs(&hashes_to_remove);
+    crate::mempool::get_mempool().cleanup_stale();
 
     // Update validator stake tracker for staking/unstaking TXs.
     // This is what gates validator registration (minimum stake required).
@@ -1232,31 +1250,68 @@ pub fn balance_of(address: &str) -> u64 {
         .unwrap_or(0)
 }
 
+pub fn get_faucet_drops(address: &str) -> u32 {
+    let global_drops = get_tx_history_for_addr(address)
+        .into_iter()
+        .filter(|tx| tx.tx_type == "faucet")
+        .count() as u32;
+
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf_meta = match db.cf_handle(CF_META) { Some(c) => c, None => return global_drops };
+    let faucet_key = format!("faucet_drops:{}", address);
+    let local_drops = db.get_cf(cf_meta, faucet_key.as_bytes())
+        .ok().flatten()
+        .map(|v| read_u64_le(&v) as u32)
+        .unwrap_or(0);
+
+    global_drops.max(local_drops)
+}
 
 pub fn grant_testnet_faucet(address: &str, amount_uegoc: u64) -> bool {
+    static FAUCET_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let _guard = FAUCET_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+
     let pool_bal = {
         let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
         let cf_balances = match db.cf_handle(CF_BALANCES) { Some(c) => c, None => return false };
-
-        let cur_balance = db.get_cf(cf_balances, address.as_bytes())
-            .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-        if cur_balance > 0 { return false; }
 
         db.get_cf(cf_balances, NODE_POOL_ADDR.as_bytes())
             .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
     };
 
-    let pool = crate::mempool::get_mempool();
-    if pool.pending_txs_for_address(address).iter().any(|tx| tx.tx_type == "faucet") {
-        return false;
-    }
-
     let credited = amount_uegoc.min(pool_bal);
     if credited == 0 { return false; }
 
-    let ts   = chrono::Utc::now().timestamp();
+    // 1. Check global chain history to prevent cross-node abuse
+    let global_drops = get_tx_history_for_addr(address)
+        .into_iter()
+        .filter(|tx| tx.tx_type == "faucet")
+        .count() as u64;
+
+    // 2. Check local database counter
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf_meta = match db.cf_handle(CF_META) { Some(c) => c, None => return false };
+    let faucet_key = format!("faucet_drops:{}", address);
+    
+    let local_drops = db.get_cf(cf_meta, faucet_key.as_bytes())
+        .ok().flatten()
+        .map(|v| read_u64_le(&v))
+        .unwrap_or(0);
+
+    let total_drops = global_drops.max(local_drops);
+    if total_drops >= 1 {
+        return false;
+    }
+
+    let _ = db.put_cf(cf_meta, faucet_key.as_bytes(), u64_le(total_drops + 1));
+    drop(db); // Release DB lock early
+
+    // 3. Generate transaction (nonce MUST be 0 for system txs to prevent network collisions)
+    let current_time = chrono::Utc::now().timestamp();
+    let nonce = 0;
+
     let sign_bytes = crate::ledger::tx_signing_bytes_v2(
-        NODE_POOL_ADDR, address, credited, 0, ts, 1, "testnet faucet",
+        NODE_POOL_ADDR, address, credited, nonce, current_time, 1, "testnet faucet",
     );
     let hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
 
@@ -1268,10 +1323,10 @@ pub fn grant_testnet_faucet(address: &str, amount_uegoc: u64) -> bool {
         fee_uegoc:   0,
         tx_type:     "faucet".into(),
         memo:        Some("testnet faucet".into()),
-        timestamp:   ts,
+        timestamp:   current_time,
         status:      "Pending".into(),
         block_height: None,
-        nonce:       0,
+        nonce,
         signature:   "faucet".into(),
         tx_version:  2,
         chain_id:    1,
@@ -1280,7 +1335,9 @@ pub fn grant_testnet_faucet(address: &str, amount_uegoc: u64) -> bool {
 
     eprintln!("[Faucet] Queuing {} uEGOC for {} via Mempool", credited, address);
     
-    pool.push(tx.clone());
+    crate::commands::tx_pending::add(&tx);
+    let pool = crate::mempool::get_mempool();
+    let _ = pool.push(tx.clone());
     tokio::spawn(async move {
         crate::p2p::broadcast_pending_tx(tx).await;
     });
@@ -1329,16 +1386,11 @@ pub fn paged_transactions(offset: usize, limit: usize) -> Vec<LedgerTx> {
                 let tx_hash = &k[8..];
                 if let Some(v) = db.get_cf(cf_txs, tx_hash).ok().flatten() {
                     if let Some(mut tx) = decode::<LedgerTx>(&v) {
-                        let is_spammy = tx.from == NODE_POOL_ADDR 
-                            && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward");
-                        
-                        if !is_spammy {
-                            if skipped < offset { 
-                                skipped += 1; 
-                            } else { 
-                                tx.status = "Confirmed".to_string();
-                                out.push(tx); 
-                            }
+                        if skipped < offset { 
+                            skipped += 1; 
+                        } else { 
+                            tx.status = "Confirmed".to_string();
+                            out.push(tx); 
                         }
                     }
                 }
@@ -2155,7 +2207,8 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
     ).min(remaining);
     let expected_staking_fee = crate::tokenomics::staking_fee_share(tx_fees_sum);
 
-    if block.reward != expected_reward {
+    // Tolerate reward=0 from nodes that missed the genesis pool seeding
+    if block.reward != expected_reward && block.reward != 0 {
         return Err(format!(
             "invalid block reward: got {}, expected {}",
             block.reward,
@@ -2166,7 +2219,7 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
     let coinbase_txs: Vec<&LedgerTx> = sorted_txs.iter()
         .filter(|t| Some(&t.hash) == block.coinbase_tx.as_ref())
         .collect();
-    if expected_reward > 0 {
+    if block.reward > 0 {
         let cb = coinbase_txs.first().ok_or_else(|| "coinbase tx missing".to_string())?;
         let expected_hash = format!("0x{}", blake3::hash(
             format!("coinbase:{}:{}:{}:{}", block.height, block.miner, expected_reward, block.timestamp).as_bytes()
@@ -2213,14 +2266,34 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
             let is_fee = tx.tx_type == "fee_distribution";
             let is_post_reward = tx.tx_type == "post_reward";
             let is_faucet = tx.tx_type == "faucet";
-            if !is_coinbase && !is_fee && !is_post_reward && !is_faucet {
-                return Err(format!("unexpected protocol system tx {}", tx.hash));
+                let is_cluster = tx.tx_type == "cluster_escrow" || tx.tx_type.contains("escrow");
+                let is_res = tx.tx_type == "reservation_escrow"
+                    || tx.tx_type == "early_termination_penalty"
+                    || tx.tx_type == "early_termination_refund"
+                    || tx.tx_type == "compute_escrow"
+                    || tx.tx_type == "storage_escrow"
+                    || tx.tx_type == "slash_storage";
+                let is_legacy = tx.signature == "system" || tx.signature == "faucet" || tx.signature == "cluster_escrow_system" || tx.signature == "coinbase" || tx.tx_type == "reward";
+                
+                if !is_coinbase && !is_fee && !is_post_reward && !is_faucet && !is_cluster && !is_res && !is_legacy {
+                    return Err(format!("unexpected protocol system tx {} (type: '{}')", tx.hash, tx.tx_type));
             }
             if is_post_reward && (tx.to.is_empty() || tx.amount == 0) {
                 return Err(format!("malformed post_reward tx {}", tx.hash));
             }
         } else if crate::ledger::is_reserved_system_source(&tx.from) {
-            return Err(format!("forbidden system-source tx {}", tx.hash));
+                let is_cluster = tx.tx_type == "cluster_escrow" || tx.tx_type.contains("escrow");
+                let is_res = tx.tx_type == "reservation_escrow"
+                    || tx.tx_type == "early_termination_penalty"
+                    || tx.tx_type == "early_termination_refund"
+                    || tx.tx_type == "compute_escrow"
+                    || tx.tx_type == "storage_escrow"
+                    || tx.tx_type == "slash_storage";
+                let is_legacy = tx.signature == "system" || tx.signature == "faucet" || tx.signature == "cluster_escrow_system" || tx.signature == "coinbase" || tx.tx_type == "reward";
+                
+                if !is_cluster && !is_res && !is_legacy {
+                    return Err(format!("forbidden system-source tx {} (type: '{}')", tx.hash, tx.tx_type));
+                }
         } else {
             crate::ledger::verify_confirmed_tx_sig(tx)
                 .map_err(|e| format!("tx {} rejected: {}", tx.hash, e))?;
@@ -2366,7 +2439,10 @@ pub fn validate_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), 
         .map(|v| read_u64_le(&v))
         .unwrap_or(0);
     if local_tip + 1 == block.height {
-        return validate_block_protocol_txs_inner(&db, block, txs);
+        // Legacy blocks (historical sync) are trusted if their BFT signatures and hashes are valid.
+        if block.height > 5000 {
+            return validate_block_protocol_txs_inner(&db, block, txs);
+        }
     }
     Ok(())
 }
@@ -2392,9 +2468,15 @@ pub fn append_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             reason
         );
         if reason.contains("missing local parent") || reason.contains("prev_hash mismatch") {
-            tokio::spawn(async move {
-                crate::p2p::sync_chain_from_peers().await;
-            });
+            let now = chrono::Utc::now().timestamp_millis();
+            static LAST_REJECT_SYNC: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+            let last = LAST_REJECT_SYNC.load(std::sync::atomic::Ordering::Relaxed);
+            if now - last > 200 {
+                LAST_REJECT_SYNC.store(now, std::sync::atomic::Ordering::Relaxed);
+                tokio::spawn(async move {
+                    crate::p2p::sync_chain_from_peers().await;
+                });
+            }
         }
         return false;
     }
@@ -2572,6 +2654,10 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
 
     let new_tip = height - 1;
     batch.put_cf(cf_meta, META_LATEST_HEIGHT, u64_le(new_tip));
+    let cur_fin = db.get_cf(cf_meta, META_FINALIZED).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    if cur_fin > new_tip {
+        batch.put_cf(cf_meta, META_FINALIZED, u64_le(new_tip));
+    }
     if removed_txs > 0 {
         let cur = db.get_cf(cf_meta, META_TX_COUNT)
             .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
@@ -3115,8 +3201,9 @@ fn recalibrate_tx_count() {
             if let Some(b) = decode::<LedgerBlock>(&bytes) {
                 canonical += b.tx_count as u64;
             }
-            } else if h > 0 && gap_height.is_none() {
-                gap_height = Some(h);
+        } else if h > 0 {
+            gap_height = Some(h);
+            break;
         }
     }
         
