@@ -26,7 +26,7 @@ pub fn os_unprotect(data: &[u8]) -> Vec<u8> {
     }
     #[cfg(not(windows))]
     {
-        if data == b"ego-keyring-protected" {
+        if data == b"ego-keyring-protected" || data == b"ego-keyring-seed-v1" {
             use base64::Engine as _;
             if let Ok(entry) = keyring::Entry::new("ego-desktop", "wallet-seed") {
                 if let Ok(pw) = entry.get_password() {

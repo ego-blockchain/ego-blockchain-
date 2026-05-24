@@ -1302,17 +1302,17 @@ const WalletPage: React.FC = () => {
               </button>
             )}
             <div className="flex gap-1">
-              {(['all', 'sent', 'received', 'rewards'] as const).map(t => (
+              {(['all', 'sent', 'received'] as const).map(t => (
                 <button
                   key={t}
                   onClick={() => { setTab(t); setTxPage(1); }}
                   className={`px-3 py-1 rounded-lg text-xs capitalize transition ${
                     tab === t
-                      ? t === 'rewards' ? 'bg-yellow-500/20 text-yellow-300 border border-yellow-500/40' : 'bg-blue-600 text-white'
+                      ? 'bg-blue-600 text-white'
                       : 'text-gray-400 hover:bg-gray-700'
                   }`}
                 >
-                  {t === 'rewards' ? '⚡ Rewards' : t}
+                  {t}
                 </button>
               ))}
             </div>
