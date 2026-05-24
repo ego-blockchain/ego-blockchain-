@@ -7148,6 +7148,7 @@ async fn handle_block_vote(
     };
 
     let finalized_canonical = {
+        // Scoping the lock ensures the MutexGuard is dropped before any .await
         let finalized = finalized_at_height();
         finalized.get(&height).cloned()
     };

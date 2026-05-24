@@ -940,10 +940,20 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     if block.height > cur_height {
         batch.put_cf(cf_meta, META_LATEST_HEIGHT, u64_le(block.height));
     }
+    // Only count non-system/non-reward transactions for the global counter
+    // so the Explorer pagination matches the visible user transactions.
+    let mut real_user_txs = 0u64;
+    for tx in &confirmed_txs {
+        let is_system = tx.from == NODE_POOL_ADDR 
+            && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward");
+        if !is_system {
+            real_user_txs += 1;
+        }
+    }
+
     let cur_tx_count = db.get_cf(cf_meta, META_TX_COUNT)
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-    let adjusted = cur_tx_count + block.tx_count as u64;
-    batch.put_cf(cf_meta, META_TX_COUNT, u64_le(adjusted));
+    batch.put_cf(cf_meta, META_TX_COUNT, u64_le(cur_tx_count + real_user_txs));
 
     // Persist confirmed nonces atomically with the block write so replay
     // protection survives node restarts.  Only non-system senders have nonces.
@@ -3199,7 +3209,13 @@ fn recalibrate_tx_count() {
     for h in 0..=tip {
         if let Ok(Some(bytes)) = db.get_cf(cf_blocks, height_key(h)) {
             if let Some(b) = decode::<LedgerBlock>(&bytes) {
-                canonical += b.tx_count as u64;
+                // Recalibrate based on user transactions only
+                let txs = get_txs_for_block(b.height);
+                for tx in txs {
+                    let is_system = tx.from == NODE_POOL_ADDR 
+                        && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward");
+                    if !is_system { canonical += 1; }
+                }
             }
         } else if h > 0 {
             gap_height = Some(h);

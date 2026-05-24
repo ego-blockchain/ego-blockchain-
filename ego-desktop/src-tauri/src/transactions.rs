@@ -232,8 +232,18 @@ pub async fn get_transaction_history(
         return Ok(vec![]);
     }
 
-    let mut txs: Vec<LedgerTx> = crate::chain_db::get_tx_history_for_addr(&my_addr);
+    let txs: Vec<LedgerTx> = crate::chain_db::get_tx_history_for_addr(&my_addr);
+    let mut filtered_txs = Vec::with_capacity(txs.len());
 
-    txs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-    Ok(txs)
+    for tx in txs {
+        // Filter out system spam to prevent burying real user transfers
+        let is_spammy = tx.from == crate::chain_db::NODE_POOL_ADDR 
+            && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward");
+        if !is_spammy {
+            filtered_txs.push(tx);
+        }
+    }
+
+    filtered_txs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    Ok(filtered_txs)
 }
