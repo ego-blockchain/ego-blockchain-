@@ -6370,7 +6370,14 @@ fn merge_remote_chain_blocking(
                     || new_blocks.iter().any(|b| b.height == parent_height);
                 
                 if !has_parent {
-                    tracing::warn!("[P2P] Trusted block #{} deferred (missing parent). Sync required.", block.height);
+                    static LAST_DEFER_LOG: AtomicI64 = AtomicI64::new(0);
+                    let now = Utc::now().timestamp();
+                    let last = LAST_DEFER_LOG.load(Ordering::Relaxed);
+                    
+                    if now - last > 5 { // Only log deferral every 5 seconds
+                        tracing::info!("[P2P] Blocks starting at #{} deferred (syncing missing parents...)", block.height);
+                        LAST_DEFER_LOG.store(now, Ordering::Relaxed);
+                    }
                     peer_ahead = true;
                     continue; // Skip appending this block until parent is synced
                 }
