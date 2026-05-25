@@ -10,7 +10,7 @@ use libp2p::{
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::{collections::HashMap, io, sync::{Mutex, OnceLock}, time::Duration};
 use tauri::Manager;
 use tokio::sync::{mpsc, oneshot};
