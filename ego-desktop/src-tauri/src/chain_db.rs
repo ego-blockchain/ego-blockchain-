@@ -2609,7 +2609,16 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
     for h in height..=tip {
         if let Ok(Some(bytes)) = db.get_cf(cf_blocks, height_key(h)) {
             if let Some(b) = decode::<LedgerBlock>(&bytes) {
-                removed_txs += b.tx_count as u64;
+                // Re-derive user tx count for this block so we don't over-subtract
+                // the META_TX_COUNT (which only tracks non-system txs).
+                let block_txs_list = get_txs_for_block(b.height);
+                for tx in block_txs_list {
+                    let is_system = tx.from == NODE_POOL_ADDR 
+                        && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward");
+                    if !is_system {
+                        removed_txs += 1;
+                    }
+                }
                 let block_tx_keys: Vec<Box<[u8]>> = db.prefix_iterator_cf(cf_block_txs, height_key(h))
                     .filter_map(|item| item.ok().map(|(k, _)| k))
                     .take_while(|k| k.starts_with(&height_key(h)))
@@ -3223,14 +3232,9 @@ fn recalibrate_tx_count() {
         }
     }
         
-        drop(db); // Drop lock before mutating
-        
-        if let Some(h) = gap_height {
-            tracing::error!("CRITICAL: Gap detected in blockchain at height {}. Truncating to recover.", h);
-            truncate_from(h);
-            // Re-run recalibration after truncation
-            return recalibrate_tx_count();
-        }
+    if let Some(h) = gap_height {
+        tracing::error!("CRITICAL: Gap detected in blockchain at height {}. Forward state will be overwritten on next block.", h);
+    }
 
         let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
         let cf_meta = match db.cf_handle(CF_META) { Some(c) => c, None => return };
