@@ -1050,6 +1050,38 @@ pub fn known_validator_count() -> usize {
     known_validators().len()
 }
 
+static MACHINE_TO_ADDR: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static IP_TO_ADDR: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn validate_unique_identity(addr: &str, machine_id: &str, endpoint: &str) -> Result<(), String> {
+    if machine_id.is_empty() { return Ok(()); }
+    
+    // Validate Machine ID uniqueness
+    let mut m_map = MACHINE_TO_ADDR.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    if let Some(existing) = m_map.get(machine_id) {
+        if existing != addr {
+            return Err(format!("Hardware ID {} already associated with node {}", machine_id, existing));
+        }
+    }
+    m_map.insert(machine_id.to_string(), addr.to_string());
+
+    // Validate IP uniqueness to prevent "echo" faking
+    if !endpoint.is_empty() {
+        let mut ip_map = IP_TO_ADDR.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+        let ip = endpoint.split('/').nth(2).unwrap_or("");
+        if !ip.is_empty() && ip != "127.0.0.1" {
+            if let Some(existing_addr) = ip_map.get(ip) {
+                if existing_addr != addr {
+                    return Err(format!("IP address {} is already running node {}", ip, existing_addr));
+                }
+            }
+            ip_map.insert(ip.to_string(), addr.to_string());
+        }
+    }
+
+    Ok(())
+}
+
 pub fn register_known_validator(address: &str) {
     if address.is_empty() { return; }
     if slashed_validators().contains(address) { return; }
@@ -1203,7 +1235,7 @@ pub fn get_discovered_relay_nodes() -> Vec<String> {
     peer_relay_nodes().values().cloned().collect()
 }
 
-fn current_wallet_announce_keys() -> (String, String) {
+pub(crate) fn current_wallet_announce_keys() -> (String, String) {
     if let Some(kp) = crate::app::global_app_state().get_keypair() {
         return (
             hex::encode(kp.dilithium_public_key().key_data),
@@ -1257,9 +1289,10 @@ fn peer_announce_signing_data(
     vrf_pubkey: &str,
     staked_amount: u64,
     genesis_hash: &str,
+    machine_id: &str,
 ) -> Vec<u8> {
     format!(
-        "ego/peer-announce/v1:{}:{}:{}:{}:{}:{}:{}:{}",
+        "ego/peer-announce/v2:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         address,
         endpoint,
         endpoints.join(","),
@@ -1268,10 +1301,11 @@ fn peer_announce_signing_data(
         vrf_pubkey,
         staked_amount,
         genesis_hash,
+        machine_id,
     ).into_bytes()
 }
 
-fn sign_peer_announce(
+pub(crate) fn sign_peer_announce(
     address: &str,
     endpoint: &str,
     endpoints: &[String],
@@ -1280,10 +1314,11 @@ fn sign_peer_announce(
     vrf_pubkey: &str,
     staked_amount: u64,
     genesis_hash: &str,
+    machine_id: &str,
 ) -> String {
     let Some(kp) = current_wallet_keypair_for_announce() else { return String::new(); };
     let data = peer_announce_signing_data(
-        address, endpoint, endpoints, coverage_score, dilithium_pubkey, vrf_pubkey, staked_amount, genesis_hash,
+        address, endpoint, endpoints, coverage_score, dilithium_pubkey, vrf_pubkey, staked_amount, genesis_hash, machine_id
     );
     hex::encode(kp.sign_dilithium(&data).signature_data)
 }
@@ -1297,6 +1332,7 @@ fn verify_peer_announce_identity(
     vrf_pubkey: &str,
     staked_amount: u64,
     genesis_hash: &str,
+    machine_id: &str,
     signature: &str,
 ) -> bool {
     let dil_pk = match hex::decode(dilithium_pubkey) {
@@ -1317,7 +1353,7 @@ fn verify_peer_announce_identity(
         _ => return false,
     };
     let data = peer_announce_signing_data(
-        address, endpoint, endpoints, coverage_score, dilithium_pubkey, vrf_pubkey, staked_amount, genesis_hash,
+        address, endpoint, endpoints, coverage_score, dilithium_pubkey, vrf_pubkey, staked_amount, genesis_hash, machine_id
     );
     let pk = ego_core::PublicKey::dilithium2(dil_pk);
     let sig = ego_core::Signature::dilithium2(sig);
@@ -1326,7 +1362,7 @@ fn verify_peer_announce_identity(
         return true;
     }
     
-    // Fallback for legacy peers (Relays/Oracles) without the endpoints field array
+    // Fallback for v1 peers
     let data_legacy = format!(
         "ego/peer-announce/v1:{}:{}:{}:{}:{}:{}:{}",
         address, endpoint, coverage_score, dilithium_pubkey, vrf_pubkey, staked_amount, genesis_hash
@@ -1381,6 +1417,8 @@ pub enum P2PMessage {
         genesis_hash: String,
         #[serde(default)]
         signature: String,
+        #[serde(default)]
+        machine_id: String,
     },
     ChatMessage {
         bundle: String,
@@ -2131,6 +2169,7 @@ pub async fn sync_chain_from_peers() {
 }
 
 pub async fn broadcast_peer_announce(app: Option<&tauri::AppHandle<tauri::Wry>>) {
+    let state = crate::app::global_app_state();
     let (address, registry, active_id) = tokio::task::spawn_blocking(|| {
         (
             crate::ledger::Ledger::load().address,
@@ -2144,9 +2183,6 @@ pub async fn broadcast_peer_announce(app: Option<&tauri::AppHandle<tauri::Wry>>)
         .find(|w| w.id == active_id)
         .map(|w| w.name.clone())
         .unwrap_or_else(|| "Ego Node".to_string());
-
-    let state = crate::app::global_app_state();
-
     let (my_city, my_country) = {
         let cache = state.cache.lock().unwrap();
         if let Some(ref cs) = cache.coverage_status {
@@ -2186,6 +2222,7 @@ pub async fn broadcast_peer_announce(app: Option<&tauri::AppHandle<tauri::Wry>>)
     let (dilithium_pubkey_hex, vrf_pubkey_hex) = current_wallet_announce_keys();
     let staked_amount = crate::ledger::Ledger::load().staked_amount;
     let genesis_hash = crate::ledger::GENESIS_HASH.to_string();
+    let machine_id = crate::commands::coverage::get_machine_id_cached();
     let signature = sign_peer_announce(
         &address,
         &my_endpoint,
@@ -2195,6 +2232,7 @@ pub async fn broadcast_peer_announce(app: Option<&tauri::AppHandle<tauri::Wry>>)
         &vrf_pubkey_hex,
         staked_amount,
         &genesis_hash,
+        &machine_id,
     );
     let msg = P2PMessage::PeerAnnounce {
         address, name,
@@ -2208,6 +2246,7 @@ pub async fn broadcast_peer_announce(app: Option<&tauri::AppHandle<tauri::Wry>>)
         staked_amount,
         genesis_hash,
         signature,
+        machine_id,
     };
 
 
@@ -4865,12 +4904,18 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
             }
         }
 
-        P2PMessage::PeerAnnounce { address, name, endpoint, endpoints, city, country, coverage_score, dilithium_pubkey, vrf_pubkey, staked_amount, genesis_hash, signature } => {
+        P2PMessage::PeerAnnounce { address, name, endpoint, endpoints, city, country, coverage_score, dilithium_pubkey, vrf_pubkey, staked_amount, genesis_hash, signature, machine_id } => {
             if genesis_hash != crate::ledger::GENESIS_HASH {
-                eprintln!("[P2P] Rejected peer {} — genesis mismatch (got '{}', want '{}')",
-                    address, genesis_hash, crate::ledger::GENESIS_HASH);
+                tracing::warn!("[P2P] Rejected peer {} — Parallel network attempt detected (Genesis mismatch)", address);
                 return;
             }
+
+            // Sybil Protection: Verify hardware fingerprint is unique for this address
+            if let Err(e) = validate_unique_identity(&address, &machine_id, &endpoint) {
+                tracing::warn!("[P2P] Rejected peer {} — Sybil/Parallel identity violation: {}", address, e);
+                return;
+            }
+
             let identity_verified = verify_peer_announce_identity(
                 &address,
                 &endpoint,
@@ -4880,6 +4925,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                 &vrf_pubkey,
                 staked_amount,
                 &genesis_hash,
+                &machine_id,
                 &signature,
             );
             if identity_verified {
@@ -4964,6 +5010,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                         let (dil_hex, vrf_hex) = current_wallet_announce_keys();
                         let endpoints = vec![my_ep.clone()];
                         let genesis_hash = crate::ledger::GENESIS_HASH.to_string();
+                        let machine_id = crate::commands::coverage::get_machine_id_cached();
                         let signature = sign_peer_announce(
                             &my_addr,
                             &my_ep,
@@ -4973,6 +5020,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                             &vrf_hex,
                             staked_amount,
                             &genesis_hash,
+                            &machine_id,
                         );
                         let announce = P2PMessage::PeerAnnounce {
                             address:          my_addr,
@@ -4987,6 +5035,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                             staked_amount,
                             genesis_hash,
                             signature,
+                            machine_id,
                         };
                         if let Err(e) = send_message_any(&[ep3.clone()], &announce).await {
                             if !e.contains("none of the requested protocols") {

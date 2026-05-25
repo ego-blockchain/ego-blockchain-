@@ -48,8 +48,9 @@ interface P2pStatus {
 }
 
 function extractPeerId(endpoint: string): string {
-  const m = endpoint.match(/\/p2p\/([A-Za-z0-9]+)$/);
-  return m ? m[1] : endpoint;
+  const safeEndpoint = endpoint || ''; // Ensure endpoint is a string, even if it's null/undefined
+  const m = safeEndpoint.match(/\/p2p\/([A-Za-z0-9]+)$/);
+  return m ? m[1] : safeEndpoint;
 }
 
 function shortPeerId(id: string): string {

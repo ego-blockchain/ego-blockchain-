@@ -46,6 +46,7 @@ interface Contact {
   status: string;
   added_at: number;
   endpoint: string;
+  machine_id?: string;
 }
 
 interface Message {
@@ -754,7 +755,10 @@ useEffect(() => {
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="text-sm font-medium truncate">{c.name || 'Unknown'}</div>
+                    <div className="flex flex-col gap-0.5">
                       <div className="text-xs text-gray-400 font-mono">{truncAddr(c.address)}</div>
+                      {c.machine_id && <div className="text-[10px] text-gray-500 font-mono italic">ID: {c.machine_id.slice(0, 8)}…</div>}
+                    </div>
                     </div>
                   </div>
                   <div className="flex gap-1.5">
