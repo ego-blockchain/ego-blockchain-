@@ -19,6 +19,7 @@ pub fn init_global_app_state(state: Arc<AppState>) {
 pub struct PeerInfo {
     pub address:   String,
     pub name:      String,
+    #[serde(skip_serializing)] // Privacy: Never expose raw IPs/Endpoints to the UI
     pub endpoint:  String,
     pub last_seen: i64,
     #[serde(default)]

@@ -260,6 +260,18 @@ function formatAgo(ts: number) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
+function isRewardTx(tx: LedgerTx): boolean {
+  const systemPrefixes = [
+    'egot1faucet', 'egot1genesis', 'egot1staking', 'egot1system',
+    'egot1coverage', 'egot1nodereward', 'egot1collateral', 'egot1slashpool',
+    'egot1storagefees', 'egot1burn', 'egot1nodepool', 'egot1rewards'
+  ];
+  return (
+    ['reward', 'coinbase', 'fee_distribution', 'post_reward', 'faucet'].includes(tx.tx_type || '') ||
+    systemPrefixes.some(p => tx.from.startsWith(p))
+  );
+}
+
 const WalletPage: React.FC = () => {
   const { wallet, reload: reloadWallet } = useWallet();
   const myAddress = wallet?.address ?? '';
@@ -897,16 +909,10 @@ const WalletPage: React.FC = () => {
     if (showAddresses && extAddresses.length === 0) loadExternalAddresses();
   }, [showAddresses]);
 
-  const isRewardTx = (tx: LedgerTx) =>
-    tx.tx_type === 'reward' || tx.tx_type === 'coinbase' ||
-    tx.from.startsWith('egot1rewards') || tx.from.startsWith('egot1faucet') ||
-    tx.from.startsWith('egot1staking') || tx.from.startsWith('egot1coinbase');
-
   const filteredTxs = txs.filter(tx => {
-    if (tab === 'rewards')  return isRewardTx(tx);
-    if (tab === 'sent')     return tx.from === myAddress && !isRewardTx(tx);
-    if (tab === 'received') return tx.to === myAddress   && !isRewardTx(tx);
-    return !isRewardTx(tx);
+    if (tab === 'sent')     return tx.from === myAddress;
+    if (tab === 'received') return tx.to === myAddress;
+    return true;
   });
   const pagedTxs = filteredTxs.slice((txPage - 1) * txPageSize, txPage * txPageSize);
 
@@ -1321,10 +1327,10 @@ const WalletPage: React.FC = () => {
 
         {filteredTxs.length === 0 ? (
           <div className="py-12 text-center text-gray-500">
-            <div className="text-4xl mb-3">{tab === 'rewards' ? '⚡' : '📋'}</div>
-            <div className="text-sm">{tab === 'rewards' ? 'No rewards yet' : 'No transactions yet'}</div>
+            <div className="text-4xl mb-3">📋</div>
+            <div className="text-sm">No transactions yet</div>
             <div className="text-xs mt-1 text-gray-600">
-              {tab === 'rewards' ? 'Mine a block to earn your first reward' : 'Send your first transaction to get started'}
+              Send your first transaction to get started
             </div>
           </div>
         ) : (
@@ -1335,7 +1341,7 @@ const WalletPage: React.FC = () => {
               const isSent = !isReward && tx.from === myAddress;
               const rewardLabel = tx.tx_type === 'coinbase' ? 'Block Reward'
                 : tx.from.startsWith('egot1staking') ? 'Staking Reward'
-                : tx.from.startsWith('egot1faucet') ? 'Faucet'
+                : (tx.from.startsWith('egot1faucet') || tx.tx_type === 'faucet') ? 'Test Coins'
                 : 'Mining Reward';
               return (
                 <button

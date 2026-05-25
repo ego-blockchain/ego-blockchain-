@@ -34,7 +34,9 @@ Formatting: use `###` for section/category headers in responses. Use `-` bullet 
 - **Key encapsulation (Kyber768)**: used for Messenger shared-key establishment and future cross-chain bridging. Keys zeroized (wiped from memory) on drop.
 - Crates: ego-core, ego-vm (WASM via wasmtime, fuel metering), ego-rollup, urego-compiler, ego-p2p (libp2p 0.56 + Kademlia DHT).
 - JSON-RPC 2.0 server: http://127.0.0.1:47395 (POST /, WS /ws, GET /health). Used by JS SDK and dApps.
-
+### P2P & Identity
+- **Peer Identity**: Every node has a unique `peer_id` (libp2p) and a hardware-bound `machine_id`.
+- **Peer Announce**: Nodes broadcast `PeerAnnounce` messages via Gossipsub. Identity is verified using a 10-point signature check including the `machine_id` to prevent Sybil attacks.
 ## Architecture — Production Hardened
 - **Storage**: RocksDB with 7 column families (blocks, txs, block_txs, addr_txs, balances, recent_txs, meta). Atomic writes via WriteBatch.
 - **Mempool**: 16 shards, EIP-1559 priority fees (`priority_fee_uegoc`), drains by total fee descending, ~100k TPS target.

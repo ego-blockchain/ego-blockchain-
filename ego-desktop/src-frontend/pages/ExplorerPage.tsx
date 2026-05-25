@@ -366,11 +366,12 @@ const ExplorerPage: React.FC = () => {
                                           : tx.tx_type === 'retrieve_file' ? '📥 Retrieve'
                                           : tx.tx_type === 'slash_storage' ? '⚡ Slash'
                                           : tx.tx_type === 'transfer'      ? '↔️ Transfer'
+                                          : tx.tx_type === 'faucet'        ? '🚰 Test Coins'
                                           : tx.tx_type                     ? tx.tx_type
-                                          : tx.from.startsWith('egot1faucet') ? '🚰 Faucet'
+                                          : tx.from.startsWith('egot1faucet') ? '🚰 Test Coins'
                                           : '↔️ Transfer';
                         const fromLabel = tx.from.startsWith('egot1rewards') ? 'Rewards Pool'
-                                        : tx.from.startsWith('egot1faucet')  ? 'Faucet'
+                                        : tx.from.startsWith('egot1faucet')  ? 'Test Coins Faucet'
                                         : shortAddr(tx.from);
                         return (
                         <tr

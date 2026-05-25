@@ -657,6 +657,7 @@ pub struct RemoteNodeInfo {
     pub balance_egoc:   u64,
     pub formatted:      String,
     pub block_height:   u64,
+    #[serde(skip_serializing)] // Privacy: Mask internal RPC routing from frontend
     pub rpc_url:        String,
 }
 

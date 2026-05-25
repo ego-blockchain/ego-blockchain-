@@ -6,8 +6,12 @@ use tauri::{Manager, State};
 
 static MACHINE_ID: OnceCell<String> = OnceCell::new();
 
-fn cached_machine_id() -> String {
+pub fn get_machine_id_cached() -> String {
     MACHINE_ID.get_or_init(get_machine_id).clone()
+}
+
+fn cached_machine_id() -> String {
+    get_machine_id_cached()
 }
 
 #[derive(Deserialize)]

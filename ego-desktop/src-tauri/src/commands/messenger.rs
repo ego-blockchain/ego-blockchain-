@@ -580,19 +580,36 @@ pub async fn approve_contact_request(
                 .find(|w| w.id == active_id)
                 .map(|w| w.name.clone())
                 .unwrap_or_else(|| my_name.trim().to_string());
+            let (dil_hex, vrf_hex) = p2p::current_wallet_announce_keys();
+            let endpoints = vec![my_endpoint.clone()];
+            let coverage_score = crate::poc::my_coverage_score();
+            let staked_amount  = crate::ledger::Ledger::load().staked_amount;
+            let machine_id = crate::commands::coverage::get_machine_id_cached();
+            let signature = p2p::sign_peer_announce(
+                &my_addr,
+                &my_endpoint,
+                &endpoints,
+                coverage_score,
+                &dil_hex,
+                &vrf_hex,
+                staked_amount,
+                crate::ledger::GENESIS_HASH,
+                &machine_id,
+            );
             let announce = p2p::P2PMessage::PeerAnnounce {
                 address:   my_addr.clone(),
                 name:      my_name_str,
                 endpoint:  my_endpoint.clone(),
-                endpoints: vec![my_endpoint.clone()],
+                endpoints,
                 city:      None,
                 country:   None,
-                coverage_score: 0,
-                dilithium_pubkey: String::new(),
-                vrf_pubkey: String::new(),
-                staked_amount: 0,
+                coverage_score,
+                dilithium_pubkey: dil_hex,
+                vrf_pubkey: vrf_hex,
+                staked_amount,
                 genesis_hash: crate::ledger::GENESIS_HASH.to_string(),
-                signature: String::new(),
+                signature,
+                machine_id,
             };
             if let Err(e) = p2p::send_message(&resolved_peer_ep, &announce).await {
                 eprintln!("[P2P] Could not send PeerAnnounce after approval: {}", e);
