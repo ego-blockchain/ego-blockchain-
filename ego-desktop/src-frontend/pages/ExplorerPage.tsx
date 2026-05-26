@@ -29,6 +29,7 @@ interface LedgerTx {
   cid?: string;
   fee_uegoc?: number;
   priority_fee_uegoc?: number;
+  is_private?: boolean;
 }
 
 interface FileEvent {
@@ -159,22 +160,17 @@ const ExplorerPage: React.FC = () => {
       Promise.race([p, new Promise<T>(resolve => setTimeout(() => resolve(fallback), ms))]);
 
     try {
-      const [b, t, n, fe] = await Promise.all([
-        withTimeout(invoke<LedgerBlock[]>('get_blocks', { offset: 0, limit: pageSize }).catch(() => [] as LedgerBlock[]), [] as LedgerBlock[]),
-        withTimeout(invoke<LedgerTx[]>('get_all_transactions', { offset: 0, limit: pageSize }).catch(() => [] as LedgerTx[]), [] as LedgerTx[]),
+      const [n, fe] = await Promise.all([
         withTimeout(invoke<NetworkStats>('get_network_stats').catch(() => null), null),
         withTimeout(invoke<FileEvent[]>('get_file_events').catch(() => [] as FileEvent[]), [] as FileEvent[]),
       ]);
 
-      if (!silent) {
-        setBlocks(b);
-        setTxs(t);
-        setFileEvents(fe);
-      } else {
-        if (b.length > 0) setBlocks(prev => b.length >= prev.length ? b : prev);
-        if (t.length > 0) setTxs(prev => t.length >= prev.length ? t : prev);
-        if (fe.length > 0) setFileEvents(fe);
+      if (fe) {
+        // Ensure file events are displayed from newest to oldest
+        const sortedFiles = [...fe].sort((a, b) => b.timestamp - a.timestamp);
+        setFileEvents(sortedFiles);
       }
+
       if (n) setNetStats(n);
       invoke<Tokenomics>('get_tokenomics').then(setTokenomics).catch(() => {});
     } finally {
@@ -360,7 +356,8 @@ const ExplorerPage: React.FC = () => {
                       </tr>
                     ) : (
                       txs.map(tx => {
-                        const txTypeLabel = tx.tx_type === 'reward'        ? '🏆 Reward'
+                        const txTypeLabel = tx.is_private                  ? '🛡 Shielded'
+                                          : tx.tx_type === 'reward'        ? '🏆 Reward'
                                           : tx.tx_type === 'store_data'    ? '📦 Store'
                                           : tx.tx_type === 'store_file'    ? '📦 Store'
                                           : tx.tx_type === 'retrieve_file' ? '📥 Retrieve'
@@ -373,6 +370,8 @@ const ExplorerPage: React.FC = () => {
                         const fromLabel = tx.from.startsWith('egot1rewards') ? 'Rewards Pool'
                                         : tx.from.startsWith('egot1faucet')  ? 'Test Coins Faucet'
                                         : shortAddr(tx.from);
+                        const fromFinal = tx.from === 'Shielded' ? <span className="text-yellow-500/70">🛡 Shielded</span> : fromLabel;
+                        const toFinal   = tx.to   === 'Shielded' ? <span className="text-yellow-500/70">🛡 Shielded</span> : shortAddr(tx.to);
                         return (
                         <tr
                           key={tx.hash}
@@ -380,12 +379,14 @@ const ExplorerPage: React.FC = () => {
                           className="hover:bg-gray-700/40 cursor-pointer transition"
                         >
                           <td className="px-5 py-3 font-mono text-xs text-blue-400">{shortHash(tx.hash)}</td>
-                          <td className="px-5 py-3 text-xs text-gray-300">{txTypeLabel}</td>
+                          <td className="px-5 py-3 text-xs text-gray-300">
+                            <span className={tx.is_private ? 'text-yellow-400 font-bold' : ''}>{txTypeLabel}</span>
+                          </td>
                           <td className="px-5 py-3 font-mono text-xs text-gray-400">
                             {tx.block_height != null ? `#${tx.block_height.toLocaleString()}` : '—'}
                           </td>
-                          <td className="px-5 py-3 font-mono text-xs text-gray-400">{fromLabel}</td>
-                          <td className="px-5 py-3 font-mono text-xs text-gray-400">{shortAddr(tx.to)}</td>
+                          <td className="px-5 py-3 font-mono text-xs text-gray-400">{fromFinal}</td>
+                          <td className="px-5 py-3 font-mono text-xs text-gray-400">{toFinal}</td>
                           <td className="px-5 py-3 text-right text-gray-200">{(tx.amount / 1_000_000).toFixed(2)} EGOC</td>
                           <td className="px-5 py-3 text-right">
                             <span className={`text-xs px-2 py-0.5 rounded-full ${

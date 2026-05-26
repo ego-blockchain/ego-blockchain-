@@ -6468,10 +6468,10 @@ fn merge_remote_chain_blocking(
                     block.prev_hash.clone()
                 };
 
-                if !has_parent {
-                    tracing::debug!("[P2P] Untrusted block #{} deferred (missing parent). Sync required.", block.height);
+                if !has_parent && block.height > local_tip {
+                    tracing::debug!("[P2P] Missing parent for block #{}, forcing sync from peers", block.height);
                     peer_ahead = true;
-                    continue; // Skip appending this block until parent is synced
+                    continue; 
                 }
 
                 if block.prev_hash != expected_prev {

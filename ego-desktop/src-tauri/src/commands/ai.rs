@@ -202,6 +202,14 @@ Advanced: EGO-50 MEV Protection, EGO-51 Fee Market, EGO-52 Governance, EGO-53 DI
 - **Results**: per-option stake_power, knowledge_power, and combined_power shown after voting closes. Results stored on-chain in RocksDB CF_DAO.
 - Governance page: proposal list (Active/All/Passed/Failed/Expired tabs), create proposal modal, proposal detail modal with stake vote + knowledge test + results bars.
 
+### Shielded Transactions (Privacy)
+- **Identity Masking**: Transactions can be marked as private, replacing public keys with a **🛡 Shielded** badge on the ledger.
+- **Tracking Prevention**: The Explorer blocks address history searches and 'Holders' lists to prevent profiling of wealthy users.
+- **Public Balance**: Only transparent funds contribute to the public balance view; shielded funds are hidden.
+- **Macro-Transparency**: Uses Supply Distribution metrics to prove decentralization without exposing individual identities.
+- **Whale Protection**: Any transaction $\ge$ 50,000 EGOC is automatically masked as **🛡 Shielded** in the Explorer to prevent tracking of large holders.
+- **ZK-Proofs**: Validity verified via zero-knowledge proofs at the protocol level.
+
 ## App pages
 Wallet (send/receive/QR), Storage (AES-256-GCM upload/download), EgoSafe (encrypt+share egoshare1 bundles), Explorer (live blocks/txs from RocksDB), Earnings (rewards + session counter), Messenger (P2P E2E encrypted chat via DHT inbox), Settings (PIN/recovery/QR keys), Contracts (deploy/call Urego with testnet/mainnet selector + dry run), Coverage, Staking, Market (live prices & charts), Governance (DAO proposals + two-type voting).
 
@@ -322,6 +330,8 @@ pub async fn ask_ego_ai(
         "Ego's DAO uses a unique two-factor voting system: Stake Power (economic weight) and Knowledge Power (score from a proposal-specific quiz). This ensures voters are both invested and informed."
     } else if q.contains("coverage") || q.contains("poc") || q.contains("beacon") {
         "Proof-of-Coverage (PoC) rewards nodes for maintaining high network uptime and reachability. Nodes ping the network, mapping their location to H3 cells, to build a resilient decentralized mesh."
+    } else if q.contains("privacy") || q.contains("shielded") || q.contains("private") || q.contains("mask") {
+        "Ego uses **Shielded Transactions** to ensure financial privacy. When a transaction is private, the sender and receiver addresses are masked with a **🛡 Shielded** badge on the public ledger.\n\n### Privacy Protections\n- **Identity Masking**: Hides public keys from the Explorer and trackers.\n- **Whale Protection**: Any transaction over **50,000 EGOC** is automatically shielded to prevent profiling.\n- **Tracking Prevention**: No address history search or 'Rich Lists' (Holders) to prevent profiling.\n- **Macro-Transparency**: Shows supply distribution audits instead of individual balances.\n- **ZK-Enforced**: Uses Zero-Knowledge logic to verify validity without exposing metadata."
     } else {
         "I am Ego AI.\n\nYou can ask me about Ego's **consensus**, **tokenomics**, **VRF elections**, **sharding**, **smart contracts**, **staking**, **ZK-rollups**, **compute renting**, **EgoSafe**, or **quantum-safe cryptography**!"
     };
