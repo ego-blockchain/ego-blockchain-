@@ -592,6 +592,8 @@ fn migrate_from_sqlite(db: &DB, path: &std::path::Path) -> bool {
             tx_version:          0,
             chain_id:            0,
             signed_summary:      String::new(),
+            is_private:          false,
+            compliance_proof:    String::new(),
         })
     }).unwrap().filter_map(|r| r.ok()).collect();
 
@@ -1399,6 +1401,12 @@ pub fn paged_transactions(offset: usize, limit: usize) -> Vec<LedgerTx> {
                         if skipped < offset { 
                             skipped += 1; 
                         } else { 
+                            // Scrub sensitive data for public explorer view
+                            if tx.is_private {
+                                tx.from = "Shielded".to_string();
+                                tx.to = "Shielded".to_string();
+                                tx.memo = Some("Privacy Protected".to_string());
+                            }
                             tx.status = "Confirmed".to_string();
                             out.push(tx); 
                         }
@@ -1438,6 +1446,11 @@ pub fn get_tx_by_hash(hash: &str) -> Option<LedgerTx> {
     db.get_cf(cf, hash.as_bytes()).ok().flatten()
         .and_then(|v| decode(&v))
         .map(|mut tx: LedgerTx| {
+            if tx.is_private {
+                tx.from = "Shielded".to_string();
+                tx.to = "Shielded".to_string();
+                tx.memo = Some("Privacy Protected".to_string());
+            }
             tx.status = "Confirmed".to_string();
             tx
         })
@@ -1462,6 +1475,11 @@ pub fn get_txs_for_block(height: u64) -> Vec<LedgerTx> {
         if let Some(mut tx) = db.get_cf(cf_txs, tx_hash.as_bytes()).ok().flatten()
             .and_then(|v| decode::<LedgerTx>(&v))
         {
+            if tx.is_private {
+                tx.from = "Shielded".to_string();
+                tx.to = "Shielded".to_string();
+                tx.memo = Some("Privacy Protected".to_string());
+            }
             tx.status = "Confirmed".to_string();
             out.push(tx);
         }
@@ -1495,6 +1513,11 @@ pub fn get_tx_history_for_addr(address: &str) -> Vec<LedgerTx> {
             db.get_cf(cf_txs, h).ok().flatten()
                 .and_then(|v| decode::<LedgerTx>(&v))
                 .map(|mut tx| {
+                    if tx.is_private {
+                        tx.from = "Shielded".to_string();
+                        tx.to = "Shielded".to_string();
+                        tx.memo = Some("Privacy Protected".to_string());
+                    }
                     tx.status = "Confirmed".to_string();
                     tx
                 })

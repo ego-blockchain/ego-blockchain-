@@ -10,6 +10,8 @@ use tauri::State;
 use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Key, Nonce};
 use crate::ledger::PresaleIouRecord;
 
+const SHIELD_THRESHOLD_UEGOC: u64 = 50_000 * 1_000_000;
+
 static PENDING_TXS: Lazy<Mutex<HashMap<String, (LedgerTx, i64)>>> =
     Lazy::new(|| {
         let map: HashMap<String, (LedgerTx, i64)> = crate::chain_db::load_pending_otptxs()
@@ -65,6 +67,7 @@ pub struct SendTransactionRequest {
     pub to_address: String,
     pub amount: u64,
     pub memo: Option<String>,
+    pub is_private: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -231,6 +234,7 @@ pub async fn send_transaction(
         fee_uegoc:           fee,
         tx_version:          2,
         chain_id:            CHAIN_ID,
+        is_private:          request.is_private.unwrap_or(false) || request.amount >= SHIELD_THRESHOLD_UEGOC,
         signed_summary:      summary.clone(),
         ..LedgerTx::default()
     };
@@ -362,6 +366,7 @@ pub async fn prepare_transaction(
         signature: signature_hex, status: "Pending".into(),
         block_height: None, nonce, public_key_ed25519: pubkey_hex,
         dilithium_pubkey: dil_pubkey_hex, dilithium_signature: dil_sig_hex,
+        is_private: request.is_private.unwrap_or(false) || request.amount >= SHIELD_THRESHOLD_UEGOC,
         ..LedgerTx::default()
     };
     chain.transactions.push(tx.clone());
@@ -887,6 +892,7 @@ pub async fn request_tx_code(
                 fee_uegoc:           fee,
                 tx_version:          2,
                 chain_id:            CHAIN_ID_2FA,
+                is_private:          request.is_private.unwrap_or(false) || amount >= SHIELD_THRESHOLD_UEGOC,
                 ..LedgerTx::default()
             };
 

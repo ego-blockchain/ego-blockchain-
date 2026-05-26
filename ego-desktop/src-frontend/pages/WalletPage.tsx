@@ -53,12 +53,14 @@ interface LedgerTx {
   block_height?: number;
   nonce: number;
   tx_type?: string;
+  is_private?: boolean;
 }
 
 interface SendForm {
   to: string;
   amount: string;
   memo: string;
+  isPrivate: boolean;
 }
 
 interface TxResult {
@@ -281,12 +283,12 @@ const WalletPage: React.FC = () => {
   const [txs, setTxs]               = useState<LedgerTx[]>([]);
   const [tab, setTab]               = useState<'all' | 'sent' | 'received' | 'rewards'>('all');
   const [txPage, setTxPage]         = useState(1);
-  const [txPageSize, setTxPageSize] = useState(20);
+  const [txPageSize, setTxPageSize] = useState(25);
   const [clearingPending, setClearingPending] = useState(false);
   const [selectedTx, setSelectedTx] = useState<LedgerTx | null>(null);
   const [showSend, setShowSend]     = useState(false);
   const [showReceive, setShowReceive] = useState(false);
-  const [sendForm, setSendForm]     = useState<SendForm>({ to: '', amount: '', memo: '' });
+  const [sendForm, setSendForm]     = useState<SendForm>({ to: '', amount: '', memo: '', isPrivate: false });
   const [sending, setSending]       = useState(false);
   const [txResult, setTxResult]         = useState<TxResult | null>(null);
   const [txConfirmedHeight, setTxConfirmedHeight] = useState<number | null>(null);
@@ -469,7 +471,7 @@ const WalletPage: React.FC = () => {
   async function submitTx() {
     if (!sendForm.to || !sendForm.amount) return;
     const amount  = Math.floor(parseFloat(sendForm.amount) * 1_000_000);
-    const request = { to_address: sendForm.to, amount, memo: sendForm.memo || null };
+    const request = { to_address: sendForm.to, amount, memo: sendForm.memo || null, is_private: sendForm.isPrivate };
     try {
       const res = await invoke<TxResult>('send_transaction', { request });
       setEmailStep('idle');
@@ -504,7 +506,7 @@ const WalletPage: React.FC = () => {
   function resetSend() {
     setShowSend(false);
     setSending(false);
-    setSendForm({ to: '', amount: '', memo: '' });
+    setSendForm({ to: '', amount: '', memo: '', isPrivate: false });
     setTxResult(null);
     setTxConfirmedHeight(null);
     setEmailStep('idle');
@@ -1347,21 +1349,21 @@ const WalletPage: React.FC = () => {
                 <button
                   key={tx.hash}
                   onClick={() => setSelectedTx(tx)}
-                  className="w-full flex items-center justify-between px-5 py-4 hover:bg-gray-700/40 transition text-left"
+                  className={`w-full flex items-center justify-between px-5 py-4 hover:bg-gray-700/40 transition text-left ${tx.is_private ? 'bg-yellow-500/5' : ''}`}
                 >
                   <div className="flex items-center gap-3 min-w-0">
                     <div className={`w-10 h-10 rounded-xl flex items-center justify-center text-lg shrink-0 ${
-                      isReward ? 'bg-yellow-500/15' : isSent ? 'bg-red-500/15' : 'bg-green-500/15'
+                      tx.is_private ? 'bg-yellow-500/20 text-yellow-500' : isReward ? 'bg-yellow-500/15' : isSent ? 'bg-red-500/15' : 'bg-green-500/15'
                     }`}>
-                      {isReward ? '⚡' : isSent ? '↑' : '↓'}
+                      {tx.is_private ? '🛡' : isReward ? '⚡' : isSent ? '↑' : '↓'}
                     </div>
                     <div className="min-w-0">
                       <div className="text-sm font-mono text-gray-300 truncate">
-                        {isReward ? rewardLabel : shortHash(tx.hash)}
+                        {tx.is_private ? <span className="text-yellow-400 font-bold">Shielded Transaction</span> : (isReward ? rewardLabel : shortHash(tx.hash))}
                       </div>
                       <div className="text-xs text-gray-500">
                         {isReward
-                          ? `Block #${tx.block_height ?? '—'}`
+                          ? `Block #${tx.block_height ?? '—'}` : tx.is_private ? 'On-chain identities hidden'
                           : isSent ? `To: ${shortAddr(tx.to)}` : `From: ${shortAddr(tx.from)}`}
                         {tx.memo && <span className="ml-2 text-gray-600">• {tx.memo}</span>}
                       </div>
@@ -2498,6 +2500,28 @@ const WalletPage: React.FC = () => {
                       placeholder="Payment for..."
                     />
                   </div>
+                  <div className="flex items-center justify-between bg-gray-900/50 p-3 rounded-xl border border-gray-700/50">
+                    <div className="flex items-center gap-3">
+                      <div className="w-8 h-8 rounded-lg bg-yellow-500/10 flex items-center justify-center text-yellow-500">🛡</div>
+                      <div>
+                        <div className="text-sm font-semibold">Private Transaction</div>
+                        <div className="text-[10px] text-gray-500 uppercase font-bold tracking-wider">Shielded with ZK-Proofs</div>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => setSendForm(f => ({ ...f, isPrivate: !f.isPrivate }))}
+                      className={`w-10 h-5 rounded-full transition-colors relative ${sendForm.isPrivate ? 'bg-yellow-500' : 'bg-gray-700'}`}
+                    >
+                      <div className={`absolute top-1 w-3 h-3 rounded-full bg-white transition-all ${sendForm.isPrivate ? 'left-6' : 'left-1'}`} />
+                    </button>
+                  </div>
+                  {(sendForm.isPrivate || (parseFloat(sendForm.amount) >= 50000)) && (
+                    <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-xl p-3 text-[11px] text-yellow-200/70 leading-relaxed">
+                      {parseFloat(sendForm.amount) >= 50000 
+                        ? "High-value transaction detected. Automatic shielding enabled for Whale Protection (≥ 50,000 EGOC)."
+                        : "Shielded transactions hide your address and the recipient's address from the public ledger."}
+                    </div>
+                  )}
                   <div className="bg-gray-900 rounded-xl p-3 space-y-2 text-sm">
                     <div className="flex justify-between">
                       <span className="text-gray-400">Transfer fee</span>
