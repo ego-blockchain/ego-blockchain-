@@ -33,7 +33,11 @@ env:
     ### macOS
     1. Download the `.dmg` file.
     2. Open it and drag **Ego Desktop** into your Applications folder.
-    3. First launch: **right-click the app → Open → Open** (required once since the app is not yet notarized).
+    3. First launch: **right-click the app → Open → Open**.
+    4. If the app still won't open, run this in Terminal:
+       ```bash
+       xattr -dr com.apple.quarantine "/Applications/Ego Desktop.app"
+       ```
 
     ### Linux
     1. **Debian/Ubuntu**: `sudo dpkg -i Ego.Desktop_*_amd64.deb`
