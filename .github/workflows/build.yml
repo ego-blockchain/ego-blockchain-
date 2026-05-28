@@ -75,11 +75,9 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          EGO_AI_KEY: ${{ secrets.EGO_AI_KEY }}
-          EGO_SMTP_HOST: ${{ secrets.EGO_SMTP_HOST }}
-          EGO_SMTP_USER: ${{ secrets.EGO_SMTP_USER }}
-          EGO_SMTP_PASS: ${{ secrets.EGO_SMTP_PASS }}
           STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          # Windows Signing Secrets
+          # SIGNTOOL_SIGN_COMMAND: 'signtool sign /f cert.pfx /p ${{ secrets.WIN_CERT_PASS }} /t http://timestamp.digicert.com'
         with:
           projectPath: ego-desktop
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
@@ -121,6 +119,11 @@ jobs:
           EGO_SMTP_USER: ${{ secrets.EGO_SMTP_USER }}
           EGO_SMTP_PASS: ${{ secrets.EGO_SMTP_PASS }}
           STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           MACOSX_DEPLOYMENT_TARGET: '11.0'
           RUSTFLAGS: '-C target-cpu=apple-m1'
         with:
@@ -167,6 +170,11 @@ jobs:
           EGO_SMTP_USER: ${{ secrets.EGO_SMTP_USER }}
           EGO_SMTP_PASS: ${{ secrets.EGO_SMTP_PASS }}
           STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           MACOSX_DEPLOYMENT_TARGET: '10.13'
         with:
           projectPath: ego-desktop
