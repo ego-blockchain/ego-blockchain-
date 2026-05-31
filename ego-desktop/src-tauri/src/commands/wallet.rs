@@ -345,10 +345,16 @@ pub async fn prepare_transaction(
             "Insufficient balance: have {} uEGOC, need {}", balance, request.amount
         )));
     }
+    let is_staker  = ledger.staked_amount > 0;
+    let fee        = crate::tokenomics::fee_for_tx_with_staking("transfer", is_staker);
     let confirmed_nonce_legacy = crate::ledger::last_confirmed_nonce(&from);
     let nonce      = ledger.nonce.max(confirmed_nonce_legacy) + 1;
     let ts         = chrono::Utc::now().timestamp();
-    let sign_bytes = tx_signing_bytes(&from, &request.to_address, request.amount, nonce, ts);
+    let memo_str   = request.memo.as_deref().unwrap_or("");
+    const CHAIN_ID: u8 = 1; 
+    let sign_bytes = tx_signing_bytes_v2(
+        &from, &request.to_address, request.amount, nonce, ts, CHAIN_ID, memo_str,
+    );
     let (signature_hex, pubkey_hex, dil_sig_hex, dil_pubkey_hex) = if let Some(kp) = state.get_keypair() {
         let ed_sig  = kp.sign_ed25519(&sign_bytes);
         let dil_sig = kp.sign_dilithium(&sign_bytes);
@@ -360,13 +366,20 @@ pub async fn prepare_transaction(
         return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
     };
     let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+    let summary = tx_human_summary(
+        &from, &request.to_address, request.amount, memo_str, CHAIN_ID, nonce, fee,
+    );
     let tx = LedgerTx {
         hash: tx_hash.clone(), from: from.clone(), to: request.to_address.clone(),
         amount: request.amount, memo: request.memo.clone(), timestamp: ts,
         signature: signature_hex, status: "Pending".into(),
         block_height: None, nonce, public_key_ed25519: pubkey_hex,
         dilithium_pubkey: dil_pubkey_hex, dilithium_signature: dil_sig_hex,
+        fee_uegoc: fee,
+        tx_version: 2,
+        chain_id: CHAIN_ID,
         is_private: request.is_private.unwrap_or(false) || request.amount >= SHIELD_THRESHOLD_UEGOC,
+        signed_summary: summary.clone(),
         ..LedgerTx::default()
     };
     chain.transactions.push(tx.clone());
@@ -875,6 +888,9 @@ pub async fn request_tx_code(
             };
 
             let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+            let summary = tx_human_summary(
+                &from, &to_address, amount, memo_str, CHAIN_ID_2FA, nonce, fee,
+            );
             let tx = LedgerTx {
                 hash:                tx_hash.clone(),
                 from:                from.clone(),
@@ -893,6 +909,7 @@ pub async fn request_tx_code(
                 tx_version:          2,
                 chain_id:            CHAIN_ID_2FA,
                 is_private:          request.is_private.unwrap_or(false) || amount >= SHIELD_THRESHOLD_UEGOC,
+                signed_summary:      summary,
                 ..LedgerTx::default()
             };
 

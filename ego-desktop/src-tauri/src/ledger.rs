@@ -147,7 +147,18 @@ pub fn load_seed() -> Result<Option<Vec<u8>>, String> {
             use base64::Engine as _;
 
             let entry = seed_keyring_entry().map_err(|e| format!("Keyring init error: {}", e))?;
-            let pw = entry.get_password().map_err(|e| format!("Keyring read error: {}", e))?;
+            let pw = entry.get_password().map_err(|e| {
+                let err_str = e.to_string();
+                if err_str.contains("User canceled") || err_str.contains("Access control") {
+                    format!(
+                        "macOS Keychain Access Denied: {}. This happens because the app signature changed or is not notarized.\n\n\
+                        FIX: Open 'Keychain Access.app', search for 'ego-desktop', delete the entry named 'ego-desktop' (which contains the 'wallet-seed'), and restart the app.",
+                        err_str
+                    )
+                } else {
+                    format!("Keyring read error: {}", err_str)
+                }
+            })?;
             let bytes = base64::engine::general_purpose::STANDARD.decode(pw).map_err(|e| format!("Base64 decode error: {}", e))?;
             if bytes.len() != 32 {
                 return Err("Decrypted seed has invalid length".into());
