@@ -16,6 +16,8 @@ pub struct FileEvent {
     pub status: String,
 }
 
+const SHIELD_THRESHOLD_UEGOC: u64 = 50_000 * 1_000_000;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NetworkStats {
     pub latest_block: u64,
@@ -124,9 +126,18 @@ pub async fn get_blocks(offset: Option<u32>, limit: Option<u32>) -> Result<Vec<L
 pub async fn get_all_transactions(offset: Option<u32>, limit: Option<u32>) -> Result<Vec<LedgerTx>, EgoDesktopError> {
     let off = offset.unwrap_or(0) as usize;
     let lim = limit.unwrap_or(25) as usize;
-    tokio::task::spawn_blocking(move || crate::chain_db::paged_transactions(off, lim))
+    let mut txs = tokio::task::spawn_blocking(move || crate::chain_db::paged_transactions(off, lim))
         .await
-        .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))
+        .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
+
+    for tx in txs.iter_mut() {
+        if tx.is_private || tx.amount >= SHIELD_THRESHOLD_UEGOC || tx.from == "Shielded" || tx.to == "Shielded" {
+            tx.from = "Shielded".to_string();
+            tx.to   = "Shielded".to_string();
+            tx.memo = Some("Privacy Protected".to_string());
+        }
+    }
+    Ok(txs)
 }
 
 #[tauri::command]
@@ -141,12 +152,19 @@ pub async fn get_block_info(height: u64) -> Result<LedgerBlock, EgoDesktopError>
 
 #[tauri::command]
 pub async fn get_transaction_info(hash: String) -> Result<LedgerTx, EgoDesktopError> {
-    tokio::task::spawn_blocking(move || {
+    let mut tx = tokio::task::spawn_blocking(move || {
         crate::chain_db::get_tx_by_hash(&hash)
             .ok_or_else(|| EgoDesktopError::NotFound(format!("TX {hash} not found")))
     })
     .await
-    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))??;
+
+    if tx.is_private || tx.amount >= SHIELD_THRESHOLD_UEGOC || tx.from == "Shielded" || tx.to == "Shielded" {
+        tx.from = "Shielded".to_string();
+        tx.to   = "Shielded".to_string();
+        tx.memo = Some("Privacy Protected".to_string());
+    }
+    Ok(tx)
 }
 
 #[tauri::command]

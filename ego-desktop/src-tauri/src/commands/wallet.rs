@@ -494,10 +494,11 @@ pub async fn commit_transaction(
             crate::p2p::oracle_post_pub(&client, "/block/broadcast", &body).await;
         }
     });
+    let summary = tx.signed_summary.clone();
     Ok(TransactionResponse {
         hash: tx_hash, success: true,
         message: "Transaction confirmed and broadcast".into(), block_height,
-        signed_summary: None,
+        signed_summary: Some(summary),
     })
 }
 
@@ -526,6 +527,13 @@ pub async fn get_transaction_history(
                 && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward");
             if is_spammy {
                 continue;
+            }
+
+            // ENFORCE PRIVACY: Mask addresses for shielded or high-value transfers
+            if tx.is_private || tx.amount >= SHIELD_THRESHOLD_UEGOC || tx.from == "Shielded" || tx.to == "Shielded" {
+                tx.from = "Shielded".to_string();
+                tx.to   = "Shielded".to_string();
+                tx.memo = Some("Privacy Protected".to_string());
             }
 
             confirmed_hashes.insert(tx.hash.clone());
@@ -564,6 +572,14 @@ pub async fn get_transaction_history(
         for mut tx in pool_txs.into_iter().chain(file_txs.into_iter()) {
             if (tx.from == my_addr || tx.to == my_addr) && !confirmed_hashes.contains(&tx.hash) {
                 let is_receiver = tx.to == my_addr && tx.from != my_addr;
+                
+                // ENFORCE PRIVACY for pending transactions
+                if tx.is_private || tx.amount >= SHIELD_THRESHOLD_UEGOC {
+                    tx.from = "Shielded".to_string();
+                    tx.to   = "Shielded".to_string();
+                    tx.memo = Some("Privacy Protected".to_string());
+                }
+
                 let is_faucet = tx.tx_type == "faucet";
                 if is_receiver && !is_faucet {
                     continue; // Hide unconfirmed inbound transfers from the receiver's UI
@@ -1051,12 +1067,13 @@ pub async fn confirm_tx_code(
         crate::p2p::broadcast_pending_tx(tx_broadcast).await;
     });
 
+    let summary = tx.signed_summary.clone();
     Ok(TransactionResponse {
         hash:           tx_hash,
         success:        true,
         message:        format!("Transaction to {} for {:.6} EGOC queued", &to_addr[..12.min(to_addr.len())], amount as f64 / 1_000_000.0),
         block_height:   None,
-        signed_summary: None,
+        signed_summary: Some(summary),
     })
 }
 

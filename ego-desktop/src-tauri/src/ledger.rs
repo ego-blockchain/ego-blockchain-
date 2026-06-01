@@ -147,33 +147,51 @@ pub fn load_seed() -> Result<Option<Vec<u8>>, String> {
             use base64::Engine as _;
 
             let entry = seed_keyring_entry().map_err(|e| format!("Keyring init error: {}", e))?;
-            let pw = match entry.get_password() {
+            let pw = match entry.get_password().map_err(|e| e.to_string()) {
                 Ok(p) => p,
-                Err(keyring::Error::NoEntry) => return Ok(None),
+                Err(e) if e.contains("No such item") || e.contains("not found") => {
+                    // Inconsistent state: Sentinel exists but Keychain entry is gone.
+                    // Clean up the sentinel so the app can start fresh.
+                    let _ = fs::remove_file(&path);
+                    return Ok(None);
+                }
                 Err(e) => {
-                    let err_str = e.to_string();
-                    if err_str.contains("User canceled") || err_str.contains("Access control") {
+                    if e.contains("User canceled") || e.contains("Access control") {
                         return Err(format!(
                             "macOS Keychain Access Denied: {}. This happens because the app signature changed or is not notarized.\n\n\
-                        FIX: Open 'Keychain Access.app', search for 'ego-desktop', delete the entry named 'ego-desktop', then run 'rm -rf ~/Library/Application\\ Support/EgoDesktop' in Terminal and restart.",
-                            err_str
+                            FIX: Open 'Keychain Access.app', search for 'ego-desktop', delete the entry, then run 'rm -rf ~/Library/Application\\ Support/EgoDesktop' and restart.",
+                            e
                         ));
                     }
-                    return Err(format!("Keyring read error: {}", err_str));
+                    return Err(format!("Keyring read error: {}", e));
                 }
             };
-            let bytes = base64::engine::general_purpose::STANDARD.decode(pw).unwrap_or_default();
+
+            // Attempt to decode the retrieved value.
+            // Try base64 (standard for new wallets), then hex, then raw bytes.
+            let mut bytes = base64::engine::general_purpose::STANDARD.decode(&pw).unwrap_or_default();
             if bytes.len() != 32 {
-                return Err(format!(
-                    "Decrypted seed has invalid length ({} bytes). Local data is out of sync with Keychain.\n\n\
-                    FIX: Delete the 'ego-desktop' keychain entry and run 'rm -rf ~/Library/Application\\ Support/EgoDesktop' in Terminal, then restart and re-import your phrase.",
-                    bytes.len()
-                ));
+                if let Ok(h) = hex::decode(&pw) {
+                    if h.len() == 32 { bytes = h; }
+                }
+            }
+            if bytes.len() != 32 && pw.as_bytes().len() == 32 {
+                bytes = pw.as_bytes().to_vec();
+            }
+
+            if bytes.len() != 32 {
+                // If the data in keychain is invalid length (e.g. 68 bytes), the state is corrupted.
+                // Return Ok(None) and remove the sentinel to force a fresh start on next launch.
+                eprintln!("[Ledger] Invalid seed length in Keychain ({} bytes). Resetting local state.", bytes.len());
+                let _ = fs::remove_file(&path);
+                return Ok(None);
             }
             return Ok(Some(bytes));
         }
         if raw.len() != 32 {
-            return Err("Raw seed has invalid length".into());
+            // Physical seed file has invalid length. Reset local state.
+            let _ = fs::remove_file(&path);
+            return Ok(None);
         }
         return Ok(Some(raw));
     }
