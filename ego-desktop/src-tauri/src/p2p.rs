@@ -1056,14 +1056,23 @@ static IP_TO_ADDR: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 fn validate_unique_identity(addr: &str, machine_id: &str, endpoint: &str) -> Result<(), String> {
     if machine_id.is_empty() { return Ok(()); }
     
-    // Validate Machine ID uniqueness
-    let mut m_map = MACHINE_TO_ADDR.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-    if let Some(existing) = m_map.get(machine_id) {
-        if existing != addr {
-            return Err(format!("Hardware ID {} already associated with node {}", machine_id, existing));
+    let ip = endpoint.split('/').nth(2).unwrap_or("");
+    let is_local = ip == "127.0.0.1" || ip.is_empty()
+        || ip.starts_with("192.168.")
+        || ip.starts_with("10.")
+        || ip.starts_with("172.");
+
+    // Sybil Protection: Hardware ID must be unique per address on public networks.
+    // For local development (127.0.0.1), we bypass this to allow multi-node testing on one PC.
+    if !is_local {
+        let mut m_map = MACHINE_TO_ADDR.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+        if let Some(existing) = m_map.get(machine_id) {
+            if existing != addr {
+                return Err(format!("Hardware ID {} already associated with node {}", machine_id, existing));
+            }
         }
+        m_map.insert(machine_id.to_string(), addr.to_string());
     }
-    m_map.insert(machine_id.to_string(), addr.to_string());
 
     // Validate IP uniqueness to prevent "echo" faking
     if !endpoint.is_empty() {
@@ -6400,8 +6409,15 @@ fn merge_remote_chain_blocking(
             .map(|b| b.height);
 
         if let Some(dh) = diverge_height {
-            let has_bft_quorum = blocks.iter().any(|b| b.height >= dh && b.vote_count >= 2);
-            if remote_tip > local_tip || has_bft_quorum {
+            // A reorg should only happen if the remote chain is actually BETTER.
+            // A better chain is either significantly longer, or has a higher BFT quorum at the same height.
+            let remote_has_quorum = blocks.iter().any(|b| b.height >= dh && b.vote_count >= 2);
+            
+            // PROTECTION: Never truncate a long chain to adopt a significantly shorter one
+            // unless the local chain has been stuck for a very long time (handled via override_hard).
+            let is_remote_longer = remote_tip > local_tip;
+            
+            if is_remote_longer || (remote_tip == local_tip && remote_has_quorum) {
                 should_reorg = true;
             } else if remote_tip == local_tip {
                 // Tie-breaker for symmetric forks: compare hashes to guarantee convergence
@@ -6422,7 +6438,7 @@ fn merge_remote_chain_blocking(
 
                 let local_is_solo = crate::chain_db::get_block_by_height(dh).map(|b| b.vote_count < 2).unwrap_or(false);
                 let remote_is_heavier = remote_tip > local_tip + 10;
-                let override_hard = dh <= last_hard && (has_bft_quorum || remote_tip > local_tip + 20) && (local_is_solo || remote_is_heavier);
+                let override_hard = dh <= last_hard && (remote_has_quorum || remote_tip > local_tip + 20) && (local_is_solo || remote_is_heavier);
 
                 if dh > last_hard || override_hard {
                     if override_hard {

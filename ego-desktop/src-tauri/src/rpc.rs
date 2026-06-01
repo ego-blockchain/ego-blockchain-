@@ -1430,7 +1430,14 @@ pub async fn start_https_server() {
     let app = Router::new().fallback(https_eo_handler);
 
     let bind_ip = https_bind_ip();
-    let port: u16 = if std::net::TcpListener::bind((bind_ip, 443)).is_ok() { 443 } else { 47396 };
+    let port: u16 = if std::net::TcpListener::bind((bind_ip, 443)).is_ok() {
+        443
+    } else {
+        std::env::var("EGO_HTTPS_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(47396)
+    };
     let _ = crate::tls::HTTPS_PORT.set(port);
     let addr = SocketAddr::from((bind_ip, port));
     eprintln!("[HTTPS] .eo gateway listening on https://{}", addr);

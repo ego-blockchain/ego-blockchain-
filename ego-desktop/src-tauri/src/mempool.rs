@@ -780,7 +780,9 @@ pub async fn run_batch_loop() {
         }
 
         // Grace period: allow peers to discover each other via DHT before deciding we are alone
-        if known_count <= 1 && startup_time.elapsed().as_secs() < 30 {
+        let is_brand_new = crate::chain_db::latest_block_info().0 < 2;
+        let settle_time = if is_brand_new { 60 } else { 15 };
+        if known_count <= 1 && startup_time.elapsed().as_secs() < settle_time {
             tokio::time::sleep(Duration::from_secs(2)).await;
             last_block_at    = Instant::now();
             batch_started_at = None;
