@@ -174,7 +174,11 @@ pub async fn compute_node_heartbeat() {
     }
 
     if is_enabled {
-        let mut node = if let Some(n) = node_opt {
+        let mut node = if let Some(mut n) = node_opt {
+            n.available_cores  = ledger.compute_allocated_cores.saturating_sub(ledger.compute_locked_cores);
+            n.available_ram_gb = ledger.compute_allocated_ram_gb.saturating_sub(ledger.compute_locked_ram_gb);
+            n.locked_cores     = ledger.compute_locked_cores;
+            n.locked_ram_gb    = ledger.compute_locked_ram_gb;
             n
         } else {
             // Reconstruct if pruned or on fresh restart
@@ -190,8 +194,8 @@ pub async fn compute_node_heartbeat() {
                     gpu_count:            hw.gpu_count,
                     has_cuda:             hw.has_cuda,
                     compute_score:        hw.compute_score,
-                    available_cores:      ledger.compute_allocated_cores,
-                    available_ram_gb:     ledger.compute_allocated_ram_gb,
+                    available_cores:      ledger.compute_allocated_cores.saturating_sub(ledger.compute_locked_cores),
+                    available_ram_gb:     ledger.compute_allocated_ram_gb.saturating_sub(ledger.compute_locked_ram_gb),
                     price_per_gpu_hour_uegoc:  ledger.compute_price_per_gpu_hour_uegoc,
                     price_per_core_hour_uegoc: ledger.compute_price_per_core_hour_uegoc,
                     jobs_completed:       ledger.compute_jobs_completed,

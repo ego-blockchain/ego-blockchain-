@@ -4122,7 +4122,17 @@ async fn handle_event(
                 match serde_json::from_slice::<P2PMessage>(&message.data) {
                     Ok(P2PMessage::ComputeAnnounce { node }) => {
                         tokio::spawn(async move {
-                            tokio::task::spawn_blocking(move || crate::chain_db::upsert_compute_node(&node)).await.ok();
+                            let n = node.clone();
+                            tokio::task::spawn_blocking(move || crate::chain_db::upsert_compute_node(&n)).await.ok();
+                            if !node.endpoint.is_empty() {
+                                upsert_peer_cache(PeerEntry {
+                                    address: node.address.clone(),
+                                    endpoint: node.endpoint.clone(),
+                                    last_seen: chrono::Utc::now().timestamp(),
+                                    city: None,
+                                    country: None,
+                                });
+                            }
                         });
                     }
                     Ok(P2PMessage::ComputeJobPost { job }) => {
