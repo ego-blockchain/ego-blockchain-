@@ -1077,8 +1077,7 @@ fn validate_unique_identity(addr: &str, machine_id: &str, endpoint: &str) -> Res
     // Validate IP uniqueness to prevent "echo" faking
     if !endpoint.is_empty() {
         let mut ip_map = IP_TO_ADDR.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-        let ip = endpoint.split('/').nth(2).unwrap_or("");
-        if !ip.is_empty() && ip != "127.0.0.1" {
+        if !is_local {
             if let Some(existing_addr) = ip_map.get(ip) {
                 if existing_addr != addr {
                     return Err(format!("IP address {} is already running node {}", ip, existing_addr));
@@ -4200,11 +4199,7 @@ async fn handle_event(
                     }
                     Ok(P2PMessage::CapacityOfferBroadcast { offer }) => {
                         tokio::spawn(async move {
-                            tokio::task::spawn_blocking(move || {
-                                if crate::chain_db::get_compute_offer(&offer.offer_id).is_none() {
-                                    crate::chain_db::upsert_compute_offer(&offer);
-                                }
-                            }).await.ok();
+                            tokio::task::spawn_blocking(move || crate::chain_db::upsert_compute_offer(&offer)).await.ok();
                         });
                     }
                     Ok(P2PMessage::CapacityOfferCancelled { offer_id }) => {
