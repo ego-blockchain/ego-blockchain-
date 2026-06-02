@@ -1417,14 +1417,20 @@ pub async fn get_reservation_connect_info(
     .ok_or_else(|| EgoDesktopError::InvalidInput("Reservation not found".into()))?;
 
     let provider_addr = res.provider_address.clone();
-    let provider = tokio::task::spawn_blocking(move || {
-        crate::chain_db::get_compute_node(&provider_addr)
-    })
-    .await
-    .map_err(|e| EgoDesktopError::WalletError(e.to_string()))?
-    .ok_or_else(|| EgoDesktopError::InvalidInput("Provider node info not found. The node may be offline.".into()))?;
 
-    let ip = provider.endpoint.split('/').nth(2).unwrap_or("127.0.0.1");
+    // Try to resolve the endpoint from the compute node registry first
+    let endpoint = if let Some(node) = tokio::task::spawn_blocking({
+        let addr = provider_addr.clone();
+        move || crate::chain_db::get_compute_node(&addr)
+    }).await.map_err(|e| EgoDesktopError::WalletError(e.to_string()))? {
+        node.endpoint
+    } else {
+        // Fallback to general P2P registry or DHT lookup if compute-specific record was pruned
+        crate::p2p::get_relay_endpoint(&provider_addr).await
+            .ok_or_else(|| EgoDesktopError::InvalidInput("Provider node info not found. The node may be offline.".into()))?
+    };
+
+    let ip = endpoint.split('/').nth(2).unwrap_or("127.0.0.1");
 
     Ok(ReservationConnectInfo {
         reservation_id: res.reservation_id,

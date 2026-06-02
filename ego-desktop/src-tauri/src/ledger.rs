@@ -149,11 +149,14 @@ pub fn load_seed() -> Result<Option<Vec<u8>>, String> {
             let entry = seed_keyring_entry().map_err(|e| format!("Keyring init error: {}", e))?;
             let pw = match entry.get_password().map_err(|e| e.to_string()) {
                 Ok(p) => p,
-                Err(e) if e.contains("No such item") || e.contains("not found") => {
-                    // Inconsistent state: Sentinel exists but Keychain entry is gone.
-                    // Clean up the sentinel so the app can start fresh.
-                    let _ = fs::remove_file(&path);
-                    return Ok(None);
+                Err(e) if e.contains("No such item") || e.contains("not found") || e.contains("Access control") => {
+                    // Inconsistent state or Access Denied due to signature change.
+                    // DO NOT delete the sentinel file. Deleting it causes a new wallet 
+                    // to be generated, losing the user's identity.
+                    return Err(format!(
+                        "macOS Keychain Access Error: {}. If you are developing, ensure your app is signed or check Keychain Access.app.",
+                        e
+                    ));
                 }
                 Err(e) => {
                     if e.contains("User canceled") || e.contains("Access control") {

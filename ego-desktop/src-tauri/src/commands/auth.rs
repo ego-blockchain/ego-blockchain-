@@ -539,7 +539,18 @@ pub async fn init_wallet(
         return load_active_wallet(&state, true, Some(app_handle)).await;
     }
 
-    let is_new = !seed_path().exists();
+    // check if seed exists and is valid
+    let seed_on_disk = seed_path().exists();
+    let mut is_new = !seed_on_disk;
+
+    // If seed exists but load_seed fails (e.g. Keychain locked), return the error 
+    // instead of creating a new wallet.
+    if seed_on_disk {
+        if let Err(e) = crate::ledger::load_seed() {
+            return Err(EgoDesktopError::CryptoError(e));
+        }
+    }
+
     if is_new {
         tokio::task::spawn_blocking(|| create_wallet_files(None))
             .await
