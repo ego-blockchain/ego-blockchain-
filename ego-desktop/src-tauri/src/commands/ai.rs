@@ -185,8 +185,8 @@ Advanced: EGO-50 MEV Protection, EGO-51 Fee Market, EGO-52 Governance, EGO-53 DI
 
 ## Explorer (egoblockchain.com/explorer)
 - Tabs: Blocks, Transactions, Tokens. (Node Status tab removed.)
-- **Blocks table**: Height, Hash, Txs, Validator, Age. Paginated: 25 / 50 / 100 rows per page with `« ‹ 1 2 … N › »` controls.
-- **Transactions table**: Tx Hash, Action, Block, Age, From, To, Amount (always shows EGOC label). Paginated same as blocks.
+- **Blocks table**: Height, Hash, Txs, Validator, Age. Includes in-page search by height or hash. Paginated: 25 / 50 / 100 rows per page.
+- **Transactions table**: Tx Hash, Action, Block, Age, From, To, Amount. Features "User Transfers" vs "All Activity" filtering and in-page search by hash or address.
 - **Action labels**: Transfer, Stake, Unstake, Slash, Faucet, System, Memo — derived from from/to addresses and memo field.
 - **Tokens tab**: Shows native EGOC stats (supply, holders, price, market cap) with a "TEST" badge. "EGO-20 tokens — Coming Soon" section below.
 - Auto-refresh every 10s preserves current page.
