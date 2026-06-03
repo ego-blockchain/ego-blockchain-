@@ -97,8 +97,6 @@
         "minimumSystemVersion": "10.13",
         "exceptionDomain": "",
         "signingIdentity": null,
-        "providerShortName": null,
-        "providerBundleIdentifier": "com.ego.desktop",
         "entitlements": null
       },
       "windows": {
