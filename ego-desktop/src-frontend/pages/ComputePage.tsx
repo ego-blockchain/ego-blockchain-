@@ -74,6 +74,7 @@ interface ReservationConnectInfo {
   provider_ip: string;
   ssh_command: string;
   note: string;
+  how_to_verify: string;
 }
 
 const u = (egoc: number) => Math.round(egoc * 1_000_000);
@@ -186,6 +187,11 @@ export default function ComputePage() {
   const [confirmTermRes,   setConfirmTermRes]   = useState<string | null>(null);
   const [confirmTermEarly, setConfirmTermEarly] = useState<{ id: string, penalty: number } | null>(null);
   const [confirmTermCluster, setConfirmTermCluster] = useState<string | null>(null);
+
+  const [sshKeyOpen,    setSshKeyOpen]    = useState(false);
+  const [sshKeyText,    setSshKeyText]    = useState('');
+  const [sshKeyLoading, setSshKeyLoading] = useState(false);
+  const [sshKeyCopied,  setSshKeyCopied]  = useState(false);
   const [resConnectInfo,   setResConnectInfo]   = useState<ReservationConnectInfo | null>(null);
 
   const [clusters,            setClusters]            = useState<ClusterBooking[]>([]);
@@ -320,6 +326,14 @@ export default function ComputePage() {
     setBusyRes(null);
   }
 
+  async function handleAutoConnect(cmd: string) {
+    try {
+      await invoke('open_ssh_terminal', { sshCommand: cmd });
+    } catch (err: any) {
+      alert('Failed to launch terminal: ' + String(err));
+    }
+  }
+
   async function showResConnectInfo(reservationId: string) {
     try {
       const info = await invoke<ReservationConnectInfo>('get_reservation_connect_info', { reservationId });
@@ -390,6 +404,16 @@ export default function ComputePage() {
     setClusterHeartbeatId(null);
   }
 
+  async function openSshKey() {
+    setSshKeyOpen(true);
+    setSshKeyLoading(true);
+    try {
+      const key = await invoke<string>('get_or_create_ssh_key');
+      setSshKeyText(key);
+    } catch (err: any) { alert(String(err)); }
+    finally { setSshKeyLoading(false); }
+  }
+
   if (loading) return <div className="flex items-center justify-center h-64 text-gray-400">Loading…</div>;
 
   const myAddr           = status?.address ?? '';
@@ -400,11 +424,17 @@ export default function ComputePage() {
     <div className="p-6 space-y-5 max-w-4xl mx-auto">
 
       {/* Header */}
-      <div>
-        <h1 className="text-2xl font-bold text-white">Compute Marketplace</h1>
-        <p className="text-gray-400 text-sm mt-0.5">
-          Rent out your CPU, GPU, or RAM and earn EGOC · Rent computing power from anyone on the network
-        </p>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold text-white">Compute Marketplace</h1>
+          <p className="text-gray-400 text-sm mt-0.5">
+            Rent out your CPU, GPU, or RAM and earn EGOC · Rent computing power from anyone on the network
+          </p>
+        </div>
+        <button onClick={openSshKey}
+          className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm rounded-xl border border-gray-700 transition flex items-center gap-2 shrink-0 shadow-lg">
+          <span>🔑</span> SSH Key
+        </button>
       </div>
 
       {/* Quick earnings strip */}
@@ -1455,8 +1485,24 @@ export default function ComputePage() {
               </div>
             </div>
 
+            <div className="p-4 bg-blue-600/10 border border-blue-500/30 rounded-xl">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-lg">🚀</span>
+                <h4 className="font-semibold text-blue-300 text-sm">One-Click Connect</h4>
+              </div>
+              <p className="text-[11px] text-gray-400 mb-4 leading-relaxed">
+                {resConnectInfo.how_to_verify}
+              </p>
+              <button 
+                onClick={() => handleAutoConnect(resConnectInfo.ssh_command)}
+                className="w-full bg-blue-600 hover:bg-blue-500 text-white py-2 rounded-lg font-bold text-xs transition"
+              >
+                Launch SSH Terminal
+              </button>
+            </div>
+
             <div>
-              <p className="text-gray-400 text-xs mb-1">SSH command (Direct Access)</p>
+              <p className="text-gray-500 text-[10px] mb-1 uppercase font-bold">Manual SSH Command</p>
               <pre className="bg-gray-900 rounded-lg p-3 text-yellow-400 text-xs overflow-x-auto">{resConnectInfo.ssh_command}</pre>
             </div>
             
@@ -1495,6 +1541,54 @@ export default function ComputePage() {
                 Close
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── SSH Key modal ── */}
+      {sshKeyOpen && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm" onClick={e => e.target === e.currentTarget && setSshKeyOpen(false)}>
+          <div className="bg-gray-800 rounded-2xl border border-gray-700 p-6 w-full max-w-lg space-y-4 shadow-2xl">
+            <div className="flex justify-between items-center">
+              <h3 className="text-white font-semibold text-lg">Your Public SSH Key</h3>
+              <button onClick={() => setSshKeyOpen(false)} className="text-gray-400 hover:text-white text-xl leading-none">✕</button>
+            </div>
+            
+            <div className="bg-blue-900/20 border border-blue-700/30 rounded-xl p-3 text-xs text-blue-300 leading-relaxed">
+              <p className="font-semibold mb-1">To authorize your computer:</p>
+              Copy the key below and send it to the compute provider. They must add it to their <code className="text-white bg-black/30 px-1 rounded">authorized_keys</code> file. Once they do, you can connect with one click.
+            </div>
+
+            <div className="relative group">
+              {sshKeyLoading ? (
+                <div className="h-32 bg-gray-900 rounded-xl flex items-center justify-center text-gray-500 text-sm animate-pulse">
+                  Generating secure Ed25519 keypair…
+                </div>
+              ) : (
+                <>
+                  <pre className="bg-gray-900 rounded-xl p-4 text-[10px] text-green-400 font-mono break-all whitespace-pre-wrap h-32 overflow-y-auto border border-gray-700 group-hover:border-blue-500 transition-colors">
+                    {sshKeyText}
+                  </pre>
+                  <button 
+                    onClick={() => {
+                      navigator.clipboard.writeText(sshKeyText);
+                      setSshKeyCopied(true);
+                      setTimeout(() => setSshKeyCopied(false), 2000);
+                    }}
+                    className={`absolute top-2 right-2 px-3 py-1.5 rounded-lg text-[10px] font-bold transition-all shadow-lg ${
+                      sshKeyCopied ? 'bg-green-600 text-white' : 'bg-blue-600 hover:bg-blue-500 text-white opacity-0 group-hover:opacity-100'
+                    }`}
+                  >
+                    {sshKeyCopied ? '✓ COPIED' : '📋 COPY'}
+                  </button>
+                </>
+              )}
+            </div>
+
+            <button onClick={() => setSshKeyOpen(false)}
+              className="w-full py-2.5 bg-gray-700 hover:bg-gray-600 text-white rounded-xl font-medium text-sm transition-colors">
+              Close
+            </button>
           </div>
         </div>
       )}
