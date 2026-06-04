@@ -877,7 +877,7 @@ async fn run_daemon_mode(
                                     true
                                 } else {
                                     // Attempt to decode as bech32 and compare bytes
-                                    ego_core::EgoAddress::from_bech32(provider)
+                                    ego_core::EgoAddress::from_bech32(provider, "egot")
                                         .map(|addr| addr.as_bytes() == my_addr_raw.as_bytes())
                                         .unwrap_or(false)
                                 };

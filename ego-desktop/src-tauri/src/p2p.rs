@@ -4292,7 +4292,7 @@ async fn handle_event(
                         let is_for_me = if reservation.provider_address == my_addr {
                             true
                         } else {
-                            let my_hex = hex::encode(ego_core::EgoAddress::from_bech32(&my_addr).map(|a| a.to_bytes()).unwrap_or_default());
+                            let my_hex = ego_core::EgoAddress::from_bech32(&my_addr, "egot").map(|a| hex::encode(a.as_bytes())).unwrap_or_default();
                             reservation.provider_address.to_lowercase().trim_start_matches("0x") == my_hex
                         };
                         let key_to_auth = ssh_public_key.clone();
