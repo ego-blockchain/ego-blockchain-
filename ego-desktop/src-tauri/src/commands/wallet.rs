@@ -1403,6 +1403,7 @@ pub struct ReservationConnectInfo {
     pub provider_ip: String,
     pub ssh_command: String,
     pub note: String,
+    pub how_to_verify: String,
 }
 
 #[tauri::command]
@@ -1438,6 +1439,7 @@ pub async fn get_reservation_connect_info(
         provider_ip: ip.to_string(),
         ssh_command: format!("ssh root@{}", ip),
         note: "Note: Direct SSH access requires the provider to have Port 22 open on their router. If the connection times out, the provider might be blocking direct external access.".to_string(),
+        how_to_verify: "After connecting, a 'Rented Hardware Report' will automatically display the machine's actual CPU, RAM, and GPU specs for you to verify.".to_string(),
     })
 }
 
