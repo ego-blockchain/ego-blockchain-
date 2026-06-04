@@ -1455,3 +1455,41 @@ pub async fn get_compute_earnings() -> Result<ComputeEarnings, EgoDesktopError> 
     .await
     .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
+
+/// Opens the system's default terminal and executes the SSH command.
+/// This allows non-technical users to connect to their rented machine with one click.
+#[tauri::command]
+pub async fn open_ssh_terminal(ssh_command: String) -> Result<(), EgoDesktopError> {
+    // We append a command to show hardware info immediately upon login
+    let verify_cmd = "echo '--- RENTED HARDWARE REPORT ---'; echo -n 'CPU Cores: '; nproc; echo -n 'RAM: '; free -h | grep Mem | awk '{print $2}'; if command -v nvidia-smi &> /dev/null; then nvidia-smi --query-gpu=name,memory.total --format=csv,noheader; fi; exec bash";
+    let full_command = format!("{} -t \"{}\"", ssh_command, verify_cmd);
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("powershell")
+            .args(["-NoExit", "-Command", &full_command])
+            .spawn()
+            .map_err(|e| EgoDesktopError::FileSystemError(format!("Failed to open terminal: {e}")))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!("tell application \"Terminal\" to do script \"{}\"", full_command);
+        std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .spawn()
+            .map_err(|e| EgoDesktopError::FileSystemError(format!("Failed to open terminal: {e}")))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let terminals = ["gnome-terminal", "konsole", "xfce4-terminal", "xterm"];
+        let mut success = false;
+        for term in terminals {
+            if std::process::Command::new(term)
+                .args(["--", "sh", "-c", &format!("{}; exec sh", full_command)])
+                .spawn()
+                .is_ok() { success = true; break; }
+        }
+        if !success { return Err(EgoDesktopError::FileSystemError("No terminal emulator found".into())); }
+    }
+    Ok(())
+}

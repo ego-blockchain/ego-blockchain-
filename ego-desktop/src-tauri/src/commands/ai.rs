@@ -315,7 +315,7 @@ pub async fn ask_ego_ai(
     } else if q.contains("shard") || q.contains("scale") || q.contains("tps") {
         "Ego scales dynamically up to 256 shards based on the active network size. Using consistent hashing, nodes are assigned to specific shards as Masters or Slaves, parallelizing transaction processing.\n\nThis allows the network to seamlessly grow to handle 100k+ TPS, with automatic cross-shard routing and vacancy healing when nodes drop offline."
     } else if q.contains("compute") || q.contains("gpu") || q.contains("cpu") || q.contains("rent") {
-        "Ego includes a Decentralized Physical Infrastructure Network (DePIN) for compute. Users can rent out their idle CPU, GPU, and RAM, or book decentralized clusters for AI training and rendering (integrated with Ray).\n\nPayments are handled trustlessly via on-chain escrow contracts, and nodes must send regular heartbeats to prove uptime or risk slashing."
+        "Ego includes a Decentralized Physical Infrastructure Network (DePIN) for compute. Users can rent idle hardware or book clusters.\n\n### How to Verify Your Rental\n1. In the **Compute** tab, find your active reservation and click **Connect**.\n2. Click the **Launch SSH Terminal** button.\n3. A **Hardware Report** will run automatically, showing the actual CPU cores, RAM, and GPU specs of the machine you are paying for."
     } else if q.contains("message") || q.contains("chat") || q.contains("messenger") {
         "Ego Messenger is a P2P end-to-end encrypted chat. It uses Kyber768 for initial key exchange and a Double Ratchet algorithm with AES-256-GCM for forward-secure messaging, delivered via the Kademlia DHT."
     } else if q.contains("egosafe") || q.contains("share") {
