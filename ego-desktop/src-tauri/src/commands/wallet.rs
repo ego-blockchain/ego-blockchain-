@@ -1433,13 +1433,22 @@ pub async fn get_reservation_connect_info(
 
     let ip = endpoint.split('/').nth(2).unwrap_or("127.0.0.1");
 
+    let is_relay = ip.contains("egoblockchain.com");
+    let how_to = if is_relay {
+        "The provider is behind a firewall/NAT. Direct SSH is blocked. They must enable Port Forwarding (Port 22) or use a direct IP to allow standard SSH clients to connect.".to_string()
+    } else {
+        "1. Click 'Launch SSH Terminal'. 2. If you see 'Permission denied', click the 'SSH Key' button in the Compute tab, copy your key, and send it to the provider so they can authorize your computer.".to_string()
+    };
+
     Ok(ReservationConnectInfo {
         reservation_id: res.reservation_id,
         status: res.status,
         provider_ip: ip.to_string(),
+        // Return a simple destination. The open_ssh_terminal command adds the 
+        // identity, security, and hardware report flags automatically.
         ssh_command: format!("ssh root@{}", ip),
-        note: "Note: Direct SSH access requires the provider to have Port 22 open on their router. If the connection times out, the provider might be blocking direct external access.".to_string(),
-        how_to_verify: "After connecting, a 'Rented Hardware Report' will automatically display the machine's actual CPU, RAM, and GPU specs for you to verify.".to_string(),
+        note: if is_relay { "⚠ Warning: Connecting to Relay. Direct access to provider is likely blocked." } else { "Note: The provider must have Port 22 open." }.to_string(),
+        how_to_verify: how_to,
     })
 }
 

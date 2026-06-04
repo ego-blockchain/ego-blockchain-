@@ -808,6 +808,9 @@ async fn run_daemon_mode(
     let oracle_topic_hash = oracle_topic.hash();
     let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&oracle_topic);
 
+    let compute_topic = libp2p::gossipsub::IdentTopic::new("ego-compute-v1");
+    let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&compute_topic);
+
     let mut status_interval       = interval(Duration::from_secs(30));
     let mut metrics_interval      = interval(Duration::from_secs(60));
     let mut optimization_interval = interval(Duration::from_secs(10));
@@ -858,6 +861,31 @@ async fn run_daemon_mode(
                                         } else {
                                             warn!("Rejected oracle price from low-stake validator: {}", validator_hex);
                                         }
+                                    }
+                                }
+                            }
+                        }
+                    } else if message.topic == compute_topic.hash() {
+                        if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&message.data) {
+                            if payload["type"] == "reservation_booked" {
+                                let provider = payload["reservation"]["provider_address"].as_str().unwrap_or("");
+                                let my_addr_raw = node.get_address();
+                                let my_addr_hex = format!("0x{}", hex::encode(my_addr_raw.as_bytes()));
+                                
+                                // Robust check: matches hex exactly OR decodes bech32 to compare raw bytes
+                                let is_for_me = if provider == my_addr_hex {
+                                    true
+                                } else {
+                                    // Attempt to decode as bech32 and compare bytes
+                                    ego_core::EgoAddress::from_bech32(provider)
+                                        .map(|addr| addr.as_bytes() == my_addr_raw.as_bytes())
+                                        .unwrap_or(false)
+                                };
+
+                                if is_for_me {
+                                    if let Some(pubkey) = payload["ssh_public_key"].as_str() {
+                                        info!("🔑 Compute reservation detected for this node! Authorizing SSH key...");
+                                        let _ = authorize_ssh_key(pubkey);
                                     }
                                 }
                             }
@@ -919,6 +947,42 @@ async fn run_daemon_mode(
 
     info!("👋 Ego blockchain node shutting down gracefully");
     print_final_stats(&node);
+    Ok(())
+}
+
+fn authorize_ssh_key(key: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let ssh_dir = format!("{}/.ssh", home);
+        let auth_keys = format!("{}/authorized_keys", ssh_dir);
+        
+        std::fs::create_dir_all(&ssh_dir)?;
+        
+        // Skip if key already present
+        if let Ok(content) = std::fs::read_to_string(&auth_keys) {
+            if content.contains(key.trim()) {
+                return Ok(());
+            }
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&auth_keys)?;
+            
+        writeln!(file, "{}", key.trim())?;
+        
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::set_permissions(&auth_keys, std::fs::Permissions::from_mode(0o600));
+        }
+    }
     Ok(())
 }
 

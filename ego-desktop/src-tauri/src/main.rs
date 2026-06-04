@@ -567,6 +567,7 @@ fn main() {
             commands::compute::get_reservations,
             commands::compute::terminate_reservation,
             commands::compute::open_ssh_terminal,
+            commands::compute::get_or_create_ssh_key,
             commands::storage_deals::create_storage_deal,
             commands::storage_deals::send_storage_proof,
             commands::storage_deals::get_storage_deals,

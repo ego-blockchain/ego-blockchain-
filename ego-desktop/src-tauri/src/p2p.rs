@@ -1742,6 +1742,8 @@ pub enum P2PMessage {
     },
     ReservationBooked {
         reservation: crate::chain_db::ComputeReservation,
+        #[serde(default)]
+        ssh_public_key: Option<String>,
     },
     ReservationHeartbeat {
         reservation_id: String,
@@ -4284,8 +4286,23 @@ async fn handle_event(
                             }).await.ok();
                         });
                     }
-                    Ok(P2PMessage::ReservationBooked { reservation }) => {
+                    Ok(P2PMessage::ReservationBooked { reservation, ssh_public_key }) => {
+                        let my_addr = crate::ledger::Ledger::load().address;
+                        // Robust comparison supporting hex (0x) vs bech32 (egot1)
+                        let is_for_me = if reservation.provider_address == my_addr {
+                            true
+                        } else {
+                            let my_hex = hex::encode(ego_core::EgoAddress::from_bech32(&my_addr).map(|a| a.to_bytes()).unwrap_or_default());
+                            reservation.provider_address.to_lowercase().trim_start_matches("0x") == my_hex
+                        };
+                        let key_to_auth = ssh_public_key.clone();
+
                         tokio::spawn(async move {
+                            if is_for_me {
+                                if let Some(key) = key_to_auth {
+                                    let _ = crate::commands::compute::authorize_ssh_key(&key);
+                                }
+                            }
                             tokio::task::spawn_blocking(move || {
                                 if crate::chain_db::get_compute_reservation(&reservation.reservation_id).is_none() {
                                     crate::chain_db::upsert_compute_reservation(&reservation);

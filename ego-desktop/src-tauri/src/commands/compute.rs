@@ -1173,10 +1173,15 @@ pub async fn book_reservation(
     if let Some(mut node) = crate::chain_db::get_compute_node(&offer.provider_address) {
         node.locked_cores  += offer.cpu_cores;
         node.locked_ram_gb += offer.ram_gb;
-        crate::chain_db::upsert_compute_node(&node);
+        crate::chain_db::upsert_compute_node(&node);    
     }
 
-    let msg = crate::p2p::P2PMessage::ReservationBooked { reservation: reservation.clone() };
+    let ssh_pub = get_or_create_ssh_key().await.unwrap_or_default();
+
+    let msg = crate::p2p::P2PMessage::ReservationBooked { 
+        reservation: reservation.clone(),
+        ssh_public_key: if ssh_pub.is_empty() { None } else { Some(ssh_pub) },
+    };
     crate::p2p::broadcast_compute_msg(msg).await;
     Ok(reservation.reservation_id)
 }
@@ -1451,9 +1456,7 @@ pub async fn get_compute_earnings() -> Result<ComputeEarnings, EgoDesktopError> 
             avg_per_job_uegoc: avg,
             last_24h_uegoc,
         })
-    })
-    .await
-    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
+    }).await.map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 /// Opens the system's default terminal and executes the SSH command.
@@ -1461,35 +1464,267 @@ pub async fn get_compute_earnings() -> Result<ComputeEarnings, EgoDesktopError> 
 #[tauri::command]
 pub async fn open_ssh_terminal(ssh_command: String) -> Result<(), EgoDesktopError> {
     // We append a command to show hardware info immediately upon login
-    let verify_cmd = "echo '--- RENTED HARDWARE REPORT ---'; echo -n 'CPU Cores: '; nproc; echo -n 'RAM: '; free -h | grep Mem | awk '{print $2}'; if command -v nvidia-smi &> /dev/null; then nvidia-smi --query-gpu=name,memory.total --format=csv,noheader; fi; exec bash";
-    let full_command = format!("{} -t \"{}\"", ssh_command, verify_cmd);
+    // This script runs on the REMOTE Linux machine.
+    let verify_cmd = "echo '--- RENTED HARDWARE REPORT ---'; echo -n 'CPU Cores: '; nproc; echo -n 'RAM: '; awk '/MemTotal/ {print $2/1024/1024}' /proc/meminfo; echo ' GB'; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader; exec bash";
+    
+    // Check if ssh is actually installed first to give a better error
+    let has_ssh = if cfg!(target_os = "windows") {
+        std::process::Command::new("where").arg("ssh").output().is_ok()
+    } else {
+        std::process::Command::new("which").arg("ssh").output().is_ok()
+    };
 
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("powershell")
-            .args(["-NoExit", "-Command", &full_command])
+        let target = ssh_command.strip_prefix("ssh ").unwrap_or(&ssh_command);
+        
+        // Escape $ for PowerShell and wrap remote command in escaped double quotes.
+        let ps_verify = verify_cmd.replace("$", "`$").replace("\"", "\\\"");
+        
+        // Detect OpenSSH path: check standard and 32-bit compatibility (Sysnative) paths
+        let ssh_exe = if std::path::Path::new("C:\\Windows\\System32\\OpenSSH\\ssh.exe").exists() {
+            "C:\\Windows\\System32\\OpenSSH\\ssh.exe"
+        } else if std::path::Path::new("C:\\Windows\\Sysnative\\OpenSSH\\ssh.exe").exists() {
+            "C:\\Windows\\Sysnative\\OpenSSH\\ssh.exe"
+        } else if has_ssh {
+            "ssh.exe"
+        } else {
+                    return Err(EgoDesktopError::NotFound(
+                "OpenSSH Client not found. Please install it via: \
+                 Settings -> Apps -> Optional Features -> Add 'OpenSSH Client'.".into()
+            ));
+        };    
+
+        // Automatically ensure the key exists before connecting
+        let key_path = ensure_ssh_key_on_disk()?;
+        let pub_key = get_or_create_ssh_key().await.unwrap_or_default();
+        
+        // Use single quotes for the path to handle spaces in Windows usernames reliably in PowerShell
+        let identity_flag = format!("-i '{}' -o IdentitiesOnly=yes", 
+            key_path.to_string_lossy().replace("'", "''"));
+
+        // Improved PowerShell command: Bypasses host warnings and provides help on failure
+        // Using single quotes for verify_cmd to prevent tokenization errors
+        let ps_verify_esc = ps_verify.replace("'", "''");
+        let ps_cmd = format!(
+            "& '{}' -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o LogLevel=ERROR {} {} -t '{}'; \
+             if ($LASTEXITCODE -ne 0) {{ \
+                Write-Host \"`n[!] Connection Failed\" -ForegroundColor Red; \
+                Write-Host \"If you see 'Permission denied', send your Public Key to the provider:`n\" -ForegroundColor Yellow; \
+                Write-Host '{}' -ForegroundColor Cyan; \
+                Write-Host \"`n[!] Also check: Is the machine behind a firewall? Is port 22 open?\" -ForegroundColor Gray; \
+             }}", 
+            ssh_exe, identity_flag, target, ps_verify_esc, pub_key);
+
+        use std::os::windows::process::CommandExt;
+                // Use absolute path for PowerShell to avoid "program not found" if PATH is restricted
+        let ps_path = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+        let mut cmd = if std::path::Path::new(ps_path).exists() {
+            std::process::Command::new(ps_path)
+        } else {
+            std::process::Command::new("powershell.exe")
+        };
+        cmd.args(["-NoExit", "-Command", &ps_cmd])
+            .creation_flags(0x00000010) // CREATE_NEW_CONSOLE
             .spawn()
-            .map_err(|e| EgoDesktopError::FileSystemError(format!("Failed to open terminal: {e}")))?;
+            .map_err(|e| EgoDesktopError::FileSystemError(format!("Failed to launch PowerShell: {e}. Try installing 'OpenSSH Client' in Windows Settings.")))?;
+
     }
+
     #[cfg(target_os = "macos")]
     {
-        let script = format!("tell application \"Terminal\" to do script \"{}\"", full_command);
-        std::process::Command::new("osascript")
-            .args(["-e", &script])
+        let final_ssh_cmd = if ssh_command.starts_with("ssh ") { 
+            ssh_command.clone() 
+        } else { 
+            format!("ssh {}", ssh_command) 
+        };
+
+        // Automatically ensure the key exists
+        let key_path = ensure_ssh_key_on_disk()?;
+        let identity_flag = format!("-i '{}' -o IdentitiesOnly=yes", key_path.to_string_lossy());
+
+        let full_command = format!("{} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR {} -t \"{}\"", 
+            final_ssh_cmd, identity_flag, verify_cmd.replace("\"", "\\\""));
+        let script = format!("tell application \"Terminal\" to do script \"{}\"", full_command.replace("\\", "\\\\").replace("\"", "\\\""));
+
+        if !has_ssh {
+            return Err(EgoDesktopError::NotFound("SSH client not found. Please install OpenSSH.".into()));
+        }
+
+        let osa_path = "/usr/bin/osascript";
+        let mut cmd = if std::path::Path::new(osa_path).exists() {
+            std::process::Command::new(osa_path)
+        } else {
+            std::process::Command::new("osascript")
+        };
+
+        cmd.args(["-e", &script])
             .spawn()
-            .map_err(|e| EgoDesktopError::FileSystemError(format!("Failed to open terminal: {e}")))?;
+            .map_err(|e| EgoDesktopError::FileSystemError(format!("Failed to launch Terminal via osascript: {e}")))?;
     }
+
     #[cfg(target_os = "linux")]
     {
-        let terminals = ["gnome-terminal", "konsole", "xfce4-terminal", "xterm"];
+        let final_ssh_cmd = if ssh_command.starts_with("ssh ") { 
+            ssh_command.clone() 
+        } else { 
+            format!("ssh {}", ssh_command) 
+        };
+
+        if !has_ssh {
+            return Err(EgoDesktopError::NotFound("SSH client not found. Please install 'openssh-client' using your package manager.".into()));
+        }
+
+        // Automatically ensure the key exists
+        let key_path = ensure_ssh_key_on_disk()?;
+        let identity_flag = format!("-i '{}' -o IdentitiesOnly=yes", key_path.to_string_lossy());
+
+        let full_command = format!("{} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR {} -t \"{}\"", 
+            final_ssh_cmd, identity_flag, verify_cmd.replace("\"", "\\\""));
+
+        // Expanded list of common Linux terminals
+        let terminals = [
+            "gnome-terminal", "konsole", "xfce4-terminal", "xterm", 
+            "alacritty", "kitty", "terminator", "tilix", "urxvt"
+        ];
         let mut success = false;
         for term in terminals {
             if std::process::Command::new(term)
-                .args(["--", "sh", "-c", &format!("{}; exec sh", full_command)])
+                .args(["--", "bash", "-c", &format!("{}; exec bash", full_command)])
                 .spawn()
                 .is_ok() { success = true; break; }
         }
-        if !success { return Err(EgoDesktopError::FileSystemError("No terminal emulator found".into())); }
+        if !success { return Err(EgoDesktopError::FileSystemError("No supported terminal found. Please install gnome-terminal or xterm.".into())); }
     }
     Ok(())
+}
+
+/// Internal helper to add a public key to the local authorized_keys file.
+/// This allows automated SSH access for renters.
+pub fn authorize_ssh_key(pub_key: &str) -> Result<(), EgoDesktopError> {
+    let pub_key = pub_key.trim();
+    if pub_key.is_empty() { return Ok(()); }
+
+    let home = dirs::home_dir()
+        .ok_or_else(|| EgoDesktopError::NotFound("Could not find home directory".into()))?;
+    let ssh_dir = home.join(".ssh");
+    if !ssh_dir.exists() {
+        std::fs::create_dir_all(&ssh_dir)
+            .map_err(|e| EgoDesktopError::FileSystemError(format!("Failed to create .ssh dir: {e}")))?;
+    }
+
+    let auth_keys_path = ssh_dir.join("authorized_keys");
+    let mut content = if auth_keys_path.exists() {
+        std::fs::read_to_string(&auth_keys_path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    if !content.contains(pub_key) {
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(pub_key);
+        content.push('\n');
+        std::fs::write(&auth_keys_path, content)
+            .map_err(|e| EgoDesktopError::FileSystemError(format!("Failed to write authorized_keys: {e}")))?;
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&auth_keys_path, std::fs::Permissions::from_mode(0o600));
+        }
+        eprintln!("[SSH] Authorized new key: {}...", &pub_key[..pub_key.len().min(30)]);
+    }
+    Ok(())
+}
+
+/// Internal helper to ensure the identity key exists, or generate it.
+fn ensure_ssh_key_on_disk() -> Result<std::path::PathBuf, EgoDesktopError> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| EgoDesktopError::NotFound("Could not find home directory".into()))?;
+    let ssh_dir = home.join(".ssh");
+    if !ssh_dir.exists() {
+        std::fs::create_dir_all(&ssh_dir)
+            .map_err(|e| EgoDesktopError::FileSystemError(format!("Failed to create .ssh dir: {e}")))?;
+    }
+
+    let key_path = ssh_dir.join("id_ed25519");
+    if !key_path.exists() {
+        eprintln!("[SSH] id_ed25519 missing, generating automatically...");
+        // Generate a new Ed25519 keypair without a passphrase
+        let keygen_exe = if cfg!(target_os = "windows") {
+            if std::path::Path::new("C:\\Windows\\System32\\OpenSSH\\ssh-keygen.exe").exists() {
+                "C:\\Windows\\System32\\OpenSSH\\ssh-keygen.exe"
+            } else if std::path::Path::new("C:\\Windows\\Sysnative\\OpenSSH\\ssh-keygen.exe").exists() {
+                "C:\\Windows\\Sysnative\\OpenSSH\\ssh-keygen.exe"
+            } else { "ssh-keygen.exe" }
+        } else { "ssh-keygen" };
+
+        let mut cmd = std::process::Command::new(keygen_exe);
+        cmd.args([
+            "-t", "ed25519",
+            "-N", "", // empty passphrase
+            "-f", &key_path.to_string_lossy(),
+            "-C", "ego-compute-key"
+        ]);
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+
+        let output = cmd.output()
+            .map_err(|e| EgoDesktopError::FileSystemError(format!("Failed to run ssh-keygen: {e}. Please ensure OpenSSH Client is installed.")))?;
+        
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            return Err(EgoDesktopError::FileSystemError(format!("ssh-keygen failed: {err}")));
+        }
+
+        // On Unix, ensure the private key has the correct 600 permissions
+        #[cfg(not(target_os = "windows"))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&key_path).map_err(|e| EgoDesktopError::FileSystemError(e.to_string()))?.permissions();
+            perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(&key_path, perms);
+        }
+    }
+    Ok(key_path)
+}
+
+/// Returns the user's public SSH key (Ed25519). 
+/// If no key exists, it attempts to generate one automatically without a passphrase.
+/// This makes it easy for non-technical users to provide their key to compute providers.
+#[tauri::command]
+pub async fn get_or_create_ssh_key() -> Result<String, EgoDesktopError> {
+    tokio::task::spawn_blocking(|| {
+        let key_path = ensure_ssh_key_on_disk()?;
+        let pub_path = key_path.with_extension("pub");
+
+        if pub_path.exists() {
+            let content = std::fs::read_to_string(&pub_path)
+                .map_err(|e| EgoDesktopError::FileSystemError(format!("Failed to read public key: {e}")))?;
+            Ok(content.trim().to_string())
+        } else {
+            // Try to re-derive the public key if .pub is missing but private is there
+            let keygen_exe = if cfg!(target_os = "windows") {
+                if std::path::Path::new("C:\\Windows\\System32\\OpenSSH\\ssh-keygen.exe").exists() {
+                    "C:\\Windows\\System32\\OpenSSH\\ssh-keygen.exe"
+                } else if std::path::Path::new("C:\\Windows\\Sysnative\\OpenSSH\\ssh-keygen.exe").exists() {
+                    "C:\\Windows\\Sysnative\\OpenSSH\\ssh-keygen.exe"
+                } else { "ssh-keygen.exe" }
+            } else { "ssh-keygen" };
+
+            let output = std::process::Command::new(keygen_exe)
+                .args(["-y", "-f", &key_path.to_string_lossy()])
+                .output()
+                .map_err(|e| EgoDesktopError::FileSystemError(e.to_string()))?;
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
