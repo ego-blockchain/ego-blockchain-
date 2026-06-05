@@ -884,13 +884,13 @@ async fn run_daemon_mode(
                                 };
 
                                 if is_for_me {
-                                    if let Some(pubkey) = payload["ssh_public_key"].as_str() {
-                                        info!("🔑 Compute reservation detected for this node! Authorizing SSH key...");
-                                        
-                                        let res_id = payload["reservation"]["reservation_id"].as_str().unwrap_or_default().to_string();
-                                        let buyer = payload["reservation"]["buyer_address"].as_str().unwrap_or_default().to_string();
-                                        rpc_state.active_renters.lock().unwrap().insert(res_id, buyer);
+                                    let res_id = payload["reservation"]["reservation_id"].as_str().unwrap_or_default().to_string();
+                                    let buyer = payload["reservation"]["buyer_address"].as_str().unwrap_or_default().to_string();
+                                    info!("🖥️ Compute reservation {} detected for buyer {}! Authorizing Web Console...", res_id, buyer);
+                                    rpc_state.active_renters.lock().unwrap().insert(res_id, buyer);
 
+                                    if let Some(pubkey) = payload["ssh_public_key"].as_str() {
+                                        info!("🔑 Authorizing SSH key for this reservation...");
                                         let _ = authorize_ssh_key(pubkey);
                                     }
                                 }

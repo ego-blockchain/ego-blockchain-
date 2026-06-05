@@ -823,11 +823,20 @@ async fn handle_exec(
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid public key").into_response(),
     };
     let derived_addr = Address::from_public_key(&pk);
-    let derived_hex = format!("0x{}", hex::encode(derived_addr.as_bytes()));
     
     // Simple check: does the key provided match the renter of this reservation?
-    // (In production, we'd handle bech32/hex comparison more robustly)
-    if !buyer_addr.contains(&derived_hex[2..]) {
+    let is_match = if buyer_addr.starts_with("egot") || buyer_addr.starts_with("ego1") {
+        // Handle Bech32 comparison (21-byte EgoAddress vs 20-byte raw Address)
+        ego_core::EgoAddress::from_bech32(&buyer_addr, "egot")
+            .map(|a| &a.as_bytes()[1..] == derived_addr.as_bytes())
+            .unwrap_or(false)
+    } else {
+        // Handle raw hex comparison
+        let clean = buyer_addr.trim_start_matches("0x");
+        hex::encode(derived_addr.as_bytes()) == clean.to_lowercase()
+    };
+
+    if !is_match {
         return (StatusCode::FORBIDDEN, "Forbidden: Public key does not match reservation buyer").into_response();
     }
 
