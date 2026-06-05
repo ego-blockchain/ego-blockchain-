@@ -878,7 +878,8 @@ async fn run_daemon_mode(
                                     true
                                 } else {
                                     // Attempt to decode as bech32 and compare bytes
-                                    ego_core::EgoAddress::from_bech32(provider, "egot")
+                                    let hrp = if provider.starts_with("egot") { "egot" } else { "ego" };
+                                    ego_core::EgoAddress::from_bech32(provider, hrp)
                                         .map(|addr| &addr.as_bytes()[1..] == my_addr_raw.as_bytes())
                                         .unwrap_or(false)
                                 };

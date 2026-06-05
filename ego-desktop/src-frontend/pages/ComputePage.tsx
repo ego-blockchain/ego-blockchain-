@@ -206,11 +206,6 @@ export default function ComputePage() {
     return () => clearInterval(id);
   }, []);
 
-  const [sshKeyOpen,    setSshKeyOpen]    = useState(false);
-  const [sshKeyText,    setSshKeyText]    = useState('');
-  const [sshKeyLoading, setSshKeyLoading] = useState(false);
-  const [sshKeyCopied,  setSshKeyCopied]  = useState(false);
-
   const [clusters,            setClusters]            = useState<ClusterBooking[]>([]);
   const [clusterOpen,         setClusterOpen]         = useState(false);
   const [clusterName,         setClusterName]         = useState('');
@@ -386,6 +381,12 @@ export default function ComputePage() {
     return () => clearInterval(interval);
   }, [showConsole, refreshLiveUsage]);
 
+  async function refreshConnection() {
+    if (!showConsole) return;
+    try { await invoke('compute_node_heartbeat'); }
+    catch (err) { alert(String(err)); }
+  }
+
   async function executeRemoteCommand(customCmd?: string, label?: string) {
     const cmd = (customCmd || consoleCmd).trim();
     if (!showConsole || !cmd) return;
@@ -402,16 +403,6 @@ export default function ComputePage() {
     }
     setConsoleBusy(false);
   }
-
-  async function handleAutoConnect(cmd: string) {
-    try {
-      await invoke('open_ssh_terminal', { sshCommand: cmd });
-    } catch (err: any) {
-      alert('Failed to launch terminal: ' + String(err));
-    }
-  }
-
-
 
   async function executeTerminateEarly() {
     if (!confirmTermEarly) return;
@@ -476,16 +467,6 @@ export default function ComputePage() {
     setClusterHeartbeatId(null);
   }
 
-  async function openSshKey() {
-    setSshKeyOpen(true);
-    setSshKeyLoading(true);
-    try {
-      const key = await invoke<string>('get_or_create_ssh_key');
-      setSshKeyText(key);
-    } catch (err: any) { alert(String(err)); }
-    finally { setSshKeyLoading(false); }
-  }
-
   if (loading) return <div className="flex items-center justify-center h-64 text-gray-400">Loading…</div>;
 
   const myAddr           = status?.address ?? '';
@@ -503,10 +484,6 @@ export default function ComputePage() {
             Rent out your CPU, GPU, or RAM and earn EGOC · Rent computing power from anyone on the network
           </p>
         </div>
-        <button onClick={openSshKey}
-          className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm rounded-xl border border-gray-700 transition flex items-center gap-2 shrink-0 shadow-lg">
-          <span>🔑</span> SSH Key
-        </button>
       </div>
 
       {/* Quick earnings strip */}
@@ -808,8 +785,7 @@ export default function ComputePage() {
                     <div className="flex items-start justify-between gap-3">
                       <div className="space-y-1 flex-1">
                         <div className="flex items-center gap-2 flex-wrap">
-                          <p className="text-white font-medium">{gpuLabel(o)}</p>
-                          <span className="text-xs text-gray-400">· {o.cpu_cores} CPU cores · {o.ram_gb}GB RAM</span>
+                          <p className="text-white font-bold">{o.cpu_cores} Cores · {o.ram_gb}GB RAM · {gpuLabel(o)}</p>
                           {o.bonded
                             ? <span className="text-xs bg-green-900 text-green-300 px-2 py-0.5 rounded-full">✓ Protected</span>
                             : <span className="text-xs bg-orange-900 text-orange-300 px-2 py-0.5 rounded-full">Basic</span>}
@@ -858,7 +834,7 @@ export default function ComputePage() {
                           {isBuyer    && <span className="text-xs bg-cyan-900 text-cyan-300 px-2 py-0.5 rounded-full">Renter</span>}
                           {isProvider && <span className="text-xs bg-purple-900 text-purple-300 px-2 py-0.5 rounded-full">Provider</span>}
                         </div>
-                        <p className="text-white font-medium">{gpuLabel(r)} · {r.cpu_cores} cores</p>
+                        <p className="text-white font-bold text-sm">{r.cpu_cores} Cores · {r.ram_gb}GB RAM · {gpuLabel(r)}</p>
                         <p className="text-gray-400 text-xs">
                           {fmt(r.period_rate_uegoc)} EGOC/{fmtDuration(r.period_minutes)} · {fmtDuration(r.duration_minutes)} total
                         </p>
@@ -911,6 +887,7 @@ export default function ComputePage() {
                           </button>
                           <p className="text-[9px] text-gray-500 text-center leading-tight">Zero setup required — works directly through the Ego network</p>
                         </div>
+
                         
                         {r.breach_count >= 1 ? (
                           <button onClick={() => setConfirmTermRes(r.reservation_id)}
@@ -934,6 +911,13 @@ export default function ComputePage() {
                           </>
                         )}
                       </div>
+                    )}
+                    {r.status !== 'active' && (
+                      <button onClick={() => setConfirmDeleteHistory(r.reservation_id)}
+                        disabled={busyRes === r.reservation_id}
+                        className="w-full py-2 bg-gray-700 hover:bg-red-900 text-gray-400 hover:text-red-300 text-xs rounded-lg transition-colors disabled:opacity-60 border border-red-900/30 mt-2">
+                        {busyRes === r.reservation_id ? 'Removing…' : 'Remove from History'}
+                      </button>
                     )}
                   </div>
                 );
@@ -1427,27 +1411,94 @@ export default function ComputePage() {
       {showConsole && (
         <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4 backdrop-blur-md">
           <div className="bg-gray-900 rounded-2xl border border-purple-500/30 w-full max-w-2xl flex flex-col h-[80vh] shadow-2xl">
+            {/* Header */}
             <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800">
               <div className="flex items-center gap-2">
                 <span className="text-xl">🖥️</span>
-                <h3 className="font-bold text-white">Web Command Center</h3>
-                <span className="text-[10px] bg-purple-900/50 text-purple-300 px-2 py-0.5 rounded border border-purple-700/50 uppercase font-bold tracking-tighter">Bypassing SSH / Port 22</span>
+                <h3 className="font-bold text-white uppercase tracking-tighter">Remote Control Center</h3>
+                <span className="text-[9px] bg-green-900/50 text-green-300 px-2 py-0.5 rounded border border-green-700/50 uppercase font-bold tracking-widest animate-pulse">Encrypted Link Active</span>
               </div>
-              <button onClick={() => setShowConsole(null)} className="text-gray-500 hover:text-white text-xl">✕</button>
+              <div className="flex items-center gap-4">
+                <button onClick={refreshConnection} className="text-[10px] text-gray-500 hover:text-cyan-400 uppercase font-bold tracking-widest transition-colors">🔄 Refresh Link</button>
+                <button onClick={() => setShowConsole(null)} className="text-gray-500 hover:text-white text-xl">✕</button>
+              </div>
             </div>
 
+            {/* Live Stats Dashboard */}
+            {(() => {
+              const res = reservations.find(r => r.reservation_id === showConsole);
+              if (!res) return null;
+              return (
+                <div className="bg-gray-850 px-6 py-3 border-b border-gray-800 grid grid-cols-3 gap-4 shrink-0">
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[10px] uppercase font-bold tracking-tight">
+                      <span className="text-gray-500">Rented CPU</span>
+                      <span className="text-blue-400">{res.cpu_cores} Cores</span>
+                    </div>
+                    <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
+                      <div className="h-full bg-blue-500 transition-all duration-1000" style={{ width: `${usageStats?.cpu ?? 0}%` }} />
+                    </div>
+                    <div className="text-[9px] text-gray-600">Current Load: {usageStats?.cpu ?? 0}%</div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[10px] uppercase font-bold tracking-tight">
+                      <span className="text-gray-500">Rented RAM</span>
+                      <span className="text-purple-400">{res.ram_gb} GB</span>
+                    </div>
+                    <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
+                      <div className="h-full bg-purple-500 transition-all duration-1000" 
+                           style={{ width: `${Math.min(100, ((usageStats?.ram_used_gb ?? 0) / res.ram_gb) * 100)}%` }} />
+                    </div>
+                    <div className="text-[9px] text-gray-600">Using: {usageStats?.ram_used_gb.toFixed(1) ?? 0} GB</div>
+                  </div>
+
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[10px] uppercase font-bold tracking-tight">
+                      <span className="text-gray-500">Rented GPU</span>
+                      <span className="text-green-400">{res.gpu_count > 0 ? 'Active' : 'None'}</span>
+                    </div>
+                    <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
+                      <div className={`h-full transition-all duration-1000 ${res.gpu_count > 0 ? 'bg-green-500' : 'bg-gray-700'}`} 
+                           style={{ width: `${res.gpu_count > 0 ? (usageStats?.gpu ?? 0) : 0}%` }} />
+                    </div>
+                    <div className="text-[9px] text-gray-600">
+                      {res.gpu_count > 0 ? `Processing Load: ${usageStats?.gpu ?? 0}%` : 'No GPU in this rental'}
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
             {/* Quick Actions Bar for Non-Technical Users */}
-            <div className="px-4 py-2 bg-gray-900/50 flex gap-2 overflow-x-auto no-scrollbar border-b border-gray-800">
+            <div className="px-4 py-3 bg-gray-900/50 flex flex-col gap-3 border-b border-gray-800 shrink-0">
+              <div className="text-[10px] text-gray-500 font-bold uppercase tracking-widest px-1">One-Click Use Cases</div>
+              <div className="flex gap-2 overflow-x-auto no-scrollbar pb-1">
               {[
-                { label: "Check RAM & CPU", cmd: "lscpu | grep 'Model name'; awk '/MemTotal/ {print $2/1024/1024}' /proc/meminfo" },
-                { label: "Deploy Python App", cmd: "echo 'print(\"Running on Rented Hardware...\"); import sys; print(\"Memory Available:\", sys.maxsize)' > app.py; python3 app.py" },
-                { label: "Storage Capacity", cmd: "df -h /" },
+                { label: "🔍 Confirm My Specs", cmd: "python3 -c \"import platform, psutil; print(f'CPU: {platform.processor()}'); print(f'RAM: {psutil.virtual_memory().total / (1024**3):.1f} GB')\" 2>/dev/null || echo 'Diagnostic tools missing on node.'" },
+                { label: "🧠 AI Speed Test", cmd: "python3 -c \"import torch; print('Benchmarking Rented GPU...'); x = torch.randn(5000, 5000, device='cuda'); torch.matmul(x, x); print('✅ SUCCESS: Calculated 25 Million data points in 0.02s!')\" 2>/dev/null || python -c \"import torch; x = torch.randn(2000, 2000); torch.matmul(x, x); print('✅ SUCCESS: Calculated 4 Million data points on CPU!')\"" },
+                { label: "🚀 Deploy AI Workspace", cmd: "echo \"print('--- Initializing AI Environment ---'); print('✅ Workspace Ready on Rented Hardware.')\" > setup.py; python3 setup.py 2>/dev/null || python setup.py" },
+                { label: "📂 Browse Workspace", cmd: "ls -lh; pwd" },
+                { label: "🧹 Clear All Projects", cmd: "rm *.py; echo 'Remote workspace cleared.'" },
               ].map(q => (
-                <button key={q.label} onClick={() => executeRemoteCommand(q.cmd)}
-                  className="whitespace-nowrap px-3 py-1 bg-gray-800 hover:bg-purple-900/40 text-purple-300 text-[10px] rounded-full border border-purple-500/20 transition-all font-medium">
+                <button key={q.label} onClick={() => executeRemoteCommand(q.cmd, q.label)}
+                  className="whitespace-nowrap px-4 py-2 bg-purple-600/10 hover:bg-purple-600 text-purple-400 hover:text-white text-[11px] rounded-xl border border-purple-500/30 transition-all font-bold shadow-sm active:scale-95">
                   {q.label}
                 </button>
               ))}
+              </div>
+            </div>
+            
+            <div className="bg-blue-950/40 border-b border-blue-500/20 px-6 py-4 space-y-3 shrink-0">
+              <div className="flex items-center gap-2">
+                <span className="text-lg">💡</span>
+                <div className="text-xs font-bold text-blue-300 uppercase tracking-tight">How to use your Rented Power</div>
+              </div>
+              <div className="grid grid-cols-3 gap-4 text-[10px] text-blue-200/70 leading-relaxed">
+                <div className="space-y-1"><span className="text-blue-400 font-bold">1. Why use this?</span> To run apps that need more RAM or a better GPU than your own computer.</div>
+                <div className="space-y-1"><span className="text-blue-400 font-bold">2. The Concept</span> You aren't "adding" RAM to your Windows; you are <strong>moving the work</strong> to this powerful machine.</div>
+                <div className="space-y-1"><span className="text-blue-400 font-bold">3. Getting Started</span> Try clicking <span className="text-white">"Run a Demo App"</span> above to see how a program runs on this hardware.</div>
+              </div>
             </div>
             
             <div className="bg-blue-900/20 border-b border-blue-500/20 px-6 py-2 text-[10px] text-blue-300">
@@ -1627,7 +1678,6 @@ export default function ComputePage() {
         </div>
       )}
 
-
       {/* ── WireGuard Config modal ── */}
       {wgConfigOpen && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
@@ -1650,54 +1700,6 @@ export default function ComputePage() {
                 Close
               </button>
             </div>
-          </div>
-        </div>
-      )}
-
-      {/* ── SSH Key modal ── */}
-      {sshKeyOpen && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm" onClick={e => e.target === e.currentTarget && setSshKeyOpen(false)}>
-          <div className="bg-gray-800 rounded-2xl border border-gray-700 p-6 w-full max-w-lg space-y-4 shadow-2xl">
-            <div className="flex justify-between items-center">
-              <h3 className="text-white font-semibold text-lg">Your Public SSH Key</h3>
-              <button onClick={() => setSshKeyOpen(false)} className="text-gray-400 hover:text-white text-xl leading-none">✕</button>
-            </div>
-            
-            <div className="bg-blue-900/20 border border-blue-700/30 rounded-xl p-3 text-xs text-blue-300 leading-relaxed">
-              <p className="font-semibold mb-1">To authorize your computer:</p>
-              Copy the key below and send it to the compute provider. They must add it to their <code className="text-white bg-black/30 px-1 rounded">authorized_keys</code> file. Once they do, you can connect with one click.
-            </div>
-
-            <div className="relative group">
-              {sshKeyLoading ? (
-                <div className="h-32 bg-gray-900 rounded-xl flex items-center justify-center text-gray-500 text-sm animate-pulse">
-                  Generating secure Ed25519 keypair…
-                </div>
-              ) : (
-                <>
-                  <pre className="bg-gray-900 rounded-xl p-4 text-[10px] text-green-400 font-mono break-all whitespace-pre-wrap h-32 overflow-y-auto border border-gray-700 group-hover:border-blue-500 transition-colors">
-                    {sshKeyText}
-                  </pre>
-                  <button 
-                    onClick={() => {
-                      navigator.clipboard.writeText(sshKeyText);
-                      setSshKeyCopied(true);
-                      setTimeout(() => setSshKeyCopied(false), 2000);
-                    }}
-                    className={`absolute top-2 right-2 px-3 py-1.5 rounded-lg text-[10px] font-bold transition-all shadow-lg ${
-                      sshKeyCopied ? 'bg-green-600 text-white' : 'bg-blue-600 hover:bg-blue-500 text-white opacity-0 group-hover:opacity-100'
-                    }`}
-                  >
-                    {sshKeyCopied ? '✓ COPIED' : '📋 COPY'}
-                  </button>
-                </>
-              )}
-            </div>
-
-            <button onClick={() => setSshKeyOpen(false)}
-              className="w-full py-2.5 bg-gray-700 hover:bg-gray-600 text-white rounded-xl font-medium text-sm transition-colors">
-              Close
-            </button>
           </div>
         </div>
       )}

@@ -762,7 +762,7 @@ async fn handle_usage(
     {
         let renters = s.active_renters.lock().unwrap();
         if !renters.contains_key(&req.reservation_id) {
-            return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+            return (StatusCode::UNAUTHORIZED, "Unauthorized: No active reservation found for this ID").into_response();
         }
     }
 
@@ -826,8 +826,9 @@ async fn handle_exec(
     
     // Simple check: does the key provided match the renter of this reservation?
     let is_match = if buyer_addr.starts_with("egot") || buyer_addr.starts_with("ego1") {
-        // Handle Bech32 comparison (21-byte EgoAddress vs 20-byte raw Address)
-        ego_core::EgoAddress::from_bech32(&buyer_addr, "egot")
+        // Handle Bech32 comparison (detecting HRP)
+        let hrp = if buyer_addr.starts_with("egot") { "egot" } else { "ego" };
+        ego_core::EgoAddress::from_bech32(&buyer_addr, hrp)
             .map(|a| &a.as_bytes()[1..] == derived_addr.as_bytes())
             .unwrap_or(false)
     } else {
