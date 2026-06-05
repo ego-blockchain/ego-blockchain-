@@ -237,6 +237,18 @@ pub async fn compute_node_heartbeat() {
             let msg = crate::p2p::P2PMessage::CapacityOfferBroadcast { offer };
             crate::p2p::broadcast_compute_msg(msg).await;
         }
+
+        // Re-broadcast active reservations where I am the provider so headless nodes relearn console auth
+        let my_res = tokio::task::spawn_blocking(move || {
+            crate::chain_db::list_compute_reservations().into_iter()
+                .filter(|r| r.provider_address == owner && r.status == "active")
+                .collect::<Vec<_>>()
+        }).await.unwrap_or_default();
+
+        for reservation in my_res {
+            let msg = crate::p2p::P2PMessage::ReservationBooked { reservation, ssh_public_key: None };
+            crate::p2p::broadcast_compute_msg(msg).await;
+        }
     }
     
     tokio::task::spawn_blocking(crate::chain_db::prune_stale_compute_nodes).await.ok();
