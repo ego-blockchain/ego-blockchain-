@@ -33,7 +33,6 @@ zeroize = { version = "1.7.0", features = ["zeroize_derive"] }
 argon2 = { version = "0.5", features = ["std"] }
 sysinfo = "0.31"
 hex = "0.4"
-chrono = { version = "0.4", features = ["serde"] }
 getrandom  = "0.2"
 rocksdb = "0.22"
 reqwest = { version = "0.12", features = ["json"] }
