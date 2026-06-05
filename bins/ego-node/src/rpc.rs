@@ -9,6 +9,7 @@ use ego_core::{AccountType, Address, AlgorithmId, Balance, Block, KeyPair, Publi
 use ego_core::state::{MIN_VALIDATOR_STAKE, ValidatorStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sysinfo::{System, CpuRefreshKind};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -764,11 +765,10 @@ async fn handle_usage(
     }
 
     // 2. Native System Check (Cross-platform)
-    use sysinfo::{System, CpuRefreshKind};
     let mut sys = System::new();
     sys.refresh_cpu_specifics(CpuRefreshKind::new().with_cpu_usage());
     sys.refresh_memory();
-    
+
     // Small sleep to get accurate CPU diff
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     sys.refresh_cpu_usage();
@@ -852,9 +852,13 @@ async fn handle_exec(
     match output {
         Ok(o) => {
             let combined = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
-            if o.status.success() { (StatusCode::OK, combined).into_response() } else { (StatusCode::BAD_REQUEST, combined).into_response() }
+            if o.status.success() {
+                (StatusCode::OK, combined).into_response()
+            } else {
+                (StatusCode::BAD_REQUEST, combined).into_response()
+            }
         },
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("System Error: {}", e)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("System Error: {e}")).into_response(),
     }
 }
 
