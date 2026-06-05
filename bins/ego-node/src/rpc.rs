@@ -768,7 +768,7 @@ async fn handle_usage(
 
     // 2. Native System Check (Cross-platform)
     let mut sys = System::new();
-    sys.refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
+    sys.refresh_cpu_specifics(CpuRefreshKind::new().with_cpu_usage());
     sys.refresh_memory();
 
     // Small sleep to get accurate CPU diff
