@@ -186,13 +186,30 @@ export default function ComputePage() {
   const [confirmRemove,    setConfirmRemove]    = useState<string | null>(null);
   const [confirmTermRes,   setConfirmTermRes]   = useState<string | null>(null);
   const [confirmTermEarly, setConfirmTermEarly] = useState<{ id: string, penalty: number } | null>(null);
+  const [confirmDeleteHistory, setConfirmDeleteHistory] = useState<string | null>(null);
   const [confirmTermCluster, setConfirmTermCluster] = useState<string | null>(null);
+
+  const [showConsole,    setShowConsole]    = useState<string | null>(null);
+  const [consoleCmd,     setConsoleCmd]     = useState('');
+  const [consoleOut,     setConsoleOut]     = useState('');
+  const [consoleBusy,    setConsoleBusy]    = useState(false);
+
+  const [usageStats, setUsageStats] = useState<{
+    cpu: number;
+    ram_used_gb: number;
+    gpu: number;
+  } | null>(null);
+
+  const [now, setNow] = useState(Math.floor(Date.now() / 1000));
+  useEffect(() => {
+    const id = setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000);
+    return () => clearInterval(id);
+  }, []);
 
   const [sshKeyOpen,    setSshKeyOpen]    = useState(false);
   const [sshKeyText,    setSshKeyText]    = useState('');
   const [sshKeyLoading, setSshKeyLoading] = useState(false);
   const [sshKeyCopied,  setSshKeyCopied]  = useState(false);
-  const [resConnectInfo,   setResConnectInfo]   = useState<ReservationConnectInfo | null>(null);
 
   const [clusters,            setClusters]            = useState<ClusterBooking[]>([]);
   const [clusterOpen,         setClusterOpen]         = useState(false);
@@ -326,6 +343,66 @@ export default function ComputePage() {
     setBusyRes(null);
   }
 
+  async function executeDeleteHistoryItem() {
+    if (!confirmDeleteHistory) return;
+    const id = confirmDeleteHistory;
+    setConfirmDeleteHistory(null);
+    setBusyRes(id);
+    try {
+      await invoke('delete_reservation_history_item', { reservationId: id });
+      await load();
+    } catch (err: any) { alert(String(err)); }
+    setBusyRes(null);
+  }
+
+  function getLiveCost(r: ComputeReservation) {
+    const elapsed = Math.max(0, now - r.created_at);
+    const periodSecs = Math.max(1, r.period_minutes * 60);
+    const ratePerSec = r.period_rate_uegoc / periodSecs;
+    return Math.min(r.total_cost_uegoc, Math.floor(elapsed * ratePerSec));
+  }
+
+  const refreshLiveUsage = useCallback(async (resId: string) => {
+    try {
+      const stats = await invoke<any>('get_remote_usage', { reservationId: resId });
+      if (stats && typeof stats.cpu === 'number') {
+        setUsageStats({
+          cpu: Math.round(stats.cpu),
+          ram_used_gb: stats.ram_used_gb,
+          gpu: stats.gpu
+        });
+      }
+    } catch (e) { console.error("Usage poll failed", e); }
+  }, []);
+
+  useEffect(() => {
+    let interval: any;
+    if (showConsole) {
+      refreshLiveUsage(showConsole);
+      interval = setInterval(() => refreshLiveUsage(showConsole), 5000);
+    } else {
+      setUsageStats(null);
+    }
+    return () => clearInterval(interval);
+  }, [showConsole, refreshLiveUsage]);
+
+  async function executeRemoteCommand(customCmd?: string, label?: string) {
+    const cmd = (customCmd || consoleCmd).trim();
+    if (!showConsole || !cmd) return;
+    const id = showConsole;
+    setConsoleBusy(true);
+    try {
+      const res = await invoke<string>('run_remote_command', { reservationId: id, command: cmd });
+      const displayTag = label ? `\n--- EXECUTE: ${label.toUpperCase()} ---\n` : `\n> ${cmd}\n`;
+      setConsoleOut(prev => prev + `${displayTag}${res}\n`);
+      if (!customCmd) setConsoleCmd('');
+    } catch (err: any) {
+      const displayTag = label ? `\n--- FAILED: ${label.toUpperCase()} ---\n` : `\n> ${cmd}\n`;
+      setConsoleOut(prev => prev + `${displayTag}Error: ${String(err)}\n`);
+    }
+    setConsoleBusy(false);
+  }
+
   async function handleAutoConnect(cmd: string) {
     try {
       await invoke('open_ssh_terminal', { sshCommand: cmd });
@@ -334,12 +411,7 @@ export default function ComputePage() {
     }
   }
 
-  async function showResConnectInfo(reservationId: string) {
-    try {
-      const info = await invoke<ReservationConnectInfo>('get_reservation_connect_info', { reservationId });
-      setResConnectInfo(info);
-    } catch (err: any) { alert(String(err)); }
-  }
+
 
   async function executeTerminateEarly() {
     if (!confirmTermEarly) return;
@@ -828,10 +900,17 @@ export default function ComputePage() {
 
                     {r.status === 'active' && isBuyer && (
                       <div className="flex flex-col gap-2 w-full mt-3 pt-3 border-t border-gray-700">
-                        <button onClick={() => showResConnectInfo(r.reservation_id)}
-                          className="w-full py-2 bg-cyan-700 hover:bg-cyan-600 text-white text-sm rounded-lg font-medium shadow-lg">
-                          Connect (SSH)
-                        </button>
+                        <div className="p-2.5 bg-purple-900/20 border border-purple-500/30 rounded-xl space-y-2">
+                          <div className="flex items-center justify-between">
+                            <span className="text-[10px] font-bold text-purple-300 uppercase tracking-widest">Instant Access</span>
+                            <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
+                          </div>
+                          <button onClick={() => { setShowConsole(r.reservation_id); setConsoleOut(''); setConsoleCmd(''); }}
+                            className="w-full py-2.5 bg-purple-600 hover:bg-purple-500 text-white text-sm rounded-lg font-bold shadow-xl transition-all active:scale-95 flex items-center justify-center gap-2">
+                            <span>🖥️</span> One-Click Web Console
+                          </button>
+                          <p className="text-[9px] text-gray-500 text-center leading-tight">Zero setup required — works directly through the Ego network</p>
+                        </div>
                         
                         {r.breach_count >= 1 ? (
                           <button onClick={() => setConfirmTermRes(r.reservation_id)}
@@ -1290,6 +1369,29 @@ export default function ComputePage() {
         </div>
       )}
 
+      {/* ── Delete History Item confirmation modal ── */}
+      {confirmDeleteHistory && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-xl border border-red-800/50 p-6 w-full max-w-sm space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-full bg-red-900/40 flex items-center justify-center shrink-0">
+                <svg className="w-5 h-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+              </div>
+              <div>
+                <h3 className="text-white font-semibold">Remove from history?</h3>
+                <p className="text-gray-400 text-sm mt-1">This will permanently clear this record from your local history.</p>
+              </div>
+            </div>
+            <div className="flex gap-3 pt-1">
+              <button onClick={executeDeleteHistoryItem} className="flex-1 py-2.5 bg-red-700 hover:bg-red-600 text-white rounded-lg text-sm font-medium transition-colors">Yes, remove</button>
+              <button onClick={() => setConfirmDeleteHistory(null)} className="flex-1 py-2.5 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm transition-colors">Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Terminate Cluster confirmation modal ── */}
       {confirmTermCluster && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
@@ -1316,6 +1418,62 @@ export default function ComputePage() {
                 className="flex-1 py-2.5 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm transition-colors">
                 Cancel
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Remote Console Modal ── */}
+      {showConsole && (
+        <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4 backdrop-blur-md">
+          <div className="bg-gray-900 rounded-2xl border border-purple-500/30 w-full max-w-2xl flex flex-col h-[80vh] shadow-2xl">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800">
+              <div className="flex items-center gap-2">
+                <span className="text-xl">🖥️</span>
+                <h3 className="font-bold text-white">Web Command Center</h3>
+                <span className="text-[10px] bg-purple-900/50 text-purple-300 px-2 py-0.5 rounded border border-purple-700/50 uppercase font-bold tracking-tighter">Bypassing SSH / Port 22</span>
+              </div>
+              <button onClick={() => setShowConsole(null)} className="text-gray-500 hover:text-white text-xl">✕</button>
+            </div>
+
+            {/* Quick Actions Bar for Non-Technical Users */}
+            <div className="px-4 py-2 bg-gray-900/50 flex gap-2 overflow-x-auto no-scrollbar border-b border-gray-800">
+              {[
+                { label: "Check RAM & CPU", cmd: "lscpu | grep 'Model name'; awk '/MemTotal/ {print $2/1024/1024}' /proc/meminfo" },
+                { label: "Deploy Python App", cmd: "echo 'print(\"Running on Rented Hardware...\"); import sys; print(\"Memory Available:\", sys.maxsize)' > app.py; python3 app.py" },
+                { label: "Storage Capacity", cmd: "df -h /" },
+              ].map(q => (
+                <button key={q.label} onClick={() => executeRemoteCommand(q.cmd)}
+                  className="whitespace-nowrap px-3 py-1 bg-gray-800 hover:bg-purple-900/40 text-purple-300 text-[10px] rounded-full border border-purple-500/20 transition-all font-medium">
+                  {q.label}
+                </button>
+              ))}
+            </div>
+            
+            <div className="bg-blue-900/20 border-b border-blue-500/20 px-6 py-2 text-[10px] text-blue-300">
+              💡 <strong>Renter Tip:</strong> To use the rented RAM (e.g. 2GB + 8GB), run your application 
+              <strong> inside this console</strong>. Your local computer acts as the controller while the rented hardware handles the heavy lifting.
+            </div>
+            
+            <div className="flex-1 bg-black/40 p-4 font-mono text-xs overflow-y-auto text-green-400 space-y-1">
+              <div className="text-gray-500 mb-4"># Connected to remote Ego node via HTTP-RPC Exec. Type commands below.</div>
+              <pre className="whitespace-pre-wrap">{consoleOut}</pre>
+              {consoleBusy && <div className="animate-pulse text-blue-400">Processing command…</div>}
+            </div>
+
+            <div className="p-4 bg-gray-900 border-t border-gray-800 flex gap-2">
+              <input 
+                value={consoleCmd}
+                onChange={e => setConsoleCmd(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && executeRemoteCommand()}
+                placeholder="Type command (e.g. ls, nvidia-smi, hostname)..."
+                className="flex-1 bg-black border border-gray-700 rounded-lg px-4 py-2.5 text-sm font-mono text-white outline-none focus:border-purple-500 transition-colors"
+                autoFocus
+              />
+              <button 
+                onClick={() => executeRemoteCommand()}
+                disabled={consoleBusy || !consoleCmd.trim()}
+                className="bg-purple-600 hover:bg-purple-500 text-white px-6 rounded-lg font-bold text-sm disabled:opacity-40 transition-colors">Run</button>
             </div>
           </div>
         </div>
@@ -1469,55 +1627,6 @@ export default function ComputePage() {
         </div>
       )}
 
-      {/* ── Individual Reservation Connect Info modal ── */}
-      {resConnectInfo && (
-        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
-          <div className="bg-gray-800 rounded-xl border border-gray-700 p-6 w-full max-w-lg space-y-4">
-            <h3 className="text-white font-semibold text-lg">Connect to Machine</h3>
-            <div className="grid grid-cols-2 gap-2 text-center">
-              <div className="bg-gray-750 rounded-lg p-2">
-                <p className="text-gray-400 text-xs">Status</p>
-                <p className="text-white font-bold text-sm capitalize">{resConnectInfo.status}</p>
-              </div>
-              <div className="bg-gray-750 rounded-lg p-2">
-                <p className="text-gray-400 text-xs">Provider IP</p>
-                <p className="text-white font-bold text-sm">{resConnectInfo.provider_ip}</p>
-              </div>
-            </div>
-
-            <div className="p-4 bg-blue-600/10 border border-blue-500/30 rounded-xl">
-              <div className="flex items-center gap-2 mb-2">
-                <span className="text-lg">🚀</span>
-                <h4 className="font-semibold text-blue-300 text-sm">One-Click Connect</h4>
-              </div>
-              <p className="text-[11px] text-gray-400 mb-4 leading-relaxed">
-                {resConnectInfo.how_to_verify}
-              </p>
-              <button 
-                onClick={() => handleAutoConnect(resConnectInfo.ssh_command)}
-                className="w-full bg-blue-600 hover:bg-blue-500 text-white py-2 rounded-lg font-bold text-xs transition"
-              >
-                Launch SSH Terminal
-              </button>
-            </div>
-
-            <div>
-              <p className="text-gray-500 text-[10px] mb-1 uppercase font-bold">Manual SSH Command</p>
-              <pre className="bg-gray-900 rounded-lg p-3 text-yellow-400 text-xs overflow-x-auto">{resConnectInfo.ssh_command}</pre>
-            </div>
-            
-            {resConnectInfo.note && (
-              <div className="bg-blue-900/20 border border-blue-700/30 rounded-lg p-3 text-xs text-blue-300">
-                {resConnectInfo.note}
-              </div>
-            )}
-            <button onClick={() => setResConnectInfo(null)}
-              className="w-full py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm">
-              Close
-            </button>
-          </div>
-        </div>
-      )}
 
       {/* ── WireGuard Config modal ── */}
       {wgConfigOpen && (

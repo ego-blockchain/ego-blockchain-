@@ -4310,6 +4310,12 @@ pub fn get_compute_reservation(reservation_id: &str) -> Option<ComputeReservatio
     db.get_cf(&cf, reservation_id.as_bytes()).ok()?.and_then(|b| decode(&b))
 }
 
+pub fn delete_compute_reservation(reservation_id: &str) -> Result<(), String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_COMPUTE_RESERVATIONS).ok_or("CF_COMPUTE_RESERVATIONS missing")?;
+    db.delete_cf(&cf, reservation_id.as_bytes()).map_err(|e| e.to_string())
+}
+
 pub fn list_compute_reservations() -> Vec<ComputeReservation> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let cf = db.cf_handle(CF_COMPUTE_RESERVATIONS).unwrap();
