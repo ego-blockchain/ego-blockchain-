@@ -768,14 +768,14 @@ async fn handle_usage(
 
     // 2. Native System Check (Cross-platform)
     let mut sys = System::new();
-    sys.refresh_cpu_specifics(CpuRefreshKind::new().with_cpu_usage());
+    sys.refresh_cpu_specifics(CpuRefreshKind::nothing().with_cpu_usage());
     sys.refresh_memory();
 
     // Small sleep to get accurate CPU diff
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     sys.refresh_cpu_usage();
 
-    let cpu_usage = sys.global_cpu_info().cpu_usage();
+    let cpu_usage = sys.global_cpu_usage();
     let ram_used = sys.used_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
     
     // Native GPU check
