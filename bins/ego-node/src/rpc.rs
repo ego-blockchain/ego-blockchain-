@@ -5,9 +5,10 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use ego_core::{AccountType, Address, AlgorithmId, Balance, Block, KeyPair, PublicKey, StateManager, Transaction};
+use ego_core::{AccountType, Address, AlgorithmId, Balance, Block, KeyPair, PublicKey, Signature, StateManager, Transaction};
 use ego_core::state::{MIN_VALIDATOR_STAKE, ValidatorStatus};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -815,7 +816,11 @@ async fn handle_exec(
     let msg = format!("{}:{}:{}", req.reservation_id, req.command, req.timestamp);
     
     // Validate the public key matches the authorized buyer address
-    let derived_addr = ego_core::Address::from_public_key(&ego_core::PublicKey::ed25519_from_bytes(&pk_bytes).unwrap());
+    let pk = match PublicKey::from_slice(&pk_bytes) {
+        Ok(k) => k,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid public key").into_response(),
+    };
+    let derived_addr = Address::from_public_key(&pk);
     let derived_hex = format!("0x{}", hex::encode(derived_addr.as_bytes()));
     
     // Simple check: does the key provided match the renter of this reservation?
@@ -824,8 +829,13 @@ async fn handle_exec(
         return (StatusCode::FORBIDDEN, "Forbidden: Public key does not match reservation buyer").into_response();
     }
 
-    let sig = ego_core::Signature::ed25519_from_bytes(&sig_bytes).unwrap();
-    let pk = ego_core::PublicKey::ed25519_from_bytes(&pk_bytes).unwrap();
+    let sig = if sig_bytes.len() == 64 {
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&sig_bytes);
+        Signature::ed25519(arr)
+    } else {
+        return (StatusCode::BAD_REQUEST, "Invalid signature length").into_response();
+    };
 
     if let Err(_) = ego_core::verify_signature(&pk, msg.as_bytes(), &sig) {
         return (StatusCode::UNAUTHORIZED, "Invalid cryptographic signature").into_response();
@@ -842,9 +852,9 @@ async fn handle_exec(
     match output {
         Ok(o) => {
             let combined = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
-            if o.status.success() { (StatusCode::OK, combined) } else { (StatusCode::BAD_REQUEST, combined) }
+            if o.status.success() { (StatusCode::OK, combined).into_response() } else { (StatusCode::BAD_REQUEST, combined).into_response() }
         },
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("System Error: {}", e)),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("System Error: {}", e)).into_response(),
     }
 }
 
