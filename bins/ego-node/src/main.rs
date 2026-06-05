@@ -155,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
         faucet_claims:  Mutex::new(std::collections::HashMap::new()),
         write_rate:     Mutex::new(std::collections::HashMap::new()),
         mempool_gossip_tx,
+        active_renters: Mutex::new(std::collections::HashMap::new()),
         peer_rpc_addrs: Mutex::new(std::collections::HashMap::new()),
     });
     let rpc_addr = format!("0.0.0.0:{}", config.rpc_port);
@@ -885,6 +886,11 @@ async fn run_daemon_mode(
                                 if is_for_me {
                                     if let Some(pubkey) = payload["ssh_public_key"].as_str() {
                                         info!("🔑 Compute reservation detected for this node! Authorizing SSH key...");
+                                        
+                                        let res_id = payload["reservation"]["reservation_id"].as_str().unwrap_or_default().to_string();
+                                        let buyer = payload["reservation"]["buyer_address"].as_str().unwrap_or_default().to_string();
+                                        rpc_state.active_renters.lock().unwrap().insert(res_id, buyer);
+
                                         let _ = authorize_ssh_key(pubkey);
                                     }
                                 }

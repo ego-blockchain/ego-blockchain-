@@ -46,6 +46,9 @@ pub struct RpcState {
     /// Channel for sending tx bytes to the daemon gossip loop (mempool propagation).
     pub mempool_gossip_tx: mpsc::UnboundedSender<Vec<u8>>,
 
+    /// Authorized renters: reservation_id -> buyer_address
+    pub active_renters: Mutex<HashMap<String, String>>,
+
     /// Known peer HTTP RPC addresses: peer_id_hex → "http://ip:port"
     pub peer_rpc_addrs: Mutex<HashMap<String, String>>,
 }
@@ -104,6 +107,8 @@ pub fn make_router(state: Arc<RpcState>) -> Router {
         .route("/node/identity",      get(node_identity))
         .route("/faucet",             get(faucet))
         .route("/tx/broadcast",       post(tx_broadcast))
+        .route("/node/usage",         post(handle_usage))
+        .route("/exec",               post(handle_exec))
         .route("/block/broadcast",    post(block_broadcast))
         .route("/blocks/range",       get(blocks_range))
         .route("/rpc",                post(json_rpc))
@@ -734,6 +739,113 @@ async fn faucet(
         "amount_uegoc": FAUCET_AMOUNT_UEGOC,
         "tx_hash": format!("faucet_{:x}", now),
     }))).into_response()
+}
+
+#[derive(Deserialize)]
+struct ExecRequest {
+    reservation_id: String,
+    command: String,
+    timestamp: i64,
+    signature: String, // Hex encoded Ed25519 signature
+    public_key: String, // Hex encoded Ed25519 public key
+}
+
+async fn handle_usage(
+    State(s): State<Arc<RpcState>>,
+    Json(req): Json<ExecRequest>,
+) -> impl IntoResponse {
+    // 1. Verify Renter Authorization (Reuse existing logic)
+    {
+        let renters = s.active_renters.lock().unwrap();
+        if !renters.contains_key(&req.reservation_id) {
+            return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+        }
+    }
+
+    // 2. Native System Check (Cross-platform)
+    use sysinfo::{System, CpuRefreshKind};
+    let mut sys = System::new();
+    sys.refresh_cpu_specifics(CpuRefreshKind::new().with_cpu_usage());
+    sys.refresh_memory();
+    
+    // Small sleep to get accurate CPU diff
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    sys.refresh_cpu_usage();
+
+    let cpu_usage = sys.global_cpu_info().cpu_usage();
+    let ram_used = sys.used_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
+    
+    // Native GPU check
+    let gpu_usage = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i32>().ok())
+        .unwrap_or(0);
+
+    (StatusCode::OK, Json(json!({
+        "cpu": cpu_usage,
+        "ram_used_gb": ram_used,
+        "gpu": gpu_usage
+    }))).into_response()
+}
+
+async fn handle_exec(
+    State(s): State<Arc<RpcState>>,
+    Json(req): Json<ExecRequest>,
+) -> impl IntoResponse {
+    // 1. Verify Renter Authorization
+    let buyer_addr = {
+        let renters = s.active_renters.lock().unwrap();
+        match renters.get(&req.reservation_id) {
+            Some(addr) => addr.clone(),
+            None => return (StatusCode::UNAUTHORIZED, "Unauthorized: No active reservation found for this ID").into_response(),
+        }
+    };
+
+    // 2. Prevent Replay Attacks (30s window)
+    let now = chrono::Utc::now().timestamp();
+    if (now - req.timestamp).abs() > 30 {
+        return (StatusCode::BAD_REQUEST, "Request expired (timestamp mismatch)").into_response();
+    }
+
+    // 3. Verify Cryptographic Signature
+    let sig_bytes = hex::decode(&req.signature).unwrap_or_default();
+    let pk_bytes = hex::decode(&req.public_key).unwrap_or_default();
+    let msg = format!("{}:{}:{}", req.reservation_id, req.command, req.timestamp);
+    
+    // Validate the public key matches the authorized buyer address
+    let derived_addr = ego_core::Address::from_public_key(&ego_core::PublicKey::ed25519_from_bytes(&pk_bytes).unwrap());
+    let derived_hex = format!("0x{}", hex::encode(derived_addr.as_bytes()));
+    
+    // Simple check: does the key provided match the renter of this reservation?
+    // (In production, we'd handle bech32/hex comparison more robustly)
+    if !buyer_addr.contains(&derived_hex[2..]) {
+        return (StatusCode::FORBIDDEN, "Forbidden: Public key does not match reservation buyer").into_response();
+    }
+
+    let sig = ego_core::Signature::ed25519_from_bytes(&sig_bytes).unwrap();
+    let pk = ego_core::PublicKey::ed25519_from_bytes(&pk_bytes).unwrap();
+
+    if let Err(_) = ego_core::verify_signature(&pk, msg.as_bytes(), &sig) {
+        return (StatusCode::UNAUTHORIZED, "Invalid cryptographic signature").into_response();
+    }
+
+    tracing::info!("📡 Remote Exec [Auth: {}]: {}", buyer_addr, req.command);
+
+    let output = if cfg!(target_os = "windows") {
+        std::process::Command::new("powershell").args(["-Command", &req.command]).output()
+    } else {
+        std::process::Command::new("sh").args(["-c", &req.command]).output()
+    };
+
+    match output {
+        Ok(o) => {
+            let combined = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+            if o.status.success() { (StatusCode::OK, combined) } else { (StatusCode::BAD_REQUEST, combined) }
+        },
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("System Error: {}", e)),
+    }
 }
 
 #[derive(Deserialize)]

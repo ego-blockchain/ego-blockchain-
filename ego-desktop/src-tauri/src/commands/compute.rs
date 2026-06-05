@@ -7,6 +7,7 @@ use crate::chain_db::{
     RESERVATION_ESCROW_ADDR, RESERVATION_SLA_BPS,
 };
 
+use crate::commands::wallet::get_reservation_connect_info;
 const HEARTBEAT_GRACE_SECS: i64 = 7_200;
 const BREACH_THRESHOLD_BONDED:   u32 = 3;
 const BREACH_THRESHOLD_UNBONDED: u32 = 1;
@@ -15,6 +16,8 @@ use crate::ledger::{tx_signing_bytes, LedgerTx};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
+use serde_json::json;
+use reqwest;
 
 const NODE_POOL_ADDR: &str = crate::chain_db::NODE_POOL_ADDR;
 const SLASH_BASE_UEGOC: u64 = 1_000_000; // 1 EGOC minimum slash regardless of bid
@@ -1180,9 +1183,20 @@ pub async fn book_reservation(
 
     let msg = crate::p2p::P2PMessage::ReservationBooked { 
         reservation: reservation.clone(),
-        ssh_public_key: if ssh_pub.is_empty() { None } else { Some(ssh_pub) },
+        ssh_public_key: if ssh_pub.is_empty() { None } else { Some(ssh_pub.clone()) },
     };
     crate::p2p::broadcast_compute_msg(msg).await;
+
+    // Direct delivery attempt to ensure the provider sees the reservation and authorizes the key
+    let provider_addr = offer.provider_address.clone();
+    if let Some(ep) = crate::p2p::get_relay_endpoint(&provider_addr).await {
+        let msg_direct = crate::p2p::P2PMessage::ReservationBooked { 
+            reservation: reservation.clone(),
+            ssh_public_key: if ssh_pub.is_empty() { None } else { Some(ssh_pub) },
+        };
+        tokio::spawn(async move { let _ = crate::p2p::send_message(&ep, &msg_direct).await; });
+    }
+
     Ok(reservation.reservation_id)
 }
 
@@ -1353,6 +1367,101 @@ pub async fn get_reservations() -> Result<Vec<ComputeReservation>, EgoDesktopErr
 }
 
 #[tauri::command]
+pub async fn run_remote_command(
+    reservation_id: String, 
+    command: String,
+    state: State<'_, AppState>,
+) -> Result<String, EgoDesktopError> {
+    let info = get_reservation_connect_info(reservation_id.clone()).await?;
+    let rpc_url = format!("http://{}:8545/exec", info.provider_ip);
+    
+    let kp = state.get_keypair().ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
+    let ts = chrono::Utc::now().timestamp();
+    
+    // Construct authentication payload
+    let msg = format!("{}:{}:{}", reservation_id, command, ts);
+    let sig = hex::encode(kp.sign_ed25519(msg.as_bytes()).as_bytes());
+    let pk  = hex::encode(kp.ed25519_public_key().as_bytes());
+
+    let client = reqwest::Client::new();
+    let resp = client.post(&rpc_url)
+        .json(&json!({ 
+            "reservation_id": reservation_id,
+            "command": command,
+            "timestamp": ts,
+            "signature": sig,
+            "public_key": pk 
+        }))
+        .send()
+        .await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err_txt = resp.text().await.unwrap_or_else(|_| "Unknown Error".into());
+        return Err(EgoDesktopError::NetworkError(format!("Node Error ({}): {}", status, err_txt)));
+    }
+
+    let text = resp.text().await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+    
+    Ok(text)
+}
+
+#[tauri::command]
+pub async fn get_remote_usage(
+    reservation_id: String,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, EgoDesktopError> {
+    let info = get_reservation_connect_info(reservation_id.clone()).await?;
+    let rpc_url = format!("http://{}:8545/node/usage", info.provider_ip);
+    
+    let kp = state.get_keypair().ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
+    let ts = chrono::Utc::now().timestamp();
+    let msg = format!("{}:METRICS:{}", reservation_id, ts);
+    let sig = hex::encode(kp.sign_ed25519(msg.as_bytes()).as_bytes());
+    let pk  = hex::encode(kp.ed25519_public_key().as_bytes());
+
+    let client = reqwest::Client::new();
+    let resp = client.post(&rpc_url)
+        .json(&json!({ 
+            "reservation_id": reservation_id,
+            "command": "METRICS",
+            "timestamp": ts,
+            "signature": sig,
+            "public_key": pk 
+        }))
+        .send().await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+
+    if !resp.status().is_success() {
+        return Err(EgoDesktopError::NetworkError("Usage fetch rejected by node".into()));
+    }
+
+    let data = resp.json().await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+    Ok(data)
+}
+
+#[tauri::command]
+pub async fn delete_reservation_history_item(reservation_id: String) -> Result<(), EgoDesktopError> {
+    tokio::task::spawn_blocking(move || {
+        let res = crate::chain_db::get_compute_reservation(&reservation_id)
+            .ok_or_else(|| EgoDesktopError::NotFound("Reservation not found".into()))?;
+
+        // Safety check: Don't allow deleting active contracts that still require escrow tracking
+        if res.status == "active" {
+            return Err(EgoDesktopError::InvalidInput("Cannot delete an active reservation. Terminate it first.".into()));
+        }
+
+        crate::chain_db::delete_compute_reservation(&reservation_id)
+            .map_err(|e| EgoDesktopError::DatabaseError(e))
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
+}
+
+#[tauri::command]
 pub async fn terminate_reservation(
     reservation_id: String,
 ) -> Result<(), EgoDesktopError> {
@@ -1476,7 +1585,21 @@ pub async fn open_ssh_terminal(ssh_command: String) -> Result<(), EgoDesktopErro
 
     #[cfg(target_os = "windows")]
     {
-        let target = ssh_command.strip_prefix("ssh ").unwrap_or(&ssh_command);
+        let mut target = ssh_command.strip_prefix("ssh ").unwrap_or(&ssh_command).to_string();
+        
+        // If no user specified and it's a local/LAN IP, don't default to root on Windows
+        if !target.contains('@') {
+            let is_local = target.contains("127.0.0.1") || target.contains("localhost") 
+                || target.contains("192.168.") || target.contains("10.");
+            if is_local {
+                if let Ok(user) = std::env::var("USERNAME") {
+                    target = format!("{}@{}", user, target);
+                }
+            } else {
+                // Remote nodes are usually Linux
+                target = format!("root@{}", target);
+            }
+        }
         
         // Escape $ for PowerShell and wrap remote command in escaped double quotes.
         let ps_verify = verify_cmd.replace("$", "`$").replace("\"", "\\\"");
@@ -1509,10 +1632,11 @@ pub async fn open_ssh_terminal(ssh_command: String) -> Result<(), EgoDesktopErro
         let ps_cmd = format!(
             "& '{}' -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o LogLevel=ERROR {} {} -t '{}'; \
              if ($LASTEXITCODE -ne 0) {{ \
-                Write-Host \"`n[!] Connection Failed\" -ForegroundColor Red; \
+                Write-Host \"`n[!] Connection Failed (Exit Code: `$LASTEXITCODE)\" -ForegroundColor Red; \
                 Write-Host \"If you see 'Permission denied', send your Public Key to the provider:`n\" -ForegroundColor Yellow; \
                 Write-Host '{}' -ForegroundColor Cyan; \
-                Write-Host \"`n[!] Also check: Is the machine behind a firewall? Is port 22 open?\" -ForegroundColor Gray; \
+                Write-Host \"`n[!] Troubleshooting:\" -ForegroundColor Yellow; \
+                Write-Host \"1. Is the provider online? 2. Is Port 22 open? 3. If the provider is Windows, is the 'OpenSSH SSH Server' service running?\" -ForegroundColor Gray; \
              }}", 
             ssh_exe, identity_flag, target, ps_verify_esc, pub_key);
 
