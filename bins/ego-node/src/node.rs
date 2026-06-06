@@ -145,8 +145,8 @@ impl Node {
             .timeout(Duration::from_secs(30))
             .or_transport(relay_transport)
             .map(|either, _| match either {
-                libp2p::core::either::Either::Left((p, m)) => (p, libp2p::core::muxing::StreamMuxerBox::new(m)),
-                libp2p::core::either::Either::Right((p, m)) => (p, libp2p::core::muxing::StreamMuxerBox::new(m)),
+                libp2p::core::Either::Left((p, m)) => (p, libp2p::core::muxing::StreamMuxerBox::new(m)),
+                libp2p::core::Either::Right((p, m)) => (p, libp2p::core::muxing::StreamMuxerBox::new(m)),
             })
             .boxed();
 
