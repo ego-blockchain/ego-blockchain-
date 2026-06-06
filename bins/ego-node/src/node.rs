@@ -12,6 +12,7 @@ use ego_consensus::porep::{PoRepProver, PoRepVerifier, PoRepEvent};
 use ego_consensus::porep::prover::ProverConfig;
 use std::sync::Arc;
 
+use either::Either;
 use libp2p::{
     Multiaddr, PeerId, Swarm, Transport, autonat, core::upgrade::Version, dcutr, gossipsub, identify, kad,
     mdns, noise, ping, relay, tcp, yamux,
@@ -146,11 +147,11 @@ impl Node {
             .map(|(p, m), _| (p, libp2p::core::muxing::StreamMuxerBox::new(m)))
             .or_transport(
                 relay_transport
-                    .map(|conn, _| (conn.peer_id(), libp2p::core::muxing::StreamMuxerBox::new(conn)))
+                    .map(|(p, c), _| (p, libp2p::core::muxing::StreamMuxerBox::new(c)))
             )
             .map(|either, _| match either {
-                libp2p::core::either::Either::Left(res) => res,
-                libp2p::core::either::Either::Right(res) => res,
+                Either::Left(res) => res,
+                Either::Right(res) => res,
             })
             .boxed();
 
