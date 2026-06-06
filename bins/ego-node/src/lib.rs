@@ -17,10 +17,12 @@ pub use keystore::*;
 pub use network_manager::*;
 pub use node::*;
 
-use libp2p::{autonat, gossipsub, identify, kad, mdns, ping, swarm::NetworkBehaviour};
+use libp2p::{autonat, dcutr, gossipsub, identify, kad, mdns, ping, relay, swarm::NetworkBehaviour};
 
 #[derive(NetworkBehaviour)]
 pub struct NodeBehaviour {
+    pub relay_client: relay::client::Behaviour,
+    pub dcutr: dcutr::Behaviour,
     pub gossipsub: gossipsub::Behaviour,
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     pub identify: identify::Behaviour,
