@@ -884,6 +884,7 @@ async fn run_daemon_mode(
                         }
                     } else if message.topic == compute_topic.hash() {
                         if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&message.data) {
+                            info!("📡 Received compute gossip message: {}", payload);
                             // Case-insensitive type matching for different SDK/Protocol versions
                             let raw_type = payload["type"].as_str().or_else(|| payload.as_object().and_then(|o| o.keys().next().map(|s| s.as_str()))).unwrap_or("");
                             let msg_type = raw_type.to_lowercase();
