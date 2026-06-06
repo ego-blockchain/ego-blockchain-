@@ -14,6 +14,8 @@ const CF_ACCOUNTS:   &str = "accounts";
 const CF_VALIDATORS: &str = "validators";
 const CF_META:       &str = "meta";
 const CF_COMPUTE_RESERVATIONS: &str = "compute_reservations";
+const CF_COMPUTE_OFFERS:       &str = "compute_offers";
+const CF_COMPUTE_JOBS:         &str = "compute_jobs";
 
 const REWARD_POOL_KEY: &[u8] = b"\x00__reward_pool__";
 const TOTAL_EMISSION_UEGOC_DEFAULT: u64 = 40_000_000 * 1_000_000;
@@ -35,6 +37,8 @@ fn store() -> &'static DB {
             ColumnFamilyDescriptor::new(CF_VALIDATORS, Options::default()),
             ColumnFamilyDescriptor::new(CF_META, Options::default()),
             ColumnFamilyDescriptor::new(CF_COMPUTE_RESERVATIONS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_COMPUTE_OFFERS, Options::default()),
+            ColumnFamilyDescriptor::new(CF_COMPUTE_JOBS, Options::default()),
         ];
 
         DB::open_cf_descriptors(&opts, DB_PATH, cf_descs)
@@ -252,6 +256,36 @@ pub fn insert_compute_auth(res_id: &str, buyer_addr: &str) {
     let db = store();
     if let Some(cf) = db.cf_handle(CF_COMPUTE_RESERVATIONS) {
         let _ = db.put_cf(cf, res_id.as_bytes(), buyer_addr.as_bytes());
+    }
+}
+
+pub fn insert_compute_offer(offer_id: &str, data: &Value) {
+    let db = store();
+    if let Some(cf) = db.cf_handle(CF_COMPUTE_OFFERS) {
+        let _ = db.put_cf(cf, offer_id.as_bytes(), data.to_string().as_bytes());
+    }
+}
+
+pub fn list_compute_offers() -> Vec<Value> {
+    let db = store();
+    let mut out = Vec::new();
+    if let Some(cf) = db.cf_handle(CF_COMPUTE_OFFERS) {
+        let iter = db.iterator_cf(cf, IteratorMode::Start);
+        for item in iter {
+            if let Ok((_, v)) = item {
+                if let Ok(val) = serde_json::from_slice(&v) {
+                    out.push(val);
+                }
+            }
+        }
+    }
+    out
+}
+
+pub fn delete_compute_offer(offer_id: &str) {
+    let db = store();
+    if let Some(cf) = db.cf_handle(CF_COMPUTE_OFFERS) {
+        let _ = db.delete_cf(cf, offer_id.as_bytes());
     }
 }
 
