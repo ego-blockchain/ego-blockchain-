@@ -757,6 +757,23 @@ async fn faucet(
     }))).into_response()
 }
 
+/// Self-attesting reservation payload included by the buyer in /exec and
+/// /node/usage requests. Lets the provider authenticate the request without
+/// relying on the ego-compute-v1 gossip topic having reached this node.
+///
+/// Extra fields on the buyer side (period_minutes, breach_count, etc.) are
+/// accepted and ignored thanks to serde's default behaviour.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct ReservationAttestation {
+    reservation_id:   String,
+    #[serde(default)] offer_id: String,
+    buyer_address:    String,
+    provider_address: String,
+    status:           String,
+    expires_at:       i64,
+}
+
 #[derive(Deserialize)]
 struct ExecRequest {
     reservation_id: String,
@@ -764,46 +781,152 @@ struct ExecRequest {
     timestamp: i64,
     signature: String, // Hex encoded Ed25519 signature
     public_key: String, // Hex encoded Ed25519 public key
+
+    /// Optional self-attesting reservation payload. Lets the request
+    /// authenticate via the chain-derived path when active_renters has not
+    /// been hydrated by gossip.
+    #[serde(default)]
+    reservation: Option<ReservationAttestation>,
+}
+
+/// Hex-encoded lowercase 20-byte address. Returns `None` if the input is not a
+/// recognisable bech32 ego address.
+fn ego_addr_to_hex(addr: &str) -> Option<String> {
+    let hrp = if addr.starts_with("egot") { "egot" }
+              else if addr.starts_with("ego1") || addr.starts_with("ego") { "ego" }
+              else { return None; };
+    ego_core::EgoAddress::from_bech32(addr, hrp)
+        .ok()
+        .map(|a| hex::encode(a.payload()))
+}
+
+/// Normalised equality check across bech32 and hex address formats.
+fn addresses_match(a: &str, b: &str) -> bool {
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    let norm = |s: &str| {
+        ego_addr_to_hex(s).unwrap_or_else(|| s.trim_start_matches("0x").to_lowercase())
+    };
+    norm(a) == norm(b)
+}
+
+/// Resolves and verifies the buyer address authorised for a /exec or
+/// /node/usage request. Tries the in-memory cache and persistent store first,
+/// then falls back to chain-derived verification using the attestation
+/// embedded in the request itself.
+///
+/// `derived_hex` is the 20-byte address derived from the request's public key
+/// (used for the attestation buyer-match check).
+fn resolve_buyer_addr(
+    s: &Arc<RpcState>,
+    req: &ExecRequest,
+    derived_hex: &str,
+) -> Result<String, (StatusCode, String)> {
+    if let Some(addr) = s.active_renters.lock().unwrap().get(&req.reservation_id).cloned() {
+        return Ok(addr);
+    }
+    if let Some(addr) = crate::store::get_compute_auth(&req.reservation_id) {
+        s.active_renters.lock().unwrap().insert(req.reservation_id.clone(), addr.clone());
+        return Ok(addr);
+    }
+
+    let att = req.reservation.as_ref().ok_or_else(|| (
+        StatusCode::UNAUTHORIZED,
+        format!("Unauthorized: reservation {} not cached and no attestation provided", req.reservation_id),
+    ))?;
+
+    if att.reservation_id != req.reservation_id {
+        return Err((StatusCode::BAD_REQUEST,
+            "Attestation reservation_id does not match request".to_string()));
+    }
+    if !addresses_match(&att.provider_address, &s.node_address) {
+        return Err((StatusCode::FORBIDDEN, format!(
+            "Attestation provider_address {} does not match this node {}",
+            att.provider_address, s.node_address)));
+    }
+    let buyer_hex = ego_addr_to_hex(&att.buyer_address)
+        .unwrap_or_else(|| att.buyer_address.trim_start_matches("0x").to_lowercase());
+    if buyer_hex != derived_hex {
+        return Err((StatusCode::FORBIDDEN, format!(
+            "Public key derives address {}, but attestation claims buyer {}",
+            derived_hex, buyer_hex)));
+    }
+    if att.status != "active" {
+        return Err((StatusCode::FORBIDDEN, format!("Reservation status is '{}', not active", att.status)));
+    }
+    let now = chrono::Utc::now().timestamp();
+    if att.expires_at <= now {
+        return Err((StatusCode::FORBIDDEN, "Reservation expired".to_string()));
+    }
+
+    crate::store::insert_compute_auth(&req.reservation_id, &att.buyer_address);
+    s.active_renters.lock().unwrap().insert(req.reservation_id.clone(), att.buyer_address.clone());
+    tracing::info!("✅ Hydrated reservation {} from buyer-presented attestation (provider={})",
+        req.reservation_id, s.node_address);
+    Ok(att.buyer_address.clone())
+}
+
+/// Shared timestamp + signature verification for /exec and /node/usage.
+/// Returns the authorised buyer address on success.
+fn verify_request_auth(
+    s: &Arc<RpcState>,
+    req: &ExecRequest,
+    signed_msg: &str,
+) -> Result<String, (StatusCode, String)> {
+    let now = chrono::Utc::now().timestamp();
+    if (now - req.timestamp).abs() > 30 {
+        return Err((StatusCode::BAD_REQUEST, "Request expired (timestamp mismatch)".to_string()));
+    }
+
+    let pk_bytes = hex::decode(&req.public_key).unwrap_or_default();
+    let pk = PublicKey::from_slice(&pk_bytes)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid public key".to_string()))?;
+    let derived_hex = hex::encode(Address::from_public_key(&pk).as_bytes()).to_lowercase();
+
+    let buyer_addr = resolve_buyer_addr(s, req, &derived_hex)?;
+
+    let buyer_hex = ego_addr_to_hex(&buyer_addr)
+        .unwrap_or_else(|| buyer_addr.trim_start_matches("0x").to_lowercase());
+    if buyer_hex != derived_hex {
+        return Err((StatusCode::FORBIDDEN, format!(
+            "Public key derives {}, but reservation belongs to {}", derived_hex, buyer_hex)));
+    }
+
+    let sig_bytes = hex::decode(&req.signature).unwrap_or_default();
+    if sig_bytes.len() != 64 {
+        return Err((StatusCode::BAD_REQUEST, "Invalid signature length".to_string()));
+    }
+    let mut arr = [0u8; 64];
+    arr.copy_from_slice(&sig_bytes);
+    let sig = Signature::ed25519(arr);
+
+    ego_core::verify_signature(&pk, signed_msg.as_bytes(), &sig)
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid cryptographic signature".to_string()))?;
+
+    Ok(buyer_addr)
 }
 
 async fn handle_usage(
     State(s): State<Arc<RpcState>>,
     Json(req): Json<ExecRequest>,
 ) -> impl IntoResponse {
-    // 1. Verify Renter Authorization (Reuse existing logic)
-    {
-        let mut renters = s.active_renters.lock().unwrap();
-        if !renters.contains_key(&req.reservation_id) {
-            // Fallback: Check persistent storage if cache miss.
-            // This handles cases where the reservation was received via P2P but the RPC cache is stale.
-            match crate::store::get_compute_auth(&req.reservation_id) {
-                Some(buyer_addr) => {
-                    // Hydrate cache for subsequent requests in this session
-                    renters.insert(req.reservation_id.clone(), buyer_addr);
-                }
-                _ => {
-                    tracing::warn!("❌ Usage Auth Failed: Reservation {} not found in cache or DB. Known: {}", 
-                        req.reservation_id, renters.len());
-                    return (StatusCode::UNAUTHORIZED, "Unauthorized: No active reservation found for this ID")
-                        .into_response();
-                }
-            }
-        }
+    let signed = format!("{}:{}:{}", req.reservation_id, req.command, req.timestamp);
+    if let Err((status, msg)) = verify_request_auth(&s, &req, &signed) {
+        tracing::warn!("❌ Usage Auth Failed for {}: {}", req.reservation_id, msg);
+        return (status, msg).into_response();
     }
 
-    // 2. Native System Check (Cross-platform)
     let mut sys = System::new();
     sys.refresh_cpu_specifics(CpuRefreshKind::new().with_cpu_usage());
     sys.refresh_memory();
 
-    // Small sleep to get accurate CPU diff
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     sys.refresh_cpu_usage();
 
     let cpu_usage = sys.global_cpu_usage();
     let ram_used = sys.used_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
-    
-    // Native GPU check
+
     let gpu_usage = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
         .output()
@@ -822,78 +945,14 @@ async fn handle_exec(
     State(s): State<Arc<RpcState>>,
     Json(req): Json<ExecRequest>,
 ) -> impl IntoResponse {
-    // 1. Verify Renter Authorization
-    let buyer_addr = {
-        let mut renters = s.active_renters.lock().unwrap();
-        if let Some(addr) = renters.get(&req.reservation_id) {
-            addr.clone()
-        } else {
-            // Fallback: Check persistent storage for headless nodes or recently received reservations
-            tracing::debug!("🔍 Cache miss for reservation {}, checking persistent store...", req.reservation_id);
-            match crate::store::get_compute_auth(&req.reservation_id) {
-                Some(buyer_addr) => {
-                    tracing::info!("✅ Hydrated RPC cache from DB for reservation {}", req.reservation_id);
-                    renters.insert(req.reservation_id.clone(), buyer_addr.clone());
-                    buyer_addr
-                }
-                _ => {
-                    tracing::warn!("❌ Exec Auth Failed: Reservation {} not found in cache or DB.", req.reservation_id);
-                    return (StatusCode::UNAUTHORIZED, "Unauthorized: No active reservation found for this ID").into_response();
-                }
-            }
+    let signed = format!("{}:{}:{}", req.reservation_id, req.command, req.timestamp);
+    let buyer_addr = match verify_request_auth(&s, &req, &signed) {
+        Ok(addr) => addr,
+        Err((status, msg)) => {
+            tracing::warn!("❌ Exec Auth Failed for {}: {}", req.reservation_id, msg);
+            return (status, msg).into_response();
         }
     };
-
-    // 2. Prevent Replay Attacks (30s window)
-    let now = chrono::Utc::now().timestamp();
-    if (now - req.timestamp).abs() > 30 {
-        return (StatusCode::BAD_REQUEST, "Request expired (timestamp mismatch)").into_response();
-    }
-
-    // 3. Verify Cryptographic Signature
-    let sig_bytes = hex::decode(&req.signature).unwrap_or_default();
-    let pk_bytes = hex::decode(&req.public_key).unwrap_or_default();
-    let msg = format!("{}:{}:{}", req.reservation_id, req.command, req.timestamp);
-    
-    // Validate the public key matches the authorized buyer address
-    let pk = match PublicKey::from_slice(&pk_bytes) {
-        Ok(k) => k,
-        Err(_) => {
-            tracing::error!("❌ Exec Failed: Malformed public key in request");
-            return (StatusCode::BAD_REQUEST, "Invalid public key").into_response();
-        }
-    };
-    let derived_addr = Address::from_public_key(&pk);
-
-    // Simple check: does the key provided match the renter of this reservation?
-    let is_match = if derived_addr.to_string().starts_with("egot") || derived_addr.to_string().starts_with("ego1") {
-        let hrp = if buyer_addr.starts_with("egot") { "egot" } else { "ego" };
-        ego_core::EgoAddress::from_bech32(&buyer_addr, hrp)
-            .map(|a| a.payload() == derived_addr.as_bytes())
-            .unwrap_or(false)
-    } else {
-        // Handle raw hex comparison
-        let clean = buyer_addr.to_lowercase().trim_start_matches("0x").to_string();
-        hex::encode(derived_addr.as_bytes()).to_lowercase() == clean.to_lowercase()
-    };
-
-    if !is_match {
-        tracing::error!("❌ Exec Forbidden: Key derives to {}, but reservation {} belongs to {}", 
-            hex::encode(derived_addr.as_bytes()), req.reservation_id, buyer_addr);
-        return (StatusCode::FORBIDDEN, "Forbidden: Public key does not match reservation buyer").into_response();
-    }
-
-    let sig = if sig_bytes.len() == 64 {
-        let mut arr = [0u8; 64];
-        arr.copy_from_slice(&sig_bytes);
-        Signature::ed25519(arr)
-    } else {
-        return (StatusCode::BAD_REQUEST, "Invalid signature length").into_response();
-    };
-
-    if let Err(_) = ego_core::verify_signature(&pk, msg.as_bytes(), &sig) {
-        return (StatusCode::UNAUTHORIZED, "Invalid cryptographic signature").into_response();
-    }
 
     tracing::info!("📡 Remote Exec [Auth: {}]: {}", buyer_addr, req.command);
 
