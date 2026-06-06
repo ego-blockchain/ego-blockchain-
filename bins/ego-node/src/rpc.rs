@@ -817,8 +817,10 @@ async fn handle_exec(
             addr.clone()
         } else {
             // Fallback: Check persistent storage for headless nodes or recently received reservations
+            tracing::debug!("🔍 Cache miss for reservation {}, checking persistent store...", req.reservation_id);
             match crate::store::get_compute_auth(&req.reservation_id) {
                 Some(buyer_addr) => {
+                    tracing::info!("✅ Hydrated RPC cache from DB for reservation {}", req.reservation_id);
                     renters.insert(req.reservation_id.clone(), buyer_addr.clone());
                     buyer_addr
                 }
@@ -860,7 +862,7 @@ async fn handle_exec(
     } else {
         // Handle raw hex comparison
         let clean = buyer_addr.trim_start_matches("0x");
-        hex::encode(derived_addr.as_bytes()) == clean.to_lowercase()
+        hex::encode(derived_addr.as_bytes()).to_lowercase() == clean.to_lowercase()
     };
 
     if !is_match {
