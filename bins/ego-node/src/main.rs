@@ -854,7 +854,7 @@ async fn run_daemon_mode(
                 // Monitor peer count changes in real-time
                 let peer_count = node.swarm.connected_peers().count();
                 if peer_count != last_peer_count {
-                    info!("👥 Network connectivity changed: {} peers connected", peer_count);
+                    info!("👥 [P2P] Mesh connectivity changed: {} peers connected", peer_count);
                     last_peer_count = peer_count;
                 }
 
@@ -901,7 +901,7 @@ async fn run_daemon_mode(
                             }
                         }
                     } else if message.topic == compute_hash1 || message.topic == compute_hash2 {
-                        debug!("📡 [Compute] Gossip received ({} bytes) on topic {}", message.data.len(), message.topic);
+                        info!("📡 [Compute] Gossip received ({} bytes) on topic {}", message.data.len(), message.topic);
                         if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&message.data) {
                             info!("📡 [Compute] Decoded payload: {}", payload);
                             // Case-insensitive type matching for different SDK/Protocol versions
