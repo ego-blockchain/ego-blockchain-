@@ -953,8 +953,47 @@ async fn run_daemon_mode(
                                         let _ = authorize_ssh_key(pubkey);
                                     }
                                 } else {
-                                    debug!("📡 Compute message ignored: provider mismatch (received: {}, mine: {})", 
-                                        provider, hex::encode(my_addr_raw.as_bytes()));
+                                    debug!("📡 [Compute] Forwarding booking for other provider: {}", provider);
+                                }
+                            } else if msg_type.contains("offer") {
+                                // Handle CapacityOfferBroadcast and CapacityOfferCancelled
+                                let offer_data = if payload.get("offer").is_some() {
+                                    &payload["offer"]
+                                } else if let Some(inner) = payload.as_object().and_then(|o| o.values().next()) {
+                                    if inner.get("offer_id").is_some() { inner } else { &payload }
+                                } else {
+                                    &payload
+                                };
+
+                                let offer_id = offer_data["offer_id"].as_str().unwrap_or("");
+                                if !offer_id.is_empty() {
+                                    if msg_type.contains("cancel") {
+                                        info!("🖥️  [Compute] Capacity Offer Cancelled: {}", offer_id);
+                                        crate::store::delete_compute_offer(offer_id);
+                                    } else {
+                                        info!("🖥️  [Compute] New Capacity Offer: {} from {}", offer_id, offer_data["provider_address"]);
+                                        crate::store::insert_compute_offer(offer_id, offer_data);
+                                    }
+                                }
+                            } else if msg_type.contains("job") {
+                                // Handle ComputeJobPost and ComputeJobCancel
+                                let job_data = if payload.get("job").is_some() {
+                                    &payload["job"]
+                                } else if let Some(inner) = payload.as_object().and_then(|o| o.values().next()) {
+                                    if inner.get("job_id").is_some() { inner } else { &payload }
+                                } else {
+                                    &payload
+                                };
+
+                                let job_id = job_data["job_id"].as_str().unwrap_or("");
+                                if !job_id.is_empty() {
+                                    if msg_type.contains("cancel") {
+                                        info!("🧠 [Compute] Job Post Cancelled: {}", job_id);
+                                        // Logic to remove job from store if applicable
+                                    } else {
+                                        info!("🧠 [Compute] New Job Post: {} (Type: {})", job_id, job_data["job_type"]);
+                                        // Logic to insert job into store if applicable
+                                    }
                                 }
                             }
                         }
