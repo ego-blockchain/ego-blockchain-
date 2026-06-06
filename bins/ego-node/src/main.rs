@@ -884,33 +884,61 @@ async fn run_daemon_mode(
                         }
                     } else if message.topic == compute_topic.hash() {
                         if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&message.data) {
-                            if payload["type"] == "reservation_booked" {
-                                let provider = payload["reservation"]["provider_address"].as_str().unwrap_or("");
-                                let my_addr_raw = node.get_address();
-                                let my_addr_hex = format!("0x{}", hex::encode(my_addr_raw.as_bytes()));
-
-                                // Robust check: matches hex exactly OR decodes bech32 to compare raw bytes
-                                let is_for_me = if provider.to_lowercase() == my_addr_hex.to_lowercase() {
-                                    true
+                            // Case-insensitive type matching for different SDK/Protocol versions
+                            let raw_type = payload["type"].as_str().or_else(|| payload.as_object().and_then(|o| o.keys().next().map(|s| s.as_str()))).unwrap_or("");
+                            let msg_type = raw_type.to_lowercase();
+                            
+                            if msg_type == "reservation_booked" || msg_type == "reservationbooked" {
+                                // Resilient data extraction for nested or flat objects
+                                let res_data = if payload.contains_key("reservation") {
+                                    &payload["reservation"]
+                                } else if payload.contains_key("reservation_booked") {
+                                    &payload["reservation_booked"]["reservation"]
+                                } else if let Some(inner) = payload.as_object().and_then(|o| o.values().next()) {
+                                    // Handle externally tagged enum: {"ReservationBooked": {"reservation": ...}}
+                                    if inner.contains_key("reservation") { &inner["reservation"] } else { inner }
                                 } else {
-                                    // Attempt to decode as bech32 and compare bytes
+                                    &payload
+                                };
+
+                                let provider = res_data["provider_address"].as_str().unwrap_or("");
+                                let my_addr_raw = node.get_address();
+                                // Robust check: matches hex exactly OR decodes bech32 to compare raw bytes
+                                let is_for_me = if provider.starts_with("0x") {
+                                    let clean = provider.trim_start_matches("0x");
+                                    hex::encode(my_addr_raw.as_bytes()).to_lowercase() == clean.to_lowercase()
+                                } else if provider.starts_with("egot") || provider.starts_with("ego1") {
                                     let hrp = if provider.starts_with("egot") { "egot" } else { "ego" };
                                     ego_core::EgoAddress::from_bech32(provider, hrp)
                                         .map(|addr| addr.payload() == my_addr_raw.as_bytes())
                                         .unwrap_or(false)
+                                } else {
+                                    hex::encode(my_addr_raw.as_bytes()).to_lowercase() == provider.to_lowercase()
                                 };
 
-                                if is_for_me {
-                                    let res_id = payload["reservation"]["reservation_id"].as_str().unwrap_or_default().to_string();
-                                    let buyer = payload["reservation"]["buyer_address"].as_str().unwrap_or_default().to_string();
-                                    info!("🖥️ Reservation {} authorized for buyer {} (Web Console active)", res_id, buyer);
+                                if is_for_me && !res_data.is_null() {
+                                    let res_id = res_data["reservation_id"].as_str().or_else(|| res_data["id"].as_str()).unwrap_or_default().to_string();
+                                    let buyer = res_data["buyer_address"].as_str().or_else(|| res_data["buyer"].as_str()).unwrap_or_default().to_string();
+                                    
+                                    if res_id.is_empty() || buyer.is_empty() {
+                                        warn!("⚠️ Received compute auth but missing ResID or Buyer fields");
+                                        continue;
+                                    }
+                                    
+                                    info!("✅ Compute Auth Received: Res {} -> Buyer {}", res_id, buyer);
                                     crate::store::insert_compute_auth(&res_id, &buyer);
-                                    rpc_state.active_renters.lock().unwrap().insert(res_id, buyer);
+                                    rpc_state.active_renters.lock().unwrap().insert(res_id.clone(), buyer);
 
-                                    if let Some(pubkey) = payload["ssh_public_key"].as_str() {
+                                    let ssh_key = payload["ssh_public_key"].as_str()
+                                        .or_else(|| payload.as_object().and_then(|o| o.values().next().and_then(|v| v["ssh_public_key"].as_str())));
+                                    
+                                    if let Some(pubkey) = ssh_key {
                                         info!("🔑 Authorizing SSH key for this reservation...");
                                         let _ = authorize_ssh_key(pubkey);
                                     }
+                                } else {
+                                    debug!("📡 Compute message ignored: provider mismatch (received: {}, mine: {})", 
+                                        provider, hex::encode(my_addr_raw.as_bytes()));
                                 }
                             }
                         }
