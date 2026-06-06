@@ -764,10 +764,10 @@ async fn handle_usage(
         if !renters.contains_key(&req.reservation_id) {
             // Fallback: Check persistent storage if cache miss.
             // This handles cases where the reservation was received via P2P but the RPC cache is stale.
-            match crate::store::get_compute_reservation(&req.reservation_id) {
-                Some(res) if res.status == "active" => {
+            match crate::store::get_compute_auth(&req.reservation_id) {
+                Some(buyer_addr) => {
                     // Hydrate cache for subsequent requests in this session
-                    renters.insert(req.reservation_id.clone(), res.buyer_address.clone());
+                    renters.insert(req.reservation_id.clone(), buyer_addr);
                 }
                 _ => {
                     tracing::warn!("❌ Usage Auth Failed: Reservation {} not found in cache or DB. Known: {}", 
@@ -817,11 +817,10 @@ async fn handle_exec(
             addr.clone()
         } else {
             // Fallback: Check persistent storage for headless nodes or recently received reservations
-            match crate::store::get_compute_reservation(&req.reservation_id) {
-                Some(res) if res.status == "active" => {
-                    let addr = res.buyer_address.clone();
-                    renters.insert(req.reservation_id.clone(), addr.clone());
-                    addr
+            match crate::store::get_compute_auth(&req.reservation_id) {
+                Some(buyer_addr) => {
+                    renters.insert(req.reservation_id.clone(), buyer_addr.clone());
+                    buyer_addr
                 }
                 _ => {
                     tracing::warn!("❌ Exec Auth Failed: Reservation {} not found in cache or DB.", req.reservation_id);
