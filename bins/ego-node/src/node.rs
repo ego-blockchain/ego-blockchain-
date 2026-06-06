@@ -141,7 +141,7 @@ impl Node {
         let noise_config = noise::Config::new(&keystore.libp2p_keypair())?;
         let yamux_config = yamux::Config::default();
 
-        let transport = tcp::tokio::Transport::default()
+        let transport = libp2p::dns::tokio::Transport::system(tcp::tokio::Transport::default())?
             .upgrade(Version::V1)
             .authenticate(noise_config.clone())
             .multiplex(yamux_config.clone())
