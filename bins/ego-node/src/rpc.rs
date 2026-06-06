@@ -866,14 +866,14 @@ async fn handle_exec(
     let derived_addr = Address::from_public_key(&pk);
 
     // Simple check: does the key provided match the renter of this reservation?
-    let is_match = if buyer_addr.starts_with("egot") || buyer_addr.starts_with("ego1") {
+    let is_match = if derived_addr.to_string().starts_with("egot") || derived_addr.to_string().starts_with("ego1") {
         let hrp = if buyer_addr.starts_with("egot") { "egot" } else { "ego" };
         ego_core::EgoAddress::from_bech32(&buyer_addr, hrp)
             .map(|a| a.payload() == derived_addr.as_bytes())
             .unwrap_or(false)
     } else {
         // Handle raw hex comparison
-        let clean = buyer_addr.to_lowercase().replace("0x", "");
+        let clean = buyer_addr.to_lowercase().trim_start_matches("0x").to_string();
         hex::encode(derived_addr.as_bytes()).to_lowercase() == clean.to_lowercase()
     };
 
