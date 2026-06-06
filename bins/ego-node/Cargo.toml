@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+either = { workspace = true }
 ego-core = { path = "../../crates/ego-core" }
 ego-rollup = { path = "../../crates/ego-rollup" }
 ego-consensus = { path = "../../crates/ego-consensus" }
