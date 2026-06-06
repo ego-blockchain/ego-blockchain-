@@ -136,7 +136,11 @@ async fn main() -> anyhow::Result<()> {
     let node_keypair = node.get_keypair().clone();
 
     // Display the node's official network address for the operator to see.
-    let bech32_addr = ego_core::EgoAddress::from_raw(node.get_address().as_bytes(), 1, ego_core::AddressType::EOA).to_bech32("egot").unwrap_or_default();
+    let bech32_addr = ego_core::EgoAddress::from_dilithium_pk(
+        &node.get_keypair().dilithium_public_key().key_data,
+        1,
+        ego_core::AddressType::EOA
+    ).to_bech32("egot").unwrap_or_default();
     info!("📍 Node Network Identity: {}", bech32_addr);
 
     let _engine = EgoExecutionEngine::new();
