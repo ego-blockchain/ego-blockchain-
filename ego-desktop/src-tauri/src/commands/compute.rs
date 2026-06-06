@@ -1399,29 +1399,32 @@ pub async fn get_reservations() -> Result<Vec<ComputeReservation>, EgoDesktopErr
 
 #[tauri::command]
 pub async fn run_remote_command(
-    reservation_id: String, 
+    reservation_id: String,
     command: String,
     state: State<'_, AppState>,
 ) -> Result<String, EgoDesktopError> {
     let info = get_reservation_connect_info(reservation_id.clone()).await?;
     let rpc_url = format!("http://{}:8545/exec", info.provider_ip);
-    
+
+    let reservation = crate::chain_db::get_compute_reservation(&reservation_id)
+        .ok_or_else(|| EgoDesktopError::NotFound("Reservation not found".into()))?;
+
     let kp = state.get_keypair().ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
     let ts = chrono::Utc::now().timestamp();
-    
-    // Construct authentication payload
+
     let msg = format!("{}:{}:{}", reservation_id, command, ts);
     let sig = hex::encode(kp.sign_ed25519(msg.as_bytes()).as_bytes());
     let pk  = hex::encode(kp.ed25519_public_key().as_bytes());
 
     let client = reqwest::Client::new();
     let resp = client.post(&rpc_url)
-        .json(&json!({ 
+        .json(&json!({
             "reservation_id": reservation_id,
-            "command": command,
-            "timestamp": ts,
-            "signature": sig,
-            "public_key": pk 
+            "command":        command,
+            "timestamp":      ts,
+            "signature":      sig,
+            "public_key":     pk,
+            "reservation":    reservation,
         }))
         .send()
         .await
@@ -1435,7 +1438,7 @@ pub async fn run_remote_command(
 
     let text = resp.text().await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
-    
+
     Ok(text)
 }
 
@@ -1446,7 +1449,10 @@ pub async fn get_remote_usage(
 ) -> Result<serde_json::Value, EgoDesktopError> {
     let info = get_reservation_connect_info(reservation_id.clone()).await?;
     let rpc_url = format!("http://{}:8545/node/usage", info.provider_ip);
-    
+
+    let reservation = crate::chain_db::get_compute_reservation(&reservation_id)
+        .ok_or_else(|| EgoDesktopError::NotFound("Reservation not found".into()))?;
+
     let kp = state.get_keypair().ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
     let ts = chrono::Utc::now().timestamp();
     let msg = format!("{}:METRICS:{}", reservation_id, ts);
@@ -1455,12 +1461,13 @@ pub async fn get_remote_usage(
 
     let client = reqwest::Client::new();
     let resp = client.post(&rpc_url)
-        .json(&json!({ 
+        .json(&json!({
             "reservation_id": reservation_id,
-            "command": "METRICS",
-            "timestamp": ts,
-            "signature": sig,
-            "public_key": pk 
+            "command":        "METRICS",
+            "timestamp":      ts,
+            "signature":      sig,
+            "public_key":     pk,
+            "reservation":    reservation,
         }))
         .send().await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;

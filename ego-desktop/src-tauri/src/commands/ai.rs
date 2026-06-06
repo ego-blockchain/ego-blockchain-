@@ -292,6 +292,23 @@ pub async fn ask_ego_ai(
         "Hello! I am Ego AI. How can I help you with Ego Blockchain today?"
     } else if q.contains("who made you") || q.contains("creator") {
         "I'm Ego AI, built by the Ego Blockchain team."
+    } else if q.contains("earn") || q.contains("income") || q.contains("profit") || q.contains("reward") {
+        "Ego is a DePIN (Decentralized Physical Infrastructure Network) where you can earn stable, **USD-pegged income** through four main channels. All rewards are automatically converted to EGOC at the live market price.
+
+### 1. Decentralized Storage
+Share your spare disk space in the **Storage** tab. You earn for every GB used by the network (target: **$0.002 / GB / day**). To keep earning, pass Proof-of-Storage (**PoST**) challenges automatically by keeping the app open.
+
+### 2. Proof-of-Coverage (PoC)
+Help map the network's global reach. Simply keep your node online and reachable (no VPN). A 'beacon' fires every 4 minutes, earning you EGOC based on network quality and witnesses (target: **$0.15 / day**).
+
+### 3. Staking & Consensus
+Stake at least **1,000 EGOC** in the **Staking** tab to become a validator. You'll earn block rewards (base **0.0832 EGOC**) plus a share of transaction fees. Staking currently offers up to **20%+ APR**.
+
+### 4. GPU & Compute Rental
+Turn your computer into a source of income for AI researchers. List your hardware in the **Compute** tab. You set the price, and the system handles the escrowed payments directly to your wallet.
+
+**How to start?**
+Just open any of the tabs above to configure your node. Your **Deterministic Reward Score (DRS)** tracks your reliability; maintain high uptime to multiply your total yield!"
     } else if q.contains("founder") || q.contains("artit") || q.contains("muhaxhiri") {
         "Artit Muhaxhiri is the founder of Ego Blockchain. He is a blockchain developer from Kosovo who previously built KosovaCoin and Roboti Besa."
     } else if q.contains("presale") || q.contains("seed") || q.contains("buy") {
