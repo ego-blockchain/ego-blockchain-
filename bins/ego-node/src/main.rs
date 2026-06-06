@@ -883,6 +883,7 @@ async fn run_daemon_mode(
                                 
                                 // Robust check: matches hex exactly OR decodes bech32 to compare raw bytes
                                 let is_for_me = if provider == my_addr_hex {
+                                let is_for_me = if provider.to_lowercase() == my_addr_hex.to_lowercase() {
                                     true
                                 } else {
                                     // Attempt to decode as bech32 and compare bytes
@@ -896,6 +897,7 @@ async fn run_daemon_mode(
                                     let res_id = payload["reservation"]["reservation_id"].as_str().unwrap_or_default().to_string();
                                     let buyer = payload["reservation"]["buyer_address"].as_str().unwrap_or_default().to_string();
                                     info!("🖥️ Compute reservation {} detected for buyer {}! Authorizing Web Console...", res_id, buyer);
+                                    info!("🖥️ Reservation {} authorized for buyer {} (Web Console active)", res_id, buyer);
                                     crate::store::insert_compute_auth(&res_id, &buyer);
                                     rpc_state.active_renters.lock().unwrap().insert(res_id, buyer);
 
