@@ -69,6 +69,9 @@ impl Default for NodeConfig {
             rpc_advertise_addr: "http://127.0.0.1:8545".to_string(),
             bootstrap_peers: vec![
                 "/dns4/rpc.egoblockchain.com/tcp/9000/p2p/12D3KooWMNRh7dJePAgtaZiwFCTisevVJQ5E52SpPqQqUPbHpJ72".to_string(),
+                "/dns4/egorelay.egoblockchain.com/tcp/9000/p2p/12D3KooWFFjZdk4nhpsXKxa44eUsggQ9rAzELeVv34Eav8qA5t9y".to_string(),
+                "/dns4/testnet.egoblockchain.com/tcp/9000/p2p/12D3KooWEgoBootstrap1FoundationNode".to_string(),
+                "/ip4/40.233.82.42/tcp/9000/p2p/12D3KooWPj6mZdk4nhpsXKxa44eUsggQ9rAzELeVv34Eav8qA5t9y".to_string(),
             ],
             storage_capacity_gb: Some(100.0),
             latitude: None,
@@ -842,6 +845,8 @@ async fn run_daemon_mode(
     let mut last_peer_count = 0;
     let compute_hash1 = compute_topic_v1.hash();
     let compute_hash2 = compute_topic_v2.hash();
+    
+    let mut discovery_interval = interval(Duration::from_secs(60));
 
     loop {
         tokio::select! {
@@ -896,8 +901,7 @@ async fn run_daemon_mode(
                             }
                         }
                     } else if message.topic == compute_hash1 || message.topic == compute_hash2 {
-                        info!("📡 [Compute] Received gossip message ({} bytes)", message.data.len());
-                        
+                        debug!("📡 [Compute] Gossip received ({} bytes) on topic {}", message.data.len(), message.topic);
                         if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&message.data) {
                             info!("📡 [Compute] Decoded payload: {}", payload);
                             // Case-insensitive type matching for different SDK/Protocol versions
@@ -1036,6 +1040,11 @@ async fn run_daemon_mode(
 
             _ = uptime_interval.tick() => {
                 node.update_uptime();
+            },
+
+            _ = discovery_interval.tick() => {
+                // Force Kademlia to find new peers if isolated
+                let _ = node.swarm.behaviour_mut().kademlia.bootstrap();
             },
 
             // Forward any tx bytes submitted via RPC into the gossip mesh so

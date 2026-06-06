@@ -873,7 +873,7 @@ async fn handle_exec(
             .unwrap_or(false)
     } else {
         // Handle raw hex comparison
-        let clean = buyer_addr.trim_start_matches("0x");
+        let clean = buyer_addr.to_lowercase().replace("0x", "");
         hex::encode(derived_addr.as_bytes()).to_lowercase() == clean.to_lowercase()
     };
 

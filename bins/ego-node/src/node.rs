@@ -135,18 +135,21 @@ impl Node {
         keystore: SecureKeystore,
     ) -> anyhow::Result<Self> {
         let peer_id = keystore.peer_id();
+        
+        let (relay_transport, relay_client) = relay::client::new(peer_id);
 
         let transport = tcp::tokio::Transport::default()
             .upgrade(Version::V1)
             .authenticate(noise::Config::new(&keystore.libp2p_keypair())?)
             .multiplex(yamux::Config::default())
+            .or_transport(relay_transport)
             .timeout(Duration::from_secs(30))
             .boxed();
 
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(Duration::from_secs(10))
             .validation_mode(gossipsub::ValidationMode::Strict)
-            .max_transmit_size(2 * 1024 * 1024)
+            .max_transmit_size(32 * 1024 * 1024)
             .duplicate_cache_time(Duration::from_secs(120))
             .message_id_fn(|message| {
                 use std::collections::hash_map::DefaultHasher;
@@ -196,6 +199,8 @@ impl Node {
         );
 
         let behaviour = NodeBehaviour {
+            relay_client,
+            dcutr: dcutr::Behaviour::new(peer_id),
             gossipsub,
             kademlia,
             identify,
@@ -1181,6 +1186,9 @@ impl Node {
             "ego/optimization/bandwidth",
             "ego/optimization/network",
             "ego/optimization/cost",
+            "ego-compute-v1",
+            "ego/compute/v1",
+            "ego-peers-v1",
         ];
 
         for topic in &optimization_topics {
