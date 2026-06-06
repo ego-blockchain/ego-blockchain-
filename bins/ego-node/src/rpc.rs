@@ -760,12 +760,22 @@ async fn handle_usage(
 ) -> impl IntoResponse {
     // 1. Verify Renter Authorization (Reuse existing logic)
     {
-        let renters = s.active_renters.lock().unwrap();
+        let mut renters = s.active_renters.lock().unwrap();
         if !renters.contains_key(&req.reservation_id) {
-            tracing::warn!("❌ Usage Auth Failed: Reservation {} not found. Known: {}", 
-                req.reservation_id, renters.len());
-            return (StatusCode::UNAUTHORIZED, "Unauthorized: No active reservation found for this ID")
-                .into_response();
+            // Fallback: Check persistent storage if cache miss.
+            // This handles cases where the reservation was received via P2P but the RPC cache is stale.
+            match crate::store::get_compute_reservation(&req.reservation_id) {
+                Some(res) if res.status == "active" => {
+                    // Hydrate cache for subsequent requests in this session
+                    renters.insert(req.reservation_id.clone(), res.buyer_address.clone());
+                }
+                _ => {
+                    tracing::warn!("❌ Usage Auth Failed: Reservation {} not found in cache or DB. Known: {}", 
+                        req.reservation_id, renters.len());
+                    return (StatusCode::UNAUTHORIZED, "Unauthorized: No active reservation found for this ID")
+                        .into_response();
+                }
+            }
         }
     }
 
@@ -802,12 +812,21 @@ async fn handle_exec(
 ) -> impl IntoResponse {
     // 1. Verify Renter Authorization
     let buyer_addr = {
-        let renters = s.active_renters.lock().unwrap();
-        match renters.get(&req.reservation_id) {
-            Some(addr) => addr.clone(),
-            None => {
-                tracing::warn!("❌ Exec Auth Failed: Reservation {} not found.", req.reservation_id);
-                return (StatusCode::UNAUTHORIZED, "Unauthorized: No active reservation found for this ID").into_response();
+        let mut renters = s.active_renters.lock().unwrap();
+        if let Some(addr) = renters.get(&req.reservation_id) {
+            addr.clone()
+        } else {
+            // Fallback: Check persistent storage for headless nodes or recently received reservations
+            match crate::store::get_compute_reservation(&req.reservation_id) {
+                Some(res) if res.status == "active" => {
+                    let addr = res.buyer_address.clone();
+                    renters.insert(req.reservation_id.clone(), addr.clone());
+                    addr
+                }
+                _ => {
+                    tracing::warn!("❌ Exec Auth Failed: Reservation {} not found in cache or DB.", req.reservation_id);
+                    return (StatusCode::UNAUTHORIZED, "Unauthorized: No active reservation found for this ID").into_response();
+                }
             }
         }
     };
@@ -826,16 +845,18 @@ async fn handle_exec(
     // Validate the public key matches the authorized buyer address
     let pk = match PublicKey::from_slice(&pk_bytes) {
         Ok(k) => k,
-        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid public key").into_response(),
+        Err(_) => {
+            tracing::error!("❌ Exec Failed: Malformed public key in request");
+            return (StatusCode::BAD_REQUEST, "Invalid public key").into_response();
+        }
     };
     let derived_addr = Address::from_public_key(&pk);
-    
+
     // Simple check: does the key provided match the renter of this reservation?
     let is_match = if buyer_addr.starts_with("egot") || buyer_addr.starts_with("ego1") {
-        // Handle Bech32 comparison (detecting HRP)
         let hrp = if buyer_addr.starts_with("egot") { "egot" } else { "ego" };
         ego_core::EgoAddress::from_bech32(&buyer_addr, hrp)
-            .map(|a| &a.as_bytes()[1..] == derived_addr.as_bytes())
+            .map(|a| a.payload() == derived_addr.as_bytes())
             .unwrap_or(false)
     } else {
         // Handle raw hex comparison
@@ -844,6 +865,8 @@ async fn handle_exec(
     };
 
     if !is_match {
+        tracing::error!("❌ Exec Forbidden: Key derives to {}, but reservation {} belongs to {}", 
+            hex::encode(derived_addr.as_bytes()), req.reservation_id, buyer_addr);
         return (StatusCode::FORBIDDEN, "Forbidden: Public key does not match reservation buyer").into_response();
     }
 

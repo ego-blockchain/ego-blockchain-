@@ -135,6 +135,10 @@ async fn main() -> anyhow::Result<()> {
     let node_pubkey  = hex::encode(&node.get_keypair().ed25519_public_key().key_data);
     let node_keypair = node.get_keypair().clone();
 
+    // Display the node's official network address for the operator to see.
+    let bech32_addr = ego_core::EgoAddress::from_raw(node.get_address().as_bytes(), 1, ego_core::AddressType::EOA).to_bech32("egot").unwrap_or_default();
+    info!("📍 Node Network Identity: {}", bech32_addr);
+
     let _engine = EgoExecutionEngine::new();
     let (supervisor, _heartbeat) = NodeSupervisor::new();
 
@@ -880,7 +884,7 @@ async fn run_daemon_mode(
                                 let provider = payload["reservation"]["provider_address"].as_str().unwrap_or("");
                                 let my_addr_raw = node.get_address();
                                 let my_addr_hex = format!("0x{}", hex::encode(my_addr_raw.as_bytes()));
-                                
+
                                 // Robust check: matches hex exactly OR decodes bech32 to compare raw bytes
                                 let is_for_me = if provider.to_lowercase() == my_addr_hex.to_lowercase() {
                                     true
@@ -888,7 +892,7 @@ async fn run_daemon_mode(
                                     // Attempt to decode as bech32 and compare bytes
                                     let hrp = if provider.starts_with("egot") { "egot" } else { "ego" };
                                     ego_core::EgoAddress::from_bech32(provider, hrp)
-                                        .map(|addr| &addr.as_bytes()[1..] == my_addr_raw.as_bytes())
+                                        .map(|addr| addr.payload() == my_addr_raw.as_bytes())
                                         .unwrap_or(false)
                                 };
 
