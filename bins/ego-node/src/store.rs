@@ -13,6 +13,7 @@ const CF_TX_INDEX:   &str = "tx_index";
 const CF_ACCOUNTS:   &str = "accounts";
 const CF_VALIDATORS: &str = "validators";
 const CF_META:       &str = "meta";
+const CF_COMPUTE_RESERVATIONS: &str = "compute_reservations";
 
 const REWARD_POOL_KEY: &[u8] = b"\x00__reward_pool__";
 const TOTAL_EMISSION_UEGOC_DEFAULT: u64 = 40_000_000 * 1_000_000;
@@ -33,6 +34,7 @@ fn store() -> &'static DB {
             ColumnFamilyDescriptor::new(CF_ACCOUNTS, Options::default()),
             ColumnFamilyDescriptor::new(CF_VALIDATORS, Options::default()),
             ColumnFamilyDescriptor::new(CF_META, Options::default()),
+            ColumnFamilyDescriptor::new(CF_COMPUTE_RESERVATIONS, Options::default()),
         ];
 
         DB::open_cf_descriptors(&opts, DB_PATH, cf_descs)
@@ -244,6 +246,30 @@ pub fn load_all_validators() -> Vec<Value> {
         .filter_map(|r| r.ok())
         .filter_map(|(_, v)| serde_json::from_slice(&v).ok())
         .collect()
+}
+
+pub fn insert_compute_auth(res_id: &str, buyer_addr: &str) {
+    let db = store();
+    if let Some(cf) = db.cf_handle(CF_COMPUTE_RESERVATIONS) {
+        let _ = db.put_cf(cf, res_id.as_bytes(), buyer_addr.as_bytes());
+    }
+}
+
+/// Returns Map of reservation_id -> buyer_address
+pub fn list_compute_auths() -> std::collections::HashMap<String, String> {
+    let db = store();
+    let mut out = std::collections::HashMap::new();
+    if let Some(cf) = db.cf_handle(CF_COMPUTE_RESERVATIONS) {
+        let iter = db.iterator_cf(cf, IteratorMode::Start);
+        for item in iter {
+            if let Ok((k, v)) = item {
+                if let (Ok(ks), Ok(vs)) = (String::from_utf8(k.to_vec()), String::from_utf8(v.to_vec())) {
+                    out.insert(ks, vs);
+                }
+            }
+        }
+    }
+    out
 }
 
 pub fn save_reward_pool(remaining_uegoc: u64) {

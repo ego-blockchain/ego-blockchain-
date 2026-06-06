@@ -138,6 +138,9 @@ async fn main() -> anyhow::Result<()> {
     let _engine = EgoExecutionEngine::new();
     let (supervisor, _heartbeat) = NodeSupervisor::new();
 
+    let active_renters_map = crate::store::list_compute_auths();
+    let active_renters_count = active_renters_map.len();
+
     let (mempool_gossip_tx, mempool_gossip_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
     let rpc_state = Arc::new(RpcState {
@@ -155,9 +158,14 @@ async fn main() -> anyhow::Result<()> {
         faucet_claims:  Mutex::new(std::collections::HashMap::new()),
         write_rate:     Mutex::new(std::collections::HashMap::new()),
         mempool_gossip_tx,
-        active_renters: Mutex::new(std::collections::HashMap::new()),
+        active_renters: Mutex::new(active_renters_map),
         peer_rpc_addrs: Mutex::new(std::collections::HashMap::new()),
     });
+
+    if active_renters_count > 0 {
+        info!("🖥️ Restored {} active compute authorizations from database", active_renters_count);
+    }
+
     let rpc_addr = format!("0.0.0.0:{}", config.rpc_port);
     let rpc_state_clone = Arc::clone(&rpc_state);
     tokio::spawn(async move {
@@ -888,6 +896,7 @@ async fn run_daemon_mode(
                                     let res_id = payload["reservation"]["reservation_id"].as_str().unwrap_or_default().to_string();
                                     let buyer = payload["reservation"]["buyer_address"].as_str().unwrap_or_default().to_string();
                                     info!("🖥️ Compute reservation {} detected for buyer {}! Authorizing Web Console...", res_id, buyer);
+                                    crate::store::insert_compute_auth(&res_id, &buyer);
                                     rpc_state.active_renters.lock().unwrap().insert(res_id, buyer);
 
                                     if let Some(pubkey) = payload["ssh_public_key"].as_str() {
