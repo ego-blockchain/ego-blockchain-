@@ -491,10 +491,6 @@ export default function ComputePage() {
             Rent out your CPU, GPU, or RAM and earn EGOC · Rent computing power from anyone on the network
           </p>
         </div>
-        <button onClick={openSshKey}
-          className="px-4 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm rounded-xl border border-gray-700 transition flex items-center gap-2 shrink-0 shadow-lg">
-          <span>🔑</span> SSH Key
-        </button>
       </div>
 
       {/* Quick earnings strip */}
@@ -532,130 +528,42 @@ export default function ComputePage() {
       {tab === 'earn' && (
         <div className="space-y-4">
 
-          {/* Setup card */}
-          <div className="bg-gray-800 rounded-xl p-5 border border-gray-700 space-y-5">
-            <div className="flex items-center justify-between">
-              <div>
-                <h2 className="text-white font-semibold">Share your computer</h2>
-                <p className="text-gray-400 text-xs mt-0.5">Rent out your CPU, GPU, or RAM to others and earn EGOC — separate from Storage</p>
-              </div>
-              <button onClick={() => setEnabled(v => !v)}
-                className={`relative w-12 h-6 rounded-full transition-colors ${enabled ? 'bg-purple-600' : 'bg-gray-600'}`}>
-                <span className={`absolute top-1 left-1 w-4 h-4 bg-white rounded-full transition-transform ${enabled ? 'translate-x-6' : ''}`} />
-              </button>
-            </div>
-
-            {/* Hardware */}
-            <div className="space-y-3">
-              <div className="flex items-center justify-between">
-                <p className="text-gray-300 text-sm font-medium">Your hardware</p>
-                <button onClick={detectHw} disabled={detectingHw}
-                  className="text-xs text-purple-400 hover:text-purple-300 disabled:opacity-50">
-                  {detectingHw ? 'Scanning…' : 'Auto-detect'}
-                </button>
-              </div>
-              {hw ? (
-                <div className="grid grid-cols-2 gap-3 text-sm">
-                  <div className="bg-gray-750 border border-gray-600 rounded-lg p-3">
-                    <p className="text-gray-400 text-xs">Processor</p>
-                    <p className="text-white">{hw.cpu_model}</p>
-                    <p className="text-gray-400 text-xs mt-0.5">{hw.cpu_cores} cores · {hw.ram_gb}GB RAM</p>
-                  </div>
-                  <div className="bg-gray-750 border border-gray-600 rounded-lg p-3">
-                    <p className="text-gray-400 text-xs">Graphics Card (GPU)</p>
-                    <p className="text-white">{gpuLabel(hw)}</p>
-                    {hw.has_cuda && <p className="text-green-400 text-xs mt-0.5">✓ CUDA — great for AI</p>}
-                  </div>
-                </div>
-              ) : (
-                <button onClick={detectHw} disabled={detectingHw}
-                  className="w-full py-3 border-2 border-dashed border-gray-600 rounded-xl text-gray-400 text-sm hover:border-purple-500 hover:text-purple-400 transition-colors">
-                  {detectingHw ? 'Scanning your hardware…' : '+ Click to detect your hardware'}
-                </button>
-              )}
-            </div>
-
-            {/* How much to share */}
-            <div className="space-y-3">
-              <p className="text-gray-300 text-sm font-medium">How much to share</p>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <div className="flex justify-between text-xs text-gray-400 mb-1">
-                    <span>CPU cores to share</span>
-                    <span className="text-white font-medium">{allocCores} / {hw?.cpu_cores ?? '?'}</span>
-                  </div>
-                  <input type="range" min={1} max={hw?.cpu_cores ?? 16}
-                    value={allocCores} onChange={ev => setAllocCores(Number(ev.target.value))}
-                    className="w-full accent-purple-500" />
-                </div>
-                <div>
-                  <div className="flex justify-between text-xs text-gray-400 mb-1">
-                    <span>RAM to share</span>
-                    <span className="text-white font-medium">{allocRam}GB / {hw?.ram_gb ?? '?'}GB</span>
-                  </div>
-                  <input type="range" min={1} max={hw?.ram_gb ?? 32}
-                    value={allocRam} onChange={ev => setAllocRam(Number(ev.target.value))}
-                    className="w-full accent-purple-500" />
-                </div>
-              </div>
-              {((status?.locked_cores ?? 0) > 0 || (status?.locked_ram_gb ?? 0) > 0) && (
-                <p className="text-yellow-400 text-xs">
-                  ⚠ {status!.locked_cores} cores and {status!.locked_ram_gb}GB RAM are reserved by active bookings.
-                </p>
-              )}
-            </div>
-
-            {/* Pricing */}
-            <div className="space-y-3">
-              <p className="text-gray-300 text-sm font-medium">Your price</p>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="text-gray-400 text-xs block mb-1">Per GPU · per hour (EGOC)</label>
-                  <div className="flex items-center gap-2">
-                    <input type="number" min={0} step={0.1} value={gpuHourEgoc}
-                      onChange={ev => setGpuHourEgoc(Number(ev.target.value))}
-                      className="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white text-sm" />
-                    <span className="text-gray-400 text-xs">EGOC/GPU/hr</span>
-                  </div>
-                </div>
-                <div>
-                  <label className="text-gray-400 text-xs block mb-1">Per CPU core · per hour (EGOC)</label>
-                  <div className="flex items-center gap-2">
-                    <input type="number" min={0} step={0.01} value={coreHourEgoc}
-                      onChange={ev => setCoreHourEgoc(Number(ev.target.value))}
-                      className="flex-1 bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white text-sm" />
-                    <span className="text-gray-400 text-xs">EGOC/core/hr</span>
-                  </div>
-                </div>
-              </div>
-              {hw && (
-                <p className="text-purple-400 text-xs">
-                  Estimated earnings: ~{fmt(u((hw.gpu_count * gpuHourEgoc + hw.cpu_cores * coreHourEgoc) * 24))} EGOC/day if running 24h
-                </p>
-              )}
-            </div>
-
-            {saveErr && <p className="text-red-400 text-sm">{saveErr}</p>}
-            {saveMsg && <p className="text-green-400 text-sm">{saveMsg}</p>}
-            <button onClick={saveSettings} disabled={saving}
-              className="w-full py-2.5 bg-purple-600 hover:bg-purple-500 text-white rounded-xl font-medium text-sm disabled:opacity-60">
-              {saving ? 'Saving…' : 'Save Settings'}
-            </button>
-          </div>
-
-          {/* Sell capacity — time-based bookings */}
           <div className="bg-gray-800 rounded-xl border border-gray-700 p-5 space-y-4">
             <div className="flex items-center justify-between">
               <div>
-                <h2 className="text-white font-semibold">List your hardware for rent</h2>
-                <p className="text-gray-400 text-xs mt-0.5">
-                  Buyers can book your hardware by the minute, hour, day, month, or year. Payment is held in escrow and released to you every period.
-                </p>
+                <h2 className="text-white font-semibold text-lg">Earn from your Hardware</h2>
+                <p className="text-gray-400 text-xs mt-0.5">List your CPU, GPU, or RAM on the marketplace to earn EGOC per hour.</p>
               </div>
-              <button onClick={() => setOfferOpen(true)}
-                className="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white text-sm rounded-lg font-medium whitespace-nowrap">
-                + List My Hardware
-              </button>
+              <div className="flex gap-2">
+                <button onClick={detectHw} disabled={detectingHw}
+                  className="px-4 py-2 bg-gray-700 hover:bg-gray-600 text-gray-300 text-sm rounded-lg font-medium transition-all disabled:opacity-50">
+                  {detectingHw ? 'Scanning…' : 'Detect Hardware'}
+                </button>
+                <button onClick={() => setOfferOpen(true)}
+                  className="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white text-sm rounded-lg font-medium whitespace-nowrap shadow-lg transition-transform active:scale-95">
+                  + List My Hardware
+                </button>
+              </div>
+            </div>
+
+            {hw && (
+              <div className="grid grid-cols-2 gap-3 text-sm">
+                <div className="bg-gray-750 border border-gray-700 rounded-xl p-3">
+                  <p className="text-gray-400 text-[10px] uppercase font-bold tracking-wider">Processor</p>
+                  <p className="text-white font-medium">{hw.cpu_model}</p>
+                  <p className="text-gray-500 text-xs mt-0.5">{hw.cpu_cores} cores · {hw.ram_gb}GB RAM</p>
+                </div>
+                <div className="bg-gray-750 border border-gray-700 rounded-xl p-3">
+                  <p className="text-gray-400 text-[10px] uppercase font-bold tracking-wider">Graphics</p>
+                  <p className="text-white font-medium">{gpuLabel(hw)}</p>
+                  {hw.has_cuda && <p className="text-green-400 text-[10px] mt-0.5 font-bold">✓ CUDA ACCELERATION ACTIVE</p>}
+                </div>
+              </div>
+            )}
+
+            <div className="bg-blue-900/10 border border-blue-700/30 rounded-xl px-4 py-3 text-xs text-blue-300">
+              Renting is simple: list your available capacity, set your price, and get paid automatically in EGOC. 
+              <strong> Keep the app open to remain listed.</strong>
             </div>
 
             {offers.filter(o => o.provider_address === myAddr).length === 0 ? (
@@ -865,6 +773,12 @@ export default function ComputePage() {
                             <p className="text-yellow-400 text-sm font-bold">{fmt(r.period_rate_uegoc * r.periods_paid)} EGOC</p>
                             <p className="text-gray-400 text-xs">earned so far</p>
                           </div>
+                        )}
+                        {r.status !== 'active' && (
+                          <button onClick={() => setConfirmDeleteHistory(r.reservation_id)}
+                            className="px-3 py-1 bg-gray-700 hover:bg-red-900/40 text-gray-400 hover:text-red-300 text-[10px] uppercase font-bold tracking-wider rounded-lg transition-all">
+                            Remove
+                          </button>
                         )}
                       </div>
                     </div>
