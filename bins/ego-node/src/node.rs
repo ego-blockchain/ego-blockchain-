@@ -13,8 +13,8 @@ use ego_consensus::porep::prover::ProverConfig;
 use std::sync::Arc;
 
 use libp2p::{
-    Multiaddr, PeerId, Swarm, Transport, autonat, core::upgrade::Version, gossipsub, identify, kad,
-    mdns, noise, ping, tcp, yamux,
+    Multiaddr, PeerId, Swarm, Transport, autonat, core::upgrade::Version, dcutr, gossipsub, identify, kad,
+    mdns, noise, ping, relay, tcp, yamux,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
@@ -142,8 +142,8 @@ impl Node {
             .upgrade(Version::V1)
             .authenticate(noise::Config::new(&keystore.libp2p_keypair())?)
             .multiplex(yamux::Config::default())
-            .or_transport(relay_transport)
             .timeout(Duration::from_secs(30))
+            .or_transport(relay_transport)
             .boxed();
 
         let gossipsub_config = gossipsub::ConfigBuilder::default()
