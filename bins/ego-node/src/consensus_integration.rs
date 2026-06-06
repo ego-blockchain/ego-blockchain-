@@ -1,5 +1,5 @@
 
-use ego_core::{Address, Balance, Hash, PublicKey, StateManager, JailReason, hash_data};
+use ego_core::{Address, Balance, PublicKey, StateManager, JailReason, hash_data};
 use ego_core::state::{
     ValidatorHotSetConfig, ValidatorInfo, ValidatorPerformance, ValidatorStatus,
 };
