@@ -891,13 +891,13 @@ async fn run_daemon_mode(
                             
                             if msg_type == "reservation_booked" || msg_type == "reservationbooked" {
                                 // Resilient data extraction for nested or flat objects
-                                let res_data = if payload.contains_key("reservation") {
+                                let res_data = if payload.get("reservation").is_some() {
                                     &payload["reservation"]
-                                } else if payload.contains_key("reservation_booked") {
+                                } else if payload.get("reservation_booked").is_some() {
                                     &payload["reservation_booked"]["reservation"]
                                 } else if let Some(inner) = payload.as_object().and_then(|o| o.values().next()) {
                                     // Handle externally tagged enum: {"ReservationBooked": {"reservation": ...}}
-                                    if inner.contains_key("reservation") { &inner["reservation"] } else { inner }
+                                    if inner.get("reservation").is_some() { &inner["reservation"] } else { inner }
                                 } else {
                                     &payload
                                 };
