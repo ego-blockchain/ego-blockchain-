@@ -622,7 +622,7 @@ impl SecureKeystore {
                 "HKDF-BLAKE2s"
             ],
             "created_at": chrono::DateTime::from_timestamp(self.metadata.created_at as i64, 0)
-                .map(|dt| dt.to_rfc3339())
+                .map(|dt: chrono::DateTime<chrono::Utc>| dt.to_rfc3339())
                 .unwrap_or_else(|| "unknown".to_string()),
             "note": "EGO keystore v2.0 with post-quantum cryptography support (private keys not exported for security)"
         });
