@@ -16,7 +16,6 @@ use libp2p::{
     Multiaddr, PeerId, Swarm, Transport, autonat, core::upgrade::Version, dcutr, gossipsub, identify, kad,
     mdns, noise, ping, relay, tcp, yamux,
 };
-use either::Either;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
@@ -156,8 +155,8 @@ impl Node {
                     .map(|(p, m), _| (p, libp2p::core::muxing::StreamMuxerBox::new(m)))
             )
             .map(|either, _| match either {
-                Either::Left(res) => res,
-                Either::Right(res) => res,
+                futures::future::Either::Left(res) => res,
+                futures::future::Either::Right(res) => res,
             })
             .boxed();
 
