@@ -139,15 +139,21 @@ impl Node {
         
         let (relay_transport, relay_client) = relay::client::new(peer_id);
 
+        let noise_config = noise::Config::new(&keystore.libp2p_keypair())?;
+        let yamux_config = yamux::Config::default();
+
         let transport = tcp::tokio::Transport::default()
             .upgrade(Version::V1)
-            .authenticate(noise::Config::new(&keystore.libp2p_keypair())?)
-            .multiplex(yamux::Config::default())
+            .authenticate(noise_config.clone())
+            .multiplex(yamux_config.clone())
             .timeout(Duration::from_secs(30))
             .map(|(p, m), _| (p, libp2p::core::muxing::StreamMuxerBox::new(m)))
             .or_transport(
                 relay_transport
-                    .map(|(p, c), _| (p, libp2p::core::muxing::StreamMuxerBox::new(c)))
+                    .upgrade(Version::V1)
+                    .authenticate(noise_config)
+                    .multiplex(yamux_config)
+                    .map(|(p, m), _| (p, libp2p::core::muxing::StreamMuxerBox::new(m)))
             )
             .map(|either, _| match either {
                 Either::Left(res) => res,

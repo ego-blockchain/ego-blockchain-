@@ -39,6 +39,7 @@ bytes = "1.10.1"
 yamux = "0.13.4"
 libp2p = { version = "0.54", features = ["tokio", "yamux", "noise", "dns", "quic", "gossipsub", "kad", "macros", "relay", "dcutr"] }
 blake2 = "0.10"
+either = "1.13"
 
 [profile.dev.package.pqcrypto-dilithium]
 opt-level = 3
