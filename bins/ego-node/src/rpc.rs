@@ -114,6 +114,8 @@ pub fn make_router(state: Arc<RpcState>) -> Router {
         .route("/node/usage",         post(handle_usage))
         .route("/exec",               post(handle_exec))
         .route("/block/broadcast",    post(block_broadcast))
+        .route("/compute/offers",     get(list_offers))
+        .route("/compute/reservations", get(list_reservations))
         .route("/blocks/range",       get(blocks_range))
         .route("/rpc",                post(json_rpc))
         .layer(CorsLayer::permissive())
@@ -126,6 +128,16 @@ async fn root() -> impl IntoResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "docs":    "/health · /chain/blocks · /chain/transactions · /balance/:address · /node/identity · /faucet?to=<address>",
     }))
+}
+
+async fn list_offers() -> impl IntoResponse {
+    let offers = crate::store::list_compute_offers();
+    Json(offers)
+}
+
+async fn list_reservations() -> impl IntoResponse {
+    let auths = crate::store::list_compute_auths();
+    Json(auths)
 }
 
 async fn health(State(s): State<Arc<RpcState>>) -> impl IntoResponse {
