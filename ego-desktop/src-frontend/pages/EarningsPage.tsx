@@ -237,28 +237,30 @@ const EarningsPage: React.FC = () => {
     <div className="p-6 space-y-5 max-w-4xl mx-auto">
 
       {/* ── Testnet notice ─────────────────────────────────────────────────── */}
-      <div className="bg-blue-500/10 border border-blue-500/40 rounded-2xl px-5 py-3 flex items-center gap-3">
-        <span className="text-lg shrink-0">🧪</span>
-        <div className="text-xs text-blue-200/80">
-          <span className="font-semibold text-blue-300">Testnet — </span>
-          All earnings, DRS scores, and rewards shown here are testnet profits and will be
-          converted to real EGOC at mainnet launch based on your accumulated balance.
+      <div className="bg-indigo-500/5 border border-indigo-500/20 rounded-xl px-5 py-3 flex items-center gap-4 shadow-sm">
+        <div className="w-10 h-10 rounded-full bg-indigo-500/10 flex items-center justify-center text-xl shrink-0 border border-indigo-500/20">🧪</div>
+        <div className="text-[11px] leading-relaxed text-indigo-200/70">
+          <span className="font-bold text-indigo-300 uppercase tracking-widest text-[10px] block mb-0.5">Network Status: Testnet Simulation</span>
+          All earnings, DRS scores, and rewards shown here are testnet profits for simulation and testing purposes only. They <span className="text-indigo-300 font-semibold underline decoration-indigo-500/50 underline-offset-2">will not</span> be converted to real EGOC.
         </div>
       </div>
 
       {/* ── Keep app open warning ──────────────────────────────────────────── */}
-      <div className="bg-yellow-500/10 border border-yellow-500/40 rounded-2xl px-5 py-4 flex items-start gap-3">
-        <span className="text-2xl shrink-0 mt-0.5">⚠️</span>
-        <div>
-          <div className="font-semibold text-yellow-300 text-sm">Keep the app open to earn</div>
-          <div className="text-xs text-yellow-200/70 mt-0.5">
-            Your node earns rewards only while running. Closing the app stops all earnings —
-            storage proofs, coverage beacons, and block validation all require an active node.
+      <div className="bg-amber-900/10 border border-amber-500/30 rounded-2xl px-6 py-5 flex items-center gap-5 shadow-lg relative overflow-hidden group">
+        <div className="absolute top-0 right-0 p-1">
+          <div className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-ping opacity-75"></div>
+        </div>
+        <div className="w-12 h-12 rounded-full bg-amber-500/10 flex items-center justify-center text-2xl shrink-0 border border-amber-500/20 group-hover:scale-110 transition-transform">⚠️</div>
+        <div className="flex-1">
+          <div className="font-black text-amber-400 text-xs uppercase tracking-[0.2em] mb-1">Node Activity Required</div>
+          <div className="text-[11px] text-amber-200/60 leading-relaxed max-w-lg">
+            Your node earns rewards <span className="text-amber-300 font-bold">only while running</span>. Closing the app stops all earnings — 
+            storage proofs, coverage beacons, and block validation all require an active node heartbeat.
           </div>
         </div>
-        <div className="ml-auto text-right shrink-0">
-          <div className="text-xs text-yellow-400/60 mb-0.5">Session uptime</div>
-          <div className="font-mono text-sm font-bold text-yellow-300">{fmtDuration(uptime)}</div>
+        <div className="text-right shrink-0 border-l border-amber-500/20 pl-6">
+          <div className="text-[10px] font-bold text-amber-500/50 uppercase tracking-widest mb-1">Session Uptime</div>
+          <div className="font-mono text-lg font-black text-amber-300 tabular-nums drop-shadow-[0_0_8px_rgba(251,191,36,0.3)]">{fmtDuration(uptime)}</div>
         </div>
       </div>
 
@@ -379,28 +381,40 @@ const EarningsPage: React.FC = () => {
       )}
 
       {/* ── Session earned counter ─────────────────────────────────────────── */}
-      <div className="bg-gradient-to-br from-green-900/40 to-blue-900/40 border border-green-500/30 rounded-2xl p-5">
-        <div className="text-xs text-gray-400 mb-1">Earned this session</div>
-        <div className="text-4xl font-black text-green-400 font-mono tabular-nums">
-          {fmtEgoc(sessionEarned, 6)} <span className="text-lg text-green-600">EGOC</span>
-        </div>
-        <div className="text-xs text-gray-500 mt-1">
-          Max rate: {fmtEgoc(earnings?.daily_rewards ?? 0, 2)} EGOC/day — actual payout depends on utilisation &amp; criteria
+      <div className="bg-slate-950 border border-slate-800 rounded-2xl p-7 shadow-2xl relative overflow-hidden group">
+        <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-emerald-500 via-cyan-500 to-indigo-500 opacity-50"></div>
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="space-y-1">
+            <div className="text-[10px] font-black text-slate-500 uppercase tracking-[0.25em] mb-2 flex items-center gap-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.8)]"></span>
+              Live Session Accrual
+            </div>
+            <div className="text-5xl font-mono font-black text-emerald-400 tabular-nums tracking-tighter drop-shadow-[0_0_15px_rgba(16,185,129,0.3)]">
+              {fmtEgoc(sessionEarned, 6)} <span className="text-xl text-emerald-700/60 ml-1">EGOC</span>
+            </div>
+          </div>
+          <div className="text-left md:text-right space-y-1 border-t md:border-t-0 md:border-l border-slate-800 pt-4 md:pt-0 md:pl-8">
+            <div className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Network Throughput</div>
+            <div className="text-sm font-mono font-bold text-slate-300">
+              {fmtEgoc(earnings?.daily_rewards ?? 0, 2)} <span className="text-[10px] text-slate-500">EGOC / DAY</span>
+            </div>
+            <div className="text-[9px] text-slate-600 leading-tight uppercase font-medium">Actual payout subject to <br/>DRS eligibility and uptime</div>
+          </div>
         </div>
       </div>
 
       {/* ── Summary cards ─────────────────────────────────────────────────── */}
       <div className="grid grid-cols-4 gap-3">
         {[
-          { label: 'Max Rate',     val: earnings ? fmtEgoc(earnings.daily_rewards) : '—',    unit: 'EGOC/day (potential)', color: 'text-green-400',  bg: 'bg-green-500/10'  },
-          { label: 'Max / Epoch',  val: earnings ? fmtEgoc(earnings.epoch_rewards)  : '—',    unit: '7 days (potential)',   color: 'text-blue-400',   bg: 'bg-blue-500/10'   },
-          { label: 'Pending',      val: earnings ? fmtEgoc(earnings.pending_rewards): '—',    unit: 'EGOC',                 color: 'text-yellow-400', bg: 'bg-yellow-500/10' },
-          { label: 'Total Earned', val: earnings ? fmtEgoc(earnings.total_earned)   : '—',    unit: 'EGOC',                 color: 'text-purple-400', bg: 'bg-purple-500/10' },
+          { label: 'Settlement Rate', val: earnings ? fmtEgoc(earnings.daily_rewards) : '—',    unit: 'EGOC / 24H', color: 'text-emerald-400', bg: 'bg-emerald-500/5 border-emerald-500/10' },
+          { label: 'Epoch Target',   val: earnings ? fmtEgoc(earnings.epoch_rewards)  : '—',    unit: 'EGOC / 7D',  color: 'text-cyan-400',    bg: 'bg-cyan-500/5 border-cyan-500/10'    },
+          { label: 'Pending Payout', val: earnings ? fmtEgoc(earnings.pending_rewards): '—',    unit: 'UEGOC UNCONFIRMED', color: 'text-amber-400',   bg: 'bg-amber-500/5 border-amber-500/10'   },
+          { label: 'Lifetime Yield', val: earnings ? fmtEgoc(earnings.total_earned)   : '—',    unit: 'TOTAL EGOC MINTED', color: 'text-indigo-400',  bg: 'bg-indigo-500/5 border-indigo-500/10' },
         ].map(c => (
-          <div key={c.label} className={`${c.bg} rounded-2xl p-4 border border-white/5`}>
-            <div className="text-xs text-gray-400 mb-1">{c.label}</div>
-            <div className={`text-xl font-black ${c.color}`}>{c.val}</div>
-            <div className="text-xs text-gray-500">{c.unit}</div>
+          <div key={c.label} className={`${c.bg} rounded-xl p-5 border relative overflow-hidden group hover:bg-opacity-10 transition-all`}>
+            <div className="text-[10px] font-black text-slate-500 uppercase tracking-[0.15em] mb-3">{c.label}</div>
+            <div className={`text-2xl font-mono font-black tabular-nums ${c.color} drop-shadow-[0_0_8px_rgba(0,0,0,0.3)]`}>{c.val}</div>
+            <div className="text-[9px] font-bold text-slate-600 uppercase tracking-widest mt-2">{c.unit}</div>
           </div>
         ))}
       </div>

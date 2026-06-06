@@ -1019,9 +1019,6 @@ const ContractsPage: React.FC = () => {
       </div>
 
       {}
-      <RollupBar />
-
-      {}
       <div className="flex gap-1 bg-gray-800 border border-gray-700 rounded-2xl p-1">
         {TABS.map(t => (
           <button
