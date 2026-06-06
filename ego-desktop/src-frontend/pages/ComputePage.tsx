@@ -218,6 +218,7 @@ export default function ComputePage() {
   const [clusterBusy,         setClusterBusy]         = useState(false);
   const [clusterMsg,          setClusterMsg]          = useState('');
   const [connectInfo,         setConnectInfo]         = useState<ClusterConnectInfo | null>(null);
+  const [resConnectInfo,      setResConnectInfo]      = useState<ReservationConnectInfo | null>(null);
   const [wgConfigText,        setWgConfigText]        = useState('');
   const [wgConfigOpen,        setWgConfigOpen]        = useState(false);
   const [clusterHeartbeatId,  setClusterHeartbeatId]  = useState<string | null>(null);
@@ -434,6 +435,21 @@ export default function ComputePage() {
       const info = await invoke<ClusterConnectInfo>('get_cluster_connect_info', { clusterId });
       setConnectInfo(info);
     } catch (err: any) { alert(String(err)); }
+  }
+
+  async function showResConnectInfo(reservationId: string) {
+    try {
+      const info = await invoke<ReservationConnectInfo>('get_reservation_connect_info', { reservationId });
+      setResConnectInfo(info);
+    } catch (err: any) { alert(String(err)); }
+  }
+
+  async function handleAutoConnect(cmd: string) {
+    try {
+      await invoke('launch_ssh_terminal', { command: cmd });
+    } catch (err: any) {
+      alert(String(err));
+    }
   }
 
   async function downloadBuyerWgConfig(clusterId: string) {
@@ -911,13 +927,6 @@ export default function ComputePage() {
                           </>
                         )}
                       </div>
-                    )}
-                    {r.status !== 'active' && (
-                      <button onClick={() => setConfirmDeleteHistory(r.reservation_id)}
-                        disabled={busyRes === r.reservation_id}
-                        className="w-full py-2 bg-gray-700 hover:bg-red-900 text-gray-400 hover:text-red-300 text-xs rounded-lg transition-colors disabled:opacity-60 border border-red-900/30 mt-2">
-                        {busyRes === r.reservation_id ? 'Removing…' : 'Remove from History'}
-                      </button>
                     )}
                   </div>
                 );
@@ -1671,6 +1680,56 @@ export default function ComputePage() {
             )}
             <p className="text-gray-500 text-xs">Subnet: {connectInfo.subnet}.0/24 · Head IP: {connectInfo.connect.head_ip}</p>
             <button onClick={() => setConnectInfo(null)}
+              className="w-full py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm">
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Individual Reservation Connect Info modal ── */}
+      {resConnectInfo && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-xl border border-gray-700 p-6 w-full max-w-lg space-y-4">
+            <h3 className="text-white font-semibold text-lg">Connect to Machine</h3>
+            <div className="grid grid-cols-2 gap-2 text-center">
+              <div className="bg-gray-750 rounded-lg p-2">
+                <p className="text-gray-400 text-xs">Status</p>
+                <p className="text-white font-bold text-sm capitalize">{resConnectInfo.status}</p>
+              </div>
+              <div className="bg-gray-750 rounded-lg p-2">
+                <p className="text-gray-400 text-xs">Provider IP</p>
+                <p className="text-white font-bold text-sm">{resConnectInfo.provider_ip}</p>
+              </div>
+            </div>
+
+            <div className="p-4 bg-blue-600/10 border border-blue-500/30 rounded-xl">
+              <div className="flex items-center gap-2 mb-2">
+                <span className="text-lg">🚀</span>
+                <h4 className="font-semibold text-blue-300 text-sm">One-Click Connect</h4>
+              </div>
+              <p className="text-[11px] text-gray-400 mb-4 leading-relaxed">
+                {resConnectInfo.how_to_verify}
+              </p>
+              <button 
+                onClick={() => handleAutoConnect(resConnectInfo.ssh_command)}
+                className="w-full bg-blue-600 hover:bg-blue-500 text-white py-2 rounded-lg font-bold text-xs transition"
+              >
+                Launch SSH Terminal
+              </button>
+            </div>
+
+            <div>
+              <p className="text-gray-500 text-[10px] mb-1 uppercase font-bold">Manual SSH Command</p>
+              <pre className="bg-gray-900 rounded-lg p-3 text-yellow-400 text-xs overflow-x-auto">{resConnectInfo.ssh_command}</pre>
+            </div>
+            
+            {resConnectInfo.note && (
+              <div className="bg-blue-900/20 border border-blue-700/30 rounded-lg p-3 text-xs text-blue-300">
+                {resConnectInfo.note}
+              </div>
+            )}
+            <button onClick={() => setResConnectInfo(null)}
               className="w-full py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm">
               Close
             </button>

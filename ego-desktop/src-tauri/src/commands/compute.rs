@@ -176,6 +176,25 @@ pub async fn compute_node_heartbeat() {
         return;
     }
 
+    // ── Re-broadcast active rentals where I am the BUYER ──
+    // This allows providers (like headless nodes) to relearn authorizations after a restart
+    // or if they missed the initial gossip message.
+    let owner_for_rentals = owner.clone();
+    let my_rentals = tokio::task::spawn_blocking(move || {
+        crate::chain_db::list_compute_reservations().into_iter()
+            .filter(|r| r.buyer_address == owner_for_rentals && r.status == "active")
+            .collect::<Vec<_>>()
+    }).await.unwrap_or_default();
+
+    let ssh_pub = get_or_create_ssh_key().await.unwrap_or_default();
+    for reservation in my_rentals {
+        let msg = crate::p2p::P2PMessage::ReservationBooked { 
+            reservation,
+            ssh_public_key: if ssh_pub.is_empty() { None } else { Some(ssh_pub.clone()) },
+        };
+        crate::p2p::broadcast_compute_msg(msg).await;
+    }
+
     if is_enabled {
         let mut node = if let Some(mut n) = node_opt {
             n.available_cores  = ledger.compute_allocated_cores.saturating_sub(ledger.compute_locked_cores);
