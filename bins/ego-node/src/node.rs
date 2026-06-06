@@ -146,11 +146,11 @@ impl Node {
             .map(|(p, m), _| (p, libp2p::core::muxing::StreamMuxerBox::new(m)))
             .or_transport(
                 relay_transport
-                    .map(|(p, m), _| (p, libp2p::core::muxing::StreamMuxerBox::new(m)))
+                    .map(|conn, _| (conn.peer_id(), libp2p::core::muxing::StreamMuxerBox::new(conn)))
             )
             .map(|either, _| match either {
-                libp2p::Either::Left(res) => res,
-                libp2p::Either::Right(res) => res,
+                libp2p::core::either::Either::Left(res) => res,
+                libp2p::core::either::Either::Right(res) => res,
             })
             .boxed();
 
