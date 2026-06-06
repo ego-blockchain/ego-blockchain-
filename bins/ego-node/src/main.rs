@@ -825,8 +825,11 @@ async fn run_daemon_mode(
     let oracle_topic_hash = oracle_topic.hash();
     let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&oracle_topic);
 
-    let compute_topic = libp2p::gossipsub::IdentTopic::new("ego-compute-v1");
-    let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&compute_topic);
+    // Subscribe to both possible topic naming conventions for compatibility
+    let compute_topic_v1 = libp2p::gossipsub::IdentTopic::new("ego-compute-v1");
+    let compute_topic_v2 = libp2p::gossipsub::IdentTopic::new("ego/compute/v1");
+    let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&compute_topic_v1);
+    let _ = node.swarm.behaviour_mut().gossipsub.subscribe(&compute_topic_v2);
 
     let mut status_interval       = interval(Duration::from_secs(30));
     let mut metrics_interval      = interval(Duration::from_secs(60));
@@ -836,10 +839,20 @@ async fn run_daemon_mode(
     let mut gc_interval           = interval(Duration::from_secs(600));
 
     print_status(&node);
+    let mut last_peer_count = 0;
+    let compute_hash1 = compute_topic_v1.hash();
+    let compute_hash2 = compute_topic_v2.hash();
 
     loop {
         tokio::select! {
             event = node.swarm.select_next_some() => {
+                // Monitor peer count changes in real-time
+                let peer_count = node.swarm.connected_peers().count();
+                if peer_count != last_peer_count {
+                    info!("👥 Network connectivity changed: {} peers connected", peer_count);
+                    last_peer_count = peer_count;
+                }
+
                 // Gossipsub automatically relays messages to all subscribed peers in
                 // the mesh — no manual forwarding needed.  We only peek at sync
                 // messages so we can track peer RPC addresses for the /peers RPC
@@ -882,9 +895,11 @@ async fn run_daemon_mode(
                                 }
                             }
                         }
-                    } else if message.topic == compute_topic.hash() {
+                    } else if message.topic == compute_hash1 || message.topic == compute_hash2 {
+                        info!("📡 [Compute] Received gossip message ({} bytes)", message.data.len());
+                        
                         if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&message.data) {
-                            info!("📡 Received compute gossip message: {}", payload);
+                            info!("📡 [Compute] Decoded payload: {}", payload);
                             // Case-insensitive type matching for different SDK/Protocol versions
                             let raw_type = payload["type"].as_str().or_else(|| payload.as_object().and_then(|o| o.keys().next().map(|s| s.as_str()))).unwrap_or("");
                             let msg_type = raw_type.to_lowercase();
