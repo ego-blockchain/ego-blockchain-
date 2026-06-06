@@ -762,7 +762,10 @@ async fn handle_usage(
     {
         let renters = s.active_renters.lock().unwrap();
         if !renters.contains_key(&req.reservation_id) {
-            return (StatusCode::UNAUTHORIZED, "Unauthorized: No active reservation found for this ID").into_response();
+            tracing::warn!("❌ Usage Auth Failed: Reservation {} not found. Known: {}", 
+                req.reservation_id, renters.len());
+            return (StatusCode::UNAUTHORIZED, "Unauthorized: No active reservation found for this ID")
+                .into_response();
         }
     }
 
@@ -802,7 +805,10 @@ async fn handle_exec(
         let renters = s.active_renters.lock().unwrap();
         match renters.get(&req.reservation_id) {
             Some(addr) => addr.clone(),
-            None => return (StatusCode::UNAUTHORIZED, "Unauthorized: No active reservation found for this ID").into_response(),
+            None => {
+                tracing::warn!("❌ Exec Auth Failed: Reservation {} not found.", req.reservation_id);
+                return (StatusCode::UNAUTHORIZED, "Unauthorized: No active reservation found for this ID").into_response();
+            }
         }
     };
 
