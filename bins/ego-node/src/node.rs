@@ -12,11 +12,11 @@ use ego_consensus::porep::{PoRepProver, PoRepVerifier, PoRepEvent};
 use ego_consensus::porep::prover::ProverConfig;
 use std::sync::Arc;
 
-use either::Either;
 use libp2p::{
     Multiaddr, PeerId, Swarm, Transport, autonat, core::upgrade::Version, dcutr, gossipsub, identify, kad,
     mdns, noise, ping, relay, tcp, yamux,
 };
+use either::Either;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
