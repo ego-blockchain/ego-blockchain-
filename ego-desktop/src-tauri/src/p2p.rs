@@ -1883,6 +1883,131 @@ impl request_response::Codec for EgoCodec {
     }
 }
 
+// ── Compute exec protocol (libp2p request/response with payload) ─────────────
+//
+// Carries remote-shell commands ("EXEC") and resource probes ("METRICS") from
+// a buyer's desktop to a provider's desktop over the existing libp2p swarm.
+// This replaces the legacy HTTP `:8545/exec` flow, which required an ego-node
+// daemon and was unreachable across NAT/firewalls.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeExecRequest {
+    pub reservation_id:       String,
+    pub command:              String,
+    pub timestamp:            i64,
+    pub dilithium_signature:  String,
+    pub dilithium_public_key: String,
+    /// "EXEC" runs the command as a shell process; "METRICS" returns sysinfo.
+    pub kind:                 String,
+    /// Self-attesting reservation, used when the provider doesn't yet have a
+    /// cached entry. Signed implicitly because the buyer-key derivation must
+    /// match `reservation.buyer_address`.
+    #[serde(default)]
+    pub reservation:          Option<crate::chain_db::ComputeReservation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeExecResponse {
+    pub ok:    bool,
+    /// Status code (HTTP-style: 200 OK, 401, 403, 500…). Helps the buyer's UI
+    /// distinguish "auth failed" from "command crashed".
+    pub status: u16,
+    /// stdout+stderr for EXEC, JSON for METRICS, error text on failure.
+    pub body:  String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExecCodec;
+impl request_response::Codec for ExecCodec {
+    type Protocol = StreamProtocol;
+    type Request  = ComputeExecRequest;
+    type Response = ComputeExecResponse;
+
+    fn read_request<'life0, 'life1, 'life2, 'async_trait, T>(
+        &'life0 mut self,
+        _: &'life1 Self::Protocol,
+        io: &'life2 mut T,
+    ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = io::Result<Self::Request>> + ::core::marker::Send + 'async_trait>>
+    where
+        T: futures::io::AsyncRead + Unpin + Send + 'async_trait,
+        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let mut len_buf = [0u8; 4];
+            AsyncReadExt::read_exact(io, &mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            if len > 8 * 1024 * 1024 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "exec request too large"));
+            }
+            let mut buf = vec![0u8; len];
+            AsyncReadExt::read_exact(io, &mut buf).await?;
+            serde_json::from_slice(&buf)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        })
+    }
+
+    fn read_response<'life0, 'life1, 'life2, 'async_trait, T>(
+        &'life0 mut self,
+        _: &'life1 Self::Protocol,
+        io: &'life2 mut T,
+    ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = io::Result<Self::Response>> + ::core::marker::Send + 'async_trait>>
+    where
+        T: futures::io::AsyncRead + Unpin + Send + 'async_trait,
+        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let mut len_buf = [0u8; 4];
+            AsyncReadExt::read_exact(io, &mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            if len > 16 * 1024 * 1024 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "exec response too large"));
+            }
+            let mut buf = vec![0u8; len];
+            AsyncReadExt::read_exact(io, &mut buf).await?;
+            serde_json::from_slice(&buf)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        })
+    }
+
+    fn write_request<'life0, 'life1, 'life2, 'async_trait, T>(
+        &'life0 mut self,
+        _: &'life1 Self::Protocol,
+        io: &'life2 mut T,
+        req: Self::Request,
+    ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = io::Result<()>> + ::core::marker::Send + 'async_trait>>
+    where
+        T: futures::io::AsyncWrite + Unpin + Send + 'async_trait,
+        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let data = serde_json::to_vec(&req)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            AsyncWriteExt::write_all(io, &(data.len() as u32).to_be_bytes()).await?;
+            AsyncWriteExt::write_all(io, &data).await?;
+            AsyncWriteExt::flush(io).await
+        })
+    }
+
+    fn write_response<'life0, 'life1, 'life2, 'async_trait, T>(
+        &'life0 mut self,
+        _: &'life1 Self::Protocol,
+        io: &'life2 mut T,
+        resp: Self::Response,
+    ) -> ::core::pin::Pin<Box<dyn ::core::future::Future<Output = io::Result<()>> + ::core::marker::Send + 'async_trait>>
+    where
+        T: futures::io::AsyncWrite + Unpin + Send + 'async_trait,
+        'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait, Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let data = serde_json::to_vec(&resp)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            AsyncWriteExt::write_all(io, &(data.len() as u32).to_be_bytes()).await?;
+            AsyncWriteExt::write_all(io, &data).await?;
+            AsyncWriteExt::flush(io).await
+        })
+    }
+}
+
 // ── Network behaviour ─────────────────────────────────────────────────────────
 
 #[derive(NetworkBehaviour)]
@@ -1894,6 +2019,9 @@ struct EgoBehaviour {
     dcutr:            dcutr::Behaviour,
     identify:         identify::Behaviour,
     request_response: request_response::Behaviour<EgoCodec>,
+    /// Dedicated request/response channel for compute-exec calls (carries
+    /// stdout/stderr payloads on the way back, so it needs its own codec).
+    compute_exec:     request_response::Behaviour<ExecCodec>,
     autonat:          autonat::Behaviour,
     ping:             ping::Behaviour,
     gossipsub:        gossipsub::Behaviour,
@@ -1915,11 +2043,204 @@ pub enum SwarmCmd {
         topic: String,
         data:  Vec<u8>,
     },
+    ComputeExec {
+        peer_addr: Multiaddr,
+        req:       ComputeExecRequest,
+        reply:     oneshot::Sender<Result<ComputeExecResponse, String>>,
+    },
 }
 
 static SWARM_TX: OnceLock<mpsc::Sender<SwarmCmd>> = OnceLock::new();
 
 // ── Public API ────────────────────────────────────────────────────────────────
+
+/// Sends a compute-exec request to `endpoint` (a libp2p multiaddr containing
+/// the provider's peer ID) and waits for the response. Replaces the old
+/// HTTP `:8545/exec` flow with a NAT-traversing libp2p call.
+pub async fn compute_exec(endpoint: &str, req: ComputeExecRequest) -> Result<ComputeExecResponse, String> {
+    let tx = SWARM_TX.get().ok_or_else(|| "P2P not started".to_string())?;
+    let peer_addr: Multiaddr = endpoint
+        .parse()
+        .map_err(|e| format!("Invalid multiaddr '{}': {}", endpoint, e))?;
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tx.send(SwarmCmd::ComputeExec { peer_addr, req, reply: reply_tx }),
+    )
+    .await
+    .map_err(|_| "Swarm channel send timed out".to_string())?
+    .map_err(|_| "Swarm channel closed".to_string())?;
+    tokio::time::timeout(std::time::Duration::from_secs(180), reply_rx)
+        .await
+        .map_err(|_| "Compute-exec reply timed out".to_string())?
+        .map_err(|_| "Swarm dropped reply".to_string())?
+}
+
+/// Tries each endpoint in priority order (LAN → public → relay circuit).
+/// Returns the first successful response or the last error.
+pub async fn compute_exec_any(endpoints: &[String], req: &ComputeExecRequest) -> Result<ComputeExecResponse, String> {
+    if endpoints.is_empty() {
+        return Err("No endpoints available".to_string());
+    }
+    let mut sorted: Vec<String> = endpoints.iter()
+        .filter(|ep| !ep.contains("/ip4/169.254."))
+        .cloned()
+        .collect();
+    if sorted.is_empty() {
+        return Err("No reachable endpoints (all link-local filtered)".to_string());
+    }
+    sorted.sort_by_key(|ep| {
+        if ep.contains("/ip4/192.168.") || ep.contains("/ip4/10.") || ep.contains("/ip4/172.") { 0usize }
+        else if ep.contains("/p2p-circuit") { 2 }
+        else { 1 }
+    });
+    let mut last_err = String::new();
+    for ep in &sorted {
+        match compute_exec(ep, req.clone()).await {
+            Ok(r)  => return Ok(r),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+/// Provider-side handler: invoked when an inbound libp2p compute-exec request
+/// arrives. Verifies the buyer's signed reservation attestation, then either
+/// runs the command (kind="EXEC") or gathers usage metrics (kind="METRICS").
+async fn serve_compute_exec(req: ComputeExecRequest) -> ComputeExecResponse {
+    let now = chrono::Utc::now().timestamp();
+    if (now - req.timestamp).abs() > 30 {
+        return ComputeExecResponse { ok: false, status: 400, body: "Request expired (timestamp mismatch)".into() };
+    }
+
+    let dil_pk_bytes = match hex::decode(&req.dilithium_public_key) {
+        Ok(b) if !b.is_empty() => b,
+        _ => return ComputeExecResponse { ok: false, status: 400, body: "Missing/invalid dilithium_public_key".into() },
+    };
+
+    let my_addr = crate::ledger::Ledger::load().address;
+    let hrp = if my_addr.starts_with("egot") { "egot" } else { "ego" };
+    let chain_id: u32 = if hrp == "egot" { 1 } else { 0 };
+    let derived_bech32 = match ego_core::EgoAddress::from_dilithium_pk(
+        &dil_pk_bytes, chain_id, ego_core::AddressType::EOA,
+    ).to_bech32(hrp) {
+        Ok(s)  => s,
+        Err(_) => return ComputeExecResponse { ok: false, status: 500, body: "Failed to derive bech32 address".into() },
+    };
+
+    // Trust order: locally stored reservation > buyer-supplied attestation.
+    let reservation = crate::chain_db::get_compute_reservation(&req.reservation_id)
+        .or_else(|| req.reservation.clone());
+    let reservation = match reservation {
+        Some(r) => r,
+        None    => return ComputeExecResponse {
+            ok: false, status: 401,
+            body: format!("Unknown reservation {} and no attestation provided", req.reservation_id),
+        },
+    };
+
+    if reservation.reservation_id != req.reservation_id {
+        return ComputeExecResponse { ok: false, status: 400, body: "Reservation id mismatch".into() };
+    }
+    if !exec_addrs_match(&reservation.provider_address, &my_addr) {
+        return ComputeExecResponse {
+            ok: false, status: 403,
+            body: format!("Reservation provider {} does not match this node {}",
+                reservation.provider_address, my_addr),
+        };
+    }
+    if !exec_addrs_match(&reservation.buyer_address, &derived_bech32) {
+        return ComputeExecResponse {
+            ok: false, status: 403,
+            body: format!("Dilithium key derives {}, but reservation buyer is {}",
+                derived_bech32, reservation.buyer_address),
+        };
+    }
+    if reservation.status != "active" {
+        return ComputeExecResponse {
+            ok: false, status: 403,
+            body: format!("Reservation status is '{}', not active", reservation.status),
+        };
+    }
+    if reservation.expires_at <= now {
+        return ComputeExecResponse { ok: false, status: 403, body: "Reservation expired".into() };
+    }
+
+    let dil_sig_bytes = match hex::decode(&req.dilithium_signature) {
+        Ok(b) if !b.is_empty() => b,
+        _ => return ComputeExecResponse { ok: false, status: 400, body: "Missing/invalid dilithium_signature".into() },
+    };
+    let dil_pk  = ego_core::PublicKey::new(ego_core::AlgorithmId::MlDsa2, dil_pk_bytes);
+    let dil_sig = ego_core::Signature::dilithium2(dil_sig_bytes);
+    let signed_msg = format!("{}:{}:{}", req.reservation_id, req.command, req.timestamp);
+    match ego_core::verify_signature(&dil_pk, signed_msg.as_bytes(), &dil_sig) {
+        Ok(true)  => {}
+        Ok(false) => return ComputeExecResponse { ok: false, status: 401, body: "Invalid Dilithium signature".into() },
+        Err(e)    => return ComputeExecResponse { ok: false, status: 401, body: format!("Signature verify error: {e}") },
+    }
+
+    match req.kind.as_str() {
+        "METRICS" => {
+            use sysinfo::{System, CpuRefreshKind};
+            let mut sys = System::new();
+            sys.refresh_cpu_specifics(CpuRefreshKind::new().with_cpu_usage());
+            sys.refresh_memory();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            sys.refresh_cpu();
+            let cpu = sys.global_cpu_info().cpu_usage();
+            let ram_used_gb = sys.used_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
+            let gpu = std::process::Command::new("nvidia-smi")
+                .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i32>().ok())
+                .unwrap_or(0);
+            let body = serde_json::json!({
+                "cpu": cpu, "ram_used_gb": ram_used_gb, "gpu": gpu,
+            }).to_string();
+            ComputeExecResponse { ok: true, status: 200, body }
+        }
+        _ => {
+            let output = if cfg!(target_os = "windows") {
+                tokio::process::Command::new("powershell")
+                    .args(["-NoProfile", "-Command", &req.command])
+                    .output().await
+            } else {
+                tokio::process::Command::new("sh")
+                    .args(["-c", &req.command])
+                    .output().await
+            };
+            match output {
+                Ok(o) => {
+                    let combined = String::from_utf8_lossy(&o.stdout).to_string()
+                        + &String::from_utf8_lossy(&o.stderr);
+                    ComputeExecResponse {
+                        ok:     o.status.success(),
+                        status: if o.status.success() { 200 } else { 400 },
+                        body:   combined,
+                    }
+                }
+                Err(e) => ComputeExecResponse {
+                    ok: false, status: 500, body: format!("System error: {e}"),
+                },
+            }
+        }
+    }
+}
+
+/// Address-equality check tolerant of bech32 vs hex representations.
+fn exec_addrs_match(a: &str, b: &str) -> bool {
+    if a.eq_ignore_ascii_case(b) { return true; }
+    let to_hex = |s: &str| {
+        let hrp = if s.starts_with("egot") { "egot" }
+                  else if s.starts_with("ego1") || s.starts_with("ego") { "ego" }
+                  else { return s.trim_start_matches("0x").to_lowercase(); };
+        ego_core::EgoAddress::from_bech32(s, hrp)
+            .map(|a| hex::encode(a.payload()))
+            .unwrap_or_else(|_| s.trim_start_matches("0x").to_lowercase())
+    };
+    to_hex(a) == to_hex(b)
+}
 
 pub async fn send_message(endpoint: &str, msg: &P2PMessage) -> Result<(), String> {
     let tx = SWARM_TX.get().ok_or_else(|| "P2P not started".to_string())?;
@@ -2933,6 +3254,12 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     let mut in_flight:        HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>> = HashMap::new();
     let mut circuit_listener: Option<libp2p_core::transport::ListenerId> = None;
 
+    // Compute-exec state — separate maps so a long-running shell command
+    // doesn't block ordinary P2P messaging.
+    let mut pending_exec_sends: HashMap<PeerId, Vec<(ComputeExecRequest, oneshot::Sender<Result<ComputeExecResponse, String>>)>> = HashMap::new();
+    let mut exec_in_flight:     HashMap<OutboundRequestId, oneshot::Sender<Result<ComputeExecResponse, String>>> = HashMap::new();
+    let (exec_resp_tx, mut exec_resp_rx) = mpsc::channel::<(request_response::ResponseChannel<ComputeExecResponse>, ComputeExecResponse)>(64);
+
     // Restore validator pubkeys from DB so BFT verification works after a node restart
     restore_validator_keys_from_db();
 
@@ -3113,6 +3440,10 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                             Err(e) => eprintln!("[Gossip] publish '{}': {:?}", topic, e),
                         }
                     }
+                    SwarmCmd::ComputeExec { peer_addr, req, reply } => {
+                        handle_compute_exec_send(&mut swarm, peer_addr, req, reply,
+                            &mut pending_exec_sends, &mut exec_in_flight);
+                    }
                 }
             }
 
@@ -3120,9 +3451,16 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                 handle_event(
                     event, app.as_ref(),
                     &mut external_addrs, &mut pending_sends, &mut in_flight,
+                    &mut pending_exec_sends, &mut exec_in_flight, &exec_resp_tx,
                     &mut swarm, &relay_addrs,
                     &mut circuit_listener,
                 ).await;
+            }
+
+            // Compute-exec response from a spawned exec task — feed back to
+            // the libp2p behaviour so the buyer's outbound request completes.
+            Some((channel, resp)) = exec_resp_rx.recv() => {
+                let _ = swarm.behaviour_mut().compute_exec.send_response(channel, resp);
             }
 
         _ = announce_tick.tick() => {
@@ -3413,6 +3751,11 @@ async fn build_swarm(
                     request_response::Config::default()
                         .with_request_timeout(Duration::from_secs(120)),
                 ),
+                compute_exec: request_response::Behaviour::new(
+                    [(StreamProtocol::new("/ego/compute-exec/1.0.0"), ProtocolSupport::Full)],
+                    request_response::Config::default()
+                        .with_request_timeout(Duration::from_secs(180)),
+                ),
                 autonat: autonat::Behaviour::new(peer_id, autonat::Config::default()),
                 ping: ping::Behaviour::new(
                     ping::Config::new()
@@ -3461,6 +3804,36 @@ fn handle_send(
         in_flight.insert(req_id, reply);
     } else {
         pending_sends.entry(peer_id).or_default().push((msg, reply));
+        let _ = swarm.dial(peer_addr);
+    }
+}
+
+fn handle_compute_exec_send(
+    swarm:              &mut libp2p::Swarm<EgoBehaviour>,
+    peer_addr:          Multiaddr,
+    req:                ComputeExecRequest,
+    reply:              oneshot::Sender<Result<ComputeExecResponse, String>>,
+    pending_exec_sends: &mut HashMap<PeerId, Vec<(ComputeExecRequest, oneshot::Sender<Result<ComputeExecResponse, String>>)>>,
+    exec_in_flight:     &mut HashMap<OutboundRequestId, oneshot::Sender<Result<ComputeExecResponse, String>>>,
+) {
+    let peer_id = match peer_id_from_multiaddr(&peer_addr) {
+        Some(id) => id,
+        None => {
+            let _ = reply.send(Err(format!("No peer ID in multiaddr: {}", peer_addr)));
+            return;
+        }
+    };
+
+    if &peer_id == swarm.local_peer_id() {
+        let _ = reply.send(Err("Refusing self-dial (ID match)".to_string()));
+        return;
+    }
+
+    if swarm.is_connected(&peer_id) {
+        let req_id = swarm.behaviour_mut().compute_exec.send_request(&peer_id, req);
+        exec_in_flight.insert(req_id, reply);
+    } else {
+        pending_exec_sends.entry(peer_id).or_default().push((req, reply));
         let _ = swarm.dial(peer_addr);
     }
 }
@@ -3545,14 +3918,17 @@ fn inject_circuit(
 }
 
 async fn handle_event(
-    event:            SwarmEvent<EgoBehaviourEvent>,
-    app:              Option<&tauri::AppHandle<tauri::Wry>>,
-    external_addrs:   &mut Vec<Multiaddr>,
-    pending_sends:    &mut HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>>,
-    in_flight:        &mut HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>>,
-    swarm:            &mut libp2p::Swarm<EgoBehaviour>,
-    relay_addrs:      &HashMap<PeerId, Multiaddr>,
-    circuit_listener: &mut Option<libp2p_core::transport::ListenerId>,
+    event:              SwarmEvent<EgoBehaviourEvent>,
+    app:                Option<&tauri::AppHandle<tauri::Wry>>,
+    external_addrs:     &mut Vec<Multiaddr>,
+    pending_sends:      &mut HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>>,
+    in_flight:          &mut HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>>,
+    pending_exec_sends: &mut HashMap<PeerId, Vec<(ComputeExecRequest, oneshot::Sender<Result<ComputeExecResponse, String>>)>>,
+    exec_in_flight:     &mut HashMap<OutboundRequestId, oneshot::Sender<Result<ComputeExecResponse, String>>>,
+    exec_resp_tx:       &mpsc::Sender<(request_response::ResponseChannel<ComputeExecResponse>, ComputeExecResponse)>,
+    swarm:              &mut libp2p::Swarm<EgoBehaviour>,
+    relay_addrs:        &HashMap<PeerId, Multiaddr>,
+    circuit_listener:   &mut Option<libp2p_core::transport::ListenerId>,
 ) {
     match event {
 
@@ -3637,6 +4013,15 @@ async fn handle_event(
                 }
             }
 
+            if let Some(pending) = pending_exec_sends.remove(&peer_id) {
+                eprintln!("[P2P] Flushing {} queued exec request(s) to {} on connect", pending.len(), peer_id);
+                for (req, reply) in pending {
+                    let req_id = swarm.behaviour_mut()
+                        .compute_exec.send_request(&peer_id, req);
+                    exec_in_flight.insert(req_id, reply);
+                }
+            }
+
             // Pull any blocks we missed while this peer was unreachable.
             // 1-second delay lets gossip subscriptions exchange first.
             if !relay_addrs.contains_key(&peer_id) {
@@ -3691,6 +4076,11 @@ async fn handle_event(
                     let _ = reply.send(Err("Connection closed before send".into()));
                 }
             }
+            if let Some(pending) = pending_exec_sends.remove(&peer_id) {
+                for (_, reply) in pending {
+                    let _ = reply.send(Err("Connection closed before exec send".into()));
+                }
+            }
         }
 
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -3718,6 +4108,11 @@ async fn handle_event(
                 if let Some(pending) = pending_sends.remove(&pid) {
                     for (_, reply) in pending {
                         let _ = reply.send(Err(format!("Cannot reach peer: {}", error)));
+                    }
+                }
+                if let Some(pending) = pending_exec_sends.remove(&pid) {
+                    for (_, reply) in pending {
+                        let _ = reply.send(Err(format!("Cannot reach peer for exec: {}", error)));
                     }
                 }
             }
@@ -3793,6 +4188,13 @@ async fn handle_event(
                     let req_id = swarm.behaviour_mut()
                         .request_response.send_request(&peer_id, msg);
                     in_flight.insert(req_id, reply);
+                }
+            }
+            for (peer_id, pending) in pending_exec_sends.drain() {
+                for (req, reply) in pending {
+                    let req_id = swarm.behaviour_mut()
+                        .compute_exec.send_request(&peer_id, req);
+                    exec_in_flight.insert(req_id, reply);
                 }
             }
         }
@@ -3880,6 +4282,38 @@ async fn handle_event(
                 let _ = reply.send(Err(format!("Network error: {}", error)));
             }
         }
+
+        SwarmEvent::Behaviour(EgoBehaviourEvent::ComputeExec(
+            request_response::Event::Message {
+                message: request_response::Message::Request { request, channel, .. }, ..
+            },
+        )) => {
+            let tx = exec_resp_tx.clone();
+            tokio::spawn(async move {
+                let resp = serve_compute_exec(request).await;
+                let _ = tx.send((channel, resp)).await;
+            });
+        }
+
+        SwarmEvent::Behaviour(EgoBehaviourEvent::ComputeExec(
+            request_response::Event::Message {
+                message: request_response::Message::Response { request_id, response, .. }, ..
+            },
+        )) => {
+            if let Some(reply) = exec_in_flight.remove(&request_id) {
+                let _ = reply.send(Ok(response));
+            }
+        }
+
+        SwarmEvent::Behaviour(EgoBehaviourEvent::ComputeExec(
+            request_response::Event::OutboundFailure { request_id, error, .. },
+        )) => {
+            if let Some(reply) = exec_in_flight.remove(&request_id) {
+                let _ = reply.send(Err(format!("Network error: {}", error)));
+            }
+        }
+
+        SwarmEvent::Behaviour(EgoBehaviourEvent::ComputeExec(_)) => {}
 
         SwarmEvent::Behaviour(EgoBehaviourEvent::Dcutr(event)) => {
             eprintln!("[P2P] DCUtR: {:?}", event);

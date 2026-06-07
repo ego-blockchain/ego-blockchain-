@@ -1397,53 +1397,71 @@ pub async fn get_reservations() -> Result<Vec<ComputeReservation>, EgoDesktopErr
     .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
+/// Build the signed compute-exec request for either an EXEC (shell command)
+/// or METRICS (resource probe) call.
+fn build_exec_request(
+    reservation: crate::chain_db::ComputeReservation,
+    command: String,
+    kind: &str,
+    kp: &ego_core::KeyPair,
+) -> crate::p2p::ComputeExecRequest {
+    let ts  = chrono::Utc::now().timestamp();
+    let signed_msg = format!("{}:{}:{}", reservation.reservation_id, command, ts);
+    crate::p2p::ComputeExecRequest {
+        reservation_id:       reservation.reservation_id.clone(),
+        command,
+        timestamp:            ts,
+        dilithium_signature:  hex::encode(&kp.sign_dilithium(signed_msg.as_bytes()).signature_data),
+        dilithium_public_key: hex::encode(&kp.dilithium_public_key().key_data),
+        kind:                 kind.to_string(),
+        reservation:          Some(reservation),
+    }
+}
+
+/// Resolves every reachable libp2p endpoint for a provider address: the
+/// registered compute_node endpoint and any DHT-known relay endpoints.
+async fn provider_endpoints(provider_addr: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(node) = tokio::task::spawn_blocking({
+        let addr = provider_addr.to_string();
+        move || crate::chain_db::get_compute_node(&addr)
+    }).await.ok().flatten() {
+        if !node.endpoint.is_empty() {
+            out.push(node.endpoint);
+        }
+    }
+    if let Some(ep) = crate::p2p::get_relay_endpoint(provider_addr).await {
+        if !out.contains(&ep) { out.push(ep); }
+    }
+    out
+}
+
 #[tauri::command]
 pub async fn run_remote_command(
     reservation_id: String,
     command: String,
     state: State<'_, AppState>,
 ) -> Result<String, EgoDesktopError> {
-    let info = get_reservation_connect_info(reservation_id.clone()).await?;
-    let rpc_url = format!("http://{}:8545/exec", info.provider_ip);
-
     let reservation = crate::chain_db::get_compute_reservation(&reservation_id)
         .ok_or_else(|| EgoDesktopError::NotFound("Reservation not found".into()))?;
-
-    let kp = state.get_keypair().ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
-    let ts  = chrono::Utc::now().timestamp();
-    let msg = format!("{}:{}:{}", reservation_id, command, ts);
-
-    let ed_sig  = hex::encode(kp.sign_ed25519(msg.as_bytes()).as_bytes());
-    let ed_pk   = hex::encode(kp.ed25519_public_key().as_bytes());
-    let dil_sig = hex::encode(&kp.sign_dilithium(msg.as_bytes()).signature_data);
-    let dil_pk  = hex::encode(&kp.dilithium_public_key().key_data);
-
-    let client = reqwest::Client::new();
-    let resp = client.post(&rpc_url)
-        .json(&json!({
-            "reservation_id":       reservation_id,
-            "command":              command,
-            "timestamp":            ts,
-            "signature":            ed_sig,
-            "public_key":           ed_pk,
-            "dilithium_signature":  dil_sig,
-            "dilithium_public_key": dil_pk,
-            "reservation":          reservation,
-        }))
-        .send()
-        .await
-        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err_txt = resp.text().await.unwrap_or_else(|_| "Unknown Error".into());
-        return Err(EgoDesktopError::NetworkError(format!("Node Error ({}): {}", status, err_txt)));
+    let endpoints = provider_endpoints(&reservation.provider_address).await;
+    if endpoints.is_empty() {
+        return Err(EgoDesktopError::NetworkError("Provider has no reachable endpoint".into()));
     }
 
-    let text = resp.text().await
-        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+    let kp = state.get_keypair()
+        .ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
+    let req = build_exec_request(reservation, command, "EXEC", &kp);
 
-    Ok(text)
+    let resp = crate::p2p::compute_exec_any(&endpoints, &req).await
+        .map_err(EgoDesktopError::NetworkError)?;
+
+    if !resp.ok {
+        return Err(EgoDesktopError::NetworkError(
+            format!("Provider error ({}): {}", resp.status, resp.body)
+        ));
+    }
+    Ok(resp.body)
 }
 
 #[tauri::command]
@@ -1451,43 +1469,27 @@ pub async fn get_remote_usage(
     reservation_id: String,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, EgoDesktopError> {
-    let info = get_reservation_connect_info(reservation_id.clone()).await?;
-    let rpc_url = format!("http://{}:8545/node/usage", info.provider_ip);
-
     let reservation = crate::chain_db::get_compute_reservation(&reservation_id)
         .ok_or_else(|| EgoDesktopError::NotFound("Reservation not found".into()))?;
-
-    let kp = state.get_keypair().ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
-    let ts  = chrono::Utc::now().timestamp();
-    let msg = format!("{}:METRICS:{}", reservation_id, ts);
-
-    let ed_sig  = hex::encode(kp.sign_ed25519(msg.as_bytes()).as_bytes());
-    let ed_pk   = hex::encode(kp.ed25519_public_key().as_bytes());
-    let dil_sig = hex::encode(&kp.sign_dilithium(msg.as_bytes()).signature_data);
-    let dil_pk  = hex::encode(&kp.dilithium_public_key().key_data);
-
-    let client = reqwest::Client::new();
-    let resp = client.post(&rpc_url)
-        .json(&json!({
-            "reservation_id":       reservation_id,
-            "command":              "METRICS",
-            "timestamp":            ts,
-            "signature":            ed_sig,
-            "public_key":           ed_pk,
-            "dilithium_signature":  dil_sig,
-            "dilithium_public_key": dil_pk,
-            "reservation":          reservation,
-        }))
-        .send().await
-        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
-
-    if !resp.status().is_success() {
-        return Err(EgoDesktopError::NetworkError("Usage fetch rejected by node".into()));
+    let endpoints = provider_endpoints(&reservation.provider_address).await;
+    if endpoints.is_empty() {
+        return Err(EgoDesktopError::NetworkError("Provider has no reachable endpoint".into()));
     }
 
-    let data = resp.json().await
-        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
-    Ok(data)
+    let kp = state.get_keypair()
+        .ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
+    let req = build_exec_request(reservation, "METRICS".to_string(), "METRICS", &kp);
+
+    let resp = crate::p2p::compute_exec_any(&endpoints, &req).await
+        .map_err(EgoDesktopError::NetworkError)?;
+
+    if !resp.ok {
+        return Err(EgoDesktopError::NetworkError(
+            format!("Usage probe rejected ({}): {}", resp.status, resp.body)
+        ));
+    }
+    serde_json::from_str(&resp.body)
+        .map_err(|e| EgoDesktopError::NetworkError(format!("Bad metrics payload: {e}")))
 }
 
 #[tauri::command]
