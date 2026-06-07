@@ -775,12 +775,25 @@ struct ReservationAttestation {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct ExecRequest {
     reservation_id: String,
     command: String,
     timestamp: i64,
-    signature: String, // Hex encoded Ed25519 signature
-    public_key: String, // Hex encoded Ed25519 public key
+    /// Hex-encoded Ed25519 signature (kept for back-compat; not the
+    /// authoritative auth signal — wallet addresses are Dilithium-derived).
+    signature: String,
+    /// Hex-encoded Ed25519 public key (back-compat only).
+    public_key: String,
+
+    /// Hex-encoded Dilithium-2 public key. Authoritative for buyer-address
+    /// derivation: `EgoAddress::from_dilithium_pk(pk, 1, EOA)` must equal the
+    /// wallet bech32 address.
+    #[serde(default)]
+    dilithium_public_key: String,
+    /// Hex-encoded Dilithium-2 signature over `{reservation_id}:{command}:{timestamp}`.
+    #[serde(default)]
+    dilithium_signature: String,
 
     /// Optional self-attesting reservation payload. Lets the request
     /// authenticate via the chain-derived path when active_renters has not
@@ -816,12 +829,12 @@ fn addresses_match(a: &str, b: &str) -> bool {
 /// then falls back to chain-derived verification using the attestation
 /// embedded in the request itself.
 ///
-/// `derived_hex` is the 20-byte address derived from the request's public key
-/// (used for the attestation buyer-match check).
+/// `derived_bech32` is the Dilithium-derived bech32 address from the request's
+/// Dilithium public key (used for the attestation buyer-match check).
 fn resolve_buyer_addr(
     s: &Arc<RpcState>,
     req: &ExecRequest,
-    derived_hex: &str,
+    derived_bech32: &str,
 ) -> Result<String, (StatusCode, String)> {
     if let Some(addr) = s.active_renters.lock().unwrap().get(&req.reservation_id).cloned() {
         return Ok(addr);
@@ -845,12 +858,10 @@ fn resolve_buyer_addr(
             "Attestation provider_address {} does not match this node {}",
             att.provider_address, s.node_address)));
     }
-    let buyer_hex = ego_addr_to_hex(&att.buyer_address)
-        .unwrap_or_else(|| att.buyer_address.trim_start_matches("0x").to_lowercase());
-    if buyer_hex != derived_hex {
+    if !addresses_match(&att.buyer_address, derived_bech32) {
         return Err((StatusCode::FORBIDDEN, format!(
-            "Public key derives address {}, but attestation claims buyer {}",
-            derived_hex, buyer_hex)));
+            "Dilithium key derives {}, but attestation claims buyer {}",
+            derived_bech32, att.buyer_address)));
     }
     if att.status != "active" {
         return Err((StatusCode::FORBIDDEN, format!("Reservation status is '{}', not active", att.status)));
@@ -867,8 +878,24 @@ fn resolve_buyer_addr(
     Ok(att.buyer_address.clone())
 }
 
+/// Derives the wallet's bech32 address (`egot1...`) from a Dilithium-2 public
+/// key. The HRP is derived from the local node's address so testnet/mainnet
+/// builds work without extra wiring.
+fn derive_bech32_from_dilithium(dil_pk: &[u8], node_address: &str) -> Option<String> {
+    let hrp = if node_address.starts_with("egot") { "egot" } else { "ego" };
+    let chain_id: u32 = if hrp == "egot" { 1 } else { 0 };
+    ego_core::EgoAddress::from_dilithium_pk(dil_pk, chain_id, ego_core::AddressType::EOA)
+        .to_bech32(hrp)
+        .ok()
+}
+
 /// Shared timestamp + signature verification for /exec and /node/usage.
 /// Returns the authorised buyer address on success.
+///
+/// The Dilithium signature is the authoritative auth signal — the wallet
+/// address is derived from the Dilithium public key, so a valid signature +
+/// matching address proves the request comes from the wallet owner. Ed25519
+/// fields are accepted but not verified (kept for back-compat).
 fn verify_request_auth(
     s: &Arc<RpcState>,
     req: &ExecRequest,
@@ -879,32 +906,35 @@ fn verify_request_auth(
         return Err((StatusCode::BAD_REQUEST, "Request expired (timestamp mismatch)".to_string()));
     }
 
-    let pk_bytes = hex::decode(&req.public_key).unwrap_or_default();
-    let pk = PublicKey::from_slice(&pk_bytes)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid public key".to_string()))?;
-    let derived_hex = hex::encode(Address::from_public_key(&pk).as_bytes()).to_lowercase();
+    let dil_pk_bytes = hex::decode(&req.dilithium_public_key)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid Dilithium public key encoding".to_string()))?;
+    if dil_pk_bytes.is_empty() {
+        return Err((StatusCode::BAD_REQUEST,
+            "Missing dilithium_public_key (required for wallet auth)".to_string()));
+    }
 
-    let buyer_addr = resolve_buyer_addr(s, req, &derived_hex)?;
+    let derived_bech32 = derive_bech32_from_dilithium(&dil_pk_bytes, &s.node_address)
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to derive bech32 address".to_string()))?;
 
-    let buyer_hex = ego_addr_to_hex(&buyer_addr)
-        .unwrap_or_else(|| buyer_addr.trim_start_matches("0x").to_lowercase());
-    if buyer_hex != derived_hex {
+    let buyer_addr = resolve_buyer_addr(s, req, &derived_bech32)?;
+    if !addresses_match(&buyer_addr, &derived_bech32) {
         return Err((StatusCode::FORBIDDEN, format!(
-            "Public key derives {}, but reservation belongs to {}", derived_hex, buyer_hex)));
+            "Dilithium key derives {}, but reservation belongs to {}", derived_bech32, buyer_addr)));
     }
 
-    let sig_bytes = hex::decode(&req.signature).unwrap_or_default();
-    if sig_bytes.len() != 64 {
-        return Err((StatusCode::BAD_REQUEST, "Invalid signature length".to_string()));
+    let dil_sig_bytes = hex::decode(&req.dilithium_signature)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid Dilithium signature encoding".to_string()))?;
+    if dil_sig_bytes.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Missing dilithium_signature".to_string()));
     }
-    let mut arr = [0u8; 64];
-    arr.copy_from_slice(&sig_bytes);
-    let sig = Signature::ed25519(arr);
+    let dil_pk = PublicKey::new(ego_core::AlgorithmId::MlDsa2, dil_pk_bytes);
+    let dil_sig = Signature::dilithium2(dil_sig_bytes);
 
-    ego_core::verify_signature(&pk, signed_msg.as_bytes(), &sig)
-        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid cryptographic signature".to_string()))?;
-
-    Ok(buyer_addr)
+    match ego_core::verify_signature(&dil_pk, signed_msg.as_bytes(), &dil_sig) {
+        Ok(true)  => Ok(buyer_addr),
+        Ok(false) => Err((StatusCode::UNAUTHORIZED, "Invalid Dilithium signature".to_string())),
+        Err(e)    => Err((StatusCode::UNAUTHORIZED, format!("Signature verify error: {e}"))),
+    }
 }
 
 async fn handle_usage(
