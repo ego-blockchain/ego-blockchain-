@@ -28,6 +28,10 @@ pub struct RpcState {
 
     pub node_address:   String,
 
+    /// Dilithium-derived bech32 address (e.g. `egot1...`) — the form used in
+    /// compute offers, reservations, and BFT vote messages.
+    pub node_bech32_address: String,
+
     pub node_pubkey:    String,
 
     pub node_keypair:   KeyPair,
@@ -853,10 +857,10 @@ fn resolve_buyer_addr(
         return Err((StatusCode::BAD_REQUEST,
             "Attestation reservation_id does not match request".to_string()));
     }
-    if !addresses_match(&att.provider_address, &s.node_address) {
+    if !addresses_match(&att.provider_address, &s.node_bech32_address) {
         return Err((StatusCode::FORBIDDEN, format!(
             "Attestation provider_address {} does not match this node {}",
-            att.provider_address, s.node_address)));
+            att.provider_address, s.node_bech32_address)));
     }
     if !addresses_match(&att.buyer_address, derived_bech32) {
         return Err((StatusCode::FORBIDDEN, format!(
@@ -913,7 +917,7 @@ fn verify_request_auth(
             "Missing dilithium_public_key (required for wallet auth)".to_string()));
     }
 
-    let derived_bech32 = derive_bech32_from_dilithium(&dil_pk_bytes, &s.node_address)
+    let derived_bech32 = derive_bech32_from_dilithium(&dil_pk_bytes, &s.node_bech32_address)
         .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to derive bech32 address".to_string()))?;
 
     let buyer_addr = resolve_buyer_addr(s, req, &derived_bech32)?;
