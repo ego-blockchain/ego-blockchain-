@@ -1252,7 +1252,7 @@ pub async fn send_reservation_heartbeat(reservation_id: String) -> Result<(), Eg
     let period_secs   = res.period_minutes as i64 * 60;
     let elapsed       = now - res.last_heartbeat_at;
     let total_periods = res.duration_minutes / res.period_minutes.max(1);
-    let missed        = (elapsed / period_secs).saturating_sub(1) as u32;
+    let missed        = (elapsed / period_secs).saturating_sub(1).max(0) as u32;
 
     if missed > 0 {
         res.breach_count += missed;
@@ -1410,21 +1410,25 @@ pub async fn run_remote_command(
         .ok_or_else(|| EgoDesktopError::NotFound("Reservation not found".into()))?;
 
     let kp = state.get_keypair().ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
-    let ts = chrono::Utc::now().timestamp();
-
+    let ts  = chrono::Utc::now().timestamp();
     let msg = format!("{}:{}:{}", reservation_id, command, ts);
-    let sig = hex::encode(kp.sign_ed25519(msg.as_bytes()).as_bytes());
-    let pk  = hex::encode(kp.ed25519_public_key().as_bytes());
+
+    let ed_sig  = hex::encode(kp.sign_ed25519(msg.as_bytes()).as_bytes());
+    let ed_pk   = hex::encode(kp.ed25519_public_key().as_bytes());
+    let dil_sig = hex::encode(&kp.sign_dilithium(msg.as_bytes()).signature_data);
+    let dil_pk  = hex::encode(&kp.dilithium_public_key().key_data);
 
     let client = reqwest::Client::new();
     let resp = client.post(&rpc_url)
         .json(&json!({
-            "reservation_id": reservation_id,
-            "command":        command,
-            "timestamp":      ts,
-            "signature":      sig,
-            "public_key":     pk,
-            "reservation":    reservation,
+            "reservation_id":       reservation_id,
+            "command":              command,
+            "timestamp":            ts,
+            "signature":            ed_sig,
+            "public_key":           ed_pk,
+            "dilithium_signature":  dil_sig,
+            "dilithium_public_key": dil_pk,
+            "reservation":          reservation,
         }))
         .send()
         .await
@@ -1454,20 +1458,25 @@ pub async fn get_remote_usage(
         .ok_or_else(|| EgoDesktopError::NotFound("Reservation not found".into()))?;
 
     let kp = state.get_keypair().ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
-    let ts = chrono::Utc::now().timestamp();
+    let ts  = chrono::Utc::now().timestamp();
     let msg = format!("{}:METRICS:{}", reservation_id, ts);
-    let sig = hex::encode(kp.sign_ed25519(msg.as_bytes()).as_bytes());
-    let pk  = hex::encode(kp.ed25519_public_key().as_bytes());
+
+    let ed_sig  = hex::encode(kp.sign_ed25519(msg.as_bytes()).as_bytes());
+    let ed_pk   = hex::encode(kp.ed25519_public_key().as_bytes());
+    let dil_sig = hex::encode(&kp.sign_dilithium(msg.as_bytes()).signature_data);
+    let dil_pk  = hex::encode(&kp.dilithium_public_key().key_data);
 
     let client = reqwest::Client::new();
     let resp = client.post(&rpc_url)
         .json(&json!({
-            "reservation_id": reservation_id,
-            "command":        "METRICS",
-            "timestamp":      ts,
-            "signature":      sig,
-            "public_key":     pk,
-            "reservation":    reservation,
+            "reservation_id":       reservation_id,
+            "command":              "METRICS",
+            "timestamp":            ts,
+            "signature":            ed_sig,
+            "public_key":           ed_pk,
+            "dilithium_signature":  dil_sig,
+            "dilithium_public_key": dil_pk,
+            "reservation":          reservation,
         }))
         .send().await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;

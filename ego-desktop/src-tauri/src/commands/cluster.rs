@@ -670,7 +670,7 @@ pub async fn send_cluster_node_heartbeat(cluster_id: String) -> Result<(), EgoDe
     let period_secs   = res.period_minutes as i64 * 60;
     let total_periods = res.duration_minutes / res.period_minutes.max(1);
     let elapsed       = now - last_hb;
-    let missed        = (elapsed / period_secs).saturating_sub(1) as u32;
+    let missed        = (elapsed / period_secs).saturating_sub(1).max(0) as u32;
 
     if missed > 0 {
         res.breach_count += missed;

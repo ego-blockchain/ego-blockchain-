@@ -151,7 +151,7 @@ pub async fn send_storage_proof(deal_id: String) -> Result<(), EgoDesktopError> 
     }
 
     let elapsed     = now - deal.last_proof_at;
-    let missed_days = (elapsed / STORAGE_DEAL_HEARTBEAT_SECS).saturating_sub(1) as u32;
+    let missed_days = (elapsed / STORAGE_DEAL_HEARTBEAT_SECS).saturating_sub(1).max(0) as u32;
     if missed_days > 0 {
         deal.breach_count += missed_days;
         if deal.breach_count >= BREACH_THRESHOLD {
