@@ -158,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
         state_manager:  node.state_manager.clone(),
         peer_id:        node.peer_id.to_string(),
         node_address:   node_address.clone(),
+        node_bech32_address: bech32_addr.clone(),
         node_pubkey,
         node_keypair,
         payout_address: config.payout_address.clone(),
