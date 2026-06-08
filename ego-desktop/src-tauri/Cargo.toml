@@ -91,6 +91,8 @@ libp2p = { version = "0.56", features = [
     "request-response", "ping", "macros", "ed25519",
     "gossipsub", "kad",
 ] }
+libp2p-stream = { version = "0.4.0-alpha" }
+tokio-util = { version = "0.7", features = ["compat"] }
 
 keyring = "2"
 

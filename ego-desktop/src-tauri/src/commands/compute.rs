@@ -14,7 +14,7 @@ const BREACH_THRESHOLD_UNBONDED: u32 = 1;
 use crate::error::EgoDesktopError;
 use crate::ledger::{tx_signing_bytes, LedgerTx};
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{Manager, State};
 use uuid::Uuid;
 use serde_json::json;
 use reqwest;
@@ -258,9 +258,10 @@ pub async fn compute_node_heartbeat() {
         }
 
         // Re-broadcast active reservations where I am the provider so headless nodes relearn console auth
+        let owner_rb = owner.clone();
         let my_res = tokio::task::spawn_blocking(move || {
             crate::chain_db::list_compute_reservations().into_iter()
-                .filter(|r| r.provider_address == owner && r.status == "active")
+                .filter(|r| r.provider_address == owner_rb && r.status == "active")
                 .collect::<Vec<_>>()
         }).await.unwrap_or_default();
 
@@ -271,6 +272,51 @@ pub async fn compute_node_heartbeat() {
     }
     
     tokio::task::spawn_blocking(crate::chain_db::prune_stale_compute_nodes).await.ok();
+    tokio::task::spawn_blocking(crate::sandbox::reap_inactive).await.ok();
+
+    // Auto-claim payment for provider reservations when a period has elapsed
+    let owner_hb = owner.clone();
+    let now_ts   = chrono::Utc::now().timestamp();
+    let due_reservations: Vec<String> = tokio::task::spawn_blocking(move || {
+        crate::chain_db::list_compute_reservations()
+            .into_iter()
+            .filter(|r| {
+                r.provider_address == owner_hb
+                    && r.status == "active"
+                    && r.started_at.is_some()
+                    && r.period_minutes > 0
+                    && now_ts - r.last_heartbeat_at >= r.period_minutes as i64 * 60
+            })
+            .map(|r| r.reservation_id)
+            .collect()
+    }).await.unwrap_or_default();
+
+    for res_id in due_reservations {
+        let _ = send_reservation_heartbeat(res_id).await;
+    }
+
+    // Auto-claim payment for cluster nodes when a period has elapsed
+    let owner_cl = owner.clone();
+    let due_clusters: Vec<String> = tokio::task::spawn_blocking(move || {
+        crate::chain_db::list_cluster_bookings()
+            .into_iter()
+            .filter(|c| c.status == "active")
+            .filter(|c| {
+                c.nodes.iter().any(|n| {
+                    if n.provider_address != owner_cl || n.status != "active" { return false; }
+                    let period_secs = crate::chain_db::get_compute_reservation(&n.reservation_id)
+                        .map(|r| r.period_minutes as i64 * 60)
+                        .unwrap_or(3600);
+                    now_ts - n.last_heartbeat_at >= period_secs
+                })
+            })
+            .map(|c| c.cluster_id)
+            .collect()
+    }).await.unwrap_or_default();
+
+    for cluster_id in due_clusters {
+        let _ = crate::commands::cluster::send_cluster_node_heartbeat(cluster_id).await;
+    }
 }
 
 #[tauri::command]
@@ -1014,6 +1060,19 @@ pub async fn post_capacity_offer(
         return Err(EgoDesktopError::InvalidInput("At least one rate must be > 0".into()));
     }
 
+    // Refuse to list GPU capacity this machine can't actually deliver, so a
+    // renter never books a GPU that fails the moment they run a command.
+    if gpu_count > 0 {
+        if let Err(reason) = tokio::task::spawn_blocking(crate::sandbox::gpu_deliverable)
+            .await
+            .unwrap_or_else(|e| Err(format!("GPU capability check failed: {e}")))
+        {
+            return Err(EgoDesktopError::InvalidInput(format!(
+                "Cannot list a GPU offer on this machine: {reason}"
+            )));
+        }
+    }
+
     let offer = ComputeCapacityOffer {
         offer_id:                 Uuid::new_v4().to_string(),
         provider_address:         my_addr.clone(),
@@ -1196,6 +1255,7 @@ pub async fn book_reservation(
         days:              0,
         days_paid:         0,
         daily_rate_uegoc:  0,
+        started_at:        None,
     };
 
     crate::chain_db::upsert_compute_reservation(&reservation);
@@ -1232,6 +1292,25 @@ pub async fn book_reservation(
 }
 
 #[tauri::command]
+pub async fn start_rental(reservation_id: String) -> Result<(), EgoDesktopError> {
+    let my_addr = crate::ledger::Ledger::load().address;
+    let mut res = crate::chain_db::get_compute_reservation(&reservation_id)
+        .ok_or_else(|| EgoDesktopError::NotFound("Reservation not found".into()))?;
+    if res.buyer_address != my_addr {
+        return Err(EgoDesktopError::PermissionDenied("Only the buyer can start the rental".into()));
+    }
+    if res.started_at.is_some() {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().timestamp();
+    res.started_at        = Some(now);
+    res.expires_at        = now + res.duration_minutes as i64 * 60;
+    res.last_heartbeat_at = now;
+    crate::chain_db::upsert_compute_reservation(&res);
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn send_reservation_heartbeat(reservation_id: String) -> Result<(), EgoDesktopError> {
     let mut ledger = crate::ledger::Ledger::load();
     let my_addr    = ledger.address.clone();
@@ -1245,6 +1324,9 @@ pub async fn send_reservation_heartbeat(reservation_id: String) -> Result<(), Eg
     }
     if res.status != "active" {
         return Err(EgoDesktopError::InvalidInput(format!("Reservation is {}", res.status)));
+    }
+    if res.started_at.is_none() {
+        return Ok(());
     }
 
     let bonded        = crate::chain_db::get_compute_offer(&res.offer_id).map(|o| o.bonded).unwrap_or(false);
@@ -1317,6 +1399,7 @@ pub async fn send_reservation_heartbeat(reservation_id: String) -> Result<(), Eg
 
 fn passive_breach_tick(res: &mut ComputeReservation, bonded: bool) -> bool {
     if res.status != "active" { return false; }
+    if res.started_at.is_none() { return false; }
     let now          = chrono::Utc::now().timestamp();
     let elapsed      = now - res.last_heartbeat_at;
     let period_secs  = res.period_minutes as i64 * 60;
@@ -1415,6 +1498,7 @@ fn build_exec_request(
         dilithium_public_key: hex::encode(&kp.dilithium_public_key().key_data),
         kind:                 kind.to_string(),
         reservation:          Some(reservation),
+        payload:              None,
     }
 }
 
@@ -1462,6 +1546,388 @@ pub async fn run_remote_command(
         ));
     }
     Ok(resp.body)
+}
+
+#[tauri::command]
+pub async fn run_remote_intent(
+    reservation_id: String,
+    kind: String,
+    state: State<'_, AppState>,
+) -> Result<String, EgoDesktopError> {
+    let kind = match kind.as_str() {
+        "SPECS" | "BENCH" => kind,
+        _ => return Err(EgoDesktopError::InvalidInput("Unknown intent".into())),
+    };
+    let reservation = crate::chain_db::get_compute_reservation(&reservation_id)
+        .ok_or_else(|| EgoDesktopError::NotFound("Reservation not found".into()))?;
+    let endpoints = provider_endpoints(&reservation.provider_address).await;
+    if endpoints.is_empty() {
+        return Err(EgoDesktopError::NetworkError("Provider has no reachable endpoint".into()));
+    }
+
+    let kp = state.get_keypair()
+        .ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
+    let req = build_exec_request(reservation, kind.clone(), &kind, &kp);
+
+    let resp = crate::p2p::compute_exec_any(&endpoints, &req).await
+        .map_err(EgoDesktopError::NetworkError)?;
+
+    if !resp.ok {
+        return Err(EgoDesktopError::NetworkError(
+            format!("Provider error ({}): {}", resp.status, resp.body)
+        ));
+    }
+    Ok(resp.body)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RentalFile {
+    pub name: String,
+    pub size: u64,
+}
+
+async fn send_file_op(
+    reservation_id: &str,
+    kind: &str,
+    command: String,
+    payload: Option<String>,
+    state: &State<'_, AppState>,
+) -> Result<String, EgoDesktopError> {
+    let reservation = crate::chain_db::get_compute_reservation(reservation_id)
+        .ok_or_else(|| EgoDesktopError::NotFound("Reservation not found".into()))?;
+    let endpoints = provider_endpoints(&reservation.provider_address).await;
+    if endpoints.is_empty() {
+        return Err(EgoDesktopError::NetworkError("Provider has no reachable endpoint".into()));
+    }
+    let kp = state.get_keypair()
+        .ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
+    let mut req = build_exec_request(reservation, command, kind, &kp);
+    req.payload = payload;
+
+    let resp = crate::p2p::compute_exec_any(&endpoints, &req).await
+        .map_err(EgoDesktopError::NetworkError)?;
+    if !resp.ok {
+        return Err(EgoDesktopError::NetworkError(
+            format!("Provider error ({}): {}", resp.status, resp.body)
+        ));
+    }
+    Ok(resp.body)
+}
+
+/// Raw bytes per chunk. base64 inflates ~33%, so 4 MB → ~5.3 MB, well under the
+/// 8 MB request / 16 MB response codec limits.
+const TRANSFER_CHUNK: usize = 4_000_000;
+
+#[tauri::command]
+pub async fn upload_to_rental(
+    reservation_id: String,
+    local_path: String,
+    state: State<'_, AppState>,
+) -> Result<String, EgoDesktopError> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let bytes = tokio::fs::read(&local_path).await
+        .map_err(|e| EgoDesktopError::FileSystemError(format!("Cannot read {local_path}: {e}")))?;
+    let name = std::path::Path::new(&local_path)
+        .file_name().map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+
+    if bytes.is_empty() {
+        send_file_op(&reservation_id, "PUT", name.clone(), Some(String::new()), &state).await?;
+        return Ok(name);
+    }
+    // First chunk truncates/creates (PUT); the rest append (APPEND). Sequential
+    // so the file is reassembled in order.
+    let mut first = true;
+    for chunk in bytes.chunks(TRANSFER_CHUNK) {
+        let kind = if first { "PUT" } else { "APPEND" };
+        send_file_op(&reservation_id, kind, name.clone(), Some(STANDARD.encode(chunk)), &state).await?;
+        first = false;
+    }
+    Ok(name)
+}
+
+#[tauri::command]
+pub async fn upload_folder_to_rental(
+    reservation_id: String,
+    local_folder: String,
+    state: State<'_, AppState>,
+) -> Result<u32, EgoDesktopError> {
+    let entries = std::fs::read_dir(&local_folder)
+        .map_err(|e| EgoDesktopError::FileSystemError(format!("Cannot read folder: {e}")))?;
+    let paths: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| e.path())
+        .collect();
+    let mut count = 0u32;
+    for path in paths {
+        let path_str = path.to_string_lossy().to_string();
+        upload_to_rental(reservation_id.clone(), path_str, state.clone()).await?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+#[tauri::command]
+pub async fn list_rental_files(
+    reservation_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<RentalFile>, EgoDesktopError> {
+    let body = send_file_op(&reservation_id, "LIST", "LIST".to_string(), None, &state).await?;
+    serde_json::from_str(&body)
+        .map_err(|e| EgoDesktopError::NetworkError(format!("Bad file list: {e}")))
+}
+
+#[tauri::command]
+pub async fn download_from_rental(
+    reservation_id: String,
+    file_name: String,
+    save_path: String,
+    state: State<'_, AppState>,
+) -> Result<(), EgoDesktopError> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use tokio::io::AsyncWriteExt;
+
+    // Determine size so we know how many ranged chunks to pull.
+    let list_body = send_file_op(&reservation_id, "LIST", "LIST".to_string(), None, &state).await?;
+    let files: Vec<RentalFile> = serde_json::from_str(&list_body)
+        .map_err(|e| EgoDesktopError::NetworkError(format!("Bad file list: {e}")))?;
+    let size = files.iter().find(|f| f.name == file_name).map(|f| f.size)
+        .ok_or_else(|| EgoDesktopError::NotFound(format!("No file '{file_name}' in workspace")))?;
+
+    let mut out = tokio::fs::File::create(&save_path).await
+        .map_err(|e| EgoDesktopError::FileSystemError(format!("Cannot create {save_path}: {e}")))?;
+    let mut offset: u64 = 0;
+    while offset < size {
+        let len = (TRANSFER_CHUNK as u64).min(size - offset);
+        let cmd = format!("{file_name}:{offset}:{len}");
+        let b64 = send_file_op(&reservation_id, "GETR", cmd, None, &state).await?;
+        let chunk = STANDARD.decode(b64.trim())
+            .map_err(|e| EgoDesktopError::NetworkError(format!("Bad file chunk: {e}")))?;
+        out.write_all(&chunk).await
+            .map_err(|e| EgoDesktopError::FileSystemError(format!("Write failed: {e}")))?;
+        offset += len;
+    }
+    out.flush().await.ok();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_rental_file_b64(
+    reservation_id: String,
+    file_name: String,
+    state: State<'_, AppState>,
+) -> Result<String, EgoDesktopError> {
+    send_file_op(&reservation_id, "GET", file_name, None, &state).await
+}
+
+const WIN_FIND_PY: &str =
+    "$py=$null; \
+     foreach($c in @('D:\\Python313\\python.exe','D:\\Python312\\python.exe','D:\\Python311\\python.exe','D:\\Python310\\python.exe', \
+       'C:\\Python313\\python.exe','C:\\Python312\\python.exe','C:\\Python311\\python.exe','C:\\Python310\\python.exe', \
+       \"$env:LOCALAPPDATA\\Programs\\Python\\Python313\\python.exe\", \
+       \"$env:LOCALAPPDATA\\Programs\\Python\\Python312\\python.exe\", \
+       \"$env:LOCALAPPDATA\\Programs\\Python\\Python311\\python.exe\", \
+       \"$env:LOCALAPPDATA\\Programs\\Python\\Python310\\python.exe\", \
+       \"$env:ProgramData\\Miniconda3\\python.exe\", \
+       \"$env:USERPROFILE\\Anaconda3\\python.exe\", \
+       \"$env:USERPROFILE\\miniconda3\\python.exe\")) \
+     { if(Test-Path $c -EA SilentlyContinue){$py=$c; break} }; \
+     if(-not $py){$t=Get-Command python -EA SilentlyContinue; if($t -and $t.Source -notlike '*WindowsApps*'){$py=$t.Source}}; \
+     if(-not $py){Write-Output '[ERROR] Python not found'; exit 1}; \
+     Write-Output \"[python] $py\"";
+
+#[tauri::command]
+pub async fn launch_web_app(
+    reservation_id: String,
+    app: String,
+    os: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, EgoDesktopError> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let is_win = os.as_deref().map(|s| s.eq_ignore_ascii_case("windows")).unwrap_or(false);
+
+    let (port, path, cmd): (u16, &'static str, String) = match app.as_str() {
+        "jupyter" => {
+            let script = r#"import subprocess, sys, os
+ws = 'C:\\ego_ws' if sys.platform == 'win32' else '/workspace'
+os.makedirs(ws, exist_ok=True)
+_log = open(os.path.join(ws, 'jupyter.log'), 'w', buffering=1)
+sys.stdout = sys.stderr = _log
+print("Installing jupyterlab...", flush=True)
+subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'jupyterlab'])
+print("Launching JupyterLab on port 8888...", flush=True)
+subprocess.run([sys.executable, '-m', 'jupyter', 'lab',
+    '--ip=0.0.0.0', '--port=8888', '--no-browser',
+    '--IdentityProvider.token=ego', '--allow-root',
+    '--notebook-dir=' + ws])
+"#;
+            let b64 = STANDARD.encode(script.as_bytes());
+            let cmd = if is_win {
+                format!(
+                    "$ws='C:\\ego_ws'; [void][IO.Directory]::CreateDirectory($ws); \
+                     [IO.File]::WriteAllBytes(\"$ws\\jupyter_launch.py\", [Convert]::FromBase64String('{b64}')); \
+                     {find_py}; \
+                     $p=Start-Process -PassThru -WindowStyle Hidden -FilePath $py -ArgumentList @(\"$ws\\jupyter_launch.py\"); \
+                     Start-Sleep 3; \
+                     if($p.HasExited){{Write-Output \"[CRASHED] exit=$($p.ExitCode)\"}} \
+                     else{{Write-Output \"[OK] python pid=$($p.Id) installing jupyterlab then port=8888\"}}",
+                    b64 = b64,
+                    find_py = WIN_FIND_PY
+                )
+            } else {
+                format!(
+                    "mkdir -p /workspace; \
+                     python3 -c \"import base64; open('/workspace/jupyter_launch.py','wb').write(base64.b64decode('{b64}'))\"; \
+                     nohup python3 /workspace/jupyter_launch.py >/workspace/jupyter.log 2>&1 & \
+                     sleep 2; echo '[OK] jupyter installer running port=8888'",
+                    b64 = b64
+                )
+            };
+            (8888, "/lab?token=ego", cmd)
+        },
+        "sdxl" => {
+            let script = r#"import subprocess, sys, os
+_ws = r'C:\ego_ws' if sys.platform == 'win32' else '/workspace'
+os.makedirs(_ws, exist_ok=True)
+_log = open(os.path.join(_ws, 'img.log'), 'w', buffering=1)
+sys.stdout = sys.stderr = _log
+print("Installing packages...", flush=True)
+subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q',
+    'gradio', 'diffusers', 'torch', 'transformers', 'accelerate'])
+import gradio as gr, torch
+from diffusers import AutoPipelineForText2Image
+print("Loading sd-turbo (~2 GB on first run)...", flush=True)
+dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+pipe = AutoPipelineForText2Image.from_pretrained("stabilityai/sd-turbo", torch_dtype=dtype)
+if torch.cuda.is_available():
+    pipe = pipe.to("cuda")
+print("Model ready on " + ("GPU" if torch.cuda.is_available() else "CPU"), flush=True)
+workspace = os.environ.get("EGO_WORKSPACE", "/workspace" if sys.platform != "win32" else "C:\\ego_ws")
+os.makedirs(workspace, exist_ok=True)
+def gen(prompt, steps, seed):
+    g = torch.manual_seed(int(seed))
+    img = pipe(prompt=prompt, num_inference_steps=int(steps), guidance_scale=0.0, generator=g).images[0]
+    img.save(os.path.join(workspace, "generated.png"))
+    return img
+gr.Interface(
+    fn=gen,
+    inputs=[
+        gr.Textbox(label="Prompt", placeholder="a futuristic city at sunset"),
+        gr.Slider(1, 8, value=4, step=1, label="Steps"),
+        gr.Number(value=42, label="Seed"),
+    ],
+    outputs=gr.Image(label="Result"),
+    title="AI Image Generator",
+    description="sd-turbo · Ego Compute",
+).launch(server_name="0.0.0.0", server_port=7860, share=False)
+"#;
+            let b64 = STANDARD.encode(script.as_bytes());
+            let cmd = if is_win {
+                format!(
+                    "$ws='C:\\ego_ws'; [void][IO.Directory]::CreateDirectory($ws); \
+                     [IO.File]::WriteAllBytes(\"$ws\\img_gen.py\", [Convert]::FromBase64String('{b64}')); \
+                     {find_py}; \
+                     $env:EGO_WORKSPACE=$ws; \
+                     $p=Start-Process -PassThru -WindowStyle Hidden -FilePath $py -ArgumentList @(\"$ws\\img_gen.py\"); \
+                     Start-Sleep 3; \
+                     if($p.HasExited){{Write-Output \"[CRASHED] exit=$($p.ExitCode)\"}} \
+                     else{{Write-Output \"[OK] python pid=$($p.Id) installing packages then port=7860\"}}",
+                    b64 = b64,
+                    find_py = WIN_FIND_PY
+                )
+            } else {
+                format!(
+                    "mkdir -p /workspace; \
+                     python3 -c \"import base64; open('/workspace/img_gen.py','wb').write(base64.b64decode('{b64}'))\"; \
+                     EGO_WORKSPACE=/workspace nohup python3 /workspace/img_gen.py >/workspace/img.log 2>&1 & \
+                     sleep 2; echo '[OK] image gen installer running port=7860'",
+                    b64 = b64
+                )
+            };
+            (7860u16, "/", cmd)
+        },
+        "llm" => {
+            let script = r#"import subprocess, sys, os
+_ws = r'C:\ego_ws' if sys.platform == 'win32' else '/workspace'
+os.makedirs(_ws, exist_ok=True)
+_log = open(os.path.join(_ws, 'llm.log'), 'w', buffering=1)
+sys.stdout = sys.stderr = _log
+print("Installing packages...", flush=True)
+subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q',
+    'gradio', 'transformers', 'torch', 'accelerate'])
+import gradio as gr, torch
+from transformers import pipeline as hf_pipeline
+import os
+print("Loading TinyLlama-1.1B (~640 MB on first run)...", flush=True)
+chat = hf_pipeline(
+    "text-generation",
+    model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    device_map="auto",
+)
+print("Model ready", flush=True)
+def respond(message, history):
+    msgs = [{"role": "system", "content": "You are a helpful AI assistant running on rented GPU hardware."}]
+    for u, a in history:
+        msgs.append({"role": "user", "content": u})
+        msgs.append({"role": "assistant", "content": a})
+    msgs.append({"role": "user", "content": message})
+    out = chat(msgs, max_new_tokens=256, do_sample=True, temperature=0.7, pad_token_id=2)[0]["generated_text"]
+    return out[-1]["content"] if isinstance(out[-1], dict) else str(out)
+gr.ChatInterface(
+    respond,
+    title="LLM Chat",
+    description="TinyLlama 1.1B · Ego Compute",
+).launch(server_name="0.0.0.0", server_port=8001, share=False)
+"#;
+            let b64 = STANDARD.encode(script.as_bytes());
+            let cmd = if is_win {
+                format!(
+                    "$ws='C:\\ego_ws'; [void][IO.Directory]::CreateDirectory($ws); \
+                     [IO.File]::WriteAllBytes(\"$ws\\llm_chat.py\", [Convert]::FromBase64String('{b64}')); \
+                     {find_py}; \
+                     $p=Start-Process -PassThru -WindowStyle Hidden -FilePath $py -ArgumentList @(\"$ws\\llm_chat.py\"); \
+                     Start-Sleep 3; \
+                     if($p.HasExited){{Write-Output \"[CRASHED] exit=$($p.ExitCode)\"}} \
+                     else{{Write-Output \"[OK] python pid=$($p.Id) installing packages then port=8001\"}}",
+                    b64 = b64,
+                    find_py = WIN_FIND_PY
+                )
+            } else {
+                format!(
+                    "mkdir -p /workspace; \
+                     python3 -c \"import base64; open('/workspace/llm_chat.py','wb').write(base64.b64decode('{b64}'))\"; \
+                     nohup python3 /workspace/llm_chat.py >/workspace/llm.log 2>&1 & \
+                     sleep 2; echo '[OK] llm installer running port=8001'",
+                    b64 = b64
+                )
+            };
+            (8001u16, "/", cmd)
+        },
+        _ => return Err(EgoDesktopError::InvalidInput(format!("Unknown app '{app}'"))),
+    };
+    let startup_log = run_remote_command(reservation_id, cmd, state).await?;
+    Ok(json!({ "container_port": port, "path": path, "startup_log": startup_log }))
+}
+
+#[tauri::command]
+pub async fn open_rental_app(
+    reservation_id: String,
+    container_port: u16,
+    state: State<'_, AppState>,
+) -> Result<String, EgoDesktopError> {
+    let reservation = crate::chain_db::get_compute_reservation(&reservation_id)
+        .ok_or_else(|| EgoDesktopError::NotFound("Reservation not found".into()))?;
+    let endpoints = provider_endpoints(&reservation.provider_address).await;
+    if endpoints.is_empty() {
+        return Err(EgoDesktopError::NetworkError("Provider has no reachable endpoint".into()));
+    }
+    let kp = state.get_keypair()
+        .ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
+    crate::p2p::open_app_tunnel(reservation, container_port, &endpoints, &kp).await
+        .map_err(EgoDesktopError::NetworkError)
 }
 
 #[tauri::command]
@@ -1513,6 +1979,7 @@ pub async fn delete_reservation_history_item(reservation_id: String) -> Result<(
 #[tauri::command]
 pub async fn terminate_reservation(
     reservation_id: String,
+    app:            tauri::AppHandle,
 ) -> Result<(), EgoDesktopError> {
     let ledger  = crate::ledger::Ledger::load();
     let my_addr = ledger.address.clone();
@@ -1530,12 +1997,6 @@ pub async fn terminate_reservation(
     let bonded = crate::chain_db::get_compute_offer(&res.offer_id)
         .map(|o| o.bonded)
         .unwrap_or(false);
-    let threshold = if bonded { BREACH_THRESHOLD_BONDED } else { BREACH_THRESHOLD_UNBONDED };
-    if res.breach_count < threshold && res.status != "breached" {
-        return Err(EgoDesktopError::InvalidInput(
-            format!("Need {} breach event(s) to terminate; currently {}", threshold, res.breach_count)
-        ));
-    }
 
     if res.escrow_remaining > 0 {
         crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, res.escrow_remaining);
@@ -1543,10 +2004,16 @@ pub async fn terminate_reservation(
             &format!("reservation_terminate_refund:{}", reservation_id), ledger.nonce + 1);
     }
 
-    if res.collateral_uegoc > 0 {
-        crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, res.collateral_uegoc);
-        push_system_tx(RESERVATION_ESCROW_ADDR, &my_addr, res.collateral_uegoc,
-            &format!("reservation_terminate_penalty:{}", reservation_id), 0);
+    if bonded && res.collateral_uegoc > 0 {
+        if res.breach_count > 0 {
+            crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, res.collateral_uegoc);
+            push_system_tx(RESERVATION_ESCROW_ADDR, &my_addr, res.collateral_uegoc,
+                &format!("reservation_terminate_penalty:{}", reservation_id), 0);
+        } else {
+            crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &res.provider_address, res.collateral_uegoc);
+            push_system_tx(RESERVATION_ESCROW_ADDR, &res.provider_address, res.collateral_uegoc,
+                &format!("reservation_cancel_collateral_return:{}", reservation_id), 0);
+        }
     }
 
     res.status           = "terminated".to_string();
@@ -1582,6 +2049,88 @@ pub async fn terminate_reservation(
     };
     crate::p2p::broadcast_compute_msg(msg).await;
 
+    let _ = app.emit_all("ego://reservation-terminated", serde_json::json!({
+        "reservation_id": reservation_id,
+        "by":             "buyer",
+        "reason":         format!("{} breach events", res.breach_count),
+        "perspective":    "buyer",
+    }));
+
+    Ok(())
+}
+
+/// Host-initiated rental termination. Releases the buyer's escrow back to
+/// them, returns the host's SLA collateral, and re-opens the offer. The buyer
+/// is notified via the `ReservationTerminated` gossip path (and a Tauri event
+/// fires locally for the host's own UI).
+#[tauri::command]
+pub async fn provider_terminate_reservation(
+    reservation_id: String,
+    reason:         Option<String>,
+    app:            tauri::AppHandle,
+) -> Result<(), EgoDesktopError> {
+    let ledger  = crate::ledger::Ledger::load();
+    let my_addr = ledger.address.clone();
+    let now     = chrono::Utc::now().timestamp();
+
+    let mut res = crate::chain_db::get_compute_reservation(&reservation_id)
+        .ok_or_else(|| EgoDesktopError::NotFound("Reservation not found".into()))?;
+
+    if res.provider_address != my_addr {
+        return Err(EgoDesktopError::PermissionDenied("Only the provider can stop this rental".into()));
+    }
+    if res.status != "active" {
+        return Err(EgoDesktopError::InvalidInput(format!("Reservation is {}", res.status)));
+    }
+
+    // Refund all remaining escrow to the buyer (provider chose to end early — buyer loses access).
+    if res.escrow_remaining > 0 {
+        crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &res.buyer_address, res.escrow_remaining);
+        push_system_tx(RESERVATION_ESCROW_ADDR, &res.buyer_address, res.escrow_remaining,
+            &format!("provider_terminate_refund:{}", reservation_id), 0);
+    }
+
+    // Provider broke the contract → collateral penalty goes to the buyer.
+    let bonded = crate::chain_db::get_compute_offer(&res.offer_id)
+        .map(|o| o.bonded)
+        .unwrap_or(false);
+    if bonded && res.collateral_uegoc > 0 {
+        crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &res.buyer_address, res.collateral_uegoc);
+        push_system_tx(RESERVATION_ESCROW_ADDR, &res.buyer_address, res.collateral_uegoc,
+            &format!("provider_terminate_penalty:{}", reservation_id), 0);
+    }
+
+    res.status           = "terminated".to_string();
+    res.escrow_remaining = 0;
+    crate::chain_db::upsert_compute_reservation(&res);
+
+    if let Some(mut node) = crate::chain_db::get_compute_node(&res.provider_address) {
+        node.locked_cores  = node.locked_cores.saturating_sub(res.cpu_cores);
+        node.locked_ram_gb = node.locked_ram_gb.saturating_sub(res.ram_gb);
+        crate::chain_db::upsert_compute_node(&node);
+    }
+
+    if let Some(mut offer) = crate::chain_db::get_compute_offer(&res.offer_id) {
+        offer.status = "open".to_string();
+        crate::chain_db::upsert_compute_offer(&offer);
+    }
+
+    let reason = reason.unwrap_or_else(|| "host_stopped".to_string());
+    let msg = crate::p2p::P2PMessage::ReservationTerminated {
+        reservation_id: reservation_id.clone(),
+        by:     "provider".to_string(),
+        reason: reason.clone(),
+    };
+    crate::p2p::broadcast_compute_msg(msg).await;
+
+    let _ = app.emit_all("ego://reservation-terminated", serde_json::json!({
+        "reservation_id": reservation_id,
+        "by":             "provider",
+        "reason":         reason,
+        "perspective":    "provider",
+    }));
+
+    let _ = now;
     Ok(())
 }
 

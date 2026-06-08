@@ -18,6 +18,7 @@ mod poc;
 mod proof;
 mod python_host;
 mod rpc;
+mod sandbox;
 mod sharding;
 mod tokenomics;
 mod tls;
@@ -563,11 +564,22 @@ fn main() {
             commands::compute::cancel_capacity_offer,
             commands::compute::get_capacity_offers,
             commands::compute::book_reservation,
+            commands::compute::start_rental,
             commands::compute::send_reservation_heartbeat,
             commands::compute::get_reservations,
             commands::compute::terminate_reservation,
+            commands::compute::provider_terminate_reservation,
             commands::compute::open_ssh_terminal,
             commands::compute::run_remote_command,
+            commands::compute::run_remote_intent,
+            commands::compute::upload_to_rental,
+            commands::compute::upload_folder_to_rental,
+            commands::compute::list_rental_files,
+            commands::compute::download_from_rental,
+            commands::compute::get_rental_file_b64,
+            commands::compute::launch_web_app,
+            commands::compute::open_rental_app,
+            commands::compute::get_remote_usage,
             commands::compute::delete_reservation_history_item,
             commands::compute::get_or_create_ssh_key,
             commands::storage_deals::create_storage_deal,

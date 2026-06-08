@@ -1,5 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
+import { listen } from '@tauri-apps/api/event';
+import { open, save } from '@tauri-apps/api/dialog';
+import { open as shellOpen } from '@tauri-apps/api/shell';
 
 interface HardwareProfile {
   cpu_cores: number; cpu_model: string; ram_gb: number;
@@ -36,6 +39,7 @@ interface ComputeReservation {
   total_cost_uegoc: number; collateral_uegoc: number; status: string;
   created_at: number; expires_at: number; last_heartbeat_at: number;
   periods_paid: number; breach_count: number; escrow_remaining: number;
+  started_at?: number | null;
 }
 interface ClusterNode {
   provider_address: string; reservation_id: string;
@@ -179,7 +183,11 @@ export default function ComputePage() {
   const [confirmTermRes,   setConfirmTermRes]   = useState<string | null>(null);
   const [confirmTermEarly, setConfirmTermEarly] = useState<{ id: string, penalty: number } | null>(null);
   const [confirmDeleteHistory, setConfirmDeleteHistory] = useState<string | null>(null);
+  const [confirmProvTerm,  setConfirmProvTerm]  = useState<string | null>(null);
   const [confirmTermCluster, setConfirmTermCluster] = useState<string | null>(null);
+
+  const [aiFilter,       setAiFilter]       = useState<string>('All');
+  const [terminalOpen,   setTerminalOpen]   = useState(false);
 
   const [showConsole,    setShowConsole]    = useState<string | null>(null);
   const [consoleCmd,     setConsoleCmd]     = useState('');
@@ -190,7 +198,21 @@ export default function ComputePage() {
     cpu: number;
     ram_used_gb: number;
     gpu: number;
+    os: string;
+    sandboxed: boolean;
   } | null>(null);
+  const [usageError, setUsageError] = useState<string | null>(null);
+
+  const [rentalFiles,  setRentalFiles]  = useState<{ name: string; size: number }[]>([]);
+  const [fileBusy,     setFileBusy]     = useState(false);
+  const [filePreview,  setFilePreview]  = useState<{ name: string; url: string } | null>(null);
+  const [appBusy,      setAppBusy]      = useState<string | null>(null);
+  const [appImgFile,   setAppImgFile]   = useState('');
+  const [appImgWidth,  setAppImgWidth]  = useState(800);
+  const [appImgPrompt, setAppImgPrompt] = useState('');
+  const [appAudioFile, setAppAudioFile] = useState('');
+  const [gpuAppUrl,    setGpuAppUrl]    = useState<{ app: string; url: string; port: number; os: string } | null>(null);
+  const [appPollSecs,  setAppPollSecs]  = useState<number | null>(null);
 
   const [now, setNow] = useState(Math.floor(Date.now() / 1000));
   useEffect(() => {
@@ -219,6 +241,7 @@ export default function ComputePage() {
   const [wgConfigOpen,        setWgConfigOpen]        = useState(false);
   const [clusterHeartbeatId,  setClusterHeartbeatId]  = useState<string | null>(null);
   const [terminatingCluster,  setTerminatingCluster]  = useState<string | null>(null);
+  const [selectedWorkspace,   setSelectedWorkspace]   = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -245,6 +268,13 @@ export default function ComputePage() {
     load();
     const t = setInterval(load, 15_000);
     return () => clearInterval(t);
+  }, [load]);
+
+  useEffect(() => {
+    const unlisten = listen('ego://reservation-terminated', () => {
+      load();
+    });
+    return () => { unlisten.then(f => f()); };
   }, [load]);
 
   async function detectHw() {
@@ -325,6 +355,18 @@ export default function ComputePage() {
     setBusyRes(null);
   }
 
+  async function executeProviderTerminate() {
+    if (!confirmProvTerm) return;
+    const id = confirmProvTerm;
+    setConfirmProvTerm(null);
+    setBusyRes(id);
+    try {
+      await invoke('provider_terminate_reservation', { reservationId: id });
+      await load();
+    } catch (err: any) { alert(String(err)); }
+    setBusyRes(null);
+  }
+
   async function executeTerminateReservation() {
     if (!confirmTermRes) return;
     const id = confirmTermRes;
@@ -348,7 +390,8 @@ export default function ComputePage() {
   }
 
   function getLiveCost(r: ComputeReservation) {
-    const elapsed = Math.max(0, now - r.created_at);
+    if (!r.started_at) return 0;
+    const elapsed = Math.max(0, now - r.started_at);
     const periodSecs = Math.max(1, r.period_minutes * 60);
     const ratePerSec = r.period_rate_uegoc / periodSecs;
     return Math.min(r.total_cost_uegoc, Math.floor(elapsed * ratePerSec));
@@ -361,19 +404,30 @@ export default function ComputePage() {
         setUsageStats({
           cpu: Math.round(stats.cpu),
           ram_used_gb: stats.ram_used_gb,
-          gpu: stats.gpu
+          gpu: stats.gpu,
+          os: typeof stats.os === 'string' ? stats.os : '',
+          sandboxed: !!stats.sandboxed
         });
+        setUsageError(null);
+      } else {
+        setUsageError('Provider returned unexpected payload');
       }
-    } catch (e) { console.error("Usage poll failed", e); }
+    } catch (e) {
+      const msg = String(e);
+      const trimmed = msg.length > 120 ? msg.slice(0, 117) + '…' : msg;
+      setUsageError(trimmed);
+      console.error("Usage poll failed", e);
+    }
   }, []);
 
   useEffect(() => {
     let interval: any;
     if (showConsole) {
       refreshLiveUsage(showConsole);
-      interval = setInterval(() => refreshLiveUsage(showConsole), 5000);
+      interval = setInterval(() => refreshLiveUsage(showConsole), 1000);
     } else {
       setUsageStats(null);
+      setUsageError(null);
     }
     return () => clearInterval(interval);
   }, [showConsole, refreshLiveUsage]);
@@ -399,6 +453,210 @@ export default function ComputePage() {
       setConsoleOut(prev => prev + `${displayTag}Error: ${String(err)}\n`);
     }
     setConsoleBusy(false);
+  }
+
+  async function executeRemoteIntent(kind: 'SPECS' | 'BENCH', label: string) {
+    if (!showConsole) return;
+    const id = showConsole;
+    setConsoleBusy(true);
+    try {
+      const res = await invoke<string>('run_remote_intent', { reservationId: id, kind });
+      setConsoleOut(prev => prev + `\n--- ${label.toUpperCase()} ---\n${res}\n`);
+    } catch (err: any) {
+      setConsoleOut(prev => prev + `\n--- FAILED: ${label.toUpperCase()} ---\nError: ${String(err)}\n`);
+    }
+    setConsoleBusy(false);
+  }
+
+  const refreshFiles = useCallback(async () => {
+    if (!showConsole) return;
+    try {
+      const f = await invoke<{ name: string; size: number }[]>('list_rental_files', { reservationId: showConsole });
+      setRentalFiles(f);
+    } catch (e) {
+      setConsoleOut(prev => prev + `\n[files] ${String(e)}\n`);
+    }
+  }, [showConsole]);
+
+  useEffect(() => {
+    if (showConsole) {
+      refreshFiles();
+    } else {
+      setRentalFiles([]); setFilePreview(null); setAppImgFile(''); setAppImgPrompt(''); setAppAudioFile(''); setGpuAppUrl(null); setAppPollSecs(null);
+    }
+  }, [showConsole, refreshFiles]);
+
+  const isImage = (n: string) => /\.(png|jpe?g|gif|webp|bmp)$/i.test(n);
+  const fmtBytes = (b: number) => b < 1024 ? `${b} B` : b < 1_048_576 ? `${(b / 1024).toFixed(1)} KB` : `${(b / 1_048_576).toFixed(1)} MB`;
+
+  async function uploadFile() {
+    if (!showConsole) return;
+    try {
+      const sel = await open({ multiple: false, title: 'Select a file to upload to your rental' });
+      if (sel && typeof sel === 'string') {
+        setFileBusy(true);
+        const name = await invoke<string>('upload_to_rental', { reservationId: showConsole, localPath: sel });
+        setConsoleOut(prev => prev + `\n[uploaded] ${name}\n`);
+        await refreshFiles();
+      }
+    } catch (e) { setConsoleOut(prev => prev + `\n[upload failed] ${String(e)}\n`); }
+    setFileBusy(false);
+  }
+
+  async function downloadFile(name: string) {
+    if (!showConsole) return;
+    try {
+      const dest = await save({ defaultPath: name });
+      if (dest) {
+        setFileBusy(true);
+        await invoke('download_from_rental', { reservationId: showConsole, fileName: name, savePath: dest });
+        setConsoleOut(prev => prev + `\n[downloaded] ${name} → ${dest}\n`);
+      }
+    } catch (e) { setConsoleOut(prev => prev + `\n[download failed] ${String(e)}\n`); }
+    setFileBusy(false);
+  }
+
+  async function previewFile(name: string) {
+    if (!showConsole) return;
+    try {
+      const b64 = await invoke<string>('get_rental_file_b64', { reservationId: showConsole, fileName: name });
+      const ext = name.split('.').pop()?.toLowerCase() || '';
+      const mime = ext === 'png' ? 'image/png'
+        : (ext === 'jpg' || ext === 'jpeg') ? 'image/jpeg'
+        : ext === 'gif' ? 'image/gif'
+        : ext === 'webp' ? 'image/webp' : 'application/octet-stream';
+      setFilePreview({ name, url: `data:${mime};base64,${b64}` });
+    } catch (e) { setConsoleOut(prev => prev + `\n[preview failed] ${String(e)}\n`); }
+  }
+
+  async function runImageResize() {
+    if (!showConsole || !appImgFile) return;
+    const id = showConsole;
+    const inName = appImgFile;
+    const w = Math.max(1, Math.floor(appImgWidth));
+    const outName = `resized_${w}_${inName}`;
+    setAppBusy('image-resize');
+    const cmd =
+      `pip install -q pillow >/dev/null 2>&1; ` +
+      `python -c "from PIL import Image; im=Image.open('${inName}'); ` +
+      `ratio=${w}/im.width; im=im.resize((${w}, max(1,int(im.height*ratio)))); ` +
+      `im.save('${outName}'); print('Saved ${outName}', im.size)"`;
+    try {
+      const res = await invoke<string>('run_remote_command', { reservationId: id, command: cmd });
+      setConsoleOut(prev => prev + `\n--- IMAGE RESIZE ---\n${res}\n`);
+      await refreshFiles();
+      await previewFile(outName);
+    } catch (e) {
+      setConsoleOut(prev => prev + `\n--- FAILED: IMAGE RESIZE ---\nError: ${String(e)}\n`);
+    }
+    setAppBusy(null);
+  }
+
+  const APP_PORTS: Record<string, number> = { llm: 8000, sdxl: 7860, jupyter: 8888 };
+  const APP_HINTS: Record<string, string> = {
+    llm:     'Installing packages + downloading TinyLlama (~640 MB). First run: 5-10 min. Click "View logs" to watch progress.',
+    sdxl:    'Installing packages + downloading Stable Diffusion (~2 GB). First run: 15-20 min. Click "View logs" to watch.',
+    jupyter: 'Installing JupyterLab in background. Ready in ~2-4 min. Click "View logs" to watch.',
+  };
+
+  async function openWebApp(app: string, label: string) {
+    if (!showConsole) return;
+    const id = showConsole;
+    setAppBusy(app);
+    setGpuAppUrl(null);
+    setAppPollSecs(null);
+    setConsoleOut(prev => prev + `\n--- ${label.toUpperCase()}: packages installing… ---\n`);
+    try {
+      const providerOs = usageStats?.os ?? 'linux';
+      const info = await invoke<{ container_port: number; path: string; startup_log?: string }>('launch_web_app', { reservationId: id, app, os: providerOs });
+      const hostPort = await invoke<string>('open_rental_app', { reservationId: id, containerPort: info.container_port });
+      const url = `http://${hostPort}${info.path}`;
+      setGpuAppUrl({ app, url, port: info.container_port, os: providerOs });
+      const log = (info.startup_log ?? '').trim();
+      const crashed = log.includes('[CRASHED]') || log.includes('[ERROR]');
+      setConsoleOut(prev => prev +
+        (log ? `${log}\n` : '') +
+        (crashed ? '' : `Tunnel: ${url}\n${APP_HINTS[app] ?? 'Starting…'}\nAuto-checking every 20 s — will open automatically when ready.\n`)
+      );
+      if (!crashed) setAppPollSecs(20);
+    } catch (e) {
+      setConsoleOut(prev => prev + `--- FAILED: ${label.toUpperCase()} ---\nError: ${String(e)}\n`);
+    }
+    setAppBusy(null);
+  }
+
+  useEffect(() => {
+    if (appPollSecs === null || !showConsole || !gpuAppUrl) return;
+    if (appPollSecs > 0) {
+      const t = setTimeout(() => setAppPollSecs(s => (s ?? 1) - 1), 1000);
+      return () => clearTimeout(t);
+    }
+    const { port, os, url } = gpuAppUrl;
+    const win = os.toLowerCase().includes('win');
+    const checkCmd = win
+      ? `try { $t = New-Object System.Net.Sockets.TcpClient('127.0.0.1', ${port}); $t.Close(); Write-Output 'ready' } catch { Write-Output 'not_ready' }`
+      : `timeout 1 bash -c 'echo "" >/dev/tcp/127.0.0.1/${port}' 2>/dev/null && echo ready || echo not_ready`;
+    invoke<string>('run_remote_command', { reservationId: showConsole, command: checkCmd })
+      .then(result => {
+        if (result.trim() === 'ready') {
+          setAppPollSecs(null);
+          setConsoleOut(prev => prev + `[✓] Server ready — opening browser\n`);
+          shellOpen(url);
+        } else {
+          setAppPollSecs(20);
+        }
+      })
+      .catch(() => setAppPollSecs(20));
+  }, [appPollSecs, showConsole, gpuAppUrl]);
+
+  async function checkAndOpenApp(app: string) {
+    if (!showConsole || !gpuAppUrl) return;
+    const { port, os, url } = gpuAppUrl;
+    const win = os.toLowerCase().includes('win');
+    const checkCmd = win
+      ? `try { $t = New-Object System.Net.Sockets.TcpClient('127.0.0.1', ${port}); $t.Close(); Write-Output 'ready' } catch { Write-Output 'not_ready' }`
+      : `timeout 1 bash -c 'echo "" >/dev/tcp/127.0.0.1/${port}' 2>/dev/null && echo ready || echo not_ready`;
+    setAppBusy(app + '_check');
+    try {
+      const result = await invoke<string>('run_remote_command', { reservationId: showConsole, command: checkCmd });
+      if (result.trim() === 'ready') {
+        setAppPollSecs(null);
+        await shellOpen(url);
+      } else {
+        setConsoleOut(prev => prev + `[not ready yet] Still loading — auto-check resumes in 20 s\n`);
+        setAppPollSecs(20);
+      }
+    } catch (e) {
+      setConsoleOut(prev => prev + `[check failed] ${String(e)}\n`);
+      setAppPollSecs(20);
+    }
+    setAppBusy(null);
+  }
+
+  async function transcribeAudio() {
+    if (!showConsole || !appAudioFile) return;
+    const id = showConsole;
+    const fname = appAudioFile;
+    const outName = fname + '.txt';
+    setAppBusy('transcribe');
+    const win = (gpuAppUrl?.os ?? usageStats?.os ?? '').toLowerCase().includes('win');
+    const pyBin = win ? 'python' : 'python3';
+    const wsSep = win ? '; ' : '; ';
+    const wsPath = win ? `os.path.join(os.environ.get('TEMP','C:\\\\Temp'),'ego')` : `'/workspace'`;
+    const install = win
+      ? `pip install -q openai-whisper 2>$null`
+      : `pip install -q openai-whisper >/dev/null 2>&1`;
+    const cmd = win
+      ? `${install}; ${pyBin} -c "import whisper,os; ws=os.path.join(os.environ.get('TEMP','C:\\\\Temp'),'ego'); m=whisper.load_model('base'); r=m.transcribe(os.path.join(ws,'${fname}')); t=r['text']; open(os.path.join(ws,'${outName}'),'w').write(t); print('TRANSCRIPT:',t)"`
+      : `${install}; ${pyBin} -c "import whisper; m=whisper.load_model('base'); r=m.transcribe('/workspace/${fname}'); t=r['text']; open('/workspace/${outName}','w').write(t); print('TRANSCRIPT:',t)"`;
+    try {
+      const res = await invoke<string>('run_remote_command', { reservationId: id, command: cmd });
+      setConsoleOut(prev => prev + `\n--- WHISPER TRANSCRIPTION ---\n${res}\n`);
+      await refreshFiles();
+    } catch (e) {
+      setConsoleOut(prev => prev + `\n--- FAILED: TRANSCRIPTION ---\nError: ${String(e)}\n`);
+    }
+    setAppBusy(null);
   }
 
   async function executeTerminateEarly() {
@@ -474,6 +732,75 @@ export default function ComputePage() {
     finally { setSshKeyLoading(false); }
   }
 
+  function aiSuitability(o: ComputeCapacityOffer): string[] {
+    if (o.gpu_count === 0) return ['Embeddings', 'Transcription', 'CPU Inference'];
+    if (o.gpu_vram_gb >= 24) return ['LLM 70B+', 'Fine-tuning', 'Image Gen'];
+    if (o.gpu_vram_gb >= 16) return ['LLM 13B', 'Fine-tuning', 'Image Gen'];
+    if (o.gpu_vram_gb >= 8)  return ['LLM 7B', 'Image Gen', 'Embeddings'];
+    if (o.gpu_vram_gb >= 4)  return ['LLM Chat', 'Image Gen', 'Embeddings'];
+    return ['Embeddings', 'Image Gen'];
+  }
+
+  function matchesAiFilter(o: ComputeCapacityOffer): boolean {
+    if (aiFilter === 'All') return true;
+    const tags = aiSuitability(o);
+    if (aiFilter === 'LLM')       return tags.some(t => t.startsWith('LLM'));
+    if (aiFilter === 'Image Gen') return tags.includes('Image Gen');
+    if (aiFilter === 'Fine-tune') return tags.includes('Fine-tuning');
+    if (aiFilter === 'Embeddings') return tags.includes('Embeddings');
+    return true;
+  }
+
+  async function openLocalFileToWorkspace() {
+    if (!showConsole) return;
+    try {
+      const sel = await open({ multiple: false, title: 'Add a file — it will be sent to your remote GPU' });
+      if (sel && typeof sel === 'string') {
+        setFileBusy(true);
+        const name = await invoke<string>('upload_to_rental', { reservationId: showConsole, localPath: sel });
+        setConsoleOut(prev => prev + `[uploaded] ${name}\n`);
+        await refreshFiles();
+        const ext = name.split('.').pop()?.toLowerCase() ?? '';
+        if (['mp3','wav','m4a','ogg','flac','webm'].includes(ext)) setAppAudioFile(name);
+        else if (['png','jpg','jpeg','gif','webp'].includes(ext))   setAppImgFile(name);
+      }
+    } catch (e) { setConsoleOut(prev => prev + `[upload failed] ${String(e)}\n`); }
+    setFileBusy(false);
+  }
+
+  async function pickAudioFile() {
+    if (!showConsole) return;
+    try {
+      const sel = await open({
+        multiple: false,
+        title: 'Select an audio file',
+        filters: [{ name: 'Audio', extensions: ['mp3','wav','m4a','ogg','flac','webm'] }],
+      });
+      if (sel && typeof sel === 'string') {
+        setFileBusy(true);
+        const name = await invoke<string>('upload_to_rental', { reservationId: showConsole, localPath: sel });
+        setConsoleOut(prev => prev + `[uploaded] ${name}\n`);
+        await refreshFiles();
+        setAppAudioFile(name);
+      }
+    } catch (e) { setConsoleOut(prev => prev + `[upload failed] ${String(e)}\n`); }
+    setFileBusy(false);
+  }
+
+  async function uploadFolder() {
+    if (!showConsole) return;
+    try {
+      const dir = await open({ directory: true, title: 'Add a folder — all files will be sent to your remote GPU' });
+      if (dir && typeof dir === 'string') {
+        setFileBusy(true);
+        const count = await invoke<number>('upload_folder_to_rental', { reservationId: showConsole, localFolder: dir });
+        setConsoleOut(prev => prev + `[uploaded folder] ${count} file(s)\n`);
+        await refreshFiles();
+      }
+    } catch (e) { setConsoleOut(prev => prev + `[folder upload failed] ${String(e)}\n`); }
+    setFileBusy(false);
+  }
+
   if (loading) return <div className="flex items-center justify-center h-64 text-gray-400">Loading…</div>;
 
   const myAddr           = status?.address ?? '';
@@ -486,9 +813,9 @@ export default function ComputePage() {
       {/* Header */}
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-white">Compute Marketplace</h1>
+          <h1 className="text-2xl font-bold text-white">AI Compute</h1>
           <p className="text-gray-400 text-sm mt-0.5">
-            Rent out your CPU, GPU, or RAM and earn EGOC · Rent computing power from anyone on the network
+            Rent a GPU for AI — run LLMs, generate images, fine-tune models · Earn by sharing your hardware
           </p>
         </div>
       </div>
@@ -514,8 +841,8 @@ export default function ComputePage() {
       <div className="flex gap-1 border-b border-gray-700 flex-wrap">
         {([
           { id: 'earn',    label: 'Earn' },
-          { id: 'book',    label: `Book${activeResCount > 0 ? ` (${activeResCount})` : ''}` },
-          { id: 'cluster', label: `Clusters${myClusterCount > 0 ? ` (${myClusterCount})` : ''}` },
+          { id: 'book',    label: `Run AI${activeResCount > 0 ? ` (${activeResCount})` : ''}` },
+          { id: 'cluster', label: `Train${myClusterCount > 0 ? ` (${myClusterCount})` : ''}` },
         ] as const).map(t => (
           <button key={t.id} onClick={() => setTab(t.id)}
             className={`px-4 py-2 text-sm font-medium rounded-t-lg transition-colors ${tab === t.id ? 'bg-purple-600 text-white' : 'text-gray-400 hover:text-white'}`}>
@@ -629,11 +956,18 @@ export default function ComputePage() {
                     {r.breach_count > 0 && (
                       <p className="text-red-400 text-xs">⚠ {r.breach_count} missed period{r.breach_count > 1 ? 's' : ''} detected</p>
                     )}
-                    <button onClick={() => sendHeartbeat(r.reservation_id)}
-                      disabled={busyRes === r.reservation_id}
-                      className="w-full py-1.5 bg-green-700 hover:bg-green-600 text-white text-xs rounded-lg disabled:opacity-60">
-                      {busyRes === r.reservation_id ? 'Sending…' : 'Send Check-In & Claim Payment'}
-                    </button>
+                    <div className="flex gap-2">
+                      <button onClick={() => sendHeartbeat(r.reservation_id)}
+                        disabled={busyRes === r.reservation_id}
+                        className="flex-1 py-1.5 bg-green-700 hover:bg-green-600 text-white text-xs rounded-lg disabled:opacity-60 font-medium">
+                        {busyRes === r.reservation_id ? 'Sending…' : 'Check-In & Claim'}
+                      </button>
+                      <button onClick={() => setConfirmProvTerm(r.reservation_id)}
+                        disabled={busyRes === r.reservation_id}
+                        className="px-3 py-1.5 bg-gray-700 hover:bg-red-900/40 text-gray-400 hover:text-red-100 text-xs rounded-lg transition-all border border-gray-600">
+                        Stop
+                      </button>
+                    </div>
                   </div>
                 );
               })}
@@ -683,49 +1017,73 @@ export default function ComputePage() {
       {tab === 'book' && (
         <div className="space-y-4">
 
-          <div className="bg-blue-900/20 border border-blue-700/30 rounded-xl px-4 py-3 text-xs text-blue-300 space-y-1">
-            <p className="font-semibold text-sm">Rent compute power</p>
-            <p>Pick a provider and a duration — from 30 minutes to a full year. Your payment is locked in escrow and released to the provider each period. If they go offline, you get the unused balance back automatically.</p>
+          <div className="bg-gradient-to-br from-purple-900/30 to-blue-900/20 border border-purple-700/30 rounded-xl p-4 space-y-2">
+            <p className="text-white font-semibold text-sm">Run AI on a rented GPU</p>
+            <p className="text-gray-300 text-xs leading-relaxed">Pick a GPU, rent it, and launch apps that open in your browser. <strong className="text-white">The heavy compute runs remotely</strong> — your computer is just the screen. Use it for LLM chat, image generation, fine-tuning, or any Python workload.</p>
+            <div className="flex gap-2 flex-wrap pt-1 text-[10px]">
+              <span className="bg-purple-900/40 text-purple-300 px-2 py-0.5 rounded-full border border-purple-700/30">🤖 LLM inference</span>
+              <span className="bg-pink-900/40 text-pink-300 px-2 py-0.5 rounded-full border border-pink-700/30">🎨 Image generation</span>
+              <span className="bg-blue-900/40 text-blue-300 px-2 py-0.5 rounded-full border border-blue-700/30">🧬 Fine-tuning</span>
+              <span className="bg-teal-900/40 text-teal-300 px-2 py-0.5 rounded-full border border-teal-700/30">🔢 Embeddings</span>
+              <span className="bg-orange-900/40 text-orange-300 px-2 py-0.5 rounded-full border border-orange-700/30">🎤 Transcription</span>
+            </div>
           </div>
 
-          <h2 className="text-white font-semibold">Available hardware</h2>
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-gray-500 text-xs font-bold uppercase tracking-widest">Filter:</span>
+            {(['All', 'LLM', 'Image Gen', 'Fine-tune', 'Embeddings'] as const).map(f => (
+              <button key={f} onClick={() => setAiFilter(f)}
+                className={`px-3 py-1 text-xs rounded-full font-medium transition-colors ${aiFilter === f ? 'bg-purple-600 text-white' : 'bg-gray-800 text-gray-400 hover:text-white border border-gray-700'}`}>
+                {f}
+              </button>
+            ))}
+          </div>
 
-          {offers.filter(o => o.status === 'open').length === 0 ? (
+          {offers.filter(o => o.status === 'open' && o.provider_address !== myAddr && matchesAiFilter(o)).length === 0 ? (
             <div className="bg-gray-800 rounded-xl border border-gray-600 p-8 text-center">
-              <p className="text-gray-400 text-sm">No hardware listed yet.</p>
-              <p className="text-gray-500 text-xs mt-1">Providers list their hardware in the Earn tab.</p>
+              <p className="text-gray-400 text-sm">{aiFilter === 'All' ? 'No GPU providers online yet.' : `No providers match "${aiFilter}" right now.`}</p>
+              <p className="text-gray-500 text-xs mt-1">Providers list hardware in the Earn tab. Try "All" to see everything.</p>
             </div>
           ) : (
             <div className="space-y-3">
-              {offers.filter(o => o.status === 'open').map(o => {
+              {offers.filter(o => o.status === 'open' && o.provider_address !== myAddr && matchesAiFilter(o)).map(o => {
                 const rate = hourlyRate(o);
+                const tags = aiSuitability(o);
                 return (
                   <div key={o.offer_id} className={`rounded-xl border p-4 space-y-3 ${o.bonded ? 'bg-gray-800 border-gray-700' : 'bg-gray-800 border-orange-800/40'}`}>
                     <div className="flex items-start justify-between gap-3">
-                      <div className="space-y-1 flex-1">
+                      <div className="space-y-1.5 flex-1">
                         <div className="flex items-center gap-2 flex-wrap">
-                          <p className="text-white font-bold">{o.cpu_cores} Cores · {o.ram_gb}GB RAM · {gpuLabel(o)}</p>
+                          {o.gpu_count > 0
+                            ? <p className="text-white font-bold text-base">{gpuLabel(o)}</p>
+                            : <p className="text-white font-bold text-base">{o.cpu_cores}-core CPU · {o.ram_gb}GB RAM</p>}
                           {o.bonded
                             ? <span className="text-xs bg-green-900 text-green-300 px-2 py-0.5 rounded-full">✓ Protected</span>
-                            : <span className="text-xs bg-orange-900 text-orange-300 px-2 py-0.5 rounded-full">Basic</span>}
+                            : <span className="text-xs bg-orange-900 text-orange-300 px-2 py-0.5 rounded-full">Unprotected</span>}
                         </div>
-                        <p className="text-yellow-400 font-semibold">{fmt(rate)} EGOC/hr</p>
-                        <p className="text-gray-400 text-xs">
-                          {fmtDuration(o.min_duration_hours * 60)}–{fmtDuration(o.max_duration_hours * 60)} · Provider: {fmtAddr(o.provider_address)}
-                        </p>
-                        {o.bonded
-                          ? <p className="text-green-400/70 text-xs">If provider goes offline: unused escrow refunded + security deposit paid to you</p>
-                          : <p className="text-orange-400/70 text-xs">If provider goes offline: unused escrow refunded (no extra penalty)</p>}
+                        {o.gpu_count > 0 && (
+                          <p className="text-gray-400 text-xs">{o.gpu_count}× GPU · {o.gpu_vram_gb}GB VRAM · {o.cpu_cores} cores · {o.ram_gb}GB RAM</p>
+                        )}
+                        <div className="flex gap-1.5 flex-wrap items-center">
+                          <span className="text-[10px] text-gray-500 font-bold uppercase tracking-wider">Good for:</span>
+                          {tags.map(t => (
+                            <span key={t} className="text-[10px] bg-gray-700 text-gray-300 px-2 py-0.5 rounded-full">{t}</span>
+                          ))}
+                        </div>
+                        <div className="flex items-center gap-3 pt-0.5">
+                          <p className="text-yellow-400 font-bold text-lg">{fmt(rate)} <span className="text-sm font-normal text-gray-400">EGOC/hr</span></p>
+                          <p className="text-gray-500 text-xs">{fmtDuration(o.min_duration_hours * 60)}–{fmtDuration(o.max_duration_hours * 60)}</p>
+                        </div>
                       </div>
                       <button onClick={() => { setBookOpen(o); setBookDurationMins(Math.max(o.min_duration_hours * 60, 1_440)); setBookMsg(''); }}
-                        className="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white text-sm rounded-lg font-medium whitespace-nowrap">
-                        Rent
+                        className="px-5 py-2.5 bg-purple-600 hover:bg-purple-500 text-white text-sm rounded-xl font-bold whitespace-nowrap shadow-lg transition-all active:scale-95">
+                        Rent GPU
                       </button>
                     </div>
-                    <div className="flex gap-4 text-xs text-gray-500 pt-1 border-t border-gray-700 flex-wrap">
-                      <span>1 day = <span className="text-white">{fmt(rate * 24)} EGOC</span></span>
-                      <span>1 week = <span className="text-white">{fmt(rate * 24 * 7)} EGOC</span></span>
-                      <span>1 month = <span className="text-white">{fmt(rate * 24 * 30)} EGOC</span></span>
+                    <div className="flex gap-4 text-xs text-gray-600 pt-1 border-t border-gray-700/50 flex-wrap">
+                      <span>1 day = <span className="text-gray-400">{fmt(rate * 24)} EGOC</span></span>
+                      <span>1 week = <span className="text-gray-400">{fmt(rate * 24 * 7)} EGOC</span></span>
+                      <span>Provider: <span className="text-gray-400">{fmtAddr(o.provider_address)}</span></span>
                     </div>
                   </div>
                 );
@@ -733,10 +1091,40 @@ export default function ComputePage() {
             </div>
           )}
 
+          {/* Unified AI Workspace — one panel for ALL active rentals */}
+          {(() => {
+            const activeRentals = reservations.filter(r => r.buyer_address === myAddr && r.status === 'active');
+            if (activeRentals.length === 0) return null;
+            const target = selectedWorkspace && activeRentals.find(r => r.reservation_id === selectedWorkspace)
+              ? selectedWorkspace
+              : activeRentals[0].reservation_id;
+            return (
+              <div className="p-4 bg-purple-900/20 border border-purple-500/30 rounded-xl space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-bold text-purple-300 uppercase tracking-widest">AI Workspace</span>
+                  <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
+                </div>
+                {activeRentals.length > 1 && (
+                  <p className="text-gray-400 text-xs">{activeRentals.length} active rentals — switch between them inside the workspace.</p>
+                )}
+                <button onClick={async () => {
+                  await invoke('start_rental', { reservationId: target }).catch(() => {});
+                  setShowConsole(target); setConsoleOut(''); setConsoleCmd(''); setTerminalOpen(false);
+                }}
+                  className="w-full py-3 bg-gradient-to-r from-purple-600 to-blue-600 hover:from-purple-500 hover:to-blue-500 text-white text-sm rounded-xl font-bold shadow-xl transition-all active:scale-95 flex items-center justify-center gap-2">
+                  <svg className="w-4 h-4 shrink-0 animate-spin" style={{ animationDuration: '6s' }} viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 2C12 7.5 7.5 12 2 12C7.5 12 12 16.5 12 22C12 16.5 16.5 12 22 12C16.5 12 12 7.5 12 2Z"/>
+                  </svg> Open AI Workspace
+                </button>
+                <p className="text-[10px] text-gray-500 text-center">Apps run on the remote GPU · Opens in your browser</p>
+              </div>
+            );
+          })()}
+
           {/* My reservations as buyer */}
           {reservations.length > 0 && (
             <div className="space-y-3">
-              <h2 className="text-white font-semibold">My rentals</h2>
+              <h2 className="text-white font-semibold">My Active AI Workspaces</h2>
               {reservations.map(r => {
                 const isBuyer      = r.buyer_address === myAddr;
                 const isProvider   = r.provider_address === myAddr;
@@ -764,7 +1152,9 @@ export default function ComputePage() {
                       <div className="text-right shrink-0">
                         {isBuyer && r.status === 'active' && (
                           <div>
-                            <p className="text-white text-sm font-bold">{fmtDuration(minsLeft)} left</p>
+                            {r.started_at
+                              ? <p className="text-white text-sm font-bold">{fmtDuration(minsLeft)} left</p>
+                              : <p className="text-yellow-400 text-sm font-bold">Ready — not started</p>}
                             <p className="text-gray-400 text-xs">{fmt(r.escrow_remaining)} EGOC in escrow</p>
                           </div>
                         )}
@@ -772,6 +1162,12 @@ export default function ComputePage() {
                           <div>
                             <p className="text-yellow-400 text-sm font-bold">{fmt(r.period_rate_uegoc * r.periods_paid)} EGOC</p>
                             <p className="text-gray-400 text-xs">earned so far</p>
+                            {isProvider && r.status === 'active' && (
+                              <button onClick={() => setConfirmProvTerm(r.reservation_id)}
+                                className="mt-1 px-3 py-1 bg-gray-700 hover:bg-red-900/40 text-gray-400 hover:text-red-300 text-[10px] uppercase font-bold tracking-wider rounded-lg transition-all">
+                                Stop
+                              </button>
+                            )}
                           </div>
                         )}
                         {r.status !== 'active' && (
@@ -801,18 +1197,6 @@ export default function ComputePage() {
 
                     {r.status === 'active' && isBuyer && (
                       <div className="flex flex-col gap-2 w-full mt-3 pt-3 border-t border-gray-700">
-                        <div className="p-2.5 bg-purple-900/20 border border-purple-500/30 rounded-xl space-y-2">
-                          <div className="flex items-center justify-between">
-                            <span className="text-[10px] font-bold text-purple-300 uppercase tracking-widest">Instant Access</span>
-                            <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
-                          </div>
-                          <button onClick={() => { setShowConsole(r.reservation_id); setConsoleOut(''); setConsoleCmd(''); }}
-                            className="w-full py-2.5 bg-purple-600 hover:bg-purple-500 text-white text-sm rounded-lg font-bold shadow-xl transition-all active:scale-95 flex items-center justify-center gap-2">
-                            <span>🖥️</span> One-Click Web Console
-                          </button>
-                        </div>
-
-                        
                         {r.breach_count >= 1 ? (
                           <button onClick={() => setConfirmTermRes(r.reservation_id)}
                             disabled={busyRes === r.reservation_id}
@@ -849,9 +1233,15 @@ export default function ComputePage() {
       {/* ── CLUSTER tab ── */}
       {tab === 'cluster' && (
         <div className="space-y-4">
-          <div className="bg-blue-900/20 border border-blue-700/30 rounded-xl px-4 py-3 text-xs text-blue-300 space-y-1">
-            <p className="font-semibold text-sm">Distributed GPU Clusters</p>
-            <p>Rent GPUs from multiple independent providers and link them into one WireGuard mesh. Nodes join automatically. Use Ray for distributed ML training, or SSH into the head node directly.</p>
+          <div className="bg-gradient-to-br from-blue-900/30 to-purple-900/20 border border-blue-700/30 rounded-xl p-4 space-y-2">
+            <p className="text-white font-semibold text-sm">Enterprise AI Training Clusters</p>
+            <p className="text-gray-300 text-xs leading-relaxed">For companies and researchers who need scale. Book GPUs from multiple independent providers — they auto-join a WireGuard mesh. Run <strong className="text-white">PyTorch distributed training, DeepSpeed, or Ray</strong> across the entire cluster with a single head-node IP.</p>
+            <div className="flex gap-2 flex-wrap pt-1 text-[10px]">
+              <span className="bg-blue-900/40 text-blue-300 px-2 py-0.5 rounded-full border border-blue-700/30">🧬 Fine-tune LLaMA 70B</span>
+              <span className="bg-purple-900/40 text-purple-300 px-2 py-0.5 rounded-full border border-purple-700/30">🔥 PyTorch DDP</span>
+              <span className="bg-teal-900/40 text-teal-300 px-2 py-0.5 rounded-full border border-teal-700/30">⚡ DeepSpeed ZeRO</span>
+              <span className="bg-orange-900/40 text-orange-300 px-2 py-0.5 rounded-full border border-orange-700/30">🌐 Ray Distributed</span>
+            </div>
           </div>
 
           <div className="flex items-center justify-between">
@@ -862,19 +1252,23 @@ export default function ComputePage() {
             </button>
           </div>
 
-          {clusters.filter(c => c.buyer_address === myAddr).length === 0 ? (
-            <div className="bg-gray-800 rounded-xl border border-gray-600 p-8 text-center space-y-2">
-              <p className="text-4xl">🖥</p>
-              <p className="text-gray-300 font-medium">No clusters yet</p>
-              <p className="text-gray-500 text-sm">Combine GPUs from multiple providers into one machine — one VPN, one head IP, thousands of GPUs.</p>
-              <button onClick={() => setClusterOpen(true)}
-                className="mt-2 px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white text-sm rounded-lg">
-                Create my first cluster
-              </button>
-            </div>
-          ) : (
+          {(() => {
+            const myActive     = clusters.filter(c => c.buyer_address === myAddr && c.status !== 'terminated' && c.status !== 'auto_terminated');
+            const myTerminated = clusters.filter(c => c.buyer_address === myAddr && (c.status === 'terminated' || c.status === 'auto_terminated'));
+            if (myActive.length === 0 && myTerminated.length === 0) return (
+              <div className="bg-gray-800 rounded-xl border border-gray-600 p-8 text-center space-y-2">
+                <p className="text-4xl">🖥</p>
+                <p className="text-gray-300 font-medium">No clusters yet</p>
+                <p className="text-gray-500 text-sm">Combine GPUs from multiple providers into one machine — one VPN, one head IP, thousands of GPUs.</p>
+                <button onClick={() => setClusterOpen(true)}
+                  className="mt-2 px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white text-sm rounded-lg">
+                  Create my first cluster
+                </button>
+              </div>
+            );
+            return (
             <div className="space-y-4">
-              {clusters.filter(c => c.buyer_address === myAddr).map(c => {
+              {[...myActive, ...myTerminated].map(c => {
                 const activeNodes = c.nodes.filter(n => n.status === 'active').length;
                 const minsLeft    = Math.max(0, Math.round((c.expires_at - Date.now() / 1000) / 60));
                 const statusCls   = c.status === 'active' ? 'bg-green-900 text-green-300'
@@ -884,7 +1278,7 @@ export default function ComputePage() {
                                   : c.status === 'forming' || c.status === 'assembling' ? 'Assembling…'
                                   : c.status;
                 return (
-                  <div key={c.cluster_id} className="bg-gray-800 border border-gray-700 rounded-xl p-4 space-y-3">
+                  <div key={c.cluster_id} className={`border rounded-xl p-4 space-y-3 ${c.status === 'terminated' || c.status === 'auto_terminated' ? 'bg-gray-850 border-gray-700 opacity-70' : 'bg-gray-800 border-gray-700'}`}>
                     <div className="flex items-start justify-between gap-3">
                       <div className="space-y-1 flex-1 min-w-0">
                         <div className="flex items-center gap-2 flex-wrap">
@@ -930,17 +1324,20 @@ export default function ComputePage() {
                           </button>
                         </>
                       )}
-                      <button onClick={() => setConfirmTermCluster(c.cluster_id)}
-                        disabled={terminatingCluster === c.cluster_id}
-                        className="px-3 py-1.5 bg-gray-700 hover:bg-red-900 text-gray-400 hover:text-red-300 text-xs rounded-lg transition-colors disabled:opacity-50 ml-auto">
-                        {terminatingCluster === c.cluster_id ? 'Terminating…' : 'Terminate'}
-                      </button>
+                      {c.status !== 'terminated' && c.status !== 'auto_terminated' && (
+                        <button onClick={() => setConfirmTermCluster(c.cluster_id)}
+                          disabled={terminatingCluster === c.cluster_id}
+                          className="px-3 py-1.5 bg-gray-700 hover:bg-red-900 text-gray-400 hover:text-red-300 text-xs rounded-lg transition-colors disabled:opacity-50 ml-auto">
+                          {terminatingCluster === c.cluster_id ? 'Terminating…' : 'Terminate'}
+                        </button>
+                      )}
                     </div>
                   </div>
                 );
               })}
             </div>
-          )}
+            );
+          })()}
         </div>
       )}
 
@@ -1208,6 +1605,37 @@ export default function ComputePage() {
         </div>
       )}
 
+      {/* ── Provider Terminate confirmation modal ── */}
+      {confirmProvTerm && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
+          <div className="bg-gray-800 rounded-xl border border-red-800/50 p-6 w-full max-w-sm space-y-4 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-full bg-red-900/40 flex items-center justify-center shrink-0">
+                <svg className="w-5 h-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                </svg>
+              </div>
+              <div>
+                <h3 className="text-white font-semibold">Stop this rental?</h3>
+                <p className="text-gray-400 text-sm mt-1">
+                  You will stop earning rewards. Remaining escrow will be refunded to the buyer. Your security deposit will be returned.
+                </p>
+              </div>
+            </div>
+            <div className="flex gap-3 pt-1">
+              <button onClick={executeProviderTerminate}
+                className="flex-1 py-2.5 bg-red-700 hover:bg-red-600 text-white rounded-lg text-sm font-medium transition-colors">
+                Stop Rental
+              </button>
+              <button onClick={() => setConfirmProvTerm(null)}
+                className="flex-1 py-2.5 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm transition-colors">
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Terminate Reservation confirmation modal ── */}
       {confirmTermRes && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
@@ -1324,125 +1752,327 @@ export default function ComputePage() {
         </div>
       )}
 
-      {/* ── Remote Console Modal ── */}
+      {/* ── AI Workspace Modal ── */}
       {showConsole && (
         <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4 backdrop-blur-md">
-          <div className="bg-gray-900 rounded-2xl border border-purple-500/30 w-full max-w-2xl flex flex-col h-[80vh] shadow-2xl">
+          <div className="bg-gray-900 rounded-2xl border border-purple-500/30 w-full max-w-3xl flex flex-col h-[88vh] shadow-2xl">
             {/* Header */}
             <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800">
-              <div className="flex items-center gap-2">
-                <span className="text-xl">🖥️</span>
-                <h3 className="font-bold text-white uppercase tracking-tighter">Remote Control Center</h3>
-                <span className="text-[9px] bg-green-900/50 text-green-300 px-2 py-0.5 rounded border border-green-700/50 uppercase font-bold tracking-widest animate-pulse">Encrypted Link Active</span>
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-purple-600 to-blue-600 flex items-center justify-center shrink-0">
+                  <svg className="w-5 h-5 text-white animate-spin" style={{ animationDuration: '6s' }} viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 2C12 7.5 7.5 12 2 12C7.5 12 12 16.5 12 22C12 16.5 16.5 12 22 12C16.5 12 12 7.5 12 2Z"/>
+                  </svg>
+                </div>
+                <div>
+                  <h3 className="font-bold text-white text-base leading-none">AI Workspace</h3>
+                  <p className="text-gray-500 text-[10px] mt-0.5">Apps open in your browser · Compute runs on remote GPU</p>
+                </div>
+                <span className="text-[9px] bg-green-900/50 text-green-300 px-2 py-0.5 rounded border border-green-700/50 uppercase font-bold tracking-widest animate-pulse">Connected</span>
+                {usageStats && (
+                  usageStats.sandboxed
+                    ? <span className="text-[9px] bg-cyan-900/50 text-cyan-300 px-2 py-0.5 rounded border border-cyan-700/50 uppercase font-bold tracking-widest">🔒 Isolated</span>
+                    : <span className="text-[9px] bg-orange-900/50 text-orange-300 px-2 py-0.5 rounded border border-orange-700/50 uppercase font-bold tracking-widest">⚠ Shared Host</span>
+                )}
               </div>
-              <div className="flex items-center gap-4">
-                <button onClick={refreshConnection} className="text-[10px] text-gray-500 hover:text-cyan-400 uppercase font-bold tracking-widest transition-colors">🔄 Refresh Link</button>
-                <button onClick={() => setShowConsole(null)} className="text-gray-500 hover:text-white text-xl">✕</button>
+              <div className="flex items-center gap-3">
+                <button onClick={refreshConnection} className="text-[10px] text-gray-500 hover:text-cyan-400 uppercase font-bold tracking-widest transition-colors">↺ Reconnect</button>
+                <button onClick={() => setShowConsole(null)} className="text-gray-500 hover:text-white text-xl leading-none">✕</button>
               </div>
             </div>
 
-            {/* Live Stats Dashboard */}
+            {/* Live Stats Dashboard — totals across ALL active rentals */}
             {(() => {
-              const res = reservations.find(r => r.reservation_id === showConsole);
-              if (!res) return null;
+              const activeRentals = reservations.filter(r => r.buyer_address === myAddr && r.status === 'active');
+              if (activeRentals.length === 0) return null;
+              const totalCores = activeRentals.reduce((s, r) => s + r.cpu_cores, 0);
+              const totalRam   = activeRentals.reduce((s, r) => s + r.ram_gb, 0);
+              const totalGpu   = activeRentals.reduce((s, r) => s + r.gpu_count, 0);
+              const nodeLabel  = activeRentals.length > 1 ? `Node ${activeRentals.findIndex(r => r.reservation_id === showConsole) + 1} load` : (usageStats?.sandboxed ? 'Your usage' : 'Host load');
               return (
                 <div className="bg-gray-850 px-6 py-3 border-b border-gray-800 grid grid-cols-3 gap-4 shrink-0">
                   <div className="space-y-1">
                     <div className="flex justify-between text-[10px] uppercase font-bold tracking-tight">
-                      <span className="text-gray-500">Rented CPU</span>
-                      <span className="text-blue-400">{res.cpu_cores} Cores</span>
+                      <span className="text-gray-500">Total CPU</span>
+                      <span className="text-blue-400">{totalCores} Cores{activeRentals.length > 1 ? ` · ${activeRentals.length} nodes` : ''}</span>
                     </div>
                     <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
                       <div className="h-full bg-blue-500 transition-all duration-1000" style={{ width: `${usageStats?.cpu ?? 0}%` }} />
                     </div>
-                    <div className="text-[9px] text-gray-600">Current Load: {usageStats?.cpu ?? 0}%</div>
+                    <div className="text-[9px] text-gray-600">{nodeLabel}: {usageStats?.cpu ?? 0}%</div>
                   </div>
 
                   <div className="space-y-1">
                     <div className="flex justify-between text-[10px] uppercase font-bold tracking-tight">
-                      <span className="text-gray-500">Rented RAM</span>
-                      <span className="text-purple-400">{res.ram_gb} GB</span>
+                      <span className="text-gray-500">Total RAM</span>
+                      <span className="text-purple-400">{totalRam} GB</span>
                     </div>
                     <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
-                      <div className="h-full bg-purple-500 transition-all duration-1000" 
-                           style={{ width: `${Math.min(100, ((usageStats?.ram_used_gb ?? 0) / res.ram_gb) * 100)}%` }} />
+                      <div className="h-full bg-purple-500 transition-all duration-1000"
+                           style={{ width: `${Math.min(100, ((usageStats?.ram_used_gb ?? 0) / totalRam) * 100)}%` }} />
                     </div>
-                    <div className="text-[9px] text-gray-600">Using: {usageStats?.ram_used_gb.toFixed(1) ?? 0} GB</div>
+                    <div className="text-[9px] text-gray-600">{nodeLabel}: {usageStats?.ram_used_gb?.toFixed(1) ?? 0} GB</div>
                   </div>
 
                   <div className="space-y-1">
                     <div className="flex justify-between text-[10px] uppercase font-bold tracking-tight">
-                      <span className="text-gray-500">Rented GPU</span>
-                      <span className="text-green-400">{res.gpu_count > 0 ? 'Active' : 'None'}</span>
+                      <span className="text-gray-500">Total GPU</span>
+                      <span className="text-green-400">{totalGpu > 0 ? `${totalGpu} active` : 'None'}</span>
                     </div>
                     <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
-                      <div className={`h-full transition-all duration-1000 ${res.gpu_count > 0 ? 'bg-green-500' : 'bg-gray-700'}`} 
-                           style={{ width: `${res.gpu_count > 0 ? (usageStats?.gpu ?? 0) : 0}%` }} />
+                      <div className={`h-full transition-all duration-1000 ${totalGpu > 0 ? 'bg-green-500' : 'bg-gray-700'}`}
+                           style={{ width: `${totalGpu > 0 ? (usageStats?.gpu ?? 0) : 0}%` }} />
                     </div>
                     <div className="text-[9px] text-gray-600">
-                      {res.gpu_count > 0 ? `Processing Load: ${usageStats?.gpu ?? 0}%` : 'No GPU in this rental'}
+                      {totalGpu > 0 ? `${nodeLabel}: ${usageStats?.gpu ?? 0}%` : 'No GPU in any rental'}
                     </div>
                   </div>
                 </div>
               );
             })()}
 
-            {/* Quick Actions Bar for Non-Technical Users */}
-            <div className="px-4 py-3 bg-gray-900/50 flex flex-col gap-3 border-b border-gray-800 shrink-0">
-              <div className="text-[10px] text-gray-500 font-bold uppercase tracking-widest px-1">One-Click Use Cases</div>
-              <div className="flex gap-2 overflow-x-auto no-scrollbar pb-1">
-              {[
-                { label: "🔍 Confirm My Specs", cmd: "python3 -c \"import platform, psutil; print(f'CPU: {platform.processor()}'); print(f'RAM: {psutil.virtual_memory().total / (1024**3):.1f} GB')\" 2>/dev/null || echo 'Diagnostic tools missing on node.'" },
-                { label: "🧠 AI Speed Test", cmd: "python3 -c \"import torch; print('Benchmarking Rented GPU...'); x = torch.randn(5000, 5000, device='cuda'); torch.matmul(x, x); print('✅ SUCCESS: Calculated 25 Million data points in 0.02s!')\" 2>/dev/null || python -c \"import torch; x = torch.randn(2000, 2000); torch.matmul(x, x); print('✅ SUCCESS: Calculated 4 Million data points on CPU!')\"" },
-                { label: "🚀 Deploy AI Workspace", cmd: "echo \"print('--- Initializing AI Environment ---'); print('✅ Workspace Ready on Rented Hardware.')\" > setup.py; python3 setup.py 2>/dev/null || python setup.py" },
-                { label: "📂 Browse Workspace", cmd: "ls -lh; pwd" },
-                { label: "🧹 Clear All Projects", cmd: "rm *.py; echo 'Remote workspace cleared.'" },
-              ].map(q => (
-                <button key={q.label} onClick={() => executeRemoteCommand(q.cmd, q.label)}
-                  className="whitespace-nowrap px-4 py-2 bg-purple-600/10 hover:bg-purple-600 text-purple-400 hover:text-white text-[11px] rounded-xl border border-purple-500/30 transition-all font-bold shadow-sm active:scale-95">
-                  {q.label}
-                </button>
-              ))}
-              </div>
-            </div>
-            
-            <div className="bg-blue-950/40 border-b border-blue-500/20 px-6 py-4 space-y-3 shrink-0">
-              <div className="flex items-center gap-2">
-                <span className="text-lg">💡</span>
-                <div className="text-xs font-bold text-blue-300 uppercase tracking-tight">How to use your Rented Power</div>
-              </div>
-              <div className="grid grid-cols-3 gap-4 text-[10px] text-blue-200/70 leading-relaxed">
-                <div className="space-y-1"><span className="text-blue-400 font-bold">1. Why use this?</span> To run apps that need more RAM or a better GPU than your own computer.</div>
-                <div className="space-y-1"><span className="text-blue-400 font-bold">2. The Concept</span> You aren't "adding" RAM to your Windows; you are <strong>moving the work</strong> to this powerful machine.</div>
-                <div className="space-y-1"><span className="text-blue-400 font-bold">3. Getting Started</span> Try clicking <span className="text-white">"Run a Demo App"</span> above to see how a program runs on this hardware.</div>
-              </div>
-            </div>
-            
-            <div className="bg-blue-900/20 border-b border-blue-500/20 px-6 py-2 text-[10px] text-blue-300">
-              💡 <strong>Renter Tip:</strong> To use the rented RAM (e.g. 2GB + 8GB), run your application 
-              <strong> inside this console</strong>. Your local computer acts as the controller while the rented hardware handles the heavy lifting.
-            </div>
-            
-            <div className="flex-1 bg-black/40 p-4 font-mono text-xs overflow-y-auto text-green-400 space-y-1">
-              <div className="text-gray-500 mb-4"># Connected to remote Ego node via HTTP-RPC Exec. Type commands below.</div>
-              <pre className="whitespace-pre-wrap">{consoleOut}</pre>
-              {consoleBusy && <div className="animate-pulse text-blue-400">Processing command…</div>}
-            </div>
+            {/* Rental switcher — only shown when 2+ active rentals */}
+            {(() => {
+              const activeRentals = reservations.filter(r => r.buyer_address === myAddr && r.status === 'active');
+              if (activeRentals.length < 2) return null;
+              return (
+                <div className="flex items-center gap-1 px-4 py-2 border-b border-gray-800 overflow-x-auto shrink-0 bg-gray-900/60">
+                  {activeRentals.map((r, i) => (
+                    <button key={r.reservation_id}
+                      onClick={async () => {
+                        await invoke('start_rental', { reservationId: r.reservation_id }).catch(() => {});
+                        setShowConsole(r.reservation_id);
+                        setConsoleOut(''); setConsoleCmd(''); setGpuAppUrl(null); setAppPollSecs(null);
+                      }}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition-colors shrink-0 ${showConsole === r.reservation_id ? 'bg-purple-700 text-white' : 'bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700'}`}>
+                      <span className="w-1.5 h-1.5 rounded-full bg-green-400 shrink-0" />
+                      GPU {i + 1} · {r.cpu_cores}c/{r.ram_gb}GB{r.gpu_count > 0 ? ` · ${r.gpu_count}×GPU` : ''}
+                    </button>
+                  ))}
+                </div>
+              );
+            })()}
 
-            <div className="p-4 bg-gray-900 border-t border-gray-800 flex gap-2">
-              <input 
-                value={consoleCmd}
-                onChange={e => setConsoleCmd(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && executeRemoteCommand()}
-                placeholder="Type command (e.g. ls, nvidia-smi, hostname)..."
-                className="flex-1 bg-black border border-gray-700 rounded-lg px-4 py-2.5 text-sm font-mono text-white outline-none focus:border-purple-500 transition-colors"
-                autoFocus
-              />
-              <button 
-                onClick={() => executeRemoteCommand()}
-                disabled={consoleBusy || !consoleCmd.trim()}
-                className="bg-purple-600 hover:bg-purple-500 text-white px-6 rounded-lg font-bold text-sm disabled:opacity-40 transition-colors">Run</button>
+            {/* Metrics error banner — surfaces the underlying P2P/auth failure
+                instead of leaving the panel frozen at 0%. */}
+            {usageError && (
+              <div className="bg-red-900/30 border-b border-red-800/60 px-6 py-2 text-[10px] text-red-300 font-mono shrink-0">
+                ⚠ Live metrics unreachable: {usageError}
+              </div>
+            )}
+
+            {/* Scrollable body */}
+            <div className="flex-1 overflow-y-auto">
+
+              {/* AI Task Launcher — 2×2 grid */}
+              {(() => {
+                const consoleRes = reservations.find(r => r.reservation_id === showConsole);
+                const hasGpu = (consoleRes?.gpu_count ?? 0) > 0;
+                return (
+                  <div className="p-4 space-y-3">
+                    <div className="text-[10px] text-gray-500 font-bold uppercase tracking-widest">Launch an AI App</div>
+                    <div className="grid grid-cols-2 gap-3">
+
+                      {/* LLM Chat */}
+                      <div className="bg-gray-800 border border-gray-700 rounded-xl p-4 space-y-2.5 hover:border-emerald-700/50 transition-colors">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <span className="text-2xl">💬</span>
+                            <div>
+                              <div className="text-white font-bold text-sm">LLM Chat</div>
+                              <div className="text-gray-500 text-[10px]">TinyLlama 1.1B · ~640 MB</div>
+                            </div>
+                          </div>
+                          {!hasGpu && <span className="text-[9px] bg-yellow-900/30 text-yellow-500 px-1.5 py-0.5 rounded border border-yellow-700/30 shrink-0">CPU ok</span>}
+                        </div>
+                        <p className="text-gray-500 text-[10px]">Chat with a local LLM. Runs on the remote GPU, opens in your browser.</p>
+                        {gpuAppUrl?.app === 'llm'
+                          ? <div className="space-y-1.5">
+                              <button onClick={() => checkAndOpenApp('llm')} disabled={appBusy === 'llm_check'}
+                                className="w-full py-2 text-xs bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg font-bold disabled:opacity-50">
+                                {appBusy === 'llm_check' ? 'Checking…' : 'Open in browser ↗'}
+                              </button>
+                              {appPollSecs !== null && <p className="text-[10px] text-emerald-600 text-center">Auto-checking in {appPollSecs}s…</p>}
+                              <button onClick={() => invoke<string>('run_remote_command', { reservationId: showConsole, command: "Get-Content 'C:\\ego_ws\\llm.log' -EA SilentlyContinue -Tail 20; Write-Output '---'; Get-Content 'C:\\ego_ws\\llm.err' -EA SilentlyContinue -Tail 20" }).then(r => setConsoleOut(p => p + `\n--- LOG ---\n${r}\n`)).catch(e => setConsoleOut(p => p + `\n[log fetch failed] ${e}\n`))} className="w-full py-1.5 text-[10px] bg-gray-700 hover:bg-gray-600 text-gray-400 hover:text-white rounded font-mono">
+                                View logs
+                              </button>
+                            </div>
+                          : <button onClick={() => openWebApp('llm', 'LLM Chat')} disabled={!!appBusy}
+                              className="w-full py-2 text-xs bg-emerald-600/20 hover:bg-emerald-600 text-emerald-300 hover:text-white rounded-lg border border-emerald-700/30 font-bold disabled:opacity-40">
+                              {appBusy === 'llm' ? 'Installing & launching…' : 'Launch Chat →'}
+                            </button>}
+                      </div>
+
+                      {/* Image Generator */}
+                      <div className="bg-gray-800 border border-gray-700 rounded-xl p-4 space-y-2.5 hover:border-pink-700/50 transition-colors">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <span className="text-2xl">🎨</span>
+                            <div>
+                              <div className="text-white font-bold text-sm">Image Generator</div>
+                              <div className="text-gray-500 text-[10px]">Stable Diffusion · ~2 GB</div>
+                            </div>
+                          </div>
+                          {!hasGpu && <span className="text-[9px] bg-orange-900/30 text-orange-400 px-1.5 py-0.5 rounded border border-orange-700/30 shrink-0">GPU rec.</span>}
+                        </div>
+                        <p className="text-gray-500 text-[10px]">Generate images from text prompts. Opens as a web UI in your browser.</p>
+                        {gpuAppUrl?.app === 'sdxl'
+                          ? <div className="space-y-1.5">
+                              <button onClick={() => checkAndOpenApp('sdxl')} disabled={appBusy === 'sdxl_check'}
+                                className="w-full py-2 text-xs bg-pink-600 hover:bg-pink-500 text-white rounded-lg font-bold disabled:opacity-50">
+                                {appBusy === 'sdxl_check' ? 'Checking…' : 'Open in browser ↗'}
+                              </button>
+                              {appPollSecs !== null && <p className="text-[10px] text-pink-600 text-center">Auto-checking in {appPollSecs}s… (~10 min first run)</p>}
+                            </div>
+                          : <button onClick={() => openWebApp('sdxl', 'Image Generator')} disabled={!!appBusy}
+                              className="w-full py-2 text-xs bg-pink-600/20 hover:bg-pink-600 text-pink-300 hover:text-white rounded-lg border border-pink-700/30 font-bold disabled:opacity-40">
+                              {appBusy === 'sdxl' ? 'Installing & launching…' : 'Launch Generator →'}
+                            </button>}
+                      </div>
+
+                      {/* Jupyter */}
+                      <div className="bg-gray-800 border border-gray-700 rounded-xl p-4 space-y-2.5 hover:border-cyan-700/50 transition-colors">
+                        <div className="flex items-center gap-2">
+                          <span className="text-2xl">🔬</span>
+                          <div>
+                            <div className="text-white font-bold text-sm">Jupyter Lab</div>
+                            <div className="text-gray-500 text-[10px]">Python notebooks · full environment</div>
+                          </div>
+                        </div>
+                        <p className="text-gray-500 text-[10px]">Write and run Python. Train models, process data, run scripts — all on the remote GPU.</p>
+                        {gpuAppUrl?.app === 'jupyter'
+                          ? <div className="space-y-1.5">
+                              <button onClick={() => checkAndOpenApp('jupyter')} disabled={appBusy === 'jupyter_check'}
+                                className="w-full py-2 text-xs bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg font-bold disabled:opacity-50">
+                                {appBusy === 'jupyter_check' ? 'Checking…' : 'Open in browser ↗'}
+                              </button>
+                              {appPollSecs !== null && <p className="text-[10px] text-cyan-600 text-center">Auto-checking in {appPollSecs}s…</p>}
+                            </div>
+                          : <button onClick={() => openWebApp('jupyter', 'Jupyter')} disabled={!!appBusy}
+                              className="w-full py-2 text-xs bg-cyan-600/20 hover:bg-cyan-600 text-cyan-300 hover:text-white rounded-lg border border-cyan-700/30 font-bold disabled:opacity-40">
+                              {appBusy === 'jupyter' ? 'Installing & launching…' : 'Launch Jupyter →'}
+                            </button>}
+                      </div>
+
+                      {/* Audio Transcription */}
+                      <div className="bg-gray-800 border border-gray-700 rounded-xl p-4 space-y-2.5 hover:border-orange-700/50 transition-colors">
+                        <div className="flex items-center gap-2">
+                          <span className="text-2xl">🎤</span>
+                          <div>
+                            <div className="text-white font-bold text-sm">Transcribe Audio</div>
+                            <div className="text-gray-500 text-[10px]">Whisper · .mp3 .wav .m4a · CPU ok</div>
+                          </div>
+                        </div>
+                        <p className="text-gray-500 text-[10px]">Pick an audio file from your computer — it gets sent to the remote GPU and transcribed with Whisper.</p>
+                        <div className="flex items-center gap-2">
+                          <button onClick={pickAudioFile} disabled={fileBusy}
+                            className="flex-1 py-1.5 text-[11px] bg-gray-700 hover:bg-gray-600 text-gray-200 hover:text-white rounded-lg font-bold disabled:opacity-40">
+                            {fileBusy ? 'Uploading…' : '📂 Add audio file'}
+                          </button>
+                          {appAudioFile && (
+                            <span className="text-[10px] text-gray-400 truncate max-w-[120px]">{appAudioFile}</span>
+                          )}
+                        </div>
+                        {rentalFiles.filter(f => /\.(mp3|wav|m4a|ogg|flac|webm)$/i.test(f.name)).length > 0 && (
+                          <select value={appAudioFile} onChange={e => setAppAudioFile(e.target.value)}
+                            className="w-full bg-black border border-gray-700 rounded-lg px-2 py-1.5 text-[11px] text-white outline-none">
+                            <option value="">Or choose from workspace…</option>
+                            {rentalFiles.filter(f => /\.(mp3|wav|m4a|ogg|flac|webm)$/i.test(f.name)).map(f => (
+                              <option key={f.name} value={f.name}>{f.name}</option>
+                            ))}
+                          </select>
+                        )}
+                        <button onClick={transcribeAudio} disabled={!appAudioFile || appBusy === 'transcribe'}
+                          className="w-full py-2 text-xs bg-orange-600/20 hover:bg-orange-600 text-orange-300 hover:text-white rounded-lg border border-orange-700/30 font-bold disabled:opacity-40">
+                          {appBusy === 'transcribe' ? 'Transcribing…' : 'Transcribe → save .txt'}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Files section */}
+              <div className="px-4 pb-3 space-y-2">
+                <div className="flex items-center justify-between">
+                  <div className="text-[10px] text-gray-500 font-bold uppercase tracking-widest">Your Files</div>
+                  <div className="flex gap-2">
+                    <button onClick={refreshFiles} disabled={fileBusy}
+                      className="text-[10px] text-gray-500 hover:text-cyan-400 font-bold transition-colors disabled:opacity-40">↺ Refresh</button>
+                    <button onClick={openLocalFileToWorkspace} disabled={fileBusy}
+                      className="px-3 py-1 bg-purple-600/20 hover:bg-purple-600 text-purple-300 hover:text-white text-[11px] rounded-lg border border-purple-500/30 font-bold disabled:opacity-40">
+                      {fileBusy ? 'Uploading…' : '📂 Add File'}
+                    </button>
+                    <button onClick={uploadFolder} disabled={fileBusy}
+                      className="px-3 py-1 bg-gray-700 hover:bg-gray-600 text-gray-300 hover:text-white text-[11px] rounded-lg font-bold disabled:opacity-40">
+                      {fileBusy ? '…' : '📁 Add Folder'}
+                    </button>
+                  </div>
+                </div>
+                <p className="text-[10px] text-gray-600">Files live on the remote machine. Add a file or folder from your computer — audio and images are auto-detected.</p>
+                <div className="rounded-xl border border-gray-800 divide-y divide-gray-800 overflow-hidden">
+                  {rentalFiles.length === 0 ? (
+                    <div className="text-[11px] text-gray-600 px-4 py-4 text-center">No files yet — click "Open from your computer" to upload one</div>
+                  ) : rentalFiles.map(f => (
+                    <div key={f.name} className="flex items-center justify-between px-4 py-2 text-[11px] hover:bg-gray-800/50">
+                      <span className="text-gray-300 truncate mr-2">{f.name} <span className="text-gray-600">· {fmtBytes(f.size)}</span></span>
+                      <div className="flex gap-3 shrink-0">
+                        {isImage(f.name) && (
+                          <button onClick={() => previewFile(f.name)} className="text-purple-400 hover:text-white font-bold">Preview</button>
+                        )}
+                        <button onClick={() => downloadFile(f.name)} className="text-cyan-400 hover:text-white font-bold">Download</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Developer Terminal — collapsed by default */}
+              <div className="border-t border-gray-800">
+                <button onClick={() => setTerminalOpen(v => !v)}
+                  className="w-full px-4 py-2.5 flex items-center justify-between text-gray-500 hover:text-gray-300 hover:bg-gray-800/30 transition-colors">
+                  <span className="text-[10px] font-bold uppercase tracking-widest">Developer Terminal</span>
+                  <span className="text-xs">{terminalOpen ? '▲ Hide' : '▼ Show'}</span>
+                </button>
+                {terminalOpen && (
+                  <>
+                    <div className="h-48 bg-black/60 px-4 py-3 font-mono text-xs overflow-y-auto text-green-400">
+                      <div className="text-gray-600 mb-2"># Dilithium-signed P2P shell · {usageStats?.os ?? 'linux'}</div>
+                      <pre className="whitespace-pre-wrap">{consoleOut}</pre>
+                      {consoleBusy && <div className="animate-pulse text-blue-400">Running…</div>}
+                    </div>
+                    <div className="p-3 bg-gray-900 border-t border-gray-800 flex gap-2">
+                      <input
+                        value={consoleCmd}
+                        onChange={e => setConsoleCmd(e.target.value)}
+                        onKeyDown={e => e.key === 'Enter' && executeRemoteCommand()}
+                        placeholder="nvidia-smi, ls, python3 script.py…"
+                        className="flex-1 bg-black border border-gray-700 rounded-lg px-3 py-2 text-sm font-mono text-white outline-none focus:border-purple-500 transition-colors"
+                        autoFocus={terminalOpen}
+                      />
+                      <button onClick={() => executeRemoteCommand()} disabled={consoleBusy || !consoleCmd.trim()}
+                        className="bg-purple-600 hover:bg-purple-500 text-white px-5 rounded-lg font-bold text-sm disabled:opacity-40">Run</button>
+                    </div>
+                  </>
+                )}
+              </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Image preview modal ── */}
+      {filePreview && (
+        <div className="fixed inset-0 bg-black/85 flex items-center justify-center z-[60] p-6 backdrop-blur-sm" onClick={() => setFilePreview(null)}>
+          <div className="bg-gray-900 rounded-2xl border border-gray-700 p-4 max-w-3xl max-h-[90vh] flex flex-col" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-3">
+              <span className="text-white text-sm font-bold truncate">{filePreview.name}</span>
+              <div className="flex items-center gap-3">
+                <button onClick={() => downloadFile(filePreview.name)} className="text-cyan-400 hover:text-white text-xs font-bold">Download</button>
+                <button onClick={() => setFilePreview(null)} className="text-gray-500 hover:text-white text-xl">✕</button>
+              </div>
+            </div>
+            <img src={filePreview.url} alt={filePreview.name} className="max-w-full max-h-[75vh] object-contain rounded-lg" />
           </div>
         </div>
       )}
@@ -1600,7 +2230,10 @@ export default function ComputePage() {
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
           <div className="bg-gray-800 rounded-xl border border-gray-700 p-6 w-full max-w-lg space-y-4">
             <h3 className="text-white font-semibold">WireGuard Configuration</h3>
-            <p className="text-gray-400 text-xs">Save as <code className="text-white bg-gray-700 px-1 rounded">wg0.conf</code> then run <code className="text-white bg-gray-700 px-1 rounded">wg-quick up wg0</code> to join the cluster VPN.</p>
+            <p className="text-gray-400 text-xs">
+              Download the config below, then on <strong className="text-white">Windows</strong>: open WireGuard → <em>Import tunnel(s) from file…</em> → select <code className="text-white bg-gray-700 px-1 rounded">wg0.conf</code> → Activate.{' '}
+              On <strong className="text-white">Linux/macOS</strong>: <code className="text-white bg-gray-700 px-1 rounded">wg-quick up wg0</code>.
+            </p>
             <pre className="bg-gray-900 rounded-lg p-3 text-green-400 text-xs overflow-x-auto max-h-64 overflow-y-auto whitespace-pre">{wgConfigText}</pre>
             <div className="flex gap-3">
               <button onClick={() => {

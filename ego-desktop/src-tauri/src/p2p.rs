@@ -1904,6 +1904,11 @@ pub struct ComputeExecRequest {
     /// match `reservation.buyer_address`.
     #[serde(default)]
     pub reservation:          Option<crate::chain_db::ComputeReservation>,
+    /// Base64 file content for `kind = "PUT"` (renter → sandbox upload). The
+    /// signed `command` carries the destination filename; transport is already
+    /// noise-encrypted and peer-authenticated, so the blob rides unsigned.
+    #[serde(default)]
+    pub payload:              Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2026,6 +2031,10 @@ struct EgoBehaviour {
     ping:             ping::Behaviour,
     gossipsub:        gossipsub::Behaviour,
     kad:              kad::Behaviour<kad::store::MemoryStore>,
+    /// Raw byte-stream channel used by the in-browser app tunnel
+    /// (`/ego/tunnel/1`) — relays a renter's local TCP connection to a web app
+    /// running inside the rental's Docker sandbox.
+    stream:           libp2p_stream::Behaviour,
 }
 
 // ── Swarm command channel ─────────────────────────────────────────────────────
@@ -2048,9 +2057,41 @@ pub enum SwarmCmd {
         req:       ComputeExecRequest,
         reply:     oneshot::Sender<Result<ComputeExecResponse, String>>,
     },
+    /// Ensure a connection to the peer in `peer_addr` exists (dialling if
+    /// needed), then reply with its PeerId. Used before opening a tunnel stream.
+    Dial {
+        peer_addr: Multiaddr,
+        reply:     oneshot::Sender<Result<PeerId, String>>,
+    },
 }
 
 static SWARM_TX: OnceLock<mpsc::Sender<SwarmCmd>> = OnceLock::new();
+
+// ── In-browser app tunnel ───────────────────────────────────────────────────
+//
+// A raw bidirectional byte stream that relays a renter's local TCP connection
+// (their browser) to a web app (Jupyter, Gradio, …) running inside the rental's
+// Docker sandbox. It rides the existing libp2p connection, so it inherits NAT
+// traversal. The first frame on every stream is a length-prefixed signed
+// handshake; the provider authenticates it exactly like a compute-exec request
+// before connecting to the container's published host port.
+
+const TUNNEL_PROTOCOL: StreamProtocol = StreamProtocol::new("/ego/tunnel/1");
+
+/// Clonable handle to open outbound `/ego/tunnel/1` streams. Set once the swarm
+/// is built; cloned per connection (cheap) so opens don't serialise.
+static TUNNEL_CONTROL: OnceLock<libp2p_stream::Control> = OnceLock::new();
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelHandshake {
+    pub reservation_id:       String,
+    pub container_port:       u16,
+    pub timestamp:            i64,
+    pub dilithium_public_key: String,
+    pub dilithium_signature:  String,
+    #[serde(default)]
+    pub reservation:          Option<crate::chain_db::ComputeReservation>,
+}
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -2181,36 +2222,192 @@ async fn serve_compute_exec(req: ComputeExecRequest) -> ComputeExecResponse {
 
     match req.kind.as_str() {
         "METRICS" => {
-            use sysinfo::{System, CpuRefreshKind};
-            let mut sys = System::new();
-            sys.refresh_cpu_specifics(CpuRefreshKind::new().with_cpu_usage());
-            sys.refresh_memory();
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            sys.refresh_cpu();
-            let cpu = sys.global_cpu_info().cpu_usage();
-            let ram_used_gb = sys.used_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
-            let gpu = std::process::Command::new("nvidia-smi")
-                .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i32>().ok())
-                .unwrap_or(0);
+            // Prefer real per-rental stats from the Docker sandbox. These reflect
+            // only the renter's own workload, capped to what they paid for.
+            let res_probe = reservation.clone();
+            let sandboxed = tokio::task::spawn_blocking(move || crate::sandbox::metrics(&res_probe))
+                .await.ok().flatten();
+
+            let (cpu, ram_used_gb, gpu, os, is_sandbox): (f32, f64, i32, &str, bool) =
+                if let Some((c, r, g)) = sandboxed {
+                    (c, r, g, "linux", true)
+                } else {
+                    // Fallback: no sandbox runtime — report the host machine, honestly.
+                    use sysinfo::{System, CpuRefreshKind};
+                    let mut sys = System::new();
+                    sys.refresh_cpu_specifics(CpuRefreshKind::new().with_cpu_usage());
+                    sys.refresh_memory();
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    sys.refresh_cpu();
+                    let cpu = sys.global_cpu_info().cpu_usage();
+                    let ram_used_gb = (sys.used_memory() as f64 / 1_073_741_824.0)
+                        .min(reservation.ram_gb as f64);
+                    let gpu = std::process::Command::new("nvidia-smi")
+                        .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
+                        .output()
+                        .ok()
+                        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i32>().ok())
+                        .unwrap_or(0);
+                    let host_os = if cfg!(target_os = "windows") { "windows" }
+                                  else if cfg!(target_os = "macos") { "macos" }
+                                  else { "linux" };
+                    (cpu, ram_used_gb, gpu, host_os, false)
+                };
             let body = serde_json::json!({
                 "cpu": cpu, "ram_used_gb": ram_used_gb, "gpu": gpu,
+                "os": os, "sandboxed": is_sandbox,
             }).to_string();
             ComputeExecResponse { ok: true, status: 200, body }
         }
-        _ => {
-            let output = if cfg!(target_os = "windows") {
-                tokio::process::Command::new("powershell")
-                    .args(["-NoProfile", "-Command", &req.command])
-                    .output().await
+        "SPECS" => {
+            use sysinfo::System;
+            let mut sys = System::new_all();
+            sys.refresh_all();
+            let cpu_model = sys.cpus().first()
+                .map(|c| c.brand().trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Unknown CPU".into());
+            let cores     = sys.cpus().len();
+            let total_ram = sys.total_memory() as f64 / 1_073_741_824.0;
+            let used_ram  = sys.used_memory()  as f64 / 1_073_741_824.0;
+            let os = if cfg!(target_os = "windows") { "Windows" }
+                     else if cfg!(target_os = "macos") { "macOS" }
+                     else { "Linux" };
+            let gpu = std::process::Command::new("nvidia-smi")
+                .args(["--query-gpu=name,memory.total", "--format=csv,noheader"])
+                .output().ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim()
+                    .lines().map(|l| l.trim()).collect::<Vec<_>>().join(", "))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "No CUDA GPU detected".into());
+            let isolation = if tokio::task::spawn_blocking(crate::sandbox::docker_available).await.unwrap_or(false) {
+                format!("Docker sandbox — your commands run isolated, capped to {} core(s) / {} GB RAM{}",
+                    reservation.cpu_cores, reservation.ram_gb,
+                    if reservation.gpu_count > 0 { format!(" / {} GPU", reservation.gpu_count) } else { String::new() })
             } else {
-                tokio::process::Command::new("sh")
-                    .args(["-c", &req.command])
-                    .output().await
+                "none — provider has no Docker runtime; commands share the host (no resource cap)".to_string()
             };
-            match output {
+            let body = format!(
+                "Remote host hardware (the provider machine you rented)\n\
+                 ----------------------------------------------\n\
+                 OS:        {os}\n\
+                 CPU:       {cpu_model}\n\
+                 Cores:     {cores} physical/logical  (you rented {})\n\
+                 RAM:       {used_ram:.1} GB in use / {total_ram:.1} GB total  (you rented {} GB)\n\
+                 GPU:       {gpu}\n\
+                 Isolation: {isolation}",
+                reservation.cpu_cores, reservation.ram_gb,
+            );
+            ComputeExecResponse { ok: true, status: 200, body }
+        }
+        "PUT" | "APPEND" | "GET" | "GETR" | "LIST" => {
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            let docker = tokio::task::spawn_blocking(crate::sandbox::docker_available).await.unwrap_or(false);
+            match req.kind.as_str() {
+                "PUT" | "APPEND" => {
+                    let bytes = match req.payload.as_ref().and_then(|b| STANDARD.decode(b).ok()) {
+                        Some(b) => b,
+                        None => return ComputeExecResponse { ok: false, status: 400, body: "Missing or invalid file payload".into() },
+                    };
+                    let res2 = reservation.clone();
+                    let path = req.command.clone();
+                    let append = req.kind == "APPEND";
+                    let r = tokio::task::spawn_blocking(move || {
+                        if docker {
+                            if append { crate::sandbox::append_file(&res2, &path, &bytes) }
+                            else      { crate::sandbox::put_file(&res2, &path, &bytes) }
+                        } else {
+                            if append { crate::sandbox::append_file_host(&res2, &path, &bytes) }
+                            else      { crate::sandbox::put_file_host(&res2, &path, &bytes) }
+                        }
+                    }).await.unwrap_or_else(|e| Err(e.to_string()));
+                    match r {
+                        Ok(())  => ComputeExecResponse { ok: true,  status: 200, body: "ok".into() },
+                        Err(e)  => ComputeExecResponse { ok: false, status: 400, body: e },
+                    }
+                }
+                "GET" => {
+                    let res2 = reservation.clone();
+                    let path = req.command.clone();
+                    let r = tokio::task::spawn_blocking(move || {
+                        if docker { crate::sandbox::get_file(&res2, &path) }
+                        else      { crate::sandbox::get_file_host(&res2, &path) }
+                    }).await.unwrap_or_else(|e| Err(e.to_string()));
+                    match r {
+                        Ok(bytes) => ComputeExecResponse { ok: true, status: 200, body: STANDARD.encode(bytes) },
+                        Err(e)    => ComputeExecResponse { ok: false, status: 400, body: e },
+                    }
+                }
+                "GETR" => {
+                    let mut parts = req.command.rsplitn(3, ':');
+                    let len    = parts.next().and_then(|s| s.parse::<u64>().ok());
+                    let offset = parts.next().and_then(|s| s.parse::<u64>().ok());
+                    let name   = parts.next().map(|s| s.to_string());
+                    let (name, offset, len) = match (name, offset, len) {
+                        (Some(n), Some(o), Some(l)) => (n, o, l),
+                        _ => return ComputeExecResponse { ok: false, status: 400, body: "Bad range request".into() },
+                    };
+                    let res2 = reservation.clone();
+                    let r = tokio::task::spawn_blocking(move || {
+                        if docker { crate::sandbox::read_range(&res2, &name, offset, len) }
+                        else      { crate::sandbox::read_range_host(&res2, &name, offset, len) }
+                    }).await.unwrap_or_else(|e| Err(e.to_string()));
+                    match r {
+                        Ok(bytes) => ComputeExecResponse { ok: true, status: 200, body: STANDARD.encode(bytes) },
+                        Err(e)    => ComputeExecResponse { ok: false, status: 400, body: e },
+                    }
+                }
+                _ => {
+                    let res2 = reservation.clone();
+                    let r = tokio::task::spawn_blocking(move || {
+                        if docker { crate::sandbox::list_files(&res2) }
+                        else      { crate::sandbox::list_files_host(&res2) }
+                    }).await.unwrap_or_else(|e| Err(e.to_string()));
+                    match r {
+                        Ok(files) => {
+                            let arr: Vec<_> = files.into_iter()
+                                .map(|(name, size)| serde_json::json!({ "name": name, "size": size }))
+                                .collect();
+                            ComputeExecResponse { ok: true, status: 200, body: serde_json::Value::Array(arr).to_string() }
+                        }
+                        Err(e) => ComputeExecResponse { ok: false, status: 400, body: e },
+                    }
+                }
+            }
+        }
+        "BENCH" => {
+            let body = tokio::task::spawn_blocking(|| {
+                let start = std::time::Instant::now();
+                let mut s = 0.0f64;
+                for i in 0..5_000_000u64 { s += (i as f64).sin(); }
+                let secs = start.elapsed().as_secs_f64().max(1e-9);
+                format!(
+                    "AI speed test on the remote host\n\
+                     ----------------------------------------------\n\
+                     5,000,000 sin() ops in {secs:.3} s\n\
+                     ~ {:.1} million ops/sec\n\
+                     (lower time = faster hardware; checksum {s:.4})",
+                    5.0 / secs,
+                )
+            }).await.unwrap_or_else(|e| format!("Benchmark failed: {e}"));
+            ComputeExecResponse { ok: true, status: 200, body }
+        }
+        _ => {
+            // Run inside the reservation's Docker sandbox when available; this
+            // enforces the rented CPU/RAM/GPU caps and isolates the renter from
+            // the host. Fall back to host shell when Docker isn't installed.
+            let docker = tokio::task::spawn_blocking(crate::sandbox::docker_available)
+                .await.unwrap_or(false);
+            let result: Result<std::process::Output, String> = if docker {
+                let res2 = reservation.clone();
+                let cmd2 = req.command.clone();
+                tokio::task::spawn_blocking(move || crate::sandbox::exec_in(&res2, &cmd2))
+                    .await.unwrap_or_else(|e| Err(format!("sandbox join error: {e}")))
+            } else {
+                run_shell_command(&req.command).await.map_err(|e| format!("System error: {e}"))
+            };
+            match result {
                 Ok(o) => {
                     let combined = String::from_utf8_lossy(&o.stdout).to_string()
                         + &String::from_utf8_lossy(&o.stderr);
@@ -2220,11 +2417,52 @@ async fn serve_compute_exec(req: ComputeExecRequest) -> ComputeExecResponse {
                         body:   combined,
                     }
                 }
-                Err(e) => ComputeExecResponse {
-                    ok: false, status: 500, body: format!("System error: {e}"),
-                },
+                Err(e) => ComputeExecResponse { ok: false, status: 500, body: e },
             }
         }
+    }
+}
+
+/// Runs a shell command, hunting for a usable shell binary because Tauri's
+/// child-process environment on Windows doesn't always include the
+/// WindowsPowerShell directory in PATH. Falls through PowerShell → pwsh → cmd.
+async fn run_shell_command(command: &str) -> std::io::Result<std::process::Output> {
+    if cfg!(target_os = "windows") {
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        let candidates: Vec<(String, Vec<&'static str>)> = vec![
+            (format!("{}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", system_root),
+                vec!["-NoProfile", "-Command"]),
+            ("powershell.exe".to_string(),
+                vec!["-NoProfile", "-Command"]),
+            ("pwsh.exe".to_string(),
+                vec!["-NoProfile", "-Command"]),
+            (format!("{}\\System32\\cmd.exe", system_root),
+                vec!["/C"]),
+            ("cmd.exe".to_string(),
+                vec!["/C"]),
+        ];
+        let mut last_err: Option<std::io::Error> = None;
+        for (prog, args) in candidates {
+            let mut cmd = tokio::process::Command::new(&prog);
+            for a in &args { cmd.arg(a); }
+            cmd.arg(command);
+            match cmd.output().await {
+                Ok(o) => return Ok(o),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No usable shell found (tried powershell, pwsh, cmd)",
+        )))
+    } else {
+        tokio::process::Command::new("sh")
+            .args(["-c", command])
+            .output().await
     }
 }
 
@@ -2240,6 +2478,193 @@ fn exec_addrs_match(a: &str, b: &str) -> bool {
             .unwrap_or_else(|_| s.trim_start_matches("0x").to_lowercase())
     };
     to_hex(a) == to_hex(b)
+}
+
+// ── In-browser app tunnel implementation ────────────────────────────────────
+
+/// Copy bytes in both directions between two futures-io streams until either
+/// side closes, then half-close the opposite writer so the peer sees EOF.
+async fn pipe_streams<A, B>(a: A, b: B)
+where
+    A: futures::AsyncRead + futures::AsyncWrite + Unpin,
+    B: futures::AsyncRead + futures::AsyncWrite + Unpin,
+{
+    let (mut ar, mut aw) = a.split();
+    let (mut br, mut bw) = b.split();
+    let a_to_b = async {
+        let _ = futures::io::copy(&mut ar, &mut bw).await;
+        let _ = bw.close().await;
+    };
+    let b_to_a = async {
+        let _ = futures::io::copy(&mut br, &mut aw).await;
+        let _ = aw.close().await;
+    };
+    futures::future::join(a_to_b, b_to_a).await;
+}
+
+/// Authenticate a tunnel handshake the same way `serve_compute_exec` does:
+/// the Dilithium key must derive the reservation's buyer address, the signature
+/// must cover `TUNNEL:<res>:<port>:<ts>`, and the reservation must be ours+active.
+fn validate_tunnel_handshake(hs: &TunnelHandshake) -> Result<crate::chain_db::ComputeReservation, String> {
+    let now = chrono::Utc::now().timestamp();
+    if (now - hs.timestamp).abs() > 30 {
+        return Err("handshake expired (timestamp mismatch)".into());
+    }
+    let dil_pk_bytes = hex::decode(&hs.dilithium_public_key).map_err(|_| "bad dilithium_public_key")?;
+    if dil_pk_bytes.is_empty() { return Err("missing dilithium_public_key".into()); }
+
+    let my_addr  = crate::ledger::Ledger::load().address;
+    let hrp      = if my_addr.starts_with("egot") { "egot" } else { "ego" };
+    let chain_id = if hrp == "egot" { 1 } else { 0 };
+    let derived  = ego_core::EgoAddress::from_dilithium_pk(&dil_pk_bytes, chain_id, ego_core::AddressType::EOA)
+        .to_bech32(hrp).map_err(|_| "failed to derive bech32 address")?;
+
+    let reservation = crate::chain_db::get_compute_reservation(&hs.reservation_id)
+        .or_else(|| hs.reservation.clone())
+        .ok_or_else(|| format!("unknown reservation {}", hs.reservation_id))?;
+    if reservation.reservation_id != hs.reservation_id { return Err("reservation id mismatch".into()); }
+    if !exec_addrs_match(&reservation.provider_address, &my_addr) { return Err("not this node's reservation".into()); }
+    if !exec_addrs_match(&reservation.buyer_address, &derived)    { return Err("key does not match reservation buyer".into()); }
+    if reservation.status != "active" { return Err(format!("reservation status is '{}'", reservation.status)); }
+    if reservation.expires_at <= now  { return Err("reservation expired".into()); }
+
+    let dil_pk  = ego_core::PublicKey::new(ego_core::AlgorithmId::MlDsa2, dil_pk_bytes);
+    let sig_raw = hex::decode(&hs.dilithium_signature).map_err(|_| "bad dilithium_signature")?;
+    let dil_sig = ego_core::Signature::dilithium2(sig_raw);
+    let signed  = format!("TUNNEL:{}:{}:{}", hs.reservation_id, hs.container_port, hs.timestamp);
+    match ego_core::verify_signature(&dil_pk, signed.as_bytes(), &dil_sig) {
+        Ok(true) => Ok(reservation),
+        _        => Err("invalid Dilithium signature".into()),
+    }
+}
+
+/// Provider side: handle one inbound tunnel stream — read+verify the handshake,
+/// ack, then relay to the container's published host port.
+async fn serve_tunnel_stream<S>(mut stream: S) -> Result<(), String>
+where
+    S: futures::AsyncRead + futures::AsyncWrite + Unpin,
+{
+    let mut len_buf = [0u8; 4];
+    AsyncReadExt::read_exact(&mut stream, &mut len_buf).await.map_err(|e| e.to_string())?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > 64 * 1024 { return Err("handshake too large".into()); }
+    let mut buf = vec![0u8; len];
+    AsyncReadExt::read_exact(&mut stream, &mut buf).await.map_err(|e| e.to_string())?;
+    let hs: TunnelHandshake = serde_json::from_slice(&buf).map_err(|e| e.to_string())?;
+
+    let reservation = match validate_tunnel_handshake(&hs) {
+        Ok(r)  => r,
+        Err(e) => {
+            // 0 = rejected; renter aborts without piping.
+            let _ = AsyncWriteExt::write_all(&mut stream, &[0u8]).await;
+            let _ = AsyncWriteExt::flush(&mut stream).await;
+            return Err(e);
+        }
+    };
+
+    let res_id = reservation.reservation_id.clone();
+    let cport  = hs.container_port;
+    let host_port = tokio::task::spawn_blocking(move || crate::sandbox::mapped_port(&res_id, cport))
+        .await.map_err(|e| e.to_string())?
+        .unwrap_or(cport);
+
+    let tcp = match tokio::net::TcpStream::connect(("127.0.0.1", host_port)).await {
+        Ok(t)  => t,
+        Err(e) => {
+            let _ = AsyncWriteExt::write_all(&mut stream, &[0u8]).await;
+            let _ = AsyncWriteExt::flush(&mut stream).await;
+            return Err(format!("app not reachable on port {host_port}: {e}"));
+        }
+    };
+
+    // 1 = accepted.
+    AsyncWriteExt::write_all(&mut stream, &[1u8]).await.map_err(|e| e.to_string())?;
+    AsyncWriteExt::flush(&mut stream).await.map_err(|e| e.to_string())?;
+
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+    pipe_streams(stream, tcp.compat()).await;
+    Ok(())
+}
+
+/// Ensure a connection to one of `endpoints` exists; returns the provider PeerId.
+async fn dial_provider_any(endpoints: &[String]) -> Result<PeerId, String> {
+    let tx = SWARM_TX.get().ok_or("P2P not started")?;
+    let mut sorted: Vec<String> = endpoints.iter()
+        .filter(|e| !e.contains("/ip4/169.254."))
+        .cloned().collect();
+    sorted.sort_by_key(|ep| {
+        if ep.contains("/ip4/192.168.") || ep.contains("/ip4/10.") || ep.contains("/ip4/172.") { 0usize }
+        else if ep.contains("/p2p-circuit") { 2 } else { 1 }
+    });
+    let mut last = "no reachable endpoints".to_string();
+    for ep in &sorted {
+        let addr: Multiaddr = match ep.parse() { Ok(a) => a, Err(e) => { last = format!("bad addr: {e}"); continue; } };
+        let (rtx, rrx) = oneshot::channel();
+        if tx.send(SwarmCmd::Dial { peer_addr: addr, reply: rtx }).await.is_err() {
+            return Err("swarm channel closed".into());
+        }
+        match tokio::time::timeout(Duration::from_secs(20), rrx).await {
+            Ok(Ok(Ok(pid))) => return Ok(pid),
+            Ok(Ok(Err(e)))  => last = e,
+            Ok(Err(_))      => last = "dial reply dropped".into(),
+            Err(_)          => last = "dial timed out".into(),
+        }
+    }
+    Err(last)
+}
+
+/// Renter side: open a local TCP listener that tunnels every browser connection
+/// to the rental's web app over libp2p. Returns the local `127.0.0.1:<port>`.
+pub async fn open_app_tunnel(
+    reservation: crate::chain_db::ComputeReservation,
+    container_port: u16,
+    endpoints: &[String],
+    kp: &ego_core::KeyPair,
+) -> Result<String, String> {
+    let control = TUNNEL_CONTROL.get().ok_or("P2P tunnel not ready")?.clone();
+    let peer_id = dial_provider_any(endpoints).await?;
+
+    let ts     = chrono::Utc::now().timestamp();
+    let signed = format!("TUNNEL:{}:{}:{}", reservation.reservation_id, container_port, ts);
+    let hs = TunnelHandshake {
+        reservation_id:       reservation.reservation_id.clone(),
+        container_port,
+        timestamp:            ts,
+        dilithium_public_key: hex::encode(&kp.dilithium_public_key().key_data),
+        dilithium_signature:  hex::encode(&kp.sign_dilithium(signed.as_bytes()).signature_data),
+        reservation:          Some(reservation.clone()),
+    };
+    let hs_bytes = serde_json::to_vec(&hs).map_err(|e| e.to_string())?;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
+    let local_port = listener.local_addr().map_err(|e| e.to_string())?.port();
+
+    tokio::spawn(async move {
+        loop {
+            let (tcp, _) = match listener.accept().await { Ok(x) => x, Err(_) => break };
+            let mut control = control.clone();
+            let hs_bytes = hs_bytes.clone();
+            tokio::spawn(async move {
+                let mut stream = match control.open_stream(peer_id, TUNNEL_PROTOCOL).await {
+                    Ok(s)  => s,
+                    Err(e) => { tracing::debug!("[tunnel] open_stream failed: {e}"); return; }
+                };
+                let len = (hs_bytes.len() as u32).to_be_bytes();
+                if AsyncWriteExt::write_all(&mut stream, &len).await.is_err() { return; }
+                if AsyncWriteExt::write_all(&mut stream, &hs_bytes).await.is_err() { return; }
+                if AsyncWriteExt::flush(&mut stream).await.is_err() { return; }
+                let mut ack = [0u8; 1];
+                if AsyncReadExt::read_exact(&mut stream, &mut ack).await.is_err() || ack[0] != 1 {
+                    tracing::debug!("[tunnel] provider rejected handshake");
+                    return;
+                }
+                use tokio_util::compat::TokioAsyncReadCompatExt;
+                pipe_streams(stream, tcp.compat()).await;
+            });
+        }
+    });
+
+    Ok(format!("127.0.0.1:{local_port}"))
 }
 
 pub async fn send_message(endpoint: &str, msg: &P2PMessage) -> Result<(), String> {
@@ -3134,6 +3559,26 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
         tracing::error!("QUIC listen failed: {}", e);
     }
 
+    // ── In-browser app tunnel: publish the control + accept inbound streams ──
+    {
+        let mut control = swarm.behaviour().stream.new_control();
+        let _ = TUNNEL_CONTROL.set(control.clone());
+        match control.accept(TUNNEL_PROTOCOL) {
+            Ok(mut incoming) => {
+                tokio::spawn(async move {
+                    while let Some((peer, stream)) = incoming.next().await {
+                        tokio::spawn(async move {
+                            if let Err(e) = serve_tunnel_stream(stream).await {
+                                tracing::debug!("[tunnel] stream from {peer} ended: {e}");
+                            }
+                        });
+                    }
+                });
+            }
+            Err(e) => tracing::error!("[tunnel] failed to register accept handler: {e}"),
+        }
+    }
+
     // relay PeerId → base transport addr (no /p2p/<id> suffix)
     // e.g.  12D3KooWPj6m... → /ip4/40.233.82.42/tcp/4001
     let mut relay_addrs: HashMap<PeerId, Multiaddr> = HashMap::new();
@@ -3260,6 +3705,9 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     let mut exec_in_flight:     HashMap<OutboundRequestId, oneshot::Sender<Result<ComputeExecResponse, String>>> = HashMap::new();
     let (exec_resp_tx, mut exec_resp_rx) = mpsc::channel::<(request_response::ResponseChannel<ComputeExecResponse>, ComputeExecResponse)>(64);
 
+    // Callers waiting for a connection to be established before opening a tunnel.
+    let mut pending_dials: HashMap<PeerId, Vec<oneshot::Sender<Result<PeerId, String>>>> = HashMap::new();
+
     // Restore validator pubkeys from DB so BFT verification works after a node restart
     restore_validator_keys_from_db();
 
@@ -3285,6 +3733,10 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     let mut announce_tick = tokio::time::interval(Duration::from_secs(45));
     announce_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     announce_tick.tick().await;
+
+    let mut termination_rebcast = tokio::time::interval(Duration::from_secs(300));
+    termination_rebcast.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    termination_rebcast.tick().await;
 
     if std::env::var("EGO_DATA_DIR").is_ok() && crate::ledger::load_seed().ok().flatten().is_none() {
         let _ = std::fs::create_dir_all(crate::ledger::data_dir());
@@ -3444,6 +3896,21 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                         handle_compute_exec_send(&mut swarm, peer_addr, req, reply,
                             &mut pending_exec_sends, &mut exec_in_flight);
                     }
+                    SwarmCmd::Dial { peer_addr, reply } => {
+                        match peer_id_from_multiaddr(&peer_addr) {
+                            Some(pid) if pid == *swarm.local_peer_id() => {
+                                let _ = reply.send(Err("Refusing self-dial".into()));
+                            }
+                            Some(pid) if swarm.is_connected(&pid) => {
+                                let _ = reply.send(Ok(pid));
+                            }
+                            Some(pid) => {
+                                pending_dials.entry(pid).or_default().push(reply);
+                                let _ = swarm.dial(peer_addr);
+                            }
+                            None => { let _ = reply.send(Err(format!("No peer ID in multiaddr: {}", peer_addr))); }
+                        }
+                    }
                 }
             }
 
@@ -3453,7 +3920,7 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                     &mut external_addrs, &mut pending_sends, &mut in_flight,
                     &mut pending_exec_sends, &mut exec_in_flight, &exec_resp_tx,
                     &mut swarm, &relay_addrs,
-                    &mut circuit_listener,
+                    &mut circuit_listener, &mut pending_dials,
                 ).await;
             }
 
@@ -3467,6 +3934,26 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
             let app_clone = app.as_ref().cloned();
             tokio::spawn(async move {
                 broadcast_peer_announce(app_clone.as_ref()).await;
+            });
+        }
+
+        _ = termination_rebcast.tick() => {
+            tokio::spawn(async move {
+                let my_addr = crate::ledger::Ledger::load().address;
+                let terminated: Vec<_> = tokio::task::spawn_blocking(move || {
+                    crate::chain_db::list_compute_reservations()
+                        .into_iter()
+                        .filter(|r| r.buyer_address == my_addr && r.status == "terminated")
+                        .collect()
+                }).await.unwrap_or_default();
+                for res in terminated {
+                    let msg = P2PMessage::ReservationTerminated {
+                        reservation_id: res.reservation_id.clone(),
+                        by:     "buyer".to_string(),
+                        reason: "rebcast".to_string(),
+                    };
+                    broadcast_compute_msg(msg).await;
+                }
             });
         }
 
@@ -3764,6 +4251,7 @@ async fn build_swarm(
                 ),
                 gossipsub: gossipsub_behaviour,
                 kad:       kad_behaviour,
+                stream:    libp2p_stream::Behaviour::new(),
             }
         })?
         .with_swarm_config(|c| {
@@ -3929,6 +4417,7 @@ async fn handle_event(
     swarm:              &mut libp2p::Swarm<EgoBehaviour>,
     relay_addrs:        &HashMap<PeerId, Multiaddr>,
     circuit_listener:   &mut Option<libp2p_core::transport::ListenerId>,
+    pending_dials:      &mut HashMap<PeerId, Vec<oneshot::Sender<Result<PeerId, String>>>>,
 ) {
     match event {
 
@@ -3966,6 +4455,10 @@ async fn handle_event(
 
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             eprintln!("[P2P] Connected to {}", peer_id);
+
+            if let Some(waiters) = pending_dials.remove(&peer_id) {
+                for w in waiters { let _ = w.send(Ok(peer_id)); }
+            }
 
             if !relay_addrs.contains_key(&peer_id) {
                 let n = DIRECT_PEER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -4113,6 +4606,11 @@ async fn handle_event(
                 if let Some(pending) = pending_exec_sends.remove(&pid) {
                     for (_, reply) in pending {
                         let _ = reply.send(Err(format!("Cannot reach peer for exec: {}", error)));
+                    }
+                }
+                if let Some(waiters) = pending_dials.remove(&pid) {
+                    for w in waiters {
+                        let _ = w.send(Err(format!("Cannot reach peer: {}", error)));
                     }
                 }
             }
@@ -4736,6 +5234,15 @@ async fn handle_event(
                                 if let Some(key) = key_to_auth {
                                     let _ = crate::commands::compute::authorize_ssh_key(&key);
                                 }
+                                // Pre-build the isolated sandbox so the renter's
+                                // first console command doesn't wait on an image pull.
+                                let res_warm = reservation.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    if res_warm.status == "active" {
+                                        crate::sandbox::prewarm_image();
+                                        let _ = crate::sandbox::ensure_container(&res_warm);
+                                    }
+                                }).await.ok();
                             }
                             tokio::task::spawn_blocking(move || {
                                 if crate::chain_db::get_compute_reservation(&reservation.reservation_id).is_none() {
@@ -4756,14 +5263,43 @@ async fn handle_event(
                             }).await.ok();
                         });
                     }
-                    Ok(P2PMessage::ReservationTerminated { reservation_id, .. }) => {
+                    Ok(P2PMessage::ReservationTerminated { reservation_id, by, reason }) => {
+                        let app2 = app.cloned();
                         tokio::spawn(async move {
-                            tokio::task::spawn_blocking(move || {
-                                if let Some(mut res) = crate::chain_db::get_compute_reservation(&reservation_id) {
-                                    res.status = "terminated".to_string();
-                                    crate::chain_db::upsert_compute_reservation(&res);
+                            // Determine our perspective (buyer / provider / other)
+                            // so the frontend can phrase the toast correctly,
+                            // then update local chain state.
+                            let res_id_for_blocking = reservation_id.clone();
+                            let res = tokio::task::spawn_blocking(move || {
+                                let r = crate::chain_db::get_compute_reservation(&res_id_for_blocking);
+                                if let Some(ref existing) = r {
+                                    let mut updated = existing.clone();
+                                    updated.status = "terminated".to_string();
+                                    crate::chain_db::upsert_compute_reservation(&updated);
                                 }
-                            }).await.ok();
+                                r
+                            }).await.ok().flatten();
+
+                            // Tear down the isolated sandbox + its workspace volume.
+                            // No-op if Docker is absent or no container exists.
+                            let rid = reservation_id.clone();
+                            tokio::task::spawn_blocking(move || crate::sandbox::destroy(&rid)).await.ok();
+
+                            if let Some(handle) = app2 {
+                                let perspective = res.as_ref().map(|r| {
+                                    let me = crate::ledger::Ledger::load().address;
+                                    if r.buyer_address == me { "buyer" }
+                                    else if r.provider_address == me { "provider" }
+                                    else { "observer" }
+                                }).unwrap_or("observer");
+
+                                let _ = handle.emit_all("ego://reservation-terminated", serde_json::json!({
+                                    "reservation_id": reservation_id,
+                                    "by":             by,
+                                    "reason":         reason,
+                                    "perspective":    perspective,
+                                }));
+                            }
                         });
                     }
                     Ok(P2PMessage::StorageDealCreated { deal }) => {
@@ -6865,21 +7401,36 @@ fn merge_remote_chain_blocking(
             .map(|b| b.height);
 
         if let Some(dh) = diverge_height {
-            // A reorg should only happen if the remote chain is actually BETTER.
-            // A better chain is either significantly longer, or has a higher BFT quorum at the same height.
             let remote_has_quorum = blocks.iter().any(|b| b.height >= dh && b.vote_count >= 2);
-            
-            // PROTECTION: Never truncate a long chain to adopt a significantly shorter one
-            // unless the local chain has been stuck for a very long time (handled via override_hard).
             let is_remote_longer = remote_tip > local_tip;
-            
+
+            // How many confirmed local blocks would this reorg delete.
+            let reorg_depth = local_tip.saturating_sub(dh) + 1;
+            // A single-block lead is never enough justification to reorg more than
+            // MAX_SAFE_REORG_DEPTH blocks. The remote must be ahead by at least half
+            // the reorg depth — so wiping 100 blocks requires 50-block lead, not 1.
+            const MAX_SAFE_REORG_DEPTH: u64 = 50;
+            let remote_lead = remote_tip.saturating_sub(local_tip);
+            let deep_reorg_allowed = reorg_depth <= MAX_SAFE_REORG_DEPTH
+                || remote_lead >= reorg_depth / 2
+                || remote_has_quorum && remote_lead >= 10;
+
+            if !deep_reorg_allowed {
+                eprintln!("[P2P] Deep reorg ({} blocks from height {}) blocked: remote lead {} is too small (need ≥{})",
+                    reorg_depth, dh, remote_lead, reorg_depth / 2);
+                return (false, false);
+            }
+
             if is_remote_longer || (remote_tip == local_tip && remote_has_quorum) {
                 should_reorg = true;
             } else if remote_tip == local_tip {
                 // Tie-breaker for symmetric forks: compare hashes to guarantee convergence
                 if let Some(local_div_block) = crate::chain_db::get_block_by_height(dh) {
                     if let Some(remote_div_block) = blocks.iter().find(|b| b.height == dh) {
-                        if remote_div_block.vote_count > local_div_block.vote_count || (remote_div_block.vote_count == local_div_block.vote_count && remote_div_block.hash > local_div_block.hash) {
+                        if remote_div_block.vote_count > local_div_block.vote_count
+                            || (remote_div_block.vote_count == local_div_block.vote_count
+                                && remote_div_block.hash > local_div_block.hash)
+                        {
                             should_reorg = true;
                         }
                     }
@@ -6890,11 +7441,16 @@ fn merge_remote_chain_blocking(
                 peer_ahead = true;
                 let hard_set = hard_finalized_heights();
                 let last_hard = hard_set.iter().max().copied().unwrap_or(0);
-                drop(hard_set); // release lock before truncate
+                drop(hard_set);
 
-                let local_is_solo = crate::chain_db::get_block_by_height(dh).map(|b| b.vote_count < 2).unwrap_or(false);
+                // Never override hard-finality for deep reorgs, regardless of vote status.
+                // (Previously local_is_solo could trigger this — that's the bug that let
+                // fresh nodes wipe hundreds of confirmed blocks.)
                 let remote_is_heavier = remote_tip > local_tip + 10;
-                let override_hard = dh <= last_hard && (remote_has_quorum || remote_tip > local_tip + 20) && (local_is_solo || remote_is_heavier);
+                let override_hard = dh <= last_hard
+                    && (remote_has_quorum || remote_tip > local_tip + 20)
+                    && remote_is_heavier
+                    && reorg_depth <= MAX_SAFE_REORG_DEPTH;
 
                 if dh > last_hard || override_hard {
                     if override_hard {
@@ -6902,8 +7458,8 @@ fn merge_remote_chain_blocking(
                         { hard_finalized_heights().retain(|&h| h < dh); }
                         { finalized_at_height().retain(|&h, _| h < dh); }
                     }
-                    eprintln!("[P2P] Longest-chain reorg: remote tip {} >= local {}, truncating from height {}",
-                        remote_tip, local_tip, dh);
+                    eprintln!("[P2P] Reorg: remote tip {} >= local {}, truncating {} blocks from height {}",
+                        remote_tip, local_tip, reorg_depth, dh);
                     for tx in crate::chain_db::truncate_from(dh) {
                         let _ = crate::mempool::get_mempool().push(tx);
                     }

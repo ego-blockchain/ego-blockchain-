@@ -211,13 +211,21 @@ Advanced: EGO-50 MEV Protection, EGO-51 Fee Market, EGO-52 Governance, EGO-53 DI
 - **ZK-Proofs**: Validity verified via zero-knowledge proofs at the protocol level.
 
 ## App pages
-Wallet (send/receive/QR), Storage (AES-256-GCM upload/download), EgoSafe (encrypt+share egoshare1 bundles), Explorer (live blocks/txs from RocksDB), Earnings (rewards + session counter), Messenger (P2P E2E encrypted chat via DHT inbox), Settings (PIN/recovery/QR keys), Contracts (deploy/call Urego with testnet/mainnet selector + dry run), Coverage, Staking, Market (live prices & charts), Governance (DAO proposals + two-type voting).
+Wallet (send/receive/QR), Storage (AES-256-GCM upload/download), EgoSafe (encrypt+share egoshare1 bundles), Explorer (live blocks/txs from RocksDB), Earnings (rewards + session counter), Messenger (P2P E2E encrypted chat via DHT inbox), Settings (PIN/recovery/QR keys), Contracts (deploy/call Urego with testnet/mainnet selector + dry run), Coverage, Staking, Market (live prices & charts), Governance (DAO proposals + two-type voting), Compute (GPU/CPU rental marketplace, AI Workspace, GPU clusters).
 
 ## Messenger
 - Bundle: `egocontact1:{addr}:{ed25519_hex}:{kyber_hex}:{name_b64}:{shared_key_hex}`. Encryption: AES-256-GCM.
 - DHT inbox delivery (fully P2P). File sharing via `egoshare1:{cid}:{key_nonce_hex}:{name_b64}:{from}`.
 - Contact pairing: A generates card with display name → B pastes card in Add Contact → B enters their name → request sent. B approves → auto-close after 1.5s. A is notified.
 - Display name is remembered after first registration or first card generation — not asked again on subsequent approvals.
+
+## Compute Marketplace (DePIN GPU/CPU)
+- **Rent tab**: Browse GPU/CPU offers from independent providers. Pay with EGOC into on-chain escrow. Duration: 30 minutes to 1 year. Payments release per period; refund if provider goes offline.
+- **AI Workspace**: unified panel for all active rentals. Apps run on the remote GPU, open in your browser: LLM Chat (open-source models via llama.cpp/Gradio), JupyterLab, Image Generation (Stable Diffusion/SDXL), Transcribe Audio (Whisper). Upload files from your local computer to the remote GPU. If you hold 2+ rentals, all appear in one workspace — tab bar to switch nodes, header shows combined total CPU/RAM/GPU.
+- **Earn tab**: providers list hardware with a per-hour price. Buyers pick duration. Provider earns EGOC each period automatically. Isolation: Docker sandbox per renter when Docker is available; shared host with warning otherwise.
+- **Train tab**: book GPUs from multiple independent providers into a **WireGuard VPN mesh cluster** (2–200 nodes). One head-node IP. Auto-starts Ray on all nodes for distributed PyTorch, DeepSpeed, or any distributed framework. Terminated clusters remain visible as history.
+- **Cluster WireGuard**: each provider node registers its external IP + WireGuard public key. Buyer gets a `.conf` file — on Windows: WireGuard → Import tunnel → Activate. On Linux/macOS: `wg-quick up wg0`.
+- **Escrow safety**: all payments locked on-chain. Provider must heartbeat each period to claim. Buyer terminates early for 1-period penalty; refund of unused escrow otherwise.
 
 ## Earnings Page
 - Shows live session uptime counter, daily reward breakdown (Storage, Consensus, Coverage, Retrieval), and potential vs. actual earnings.
@@ -331,8 +339,34 @@ Just open any of the tabs above to configure your node. Your **Deterministic Rew
         "Ego uses a Verifiable Random Function (VRF) for block proposer and committee election. This cryptographically ensures that the 21-node voting committee is selected randomly and fairly, preventing predictability and DDoS attacks."
     } else if q.contains("shard") || q.contains("scale") || q.contains("tps") {
         "Ego scales dynamically up to 256 shards based on the active network size. Using consistent hashing, nodes are assigned to specific shards as Masters or Slaves, parallelizing transaction processing.\n\nThis allows the network to seamlessly grow to handle 100k+ TPS, with automatic cross-shard routing and vacancy healing when nodes drop offline."
-    } else if q.contains("compute") || q.contains("gpu") || q.contains("cpu") || q.contains("rent") {
-        "Ego includes a DePIN for compute. Users can rent idle hardware or book clusters.\n\n### How to Proceed\n1. In the **Compute** tab, click **Connect** on your reservation.\n2. Click **Launch SSH Terminal**. \n\n**Note for Windows**: If you see an error about 'ssh' not recognized, you need to install the **OpenSSH Client**:\n- Open Settings -> Apps -> Optional Features -> Add 'OpenSSH Client'.\n- Or run: `Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0` in an Admin PowerShell."
+    } else if q.contains("compute") || q.contains("gpu") || q.contains("cpu") || q.contains("rent") || q.contains("ai workspace") || q.contains("cluster") || q.contains("train") || q.contains("jupyter") || q.contains("llm chat") {
+        "Ego includes a full **DePIN Compute Marketplace** where anyone can rent or provide GPU/CPU hardware.
+
+### For Renters (Compute tab → Rent)
+- Browse available GPUs and CPUs from independent providers worldwide.
+- Set your duration (30 minutes to 1 year), pay with EGOC — funds go into **on-chain escrow**.
+- Open the unified **AI Workspace** to launch apps that run on the remote GPU and open in your browser:
+  - **LLM Chat** — run any open-source language model (Mistral, LLaMA, Phi, etc.)
+  - **JupyterLab** — full Python notebook environment
+  - **Image Generation** — Stable Diffusion / SDXL
+  - **Transcribe Audio** — Whisper speech-to-text
+- Upload files from your computer directly to the remote GPU for processing.
+- If you have **multiple active rentals**, they all appear in one workspace — switch between nodes with tabs. The header shows your **combined** total CPU cores, RAM, and GPUs.
+- Payments release **automatically each period**. If the provider goes offline, you get refunded.
+
+### For Providers (Compute tab → Earn)
+- List your hardware with a price per hour. Buyers pick duration — you receive EGOC each period.
+- Your own listings are hidden from your own marketplace view (no self-rental).
+- Sandboxed isolation: Docker containers keep each renter's workload separate when Docker is installed. Falls back to shared host with a visible warning.
+
+### GPU Clusters (Compute tab → Train)
+- Book GPUs from **2–200 independent providers** into one private cluster.
+- All nodes auto-join a **WireGuard VPN mesh** — one head-node IP for the whole cluster.
+- Run **PyTorch distributed training, DeepSpeed, or Ray** across the full cluster.
+- Framework options: Ray (auto-started on all nodes) or raw SSH access.
+- After termination, clusters appear in history so you can review past jobs.
+
+**Escrow & Safety**: all compute payments use on-chain EGOC escrow. Providers must maintain uptime or the buyer gets a refund."
     } else if q.contains("message") || q.contains("chat") || q.contains("messenger") {
         "Ego Messenger is a P2P end-to-end encrypted chat. It uses Kyber768 for initial key exchange and a Double Ratchet algorithm with AES-256-GCM for forward-secure messaging, delivered via the Kademlia DHT."
     } else if q.contains("egosafe") || q.contains("share") {
@@ -350,7 +384,7 @@ Just open any of the tabs above to configure your node. Your **Deterministic Rew
     } else if q.contains("privacy") || q.contains("shielded") || q.contains("private") || q.contains("mask") {
         "Ego uses **Shielded Transactions** to ensure financial privacy. When a transaction is private, the sender and receiver addresses are masked with a **🛡 Shielded** badge on the public ledger.\n\n### Privacy Protections\n- **Identity Masking**: Hides public keys from the Explorer and trackers.\n- **Whale Protection**: Any transaction over **50,000 EGOC** is automatically shielded to prevent profiling.\n- **Tracking Prevention**: No address history search or 'Rich Lists' (Holders) to prevent profiling.\n- **Macro-Transparency**: Shows supply distribution audits instead of individual balances.\n- **ZK-Enforced**: Uses Zero-Knowledge logic to verify validity without exposing metadata."
     } else {
-        "I am Ego AI.\n\nYou can ask me about Ego's **consensus**, **tokenomics**, **VRF elections**, **sharding**, **smart contracts**, **staking**, **ZK-rollups**, **compute renting**, **EgoSafe**, or **quantum-safe cryptography**!"
+        "I am Ego AI.\n\nYou can ask me about Ego's **consensus**, **tokenomics**, **VRF elections**, **sharding**, **smart contracts**, **staking**, **ZK-rollups**, **GPU compute rental**, **AI Workspace**, **GPU clusters**, **EgoSafe**, or **quantum-safe cryptography**!"
     };
 
     // Simulate slight typing delay for realism

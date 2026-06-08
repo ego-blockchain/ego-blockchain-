@@ -9,9 +9,11 @@ pub fn notify(app: &AppHandle, title: &str, body: &str) {
     let mut n = tauri::api::notification::Notification::new(&app.config().tauri.bundle.identifier)
         .title(title)
         .body(body);
-    // On non-Windows we can set an icon path; on Windows the icon comes from the
-    // AUMID registry entry set at startup — setting it here causes silent failures.
-    #[cfg(not(target_os = "windows"))]
+    // Windows: icon comes from the AUMID registry entry set at startup.
+    // macOS: icon comes from the app bundle automatically — passing a path here
+    //        causes show() to fail silently on macOS.
+    // Linux only: set the icon path explicitly.
+    #[cfg(target_os = "linux")]
     if let Some(p) = app
         .path_resolver()
         .resource_dir()

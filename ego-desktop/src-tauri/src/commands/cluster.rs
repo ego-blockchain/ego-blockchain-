@@ -33,7 +33,17 @@ fn load_wg_privkey(cluster_id: &str, role: &str) -> Option<String> {
     std::fs::read_to_string(wg_key_path(cluster_id, role)).ok()
 }
 
-fn get_public_ip() -> String {
+async fn get_public_ip() -> String {
+    for url in &["https://api4.my-ip.io/ip", "https://ipv4.icanhazip.com", "https://api.ipify.org"] {
+        if let Ok(resp) = reqwest::get(*url).await {
+            if let Ok(text) = resp.text().await {
+                let ip = text.trim().to_string();
+                if ip.parse::<std::net::IpAddr>().is_ok() && !ip.starts_with("169.254") {
+                    return ip;
+                }
+            }
+        }
+    }
     local_ip_address::local_ip()
         .map(|ip| ip.to_string())
         .unwrap_or_else(|_| "0.0.0.0".to_string())
@@ -314,6 +324,7 @@ pub async fn create_cluster_booking(
             days:              0,
             days_paid:         0,
             daily_rate_uegoc:  0,
+            started_at:        None,
         };
         crate::chain_db::upsert_compute_reservation(&reservation);
 
@@ -387,7 +398,7 @@ pub async fn auto_join_cluster(cluster_id: String, app: tauri::AppHandle) {
 
     let (priv_key, pub_key) = generate_wg_keypair();
     save_wg_privkey(&cluster_id, "provider", &priv_key);
-    let endpoint  = format!("{}:{}", get_public_ip(), WG_PORT);
+    let endpoint  = format!("{}:{}", get_public_ip().await, WG_PORT);
     let now       = chrono::Utc::now().timestamp();
     let mut is_head = false;
 
@@ -448,9 +459,8 @@ pub async fn get_cluster_bookings() -> Result<Vec<ClusterBooking>, EgoDesktopErr
         let bookings = crate::chain_db::list_cluster_bookings()
             .into_iter()
             .filter(|b| {
-                b.status != "terminated"
-                    && (b.buyer_address == my_addr
-                        || b.nodes.iter().any(|n| n.provider_address == my_addr))
+                b.buyer_address == my_addr
+                    || b.nodes.iter().any(|n| n.provider_address == my_addr)
             })
             .collect();
         Ok::<_, EgoDesktopError>(bookings)

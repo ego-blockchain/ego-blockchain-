@@ -4269,6 +4269,9 @@ pub struct ComputeReservation {
     #[serde(default)] pub days:             u32,
     #[serde(default)] pub days_paid:        u32,
     #[serde(default)] pub daily_rate_uegoc: u64,
+    /// Unix timestamp when the buyer first actively used the rental (opened console).
+    /// None = not yet started; timer and billing begin at this moment, not at created_at.
+    #[serde(default)] pub started_at: Option<i64>,
 }
 
 pub fn upsert_compute_offer(offer: &ComputeCapacityOffer) {

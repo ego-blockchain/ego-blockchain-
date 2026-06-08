@@ -270,6 +270,8 @@ const HostingPage: React.FC = () => {
   const [planError, setPlanError]     = useState('');
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [access, setAccess]           = useState<HostingAccess | null>(null);
+  const [previewSite, setPreviewSite] = useState<HostedSite | null>(null);
+  const [previewInput, setPreviewInput] = useState('');
 
   const load = () => {
     invoke<HostedSite[]>('get_hosted_sites')
@@ -732,7 +734,7 @@ const HostingPage: React.FC = () => {
                           {copiedUrl === publicUrl ? '✓' : 'Copy URL'}
                         </button>
                         <button
-                          onClick={() => invoke('open_in_browser', { url: site.local_url })}
+                          onClick={() => { setPreviewSite(site); setPreviewInput(site.custom_domain ?? site.name); }}
                           className="text-xs px-2.5 py-1.5 bg-blue-600/20 hover:bg-blue-600/40 text-blue-300 rounded-lg transition-colors"
                         >
                           Preview
@@ -772,6 +774,106 @@ const HostingPage: React.FC = () => {
               })}
             </div>
           )}
+        </div>
+      )}
+      {/* ── In-app site preview modal ── */}
+      {previewSite && (
+        <div className="fixed inset-0 z-50 flex flex-col bg-black/80 backdrop-blur-md">
+          {/* Browser chrome */}
+          <div className="flex items-center gap-3 px-4 py-3 bg-gray-900 border-b border-gray-700 shrink-0">
+            {/* Traffic lights */}
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button onClick={() => setPreviewSite(null)}
+                className="w-3 h-3 rounded-full bg-red-500 hover:bg-red-400 transition-colors" />
+              <div className="w-3 h-3 rounded-full bg-yellow-500/60" />
+              <div className="w-3 h-3 rounded-full bg-green-500/60" />
+            </div>
+
+            {/* Back / Forward / Reload */}
+            <div className="flex items-center gap-1 shrink-0 text-gray-500">
+              <button className="w-7 h-7 flex items-center justify-center hover:bg-gray-800 rounded-md text-sm" title="Back">‹</button>
+              <button className="w-7 h-7 flex items-center justify-center hover:bg-gray-800 rounded-md text-sm" title="Forward">›</button>
+              <button
+                onClick={() => {
+                  const frame = document.getElementById('ego-preview-frame') as HTMLIFrameElement | null;
+                  if (frame) frame.src = frame.src;
+                }}
+                className="w-7 h-7 flex items-center justify-center hover:bg-gray-800 rounded-md text-sm" title="Reload">↻</button>
+            </div>
+
+            {/* Address bar */}
+            <div className="flex-1 flex items-center bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 gap-2 min-w-0">
+              <span className="text-green-400 text-xs shrink-0">🔒</span>
+              <input
+                value={previewInput}
+                onChange={e => setPreviewInput(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') {
+                    const frame = document.getElementById('ego-preview-frame') as HTMLIFrameElement | null;
+                    if (frame) frame.src = previewSite.local_url;
+                  }
+                }}
+                className="flex-1 bg-transparent text-sm text-gray-200 font-mono outline-none min-w-0"
+              />
+            </div>
+
+            {/* Open in real browser */}
+            <button
+              onClick={() => invoke('open_in_browser', { url: previewSite.local_url })}
+              className="text-xs px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-300 rounded-lg shrink-0 transition-colors"
+              title="Open in system browser"
+            >
+              ↗ Open
+            </button>
+          </div>
+
+          {/* Viewport tabs for responsive preview */}
+          <div className="flex items-center gap-1 px-4 py-2 bg-gray-900/80 border-b border-gray-800 shrink-0">
+            {[
+              { label: '🖥 Desktop', w: '100%' },
+              { label: '📱 Mobile', w: '390px' },
+              { label: '📟 Tablet', w: '768px' },
+            ].map(vp => (
+              <button
+                key={vp.label}
+                onClick={() => {
+                  const wrap = document.getElementById('ego-preview-wrap');
+                  if (wrap) wrap.style.width = vp.w;
+                }}
+                className="text-[11px] px-3 py-1 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white transition-colors"
+              >
+                {vp.label}
+              </button>
+            ))}
+            <span className="ml-auto text-[11px] text-gray-600 font-mono">{previewSite.custom_domain ?? previewSite.name}</span>
+          </div>
+
+          {/* iframe area */}
+          <div className="flex-1 overflow-auto bg-gray-950 flex justify-center py-4">
+            <div
+              id="ego-preview-wrap"
+              className="h-full transition-all duration-300 bg-white rounded-t-lg overflow-hidden shadow-2xl"
+              style={{ width: '100%' }}
+            >
+              {previewSite.local_url ? (
+                <iframe
+                  id="ego-preview-frame"
+                  src={previewSite.local_url}
+                  title="Site preview"
+                  className="w-full h-full border-0"
+                  sandbox="allow-scripts allow-same-origin allow-forms"
+                />
+              ) : (
+                <div className="flex items-center justify-center h-full text-gray-400 text-sm">
+                  <div className="text-center space-y-2">
+                    <div className="text-4xl">🌐</div>
+                    <p>No local preview URL available.</p>
+                    <p className="text-xs text-gray-600">The site may still be deploying.</p>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       )}
     </div>

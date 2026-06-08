@@ -233,7 +233,8 @@ fn sanitize_site_relative_path(path: &str) -> Result<std::path::PathBuf, EgoDesk
         match component {
             Component::Normal(part) => clean.push(part),
             Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+            Component::RootDir | Component::Prefix(_) => {}
+            Component::ParentDir => {
                 return Err(EgoDesktopError::InvalidInput(
                     "Invalid file path: traversal outside site directory is not allowed".into(),
                 ));
@@ -309,12 +310,6 @@ pub fn deploy_site_file(name: String, file: SiteFileInput) -> Result<SiteFileRes
     let cid  = cid_of(&content);
     let rel_path = sanitize_site_relative_path(&file.path)?;
     let dest = dir.join(&rel_path);
-    let dir_canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-    if !dest.starts_with(&dir_canon) {
-        return Err(EgoDesktopError::InvalidInput(
-            "Invalid file path: traversal outside site directory is not allowed".into()
-        ));
-    }
     if let Some(p) = dest.parent() {
         std::fs::create_dir_all(p)
             .map_err(|e| EgoDesktopError::FileSystemError(e.to_string()))?;
