@@ -5,6 +5,7 @@ use once_cell::sync::Lazy;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tauri::Manager;
 use std::sync::Mutex;
 use tauri::State;
 use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Key, Nonce};
@@ -1453,7 +1454,10 @@ pub async fn get_reservation_connect_info(
 }
 
 #[tauri::command]
-pub async fn terminate_reservation_early(reservation_id: String) -> Result<(), EgoDesktopError> {
+pub async fn terminate_reservation_early(
+    reservation_id: String,
+    app:            tauri::AppHandle,
+) -> Result<(), EgoDesktopError> {
     let my_addr = crate::ledger::Ledger::load().address;
     let mut res = crate::chain_db::get_compute_reservation(&reservation_id)
         .ok_or_else(|| EgoDesktopError::NotFound("Reservation not found".into()))?;
@@ -1533,6 +1537,13 @@ pub async fn terminate_reservation_early(reservation_id: String) -> Result<(), E
         reason: "early_termination".to_string(),
     };
     crate::p2p::broadcast_compute_msg(msg).await;
+
+    let _ = app.emit_all("ego://reservation-terminated", serde_json::json!({
+        "reservation_id": reservation_id,
+        "by":             my_addr.clone(),
+        "reason":         "early_termination",
+        "perspective":    "buyer",
+    }));
 
     Ok(())
 }

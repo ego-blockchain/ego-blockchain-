@@ -183,11 +183,18 @@ pub fn load_seed() -> Result<Option<Vec<u8>>, String> {
             }
 
             if bytes.len() != 32 {
-                // If the data in keychain is invalid length (e.g. 68 bytes), the state is corrupted.
-                // Return Ok(None) and remove the sentinel to force a fresh start on next launch.
-                eprintln!("[Ledger] Invalid seed length in Keychain ({} bytes). Resetting local state.", bytes.len());
-                let _ = fs::remove_file(&path);
-                return Ok(None);
+                // Keychain returned empty or corrupted data (common when app signature changes
+                // between builds, or macOS returns "" for the password).
+                // Do NOT delete the sentinel — that would cause a brand-new wallet to be
+                // silently generated on next launch, losing the user's identity.
+                // Instead, surface a clear error so the user can recover manually.
+                return Err(format!(
+                    "macOS Keychain returned invalid seed data ({} bytes). \
+                     Your wallet seed is still protected in Keychain but could not be read.\n\n\
+                     To fix: open Keychain Access.app, search for 'ego-desktop', \
+                     delete the entry, then re-import your 24-word recovery phrase.",
+                    bytes.len()
+                ));
             }
             return Ok(Some(bytes));
         }
@@ -219,13 +226,23 @@ pub fn save_seed(seed: &[u8]) -> std::io::Result<()> {
     {
         use base64::Engine as _;
 
-        let entry = seed_keyring_entry()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("keyring init: {e}")))?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(seed);
-        entry
-            .set_password(&encoded)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("keyring store: {e}")))?;
-        return crate::utils::atomic_write(&seed_path(), SEED_KEYRING_SENTINEL);
+        let keyring_ok = seed_keyring_entry()
+            .ok()
+            .and_then(|entry| {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(seed);
+                entry.set_password(&encoded).ok()
+            })
+            .is_some();
+
+        if keyring_ok {
+            return crate::utils::atomic_write(&seed_path(), SEED_KEYRING_SENTINEL);
+        }
+
+        // Keychain unavailable (unsigned build, sandboxing restriction, etc.).
+        // Fall back to writing the raw seed directly to the file.
+        // load_seed already handles this case: a 32-byte file is read as-is.
+        eprintln!("[Ledger] Keychain unavailable — storing seed in plain file (development mode).");
+        return crate::utils::atomic_write(&seed_path(), seed);
     }
 
     #[cfg(windows)]
