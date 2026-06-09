@@ -715,6 +715,9 @@ fn main() {
                     tracing::info!("{} peers — skipping oracle, using P2P only", startup_peers);
                 }
 
+                // Restore pending TXs after oracle sync so confirmed nonces are populated.
+                tokio::task::spawn_blocking(|| crate::commands::tx_pending::restore_to_mempool()).await.ok();
+
                 crate::p2p::broadcast_peer_announce(Some(&handle_startup)).await;
                 tracing::info!("Peer announce sent (endpoint: {})", my_endpoint);
 
@@ -774,7 +777,8 @@ fn main() {
                     let peer_count = crate::p2p::get_known_peers().len();
                     let use_oracle = !no_oracle && peer_count < P2P_SELF_SUFFICIENT_PEERS;
 
-                    if use_oracle {
+                    let gap_fill = crate::p2p::ORACLE_GAP_FILL_NEEDED.swap(false, std::sync::atomic::Ordering::Relaxed);
+                    if use_oracle || gap_fill {
                         crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)).await;
                     }
                     crate::p2p::broadcast_peer_announce(Some(&handle_startup)).await;
@@ -823,9 +827,6 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 crate::p2p::run_shard_rebalance_monitor().await;
             });
-
-            // Restore any txs that were pending when the app last closed.
-            crate::commands::tx_pending::restore_to_mempool();
 
             tauri::async_runtime::spawn(async move {
                 crate::mempool::run_batch_loop().await;

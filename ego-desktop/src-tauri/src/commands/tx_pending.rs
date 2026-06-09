@@ -23,6 +23,10 @@ fn save(txs: &[LedgerTx]) {
 }
 
 pub fn add(tx: &LedgerTx) {
+    if tx.signature.is_empty() || tx.public_key_ed25519.is_empty() {
+        eprintln!("[TxPending] Dropping malformed TX {} — missing signature/pubkey", &tx.hash[..12.min(tx.hash.len())]);
+        return;
+    }
     let mut txs = load();
     if !txs.iter().any(|t| t.hash == tx.hash) {
         txs.push(tx.clone());
@@ -53,6 +57,13 @@ pub fn restore_to_mempool() {
     let mut pruned = 0usize;
 
     for tx in &txs {
+        if tx.signature.is_empty() || tx.public_key_ed25519.is_empty() {
+            eprintln!("[TxPending] Pruning malformed TX {} — missing signature/pubkey", &tx.hash[..12.min(tx.hash.len())]);
+            remove(&tx.hash);
+            pruned += 1;
+            continue;
+        }
+
         if crate::chain_db::get_tx_by_hash(&tx.hash).is_some() {
             remove(&tx.hash);
             pruned += 1;
@@ -78,8 +89,18 @@ pub fn restore_to_mempool() {
             continue;
         }
 
-        pool.push(tx.clone());
-        restored += 1;
+        match pool.push(tx.clone()) {
+            Ok(_) => { restored += 1; }
+            Err(ref e) if e.contains("too far ahead") => {
+                eprintln!("[TxPending] TX {} deferred — nonce {} not yet confirmable (confirmed={}); will retry after oracle sync",
+                    &tx.hash[..12.min(tx.hash.len())], tx.nonce, confirmed_nonce);
+            }
+            Err(e) => {
+                eprintln!("[TxPending] Pruning TX {} — push rejected: {}", &tx.hash[..12.min(tx.hash.len())], e);
+                remove(&tx.hash);
+                pruned += 1;
+            }
+        }
     }
 
     if restored > 0 {

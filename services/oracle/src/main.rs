@@ -72,14 +72,17 @@ pub struct ChainState {
     pub transactions: Vec<Value>,
 }
 
+#[derive(Deserialize)]
+struct ChainQuery {
+    #[serde(rename = "fromHeight")]
+    from_height: Option<u64>,
+    limit: Option<usize>,
+}
+
 const MAX_BLOCKS: usize       = 50_000;
 const MAX_TRANSACTIONS: usize = 500_000;
 
-/// Fill in any missing block fields with defaults so /chain/blocks returns
-/// the full LedgerBlock schema regardless of when the block was pushed.
-/// This prevents desktop clients from rejecting blocks with "hash mismatch"
-/// because old/incomplete payloads were missing tx_merkle_root/poc_ticket/
-/// state_root/etc. — which are part of the v2/v3 hash.
+
 fn normalize_block_schema(block: &mut Value) {
     let obj = match block.as_object_mut() {
         Some(o) => o,
@@ -335,14 +338,34 @@ async fn handle_egoc(State(state): State<AppState>) -> impl IntoResponse {
 
 // ── Handlers: chain ───────────────────────────────────────────────────────────
 
-async fn handle_chain_blocks(State(state): State<AppState>) -> impl IntoResponse {
+async fn handle_chain_blocks(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ChainQuery>
+) -> impl IntoResponse {
     let chain = state.chain.read().await;
-    Json(chain.sorted_blocks())
+    let from = q.from_height.unwrap_or(0);
+    let limit = q.limit.unwrap_or(500);
+    
+    let filtered: Vec<Value> = chain.blocks.iter()
+        .filter(|b| b["height"].as_u64().unwrap_or(0) >= from)
+        .take(limit)
+        .cloned()
+        .collect();
+    Json(filtered)
 }
 
-async fn handle_chain_transactions(State(state): State<AppState>) -> impl IntoResponse {
+async fn handle_chain_transactions(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ChainQuery>
+) -> impl IntoResponse {
     let chain = state.chain.read().await;
-    Json(chain.sorted_txs())
+    let from = q.from_height.unwrap_or(0);
+    let filtered: Vec<Value> = chain.transactions.iter()
+        .filter(|t| t["block_height"].as_u64().unwrap_or(0) >= from)
+        .take(500)
+        .cloned()
+        .collect();
+    Json(filtered)
 }
 
 #[derive(Deserialize)]

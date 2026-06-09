@@ -1022,6 +1022,18 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
                             }));
                         }
                     }
+                    // Update ledger.nonce if the block contains a transaction from the local node
+                    let max_nonce_for_addr = max_confirmed_nonce_from_db(&addr);
+                    if ledger.nonce != max_nonce_for_addr {
+                        ledger.nonce = max_nonce_for_addr;
+                        let _ = ledger.save(); // Save the updated nonce to disk
+                        if let Some(h) = crate::p2p::APP_HANDLE.get() {
+                            let _ = h.emit_all("wallet-nonce-updated", serde_json::json!({
+                                "address": addr,
+                                "nonce": max_nonce_for_addr
+                            }));
+                        }
+                    }
                 }
             });
         }
@@ -3891,6 +3903,17 @@ pub fn persist_nonce_in_batch(batch: &mut WriteBatch, db: &DB, address: &str, no
     if nonce > existing {
         batch.put_cf(cf, &key, u64_le(nonce));
     }
+}
+
+/// Read the persisted confirmed nonce for a single address directly from CF_META.
+/// Used as a fallback when the in-memory NONCE_STORE is stale (e.g. after oracle sync
+/// writes blocks without updating memory, or after a reorg that zeros the store).
+pub fn max_confirmed_nonce_from_db(address: &str) -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return 0 };
+    let mut key = NONCE_KEY_PREFIX.to_vec();
+    key.extend_from_slice(address.as_bytes());
+    db.get_cf(cf, &key).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
 }
 
 /// Restore all confirmed nonces from CF_META into the in-memory NONCE_STORE.

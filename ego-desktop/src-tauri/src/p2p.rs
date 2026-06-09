@@ -675,6 +675,7 @@ fn should_solo_commit_now() -> bool {
     committee_alone
 }
 
+pub static ORACLE_GAP_FILL_NEEDED: AtomicBool = AtomicBool::new(false);
 pub static LAST_BLOCK_FINALIZED_TS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 
@@ -7690,6 +7691,9 @@ async fn merge_remote_chain_inner(
             sync_chain_from_peers().await;
         });
     }
+    if peer_ahead {
+        ORACLE_GAP_FILL_NEEDED.store(true, Ordering::Relaxed);
+    }
 }
 
 pub async fn oracle_sync_chain() {
@@ -7734,12 +7738,14 @@ pub async fn fetch_chain_from_oracle(app: Option<&tauri::AppHandle<tauri::Wry>>)
         .build()
         .unwrap_or_default();
 
-    let blocks: Vec<crate::ledger::LedgerBlock> = match oracle_get(&client, "/chain/blocks").await {
+    let local_tip = crate::chain_db::latest_block_info().0;
+    let url = format!("/chain/blocks?fromHeight={}", local_tip);
+    let blocks: Vec<crate::ledger::LedgerBlock> = match oracle_get(&client, &url).await {
         Some(resp) => resp.json().await.unwrap_or_default(),
         None => { eprintln!("[Oracle] fetch blocks: all endpoints unreachable"); vec![] }
     };
 
-    let transactions: Vec<crate::ledger::LedgerTx> = match oracle_get(&client, "/chain/transactions").await {
+    let transactions: Vec<crate::ledger::LedgerTx> = match oracle_get(&client, &format!("/chain/transactions?fromHeight={}", local_tip)).await {
         Some(resp) => resp.json().await.unwrap_or_default(),
         None => { eprintln!("[Oracle] fetch txs: all endpoints unreachable"); vec![] }
     };

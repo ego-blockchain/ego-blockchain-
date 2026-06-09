@@ -61,6 +61,13 @@ pub struct RpcState {
     pub peer_rpc_addrs: Mutex<HashMap<String, String>>,
 }
 
+#[derive(Deserialize)]
+struct ChainQuery {
+    #[serde(rename = "fromHeight")]
+    from_height: Option<u64>,
+    limit: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BlockSummary {
     pub height:    u64,
@@ -156,9 +163,10 @@ async fn health(State(s): State<Arc<RpcState>>) -> impl IntoResponse {
     }))
 }
 
-async fn chain_blocks(_s: State<Arc<RpcState>>) -> impl IntoResponse {
-    // Serve newest 500 blocks from the persistent store — no memory pressure.
-    let blocks = crate::store::get_blocks(500);
+async fn chain_blocks(_s: State<Arc<RpcState>>, axum::extract::Query(q): axum::extract::Query<ChainQuery>) -> impl IntoResponse {
+    let from = q.from_height.unwrap_or(0);
+    let limit = q.limit.unwrap_or(500).min(1000);
+    let blocks = crate::store::get_blocks_range(from, limit);
     Json(blocks)
 }
 
@@ -584,8 +592,21 @@ async fn tx_submit(
     }
 }
 
-async fn chain_transactions(_s: State<Arc<RpcState>>) -> impl IntoResponse {
-    Json(crate::store::get_txs(100))
+async fn chain_transactions(
+    State(s): State<Arc<RpcState>>,
+    axum::extract::Query(q): axum::extract::Query<ChainQuery>
+) -> impl IntoResponse {
+    let from = q.from_height.unwrap_or(0);
+    let limit = q.limit.unwrap_or(100) as usize;
+    
+    // Fetch blocks in range and collect their transactions
+    let blocks = crate::store::get_blocks_range(from, 50); // Small window for tx collection
+    let mut txs = Vec::new();
+    for block in blocks {
+        let height = block["header"]["core"]["height"].as_u64().unwrap_or(0);
+        // Note: ego-node store implementation for per-block txs would go here
+    }
+    Json(crate::store::get_txs(limit))
 }
 
 async fn tx_broadcast(
