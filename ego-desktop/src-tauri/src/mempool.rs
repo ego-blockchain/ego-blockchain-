@@ -180,9 +180,18 @@ impl ShardedMempool {
                     return Err(err);
                 }
                 if tx.nonce > confirmed_nonce + 10 {
-                    let err = format!("nonce {} too far ahead of confirmed {}", tx.nonce, confirmed_nonce);
-                    eprintln!("[Mempool] REJECTED {:.12} — {}", &tx.hash[..12.min(tx.hash.len())], err);
-                    return Err(err);
+                    // In-memory store may lag behind DB (e.g. after oracle sync or reorg).
+                    // Check CF_META directly and repair memory before rejecting.
+                    let db_nonce = crate::chain_db::max_confirmed_nonce_from_db(&tx.from);
+                    if db_nonce > confirmed_nonce {
+                        crate::ledger::record_confirmed_nonce(&tx.from, db_nonce);
+                    }
+                    let effective = db_nonce.max(confirmed_nonce);
+                    if tx.nonce > effective + 10 {
+                        let err = format!("nonce {} too far ahead of confirmed {}", tx.nonce, effective);
+                        eprintln!("[Mempool] REJECTED {:.12} — {}", &tx.hash[..12.min(tx.hash.len())], err);
+                        return Err(err);
+                    }
                 }
             }
         }
