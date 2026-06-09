@@ -601,7 +601,7 @@ async fn chain_transactions(
     
     // Fetch blocks in range and collect their transactions
     let blocks = crate::store::get_blocks_range(from, 50); // Small window for tx collection
-    let mut txs = Vec::new();
+    let mut txs: Vec<serde_json::Value> = Vec::new();
     for block in blocks {
         let height = block["header"]["core"]["height"].as_u64().unwrap_or(0);
         // Note: ego-node store implementation for per-block txs would go here
