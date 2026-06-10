@@ -776,9 +776,9 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     let mut slashed_seen = load_slashed_set_inner(db);
     let mut newly_slashed: Vec<(String, u64)> = Vec::new();
 
-    let confirmed_txs: Vec<&LedgerTx> = txs.iter()
-        .filter(|tx| tx.status == "Confirmed" || tx.status.is_empty())
-        .collect();
+    // Process all transactions provided in the block. If they are in the block 
+    // payload, they are being treated as valid and confirmed by the consensus layer.
+    let confirmed_txs: Vec<&LedgerTx> = txs.iter().collect();
 
     for tx in &confirmed_txs {
         // Skip if tx already exists.
@@ -1306,31 +1306,27 @@ pub fn grant_testnet_faucet(address: &str, amount_uegoc: u64) -> bool {
     let credited = amount_uegoc.min(pool_bal);
     if credited == 0 { return false; }
 
-    // 1. Check global chain history to prevent cross-node abuse
+    // Check confirmed chain history — if a faucet tx already committed, don't grant again.
     let global_drops = get_tx_history_for_addr(address)
         .into_iter()
         .filter(|tx| tx.tx_type == "faucet")
         .count() as u64;
 
-    // 2. Check local database counter
-    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let cf_meta = match db.cf_handle(CF_META) { Some(c) => c, None => return false };
-    let faucet_key = format!("faucet_drops:{}", address);
-    
-    let local_drops = db.get_cf(cf_meta, faucet_key.as_bytes())
-        .ok().flatten()
-        .map(|v| read_u64_le(&v))
-        .unwrap_or(0);
-
-    let total_drops = global_drops.max(local_drops);
-    if total_drops >= 1 {
+    if global_drops >= 1 {
         return false;
     }
 
-    let _ = db.put_cf(cf_meta, faucet_key.as_bytes(), u64_le(total_drops + 1));
-    drop(db); // Release DB lock early
+    // Check mempool — don't grant if a faucet tx is already pending (not yet committed).
+    let already_pending = crate::mempool::get_mempool()
+        .pending_txs_for_address(address)
+        .into_iter()
+        .any(|tx| tx.tx_type == "faucet" && tx.to == address);
 
-    // 3. Generate transaction (nonce MUST be 0 for system txs to prevent network collisions)
+    if already_pending {
+        return false;
+    }
+
+    // Generate transaction (nonce MUST be 0 for system txs to prevent network collisions)
     let current_time = chrono::Utc::now().timestamp();
     let nonce = 0;
 
@@ -2757,9 +2753,6 @@ pub fn apply_missing_tx(block_height: u64, tx: &LedgerTx) {
     let cf_meta       = db.cf_handle(CF_META).unwrap();
 
     if db.get_cf(cf_txs, tx.hash.as_bytes()).ok().flatten().is_some() {
-        return;
-    }
-    if tx.status != "Confirmed" && !tx.status.is_empty() {
         return;
     }
 
