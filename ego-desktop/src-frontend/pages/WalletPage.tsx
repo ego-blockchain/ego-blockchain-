@@ -26,6 +26,8 @@ interface Balance {
   formatted: string;
   egusd: number;
   uegusd: number;
+  pending_out_uegoc: number;
+  pending_in_uegoc: number;
 }
 
 interface RemoteNodeInfo {
@@ -937,6 +939,11 @@ const WalletPage: React.FC = () => {
             <div className={`text-sm mt-1 ${isLiveMode ? 'text-gray-500' : 'text-blue-300'}`}>
               {isLiveMode ? '≈ $0.00 USD' : `≈ ${fiatBal} USD`}
             </div>
+            {!isLiveMode && balance && balance.pending_out_uegoc > 0 && (
+              <div className="text-xs mt-1 text-yellow-300 font-medium">
+                {(balance.pending_out_uegoc / 1_000_000).toFixed(2)} EGOC pending · available {((balance.uegoc - balance.pending_out_uegoc) / 1_000_000).toFixed(2)} EGOC
+              </div>
+            )}
           </div>
 
           {/* Network + flip button */}

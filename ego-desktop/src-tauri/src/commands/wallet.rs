@@ -61,6 +61,8 @@ pub struct Balance {
     pub formatted: String,
     pub egusd: u64,
     pub uegusd: u64,
+    pub pending_out_uegoc: u64,
+    pub pending_in_uegoc: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -88,7 +90,7 @@ pub async fn get_balance(_state: State<'_, AppState>) -> Result<Balance, EgoDesk
         let my_addr = ledger.address.clone();
 
         if my_addr.is_empty() {
-            return Ok(Balance { egoc: 0, uegoc: 0, formatted: "0.00 EGOC".into(), egusd: 0, uegusd: 0 });
+            return Ok(Balance { egoc: 0, uegoc: 0, formatted: "0.00 EGOC".into(), egusd: 0, uegusd: 0, pending_out_uegoc: 0, pending_in_uegoc: 0 });
         }
 
         let confirmed = crate::chain_db::balance_of(&my_addr);
@@ -106,7 +108,7 @@ pub async fn get_balance(_state: State<'_, AppState>) -> Result<Balance, EgoDesk
             .map(|tx| tx.amount)
             .sum();
 
-        let uegoc = confirmed.saturating_add(pending_faucet_in).saturating_sub(pending_out);
+        let uegoc = confirmed.saturating_add(pending_faucet_in);
         let egoc  = uegoc / 1_000_000;
 
         let uegusd = ledger.balance_uegusd;
@@ -118,6 +120,8 @@ pub async fn get_balance(_state: State<'_, AppState>) -> Result<Balance, EgoDesk
             formatted: format!("{:.2} EGOC", uegoc as f64 / 1_000_000.0),
             egusd,
             uegusd,
+            pending_out_uegoc: pending_out,
+            pending_in_uegoc: pending_faucet_in,
         })
     })
     .await
