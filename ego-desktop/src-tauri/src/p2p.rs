@@ -1348,13 +1348,18 @@ fn verify_peer_announce_identity(
         Ok(bytes) if !bytes.is_empty() => bytes,
         _ => return false,
     };
-    let expected = ego_core::EgoAddress::from_dilithium_pk(
+    let dil_derived = ego_core::EgoAddress::from_dilithium_pk(
         &dil_pk,
         1,
         ego_core::AddressType::EOA,
     ).to_bech32("egot").unwrap_or_default();
-    if expected != address {
-        tracing::debug!("[P2P] Rejected peer {} - Dilithium key does not derive this address", address);
+    let ed_derived = hex::decode(vrf_pubkey).ok()
+        .filter(|b| b.len() == 32)
+        .map(|b| ego_core::EgoAddress::from_public_key_bytes(&b, 1, ego_core::AddressType::EOA)
+            .to_bech32("egot").unwrap_or_default())
+        .unwrap_or_default();
+    if dil_derived != address && ed_derived != address {
+        tracing::debug!("[P2P] Rejected peer {} - announced keys do not derive this address", address);
         return false;
     }
     let sig = match hex::decode(signature) {

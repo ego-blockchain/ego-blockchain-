@@ -44,7 +44,7 @@ export function SendScreen({ navigation }: { navigation: Nav }) {
     let amt  = '';
     if (data.startsWith('ego:')) {
       const url = new URL(data.replace('ego:', 'ego://'));
-      addr = url.pathname.replace(/^\/\
+      addr = (url.hostname || url.pathname).replace(/^\/+/, '');
       amt  = url.searchParams.get('amount') ?? '';
     }
     setToAddress(addr);

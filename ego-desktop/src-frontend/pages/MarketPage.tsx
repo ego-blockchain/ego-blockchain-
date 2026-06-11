@@ -72,6 +72,14 @@ function fmtPrice(p: number): string {
   return '$' + p.toFixed(8);
 }
 
+function fmtEur(p: number): string {
+  if (!p) return '—';
+  if (p >= 1000) return '€' + p.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  if (p >= 1)    return '€' + p.toFixed(2);
+  if (p >= 0.01) return '€' + p.toFixed(4);
+  return '€' + p.toFixed(8);
+}
+
 function fmtTooltipDate(idx: number, totalBars: number, minPerBar: number, isLive: boolean): string {
   if (isLive) { return idx === totalBars - 1 ? 'Now' : `${totalBars - 1 - idx}s ago`; }
   const now    = new Date();
@@ -272,6 +280,7 @@ const MarketPage: React.FC = () => {
   const { wallet }                        = useWallet();
   const [rates, setRates]                 = useState<Record<string, number>>({});
   const [ratesLoading, setRatesLoading]   = useState(true);
+  const [eurUsd, setEurUsd]               = useState(0); // USD per 1 EUR
   const [selected, setSelected]           = useState<typeof COIN_MAP[0] | null>(null);
   const [rangeKey, setRangeKey]           = useState<RangeKey>('3M');
   const [chartType, setChartType]         = useState<ChartType>('line');
@@ -294,7 +303,15 @@ const MarketPage: React.FC = () => {
       .then(r => { setRates(r); setRatesLoading(false); })
       .catch(() => setRatesLoading(false))
       .finally(() => clearTimeout(giveUp));
+    invoke<number>('fetch_eur_usd_rate')
+      .then(setEurUsd)
+      .catch(() => setEurUsd(0));
   }, []);
+
+  const usdToEur = useCallback(
+    (usd: number) => (eurUsd > 0 ? usd / eurUsd : 0),
+    [eurUsd],
+  );
 
   function stopLive() {
     if (liveRef.current) { clearInterval(liveRef.current); liveRef.current = null; }
@@ -419,7 +436,7 @@ const MarketPage: React.FC = () => {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-xl font-bold">Market</h1>
-          <p className="text-xs text-gray-400 mt-0.5">Click a coin to view its chart • Hover for price &amp; date</p>
+          <p className="text-xs text-gray-400 mt-0.5">Prices in US Dollars ($) with Euro (€) equivalent • Click a coin to view its chart</p>
         </div>
         <button onClick={() => { setRatesLoading(true); invoke<Record<string,number>>('fetch_swap_rates').then(r=>{setRates(r);setRatesLoading(false);}).catch(()=>setRatesLoading(false)); }}
           disabled={ratesLoading}
@@ -443,11 +460,21 @@ const MarketPage: React.FC = () => {
                   {selected ? selected.name : 'Ego Coin'}
                   {currentRange.isLive && <span className="flex items-center gap-1 text-green-400 font-semibold"><span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse"/>LIVE</span>}
                 </div>
-                <div className="text-3xl font-bold">
-                  {currentRange.isLive
-                    ? fmtPrice(chartType==='line' ? lineData[lineData.length-1] : candleData[candleData.length-1]?.[3])
-                    : fmtPrice(activePrice)}
-                </div>
+                {(() => {
+                  const shown = currentRange.isLive
+                    ? (chartType==='line' ? lineData[lineData.length-1] : candleData[candleData.length-1]?.[3])
+                    : activePrice;
+                  return (
+                    <div>
+                      <div className="text-3xl font-bold">
+                        {fmtPrice(shown)} <span className="text-sm font-medium text-gray-500">USD</span>
+                      </div>
+                      {eurUsd > 0 && shown > 0 && (
+                        <div className="text-sm text-gray-400 mt-0.5">≈ {fmtEur(usdToEur(shown))} EUR</div>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             </div>
 
@@ -515,8 +542,11 @@ const MarketPage: React.FC = () => {
                   {balancesLoading ? '⟳' : '⟳ Sync'}
                 </button>
                 <div className="text-right">
-                  <div className="text-[10px] text-gray-500 uppercase tracking-wide">Total Value</div>
+                  <div className="text-[10px] text-gray-500 uppercase tracking-wide">Total Value (USD)</div>
                   <div className="text-base font-bold">{fmtUsd(totalUsd)}</div>
+                  {eurUsd > 0 && totalUsd > 0 && (
+                    <div className="text-[11px] text-gray-500">≈ {fmtEur(usdToEur(totalUsd))}</div>
+                  )}
                 </div>
               </div>
             </div>
@@ -583,7 +613,7 @@ const MarketPage: React.FC = () => {
       {/* Coin list */}
       <div>
         <div className="flex items-center justify-between mb-2">
-          <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Live Prices</h2>
+          <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wide">Live Prices · USD / EUR</h2>
           {selected && <button onClick={() => selectCoin(null)} className="text-xs text-blue-400 hover:text-blue-300 transition">← Back to EGOC</button>}
         </div>
 
@@ -601,6 +631,7 @@ const MarketPage: React.FC = () => {
           </div>
           <div className="text-right">
             <div className="text-sm font-semibold">{fmtPrice(EGOC_PRICE)}</div>
+            {eurUsd > 0 && <div className="text-[11px] text-gray-500">{fmtEur(usdToEur(EGOC_PRICE))}</div>}
             <div className="text-xs text-green-400">▲ simulated</div>
           </div>
         </button>
@@ -627,8 +658,13 @@ const MarketPage: React.FC = () => {
                       {heldQty.toLocaleString(undefined, { maximumFractionDigits: 6 })} held
                     </div>
                   )}
-                  <div className="text-sm font-semibold">
-                    {ratesLoading && !price ? <span className="text-gray-500 text-xs">Loading…</span> : fmtPrice(price)}
+                  <div className="text-right">
+                    <div className="text-sm font-semibold">
+                      {ratesLoading && !price ? <span className="text-gray-500 text-xs">Loading…</span> : fmtPrice(price)}
+                    </div>
+                    {eurUsd > 0 && price > 0 && (
+                      <div className="text-[11px] text-gray-500">{fmtEur(usdToEur(price))}</div>
+                    )}
                   </div>
                 </div>
               </button>

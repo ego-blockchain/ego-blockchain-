@@ -1,47 +1,17 @@
 import nacl from 'tweetnacl';
 import { blake2s } from 'blakejs';
-import { bech32 } from 'bech32';
+import { bech32m } from 'bech32';
 
-const WORDLIST: string[] = [
-  'abandon','ability','able','about','above','absent','absorb','abstract',
-  'absurd','abuse','access','accident','account','accuse','achieve','acid',
-  'acoustic','acquire','across','action','actor','actress','actual','adapt',
-  'add','addict','address','adjust','admit','adult','advance','advice',
-  'aerobic','afford','afraid','again','agent','agree','ahead','aim',
-  'air','airport','aisle','alarm','album','alcohol','alert','alien',
-  'alley','allow','almost','alone','alpha','already','also','alter',
-  'always','amateur','amazing','among','amount','amused','analyst','anchor',
-  'ancient','anger','angle','angry','animal','ankle','announce','annual',
-  'another','answer','antenna','antique','anxiety','any','apart','apology',
-  'appear','apple','approve','april','arch','arctic','area','arena',
-  'argue','arm','armor','army','around','arrange','arrest','arrive',
-  'arrow','art','artefact','artist','artwork','ask','aspect','assault',
-  'asset','assist','assume','asthma','athlete','atom','attack','attend',
-  'attitude','attract','auction','audit','august','aunt','author','auto',
-  'autumn','average','avocado','avoid','awake','aware','away','awesome',
-  'awful','awkward','axis','baby','balance','bamboo','banana','banner',
-  'bar','barely','bargain','barrel','base','basic','basket','battle',
-  'beach','beauty','because','become','beef','before','begin','behave',
-  'behind','believe','below','belt','bench','benefit','best','betray',
-  'better','between','beyond','bicycle','bid','bike','bind','biology',
-  'bird','birth','bitter','black','blade','blame','blanket','blast',
-  'bleak','bless','blind','blood','blossom','blouse','blue','blur',
-  'blush','board','boat','body','boil','bomb','bone','book',
-  'boost','border','boring','borrow','boss','bottom','bounce','box',
-  'boy','bracket','brain','brand','brave','bread','breeze','brick',
-  'bridge','brief','bright','bring','brisk','broccoli','broken','bronze',
-  'broom','brother','brown','brush','bubble','buddy','budget','buffalo',
-  'build','bulb','bulk','bullet','bundle','bunker','burden','burger',
-];
+import { WORDLIST } from './wordlist';
 
 export function generateSeed(): Uint8Array {
   return crypto.getRandomValues(new Uint8Array(32));
 }
 
+// Encodes seed exactly like Ego Desktop's generate_recovery_phrase():
+// buf = seed(32) || blake2s256(seed)[0], split into 24 x 11-bit indices.
 export async function seedToMnemonic(seed: Uint8Array): Promise<string[]> {
-
-  const hashBuf = await crypto.subtle.digest('SHA-256', seed);
-  const checksum = new Uint8Array(hashBuf)[0];
+  const checksum = blake2s(seed, undefined, 32)[0];
 
   const data = new Uint8Array(33);
   data.set(seed);
@@ -49,56 +19,71 @@ export async function seedToMnemonic(seed: Uint8Array): Promise<string[]> {
 
   const words: string[] = [];
   for (let i = 0; i < 24; i++) {
-    const bitStart = i * 11;
-    const byteStart = Math.floor(bitStart / 8);
-    const bitOffset = bitStart % 8;
+    const bitOffset = i * 11;
+    const byteIdx = Math.floor(bitOffset / 8);
+    const bitShift = bitOffset % 8;
 
-    const b0 = data[byteStart] ?? 0;
-    const b1 = data[byteStart + 1] ?? 0;
-    const b2 = data[byteStart + 2] ?? 0;
+    const b0 = data[byteIdx] ?? 0;
+    const b1 = data[byteIdx + 1] ?? 0;
+    const b2 = data[byteIdx + 2] ?? 0;
 
-    const val24 = (b0 << 16) | (b1 << 8) | b2;
-    const index = (val24 >> (13 - bitOffset)) & 0x7ff;
-
-    words.push(WORDLIST[index % WORDLIST.length]);
+    const raw = (b0 << 16) | (b1 << 8) | b2;
+    const index = ((raw >> (13 - bitShift)) & 0x7ff) % WORDLIST.length;
+    words.push(WORDLIST[index]);
   }
   return words;
 }
 
+// Decodes an Ego Desktop recovery phrase. The desktop wordlist contains a
+// few duplicated words, so every occurrence position is tried as a candidate
+// and the blake2s checksum picks the correct combination.
 export function mnemonicToSeed(words: string[]): Uint8Array | null {
   if (words.length !== 24) return null;
 
-  const data = new Uint8Array(33);
+  const positions = new Map<string, number[]>();
+  WORDLIST.forEach((w, i) => {
+    const list = positions.get(w);
+    if (list) list.push(i); else positions.set(w, [i]);
+  });
 
-  for (let i = 0; i < 24; i++) {
-    const idx = WORDLIST.indexOf(words[i].toLowerCase().trim());
-    if (idx === -1) return null;
-
-    const bitStart = i * 11;
-    const byteStart = Math.floor(bitStart / 8);
-    const bitOffset = bitStart % 8;
-
-    const val = idx & 0x7ff;
-
-    const bitsInFirst = 8 - bitOffset;
-
-    if (bitsInFirst >= 11) {
-      data[byteStart] |= (val << (bitsInFirst - 11)) & 0xff;
-    } else {
-      const bitsInSecond = 11 - bitsInFirst;
-      if (bitsInSecond <= 8) {
-        data[byteStart] |= (val >> bitsInSecond) & 0xff;
-        data[byteStart + 1] |= (val << (8 - bitsInSecond)) & 0xff;
-      } else {
-        const bitsInThird = bitsInSecond - 8;
-        data[byteStart] |= (val >> bitsInSecond) & 0xff;
-        data[byteStart + 1] |= (val >> bitsInThird) & 0xff;
-        data[byteStart + 2] |= (val << (8 - bitsInThird)) & 0xff;
-      }
-    }
+  const candidates: number[][] = [];
+  for (const raw of words) {
+    const found = positions.get(raw.toLowerCase().trim());
+    if (!found) return null;
+    candidates.push(found);
   }
 
-  return data.slice(0, 32);
+  const totalCombos = candidates.reduce((n, c) => n * c.length, 1);
+  if (totalCombos > 256) return null;
+
+  const tryCombo = (indices: number[]): Uint8Array | null => {
+    const buf = new Uint8Array(33);
+    for (let i = 0; i < 24; i++) {
+      const bitOffset = i * 11;
+      const byteIdx = Math.floor(bitOffset / 8);
+      const bitShift = bitOffset % 8;
+      const raw = (indices[i] & 0x7ff) << (13 - bitShift);
+      buf[byteIdx] |= (raw >> 16) & 0xff;
+      if (byteIdx + 1 < 33) buf[byteIdx + 1] |= (raw >> 8) & 0xff;
+      if (byteIdx + 2 < 33) buf[byteIdx + 2] |= raw & 0xff;
+    }
+    const seed = buf.slice(0, 32);
+    if (blake2s(seed, undefined, 32)[0] !== buf[32]) return null;
+    return seed;
+  };
+
+  const combo = new Array<number>(24);
+  const search = (pos: number): Uint8Array | null => {
+    if (pos === 24) return tryCombo(combo);
+    for (const idx of candidates[pos]) {
+      combo[pos] = idx;
+      const result = search(pos + 1);
+      if (result) return result;
+    }
+    return null;
+  };
+
+  return search(0);
 }
 
 export function hexToSeed(hex: string): Uint8Array | null {
@@ -124,10 +109,22 @@ export function seedToKeypair(seed: Uint8Array): { privateKey: Uint8Array; publi
   };
 }
 
+// Mirrors ego-core EgoAddress::from_public_key_bytes(pk, 1, EOA).to_bech32("egot"):
+// blake2s256("ego/addr/v1" || chain_id_le || pubkey)[..20], version byte, bech32m.
 export function publicKeyToAddress(pubkey: Uint8Array): string {
-  const hash = blake2s(pubkey, undefined, 20);
-  const words = bech32.toWords(hash);
-  return bech32.encode('egot', words);
+  const domainTag = new TextEncoder().encode('ego/addr/v1');
+  const input = new Uint8Array(domainTag.length + 4 + pubkey.length);
+  input.set(domainTag, 0);
+  input.set(new Uint8Array([1, 0, 0, 0]), domainTag.length); // chain_id = 1u32 LE (testnet)
+  input.set(pubkey, domainTag.length + 4);
+  const digest = blake2s(input, undefined, 32);
+
+  const ADDRESS_VERSION = 0b001;
+  const EOA = 0;
+  const payload = new Uint8Array(21);
+  payload[0] = (ADDRESS_VERSION << 5) | EOA;
+  payload.set(digest.slice(0, 20), 1);
+  return bech32m.encode('egot', bech32m.toWords(payload));
 }
 
 export interface TxPayload {
@@ -179,7 +176,7 @@ export async function encryptSeed(seed: Uint8Array, password: string): Promise<s
     false,
     ['encrypt'],
   );
-  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, seed);
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, seed as BufferSource);
 
   const packed = new Uint8Array(16 + 12 + ciphertext.byteLength);
   packed.set(salt, 0);

@@ -5,11 +5,20 @@ use crate::lexer::{Spanned, Token};
 pub struct Parser {
     tokens: Vec<Spanned>,
     pos:    usize,
+    no_struct_lit: bool,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Spanned>) -> Self {
-        Self { tokens, pos: 0 }
+        Self { tokens, pos: 0, no_struct_lit: false }
+    }
+
+    fn parse_cond_expr(&mut self) -> Result<Expr> {
+        let prev = self.no_struct_lit;
+        self.no_struct_lit = true;
+        let out = self.parse_expr();
+        self.no_struct_lit = prev;
+        out
     }
 
     fn peek(&self) -> &Token {
@@ -270,7 +279,7 @@ impl Parser {
 
     fn parse_if(&mut self) -> Result<Stmt> {
         self.expect(&Token::If)?;
-        let cond = self.parse_expr()?;
+        let cond = self.parse_cond_expr()?;
         self.expect(&Token::LBrace)?;
         let then = self.parse_block()?;
         self.expect(&Token::RBrace)?;
@@ -288,7 +297,7 @@ impl Parser {
 
     fn parse_while(&mut self) -> Result<Stmt> {
         self.expect(&Token::While)?;
-        let cond = self.parse_expr()?;
+        let cond = self.parse_cond_expr()?;
         self.expect(&Token::LBrace)?;
         let body = self.parse_block()?;
         self.expect(&Token::RBrace)?;
@@ -301,7 +310,7 @@ impl Parser {
         if self.peek() == &Token::Mut { self.advance(); }
         let var = self.expect_ident()?;
         self.expect(&Token::In)?;
-        let iter = self.parse_expr()?;
+        let iter = self.parse_cond_expr()?;
         self.expect(&Token::LBrace)?;
         let body = self.parse_block()?;
         self.expect(&Token::RBrace)?;
@@ -310,7 +319,7 @@ impl Parser {
 
     fn parse_match(&mut self) -> Result<Stmt> {
         self.expect(&Token::Match)?;
-        let expr = self.parse_expr()?;
+        let expr = self.parse_cond_expr()?;
         self.expect(&Token::LBrace)?;
         let mut arms = Vec::new();
         while self.peek() != &Token::RBrace && self.peek() != &Token::Eof {
@@ -476,7 +485,12 @@ impl Parser {
             match self.peek() {
                 Token::Dot => {
                     self.advance();
-                    let field_or_method = self.expect_ident()?;
+                    let field_or_method = if self.peek() == &Token::Emit {
+                        self.advance();
+                        "emit".to_string()
+                    } else {
+                        self.expect_ident()?
+                    };
                     if self.peek() == &Token::LParen {
 
                         self.advance();
@@ -534,7 +548,11 @@ impl Parser {
                     self.advance();
                     return Ok(Expr::Tuple(Vec::new()));
                 }
-                let first = self.parse_expr()?;
+                let prev = self.no_struct_lit;
+                self.no_struct_lit = false;
+                let first = self.parse_expr();
+                self.no_struct_lit = prev;
+                let first = first?;
                 if self.peek() == &Token::Comma {
 
                     self.advance();
@@ -593,7 +611,7 @@ impl Parser {
                             let args = self.parse_args()?;
                             self.expect(&Token::RParen)?;
                             Ok(Expr::Call { name, args })
-                        } else if self.peek() == &Token::LBrace {
+                        } else if self.peek() == &Token::LBrace && !self.no_struct_lit {
 
                             self.advance();
                             let mut fields = Vec::new();

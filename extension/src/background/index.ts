@@ -24,9 +24,24 @@ import type {
   ExtResponse,
   PendingConnection,
   SendTxParams,
+  TrackedAsset,
+  AssetBalance,
   WalletData,
 } from '../shared/types';
 import { NETWORKS } from '../shared/types';
+import {
+  CHAINS,
+  fetchAssetBalance,
+  fetchTokenMeta,
+  validateAddress,
+  type ChainId,
+} from '../shared/assets';
+import {
+  deriveAddress,
+  isSignableChain,
+  sendBtc,
+  sendEvm,
+} from '../shared/signers';
 
 let unlockedSeed: Uint8Array | null = null;
 
@@ -101,12 +116,12 @@ async function importWallet(
 
   if (words.length === 24) {
     seed = mnemonicToSeed(words);
-    if (!seed) return { success: false, error: 'Invalid mnemonic phrase' };
-  } else if (/^[0-9a-fA-F]{64}$/.test(input.trim())) {
-    seed = hexToSeed(input.trim());
-    if (!seed) return { success: false, error: 'Invalid hex seed' };
+    if (!seed) return { success: false, error: 'Invalid recovery phrase — check every word (and their order)' };
   } else {
-    return { success: false, error: 'Provide 24 mnemonic words or a 64-character hex seed' };
+    seed = hexToSeed(input);
+    if (!seed) {
+      return { success: false, error: 'Provide your 24-word recovery phrase, or the 64-character hex seed (with or without 0x)' };
+    }
   }
 
   const { publicKey } = seedToKeypair(seed);
@@ -313,6 +328,142 @@ async function hasWallet(): Promise<ExtResponse<{ hasWallet: boolean }>> {
   return { success: true, data: { hasWallet: walletData !== null } };
 }
 
+// ── Tracked assets (watch-only coins & tokens) ────────────────────────────────
+
+async function loadAssets(): Promise<TrackedAsset[]> {
+  return new Promise(resolve => {
+    chrome.storage.local.get(['trackedAssets'], result => {
+      resolve((result.trackedAssets as TrackedAsset[]) ?? []);
+    });
+  });
+}
+
+async function saveAssets(assets: TrackedAsset[]): Promise<void> {
+  return new Promise(resolve => {
+    chrome.storage.local.set({ trackedAssets: assets }, resolve);
+  });
+}
+
+async function getAssets(): Promise<ExtResponse<{ assets: TrackedAsset[] }>> {
+  return { success: true, data: { assets: await loadAssets() } };
+}
+
+async function addAsset(payload: {
+  chain: ChainId;
+  address: string;
+  contract?: string;
+}): Promise<ExtResponse<{ asset: TrackedAsset }>> {
+  const chain = payload.chain;
+  const chainInfo = CHAINS[chain];
+  if (!chainInfo) return { success: false, error: `Unsupported chain: ${chain}` };
+
+  const address = (payload.address ?? '').trim();
+  if (!validateAddress(chain, address)) {
+    return { success: false, error: `Invalid ${chainInfo.name} address` };
+  }
+
+  const contract = payload.contract?.trim();
+  let symbol: string = chain;
+  let name: string = chainInfo.name;
+  let decimals: number | undefined;
+
+  if (contract) {
+    if (!chainInfo.tokens || (chain !== 'ETH' && chain !== 'BNB')) {
+      return { success: false, error: `Tokens are not supported on ${chainInfo.name}` };
+    }
+    if (!/^0x[0-9a-fA-F]{40}$/.test(contract)) {
+      return { success: false, error: 'Invalid token contract address' };
+    }
+    try {
+      const meta = await fetchTokenMeta(chain, contract);
+      symbol = meta.symbol;
+      decimals = meta.decimals;
+      name = `${meta.symbol} (${chain === 'ETH' ? 'ERC-20' : 'BEP-20'})`;
+    } catch (e: unknown) {
+      return { success: false, error: `Token lookup failed: ${(e as Error).message}` };
+    }
+  }
+
+  const assets = await loadAssets();
+  const duplicate = assets.find(a =>
+    a.chain === chain &&
+    a.address.toLowerCase() === address.toLowerCase() &&
+    (a.contract ?? '').toLowerCase() === (contract ?? '').toLowerCase(),
+  );
+  if (duplicate) return { success: false, error: 'This asset is already in your list' };
+
+  const asset: TrackedAsset = {
+    id: crypto.randomUUID(),
+    chain,
+    symbol,
+    name,
+    address,
+    contract: contract || undefined,
+    decimals,
+  };
+  assets.push(asset);
+  await saveAssets(assets);
+  return { success: true, data: { asset } };
+}
+
+async function removeAsset(id: string): Promise<ExtResponse> {
+  const assets = await loadAssets();
+  const next = assets.filter(a => a.id !== id);
+  if (next.length === assets.length) return { success: false, error: 'Asset not found' };
+  await saveAssets(next);
+  return { success: true };
+}
+
+async function refreshAssets(): Promise<ExtResponse<{ balances: AssetBalance[] }>> {
+  const assets = await loadAssets();
+  const balances = await Promise.all(assets.map(a => fetchAssetBalance(a)));
+  return { success: true, data: { balances } };
+}
+
+// ── External-chain signing (BTC / ETH / BNB derived from the wallet seed) ─────
+
+async function getChainAddresses(): Promise<ExtResponse<{ addresses: Record<string, string> }>> {
+  if (!unlockedSeed) return { success: false, error: 'Wallet is locked' };
+  const addresses: Record<string, string> = {};
+  for (const chain of ['BTC', 'ETH', 'BNB'] as const) {
+    try {
+      addresses[chain] = deriveAddress(unlockedSeed, chain);
+    } catch (e: unknown) {
+      return { success: false, error: `Derivation failed for ${chain}: ${(e as Error).message}` };
+    }
+  }
+  return { success: true, data: { addresses } };
+}
+
+async function sendExternal(payload: {
+  chain: string;
+  to: string;
+  amount: string;
+  contract?: string;
+  decimals?: number;
+}): Promise<ExtResponse<{ txid: string; explorer_url: string }>> {
+  if (!unlockedSeed) return { success: false, error: 'Wallet is locked' };
+  const { chain, to, amount, contract, decimals } = payload;
+  if (!isSignableChain(chain)) {
+    return { success: false, error: `Sending on ${chain} is not supported yet (watch-only)` };
+  }
+  if (!to?.trim()) return { success: false, error: 'Recipient address required' };
+  if (!amount?.trim()) return { success: false, error: 'Amount required' };
+
+  try {
+    if (chain === 'BTC') {
+      if (contract) return { success: false, error: 'Tokens are not supported on Bitcoin' };
+      const result = await sendBtc(unlockedSeed, to.trim(), amount.trim());
+      return { success: true, data: result };
+    }
+    const token = contract ? { contract, decimals: decimals ?? 18 } : undefined;
+    const result = await sendEvm(unlockedSeed, chain, to.trim(), amount.trim(), token);
+    return { success: true, data: result };
+  } catch (e: unknown) {
+    return { success: false, error: (e as Error).message };
+  }
+}
+
 chrome.runtime.onMessage.addListener(
   (message: ExtMessage, sender, sendResponse) => {
     const { type, payload = {} } = message;
@@ -347,7 +498,7 @@ chrome.runtime.onMessage.addListener(
           return getWalletBalance();
 
         case 'EGO_SEND_TX':
-          return sendTransaction(payload as SendTxParams);
+          return sendTransaction(payload as unknown as SendTxParams);
 
         case 'EGO_SIGN_MESSAGE':
           return handleSignMessage(payload.message as string);
@@ -356,7 +507,7 @@ chrome.runtime.onMessage.addListener(
           return getMnemonic(payload.password as string);
 
         case 'EGO_CONNECT_DAPP':
-          return handleConnectDapp(payload as PendingConnection);
+          return handleConnectDapp(payload as unknown as PendingConnection);
 
         case 'EGO_APPROVE_CONNECTION':
           return approveConnection(payload.requestId as string);
@@ -414,6 +565,26 @@ chrome.runtime.onMessage.addListener(
             return { success: false, error: (e as Error).message };
           }
         }
+
+        case 'EGO_GET_ASSETS':
+          return getAssets();
+
+        case 'EGO_ADD_ASSET':
+          return addAsset(payload as { chain: ChainId; address: string; contract?: string });
+
+        case 'EGO_REMOVE_ASSET':
+          return removeAsset(payload.id as string);
+
+        case 'EGO_REFRESH_ASSETS':
+          return refreshAssets();
+
+        case 'EGO_GET_CHAIN_ADDRESSES':
+          return getChainAddresses();
+
+        case 'EGO_SEND_EXTERNAL':
+          return sendExternal(payload as {
+            chain: string; to: string; amount: string; contract?: string; decimals?: number;
+          });
 
         default:
           return { success: false, error: `Unknown message type: ${type}` };

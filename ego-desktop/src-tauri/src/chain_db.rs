@@ -1393,6 +1393,21 @@ pub fn paged_blocks(offset: usize, limit: usize) -> Vec<LedgerBlock> {
     out
 }
 
+pub fn local_chain_height() -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf) = db.cf_handle(CF_BLOCKS) else { return 0; };
+    let mut iter = db.raw_iterator_cf(cf);
+    iter.seek_to_last();
+    if iter.valid() {
+        if let Some(v) = iter.value() {
+            if let Some(b) = decode::<LedgerBlock>(v) {
+                return b.height;
+            }
+        }
+    }
+    0
+}
+
 pub fn recent_transactions(limit: usize) -> Vec<LedgerTx> {
     paged_transactions(0, limit)
 }

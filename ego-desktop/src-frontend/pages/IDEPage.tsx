@@ -1951,6 +1951,7 @@ export default function IDEPage() {
                   scrollBeyondLastLine: false,
                   automaticLayout: true,
                   padding: { top: 8 },
+                  stickyScroll: { enabled: false },
                 }}
               />
             ) : (

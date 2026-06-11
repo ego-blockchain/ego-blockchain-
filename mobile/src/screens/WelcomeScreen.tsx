@@ -51,6 +51,10 @@ export function WelcomeScreen({ navigation }: { navigation: Nav }) {
     setLoading(true);
     try {
       const seed = mnemonicToSeed(mnemonic);
+      if (!seed) {
+        Alert.alert('Invalid phrase', 'Recovery phrase checksum failed — check every word and their order.');
+        return;
+      }
       const kp   = keyPairFromSeed(seed);
       await saveWallet({
         address:      kp.address,
