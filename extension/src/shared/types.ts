@@ -82,7 +82,13 @@ export type MessageType =
   | 'EGO_GET_BLOCKS'
   | 'EGO_GET_TXS'
   | 'EGO_FAUCET'
-  | 'EGO_HAS_WALLET';
+  | 'EGO_HAS_WALLET'
+  | 'EGO_GET_ASSETS'
+  | 'EGO_ADD_ASSET'
+  | 'EGO_REMOVE_ASSET'
+  | 'EGO_REFRESH_ASSETS'
+  | 'EGO_GET_CHAIN_ADDRESSES'
+  | 'EGO_SEND_EXTERNAL';
 
 export interface ExtMessage {
   type: MessageType;
@@ -106,6 +112,24 @@ export interface SendTxParams {
   to: string;
   amount_egoc: number;
   memo?: string;
+}
+
+export interface TrackedAsset {
+  id: string;
+  chain: 'BTC' | 'ETH' | 'BNB' | 'SOL' | 'DOGE' | 'LTC';
+  symbol: string;
+  name: string;
+  address: string;
+  contract?: string;
+  decimals?: number;
+}
+
+export interface AssetBalance {
+  id: string;
+  balance: number;
+  price_usd: number;
+  value_usd: number;
+  error?: string;
 }
 
 export const NETWORKS = {

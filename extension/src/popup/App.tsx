@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import qrcode from 'qrcode-generator';
 import { generateSeed, seedToMnemonic } from '../shared/crypto';
-import type { ExtMessage, ExtResponse, PendingConnection } from '../shared/types';
+import { CHAINS, type ChainId } from '../shared/assets';
+import type { ExtMessage, ExtResponse, PendingConnection, TrackedAsset, AssetBalance } from '../shared/types';
 
 function sendMsg<T = unknown>(
   type: ExtMessage['type'],
@@ -23,31 +24,56 @@ function cls(...args: (string | boolean | undefined | null)[]): string {
   return args.filter(Boolean).join(' ');
 }
 
+function timeAgo(ts: number): string {
+  const ms = ts > 1e12 ? ts : ts * 1000;
+  const diff = Date.now() - ms;
+  if (diff < 60_000) return 'just now';
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+  return new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
 const S = {
-  page: 'flex flex-col h-full bg-gray-900 text-white',
-  header: 'flex items-center justify-between px-4 py-3 bg-gray-800 border-b border-gray-700',
-  title: 'text-lg font-bold text-blue-400',
-  btn: 'flex items-center justify-center rounded-lg font-semibold transition-colors cursor-pointer',
-  btnPrimary: 'bg-blue-600 hover:bg-blue-500 text-white py-2.5 px-4',
-  btnSecondary: 'bg-gray-700 hover:bg-gray-600 text-white py-2.5 px-4',
-  btnDanger: 'bg-red-700 hover:bg-red-600 text-white py-2.5 px-4',
-  btnGhost: 'bg-transparent hover:bg-gray-700 text-gray-300 py-2 px-3',
-  input: 'w-full rounded-lg bg-gray-800 border border-gray-600 text-white placeholder-gray-400 px-3 py-2.5 outline-none focus:border-blue-500 transition-colors',
-  label: 'block text-sm text-gray-400 mb-1',
-  card: 'rounded-xl bg-gray-800 border border-gray-700 p-4',
+  input: 'ego-input',
+  label: 'ego-label',
   error: 'text-red-400 text-sm mt-1',
   success: 'text-green-400 text-sm mt-1',
-  section: 'flex-1 overflow-y-auto px-4 py-4 flex flex-col gap-4',
 };
 
 const LOGO_URL = chrome.runtime.getURL('icons/icon128.png');
 
 const STYLES = `
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: #0a0a0f; }
 
+  :root {
+    --bg:        #07070d;
+    --bg-1:      #0c0c16;
+    --bg-2:      #12121f;
+    --bg-3:      #1a1a2c;
+    --line:      rgba(148,163,255,0.10);
+    --line-2:    rgba(148,163,255,0.18);
+    --txt:       #f4f5fb;
+    --txt-2:     #9aa1c0;
+    --txt-3:     #5d6485;
+    --indigo:    #6366f1;
+    --violet:    #8b5cf6;
+    --blue:      #3b82f6;
+    --green:     #34d399;
+    --red:       #f87171;
+    --amber:     #fbbf24;
+    --grad:      linear-gradient(135deg, #6366f1, #8b5cf6 55%, #3b82f6);
+  }
+
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--bg);
+    color: var(--txt);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ── Utility classes ─────────────────────────────────────────── */
   .flex { display: flex; }
   .flex-col { flex-direction: column; }
   .flex-1 { flex: 1 1 0%; }
@@ -61,186 +87,389 @@ const STYLES = `
   .gap-2 { gap: 0.5rem; }
   .gap-3 { gap: 0.75rem; }
   .gap-4 { gap: 1rem; }
+  .gap-5 { gap: 1.25rem; }
   .gap-6 { gap: 1.5rem; }
   .grid { display: grid; }
   .grid-cols-3 { grid-template-columns: repeat(3, 1fr); }
-  .grid-cols-4 { grid-template-columns: repeat(4, 1fr); }
   .h-full { height: 100%; }
-  .h-6 { height: 1.5rem; }
-  .h-8 { height: 2rem; }
-  .h-10 { height: 2.5rem; }
   .w-full { width: 100%; }
-  .w-6 { width: 1.5rem; }
-  .w-8 { width: 2rem; }
-  .w-10 { width: 2.5rem; }
   .min-h-0 { min-height: 0; }
   .overflow-hidden { overflow: hidden; }
   .overflow-y-auto { overflow-y: auto; }
-  .rounded { border-radius: 0.25rem; }
   .rounded-lg { border-radius: 0.5rem; }
   .rounded-xl { border-radius: 0.75rem; }
+  .rounded-2xl { border-radius: 1rem; }
   .rounded-full { border-radius: 9999px; }
-  .border { border-width: 1px; border-style: solid; }
-  .border-b { border-bottom-width: 1px; border-bottom-style: solid; }
-  .border-t { border-top-width: 1px; border-top-style: solid; }
-  .border-gray-600 { border-color: #4b5563; }
-  .border-gray-700 { border-color: #374151; }
-  .border-blue-500 { border-color: #3b82f6; }
-  .bg-gray-900 { background-color: #0a0a0f; }
-  .bg-gray-800 { background-color: #13131a; }
-  .bg-gray-700 { background-color: #1e1e2e; }
-  .bg-blue-600 { background-color: #2563eb; }
-  .bg-blue-900 { background-color: #1e3a8a; }
-  .bg-green-900 { background-color: #14532d; }
-  .bg-red-700 { background-color: #b91c1c; }
-  .bg-transparent { background-color: transparent; }
-  .text-white { color: #ffffff; }
-  .text-gray-300 { color: #d1d5db; }
-  .text-gray-400 { color: #9ca3af; }
-  .text-gray-500 { color: #6b7280; }
-  .text-blue-400 { color: #60a5fa; }
-  .text-blue-300 { color: #93c5fd; }
-  .text-green-400 { color: #4ade80; }
-  .text-red-400 { color: #f87171; }
-  .text-yellow-400 { color: #facc15; }
-  .text-xs { font-size: 0.75rem; line-height: 1rem; }
-  .text-sm { font-size: 0.875rem; line-height: 1.25rem; }
+  .text-white { color: var(--txt); }
+  .text-gray-300 { color: #c7cce6; }
+  .text-gray-400 { color: var(--txt-2); }
+  .text-gray-500 { color: var(--txt-3); }
+  .text-gray-600 { color: #494f6b; }
+  .text-blue-400 { color: #818cf8; }
+  .text-blue-300 { color: #a5b4fc; }
+  .text-green-400 { color: var(--green); }
+  .text-red-400 { color: var(--red); }
+  .text-xs { font-size: 0.72rem; line-height: 1rem; }
+  .text-sm { font-size: 0.84rem; line-height: 1.25rem; }
   .text-base { font-size: 1rem; line-height: 1.5rem; }
   .text-lg { font-size: 1.125rem; line-height: 1.75rem; }
   .text-xl { font-size: 1.25rem; line-height: 1.75rem; }
   .text-2xl { font-size: 1.5rem; line-height: 2rem; }
-  .text-3xl { font-size: 1.875rem; line-height: 2.25rem; }
+  .text-3xl { font-size: 1.95rem; line-height: 2.3rem; }
   .font-medium { font-weight: 500; }
   .font-semibold { font-weight: 600; }
   .font-bold { font-weight: 700; }
-  .font-mono { font-family: ui-monospace, SFMono-Regular, monospace; }
-  .tracking-wide { letter-spacing: 0.025em; }
+  .font-extrabold { font-weight: 800; }
+  .font-mono { font-family: 'SF Mono', ui-monospace, SFMono-Regular, monospace; }
+  .tracking-wide { letter-spacing: 0.04em; }
+  .uppercase { text-transform: uppercase; }
   .break-all { word-break: break-all; }
   .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .text-center { text-align: center; }
   .text-right { text-align: right; }
   .leading-relaxed { line-height: 1.625; }
-  .opacity-70 { opacity: 0.7; }
   .cursor-pointer { cursor: pointer; }
-  .select-none { user-select: none; }
-  .select-all { user-select: all; }
-  .appearance-none { appearance: none; }
-  .outline-none { outline: none; }
-  .transition-colors { transition: background-color 0.15s, border-color 0.15s, color 0.15s; }
-  .shadow-lg { box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -2px rgba(0,0,0,0.05); }
-  .animate-spin { animation: spin 1s linear infinite; }
-  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-  .animate-pulse { animation: pulse 2s cubic-bezier(0.4,0,0.6,1) infinite; }
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
-
-  /* Padding / margin */
-  .p-1 { padding: 0.25rem; }
-  .p-2 { padding: 0.5rem; }
   .p-3 { padding: 0.75rem; }
   .p-4 { padding: 1rem; }
   .p-6 { padding: 1.5rem; }
-  .px-2 { padding-left: 0.5rem; padding-right: 0.5rem; }
   .px-3 { padding-left: 0.75rem; padding-right: 0.75rem; }
   .px-4 { padding-left: 1rem; padding-right: 1rem; }
-  .py-1 { padding-top: 0.25rem; padding-bottom: 0.25rem; }
-  .py-1\\.5 { padding-top: 0.375rem; padding-bottom: 0.375rem; }
   .py-2 { padding-top: 0.5rem; padding-bottom: 0.5rem; }
-  .py-2\\.5 { padding-top: 0.625rem; padding-bottom: 0.625rem; }
   .py-3 { padding-top: 0.75rem; padding-bottom: 0.75rem; }
-  .py-4 { padding-top: 1rem; padding-bottom: 1rem; }
-  .pb-2 { padding-bottom: 0.5rem; }
-  .pb-4 { padding-bottom: 1rem; }
-  .pt-2 { padding-top: 0.5rem; }
+  .py-6 { padding-top: 1.5rem; padding-bottom: 1.5rem; }
   .mt-1 { margin-top: 0.25rem; }
   .mt-2 { margin-top: 0.5rem; }
   .mt-3 { margin-top: 0.75rem; }
   .mt-4 { margin-top: 1rem; }
-  .mt-6 { margin-top: 1.5rem; }
   .mb-1 { margin-bottom: 0.25rem; }
   .mb-2 { margin-bottom: 0.5rem; }
   .mb-3 { margin-bottom: 0.75rem; }
-  .mb-4 { margin-bottom: 1rem; }
-  .mx-auto { margin-left: auto; margin-right: auto; }
+  .mx-4 { margin-left: 1rem; margin-right: 1rem; }
   .mr-2 { margin-right: 0.5rem; }
-  .ml-auto { margin-left: auto; }
 
-  /* Hover states */
-  .hover\\:bg-blue-500:hover { background-color: #3b82f6; }
-  .hover\\:bg-gray-600:hover { background-color: #4b5563; }
-  .hover\\:bg-gray-700:hover { background-color: #374151; }
-  .hover\\:bg-red-600:hover { background-color: #dc2626; }
-  .hover\\:text-white:hover { color: #ffffff; }
-  .hover\\:border-blue-500:hover { border-color: #3b82f6; }
-
-  /* Glassmorphism cards */
-  .glass {
-    background: rgba(255,255,255,0.04);
-    backdrop-filter: blur(12px);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 16px;
+  /* ── Animations ──────────────────────────────────────────────── */
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
   }
-  .glow-blue { box-shadow: 0 0 30px rgba(37,99,235,0.25); }
-  .glow-ring { box-shadow: 0 0 0 1px rgba(99,102,241,0.4), 0 0 40px rgba(99,102,241,0.15); }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes shimmer {
+    0%   { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+  @keyframes pulseDot {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%      { opacity: 0.55; transform: scale(0.85); }
+  }
+  @keyframes floaty {
+    0%, 100% { transform: translateY(0); }
+    50%      { transform: translateY(-6px); }
+  }
+  @keyframes orbit { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
-  /* Gradient text */
+  .animate-spin { animation: spin 1s linear infinite; }
+  .screen-enter { animation: fadeUp 0.22s ease both; }
+  .fade-in { animation: fadeIn 0.3s ease both; }
+
+  .skeleton {
+    background: linear-gradient(90deg, var(--bg-2) 25%, var(--bg-3) 50%, var(--bg-2) 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.4s infinite;
+    border-radius: 8px;
+  }
+
+  /* ── Cards ───────────────────────────────────────────────────── */
+  .card {
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 14px;
+  }
+  .card-hover { transition: border-color 0.15s, transform 0.15s, background 0.15s; }
+  .card-hover:hover { border-color: var(--line-2); background: var(--bg-3); }
+
+  .hero-card {
+    position: relative;
+    border-radius: 18px;
+    padding: 22px 18px 18px;
+    text-align: center;
+    overflow: hidden;
+    background:
+      radial-gradient(120% 140% at 50% 0%, rgba(99,102,241,0.28) 0%, rgba(139,92,246,0.10) 45%, transparent 75%),
+      var(--bg-2);
+    border: 1px solid rgba(129,140,248,0.28);
+    box-shadow: 0 12px 40px -16px rgba(99,102,241,0.45), inset 0 1px 0 rgba(255,255,255,0.06);
+  }
+  .hero-card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(60% 50% at 50% -10%, rgba(165,180,252,0.18), transparent 70%);
+    pointer-events: none;
+  }
+
+  /* ── Buttons ─────────────────────────────────────────────────── */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    font-family: inherit;
+    font-weight: 600;
+    font-size: 0.875rem;
+    border-radius: 12px;
+    border: none;
+    cursor: pointer;
+    padding: 11px 16px;
+    transition: transform 0.12s, box-shadow 0.15s, background 0.15s, opacity 0.15s, border-color 0.15s;
+    user-select: none;
+  }
+  .btn:active { transform: scale(0.97); }
+  .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  .btn-primary {
+    background: var(--grad);
+    color: white;
+    box-shadow: 0 6px 20px -8px rgba(99,102,241,0.7);
+  }
+  .btn-primary:hover:not(:disabled) { box-shadow: 0 8px 26px -8px rgba(99,102,241,0.9); filter: brightness(1.08); }
+
+  .btn-secondary {
+    background: var(--bg-3);
+    color: var(--txt);
+    border: 1px solid var(--line-2);
+  }
+  .btn-secondary:hover:not(:disabled) { background: #222238; }
+
+  .btn-danger {
+    background: rgba(248,113,113,0.12);
+    color: var(--red);
+    border: 1px solid rgba(248,113,113,0.35);
+  }
+  .btn-danger:hover:not(:disabled) { background: rgba(248,113,113,0.2); }
+
+  .btn-ghost { background: transparent; color: var(--txt-2); padding: 8px 12px; }
+  .btn-ghost:hover:not(:disabled) { color: var(--txt); background: var(--bg-3); }
+
+  .icon-btn {
+    display: flex; align-items: center; justify-content: center;
+    width: 34px; height: 34px;
+    border-radius: 10px;
+    background: transparent;
+    border: none;
+    color: var(--txt-2);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .icon-btn:hover { background: var(--bg-3); color: var(--txt); }
+
+  /* Quick actions on home */
+  .qa-btn {
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+    background: transparent; border: none; cursor: pointer;
+    color: var(--txt-2); font-family: inherit; font-size: 0.7rem; font-weight: 600;
+    flex: 1;
+  }
+  .qa-circle {
+    width: 46px; height: 46px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--bg-3);
+    border: 1px solid var(--line-2);
+    color: #a5b4fc;
+    transition: transform 0.15s, box-shadow 0.2s, border-color 0.15s, background 0.15s;
+  }
+  .qa-btn:hover .qa-circle {
+    transform: translateY(-2px);
+    border-color: rgba(129,140,248,0.55);
+    box-shadow: 0 8px 22px -10px rgba(99,102,241,0.8);
+    background: rgba(99,102,241,0.14);
+  }
+  .qa-btn:hover { color: var(--txt); }
+  .qa-circle svg { width: 19px; height: 19px; }
+
+  /* ── Inputs ──────────────────────────────────────────────────── */
+  .ego-label {
+    display: block;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--txt-3);
+    margin-bottom: 6px;
+  }
+  .ego-input {
+    width: 100%;
+    border-radius: 12px;
+    background: var(--bg-2);
+    border: 1px solid var(--line-2);
+    color: var(--txt);
+    padding: 11px 13px;
+    font-size: 0.875rem;
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .ego-input::placeholder { color: var(--txt-3); }
+  .ego-input:focus {
+    border-color: var(--indigo);
+    box-shadow: 0 0 0 3px rgba(99,102,241,0.18);
+  }
+
+  /* ── Header ──────────────────────────────────────────────────── */
+  .topbar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 16px;
+    background: rgba(12,12,22,0.85);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+    min-height: 54px;
+  }
   .grad-text {
-    background: linear-gradient(135deg, #60a5fa, #a78bfa);
+    background: var(--grad);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
   }
-
-  /* Logo glow */
-  .logo-glow {
-    filter: drop-shadow(0 0 12px rgba(99,102,241,0.6));
+  .net-pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 0.68rem; font-weight: 600;
+    padding: 4px 9px;
+    border-radius: 999px;
+    border: 1px solid var(--line-2);
+    background: var(--bg-2);
+    color: var(--txt-2);
+    white-space: nowrap;
   }
+  .net-dot { width: 6px; height: 6px; border-radius: 50%; animation: pulseDot 2s ease infinite; }
 
-  /* Scrollbar */
-  ::-webkit-scrollbar { width: 4px; }
-  ::-webkit-scrollbar-track { background: #0a0a0f; }
-  ::-webkit-scrollbar-thumb { background: #2d2d3d; border-radius: 2px; }
+  /* ── Tx rows ─────────────────────────────────────────────────── */
+  .tx-row {
+    display: flex; align-items: center; gap: 11px;
+    padding: 11px 12px;
+    border-radius: 13px;
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .tx-row:hover { border-color: var(--line-2); background: var(--bg-3); }
+  .tx-icon {
+    width: 34px; height: 34px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .tx-in  { background: rgba(52,211,153,0.12); color: var(--green); }
+  .tx-out { background: rgba(248,113,113,0.12); color: var(--red); }
+  .tx-icon svg { width: 15px; height: 15px; }
 
-  /* Focus */
-  input:focus, textarea:focus { border-color: #3b82f6 !important; }
-
-  /* Word badge */
+  /* ── Word badges (mnemonic) ──────────────────────────────────── */
   .word-badge {
     display: inline-flex;
     align-items: center;
-    background: #1e3a8a;
-    border: 1px solid #2563eb;
-    border-radius: 6px;
-    padding: 4px 8px;
-    font-size: 0.8rem;
-    font-family: monospace;
-    color: #93c5fd;
+    background: rgba(99,102,241,0.10);
+    border: 1px solid rgba(99,102,241,0.30);
+    border-radius: 8px;
+    padding: 5px 8px;
+    font-size: 0.76rem;
+    font-family: 'SF Mono', ui-monospace, monospace;
+    color: #c7d2fe;
   }
-  .word-badge span.num {
-    color: #4b5563;
-    margin-right: 4px;
-    font-size: 0.7rem;
-  }
+  .word-badge span.num { color: var(--txt-3); margin-right: 5px; font-size: 0.65rem; }
 
-  /* Navbar */
-  .navbar { display: flex; background: #0d0d14; border-top: 1px solid rgba(255,255,255,0.06); }
+  /* ── Logo treatments ─────────────────────────────────────────── */
+  .logo-glow { filter: drop-shadow(0 0 14px rgba(99,102,241,0.65)); }
+  .logo-orbit {
+    position: absolute; inset: -10px;
+    border-radius: 50%;
+    background: conic-gradient(from 0deg, transparent 10%, #6366f1 30%, #8b5cf6 50%, #3b82f6 70%, transparent 90%);
+    animation: orbit 4s linear infinite;
+    opacity: 0.7;
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2px));
+    mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2px));
+  }
+  .float { animation: floaty 4.5s ease-in-out infinite; }
+
+  /* ── Navbar ──────────────────────────────────────────────────── */
+  .navbar {
+    display: flex;
+    background: rgba(10,10,18,0.92);
+    backdrop-filter: blur(12px);
+    border-top: 1px solid var(--line);
+    padding: 4px 6px 6px;
+  }
   .nav-btn {
     flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 8px 4px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 3px;
+    padding: 7px 2px 5px;
     cursor: pointer;
     border: none;
     background: transparent;
-    color: #9ca3af;
-    font-size: 0.65rem;
-    transition: color 0.15s;
-    gap: 2px;
+    color: var(--txt-3);
+    font-family: inherit;
+    font-size: 0.62rem;
+    font-weight: 600;
+    border-radius: 11px;
+    transition: color 0.15s, background 0.15s;
+    position: relative;
   }
-  .nav-btn.active { color: #60a5fa; }
-  .nav-btn:hover { color: #d1d5db; }
-  .nav-btn svg { width: 20px; height: 20px; }
+  .nav-btn:hover { color: var(--txt-2); }
+  .nav-btn.active { color: #a5b4fc; background: rgba(99,102,241,0.10); }
+  .nav-btn.active::after {
+    content: '';
+    position: absolute; top: 0; left: 50%; transform: translateX(-50%);
+    width: 18px; height: 2.5px; border-radius: 2px;
+    background: var(--grad);
+  }
+  .nav-btn svg { width: 19px; height: 19px; }
+
+  /* ── Toast ───────────────────────────────────────────────────── */
+  .toast {
+    position: fixed;
+    bottom: 70px; left: 50%; transform: translateX(-50%);
+    background: var(--bg-3);
+    border: 1px solid var(--line-2);
+    color: var(--txt);
+    font-size: 0.78rem;
+    font-weight: 500;
+    border-radius: 999px;
+    padding: 8px 16px;
+    box-shadow: 0 10px 30px -10px rgba(0,0,0,0.8);
+    animation: fadeUp 0.2s ease both;
+    z-index: 9999;
+    white-space: nowrap;
+  }
+
+  /* ── Misc ────────────────────────────────────────────────────── */
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #262640; border-radius: 2px; }
+
+  .divider { height: 1px; background: var(--line); border: none; }
+
+  .alert {
+    border-radius: 12px;
+    padding: 11px 13px;
+    font-size: 0.8rem;
+    line-height: 1.45;
+    animation: fadeUp 0.18s ease both;
+  }
+  .alert-error   { background: rgba(248,113,113,0.10); border: 1px solid rgba(248,113,113,0.35); color: #fca5a5; }
+  .alert-success { background: rgba(52,211,153,0.10);  border: 1px solid rgba(52,211,153,0.35);  color: #6ee7b7; }
+  .alert-info    { background: rgba(99,102,241,0.10);  border: 1px solid rgba(99,102,241,0.35);  color: #c7d2fe; }
+  .alert-warn    { background: rgba(251,191,36,0.08);  border: 1px solid rgba(251,191,36,0.30);  color: #fcd34d; }
+
+  .checkbox-row {
+    display: flex; align-items: flex-start; gap: 9px;
+    cursor: pointer;
+    padding: 11px 13px;
+    border-radius: 12px;
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    transition: border-color 0.15s;
+  }
+  .checkbox-row:hover { border-color: var(--line-2); }
 `;
 
 function StyleTag() {
@@ -258,7 +487,9 @@ type Screen =
   | 'receive'
   | 'settings'
   | 'dappConnect'
-  | 'activity';
+  | 'activity'
+  | 'addAsset'
+  | 'sendAsset';
 
 interface AppState {
   screen: Screen;
@@ -320,17 +551,17 @@ const Icons = {
   ),
   Send: () => (
     <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M7 17L17 7m0 0H9m8 0v8" />
     </svg>
   ),
   Receive: () => (
     <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M17 7L7 17m0 0h8m-8 0V9" />
     </svg>
   ),
   Activity: () => (
     <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
     </svg>
   ),
   Settings: () => (
@@ -350,19 +581,39 @@ const Icons = {
     </svg>
   ),
   Back: () => (
-    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} style={{ width: 20, height: 20 }}>
+    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} style={{ width: 19, height: 19 }}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
     </svg>
   ),
+  Refresh: () => (
+    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} style={{ width: 14, height: 14 }}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+    </svg>
+  ),
   Spinner: () => (
-    <svg className="animate-spin" viewBox="0 0 24 24" fill="none" style={{ width: 20, height: 20 }}>
-      <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" style={{ opacity: 0.25 }} />
-      <path d="M4 12a8 8 0 018-8" stroke="currentColor" strokeWidth="4" strokeLinecap="round" style={{ opacity: 0.75 }} />
+    <svg className="animate-spin" viewBox="0 0 24 24" fill="none" style={{ width: 22, height: 22 }}>
+      <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" style={{ opacity: 0.2 }} />
+      <path d="M4 12a8 8 0 018-8" stroke="currentColor" strokeWidth="4" strokeLinecap="round" style={{ opacity: 0.8 }} />
     </svg>
   ),
   Faucet: () => (
-    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} style={{ width: 16, height: 16 }}>
+    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" />
+    </svg>
+  ),
+  Shield: () => (
+    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} style={{ width: 14, height: 14 }}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+    </svg>
+  ),
+  Check: () => (
+    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5} style={{ width: 30, height: 30 }}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+    </svg>
+  ),
+  Link: () => (
+    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} style={{ width: 24, height: 24 }}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
     </svg>
   ),
 };
@@ -381,6 +632,7 @@ function QRCode({ data, size = 200 }: { data: string; size?: number }) {
       img.style.width = `${size}px`;
       img.style.height = `${size}px`;
       img.style.imageRendering = 'pixelated';
+      img.style.display = 'block';
     }
   }, [data, size]);
 
@@ -389,9 +641,10 @@ function QRCode({ data, size = 200 }: { data: string; size?: number }) {
       ref={canvasRef}
       style={{
         background: 'white',
-        padding: 8,
-        borderRadius: 8,
+        padding: 10,
+        borderRadius: 14,
         display: 'inline-block',
+        boxShadow: '0 0 0 1px rgba(148,163,255,0.25), 0 14px 40px -14px rgba(99,102,241,0.5)',
       }}
     />
   );
@@ -405,6 +658,7 @@ function Input({
   placeholder,
   autoFocus,
   rows,
+  onEnter,
 }: {
   label?: string;
   type?: string;
@@ -413,6 +667,7 @@ function Input({
   placeholder?: string;
   autoFocus?: boolean;
   rows?: number;
+  onEnter?: () => void;
 }) {
   const shared = {
     className: S.input,
@@ -420,6 +675,7 @@ function Input({
     onChange: (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => onChange(e.target.value),
     placeholder,
     autoFocus,
+    onKeyDown: (e: React.KeyboardEvent) => { if (e.key === 'Enter' && onEnter) onEnter(); },
   };
   return (
     <div>
@@ -448,18 +704,12 @@ function Button({
   fullWidth?: boolean;
   small?: boolean;
 }) {
-  const variantCls: Record<string, string> = {
-    primary: S.btnPrimary,
-    secondary: S.btnSecondary,
-    danger: S.btnDanger,
-    ghost: S.btnGhost,
-  };
   return (
     <button
-      className={cls(S.btn, variantCls[variant], fullWidth && 'w-full', small && 'text-sm py-1.5 px-3')}
+      className={cls('btn', `btn-${variant}`, fullWidth && 'w-full', small && 'text-sm')}
       onClick={onClick}
       disabled={disabled}
-      style={{ opacity: disabled ? 0.5 : 1, cursor: disabled ? 'not-allowed' : 'pointer' }}
+      style={small ? { padding: '7px 12px', fontSize: '0.78rem' } : undefined}
     >
       {children}
     </button>
@@ -470,27 +720,33 @@ function Header({
   title,
   onBack,
   onLock,
+  network,
+  nodeOnline,
 }: {
   title: string;
   onBack?: () => void;
   onLock?: () => void;
+  network?: 'testnet' | 'mainnet';
+  nodeOnline?: boolean;
 }) {
   return (
-    <div className="flex items-center px-4 py-3 bg-gray-800 border-b border-gray-700" style={{ minHeight: 52 }}>
+    <div className="topbar">
       {onBack ? (
-        <button className="mr-2 text-gray-400 hover:text-white transition-colors" onClick={onBack} style={{ background: 'none', border: 'none', cursor: 'pointer' }}>
+        <button className="icon-btn" onClick={onBack} aria-label="Back">
           <Icons.Back />
         </button>
       ) : (
-        <img src={LOGO_URL} alt="Ego" className="logo-glow" style={{ width: 28, height: 28, borderRadius: '50%', marginRight: 8 }} />
+        <img src={LOGO_URL} alt="Ego" className="logo-glow" style={{ width: 28, height: 28, borderRadius: '50%' }} />
       )}
-      <span className="text-lg font-bold text-blue-400 flex-1">{title}</span>
+      <span className="text-base font-bold grad-text flex-1" style={{ letterSpacing: '0.01em' }}>{title}</span>
+      {network && (
+        <span className="net-pill">
+          <span className="net-dot" style={{ background: nodeOnline ? 'var(--green)' : 'var(--red)' }} />
+          {network === 'testnet' ? 'Testnet' : 'Mainnet'}
+        </span>
+      )}
       {onLock && (
-        <button
-          onClick={onLock}
-          style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#9ca3af' }}
-          title="Lock wallet"
-        >
+        <button className="icon-btn" onClick={onLock} title="Lock wallet" aria-label="Lock wallet">
           <Icons.Lock />
         </button>
       )}
@@ -500,20 +756,17 @@ function Header({
 
 function ErrorBox({ message }: { message: string }) {
   if (!message) return null;
-  return (
-    <div className="rounded-lg p-3 text-sm" style={{ background: '#450a0a', border: '1px solid #7f1d1d', color: '#fca5a5' }}>
-      {message}
-    </div>
-  );
+  return <div className="alert alert-error">{message}</div>;
 }
 
 function SuccessBox({ message }: { message: string }) {
   if (!message) return null;
-  return (
-    <div className="rounded-lg p-3 text-sm" style={{ background: '#052e16', border: '1px solid #166534', color: '#86efac' }}>
-      {message}
-    </div>
-  );
+  return <div className="alert alert-success">{message}</div>;
+}
+
+function Toast({ message }: { message: string }) {
+  if (!message) return null;
+  return <div className="toast">{message}</div>;
 }
 
 function Navbar({
@@ -549,31 +802,29 @@ function Navbar({
 
 function WelcomeScreen({ onNavigate }: { onNavigate: (s: Screen) => void }) {
   return (
-    <div className="flex flex-col h-full">
-      <div className="flex-1 flex flex-col items-center justify-center p-6 gap-6" style={{ background: 'radial-gradient(ellipse at 50% 0%, rgba(99,102,241,0.12) 0%, transparent 70%)' }}>
-        <div style={{ position: 'relative' }}>
-          <div style={{
-            position: 'absolute', inset: -8,
-            borderRadius: '50%',
-            background: 'conic-gradient(from 0deg, #6366f1, #2563eb, #7c3aed, #6366f1)',
-            animation: 'spin 4s linear infinite',
-            opacity: 0.6,
-          }} />
-          <img src={LOGO_URL} alt="Ego" className="logo-glow" style={{ width: 88, height: 88, borderRadius: '50%', position: 'relative', zIndex: 1 }} />
+    <div className="flex flex-col h-full screen-enter">
+      <div
+        className="flex-1 flex flex-col items-center justify-center p-6 gap-5"
+        style={{ background: 'radial-gradient(85% 55% at 50% 0%, rgba(99,102,241,0.16) 0%, transparent 70%)' }}
+      >
+        <div className="float" style={{ position: 'relative' }}>
+          <div className="logo-orbit" />
+          <img src={LOGO_URL} alt="Ego" className="logo-glow" style={{ width: 92, height: 92, borderRadius: '50%', position: 'relative', zIndex: 1 }} />
         </div>
         <div className="text-center">
-          <h1 className="text-2xl font-bold grad-text mb-2">Ego Wallet</h1>
+          <h1 className="text-2xl font-extrabold grad-text mb-2">Ego Wallet</h1>
           <p className="text-gray-400 text-sm leading-relaxed">
-            Quantum-safe wallet for the Ego Blockchain
+            The quantum-safe wallet for the<br />Ego Blockchain
           </p>
         </div>
         <div className="w-full flex flex-col gap-3 mt-2">
           <Button onClick={() => onNavigate('create')}>Create New Wallet</Button>
           <Button variant="secondary" onClick={() => onNavigate('import')}>Import Existing Wallet</Button>
         </div>
-        <p className="text-xs text-gray-500 text-center">
-          Ed25519 · Dilithium-2 · AES-256-GCM
-        </p>
+        <div className="flex items-center gap-2 text-xs text-gray-500">
+          <Icons.Shield />
+          <span>Ed25519 · Dilithium-2 · AES-256-GCM</span>
+        </div>
       </div>
     </div>
   );
@@ -591,7 +842,6 @@ function CreateScreen({
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-
     (async () => {
       const seed = generateSeed();
       const words = await seedToMnemonic(seed);
@@ -603,7 +853,7 @@ function CreateScreen({
     return (
       <div className="flex flex-col h-full">
         <Header title="Create Wallet" onBack={onBack} />
-        <div className="flex-1 flex items-center justify-center">
+        <div className="flex-1 flex items-center justify-center text-blue-400">
           <Icons.Spinner />
         </div>
       </div>
@@ -611,27 +861,29 @@ function CreateScreen({
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full screen-enter">
       <Header title="Create Wallet" onBack={onBack} />
       <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4">
-        <div className="rounded-xl p-3" style={{ background: '#1e3a5f', border: '1px solid #1d4ed8' }}>
-          <p className="text-sm text-blue-300 font-semibold mb-1">Your Secret Recovery Phrase</p>
-          <p className="text-xs text-gray-400">Write these 24 words down and store them safely. Never share them.</p>
+        <div className="alert alert-info">
+          <p className="font-semibold mb-1">Your Secret Recovery Phrase</p>
+          <p className="text-xs" style={{ color: 'var(--txt-2)' }}>
+            Write these 24 words down in order and store them somewhere safe. Anyone with these words controls your funds — never share them.
+          </p>
         </div>
         <div className="grid grid-cols-3 gap-2">
           {mnemonic.map((word, i) => (
             <div key={i} className="word-badge">
-              <span className="num">{i + 1}.</span>
+              <span className="num">{i + 1}</span>
               {word}
             </div>
           ))}
         </div>
-        <label className="flex items-start gap-2 cursor-pointer">
+        <label className="checkbox-row">
           <input
             type="checkbox"
             checked={confirmed}
             onChange={e => setConfirmed(e.target.checked)}
-            style={{ marginTop: 2, accentColor: '#3b82f6' }}
+            style={{ marginTop: 2, accentColor: '#6366f1' }}
           />
           <span className="text-sm text-gray-300">
             I have safely backed up my recovery phrase
@@ -641,7 +893,7 @@ function CreateScreen({
           disabled={!confirmed || loading}
           onClick={() => onDone(mnemonic)}
         >
-          {loading ? 'Generating…' : 'Continue to Set Password'}
+          {loading ? 'Generating…' : 'Continue'}
         </Button>
       </div>
     </div>
@@ -658,7 +910,7 @@ function ImportScreen({
   const [input, setInput] = useState('');
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full screen-enter">
       <Header title="Import Wallet" onBack={onBack} />
       <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4">
         <p className="text-sm text-gray-400">
@@ -670,6 +922,7 @@ function ImportScreen({
           onChange={setInput}
           placeholder="word1 word2 word3 … or 0x…"
           rows={5}
+          autoFocus
         />
         <Button disabled={input.trim().length < 10} onClick={() => onDone(input)}>
           Continue
@@ -698,6 +951,10 @@ function SetPasswordScreen({
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState('');
 
+  const strength = password.length >= 16 ? 3 : password.length >= 12 ? 2 : password.length >= 8 ? 1 : 0;
+  const strengthLabel = ['Too short', 'Okay', 'Good', 'Strong'][strength];
+  const strengthColor = ['var(--red)', 'var(--amber)', '#a3e635', 'var(--green)'][strength];
+
   async function handleSubmit() {
     if (password.length < 8) { setError('Password must be at least 8 characters'); return; }
     if (password !== confirm) { setError('Passwords do not match'); return; }
@@ -706,7 +963,6 @@ function SetPasswordScreen({
 
     let resp: ExtResponse;
     if (createMode && mnemonic) {
-
       resp = await sendMsg('EGO_IMPORT_WALLET', { input: mnemonic.join(' '), password });
     } else if (!createMode && importInput) {
       resp = await sendMsg('EGO_IMPORT_WALLET', { input: importInput, password });
@@ -716,7 +972,7 @@ function SetPasswordScreen({
 
     setLoading(false);
     if (resp.success) {
-      setSuccess('Wallet created! Redirecting…');
+      setSuccess('Wallet ready! Redirecting…');
       setTimeout(onDone, 800);
     } else {
       setError(resp.error ?? 'Failed to create wallet');
@@ -724,7 +980,7 @@ function SetPasswordScreen({
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full screen-enter">
       <Header title="Set Password" onBack={onBack} />
       <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4">
         <p className="text-sm text-gray-400">
@@ -738,12 +994,27 @@ function SetPasswordScreen({
           placeholder="Min 8 characters"
           autoFocus
         />
+        {password.length > 0 && (
+          <div className="flex items-center gap-2" style={{ marginTop: -8 }}>
+            <div style={{ flex: 1, height: 4, borderRadius: 2, background: 'var(--bg-3)', overflow: 'hidden' }}>
+              <div style={{
+                width: `${Math.min(100, (strength + 1) * 25)}%`,
+                height: '100%',
+                background: strengthColor,
+                borderRadius: 2,
+                transition: 'width 0.25s, background 0.25s',
+              }} />
+            </div>
+            <span className="text-xs" style={{ color: strengthColor, minWidth: 56, textAlign: 'right' }}>{strengthLabel}</span>
+          </div>
+        )}
         <Input
           label="Confirm Password"
           type="password"
           value={confirm}
           onChange={setConfirm}
           placeholder="Re-enter password"
+          onEnter={handleSubmit}
         />
         <ErrorBox message={error} />
         <SuccessBox message={success} />
@@ -774,18 +1045,27 @@ function UnlockScreen({ onUnlocked }: { onUnlocked: () => void }) {
   }
 
   return (
-    <div className="flex flex-col h-full">
-      <div className="flex-1 flex flex-col items-center justify-center p-6 gap-6" style={{ background: 'radial-gradient(ellipse at 50% 0%, rgba(99,102,241,0.10) 0%, transparent 70%)' }}>
-        <img src={LOGO_URL} alt="Ego" className="logo-glow" style={{ width: 64, height: 64, borderRadius: '50%' }} />
-        <h1 className="text-xl font-bold grad-text">Ego Wallet</h1>
+    <div className="flex flex-col h-full screen-enter">
+      <div
+        className="flex-1 flex flex-col items-center justify-center p-6 gap-5"
+        style={{ background: 'radial-gradient(85% 55% at 50% 0%, rgba(99,102,241,0.14) 0%, transparent 70%)' }}
+      >
+        <div className="float" style={{ position: 'relative' }}>
+          <div className="logo-orbit" />
+          <img src={LOGO_URL} alt="Ego" className="logo-glow" style={{ width: 72, height: 72, borderRadius: '50%', position: 'relative', zIndex: 1 }} />
+        </div>
+        <div className="text-center">
+          <h1 className="text-xl font-extrabold grad-text mb-1">Welcome back</h1>
+          <p className="text-xs text-gray-500">Enter your password to unlock Ego Wallet</p>
+        </div>
         <div className="w-full flex flex-col gap-3">
           <Input
-            label="Password"
             type="password"
             value={password}
             onChange={setPassword}
-            placeholder="Enter your password"
+            placeholder="Password"
             autoFocus
+            onEnter={handleUnlock}
           />
           <ErrorBox message={error} />
           <Button disabled={!password || loading} onClick={handleUnlock}>
@@ -797,148 +1077,302 @@ function UnlockScreen({ onUnlocked }: { onUnlocked: () => void }) {
   );
 }
 
+function TxRow({ tx, address }: { tx: AppState['recentTxs'][number]; address: string }) {
+  const isOut = !!tx.from && tx.from === address;
+  return (
+    <div className="tx-row">
+      <div className={cls('tx-icon', isOut ? 'tx-out' : 'tx-in')}>
+        {isOut ? <Icons.Send /> : <Icons.Receive />}
+      </div>
+      <div className="flex-1 min-h-0" style={{ minWidth: 0 }}>
+        <p className="text-sm font-semibold">{isOut ? 'Sent' : 'Received'}</p>
+        <p className="text-xs text-gray-500 font-mono truncate">
+          {isOut
+            ? (tx.to ? `To ${shortAddress(tx.to)}` : tx.hash?.slice(0, 18) + '…')
+            : (tx.from ? `From ${shortAddress(tx.from)}` : tx.hash?.slice(0, 18) + '…')}
+        </p>
+      </div>
+      <div className="text-right">
+        {tx.amount_egoc != null && (
+          <p className="text-sm font-bold" style={{ color: isOut ? 'var(--red)' : 'var(--green)' }}>
+            {isOut ? '−' : '+'}{tx.amount_egoc.toLocaleString(undefined, { maximumFractionDigits: 6 })}
+          </p>
+        )}
+        <p className="text-xs text-gray-600">{tx.timestamp ? timeAgo(tx.timestamp) : 'EGOC'}</p>
+      </div>
+    </div>
+  );
+}
+
+function fmtUsd(v: number): string {
+  if (v >= 1000) return '$' + v.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  if (v >= 1) return '$' + v.toFixed(2);
+  if (v > 0) return '$' + v.toFixed(4);
+  return '$0.00';
+}
+
+function AssetRow({
+  asset,
+  bal,
+  sendable,
+  onSend,
+  onRemove,
+}: {
+  asset: TrackedAsset;
+  bal?: AssetBalance;
+  sendable: boolean;
+  onSend: (a: TrackedAsset) => void;
+  onRemove: (id: string) => void;
+}) {
+  const chain = CHAINS[asset.chain];
+  return (
+    <div className="tx-row">
+      <div
+        className="tx-icon font-bold"
+        style={{ background: chain.color + '22', color: chain.color, fontSize: 15 }}
+      >
+        {chain.icon}
+      </div>
+      <div className="flex-1" style={{ minWidth: 0 }}>
+        <p className="text-sm font-semibold">
+          {asset.symbol}
+          {sendable && (
+            <span className="text-xs" style={{ color: 'var(--green)', marginLeft: 6, fontWeight: 600 }}>● my wallet</span>
+          )}
+        </p>
+        <p className="text-xs text-gray-500 truncate">
+          {bal?.error
+            ? <span className="text-red-400">balance unavailable</span>
+            : bal
+              ? `${bal.balance.toLocaleString(undefined, { maximumFractionDigits: 8 })} ${asset.symbol}`
+              : <span className="skeleton" style={{ display: 'inline-block', width: 70, height: 10 }} />}
+        </p>
+      </div>
+      <div className="text-right">
+        <p className="text-sm font-bold">{bal ? fmtUsd(bal.value_usd) : '—'}</p>
+        <p className="text-xs text-gray-600">{bal && bal.price_usd > 0 ? fmtUsd(bal.price_usd) : asset.name}</p>
+      </div>
+      {sendable && (
+        <button
+          className="icon-btn"
+          onClick={() => onSend(asset)}
+          title={`Send ${asset.symbol}`}
+          style={{ width: 26, height: 26, color: '#818cf8' }}
+        >
+          <span style={{ display: 'flex', width: 15, height: 15 }}><Icons.Send /></span>
+        </button>
+      )}
+      <button
+        className="icon-btn"
+        onClick={() => onRemove(asset.id)}
+        title={`Remove ${asset.symbol}`}
+        style={{ width: 24, height: 24, fontSize: 14, color: 'var(--txt-3)' }}
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
+function isMyAsset(asset: TrackedAsset, chainAddrs: Record<string, string>): boolean {
+  const mine = chainAddrs[asset.chain];
+  return !!mine && mine.toLowerCase() === asset.address.toLowerCase();
+}
+
 function HomeScreen({
   state,
   onRefresh,
-  onFaucet,
+  onNavigate,
+  onSendAsset,
 }: {
   state: AppState;
   onRefresh: () => void;
-  onFaucet: () => void;
+  onNavigate: (s: Screen) => void;
+  onSendAsset: (a: TrackedAsset) => void;
 }) {
-  const [copied, setCopied] = useState(false);
-  const [faucetMsg, setFaucetMsg] = useState('');
+  const [toast, setToast] = useState('');
   const [faucetLoading, setFaucetLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [assets, setAssets] = useState<TrackedAsset[]>([]);
+  const [assetBals, setAssetBals] = useState<Record<string, AssetBalance>>({});
+  const [chainAddrs, setChainAddrs] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    sendMsg<{ addresses: Record<string, string> }>('EGO_GET_CHAIN_ADDRESSES')
+      .then(resp => { if (resp.success && resp.data) setChainAddrs(resp.data.addresses); });
+  }, []);
+
+  const loadAssets = useCallback(async () => {
+    const resp = await sendMsg<{ assets: TrackedAsset[] }>('EGO_GET_ASSETS');
+    if (resp.success && resp.data) {
+      setAssets(resp.data.assets);
+      if (resp.data.assets.length > 0) {
+        const balResp = await sendMsg<{ balances: AssetBalance[] }>('EGO_REFRESH_ASSETS');
+        if (balResp.success && balResp.data) {
+          const map: Record<string, AssetBalance> = {};
+          for (const b of balResp.data.balances) map[b.id] = b;
+          setAssetBals(map);
+        }
+      }
+    }
+  }, []);
+
+  useEffect(() => { loadAssets(); }, [loadAssets]);
+
+  async function handleRemoveAsset(id: string) {
+    await sendMsg('EGO_REMOVE_ASSET', { id });
+    setAssets(prev => prev.filter(a => a.id !== id));
+    flash('Asset removed');
+  }
+
+  function flash(msg: string) {
+    setToast(msg);
+    setTimeout(() => setToast(''), 2200);
+  }
 
   function copyAddress() {
     navigator.clipboard.writeText(state.address);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    flash('Address copied');
   }
 
   async function handleFaucet() {
     setFaucetLoading(true);
-    setFaucetMsg('');
     const resp = await sendMsg('EGO_FAUCET', {});
     setFaucetLoading(false);
     if (resp.success) {
-      setFaucetMsg('100 EGOC sent from faucet!');
+      flash('100 EGOC requested from faucet');
       onRefresh();
     } else {
-      setFaucetMsg((resp.error ?? 'Faucet unavailable'));
+      flash(resp.error ?? 'Faucet unavailable');
     }
-    setTimeout(() => setFaucetMsg(''), 4000);
   }
 
-  const networkLabel = state.network === 'testnet' ? 'Ego Testnet' : 'Ego Mainnet';
-  const nodeOnline = state.nodeStatus === 'healthy' || state.nodeStatus === 'ok';
+  function handleRefresh() {
+    setRefreshing(true);
+    onRefresh();
+    loadAssets();
+    setTimeout(() => setRefreshing(false), 700);
+  }
 
   return (
-    <div className="flex flex-col h-full min-h-0">
-      {}
-      <div className="flex items-center justify-between px-4 py-2 bg-gray-800 border-b border-gray-700">
-        <span className="text-xs font-medium" style={{ color: nodeOnline ? '#4ade80' : '#f87171' }}>
-          {nodeOnline ? '● ' : '○ '}{networkLabel}
-        </span>
-        {state.blockHeight > 0 && (
-          <span className="text-xs text-gray-500">Block #{state.blockHeight.toLocaleString()}</span>
-        )}
-      </div>
-
-      <div className="flex-1 overflow-y-auto">
-        {}
-        <div className="mx-4 mt-4 rounded-xl p-5 text-center glow-blue" style={{
-          background: 'linear-gradient(135deg, rgba(37,99,235,0.2), rgba(99,102,241,0.15))',
-          border: '1px solid rgba(99,102,241,0.35)',
-        }}>
-          <p className="text-xs text-gray-400 mb-1">Total Balance</p>
-          <p className="text-3xl font-bold text-white">{state.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}</p>
-          <p className="text-sm text-blue-300 mt-1">EGOC</p>
-          <p className="text-xs text-gray-500 mt-1">{state.balanceUegoc.toLocaleString()} uEGOC</p>
-        </div>
-
-        {}
-        <div className="mx-4 mt-3 rounded-xl p-3" style={{ background: '#1f2937', border: '1px solid #374151' }}>
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-xs text-gray-400 mb-0.5">Address</p>
-              <p className="font-mono text-sm text-gray-200">{shortAddress(state.address)}</p>
-            </div>
-            <button
-              onClick={copyAddress}
-              style={{ background: '#374151', border: 'none', cursor: 'pointer', borderRadius: 6, padding: '6px 10px', color: copied ? '#4ade80' : '#9ca3af', fontSize: 12, display: 'flex', alignItems: 'center', gap: 4 }}
-            >
-              <Icons.Copy />
-              {copied ? 'Copied!' : 'Copy'}
-            </button>
-          </div>
-        </div>
-
-        {}
-        {state.network === 'testnet' && (
-          <div className="mx-4 mt-2">
-            <button
-              onClick={handleFaucet}
-              disabled={faucetLoading}
-              style={{
-                width: '100%',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: 6,
-                padding: '8px 12px',
-                borderRadius: 8,
-                background: '#1c1917',
-                border: '1px solid #44403c',
-                color: '#d6d3d1',
-                fontSize: 13,
-                cursor: faucetLoading ? 'wait' : 'pointer',
-                opacity: faucetLoading ? 0.7 : 1,
-              }}
-            >
-              <Icons.Faucet />
-              {faucetLoading ? 'Requesting…' : 'Request 100 EGOC from Faucet'}
-            </button>
-            {faucetMsg && (
-              <p className="text-xs mt-1 text-center" style={{ color: faucetMsg.includes('sent') ? '#4ade80' : '#f87171' }}>
-                {faucetMsg}
-              </p>
+    <div className="flex flex-col h-full min-h-0 screen-enter">
+      <div className="flex-1 overflow-y-auto" style={{ paddingBottom: 8 }}>
+        {/* Balance hero */}
+        <div className="mx-4 mt-4 hero-card">
+          <div className="flex items-center justify-center gap-2 mb-1">
+            <p className="text-xs font-semibold uppercase tracking-wide" style={{ color: 'var(--txt-3)' }}>Total Balance</p>
+            {state.blockHeight > 0 && (
+              <span className="text-xs" style={{ color: 'var(--txt-3)' }}>· #{state.blockHeight.toLocaleString()}</span>
             )}
           </div>
-        )}
+          <p className="text-3xl font-extrabold" style={{ letterSpacing: '-0.02em', position: 'relative' }}>
+            {state.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}
+            <span className="text-base font-semibold grad-text" style={{ marginLeft: 7 }}>EGOC</span>
+          </p>
+          <p className="text-xs mt-1" style={{ color: 'var(--txt-3)', position: 'relative' }}>
+            {state.balanceUegoc.toLocaleString()} uEGOC
+          </p>
 
-        {}
-        <div className="mx-4 mt-4 mb-4">
+          {/* Quick actions */}
+          <div className="flex mt-4" style={{ position: 'relative', gap: 4 }}>
+            <button className="qa-btn" onClick={() => onNavigate('send')}>
+              <span className="qa-circle"><Icons.Send /></span>
+              Send
+            </button>
+            <button className="qa-btn" onClick={() => onNavigate('receive')}>
+              <span className="qa-circle"><Icons.Receive /></span>
+              Receive
+            </button>
+            {state.network === 'testnet' && (
+              <button className="qa-btn" onClick={handleFaucet} disabled={faucetLoading}>
+                <span className="qa-circle" style={faucetLoading ? { opacity: 0.6 } : undefined}>
+                  {faucetLoading
+                    ? <span className="animate-spin" style={{ display: 'flex' }}><Icons.Refresh /></span>
+                    : <span style={{ display: 'flex', width: 19, height: 19 }}><Icons.Faucet /></span>}
+                </span>
+                Faucet
+              </button>
+            )}
+            <button className="qa-btn" onClick={() => onNavigate('activity')}>
+              <span className="qa-circle"><Icons.Activity /></span>
+              Activity
+            </button>
+          </div>
+        </div>
+
+        {/* Address chip */}
+        <button
+          onClick={copyAddress}
+          className="card card-hover mx-4 mt-3 w-full flex items-center justify-between cursor-pointer"
+          style={{ width: 'calc(100% - 2rem)', fontFamily: 'inherit', textAlign: 'left' }}
+        >
+          <div style={{ minWidth: 0 }}>
+            <p className="ego-label" style={{ marginBottom: 2 }}>Address</p>
+            <p className="font-mono text-sm text-gray-300">{shortAddress(state.address)}</p>
+          </div>
+          <span className="icon-btn" style={{ pointerEvents: 'none' }}><Icons.Copy /></span>
+        </button>
+
+        {/* Tracked assets */}
+        <div className="mx-4 mt-4">
           <div className="flex items-center justify-between mb-2">
-            <p className="text-sm font-semibold text-gray-300">Recent Transactions</p>
+            <p className="text-xs font-semibold uppercase tracking-wide" style={{ color: 'var(--txt-3)' }}>Assets</p>
             <button
-              onClick={onRefresh}
-              style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#60a5fa', fontSize: 12 }}
+              className="btn btn-ghost"
+              onClick={() => onNavigate('addAsset')}
+              style={{ padding: '3px 9px', fontSize: '0.72rem', color: '#818cf8' }}
             >
-              Refresh
+              + Add coin / token
+            </button>
+          </div>
+          {assets.length === 0 ? (
+            <button
+              className="card card-hover w-full text-center cursor-pointer"
+              onClick={() => onNavigate('addAsset')}
+              style={{ fontFamily: 'inherit', padding: '14px' }}
+            >
+              <p className="text-sm text-gray-400">Track other coins &amp; tokens</p>
+              <p className="text-xs text-gray-600 mt-1">BTC · ETH · BNB · SOL · DOGE · LTC · ERC-20 · BEP-20</p>
+            </button>
+          ) : (
+            <div className="flex flex-col gap-2">
+              {assets.map(a => (
+                <AssetRow
+                  key={a.id}
+                  asset={a}
+                  bal={assetBals[a.id]}
+                  sendable={isMyAsset(a, chainAddrs)}
+                  onSend={onSendAsset}
+                  onRemove={handleRemoveAsset}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Recent transactions */}
+        <div className="mx-4 mt-4 mb-3">
+          <div className="flex items-center justify-between mb-2">
+            <p className="text-xs font-semibold uppercase tracking-wide" style={{ color: 'var(--txt-3)' }}>Recent Activity</p>
+            <button className="icon-btn" onClick={handleRefresh} title="Refresh" style={{ width: 28, height: 28 }}>
+              <span className={refreshing ? 'animate-spin' : ''} style={{ display: 'flex' }}><Icons.Refresh /></span>
             </button>
           </div>
           {state.recentTxs.length === 0 ? (
-            <p className="text-xs text-gray-500 text-center py-6">No transactions yet</p>
+            <div className="card text-center py-6">
+              <p className="text-sm text-gray-500">No transactions yet</p>
+              <p className="text-xs text-gray-600 mt-1">Your activity will appear here</p>
+            </div>
           ) : (
             <div className="flex flex-col gap-2">
               {state.recentTxs.slice(0, 5).map((tx, i) => (
-                <div key={i} className="rounded-lg p-3" style={{ background: '#1f2937', border: '1px solid #374151' }}>
-                  <div className="flex items-center justify-between">
-                    <span className="font-mono text-xs text-gray-400">{tx.hash?.slice(0, 16)}…</span>
-                    {tx.amount_egoc != null && (
-                      <span className="text-sm font-semibold text-green-400">+{tx.amount_egoc} EGOC</span>
-                    )}
-                  </div>
-                  {tx.from && (
-                    <p className="text-xs text-gray-500 mt-1">From: {shortAddress(tx.from)}</p>
-                  )}
-                </div>
+                <TxRow key={i} tx={tx} address={state.address} />
               ))}
             </div>
           )}
         </div>
       </div>
+      <Toast message={toast} />
     </div>
   );
 }
@@ -978,14 +1412,25 @@ function SendScreen({
 
   if (txHash) {
     return (
-      <div className="flex flex-col h-full">
+      <div className="flex flex-col h-full screen-enter">
         <Header title="Send EGOC" onBack={onBack} />
         <div className="flex-1 flex flex-col items-center justify-center p-6 gap-4">
-          <div style={{ fontSize: 48 }}>✓</div>
-          <p className="text-xl font-bold text-green-400">Transaction Sent!</p>
-          <div className="rounded-xl p-4 w-full" style={{ background: '#1f2937', border: '1px solid #374151' }}>
-            <p className="text-xs text-gray-400 mb-1">Transaction Hash</p>
-            <p className="font-mono text-xs text-gray-200 break-all">{txHash}</p>
+          <div
+            className="flex items-center justify-center fade-in"
+            style={{
+              width: 72, height: 72, borderRadius: '50%',
+              background: 'rgba(52,211,153,0.12)',
+              border: '1px solid rgba(52,211,153,0.4)',
+              color: 'var(--green)',
+              boxShadow: '0 0 40px -8px rgba(52,211,153,0.5)',
+            }}
+          >
+            <Icons.Check />
+          </div>
+          <p className="text-xl font-bold text-green-400">Transaction Sent</p>
+          <div className="card w-full">
+            <p className="ego-label">Transaction Hash</p>
+            <p className="font-mono text-xs text-gray-300 break-all">{txHash}</p>
           </div>
           <Button onClick={onBack}>Back to Home</Button>
         </div>
@@ -994,19 +1439,22 @@ function SendScreen({
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full screen-enter">
       <Header title="Send EGOC" onBack={onBack} />
       <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4">
-        <div className="rounded-xl p-3" style={{ background: '#1f2937', border: '1px solid #374151' }}>
-          <p className="text-xs text-gray-400">From</p>
-          <p className="font-mono text-sm text-gray-200">{shortAddress(address)}</p>
+        <div className="card flex items-center gap-3">
+          <img src={LOGO_URL} alt="" style={{ width: 30, height: 30, borderRadius: '50%' }} />
+          <div style={{ minWidth: 0 }}>
+            <p className="ego-label" style={{ marginBottom: 2 }}>From</p>
+            <p className="font-mono text-sm text-gray-300">{shortAddress(address)}</p>
+          </div>
         </div>
-        <Input label="Recipient Address" value={to} onChange={setTo} placeholder="egot1…" />
+        <Input label="Recipient Address" value={to} onChange={setTo} placeholder="egot1…" autoFocus />
         <Input label="Amount (EGOC)" type="number" value={amount} onChange={setAmount} placeholder="0.00" />
         <Input label="Memo (optional)" value={memo} onChange={setMemo} placeholder="Optional note" />
         <ErrorBox message={error} />
         <Button disabled={!to || !amount || loading} onClick={handleSend}>
-          {loading ? 'Sending…' : 'Send EGOC'}
+          {loading ? 'Sending…' : `Send${network === 'testnet' ? ' on Testnet' : ''}`}
         </Button>
       </div>
     </div>
@@ -1023,63 +1471,313 @@ function ReceiveScreen({ address, onBack }: { address: string; onBack: () => voi
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full screen-enter">
       <Header title="Receive EGOC" onBack={onBack} />
-      <div className="flex-1 flex flex-col items-center p-6 gap-5">
+      <div className="flex-1 overflow-y-auto flex flex-col items-center p-6 gap-5">
         <p className="text-sm text-gray-400 text-center">
-          Share your address to receive EGOC on the Ego Blockchain.
+          Share your address or QR code to receive EGOC.
         </p>
         <div style={{ display: 'flex', justifyContent: 'center' }}>
-          <QRCode data={address} size={180} />
+          <QRCode data={address} size={172} />
         </div>
-        <div className="w-full rounded-xl p-4" style={{ background: '#1f2937', border: '1px solid #374151' }}>
-          <p className="text-xs text-gray-400 mb-2">Your Address</p>
-          <p className="font-mono text-sm text-gray-200 break-all">{address}</p>
+        <div className="card w-full">
+          <p className="ego-label">Your Address</p>
+          <p className="font-mono text-sm text-gray-300 break-all" style={{ userSelect: 'all' }}>{address}</p>
         </div>
-        <Button onClick={copyAddress}>
-          {copied ? '✓ Copied!' : 'Copy Address'}
+        <Button onClick={copyAddress} variant={copied ? 'secondary' : 'primary'}>
+          {copied ? '✓ Copied' : 'Copy Address'}
         </Button>
       </div>
     </div>
   );
 }
 
-function ActivityScreen({ txs, onRefresh }: { txs: AppState['recentTxs']; onRefresh: () => void }) {
+function ActivityScreen({
+  txs,
+  address,
+  onRefresh,
+}: {
+  txs: AppState['recentTxs'];
+  address: string;
+  onRefresh: () => void;
+}) {
+  const [refreshing, setRefreshing] = useState(false);
+
+  function handleRefresh() {
+    setRefreshing(true);
+    onRefresh();
+    setTimeout(() => setRefreshing(false), 700);
+  }
+
   return (
-    <div className="flex flex-col h-full">
-      <Header title="Activity" />
-      <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3">
-        <div className="flex justify-end">
-          <button
-            onClick={onRefresh}
-            style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#60a5fa', fontSize: 13 }}
-          >
-            Refresh
-          </button>
-        </div>
+    <div className="flex flex-col h-full screen-enter">
+      <div className="topbar">
+        <span className="text-base font-bold grad-text flex-1">Activity</span>
+        <button className="icon-btn" onClick={handleRefresh} title="Refresh">
+          <span className={refreshing ? 'animate-spin' : ''} style={{ display: 'flex' }}><Icons.Refresh /></span>
+        </button>
+      </div>
+      <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-2">
         {txs.length === 0 ? (
-          <div className="flex-1 flex items-center justify-center">
-            <p className="text-gray-500 text-sm">No transactions found</p>
+          <div className="flex-1 flex flex-col items-center justify-center gap-2">
+            <div
+              className="flex items-center justify-center"
+              style={{ width: 56, height: 56, borderRadius: '50%', background: 'var(--bg-2)', border: '1px solid var(--line)', color: 'var(--txt-3)' }}
+            >
+              <span style={{ width: 24, height: 24, display: 'flex' }}><Icons.Activity /></span>
+            </div>
+            <p className="text-sm text-gray-500">No transactions found</p>
+            <p className="text-xs text-gray-600">Send or receive EGOC to see activity here</p>
           </div>
         ) : (
-          txs.map((tx, i) => (
-            <div key={i} className="rounded-xl p-4" style={{ background: '#1f2937', border: '1px solid #374151' }}>
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs text-gray-400 font-mono">{tx.hash?.slice(0, 20)}…</span>
-                {tx.amount_egoc != null && (
-                  <span className="text-sm font-semibold text-green-400">+{tx.amount_egoc} EGOC</span>
-                )}
-              </div>
-              {tx.from && <p className="text-xs text-gray-500">From: {shortAddress(tx.from)}</p>}
-              {tx.to && <p className="text-xs text-gray-500">To: {shortAddress(tx.to)}</p>}
-              {tx.timestamp && (
-                <p className="text-xs text-gray-600 mt-1">
-                  {new Date(tx.timestamp).toLocaleString()}
-                </p>
-              )}
-            </div>
-          ))
+          txs.map((tx, i) => <TxRow key={i} tx={tx} address={address} />)
         )}
+      </div>
+    </div>
+  );
+}
+
+function AddAssetScreen({ onBack }: { onBack: () => void }) {
+  const [mode, setMode] = useState<'coin' | 'token'>('coin');
+  const [chain, setChain] = useState<ChainId>('BTC');
+  const [address, setAddress] = useState('');
+  const [contract, setContract] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [chainAddrs, setChainAddrs] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    sendMsg<{ addresses: Record<string, string> }>('EGO_GET_CHAIN_ADDRESSES')
+      .then(resp => { if (resp.success && resp.data) setChainAddrs(resp.data.addresses); });
+  }, []);
+
+  const chainIds = Object.keys(CHAINS) as ChainId[];
+  const tokenChains = chainIds.filter(c => CHAINS[c].tokens);
+  const visibleChains = mode === 'token' ? tokenChains : chainIds;
+  const activeChain = mode === 'token' && !CHAINS[chain].tokens ? 'ETH' : chain;
+
+  async function handleAdd() {
+    setError('');
+    setLoading(true);
+    const resp = await sendMsg<{ asset: TrackedAsset }>('EGO_ADD_ASSET', {
+      chain: activeChain,
+      address: address.trim(),
+      contract: mode === 'token' ? contract.trim() : undefined,
+    });
+    setLoading(false);
+    if (resp.success) {
+      onBack();
+    } else {
+      setError(resp.error ?? 'Failed to add asset');
+    }
+  }
+
+  const canSubmit = address.trim().length > 10 && (mode === 'coin' || contract.trim().length === 42);
+
+  return (
+    <div className="flex flex-col h-full screen-enter">
+      <Header title="Add Asset" onBack={onBack} />
+      <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4">
+        {/* Mode toggle */}
+        <div className="flex gap-2">
+          {(['coin', 'token'] as const).map(m => {
+            const active = mode === m;
+            return (
+              <button
+                key={m}
+                className="btn"
+                onClick={() => { setMode(m); setError(''); if (m === 'token' && !CHAINS[chain].tokens) setChain('ETH'); }}
+                style={{
+                  flex: 1,
+                  padding: '9px 0',
+                  fontSize: '0.8rem',
+                  background: active ? 'rgba(99,102,241,0.16)' : 'var(--bg-3)',
+                  border: `1px solid ${active ? 'rgba(129,140,248,0.55)' : 'var(--line-2)'}`,
+                  color: active ? '#c7d2fe' : 'var(--txt-2)',
+                }}
+              >
+                {m === 'coin' ? 'Coin' : 'Token (ERC-20 / BEP-20)'}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Chain picker */}
+        <div>
+          <label className="ego-label">{mode === 'token' ? 'Token network' : 'Blockchain'}</label>
+          <div className="grid grid-cols-3 gap-2">
+            {visibleChains.map(c => {
+              const info = CHAINS[c];
+              const active = activeChain === c;
+              return (
+                <button
+                  key={c}
+                  onClick={() => setChain(c)}
+                  className="card card-hover cursor-pointer"
+                  style={{
+                    fontFamily: 'inherit',
+                    padding: '10px 6px',
+                    textAlign: 'center',
+                    borderColor: active ? info.color + '99' : undefined,
+                    background: active ? info.color + '14' : undefined,
+                  }}
+                >
+                  <div className="font-bold" style={{ color: info.color, fontSize: 17 }}>{info.icon}</div>
+                  <div className="text-xs font-semibold mt-1" style={{ color: active ? 'var(--txt)' : 'var(--txt-2)' }}>{c}</div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {mode === 'token' && (
+          <Input
+            label="Token Contract Address"
+            value={contract}
+            onChange={setContract}
+            placeholder="0x…"
+          />
+        )}
+
+        <div>
+          <div className="flex items-center justify-between">
+            <label className="ego-label">{`Your ${CHAINS[activeChain].name} Address`}</label>
+            {chainAddrs[activeChain] && (
+              <button
+                className="btn btn-ghost"
+                onClick={() => setAddress(chainAddrs[activeChain])}
+                style={{ padding: '2px 8px', fontSize: '0.7rem', color: '#818cf8', marginBottom: 6 }}
+              >
+                Use my wallet address
+              </button>
+            )}
+          </div>
+          <Input
+            value={address}
+            onChange={setAddress}
+            placeholder={activeChain === 'ETH' || activeChain === 'BNB' ? '0x…' : `${CHAINS[activeChain].name} address`}
+            onEnter={handleAdd}
+          />
+        </div>
+
+        <div className="alert alert-info">
+          {chainAddrs[activeChain]
+            ? 'Use your wallet address (derived from your seed) to send and receive, or paste any address to watch it read-only.'
+            : `${CHAINS[activeChain].name} assets are watch-only — balances and prices are tracked, but sending requires that chain's native wallet.`}
+        </div>
+
+        <ErrorBox message={error} />
+        <Button disabled={!canSubmit || loading} onClick={handleAdd}>
+          {loading ? 'Verifying…' : 'Add Asset'}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function SendAssetScreen({ asset, onBack }: { asset: TrackedAsset; onBack: () => void }) {
+  const chain = CHAINS[asset.chain];
+  const [to, setTo] = useState('');
+  const [amount, setAmount] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [result, setResult] = useState<{ txid: string; explorer_url: string } | null>(null);
+
+  async function handleSend() {
+    setError('');
+    setLoading(true);
+    const resp = await sendMsg<{ txid: string; explorer_url: string }>('EGO_SEND_EXTERNAL', {
+      chain: asset.chain,
+      to: to.trim(),
+      amount: amount.trim(),
+      contract: asset.contract,
+      decimals: asset.decimals,
+    });
+    setLoading(false);
+    if (resp.success && resp.data) {
+      setResult(resp.data);
+    } else {
+      setError(resp.error ?? 'Transaction failed');
+    }
+  }
+
+  if (result) {
+    return (
+      <div className="flex flex-col h-full screen-enter">
+        <Header title={`Send ${asset.symbol}`} onBack={onBack} />
+        <div className="flex-1 flex flex-col items-center justify-center p-6 gap-4">
+          <div
+            className="flex items-center justify-center fade-in"
+            style={{
+              width: 72, height: 72, borderRadius: '50%',
+              background: 'rgba(52,211,153,0.12)',
+              border: '1px solid rgba(52,211,153,0.4)',
+              color: 'var(--green)',
+              boxShadow: '0 0 40px -8px rgba(52,211,153,0.5)',
+            }}
+          >
+            <Icons.Check />
+          </div>
+          <p className="text-xl font-bold text-green-400">Broadcast Successful</p>
+          <div className="card w-full">
+            <p className="ego-label">Transaction ID</p>
+            <p className="font-mono text-xs text-gray-300 break-all">{result.txid}</p>
+          </div>
+          <Button variant="secondary" onClick={() => window.open(result.explorer_url, '_blank')}>
+            View on Explorer ↗
+          </Button>
+          <Button onClick={onBack}>Done</Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col h-full screen-enter">
+      <Header title={`Send ${asset.symbol}`} onBack={onBack} />
+      <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4">
+        <div className="card flex items-center gap-3">
+          <div
+            className="tx-icon font-bold"
+            style={{ background: chain.color + '22', color: chain.color, fontSize: 16 }}
+          >
+            {chain.icon}
+          </div>
+          <div style={{ minWidth: 0 }}>
+            <p className="text-sm font-semibold">{asset.symbol} · {asset.name}</p>
+            <p className="font-mono text-xs text-gray-500 truncate">{asset.address}</p>
+          </div>
+        </div>
+
+        <Input
+          label="Recipient Address"
+          value={to}
+          onChange={setTo}
+          placeholder={asset.chain === 'BTC' ? 'bc1…, 1…, or 3…' : '0x…'}
+          autoFocus
+        />
+        <Input
+          label={`Amount (${asset.symbol})`}
+          type="number"
+          value={amount}
+          onChange={setAmount}
+          placeholder="0.00"
+          onEnter={handleSend}
+        />
+
+        <div className="alert alert-warn">
+          {asset.chain === 'BTC'
+            ? 'The network fee is added on top of the amount and deducted from your BTC balance.'
+            : asset.contract
+              ? `Gas is paid in ${asset.chain === 'ETH' ? 'ETH' : 'BNB'} from this same address.`
+              : 'The network fee (gas) is deducted from your balance in addition to the amount.'}
+          {' '}Mainnet transactions are irreversible — double-check the recipient.
+        </div>
+
+        <ErrorBox message={error} />
+        <Button disabled={!to || !amount || loading} onClick={handleSend}>
+          {loading ? 'Signing & broadcasting…' : `Send ${asset.symbol}`}
+        </Button>
       </div>
     </div>
   );
@@ -1122,95 +1820,104 @@ function SettingsScreen({
   }
 
   return (
-    <div className="flex flex-col h-full">
-      <Header title="Settings" />
-      <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4">
-        {}
-        <div className="rounded-xl p-4" style={{ background: '#1f2937', border: '1px solid #374151' }}>
-          <p className="text-sm font-semibold text-gray-200 mb-3">Network</p>
-          <div className="flex gap-2">
-            {(['testnet', 'mainnet'] as const).map(n => (
-              <button
-                key={n}
-                onClick={() => onNetworkChange(n)}
-                style={{
-                  flex: 1,
-                  padding: '8px 0',
-                  borderRadius: 8,
-                  border: '1px solid',
-                  borderColor: state.network === n ? '#3b82f6' : '#374151',
-                  background: state.network === n ? '#1e3a8a' : '#374151',
-                  color: state.network === n ? '#93c5fd' : '#9ca3af',
-                  fontWeight: 600,
-                  fontSize: 13,
-                  cursor: 'pointer',
-                }}
-              >
-                {n === 'testnet' ? 'Testnet' : 'Mainnet'}
-              </button>
-            ))}
+    <div className="flex flex-col h-full screen-enter">
+      <div className="topbar">
+        <span className="text-base font-bold grad-text flex-1">Settings</span>
+      </div>
+      <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3">
+        {/* Network */}
+        <div className="card">
+          <p className="ego-label">Network</p>
+          <div className="flex gap-2 mt-1">
+            {(['testnet', 'mainnet'] as const).map(n => {
+              const active = state.network === n;
+              return (
+                <button
+                  key={n}
+                  onClick={() => onNetworkChange(n)}
+                  className="btn"
+                  style={{
+                    flex: 1,
+                    padding: '9px 0',
+                    fontSize: '0.8rem',
+                    background: active ? 'rgba(99,102,241,0.16)' : 'var(--bg-3)',
+                    border: `1px solid ${active ? 'rgba(129,140,248,0.55)' : 'var(--line-2)'}`,
+                    color: active ? '#c7d2fe' : 'var(--txt-2)',
+                  }}
+                >
+                  {active && <span className="net-dot" style={{ background: 'var(--green)' }} />}
+                  {n === 'testnet' ? 'Testnet' : 'Mainnet'}
+                </button>
+              );
+            })}
           </div>
         </div>
 
-        {}
-        <div className="rounded-xl p-4" style={{ background: '#1f2937', border: '1px solid #374151' }}>
+        {/* Address */}
+        <div className="card">
           <div className="flex items-center justify-between mb-1">
-            <p className="text-sm font-semibold text-gray-200">Your Address</p>
+            <p className="ego-label" style={{ marginBottom: 0 }}>Your Address</p>
             <button
+              className="btn btn-ghost"
               onClick={() => copyItem(state.address, 'address')}
-              style={{ background: 'none', border: 'none', cursor: 'pointer', color: copied === 'address' ? '#4ade80' : '#60a5fa', fontSize: 12 }}
+              style={{ padding: '3px 8px', fontSize: '0.72rem', color: copied === 'address' ? 'var(--green)' : '#818cf8' }}
             >
-              {copied === 'address' ? 'Copied!' : 'Copy'}
+              {copied === 'address' ? '✓ Copied' : 'Copy'}
             </button>
           </div>
           <p className="font-mono text-xs text-gray-400 break-all">{state.address}</p>
         </div>
 
-        {}
-        <div className="rounded-xl p-4" style={{ background: '#1f2937', border: '1px solid #374151' }}>
-          <p className="text-sm font-semibold text-gray-200 mb-2">Recovery Phrase</p>
+        {/* Recovery phrase */}
+        <div className="card">
+          <p className="ego-label">Recovery Phrase</p>
           {!showPhrase ? (
-            <div className="flex flex-col gap-2">
-              <p className="text-xs text-gray-400">Enter your password to reveal the 24-word recovery phrase.</p>
-              <Input type="password" value={password} onChange={setPassword} placeholder="Your password" />
+            <div className="flex flex-col gap-2 mt-1">
+              <p className="text-xs text-gray-500">Enter your password to reveal the 24-word recovery phrase.</p>
+              <Input type="password" value={password} onChange={setPassword} placeholder="Your password" onEnter={revealPhrase} />
               <ErrorBox message={phraseError} />
               <Button variant="secondary" disabled={!password || phraseLoading} onClick={revealPhrase}>
                 {phraseLoading ? 'Verifying…' : 'Reveal Phrase'}
               </Button>
             </div>
           ) : (
-            <div className="flex flex-col gap-2">
+            <div className="flex flex-col gap-2 mt-1">
+              <div className="alert alert-warn" style={{ padding: '8px 11px' }}>
+                Never share these words. Anyone with them controls your funds.
+              </div>
               <div className="grid grid-cols-3 gap-1">
                 {mnemonic.map((word, i) => (
                   <div key={i} className="word-badge">
-                    <span className="num">{i + 1}.</span>
+                    <span className="num">{i + 1}</span>
                     {word}
                   </div>
                 ))}
               </div>
-              <button
-                onClick={() => copyItem(mnemonic.join(' '), 'mnemonic')}
-                style={{ background: 'none', border: 'none', cursor: 'pointer', color: copied === 'mnemonic' ? '#4ade80' : '#60a5fa', fontSize: 13, marginTop: 4 }}
-              >
-                {copied === 'mnemonic' ? '✓ Copied all words' : 'Copy all words'}
-              </button>
-              <button
-                onClick={() => { setShowPhrase(false); setMnemonic([]); setPassword(''); }}
-                style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#9ca3af', fontSize: 12 }}
-              >
-                Hide phrase
-              </button>
+              <div className="flex gap-2 mt-1">
+                <Button
+                  variant="secondary"
+                  small
+                  onClick={() => copyItem(mnemonic.join(' '), 'mnemonic')}
+                >
+                  {copied === 'mnemonic' ? '✓ Copied' : 'Copy all'}
+                </Button>
+                <Button
+                  variant="ghost"
+                  small
+                  onClick={() => { setShowPhrase(false); setMnemonic([]); setPassword(''); }}
+                >
+                  Hide
+                </Button>
+              </div>
             </div>
           )}
         </div>
 
-        {}
         <Button variant="danger" onClick={onLock}>
-          Lock Wallet
+          <Icons.Lock /> Lock Wallet
         </Button>
 
-        {}
-        <p className="text-xs text-gray-600 text-center">Ego Wallet v1.0.0 · MV3</p>
+        <p className="text-xs text-gray-600 text-center mt-1">Ego Wallet v1.0.0 · Manifest V3</p>
       </div>
     </div>
   );
@@ -1226,27 +1933,38 @@ function DAppConnectScreen({
   onReject: () => void;
 }) {
   return (
-    <div className="flex flex-col h-full">
-      <Header title="Connect Request" />
+    <div className="flex flex-col h-full screen-enter">
+      <Header title="Connection Request" />
       <div className="flex-1 flex flex-col items-center justify-center p-6 gap-5">
-        <div style={{ fontSize: 40, lineHeight: 1 }}>🔗</div>
-        <div className="text-center">
-          <h2 className="text-lg font-bold text-white mb-1">Connection Request</h2>
-          <p className="text-sm text-gray-400">A dApp wants to connect to your wallet</p>
+        <div
+          className="flex items-center justify-center float"
+          style={{
+            width: 64, height: 64, borderRadius: '50%',
+            background: 'rgba(99,102,241,0.12)',
+            border: '1px solid rgba(129,140,248,0.4)',
+            color: '#a5b4fc',
+            boxShadow: '0 0 40px -8px rgba(99,102,241,0.6)',
+          }}
+        >
+          <Icons.Link />
         </div>
-        <div className="w-full rounded-xl p-4" style={{ background: '#1f2937', border: '1px solid #374151' }}>
-          <p className="text-xs text-gray-400 mb-1">Origin</p>
-          <p className="font-semibold text-blue-400">{conn.origin}</p>
+        <div className="text-center">
+          <h2 className="text-lg font-bold text-white mb-1">Connect to dApp</h2>
+          <p className="text-sm text-gray-400">This site wants to connect to your wallet</p>
+        </div>
+        <div className="card w-full">
+          <p className="ego-label">Origin</p>
+          <p className="font-semibold text-blue-400 break-all">{conn.origin}</p>
           {conn.title && (
             <>
-              <p className="text-xs text-gray-400 mb-1 mt-2">Site</p>
+              <p className="ego-label mt-3">Site</p>
               <p className="text-sm text-gray-300">{conn.title}</p>
             </>
           )}
         </div>
-        <p className="text-xs text-gray-500 text-center">
-          This will share your address. You can revoke access in Settings.
-        </p>
+        <div className="alert alert-info w-full" style={{ textAlign: 'center' }}>
+          Connecting shares your wallet address with this site.
+        </div>
         <div className="flex gap-3 w-full">
           <Button variant="secondary" onClick={onReject} fullWidth>Reject</Button>
           <Button variant="primary" onClick={onApprove} fullWidth>Connect</Button>
@@ -1262,6 +1980,7 @@ export default function App() {
   const [wizardMnemonic, setWizardMnemonic] = useState<string[]>([]);
   const [importInput, setImportInput] = useState('');
   const [wizardMode, setWizardMode] = useState<'create' | 'import'>('create');
+  const [sendAssetTarget, setSendAssetTarget] = useState<TrackedAsset | null>(null);
 
   const loadState = useCallback(async () => {
     const resp = await sendMsg<{
@@ -1371,26 +2090,24 @@ export default function App() {
     return (
       <>
         <StyleTag />
-        <div className="flex flex-col h-full bg-gray-900 items-center justify-center gap-4">
-          <Icons.Spinner />
-          <p className="text-sm text-gray-400">Loading…</p>
+        <div className="flex flex-col h-full items-center justify-center gap-4" style={{ background: 'var(--bg)' }}>
+          <img src={LOGO_URL} alt="Ego" className="logo-glow float" style={{ width: 52, height: 52, borderRadius: '50%' }} />
+          <span className="text-blue-400"><Icons.Spinner /></span>
         </div>
       </>
     );
   }
 
-  const isWalletScreen = ['home', 'send', 'receive', 'activity', 'settings', 'dappConnect'].includes(state.screen);
+  const nodeOnline = state.nodeStatus === 'healthy' || state.nodeStatus === 'ok';
 
   return (
     <>
       <StyleTag />
-      <div className="flex flex-col h-full bg-gray-900 text-white overflow-hidden">
-        {}
-        {isWalletScreen && state.screen !== 'send' && state.screen !== 'receive' && state.screen !== 'dappConnect' && state.screen !== 'settings' && state.screen !== 'activity' && (
-          <Header title="Ego Wallet" onLock={handleLock} />
+      <div className="flex flex-col h-full overflow-hidden" style={{ background: 'var(--bg)' }}>
+        {state.screen === 'home' && (
+          <Header title="Ego Wallet" onLock={handleLock} network={state.network} nodeOnline={nodeOnline} />
         )}
 
-        {}
         <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
           {state.screen === 'welcome' && (
             <WelcomeScreen onNavigate={s => dispatch({ type: 'SET_SCREEN', screen: s })} />
@@ -1436,7 +2153,8 @@ export default function App() {
             <HomeScreen
               state={state}
               onRefresh={refreshAll}
-              onFaucet={() => {}}
+              onNavigate={navigate}
+              onSendAsset={(a) => { setSendAssetTarget(a); navigate('sendAsset'); }}
             />
           )}
 
@@ -1453,7 +2171,15 @@ export default function App() {
           )}
 
           {state.screen === 'activity' && (
-            <ActivityScreen txs={state.recentTxs} onRefresh={refreshAll} />
+            <ActivityScreen txs={state.recentTxs} address={state.address} onRefresh={refreshAll} />
+          )}
+
+          {state.screen === 'addAsset' && (
+            <AddAssetScreen onBack={() => navigate('home')} />
+          )}
+
+          {state.screen === 'sendAsset' && sendAssetTarget && (
+            <SendAssetScreen asset={sendAssetTarget} onBack={() => navigate('home')} />
           )}
 
           {state.screen === 'settings' && (
@@ -1473,7 +2199,6 @@ export default function App() {
           )}
         </div>
 
-        {}
         {['home', 'send', 'receive', 'activity', 'settings'].includes(state.screen) && (
           <Navbar screen={state.screen} onNavigate={navigate} />
         )}

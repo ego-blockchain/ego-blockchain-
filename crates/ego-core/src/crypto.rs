@@ -81,6 +81,14 @@ pub struct EgoAddress {
 }
 
 impl EgoAddress {
+    pub fn from_public_key_bytes(
+        public_key: &[u8],
+        chain_id: u32,
+        address_type: AddressType,
+    ) -> Self {
+        Self::from_dilithium_pk(public_key, chain_id, address_type)
+    }
+
     pub fn from_dilithium_pk(
         dilithium_pk: &[u8],
         chain_id: u32,
@@ -350,6 +358,14 @@ impl KeyPair {
     }
 
     pub fn derive_address(&self, chain_id: u32, address_type: AddressType) -> EgoAddress {
+        EgoAddress::from_public_key_bytes(
+            &self.ed25519_verifying_key.to_bytes(),
+            chain_id,
+            address_type,
+        )
+    }
+
+    pub fn derive_legacy_address(&self, chain_id: u32, address_type: AddressType) -> EgoAddress {
         EgoAddress::from_dilithium_pk(&self.dilithium_pk, chain_id, address_type)
     }
 
@@ -1494,4 +1510,16 @@ fn kyber_decapsulate(secret_key: &[u8], ciphertext: &[u8]) -> EgoResult<Vec<u8>>
         .map_err(|_| EgoError::CryptoError("Invalid Kyber768 ciphertext".to_string()))?;
     let ss = kyber768::decapsulate(&ct, &sk);
     Ok(ss.as_bytes().to_vec())
+}
+
+#[cfg(test)]
+mod address_derivation_tests {
+    use super::*;
+
+    #[test]
+    fn ed25519_address_matches_extension() {
+        let kp = KeyPair::from_bytes(&[1u8; 32]).unwrap();
+        let addr = kp.derive_bech32_address(1, AddressType::EOA, "egot").unwrap();
+        assert_eq!(addr, "egot1yrx6vtpy9r52smcmsqjudszeck0890s2nyh6prhn");
+    }
 }

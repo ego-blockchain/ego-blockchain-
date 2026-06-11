@@ -779,6 +779,9 @@ pub async fn rename_wallet(
 // ── generate_keypair (legacy) ─────────────────────────────────────────────────
 
 fn credit_testnet_faucet(address: &str) {
+    if std::env::var("EGO_NO_FAUCET").map(|v| v == "1").unwrap_or(false) {
+        return;
+    }
     const FAUCET_UEGOC: u64 = 1_000 * 1_000_000;
     crate::chain_db::grant_testnet_faucet(address, FAUCET_UEGOC);
 }
@@ -2134,4 +2137,37 @@ pub async fn get_mainnet_address() -> Result<String, EgoDesktopError> {
         return Err(EgoDesktopError::WalletError("Mainnet address not yet derived".into()));
     }
     Ok(ledger.mainnet_address)
+}
+
+#[cfg(test)]
+mod phrase_compat_tests {
+    use super::*;
+
+    fn phrase_from_seed(seed: &[u8; 32]) -> Vec<String> {
+        let wordlist = get_bip39_wordlist();
+        let checksum_byte = ego_core::hash_data(seed).as_bytes()[0];
+        let mut buf = [0u8; 33];
+        buf[..32].copy_from_slice(seed);
+        buf[32] = checksum_byte;
+        let mut words = Vec::with_capacity(24);
+        for i in 0..24 {
+            let bit_offset = i * 11;
+            let byte_idx = bit_offset / 8;
+            let bit_shift = bit_offset % 8;
+            let b0 = buf[byte_idx] as u32;
+            let b1 = if byte_idx + 1 < 33 { buf[byte_idx + 1] as u32 } else { 0 };
+            let b2 = if byte_idx + 2 < 33 { buf[byte_idx + 2] as u32 } else { 0 };
+            let raw = (b0 << 16) | (b1 << 8) | b2;
+            let index = (((raw >> (13 - bit_shift)) & 0x7FF) as usize) % wordlist.len();
+            words.push(wordlist[index].to_string());
+        }
+        words
+    }
+
+    #[test]
+    fn extension_phrase_matches_desktop() {
+        let seed = [1u8; 32];
+        let expected = "absurd amount dress acoustic aware mask advice can absurd amount dress acoustic aware mask advice can absurd amount dress acoustic aware mask advice combine";
+        assert_eq!(phrase_from_seed(&seed).join(" "), expected);
+    }
 }

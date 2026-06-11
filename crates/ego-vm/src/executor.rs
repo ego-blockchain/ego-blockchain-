@@ -18,6 +18,13 @@ static MODULE_CACHE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, Module>>
 > = std::sync::OnceLock::new();
 
+fn default_val(vt: &wasmtime::ValType) -> wasmtime::Val {
+    if vt.is_i64()      { wasmtime::Val::I64(0) }
+    else if vt.is_f32() { wasmtime::Val::F32(0) }
+    else if vt.is_f64() { wasmtime::Val::F64(0) }
+    else                { wasmtime::Val::I32(0) }
+}
+
 fn get_engine() -> &'static Engine {
     WASM_ENGINE.get_or_init(|| {
         let mut config = Config::new();
@@ -290,12 +297,12 @@ impl Executor {
                     decoded.push(wasmtime::Val::F64(bits));
                     off += 8;
                 } else {
-                    decoded.push(wasmtime::Val::I32(0));
+                    decoded.push(default_val(vt));
                 }
             }
 
             while decoded.len() < param_types.len() {
-                decoded.push(wasmtime::Val::I32(0));
+                decoded.push(default_val(&param_types[decoded.len()]));
             }
             decoded
         };

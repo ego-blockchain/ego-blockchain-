@@ -2289,6 +2289,25 @@ pub async fn fetch_single_price(coin_id: String) -> Result<f64, EgoDesktopError>
         .ok_or_else(|| EgoDesktopError::NetworkError("No price field".into()))
 }
 
+/// Fetch the EUR/USD exchange rate via Binance EURUSDT (USD per 1 EUR).
+#[tauri::command]
+pub async fn fetch_eur_usd_rate() -> Result<f64, EgoDesktopError> {
+    let url = "https://api.binance.com/api/v3/ticker/price?symbol=EURUSDT";
+    let json: serde_json::Value = http_client()
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+    json["price"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|p| *p > 0.0)
+        .ok_or_else(|| EgoDesktopError::NetworkError("No price field".into()))
+}
+
 /// Fetch OHLC candle data. Returns Vec of [open, high, low, close] arrays.
 /// limit=0 triggers all-time paginated fetch (same logic as fetch_coin_chart).
 #[tauri::command]
@@ -2484,4 +2503,18 @@ pub async fn confirm_ext_tx(
         pending.contract,
         pending.decimals,
     ).await
+}
+
+#[cfg(test)]
+mod derivation_tests {
+    use super::*;
+
+    #[test]
+    fn js_extension_derivation_matches() {
+        let seed = [1u8; 32];
+        let btc = addr_btc_like(&seed, "ego:bitcoin:0", "bc").unwrap();
+        let eth = addr_evm(&seed, "ego:ethereum:0").unwrap();
+        assert_eq!(btc, "bc1qgmnrpevzlcnwayhpx633t9756pm49c9y3ll2dh");
+        assert_eq!(eth, "0xDCA8Ad692D3338a2AfcfA75f935961503EaB29BA");
+    }
 }

@@ -1470,18 +1470,22 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
 
     let hrp = if tx.chain_id == 1 { "egot" } else { "ego" };
     
+    let ed_pk = hex::decode(&tx.public_key_ed25519).unwrap_or_default();
+    if ed_pk.len() != 32 {
+        return Err(format!("Spoofing detected: invalid Ed25519 pubkey length"));
+    }
+    let ed_expected = ego_core::EgoAddress::from_public_key_bytes(&ed_pk, tx.chain_id as u32, ego_core::AddressType::EOA)
+        .to_bech32(hrp).unwrap_or_default();
+
     if !dilithium_disabled && !tx.dilithium_pubkey.is_empty() {
         let dil_pk = hex::decode(&tx.dilithium_pubkey).unwrap_or_default();
-        let expected_addr = ego_core::EgoAddress::from_dilithium_pk(&dil_pk, tx.chain_id as u32, ego_core::AddressType::EOA)
+        let dil_expected = ego_core::EgoAddress::from_dilithium_pk(&dil_pk, tx.chain_id as u32, ego_core::AddressType::EOA)
             .to_bech32(hrp).unwrap_or_default();
-        if tx.from != expected_addr {
-            return Err(format!("Spoofing detected: TX from {} does not match dilithium pubkey", tx.from));
+        if tx.from != dil_expected && tx.from != ed_expected {
+            return Err(format!("Spoofing detected: TX from {} does not match attached pubkeys", tx.from));
         }
-    } else {
-        let ed_pk = hex::decode(&tx.public_key_ed25519).unwrap_or_default();
-        if ed_pk.len() != 32 {
-            return Err(format!("Spoofing detected: invalid Ed25519 pubkey length"));
-        }
+    } else if tx.from != ed_expected {
+        return Err(format!("Spoofing detected: TX from {} does not match Ed25519 pubkey", tx.from));
     }
 
     let pk_bytes = hex::decode(&tx.public_key_ed25519)

@@ -502,6 +502,7 @@ fn main() {
             commands::multichain::estimate_external_fee,
             commands::multichain::fetch_coin_chart,
             commands::multichain::fetch_single_price,
+            commands::multichain::fetch_eur_usd_rate,
             commands::multichain::fetch_coin_candles,
             commands::multichain::request_ext_tx_code,
             commands::multichain::confirm_ext_tx,
