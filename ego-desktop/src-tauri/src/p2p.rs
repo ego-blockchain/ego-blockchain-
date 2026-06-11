@@ -7715,14 +7715,30 @@ pub async fn oracle_sync_chain() {
         None => 0,
     };
 
+    let mut from_height = oracle_tip + 1;
     if oracle_tip >= tip {
-        eprintln!("[Oracle] catch-up: oracle tip={} >= local tip={}, skipping", oracle_tip, tip);
-        return;
+        let local_hash = crate::chain_db::get_block_by_height(tip)
+            .map(|b| b.hash.clone())
+            .unwrap_or_default();
+        let oracle_hash: String = match oracle_get(&client, &format!("/chain/blocks?fromHeight={}&limit=1", tip)).await {
+            Some(resp) => resp.json::<Vec<serde_json::Value>>().await
+                .ok()
+                .and_then(|v| v.into_iter().find(|b| b["height"].as_u64() == Some(tip)))
+                .and_then(|b| b["hash"].as_str().map(String::from))
+                .unwrap_or_default(),
+            None => return,
+        };
+        if local_hash.is_empty() || local_hash == oracle_hash {
+            eprintln!("[Oracle] catch-up: oracle tip={} >= local tip={}, chains agree — skipping", oracle_tip, tip);
+            return;
+        }
+        eprintln!("[Oracle] catch-up: oracle on divergent chain (tip={} hash mismatch at #{}) — resubmitting local chain", oracle_tip, tip);
+        from_height = 1;
     }
 
-    eprintln!("[Oracle] catch-up: submitting blocks {}..{} to oracle", oracle_tip + 1, tip);
+    eprintln!("[Oracle] catch-up: submitting blocks {}..{} to oracle", from_height, tip);
     let mut submitted = 0u64;
-    for height in (oracle_tip + 1)..=tip {
+    for height in from_height..=tip {
         let Some(block) = crate::chain_db::get_block_by_height(height) else { continue };
         let txs = crate::chain_db::get_txs_for_block(height);
         let body = serde_json::json!({ "block": block, "transactions": txs });

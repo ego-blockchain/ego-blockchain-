@@ -492,12 +492,8 @@ pub async fn commit_transaction(
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap_or_default();
-        if let Ok(body) = serde_json::to_value(&tx4) {
-            crate::p2p::oracle_post_pub(&client, "/tx/broadcast", &body).await;
-        }
-        if let Ok(body) = serde_json::to_value(&blk4) {
-            crate::p2p::oracle_post_pub(&client, "/block/broadcast", &body).await;
-        }
+        let body = serde_json::json!({ "block": blk4, "transactions": [tx4] });
+        crate::p2p::oracle_post_pub(&client, "/chain/submit", &body).await;
     });
     let summary = tx.signed_summary.clone();
     Ok(TransactionResponse {
