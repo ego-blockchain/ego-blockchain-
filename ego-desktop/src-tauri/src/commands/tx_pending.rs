@@ -22,8 +22,12 @@ fn save(txs: &[LedgerTx]) {
     }
 }
 
+fn is_pool_faucet(tx: &LedgerTx) -> bool {
+    tx.tx_type == "faucet" && tx.from == crate::chain_db::NODE_POOL_ADDR
+}
+
 pub fn add(tx: &LedgerTx) {
-    if tx.signature.is_empty() || tx.public_key_ed25519.is_empty() {
+    if !is_pool_faucet(tx) && (tx.signature.is_empty() || tx.public_key_ed25519.is_empty()) {
         eprintln!("[TxPending] Dropping malformed TX {} — missing signature/pubkey", &tx.hash[..12.min(tx.hash.len())]);
         return;
     }
@@ -57,7 +61,7 @@ pub fn restore_to_mempool() {
     let mut pruned = 0usize;
 
     for tx in &txs {
-        if tx.signature.is_empty() || tx.public_key_ed25519.is_empty() {
+        if !is_pool_faucet(tx) && (tx.signature.is_empty() || tx.public_key_ed25519.is_empty()) {
             eprintln!("[TxPending] Pruning malformed TX {} — missing signature/pubkey", &tx.hash[..12.min(tx.hash.len())]);
             remove(&tx.hash);
             pruned += 1;
