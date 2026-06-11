@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/tauri';
 import { listen } from '@tauri-apps/api/event';
 import Pagination from '../components/Pagination';
 import { useWallet } from '../App';
+import { decodeLandDots, decodeBorders, DOT_LAT_TOP, DOT_LAT_BOTTOM } from '../components/landDots';
 
 interface Location {
   latitude: number;
@@ -32,6 +33,8 @@ interface PeerInfo {
   last_seen: number;
   city?:    string;
   country?: string;
+  lat?:     number | null;
+  lon?:     number | null;
 }
 
 interface PocEvent {
@@ -154,38 +157,29 @@ function resolveCoords(city?: string, country?: string): [number, number] | null
   return null;
 }
 
-// Land polygons — continent + island shapes [lon, lat]
-const LAND: [number, number][][] = [
-  [[-167,62],[-158,56],[-152,60],[-148,60],[-140,60],[-136,56],[-132,54],[-128,50],[-126,50],[-124,46],[-124,40],[-122,36],[-118,34],[-116,32],[-110,30],[-106,28],[-100,26],[-97,26],[-93,28],[-90,28],[-88,30],[-84,30],[-82,30],[-80,26],[-82,24],[-88,20],[-88,16],[-84,14],[-82,10],[-78,8],[-76,8],[-72,10],[-68,12],[-62,12],[-64,16],[-66,18],[-68,18],[-70,20],[-74,22],[-76,24],[-78,26],[-80,26],[-82,30],[-80,32],[-78,34],[-76,36],[-72,42],[-70,44],[-68,47],[-64,44],[-62,46],[-60,47],[-58,48],[-56,50],[-54,52],[-56,56],[-58,60],[-60,62],[-64,64],[-72,64],[-78,66],[-80,70],[-85,72],[-94,74],[-100,72],[-110,70],[-120,72],[-130,70],[-140,70],[-148,68],[-158,66],[-165,66],[-167,68]],
-  [[-78,10],[-75,12],[-70,12],[-62,12],[-60,10],[-56,8],[-52,5],[-50,4],[-44,2],[-40,0],[-36,-4],[-35,-6],[-35,-10],[-36,-12],[-38,-16],[-40,-20],[-42,-22],[-44,-24],[-46,-24],[-48,-28],[-50,-30],[-52,-34],[-54,-36],[-56,-38],[-58,-42],[-62,-46],[-64,-52],[-65,-55],[-67,-55],[-68,-55],[-68,-52],[-70,-50],[-72,-48],[-74,-44],[-75,-40],[-76,-36],[-78,-28],[-80,-22],[-80,-18],[-80,-10],[-80,-4],[-80,0],[-78,2],[-78,6],[-78,10]],
-  [[-10,36],[-8,36],[-2,36],[2,38],[4,40],[2,44],[0,46],[-2,48],[-2,50],[0,52],[2,52],[4,52],[6,52],[8,54],[10,54],[12,56],[14,56],[16,56],[18,56],[20,54],[22,54],[24,52],[26,50],[28,48],[30,46],[28,44],[26,42],[24,40],[22,40],[22,38],[24,38],[26,38],[28,40],[30,40],[32,42],[36,44],[38,42],[36,40],[36,38],[34,36],[30,36],[26,36],[22,38],[18,40],[16,40],[14,42],[12,44],[10,44],[8,44],[6,44],[4,44],[2,44],[0,44],[-2,44],[-4,44],[-6,44],[-8,44],[-10,42],[-10,40],[-10,38],[-10,36]],
-  [[4,58],[6,58],[8,56],[10,56],[12,56],[14,56],[16,58],[18,60],[20,60],[22,62],[24,64],[26,66],[28,68],[26,70],[22,70],[18,70],[16,70],[14,68],[12,66],[10,64],[8,62],[6,60],[4,58]],
-  [[28,47],[28,52],[30,58],[30,64],[28,70],[34,70],[40,70],[50,68],[60,70],[70,72],[80,72],[90,74],[100,76],[110,78],[120,78],[130,76],[140,76],[150,78],[160,76],[170,74],[180,72],[180,66],[176,62],[170,58],[164,56],[158,52],[152,48],[148,46],[142,44],[134,44],[126,46],[120,48],[110,50],[100,50],[90,48],[80,50],[70,52],[60,52],[52,50],[46,50],[42,50],[38,48],[34,46],[28,47]],
-  [[28,42],[28,38],[30,36],[32,32],[34,24],[36,18],[38,14],[44,12],[50,14],[54,14],[60,14],[70,10],[78,8],[80,6],[90,4],[100,2],[104,4],[106,8],[108,10],[110,14],[114,18],[118,22],[122,28],[126,32],[128,36],[130,40],[130,44],[132,44],[130,47],[120,50],[110,52],[100,54],[60,54],[54,52],[50,50],[46,50],[42,50],[40,48],[36,46],[32,44],[28,42]],
-  [[68,22],[72,22],[76,20],[78,16],[80,12],[80,8],[78,8],[74,8],[70,10],[66,16],[66,20],[68,22]],
-  [[98,22],[102,22],[108,16],[110,12],[108,8],[106,8],[104,4],[100,2],[98,4],[96,8],[92,16],[90,20],[90,22],[98,22]],
-  [[-6,36],[-2,36],[2,36],[6,36],[10,36],[14,36],[18,34],[22,34],[26,34],[30,32],[34,30],[36,26],[38,22],[40,18],[42,16],[44,14],[46,12],[48,12],[50,12],[52,14],[50,12],[48,10],[46,10],[44,10],[42,8],[44,4],[44,0],[42,-4],[40,-8],[40,-12],[38,-16],[36,-20],[34,-24],[32,-28],[30,-32],[28,-34],[24,-36],[20,-36],[16,-32],[14,-26],[12,-20],[10,-14],[10,-8],[8,-4],[6,0],[4,4],[2,6],[0,6],[-2,6],[-4,6],[-6,4],[-8,4],[-12,4],[-14,8],[-16,10],[-16,12],[-16,14],[-16,16],[-16,18],[-14,20],[-14,22],[-14,24],[-12,26],[-8,28],[-6,30],[-4,32],[-4,34],[-6,36]],
-  [[114,-22],[116,-20],[118,-18],[120,-18],[122,-18],[124,-16],[126,-14],[128,-14],[130,-12],[132,-12],[134,-12],[136,-12],[138,-14],[140,-16],[142,-16],[144,-16],[146,-18],[148,-20],[150,-22],[152,-24],[152,-26],[152,-28],[152,-32],[150,-36],[148,-38],[146,-40],[144,-40],[142,-38],[140,-38],[138,-36],[136,-34],[132,-32],[128,-34],[126,-34],[122,-34],[118,-34],[116,-32],[114,-30],[114,-26],[114,-22]],
-  [[-56,82],[-44,82],[-30,82],[-18,82],[-18,78],[-20,76],[-22,74],[-24,72],[-24,70],[-28,68],[-34,68],[-40,68],[-46,68],[-52,68],[-54,72],[-56,76],[-56,80],[-56,82]],
-  [[-6,50],[-4,50],[-2,52],[0,52],[2,52],[2,54],[0,56],[-2,58],[-4,58],[-6,58],[-6,56],[-4,54],[-4,52],[-6,50]],
-  [[-10,52],[-6,52],[-6,54],[-8,54],[-10,54],[-10,52]],
-  [[130,32],[132,34],[134,36],[136,36],[138,38],[140,40],[142,40],[142,38],[140,36],[138,34],[136,34],[134,32],[132,30],[130,32]],
-  [[108,2],[110,4],[112,4],[114,6],[116,6],[118,4],[118,2],[116,2],[116,0],[114,0],[112,0],[110,0],[108,0],[108,2]],
-  [[96,6],[98,4],[100,2],[102,2],[104,2],[106,2],[106,0],[104,0],[102,-2],[100,-4],[98,-4],[96,-2],[96,0],[96,4],[96,6]],
-  [[130,-2],[132,-2],[134,-4],[136,-4],[138,-4],[140,-4],[142,-4],[144,-6],[146,-6],[148,-6],[148,-8],[146,-8],[144,-8],[142,-6],[140,-6],[138,-6],[136,-6],[134,-4],[132,-4],[130,-4],[130,-2]],
-  [[44,-12],[46,-14],[48,-16],[50,-18],[50,-20],[50,-22],[50,-24],[48,-26],[46,-26],[44,-24],[44,-22],[44,-20],[44,-18],[44,-16],[44,-12]],
-  [[-24,64],[-20,64],[-16,64],[-14,66],[-14,68],[-18,68],[-22,68],[-24,66],[-24,64]],
-  [[172,-36],[174,-38],[176,-40],[178,-40],[176,-42],[174,-42],[172,-40],[172,-38],[172,-36]],
-];
+const LAND_DOTS = decodeLandDots();
+const BORDER_LINES = decodeBorders();
 
-interface TooltipState { x: number; y: number; node: MapNode }
+interface Cluster {
+  x: number;
+  y: number;
+  count: number;
+  hasMe: boolean;
+  label: string;
+  id: string;
+  r: number;
+}
+
+interface TooltipState { x: number; y: number; cluster: Cluster }
 
 const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = ({ myNode, peers }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const vsRef     = useRef({ scale: 1, ox: 0, oy: 0, drag: false, lx: 0, ly: 0 });
+  const vsRef     = useRef({ scale: 1, ox: 0, oy: 0, drag: false, lx: 0, ly: 0, moved: false });
   const frameRef  = useRef(0);
+  const baseRef   = useRef<{ canvas: HTMLCanvasElement; key: string } | null>(null);
   const [tooltip, setTooltip] = useState<TooltipState | null>(null);
   const nodesRef  = useRef<MapNode[]>([]);
+  const clustersRef = useRef<Cluster[]>([]);
 
   const allNodes = myNode ? [myNode, ...peers] : peers;
   nodesRef.current = allNodes;
@@ -194,8 +188,29 @@ const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = 
     const vs = vsRef.current;
     return [
       ((lon + 180) / 360) * w * vs.scale + vs.ox,
-      ((90 - lat)  / 180) * h * vs.scale + vs.oy,
+      ((DOT_LAT_TOP - lat) / (DOT_LAT_TOP - DOT_LAT_BOTTOM)) * h * vs.scale + vs.oy,
     ];
+  }, []);
+
+  const zoomAt = useCallback((cx: number, cy: number, factor: number) => {
+    const v  = vsRef.current;
+    const ns = Math.max(0.5, Math.min(2000, v.scale * factor));
+    const sf = ns / v.scale;
+    v.ox = cx - sf * (cx - v.ox);
+    v.oy = cy - sf * (cy - v.oy);
+    v.scale = ns;
+  }, []);
+
+  const zoomCenter = useCallback((factor: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    zoomAt(rect.width / 2, rect.height / 2, factor);
+  }, [zoomAt]);
+
+  const resetView = useCallback(() => {
+    const v = vsRef.current;
+    v.scale = 1; v.ox = 0; v.oy = 0;
   }, []);
 
   useEffect(() => {
@@ -215,154 +230,246 @@ const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = 
     const ro = new ResizeObserver(resize);
     ro.observe(canvas);
 
+    const renderBase = (w: number, h: number): HTMLCanvasElement => {
+      const vs  = vsRef.current;
+      const key = `${vs.scale.toFixed(4)}|${vs.ox.toFixed(1)}|${vs.oy.toFixed(1)}|${w}|${h}|${dpr}`;
+      if (baseRef.current?.key === key) return baseRef.current.canvas;
+
+      let off = baseRef.current?.canvas;
+      if (!off) off = document.createElement('canvas');
+      off.width  = w * dpr;
+      off.height = h * dpr;
+      const bctx = off.getContext('2d')!;
+      bctx.save();
+      bctx.scale(dpr, dpr);
+
+      const grad = bctx.createRadialGradient(w / 2, h / 2, 40, w / 2, h / 2, Math.max(w, h) * 0.75);
+      grad.addColorStop(0, '#0b1224');
+      grad.addColorStop(1, '#04060d');
+      bctx.fillStyle = grad;
+      bctx.fillRect(0, 0, w, h);
+
+      bctx.strokeStyle = 'rgba(120,150,255,0.035)';
+      bctx.lineWidth = 0.5;
+      for (let lon = -180; lon <= 180; lon += 30) {
+        const [x] = project(lon, 0, w, h);
+        bctx.beginPath(); bctx.moveTo(x, 0); bctx.lineTo(x, h); bctx.stroke();
+      }
+      for (let lat = -45; lat <= 75; lat += 30) {
+        const [, y] = project(0, lat, w, h);
+        bctx.beginPath(); bctx.moveTo(0, y); bctx.lineTo(w, y); bctx.stroke();
+      }
+
+      const r = Math.min(3.2, Math.max(0.9, 1.15 * Math.sqrt(vs.scale)));
+      bctx.fillStyle = '#2c3a63';
+      bctx.beginPath();
+      for (let i = 0; i < LAND_DOTS.length; i += 2) {
+        const [x, y] = project(LAND_DOTS[i], LAND_DOTS[i + 1], w, h);
+        if (x < -4 || x > w + 4 || y < -4 || y > h + 4) continue;
+        bctx.moveTo(x + r, y);
+        bctx.arc(x, y, r, 0, Math.PI * 2);
+      }
+      bctx.fill();
+
+      bctx.strokeStyle = `rgba(130,160,235,${Math.min(0.34, 0.16 + vs.scale * 0.05)})`;
+      bctx.lineWidth = Math.min(1.1, 0.55 + vs.scale * 0.08);
+      bctx.beginPath();
+      for (const line of BORDER_LINES) {
+        let started = false;
+        for (let i = 0; i < line.length; i += 2) {
+          const [x, y] = project(line[i], line[i + 1], w, h);
+          if (!started) { bctx.moveTo(x, y); started = true; }
+          else bctx.lineTo(x, y);
+        }
+      }
+      bctx.stroke();
+
+      if (vs.scale >= 1.8) {
+        const showLabels = vs.scale >= 2.6;
+        bctx.font = '9px sans-serif';
+        for (const [name, [lat, lon]] of Object.entries(CITY_COORDS)) {
+          const [x, y] = project(lon, lat, w, h);
+          if (x < -10 || x > w + 10 || y < -10 || y > h + 10) continue;
+          bctx.fillStyle = 'rgba(150,170,220,0.8)';
+          bctx.beginPath();
+          bctx.arc(x, y, 1.6, 0, Math.PI * 2);
+          bctx.fill();
+          if (showLabels) {
+            bctx.fillStyle = 'rgba(160,180,225,0.6)';
+            bctx.fillText(name, x + 5, y + 3);
+          }
+        }
+      }
+
+      bctx.restore();
+      baseRef.current = { canvas: off, key };
+      return off;
+    };
+
+    const drawNodeMarker = (
+      c: CanvasRenderingContext2D, x: number, y: number, t: number,
+      color: [number, number, number], phase: number, big: boolean,
+    ) => {
+      const [cr, cg, cb] = color;
+      const rgba = (a: number) => `rgba(${cr},${cg},${cb},${a})`;
+
+      const glowR = big ? 26 : 18;
+      const glow  = c.createRadialGradient(x, y, 1, x, y, glowR);
+      glow.addColorStop(0, rgba(0.30));
+      glow.addColorStop(1, rgba(0));
+      c.fillStyle = glow;
+      c.beginPath(); c.arc(x, y, glowR, 0, Math.PI * 2); c.fill();
+
+      const rings = big ? 2 : 1;
+      for (let k = 0; k < rings; k++) {
+        const u = ((t * 0.55 + phase + k * 0.5) % 1);
+        const ringR  = 5 + u * (big ? 22 : 15);
+        c.strokeStyle = rgba(0.55 * (1 - u));
+        c.lineWidth   = 1.4;
+        c.beginPath(); c.arc(x, y, ringR, 0, Math.PI * 2); c.stroke();
+      }
+
+      c.fillStyle = rgba(1);
+      c.beginPath(); c.arc(x, y, big ? 5 : 4, 0, Math.PI * 2); c.fill();
+      c.fillStyle = '#ffffff';
+      c.beginPath(); c.arc(x, y, big ? 2 : 1.6, 0, Math.PI * 2); c.fill();
+      c.strokeStyle = rgba(0.9);
+      c.lineWidth = 1;
+      c.beginPath(); c.arc(x, y, big ? 7.5 : 6, 0, Math.PI * 2); c.stroke();
+    };
+
     const draw = (ts: number) => {
-      const t  = ts / 1000;
+      const t    = ts / 1000;
       const rect = canvas.getBoundingClientRect();
-      const w  = rect.width;
-      const h  = rect.height;
-      const vs = vsRef.current;
+      const w    = rect.width;
+      const h    = rect.height;
+      const vs   = vsRef.current;
 
       ctx.save();
       ctx.scale(dpr, dpr);
       ctx.clearRect(0, 0, w, h);
-
-      // Ocean
-      ctx.fillStyle = '#050810';
-      ctx.fillRect(0, 0, w, h);
-
-      // Graticule
-      ctx.strokeStyle = 'rgba(255,255,255,0.04)';
-      ctx.lineWidth = 0.4;
-      for (let lon = -180; lon <= 180; lon += 30) {
-        const [x, y0] = project(lon, 85, w, h);
-        const [, y1]  = project(lon, -85, w, h);
-        ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y1); ctx.stroke();
-      }
-      for (let lat = -60; lat <= 90; lat += 30) {
-        const [x0, y] = project(-180, lat, w, h);
-        const [x1]    = project(180,  lat, w, h);
-        ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke();
-      }
-
-      // Land polygons
-      ctx.setLineDash([]);
-      for (const poly of LAND) {
-        if (poly.length < 3) continue;
-        ctx.beginPath();
-        const [sx, sy] = project(poly[0][0], poly[0][1], w, h);
-        ctx.moveTo(sx, sy);
-        for (let i = 1; i < poly.length; i++) {
-          ctx.lineTo(...project(poly[i][0], poly[i][1], w, h));
-        }
-        ctx.closePath();
-        ctx.fillStyle   = '#1e2540';
-        ctx.strokeStyle = '#2e3560';
-        ctx.lineWidth   = vs.scale > 2 ? 0.8 : 0.5;
-        ctx.fill();
-        ctx.stroke();
-      }
+      ctx.drawImage(renderBase(w, h), 0, 0, w, h);
 
       const nodes = nodesRef.current;
-      const me    = nodes.find(n => n.isMe);
-      const dashOff = (t * 25) % 18;
 
-      // Mesh connections — all node pairs
-      const MAX_LINES = 80;
-      let lineCount = 0;
-      for (let i = 0; i < nodes.length && lineCount < MAX_LINES; i++) {
-        for (let j = i + 1; j < nodes.length && lineCount < MAX_LINES; j++) {
-          const a = nodes[i], b = nodes[j];
-          const [ax, ay] = project(a.lon, a.lat, w, h);
-          const [bx, by] = project(b.lon, b.lat, w, h);
-          const isMyLine = a.isMe || b.isMe;
-          ctx.save();
-          ctx.strokeStyle = isMyLine
-            ? 'rgba(100,180,255,0.55)'
-            : 'rgba(140,200,140,0.25)';
-          ctx.lineWidth   = isMyLine ? 1.0 : 0.6;
-          ctx.setLineDash([4, 6]);
-          ctx.lineDashOffset = isMyLine ? -dashOff : -(dashOff * 0.6);
-          ctx.beginPath();
-          ctx.moveTo(ax, ay);
-          ctx.lineTo(bx, by);
-          ctx.stroke();
-          ctx.restore();
-          lineCount++;
-        }
-      }
-
-      // Peer nodes
-      for (const node of nodes.filter(n => !n.isMe)) {
+      const CELL = 34;
+      const cellMap = new Map<string, { sx: number; sy: number; count: number; hasMe: boolean; label: string; id: string }>();
+      for (const node of nodes) {
         const [px, py] = project(node.lon, node.lat, w, h);
-        
-        ctx.save();
-        ctx.translate(px, py);
-        
-        // Draw Pin Marker
-        ctx.beginPath();
-        ctx.arc(0, -14, 6, Math.PI, 0);
-        ctx.bezierCurveTo(6, -6, 2, -2, 0, 0);
-        ctx.bezierCurveTo(-2, -2, -6, -6, -6, -14);
-        ctx.closePath();
-        
-        ctx.fillStyle = '#ef4444'; // Red pin
-        ctx.fill();
-        ctx.strokeStyle = 'rgba(0,0,0,0.5)';
-        ctx.lineWidth   = 1;
-        ctx.stroke();
+        if (px < -60 || px > w + 60 || py < -60 || py > h + 60) continue;
+        const key = `${Math.round(px / CELL)},${Math.round(py / CELL)}`;
+        const c = cellMap.get(key);
+        if (c) {
+          c.sx += px; c.sy += py; c.count++;
+          c.hasMe = c.hasMe || node.isMe;
+        } else {
+          cellMap.set(key, { sx: px, sy: py, count: 1, hasMe: node.isMe, label: node.label, id: node.id });
+        }
+      }
+      const clusters: Cluster[] = [];
+      for (const c of cellMap.values()) {
+        clusters.push({
+          x: c.sx / c.count,
+          y: c.sy / c.count,
+          count: c.count,
+          hasMe: c.hasMe,
+          label: c.label,
+          id: c.id,
+          r: c.count === 1 ? 13 : Math.min(26, 12 + Math.log2(c.count) * 3),
+        });
+      }
+      clustersRef.current = clusters;
 
-        // Pin Hole
-        ctx.beginPath();
-        ctx.arc(0, -14, 2.5, 0, Math.PI * 2);
-        ctx.fillStyle = '#ffffff';
-        ctx.fill();
-        
-        ctx.restore();
+      const meCluster = clusters.find(c => c.hasMe);
+
+      if (meCluster) {
+        const { x: mx, y: my } = meCluster;
+        let ai = 0;
+        for (const c of clusters) {
+          if (c.hasMe || ai >= 60) continue;
+          const dx = c.x - mx, dy = c.y - my;
+          if (Math.hypot(dx, dy) < 10) continue;
+          const cpx = (mx + c.x) / 2 - dy * 0.18;
+          const cpy = (my + c.y) / 2 + dx * 0.18;
+
+          const lg = ctx.createLinearGradient(mx, my, c.x, c.y);
+          lg.addColorStop(0, 'rgba(56,189,248,0.45)');
+          lg.addColorStop(1, 'rgba(248,113,113,0.35)');
+          ctx.strokeStyle = lg;
+          ctx.lineWidth = 1.1;
+          ctx.beginPath();
+          ctx.moveTo(mx, my);
+          ctx.quadraticCurveTo(cpx, cpy, c.x, c.y);
+          ctx.stroke();
+
+          const u  = (t * 0.30 + ai * 0.37) % 1;
+          const iu = 1 - u;
+          const qx = iu * iu * mx + 2 * iu * u * cpx + u * u * c.x;
+          const qy = iu * iu * my + 2 * iu * u * cpy + u * u * c.y;
+          const pg = ctx.createRadialGradient(qx, qy, 0, qx, qy, 5);
+          pg.addColorStop(0, 'rgba(255,255,255,0.95)');
+          pg.addColorStop(1, 'rgba(125,211,252,0)');
+          ctx.fillStyle = pg;
+          ctx.beginPath(); ctx.arc(qx, qy, 5, 0, Math.PI * 2); ctx.fill();
+          ai++;
+        }
       }
 
-      // My node — pulsing glow + pin
-      if (me) {
-        const [mx, my_y] = project(me.lon, me.lat, w, h);
-        const pulse  = 0.5 + 0.5 * Math.sin(t * 2.5);
-        
-        // Base pulse
-        const outerR = 10 + pulse * 8;
-        const grad   = ctx.createRadialGradient(mx, my_y, 2, mx, my_y, outerR);
-        grad.addColorStop(0, 'rgba(79,195,247,0.85)');
-        grad.addColorStop(1, 'rgba(79,195,247,0)');
-        ctx.beginPath(); ctx.arc(mx, my_y, outerR, 0, Math.PI * 2);
-        ctx.fillStyle = grad; ctx.fill();
+      let pi = 0;
+      for (const c of clusters) {
+        if (c.hasMe) continue;
+        if (c.count === 1) {
+          drawNodeMarker(ctx, c.x, c.y, t, [248, 113, 113], pi * 0.23, false);
+          if (vs.scale >= 1.8 && c.label && c.label !== '—') {
+            ctx.font = '10px sans-serif';
+            ctx.fillStyle = 'rgba(252,165,165,0.85)';
+            ctx.fillText(c.label, c.x + 10, c.y + 3);
+          }
+        } else {
+          const glow = ctx.createRadialGradient(c.x, c.y, 2, c.x, c.y, c.r + 10);
+          glow.addColorStop(0, 'rgba(248,113,113,0.35)');
+          glow.addColorStop(1, 'rgba(248,113,113,0)');
+          ctx.fillStyle = glow;
+          ctx.beginPath(); ctx.arc(c.x, c.y, c.r + 10, 0, Math.PI * 2); ctx.fill();
 
-        ctx.save();
-        ctx.translate(mx, my_y);
+          ctx.fillStyle = 'rgba(127,29,29,0.85)';
+          ctx.beginPath(); ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2); ctx.fill();
+          ctx.strokeStyle = 'rgba(248,113,113,0.9)';
+          ctx.lineWidth = 1.6;
+          ctx.beginPath(); ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2); ctx.stroke();
 
-        // Draw Pin Marker
-        ctx.beginPath();
-        ctx.arc(0, -14, 6, Math.PI, 0);
-        ctx.bezierCurveTo(6, -6, 2, -2, 0, 0);
-        ctx.bezierCurveTo(-2, -2, -6, -6, -6, -14);
-        ctx.closePath();
-        
-        ctx.fillStyle = '#4fc3f7'; // Blue pin
-        ctx.fill();
-        ctx.strokeStyle = 'rgba(0,0,0,0.5)';
-        ctx.lineWidth = 1;
-        ctx.stroke();
+          const u = ((t * 0.5 + pi * 0.31) % 1);
+          ctx.strokeStyle = `rgba(248,113,113,${0.5 * (1 - u)})`;
+          ctx.lineWidth = 1.2;
+          ctx.beginPath(); ctx.arc(c.x, c.y, c.r + u * 14, 0, Math.PI * 2); ctx.stroke();
 
-        // Pin Hole
-        ctx.beginPath();
-        ctx.arc(0, -14, 2.5, 0, Math.PI * 2);
-        ctx.fillStyle = '#ffffff';
-        ctx.fill();
-        
-        ctx.restore();
-
-        // Label
-        if (vs.scale > 1.0) {
-          ctx.fillStyle = 'rgba(79,195,247,0.9)';
-          ctx.font = `bold ${Math.max(8, 9 * vs.scale)}px sans-serif`;
-          ctx.fillText('YOU', mx + 10, my_y - 14);
+          ctx.fillStyle = '#fecaca';
+          ctx.font = `bold ${c.count > 999 ? 10 : 11}px sans-serif`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(c.count > 9999 ? `${Math.round(c.count / 1000)}k` : String(c.count), c.x, c.y + 0.5);
+          ctx.textAlign = 'start';
+          ctx.textBaseline = 'alphabetic';
         }
+        pi++;
+      }
+
+      if (meCluster) {
+        const { x: mx, y: my } = meCluster;
+        drawNodeMarker(ctx, mx, my, t, [56, 189, 248], 0, true);
+
+        const label = meCluster.count > 1 ? `YOU +${meCluster.count - 1}` : 'YOU';
+        ctx.font = 'bold 10px sans-serif';
+        const tw = ctx.measureText(label).width;
+        const bx = mx + 11, by = my - 19;
+        ctx.fillStyle = 'rgba(8,18,34,0.85)';
+        ctx.strokeStyle = 'rgba(56,189,248,0.5)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        (ctx as any).roundRect ? (ctx as any).roundRect(bx, by, tw + 12, 16, 5) : ctx.rect(bx, by, tw + 12, 16);
+        ctx.fill(); ctx.stroke();
+        ctx.fillStyle = '#7dd3fc';
+        ctx.fillText(label, bx + 6, by + 11.5);
       }
 
       ctx.restore();
@@ -373,30 +480,24 @@ const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = 
 
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
-      const v    = vsRef.current;
       const rect = canvas.getBoundingClientRect();
-      const cx = e.clientX - rect.left;
-      const cy = e.clientY - rect.top;
-      const d  = e.deltaY > 0 ? 0.82 : 1.22;
-      const ns = Math.max(0.4, Math.min(12, v.scale * d));
-      const sf = ns / v.scale;
-      v.ox = cx - sf * (cx - v.ox);
-      v.oy = cy - sf * (cy - v.oy);
-      v.scale = ns;
+      zoomAt(e.clientX - rect.left, e.clientY - rect.top, e.deltaY > 0 ? 0.82 : 1.22);
     };
     canvas.addEventListener('wheel', onWheel, { passive: false });
 
     return () => { cancelAnimationFrame(frameRef.current); ro.disconnect(); canvas.removeEventListener('wheel', onWheel); };
-  }, [project]);
+  }, [project, zoomAt]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
-    vsRef.current.drag = true; vsRef.current.lx = e.clientX; vsRef.current.ly = e.clientY;
+    vsRef.current.drag = true; vsRef.current.moved = false;
+    vsRef.current.lx = e.clientX; vsRef.current.ly = e.clientY;
     setTooltip(null);
   }, []);
 
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     const vs = vsRef.current;
     if (vs.drag) {
+      if (Math.abs(e.clientX - vs.lx) + Math.abs(e.clientY - vs.ly) > 2) vs.moved = true;
       vs.ox += e.clientX - vs.lx; vs.oy += e.clientY - vs.ly;
       vs.lx  = e.clientX;          vs.ly  = e.clientY;
       setTooltip(null); return;
@@ -405,15 +506,31 @@ const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = 
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const mx = e.clientX - rect.left, my = e.clientY - rect.top;
-    let found: MapNode | null = null;
-    for (const node of nodesRef.current) {
-      const [px, py] = project(node.lon, node.lat, rect.width, rect.height);
-      if (Math.hypot(px - mx, (py - 10) - my) < 14) { found = node; break; }
+    let found: Cluster | null = null;
+    for (const c of clustersRef.current) {
+      if (Math.hypot(c.x - mx, c.y - my) < Math.max(13, c.r + 2)) { found = c; break; }
     }
-    setTooltip(found ? { x: mx, y: my, node: found } : null);
-  }, [project]);
+    setTooltip(found ? { x: mx, y: my, cluster: found } : null);
+  }, []);
 
-  const handleMouseUp    = useCallback(() => { vsRef.current.drag = false; }, []);
+  const handleMouseUp = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const vs = vsRef.current;
+    const wasDrag = vs.drag && vs.moved;
+    vs.drag = false;
+    if (wasDrag) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    for (const c of clustersRef.current) {
+      if (c.count > 1 && Math.hypot(c.x - mx, c.y - my) < c.r + 2) {
+        zoomAt(c.x, c.y, 2.6);
+        setTooltip(null);
+        return;
+      }
+    }
+  }, [zoomAt]);
+
   const handleMouseLeave = useCallback(() => { vsRef.current.drag = false; setTooltip(null); }, []);
 
   return (
@@ -427,8 +544,26 @@ const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = 
         onMouseLeave={handleMouseLeave}
         style={{ display: 'block', width: '100%', height: '100%' }}
       />
+      <div className="absolute top-3 right-3 flex flex-col gap-1.5">
+        {[
+          { label: '+', title: 'Zoom in',  fn: () => zoomCenter(1.45) },
+          { label: '−', title: 'Zoom out', fn: () => zoomCenter(0.69) },
+          { label: '⌖', title: 'Reset view', fn: resetView },
+        ].map(b => (
+          <button
+            key={b.label}
+            title={b.title}
+            onClick={b.fn}
+            className="w-7 h-7 rounded-lg bg-gray-900/80 border border-gray-600/50 text-gray-300 text-sm font-bold
+                       hover:bg-gray-700/80 hover:text-white hover:border-gray-500 transition-colors backdrop-blur-sm
+                       flex items-center justify-center leading-none"
+          >
+            {b.label}
+          </button>
+        ))}
+      </div>
       <div className="absolute bottom-2 right-2 flex gap-3 text-xs text-gray-400 bg-black/50 backdrop-blur-sm rounded-lg px-3 py-1.5 border border-gray-700/40">
-        <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-blue-400 inline-block"/>You</span>
+        <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-sky-400 inline-block"/>You</span>
         <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-red-400 inline-block"/>Peers</span>
         <span className="text-gray-600 hidden sm:inline">Scroll=zoom · Drag=pan</span>
       </div>
@@ -437,12 +572,16 @@ const WorldNetworkMap: React.FC<{ myNode: MapNode | null; peers: MapNode[] }> = 
           className="absolute pointer-events-none bg-gray-900/95 border border-gray-600 rounded-lg px-3 py-2 text-xs shadow-xl backdrop-blur-sm"
           style={{ left: Math.min(tooltip.x + 14, 320), top: tooltip.y - 14, zIndex: 20 }}
         >
-          <div className={`font-bold mb-1 ${tooltip.node.isMe ? 'text-blue-300' : 'text-green-300'}`}>
-            {tooltip.node.isMe ? '◉ Your Node' : '● Peer Node'}
+          <div className={`font-bold mb-1 ${tooltip.cluster.hasMe ? 'text-sky-300' : 'text-red-300'}`}>
+            {tooltip.cluster.count > 1
+              ? `◉ ${tooltip.cluster.count} nodes${tooltip.cluster.hasMe ? ' (incl. you)' : ''}`
+              : tooltip.cluster.hasMe ? '◉ Your Node' : '● Peer Node'}
           </div>
-          <div className="text-gray-200">{tooltip.node.label}</div>
-          {!tooltip.node.isMe && (
-            <div className="text-gray-500 font-mono mt-0.5 text-[10px]">{shortPeerId(tooltip.node.id)}</div>
+          <div className="text-gray-200">{tooltip.cluster.label}</div>
+          {tooltip.cluster.count > 1 ? (
+            <div className="text-gray-500 mt-0.5 text-[10px]">Click to zoom in</div>
+          ) : !tooltip.cluster.hasMe && (
+            <div className="text-gray-500 font-mono mt-0.5 text-[10px]">{shortPeerId(tooltip.cluster.id)}</div>
           )}
         </div>
       )}
@@ -564,28 +703,37 @@ const CoveragePage: React.FC = () => {
     });
   }
 
-  const seenLocs = new Set<string>();
+  const locCounts = new Map<string, number>();
+  if (loc) locCounts.set(`${loc.latitude.toFixed(2)},${loc.longitude.toFixed(2)}`, 1);
+  const seenPeers = new Set<string>();
+  let peersNoLocation = 0;
   for (const peer of peers) {
-    const coords = resolveCoords(peer.city, peer.country);
-    if (!coords) continue;
-    const jitter: [number, number] = [
-      coords[0] + (Math.sin(peer.address.charCodeAt(0) * 7919) * 2),
-      coords[1] + (Math.cos(peer.address.charCodeAt(1) * 6271) * 2),
-    ];
-    const key = `${jitter[0].toFixed(1)},${jitter[1].toFixed(1)}`;
-    if (seenLocs.has(key)) continue;
-    seenLocs.add(key);
+    if (peer.address === wallet?.address) continue;
+    const peerId = extractPeerId(peer.endpoint) || peer.address;
+    if (seenPeers.has(peerId)) continue;
+    seenPeers.add(peerId);
+
+    const coords: [number, number] | null =
+      (typeof peer.lat === 'number' && typeof peer.lon === 'number')
+        ? [peer.lat, peer.lon]
+        : resolveCoords(peer.city, peer.country);
+    if (!coords) { peersNoLocation++; continue; }
+
+    const key = `${coords[0].toFixed(2)},${coords[1].toFixed(2)}`;
+    const n = locCounts.get(key) ?? 0;
+    locCounts.set(key, n + 1);
+    const angle  = n * 2.39996;
+    const radius = 0.0045 * Math.sqrt(n);
     mapNodes.push({
-      id: extractPeerId(peer.endpoint) || peer.address,
-      lat: jitter[0],
-      lon: jitter[1],
+      id: peerId,
+      lat: coords[0] + Math.sin(angle) * radius,
+      lon: coords[1] + Math.cos(angle) * radius,
       label: [peer.city, peer.country].filter(Boolean).join(', ') || peer.name || '—',
       isMe: false,
     });
   }
 
-  const peersOnMap     = mapNodes.filter(n => !n.isMe).length;
-  const peersNoLocation = peers.filter(p => !resolveCoords(p.city, p.country)).length;
+  const peersOnMap = mapNodes.filter(n => !n.isMe).length;
 
   return (
     <div className="p-6 space-y-5 max-w-4xl mx-auto">

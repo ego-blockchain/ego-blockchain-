@@ -285,6 +285,53 @@ fn unstake_credit_amount(tx: &LedgerTx) -> u64 {
     }
 }
 
+fn stake_meta_key(addr: &str) -> Vec<u8> {
+    let mut k = b"stakemeta:".to_vec();
+    k.extend_from_slice(addr.as_bytes());
+    k
+}
+
+/// Parse the lock period (days) out of a stake tx memo ("stake:{lock_days}").
+fn parse_stake_lock_days(tx: &LedgerTx) -> u32 {
+    tx.memo.as_deref()
+        .and_then(|m| m.strip_prefix("stake:"))
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Read a staker's recorded stake-start timestamp + lock days from CF_META.
+fn get_stake_meta(db: &DB, addr: &str) -> Option<(i64, u32)> {
+    let cf_meta = db.cf_handle(CF_META)?;
+    let raw = db.get_cf(cf_meta, &stake_meta_key(addr)).ok().flatten()?;
+    if raw.len() < 12 { return None; }
+    let start_ts = i64::from_le_bytes(raw[0..8].try_into().ok()?);
+    let lock_days = u32::from_le_bytes(raw[8..12].try_into().ok()?);
+    Some((start_ts, lock_days))
+}
+
+/// Deterministic accrued staking reward owed when `tx` (an unstake) commits.
+/// Computed purely from on-chain data — the staker's recorded stake start +
+/// lock days and the unstake timestamp — so every node derives the same value.
+/// Clamped to the remaining STAKING_POOL balance (incl. pending deltas this block)
+/// so it can never exceed the seeded reward pool.
+fn staking_reward_for_unstake(
+    db: &DB,
+    tx: &LedgerTx,
+    pool_pending_delta: i128,
+) -> u64 {
+    let Some((start_ts, lock_days)) = get_stake_meta(db, &tx.from) else { return 0; };
+    let secs = (tx.timestamp - start_ts).max(0) as u64;
+    let principal = tx.amount;
+    let entitled = crate::tokenomics::staking_reward_uegoc(principal, lock_days, secs);
+    if entitled == 0 { return 0; }
+
+    let cf_bal = match db.cf_handle(CF_BALANCES) { Some(c) => c, None => return 0 };
+    let pool_bal: u64 = db.get_cf(cf_bal, STAKING_POOL_ADDR.as_bytes())
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    let effective_pool = (pool_bal as i128 + pool_pending_delta).max(0) as u64;
+    entitled.min(effective_pool)
+}
+
 pub fn equivocation_proof_hash(memo_json: &str) -> String {
     format!("0x{}", blake3::hash(memo_json.as_bytes()).to_hex())
 }
@@ -769,15 +816,13 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         return false;
     }
 
-    // Pre-read balances for all addresses involved (read-before-batch).
     let mut balance_delta: std::collections::HashMap<String, i128> = Default::default();
     let mut new_tx_count: u64 = 0;
     let mut stake_sim: std::collections::HashMap<String, u64> = Default::default();
     let mut slashed_seen = load_slashed_set_inner(db);
     let mut newly_slashed: Vec<(String, u64)> = Vec::new();
 
-    // Process all transactions provided in the block. If they are in the block 
-    // payload, they are being treated as valid and confirmed by the consensus layer.
+ 
     let confirmed_txs: Vec<&LedgerTx> = txs.iter().collect();
 
     for tx in &confirmed_txs {
@@ -786,10 +831,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             continue;
         }
 
-        // ── Foundation vesting enforcement ───────────────────────────────────
-        // Transfers from the foundation wallet are gated by a 4-year linear
-        // vesting schedule.  Blocks containing over-vested foundation TXs are
-        // silently filtered — the block itself is still accepted.
+
         if tx.from == FOUNDATION_ADDR && tx.amount > 0 {
             let now = chrono::Utc::now().timestamp();
             let vested = crate::tokenomics::foundation_vested_egoc(now)
@@ -811,14 +853,11 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             }
         }
 
-        // ── Max supply enforcement ────────────────────────────────────────────
-        // When the node pool is the source (coinbase), cap the outgoing amount to
-        // the pool's current balance. This prevents any block — local or peer —
-        // from inflating supply past the genesis-allocated NODE_POOL_UEGOC.
+
         let credited_amount = if tx.from == NODE_POOL_ADDR && tx.amount > 0 {
             let pool_bal: u64 = db.get_cf(cf_balances, NODE_POOL_ADDR.as_bytes())
                 .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-            // Apply any earlier delta for NODE_POOL_ADDR in this same batch
+
             let pending_delta = *balance_delta.get(NODE_POOL_ADDR).unwrap_or(&0);
             let effective_pool = (pool_bal as i128 + pending_delta).max(0) as u64;
             let capped = tx.amount.min(effective_pool);
@@ -837,6 +876,14 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             let credit = unstake_credit_amount(tx);
             *balance_delta.entry(tx.from.clone()).or_insert(0) += credit as i128 - tx.fee_uegoc as i128;
             *balance_delta.entry(STAKING_ADDR.to_string()).or_insert(0) -= credit as i128;
+            // Accrued APR reward, paid from the staking reward pool (separate from
+            // the principal-holding contract). Deterministic from on-chain data.
+            let pool_pending = *balance_delta.get(STAKING_POOL_ADDR).unwrap_or(&0);
+            let reward = staking_reward_for_unstake(db, tx, pool_pending);
+            if reward > 0 {
+                *balance_delta.entry(tx.from.clone()).or_insert(0) += reward as i128;
+                *balance_delta.entry(STAKING_POOL_ADDR.to_string()).or_insert(0) -= reward as i128;
+            }
             let stake = stake_sim
                 .entry(tx.from.clone())
                 .or_insert_with(|| crate::ledger::get_validator_stake(&tx.from));
@@ -981,6 +1028,19 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         batch.put_cf(cf_meta, &key, u64_le(*amount));
     }
 
+    // Persist / clear per-staker reward metadata (start_ts + lock_days) so the
+    // accrued APR reward can be recomputed deterministically at unstake time.
+    for tx in &confirmed_txs {
+        if is_stake_tx(tx) {
+            let mut rec = Vec::with_capacity(12);
+            rec.extend_from_slice(&tx.timestamp.to_le_bytes());
+            rec.extend_from_slice(&parse_stake_lock_days(tx).to_le_bytes());
+            batch.put_cf(cf_meta, &stake_meta_key(&tx.from), rec);
+        } else if is_unstake_tx(tx) {
+            batch.delete_cf(cf_meta, &stake_meta_key(&tx.from));
+        }
+    }
+
     if !newly_slashed.is_empty() {
         persist_slashed_set_in_batch(&mut batch, &db, &slashed_seen);
         for (addr, _) in &newly_slashed {
@@ -1047,9 +1107,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     // Prune old data to keep disk bounded.
     prune_if_needed(db);
 
-    // Update the in-memory nonce store so replay detection stays current.
-    // Also remove any confirmed TXs from the local pending tracker so the UI
-    // updates correctly even when a peer committed the block (not bft_solo_commit).
+
     let mut hashes_to_remove = Vec::with_capacity(confirmed_txs.len());
     for tx in &confirmed_txs {
         hashes_to_remove.push(tx.hash.clone());
@@ -1083,14 +1141,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     true
 }
 
-// ── Pruning ───────────────────────────────────────────────────────────────────
-//
-// Desktop wallet = light client.  We keep:
-//   • Last FULL_BLOCK_CAP full blocks (CF_BLOCKS + CF_BLOCK_TXS).
-//   • Last HEADER_CAP light headers (CF_HEADERS).
-//   • All transactions in CF_TXS / CF_ADDR_TXS — user's own history is never pruned.
-//
-// RocksDB's delete_range_cf is O(log N) — it writes a range tombstone, not N deletes.
+
 
 fn prune_zero_balance_accounts(db: &DB) -> u64 {
     let cf = match db.cf_handle(CF_BALANCES) { Some(c) => c, None => return 0 };
@@ -1759,6 +1810,16 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
     let tx_hashes: Vec<&str> = stamped.iter().map(|t| t.hash.as_str()).collect();
     let tx_merkle_root = compute_merkle_root(&tx_hashes);
 
+    // Precompute unstake APR rewards sequentially (the RocksDB guard is not Sync,
+    // so it can't be touched inside the parallel closure below).
+    let reward_by_unstake: std::collections::HashMap<String, u64> = stamped.iter()
+        .filter(|tx| is_unstake_tx(tx))
+        .filter_map(|tx| {
+            let r = staking_reward_for_unstake(&db, tx, 0);
+            if r > 0 { Some((tx.hash.clone(), r)) } else { None }
+        })
+        .collect();
+
     let state_root = {
         use rayon::prelude::*;
 
@@ -1770,6 +1831,10 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
                     let credit = unstake_credit_amount(tx);
                     pairs.push((tx.from.as_bytes().to_vec(), credit as i128 - tx.fee_uegoc as i128));
                     pairs.push((STAKING_ADDR.as_bytes().to_vec(), -(credit as i128)));
+                    if let Some(&reward) = reward_by_unstake.get(&tx.hash) {
+                        pairs.push((tx.from.as_bytes().to_vec(), reward as i128));
+                        pairs.push((STAKING_POOL_ADDR.as_bytes().to_vec(), -(reward as i128)));
+                    }
                     return pairs;
                 }
                 if !tx.to.is_empty() {
@@ -2034,6 +2099,12 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
                 let credit = unstake_credit_amount(tx);
                 *deltas.entry(tx.from.as_bytes().to_vec()).or_insert(0) += credit as i128 - tx.fee_uegoc as i128;
                 *deltas.entry(STAKING_ADDR.as_bytes().to_vec()).or_insert(0) -= credit as i128;
+                let pool_pending = *deltas.get(STAKING_POOL_ADDR.as_bytes()).unwrap_or(&0);
+                let reward = staking_reward_for_unstake(&db, tx, pool_pending);
+                if reward > 0 {
+                    *deltas.entry(tx.from.as_bytes().to_vec()).or_insert(0) += reward as i128;
+                    *deltas.entry(STAKING_POOL_ADDR.as_bytes().to_vec()).or_insert(0) -= reward as i128;
+                }
                 continue;
             }
             if !tx.to.is_empty() {
@@ -2174,6 +2245,12 @@ fn compute_projected_state_root_inner(db: &DB, txs: &[LedgerTx]) -> String {
             let credit = unstake_credit_amount(tx);
             *deltas.entry(tx.from.as_bytes().to_vec()).or_insert(0) += credit as i128 - tx.fee_uegoc as i128;
             *deltas.entry(STAKING_ADDR.as_bytes().to_vec()).or_insert(0) -= credit as i128;
+            let pool_pending = *deltas.get(STAKING_POOL_ADDR.as_bytes()).unwrap_or(&0);
+            let reward = staking_reward_for_unstake(db, tx, pool_pending);
+            if reward > 0 {
+                *deltas.entry(tx.from.as_bytes().to_vec()).or_insert(0) += reward as i128;
+                *deltas.entry(STAKING_POOL_ADDR.as_bytes().to_vec()).or_insert(0) -= reward as i128;
+            }
             continue;
         }
         if !tx.to.is_empty() {
@@ -2314,8 +2391,11 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
                     || tx.tx_type == "compute_escrow"
                     || tx.tx_type == "storage_escrow"
                     || tx.tx_type == "slash_storage";
-                let is_legacy = tx.signature == "system" || tx.signature == "faucet" || tx.signature == "cluster_escrow_system" || tx.signature == "coinbase" || tx.tx_type == "reward";
-                
+                // NOTE: "reward" and "coinbase" signatures are NOT a free pass here.
+                // The block's single coinbase is validated above (is_coinbase); any
+                // other coinbase-signed/reward-typed tx must be rejected.
+                let is_legacy = tx.signature == "system" || tx.signature == "faucet" || tx.signature == "cluster_escrow_system";
+
                 if !is_coinbase && !is_fee && !is_post_reward && !is_faucet && !is_cluster && !is_res && !is_legacy {
                     return Err(format!("unexpected protocol system tx {} (type: '{}')", tx.hash, tx.tx_type));
             }
@@ -2330,9 +2410,17 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
                     || tx.tx_type == "compute_escrow"
                     || tx.tx_type == "storage_escrow"
                     || tx.tx_type == "slash_storage";
-                let is_legacy = tx.signature == "system" || tx.signature == "faucet" || tx.signature == "cluster_escrow_system" || tx.signature == "coinbase" || tx.tx_type == "reward";
-                
-                if !is_cluster && !is_res && !is_legacy {
+                // C1 fix: an operational reward tx is only valid if it credits the
+                // block miner (no paying arbitrary addresses) and is bounded. This
+                // blocks the free-mint vector where any peer gossips a "reward" tx
+                // from the node pool to itself for an arbitrary amount.
+                let is_reward = tx.tx_type == "reward"
+                    && !block.miner.is_empty()
+                    && tx.to == block.miner
+                    && tx.amount <= crate::tokenomics::REWARD_CAP_PER_TX_UEGOC;
+                let is_legacy = tx.signature == "system" || tx.signature == "faucet" || tx.signature == "cluster_escrow_system";
+
+                if !is_cluster && !is_res && !is_reward && !is_legacy {
                     return Err(format!("forbidden system-source tx {} (type: '{}')", tx.hash, tx.tx_type));
                 }
         } else {
@@ -2756,12 +2844,7 @@ pub fn append_peer_block_with_votes(block: &LedgerBlock, txs: &[LedgerTx], votes
     write_block_batch(&db, &b, txs);
 }
 
-/// Applies a single TX to a block that is already in the chain.
-/// Called when multiple TxBroadcast messages share the same block — the first
-/// message creates the block, but subsequent TXs in that block must still be
-/// credited.  The fork-choice guard inside write_block_batch would silently
-/// drop equal-vote-count re-writes, so we bypass it here and only touch the
-/// TX and balance columns, never the block record.
+
 pub fn apply_missing_tx(block_height: u64, tx: &LedgerTx) {
     if tx.hash.is_empty() { return; }
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
@@ -2846,18 +2929,12 @@ pub fn apply_missing_tx(block_height: u64, tx: &LedgerTx) {
     }
 }
 
-// ── Merkle tree (Blake3) ───────────────────────────────────────────────────────
-//
-// Standard binary Merkle tree. Leaf = blake3(tx_hash). Internal nodes:
-// blake3(left_child_hex ++ right_child_hex). Odd levels: duplicate last leaf.
-// This allows any light client to verify TX inclusion with O(log N) hashes.
 
 fn blake3_hex(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
 }
 
-/// Compute the Merkle root of a list of transaction hashes.
-/// Returns 64 zero chars for an empty block.
+
 pub fn compute_merkle_root(tx_hashes: &[&str]) -> String {
     if tx_hashes.is_empty() {
         return "0".repeat(64);

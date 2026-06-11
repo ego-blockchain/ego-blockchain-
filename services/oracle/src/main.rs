@@ -3,7 +3,7 @@ mod dns;
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -123,6 +123,63 @@ impl ChainState {
         }
     }
 
+    /// Validating merge: structural sanity + parent linkage. Rejects malformed
+    /// blocks and silent history rewrites (a replacement at an existing height
+    /// whose prev_hash doesn't match the stored parent). Out-of-order delivery
+    /// is tolerated — linkage is only enforced when the parent is already known.
+    fn merge_block_checked(&mut self, mut block: Value) -> Result<(), String> {
+        normalize_block_schema(&mut block);
+        let height   = block["height"].as_u64().ok_or("block missing numeric height")?;
+        let new_hash = block["hash"].as_str().unwrap_or("").to_string();
+        let prev     = block["prev_hash"].as_str().unwrap_or("").to_string();
+
+        if new_hash.len() < 40 {
+            return Err("block hash too short / missing".into());
+        }
+        let hash_ok = new_hash == GENESIS_HASH
+            || new_hash.bytes().all(|c| c.is_ascii_hexdigit());
+        if !hash_ok {
+            return Err("block hash is not valid hex".into());
+        }
+
+        if height == 0 {
+            if new_hash != GENESIS_HASH {
+                return Err("genesis block hash mismatch".into());
+            }
+        } else if prev.len() < 40 {
+            return Err("non-genesis block missing prev_hash".into());
+        }
+
+        // Parent linkage (best-effort: only when we already hold height-1).
+        if height > 0 {
+            if let Some(parent) = self.blocks.iter().find(|b| b["height"].as_u64() == Some(height - 1)) {
+                if parent["hash"].as_str() != Some(prev.as_str()) {
+                    return Err(format!(
+                        "prev_hash does not link to known parent at height {}", height - 1
+                    ));
+                }
+            }
+        }
+
+        // Reject silent rewrite: a different block already occupies this height
+        // whose hash differs and whose parent linkage we can't justify.
+        if let Some(existing) = self.blocks.iter().find(|b| b["height"].as_u64() == Some(height)) {
+            let old_hash = existing["hash"].as_str().unwrap_or("");
+            if !old_hash.is_empty() && old_hash != new_hash {
+                // Only allow the replacement if it links to a parent we hold.
+                let parent_known = height == 0
+                    || self.blocks.iter().any(|b| b["height"].as_u64() == Some(height - 1)
+                        && b["hash"].as_str() == Some(prev.as_str()));
+                if !parent_known {
+                    return Err("refusing to replace existing block with unlinked fork".into());
+                }
+            }
+        }
+
+        self.merge_block(block);
+        Ok(())
+    }
+
     fn prune_descendants_of(&mut self, parent_hash: &str) {
         let orphaned: Vec<String> = self.blocks.iter()
             .filter(|b| b["prev_hash"].as_str() == Some(parent_hash))
@@ -235,6 +292,10 @@ pub struct AppState {
     pub acme:           Arc<acme::AcmeState>,
     pub post_approvals: Arc<RwLock<HashMap<String, PostRewardApproval>>>,
     pub post_rate_limit: Arc<RwLock<HashMap<String, i64>>>,
+    /// Shared secret required on chain-mutating endpoints. When `None`, submits
+    /// are still accepted but a loud SECURITY warning is logged on every call —
+    /// set ORACLE_SUBMIT_TOKEN before any public exposure to enforce auth.
+    pub submit_token: Option<String>,
 }
 
 const EGOC_USD: f64 = 0.01;
@@ -388,19 +449,55 @@ struct SubmitPayload {
     transactions: Vec<Value>,
 }
 
+/// Constant-time-ish bearer/token check. Accepts the token via either
+/// `Authorization: Bearer <token>` or `X-Ego-Submit-Token: <token>`.
+fn submit_authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(expected) = state.submit_token.as_deref() else {
+        // No token configured — allowed but the startup warning already fired.
+        return true;
+    };
+    let presented = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim_start_matches("Bearer ").trim())
+        .filter(|v| !v.is_empty())
+        .or_else(|| headers.get("x-ego-submit-token").and_then(|v| v.to_str().ok()));
+    match presented {
+        Some(tok) => {
+            // length-independent comparison to avoid trivial timing leaks
+            let a = tok.as_bytes();
+            let b = expected.as_bytes();
+            let mut diff = (a.len() ^ b.len()) as u8;
+            for i in 0..a.len().max(b.len()) {
+                diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+            }
+            diff == 0
+        }
+        None => false,
+    }
+}
+
 async fn handle_chain_submit(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<SubmitPayload>,
 ) -> impl IntoResponse {
+    if !submit_authorized(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid or missing submit token" })));
+    }
+
     let mut chain = state.chain.write().await;
 
     if let Some(block) = payload.block {
-        let height = block["height"].as_u64().unwrap_or(0);
-        chain.merge_block(block);
-        info!("Oracle: accepted block #{}", height);
+        if let Err(e) = chain.merge_block_checked(block) {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": e })));
+        }
     }
     for block in payload.blocks {
-        chain.merge_block(block);
+        if let Err(e) = chain.merge_block_checked(block) {
+            // One bad block in a batch shouldn't poison the rest, but log it.
+            error!("Oracle: rejected batched block: {}", e);
+        }
     }
     chain.merge_txs(payload.transactions);
 
@@ -652,7 +749,14 @@ async fn main() {
         acme:            acme_state,
         post_approvals:  Arc::new(RwLock::new(HashMap::new())),
         post_rate_limit: Arc::new(RwLock::new(HashMap::new())),
+        submit_token:    std::env::var("ORACLE_SUBMIT_TOKEN").ok().filter(|s| !s.trim().is_empty()),
     };
+    if state.submit_token.is_none() {
+        error!("SECURITY: ORACLE_SUBMIT_TOKEN is not set — /chain/submit is UNAUTHENTICATED. \
+                Set this env var (matching EGO_ORACLE_SUBMIT_TOKEN on nodes) before public launch.");
+    } else {
+        info!("Chain-submit authentication enabled (ORACLE_SUBMIT_TOKEN set)");
+    }
 
     tokio::spawn(price_refresh_task(state.clone()));
 

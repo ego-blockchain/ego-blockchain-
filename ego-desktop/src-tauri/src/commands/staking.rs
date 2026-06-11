@@ -1,7 +1,7 @@
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
-use crate::ledger::{load_chain, tx_signing_bytes, tx_signing_bytes_v2, Ledger, LedgerTx};
-use crate::tokenomics::{STAKING_APR_BPS, staking_pool_remaining_uegoc};
+use crate::ledger::{load_chain, tx_signing_bytes_v2, Ledger, LedgerTx};
+use crate::tokenomics::{staking_pool_remaining_uegoc, effective_apr_bps};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -17,22 +17,6 @@ const MAX_STAKE_FRACTION: f64 = 0.05;
 /// Below this floor we want MORE validators to join, not fewer — so we
 /// skip the cap entirely to allow the network to bootstrap.
 const MIN_VALIDATORS_BEFORE_CAP: usize = 3;
-
-/// Returns effective APR in basis points including lock-period bonus.
-/// Matches the LOCK_OPTIONS bonuses shown in the frontend.
-///   30 days  →  0 bp bonus → 12.50%
-///   90 days  → +200 bp     → 14.50%
-///  180 days  → +500 bp     → 17.50%
-///  365 days  → +1000 bp    → 22.50%
-fn effective_apr_bps(lock_days: u32) -> u64 {
-    let bonus: u64 = match lock_days {
-        d if d >= 365 => 1_000,
-        d if d >= 180 =>   500,
-        d if d >=  90 =>   200,
-        _             =>     0,
-    };
-    STAKING_APR_BPS + bonus
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StakingInfo {
@@ -321,6 +305,13 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
         ..LedgerTx::default()
     });
 
+    // Both principal AND accrued APR reward are settled deterministically at
+    // block-commit, derived from on-chain data (see chain_db: unstake_credit_amount
+    // for principal, staking_reward_for_unstake for the APR reward paid from
+    // STAKING_POOL_ADDR). The "unstake" signal tx above is the only tx we emit;
+    // the credits are protocol-derived, so there is no self-asserted reward tx
+    // and no mint surface. `accrued_rewards` here is only for the optimistic UI
+    // estimate — the authoritative figure is recomputed on-chain.
     let _ = accrued_rewards;
     ledger.staked_amount         = 0;
     ledger.staked_at             = None;
@@ -329,146 +320,6 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
     ledger.pending_stake_tx_hash = String::new();
     ledger.nonce                 = unstake_nonce;
     ledger.save().map_err(EgoDesktopError::FileSystemError)?;
-    return Ok(());
-
-    #[allow(unreachable_code)]
-    if is_locked && early {
-        // Early unstake: charge 10% fee on principal only; rewards still paid in full.
-        let fee           = staked_amount / 10;
-        let return_amount = (staked_amount - fee) + accrued_rewards;
-        let kp = match state.get_keypair() {
-            Some(k) => k,
-            None    => return Err(EgoDesktopError::WalletError("Wallet not initialized".into())),
-        };
-
-        // Unstake signal tx: user → staking contract, memo="unstake" (source of truth for relay)
-        let unstake_nonce      = ledger.nonce + 1;
-        let unstake_sign_bytes = tx_signing_bytes(&from, STAKING_ADDR, staked_amount, unstake_nonce, ts);
-        let unstake_sig_hex    = hex::encode(kp.sign_ed25519(&unstake_sign_bytes).as_bytes());
-        let unstake_hash       = format!("0x{}", ego_core::hash_data(&unstake_sign_bytes).to_hex());
-
-        crate::mempool::get_mempool().push(LedgerTx {
-            hash:               unstake_hash.clone(),
-            from:               from.clone(),
-            to:                 STAKING_ADDR.to_string(),
-            amount:             staked_amount,
-            memo:               Some("unstake".to_string()),
-            timestamp:          ts,
-            signature:          unstake_sig_hex,
-            status:             "Pending".into(),
-            block_height:       None,
-            nonce:              unstake_nonce,
-            public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
-            ..LedgerTx::default()
-        });
-
-        // Fee tx: user → staking contract (10% penalty)
-        let fee_nonce      = unstake_nonce + 1;
-        let fee_sign_bytes = tx_signing_bytes(&from, STAKING_ADDR, fee, fee_nonce, ts);
-        let fee_sig_hex    = hex::encode(kp.sign_ed25519(&fee_sign_bytes).as_bytes());
-        let fee_hash       = format!("0x{}", ego_core::hash_data(&fee_sign_bytes).to_hex());
-
-        crate::mempool::get_mempool().push(LedgerTx {
-            hash:               fee_hash.clone(),
-            from:               from.clone(),
-            to:                 STAKING_ADDR.to_string(),
-            amount:             fee,
-            memo:               Some("Early unstake fee".to_string()),
-            timestamp:          ts,
-            signature:          fee_sig_hex,
-            status:             "Pending".into(),
-            block_height:       None,
-            nonce:              fee_nonce,
-            public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
-            ..LedgerTx::default()
-        });
-
-        // Return tx: staking contract → user (90% returned)
-        let ret_nonce      = fee_nonce + 1;
-        let ret_sign_bytes = tx_signing_bytes(STAKING_ADDR, &from, return_amount, ret_nonce, ts);
-        let ret_hash       = format!("0x{}", ego_core::hash_data(&ret_sign_bytes).to_hex());
-
-        crate::mempool::get_mempool().push(LedgerTx {
-            hash:               ret_hash.clone(),
-            from:               STAKING_ADDR.to_string(),
-            to:                 from.clone(),
-            amount:             return_amount,
-            memo:               Some(format!("Early unstake return (+{} uEGOC rewards)", accrued_rewards)),
-            timestamp:          ts,
-            signature:          "staking_system".to_string(),
-            status:             "Pending".into(),
-            block_height:       None,
-            nonce:              ret_nonce,
-            public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
-            ..LedgerTx::default()
-        });
-
-        ledger.staked_amount         = 0;
-        ledger.staked_at             = None;
-        ledger.stake_lock_days       = 0;
-        ledger.unstake_at            = None;
-        ledger.pending_stake_tx_hash = String::new();
-        ledger.nonce                 = ledger.nonce + 3;
-        ledger.save().map_err(EgoDesktopError::FileSystemError)?;
-        // On-chain unstake TX (memo="unstake") is the source of truth for the relay.
-    } else {
-        // Normal unstake (lock expired): return full amount
-        let kp = match state.get_keypair() {
-            Some(k) => k,
-            None    => return Err(EgoDesktopError::WalletError("Wallet not initialized".into())),
-        };
-
-        // Unstake signal tx: user → staking contract, memo="unstake" (source of truth for relay)
-        let unstake_nonce      = ledger.nonce + 1;
-        let unstake_sign_bytes = tx_signing_bytes(&from, STAKING_ADDR, staked_amount, unstake_nonce, ts);
-        let unstake_sig_hex    = hex::encode(kp.sign_ed25519(&unstake_sign_bytes).as_bytes());
-        let unstake_hash       = format!("0x{}", ego_core::hash_data(&unstake_sign_bytes).to_hex());
-
-        crate::mempool::get_mempool().push(LedgerTx {
-            hash:               unstake_hash.clone(),
-            from:               from.clone(),
-            to:                 STAKING_ADDR.to_string(),
-            amount:             staked_amount,
-            memo:               Some("unstake".to_string()),
-            timestamp:          ts,
-            signature:          unstake_sig_hex,
-            status:             "Pending".into(),
-            block_height:       None,
-            nonce:              unstake_nonce,
-            public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
-            ..LedgerTx::default()
-        });
-
-        // Return tx: staking contract → user (principal + accrued rewards)
-        let total_return   = staked_amount + accrued_rewards;
-        let ret_nonce      = unstake_nonce + 1;
-        let ret_sign_bytes = tx_signing_bytes(STAKING_ADDR, &from, total_return, ret_nonce, ts);
-        let ret_hash       = format!("0x{}", ego_core::hash_data(&ret_sign_bytes).to_hex());
-
-        crate::mempool::get_mempool().push(LedgerTx {
-            hash:               ret_hash.clone(),
-            from:               STAKING_ADDR.to_string(),
-            to:                 from.clone(),
-            amount:             total_return,
-            memo:               Some(format!("Unstake return (+{} uEGOC rewards)", accrued_rewards)),
-            timestamp:          ts,
-            signature:          "staking_system".to_string(),
-            status:             "Pending".into(),
-            block_height:       None,
-            nonce:              ret_nonce,
-            public_key_ed25519: String::new(), dilithium_pubkey: String::new(), dilithium_signature: String::new(),
-            ..LedgerTx::default()
-        });
-        ledger.staked_amount         = 0;
-        ledger.staked_at             = None;
-        ledger.stake_lock_days       = 0;
-        ledger.unstake_at            = None;
-        ledger.pending_stake_tx_hash = String::new();
-        ledger.nonce                 = unstake_nonce + 1;
-        ledger.save().map_err(EgoDesktopError::FileSystemError)?;
-        // On-chain unstake TX (memo="unstake") is the source of truth for the relay.
-    }
-
     Ok(())
 }
 
