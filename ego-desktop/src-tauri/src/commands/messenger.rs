@@ -603,6 +603,8 @@ pub async fn approve_contact_request(
                 endpoints,
                 city:      None,
                 country:   None,
+                lat:       None,
+                lon:       None,
                 coverage_score,
                 dilithium_pubkey: dil_hex,
                 vrf_pubkey: vrf_hex,

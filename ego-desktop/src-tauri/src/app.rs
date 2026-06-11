@@ -26,6 +26,10 @@ pub struct PeerInfo {
     pub city:    Option<String>,
     #[serde(default)]
     pub country: Option<String>,
+    #[serde(default)]
+    pub lat: Option<f64>,
+    #[serde(default)]
+    pub lon: Option<f64>,
 }
 
 #[derive(Debug, Clone)]

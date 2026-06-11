@@ -284,10 +284,19 @@ async fn oracle_get(client: &reqwest::Client, path: &str) -> Option<reqwest::Res
 }
 
 
+fn oracle_submit_token() -> Option<String> {
+    std::env::var("EGO_ORACLE_SUBMIT_TOKEN").ok().filter(|s| !s.trim().is_empty())
+}
+
 async fn oracle_post(client: &reqwest::Client, path: &str, body: &serde_json::Value) {
+    let token = oracle_submit_token();
     for base in ORACLE_RPCS {
-        if let Ok(resp) = client.post(format!("{}{}", base, path)).json(body).send().await {
-            if resp.status().is_success() { return; } 
+        let mut req = client.post(format!("{}{}", base, path)).json(body);
+        if let Some(ref t) = token {
+            req = req.header("X-Ego-Submit-Token", t);
+        }
+        if let Ok(resp) = req.send().await {
+            if resp.status().is_success() { return; }
         }
     }
 }
@@ -1420,6 +1429,10 @@ pub enum P2PMessage {
         #[serde(default)]
         country: Option<String>,
         #[serde(default)]
+        lat: Option<f64>,
+        #[serde(default)]
+        lon: Option<f64>,
+        #[serde(default)]
         coverage_score: u64,
         #[serde(default, alias = "ed25519_pubkey")]
         dilithium_pubkey: String,
@@ -1800,6 +1813,10 @@ pub struct PeerEntry {
     pub city:    Option<String>,
     #[serde(default)]
     pub country: Option<String>,
+    #[serde(default)]
+    pub lat: Option<f64>,
+    #[serde(default)]
+    pub lon: Option<f64>,
 }
 
 
@@ -2945,13 +2962,18 @@ pub async fn broadcast_peer_announce(app: Option<&tauri::AppHandle<tauri::Wry>>)
         .find(|w| w.id == active_id)
         .map(|w| w.name.clone())
         .unwrap_or_else(|| "Ego Node".to_string());
-    let (my_city, my_country) = {
+    let (my_city, my_country, my_lat, my_lon) = {
         let cache = state.cache.lock().unwrap();
         if let Some(ref cs) = cache.coverage_status {
             if let Some(ref loc) = cs.location {
-                (loc.city.clone(), loc.country.clone())
-            } else { (None, None) }
-        } else { (None, None) }
+                (
+                    loc.city.clone(),
+                    loc.country.clone(),
+                    Some((loc.latitude * 100.0).round() / 100.0),
+                    Some((loc.longitude * 100.0).round() / 100.0),
+                )
+            } else { (None, None, None, None) }
+        } else { (None, None, None, None) }
     };
 
     {
@@ -2962,6 +2984,8 @@ pub async fn broadcast_peer_announce(app: Option<&tauri::AppHandle<tauri::Wry>>)
             last_seen: Utc::now().timestamp(),
             city:      my_city.clone(),
             country:   my_country.clone(),
+            lat:       my_lat,
+            lon:       my_lon,
         });
     }
     let local_peer_id = {
@@ -3002,6 +3026,8 @@ pub async fn broadcast_peer_announce(app: Option<&tauri::AppHandle<tauri::Wry>>)
         endpoints: all_endpoints,
         city:      my_city,
         country:   my_country,
+        lat:       my_lat,
+        lon:       my_lon,
         coverage_score,
         dilithium_pubkey: dilithium_pubkey_hex,
         vrf_pubkey: vrf_pubkey_hex,
@@ -3638,6 +3664,8 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                         last_seen: chrono::Utc::now().timestamp(),
                         city:      None,
                         country:   None,
+                        lat:       None,
+                        lon:       None,
                     });
                 }
             }
@@ -4671,6 +4699,8 @@ async fn handle_event(
                     last_seen: chrono::Utc::now().timestamp(),
                     city:      None,
                     country:   None,
+                    lat:       None,
+                    lon:       None,
                 });
             }
         }
@@ -5070,6 +5100,8 @@ async fn handle_event(
                                     last_seen: chrono::Utc::now().timestamp(),
                                     city: None,
                                     country: None,
+                                    lat: None,
+                                    lon: None,
                                 });
                             }
                         });
@@ -5911,7 +5943,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
             }
         }
 
-        P2PMessage::PeerAnnounce { address, name, endpoint, endpoints, city, country, coverage_score, dilithium_pubkey, vrf_pubkey, staked_amount, genesis_hash, signature, machine_id } => {
+        P2PMessage::PeerAnnounce { address, name, endpoint, endpoints, city, country, lat, lon, coverage_score, dilithium_pubkey, vrf_pubkey, staked_amount, genesis_hash, signature, machine_id } => {
             if genesis_hash != crate::ledger::GENESIS_HASH {
                 tracing::warn!("[P2P] Rejected peer {} — Parallel network attempt detected (Genesis mismatch)", address);
                 return;
@@ -5966,6 +5998,8 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                 last_seen: Utc::now().timestamp(),
             city:      city.clone(),
             country:   country.clone(),
+            lat,
+            lon,
             });
             upsert_peer_cache(PeerEntry {
                 address:   address.clone(),
@@ -5973,6 +6007,8 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                 last_seen: Utc::now().timestamp(),
             city,
             country,
+            lat,
+            lon,
             });
 
             if !endpoint.is_empty() {
@@ -6036,6 +6072,8 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                             endpoints,
                             city:             None,
                             country:          None,
+                            lat:              None,
+                            lon:              None,
                             coverage_score,
                             dilithium_pubkey: dil_hex,
                             vrf_pubkey:       vrf_hex,
@@ -6279,6 +6317,8 @@ P2PMessage::ChatMessage { bundle, seq } => {
                     last_seen: Utc::now().timestamp(),
                     city:      peer.city,
                     country:   peer.country,
+                    lat:       peer.lat,
+                    lon:       peer.lon,
                 });
             }
         }

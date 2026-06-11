@@ -92,6 +92,14 @@ pub const RETRIEVAL_REWARD_USD_PER_GB:    f64 = 0.003;
 // to near zero (e.g. at $0.000001 the USD target would require trillions of EGOC).
 pub const NODE_REWARD_CEILING_UEGOC: u64 = 50 * UEGOC_PER_EGOC; // 50 EGOC per event max
 
+// Hard cap on a single operational `reward` tx accepted into a block. Operational
+// rewards (storage/coverage/consensus/retrieval) are still self-asserted by the
+// node (see audit M2 — trustless sizing requires consensus-validated entitlement),
+// so block validation additionally requires reward.to == block.miner and bounds
+// each reward tx to this ceiling. This stops a peer from gossiping a reward tx
+// that credits an arbitrary address an arbitrary amount (the C1 free-mint vector).
+pub const REWARD_CAP_PER_TX_UEGOC: u64 = 10_000 * UEGOC_PER_EGOC;
+
 /// Convert a USD reward target to uEGOC at the live price,
 /// clamped to [FEE_FLOOR_UEGOC, NODE_REWARD_CEILING_UEGOC].
 pub fn reward_usd_to_uegoc(target_usd: f64) -> u64 {
@@ -154,6 +162,32 @@ pub fn staking_mining_bonus_bps(staked_uegoc: u64) -> u64 {
 }
 
 pub const STAKING_APR_BPS: u64 = 1_250;
+
+pub const SECONDS_PER_YEAR: u64 = 31_536_000;
+
+/// Effective staking APR in basis points including the lock-period bonus.
+///   30d → +0, 90d → +200, 180d → +500, 365d+ → +1000
+pub fn effective_apr_bps(lock_days: u32) -> u64 {
+    let bonus: u64 = match lock_days {
+        d if d >= 365 => 1_000,
+        d if d >= 180 =>   500,
+        d if d >=  90 =>   200,
+        _             =>     0,
+    };
+    STAKING_APR_BPS + bonus
+}
+
+/// Deterministic accrued staking reward for `principal` staked for `secs`
+/// seconds at the APR implied by `lock_days`. Pure integer math so every node
+/// computes an identical value when validating an unstake.
+pub fn staking_reward_uegoc(principal_uegoc: u64, lock_days: u32, secs: u64) -> u64 {
+    if principal_uegoc == 0 || secs == 0 { return 0; }
+    let apr_bps = effective_apr_bps(lock_days);
+    (principal_uegoc as u128
+        * apr_bps as u128
+        * secs as u128
+        / (10_000u128 * SECONDS_PER_YEAR as u128)) as u64
+}
 
 pub const MIN_STAKE_FREE_TX_UEGOC: u64 = UEGOC_PER_EGOC;
 
