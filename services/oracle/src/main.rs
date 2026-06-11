@@ -272,10 +272,28 @@ fn load_chain() -> ChainState {
 fn save_chain(chain: &ChainState) {
     let path = chain_data_path();
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            error!("Chain persistence FAILED: cannot create dir {}: {}. \
+                    Set ORACLE_DATA to a writable path — the chain will be LOST on restart.",
+                   parent.display(), e);
+            return;
+        }
     }
     match serde_json::to_string(chain) {
-        Ok(data) => { let _ = std::fs::write(&path, data); }
+        Ok(data) => {
+            // Write to a temp file then rename, so a crash mid-write can't corrupt
+            // the persisted chain.
+            let tmp = path.with_extension("json.tmp");
+            if let Err(e) = std::fs::write(&tmp, &data) {
+                error!("Chain persistence FAILED: cannot write {}: {}. \
+                        Set ORACLE_DATA to a writable path — the chain will be LOST on restart.",
+                       tmp.display(), e);
+                return;
+            }
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                error!("Chain persistence FAILED: cannot rename into {}: {}", path.display(), e);
+            }
+        }
         Err(e) => { error!("Failed to serialize chain state: {}", e); }
     }
 }
