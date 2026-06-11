@@ -1306,13 +1306,7 @@ pub fn grant_testnet_faucet(address: &str, amount_uegoc: u64) -> bool {
     let credited = amount_uegoc.min(pool_bal);
     if credited == 0 { return false; }
 
-    // Check confirmed chain history — if a faucet tx already committed, don't grant again.
-    let global_drops = get_tx_history_for_addr(address)
-        .into_iter()
-        .filter(|tx| tx.tx_type == "faucet")
-        .count() as u64;
-
-    if global_drops >= 1 {
+    if get_faucet_drops(address) >= 1 {
         return false;
     }
 
@@ -1354,7 +1348,19 @@ pub fn grant_testnet_faucet(address: &str, amount_uegoc: u64) -> bool {
     };
 
     eprintln!("[Faucet] Queuing {} uEGOC for {} via Mempool", credited, address);
-    
+
+    {
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cf_meta) = db.cf_handle(CF_META) {
+            let faucet_key = format!("faucet_drops:{}", address);
+            let prev = db.get_cf(cf_meta, faucet_key.as_bytes())
+                .ok().flatten()
+                .map(|v| read_u64_le(&v))
+                .unwrap_or(0);
+            let _ = db.put_cf(cf_meta, faucet_key.as_bytes(), u64_le(prev + 1));
+        }
+    }
+
     crate::commands::tx_pending::add(&tx);
     let pool = crate::mempool::get_mempool();
     let _ = pool.push(tx.clone());

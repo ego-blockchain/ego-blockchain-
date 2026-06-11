@@ -343,15 +343,24 @@ async fn handle_chain_blocks(
     axum::extract::Query(q): axum::extract::Query<ChainQuery>
 ) -> impl IntoResponse {
     let chain = state.chain.read().await;
-    let from = q.from_height.unwrap_or(0);
     let limit = q.limit.unwrap_or(500);
-    
-    let filtered: Vec<Value> = chain.blocks.iter()
-        .filter(|b| b["height"].as_u64().unwrap_or(0) >= from)
-        .take(limit)
-        .cloned()
-        .collect();
-    Json(filtered)
+
+    let mut filtered: Vec<Value> = match q.from_height {
+        Some(from) => chain.blocks.iter()
+            .filter(|b| b["height"].as_u64().unwrap_or(0) >= from)
+            .cloned()
+            .collect(),
+        None => chain.blocks.iter().cloned().collect(),
+    };
+    filtered.sort_by_key(|b| b["height"].as_u64().unwrap_or(0));
+
+    let out: Vec<Value> = if q.from_height.is_some() {
+        filtered.into_iter().take(limit).collect()
+    } else {
+        let skip = filtered.len().saturating_sub(limit);
+        filtered.into_iter().skip(skip).collect()
+    };
+    Json(out)
 }
 
 async fn handle_chain_transactions(
@@ -360,11 +369,12 @@ async fn handle_chain_transactions(
 ) -> impl IntoResponse {
     let chain = state.chain.read().await;
     let from = q.from_height.unwrap_or(0);
-    let filtered: Vec<Value> = chain.transactions.iter()
+    let mut filtered: Vec<Value> = chain.transactions.iter()
         .filter(|t| t["block_height"].as_u64().unwrap_or(0) >= from)
-        .take(500)
         .cloned()
         .collect();
+    filtered.sort_by_key(|t| std::cmp::Reverse(t["block_height"].as_u64().unwrap_or(0)));
+    filtered.truncate(q.limit.unwrap_or(500));
     Json(filtered)
 }
 
@@ -606,7 +616,9 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
         "last_update":  last_update,
         "chain_blocks": chain.blocks.len(),
         "chain_tip":    tip,
+        "block_height": tip,
         "chain_txs":    chain.transactions.len(),
+        "tx_count":     chain.transactions.len(),
     }))
 }
 
