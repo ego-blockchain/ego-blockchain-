@@ -550,6 +550,41 @@ pub fn register_validator_pubkey(address: &str, dilithium_pubkey_hex: &str) {
     validator_pubkeys().insert(address.to_string(), dilithium_pubkey_hex.to_string());
 }
 
+/// This node's own Ed25519 public key (hex), or "" if the seed isn't loaded.
+fn my_ed25519_pubkey_hex() -> String {
+    match get_ed25519_seed() {
+        Some(seed) => {
+            use ed25519_dalek::SigningKey;
+            hex::encode(SigningKey::from_bytes(&seed).verifying_key().as_bytes())
+        }
+        None => String::new(),
+    }
+}
+
+/// If `pubkey_hex` derives `address`, cache it for future verifications and
+/// return true. Lets a node learn a voter's key directly from the vote that
+/// carries it, instead of waiting for the voter's announce to propagate.
+fn learn_voter_pubkey(address: &str, pubkey_hex: &str) -> bool {
+    if address.is_empty() || pubkey_hex.len() != 64 { return false; }
+    let Ok(bytes) = hex::decode(pubkey_hex) else { return false; };
+    if bytes.len() != 32 { return false; }
+    let derived = ego_core::EgoAddress::from_public_key_bytes(&bytes, 1, ego_core::AddressType::EOA)
+        .to_bech32("egot").unwrap_or_default();
+    if derived != address { return false; }
+    record_peer_ed25519(address, pubkey_hex);
+    true
+}
+
+/// Verify a BFT signature, accepting an inline pubkey carried with the vote.
+/// The inline key is only trusted after `learn_voter_pubkey` confirms it derives
+/// the claimed address, so it cannot be used to vote as someone else.
+fn verify_bft_sig_with_key(address: &str, data: &str, sig_hex: &str, pubkey_hex: &str) -> bool {
+    if !pubkey_hex.is_empty() {
+        learn_voter_pubkey(address, pubkey_hex);
+    }
+    verify_bft_sig(address, data, sig_hex)
+}
+
 fn verify_bft_sig(address: &str, data: &str, sig_hex: &str) -> bool {
     let pubkey = match get_peer_ed25519_pubkey(address) {
         Some(pk) => pk,
@@ -1619,6 +1654,11 @@ pub enum P2PMessage {
         bls_sig:    String,
         #[serde(default)]
         bls_pubkey: String,
+        /// Voter's Ed25519 pubkey (hex). Carried with the vote so any receiver can
+        /// verify the signature without having first seen the voter's announce —
+        /// it is trusted only after confirming it derives `voter`'s address.
+        #[serde(default)]
+        voter_pubkey: String,
     },
     BlockFinalized {
         block:        LedgerBlock,
@@ -4982,9 +5022,13 @@ async fn handle_event(
                     });
                 }
             } else if topic == "ego-votes-v1" {
-                if let Ok(P2PMessage::BlockVote { block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey }) =
+                if let Ok(P2PMessage::BlockVote { block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, voter_pubkey }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
+                    // Learn the voter's key directly from the vote (verified to derive
+                    // their address) so signature verification doesn't depend on the
+                    // announce having arrived first.
+                    learn_voter_pubkey(&voter, &voter_pubkey);
                     // Only register voter if they're voting on a block on our chain.
                     let our_height = crate::chain_db::latest_block_info().0;
                     let vote_on_our_chain = height == our_height + 1
@@ -6204,7 +6248,8 @@ P2PMessage::ChatMessage { bundle, seq } => {
             handle_block_proposal(block, transactions, proposer, signature, vrf_ticket, app).await;
         }
 
-        P2PMessage::BlockVote { block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey } => {
+        P2PMessage::BlockVote { block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, voter_pubkey } => {
+            learn_voter_pubkey(&voter, &voter_pubkey);
             register_known_validator(&voter);
             handle_block_vote(block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, app.cloned()).await;
         }
@@ -8257,6 +8302,7 @@ async fn handle_block_proposal(
         prev_hash:  block.prev_hash.clone(),
         bls_sig:    my_bls_sig.clone(),
         bls_pubkey: my_bls_pk.clone(),
+        voter_pubkey: my_ed25519_pubkey_hex(),
     };
 
     if let Ok(data) = serde_json::to_vec(&vote) {
@@ -8589,7 +8635,10 @@ async fn handle_block_vote(
                 let sig = cast.get(&(v.clone(), height))
                     .map(|(_, s)| s.as_str())
                     .unwrap_or("");
-                serde_json::json!({"voter": v, "signature": sig})
+                let voter_pk = get_peer_ed25519_pubkey(v)
+                    .map(hex::encode)
+                    .unwrap_or_default();
+                serde_json::json!({"voter": v, "signature": sig, "voter_pubkey": voter_pk})
             })
             .collect()
     };
@@ -8703,8 +8752,9 @@ fn process_inbound_qc_finalization(
         let sig_hex = v.get("signature").and_then(|x| x.as_str()).unwrap_or("");
         if sig_hex.is_empty() { continue; }
         if !known.contains(voter) { continue; }
+        let voter_pk = v.get("voter_pubkey").and_then(|x| x.as_str()).unwrap_or("");
         let vote_data = crate::bft_committee::vote_signing_data(block_hash, height, voter);
-        if verify_bft_sig(voter, &vote_data, sig_hex) {
+        if verify_bft_sig_with_key(voter, &vote_data, sig_hex, voter_pk) {
             verified_voters.push(voter.to_string());
         }
     }
@@ -9032,6 +9082,7 @@ pub async fn propose_block_as_leader() {
             prev_hash:  block.prev_hash.clone(),
             bls_sig:    self_bls_sig.clone(),
             bls_pubkey: self_bls_pk.clone(),
+            voter_pubkey: my_ed25519_pubkey_hex(),
         };
         if let Ok(data) = serde_json::to_vec(&self_vote) {
             publish_gossip("ego-votes-v1", data).await;
@@ -9163,6 +9214,7 @@ pub async fn propose_block_as_leader() {
             prev_hash:  block.prev_hash.clone(),
             bls_sig:    self_bls_sig.clone(),
             bls_pubkey: self_bls_pk.clone(),
+            voter_pubkey: my_ed25519_pubkey_hex(),
         };
         if let Ok(data) = serde_json::to_vec(&self_vote) {
             publish_gossip("ego-votes-v1", data).await;
@@ -9356,6 +9408,7 @@ pub async fn propose_block_as_leader_forced() {
             prev_hash:  block.prev_hash.clone(),
             bls_sig:    self_bls_sig.clone(),
             bls_pubkey: self_bls_pk.clone(),
+            voter_pubkey: my_ed25519_pubkey_hex(),
         };
         if let Ok(data) = serde_json::to_vec(&self_vote) {
             publish_gossip("ego-votes-v1", data).await;
@@ -9489,6 +9542,7 @@ pub async fn propose_block_as_leader_forced() {
             prev_hash:  block.prev_hash.clone(),
             bls_sig:    fb_bls_sig.clone(),
             bls_pubkey: fb_bls_pk.clone(),
+            voter_pubkey: my_ed25519_pubkey_hex(),
         };
         if let Ok(data) = serde_json::to_vec(&self_vote) {
             publish_gossip("ego-votes-v1", data).await;
