@@ -2567,11 +2567,14 @@ pub fn validate_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), 
         .and_then(|cf| db.get_cf(cf, META_LATEST_HEIGHT).ok().flatten())
         .map(|v| read_u64_le(&v))
         .unwrap_or(0);
-    if local_tip + 1 == block.height {
-        // Legacy blocks (historical sync) are trusted if their BFT signatures and hashes are valid.
-        if block.height > 5000 {
-            return validate_block_protocol_txs_inner(&db, block, txs);
-        }
+    if local_tip + 1 == block.height && block.height > 0 {
+        // Full reward/balance/coinbase validation on every appended block, so a
+        // forged chain is rejected by math at any height — not just above 5000.
+        // This is what lets the oracle be an untrusted cache: every node verifies
+        // what it serves. (The old `> 5000` gate existed only to skip re-validating
+        // a legacy historical chain that predated these rules; the chain is fresh
+        // from genesis now, so there is nothing legacy to grandfather.)
+        return validate_block_protocol_txs_inner(&db, block, txs);
     }
     Ok(())
 }
