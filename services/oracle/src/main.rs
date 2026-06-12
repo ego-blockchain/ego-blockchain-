@@ -571,13 +571,41 @@ async fn handle_nodes_register(
 #[derive(serde::Deserialize)]
 struct CertRequest { domain: String }
 
+// Cert-request abuse guard: each ACME issuance counts against Let's Encrypt
+// rate limits, so we cap per-domain re-requests and total issuance volume.
+static CERT_RATE: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashMap<String, i64>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+const CERT_DOMAIN_COOLDOWN_SECS: i64 = 3600;     // one issuance per domain per hour
+const CERT_GLOBAL_WINDOW_SECS:   i64 = 3600;
+const CERT_GLOBAL_MAX_PER_WINDOW: usize = 50;    // total new domains per hour
+
 async fn handle_cert_request(
     State(state): State<AppState>,
     Json(body): Json<CertRequest>,
 ) -> impl IntoResponse {
     let domain = body.domain.trim().to_lowercase();
-    if domain.is_empty() || !domain.contains('.') {
+    if domain.is_empty() || !domain.contains('.') || domain.len() > 253 {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid domain" })));
+    }
+    // Basic hostname sanity — block obvious junk before hitting ACME.
+    if !domain.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid domain characters" })));
+    }
+    {
+        let now = Utc::now().timestamp();
+        let mut rate = CERT_RATE.lock().unwrap_or_else(|e| e.into_inner());
+        rate.retain(|_, &mut t| now - t < CERT_GLOBAL_WINDOW_SECS);
+        if let Some(&last) = rate.get(&domain) {
+            if now - last < CERT_DOMAIN_COOLDOWN_SECS {
+                return (StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({ "error": "cert recently requested for this domain; retry later" })));
+            }
+        }
+        if rate.len() >= CERT_GLOBAL_MAX_PER_WINDOW {
+            return (StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": "cert issuance rate limit reached; retry later" })));
+        }
+        rate.insert(domain.clone(), now);
     }
     state.acme.request(domain.clone()).await;
     (StatusCode::ACCEPTED, Json(json!({ "domain": domain, "status": "pending" })))

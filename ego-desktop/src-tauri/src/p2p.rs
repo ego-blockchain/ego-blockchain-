@@ -288,15 +288,39 @@ fn oracle_submit_token() -> Option<String> {
     std::env::var("EGO_ORACLE_SUBMIT_TOKEN").ok().filter(|s| !s.trim().is_empty())
 }
 
+/// Whether this node feeds chain state to the oracle. Only designated writer
+/// nodes (those holding the submit token) push — end-user clients never do;
+/// they read from the oracle and sync via P2P. This keeps the token a secret
+/// held by a small trusted set instead of shipping it to millions of clients.
+pub fn is_oracle_writer() -> bool {
+    oracle_submit_token().is_some()
+}
+
 async fn oracle_post(client: &reqwest::Client, path: &str, body: &serde_json::Value) {
     let token = oracle_submit_token();
+    if token.is_none() && path == "/chain/submit" {
+        eprintln!("[Oracle] WARNING: EGO_ORACLE_SUBMIT_TOKEN not set — submits will be rejected once the oracle enforces auth");
+    }
     for base in ORACLE_RPCS {
         let mut req = client.post(format!("{}{}", base, path)).json(body);
         if let Some(ref t) = token {
             req = req.header("X-Ego-Submit-Token", t);
         }
-        if let Ok(resp) = req.send().await {
-            if resp.status().is_success() { return; }
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() { return; }
+                if status.as_u16() == 401 {
+                    eprintln!("[Oracle] {}{} REJECTED 401 — token mismatch (EGO_ORACLE_SUBMIT_TOKEN vs oracle ORACLE_SUBMIT_TOKEN)", base, path);
+                } else {
+                    let body_txt = resp.text().await.unwrap_or_default();
+                    eprintln!("[Oracle] {}{} failed: HTTP {} {}", base, path, status.as_u16(),
+                        body_txt.chars().take(160).collect::<String>());
+                }
+            }
+            Err(e) => {
+                eprintln!("[Oracle] {}{} unreachable: {}", base, path, e);
+            }
         }
     }
 }
@@ -307,6 +331,8 @@ pub async fn oracle_post_pub(client: &reqwest::Client, path: &str, body: &serde_
 }
 
 pub async fn push_block_to_oracle(block: &crate::ledger::LedgerBlock, txs: &[crate::ledger::LedgerTx]) {
+    // Only token-holding writer nodes feed the oracle; plain clients just read.
+    if !is_oracle_writer() { return; }
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
@@ -675,13 +701,43 @@ pub fn record_eviction_cooldown(addr: &str) {
 /// validator. The `SOLO_AFTER_EVICTION` flag is cleared regardless so a
 /// stale flag from an earlier eviction can never authorise a fork once
 /// peers rejoin.
+/// Wall-clock time (unix secs) of the first solo-commit check — the start of the
+/// bootstrap anti-fork grace window. Lazily set on first call.
+static SOLO_GRACE_START_TS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn bootstrap_solo_grace_secs() -> i64 {
+    std::env::var("EGO_BOOTSTRAP_SOLO_GRACE_SECS")
+        .ok().and_then(|v| v.parse().ok())
+        .unwrap_or(25)
+}
+
 fn should_solo_commit_now() -> bool {
     let stale_flag = SOLO_AFTER_EVICTION.swap(false, Ordering::Relaxed);
     let committee_alone = known_validators().len() <= 1;
     if stale_flag && !committee_alone {
         tracing::debug!("[BFT] discarding stale SOLO_AFTER_EVICTION — committee grew back to {}", known_validators().len());
     }
-    committee_alone
+    if !committee_alone {
+        // Have peers → run BFT, never solo.
+        return false;
+    }
+    // Bootstrap anti-fork grace: hold off solo-committing for the first
+    // few seconds so peers that started at the same time get discovered first
+    // (and we run BFT) instead of each node sealing its own block #1 and forking.
+    // A genuinely-alone node proceeds normally once the window elapses.
+    let grace = bootstrap_solo_grace_secs();
+    if grace > 0 {
+        let now = chrono::Utc::now().timestamp();
+        let start = SOLO_GRACE_START_TS.load(Ordering::Relaxed);
+        let start = if start == 0 {
+            SOLO_GRACE_START_TS.store(now, Ordering::Relaxed);
+            now
+        } else { start };
+        if now - start < grace {
+            return false;
+        }
+    }
+    true
 }
 
 pub static ORACLE_GAP_FILL_NEEDED: AtomicBool = AtomicBool::new(false);
@@ -7742,6 +7798,8 @@ async fn merge_remote_chain_inner(
 }
 
 pub async fn oracle_sync_chain() {
+    // Only designated writer nodes push the local chain to the oracle.
+    if !is_oracle_writer() { return; }
     let tip = crate::chain_db::block_count().saturating_sub(1);
     if tip == 0 { return; }
 
