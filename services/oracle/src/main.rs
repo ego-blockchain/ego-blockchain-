@@ -26,6 +26,53 @@ use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
+// ── BFT quorum-certificate verification ──────────────────────────────────────
+// A finalized Ego block carries a BLS12-381 aggregate signature (`agg_bls_sig`)
+// over the raw block-hash bytes, signed by the committee validators whose BLS
+// public keys are listed in `bls_pubkeys` (DST = EGO-BFT-VOTE-BLS12381-v1).
+// Verifying it proves those keys actually signed this exact block — the first
+// half of making the oracle an untrusted cache (it can reject forged blocks
+// that do not carry a valid quorum certificate, no shared secret needed).
+const BLS_DST: &[u8] = b"EGO-BFT-VOTE-BLS12381-v1";
+
+#[derive(PartialEq, Debug)]
+enum QcStatus { Valid, Invalid, Absent }
+
+fn verify_block_qc(block: &Value) -> QcStatus {
+    use blst::min_pk::{AggregateSignature, PublicKey, Signature};
+    use blst::BLST_ERROR;
+
+    let hash_hex = block["hash"].as_str().unwrap_or("");
+    let agg_hex  = block["agg_bls_sig"].as_str().unwrap_or("");
+    let pubkeys  = block["bls_pubkeys"].as_array();
+
+    if agg_hex.is_empty() || pubkeys.map(|p| p.is_empty()).unwrap_or(true) {
+        return QcStatus::Absent;
+    }
+    let (Ok(msg), Ok(agg_bytes)) = (hex::decode(hash_hex), hex::decode(agg_hex)) else {
+        return QcStatus::Invalid;
+    };
+    let agg_sig = match Signature::from_bytes(&agg_bytes) {
+        Ok(s) => s,
+        Err(_) => return QcStatus::Invalid,
+    };
+    let pks: Vec<PublicKey> = pubkeys.unwrap().iter()
+        .filter_map(|v| v.as_str())
+        .filter_map(|h| hex::decode(h).ok())
+        .filter_map(|b| PublicKey::from_bytes(&b).ok())
+        .collect();
+    if pks.is_empty() {
+        return QcStatus::Invalid;
+    }
+    let pk_refs: Vec<&PublicKey> = pks.iter().collect();
+    let _ = AggregateSignature::aggregate; // (verify path uses fast_aggregate_verify)
+    if agg_sig.fast_aggregate_verify(true, &msg, BLS_DST, &pk_refs) == BLST_ERROR::BLST_SUCCESS {
+        QcStatus::Valid
+    } else {
+        QcStatus::Invalid
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HostingNodeRecord {
     pub node_id:   String,
@@ -172,6 +219,30 @@ impl ChainState {
                         && b["hash"].as_str() == Some(prev.as_str()));
                 if !parent_known {
                     return Err("refusing to replace existing block with unlinked fork".into());
+                }
+            }
+        }
+
+        // Quorum-certificate check. A block that carries a QC must carry a VALID
+        // one — this rejects forged blocks regardless of the submit token. Blocks
+        // without a QC (solo/bootstrap) are still accepted unless ORACLE_REQUIRE_QC
+        // is set, which enforces a valid QC on every non-genesis block (use once
+        // the network reliably produces quorum certificates, to retire the token).
+        if height > 0 {
+            match verify_block_qc(&block) {
+                QcStatus::Invalid => {
+                    return Err(format!("block #{} has an invalid quorum certificate", height));
+                }
+                QcStatus::Absent => {
+                    if std::env::var("ORACLE_REQUIRE_QC").map(|v| v == "1").unwrap_or(false) {
+                        return Err(format!("block #{} missing required quorum certificate", height));
+                    }
+                }
+                QcStatus::Valid => {
+                    static QC_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !QC_SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        info!("Quorum-certificate verification ACTIVE — first valid QC accepted at block #{}", height);
+                    }
                 }
             }
         }

@@ -27,3 +27,4 @@ rcgen         = "0.11"
 ed25519-dalek = { version = "2", default-features = false }
 blake3        = "1"
 hex           = "0.4"
+blst          = "0.3"
