@@ -722,6 +722,13 @@ fn main() {
                 crate::p2p::broadcast_peer_announce(Some(&handle_startup)).await;
                 tracing::info!("Peer announce sent (endpoint: {})", my_endpoint);
 
+                // Publish this validator's address↔BLS binding on-chain (once) so
+                // the oracle/peers can stake-weight its QC votes.
+                tokio::spawn(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                    tokio::task::spawn_blocking(crate::p2p::maybe_emit_validator_registration).await.ok();
+                });
+
                 crate::p2p::restore_dht_cache().await;
 
                 crate::p2p::dht_publish_self(&{

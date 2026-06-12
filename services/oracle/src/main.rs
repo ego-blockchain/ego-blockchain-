@@ -38,6 +38,30 @@ const BLS_DST: &[u8] = b"EGO-BFT-VOTE-BLS12381-v1";
 #[derive(PartialEq, Debug)]
 enum QcStatus { Valid, Invalid, Absent }
 
+/// Below these thresholds the stake-weighted quorum check is bypassed (matches
+/// the node's `stake_quorum_reached`), so a small bootstrap network isn't broken.
+const MIN_VALIDATORS_FOR_STAKE_QUORUM: usize = 10;
+const MIN_STAKE_FOR_QUORUM_UEGOC: u64 = 10_000_000_000_000; // 10M EGOC
+
+/// Derive an Ego testnet address from an Ed25519 public key — mirrors ego-core
+/// `EgoAddress::from_public_key_bytes(pk, 1, EOA).to_bech32("egot")`:
+/// blake2s256("ego/addr/v1" || chain_id_u32_le || pubkey)[..20], version byte
+/// (0b001<<5)|0, bech32m over the 21-byte payload.
+fn ed25519_pubkey_to_address(pk: &[u8]) -> Option<String> {
+    use blake2::{Blake2s256, Digest};
+    if pk.len() != 32 { return None; }
+    let mut h = Blake2s256::new();
+    h.update(b"ego/addr/v1");
+    h.update(1u32.to_le_bytes());
+    h.update(pk);
+    let digest = h.finalize();
+    let mut payload = [0u8; 21];
+    payload[0] = 0b001 << 5; // version 1, AddressType::EOA = 0
+    payload[1..].copy_from_slice(&digest[..20]);
+    use bech32::ToBase32;
+    bech32::encode("egot", payload.to_base32(), bech32::Variant::Bech32m).ok()
+}
+
 fn verify_block_qc(block: &Value) -> QcStatus {
     use blst::min_pk::{AggregateSignature, PublicKey, Signature};
     use blst::BLST_ERROR;
@@ -239,6 +263,9 @@ impl ChainState {
                     }
                 }
                 QcStatus::Valid => {
+                    // Signers proven; now require they carry ≥⅔ of validator stake
+                    // (no-op until the network passes the bootstrap thresholds).
+                    self.qc_stake_weight_ok(&block)?;
                     static QC_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !QC_SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
                         info!("Quorum-certificate verification ACTIVE — first valid QC accepted at block #{}", height);
@@ -273,6 +300,96 @@ impl ChainState {
         if self.transactions.len() > MAX_TRANSACTIONS {
             self.transactions = self.transactions.split_off(self.transactions.len() - MAX_TRANSACTIONS);
         }
+    }
+
+    /// Replay confirmed stake/unstake transactions into an address→stake map.
+    /// Mirrors the node's validator-stake tracker. This is the weight input for
+    /// the (upcoming) stake-weighted quorum check — derived purely from the chain
+    /// the oracle already holds, no extra trust.
+    fn validator_stakes(&self) -> std::collections::HashMap<String, u64> {
+        const STAKING_ADDR: &str = "egot1staking000000000000000000000000000000000";
+        let mut stakes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        // Process oldest-first so stake/unstake apply in order.
+        let mut txs = self.transactions.clone();
+        txs.sort_by_key(|t| t["timestamp"].as_i64().unwrap_or(0));
+        for tx in &txs {
+            let to = tx["to"].as_str().unwrap_or("");
+            if to != STAKING_ADDR { continue; }
+            let from = tx["from"].as_str().unwrap_or("");
+            if from.is_empty() { continue; }
+            let amount = tx["amount"].as_u64().unwrap_or(0);
+            match tx["tx_type"].as_str().unwrap_or("") {
+                "stake"   => { *stakes.entry(from.to_string()).or_insert(0) += amount; }
+                "unstake" => {
+                    let e = stakes.entry(from.to_string()).or_insert(0);
+                    *e = e.saturating_sub(amount);
+                }
+                _ => {}
+            }
+        }
+        stakes.retain(|_, &mut v| v > 0);
+        stakes
+    }
+
+    /// Build the verified address→BLS-pubkey registry from on-chain
+    /// `validator_register` txs. Each binding is accepted only if the tx's
+    /// Ed25519 pubkey derives `from` AND the bind-signature over the BLS pubkey
+    /// is valid — so the oracle trusts no one for the binding.
+    fn validator_bls_registry(&self) -> std::collections::HashMap<String, Vec<u8>> {
+        use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+        let mut reg = std::collections::HashMap::new();
+        let mut txs = self.transactions.clone();
+        txs.sort_by_key(|t| t["timestamp"].as_i64().unwrap_or(0));
+        for tx in &txs {
+            if tx["tx_type"].as_str() != Some("validator_register") { continue; }
+            let from = tx["from"].as_str().unwrap_or("");
+            let ed_hex = tx["public_key_ed25519"].as_str().unwrap_or("");
+            let memo = tx["memo"].as_str().unwrap_or("");
+            let parts: Vec<&str> = memo.splitn(3, ':').collect();
+            if parts.len() != 3 || parts[0] != "valreg" { continue; }
+            let Ok(ed_bytes) = hex::decode(ed_hex) else { continue };
+            if ed25519_pubkey_to_address(&ed_bytes).as_deref() != Some(from) { continue; }
+            let (Ok(bls_bytes), Ok(sig_bytes)) = (hex::decode(parts[1]), hex::decode(parts[2])) else { continue };
+            let Ok(ed_arr): Result<[u8; 32], _> = ed_bytes.try_into() else { continue };
+            let Ok(sig_arr): Result<[u8; 64], _> = sig_bytes.try_into() else { continue };
+            let Ok(vk) = VerifyingKey::from_bytes(&ed_arr) else { continue };
+            if vk.verify(&bls_bytes, &Signature::from_bytes(&sig_arr)).is_err() { continue; }
+            reg.insert(from.to_string(), bls_bytes);
+        }
+        reg
+    }
+
+    /// Stake-weighted quorum gate for a block's QC. Returns Ok(()) if the QC's
+    /// BLS signers represent ≥⅔ of total validator stake — or if the network is
+    /// still below the bootstrap thresholds (then it's a no-op, matching the node).
+    fn qc_stake_weight_ok(&self, block: &Value) -> Result<(), String> {
+        let stakes = self.validator_stakes();
+        let total_stake: u64 = stakes.values().sum();
+        if stakes.len() < MIN_VALIDATORS_FOR_STAKE_QUORUM || total_stake < MIN_STAKE_FOR_QUORUM_UEGOC {
+            return Ok(()); // bootstrap phase — weight check not yet enforced
+        }
+        let registry = self.validator_bls_registry();
+        // reverse map: bls pubkey hex → address
+        let mut by_bls: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for (addr, bls) in &registry {
+            by_bls.insert(hex::encode(bls), addr.clone());
+        }
+        let signers = block["bls_pubkeys"].as_array().cloned().unwrap_or_default();
+        let mut signer_stake: u64 = 0;
+        let mut counted: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for pk in signers.iter().filter_map(|v| v.as_str()) {
+            if let Some(addr) = by_bls.get(pk) {
+                if counted.insert(addr.clone()) {
+                    signer_stake += stakes.get(addr).copied().unwrap_or(0);
+                }
+            }
+        }
+        if (signer_stake as u128) * 3 < (total_stake as u128) * 2 {
+            return Err(format!(
+                "QC stake weight {} < ⅔ of {} total", signer_stake, total_stake
+            ));
+        }
+        Ok(())
     }
 
     fn sorted_blocks(&self) -> Vec<Value> {
