@@ -1,8 +1,0 @@
-$env:EGO_DATA_DIR  = "C:\Temp\ego-node2"
-$env:EGO_HEADLESS  = "1"
-$env:EGO_LOCK_PORT = "47392"
-$env:EGO_P2P_PORT  = "47396"
-$env:EGO_RPC_PORT  = "47398"
-$env:EGO_DIRECT_PEERS = "/ip4/127.0.0.1/tcp/47393"
-$env:EGO_NO_ORACLE = "1"
-& "D:\OneDrive\Desktop\ego-blockchain-\ego-desktop\src-tauri\target\debug\Ego Desktop.exe"
