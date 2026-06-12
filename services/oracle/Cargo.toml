@@ -28,3 +28,5 @@ ed25519-dalek = { version = "2", default-features = false }
 blake3        = "1"
 hex           = "0.4"
 blst          = "0.3"
+blake2        = "0.10"
+bech32        = "0.9"

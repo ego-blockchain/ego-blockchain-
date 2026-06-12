@@ -7972,6 +7972,64 @@ fn bls_vote_fields(block_hash_bytes: &[u8]) -> (String, String) {
     }
 }
 
+/// Emit a one-time on-chain `validator_register` tx binding this node's address
+/// to its BLS public key (memo `valreg:<bls_hex>:<bind_sig_hex>`, where bind_sig
+/// is the Ed25519 signature over the BLS pubkey bytes). The oracle and other
+/// nodes use this to know which validator a QC's BLS key belongs to, and thus
+/// its stake weight. Skips if an identical registration is already on-chain.
+pub fn maybe_emit_validator_registration() {
+    let seed = match get_ed25519_seed() { Some(s) => s, None => return };
+    let bls_sk = match BLS_SECRET_KEY.get() { Some(s) => s, None => return };
+    let ledger = crate::ledger::Ledger::load();
+    let addr = ledger.address.clone();
+    if addr.is_empty() { return; }
+
+    let bls_pk_hex = hex::encode(crate::bls_agg::bls_pubkey(bls_sk));
+    let bls_pk_bytes = crate::bls_agg::bls_pubkey(bls_sk);
+    use ed25519_dalek::{SigningKey, Signer};
+    let sk = SigningKey::from_bytes(&seed);
+    let ed_pk_hex = hex::encode(sk.verifying_key().as_bytes());
+    let bind_sig_hex = hex::encode(sk.sign(&bls_pk_bytes).to_bytes());
+    let memo = format!("valreg:{}:{}", bls_pk_hex, bind_sig_hex);
+
+    // Skip if we already registered this exact BLS key on-chain.
+    let already = crate::chain_db::get_tx_history_for_addr(&addr)
+        .into_iter()
+        .any(|tx| tx.tx_type == "validator_register"
+            && tx.memo.as_deref() == Some(memo.as_str()));
+    if already { return; }
+
+    let nonce = ledger.nonce + 1;
+    let ts = chrono::Utc::now().timestamp();
+    let sign_bytes = crate::ledger::tx_signing_bytes_v2(&addr, &addr, 0, nonce, ts, 1, &memo);
+    let signature = hex::encode(sk.sign(&sign_bytes).to_bytes());
+    let hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+
+    let tx = crate::ledger::LedgerTx {
+        hash,
+        from: addr.clone(),
+        to: addr.clone(),
+        amount: 0,
+        fee_uegoc: 0,
+        memo: Some(memo),
+        timestamp: ts,
+        status: "Pending".into(),
+        nonce,
+        public_key_ed25519: ed_pk_hex,
+        signature,
+        tx_type: "validator_register".into(),
+        tx_version: 2,
+        chain_id: 1,
+        ..crate::ledger::LedgerTx::default()
+    };
+
+    let mut l = crate::ledger::Ledger::load();
+    l.nonce = nonce;
+    let _ = l.save();
+    let _ = crate::mempool::get_mempool().push(tx);
+    eprintln!("[Validator] Emitted on-chain registration binding {} ↔ BLS key", &addr[..addr.len().min(16)]);
+}
+
 fn proposal_signing_data(block_hash: &str, height: u64) -> String {
     format!("proposal:{}:{}", block_hash, height)
 }
