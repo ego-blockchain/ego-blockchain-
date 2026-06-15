@@ -102,6 +102,10 @@ pub fn ecvrf_verify(pk_bytes: &[u8; 32], alpha: &[u8], proof: &[u8]) -> bool {
         Some(p) => p,
         None => return false,
     };
+    // M1: reject small-order / identity gamma (mul_by_cofactor lands on identity).
+    if gamma.mul_by_cofactor().is_identity() {
+        return false;
+    }
 
     let s_opt: Option<Scalar> = Scalar::from_canonical_bytes(s_b).into();
     let s = match s_opt {
@@ -121,6 +125,11 @@ pub fn ecvrf_verify(pk_bytes: &[u8; 32], alpha: &[u8], proof: &[u8]) -> bool {
         Some(p) => p,
         None => return false,
     };
+    // M1: reject small-order / identity public keys — they'd let an attacker
+    // forge VRF proofs that verify for a key they don't actually control.
+    if pk_point.mul_by_cofactor().is_identity() {
+        return false;
+    }
 
     let u = s * ED25519_BASEPOINT_POINT + c * pk_point;
 

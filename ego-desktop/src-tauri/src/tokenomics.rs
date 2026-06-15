@@ -44,28 +44,20 @@ pub fn block_reward_at(height: u64) -> u64 {
     (reward_f as u64).max(1)
 }
 
-/// Dynamic block reward: base halving reward + all tx fees collected in the block
-/// + a VRF bonus [0, 4×base] derived from prev_hash (deterministic "gift box").
-///
-/// The bonus is unknown until the previous block is finalized — miners experience
-/// it as a surprise payout.  All nodes compute the same value deterministically.
 pub const MINER_FEE_PCT:   u64 = 60;
 pub const STAKING_FEE_PCT: u64 = 40;
 
 pub fn miner_fee_share(tx_fees: u64)   -> u64 { tx_fees * MINER_FEE_PCT   / 100 }
 pub fn staking_fee_share(tx_fees: u64) -> u64 { tx_fees - miner_fee_share(tx_fees) }
 
-/// Miner's coinbase payout:
-///   base halving reward + 60% of block tx fees + VRF bonus [0, 4×base]
-/// The bonus is derived from prev_hash so it is unknown until the previous block
-/// lands — miners experience it as a surprise. All nodes compute it identically.
 pub fn compute_block_reward(height: u64, tx_fees_uegoc: u64, prev_hash: &str) -> u64 {
     let base = block_reward_at(height);
     let seed = format!("ego/block-bonus/v1:{prev_hash}:{height}");
     let h    = blake3::hash(seed.as_bytes());
     let r    = u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap());
-    let bonus = r % (base.saturating_mul(4).saturating_add(1));
-    base.saturating_add(miner_fee_share(tx_fees_uegoc)).saturating_add(bonus)
+    let variance = r % base.saturating_add(1);
+    let surprise = (base / 2).saturating_add(variance);
+    surprise.saturating_add(miner_fee_share(tx_fees_uegoc))
 }
 
 // ── Node reward targets (USD) ─────────────────────────────────────────────────

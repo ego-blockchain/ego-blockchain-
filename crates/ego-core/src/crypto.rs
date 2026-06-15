@@ -10,7 +10,6 @@ use chacha20poly1305::{
 };
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
-use pqcrypto_dilithium::dilithium2;
 use pqcrypto_kyber::kyber768;
 use pqcrypto_sphincsplus::sphincssha256128ssimple;
 use pqcrypto_traits::kem::{
@@ -309,10 +308,11 @@ impl KeyPair {
             *p += len;
             Some(chunk)
         };
-        let dil_pk = read_chunk(bytes, &mut pos).ok_or_else(|| EgoError::CryptoError("bad pq cache".into()))?;
-        let dil_sk = read_chunk(bytes, &mut pos).ok_or_else(|| EgoError::CryptoError("bad pq cache".into()))?;
+        let _stale_dil_pk = read_chunk(bytes, &mut pos).ok_or_else(|| EgoError::CryptoError("bad pq cache".into()))?;
+        let _stale_dil_sk = read_chunk(bytes, &mut pos).ok_or_else(|| EgoError::CryptoError("bad pq cache".into()))?;
         let kyb_pk = read_chunk(bytes, &mut pos).ok_or_else(|| EgoError::CryptoError("bad pq cache".into()))?;
         let kyb_sk = read_chunk(bytes, &mut pos).ok_or_else(|| EgoError::CryptoError("bad pq cache".into()))?;
+        let (dil_pk, dil_sk) = derive_dilithium_keypair(seed)?;
         let ed25519_signing_key = SigningKey::from_bytes(seed);
         let ed25519_verifying_key = ed25519_signing_key.verifying_key();
         Ok(Self {
@@ -335,7 +335,7 @@ impl KeyPair {
         let ed25519_signing_key = SigningKey::from_bytes(&seed);
         let ed25519_verifying_key = ed25519_signing_key.verifying_key();
 
-        let (dilithium_pk, dilithium_sk) = derive_dilithium_keypair().unwrap();
+        let (dilithium_pk, dilithium_sk) = derive_dilithium_keypair(&seed).unwrap();
         let (kyber_pk, kyber_sk) = derive_kyber_keypair().unwrap();
 
         let x25519_secret = seed;
@@ -670,8 +670,8 @@ impl KeyPair {
         self.sign_dilithium(&msg)
     }
 
-    pub fn derive_ots_keypair_from_seed(_seed: &[u8; 32]) -> EgoResult<(Vec<u8>, Vec<u8>)> {
-        derive_dilithium_keypair()
+    pub fn derive_ots_keypair_from_seed(seed: &[u8; 32]) -> EgoResult<(Vec<u8>, Vec<u8>)> {
+        dilithium_keypair_from_xi(&mldsa_xi(b"ego/ml-dsa-44/ots/v1", seed))
     }
 
     pub fn export_keys(&self) -> ExportedKeys {
@@ -1445,9 +1445,26 @@ impl MerkleProof {
     }
 }
 
-fn derive_dilithium_keypair() -> EgoResult<(Vec<u8>, Vec<u8>)> {
-    let (pk, sk) = dilithium2::keypair();
-    Ok((pk.as_bytes().to_vec(), sk.as_bytes().to_vec()))
+fn dilithium_keypair_from_xi(xi: &[u8; 32]) -> EgoResult<(Vec<u8>, Vec<u8>)> {
+    use ml_dsa::{KeyGen, MlDsa44};
+    let kp = MlDsa44::key_gen_internal(&(*xi).into());
+    let pk = kp.verifying_key().encode().to_vec();
+    let sk = kp.signing_key().encode().to_vec();
+    Ok((pk, sk))
+}
+
+fn mldsa_xi(tag: &[u8], seed: &[u8; 32]) -> [u8; 32] {
+    let mut h = Blake2s256::new();
+    h.update(tag);
+    h.update(seed);
+    let digest = h.finalize();
+    let mut xi = [0u8; 32];
+    xi.copy_from_slice(&digest[..32]);
+    xi
+}
+
+fn derive_dilithium_keypair(seed: &[u8; 32]) -> EgoResult<(Vec<u8>, Vec<u8>)> {
+    dilithium_keypair_from_xi(&mldsa_xi(b"ego/ml-dsa-44/wallet/v1", seed))
 }
 
 fn derive_kyber_keypair() -> EgoResult<(Vec<u8>, Vec<u8>)> {
@@ -1461,21 +1478,33 @@ fn derive_slh_dsa_keypair() -> EgoResult<(Vec<u8>, Vec<u8>)> {
 }
 
 pub fn dilithium_sign(secret_key: &[u8], message: &[u8]) -> EgoResult<Vec<u8>> {
-    let sk = dilithium2::SecretKey::from_bytes(secret_key)
-        .map_err(|_| EgoError::CryptoError("Invalid Dilithium2 secret key".to_string()))?;
-    let sig = dilithium2::detached_sign(message, &sk);
-    Ok(sig.as_bytes().to_vec())
+    use ml_dsa::{EncodedSigningKey, MlDsa44, SigningKey};
+    let enc = EncodedSigningKey::<MlDsa44>::try_from(secret_key)
+        .map_err(|_| EgoError::CryptoError("Invalid ML-DSA-44 secret key".to_string()))?;
+    let sk = SigningKey::<MlDsa44>::decode(&enc);
+    let sig = sk
+        .sign_deterministic(message, &[])
+        .map_err(|_| EgoError::CryptoError("ML-DSA-44 signing failed".to_string()))?;
+    Ok(sig.encode().to_vec())
 }
 
 pub fn dilithium_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> EgoResult<bool> {
-    let pk = dilithium2::PublicKey::from_bytes(public_key)
-        .map_err(|_| EgoError::CryptoError("Invalid Dilithium2 public key".to_string()))?;
-    let sig = dilithium2::DetachedSignature::from_bytes(signature)
-        .map_err(|_| EgoError::CryptoError("Invalid Dilithium2 signature".to_string()))?;
-    match dilithium2::verify_detached_signature(&sig, message, &pk) {
-        Ok(()) => Ok(true),
-        Err(_) => Ok(false),
-    }
+    use ml_dsa::signature::Verifier;
+    use ml_dsa::{EncodedSignature, EncodedVerifyingKey, MlDsa44, Signature, VerifyingKey};
+    let pk_enc = match EncodedVerifyingKey::<MlDsa44>::try_from(public_key) {
+        Ok(e) => e,
+        Err(_) => return Ok(false),
+    };
+    let vk = VerifyingKey::<MlDsa44>::decode(&pk_enc);
+    let sig_enc = match EncodedSignature::<MlDsa44>::try_from(signature) {
+        Ok(e) => e,
+        Err(_) => return Ok(false),
+    };
+    let sig = match Signature::<MlDsa44>::decode(&sig_enc) {
+        Some(s) => s,
+        None => return Ok(false),
+    };
+    Ok(vk.verify(message, &sig).is_ok())
 }
 
 fn slh_dsa_sign(secret_key: &[u8], message: &[u8]) -> EgoResult<Vec<u8>> {
@@ -1521,5 +1550,47 @@ mod address_derivation_tests {
         let kp = KeyPair::from_bytes(&[1u8; 32]).unwrap();
         let addr = kp.derive_bech32_address(1, AddressType::EOA, "egot").unwrap();
         assert_eq!(addr, "egot1yrx6vtpy9r52smcmsqjudszeck0890s2nyh6prhn");
+    }
+
+    #[test]
+    fn dilithium_key_is_deterministic_from_seed() {
+        let seed = [7u8; 32];
+        let a = KeyPair::from_bytes(&seed).unwrap();
+        let b = KeyPair::from_bytes(&seed).unwrap();
+        assert_eq!(
+            a.dilithium_public_key().as_bytes(),
+            b.dilithium_public_key().as_bytes(),
+            "same seed must yield the same ML-DSA-44 public key"
+        );
+        let c = KeyPair::from_bytes(&[8u8; 32]).unwrap();
+        assert_ne!(
+            a.dilithium_public_key().as_bytes(),
+            c.dilithium_public_key().as_bytes(),
+        );
+    }
+
+    #[test]
+    fn dilithium_sign_verify_roundtrip() {
+        let kp = KeyPair::from_bytes(&[9u8; 32]).unwrap();
+        let msg = b"ego hybrid post-quantum transaction";
+        let sig = kp.sign_dilithium(msg);
+        let pk = kp.dilithium_public_key();
+        assert!(
+            verify_signature(&pk, msg, &sig).unwrap(),
+            "valid ML-DSA-44 signature must verify"
+        );
+        assert!(
+            !verify_signature(&pk, b"tampered", &sig).unwrap(),
+            "signature over a different message must not verify"
+        );
+    }
+
+    #[test]
+    fn ots_keypair_is_deterministic_from_seed() {
+        let seed = [3u8; 32];
+        let (pk1, sk1) = KeyPair::derive_ots_keypair_from_seed(&seed).unwrap();
+        let (pk2, sk2) = KeyPair::derive_ots_keypair_from_seed(&seed).unwrap();
+        assert_eq!(pk1, pk2, "OTS public key must be deterministic");
+        assert_eq!(sk1, sk2, "OTS secret key must be deterministic");
     }
 }

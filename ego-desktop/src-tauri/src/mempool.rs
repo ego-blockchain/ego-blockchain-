@@ -623,7 +623,14 @@ async fn try_mine(txs: Vec<LedgerTx>, miner: &str) -> Vec<LedgerTx> {
     if known_count >= min_validators_for_finality() {
         return txs;
     }
-    
+
+    let allow_solo_fork = std::env::var("EGO_ALLOW_SOLO_FORK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !allow_solo_fork && crate::chain_db::chain_has_graduated(32) {
+        return txs;
+    }
+
     // If we are significantly behind the network, do not attempt to mine.
     // Catch-up sync must take priority to avoid creating orphaned mini-forks.
     let (tip_h, _) = crate::chain_db::latest_block_info();

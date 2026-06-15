@@ -408,6 +408,108 @@ pub fn persist_validator_bls_pubkey(addr: &str, pubkey_hex: &str) {
     let _ = db.put_cf(cf, validator_bls_key(addr), pubkey_hex.as_bytes());
 }
 
+// ── On-chain BLS validator registry ───────────────────────────────────────────
+// Deterministic map (BLS pubkey hex → validator address) built ONLY from
+// `validator_register` txs whose (address ↔ Ed25519 ↔ BLS) binding has been
+// cryptographically verified. Unlike the gossip-populated `validator_bls:` keys,
+// this is replayed from committed chain state, so every node agrees. The QC
+// verifier requires every signer's BLS key to live here, closing the window
+// where an attacker signs a QC with self-generated (unregistered) keys.
+
+fn bls_reg_key(bls_hex: &str) -> Vec<u8> {
+    format!("bls_reg:{bls_hex}").into_bytes()
+}
+
+const META_BLS_REG_BACKFILLED: &[u8] = b"bls_reg_backfilled";
+
+/// Validate a `validator_register` tx and return (validator_address, bls_hex) iff
+/// the memo is `valreg:<bls_hex>:<bind_sig>`, the `from` address derives from the
+/// tx's Ed25519 pubkey, and `bind_sig` is a valid Ed25519 signature (by that key)
+/// over the BLS pubkey bytes — i.e. on-chain proof the address controls the BLS
+/// key. Mirrors the oracle's `validator_bls_registry`.
+pub fn parse_validator_registration(tx: &LedgerTx) -> Option<(String, String)> {
+    if tx.tx_type != "validator_register" { return None; }
+    let memo = tx.memo.as_deref()?;
+    let parts: Vec<&str> = memo.splitn(3, ':').collect();
+    if parts.len() != 3 || parts[0] != "valreg" { return None; }
+    let bls_hex = parts[1].to_lowercase();
+    let bind_sig_hex = parts[2];
+
+    let ed_pk = hex::decode(&tx.public_key_ed25519).ok()?;
+    if ed_pk.len() != 32 { return None; }
+    let hrp = if tx.chain_id == 1 { "egot" } else { "ego" };
+    let derived = ego_core::EgoAddress::from_public_key_bytes(&ed_pk, tx.chain_id as u32, ego_core::AddressType::EOA)
+        .to_bech32(hrp).ok()?;
+    if derived != tx.from { return None; }
+
+    let bls_bytes = hex::decode(&bls_hex).ok()?;
+    if bls_bytes.len() != 48 { return None; }
+    let sig_bytes = hex::decode(bind_sig_hex).ok()?;
+
+    use ed25519_dalek::{VerifyingKey, Signature, Verifier};
+    let ed_arr: [u8; 32] = ed_pk.try_into().ok()?;
+    let sig_arr: [u8; 64] = sig_bytes.try_into().ok()?;
+    let vk = VerifyingKey::from_bytes(&ed_arr).ok()?;
+    vk.verify(&bls_bytes, &Signature::from_bytes(&sig_arr)).ok()?;
+
+    Some((tx.from.clone(), bls_hex))
+}
+
+/// One-time migration: nodes that synced `validator_register` txs before this
+/// build have no `bls_reg:` entries. Replay every committed tx once (guarded by a
+/// persistent meta flag) to seed the registry. Deterministic — every node derives
+/// the same set from the same chain. Newer commits populate the registry inline
+/// in `write_block_batch`, so this only runs against pre-existing history.
+fn backfill_bls_registry(db: &DB) {
+    let Some(cf_meta) = db.cf_handle(CF_META) else { return };
+    if db.get_cf(cf_meta, META_BLS_REG_BACKFILLED).ok().flatten().is_some() { return; }
+    let Some(cf_txs) = db.cf_handle(CF_TXS) else { return };
+    let mut count = 0u64;
+    let mut iter = db.raw_iterator_cf(cf_txs);
+    iter.seek_to_first();
+    while iter.valid() {
+        if let Some(v) = iter.value() {
+            if let Some(tx) = decode::<LedgerTx>(v) {
+                if let Some((addr, bls_hex)) = parse_validator_registration(&tx) {
+                    let _ = db.put_cf(cf_meta, bls_reg_key(&bls_hex), addr.as_bytes());
+                    count += 1;
+                }
+            }
+        }
+        iter.next();
+    }
+    let _ = db.put_cf(cf_meta, META_BLS_REG_BACKFILLED, b"1");
+    if count > 0 {
+        eprintln!("[Validator] Backfilled on-chain BLS registry: {} registration(s)", count);
+    }
+}
+
+/// True if `bls_hex` is a registered validator BLS key (on-chain, verified).
+pub fn is_registered_bls_key(db: &DB, bls_hex: &str) -> bool {
+    backfill_bls_registry(db);
+    let Some(cf) = db.cf_handle(CF_META) else { return false };
+    db.get_cf(cf, bls_reg_key(&bls_hex.to_lowercase())).ok().flatten().is_some()
+}
+
+/// Convenience wrapper for callers that don't hold the DB lock (e.g. the
+/// QC-gossip finalization path): every BLS key must be an on-chain registered
+/// validator. Returns true during pure pre-registration bootstrap (empty
+/// registry) so the network can still finalize its very first blocks.
+pub fn qc_signers_registered(bls_pubkeys: &[String]) -> bool {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    if !any_registered_bls(&db) { return true; }
+    bls_pubkeys.iter().all(|pk| is_registered_bls_key(&db, pk))
+}
+
+/// True if ANY validator has registered a BLS key on-chain. Used to skip the
+/// registration binding only during pure pre-registration genesis bootstrap.
+pub fn any_registered_bls(db: &DB) -> bool {
+    backfill_bls_registry(db);
+    let Some(cf) = db.cf_handle(CF_META) else { return false };
+    let mut iter = db.prefix_iterator_cf(cf, b"bls_reg:");
+    matches!(iter.next(), Some(Ok((k, _))) if k.starts_with(b"bls_reg:"))
+}
+
 fn load_slashed_set_inner(db: &DB) -> std::collections::HashSet<String> {
     let Some(cf) = db.cf_handle(CF_META) else { return Default::default(); };
     db.get_cf(cf, META_SLASHED)
@@ -736,6 +838,30 @@ pub fn get_dynamic_checkpoint(height: u64) -> Option<String> {
         .and_then(|b| String::from_utf8(b.to_vec()).ok())
 }
 
+/// Highest height the chain will never reorg below — the finality floor.
+/// It is the max of every hardcoded checkpoint and the latest dynamic checkpoint
+/// stored in RocksDB. Long-range attacks rewrite deep history by reorging from
+/// far back; refusing any truncation at or below this height makes a checkpointed
+/// prefix immutable, so neither a synced node nor a freshly-syncing one can be
+/// fed a fork that diverges before the last checkpoint.
+fn finality_floor_height(db: &DB) -> u64 {
+    let mut floor = CHECKPOINTS.iter().map(|(h, _)| *h).max().unwrap_or(0);
+    if let Some(cf) = db.cf_handle(CF_META) {
+        // Checkpoint keys are big-endian, so the iterator yields ascending
+        // heights — the last one with our prefix is the highest.
+        for item in db.prefix_iterator_cf(cf, META_CHECKPOINT_PREFIX) {
+            let (k, _) = match item { Ok(kv) => kv, Err(_) => break };
+            if !k.starts_with(META_CHECKPOINT_PREFIX) { break; }
+            if k.len() >= META_CHECKPOINT_PREFIX.len() + 8 {
+                let mut hb = [0u8; 8];
+                hb.copy_from_slice(&k[META_CHECKPOINT_PREFIX.len()..META_CHECKPOINT_PREFIX.len() + 8]);
+                floor = floor.max(u64::from_be_bytes(hb));
+            }
+        }
+    }
+    floor
+}
+
 /// Returns Err if `block` contradicts a known checkpoint (hardcoded or dynamic).
 pub fn check_checkpoint(block: &LedgerBlock) -> Result<(), String> {
     // 1. Hardcoded checkpoints (genesis + post-launch milestones).
@@ -854,17 +980,20 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         }
 
 
-        let credited_amount = if tx.from == NODE_POOL_ADDR && tx.amount > 0 {
-            let pool_bal: u64 = db.get_cf(cf_balances, NODE_POOL_ADDR.as_bytes())
+        let credited_amount = if !tx.from.is_empty()
+            && crate::ledger::is_reserved_system_source(&tx.from)
+            && tx.amount > 0
+        {
+            let pool_bal: u64 = db.get_cf(cf_balances, tx.from.as_bytes())
                 .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
 
-            let pending_delta = *balance_delta.get(NODE_POOL_ADDR).unwrap_or(&0);
+            let pending_delta = *balance_delta.get(&tx.from).unwrap_or(&0);
             let effective_pool = (pool_bal as i128 + pending_delta).max(0) as u64;
             let capped = tx.amount.min(effective_pool);
             if capped < tx.amount {
                 eprintln!(
-                    "[ChainDB] Max supply cap: coinbase {} capped from {} to {} uEGOC (pool={})",
-                    &tx.hash[..tx.hash.len().min(12)], tx.amount, capped, effective_pool
+                    "[ChainDB] System-emission cap: {} tx {} capped from {} to {} uEGOC (pool {} = {})",
+                    tx.tx_type, &tx.hash[..tx.hash.len().min(12)], tx.amount, capped, tx.from, effective_pool
                 );
             }
             capped
@@ -898,8 +1027,15 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             }
         } else {
             *balance_delta.entry(tx.to.clone()).or_insert(0) += credited_amount as i128;
-        let is_system_source = tx.from == NODE_POOL_ADDR || tx.from.is_empty();
-        if !is_system_source {
+        if tx.from.is_empty() {
+            // Genesis/coinbase mint — no source pool to debit (bounded by genesis rules).
+        } else if crate::ledger::is_reserved_system_source(&tx.from) {
+            // Every system pool (node pool, staking pool, collateral, escrow, …) is
+            // debited by exactly what it emitted — capped above to its own balance,
+            // so a system source can never emit more than it holds: no mint, and no
+            // drain past the pool. Enforces the hard supply cap for ALL pools.
+            *balance_delta.entry(tx.from.clone()).or_insert(0) -= credited_amount as i128;
+        } else {
             let total_out = tx.amount as i128 + tx.fee_uegoc as i128;
             *balance_delta.entry(tx.from.clone()).or_insert(0) -= total_out;
             if is_stake_tx(tx) {
@@ -908,9 +1044,6 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
                     .or_insert_with(|| crate::ledger::get_validator_stake(&tx.from));
                 *stake = stake.saturating_add(tx.amount);
             }
-        } else if tx.from == NODE_POOL_ADDR {
-            // Debit the node pool so it actually decreases — enforces hard supply cap.
-            *balance_delta.entry(NODE_POOL_ADDR.to_string()).or_insert(0) -= credited_amount as i128;
         }
         }
         new_tx_count += 1;
@@ -944,7 +1077,15 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         }
         batch.put_cf(cf_txs,        tx.hash.as_bytes(), encode(tx));
         batch.put_cf(cf_block_txs,  block_txs_key(block.height, &tx.hash), b"");
-        
+
+        // On-chain BLS validator registry: bind (address ↔ BLS key) the moment a
+        // verified validator_register tx commits, atomically with the block, so
+        // the QC verifier can reject signers using unregistered keys.
+        if let Some((addr, bls_hex)) = parse_validator_registration(tx) {
+            batch.put_cf(cf_meta, bls_reg_key(&bls_hex), addr.as_bytes());
+        }
+
+
         let is_spammy = tx.from == NODE_POOL_ADDR 
             && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward");
         if !is_spammy {
@@ -1457,6 +1598,26 @@ pub fn local_chain_height() -> u64 {
         }
     }
     0
+}
+
+/// True if the chain has "graduated" to multi-validator finality — i.e. any of
+/// the last `window` blocks was finalized with a real quorum
+/// (vote_count >= MIN_VALIDATORS_FOR_FINALITY). Used to stop a node that is
+/// momentarily alone from solo-extending a chain that now requires a quorum (the
+/// production-side counterpart to the QC ratchet in validate_peer_block). Scans
+/// a window rather than only the tip so a single stray solo block can't reset it.
+pub fn chain_has_graduated(window: u64) -> bool {
+    let tip = local_chain_height();
+    if tip == 0 { return false; }
+    let lo = tip.saturating_sub(window);
+    for h in (lo + 1..=tip).rev() {
+        if let Some(b) = get_block_by_height(h) {
+            if (b.vote_count as usize) >= crate::mempool::MIN_VALIDATORS_FOR_FINALITY {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn recent_transactions(limit: usize) -> Vec<LedgerTx> {
@@ -2199,10 +2360,12 @@ pub fn verify_block_hash(block: &LedgerBlock, _txs: &[crate::ledger::LedgerTx]) 
     // rejections. The block hash already commits to tx_merkle_root, so verifying the
     // hash is sufficient to detect tampering.
 
-    // v1 hash (no domain tag, no merkle root) — legacy acceptance.
-    let v1_input = format!("{}{}{}{}", block.prev_hash, block.height, block.miner, block.timestamp);
-    let v1_hash  = blake3::hash(v1_input.as_bytes()).to_hex().to_string();
-    if block.hash == v1_hash { return true; }
+    // H3: the legacy v1 hash (prev_hash+height+miner+timestamp, no domain tag, no
+    // merkle root, no poc_ticket, no state_root) is NO LONGER accepted. It bound
+    // none of the block's contents to its hash, so a block could carry an
+    // arbitrary tx set / poc_ticket / state_root behind a valid-looking v1 hash.
+    // Every block must now commit to its tx_merkle_root via the v2 or v3 format.
+    // (Genesis is height 0 and is checked separately before this is reached.)
 
     // v2 hash (tx_merkle_root + poc_ticket, no state_root).
     let v2_hash = block_hash_for(
@@ -2288,6 +2451,39 @@ fn compute_projected_state_root_inner(db: &DB, txs: &[LedgerTx]) -> String {
     let refs: Vec<&str> = leaf_strings.iter().map(|s| s.as_str()).collect();
     let delta_root = compute_merkle_root(&refs);
     blake3_hex(format!("{}{}", prev_state_root, delta_root).as_bytes())
+}
+
+/// Recognized protocol system-emission tx types (from a reserved source).
+/// Used instead of trusting magic-string `signature` values like "system" /
+/// "faucet" / "cluster_escrow_system" (audit H3): a system-source tx must carry
+/// one of these known types, so an attacker can't move value with an arbitrary
+/// type by stamping a fake signature string. NOTE: "reward"/"coinbase" are NOT
+/// here — they go through their own amount-validated checks (is_reward / is_coinbase).
+fn is_system_emission_type(tx_type: &str) -> bool {
+    matches!(
+        tx_type,
+        "cluster_escrow" | "compute_escrow" | "storage_escrow" | "reservation_escrow"
+        | "early_termination_penalty" | "early_termination_refund" | "slash_storage"
+        | "burn_collateral" | "unlock_collateral" | "lock_collateral"
+        | "fee_distribution" | "post_reward"
+    ) || tx_type.contains("escrow")
+}
+
+/// Minimum spacing between operational reward credits to the same address
+/// (matches the honest client's hourly credit). Enforced in consensus so a
+/// modified validator can't self-issue a capped reward every block — bounding
+/// the M2 self-sizing drain to at most one cap per hour per validator.
+const OPERATIONAL_REWARD_MIN_INTERVAL_SECS: i64 = 3600;
+
+fn operational_reward_rate_ok(to: &str, ts: i64) -> bool {
+    let last = get_tx_history_for_addr(to).into_iter()
+        .filter(|t| t.tx_type == "reward" && t.from == NODE_POOL_ADDR && t.signature != "coinbase")
+        .map(|t| t.timestamp)
+        .max();
+    match last {
+        Some(prev) => ts - prev >= OPERATIONAL_REWARD_MIN_INTERVAL_SECS,
+        None => true,
+    }
 }
 
 fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), String> {
@@ -2381,35 +2577,19 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
     for tx in &sorted_txs {
         if crate::ledger::is_protocol_system_tx(tx) {
             let is_coinbase = Some(&tx.hash) == block.coinbase_tx.as_ref();
-            let is_fee = tx.tx_type == "fee_distribution";
             let is_post_reward = tx.tx_type == "post_reward";
             let is_faucet = tx.tx_type == "faucet";
-                let is_cluster = tx.tx_type == "cluster_escrow" || tx.tx_type.contains("escrow");
-                let is_res = tx.tx_type == "reservation_escrow"
-                    || tx.tx_type == "early_termination_penalty"
-                    || tx.tx_type == "early_termination_refund"
-                    || tx.tx_type == "compute_escrow"
-                    || tx.tx_type == "storage_escrow"
-                    || tx.tx_type == "slash_storage";
-                // NOTE: "reward" and "coinbase" signatures are NOT a free pass here.
-                // The block's single coinbase is validated above (is_coinbase); any
-                // other coinbase-signed/reward-typed tx must be rejected.
-                let is_legacy = tx.signature == "system" || tx.signature == "faucet" || tx.signature == "cluster_escrow_system";
-
-                if !is_coinbase && !is_fee && !is_post_reward && !is_faucet && !is_cluster && !is_res && !is_legacy {
-                    return Err(format!("unexpected protocol system tx {} (type: '{}')", tx.hash, tx.tx_type));
+            // H3: accept by tx TYPE, not by a magic `signature` string. The block's
+            // single coinbase is validated above (is_coinbase); any other
+            // coinbase-signed/reward-typed tx is rejected. Faucet + the known
+            // emission types are allowed by type.
+            if !is_coinbase && !is_faucet && !is_system_emission_type(&tx.tx_type) {
+                return Err(format!("unexpected protocol system tx {} (type: '{}')", tx.hash, tx.tx_type));
             }
             if is_post_reward && (tx.to.is_empty() || tx.amount == 0) {
                 return Err(format!("malformed post_reward tx {}", tx.hash));
             }
         } else if crate::ledger::is_reserved_system_source(&tx.from) {
-                let is_cluster = tx.tx_type == "cluster_escrow" || tx.tx_type.contains("escrow");
-                let is_res = tx.tx_type == "reservation_escrow"
-                    || tx.tx_type == "early_termination_penalty"
-                    || tx.tx_type == "early_termination_refund"
-                    || tx.tx_type == "compute_escrow"
-                    || tx.tx_type == "storage_escrow"
-                    || tx.tx_type == "slash_storage";
                 // C1 fix: an operational reward tx is only valid if it credits the
                 // block miner (no paying arbitrary addresses) and is bounded. This
                 // blocks the free-mint vector where any peer gossips a "reward" tx
@@ -2417,10 +2597,11 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
                 let is_reward = tx.tx_type == "reward"
                     && !block.miner.is_empty()
                     && tx.to == block.miner
-                    && tx.amount <= crate::tokenomics::REWARD_CAP_PER_TX_UEGOC;
-                let is_legacy = tx.signature == "system" || tx.signature == "faucet" || tx.signature == "cluster_escrow_system";
-
-                if !is_cluster && !is_res && !is_reward && !is_legacy {
+                    && tx.amount <= crate::tokenomics::REWARD_CAP_PER_TX_UEGOC
+                    && operational_reward_rate_ok(&tx.to, tx.timestamp);
+                // H3: every other system-source tx must carry a recognized emission
+                // type (no magic-string signatures).
+                if !is_reward && !is_system_emission_type(&tx.tx_type) {
                     return Err(format!("forbidden system-source tx {} (type: '{}')", tx.hash, tx.tx_type));
                 }
         } else {
@@ -2434,7 +2615,42 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
     let mut simulated_nonces: std::collections::HashMap<String, u64> = Default::default();
     let mut simulated_stakes: std::collections::HashMap<String, u64> = Default::default();
     for tx in &sorted_txs {
-        if crate::ledger::is_protocol_system_tx(tx) || crate::ledger::is_reserved_system_source(&tx.from) {
+        if crate::ledger::is_protocol_system_tx(tx) {
+            continue;
+        }
+        if !tx.from.is_empty() && crate::ledger::is_reserved_system_source(&tx.from) {
+            // C2-residual: system-emission txs (escrow/collateral/staking-pool
+            // payouts, etc.) were previously skipped entirely — no amount or
+            // source-pool check — letting a block producer drain or mint from a
+            // system pool (e.g. from=STAKING_POOL, type="storage_escrow",
+            // to=self, amount=huge). Bound every emission to the source pool's
+            // simulated balance and reject the block if it would overdraw.
+            let pool = simulated_balances.entry(tx.from.clone()).or_insert_with(|| {
+                db.get_cf(cf_bal, tx.from.as_bytes())
+                    .ok().flatten()
+                    .map(|v| read_u64_le(&v))
+                    .unwrap_or(0)
+            });
+            if *pool < tx.amount {
+                return Err(format!(
+                    "system-emission tx {} (type '{}') overdraws pool {} ({} < {})",
+                    tx.hash, tx.tx_type, tx.from, pool, tx.amount
+                ));
+            }
+            *pool = pool.saturating_sub(tx.amount);
+            if !tx.to.is_empty() {
+                let credit = simulated_balances.entry(tx.to.clone()).or_insert_with(|| {
+                    db.get_cf(cf_bal, tx.to.as_bytes())
+                        .ok().flatten()
+                        .map(|v| read_u64_le(&v))
+                        .unwrap_or(0)
+                });
+                *credit = credit.saturating_add(tx.amount);
+            }
+            continue;
+        }
+        if tx.from.is_empty() {
+            // Genesis/coinbase mint — bounded by the coinbase/genesis checks above.
             continue;
         }
         if is_unstake_tx(tx) {
@@ -2508,6 +2724,14 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
 }
 
 pub fn validate_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), String> {
+    validate_peer_block_impl(block, txs, false)
+}
+
+pub fn validate_proposal_block(block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), String> {
+    validate_peer_block_impl(block, txs, true)
+}
+
+fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: bool) -> Result<(), String> {
     if block.height == 0 {
         return if block.hash == GENESIS_HASH { Ok(()) } else { Err("invalid genesis hash".into()) };
     }
@@ -2515,13 +2739,14 @@ pub fn validate_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), 
         return Err("block hash/merkle verification failed".into());
     }
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let mut parent_vote_count: u32 = 0;
     if block.height > 1 {
         let parent = db
             .cf_handle(CF_BLOCKS)
             .and_then(|cf| db.get_cf(cf, height_key(block.height - 1)).ok().flatten())
             .and_then(|v| decode::<LedgerBlock>(&v));
         match parent {
-            Some(parent) if parent.hash == block.prev_hash => {}
+            Some(parent) if parent.hash == block.prev_hash => { parent_vote_count = parent.vote_count; }
             Some(_) => return Err("prev_hash mismatch against local parent".into()),
             None => return Err("missing local parent".into()),
         }
@@ -2529,7 +2754,31 @@ pub fn validate_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), 
         return Err("height-1 block does not point at genesis".into());
     }
 
-    if block.height > 1 && block.vote_count > 0 && !block.agg_bls_sig.is_empty() && !block.bls_pubkeys.is_empty() {
+    // H2: quorum-certificate ratchet. Once the chain has finalized a block with a
+    // real quorum (parent carried >= MIN_VALIDATORS_FOR_FINALITY votes), EVERY
+    // child must carry a valid QC — a peer can no longer bypass quorum
+    // verification by submitting a block that simply claims zero votes. The gate
+    // is the COMMITTED parent's vote_count, which is identical on every node, so
+    // the accept/reject decision is deterministic (no consensus split) and cannot
+    // be downgraded by the attacker. Pure bootstrap (parent never reached a
+    // quorum) stays permissive so a fresh network can mine its first blocks.
+    let qc_required = !is_proposal
+        && block.height > 1
+        && (parent_vote_count as usize) >= crate::mempool::MIN_VALIDATORS_FOR_FINALITY;
+    let carries_qc = block.vote_count > 0
+        && !block.agg_bls_sig.is_empty()
+        && !block.bls_pubkeys.is_empty();
+
+    if qc_required {
+        if !carries_qc || (block.vote_count as usize) < crate::mempool::MIN_VALIDATORS_FOR_FINALITY {
+            return Err(format!(
+                "block #{} requires a quorum certificate (parent finalized by {} validators) but carries {} votes",
+                block.height, parent_vote_count, block.vote_count
+            ));
+        }
+    }
+
+    if block.height > 1 && (carries_qc || qc_required) {
         let block_hash_bytes = hex::decode(&block.hash).unwrap_or_default();
         let sig_bytes = hex::decode(&block.agg_bls_sig).unwrap_or_default();
         let pubkeys: Vec<Vec<u8>> = block.bls_pubkeys.iter().filter_map(|pk| hex::decode(pk).ok()).collect();
@@ -2555,6 +2804,27 @@ pub fn validate_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) -> Result<(), 
         // If we don't have all BLS keys cached locally, we assume the unknown keys *could* belong to the signers.
         if active_validators.len() >= 10 && total_weight > 0.0 && (max_possible_weight * 3.0) < (total_weight * 2.0) {
             return Err("Quorum Certificate rejected: cumulative DRS weight is < 2/3 of network".into());
+        }
+
+        // H2 residual close: bind the QC signer set to ON-CHAIN registered
+        // validators — regardless of network size. Without this, the aggregate
+        // signature only proves the listed keys signed, not that they belong to
+        // authorized validators, so an attacker could sign a QC with their own
+        // freshly-generated BLS keys and have it verify. We now require every
+        // signer's BLS key to be present in the deterministic on-chain registry
+        // (built from verified validator_register txs). Skipped only during pure
+        // pre-registration genesis (registry entirely empty), where the finality
+        // floor + bootstrap rules apply; the instant the first validator
+        // registers, every QC signer must be registered.
+        if any_registered_bls(&db) {
+            for pk in &block.bls_pubkeys {
+                if !is_registered_bls_key(&db, pk) {
+                    return Err(format!(
+                        "Quorum Certificate rejected: signer BLS key {:.16}… is not an on-chain registered validator",
+                        pk
+                    ));
+                }
+            }
         }
 
         if sig_bytes.is_empty() || pubkeys.is_empty() || !crate::bls_agg::verify_aggregate(&sig_bytes, &pubkeys, &block_hash_bytes) {
@@ -2716,6 +2986,19 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
     let tip = db.get_cf(cf_meta, META_LATEST_HEIGHT)
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
     if height > tip { return vec![]; }
+
+    // Long-range attack protection: never rewind history at or below the finality
+    // floor (the last checkpoint). A reorg must begin strictly above it. Normal
+    // BFT fork-choice only ever truncates a handful of blocks at the tip, far
+    // above any checkpoint, so this never interferes with honest operation.
+    let floor = finality_floor_height(&db);
+    if height <= floor {
+        eprintln!(
+            "[Checkpoint] REJECTED reorg to height {} — at/below finality floor {} (long-range attack protection)",
+            height, floor
+        );
+        return vec![];
+    }
     let cf_block_txs  = db.cf_handle(CF_BLOCK_TXS).unwrap();
     let cf_txs        = db.cf_handle(CF_TXS).unwrap();
     let cf_addr_txs   = db.cf_handle(CF_ADDR_TXS).unwrap();
