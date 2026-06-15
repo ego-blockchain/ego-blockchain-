@@ -530,6 +530,36 @@ fn votes_cast() -> std::sync::MutexGuard<'static, HashMap<(String, u64), (String
         .unwrap()
 }
 
+// Persistent anti-equivocation lock for THIS node's OWN votes: height → the block
+// hash this node committed its vote to. Unlike VOTES_CAST (which is wiped per view
+// change for liveness), this lock survives view changes and is only released once the
+// height is decided (finalized) or pruned as ancient. It guarantees the node casts at
+// most ONE effective vote per height, so two conflicting blocks can never each gather
+// a quorum — closing the safety hole where the per-view vote-lock wipe let a node vote
+// for competing blocks across views and fork the chain at a single height.
+static SELF_VOTE_LOCK: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, String>>> =
+    std::sync::OnceLock::new();
+
+fn self_vote_lock() -> std::sync::MutexGuard<'static, HashMap<u64, String>> {
+    SELF_VOTE_LOCK
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+}
+
+// Atomically reserve this node's single vote for `height` on `hash`. Returns true if
+// the node may vote/broadcast for this block (lock was free or already held by the
+// same hash); false if it already locked a DIFFERENT block at this height — in which
+// case the caller MUST NOT sign, count, or broadcast a vote, since the peer would
+// otherwise combine it into a competing quorum and fork the chain.
+fn try_lock_self_vote(height: u64, hash: &str) -> bool {
+    let mut lock = self_vote_lock();
+    match lock.entry(height) {
+        std::collections::hash_map::Entry::Occupied(e) => e.get() == hash,
+        std::collections::hash_map::Entry::Vacant(e) => { e.insert(hash.to_string()); true }
+    }
+}
+
 const WRONG_VOTE_THRESHOLD: u32 = 2;
 
 // ── Validator pubkey registry ──────────────────────────────────────────────────
@@ -1695,6 +1725,12 @@ pub enum P2PMessage {
         signature:    String,
         #[serde(default)]
         vrf_ticket:   String,
+        /// The consensus view this proposal was created in. Lets committee members
+        /// adopt the leader's view (pacemaker sync) and reject proposals from anyone
+        /// who is not the deterministic leader of that view — so two desynced nodes
+        /// can't both have their competing proposals voted into a quorum.
+        #[serde(default)]
+        view:         u64,
     },
     BlockVote {
         block_hash: String,
@@ -5067,7 +5103,7 @@ async fn handle_event(
                     _ => {}
                 }
             } else if topic == "ego-proposals-v1" {
-                if let Ok(P2PMessage::BlockProposal { block, transactions, proposer, signature, vrf_ticket }) =
+                if let Ok(P2PMessage::BlockProposal { block, transactions, proposer, signature, vrf_ticket, view }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
                     // Only count validators building on our chain.
@@ -5081,7 +5117,7 @@ async fn handle_event(
                     if prev_known { register_known_validator(&proposer); }
                     let app2 = app.cloned();
                     tokio::spawn(async move {
-                        handle_block_proposal(block, transactions, proposer, signature, vrf_ticket, app2.as_ref()).await;
+                        handle_block_proposal(block, transactions, proposer, signature, vrf_ticket, view, app2.as_ref()).await;
                     });
                 }
             } else if topic == "ego-votes-v1" {
@@ -6332,9 +6368,9 @@ P2PMessage::ChatMessage { bundle, seq } => {
             apply_incoming_tx(tx, block, app).await;
         }
 
-        P2PMessage::BlockProposal { block, transactions, proposer, signature, vrf_ticket } => {
+        P2PMessage::BlockProposal { block, transactions, proposer, signature, vrf_ticket, view } => {
             register_known_validator(&proposer);
-            handle_block_proposal(block, transactions, proposer, signature, vrf_ticket, app).await;
+            handle_block_proposal(block, transactions, proposer, signature, vrf_ticket, view, app).await;
         }
 
         P2PMessage::BlockVote { block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, voter_pubkey } => {
@@ -8242,6 +8278,7 @@ async fn handle_block_proposal(
     proposer: String,
     signature: String,
     vrf_ticket: String,
+    proposal_view: u64,
     app: Option<&tauri::AppHandle<tauri::Wry>>,
 ) {
     let (my_addr, seed_arr_opt) = match tokio::task::spawn_blocking(|| {
@@ -8283,6 +8320,8 @@ async fn handle_block_proposal(
         }
         return;
     }
+
+    let _ = proposal_view; // reserved for future pacemaker use; not gating votes
 
     let vrf_in  = crate::bft_committee::vrf_input(&block.prev_hash, block.height, crate::bft_committee::VRF_ROLE_COMMITTEE);
     let ticket  = crate::bft_committee::sign_vrf_ticket(&seed_arr, &vrf_in);
@@ -8443,6 +8482,15 @@ async fn handle_block_proposal(
             if voters.contains(&my_addr) { return; }
         }
     }
+    // Persistent anti-equivocation reservation: refuse to vote (and broadcast) a
+    // competing block at a height we already locked. VOTES_CAST above is wiped on
+    // view change for liveness, so it alone can't stop a node from voting for two
+    // blocks at one height across views — this lock survives view changes and is the
+    // authoritative gate that prevents both halves of a split from reaching quorum.
+    if !try_lock_self_vote(block.height, &block.hash) {
+        eprintln!("[BFT] Not voting proposal #{} — already locked on a different block (anti-equivocation)", block.height);
+        return;
+    }
 
 
     pending_proposals().insert(block.height, proposer.clone());
@@ -8565,6 +8613,21 @@ async fn handle_block_vote(
         && (signature.is_empty() || !verify_bft_sig(&voter, &vote_data, &signature))
     {
         eprintln!("[BFT] Invalid vote signature from {} at height {} — dropping", voter, height);
+        return;
+    }
+
+    // ── Anti-equivocation lock (safety) ────────────────────────────────────
+    // This node may back exactly ONE block per height. The lock is atomic
+    // (single guard) and persists across view changes, so two conflicting
+    // blocks can never each collect this node's vote — which is what made both
+    // halves of a split reach a 2-of-2 quorum and hard-finalize, forking the
+    // chain at one height. Only enforced for our OWN vote; peer equivocation is
+    // handled separately (slashing + EquivocationProof).
+    if is_self_vote && !try_lock_self_vote(height, &block_hash) {
+        eprintln!(
+            "[BFT] Refusing to count own vote for block {} at height {} — locked on a different block (anti-equivocation)",
+            &block_hash[..8.min(block_hash.len())], height
+        );
         return;
     }
 
@@ -8699,6 +8762,10 @@ async fn handle_block_vote(
     {
         let cutoff = height.saturating_sub(100);
         votes_cast().retain(|(_, h), _| *h >= cutoff);
+        // The persistent self-vote lock is released only here (a height was
+        // decided) and for ancient heights — never on a bare view change, so a
+        // node can't be tricked into voting a second block at an undecided height.
+        self_vote_lock().retain(|h, _| *h >= cutoff);
     }
 
     {
@@ -9251,6 +9318,7 @@ pub async fn propose_block_as_leader() {
             proposer:     miner.clone(),
             signature,
             vrf_ticket:   hex::encode(&vrf_ticket2),
+            view:         current_view(),
         };
         if let Ok(data) = serde_json::to_vec(&proposal) {
             publish_gossip("ego-proposals-v1", data).await;
@@ -9279,8 +9347,12 @@ pub async fn propose_block_as_leader() {
             bls_pubkey: self_bls_pk.clone(),
             voter_pubkey: my_ed25519_pubkey_hex(),
         };
-        if let Ok(data) = serde_json::to_vec(&self_vote) {
-            publish_gossip("ego-votes-v1", data).await;
+        if try_lock_self_vote(block.height, &block.hash) {
+            if let Ok(data) = serde_json::to_vec(&self_vote) {
+                publish_gossip("ego-votes-v1", data).await;
+            }
+        } else {
+            eprintln!("[BFT] Suppressing self-vote for #{} — locked on a different block (anti-equivocation)", block.height);
         }
         
         let bh = block.hash.clone();
@@ -9382,6 +9454,7 @@ pub async fn propose_block_as_leader() {
         proposer:     miner.clone(),
         signature,
         vrf_ticket:   hex::encode(&vrf_ticket),
+        view:         current_view(),
     };
 
     if let Ok(data) = serde_json::to_vec(&proposal) {
@@ -9411,8 +9484,12 @@ pub async fn propose_block_as_leader() {
             bls_pubkey: self_bls_pk.clone(),
             voter_pubkey: my_ed25519_pubkey_hex(),
         };
-        if let Ok(data) = serde_json::to_vec(&self_vote) {
-            publish_gossip("ego-votes-v1", data).await;
+        if try_lock_self_vote(block.height, &block.hash) {
+            if let Ok(data) = serde_json::to_vec(&self_vote) {
+                publish_gossip("ego-votes-v1", data).await;
+            }
+        } else {
+            eprintln!("[BFT] Suppressing self-vote for #{} — locked on a different block (anti-equivocation)", block.height);
         }
         
         if !is_solo {
@@ -9577,6 +9654,7 @@ pub async fn propose_block_as_leader_forced() {
             proposer:     miner.clone(),
             signature,
             vrf_ticket:   hex::encode(&vrf_ticket2),
+            view:         current_view(),
         };
         if let Ok(data) = serde_json::to_vec(&proposal) {
             publish_gossip("ego-proposals-v1", data).await;
@@ -9605,8 +9683,12 @@ pub async fn propose_block_as_leader_forced() {
             bls_pubkey: self_bls_pk.clone(),
             voter_pubkey: my_ed25519_pubkey_hex(),
         };
-        if let Ok(data) = serde_json::to_vec(&self_vote) {
-            publish_gossip("ego-votes-v1", data).await;
+        if try_lock_self_vote(block.height, &block.hash) {
+            if let Ok(data) = serde_json::to_vec(&self_vote) {
+                publish_gossip("ego-votes-v1", data).await;
+            }
+        } else {
+            eprintln!("[BFT] Suppressing self-vote for #{} — locked on a different block (anti-equivocation)", block.height);
         }
         
         let bh = block.hash.clone();
@@ -9710,6 +9792,7 @@ pub async fn propose_block_as_leader_forced() {
         proposer:     miner.clone(),
         signature,
         vrf_ticket:   hex::encode(&vrf_ticket2),
+        view:         current_view(),
     };
 
     if let Ok(data) = serde_json::to_vec(&proposal) {
@@ -9739,8 +9822,12 @@ pub async fn propose_block_as_leader_forced() {
             bls_pubkey: fb_bls_pk.clone(),
             voter_pubkey: my_ed25519_pubkey_hex(),
         };
-        if let Ok(data) = serde_json::to_vec(&self_vote) {
-            publish_gossip("ego-votes-v1", data).await;
+        if try_lock_self_vote(block.height, &block.hash) {
+            if let Ok(data) = serde_json::to_vec(&self_vote) {
+                publish_gossip("ego-votes-v1", data).await;
+            }
+        } else {
+            eprintln!("[BFT] Suppressing self-vote for #{} — locked on a different block (anti-equivocation)", block.height);
         }
         
         if !is_solo {
