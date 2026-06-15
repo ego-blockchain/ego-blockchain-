@@ -152,6 +152,18 @@ fn headless_main() {
             crate::p2p::run_shard_rebalance_monitor().await;
         });
 
+        tokio::spawn(async {
+            crate::p2p::run_view_change_monitor().await;
+        });
+
+        tokio::spawn(async {
+            crate::p2p::run_solo_liveness_watchdog().await;
+        });
+
+        tokio::spawn(async {
+            crate::p2p::run_porep_challenge_loop().await;
+        });
+
         let rpc_port: u16 = std::env::var("EGO_RPC_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(47395);
         tracing::info!("All services started. RPC on port {}. P2P on port {}", rpc_port, crate::p2p::p2p_port());
         tracing::info!("Chain data: {:?}", crate::ledger::base_data_dir());
@@ -856,6 +868,10 @@ fn main() {
 
             tauri::async_runtime::spawn(async move {
                 crate::p2p::run_view_change_monitor().await;
+            });
+
+            tauri::async_runtime::spawn(async move {
+                crate::p2p::run_solo_liveness_watchdog().await;
             });
 
             tauri::async_runtime::spawn(async move {

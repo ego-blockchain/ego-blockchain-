@@ -194,6 +194,14 @@ pub struct QuorumCertificate {
 }
 
 impl QuorumCertificate {
+    /// ⚠️ Constructs a QC WITHOUT verifying anything — `voters_bitmap` is set
+    /// all-true and only a Merkle root of the signatures is retained. A QC built
+    /// here (or decoded from the wire) is NOT trustworthy until [`Self::verify`]
+    /// has returned `true` against the originating votes and the validator set.
+    /// This engine is currently unused by every shipped binary; production
+    /// consensus uses the self-verifying `ego_core::BlsQuorumCertificate`. Do not
+    /// wire this into a live node without calling `verify` on every external QC
+    /// (e.g. in `ForkChoiceStore::add_qc`).
     pub fn new(block_hash: Hash, height: u64, epoch: u64, round: u32, votes: &[Vote]) -> Self {
         let sig_hashes: Vec<Hash> = votes.iter().map(|v| hash_data(v.signature.as_bytes())).collect();
         Self {
@@ -204,6 +212,36 @@ impl QuorumCertificate {
         }
     }
     pub fn voter_count(&self) -> usize { self.voters_bitmap.iter().filter(|&&v| v).count() }
+
+    /// Cryptographically verify this QC against the votes it certifies and the
+    /// active validator set. The certificate stores only a Merkle root of the
+    /// vote signatures, so the original `votes` MUST be supplied. Checks:
+    ///   1. the votes rebind to this QC (recomputed `sigs_root` matches),
+    ///   2. every vote targets this QC's (block_hash, height, epoch, round),
+    ///   3. each voter is a distinct member of `validator_set` whose public key
+    ///      actually derives its claimed address (no address spoofing),
+    ///   4. every vote's Ed25519 signature is valid,
+    ///   5. the distinct voter count meets the ⅔+1 quorum.
+    /// Returns `false` (never trusts) on any failure.
+    pub fn verify(&self, votes: &[Vote], validator_set: &[Address]) -> PoCResult<bool> {
+        if validator_set.is_empty() { return Ok(false); }
+        let sig_hashes: Vec<Hash> = votes.iter().map(|v| hash_data(v.signature.as_bytes())).collect();
+        if merkle_root(&sig_hashes) != self.sigs_root { return Ok(false); }
+
+        let quorum = (2 * validator_set.len()) / 3 + 1;
+        let mut seen: std::collections::HashSet<Address> = std::collections::HashSet::new();
+        for v in votes {
+            if v.block_hash != self.block_hash || v.height != self.height
+                || v.epoch != self.epoch || v.round != self.round {
+                return Ok(false);
+            }
+            if Address::from_public_key(&v.voter_public_key) != v.voter { return Ok(false); }
+            if !validator_set.contains(&v.voter) { return Ok(false); }
+            if !seen.insert(v.voter.clone()) { return Ok(false); }
+            if !v.verify()? { return Ok(false); }
+        }
+        Ok(seen.len() >= quorum)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -689,18 +689,23 @@ static CURRENT_VIEW: std::sync::atomic::AtomicU64 =
 static LAST_PROPOSAL_TS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 
-/// Counts consecutive view changes that produced no new block.
-/// Resets to 0 when a block is finalized.
-/// Triggers a deterministic (highest-DRS) fallback when it reaches
-/// FALLBACK_AFTER_EMPTY_VIEWS.
+
 static CONSECUTIVE_EMPTY_VIEWS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
+
+
+const SOLO_DEADLOCK_VIEWS: u32 = 3;
 
 static STUCK_AT_NEXT_VIEW: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 static STUCK_VIEWCHANGE_CYCLES: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
+
+static LIVENESS_STALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+const SOLO_STALL_SECS: i64 = 15;
+const SOLO_ALONE_STALL_SECS: i64 = 4;
 
 static SOLO_AFTER_EVICTION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -746,20 +751,37 @@ fn bootstrap_solo_grace_secs() -> i64 {
         .unwrap_or(25)
 }
 
+
 fn should_solo_commit_now() -> bool {
     let stale_flag = SOLO_AFTER_EVICTION.swap(false, Ordering::Relaxed);
     let committee_alone = known_validators().len() <= 1;
     if stale_flag && !committee_alone {
         tracing::debug!("[BFT] discarding stale SOLO_AFTER_EVICTION — committee grew back to {}", known_validators().len());
     }
-    if !committee_alone {
-        // Have peers → run BFT, never solo.
+
+    let deadlocked = STUCK_VIEWCHANGE_CYCLES.load(Ordering::Relaxed) >= SOLO_DEADLOCK_VIEWS
+        || LIVENESS_STALLED.load(Ordering::Relaxed);
+
+    if !committee_alone && !deadlocked {
         return false;
     }
-    // Bootstrap anti-fork grace: hold off solo-committing for the first
-    // few seconds so peers that started at the same time get discovered first
-    // (and we run BFT) instead of each node sealing its own block #1 and forking.
-    // A genuinely-alone node proceeds normally once the window elapses.
+
+    let allow_solo_fork = std::env::var("EGO_ALLOW_SOLO_FORK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !allow_solo_fork && crate::chain_db::chain_has_graduated(32) {
+        static LAST_HALT_LOG: AtomicI64 = AtomicI64::new(0);
+        let now = chrono::Utc::now().timestamp();
+        if now - LAST_HALT_LOG.swap(now, Ordering::Relaxed) > 30 {
+            tracing::warn!("[BFT] Chain is quorum-finalized — refusing to solo-produce a sub-quorum block (peers reject it via the QC ratchet). Halting until a 2+ validator quorum re-forms; set EGO_ALLOW_SOLO_FORK=1 to override (dev only).");
+        }
+        return false;
+    }
+
+    if deadlocked {
+        return true;
+    }
+
     let grace = bootstrap_solo_grace_secs();
     if grace > 0 {
         let now = chrono::Utc::now().timestamp();
@@ -782,10 +804,7 @@ pub static LAST_BLOCK_FINALIZED_TS: std::sync::atomic::AtomicI64 =
 static LAST_FORK_SYNC_TS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 
-/// Maps block_height → proposer_address for in-flight proposals.
-/// Populated when a BlockProposal is accepted by the committee (after structural
-/// validation), cleared when the block is finalized.  If a view change fires
-/// while an entry exists, that proposer explicitly failed to deliver → penalise.
+
 static PENDING_PROPOSALS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, String>>> =
     std::sync::OnceLock::new();
 
@@ -943,12 +962,7 @@ fn record_peer_invalid_block(peer_id: &str) {
     }
 }
 
-/// Elect the block proposer for the next chain height using VRF self-selection.
-///
-/// Each node with a seed checks if its VRF ticket qualifies (ticket_float < threshold).
-/// If this node qualifies, it returns its own address; otherwise None.
-/// The deterministic fallback (max DRS weight) is intentionally removed —
-/// every round must go through VRF so no single node can predict future proposers.
+
 pub fn elect_proposer_for_next_slot() -> Option<String> {
     let my_addr = crate::ledger::Ledger::load().address;
     if my_addr.is_empty() { return None; }
@@ -1191,6 +1205,44 @@ fn validate_unique_identity(addr: &str, machine_id: &str, endpoint: &str) -> Res
     Ok(())
 }
 
+
+pub fn min_validator_stake_uegoc() -> u64 {
+    std::env::var("EGO_MIN_VALIDATOR_STAKE")
+        .ok().and_then(|v| v.parse().ok())
+        .unwrap_or(100 * 1_000_000)
+}
+
+/// Has any known validator met the stake floor? Once true, the network has
+/// "graduated" from unstaked bootstrap to stake-gated validation.
+fn network_has_staked_validator() -> bool {
+    let min = min_validator_stake_uegoc();
+    known_validators().iter().any(|a| crate::ledger::get_validator_stake(a) >= min)
+}
+
+
+
+pub fn is_eligible_validator(addr: &str) -> bool {
+    // If the network is small (dev mode), allow unstaked nodes to participate
+    if known_validator_count() < 3 || !network_has_staked_validator() { return true; }
+    // ENFORCE STAKE GATE AFTER BOOTSTRAP WINDOW
+    let (height, _) = crate::chain_db::latest_block_info();
+    if height < 5000 && !network_has_staked_validator() { 
+        return true; 
+    }
+    crate::ledger::get_validator_stake(addr) >= min_validator_stake_uegoc()
+}
+
+/// Sorted list of stake-eligible validators — the set leader election rotates
+/// over, so an unstaked Sybil can't be elected proposer.
+fn eligible_validators_sorted() -> Vec<String> {
+    let snapshot: Vec<String> = known_validators().iter().cloned().collect();
+    let mut vs: Vec<String> = snapshot.into_iter()
+        .filter(|a| is_eligible_validator(a))
+        .collect();
+    vs.sort();
+    vs
+}
+
 pub fn register_known_validator(address: &str) {
     if address.is_empty() { return; }
     if slashed_validators().contains(address) { return; }
@@ -1249,10 +1301,11 @@ pub fn set_local_validator(address: &str) {
 const VALIDATOR_WARMUP_SECS: i64 = 10;
 
 fn warmed_validator_count() -> usize {
-    let now   = chrono::Utc::now().timestamp();
+    let now = chrono::Utc::now().timestamp();
+    let all: Vec<String> = known_validators().iter().cloned().collect();
     let first = validator_first_seen();
-    let all   = known_validators();
     all.iter()
+        .filter(|addr| is_eligible_validator(addr)) // stake-gated (Sybil resistance)
         .filter(|addr| {
             first.get(*addr).map(|&t| now - t >= VALIDATOR_WARMUP_SECS).unwrap_or(false)
         })
@@ -1262,7 +1315,10 @@ fn warmed_validator_count() -> usize {
 
 fn bft_threshold() -> usize {
     evict_stale_validators(120);
-    let n_total = known_validators().len();
+    // Count only stake-eligible validators (Sybil resistance) — unstaked nodes
+    // don't inflate the committee. warmed_validator_count() is likewise filtered.
+    let snapshot: Vec<String> = known_validators().iter().cloned().collect();
+    let n_total = snapshot.iter().filter(|a| is_eligible_validator(a)).count();
     let n = warmed_validator_count();
     let min_validators = crate::mempool::min_validators_for_finality();
     let effective = if n_total < min_validators {
@@ -4278,7 +4334,8 @@ async fn build_swarm(
 ) -> Result<libp2p::Swarm<EgoBehaviour>, Box<dyn std::error::Error>> {
     let peer_id = identity.public().to_peer_id();
     #[cfg(target_os = "windows")]
-    let tcp_cfg = tcp::Config::default().nodelay(true).port_reuse(true);
+    // Disable port_reuse on Windows to prevent loopback OS error 10048
+    let tcp_cfg = tcp::Config::default().nodelay(true).port_reuse(false);
     #[cfg(not(target_os = "windows"))]
     let tcp_cfg = tcp::Config::default().nodelay(true);
     let swarm = SwarmBuilder::with_existing_identity(identity)
@@ -4977,10 +5034,16 @@ async fn handle_event(
                         let app2 = app.cloned();
                         tokio::spawn(async move { merge_remote_chain(blocks, transactions, app2.as_ref()).await; });
                     }
-                    Ok(P2PMessage::BlockFinalized { block, transactions, votes, agg_bls_sig, bls_pubkeys }) => {
+                    Ok(P2PMessage::BlockFinalized { mut block, transactions, votes, agg_bls_sig, bls_pubkeys }) => {
                         let block_hash = block.hash.clone();
                         let height     = block.height;
                         let app2 = app.cloned();
+                        // If the producer's block arrived without a QC, build one from the
+                        // vote signatures this node collected and attach it before the first
+                        // persist — write_block_batch is idempotent on hash, so a block can
+                        // only acquire its certificate on first write. Must run before
+                        // process_inbound_qc_finalization, which clears pending_bls_sigs.
+                        attach_local_qc_if_missing(&mut block);
                         tokio::spawn(async move {
                             if process_inbound_qc_finalization(&block_hash, height, &votes, &agg_bls_sig, &bls_pubkeys) {
                                 merge_remote_chain_trusted(vec![block], transactions, app2.as_ref()).await;
@@ -5966,11 +6029,37 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
         P2PMessage::ReplicaHeartbeat { cid, master_addr, timestamp } => {
             let _guard = crate::ledger::TX_MUTEX.lock().await;
             let mut ledger = crate::ledger::Ledger::load();
+            let my_addr = ledger.address.clone();
             let mut changed = false;
             for f in ledger.stored_files.iter_mut() {
+                if f.cid != cid { continue; }
                 if f.cid == cid && f.replication_role == "slave" && f.replica_master == master_addr {
                     f.master_last_seen = timestamp;
                     changed = true;
+                } else if f.replication_role == "master" && master_addr != my_addr {
+                    // Split-brain: two nodes claim master for the same CID. This
+                    // happens when a slave promotes itself while the master is
+                    // briefly offline (its one-shot ReplicaPromote broadcast never
+                    // reaches the offline master), and the old master returns still
+                    // believing it's master — both would run proofs and claim the
+                    // storage reward for the same CID (the "double-reward" bug).
+                    // Resolve deterministically: the lower address stays master,
+                    // the other steps down. Both nodes run the same comparison on
+                    // each other's heartbeats and converge to a single master with
+                    // no oscillation.
+                    if master_addr.as_str() < my_addr.as_str() {
+                        f.replication_role = "slave".to_string();
+                        f.replica_master   = master_addr.clone();
+                        f.master_last_seen = timestamp;
+                        if !f.replica_peers.contains(&master_addr) {
+                            f.replica_peers.push(master_addr.clone());
+                        }
+                        changed = true;
+                        eprintln!("[Replication] Split-brain resolved for {} — stepping down to slave ({} has lower address)",
+                            &cid[..16.min(cid.len())], master_addr);
+                    }
+                    // else: we hold the lower address → we remain master; the
+                    // competing node steps down when it sees OUR heartbeat.
                 }
             }
             if changed { let _ = ledger.save(); }
@@ -6255,9 +6344,13 @@ P2PMessage::ChatMessage { bundle, seq } => {
         }
 
 
-        P2PMessage::BlockFinalized { block, transactions, votes, agg_bls_sig, bls_pubkeys } => {
+        P2PMessage::BlockFinalized { mut block, transactions, votes, agg_bls_sig, bls_pubkeys } => {
             let block_hash = block.hash.clone();
             let height     = block.height;
+            // Attach a locally-assembled QC before first persist if the producer's
+            // block lacks one (see attach_local_qc_if_missing); must precede
+            // process_inbound_qc_finalization, which clears the collected sigs.
+            attach_local_qc_if_missing(&mut block);
             if process_inbound_qc_finalization(&block_hash, height, &votes, &agg_bls_sig, &bls_pubkeys) {
                 merge_remote_chain_trusted(vec![block], transactions, app).await;
             }
@@ -7255,42 +7348,40 @@ fn validate_block(block: &crate::ledger::LedgerBlock, _chain: &crate::ledger::Sh
     }
 
     let base_reward = crate::tokenomics::block_reward_at(block.height);
-    if block.reward != 0 && block.reward < base_reward {
-        eprintln!("[Validate] Block #{} rejected: reward {} below base {}",
-            block.height, block.reward, base_reward);
+    if block.reward != 0 && block.reward < base_reward / 2 {
+        eprintln!("[Validate] Block #{} rejected: reward {} below floor {}",
+            block.height, block.reward, base_reward / 2);
         return false;
     }
 
-    if !block.tx_merkle_root.is_empty() {
-        let expected_v2_hash = crate::chain_db::block_hash_for(
+    // H3: hash verification is UNCONDITIONAL — a block can no longer skip it by
+    // presenting an empty tx_merkle_root, and the legacy v1 hash (which committed
+    // none of the block's contents) is no longer accepted. Every non-genesis
+    // block must match the v2 or v3 hash, both of which commit tx_merkle_root and
+    // poc_ticket (v3 also state_root).
+    let expected_v2_hash = crate::chain_db::block_hash_for(
+        &block.prev_hash, block.height, &block.miner,
+        block.timestamp, &block.tx_merkle_root, &block.poc_ticket,
+    );
+
+    // v3: state_root committed into hash.
+    let expected_v3_hash = if !block.state_root.is_empty() {
+        crate::chain_db::block_hash_v3(
             &block.prev_hash, block.height, &block.miner,
-            block.timestamp, &block.tx_merkle_root, &block.poc_ticket,
+            block.timestamp, &block.tx_merkle_root, &block.poc_ticket, &block.state_root,
+        )
+    } else {
+        String::new()
+    };
+    let valid = block.hash == expected_v2_hash
+        || (!expected_v3_hash.is_empty() && block.hash == expected_v3_hash);
+    if !valid {
+        eprintln!(
+            "[Validate] Block #{} rejected: hash mismatch (stored={:.8}… v2={:.8}… v3={:.8}…)",
+            block.height, block.hash, expected_v2_hash,
+            if expected_v3_hash.is_empty() { "n/a".to_string() } else { expected_v3_hash[..8.min(expected_v3_hash.len())].to_string() }
         );
-        // v3: state_root committed into hash.
-        let expected_v3_hash = if !block.state_root.is_empty() {
-            crate::chain_db::block_hash_v3(
-                &block.prev_hash, block.height, &block.miner,
-                block.timestamp, &block.tx_merkle_root, &block.poc_ticket, &block.state_root,
-            )
-        } else {
-            String::new()
-        };
-        // Legacy v1 hash (pre-merkle blocks).
-        let v1_hash = {
-            let v1_input = format!("{}{}{}{}", block.prev_hash, block.height, block.miner, block.timestamp);
-            blake3::hash(v1_input.as_bytes()).to_hex().to_string()
-        };
-        let valid = block.hash == expected_v2_hash
-            || block.hash == v1_hash
-            || (!expected_v3_hash.is_empty() && block.hash == expected_v3_hash);
-        if !valid {
-            eprintln!(
-                "[Validate] Block #{} rejected: hash mismatch (stored={:.8}… v2={:.8}… v3={:.8}…)",
-                block.height, block.hash, expected_v2_hash,
-                if expected_v3_hash.is_empty() { "n/a".to_string() } else { expected_v3_hash[..8.min(expected_v3_hash.len())].to_string() }
-            );
-            return false;
-        }
+        return false;
     }
 
     true
@@ -7664,7 +7755,7 @@ fn merge_remote_chain_blocking(
             }
 
             let base_reward = crate::tokenomics::block_reward_at(block.height);
-            let reward_ok = block.reward == 0 || block.reward >= base_reward;
+            let reward_ok = block.reward == 0 || block.reward >= base_reward / 2;
             if !reward_ok {
                 tracing::debug!("[P2P] Block #{} rejected: reward {} below base {}",
                     block.height, block.reward, base_reward);
@@ -7972,6 +8063,33 @@ fn bls_vote_fields(block_hash_bytes: &[u8]) -> (String, String) {
     }
 }
 
+fn attach_local_qc_if_missing(block: &mut crate::ledger::LedgerBlock) {
+    if !block.agg_bls_sig.is_empty() && !block.bls_pubkeys.is_empty() {
+        return;
+    }
+    let collected: HashMap<String, Vec<u8>> = match pending_bls_sigs().get(&block.hash) {
+        Some(e) if !e.is_empty() => e.clone(),
+        _ => return,
+    };
+    let pks = peer_bls_pubkeys();
+    let mut pk_list: Vec<String> = Vec::new();
+    let mut sig_list: Vec<Vec<u8>> = Vec::new();
+    for (voter, sig) in collected.iter() {
+        if let Some(pk) = pks.get(voter) {
+            pk_list.push(hex::encode(pk));
+            sig_list.push(sig.clone());
+        }
+    }
+    drop(pks);
+    if sig_list.is_empty() {
+        return;
+    }
+    if let Ok(agg) = crate::bls_agg::aggregate_signatures(&sig_list) {
+        block.agg_bls_sig = hex::encode(&agg);
+        block.bls_pubkeys = pk_list;
+    }
+}
+
 /// Emit a one-time on-chain `validator_register` tx binding this node's address
 /// to its BLS public key (memo `valreg:<bls_hex>:<bind_sig_hex>`, where bind_sig
 /// is the Ed25519 signature over the BLS pubkey bytes). The oracle and other
@@ -8010,7 +8128,7 @@ pub fn maybe_emit_validator_registration() {
         from: addr.clone(),
         to: addr.clone(),
         amount: 0,
-        fee_uegoc: 0,
+        fee_uegoc: 10_000, // 0.01 EGOC — clears the mempool's anti-spam fee floor
         memo: Some(memo),
         timestamp: ts,
         status: "Pending".into(),
@@ -8023,11 +8141,15 @@ pub fn maybe_emit_validator_registration() {
         ..crate::ledger::LedgerTx::default()
     };
 
-    let mut l = crate::ledger::Ledger::load();
-    l.nonce = nonce;
-    let _ = l.save();
-    let _ = crate::mempool::get_mempool().push(tx);
-    eprintln!("[Validator] Emitted on-chain registration binding {} ↔ BLS key", &addr[..addr.len().min(16)]);
+    match crate::mempool::get_mempool().push(tx) {
+        Ok(()) => {
+            let mut l = crate::ledger::Ledger::load();
+            l.nonce = nonce;
+            let _ = l.save();
+            eprintln!("[Validator] Emitted on-chain registration binding {} ↔ BLS key", &addr[..addr.len().min(16)]);
+        }
+        Err(e) => eprintln!("[Validator] Registration NOT emitted: {}", e),
+    }
 }
 
 fn proposal_signing_data(block_hash: &str, height: u64) -> String {
@@ -8233,7 +8355,7 @@ async fn handle_block_proposal(
     }
 
 
-    if let Err(reason) = crate::chain_db::validate_peer_block(&block, &transactions) {
+    if let Err(reason) = crate::chain_db::validate_proposal_block(&block, &transactions) {
         eprintln!(
             "[BFT] Committee: rejected proposal #{} from {} - block/tx integrity failed: {}",
             block.height, proposer, reason
@@ -8446,6 +8568,25 @@ async fn handle_block_vote(
         return;
     }
 
+    // Collect this validator's BLS pubkey + vote signature the moment the vote is
+    // verified — BEFORE any finalization-state early return below. A vote that
+    // lands after the height is already in finalized_at_height still deposits its
+    // signature, so the proposer can always assemble the FULL quorum certificate
+    // and attach it to the committed/gossiped block. Storing it only after the
+    // early return (the old location) starved the aggregate under pipelining
+    // races, leaving agg_bls_sig empty and halting the chain at graduation when
+    // the QC ratchet starts demanding a certificate on every child.
+    if !bls_pubkey.is_empty() {
+        if let Ok(pk_bytes) = hex::decode(&bls_pubkey) {
+            peer_bls_pubkeys().insert(voter.clone(), pk_bytes);
+            crate::chain_db::persist_validator_bls_pubkey(&voter, &bls_pubkey);
+        }
+    }
+    if !bls_sig.is_empty() {
+        if let Ok(sig_bytes) = hex::decode(&bls_sig) {
+            pending_bls_sigs().entry(block_hash.clone()).or_default().insert(voter.clone(), sig_bytes);
+        }
+    }
 
     let prior_vote: Option<(String, String)> = {
         let mut cast = votes_cast();
@@ -8479,27 +8620,16 @@ async fn handle_block_vote(
         return;
     }
 
-    if !bls_pubkey.is_empty() {
-        if let Ok(pk_bytes) = hex::decode(&bls_pubkey) {
-            peer_bls_pubkeys().insert(voter.clone(), pk_bytes);
-            crate::chain_db::persist_validator_bls_pubkey(&voter, &bls_pubkey);
-        }
-    }
-
-    if !bls_sig.is_empty() {
-        if let Ok(sig_bytes) = hex::decode(&bls_sig) {
-            let mut sigs = pending_bls_sigs();
-            let entry = sigs.entry(block_hash.clone()).or_default();
-            entry.insert(voter.clone(), sig_bytes);
-        }
-    }
-
     let threshold = bft_threshold();
 
     let should_finalize = {
         let mut votes = pending_votes();
         let voters = votes.entry(block_hash.clone()).or_default();
-        if !voters.contains(&voter) {
+        // Sybil gate: an unstaked validator's vote does not count toward quorum
+        // (unless the network is still bootstrapping — see is_eligible_validator).
+        if !is_eligible_validator(&voter) {
+            eprintln!("[BFT] Ignoring vote for block #{} from unstaked validator {} (below stake floor)", height, voter);
+        } else if !voters.contains(&voter) {
             voters.push(voter.clone());
             crate::chain_db::persist_pending_vote(&block_hash, &voter);
             let my_addr = crate::ledger::Ledger::load().address;
@@ -8534,6 +8664,9 @@ async fn handle_block_vote(
             }
         }
         touch_proposal_timestamp();
+        // Pipeline the next view from this path too (a node that finalized via the
+        // QC/gossip path otherwise waits out the 5s timeout, gating the quorum).
+        if known_validators().len() >= 2 { request_pipeline_next(); }
         return;
     }
 
@@ -8646,6 +8779,9 @@ async fn handle_block_vote(
             }
             if !is_solo_bootstrap {
                 crate::chain_db::pipeline_commit(height);
+                // Happy-path: signal the view-change monitor to propose the next
+                // block immediately instead of waiting out the 5s proposal timeout.
+                request_pipeline_next();
             } else {
                 crate::chain_db::pipeline_commit(height + 2);
             }
@@ -8665,6 +8801,7 @@ async fn handle_block_vote(
                 (Some(b), Some(txs)) if b.hash == block_hash => {
                     crate::chain_db::pipeline_commit(height);
                     touch_proposal_timestamp();
+                    if known_validators().len() >= 2 { request_pipeline_next(); }
                     (b, txs)
                 }
                 _ => {
@@ -8762,18 +8899,20 @@ fn process_inbound_qc_finalization(
         let sig_bytes = hex::decode(agg_bls_sig).unwrap_or_default();
         let pubkeys: Vec<Vec<u8>> = bls_pubkeys.iter().filter_map(|pk| hex::decode(pk).ok()).collect();
         
-        if crate::bls_agg::verify_aggregate(&sig_bytes, &pubkeys, &block_hash_bytes) {
-            let known = known_validators();
+        if crate::bls_agg::verify_aggregate(&sig_bytes, &pubkeys, &block_hash_bytes)
+            && crate::chain_db::qc_signers_registered(bls_pubkeys) {
+            let known: Vec<String> = known_validators().iter().cloned().collect();
             let pks = peer_bls_pubkeys();
             let mut verified_voters = Vec::new();
             for (voter, pk) in pks.iter() {
-                if bls_pubkeys.contains(&hex::encode(pk)) && known.contains(voter) {
+                // Sybil gate: only stake-eligible signers count toward the QC.
+                if bls_pubkeys.contains(&hex::encode(pk)) && known.contains(voter)
+                    && is_eligible_validator(voter) {
                     verified_voters.push(voter.clone());
                 }
             }
-            
+
             // Drop locks before calling stake_quorum_reached to prevent deadlock
-            drop(known);
             drop(pks);
             
             if verified_voters.len() >= threshold && stake_quorum_reached(&verified_voters) {
@@ -9015,8 +9154,7 @@ async fn handle_view_change_msg(view: u64, voter: String) {
             "[HotStuff] {} consecutive empty views — activating deterministic fallback for view {}",
             empty_views, view
         );
-        let mut validators: Vec<String> = known_validators().iter().cloned().collect();
-        validators.sort();
+        let validators = eligible_validators_sorted();
         let fallback_idx    = (view as usize).wrapping_rem(validators.len().max(1));
         let fallback_leader = validators.get(fallback_idx).cloned().unwrap_or_default();
         if fallback_leader == my_addr {
@@ -9026,10 +9164,9 @@ async fn handle_view_change_msg(view: u64, voter: String) {
             eprintln!("[HotStuff] Fallback: round-robin elected {} for view {}", &fallback_leader[..12.min(fallback_leader.len())], view);
         }
     } else {
-        let n_validators = known_validators().len();
+        let vs = eligible_validators_sorted();
+        let n_validators = vs.len();
         if n_validators <= 10 {
-            let mut vs: Vec<String> = known_validators().iter().cloned().collect();
-            vs.sort();
             let idx = (view as usize).wrapping_rem(vs.len().max(1));
             if vs.get(idx).map(|v| v == &my_addr).unwrap_or(false) {
                 eprintln!("[HotStuff] Round-robin elected us for view {} ({}/{}) — proposing block", view, idx + 1, vs.len());
@@ -9637,30 +9774,47 @@ pub async fn propose_block_as_leader_forced() {
     }
 }
 
+/// Set by the commit path to ask the view-change monitor to drive the next
+/// proposal immediately (happy-path pipelining) rather than waiting out the 5s
+/// proposal timeout. The monitor — not the vote handler — performs the view
+/// change, which keeps it out of the vote→propose async recursion chain.
+static PIPELINE_NEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn request_pipeline_next() {
+    PIPELINE_NEXT.store(true, Ordering::Relaxed);
+}
+
 pub async fn run_view_change_monitor() {
 
     tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
     touch_proposal_timestamp();
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    // 250ms tick so the happy-path pipeline signal is picked up quickly; the 5s
+    // timeout below is still the fallback for a silent/faulty proposer.
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut _tick_count: u64 = 0;
     loop {
         interval.tick().await;
         _tick_count += 1;
 
-        evict_stale_validators(30);
-
-        if _tick_count % 10 == 0 {
+        // Housekeeping/logging at ~1s and ~10s cadence respectively (not every 250ms).
+        if _tick_count % 4 == 0 {
+            evict_stale_validators(30);
+        }
+        if _tick_count % 40 == 0 {
             eprintln!("[ViewMon] alive — tick #{} validators={}", _tick_count, known_validators().len());
         }
 
         if known_validators().is_empty() { continue; }
 
+        // Fire immediately if the commit path requested pipelining; otherwise wait
+        // for the proposal timeout.
+        let pipeline = PIPELINE_NEXT.swap(false, Ordering::Relaxed);
         let now  = chrono::Utc::now().timestamp();
         let last = LAST_PROPOSAL_TS.load(Ordering::Relaxed);
-        if last == 0 || now - last < VIEW_CHANGE_TIMEOUT_SECS { continue; }
+        if !pipeline && (last == 0 || now - last < VIEW_CHANGE_TIMEOUT_SECS) { continue; }
 
         let view_init = tokio::task::spawn_blocking(|| {
             let chain_next = crate::chain_db::latest_block_info().0 + 1;
@@ -9675,21 +9829,44 @@ pub async fn run_view_change_monitor() {
         };
         let next_view = chain_next.max(current_view() + 1);
 
-        let prev_stuck = STUCK_AT_NEXT_VIEW.swap(next_view, Ordering::Relaxed);
-        if prev_stuck == next_view {
-            let cycles = STUCK_VIEWCHANGE_CYCLES.fetch_add(1, Ordering::Relaxed) + 1;
-            if cycles >= 10 { // Wait 30 seconds before permanently evicting a validator
-                STUCK_VIEWCHANGE_CYCLES.store(0, Ordering::Relaxed);
-                eprintln!(
-                    "[HotStuff] ViewChange deadlock at view {} — halting to preserve BFT safety (waiting for peers to reconnect)",
-                    next_view
-                );
-            }
+        if pipeline {
+            // Healthy progression after a commit — not a stuck/timeout event, so
+            // don't accrue deadlock cycles.
+            STUCK_VIEWCHANGE_CYCLES.store(0, Ordering::Relaxed);
+            STUCK_AT_NEXT_VIEW.store(next_view, Ordering::Relaxed);
         } else {
-            STUCK_VIEWCHANGE_CYCLES.store(1, Ordering::Relaxed);
-        }
+            let prev_stuck = STUCK_AT_NEXT_VIEW.swap(next_view, Ordering::Relaxed);
+            let cycles = if prev_stuck == next_view {
+                let c = STUCK_VIEWCHANGE_CYCLES.fetch_add(1, Ordering::Relaxed) + 1;
+                if c >= 10 { // Wait 30 seconds before permanently evicting a validator
+                    STUCK_VIEWCHANGE_CYCLES.store(0, Ordering::Relaxed);
+                    eprintln!(
+                        "[HotStuff] ViewChange deadlock at view {} — halting to preserve BFT safety (waiting for peers to reconnect)",
+                        next_view
+                    );
+                }
+                c
+            } else {
+                STUCK_VIEWCHANGE_CYCLES.store(1, Ordering::Relaxed);
+                1
+            };
+            eprintln!("[HotStuff] Proposal timeout — broadcasting ViewChange for view {} (stuck cycle {})", next_view, cycles);
 
-        eprintln!("[HotStuff] Proposal timeout — broadcasting ViewChange for view {}", next_view);
+            // Deadlock escape: stuck at the same view across SOLO_DEADLOCK_VIEWS
+            // timeouts means the committee is unreachable (can't gather a
+            // ViewChange quorum). Fall back to solo so a partitioned /
+            // single-operator node keeps producing instead of looping forever.
+            // should_solo_commit_now() gates this (returns false on a
+            // quorum-graduated chain unless EGO_ALLOW_SOLO_FORK=1). The solo commit
+            // advances the chain → STUCK_VIEWCHANGE_CYCLES resets → BFT retries.
+            if cycles >= SOLO_DEADLOCK_VIEWS && should_solo_commit_now() {
+                eprintln!("[HotStuff] ViewChange deadlock at view {} — solo-producing to restore liveness", next_view);
+                tokio::spawn(async { propose_block_as_leader_forced().await; });
+                touch_proposal_timestamp();
+                continue;
+            }
+            eprintln!("[HotStuff] Proposal timeout — broadcasting ViewChange for view {}", next_view);
+        }
 
         let vote_data = format!("viewchange:{}:{}", next_view, my_addr);
         let sig = {
@@ -9706,6 +9883,70 @@ pub async fn run_view_change_monitor() {
         handle_view_change_msg(next_view, my_addr).await;
 
         touch_proposal_timestamp();
+    }
+}
+
+/// Independent liveness watchdog: detects a stalled chain by the only signal that
+/// can't be fooled by the view-change machinery — the chain HEIGHT not advancing.
+/// If it hasn't moved for SOLO_STALL_SECS, flag LIVENESS_STALLED (so
+/// should_solo_commit_now flips to solo) and force a proposal so a partitioned /
+/// single-operator node keeps producing instead of hanging on ViewChange forever.
+/// Runs on its own task so a stuck view-change monitor can't take it down. Gated
+/// by should_solo_commit_now (no-op on a quorum-graduated chain unless
+/// EGO_ALLOW_SOLO_FORK=1, so it can never fork past the QC ratchet).
+pub async fn run_solo_liveness_watchdog() {
+    let startup_delay = 20;
+    tokio::time::sleep(std::time::Duration::from_secs(startup_delay)).await;
+    let mut last_height = crate::chain_db::latest_block_info().0;
+    let mut last_advance = chrono::Utc::now().timestamp();
+    let mut last_heartbeat = 0i64;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let h   = crate::chain_db::latest_block_info().0;
+        let now = chrono::Utc::now().timestamp();
+
+        if h > last_height && h > 0 {
+            last_height  = h;
+            last_advance = now;
+            LIVENESS_STALLED.store(false, Ordering::Relaxed);
+            continue;
+        }
+
+        let stalled_for = now - last_advance;
+
+        if now - last_heartbeat >= 30 {
+            last_heartbeat = now;
+            eprintln!(
+                "[Liveness] watchdog alive — height={} stalled={}s validators={}",
+                h, stalled_for, known_validators().len()
+            );
+        }
+
+        let stall_threshold = if known_validators().len() <= 1 { SOLO_ALONE_STALL_SECS } else { SOLO_STALL_SECS };
+        if stalled_for < stall_threshold { continue; }
+        if known_validators().is_empty() { continue; }
+
+        LIVENESS_STALLED.store(true, Ordering::Relaxed);
+        if should_solo_commit_now() {
+            eprintln!(
+                "[Liveness] Chain stalled {}s at height {} — solo-producing to restore liveness",
+                stalled_for, h
+            );
+            if tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                propose_block_as_leader_forced(),
+            ).await.is_err() {
+                eprintln!("[Liveness] block production timed out (swarm busy) — will retry");
+            }
+            last_advance = now;
+        } else {
+            eprintln!(
+                "[Liveness] Chain stalled {}s at height {} but solo is not permitted \
+                 (peers still reachable, or chain is quorum-finalized) — \
+                 holding for a quorum",
+                stalled_for, h
+            );
+        }
     }
 }
 

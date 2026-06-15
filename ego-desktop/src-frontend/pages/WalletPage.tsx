@@ -914,6 +914,9 @@ const WalletPage: React.FC = () => {
   }, [showAddresses]);
 
   const filteredTxs = txs.filter(tx => {
+    // Hide internal protocol txs (e.g. validator BLS-key registration) — they're
+    // not user transfers and only confuse the wallet history.
+    if (tx.tx_type === 'validator_register') return false;
     if (tab === 'sent')     return tx.from === myAddress;
     if (tab === 'received') return tx.to === myAddress;
     return true;
