@@ -494,7 +494,10 @@ pub struct AppState {
     pub chain:          Arc<RwLock<ChainState>>,
     pub client:         Client,
     pub hosting_nodes:  Arc<RwLock<HostingNodes>>,
-    pub ego_nodes:      Arc<RwLock<Vec<String>>>,
+    /// Peer rendezvous: dialable node endpoint → last-seen unix ts. Nodes POST
+    /// their relayed /p2p-circuit address to /nodes/register and GET /nodes to
+    /// discover and dial each other (so two NAT'd nodes behind one relay meet).
+    pub ego_nodes:      Arc<RwLock<HashMap<String, i64>>>,
     pub acme:           Arc<acme::AcmeState>,
     pub post_approvals: Arc<RwLock<HashMap<String, PostRewardApproval>>>,
     pub post_rate_limit: Arc<RwLock<HashMap<String, i64>>>,
@@ -745,13 +748,32 @@ async fn handle_nodes_register(
 ) -> impl IntoResponse {
     if let Some(endpoint) = body["endpoint"].as_str() {
         let ep = endpoint.trim_end_matches('/').to_string();
-        let mut nodes = state.ego_nodes.write().await;
-        if !nodes.contains(&ep) {
-            info!("[Registry] Ego node registered: {}", ep);
-            nodes.push(ep);
+        // Only relayed circuit addresses are dialable across NATs. Reject direct
+        // LAN/loopback endpoints (e.g. 192.168.x / 127.0.0.1) that other nodes on
+        // the internet could never reach — registering those just causes failed
+        // dials. Override for same-LAN testing via EGO_ORACLE_ALLOW_DIRECT_PEERS.
+        let dialable = ep.contains("/p2p-circuit")
+            || std::env::var("EGO_ORACLE_ALLOW_DIRECT_PEERS").is_ok();
+        if dialable {
+            let now = Utc::now().timestamp();
+            let mut nodes = state.ego_nodes.write().await;
+            if nodes.insert(ep.clone(), now).is_none() {
+                info!("[Registry] Ego node registered: {}", ep);
+            }
         }
     }
     StatusCode::OK
+}
+
+/// Peer rendezvous: return node endpoints seen within the last 10 minutes so
+/// nodes can dial each other. This is the read half of /nodes/register — without
+/// it the registry is write-only and peers never discover one another.
+async fn handle_nodes_list(State(state): State<AppState>) -> impl IntoResponse {
+    let now = Utc::now().timestamp();
+    let mut nodes = state.ego_nodes.write().await;
+    nodes.retain(|_, seen| now - *seen < 600);
+    let list: Vec<String> = nodes.keys().cloned().collect();
+    Json(json!({ "nodes": list }))
 }
 
 // ── Handlers: TLS cert automation (Let's Encrypt DNS-01) ─────────────────
@@ -979,7 +1001,7 @@ async fn main() {
         chain:           Arc::new(RwLock::new(load_chain())),
         client,
         hosting_nodes:   Arc::new(RwLock::new(HashMap::new())),
-        ego_nodes:       Arc::new(RwLock::new(Vec::new())),
+        ego_nodes:       Arc::new(RwLock::new(HashMap::new())),
         acme:            acme_state,
         post_approvals:  Arc::new(RwLock::new(HashMap::new())),
         post_rate_limit: Arc::new(RwLock::new(HashMap::new())),
@@ -1020,6 +1042,7 @@ async fn main() {
         .route("/hosting/announce",         post(handle_hosting_announce))
         .route("/hosting/nodes/:domain",    get(handle_hosting_nodes))
         .route("/nodes/register",           post(handle_nodes_register))
+        .route("/nodes",                    get(handle_nodes_list))
         .route("/cert/request",             post(handle_cert_request))
         .route("/cert/status/:domain",      get(handle_cert_status))
         .route("/post/proof",               post(handle_post_proof))
