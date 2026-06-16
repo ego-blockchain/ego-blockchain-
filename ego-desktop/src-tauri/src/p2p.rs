@@ -8061,6 +8061,55 @@ pub async fn fetch_chain_from_oracle(app: Option<&tauri::AppHandle<tauri::Wry>>)
     eprintln!("[Oracle] Chain merged from Oracle RPC (trusted)");
 }
 
+/// Oracle-backed peer rendezvous. Registers THIS node's dialable relayed
+/// endpoint with the oracle and dials every other registered node, so two
+/// NAT'd machines behind the same relay actually find and connect to each
+/// other (otherwise each runs an isolated solo chain — "Active Nodes: 1" — and
+/// transactions never cross). Pure-P2P DHT discovery alone was not bridging
+/// remote nodes; this is the reliable centralized fallback for the testnet.
+pub async fn oracle_peer_discovery_tick() {
+    if std::env::var("EGO_NO_ORACLE").is_ok() { return; }
+
+    let my_ep = get_public_endpoint().await;
+    let allow_direct = std::env::var("EGO_DIRECT_PEERS").is_ok();
+    // Only a relayed circuit address is reachable across the internet; don't
+    // advertise a LAN/loopback addr that peers could never dial.
+    let my_ep_dialable = my_ep.contains("/p2p-circuit") || (allow_direct && !my_ep.is_empty());
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+
+    if my_ep_dialable {
+        oracle_post_pub(&client, "/nodes/register",
+            &serde_json::json!({ "endpoint": my_ep })).await;
+    }
+
+    #[derive(serde::Deserialize, Default)]
+    struct NodesResp { nodes: Vec<String> }
+    let resp = match oracle_get(&client, "/nodes").await {
+        Some(r) => r.json::<NodesResp>().await.unwrap_or_default(),
+        None => return,
+    };
+
+    let Some(tx) = SWARM_TX.get() else { return };
+    let mut dialed = 0usize;
+    for ep in resp.nodes {
+        let ep = ep.trim_end_matches('/').to_string();
+        if ep.is_empty() || ep == my_ep { continue; }
+        if !ep.contains("/p2p-circuit") && !allow_direct { continue; }
+        let addr: Multiaddr = match ep.parse() { Ok(a) => a, Err(_) => continue };
+        let (rtx, _rrx) = oneshot::channel();
+        if tx.send(SwarmCmd::Dial { peer_addr: addr, reply: rtx }).await.is_ok() {
+            dialed += 1;
+        }
+    }
+    if dialed > 0 {
+        eprintln!("[Oracle] peer discovery: dialed {} peer(s) from oracle registry", dialed);
+    }
+}
+
 
 pub(crate) fn get_ed25519_seed() -> Option<[u8; 32]> {
     if let Ok(cache) = SEED_CACHE.read() {

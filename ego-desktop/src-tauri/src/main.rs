@@ -734,6 +734,20 @@ fn main() {
                 crate::p2p::broadcast_peer_announce(Some(&handle_startup)).await;
                 tracing::info!("Peer announce sent (endpoint: {})", my_endpoint);
 
+                // Oracle-backed peer rendezvous: register our relayed endpoint and
+                // dial peers the oracle knows about, so two NAT'd nodes behind one
+                // relay actually connect (DHT discovery alone left them isolated at
+                // "Active Nodes: 1" on separate solo chains). Re-run periodically so
+                // a node that joins later is discovered and the relay circuit (which
+                // may not be confirmed at first tick) is retried.
+                crate::p2p::oracle_peer_discovery_tick().await;
+                tokio::spawn(async {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        crate::p2p::oracle_peer_discovery_tick().await;
+                    }
+                });
+
                 // Publish this validator's address↔BLS binding on-chain (once) so
                 // the oracle/peers can stake-weight its QC votes.
                 tokio::spawn(async {
