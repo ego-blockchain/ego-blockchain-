@@ -505,6 +505,9 @@ pub struct AppState {
     /// are still accepted but a loud SECURITY warning is logged on every call —
     /// set ORACLE_SUBMIT_TOKEN before any public exposure to enforce auth.
     pub submit_token: Option<String>,
+    /// Latest trusted state snapshot (raw JSON from a writer node) for checkpoint
+    /// fast-sync. Kept in memory; the writer re-pushes it every ~100 blocks.
+    pub snapshot:     Arc<RwLock<Option<serde_json::Value>>>,
 }
 
 const EGOC_USD: f64 = 0.01;
@@ -776,6 +779,35 @@ async fn handle_nodes_list(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({ "nodes": list }))
 }
 
+// ── Checkpoint fast-sync: trusted state snapshot store/serve ──────────────
+async fn handle_snapshot_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if !submit_authorized(&state, &headers) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid or missing submit token" })));
+    }
+    let new_h = payload.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+    if new_h == 0 {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "snapshot missing height" })));
+    }
+    let mut snap = state.snapshot.write().await;
+    let cur_h = snap.as_ref().and_then(|s| s.get("height")).and_then(|v| v.as_u64()).unwrap_or(0);
+    if new_h >= cur_h {
+        *snap = Some(payload);
+    }
+    (StatusCode::OK, Json(json!({ "ok": true, "height": new_h.max(cur_h) })))
+}
+
+async fn handle_snapshot_get(State(state): State<AppState>) -> impl IntoResponse {
+    let snap = state.snapshot.read().await;
+    match snap.as_ref() {
+        Some(v) => (StatusCode::OK, Json(v.clone())),
+        None    => (StatusCode::NOT_FOUND, Json(json!({ "error": "no snapshot available yet" }))),
+    }
+}
+
 // ── Handlers: TLS cert automation (Let's Encrypt DNS-01) ─────────────────
 
 #[derive(serde::Deserialize)]
@@ -1006,6 +1038,7 @@ async fn main() {
         post_approvals:  Arc::new(RwLock::new(HashMap::new())),
         post_rate_limit: Arc::new(RwLock::new(HashMap::new())),
         submit_token:    std::env::var("ORACLE_SUBMIT_TOKEN").ok().filter(|s| !s.trim().is_empty()),
+        snapshot:        Arc::new(RwLock::new(None)),
     };
     if state.submit_token.is_none() {
         error!("SECURITY: ORACLE_SUBMIT_TOKEN is not set — /chain/submit is UNAUTHENTICATED. \
@@ -1039,6 +1072,7 @@ async fn main() {
         .route("/chain/blocks",             get(handle_chain_blocks))
         .route("/chain/transactions",       get(handle_chain_transactions))
         .route("/chain/submit",             post(handle_chain_submit))
+        .route("/chain/snapshot",           post(handle_snapshot_submit).get(handle_snapshot_get))
         .route("/hosting/announce",         post(handle_hosting_announce))
         .route("/hosting/nodes/:domain",    get(handle_hosting_nodes))
         .route("/nodes/register",           post(handle_nodes_register))

@@ -1928,6 +1928,101 @@ pub fn compute_full_state_root() -> String {
     get_block_by_height(h).map(|b| b.state_root).unwrap_or_else(|| "0".repeat(64))
 }
 
+/// Trusted checkpoint snapshot of the full ledger state at the chain tip.
+/// `state_root` is delta-chained (state_root(N)=blake3(state_root(N-1)||delta(N))),
+/// so a snapshot can't be verified standalone — it is TRUSTED from the oracle, same
+/// as the existing "Oracle chain merged (trusted)" path. Forward sync from the
+/// checkpoint IS verified (each new block's state_root delta-chains from the tip).
+/// Raw key/value bytes (hex) from CF_BALANCES + CF_META are dumped verbatim so the
+/// snapshot round-trips regardless of internal key encoding (balances, nonces,
+/// stakes, supply pools, tip height, tx_count all live in those two CFs).
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+pub struct StateSnapshot {
+    pub height:     u64,
+    pub tip_hash:   String,
+    pub state_root: String,
+    pub balances:   Vec<(String, String)>,
+    pub meta:       Vec<(String, String)>,
+    /// Recent block headers (last N) so the tip block exists for forward sync and
+    /// the explorer has recent history. Older history is intentionally pruned —
+    /// a fast-synced node trusts the snapshot state and only keeps recent blocks.
+    #[serde(default)]
+    pub blocks:     Vec<LedgerBlock>,
+}
+
+/// How many recent block headers to ship in a snapshot.
+pub const SNAPSHOT_BLOCK_WINDOW: u32 = 600;
+
+pub fn export_state_snapshot() -> StateSnapshot {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let (height, tip_hash) = {
+        let cf_meta = db.cf_handle(CF_META).unwrap();
+        let h = db.get_cf(cf_meta, META_LATEST_HEIGHT).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+        let cf_blocks = db.cf_handle(CF_BLOCKS).unwrap();
+        let hash = db.get_cf(cf_blocks, height_key(h)).ok().flatten()
+            .and_then(|v| decode::<LedgerBlock>(&v)).map(|b| b.hash).unwrap_or_default();
+        (h, hash)
+    };
+    let state_root = {
+        let cf_blocks = db.cf_handle(CF_BLOCKS).unwrap();
+        db.get_cf(cf_blocks, height_key(height)).ok().flatten()
+            .and_then(|v| decode::<LedgerBlock>(&v)).map(|b| b.state_root).unwrap_or_else(|| "0".repeat(64))
+    };
+    let dump = |cf_name: &str| -> Vec<(String, String)> {
+        match db.cf_handle(cf_name) {
+            Some(cf) => db.iterator_cf(cf, rocksdb::IteratorMode::Start)
+                .filter_map(|r| r.ok())
+                .map(|(k, v)| (hex::encode(&k), hex::encode(&v)))
+                .collect(),
+            None => vec![],
+        }
+    };
+    let from = height.saturating_sub(SNAPSHOT_BLOCK_WINDOW as u64).max(1);
+    let blocks = {
+        let cf_blocks = db.cf_handle(CF_BLOCKS).unwrap();
+        (from..=height).filter_map(|h| db.get_cf(cf_blocks, height_key(h)).ok().flatten().and_then(|v| decode::<LedgerBlock>(&v))).collect()
+    };
+    StateSnapshot { height, tip_hash, state_root, balances: dump(CF_BALANCES), meta: dump(CF_META), blocks }
+}
+
+/// Install a trusted checkpoint snapshot. Writes the balances + meta verbatim (which
+/// also sets META_LATEST_HEIGHT = snapshot height), then rebuilds in-memory state.
+/// Callers MUST first write the recent block window (so the tip block exists in
+/// CF_BLOCKS) before relying on the new tip.
+pub fn import_state_snapshot(snap: &StateSnapshot) -> Result<(), String> {
+    {
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let mut batch = rocksdb::WriteBatch::default();
+        if let Some(cf) = db.cf_handle(CF_BALANCES) {
+            for (k, v) in &snap.balances {
+                let kb = hex::decode(k).map_err(|e| format!("bad bal key: {e}"))?;
+                let vb = hex::decode(v).map_err(|e| format!("bad bal val: {e}"))?;
+                batch.put_cf(cf, &kb, &vb);
+            }
+        }
+        // Recent block headers written RAW (no balance application — state comes
+        // from the snapshot directly, applying them would double-count).
+        if let Some(cf) = db.cf_handle(CF_BLOCKS) {
+            for b in &snap.blocks {
+                batch.put_cf(cf, height_key(b.height), &encode(b));
+            }
+        }
+        // Meta last — it carries META_LATEST_HEIGHT, so the tip only becomes valid
+        // after the tip block (above) and balances are in place.
+        if let Some(cf) = db.cf_handle(CF_META) {
+            for (k, v) in &snap.meta {
+                let kb = hex::decode(k).map_err(|e| format!("bad meta key: {e}"))?;
+                let vb = hex::decode(v).map_err(|e| format!("bad meta val: {e}"))?;
+                batch.put_cf(cf, &kb, &vb);
+            }
+        }
+        db.write(batch).map_err(|e| format!("snapshot write: {e}"))?;
+    }
+    restore_in_memory_state_from_db();
+    tracing::info!("[FastSync] Installed state snapshot at height {} ({} balances, {} meta)", snap.height, snap.balances.len(), snap.meta.len());
+    Ok(())
+}
+
 pub fn get_state_merkle_proof(address: &str) -> Vec<String> {
     // O(N) full state proofs are deprecated in favor of delta roots.
     vec![]

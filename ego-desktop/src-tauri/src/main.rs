@@ -723,6 +723,10 @@ fn main() {
                 // Bootstrap from oracle only while the P2P network is small
                 let startup_peers = crate::p2p::get_known_peers().len();
                 if !no_oracle && startup_peers < 50 {
+                    // Checkpoint fast-sync first: if we're far behind the oracle tip
+                    // (fresh node / pruned history), trust-install a state snapshot and
+                    // jump to the checkpoint instead of failing to fetch old blocks.
+                    crate::p2p::fast_sync_from_oracle_if_behind().await;
                     crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)).await;
                     crate::p2p::oracle_sync_chain().await;
                     tracing::info!("Oracle chain sync complete ({} peers, oracle active)", startup_peers);
@@ -803,6 +807,7 @@ fn main() {
                         
                         if !no_oracle {
                             tracing::info!("Fetching latest state from Explorer RPC for fast-sync...");
+                            crate::p2p::fast_sync_from_oracle_if_behind().await;
                             crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)).await;
                         }
                         

@@ -280,5 +280,5 @@ jobs:
           name: Ego Desktop ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
           body: ${{ env.RELEASE_BODY }}
           files: |
-            ego-desktop/src-tauri/target/x86_64-unknown-linux-musl/release/bundle/appimage/*.AppImage
-            ego-desktop/src-tauri/target/x86_64-unknown-linux-musl/release/bundle/deb/*.deb
+            ego-desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+            ego-desktop/src-tauri/target/release/bundle/deb/*.deb
