@@ -354,6 +354,12 @@ pub async fn push_block_to_oracle(block: &crate::ledger::LedgerBlock, txs: &[cra
         "transactions": txs,
     });
     oracle_post(&client, "/chain/submit", &body).await;
+    // Every 100 blocks, also publish a full state snapshot so fresh / far-behind
+    // nodes can checkpoint-sync (the oracle prunes old blocks, so replay isn't an
+    // option). Cheap while the account set is small.
+    if block.height % 100 == 0 {
+        push_snapshot_to_oracle().await;
+    }
 }
 
 pub static RELAY_CIRCUIT_READY: AtomicBool = AtomicBool::new(false);
@@ -8082,6 +8088,68 @@ pub async fn oracle_sync_chain() {
         submitted += 1;
     }
     eprintln!("[Oracle] catch-up: submitted {} blocks to oracle", submitted);
+}
+
+/// Validator/full-node: publish a trusted state snapshot to the oracle so fresh
+/// nodes can checkpoint-sync instead of replaying (or being unable to fetch) the
+/// full history. Cheap while account count is small; the oracle keeps the highest.
+pub async fn push_snapshot_to_oracle() {
+    if std::env::var("EGO_NO_ORACLE").is_ok() { return; }
+    let snap = match tokio::task::spawn_blocking(crate::chain_db::export_state_snapshot).await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if snap.height == 0 { return; }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build().unwrap_or_default();
+    let body = match serde_json::to_value(&snap) { Ok(v) => v, Err(_) => return };
+    oracle_post(&client, "/chain/snapshot", &body).await;
+}
+
+/// Fresh / far-behind node: if the oracle tip is well beyond our local tip (so we
+/// can't paginate the gap — the oracle prunes old blocks, and replaying 10k+ would
+/// not scale), trust-install a state snapshot and jump to the checkpoint. Forward
+/// sync from there is verified normally. Returns true if a snapshot was installed.
+pub async fn fast_sync_from_oracle_if_behind() -> bool {
+    if std::env::var("EGO_NO_ORACLE").is_ok() { return false; }
+    let local_tip = crate::chain_db::latest_block_info().0;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build().unwrap_or_default();
+
+    #[derive(serde::Deserialize, Default)]
+    struct OracleHealth { chain_tip: Option<u64> }
+    let oracle_tip: u64 = match oracle_get(&client, "/health").await {
+        Some(r) => r.json::<OracleHealth>().await.map(|h| h.chain_tip.unwrap_or(0)).unwrap_or(0),
+        None => return false,
+    };
+
+    // Only checkpoint-sync when the gap is larger than the block window we could
+    // paginate; within the window, normal block sync handles it.
+    if oracle_tip == 0 || oracle_tip <= local_tip + crate::chain_db::SNAPSHOT_BLOCK_WINDOW as u64 {
+        return false;
+    }
+
+    let snap: crate::chain_db::StateSnapshot = match oracle_get(&client, "/chain/snapshot").await {
+        Some(r) => match r.json().await {
+            Ok(s) => s,
+            Err(e) => { eprintln!("[FastSync] snapshot decode failed: {e}"); return false; }
+        },
+        None => { eprintln!("[FastSync] oracle snapshot unavailable"); return false; }
+    };
+    if snap.height <= local_tip {
+        return false;
+    }
+    let height = snap.height;
+    match tokio::task::spawn_blocking(move || crate::chain_db::import_state_snapshot(&snap)).await {
+        Ok(Ok(())) => {
+            eprintln!("[FastSync] checkpoint-synced to height {} via trusted oracle snapshot (local was {})", height, local_tip);
+            true
+        }
+        Ok(Err(e)) => { eprintln!("[FastSync] snapshot install failed: {e}"); false }
+        Err(_) => false,
+    }
 }
 
 pub async fn fetch_chain_from_oracle(app: Option<&tauri::AppHandle<tauri::Wry>>) {
