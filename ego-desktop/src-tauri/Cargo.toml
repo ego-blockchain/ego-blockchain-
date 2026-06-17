@@ -129,4 +129,11 @@ opt-level = 3
 [dev-dependencies]
 tempfile = "3"
 
+# Patched wry 0.24.11 — adds the missing `use webkit2gtk::SettingsExt;` so the
+# Linux (webkit2gtk) webview backend compiles. Without this the GUI/webview layer
+# fails to build on Linux (E0599 on settings.set_enable_*). Vendored so any Linux
+# build / CI picks it up automatically.
+[patch.crates-io]
+wry = { path = "patches/wry" }
+
 [workspace]

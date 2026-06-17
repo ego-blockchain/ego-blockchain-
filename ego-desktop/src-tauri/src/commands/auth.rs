@@ -426,6 +426,17 @@ fn create_wallet_files(address_override: Option<&str>) -> Result<String, EgoDesk
     Ok(final_address)
 }
 
+/// Headless bootstrap: a validator started with EGO_HEADLESS=1 has no GUI to run
+/// init_wallet, so self-provision a fresh identity on first run if none exists.
+/// Idempotent — returns the existing address once a wallet is present.
+pub fn ensure_wallet_exists() -> Result<String, EgoDesktopError> {
+    let existing = Ledger::load().address;
+    if !existing.is_empty() {
+        return Ok(existing);
+    }
+    create_wallet_files(None)
+}
+
 #[tauri::command]
 pub async fn init_wallet(
     state: State<'_, AppState>,

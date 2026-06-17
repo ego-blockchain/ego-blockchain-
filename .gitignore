@@ -59,6 +59,12 @@ services/erlang/erl_bridge/_build
 /simple_*.rs
 /test_*.rs
 
+# Built Linux validator binary (build artifact — lives on the server, not in git)
+/ego-validator
+# Real systemd units may carry secrets (ORACLE_SUBMIT_TOKEN); only the .example is tracked
+/ego-validator.service
+deploy/ego-validator.service
+
 # Node artifacts
 extension/node_modules/
 extension/dist/
