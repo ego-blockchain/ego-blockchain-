@@ -33,11 +33,7 @@ pub async fn get_network_stats() -> Result<NetworkStats, EgoDesktopError> {
     let result = tokio::task::spawn_blocking(|| {
         let registry = load_registry();
         let (latest_height, _) = crate::chain_db::latest_block_info();
-        let node_count = registry
-            .wallets
-            .iter()
-            .filter(|w| !w.address.is_empty())
-            .count() as u32;
+        let node_count = crate::p2p::active_node_count() as u32;
         let mut seen_cids: HashSet<String> = HashSet::new();
         for entry in &registry.wallets {
             let path = wallet_dir(&entry.id).join("ledger.json");

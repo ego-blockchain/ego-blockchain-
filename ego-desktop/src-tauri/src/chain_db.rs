@@ -1620,6 +1620,36 @@ pub fn chain_has_graduated(window: u64) -> bool {
     false
 }
 
+const META_GRADUATED: &[u8] = b"chain_graduated";
+static GRADUATED_LATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Like `chain_has_graduated`, but once true it latches permanently — persisted to
+/// CF_META and re-loaded across restarts. A node that has ever reached quorum
+/// finality must never fall back to solo-forking just because the recent-block
+/// window scrolled past the last quorum block (that bug let a lone node that lost
+/// its peer to sleep silently fork its own chain).
+pub fn chain_has_graduated_sticky(window: u64) -> bool {
+    if GRADUATED_LATCH.load(std::sync::atomic::Ordering::Relaxed) { return true; }
+    {
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cf_meta) = db.cf_handle(CF_META) {
+            if db.get_cf(cf_meta, META_GRADUATED).ok().flatten().is_some() {
+                GRADUATED_LATCH.store(true, std::sync::atomic::Ordering::Relaxed);
+                return true;
+            }
+        }
+    }
+    if chain_has_graduated(window) {
+        GRADUATED_LATCH.store(true, std::sync::atomic::Ordering::Relaxed);
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cf_meta) = db.cf_handle(CF_META) {
+            let _ = db.put_cf(cf_meta, META_GRADUATED, b"1");
+        }
+        return true;
+    }
+    false
+}
+
 pub fn recent_transactions(limit: usize) -> Vec<LedgerTx> {
     paged_transactions(0, limit)
 }

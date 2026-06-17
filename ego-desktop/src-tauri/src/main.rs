@@ -804,6 +804,7 @@ fn main() {
                         
                         crate::p2p::restore_dht_cache().await;
                         crate::p2p::dht_discover_peers().await;
+                        crate::p2p::oracle_peer_discovery_tick().await;
                         crate::p2p::register_with_relay_as_ego_node().await;
                         crate::p2p::touch_proposal_timestamp();
                     }

@@ -799,7 +799,7 @@ fn should_solo_commit_now() -> bool {
     let allow_solo_fork = std::env::var("EGO_ALLOW_SOLO_FORK")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    if !allow_solo_fork && crate::chain_db::chain_has_graduated(32) {
+    if !allow_solo_fork && crate::chain_db::chain_has_graduated_sticky(32) {
         static LAST_HALT_LOG: AtomicI64 = AtomicI64::new(0);
         let now = chrono::Utc::now().timestamp();
         if now - LAST_HALT_LOG.swap(now, Ordering::Relaxed) > 30 {
@@ -1193,6 +1193,67 @@ pub fn evict_stale_validators(ttl_secs: i64) {
 
 pub fn known_validator_count() -> usize {
     known_validators().len()
+}
+
+/// Real count of nodes currently participating in consensus: peer validators seen
+/// within the last 180s, plus self. This is the genuine "Active Nodes" figure — the
+/// Explorer previously reported the local wallet count, which has nothing to do with
+/// network connectivity (always 1 per machine, connected or not).
+pub fn active_node_count() -> usize {
+    let now   = chrono::Utc::now().timestamp();
+    let local = local_validator_mutex().lock().unwrap().clone();
+    let seen  = validator_last_seen();
+    let peers = known_validators().iter()
+        .filter(|a| !a.is_empty() && **a != local)
+        .filter(|a| seen.get(*a).map(|&t| now - t < 180).unwrap_or(false))
+        .count();
+    peers + 1
+}
+
+fn is_bootstrap_validator() -> bool {
+    std::env::var("EGO_BOOTSTRAP_VALIDATOR")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn bootstrap_retire_threshold() -> usize {
+    std::env::var("EGO_BOOTSTRAP_RETIRE_AT")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(50)
+}
+
+fn bootstrap_rejoin_floor() -> usize {
+    std::env::var("EGO_BOOTSTRAP_REJOIN_FLOOR")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(8)
+}
+
+static BOOTSTRAP_RETIRED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this node should currently propose and vote. Always true for a normal
+/// node (the env flag is unset). A bootstrap validator (EGO_BOOTSTRAP_VALIDATOR=1)
+/// validates only until the network is self-sufficient: once it sees
+/// >= EGO_BOOTSTRAP_RETIRE_AT (default 50) active nodes it retires (stops proposing
+/// and voting, drops itself from the local committee, keeps serving oracle/relay/RPC
+/// + full-node sync). It re-activates only if the active set later collapses below
+/// EGO_BOOTSTRAP_REJOIN_FLOOR (default 8) so the chain can never die.
+pub fn bootstrap_validator_active() -> bool {
+    if !is_bootstrap_validator() { return true; }
+    let active = active_node_count();
+    if BOOTSTRAP_RETIRED.load(Ordering::Relaxed) {
+        if active < bootstrap_rejoin_floor() {
+            BOOTSTRAP_RETIRED.store(false, Ordering::Relaxed);
+            tracing::warn!("[BFT] Bootstrap validator re-activating — only {} active nodes (below floor) — rejoining consensus to keep the chain alive", active);
+            return true;
+        }
+        return false;
+    }
+    if active >= bootstrap_retire_threshold() {
+        BOOTSTRAP_RETIRED.store(true, Ordering::Relaxed);
+        tracing::info!("[BFT] Bootstrap validator retiring — {} active nodes >= {} threshold — network is self-sufficient; continuing as oracle/relay/RPC + full node only", active, bootstrap_retire_threshold());
+        let local = local_validator_mutex().lock().unwrap().clone();
+        if !local.is_empty() { known_validators().remove(&local); }
+        return false;
+    }
+    true
 }
 
 static MACHINE_TO_ADDR: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -8358,6 +8419,8 @@ async fn handle_block_proposal(
         return;
     }
 
+    if !bootstrap_validator_active() { return; }
+
     let auth = verify_block_proposal_auth(&block, &proposer, &signature, &vrf_ticket);
     if auth != ProposalAuth::Valid {
         // Only ban on cryptographic / structural failure. VRF disqualification
@@ -9301,6 +9364,7 @@ async fn handle_view_change_msg(view: u64, voter: String) {
 
 pub async fn propose_block_as_leader() {
     if known_validators().is_empty() { return; }
+    if !bootstrap_validator_active() { return; }
 
     let init = tokio::task::spawn_blocking(|| {
         let miner = crate::ledger::Ledger::load().address;
@@ -9659,6 +9723,7 @@ pub fn try_proactive_proposal() -> std::pin::Pin<Box<dyn std::future::Future<Out
 /// consecutive view changes with no block — prevents chain death.
 pub async fn propose_block_as_leader_forced() {
     if known_validators().is_empty() { return; }
+    if !bootstrap_validator_active() { return; }
 
     let init = tokio::task::spawn_blocking(|| {
         let miner = crate::ledger::Ledger::load().address;
