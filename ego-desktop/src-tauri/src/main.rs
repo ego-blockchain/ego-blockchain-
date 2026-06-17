@@ -115,6 +115,10 @@ fn headless_main() {
     tracing::info!("All GUI components disabled — blockchain services only");
 
     crate::app::init_global_app_state(std::sync::Arc::new(crate::app::AppState::new()));
+    match crate::commands::auth::ensure_wallet_exists() {
+        Ok(addr) => tracing::info!("Headless wallet ready: {}", addr),
+        Err(e)   => tracing::error!("Headless wallet init failed: {}", e),
+    }
     crate::p2p::prime_ed25519_seed_cache();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
