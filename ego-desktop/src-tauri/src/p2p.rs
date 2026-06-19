@@ -171,6 +171,14 @@ pub const RELAY_NODES: &[&str] = &[
     "/dns4/relay4.egoblockchain.com/tcp/4001/p2p/12D3KooWL4v3k3nhpsXKxa44eUsggQ9rAzELeVv34Eav8qA5t9y",
 ];
 
+/// Always-on, publicly-reachable validator anchors. Unlike RELAY_NODES (circuit
+/// relays), these are dialed DIRECTLY — a stable connection that doesn't depend on
+/// relay NAT-traversal, so nodes reliably exchange validator announcements + gossip
+/// and form a quorum. A node dialing its own address here is harmlessly self-rejected.
+pub const BOOTSTRAP_PEERS: &[&str] = &[
+    "/ip4/40.233.82.42/tcp/47393/p2p/12D3KooWBJthxzWdKk4FgwKWn98oytdzr9BDnrb6MJ1LynnU3Spz",
+];
+
 fn shuffled_relay_nodes() -> Vec<&'static str> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -8196,7 +8204,28 @@ pub async fn fetch_chain_from_oracle(app: Option<&tauri::AppHandle<tauri::Wry>>)
 /// other (otherwise each runs an isolated solo chain — "Active Nodes: 1" — and
 /// transactions never cross). Pure-P2P DHT discovery alone was not bridging
 /// remote nodes; this is the reliable centralized fallback for the testnet.
+/// Dial the always-on public validator anchors directly. Cheap + idempotent —
+/// libp2p ignores a dial to an already-connected peer and self-rejects our own
+/// address, so it's safe to call on startup and on every discovery tick.
+pub async fn dial_bootstrap_peers() {
+    let Some(tx) = SWARM_TX.get() else { return };
+    let mut dialed = 0usize;
+    for ep in BOOTSTRAP_PEERS {
+        let addr: Multiaddr = match ep.parse() { Ok(a) => a, Err(_) => continue };
+        let (rtx, _rrx) = oneshot::channel();
+        if tx.send(SwarmCmd::Dial { peer_addr: addr, reply: rtx }).await.is_ok() {
+            dialed += 1;
+        }
+    }
+    if dialed > 0 {
+        eprintln!("[P2P] dialed {} direct bootstrap peer(s)", dialed);
+    }
+}
+
 pub async fn oracle_peer_discovery_tick() {
+    // Always dial the public validator anchor(s), even with EGO_NO_ORACLE — direct
+    // peering doesn't depend on the oracle.
+    dial_bootstrap_peers().await;
     if std::env::var("EGO_NO_ORACLE").is_ok() { return; }
 
     let my_ep = get_public_endpoint().await;
