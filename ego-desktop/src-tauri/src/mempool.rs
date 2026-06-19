@@ -795,9 +795,27 @@ pub async fn run_batch_loop() {
             continue;
         }
 
-        // Grace period: allow peers to discover each other via DHT before deciding we are alone
-        let is_brand_new = crate::chain_db::latest_block_info().0 < 2;
-        let settle_time = if is_brand_new { 60 } else { 15 };
+        let tip = crate::chain_db::latest_block_info().0;
+        let is_brand_new = tip < 2;
+        let allow_solo_fork = std::env::var("EGO_ALLOW_SOLO_FORK")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+        if known_count <= 1 && !is_brand_new && !allow_solo_fork
+            && crate::chain_db::chain_has_graduated_sticky(64)
+        {
+            static LAST_HOLD_LOG: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+            let now = chrono::Utc::now().timestamp();
+            if now - LAST_HOLD_LOG.swap(now, Ordering::Relaxed) > 30 {
+                tracing::warn!(
+                    "Joined a quorum-finalized chain at height {} — holding for a 2+ validator quorum instead of solo-forking (set EGO_ALLOW_SOLO_FORK=1 to override).",
+                    tip
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            last_block_at    = Instant::now();
+            batch_started_at = None;
+            continue;
+        }
+        let settle_time = if is_brand_new { 60 } else { 90 };
         if known_count <= 1 && startup_time.elapsed().as_secs() < settle_time {
             tokio::time::sleep(Duration::from_secs(2)).await;
             last_block_at    = Instant::now();

@@ -3780,7 +3780,13 @@ fn recalibrate_tx_count() {
     let cf_meta   = match db.cf_handle(CF_META)   { Some(c) => c, None => return };
     let tip = db.get_cf(cf_meta, META_LATEST_HEIGHT)
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-        
+
+    let pruned_below_early = db.get_cf(cf_meta, META_PRUNE_BELOW)
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(1);
+    if pruned_below_early > 1 {
+        return;
+    }
+
         let mut gap_height = None;
     let mut canonical: u64 = 0;
     for h in 0..=tip {
