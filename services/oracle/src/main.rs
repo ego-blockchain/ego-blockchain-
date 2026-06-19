@@ -508,6 +508,8 @@ pub struct AppState {
     /// Latest trusted state snapshot (raw JSON from a writer node) for checkpoint
     /// fast-sync. Kept in memory; the writer re-pushes it every ~100 blocks.
     pub snapshot:     Arc<RwLock<Option<serde_json::Value>>>,
+    pub blocks_cache: Arc<RwLock<Option<Arc<Vec<Value>>>>>,
+    pub txs_cache:    Arc<RwLock<Option<Arc<Vec<Value>>>>>,
 }
 
 const EGOC_USD: f64 = 0.01;
@@ -615,9 +617,30 @@ async fn handle_chain_blocks(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<ChainQuery>
 ) -> impl IntoResponse {
-    let chain = state.chain.read().await;
     let limit = q.limit.unwrap_or(500);
 
+    if q.from_height.is_none() && limit <= 500 {
+        let cached = { let c = state.blocks_cache.read().await; c.as_ref().cloned() };
+        let arc = match cached {
+            Some(a) => a,
+            None => {
+                let built: Vec<Value> = {
+                    let chain = state.chain.read().await;
+                    let mut v: Vec<Value> = chain.blocks.clone();
+                    v.sort_by_key(|b| b["height"].as_u64().unwrap_or(0));
+                    let skip = v.len().saturating_sub(500);
+                    v.into_iter().skip(skip).collect()
+                };
+                let a = Arc::new(built);
+                *state.blocks_cache.write().await = Some(a.clone());
+                a
+            }
+        };
+        let skip = arc.len().saturating_sub(limit);
+        return Json(arc.iter().skip(skip).cloned().collect::<Vec<Value>>());
+    }
+
+    let chain = state.chain.read().await;
     let mut filtered: Vec<Value> = match q.from_height {
         Some(from) => chain.blocks.iter()
             .filter(|b| b["height"].as_u64().unwrap_or(0) >= from)
@@ -640,6 +663,28 @@ async fn handle_chain_transactions(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<ChainQuery>
 ) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(500);
+
+    if q.from_height.is_none() && limit <= 500 {
+        let cached = { let c = state.txs_cache.read().await; c.as_ref().cloned() };
+        let arc = match cached {
+            Some(a) => a,
+            None => {
+                let built: Vec<Value> = {
+                    let chain = state.chain.read().await;
+                    let mut v: Vec<Value> = chain.transactions.clone();
+                    v.sort_by_key(|t| std::cmp::Reverse(t["block_height"].as_u64().unwrap_or(0)));
+                    v.truncate(500);
+                    v
+                };
+                let a = Arc::new(built);
+                *state.txs_cache.write().await = Some(a.clone());
+                a
+            }
+        };
+        return Json(arc.iter().take(limit).cloned().collect::<Vec<Value>>());
+    }
+
     let chain = state.chain.read().await;
     let from = q.from_height.unwrap_or(0);
     let mut filtered: Vec<Value> = chain.transactions.iter()
@@ -647,7 +692,7 @@ async fn handle_chain_transactions(
         .cloned()
         .collect();
     filtered.sort_by_key(|t| std::cmp::Reverse(t["block_height"].as_u64().unwrap_or(0)));
-    filtered.truncate(q.limit.unwrap_or(500));
+    filtered.truncate(limit);
     Json(filtered)
 }
 
@@ -715,6 +760,8 @@ async fn handle_chain_submit(
 
     let snapshot = chain.clone();
     drop(chain);
+    *state.blocks_cache.write().await = None;
+    *state.txs_cache.write().await = None;
     tokio::task::spawn_blocking(move || save_chain(&snapshot));
 
     let chain = state.chain.read().await;
@@ -992,12 +1039,21 @@ async fn handle_post_challenges(Path(_addr): Path<String>) -> impl IntoResponse 
 
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     let prices = state.prices.read().await;
-    let chain  = state.chain.read().await;
     let last_update = prices.values().map(|e| e.updated_at).max().unwrap_or(0);
-    let tip = chain.blocks.iter().map(|b| b["height"].as_u64().unwrap_or(0)).max().unwrap_or(0);
+    let prices_count = prices.len();
+    drop(prices);
+
+    let cached_tip = {
+        let bc = state.blocks_cache.read().await;
+        bc.as_ref().and_then(|b| b.last()).and_then(|x| x["height"].as_u64())
+    };
+    let chain = state.chain.read().await;
+    let tip = cached_tip.unwrap_or_else(|| {
+        chain.blocks.iter().map(|b| b["height"].as_u64().unwrap_or(0)).max().unwrap_or(0)
+    });
     Json(json!({
         "status":       "ok",
-        "prices_count": prices.len(),
+        "prices_count": prices_count,
         "last_update":  last_update,
         "chain_blocks": chain.blocks.len(),
         "chain_tip":    tip,
@@ -1039,6 +1095,8 @@ async fn main() {
         post_rate_limit: Arc::new(RwLock::new(HashMap::new())),
         submit_token:    std::env::var("ORACLE_SUBMIT_TOKEN").ok().filter(|s| !s.trim().is_empty()),
         snapshot:        Arc::new(RwLock::new(None)),
+        blocks_cache:    Arc::new(RwLock::new(None)),
+        txs_cache:       Arc::new(RwLock::new(None)),
     };
     if state.submit_token.is_none() {
         error!("SECURITY: ORACLE_SUBMIT_TOKEN is not set — /chain/submit is UNAUTHENTICATED. \
