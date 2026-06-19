@@ -518,10 +518,17 @@ pub async fn get_transaction_history(
                 continue;
             }
 
-            // ENFORCE PRIVACY: Mask addresses for shielded or high-value transfers
             if tx.is_private || tx.amount >= SHIELD_THRESHOLD_UEGOC || tx.from == "Shielded" || tx.to == "Shielded" {
-                tx.from = "Shielded".to_string();
-                tx.to   = "Shielded".to_string();
+                let i_am_sender   = tx.from == my_addr;
+                let i_am_receiver = tx.to   == my_addr;
+                if i_am_sender && !i_am_receiver {
+                    tx.to = "Shielded".to_string();
+                } else if i_am_receiver && !i_am_sender {
+                    tx.from = "Shielded".to_string();
+                } else {
+                    tx.from = "Shielded".to_string();
+                    tx.to   = "Shielded".to_string();
+                }
                 tx.memo = Some("Privacy Protected".to_string());
             }
 
@@ -562,10 +569,15 @@ pub async fn get_transaction_history(
             if (tx.from == my_addr || tx.to == my_addr) && !confirmed_hashes.contains(&tx.hash) {
                 let is_receiver = tx.to == my_addr && tx.from != my_addr;
                 
-                // ENFORCE PRIVACY for pending transactions
                 if tx.is_private || tx.amount >= SHIELD_THRESHOLD_UEGOC {
-                    tx.from = "Shielded".to_string();
-                    tx.to   = "Shielded".to_string();
+                    if tx.from == my_addr && tx.to != my_addr {
+                        tx.to = "Shielded".to_string();
+                    } else if tx.to == my_addr && tx.from != my_addr {
+                        tx.from = "Shielded".to_string();
+                    } else {
+                        tx.from = "Shielded".to_string();
+                        tx.to   = "Shielded".to_string();
+                    }
                     tx.memo = Some("Privacy Protected".to_string());
                 }
 

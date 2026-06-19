@@ -2015,6 +2015,11 @@ pub fn import_state_snapshot(snap: &StateSnapshot) -> Result<(), String> {
                 let vb = hex::decode(v).map_err(|e| format!("bad meta val: {e}"))?;
                 batch.put_cf(cf, &kb, &vb);
             }
+            // A fast-synced node intentionally lacks blocks 1..window_start. Mark
+            // that range pruned so tx-count recalibration trusts the snapshot's
+            // META_TX_COUNT instead of erroring on the (expected) gap.
+            let prune_below = snap.blocks.iter().map(|b| b.height).min().unwrap_or(snap.height).max(1);
+            batch.put_cf(cf, META_PRUNE_BELOW, &u64_le(prune_below));
         }
         db.write(batch).map_err(|e| format!("snapshot write: {e}"))?;
     }

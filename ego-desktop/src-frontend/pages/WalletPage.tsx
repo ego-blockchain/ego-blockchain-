@@ -1369,7 +1369,7 @@ const WalletPage: React.FC = () => {
                     </div>
                     <div className="min-w-0">
                       <div className="text-sm font-mono text-gray-300 truncate">
-                        {tx.is_private ? <span className="text-yellow-400 font-bold">Shielded Transaction</span> : (isReward ? rewardLabel : shortHash(tx.hash))}
+                        {tx.is_private ? <span className="text-yellow-400 font-bold">Shielded · {isSent ? 'Sent' : 'Received'}</span> : (isReward ? rewardLabel : shortHash(tx.hash))}
                       </div>
                       <div className="text-xs text-gray-500">
                         {isReward
