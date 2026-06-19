@@ -1277,6 +1277,7 @@ fn validate_unique_identity(addr: &str, machine_id: &str, endpoint: &str) -> Res
     if machine_id.is_empty() { return Ok(()); }
     
     let ip = endpoint.split('/').nth(2).unwrap_or("");
+    let is_relayed = endpoint.contains("p2p-circuit");
     let is_local = ip == "127.0.0.1" || ip.is_empty()
         || ip.starts_with("192.168.")
         || ip.starts_with("10.")
@@ -1297,7 +1298,7 @@ fn validate_unique_identity(addr: &str, machine_id: &str, endpoint: &str) -> Res
     // Validate IP uniqueness to prevent "echo" faking
     if !endpoint.is_empty() {
         let mut ip_map = IP_TO_ADDR.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-        if !is_local {
+        if !is_local && !is_relayed {
             if let Some(existing_addr) = ip_map.get(ip) {
                 if existing_addr != addr {
                     return Err(format!("IP address {} is already running node {}", ip, existing_addr));
@@ -5149,6 +5150,7 @@ async fn handle_event(
                         let block_hash = block.hash.clone();
                         let height     = block.height;
                         let app2 = app.cloned();
+                        let source_pid = propagation_source.to_string();
                         // If the producer's block arrived without a QC, build one from the
                         // vote signatures this node collected and attach it before the first
                         // persist — write_block_batch is idempotent on hash, so a block can
@@ -5156,6 +5158,15 @@ async fn handle_event(
                         // process_inbound_qc_finalization, which clears pending_bls_sigs.
                         attach_local_qc_if_missing(&mut block);
                         tokio::spawn(async move {
+                            let local_tip = tokio::task::spawn_blocking(|| crate::chain_db::latest_block_info().0).await.unwrap_or(0);
+                            if height > local_tip + 1 {
+                                static LAST_GAP_REQ: AtomicI64 = AtomicI64::new(0);
+                                let now = Utc::now().timestamp_millis();
+                                if now - LAST_GAP_REQ.load(Ordering::Relaxed) > 2000 {
+                                    LAST_GAP_REQ.store(now, Ordering::Relaxed);
+                                    request_gap_backfill(local_tip, &source_pid).await;
+                                }
+                            }
                             if process_inbound_qc_finalization(&block_hash, height, &votes, &agg_bls_sig, &bls_pubkeys) {
                                 merge_remote_chain_trusted(vec![block], transactions, app2.as_ref()).await;
                             }
@@ -7594,6 +7605,20 @@ fn handle_governance_tx(tx: &LedgerTx) {
     }
 }
 
+async fn request_gap_backfill(from_height: u64, source_peer_id: &str) {
+    let my_endpoint = get_public_endpoint().await;
+    let msg = P2PMessage::ChainSyncRequest { requester_endpoint: my_endpoint, from_height };
+    for ep in load_peer_cache().into_iter().map(|p| p.endpoint) {
+        if !ep.is_empty() && ep.contains(source_peer_id) {
+            let _ = send_message(&ep, &msg).await;
+            return;
+        }
+    }
+    if let Ok(data) = serde_json::to_vec(&msg) {
+        publish_gossip("ego-sync-v1", data).await;
+    }
+}
+
 async fn merge_remote_chain(
     blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: Option<&tauri::AppHandle<tauri::Wry>>,
 ) {
@@ -8031,8 +8056,21 @@ async fn merge_remote_chain_inner(
             let _ = h.emit_all("ego://chain-updated", ());
         }
         tokio::spawn(try_proactive_proposal());
+
+        if is_oracle_writer() {
+            let tip_h = crate::chain_db::latest_block_info().0;
+            tokio::spawn(async move {
+                let fetched = tokio::task::spawn_blocking(move || {
+                    crate::chain_db::get_block_by_height(tip_h)
+                        .map(|b| (b, crate::chain_db::get_txs_for_block(tip_h)))
+                }).await.ok().flatten();
+                if let Some((b, txs)) = fetched {
+                    push_block_to_oracle(&b, &txs).await;
+                }
+            });
+        }
     }
-    
+
     if peer_ahead || received_full_chunk {
         tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;

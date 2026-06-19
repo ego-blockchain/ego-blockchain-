@@ -1602,6 +1602,26 @@ pub fn paged_blocks(offset: usize, limit: usize) -> Vec<LedgerBlock> {
     out
 }
 
+pub fn local_block_count() -> usize {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf) = db.cf_handle(CF_BLOCKS) else { return 0; };
+    let mut iter = db.raw_iterator_cf(cf);
+    iter.seek_to_first();
+    let mut n = 0usize;
+    while iter.valid() && n < 100_000 { n += 1; iter.next(); }
+    n
+}
+
+pub fn local_tx_count() -> usize {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf) = db.cf_handle(CF_RECENT_TXS) else { return 0; };
+    let mut iter = db.raw_iterator_cf(cf);
+    iter.seek_to_first();
+    let mut n = 0usize;
+    while iter.valid() && n < 100_000 { n += 1; iter.next(); }
+    n
+}
+
 pub fn local_chain_height() -> u64 {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let Some(cf) = db.cf_handle(CF_BLOCKS) else { return 0; };

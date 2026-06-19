@@ -47,6 +47,8 @@ interface NetworkStats {
   latest_block: number;
   total_transactions: number;
   total_files_stored: number;
+  local_blocks: number;
+  local_transactions: number;
   node_count: number;
   network: string;
 }
@@ -201,6 +203,8 @@ const ExplorerPage: React.FC = () => {
 
   const totalBlocks = netStats?.latest_block ?? blocks.length;
   const totalTxs    = netStats?.total_transactions ?? txs.length;
+  const localBlocks = netStats?.local_blocks ?? blocks.length;
+  const localTxs    = netStats?.local_transactions ?? txs.length;
 
   const tabs: { key: Tab; label: string; count: number }[] = [
     { key: 'blocks',     label: '🧱 Blocks',       count: totalBlocks        },
@@ -251,6 +255,13 @@ const ExplorerPage: React.FC = () => {
         >
           ↻
         </button>
+      </div>
+
+      <div className="flex items-start gap-2.5 bg-blue-500/5 border border-blue-500/20 rounded-xl px-4 py-3 text-xs text-gray-400 leading-relaxed">
+        <span className="text-blue-400 text-sm leading-none mt-0.5">ℹ️</span>
+        <span>
+          Ego Desktop is a full <span className="text-gray-200 font-medium">miner, validator, and storage/compute node</span> — it keeps the complete account state and the recent blocks it needs to produce and verify blocks, but not the entire historical archive. Storing every past block on every device won&apos;t scale as the chain grows — <span className="text-gray-200 font-medium">sharding</span> will distribute archival history across the network. So this Explorer shows recent activity this node has synced; the counters above are <span className="text-gray-200 font-medium">network-wide totals</span> and can exceed the rows listed. For complete history, open <span className="text-gray-200 font-medium">EgoScan</span> (the web explorer) at egoblockchain.com.
+        </span>
       </div>
 
       {}
@@ -323,7 +334,7 @@ const ExplorerPage: React.FC = () => {
                   </tbody>
                 </table>
               </div>
-              <Pagination total={totalBlocks} page={blockPage} pageSize={pageSize} onPage={setBlockPage} onPageSize={ps => { setPageSize(ps); setBlockPage(1); }} />
+              <Pagination total={localBlocks} page={blockPage} pageSize={pageSize} onPage={setBlockPage} onPageSize={ps => { setPageSize(ps); setBlockPage(1); }} />
             </>
           )
 
@@ -402,7 +413,7 @@ const ExplorerPage: React.FC = () => {
                   </tbody>
                 </table>
               </div>
-              <Pagination total={totalTxs} page={txPage} pageSize={pageSize} onPage={setTxPage} onPageSize={ps => { setPageSize(ps); setTxPage(1); }} />
+              <Pagination total={localTxs} page={txPage} pageSize={pageSize} onPage={setTxPage} onPageSize={ps => { setPageSize(ps); setTxPage(1); }} />
             </>
           )
 

@@ -796,7 +796,12 @@ fn main() {
                 let mut last_tick_wall = std::time::SystemTime::now();
 
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    for _ in 0..6 {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        if !no_oracle && crate::p2p::ORACLE_GAP_FILL_NEEDED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                            crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)).await;
+                        }
+                    }
                     loop_tick = loop_tick.wrapping_add(1);
 
                     let now_wall = std::time::SystemTime::now();
