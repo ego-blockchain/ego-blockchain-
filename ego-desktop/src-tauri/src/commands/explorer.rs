@@ -24,6 +24,9 @@ pub struct NetworkStats {
     pub total_transactions: usize,
     pub total_files_stored: usize,
 
+    pub local_blocks: usize,
+    pub local_transactions: usize,
+
     pub node_count: u32,
     pub network: String,
 }
@@ -49,6 +52,8 @@ pub async fn get_network_stats() -> Result<NetworkStats, EgoDesktopError> {
             latest_block: latest_height,
             total_transactions: crate::chain_db::tx_count() as usize,
             total_files_stored: seen_cids.len(),
+            local_blocks: crate::chain_db::local_block_count(),
+            local_transactions: crate::chain_db::local_tx_count(),
             node_count: node_count.max(1),
             network: "Ego Testnet".into(),
         })
