@@ -486,6 +486,37 @@ fn save_chain(chain: &ChainState) {
     }
 }
 
+/// Sibling of the chain file: the trusted fast-sync snapshot. Persisted so an
+/// oracle restart never strands joining nodes (no snapshot → fresh nodes can't
+/// jump to tip and can't paginate genesis→tip because early blocks are pruned).
+fn snapshot_data_path() -> std::path::PathBuf {
+    chain_data_path().with_file_name("snapshot.json")
+}
+
+fn load_snapshot() -> Option<serde_json::Value> {
+    let data = std::fs::read_to_string(snapshot_data_path()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let h = v.get("height").and_then(|x| x.as_u64()).unwrap_or(0);
+    if h == 0 { return None; }
+    info!("Loaded fast-sync snapshot from disk at height {}", h);
+    Some(v)
+}
+
+fn save_snapshot(snap: &serde_json::Value) {
+    let path = snapshot_data_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(data) = serde_json::to_string(snap) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &data).is_ok() {
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                error!("Snapshot persistence FAILED: cannot rename into {}: {}", path.display(), e);
+            }
+        }
+    }
+}
+
 // ── App state ──────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -844,7 +875,9 @@ async fn handle_snapshot_submit(
     let mut snap = state.snapshot.write().await;
     let cur_h = snap.as_ref().and_then(|s| s.get("height")).and_then(|v| v.as_u64()).unwrap_or(0);
     if new_h >= cur_h {
-        *snap = Some(payload);
+        *snap = Some(payload.clone());
+        drop(snap);
+        tokio::task::spawn_blocking(move || save_snapshot(&payload));
     }
     (StatusCode::OK, Json(json!({ "ok": true, "height": new_h.max(cur_h) })))
 }
@@ -1096,7 +1129,7 @@ async fn main() {
         post_approvals:  Arc::new(RwLock::new(HashMap::new())),
         post_rate_limit: Arc::new(RwLock::new(HashMap::new())),
         submit_token:    std::env::var("ORACLE_SUBMIT_TOKEN").ok().filter(|s| !s.trim().is_empty()),
-        snapshot:        Arc::new(RwLock::new(None)),
+        snapshot:        Arc::new(RwLock::new(load_snapshot())),
         blocks_cache:    Arc::new(RwLock::new(None)),
         txs_cache:       Arc::new(RwLock::new(None)),
         chain_dirty:     Arc::new(std::sync::atomic::AtomicBool::new(false)),
