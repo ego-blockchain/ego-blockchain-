@@ -641,20 +641,19 @@ async fn handle_chain_blocks(
     }
 
     let chain = state.chain.read().await;
-    let mut filtered: Vec<Value> = match q.from_height {
+    let mut refs: Vec<&Value> = match q.from_height {
         Some(from) => chain.blocks.iter()
             .filter(|b| b["height"].as_u64().unwrap_or(0) >= from)
-            .cloned()
             .collect(),
-        None => chain.blocks.iter().cloned().collect(),
+        None => chain.blocks.iter().collect(),
     };
-    filtered.sort_by_key(|b| b["height"].as_u64().unwrap_or(0));
+    refs.sort_by_key(|b| b["height"].as_u64().unwrap_or(0));
 
     let out: Vec<Value> = if q.from_height.is_some() {
-        filtered.into_iter().take(limit).collect()
+        refs.iter().take(limit).map(|b| (*b).clone()).collect()
     } else {
-        let skip = filtered.len().saturating_sub(limit);
-        filtered.into_iter().skip(skip).collect()
+        let skip = refs.len().saturating_sub(limit);
+        refs.iter().skip(skip).map(|b| (*b).clone()).collect()
     };
     Json(out)
 }
@@ -686,13 +685,12 @@ async fn handle_chain_transactions(
 
     let chain = state.chain.read().await;
     let from = q.from_height.unwrap_or(0);
-    let mut filtered: Vec<Value> = chain.transactions.iter()
+    let mut refs: Vec<&Value> = chain.transactions.iter()
         .filter(|t| t["block_height"].as_u64().unwrap_or(0) >= from)
-        .cloned()
         .collect();
-    filtered.sort_by_key(|t| std::cmp::Reverse(t["block_height"].as_u64().unwrap_or(0)));
-    filtered.truncate(limit);
-    Json(filtered)
+    refs.sort_by_key(|t| t["block_height"].as_u64().unwrap_or(0));
+    let out: Vec<Value> = refs.iter().take(limit).map(|t| (*t).clone()).collect();
+    Json(out)
 }
 
 #[derive(Deserialize)]
