@@ -114,10 +114,6 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          EGO_AI_KEY: ${{ secrets.EGO_AI_KEY }}
-          EGO_SMTP_HOST: ${{ secrets.EGO_SMTP_HOST }}
-          EGO_SMTP_USER: ${{ secrets.EGO_SMTP_USER }}
-          EGO_SMTP_PASS: ${{ secrets.EGO_SMTP_PASS }}
           STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -165,10 +161,6 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          EGO_AI_KEY: ${{ secrets.EGO_AI_KEY }}
-          EGO_SMTP_HOST: ${{ secrets.EGO_SMTP_HOST }}
-          EGO_SMTP_USER: ${{ secrets.EGO_SMTP_USER }}
-          EGO_SMTP_PASS: ${{ secrets.EGO_SMTP_PASS }}
           STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -264,10 +256,6 @@ jobs:
       - name: Build Tauri app
         working-directory: ego-desktop
         env:
-          EGO_AI_KEY: ${{ secrets.EGO_AI_KEY }}
-          EGO_SMTP_HOST: ${{ secrets.EGO_SMTP_HOST }}
-          EGO_SMTP_USER: ${{ secrets.EGO_SMTP_USER }}
-          EGO_SMTP_PASS: ${{ secrets.EGO_SMTP_PASS }}
           STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
         run: npx tauri build
 
