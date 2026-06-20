@@ -1151,9 +1151,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     // so the Explorer pagination matches the visible user transactions.
     let mut real_user_txs = 0u64;
     for tx in &confirmed_txs {
-        let is_system = tx.from == NODE_POOL_ADDR 
-            && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward");
-        if !is_system {
+        if !is_protocol_tx(tx) {
             real_user_txs += 1;
         }
     }
@@ -1615,10 +1613,24 @@ pub fn local_block_count() -> usize {
 pub fn local_tx_count() -> usize {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let Some(cf) = db.cf_handle(CF_RECENT_TXS) else { return 0; };
+    let Some(cf_txs) = db.cf_handle(CF_TXS) else { return 0; };
     let mut iter = db.raw_iterator_cf(cf);
     iter.seek_to_first();
     let mut n = 0usize;
-    while iter.valid() && n < 100_000 { n += 1; iter.next(); }
+    let mut scanned = 0usize;
+    while iter.valid() && scanned < 100_000 {
+        scanned += 1;
+        if let Some(k) = iter.key() {
+            if k.len() > 8 {
+                if let Some(v) = db.get_cf(cf_txs, &k[8..]).ok().flatten() {
+                    if let Some(tx) = decode::<LedgerTx>(&v) {
+                        if !is_protocol_tx(&tx) { n += 1; }
+                    }
+                }
+            }
+        }
+        iter.next();
+    }
     n
 }
 
@@ -1691,6 +1703,19 @@ pub fn recent_transactions(limit: usize) -> Vec<LedgerTx> {
     paged_transactions(0, limit)
 }
 
+pub fn is_protocol_tx(tx: &LedgerTx) -> bool {
+    if tx.from == NODE_POOL_ADDR
+        && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward") {
+        return true;
+    }
+    if matches!(tx.tx_type.as_str(),
+        "validator_register" | "governance" | "stake" | "unstake"
+        | "slash" | "slash_storage" | "post_proof" | "equivocation_proof") {
+        return true;
+    }
+    !tx.from.is_empty() && tx.from == tx.to
+}
+
 pub fn paged_transactions(offset: usize, limit: usize) -> Vec<LedgerTx> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let Some(cf_recent) = db.cf_handle(CF_RECENT_TXS) else { return vec![]; };
@@ -1699,18 +1724,22 @@ pub fn paged_transactions(offset: usize, limit: usize) -> Vec<LedgerTx> {
     iter.seek_to_last();
     let mut skipped = 0usize;
     let mut out = Vec::with_capacity(limit);
-    
+
     while iter.valid() && out.len() < limit {
         if let Some(k) = iter.key() {
             if k.len() > 8 {
                 let tx_hash = &k[8..];
                 if let Some(v) = db.get_cf(cf_txs, tx_hash).ok().flatten() {
                     if let Some(mut tx) = decode::<LedgerTx>(&v) {
-                        if skipped < offset { 
-                            skipped += 1; 
-                        } else { 
+                        if is_protocol_tx(&tx) {
+                            iter.prev();
+                            continue;
+                        }
+                        if skipped < offset {
+                            skipped += 1;
+                        } else {
                             tx.status = "Confirmed".to_string();
-                            out.push(tx); 
+                            out.push(tx);
                         }
                     }
                 }
