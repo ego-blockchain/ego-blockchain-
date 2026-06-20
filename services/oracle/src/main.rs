@@ -626,10 +626,10 @@ async fn handle_chain_blocks(
             None => {
                 let built: Vec<Value> = {
                     let chain = state.chain.read().await;
-                    let mut v: Vec<Value> = chain.blocks.clone();
-                    v.sort_by_key(|b| b["height"].as_u64().unwrap_or(0));
-                    let skip = v.len().saturating_sub(500);
-                    v.into_iter().skip(skip).collect()
+                    let mut refs: Vec<&Value> = chain.blocks.iter().collect();
+                    refs.sort_by_key(|b| b["height"].as_u64().unwrap_or(0));
+                    let start = refs.len().saturating_sub(500);
+                    refs[start..].iter().map(|b| (*b).clone()).collect()
                 };
                 let a = Arc::new(built);
                 *state.blocks_cache.write().await = Some(a.clone());
@@ -672,10 +672,9 @@ async fn handle_chain_transactions(
             None => {
                 let built: Vec<Value> = {
                     let chain = state.chain.read().await;
-                    let mut v: Vec<Value> = chain.transactions.clone();
-                    v.sort_by_key(|t| std::cmp::Reverse(t["block_height"].as_u64().unwrap_or(0)));
-                    v.truncate(500);
-                    v
+                    let mut refs: Vec<&Value> = chain.transactions.iter().collect();
+                    refs.sort_by_key(|t| std::cmp::Reverse(t["block_height"].as_u64().unwrap_or(0)));
+                    refs.iter().take(500).map(|t| (*t).clone()).collect()
                 };
                 let a = Arc::new(built);
                 *state.txs_cache.write().await = Some(a.clone());
