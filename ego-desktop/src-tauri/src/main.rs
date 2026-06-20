@@ -795,11 +795,24 @@ fn main() {
 
                 let mut last_tick_wall = std::time::SystemTime::now();
 
+                // Every network call below is bounded so one hung P2P/DHT/relay
+                // request can never stall the loop for minutes. A stalled loop
+                // used to trip the wall-clock "wake-from-sleep" heuristic, which
+                // then fired an even more expensive re-sync — a runaway spiral
+                // that left the node solo-forking instead of following the chain.
+                macro_rules! bounded {
+                    ($secs:expr, $fut:expr) => {
+                        if tokio::time::timeout(std::time::Duration::from_secs($secs), $fut).await.is_err() {
+                            tracing::warn!("loop step timed out after {}s (skipping, will retry next tick)", $secs);
+                        }
+                    };
+                }
+
                 loop {
                     for _ in 0..6 {
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         if !no_oracle && crate::p2p::ORACLE_GAP_FILL_NEEDED.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                            crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)).await;
+                            bounded!(20, crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)));
                         }
                     }
                     loop_tick = loop_tick.wrapping_add(1);
@@ -807,19 +820,22 @@ fn main() {
                     let now_wall = std::time::SystemTime::now();
                     let wall_elapsed = now_wall.duration_since(last_tick_wall).unwrap_or_default().as_secs();
                     last_tick_wall = now_wall;
-                    if wall_elapsed > 60 {
+                    // Only treat a large gap as a genuine suspend/resume — with the
+                    // bounded calls below the loop can no longer drift past ~60s on
+                    // its own, so a gap this big really is a sleep/hibernate.
+                    if wall_elapsed > 120 {
                         tracing::info!("Wake-from-sleep detected ({}s gap) — reconnecting P2P", wall_elapsed);
-                        
+
                         if !no_oracle {
                             tracing::info!("Fetching latest state from Explorer RPC for fast-sync...");
-                            crate::p2p::fast_sync_from_oracle_if_behind().await;
-                            crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)).await;
+                            bounded!(20, crate::p2p::fast_sync_from_oracle_if_behind());
+                            bounded!(20, crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)));
                         }
-                        
-                        crate::p2p::restore_dht_cache().await;
-                        crate::p2p::dht_discover_peers().await;
-                        crate::p2p::oracle_peer_discovery_tick().await;
-                        crate::p2p::register_with_relay_as_ego_node().await;
+
+                        bounded!(15, crate::p2p::restore_dht_cache());
+                        bounded!(15, crate::p2p::dht_discover_peers());
+                        bounded!(15, crate::p2p::oracle_peer_discovery_tick());
+                        bounded!(15, crate::p2p::register_with_relay_as_ego_node());
                         crate::p2p::touch_proposal_timestamp();
                     }
 
@@ -828,43 +844,43 @@ fn main() {
 
                     let gap_fill = crate::p2p::ORACLE_GAP_FILL_NEEDED.swap(false, std::sync::atomic::Ordering::Relaxed);
                     if use_oracle || gap_fill {
-                        crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)).await;
+                        bounded!(20, crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)));
                     }
-                    crate::p2p::broadcast_peer_announce(Some(&handle_startup)).await;
-                    crate::p2p::sync_chain_from_peers().await;
-                    crate::p2p::dht_discover_relays().await;
+                    bounded!(15, crate::p2p::broadcast_peer_announce(Some(&handle_startup)));
+                    bounded!(15, crate::p2p::sync_chain_from_peers());
+                    bounded!(15, crate::p2p::dht_discover_relays());
 
                     let my_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
                         .await.unwrap_or_default();
                     if !my_addr.is_empty() {
-                        crate::commands::messenger::poll_relay_inbox(&my_addr, Some(&handle_startup)).await;
+                        bounded!(15, crate::commands::messenger::poll_relay_inbox(&my_addr, Some(&handle_startup)));
                     }
 
-                    crate::p2p::fetch_and_cache_egoc_price().await;
+                    bounded!(15, crate::p2p::fetch_and_cache_egoc_price());
 
-                    crate::commands::outbox::flush_pending().await;
+                    bounded!(15, crate::commands::outbox::flush_pending());
 
-                    crate::p2p::check_file_replication().await;
+                    bounded!(20, crate::p2p::check_file_replication());
 
-                    crate::commands::compute::compute_node_heartbeat().await;
+                    bounded!(15, crate::commands::compute::compute_node_heartbeat());
 
                     if loop_tick % POST_EVERY_N_TICKS == 1 {
-                        crate::proof::run_post_checks(Some(&handle_startup)).await;
+                        bounded!(30, crate::proof::run_post_checks(Some(&handle_startup)));
                     }
 
                     let shard_peers = crate::p2p::get_known_peers();
                     let ledger_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
                         .await.unwrap_or_default();
                     let endpoint = crate::p2p::get_public_endpoint().await;
-                    crate::sharding::run_shard_startup(&ledger_addr, &endpoint, &shard_peers, 0).await;
-                    crate::p2p::broadcast_shard_announce().await;
-                    crate::sharding::check_master_health(&ledger_addr, &endpoint, 0).await;
+                    bounded!(20, crate::sharding::run_shard_startup(&ledger_addr, &endpoint, &shard_peers, 0));
+                    bounded!(15, crate::p2p::broadcast_shard_announce());
+                    bounded!(15, crate::sharding::check_master_health(&ledger_addr, &endpoint, 0));
 
-                    crate::p2p::push_shard_data_to_slaves().await;
+                    bounded!(20, crate::p2p::push_shard_data_to_slaves());
 
                     let ep3 = crate::p2p::get_public_endpoint().await;
-                    crate::p2p::dht_publish_shard_assignments(&ledger_addr, &ep3).await;
-                    crate::p2p::broadcast_vacancy_notices().await;
+                    bounded!(15, crate::p2p::dht_publish_shard_assignments(&ledger_addr, &ep3));
+                    bounded!(15, crate::p2p::broadcast_vacancy_notices());
                     crate::sharding::prune_observer_shards(&ledger_addr);
                 }
             });
