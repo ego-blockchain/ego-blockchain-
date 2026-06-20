@@ -510,6 +510,9 @@ pub struct AppState {
     pub snapshot:     Arc<RwLock<Option<serde_json::Value>>>,
     pub blocks_cache: Arc<RwLock<Option<Arc<Vec<Value>>>>>,
     pub txs_cache:    Arc<RwLock<Option<Arc<Vec<Value>>>>>,
+    /// Set on every submit; a background task debounces the expensive full-chain
+    /// clone+save to disk so it never runs under the request's write lock.
+    pub chain_dirty:  Arc<std::sync::atomic::AtomicBool>,
 }
 
 const EGOC_USD: f64 = 0.01;
@@ -755,14 +758,16 @@ async fn handle_chain_submit(
     }
     chain.merge_txs(payload.transactions);
 
-    let snapshot = chain.clone();
+    let nblocks = chain.blocks.len();
+    let ntxs = chain.transactions.len();
     drop(chain);
     *state.blocks_cache.write().await = None;
     *state.txs_cache.write().await = None;
-    tokio::task::spawn_blocking(move || save_chain(&snapshot));
+    // Persistence is debounced (see the saver task in main) — never clone the
+    // whole chain under the write lock here, or /health and submits starve.
+    state.chain_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
 
-    let chain = state.chain.read().await;
-    (StatusCode::OK, Json(json!({ "ok": true, "blocks": chain.blocks.len(), "txs": chain.transactions.len() })))
+    (StatusCode::OK, Json(json!({ "ok": true, "blocks": nblocks, "txs": ntxs })))
 }
 
 // ── Handlers: hosting node registry ──────────────────────────────────────
@@ -1094,6 +1099,7 @@ async fn main() {
         snapshot:        Arc::new(RwLock::new(None)),
         blocks_cache:    Arc::new(RwLock::new(None)),
         txs_cache:       Arc::new(RwLock::new(None)),
+        chain_dirty:     Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     if state.submit_token.is_none() {
         error!("SECURITY: ORACLE_SUBMIT_TOKEN is not set — /chain/submit is UNAUTHENTICATED. \
@@ -1103,6 +1109,22 @@ async fn main() {
     }
 
     tokio::spawn(price_refresh_task(state.clone()));
+
+    // Debounced persistence: clone+save the chain at most once every few seconds,
+    // and only the clone runs under a (shared) read lock — never blocking /health
+    // or submits the way a per-submit clone-under-write-lock did.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if state.chain_dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    let snapshot = { state.chain.read().await.clone() };
+                    let _ = tokio::task::spawn_blocking(move || save_chain(&snapshot)).await;
+                }
+            }
+        });
+    }
 
     let relay_ip_str = std::env::var("RELAY_PUBLIC_IP").unwrap_or_else(|_| "127.0.0.1".to_string());
     let dns_upstream  = std::env::var("DNS_UPSTREAM").unwrap_or_else(|_| "8.8.8.8:53".to_string());
