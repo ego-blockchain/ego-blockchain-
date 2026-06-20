@@ -131,9 +131,12 @@ jobs:
           prerelease: false
 
   # ── macOS Intel (x64 cross-compiled from Apple Silicon) ──────────────────
+  # GitHub no longer provisions the free hosted macos-13 (Intel) runner, so that
+  # label queues forever. Build Intel by cross-compiling on macos-latest (Apple
+  # Silicon) via --target x86_64-apple-darwin; DMG packaging is arch-independent.
   build-macos-intel:
     name: macOS Intel
-    runs-on: macos-13
+    runs-on: macos-latest
     permissions:
       contents: write
 
