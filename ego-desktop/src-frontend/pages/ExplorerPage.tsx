@@ -75,6 +75,23 @@ function timeAgo(ts: number) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
+// Absolute block/tx times are shown in San Francisco time (US Pacific) so the
+// chain has one canonical clock regardless of the viewer's location.
+// timeZoneName:'short' appends PST/PDT so users know the zone.
+function sfTime(ts: number) {
+  if (!ts) return '—';
+  try {
+    return new Date(ts * 1000).toLocaleString('en-US', {
+      timeZone: 'America/Los_Angeles',
+      year: 'numeric', month: 'short', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      timeZoneName: 'short',
+    });
+  } catch {
+    return new Date(ts * 1000).toLocaleString();
+  }
+}
+
 interface EmissionPool { cap_uegoc: number; pct: number; }
 interface Tokenomics {
   total_supply_egoc:          number;
@@ -585,7 +602,7 @@ const ExplorerPage: React.FC = () => {
                 { label: 'Height',       val: `#${selectedBlock.height.toLocaleString()}` },
                 { label: 'Hash',         val: selectedBlock.hash,      mono: true },
                 { label: 'Prev Hash',    val: selectedBlock.prev_hash, mono: true },
-                { label: 'Timestamp',    val: new Date(selectedBlock.timestamp * 1000).toLocaleString() },
+                { label: 'Timestamp',    val: sfTime(selectedBlock.timestamp) },
                 { label: 'Miner',        val: selectedBlock.miner,     mono: true },
                 { label: 'Reward',       val: `${(selectedBlock.reward / 1_000_000).toFixed(3)} EGOC` },
                 { label: 'Transactions', val: String(selectedBlock.tx_count) },
@@ -635,7 +652,7 @@ const ExplorerPage: React.FC = () => {
                 { label: 'Amount',    val: `${(selectedTx.amount / 1_000_000).toFixed(6)} EGOC` },
                 { label: 'Fee',       val: selectedTx.fee_uegoc && selectedTx.fee_uegoc > 0 ? `${(selectedTx.fee_uegoc / 1_000_000).toFixed(6)} EGOC` : '0 EGOC' },
                 { label: 'Nonce',     val: String(selectedTx.nonce) },
-                { label: 'Timestamp', val: new Date(selectedTx.timestamp * 1000).toLocaleString() },
+                { label: 'Timestamp', val: sfTime(selectedTx.timestamp) },
                 { label: 'Signature', val: selectedTx.signature.slice(0, 32) + '…', mono: true },
                 ...(selectedTx.memo ? [{ label: 'Memo', val: selectedTx.memo }] : []),
               ].map(({ label, val, mono }) => (

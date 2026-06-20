@@ -238,6 +238,22 @@ function timeAgo(ts: number) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
+// Transaction times are shown in San Francisco time (US Pacific) — one canonical
+// chain clock for everyone. timeZoneName:'short' appends PST/PDT.
+function sfTime(ts: number) {
+  if (!ts) return '—';
+  try {
+    return new Date(ts * 1000).toLocaleString('en-US', {
+      timeZone: 'America/Los_Angeles',
+      year: 'numeric', month: 'short', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      timeZoneName: 'short',
+    });
+  } catch {
+    return new Date(ts * 1000).toLocaleString();
+  }
+}
+
 const FIAT_RATE = EGOC_USD;
 
 function shortHash(h: string) {
@@ -2650,7 +2666,7 @@ const WalletPage: React.FC = () => {
                 },
                 { label: 'Block',     val: selectedTx.block_height != null ? `#${selectedTx.block_height.toLocaleString()}` : 'Unconfirmed' },
                 { label: 'Nonce',     val: String(selectedTx.nonce) },
-                { label: 'Timestamp', val: new Date(selectedTx.timestamp * 1000).toLocaleString() },
+                { label: 'Timestamp', val: sfTime(selectedTx.timestamp) },
                 { label: 'Signature', val: selectedTx.signature.slice(0, 32) + '…', mono: true },
                 ...(selectedTx.memo ? [{ label: 'Memo', val: selectedTx.memo }] : []),
               ].map(({ label, val, mono }) => (
