@@ -133,7 +133,7 @@ jobs:
   # ── macOS Intel (x64 cross-compiled from Apple Silicon) ──────────────────
   build-macos-intel:
     name: macOS Intel
-    runs-on: macos-latest
+    runs-on: macos-13
     permissions:
       contents: write
 
