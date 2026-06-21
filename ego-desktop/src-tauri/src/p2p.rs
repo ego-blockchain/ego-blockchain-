@@ -348,11 +348,16 @@ pub async fn push_block_to_oracle(block: &crate::ledger::LedgerBlock, txs: &[cra
         Ok(c) => c,
         Err(_) => return,
     };
+    // Re-push the last few ancestors alongside the new block, so a transient
+    // submit failure for any of them is backfilled by the very next block —
+    // keeps the oracle feed gap-free without waiting for the next snapshot.
     let mut extra_blocks: Vec<serde_json::Value> = Vec::new();
-    if block.height > 1 {
-        if let Some(parent) = crate::chain_db::get_block_by_height(block.height - 1) {
-            if let Ok(v) = serde_json::to_value(&parent) {
-                extra_blocks.push(v);
+    for back in 1..=4u64 {
+        if block.height > back {
+            if let Some(parent) = crate::chain_db::get_block_by_height(block.height - back) {
+                if let Ok(v) = serde_json::to_value(&parent) {
+                    extra_blocks.push(v);
+                }
             }
         }
     }
@@ -362,10 +367,10 @@ pub async fn push_block_to_oracle(block: &crate::ledger::LedgerBlock, txs: &[cra
         "transactions": txs,
     });
     oracle_post(&client, "/chain/submit", &body).await;
-    // Every 100 blocks, also publish a full state snapshot so fresh / far-behind
-    // nodes can checkpoint-sync (the oracle prunes old blocks, so replay isn't an
-    // option). Cheap while the account set is small.
-    if block.height % 100 == 0 {
+    // Every 50 blocks, also publish a full state snapshot. Besides letting fresh
+    // nodes checkpoint-sync, the oracle now merges the snapshot's blocks to patch
+    // any holes — so a more frequent snapshot heals gaps faster.
+    if block.height % 50 == 0 {
         push_snapshot_to_oracle().await;
     }
 }
