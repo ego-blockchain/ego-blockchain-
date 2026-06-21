@@ -66,6 +66,25 @@ const STYLES = `
     --grad:      linear-gradient(135deg, #6366f1, #8b5cf6 55%, #3b82f6);
   }
 
+  /* ── Light theme ─────────────────────────────────────────────── */
+  :root[data-theme="light"] {
+    --bg:     #f6f7fb;
+    --bg-1:   #ffffff;
+    --bg-2:   #f0f1f8;
+    --bg-3:   #e6e8f2;
+    --line:   rgba(40,46,99,0.12);
+    --line-2: rgba(40,46,99,0.20);
+    --txt:    #15172b;
+    --txt-2:  #4c5374;
+    --txt-3:  #737a98;
+  }
+  /* Hardcoded grays that would be invisible on a light background */
+  :root[data-theme="light"] .text-gray-300 { color: #2a3047; }
+  :root[data-theme="light"] .text-gray-600 { color: #737a98; }
+  :root[data-theme="light"] .text-blue-300 { color: #4f46e5; }
+  :root[data-theme="light"] .text-blue-400 { color: #4f46e5; }
+  :root[data-theme="light"] .topbar { background: rgba(255,255,255,0.85); }
+
   body {
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
     background: var(--bg);
@@ -580,6 +599,16 @@ const Icons = {
       <path strokeLinecap="round" strokeLinejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
     </svg>
   ),
+  Sun: () => (
+    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} style={{ width: 16, height: 16 }}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+    </svg>
+  ),
+  Moon: () => (
+    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} style={{ width: 16, height: 16 }}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+    </svg>
+  ),
   Back: () => (
     <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} style={{ width: 19, height: 19 }}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
@@ -716,6 +745,28 @@ function Button({
   );
 }
 
+function ThemeToggle() {
+  const [theme, setTheme] = useState<'dark' | 'light'>(
+    () => (localStorage.getItem('ego-theme') === 'light' ? 'light' : 'dark'),
+  );
+  function toggle() {
+    const next = theme === 'dark' ? 'light' : 'dark';
+    setTheme(next);
+    localStorage.setItem('ego-theme', next);
+    document.documentElement.setAttribute('data-theme', next);
+  }
+  return (
+    <button
+      className="icon-btn"
+      onClick={toggle}
+      title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+      aria-label="Toggle theme"
+    >
+      {theme === 'dark' ? <Icons.Sun /> : <Icons.Moon />}
+    </button>
+  );
+}
+
 function Header({
   title,
   onBack,
@@ -745,6 +796,7 @@ function Header({
           {network === 'testnet' ? 'Testnet' : 'Mainnet'}
         </span>
       )}
+      <ThemeToggle />
       {onLock && (
         <button className="icon-btn" onClick={onLock} title="Lock wallet" aria-label="Lock wallet">
           <Icons.Lock />
@@ -1026,7 +1078,7 @@ function SetPasswordScreen({
   );
 }
 
-function UnlockScreen({ onUnlocked }: { onUnlocked: () => void }) {
+function UnlockScreen({ onUnlocked, onForgot }: { onUnlocked: () => void; onForgot: () => void }) {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -1046,6 +1098,9 @@ function UnlockScreen({ onUnlocked }: { onUnlocked: () => void }) {
 
   return (
     <div className="flex flex-col h-full screen-enter">
+      <div className="flex justify-end px-3 pt-3">
+        <ThemeToggle />
+      </div>
       <div
         className="flex-1 flex flex-col items-center justify-center p-6 gap-5"
         style={{ background: 'radial-gradient(85% 55% at 50% 0%, rgba(99,102,241,0.14) 0%, transparent 70%)' }}
@@ -1071,6 +1126,12 @@ function UnlockScreen({ onUnlocked }: { onUnlocked: () => void }) {
           <Button disabled={!password || loading} onClick={handleUnlock}>
             {loading ? 'Unlocking…' : 'Unlock'}
           </Button>
+          <button
+            onClick={onForgot}
+            className="text-xs text-gray-500 hover:text-indigo-400 transition mx-auto mt-1"
+          >
+            Forgot password? Recover with recovery phrase
+          </button>
         </div>
       </div>
     </div>
@@ -2146,7 +2207,13 @@ export default function App() {
           )}
 
           {state.screen === 'unlock' && (
-            <UnlockScreen onUnlocked={handleUnlocked} />
+            <UnlockScreen
+              onUnlocked={handleUnlocked}
+              onForgot={() => {
+                setWizardMode('import');
+                dispatch({ type: 'SET_SCREEN', screen: 'import' });
+              }}
+            />
           )}
 
           {state.screen === 'home' && (
