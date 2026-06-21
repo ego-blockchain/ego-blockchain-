@@ -800,8 +800,9 @@ async fn handle_chain_submit(
     let nblocks = chain.blocks.len() as u64;
     let ntxs = chain.transactions.len() as u64;
     drop(chain);
-    *state.blocks_cache.write().await = None;
-    *state.txs_cache.write().await = None;
+    // Do NOT invalidate the read caches here — a block arrives every few seconds,
+    // so per-submit invalidation would keep /chain/blocks rebuilding (50k sort)
+    // under the chain lock. A background task refreshes the caches instead.
     // Publish lock-free stats for /health, then flag the debounced saver. Never
     // clone the whole chain under the write lock here, or /health and submits starve.
     use std::sync::atomic::Ordering;
@@ -1163,15 +1164,37 @@ async fn main() {
 
     tokio::spawn(price_refresh_task(state.clone()));
 
-    // Debounced persistence: clone+save the chain at most once every few seconds,
-    // and only the clone runs under a (shared) read lock — never blocking /health
-    // or submits the way a per-submit clone-under-write-lock did.
+    // Background maintenance:
+    //  • every 4s — rebuild the read caches (last 500 blocks / 500 txs) from a
+    //    brief shared read lock, so /chain/blocks always serves a warm cache and
+    //    never sorts 50k blocks under a request.
+    //  • every ~16s — if the chain changed, clone+save to disk (the only heavy
+    //    lock hold), so persistence never runs under a submit's write lock.
     {
+        use std::sync::atomic::Ordering;
         let state = state.clone();
         tokio::spawn(async move {
+            let mut tick: u32 = 0;
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                if state.chain_dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                tick = tick.wrapping_add(1);
+
+                let (blocks500, txs500) = {
+                    let chain = state.chain.read().await;
+                    let mut brefs: Vec<&Value> = chain.blocks.iter().collect();
+                    brefs.sort_by_key(|b| b["height"].as_u64().unwrap_or(0));
+                    let bstart = brefs.len().saturating_sub(500);
+                    let blocks500: Vec<Value> = brefs[bstart..].iter().map(|b| (*b).clone()).collect();
+
+                    let mut trefs: Vec<&Value> = chain.transactions.iter().collect();
+                    trefs.sort_by_key(|t| std::cmp::Reverse(t["block_height"].as_u64().unwrap_or(0)));
+                    let txs500: Vec<Value> = trefs.iter().take(500).map(|t| (*t).clone()).collect();
+                    (blocks500, txs500)
+                };
+                *state.blocks_cache.write().await = Some(Arc::new(blocks500));
+                *state.txs_cache.write().await = Some(Arc::new(txs500));
+
+                if tick % 4 == 0 && state.chain_dirty.swap(false, Ordering::Relaxed) {
                     let snapshot = { state.chain.read().await.clone() };
                     let _ = tokio::task::spawn_blocking(move || save_chain(&snapshot)).await;
                 }
