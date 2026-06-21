@@ -544,6 +544,11 @@ pub struct AppState {
     /// Set on every submit; a background task debounces the expensive full-chain
     /// clone+save to disk so it never runs under the request's write lock.
     pub chain_dirty:  Arc<std::sync::atomic::AtomicBool>,
+    /// Lock-free chain stats for /health. Updated on submit; read without ever
+    /// taking the chain lock, so /health can't starve behind submits or the saver.
+    pub stat_blocks:  Arc<std::sync::atomic::AtomicU64>,
+    pub stat_txs:     Arc<std::sync::atomic::AtomicU64>,
+    pub stat_tip:     Arc<std::sync::atomic::AtomicU64>,
 }
 
 const EGOC_USD: f64 = 0.01;
@@ -775,13 +780,16 @@ async fn handle_chain_submit(
     }
 
     let mut chain = state.chain.write().await;
+    let mut max_h: u64 = 0;
 
     if let Some(block) = payload.block {
+        max_h = max_h.max(block["height"].as_u64().unwrap_or(0));
         if let Err(e) = chain.merge_block_checked(block) {
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": e })));
         }
     }
     for block in payload.blocks {
+        max_h = max_h.max(block["height"].as_u64().unwrap_or(0));
         if let Err(e) = chain.merge_block_checked(block) {
             // One bad block in a batch shouldn't poison the rest, but log it.
             error!("Oracle: rejected batched block: {}", e);
@@ -789,14 +797,20 @@ async fn handle_chain_submit(
     }
     chain.merge_txs(payload.transactions);
 
-    let nblocks = chain.blocks.len();
-    let ntxs = chain.transactions.len();
+    let nblocks = chain.blocks.len() as u64;
+    let ntxs = chain.transactions.len() as u64;
     drop(chain);
     *state.blocks_cache.write().await = None;
     *state.txs_cache.write().await = None;
-    // Persistence is debounced (see the saver task in main) — never clone the
-    // whole chain under the write lock here, or /health and submits starve.
-    state.chain_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Publish lock-free stats for /health, then flag the debounced saver. Never
+    // clone the whole chain under the write lock here, or /health and submits starve.
+    use std::sync::atomic::Ordering;
+    state.stat_blocks.store(nblocks, Ordering::Relaxed);
+    state.stat_txs.store(ntxs, Ordering::Relaxed);
+    if max_h > state.stat_tip.load(Ordering::Relaxed) {
+        state.stat_tip.store(max_h, Ordering::Relaxed);
+    }
+    state.chain_dirty.store(true, Ordering::Relaxed);
 
     (StatusCode::OK, Json(json!({ "ok": true, "blocks": nblocks, "txs": ntxs })))
 }
@@ -1078,23 +1092,21 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     let prices_count = prices.len();
     drop(prices);
 
-    let cached_tip = {
-        let bc = state.blocks_cache.read().await;
-        bc.as_ref().and_then(|b| b.last()).and_then(|x| x["height"].as_u64())
-    };
-    let chain = state.chain.read().await;
-    let tip = cached_tip.unwrap_or_else(|| {
-        chain.blocks.iter().map(|b| b["height"].as_u64().unwrap_or(0)).max().unwrap_or(0)
-    });
+    // Fully lock-free: read the atomics, never touch the chain lock — so /health
+    // can't stall behind a submit's write lock or the saver's clone.
+    use std::sync::atomic::Ordering;
+    let tip     = state.stat_tip.load(Ordering::Relaxed);
+    let nblocks = state.stat_blocks.load(Ordering::Relaxed);
+    let ntxs    = state.stat_txs.load(Ordering::Relaxed);
     Json(json!({
         "status":       "ok",
         "prices_count": prices_count,
         "last_update":  last_update,
-        "chain_blocks": chain.blocks.len(),
+        "chain_blocks": nblocks,
         "chain_tip":    tip,
         "block_height": tip,
-        "chain_txs":    chain.transactions.len(),
-        "tx_count":     chain.transactions.len(),
+        "chain_txs":    ntxs,
+        "tx_count":     ntxs,
     }))
 }
 
@@ -1119,9 +1131,14 @@ async fn main() {
 
     let acme_state = acme::AcmeState::new();
 
+    let loaded_chain = load_chain();
+    let init_tip = loaded_chain.blocks.iter().map(|b| b["height"].as_u64().unwrap_or(0)).max().unwrap_or(0);
+    let init_blocks = loaded_chain.blocks.len() as u64;
+    let init_txs = loaded_chain.transactions.len() as u64;
+
     let state = AppState {
         prices:          Arc::new(RwLock::new(initial_prices)),
-        chain:           Arc::new(RwLock::new(load_chain())),
+        chain:           Arc::new(RwLock::new(loaded_chain)),
         client,
         hosting_nodes:   Arc::new(RwLock::new(HashMap::new())),
         ego_nodes:       Arc::new(RwLock::new(HashMap::new())),
@@ -1133,6 +1150,9 @@ async fn main() {
         blocks_cache:    Arc::new(RwLock::new(None)),
         txs_cache:       Arc::new(RwLock::new(None)),
         chain_dirty:     Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        stat_blocks:     Arc::new(std::sync::atomic::AtomicU64::new(init_blocks)),
+        stat_txs:        Arc::new(std::sync::atomic::AtomicU64::new(init_txs)),
+        stat_tip:        Arc::new(std::sync::atomic::AtomicU64::new(init_tip)),
     };
     if state.submit_token.is_none() {
         error!("SECURITY: ORACLE_SUBMIT_TOKEN is not set — /chain/submit is UNAUTHENTICATED. \
@@ -1150,7 +1170,7 @@ async fn main() {
         let state = state.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 if state.chain_dirty.swap(false, std::sync::atomic::Ordering::Relaxed) {
                     let snapshot = { state.chain.read().await.clone() };
                     let _ = tokio::task::spawn_blocking(move || save_chain(&snapshot)).await;
