@@ -671,7 +671,7 @@ const TABS = [
   { key: 'expired', label: 'Expired' },
 ];
 
-interface RateLimit { used: number; max: number; window_hours: number; resets_in_secs: number; }
+interface RateLimit { used: number; max: number; window_days: number; resets_in_secs: number; }
 
 function fmtCountdown(secs: number): string {
   const h = Math.floor(secs / 3600);
@@ -746,7 +746,7 @@ export default function GovernancePage() {
             <span className={`text-[10px] ${atLimit ? 'text-red-400' : 'text-gray-500'}`}>
               {atLimit
                 ? `Rate limited — resets in ${fmtCountdown(rateLimit.resets_in_secs)}`
-                : `${rateLimit.used}/${rateLimit.max} used · resets every ${rateLimit.window_hours}h`}
+                : `${rateLimit.used}/${rateLimit.max} used this month · ${rateLimit.window_days}-day window`}
             </span>
           )}
         </div>
@@ -761,7 +761,7 @@ export default function GovernancePage() {
         </div>
         {rateLimit && (
           <div className="flex items-center gap-2">
-            <span className="text-gray-400">My proposals (4h):</span>
+            <span className="text-gray-400">My proposals (month):</span>
             <span className={`font-medium ${atLimit ? 'text-red-400' : 'text-white'}`}>
               {rateLimit.used}/{rateLimit.max}
             </span>

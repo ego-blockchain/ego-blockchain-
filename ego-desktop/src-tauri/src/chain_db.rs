@@ -4172,6 +4172,33 @@ pub fn store_dao_proposal(proposal: DaoProposal) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+fn dao_create_log_key(creator: &str) -> Vec<u8> {
+    format!("__createlog__{}", creator).into_bytes()
+}
+
+/// Per-creator proposal-creation timestamps, persisted independently of the
+/// proposals themselves so that DELETING a proposal does NOT free a rate-limit
+/// slot (otherwise create→delete→repeat would defeat the monthly cap).
+pub fn get_proposal_creation_times(creator: &str, since: i64) -> Vec<i64> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_DAO) { Some(c) => c, None => return vec![] };
+    let times: Vec<i64> = db.get_cf(cf, dao_create_log_key(creator)).ok().flatten()
+        .and_then(|b| decode::<Vec<i64>>(&b)).unwrap_or_default();
+    times.into_iter().filter(|t| *t >= since).collect()
+}
+
+/// Record a creation timestamp. `keep_since` prunes entries older than the
+/// rate-limit window so the log stays bounded.
+pub fn record_proposal_creation(creator: &str, ts: i64, keep_since: i64) {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = match db.cf_handle(CF_DAO) { Some(c) => c, None => return };
+    let mut times: Vec<i64> = db.get_cf(cf, dao_create_log_key(creator)).ok().flatten()
+        .and_then(|b| decode::<Vec<i64>>(&b)).unwrap_or_default();
+    times.push(ts);
+    times.retain(|t| *t >= keep_since);
+    let _ = db.put_cf(cf, dao_create_log_key(creator), encode(&times));
+}
+
 /// Delete a proposal. Only the original creator may remove it — enforced here
 /// so the command layer can't be bypassed.
 pub fn delete_dao_proposal(id: &str, requester: &str) -> Result<(), String> {

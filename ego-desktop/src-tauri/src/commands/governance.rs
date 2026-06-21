@@ -101,12 +101,11 @@ fn now_ts() -> i64 {
         .as_secs() as i64
 }
 
+// Anyone can create a proposal (no stake required) — but at most 5 per month,
+// and that count is based on CREATIONS, not currently-live proposals, so
+// deleting one does not give the slot back.
 const MAX_PROPOSALS_PER_WINDOW: usize = 5;
-const WINDOW_SECS: i64 = 4 * 3600; // 4 hours
-
-/// Minimum stake required to create a proposal — Sybil/spam resistance: a
-/// proposer must have real skin in the game. 100 EGOC.
-const MIN_PROPOSAL_STAKE_UEGOC: u64 = 100_000_000;
+const WINDOW_SECS: i64 = 30 * 86_400; // 30 days (~1 month)
 
 /// Create a new community DAO proposal. Any wallet holder can submit.
 #[tauri::command]
@@ -123,13 +122,6 @@ pub async fn create_dao_proposal(
     if creator.is_empty() {
         return Err(EgoDesktopError::WalletError("wallet not initialized".into()));
     }
-    if ledger.staked_amount < MIN_PROPOSAL_STAKE_UEGOC {
-        return Err(EgoDesktopError::InvalidInput(format!(
-            "You must stake at least {} EGOC to create a proposal (you currently have {} EGOC staked). Stake on the Stake page first.",
-            MIN_PROPOSAL_STAKE_UEGOC / 1_000_000,
-            ledger.staked_amount / 1_000_000
-        )));
-    }
     if title.trim().is_empty() {
         return Err(EgoDesktopError::InvalidInput("Title is required".into()));
     }
@@ -137,16 +129,14 @@ pub async fn create_dao_proposal(
         return Err(EgoDesktopError::InvalidInput("At least 2 options required".into()));
     }
 
-    // Enforce 4-hour sliding window rate limit (max 5 proposals per window)
+    // Enforce the monthly creation cap. The count comes from a persistent
+    // creation log (not live proposals), so deleting a proposal does NOT free a
+    // slot — preventing create→delete→repeat spam.
     let now_ts_val = now_ts();
     let window_start = now_ts_val - WINDOW_SECS;
     let creator_clone = creator.clone();
     let (recent_times, banned) = tokio::task::spawn_blocking(move || {
-        let all = list_dao_proposals(Some("all"), None);
-        let times: Vec<i64> = all.iter()
-            .filter(|p| p.creator == creator_clone && p.created_at >= window_start)
-            .map(|p| p.created_at)
-            .collect();
+        let times = crate::chain_db::get_proposal_creation_times(&creator_clone, window_start);
         let banned = is_proposer_banned(&creator_clone);
         (times, banned)
     }).await.map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
@@ -154,11 +144,11 @@ pub async fn create_dao_proposal(
     if recent_times.len() >= MAX_PROPOSALS_PER_WINDOW {
         let oldest = recent_times.iter().copied().min().unwrap_or(now_ts_val);
         let resets_in = (oldest + WINDOW_SECS) - now_ts_val;
-        let h = resets_in / 3600;
-        let m = (resets_in % 3600) / 60;
+        let d = resets_in / 86_400;
+        let h = (resets_in % 86_400) / 3600;
         return Err(EgoDesktopError::InvalidInput(format!(
-            "Rate limit: {} proposals per 4 hours. Next slot opens in {}h {}m.",
-            MAX_PROPOSALS_PER_WINDOW, h, m
+            "Rate limit: {} proposals per month (deleting one does not free a slot). Next slot opens in {}d {}h.",
+            MAX_PROPOSALS_PER_WINDOW, d, h
         )));
     }
 
@@ -203,6 +193,7 @@ pub async fn create_dao_proposal(
 
     let duration_secs = duration_days.map(|d| d as i64 * 86_400).unwrap_or(7 * 86_400);
 
+    let creator_for_log = creator.clone();
     let proposal = DaoProposal {
         id: id.clone(), title, description, proposal_type, options, creator,
         created_at: now, voting_ends_at: now + duration_secs,
@@ -215,6 +206,13 @@ pub async fn create_dao_proposal(
         .await
         .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
         .map_err(EgoDesktopError::WalletError)?;
+
+    // Record the creation in the persistent per-creator log AFTER a successful
+    // store, so it counts against the monthly cap even if the proposal is later
+    // deleted.
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::chain_db::record_proposal_creation(&creator_for_log, now, now - WINDOW_SECS)
+    }).await;
     Ok(id)
 }
 
@@ -359,11 +357,11 @@ pub async fn get_ban_status(target_address: String) -> Result<ProposerBanStatus,
 pub struct ProposalRateLimit {
     pub used:          usize,
     pub max:           usize,
-    pub window_hours:  u32,
+    pub window_days:   u32,
     pub resets_in_secs: i64, // seconds until oldest submission leaves the window; 0 if not at limit
 }
 
-/// Returns the current user's proposal rate-limit status for the 4-hour window.
+/// Returns the current user's proposal rate-limit status for the monthly window.
 #[tauri::command]
 pub async fn get_proposal_rate_limit() -> Result<ProposalRateLimit, EgoDesktopError> {
     tokio::task::spawn_blocking(|| {
@@ -372,7 +370,7 @@ pub async fn get_proposal_rate_limit() -> Result<ProposalRateLimit, EgoDesktopEr
             return Ok::<_, EgoDesktopError>(ProposalRateLimit {
                 used: 0,
                 max: MAX_PROPOSALS_PER_WINDOW,
-                window_hours: 4,
+                window_days: (WINDOW_SECS / 86_400) as u32,
                 resets_in_secs: 0,
             });
         }
@@ -380,11 +378,7 @@ pub async fn get_proposal_rate_limit() -> Result<ProposalRateLimit, EgoDesktopEr
         let creator = ledger.address;
         let now = now_ts();
         let window_start = now - WINDOW_SECS;
-        let all = list_dao_proposals(Some("all"), None);
-        let recent_times: Vec<i64> = all.iter()
-            .filter(|p| p.creator == creator && p.created_at >= window_start)
-            .map(|p| p.created_at)
-            .collect();
+        let recent_times = crate::chain_db::get_proposal_creation_times(&creator, window_start);
         let used = recent_times.len();
         let resets_in = if used >= MAX_PROPOSALS_PER_WINDOW {
             let oldest = recent_times.iter().copied().min().unwrap_or(now);
@@ -396,7 +390,7 @@ pub async fn get_proposal_rate_limit() -> Result<ProposalRateLimit, EgoDesktopEr
         Ok(ProposalRateLimit {
             used,
             max: MAX_PROPOSALS_PER_WINDOW,
-            window_hours: 4,
+            window_days: (WINDOW_SECS / 86_400) as u32,
             resets_in_secs: resets_in,
         })
     })
