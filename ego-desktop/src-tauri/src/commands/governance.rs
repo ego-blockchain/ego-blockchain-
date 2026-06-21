@@ -104,6 +104,10 @@ fn now_ts() -> i64 {
 const MAX_PROPOSALS_PER_WINDOW: usize = 5;
 const WINDOW_SECS: i64 = 4 * 3600; // 4 hours
 
+/// Minimum stake required to create a proposal — Sybil/spam resistance: a
+/// proposer must have real skin in the game. 100 EGOC.
+const MIN_PROPOSAL_STAKE_UEGOC: u64 = 100_000_000;
+
 /// Create a new community DAO proposal. Any wallet holder can submit.
 #[tauri::command]
 pub async fn create_dao_proposal(
@@ -118,6 +122,13 @@ pub async fn create_dao_proposal(
     let creator = ledger.address.clone();
     if creator.is_empty() {
         return Err(EgoDesktopError::WalletError("wallet not initialized".into()));
+    }
+    if ledger.staked_amount < MIN_PROPOSAL_STAKE_UEGOC {
+        return Err(EgoDesktopError::InvalidInput(format!(
+            "You must stake at least {} EGOC to create a proposal (you currently have {} EGOC staked). Stake on the Stake page first.",
+            MIN_PROPOSAL_STAKE_UEGOC / 1_000_000,
+            ledger.staked_amount / 1_000_000
+        )));
     }
     if title.trim().is_empty() {
         return Err(EgoDesktopError::InvalidInput("Title is required".into()));
@@ -205,6 +216,23 @@ pub async fn create_dao_proposal(
         .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
         .map_err(EgoDesktopError::WalletError)?;
     Ok(id)
+}
+
+/// Delete a proposal you created. Only the original creator can remove it, and
+/// it can be withdrawn at any time while it is still yours.
+#[tauri::command]
+pub async fn delete_dao_proposal(proposal_id: String) -> Result<(), EgoDesktopError> {
+    let ledger = Ledger::load();
+    let requester = ledger.address.clone();
+    if requester.is_empty() {
+        return Err(EgoDesktopError::WalletError("wallet not initialized".into()));
+    }
+    tokio::task::spawn_blocking(move || {
+        crate::chain_db::delete_dao_proposal(&proposal_id, &requester)
+            .map_err(EgoDesktopError::InvalidInput)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
 /// List proposals. status_filter: "all" | "active" | "passed" | "failed" | "expired"

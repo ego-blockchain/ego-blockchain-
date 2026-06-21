@@ -535,6 +535,7 @@ fn main() {
             commands::governance::get_governance_proposals,
             commands::governance::is_feature_active,
             commands::governance::create_dao_proposal,
+            commands::governance::delete_dao_proposal,
             commands::governance::get_dao_proposals,
             commands::governance::get_dao_proposal,
             commands::governance::cast_stake_vote,

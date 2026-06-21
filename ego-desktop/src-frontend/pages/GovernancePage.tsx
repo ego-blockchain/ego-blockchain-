@@ -266,6 +266,8 @@ function ProposalDetailModal({ proposal, onClose, onVoted, myAddress }: {
   const [banStatus, setBanStatus]     = useState<BanStatus | null>(null);
   const [banBusy, setBanBusy]         = useState(false);
   const [banConfirm, setBanConfirm]   = useState(false);
+  const [delBusy, setDelBusy]         = useState(false);
+  const [delConfirm, setDelConfirm]   = useState(false);
   const [busy, setBusy]   = useState('');
   const [error, setError] = useState('');
 
@@ -293,6 +295,15 @@ function ProposalDetailModal({ proposal, onClose, onVoted, myAddress }: {
       setBanConfirm(false);
     } catch (e: any) { setError(String(e)); }
     finally { setBanBusy(false); }
+  }
+
+  async function deleteProposal() {
+    setDelBusy(true); setError('');
+    try {
+      await invoke('delete_dao_proposal', { proposalId: proposal.id });
+      onVoted();   // refresh the list
+      onClose();   // close the modal
+    } catch (e: any) { setError(String(e)); setDelBusy(false); }
   }
 
   async function submitStakeVote() {
@@ -386,6 +397,26 @@ function ProposalDetailModal({ proposal, onClose, onVoted, myAddress }: {
                       <span className="text-[10px] text-yellow-500">You reported this proposer</span>
                     )}
                   </>
+                )}
+              </div>
+            )}
+            {/* Creator can withdraw their own proposal early */}
+            {isOwnProposal && (
+              <div className="mt-2">
+                {delConfirm ? (
+                  <span className="flex items-center gap-1.5">
+                    <span className="text-[10px] text-yellow-400">Delete your proposal? This removes it and its votes permanently.</span>
+                    <button onClick={deleteProposal} disabled={delBusy}
+                      className="text-[10px] px-2 py-0.5 rounded bg-red-600 hover:bg-red-500 text-white disabled:opacity-50 transition">
+                      {delBusy ? '…' : 'Delete'}
+                    </button>
+                    <button onClick={() => setDelConfirm(false)} className="text-[10px] text-gray-500 hover:text-gray-300">Cancel</button>
+                  </span>
+                ) : (
+                  <button onClick={() => setDelConfirm(true)}
+                    className="text-[10px] text-gray-600 hover:text-red-400 transition underline underline-offset-2">
+                    🗑 Withdraw / delete this proposal
+                  </button>
                 )}
               </div>
             )}
