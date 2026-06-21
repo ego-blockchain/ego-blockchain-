@@ -1753,7 +1753,7 @@ function AddAssetScreen({ onBack }: { onBack: () => void }) {
           <Input
             value={address}
             onChange={setAddress}
-            placeholder={activeChain === 'ETH' || activeChain === 'BNB' ? '0x…' : `${CHAINS[activeChain].name} address`}
+            placeholder={activeChain === 'ETH' || activeChain === 'BNB' || activeChain === 'POL' ? '0x…' : `${CHAINS[activeChain].name} address`}
             onEnter={handleAdd}
           />
         </div>

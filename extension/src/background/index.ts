@@ -368,7 +368,7 @@ async function addAsset(payload: {
   let decimals: number | undefined;
 
   if (contract) {
-    if (!chainInfo.tokens || (chain !== 'ETH' && chain !== 'BNB')) {
+    if (!chainInfo.tokens || (chain !== 'ETH' && chain !== 'BNB' && chain !== 'POL')) {
       return { success: false, error: `Tokens are not supported on ${chainInfo.name}` };
     }
     if (!/^0x[0-9a-fA-F]{40}$/.test(contract)) {
@@ -378,7 +378,8 @@ async function addAsset(payload: {
       const meta = await fetchTokenMeta(chain, contract);
       symbol = meta.symbol;
       decimals = meta.decimals;
-      name = `${meta.symbol} (${chain === 'ETH' ? 'ERC-20' : 'BEP-20'})`;
+      const std = chain === 'ETH' ? 'ERC-20' : chain === 'BNB' ? 'BEP-20' : 'Polygon ERC-20';
+      name = `${meta.symbol} (${std})`;
     } catch (e: unknown) {
       return { success: false, error: `Token lookup failed: ${(e as Error).message}` };
     }
@@ -425,11 +426,11 @@ async function refreshAssets(): Promise<ExtResponse<{ balances: AssetBalance[] }
 async function getChainAddresses(): Promise<ExtResponse<{ addresses: Record<string, string> }>> {
   if (!unlockedSeed) return { success: false, error: 'Wallet is locked' };
   const addresses: Record<string, string> = {};
-  for (const chain of ['BTC', 'ETH', 'BNB'] as const) {
+  for (const chain of ['BTC', 'ETH', 'BNB', 'POL', 'SOL', 'XRP', 'DOGE', 'LTC'] as const) {
     try {
       addresses[chain] = deriveAddress(unlockedSeed, chain);
-    } catch (e: unknown) {
-      return { success: false, error: `Derivation failed for ${chain}: ${(e as Error).message}` };
+    } catch {
+      // Skip any chain that fails to derive rather than blocking all "use my address" buttons.
     }
   }
   return { success: true, data: { addresses } };
