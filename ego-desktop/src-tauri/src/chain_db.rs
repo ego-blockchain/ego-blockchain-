@@ -4172,6 +4172,20 @@ pub fn store_dao_proposal(proposal: DaoProposal) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Delete a proposal. Only the original creator may remove it — enforced here
+/// so the command layer can't be bypassed.
+pub fn delete_dao_proposal(id: &str, requester: &str) -> Result<(), String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_DAO).ok_or("CF_DAO missing")?;
+    let bytes = db.get_cf(cf, dao_key(id)).map_err(|e| e.to_string())?
+        .ok_or("Proposal not found")?;
+    let p: DaoProposal = decode(&bytes).ok_or("Corrupt proposal record")?;
+    if p.creator != requester {
+        return Err("Only the proposal's creator can delete it".to_string());
+    }
+    db.delete_cf(cf, dao_key(id)).map_err(|e| e.to_string())
+}
+
 pub fn get_dao_proposal_public(id: &str, voter: Option<&str>) -> Option<DaoProposalPublic> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let cf = db.cf_handle(CF_DAO)?;
