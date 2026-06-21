@@ -50,6 +50,7 @@ export default defineConfig({
         popup: resolve(__dirname, 'src/popup/index.html'),
         background: resolve(__dirname, 'src/background/index.ts'),
         content: resolve(__dirname, 'src/content/inject.ts'),
+        inject: resolve(__dirname, 'src/content/provider.ts'),
       },
       output: {
         entryFileNames: (chunk) => {
