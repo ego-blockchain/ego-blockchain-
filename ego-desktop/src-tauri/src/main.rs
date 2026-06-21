@@ -850,6 +850,12 @@ fn main() {
                     bounded!(15, crate::p2p::sync_chain_from_peers());
                     bounded!(15, crate::p2p::dht_discover_relays());
 
+                    // Auto-heal: every ~4 ticks (~2 min) verify we're on the canonical
+                    // chain and self-repair a fork so a user never has to wipe a DB.
+                    if !no_oracle && loop_tick % 4 == 0 {
+                        bounded!(40, crate::p2p::check_and_heal_fork());
+                    }
+
                     let my_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
                         .await.unwrap_or_default();
                     if !my_addr.is_empty() {
