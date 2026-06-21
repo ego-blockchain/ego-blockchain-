@@ -8198,6 +8198,104 @@ pub async fn fast_sync_from_oracle_if_behind() -> bool {
     }
 }
 
+/// Auto-heal: detect if this node is on a fork (its block at a confirmed depth
+/// disagrees with the canonical chain) and, if so, truncate the divergent blocks
+/// and re-sync — so a non-technical user never has to wipe a database by hand.
+/// Read-only when in sync; only acts on a confirmed hash mismatch at depth.
+pub async fn check_and_heal_fork() {
+    if std::env::var("EGO_NO_ORACLE").is_ok() { return; }
+    const FORK_CHECK_DEPTH: u64 = 24;   // compare this many blocks below the tip (finalized)
+    const FORK_WINDOW: u64 = 256;       // how far back to search for the divergence point
+
+    let local_tip = crate::chain_db::latest_block_info().0;
+    if local_tip < 100 { return; }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build().unwrap_or_default();
+
+    #[derive(serde::Deserialize, Default)]
+    struct OracleHealth { chain_tip: Option<u64> }
+    let oracle_tip: u64 = match oracle_get(&client, "/health").await {
+        Some(r) => r.json::<OracleHealth>().await.map(|h| h.chain_tip.unwrap_or(0)).unwrap_or(0),
+        None => return,
+    };
+    if oracle_tip < 100 { return; }
+
+    // Compare at a depth both chains certainly have.
+    let check_h = local_tip.min(oracle_tip).saturating_sub(FORK_CHECK_DEPTH);
+    if check_h < 50 { return; }
+
+    let local_block = match crate::chain_db::get_block_by_height(check_h) {
+        Some(b) => b,
+        None => return,
+    };
+    let canon_at = match oracle_get(&client, &format!("/chain/blocks?fromHeight={}&limit=1", check_h)).await {
+        Some(r) => r.json::<Vec<crate::ledger::LedgerBlock>>().await.unwrap_or_default(),
+        None => return,
+    };
+    let canon_block = match canon_at.into_iter().find(|b| b.height == check_h) {
+        Some(b) => b,
+        None => return,
+    };
+    if canon_block.hash == local_block.hash {
+        return; // on the canonical chain — nothing to do
+    }
+
+    tracing::error!(
+        "[AutoHeal] FORK DETECTED at height {} — local {}… disagrees with canonical {}…. Repairing automatically.",
+        check_h,
+        &local_block.hash[..local_block.hash.len().min(12)],
+        &canon_block.hash[..canon_block.hash.len().min(12)],
+    );
+
+    // Pull a window of canonical blocks and find the highest height where we still
+    // agree — the fork point — so we only truncate the divergent tail.
+    let window_start = check_h.saturating_sub(FORK_WINDOW);
+    let canon_window: Vec<crate::ledger::LedgerBlock> =
+        match oracle_get(&client, &format!("/chain/blocks?fromHeight={}&limit=400", window_start)).await {
+            Some(r) => r.json().await.unwrap_or_default(),
+            None => return,
+        };
+    let canon_by_h: std::collections::HashMap<u64, String> =
+        canon_window.into_iter().map(|b| (b.height, b.hash)).collect();
+
+    let mut fork_point: Option<u64> = None;
+    let mut h = check_h;
+    while h >= window_start {
+        if let (Some(lb), Some(ch)) = (crate::chain_db::get_block_by_height(h), canon_by_h.get(&h)) {
+            if &lb.hash == ch { fork_point = Some(h); break; }
+        }
+        if h == 0 { break; }
+        h -= 1;
+    }
+
+    let truncate_at = fork_point.map(|fp| fp + 1).unwrap_or(window_start);
+    let before_tip = crate::chain_db::latest_block_info().0;
+    let removed = crate::chain_db::truncate_from(truncate_at);
+    let after_tip = crate::chain_db::latest_block_info().0;
+
+    if after_tip >= before_tip {
+        // truncate_from refused (divergence is below the finality checkpoint).
+        tracing::error!(
+            "[AutoHeal] fork is below the finality checkpoint — automatic truncate blocked. \
+             A full chain-DB reset is required to rejoin canonical (delete chain_rocksdb + restart)."
+        );
+        return;
+    }
+
+    tracing::warn!(
+        "[AutoHeal] truncated local chain to height {} ({} txs returned to mempool); re-syncing from canonical.",
+        truncate_at.saturating_sub(1), removed.len()
+    );
+    for tx in removed {
+        let _ = crate::mempool::get_mempool().push(tx);
+    }
+
+    fast_sync_from_oracle_if_behind().await;
+    fetch_chain_from_oracle(None).await;
+}
+
 pub async fn fetch_chain_from_oracle(app: Option<&tauri::AppHandle<tauri::Wry>>) {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
