@@ -24,11 +24,28 @@ async function fetchJSON<T>(url: string, options?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+// The Ego node serves wallet data over JSON-RPC 2.0 at POST / (not REST paths).
+async function jsonRpc<T>(rpcUrl: string, method: string, params: unknown): Promise<T> {
+  const res = await fetchJSON<{ result?: T; error?: { message?: string } }>(rpcUrl, {
+    method: 'POST',
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+  });
+  if (res.error) throw new Error(res.error.message ?? `${method} failed`);
+  return res.result as T;
+}
+
 export async function getBalance(
   address: string,
   rpcUrl = DEFAULT_RPC_URL,
 ): Promise<BalanceResponse> {
-  return fetchJSON<BalanceResponse>(`${rpcUrl}/balance/${address}`);
+  const r = await jsonRpc<{ uegoc?: number; egoc?: number }>(
+    rpcUrl, 'wallet.getBalance', { address },
+  );
+  return {
+    address,
+    balance_uegoc: r?.uegoc ?? 0,
+    balance_egoc:  r?.egoc  ?? 0,
+  };
 }
 
 export async function submitTx(

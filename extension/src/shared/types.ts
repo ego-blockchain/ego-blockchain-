@@ -136,11 +136,11 @@ export const NETWORKS = {
   testnet: {
     name: 'Ego Testnet',
     chainId: '0x1',
-    rpcUrl: 'http://127.0.0.1:8545',
+    rpcUrl: 'http://127.0.0.1:47395',
   },
   mainnet: {
     name: 'Ego Mainnet',
     chainId: '0x1',
-    rpcUrl: 'http://127.0.0.1:8545',
+    rpcUrl: 'http://127.0.0.1:47395',
   },
 } as const;
