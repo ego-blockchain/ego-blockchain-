@@ -796,6 +796,12 @@ fn main() {
 
                 let mut last_tick_wall = std::time::SystemTime::now();
 
+                // Stuck-detection: if our tip stops advancing while the oracle is
+                // ahead, we're likely wedged on a hole in the oracle's block feed
+                // (a block the paginated endpoint is missing). Force a snapshot jump.
+                let mut last_seen_tip = crate::chain_db::latest_block_info().0;
+                let mut tip_stuck_since = std::time::Instant::now();
+
                 // Every network call below is bounded so one hung P2P/DHT/relay
                 // request can never stall the loop for minutes. A stalled loop
                 // used to trip the wall-clock "wake-from-sleep" heuristic, which
@@ -850,6 +856,19 @@ fn main() {
                     bounded!(15, crate::p2p::broadcast_peer_announce(Some(&handle_startup)));
                     bounded!(15, crate::p2p::sync_chain_from_peers());
                     bounded!(15, crate::p2p::dht_discover_relays());
+
+                    // If the tip hasn't advanced for ~100s, we're wedged (e.g. a
+                    // missing block in the oracle feed) — jump the gap via the
+                    // writer's full snapshot, which contains the missing blocks.
+                    let cur_tip = crate::chain_db::latest_block_info().0;
+                    if cur_tip > last_seen_tip {
+                        last_seen_tip = cur_tip;
+                        tip_stuck_since = std::time::Instant::now();
+                    } else if !no_oracle && tip_stuck_since.elapsed().as_secs() > 100 {
+                        bounded!(25, crate::p2p::force_snapshot_jump());
+                        last_seen_tip = crate::chain_db::latest_block_info().0;
+                        tip_stuck_since = std::time::Instant::now();
+                    }
 
                     // Auto-heal: every ~4 ticks (~2 min) verify we're on the canonical
                     // chain and self-repair a fork so a user never has to wipe a DB.

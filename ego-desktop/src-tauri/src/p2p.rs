@@ -8198,6 +8198,38 @@ pub async fn fast_sync_from_oracle_if_behind() -> bool {
     }
 }
 
+/// Recovery for a node wedged just below the tip: the oracle's paginated block
+/// feed can have holes (a lost submit), so a node sitting exactly on the block
+/// before a hole can never bridge it via incremental sync — and it's too close
+/// to the tip (< SNAPSHOT_BLOCK_WINDOW) for fast_sync to trigger. The trusted
+/// snapshot is pushed whole by the writer and DOES contain those blocks, so
+/// jumping to it fills the gap. Ignores the distance threshold by design.
+pub async fn force_snapshot_jump() -> bool {
+    if std::env::var("EGO_NO_ORACLE").is_ok() { return false; }
+    let local_tip = crate::chain_db::latest_block_info().0;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build().unwrap_or_default();
+    let snap: crate::chain_db::StateSnapshot = match oracle_get(&client, "/chain/snapshot").await {
+        Some(r) => match r.json().await { Ok(s) => s, Err(_) => return false },
+        None => return false,
+    };
+    if snap.height <= local_tip {
+        return false; // snapshot not ahead — nothing to jump to
+    }
+    let height = snap.height;
+    match tokio::task::spawn_blocking(move || crate::chain_db::import_state_snapshot(&snap)).await {
+        Ok(Ok(())) => {
+            tracing::warn!(
+                "[StuckRecovery] tip was stuck at {} (missing block in the oracle feed) — jumped past the gap to snapshot height {}",
+                local_tip, height
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Auto-heal: detect if this node is on a fork (its block at a confirmed depth
 /// disagrees with the canonical chain) and, if so, truncate the divergent blocks
 /// and re-sync — so a non-technical user never has to wipe a database by hand.
