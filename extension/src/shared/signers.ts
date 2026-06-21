@@ -1,4 +1,5 @@
 import { secp256k1 } from '@noble/curves/secp256k1';
+import { ed25519 } from '@noble/curves/ed25519';
 import { sha256 } from '@noble/hashes/sha256';
 import { sha512 } from '@noble/hashes/sha512';
 import { ripemd160 } from '@noble/hashes/ripemd160';
@@ -7,22 +8,56 @@ import { hmac } from '@noble/hashes/hmac';
 import { bech32, bech32m } from 'bech32';
 
 // ── Key derivation (matches Ego Desktop multichain.rs) ────────────────────────
-// privkey = HMAC-SHA512(key = seed, msg = path)[..32]
+// privkey = HMAC-SHA512(key = seed, msg = path)[..32]. Polygon shares the EVM
+// (Ethereum) address. SOL/DOGE/LTC/XRP are derivable (watch + receive) but
+// sending is currently limited to the SIGNABLE set below.
 
-const PATHS = {
-  BTC: 'ego:bitcoin:0',
-  ETH: 'ego:ethereum:0',
-  BNB: 'ego:bnb:0',
+const DERIVE_PATHS = {
+  BTC:  'ego:bitcoin:0',
+  ETH:  'ego:ethereum:0',
+  BNB:  'ego:bnb:0',
+  POL:  'ego:ethereum:0',   // Polygon is EVM — same address as Ethereum
+  SOL:  'ego:solana:0',
+  DOGE: 'ego:dogecoin:0',
+  LTC:  'ego:litecoin:0',
+  XRP:  'ego:xrp:0',
 } as const;
 
-export type SignableChain = keyof typeof PATHS;
+export type DerivableChain = keyof typeof DERIVE_PATHS;
+
+// Chains we can produce signed transactions for today (others are watch-only).
+const SIGNABLE = new Set<DerivableChain>(['BTC', 'ETH', 'BNB']);
+export type SignableChain = 'BTC' | 'ETH' | 'BNB';
 
 export function isSignableChain(chain: string): chain is SignableChain {
-  return chain in PATHS;
+  return SIGNABLE.has(chain as DerivableChain) && chain !== 'POL';
 }
 
-function derivePrivkey(seed: Uint8Array, chain: SignableChain): Uint8Array {
-  return hmac(sha512, seed, new TextEncoder().encode(PATHS[chain])).slice(0, 32);
+export function isDerivableChain(chain: string): chain is DerivableChain {
+  return chain in DERIVE_PATHS;
+}
+
+function derivePrivkey(seed: Uint8Array, chain: DerivableChain): Uint8Array {
+  return hmac(sha512, seed, new TextEncoder().encode(DERIVE_PATHS[chain])).slice(0, 32);
+}
+
+// ── Base58 (standard + XRP/Ripple alphabet) ───────────────────────────────────
+const B58_STD = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const B58_XRP = 'rpshnaf39wBUDNEGHJKLM4PQRST7VWXYZ2bcdeCg65jkm8oFqi1tuvAxyz';
+
+function base58(bytes: Uint8Array, alphabet = B58_STD): string {
+  let n = 0n;
+  for (const b of bytes) n = n * 256n + BigInt(b);
+  let out = '';
+  while (n > 0n) { out = alphabet[Number(n % 58n)] + out; n /= 58n; }
+  for (const b of bytes) { if (b === 0) out = alphabet[0] + out; else break; }
+  return out;
+}
+
+function base58check(version: number, payload: Uint8Array, alphabet = B58_STD): string {
+  const data = concat(new Uint8Array([version]), payload);
+  const checksum = sha256(sha256(data)).slice(0, 4);
+  return base58(concat(data, checksum), alphabet);
 }
 
 function hash160(data: Uint8Array): Uint8Array {
@@ -73,15 +108,35 @@ function eip55(addr20: Uint8Array): string {
   return out;
 }
 
-export function deriveAddress(seed: Uint8Array, chain: SignableChain): string {
+export function deriveAddress(seed: Uint8Array, chain: DerivableChain): string {
   const priv = derivePrivkey(seed, chain);
-  if (chain === 'BTC') {
-    const pub = secp256k1.getPublicKey(priv, true);
-    const h = hash160(pub);
-    return bech32.encode('bc', [0, ...bech32.toWords(h)]);
+  switch (chain) {
+    case 'BTC':
+    case 'LTC': {
+      // P2WPKH bech32 (hrp 'bc' / 'ltc')
+      const pub = secp256k1.getPublicKey(priv, true);
+      const words = bech32.toWords(hash160(pub));
+      return bech32.encode(chain === 'BTC' ? 'bc' : 'ltc', [0, ...words]);
+    }
+    case 'ETH':
+    case 'BNB':
+    case 'POL': {
+      // EVM — Polygon shares the Ethereum address
+      const pub = secp256k1.getPublicKey(priv, false);
+      return eip55(keccak_256(pub.slice(1)).slice(12));
+    }
+    case 'DOGE': {
+      const pub = secp256k1.getPublicKey(priv, true);
+      return base58check(0x1e, hash160(pub));        // P2PKH, version 0x1E → 'D…'
+    }
+    case 'SOL': {
+      return base58(ed25519.getPublicKey(priv));     // base58 of the ed25519 pubkey
+    }
+    case 'XRP': {
+      const pub = secp256k1.getPublicKey(priv, true);
+      return base58check(0x00, hash160(pub), B58_XRP); // classic address (ripple alphabet)
+    }
   }
-  const pub = secp256k1.getPublicKey(priv, false);
-  return eip55(keccak_256(pub.slice(1)).slice(12));
 }
 
 // ── EVM (ETH / BNB) ───────────────────────────────────────────────────────────

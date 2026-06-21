@@ -4,23 +4,30 @@ export const CHAINS = {
   BTC:  { name: 'Bitcoin',  icon: '₿', color: '#f7931a', tokens: false },
   ETH:  { name: 'Ethereum', icon: 'Ξ', color: '#627EEA', tokens: true  },
   BNB:  { name: 'BNB Chain', icon: '◆', color: '#F3BA2F', tokens: true  },
+  POL:  { name: 'Polygon',  icon: '⬡', color: '#8247E5', tokens: true  },
   SOL:  { name: 'Solana',   icon: '◎', color: '#9945FF', tokens: false },
+  XRP:  { name: 'XRP',      icon: '✕', color: '#00AAE4', tokens: false },
   DOGE: { name: 'Dogecoin', icon: 'Ð', color: '#C2A633', tokens: false },
   LTC:  { name: 'Litecoin', icon: 'Ł', color: '#A5A5A5', tokens: false },
 } as const;
 
 export type ChainId = keyof typeof CHAINS;
 
-const EVM_RPC: Record<string, string> = {
-  ETH: 'https://eth.llamarpc.com',
-  BNB: 'https://bsc-dataseed.binance.org',
+// Multiple public RPCs per EVM chain; tried in order so a single 403/outage
+// (e.g. llamarpc started returning 403) doesn't break balance lookups.
+const EVM_RPCS: Record<string, string[]> = {
+  ETH: ['https://cloudflare-eth.com', 'https://ethereum-rpc.publicnode.com', 'https://rpc.ankr.com/eth'],
+  BNB: ['https://bsc-dataseed.binance.org', 'https://bsc-rpc.publicnode.com'],
+  POL: ['https://polygon-rpc.com', 'https://polygon-bor-rpc.publicnode.com', 'https://rpc.ankr.com/polygon'],
 };
 
 const ADDRESS_PATTERNS: Record<ChainId, RegExp> = {
   BTC:  /^(bc1[a-z0-9]{20,90}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$/,
   ETH:  /^0x[0-9a-fA-F]{40}$/,
   BNB:  /^0x[0-9a-fA-F]{40}$/,
+  POL:  /^0x[0-9a-fA-F]{40}$/,
   SOL:  /^[1-9A-HJ-NP-Za-km-z]{32,44}$/,
+  XRP:  /^r[1-9A-HJ-NP-Za-km-z]{24,34}$/,
   DOGE: /^D[a-km-zA-HJ-NP-Z1-9]{25,34}$/,
   LTC:  /^(ltc1[a-z0-9]{20,90}|[LM][a-km-zA-HJ-NP-Z1-9]{25,34})$/,
 };
@@ -35,14 +42,24 @@ async function fetchJson(url: string, init?: RequestInit): Promise<any> {
   return res.json();
 }
 
-async function evmRpc(rpc: string, method: string, params: unknown[]): Promise<string> {
-  const j = await fetchJson(rpc, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-  });
-  if (j.error) throw new Error(j.error.message ?? 'RPC error');
-  return j.result as string;
+async function evmRpc(chain: string, method: string, params: unknown[]): Promise<string> {
+  const rpcs = EVM_RPCS[chain];
+  if (!rpcs || !rpcs.length) throw new Error(`No RPC for ${chain}`);
+  let lastErr: unknown;
+  for (const rpc of rpcs) {
+    try {
+      const j = await fetchJson(rpc, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      });
+      if (j.error) throw new Error(j.error.message ?? 'RPC error');
+      return j.result as string;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw new Error(`All ${chain} RPCs unavailable: ${(lastErr as Error)?.message ?? 'unknown'}`);
 }
 
 function hexToBigInt(hex: string): bigint {
@@ -74,13 +91,12 @@ function decodeAbiString(hex: string): string {
 }
 
 export async function fetchTokenMeta(
-  chain: 'ETH' | 'BNB',
+  chain: 'ETH' | 'BNB' | 'POL',
   contract: string,
 ): Promise<{ symbol: string; decimals: number }> {
-  const rpc = EVM_RPC[chain];
   const [symHex, decHex] = await Promise.all([
-    evmRpc(rpc, 'eth_call', [{ to: contract, data: '0x95d89b41' }, 'latest']).catch(() => ''),
-    evmRpc(rpc, 'eth_call', [{ to: contract, data: '0x313ce567' }, 'latest']).catch(() => '0x12'),
+    evmRpc(chain, 'eth_call', [{ to: contract, data: '0x95d89b41' }, 'latest']).catch(() => ''),
+    evmRpc(chain, 'eth_call', [{ to: contract, data: '0x313ce567' }, 'latest']).catch(() => '0x12'),
   ]);
   const symbol = symHex ? decodeAbiString(symHex) : '';
   const decimals = decHex && decHex !== '0x' ? parseInt(decHex, 16) : 18;
@@ -98,8 +114,9 @@ async function fetchNativeBalance(chain: ChainId, address: string): Promise<numb
       return (funded - spent) / 1e8;
     }
     case 'ETH':
-    case 'BNB': {
-      const hex = await evmRpc(EVM_RPC[chain], 'eth_getBalance', [address, 'latest']);
+    case 'BNB':
+    case 'POL': {
+      const hex = await evmRpc(chain, 'eth_getBalance', [address, 'latest']);
       return units(hexToBigInt(hex), 18);
     }
     case 'SOL': {
@@ -111,6 +128,19 @@ async function fetchNativeBalance(chain: ChainId, address: string): Promise<numb
       if (j.error) throw new Error(j.error.message);
       return (j.result?.value ?? 0) / 1e9;
     }
+    case 'XRP': {
+      const j = await fetchJson('https://xrplcluster.com/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ method: 'account_info', params: [{ account: address, ledger_index: 'validated' }] }),
+      });
+      const r = j.result ?? {};
+      if (r.status === 'error') {
+        if (r.error === 'actNotFound') return 0; // unfunded account (below reserve)
+        throw new Error(r.error_message ?? r.error ?? 'XRP error');
+      }
+      return Number(r.account_data?.Balance ?? 0) / 1e6;
+    }
     case 'DOGE':
     case 'LTC': {
       const net = chain === 'DOGE' ? 'doge' : 'ltc';
@@ -121,9 +151,8 @@ async function fetchNativeBalance(chain: ChainId, address: string): Promise<numb
 }
 
 async function fetchTokenBalance(asset: TrackedAsset): Promise<number> {
-  const rpc = EVM_RPC[asset.chain];
-  if (!rpc || !asset.contract) throw new Error('Token not supported on this chain');
-  const hex = await evmRpc(rpc, 'eth_call', [
+  if (!EVM_RPCS[asset.chain] || !asset.contract) throw new Error('Token not supported on this chain');
+  const hex = await evmRpc(asset.chain, 'eth_call', [
     { to: asset.contract, data: '0x70a08231' + pad32(asset.address) },
     'latest',
   ]);
