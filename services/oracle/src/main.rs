@@ -892,8 +892,40 @@ async fn handle_snapshot_submit(
     if new_h >= cur_h {
         *snap = Some(payload.clone());
         drop(snap);
-        tokio::task::spawn_blocking(move || save_snapshot(&payload));
+        let to_save = payload.clone();
+        tokio::task::spawn_blocking(move || save_snapshot(&to_save));
+    } else {
+        drop(snap);
     }
+
+    // Self-heal: fill any holes in the block feed from the trusted snapshot, which
+    // carries the full recent window. A dropped /chain/submit no longer leaves a
+    // permanent gap that wedges syncing nodes — the next snapshot patches it.
+    if let Some(blocks_arr) = payload.get("blocks").and_then(|b| b.as_array()) {
+        let mut chain = state.chain.write().await;
+        let existing: std::collections::HashSet<u64> =
+            chain.blocks.iter().filter_map(|b| b["height"].as_u64()).collect();
+        let mut missing: Vec<Value> = blocks_arr.iter()
+            .filter(|b| b["height"].as_u64().map(|h| !existing.contains(&h)).unwrap_or(false))
+            .cloned()
+            .collect();
+        let mut filled = 0u32;
+        if !missing.is_empty() {
+            missing.sort_by_key(|b| b["height"].as_u64().unwrap_or(0)); // parents before children
+            for b in missing {
+                if chain.merge_block_checked(b).is_ok() { filled += 1; }
+            }
+        }
+        let nblocks = chain.blocks.len() as u64;
+        drop(chain);
+        if filled > 0 {
+            use std::sync::atomic::Ordering;
+            state.stat_blocks.store(nblocks, Ordering::Relaxed);
+            state.chain_dirty.store(true, Ordering::Relaxed);
+            info!("[SelfHeal] snapshot merge filled {} missing block(s) in the oracle feed", filled);
+        }
+    }
+
     (StatusCode::OK, Json(json!({ "ok": true, "height": new_h.max(cur_h) })))
 }
 
