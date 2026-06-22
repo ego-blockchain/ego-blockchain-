@@ -193,6 +193,8 @@ pub async fn start_rpc_server() {
         .route("/hosting/nodes/:domain",  get(hosting_nodes))
         .route("/hosting/announce",       post(hosting_announce))
         .route("/faucet",                 get(faucet_handler))
+        .route("/chain/blocks",           get(chain_blocks))
+        .route("/chain/transactions",     get(chain_transactions))
         .fallback(vhost_handler)
         .with_state(subs)
         .layer(middleware::from_fn(cors_layer));
@@ -209,7 +211,66 @@ pub async fn start_rpc_server() {
 
 // ── Health ─────────────────────────────────────────────────────────────────────
 
-async fn health() -> &'static str { "ok" }
+async fn health() -> Json<Value> {
+    let (tip, fin, txc) = tokio::task::spawn_blocking(|| {
+        (
+            crate::chain_db::latest_block_info().0,
+            crate::chain_db::finalized_height(),
+            crate::chain_db::tx_count(),
+        )
+    })
+    .await
+    .unwrap_or((0, 0, 0));
+    Json(json!({
+        "status":           "ok",
+        "block_height":     tip,
+        "chain_tip":        tip,
+        "finalized_height": fin,
+        "tx_count":         txc,
+    }))
+}
+
+// ── Read-only chain endpoints (public block explorer backend) ────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ChainQuery {
+    #[serde(rename = "fromHeight")]
+    from_height: Option<u64>,
+    limit:       Option<u32>,
+}
+
+async fn chain_blocks(Query(q): Query<ChainQuery>) -> Json<Vec<crate::ledger::LedgerBlock>> {
+    let blocks = tokio::task::spawn_blocking(move || {
+        let limit = q.limit.unwrap_or(500).min(1000);
+        let tip   = crate::chain_db::latest_block_info().0;
+        let start = match q.from_height {
+            Some(f) => f.max(1),
+            None    => tip.saturating_sub(limit as u64).saturating_add(1).max(1),
+        };
+        crate::chain_db::get_blocks_range(start, limit)
+    })
+    .await
+    .unwrap_or_default();
+    Json(blocks)
+}
+
+async fn chain_transactions(Query(q): Query<ChainQuery>) -> Json<Vec<crate::ledger::LedgerTx>> {
+    let txs = tokio::task::spawn_blocking(move || {
+        let limit = q.limit.unwrap_or(500).min(1000);
+        let tip   = crate::chain_db::latest_block_info().0;
+        let start = match q.from_height {
+            Some(f) => f.max(1),
+            None    => tip.saturating_sub(limit as u64).saturating_add(1).max(1),
+        };
+        crate::chain_db::get_blocks_range(start, limit)
+            .iter()
+            .flat_map(|b| crate::chain_db::get_txs_for_block(b.height))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    Json(txs)
+}
 
 // ── Faucet ─────────────────────────────────────────────────────────────────────
 
