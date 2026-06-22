@@ -964,8 +964,8 @@ pub fn elect_proposer_for_next_slot() -> Option<String> {
     if validators.len() <= 10 && !validators.is_empty() {
         let mut vs = validators.clone();
         vs.sort();
-        let view = current_view();
-        let idx = (view as usize).wrapping_rem(vs.len());
+        let next_height = crate::chain_db::latest_block_info().0 + 1;
+        let idx = (next_height as usize).wrapping_rem(vs.len());
         return vs.get(idx).cloned();
     }
 
