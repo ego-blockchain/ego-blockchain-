@@ -83,7 +83,17 @@
         "icons/icon.ico",
         "icons/icon.png"
       ],
-      "resources": ["icons/ego_square.png"],
+      "resources": {
+        "icons/ego_square.png": "icons/",
+        "runtime/vcruntime140.dll": "",
+        "runtime/vcruntime140_1.dll": "",
+        "runtime/msvcp140.dll": "",
+        "runtime/msvcp140_1.dll": "",
+        "runtime/msvcp140_2.dll": "",
+        "runtime/concrt140.dll": "",
+        "runtime/mfc140.dll": "",
+        "runtime/mfc140u.dll": ""
+      },
       "externalBin": [],
       "copyright": "",
       "category": "DeveloperTool",
