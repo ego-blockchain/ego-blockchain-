@@ -1771,6 +1771,8 @@ pub enum P2PMessage {
         /// can't both have their competing proposals voted into a quorum.
         #[serde(default)]
         view:         u64,
+        #[serde(default)]
+        proposer_pubkey: String,
     },
     BlockVote {
         block_hash: String,
@@ -5166,9 +5168,10 @@ async fn handle_event(
                     _ => {}
                 }
             } else if topic == "ego-proposals-v1" {
-                if let Ok(P2PMessage::BlockProposal { block, transactions, proposer, signature, vrf_ticket, view }) =
+                if let Ok(P2PMessage::BlockProposal { block, transactions, proposer, signature, vrf_ticket, view, proposer_pubkey }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
+                    learn_voter_pubkey(&proposer, &proposer_pubkey);
                     // Only count validators building on our chain.
                     // A stranger on a different fork has a prev_hash we don't know.
                     let our_tip = crate::chain_db::latest_block_info().0;
@@ -6432,7 +6435,8 @@ P2PMessage::ChatMessage { bundle, seq } => {
             apply_incoming_tx(tx, block, app).await;
         }
 
-        P2PMessage::BlockProposal { block, transactions, proposer, signature, vrf_ticket, view } => {
+        P2PMessage::BlockProposal { block, transactions, proposer, signature, vrf_ticket, view, proposer_pubkey } => {
+            learn_voter_pubkey(&proposer, &proposer_pubkey);
             register_known_validator(&proposer);
             handle_block_proposal(block, transactions, proposer, signature, vrf_ticket, view, app).await;
         }
@@ -9681,6 +9685,7 @@ pub async fn propose_block_as_leader() {
             signature,
             vrf_ticket:   hex::encode(&vrf_ticket2),
             view:         current_view(),
+            proposer_pubkey: my_ed25519_pubkey_hex(),
         };
         if let Ok(data) = serde_json::to_vec(&proposal) {
             publish_gossip("ego-proposals-v1", data).await;
@@ -9817,6 +9822,7 @@ pub async fn propose_block_as_leader() {
         signature,
         vrf_ticket:   hex::encode(&vrf_ticket),
         view:         current_view(),
+        proposer_pubkey: my_ed25519_pubkey_hex(),
     };
 
     if let Ok(data) = serde_json::to_vec(&proposal) {
@@ -10018,6 +10024,7 @@ pub async fn propose_block_as_leader_forced() {
             signature,
             vrf_ticket:   hex::encode(&vrf_ticket2),
             view:         current_view(),
+            proposer_pubkey: my_ed25519_pubkey_hex(),
         };
         if let Ok(data) = serde_json::to_vec(&proposal) {
             publish_gossip("ego-proposals-v1", data).await;
@@ -10156,6 +10163,7 @@ pub async fn propose_block_as_leader_forced() {
         signature,
         vrf_ticket:   hex::encode(&vrf_ticket2),
         view:         current_view(),
+        proposer_pubkey: my_ed25519_pubkey_hex(),
     };
 
     if let Ok(data) = serde_json::to_vec(&proposal) {
