@@ -409,7 +409,7 @@ const EarningsPage: React.FC = () => {
           { label: 'Settlement Rate', val: earnings ? fmtEgoc(earnings.daily_rewards) : '—',    unit: 'EGOC / 24H', color: 'text-emerald-400', bg: 'bg-emerald-500/5 border-emerald-500/10' },
           { label: 'Epoch Target',   val: earnings ? fmtEgoc(earnings.epoch_rewards)  : '—',    unit: 'EGOC / 7D',  color: 'text-cyan-400',    bg: 'bg-cyan-500/5 border-cyan-500/10'    },
           { label: 'Pending Payout', val: earnings ? fmtEgoc(earnings.pending_rewards): '—',    unit: 'UEGOC UNCONFIRMED', color: 'text-amber-400',   bg: 'bg-amber-500/5 border-amber-500/10'   },
-          { label: 'Lifetime Yield', val: earnings ? fmtEgoc(earnings.total_earned)   : '—',    unit: 'TOTAL EGOC MINTED', color: 'text-indigo-400',  bg: 'bg-indigo-500/5 border-indigo-500/10' },
+          { label: 'Lifetime Earnings', val: earnings ? fmtEgoc(earnings.total_earned)   : '—',    unit: 'TOTAL EGOC · ALL TIME', color: 'text-indigo-400',  bg: 'bg-indigo-500/5 border-indigo-500/10' },
         ].map(c => (
           <div key={c.label} className={`${c.bg} rounded-xl p-5 border relative overflow-hidden group hover:bg-opacity-10 transition-all`}>
             <div className="text-[10px] font-black text-slate-500 uppercase tracking-[0.15em] mb-3">{c.label}</div>

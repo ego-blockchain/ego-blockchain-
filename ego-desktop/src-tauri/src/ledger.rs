@@ -708,6 +708,15 @@ pub struct Ledger {
     #[serde(default)]
     pub reward_suspended_until: Option<i64>,
 
+    /// Persisted cumulative rewards this node has ever earned (block + storage + coverage +
+    /// retrieval). Accumulated forward via `lifetime_counted_height`, so it survives app
+    /// restarts AND chain pruning (the local chain only retains recent blocks).
+    #[serde(default)]
+    pub lifetime_earned_uegoc: u64,
+    /// Highest block height already counted into `lifetime_earned_uegoc` (watermark).
+    #[serde(default)]
+    pub lifetime_counted_height: u64,
+
     /// TX hash of the most recent stake submission that has NOT yet been confirmed on-chain.
     /// Used at startup to reconcile ledger.staked_amount against the actual chain state:
     /// if this hash has no confirmed block_height in chain_db, the local stake state is
