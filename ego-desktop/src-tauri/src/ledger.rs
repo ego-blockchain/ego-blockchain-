@@ -1433,7 +1433,11 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
     // Stakers (≥ MIN_STAKE_FREE_TX_UEGOC) get free transactions as a reward
     // for securing the network. Everyone else must pay the minimum fee.
     // This prevents mempool spam: flooding with free txs now costs real money.
-    if tx.fee_uegoc < crate::tokenomics::FEE_FLOOR_UEGOC {
+    let is_validator_reg = tx.tx_type == "validator_register"
+        && tx.from == tx.to
+        && tx.amount == 0;
+
+    if !is_validator_reg && tx.fee_uegoc < crate::tokenomics::FEE_FLOOR_UEGOC {
         return Err(format!(
             "tx from {} rejected: fee {} uEGOC below absolute floor {} uEGOC. Zero-fee transactions are disabled to prevent network spam.",
             tx.from, tx.fee_uegoc,
@@ -1455,7 +1459,8 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
     // supply inflation.  We reject here so the TX never enters a confirmed block.
     // Stake/unstake TXs are exempt: the staking contract handles those flows.
     let is_staking_tx = tx.tx_type == "stake" || tx.tx_type == "unstake";
-    if !is_staking_tx {
+    if is_validator_reg {
+    } else if !is_staking_tx {
         let confirmed_balance = crate::chain_db::balance_of(&tx.from);
         let required = tx.amount.saturating_add(tx.fee_uegoc);
         if confirmed_balance < required {
