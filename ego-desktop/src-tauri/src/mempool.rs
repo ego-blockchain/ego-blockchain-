@@ -99,6 +99,10 @@ impl ShardedMempool {
             || tx.tx_type == "faucet"
             || tx.from.starts_with("egot1faucet");
 
+        let is_validator_reg = tx.tx_type == "validator_register"
+            && tx.from == tx.to
+            && tx.amount == 0;
+
         if is_system && !is_pool_faucet {
             tracing::warn!("Mempool rejected {} - system txs are only valid inside verified blocks", tx.hash);
             return Err("System txs are only valid inside verified blocks".into());
@@ -160,16 +164,18 @@ impl ShardedMempool {
         }
 
         if !is_system {
-            if tx.fee_uegoc < MIN_FEE_UEGOC {
-                let err = format!("fee {} uEGOC below floor {}", tx.fee_uegoc, MIN_FEE_UEGOC);
-                eprintln!("[Mempool] REJECTED {:.12} — {}", &tx.hash[..12.min(tx.hash.len())], err);
-                return Err(err);
-            }
-            let current_base_fee = crate::chain_db::get_current_base_fee();
-            if tx.fee_uegoc < current_base_fee {
-                let err = format!("fee {} uEGOC below base fee {}", tx.fee_uegoc, current_base_fee);
-                eprintln!("[Mempool] REJECTED {:.12} — {}", &tx.hash[..12.min(tx.hash.len())], err);
-                return Err(err);
+            if !is_validator_reg {
+                if tx.fee_uegoc < MIN_FEE_UEGOC {
+                    let err = format!("fee {} uEGOC below floor {}", tx.fee_uegoc, MIN_FEE_UEGOC);
+                    eprintln!("[Mempool] REJECTED {:.12} — {}", &tx.hash[..12.min(tx.hash.len())], err);
+                    return Err(err);
+                }
+                let current_base_fee = crate::chain_db::get_current_base_fee();
+                if tx.fee_uegoc < current_base_fee {
+                    let err = format!("fee {} uEGOC below base fee {}", tx.fee_uegoc, current_base_fee);
+                    eprintln!("[Mempool] REJECTED {:.12} — {}", &tx.hash[..12.min(tx.hash.len())], err);
+                    return Err(err);
+                }
             }
 
             if tx.nonce > 0 {
@@ -240,7 +246,7 @@ impl ShardedMempool {
                 })
                 .fold(0u64, |acc, v| acc.saturating_add(v));
             let required = tx.amount.saturating_add(tx.fee_uegoc).saturating_add(pending_outflow);
-            if balance < required {
+            if !is_validator_reg && balance < required {
                 let err = format!("insufficient balance: has {} uEGOC, needs {} (amount {} + fee {} + pending_outflow {})",
                     balance, required, tx.amount, tx.fee_uegoc, pending_outflow);
                 eprintln!("[Mempool] REJECTED {:.12} — {}", &tx.hash[..12.min(tx.hash.len())], err);

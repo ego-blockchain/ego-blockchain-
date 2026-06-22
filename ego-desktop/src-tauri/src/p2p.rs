@@ -8527,7 +8527,7 @@ pub fn maybe_emit_validator_registration() {
         from: addr.clone(),
         to: addr.clone(),
         amount: 0,
-        fee_uegoc: 10_000, // 0.01 EGOC — clears the mempool's anti-spam fee floor
+        fee_uegoc: 0,
         memo: Some(memo),
         timestamp: ts,
         status: "Pending".into(),
