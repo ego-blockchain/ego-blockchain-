@@ -367,12 +367,6 @@ pub async fn push_block_to_oracle(block: &crate::ledger::LedgerBlock, txs: &[cra
         "transactions": txs,
     });
     oracle_post(&client, "/chain/submit", &body).await;
-    // Every 50 blocks, also publish a full state snapshot. Besides letting fresh
-    // nodes checkpoint-sync, the oracle now merges the snapshot's blocks to patch
-    // any holes — so a more frequent snapshot heals gaps faster.
-    if block.height % 50 == 0 {
-        push_snapshot_to_oracle().await;
-    }
 }
 
 pub static RELAY_CIRCUIT_READY: AtomicBool = AtomicBool::new(false);
@@ -757,9 +751,6 @@ static LIVENESS_STALLED: std::sync::atomic::AtomicBool =
 const SOLO_STALL_SECS: i64 = 15;
 const SOLO_ALONE_STALL_SECS: i64 = 4;
 
-static SOLO_AFTER_EVICTION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// Validators recently evicted via the deadlock-eviction path. Each entry
 /// holds the wall-clock timestamp until which the address should NOT be
 /// re-registered, regardless of incoming gossip echoes. Without this, a
@@ -786,22 +777,6 @@ pub fn record_eviction_cooldown(addr: &str) {
     eviction_cooldown().insert(addr.to_string(), until);
 }
 
-/// Decides whether the next proposal should be solo-committed.
-/// Returns true ONLY if the current committee has shrunk to a single
-/// validator. The `SOLO_AFTER_EVICTION` flag is cleared regardless so a
-/// stale flag from an earlier eviction can never authorise a fork once
-/// peers rejoin.
-/// Wall-clock time (unix secs) of the first solo-commit check — the start of the
-/// bootstrap anti-fork grace window. Lazily set on first call.
-static SOLO_GRACE_START_TS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
-fn bootstrap_solo_grace_secs() -> i64 {
-    std::env::var("EGO_BOOTSTRAP_SOLO_GRACE_SECS")
-        .ok().and_then(|v| v.parse().ok())
-        .unwrap_or(25)
-}
-
-
 fn should_solo_commit_now() -> bool {
     let allow_solo_fork = std::env::var("EGO_ALLOW_SOLO_FORK")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -809,48 +784,10 @@ fn should_solo_commit_now() -> bool {
     if !allow_solo_fork {
         return false;
     }
-    let stale_flag = SOLO_AFTER_EVICTION.swap(false, Ordering::Relaxed);
     let committee_alone = known_validators().len() <= 1;
-    if stale_flag && !committee_alone {
-        tracing::debug!("[BFT] discarding stale SOLO_AFTER_EVICTION — committee grew back to {}", known_validators().len());
-    }
-
     let deadlocked = STUCK_VIEWCHANGE_CYCLES.load(Ordering::Relaxed) >= SOLO_DEADLOCK_VIEWS
         || LIVENESS_STALLED.load(Ordering::Relaxed);
-
-    if !committee_alone && !deadlocked {
-        return false;
-    }
-
-    let allow_solo_fork = std::env::var("EGO_ALLOW_SOLO_FORK")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if !allow_solo_fork && crate::chain_db::chain_has_graduated_sticky(32) {
-        static LAST_HALT_LOG: AtomicI64 = AtomicI64::new(0);
-        let now = chrono::Utc::now().timestamp();
-        if now - LAST_HALT_LOG.swap(now, Ordering::Relaxed) > 30 {
-            tracing::warn!("[BFT] Chain is quorum-finalized — refusing to solo-produce a sub-quorum block (peers reject it via the QC ratchet). Halting until a 2+ validator quorum re-forms; set EGO_ALLOW_SOLO_FORK=1 to override (dev only).");
-        }
-        return false;
-    }
-
-    if deadlocked {
-        return true;
-    }
-
-    let grace = bootstrap_solo_grace_secs();
-    if grace > 0 {
-        let now = chrono::Utc::now().timestamp();
-        let start = SOLO_GRACE_START_TS.load(Ordering::Relaxed);
-        let start = if start == 0 {
-            SOLO_GRACE_START_TS.store(now, Ordering::Relaxed);
-            now
-        } else { start };
-        if now - start < grace {
-            return false;
-        }
-    }
-    true
+    committee_alone || deadlocked
 }
 
 pub static ORACLE_GAP_FILL_NEEDED: AtomicBool = AtomicBool::new(false);
@@ -1234,52 +1171,6 @@ pub fn active_node_count() -> usize {
         .filter(|a| seen.get(*a).map(|&t| now - t < 180).unwrap_or(false))
         .count();
     peers + 1
-}
-
-fn is_bootstrap_validator() -> bool {
-    std::env::var("EGO_BOOTSTRAP_VALIDATOR")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
-fn bootstrap_retire_threshold() -> usize {
-    std::env::var("EGO_BOOTSTRAP_RETIRE_AT")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(50)
-}
-
-fn bootstrap_rejoin_floor() -> usize {
-    std::env::var("EGO_BOOTSTRAP_REJOIN_FLOOR")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(8)
-}
-
-static BOOTSTRAP_RETIRED: AtomicBool = AtomicBool::new(false);
-
-/// Whether this node should currently propose and vote. Always true for a normal
-/// node (the env flag is unset). A bootstrap validator (EGO_BOOTSTRAP_VALIDATOR=1)
-/// validates only until the network is self-sufficient: once it sees
-/// >= EGO_BOOTSTRAP_RETIRE_AT (default 50) active nodes it retires (stops proposing
-/// and voting, drops itself from the local committee, keeps serving oracle/relay/RPC
-/// + full-node sync). It re-activates only if the active set later collapses below
-/// EGO_BOOTSTRAP_REJOIN_FLOOR (default 8) so the chain can never die.
-pub fn bootstrap_validator_active() -> bool {
-    if !is_bootstrap_validator() { return true; }
-    let active = active_node_count();
-    if BOOTSTRAP_RETIRED.load(Ordering::Relaxed) {
-        if active < bootstrap_rejoin_floor() {
-            BOOTSTRAP_RETIRED.store(false, Ordering::Relaxed);
-            tracing::warn!("[BFT] Bootstrap validator re-activating — only {} active nodes (below floor) — rejoining consensus to keep the chain alive", active);
-            return true;
-        }
-        return false;
-    }
-    if active >= bootstrap_retire_threshold() {
-        BOOTSTRAP_RETIRED.store(true, Ordering::Relaxed);
-        tracing::info!("[BFT] Bootstrap validator retiring — {} active nodes >= {} threshold — network is self-sufficient; continuing as oracle/relay/RPC + full node only", active, bootstrap_retire_threshold());
-        let local = local_validator_mutex().lock().unwrap().clone();
-        if !local.is_empty() { known_validators().remove(&local); }
-        return false;
-    }
-    true
 }
 
 pub fn min_validator_stake_uegoc() -> u64 {
@@ -1687,6 +1578,14 @@ pub enum P2PMessage {
     ChainSyncResponse {
         blocks:       Vec<LedgerBlock>,
         transactions: Vec<LedgerTx>,
+    },
+    SnapshotRequest {
+        requester_endpoint: String,
+        #[serde(default)]
+        have_height: u64,
+    },
+    SnapshotResponse {
+        snapshot: crate::chain_db::StateSnapshot,
     },
     PeerListRequest {
         requester_endpoint: String,
@@ -3935,6 +3834,9 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     let sync_req_topic = gossipsub::IdentTopic::new("ego-sync-v1");
     swarm.behaviour_mut().gossipsub.subscribe(&sync_req_topic).ok();
 
+    let snapshot_topic = gossipsub::IdentTopic::new("ego-snapshot-v1");
+    swarm.behaviour_mut().gossipsub.subscribe(&snapshot_topic).ok();
+
     let hosting_topic = gossipsub::IdentTopic::new("ego-hosting-v1");
     swarm.behaviour_mut().gossipsub.subscribe(&hosting_topic).ok();
 
@@ -5149,7 +5051,11 @@ async fn handle_event(
                                 let now = Utc::now().timestamp_millis();
                                 if now - LAST_GAP_REQ.load(Ordering::Relaxed) > 2000 {
                                     LAST_GAP_REQ.store(now, Ordering::Relaxed);
-                                    request_gap_backfill(local_tip, &source_pid).await;
+                                    if height > local_tip + crate::chain_db::SNAPSHOT_BLOCK_WINDOW as u64 {
+                                        request_snapshot_from_peers(local_tip).await;
+                                    } else {
+                                        request_gap_backfill(local_tip, &source_pid).await;
+                                    }
                                 }
                             }
                             if process_inbound_qc_finalization(&block_hash, height, &votes, &agg_bls_sig, &bls_pubkeys) {
@@ -5233,11 +5139,31 @@ async fn handle_event(
                                 blocks.len(), transactions.len(), from_height.max(1),
                                 blocks.last().map(|b| b.height).unwrap_or(from_height));
                             let response = P2PMessage::ChainSyncResponse { blocks, transactions };
-                            
+
                             // Send response via gossip to bypass NAT dial-back issues
                             if let Ok(data) = serde_json::to_vec(&response) {
                                 publish_gossip("ego-blocks-v1", data).await;
                             }
+                        });
+                    }
+                }
+            } else if topic == "ego-snapshot-v1" {
+                if let Ok(P2PMessage::SnapshotRequest { requester_endpoint, have_height }) =
+                    serde_json::from_slice::<P2PMessage>(&message.data)
+                {
+                    let local_tip = crate::chain_db::latest_block_info().0;
+                    if local_tip > have_height + crate::chain_db::SNAPSHOT_BLOCK_WINDOW as u64
+                        && !requester_endpoint.is_empty()
+                        && sync_reply_allowed(&requester_endpoint)
+                    {
+                        tokio::spawn(async move {
+                            let snap = match tokio::task::spawn_blocking(crate::chain_db::export_state_snapshot).await {
+                                Ok(s) => s,
+                                Err(_) => return,
+                            };
+                            if snap.height <= have_height { return; }
+                            let resp = P2PMessage::SnapshotResponse { snapshot: snap };
+                            let _ = send_message(&requester_endpoint, &resp).await;
                         });
                     }
                 }
@@ -6488,6 +6414,36 @@ P2PMessage::ChatMessage { bundle, seq } => {
             }
         }
 
+        P2PMessage::SnapshotRequest { requester_endpoint, have_height } => {
+            let local_tip = crate::chain_db::latest_block_info().0;
+            if local_tip > have_height + crate::chain_db::SNAPSHOT_BLOCK_WINDOW as u64
+                && !requester_endpoint.is_empty()
+                && sync_reply_allowed(&requester_endpoint)
+            {
+                tokio::spawn(async move {
+                    let snap = match tokio::task::spawn_blocking(crate::chain_db::export_state_snapshot).await {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    if snap.height <= have_height { return; }
+                    let resp = P2PMessage::SnapshotResponse { snapshot: snap };
+                    let _ = send_message(&requester_endpoint, &resp).await;
+                });
+            }
+        }
+
+        P2PMessage::SnapshotResponse { snapshot } => {
+            let local_tip = crate::chain_db::latest_block_info().0;
+            if snapshot.height > local_tip {
+                let h = snapshot.height;
+                let ok = tokio::task::spawn_blocking(move || crate::chain_db::import_state_snapshot(&snapshot))
+                    .await.map(|r| r.is_ok()).unwrap_or(false);
+                if ok {
+                    eprintln!("[P2PSnapshot] checkpoint-synced to height {} from peer (local was {})", h, local_tip);
+                }
+            }
+        }
+
         P2PMessage::HeaderSyncRequest { from_height, limit } => {
 
             let headers  = crate::chain_db::get_block_headers(from_height, limit.min(10_000));
@@ -7607,6 +7563,15 @@ async fn request_gap_backfill(from_height: u64, source_peer_id: &str) {
     }
 }
 
+pub async fn request_snapshot_from_peers(have_height: u64) {
+    let my_endpoint = get_public_endpoint().await;
+    if my_endpoint.is_empty() { return; }
+    let msg = P2PMessage::SnapshotRequest { requester_endpoint: my_endpoint, have_height };
+    if let Ok(data) = serde_json::to_vec(&msg) {
+        publish_gossip("ego-snapshot-v1", data).await;
+    }
+}
+
 async fn merge_remote_chain(
     blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: Option<&tauri::AppHandle<tauri::Wry>>,
 ) {
@@ -8070,289 +8035,6 @@ async fn merge_remote_chain_inner(
     }
 }
 
-pub async fn oracle_sync_chain() {
-    // Only designated writer nodes push the local chain to the oracle.
-    if !is_oracle_writer() { return; }
-    let tip = crate::chain_db::block_count().saturating_sub(1);
-    if tip == 0 { return; }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap_or_default();
-
-    // Fetch oracle's current tip to avoid redundant submissions.
-    #[derive(serde::Deserialize, Default)]
-    struct OracleHealth { chain_tip: Option<u64> }
-    let oracle_tip: u64 = match oracle_get(&client, "/health").await {
-        Some(resp) => resp.json::<OracleHealth>().await
-            .map(|h| h.chain_tip.unwrap_or(0))
-            .unwrap_or(0),
-        None => 0,
-    };
-
-    let mut from_height = oracle_tip + 1;
-    if oracle_tip >= tip {
-        let local_hash = crate::chain_db::get_block_by_height(tip)
-            .map(|b| b.hash.clone())
-            .unwrap_or_default();
-        let oracle_hash: String = match oracle_get(&client, &format!("/chain/blocks?fromHeight={}&limit=1", tip)).await {
-            Some(resp) => resp.json::<Vec<serde_json::Value>>().await
-                .ok()
-                .and_then(|v| v.into_iter().find(|b| b["height"].as_u64() == Some(tip)))
-                .and_then(|b| b["hash"].as_str().map(String::from))
-                .unwrap_or_default(),
-            None => return,
-        };
-        if local_hash.is_empty() || local_hash == oracle_hash {
-            eprintln!("[Oracle] catch-up: oracle tip={} >= local tip={}, chains agree — skipping", oracle_tip, tip);
-            return;
-        }
-        eprintln!("[Oracle] catch-up: oracle on divergent chain (tip={} hash mismatch at #{}) — resubmitting local chain", oracle_tip, tip);
-        from_height = 1;
-    }
-
-    eprintln!("[Oracle] catch-up: submitting blocks {}..{} to oracle", from_height, tip);
-    let mut submitted = 0u64;
-    for height in from_height..=tip {
-        let Some(block) = crate::chain_db::get_block_by_height(height) else { continue };
-        let txs = crate::chain_db::get_txs_for_block(height);
-        let body = serde_json::json!({ "block": block, "transactions": txs });
-        oracle_post(&client, "/chain/submit", &body).await;
-        submitted += 1;
-    }
-    eprintln!("[Oracle] catch-up: submitted {} blocks to oracle", submitted);
-}
-
-/// Validator/full-node: publish a trusted state snapshot to the oracle so fresh
-/// nodes can checkpoint-sync instead of replaying (or being unable to fetch) the
-/// full history. Cheap while account count is small; the oracle keeps the highest.
-pub async fn push_snapshot_to_oracle() {
-    if std::env::var("EGO_NO_ORACLE").is_ok() { return; }
-    let snap = match tokio::task::spawn_blocking(crate::chain_db::export_state_snapshot).await {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    if snap.height == 0 { return; }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build().unwrap_or_default();
-    let body = match serde_json::to_value(&snap) { Ok(v) => v, Err(_) => return };
-    oracle_post(&client, "/chain/snapshot", &body).await;
-}
-
-/// Fresh / far-behind node: if the oracle tip is well beyond our local tip (so we
-/// can't paginate the gap — the oracle prunes old blocks, and replaying 10k+ would
-/// not scale), trust-install a state snapshot and jump to the checkpoint. Forward
-/// sync from there is verified normally. Returns true if a snapshot was installed.
-pub async fn fast_sync_from_oracle_if_behind() -> bool {
-    if std::env::var("EGO_NO_ORACLE").is_ok() { return false; }
-    let local_tip = crate::chain_db::latest_block_info().0;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build().unwrap_or_default();
-
-    #[derive(serde::Deserialize, Default)]
-    struct OracleHealth { chain_tip: Option<u64> }
-    let oracle_tip: u64 = match oracle_get(&client, "/health").await {
-        Some(r) => r.json::<OracleHealth>().await.map(|h| h.chain_tip.unwrap_or(0)).unwrap_or(0),
-        None => return false,
-    };
-
-    // Only checkpoint-sync when the gap is larger than the block window we could
-    // paginate; within the window, normal block sync handles it.
-    if oracle_tip == 0 || oracle_tip <= local_tip + crate::chain_db::SNAPSHOT_BLOCK_WINDOW as u64 {
-        return false;
-    }
-
-    let snap: crate::chain_db::StateSnapshot = match oracle_get(&client, "/chain/snapshot").await {
-        Some(r) => match r.json().await {
-            Ok(s) => s,
-            Err(e) => { eprintln!("[FastSync] snapshot decode failed: {e}"); return false; }
-        },
-        None => { eprintln!("[FastSync] oracle snapshot unavailable"); return false; }
-    };
-    if snap.height <= local_tip {
-        return false;
-    }
-    let height = snap.height;
-    match tokio::task::spawn_blocking(move || crate::chain_db::import_state_snapshot(&snap)).await {
-        Ok(Ok(())) => {
-            eprintln!("[FastSync] checkpoint-synced to height {} via trusted oracle snapshot (local was {})", height, local_tip);
-            true
-        }
-        Ok(Err(e)) => { eprintln!("[FastSync] snapshot install failed: {e}"); false }
-        Err(_) => false,
-    }
-}
-
-/// Recovery for a node wedged just below the tip: the oracle's paginated block
-/// feed can have holes (a lost submit), so a node sitting exactly on the block
-/// before a hole can never bridge it via incremental sync — and it's too close
-/// to the tip (< SNAPSHOT_BLOCK_WINDOW) for fast_sync to trigger. The trusted
-/// snapshot is pushed whole by the writer and DOES contain those blocks, so
-/// jumping to it fills the gap. Ignores the distance threshold by design.
-pub async fn force_snapshot_jump() -> bool {
-    if std::env::var("EGO_NO_ORACLE").is_ok() { return false; }
-    let local_tip = crate::chain_db::latest_block_info().0;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build().unwrap_or_default();
-    let snap: crate::chain_db::StateSnapshot = match oracle_get(&client, "/chain/snapshot").await {
-        Some(r) => match r.json().await { Ok(s) => s, Err(_) => return false },
-        None => return false,
-    };
-    if snap.height <= local_tip {
-        return false; // snapshot not ahead — nothing to jump to
-    }
-    let height = snap.height;
-    match tokio::task::spawn_blocking(move || crate::chain_db::import_state_snapshot(&snap)).await {
-        Ok(Ok(())) => {
-            tracing::warn!(
-                "[StuckRecovery] tip was stuck at {} (missing block in the oracle feed) — jumped past the gap to snapshot height {}",
-                local_tip, height
-            );
-            true
-        }
-        _ => false,
-    }
-}
-
-/// Auto-heal: detect if this node is on a fork (its block at a confirmed depth
-/// disagrees with the canonical chain) and, if so, truncate the divergent blocks
-/// and re-sync — so a non-technical user never has to wipe a database by hand.
-/// Read-only when in sync; only acts on a confirmed hash mismatch at depth.
-pub async fn check_and_heal_fork() {
-    if std::env::var("EGO_NO_ORACLE").is_ok() { return; }
-    const FORK_CHECK_DEPTH: u64 = 24;   // compare this many blocks below the tip (finalized)
-    const FORK_WINDOW: u64 = 256;       // how far back to search for the divergence point
-
-    let local_tip = crate::chain_db::latest_block_info().0;
-    if local_tip < 100 { return; }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build().unwrap_or_default();
-
-    #[derive(serde::Deserialize, Default)]
-    struct OracleHealth { chain_tip: Option<u64> }
-    let oracle_tip: u64 = match oracle_get(&client, "/health").await {
-        Some(r) => r.json::<OracleHealth>().await.map(|h| h.chain_tip.unwrap_or(0)).unwrap_or(0),
-        None => return,
-    };
-    if oracle_tip < 100 { return; }
-
-    // Compare at a depth both chains certainly have.
-    let check_h = local_tip.min(oracle_tip).saturating_sub(FORK_CHECK_DEPTH);
-    if check_h < 50 { return; }
-
-    let local_block = match crate::chain_db::get_block_by_height(check_h) {
-        Some(b) => b,
-        None => return,
-    };
-    let canon_at = match oracle_get(&client, &format!("/chain/blocks?fromHeight={}&limit=1", check_h)).await {
-        Some(r) => r.json::<Vec<crate::ledger::LedgerBlock>>().await.unwrap_or_default(),
-        None => return,
-    };
-    let canon_block = match canon_at.into_iter().find(|b| b.height == check_h) {
-        Some(b) => b,
-        None => return,
-    };
-    if canon_block.hash == local_block.hash {
-        return; // on the canonical chain — nothing to do
-    }
-
-    tracing::error!(
-        "[AutoHeal] FORK DETECTED at height {} — local {}… disagrees with canonical {}…. Repairing automatically.",
-        check_h,
-        &local_block.hash[..local_block.hash.len().min(12)],
-        &canon_block.hash[..canon_block.hash.len().min(12)],
-    );
-
-    // Pull a window of canonical blocks and find the highest height where we still
-    // agree — the fork point — so we only truncate the divergent tail.
-    let window_start = check_h.saturating_sub(FORK_WINDOW);
-    let canon_window: Vec<crate::ledger::LedgerBlock> =
-        match oracle_get(&client, &format!("/chain/blocks?fromHeight={}&limit=400", window_start)).await {
-            Some(r) => r.json().await.unwrap_or_default(),
-            None => return,
-        };
-    let canon_by_h: std::collections::HashMap<u64, String> =
-        canon_window.into_iter().map(|b| (b.height, b.hash)).collect();
-
-    let mut fork_point: Option<u64> = None;
-    let mut h = check_h;
-    while h >= window_start {
-        if let (Some(lb), Some(ch)) = (crate::chain_db::get_block_by_height(h), canon_by_h.get(&h)) {
-            if &lb.hash == ch { fork_point = Some(h); break; }
-        }
-        if h == 0 { break; }
-        h -= 1;
-    }
-
-    let truncate_at = fork_point.map(|fp| fp + 1).unwrap_or(window_start);
-    let before_tip = crate::chain_db::latest_block_info().0;
-    let removed = crate::chain_db::truncate_from(truncate_at);
-    let after_tip = crate::chain_db::latest_block_info().0;
-
-    if after_tip >= before_tip {
-        // truncate_from refused (divergence is below the finality checkpoint).
-        tracing::error!(
-            "[AutoHeal] fork is below the finality checkpoint — automatic truncate blocked. \
-             A full chain-DB reset is required to rejoin canonical (delete chain_rocksdb + restart)."
-        );
-        return;
-    }
-
-    tracing::warn!(
-        "[AutoHeal] truncated local chain to height {} ({} txs returned to mempool); re-syncing from canonical.",
-        truncate_at.saturating_sub(1), removed.len()
-    );
-    for tx in removed {
-        let _ = crate::mempool::get_mempool().push(tx);
-    }
-
-    fast_sync_from_oracle_if_behind().await;
-    fetch_chain_from_oracle(None).await;
-}
-
-pub async fn fetch_chain_from_oracle(app: Option<&tauri::AppHandle<tauri::Wry>>) {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap_or_default();
-
-    let local_tip = crate::chain_db::latest_block_info().0;
-    let url = format!("/chain/blocks?fromHeight={}", local_tip);
-    let blocks: Vec<crate::ledger::LedgerBlock> = match oracle_get(&client, &url).await {
-        Some(resp) => resp.json().await.unwrap_or_default(),
-        None => { eprintln!("[Oracle] fetch blocks: all endpoints unreachable"); vec![] }
-    };
-
-    let transactions: Vec<crate::ledger::LedgerTx> = match oracle_get(&client, &format!("/chain/transactions?fromHeight={}", local_tip)).await {
-        Some(resp) => resp.json().await.unwrap_or_default(),
-        None => { eprintln!("[Oracle] fetch txs: all endpoints unreachable"); vec![] }
-    };
-
-    if blocks.is_empty() && transactions.is_empty() {
-        eprintln!("[Oracle] chain empty or unreachable — skipping merge");
-        return;
-    }
-
-
-    if let Some(genesis) = blocks.iter().find(|b| b.height == 0) {
-        if genesis.hash != GENESIS_HASH {
-            eprintln!(
-                "[Oracle] REJECTED: remote genesis hash {} does not match expected {}",
-                genesis.hash, GENESIS_HASH
-            );
-            return;
-        }
-    }
-
-    merge_remote_chain_trusted(blocks, transactions, app).await;
-    eprintln!("[Oracle] Chain merged from Oracle RPC (trusted)");
-}
 
 /// Oracle-backed peer rendezvous. Registers THIS node's dialable relayed
 /// endpoint with the oracle and dials every other registered node, so two
@@ -8678,7 +8360,6 @@ async fn handle_block_proposal(
         return;
     }
 
-    if !bootstrap_validator_active() { return; }
 
     let auth = verify_block_proposal_auth(&block, &proposer, &signature, &vrf_ticket);
     if auth != ProposalAuth::Valid {
@@ -9623,7 +9304,6 @@ async fn handle_view_change_msg(view: u64, voter: String) {
 
 pub async fn propose_block_as_leader() {
     if known_validators().is_empty() { return; }
-    if !bootstrap_validator_active() { return; }
 
     let init = tokio::task::spawn_blocking(|| {
         let miner = crate::ledger::Ledger::load().address;
@@ -9984,7 +9664,6 @@ pub fn try_proactive_proposal() -> std::pin::Pin<Box<dyn std::future::Future<Out
 /// consecutive view changes with no block — prevents chain death.
 pub async fn propose_block_as_leader_forced() {
     if known_validators().is_empty() { return; }
-    if !bootstrap_validator_active() { return; }
 
     let init = tokio::task::spawn_blocking(|| {
         let miner = crate::ledger::Ledger::load().address;

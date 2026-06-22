@@ -256,22 +256,6 @@ pub const STAKING_POOL_ADDR:&str = "egot1stakingpool0000000000000000000000000000
 pub const SLASH_POOL_ADDR:  &str = "egot1slashpool0000000000000000000000000000000";
 pub const FAUCET_ADDR_FULL: &str = "egot1faucet000000000000000000000000000000000000";
 
-/// A bootstrap validator (EGO_BOOTSTRAP_VALIDATOR=1) is a temporary, trusted
-/// sequencer that keeps the chain alive before real multi-validator consensus
-/// exists. It must NOT enrich itself for that unilateral work, so the blocks it
-/// produces emit a ZERO coinbase reward — nothing is minted to its wallet (the
-/// reward is effectively burned, and supply is not inflated). `reward == 0` is
-/// explicitly consensus-valid, so peers accept these blocks. Set
-/// EGO_BOOTSTRAP_PAID=1 to override (dev/testing only).
-pub fn bootstrap_validator_burns_reward() -> bool {
-    let is_bootstrap = std::env::var("EGO_BOOTSTRAP_VALIDATOR")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let paid_override = std::env::var("EGO_BOOTSTRAP_PAID")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    is_bootstrap && !paid_override
-}
 pub const SLASH_BPS: u64 = 1_000; // 10%
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1985,7 +1969,7 @@ pub fn compute_full_state_root() -> String {
 /// Raw key/value bytes (hex) from CF_BALANCES + CF_META are dumped verbatim so the
 /// snapshot round-trips regardless of internal key encoding (balances, nonces,
 /// stakes, supply pools, tip height, tx_count all live in those two CFs).
-#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone, Debug)]
 pub struct StateSnapshot {
     pub height:     u64,
     pub tip_hash:   String,
@@ -2111,13 +2095,8 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
     let tx_fees_sum: u64 = txs.iter().map(|t| t.fee_uegoc).sum();
     let remaining = crate::tokenomics::TOTAL_SUPPLY_UEGOC.saturating_sub(circulating_supply_inner(&db));
     let reward = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash).min(remaining);
-    let reward = if bootstrap_validator_burns_reward() { 0 } else { reward };
     if reward == 0 {
-        if bootstrap_validator_burns_reward() {
-            tracing::debug!("Bootstrap validator: coinbase reward burned (0) at block {}", height);
-        } else {
-            tracing::warn!("Supply cap reached at block {} — no coinbase reward", height);
-        }
+        tracing::warn!("Supply cap reached at block {} — no coinbase reward", height);
     }
 
     let coinbase_hash = format!("0x{}", blake3::hash(
@@ -2398,13 +2377,8 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
     let tx_fees_sum: u64 = valid_txs.iter().map(|t| t.fee_uegoc).sum();
     let remaining = crate::tokenomics::TOTAL_SUPPLY_UEGOC.saturating_sub(circulating_supply_inner(&db));
     let reward = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash).min(remaining);
-    let reward = if bootstrap_validator_burns_reward() { 0 } else { reward };
     if reward == 0 {
-        if bootstrap_validator_burns_reward() {
-            tracing::debug!("Bootstrap validator: coinbase reward burned (0) at block {}", height);
-        } else {
-            tracing::warn!("Supply cap reached at block {} — no coinbase reward", height);
-        }
+        tracing::warn!("Supply cap reached at block {} — no coinbase reward", height);
     }
 
     let coinbase_hash = format!("0x{}", blake3::hash(
