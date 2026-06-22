@@ -1288,7 +1288,7 @@ fn bft_threshold() -> usize {
     let n_total = snapshot.iter().filter(|a| is_eligible_validator(a)).count();
     let n = warmed_validator_count();
     let min_validators = crate::mempool::min_validators_for_finality();
-    let effective = if n_total < min_validators {
+    let effective = if n_total < min_validators && !crate::chain_db::chain_has_graduated_sticky(32) {
         n.max(1)
     } else {
         n.max(min_validators).min(crate::bft_committee::COMMITTEE_SIZE)
@@ -8808,7 +8808,8 @@ async fn handle_block_vote(
     eprintln!("[BFT] Block #{} FINALIZED with {} votes (threshold={})",
         height, final_vote_count, threshold);
 
-    let is_solo_bootstrap = known_validator_count() < crate::mempool::min_validators_for_finality();
+    let is_solo_bootstrap = known_validator_count() < crate::mempool::min_validators_for_finality()
+        && !crate::chain_db::chain_has_graduated_sticky(32);
 
     if final_vote_count >= threshold && !is_solo_bootstrap {
         let mut hard = hard_finalized_heights();
@@ -9020,7 +9021,8 @@ fn process_inbound_qc_finalization(
     
     // Allow solo-mined blocks (0 or 1 votes) to be accepted if the network
     // has not yet met the minimum validator threshold to form a BFT quorum.
-    let is_solo_bootstrap = known_validator_count() < crate::mempool::min_validators_for_finality();
+    let is_solo_bootstrap = known_validator_count() < crate::mempool::min_validators_for_finality()
+        && !crate::chain_db::chain_has_graduated_sticky(32);
 
     if !is_solo_bootstrap && votes.len() < threshold {
         eprintln!(
