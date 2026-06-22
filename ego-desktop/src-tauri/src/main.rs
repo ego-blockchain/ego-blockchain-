@@ -181,8 +181,11 @@ fn headless_main() {
 fn main() {
     {
         use tracing_subscriber::{fmt, EnvFilter, prelude::*};
+        // `libp2p_gossipsub=error` silences the noisy "Send Queue full" WARN that dumps
+        // the entire message payload as a raw byte array — it's backpressure to a slow
+        // (relayed) peer, not corruption, and gossip resends, so it's safe to quiet.
         let filter = EnvFilter::try_from_env("EGO_LOG")
-            .unwrap_or_else(|_| EnvFilter::new("ego_desktop=info,warn"));
+            .unwrap_or_else(|_| EnvFilter::new("ego_desktop=info,warn,libp2p_gossipsub=error"));
         tracing_subscriber::registry()
             .with(fmt::layer().with_target(false))
             .with(filter)
