@@ -722,23 +722,7 @@ fn main() {
 
                 crate::p2p::fetch_and_cache_egoc_price().await;
 
-                let no_oracle = std::env::var("EGO_NO_ORACLE").is_ok();
-
-                // Bootstrap from oracle only while the P2P network is small
-                let startup_peers = crate::p2p::get_known_peers().len();
-                if !no_oracle && startup_peers < 50 {
-                    // Checkpoint fast-sync first: if we're far behind the oracle tip
-                    // (fresh node / pruned history), trust-install a state snapshot and
-                    // jump to the checkpoint instead of failing to fetch old blocks.
-                    crate::p2p::fast_sync_from_oracle_if_behind().await;
-                    crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)).await;
-                    crate::p2p::oracle_sync_chain().await;
-                    tracing::info!("Oracle chain sync complete ({} peers, oracle active)", startup_peers);
-                } else if no_oracle {
-                    tracing::info!("Oracle disabled via EGO_NO_ORACLE — using pure P2P");
-                } else {
-                    tracing::info!("{} peers — skipping oracle, using P2P only", startup_peers);
-                }
+                crate::p2p::sync_chain_from_peers().await;
 
                 // Restore pending TXs after oracle sync so confirmed nonces are populated.
                 tokio::task::spawn_blocking(|| crate::commands::tx_pending::restore_to_mempool()).await.ok();
@@ -821,8 +805,8 @@ fn main() {
                 loop {
                     for _ in 0..6 {
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        if !no_oracle && crate::p2p::ORACLE_GAP_FILL_NEEDED.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                            bounded!(20, crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)));
+                        if crate::p2p::ORACLE_GAP_FILL_NEEDED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                            bounded!(20, crate::p2p::sync_chain_from_peers());
                         }
                     }
                     loop_tick = loop_tick.wrapping_add(1);
@@ -836,12 +820,7 @@ fn main() {
                     if wall_elapsed > 120 {
                         tracing::info!("Wake-from-sleep detected ({}s gap) — reconnecting P2P", wall_elapsed);
 
-                        if !no_oracle {
-                            tracing::info!("Fetching latest state from Explorer RPC for fast-sync...");
-                            bounded!(20, crate::p2p::fast_sync_from_oracle_if_behind());
-                            bounded!(20, crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)));
-                        }
-
+                        bounded!(15, crate::p2p::sync_chain_from_peers());
                         bounded!(15, crate::p2p::restore_dht_cache());
                         bounded!(15, crate::p2p::dht_discover_peers());
                         bounded!(15, crate::p2p::oracle_peer_discovery_tick());
@@ -849,34 +828,19 @@ fn main() {
                         crate::p2p::touch_proposal_timestamp();
                     }
 
-                    let peer_count = crate::p2p::get_known_peers().len();
-                    let use_oracle = !no_oracle && peer_count < P2P_SELF_SUFFICIENT_PEERS;
-
-                    let gap_fill = crate::p2p::ORACLE_GAP_FILL_NEEDED.swap(false, std::sync::atomic::Ordering::Relaxed);
-                    if use_oracle || gap_fill {
-                        bounded!(20, crate::p2p::fetch_chain_from_oracle(Some(&handle_startup)));
-                    }
+                    let _ = crate::p2p::ORACLE_GAP_FILL_NEEDED.swap(false, std::sync::atomic::Ordering::Relaxed);
                     bounded!(15, crate::p2p::broadcast_peer_announce(Some(&handle_startup)));
                     bounded!(15, crate::p2p::sync_chain_from_peers());
                     bounded!(15, crate::p2p::dht_discover_relays());
 
-                    // If the tip hasn't advanced for ~100s, we're wedged (e.g. a
-                    // missing block in the oracle feed) — jump the gap via the
-                    // writer's full snapshot, which contains the missing blocks.
                     let cur_tip = crate::chain_db::latest_block_info().0;
                     if cur_tip > last_seen_tip {
                         last_seen_tip = cur_tip;
                         tip_stuck_since = std::time::Instant::now();
-                    } else if !no_oracle && tip_stuck_since.elapsed().as_secs() > 100 {
-                        bounded!(25, crate::p2p::force_snapshot_jump());
+                    } else if tip_stuck_since.elapsed().as_secs() > 100 {
+                        bounded!(25, crate::p2p::request_snapshot_from_peers(cur_tip));
                         last_seen_tip = crate::chain_db::latest_block_info().0;
                         tip_stuck_since = std::time::Instant::now();
-                    }
-
-                    // Auto-heal: every ~4 ticks (~2 min) verify we're on the canonical
-                    // chain and self-repair a fork so a user never has to wipe a DB.
-                    if !no_oracle && loop_tick % 4 == 0 {
-                        bounded!(40, crate::p2p::check_and_heal_fork());
                     }
 
                     let my_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
