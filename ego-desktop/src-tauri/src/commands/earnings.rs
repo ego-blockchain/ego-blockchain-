@@ -133,9 +133,6 @@ pub async fn get_earnings_data(
         state.set_last_earnings_credit(now);
     }
 
-    // Lifetime earnings: accumulate confirmed reward/coinbase credits for blocks above our
-    // watermark into a PERSISTED total, so it survives app restarts and chain pruning (the
-    // local chain only keeps recent blocks). This is the "report" figure the user sees.
     let addr = ledger.address.clone();
     let watermark = ledger.lifetime_counted_height;
     let (newly_earned, new_watermark) = tokio::task::spawn_blocking(move || {

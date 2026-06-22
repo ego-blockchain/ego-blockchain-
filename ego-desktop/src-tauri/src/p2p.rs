@@ -377,6 +377,7 @@ pub async fn push_block_to_oracle(block: &crate::ledger::LedgerBlock, txs: &[cra
 
 pub static RELAY_CIRCUIT_READY: AtomicBool = AtomicBool::new(false);
 
+pub static IS_PUBLIC_REACHABLE: AtomicBool = AtomicBool::new(false);
 
 static IS_RELAY_SERVER: AtomicBool = AtomicBool::new(false);
 
@@ -4599,11 +4600,6 @@ fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
 fn best_endpoint(external_addrs: &[Multiaddr], peer_id: &PeerId) -> String {
     let pid_str = peer_id.to_string();
 
-    if let Some(a) = external_addrs.iter().find(|a| a.to_string().contains("/p2p-circuit")) {
-        let s = a.to_string();
-        return if s.contains(&pid_str) { s } else { format!("{}/p2p/{}", s, pid_str) };
-    }
-
     let is_public = |a: &Multiaddr| {
         let s = a.to_string();
         !s.starts_with("/ip4/127.")     &&
@@ -4611,6 +4607,20 @@ fn best_endpoint(external_addrs: &[Multiaddr], peer_id: &PeerId) -> String {
         !s.starts_with("/ip4/192.168.") &&
         !s.starts_with("/ip4/172.")
     };
+
+    if IS_PUBLIC_REACHABLE.load(Ordering::Relaxed) {
+        if let Some(a) = external_addrs.iter()
+            .find(|a| { let s = a.to_string(); is_public(a) && !s.contains("/p2p-circuit") })
+        {
+            let s = a.to_string();
+            return if s.contains("/p2p/") { s } else { format!("{}/p2p/{}", s, pid_str) };
+        }
+    }
+
+    if let Some(a) = external_addrs.iter().find(|a| a.to_string().contains("/p2p-circuit")) {
+        let s = a.to_string();
+        return if s.contains(&pid_str) { s } else { format!("{}/p2p/{}", s, pid_str) };
+    }
     let base = external_addrs.iter().find(|a| is_public(a))
         .or_else(|| external_addrs.first())
         .map(|a| a.to_string())
@@ -4983,12 +4993,15 @@ async fn handle_event(
             let state = crate::app::global_app_state();
             match new {
                 autonat::NatStatus::Public(addr) => {
-                    eprintln!("[P2P] AutoNAT: public at {}", addr);
+                    eprintln!("[P2P] AutoNAT: public at {} — advertising DIRECT address so peers don't route through the relay", addr);
                     state.set_upnp_status(Ok(()));
+                    IS_PUBLIC_REACHABLE.store(true, Ordering::Relaxed);
                     if !external_addrs.contains(&addr) {
                         external_addrs.push(addr.clone());
                     }
-                    if !RELAY_CIRCUIT_READY.load(Ordering::Relaxed) {
+                    // Re-advertise our endpoint as the DIRECT address (even if the relay
+                    // circuit is up) so peers connect to us directly — this offloads the relay.
+                    {
                         let peer_id = *swarm.local_peer_id();
                         state.set_public_endpoint(best_endpoint(external_addrs, &peer_id));
                         if let Some(h) = app {
@@ -5008,6 +5021,7 @@ async fn handle_event(
                 }
                 autonat::NatStatus::Private => {
                     eprintln!("[P2P] AutoNAT: behind NAT — relay required");
+                    IS_PUBLIC_REACHABLE.store(false, Ordering::Relaxed);
                     state.set_upnp_status(Err("Behind NAT — using relay".into()));
                     if let Some(h) = app {
                         let _ = h.emit_all("ego://p2p-status-changed", ());
@@ -8362,9 +8376,9 @@ pub async fn oracle_peer_discovery_tick() {
 
     let my_ep = get_public_endpoint().await;
     let allow_direct = std::env::var("EGO_DIRECT_PEERS").is_ok();
-    // Only a relayed circuit address is reachable across the internet; don't
-    // advertise a LAN/loopback addr that peers could never dial.
-    let my_ep_dialable = my_ep.contains("/p2p-circuit") || (allow_direct && !my_ep.is_empty());
+    let my_ep_dialable = my_ep.contains("/p2p-circuit")
+        || IS_PUBLIC_REACHABLE.load(Ordering::Relaxed)
+        || (allow_direct && !my_ep.is_empty());
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -8388,7 +8402,13 @@ pub async fn oracle_peer_discovery_tick() {
     for ep in resp.nodes {
         let ep = ep.trim_end_matches('/').to_string();
         if ep.is_empty() || ep == my_ep { continue; }
-        if !ep.contains("/p2p-circuit") && !allow_direct { continue; }
+        let is_circuit = ep.contains("/p2p-circuit");
+        let is_private = ep.contains("/ip4/127.")
+            || ep.contains("/ip4/10.")
+            || ep.contains("/ip4/192.168.")
+            || ep.contains("/ip4/169.254.")
+            || ep.contains("/ip6/::1");
+        if !is_circuit && is_private && !allow_direct { continue; }
         let addr: Multiaddr = match ep.parse() { Ok(a) => a, Err(_) => continue };
         let (rtx, _rrx) = oneshot::channel();
         if tx.send(SwarmCmd::Dial { peer_addr: addr, reply: rtx }).await.is_ok() {
