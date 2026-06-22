@@ -26,7 +26,7 @@ pub const MIN_VALIDATORS_FOR_FINALITY: usize = crate::bft_committee::MIN_LIVE_VA
 fn allow_pre_bft_solo() -> bool {
     std::env::var("EGO_ALLOW_PRE_BFT_SOLO")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 
