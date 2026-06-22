@@ -3867,6 +3867,15 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     let _ = SWARM_TX.set(tx);
 
     let mut external_addrs:   Vec<Multiaddr> = Vec::new();
+    if let Ok(pub_addr) = std::env::var("EGO_PUBLIC_ADDR") {
+        if let Ok(addr) = pub_addr.trim().parse::<Multiaddr>() {
+            swarm.add_external_address(addr.clone());
+            external_addrs.push(addr.clone());
+            IS_PUBLIC_REACHABLE.store(true, Ordering::Relaxed);
+            crate::app::global_app_state().set_public_endpoint(best_endpoint(&external_addrs, &local_peer_id));
+            eprintln!("[P2P] EGO_PUBLIC_ADDR set — advertising direct public address {}", addr);
+        }
+    }
     let mut pending_sends:    HashMap<PeerId, Vec<(P2PMessage, oneshot::Sender<Result<(), String>>)>> = HashMap::new();
     let mut in_flight:        HashMap<OutboundRequestId, oneshot::Sender<Result<(), String>>> = HashMap::new();
     let mut circuit_listener: Option<libp2p_core::transport::ListenerId> = None;
@@ -9282,7 +9291,7 @@ async fn handle_view_change_msg(view: u64, voter: String) {
             empty_views, view
         );
         let validators = eligible_validators_sorted();
-        let fallback_idx    = (view as usize).wrapping_rem(validators.len().max(1));
+        let fallback_idx    = (block_count_now as usize).wrapping_rem(validators.len().max(1));
         let fallback_leader = validators.get(fallback_idx).cloned().unwrap_or_default();
         if fallback_leader == my_addr {
             eprintln!("[HotStuff] Fallback: round-robin elected us for view {} — proposing", view);
@@ -9294,9 +9303,9 @@ async fn handle_view_change_msg(view: u64, voter: String) {
         let vs = eligible_validators_sorted();
         let n_validators = vs.len();
         if n_validators <= 10 {
-            let idx = (view as usize).wrapping_rem(vs.len().max(1));
+            let idx = (block_count_now as usize).wrapping_rem(vs.len().max(1));
             if vs.get(idx).map(|v| v == &my_addr).unwrap_or(false) {
-                eprintln!("[HotStuff] Round-robin elected us for view {} ({}/{}) — proposing block", view, idx + 1, vs.len());
+                eprintln!("[HotStuff] Round-robin elected us for height {} ({}/{}) — proposing block", block_count_now, idx + 1, vs.len());
                 tokio::spawn(async move { propose_block_as_leader().await; });
             }
         } else {
