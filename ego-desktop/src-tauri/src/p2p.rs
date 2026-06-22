@@ -1275,48 +1275,6 @@ pub fn bootstrap_validator_active() -> bool {
     true
 }
 
-static MACHINE_TO_ADDR: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-static IP_TO_ADDR: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-
-fn validate_unique_identity(addr: &str, machine_id: &str, endpoint: &str) -> Result<(), String> {
-    if machine_id.is_empty() { return Ok(()); }
-    
-    let ip = endpoint.split('/').nth(2).unwrap_or("");
-    let is_relayed = endpoint.contains("p2p-circuit");
-    let is_local = ip == "127.0.0.1" || ip.is_empty()
-        || ip.starts_with("192.168.")
-        || ip.starts_with("10.")
-        || ip.starts_with("172.");
-
-    // Sybil Protection: Hardware ID must be unique per address on public networks.
-    // For local development (127.0.0.1), we bypass this to allow multi-node testing on one PC.
-    if !is_local {
-        let mut m_map = MACHINE_TO_ADDR.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-        if let Some(existing) = m_map.get(machine_id) {
-            if existing != addr {
-                return Err(format!("Hardware ID {} already associated with node {}", machine_id, existing));
-            }
-        }
-        m_map.insert(machine_id.to_string(), addr.to_string());
-    }
-
-    // Validate IP uniqueness to prevent "echo" faking
-    if !endpoint.is_empty() {
-        let mut ip_map = IP_TO_ADDR.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-        if !is_local && !is_relayed {
-            if let Some(existing_addr) = ip_map.get(ip) {
-                if existing_addr != addr {
-                    return Err(format!("IP address {} is already running node {}", ip, existing_addr));
-                }
-            }
-            ip_map.insert(ip.to_string(), addr.to_string());
-        }
-    }
-
-    Ok(())
-}
-
-
 pub fn min_validator_stake_uegoc() -> u64 {
     std::env::var("EGO_MIN_VALIDATOR_STAKE")
         .ok().and_then(|v| v.parse().ok())
@@ -6265,11 +6223,12 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                 return;
             }
 
-            // Sybil Protection: Verify hardware fingerprint is unique for this address
-            if let Err(e) = validate_unique_identity(&address, &machine_id, &endpoint) {
-                tracing::warn!("[P2P] Rejected peer {} — Sybil/Parallel identity violation: {}", address, e);
-                return;
-            }
+            // NOTE: No hardware-ID / IP uniqueness rejection. Rewards are weighted
+            // by DRS (real storage + coverage), so running several nodes — from one
+            // PC or behind the same WiFi/NAT — earns nothing without genuine
+            // contribution and can't cheat the system. Rejecting co-located peers
+            // only broke legitimate users on the same network.
+            let _ = &machine_id;
 
             let identity_verified = verify_peer_announce_identity(
                 &address,
