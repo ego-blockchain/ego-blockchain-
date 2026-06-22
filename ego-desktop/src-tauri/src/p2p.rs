@@ -803,6 +803,12 @@ fn bootstrap_solo_grace_secs() -> i64 {
 
 
 fn should_solo_commit_now() -> bool {
+    let allow_solo_fork = std::env::var("EGO_ALLOW_SOLO_FORK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !allow_solo_fork {
+        return false;
+    }
     let stale_flag = SOLO_AFTER_EVICTION.swap(false, Ordering::Relaxed);
     let committee_alone = known_validators().len() <= 1;
     if stale_flag && !committee_alone {
