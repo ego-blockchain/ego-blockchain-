@@ -8182,7 +8182,14 @@ fn attach_local_qc_if_missing(block: &mut crate::ledger::LedgerBlock) {
 /// is the Ed25519 signature over the BLS pubkey bytes). The oracle and other
 /// nodes use this to know which validator a QC's BLS key belongs to, and thus
 /// its stake weight. Skips if an identical registration is already on-chain.
+pub fn is_observer() -> bool {
+    std::env::var("EGO_OBSERVER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 pub fn maybe_emit_validator_registration() {
+    if is_observer() { return; }
     let seed = match get_ed25519_seed() { Some(s) => s, None => return };
     let bls_sk = match BLS_SECRET_KEY.get() { Some(s) => s, None => return };
     let ledger = crate::ledger::Ledger::load();
@@ -8332,6 +8339,7 @@ async fn handle_block_proposal(
     proposal_view: u64,
     app: Option<&tauri::AppHandle<tauri::Wry>>,
 ) {
+    if is_observer() { return; }
     let (my_addr, seed_arr_opt) = match tokio::task::spawn_blocking(|| {
         let addr = crate::ledger::Ledger::load().address;
         let seed = get_ed25519_seed();
@@ -9303,6 +9311,7 @@ async fn handle_view_change_msg(view: u64, voter: String) {
 }
 
 pub async fn propose_block_as_leader() {
+    if is_observer() { return; }
     if known_validators().is_empty() { return; }
 
     let init = tokio::task::spawn_blocking(|| {
@@ -9663,6 +9672,7 @@ pub fn try_proactive_proposal() -> std::pin::Pin<Box<dyn std::future::Future<Out
 /// Called by the deterministic liveness fallback after FALLBACK_AFTER_EMPTY_VIEWS
 /// consecutive view changes with no block — prevents chain death.
 pub async fn propose_block_as_leader_forced() {
+    if is_observer() { return; }
     if known_validators().is_empty() { return; }
 
     let init = tokio::task::spawn_blocking(|| {
