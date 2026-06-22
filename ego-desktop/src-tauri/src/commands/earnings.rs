@@ -133,7 +133,46 @@ pub async fn get_earnings_data(
         state.set_last_earnings_credit(now);
     }
 
-    let total_earned    = state.get_cached_total_earned();
+    // Lifetime earnings: accumulate confirmed reward/coinbase credits for blocks above our
+    // watermark into a PERSISTED total, so it survives app restarts and chain pruning (the
+    // local chain only keeps recent blocks). This is the "report" figure the user sees.
+    let addr = ledger.address.clone();
+    let watermark = ledger.lifetime_counted_height;
+    let (newly_earned, new_watermark) = tokio::task::spawn_blocking(move || {
+        let mut sum: u64 = 0;
+        let mut maxh = watermark;
+        for tx in crate::chain_db::get_tx_history_for_addr(&addr) {
+            let h = tx.block_height.unwrap_or(0);
+            if h > watermark
+                && tx.status == "Confirmed"
+                && (tx.tx_type == "reward" || tx.tx_type == "coinbase")
+                && (tx.from == crate::chain_db::NODE_POOL_ADDR || tx.from.starts_with("egot1rewards"))
+            {
+                sum = sum.saturating_add(tx.amount);
+                if h > maxh { maxh = h; }
+            }
+        }
+        (sum, maxh)
+    })
+    .await
+    .unwrap_or((0, watermark));
+
+    let total_earned = if newly_earned > 0 || new_watermark > watermark {
+        tokio::task::spawn_blocking(move || {
+            let mut l = Ledger::load();
+            l.lifetime_earned_uegoc = l.lifetime_earned_uegoc.saturating_add(newly_earned);
+            if new_watermark > l.lifetime_counted_height {
+                l.lifetime_counted_height = new_watermark;
+            }
+            let _ = l.save();
+            l.lifetime_earned_uegoc
+        })
+        .await
+        .unwrap_or(ledger.lifetime_earned_uegoc)
+    } else {
+        ledger.lifetime_earned_uegoc
+    };
+
     let pending         = daily_storage / 24;
     let session_started = state.get_session_started();
 
