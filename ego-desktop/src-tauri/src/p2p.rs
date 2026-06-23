@@ -10008,6 +10008,20 @@ pub async fn run_view_change_monitor() {
         };
         let next_view = chain_next.max(current_view() + 1);
 
+        {
+            let vs = eligible_validators_sorted();
+            if !vs.is_empty() {
+                let idx = (chain_next as usize).wrapping_rem(vs.len());
+                if vs.get(idx).map(|v| v == &my_addr).unwrap_or(false) {
+                    eprintln!("[HotStuff] Stall timeout — round-robin leader for height {} — proposing directly", chain_next);
+                    tokio::spawn(async move { propose_block_as_leader().await; });
+                    touch_proposal_timestamp();
+                    STUCK_VIEWCHANGE_CYCLES.store(0, Ordering::Relaxed);
+                    continue;
+                }
+            }
+        }
+
         if pipeline {
             // Healthy progression after a commit — not a stuck/timeout event, so
             // don't accrue deadlock cycles.
