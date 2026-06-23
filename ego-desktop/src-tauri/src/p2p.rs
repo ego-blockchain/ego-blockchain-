@@ -1272,6 +1272,35 @@ pub fn set_local_validator(address: &str) {
     register_known_validator(address);
 }
 
+pub fn local_validator_is_unset() -> bool {
+    local_validator_mutex().lock().map(|v| v.is_empty()).unwrap_or(true)
+}
+
+pub fn ensure_local_validator_identity() -> bool {
+    let ledger = crate::ledger::Ledger::load();
+    if ledger.address.is_empty() { return false; }
+    if BLS_SECRET_KEY.get().is_none() {
+        if let Ok(Some(seed_bytes)) = crate::ledger::load_seed() {
+            if seed_bytes.len() == 32 {
+                let mut seed = [0u8; 32];
+                seed.copy_from_slice(&seed_bytes);
+                let vk_hex = {
+                    use ed25519_dalek::SigningKey;
+                    hex::encode(SigningKey::from_bytes(&seed).verifying_key().as_bytes())
+                };
+                record_peer_ed25519(&ledger.address, &vk_hex);
+                let bls_sk = crate::bls_agg::derive_bls_key(&seed_bytes);
+                let bls_pk_bytes = crate::bls_agg::bls_pubkey(&bls_sk);
+                crate::chain_db::persist_validator_bls_pubkey(&ledger.address, &hex::encode(&bls_pk_bytes));
+                peer_bls_pubkeys().insert(ledger.address.clone(), bls_pk_bytes);
+                let _ = BLS_SECRET_KEY.set(bls_sk);
+            }
+        }
+    }
+    set_local_validator(&ledger.address);
+    true
+}
+
 
 const VALIDATOR_WARMUP_SECS: i64 = 10;
 
@@ -3965,26 +3994,7 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     }
 
     {
-        let ledger = crate::ledger::Ledger::load();
-        if !ledger.address.is_empty() {
-        if let Ok(Some(seed_bytes)) = crate::ledger::load_seed() {
-                if seed_bytes.len() == 32 {
-                    let mut seed = [0u8; 32];
-                    seed.copy_from_slice(&seed_bytes);
-                    let vk_hex = {
-                        use ed25519_dalek::SigningKey;
-                        hex::encode(SigningKey::from_bytes(&seed).verifying_key().as_bytes())
-                    };
-                    record_peer_ed25519(&ledger.address, &vk_hex);
-
-                    let bls_sk = crate::bls_agg::derive_bls_key(&seed_bytes);
-                    let bls_pk_bytes = crate::bls_agg::bls_pubkey(&bls_sk);
-                    crate::chain_db::persist_validator_bls_pubkey(&ledger.address, &hex::encode(&bls_pk_bytes));
-                    peer_bls_pubkeys().insert(ledger.address.clone(), bls_pk_bytes);
-                    let _ = BLS_SECRET_KEY.set(bls_sk);
-                }
-            }
-        }
+        let _ = ensure_local_validator_identity();
 
         for addr in crate::chain_db::load_slashed_validators() {
             slashed_validators().insert(addr);
@@ -4011,14 +4021,6 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
             }
             LAST_BLOCK_FINALIZED_TS.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
         }
-
-        {
-            let ledger = crate::ledger::Ledger::load();
-            if !ledger.address.is_empty() {
-                set_local_validator(&ledger.address);
-            }
-        }
-
 
         {
             let saved = crate::chain_db::restore_pending_votes_from_db();
@@ -9984,6 +9986,14 @@ pub async fn run_view_change_monitor() {
         }
         if _tick_count % 40 == 0 {
             eprintln!("[ViewMon] alive — tick #{} validators={}", _tick_count, known_validators().len());
+        }
+
+        if local_validator_is_unset() {
+            let registered = tokio::task::spawn_blocking(ensure_local_validator_identity)
+                .await.unwrap_or(false);
+            if registered {
+                eprintln!("[BFT] Registered local validator (late wallet init)");
+            }
         }
 
         if known_validators().is_empty() { continue; }
