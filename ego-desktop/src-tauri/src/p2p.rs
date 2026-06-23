@@ -1201,18 +1201,19 @@ pub fn is_eligible_validator(addr: &str) -> bool {
 /// over, so an unstaked Sybil can't be elected proposer.
 fn eligible_validators_sorted() -> Vec<String> {
     let registered = crate::chain_db::registered_validators_sorted();
-    if !registered.is_empty() {
-        let slashed = slashed_validators();
-        let mut vs: Vec<String> = registered.into_iter()
-            .filter(|a| !slashed.contains(a))
-            .collect();
-        vs.sort();
-        return vs;
-    }
-    let snapshot: Vec<String> = known_validators().iter().cloned().collect();
-    let mut vs: Vec<String> = snapshot.into_iter()
+    let known: Vec<String> = known_validators().iter()
         .filter(|a| is_eligible_validator(a))
+        .cloned()
         .collect();
+    let reg_set: std::collections::HashSet<&String> = registered.iter().collect();
+    let all_known_registered = !known.is_empty() && known.iter().all(|a| reg_set.contains(a));
+
+    let mut vs: Vec<String> = if !registered.is_empty() && all_known_registered {
+        let slashed = slashed_validators();
+        registered.into_iter().filter(|a| !slashed.contains(a)).collect()
+    } else {
+        known
+    };
     vs.sort();
     vs
 }
