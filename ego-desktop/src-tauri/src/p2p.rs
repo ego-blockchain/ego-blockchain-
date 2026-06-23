@@ -8390,18 +8390,7 @@ async fn handle_block_proposal(
         return;
     }
 
-    let _ = proposal_view;
-
-    {
-        let vs = eligible_validators_sorted();
-        if vs.len() <= 10 && !vs.is_empty() {
-            let leader_idx = (block.height as usize).wrapping_rem(vs.len());
-            if vs.get(leader_idx).map(|l| l != &proposer).unwrap_or(false) {
-                eprintln!("[BFT] Ignoring proposal #{} from {} — not the deterministic leader for this height", block.height, proposer);
-                return;
-            }
-        }
-    }
+    let _ = proposal_view; // reserved for future pacemaker use; not gating votes
 
     let vrf_in  = crate::bft_committee::vrf_input(&block.prev_hash, block.height, crate::bft_committee::VRF_ROLE_COMMITTEE);
     let ticket  = crate::bft_committee::sign_vrf_ticket(&seed_arr, &vrf_in);
