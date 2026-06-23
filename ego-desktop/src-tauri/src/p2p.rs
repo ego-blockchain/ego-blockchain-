@@ -3126,6 +3126,37 @@ pub async fn sync_chain_from_peers() {
     }
 }
 
+pub async fn send_direct_peer_announce(target_endpoint: String) {
+    if target_endpoint.is_empty() { return; }
+    let my_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
+        .await.unwrap_or_default();
+    if my_addr.is_empty() { return; }
+    let my_ep = get_public_endpoint().await;
+    if my_ep.is_empty() { return; }
+    let coverage_score = crate::poc::my_coverage_score();
+    let staked_amount  = crate::ledger::Ledger::load().staked_amount;
+    let (dil_hex, vrf_hex) = current_wallet_announce_keys();
+    let endpoints = vec![my_ep.clone()];
+    let genesis_hash = crate::ledger::GENESIS_HASH.to_string();
+    let machine_id = crate::commands::coverage::get_machine_id_cached();
+    let signature = sign_peer_announce(
+        &my_addr, &my_ep, &endpoints, coverage_score,
+        &dil_hex, &vrf_hex, staked_amount, &genesis_hash, &machine_id,
+    );
+    let announce = P2PMessage::PeerAnnounce {
+        address: my_addr, name: "Ego Node".to_string(),
+        endpoint: my_ep, endpoints,
+        city: None, country: None, lat: None, lon: None,
+        coverage_score, dilithium_pubkey: dil_hex, vrf_pubkey: vrf_hex,
+        staked_amount, genesis_hash, signature, machine_id,
+    };
+    if let Err(e) = send_message_any(&[target_endpoint.clone()], &announce).await {
+        if !e.contains("none of the requested protocols") {
+            tracing::debug!("[P2P] direct PeerAnnounce to {}: {}", target_endpoint, e);
+        }
+    }
+}
+
 pub async fn broadcast_peer_announce(app: Option<&tauri::AppHandle<tauri::Wry>>) {
     let state = crate::app::global_app_state();
     let (address, registry, active_id) = tokio::task::spawn_blocking(|| {
@@ -4661,7 +4692,7 @@ async fn handle_event(
             }
         }
 
-        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+        SwarmEvent::ConnectionEstablished { peer_id, endpoint: conn_endpoint, .. } => {
             eprintln!("[P2P] Connected to {}", peer_id);
 
             if let Some(waiters) = pending_dials.remove(&peer_id) {
@@ -4737,6 +4768,21 @@ async fn handle_event(
             tokio::spawn(async move {
                 broadcast_peer_announce(app_clone.as_ref()).await;
             });
+
+            if !relay_addrs.contains_key(&peer_id) {
+                let remote = conn_endpoint.get_remote_address().to_string();
+                let direct_ep = if remote.contains("/p2p/") {
+                    remote
+                } else {
+                    format!("{}/p2p/{}", remote, peer_id)
+                };
+                tokio::spawn(async move {
+                    for _ in 0..3 {
+                        send_direct_peer_announce(direct_ep.clone()).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                });
+            }
         }
 
         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
@@ -6294,49 +6340,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                 if announce_reply_allowed(&endpoint) {
                     let ep3 = endpoint.clone();
                     tokio::spawn(async move {
-                        let my_addr = crate::ledger::Ledger::load().address;
-                        if my_addr.is_empty() { return; }
-                        let my_ep   = get_public_endpoint().await;
-                        if my_ep.is_empty() { return; }
-                        let coverage_score = crate::poc::my_coverage_score();
-                        let staked_amount  = crate::ledger::Ledger::load().staked_amount;
-                        let (dil_hex, vrf_hex) = current_wallet_announce_keys();
-                        let endpoints = vec![my_ep.clone()];
-                        let genesis_hash = crate::ledger::GENESIS_HASH.to_string();
-                        let machine_id = crate::commands::coverage::get_machine_id_cached();
-                        let signature = sign_peer_announce(
-                            &my_addr,
-                            &my_ep,
-                            &endpoints,
-                            coverage_score,
-                            &dil_hex,
-                            &vrf_hex,
-                            staked_amount,
-                            &genesis_hash,
-                            &machine_id,
-                        );
-                        let announce = P2PMessage::PeerAnnounce {
-                            address:          my_addr,
-                            name:             "Ego Node".to_string(),
-                            endpoint:         my_ep.clone(),
-                            endpoints,
-                            city:             None,
-                            country:          None,
-                            lat:              None,
-                            lon:              None,
-                            coverage_score,
-                            dilithium_pubkey: dil_hex,
-                            vrf_pubkey:       vrf_hex,
-                            staked_amount,
-                            genesis_hash,
-                            signature,
-                            machine_id,
-                        };
-                        if let Err(e) = send_message_any(&[ep3.clone()], &announce).await {
-                            if !e.contains("none of the requested protocols") {
-                                tracing::debug!("[P2P] PeerAnnounce reply to {}: {}", ep3, e);
-                            }
-                        }
+                        send_direct_peer_announce(ep3).await;
                     });
                 }
             }
