@@ -511,6 +511,22 @@ pub fn any_registered_bls(db: &DB) -> bool {
     matches!(iter.next(), Some(Ok((k, _))) if k.starts_with(b"bls_reg:"))
 }
 
+pub fn registered_validators_sorted() -> Vec<String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    backfill_bls_registry(&db);
+    let Some(cf) = db.cf_handle(CF_META) else { return Vec::new(); };
+    let mut set = std::collections::BTreeSet::new();
+    let iter = db.prefix_iterator_cf(cf, b"bls_reg:");
+    for item in iter {
+        let Ok((k, v)) = item else { break };
+        if !k.starts_with(b"bls_reg:") { break; }
+        if let Ok(addr) = String::from_utf8(v.to_vec()) {
+            if !addr.is_empty() { set.insert(addr); }
+        }
+    }
+    set.into_iter().collect()
+}
+
 fn load_slashed_set_inner(db: &DB) -> std::collections::HashSet<String> {
     let Some(cf) = db.cf_handle(CF_META) else { return Default::default(); };
     db.get_cf(cf, META_SLASHED)

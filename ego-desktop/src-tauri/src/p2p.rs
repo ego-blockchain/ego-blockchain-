@@ -960,10 +960,8 @@ pub fn elect_proposer_for_next_slot() -> Option<String> {
     let my_addr = crate::ledger::Ledger::load().address;
     if my_addr.is_empty() { return None; }
 
-    let validators: Vec<String> = known_validators().iter().cloned().collect();
-    if validators.len() <= 10 && !validators.is_empty() {
-        let mut vs = validators.clone();
-        vs.sort();
+    let vs = eligible_validators_sorted();
+    if vs.len() <= 10 && !vs.is_empty() {
         let next_height = crate::chain_db::latest_block_info().0 + 1;
         let idx = (next_height as usize).wrapping_rem(vs.len());
         return vs.get(idx).cloned();
@@ -1202,6 +1200,15 @@ pub fn is_eligible_validator(addr: &str) -> bool {
 /// Sorted list of stake-eligible validators — the set leader election rotates
 /// over, so an unstaked Sybil can't be elected proposer.
 fn eligible_validators_sorted() -> Vec<String> {
+    let registered = crate::chain_db::registered_validators_sorted();
+    if !registered.is_empty() {
+        let slashed = slashed_validators();
+        let mut vs: Vec<String> = registered.into_iter()
+            .filter(|a| !slashed.contains(a))
+            .collect();
+        vs.sort();
+        return vs;
+    }
     let snapshot: Vec<String> = known_validators().iter().cloned().collect();
     let mut vs: Vec<String> = snapshot.into_iter()
         .filter(|a| is_eligible_validator(a))
@@ -1282,16 +1289,23 @@ fn warmed_validator_count() -> usize {
 
 fn bft_threshold() -> usize {
     evict_stale_validators(120);
-    // Count only stake-eligible validators (Sybil resistance) — unstaked nodes
-    // don't inflate the committee. warmed_validator_count() is likewise filtered.
-    let snapshot: Vec<String> = known_validators().iter().cloned().collect();
-    let n_total = snapshot.iter().filter(|a| is_eligible_validator(a)).count();
-    let n = warmed_validator_count();
     let min_validators = crate::mempool::min_validators_for_finality();
-    let effective = if n_total < min_validators && !crate::chain_db::chain_has_graduated_sticky(32) {
-        n.max(1)
+    let registered = crate::chain_db::registered_validators_sorted();
+    let (n_total, effective) = if !registered.is_empty() {
+        let slashed = slashed_validators();
+        let n_reg = registered.iter().filter(|a| !slashed.contains(*a)).count();
+        let eff = n_reg.max(min_validators).min(crate::bft_committee::COMMITTEE_SIZE);
+        (n_reg, eff)
     } else {
-        n.max(min_validators).min(crate::bft_committee::COMMITTEE_SIZE)
+        let snapshot: Vec<String> = known_validators().iter().cloned().collect();
+        let nt = snapshot.iter().filter(|a| is_eligible_validator(a)).count();
+        let n  = warmed_validator_count();
+        let eff = if nt < min_validators && !crate::chain_db::chain_has_graduated_sticky(32) {
+            n.max(1)
+        } else {
+            n.max(min_validators).min(crate::bft_committee::COMMITTEE_SIZE)
+        };
+        (nt, eff)
     };
     eprintln!("[BFT] Committee size: {} effective / {} total validators", effective, n_total);
     (effective * 2 + 2) / 3
