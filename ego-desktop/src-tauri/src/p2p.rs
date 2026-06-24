@@ -1228,26 +1228,28 @@ pub fn is_eligible_validator(addr: &str) -> bool {
 /// Sorted list of stake-eligible validators — the set leader election rotates
 /// over, so an unstaked Sybil can't be elected proposer.
 fn eligible_validators_sorted() -> Vec<String> {
-    // Only LIVE validators take a proposer slot. Round-robin election must never
-    // land on a node that's offline (or a ghost restored from DB), or the height
-    // stalls waiting for a proposal that never comes.
-    let live: std::collections::HashSet<String> = live_validators().into_iter().collect();
-    let registered = crate::chain_db::registered_validators_sorted();
-    let known: Vec<String> = live.iter()
-        .filter(|a| is_eligible_validator(a))
-        .cloned()
+    // Prefer the ON-CHAIN registered validator set for leader election. It is read
+    // from the shared committed chain, so it is IDENTICAL on every node — all nodes
+    // therefore agree on the single round-robin proposer for each height and can
+    // never duel. It also excludes relay/public peers that merely announced (same
+    // genesis hash) but never registered on THIS chain — those otherwise polluted
+    // each node's live set differently and broke leader agreement, producing two
+    // competing proposals whose votes split 1/2 forever under load.
+    let slashed = slashed_validators();
+    let registered: Vec<String> = crate::chain_db::registered_validators_sorted()
+        .into_iter()
+        .filter(|a| !slashed.contains(a))
         .collect();
-    let reg_set: std::collections::HashSet<&String> = registered.iter().collect();
-    let all_known_registered = !known.is_empty() && known.iter().all(|a| reg_set.contains(a));
-
-    let mut vs: Vec<String> = if !registered.is_empty() && all_known_registered {
-        let slashed = slashed_validators();
-        registered.into_iter()
-            .filter(|a| live.contains(a) && !slashed.contains(a))
-            .collect()
-    } else {
-        known
-    };
+    if !registered.is_empty() {
+        let mut vs = registered;
+        vs.sort();
+        return vs;
+    }
+    // Pure-genesis bootstrap: nobody has a committed validator_register yet, so fall
+    // back to the live set (self + recently-seen peers, excluding DB ghosts).
+    let mut vs: Vec<String> = live_validators().into_iter()
+        .filter(|a| is_eligible_validator(a))
+        .collect();
     vs.sort();
     vs
 }
