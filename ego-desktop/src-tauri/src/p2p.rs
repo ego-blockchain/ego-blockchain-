@@ -1152,8 +1152,36 @@ pub fn evict_stale_validators(ttl_secs: i64) {
     }
 }
 
+/// Liveness window. A peer validator counts toward the committee only if we've
+/// seen its announce within this window. Without it, a restarted node treats
+/// validators restored from DB (possibly long dead) as live committee members —
+/// inflating quorum with ghosts that can never vote, so the round stalls and no
+/// block is ever finalized.
+pub const VALIDATOR_LIVENESS_SECS: i64 = 180;
+
+/// The LIVE validator committee: ourselves plus every peer validator whose
+/// announce we've seen within VALIDATOR_LIVENESS_SECS. This is the single source
+/// of truth for both quorum gating and proposer election, so two connected nodes
+/// agree on the committee and a lone node never believes it has quorum with stale
+/// peers it can't actually reach.
+pub fn live_validators() -> Vec<String> {
+    let now   = chrono::Utc::now().timestamp();
+    let local = local_validator_mutex().lock().unwrap().clone();
+    let seen  = validator_last_seen();
+    let mut out: Vec<String> = known_validators().iter()
+        .filter(|a| !a.is_empty())
+        .filter(|a| **a == local
+            || seen.get(*a).map(|&t| now - t < VALIDATOR_LIVENESS_SECS).unwrap_or(false))
+        .cloned()
+        .collect();
+    if !local.is_empty() && !out.contains(&local) {
+        out.push(local);
+    }
+    out
+}
+
 pub fn known_validator_count() -> usize {
-    known_validators().len()
+    live_validators().len()
 }
 
 /// Real count of nodes currently participating in consensus: peer validators seen
@@ -1200,8 +1228,12 @@ pub fn is_eligible_validator(addr: &str) -> bool {
 /// Sorted list of stake-eligible validators — the set leader election rotates
 /// over, so an unstaked Sybil can't be elected proposer.
 fn eligible_validators_sorted() -> Vec<String> {
+    // Only LIVE validators take a proposer slot. Round-robin election must never
+    // land on a node that's offline (or a ghost restored from DB), or the height
+    // stalls waiting for a proposal that never comes.
+    let live: std::collections::HashSet<String> = live_validators().into_iter().collect();
     let registered = crate::chain_db::registered_validators_sorted();
-    let known: Vec<String> = known_validators().iter()
+    let known: Vec<String> = live.iter()
         .filter(|a| is_eligible_validator(a))
         .cloned()
         .collect();
@@ -1210,7 +1242,9 @@ fn eligible_validators_sorted() -> Vec<String> {
 
     let mut vs: Vec<String> = if !registered.is_empty() && all_known_registered {
         let slashed = slashed_validators();
-        registered.into_iter().filter(|a| !slashed.contains(a)).collect()
+        registered.into_iter()
+            .filter(|a| live.contains(a) && !slashed.contains(a))
+            .collect()
     } else {
         known
     };
@@ -1325,7 +1359,7 @@ fn warmed_validator_count() -> usize {
 }
 
 fn bft_threshold() -> usize {
-    evict_stale_validators(120);
+    evict_stale_validators(VALIDATOR_LIVENESS_SECS);
     let min_validators = crate::mempool::min_validators_for_finality();
     let registered = crate::chain_db::registered_validators_sorted();
     let (n_total, effective) = if !registered.is_empty() {
@@ -4141,12 +4175,17 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                 for addr in &restored {
                     if addr.is_empty() || slashed.contains(addr) { continue; }
                     first.insert(addr.clone(), now - VALIDATOR_WARMUP_SECS - 1);
-                    last.insert(addr.clone(), now);
+                    // Restored from DB ≠ currently online. Mark them as last-seen
+                    // in the past so they do NOT count as a live committee member
+                    // until they actually re-announce. Otherwise a restarted node
+                    // believes a dead peer is live, thinks it has quorum, and
+                    // stalls forever waiting for votes that never come.
+                    last.insert(addr.clone(), now - VALIDATOR_LIVENESS_SECS - 1);
                     if set.len() < MAX_VALIDATORS {
                         set.insert(addr.clone());
                     }
                 }
-                tracing::info!("Restored {} known validators from DB", restored.len());
+                tracing::info!("Restored {} known validators from DB (pending re-announce before they count toward quorum)", restored.len());
             }
         }
     }
@@ -10109,7 +10148,7 @@ pub async fn run_view_change_monitor() {
 
         // Housekeeping/logging at ~1s and ~10s cadence respectively (not every 250ms).
         if _tick_count % 4 == 0 {
-            evict_stale_validators(30);
+            evict_stale_validators(VALIDATOR_LIVENESS_SECS);
         }
         if _tick_count % 40 == 0 {
             eprintln!("[ViewMon] alive — tick #{} validators={}", _tick_count, known_validators().len());
