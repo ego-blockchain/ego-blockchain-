@@ -9355,7 +9355,13 @@ async fn handle_view_change_msg(view: u64, voter: String) {
         let our_chain_next = block_count_now;
         // Allow substantial jumps to catch up to the network proposers
         let view_jump_limit = my_view.max(our_chain_next).saturating_add(100_000);
-        if view > my_view + 1 && view <= view_jump_limit {
+        // Sync to the peer's view whenever they're ahead by ANY amount — including
+        // exactly one. The off-by-one case is the common one under async timing:
+        // if we only jumped when the peer was 2+ ahead, two nodes a single view
+        // apart would each count only their own ViewChange (1/2 forever) and the
+        // chain would deadlock. Jumping on `view > my_view` adds our vote to the
+        // peer's view so the round reaches quorum and a new leader is elected.
+        if view > my_view && view <= view_jump_limit {
             if !my_addr.is_empty() && voter != my_addr {
                 // Peer is ahead: jump to their view to stay in sync with the leader rotation
                 let target_view = view;
