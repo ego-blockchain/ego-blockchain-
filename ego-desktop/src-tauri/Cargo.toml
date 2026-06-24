@@ -89,7 +89,7 @@ libp2p = { version = "0.56", features = [
     "tokio", "tcp", "quic", "dns", "noise", "yamux",
     "identify", "dcutr", "autonat", "relay",
     "request-response", "ping", "macros", "ed25519",
-    "gossipsub", "kad",
+    "gossipsub", "kad", "mdns", "upnp",
 ] }
 libp2p-stream = { version = "0.4.0-alpha" }
 tokio-util = { version = "0.7", features = ["compat"] }

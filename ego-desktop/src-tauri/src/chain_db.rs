@@ -241,6 +241,12 @@ fn init_db(db: &DB) {
     }
 
     // 3. Seed genesis.
+    if std::env::var("EGO_NO_GENESIS").as_deref() == Ok("1") {
+        tracing::info!("EGO_NO_GENESIS=1: skipping genesis block seeding, will sync from peer.");
+        db.put_cf(meta, META_MIGRATION_DONE, b"1").ok();
+        return;
+    }
+
     seed_genesis(db);
     db.put_cf(meta, META_MIGRATION_DONE, b"1").ok();
     tracing::info!("Seeded genesis block");

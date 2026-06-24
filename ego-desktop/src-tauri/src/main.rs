@@ -95,7 +95,9 @@ static INSTANCE_LOCK: once_cell::sync::OnceCell<std::net::TcpListener> =
     once_cell::sync::OnceCell::new();
 
 fn acquire_single_instance_lock() -> bool {
-    let port: u16 = std::env::var("EGO_LOCK_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(47391);
+    let port: u16 = std::env::var("EGO_LOCK_PORT")
+        .ok().and_then(|v| v.parse().ok())
+        .unwrap_or(47391);
     match std::net::TcpListener::bind(format!("127.0.0.1:{}", port)) {
         Ok(l) => {
             let _ = INSTANCE_LOCK.set(l);
