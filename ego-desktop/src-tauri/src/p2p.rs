@@ -8468,6 +8468,19 @@ fn verify_block_proposal_auth(
         eprintln!("[BFT] Proposal #{} rejected: invalid proposer signature from {}", block.height, proposer);
         return ProposalAuth::Invalid;
     }
+    // Small committees (≤10) elect the proposer by deterministic ROUND-ROBIN, not
+    // by VRF. The proposer is already authenticated above by its Ed25519 proposal
+    // signature + validator membership, so the VRF ticket is NOT the authority
+    // here — and verifying it as if it were caused a fatal false-negative under
+    // burst load (a transiently mismatched ticket made a node reject the genuine
+    // round-robin leader's block, then propose its own competing one → dueling
+    // proposers → split votes → deadlock). Only the VRF-election regime (>10
+    // validators) gates on the ticket.
+    let all_validators: Vec<String> = known_validators().iter().cloned().collect();
+    if all_validators.len() <= 10 {
+        return ProposalAuth::Valid;
+    }
+
     let ticket_bytes = match hex::decode(vrf_ticket) {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -8507,17 +8520,14 @@ fn verify_block_proposal_auth(
     let proposer_drs = crate::bft_committee::compute_drs_weight(proposer);
     let total_drs = crate::bft_committee::total_drs_weight(&drs_validators);
 
-    let all_validators: Vec<String> = known_validators().iter().cloned().collect();
-    if all_validators.len() > 10 {
-        if !crate::bft_committee::qualifies_proposer_for_network(
-            &ticket_bytes,
-            proposer_drs,
-            total_drs,
-            n_warmed,
-        ) {
-            eprintln!("[BFT] Proposal #{} rejected: proposer VRF ticket did not qualify", block.height);
-            return ProposalAuth::Disqualified;
-        }
+    if !crate::bft_committee::qualifies_proposer_for_network(
+        &ticket_bytes,
+        proposer_drs,
+        total_drs,
+        n_warmed,
+    ) {
+        eprintln!("[BFT] Proposal #{} rejected: proposer VRF ticket did not qualify", block.height);
+        return ProposalAuth::Disqualified;
     }
     ProposalAuth::Valid
 }
