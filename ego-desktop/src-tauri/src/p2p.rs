@@ -4,7 +4,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use futures::{AsyncReadExt, AsyncWriteExt};
 use libp2p::{
-    autonat, dcutr, gossipsub, identify, kad, noise, ping, relay,
+    autonat, dcutr, gossipsub, identify, kad, mdns, noise, ping, relay, upnp,
     request_response::{self, OutboundRequestId, ProtocolSupport},
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder,
@@ -1247,8 +1247,15 @@ pub fn register_known_validator(address: &str) {
             set.remove(&evict);
         }
     }
-    set.insert(address.to_string());
+    let newly_added = set.insert(address.to_string());
+    let total = set.len();
     drop(set);
+    if newly_added {
+        let local = local_validator_mutex().lock().unwrap().clone();
+        if *address != local {
+            tracing::info!("Validator registered: {} — committee now {} validator(s)", address, total);
+        }
+    }
     crate::chain_db::persist_known_validator(address);
     crate::poc::seed_peer_score_from_stake(address);
 }
@@ -1492,11 +1499,22 @@ pub(crate) fn sign_peer_announce(
     genesis_hash: &str,
     machine_id: &str,
 ) -> String {
-    let Some(kp) = current_wallet_keypair_for_announce() else { return String::new(); };
     let data = peer_announce_signing_data(
         address, endpoint, endpoints, coverage_score, dilithium_pubkey, vrf_pubkey, staked_amount, genesis_hash, machine_id
     );
-    hex::encode(kp.sign_dilithium(&data).signature_data)
+    // Prefer a Dilithium signature when the PQ keypair is available (post-quantum,
+    // and verifiable by every peer). When it isn't loaded, fall back to an Ed25519
+    // signature derived from the seed — the address is Ed25519-derived, so this is
+    // a valid identity proof and lets the node still join the committee instead of
+    // announcing an unsigned, always-rejected identity.
+    if let Some(kp) = current_wallet_keypair_for_announce() {
+        return hex::encode(kp.sign_dilithium(&data).signature_data);
+    }
+    if let Some(seed) = get_ed25519_seed() {
+        use ed25519_dalek::{Signer, SigningKey};
+        return hex::encode(SigningKey::from_bytes(&seed).sign(&data).to_bytes());
+    }
+    String::new()
 }
 
 fn verify_peer_announce_identity(
@@ -1511,21 +1529,23 @@ fn verify_peer_announce_identity(
     machine_id: &str,
     signature: &str,
 ) -> bool {
-    let dil_pk = match hex::decode(dilithium_pubkey) {
-        Ok(bytes) if !bytes.is_empty() => bytes,
-        _ => return false,
-    };
-    let dil_derived = ego_core::EgoAddress::from_dilithium_pk(
-        &dil_pk,
-        1,
-        ego_core::AddressType::EOA,
-    ).to_bech32("egot").unwrap_or_default();
-    let ed_derived = hex::decode(vrf_pubkey).ok()
-        .filter(|b| b.len() == 32)
-        .map(|b| ego_core::EgoAddress::from_public_key_bytes(&b, 1, ego_core::AddressType::EOA)
-            .to_bech32("egot").unwrap_or_default())
-        .unwrap_or_default();
-    if dil_derived != address && ed_derived != address {
+    // The canonical Ego address is Ed25519-derived (see KeyPair::derive_address),
+    // so a peer's identity can be proven with EITHER its Dilithium key (legacy /
+    // PQ-capable nodes) or its Ed25519 key. Accepting Ed25519 is essential: a node
+    // whose Dilithium keypair isn't loaded (no pq_keys.bin) announces an
+    // Ed25519-only identity, and rejecting it left it permanently out of the
+    // validator committee — the real reason quorum never formed.
+    let dil_pk: Option<Vec<u8>> = hex::decode(dilithium_pubkey).ok().filter(|b| !b.is_empty());
+    let ed_pk: Option<Vec<u8>>  = hex::decode(vrf_pubkey).ok().filter(|b| b.len() == 32);
+
+    let dil_derived = dil_pk.as_ref().map(|b| ego_core::EgoAddress::from_dilithium_pk(
+        b, 1, ego_core::AddressType::EOA,
+    ).to_bech32("egot").unwrap_or_default());
+    let ed_derived = ed_pk.as_ref().map(|b| ego_core::EgoAddress::from_public_key_bytes(
+        b, 1, ego_core::AddressType::EOA,
+    ).to_bech32("egot").unwrap_or_default());
+
+    if dil_derived.as_deref() != Some(address) && ed_derived.as_deref() != Some(address) {
         tracing::debug!("[P2P] Rejected peer {} - announced keys do not derive this address", address);
         return false;
     }
@@ -1536,19 +1556,46 @@ fn verify_peer_announce_identity(
     let data = peer_announce_signing_data(
         address, endpoint, endpoints, coverage_score, dilithium_pubkey, vrf_pubkey, staked_amount, genesis_hash, machine_id
     );
-    let pk = ego_core::PublicKey::dilithium2(dil_pk);
-    let sig = ego_core::Signature::dilithium2(sig);
-    
-    if ego_core::verify_signature(&pk, &data, &sig).unwrap_or(false) {
-        return true;
+
+    // Ed25519 path (preferred, and cryptographically sound: the address IS the
+    // Ed25519 key). A 64-byte Ed25519 signature over the announce by the address's
+    // key proves identity — and works for nodes without a loaded Dilithium key.
+    if ed_derived.as_deref() == Some(address) {
+        if let Some(ref ed_bytes) = ed_pk {
+            use ed25519_dalek::{Signature as EdSig, Verifier, VerifyingKey};
+            if let (Ok(pk_arr), Ok(sig_arr)) = (
+                <[u8; 32]>::try_from(ed_bytes.as_slice()),
+                <[u8; 64]>::try_from(sig.as_slice()),
+            ) {
+                if let Ok(vk) = VerifyingKey::from_bytes(&pk_arr) {
+                    if vk.verify(&data, &EdSig::from_bytes(&sig_arr)).is_ok() {
+                        return true;
+                    }
+                }
+            }
+        }
     }
-    
-    // Fallback for v1 peers
-    let data_legacy = format!(
-        "ego/peer-announce/v1:{}:{}:{}:{}:{}:{}:{}",
-        address, endpoint, coverage_score, dilithium_pubkey, vrf_pubkey, staked_amount, genesis_hash
-    ).into_bytes();
-    ego_core::verify_signature(&pk, &data_legacy, &sig).unwrap_or(false)
+
+    // Dilithium path (legacy / PQ-capable nodes that sign the announce with
+    // Dilithium). The address gate above already passed, so verify the Dilithium
+    // signature against the announced Dilithium key.
+    if let Some(ref dil_bytes) = dil_pk {
+        let pk = ego_core::PublicKey::dilithium2(dil_bytes.clone());
+        let dsig = ego_core::Signature::dilithium2(sig.clone());
+        if ego_core::verify_signature(&pk, &data, &dsig).unwrap_or(false) {
+            return true;
+        }
+        // Fallback for v1 peers
+        let data_legacy = format!(
+            "ego/peer-announce/v1:{}:{}:{}:{}:{}:{}:{}",
+            address, endpoint, coverage_score, dilithium_pubkey, vrf_pubkey, staked_amount, genesis_hash
+        ).into_bytes();
+        if ego_core::verify_signature(&pk, &data_legacy, &dsig).unwrap_or(false) {
+            return true;
+        }
+    }
+
+    false
 }
 
 // ── Wire protocol ─────────────────────────────────────────────────────────────
@@ -2233,6 +2280,16 @@ struct EgoBehaviour {
     ping:             ping::Behaviour,
     gossipsub:        gossipsub::Behaviour,
     kad:              kad::Behaviour<kad::store::MemoryStore>,
+    /// Zero-config local-network discovery. Two nodes on the same LAN find and
+    /// connect to each other directly over mDNS — no relay, no oracle, no NAT
+    /// traversal — so same-network peers always form a committee even when the
+    /// public relay path is flaky.
+    mdns:             mdns::tokio::Behaviour,
+    /// Automatic router port-mapping (UPnP-IGD / NAT-PMP). Asks the home router to
+    /// open a port for us so the node becomes DIRECTLY reachable from the internet
+    /// with no manual firewall config and no admin prompt — the same mechanism
+    /// IPFS uses to "just work" behind consumer routers on every OS.
+    upnp:             upnp::tokio::Behaviour,
     /// Raw byte-stream channel used by the in-browser app tunnel
     /// (`/ego/tunnel/1`) — relays a renter's local TCP connection to a web app
     /// running inside the rental's Docker sandbox.
@@ -3796,7 +3853,10 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     if let Err(e) = swarm.listen_on(format!("/ip4/0.0.0.0/tcp/{}", p2p_port()).parse().unwrap()) {
         tracing::error!("TCP listen failed: {}", e);
     }
-    #[cfg(not(target_os = "windows"))]
+    // QUIC (UDP) on every platform — it is the transport DCUtR hole-punching works
+    // best over, so two NAT'd peers can form a DIRECT connection without any inbound
+    // firewall rule. Previously disabled on Windows; re-enabled so Windows nodes get
+    // the same NAT traversal as Linux/macOS.
     if let Err(e) = swarm.listen_on(format!("/ip4/0.0.0.0/udp/{}/quic-v1", p2p_port()).parse().unwrap()) {
         tracing::error!("QUIC listen failed: {}", e);
     }
@@ -4481,6 +4541,9 @@ async fn build_swarm(
                 ),
                 gossipsub: gossipsub_behaviour,
                 kad:       kad_behaviour,
+                mdns:      mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
+                               .expect("mdns behaviour"),
+                upnp:      upnp::tokio::Behaviour::default(),
                 stream:    libp2p_stream::Behaviour::new(),
             }
         })?
@@ -4763,10 +4826,26 @@ async fn handle_event(
                 });
             }
 
-            // Immediately send a PeerAnnounce to the newly connected peer
+            // Re-gossip our PeerAnnounce after a peer connects so the validator
+            // committee forms reliably. A single publish is routinely lost: the
+            // peer's topic subscription arrives just AFTER the connection is up,
+            // and across NATs the only working link is the relay circuit, which
+            // flaps (DCUtR hole-punching frequently fails). While we are still
+            // below quorum, repeat the announce for ~20s so at least one publish
+            // lands on a live, subscribed connection — this forms the committee
+            // over gossip instead of the request-response path, which times out
+            // over the relay. Once quorum exists, a single announce is enough, so
+            // healthy/large networks don't pay the repeated-signing cost.
             let app_clone = app.cloned();
             tokio::spawn(async move {
-                broadcast_peer_announce(app_clone.as_ref()).await;
+                if known_validator_count() < crate::mempool::min_validators_for_finality() {
+                    for _ in 0..7 {
+                        broadcast_peer_announce(app_clone.as_ref()).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    }
+                } else {
+                    broadcast_peer_announce(app_clone.as_ref()).await;
+                }
             });
 
             if !relay_addrs.contains_key(&peer_id) {
@@ -4968,6 +5047,47 @@ async fn handle_event(
             eprintln!("[Relay] Relaying circuit: {} → {}", src_peer_id, dst_peer_id);
         }
         SwarmEvent::Behaviour(EgoBehaviourEvent::RelayServer(_)) => {}
+
+        // Zero-config LAN discovery: dial every peer mDNS finds on the local
+        // network directly. This is how two machines on the same network form a
+        // committee without depending on the public relay (which flaps across
+        // NATs and dies under Windows port exhaustion). Direct LAN links are
+        // stable, so BFT vote rounds actually complete.
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+            for (peer, addr) in list {
+                if peer == *swarm.local_peer_id() { continue; }
+                if swarm.is_connected(&peer) { continue; }
+                eprintln!("[mDNS] Discovered LAN peer {} at {} — dialling directly", peer, addr);
+                let dial_addr = addr.clone().with_p2p(peer).unwrap_or(addr);
+                let _ = swarm.dial(dial_addr);
+            }
+        }
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Mdns(mdns::Event::Expired(_))) => {}
+
+        // UPnP: the router opened a port for us, so we're now directly reachable
+        // from the internet — advertise the public address and stop routing new
+        // peers through the relay. No firewall rule, no admin, on any OS.
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Upnp(upnp::Event::NewExternalAddr(addr))) => {
+            eprintln!("[UPnP] Router mapped a public address: {} — node is now directly reachable", addr);
+            IS_PUBLIC_REACHABLE.store(true, Ordering::Relaxed);
+            if !external_addrs.contains(&addr) {
+                external_addrs.push(addr.clone());
+            }
+            let peer_id = *swarm.local_peer_id();
+            crate::app::global_app_state().set_public_endpoint(best_endpoint(external_addrs, &peer_id));
+            if let Some(h) = app {
+                let _ = h.emit_all("ego://p2p-status-changed", ());
+            }
+        }
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Upnp(upnp::Event::ExpiredExternalAddr(addr))) => {
+            external_addrs.retain(|a| a != &addr);
+        }
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Upnp(upnp::Event::GatewayNotFound)) => {
+            tracing::debug!("[UPnP] No UPnP-capable router found — relying on relay + hole-punching");
+        }
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Upnp(upnp::Event::NonRoutableGateway)) => {
+            tracing::debug!("[UPnP] Router is not internet-routable — relying on relay + hole-punching");
+        }
 
         SwarmEvent::Behaviour(EgoBehaviourEvent::Autonat(
             autonat::Event::StatusChanged { new, .. },
@@ -6268,7 +6388,13 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                 if !vrf_pubkey.is_empty() { record_peer_ed25519(&address, &vrf_pubkey); }
                 register_known_validator(&address);
             } else if staked_amount > 0 || coverage_score > 0 || !dilithium_pubkey.is_empty() || !vrf_pubkey.is_empty() {
-                tracing::debug!("[P2P] Ignoring unauthenticated validator/DRS fields from {}", address);
+                tracing::warn!(
+                    "PeerAnnounce from {} FAILED identity verification — not registering as validator (genesis_match={}, has_dil={}, has_vrf={})",
+                    address,
+                    genesis_hash == crate::ledger::GENESIS_HASH,
+                    !dilithium_pubkey.is_empty(),
+                    !vrf_pubkey.is_empty(),
+                );
             }
             if !endpoint.is_empty() {
                 let _cg = crate::commands::messenger::CONTACTS_LOCK.lock().unwrap();
@@ -8091,10 +8217,7 @@ pub async fn dial_bootstrap_peers() {
 }
 
 pub async fn oracle_peer_discovery_tick() {
-    // Always dial the public validator anchor(s), even with EGO_NO_ORACLE — direct
-    // peering doesn't depend on the oracle.
     dial_bootstrap_peers().await;
-    if std::env::var("EGO_NO_ORACLE").is_ok() { return; }
 
     let my_ep = get_public_endpoint().await;
     let allow_direct = std::env::var("EGO_DIRECT_PEERS").is_ok();
@@ -10584,9 +10707,38 @@ fn ensure_firewall_rule() {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+    // Program-based rule first: allow ALL inbound traffic for the Ego Desktop
+    // binary. A port rule for 47393 alone does NOT cover mDNS multicast (UDP
+    // 5353), so same-LAN peers could never discover each other. Allowing the
+    // program covers the P2P port, mDNS, and any future ports in one rule.
+    if let Ok(exe) = std::env::current_exe() {
+        let exe_str = exe.to_string_lossy().to_string();
+        let name = "Ego Desktop (allow app)";
+        let exists = std::process::Command::new("netsh")
+            .args(["advfirewall", "firewall", "show", "rule", &format!("name={}", name)])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map(|o| o.status.success() && !o.stdout.is_empty())
+            .unwrap_or(false);
+        if !exists {
+            let _ = std::process::Command::new("netsh")
+                .args([
+                    "advfirewall", "firewall", "add", "rule",
+                    &format!("name={}", name),
+                    "dir=in", "action=allow",
+                    &format!("program={}", exe_str),
+                    "enable=yes", "profile=any",
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        }
+    }
+
     for (name, proto, port) in [
         (format!("Ego Desktop P2P TCP {}", p2p_port()), "TCP", p2p_port()),
         (format!("Ego Desktop P2P UDP {}", p2p_port()), "UDP", p2p_port()),
+        // mDNS multicast — required for zero-config same-LAN peer discovery.
+        ("Ego Desktop mDNS UDP 5353".to_string(), "UDP", 5353),
     ] {
         let check = std::process::Command::new("netsh")
             .args(["advfirewall", "firewall", "show", "rule", &format!("name={}", name)])
