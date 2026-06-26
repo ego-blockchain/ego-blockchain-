@@ -131,12 +131,10 @@ pub fn check_slot_winner(prev_hash: &str) -> Option<(String, String)> {
 
     let slot = current_slot();
     let seed = slot_seed(prev_hash, slot);
+
     let (ticket, sig_hex) = compute_ticket(&seed)?;
 
-    // ── DRS-weighted lottery (same metric as BFT proposer election) ──────────
-    // Previously used coverage-only weights, which diverged from the BFT VRF
-    // (which uses DRS = stake + coverage).  Using DRS here ensures the PoC
-    // ticket lottery and the BFT consensus lottery agree on who is eligible.
+
     let all_validators = crate::p2p::get_known_validators_snapshot();
 
     if all_validators.is_empty() {
@@ -172,7 +170,7 @@ pub fn verify_ticket(
     sig_hex:      &str,
     proposer:     &str,
     prev_hash:    &str,
-    slot:         u64,
+    poc_slot:         u64,
     block_height: u64,
 ) -> bool {
     if ticket_hex.is_empty() || sig_hex.is_empty() {
@@ -185,7 +183,7 @@ pub fn verify_ticket(
         return false;
     }
 
-    let seed = slot_seed(prev_hash, slot);
+    let seed = slot_seed(prev_hash, poc_slot);
 
     let sig_bytes = match hex::decode(sig_hex) {
         Ok(b) => b,

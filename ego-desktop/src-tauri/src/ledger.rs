@@ -364,7 +364,7 @@ pub fn load_registry() -> WalletRegistry {
     if !path.exists() {
         return WalletRegistry::default();
     }
-    for attempt in 0..10 {
+        for attempt in 0..10 {
         match fs::read_to_string(&path) {
             Ok(data) => {
                 if data.is_empty() {
@@ -785,7 +785,7 @@ impl Ledger {
         if !path.exists() {
             return Self::default();
         }
-        for attempt in 0..10 {
+    for attempt in 0..10 {
             match fs::read_to_string(&path) {
                 Ok(data) => {
                     if data.is_empty() {
