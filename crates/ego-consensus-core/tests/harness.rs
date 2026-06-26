@@ -201,6 +201,37 @@ fn dilithium_default_finalizes_and_agrees() {
     }
 }
 
+/// The exact scenario the user hit on the INLINE BFT: one node "sleeps" (goes offline)
+/// while the chain is live, time passes, then it reconnects — the chain MUST resume.
+/// The inline BFT fails this (its view runs away to ~791 and the peer never re-votes).
+/// The v2 engine's round only advances on a QUORUM, so a lone node can't run its view
+/// away; reconnection must converge and finalize again.
+#[test]
+fn sleeping_node_rejoins_and_chain_resumes() {
+    let n = 2;
+    let net = Net::new(n);
+    for _ in 0..3 {
+        let h = net.run_height(&all_reachable(n), 4).expect("warmup");
+        net.assert_agreement(&all_reachable(n), h);
+    }
+    let tip = net.engines[0].get_current_height();
+
+    // Node 1 asleep: only node 0 reachable for a long time. With quorum 2 it must make
+    // NO progress (no solo) and must not run its view away.
+    for _ in 0..100 {
+        assert!(net.run_height(&[true, false], 3).is_none(), "lone node must not finalize");
+    }
+    assert_eq!(net.engines[0].get_current_height(), tip, "awake node must not advance");
+    assert_eq!(net.engines[1].get_current_height(), tip, "sleeping node is frozen");
+
+    // Wake up: both reachable again. The chain must auto-heal and resume in lockstep.
+    for i in 0..10u64 {
+        let h = net.run_height(&all_reachable(n), 8).expect("must resume after node wakes");
+        net.assert_agreement(&all_reachable(n), h);
+        assert_eq!(net.engines[0].get_current_height(), tip + i + 1);
+    }
+}
+
 /// Nodes that seed to the live chain tip (instead of 0) agree on the proposer schedule
 /// and finalize from there — the property the shadow needs so two nodes that didn't
 /// start simultaneously still run in lockstep.
