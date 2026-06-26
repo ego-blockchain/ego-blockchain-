@@ -8,7 +8,7 @@
 //!
 //! Phase 1 of CONSENSUS_REPLACEMENT_SCOPE.md.
 
-use ego_consensus_core::bft::{BftEngine, BlockRoots, Vote};
+use ego_consensus_core::bft::{BftEngine, BlockRoots, SigScheme, Vote};
 use ego_core::{Address, Hash, KeyPair};
 
 /// A simulated network of N engines that all share the SAME validator set (so they
@@ -18,14 +18,20 @@ struct Net {
 }
 
 impl Net {
+    /// Fast default for the state-machine suites: ed25519 (the consensus logic is
+    /// identical regardless of scheme; ed25519 just keeps these heavy loops quick).
     fn new(n: usize) -> Self {
+        Self::with_scheme(n, SigScheme::Ed25519)
+    }
+
+    fn with_scheme(n: usize, scheme: SigScheme) -> Self {
         let kps: Vec<KeyPair> = (0..n).map(|_| KeyPair::generate()).collect();
-        // One canonical validator-set Vec, cloned identically into every engine.
-        let validators: Vec<Address> =
-            kps.iter().map(|k| Address::from_public_key(&k.ed25519_public_key())).collect();
+        // One canonical validator-set Vec, cloned identically into every engine, derived
+        // with the SAME scheme the engines sign under so vote.voter matches a member.
+        let validators: Vec<Address> = kps.iter().map(|k| scheme.address(k)).collect();
         let engines = kps
             .into_iter()
-            .map(|kp| BftEngine::new(kp, validators.clone()))
+            .map(|kp| BftEngine::with_scheme(kp, validators.clone(), scheme))
             .collect();
         Net { engines }
     }
@@ -176,6 +182,23 @@ fn liveness_and_agreement_4_validators() {
 #[test]
 fn liveness_and_agreement_7_validators() {
     liveness_for(7, 50);
+}
+
+/// The production default scheme is post-quantum **Dilithium**. The heavy
+/// liveness/adversarial suites run on ed25519 for speed (the state machine is
+/// scheme-independent); this exercises the real PQ signing/verifying path end-to-end to
+/// confirm it finalizes and agrees.
+#[test]
+fn dilithium_default_finalizes_and_agrees() {
+    let n = 4;
+    let net = Net::with_scheme(n, SigScheme::Dilithium);
+    for h in 0..5 {
+        let hash = net.run_height(&all_reachable(n), 4).expect("dilithium finalize");
+        net.assert_agreement(&all_reachable(n), hash);
+        for e in &net.engines {
+            assert_eq!(e.get_current_height(), h + 1);
+        }
+    }
 }
 
 /// The exact failure that killed the live network: the elected leader for a height

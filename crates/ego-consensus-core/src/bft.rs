@@ -12,6 +12,48 @@ pub const PROPOSE_TIMEOUT_MS: u64 = 500;
 pub const VOTE_TIMEOUT_MS: u64 = 1_000;
 pub const COMMIT_TIMEOUT_MS: u64 = 1_500;
 
+/// The signature scheme used for consensus messages (votes, block headers,
+/// view-changes). A network-wide consensus parameter — every validator MUST use the
+/// same scheme, because the `validator_set` addresses are derived from the matching
+/// public key (`Address::from_public_key`).
+///
+/// `Dilithium` (ML-DSA-44) is the **default** — post-quantum. It does NOT bloat the
+/// chain: a `QuorumCertificate` stores only a Merkle root of the signatures + a voter
+/// bitmap (not the full ~2.4 KB sigs), and consensus runs over a *bounded committee*, so
+/// the heavier per-vote sigs are transient committee bandwidth, not permanent per-block
+/// storage. The path to fully self-contained, light historical verification is a
+/// SNARK-aggregated finality proof (one succinct proof per block/epoch).
+///
+/// `Ed25519` is classical (NOT post-quantum) — kept for fast tests/dev and as a future
+/// fallback knob; do not ship it on a network that advertises post-quantum security.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SigScheme {
+    #[default]
+    Dilithium,
+    Ed25519,
+}
+
+impl SigScheme {
+    /// The public key this scheme presents for `kp` (also what derives the address).
+    pub fn public_key(&self, kp: &KeyPair) -> PublicKey {
+        match self {
+            SigScheme::Dilithium => kp.dilithium_public_key(),
+            SigScheme::Ed25519 => kp.ed25519_public_key(),
+        }
+    }
+    /// Sign `msg` under this scheme.
+    pub fn sign(&self, kp: &KeyPair, msg: &[u8]) -> Signature {
+        match self {
+            SigScheme::Dilithium => kp.sign_dilithium(msg),
+            SigScheme::Ed25519 => kp.sign_ed25519(msg),
+        }
+    }
+    /// The consensus `Address` of `kp` under this scheme = `blake3(public_key)[..20]`.
+    pub fn address(&self, kp: &KeyPair) -> Address {
+        Address::from_public_key(&self.public_key(kp))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct BlockHeader {
     pub height: u64,
@@ -85,9 +127,9 @@ impl BlockHeader {
         d
     }
 
-    pub fn sign(&mut self, kp: &KeyPair) -> PoCResult<()> {
-        self.proposer_public_key = kp.ed25519_public_key();
-        self.signature = kp.sign_ed25519(&self.signing_bytes());
+    pub fn sign(&mut self, kp: &KeyPair, scheme: SigScheme) -> PoCResult<()> {
+        self.proposer_public_key = scheme.public_key(kp);
+        self.signature = scheme.sign(kp, &self.signing_bytes());
         Ok(())
     }
 
@@ -158,13 +200,13 @@ pub struct Vote {
 }
 
 impl Vote {
-    pub fn new(block_hash: Hash, height: u64, epoch: u64, round: u32, kp: &KeyPair) -> PoCResult<Self> {
+    pub fn new(block_hash: Hash, height: u64, epoch: u64, round: u32, kp: &KeyPair, scheme: SigScheme) -> PoCResult<Self> {
         let msg = Self::msg(block_hash, height, epoch, round);
         Ok(Self {
             block_hash, height, epoch, round,
-            voter: Address::from_public_key(&kp.ed25519_public_key()),
-            voter_public_key: kp.ed25519_public_key(),
-            signature: kp.sign_ed25519(&msg),
+            voter: scheme.address(kp),
+            voter_public_key: scheme.public_key(kp),
+            signature: scheme.sign(kp, &msg),
             timestamp: Timestamp::now(),
         })
     }
@@ -279,6 +321,7 @@ impl RoundState {
 pub struct BftEngine {
     keypair: Arc<KeyPair>,
     address: Address,
+    scheme: SigScheme,
     validator_set: Vec<Address>,
     finalized_blocks: Arc<RwLock<Vec<(BlockHeader, QuorumCertificate)>>>,
     current_round: Arc<RwLock<RoundState>>,
@@ -290,10 +333,19 @@ pub struct BftEngine {
 }
 
 impl BftEngine {
+    /// Create an engine with the default (post-quantum **Dilithium**) signature scheme.
+    /// `validator_set` MUST be derived with the same scheme (`SigScheme::address`).
     pub fn new(keypair: KeyPair, validator_set: Vec<Address>) -> Self {
-        let address = Address::from_public_key(&keypair.ed25519_public_key());
+        Self::with_scheme(keypair, validator_set, SigScheme::default())
+    }
+
+    /// Create an engine with an explicit signature scheme. Every validator on the
+    /// network must use the SAME scheme, and `validator_set` must be derived from the
+    /// matching public keys.
+    pub fn with_scheme(keypair: KeyPair, validator_set: Vec<Address>, scheme: SigScheme) -> Self {
+        let address = scheme.address(&keypair);
         Self {
-            keypair: Arc::new(keypair), address, validator_set,
+            keypair: Arc::new(keypair), address, scheme, validator_set,
             finalized_blocks: Arc::new(RwLock::new(Vec::new())),
             current_round: Arc::new(RwLock::new(RoundState::new(0, 0, 0))),
             current_epoch: Arc::new(RwLock::new(0)),
@@ -302,6 +354,8 @@ impl BftEngine {
             fork_choice: Arc::new(RwLock::new(ForkChoiceStore::new())),
         }
     }
+
+    pub fn scheme(&self) -> SigScheme { self.scheme }
 
     pub fn quorum_size(&self) -> usize { (2 * self.validator_set.len()) / 3 + 1 }
 
@@ -332,7 +386,7 @@ impl BftEngine {
         let (vrf_output, vrf_proof) = BlockHeader::compute_vrf_output(&self.keypair, epoch, slot);
         self.vrf_outputs.write().unwrap().insert(epoch, vrf_output);
         let mut header = BlockHeader::new(height, epoch, slot, prev_hash, self.address, roots, vrf_output, vrf_proof);
-        header.sign(&self.keypair)?;
+        header.sign(&self.keypair, self.scheme)?;
 
         self.fork_choice.write().unwrap().add_block(header.clone());
 
@@ -384,7 +438,7 @@ impl BftEngine {
             s.advance_phase(RoundPhase::Vote);
             s.round
         };
-        let vote = Vote::new(header.block_hash(), header.height, header.epoch, round, &self.keypair)?;
+        let vote = Vote::new(header.block_hash(), header.height, header.epoch, round, &self.keypair, self.scheme)?;
         debug!("✅ Cast vote for h={} (voter {})", header.height, self.address);
         Ok(Some(vote))
     }
@@ -454,7 +508,7 @@ impl BftEngine {
             let fc = self.fork_choice.read().unwrap();
             (s.round + 1, s.height, s.epoch, fc.high_qc.clone())
         };
-        let msg = ViewChangeMsg::new(new_round, height, epoch, high_qc, &self.keypair)?;
+        let msg = ViewChangeMsg::new(new_round, height, epoch, high_qc, &self.keypair, self.scheme)?;
         warn!("⏱️  View change triggered: round {} → {}", new_round - 1, new_round);
         Ok(msg)
     }
@@ -521,8 +575,8 @@ mod tests {
 
     fn make_engine(n: usize) -> (BftEngine, Vec<KeyPair>) {
         let kps: Vec<KeyPair> = (0..n).map(|_| KeyPair::generate()).collect();
-        let vals: Vec<Address> = kps.iter().map(|kp| Address::from_public_key(&kp.ed25519_public_key())).collect();
-        (BftEngine::new(kps[0].clone(), vals), kps)
+        let vals: Vec<Address> = kps.iter().map(|kp| SigScheme::Ed25519.address(kp)).collect();
+        (BftEngine::with_scheme(kps[0].clone(), vals, SigScheme::Ed25519), kps)
     }
 
     #[test] fn test_quorum_size() { let (e, _) = make_engine(4); assert_eq!(e.quorum_size(), 3); }
@@ -538,13 +592,13 @@ mod tests {
         let kp = KeyPair::generate();
         let addr = Address::from_public_key(&kp.ed25519_public_key());
         let mut h = BlockHeader::new(1, 0, 0, Hash::new([0u8; 32]), addr, BlockRoots::empty(), Hash::new([1u8; 32]), vec![]);
-        h.sign(&kp).unwrap();
+        h.sign(&kp, SigScheme::Ed25519).unwrap();
         assert!(h.verify_signature().unwrap());
     }
 
     #[test] fn test_vote_verify() {
         let kp = KeyPair::generate();
-        let v = Vote::new(Hash::new([1u8; 32]), 1, 0, 0, &kp).unwrap();
+        let v = Vote::new(Hash::new([1u8; 32]), 1, 0, 0, &kp, SigScheme::Ed25519).unwrap();
         assert!(v.verify().unwrap());
     }
 
@@ -570,7 +624,7 @@ mod tests {
         let header = engine.propose_block(BlockRoots::empty()).unwrap();
         let mut qc_opt = None;
         for kp in &kps {
-            let vote = Vote::new(header.block_hash(), header.height, header.epoch, 0, kp).unwrap();
+            let vote = Vote::new(header.block_hash(), header.height, header.epoch, 0, kp, SigScheme::Ed25519).unwrap();
             qc_opt = engine.receive_vote(&vote).unwrap();
             if qc_opt.is_some() { break; }
         }

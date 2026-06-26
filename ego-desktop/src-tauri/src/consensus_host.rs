@@ -10,8 +10,12 @@
 //! See CONSENSUS_REPLACEMENT_SCOPE.md.
 
 use crate::ledger::LedgerBlock;
-use ego_consensus_core::bft::{BftEngine, BlockHeader, BlockRoots, QuorumCertificate, Vote};
+use ego_consensus_core::bft::{BftEngine, BlockHeader, BlockRoots, QuorumCertificate, SigScheme, Vote};
 use ego_core::{Address, Hash, KeyPair, PublicKey};
+
+/// Re-exported so the p2p layer can name the consensus signature scheme. Default is
+/// post-quantum Dilithium2; ed25519 is the lighter (non-PQ) option for dev/testnet.
+pub use ego_consensus_core::bft::SigScheme as ConsensusSigScheme;
 
 /// Parse a hex hash string (desktop `LedgerBlock` hashes are lowercase hex). An empty
 /// or malformed value maps to the zero hash — a valid, agreed placeholder.
@@ -22,27 +26,32 @@ pub fn hash_from_hex(s: &str) -> Hash {
     Hash::from_hex(s).unwrap_or_else(|_| Hash::new([0u8; 32]))
 }
 
-/// The consensus address of a validator. `BftEngine` votes carry
-/// `Address::from_public_key(kp.public_key())`, so the `validator_set` MUST be derived
-/// the same way for `vote.voter` to match a set member.
+/// The consensus address of a validator = `blake3(public_key)[..20]` (=
+/// `Address::from_public_key`). `BftEngine` derives `vote.voter` this way, so the
+/// `validator_set` MUST be built from the SAME public key the engine signs with.
 ///
-/// `BftEngine` signs consensus messages with **ed25519** (chosen over Dilithium for
-/// bandwidth at scale — 64 B/vote vs ~2.4 KB; post-quantum security is provided at the
-/// QC/BLS finality layer). Votes therefore carry
-/// `Address::from_public_key(kp.ed25519_public_key())`, so the `validator_set` MUST be
-/// built from each validator's **ed25519** public key. Self:
-/// `Address::from_public_key(&local_kp.ed25519_public_key())`; peers:
-/// [`address_from_ed25519`]`(p2p::get_peer_ed25519_pubkey(addr)?)` — the desktop already
-/// keeps that registry for its inline BFT vote verification, so no new plumbing.
-/// (The desktop's bech32 address is also ed25519-derived but via `EgoAddress`, a
-/// SEPARATE encoding — map bech32 <-> engine-`Address` via the per-validator pubkey
-/// lookup, never by re-deriving.)
+/// The engine's scheme is pluggable ([`ConsensusSigScheme`]) and defaults to
+/// **post-quantum Dilithium2** (chosen for security; it does NOT bloat the chain — the
+/// QC stores only a Merkle root of sigs + a voter bitmap, consensus runs over a bounded
+/// committee, and the path to light historical verification is SNARK-aggregated
+/// finality). For the default, build addresses from each validator's Dilithium key
+/// ([`address_from_dilithium`]); for the ed25519 option, from the ed25519 key
+/// ([`address_from_ed25519`]). Self: `scheme.address(&local_kp)`; peers: the matching
+/// desktop registry (Dilithium → `register_validator_pubkey`; ed25519 →
+/// `get_peer_ed25519_pubkey`). The desktop's bech32 address is a SEPARATE encoding — map
+/// bech32 <-> engine-`Address` via the per-validator pubkey lookup, never re-derive.
 pub fn consensus_address(pk: &PublicKey) -> Address {
     Address::from_public_key(pk)
 }
 
-/// Build an engine `Address` from a validator's raw 32-byte ed25519 public key (as
-/// returned by `p2p::get_peer_ed25519_pubkey`, or the local keypair's verifying key).
+/// Engine `Address` from a validator's RAW Dilithium2 key_data (`PublicKey::as_bytes()`,
+/// NOT the tagged `to_vec()`) — the default post-quantum scheme's identity.
+pub fn address_from_dilithium(dilithium_key_data: Vec<u8>) -> Address {
+    Address::from_public_key(&PublicKey::dilithium2(dilithium_key_data))
+}
+
+/// Engine `Address` from a validator's raw 32-byte ed25519 public key (the ed25519
+/// scheme option; `p2p::get_peer_ed25519_pubkey` returns these).
 pub fn address_from_ed25519(ed25519_pk: [u8; 32]) -> Address {
     Address::from_public_key(&PublicKey::ed25519(ed25519_pk))
 }
@@ -59,19 +68,20 @@ pub fn roots_from_ledger_block(b: &LedgerBlock) -> BlockRoots {
 }
 
 /// Build the engine `validator_set` (and a reverse `Address -> bech32` map for mapping
-/// finalized headers back to `LedgerBlock.miner`) from each validator's **ed25519 public
-/// key**. `validators` must list every registered validator INCLUDING self, as
-/// `(bech32_address, ed25519_pk_bytes)`.
+/// finalized headers back to `LedgerBlock.miner`) from each validator's pre-computed
+/// engine `Address` (use [`address_from_dilithium`] for the default scheme, or
+/// [`address_from_ed25519`]). `validators` must list every registered validator
+/// INCLUDING self, as `(bech32_address, engine_address)`.
 ///
 /// The result is sorted by `Address` and de-duplicated, so every node that sees the
 /// same registered set produces the byte-identical ordered set — the prerequisite for
 /// all engines agreeing on the per-round proposer `(height + round) % n`.
 pub fn build_validator_set(
-    validators: &[(String, [u8; 32])],
+    validators: &[(String, Address)],
 ) -> (Vec<Address>, std::collections::HashMap<Address, String>) {
     let mut pairs: Vec<(Address, String)> = validators
         .iter()
-        .map(|(bech32, ed)| (address_from_ed25519(*ed), bech32.clone()))
+        .map(|(bech32, addr)| (addr.clone(), bech32.clone()))
         .collect();
     pairs.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     pairs.dedup_by(|a, b| a.0 == b.0);
@@ -89,11 +99,17 @@ pub struct ConsensusHost {
 }
 
 impl ConsensusHost {
-    /// `validator_set` must be the SAME ordered list on every node (e.g. the on-chain
-    /// registered set, each mapped via [`consensus_address`]/[`address_from_ed25519`]),
-    /// so all engines agree on the per-round proposer = `(height + round) % n`.
+    /// Create a host with the default (post-quantum **Dilithium**) scheme. `validator_set`
+    /// must be the SAME ordered list on every node (the registered set mapped via
+    /// [`address_from_dilithium`]) so all engines agree on the proposer `(height+round)%n`.
     pub fn new(local: KeyPair, validator_set: Vec<Address>) -> Self {
-        let engine = BftEngine::new(local, validator_set.clone());
+        Self::with_scheme(local, validator_set, SigScheme::default())
+    }
+
+    /// Create a host with an explicit signature scheme. Every node on the network must
+    /// use the same scheme, and `validator_set` must be derived from the matching keys.
+    pub fn with_scheme(local: KeyPair, validator_set: Vec<Address>, scheme: SigScheme) -> Self {
+        let engine = BftEngine::with_scheme(local, validator_set.clone(), scheme);
         Self { engine, validator_set }
     }
 
@@ -174,29 +190,33 @@ mod tests {
         assert_eq!(hash_from_hex("not-hex"), Hash::new([0u8; 32]));
     }
 
-    /// LINCHPIN: pins that the engine derives `vote.voter` from the **ed25519** key. The
-    /// engine was switched to ed25519 signing; the `validator_set` must match. If the
-    /// engine's signing key ever changes algorithm, this fails loudly.
+    /// LINCHPIN: the engine's DEFAULT scheme is post-quantum Dilithium, and the
+    /// `validator_set` must be derived from the SAME key. If the default scheme or its
+    /// address derivation ever changes, this fails loudly so the set construction is
+    /// revisited (a mismatched set silently never matches `vote.voter`).
     #[test]
-    fn engine_address_is_ed25519_derived() {
+    fn engine_default_address_is_dilithium() {
         let kp = KeyPair::generate();
-        // What BftEngine now uses for vote.voter (ed25519):
-        let engine_addr = consensus_address(&kp.ed25519_public_key());
-        assert_ne!(engine_addr, consensus_address(&kp.dilithium_public_key()));
-        // The helper we use for peers (raw 32-byte ed25519 key) agrees.
+        // The default scheme's address == derived from the Dilithium key, != ed25519.
+        let engine_addr = SigScheme::default().address(&kp);
+        assert_eq!(engine_addr, consensus_address(&kp.dilithium_public_key()));
+        assert_ne!(engine_addr, consensus_address(&kp.ed25519_public_key()));
+        // The Dilithium helper (RAW key_data) agrees with the default-scheme address.
+        let dil_raw = kp.dilithium_public_key().as_bytes().to_vec();
+        assert_eq!(engine_addr, address_from_dilithium(dil_raw));
+        // The ed25519 helper agrees with the ed25519-scheme address (the option).
         let ed_raw: [u8; 32] = kp.ed25519_public_key().as_bytes().try_into().unwrap();
-        assert_eq!(engine_addr, address_from_ed25519(ed_raw));
+        assert_eq!(consensus_address(&kp.ed25519_public_key()), address_from_ed25519(ed_raw));
     }
 
     #[test]
     fn validator_set_is_deterministic_and_dedup() {
         let kps: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
-        let raw: Vec<(String, [u8; 32])> = kps
+        // Default (Dilithium) scheme addresses, paired with bech32.
+        let raw: Vec<(String, Address)> = kps
             .iter()
             .enumerate()
-            .map(|(i, k)| {
-                (format!("egot1node{i}"), k.ed25519_public_key().as_bytes().try_into().unwrap())
-            })
+            .map(|(i, k)| (format!("egot1node{i}"), consensus_address(&k.dilithium_public_key())))
             .collect();
 
         // Same inputs in DIFFERENT orders must yield the byte-identical ordered set.
@@ -210,7 +230,7 @@ mod tests {
         // The set members are exactly the engine addresses of those keypairs, and the
         // reverse map recovers the bech32.
         for (i, k) in kps.iter().enumerate() {
-            let addr = consensus_address(&k.ed25519_public_key());
+            let addr = consensus_address(&k.dilithium_public_key());
             assert!(set_a.contains(&addr));
             assert_eq!(map_a.get(&addr).map(|s| s.as_str()), Some(format!("egot1node{i}").as_str()));
         }
@@ -229,7 +249,8 @@ mod tests {
     #[test]
     fn two_hosts_finalize_in_lockstep() {
         let kps: Vec<KeyPair> = (0..2).map(|_| KeyPair::generate()).collect();
-        let set: Vec<Address> = kps.iter().map(|k| consensus_address(&k.ed25519_public_key())).collect();
+        // Default (Dilithium) scheme — exercises the real production signing path.
+        let set: Vec<Address> = kps.iter().map(|k| consensus_address(&k.dilithium_public_key())).collect();
         let hosts: Vec<ConsensusHost> =
             kps.into_iter().map(|kp| ConsensusHost::new(kp, set.clone())).collect();
 
