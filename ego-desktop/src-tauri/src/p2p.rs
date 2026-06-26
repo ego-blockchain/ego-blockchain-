@@ -668,7 +668,12 @@ pub fn build_shadow_consensus_host() -> Option<crate::consensus_host::ConsensusH
     }
 
     let (set, _bech32_by_addr) = build_validator_set(&pairs);
-    Some(ConsensusHost::new(kp, set))
+    let host = ConsensusHost::new(kp, set);
+    // Align with peers at the live chain tip: the next height to produce is tip+1, so
+    // two nodes that didn't start simultaneously still agree on the proposer schedule.
+    let next_height = crate::chain_db::latest_block_info().0 + 1;
+    host.seed_height(next_height);
+    Some(host)
 }
 
 // ── Consensus-v2 SHADOW driver (cutover step 2) ──────────────────────────────────

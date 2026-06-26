@@ -137,6 +137,12 @@ impl ConsensusHost {
         self.engine.current_round()
     }
 
+    /// Seed the engine to start at `height` (the live chain tip) so a node joining
+    /// mid-chain aligns with peers. Call before any propose/vote.
+    pub fn seed_height(&self, height: u64) {
+        self.engine.seed_height(height);
+    }
+
     pub fn validator_set(&self) -> &[Address] {
         &self.validator_set
     }

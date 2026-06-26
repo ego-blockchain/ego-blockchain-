@@ -201,6 +201,26 @@ fn dilithium_default_finalizes_and_agrees() {
     }
 }
 
+/// Nodes that seed to the live chain tip (instead of 0) agree on the proposer schedule
+/// and finalize from there — the property the shadow needs so two nodes that didn't
+/// start simultaneously still run in lockstep.
+#[test]
+fn seed_height_aligns_late_joiners() {
+    let n = 4;
+    let net = Net::new(n);
+    const TIP: u64 = 137;
+    for e in &net.engines {
+        e.seed_height(TIP);
+    }
+    for h in 0..10u64 {
+        let hash = net.run_height(&all_reachable(n), 4).expect("finalize from seeded height");
+        net.assert_agreement(&all_reachable(n), hash);
+        for e in &net.engines {
+            assert_eq!(e.get_current_height(), TIP + h + 1);
+        }
+    }
+}
+
 /// The exact failure that killed the live network: the elected leader for a height
 /// goes offline. The inline p2p.rs BFT could not rotate past it (its view-change
 /// ignored the view) and deadlocked. Here the reachable majority must view-change

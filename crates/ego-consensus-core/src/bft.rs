@@ -357,6 +357,16 @@ impl BftEngine {
 
     pub fn scheme(&self) -> SigScheme { self.scheme }
 
+    /// Seed the engine's starting height/epoch BEFORE consensus begins (e.g. to the live
+    /// chain tip), so a node joining mid-chain aligns with peers on the proposer schedule
+    /// `(height + round) % n` instead of restarting from 0. MUST be called before any
+    /// propose/vote (it resets the round state). No-op safety: only sets initial state.
+    pub fn seed_height(&self, height: u64) {
+        *self.current_height.write().unwrap() = height;
+        *self.current_epoch.write().unwrap() = height;
+        *self.current_round.write().unwrap() = RoundState::new(height, height, 0);
+    }
+
     pub fn quorum_size(&self) -> usize { (2 * self.validator_set.len()) / 3 + 1 }
 
     pub fn is_proposer(&self) -> bool {
