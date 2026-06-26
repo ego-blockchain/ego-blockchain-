@@ -86,8 +86,8 @@ impl BlockHeader {
     }
 
     pub fn sign(&mut self, kp: &KeyPair) -> PoCResult<()> {
-        self.proposer_public_key = kp.public_key();
-        self.signature = kp.sign(&self.signing_bytes());
+        self.proposer_public_key = kp.ed25519_public_key();
+        self.signature = kp.sign_ed25519(&self.signing_bytes());
         Ok(())
     }
 
@@ -115,7 +115,7 @@ impl BlockHeader {
     ///   • **Verifiability** — verifier reconstructs input from PK + (epoch, slot),
     ///     checks the Ed25519 signature, then recomputes BLAKE2s(proof) and compares.
     pub fn compute_vrf_output(kp: &KeyPair, epoch: u64, slot: u64) -> (Hash, Vec<u8>) {
-        let input = hash_multiple(&[kp.public_key().as_bytes(), &epoch.to_le_bytes(), &slot.to_le_bytes()]);
+        let input = hash_multiple(&[kp.ed25519_public_key().as_bytes(), &epoch.to_le_bytes(), &slot.to_le_bytes()]);
         // Ed25519 signature is the proof — deterministic for the same SK + input.
         let proof = kp.sign_ed25519(input.as_bytes()).as_bytes().to_vec();
         // Output is derived solely from the proof so it is uniquely bound to it.
@@ -162,9 +162,9 @@ impl Vote {
         let msg = Self::msg(block_hash, height, epoch, round);
         Ok(Self {
             block_hash, height, epoch, round,
-            voter: Address::from_public_key(&kp.public_key()),
-            voter_public_key: kp.public_key(),
-            signature: kp.sign(&msg),
+            voter: Address::from_public_key(&kp.ed25519_public_key()),
+            voter_public_key: kp.ed25519_public_key(),
+            signature: kp.sign_ed25519(&msg),
             timestamp: Timestamp::now(),
         })
     }
@@ -291,7 +291,7 @@ pub struct BftEngine {
 
 impl BftEngine {
     pub fn new(keypair: KeyPair, validator_set: Vec<Address>) -> Self {
-        let address = Address::from_public_key(&keypair.public_key());
+        let address = Address::from_public_key(&keypair.ed25519_public_key());
         Self {
             keypair: Arc::new(keypair), address, validator_set,
             finalized_blocks: Arc::new(RwLock::new(Vec::new())),
@@ -521,7 +521,7 @@ mod tests {
 
     fn make_engine(n: usize) -> (BftEngine, Vec<KeyPair>) {
         let kps: Vec<KeyPair> = (0..n).map(|_| KeyPair::generate()).collect();
-        let vals: Vec<Address> = kps.iter().map(|kp| Address::from_public_key(&kp.public_key())).collect();
+        let vals: Vec<Address> = kps.iter().map(|kp| Address::from_public_key(&kp.ed25519_public_key())).collect();
         (BftEngine::new(kps[0].clone(), vals), kps)
     }
 
@@ -529,14 +529,14 @@ mod tests {
 
     #[test] fn test_block_hash_stable() {
         let kp = KeyPair::generate();
-        let addr = Address::from_public_key(&kp.public_key());
+        let addr = Address::from_public_key(&kp.ed25519_public_key());
         let h = BlockHeader::new(1, 0, 0, Hash::new([0u8; 32]), addr, BlockRoots::empty(), Hash::new([1u8; 32]), vec![]);
         assert_eq!(h.block_hash(), h.block_hash());
     }
 
     #[test] fn test_sign_verify() {
         let kp = KeyPair::generate();
-        let addr = Address::from_public_key(&kp.public_key());
+        let addr = Address::from_public_key(&kp.ed25519_public_key());
         let mut h = BlockHeader::new(1, 0, 0, Hash::new([0u8; 32]), addr, BlockRoots::empty(), Hash::new([1u8; 32]), vec![]);
         h.sign(&kp).unwrap();
         assert!(h.verify_signature().unwrap());
@@ -550,7 +550,7 @@ mod tests {
 
     #[test] fn test_epoch_randomness() {
         let kp = KeyPair::generate();
-        let addr = Address::from_public_key(&kp.public_key());
+        let addr = Address::from_public_key(&kp.ed25519_public_key());
         let h = BlockHeader::new(1, 5, 3, Hash::new([0u8; 32]), addr, BlockRoots::empty(), Hash::new([7u8; 32]), vec![]);
         assert_eq!(h.epoch_randomness("r1"), h.epoch_randomness("r1"));
         assert_ne!(h.epoch_randomness("r1"), h.epoch_randomness("r2"));
