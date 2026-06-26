@@ -671,6 +671,123 @@ pub fn build_shadow_consensus_host() -> Option<crate::consensus_host::ConsensusH
     Some(ConsensusHost::new(kp, set))
 }
 
+// ── Consensus-v2 SHADOW driver (cutover step 2) ──────────────────────────────────
+// Runs the BftEngine in PARALLEL with the inline BFT over a dedicated gossip topic,
+// logging what it WOULD decide. It finalizes its own (non-persisted) chain to advance
+// heights so leader rotation/lockstep can be observed, but writes NOTHING to disk and
+// never touches the inline consensus. Entirely gated by EGO_CONSENSUS_V2_SHADOW.
+const V2_TOPIC: &str = "ego-bftv2-v1";
+
+static SHADOW_HOST: std::sync::OnceLock<std::sync::Mutex<Option<crate::consensus_host::ConsensusHost>>> =
+    std::sync::OnceLock::new();
+fn shadow_host_lock() -> std::sync::MutexGuard<'static, Option<crate::consensus_host::ConsensusHost>> {
+    SHADOW_HOST.get_or_init(|| std::sync::Mutex::new(None)).lock().unwrap()
+}
+fn shadow_v2_enabled() -> bool { std::env::var("EGO_CONSENSUS_V2_SHADOW").is_ok() }
+static SHADOW_LAST_PROPOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Build the stored shadow host once we have a quorum-sized validator set. Returns true
+/// if a host is available. The build (DPAPI seed load) runs off the async executor.
+async fn ensure_shadow_host() -> bool {
+    if shadow_host_lock().is_some() { return true; }
+    let built = tokio::task::spawn_blocking(build_shadow_consensus_host).await.ok().flatten();
+    let mut guard = shadow_host_lock();
+    if guard.is_none() {
+        if let Some(h) = built {
+            eprintln!("[ConsensusV2/shadow] host built — validators={} quorum={} scheme=Dilithium",
+                h.validator_set().len(), h.quorum_size());
+            *guard = Some(h);
+        }
+    }
+    guard.is_some()
+}
+
+async fn shadow_publish(msg: &P2PMessage) {
+    if let Ok(data) = serde_json::to_vec(msg) {
+        publish_gossip(V2_TOPIC, data).await;
+    }
+}
+
+/// A v2 proposal arrived (or we just produced our own): vote on it, publish the vote,
+/// and count our own vote toward the QC.
+pub async fn shadow_on_proposal(header: ego_consensus_core::bft::BlockHeader) {
+    if !shadow_v2_enabled() { return; }
+    let vote = {
+        let guard = shadow_host_lock();
+        guard.as_ref().and_then(|h| h.on_proposal(&header))
+    };
+    if let Some(v) = vote {
+        eprintln!("[ConsensusV2/shadow] voted h={} round={}", header.height, v.round);
+        shadow_publish(&P2PMessage::BftV2Vote { vote: v.clone() }).await;
+        shadow_on_vote(v).await;
+    }
+}
+
+/// A v2 vote arrived (or our own): tally it; on QC, log a would-finalize and advance the
+/// shadow engine's (non-persisted) height.
+pub async fn shadow_on_vote(vote: ego_consensus_core::bft::Vote) {
+    if !shadow_v2_enabled() { return; }
+    let decided = {
+        let guard = shadow_host_lock();
+        guard.as_ref().and_then(|h| {
+            h.on_vote(&vote).and_then(|qc| {
+                h.proposed_header().map(|hdr| {
+                    let ht = hdr.height;
+                    let hash = hdr.block_hash();
+                    let ok = h.finalize(hdr, qc);
+                    (ht, hash, ok)
+                })
+            })
+        })
+    };
+    if let Some((ht, hash, ok)) = decided {
+        eprintln!("[ConsensusV2/shadow] QC formed h={} — WOULD finalize {} (ok={}, NOT persisted)",
+            ht, &hash.to_hex()[..12], ok);
+    }
+}
+
+/// A v2 view-change arrived.
+pub async fn shadow_on_view_change(msg: ego_consensus_core::fork_choice::ViewChangeMsg) {
+    if !shadow_v2_enabled() { return; }
+    let new_round = {
+        let guard = shadow_host_lock();
+        guard.as_ref().and_then(|h| h.on_view_change(msg))
+    };
+    if let Some(r) = new_round {
+        eprintln!("[ConsensusV2/shadow] view-change quorum → round {}", r);
+    }
+}
+
+/// Periodic driver: when we're the v2 leader for the current (height, round) and haven't
+/// proposed it yet, build an (empty-roots) candidate, propose it, publish, and self-vote.
+pub async fn shadow_v2_tick() {
+    if !shadow_v2_enabled() || !ensure_shadow_host().await { return; }
+    let proposed = {
+        let guard = shadow_host_lock();
+        guard.as_ref().and_then(|h| {
+            if !h.is_proposer() { return None; }
+            let key = (h.current_height() << 16) | (h.current_round() as u64 & 0xFFFF);
+            if SHADOW_LAST_PROPOSED.swap(key, std::sync::atomic::Ordering::Relaxed) == key {
+                return None; // already proposed this (height, round)
+            }
+            let mut candidate = crate::ledger::LedgerBlock::default();
+            candidate.height = h.current_height();
+            h.propose(&candidate).map(|hdr| (hdr, candidate))
+        })
+    };
+    if let Some((header, candidate)) = proposed {
+        eprintln!("[ConsensusV2/shadow] proposed h={} round={}", header.height, header_round_hint());
+        shadow_publish(&P2PMessage::BftV2Proposal {
+            header: header.clone(), block: candidate, transactions: vec![],
+        }).await;
+        shadow_on_proposal(header).await; // our own self-vote
+    }
+}
+
+fn header_round_hint() -> u32 {
+    shadow_host_lock().as_ref().map(|h| h.current_round()).unwrap_or(0)
+}
+
 pub fn register_validator_pubkey(address: &str, dilithium_pubkey_hex: &str) {
     if address.is_empty() || dilithium_pubkey_hex.is_empty() { return; }
     validator_pubkeys().insert(address.to_string(), dilithium_pubkey_hex.to_string());
@@ -4130,6 +4247,10 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     let _ = swarm.behaviour_mut().gossipsub.subscribe(&vote_topic);
     let _ = swarm.behaviour_mut().gossipsub.subscribe(&peers_topic);
     let _ = swarm.behaviour_mut().gossipsub.subscribe(&vc_topic);
+    // Consensus-v2 shadow topic (cutover step 2). Subscribed always (cheap); only
+    // produces/consumes when EGO_CONSENSUS_V2_SHADOW is set.
+    let bftv2_topic = gossipsub::IdentTopic::new(V2_TOPIC);
+    let _ = swarm.behaviour_mut().gossipsub.subscribe(&bftv2_topic);
 
     let shard_topic = gossipsub::IdentTopic::new("ego-shards-v1");
     swarm.behaviour_mut().gossipsub.subscribe(&shard_topic).ok();
@@ -5390,7 +5511,14 @@ async fn handle_event(
                 return;
             }
             let topic = message.topic.to_string();
-            if topic == "ego-txs-v1" {
+            if topic == V2_TOPIC {
+                // Consensus-v2 shadow messages → handle_incoming (BftV2* arms feed the
+                // parallel engine). No-op unless EGO_CONSENSUS_V2_SHADOW is set.
+                if let Ok(msg) = serde_json::from_slice::<P2PMessage>(&message.data) {
+                    let app2 = app.cloned();
+                    tokio::spawn(async move { handle_incoming(msg, app2.as_ref()).await; });
+                }
+            } else if topic == "ego-txs-v1" {
 
                 match serde_json::from_slice::<P2PMessage>(&message.data) {
                     Ok(P2PMessage::TxBroadcast { tx, block }) => {
@@ -6168,13 +6296,19 @@ async fn handle_event(
 
 pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<tauri::Wry>>) {
     match msg {
-        // ── Consensus-v2 (BftEngine) shadow path ─────────────────────────────
-        // Cutover step 1: the variants exist on the wire but are NOT yet produced
-        // or routed into live consensus. Ignored on receipt for now; a later step
-        // feeds them to a shadow `ConsensusHost` for parity logging before cutover.
-        P2PMessage::BftV2Proposal { .. }
-        | P2PMessage::BftV2Vote { .. }
-        | P2PMessage::BftV2ViewChange { .. } => {}
+        // ── Consensus-v2 (BftEngine) SHADOW path (cutover step 2) ────────────
+        // Feed the parallel engine; it logs would-decisions and advances a
+        // non-persisted chain. Gated inside the handlers by EGO_CONSENSUS_V2_SHADOW;
+        // touches no live state.
+        P2PMessage::BftV2Proposal { header, .. } => {
+            shadow_on_proposal(header).await;
+        }
+        P2PMessage::BftV2Vote { vote } => {
+            shadow_on_vote(vote).await;
+        }
+        P2PMessage::BftV2ViewChange { msg } => {
+            shadow_on_view_change(msg).await;
+        }
 
         P2PMessage::ContactRequest {
             from_addr, from_name, from_ed25519, from_kyber, from_shared_key, from_endpoint, bundle_token,
@@ -10372,18 +10506,10 @@ pub async fn run_view_change_monitor() {
             eprintln!("[ViewMon] alive — tick #{} validators={}", _tick_count, known_validators().len());
         }
 
-        // Cutover step 1 (shadow/inert): when EGO_CONSENSUS_V2_SHADOW is set, build a v2
-        // ConsensusHost from the live registered set and log what it WOULD do. Proves the
-        // engine + validator-set wiring assembles with real state; touches no live state.
-        if _tick_count % 40 == 0 && std::env::var("EGO_CONSENSUS_V2_SHADOW").is_ok() {
-            match tokio::task::spawn_blocking(build_shadow_consensus_host).await.ok().flatten() {
-                Some(host) => eprintln!(
-                    "[ConsensusV2/shadow] host built — validators={} quorum={} is_proposer={} height={}",
-                    host.validator_set().len(), host.quorum_size(), host.is_proposer(), host.current_height(),
-                ),
-                None => eprintln!("[ConsensusV2/shadow] not enough registered validators with known Dilithium keys yet"),
-            }
-        }
+        // Cutover step 2 (shadow): drive the parallel v2 engine — propose when we're its
+        // leader, then publish + self-vote. Receive-side handlers tally votes/QCs. Logs
+        // would-decisions; persists nothing; gated by EGO_CONSENSUS_V2_SHADOW.
+        shadow_v2_tick().await;
 
         if local_validator_is_unset() {
             let registered = tokio::task::spawn_blocking(ensure_local_validator_identity)

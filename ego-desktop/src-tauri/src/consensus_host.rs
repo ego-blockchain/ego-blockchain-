@@ -126,6 +126,17 @@ impl ConsensusHost {
         self.engine.get_current_height()
     }
 
+    /// The header this node currently has proposed/accepted for the live round — used to
+    /// `finalize` once `on_vote` returns a QC.
+    pub fn proposed_header(&self) -> Option<BlockHeader> {
+        self.engine.proposed_header()
+    }
+
+    /// Current round (view) of the live height.
+    pub fn current_round(&self) -> u32 {
+        self.engine.current_round()
+    }
+
     pub fn validator_set(&self) -> &[Address] {
         &self.validator_set
     }

@@ -548,6 +548,11 @@ impl BftEngine {
     pub fn get_current_height(&self) -> u64 { *self.current_height.read().unwrap() }
     pub fn get_current_epoch(&self) -> u64 { *self.current_epoch.read().unwrap() }
     pub fn get_latest_finalized_block(&self) -> Option<(BlockHeader, QuorumCertificate)> { self.finalized_blocks.read().unwrap().last().cloned() }
+    /// The block this node has currently proposed/accepted for the live round (set by
+    /// `propose_block`/`receive_proposal`). Lets a caller finalize once a QC is formed.
+    pub fn proposed_header(&self) -> Option<BlockHeader> { self.current_round.read().unwrap().proposed_block.clone() }
+    /// The current round number (view) of the live height — for shadow/diagnostics.
+    pub fn current_round(&self) -> u32 { self.current_round.read().unwrap().round }
 }
 
 pub fn merkle_root(hashes: &[Hash]) -> Hash {
