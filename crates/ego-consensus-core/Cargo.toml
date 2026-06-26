@@ -1,0 +1,17 @@
+[package]
+name = "ego-consensus-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Lightweight, dependency-minimal extraction of the BFT state machine
+# (bft.rs + fork_choice.rs) from `ego-consensus`. Deliberately pulls NONE of the
+# heavy deps (rocksdb / libp2p / ark ZK) so the consensus core builds fast and is
+# testable in isolation — this is the engine that replaces the inline p2p.rs BFT.
+
+[dependencies]
+ego-core = { path = "../ego-core" }
+serde = { workspace = true }
+bincode = "2.0.1"
+tracing = { workspace = true }
