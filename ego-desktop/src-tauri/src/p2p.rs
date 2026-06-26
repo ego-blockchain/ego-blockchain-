@@ -688,8 +688,21 @@ static SHADOW_HOST: std::sync::OnceLock<std::sync::Mutex<Option<crate::consensus
 fn shadow_host_lock() -> std::sync::MutexGuard<'static, Option<crate::consensus_host::ConsensusHost>> {
     SHADOW_HOST.get_or_init(|| std::sync::Mutex::new(None)).lock().unwrap()
 }
-fn shadow_v2_enabled() -> bool { std::env::var("EGO_CONSENSUS_V2_SHADOW").is_ok() }
+/// LIVE mode: the v2 engine drives the REAL chain — proposes real LedgerBlocks and
+/// PERSISTS them on QC, and the inline BFT is suppressed (kept only as the fallback when
+/// this is off). Implies the engine runs (so it also satisfies `consensus_v2_active`).
+fn consensus_v2_live_enabled() -> bool { std::env::var("EGO_CONSENSUS_V2_LIVE").is_ok() }
+/// The v2 engine runs (shadow OR live).
+fn consensus_v2_active() -> bool { consensus_v2_live_enabled() || std::env::var("EGO_CONSENSUS_V2_SHADOW").is_ok() }
 static SHADOW_LAST_PROPOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+// In LIVE mode, the LedgerBlock payload each v2 BlockHeader commits to, keyed by the
+// engine header hash — so when a QC forms for that header we persist the right block.
+static V2_PENDING_BLOCKS: std::sync::OnceLock<std::sync::Mutex<HashMap<ego_core::Hash, (crate::ledger::LedgerBlock, Vec<LedgerTx>)>>> =
+    std::sync::OnceLock::new();
+fn v2_pending_blocks() -> std::sync::MutexGuard<'static, HashMap<ego_core::Hash, (crate::ledger::LedgerBlock, Vec<LedgerTx>)>> {
+    V2_PENDING_BLOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap()
+}
 
 /// Build the stored shadow host once we have a quorum-sized validator set. Returns true
 /// if a host is available. The build (DPAPI seed load) runs off the async executor.
@@ -713,25 +726,33 @@ async fn shadow_publish(msg: &P2PMessage) {
     }
 }
 
-/// A v2 proposal arrived (or we just produced our own): vote on it, publish the vote,
-/// and count our own vote toward the QC.
-pub async fn shadow_on_proposal(header: ego_consensus_core::bft::BlockHeader) {
-    if !shadow_v2_enabled() { return; }
+/// A v2 proposal arrived (or we just produced our own): in LIVE mode remember the
+/// LedgerBlock payload so we can persist it on QC; then vote, publish, and self-count.
+pub async fn shadow_on_proposal(
+    header: ego_consensus_core::bft::BlockHeader,
+    block: crate::ledger::LedgerBlock,
+    txs: Vec<LedgerTx>,
+) {
+    if !consensus_v2_active() { return; }
+    if consensus_v2_live_enabled() {
+        v2_pending_blocks().insert(header.block_hash(), (block, txs));
+    }
     let vote = {
         let guard = shadow_host_lock();
         guard.as_ref().and_then(|h| h.on_proposal(&header))
     };
     if let Some(v) = vote {
-        eprintln!("[ConsensusV2/shadow] voted h={} round={}", header.height, v.round);
+        let tag = if consensus_v2_live_enabled() { "LIVE" } else { "shadow" };
+        eprintln!("[ConsensusV2/{}] voted h={} round={}", tag, header.height, v.round);
         shadow_publish(&P2PMessage::BftV2Vote { vote: v.clone() }).await;
         shadow_on_vote(v).await;
     }
 }
 
-/// A v2 vote arrived (or our own): tally it; on QC, log a would-finalize and advance the
-/// shadow engine's (non-persisted) height.
+/// A v2 vote arrived (or our own): tally it; on QC, advance the engine. In LIVE mode
+/// PERSIST the agreed LedgerBlock to the real chain; in shadow mode just log.
 pub async fn shadow_on_vote(vote: ego_consensus_core::bft::Vote) {
-    if !shadow_v2_enabled() { return; }
+    if !consensus_v2_active() { return; }
     let decided = {
         let guard = shadow_host_lock();
         guard.as_ref().and_then(|h| {
@@ -739,13 +760,29 @@ pub async fn shadow_on_vote(vote: ego_consensus_core::bft::Vote) {
                 h.proposed_header().map(|hdr| {
                     let ht = hdr.height;
                     let hash = hdr.block_hash();
+                    let vc = qc.voter_count() as u32;
                     let ok = h.finalize(hdr, qc);
-                    (ht, hash, ok)
+                    (ht, hash, vc, ok)
                 })
             })
         })
     };
-    if let Some((ht, hash, ok)) = decided {
+    let Some((ht, hash, vc, ok)) = decided else { return };
+    if consensus_v2_live_enabled() {
+        let payload = v2_pending_blocks().remove(&hash);
+        if let Some((block, txs)) = payload {
+            let bh = block.hash.clone();
+            let persisted = tokio::task::spawn_blocking(move || {
+                crate::chain_db::commit_staged_block(&block, &txs, vc)
+            }).await.unwrap_or(false);
+            eprintln!("[ConsensusV2/LIVE] finalized h={} ({} votes) — persisted={} block={:.12}",
+                ht, vc, persisted, bh);
+            touch_proposal_timestamp();
+        } else {
+            eprintln!("[ConsensusV2/LIVE] QC h={} but no LedgerBlock payload cached — cannot persist", ht);
+        }
+        v2_pending_blocks().retain(|_, (b, _)| b.height >= ht);
+    } else {
         eprintln!("[ConsensusV2/shadow] QC formed h={} — WOULD finalize {} (ok={}, NOT persisted)",
             ht, &hash.to_hex()[..12], ok);
     }
@@ -753,44 +790,83 @@ pub async fn shadow_on_vote(vote: ego_consensus_core::bft::Vote) {
 
 /// A v2 view-change arrived.
 pub async fn shadow_on_view_change(msg: ego_consensus_core::fork_choice::ViewChangeMsg) {
-    if !shadow_v2_enabled() { return; }
+    if !consensus_v2_active() { return; }
     let new_round = {
         let guard = shadow_host_lock();
         guard.as_ref().and_then(|h| h.on_view_change(msg))
     };
     if let Some(r) = new_round {
-        eprintln!("[ConsensusV2/shadow] view-change quorum → round {}", r);
+        let tag = if consensus_v2_live_enabled() { "LIVE" } else { "shadow" };
+        eprintln!("[ConsensusV2/{}] view-change quorum → round {}", tag, r);
     }
 }
 
 /// Periodic driver: when we're the v2 leader for the current (height, round) and haven't
-/// proposed it yet, build an (empty-roots) candidate, propose it, publish, and self-vote.
+/// proposed it yet, build a candidate (real block in LIVE, empty in shadow), propose,
+/// publish, and self-vote.
 pub async fn shadow_v2_tick() {
-    if !shadow_v2_enabled() || !ensure_shadow_host().await { return; }
-    let proposed = {
+    if !consensus_v2_active() || !ensure_shadow_host().await { return; }
+
+    // Decide if it's our turn and reserve this (height, round) under the lock.
+    let my_turn = {
         let guard = shadow_host_lock();
-        guard.as_ref().and_then(|h| {
-            if !h.is_proposer() { return None; }
+        guard.as_ref().map_or(false, |h| {
+            if !h.is_proposer() { return false; }
             let key = (h.current_height() << 16) | (h.current_round() as u64 & 0xFFFF);
-            if SHADOW_LAST_PROPOSED.swap(key, std::sync::atomic::Ordering::Relaxed) == key {
-                return None; // already proposed this (height, round)
-            }
-            let mut candidate = crate::ledger::LedgerBlock::default();
-            candidate.height = h.current_height();
-            h.propose(&candidate).map(|hdr| (hdr, candidate))
+            SHADOW_LAST_PROPOSED.swap(key, std::sync::atomic::Ordering::Relaxed) != key
         })
     };
-    if let Some((header, candidate)) = proposed {
-        eprintln!("[ConsensusV2/shadow] proposed h={} round={}", header.height, header_round_hint());
-        shadow_publish(&P2PMessage::BftV2Proposal {
-            header: header.clone(), block: candidate, transactions: vec![],
-        }).await;
-        shadow_on_proposal(header).await; // our own self-vote
-    }
+    if !my_turn { return; }
+
+    // Build the candidate (real txs in LIVE, empty otherwise) OFF the lock.
+    let (candidate, stamped) = if consensus_v2_live_enabled() {
+        match build_live_candidate().await { Some(v) => v, None => return }
+    } else {
+        (crate::ledger::LedgerBlock::default(), vec![])
+    };
+
+    // Propose through the engine (header commits to the candidate's roots).
+    let header = {
+        let guard = shadow_host_lock();
+        match guard.as_ref().and_then(|h| h.propose(&candidate)) {
+            Some(hdr) => hdr,
+            None => return,
+        }
+    };
+    let tag = if consensus_v2_live_enabled() { "LIVE" } else { "shadow" };
+    eprintln!("[ConsensusV2/{}] proposed h={} txs={}", tag, header.height, stamped.len());
+    shadow_publish(&P2PMessage::BftV2Proposal {
+        header: header.clone(), block: candidate.clone(), transactions: stamped.clone(),
+    }).await;
+    shadow_on_proposal(header, candidate, stamped).await; // our own self-vote
 }
 
-fn header_round_hint() -> u32 {
-    shadow_host_lock().as_ref().map(|h| h.current_round()).unwrap_or(0)
+/// Build a real LedgerBlock candidate from the mempool for the v2 LIVE proposer,
+/// mirroring the inline proposer's assembly so the persisted block is fully valid.
+async fn build_live_candidate() -> Option<(crate::ledger::LedgerBlock, Vec<LedgerTx>)> {
+    let miner = crate::ledger::Ledger::load().address;
+    if miner.is_empty() { return None; }
+    let seed = get_ed25519_seed()?;
+    let (_, prev_hash) = crate::chain_db::latest_block_info();
+
+    let mut all_txs = crate::mempool::get_mempool().drain_all();
+    {
+        let mut seen = std::collections::HashSet::new();
+        all_txs.retain(|tx| !tx.hash.is_empty() && seen.insert(tx.hash.clone()));
+    }
+
+    let poc_slot = crate::poc::current_slot();
+    let combined_ticket = {
+        use ed25519_dalek::{SigningKey, Signer};
+        let slot_seed = crate::poc::slot_seed(&prev_hash, poc_slot);
+        let sig = SigningKey::from_bytes(&seed).sign(&slot_seed);
+        let ticket = *blake3::hash(&sig.to_bytes()).as_bytes();
+        format!("{}:{}", hex::encode(ticket), hex::encode(sig.to_bytes()))
+    };
+
+    tokio::task::spawn_blocking(move || {
+        crate::chain_db::build_block_proposal(&all_txs, &miner, &combined_ticket, poc_slot)
+    }).await.ok()
 }
 
 pub fn register_validator_pubkey(address: &str, dilithium_pubkey_hex: &str) {
@@ -6305,8 +6381,8 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
         // Feed the parallel engine; it logs would-decisions and advances a
         // non-persisted chain. Gated inside the handlers by EGO_CONSENSUS_V2_SHADOW;
         // touches no live state.
-        P2PMessage::BftV2Proposal { header, .. } => {
-            shadow_on_proposal(header).await;
+        P2PMessage::BftV2Proposal { header, block, transactions } => {
+            shadow_on_proposal(header, block, transactions).await;
         }
         P2PMessage::BftV2Vote { vote } => {
             shadow_on_vote(vote).await;
@@ -9829,6 +9905,7 @@ async fn handle_view_change_msg(view: u64, voter: String) {
 
 pub async fn propose_block_as_leader() {
     if is_observer() { return; }
+    if consensus_v2_live_enabled() { return; } // v2 engine drives the chain when live
     // No solo: never propose (or self-lock) a block while below quorum. A lone node
     // would otherwise stage + self-vote a block that can never finalize, then refuse
     // the peer's canonical block when it joins (permanent 1/1 split). Wait for a
@@ -10210,6 +10287,7 @@ pub fn try_proactive_proposal() -> std::pin::Pin<Box<dyn std::future::Future<Out
 /// consecutive view changes with no block — prevents chain death.
 pub async fn propose_block_as_leader_forced() {
     if is_observer() { return; }
+    if consensus_v2_live_enabled() { return; } // v2 engine drives the chain when live
     // No solo: never propose while below quorum (see propose_block_as_leader).
     if known_validator_count() < crate::mempool::min_validators_for_finality() { return; }
 
