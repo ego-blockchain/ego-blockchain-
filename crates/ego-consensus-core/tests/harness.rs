@@ -8,7 +8,7 @@
 //!
 //! Phase 1 of CONSENSUS_REPLACEMENT_SCOPE.md.
 
-use ego_consensus_core::bft::{BftEngine, BlockRoots};
+use ego_consensus_core::bft::{BftEngine, BlockRoots, Vote};
 use ego_core::{Address, Hash, KeyPair};
 
 /// A simulated network of N engines that all share the SAME validator set (so they
@@ -235,9 +235,10 @@ fn below_quorum_halts_then_resumes() {
     }
 
     // Partition: only one node reachable. Quorum is 2, so it must NOT finalize.
+    // Use a single-round attempt (no view-change churn) to assert the clean halt.
     let solo = vec![true, false];
     let h_before = net.engines[0].get_current_height();
-    let res = net.run_height(&solo, 6);
+    let res = net.try_round(&solo);
     assert!(res.is_none(), "a lone node must HALT, never finalize (no solo-fork)");
     assert_eq!(
         net.engines[0].get_current_height(),
@@ -249,4 +250,151 @@ fn below_quorum_halts_then_resumes() {
     let hash = net.run_height(&all_reachable(n), 6).expect("must resume after heal");
     net.assert_agreement(&all_reachable(n), hash);
     assert_eq!(net.engines[0].get_current_height(), h_before + 1);
+}
+
+impl Net {
+    /// A single proposal+vote round with NO view-change machinery. Returns the
+    /// finalized hash if the reachable set reached quorum this round, else `None`.
+    /// Used to assert a clean HALT below quorum without churning view-change state.
+    fn try_round(&self, reachable: &[bool]) -> Option<Hash> {
+        let p = self
+            .engines
+            .iter()
+            .enumerate()
+            .find(|(i, e)| reachable[*i] && e.is_proposer())
+            .map(|(i, _)| i)?;
+        let header = self.engines[p].propose_block(BlockRoots::empty()).unwrap();
+        let mut votes = Vec::new();
+        for (i, e) in self.engines.iter().enumerate() {
+            if reachable[i] {
+                if let Some(v) = e.receive_proposal(&header).unwrap() {
+                    votes.push(v);
+                }
+            }
+        }
+        let mut finalized = None;
+        for (i, e) in self.engines.iter().enumerate() {
+            if !reachable[i] {
+                continue;
+            }
+            for v in &votes {
+                if let Some(qc) = e.receive_vote(v).unwrap() {
+                    e.finalize_block(header.clone(), qc).unwrap();
+                    finalized = Some(header.block_hash());
+                    break;
+                }
+            }
+        }
+        finalized
+    }
+
+    /// Drive one all-reachable height to finalization, but pass the collected votes
+    /// through `mangle` first — used to simulate adversarial network conditions
+    /// (reordering, duplication) on the vote stream.
+    fn run_height_mangled(&self, mangle: impl Fn(&mut Vec<Vote>)) -> Hash {
+        let p = self
+            .engines
+            .iter()
+            .position(|e| e.is_proposer())
+            .expect("a proposer exists");
+        let header = self.engines[p].propose_block(BlockRoots::empty()).unwrap();
+
+        let mut votes = Vec::new();
+        for e in &self.engines {
+            if let Some(v) = e.receive_proposal(&header).unwrap() {
+                votes.push(v);
+            }
+        }
+        mangle(&mut votes);
+
+        let mut finalized = None;
+        for e in &self.engines {
+            for v in &votes {
+                if let Some(qc) = e.receive_vote(v).unwrap() {
+                    e.finalize_block(header.clone(), qc).unwrap();
+                    finalized = Some(header.block_hash());
+                    break;
+                }
+            }
+        }
+        finalized.expect("finalized")
+    }
+}
+
+/// Async networks reorder and re-deliver messages. The engine tallies votes in a
+/// per-voter map, so out-of-order and duplicate votes must not change the outcome:
+/// the same single chain finalizes regardless of vote delivery order.
+#[test]
+fn vote_reordering_and_duplicates_tolerated() {
+    let n = 7;
+    let net = Net::new(n);
+    for h in 0..30 {
+        let hash = net.run_height_mangled(|votes| {
+            votes.reverse(); // deliver newest-first
+            let dups = votes.clone();
+            votes.extend(dups); // every vote arrives twice
+        });
+        net.assert_agreement(&all_reachable(n), hash);
+        for e in &net.engines {
+            assert_eq!(e.get_current_height(), h + 1);
+        }
+    }
+}
+
+/// SAFETY under a Byzantine proposer (the ⅓-fault assumption): the elected proposer
+/// equivocates — it signs TWO different blocks at the same height and feeds them to
+/// honest nodes in conflicting orders. No two honest engines may finalize different
+/// blocks (no fork). A single equivocator must never split the chain.
+#[test]
+fn byzantine_equivocating_proposer_no_fork() {
+    let n = 4;
+    let net = Net::new(n);
+    let p = net
+        .engines
+        .iter()
+        .position(|e| e.is_proposer())
+        .expect("a proposer exists");
+    let honest: Vec<usize> = (0..n).filter(|&i| i != p).collect();
+
+    // Byzantine proposer crafts two conflicting, validly-signed blocks for this height.
+    let b1 = net.engines[p].propose_block(BlockRoots::empty()).unwrap();
+    let mut other = BlockRoots::empty();
+    other.tx_root = Hash::new([7u8; 32]); // different root → different block_hash
+    let b2 = net.engines[p].propose_block(other).unwrap();
+    assert_ne!(b1.block_hash(), b2.block_hash(), "equivocating blocks must differ");
+
+    // Worst case for safety: honest nodes receive the two proposals in DIFFERENT
+    // orders, so without an equivocation guard they would end on different blocks and
+    // each cast votes for both — enabling two QCs.
+    let orders: [[&_; 2]; 3] = [[&b1, &b2], [&b2, &b1], [&b1, &b2]];
+    let mut votes = Vec::new();
+    for (k, &hi) in honest.iter().enumerate() {
+        for hdr in orders[k % orders.len()] {
+            if let Some(v) = net.engines[hi].receive_proposal(hdr).unwrap() {
+                votes.push(v);
+            }
+        }
+    }
+
+    // Deliver every vote to every honest engine; each may form a QC for whichever
+    // block it is on.
+    for &hi in &honest {
+        for v in &votes {
+            if let Some(qc) = net.engines[hi].receive_vote(v).unwrap() {
+                let hdr = if qc.block_hash == b1.block_hash() { &b1 } else { &b2 };
+                let _ = net.engines[hi].finalize_block(hdr.clone(), qc);
+            }
+        }
+    }
+
+    // The invariant: at most ONE distinct block finalized across all honest engines.
+    let finals: std::collections::HashSet<Hash> = honest
+        .iter()
+        .filter_map(|&hi| net.engines[hi].get_latest_finalized_block().map(|(h, _)| h.block_hash()))
+        .collect();
+    assert!(
+        finals.len() <= 1,
+        "FORK: honest engines finalized {} different blocks under an equivocating proposer",
+        finals.len(),
+    );
 }

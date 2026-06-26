@@ -257,11 +257,16 @@ pub struct RoundState {
     pub votes: HashMap<Address, Vote>,
     pub qc: Option<QuorumCertificate>,
     pub phase_started_at: Timestamp,
+    /// The block hash this node has already cast its single vote for in this
+    /// (height, round). Enforces one-vote-per-round so an equivocating proposer
+    /// cannot make this node back two conflicting blocks. Reset on every new round
+    /// (view change) and every finalized height.
+    pub voted_for: Option<Hash>,
 }
 
 impl RoundState {
     pub fn new(height: u64, epoch: u64, round: u32) -> Self {
-        Self { height, epoch, round, phase: RoundPhase::Propose, proposed_block: None, votes: HashMap::new(), qc: None, phase_started_at: Timestamp::now() }
+        Self { height, epoch, round, phase: RoundPhase::Propose, proposed_block: None, votes: HashMap::new(), qc: None, phase_started_at: Timestamp::now(), voted_for: None }
     }
     pub fn is_phase_timed_out(&self) -> bool {
         let elapsed = Timestamp::now().as_millis().saturating_sub(self.phase_started_at.as_millis());
@@ -364,7 +369,18 @@ impl BftEngine {
 
         let round = {
             let mut s = self.current_round.write().unwrap();
+            // Equivocation guard (atomic check-and-set): cast at most ONE vote per
+            // (height, round). If we already voted a DIFFERENT block this round, refuse
+            // — without this, an equivocating proposer splits honest nodes into two QCs
+            // and forks the chain (caught by the harness's Byzantine test).
+            if let Some(prev) = s.voted_for {
+                if prev != header.block_hash() {
+                    warn!("🛑 Refusing to equivocate at h={} round={}: already voted a different block", header.height, s.round);
+                    return Ok(None);
+                }
+            }
             s.proposed_block = Some(header.clone());
+            s.voted_for = Some(header.block_hash());
             s.advance_phase(RoundPhase::Vote);
             s.round
         };
@@ -385,9 +401,13 @@ impl BftEngine {
 
         let mut s = self.current_round.write().unwrap();
         s.votes.insert(vote.voter, vote.clone());
-        if s.votes.len() >= self.quorum_size() && s.qc.is_none() {
-            let votes: Vec<Vote> = s.votes.values().cloned().collect();
-            let qc = QuorumCertificate::new(vote.block_hash, vote.height, vote.epoch, vote.round, &votes);
+        // A QC is votes for ONE block. Count only votes matching the current proposed
+        // block — a stale vote left in the map for a PRIOR proposed block (e.g. this
+        // node's own vote cast before a re-proposal at the same round) must never be
+        // conflated into a quorum for a different block (caught by the harness).
+        let votes: Vec<Vote> = s.votes.values().filter(|v| v.block_hash == state_bh).cloned().collect();
+        if votes.len() >= self.quorum_size() && s.qc.is_none() {
+            let qc = QuorumCertificate::new(state_bh, vote.height, vote.epoch, vote.round, &votes);
             s.qc = Some(qc.clone());
             s.advance_phase(RoundPhase::Commit);
             info!("🏆 QC formed h={} {}/{} votes", vote.height, qc.voter_count(), self.validator_set.len());
