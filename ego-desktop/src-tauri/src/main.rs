@@ -8,6 +8,7 @@ mod ecvrf;
 mod chain_db;
 mod commands;
 mod config;
+mod consensus_host;
 mod email;
 mod error;
 mod l2;
@@ -692,7 +693,10 @@ fn main() {
                 });
             }
 
-            crate::poc::init_session_start();
+            tauri::async_runtime::spawn(async {
+                tokio::task::spawn_blocking(crate::poc::init_session_start)
+                    .await.ok();
+            });
 
             let handle_p2p = app.handle();
             tauri::async_runtime::spawn(async move {

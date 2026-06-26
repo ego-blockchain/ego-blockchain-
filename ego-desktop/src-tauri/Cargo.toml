@@ -34,7 +34,8 @@ base64 = "0.21"
 bech32 = "0.9"
 
 # Ego Blockchain dependencies
-ego-core        = { path = "../../crates/ego-core" }
+ego-core            = { path = "../../crates/ego-core" }
+ego-consensus-core  = { path = "../../crates/ego-consensus-core" }
 ego-vm          = { path = "../../crates/ego-vm" }
 ego-rollup      = { path = "../../crates/ego-rollup" }
 urego-compiler  = { path = "../../crates/urego-compiler" }
