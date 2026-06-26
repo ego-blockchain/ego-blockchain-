@@ -1,4 +1,4 @@
-use crate::bft::{BlockHeader, QuorumCertificate};
+use crate::bft::{BlockHeader, QuorumCertificate, SigScheme};
 use crate::error::{PoCError, PoCResult};
 use ego_core::{Address, Hash, KeyPair, Signature, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -26,8 +26,9 @@ impl ViewChangeMsg {
         epoch: u64,
         high_qc: Option<QuorumCertificate>,
         kp: &KeyPair,
+        scheme: SigScheme,
     ) -> PoCResult<Self> {
-        let sender = Address::from_public_key(&kp.ed25519_public_key());
+        let sender = scheme.address(kp);
         let msg = Self::signing_bytes(new_round, height, epoch);
         Ok(Self {
             new_round,
@@ -35,8 +36,8 @@ impl ViewChangeMsg {
             epoch,
             high_qc,
             sender,
-            sender_pk: kp.ed25519_public_key(),
-            signature: kp.sign_ed25519(&msg),
+            sender_pk: scheme.public_key(kp),
+            signature: scheme.sign(kp, &msg),
             timestamp: Timestamp::now(),
         })
     }
@@ -292,7 +293,7 @@ mod tests {
             Hash::new([0u8; 32]),
             vec![],
         );
-        h.sign(&kp).unwrap();
+        h.sign(&kp, SigScheme::Ed25519).unwrap();
         h
     }
 
@@ -301,7 +302,7 @@ mod tests {
         let votes: Vec<Vote> = (0..n_votes)
             .map(|_| {
                 let kp = KeyPair::generate();
-                Vote::new(block_hash, height, epoch, round, &kp).unwrap()
+                Vote::new(block_hash, height, epoch, round, &kp, SigScheme::Ed25519).unwrap()
             })
             .collect();
         QuorumCertificate::new(block_hash, height, epoch, round, &votes)
@@ -350,7 +351,7 @@ mod tests {
 
         let mut result = None;
         for kp in &kps {
-            let msg = ViewChangeMsg::new(1, 10, 2, None, kp).unwrap();
+            let msg = ViewChangeMsg::new(1, 10, 2, None, kp, SigScheme::Ed25519).unwrap();
             result = store.add_view_change(msg, quorum).unwrap();
             if result.is_some() { break; }
         }
@@ -361,8 +362,8 @@ mod tests {
     fn test_view_change_dedup() {
         let mut store = ForkChoiceStore::new();
         let kp = KeyPair::generate();
-        let msg1 = ViewChangeMsg::new(1, 10, 2, None, &kp).unwrap();
-        let msg2 = ViewChangeMsg::new(1, 10, 2, None, &kp).unwrap();
+        let msg1 = ViewChangeMsg::new(1, 10, 2, None, &kp, SigScheme::Ed25519).unwrap();
+        let msg2 = ViewChangeMsg::new(1, 10, 2, None, &kp, SigScheme::Ed25519).unwrap();
         let _ = store.add_view_change(msg1, 3).unwrap();
         let r = store.add_view_change(msg2, 3).unwrap();
         assert!(r.is_none(), "duplicate from same sender must be ignored");
