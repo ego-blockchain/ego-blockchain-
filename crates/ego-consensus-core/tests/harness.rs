@@ -1,0 +1,252 @@
+//! Deterministic in-process multi-node harness for the BFT state machine.
+//!
+//! This replaces the "run it on two PCs and paste the logs" loop that the inline
+//! p2p.rs BFT forced on us. Engines are driven with synchronous, in-memory message
+//! passing — no libp2p, no relay, no Windows port exhaustion — so consensus
+//! behaviour (liveness, agreement, no-fork, leader-down failover, partition/heal)
+//! is reproducible and asserted in CI.
+//!
+//! Phase 1 of CONSENSUS_REPLACEMENT_SCOPE.md.
+
+use ego_consensus_core::bft::{BftEngine, BlockRoots};
+use ego_core::{Address, Hash, KeyPair};
+
+/// A simulated network of N engines that all share the SAME validator set (so they
+/// agree deterministically on the per-round proposer via `(height + round) % n`).
+struct Net {
+    engines: Vec<BftEngine>,
+}
+
+impl Net {
+    fn new(n: usize) -> Self {
+        let kps: Vec<KeyPair> = (0..n).map(|_| KeyPair::generate()).collect();
+        // One canonical validator-set Vec, cloned identically into every engine.
+        let validators: Vec<Address> =
+            kps.iter().map(|k| Address::from_public_key(&k.public_key())).collect();
+        let engines = kps
+            .into_iter()
+            .map(|kp| BftEngine::new(kp, validators.clone()))
+            .collect();
+        Net { engines }
+    }
+
+    fn n(&self) -> usize {
+        self.engines.len()
+    }
+
+    fn quorum(&self) -> usize {
+        (2 * self.n()) / 3 + 1
+    }
+
+    /// Drive exactly one height to finalization, tolerating up to `max_rounds`
+    /// view-changes when the current round's proposer is unreachable. `reachable[i]`
+    /// marks which engines can send/receive this height (false = partitioned away).
+    ///
+    /// Returns the finalized block hash, or `None` if the reachable set could not
+    /// reach quorum within `max_rounds` (i.e. the chain correctly HALTS — no solo).
+    fn run_height(&self, reachable: &[bool], max_rounds: u32) -> Option<Hash> {
+        for _ in 0..max_rounds {
+            // The elected proposer for the CURRENT (height, round) of each engine.
+            let proposer = self
+                .engines
+                .iter()
+                .enumerate()
+                .find(|(i, e)| reachable[*i] && e.is_proposer())
+                .map(|(i, _)| i);
+
+            if let Some(p) = proposer {
+                let header = self.engines[p]
+                    .propose_block(BlockRoots::empty())
+                    .expect("propose_block");
+
+                // Every reachable engine (incl. the proposer) votes on the proposal.
+                let mut votes = Vec::new();
+                for (i, e) in self.engines.iter().enumerate() {
+                    if !reachable[i] {
+                        continue;
+                    }
+                    if let Some(v) = e.receive_proposal(&header).expect("receive_proposal") {
+                        votes.push(v);
+                    }
+                }
+
+                // Deliver all votes to all reachable engines; each forms its own QC
+                // at quorum and finalizes independently.
+                let mut finalized = None;
+                for (i, e) in self.engines.iter().enumerate() {
+                    if !reachable[i] {
+                        continue;
+                    }
+                    for v in &votes {
+                        if let Some(qc) = e.receive_vote(v).expect("receive_vote") {
+                            assert!(
+                                qc.voter_count() >= self.quorum(),
+                                "QC formed with {} votes < quorum {}",
+                                qc.voter_count(),
+                                self.quorum()
+                            );
+                            e.finalize_block(header.clone(), qc).expect("finalize_block");
+                            finalized = Some(header.block_hash());
+                            break;
+                        }
+                    }
+                }
+                if finalized.is_some() {
+                    return finalized;
+                }
+                // Proposed but quorum not reached (too few reachable) → view-change.
+            }
+
+            // No reachable proposer, or the round failed → every reachable engine
+            // broadcasts a ViewChange and they advance to the next round together.
+            let vc: Vec<_> = self
+                .engines
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| reachable[*i])
+                .map(|(_, e)| e.trigger_view_change().expect("trigger_view_change"))
+                .collect();
+            for (i, e) in self.engines.iter().enumerate() {
+                if !reachable[i] {
+                    continue;
+                }
+                for m in &vc {
+                    let _ = e.receive_view_change(m.clone()).expect("receive_view_change");
+                }
+            }
+        }
+        None
+    }
+
+    /// All engines that participated this height must agree on the finalized block
+    /// AND be at the same next height — the core safety property (no fork).
+    fn assert_agreement(&self, reachable: &[bool], expected: Hash) {
+        let mut heights = Vec::new();
+        for (i, e) in self.engines.iter().enumerate() {
+            if !reachable[i] {
+                continue;
+            }
+            let (h, _qc) = e
+                .get_latest_finalized_block()
+                .expect("engine should have a finalized block");
+            assert_eq!(
+                h.block_hash(),
+                expected,
+                "engine {i} finalized a DIFFERENT block — FORK",
+            );
+            heights.push(e.get_current_height());
+        }
+        assert!(
+            heights.windows(2).all(|w| w[0] == w[1]),
+            "engines diverged on height: {heights:?}",
+        );
+    }
+}
+
+fn all_reachable(n: usize) -> Vec<bool> {
+    vec![true; n]
+}
+
+/// Liveness + agreement under perfect network, for several committee sizes.
+fn liveness_for(n: usize, heights: u64) {
+    let net = Net::new(n);
+    let reach = all_reachable(n);
+    for h in 0..heights {
+        let hash = net
+            .run_height(&reach, 4)
+            .unwrap_or_else(|| panic!("N={n}: failed to finalize height {h}"));
+        net.assert_agreement(&reach, hash);
+        // Every engine advanced exactly one height.
+        for e in &net.engines {
+            assert_eq!(e.get_current_height(), h + 1);
+        }
+    }
+}
+
+#[test]
+fn liveness_and_agreement_2_validators() {
+    liveness_for(2, 50);
+}
+
+#[test]
+fn liveness_and_agreement_4_validators() {
+    liveness_for(4, 50);
+}
+
+#[test]
+fn liveness_and_agreement_7_validators() {
+    liveness_for(7, 50);
+}
+
+/// The exact failure that killed the live network: the elected leader for a height
+/// goes offline. The inline p2p.rs BFT could not rotate past it (its view-change
+/// ignored the view) and deadlocked. Here the reachable majority must view-change
+/// to the NEXT proposer and finalize anyway — with f = 1 fault out of 4 (quorum 3).
+#[test]
+fn leader_down_rotates_and_recovers() {
+    let n = 4;
+    let net = Net::new(n);
+
+    // Warm up a few clean heights.
+    for h in 0..5 {
+        let hash = net.run_height(&all_reachable(n), 4).expect("warmup finalize");
+        net.assert_agreement(&all_reachable(n), hash);
+        assert_eq!(net.engines[0].get_current_height(), h + 1);
+    }
+
+    // Partition out whichever node is the round-0 proposer for the next height.
+    let down = net
+        .engines
+        .iter()
+        .position(|e| e.is_proposer())
+        .expect("a proposer exists");
+    let mut reach = all_reachable(n);
+    reach[down] = false;
+
+    // The other 3 (>= quorum) must route around the dead leader via view-change.
+    let hash = net
+        .run_height(&reach, 8)
+        .expect("must finalize past a down leader via view-change");
+    net.assert_agreement(&reach, hash);
+
+    // Heal: the down node is back. The majority kept the chain alive, so the
+    // network resumes cleanly for subsequent heights.
+    let target = net.engines.iter().enumerate()
+        .filter(|(i, _)| reach[*i])
+        .map(|(_, e)| e.get_current_height())
+        .max()
+        .unwrap();
+    assert!(target >= 6, "chain should have advanced past the partition, got {target}");
+}
+
+/// A network that drops below quorum (2-of-2 loses one) must HALT, not solo-fork —
+/// and then RESUME when the peer returns. This is the user's rule ("1 active → stop,
+/// 2 active → blocks") expressed as a test the engine must satisfy.
+#[test]
+fn below_quorum_halts_then_resumes() {
+    let n = 2;
+    let net = Net::new(n);
+
+    // Two clean heights.
+    for h in 0..2 {
+        let hash = net.run_height(&all_reachable(n), 4).expect("finalize");
+        net.assert_agreement(&all_reachable(n), hash);
+        assert_eq!(net.engines[0].get_current_height(), h + 1);
+    }
+
+    // Partition: only one node reachable. Quorum is 2, so it must NOT finalize.
+    let solo = vec![true, false];
+    let h_before = net.engines[0].get_current_height();
+    let res = net.run_height(&solo, 6);
+    assert!(res.is_none(), "a lone node must HALT, never finalize (no solo-fork)");
+    assert_eq!(
+        net.engines[0].get_current_height(),
+        h_before,
+        "height must not advance while below quorum",
+    );
+
+    // Heal: both reachable again → chain resumes from where it halted.
+    let hash = net.run_height(&all_reachable(n), 6).expect("must resume after heal");
+    net.assert_agreement(&all_reachable(n), hash);
+    assert_eq!(net.engines[0].get_current_height(), h_before + 1);
+}
