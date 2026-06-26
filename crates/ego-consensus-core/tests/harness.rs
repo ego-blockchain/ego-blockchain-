@@ -22,7 +22,7 @@ impl Net {
         let kps: Vec<KeyPair> = (0..n).map(|_| KeyPair::generate()).collect();
         // One canonical validator-set Vec, cloned identically into every engine.
         let validators: Vec<Address> =
-            kps.iter().map(|k| Address::from_public_key(&k.public_key())).collect();
+            kps.iter().map(|k| Address::from_public_key(&k.ed25519_public_key())).collect();
         let engines = kps
             .into_iter()
             .map(|kp| BftEngine::new(kp, validators.clone()))

@@ -27,7 +27,7 @@ impl ViewChangeMsg {
         high_qc: Option<QuorumCertificate>,
         kp: &KeyPair,
     ) -> PoCResult<Self> {
-        let sender = Address::from_public_key(&kp.public_key());
+        let sender = Address::from_public_key(&kp.ed25519_public_key());
         let msg = Self::signing_bytes(new_round, height, epoch);
         Ok(Self {
             new_round,
@@ -35,8 +35,8 @@ impl ViewChangeMsg {
             epoch,
             high_qc,
             sender,
-            sender_pk: kp.public_key(),
-            signature: kp.sign(&msg),
+            sender_pk: kp.ed25519_public_key(),
+            signature: kp.sign_ed25519(&msg),
             timestamp: Timestamp::now(),
         })
     }
@@ -285,7 +285,7 @@ mod tests {
 
     fn make_header(height: u64, epoch: u64, round: u32, prev: Hash) -> BlockHeader {
         let kp = KeyPair::generate();
-        let addr = ego_core::Address::from_public_key(&kp.public_key());
+        let addr = ego_core::Address::from_public_key(&kp.ed25519_public_key());
         let mut h = BlockHeader::new(
             height, epoch, round as u64, prev, addr,
             BlockRoots::empty(),
