@@ -56,6 +56,28 @@ pub fn roots_from_ledger_block(b: &LedgerBlock) -> BlockRoots {
     }
 }
 
+/// Build the engine `validator_set` (and a reverse `Address -> bech32` map for mapping
+/// finalized headers back to `LedgerBlock.miner`) from each validator's **raw Dilithium2
+/// key_data**. `validators` must list every registered validator INCLUDING self, as
+/// `(bech32_address, raw_dilithium_pk_bytes)`.
+///
+/// The result is sorted by `Address` and de-duplicated, so every node that sees the
+/// same registered set produces the byte-identical ordered set — the prerequisite for
+/// all engines agreeing on the per-round proposer `(height + round) % n`.
+pub fn build_validator_set(
+    validators: &[(String, Vec<u8>)],
+) -> (Vec<Address>, std::collections::HashMap<Address, String>) {
+    let mut pairs: Vec<(Address, String)> = validators
+        .iter()
+        .map(|(bech32, dil)| (address_from_dilithium(dil.clone()), bech32.clone()))
+        .collect();
+    pairs.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    pairs.dedup_by(|a, b| a.0 == b.0);
+    let set: Vec<Address> = pairs.iter().map(|(a, _)| a.clone()).collect();
+    let map: std::collections::HashMap<Address, String> = pairs.into_iter().collect();
+    (set, map)
+}
+
 /// Owns the local node's `BftEngine` plus the validator set it agrees on. The p2p
 /// layer routes gossip through these methods instead of the inline vote/proposal/
 /// view-change statics.
@@ -167,6 +189,38 @@ mod tests {
         // be used here — the wire-in registry must likewise store raw key_data).
         let dil_raw = kp.dilithium_public_key().as_bytes().to_vec();
         assert_eq!(engine_addr, address_from_dilithium(dil_raw));
+    }
+
+    #[test]
+    fn validator_set_is_deterministic_and_dedup() {
+        let kps: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
+        let raw: Vec<(String, Vec<u8>)> = kps
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (format!("egot1node{i}"), k.dilithium_public_key().as_bytes().to_vec()))
+            .collect();
+
+        // Same inputs in DIFFERENT orders must yield the byte-identical ordered set.
+        let (set_a, map_a) = build_validator_set(&raw);
+        let mut shuffled = raw.clone();
+        shuffled.reverse();
+        let (set_b, _) = build_validator_set(&shuffled);
+        assert_eq!(set_a, set_b, "validator_set order must not depend on input order");
+        assert_eq!(set_a.len(), 3);
+
+        // The set members are exactly the engine addresses of those keypairs, and the
+        // reverse map recovers the bech32.
+        for (i, k) in kps.iter().enumerate() {
+            let addr = consensus_address(&k.public_key());
+            assert!(set_a.contains(&addr));
+            assert_eq!(map_a.get(&addr).map(|s| s.as_str()), Some(format!("egot1node{i}").as_str()));
+        }
+
+        // A duplicate validator entry collapses to one.
+        let mut dup = raw.clone();
+        dup.push(raw[0].clone());
+        let (set_dup, _) = build_validator_set(&dup);
+        assert_eq!(set_dup.len(), 3, "duplicates must be removed");
     }
 
     /// Two hosts sharing one validator set must agree on the proposer, finalize the
