@@ -3007,9 +3007,18 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
     let carries_qc = block.vote_count > 0
         && !block.agg_bls_sig.is_empty()
         && !block.bls_pubkeys.is_empty();
+    // v2 finalizes with a compact Dilithium QC, NOT the inline BLS aggregate, so a
+    // v2-finalized block legitimately carries no agg_bls_sig. Under v2 we accept a synced
+    // block on the strength of its vote_count meeting quorum (so a node that fell behind —
+    // e.g. after sleep — can catch up via sync). INTERIM: this trusts the synced count;
+    // carrying + verifying the Dilithium QC on the block is the follow-on for fully
+    // trustless sync. The block still must pass hash/merkle + prev_hash linkage above.
+    let v2_live = crate::p2p::consensus_v2_live_enabled();
 
     if qc_required {
-        if !carries_qc || (block.vote_count as usize) < crate::mempool::MIN_VALIDATORS_FOR_FINALITY {
+        let quorum_ok = (block.vote_count as usize) >= crate::mempool::MIN_VALIDATORS_FOR_FINALITY;
+        let ok = if v2_live { quorum_ok } else { carries_qc && quorum_ok };
+        if !ok {
             return Err(format!(
                 "block #{} requires a quorum certificate (parent finalized by {} validators) but carries {} votes",
                 block.height, parent_vote_count, block.vote_count
@@ -3017,7 +3026,9 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
         }
     }
 
-    if block.height > 1 && (carries_qc || qc_required) {
+    // BLS QC verification — inline path only. v2 blocks carry no BLS aggregate (gated
+    // above on vote_count), so they skip this and are not run through the BLS verifier.
+    if block.height > 1 && carries_qc {
         let block_hash_bytes = hex::decode(&block.hash).unwrap_or_default();
         let sig_bytes = hex::decode(&block.agg_bls_sig).unwrap_or_default();
         let pubkeys: Vec<Vec<u8>> = block.bls_pubkeys.iter().filter_map(|pk| hex::decode(pk).ok()).collect();
