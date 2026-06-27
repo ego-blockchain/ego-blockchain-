@@ -623,15 +623,11 @@ fn validator_pubkeys() -> std::sync::MutexGuard<'static, HashMap<String, String>
         .unwrap()
 }
 
-/// Cutover step 1 (shadow/inert): construct a v2 `ConsensusHost` (the
-/// `ego-consensus-core` BftEngine) from the CURRENT desktop state — the local keypair
-/// plus the on-chain registered validator set, each mapped to its engine `Address` via
-/// its Dilithium public key (the default post-quantum scheme). Returns `None` until we
-/// have our own identity AND at least a 2-validator set with known Dilithium keys.
-///
-/// This is NOT used by live consensus — it proves the validator-set construction works
-/// end-to-end with real desktop state. A later step stores the host and routes the
-/// `BftV2*` gossip through it in shadow mode for parity logging before cutover.
+/// Construct the v2 `ConsensusHost` (the `ego-consensus-core` BftEngine) that DRIVES the
+/// live chain by default. Built from the local keypair plus the LIVE validator set (self +
+/// recently-seen peers), each mapped to its engine `Address` via its Dilithium public key
+/// (the default post-quantum scheme). Returns `None` until we have our own identity AND a
+/// quorum-sized set with known Dilithium keys — below that the chain halts (no solo fork).
 pub fn build_shadow_consensus_host() -> Option<crate::consensus_host::ConsensusHost> {
     use crate::consensus_host::{address_from_dilithium, build_validator_set, ConsensusHost};
 
@@ -641,13 +637,16 @@ pub fn build_shadow_consensus_host() -> Option<crate::consensus_host::ConsensusH
     let kp = ego_core::KeyPair::from_bytes(&seed).ok()?;
     let my_dil_raw = kp.dilithium_public_key().key_data;
 
-    // (bech32, Dilithium-derived engine Address) for every registered validator. The
-    // engine derives the SAME address from kp.dilithium_public_key(), so self matches.
-    let registered = crate::chain_db::registered_validators_sorted();
+    // v2 builds its committee from the LIVE validator set (self + recently-seen peers
+    // with exchanged Dilithium keys), so it bootstraps straight from PeerAnnounce WITHOUT
+    // needing on-chain registration first, and never drops an active peer (the cause of
+    // the inline `vs(len=1)` stalls). For an isolated pair this is {self, peer} identically
+    // on both nodes; the engine derives the SAME Address from kp.dilithium_public_key().
+    let source = live_validators();
     let mut pairs: Vec<(String, ego_core::Address)> = Vec::new();
     {
         let pubkeys = validator_pubkeys();
-        for addr in &registered {
+        for addr in &source {
             let dil_raw = if *addr == my_addr {
                 my_dil_raw.clone()
             } else {
@@ -676,11 +675,11 @@ pub fn build_shadow_consensus_host() -> Option<crate::consensus_host::ConsensusH
     Some(host)
 }
 
-// ── Consensus-v2 SHADOW driver (cutover step 2) ──────────────────────────────────
-// Runs the BftEngine in PARALLEL with the inline BFT over a dedicated gossip topic,
-// logging what it WOULD decide. It finalizes its own (non-persisted) chain to advance
-// heights so leader rotation/lockstep can be observed, but writes NOTHING to disk and
-// never touches the inline consensus. Entirely gated by EGO_CONSENSUS_V2_SHADOW.
+// ── Consensus-v2 driver (DEFAULT live engine) ────────────────────────────────────
+// Runs the ego-consensus-core BftEngine over a dedicated gossip topic. By default it is
+// LIVE: it proposes real LedgerBlocks, persists them on QC, and the inline BFT is gated
+// off. With EGO_CONSENSUS_LEGACY=1 the inline BFT drives instead; with LEGACY+SHADOW the
+// engine runs alongside inline writing nothing to disk (parity logging only).
 const V2_TOPIC: &str = "ego-bftv2-v1";
 
 static SHADOW_HOST: std::sync::OnceLock<std::sync::Mutex<Option<crate::consensus_host::ConsensusHost>>> =
@@ -688,11 +687,12 @@ static SHADOW_HOST: std::sync::OnceLock<std::sync::Mutex<Option<crate::consensus
 fn shadow_host_lock() -> std::sync::MutexGuard<'static, Option<crate::consensus_host::ConsensusHost>> {
     SHADOW_HOST.get_or_init(|| std::sync::Mutex::new(None)).lock().unwrap()
 }
-/// LIVE mode: the v2 engine drives the REAL chain — proposes real LedgerBlocks and
-/// PERSISTS them on QC, and the inline BFT is suppressed (kept only as the fallback when
-/// this is off). Implies the engine runs (so it also satisfies `consensus_v2_active`).
-fn consensus_v2_live_enabled() -> bool { std::env::var("EGO_CONSENSUS_V2_LIVE").is_ok() }
-/// The v2 engine runs (shadow OR live).
+/// v2 is the DEFAULT consensus — it drives the real chain and the inline BFT is gated
+/// off. No configuration required; ordinary users get this automatically. The ONLY knob
+/// is an emergency escape hatch: set `EGO_CONSENSUS_LEGACY=1` to fall back to the inline
+/// BFT (e.g. if a v2 issue is found in the field, before a fix ships).
+fn consensus_v2_live_enabled() -> bool { std::env::var("EGO_CONSENSUS_LEGACY").is_err() }
+/// The v2 engine runs (live by default, or shadow-alongside-inline when LEGACY+SHADOW).
 fn consensus_v2_active() -> bool { consensus_v2_live_enabled() || std::env::var("EGO_CONSENSUS_V2_SHADOW").is_ok() }
 static SHADOW_LAST_PROPOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
@@ -735,6 +735,26 @@ pub async fn shadow_on_proposal(
 ) {
     if !consensus_v2_active() { return; }
     if consensus_v2_live_enabled() {
+        // Never trust a proposer: validate the block before voting/persisting.
+        let tip = crate::chain_db::latest_block_info().1;
+        if block.prev_hash != tip {
+            eprintln!("[ConsensusV2/LIVE] reject #{} — prev_hash {:.12} != tip {:.12}",
+                header.height, block.prev_hash, tip);
+            return;
+        }
+        if header.tx_root != crate::consensus_host::hash_from_hex(&block.tx_merkle_root)
+            || header.state_root != crate::consensus_host::hash_from_hex(&block.state_root)
+        {
+            eprintln!("[ConsensusV2/LIVE] reject #{} — header roots do not commit to the block", header.height);
+            return;
+        }
+        let (b, t) = (block.clone(), txs.clone());
+        let valid = tokio::task::spawn_blocking(move || crate::chain_db::validate_proposal_block(&b, &t))
+            .await.unwrap_or_else(|_| Err("validation task panicked".into()));
+        if let Err(e) = valid {
+            eprintln!("[ConsensusV2/LIVE] reject #{} — invalid block: {}", header.height, e);
+            return;
+        }
         v2_pending_blocks().insert(header.block_hash(), (block, txs));
     }
     let vote = {
@@ -777,7 +797,16 @@ pub async fn shadow_on_vote(vote: ego_consensus_core::bft::Vote) {
             }).await.unwrap_or(false);
             eprintln!("[ConsensusV2/LIVE] finalized h={} ({} votes) — persisted={} block={:.12}",
                 ht, vc, persisted, bh);
-            touch_proposal_timestamp();
+            if persisted {
+                touch_proposal_timestamp();
+            } else {
+                // The engine advanced past this height on the QC, but the chain did NOT
+                // record the block. Re-seed the engine to the real tip so it retries this
+                // height instead of racing ahead of a chain that's missing the block.
+                let real_next = crate::chain_db::latest_block_info().0 + 1;
+                if let Some(h) = shadow_host_lock().as_ref() { h.seed_height(real_next); }
+                eprintln!("[ConsensusV2/LIVE] persist FAILED h={} — re-seeded engine to {}", ht, real_next);
+            }
         } else {
             eprintln!("[ConsensusV2/LIVE] QC h={} but no LedgerBlock payload cached — cannot persist", ht);
         }
@@ -806,6 +835,17 @@ pub async fn shadow_on_view_change(msg: ego_consensus_core::fork_choice::ViewCha
 /// publish, and self-vote.
 pub async fn shadow_v2_tick() {
     if !consensus_v2_active() || !ensure_shadow_host().await { return; }
+
+    // If the chain advanced via block-sync while the engine lagged (e.g. we just restarted
+    // and caught up from peers), pull the engine forward to the real tip so it proposes and
+    // votes at the correct height instead of re-running an already-finalized one.
+    if consensus_v2_live_enabled() {
+        let real_next = crate::chain_db::latest_block_info().0 + 1;
+        let guard = shadow_host_lock();
+        if let Some(h) = guard.as_ref() {
+            if h.current_height() < real_next { h.seed_height(real_next); }
+        }
+    }
 
     // Decide if it's our turn and reserve this (height, round) under the lock.
     let my_turn = {
@@ -5593,8 +5633,8 @@ async fn handle_event(
             }
             let topic = message.topic.to_string();
             if topic == V2_TOPIC {
-                // Consensus-v2 shadow messages → handle_incoming (BftV2* arms feed the
-                // parallel engine). No-op unless EGO_CONSENSUS_V2_SHADOW is set.
+                // Consensus-v2 messages → handle_incoming. The BftV2* arms feed the live
+                // engine that drives the chain by default (inline only with LEGACY=1).
                 if let Ok(msg) = serde_json::from_slice::<P2PMessage>(&message.data) {
                     let app2 = app.cloned();
                     tokio::spawn(async move { handle_incoming(msg, app2.as_ref()).await; });
@@ -6377,10 +6417,10 @@ async fn handle_event(
 
 pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<tauri::Wry>>) {
     match msg {
-        // ── Consensus-v2 (BftEngine) SHADOW path (cutover step 2) ────────────
-        // Feed the parallel engine; it logs would-decisions and advances a
-        // non-persisted chain. Gated inside the handlers by EGO_CONSENSUS_V2_SHADOW;
-        // touches no live state.
+        // ── Consensus-v2 (BftEngine) — the live consensus path ───────────────
+        // Feed the engine that drives the real chain: validate + vote on proposals,
+        // tally votes, persist the agreed LedgerBlock on QC. Inline runs instead only
+        // under EGO_CONSENSUS_LEGACY=1.
         P2PMessage::BftV2Proposal { header, block, transactions } => {
             shadow_on_proposal(header, block, transactions).await;
         }
@@ -10589,9 +10629,9 @@ pub async fn run_view_change_monitor() {
             eprintln!("[ViewMon] alive — tick #{} validators={}", _tick_count, known_validators().len());
         }
 
-        // Cutover step 2 (shadow): drive the parallel v2 engine — propose when we're its
-        // leader, then publish + self-vote. Receive-side handlers tally votes/QCs. Logs
-        // would-decisions; persists nothing; gated by EGO_CONSENSUS_V2_SHADOW.
+        // Drive the v2 engine that runs consensus by default: propose a real block when
+        // we're its leader, publish + self-vote; receive-side handlers tally votes/QCs and
+        // persist on quorum. (Inline BFT drives instead only under EGO_CONSENSUS_LEGACY=1.)
         shadow_v2_tick().await;
 
         if local_validator_is_unset() {
