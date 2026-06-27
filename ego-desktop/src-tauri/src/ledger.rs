@@ -591,10 +591,22 @@ pub struct StoredFile {
     #[serde(default)]
     pub replica_peers: Vec<String>,
 
-    /// Total fee paid by the uploader for this file (uEGOC).
-    /// Split equally among storage providers (master + slaves) as they confirm.
+    /// Total fee prepaid by the uploader for this file (uEGOC), held in escrow and
+    /// streamed per period to the CURRENT proven holders over the deal window
+    /// [stored_at, expiry].
     #[serde(default)]
     pub storage_fee_uegoc: u64,
+
+    /// Cumulative escrow already released to providers (uEGOC). Remaining escrow =
+    /// storage_fee_uegoc - storage_fee_paid_uegoc. Tracked by the master.
+    #[serde(default)]
+    pub storage_fee_paid_uegoc: u64,
+
+    /// Unix ts of the last per-period escrow release (master duty). 0 = never (falls
+    /// back to stored_at). Reset to `now` on promotion so a freshly promoted master
+    /// only pays for the time it actually serves — payment follows the data.
+    #[serde(default)]
+    pub last_storage_payout_ts: i64,
 
     /// "master" = this node is responsible for re-replicating when a slave drops.
     /// "slave"  = this node holds a replica; watches master liveness.
