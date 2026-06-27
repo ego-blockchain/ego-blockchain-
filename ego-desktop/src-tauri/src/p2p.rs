@@ -695,6 +695,7 @@ fn consensus_v2_live_enabled() -> bool { std::env::var("EGO_CONSENSUS_LEGACY").i
 /// The v2 engine runs (live by default, or shadow-alongside-inline when LEGACY+SHADOW).
 fn consensus_v2_active() -> bool { consensus_v2_live_enabled() || std::env::var("EGO_CONSENSUS_V2_SHADOW").is_ok() }
 static SHADOW_LAST_PROPOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static V2_HEARTBEAT_TS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 // In LIVE mode, the LedgerBlock payload each v2 BlockHeader commits to, keyed by the
 // engine header hash — so when a QC forms for that header we persist the right block.
@@ -712,8 +713,9 @@ async fn ensure_shadow_host() -> bool {
     let mut guard = shadow_host_lock();
     if guard.is_none() {
         if let Some(h) = built {
-            eprintln!("[ConsensusV2/shadow] host built — validators={} quorum={} scheme=Dilithium",
-                h.validator_set().len(), h.quorum_size());
+            let mode = if consensus_v2_live_enabled() { "LIVE" } else { "shadow" };
+            eprintln!("[ConsensusV2/{}] host built — validators={} quorum={} scheme=Dilithium",
+                mode, h.validator_set().len(), h.quorum_size());
             *guard = Some(h);
         }
     }
@@ -844,6 +846,22 @@ pub async fn shadow_v2_tick() {
         let guard = shadow_host_lock();
         if let Some(h) = guard.as_ref() {
             if h.current_height() < real_next { h.seed_height(real_next); }
+        }
+    }
+
+    // Heartbeat (~5s): proves the engine is alive and shows whether we're the proposer
+    // for this height — so a node correctly WAITING for the peer's proposal is visibly
+    // distinct from "v2 not running".
+    {
+        let now = chrono::Utc::now().timestamp();
+        if now - V2_HEARTBEAT_TS.load(Ordering::Relaxed) >= 5 {
+            V2_HEARTBEAT_TS.store(now, Ordering::Relaxed);
+            let guard = shadow_host_lock();
+            if let Some(h) = guard.as_ref() {
+                let tag = if consensus_v2_live_enabled() { "LIVE" } else { "shadow" };
+                eprintln!("[ConsensusV2/{}] alive — h={} round={} i_am_proposer={} validators={}",
+                    tag, h.current_height(), h.current_round(), h.is_proposer(), h.validator_set().len());
+            }
         }
     }
 
@@ -10611,6 +10629,15 @@ pub async fn run_view_change_monitor() {
     tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
     touch_proposal_timestamp();
+
+    // Unambiguous banner: which consensus engine is actually driving this binary.
+    if consensus_v2_live_enabled() {
+        eprintln!("[Consensus] ENGINE = v2 BftEngine (Dilithium) — LIVE; inline BFT gated off. (EGO_CONSENSUS_LEGACY=1 reverts to inline.)");
+    } else if consensus_v2_active() {
+        eprintln!("[Consensus] ENGINE = inline HotStuff (EGO_CONSENSUS_LEGACY) with v2 running in SHADOW alongside.");
+    } else {
+        eprintln!("[Consensus] ENGINE = inline HotStuff (EGO_CONSENSUS_LEGACY).");
+    }
 
     // 250ms tick so the happy-path pipeline signal is picked up quickly; the 5s
     // timeout below is still the fallback for a silent/faulty proposer.
