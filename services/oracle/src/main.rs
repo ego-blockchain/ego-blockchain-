@@ -1251,6 +1251,12 @@ async fn main() {
 
     let app = Router::new()
         .route("/health",                   get(handle_health))
+        // Read-only chain indexing for the public block explorer. NOT part of consensus —
+        // peers reach finality peer-to-peer; nodes fire-and-forget finalized blocks here so
+        // explorer.html (rpc.egoblockchain.com/chain/blocks) has something to show.
+        .route("/chain/blocks",             get(handle_chain_blocks))
+        .route("/chain/transactions",       get(handle_chain_transactions))
+        .route("/chain/submit",             post(handle_chain_submit))
         .route("/prices",                   get(handle_prices))
         .route("/price/:symbol",            get(handle_price))
         .route("/egoc",                     get(handle_egoc))

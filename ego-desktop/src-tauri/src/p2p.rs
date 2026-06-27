@@ -844,9 +844,16 @@ pub async fn shadow_on_vote(vote: ego_consensus_core::bft::Vote) {
         let payload = v2_pending_blocks().remove(&hash);
         if let Some((block, txs)) = payload {
             let bh = block.hash.clone();
+            // Copy for the explorer feed before the block is moved into the commit task.
+            let (block_for_oracle, txs_for_oracle) = (block.clone(), txs.clone());
             let persisted = tokio::task::spawn_blocking(move || {
                 crate::chain_db::commit_staged_block(&block, &txs, vc)
             }).await.unwrap_or(false);
+            if persisted {
+                // Fire-and-forget the finalized block to the oracle's read-only chain index
+                // so the public explorer can display it. NOT in the consensus path.
+                tokio::spawn(async move { push_block_to_oracle(&block_for_oracle, &txs_for_oracle).await; });
+            }
             eprintln!("[ConsensusV2/LIVE] finalized h={} ({} votes) — persisted={} block={:.12}",
                 ht, vc, persisted, bh);
             if persisted {
