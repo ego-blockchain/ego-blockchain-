@@ -691,7 +691,7 @@ fn shadow_host_lock() -> std::sync::MutexGuard<'static, Option<crate::consensus_
 /// off. No configuration required; ordinary users get this automatically. The ONLY knob
 /// is an emergency escape hatch: set `EGO_CONSENSUS_LEGACY=1` to fall back to the inline
 /// BFT (e.g. if a v2 issue is found in the field, before a fix ships).
-fn consensus_v2_live_enabled() -> bool { std::env::var("EGO_CONSENSUS_LEGACY").is_err() }
+pub(crate) fn consensus_v2_live_enabled() -> bool { std::env::var("EGO_CONSENSUS_LEGACY").is_err() }
 /// The v2 engine runs (live by default, or shadow-alongside-inline when LEGACY+SHADOW).
 fn consensus_v2_active() -> bool { consensus_v2_live_enabled() || std::env::var("EGO_CONSENSUS_V2_SHADOW").is_ok() }
 static SHADOW_LAST_PROPOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
