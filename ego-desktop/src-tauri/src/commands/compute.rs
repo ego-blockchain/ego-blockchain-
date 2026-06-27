@@ -21,6 +21,9 @@ use reqwest;
 
 const NODE_POOL_ADDR: &str = crate::chain_db::NODE_POOL_ADDR;
 const SLASH_BASE_UEGOC: u64 = 1_000_000; // 1 EGOC minimum slash regardless of bid
+/// Periods a rented provider may miss its heartbeat before the renter declares an SLA
+/// breach (matches the cluster breach threshold).
+const SLA_BREACH_PERIODS: i64 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareProfile {
@@ -120,6 +123,45 @@ fn push_system_tx(from: &str, to: &str, amount: u64, memo: &str, nonce: u64) -> 
         ..LedgerTx::default()
     });
     hash
+}
+
+/// Renter-side SLA enforcement: a provider we rented from has gone dark. Compute can't
+/// live-migrate a running container, so the resilience guarantee is COMPENSATION — refund
+/// the renter's unused escrow AND award them the provider's SLA bond, then free the
+/// provider's locked resources and mark the reservation breached.
+async fn refund_breached_reservation(res: crate::chain_db::ComputeReservation) {
+    let provider_short: String = res.provider_address.chars().take(12).collect();
+    let rid    = res.reservation_id.clone();
+    let refund = res.escrow_remaining;     // renter's unspent funds
+    let bond   = res.collateral_uegoc;     // provider's SLA collateral → renter
+
+    tokio::task::spawn_blocking(move || {
+        let mut r = res;
+        let buyer = r.buyer_address.clone();
+        if refund > 0 {
+            crate::chain_db::internal_balance_transfer(crate::chain_db::RESERVATION_ESCROW_ADDR, &buyer, refund);
+            push_system_tx(crate::chain_db::RESERVATION_ESCROW_ADDR, &buyer, refund,
+                &format!("sla_breach_refund:{}", r.reservation_id), 0);
+        }
+        if bond > 0 {
+            crate::chain_db::internal_balance_transfer(crate::chain_db::RESERVATION_ESCROW_ADDR, &buyer, bond);
+            push_system_tx(crate::chain_db::RESERVATION_ESCROW_ADDR, &buyer, bond,
+                &format!("sla_breach_bond:{}", r.reservation_id), 0);
+        }
+        r.status           = "breached".to_string();
+        r.escrow_remaining = 0;
+        r.breach_count     = r.breach_count.saturating_add(SLA_BREACH_PERIODS as u32);
+        crate::chain_db::upsert_compute_reservation(&r);
+
+        if let Some(mut node) = crate::chain_db::get_compute_node(&r.provider_address) {
+            node.locked_cores = node.locked_cores.saturating_sub(r.cpu_cores);
+            node.slash_count  = node.slash_count.saturating_add(1);
+            crate::chain_db::upsert_compute_node(&node);
+        }
+    }).await.ok();
+
+    eprintln!("[Compute] SLA breach: provider {} went dark on {} — refunded {} escrow + {} bond to renter",
+        provider_short, rid, refund, bond);
 }
 
 fn check_and_apply_timeout(job: &mut ComputeJob) -> bool {
@@ -293,6 +335,30 @@ pub async fn compute_node_heartbeat() {
 
     for res_id in due_reservations {
         let _ = send_reservation_heartbeat(res_id).await;
+    }
+
+    // Renter-side SLA watchdog: refund + bond-slash any reservation whose provider has
+    // gone dark (no heartbeat for SLA_BREACH_PERIODS periods). Only for STARTED rentals,
+    // measured from the later of start / last heartbeat, so a provider is never penalised
+    // for a renter who never began using the rental.
+    let owner_buyer = owner.clone();
+    let breached: Vec<crate::chain_db::ComputeReservation> = tokio::task::spawn_blocking(move || {
+        crate::chain_db::list_compute_reservations()
+            .into_iter()
+            .filter(|r| {
+                r.buyer_address == owner_buyer
+                    && r.status == "active"
+                    && r.period_minutes > 0
+                    && r.started_at.is_some()
+                    && {
+                        let reference = r.started_at.unwrap_or(r.last_heartbeat_at).max(r.last_heartbeat_at);
+                        now_ts - reference >= r.period_minutes as i64 * 60 * SLA_BREACH_PERIODS
+                    }
+            })
+            .collect()
+    }).await.unwrap_or_default();
+    for res in breached {
+        refund_breached_reservation(res).await;
     }
 
     // Auto-claim payment for cluster nodes when a period has elapsed
