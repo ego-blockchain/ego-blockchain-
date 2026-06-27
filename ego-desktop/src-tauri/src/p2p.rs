@@ -696,6 +696,11 @@ fn consensus_v2_live_enabled() -> bool { std::env::var("EGO_CONSENSUS_LEGACY").i
 fn consensus_v2_active() -> bool { consensus_v2_live_enabled() || std::env::var("EGO_CONSENSUS_V2_SHADOW").is_ok() }
 static SHADOW_LAST_PROPOSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 static V2_HEARTBEAT_TS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+// Pacemaker state: the (height<<16|round) we're currently sitting in, and when we entered
+// it. If we stay past V2_VIEW_TIMEOUT_MS without finalizing, we broadcast a view-change.
+static V2_VIEW_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static V2_VIEW_ENTERED_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+const V2_VIEW_TIMEOUT_MS: i64 = 4_000;
 
 // In LIVE mode, the LedgerBlock payload each v2 BlockHeader commits to, keyed by the
 // engine header hash — so when a QC forms for that header we persist the right block.
@@ -861,6 +866,34 @@ pub async fn shadow_v2_tick() {
                 let tag = if consensus_v2_live_enabled() { "LIVE" } else { "shadow" };
                 eprintln!("[ConsensusV2/{}] alive — h={} round={} i_am_proposer={} validators={}",
                     tag, h.current_height(), h.current_round(), h.is_proposer(), h.validator_set().len());
+            }
+        }
+    }
+
+    // ── Pacemaker ─────────────────────────────────────────────────────────────
+    // If we sit at the same (height, round) too long without finalizing — the elected
+    // proposer is offline, can't build a block, or its proposal isn't reaching us — rotate
+    // the proposer by broadcasting a view-change. The round advances ONLY on a quorum of
+    // view-changes, so it cannot run away like the inline view counter. Without this a
+    // stalled proposer halts the chain forever (observed live: stuck at h=1 round=0).
+    if consensus_v2_live_enabled() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let view_key = {
+            let g = shadow_host_lock();
+            g.as_ref().map(|h| (h.current_height() << 16) | (h.current_round() as u64 & 0xFFFF))
+        };
+        if let Some(key) = view_key {
+            let prev = V2_VIEW_KEY.swap(key, Ordering::Relaxed);
+            if prev != key {
+                V2_VIEW_ENTERED_MS.store(now_ms, Ordering::Relaxed); // entered a new view
+            } else if now_ms - V2_VIEW_ENTERED_MS.load(Ordering::Relaxed) >= V2_VIEW_TIMEOUT_MS {
+                let vc = { let g = shadow_host_lock(); g.as_ref().and_then(|h| h.trigger_view_change()) };
+                if let Some(vc) = vc {
+                    eprintln!("[ConsensusV2/LIVE] view timeout (key={:#x}) — broadcasting view-change", key);
+                    shadow_publish(&P2PMessage::BftV2ViewChange { msg: vc.clone() }).await;
+                    shadow_on_view_change(vc).await; // count our own toward quorum
+                }
+                V2_VIEW_ENTERED_MS.store(now_ms, Ordering::Relaxed); // re-arm; avoid a VC storm
             }
         }
     }
