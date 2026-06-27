@@ -4062,7 +4062,12 @@ const UNDER_REPLICATED_WARN_SECS:     i64 = 3_600;      // 1 hour  → warning +
 const UNDER_REPLICATED_CRITICAL_SECS: i64 = 86_400;     // 24 hours → critical alert
 
 pub async fn check_file_replication() {
-    if known_validator_count() <= 50 { return; }
+    // Replicate as soon as there is at least one OTHER node to hold a copy. A client's
+    // paid-for data must never live on a single machine that can be turned off — with 2
+    // nodes we keep 2 copies, with 3+ we reach the full MIN_REPLICAS. (Previously gated to
+    // >50 validators, which left every early-network file on a single master = data loss
+    // the moment that user shut down.)
+    if known_validator_count() < 2 { return; }
     let _guard = crate::ledger::TX_MUTEX.lock().await; // This is fine, it's a tokio mutex
     let mut ledger = tokio::task::spawn_blocking(crate::ledger::Ledger::load)
         .await.unwrap_or_default();

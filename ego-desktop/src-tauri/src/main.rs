@@ -279,49 +279,69 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     {
-        let pid = std::process::id().to_string();
-        match std::process::Command::new("caffeinate")
-            .args(["-di", "-w", &pid])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(_child) => {
-                std::mem::forget(_child);
-                eprintln!("[Node] Sleep prevention active (macOS caffeinate)");
+        // -i prevent idle sleep (works on battery too), -m prevent disk sleep, -s prevent
+        // system sleep (AC only). Display is allowed to turn off (no -d) — server-like.
+        // A watchdog re-launches caffeinate if it ever exits, so the wake lock survives a
+        // forced sleep/wake or the helper being killed.
+        std::thread::spawn(|| loop {
+            let child = std::process::Command::new("caffeinate")
+                .args(["-i", "-m", "-s"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            match child {
+                Ok(mut c) => {
+                    eprintln!("[Node] Sleep prevention active (macOS caffeinate)");
+                    let _ = c.wait(); // blocks until caffeinate exits, then re-launch below
+                }
+                Err(e) => {
+                    eprintln!("[Node] Sleep prevention unavailable: {e}");
+                    return;
+                }
             }
-            Err(e) => eprintln!("[Node] Sleep prevention unavailable: {e}"),
-        }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
     }
 
     #[cfg(target_os = "linux")]
     {
-        let result = std::process::Command::new("systemd-inhibit")
-            .args([
-                "--what=sleep:idle:handle-lid-switch",
-                "--who=Ego Desktop",
-                "--why=Node is sharing compute or storage",
-                "--mode=block",
-                "sleep", "infinity",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-
-        match result {
-            Ok(_child) => {
-                std::mem::forget(_child);
-                eprintln!("[Node] Sleep prevention active (Linux systemd-inhibit)");
-            }
-            Err(_) => {
-                let _ = std::process::Command::new("xdg-screensaver")
-                    .args(["reset"])
+        // systemd-inhibit blocks sleep + idle + lid-close for the whole node lifetime. A
+        // watchdog re-launches it if it exits (e.g. killed on resume) so the lock persists.
+        std::thread::spawn(|| {
+            loop {
+                let child = std::process::Command::new("systemd-inhibit")
+                    .args([
+                        "--what=sleep:idle:handle-lid-switch",
+                        "--who=Ego Desktop",
+                        "--why=Node is sharing compute or storage",
+                        "--mode=block",
+                        "sleep", "infinity",
+                    ])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .spawn();
-                eprintln!("[Node] Sleep prevention: systemd-inhibit not available, using xdg-screensaver fallback");
+                match child {
+                    Ok(mut c) => {
+                        eprintln!("[Node] Sleep prevention active (Linux systemd-inhibit)");
+                        let _ = c.wait();
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
+                    Err(_) => {
+                        // No systemd: best-effort screensaver poke loop so at least the
+                        // session's idle timer keeps getting reset.
+                        eprintln!("[Node] Sleep prevention: systemd-inhibit unavailable, using xdg-screensaver fallback");
+                        loop {
+                            let _ = std::process::Command::new("xdg-screensaver")
+                                .args(["reset"])
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .status();
+                            std::thread::sleep(std::time::Duration::from_secs(50));
+                        }
+                    }
+                }
             }
-        }
+        });
     }
 
     if !acquire_single_instance_lock() {
