@@ -710,6 +710,24 @@ fn v2_pending_blocks() -> std::sync::MutexGuard<'static, HashMap<ego_core::Hash,
     V2_PENDING_BLOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap()
 }
 
+// Out-of-order buffers: a proposal or vote for height N can arrive BEFORE we finalize N-1
+// (gossip race). We keep these by height and replay them once the engine reaches N, rather
+// than dropping them — dropping strands the chain (observed live: reject #60 then finalize
+// #59 → permanent stall, because the proposer had already moved past #60).
+type V2Proposal = (ego_consensus_core::bft::BlockHeader, crate::ledger::LedgerBlock, Vec<LedgerTx>);
+static V2_FUTURE_PROPOSALS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, V2Proposal>>> = std::sync::OnceLock::new();
+static V2_FUTURE_VOTES: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, Vec<ego_consensus_core::bft::Vote>>>> = std::sync::OnceLock::new();
+const V2_FUTURE_WINDOW: u64 = 256; // how far ahead we buffer
+fn v2_future_proposals() -> std::sync::MutexGuard<'static, HashMap<u64, V2Proposal>> {
+    V2_FUTURE_PROPOSALS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap()
+}
+fn v2_future_votes() -> std::sync::MutexGuard<'static, HashMap<u64, Vec<ego_consensus_core::bft::Vote>>> {
+    V2_FUTURE_VOTES.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap()
+}
+fn v2_engine_height() -> Option<u64> {
+    shadow_host_lock().as_ref().map(|h| h.current_height())
+}
+
 /// Build the stored shadow host once we have a quorum-sized validator set. Returns true
 /// if a host is available. The build (DPAPI seed load) runs off the async executor.
 async fn ensure_shadow_host() -> bool {
@@ -741,6 +759,19 @@ pub async fn shadow_on_proposal(
     txs: Vec<LedgerTx>,
 ) {
     if !consensus_v2_active() { return; }
+
+    // Route by height. A proposal can arrive before we finalize its parent (gossip race):
+    // buffer it and replay once the engine reaches that height, rather than dropping it.
+    if let Some(cur) = v2_engine_height() {
+        if header.height < cur { return; } // stale — already past this height
+        if header.height > cur {
+            if header.height <= cur + V2_FUTURE_WINDOW {
+                v2_future_proposals().insert(header.height, (header, block, txs));
+            }
+            return;
+        }
+    }
+
     if consensus_v2_live_enabled() {
         // Never trust a proposer: validate the block before voting/persisting.
         let tip = crate::chain_db::latest_block_info().1;
@@ -780,6 +811,20 @@ pub async fn shadow_on_proposal(
 /// PERSIST the agreed LedgerBlock to the real chain; in shadow mode just log.
 pub async fn shadow_on_vote(vote: ego_consensus_core::bft::Vote) {
     if !consensus_v2_active() { return; }
+
+    // Route by height: a vote for height N can outrun the proposal it certifies (or our
+    // own finalization of N-1). Buffer future-height votes and replay them when the engine
+    // reaches N, so the QC still forms instead of being lost.
+    if let Some(cur) = v2_engine_height() {
+        if vote.height < cur { return; }
+        if vote.height > cur {
+            if vote.height <= cur + V2_FUTURE_WINDOW {
+                v2_future_votes().entry(vote.height).or_default().push(vote);
+            }
+            return;
+        }
+    }
+
     let decided = {
         let guard = shadow_host_lock();
         guard.as_ref().and_then(|h| {
@@ -851,6 +896,28 @@ pub async fn shadow_v2_tick() {
         let guard = shadow_host_lock();
         if let Some(h) = guard.as_ref() {
             if h.current_height() < real_next { h.seed_height(real_next); }
+        }
+    }
+
+    // Replay any buffered out-of-order messages for the height we're now on, and prune
+    // anything we've already passed. This is what unsticks the proposal-before-parent race:
+    // once we advance to N, the buffered proposal + votes for N are processed and N finalizes.
+    if let Some(cur) = v2_engine_height() {
+        let prop = {
+            let mut b = v2_future_proposals();
+            b.retain(|&h, _| h >= cur);
+            b.remove(&cur)
+        };
+        let votes = {
+            let mut b = v2_future_votes();
+            b.retain(|&h, _| h >= cur);
+            b.remove(&cur)
+        };
+        if let Some((header, block, txs)) = prop {
+            Box::pin(shadow_on_proposal(header, block, txs)).await;
+        }
+        if let Some(vs) = votes {
+            for v in vs { Box::pin(shadow_on_vote(v)).await; }
         }
     }
 
