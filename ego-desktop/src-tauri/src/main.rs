@@ -221,16 +221,60 @@ fn main() {
 
     #[cfg(target_os = "windows")]
     {
+        // Keep the machine awake so storage/compute clients are never cut off by an idle
+        // sleep. TWO mechanisms, because one alone is not enough on modern hardware:
+        //   1. SetThreadExecutionState(ES_SYSTEM_REQUIRED): the classic API. Works on
+        //      traditional S3 sleep but is IGNORED by Windows 11 "Modern Standby" (S0).
+        //   2. PowerSetRequest(PowerRequestExecutionRequired): the Modern-Standby-aware
+        //      power request that actually holds a Win11 laptop in the working state.
+        // The display is deliberately allowed to turn off (no ES_DISPLAY_REQUIRED) — a
+        // node behaves like a server: stay running, but don't waste power lighting a screen.
         extern "system" {
-            fn SetThreadExecutionState(esFlags: u32) -> u32;
+            fn SetThreadExecutionState(es_flags: u32) -> u32;
+            fn PowerCreateRequest(context: *const ReasonContext) -> isize;
+            fn PowerSetRequest(power_request: isize, request_type: u32) -> i32;
         }
-        const ES_CONTINUOUS: u32          = 0x80000000;
-        const ES_SYSTEM_REQUIRED: u32     = 0x00000001;
-        const ES_AWAYMODE_REQUIRED: u32   = 0x00000040;
+        #[repr(C)]
+        struct ReasonContext { version: u32, flags: u32, simple_reason_string: *const u16 }
+
+        const ES_CONTINUOUS: u32        = 0x80000000;
+        const ES_SYSTEM_REQUIRED: u32   = 0x00000001;
+        const ES_AWAYMODE_REQUIRED: u32 = 0x00000040;
+        const POWER_REQUEST_CONTEXT_SIMPLE_STRING: u32 = 0x00000001;
+        const POWER_REQUEST_SYSTEM_REQUIRED: u32 = 1;
+        const POWER_REQUEST_EXECUTION_REQUIRED: u32 = 3;
+
         unsafe {
             SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED);
+
+            let reason: Vec<u16> = "Ego node is serving storage and compute\0".encode_utf16().collect();
+            let ctx = ReasonContext {
+                version: 0,
+                flags: POWER_REQUEST_CONTEXT_SIMPLE_STRING,
+                simple_reason_string: reason.as_ptr(),
+            };
+            let h = PowerCreateRequest(&ctx);
+            if h != 0 && h != -1 {
+                PowerSetRequest(h, POWER_REQUEST_SYSTEM_REQUIRED);
+                PowerSetRequest(h, POWER_REQUEST_EXECUTION_REQUIRED);
+                // Hold the request (never cleared/closed) and its reason string for the
+                // whole process lifetime so the wake lock stays active.
+                std::mem::forget(reason);
+            }
         }
-        eprintln!("[Node] Sleep prevention active (Windows)");
+        eprintln!("[Node] Sleep prevention active (Windows: execution-state + power-request)");
+
+        // Re-assert periodically from a long-lived thread: returning from a forced sleep,
+        // a fast-user-switch, or another app toggling power state can clear ES_CONTINUOUS.
+        // Re-setting every 50s means a node that briefly slept goes back to staying awake
+        // on its own, without needing a restart.
+        std::thread::spawn(|| {
+            extern "system" { fn SetThreadExecutionState(es_flags: u32) -> u32; }
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(50));
+                unsafe { SetThreadExecutionState(0x80000000 | 0x00000001 | 0x00000040); }
+            }
+        });
     }
 
     #[cfg(target_os = "macos")]
