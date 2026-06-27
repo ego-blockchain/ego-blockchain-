@@ -1324,6 +1324,12 @@ pub async fn book_reservation(
         started_at:        None,
     };
 
+    // Anchor the reservation ON-CHAIN: this hash-bound tx lands in a block's
+    // tx_merkle_root and every node materializes the identical ComputeReservation from it.
+    // The local upsert below is an optimistic copy for instant UX; the block is canonical.
+    if let Err(e) = crate::mempool::get_mempool().push(crate::chain_db::compute_reservation_tx(&reservation)) {
+        eprintln!("[Compute] on-chain reservation anchor tx rejected: {e}");
+    }
     crate::chain_db::upsert_compute_reservation(&reservation);
 
     let mut updated_offer = offer.clone();

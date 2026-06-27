@@ -72,9 +72,9 @@ pub async fn create_storage_deal(
     }
 
     let my_balance = crate::chain_db::balance_of(&my_addr);
-    if my_balance < total_cost {
+    if my_balance < total_cost + crate::mempool::MIN_FEE_UEGOC {
         return Err(EgoDesktopError::WalletError(
-            format!("Insufficient balance: need {} uEGOC, have {}", total_cost, my_balance)
+            format!("Insufficient balance: need {} uEGOC (+fee), have {}", total_cost, my_balance)
         ));
     }
 
@@ -126,6 +126,13 @@ pub async fn create_storage_deal(
         n_padded_leaves,
     };
 
+    // Anchor the deal ON-CHAIN: this tx carries the full record (hash-bound) so it lands
+    // in a block's tx_merkle_root and every node materializes the identical StorageDeal
+    // from it. The local upsert below is just an optimistic copy for instant UX — the
+    // block is the canonical source of truth.
+    if let Err(e) = crate::mempool::get_mempool().push(crate::chain_db::storage_deal_tx(&deal)) {
+        eprintln!("[StorageDeal] on-chain anchor tx rejected: {e}");
+    }
     crate::chain_db::upsert_storage_deal(&deal);
 
     let msg = crate::p2p::P2PMessage::StorageDealCreated { deal: deal.clone() };
