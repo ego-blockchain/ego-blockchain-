@@ -456,21 +456,26 @@ impl BftEngine {
     pub fn receive_vote(&self, vote: &Vote) -> PoCResult<Option<QuorumCertificate>> {
         if !vote.verify()? { return Ok(None); }
 
-        let (state_h, state_bh) = {
-            let s = self.current_round.read().unwrap();
-            let bh = s.proposed_block.as_ref().map(|b| b.block_hash()).unwrap_or(Hash::new([0u8; 32]));
-            (s.height, bh)
-        };
-        if vote.height != state_h || vote.block_hash != state_bh { return Ok(None); }
-
         let mut s = self.current_round.write().unwrap();
+        // Only consider votes for the round's CURRENT height. A vote can legitimately
+        // arrive BEFORE this node has seen the matching proposal (gossip reordering), so
+        // we BUFFER it by voter instead of dropping it — dropping the early vote loses it
+        // forever and the QC never forms (observed live: the chain stalled at the first
+        // height whose vote outran its proposal).
+        if vote.height != s.height { return Ok(None); }
         s.votes.insert(vote.voter, vote.clone());
-        // A QC is votes for ONE block. Count only votes matching the current proposed
-        // block — a stale vote left in the map for a PRIOR proposed block (e.g. this
-        // node's own vote cast before a re-proposal at the same round) must never be
-        // conflated into a quorum for a different block (caught by the harness).
+
+        // Certify only once a proposal is set, and count ONLY votes for that exact block.
+        // A buffered vote for a DIFFERENT block at this height (e.g. a stale vote from a
+        // prior proposal at the same round) must never be conflated into a quorum for the
+        // current block (caught by the harness conflation test).
+        let state_bh = match s.proposed_block.as_ref() {
+            Some(b) => b.block_hash(),
+            None => return Ok(None),
+        };
+        if s.qc.is_some() { return Ok(None); }
         let votes: Vec<Vote> = s.votes.values().filter(|v| v.block_hash == state_bh).cloned().collect();
-        if votes.len() >= self.quorum_size() && s.qc.is_none() {
+        if votes.len() >= self.quorum_size() {
             let qc = QuorumCertificate::new(state_bh, vote.height, vote.epoch, vote.round, &votes);
             s.qc = Some(qc.clone());
             s.advance_phase(RoundPhase::Commit);

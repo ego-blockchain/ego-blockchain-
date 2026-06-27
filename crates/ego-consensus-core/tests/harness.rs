@@ -201,6 +201,40 @@ fn dilithium_default_finalizes_and_agrees() {
     }
 }
 
+/// REGRESSION (live stall at block 13): under gossip reordering a vote can arrive BEFORE
+/// the proposal it certifies. The engine must BUFFER the early vote and certify once the
+/// proposal lands — the pre-fix engine dropped any vote not matching the (not-yet-known)
+/// proposed block, lost it forever, and the QC never formed, stalling the chain.
+#[test]
+fn vote_arriving_before_proposal_still_forms_qc() {
+    let net = Net::new(2);
+
+    let p = net.engines.iter().position(|e| e.is_proposer()).expect("a proposer for height 0");
+    let other = 1 - p;
+
+    let header = net.engines[p].propose_block(BlockRoots::empty()).expect("propose");
+    let proposer_vote = net.engines[p]
+        .receive_proposal(&header).expect("proposer receive_proposal").expect("proposer self-vote");
+
+    // Deliver the proposer's vote to the other node BEFORE it has seen the proposal.
+    // Must be buffered (no QC yet — only one vote and no proposed block), not dropped.
+    assert!(
+        net.engines[other].receive_vote(&proposer_vote).expect("early vote").is_none(),
+        "no QC should form from a single early vote",
+    );
+
+    // The proposal now arrives; the other node votes, and its own vote should complete
+    // the quorum together with the BUFFERED proposer vote.
+    let other_vote = net.engines[other]
+        .receive_proposal(&header).expect("other receive_proposal").expect("other vote");
+    let qc = net.engines[other]
+        .receive_vote(&other_vote).expect("self vote")
+        .expect("QC must form from the buffered early vote + own vote");
+    assert!(qc.voter_count() >= net.quorum(), "QC below quorum");
+    net.engines[other].finalize_block(header.clone(), qc).expect("finalize");
+    assert_eq!(net.engines[other].get_current_height(), 1, "node must advance past the height");
+}
+
 /// The exact scenario the user hit on the INLINE BFT: one node "sleeps" (goes offline)
 /// while the chain is live, time passes, then it reconnects — the chain MUST resume.
 /// The inline BFT fails this (its view runs away to ~791 and the peer never re-votes).
