@@ -4060,6 +4060,8 @@ const MASTER_TIMEOUT_SECS: i64 = 5 * 60; // 5 minutes
 const MIN_REPLICAS: usize = 2;            // 1 master + 2 slaves
 const UNDER_REPLICATED_WARN_SECS:     i64 = 3_600;      // 1 hour  → warning + immediate retry
 const UNDER_REPLICATED_CRITICAL_SECS: i64 = 86_400;     // 24 hours → critical alert
+const STORAGE_PAYOUT_INTERVAL_SECS:   i64 = 3_600;      // stream escrow at most hourly
+const STORAGE_FEES_POOL: &str = "egot1storagefees000000000000000000000000000000";
 
 pub async fn check_file_replication() {
     // Replicate as soon as there is at least one OTHER node to hold a copy. A client's
@@ -4077,6 +4079,7 @@ pub async fn check_file_replication() {
 
     let mut need_save   = false;
     let mut pin_needed: Vec<String> = Vec::new();
+    let mut payouts: Vec<(String, u64, String)> = Vec::new(); // (recipient, amount_uegoc, cid)
 
     // ── Re-publish under-distributed Active files when connectivity returns ───
     // Files stored while offline have replication_role="" and replica_peers=[].
@@ -4097,6 +4100,56 @@ pub async fn check_file_replication() {
 
             // ── MASTER duties ─────────────────────────────────────────────
             "master" => {
+                // ── Per-period escrow release ─────────────────────────────
+                // Stream the uploader's prepaid fee to the CURRENT proven holders
+                // (this master + live replica_peers) pro-rata for the elapsed time,
+                // capped at the deal window and the remaining escrow. Because only
+                // the live master runs this — and a promoted slave resets its payout
+                // clock to `now` — an offline master earns nothing for time it isn't
+                // serving: payment follows the data.
+                if file.storage_fee_uegoc > file.storage_fee_paid_uegoc
+                    && file.expiry > file.stored_at
+                {
+                    let last = if file.last_storage_payout_ts > 0 {
+                        file.last_storage_payout_ts
+                    } else {
+                        file.stored_at
+                    };
+                    let until = now.min(file.expiry);
+                    if until - last >= STORAGE_PAYOUT_INTERVAL_SECS {
+                        let duration  = (file.expiry - file.stored_at) as u128;
+                        let elapsed   = (until - last) as u128;
+                        let remaining = file.storage_fee_uegoc - file.storage_fee_paid_uegoc;
+                        let accrued   = (file.storage_fee_uegoc as u128 * elapsed / duration) as u64;
+                        let amount    = accrued.min(remaining);
+                        if amount > 0 {
+                            // Current proven holders: self (unless proof-suspended) plus
+                            // the live replicas (PoRep evicts dead/failed ones, so this
+                            // list is exactly who is actually holding the data now).
+                            let mut holders: Vec<String> = Vec::new();
+                            if file.proof_suspended_until <= now {
+                                holders.push(my_addr.clone());
+                            }
+                            for p in &file.replica_peers { holders.push(p.clone()); }
+
+                            let n = holders.len() as u64;
+                            if n > 0 {
+                                let share = amount / n;
+                                if share > 0 {
+                                    let dust = amount - share * n; // give remainder to first holder
+                                    for (i, haddr) in holders.iter().enumerate() {
+                                        let amt = if i == 0 { share + dust } else { share };
+                                        payouts.push((haddr.clone(), amt, file.cid.clone()));
+                                    }
+                                    file.storage_fee_paid_uegoc += amount;
+                                    file.last_storage_payout_ts = until;
+                                    need_save = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Broadcast heartbeat to all known slaves
                 let hb = P2PMessage::ReplicaHeartbeat {
                     cid:         file.cid.clone(),
@@ -4166,6 +4219,10 @@ pub async fn check_file_replication() {
                     file.replication_role = "master".to_string();
                     file.replica_master   = String::new();
                     file.master_last_seen = now;
+                    // Start the escrow payout clock at promotion: this node only earns for
+                    // the data from the moment it takes over serving it, never the dead
+                    // master's unserved gap.
+                    file.last_storage_payout_ts = now;
                     // Remove the dead master from replica list
                     file.replica_peers.retain(|p| p != &old_master);
                     need_save = true;
@@ -4200,6 +4257,29 @@ pub async fn check_file_replication() {
     }
     if !pin_needed.is_empty() {
         request_file_pinning(pin_needed).await;
+    }
+    if !payouts.is_empty() {
+        let now2 = now;
+        tokio::task::spawn_blocking(move || {
+            let mut chain = crate::ledger::load_chain();
+            for (to, amount, cid) in payouts {
+                let h = format!("0x{}", ego_core::hash_data(
+                    format!("storage-escrow:{}:{}:{}", cid, to, now2).as_bytes()
+                ).to_hex());
+                chain.transactions.push(crate::ledger::LedgerTx {
+                    hash: h,
+                    from: STORAGE_FEES_POOL.into(),
+                    to,
+                    amount,
+                    memo: Some(format!("Storage escrow release: {}", &cid[..16.min(cid.len())])),
+                    timestamp: now2,
+                    signature: "provider".into(),
+                    status: "Confirmed".into(),
+                    ..crate::ledger::LedgerTx::default()
+                });
+            }
+            let _ = crate::ledger::save_chain(&chain);
+        }).await.ok();
     }
 }
 
@@ -6642,11 +6722,10 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
             eprintln!("[P2P] PinAck for {} — accepted={} reason={}", cid, accepted, reason);
 
             if accepted && !ack_from.is_empty() {
-            let _guard = crate::ledger::TX_MUTEX.lock().await;
+                let _guard = crate::ledger::TX_MUTEX.lock().await;
                 let mut ledger = tokio::task::spawn_blocking(crate::ledger::Ledger::load)
                     .await.unwrap_or_default();
                 let mut changed = false;
-                let mut provider_payment: Option<(String, String, u64)> = None; // (from, to, amount)
 
                 for f in ledger.stored_files.iter_mut() {
                     if f.cid == cid && !f.replica_peers.contains(&ack_from) {
@@ -6657,67 +6736,15 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                         changed = true;
                         eprintln!("[Replication] {} pinned by {} ({}/{} replicas)",
                             cid, ack_from, f.replica_peers.len(), MIN_REPLICAS);
-
-                        // Pay the new slave their share of the storage fee.
-                        // Fee splits equally among (MIN_REPLICAS + 1) providers:
-                        // master + MIN_REPLICAS slaves.
-                        if f.storage_fee_uegoc > 0 {
-                            let share = f.storage_fee_uegoc / (MIN_REPLICAS as u64 + 1);
-                            if share > 0 {
-                                provider_payment = Some((
-                                    "egot1storagefees000000000000000000000000000000".to_string(),
-                                    ack_from.clone(),
-                                    share,
-                                ));
-                            }
-                        }
                     }
                 }
 
+                // Providers are NOT paid a lump sum on pin. The uploader's fee is held in
+                // escrow and streamed per-period to the CURRENT proven holders by
+                // check_file_replication (master duty), so revenue follows the data when a
+                // master fails over to a slave.
                 if changed {
-                    // Also pay self (master) their share on first replica confirmation
-                    let master_share = ledger.stored_files.iter()
-                        .find(|f| f.cid == cid)
-                        .filter(|f| f.replica_peers.len() == 1) // only on first slave
-                        .and_then(|f| {
-                            let share = f.storage_fee_uegoc / (MIN_REPLICAS as u64 + 1);
-                            if share > 0 { Some((ledger.address.clone(), share)) } else { None }
-                        });
-
-                    let now = chrono::Utc::now().timestamp();
-                    let mut chain = tokio::task::spawn_blocking(crate::ledger::load_chain)
-                        .await.unwrap_or_default();
-
-                    if let Some((_, to, amount)) = provider_payment {
-                        let h = format!("0x{}", ego_core::hash_data(
-                            format!("provider-pay:{}:{}:{}", cid, to, now).as_bytes()
-                        ).to_hex());
-                        chain.transactions.push(crate::ledger::LedgerTx {
-                            hash: h, from: "egot1storagefees000000000000000000000000000000".into(),
-                            to, amount,
-                            memo: Some(format!("Storage provider reward: {}", &cid[..16.min(cid.len())])),
-                            timestamp: now, signature: "provider".into(),
-                            status: "Confirmed".into(),
-                            ..crate::ledger::LedgerTx::default()
-                        });
-                    }
-                    if let Some((to, amount)) = master_share {
-                        let h = format!("0x{}", ego_core::hash_data(
-                            format!("master-pay:{}:{}:{}", cid, to, now).as_bytes()
-                        ).to_hex());
-                        chain.transactions.push(crate::ledger::LedgerTx {
-                            hash: h, from: "egot1storagefees000000000000000000000000000000".into(),
-                            to, amount,
-                            memo: Some(format!("Storage master reward: {}", &cid[..16.min(cid.len())])),
-                            timestamp: now, signature: "provider".into(),
-                            status: "Confirmed".into(),
-                            ..crate::ledger::LedgerTx::default()
-                        });
-                    }
-                    tokio::task::spawn_blocking(move || {
-                        let _ = crate::ledger::save_chain(&chain);
-                        let _ = ledger.save();
-                    }).await.ok();
+                    tokio::task::spawn_blocking(move || { let _ = ledger.save(); }).await.ok();
                 }
             }
         }
