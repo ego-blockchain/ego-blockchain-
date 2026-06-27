@@ -1400,6 +1400,20 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
         ));
     }
 
+    // ── On-chain deal records ────────────────────────────────────────────
+    // A storage_deal / compute_reservation tx carries the full record as JSON in
+    // call_args and is BOUND by its hash (tx.hash = blake3(call_args)) rather than a
+    // signature: the record is materialized deterministically from the committed tx, so
+    // tamper-resistance comes from the hash, re-checked identically at block apply. The
+    // tx moves no value (amount 0); it only anchors the deal terms in the block.
+    if matches!(tx.tx_type.as_str(), "storage_deal" | "compute_reservation") {
+        let bound = format!("0x{}", ego_core::hash_data(tx.call_args.as_bytes()).to_hex());
+        if tx.hash != bound {
+            return Err(format!("{} tx {} body/hash mismatch", tx.tx_type, tx.hash));
+        }
+        return Ok(());
+    }
+
     // ── Equivocation proof: fee/nonce/dilithium exempted, Ed25519 required ──
     // These txs are submitted by validator nodes to record slash evidence on-chain.
     // They must carry a valid Ed25519 sig from the detector (from = detector address),

@@ -956,6 +956,8 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     let cf_balances   = db.cf_handle(CF_BALANCES).unwrap();
     let cf_recent_txs = db.cf_handle(CF_RECENT_TXS).unwrap();
     let cf_meta       = db.cf_handle(CF_META).unwrap();
+    let cf_storage_deals = db.cf_handle(CF_STORAGE_DEALS);
+    let cf_compute_res   = db.cf_handle(CF_COMPUTE_RESERVATIONS);
 
     let height_k = height_key(block.height);
 
@@ -1106,6 +1108,41 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         // the QC verifier can reject signers using unregistered keys.
         if let Some((addr, bls_hex)) = parse_validator_registration(tx) {
             batch.put_cf(cf_meta, bls_reg_key(&bls_hex), addr.as_bytes());
+        }
+
+        // On-chain deal records. A storage_deal / compute_reservation tx carries the
+        // full record as JSON in call_args, hash-bound (tx.hash = blake3(call_args)),
+        // so the block's tx_merkle_root commits to the deal verbatim. We materialize it
+        // into the deal CF in the SAME atomic batch — every node derives the identical
+        // record from the committed tx, making the deal canonical chain state rather
+        // than a gossip-only local table. The hash check rejects a proposer that tampered
+        // the body after the hash was fixed.
+        match tx.tx_type.as_str() {
+            "storage_deal" => {
+                let bound = format!("0x{}", ego_core::hash_data(tx.call_args.as_bytes()).to_hex());
+                if tx.hash == bound {
+                    if let (Some(cf), Some(deal)) =
+                        (cf_storage_deals, serde_json::from_str::<StorageDeal>(&tx.call_args).ok())
+                    {
+                        batch.put_cf(cf, deal.deal_id.as_bytes(), encode(&deal));
+                    }
+                } else {
+                    tracing::warn!("storage_deal tx {} body/hash mismatch — not materialized", &tx.hash[..tx.hash.len().min(12)]);
+                }
+            }
+            "compute_reservation" => {
+                let bound = format!("0x{}", ego_core::hash_data(tx.call_args.as_bytes()).to_hex());
+                if tx.hash == bound {
+                    if let (Some(cf), Some(res)) =
+                        (cf_compute_res, serde_json::from_str::<ComputeReservation>(&tx.call_args).ok())
+                    {
+                        batch.put_cf(cf, res.reservation_id.as_bytes(), encode(&res));
+                    }
+                } else {
+                    tracing::warn!("compute_reservation tx {} body/hash mismatch — not materialized", &tx.hash[..tx.hash.len().min(12)]);
+                }
+            }
+            _ => {}
         }
 
 
@@ -4954,6 +4991,51 @@ pub fn upsert_compute_reservation(res: &ComputeReservation) {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let cf = db.cf_handle(CF_COMPUTE_RESERVATIONS).unwrap();
     let _ = db.put_cf(&cf, res.reservation_id.as_bytes(), encode(res));
+}
+
+/// Build the on-chain transaction that anchors a compute reservation. The full record is
+/// carried as JSON in `call_args` and the tx hash binds it (`hash = blake3(call_args)`), so
+/// the block's tx_merkle_root commits to the reservation verbatim and `write_block_batch`
+/// materializes the identical record on every node. Value-neutral (amount 0); the escrow
+/// movement is a separate tx. Carries the minimum fee (anti-spam, paid by the renter).
+pub fn compute_reservation_tx(res: &ComputeReservation) -> crate::ledger::LedgerTx {
+    let body = serde_json::to_string(res).unwrap_or_default();
+    crate::ledger::LedgerTx {
+        hash: format!("0x{}", ego_core::hash_data(body.as_bytes()).to_hex()),
+        from: res.buyer_address.clone(),
+        to: res.provider_address.clone(),
+        amount: 0,
+        memo: Some(format!("compute_reservation:{}", res.reservation_id)),
+        call_args: body,
+        tx_type: "compute_reservation".to_string(),
+        timestamp: res.created_at,
+        status: "Pending".into(),
+        signature: "deal".into(),
+        nonce: 0,
+        fee_uegoc: crate::mempool::MIN_FEE_UEGOC,
+        ..Default::default()
+    }
+}
+
+/// Build the on-chain transaction that anchors a storage deal — see
+/// [`compute_reservation_tx`] for the binding/materialization model.
+pub fn storage_deal_tx(deal: &StorageDeal) -> crate::ledger::LedgerTx {
+    let body = serde_json::to_string(deal).unwrap_or_default();
+    crate::ledger::LedgerTx {
+        hash: format!("0x{}", ego_core::hash_data(body.as_bytes()).to_hex()),
+        from: deal.client_address.clone(),
+        to: deal.provider_address.clone(),
+        amount: 0,
+        memo: Some(format!("storage_deal:{}", deal.deal_id)),
+        call_args: body,
+        tx_type: "storage_deal".to_string(),
+        timestamp: deal.created_at,
+        status: "Pending".into(),
+        signature: "deal".into(),
+        nonce: 0,
+        fee_uegoc: crate::mempool::MIN_FEE_UEGOC,
+        ..Default::default()
+    }
 }
 
 pub fn get_compute_reservation(reservation_id: &str) -> Option<ComputeReservation> {
