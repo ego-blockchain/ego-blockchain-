@@ -645,11 +645,22 @@ async fn try_mine(txs: Vec<LedgerTx>, miner: &str) -> Vec<LedgerTx> {
     let last_fin = crate::p2p::LAST_BLOCK_FINALIZED_TS.load(Ordering::Relaxed);
     let stuck_secs = chrono::Utc::now().timestamp() - last_fin;
 
-    if network_view > 0 && tip_h + 10 < network_view && (stuck_secs < 60 || last_fin == 0) {
-        return txs;
+    // If the network is small, or we're stuck, allow solo mining.
+    // Otherwise, wait for the BFT committee.
+    let is_bootstrap_phase = known_count < min_validators_for_finality();
+    let is_stuck = stuck_secs > 30 && last_fin > 0;
+
+    if !is_bootstrap_phase && !is_stuck {
+        // We are in a multi-validator network that should be making BFT progress.
+        // If we are far behind the network's view, don't mine, just sync.
+        if network_view > 0 && tip_h + 10 < network_view {
+            tracing::debug!("[Mine] Deferring to BFT committee; local tip {} is behind network view {}", tip_h, network_view);
+            return txs;
+        }
     }
 
     let is_alone = known_count <= 1;
+    tracing::info!("[Mine] Attempting solo mine: bootstrap={}, stuck={}, alone={}", is_bootstrap_phase, is_stuck, is_alone);
 
     if !is_alone && !crate::commands::consensus::drs_eligible() {
         tracing::debug!("[Mine] DRS < 0.5 — not eligible to mine");

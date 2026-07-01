@@ -8,6 +8,7 @@ mod ecvrf;
 mod chain_db;
 mod commands;
 mod config;
+mod consensus_host;
 mod email;
 mod error;
 mod l2;
@@ -95,7 +96,9 @@ static INSTANCE_LOCK: once_cell::sync::OnceCell<std::net::TcpListener> =
     once_cell::sync::OnceCell::new();
 
 fn acquire_single_instance_lock() -> bool {
-    let port: u16 = std::env::var("EGO_LOCK_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(47391);
+    let port: u16 = std::env::var("EGO_LOCK_PORT")
+        .ok().and_then(|v| v.parse().ok())
+        .unwrap_or(47391);
     match std::net::TcpListener::bind(format!("127.0.0.1:{}", port)) {
         Ok(l) => {
             let _ = INSTANCE_LOCK.set(l);
@@ -218,63 +221,127 @@ fn main() {
 
     #[cfg(target_os = "windows")]
     {
+        // Keep the machine awake so storage/compute clients are never cut off by an idle
+        // sleep. TWO mechanisms, because one alone is not enough on modern hardware:
+        //   1. SetThreadExecutionState(ES_SYSTEM_REQUIRED): the classic API. Works on
+        //      traditional S3 sleep but is IGNORED by Windows 11 "Modern Standby" (S0).
+        //   2. PowerSetRequest(PowerRequestExecutionRequired): the Modern-Standby-aware
+        //      power request that actually holds a Win11 laptop in the working state.
+        // The display is deliberately allowed to turn off (no ES_DISPLAY_REQUIRED) — a
+        // node behaves like a server: stay running, but don't waste power lighting a screen.
         extern "system" {
-            fn SetThreadExecutionState(esFlags: u32) -> u32;
+            fn SetThreadExecutionState(es_flags: u32) -> u32;
+            fn PowerCreateRequest(context: *const ReasonContext) -> isize;
+            fn PowerSetRequest(power_request: isize, request_type: u32) -> i32;
         }
-        const ES_CONTINUOUS: u32          = 0x80000000;
-        const ES_SYSTEM_REQUIRED: u32     = 0x00000001;
-        const ES_AWAYMODE_REQUIRED: u32   = 0x00000040;
+        #[repr(C)]
+        struct ReasonContext { version: u32, flags: u32, simple_reason_string: *const u16 }
+
+        const ES_CONTINUOUS: u32        = 0x80000000;
+        const ES_SYSTEM_REQUIRED: u32   = 0x00000001;
+        const ES_AWAYMODE_REQUIRED: u32 = 0x00000040;
+        const POWER_REQUEST_CONTEXT_SIMPLE_STRING: u32 = 0x00000001;
+        const POWER_REQUEST_SYSTEM_REQUIRED: u32 = 1;
+        const POWER_REQUEST_EXECUTION_REQUIRED: u32 = 3;
+
         unsafe {
             SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED);
+
+            let reason: Vec<u16> = "Ego node is serving storage and compute\0".encode_utf16().collect();
+            let ctx = ReasonContext {
+                version: 0,
+                flags: POWER_REQUEST_CONTEXT_SIMPLE_STRING,
+                simple_reason_string: reason.as_ptr(),
+            };
+            let h = PowerCreateRequest(&ctx);
+            if h != 0 && h != -1 {
+                PowerSetRequest(h, POWER_REQUEST_SYSTEM_REQUIRED);
+                PowerSetRequest(h, POWER_REQUEST_EXECUTION_REQUIRED);
+                // Hold the request (never cleared/closed) and its reason string for the
+                // whole process lifetime so the wake lock stays active.
+                std::mem::forget(reason);
+            }
         }
-        eprintln!("[Node] Sleep prevention active (Windows)");
+        eprintln!("[Node] Sleep prevention active (Windows: execution-state + power-request)");
+
+        // Re-assert periodically from a long-lived thread: returning from a forced sleep,
+        // a fast-user-switch, or another app toggling power state can clear ES_CONTINUOUS.
+        // Re-setting every 50s means a node that briefly slept goes back to staying awake
+        // on its own, without needing a restart.
+        std::thread::spawn(|| {
+            extern "system" { fn SetThreadExecutionState(es_flags: u32) -> u32; }
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(50));
+                unsafe { SetThreadExecutionState(0x80000000 | 0x00000001 | 0x00000040); }
+            }
+        });
     }
 
     #[cfg(target_os = "macos")]
     {
-        let pid = std::process::id().to_string();
-        match std::process::Command::new("caffeinate")
-            .args(["-di", "-w", &pid])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(_child) => {
-                std::mem::forget(_child);
-                eprintln!("[Node] Sleep prevention active (macOS caffeinate)");
+        // -i prevent idle sleep (works on battery too), -m prevent disk sleep, -s prevent
+        // system sleep (AC only). Display is allowed to turn off (no -d) — server-like.
+        // A watchdog re-launches caffeinate if it ever exits, so the wake lock survives a
+        // forced sleep/wake or the helper being killed.
+        std::thread::spawn(|| loop {
+            let child = std::process::Command::new("caffeinate")
+                .args(["-i", "-m", "-s"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            match child {
+                Ok(mut c) => {
+                    eprintln!("[Node] Sleep prevention active (macOS caffeinate)");
+                    let _ = c.wait(); // blocks until caffeinate exits, then re-launch below
+                }
+                Err(e) => {
+                    eprintln!("[Node] Sleep prevention unavailable: {e}");
+                    return;
+                }
             }
-            Err(e) => eprintln!("[Node] Sleep prevention unavailable: {e}"),
-        }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        });
     }
 
     #[cfg(target_os = "linux")]
     {
-        let result = std::process::Command::new("systemd-inhibit")
-            .args([
-                "--what=sleep:idle:handle-lid-switch",
-                "--who=Ego Desktop",
-                "--why=Node is sharing compute or storage",
-                "--mode=block",
-                "sleep", "infinity",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-
-        match result {
-            Ok(_child) => {
-                std::mem::forget(_child);
-                eprintln!("[Node] Sleep prevention active (Linux systemd-inhibit)");
-            }
-            Err(_) => {
-                let _ = std::process::Command::new("xdg-screensaver")
-                    .args(["reset"])
+        // systemd-inhibit blocks sleep + idle + lid-close for the whole node lifetime. A
+        // watchdog re-launches it if it exits (e.g. killed on resume) so the lock persists.
+        std::thread::spawn(|| {
+            loop {
+                let child = std::process::Command::new("systemd-inhibit")
+                    .args([
+                        "--what=sleep:idle:handle-lid-switch",
+                        "--who=Ego Desktop",
+                        "--why=Node is sharing compute or storage",
+                        "--mode=block",
+                        "sleep", "infinity",
+                    ])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .spawn();
-                eprintln!("[Node] Sleep prevention: systemd-inhibit not available, using xdg-screensaver fallback");
+                match child {
+                    Ok(mut c) => {
+                        eprintln!("[Node] Sleep prevention active (Linux systemd-inhibit)");
+                        let _ = c.wait();
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
+                    Err(_) => {
+                        // No systemd: best-effort screensaver poke loop so at least the
+                        // session's idle timer keeps getting reset.
+                        eprintln!("[Node] Sleep prevention: systemd-inhibit unavailable, using xdg-screensaver fallback");
+                        loop {
+                            let _ = std::process::Command::new("xdg-screensaver")
+                                .args(["reset"])
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .status();
+                            std::thread::sleep(std::time::Duration::from_secs(50));
+                        }
+                    }
+                }
             }
-        }
+        });
     }
 
     if !acquire_single_instance_lock() {
@@ -690,7 +757,10 @@ fn main() {
                 });
             }
 
-            crate::poc::init_session_start();
+            tauri::async_runtime::spawn(async {
+                tokio::task::spawn_blocking(crate::poc::init_session_start)
+                    .await.ok();
+            });
 
             let handle_p2p = app.handle();
             tauri::async_runtime::spawn(async move {

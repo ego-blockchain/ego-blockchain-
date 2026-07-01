@@ -2032,6 +2032,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ego-consensus-core"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "ego-core",
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "ego-core"
 version = "0.1.0"
 dependencies = [

@@ -9,6 +9,8 @@ pub struct Balance {
     pub egoc:      u64,
     pub uegoc:     u64,
     pub formatted: String,
+    pub egusd: u64,
+    pub uegusd: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -30,14 +32,17 @@ pub struct TransactionResponse {
 
 #[tauri::command]
 pub async fn get_balance(_state: State<'_, AppState>) -> Result<Balance, EgoDesktopError> {
-    let ledger  = Ledger::load();
-    let my_addr = ledger.address.clone();
+    let my_addr = tokio::task::spawn_blocking(|| {
+        Ledger::load().address
+    }).await.map_err(|e| EgoDesktopError::WalletError(e.to_string()))?;
 
     if my_addr.is_empty() {
         return Ok(Balance { egoc: 0, uegoc: 0, formatted: "0.00 EGOC".into() });
     }
 
-    let confirmed = crate::chain_db::balance_of(&my_addr);
+    let my_addr_clone = my_addr.clone();
+    let confirmed = tokio::task::spawn_blocking(move || crate::chain_db::balance_of(&my_addr_clone))
+        .await.unwrap_or(0);
 
     let pool = crate::mempool::get_mempool();
     let pending_out: u64 = pool.pending_outflow_for_address(&my_addr);
@@ -61,17 +66,20 @@ pub async fn send_transaction(
     request: SendTransactionRequest,
     state:   State<'_, AppState>,
 ) -> Result<TransactionResponse, EgoDesktopError> {
-    let mut ledger = Ledger::load();
-    let from = ledger.address.clone();
+    let (mut ledger, from) = tokio::task::spawn_blocking(|| {
+        let l = Ledger::load();
+        let f = l.address.clone();
+        (l, f)
+    }).await.map_err(|e| EgoDesktopError::WalletError(e.to_string()))?;
 
     if from.is_empty() {
         return Err(EgoDesktopError::WalletError(
             "Wallet not initialized – call init_wallet first".into(),
         ));
     }
-
-    let mut chain   = load_chain();
-    let balance     = chain.balance_of(&from);
+    let from_for_balance = from.clone();
+    let balance = tokio::task::spawn_blocking(move || crate::chain_db::balance_of(&from_for_balance))
+        .await.unwrap_or(0);
 
     if request.to_address.trim() == from.trim() {
         return Err(EgoDesktopError::InvalidInput("Cannot send to your own address".into()));
@@ -90,8 +98,6 @@ pub async fn send_transaction(
     let ts         = chrono::Utc::now().timestamp();
     let memo_str   = request.memo.as_deref().unwrap_or("");
     const CHAIN_ID: u8 = 1; // testnet
-    let fee_uegoc  = crate::chain_db::get_current_base_fee()
-        .max(crate::mempool::MIN_FEE_UEGOC);
     let sign_bytes = tx_signing_bytes_v2(
         &from, &request.to_address, request.amount, nonce, ts, CHAIN_ID, memo_str,
     );
@@ -112,10 +118,10 @@ pub async fn send_transaction(
         };
 
     let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-    let summary = tx_human_summary(
-        &from, &request.to_address, request.amount, memo_str, CHAIN_ID, nonce, fee_uegoc,
-    );
-
+    let fee_uegoc = tokio::task::spawn_blocking(crate::chain_db::get_current_base_fee)
+        .await
+        .unwrap_or(crate::mempool::MIN_FEE_UEGOC).max(crate::mempool::MIN_FEE_UEGOC);
+    let summary = tx_human_summary(&from, &request.to_address, request.amount, memo_str, CHAIN_ID, nonce, fee_uegoc);
     let total_required = request.amount.saturating_add(fee_uegoc);
     if balance < total_required {
         return Err(EgoDesktopError::InvalidInput(format!(
@@ -154,7 +160,7 @@ pub async fn send_transaction(
     tokio::spawn(async move { crate::p2p::broadcast_pending_tx(gossip_tx).await; });
 
     ledger.nonce = nonce;
-    let _ = ledger.save();
+    tokio::task::spawn_blocking(move || ledger.save()).await.ok();
 
     Ok(TransactionResponse {
         hash:           tx_hash,
