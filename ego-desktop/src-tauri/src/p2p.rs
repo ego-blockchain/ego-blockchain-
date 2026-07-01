@@ -5168,7 +5168,10 @@ async fn build_swarm(
                 ping: ping::Behaviour::new(
                     ping::Config::new()
                         .with_interval(Duration::from_secs(15))
-                        .with_timeout(Duration::from_secs(60)),
+                        // Short timeout so a dead connection (e.g. after a LAN/WiFi change)
+                        // is detected in ~20s and closed → ConnectionClosed → relay/peer
+                        // redial re-establishes connectivity on the new network.
+                        .with_timeout(Duration::from_secs(20)),
                 ),
                 gossipsub: gossipsub_behaviour,
                 kad:       kad_behaviour,
@@ -5827,6 +5830,19 @@ async fn handle_event(
 
         SwarmEvent::Behaviour(EgoBehaviourEvent::Dcutr(event)) => {
             eprintln!("[P2P] DCUtR: {:?}", event);
+        }
+
+        // Ping-based dead-connection detection. libp2p keeps a connection "open" long after
+        // the underlying socket dies (e.g. a LAN/WiFi change) — the idle timeout is 24h and a
+        // relay reservation keeps a stream active, so ConnectionClosed never fires on its own
+        // and the redial logic below never runs → the chain stalls with peers it can't reach.
+        // When ping fails (no response within the 20s timeout), the connection is dead: close
+        // it so ConnectionClosed fires and the relay/peer redial re-establishes connectivity.
+        SwarmEvent::Behaviour(EgoBehaviourEvent::Ping(ping::Event { peer, connection, result })) => {
+            if result.is_err() {
+                eprintln!("[P2P] Ping failed to {} — closing dead connection to force redial", peer);
+                swarm.close_connection(connection);
+            }
         }
 
         SwarmEvent::Behaviour(EgoBehaviourEvent::Gossipsub(

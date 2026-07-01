@@ -1,6 +1,6 @@
 [package]
 name = "ego-desktop"
-version = "0.3.16"
+version = "0.3.17"
 description = "Ego Desktop - Quantum-Safe Blockchain"
 authors = ["Ego Blockchain Team"]
 license = "MIT"
