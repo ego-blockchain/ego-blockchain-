@@ -1,6 +1,6 @@
 {
   "name": "ego-desktop",
-  "version": "0.1.0",
+  "version": "0.3.16",
   "description": "Ego Desktop - Quantum-Safe Blockchain",
   "main": "dist/index.html",
   "scripts": {

@@ -2193,7 +2193,6 @@ dependencies = [
  "criterion 0.7.0",
  "dashmap 5.5.3",
  "ed25519-dalek",
- "ego-consensus",
  "ego-core",
  "flate2",
  "futures",
