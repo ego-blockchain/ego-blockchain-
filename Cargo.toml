@@ -3,6 +3,7 @@ members = [
   "crates/ego-core",
   "crates/ego-p2p",
   "crates/ego-consensus",
+  "crates/ego-consensus-core",
   "crates/ego-rollup",
   "crates/ego-ffi",
   "crates/ego-vm",

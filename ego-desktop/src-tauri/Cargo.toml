@@ -34,7 +34,8 @@ base64 = "0.21"
 bech32 = "0.9"
 
 # Ego Blockchain dependencies
-ego-core        = { path = "../../crates/ego-core" }
+ego-core            = { path = "../../crates/ego-core" }
+ego-consensus-core  = { path = "../../crates/ego-consensus-core" }
 ego-vm          = { path = "../../crates/ego-vm" }
 ego-rollup      = { path = "../../crates/ego-rollup" }
 urego-compiler  = { path = "../../crates/urego-compiler" }
@@ -89,7 +90,7 @@ libp2p = { version = "0.56", features = [
     "tokio", "tcp", "quic", "dns", "noise", "yamux",
     "identify", "dcutr", "autonat", "relay",
     "request-response", "ping", "macros", "ed25519",
-    "gossipsub", "kad",
+    "gossipsub", "kad", "mdns", "upnp",
 ] }
 libp2p-stream = { version = "0.4.0-alpha" }
 tokio-util = { version = "0.7", features = ["compat"] }

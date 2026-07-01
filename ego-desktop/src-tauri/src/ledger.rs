@@ -364,7 +364,7 @@ pub fn load_registry() -> WalletRegistry {
     if !path.exists() {
         return WalletRegistry::default();
     }
-    for attempt in 0..10 {
+        for attempt in 0..10 {
         match fs::read_to_string(&path) {
             Ok(data) => {
                 if data.is_empty() {
@@ -591,10 +591,22 @@ pub struct StoredFile {
     #[serde(default)]
     pub replica_peers: Vec<String>,
 
-    /// Total fee paid by the uploader for this file (uEGOC).
-    /// Split equally among storage providers (master + slaves) as they confirm.
+    /// Total fee prepaid by the uploader for this file (uEGOC), held in escrow and
+    /// streamed per period to the CURRENT proven holders over the deal window
+    /// [stored_at, expiry].
     #[serde(default)]
     pub storage_fee_uegoc: u64,
+
+    /// Cumulative escrow already released to providers (uEGOC). Remaining escrow =
+    /// storage_fee_uegoc - storage_fee_paid_uegoc. Tracked by the master.
+    #[serde(default)]
+    pub storage_fee_paid_uegoc: u64,
+
+    /// Unix ts of the last per-period escrow release (master duty). 0 = never (falls
+    /// back to stored_at). Reset to `now` on promotion so a freshly promoted master
+    /// only pays for the time it actually serves — payment follows the data.
+    #[serde(default)]
+    pub last_storage_payout_ts: i64,
 
     /// "master" = this node is responsible for re-replicating when a slave drops.
     /// "slave"  = this node holds a replica; watches master liveness.
@@ -785,7 +797,7 @@ impl Ledger {
         if !path.exists() {
             return Self::default();
         }
-        for attempt in 0..10 {
+    for attempt in 0..10 {
             match fs::read_to_string(&path) {
                 Ok(data) => {
                     if data.is_empty() {
@@ -1386,6 +1398,20 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
             "system-source tx {} from {} requires block-context protocol validation",
             tx.hash, tx.from
         ));
+    }
+
+    // ── On-chain deal records ────────────────────────────────────────────
+    // A storage_deal / compute_reservation tx carries the full record as JSON in
+    // call_args and is BOUND by its hash (tx.hash = blake3(call_args)) rather than a
+    // signature: the record is materialized deterministically from the committed tx, so
+    // tamper-resistance comes from the hash, re-checked identically at block apply. The
+    // tx moves no value (amount 0); it only anchors the deal terms in the block.
+    if matches!(tx.tx_type.as_str(), "storage_deal" | "compute_reservation") {
+        let bound = format!("0x{}", ego_core::hash_data(tx.call_args.as_bytes()).to_hex());
+        if tx.hash != bound {
+            return Err(format!("{} tx {} body/hash mismatch", tx.tx_type, tx.hash));
+        }
+        return Ok(());
     }
 
     // ── Equivocation proof: fee/nonce/dilithium exempted, Ed25519 required ──
