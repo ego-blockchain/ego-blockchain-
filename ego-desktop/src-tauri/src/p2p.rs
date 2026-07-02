@@ -172,6 +172,7 @@ pub async fn run_power_event_loop() {
         } else {
             SUSPENDING.store(false, std::sync::atomic::Ordering::Relaxed);
             eprintln!("[Power] System resumed — reconnecting and resyncing");
+            bump_payout_floor();
             tokio::spawn(dial_bootstrap_peers());
             tokio::spawn(sync_chain_from_peers());
             let app = APP_HANDLE.get().cloned();
@@ -1487,6 +1488,10 @@ fn porep_evict_peer(prover: &str, manifest_cid: &str) {
         if file.cid == manifest_cid || manifest_cid.is_empty() {
             let before = file.replica_peers.len();
             file.replica_peers.retain(|p| p != prover);
+            // Failed proofs are disqualifying, not a nap: no grace window — the
+            // recruitment gate sees the hole immediately and replaces the peer.
+            file.replica_last_ack.remove(prover);
+            file.replica_grace.remove(prover);
             if file.replica_peers.len() < before {
                 changed = true;
                 eprintln!(
@@ -1496,6 +1501,109 @@ fn porep_evict_peer(prover: &str, manifest_cid: &str) {
                     POREP_MAX_CONSECUTIVE_FAILS
                 );
             }
+        }
+    }
+    if changed {
+        let _ = ledger.save();
+    }
+}
+
+static REJOIN_CHALLENGE_LAST: std::sync::OnceLock<std::sync::Mutex<HashMap<String, i64>>> =
+    std::sync::OnceLock::new();
+const REJOIN_CHALLENGE_MIN_INTERVAL_SECS: i64 = 120;
+
+/// Challenge a grace-window holder that reported back, so it can rejoin the
+/// replica set only by proving it still has the data (zero re-transfer).
+async fn issue_rejoin_challenge(manifest_cid: &str, prover: &str) {
+    {
+        let key = format!("{}:{}", manifest_cid, prover);
+        let now = chrono::Utc::now().timestamp();
+        let mut map = REJOIN_CHALLENGE_LAST
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock().unwrap();
+        let last = map.get(&key).copied().unwrap_or(0);
+        if now - last < REJOIN_CHALLENGE_MIN_INTERVAL_SECS { return; }
+        map.insert(key, now);
+    }
+
+    let my_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
+        .await.unwrap_or_default();
+    if my_addr.is_empty() || my_addr == prover { return; }
+
+    let manifest = match crate::blocks::load_manifest(manifest_cid) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    if manifest.blocks.is_empty() { return; }
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let block_idx = (now_ms as usize) % manifest.blocks.len();
+    let block_cid = manifest.blocks[block_idx].block_cid.clone();
+    if !crate::blocks::have_block(&block_cid) { return; }
+    let enc_block = match crate::blocks::load_block(&block_cid) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    let nonce_input = format!("porep-rejoin:{}:{}:{}", prover, block_cid, now_ms);
+    let nonce_bytes = *blake3::hash(nonce_input.as_bytes()).as_bytes();
+    let nonce_hex   = hex::encode(nonce_bytes);
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&nonce_bytes);
+    hasher.update(&enc_block);
+    let expected_hash = hasher.finalize().to_hex().to_string();
+
+    let challenge_key = format!("{}:{}", block_cid, nonce_hex);
+    outstanding_challenges().insert(challenge_key, OutstandingChallenge {
+        expected_hash,
+        prover: prover.to_string(),
+        issued_at_ms: now_ms,
+        manifest_cid: manifest_cid.to_string(),
+    });
+
+    let challenge = P2PMessage::StorageProofChallenge {
+        manifest_cid: manifest_cid.to_string(),
+        block_cid,
+        nonce: nonce_hex,
+        challenger: my_addr,
+    };
+    if let Ok(data) = serde_json::to_vec(&challenge) {
+        publish_gossip("ego-storage-v1", data).await;
+        eprintln!(
+            "[Replication] Rejoin challenge sent to {} for {} — it re-enters the replica set only on a valid proof",
+            &prover[..prover.len().min(20)],
+            &manifest_cid[..manifest_cid.len().min(16)]
+        );
+    }
+}
+
+/// A prover passed a PoRep challenge: if it was sitting in this file's 24h grace
+/// window, it has proven possession — move it back into the replica set with zero
+/// re-transfer. No-op for ordinary (non-grace) challenge passes.
+fn porep_rejoin_on_pass(prover: &str, manifest_cid: &str) {
+    let mut ledger = crate::ledger::Ledger::load();
+    let now = chrono::Utc::now().timestamp();
+    let mut changed = false;
+    for file in ledger.stored_files.iter_mut() {
+        if file.cid != manifest_cid || file.replication_role != "master" { continue; }
+        if file.replica_grace.remove(prover).is_none() { continue; }
+        changed = true;
+        if file.replica_peers.len() < MIN_REPLICAS && !file.replica_peers.iter().any(|p| p == prover) {
+            file.replica_peers.push(prover.to_string());
+            file.replica_last_ack.insert(prover.to_string(), now);
+            eprintln!(
+                "[Replication] {} proved possession within the 24h grace — rejoined {} as replica ({}/{}), zero bytes re-transferred",
+                &prover[..prover.len().min(20)],
+                &file.cid[..file.cid.len().min(16)],
+                file.replica_peers.len(), MIN_REPLICAS
+            );
+        } else {
+            eprintln!(
+                "[Replication] {} proved possession for {} but the replica set is already full — released from grace",
+                &prover[..prover.len().min(20)],
+                &file.cid[..file.cid.len().min(16)]
+            );
         }
     }
     if changed {
@@ -2425,6 +2533,20 @@ pub enum P2PMessage {
         cid:         String,
         master_addr: String,
         timestamp:   i64,
+        /// When the sender became master for this CID. Used to resolve split-brain:
+        /// the LATER promotion wins (the failover master that actually served while
+        /// the old master was dark), falling back to lowest address on a tie.
+        #[serde(default)]
+        master_since: i64,
+    },
+
+    /// Slave → master: "I'm alive and still hold this CID." Lets the master track
+    /// per-replica liveness, move silent replicas into the 24h rejoin grace window,
+    /// and proof-challenge returning ones instead of re-transferring the data.
+    ReplicaHeartbeatAck {
+        cid:          String,
+        replica_addr: String,
+        timestamp:    i64,
     },
 
     /// Slave → network: "Master {master_addr} has not responded for {MASTER_TIMEOUT_SECS}s.
@@ -4377,6 +4499,16 @@ pub async fn request_file_pinning(cids: Vec<String>) {
 /// How long (seconds) without a heartbeat before a slave declares the master dead.
 const MASTER_TIMEOUT_SECS: i64 = 5 * 60; // 5 minutes
 const MIN_REPLICAS: usize = 2;            // 1 master + 2 slaves
+/// Rejoin window for a dark holder: within it the holder re-proves possession and
+/// rejoins with zero re-transfer; past it, it's evicted and a new replica recruited.
+const REPLICA_GRACE_SECS: i64 = 24 * 3600;
+/// Escrow is never streamed for wall-clock time that predates this process epoch —
+/// a master returning from sleep must not pay (or pay itself) for the dark gap.
+static PAYOUT_FLOOR_TS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub fn bump_payout_floor() {
+    PAYOUT_FLOOR_TS.store(chrono::Utc::now().timestamp(), std::sync::atomic::Ordering::Relaxed);
+}
 const UNDER_REPLICATED_WARN_SECS:     i64 = 3_600;      // 1 hour  → warning + immediate retry
 const UNDER_REPLICATED_CRITICAL_SECS: i64 = 86_400;     // 24 hours → critical alert
 const STORAGE_PAYOUT_INTERVAL_SECS:   i64 = 3_600;      // stream escrow at most hourly
@@ -4412,6 +4544,7 @@ pub async fn check_file_replication() {
         if file.replication_role.is_empty() && has_data {
             file.replication_role = "master".to_string();
             file.master_last_seen = now;
+            file.master_since     = now;
             need_save = true;
         }
 
@@ -4419,6 +4552,46 @@ pub async fn check_file_replication() {
 
             // ── MASTER duties ─────────────────────────────────────────────
             "master" => {
+                // ── Replica liveness → 24h rejoin grace ───────────────────
+                // A replica silent past MASTER_TIMEOUT_SECS stops being paid and
+                // enters the grace window; within 24h it can re-prove possession
+                // and rejoin without re-transfer, after that it's gone for good.
+                let silent: Vec<String> = file.replica_peers.iter()
+                    .filter(|addr| {
+                        let last = file.replica_last_ack.get(*addr).copied().unwrap_or(0);
+                        if last == 0 { return false; }
+                        now - last > MASTER_TIMEOUT_SECS
+                    })
+                    .cloned()
+                    .collect();
+                for addr in &file.replica_peers {
+                    file.replica_last_ack.entry(addr.clone()).or_insert(now);
+                }
+                for addr in silent {
+                    file.replica_peers.retain(|p| p != &addr);
+                    file.replica_last_ack.remove(&addr);
+                    file.replica_grace.insert(addr.clone(), now);
+                    need_save = true;
+                    tracing::warn!(
+                        "Replication: replica {} for {} went dark — entering 24h rejoin grace",
+                        &addr[..20.min(addr.len())],
+                        &file.cid[..16.min(file.cid.len())]
+                    );
+                }
+                let expired: Vec<String> = file.replica_grace.iter()
+                    .filter(|(_, &since)| now - since > REPLICA_GRACE_SECS)
+                    .map(|(a, _)| a.clone())
+                    .collect();
+                for addr in expired {
+                    file.replica_grace.remove(&addr);
+                    need_save = true;
+                    tracing::warn!(
+                        "Replication: {} did not return within the 24h grace for {} — evicted permanently",
+                        &addr[..20.min(addr.len())],
+                        &file.cid[..16.min(file.cid.len())]
+                    );
+                }
+
                 // ── Per-period escrow release ─────────────────────────────
                 // Stream the uploader's prepaid fee to the CURRENT proven holders
                 // (this master + live replica_peers) pro-rata for the elapsed time,
@@ -4429,11 +4602,21 @@ pub async fn check_file_replication() {
                 if file.storage_fee_uegoc > file.storage_fee_paid_uegoc
                     && file.expiry > file.stored_at
                 {
+                    let floor = {
+                        let f = PAYOUT_FLOOR_TS.load(std::sync::atomic::Ordering::Relaxed);
+                        if f == 0 {
+                            PAYOUT_FLOOR_TS.store(now, std::sync::atomic::Ordering::Relaxed);
+                            now
+                        } else {
+                            f
+                        }
+                    };
                     let last = if file.last_storage_payout_ts > 0 {
                         file.last_storage_payout_ts
                     } else {
                         file.stored_at
                     };
+                    let last = last.max(floor);
                     let until = now.min(file.expiry);
                     if until - last >= STORAGE_PAYOUT_INTERVAL_SECS {
                         let duration  = (file.expiry - file.stored_at) as u128;
@@ -4471,9 +4654,10 @@ pub async fn check_file_replication() {
 
                 // Broadcast heartbeat to all known slaves
                 let hb = P2PMessage::ReplicaHeartbeat {
-                    cid:         file.cid.clone(),
-                    master_addr: my_addr.clone(),
-                    timestamp:   now,
+                    cid:          file.cid.clone(),
+                    master_addr:  my_addr.clone(),
+                    timestamp:    now,
+                    master_since: file.master_since,
                 };
                 let peers = tokio::task::spawn_blocking(load_peer_cache)
                     .await.unwrap_or_default();
@@ -4483,7 +4667,17 @@ pub async fn check_file_replication() {
                     }
                 }
 
-                if file.replica_peers.is_empty() {
+                // ── Recruitment gate ──────────────────────────────────────
+                // A slot covered by a holder in its 24h grace does NOT trigger a
+                // replacement (anti-churn: sleeping laptops come back with their
+                // copy intact) — UNLESS redundancy is critical: with zero live
+                // replicas the master is the only copy, and a fresh replica is
+                // recruited immediately regardless of grace.
+                let live    = file.replica_peers.len();
+                let in_grace = file.replica_grace.len();
+                let recruit = live == 0 || live + in_grace < MIN_REPLICAS;
+
+                if live == 0 {
                     if file.under_replicated_since == 0 {
                         file.under_replicated_since = now;
                         need_save = true;
@@ -4491,33 +4685,38 @@ pub async fn check_file_replication() {
                     let under_secs = now - file.under_replicated_since;
                     if under_secs >= UNDER_REPLICATED_CRITICAL_SECS {
                         tracing::error!(
-                            "CRITICAL: {} has 0 replicas for {}h — file at risk of loss",
+                            "CRITICAL: {} has 0 live replicas for {}h — file at risk of loss",
                             &file.cid[..16.min(file.cid.len())],
                             under_secs / 3600
                         );
                     } else if under_secs >= UNDER_REPLICATED_WARN_SECS {
                         tracing::warn!(
-                            "{} has 0 replicas for {}min — requesting replication",
+                            "{} has 0 live replicas for {}min — requesting replication",
                             &file.cid[..16.min(file.cid.len())],
                             under_secs / 60
                         );
                     } else {
-                        tracing::info!("Replication: {} has 0/{} replicas — requesting",
+                        tracing::info!("Replication: {} has 0/{} live replicas — requesting",
                             &file.cid[..16.min(file.cid.len())], MIN_REPLICAS);
                     }
-                    pin_needed.push(file.cid.clone());
-                } else if file.replica_peers.len() < MIN_REPLICAS {
-                    if file.under_replicated_since != 0 {
-                        file.under_replicated_since = 0;
-                        need_save = true;
-                    }
-                    tracing::info!("Replication: {} has {}/{} replicas — requesting more",
-                        &file.cid[..16.min(file.cid.len())],
-                        file.replica_peers.len(), MIN_REPLICAS);
-                    pin_needed.push(file.cid.clone());
                 } else if file.under_replicated_since != 0 {
                     file.under_replicated_since = 0;
                     need_save = true;
+                }
+
+                if recruit {
+                    if live > 0 {
+                        tracing::info!(
+                            "Replication: {} has {}/{} live replicas ({} in grace) — requesting more",
+                            &file.cid[..16.min(file.cid.len())],
+                            live, MIN_REPLICAS, in_grace);
+                    }
+                    pin_needed.push(file.cid.clone());
+                } else if live < MIN_REPLICAS {
+                    tracing::debug!(
+                        "Replication: {} at {}/{} live — hole covered by {} grace holder(s), not recruiting",
+                        &file.cid[..16.min(file.cid.len())],
+                        live, MIN_REPLICAS, in_grace);
                 }
             }
 
@@ -4538,12 +4737,19 @@ pub async fn check_file_replication() {
                     file.replication_role = "master".to_string();
                     file.replica_master   = String::new();
                     file.master_last_seen = now;
+                    file.master_since     = now;
                     // Start the escrow payout clock at promotion: this node only earns for
                     // the data from the moment it takes over serving it, never the dead
                     // master's unserved gap.
                     file.last_storage_payout_ts = now;
-                    // Remove the dead master from replica list
+                    // The dead master keeps its copy on disk: give it the 24h rejoin
+                    // grace instead of dropping it — if it returns and re-proves
+                    // possession it rejoins as a slave with zero re-transfer.
                     file.replica_peers.retain(|p| p != &old_master);
+                    file.replica_last_ack.remove(&old_master);
+                    if !old_master.is_empty() {
+                        file.replica_grace.insert(old_master.clone(), now);
+                    }
                     need_save = true;
 
                     // Broadcast promotion so other slaves know who the new master is
@@ -6237,12 +6443,23 @@ async fn handle_event(
                     }
                 }
             } else if topic == "ego-storage-v1" {
-                if let Ok(P2PMessage::StorageCommit { prover_addr, cid, comm_r, signature, .. }) =
-                    serde_json::from_slice::<P2PMessage>(&message.data)
-                {
-                    if !prover_addr.is_empty() && !cid.is_empty() && !comm_r.is_empty() {
-                        record_peer_commitment(&cid, &prover_addr, &comm_r, &signature);
+                match serde_json::from_slice::<P2PMessage>(&message.data) {
+                    Ok(P2PMessage::StorageCommit { prover_addr, cid, comm_r, signature, .. }) => {
+                        if !prover_addr.is_empty() && !cid.is_empty() && !comm_r.is_empty() {
+                            record_peer_commitment(&cid, &prover_addr, &comm_r, &signature);
+                        }
                     }
+                    // PoRep challenges/responses and replica liveness acks are
+                    // published on this topic — route them to their handlers
+                    // (previously only StorageCommit was parsed here, so gossiped
+                    // proofs never reached handle_incoming).
+                    Ok(msg @ P2PMessage::StorageProofChallenge { .. })
+                    | Ok(msg @ P2PMessage::StorageProofResponse { .. })
+                    | Ok(msg @ P2PMessage::ReplicaHeartbeatAck { .. }) => {
+                        let app2 = app.cloned();
+                        tokio::spawn(async move { handle_incoming(msg, app2.as_ref()).await; });
+                    }
+                    _ => {}
                 }
             } else if topic == "ego-viewchange-v1" {
 
@@ -7067,11 +7284,16 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                     .await.unwrap_or_default();
                 let mut changed = false;
 
+                let now = chrono::Utc::now().timestamp();
                 for f in ledger.stored_files.iter_mut() {
                     if f.cid == cid && !f.replica_peers.contains(&ack_from) {
                         f.replica_peers.push(ack_from.clone());
                         if f.replica_peers.len() > MIN_REPLICAS {
                             f.replica_peers.truncate(MIN_REPLICAS);
+                        }
+                        if f.replica_peers.contains(&ack_from) {
+                            f.replica_last_ack.insert(ack_from.clone(), now);
+                            f.replica_grace.remove(&ack_from);
                         }
                         changed = true;
                         eprintln!("[Replication] {} pinned by {} ({}/{} replicas)",
@@ -7090,44 +7312,99 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
         }
 
         // ── Master → slave heartbeat ──────────────────────────────────────
-        P2PMessage::ReplicaHeartbeat { cid, master_addr, timestamp } => {
+        P2PMessage::ReplicaHeartbeat { cid, master_addr, timestamp, master_since } => {
             let _guard = crate::ledger::TX_MUTEX.lock().await;
             let mut ledger = tokio::task::spawn_blocking(crate::ledger::Ledger::load)
                 .await.unwrap_or_default();
             let my_addr = ledger.address.clone();
-            let mut changed = false;
+            let now = chrono::Utc::now().timestamp();
+            let mut changed  = false;
+            let mut send_ack = false;
             for f in ledger.stored_files.iter_mut() {
                 if f.cid != cid { continue; }
-                if f.cid == cid && f.replication_role == "slave" && f.replica_master == master_addr {
+                let has_data = !f.local_path.is_empty() && !f.local_path.starts_with("sender:");
+                if f.replication_role == "slave" && f.replica_master == master_addr {
                     f.master_last_seen = timestamp;
+                    send_ack = has_data;
+                    changed = true;
+                } else if f.replication_role == "slave"
+                    && f.replica_master != master_addr
+                    && now - f.master_last_seen > MASTER_TIMEOUT_SECS
+                {
+                    // Our recorded master is dark but someone else is actively
+                    // mastering this CID (we slept through the ReplicaPromote) —
+                    // adopt the live master and announce ourselves so it can
+                    // proof-challenge us back in from its grace window.
+                    eprintln!("[Replication] Adopting live master {} for {} (old master {} is dark)",
+                        master_addr, &cid[..16.min(cid.len())], f.replica_master);
+                    f.replica_master   = master_addr.clone();
+                    f.master_last_seen = timestamp;
+                    send_ack = has_data;
                     changed = true;
                 } else if f.replication_role == "master" && master_addr != my_addr {
-                    // Split-brain: two nodes claim master for the same CID. This
-                    // happens when a slave promotes itself while the master is
-                    // briefly offline (its one-shot ReplicaPromote broadcast never
-                    // reaches the offline master), and the old master returns still
-                    // believing it's master — both would run proofs and claim the
-                    // storage reward for the same CID (the "double-reward" bug).
-                    // Resolve deterministically: the lower address stays master,
-                    // the other steps down. Both nodes run the same comparison on
-                    // each other's heartbeats and converge to a single master with
-                    // no oscillation.
-                    if master_addr.as_str() < my_addr.as_str() {
+                    // Split-brain: two nodes claim master for the same CID (a slave
+                    // promoted itself while the real master was dark, and the old
+                    // master returned still believing it's master). The LATER
+                    // promotion wins — that's the failover node that actually kept
+                    // serving the file while the other was gone. Tie (both legacy
+                    // heartbeats without master_since) → lower address, as before.
+                    let step_down = master_since > f.master_since
+                        || (master_since == f.master_since && master_addr.as_str() < my_addr.as_str());
+                    if step_down {
                         f.replication_role = "slave".to_string();
                         f.replica_master   = master_addr.clone();
                         f.master_last_seen = timestamp;
-                        if !f.replica_peers.contains(&master_addr) {
-                            f.replica_peers.push(master_addr.clone());
-                        }
+                        f.replica_last_ack.clear();
+                        f.replica_grace.clear();
+                        f.master_since = 0;
+                        send_ack = has_data;
                         changed = true;
-                        eprintln!("[Replication] Split-brain resolved for {} — stepping down to slave ({} has lower address)",
+                        eprintln!("[Replication] Split-brain resolved for {} — stepping down to slave of {} (their promotion is newer)",
                             &cid[..16.min(cid.len())], master_addr);
                     }
-                    // else: we hold the lower address → we remain master; the
-                    // competing node steps down when it sees OUR heartbeat.
+                    // else: our promotion is newer (or we win the tie) → we remain
+                    // master; the competing node steps down on OUR heartbeat.
                 }
             }
             if changed { tokio::task::spawn_blocking(move || ledger.save()).await.ok(); }
+            if send_ack && !my_addr.is_empty() {
+                let ack = P2PMessage::ReplicaHeartbeatAck {
+                    cid,
+                    replica_addr: my_addr,
+                    timestamp: now,
+                };
+                if let Ok(data) = serde_json::to_vec(&ack) {
+                    tokio::spawn(async move { publish_gossip("ego-storage-v1", data).await; });
+                }
+            }
+        }
+
+        // ── Slave → master liveness ack ───────────────────────────────────
+        P2PMessage::ReplicaHeartbeatAck { cid, replica_addr, .. } => {
+            if replica_addr.is_empty() { return; }
+            let _guard = crate::ledger::TX_MUTEX.lock().await;
+            let mut ledger = tokio::task::spawn_blocking(crate::ledger::Ledger::load)
+                .await.unwrap_or_default();
+            if replica_addr == ledger.address { return; }
+            let now = chrono::Utc::now().timestamp();
+            let mut changed = false;
+            let mut challenge_rejoin = false;
+            for f in ledger.stored_files.iter_mut() {
+                if f.cid != cid || f.replication_role != "master" { continue; }
+                if f.replica_peers.contains(&replica_addr) {
+                    f.replica_last_ack.insert(replica_addr.clone(), now);
+                    changed = true;
+                } else if f.replica_grace.contains_key(&replica_addr) {
+                    // A dark holder is back within its grace window: verify it still
+                    // has the data (PoRep challenge) before letting it rejoin —
+                    // never on its word alone.
+                    challenge_rejoin = true;
+                }
+            }
+            if changed { tokio::task::spawn_blocking(move || ledger.save()).await.ok(); }
+            if challenge_rejoin {
+                issue_rejoin_challenge(&cid, &replica_addr).await;
+            }
         }
 
         // ── Slave promoted itself to master — update our records ──────────
@@ -8241,6 +8518,7 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
                         let boosted  = (current + 5).min(crate::poc::MAX_COVERAGE_SCORE);
                         crate::poc::record_peer_score(&prover, boosted);
                         porep_record_pass(&prover);
+                        porep_rejoin_on_pass(&prover, &expected.manifest_cid);
                     } else {
                         eprintln!(
                             "[PoRep] FAIL: {} returned wrong hash for block {} (expected={:.8}… got={:.8}…) — penalising",
@@ -11263,6 +11541,7 @@ pub async fn run_sync_status_watcher() {
         if woke {
             eprintln!("[SyncStatus] Wake from sleep detected — reconnecting and checking the chain tip");
             SUSPENDING.store(false, Ordering::Relaxed);
+            bump_payout_floor();
             tokio::spawn(dial_bootstrap_peers());
             tokio::spawn(sync_chain_from_peers());
             if state != 2 {

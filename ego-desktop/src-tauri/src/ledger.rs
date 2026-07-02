@@ -648,6 +648,25 @@ pub struct StoredFile {
     /// Used to filter Storage tab so EgoSafe-received files don't appear there.
     #[serde(default)]
     pub from_egosafe: bool,
+
+    /// Master bookkeeping: replica address → unix ts of its last heartbeat ack.
+    /// A replica silent past MASTER_TIMEOUT_SECS moves into `replica_grace`.
+    #[serde(default)]
+    pub replica_last_ack: std::collections::HashMap<String, i64>,
+
+    /// Master bookkeeping: dark holders in their 24h rejoin window (address → dark
+    /// since ts). A returning holder re-proves possession (PoRep challenge) and
+    /// rejoins with zero re-transfer; past the window it is evicted permanently and
+    /// a fresh replica is recruited. While a slot is covered by grace AND at least
+    /// two live copies remain, no replacement is recruited (anti-churn for sleeping
+    /// laptops). If live copies drop below two, recruitment is immediate.
+    #[serde(default)]
+    pub replica_grace: std::collections::HashMap<String, i64>,
+
+    /// Unix ts when this node became master for the file (initial assignment or
+    /// promotion). Split-brain resolution prefers the LATER master_since.
+    #[serde(default)]
+    pub master_since: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
