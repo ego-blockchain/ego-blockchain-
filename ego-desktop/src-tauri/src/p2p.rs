@@ -728,21 +728,82 @@ fn v2_engine_height() -> Option<u64> {
     shadow_host_lock().as_ref().map(|h| h.current_height())
 }
 
+static V2_COMMITTEE_SIG: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
+static V2_PENDING_SIG: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
+static V2_PENDING_SINCE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static V2_RECONFIG_LAST_CHECK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+const V2_RECONFIG_STABILITY_SECS: i64 = 12;
+fn v2_committee_sig() -> std::sync::MutexGuard<'static, String> {
+    V2_COMMITTEE_SIG.get_or_init(|| std::sync::Mutex::new(String::new())).lock().unwrap()
+}
+fn v2_pending_sig() -> std::sync::MutexGuard<'static, String> {
+    V2_PENDING_SIG.get_or_init(|| std::sync::Mutex::new(String::new())).lock().unwrap()
+}
+fn live_committee_sig() -> String {
+    let mut v = live_validators();
+    v.sort();
+    v.join(",")
+}
+
+async fn maybe_reconfigure_committee() {
+    if !consensus_v2_live_enabled() { return; }
+    if shadow_host_lock().is_none() { return; }
+
+    let now = chrono::Utc::now().timestamp();
+    if now - V2_RECONFIG_LAST_CHECK.load(Ordering::Relaxed) < 2 { return; }
+    V2_RECONFIG_LAST_CHECK.store(now, Ordering::Relaxed);
+
+    let cur_sig = live_committee_sig();
+    if cur_sig == *v2_committee_sig() {
+        if !v2_pending_sig().is_empty() { v2_pending_sig().clear(); }
+        return;
+    }
+    {
+        let mut pending = v2_pending_sig();
+        if *pending != cur_sig {
+            *pending = cur_sig.clone();
+            V2_PENDING_SINCE.store(now, Ordering::Relaxed);
+            return;
+        }
+    }
+    if now - V2_PENDING_SINCE.load(Ordering::Relaxed) < V2_RECONFIG_STABILITY_SECS { return; }
+
+    let built = tokio::task::spawn_blocking(build_shadow_consensus_host).await.ok().flatten();
+    if let Some(host) = built {
+        let tip = crate::chain_db::latest_block_info().0 + 1;
+        host.seed_height(tip);
+        let (n, q) = (host.validator_set().len(), host.quorum_size());
+        *shadow_host_lock() = Some(host);
+        v2_future_proposals().clear();
+        v2_future_votes().clear();
+        *v2_committee_sig() = cur_sig;
+        v2_pending_sig().clear();
+        eprintln!("[ConsensusV2/LIVE] committee reconfigured → validators={} quorum={} (seeded h={})", n, q, tip);
+    }
+}
+
 /// Build the stored shadow host once we have a quorum-sized validator set. Returns true
 /// if a host is available. The build (DPAPI seed load) runs off the async executor.
 async fn ensure_shadow_host() -> bool {
     if shadow_host_lock().is_some() { return true; }
     let built = tokio::task::spawn_blocking(build_shadow_consensus_host).await.ok().flatten();
-    let mut guard = shadow_host_lock();
-    if guard.is_none() {
-        if let Some(h) = built {
-            let mode = if consensus_v2_live_enabled() { "LIVE" } else { "shadow" };
-            eprintln!("[ConsensusV2/{}] host built — validators={} quorum={} scheme=Dilithium",
-                mode, h.validator_set().len(), h.quorum_size());
-            *guard = Some(h);
+    let mut built_now = false;
+    {
+        let mut guard = shadow_host_lock();
+        if guard.is_none() {
+            if let Some(h) = built {
+                let mode = if consensus_v2_live_enabled() { "LIVE" } else { "shadow" };
+                eprintln!("[ConsensusV2/{}] host built — validators={} quorum={} scheme=Dilithium",
+                    mode, h.validator_set().len(), h.quorum_size());
+                *guard = Some(h);
+                built_now = true;
+            }
         }
     }
-    guard.is_some()
+    if built_now {
+        *v2_committee_sig() = live_committee_sig();
+    }
+    shadow_host_lock().is_some()
 }
 
 async fn shadow_publish(msg: &P2PMessage) {
@@ -894,6 +955,10 @@ pub async fn shadow_on_view_change(msg: ego_consensus_core::fork_choice::ViewCha
 /// publish, and self-vote.
 pub async fn shadow_v2_tick() {
     if !consensus_v2_active() || !ensure_shadow_host().await { return; }
+
+    // Follow the live validator set: rebuild the committee when a node joins/drops (so a
+    // dropped validator can't block quorum and a rejoiner is re-included).
+    maybe_reconfigure_committee().await;
 
     // If the chain advanced via block-sync while the engine lagged (e.g. we just restarted
     // and caught up from peers), pull the engine forward to the real tip so it proposes and

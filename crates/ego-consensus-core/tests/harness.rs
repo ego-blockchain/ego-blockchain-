@@ -429,6 +429,81 @@ impl Net {
     }
 }
 
+/// Dynamic committee reconfiguration: the live network derives the committee from whoever
+/// is online. A 3-validator committee has quorum 3 (zero fault tolerance), so one node
+/// dropping stalls it forever — until the committee reconfigures to the 2 live nodes
+/// (quorum 2), seeded at the halted tip, which resume in lockstep. This is what
+/// `maybe_reconfigure_committee` does in p2p.rs, asserted as a state-machine property:
+/// MORE nodes never make the chain LESS live than fewer.
+#[test]
+fn committee_shrinks_when_validator_drops_then_resumes() {
+    let scheme = SigScheme::Ed25519;
+    let kps: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
+    let full: Vec<Address> = kps.iter().map(|k| scheme.address(k)).collect();
+
+    let net3 = Net {
+        engines: kps.iter().map(|kp| BftEngine::with_scheme(kp.clone(), full.clone(), scheme)).collect(),
+    };
+    for h in 0..5 {
+        let hash = net3.run_height(&all_reachable(3), 4).expect("3-committee finalize");
+        net3.assert_agreement(&all_reachable(3), hash);
+        for e in &net3.engines { assert_eq!(e.get_current_height(), h + 1); }
+    }
+    let tip = net3.engines[0].get_current_height();
+
+    for _ in 0..20 {
+        assert!(
+            net3.run_height(&[true, true, false], 3).is_none(),
+            "quorum-3 committee must HALT when only 2 of 3 are live (no solo-fork)",
+        );
+    }
+    assert_eq!(net3.engines[0].get_current_height(), tip, "must not advance below quorum");
+
+    let live: Vec<Address> = kps[..2].iter().map(|k| scheme.address(k)).collect();
+    let net2 = Net {
+        engines: kps[..2].iter().map(|kp| BftEngine::with_scheme(kp.clone(), live.clone(), scheme)).collect(),
+    };
+    for e in &net2.engines { e.seed_height(tip); }
+
+    for i in 0..10u64 {
+        let hash = net2.run_height(&all_reachable(2), 6).expect("reconfigured 2-committee resumes");
+        net2.assert_agreement(&all_reachable(2), hash);
+        for e in &net2.engines { assert_eq!(e.get_current_height(), tip + i + 1); }
+    }
+}
+
+/// The rejoin direction: a 2-validator committee grows to 3 when a node comes online and
+/// the set stays stable. The rebuilt 3-committee (seeded at the tip) finalizes with the
+/// larger quorum — a bigger, more fault-tolerant network without losing the chain.
+#[test]
+fn committee_grows_when_validator_joins() {
+    let scheme = SigScheme::Ed25519;
+    let kps: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate()).collect();
+
+    let live2: Vec<Address> = kps[..2].iter().map(|k| scheme.address(k)).collect();
+    let net2 = Net {
+        engines: kps[..2].iter().map(|kp| BftEngine::with_scheme(kp.clone(), live2.clone(), scheme)).collect(),
+    };
+    for h in 0..3 {
+        let hash = net2.run_height(&all_reachable(2), 4).expect("2-committee finalize");
+        net2.assert_agreement(&all_reachable(2), hash);
+        for e in &net2.engines { assert_eq!(e.get_current_height(), h + 1); }
+    }
+    let tip = net2.engines[0].get_current_height();
+
+    let full: Vec<Address> = kps.iter().map(|k| scheme.address(k)).collect();
+    let net3 = Net {
+        engines: kps.iter().map(|kp| BftEngine::with_scheme(kp.clone(), full.clone(), scheme)).collect(),
+    };
+    for e in &net3.engines { e.seed_height(tip); }
+
+    for i in 0..8u64 {
+        let hash = net3.run_height(&all_reachable(3), 6).expect("grown 3-committee finalizes");
+        net3.assert_agreement(&all_reachable(3), hash);
+        for e in &net3.engines { assert_eq!(e.get_current_height(), tip + i + 1); }
+    }
+}
+
 /// Async networks reorder and re-deliver messages. The engine tallies votes in a
 /// per-voter map, so out-of-order and duplicate votes must not change the outcome:
 /// the same single chain finalizes regardless of vote delivery order.
