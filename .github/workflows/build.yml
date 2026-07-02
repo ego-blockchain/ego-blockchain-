@@ -89,7 +89,7 @@ jobs:
   # ── macOS Apple Silicon (aarch64 — M1/M2/M3/M4) ──────────────────────────
   build-macos-arm:
     name: macOS Apple Silicon
-    runs-on: macos-latest
+    runs-on: macos-14
     permissions:
       contents: write
 
@@ -132,11 +132,13 @@ jobs:
 
   # ── macOS Intel (x64 cross-compiled from Apple Silicon) ──────────────────
   # GitHub no longer provisions the free hosted macos-13 (Intel) runner, so that
-  # label queues forever. Build Intel by cross-compiling on macos-latest (Apple
+  # label queues forever. Build Intel by cross-compiling on macos-14 (Apple
   # Silicon) via --target x86_64-apple-darwin; DMG packaging is arch-independent.
+  # macos-14 is pinned (not macos-latest) to avoid newer macOS runner images
+  # whose hdiutil regresses bundle_dmg.sh in headless CI.
   build-macos-intel:
     name: macOS Intel
-    runs-on: macos-latest
+    runs-on: macos-14
     permissions:
       contents: write
 
