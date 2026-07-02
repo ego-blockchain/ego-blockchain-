@@ -53,7 +53,7 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
   }
 
   if (step === 'form') return (
-    <div className="min-h-screen bg-gray-900 flex items-center justify-center p-6">
+    <div className="min-h-full bg-gray-900 flex items-center justify-center p-6">
       <div className="w-full max-w-md bg-gray-800 rounded-2xl shadow-2xl overflow-hidden border border-gray-700">
         <div className="px-8 py-6 border-b border-gray-700 bg-gradient-to-br from-blue-900/40 to-purple-900/40">
           <img src="/ego_logo.png" alt="Ego" className="w-20 h-20 mx-auto mb-3 select-none rounded-full" draggable={false} />
@@ -116,14 +116,14 @@ const RegistrationFlow: React.FC<Props> = ({ address, onComplete }) => {
   );
 
   if (step === 'recovery') return (
-    <div className="min-h-screen bg-gray-900 flex items-center justify-center p-6">
+    <div className="min-h-full bg-gray-900 flex items-center justify-center p-6">
       <div className="w-full max-w-lg bg-gray-800 rounded-2xl shadow-2xl overflow-hidden border border-gray-700">
         <div className="px-8 py-6 border-b border-gray-700 bg-gradient-to-br from-red-900/40 to-orange-900/40">
           <div className="text-5xl text-center mb-3">🔑</div>
           <h1 className="text-xl font-bold text-white text-center">Your Recovery Phrase</h1>
           <p className="text-sm text-gray-400 mt-1 text-center">Step 2 of 2 — Back Up Your Wallet</p>
         </div>
-        <div className="px-8 py-6 space-y-5 max-h-[70vh] overflow-y-auto">
+        <div className="px-8 py-6 space-y-5">
           <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 text-sm text-red-300">
             <strong>⚠️ Critical:</strong> Write these 24 words on paper and store them somewhere safe.
             Anyone with these words can access your wallet — and they're also your only way to reset
