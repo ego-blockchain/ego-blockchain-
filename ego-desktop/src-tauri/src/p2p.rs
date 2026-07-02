@@ -137,6 +137,94 @@ pub fn note_network_height(height: u64) {
     NETWORK_BEST_HEIGHT.fetch_max(height, std::sync::atomic::Ordering::Relaxed);
 }
 
+pub static SUSPENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SUSPEND_TS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+const SUSPEND_GATE_MAX_SECS: i64 = 180;
+static POWER_EVENT_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<bool>> = OnceLock::new();
+
+pub fn notify_power_event(going_to_sleep: bool) {
+    if let Some(tx) = POWER_EVENT_TX.get() {
+        let _ = tx.send(going_to_sleep);
+    }
+}
+
+pub fn proposing_suspended() -> bool {
+    if !SUSPENDING.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let now = chrono::Utc::now().timestamp();
+    if now - SUSPEND_TS.load(std::sync::atomic::Ordering::Relaxed) >= SUSPEND_GATE_MAX_SECS {
+        SUSPENDING.store(false, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
+pub async fn run_power_event_loop() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
+    let _ = POWER_EVENT_TX.set(tx);
+    while let Some(sleeping) = rx.recv().await {
+        if sleeping {
+            SUSPENDING.store(true, std::sync::atomic::Ordering::Relaxed);
+            SUSPEND_TS.store(chrono::Utc::now().timestamp(), std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[Power] System is suspending — pausing proposing and notifying peers");
+            broadcast_validator_leaving().await;
+        } else {
+            SUSPENDING.store(false, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[Power] System resumed — reconnecting and resyncing");
+            tokio::spawn(dial_bootstrap_peers());
+            tokio::spawn(sync_chain_from_peers());
+            let app = APP_HANDLE.get().cloned();
+            tokio::spawn(async move { broadcast_peer_announce(app.as_ref()).await; });
+            touch_proposal_timestamp();
+        }
+    }
+}
+
+async fn broadcast_validator_leaving() {
+    let (my_addr, seed) = match tokio::task::spawn_blocking(|| {
+        (crate::ledger::Ledger::load().address, get_ed25519_seed())
+    }).await {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let Some(seed_32) = seed else { return };
+    if my_addr.is_empty() { return; }
+    let ts = chrono::Utc::now().timestamp();
+    let payload = format!("leaving:{}:{}", my_addr, ts);
+    let signature = {
+        use ed25519_dalek::{Signer, SigningKey};
+        hex::encode(SigningKey::from_bytes(&seed_32).sign(payload.as_bytes()).to_bytes())
+    };
+    let msg = P2PMessage::ValidatorLeaving { address: my_addr, timestamp: ts, signature };
+    if let Ok(data) = serde_json::to_vec(&msg) {
+        publish_gossip("ego-peers-v1", data).await;
+    }
+    for p in load_peer_cache().into_iter().filter(|p| !p.endpoint.is_empty()) {
+        let msg_clone = msg.clone();
+        tokio::spawn(async move { let _ = send_message(&p.endpoint, &msg_clone).await; });
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+}
+
+fn handle_validator_leaving(address: &str, timestamp: i64, signature: &str) {
+    if address.is_empty() { return; }
+    let local = local_validator_mutex().lock().unwrap().clone();
+    if address == local { return; }
+    let now = chrono::Utc::now().timestamp();
+    if (now - timestamp).abs() > 120 { return; }
+    let Some(pk_bytes) = get_peer_ed25519_pubkey(address) else { return };
+    use ed25519_dalek::{Signature as DalekSig, Verifier, VerifyingKey};
+    let Ok(vk) = VerifyingKey::from_bytes(&pk_bytes) else { return };
+    let Ok(sig_bytes) = hex::decode(signature) else { return };
+    let Ok(sig_arr) = <[u8; 64]>::try_from(sig_bytes) else { return };
+    let payload = format!("leaving:{}:{}", address, timestamp);
+    if vk.verify(payload.as_bytes(), &DalekSig::from_bytes(&sig_arr)).is_err() { return; }
+    if validator_last_seen().remove(address).is_some() {
+        eprintln!("[Power] Validator {} announced suspend/shutdown — dropped from the live committee", address);
+    }
+}
+
 static SEED_CACHE: std::sync::RwLock<Option<[u8; 32]>> = std::sync::RwLock::new(None);
 
 pub fn prime_ed25519_seed_cache() {
@@ -968,6 +1056,7 @@ pub async fn shadow_on_view_change(msg: ego_consensus_core::fork_choice::ViewCha
 /// publish, and self-vote.
 pub async fn shadow_v2_tick() {
     if !consensus_v2_active() || !ensure_shadow_host().await { return; }
+    if proposing_suspended() { return; }
 
     // Follow the live validator set: rebuild the committee when a node joins/drops (so a
     // dropped validator can't block quorum and a rejoiner is re-included).
@@ -2382,6 +2471,12 @@ pub enum P2PMessage {
     /// Engine view-change (carries the sender's high-QC for HotStuff safety).
     BftV2ViewChange {
         msg: ego_consensus_core::fork_choice::ViewChangeMsg,
+    },
+
+    ValidatorLeaving {
+        address:   String,
+        timestamp: i64,
+        signature: String,
     },
 
     BlockVote {
@@ -6188,6 +6283,9 @@ async fn handle_event(
                         let app2 = app.cloned();
                         tokio::spawn(async move { handle_incoming(msg, app2.as_ref()).await; });
                     }
+                    Ok(P2PMessage::ValidatorLeaving { address, timestamp, signature }) => {
+                        handle_validator_leaving(&address, timestamp, &signature);
+                    }
                     Ok(P2PMessage::PeerSeedGossip { multiaddrs, known_count }) => {
 
                         let msg_n = PEER_SEED_MSG_COUNT
@@ -7266,6 +7364,10 @@ P2PMessage::ChatMessage { bundle, seq } => {
 
         P2PMessage::TxBroadcast { tx, block } => {
             apply_incoming_tx(tx, block, app).await;
+        }
+
+        P2PMessage::ValidatorLeaving { address, timestamp, signature } => {
+            handle_validator_leaving(&address, timestamp, &signature);
         }
 
         P2PMessage::BlockProposal { block, transactions, proposer, signature, vrf_ticket, view, proposer_pubkey } => {
@@ -11160,6 +11262,7 @@ pub async fn run_sync_status_watcher() {
 
         if woke {
             eprintln!("[SyncStatus] Wake from sleep detected — reconnecting and checking the chain tip");
+            SUSPENDING.store(false, Ordering::Relaxed);
             tokio::spawn(dial_bootstrap_peers());
             tokio::spawn(sync_chain_from_peers());
             if state != 2 {
