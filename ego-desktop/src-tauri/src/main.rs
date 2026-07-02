@@ -112,6 +112,167 @@ fn acquire_single_instance_lock() -> bool {
     }
 }
 
+fn register_suspend_listeners() {
+    #[cfg(target_os = "windows")]
+    {
+        unsafe extern "system" fn power_cb(
+            _context: *const std::ffi::c_void,
+            event: u32,
+            _setting: *const std::ffi::c_void,
+        ) -> u32 {
+            const PBT_APMSUSPEND: u32 = 4;
+            const PBT_APMRESUMESUSPEND: u32 = 7;
+            const PBT_APMRESUMEAUTOMATIC: u32 = 18;
+            match event {
+                PBT_APMSUSPEND => crate::p2p::notify_power_event(true),
+                PBT_APMRESUMESUSPEND | PBT_APMRESUMEAUTOMATIC => crate::p2p::notify_power_event(false),
+                _ => {}
+            }
+            0
+        }
+
+        #[repr(C)]
+        struct DeviceNotifySubscribeParameters {
+            callback: unsafe extern "system" fn(*const std::ffi::c_void, u32, *const std::ffi::c_void) -> u32,
+            context: *const std::ffi::c_void,
+        }
+
+        #[link(name = "powrprof")]
+        extern "system" {
+            fn PowerRegisterSuspendResumeNotification(
+                flags: u32,
+                recipient: *const std::ffi::c_void,
+                registration_handle: *mut *mut std::ffi::c_void,
+            ) -> u32;
+        }
+
+        const DEVICE_NOTIFY_CALLBACK: u32 = 2;
+        let params = Box::leak(Box::new(DeviceNotifySubscribeParameters {
+            callback: power_cb,
+            context: std::ptr::null(),
+        }));
+        let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
+        let rc = unsafe {
+            PowerRegisterSuspendResumeNotification(
+                DEVICE_NOTIFY_CALLBACK,
+                params as *const _ as *const std::ffi::c_void,
+                &mut handle,
+            )
+        };
+        if rc == 0 {
+            eprintln!("[Power] Suspend/resume notifications registered (Windows)");
+        } else {
+            eprintln!("[Power] Suspend notification registration failed ({rc}) — relying on clock-jump detection");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::c_void;
+
+        const K_IO_MESSAGE_CAN_SYSTEM_SLEEP: u32 = 0xE000_0270;
+        const K_IO_MESSAGE_SYSTEM_WILL_SLEEP: u32 = 0xE000_0280;
+        const K_IO_MESSAGE_SYSTEM_HAS_POWERED_ON: u32 = 0xE000_0300;
+
+        static ROOT_PORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+        #[link(name = "IOKit", kind = "framework")]
+        extern "C" {
+            fn IORegisterForSystemPower(
+                refcon: *mut c_void,
+                the_port_ref: *mut *mut c_void,
+                callback: extern "C" fn(*mut c_void, u32, u32, *mut c_void),
+                notifier: *mut u32,
+            ) -> u32;
+            fn IOAllowPowerChange(kernel_port: u32, notification_id: isize) -> i32;
+            fn IONotificationPortGetRunLoopSource(notify: *mut c_void) -> *mut c_void;
+        }
+
+        #[link(name = "CoreFoundation", kind = "framework")]
+        extern "C" {
+            fn CFRunLoopGetCurrent() -> *mut c_void;
+            fn CFRunLoopAddSource(rl: *mut c_void, source: *mut c_void, mode: *const c_void);
+            fn CFRunLoopRun();
+            static kCFRunLoopDefaultMode: *const c_void;
+        }
+
+        extern "C" fn power_cb(_refcon: *mut c_void, _service: u32, message_type: u32, argument: *mut c_void) {
+            let port = ROOT_PORT.load(std::sync::atomic::Ordering::Relaxed);
+            match message_type {
+                K_IO_MESSAGE_SYSTEM_WILL_SLEEP => {
+                    crate::p2p::notify_power_event(true);
+                    unsafe { IOAllowPowerChange(port, argument as isize); }
+                }
+                K_IO_MESSAGE_CAN_SYSTEM_SLEEP => {
+                    unsafe { IOAllowPowerChange(port, argument as isize); }
+                }
+                K_IO_MESSAGE_SYSTEM_HAS_POWERED_ON => {
+                    crate::p2p::notify_power_event(false);
+                }
+                _ => {}
+            }
+        }
+
+        std::thread::spawn(|| unsafe {
+            let mut notify_port: *mut c_void = std::ptr::null_mut();
+            let mut notifier: u32 = 0;
+            let root_port = IORegisterForSystemPower(
+                std::ptr::null_mut(),
+                &mut notify_port,
+                power_cb,
+                &mut notifier,
+            );
+            if root_port == 0 {
+                eprintln!("[Power] IORegisterForSystemPower failed — relying on clock-jump detection");
+                return;
+            }
+            ROOT_PORT.store(root_port, std::sync::atomic::Ordering::Relaxed);
+            let source = IONotificationPortGetRunLoopSource(notify_port);
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
+            eprintln!("[Power] Suspend/resume notifications registered (macOS IOKit)");
+            CFRunLoopRun();
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::thread::spawn(|| loop {
+            let child = std::process::Command::new("dbus-monitor")
+                .args([
+                    "--system",
+                    "type='signal',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'",
+                ])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            match child {
+                Ok(mut c) => {
+                    if let Some(out) = c.stdout.take() {
+                        use std::io::{BufRead, BufReader};
+                        eprintln!("[Power] Suspend/resume notifications registered (Linux logind)");
+                        for line in BufReader::new(out).lines().map_while(Result::ok) {
+                            let l = line.trim();
+                            if l.starts_with("boolean") {
+                                if l.ends_with("true") {
+                                    crate::p2p::notify_power_event(true);
+                                } else if l.ends_with("false") {
+                                    crate::p2p::notify_power_event(false);
+                                }
+                            }
+                        }
+                    }
+                    let _ = c.wait();
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                }
+                Err(_) => {
+                    eprintln!("[Power] dbus-monitor unavailable — relying on clock-jump detection");
+                    return;
+                }
+            }
+        });
+    }
+}
+
 fn headless_main() {
     tracing::info!("Ego full node — P2P + BFT + RPC + Mempool");
     tracing::info!("Starting in headless full-node mode (EGO_HEADLESS=1)");
@@ -169,6 +330,10 @@ fn headless_main() {
 
         tokio::spawn(async {
             crate::p2p::run_sync_status_watcher().await;
+        });
+
+        tokio::spawn(async {
+            crate::p2p::run_power_event_loop().await;
         });
 
         tokio::spawn(async {
@@ -351,6 +516,8 @@ fn main() {
     if !acquire_single_instance_lock() {
         std::process::exit(0);
     }
+
+    register_suspend_listeners();
 
     let quit = CustomMenuItem::new("quit".to_string(), "Quit");
     let hide = CustomMenuItem::new("hide".to_string(), "Hide");
@@ -988,6 +1155,10 @@ fn main() {
 
             tauri::async_runtime::spawn(async move {
                 crate::p2p::run_sync_status_watcher().await;
+            });
+
+            tauri::async_runtime::spawn(async move {
+                crate::p2p::run_power_event_loop().await;
             });
 
             tauri::async_runtime::spawn(async move {
