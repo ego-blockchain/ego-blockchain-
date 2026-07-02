@@ -71,7 +71,7 @@ pub struct ForkChoiceStore {
 
     pub locked_qc: Option<QuorumCertificate>,
 
-    pub view_changes: HashMap<u32, Vec<ViewChangeMsg>>,
+    pub view_changes: HashMap<(u64, u32), Vec<ViewChangeMsg>>,
 
     pub canonical_head: Option<Hash>,
 }
@@ -229,7 +229,7 @@ impl ForkChoiceStore {
             ));
         }
 
-        let msgs = self.view_changes.entry(msg.new_round).or_default();
+        let msgs = self.view_changes.entry((msg.height, msg.new_round)).or_default();
 
         if msgs.iter().any(|m| m.sender == msg.sender) {
             return Ok(None);
@@ -269,8 +269,17 @@ impl ForkChoiceStore {
         Ok(None)
     }
 
-    pub fn prune_view_changes(&mut self, current_round: u32) {
-        self.view_changes.retain(|&r, _| r >= current_round);
+    pub fn prune_view_changes(&mut self, min_height: u64) {
+        self.view_changes.retain(|&(h, _), _| h >= min_height);
+    }
+
+    pub fn highest_view_change_round(&self, height: u64) -> u32 {
+        self.view_changes
+            .keys()
+            .filter(|&&(h, _)| h == height)
+            .map(|&(_, r)| r)
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn prune_blocks(&mut self, keep_from_height: u64) {
