@@ -36,7 +36,9 @@ static PEER_ANNOUNCE_REPLY_LAST: OnceLock<Mutex<HashMap<String, i64>>> = OnceLoc
 const ANNOUNCE_REPLY_COOLDOWN_SECS: i64 = 60;
 
 static SYNC_REPLY_LAST: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
-const SYNC_REPLY_COOLDOWN_MS: i64 = 100;
+const SYNC_REPLY_COOLDOWN_MS: i64 = 1_500;
+const CHAIN_PUSH_COOLDOWN_MS: i64 = 100;
+const SNAPSHOT_SERVE_MIN_LAG: u64 = 16;
 
 static BLOCK_REJECT_LAST: OnceLock<Mutex<HashMap<(u64, String), i64>>> = OnceLock::new();
 const BLOCK_REJECT_LOG_COOLDOWN_SECS: i64 = 30;
@@ -45,7 +47,7 @@ fn chain_push_allowed(endpoint: &str) -> bool {
     let now = Utc::now().timestamp_millis();
     let mut map = PEER_CHAIN_PUSH_LAST.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
     let last = map.entry(endpoint.to_string()).or_insert(0);
-    if now - *last >= SYNC_REPLY_COOLDOWN_MS {
+    if now - *last >= CHAIN_PUSH_COOLDOWN_MS {
         *last = now;
         true
     } else {
@@ -128,6 +130,12 @@ fn record_peer_commitment(cid: &str, prover_addr: &str, comm_r: &str, signature:
 pub static DHT_CMD_TX: OnceLock<mpsc::Sender<DhtCommand>> = OnceLock::new();
 
 pub static APP_HANDLE: OnceLock<tauri::AppHandle<tauri::Wry>> = OnceLock::new();
+
+pub static NETWORK_BEST_HEIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn note_network_height(height: u64) {
+    NETWORK_BEST_HEIGHT.fetch_max(height, std::sync::atomic::Ordering::Relaxed);
+}
 
 static SEED_CACHE: std::sync::RwLock<Option<[u8; 32]>> = std::sync::RwLock::new(None);
 
@@ -768,6 +776,10 @@ async fn maybe_reconfigure_committee() {
     }
     if now - V2_PENDING_SINCE.load(Ordering::Relaxed) < V2_RECONFIG_STABILITY_SECS { return; }
 
+    if live_validators().len() < crate::mempool::MIN_VALIDATORS_FOR_FINALITY {
+        return;
+    }
+
     let built = tokio::task::spawn_blocking(build_shadow_consensus_host).await.ok().flatten();
     if let Some(host) = built {
         let tip = crate::chain_db::latest_block_info().0 + 1;
@@ -820,6 +832,7 @@ pub async fn shadow_on_proposal(
     txs: Vec<LedgerTx>,
 ) {
     if !consensus_v2_active() { return; }
+    note_network_height(header.height);
 
     // Route by height. A proposal can arrive before we finalize its parent (gossip race):
     // buffer it and replay once the engine reaches that height, rather than dropping it.
@@ -1813,6 +1826,29 @@ pub fn register_known_validator(address: &str) {
     }
     crate::chain_db::persist_known_validator(address);
     crate::poc::seed_peer_score_from_stake(address);
+}
+
+pub fn committee_admission_open() -> bool {
+    known_validators().len() < crate::mempool::MIN_VALIDATORS_FOR_FINALITY
+        || !crate::chain_db::chain_has_graduated_sticky(64)
+}
+
+pub fn register_announced_validator(address: &str) {
+    if address.is_empty() { return; }
+    if committee_admission_open() {
+        register_known_validator(address);
+        return;
+    }
+    if known_validators().contains(address) {
+        if live_validators().len() < crate::mempool::MIN_VALIDATORS_FOR_FINALITY {
+            register_known_validator(address);
+        }
+        return;
+    }
+    tracing::debug!(
+        "Announce from {} noted — joins the committee once it votes or proposes at our tip",
+        address
+    );
 }
 
 static LOCAL_VALIDATOR_ADDR: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
@@ -3717,15 +3753,31 @@ pub async fn broadcast_pending_tx(tx: LedgerTx) {
 
 pub async fn sync_chain_from_peers() {
     static LAST_SYNC_REQ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    static LAST_FROM_HEIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    static STUCK_ROUNDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let now = chrono::Utc::now().timestamp_millis();
     let last = LAST_SYNC_REQ.load(std::sync::atomic::Ordering::Relaxed);
-    if now - last < 100 { return; } // Prevent self-DDoS (max 10 sync requests per 1s)
+    if now - last < 2_000 { return; }
     LAST_SYNC_REQ.store(now, std::sync::atomic::Ordering::Relaxed);
 
     let my_endpoint = get_public_endpoint().await;
     let my_height = tokio::task::spawn_blocking(|| crate::chain_db::latest_block_info().0)
         .await.unwrap_or(0);
     let from_height = my_height.saturating_sub(1);
+
+    if LAST_FROM_HEIGHT.swap(from_height, std::sync::atomic::Ordering::Relaxed) == from_height {
+        let stuck = STUCK_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if stuck >= 5 && stuck % 5 == 0 {
+            tracing::warn!(
+                "[Sync] Block sync stuck at height {} for {} rounds — falling back to state snapshot",
+                my_height, stuck
+            );
+            request_snapshot_from_peers(my_height).await;
+        }
+    } else {
+        STUCK_ROUNDS.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
     let msg = P2PMessage::ChainSyncRequest { requester_endpoint: my_endpoint.clone(), from_height };
 
     // Broadcast request over gossip to reach NAT-traversing peers
@@ -5996,6 +6048,7 @@ async fn handle_event(
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
                     learn_voter_pubkey(&proposer, &proposer_pubkey);
+                    note_network_height(block.height);
                     // Only count validators building on our chain.
                     // A stranger on a different fork has a prev_hash we don't know.
                     let our_tip = crate::chain_db::latest_block_info().0;
@@ -6018,6 +6071,7 @@ async fn handle_event(
                     // their address) so signature verification doesn't depend on the
                     // announce having arrived first.
                     learn_voter_pubkey(&voter, &voter_pubkey);
+                    note_network_height(height);
                     // Only register voter if they're voting on a block on our chain.
                     let our_height = crate::chain_db::latest_block_info().0;
                     let vote_on_our_chain = height == our_height + 1
@@ -6064,7 +6118,7 @@ async fn handle_event(
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
                     let local_tip = crate::chain_db::latest_block_info().0;
-                    if local_tip > have_height + crate::chain_db::SNAPSHOT_BLOCK_WINDOW as u64
+                    if local_tip > have_height + SNAPSHOT_SERVE_MIN_LAG
                         && !requester_endpoint.is_empty()
                         && sync_reply_allowed(&requester_endpoint)
                     {
@@ -7075,7 +7129,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
             if identity_verified {
                 register_validator_pubkey(&address, &dilithium_pubkey);
                 if !vrf_pubkey.is_empty() { record_peer_ed25519(&address, &vrf_pubkey); }
-                register_known_validator(&address);
+                register_announced_validator(&address);
             } else if staked_amount > 0 || coverage_score > 0 || !dilithium_pubkey.is_empty() || !vrf_pubkey.is_empty() {
                 tracing::warn!(
                     "PeerAnnounce from {} FAILED identity verification — not registering as validator (genesis_match={}, has_dil={}, has_vrf={})",
@@ -7216,13 +7270,26 @@ P2PMessage::ChatMessage { bundle, seq } => {
 
         P2PMessage::BlockProposal { block, transactions, proposer, signature, vrf_ticket, view, proposer_pubkey } => {
             learn_voter_pubkey(&proposer, &proposer_pubkey);
-            register_known_validator(&proposer);
+            note_network_height(block.height);
+            let our_tip = crate::chain_db::latest_block_info().0;
+            let prev_known = block.height <= 1
+                || block.height == our_tip + 1
+                || crate::chain_db::get_block_hash_at(block.height.saturating_sub(1))
+                    .map(|h| h == block.prev_hash)
+                    .unwrap_or(false);
+            if prev_known { register_known_validator(&proposer); }
             handle_block_proposal(block, transactions, proposer, signature, vrf_ticket, view, app).await;
         }
 
         P2PMessage::BlockVote { block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, voter_pubkey } => {
             learn_voter_pubkey(&voter, &voter_pubkey);
-            register_known_validator(&voter);
+            note_network_height(height);
+            let our_height = crate::chain_db::latest_block_info().0;
+            let vote_on_our_chain = height == our_height + 1
+                || crate::chain_db::get_block_hash_at(height.saturating_sub(1))
+                    .map(|h| h == prev_hash)
+                    .unwrap_or(false);
+            if vote_on_our_chain { register_known_validator(&voter); }
             handle_block_vote(block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, app.cloned()).await;
         }
 
@@ -7241,7 +7308,7 @@ P2PMessage::ChatMessage { bundle, seq } => {
 
 
         P2PMessage::ChainSyncRequest { requester_endpoint, from_height } => {
-            if !requester_endpoint.is_empty() {
+            if !requester_endpoint.is_empty() && sync_reply_allowed(&requester_endpoint) {
                 tokio::spawn(async move {
                     let (blocks, transactions) = tokio::task::spawn_blocking(move || {
                     let start = from_height.max(1);
@@ -7263,7 +7330,7 @@ P2PMessage::ChatMessage { bundle, seq } => {
 
         P2PMessage::SnapshotRequest { requester_endpoint, have_height } => {
             let local_tip = crate::chain_db::latest_block_info().0;
-            if local_tip > have_height + crate::chain_db::SNAPSHOT_BLOCK_WINDOW as u64
+            if local_tip > have_height + SNAPSHOT_SERVE_MIN_LAG
                 && !requester_endpoint.is_empty()
                 && sync_reply_allowed(&requester_endpoint)
             {
@@ -8828,6 +8895,9 @@ async fn merge_remote_chain_inner(
     blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: Option<&tauri::AppHandle<tauri::Wry>>,
     trusted: bool,
 ) {
+    if let Some(max_h) = blocks.iter().map(|b| b.height).max() {
+        note_network_height(max_h);
+    }
     let received_full_chunk = blocks.len() >= 500;
 
     let (any_new, peer_ahead) = tokio::task::spawn_blocking(move || {
@@ -8879,7 +8949,7 @@ async fn merge_remote_chain_inner(
 
     if peer_ahead || received_full_chunk {
         tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
             sync_chain_from_peers().await;
         });
     }
@@ -10007,7 +10077,7 @@ pub fn touch_proposal_timestamp() {
 }
 
 async fn handle_view_change_msg(view: u64, voter: String) {
-    register_known_validator(&voter);
+    register_announced_validator(&voter);
     if !known_validators().contains(&voter) { return; }
     let threshold = bft_threshold().max(1);
 
@@ -11051,6 +11121,110 @@ pub async fn run_solo_liveness_watchdog() {
                  holding for a quorum",
                 stalled_for, h
             );
+        }
+    }
+}
+
+fn emit_sync_status(state: &str, local: u64, target: u64, after_sleep: bool) {
+    if let Some(h) = APP_HANDLE.get() {
+        let _ = h.emit_all("ego://sync-status", serde_json::json!({
+            "state": state,
+            "local": local,
+            "target": target,
+            "after_sleep": after_sleep,
+        }));
+    }
+}
+
+pub async fn run_sync_status_watcher() {
+    const LAG_ENTER: u64 = 8;
+    const LAG_EXIT: u64 = 2;
+    const SLEEP_GAP_SECS: i64 = 30;
+    const CHECKING_GRACE_SECS: i64 = 20;
+
+    let mut last_tick = chrono::Utc::now().timestamp();
+    let mut state = 0u8;
+    let mut checking_since = 0i64;
+    let mut after_sleep = false;
+    let mut last_progress_emit = 0i64;
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let now = chrono::Utc::now().timestamp();
+        let woke = now - last_tick > SLEEP_GAP_SECS;
+        last_tick = now;
+
+        let local = crate::chain_db::latest_block_info().0;
+        let best = NETWORK_BEST_HEIGHT.load(Ordering::Relaxed).max(local);
+        let behind = best.saturating_sub(local);
+
+        if woke {
+            eprintln!("[SyncStatus] Wake from sleep detected — reconnecting and checking the chain tip");
+            tokio::spawn(dial_bootstrap_peers());
+            tokio::spawn(sync_chain_from_peers());
+            if state != 2 {
+                state = 1;
+                checking_since = now;
+                after_sleep = true;
+                emit_sync_status("checking", local, best, true);
+            }
+            continue;
+        }
+
+        match state {
+            0 => {
+                if behind >= LAG_ENTER {
+                    state = 2;
+                    after_sleep = false;
+                    last_progress_emit = now;
+                    eprintln!("[SyncStatus] {} blocks behind the network — catching up", behind);
+                    emit_sync_status("catching_up", local, best, false);
+                    if let Some(h) = APP_HANDLE.get() {
+                        crate::commands::notifications::notify(
+                            h,
+                            "Catching up with the network",
+                            "Your node fell behind and is syncing blocks. Block creation resumes automatically once caught up.",
+                        );
+                    }
+                }
+            }
+            1 => {
+                if behind > LAG_EXIT {
+                    state = 2;
+                    last_progress_emit = now;
+                    eprintln!("[SyncStatus] {} blocks behind after wake — catching up", behind);
+                    emit_sync_status("catching_up", local, best, after_sleep);
+                    if let Some(h) = APP_HANDLE.get() {
+                        crate::commands::notifications::notify(
+                            h,
+                            "Catching up after sleep",
+                            "Your node is syncing the blocks it missed. Block creation resumes automatically once caught up.",
+                        );
+                    }
+                } else if now - checking_since >= CHECKING_GRACE_SECS {
+                    state = 0;
+                    after_sleep = false;
+                    emit_sync_status("synced", local, best, false);
+                }
+            }
+            _ => {
+                if behind <= LAG_EXIT {
+                    state = 0;
+                    after_sleep = false;
+                    eprintln!("[SyncStatus] Caught up to the network at height {}", local);
+                    emit_sync_status("synced", local, best, false);
+                    if let Some(h) = APP_HANDLE.get() {
+                        crate::commands::notifications::notify(
+                            h,
+                            "Back in sync",
+                            "Your node caught up and is creating blocks again.",
+                        );
+                    }
+                } else if now - last_progress_emit >= 2 {
+                    last_progress_emit = now;
+                    emit_sync_status("catching_up", local, best, after_sleep);
+                }
+            }
         }
     }
 }

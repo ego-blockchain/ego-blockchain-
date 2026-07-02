@@ -22,6 +22,7 @@ import GovernancePage from './pages/GovernancePage';
 import HostingPage from './pages/HostingPage';
 import ComputePage from './pages/ComputePage';
 import RegistrationFlow from './components/RegistrationFlow';
+import SyncBanner from './components/SyncBanner';
 import { GlobalLockScreen } from './components/GlobalLockScreen';
 
 type Theme = 'dark' | 'light';
@@ -355,6 +356,7 @@ function App() {
         <GlobalLockScreen>
           <Router>
             <div data-theme={theme} className="App min-h-screen bg-gray-900 text-white">
+              <SyncBanner />
               <Routes>
                 <Route path="/welcome" element={<WelcomeScreen />} />
                 <Route path="/" element={<Layout />}>

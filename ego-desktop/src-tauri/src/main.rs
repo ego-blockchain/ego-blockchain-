@@ -168,6 +168,10 @@ fn headless_main() {
         });
 
         tokio::spawn(async {
+            crate::p2p::run_sync_status_watcher().await;
+        });
+
+        tokio::spawn(async {
             crate::p2p::run_porep_challenge_loop().await;
         });
 
@@ -980,6 +984,10 @@ fn main() {
 
             tauri::async_runtime::spawn(async move {
                 crate::p2p::run_solo_liveness_watchdog().await;
+            });
+
+            tauri::async_runtime::spawn(async move {
+                crate::p2p::run_sync_status_watcher().await;
             });
 
             tauri::async_runtime::spawn(async move {
