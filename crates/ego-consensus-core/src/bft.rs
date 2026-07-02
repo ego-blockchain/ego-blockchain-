@@ -507,7 +507,7 @@ impl BftEngine {
             fc.update_locked_qc(qc.clone());
 
             fc.prune_blocks(header.height.saturating_sub(64));
-            fc.prune_view_changes(0);
+            fc.prune_view_changes(header.height + 1);
         }
 
         *self.current_height.write().unwrap() = new_height;
@@ -521,16 +521,23 @@ impl BftEngine {
         let (new_round, height, epoch, high_qc) = {
             let s = self.current_round.read().unwrap();
             let fc = self.fork_choice.read().unwrap();
-            (s.round + 1, s.height, s.epoch, fc.high_qc.clone())
+            let joined = (s.round + 1).max(fc.highest_view_change_round(s.height));
+            (joined, s.height, s.epoch, fc.high_qc.clone())
         };
         let msg = ViewChangeMsg::new(new_round, height, epoch, high_qc, &self.keypair, self.scheme)?;
-        warn!("⏱️  View change triggered: round {} → {}", new_round - 1, new_round);
+        warn!("⏱️  View change triggered: round {} → {}", new_round.saturating_sub(1), new_round);
         Ok(msg)
     }
 
     pub fn receive_view_change(&self, msg: ViewChangeMsg) -> PoCResult<Option<u32>> {
         let quorum = self.quorum_size();
         let new_round = msg.new_round;
+        {
+            let s = self.current_round.read().unwrap();
+            if msg.height != s.height || new_round <= s.round {
+                return Ok(None);
+            }
+        }
         let result = self.fork_choice.write().unwrap().add_view_change(msg, quorum)?;
 
         if let Some(best_high_qc) = result {
