@@ -183,11 +183,22 @@ pub fn load_seed() -> Result<Option<Vec<u8>>, String> {
             }
 
             if bytes.len() != 32 {
-                // Keychain returned empty or corrupted data (common when app signature changes
-                // between builds, or macOS returns "" for the password).
+                // Keychain returned something that isn't a 32-byte seed.
                 // Do NOT delete the sentinel — that would cause a brand-new wallet to be
                 // silently generated on next launch, losing the user's identity.
-                // Instead, surface a clear error so the user can recover manually.
+                if libp2p::identity::Keypair::from_protobuf_encoding(&bytes).is_ok() {
+                    // The pre-fix os_protect wrote the node's P2P identity into the
+                    // wallet-seed Keychain slot, overwriting the seed (the
+                    // "invalid seed data (68 bytes)" bug). The seed itself is not
+                    // recoverable from this device.
+                    return Err(
+                        "A bug in an earlier version overwrote the wallet seed in your macOS \
+                         Keychain with the node's P2P identity (this version fixes the cause).\n\n\
+                         To recover your wallet: open Keychain Access.app, search for \
+                         'ego-desktop', delete the 'wallet-seed' entry, restart Ego Desktop \
+                         and re-import your 24-word recovery phrase.".to_string()
+                    );
+                }
                 return Err(format!(
                     "macOS Keychain returned invalid seed data ({} bytes). \
                      Your wallet seed is still protected in Keychain but could not be read.\n\n\
