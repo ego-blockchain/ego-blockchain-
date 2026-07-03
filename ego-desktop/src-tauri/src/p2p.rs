@@ -4842,16 +4842,17 @@ pub fn upsert_peer_cache(entry: PeerEntry) {
 fn load_or_create_identity() -> libp2p::identity::Keypair {
     let path = base_data_dir().join("p2p_identity.bin");
     if let Ok(raw) = std::fs::read(&path) {
-        // Decrypt with DPAPI (no-op on non-Windows). Handles both legacy
-        // plaintext protobuf and the new DPAPI-protected format.
+        // os_unprotect handles DPAPI blobs (Windows), legacy keyring sentinels
+        // (macOS/Linux migration) and plain protobuf alike.
         let bytes = crate::utils::os_unprotect(&raw);
         if let Ok(kp) = libp2p::identity::Keypair::from_protobuf_encoding(&bytes) {
-            // Re-save with DPAPI protection if it was stored as plaintext.
-            if raw == bytes {
-                if let Ok(pb) = kp.to_protobuf_encoding() {
-                    let protected = crate::utils::os_protect(&pb);
-                    let _ = crate::utils::atomic_write(&path, &protected);
-                }
+            // Migrate: if the file held a sentinel (the old macOS/Linux path that
+            // hijacked the wallet-seed Keychain slot) or plaintext needing DPAPI,
+            // re-save in the current on-disk format and stop depending on the
+            // shared Keychain item.
+            let desired = crate::utils::os_protect(&bytes);
+            if raw != desired {
+                let _ = crate::utils::atomic_write(&path, &desired);
             }
             return kp;
         }

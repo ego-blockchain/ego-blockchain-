@@ -8,13 +8,11 @@ pub fn os_protect(data: &[u8]) -> Vec<u8> {
     }
     #[cfg(not(windows))]
     {
-        use base64::Engine as _;
-        if let Ok(entry) = keyring::Entry::new("ego-desktop", "wallet-seed") {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(data);
-            if entry.set_password(&b64).is_ok() {
-                return b"ego-keyring-protected".to_vec();
-            }
-        }
+        // NEVER write to the Keychain here. This function is called with arbitrary
+        // blobs (e.g. the libp2p identity), and the old implementation stored them
+        // all into the single "wallet-seed" Keychain item — overwriting the user's
+        // wallet seed (the "invalid seed data (68 bytes)" data-loss bug on macOS).
+        // The wallet seed has its own dedicated writer in ledger::save_seed.
         data.to_vec()
     }
 }
