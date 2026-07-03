@@ -1310,6 +1310,16 @@ pub fn is_protocol_system_tx(tx: &LedgerTx) -> bool {
     if tx.tx_type == "faucet" && tx.from == crate::chain_db::NODE_POOL_ADDR {
         return true;
     }
+    // Escrow releases: once the escrow-validation rule is active, these txs are
+    // accepted structurally here and their REAL validation is the block-context
+    // consensus rule (validate_escrow_release_tx) — deal membership, deposit cap,
+    // provider pro-rata. Inactive rule keeps the legacy behavior (dropped).
+    if crate::chain_db::is_escrow_source(&tx.from)
+        && (tx.signature.ends_with("_escrow_system") || tx.signature == "provider")
+        && crate::chain_db::escrow_rule_enabled_at_tip()
+    {
+        return true;
+    }
     tx.from == crate::chain_db::NODE_POOL_ADDR
         && tx.signature == "coinbase"
         && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward")
