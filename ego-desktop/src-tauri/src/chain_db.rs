@@ -1337,6 +1337,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             }
         }
     }
+    record_escrow_releases(db, &confirmed_txs);
     true
 }
 
@@ -2976,6 +2977,13 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
     }
     if !verify_block_hash(block, txs) {
         return Err("block hash/merkle verification failed".into());
+    }
+    if escrow_rule_active(block.height) {
+        for tx in txs {
+            if is_escrow_source(&tx.from) {
+                validate_escrow_release_tx(tx, block.timestamp)?;
+            }
+        }
     }
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let mut parent_vote_count: u32 = 0;
@@ -4817,6 +4825,139 @@ pub struct ComputeJob {
 /// Move EGOC between two addresses directly in the balance CF.
 /// Used for protocol-level escrow operations (compute, future contracts).
 /// Does NOT create a mempool TX — call before creating the audit TX.
+pub const FEATURE_ESCROW_VALIDATION: &str = "escrow_validation";
+
+/// Consensus-validated escrow releases. Activated by governance feature vote or
+/// the EGO_ESCROW_RULE_HEIGHT env (blocks at/above that height enforce the rule).
+/// Inactive by default so existing chains don't fork; ALL validators must
+/// activate together.
+pub fn escrow_rule_active(block_height: u64) -> bool {
+    if let Ok(v) = std::env::var("EGO_ESCROW_RULE_HEIGHT") {
+        if let Ok(h) = v.parse::<u64>() {
+            return block_height >= h;
+        }
+    }
+    is_feature_enabled(FEATURE_ESCROW_VALIDATION)
+}
+
+pub fn escrow_rule_enabled_at_tip() -> bool {
+    escrow_rule_active(local_chain_height().saturating_add(1))
+}
+
+pub fn is_escrow_source(addr: &str) -> bool {
+    addr == RESERVATION_ESCROW_ADDR
+        || addr == COMPUTE_ESCROW_ADDR
+        || addr == CLUSTER_ESCROW_ADDR
+        || addr == STORAGE_ESCROW_ADDR
+        || addr.starts_with("egot1storagefees")
+}
+
+fn escrow_released_key(deal_id: &str, recipient: &str) -> Vec<u8> {
+    format!("escrow_rel:{}:{}", deal_id, recipient).into_bytes()
+}
+
+pub fn escrow_released_so_far(deal_id: &str, recipient: &str) -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf) = db.cf_handle(CF_META) else { return 0 };
+    db.get_cf(cf, escrow_released_key(deal_id, recipient))
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
+}
+
+fn escrow_deal_id_from_memo(memo: &Option<String>) -> Option<(String, String)> {
+    let m = memo.as_deref().unwrap_or("");
+    let (action, deal_id) = m.split_once(':')?;
+    if action.is_empty() || deal_id.is_empty() { return None; }
+    Some((action.to_string(), deal_id.to_string()))
+}
+
+/// Record confirmed escrow releases in the cumulative per-deal/per-recipient
+/// index. Runs inside the block-apply path (db lock already held) so every
+/// validator derives the same accounting from the same committed blocks.
+fn record_escrow_releases(db: &DB, txs: &[&crate::ledger::LedgerTx]) {
+    let mut updates: Vec<(Vec<u8>, u64)> = Vec::new();
+    for tx in txs {
+        if !is_escrow_source(&tx.from) || tx.amount == 0 { continue; }
+        let Some((_, deal_id)) = escrow_deal_id_from_memo(&tx.memo) else { continue };
+        updates.push((escrow_released_key(&deal_id, &tx.to), tx.amount));
+        updates.push((escrow_released_key(&deal_id, "*"), tx.amount));
+    }
+    if updates.is_empty() { return; }
+    let Some(cf) = db.cf_handle(CF_META) else { return };
+    let mut batch = rocksdb::WriteBatch::default();
+    for (key, amount) in updates {
+        let cur = db.get_cf(cf, &key).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+        batch.put_cf(cf, &key, u64_le(cur.saturating_add(amount)));
+    }
+    let _ = db.write(batch);
+}
+
+/// Consensus rule for escrow-source transactions: every validator re-derives the
+/// entitlement from the on-chain deal record instead of trusting the sender.
+/// - recipient must be a party to the deal (buyer/client or provider)
+/// - cumulative releases can never exceed the deal's total deposit
+/// - the provider's cumulative take can never exceed the pro-rata share of the
+///   deal window elapsed at the block's timestamp (+ its own collateral back)
+pub fn validate_escrow_release_tx(tx: &crate::ledger::LedgerTx, block_time: i64) -> Result<(), String> {
+    if tx.amount == 0 {
+        return Ok(());
+    }
+    let Some((_action, deal_id)) = escrow_deal_id_from_memo(&tx.memo) else {
+        return Err(format!("escrow tx {} missing action:deal_id memo", tx.hash));
+    };
+
+    let prorata = |total: u64, start: i64, end: i64| -> u64 {
+        if end <= start { return total; }
+        let dur = (end - start) as u128;
+        let elapsed = (block_time - start).clamp(0, end - start) as u128;
+        (total as u128 * elapsed / dur) as u64
+    };
+
+    let (buyer, provider, total_earnable, collateral, start, end) =
+        if tx.from == RESERVATION_ESCROW_ADDR {
+            let Some(r) = get_compute_reservation(&deal_id) else {
+                return Err(format!("escrow tx {} references unknown reservation {}", tx.hash, deal_id));
+            };
+            let start = r.started_at.unwrap_or(r.created_at);
+            (r.buyer_address, r.provider_address, r.total_cost_uegoc, r.collateral_uegoc, start, r.expires_at)
+        } else if tx.from == STORAGE_ESCROW_ADDR {
+            let Some(d) = get_storage_deal(&deal_id) else {
+                return Err(format!("escrow tx {} references unknown storage deal {}", tx.hash, deal_id));
+            };
+            (d.client_address, d.provider_address, d.total_cost_uegoc, 0, d.created_at, d.expires_at)
+        } else {
+            return Ok(());
+        };
+
+    if tx.to != buyer && tx.to != provider {
+        return Err(format!(
+            "escrow tx {} pays {} who is not a party to deal {}",
+            tx.hash, tx.to, deal_id
+        ));
+    }
+
+    let deposit = total_earnable.saturating_add(collateral);
+    let released_all = escrow_released_so_far(&deal_id, "*");
+    if released_all.saturating_add(tx.amount) > deposit {
+        return Err(format!(
+            "escrow tx {} over-releases deal {}: {} + {} > deposit {}",
+            tx.hash, deal_id, released_all, tx.amount, deposit
+        ));
+    }
+
+    if tx.to == provider && provider != buyer {
+        let released_provider = escrow_released_so_far(&deal_id, &provider);
+        let cap = prorata(total_earnable, start, end).saturating_add(collateral);
+        if released_provider.saturating_add(tx.amount) > cap {
+            return Err(format!(
+                "escrow tx {} exceeds provider pro-rata for deal {}: {} + {} > cap {}",
+                tx.hash, deal_id, released_provider, tx.amount, cap
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 pub fn internal_balance_transfer(from: &str, to: &str, amount: u64) -> bool {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let cf = db.cf_handle(CF_BALANCES).unwrap();
