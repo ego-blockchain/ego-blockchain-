@@ -60,6 +60,47 @@ pub fn compute_block_reward(height: u64, tx_fees_uegoc: u64, prev_hash: &str) ->
     surprise.saturating_add(miner_fee_share(tx_fees_uegoc))
 }
 
+// ── Emission v2: time-based, adoption-scaled ─────────────────────────────────
+//
+// v1 minted per BLOCK while the block rate is demand-elastic, so tx volume (or
+// an idle-loop bug) directly printed money, and the 105M/era curve only held at
+// exactly 10 blocks/s. v2 accrues the coinbase per SECOND of chain time and
+// scales it by network adoption:
+//
+//   emission = era_rate/sec × seconds_since_parent × min(1, validators/864,000)
+//
+// Which is equivalent to "every registered validator earns ~0.0832 EGOC/day"
+// (≈ the documented $0.20/day consensus target at the $2.45 launch price) until
+// the network reaches 864k validators, where the era curve (72,000 EGOC/day,
+// halving every 4 years) becomes the cap. Fees ride on top per block, so busy
+// blocks still pay their proposer more — demand rewards without demand MINTING.
+pub const VALIDATOR_TARGET_FOR_FULL_EMISSION: u64 = 864_000;
+pub const ERA_WALL_SECS: i64 = 126_144_000;
+pub const ERA0_RATE_UEGOC_PER_SEC: u64 = 10 * INITIAL_BLOCK_REWARD_UEGOC;
+pub const MAX_COINBASE_GAP_SECS: i64 = 3_600;
+
+pub fn emission_v2_base(
+    genesis_ts: i64,
+    parent_ts: i64,
+    block_ts: i64,
+    registered_validators: u64,
+) -> u64 {
+    let era = if genesis_ts > 0 && block_ts > genesis_ts {
+        ((block_ts - genesis_ts) / ERA_WALL_SECS) as u32
+    } else {
+        0
+    };
+    let rate = (ERA0_RATE_UEGOC_PER_SEC as f64 / 2f64.powi(era.min(63) as i32)) as u64;
+    let elapsed = (block_ts.saturating_sub(parent_ts)).clamp(0, MAX_COINBASE_GAP_SECS) as u64;
+    let n = registered_validators.min(VALIDATOR_TARGET_FOR_FULL_EMISSION);
+    ((rate as u128 * elapsed as u128 * n as u128)
+        / VALIDATOR_TARGET_FOR_FULL_EMISSION as u128) as u64
+}
+
+pub fn compute_block_reward_v2(base_emission: u64, tx_fees_uegoc: u64) -> u64 {
+    base_emission.saturating_add(miner_fee_share(tx_fees_uegoc))
+}
+
 // ── Node reward targets (USD) ─────────────────────────────────────────────────
 //
 // Node rewards are defined in USD and converted to EGOC at the live price.

@@ -9173,7 +9173,9 @@ fn merge_remote_chain_blocking(
             }
 
             let base_reward = crate::tokenomics::block_reward_at(block.height);
-            let reward_ok = block.reward == 0 || block.reward >= base_reward / 2;
+            let reward_ok = crate::chain_db::emission_v2_active(block.height)
+                || block.reward == 0
+                || block.reward >= base_reward / 2;
             if !reward_ok {
                 tracing::debug!("[P2P] Block #{} rejected: reward {} below base {}",
                     block.height, block.reward, base_reward);
@@ -9820,15 +9822,21 @@ async fn handle_block_proposal(
                  && t.tx_type != "fee_distribution")
         .map(|t| t.fee_uegoc)
         .sum();
-    let expected_reward = crate::tokenomics::compute_block_reward(
-        block.height, tx_fees_sum, &block.prev_hash,
+    let emission_v2 = crate::chain_db::emission_v2_active(block.height);
+    let expected_reward = crate::chain_db::expected_block_reward(
+        block.height, block.timestamp, tx_fees_sum, &block.prev_hash,
     );
     let expected_staking_fee = crate::tokenomics::staking_fee_share(tx_fees_sum);
 
     if let Some(ref cb_hash) = block.coinbase_tx {
         match transactions.iter().find(|t| &t.hash == cb_hash) {
             Some(cb) => {
-                if cb.amount != expected_reward || cb.to != proposer {
+                let reward_invalid = if emission_v2 {
+                    cb.amount > expected_reward || cb.amount != block.reward
+                } else {
+                    cb.amount != expected_reward
+                };
+                if reward_invalid || cb.to != proposer {
                     eprintln!(
                         "[BFT] Committee: rejected proposal #{} — invalid coinbase \
                          (amount={} expected={}, to={} proposer={})",
