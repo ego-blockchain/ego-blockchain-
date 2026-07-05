@@ -1504,6 +1504,23 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
         && tx.from == tx.to
         && tx.amount == 0;
 
+    // Under emission v2, registration mints emission weight — it must cost
+    // real stake or ghost validators inflate the emission rate for free.
+    if is_validator_reg
+        && crate::chain_db::emission_v2_active(
+            crate::chain_db::latest_block_info().0.saturating_add(1),
+        )
+    {
+        let floor = crate::p2p::min_validator_stake_uegoc();
+        let staked = get_validator_stake(&tx.from);
+        if staked < floor {
+            return Err(format!(
+                "validator_register from {} rejected: stake {} uEGOC below the {} uEGOC floor — stake first, registration carries emission weight",
+                tx.from, staked, floor
+            ));
+        }
+    }
+
     if !is_validator_reg && tx.fee_uegoc < crate::tokenomics::FEE_FLOOR_UEGOC {
         return Err(format!(
             "tx from {} rejected: fee {} uEGOC below absolute floor {} uEGOC. Zero-fee transactions are disabled to prevent network spam.",
