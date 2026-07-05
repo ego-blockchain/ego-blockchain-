@@ -551,7 +551,7 @@ pub async fn get_transaction_history(
                     }
                 }
             } else {
-                tx.status = "Confirming (0/3)".into();
+                tx.status = "Pending".into();
             }
 
             if is_receiver && !is_faucet && !is_fully_confirmed {
@@ -590,7 +590,7 @@ pub async fn get_transaction_history(
                 if now - tx.timestamp >= 1800 { // 30 mins
                     tx.status = "Failed".into();
                 } else {
-                    tx.status = "Confirming (0/3)".into();
+                    tx.status = "Pending".into();
                 }
                 tx.block_height = None;
                 final_txs.push(tx);

@@ -1339,6 +1339,21 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     }
     record_escrow_releases(db, &confirmed_txs);
     apply_credit_txs(db, &confirmed_txs);
+
+    // BFT finality is immediate: a block persisted with a quorum of votes is
+    // irreversible the moment it lands — no pipelining, no depth. Advance the
+    // finality marker here so the wallet shows Confirmed exactly when the
+    // balances move (covers v2 commits AND QC blocks applied via sync; the old
+    // pipeline_commit path only ever trailed the tip by 2 blocks).
+    if (block.vote_count as usize) >= crate::mempool::MIN_VALIDATORS_FOR_FINALITY {
+        if let Some(cf_meta) = db.cf_handle(CF_META) {
+            let cur = db.get_cf(cf_meta, META_FINALIZED)
+                .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+            if block.height > cur {
+                let _ = db.put_cf(cf_meta, META_FINALIZED, u64_le(block.height));
+            }
+        }
+    }
     true
 }
 
