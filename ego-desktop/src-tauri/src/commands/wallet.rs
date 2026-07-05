@@ -542,16 +542,23 @@ pub async fn get_transaction_history(
                     tx.status = "Confirmed".into();
                     is_fully_confirmed = true;
                 } else {
+                    // In a block that hasn't reached quorum finality yet (or a
+                    // QC-less bootstrap block): show real pipeline progress —
+                    // 2/3 = included, waiting on the finality marker. With BFT
+                    // this window is typically well under a second.
                     let confs = tip_height.saturating_sub(h) + 1;
                     if confs >= 3 {
                         tx.status = "Confirmed".into();
                         is_fully_confirmed = true;
                     } else {
-                        tx.status = format!("Confirming ({}/3)", confs);
+                        tx.status = format!("Confirming ({}/3)", confs.min(2));
                     }
                 }
             } else {
-                tx.status = "Pending".into();
+                // Signed and broadcast, waiting for the network to include it in
+                // a block. Sitting here means consensus isn't producing blocks
+                // (e.g. no quorum) — exactly the signal users should see.
+                tx.status = "Confirming (0/3)".into();
             }
 
             if is_receiver && !is_faucet && !is_fully_confirmed {
@@ -590,7 +597,7 @@ pub async fn get_transaction_history(
                 if now - tx.timestamp >= 1800 { // 30 mins
                     tx.status = "Failed".into();
                 } else {
-                    tx.status = "Pending".into();
+                    tx.status = "Confirming (0/3)".into();
                 }
                 tx.block_height = None;
                 final_txs.push(tx);
