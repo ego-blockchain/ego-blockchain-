@@ -1376,6 +1376,7 @@ fn tx_hash_must_match_standard_signing(tx: &LedgerTx) -> bool {
     matches!(
         tx.tx_type.as_str(),
         "transfer" | "stake" | "unstake" | "governance" | "cluster_escrow" | "storage_escrow" | "hosting_plan"
+            | "credits_mint" | "credits_pay"
     )
 }
 

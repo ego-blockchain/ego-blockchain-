@@ -1338,6 +1338,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         }
     }
     record_escrow_releases(db, &confirmed_txs);
+    apply_credit_txs(db, &confirmed_txs);
     true
 }
 
@@ -2983,6 +2984,11 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
             if is_escrow_source(&tx.from) {
                 validate_escrow_release_tx(tx, block.timestamp)?;
             }
+        }
+    }
+    for tx in txs {
+        if matches!(tx.tx_type.as_str(), "credits_mint" | "credits_pay") {
+            validate_credits_tx(tx)?;
         }
     }
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
@@ -4825,6 +4831,131 @@ pub struct ComputeJob {
 /// Move EGOC between two addresses directly in the balance CF.
 /// Used for protocol-level escrow operations (compute, future contracts).
 /// Does NOT create a mempool TX — call before creating the audit TX.
+pub const CREDITS_BURN_ADDR: &str = "egot1burncredits00000000000000000000000000000";
+pub const MICRO_USD_PER_CREDIT: u64 = 10_000;
+pub const CREDITS_PRICE_TOLERANCE_PCT: u64 = 25;
+
+fn credits_key(addr: &str) -> Vec<u8> {
+    format!("credits:{}", addr).into_bytes()
+}
+
+pub fn credits_balance(addr: &str) -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf) = db.cf_handle(CF_META) else { return 0 };
+    db.get_cf(cf, credits_key(addr)).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
+}
+
+/// Credits minted for burning `amount_uegoc` at `price_micro_usd` (µUSD per EGOC).
+/// 1 credit is permanently worth $0.01 — the stable payment unit; the burn is
+/// one-way (credits can never mint EGOC back, so this cannot Terra-spiral).
+pub fn credits_mint_amount(amount_uegoc: u64, price_micro_usd: u64) -> u64 {
+    (amount_uegoc as u128 * price_micro_usd as u128
+        / (1_000_000u128 * MICRO_USD_PER_CREDIT as u128)) as u64
+}
+
+pub fn parse_credits_mint_memo(memo: &Option<String>) -> Option<u64> {
+    memo.as_deref()?.strip_prefix("credits_mint:")?.parse::<u64>().ok()
+}
+
+pub fn parse_credits_pay_memo(memo: &Option<String>) -> Option<u64> {
+    let m = memo.as_deref()?.strip_prefix("credits_pay:")?;
+    m.split(':').next()?.parse::<u64>().ok()
+}
+
+/// Consensus rules for the stable-credits txs. Deterministic except the mint
+/// price tolerance, which bounds how far a sender's attested EGOC price may sit
+/// from this validator's oracle view — the hardening path is an on-chain price
+/// feed; until then the band caps the damage of a lying sender to ±25%.
+pub fn validate_credits_tx(tx: &crate::ledger::LedgerTx) -> Result<(), String> {
+    match tx.tx_type.as_str() {
+        "credits_mint" => {
+            if tx.to != CREDITS_BURN_ADDR {
+                return Err(format!("credits_mint {} must burn to {}", tx.hash, CREDITS_BURN_ADDR));
+            }
+            if tx.amount == 0 {
+                return Err(format!("credits_mint {} burns zero EGOC", tx.hash));
+            }
+            let Some(price_micro) = parse_credits_mint_memo(&tx.memo) else {
+                return Err(format!("credits_mint {} missing credits_mint:{{price}} memo", tx.hash));
+            };
+            if price_micro == 0 {
+                return Err(format!("credits_mint {} has zero price", tx.hash));
+            }
+            let local_micro = (crate::p2p::get_egoc_price_usd() * 1_000_000.0) as u64;
+            if local_micro > 0 {
+                let tol = local_micro.saturating_mul(CREDITS_PRICE_TOLERANCE_PCT) / 100;
+                if price_micro > local_micro.saturating_add(tol)
+                    || price_micro < local_micro.saturating_sub(tol)
+                {
+                    return Err(format!(
+                        "credits_mint {} price {}µ$ outside ±{}% of oracle {}µ$",
+                        tx.hash, price_micro, CREDITS_PRICE_TOLERANCE_PCT, local_micro
+                    ));
+                }
+            }
+            Ok(())
+        }
+        "credits_pay" => {
+            if tx.amount != 0 {
+                return Err(format!("credits_pay {} must carry zero EGOC amount", tx.hash));
+            }
+            if tx.to.is_empty() || tx.to == tx.from || crate::ledger::is_reserved_system_source(&tx.to) {
+                return Err(format!("credits_pay {} has invalid recipient", tx.hash));
+            }
+            let Some(credits) = parse_credits_pay_memo(&tx.memo) else {
+                return Err(format!("credits_pay {} missing credits_pay:{{amount}} memo", tx.hash));
+            };
+            if credits == 0 {
+                return Err(format!("credits_pay {} pays zero credits", tx.hash));
+            }
+            if credits_balance(&tx.from) < credits {
+                return Err(format!(
+                    "credits_pay {} overspends: {} has {} credits, needs {}",
+                    tx.hash, tx.from, credits_balance(&tx.from), credits
+                ));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn apply_credit_txs(db: &DB, txs: &[&crate::ledger::LedgerTx]) {
+    let Some(cf) = db.cf_handle(CF_META) else { return };
+    let mut deltas: std::collections::HashMap<String, i128> = std::collections::HashMap::new();
+    for tx in txs {
+        match tx.tx_type.as_str() {
+            "credits_mint" => {
+                let Some(price) = parse_credits_mint_memo(&tx.memo) else { continue };
+                let minted = credits_mint_amount(tx.amount, price);
+                if minted == 0 { continue; }
+                *deltas.entry(tx.from.clone()).or_default() += minted as i128;
+                tracing::info!(
+                    "[Credits] {} burned {} uEGOC @ {}µ$ → +{} credits (${:.2})",
+                    tx.from, tx.amount, price, minted,
+                    minted as f64 * MICRO_USD_PER_CREDIT as f64 / 1_000_000.0
+                );
+            }
+            "credits_pay" => {
+                let Some(credits) = parse_credits_pay_memo(&tx.memo) else { continue };
+                if credits == 0 { continue; }
+                *deltas.entry(tx.from.clone()).or_default() -= credits as i128;
+                *deltas.entry(tx.to.clone()).or_default() += credits as i128;
+            }
+            _ => {}
+        }
+    }
+    if deltas.is_empty() { return; }
+    let mut batch = rocksdb::WriteBatch::default();
+    for (addr, delta) in deltas {
+        let key = credits_key(&addr);
+        let cur = db.get_cf(cf, &key).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+        let next = (cur as i128 + delta).clamp(0, u64::MAX as i128) as u64;
+        batch.put_cf(cf, &key, u64_le(next));
+    }
+    let _ = db.write(batch);
+}
+
 pub const FEATURE_ESCROW_VALIDATION: &str = "escrow_validation";
 
 /// Consensus-validated escrow releases. Activated by governance feature vote or
