@@ -3004,6 +3004,8 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
     for tx in txs {
         if matches!(tx.tx_type.as_str(), "credits_mint" | "credits_pay") {
             validate_credits_tx(tx)?;
+        } else if tx.tx_type == "credits_escrow" {
+            validate_credits_escrow_tx(tx, block.timestamp)?;
         }
     }
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
@@ -4877,6 +4879,82 @@ pub fn parse_credits_pay_memo(memo: &Option<String>) -> Option<u64> {
     m.split(':').next()?.parse::<u64>().ok()
 }
 
+pub fn parse_credits_release_memo(memo: &Option<String>) -> Option<(u64, String)> {
+    let m = memo.as_deref()?.strip_prefix("credits_release:")?;
+    let mut parts = m.splitn(3, ':');
+    let credits = parts.next()?.parse::<u64>().ok()?;
+    let _action = parts.next()?;
+    let deal_id = parts.next()?;
+    if deal_id.is_empty() { return None; }
+    Some((credits, deal_id.to_string()))
+}
+
+fn escrow_credits_released_key(deal_id: &str, recipient: &str) -> Vec<u8> {
+    format!("escrow_relc:{}:{}", deal_id, recipient).into_bytes()
+}
+
+pub fn escrow_credits_released_so_far(deal_id: &str, recipient: &str) -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf) = db.cf_handle(CF_META) else { return 0 };
+    db.get_cf(cf, escrow_credits_released_key(deal_id, recipient))
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
+}
+
+/// Consensus rule for EGUSD escrow releases (`credits_escrow` system txs):
+/// mirror of validate_escrow_release_tx but over the credits ledger — the
+/// release must reference an EGUSD-funded on-chain deal, pay a party to it,
+/// never exceed the credits deposit cumulatively, and never pay the provider
+/// ahead of pro-rata time served.
+pub fn validate_credits_escrow_tx(tx: &crate::ledger::LedgerTx, block_time: i64) -> Result<(), String> {
+    if !is_escrow_source(&tx.from) {
+        return Err(format!("credits_escrow {} from non-escrow source {}", tx.hash, tx.from));
+    }
+    if tx.amount != 0 {
+        return Err(format!("credits_escrow {} must carry zero EGOC amount", tx.hash));
+    }
+    let Some((credits, deal_id)) = parse_credits_release_memo(&tx.memo) else {
+        return Err(format!("credits_escrow {} missing credits_release memo", tx.hash));
+    };
+    if credits == 0 {
+        return Err(format!("credits_escrow {} releases zero credits", tx.hash));
+    }
+    let Some(r) = get_compute_reservation(&deal_id) else {
+        return Err(format!("credits_escrow {} references unknown deal {}", tx.hash, deal_id));
+    };
+    if !r.paid_in_egusd {
+        return Err(format!("credits_escrow {} but reservation {} is EGOC-funded", tx.hash, deal_id));
+    }
+    if tx.to != r.buyer_address && tx.to != r.provider_address {
+        return Err(format!("credits_escrow {} pays non-party {}", tx.hash, tx.to));
+    }
+    let deposit = r.total_cost_uegoc;
+    let released_all = escrow_credits_released_so_far(&deal_id, "*");
+    if released_all.saturating_add(credits) > deposit {
+        return Err(format!(
+            "credits_escrow {} over-releases deal {}: {} + {} > deposit {}",
+            tx.hash, deal_id, released_all, credits, deposit
+        ));
+    }
+    if tx.to == r.provider_address && r.provider_address != r.buyer_address {
+        let start = r.started_at.unwrap_or(r.created_at);
+        let cap = if r.expires_at <= start {
+            deposit
+        } else {
+            let dur = (r.expires_at - start) as u128;
+            let elapsed = (block_time - start).clamp(0, r.expires_at - start) as u128;
+            (deposit as u128 * elapsed / dur) as u64
+        };
+        let released_provider = escrow_credits_released_so_far(&deal_id, &r.provider_address);
+        if released_provider.saturating_add(credits) > cap {
+            return Err(format!(
+                "credits_escrow {} exceeds provider pro-rata for {}: {} + {} > cap {}",
+                tx.hash, deal_id, released_provider, credits, cap
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Consensus rules for the stable-credits txs. Deterministic except the mint
 /// price tolerance, which bounds how far a sender's attested EGOC price may sit
 /// from this validator's oracle view — the hardening path is an on-chain price
@@ -4938,6 +5016,7 @@ pub fn validate_credits_tx(tx: &crate::ledger::LedgerTx) -> Result<(), String> {
 fn apply_credit_txs(db: &DB, txs: &[&crate::ledger::LedgerTx]) {
     let Some(cf) = db.cf_handle(CF_META) else { return };
     let mut deltas: std::collections::HashMap<String, i128> = std::collections::HashMap::new();
+    let mut rel_index: std::collections::HashMap<(String, String), u64> = std::collections::HashMap::new();
     for tx in txs {
         match tx.tx_type.as_str() {
             "credits_mint" => {
@@ -4957,16 +5036,29 @@ fn apply_credit_txs(db: &DB, txs: &[&crate::ledger::LedgerTx]) {
                 *deltas.entry(tx.from.clone()).or_default() -= credits as i128;
                 *deltas.entry(tx.to.clone()).or_default() += credits as i128;
             }
+            "credits_escrow" => {
+                let Some((credits, deal_id)) = parse_credits_release_memo(&tx.memo) else { continue };
+                if credits == 0 { continue; }
+                *deltas.entry(tx.from.clone()).or_default() -= credits as i128;
+                *deltas.entry(tx.to.clone()).or_default() += credits as i128;
+                *rel_index.entry((deal_id.clone(), tx.to.clone())).or_default() += credits;
+                *rel_index.entry((deal_id, "*".to_string())).or_default() += credits;
+            }
             _ => {}
         }
     }
-    if deltas.is_empty() { return; }
+    if deltas.is_empty() && rel_index.is_empty() { return; }
     let mut batch = rocksdb::WriteBatch::default();
     for (addr, delta) in deltas {
         let key = credits_key(&addr);
         let cur = db.get_cf(cf, &key).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
         let next = (cur as i128 + delta).clamp(0, u64::MAX as i128) as u64;
         batch.put_cf(cf, &key, u64_le(next));
+    }
+    for ((deal_id, recipient), credits) in rel_index {
+        let key = escrow_credits_released_key(&deal_id, &recipient);
+        let cur = db.get_cf(cf, &key).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+        batch.put_cf(cf, &key, u64_le(cur.saturating_add(credits)));
     }
     let _ = db.write(batch);
 }
@@ -5327,6 +5419,11 @@ pub struct ComputeReservation {
     /// Unix timestamp when the buyer first actively used the rental (opened console).
     /// None = not yet started; timer and billing begin at this moment, not at created_at.
     #[serde(default)] pub started_at: Option<i64>,
+    /// true = the renter funded this reservation in EGUSD. total_cost_uegoc,
+    /// period_rate_uegoc and escrow_remaining are then denominated in CREDITS
+    /// ($0.01 units) and settle over the credits ledger via `credits_escrow`
+    /// system txs. The provider SLA collateral stays in EGOC either way.
+    #[serde(default)] pub paid_in_egusd: bool,
 }
 
 pub fn upsert_compute_offer(offer: &ComputeCapacityOffer) {

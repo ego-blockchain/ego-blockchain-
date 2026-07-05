@@ -325,6 +325,7 @@ pub async fn create_cluster_booking(
             days_paid:         0,
             daily_rate_uegoc:  0,
             started_at:        None,
+            paid_in_egusd:     false,
         };
         crate::chain_db::upsert_compute_reservation(&reservation);
 

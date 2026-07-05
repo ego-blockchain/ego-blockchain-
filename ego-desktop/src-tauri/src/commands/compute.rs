@@ -125,6 +125,26 @@ fn push_system_tx(from: &str, to: &str, amount: u64, memo: &str, nonce: u64) -> 
     hash
 }
 
+fn push_credits_escrow_tx(to: &str, credits: u64, action: &str, deal_id: &str) {
+    let ts = chrono::Utc::now().timestamp();
+    let memo = format!("credits_release:{}:{}:{}", credits, action, deal_id);
+    let sign_bytes = tx_signing_bytes(crate::chain_db::RESERVATION_ESCROW_ADDR, to, 0, credits, ts);
+    let hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+    let _ = crate::mempool::get_mempool().push(LedgerTx {
+        hash,
+        from:      crate::chain_db::RESERVATION_ESCROW_ADDR.to_string(),
+        to:        to.to_string(),
+        amount:    0,
+        memo:      Some(memo),
+        timestamp: ts,
+        signature: "credits_escrow_system".to_string(),
+        status:    "Pending".into(),
+        nonce:     credits,
+        tx_type:   "credits_escrow".to_string(),
+        ..LedgerTx::default()
+    });
+}
+
 /// Renter-side SLA enforcement: a provider we rented from has gone dark. Compute can't
 /// live-migrate a running container, so the resilience guarantee is COMPENSATION — refund
 /// the renter's unused escrow AND award them the provider's SLA bond, then free the
@@ -139,9 +159,13 @@ async fn refund_breached_reservation(res: crate::chain_db::ComputeReservation) {
         let mut r = res;
         let buyer = r.buyer_address.clone();
         if refund > 0 {
-            crate::chain_db::internal_balance_transfer(crate::chain_db::RESERVATION_ESCROW_ADDR, &buyer, refund);
-            push_system_tx(crate::chain_db::RESERVATION_ESCROW_ADDR, &buyer, refund,
-                &format!("sla_breach_refund:{}", r.reservation_id), 0);
+            if r.paid_in_egusd {
+                push_credits_escrow_tx(&buyer, refund, "sla_breach_refund", &r.reservation_id);
+            } else {
+                crate::chain_db::internal_balance_transfer(crate::chain_db::RESERVATION_ESCROW_ADDR, &buyer, refund);
+                push_system_tx(crate::chain_db::RESERVATION_ESCROW_ADDR, &buyer, refund,
+                    &format!("sla_breach_refund:{}", r.reservation_id), 0);
+            }
         }
         if bond > 0 {
             crate::chain_db::internal_balance_transfer(crate::chain_db::RESERVATION_ESCROW_ADDR, &buyer, bond);
@@ -1197,6 +1221,7 @@ pub async fn get_capacity_offers() -> Result<Vec<ComputeCapacityOffer>, EgoDeskt
 pub async fn book_reservation(
     offer_id:         String,
     duration_minutes: u64,
+    pay_with_egusd:   Option<bool>,
     state:            State<'_, AppState>,
 ) -> Result<String, EgoDesktopError> {
     let mut ledger = crate::ledger::Ledger::load();
@@ -1234,69 +1259,148 @@ pub async fn book_reservation(
     };
     let period_rate = hourly_rate * period_minutes / 60;
 
-    let my_balance = crate::chain_db::balance_of(&my_addr);
-    if my_balance < total_cost {
-        return Err(EgoDesktopError::WalletError(
-            format!("Insufficient balance: need {} uEGOC, have {}", total_cost, my_balance)
-        ));
-    }
+    let pay_egusd = pay_with_egusd.unwrap_or(false);
+    let egoc_total_cost = total_cost;
+    let (total_cost, period_rate) = if pay_egusd {
+        let price_micro = (crate::p2p::get_egoc_price_usd() * 1_000_000.0) as u64;
+        if price_micro == 0 {
+            return Err(EgoDesktopError::WalletError("No EGOC price available for EGUSD conversion".into()));
+        }
+        let credits_cost = crate::chain_db::credits_mint_amount(total_cost, price_micro).max(1);
+        let period_credits = (credits_cost.saturating_mul(period_minutes) / duration_minutes.max(1)).max(1);
+        (credits_cost, period_credits)
+    } else {
+        (total_cost, period_rate)
+    };
 
-    if !crate::chain_db::internal_balance_transfer(&my_addr, RESERVATION_ESCROW_ADDR, total_cost) {
-        return Err(EgoDesktopError::WalletError("Failed to lock buyer payment in escrow".into()));
-    }
+    let collateral;
+    if pay_egusd {
+        let have = crate::chain_db::credits_balance(&my_addr);
+        if have < total_cost {
+            return Err(EgoDesktopError::WalletError(format!(
+                "Insufficient EGUSD: need {:.2}, have {:.2}",
+                total_cost as f64 / 100.0,
+                have as f64 / 100.0
+            )));
+        }
 
-    let nonce      = ledger.nonce + 1;
-    let sign_bytes = tx_signing_bytes(&my_addr, RESERVATION_ESCROW_ADDR, total_cost, nonce, now);
-    let kp = state.get_keypair().ok_or_else(|| {
-        crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, total_cost);
-        EgoDesktopError::WalletError("Wallet not initialized".into())
-    })?;
-    let sig_hex    = hex::encode(kp.sign_ed25519(&sign_bytes).as_bytes());
-    let dil_sig    = kp.sign_dilithium(&sign_bytes);
-    let pubkey_hex = hex::encode(kp.ed25519_public_key().as_bytes());
-    let dil_pk_hex = hex::encode(&kp.dilithium_public_key().key_data);
-    let dil_sig_hex= hex::encode(&dil_sig.signature_data);
-    let tx_hash    = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
-    crate::mempool::get_mempool().push(LedgerTx {
-        hash:                 tx_hash,
-        from:                 my_addr.clone(),
-        to:                   RESERVATION_ESCROW_ADDR.to_string(),
-        amount:               total_cost,
-        memo:                 Some(format!("reservation_escrow_buyer:{}", offer_id)),
-        timestamp:            now,
-        signature:            sig_hex,
-        status:               "Pending".into(),
-        nonce,
-        public_key_ed25519:   pubkey_hex,
-        dilithium_pubkey:     dil_pk_hex,
-        dilithium_signature:  dil_sig_hex,
-        tx_type:              "reservation_escrow".to_string(),
-        tx_version:           2,
-        chain_id:             1,
-        ..LedgerTx::default()
-    });
-    ledger.nonce = nonce;
-    ledger.save().map_err(EgoDesktopError::FileSystemError)?;
+        collateral = if offer.bonded {
+            let required = (egoc_total_cost * RESERVATION_SLA_BPS / 10_000).max(1_000_000);
+            let provider_balance = crate::chain_db::balance_of(&offer.provider_address);
+            if provider_balance < required {
+                return Err(EgoDesktopError::InvalidInput(
+                    format!("Provider cannot meet SLA bond of {} uEGOC (has {})", required, provider_balance)
+                ));
+            }
+            if !crate::chain_db::internal_balance_transfer(&offer.provider_address, RESERVATION_ESCROW_ADDR, required) {
+                return Err(EgoDesktopError::WalletError("Failed to lock provider SLA collateral".into()));
+            }
+            push_system_tx(&offer.provider_address, RESERVATION_ESCROW_ADDR, required,
+                &format!("reservation_escrow_collateral:{}", offer_id), 0);
+            required
+        } else {
+            0
+        };
 
-    let collateral = if offer.bonded {
-        let required = (total_cost * RESERVATION_SLA_BPS / 10_000).max(1_000_000);
-        let provider_balance = crate::chain_db::balance_of(&offer.provider_address);
-        if provider_balance < required {
-            crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, total_cost);
-            return Err(EgoDesktopError::InvalidInput(
-                format!("Provider cannot meet SLA bond of {} uEGOC (has {})", required, provider_balance)
+        let is_staker = ledger.staked_amount > 0;
+        let fee = crate::tokenomics::fee_for_tx_with_staking("transfer", is_staker);
+        if crate::chain_db::balance_of(&my_addr) < fee {
+            return Err(EgoDesktopError::WalletError("Insufficient EGOC for the network fee".into()));
+        }
+        let nonce = ledger.nonce + 1;
+        let memo  = format!("credits_pay:{}:resv:{}", total_cost, offer_id);
+        let sign_bytes = crate::ledger::tx_signing_bytes_v2(
+            &my_addr, RESERVATION_ESCROW_ADDR, 0, nonce, now, 1, &memo,
+        );
+        let kp = state.get_keypair()
+            .ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
+        let tx_hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+        let _ = crate::mempool::get_mempool().push(LedgerTx {
+            hash:                tx_hash,
+            from:                my_addr.clone(),
+            to:                  RESERVATION_ESCROW_ADDR.to_string(),
+            amount:              0,
+            memo:                Some(memo),
+            timestamp:           now,
+            signature:           hex::encode(kp.sign_ed25519(&sign_bytes).as_bytes()),
+            status:              "Pending".into(),
+            nonce,
+            public_key_ed25519:  hex::encode(kp.ed25519_public_key().as_bytes()),
+            dilithium_pubkey:    hex::encode(&kp.dilithium_public_key().key_data),
+            dilithium_signature: hex::encode(&kp.sign_dilithium(&sign_bytes).signature_data),
+            fee_uegoc:           fee,
+            tx_type:             "credits_pay".to_string(),
+            tx_version:          2,
+            chain_id:            1,
+            ..LedgerTx::default()
+        });
+        ledger.nonce = nonce;
+        ledger.save().map_err(EgoDesktopError::FileSystemError)?;
+    } else {
+        let my_balance = crate::chain_db::balance_of(&my_addr);
+        if my_balance < total_cost {
+            return Err(EgoDesktopError::WalletError(
+                format!("Insufficient balance: need {} uEGOC, have {}", total_cost, my_balance)
             ));
         }
-        if !crate::chain_db::internal_balance_transfer(&offer.provider_address, RESERVATION_ESCROW_ADDR, required) {
-            crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, total_cost);
-            return Err(EgoDesktopError::WalletError("Failed to lock provider SLA collateral".into()));
+
+        if !crate::chain_db::internal_balance_transfer(&my_addr, RESERVATION_ESCROW_ADDR, total_cost) {
+            return Err(EgoDesktopError::WalletError("Failed to lock buyer payment in escrow".into()));
         }
-        push_system_tx(&offer.provider_address, RESERVATION_ESCROW_ADDR, required,
-            &format!("reservation_escrow_collateral:{}", offer_id), 0);
-        required
-    } else {
-        0
-    };
+
+        let nonce      = ledger.nonce + 1;
+        let sign_bytes = tx_signing_bytes(&my_addr, RESERVATION_ESCROW_ADDR, total_cost, nonce, now);
+        let kp = state.get_keypair().ok_or_else(|| {
+            crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, total_cost);
+            EgoDesktopError::WalletError("Wallet not initialized".into())
+        })?;
+        let sig_hex    = hex::encode(kp.sign_ed25519(&sign_bytes).as_bytes());
+        let dil_sig    = kp.sign_dilithium(&sign_bytes);
+        let pubkey_hex = hex::encode(kp.ed25519_public_key().as_bytes());
+        let dil_pk_hex = hex::encode(&kp.dilithium_public_key().key_data);
+        let dil_sig_hex= hex::encode(&dil_sig.signature_data);
+        let tx_hash    = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+        crate::mempool::get_mempool().push(LedgerTx {
+            hash:                 tx_hash,
+            from:                 my_addr.clone(),
+            to:                   RESERVATION_ESCROW_ADDR.to_string(),
+            amount:               total_cost,
+            memo:                 Some(format!("reservation_escrow_buyer:{}", offer_id)),
+            timestamp:            now,
+            signature:            sig_hex,
+            status:               "Pending".into(),
+            nonce,
+            public_key_ed25519:   pubkey_hex,
+            dilithium_pubkey:     dil_pk_hex,
+            dilithium_signature:  dil_sig_hex,
+            tx_type:              "reservation_escrow".to_string(),
+            tx_version:           2,
+            chain_id:             1,
+            ..LedgerTx::default()
+        });
+        ledger.nonce = nonce;
+        ledger.save().map_err(EgoDesktopError::FileSystemError)?;
+
+        collateral = if offer.bonded {
+            let required = (total_cost * RESERVATION_SLA_BPS / 10_000).max(1_000_000);
+            let provider_balance = crate::chain_db::balance_of(&offer.provider_address);
+            if provider_balance < required {
+                crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, total_cost);
+                return Err(EgoDesktopError::InvalidInput(
+                    format!("Provider cannot meet SLA bond of {} uEGOC (has {})", required, provider_balance)
+                ));
+            }
+            if !crate::chain_db::internal_balance_transfer(&offer.provider_address, RESERVATION_ESCROW_ADDR, required) {
+                crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, total_cost);
+                return Err(EgoDesktopError::WalletError("Failed to lock provider SLA collateral".into()));
+            }
+            push_system_tx(&offer.provider_address, RESERVATION_ESCROW_ADDR, required,
+                &format!("reservation_escrow_collateral:{}", offer_id), 0);
+            required
+        } else {
+            0
+        };
+    }
 
     let reservation = ComputeReservation {
         reservation_id:    Uuid::new_v4().to_string(),
@@ -1322,6 +1426,7 @@ pub async fn book_reservation(
         days_paid:         0,
         daily_rate_uegoc:  0,
         started_at:        None,
+        paid_in_egusd:     pay_egusd,
     };
 
     // Anchor the reservation ON-CHAIN: this hash-bound tx lands in a block's
@@ -1428,13 +1533,17 @@ pub async fn send_reservation_heartbeat(reservation_id: String) -> Result<(), Eg
 
     let payment = res.period_rate_uegoc;
     if res.escrow_remaining >= payment {
-        crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, payment);
-        push_system_tx(RESERVATION_ESCROW_ADDR, &my_addr, payment,
-            &format!("reservation_period_payment:{}", reservation_id), 0);
+        if res.paid_in_egusd {
+            push_credits_escrow_tx(&my_addr, payment, "period_payment", &reservation_id);
+        } else {
+            crate::chain_db::internal_balance_transfer(RESERVATION_ESCROW_ADDR, &my_addr, payment);
+            push_system_tx(RESERVATION_ESCROW_ADDR, &my_addr, payment,
+                &format!("reservation_period_payment:{}", reservation_id), 0);
+            ledger.compute_reservation_earnings_uegoc += payment;
+            ledger.save().map_err(EgoDesktopError::FileSystemError)?;
+        }
         res.escrow_remaining = res.escrow_remaining.saturating_sub(payment);
         res.periods_paid += 1;
-        ledger.compute_reservation_earnings_uegoc += payment;
-        ledger.save().map_err(EgoDesktopError::FileSystemError)?;
     }
 
     res.last_heartbeat_at = now;
