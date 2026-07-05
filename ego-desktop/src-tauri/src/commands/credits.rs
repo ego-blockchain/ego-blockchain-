@@ -143,17 +143,16 @@ pub async fn mint_credits(
     )?;
     let hash = tx.hash.clone();
     eprintln!(
-        "[Credits] Mint queued — burn {} uEGOC @ {}µ$ → {} credits ({})",
-        amount_uegoc, price_micro, credits, hash
+        "[Credits] Mint queued — burn {} uEGOC @ {}µ$ → {:.2} EGUSD ({})",
+        amount_uegoc, price_micro, credits as f64 / 100.0, hash
     );
     queue_tx(tx, ledger).await;
     Ok(CreditsTxResponse {
         hash,
         credits,
         message: format!(
-            "Burning {:.6} EGOC for {} credits (${:.2}) — confirms next block",
+            "Burning {:.6} EGOC for {:.2} EGUSD — confirms next block",
             amount_uegoc as f64 / 1_000_000.0,
-            credits,
             credits as f64 / 100.0
         ),
     })
@@ -200,14 +199,13 @@ pub async fn pay_credits(
     let memo = format!("credits_pay:{}", credits);
     let tx = build_signed_tx(&state, &mut ledger, &to, 0, memo, "credits_pay", fee)?;
     let hash = tx.hash.clone();
-    eprintln!("[Credits] Pay queued — {} credits → {} ({})", credits, to, hash);
+    eprintln!("[Credits] Pay queued — {:.2} EGUSD → {} ({})", credits as f64 / 100.0, to, hash);
     queue_tx(tx, ledger).await;
     Ok(CreditsTxResponse {
         hash,
         credits,
         message: format!(
-            "Paying {} credits (${:.2}) to {} — confirms next block",
-            credits,
+            "Paying {:.2} EGUSD to {} — confirms next block",
             credits as f64 / 100.0,
             to
         ),
