@@ -1112,6 +1112,34 @@ pub async fn shadow_v2_tick() {
         }
     }
 
+    // ── Idle gate ─────────────────────────────────────────────────────────────
+    // Block production is DEMAND-driven, not tick-driven. With an empty mempool,
+    // no proposal in flight and a young tip there is nothing to decide: don't
+    // propose (each empty block mints a coinbase — observed live at 1.35 empty
+    // blocks/sec ≈ 9,600 EGOC/day for nothing) and don't fire the pacemaker
+    // (idle view-changes would storm every timeout). One empty heartbeat block
+    // per EMPTY_BLOCK_INTERVAL_S keeps the chain demonstrably alive.
+    {
+        let inflight = {
+            let guard = shadow_host_lock();
+            guard.as_ref().and_then(|h| h.proposed_header()).is_some()
+        };
+        let due = inflight
+            || crate::mempool::get_mempool().pending_count() > 0
+            || {
+                let (tip_h, _) = crate::chain_db::latest_block_info();
+                let tip_ts = crate::chain_db::get_block_by_height(tip_h)
+                    .map(|b| b.timestamp)
+                    .unwrap_or(0);
+                chrono::Utc::now().timestamp() - tip_ts
+                    >= crate::mempool::EMPTY_BLOCK_INTERVAL_S as i64
+            };
+        if !due {
+            V2_VIEW_ENTERED_MS.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
+            return;
+        }
+    }
+
     // ── Pacemaker ─────────────────────────────────────────────────────────────
     // If we sit at the same (height, round) too long without finalizing — the elected
     // proposer is offline, can't build a block, or its proposal isn't reaching us — rotate
