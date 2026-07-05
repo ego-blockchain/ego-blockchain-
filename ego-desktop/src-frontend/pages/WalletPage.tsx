@@ -5,6 +5,7 @@ import { fetch as tauriFetch, Body } from '@tauri-apps/api/http';
 import { useWallet } from '../App';
 import qrcode from 'qrcode-generator';
 import Pagination from '../components/Pagination';
+import { txDisplayAmount } from '../constants';
 
 import { RELAY_HTTP as RELAY, RPC_URL } from '../config';
 
@@ -1430,7 +1431,7 @@ const WalletPage: React.FC = () => {
                   </div>
                   <div className="text-right shrink-0 ml-3">
                     <div className={`text-sm font-semibold ${isReward ? 'text-yellow-400' : isSent ? 'text-red-400' : 'text-green-400'}`}>
-                      {isSent ? '-' : '+'}{(tx.amount / 1_000_000).toFixed(2)} EGOC
+                      {isSent ? '-' : '+'}{txDisplayAmount(tx, 2)}
                     </div>
                     <div className="flex items-center justify-end gap-1.5 mt-0.5">
                       <span className={`inline-block w-1.5 h-1.5 rounded-full ${
@@ -2783,7 +2784,7 @@ const WalletPage: React.FC = () => {
                 selectedTx.from === myAddress ? 'text-red-400' : 'text-green-400'
               }`}>
                 {selectedTx.from === myAddress ? '-' : '+'}
-                {(selectedTx.amount / 1_000_000).toFixed(6)} EGOC
+                {txDisplayAmount(selectedTx)}
               </div>
               <div className={`text-sm mt-0.5 ${statusBadge(selectedTx.status).split(' ')[1]}`}>
                 {selectedTx.status}
@@ -2794,7 +2795,7 @@ const WalletPage: React.FC = () => {
                 { label: 'Hash',      val: selectedTx.hash,       mono: true },
                 { label: 'From',      val: selectedTx.from,       mono: true },
                 { label: 'To',        val: selectedTx.to,         mono: true },
-                { label: 'Amount',    val: `${(selectedTx.amount / 1_000_000).toFixed(6)} EGOC` },
+                { label: 'Amount',    val: txDisplayAmount(selectedTx) },
                 {
                   label: 'Fee',
                   val: (() => {

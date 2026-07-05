@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { listen } from '@tauri-apps/api/event';
 import Pagination from '../components/Pagination';
+import { txDisplayAmount } from '../constants';
 
 interface LedgerBlock {
   height: number;
@@ -415,7 +416,7 @@ const ExplorerPage: React.FC = () => {
                           </td>
                           <td className="px-5 py-3 font-mono text-xs text-gray-400">{fromFinal}</td>
                           <td className="px-5 py-3 font-mono text-xs text-gray-400">{toFinal}</td>
-                          <td className="px-5 py-3 text-right text-gray-200">{(tx.amount / 1_000_000).toFixed(2)} EGOC</td>
+                          <td className="px-5 py-3 text-right text-gray-200">{txDisplayAmount(tx, 2)}</td>
                           <td className="px-5 py-3 text-right">
                             <span className={`text-xs px-2 py-0.5 rounded-full ${
                               tx.status === 'Confirmed' ? 'bg-green-500/20 text-green-400' :
@@ -636,7 +637,7 @@ const ExplorerPage: React.FC = () => {
                 {selectedTx.status === 'Confirmed' ? '✅' : (selectedTx.status === 'Pending' || selectedTx.status.startsWith('Confirming')) ? '⏳' : '❌'}
               </div>
               <div className="text-2xl font-black text-white">
-                {(selectedTx.amount / 1_000_000).toFixed(6)} EGOC
+                {txDisplayAmount(selectedTx)}
               </div>
               <div className={`text-sm ${
                 selectedTx.status === 'Confirmed' ? 'text-green-400' :
@@ -649,7 +650,7 @@ const ExplorerPage: React.FC = () => {
                 { label: 'Block',     val: selectedTx.block_height != null ? `#${selectedTx.block_height.toLocaleString()}` : 'Unconfirmed' },
                 { label: 'From',      val: selectedTx.from,                    mono: true },
                 { label: 'To',        val: selectedTx.to,                      mono: true },
-                { label: 'Amount',    val: `${(selectedTx.amount / 1_000_000).toFixed(6)} EGOC` },
+                { label: 'Amount',    val: txDisplayAmount(selectedTx) },
                 { label: 'Fee',       val: selectedTx.fee_uegoc && selectedTx.fee_uegoc > 0 ? `${(selectedTx.fee_uegoc / 1_000_000).toFixed(6)} EGOC` : '0 EGOC' },
                 { label: 'Nonce',     val: String(selectedTx.nonce) },
                 { label: 'Timestamp', val: sfTime(selectedTx.timestamp) },
