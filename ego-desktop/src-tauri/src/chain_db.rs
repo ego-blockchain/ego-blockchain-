@@ -4982,13 +4982,23 @@ pub fn emission_v2_active(height: u64) -> bool {
     is_feature_enabled(FEATURE_EMISSION_V2)
 }
 
+/// Emission-weight validator count: only REGISTERED validators whose CURRENT
+/// stake meets the floor. Registration alone must never mint emission weight —
+/// otherwise ghost registrations (or register-then-unstake) inflate the v2
+/// emission rate for free. Stake state is chain-derived, so every node counts
+/// identically at a given applied height.
 fn registered_validator_count_inner(db: &DB) -> u64 {
     let Some(cf) = db.cf_handle(CF_META) else { return 0 };
+    let floor = crate::p2p::min_validator_stake_uegoc();
     let mut n = 0u64;
     for item in db.prefix_iterator_cf(cf, b"bls_reg:") {
-        let Ok((k, _)) = item else { break };
+        let Ok((k, v)) = item else { break };
         if !k.starts_with(b"bls_reg:") { break; }
-        n += 1;
+        let Ok(addr) = String::from_utf8(v.to_vec()) else { continue };
+        if addr.is_empty() { continue; }
+        if crate::ledger::get_validator_stake(&addr) >= floor {
+            n += 1;
+        }
     }
     n
 }

@@ -337,6 +337,14 @@ fn headless_main() {
         });
 
         tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            loop {
+                tokio::task::spawn_blocking(crate::p2p::maybe_emit_validator_registration).await.ok();
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            }
+        });
+
+        tokio::spawn(async {
             crate::p2p::run_porep_challenge_loop().await;
         });
 
@@ -988,11 +996,17 @@ fn main() {
                     }
                 });
 
-                // Publish this validator's address↔BLS binding on-chain (once) so
-                // the oracle/peers can stake-weight its QC votes.
+                // Publish this validator's address↔BLS binding on-chain so the
+                // oracle/peers can stake-weight its QC votes. Retries periodically:
+                // the fn skips itself once registered, and under emission v2 it
+                // defers until the node has staked the floor — so a node that
+                // stakes later still registers without a restart.
                 tokio::spawn(async {
                     tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-                    tokio::task::spawn_blocking(crate::p2p::maybe_emit_validator_registration).await.ok();
+                    loop {
+                        tokio::task::spawn_blocking(crate::p2p::maybe_emit_validator_registration).await.ok();
+                        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                    }
                 });
 
                 crate::p2p::restore_dht_cache().await;

@@ -9527,6 +9527,18 @@ pub fn maybe_emit_validator_registration() {
     let addr = ledger.address.clone();
     if addr.is_empty() { return; }
 
+    if crate::chain_db::emission_v2_active(crate::chain_db::latest_block_info().0.saturating_add(1)) {
+        let floor = min_validator_stake_uegoc();
+        let staked = crate::ledger::get_validator_stake(&addr);
+        if staked < floor {
+            eprintln!(
+                "[Validator] Registration deferred — stake {} uEGOC below the {} uEGOC floor (stake first; registration carries emission weight under emission v2)",
+                staked, floor
+            );
+            return;
+        }
+    }
+
     let bls_pk_hex = hex::encode(crate::bls_agg::bls_pubkey(bls_sk));
     let bls_pk_bytes = crate::bls_agg::bls_pubkey(bls_sk);
     use ed25519_dalek::{SigningKey, Signer};
