@@ -2155,7 +2155,7 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
 
     let tx_fees_sum: u64 = txs.iter().map(|t| t.fee_uegoc).sum();
     let remaining = crate::tokenomics::TOTAL_SUPPLY_UEGOC.saturating_sub(circulating_supply_inner(&db));
-    let reward = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash).min(remaining);
+    let reward = expected_block_reward_inner(&db, height, timestamp, tx_fees_sum, &prev_hash).min(remaining);
     if reward == 0 {
         tracing::warn!("Supply cap reached at block {} — no coinbase reward", height);
     }
@@ -2437,7 +2437,7 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
 
     let tx_fees_sum: u64 = valid_txs.iter().map(|t| t.fee_uegoc).sum();
     let remaining = crate::tokenomics::TOTAL_SUPPLY_UEGOC.saturating_sub(circulating_supply_inner(&db));
-    let reward = crate::tokenomics::compute_block_reward(height, tx_fees_sum, &prev_hash).min(remaining);
+    let reward = expected_block_reward_inner(&db, height, timestamp, tx_fees_sum, &prev_hash).min(remaining);
     if reward == 0 {
         tracing::warn!("Supply cap reached at block {} — no coinbase reward", height);
     }
@@ -2755,15 +2755,27 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
         .map(|t| t.fee_uegoc)
         .sum();
     let remaining = crate::tokenomics::TOTAL_SUPPLY_UEGOC.saturating_sub(circulating_supply_inner(db));
-    let expected_reward = crate::tokenomics::compute_block_reward(
+    let v2 = emission_v2_active(block.height);
+    let expected_reward = expected_block_reward_inner(
+        db,
         block.height,
+        block.timestamp,
         tx_fees_sum,
         &block.prev_hash,
     ).min(remaining);
     let expected_staking_fee = crate::tokenomics::staking_fee_share(tx_fees_sum);
 
-    // Tolerate reward=0 from nodes that missed the genesis pool seeding
-    if block.reward != expected_reward && block.reward != 0 {
+    // Tolerate reward=0 from nodes that missed the genesis pool seeding.
+    // v2: the reward is an upper bound (registry growth must not invalidate
+    // history on resync); v1 keeps exact equality.
+    if v2 {
+        if block.reward > expected_reward {
+            return Err(format!(
+                "invalid block reward: got {}, v2 cap is {}",
+                block.reward, expected_reward
+            ));
+        }
+    } else if block.reward != expected_reward && block.reward != 0 {
         return Err(format!(
             "invalid block reward: got {}, expected {}",
             block.reward,
@@ -2776,12 +2788,15 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
         .collect();
     if block.reward > 0 {
         let cb = coinbase_txs.first().ok_or_else(|| "coinbase tx missing".to_string())?;
+        // v2: the coinbase commits to the producer's actual (capped) reward,
+        // already bounds-checked against expected_reward above.
+        let reward_for_cb = if v2 { block.reward } else { expected_reward };
         let expected_hash = format!("0x{}", blake3::hash(
-            format!("coinbase:{}:{}:{}:{}", block.height, block.miner, expected_reward, block.timestamp).as_bytes()
+            format!("coinbase:{}:{}:{}:{}", block.height, block.miner, reward_for_cb, block.timestamp).as_bytes()
         ).to_hex());
         if cb.from != NODE_POOL_ADDR
             || cb.to != block.miner
-            || cb.amount != expected_reward
+            || cb.amount != reward_for_cb
             || cb.signature != "coinbase"
             || cb.tx_type != "reward"
             || cb.hash != expected_hash
@@ -4954,6 +4969,67 @@ fn apply_credit_txs(db: &DB, txs: &[&crate::ledger::LedgerTx]) {
         batch.put_cf(cf, &key, u64_le(next));
     }
     let _ = db.write(batch);
+}
+
+pub const FEATURE_EMISSION_V2: &str = "emission_v2";
+
+pub fn emission_v2_active(height: u64) -> bool {
+    if let Ok(v) = std::env::var("EGO_EMISSION_V2_HEIGHT") {
+        if let Ok(h) = v.parse::<u64>() {
+            return height >= h;
+        }
+    }
+    is_feature_enabled(FEATURE_EMISSION_V2)
+}
+
+fn registered_validator_count_inner(db: &DB) -> u64 {
+    let Some(cf) = db.cf_handle(CF_META) else { return 0 };
+    let mut n = 0u64;
+    for item in db.prefix_iterator_cf(cf, b"bls_reg:") {
+        let Ok((k, _)) = item else { break };
+        if !k.starts_with(b"bls_reg:") { break; }
+        n += 1;
+    }
+    n
+}
+
+fn block_ts_inner(db: &DB, height: u64) -> i64 {
+    db.cf_handle(CF_BLOCKS)
+        .and_then(|cf| db.get_cf(cf, height_key(height)).ok().flatten())
+        .and_then(|v| decode::<LedgerBlock>(&v))
+        .map(|b| b.timestamp)
+        .unwrap_or(0)
+}
+
+/// The block reward every validator independently derives. v2 (activation-gated):
+/// time-based emission scaled by registered-validator count + the miner fee
+/// share. Validation treats it as an UPPER bound rather than exact equality —
+/// the registry only grows, so historical blocks stay valid on resync and a
+/// one-registration skew between two live nodes can't reject an honest block.
+pub(crate) fn expected_block_reward_inner(
+    db: &DB,
+    height: u64,
+    block_ts: i64,
+    tx_fees_sum: u64,
+    prev_hash: &str,
+) -> u64 {
+    if emission_v2_active(height) {
+        let parent_ts = if height > 0 { block_ts_inner(db, height - 1) } else { 0 };
+        let parent_ts = if parent_ts > 0 { parent_ts } else { block_ts };
+        let genesis_ts = block_ts_inner(db, 0);
+        let n = registered_validator_count_inner(db).max(1);
+        crate::tokenomics::compute_block_reward_v2(
+            crate::tokenomics::emission_v2_base(genesis_ts, parent_ts, block_ts, n),
+            tx_fees_sum,
+        )
+    } else {
+        crate::tokenomics::compute_block_reward(height, tx_fees_sum, prev_hash)
+    }
+}
+
+pub fn expected_block_reward(height: u64, block_ts: i64, tx_fees_sum: u64, prev_hash: &str) -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    expected_block_reward_inner(&db, height, block_ts, tx_fees_sum, prev_hash)
 }
 
 pub const FEATURE_ESCROW_VALIDATION: &str = "escrow_validation";
