@@ -303,6 +303,8 @@ const WalletPage: React.FC = () => {
   const [creditsAmt, setCreditsAmt]   = useState('');
   const [creditsBusy, setCreditsBusy] = useState(false);
   const [creditsMsg, setCreditsMsg]   = useState<string | null>(null);
+  const [egusdSendTo, setEgusdSendTo]   = useState('');
+  const [egusdSendAmt, setEgusdSendAmt] = useState('');
   const [txs, setTxs]               = useState<LedgerTx[]>([]);
   const [tab, setTab]               = useState<'all' | 'sent' | 'received' | 'rewards'>('all');
   const [txPage, setTxPage]         = useState(1);
@@ -2477,6 +2479,49 @@ const WalletPage: React.FC = () => {
               <div className="text-[11px] text-gray-500 leading-relaxed">
                 Conversion is one-way: EGOC is burned (reducing supply) and EGUSD is minted at the network
                 oracle price. EGUSD is Ego's native stable dollar for real-world payments.
+              </div>
+
+              <div className="border-t border-gray-700 pt-3">
+                <label className="text-xs text-gray-400 block mb-1.5">Send EGUSD</label>
+                <input
+                  type="text"
+                  value={egusdSendTo}
+                  onChange={e => setEgusdSendTo(e.target.value)}
+                  placeholder="Recipient address (egot1…)"
+                  className="w-full bg-gray-900 border border-gray-700 focus:border-emerald-500 rounded-xl px-4 py-3 text-sm outline-none transition mb-2 font-mono"
+                />
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={egusdSendAmt}
+                  onChange={e => setEgusdSendAmt(e.target.value)}
+                  placeholder="Amount in EGUSD (e.g. 25.00)"
+                  className="w-full bg-gray-900 border border-gray-700 focus:border-emerald-500 rounded-xl px-4 py-3 text-sm outline-none transition mb-2"
+                />
+                <button
+                  disabled={creditsBusy || !(parseFloat(egusdSendAmt) > 0) || !egusdSendTo.trim().startsWith('egot1')}
+                  onClick={async () => {
+                    setCreditsBusy(true);
+                    setCreditsMsg(null);
+                    try {
+                      const res = await invoke<{ hash: string; credits: number; message: string }>('pay_credits', {
+                        toAddress: egusdSendTo.trim(),
+                        credits: Math.round(parseFloat(egusdSendAmt) * 100),
+                      });
+                      setCreditsMsg(res.message);
+                      setEgusdSendAmt('');
+                      setEgusdSendTo('');
+                    } catch (err) {
+                      setCreditsMsg(String(err));
+                    } finally {
+                      setCreditsBusy(false);
+                    }
+                  }}
+                  className="w-full py-3 bg-gray-700 hover:bg-gray-600 disabled:opacity-40 rounded-xl font-semibold text-sm transition"
+                >
+                  {creditsBusy ? 'Sending…' : 'Send EGUSD'}
+                </button>
               </div>
             </div>
           </div>

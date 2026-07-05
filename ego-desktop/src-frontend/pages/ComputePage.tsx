@@ -175,6 +175,7 @@ export default function ComputePage() {
 
   const [bookOpen,         setBookOpen]         = useState<ComputeCapacityOffer | null>(null);
   const [bookDurationMins, setBookDurationMins] = useState(1_440);
+  const [bookPayEgusd, setBookPayEgusd] = useState(false);
   const [booking,          setBooking]          = useState(false);
   const [bookMsg,          setBookMsg]          = useState('');
   const [busyRes,          setBusyRes]          = useState<string | null>(null);
@@ -331,7 +332,7 @@ export default function ComputePage() {
     if (!bookOpen) return;
     setBooking(true); setBookMsg('');
     try {
-      await invoke<string>('book_reservation', { offerId: bookOpen.offer_id, durationMinutes: bookDurationMins });
+      await invoke<string>('book_reservation', { offerId: bookOpen.offer_id, durationMinutes: bookDurationMins, payWithEgusd: bookPayEgusd });
       setBookOpen(null);
       await load();
     } catch (err: any) { setBookMsg(String(err)); }
@@ -1547,6 +1548,16 @@ export default function ComputePage() {
               )}
             </div>
 
+            <label className="flex items-center gap-2.5 bg-gray-900/60 border border-gray-700 rounded-lg px-3 py-2.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={bookPayEgusd}
+                onChange={e => setBookPayEgusd(e.target.checked)}
+                className="accent-emerald-500"
+              />
+              <span className="text-sm text-gray-200">Pay with EGUSD <span className="text-gray-500">(stable — billed at the live EGOC price at booking)</span></span>
+            </label>
+
             {bookOpen.bonded ? (
               <div className="bg-green-950/20 border border-green-800/40 rounded-lg p-3 text-xs text-green-300 space-y-1">
                 <p className="font-medium">✓ Your payment is protected</p>
@@ -1563,7 +1574,7 @@ export default function ComputePage() {
             <div className="flex gap-3">
               <button onClick={bookReservation} disabled={booking}
                 className="flex-1 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-sm font-medium disabled:opacity-60">
-                {booking ? 'Booking…' : `Confirm — Pay ${fmt(Math.round(hourlyRate(bookOpen) * bookDurationMins / 60))} EGOC`}
+                {booking ? 'Booking…' : `Confirm — Pay ${fmt(Math.round(hourlyRate(bookOpen) * bookDurationMins / 60))} ${bookPayEgusd ? 'EGOC-worth in EGUSD' : 'EGOC'}`}
               </button>
               <button onClick={() => setBookOpen(null)}
                 className="flex-1 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg text-sm">
