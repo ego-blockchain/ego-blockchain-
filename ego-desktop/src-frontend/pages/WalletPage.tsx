@@ -980,7 +980,7 @@ const WalletPage: React.FC = () => {
             )}
             {!isLiveMode && creditsBal && (
               <div className="text-xs mt-1 text-emerald-300 font-medium">
-                💵 {creditsBal.credits.toLocaleString()} Credits · ${creditsBal.usd_value.toFixed(2)} stable
+                {creditsBal.usd_value.toFixed(2)} EGUSD · stable ≡ ${creditsBal.usd_value.toFixed(2)}
               </div>
             )}
           </div>
@@ -1033,7 +1033,7 @@ const WalletPage: React.FC = () => {
             { label: '↓ Receive', live: false, action: () => setShowReceive(true) },
             { label: '⇄ Swap',   live: true,  action: openSwap },
             {
-              label: '💵 Credits',
+              label: '$ EGUSD',
               live: false,
               action: () => {
                 setCreditsMsg(null);
@@ -2424,17 +2424,17 @@ const WalletPage: React.FC = () => {
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm" onClick={e => { if (e.target === e.currentTarget) setShowCredits(false); }}>
           <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-md border border-gray-700 shadow-2xl">
             <div className="flex justify-between items-center mb-4">
-              <h3 className="text-lg font-bold">💵 Stable Credits</h3>
+              <h3 className="text-lg font-bold">$ EGUSD — Stable Dollar</h3>
               <button onClick={() => setShowCredits(false)} className="text-gray-400 hover:text-white text-xl">✕</button>
             </div>
             <div className="rounded-xl bg-gray-900 border border-gray-700 p-4 mb-4">
-              <div className="text-xs text-gray-400 mb-1">Your credits</div>
-              <div className="text-2xl font-black">{(creditsBal?.credits ?? 0).toLocaleString()} <span className="text-sm font-semibold text-emerald-400">= ${(creditsBal?.usd_value ?? 0).toFixed(2)}</span></div>
-              <div className="text-xs text-gray-500 mt-1">1 credit = $0.01, always. Credits never change value — use them for payments, fees and bills.</div>
+              <div className="text-xs text-gray-400 mb-1">Your EGUSD</div>
+              <div className="text-2xl font-black">{(creditsBal?.usd_value ?? 0).toFixed(2)} EGUSD <span className="text-sm font-semibold text-emerald-400">= ${(creditsBal?.usd_value ?? 0).toFixed(2)}</span></div>
+              <div className="text-xs text-gray-500 mt-1">1 EGUSD = 1 US dollar, always. EGUSD never changes value — use it for payments, fees and bills.</div>
             </div>
             <div className="space-y-3">
               <div>
-                <label className="text-xs text-gray-400 block mb-1.5">Convert EGOC → Credits (burns EGOC at the live price)</label>
+                <label className="text-xs text-gray-400 block mb-1.5">Convert EGOC → EGUSD (burns EGOC at the live price)</label>
                 <input
                   type="number"
                   min="0"
@@ -2446,8 +2446,8 @@ const WalletPage: React.FC = () => {
               </div>
               {creditsBal && parseFloat(creditsAmt) > 0 && (
                 <div className="text-xs text-gray-400">
-                  ≈ {Math.floor(parseFloat(creditsAmt) * creditsBal.egoc_price_usd * 100).toLocaleString()} credits
-                  (${(parseFloat(creditsAmt) * creditsBal.egoc_price_usd).toFixed(2)}) at ${creditsBal.egoc_price_usd.toFixed(2)}/EGOC
+                  ≈ {(Math.floor(parseFloat(creditsAmt) * creditsBal.egoc_price_usd * 100) / 100).toFixed(2)} EGUSD
+                  at ${creditsBal.egoc_price_usd.toFixed(2)}/EGOC
                 </div>
               )}
               {creditsMsg && (
@@ -2472,11 +2472,11 @@ const WalletPage: React.FC = () => {
                 }}
                 className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 rounded-xl font-semibold text-sm transition"
               >
-                {creditsBusy ? 'Converting…' : 'Convert to Credits'}
+                {creditsBusy ? 'Converting…' : 'Convert to EGUSD'}
               </button>
               <div className="text-[11px] text-gray-500 leading-relaxed">
-                Conversion is one-way: EGOC is burned (reducing supply) and credits are minted at the network
-                oracle price. Credits are the stable unit for real-world payments on Ego.
+                Conversion is one-way: EGOC is burned (reducing supply) and EGUSD is minted at the network
+                oracle price. EGUSD is Ego's native stable dollar for real-world payments.
               </div>
             </div>
           </div>
