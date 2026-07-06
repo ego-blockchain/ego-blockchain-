@@ -52,10 +52,21 @@ export async function submitTx(
   tx: object,
   rpcUrl = DEFAULT_RPC_URL,
 ): Promise<SubmitTxResponse> {
-  return fetchJSON<SubmitTxResponse>(`${rpcUrl}/tx/submit`, {
-    method: 'POST',
-    body: JSON.stringify({ tx }),
-  });
+  return jsonRpc<SubmitTxResponse>(rpcUrl, 'tx.submit', { tx });
+}
+
+export interface NonceInfo {
+  last_confirmed: number;
+  next: number;
+  fee_uegoc: number;
+  chain_id: number;
+}
+
+export async function getNonceInfo(
+  address: string,
+  rpcUrl = DEFAULT_RPC_URL,
+): Promise<NonceInfo> {
+  return jsonRpc<NonceInfo>(rpcUrl, 'wallet.getNonce', { address });
 }
 
 export async function getBlocks(rpcUrl = DEFAULT_RPC_URL): Promise<BlockSummary[]> {

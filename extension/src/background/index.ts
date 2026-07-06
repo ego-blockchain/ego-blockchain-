@@ -8,12 +8,13 @@ import {
   seedToKeypair,
   seedToMnemonic,
   signMessage,
-  signTransaction,
+  buildSignedEgoTx,
 } from '../shared/crypto';
 import {
   getBalance,
   getBlocks,
   getHealth,
+  getNonceInfo,
   getTransactions,
   requestFaucet,
   submitTx,
@@ -215,30 +216,24 @@ async function sendTransaction(
   const walletData = await loadWalletData();
   if (!walletData) return { success: false, error: 'No wallet' };
 
-  const nonce = await getNextNonce();
-  const txPayload = {
-    from: walletData.address,
-    to: params.to,
-    amount_uegoc: Math.round(params.amount_egoc * 1_000_000),
-    nonce,
-    memo: params.memo ?? '',
-    timestamp: Date.now(),
-  };
-
-  const { tx, signature, public_key_hex } = signTransaction(txPayload, unlockedSeed);
-
-  const txObj = {
-    ...tx,
-    signature,
-    public_key_hex,
-    type: 'Transfer',
-  };
-
   try {
     const rpcUrl = getRpcUrl(walletData.network);
-    const result = await submitTx(txObj, rpcUrl);
-    await incrementNonce();
-    return { success: true, data: { tx_hash: result.tx_hash } };
+    // Nonce and fee come from the chain, never a local counter — this keeps
+    // the extension in sync even when the same wallet is used in Ego Desktop.
+    const info = await getNonceInfo(walletData.address, rpcUrl);
+
+    const tx = buildSignedEgoTx(
+      unlockedSeed,
+      walletData.address,
+      params.to,
+      Math.round(params.amount_egoc * 1_000_000),
+      info.next,
+      info.fee_uegoc,
+      params.memo ?? '',
+    );
+
+    const result = await submitTx(tx, rpcUrl);
+    return { success: true, data: { tx_hash: result.tx_hash ?? tx.hash } };
   } catch (e: unknown) {
     return { success: false, error: (e as Error).message };
   }

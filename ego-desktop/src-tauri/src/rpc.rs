@@ -384,6 +384,48 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
             RpcResponse::ok(req.id, json!({ "uegoc": bal, "egoc": bal as f64 / 1_000_000.0 }))
         }
 
+        "wallet.getNonce" => {
+            let addr = p["address"].as_str().unwrap_or_default().to_string();
+            let confirmed = crate::ledger::last_confirmed_nonce(&addr);
+            let pending_max = crate::mempool::get_mempool().peek_all().into_iter()
+                .filter(|t| t.from == addr)
+                .map(|t| t.nonce)
+                .max()
+                .unwrap_or(0);
+            let is_staker = crate::ledger::get_validator_stake(&addr) > 0;
+            let fee = crate::tokenomics::fee_for_tx_with_staking("transfer", is_staker);
+            RpcResponse::ok(req.id, json!({
+                "last_confirmed": confirmed,
+                "next": confirmed.max(pending_max) + 1,
+                "fee_uegoc": fee,
+                "chain_id": 1,
+            }))
+        }
+
+        "tx.submit" => {
+            match serde_json::from_value::<crate::ledger::LedgerTx>(p["tx"].clone()) {
+                Ok(mut tx) => {
+                    tx.status = "Pending".into();
+                    tx.block_height = None;
+                    if let Err(e) = crate::ledger::verify_incoming_tx(&tx) {
+                        RpcResponse::err(req.id, -32000, &format!("rejected: {e}"))
+                    } else {
+                        match crate::mempool::get_mempool().push(tx.clone()) {
+                            Ok(()) => {
+                                let gossip = tx.clone();
+                                tokio::spawn(async move {
+                                    crate::p2p::broadcast_pending_tx(gossip).await;
+                                });
+                                RpcResponse::ok(req.id, json!({ "success": true, "tx_hash": tx.hash }))
+                            }
+                            Err(e) => RpcResponse::err(req.id, -32001, &format!("mempool: {e}")),
+                        }
+                    }
+                }
+                Err(e) => RpcResponse::err(req.id, -32602, &format!("invalid tx object: {e}")),
+            }
+        }
+
         "wallet.getTransactionHistory" => {
             let addr  = p["address"].as_str().unwrap_or_default();
             let limit = p["limit"].as_u64().unwrap_or(50) as usize;
