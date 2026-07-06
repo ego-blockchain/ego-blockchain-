@@ -127,28 +127,104 @@ export function publicKeyToAddress(pubkey: Uint8Array): string {
   return bech32m.encode('egot', bech32m.toWords(payload));
 }
 
-export interface TxPayload {
-  from: string;
-  to: string;
-  amount_uegoc: number;
-  nonce: number;
-  memo?: string;
-  timestamp: number;
+function u64le(n: bigint): Uint8Array {
+  const b = new Uint8Array(8);
+  new DataView(b.buffer).setBigUint64(0, n, true);
+  return b;
 }
 
-export function signTransaction(tx: TxPayload, privateKey: Uint8Array): {
-  tx: TxPayload;
-  signature: string;
-  public_key_hex: string;
-} {
+function toHex(b: Uint8Array): string {
+  return Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
+}
 
-  const keypair = nacl.sign.keyPair.fromSeed(privateKey);
-  const message = new TextEncoder().encode(JSON.stringify(tx));
-  const sig = nacl.sign.detached(message, keypair.secretKey);
+// Byte-identical mirror of Ego Desktop's ledger::tx_signing_bytes_v2:
+// "ego/tx/v2:" chain_id ':' from ':' to ':' amount_u64le ':' nonce_u64le ':'
+// timestamp_i64le ':' memo_len_u32le memo
+export function txSigningBytesV2(
+  from: string,
+  to: string,
+  amountUegoc: bigint,
+  nonce: bigint,
+  timestamp: bigint,
+  chainId: number,
+  memo: string,
+): Uint8Array {
+  const enc = new TextEncoder();
+  const memoBytes = enc.encode(memo.slice(0, 256));
+  const colon = new Uint8Array([0x3a]);
+  const memoLen = new Uint8Array(4);
+  new DataView(memoLen.buffer).setUint32(0, memoBytes.length, true);
+
+  const parts = [
+    enc.encode('ego/tx/v2:'),
+    new Uint8Array([chainId]), colon,
+    enc.encode(from), colon,
+    enc.encode(to), colon,
+    u64le(amountUegoc), colon,
+    u64le(nonce), colon,
+    u64le(BigInt.asUintN(64, timestamp)), colon,
+    memoLen, memoBytes,
+  ];
+  const total = parts.reduce((s, a) => s + a.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const a of parts) { out.set(a, off); off += a.length; }
+  return out;
+}
+
+export interface SignedEgoTx {
+  hash: string;
+  from: string;
+  to: string;
+  amount: number;
+  memo: string | null;
+  timestamp: number;
+  signature: string;
+  status: string;
+  nonce: number;
+  public_key_ed25519: string;
+  fee_uegoc: number;
+  tx_type: string;
+  tx_version: number;
+  chain_id: number;
+}
+
+// Builds a fully-formed, chain-valid transfer exactly like Ego Desktop's
+// send_transaction: v2 signing bytes, Ed25519 signature, and the tx hash
+// bound to blake2s(sign_bytes) — the node verifies all three.
+export function buildSignedEgoTx(
+  seed: Uint8Array,
+  from: string,
+  to: string,
+  amountUegoc: number,
+  nonce: number,
+  feeUegoc: number,
+  memo: string,
+): SignedEgoTx {
+  const chainId = 1;
+  const timestamp = Math.floor(Date.now() / 1000);
+  const signBytes = txSigningBytesV2(
+    from, to, BigInt(amountUegoc), BigInt(nonce), BigInt(timestamp), chainId, memo,
+  );
+  const keypair = nacl.sign.keyPair.fromSeed(seed);
+  const sig = nacl.sign.detached(signBytes, keypair.secretKey);
+  const hash = '0x' + toHex(blake2s(signBytes, undefined, 32));
+
   return {
-    tx,
-    signature: Array.from(sig).map(b => b.toString(16).padStart(2, '0')).join(''),
-    public_key_hex: Array.from(keypair.publicKey).map(b => b.toString(16).padStart(2, '0')).join(''),
+    hash,
+    from,
+    to,
+    amount: amountUegoc,
+    memo: memo || null,
+    timestamp,
+    signature: toHex(sig),
+    status: 'Pending',
+    nonce,
+    public_key_ed25519: toHex(keypair.publicKey),
+    fee_uegoc: feeUegoc,
+    tx_type: 'transfer',
+    tx_version: 2,
+    chain_id: chainId,
   };
 }
 
