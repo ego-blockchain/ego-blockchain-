@@ -394,19 +394,23 @@ fn oracle_submit_token() -> Option<String> {
     std::env::var("EGO_ORACLE_SUBMIT_TOKEN").ok().filter(|s| !s.trim().is_empty())
 }
 
-/// Whether this node feeds chain state to the oracle. Only designated writer
-/// nodes (those holding the submit token) push — end-user clients never do;
-/// they read from the oracle and sync via P2P. This keeps the token a secret
-/// held by a small trusted set instead of shipping it to millions of clients.
+/// A designated ARCHIVE writer holds the submit token and pushes EVERY block
+/// (belt-and-suspenders indexer). Ordinary nodes don't hold the token and don't
+/// need it — see push_block_to_oracle: every node pushes the blocks IT produced,
+/// which the oracle accepts on the block's quorum certificate (no shared secret).
 pub fn is_oracle_writer() -> bool {
     oracle_submit_token().is_some()
 }
 
+/// Feeding the public explorer is on by default. A node contributes exactly the
+/// blocks it produced, so total oracle load is ~1 push per block regardless of
+/// network size. Set EGO_ORACLE_NO_PUSH=1 to opt a node out entirely.
+pub fn oracle_push_enabled() -> bool {
+    !std::env::var("EGO_ORACLE_NO_PUSH").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
+}
+
 async fn oracle_post(client: &reqwest::Client, path: &str, body: &serde_json::Value) {
     let token = oracle_submit_token();
-    if token.is_none() && path == "/chain/submit" {
-        eprintln!("[Oracle] WARNING: EGO_ORACLE_SUBMIT_TOKEN not set — submits will be rejected once the oracle enforces auth");
-    }
     for base in ORACLE_RPCS {
         let mut req = client.post(format!("{}{}", base, path)).json(body);
         if let Some(ref t) = token {
@@ -437,8 +441,15 @@ pub async fn oracle_post_pub(client: &reqwest::Client, path: &str, body: &serde_
 }
 
 pub async fn push_block_to_oracle(block: &crate::ledger::LedgerBlock, txs: &[crate::ledger::LedgerTx]) {
-    // Only token-holding writer nodes feed the oracle; plain clients just read.
-    if !is_oracle_writer() { return; }
+    // Two ways to be allowed to feed the oracle, NEITHER needing a shipped secret:
+    //  1. I produced this block (block.miner == my address) — one push per block
+    //     across the whole network, and the oracle accepts it on its quorum
+    //     certificate (a forged block can't fake the BFT signatures).
+    //  2. I'm a designated archive node holding the submit token — pushes all.
+    if !oracle_push_enabled() { return; }
+    let my_addr = local_validator_mutex().lock().unwrap().clone();
+    let i_produced = !my_addr.is_empty() && block.miner == my_addr;
+    if !i_produced && !is_oracle_writer() { return; }
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
@@ -9344,7 +9355,7 @@ async fn merge_remote_chain_inner(
         }
         tokio::spawn(try_proactive_proposal());
 
-        if is_oracle_writer() {
+        if oracle_push_enabled() {
             let tip_h = crate::chain_db::latest_block_info().0;
             tokio::spawn(async move {
                 let fetched = tokio::task::spawn_blocking(move || {
