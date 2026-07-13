@@ -2898,6 +2898,27 @@ pub enum P2PMessage {
         timestamp: i64,
         signature: String,
     },
+    PocBeacon {
+        beacon_id:  String,
+        address:    String,
+        machine_id: String,
+        cell:       String,
+        epoch:      u64,
+        timestamp:  i64,
+        transport:  String,
+        signature:  String,
+    },
+    PocWitnessReceipt {
+        beacon_id:          String,
+        beaconer:           String,
+        witness:            String,
+        witness_machine_id: String,
+        witness_cell:       String,
+        latency_ms:         u32,
+        rssi_dbm:           i32,
+        timestamp:          i64,
+        signature:          String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3919,6 +3940,140 @@ pub async fn publish_gossip(topic: &str, data: Vec<u8>) {
     }
 }
 
+fn my_coverage_cell_and_geo() -> (String, f64, f64) {
+    let state = crate::app::global_app_state();
+    let cache = state.cache.lock().unwrap();
+    if let Some(loc) = cache.coverage_status.as_ref().and_then(|cs| cs.location.as_ref()) {
+        let lat = (loc.latitude * 100.0).round() / 100.0;
+        let lon = (loc.longitude * 100.0).round() / 100.0;
+        (crate::commands::coverage::derive_h3_cell(loc.latitude, loc.longitude), lat, lon)
+    } else {
+        (String::new(), 0.0, 0.0)
+    }
+}
+
+pub async fn broadcast_poc_beacon() -> Option<String> {
+    let my_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
+        .await.unwrap_or_default();
+    if my_addr.is_empty() { return None; }
+    let machine_id = crate::commands::coverage::get_machine_id_cached();
+    let (cell, _lat, _lon) = my_coverage_cell_and_geo();
+    let now   = chrono::Utc::now().timestamp();
+    let epoch = crate::poc::poc_epoch(now);
+    let mut nonce = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let beacon_id = hex::encode(blake3::hash(
+        format!("{}:{}:{}", my_addr, epoch, hex::encode(nonce)).as_bytes()
+    ).as_bytes());
+    let transport = "internet".to_string();
+    let bytes = crate::poc::beacon_signing_bytes(&beacon_id, &my_addr, &machine_id, &cell, epoch, now, &transport);
+    let signature = crate::poc::sign_with_node_key(&bytes)?;
+    let msg = P2PMessage::PocBeacon {
+        beacon_id: beacon_id.clone(),
+        address: my_addr,
+        machine_id,
+        cell,
+        epoch,
+        timestamp: now,
+        transport,
+        signature,
+    };
+    let data = serde_json::to_vec(&msg).ok()?;
+    crate::poc::start_beacon(&beacon_id, now);
+    publish_gossip("ego-poc-v1", data).await;
+    eprintln!("[PoC] beacon {} published (epoch {})", &beacon_id[..12], epoch);
+    Some(beacon_id)
+}
+
+async fn handle_poc_beacon(
+    beacon_id: String, address: String, machine_id: String, cell: String,
+    epoch: u64, timestamp: i64, transport: String, signature: String,
+) {
+    let short = &address[..address.len().min(20)];
+    let now = chrono::Utc::now().timestamp();
+    if (now - timestamp).abs() > crate::poc::POC_BEACON_FRESH_SECS {
+        eprintln!("[PoC] beacon from {} rejected: stale ({}s)", short, (now - timestamp).abs());
+        return;
+    }
+    let expected_epoch = crate::poc::poc_epoch(timestamp);
+    if epoch != expected_epoch && epoch != expected_epoch.saturating_sub(1) {
+        eprintln!("[PoC] beacon from {} rejected: epoch mismatch", short);
+        return;
+    }
+    let (my_addr, _) = tokio::task::spawn_blocking(|| {
+        (crate::ledger::Ledger::load().address, ())
+    }).await.unwrap_or_default();
+    if my_addr.is_empty() || my_addr == address { return; }
+    let my_machine = crate::commands::coverage::get_machine_id_cached();
+    if !machine_id.is_empty() && machine_id == my_machine && !crate::poc::poc_same_machine_allowed() {
+        eprintln!("[PoC] beacon from {} rejected: same machine (set EGO_POC_SAME_MACHINE=1 on single-PC testnets)", short);
+        return;
+    }
+    let bytes = crate::poc::beacon_signing_bytes(&beacon_id, &address, &machine_id, &cell, epoch, timestamp, &transport);
+    if !crate::poc::verify_peer_sig(&address, &bytes, &signature) {
+        eprintln!("[PoC] beacon from {} rejected: signature unverifiable (no announced ed25519 key yet?)", short);
+        return;
+    }
+    if !crate::poc::should_witness(&address, epoch) { return; }
+    eprintln!("[PoC] witnessing beacon {} from {}", &beacon_id[..12.min(beacon_id.len())], short);
+
+    let (witness_cell, _lat, _lon) = my_coverage_cell_and_geo();
+    let latency_ms = ((now - timestamp).max(0) as u32).saturating_mul(1000).min(120_000);
+    let rssi_dbm = 0i32;
+    let wbytes = crate::poc::witness_signing_bytes(
+        &beacon_id, &address, &my_addr, &my_machine, &witness_cell, latency_ms, rssi_dbm, now,
+    );
+    let Some(wsig) = crate::poc::sign_with_node_key(&wbytes) else { return; };
+    let receipt = P2PMessage::PocWitnessReceipt {
+        beacon_id,
+        beaconer: address,
+        witness: my_addr,
+        witness_machine_id: my_machine,
+        witness_cell,
+        latency_ms,
+        rssi_dbm,
+        timestamp: now,
+        signature: wsig,
+    };
+    if let Ok(data) = serde_json::to_vec(&receipt) {
+        publish_gossip("ego-poc-v1", data).await;
+    }
+}
+
+async fn handle_poc_witness(
+    beacon_id: String, beaconer: String, witness: String, witness_machine_id: String,
+    witness_cell: String, latency_ms: u32, rssi_dbm: i32, timestamp: i64, signature: String,
+) {
+    let my_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
+        .await.unwrap_or_default();
+    if my_addr.is_empty() || beaconer != my_addr || witness == my_addr { return; }
+    let now = chrono::Utc::now().timestamp();
+    if (now - timestamp).abs() > crate::poc::POC_BEACON_FRESH_SECS { return; }
+    let my_machine = crate::commands::coverage::get_machine_id_cached();
+    if !witness_machine_id.is_empty() && witness_machine_id == my_machine && !crate::poc::poc_same_machine_allowed() {
+        eprintln!("[PoC] receipt from {} rejected: same machine", &witness[..witness.len().min(20)]);
+        return;
+    }
+    let bytes = crate::poc::witness_signing_bytes(
+        &beacon_id, &beaconer, &witness, &witness_machine_id, &witness_cell, latency_ms, rssi_dbm, timestamp,
+    );
+    if !crate::poc::verify_peer_sig(&witness, &bytes, &signature) {
+        eprintln!("[PoC] receipt from {} rejected: signature unverifiable", &witness[..witness.len().min(20)]);
+        return;
+    }
+    let accepted = crate::poc::add_witness(&beacon_id, crate::poc::PocWitnessRecord {
+        witness:    witness.clone(),
+        machine_id: witness_machine_id,
+        cell:       witness_cell,
+        latency_ms,
+        timestamp,
+        signature,
+    });
+    if accepted {
+        eprintln!("[PoC] witness receipt accepted from {} ({}ms)", &witness[..witness.len().min(20)], latency_ms);
+    }
+}
+
 pub async fn broadcast_tx(tx: LedgerTx, block: LedgerBlock) {
     // This is an async function, so all blocking calls must be wrapped.
     let msg = P2PMessage::TxBroadcast { tx: tx.clone(), block: block.clone() };
@@ -4090,6 +4245,18 @@ pub async fn send_direct_peer_announce(target_endpoint: String) {
     let endpoints = vec![my_ep.clone()];
     let genesis_hash = crate::ledger::GENESIS_HASH.to_string();
     let machine_id = crate::commands::coverage::get_machine_id_cached();
+    let (my_city, my_country, my_lat, my_lon) = {
+        let state = crate::app::global_app_state();
+        let cache = state.cache.lock().unwrap();
+        if let Some(loc) = cache.coverage_status.as_ref().and_then(|cs| cs.location.as_ref()) {
+            (
+                loc.city.clone(),
+                loc.country.clone(),
+                Some((loc.latitude * 100.0).round() / 100.0),
+                Some((loc.longitude * 100.0).round() / 100.0),
+            )
+        } else { (None, None, None, None) }
+    };
     let signature = sign_peer_announce(
         &my_addr, &my_ep, &endpoints, coverage_score,
         &dil_hex, &vrf_hex, staked_amount, &genesis_hash, &machine_id,
@@ -4097,7 +4264,7 @@ pub async fn send_direct_peer_announce(target_endpoint: String) {
     let announce = P2PMessage::PeerAnnounce {
         address: my_addr, name: "Ego Node".to_string(),
         endpoint: my_ep, endpoints,
-        city: None, country: None, lat: None, lon: None,
+        city: my_city, country: my_country, lat: my_lat, lon: my_lon,
         coverage_score, dilithium_pubkey: dil_hex, vrf_pubkey: vrf_hex,
         staked_amount, genesis_hash, signature, machine_id,
     };
@@ -4577,6 +4744,7 @@ pub async fn check_file_replication() {
 
     for file in ledger.stored_files.iter_mut() {
         if file.status != "Active" { continue; }
+        if file.from_egosafe && file.replication_role.is_empty() { continue; }
         let has_data = !file.local_path.is_empty() && !file.local_path.starts_with("sender:");
 
         // ── Assign initial role ───────────────────────────────────────────
@@ -5266,7 +5434,11 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                         let t = gossipsub::IdentTopic::new(topic.clone());
                         match swarm.behaviour_mut().gossipsub.publish(t, data) {
                             Ok(_) => {}
-                            Err(gossipsub::PublishError::NoPeersSubscribedToTopic) => {}
+                            Err(gossipsub::PublishError::NoPeersSubscribedToTopic) => {
+                                if topic == "ego-poc-v1" {
+                                    eprintln!("[PoC] publish on {}: no peers subscribed yet", topic);
+                                }
+                            }
                             Err(e) => eprintln!("[Gossip] publish '{}': {:?}", topic, e),
                         }
                     }
@@ -6988,14 +7160,19 @@ async fn handle_event(
                     }
                 }
             } else if topic == "ego-poc-v1" {
-            if let Ok(P2PMessage::PocEventBroadcast { address, quality, peers, timestamp, signature }) =
-                serde_json::from_slice::<P2PMessage>(&message.data)
-            {
-                // If this desktop node is configured as an Oracle/Relay server, 
-                // process and write the reward to the DB.
-                if IS_RELAY_SERVER.load(Ordering::Relaxed) {
-                    eprintln!("[Oracle] Received PoC Gossip from {}: quality={}, peers={}", address, quality, peers);
+            match serde_json::from_slice::<P2PMessage>(&message.data) {
+                Ok(P2PMessage::PocBeacon { beacon_id, address, machine_id, cell, epoch, timestamp, transport, signature }) => {
+                    tokio::spawn(handle_poc_beacon(beacon_id, address, machine_id, cell, epoch, timestamp, transport, signature));
                 }
+                Ok(P2PMessage::PocWitnessReceipt { beacon_id, beaconer, witness, witness_machine_id, witness_cell, latency_ms, rssi_dbm, timestamp, signature }) => {
+                    tokio::spawn(handle_poc_witness(beacon_id, beaconer, witness, witness_machine_id, witness_cell, latency_ms, rssi_dbm, timestamp, signature));
+                }
+                Ok(P2PMessage::PocEventBroadcast { address, quality, peers, timestamp: _, signature: _ }) => {
+                    if IS_RELAY_SERVER.load(Ordering::Relaxed) {
+                        eprintln!("[Oracle] Received PoC Gossip from {}: quality={}, peers={}", address, quality, peers);
+                    }
+                }
+                _ => {}
             }
             }
         }
@@ -8094,12 +8271,14 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
             let mut ledger = crate::ledger::Ledger::load();
             let enc_str    = enc_path.to_string_lossy().to_string();
             if let Some(f) = ledger.stored_files.iter_mut().find(|f| f.cid == cid) {
-                f.local_path = enc_str.clone();
-                if !key_nonce_hex.is_empty() {
-                    f.key_nonce_hex = crate::ledger::protect_key_hex(&key_nonce_hex).unwrap_or(key_nonce_hex.clone());
+                if f.status != "Active" {
+                    f.local_path = enc_str.clone();
+                    if !key_nonce_hex.is_empty() {
+                        f.key_nonce_hex = crate::ledger::protect_key_hex(&key_nonce_hex).unwrap_or(key_nonce_hex.clone());
+                    }
+                    if f.name.is_empty() { f.name = file_name.clone(); }
+                    f.status = "Received".to_string();
                 }
-                if f.name.is_empty() { f.name = file_name.clone(); }
-                f.status = "Received".to_string();
             } else {
 
                 let now = chrono::Utc::now().timestamp();
@@ -8512,6 +8691,14 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
 
         P2PMessage::PocEventBroadcast { .. } => {}
 
+        P2PMessage::PocBeacon { beacon_id, address, machine_id, cell, epoch, timestamp, transport, signature } => {
+            handle_poc_beacon(beacon_id, address, machine_id, cell, epoch, timestamp, transport, signature).await;
+        }
+
+        P2PMessage::PocWitnessReceipt { beacon_id, beaconer, witness, witness_machine_id, witness_cell, latency_ms, rssi_dbm, timestamp, signature } => {
+            handle_poc_witness(beacon_id, beaconer, witness, witness_machine_id, witness_cell, latency_ms, rssi_dbm, timestamp, signature).await;
+        }
+
         P2PMessage::ShardRebalance { .. } => {}
 
         P2PMessage::ShardTxRoute { shard_id, tx } => {
@@ -8596,7 +8783,7 @@ async fn update_ledger_for_block(manifest_cid: &str, app: Option<&tauri::AppHand
         if received > prev {
             f.last_block_at = chrono::Utc::now().timestamp();
         }
-        if received >= total {
+        if received >= total && f.status != "Active" {
             f.status     = "Received".to_string();
             f.local_path = crate::blocks::manifest_path(manifest_cid)
                 .to_string_lossy().to_string();
@@ -8656,7 +8843,7 @@ async fn process_received_manifest(manifest_cid: &str, app: Option<&tauri::AppHa
                 if f.last_block_at == 0 || received > prev {
                     f.last_block_at = now;
                 }
-                if received >= total {
+                if received >= total && f.status != "Active" {
                     f.status     = "Received".to_string();
                     f.local_path = crate::blocks::manifest_path(manifest_cid)
                         .to_string_lossy().to_string();

@@ -140,14 +140,14 @@ fn quality_str(q: &NetworkQuality) -> &'static str {
     }
 }
 
-fn derive_h3_cell(lat: f64, lon: f64) -> String {
+pub fn derive_h3_cell(lat: f64, lon: f64) -> String {
     let a = (lat.abs() * 1_000.0).round() as u64;
     let b = (lon.abs() * 1_000.0).round() as u64;
     let n = a.wrapping_mul(180_000).wrapping_add(b) & 0xFFFF_FFFF;
     format!("892{:09x}ff", n % 1_000_000_000)
 }
 
-fn maybe_record_poc_event(status: &CoverageStatus) {
+fn maybe_record_poc_event(status: &CoverageStatus, witnesses: Option<Vec<crate::poc::PocWitnessRecord>>) {
     let now    = chrono::Utc::now().timestamp();
     let mut events = crate::ledger::load_poc_events();
 
@@ -158,7 +158,13 @@ fn maybe_record_poc_event(status: &CoverageStatus) {
     if !should_record { return; }
 
     let quality = quality_str(&status.network_quality);
-    let peers   = status.coverage_synced_count;
+    // Witness-backed count when signed receipts arrived for our beacon;
+    // otherwise fall back to the legacy reachability estimate so nodes
+    // surrounded by old builds keep earning until the network upgrades.
+    let (peers, witness_addrs): (u32, Vec<String>) = match witnesses {
+        Some(w) if !w.is_empty() => (w.len() as u32, w.into_iter().map(|r| r.witness).collect()),
+        _ => (status.coverage_synced_count, Vec::new()),
+    };
     // Continuous reward: 11,111 base + 1,500 per witnessed peer, cap 44,444 (~22 peers).
     // This makes every additional peer genuinely worth more reward rather than
     // jumping between a few fixed tiers.
@@ -177,6 +183,7 @@ fn maybe_record_poc_event(status: &CoverageStatus) {
         peers,
         reward_uegoc,
         h3_cell,
+        witnesses: witness_addrs,
     });
 
     if events.len() > 200 {
@@ -333,7 +340,17 @@ async fn tick_coverage(
     let _ = app.emit_all("ego://coverage-updated", ());
 
     if is_online {
-        maybe_record_poc_event(&status);
+        let now = chrono::Utc::now().timestamp();
+        if let Some((_beacon_id, records)) = crate::poc::take_beacon_older_than(now - 60) {
+            eprintln!("[PoC] beacon finalized — {} signed witness receipt(s)", records.len());
+            maybe_record_poc_event(&status, Some(records));
+        }
+        let last_event_ts = crate::ledger::load_poc_events().last().map(|e| e.timestamp).unwrap_or(0);
+        if crate::poc::current_beacon().is_none() && now - last_event_ts >= 180 {
+            if crate::p2p::broadcast_poc_beacon().await.is_none() && now - last_event_ts >= 300 {
+                maybe_record_poc_event(&status, None);
+            }
+        }
         eprintln!(
             "[Coverage] tick — peers: {}, quality: {}, PoC eligible",
             peer_count,

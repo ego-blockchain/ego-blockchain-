@@ -163,6 +163,140 @@ pub fn check_slot_winner(prev_hash: &str) -> Option<(String, String)> {
     }
 }
 
+pub const POC_EPOCH_SECS: i64 = 240;
+pub const POC_BEACON_FRESH_SECS: i64 = 120;
+pub const POC_MAX_WITNESSES: usize = 22;
+const POC_WITNESSED_EPOCHS_CAP: usize = 10_000;
+
+#[derive(Debug, Clone)]
+pub struct PocWitnessRecord {
+    pub witness:    String,
+    pub machine_id: String,
+    pub cell:       String,
+    pub latency_ms: u32,
+    pub timestamp:  i64,
+    pub signature:  String,
+}
+
+static ACTIVE_BEACON: OnceCell<Mutex<Option<(String, i64)>>> = OnceCell::new();
+static BEACON_WITNESSES: OnceCell<Mutex<HashMap<String, PocWitnessRecord>>> = OnceCell::new();
+static WITNESSED_EPOCHS: OnceCell<Mutex<HashMap<String, u64>>> = OnceCell::new();
+
+fn active_beacon() -> std::sync::MutexGuard<'static, Option<(String, i64)>> {
+    ACTIVE_BEACON.get_or_init(|| Mutex::new(None)).lock().expect("active_beacon lock poisoned")
+}
+
+fn beacon_witnesses() -> std::sync::MutexGuard<'static, HashMap<String, PocWitnessRecord>> {
+    BEACON_WITNESSES.get_or_init(|| Mutex::new(HashMap::new())).lock().expect("beacon_witnesses lock poisoned")
+}
+
+fn witnessed_epochs() -> std::sync::MutexGuard<'static, HashMap<String, u64>> {
+    WITNESSED_EPOCHS.get_or_init(|| Mutex::new(HashMap::new())).lock().expect("witnessed_epochs lock poisoned")
+}
+
+pub fn poc_epoch(ts: i64) -> u64 {
+    (ts / POC_EPOCH_SECS).max(0) as u64
+}
+
+pub fn poc_same_machine_allowed() -> bool {
+    std::env::var("EGO_POC_SAME_MACHINE").map(|v| v == "1").unwrap_or(false)
+}
+
+pub fn beacon_signing_bytes(
+    beacon_id: &str, address: &str, machine_id: &str,
+    cell: &str, epoch: u64, timestamp: i64, transport: &str,
+) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"ego/poc-beacon/v1:");
+    v.extend_from_slice(beacon_id.as_bytes());   v.push(b':');
+    v.extend_from_slice(address.as_bytes());     v.push(b':');
+    v.extend_from_slice(machine_id.as_bytes());  v.push(b':');
+    v.extend_from_slice(cell.as_bytes());        v.push(b':');
+    v.extend_from_slice(&epoch.to_le_bytes());   v.push(b':');
+    v.extend_from_slice(&timestamp.to_le_bytes()); v.push(b':');
+    v.extend_from_slice(transport.as_bytes());
+    v
+}
+
+pub fn witness_signing_bytes(
+    beacon_id: &str, beaconer: &str, witness: &str, witness_machine_id: &str,
+    witness_cell: &str, latency_ms: u32, rssi_dbm: i32, timestamp: i64,
+) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"ego/poc-witness/v1:");
+    v.extend_from_slice(beacon_id.as_bytes());          v.push(b':');
+    v.extend_from_slice(beaconer.as_bytes());           v.push(b':');
+    v.extend_from_slice(witness.as_bytes());            v.push(b':');
+    v.extend_from_slice(witness_machine_id.as_bytes()); v.push(b':');
+    v.extend_from_slice(witness_cell.as_bytes());       v.push(b':');
+    v.extend_from_slice(&latency_ms.to_le_bytes());     v.push(b':');
+    v.extend_from_slice(&rssi_dbm.to_le_bytes());       v.push(b':');
+    v.extend_from_slice(&timestamp.to_le_bytes());
+    v
+}
+
+pub fn sign_with_node_key(bytes: &[u8]) -> Option<String> {
+    if let Some(kp) = crate::app::global_app_state().get_keypair() {
+        return Some(hex::encode(kp.sign_ed25519(bytes).as_bytes()));
+    }
+    let seed = crate::p2p::get_ed25519_seed()?;
+    use ed25519_dalek::{Signer, SigningKey};
+    let sig = SigningKey::from_bytes(&seed).sign(bytes);
+    Some(hex::encode(sig.to_bytes()))
+}
+
+pub fn verify_peer_sig(address: &str, bytes: &[u8], sig_hex: &str) -> bool {
+    let Some(pk_bytes) = crate::p2p::get_peer_ed25519_pubkey(address) else { return false; };
+    use ed25519_dalek::{Signature as DalekSig, Verifier, VerifyingKey};
+    let Ok(vk) = VerifyingKey::from_bytes(&pk_bytes) else { return false; };
+    let Ok(sig_raw) = hex::decode(sig_hex) else { return false; };
+    let Ok(sig_arr) = <[u8; 64]>::try_from(sig_raw.as_slice()) else { return false; };
+    vk.verify(bytes, &DalekSig::from_bytes(&sig_arr)).is_ok()
+}
+
+pub fn start_beacon(beacon_id: &str, timestamp: i64) {
+    *active_beacon() = Some((beacon_id.to_string(), timestamp));
+    beacon_witnesses().clear();
+}
+
+pub fn current_beacon() -> Option<(String, i64)> {
+    active_beacon().clone()
+}
+
+pub fn add_witness(beacon_id: &str, record: PocWitnessRecord) -> bool {
+    let matches_active = active_beacon()
+        .as_ref()
+        .map(|(id, _)| id == beacon_id)
+        .unwrap_or(false);
+    if !matches_active { return false; }
+    let mut w = beacon_witnesses();
+    if w.len() >= POC_MAX_WITNESSES && !w.contains_key(&record.witness) { return false; }
+    w.insert(record.witness.clone(), record);
+    true
+}
+
+pub fn take_beacon_older_than(cutoff_ts: i64) -> Option<(String, Vec<PocWitnessRecord>)> {
+    let mut active = active_beacon();
+    match active.as_ref() {
+        Some((_, sent)) if *sent <= cutoff_ts => {}
+        _ => return None,
+    }
+    let (id, _) = active.take().unwrap();
+    let records: Vec<PocWitnessRecord> = beacon_witnesses().drain().map(|(_, r)| r).collect();
+    Some((id, records))
+}
+
+pub fn should_witness(beaconer: &str, epoch: u64) -> bool {
+    let mut map = witnessed_epochs();
+    if map.get(beaconer).copied() == Some(epoch) { return false; }
+    if map.len() >= POC_WITNESSED_EPOCHS_CAP && !map.contains_key(beaconer) {
+        map.retain(|_, e| *e + 2 >= epoch);
+        if map.len() >= POC_WITNESSED_EPOCHS_CAP { return false; }
+    }
+    map.insert(beaconer.to_string(), epoch);
+    true
+}
+
 const POC_ENFORCE_HEIGHT: u64 = 100_000;
 
 pub fn verify_ticket(
