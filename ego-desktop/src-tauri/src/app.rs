@@ -251,8 +251,14 @@ impl AppState {
         self.public_endpoint.lock().unwrap().clone()
     }
 
-    pub fn upsert_peer(&self, info: PeerInfo) {
+    pub fn upsert_peer(&self, mut info: PeerInfo) {
         let mut peers = self.peers.lock().unwrap();
+        if let Some(prev) = peers.get(&info.address) {
+            if info.lat.is_none()     { info.lat     = prev.lat; }
+            if info.lon.is_none()     { info.lon     = prev.lon; }
+            if info.city.is_none()    { info.city    = prev.city.clone(); }
+            if info.country.is_none() { info.country = prev.country.clone(); }
+        }
         peers.insert(info.address.clone(), info);
     }
 

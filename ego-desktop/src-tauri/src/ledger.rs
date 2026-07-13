@@ -1132,6 +1132,8 @@ pub struct PocEvent {
     pub peers: u32,
     pub reward_uegoc: u64,
     pub h3_cell: Option<String>,
+    #[serde(default)]
+    pub witnesses: Vec<String>,
 }
 
 pub fn poc_events_path() -> PathBuf {

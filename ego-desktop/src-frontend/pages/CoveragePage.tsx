@@ -44,6 +44,7 @@ interface PocEvent {
   peers: number;
   reward_uegoc: number;
   h3_cell?: string;
+  witnesses?: string[];
 }
 
 interface P2pStatus {
@@ -845,6 +846,11 @@ const CoveragePage: React.FC = () => {
                   <div>
                     <div className="text-xs text-gray-300">
                       {ev.peers > 0 ? `${ev.peers} peer${ev.peers > 1 ? 's' : ''} witnessed` : 'Self-attested (solo node)'}
+                      {(ev.witnesses?.length ?? 0) > 0 && (
+                        <span className="ml-1.5 text-green-400" title={`Signed receipts from: ${ev.witnesses!.map(w => w.slice(0, 14) + '…').join(', ')}`}>
+                          ✓ signed
+                        </span>
+                      )}
                     </div>
                     <div className="text-xs text-gray-500">
                       base 0.011 + {ev.peers} × 0.0015 EGOC
