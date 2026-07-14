@@ -13,6 +13,7 @@ mod email;
 mod error;
 mod l2;
 mod ledger;
+mod maintenance;
 mod mempool;
 mod p2p;
 mod poc;
@@ -99,17 +100,21 @@ fn acquire_single_instance_lock() -> bool {
     let port: u16 = std::env::var("EGO_LOCK_PORT")
         .ok().and_then(|v| v.parse().ok())
         .unwrap_or(47391);
-    match std::net::TcpListener::bind(format!("127.0.0.1:{}", port)) {
-        Ok(l) => {
-            let _ = INSTANCE_LOCK.set(l);
-            true
-        }
-        Err(_) => {
-            // Another instance is running — poke it to show its window, then exit.
-            let _ = std::net::TcpStream::connect(format!("127.0.0.1:{}", port));
-            false
+    // Retry for a few seconds: during a maintenance self-restart the new process
+    // starts while the old one is still releasing the port.
+    for attempt in 0..8 {
+        match std::net::TcpListener::bind(format!("127.0.0.1:{}", port)) {
+            Ok(l) => {
+                let _ = INSTANCE_LOCK.set(l);
+                return true;
+            }
+            Err(_) if attempt < 7 => std::thread::sleep(std::time::Duration::from_millis(500)),
+            Err(_) => {}
         }
     }
+    // Another instance is running — poke it to show its window, then exit.
+    let _ = std::net::TcpStream::connect(format!("127.0.0.1:{}", port));
+    false
 }
 
 fn register_suspend_listeners() {
@@ -396,6 +401,9 @@ fn main() {
     #[cfg(target_os = "windows")]
     register_windows_notifications();
 
+    maintenance::init_process_start();
+    maintenance::start_power_source_watcher();
+
     #[cfg(target_os = "windows")]
     {
         // Keep the machine awake so storage/compute clients are never cut off by an idle
@@ -421,6 +429,7 @@ fn main() {
         const POWER_REQUEST_SYSTEM_REQUIRED: u32 = 1;
         const POWER_REQUEST_EXECUTION_REQUIRED: u32 = 3;
 
+        let mut request_handle: isize = 0;
         unsafe {
             SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED);
 
@@ -434,22 +443,45 @@ fn main() {
             if h != 0 && h != -1 {
                 PowerSetRequest(h, POWER_REQUEST_SYSTEM_REQUIRED);
                 PowerSetRequest(h, POWER_REQUEST_EXECUTION_REQUIRED);
-                // Hold the request (never cleared/closed) and its reason string for the
-                // whole process lifetime so the wake lock stays active.
+                // Hold the request (never closed) and its reason string for the whole
+                // process lifetime; the maintenance thread below sets/clears it as the
+                // machine moves between AC and battery power.
                 std::mem::forget(reason);
+                request_handle = h;
             }
         }
         eprintln!("[Node] Sleep prevention active (Windows: execution-state + power-request)");
 
         // Re-assert periodically from a long-lived thread: returning from a forced sleep,
         // a fast-user-switch, or another app toggling power state can clear ES_CONTINUOUS.
-        // Re-setting every 50s means a node that briefly slept goes back to staying awake
-        // on its own, without needing a restart.
-        std::thread::spawn(|| {
-            extern "system" { fn SetThreadExecutionState(es_flags: u32) -> u32; }
+        // On battery the lock is released instead, so an unplugged laptop can sleep
+        // normally and the battery is not drained flat by the node.
+        std::thread::spawn(move || {
+            extern "system" {
+                fn SetThreadExecutionState(es_flags: u32) -> u32;
+                fn PowerSetRequest(power_request: isize, request_type: u32) -> i32;
+                fn PowerClearRequest(power_request: isize, request_type: u32) -> i32;
+            }
+            let mut engaged = true;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(50));
-                unsafe { SetThreadExecutionState(0x80000000 | 0x00000001 | 0x00000040); }
+                let wanted = crate::maintenance::wake_lock_wanted();
+                unsafe {
+                    if wanted {
+                        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED);
+                        if !engaged && request_handle != 0 {
+                            PowerSetRequest(request_handle, POWER_REQUEST_SYSTEM_REQUIRED);
+                            PowerSetRequest(request_handle, POWER_REQUEST_EXECUTION_REQUIRED);
+                        }
+                    } else if engaged {
+                        SetThreadExecutionState(ES_CONTINUOUS);
+                        if request_handle != 0 {
+                            PowerClearRequest(request_handle, POWER_REQUEST_SYSTEM_REQUIRED);
+                            PowerClearRequest(request_handle, POWER_REQUEST_EXECUTION_REQUIRED);
+                        }
+                    }
+                }
+                engaged = wanted;
             }
         });
     }
@@ -461,6 +493,10 @@ fn main() {
         // A watchdog re-launches caffeinate if it ever exits, so the wake lock survives a
         // forced sleep/wake or the helper being killed.
         std::thread::spawn(|| loop {
+            if !crate::maintenance::wake_lock_wanted() {
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                continue;
+            }
             let child = std::process::Command::new("caffeinate")
                 .args(["-i", "-m", "-s"])
                 .stdout(std::process::Stdio::null())
@@ -469,7 +505,19 @@ fn main() {
             match child {
                 Ok(mut c) => {
                     eprintln!("[Node] Sleep prevention active (macOS caffeinate)");
-                    let _ = c.wait(); // blocks until caffeinate exits, then re-launch below
+                    loop {
+                        match c.try_wait() {
+                            Ok(Some(_)) | Err(_) => break,
+                            Ok(None) => {
+                                if !crate::maintenance::wake_lock_wanted() {
+                                    let _ = c.kill();
+                                    let _ = c.wait();
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_secs(5));
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     eprintln!("[Node] Sleep prevention unavailable: {e}");
@@ -486,6 +534,10 @@ fn main() {
         // watchdog re-launches it if it exits (e.g. killed on resume) so the lock persists.
         std::thread::spawn(|| {
             loop {
+                if !crate::maintenance::wake_lock_wanted() {
+                    std::thread::sleep(std::time::Duration::from_secs(15));
+                    continue;
+                }
                 let child = std::process::Command::new("systemd-inhibit")
                     .args([
                         "--what=sleep:idle:handle-lid-switch",
@@ -500,7 +552,19 @@ fn main() {
                 match child {
                     Ok(mut c) => {
                         eprintln!("[Node] Sleep prevention active (Linux systemd-inhibit)");
-                        let _ = c.wait();
+                        loop {
+                            match c.try_wait() {
+                                Ok(Some(_)) | Err(_) => break,
+                                Ok(None) => {
+                                    if !crate::maintenance::wake_lock_wanted() {
+                                        let _ = c.kill();
+                                        let _ = c.wait();
+                                        break;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_secs(5));
+                                }
+                            }
+                        }
                         std::thread::sleep(std::time::Duration::from_secs(5));
                     }
                     Err(_) => {
@@ -508,11 +572,13 @@ fn main() {
                         // session's idle timer keeps getting reset.
                         eprintln!("[Node] Sleep prevention: systemd-inhibit unavailable, using xdg-screensaver fallback");
                         loop {
-                            let _ = std::process::Command::new("xdg-screensaver")
-                                .args(["reset"])
-                                .stdout(std::process::Stdio::null())
-                                .stderr(std::process::Stdio::null())
-                                .status();
+                            if crate::maintenance::wake_lock_wanted() {
+                                let _ = std::process::Command::new("xdg-screensaver")
+                                    .args(["reset"])
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .status();
+                            }
                             std::thread::sleep(std::time::Duration::from_secs(50));
                         }
                     }
@@ -1181,6 +1247,8 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 crate::p2p::run_porep_challenge_loop().await;
             });
+
+            crate::maintenance::start_health_watchdog(app.handle());
 
             #[cfg(debug_assertions)]
             app.get_window("main").unwrap().open_devtools();
