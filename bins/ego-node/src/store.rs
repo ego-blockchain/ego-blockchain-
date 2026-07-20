@@ -213,7 +213,7 @@ pub fn save_accounts_batch(accounts: &[(&[u8; 20], &Account)]) {
     let mut batch = WriteBatch::default();
     for (addr, acct) in accounts {
         if let Ok(json) = serde_json::to_vec(acct) {
-            batch.put_cf(cf, addr.as_ref(), json);
+            batch.put_cf(cf, &addr[..], json);   
         }
     }
     let _ = db.write(batch);
