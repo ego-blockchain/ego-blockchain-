@@ -221,6 +221,41 @@ impl ChainState {
             return Err("non-genesis block missing prev_hash".into());
         }
 
+        // Testnet-wipe recovery: the anti-rewrite checks below correctly refuse to
+        // let an unrelated chain silently overwrite history at the same height —
+        // but after an intentional wipe (fresh genesis, height counting restarts),
+        // every new block's honest prev_hash will conflict with the abandoned old
+        // chain's block at that same height FOREVER, since the old data never ages
+        // out (MAX_BLOCKS is 50,000; a wipe rarely produces enough new blocks to
+        // out-compete it by height). That permanently blinds the explorer.
+        // Detection: our stored data has gone stale (no accepted block in a long
+        // time — blocks are produced at least every ~60s even when idle) AND this
+        // submission doesn't line up with what we're holding. That combination
+        // only happens after a deliberate reset, so treat the old chain as dead
+        // and start fresh rather than rejecting the live chain forever.
+        const STALE_RESET_SECS: i64 = 600;
+        if height > 0 {
+            let last_seen = self.blocks.iter()
+                .filter_map(|b| b["timestamp"].as_i64())
+                .max()
+                .unwrap_or(0);
+            let stale = !self.blocks.is_empty() && Utc::now().timestamp() - last_seen > STALE_RESET_SECS;
+            if stale {
+                let conflicts = self.blocks.iter().any(|b| {
+                    (b["height"].as_u64() == Some(height) && b["hash"].as_str() != Some(new_hash.as_str()))
+                        || (b["height"].as_u64() == Some(height - 1) && b["hash"].as_str() != Some(prev.as_str()))
+                });
+                if conflicts {
+                    info!(
+                        "Stored chain stale for {}s and block #{} doesn't link to it — treating as a chain reset, clearing stored history",
+                        Utc::now().timestamp() - last_seen, height,
+                    );
+                    self.blocks.clear();
+                    self.transactions.clear();
+                }
+            }
+        }
+
         // Parent linkage (best-effort: only when we already hold height-1).
         if height > 0 {
             if let Some(parent) = self.blocks.iter().find(|b| b["height"].as_u64() == Some(height - 1)) {
