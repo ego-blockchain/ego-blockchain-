@@ -3,7 +3,7 @@
   "name": "Ego Wallet",
   "version": "1.0.0",
   "description": "Quantum-safe wallet for Ego Blockchain",
-  "permissions": ["storage", "activeTab", "scripting"],
+  "permissions": ["storage", "activeTab"],
   "host_permissions": ["http://127.0.0.1:47395/*", "<all_urls>"],
   "background": {
     "service_worker": "background.js",
