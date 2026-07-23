@@ -252,6 +252,7 @@ impl ChainState {
                     );
                     self.blocks.clear();
                     self.transactions.clear();
+                    self.blocks.push(genesis_chain_state().blocks.remove(0));
                 }
             }
         }
