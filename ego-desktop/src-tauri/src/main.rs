@@ -383,7 +383,7 @@ fn main() {
         return;
     }
 
-    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    #[cfg(target_os = "windows")]
     {
         extern "system" {
             fn SetStdHandle(nStdHandle: u32, hHandle: isize) -> i32;
