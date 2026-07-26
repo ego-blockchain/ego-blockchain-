@@ -419,7 +419,10 @@ async fn oracle_post(client: &reqwest::Client, path: &str, body: &serde_json::Va
         match req.send().await {
             Ok(resp) => {
                 let status = resp.status();
-                if status.is_success() { return; }
+                if status.is_success() {
+                    eprintln!("[Oracle] {}{} accepted (HTTP {})", base, path, status.as_u16());
+                    return;
+                }
                 if status.as_u16() == 401 {
                     eprintln!("[Oracle] {}{} REJECTED 401 — token mismatch (EGO_ORACLE_SUBMIT_TOKEN vs oracle ORACLE_SUBMIT_TOKEN)", base, path);
                 } else {
@@ -446,10 +449,21 @@ pub async fn push_block_to_oracle(block: &crate::ledger::LedgerBlock, txs: &[cra
     //     across the whole network, and the oracle accepts it on its quorum
     //     certificate (a forged block can't fake the BFT signatures).
     //  2. I'm a designated archive node holding the submit token — pushes all.
-    if !oracle_push_enabled() { return; }
+    if !oracle_push_enabled() {
+        eprintln!("[Oracle] push skipped for block #{}: EGO_ORACLE_NO_PUSH is set", block.height);
+        return;
+    }
     let my_addr = local_validator_mutex().lock().unwrap().clone();
     let i_produced = !my_addr.is_empty() && block.miner == my_addr;
-    if !i_produced && !is_oracle_writer() { return; }
+    let writer = is_oracle_writer();
+    if !i_produced && !writer {
+        eprintln!(
+            "[Oracle] push skipped for block #{}: not producer (miner={}, me={}) and not archive writer",
+            block.height, &block.miner[..block.miner.len().min(20)], &my_addr[..my_addr.len().min(20)],
+        );
+        return;
+    }
+    eprintln!("[Oracle] pushing block #{} (i_produced={}, writer={})", block.height, i_produced, writer);
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
