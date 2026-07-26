@@ -702,9 +702,13 @@ async fn handle_chain_blocks(
                 let built: Vec<Value> = {
                     let chain = state.chain.read().await;
                     let mut refs: Vec<&Value> = chain.blocks.iter().collect();
-                    refs.sort_by_key(|b| b["height"].as_u64().unwrap_or(0));
-                    let start = refs.len().saturating_sub(500);
-                    refs[start..].iter().map(|b| (*b).clone()).collect()
+                    // Same recency-based selection as the periodic cache builder —
+                    // this cold path only runs in the brief window right after a
+                    // restart, before that loop's first tick.
+                    refs.sort_by_key(|b| std::cmp::Reverse(b["timestamp"].as_i64().unwrap_or(0)));
+                    let mut built: Vec<Value> = refs.iter().take(500).map(|b| (*b).clone()).collect();
+                    built.sort_by_key(|b| b["height"].as_u64().unwrap_or(0));
+                    built
                 };
                 let a = Arc::new(built);
                 *state.blocks_cache.write().await = Some(a.clone());
@@ -1247,20 +1251,29 @@ async fn main() {
                 tokio::time::sleep(std::time::Duration::from_secs(4)).await;
                 tick = tick.wrapping_add(1);
 
-                let (blocks500, txs500) = {
+                let (blocks500, txs500, live_tip) = {
                     let chain = state.chain.read().await;
+                    // Select by RECENCY (timestamp), not raw height. After a testnet
+                    // wipe the abandoned chain's numerically-higher-but-ancient blocks
+                    // would otherwise permanently outrank the live chain's lower (but
+                    // current) heights in this window forever — same class of bug the
+                    // merge-level stale-reset check exists to fix, just for display.
                     let mut brefs: Vec<&Value> = chain.blocks.iter().collect();
-                    brefs.sort_by_key(|b| b["height"].as_u64().unwrap_or(0));
-                    let bstart = brefs.len().saturating_sub(500);
-                    let blocks500: Vec<Value> = brefs[bstart..].iter().map(|b| (*b).clone()).collect();
+                    brefs.sort_by_key(|b| std::cmp::Reverse(b["timestamp"].as_i64().unwrap_or(0)));
+                    let mut blocks500: Vec<Value> = brefs.iter().take(500).map(|b| (*b).clone()).collect();
+                    blocks500.sort_by_key(|b| b["height"].as_u64().unwrap_or(0));
+                    let live_tip = blocks500.last().and_then(|b| b["height"].as_u64()).unwrap_or(0);
 
                     let mut trefs: Vec<&Value> = chain.transactions.iter().collect();
-                    trefs.sort_by_key(|t| std::cmp::Reverse(t["block_height"].as_u64().unwrap_or(0)));
+                    trefs.sort_by_key(|t| std::cmp::Reverse(t["timestamp"].as_i64().unwrap_or(0)));
                     let txs500: Vec<Value> = trefs.iter().take(500).map(|t| (*t).clone()).collect();
-                    (blocks500, txs500)
+                    (blocks500, txs500, live_tip)
                 };
                 *state.blocks_cache.write().await = Some(Arc::new(blocks500));
                 *state.txs_cache.write().await = Some(Arc::new(txs500));
+                if live_tip > 0 {
+                    state.stat_tip.store(live_tip, Ordering::Relaxed);
+                }
 
                 if tick % 4 == 0 && state.chain_dirty.swap(false, Ordering::Relaxed) {
                     let snapshot = { state.chain.read().await.clone() };
