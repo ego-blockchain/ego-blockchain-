@@ -2173,7 +2173,16 @@ fn bft_threshold() -> usize {
     let (n_total, effective) = if !registered.is_empty() {
         let slashed = slashed_validators();
         let n_reg = registered.iter().filter(|a| !slashed.contains(*a)).count();
-        let eff = n_reg.max(min_validators).min(crate::bft_committee::COMMITTEE_SIZE);
+        // A validator_register tx is permanent — the on-chain registry only ever
+        // grows, so an address that registered once and never came back would
+        // otherwise inflate the quorum bar forever, eventually making it
+        // impossible for the currently-active minority to ever finalize again.
+        // Only count registered validators actually seen recently; the honest
+        // minimum floor (min_validators) still applies, so this can only ever
+        // relax an artificially inflated requirement, never drop below "no solo."
+        let live: std::collections::HashSet<String> = live_validators().into_iter().collect();
+        let n_live_reg = registered.iter().filter(|a| !slashed.contains(*a) && live.contains(*a)).count();
+        let eff = n_live_reg.max(min_validators).min(crate::bft_committee::COMMITTEE_SIZE);
         (n_reg, eff)
     } else {
         let snapshot: Vec<String> = known_validators().iter().cloned().collect();
