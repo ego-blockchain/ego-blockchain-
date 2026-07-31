@@ -139,22 +139,23 @@ const unlistenDl = listen<{ cid?: string }>('ego://file-downloaded', async (e) =
 }, []);
 
   async function loadStoredFiles() {
-    try {
-      const egosafeFiles = await invoke<StoredFile[]>('get_egosafe_files');
-      // Sent files: Active + local_path is a real path (not a sender: placeholder)
-      setStoredFiles(egosafeFiles.filter(f =>
-        f.status === 'Active' &&
-        f.local_path.length > 0 &&
-        !f.local_path.startsWith('sender:')
-      ));
-      // Received files: everything else (Pending, Failed, Received, or Active-but-from-sender)
-      setReceivedFiles(egosafeFiles.filter(f =>
-        f.status !== 'Active' ||
-        f.local_path.startsWith('sender:') ||
-        f.local_path.length === 0
-      ));
-    } catch {}
+  try {
+    const egosafeFiles = await invoke<StoredFile[]>('get_egosafe_files');
+    console.log('[EgoSafe] egosafeFiles:', egosafeFiles);
+    setStoredFiles(egosafeFiles.filter(f =>
+      f.status === 'Active' &&
+      f.local_path.length > 0 &&
+      !f.local_path.startsWith('sender:')
+    ));
+    setReceivedFiles(egosafeFiles.filter(f =>
+      f.status !== 'Active' ||
+      f.local_path.startsWith('sender:') ||
+      f.local_path.length === 0
+    ));
+  } catch (err) {
+    console.error('[EgoSafe] loadStoredFiles failed:', err);
   }
+}
 
   async function sendToContact(contact: Contact) {
     if (!sendTarget) return;
@@ -178,29 +179,31 @@ const unlistenDl = listen<{ cid?: string }>('ego://file-downloaded', async (e) =
   }
 
   async function startShare() {
-    if (!filePath || selectedContacts.length === 0) return;
-    setStep('sharing');
-    setShareError('');
-    try {
-      const result = await invoke<StoreFileResult>('store_file', {
-        request: { file_path: filePath, duration_months: 1, free: true, from_egosafe: true },
+  if (!filePath || selectedContacts.length === 0) return;
+  setStep('sharing');
+  setShareError('');
+  try {
+    const result = await invoke<StoreFileResult>('store_file', {
+      request: { file_path: filePath, duration_months: 1, free: true, from_egosafe: true },
+    });
+    await loadStoredFiles(); 
+
+    const bundle = await invoke<string>('create_public_share', { cid: result.cid });
+    for (const c of selectedContacts) {
+      await invoke('send_message', {
+        contactAddr: c.address,
+        content:     bundle,
+        messageType: 'file_bundle',
       });
-      const bundle = await invoke<string>('create_public_share', { cid: result.cid });
-      for (const c of selectedContacts) {
-        await invoke('send_message', {
-          contactAddr: c.address,
-          content:     bundle,
-          messageType: 'file_bundle',
-        });
-      }
-      setResultCid(result.cid);
-      await loadStoredFiles();
-      setStep('done');
-    } catch (e: any) {
-      setShareError(String(e));
-      setStep('recipients');
     }
+    setResultCid(result.cid);
+    setStep('done');
+  } catch (e: any) {
+    setShareError(String(e));
+    await loadStoredFiles(); 
+    setStep('recipients');
   }
+}
 
   function reset() {
     setStep('idle');

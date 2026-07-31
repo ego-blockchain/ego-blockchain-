@@ -946,6 +946,7 @@ pub async fn request_file_from_contact(
     // 1. Import into ledger so EgoSafe shows it immediately (as "pending download").
     //    Creates a new entry if not present, or resets "Failed" → "Received" for retries.
     {
+        let _guard = crate::ledger::TX_MUTEX.lock().await; 
         use base64::Engine as _;
         let parts: Vec<&str> = content.splitn(5, ':').collect();
         let key_nonce_hex = parts.get(2).copied().unwrap_or("").to_string();
@@ -965,8 +966,6 @@ pub async fn request_file_from_contact(
                 && f.status != "Failed"
         });
         if already_ready {
-            // File was pre-delivered (sender pushed it before user clicked Save).
-            // Re-emit file-downloaded so Messenger and EgoSafe update correctly.
             let _ = ledger.save();
             let _ = app.emit_all("ego://file-downloaded", serde_json::json!({ "cid": cid }));
             return Ok(());
@@ -974,7 +973,7 @@ pub async fn request_file_from_contact(
         if let Some(f) = ledger.stored_files.iter_mut().find(|f| f.cid == cid) {
             if f.status == "Failed" || f.local_path.starts_with("sender:") || f.local_path.is_empty() {
                 f.status = "Pending".to_string();
-                f.last_block_at = 0; // reset timeout clock
+                f.last_block_at = 0;
                 f.local_path = format!("sender:{}", from_addr);
             }
         } else {
@@ -1011,7 +1010,6 @@ pub async fn request_file_from_contact(
         requester_endpoint: my_endpoint,
     };
 
-    // 3. Build multi-path endpoint list: contact endpoints, relay lookup, shard registry
     let mut eps: Vec<String> = Vec::new();
     if let Some(c) = contact_info {
         eps.extend(c.all_endpoints.clone());
@@ -1024,9 +1022,6 @@ pub async fn request_file_from_contact(
             if !relay_ep.is_empty() { eps.push(relay_ep); }
         }
     }
-
-    // 4. Shard registry fallback — query relay to discover holders we don't have as contacts.
-
     if eps.is_empty() {
         let holders = crate::p2p::find_cid_holders(&cid).await;
         for h in &holders {
@@ -1035,7 +1030,6 @@ pub async fn request_file_from_contact(
             }
         }
     }
-
     if eps.is_empty() {
         eprintln!("[FileRequest] No endpoint for {} and no shard holders — depositing in relay inbox", from_addr);
         crate::commands::messenger::deposit_in_relay_inbox(&from_addr, &my_addr, &msg).await;
@@ -1043,7 +1037,6 @@ pub async fn request_file_from_contact(
     }
 
     if let Err(e) = crate::p2p::send_message_any(&eps, &msg).await {
-
         let holders = crate::p2p::find_cid_holders(&cid).await;
         let mut shard_eps: Vec<String> = holders.iter()
             .filter(|h| !h.endpoint.is_empty() && h.holder_addr != my_addr && !eps.contains(&h.endpoint))
@@ -1257,7 +1250,6 @@ pub async fn import_secure_share(
         return Err(EgoDesktopError::CryptoError("Encrypted key too short".into()));
     }
 
-    // Decapsulate: recover the shared secret with our Kyber secret key.
     let seed_bytes = crate::ledger::load_seed()
         .map_err(|e| EgoDesktopError::CryptoError(format!("Failed to load seed: {e}")))?
         .ok_or_else(|| EgoDesktopError::CryptoError("No seed".into()))?;
@@ -1268,7 +1260,6 @@ pub async fn import_secure_share(
     let shared_secret = keypair.decapsulate_kyber(&kem_ct)
         .map_err(|e| EgoDesktopError::CryptoError(format!("KEM decap: {e}")))?;
 
-    // Decrypt the file key.
     let nonce = Nonce::from_slice(&nonce_enc[..12]);
     let cipher = Aes256Gcm::new_from_slice(&shared_secret[..32])
         .map_err(|e| EgoDesktopError::CryptoError(format!("Cipher: {e}")))?;
@@ -1277,10 +1268,11 @@ pub async fn import_secure_share(
             "Decryption failed — this bundle was not encrypted for your key".into()
         ))?;
 
-    // Protect the key and store in ledger.
     let protected_key = crate::ledger::protect_key_hex(&hex::encode(&file_key))
         .map_err(EgoDesktopError::CryptoError)?;
     let now = chrono::Utc::now().timestamp();
+
+    let _guard = crate::ledger::TX_MUTEX.lock().await; 
     let mut ledger = crate::ledger::Ledger::load();
 
     let stored = crate::ledger::StoredFile {

@@ -109,7 +109,7 @@ custom-protocol = ["tauri/custom-protocol"]
 [profile.dev]
 debug = false
 opt-level = 1
-codegen-units = 16
+codegen-units = 1
 
 [profile.dev.package."*"]
 opt-level = 1
