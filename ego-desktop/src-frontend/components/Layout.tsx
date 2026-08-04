@@ -333,6 +333,7 @@ const WalletSwitcher: React.FC = () => {
 const Layout: React.FC = () => {
   const { theme, toggleTheme } = useTheme();
   const navigate = useNavigate();
+  const [unreadCount, setUnreadCount] = useState(0);
 
   // Global handler: notification click → navigate to Messenger and open that chat
   useEffect(() => {
@@ -341,6 +342,15 @@ const Layout: React.FC = () => {
     });
     return () => { unlisten.then(fn => fn()); };
   }, [navigate]);
+
+  useEffect(() => {
+    const refresh = () => {
+      invoke<number>('get_unread_count').then(setUnreadCount).catch(() => {});
+    };
+    refresh();
+    const unlisten = listen('ego://message-received', refresh);
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
 
   return (
     <div className="flex flex-col h-screen bg-gray-900 text-white overflow-hidden">
@@ -377,8 +387,13 @@ const Layout: React.FC = () => {
               }
             >
               <span className="text-base w-5 text-center">{item.icon}</span>
-              <div className="min-w-0">
+              <div className="min-w-0 flex-1 flex items-center justify-between gap-2">
                 <div className="font-medium leading-tight">{item.label}</div>
+                {item.path === '/messenger' && unreadCount > 0 && (
+                  <span className="shrink-0 bg-red-500 text-white text-[10px] font-bold leading-none rounded-full px-1.5 py-1 min-w-[18px] text-center">
+                    {unreadCount > 99 ? '99+' : unreadCount}
+                  </span>
+                )}
               </div>
             </NavLink>
           ))}

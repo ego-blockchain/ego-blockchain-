@@ -657,13 +657,22 @@ fn main() {
                     let win = event.window();
                     let app_handle = win.app_handle();
                     let state = app_handle.state::<app::AppState>();
-                    let maybe_addr = state.pending_chat_address.lock().unwrap().take();
-                    if let Some(addr) = maybe_addr {
-                        // Ensure window is visible (may have been hidden to tray)
-                        if !win.is_visible().unwrap_or(true) {
-                            let _ = win.show();
+                    let pending = state.pending_chat_address.lock().unwrap().take();
+                    if let Some((addr, set_at)) = pending {
+                        // Only treat this focus as "the user clicked the toast" if it
+                        // happened within a few seconds of the message arriving — a
+                        // window focus long after (e.g. reopening the app hours later
+                        // for something unrelated) must not force-navigate away from
+                        // whatever the user actually meant to do.
+                        const NOTIFICATION_CLICK_WINDOW_SECS: i64 = 15;
+                        let now = chrono::Utc::now().timestamp();
+                        if now - set_at <= NOTIFICATION_CLICK_WINDOW_SECS {
+                            // Ensure window is visible (may have been hidden to tray)
+                            if !win.is_visible().unwrap_or(true) {
+                                let _ = win.show();
+                            }
+                            let _ = win.emit("ego://open-chat", serde_json::json!({ "address": addr }));
                         }
-                        let _ = win.emit("ego://open-chat", serde_json::json!({ "address": addr }));
                     }
                 }
                 _ => {}
@@ -794,6 +803,8 @@ fn main() {
             commands::messenger::send_message,
             commands::messenger::receive_message,
             commands::messenger::get_messages,
+            commands::messenger::mark_messages_read,
+            commands::messenger::get_unread_count,
             commands::messenger::delete_contact,
             commands::messenger::rename_contact,
             commands::messenger::clear_messages,

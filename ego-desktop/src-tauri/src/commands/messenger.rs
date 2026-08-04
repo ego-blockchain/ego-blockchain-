@@ -54,7 +54,20 @@ pub struct Message {
     pub message_type: String,
     pub timestamp:    i64,
     pub outgoing:     bool,
+    // Messages stored before this field existed have no "read" key on disk —
+    // default them to already-read so upgrading never dumps a false backlog
+    // of "unread" messages on the user. Freshly received messages set this
+    // explicitly to false.
+    #[serde(default = "default_true")]
+    pub read:         bool,
+    // Only meaningful on outgoing messages: whether the recipient's own
+    // ReadReceipt has come back confirming they opened this message. Always
+    // false for incoming messages (unused there).
+    #[serde(default)]
+    pub read_by_recipient: bool,
 }
+
+fn default_true() -> bool { true }
 
 pub(crate) fn load_contacts() -> Vec<Contact> {
     let path = contacts_path();
@@ -326,6 +339,8 @@ pub(crate) fn receive_message_inner(bundle: &str, seq: u64) -> Result<(Message, 
         message_type: mtype,
         timestamp:    ts,
         outgoing:     false,
+        read:         false,
+        read_by_recipient: false,
     };
 
     let mut msgs = load_messages();
@@ -737,6 +752,8 @@ pub async fn send_message(
         message_type,
         timestamp:    ts,
         outgoing:     true,
+        read:         true,
+        read_by_recipient: false,
     });
     save_messages(&msgs).map_err(EgoDesktopError::FileSystemError)?;
 
@@ -884,6 +901,73 @@ pub async fn get_messages(contact_addr: String) -> Result<Vec<Message>, EgoDeskt
         .collect();
     msgs.sort_by_key(|m| m.timestamp);
     Ok(msgs)
+}
+
+#[tauri::command]
+pub async fn mark_messages_read(contact_addr: String) -> Result<(), EgoDesktopError> {
+    let mut msgs = load_messages();
+    let mut newly_read: Vec<String> = Vec::new();
+    for m in msgs.iter_mut() {
+        if !m.outgoing && m.from == contact_addr && !m.read {
+            m.read = true;
+            newly_read.push(m.id.clone());
+        }
+    }
+    if !newly_read.is_empty() {
+        save_messages(&msgs).map_err(EgoDesktopError::FileSystemError)?;
+        send_read_receipt(&contact_addr, newly_read).await;
+    }
+    Ok(())
+}
+
+/// Tell the original sender which of their messages we just read, so their
+/// UI can flip those bubbles from "Delivered" to "Read". Best-effort: same
+/// delivery path as chat messages (direct, falling back to outbox + relay
+/// inbox if the sender is offline right now).
+async fn send_read_receipt(contact_addr: &str, message_ids: Vec<String>) {
+    let my_addr = Ledger::load().address;
+    if my_addr.is_empty() { return; }
+    let contacts = load_contacts();
+    let Some(contact) = contacts.iter().find(|c| c.address == contact_addr) else { return; };
+    let msg = crate::p2p::P2PMessage::ReadReceipt {
+        from: my_addr.clone(),
+        to:   contact_addr.to_string(),
+        message_ids,
+    };
+    let endpoint = resolve_endpoint(contact_addr, &contact.endpoint).await;
+    if endpoint.is_empty() {
+        crate::commands::outbox::enqueue(contact_addr, "", &msg);
+        deposit_in_relay_inbox(&my_addr, contact_addr, &msg).await;
+        return;
+    }
+    if let Err(e) = crate::p2p::send_message(&endpoint, &msg).await {
+        eprintln!("[Messenger] read receipt delivery to {} failed: {} — queuing", contact_addr, e);
+        crate::commands::outbox::enqueue(contact_addr, &endpoint, &msg);
+        deposit_in_relay_inbox(&my_addr, contact_addr, &msg).await;
+    }
+}
+
+/// Called when a ReadReceipt arrives from a contact — flips our own sent
+/// messages to that contact from "Delivered" to "Read". Returns how many
+/// changed, so the caller only bothers notifying the frontend when needed.
+pub fn mark_messages_read_by_recipient(contact_addr: &str, message_ids: &[String]) -> usize {
+    let mut msgs = load_messages();
+    let mut changed = 0usize;
+    for m in msgs.iter_mut() {
+        if m.outgoing && m.to == contact_addr && !m.read_by_recipient && message_ids.contains(&m.id) {
+            m.read_by_recipient = true;
+            changed += 1;
+        }
+    }
+    if changed > 0 {
+        let _ = save_messages(&msgs);
+    }
+    changed
+}
+
+#[tauri::command]
+pub async fn get_unread_count() -> Result<u32, EgoDesktopError> {
+    Ok(load_messages().iter().filter(|m| !m.outgoing && !m.read).count() as u32)
 }
 
 #[tauri::command]
