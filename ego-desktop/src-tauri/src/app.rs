@@ -54,7 +54,10 @@ pub struct AppState {
 
     pub public_endpoint: Arc<Mutex<String>>,
 
-    pub pending_chat_address: Arc<Mutex<Option<String>>>,
+    // (address, set_at_unix_ts) — the timestamp lets the focus handler tell a
+    // genuine notification click (focus follows within seconds) apart from
+    // the user simply refocusing the window later for something unrelated.
+    pub pending_chat_address: Arc<Mutex<Option<(String, i64)>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

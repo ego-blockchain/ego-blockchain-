@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
-import { listen } from '@tauri-apps/api/event';
+import { open as openDialog } from '@tauri-apps/api/dialog';
+import { open as openUrl } from '@tauri-apps/api/shell';
+import { emit, listen } from '@tauri-apps/api/event';
 import { useLocation } from 'react-router-dom';
 import { writeText } from '@tauri-apps/api/clipboard';
 import { useConfirm } from '../hooks/useConfirm';
@@ -57,6 +59,8 @@ interface Message {
   message_type: string;
   timestamp: number;
   outgoing: boolean;
+  read: boolean;
+  read_by_recipient: boolean;
 }
 
 function fmtTime(ts: number): string {
@@ -89,6 +93,32 @@ function msgTypeLabel(t: string): string {
   if (t === 'file_bundle') return '📎 File Bundle';
   if (t === 'decrypt_key') return '🔑 Decrypt Key';
   return '';
+}
+
+const URL_RE = /(https?:\/\/[^\s<]+[^\s<.,:;!?)'"\]])/g;
+
+function linkifyContent(text: string): React.ReactNode {
+  // URL_RE has a single capturing group, so String.split interleaves
+  // [text, url, text, url, ...] — odd indices are always the matched URLs.
+  // (Deliberately not using URL_RE.test() here: it's a global regex, and
+  // .test() on a global regex is stateful across calls — reusing it in a
+  // loop like this alternates true/false unpredictably.)
+  const parts = text.split(URL_RE);
+  if (parts.length === 1) return text;
+  return parts.map((part, i) =>
+    i % 2 === 1 ? (
+      <span
+        key={i}
+        onClick={e => { e.stopPropagation(); openUrl(part).catch(() => {}); }}
+        className="underline text-blue-300 hover:text-blue-200 cursor-pointer break-all"
+        title={part}
+      >
+        {part}
+      </span>
+    ) : (
+      <React.Fragment key={i}>{part}</React.Fragment>
+    )
+  );
 }
 
 function isImageName(name: string): boolean {
@@ -278,6 +308,10 @@ const MessengerPage: React.FC = () => {
   const [msgInput, setMsgInput]     = useState('');
   const [sending, setSending]       = useState(false);
   const [sendError, setSendError]   = useState('');
+  const [showAttachMenu, setShowAttachMenu] = useState(false);
+  const [attaching, setAttaching]   = useState(false);
+  const [attachError, setAttachError] = useState('');
+  const msgInputRef = useRef<HTMLTextAreaElement>(null);
 
   const [aiMessages, setAiMessages]       = useState<AiMsg[]>(() => {
     try {
@@ -362,6 +396,10 @@ const MessengerPage: React.FC = () => {
     try {
       const ms = await invoke<Message[]>('get_messages', { contactAddr: addr });
       setMessages(ms);
+      if (ms.some(m => !m.outgoing && !m.read)) {
+        await invoke('mark_messages_read', { contactAddr: addr });
+        emit('ego://message-received');
+      }
     } catch (e) {
       console.error('get_messages', e);
     }
@@ -422,6 +460,13 @@ const MessengerPage: React.FC = () => {
       listen<{ to: string }>('ego://message-sent', (event) => {
         const cur = selectedRef.current;
         if (cur && cur.address === event.payload.to) {
+          loadMessages(cur.address);
+        }
+      }),
+
+      listen<{ contact: string }>('ego://messages-read-receipt', (event) => {
+        const cur = selectedRef.current;
+        if (cur && cur.address === event.payload.contact) {
           loadMessages(cur.address);
         }
       }),
@@ -565,6 +610,42 @@ useEffect(() => {
       setMsgInput(text);
     } finally {
       setSending(false);
+    }
+  }
+
+  async function handlePickAttachment(isImage: boolean) {
+    if (!selected || selected.address === EGO_AI_ADDRESS) return;
+    setAttachError('');
+    try {
+      const path = await openDialog({
+        multiple: false,
+        filters: isImage
+          ? [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'] }]
+          : undefined,
+      });
+      if (typeof path !== 'string') return;
+
+      const { size } = await invoke<{ size: number }>('get_file_metadata', { path });
+      if (size > 250 * 1024 * 1024) {
+        setAttachError(`This file is ${(size / 1024 / 1024).toFixed(1)} MB. Maximum file size is 250 MB.`);
+        return;
+      }
+
+      setAttaching(true);
+      const result = await invoke<{ cid: string }>('store_file', {
+        request: { file_path: path, duration_months: 1, free: true, from_egosafe: true },
+      });
+      const bundle = await invoke<string>('create_public_share', { cid: result.cid });
+      await invoke('send_message', {
+        contactAddr: selected.address,
+        content:     bundle,
+        messageType: 'file_bundle',
+      });
+      await loadMessages(selected.address);
+    } catch (e: any) {
+      setAttachError(String(e));
+    } finally {
+      setAttaching(false);
     }
   }
 
@@ -1018,7 +1099,17 @@ useEffect(() => {
                       </div>
                     )}
                   <div className={`flex flex-col ${m.outgoing ? 'items-end' : 'items-start'} group`}>
-                    <p className="text-xs text-gray-500 mb-0.5 px-2">{fmtTime(m.timestamp)}</p>
+                    <p className="text-xs text-gray-500 mb-0.5 px-2 flex items-center gap-1">
+                      {fmtTime(m.timestamp)}
+                      {m.outgoing && (
+                        <span
+                          className={m.read_by_recipient ? 'text-blue-400' : 'text-gray-500'}
+                          title={m.read_by_recipient ? 'Read' : 'Delivered'}
+                        >
+                          {m.read_by_recipient ? '✓✓' : '✓'}
+                        </span>
+                      )}
+                    </p>
                   <div className={`flex items-end gap-1 ${m.outgoing ? 'justify-end' : 'justify-start'}`}>
                     {m.outgoing && (
                       <button
@@ -1121,7 +1212,7 @@ useEffect(() => {
                           </div>
                         );
                       })() : (
-                        <p className="text-sm whitespace-pre-wrap break-words">{m.content}</p>
+                        <p className="text-sm whitespace-pre-wrap break-words">{linkifyContent(m.content)}</p>
                       )}
                     </div>
 
@@ -1158,18 +1249,33 @@ useEffect(() => {
 
             {/* Input area */}
             <div className="px-5 py-4 border-t border-gray-700 shrink-0 space-y-2">
-              <div className="flex gap-2">
-                <input
+              <div className="flex gap-2 items-end">
+                <button
+                  onClick={() => setShowAttachMenu(v => !v)}
+                  disabled={selected.address === EGO_AI_ADDRESS || attaching}
+                  title="Attach file or image"
+                  className="shrink-0 w-10 h-10 flex items-center justify-center rounded-xl bg-gray-700 hover:bg-gray-600 disabled:opacity-40 text-lg transition-colors"
+                >
+                  {attaching ? <span className="animate-spin text-sm">⏳</span> : '📎'}
+                </button>
+                <textarea
+                  ref={msgInputRef}
                   value={msgInput}
-                  onChange={e => setMsgInput(e.target.value)}
+                  onChange={e => {
+                    setMsgInput(e.target.value);
+                    const el = e.target;
+                    el.style.height = 'auto';
+                    el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+                  }}
                   onKeyDown={e => {
                     if (e.key === 'Enter' && !e.shiftKey) {
                       e.preventDefault();
                       handleSend('text');
                     }
                   }}
-                  placeholder={selected.address === EGO_AI_ADDRESS ? 'Ask Ego AI anything…' : 'Type a message… press Enter to send'}
-                  className={`flex-1 bg-gray-700 border rounded-xl px-4 py-2.5 text-sm focus:outline-none ${
+                  rows={1}
+                  placeholder={selected.address === EGO_AI_ADDRESS ? 'Ask Ego AI anything…' : 'Type a message… Enter to send, Shift+Enter for a new line'}
+                  className={`flex-1 bg-gray-700 border rounded-xl px-4 py-2.5 text-sm focus:outline-none resize-none leading-relaxed max-h-40 overflow-y-auto ${
                     selected.address === EGO_AI_ADDRESS
                       ? 'border-yellow-600/40 focus:border-yellow-400'
                       : 'border-gray-600 focus:border-blue-500'
@@ -1178,7 +1284,7 @@ useEffect(() => {
                 <button
                   onClick={() => handleSend('text')}
                   disabled={(selected.address === EGO_AI_ADDRESS ? aiThinking : sending) || !msgInput.trim()}
-                  className={`px-5 py-2.5 disabled:opacity-50 rounded-xl text-sm font-medium transition-colors ${
+                  className={`shrink-0 px-5 py-2.5 disabled:opacity-50 rounded-xl text-sm font-medium transition-colors ${
                     selected.address === EGO_AI_ADDRESS
                       ? 'bg-yellow-500 hover:bg-yellow-400 text-black'
                       : 'bg-blue-600 hover:bg-blue-500 text-white'
@@ -1189,6 +1295,25 @@ useEffect(() => {
                     : (sending ? '…' : 'Send')}
                 </button>
               </div>
+              {showAttachMenu && selected.address !== EGO_AI_ADDRESS && (
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => { setShowAttachMenu(false); handlePickAttachment(false); }}
+                    className="flex items-center gap-1.5 text-xs bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded-lg transition-colors"
+                  >
+                    📄 File
+                  </button>
+                  <button
+                    onClick={() => { setShowAttachMenu(false); handlePickAttachment(true); }}
+                    className="flex items-center gap-1.5 text-xs bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded-lg transition-colors"
+                  >
+                    🖼️ Image
+                  </button>
+                </div>
+              )}
+              {attachError && (
+                <div className="text-xs text-red-400 bg-red-500/10 rounded-lg px-3 py-2">{attachError}</div>
+              )}
             </div>
           </>
         ) : (

@@ -2508,6 +2508,15 @@ pub enum P2PMessage {
         #[serde(default)]
         seq: u64,
     },
+    // Sent by the reader back to the original sender when they open a chat and
+    // see previously-unread messages — lets the sender show "Read" on their
+    // own outgoing bubbles. Metadata only (message IDs, not content), so it
+    // isn't run through the chat double-ratchet like ChatMessage is.
+    ReadReceipt {
+        from:        String,
+        to:          String,
+        message_ids: Vec<String>,
+    },
     TxBroadcast {
         tx:    LedgerTx,
         block: LedgerBlock,
@@ -7860,7 +7869,8 @@ P2PMessage::ChatMessage { bundle, seq } => {
             } else {
 
                 {
-                    crate::app::global_app_state().pending_chat_address.lock().unwrap().replace(msg.from.clone());
+                    let now = chrono::Utc::now().timestamp();
+                    crate::app::global_app_state().pending_chat_address.lock().unwrap().replace((msg.from.clone(), now));
                 }
                 let preview = if msg.content.len() > 40 {
                     format!("{}…", &msg.content[..40])
@@ -7876,6 +7886,18 @@ P2PMessage::ChatMessage { bundle, seq } => {
             }
         }
         Err(e) => eprintln!("[P2P] Decrypt error: {}", e),
+    }
+}
+
+P2PMessage::ReadReceipt { from, to, message_ids } => {
+    let my_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
+        .await.unwrap_or_default();
+    if my_addr.is_empty() || to != my_addr || message_ids.is_empty() { return; }
+    let updated = crate::commands::messenger::mark_messages_read_by_recipient(&from, &message_ids);
+    if updated > 0 {
+        if let Some(h) = app {
+            let _ = h.emit_all("ego://messages-read-receipt", serde_json::json!({ "contact": from }));
+        }
     }
 }
 
