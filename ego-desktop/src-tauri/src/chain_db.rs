@@ -1573,17 +1573,43 @@ pub fn grant_testnet_faucet(address: &str, amount_uegoc: u64) -> bool {
     let credited = amount_uegoc.min(pool_bal);
     if credited == 0 { return false; }
 
-    if get_faucet_drops(address) >= 1 {
-        return false;
-    }
-
     // Check mempool — don't grant if a faucet tx is already pending (not yet committed).
     let already_pending = crate::mempool::get_mempool()
         .pending_txs_for_address(address)
         .into_iter()
         .any(|tx| tx.tx_type == "faucet" && tx.to == address);
 
-    if already_pending {
+    if get_faucet_drops(address) >= 1 {
+        if already_pending {
+            return false;
+        }
+        // Not confirmed on-chain (get_faucet_drops would count it) and not sitting
+        // in the live mempool either — the original grant was lost (e.g. evicted
+        // under mempool pressure before the eviction fix protected faucet txs).
+        // Recover once: a stale local record older than 30 min with no live copy
+        // anywhere means it is never coming back on its own. Clear the "already
+        // granted" marker and the dead local record, then fall through to issue
+        // a fresh one below.
+        const STUCK_AFTER_SECS: i64 = 30 * 60;
+        let now = chrono::Utc::now().timestamp();
+        let stuck_locally = crate::commands::tx_pending::get_all().iter().any(|tx| {
+            tx.tx_type == "faucet" && tx.to == address && now - tx.timestamp > STUCK_AFTER_SECS
+        });
+        if !stuck_locally {
+            return false;
+        }
+        eprintln!("[Faucet] Recovering lost grant for {} — clearing stale record and retrying", address);
+        for tx in crate::commands::tx_pending::get_all().iter().filter(|tx| tx.tx_type == "faucet" && tx.to == address) {
+            crate::commands::tx_pending::remove(&tx.hash);
+        }
+        {
+            let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(cf_meta) = db.cf_handle(CF_META) {
+                let faucet_key = format!("faucet_drops:{}", address);
+                let _ = db.delete_cf(cf_meta, faucet_key.as_bytes());
+            }
+        }
+    } else if already_pending {
         return false;
     }
 

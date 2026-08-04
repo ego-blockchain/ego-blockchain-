@@ -259,16 +259,43 @@ impl ShardedMempool {
         // Localized O(K) eviction instead of O(N) global scan
         let max_per_shard = MAX_MEMPOOL_SIZE / SHARD_COUNT as usize;
         if s.len() >= max_per_shard {
+            // Pool-faucet grants are always fee_uegoc=0 by design (protocol mint,
+            // not a fee-market participant), so a pure lowest-fee scan picks one
+            // every single time a shard fills up — the grant silently vanishes
+            // from every mempool that evicts it while the recipient's own
+            // tx_pending.json still shows "Pending" forever, with no retry since
+            // grant_testnet_faucet() only ever issues one per address. Protect
+            // faucet entries from the fee auction; only drain them (oldest first,
+            // fair FIFO) once they themselves have piled up past a sane cap, so a
+            // faucet backlog still can't grow unbounded or starve real users.
+            const MAX_FAUCET_PER_SHARD: usize = 500;
             let mut worst_fee = u64::MAX;
-            let mut worst_idx = 0;
+            let mut worst_idx: Option<usize> = None;
+            let mut oldest_faucet_idx: Option<usize> = None;
+            let mut oldest_faucet_ts = i64::MAX;
+            let mut faucet_count = 0usize;
             for (j, existing_tx) in s.iter().enumerate() {
+                let existing_is_pool_faucet = existing_tx.tx_type == "faucet"
+                    && existing_tx.from == crate::chain_db::NODE_POOL_ADDR;
+                if existing_is_pool_faucet {
+                    faucet_count += 1;
+                    if existing_tx.timestamp < oldest_faucet_ts {
+                        oldest_faucet_ts = existing_tx.timestamp;
+                        oldest_faucet_idx = Some(j);
+                    }
+                    continue;
+                }
                 let fee = existing_tx.fee_uegoc.saturating_add(existing_tx.priority_fee_uegoc);
                 if fee < worst_fee {
                     worst_fee = fee;
-                    worst_idx = j;
+                    worst_idx = Some(j);
                 }
             }
-            let evicted = s.swap_remove(worst_idx);
+            let victim_idx = match worst_idx {
+                Some(idx) if faucet_count < MAX_FAUCET_PER_SHARD => idx,
+                _ => oldest_faucet_idx.or(worst_idx).unwrap_or(0),
+            };
+            let evicted = s.swap_remove(victim_idx);
             self.seen_hashes[shard].lock().expect("lock poisoned").remove(&evicted.hash);
             self.pending_total.fetch_sub(1, Ordering::Relaxed);
             tracing::info!("Mempool evicted lowest-fee tx {} from shard {}", &evicted.hash[..12], shard);
