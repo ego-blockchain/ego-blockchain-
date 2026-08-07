@@ -338,11 +338,21 @@ impl ShardedMempool {
             if s.is_empty() { return vec![]; }
 
             // TTL eviction: remove stale txs that have been waiting too long.
+            // Pool-faucet grants are exempt — same reasoning as the low-fee
+            // eviction guard in push(): they're a protocol mint, not a
+            // fee-market participant, and every one shares NODE_POOL_ADDR as
+            // sender, so they all land in this one shard. A 30-minute TTL
+            // with no exemption meant a grant that didn't get drained into a
+            // block within 30 minutes (e.g. this shard wasn't visited yet)
+            // was silently destroyed with no way to tell — the exact "stuck
+            // Pending forever" bug, just via a second, separate eviction path
+            // the earlier low-fee-eviction fix never touched.
             let now = chrono::Utc::now().timestamp();
             s.retain(|tx| {
-                let stale = tx.timestamp > 0 && (now - tx.timestamp) >= MAX_TX_AGE_SECS;
-                if stale { 
-                    expired_hashes.push(tx.hash.clone()); 
+                let is_pool_faucet = tx.tx_type == "faucet" && tx.from == crate::chain_db::NODE_POOL_ADDR;
+                let stale = !is_pool_faucet && tx.timestamp > 0 && (now - tx.timestamp) >= MAX_TX_AGE_SECS;
+                if stale {
+                    expired_hashes.push(tx.hash.clone());
                     if tx.from == my_addr || tx.to == my_addr { my_expired_txs.push(tx.clone()); }
                 }
                 !stale
