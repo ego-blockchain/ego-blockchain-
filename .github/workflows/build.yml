@@ -9,6 +9,11 @@ on:
         description: 'Release version (e.g. v1.0.0) — leave empty to build without releasing'
         required: false
         default: ''
+      linux_only:
+        description: 'Only build Linux (skip Windows/macOS — use to rebuild just the Linux artifacts)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -48,6 +53,7 @@ jobs:
   build-windows:
     name: Windows x64
     runs-on: windows-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.linux_only != true }}
     permissions:
       contents: write
 
@@ -90,6 +96,7 @@ jobs:
   build-macos-arm:
     name: macOS Apple Silicon
     runs-on: macos-14
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.linux_only != true }}
     permissions:
       contents: write
 
@@ -139,6 +146,7 @@ jobs:
   build-macos-intel:
     name: macOS Intel
     runs-on: macos-14
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.linux_only != true }}
     permissions:
       contents: write
 
@@ -186,7 +194,6 @@ jobs:
   build-linux:
     name: Linux x64
     runs-on: ubuntu-22.04
-    needs: build-windows
     permissions:
       contents: write
 

@@ -149,9 +149,30 @@ pub fn load_seed() -> Result<Option<Vec<u8>>, String> {
             let entry = seed_keyring_entry().map_err(|e| format!("Keyring init error: {}", e))?;
             let pw = match entry.get_password().map_err(|e| e.to_string()) {
                 Ok(p) => p,
+                Err(e) if cfg!(target_os = "linux") && (
+                    e.contains("zbus") || e.contains("D-Bus") || e.contains("DBus")
+                    || e.contains("NoReply") || e.contains("message bus")
+                    || e.contains("NoSuchObject") || e.contains("ServiceUnknown")
+                ) => {
+                    // Secret Service (gnome-keyring / kwallet) isn't reachable over D-Bus in
+                    // this session. This is an environment/session problem, not data loss —
+                    // the seed is still safely stored once the Secret Service is reachable
+                    // again. DO NOT delete the sentinel file: that would silently generate a
+                    // brand-new wallet on next launch and orphan the real one.
+                    return Err(format!(
+                        "Ego Desktop couldn't reach your Linux Secret Service (gnome-keyring or \
+                         kwallet) over D-Bus, which is needed to unlock your wallet seed: {}\n\n\
+                         Your wallet is safe — nothing was lost. This usually means the keyring \
+                         daemon isn't running in this session.\n\n\
+                         FIX: log out and back in (so the desktop session starts the keyring \
+                         daemon), or install/start one manually, e.g. `sudo apt install \
+                         gnome-keyring` then restart Ego Desktop.",
+                        e
+                    ));
+                }
                 Err(e) if e.contains("No such item") || e.contains("not found") || e.contains("Access control") => {
                     // Inconsistent state or Access Denied due to signature change.
-                    // DO NOT delete the sentinel file. Deleting it causes a new wallet 
+                    // DO NOT delete the sentinel file. Deleting it causes a new wallet
                     // to be generated, losing the user's identity.
                     return Err(format!(
                         "macOS Keychain Access Error: {}. If you are developing, ensure your app is signed or check Keychain Access.app.",
