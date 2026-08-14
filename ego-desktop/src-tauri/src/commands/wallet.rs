@@ -1680,8 +1680,15 @@ pub async fn presale_stripe_checkout(
 }
 
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StripeVerifyResult {
+    pub paid: bool,
+    pub status: String,
+    pub amount_total_cents: i64,
+}
+
 #[tauri::command]
-pub async fn presale_stripe_verify(session_id: String) -> Result<serde_json::Value, EgoDesktopError> {
+pub async fn presale_stripe_verify(session_id: String) -> Result<StripeVerifyResult, EgoDesktopError> {
     let stripe_key = get_stripe_key();
     if stripe_key.is_empty() {
         return Err(EgoDesktopError::NetworkError("Stripe API key is missing.".into()));
@@ -1706,12 +1713,20 @@ pub async fn presale_stripe_verify(session_id: String) -> Result<serde_json::Val
         return Err(EgoDesktopError::NetworkError(format!("Stripe API: {err}")));
     }
 
+    // Stripe's checkout session object has `payment_status` ("paid"/"unpaid"/
+    // "no_payment_required") and a separate lifecycle `status` ("open"/
+    // "complete"/"expired") — neither is a `paid` boolean, which is what the
+    // frontend actually checks. Derive it explicitly instead of forwarding
+    // Stripe's raw shape.
     let payment_status = json["payment_status"].as_str().unwrap_or("");
-    if payment_status != "paid" {
-        return Err(EgoDesktopError::NetworkError("Payment is not confirmed yet. Please complete the checkout in your browser.".into()));
-    }
+    let status = json["status"].as_str().unwrap_or("").to_string();
+    let amount_total_cents = json["amount_total"].as_i64().unwrap_or(0);
 
-    Ok(json)
+    Ok(StripeVerifyResult {
+        paid: payment_status == "paid",
+        status,
+        amount_total_cents,
+    })
 }
 
 

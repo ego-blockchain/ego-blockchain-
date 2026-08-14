@@ -73,15 +73,18 @@ fn save_tokens(tokens: &[CustomToken]) -> Result<(), String> {
     fs::write(tokens_path(), s).map_err(|e| e.to_string())
 }
 
-fn evm_rpc(chain_symbol: &str) -> &'static str {
+/// RPC endpoints per chain, tried in order until one responds — a single
+/// free public RPC going down (common) previously broke balance/swap for
+/// that entire chain with no fallback.
+fn evm_rpc_list(chain_symbol: &str) -> &'static [&'static str] {
     match chain_symbol {
-        "ETH"  => "https://eth.llamarpc.com",
-        "BNB"  => "https://bsc-dataseed.binance.org",
-        "MATIC"=> "https://polygon.llamarpc.com",
-        "AVAX" => "https://api.avax.network/ext/bc/C/rpc",
-        "ARB"  => "https://arb1.arbitrum.io/rpc",
-        "OP"   => "https://mainnet.optimism.io",
-        _      => "https://eth.llamarpc.com",
+        "ETH"   => &["https://eth.llamarpc.com", "https://ethereum-rpc.publicnode.com", "https://eth.drpc.org"],
+        "BNB"   => &["https://bsc-dataseed.binance.org", "https://bsc-rpc.publicnode.com", "https://bsc.drpc.org"],
+        "MATIC" => &["https://polygon.llamarpc.com", "https://polygon-bor-rpc.publicnode.com", "https://polygon.drpc.org"],
+        "AVAX"  => &["https://api.avax.network/ext/bc/C/rpc", "https://avalanche-c-chain-rpc.publicnode.com"],
+        "ARB"   => &["https://arb1.arbitrum.io/rpc", "https://arbitrum-one-rpc.publicnode.com"],
+        "OP"    => &["https://mainnet.optimism.io", "https://optimism-rpc.publicnode.com"],
+        _       => &["https://eth.llamarpc.com", "https://ethereum-rpc.publicnode.com"],
     }
 }
 
@@ -143,6 +146,24 @@ async fn evm_call(rpc: &str, method: &str, params: serde_json::Value)
     Ok(json["result"].clone())
 }
 
+/// Same as `evm_call`, but tries every RPC endpoint for `chain_symbol` in
+/// order until one responds — a single free public RPC going down (common)
+/// previously broke balance/swap for that entire chain with no fallback.
+/// Only for genuine EVM chains; other callers of `evm_call` (e.g. Solana)
+/// pass a hardcoded provider URL directly and must keep using `evm_call`.
+async fn evm_call_multi(chain_symbol: &str, method: &str, params: serde_json::Value)
+    -> Result<serde_json::Value, String>
+{
+    let mut last_err = String::new();
+    for rpc in evm_rpc_list(chain_symbol) {
+        match evm_call(rpc, method, params.clone()).await {
+            Ok(v) => return Ok(v),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
 // ABI: encode a 32-byte-padded address parameter
 fn abi_address_param(addr: &str) -> String {
     let stripped = addr.trim_start_matches("0x").to_lowercase();
@@ -194,8 +215,7 @@ fn fmt_amount(raw: u128, decimals: u8) -> String {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn fetch_evm_native_balance(chain: &str, address: &str) -> Result<BalanceResult, String> {
-    let rpc = evm_rpc(chain);
-    let result = evm_call(rpc, "eth_getBalance",
+    let result = evm_call_multi(chain, "eth_getBalance",
         serde_json::json!([address, "latest"])).await?;
 
     let hex = result.as_str().unwrap_or("0x0");
@@ -208,11 +228,11 @@ async fn fetch_evm_native_balance(chain: &str, address: &str) -> Result<BalanceR
     })
 }
 
-async fn fetch_erc20_balance(rpc: &str, contract: &str, wallet: &str, symbol: &str, decimals: u8)
+async fn fetch_erc20_balance(chain: &str, contract: &str, wallet: &str, symbol: &str, decimals: u8)
     -> Result<BalanceResult, String>
 {
     let data = format!("0x70a08231{}", abi_address_param(wallet)); // balanceOf(address)
-    let result = evm_call(rpc, "eth_call",
+    let result = evm_call_multi(chain, "eth_call",
         serde_json::json!([{ "to": contract, "data": data }, "latest"])).await?;
 
     let raw = abi_decode_u128(result.as_str().unwrap_or("0x0"));
@@ -1089,16 +1109,15 @@ pub async fn fetch_chain_balance(
             match &contract {
                 Some(addr) => {
                     // Get token decimals first (default 18)
-                    let rpc  = evm_rpc(c);
                     let dec_data = "0x313ce567"; // decimals()
-                    let dec_res  = evm_call(rpc, "eth_call",
+                    let dec_res  = evm_call_multi(c, "eth_call",
                         serde_json::json!([{"to": addr, "data": dec_data}, "latest"])).await
                         .ok();
                     let decimals = dec_res.as_ref()
                         .and_then(|v| v.as_str())
                         .map(|s| abi_decode_u64(s) as u8)
                         .unwrap_or(18);
-                    fetch_erc20_balance(rpc, addr, &address, &chain_symbol, decimals).await
+                    fetch_erc20_balance(c, addr, &address, &chain_symbol, decimals).await
                 }
                 None => fetch_evm_native_balance(&chain_symbol, &address).await,
             }
@@ -1150,18 +1169,17 @@ pub async fn lookup_token_info(
             "Token lookup is only supported for EVM chains".into()
         ));
     }
-    let rpc = evm_rpc(&chain_symbol);
     let contract = &contract_address;
 
-    async fn call_str(rpc: &str, contract: &str, selector: &str) -> String {
-        let res = evm_call(rpc, "eth_call",
+    async fn call_str(chain: &str, contract: &str, selector: &str) -> String {
+        let res = evm_call_multi(chain, "eth_call",
             serde_json::json!([{"to": contract, "data": selector}, "latest"])).await;
         res.ok().and_then(|v| v.as_str().map(abi_decode_string)).unwrap_or_default()
     }
 
-    let symbol   = call_str(rpc, contract, "0x95d89b41").await; // symbol()
-    let name     = call_str(rpc, contract, "0x06fdde03").await; // name()
-    let dec_res  = evm_call(rpc, "eth_call",
+    let symbol   = call_str(&chain_symbol, contract, "0x95d89b41").await; // symbol()
+    let name     = call_str(&chain_symbol, contract, "0x06fdde03").await; // name()
+    let dec_res  = evm_call_multi(&chain_symbol, "eth_call",
         serde_json::json!([{"to": contract, "data": "0x313ce567"}, "latest"])).await
         .ok();
     let decimals: u8 = dec_res.as_ref()
@@ -1387,7 +1405,6 @@ async fn send_evm_tx(
     use k256::elliptic_curve::sec1::ToEncodedPoint;
     use sha3::{Digest, Keccak256};
 
-    let rpc = evm_rpc(chain);
     let chain_id = evm_chain_id_num(chain);
 
     let signing_key = SigningKey::from_slice(privkey_bytes).map_err(|e| e.to_string())?;
@@ -1395,12 +1412,12 @@ async fn send_evm_tx(
     let keccak = Keccak256::digest(&uncompressed.as_bytes()[1..]);
     let from_addr = eip55_checksum(&keccak[12..]);
 
-    let nonce_res = evm_call(rpc, "eth_getTransactionCount",
+    let nonce_res = evm_call_multi(chain, "eth_getTransactionCount",
         serde_json::json!([&from_addr, "pending"])).await?;
     let nonce = u64::from_str_radix(
         nonce_res.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or(0);
 
-    let gp_res = evm_call(rpc, "eth_gasPrice", serde_json::json!([])).await?;
+    let gp_res = evm_call_multi(chain, "eth_gasPrice", serde_json::json!([])).await?;
     let gas_price = u128::from_str_radix(
         gp_res.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or(1_000_000_000)
         * 12 / 10; // +20% buffer
@@ -1442,7 +1459,7 @@ async fn send_evm_tx(
     ]);
 
     let raw_hex = format!("0x{}", hex::encode(&signed_tx));
-    let result = evm_call(rpc, "eth_sendRawTransaction", serde_json::json!([raw_hex])).await?;
+    let result = evm_call_multi(chain, "eth_sendRawTransaction", serde_json::json!([raw_hex])).await?;
     Ok(result.as_str().map(|s| s.to_string())
         .unwrap_or_else(|| result.to_string()))
 }
@@ -2041,8 +2058,7 @@ pub async fn estimate_external_fee(
 ) -> Result<String, EgoDesktopError> {
     let fee = match chain_symbol.as_str() {
         c if is_evm(c) => {
-            let rpc = evm_rpc(c);
-            let gp_res = evm_call(rpc, "eth_gasPrice", serde_json::json!([])).await
+            let gp_res = evm_call_multi(c, "eth_gasPrice", serde_json::json!([])).await
                 .unwrap_or(serde_json::json!("0x77359400")); // 2 Gwei default
             let gas_price = u128::from_str_radix(
                 gp_res.as_str().unwrap_or("0x77359400").trim_start_matches("0x"), 16).unwrap_or(2_000_000_000);

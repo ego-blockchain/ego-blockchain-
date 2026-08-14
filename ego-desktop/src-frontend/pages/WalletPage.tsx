@@ -299,6 +299,9 @@ const WalletPage: React.FC = () => {
   const addressQR = useMemo(() => makeQR(myAddress), [myAddress]);
 
   const [balance, setBalance]       = useState<Balance | null>(null);
+  const [faucet, setFaucet]         = useState<{ claimed_uegoc: number; cap_uegoc: number; step_uegoc: number } | null>(null);
+  const [faucetClaiming, setFaucetClaiming] = useState(false);
+  const [faucetMsg, setFaucetMsg]   = useState<string | null>(null);
   const [creditsBal, setCreditsBal] = useState<{ credits: number; usd_value: number; egoc_price_usd: number } | null>(null);
   const [showCredits, setShowCredits] = useState(false);
   const [creditsAmt, setCreditsAmt]   = useState('');
@@ -358,6 +361,8 @@ const WalletPage: React.FC = () => {
   const [stripeSessionId, setStripeSessionId]   = useState('');
   const [stripeVerifying, setStripeVerifying]   = useState(false);
   const [stripeVerified, setStripeVerified]     = useState(false);
+  const [showResumeStripe, setShowResumeStripe] = useState(false);
+  const [resumeSessionInput, setResumeSessionInput] = useState('');
   const [stripeError, setStripeError]           = useState('');
   const [showSwap, setShowSwap]       = useState(false);
   const [swapStep, setSwapStep]       = useState<'quote' | 'deposit' | 'done'>('quote');
@@ -465,6 +470,30 @@ const WalletPage: React.FC = () => {
     const id = setInterval(load, 30000);
     return () => clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    const loadFaucet = () =>
+      invoke<{ claimed_uegoc: number; cap_uegoc: number; step_uegoc: number }>('get_faucet_status')
+        .then(setFaucet).catch(() => {});
+    loadFaucet();
+    const unsub = listen('wallet-balance-updated', loadFaucet);
+    return () => { unsub.then(fn => fn()); };
+  }, [myAddress]);
+
+  async function claimFaucet() {
+    if (faucetClaiming) return;
+    setFaucetClaiming(true);
+    setFaucetMsg(null);
+    try {
+      const status = await invoke<{ claimed_uegoc: number; cap_uegoc: number; step_uegoc: number }>('claim_faucet');
+      setFaucet(status);
+      setFaucetMsg(`+${(status.step_uegoc / 1_000_000).toFixed(0)} EGOC claimed`);
+    } catch (e) {
+      setFaucetMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFaucetClaiming(false);
+    }
+  }
 
   const loadingRef = useRef(false);
   const lastTxSigRef = useRef<string>('');
@@ -739,6 +768,13 @@ const WalletPage: React.FC = () => {
     swapFromBalance !== null &&
     parseFloat(swapAmount) > 0 &&
     parseFloat(swapAmount) > swapFromBalance;
+  // Balance couldn't be confirmed (no address on file, or the RPC lookup failed) —
+  // block the swap rather than silently forwarding an unverified amount to ChangeNow.
+  const swapBalanceUnverified =
+    !swapFrom.is_ego &&
+    !swapBalFetching &&
+    swapFromBalance === null &&
+    parseFloat(swapAmount) > 0;
 
   async function loadExternalAddresses() {
     setLoadingAddr(true);
@@ -1014,7 +1050,7 @@ const WalletPage: React.FC = () => {
               {isLiveMode ? '🟢 Mainnet' : '🟡 Testnet'}
             </button>
             <div className={`text-xs text-right ${isLiveMode ? 'text-gray-500' : 'text-blue-300'}`}>
-              {isLiveMode ? 'Coming soon' : 'Ego Chain · v0.1.0'}
+              {isLiveMode ? 'Coming soon' : 'Ego Chain · v0.3.30'}
             </div>
           </div>
         </div>
@@ -1088,6 +1124,43 @@ const WalletPage: React.FC = () => {
           }
         `}</style>
       </div>
+
+      {!isLiveMode && faucet && (
+        <div className="bg-gray-800/60 rounded-2xl border border-gray-700/50 p-5">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <div className="font-semibold text-sm flex items-center gap-2">🚰 Testnet Faucet</div>
+              <div className="text-xs text-gray-400 mt-0.5">
+                {(faucet.claimed_uegoc / 1_000_000).toFixed(0)} / {(faucet.cap_uegoc / 1_000_000).toFixed(0)} EGOC claimed
+              </div>
+            </div>
+            <button
+              onClick={claimFaucet}
+              disabled={faucetClaiming || faucet.claimed_uegoc >= faucet.cap_uegoc}
+              className={`px-4 py-2.5 rounded-xl text-sm font-semibold transition whitespace-nowrap ${
+                faucet.claimed_uegoc >= faucet.cap_uegoc
+                  ? 'bg-white/5 text-white/30 cursor-not-allowed'
+                  : 'bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30'
+              }`}
+            >
+              {faucetClaiming
+                ? 'Claiming…'
+                : faucet.claimed_uegoc >= faucet.cap_uegoc
+                ? 'Fully claimed'
+                : `Claim ${(faucet.step_uegoc / 1_000_000).toFixed(0)} EGOC`}
+            </button>
+          </div>
+          <div className="w-full h-1.5 bg-white/5 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-emerald-500/60 transition-all duration-500"
+              style={{ width: `${Math.min(100, (faucet.claimed_uegoc / faucet.cap_uegoc) * 100)}%` }}
+            />
+          </div>
+          {faucetMsg && (
+            <div className="text-xs mt-2 text-gray-400">{faucetMsg}</div>
+          )}
+        </div>
+      )}
 
       {}
       <div className="bg-gray-800/60 rounded-2xl border border-gray-700/50 overflow-hidden">
@@ -1710,7 +1783,40 @@ const WalletPage: React.FC = () => {
                           >
                             {presaleLoading ? 'Opening Stripe…' : 'Checkout with Stripe →'}
                           </button>
-                        ) : (
+                        ) : null}
+                        {!stripeSessionId && (
+                          <div className="text-center">
+                            <button
+                              onClick={() => setShowResumeStripe(v => !v)}
+                              className="text-xs text-gray-500 hover:text-gray-300 underline"
+                            >
+                              Already paid but lost the verify screen?
+                            </button>
+                            {showResumeStripe && (
+                              <div className="mt-2 flex gap-2">
+                                <input
+                                  type="text"
+                                  value={resumeSessionInput}
+                                  onChange={e => setResumeSessionInput(e.target.value.trim())}
+                                  placeholder="cs_live_… or cs_test_… session ID"
+                                  className="flex-1 bg-gray-700 rounded-lg px-3 py-2 text-xs font-mono outline-none focus:ring-1 focus:ring-blue-500"
+                                />
+                                <button
+                                  onClick={() => {
+                                    if (!resumeSessionInput) return;
+                                    setStripeSessionId(resumeSessionInput);
+                                    setStripeError('');
+                                  }}
+                                  disabled={!resumeSessionInput}
+                                  className="px-3 py-2 rounded-lg text-xs font-semibold bg-gray-600 hover:bg-gray-500 disabled:opacity-40 transition"
+                                >
+                                  Resume
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        {stripeSessionId && (
                           <div className="space-y-2">
                             <div className="text-xs text-yellow-300 bg-yellow-500/10 border border-yellow-500/20 rounded-xl p-2">
                               Browser checkout opened. Complete payment then click Verify below.
@@ -1719,7 +1825,7 @@ const WalletPage: React.FC = () => {
                               onClick={async () => {
                                 setStripeVerifying(true); setStripeError('');
                                 try {
-                                  const result = await invoke<{ paid: boolean; status: string; egoc_amount: number }>('presale_stripe_verify', { sessionId: stripeSessionId });
+                                  const result = await invoke<{ paid: boolean; status: string; amount_total_cents: number }>('presale_stripe_verify', { sessionId: stripeSessionId });
                                   if (!result.paid) { setStripeError(`Payment not confirmed yet (status: ${result.status}). Try again in a moment.`); return; }
                                   setStripeVerified(true);
                                 } catch (e: any) { setStripeError(String(e).replace(/^Error: /, '')); }
@@ -2033,6 +2139,11 @@ const WalletPage: React.FC = () => {
                       Insufficient balance — you only have {swapFromBalance!.toFixed(4)} {swapFrom.symbol}
                     </div>
                   )}
+                  {swapBalanceUnverified && (
+                    <div className="text-right text-xs text-red-400 mt-1 font-medium">
+                      Couldn't verify your {swapFrom.symbol} balance — check your address in the Multi-Chain Wallet section, or try again.
+                    </div>
+                  )}
                 </div>
 
                 {}
@@ -2137,6 +2248,10 @@ const WalletPage: React.FC = () => {
                 <button
                   onClick={async () => {
                     if (swapOutput <= 0 || swapInsufficientBalance) return;
+                    if (swapBalanceUnverified) {
+                      setCnCreateError(`Couldn't verify your ${swapFrom.symbol} balance — check your address in the Multi-Chain Wallet section, or try again.`);
+                      return;
+                    }
                     if (useChangenow) {
                       // Find the to-address for the destination asset
                       const toExt = extAddresses.find(a => a.symbol === swapTo.symbol);
@@ -2178,10 +2293,10 @@ const WalletPage: React.FC = () => {
                       setSwapStep('deposit');
                     }
                   }}
-                  disabled={!swapAmount || swapOutput <= 0 || swapRateLoading || cnEstLoading || swapInsufficientBalance || cnCreating || (cnMinAmount > 0 && parseFloat(swapAmount) < cnMinAmount)}
+                  disabled={!swapAmount || swapOutput <= 0 || swapRateLoading || cnEstLoading || swapInsufficientBalance || swapBalanceUnverified || cnCreating || (cnMinAmount > 0 && parseFloat(swapAmount) < cnMinAmount)}
                   className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed py-3 rounded-xl font-semibold transition"
                 >
-                  {cnCreating ? 'Creating swap…' : swapInsufficientBalance ? 'Insufficient Balance' : 'Continue'}
+                  {cnCreating ? 'Creating swap…' : swapInsufficientBalance ? 'Insufficient Balance' : swapBalanceUnverified ? 'Balance Unverified' : 'Continue'}
                 </button>
                 {cnCreateError && (
                   <div className="text-xs text-red-400 text-center">{cnCreateError}</div>

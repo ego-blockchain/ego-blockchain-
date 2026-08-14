@@ -719,6 +719,8 @@ fn main() {
             commands::auth::generate_keypair,
             commands::auth::import_keypair,
             commands::auth::get_address,
+            commands::auth::get_faucet_status,
+            commands::auth::claim_faucet,
             commands::auth::list_wallets,
             commands::auth::create_wallet,
             commands::auth::import_wallet,
