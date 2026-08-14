@@ -448,11 +448,15 @@ const MessengerPage: React.FC = () => {
         }
       }),
 
-      listen<Message>('ego://message-received', (event) => {
+      listen<Message | null>('ego://message-received', (event) => {
         const msg = event.payload;
 
         const cur = selectedRef.current;
-        if (cur && (msg.from === cur.address || msg.to === cur.address)) {
+        // This event doubles as a generic "messages changed, refresh" signal
+        // (see the payload-less emit in loadMessages below) — treat a missing
+        // payload as "refresh the open conversation" rather than a real message.
+        if (!cur) return;
+        if (!msg || msg.from === cur.address || msg.to === cur.address) {
           loadMessages(cur.address);
         }
       }),
