@@ -1663,6 +1663,100 @@ pub fn grant_testnet_faucet(address: &str, amount_uegoc: u64) -> bool {
     true
 }
 
+/// Amount granted per manual desktop-app faucet claim (button click).
+pub const FAUCET_STEP_UEGOC: u64 = 1_000 * 1_000_000;
+/// Lifetime cap per address for manual desktop-app faucet claims.
+pub const FAUCET_CAP_UEGOC: u64 = 5_000 * 1_000_000;
+
+/// Sum of all *confirmed* faucet grants ever received by `address`.
+pub fn get_faucet_total_uegoc(address: &str) -> u64 {
+    get_tx_history_for_addr(address)
+        .into_iter()
+        .filter(|tx| tx.tx_type == "faucet")
+        .map(|tx| tx.amount)
+        .sum()
+}
+
+/// Amount from a faucet grant to `address` still sitting unconfirmed in the mempool.
+pub fn get_faucet_pending_uegoc(address: &str) -> u64 {
+    crate::mempool::get_mempool()
+        .pending_txs_for_address(address)
+        .into_iter()
+        .filter(|tx| tx.tx_type == "faucet" && tx.to == address)
+        .map(|tx| tx.amount)
+        .sum()
+}
+
+/// Manual, button-driven testnet faucet claim: grants `FAUCET_STEP_UEGOC` per
+/// call, capped cumulatively at `FAUCET_CAP_UEGOC` per address. Unlike
+/// `grant_testnet_faucet` (one-time, auto-fired), this is meant to be called
+/// repeatedly by explicit user action, so a claim that never confirms (e.g.
+/// evicted from mempool) simply stops counting against the cap once it drops
+/// out of the mempool — no separate stuck-grant recovery needed.
+pub fn claim_desktop_faucet(address: &str) -> Result<u64, String> {
+    static CLAIM_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let _guard = CLAIM_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+
+    if get_faucet_pending_uegoc(address) > 0 {
+        return Err("A previous test-coin claim is still pending confirmation".into());
+    }
+
+    let total_granted = get_faucet_total_uegoc(address);
+    if total_granted >= FAUCET_CAP_UEGOC {
+        return Err("You've already claimed the maximum 5000 test EGOC".into());
+    }
+
+    let pool_bal = {
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let cf_balances = db.cf_handle(CF_BALANCES).ok_or("balances column family missing")?;
+        db.get_cf(cf_balances, NODE_POOL_ADDR.as_bytes())
+            .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
+    };
+
+    let grant = FAUCET_STEP_UEGOC
+        .min(FAUCET_CAP_UEGOC - total_granted)
+        .min(pool_bal);
+    if grant == 0 {
+        return Err("Faucet pool is empty — try again later".into());
+    }
+
+    let current_time = chrono::Utc::now().timestamp();
+    let nonce = 0;
+    let sign_bytes = crate::ledger::tx_signing_bytes_v2(
+        NODE_POOL_ADDR, address, grant, nonce, current_time, 1, "testnet faucet",
+    );
+    let hash = format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex());
+
+    let tx = crate::ledger::LedgerTx {
+        hash: hash.clone(),
+        from: NODE_POOL_ADDR.into(),
+        to: address.into(),
+        amount: grant,
+        fee_uegoc: 0,
+        tx_type: "faucet".into(),
+        memo: Some("testnet faucet".into()),
+        timestamp: current_time,
+        status: "Pending".into(),
+        block_height: None,
+        nonce,
+        signature: "faucet".into(),
+        tx_version: 2,
+        chain_id: 1,
+        ..crate::ledger::LedgerTx::default()
+    };
+
+    eprintln!("[Faucet] Queuing {} uEGOC claim for {} via Mempool", grant, address);
+
+    crate::commands::tx_pending::add(&tx);
+    let pool = crate::mempool::get_mempool();
+    let _ = pool.push(tx.clone());
+    tokio::spawn(async move {
+        crate::p2p::broadcast_pending_tx(tx).await;
+    });
+
+    Ok(grant)
+}
+
 pub fn recent_blocks(limit: usize) -> Vec<LedgerBlock> {
     paged_blocks(0, limit)
 }

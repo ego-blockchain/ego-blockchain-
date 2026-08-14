@@ -305,12 +305,13 @@ async fn load_active_wallet(
         }
     }
 
-    // Heavy chain_db work (RocksDB cold open + faucet + real balance) runs in
+    // Heavy chain_db work (RocksDB cold open + real balance) runs in
     // background so init_wallet returns in ~50 ms instead of 2-8 s.
+    // Test coins are no longer auto-granted here — the frontend's faucet
+    // button (claim_faucet command) drives that explicitly now.
     let addr = keys.address.clone();
     tauri::async_runtime::spawn(async move {
         let (bal, fmt) = tokio::task::spawn_blocking(move || {
-            credit_testnet_faucet(&addr);
             let b = crate::chain_db::balance_of(&addr);
 
             let pending_faucet_in: u64 = crate::mempool::get_mempool()
@@ -789,14 +790,6 @@ pub async fn rename_wallet(
 
 // ── generate_keypair (legacy) ─────────────────────────────────────────────────
 
-fn credit_testnet_faucet(address: &str) {
-    if std::env::var("EGO_NO_FAUCET").map(|v| v == "1").unwrap_or(false) {
-        return;
-    }
-    const FAUCET_UEGOC: u64 = 1_000 * 1_000_000;
-    crate::chain_db::grant_testnet_faucet(address, FAUCET_UEGOC);
-}
-
 #[tauri::command]
 pub async fn generate_keypair(state: State<'_, AppState>) -> Result<KeypairInfo, EgoDesktopError> {
     let keypair  = KeyPair::generate();
@@ -810,8 +803,6 @@ pub async fn generate_keypair(state: State<'_, AppState>) -> Result<KeypairInfo,
     let dilithium_pk = hex::encode(keypair.dilithium_public_key().as_bytes());
     let kyber_pk     = hex::encode(keypair.kyber_public_key().as_bytes());
     let qr_code      = generate_address_qr(&address)?;
-
-    credit_testnet_faucet(&address);
 
     state
         .initialize_wallet(keypair, true)  // true = explicit user action, force switch
@@ -841,8 +832,6 @@ pub async fn import_keypair(
     let dilithium_pk = hex::encode(keypair.dilithium_public_key().as_bytes());
     let kyber_pk     = hex::encode(keypair.kyber_public_key().as_bytes());
     let qr_code      = generate_address_qr(&address)?;
-
-    credit_testnet_faucet(&address);
 
     state
         .initialize_wallet(keypair, true)  // true = explicit user action, force switch
@@ -1212,6 +1201,52 @@ pub async fn get_address(_state: State<'_, AppState>) -> Result<Option<String>, 
     } else {
         Ok(Some(ledger.address))
     }
+}
+
+// ── faucet (manual, button-driven test coins) ─────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FaucetStatus {
+    pub claimed_uegoc: u64,
+    pub cap_uegoc: u64,
+    pub step_uegoc: u64,
+}
+
+#[tauri::command]
+pub async fn get_faucet_status() -> Result<FaucetStatus, EgoDesktopError> {
+    let addr = Ledger::load().address;
+    let claimed_uegoc = if addr.is_empty() {
+        0
+    } else {
+        crate::chain_db::get_faucet_total_uegoc(&addr) + crate::chain_db::get_faucet_pending_uegoc(&addr)
+    };
+    Ok(FaucetStatus {
+        claimed_uegoc,
+        cap_uegoc: crate::chain_db::FAUCET_CAP_UEGOC,
+        step_uegoc: crate::chain_db::FAUCET_STEP_UEGOC,
+    })
+}
+
+#[tauri::command]
+pub async fn claim_faucet() -> Result<FaucetStatus, EgoDesktopError> {
+    if std::env::var("EGO_NO_FAUCET").map(|v| v == "1").unwrap_or(false) {
+        return Err(EgoDesktopError::WalletError("Faucet disabled".into()));
+    }
+    let addr = Ledger::load().address;
+    if addr.is_empty() {
+        return Err(EgoDesktopError::WalletError("No wallet loaded".into()));
+    }
+    let addr2 = addr.clone();
+    tokio::task::spawn_blocking(move || crate::chain_db::claim_desktop_faucet(&addr2))
+        .await
+        .map_err(|e| EgoDesktopError::WalletError(format!("Claim panicked: {e}")))?
+        .map_err(EgoDesktopError::WalletError)?;
+
+    Ok(FaucetStatus {
+        claimed_uegoc: crate::chain_db::get_faucet_total_uegoc(&addr) + crate::chain_db::get_faucet_pending_uegoc(&addr),
+        cap_uegoc: crate::chain_db::FAUCET_CAP_UEGOC,
+        step_uegoc: crate::chain_db::FAUCET_STEP_UEGOC,
+    })
 }
 
 /// Encode the wallet's 32-byte seed as a 24-word BIP39-compatible mnemonic.

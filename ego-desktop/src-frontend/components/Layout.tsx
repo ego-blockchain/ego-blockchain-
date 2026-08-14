@@ -364,7 +364,7 @@ const Layout: React.FC = () => {
             <img src="/ego_logo.png" alt="Ego" className="w-9 h-9 rounded-full object-cover" />
             <div>
               <div className="font-bold text-sm leading-tight">Ego Wallet</div>
-              <div className="text-xs text-gray-400">v0.1.0</div>
+              <div className="text-xs text-gray-400">v0.3.30</div>
             </div>
           </div>
         </div>
