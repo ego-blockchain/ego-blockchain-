@@ -378,6 +378,27 @@ fn main() {
     }
     tracing::info!("Ego Desktop starting");
 
+    // Windows WebView2 (Chromium) suspends compositing for occluded/minimized
+    // windows to save power, and after long periods minimized can fail to
+    // properly resume it on restore — the window redraws only partially
+    // (title bar / corners) until something forces a repaint. Disabling
+    // Chromium's native window occlusion detection avoids that suspension
+    // in the first place. Must be set before the WebView2 environment is
+    // created, so this has to happen this early in main().
+    #[cfg(target_os = "windows")]
+    {
+        let extra_arg = "--disable-features=CalculateNativeWinOcclusion";
+        let existing = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+        if !existing.contains("CalculateNativeWinOcclusion") {
+            let combined = if existing.is_empty() {
+                extra_arg.to_string()
+            } else {
+                format!("{existing} {extra_arg}")
+            };
+            std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", combined);
+        }
+    }
+
     if std::env::var("EGO_HEADLESS").as_deref() == Ok("1") {
         headless_main();
         return;
