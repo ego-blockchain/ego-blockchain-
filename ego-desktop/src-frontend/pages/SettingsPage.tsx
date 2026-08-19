@@ -297,7 +297,7 @@ const SettingsPage: React.FC = () => {
         <h3 className="font-semibold mb-4">About</h3>
         <div className="space-y-2 text-sm">
           {[
-            { label: 'Version', val: 'v0.3.30' },
+            { label: 'Version', val: 'v0.3.31' },
             { label: 'Network', val: 'Ego Network' },
             { label: 'Node ID', val: wallet?.address ? wallet.address.slice(0, 26) + '…' : '—' },
             { label: 'Crypto',  val: 'Dilithium-3 + Ed25519 + Kyber + AES-256-GCM' },
