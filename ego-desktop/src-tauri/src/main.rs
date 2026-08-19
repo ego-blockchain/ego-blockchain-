@@ -1207,6 +1207,8 @@ fn main() {
                         bounded!(15, crate::commands::messenger::poll_relay_inbox(&my_addr, Some(&handle_startup)));
                     }
 
+                    bounded!(20, crate::commands::messenger::resend_pending_contact_requests());
+
                     bounded!(15, crate::p2p::fetch_and_cache_egoc_price());
 
                     bounded!(15, crate::commands::outbox::flush_pending());

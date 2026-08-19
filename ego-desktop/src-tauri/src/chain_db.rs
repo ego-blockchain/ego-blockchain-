@@ -1256,6 +1256,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
 
     let block_height = block.height;
     let addr = crate::ledger::Ledger::load().address;
+    let my_addr = addr.clone();
     if let Some(&new_bal) = new_balances.get(&addr) {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
@@ -1354,7 +1355,104 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             }
         }
     }
+
+    notify_wallet_activity(&my_addr, block, &confirmed_txs);
     true
+}
+
+/// `Some(true)` for money arriving, `Some(false)` for money leaving, `None`
+/// when the transaction isn't something to put a notification in front of the
+/// user for.
+fn wallet_tx_direction(my_addr: &str, tx: &LedgerTx) -> Option<bool> {
+    if tx.amount == 0 {
+        return None;
+    }
+    // Rewards, coinbase and fee splits land every block on a running node —
+    // notifying on those would bury the transfers the user actually cares about.
+    if !matches!(tx.tx_type.as_str(), "transfer" | "faucet") {
+        return None;
+    }
+    let incoming = tx.to == my_addr;
+    let outgoing = tx.from == my_addr;
+    // Neither side is us, or both are (a self-send): nothing to announce.
+    if incoming == outgoing {
+        return None;
+    }
+    Some(incoming)
+}
+
+fn format_egoc(uegoc: u64) -> String {
+    let s = format!("{:.6}", uegoc as f64 / 1_000_000.0);
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    format!("{} EGOC", trimmed)
+}
+
+fn short_addr(addr: &str) -> String {
+    if addr.len() > 14 {
+        format!("{}…{}", &addr[..10], &addr[addr.len() - 4..])
+    } else {
+        addr.to_string()
+    }
+}
+
+/// Desktop notification when money actually moves in or out of this wallet.
+///
+/// Every confirmed transaction passes through write_block_batch exactly once —
+/// the function returns early on a block it has already written — so this is
+/// the one place that catches a transfer no matter which path confirmed it
+/// (local proposal, BFT commit, or sync from a peer).
+fn notify_wallet_activity(my_addr: &str, block: &LedgerBlock, txs: &[&LedgerTx]) {
+    // Replaying history must stay silent: a node catching up writes thousands
+    // of old blocks and would fire a notification for every past transfer.
+    const FRESH_BLOCK_SECS: i64 = 120;
+    if my_addr.is_empty()
+        || chrono::Utc::now().timestamp().saturating_sub(block.timestamp) > FRESH_BLOCK_SECS
+    {
+        return;
+    }
+
+    if crate::p2p::APP_HANDLE.get().is_none() {
+        return;
+    }
+
+    let mut pending: Vec<(String, String)> = Vec::new();
+    for tx in txs {
+        let Some(incoming) = wallet_tx_direction(my_addr, tx) else { continue };
+
+        let amount = format_egoc(tx.amount);
+        let (title, body) = if incoming {
+            let source = if tx.tx_type == "faucet" {
+                "the testnet faucet".to_string()
+            } else {
+                format!("from {}", short_addr(&tx.from))
+            };
+            ("Payment Received".to_string(), format!("{} {}", amount, source))
+        } else {
+            (
+                "Payment Sent".to_string(),
+                format!("{} to {}", amount, short_addr(&tx.to)),
+            )
+        };
+
+        let body = match tx.memo.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            Some(memo) => format!("{} — {}", body, memo),
+            None => body,
+        };
+
+        pending.push((title, body));
+    }
+
+    if pending.is_empty() {
+        return;
+    }
+    // Off the commit path: showing a toast is a WinRT/DBus round trip, and this
+    // runs while the block-commit mutex is still held.
+    std::thread::spawn(move || {
+        let Some(app) = crate::p2p::APP_HANDLE.get() else { return };
+        for (title, body) in pending {
+            crate::commands::notifications::notify(app, &title, &body);
+        }
+    });
 }
 
 
@@ -6038,4 +6136,57 @@ pub fn remove_pending_otptx(tx_id: &str) {
     let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return };
     let key = format!("{}{}", META_OTP_TX_PREFIX, tx_id);
     let _ = db.delete_cf(cf, key.as_bytes());
+}
+
+#[cfg(test)]
+mod wallet_notification_tests {
+    use super::*;
+
+    fn tx(tx_type: &str, from: &str, to: &str, amount: u64) -> LedgerTx {
+        LedgerTx {
+            hash: "0xabc".into(),
+            from: from.into(),
+            to: to.into(),
+            amount,
+            tx_type: tx_type.into(),
+            ..LedgerTx::default()
+        }
+    }
+
+    const ME: &str = "egot1me000000000000000000000000000000000000000";
+    const THEM: &str = "egot1them00000000000000000000000000000000000000";
+
+    #[test]
+    fn transfers_to_and_from_the_wallet_are_announced() {
+        assert_eq!(wallet_tx_direction(ME, &tx("transfer", THEM, ME, 5)), Some(true));
+        assert_eq!(wallet_tx_direction(ME, &tx("transfer", ME, THEM, 5)), Some(false));
+        assert_eq!(wallet_tx_direction(ME, &tx("faucet", NODE_POOL_ADDR, ME, 5)), Some(true));
+    }
+
+    /// A running node collects rewards every block. If those notified, the
+    /// transfers a user actually wants to see would be buried.
+    #[test]
+    fn rewards_and_unrelated_transfers_stay_silent() {
+        for kind in ["reward", "coinbase", "fee_distribution", "post_reward", "stake"] {
+            assert_eq!(wallet_tx_direction(ME, &tx(kind, NODE_POOL_ADDR, ME, 5)), None, "{kind}");
+        }
+        assert_eq!(wallet_tx_direction(ME, &tx("transfer", THEM, THEM, 5)), None);
+        assert_eq!(wallet_tx_direction(ME, &tx("transfer", ME, ME, 5)), None);
+        assert_eq!(wallet_tx_direction(ME, &tx("transfer", THEM, ME, 0)), None);
+        assert_eq!(wallet_tx_direction("", &tx("transfer", THEM, ME, 5)), None);
+    }
+
+    #[test]
+    fn amounts_render_without_trailing_zeros() {
+        assert_eq!(format_egoc(1_000_000), "1 EGOC");
+        assert_eq!(format_egoc(1_500_000), "1.5 EGOC");
+        assert_eq!(format_egoc(1), "0.000001 EGOC");
+        assert_eq!(format_egoc(0), "0 EGOC");
+    }
+
+    #[test]
+    fn long_addresses_are_shortened_for_the_toast() {
+        assert_eq!(short_addr(ME), "egot1me000…0000");
+        assert_eq!(short_addr("egot1short"), "egot1short");
+    }
 }

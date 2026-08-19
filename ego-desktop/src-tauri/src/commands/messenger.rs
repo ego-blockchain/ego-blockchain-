@@ -43,6 +43,15 @@ pub struct Contact {
 
     #[serde(default)]
     pub ratchet_recv_count: u64,
+
+    // Token from the card that started this request, kept so a pending_out
+    // request can be re-sent later — the recipient drops requests that don't
+    // carry their current token.
+    #[serde(default)]
+    pub bundle_token: Option<String>,
+
+    #[serde(default)]
+    pub last_request_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -438,6 +447,8 @@ pub async fn import_contact(
             )
         })?;
 
+    let ed25519_for_seal = ed25519.clone();
+
     // Extract bundle token from 5th field (if present) to forward in ContactRequest
     let bundle_token: Option<String> = bundle.trim()
         .strip_prefix("egocontact1:")
@@ -520,6 +531,8 @@ pub async fn import_contact(
             ratchet_recv_chain: String::new(),
             ratchet_send_count: 0,
             ratchet_recv_count: 0,
+            bundle_token:       bundle_token.clone(),
+            last_request_at:    chrono::Utc::now().timestamp(),
         };
         contacts.push(contact.clone());
         save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
@@ -539,6 +552,13 @@ pub async fn import_contact(
         eprintln!("[Messenger] ContactRequest delivery deferred for {}: {}", addr, e);
         // Deposit in SOVRAN's inbox (addr = recipient), not our own.
         deposit_in_relay_inbox(&my_addr, &addr, &request).await;
+    }
+    // Always gossip a sealed copy too. Direct delivery can report success and
+    // still be dropped on arrival (revoked token, older build), and the DHT
+    // record may never land anywhere the recipient queries — while a duplicate
+    // costs nothing, since the handler ignores requests from a known contact.
+    if !p2p::gossip_sealed_dm(&addr, &ed25519_for_seal, &request).await {
+        eprintln!("[Messenger] No usable identity key for {} — gossip fallback skipped", addr);
     }
 
     Ok(contact)
@@ -638,6 +658,11 @@ pub async fn approve_contact_request(
     // even if they were offline or direct delivery was unreliable.
     // Deposit in CONTACT's inbox (contact_addr = recipient), not our own.
     deposit_in_relay_inbox(&my_addr, &contact_addr, &response).await;
+    // …and a sealed copy over gossip, which is the only path that survives both
+    // sides being NAT'd behind the relay.
+    if !p2p::gossip_sealed_dm(&contact_addr, &contact.ed25519_pubkey, &response).await {
+        eprintln!("[Messenger] No usable identity key for {} — approval gossip skipped", contact_addr);
+    }
 
     Ok(contact)
 }
@@ -656,34 +681,114 @@ pub async fn decline_contact_request(
     let ed25519_hex = hex::encode(keypair.ed25519_public_key().as_bytes());
     let kyber_hex   = hex::encode(keypair.kyber_public_key().as_bytes());
 
-    let (shared_key_hex, peer_endpoint) = {
+    let (shared_key_hex, peer_endpoint, peer_ed25519) = {
         let _cg = CONTACTS_LOCK.lock().unwrap();
         let mut contacts = load_contacts();
         let pos = contacts.iter().position(|c| c.address == contact_addr && c.status == "pending_in")
             .ok_or_else(|| EgoDesktopError::NotFound("No pending request from this address".into()))?;
         let shared_key_hex = contacts[pos].shared_key_hex.clone();
         let peer_endpoint  = contacts[pos].endpoint.clone();
+        let peer_ed25519   = contacts[pos].ed25519_pubkey.clone();
         contacts.remove(pos);
         save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
-        (shared_key_hex, peer_endpoint)
+        (shared_key_hex, peer_endpoint, peer_ed25519)
     };
 
+    let response = p2p::P2PMessage::ContactResponse {
+        from_addr:     my_addr,
+        from_name:     my_name.trim().to_string(),
+        from_ed25519:  ed25519_hex,
+        from_kyber:    kyber_hex,
+        approved:      false,
+        shared_key:    shared_key_hex,
+        from_endpoint: String::new(),
+    };
     if !peer_endpoint.is_empty() {
-        let response = p2p::P2PMessage::ContactResponse {
-            from_addr:     my_addr,
-            from_name:     my_name.trim().to_string(),
-            from_ed25519:  ed25519_hex,
-            from_kyber:    kyber_hex,
-            approved:      false,
-            shared_key:    shared_key_hex,
-            from_endpoint: String::new(),
-        };
         if let Err(e) = p2p::send_message(&peer_endpoint, &response).await {
             eprintln!("[P2P] Could not send decline notice: {}", e);
         }
     }
+    // Gossip it as well, so the requester stops waiting even when there is no
+    // dialable endpoint back to them.
+    p2p::gossip_sealed_dm(&contact_addr, &peer_ed25519, &response).await;
 
     Ok(())
+}
+
+/// Re-send outgoing contact requests that are still unanswered.
+///
+/// A first attempt can vanish without any error surfacing: the recipient may
+/// have been offline, the relay may have dropped the circuit dial at capacity,
+/// the DHT record may never have landed on a peer they later query, or the
+/// request may have been delivered and then discarded on arrival. Without a
+/// retry the contact sits at "Waiting for approval" forever and the only way
+/// out is re-importing the card.
+pub async fn resend_pending_contact_requests() {
+    const RETRY_INTERVAL_SECS: i64 = 120;
+    const GIVE_UP_AFTER_SECS:  i64 = 7 * 24 * 3600;
+
+    let now = chrono::Utc::now().timestamp();
+    let pending: Vec<Contact> = load_contacts()
+        .into_iter()
+        .filter(|c| c.status == "pending_out")
+        .filter(|c| now - c.added_at < GIVE_UP_AFTER_SECS)
+        .filter(|c| now - c.last_request_at.max(c.added_at) >= RETRY_INTERVAL_SECS)
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+
+    let Some(keypair) = crate::app::global_app_state().get_keypair() else { return };
+    let my_addr = Ledger::load().address;
+    if my_addr.is_empty() {
+        return;
+    }
+
+    let registry  = crate::ledger::load_registry();
+    let active_id = crate::ledger::get_active_wallet_id();
+    let my_name = registry.wallets.iter()
+        .find(|w| w.id == active_id)
+        .map(|w| w.name.clone())
+        .unwrap_or_else(|| "Ego User".to_string());
+
+    let my_ed25519_hex = hex::encode(keypair.ed25519_public_key().as_bytes());
+    let my_kyber_hex   = hex::encode(keypair.kyber_public_key().as_bytes());
+    let my_endpoint    = p2p::get_public_endpoint().await;
+
+    for contact in pending {
+        let request = p2p::P2PMessage::ContactRequest {
+            from_addr:       my_addr.clone(),
+            from_name:       my_name.clone(),
+            from_ed25519:    my_ed25519_hex.clone(),
+            from_kyber:      my_kyber_hex.clone(),
+            from_shared_key: contact.shared_key_hex.clone(),
+            from_endpoint:   my_endpoint.clone(),
+            bundle_token:    contact.bundle_token.clone(),
+        };
+
+        if contact.endpoint.is_empty() {
+            deposit_in_relay_inbox(&my_addr, &contact.address, &request).await;
+        } else {
+            let ep = resolve_endpoint(&contact.address, &contact.endpoint).await;
+            if let Err(e) = p2p::send_message(&ep, &request).await {
+                eprintln!("[Messenger] Retry of contact request to {} failed: {}", contact.address, e);
+                deposit_in_relay_inbox(&my_addr, &contact.address, &request).await;
+            }
+        }
+        p2p::gossip_sealed_dm(&contact.address, &contact.ed25519_pubkey, &request).await;
+        eprintln!("[Messenger] Re-sent contact request to {}", contact.address);
+
+        {
+            let _cg = CONTACTS_LOCK.lock().unwrap();
+            let mut all = load_contacts();
+            if let Some(c) = all.iter_mut()
+                .find(|c| c.address == contact.address && c.status == "pending_out")
+            {
+                c.last_request_at = now;
+                let _ = save_contacts(&all);
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -736,6 +841,7 @@ pub async fn send_message(
 
     let stored_endpoint = contacts[contact_pos].endpoint.clone();
     let all_endpoints   = contacts[contact_pos].all_endpoints.clone();
+    let contact_ed25519 = contacts[contact_pos].ed25519_pubkey.clone();
 
     save_contacts(&contacts).map_err(EgoDesktopError::FileSystemError)?;
     drop(_cg);
@@ -820,17 +926,19 @@ pub async fn send_message(
 
         let p2p_msg = p2p::P2PMessage::ChatMessage { bundle, seq: send_seq };
         if stored_endpoint.is_empty() {
-            eprintln!("[Messenger] No endpoint for {} — queued in outbox + DHT inbox", contact_addr_key);
+            eprintln!("[Messenger] No endpoint for {} — queued in outbox + DHT inbox + gossip", contact_addr_key);
             crate::commands::outbox::enqueue(&contact_addr_key, "", &p2p_msg);
             deposit_in_relay_inbox(&my_addr, &contact_addr_key, &p2p_msg).await;
+            p2p::gossip_sealed_dm(&contact_addr_key, &contact_ed25519, &p2p_msg).await;
             return;
         }
         let endpoint = resolve_endpoint(&contact_addr_key, &stored_endpoint).await;
         if let Err(e) = p2p::send_message(&endpoint, &p2p_msg).await {
-            eprintln!("[Messenger] direct delivery to {} failed: {} — queuing outbox + DHT inbox", contact_addr_key, e);
+            eprintln!("[Messenger] direct delivery to {} failed: {} — queuing outbox + DHT inbox + gossip", contact_addr_key, e);
             crate::commands::outbox::enqueue(&contact_addr_key, &endpoint, &p2p_msg);
 
             deposit_in_relay_inbox(&my_addr, &contact_addr_key, &p2p_msg).await;
+            p2p::gossip_sealed_dm(&contact_addr_key, &contact_ed25519, &p2p_msg).await;
         }
 
         if is_file_bundle {
