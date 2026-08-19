@@ -2474,6 +2474,19 @@ pub enum P2PMessage {
         #[serde(default)]
         from_endpoint: String,
     },
+    /// Any messenger message, encrypted to one recipient and broadcast on the
+    /// gossip mesh. Direct dials and DHT records both fail whenever every peer
+    /// sits behind NAT on relay circuits; the gossip mesh is the only transport
+    /// that keeps working there, so it carries a sealed envelope as a fallback.
+    /// Only `to` is in the clear — enough to drop other people's envelopes
+    /// without doing any crypto, and nothing else about the pair leaks.
+    SealedDm {
+        to:      String,
+        eph_pub: String,
+        nonce:   String,
+        ct:      String,
+        id:      String,
+    },
     PeerAnnounce {
         address:  String,
         name:     String,
@@ -5271,6 +5284,9 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     let poc_topic = gossipsub::IdentTopic::new("ego-poc-v1");
     swarm.behaviour_mut().gossipsub.subscribe(&poc_topic).ok();
 
+    let dm_topic = gossipsub::IdentTopic::new(DM_TOPIC);
+    swarm.behaviour_mut().gossipsub.subscribe(&dm_topic).ok();
+
     let _ = swarm.behaviour_mut().kad.bootstrap();
 
 
@@ -6527,6 +6543,31 @@ async fn handle_event(
                     let app2 = app.cloned();
                     tokio::spawn(async move { handle_incoming(msg, app2.as_ref()).await; });
                 }
+            } else if topic == DM_TOPIC {
+                // Sealed messenger envelope. Every node forwards these; only the
+                // addressee holds the key that opens one, so everyone else drops
+                // it after a string compare — no crypto on other people's mail.
+                if let Ok(P2PMessage::SealedDm { to, eph_pub, nonce, ct, id }) =
+                    serde_json::from_slice::<P2PMessage>(&message.data)
+                {
+                    let app2 = app.cloned();
+                    tokio::spawn(async move {
+                        let my_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
+                            .await.unwrap_or_default();
+                        if my_addr.is_empty() || to != my_addr {
+                            return;
+                        }
+                        if dm_already_seen(&id) {
+                            return;
+                        }
+                        let Some(inner) = open_dm(&eph_pub, &nonce, &ct) else {
+                            eprintln!("[DM] Sealed envelope addressed to us could not be opened");
+                            return;
+                        };
+                        eprintln!("[DM] Sealed envelope opened from gossip — delivering");
+                        handle_incoming(inner, app2.as_ref()).await;
+                    });
+                }
             } else if topic == "ego-txs-v1" {
 
                 match serde_json::from_slice::<P2PMessage>(&message.data) {
@@ -7340,6 +7381,11 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
             shadow_on_view_change(msg).await;
         }
 
+        // Unsealed in the gossip arm of handle_event, which then dispatches the
+        // inner message here. Keeping the unseal out of this function is what
+        // stops handle_incoming from having to call itself.
+        P2PMessage::SealedDm { .. } => {}
+
         P2PMessage::ContactRequest {
             from_addr, from_name, from_ed25519, from_kyber, from_shared_key, from_endpoint, bundle_token,
         } => {
@@ -7349,9 +7395,20 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
             if !my_token.is_empty() {
                 match &bundle_token {
                     Some(t) if t == &my_token => {}
-                    _ => return, // old / missing token — bundle has been revoked
+                    // old / missing token — the card it came from was revoked.
+                    // Logged because it is otherwise indistinguishable from the
+                    // request never arriving at all.
+                    _ => {
+                        eprintln!(
+                            "[Messenger] Dropped contact request from {} — card token {} does not match the current one",
+                            from_addr,
+                            bundle_token.as_deref().unwrap_or("<absent>"),
+                        );
+                        return;
+                    }
                 }
             }
+            eprintln!("[Messenger] Contact request accepted from {} ({})", from_name, from_addr);
             let _cg = crate::commands::messenger::CONTACTS_LOCK.lock().unwrap();
             let mut contacts = load_contacts();
             if let Some(existing) = contacts.iter_mut().find(|c| c.address == from_addr) {
@@ -7375,6 +7432,8 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                 ratchet_recv_chain: String::new(),
                 ratchet_send_count: 0,
                 ratchet_recv_count: 0,
+                bundle_token:       None,
+                last_request_at:    0,
             };
             contacts.push(contact.clone());
             let _ = save_contacts(&contacts);
@@ -12228,6 +12287,223 @@ pub async fn dht_inbox_poll(my_addr: &str) {
     }
     if queried > 0 {
         eprintln!("[DHT-Inbox] Polling {} inbox slot(s) in DHT", queried);
+    }
+}
+
+// ── Sealed gossip DM ─────────────────────────────────────────────────────────
+// Fallback transport for messenger traffic. Direct request-response needs a
+// dialable circuit and the DHT needs the record to land on a peer the recipient
+// later queries; both are unreliable when every node is NAT'd behind one relay.
+// Gossip reaches the whole mesh regardless, so a message sealed to the
+// recipient's identity key rides it without exposing anything to the relay or
+// to the other nodes forwarding it.
+
+pub const DM_TOPIC: &str = "ego-dm-v1";
+
+static DM_SEEN: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+const DM_SEEN_TTL_SECS: i64 = 3600;
+
+fn dm_already_seen(id: &str) -> bool {
+    let now = Utc::now().timestamp();
+    let mut map = DM_SEEN.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    map.retain(|_, ts| now - *ts < DM_SEEN_TTL_SECS);
+    if map.contains_key(id) {
+        return true;
+    }
+    map.insert(id.to_string(), now);
+    false
+}
+
+/// Contact records hold ed25519 keys as hex (old bundles, and the requester's
+/// own key) or base64 (v2 bundles). Accept both.
+fn decode_pubkey32(s: &str) -> Option<[u8; 32]> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let raw = hex::decode(trimmed).ok().filter(|b| b.len() == 32).or_else(|| {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(trimmed)
+            .ok()
+            .filter(|b| b.len() == 32)
+    })?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw);
+    Some(out)
+}
+
+fn ed25519_pub_to_x25519(ed: &[u8; 32]) -> Option<x25519_dalek::PublicKey> {
+    let point = curve25519_dalek::edwards::CompressedEdwardsY(*ed).decompress()?;
+    Some(x25519_dalek::PublicKey::from(point.to_montgomery().to_bytes()))
+}
+
+/// x25519 counterpart of this wallet's ed25519 identity key. ed25519 signing
+/// keys expand as `sha512(seed)[..32]`, and x25519-dalek clamps on use, so this
+/// is the same scalar the sender's `ed25519_pub_to_x25519` derives a point for.
+fn my_x25519_secret() -> Option<x25519_dalek::StaticSecret> {
+    let seed = crate::ledger::load_seed().ok().flatten()?;
+    if seed.len() < 32 {
+        return None;
+    }
+    use sha2::{Digest, Sha512};
+    let expanded = Sha512::digest(&seed[..32]);
+    let mut sk = [0u8; 32];
+    sk.copy_from_slice(&expanded[..32]);
+    Some(x25519_dalek::StaticSecret::from(sk))
+}
+
+fn dm_cipher_key(shared: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("ego dm seal v1", shared)
+}
+
+pub fn seal_dm(to_addr: &str, to_ed25519: &str, inner: &P2PMessage) -> Option<P2PMessage> {
+    use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
+    use rand::RngCore;
+
+    let their_x = ed25519_pub_to_x25519(&decode_pubkey32(to_ed25519)?)?;
+
+    let mut eph_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut eph_bytes);
+    let eph_secret = x25519_dalek::StaticSecret::from(eph_bytes);
+    let eph_public = x25519_dalek::PublicKey::from(&eph_secret);
+    let shared     = eph_secret.diffie_hellman(&their_x);
+
+    let cipher = Aes256Gcm::new_from_slice(&dm_cipher_key(shared.as_bytes())).ok()?;
+    let mut nonce_bytes = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let plaintext = serde_json::to_vec(inner).ok()?;
+    let ct = cipher.encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_ref()).ok()?;
+
+    let ct_hex = hex::encode(&ct);
+    Some(P2PMessage::SealedDm {
+        to:      to_addr.to_string(),
+        eph_pub: hex::encode(eph_public.as_bytes()),
+        nonce:   hex::encode(nonce_bytes),
+        id:      hex::encode(&blake3::hash(ct_hex.as_bytes()).as_bytes()[..16]),
+        ct:      ct_hex,
+    })
+}
+
+fn open_dm(eph_pub: &str, nonce_hex: &str, ct_hex: &str) -> Option<P2PMessage> {
+    open_dm_with(&my_x25519_secret()?, eph_pub, nonce_hex, ct_hex)
+}
+
+fn open_dm_with(
+    secret:    &x25519_dalek::StaticSecret,
+    eph_pub:   &str,
+    nonce_hex: &str,
+    ct_hex:    &str,
+) -> Option<P2PMessage> {
+    use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
+
+    let mut eph = [0u8; 32];
+    let raw = hex::decode(eph_pub).ok()?;
+    if raw.len() != 32 {
+        return None;
+    }
+    eph.copy_from_slice(&raw);
+
+    let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(eph));
+    let cipher = Aes256Gcm::new_from_slice(&dm_cipher_key(shared.as_bytes())).ok()?;
+
+    let nonce_bytes = hex::decode(nonce_hex).ok()?;
+    if nonce_bytes.len() != 12 {
+        return None;
+    }
+    let ct = hex::decode(ct_hex).ok()?;
+    let pt = cipher.decrypt(Nonce::from_slice(&nonce_bytes), ct.as_ref()).ok()?;
+    serde_json::from_slice::<P2PMessage>(&pt).ok()
+}
+
+/// Seal `inner` to `to_addr` and broadcast it on the mesh. Returns false only
+/// when the contact's identity key is unusable, so callers can log it.
+pub async fn gossip_sealed_dm(to_addr: &str, to_ed25519: &str, inner: &P2PMessage) -> bool {
+    let Some(sealed) = seal_dm(to_addr, to_ed25519, inner) else {
+        return false;
+    };
+    let Ok(data) = serde_json::to_vec(&sealed) else {
+        return false;
+    };
+    publish_gossip(DM_TOPIC, data).await;
+    true
+}
+
+#[cfg(test)]
+mod sealed_dm_tests {
+    use super::*;
+
+    fn x25519_secret_from_seed(seed: &[u8; 32]) -> x25519_dalek::StaticSecret {
+        use sha2::{Digest, Sha512};
+        let expanded = Sha512::digest(seed);
+        let mut sk = [0u8; 32];
+        sk.copy_from_slice(&expanded[..32]);
+        x25519_dalek::StaticSecret::from(sk)
+    }
+
+    /// The sender converts the recipient's published ed25519 key to a
+    /// montgomery point; the recipient derives a scalar straight from its seed.
+    /// If those two ever stop describing the same keypair, every sealed
+    /// envelope silently fails to open.
+    #[test]
+    fn ed25519_pub_converts_to_the_recipients_own_x25519_key() {
+        let seed = [7u8; 32];
+        let ed_pub = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+
+        let from_public = ed25519_pub_to_x25519(&ed_pub).expect("decompress");
+        let from_secret = x25519_dalek::PublicKey::from(&x25519_secret_from_seed(&seed));
+
+        assert_eq!(from_public.as_bytes(), from_secret.as_bytes());
+    }
+
+    #[test]
+    fn sealed_envelope_round_trips_to_the_addressee() {
+        let seed = [42u8; 32];
+        let ed_pub = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+
+        let inner = P2PMessage::ChatMessage {
+            bundle: "egomsg1:a:b:1:text:00:ff".to_string(),
+            seq:    3,
+        };
+        let sealed = seal_dm("egot1recipient", &hex::encode(ed_pub), &inner).expect("seal");
+
+        let P2PMessage::SealedDm { to, eph_pub, nonce, ct, id } = sealed else {
+            panic!("seal_dm produced the wrong variant");
+        };
+        assert_eq!(to, "egot1recipient");
+        assert!(!id.is_empty());
+
+        let opened = open_dm_with(&x25519_secret_from_seed(&seed), &eph_pub, &nonce, &ct)
+            .expect("addressee opens its own envelope");
+        match opened {
+            P2PMessage::ChatMessage { bundle, seq } => {
+                assert_eq!(bundle, "egomsg1:a:b:1:text:00:ff");
+                assert_eq!(seq, 3);
+            }
+            other => panic!("unexpected inner message: {:?}", other),
+        }
+
+        // A different wallet must not be able to open it.
+        assert!(open_dm_with(&x25519_secret_from_seed(&[9u8; 32]), &eph_pub, &nonce, &ct).is_none());
+    }
+
+    /// v2 cards carry base64 keys, older ones and locally-built records carry
+    /// hex; both have to seal.
+    #[test]
+    fn identity_keys_decode_from_hex_and_base64() {
+        use base64::Engine as _;
+        let raw = [3u8; 32];
+        let hex_form = hex::encode(raw);
+        let b64_form = base64::engine::general_purpose::STANDARD.encode(raw);
+
+        assert_eq!(decode_pubkey32(&hex_form), Some(raw));
+        assert_eq!(decode_pubkey32(&b64_form), Some(raw));
+        assert_eq!(decode_pubkey32(""), None);
+        assert_eq!(decode_pubkey32("not-a-key"), None);
     }
 }
 
