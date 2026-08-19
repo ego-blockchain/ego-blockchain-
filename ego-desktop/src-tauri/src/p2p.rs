@@ -12177,9 +12177,26 @@ fn inbox_key(recipient_addr: &str, sender_addr: &str) -> String {
     format!("ego-inbox:{}:{}", rh, sh)
 }
 
+/// Well-known per-recipient key with no sender component — the only DHT key
+/// a recipient can query without already knowing who's trying to reach them.
+/// `dht_inbox_poll` blind-polls exactly this key every tick, independent of
+/// its local cache. Used for first-contact handshake messages (ContactRequest
+/// / ContactResponse), where the recipient by definition doesn't yet know the
+/// sender's address to derive the sender-specific `inbox_key`.
+fn doorbell_key(recipient_addr: &str) -> String {
+    format!("ego-inbox:{}", hex::encode(blake3::hash(recipient_addr.as_bytes()).as_bytes()))
+}
+
 pub async fn dht_inbox_deposit(from_addr: &str, to_addr: &str, msg: &P2PMessage) {
     let Ok(value) = serde_json::to_vec(msg) else { return };
-    let key = inbox_key(to_addr, from_addr);
+    // ContactRequest/ContactResponse are first-contact messages: the recipient
+    // can't have `inbox_key(to, from)` in their local cache to discover it
+    // (they don't know `from` yet), so those go to the sender-agnostic
+    // doorbell key that gets blind-polled unconditionally instead.
+    let key = match msg {
+        P2PMessage::ContactRequest { .. } | P2PMessage::ContactResponse { .. } => doorbell_key(to_addr),
+        _ => inbox_key(to_addr, from_addr),
+    };
     save_dht_record_to_cache(&key, &value);
     if let Some(tx) = DHT_CMD_TX.get() {
         let _ = tx.send(DhtCommand::PutPeer { key, value });
@@ -12200,9 +12217,7 @@ pub async fn dht_inbox_poll(my_addr: &str) {
 
     let Some(tx) = DHT_CMD_TX.get() else { return };
 
-    let _ = tx.send(DhtCommand::GetPeers {
-        key: format!("ego-inbox:{}", hex::encode(blake3::hash(my_addr.as_bytes()).as_bytes())),
-    });
+    let _ = tx.send(DhtCommand::GetPeers { key: doorbell_key(my_addr) });
 
     let mut queried = 0;
     for key in map.keys() {
