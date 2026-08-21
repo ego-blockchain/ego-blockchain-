@@ -880,6 +880,13 @@ const CoveragePage: React.FC = () => {
                   <div className="text-3xl mb-2">📍</div>
                   <div className="text-sm font-mono text-gray-300">{coordStr}</div>
                   <div className="text-xs text-gray-400 mt-1">{cityStr}</div>
+                  {/* Precise coords are local; PeerAnnounce broadcasts them
+                      rounded to 2dp (~1km) with city/country. Saying "only you
+                      can see this" would be untrue. */}
+                  <div className="text-[11px] text-gray-500 mt-2 leading-snug max-w-[15rem] mx-auto">
+                    🔒 This exact position stays on your device. Peers only receive
+                    your city and a position rounded to about 1 km.
+                  </div>
                 </div>
               ) : (
                 <div className="text-center text-gray-500">

@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { Outlet, NavLink, useNavigate } from 'react-router-dom';
 import { invoke } from '@tauri-apps/api/tauri';
 import { listen } from '@tauri-apps/api/event';
+import { open as openUrl } from '@tauri-apps/api/shell';
 import { useWallet, useTheme } from '../App';
 import TitleBar from './TitleBar';
 
@@ -330,6 +331,64 @@ const WalletSwitcher: React.FC = () => {
   );
 };
 
+interface UpdateInfo {
+  update_available: boolean;
+  current: string;
+  latest: string;
+  download_url: string;
+  notes: string;
+}
+
+/// Tells the user a newer build is published and sends them to the download
+/// page. Deliberately advisory: the check fails silently, and dismissing is
+/// remembered per version so nobody is nagged about one they've declined —
+/// while a later release still gets a fresh banner.
+const UpdateBanner: React.FC = () => {
+  const [info, setInfo] = useState<UpdateInfo | null>(null);
+
+  useEffect(() => {
+    invoke<UpdateInfo>('check_for_update')
+      .then(res => {
+        if (!res.update_available) return;
+        if (localStorage.getItem('ego-update-dismissed') === res.latest) return;
+        setInfo(res);
+      })
+      .catch(() => {});
+  }, []);
+
+  if (!info) return null;
+
+  return (
+    <div className="bg-blue-600/15 border-b border-blue-500/30 px-5 py-3 flex items-center gap-3">
+      <span className="text-lg shrink-0">⬆️</span>
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-semibold text-blue-200">
+          Ego Desktop v{info.latest} is available
+        </div>
+        <div className="text-xs text-gray-400 truncate">
+          {info.notes || `You're running v${info.current}.`}
+        </div>
+      </div>
+      <button
+        onClick={() => { openUrl(info.download_url).catch(() => {}); }}
+        className="shrink-0 bg-blue-600 hover:bg-blue-500 px-4 py-1.5 rounded-xl text-xs font-semibold transition-colors"
+      >
+        Download
+      </button>
+      <button
+        onClick={() => {
+          localStorage.setItem('ego-update-dismissed', info.latest);
+          setInfo(null);
+        }}
+        title="Remind me at the next version"
+        className="shrink-0 text-gray-400 hover:text-white text-lg leading-none px-1"
+      >
+        ✕
+      </button>
+    </div>
+  );
+};
+
 const Layout: React.FC = () => {
   const { theme, toggleTheme } = useTheme();
   const navigate = useNavigate();
@@ -364,7 +423,7 @@ const Layout: React.FC = () => {
             <img src="/ego_logo.png" alt="Ego" className="w-9 h-9 rounded-full object-cover" />
             <div>
               <div className="font-bold text-sm leading-tight">Ego Wallet</div>
-              <div className="text-xs text-gray-400">v0.3.32</div>
+              <div className="text-xs text-gray-400">v0.3.33</div>
             </div>
           </div>
         </div>
@@ -425,6 +484,7 @@ const Layout: React.FC = () => {
 
       {}
       <main className="flex-1 overflow-auto min-w-0">
+        <UpdateBanner />
         <Outlet />
       </main>
       </div>

@@ -121,12 +121,8 @@ pub async fn import_shared_file(
         let _ = ledger.save();
     }
 
-    let from_short = if bundle.from_address.len() > 12 {
-        format!("{}…", &bundle.from_address[..12])
-    } else {
-        bundle.from_address.clone()
-    };
-    notify(&app, "File Received!", &format!("\"{}\" shared by {}", bundle.display_name, from_short));
+    let sender = crate::commands::messenger::contact_display_name(&bundle.from_address);
+    notify(&app, &format!("{} shared a file", sender), &format!("\"{}\"", bundle.display_name));
 
     let _ = app.emit_all("ego://file-receiving", serde_json::json!({ "cid": bundle.cid }));
 
@@ -163,13 +159,8 @@ pub async fn try_auto_import(app: Option<&AppHandle<tauri::Wry>>, content: &str,
             "from_address":  from_addr,
         }));
 
-        let from_short = if from_addr.len() > 12 {
-            format!("{}…", &from_addr[..12])
-        } else {
-            from_addr.to_string()
-        };
-
+        let sender = crate::commands::messenger::contact_display_name(from_addr);
         let security = if prefix == "egoshare2" { " (encrypted for you)" } else { "" };
-        notify(h, "File Received!", &format!("\"{}\" from {}{}", display_name, from_short, security));
+        notify(h, &format!("{} sent you a file", sender), &format!("\"{}\"{}", display_name, security));
     }
 }

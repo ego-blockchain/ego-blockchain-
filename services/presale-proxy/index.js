@@ -65,6 +65,152 @@ function stripeRequest(method, path, data) {
   });
 }
 
+// ── Fiat on/off-ramp ────────────────────────────────────────────────────────
+// The desktop app never learns which provider is in use: it posts the asset,
+// destination address and amount, and gets back a URL to open. Switching
+// provider, or adding a second one, is a change here plus a restart — no app
+// release, no new binary for users to install.
+//
+// URL shapes below follow each provider's hosted-widget docs. VERIFY against
+// current docs when you activate an account — query parameter names do change,
+// and a wrong one silently drops the value rather than erroring.
+const RAMP_PROVIDER = (process.env.RAMP_PROVIDER || 'onramper').toLowerCase();
+const RAMP_API_KEY  = process.env.RAMP_API_KEY  || '';
+// Staging keys are issued on signup; production keys need business
+// verification. RAMP_ENV=staging lets the whole flow be tested with test cards
+// before that clears. Anything other than "staging" means real money.
+const RAMP_STAGING  = (process.env.RAMP_ENV || 'production').toLowerCase() === 'staging';
+// MoonPay only: HMAC secret used to sign widget URLs. Never ships in the app.
+const MOONPAY_SECRET = process.env.MOONPAY_SECRET_KEY || '';
+
+// MoonPay identifies assets by its own codes, and chain-qualifies anything that
+// exists on more than one network. A plain lowercase of the ticker is wrong for
+// those: BNB on BSC is "bnb_bsc", not "bnb" (which is BNB Beacon Chain — a
+// different address format entirely). Verify each against MoonPay's
+// /v3/currencies list before going live.
+const MOONPAY_CODES = {
+  BTC:  'btc',
+  ETH:  'eth',
+  BNB:  'bnb_bsc',
+  SOL:  'sol',
+  ADA:  'ada',
+  XRP:  'xrp',
+  TRX:  'trx',
+  LTC:  'ltc',
+  DOGE: 'doge',
+  // Our USDT/USDC are ERC-20 on Ethereum — MoonPay's bare codes mean exactly
+  // that, with other chains carrying a suffix (usdt_trx, usdc_polygon).
+  USDT: 'usdt',
+  USDC: 'usdc',
+};
+
+function moonpayCurrencyCode(asset, network) {
+  const known = MOONPAY_CODES[String(asset).toUpperCase()];
+  if (known) return known;
+  const net = String(network || '').toLowerCase();
+  return net && net !== 'mainnet'
+    ? `${String(asset).toLowerCase()}_${net}`
+    : String(asset).toLowerCase();
+}
+
+const RAMP_BUILDERS = {
+  onramper({ side, asset, address, amount, fiat }) {
+    const p = new URLSearchParams({
+      apiKey: RAMP_API_KEY,
+      mode: side,
+      defaultCrypto: asset,
+      defaultFiat: fiat,
+    });
+    if (amount) p.set('defaultAmount', String(amount));
+    // Onramper takes wallets as ASSET:address pairs and locks the field so the
+    // user cannot be talked into changing the destination.
+    if (address) {
+      p.set('wallets', `${asset}:${address}`);
+      p.set('walletAddressLocked', 'true');
+    }
+    const host = RAMP_STAGING ? 'buy.onramper.dev' : 'buy.onramper.com';
+    return `https://${host}/?${p.toString()}`;
+  },
+
+  ramp({ side, asset, network, address, amount, fiat }) {
+    // Ramp names assets CHAIN_SYMBOL, e.g. ETH_USDT / BTC_BTC.
+    const chainPrefix = (network || asset).toUpperCase()
+      .replace('ETHEREUM', 'ETH').replace('MAINNET', 'BTC')
+      .replace('SOLANA', 'SOL').replace('BSC', 'BSC');
+    const swapAsset = asset === chainPrefix ? `${chainPrefix}_${asset}` : `${chainPrefix}_${asset}`;
+    const p = new URLSearchParams({
+      hostApiKey: RAMP_API_KEY,
+      hostAppName: 'Ego Desktop',
+      swapAsset,
+      fiatCurrency: fiat,
+      enabledFlows: side === 'sell' ? 'OFFRAMP' : 'ONRAMP',
+      defaultFlow: side === 'sell' ? 'OFFRAMP' : 'ONRAMP',
+    });
+    if (amount) p.set('fiatValue', String(amount));
+    if (address) p.set('userAddress', address);
+    const host = RAMP_STAGING ? 'app.demo.ramp.network' : 'buy.ramp.network';
+    return `https://${host}/?${p.toString()}`;
+  },
+
+  moonpay({ side, asset, network, address, amount, fiat }) {
+    const base = side === 'sell'
+      ? (RAMP_STAGING ? 'sell-sandbox.moonpay.com' : 'sell.moonpay.com')
+      : (RAMP_STAGING ? 'buy-sandbox.moonpay.com'  : 'buy.moonpay.com');
+
+    const code = moonpayCurrencyCode(asset, network);
+    let p;
+
+    if (side === 'sell') {
+      // Sell inverts the meaning of the parameters: baseCurrency is the CRYPTO
+      // being sold and the amount is denominated in crypto, not fiat. Our UI
+      // collects a USD figure, so no amount is sent — the user enters the
+      // quantity in MoonPay. Passing the USD number here would read as
+      // "sell 100 BTC" instead of "sell $100 of BTC".
+      p = new URLSearchParams({
+        apiKey: RAMP_API_KEY,
+        baseCurrencyCode:  code,
+        quoteCurrencyCode: fiat.toLowerCase(),
+      });
+      if (address) p.set('refundWalletAddress', address);
+    } else {
+      p = new URLSearchParams({
+        apiKey: RAMP_API_KEY,
+        currencyCode:     code,
+        baseCurrencyCode: fiat.toLowerCase(),
+      });
+      if (amount) p.set('baseCurrencyAmount', String(amount));
+      if (address) p.set('walletAddress', address);
+    }
+
+    const query = `?${p.toString()}`;
+    // MoonPay rejects unsigned URLs in production. The signing secret is the
+    // reason this belongs on a server — it must never reach the desktop app.
+    if (MOONPAY_SECRET) {
+      const sig = require('crypto')
+        .createHmac('sha256', MOONPAY_SECRET)
+        .update(query)
+        .digest('base64');
+      return `https://${base}${query}&signature=${encodeURIComponent(sig)}`;
+    }
+    return `https://${base}${query}`;
+  },
+
+  transak({ side, asset, network, address, amount, fiat }) {
+    const p = new URLSearchParams({
+      apiKey: RAMP_API_KEY,
+      productsAvailed: side === 'sell' ? 'SELL' : 'BUY',
+      cryptoCurrencyCode: asset,
+      fiatCurrency: fiat,
+      disableWalletAddressForm: 'true',
+    });
+    if (network) p.set('network', network);
+    if (amount) p.set('fiatAmount', String(amount));
+    if (address) p.set('walletAddress', address);
+    const host = RAMP_STAGING ? 'global-stg.transak.com' : 'global.transak.com';
+    return `https://${host}/?${p.toString()}`;
+  },
+};
+
 // ── ChangeNow helper ────────────────────────────────────────────────────────
 function changenowRequest(method, path, data) {
   return new Promise((resolve, reject) => {
@@ -180,6 +326,48 @@ const server = http.createServer(async (req, res) => {
         status:       session.payment_status,
         amount_total: session.amount_total,
         egoc_amount,
+      }));
+      return;
+    }
+
+    // POST /ramp/session — returns a hosted-widget URL to open in the browser
+    if (req.method === 'POST' && url === '/ramp/session') {
+      const body    = await parseBody(req);
+      const side    = body.side === 'sell' ? 'sell' : 'buy';
+      const asset   = String(body.asset || '').toUpperCase();
+      const network = String(body.network || '');
+      const address = String(body.address || '');
+      const fiat    = String(body.fiat || 'USD').toUpperCase();
+      const amount  = body.amount == null ? null : Number(body.amount);
+
+      if (!RAMP_API_KEY) {
+        res.writeHead(503);
+        res.end(JSON.stringify({ error: 'Buy/Sell is not configured yet — no ramp provider account is connected.' }));
+        return;
+      }
+      if (!asset || !/^[A-Z0-9]{2,10}$/.test(asset)) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid asset' })); return;
+      }
+      // Buying needs somewhere to deliver to. Selling doesn't — the provider
+      // gives the user a deposit address instead.
+      if (side === 'buy' && !address) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Missing destination address' })); return;
+      }
+      if (amount != null && (!Number.isFinite(amount) || amount <= 0)) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid amount' })); return;
+      }
+
+      const build = RAMP_BUILDERS[RAMP_PROVIDER];
+      if (!build) {
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: `Unknown RAMP_PROVIDER "${RAMP_PROVIDER}"` }));
+        return;
+      }
+
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        url:      build({ side, asset, network, address, amount, fiat }),
+        provider: RAMP_PROVIDER,
       }));
       return;
     }

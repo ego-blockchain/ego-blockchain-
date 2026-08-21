@@ -52,6 +52,11 @@ pub struct Contact {
 
     #[serde(default)]
     pub last_request_at: i64,
+
+    /// Contact's profile picture as a data URI, pushed to us by them. Empty
+    /// falls back to their initial.
+    #[serde(default)]
+    pub avatar: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -364,15 +369,16 @@ pub(crate) fn receive_message_inner(bundle: &str, seq: u64) -> Result<(Message, 
 #[tauri::command]
 pub async fn get_my_contact_bundle(
     state: State<'_, AppState>,
-    my_name: String,
+    my_name: Option<String>,
 ) -> Result<String, EgoDesktopError> {
     let keypair = state.get_keypair()
         .ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
 
+    let my_name     = resolve_my_name(my_name);
     let ledger      = Ledger::load();
     let my_addr     = ledger.address.clone();
     let ed25519_b64 = STANDARD.encode(keypair.ed25519_public_key().as_bytes());
-    let name_b64    = STANDARD.encode(my_name.trim().as_bytes());
+    let name_b64    = STANDARD.encode(my_name.as_bytes());
 
     // Prefer a relay circuit (works across NAT); fall back to whatever the swarm
     // has (public IP or LAN IP). Both are valid endpoints — LAN works fine for
@@ -438,8 +444,9 @@ pub async fn import_contact(
     _app: AppHandle,
     state: State<'_, AppState>,
     bundle: String,
-    my_name: String,
+    my_name: Option<String>,
 ) -> Result<Contact, EgoDesktopError> {
+    let my_name = resolve_my_name(my_name);
     let (addr, ed25519, kyber, name, _bundle_key, endpoint_opt) =
         parse_contact_bundle(&bundle).ok_or_else(|| {
             EgoDesktopError::InvalidInput(
@@ -532,6 +539,7 @@ pub async fn import_contact(
             ratchet_send_count: 0,
             ratchet_recv_count: 0,
             bundle_token:       bundle_token.clone(),
+            avatar:             String::new(),
             last_request_at:    chrono::Utc::now().timestamp(),
         };
         contacts.push(contact.clone());
@@ -568,8 +576,9 @@ pub async fn import_contact(
 pub async fn approve_contact_request(
     state: State<'_, AppState>,
     contact_addr: String,
-    my_name: String,
+    my_name: Option<String>,
 ) -> Result<Contact, EgoDesktopError> {
+    let my_name = resolve_my_name(my_name);
     let keypair = state.get_keypair()
         .ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
 
@@ -664,6 +673,13 @@ pub async fn approve_contact_request(
         eprintln!("[Messenger] No usable identity key for {} — approval gossip skipped", contact_addr);
     }
 
+    // Now that they're approved, send our picture so they see it immediately
+    // rather than an initial until we next change it.
+    let avatar = Ledger::load().avatar;
+    if !avatar.is_empty() {
+        tokio::spawn(async move { broadcast_profile(avatar).await; });
+    }
+
     Ok(contact)
 }
 
@@ -671,8 +687,9 @@ pub async fn approve_contact_request(
 pub async fn decline_contact_request(
     state: State<'_, AppState>,
     contact_addr: String,
-    my_name: String,
+    my_name: Option<String>,
 ) -> Result<(), EgoDesktopError> {
+    let my_name = resolve_my_name(my_name);
     let keypair = state.get_keypair()
         .ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
 
@@ -1105,6 +1122,154 @@ pub async fn delete_contact(
     Ok(())
 }
 
+/// This wallet's own messenger display name.
+///
+/// Resolved from the ledger first, then the registry wallet name (set when the
+/// wallet was created), then a plain default. There is always an answer, which
+/// is why nothing needs to prompt for it — adding a contact, generating a card
+/// and approving a request all just call this.
+pub fn my_display_name() -> String {
+    let stored = Ledger::load().display_name.trim().to_string();
+    if !stored.is_empty() {
+        return stored;
+    }
+    let registry  = crate::ledger::load_registry();
+    let active_id = crate::ledger::get_active_wallet_id();
+    registry.wallets.iter()
+        .find(|w| w.id == active_id)
+        .map(|w| w.name.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "Ego User".to_string())
+}
+
+/// Callers may still pass a name explicitly; an absent or blank one resolves to
+/// the stored display name rather than being prompted for.
+fn resolve_my_name(passed: Option<String>) -> String {
+    passed
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(my_display_name)
+}
+
+#[tauri::command]
+pub async fn get_display_name() -> Result<String, EgoDesktopError> {
+    Ok(my_display_name())
+}
+
+/// Ceiling on a stored avatar. The UI downscales to 128×128 before sending, so
+/// anything past this is a UI bug — and every byte here is re-sent to every
+/// contact each time the picture changes.
+const MAX_AVATAR_BYTES: usize = 96 * 1024;
+
+#[tauri::command]
+pub async fn get_my_avatar() -> Result<String, EgoDesktopError> {
+    Ok(Ledger::load().avatar)
+}
+
+#[tauri::command]
+pub async fn set_my_avatar(data_url: String) -> Result<String, EgoDesktopError> {
+    let data_url = data_url.trim().to_string();
+    if !data_url.is_empty() {
+        if !data_url.starts_with("data:image/") || !data_url.contains(";base64,") {
+            return Err(EgoDesktopError::InvalidInput(
+                "Profile picture must be a base64 image".into(),
+            ));
+        }
+        if data_url.len() > MAX_AVATAR_BYTES {
+            return Err(EgoDesktopError::InvalidInput(
+                "Profile picture is too large — pick a smaller image".into(),
+            ));
+        }
+    }
+
+    let mut ledger = Ledger::load();
+    ledger.avatar = data_url.clone();
+    ledger.save().map_err(EgoDesktopError::FileSystemError)?;
+
+    // Contacts only learn about the change if we tell them.
+    let avatar = data_url.clone();
+    tokio::spawn(async move { broadcast_profile(avatar).await; });
+
+    Ok(data_url)
+}
+
+/// Push our current picture to every approved contact. Direct first, with the
+/// sealed gossip fallback behind it — same delivery path as a chat message.
+pub async fn broadcast_profile(avatar: String) {
+    let my_addr = Ledger::load().address;
+    if my_addr.is_empty() {
+        return;
+    }
+    let contacts: Vec<Contact> = load_contacts()
+        .into_iter()
+        .filter(|c| c.status == "approved")
+        .collect();
+
+    for contact in contacts {
+        let msg = p2p::P2PMessage::ProfileUpdate {
+            from_addr: my_addr.clone(),
+            avatar:    avatar.clone(),
+        };
+        let mut delivered = false;
+        if !contact.endpoint.is_empty() {
+            let ep = resolve_endpoint(&contact.address, &contact.endpoint).await;
+            delivered = p2p::send_message(&ep, &msg).await.is_ok();
+        }
+        if !delivered {
+            p2p::gossip_sealed_dm(&contact.address, &contact.ed25519_pubkey, &msg).await;
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn set_display_name(name: String) -> Result<String, EgoDesktopError> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(EgoDesktopError::InvalidInput("Name cannot be empty".into()));
+    }
+    if name.chars().count() > 32 {
+        return Err(EgoDesktopError::InvalidInput("Name is too long (max 32 characters)".into()));
+    }
+    let mut ledger = Ledger::load();
+    ledger.display_name = name.clone();
+    ledger.save().map_err(EgoDesktopError::FileSystemError)?;
+    Ok(name)
+}
+
+/// The name to show for a peer address — in notifications, and anywhere else
+/// the user should see a person rather than an address.
+///
+/// Read live from contacts.json on every call and never cached, so a rename
+/// shows up on the very next notification without anything to invalidate.
+/// Falls back to a shortened address for someone who isn't a contact yet.
+pub fn contact_display_name(addr: &str) -> String {
+    load_contacts()
+        .iter()
+        .find(|c| c.address == addr)
+        .map(|c| c.name.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| short_address(addr))
+}
+
+pub fn short_address(addr: &str) -> String {
+    if addr.chars().count() > 14 {
+        let head: String = addr.chars().take(12).collect();
+        format!("{head}…")
+    } else {
+        addr.to_string()
+    }
+}
+
+/// Char-safe truncation. Slicing a message by byte offset panics the moment
+/// someone sends an emoji that straddles the cut.
+pub fn truncate_preview(text: &str, max_chars: usize) -> String {
+    let mut out: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
 #[tauri::command]
 pub async fn rename_contact(
     contact_addr: String,
@@ -1128,4 +1293,33 @@ pub async fn deposit_in_relay_inbox(from_addr: &str, to_addr: &str, msg: &crate:
 
 pub async fn poll_relay_inbox(my_addr: &str, _app: Option<&tauri::AppHandle<tauri::Wry>>) {
     crate::p2p::dht_inbox_poll(my_addr).await;
+}
+
+#[cfg(test)]
+mod display_name_tests {
+    use super::*;
+
+    #[test]
+    fn preview_truncation_survives_multibyte_text() {
+        // Byte-slicing "🙂" at offset 40 panics; this must not.
+        let emoji = "🙂".repeat(60);
+        let out = truncate_preview(&emoji, 40);
+        assert_eq!(out.chars().count(), 41, "40 chars plus the ellipsis");
+        assert!(out.ends_with('…'));
+
+        assert_eq!(truncate_preview("hey", 40), "hey");
+        assert_eq!(truncate_preview("", 40), "");
+
+        let exact: String = "a".repeat(40);
+        assert_eq!(truncate_preview(&exact, 40), exact, "no ellipsis at the boundary");
+    }
+
+    #[test]
+    fn unknown_addresses_fall_back_to_a_short_label() {
+        assert_eq!(short_address("egot1short"), "egot1short");
+        let long = "egot1yqlden7hzn3fnj9abcdefghijklmnop";
+        let out = short_address(long);
+        assert_eq!(out, "egot1yqlden7…");
+        assert!(out.chars().count() < long.chars().count());
+    }
 }

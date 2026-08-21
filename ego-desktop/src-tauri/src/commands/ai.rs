@@ -442,6 +442,56 @@ The dApp IDE and `ego-cli` use the `src/main.urego` project layout. The standalo
 - **Interact** — select the contract, pick an entrypoint, enter args, Call.
 - **Read State** — query any storage key for its on-chain value."#
 
+    } else if q.contains("create a dapp") || q.contains("create dapp") || q.contains("build a dapp")
+        || q.contains("build dapp") || q.contains("make a dapp") || q.contains("create an app")
+        || q.contains("build an app") || q.contains("publish my dapp")
+        || ((q.contains("website") || q.contains("web site"))
+            && (q.contains("contract") || q.contains("dapp") || q.contains("launch") || has_word(&q, "app"))) {
+        r#"End to end, from nothing to a live dApp. You need no tools beyond this app for steps 1–3.
+
+### 1. Write the contract
+**dApp IDE** in the sidebar → New Project → **Hello World**. You get `src/main.urego` with a working contract:
+```urego
+contract HelloWorld {
+    pub fn init() {
+        storage.set("visits", 0);
+    }
+    pub fn visit() {
+        let v: u64 = storage.get_u64("visits");
+        storage.set("visits", v + 1);
+    }
+    pub fn get_visits() -> u64 {
+        return storage.get_u64("visits");
+    }
+}
+```
+Anything you want callable from a web page must be `pub fn` — only those become the contract's ABI.
+
+### 2. Compile and deploy
+**Compile** → check the **ABI** tab lists your entrypoints → **Dry Run** (free, no network) → **Deploy**. Note the contract address it gives you; your web page needs it.
+
+### 3. Build the interface
+Add `frontend/index.html` to the same project — a plain web page, no framework required. The **Preview** tab renders it right next to your editor, so you can iterate on the contract and the UI together.
+
+### 4. Connect the page to the chain
+Three options, easiest first:
+- **JSON-RPC** — `POST http://127.0.0.1:47395` with `contract.getState` to read and `tx.submit` to write. Plain `fetch()`, no library.
+- **TypeScript SDK** — `npm install @ego-blockchain/sdk`, then `callContract`, `getContractState`, `subscribeToBlocks` with real types.
+- **Browser extension** — for a public site where *visitors* use their own wallets. The Ego Wallet extension injects `window.ego` (and `window.ethereum` for Ethereum-style code). Your page requests a signature; the user approves it in their wallet. Your site never touches anyone's private key.
+
+```js
+const accounts = await window.ego.request({ method: "ego_getAccounts" });
+```
+
+### 5. Put it online
+- **Ego hosting** — the **Hosting** page uploads your site files and serves them at a `.eo` domain, or a custom domain you own. Decentralized, no server to rent.
+- **Any normal host** — it's ordinary HTML/JS, so Netlify, Vercel, GitHub Pages or your existing site all work. Visitors need the Ego Wallet extension to sign transactions.
+
+### The shortest possible first project
+Hello World template → Compile → Deploy → add a button to `frontend/index.html` that calls `visit()` → publish from the Hosting page. That's a complete dApp.
+
+Ask me for a **contract example**, or about the **dApp IDE**, and I'll go deeper on any step."#
+
     } else if has_any_word(&q, &["dapp", "dapps"]) || q.contains("decentralized app") || q.contains("decentralised app") || q.contains("web3 app") {
         r#"### What a dApp is
 A **dApp** (decentralized application) is an app whose backend is a smart contract on a blockchain instead of a server somebody owns.
@@ -517,7 +567,7 @@ Blocks are produced at 10/second; global BFT finality lands in 1–3 seconds."#
 - Global finality: 1–3s
 - Max throughput: ≥100,000 TPS across 16 shards"#
 
-    } else if q.contains("resource unit") || q.contains("feeless") || q.contains("transaction format") || q.contains("tx format") || has_word(&q, "gas") {
+    } else if q.contains("resource unit") || q.contains("feeless") || q.contains("transaction format") || q.contains("tx format") || has_any_word(&q, &["gas", "fee", "fees"]) {
         r#"Ego replaces per-operation gas with **Resource Units** — you declare a compute budget upfront instead of paying for every opcode at an unpredictable spot price.
 
 ### Transaction shape
@@ -1064,6 +1114,9 @@ mod ai_routing_tests {
         assert!(!has_word("show me the video", "ide"));
         assert!(has_word("what is a dapp", "dapp"));
         assert!(!has_word("what is a dapple", "dapp"));
+        // "fee" inside "price feed" sent the oracle question to the fee answer.
+        assert!(has_word("how do transaction fees work", "fees"));
+        assert!(!has_word("tell me about the oracle price feed", "fee"));
     }
 
     #[tokio::test]
@@ -1094,6 +1147,88 @@ mod ai_routing_tests {
 
         let earn = ask("how do i earn rewards").await;
         assert!(earn.contains("DePIN"), "earning question was stolen by a new branch");
+    }
+
+    /// Every starter chip on the Ego AI empty screen, verbatim from
+    /// AI_STARTERS in MessengerPage.tsx. A chip that lands on the generic
+    /// fallback is a dead button on the first screen a new user sees, so each
+    /// one is pinned to a phrase only its intended answer contains.
+    #[tokio::test]
+    async fn every_starter_question_reaches_a_real_answer() {
+        let starters = [
+            ("What is a dApp?",                                                        "decentralized application"),
+            ("How do I create a dApp?",                                                "End to end"),
+            ("How do I build an app with a smart contract and launch it on my website?", "Put it online"),
+            ("Show me a smart contract example",                                       "contract MyToken"),
+            ("Why should I use Urego?",                                                "Why Urego specifically"),
+            ("How do I deploy a contract?",                                            "Route A"),
+            ("What is Ego?",                                                           "quantum-safe Layer-1"),
+            ("How do I earn EGOC?",                                                    "DePIN"),
+            ("How does staking work?",                                                 "1,000 EGOC"),
+        ];
+        for (question, expected) in starters {
+            let answer = ask(question).await;
+            assert!(
+                answer.contains(expected),
+                "starter {question:?} did not reach its answer (wanted {expected:?}), got: {}",
+                &answer[..answer.len().min(120)]
+            );
+            assert!(!answer.starts_with("I am Ego AI."), "starter {question:?} hit the fallback");
+        }
+    }
+
+    /// Every follow-up chip offered under an answer, verbatim from
+    /// AI_FOLLOW_UPS in MessengerPage.tsx. Same reasoning as the starters:
+    /// a suggestion the router can't answer is a dead button.
+    #[tokio::test]
+    async fn every_follow_up_question_reaches_a_real_answer() {
+        let follow_ups = [
+            "Show me a smart contract example",
+            "How do I build an app with a smart contract and launch it on my website?",
+            "What is the dApp IDE?",
+            "Why should I use Urego?",
+            "How do I deploy a contract?",
+            "How do I host a website?",
+            "What is a dApp?",
+            "How does Proof of Coverage work?",
+            "What is DRS reward scoring?",
+            "How do I run a node?",
+            "How does sharding work?",
+            "What is in a block header?",
+            "What is the security model?",
+            "Explain the tokenomics",
+            "What is EGUSD?",
+            "How do transaction fees work?",
+            "How does Proof of Storage work?",
+            "What is PoRep?",
+            "How does the messenger stay private?",
+            "How do I earn EGOC?",
+            "How do I create a dApp?",
+        ];
+        for question in follow_ups {
+            let answer = ask(question).await;
+            assert!(
+                !answer.starts_with("I am Ego AI."),
+                "follow-up {question:?} fell through to the generic fallback"
+            );
+        }
+    }
+
+    /// "how do I create a dApp" must not land on the answer that only explains
+    /// what one is, and vice versa.
+    #[tokio::test]
+    async fn creating_a_dapp_is_distinct_from_defining_one() {
+        let creating = ask("how do i create a dapp").await;
+        let defining = ask("what is a dapp").await;
+
+        assert!(creating.contains("End to end"), "build walkthrough not reached");
+        assert!(!creating.contains("decentralized application"), "creating hit the definition");
+
+        assert!(defining.contains("decentralized application"), "definition not reached");
+        assert!(!defining.contains("End to end"), "defining hit the build walkthrough");
+
+        // A plain hosting question still belongs to the hosting answer.
+        assert!(ask("how do i host a website").await.contains(".eo"));
     }
 
     #[tokio::test]

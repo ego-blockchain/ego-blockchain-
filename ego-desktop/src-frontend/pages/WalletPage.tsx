@@ -74,6 +74,9 @@ interface TxResult {
 }
 
 interface ExternalAddress {
+  // Ticker of the asset itself. chain/symbol are display-only and mean
+  // different things for coins vs ERC-20s — always look up by asset.
+  asset: string;
   chain: string;
   symbol: string;
   address: string;
@@ -365,6 +368,22 @@ const WalletPage: React.FC = () => {
   const [resumeSessionInput, setResumeSessionInput] = useState('');
   const [stripeError, setStripeError]           = useState('');
   const [showSwap, setShowSwap]       = useState(false);
+
+  // Fiat on/off-ramp. Hidden until the MoonPay account is approved — without a
+  // provider key every click just errors. Flip to true once RAMP_API_KEY and
+  // MOONPAY_SECRET_KEY are set on the payments proxy; the backend command,
+  // proxy endpoint and modal below are all finished and tested.
+  const RAMP_ENABLED = false;
+
+  // The provider is chosen server-side, so nothing here names one — the app
+  // only asks for a URL and opens it.
+  const [showRamp, setShowRamp]       = useState(false);
+  const [rampSide, setRampSide]       = useState<'buy' | 'sell'>('buy');
+  const [rampAsset, setRampAsset]     = useState('BTC');
+  const [rampAmount, setRampAmount]   = useState('100');
+  const [rampBusy, setRampBusy]       = useState(false);
+  const [rampError, setRampError]     = useState('');
+  const [rampAddress, setRampAddress] = useState('');
   const [swapStep, setSwapStep]       = useState<'quote' | 'deposit' | 'done'>('quote');
   const [swapFrom, setSwapFrom]       = useState<SwapAsset>(SWAP_ASSETS[2]); // BTC
   const [swapTo, setSwapTo]           = useState<SwapAsset>(SWAP_ASSETS[3]); // ETH
@@ -630,10 +649,12 @@ const WalletPage: React.FC = () => {
       const addrs = extAddresses.length > 0
         ? extAddresses
         : await invoke<ExternalAddress[]>('get_external_addresses');
-      const ext = addrs.find(a => a.symbol === asset.symbol && !a.contract);
+      const ext = addrs.find(a => a.asset === asset.symbol);
       if (!ext) { setPresalePayBal(0); return; }
+      // Query the chain the asset settles on, with its token contract — for
+      // USDT that's Ethereum + the ERC-20 address, not "USDT" with no contract.
       const res = await invoke<BalanceResult>('fetch_chain_balance', {
-        chainSymbol: asset.symbol, address: ext.address, contract: null,
+        chainSymbol: ext.symbol, address: ext.address, contract: ext.contract ?? null,
       });
       const num = parseFloat(res.raw) || 0;
       setPresalePayBal(num);
@@ -647,6 +668,30 @@ const WalletPage: React.FC = () => {
     const usdPrice = assetUsdPrice(asset, rates);
     if (!usdPrice) return 0;
     return (payAmount * usdPrice) / ACTIVE_TIER.price;
+  }
+
+  const RAMP_ASSETS = ['BTC', 'ETH', 'USDT', 'USDC', 'BNB', 'SOL', 'ADA', 'TRX', 'LTC', 'DOGE'];
+
+  async function startRamp() {
+    setRampBusy(true);
+    setRampError('');
+    setRampAddress('');
+    try {
+      const amt = parseFloat(rampAmount);
+      const sess = await invoke<{ url: string; provider: string; address: string }>('create_ramp_session', {
+        side:   rampSide,
+        symbol: rampAsset,
+        amount: Number.isFinite(amt) && amt > 0 ? amt : null,
+        fiat:   'USD',
+      });
+      setRampAddress(sess.address);
+      const { open } = await import('@tauri-apps/api/shell');
+      await open(sess.url);
+    } catch (e: any) {
+      setRampError(String(e).replace(/^Error: /, ''));
+    } finally {
+      setRampBusy(false);
+    }
   }
 
   async function openSwap() {
@@ -687,11 +732,11 @@ const WalletPage: React.FC = () => {
     const externalAssets = SWAP_ASSETS.filter(a => !a.is_ego);
     const results = await Promise.allSettled(
       externalAssets.map(async asset => {
-        const ext = addrs.find(a => a.symbol === asset.symbol);
+        const ext = addrs.find(a => a.asset === asset.symbol);
         if (!ext) return { symbol: asset.symbol, balance: null };
         try {
           const res = await invoke<BalanceResult>('fetch_chain_balance', {
-            chainSymbol: asset.symbol,
+            chainSymbol: ext.symbol,
             address: ext.address,
             contract: ext.contract ?? null,
           });
@@ -1050,7 +1095,7 @@ const WalletPage: React.FC = () => {
               {isLiveMode ? '🟢 Mainnet' : '🟡 Testnet'}
             </button>
             <div className={`text-xs text-right ${isLiveMode ? 'text-gray-500' : 'text-blue-300'}`}>
-              {isLiveMode ? 'Coming soon' : 'Ego Chain · v0.3.32'}
+              {isLiveMode ? 'Coming soon' : 'Ego Chain · v0.3.33'}
             </div>
           </div>
         </div>
@@ -1062,7 +1107,7 @@ const WalletPage: React.FC = () => {
         )}
         {isLiveMode && <div className="mb-5" />}
 
-        <div className="grid grid-cols-4 gap-2">
+        <div className={`grid gap-2 ${RAMP_ENABLED ? 'grid-cols-5' : 'grid-cols-4'}`}>
           {[
             {
               label: '↑ Send',
@@ -1071,6 +1116,11 @@ const WalletPage: React.FC = () => {
             },
             { label: '↓ Receive', live: false, action: () => setShowReceive(true) },
             { label: '⇄ Swap',   live: true,  action: openSwap },
+            ...(RAMP_ENABLED ? [{
+              label: '$ Buy',
+              live: true,
+              action: () => { setRampError(''); setRampAddress(''); setShowRamp(true); },
+            }] : []),
             {
               label: '$ EGUSD',
               live: false,
@@ -2254,7 +2304,7 @@ const WalletPage: React.FC = () => {
                     }
                     if (useChangenow) {
                       // Find the to-address for the destination asset
-                      const toExt = extAddresses.find(a => a.symbol === swapTo.symbol);
+                      const toExt = extAddresses.find(a => a.asset === swapTo.symbol);
                       if (!toExt) {
                         setCnCreateError(`No ${swapTo.symbol} address found. Visit the multichain section first.`);
                         return;
@@ -2538,6 +2588,84 @@ const WalletPage: React.FC = () => {
       )}
 
       {}
+      {RAMP_ENABLED && showRamp && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={() => setShowRamp(false)}>
+          <div className="bg-gray-800 rounded-2xl w-full max-w-md border border-gray-700" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-700">
+              <h3 className="text-lg font-bold">{rampSide === 'buy' ? '$ Buy Crypto' : '$ Sell Crypto'}</h3>
+              <button onClick={() => setShowRamp(false)} className="text-gray-400 hover:text-white text-xl leading-none">✕</button>
+            </div>
+
+            <div className="p-6 space-y-4">
+              <div className="grid grid-cols-2 gap-2">
+                {(['buy', 'sell'] as const).map(s => (
+                  <button
+                    key={s}
+                    onClick={() => { setRampSide(s); setRampError(''); setRampAddress(''); }}
+                    className={`py-2 rounded-xl text-sm font-semibold transition ${
+                      rampSide === s ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                    }`}
+                  >
+                    {s === 'buy' ? 'Buy' : 'Sell'}
+                  </button>
+                ))}
+              </div>
+
+              <div>
+                <label className="text-xs text-gray-400 mb-1.5 block">Asset</label>
+                <select
+                  value={rampAsset}
+                  onChange={e => { setRampAsset(e.target.value); setRampAddress(''); }}
+                  className="w-full bg-gray-700 border border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-500"
+                >
+                  {RAMP_ASSETS.map(a => <option key={a} value={a}>{a}</option>)}
+                </select>
+              </div>
+
+              {/* Buy is priced in USD; sell is priced in the crypto itself, so
+                  the quantity is entered on the provider's side rather than
+                  risking a USD figure being read as a coin amount. */}
+              {rampSide === 'buy' && (
+                <div>
+                  <label className="text-xs text-gray-400 mb-1.5 block">Amount (USD)</label>
+                  <input
+                    value={rampAmount}
+                    onChange={e => setRampAmount(e.target.value.replace(/[^0-9.]/g, ''))}
+                    inputMode="decimal"
+                    className="w-full bg-gray-700 border border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+              )}
+
+              <p className="text-xs text-gray-500 leading-relaxed">
+                {rampSide === 'buy'
+                  ? <>Payment and identity checks happen on the provider&apos;s own site, which opens in your browser. Your {rampAsset} is delivered straight to this wallet — Ego never sees your card details.</>
+                  : <>The provider gives you a deposit address and pays out to your bank. Selling is available in fewer countries than buying.</>}
+              </p>
+
+              {rampAddress && (
+                <div className="bg-gray-900 rounded-xl px-4 py-3">
+                  <div className="text-xs text-gray-400 mb-1">Delivering to your {rampAsset} address</div>
+                  <div className="text-xs font-mono break-all text-gray-300">{rampAddress}</div>
+                </div>
+              )}
+
+              <button
+                onClick={startRamp}
+                disabled={rampBusy}
+                className="w-full py-2.5 rounded-xl font-semibold text-sm bg-blue-600 hover:bg-blue-500 disabled:opacity-40 transition"
+              >
+                {rampBusy ? 'Opening…' : `Continue to ${rampSide === 'buy' ? 'Buy' : 'Sell'}`}
+              </button>
+
+              {rampError && (
+                <div className="text-sm text-red-400 bg-red-500/10 rounded-xl px-3 py-2">{rampError}</div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {showCredits && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm" onClick={e => { if (e.target === e.currentTarget) setShowCredits(false); }}>
           <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-md border border-gray-700 shadow-2xl">
