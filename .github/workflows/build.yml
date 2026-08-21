@@ -86,8 +86,6 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
-          CHANGENOW_API_KEY: ${{ secrets.CHANGENOW_API_KEY }}
           # Windows Signing Secrets
           # SIGNTOOL_SIGN_COMMAND: 'signtool sign /f cert.pfx /p ${{ secrets.WIN_CERT_PASS }} /t http://timestamp.digicert.com'
         with:
@@ -127,8 +125,6 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
-          CHANGENOW_API_KEY: ${{ secrets.CHANGENOW_API_KEY }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -181,8 +177,6 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
-          CHANGENOW_API_KEY: ${{ secrets.CHANGENOW_API_KEY }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -277,8 +271,6 @@ jobs:
       - name: Build Tauri app
         working-directory: ego-desktop
         env:
-          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
-          CHANGENOW_API_KEY: ${{ secrets.CHANGENOW_API_KEY }}
         run: npx tauri build
 
       - name: Upload Linux artifacts to release

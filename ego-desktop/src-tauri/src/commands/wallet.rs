@@ -1087,41 +1087,9 @@ pub async fn confirm_tx_code(
 
 // ── ChangeNow real swap integration ───────────────────────────────────────────
 
-// Key is injected at compile time via: set CHANGENOW_API_KEY=<key> && cargo build
-// Never hardcode the real key here — this file is open source.
-const CHANGENOW_KEY: &str = match option_env!("CHANGENOW_API_KEY") {
-    Some(k) => k,
-    None    => "",
-};
-const CHANGENOW_BASE: &str = "https://api.changenow.io/v2";
-
-fn changenow_key() -> Result<&'static str, EgoDesktopError> {
-    if CHANGENOW_KEY.is_empty() {
-        return Err(EgoDesktopError::NetworkError(
-            "Swap service not available in this build. Set CHANGENOW_API_KEY at compile time.".into(),
-        ));
-    }
-    Ok(CHANGENOW_KEY)
-}
-
-/// Map a coin symbol to its ChangeNow network string.
-fn cn_network(sym: &str) -> &'static str {
-    match sym {
-        "BTC"  => "btc",
-        "ETH"  => "eth",
-        "BNB"  => "bsc",
-        "SOL"  => "sol",
-        "XRP"  => "xrp",
-        "ADA"  => "ada",
-        "TRX"  => "trx",
-        "DOT"  => "dot",
-        "LINK" => "eth",
-        "SHIB" => "eth",
-        "USDT" => "eth",
-        "USDC" => "eth",
-        _      => "eth",
-    }
-}
+// The ChangeNow key is NOT in this binary. It lives on the payments proxy
+// (services/presale-proxy), which owns the symbol→network mapping too, so
+// adding a coin is a server deploy rather than a new app release.
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CnEstimate {
@@ -1138,52 +1106,34 @@ pub async fn changenow_estimate(
     to_symbol:   String,
     from_amount: f64,
 ) -> Result<CnEstimate, EgoDesktopError> {
-    let cn_key = changenow_key()?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build().unwrap_or_default();
-
-    let from_cur     = from_symbol.to_lowercase();
-    let to_cur       = to_symbol.to_lowercase();
-    let from_network = cn_network(&from_symbol);
-    let to_network   = cn_network(&to_symbol);
-
-    // Fetch min-amount and estimate in parallel
-    let min_url = format!(
-        "{CHANGENOW_BASE}/exchange/min-amount?fromCurrency={from_cur}&toCurrency={to_cur}&fromNetwork={from_network}&toNetwork={to_network}&flow=standard"
-    );
-    let est_url = format!(
-        "{CHANGENOW_BASE}/exchange/estimated-amount?fromCurrency={from_cur}&toCurrency={to_cur}&fromAmount={from_amount}&fromNetwork={from_network}&toNetwork={to_network}&flow=standard&type=direct"
+    let url = format!(
+        "{}/swap/estimate?from={}&to={}&amount={}",
+        payments_proxy_base(),
+        url_escape(&from_symbol.to_lowercase()),
+        url_escape(&to_symbol.to_lowercase()),
+        from_amount,
     );
 
-    let (min_result, est_result) = tokio::join!(
-        async {
-            let r = client.get(&min_url).header("x-changenow-api-key", cn_key).send().await.ok()?;
-            let v: serde_json::Value = r.json().await.ok()?;
-            v["minAmount"].as_f64()
-        },
-        client.get(&est_url).header("x-changenow-api-key", cn_key).send(),
-    );
-
-    let min_amount = min_result.unwrap_or(0.0);
-
-    let est: serde_json::Value = est_result
+    let est: serde_json::Value = proxy_client()
+        .get(&url)
+        .send().await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?
         .json().await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
 
-    if let Some(err) = est["error"].as_str() {
-        return Err(EgoDesktopError::NetworkError(
-            est["message"].as_str().unwrap_or(err).to_string()
-        ));
+    if let Some(err) = proxy_error(&est) {
+        return Err(err);
     }
 
-    let to_amount       = est["toAmount"].as_f64()
-        .ok_or_else(|| EgoDesktopError::NetworkError("Invalid response from ChangeNow".into()))?;
-    let network_fee     = est["networkFee"].as_f64().unwrap_or(0.0);
-    let network_fee_usd = est["networkFeeUSD"].as_f64().unwrap_or(0.0);
+    let to_amount = est["to_amount"].as_f64()
+        .ok_or_else(|| EgoDesktopError::NetworkError("Invalid response from swap service".into()))?;
 
-    Ok(CnEstimate { to_amount, min_amount, network_fee, network_fee_usd })
+    Ok(CnEstimate {
+        to_amount,
+        min_amount:      est["min_amount"].as_f64().unwrap_or(0.0),
+        network_fee:     est["network_fee"].as_f64().unwrap_or(0.0),
+        network_fee_usd: est["network_fee_usd"].as_f64().unwrap_or(0.0),
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1202,43 +1152,30 @@ pub async fn changenow_create_exchange(
     from_amount: f64,
     to_address:  String,
 ) -> Result<CnExchange, EgoDesktopError> {
-    let cn_key = changenow_key()?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build().unwrap_or_default();
-
     let body = serde_json::json!({
-        "fromCurrency":  from_symbol.to_lowercase(),
-        "toCurrency":    to_symbol.to_lowercase(),
-        "fromAmount":    from_amount.to_string(),
-        "toAddress":     to_address,
-        "fromNetwork":   cn_network(&from_symbol),
-        "toNetwork":     cn_network(&to_symbol),
-        "flow":          "standard",
-        "type":          "direct",
+        "from":       from_symbol.to_lowercase(),
+        "to":         to_symbol.to_lowercase(),
+        "amount":     from_amount,
+        "to_address": to_address,
     });
 
-    let resp: serde_json::Value = client
-        .post(&format!("{CHANGENOW_BASE}/exchange"))
-        .header("x-changenow-api-key", cn_key)
-        .header("Content-Type", "application/json")
+    let resp: serde_json::Value = proxy_client()
+        .post(format!("{}/swap/create", payments_proxy_base()))
         .json(&body)
         .send().await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?
         .json().await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
 
-    if let Some(err) = resp["error"].as_str() {
-        return Err(EgoDesktopError::NetworkError(
-            resp["message"].as_str().unwrap_or(err).to_string()
-        ));
+    if let Some(err) = proxy_error(&resp) {
+        return Err(err);
     }
 
     Ok(CnExchange {
         id:               resp["id"].as_str().unwrap_or("").to_string(),
-        deposit_address:  resp["payinAddress"].as_str().unwrap_or("").to_string(),
-        deposit_extra_id: resp["payinExtraId"].as_str().map(|s| s.to_string()),
-        to_amount:        resp["toAmount"].as_f64().unwrap_or(0.0),
+        deposit_address:  resp["deposit_address"].as_str().unwrap_or("").to_string(),
+        deposit_extra_id: resp["deposit_extra_id"].as_str().map(|s| s.to_string()),
+        to_amount:        resp["to_amount"].as_f64().unwrap_or(0.0),
     })
 }
 
@@ -1254,23 +1191,26 @@ pub struct CnStatus {
 pub async fn changenow_get_status(
     exchange_id: String,
 ) -> Result<CnStatus, EgoDesktopError> {
-    let cn_key = changenow_key()?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build().unwrap_or_default();
-
-    let resp: serde_json::Value = client
-        .get(&format!("{CHANGENOW_BASE}/exchange/{exchange_id}"))
-        .header("x-changenow-api-key", cn_key)
+    let url = format!(
+        "{}/swap/status/{}",
+        payments_proxy_base(),
+        url_escape(&exchange_id),
+    );
+    let resp: serde_json::Value = proxy_client()
+        .get(&url)
         .send().await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?
         .json().await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
 
+    if let Some(err) = proxy_error(&resp) {
+        return Err(err);
+    }
+
     Ok(CnStatus {
         status:    resp["status"].as_str().unwrap_or("unknown").to_string(),
-        to_amount: resp["amountTo"].as_f64(),
-        hash_out:  resp["payoutHash"].as_str().map(|s| s.to_string()),
+        to_amount: resp["to_amount"].as_f64(),
+        hash_out:  resp["hash_out"].as_str().map(|s| s.to_string()),
     })
 }
 
@@ -1605,14 +1545,49 @@ pub async fn presale_info() -> Result<serde_json::Value, EgoDesktopError> {
 }
 
 
-fn get_stripe_key() -> String {
-    if let Ok(k) = std::env::var("STRIPE_SECRET_KEY") {
-        if !k.trim().is_empty() { return k; }
+/// Base URL of the Ego payment proxy (`services/presale-proxy`).
+///
+/// Payment provider secrets live there and never in this binary. `option_env!`
+/// substitutes its value into the compiled artifact at build time, so anything
+/// passed to it ships to every user and can be recovered with `strings` — fine
+/// for a public URL, never for a key.
+fn payments_proxy_base() -> String {
+    if let Ok(u) = std::env::var("EGO_PAYMENTS_PROXY") {
+        if !u.trim().is_empty() { return u.trim().trim_end_matches('/').to_string(); }
     }
-    if let Some(k) = option_env!("STRIPE_SECRET_KEY") {
-        if !k.trim().is_empty() { return k.to_string(); }
+    if let Some(u) = option_env!("EGO_PAYMENTS_PROXY") {
+        if !u.trim().is_empty() { return u.trim().trim_end_matches('/').to_string(); }
     }
-    String::new()
+    "https://pay.egoblockchain.com".to_string()
+}
+
+/// Percent-encode a value going into a URL path or query. These are coin
+/// symbols and provider IDs, but they reach us from the frontend, so they get
+/// escaped rather than trusted.
+fn url_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn proxy_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .unwrap_or_default()
+}
+
+/// Surface the proxy's own `{"error": "..."}` shape as a real error instead of
+/// letting it fall through and be read as a successful empty response.
+fn proxy_error(json: &serde_json::Value) -> Option<EgoDesktopError> {
+    json["error"].as_str().map(|e| EgoDesktopError::NetworkError(e.to_string()))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1629,33 +1604,12 @@ pub async fn presale_stripe_checkout(
     egoc_amount: f64,
     usd_amount:  f64,
 ) -> Result<StripeSession, EgoDesktopError> {
-    let stripe_key = get_stripe_key();
-    if stripe_key.is_empty() {
-        return Err(EgoDesktopError::NetworkError("Stripe integration is not configured. For local testing, set the STRIPE_SECRET_KEY environment variable.".into()));
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build().unwrap_or_default();
-
-    let unit_amount = (usd_amount * 100.0).round() as u64;
-    let product_name = format!("Ego Blockchain Pre-Sale ({} EGOC)", egoc_amount);
-
-    let params = [
-        ("payment_method_types[0]", "card".to_string()),
-        ("line_items[0][price_data][currency]", "usd".to_string()),
-        ("line_items[0][price_data][product_data][name]", product_name),
-        ("line_items[0][price_data][unit_amount]", unit_amount.to_string()),
-        ("line_items[0][quantity]", "1".to_string()),
-        ("mode", "payment".to_string()),
-        ("success_url", "https://egoblockchain.com/success?session_id={CHECKOUT_SESSION_ID}".to_string()),
-        ("cancel_url", "https://egoblockchain.com/cancel".to_string()),
-    ];
-
-    let resp = client
-        .post("https://api.stripe.com/v1/checkout/sessions")
-        .bearer_auth(&stripe_key)
-        .form(&params)
+    // The proxy prices the order itself from usd_amount — it deliberately
+    // ignores any client-supplied EGOC figure, so a tampered client can't pay
+    // $10 and claim an arbitrary allocation. We send usd_amount only.
+    let resp = proxy_client()
+        .post(format!("{}/presale/checkout", payments_proxy_base()))
+        .json(&serde_json::json!({ "usd_amount": usd_amount }))
         .send()
         .await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
@@ -1663,16 +1617,20 @@ pub async fn presale_stripe_checkout(
     let json: serde_json::Value = resp.json().await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
 
-    if let Some(err) = json["error"]["message"].as_str() {
-        return Err(EgoDesktopError::NetworkError(format!("Stripe API: {err}")));
+    if let Some(err) = proxy_error(&json) {
+        return Err(err);
     }
 
-    let session_id   = json["id"].as_str().unwrap_or("").to_string();
-    let checkout_url = json["url"].as_str().unwrap_or("").to_string();
+    let session_id   = json["session_id"].as_str().unwrap_or("").to_string();
+    let checkout_url = json["checkout_url"].as_str().unwrap_or("").to_string();
 
     if session_id.is_empty() || checkout_url.is_empty() {
-        return Err(EgoDesktopError::NetworkError("No checkout URL returned from Stripe".into()));
+        return Err(EgoDesktopError::NetworkError("No checkout URL returned".into()));
     }
+
+    // Trust the server's arithmetic over the caller's.
+    let egoc_amount = json["egoc_amount"].as_f64().unwrap_or(egoc_amount);
+    let usd_amount  = json["usd_amount"].as_f64().unwrap_or(usd_amount);
 
     let _ = opener::open(&checkout_url);
 
@@ -1689,19 +1647,13 @@ pub struct StripeVerifyResult {
 
 #[tauri::command]
 pub async fn presale_stripe_verify(session_id: String) -> Result<StripeVerifyResult, EgoDesktopError> {
-    let stripe_key = get_stripe_key();
-    if stripe_key.is_empty() {
-        return Err(EgoDesktopError::NetworkError("Stripe API key is missing.".into()));
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build().unwrap_or_default();
-
-    let url = format!("https://api.stripe.com/v1/checkout/sessions/{}", session_id);
-    let resp = client
+    let url = format!(
+        "{}/presale/verify/{}",
+        payments_proxy_base(),
+        url_escape(&session_id),
+    );
+    let resp = proxy_client()
         .get(&url)
-        .bearer_auth(&stripe_key)
         .send()
         .await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
@@ -1709,23 +1661,16 @@ pub async fn presale_stripe_verify(session_id: String) -> Result<StripeVerifyRes
     let json: serde_json::Value = resp.json().await
         .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
 
-    if let Some(err) = json["error"]["message"].as_str() {
-        return Err(EgoDesktopError::NetworkError(format!("Stripe API: {err}")));
+    if let Some(err) = proxy_error(&json) {
+        return Err(err);
     }
 
-    // Stripe's checkout session object has `payment_status` ("paid"/"unpaid"/
-    // "no_payment_required") and a separate lifecycle `status` ("open"/
-    // "complete"/"expired") — neither is a `paid` boolean, which is what the
-    // frontend actually checks. Derive it explicitly instead of forwarding
-    // Stripe's raw shape.
-    let payment_status = json["payment_status"].as_str().unwrap_or("");
-    let status = json["status"].as_str().unwrap_or("").to_string();
-    let amount_total_cents = json["amount_total"].as_i64().unwrap_or(0);
-
+    // The proxy already resolves Stripe's `payment_status` / `status` pair into
+    // the boolean the frontend checks.
     Ok(StripeVerifyResult {
-        paid: payment_status == "paid",
-        status,
-        amount_total_cents,
+        paid:               json["paid"].as_bool().unwrap_or(false),
+        status:             json["status"].as_str().unwrap_or("").to_string(),
+        amount_total_cents: json["amount_total"].as_i64().unwrap_or(0),
     })
 }
 
