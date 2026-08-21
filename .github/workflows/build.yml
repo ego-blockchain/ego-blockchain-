@@ -270,7 +270,6 @@ jobs:
 
       - name: Build Tauri app
         working-directory: ego-desktop
-        env:
         run: npx tauri build
 
       - name: Upload Linux artifacts to release
