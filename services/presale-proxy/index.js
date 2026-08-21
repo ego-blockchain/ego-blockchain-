@@ -10,8 +10,21 @@ const STRIPE_KEY     = process.env.STRIPE_SECRET_KEY || '';
 const CHANGENOW_KEY  = process.env.CHANGENOW_API_KEY || '';
 const PORT           = parseInt(process.env.PORT || '3031', 10);
 const EGOC_PRICE_USD = parseFloat(process.env.EGOC_PRICE_USD || '2.00');
-const SUCCESS_URL    = process.env.SUCCESS_URL || 'https://egoblockchain.com/presale/success';
-const CANCEL_URL     = process.env.CANCEL_URL  || 'https://egoblockchain.com/presale/cancel';
+// These must match the routes the website actually serves — /success and
+// /cancel in src/App.js. A URL with no matching route renders a blank SPA
+// shell, which looks exactly like a broken payment to the buyer.
+const SUCCESS_URL    = withSessionPlaceholder(
+  process.env.SUCCESS_URL || 'https://egoblockchain.com/success'
+);
+const CANCEL_URL     = process.env.CANCEL_URL  || 'https://egoblockchain.com/cancel';
+
+// The success page reads ?session_id= to verify the payment, and Stripe only
+// substitutes {CHECKOUT_SESSION_ID} if we ask for it. Append it when an
+// override forgets, so the page always has something to verify with.
+function withSessionPlaceholder(url) {
+  if (url.includes('{CHECKOUT_SESSION_ID}')) return url;
+  return url + (url.includes('?') ? '&' : '?') + 'session_id={CHECKOUT_SESSION_ID}';
+}
 // Comma-separated allowlist of browser origins permitted to call this proxy.
 // Empty/unset → '*' is sent but a warning is logged (set this before launch).
 const ALLOWED_ORIGINS = (process.env.PRESALE_ORIGIN || '')
