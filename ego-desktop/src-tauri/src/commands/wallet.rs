@@ -1591,6 +1591,105 @@ fn proxy_error(json: &serde_json::Value) -> Option<EgoDesktopError> {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct RampSession {
+    pub url:      String,
+    pub provider: String,
+    /// Where the bought crypto will land. Shown to the user before they leave
+    /// the app so a wrong-chain purchase is caught before money moves.
+    pub address:  String,
+}
+
+/// Open a fiat buy/sell session for one of the wallet's own external assets.
+///
+/// The destination is resolved here from the wallet's derived addresses rather
+/// than taken from the frontend — the address a ramp delivers to should never
+/// be something the UI can be talked into supplying.
+#[tauri::command]
+pub async fn create_ramp_session(
+    side:   String,
+    symbol: String,
+    amount: Option<f64>,
+    fiat:   Option<String>,
+) -> Result<RampSession, EgoDesktopError> {
+    let side = if side.eq_ignore_ascii_case("sell") { "sell" } else { "buy" };
+    let symbol_uc = symbol.to_uppercase();
+
+    // Match on `asset` — the only field that means the same thing for native
+    // coins and ERC-20 stablecoins alike.
+    let addresses = crate::commands::multichain::get_external_addresses()?;
+    let entry = addresses.iter()
+        .find(|a| a.asset.eq_ignore_ascii_case(&symbol_uc))
+        .ok_or_else(|| EgoDesktopError::InvalidInput(
+            format!("{symbol_uc} has no receive address in this wallet")
+        ))?;
+
+    if side == "buy" && entry.address.trim().is_empty() {
+        return Err(EgoDesktopError::WalletError(
+            format!("No {symbol_uc} address derived yet — open the Wallet page once and retry")
+        ));
+    }
+
+    // Pin the settlement network explicitly. USDT exists on several chains and
+    // a provider defaulting to the wrong one would deliver funds to an address
+    // this wallet cannot spend from.
+    let network = ramp_network_for(&entry.asset, &entry.symbol);
+
+    let resp = proxy_client()
+        .post(format!("{}/ramp/session", payments_proxy_base()))
+        .json(&serde_json::json!({
+            "side":    side,
+            "asset":   symbol_uc,
+            "network": network,
+            "address": entry.address,
+            "amount":  amount,
+            "fiat":    fiat.unwrap_or_else(|| "USD".into()),
+        }))
+        .send().await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+
+    let json: serde_json::Value = resp.json().await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+
+    if let Some(err) = proxy_error(&json) {
+        return Err(err);
+    }
+
+    let url = json["url"].as_str().unwrap_or("").to_string();
+    if url.is_empty() {
+        return Err(EgoDesktopError::NetworkError("No checkout URL returned".into()));
+    }
+
+    Ok(RampSession {
+        url,
+        provider: json["provider"].as_str().unwrap_or("").to_string(),
+        address:  entry.address.clone(),
+    })
+}
+
+/// Settlement network a ramp should deliver on, per asset.
+fn ramp_network_for(asset: &str, settles_on: &str) -> String {
+    match asset.to_uppercase().as_str() {
+        "BTC"  => "mainnet".to_string(),
+        "ETH"  => "ethereum".to_string(),
+        "BNB"  => "bsc".to_string(),
+        "SOL"  => "solana".to_string(),
+        "ADA"  => "cardano".to_string(),
+        "XRP"  => "ripple".to_string(),
+        "TRX"  => "tron".to_string(),
+        "LTC"  => "litecoin".to_string(),
+        "DOGE" => "dogecoin".to_string(),
+        // ERC-20s carry the chain they settle on, not their own symbol.
+        _ => match settles_on.to_uppercase().as_str() {
+            "ETH" => "ethereum".to_string(),
+            "BNB" => "bsc".to_string(),
+            "TRX" => "tron".to_string(),
+            "SOL" => "solana".to_string(),
+            other => other.to_lowercase(),
+        },
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct StripeSession {
     pub session_id:   String,
     pub checkout_url: String,
@@ -1632,8 +1731,8 @@ pub async fn presale_stripe_checkout(
     let egoc_amount = json["egoc_amount"].as_f64().unwrap_or(egoc_amount);
     let usd_amount  = json["usd_amount"].as_f64().unwrap_or(usd_amount);
 
-    let _ = opener::open(&checkout_url);
-
+    // The caller opens `checkout_url` — WalletPage does it via the Tauri shell
+    // API. Opening it here too launched the browser twice for one click.
     Ok(StripeSession { session_id, checkout_url, egoc_amount, usd_amount })
 }
 

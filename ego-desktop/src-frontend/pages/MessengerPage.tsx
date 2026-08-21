@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { open as openDialog } from '@tauri-apps/api/dialog';
 import { open as openUrl } from '@tauri-apps/api/shell';
@@ -49,6 +49,7 @@ interface Contact {
   added_at: number;
   endpoint: string;
   machine_id?: string;
+  avatar?: string;
 }
 
 interface Message {
@@ -285,6 +286,141 @@ function AiMessageContent({ content }: { content: string }) {
 
 const EGO_AI_ADDRESS = 'ego_ai_assistant';
 
+// Starter questions for the empty Ego AI view. Written for someone who knows
+// roughly what a blockchain is and nothing else — plain wording, no jargon in
+// the question itself, and each one has a real answer behind it.
+const AI_STARTERS: { heading: string; questions: string[] }[] = [
+  {
+    heading: 'Start here',
+    questions: [
+      'What is a dApp?',
+      'How do I create a dApp?',
+      'How do I build an app with a smart contract and launch it on my website?',
+    ],
+  },
+  {
+    heading: 'Smart contracts',
+    questions: [
+      'Show me a smart contract example',
+      'Why should I use Urego?',
+      'How do I deploy a contract?',
+    ],
+  },
+  {
+    heading: 'Using Ego',
+    questions: [
+      'What is Ego?',
+      'How do I earn EGOC?',
+      'How does staking work?',
+    ],
+  },
+];
+
+// Follow-ups offered under each answer, picked from what was just asked so the
+// next step is related rather than random. First matching topic wins; anything
+// unmatched falls back to the starter list.
+const AI_FOLLOW_UPS: { topic: RegExp; questions: string[] }[] = [
+  {
+    topic: /dapp|decentrali[sz]ed app|web3 app/i,
+    questions: [
+      'Show me a smart contract example',
+      'How do I build an app with a smart contract and launch it on my website?',
+      'What is the dApp IDE?',
+    ],
+  },
+  {
+    topic: /contract|urego|deploy|compile|ide/i,
+    questions: [
+      'Why should I use Urego?',
+      'How do I deploy a contract?',
+      'How do I host a website?',
+      'What is a dApp?',
+    ],
+  },
+  {
+    topic: /earn|income|reward|stake|staking|apr|mining/i,
+    questions: [
+      'How does Proof of Coverage work?',
+      'What is DRS reward scoring?',
+      'How do I run a node?',
+    ],
+  },
+  {
+    topic: /consensus|bft|shard|block|validator|node/i,
+    questions: [
+      'How does sharding work?',
+      'What is in a block header?',
+      'What is the security model?',
+    ],
+  },
+  {
+    topic: /token|supply|price|egusd|egoc|fee|gas/i,
+    questions: [
+      'Explain the tokenomics',
+      'What is EGUSD?',
+      'How do transaction fees work?',
+    ],
+  },
+  {
+    topic: /storage|file|egosafe|messenger|chat|privacy/i,
+    questions: [
+      'How does Proof of Storage work?',
+      'What is PoRep?',
+      'How does the messenger stay private?',
+    ],
+  },
+];
+
+const AI_FALLBACK_FOLLOW_UPS = [
+  'What is a dApp?',
+  'How do I create a dApp?',
+  'Show me a smart contract example',
+  'How do I earn EGOC?',
+];
+
+function pickFollowUps(lastQuestion: string, alreadyAsked: string[]): string[] {
+  const asked = new Set(alreadyAsked.map(q => q.trim().toLowerCase()));
+  const pool =
+    AI_FOLLOW_UPS.find(g => g.topic.test(lastQuestion))?.questions ?? AI_FALLBACK_FOLLOW_UPS;
+  const fresh = pool.filter(q => !asked.has(q.toLowerCase()));
+  // Everything in this topic has been asked — offer the general list instead of
+  // nothing, so the conversation never dead-ends.
+  const chosen = fresh.length
+    ? fresh
+    : AI_FALLBACK_FOLLOW_UPS.filter(q => !asked.has(q.toLowerCase()));
+  return chosen.slice(0, 3);
+}
+
+/// Profile picture, falling back to the initial when there's no image — the
+/// same shape and gradient either way so layouts don't shift.
+const Avatar: React.FC<{
+  name?: string;
+  avatar?: string;
+  size: number;
+  gradient?: string;
+  className?: string;
+}> = ({ name, avatar, size, gradient = 'from-purple-500 to-pink-600', className = '' }) => {
+  const box = { width: size, height: size };
+  if (avatar) {
+    return (
+      <img
+        src={avatar}
+        alt={name || 'Profile picture'}
+        style={box}
+        className={`rounded-full object-cover shrink-0 bg-gray-700 ${className}`}
+      />
+    );
+  }
+  return (
+    <div
+      style={{ ...box, fontSize: Math.max(10, Math.round(size * 0.42)) }}
+      className={`rounded-full bg-gradient-to-br ${gradient} flex items-center justify-center font-bold shrink-0 ${className}`}
+    >
+      {(name || '?').charAt(0).toUpperCase()}
+    </div>
+  );
+};
+
 const EGO_AI_CONTACT: Contact = {
   address:        EGO_AI_ADDRESS,
   name:           'Ego AI',
@@ -323,7 +459,10 @@ const MessengerPage: React.FC = () => {
   const [aiThinking, setAiThinking]       = useState(false);
 
   const [showMyCard, setShowMyCard]         = useState(false);
-  const [myCardName, setMyCardName]         = useState('');
+  // Resolved by the backend from the ledger, falling back to the wallet name set
+  // at install. Never prompted for here — Settings is the one place to change it.
+  const [myDisplayName, setMyDisplayName]   = useState('');
+  const [myAvatar, setMyAvatar]             = useState('');
   const [myCard, setMyCard]                 = useState('');
   const [generatingCard, setGeneratingCard] = useState(false);
   const [copied, setCopied]                 = useState(false);
@@ -334,7 +473,6 @@ const MessengerPage: React.FC = () => {
 
   const [showAdd, setShowAdd]     = useState(false);
   const [addBundle, setAddBundle] = useState('');
-  const [addMyName, setAddMyName] = useState('');
   const [addMsg, setAddMsg]       = useState('');
   const [adding, setAdding]       = useState(false);
 
@@ -342,7 +480,6 @@ const MessengerPage: React.FC = () => {
     contact: Contact;
     action: 'approve' | 'decline';
   } | null>(null);
-  const [actionName, setActionName] = useState('');
   const [actioning, setActioning]   = useState(false);
   const [actionDone, setActionDone] = useState(false);
 
@@ -404,6 +541,33 @@ const MessengerPage: React.FC = () => {
       console.error('get_messages', e);
     }
   }
+
+  // Suggestions under the latest answer. Only while the last turn is a finished
+  // assistant reply — not mid-thought, and not under the user's own message.
+  const aiFollowUps = useMemo(() => {
+    if (aiThinking || aiMessages.length === 0) return [];
+    if (aiMessages[aiMessages.length - 1].role !== 'assistant') return [];
+    const asked = aiMessages.filter(m => m.role === 'user').map(m => m.content);
+    return pickFollowUps(asked[asked.length - 1] ?? '', asked);
+  }, [aiMessages, aiThinking]);
+
+  // Load once, and refresh whenever Settings changes it so an open Messenger
+  // doesn't keep showing the old name.
+  useEffect(() => {
+    const load = () => {
+      invoke<string>('get_display_name').then(setMyDisplayName).catch(() => {});
+      invoke<string>('get_my_avatar').then(setMyAvatar).catch(() => {});
+    };
+    load();
+    const unlisten = listen('ego://display-name-changed', load);
+    return () => { unlisten.then(f => f()); };
+  }, []);
+
+  // A contact's picture arriving over P2P changes the sidebar and header.
+  useEffect(() => {
+    const unlisten = listen('ego://contact-updated', () => { loadContacts(); });
+    return () => { unlisten.then(f => f()); };
+  }, []);
 
   const selectedRef = useRef<Contact | null>(null);
   useEffect(() => { selectedRef.current = selected; }, [selected]);
@@ -515,16 +679,12 @@ useEffect(() => {
   }
 
   async function handleGenerateCard() {
-    if (!myCardName.trim()) return;
     setGeneratingCard(true);
     setMyCard('');
     setCopied(false);
     try {
-      const card = await invoke<string>('get_my_contact_bundle', {
-        myName: myCardName.trim(),
-      });
+      const card = await invoke<string>('get_my_contact_bundle', {});
       setMyCard(card);
-      localStorage.setItem('ego-my-display-name', myCardName.trim());
     } catch (e: any) {
       console.error(e);
     } finally {
@@ -533,13 +693,12 @@ useEffect(() => {
   }
 
   async function handleAddContact() {
-    if (!addBundle.trim() || !addMyName.trim()) return;
+    if (!addBundle.trim()) return;
     setAdding(true);
     setAddMsg('');
     try {
       await invoke<Contact>('import_contact', {
         bundle: addBundle.trim(),
-        myName: addMyName.trim(),
       });
       setAddMsg('✓ Request sent! Waiting for them to approve…');
       await loadContacts();
@@ -556,14 +715,12 @@ useEffect(() => {
   }
 
   async function handleApprove() {
-    if (!pendingAction || pendingAction.action !== 'approve' || !actionName.trim()) return;
+    if (!pendingAction || pendingAction.action !== 'approve') return;
     setActioning(true);
     try {
       await invoke<Contact>('approve_contact_request', {
         contactAddr: pendingAction.contact.address,
-        myName: actionName.trim(),
       });
-      localStorage.setItem('ego-my-display-name', actionName.trim());
       setActionDone(true);
       await loadContacts();
       setTimeout(() => closePendingAction(), 1500);
@@ -580,7 +737,6 @@ useEffect(() => {
     try {
       await invoke('decline_contact_request', {
         contactAddr: pendingAction.contact.address,
-        myName: 'Me',
       });
       setActionDone(true);
       await loadContacts();
@@ -653,10 +809,12 @@ useEffect(() => {
     }
   }
 
-  async function handleAiSend() {
-    const text = msgInput.trim();
+  // `preset` lets a starter-question chip ask directly instead of only filling
+  // the input box and making the user press send a second time.
+  async function handleAiSend(preset?: string) {
+    const text = (preset ?? msgInput).trim();
     if (!text) return;
-    setMsgInput('');
+    if (!preset) setMsgInput('');
     const userMsg: AiMsg = { role: 'user', content: text, ts: Date.now() / 1000 };
     setAiMessages(prev => [...prev, userMsg]);
     setAiThinking(true);
@@ -835,9 +993,7 @@ useEffect(() => {
                   className="px-4 py-3 bg-yellow-500/5 border-l-2 border-yellow-500/40"
                 >
                   <div className="flex items-center gap-2 mb-2">
-                    <div className="w-8 h-8 rounded-full bg-gradient-to-br from-yellow-500 to-orange-600 flex items-center justify-center text-xs font-bold shrink-0">
-                      {(c.name || '?').charAt(0).toUpperCase()}
-                    </div>
+                    <Avatar name={c.name} avatar={c.avatar} size={32} gradient="from-yellow-500 to-orange-600" />
                     <div className="min-w-0 flex-1">
                       <div className="text-sm font-medium truncate">{c.name || 'Unknown'}</div>
                     <div className="flex flex-col gap-0.5">
@@ -884,9 +1040,7 @@ useEffect(() => {
                   : ''
               }`}
             >
-              <div className="w-9 h-9 rounded-full bg-gradient-to-br from-purple-500 to-pink-600 flex items-center justify-center text-sm font-bold shrink-0">
-                {(c.name || '?').charAt(0).toUpperCase()}
-              </div>
+              <Avatar name={c.name} avatar={c.avatar} size={36} />
               <div className="min-w-0 flex-1">
                 <div className="text-sm font-medium truncate">{c.name || 'Unknown'}</div>
                 <div className="text-xs text-gray-400 font-mono">{truncAddr(c.address)}</div>
@@ -963,9 +1117,7 @@ useEffect(() => {
               </div>
             ) : (
               <div className="px-6 py-3 border-b border-gray-700 flex items-center shrink-0 gap-3">
-                <div className="w-9 h-9 rounded-full bg-gradient-to-br from-purple-500 to-pink-600 flex items-center justify-center text-sm font-bold shrink-0">
-                  {(selected.name || '?').charAt(0).toUpperCase()}
-                </div>
+                <Avatar name={selected.name} avatar={selected.avatar} size={36} />
                 <div className="flex-1 min-w-0">
                   {editingName ? (
                     <input
@@ -1021,18 +1173,29 @@ useEffect(() => {
                     <div className="text-center text-gray-500 text-sm py-10">
                       <div className="flex justify-center mb-3"><EgoAiIcon size={64} /></div>
                       <div className="text-gray-300 font-medium mb-1">Ego AI Assistant</div>
-                      <div className="text-xs text-gray-500 max-w-xs mx-auto leading-relaxed">
-                        Ask me anything about Ego blockchain — smart contracts, EIPs, tokenomics, how to use this app, or get help writing Urego code.
+                      <div className="text-xs text-gray-500 max-w-sm mx-auto leading-relaxed">
+                        Ask me anything about Ego blockchain — smart contracts, EIPs, tokenomics,
+                        how to use this app, or get help writing Urego code.
+                        New here? Start with one of these.
                       </div>
-                      <div className="mt-4 space-y-2">
-                        {['How do I write a Urego token contract?', 'What is EGOC and how do I earn it?', 'Explain the HotStuff BFT consensus'].map(suggestion => (
-                          <button
-                            key={suggestion}
-                            onClick={() => { setMsgInput(suggestion); }}
-                            className="block w-full max-w-xs mx-auto text-xs bg-gray-700/60 hover:bg-gray-700 text-gray-300 px-4 py-2 rounded-xl transition-colors text-left"
-                          >
-                            💬 {suggestion}
-                          </button>
+                      <div className="mt-5 max-w-sm mx-auto text-left">
+                        {AI_STARTERS.map(group => (
+                          <div key={group.heading} className="mb-4">
+                            <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-1.5 px-1">
+                              {group.heading}
+                            </div>
+                            <div className="space-y-1.5">
+                              {group.questions.map(question => (
+                                <button
+                                  key={question}
+                                  onClick={() => handleAiSend(question)}
+                                  className="block w-full text-xs bg-gray-700/60 hover:bg-gray-700 text-gray-300 px-3 py-2 rounded-xl transition-colors text-left leading-snug"
+                                >
+                                  {question}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
                         ))}
                       </div>
                     </div>
@@ -1078,6 +1241,24 @@ useEffect(() => {
                           <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
                           <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
                         </div>
+                      </div>
+                    </div>
+                  )}
+                  {aiFollowUps.length > 0 && (
+                    <div className="mt-2 mb-1 pl-9">
+                      <div className="text-[10px] uppercase tracking-wider text-gray-500 mb-1.5">
+                        Ask next
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {aiFollowUps.map(question => (
+                          <button
+                            key={question}
+                            onClick={() => handleAiSend(question)}
+                            className="text-xs bg-gray-700/60 hover:bg-gray-700 text-gray-300 px-3 py-1.5 rounded-full transition-colors text-left"
+                          >
+                            {question}
+                          </button>
+                        ))}
                       </div>
                     </div>
                   )}
@@ -1127,9 +1308,7 @@ useEffect(() => {
 
                     {/* Avatar for incoming messages */}
                     {!m.outgoing && (
-                      <div className="w-7 h-7 rounded-full bg-gradient-to-br from-purple-500 to-pink-600 flex items-center justify-center text-xs font-bold shrink-0">
-                        {(selected?.name || '?').charAt(0).toUpperCase()}
-                      </div>
+                      <Avatar name={selected?.name} avatar={selected?.avatar} size={28} />
                     )}
 
                     <div
@@ -1394,20 +1573,13 @@ useEffect(() => {
                   </div>
                 )}
               </div>
-              <div>
-                <label className="text-xs text-gray-400 mb-1.5 block">Your display name</label>
-                <input
-                  value={myCardName}
-                  onChange={e => setMyCardName(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter') handleGenerateCard(); }}
-                  placeholder="e.g. Alice"
-                  autoFocus
-                  className="w-full bg-gray-700 border border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-500"
-                />
-              </div>
+              <p className="text-xs text-gray-500">
+                Your card goes out as <strong className="text-gray-300">{myDisplayName || '…'}</strong>.
+                Change this in Settings.
+              </p>
               <button
                 onClick={handleGenerateCard}
-                disabled={!myCardName.trim() || generatingCard}
+                disabled={generatingCard}
                 className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-50 py-2.5 rounded-xl text-sm font-medium transition-colors"
               >
                 {generatingCard ? 'Generating…' : 'Generate Card'}
@@ -1418,11 +1590,9 @@ useEffect(() => {
                   <div className="space-y-3">
                     <div className="text-xs text-green-400 font-medium">✓ Card ready — click Copy and share it:</div>
                     <div className="bg-gray-900 rounded-xl px-4 py-3 flex items-center gap-3">
-                      <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-lg font-black shrink-0">
-                        {myCardName.charAt(0).toUpperCase()}
-                      </div>
+                      <Avatar name={myDisplayName} avatar={myAvatar} size={40} gradient="from-blue-500 to-purple-600" />
                       <div className="min-w-0">
-                        <div className="text-sm font-semibold text-white">{myCardName}</div>
+                        <div className="text-sm font-semibold text-white">{myDisplayName}</div>
                         <div className="text-xs text-gray-400 font-mono mt-0.5" title={myCard}>{shortBundle}</div>
                       </div>
                     </div>
@@ -1472,19 +1642,13 @@ useEffect(() => {
                   className="w-full bg-gray-700 border border-gray-600 rounded-xl px-4 py-2.5 text-xs font-mono focus:outline-none focus:border-blue-500 resize-none"
                 />
               </div>
-              <div>
-                <label className="text-xs text-gray-400 mb-1.5 block">Your display name (they'll see this)</label>
-                <input
-                  value={addMyName}
-                  onChange={e => setAddMyName(e.target.value)}
-                  onKeyDown={e => { if (e.key === 'Enter') handleAddContact(); }}
-                  placeholder="e.g. Bob"
-                  className="w-full bg-gray-700 border border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-500"
-                />
-              </div>
+              <p className="text-xs text-gray-500">
+                They'll see you as <strong className="text-gray-300">{myDisplayName || '…'}</strong>.
+                Change this in Settings.
+              </p>
               <button
                 onClick={handleAddContact}
-                disabled={!addBundle.trim() || !addMyName.trim() || adding}
+                disabled={!addBundle.trim() || adding}
                 className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-50 py-2.5 rounded-xl text-sm font-medium transition-colors"
               >
                 {adding ? 'Sending request…' : 'Send Contact Request'}
@@ -1517,9 +1681,7 @@ useEffect(() => {
             </div>
             <div className="p-6 space-y-4">
               <div className="flex items-center gap-3 bg-gray-700/50 rounded-xl p-3">
-                <div className="w-10 h-10 rounded-full bg-gradient-to-br from-yellow-500 to-orange-600 flex items-center justify-center text-sm font-bold shrink-0">
-                  {(pendingAction.contact.name || '?').charAt(0).toUpperCase()}
-                </div>
+                <Avatar name={pendingAction.contact.name} avatar={pendingAction.contact.avatar} size={40} gradient="from-yellow-500 to-orange-600" />
                 <div>
                   <div className="font-medium text-sm">{pendingAction.contact.name}</div>
                   <div className="text-xs text-gray-400 font-mono">{truncAddr(pendingAction.contact.address)}</div>
@@ -1535,25 +1697,13 @@ useEffect(() => {
               ) : pendingAction.action === 'approve' ? (
                 <>
                   <p className="text-sm text-gray-400">
-                    {actionName
-                      ? <>You'll appear as <strong className="text-white">{actionName}</strong> to{' '}<strong className="text-white">{pendingAction.contact.name}</strong>.</>
-                      : <>Enter your display name so{' '}<strong className="text-white">{pendingAction.contact.name}</strong>{' '}knows who accepted.</>
-                    }
+                    You'll appear as <strong className="text-white">{myDisplayName || '…'}</strong> to{' '}
+                    <strong className="text-white">{pendingAction.contact.name}</strong>.
+                    Change your name in Settings.
                   </p>
-                  <div>
-                    <label className="text-xs text-gray-400 mb-1.5 block">Your display name</label>
-                    <input
-                      value={actionName}
-                      onChange={e => setActionName(e.target.value)}
-                      onKeyDown={e => { if (e.key === 'Enter') handleApprove(); }}
-                      placeholder="e.g. Bob"
-                      autoFocus={!actionName}
-                      className="w-full bg-gray-700 border border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-green-500"
-                    />
-                  </div>
                   <button
                     onClick={handleApprove}
-                    disabled={!actionName.trim() || actioning}
+                    disabled={actioning}
                     className="w-full bg-green-600 hover:bg-green-500 disabled:opacity-50 py-2.5 rounded-xl text-sm font-medium transition-colors"
                   >
                     {actioning ? 'Approving…' : 'Approve & Connect'}

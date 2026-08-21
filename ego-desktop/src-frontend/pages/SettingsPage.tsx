@@ -1,5 +1,6 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
+import { emit } from '@tauri-apps/api/event';
 import { open as openUrl } from '@tauri-apps/api/shell';
 import { save as saveDialog, open as openDialog } from '@tauri-apps/api/dialog';
 import { writeBinaryFile, readBinaryFile } from '@tauri-apps/api/fs';
@@ -25,6 +26,15 @@ interface RecoveryInfo {
 
 const SettingsPage: React.FC = () => {
   const { wallet } = useWallet();
+  const [displayName, setDisplayName]         = useState('');
+  const [savedName, setSavedName]             = useState('');
+  const [savingName, setSavingName]           = useState(false);
+  const [nameMsg, setNameMsg]                 = useState('');
+  const [avatar, setAvatar]                   = useState('');
+  const [savingAvatar, setSavingAvatar]       = useState(false);
+  const [avatarMsg, setAvatarMsg]             = useState('');
+  const avatarInputRef                        = useRef<HTMLInputElement>(null);
+
   const [notifications, setNotifications]     = useState(true);
   const [autoStart, setAutoStart]             = useState(true);
   const [minimizeToTray, setMinimizeToTray]   = useState(true);
@@ -66,6 +76,77 @@ const SettingsPage: React.FC = () => {
       .then(s => { console.log('[Settings] password status:', s); setHasPin(s.has_pin); })
       .catch((e) => console.error('[Settings] password status error:', e));
   }, [wallet?.address]);
+
+  useEffect(() => {
+    invoke<string>('get_display_name')
+      .then(n => { setDisplayName(n); setSavedName(n); })
+      .catch(() => {});
+    invoke<string>('get_my_avatar').then(setAvatar).catch(() => {});
+  }, []);
+
+  // Downscale to a 128px square here rather than shipping a multi-megabyte
+  // camera image to the backend and on to every contact.
+  const AVATAR_PX = 128;
+
+  async function pickAvatar(file: File) {
+    setAvatarMsg('');
+    setSavingAvatar(true);
+    try {
+      const bitmap = await createImageBitmap(file);
+      const side   = Math.min(bitmap.width, bitmap.height);
+      const canvas = document.createElement('canvas');
+      canvas.width = AVATAR_PX;
+      canvas.height = AVATAR_PX;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('Could not process this image');
+      ctx.drawImage(
+        bitmap,
+        (bitmap.width - side) / 2, (bitmap.height - side) / 2, side, side,
+        0, 0, AVATAR_PX, AVATAR_PX,
+      );
+      bitmap.close?.();
+      await saveAvatar(canvas.toDataURL('image/jpeg', 0.82));
+    } catch (e: any) {
+      setAvatarMsg(`✕ ${String(e?.message ?? e)}`);
+      setSavingAvatar(false);
+    }
+  }
+
+  async function saveAvatar(dataUrl: string) {
+    setSavingAvatar(true);
+    setAvatarMsg('');
+    try {
+      const stored = await invoke<string>('set_my_avatar', { dataUrl });
+      setAvatar(stored);
+      setAvatarMsg(stored ? '✓ Picture updated' : '✓ Picture removed');
+      await emit('ego://display-name-changed');
+      setTimeout(() => setAvatarMsg(''), 2500);
+    } catch (e: any) {
+      setAvatarMsg(`✕ ${String(e)}`);
+    } finally {
+      setSavingAvatar(false);
+    }
+  }
+
+  async function saveDisplayName() {
+    const next = displayName.trim();
+    if (!next || next === savedName) return;
+    setSavingName(true);
+    setNameMsg('');
+    try {
+      const stored = await invoke<string>('set_display_name', { name: next });
+      setDisplayName(stored);
+      setSavedName(stored);
+      setNameMsg('✓ Saved');
+      // Messenger may be mounted already — tell it to pick up the new name.
+      await emit('ego://display-name-changed');
+      setTimeout(() => setNameMsg(''), 2500);
+    } catch (e: any) {
+      setNameMsg(`✕ ${String(e)}`);
+    } finally {
+      setSavingName(false);
+    }
+  }
 
   const Toggle: React.FC<{ value: boolean; onChange: (v: boolean) => void }> = ({ value, onChange }) => (
     <button
@@ -187,6 +268,92 @@ const SettingsPage: React.FC = () => {
 
       {}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
+        <div className="px-5 py-4 border-b border-gray-700">
+          <h3 className="font-semibold">Your Name</h3>
+          <div className="text-xs text-gray-400 mt-0.5">
+            How you appear to your Messenger contacts
+          </div>
+        </div>
+        <div className="px-5 py-4">
+          <div className="flex items-center gap-4 mb-4">
+            {avatar ? (
+              <img
+                src={avatar}
+                alt="Your profile picture"
+                className="w-16 h-16 rounded-full object-cover bg-gray-700 shrink-0"
+              />
+            ) : (
+              <div className="w-16 h-16 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-2xl font-bold shrink-0">
+                {(displayName || '?').charAt(0).toUpperCase()}
+              </div>
+            )}
+            <div className="min-w-0">
+              <div className="flex gap-2 flex-wrap">
+                <button
+                  onClick={() => avatarInputRef.current?.click()}
+                  disabled={savingAvatar}
+                  className="bg-gray-700 hover:bg-gray-600 disabled:opacity-40 px-4 py-2 rounded-xl text-xs font-medium transition-colors"
+                >
+                  {savingAvatar ? 'Saving…' : avatar ? 'Change picture' : 'Add picture'}
+                </button>
+                {avatar && (
+                  <button
+                    onClick={() => saveAvatar('')}
+                    disabled={savingAvatar}
+                    className="text-xs text-gray-400 hover:text-red-400 px-2 transition-colors"
+                  >
+                    Remove
+                  </button>
+                )}
+              </div>
+              <div className="text-xs text-gray-500 mt-1.5">
+                {avatarMsg
+                  ? <span className={avatarMsg.startsWith('✓') ? 'text-green-400' : 'text-red-400'}>{avatarMsg}</span>
+                  : 'Square works best — it gets resized to 128×128.'}
+              </div>
+            </div>
+            <input
+              ref={avatarInputRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp,image/gif"
+              className="hidden"
+              onChange={e => {
+                const file = e.target.files?.[0];
+                e.target.value = ''; // let the same file be picked again
+                if (file) pickAvatar(file);
+              }}
+            />
+          </div>
+          <div className="flex gap-2">
+            <input
+              value={displayName}
+              onChange={e => { setDisplayName(e.target.value); setNameMsg(''); }}
+              onKeyDown={e => { if (e.key === 'Enter') saveDisplayName(); }}
+              maxLength={32}
+              placeholder="Your name"
+              className="flex-1 bg-gray-700 border border-gray-600 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-blue-500"
+            />
+            <button
+              onClick={saveDisplayName}
+              disabled={savingName || !displayName.trim() || displayName.trim() === savedName}
+              className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 px-5 rounded-xl text-sm font-medium transition-colors"
+            >
+              {savingName ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+          <div className="text-xs mt-2 min-h-[1rem]">
+            {nameMsg
+              ? <span className={nameMsg.startsWith('✓') ? 'text-green-400' : 'text-red-400'}>{nameMsg}</span>
+              : <span className="text-gray-500">
+                  Contacts you already have keep seeing the old name until you share a new card.
+                </span>
+            }
+          </div>
+        </div>
+      </div>
+
+      {}
+      <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="px-5 py-4 border-b border-gray-700"><h3 className="font-semibold">General</h3></div>
         <div className="divide-y divide-gray-700/50">
           {[
@@ -297,7 +464,7 @@ const SettingsPage: React.FC = () => {
         <h3 className="font-semibold mb-4">About</h3>
         <div className="space-y-2 text-sm">
           {[
-            { label: 'Version', val: 'v0.3.32' },
+            { label: 'Version', val: 'v0.3.33' },
             { label: 'Network', val: 'Ego Network' },
             { label: 'Node ID', val: wallet?.address ? wallet.address.slice(0, 26) + '…' : '—' },
             { label: 'Crypto',  val: 'Dilithium-3 + Ed25519 + Kyber + AES-256-GCM' },

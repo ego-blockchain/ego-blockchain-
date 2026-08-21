@@ -2474,6 +2474,12 @@ pub enum P2PMessage {
         #[serde(default)]
         from_endpoint: String,
     },
+    /// A contact telling us their profile picture changed. Carries only the
+    /// avatar — the contact's name is whatever the local user set it to.
+    ProfileUpdate {
+        from_addr: String,
+        avatar:    String,
+    },
     /// Any messenger message, encrypted to one recipient and broadcast on the
     /// gossip mesh. Direct dials and DHT records both fail whenever every peer
     /// sits behind NAT on relay circuits; the gossip mesh is the only transport
@@ -7433,6 +7439,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                 ratchet_send_count: 0,
                 ratchet_recv_count: 0,
                 bundle_token:       None,
+                avatar:             String::new(),
                 last_request_at:    0,
             };
             contacts.push(contact.clone());
@@ -7758,7 +7765,13 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                 {
                     let already_approved = p.status == "approved";
                     p.address        = from_addr.clone();
-                    p.name           = from_name.clone();
+                    // Only take the peer's declared name on first approval. After
+                    // that the local name is the user's — a duplicate response
+                    // (the gossip fallback sends a second copy by design) must not
+                    // reset a contact they renamed.
+                    if !already_approved {
+                        p.name = from_name.clone();
+                    }
                     p.ed25519_pubkey = from_ed25519;
                     p.kyber_pubkey   = from_kyber;
                     p.status         = "approved".to_string();
@@ -7771,6 +7784,13 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                         if let Some(h) = app {
                             crate::commands::notifications::notify(h, "Contact Request Accepted!", &format!("{} accepted your request", from_name));
                             let _ = h.emit_all("ego://contact-approved", &contact);
+                        }
+                        // They just became a contact — send them our picture.
+                        let avatar = crate::ledger::Ledger::load().avatar;
+                        if !avatar.is_empty() {
+                            tokio::spawn(async move {
+                                crate::commands::messenger::broadcast_profile(avatar).await;
+                            });
                         }
                     }
                 }
@@ -7931,13 +7951,12 @@ P2PMessage::ChatMessage { bundle, seq } => {
                     let now = chrono::Utc::now().timestamp();
                     crate::app::global_app_state().pending_chat_address.lock().unwrap().replace((msg.from.clone(), now));
                 }
-                let preview = if msg.content.len() > 40 {
-                    format!("{}…", &msg.content[..40])
-                } else {
-                    msg.content.clone()
-                };
+                let preview = crate::commands::messenger::truncate_preview(&msg.content, 40);
                 if let Some(h) = app {
-                    crate::commands::notifications::notify(h, "New Message", &preview);
+                    // Title is who it's from, looked up fresh — rename a contact
+                    // and the next notification already says the new name.
+                    let sender = crate::commands::messenger::contact_display_name(&msg.from);
+                    crate::commands::notifications::notify(h, &sender, &preview);
                 }
             }
             if let Some(h) = app {
@@ -7945,6 +7964,38 @@ P2PMessage::ChatMessage { bundle, seq } => {
             }
         }
         Err(e) => eprintln!("[P2P] Decrypt error: {}", e),
+    }
+}
+
+P2PMessage::ProfileUpdate { from_addr, avatar } => {
+    // Same ceiling the setter enforces — a peer doesn't get to park an
+    // unbounded blob in our contacts file.
+    const MAX_AVATAR_BYTES: usize = 96 * 1024;
+    if avatar.len() > MAX_AVATAR_BYTES
+        || (!avatar.is_empty()
+            && (!avatar.starts_with("data:image/") || !avatar.contains(";base64,")))
+    {
+        eprintln!("[Messenger] Rejected profile picture from {}", from_addr);
+        return;
+    }
+    let updated = {
+        let _cg = crate::commands::messenger::CONTACTS_LOCK.lock().unwrap();
+        let mut contacts = load_contacts();
+        match contacts.iter_mut()
+            .find(|c| c.address == from_addr && c.status == "approved")
+        {
+            Some(c) if c.avatar != avatar => {
+                c.avatar = avatar;
+                let _ = save_contacts(&contacts);
+                true
+            }
+            _ => false,
+        }
+    };
+    if updated {
+        if let Some(h) = app {
+            let _ = h.emit_all("ego://contact-updated", &from_addr);
+        }
     }
 }
 

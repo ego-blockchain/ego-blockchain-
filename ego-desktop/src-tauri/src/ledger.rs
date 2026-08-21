@@ -761,6 +761,18 @@ pub struct Ledger {
     #[serde(default)]
     pub bundle_token: String,
 
+    /// How this wallet appears to messenger contacts. Set once at wallet
+    /// creation and changeable in Settings — never asked for again while
+    /// adding a contact. Empty falls back to the registry wallet name.
+    #[serde(default)]
+    pub display_name: String,
+
+    /// Profile picture as a `data:image/...;base64,…` URI, already downscaled
+    /// by the UI before it gets here. Empty = fall back to the initial. Kept
+    /// small deliberately: it is pushed to every contact when it changes.
+    #[serde(default)]
+    pub avatar: String,
+
     /// Unix timestamp (seconds) when storage allocation was last configured.
     /// Nodes are locked from changing their allocation for 60 days after this.
     #[serde(default)]

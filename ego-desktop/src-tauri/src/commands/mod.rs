@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod updates;
 pub mod auth;
 pub mod wallet;
 pub mod coverage;

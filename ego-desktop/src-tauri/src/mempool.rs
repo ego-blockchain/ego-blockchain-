@@ -592,6 +592,22 @@ mod tests {
     use super::*;
     use crate::ledger::LedgerTx;
 
+    /// The one system-shaped tx the pool does accept: a faucet payout from the
+    /// node pool, which `push` allows explicitly via `is_pool_faucet`.
+    fn pool_faucet_tx(hash: &str) -> LedgerTx {
+        LedgerTx {
+            hash: hash.to_string(),
+            from: crate::chain_db::NODE_POOL_ADDR.to_string(),
+            to: "egot1recv".to_string(),
+            amount: 0,
+            fee_uegoc: 0,
+            tx_type: "faucet".to_string(),
+            timestamp: 0,
+            status: "Pending".to_string(),
+            ..LedgerTx::default()
+        }
+    }
+
     fn sys_tx(hash: &str) -> LedgerTx {
         LedgerTx { hash: hash.to_string(), from: String::new(), to: "egot1recv".to_string(),
             amount: 0, fee_uegoc: 0, tx_type: "coinbase".to_string(),
@@ -607,24 +623,31 @@ mod tests {
     #[test]
     fn duplicate_hash_rejected() {
         let pool = ShardedMempool::new();
-        let tx = sys_tx("0xdup");
+        let tx = pool_faucet_tx("0xdup");
         let _ = pool.push(tx.clone());
         let _ = pool.push(tx);
         assert_eq!(pool.pending_count(), 1);
     }
 
+    /// Coinbase and reward transactions must never be accepted from the
+    /// network — minting is only valid inside a block the node has verified.
+    /// Accepting one here would let any peer manufacture supply.
     #[test]
-    fn system_tx_bypasses_fee_check() {
+    fn system_tx_is_refused_from_the_mempool() {
         let pool = ShardedMempool::new();
-        let _ = pool.push(sys_tx("0xcb1"));
-        assert_eq!(pool.pending_count(), 1);
+        for kind in ["coinbase", "reward"] {
+            let mut tx = sys_tx("0xcb1");
+            tx.tx_type = kind.to_string();
+            assert!(pool.push(tx).is_err(), "{kind} must not enter the mempool");
+        }
+        assert_eq!(pool.pending_count(), 0);
     }
 
     #[test]
     fn drain_empties_pool() {
         let pool = ShardedMempool::new();
         for i in 0..4u64 {
-            let _ = pool.push(sys_tx(&format!("0xd{i}")));
+            let _ = pool.push(pool_faucet_tx(&format!("0xd{i}")));
         }
         let got = pool.drain_all();
         assert_eq!(got.len(), 4);

@@ -5,6 +5,16 @@ use std::fs;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ExternalAddress {
+    /// Ticker of the asset itself — BTC, ETH, USDT. The one field safe to look
+    /// an address up by.
+    ///
+    /// `chain` and `symbol` are used inconsistently across entry types and are
+    /// kept only for display: for native coins `chain` is a network name
+    /// ("Bitcoin") and `symbol` the ticker, while for ERC-20 stablecoins
+    /// `chain` is the ticker ("USDT") and `symbol` the settlement chain
+    /// ("ETH"). Matching on either one silently misses half the list.
+    #[serde(default)]
+    pub asset:           String,
     pub chain:           String,
     pub symbol:          String,
     pub address:         String,
@@ -1014,6 +1024,7 @@ pub fn get_external_addresses() -> Result<Vec<ExternalAddress>, EgoDesktopError>
         ($chain:expr, $sym:expr, $icon:expr, $color:expr, $result:expr,
          $atype:expr, $explorer:expr) => {
             ExternalAddress {
+                asset: $sym.into(),
                 chain: $chain.into(), symbol: $sym.into(),
                 address: $result.unwrap_or_else(|e| format!("Error: {e}")),
                 network: "Mainnet".into(), address_type: $atype.into(),
@@ -1039,6 +1050,7 @@ pub fn get_external_addresses() -> Result<Vec<ExternalAddress>, EgoDesktopError>
         push!("Litecoin",  "LTC",  "Ł", "#A5A5A5", addr_btc_like(&seed,"ego:litecoin:0","ltc"), "P2WPKH", "https://litecoinspace.org/address/"),
         push!("Dogecoin",  "DOGE", "Ð", "#C2A633", addr_doge(&seed),                            "P2PKH",  "https://dogechain.info/address/"),
         ExternalAddress {
+            asset: "USDT".into(),
             chain: "USDT".into(), symbol: "ETH".into(),
             address: eth_addr.clone().unwrap_or_else(|e| format!("Error: {e}")),
             network: "Mainnet".into(), address_type: "ERC-20".into(),
@@ -1047,6 +1059,7 @@ pub fn get_external_addresses() -> Result<Vec<ExternalAddress>, EgoDesktopError>
             contract: Some("0xdAC17F958D2ee523a2206206994597C13D831ec7".into()),
         },
         ExternalAddress {
+            asset: "USDC".into(),
             chain: "USDC".into(), symbol: "ETH".into(),
             address: eth_addr.unwrap_or_else(|e| format!("Error: {e}")),
             network: "Mainnet".into(), address_type: "ERC-20".into(),
@@ -2532,5 +2545,65 @@ mod derivation_tests {
         let eth = addr_evm(&seed, "ego:ethereum:0").unwrap();
         assert_eq!(btc, "bc1qgmnrpevzlcnwayhpx633t9756pm49c9y3ll2dh");
         assert_eq!(eth, "0xDCA8Ad692D3338a2AfcfA75f935961503EaB29BA");
+    }
+}
+
+#[cfg(test)]
+mod address_consistency_tests {
+    use super::*;
+
+    /// Buy/Sell, Swap and the Multi-Chain list must all resolve the same
+    /// address for a given ticker. They each look the entry up themselves, so
+    /// the field they agree on has to be unambiguous — `chain` and `symbol`
+    /// are not: for BTC chain is "Bitcoin", for USDT chain is "USDT".
+    #[test]
+    fn every_asset_is_addressable_by_its_ticker() {
+        let seed_ok = crate::ledger::load_seed().ok().flatten().is_some();
+        if !seed_ok {
+            eprintln!("no wallet seed in this environment — skipping");
+            return;
+        }
+        let addrs = get_external_addresses().expect("derive addresses");
+
+        for ticker in ["BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "TRX", "LTC", "DOGE", "USDT", "USDC"] {
+            let hit = addrs.iter().find(|a| a.asset.eq_ignore_ascii_case(ticker));
+            assert!(hit.is_some(), "{ticker} is not addressable by ticker");
+            let a = hit.unwrap();
+            assert!(!a.address.is_empty(), "{ticker} has an empty address");
+            assert!(!a.address.starts_with("Error:"), "{ticker} failed to derive: {}", a.address);
+        }
+    }
+
+    /// USDT and USDC are ERC-20: they must carry the very same address as
+    /// native ETH, or a buy delivered to one would be invisible in the other.
+    #[test]
+    fn erc20_stablecoins_share_the_ethereum_address() {
+        if crate::ledger::load_seed().ok().flatten().is_none() {
+            eprintln!("no wallet seed in this environment — skipping");
+            return;
+        }
+        let addrs = get_external_addresses().expect("derive addresses");
+        let by = |t: &str| addrs.iter()
+            .find(|a| a.asset.eq_ignore_ascii_case(t))
+            .map(|a| a.address.clone())
+            .unwrap_or_default();
+
+        let eth = by("ETH");
+        assert!(!eth.is_empty());
+        assert_eq!(by("USDT"), eth, "USDT must use the ETH address");
+        assert_eq!(by("USDC"), eth, "USDC must use the ETH address");
+    }
+
+    /// `asset` is populated on every entry — an empty one silently drops that
+    /// asset out of both the swap and buy/sell pickers.
+    #[test]
+    fn asset_field_is_never_blank() {
+        if crate::ledger::load_seed().ok().flatten().is_none() {
+            eprintln!("no wallet seed in this environment — skipping");
+            return;
+        }
+        for a in get_external_addresses().expect("derive addresses") {
+            assert!(!a.asset.trim().is_empty(), "entry {:?} has no asset ticker", a.chain);
+        }
     }
 }

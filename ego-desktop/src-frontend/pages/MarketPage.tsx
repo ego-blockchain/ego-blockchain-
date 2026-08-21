@@ -261,7 +261,7 @@ function RangeDropdown({ value, onChange }: { value: RangeKey; onChange: (k: Ran
 }
 
 interface ExternalAddress {
-  chain: string; symbol: string; address: string;
+  asset: string; chain: string; symbol: string; address: string;
   network: string; address_type: string; explorer_prefix: string;
   color: string; icon: string; contract: string | null;
 }
@@ -397,10 +397,10 @@ const MarketPage: React.FC = () => {
       const addrs = await invoke<ExternalAddress[]>('get_external_addresses');
       const results: Record<string, number> = {};
       await Promise.all(COIN_MAP.map(async coin => {
-        // USDT/USDC: chain field = token symbol; native coins: symbol field = chain symbol
-        const ext = (coin.symbol === 'USDT' || coin.symbol === 'USDC')
-          ? addrs.find(a => a.chain === coin.symbol)
-          : addrs.find(a => a.symbol === coin.symbol && !a.contract);
+        // `asset` is the ticker on every entry, so one lookup covers native
+        // coins and ERC-20s alike — no hardcoded stablecoin list to keep in
+        // sync when another token is added.
+        const ext = addrs.find(a => a.asset === coin.symbol);
         if (!ext || ext.address.startsWith('Error:')) return;
         try {
           const bal = await invoke<BalanceResult>('fetch_chain_balance', {
