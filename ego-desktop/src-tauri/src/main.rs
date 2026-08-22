@@ -836,6 +836,7 @@ fn main() {
             commands::messenger::set_my_avatar,
             commands::wallet::create_ramp_session,
             commands::updates::check_for_update,
+            commands::wallet::get_presale_config,
             commands::messenger::clear_messages,
             commands::messenger::delete_message,
             commands::storage::open_file,

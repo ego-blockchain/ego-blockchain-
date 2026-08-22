@@ -1219,7 +1219,73 @@ pub async fn changenow_get_status(
 // purchase. All allocations are written into the Ego Chain Genesis Block when
 // mainnet launches.
 
-const PRESALE_EGOC_USD: f64 = 2.00; // seed-round price ($2.45 market → 18% off)
+/// Last price fetched from the proxy. Only ever written by
+/// `get_presale_config`; the local paths below read it so an IOU is never
+/// written at a price the buyer was not shown.
+static PRESALE_PRICE_USD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn cached_presale_price() -> Option<f64> {
+    let bits = PRESALE_PRICE_USD.load(std::sync::atomic::Ordering::Relaxed);
+    if bits == 0 { return None; }
+    let p = f64::from_bits(bits);
+    if p.is_finite() && p > 0.0 { Some(p) } else { None }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PresaleConfig {
+    pub price_usd:    f64,
+    pub launch_usd:   f64,
+    pub discount_pct: i64,
+    pub tier_label:   String,
+    pub tier_index:   u32,
+    pub tier_count:   u32,
+}
+
+/// Fetch the live pre-sale price. This is the ONLY source — the UI quotes it
+/// and the IOU is written from it, so they cannot disagree.
+///
+/// Deliberately has no hardcoded fallback: if the price is unknown, the UI
+/// disables buying rather than guessing. Quoting a stale price at a buyer is
+/// how the previous 4x under-allocation happened.
+#[tauri::command]
+pub async fn get_presale_config() -> Result<PresaleConfig, EgoDesktopError> {
+    let resp = proxy_client()
+        .get(format!("{}/presale/config", payments_proxy_base()))
+        .send().await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+
+    let json: serde_json::Value = resp.json().await
+        .map_err(|e| EgoDesktopError::NetworkError(e.to_string()))?;
+
+    if let Some(err) = proxy_error(&json) {
+        return Err(err);
+    }
+
+    let price_usd = json["price_usd"].as_f64().unwrap_or(0.0);
+    if !(price_usd.is_finite() && price_usd > 0.0) {
+        return Err(EgoDesktopError::NetworkError(
+            "Pre-sale price unavailable — please try again shortly".into(),
+        ));
+    }
+    PRESALE_PRICE_USD.store(price_usd.to_bits(), std::sync::atomic::Ordering::Relaxed);
+
+    Ok(PresaleConfig {
+        price_usd,
+        launch_usd:   json["launch_usd"].as_f64().unwrap_or(0.0),
+        discount_pct: json["discount_pct"].as_i64().unwrap_or(0),
+        tier_label:   json["tier_label"].as_str().unwrap_or("").to_string(),
+        tier_index:   json["tier_index"].as_u64().unwrap_or(0) as u32,
+        tier_count:   json["tier_count"].as_u64().unwrap_or(1) as u32,
+    })
+}
+
+/// Price for the local (crypto-deposit) IOU paths. Errors rather than assuming
+/// a value — an IOU written at the wrong price is a debt to the buyer.
+fn presale_price_or_err() -> Result<f64, EgoDesktopError> {
+    cached_presale_price().ok_or_else(|| EgoDesktopError::NetworkError(
+        "Pre-sale price not loaded yet — open the Pre-Sale panel and try again".into(),
+    ))
+}
 
 /// Returns the Ego team's treasury address for the given payment coin.
 /// Funds sent here go directly to the presale treasury wallet.
@@ -1257,8 +1323,9 @@ pub async fn presale_create_iou(
         return Err(EgoDesktopError::WalletError("Password cannot be empty".into()));
     }
 
+    let presale_price = presale_price_or_err()?;
     let usd_value   = pay_amount * pay_usd_price;
-    let egoc_amount = usd_value / PRESALE_EGOC_USD;
+    let egoc_amount = usd_value / presale_price;
     let deposit_addr = presale_deposit_addr(&pay_symbol);
     let id  = uuid::Uuid::new_v4().to_string();
     let ts  = chrono::Utc::now().timestamp();
@@ -1270,7 +1337,7 @@ pub async fn presale_create_iou(
         "testnet_address":   ledger.address,
         "egoc_amount":       egoc_amount,
         "usd_value":         usd_value,
-        "price_per_egoc":    PRESALE_EGOC_USD,
+        "price_per_egoc":    presale_price,
         "pay_coin":          pay_symbol,
         "pay_amount":        pay_amount,
         "deposit_address":   deposit_addr,
@@ -1312,7 +1379,7 @@ pub async fn presale_create_iou(
         "allocation": {
             "egoc_amount":        egoc_amount,
             "usd_value":          usd_value,
-            "price_per_egoc_usd": PRESALE_EGOC_USD
+            "price_per_egoc_usd": presale_price
         },
         "genesis_note": "This allocation will be credited in the Ego Chain Genesis Block upon mainnet launch. Keep this file and your password — they are your proof of purchase.",
         "crypto": {
@@ -1536,7 +1603,7 @@ pub async fn presale_list_iou() -> Result<Vec<PresaleIouRecord>, EgoDesktopError
 #[tauri::command]
 pub async fn presale_info() -> Result<serde_json::Value, EgoDesktopError> {
     Ok(serde_json::json!({
-        "egoc_price_usd": PRESALE_EGOC_USD,
+        "egoc_price_usd": cached_presale_price().unwrap_or(0.0),
         "round":          1,
         "round_name":     "Seed Round",
         "market_price":   2.45,
@@ -1785,6 +1852,14 @@ pub async fn presale_stripe_create_iou(
     if password.trim().is_empty() {
         return Err(EgoDesktopError::WalletError("Password cannot be empty".into()));
     }
+    if !(egoc_amount.is_finite() && egoc_amount > 0.0) {
+        return Err(EgoDesktopError::InvalidInput("Invalid EGOC amount for this purchase".into()));
+    }
+
+    // Record the price this buyer actually got — derived from what Stripe
+    // collected and the allocation the server computed, so the IOU can never
+    // claim a rate that differs from the transaction behind it.
+    let presale_price = usd_amount / egoc_amount;
 
     let id  = uuid::Uuid::new_v4().to_string();
     let ts  = chrono::Utc::now().timestamp();
@@ -1795,7 +1870,7 @@ pub async fn presale_stripe_create_iou(
         "testnet_address": ledger.address,
         "egoc_amount":     egoc_amount,
         "usd_value":       usd_amount,
-        "price_per_egoc":  PRESALE_EGOC_USD,
+        "price_per_egoc":  presale_price,
         "pay_method":      "stripe",
         "stripe_session":  session_id,
         "timestamp":       ts,
@@ -1833,7 +1908,7 @@ pub async fn presale_stripe_create_iou(
         "allocation": {
             "egoc_amount":        egoc_amount,
             "usd_value":          usd_amount,
-            "price_per_egoc_usd": PRESALE_EGOC_USD
+            "price_per_egoc_usd": presale_price
         },
         "genesis_note": "This allocation will be credited in the Ego Chain Genesis Block upon mainnet launch. Keep this file and your password — they are your proof of purchase.",
         "crypto": {
