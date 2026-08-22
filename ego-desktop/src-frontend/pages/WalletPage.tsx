@@ -171,17 +171,32 @@ const EGOC_USD   = 2.45;
 const EGUSD_USD  = 1.00;
 const BRIDGE_FEE = 0.005;
 
-// Presale tiers — price rises as each tier sells out.
-// Tier 0 (Early Bird) is live; tiers 1-2 unlock when the prior tier is exhausted.
-const PRESALE_LAUNCH_PRICE = 2.00; // USD at Genesis Block
-const PRESALE_TIERS = [
-  { label: 'Early Bird',     price: 0.50,  cap: 20_000_000,  sold: 0,          discount: 75 },
-  { label: 'Pre-Sale A',     price: 1.00,  cap: 50_000_000,  sold: 0,          discount: 50 },
-  { label: 'Pre-Sale B',     price: 1.50,  cap: 100_000_000, sold: 0,          discount: 25 },
-] as const;
-// Active tier index — 0 = Early Bird currently live
-const ACTIVE_TIER_IDX = 0;
-const ACTIVE_TIER = PRESALE_TIERS[ACTIVE_TIER_IDX];
+// Pre-sale pricing comes from the server (/presale/config) — the same value
+// the checkout prices against. It is never hardcoded here: this file used to
+// quote $0.50 while allocations were computed at $2.00, so buyers received a
+// quarter of what they were shown. If the price can't be fetched, buying is
+// disabled rather than quoted at a guess.
+interface PresaleConfig {
+  price_usd:    number;
+  launch_usd:   number;
+  discount_pct: number;
+  tier_label:   string;
+  tier_index:   number;
+  tier_count:   number;
+  tiers:        { label: string; price: number; cap: number }[];
+}
+
+// The published tier ladder, shown for information. Safe to keep here because
+// it is never used to price a purchase — the live price comes from the server
+// and overrides these for display the moment it loads. Without this the panel
+// renders empty whenever the price service is unreachable.
+const PRESALE_TIER_LADDER = [
+  { label: 'Early Bird', price: 0.50, cap: 20_000_000 },
+  { label: 'Pre-Sale A', price: 1.00, cap: 50_000_000 },
+  { label: 'Pre-Sale B', price: 1.50, cap: 100_000_000 },
+];
+const PRESALE_LAUNCH_USD = 2.00;
+const PRESALE_FALLBACK_DISCOUNT = Math.round((1 - PRESALE_TIER_LADDER[0].price / PRESALE_LAUNCH_USD) * 100);
 
 const BRIDGE_DEPOSIT_ADDRS: Record<string, string> = {
   BTC:  'bc1qego10bridgexxxxxxxxxxxxxxxxxxxxxxxx',
@@ -367,6 +382,9 @@ const WalletPage: React.FC = () => {
   const [showResumeStripe, setShowResumeStripe] = useState(false);
   const [resumeSessionInput, setResumeSessionInput] = useState('');
   const [stripeError, setStripeError]           = useState('');
+  const [presaleCfg, setPresaleCfg]   = useState<PresaleConfig | null>(null);
+  const [presaleCfgErr, setPresaleCfgErr] = useState('');
+
   const [showSwap, setShowSwap]       = useState(false);
 
   // Fiat on/off-ramp. Hidden until the MoonPay account is approved — without a
@@ -616,6 +634,13 @@ const WalletPage: React.FC = () => {
   }
 
   async function openPresale() {
+    // Load the live price before anything can be quoted. On failure the panel
+    // shows the error and buying stays disabled — quoting a guessed price is
+    // what caused buyers to be under-allocated.
+    setPresaleCfgErr('');
+    invoke<PresaleConfig>('get_presale_config')
+      .then(cfg => { setPresaleCfg(cfg); setPresaleCfgErr(''); })
+      .catch(e => { setPresaleCfg(null); setPresaleCfgErr(String(e).replace(/^Error: /, '')); });
     setPresaleStep('buy');
     setPresalePayAmount('');
     setPresaleOutput(0);
@@ -667,7 +692,9 @@ const WalletPage: React.FC = () => {
     if (!asset) return 0;
     const usdPrice = assetUsdPrice(asset, rates);
     if (!usdPrice) return 0;
-    return (payAmount * usdPrice) / ACTIVE_TIER.price;
+    const price = presaleCfg?.price_usd ?? 0;
+    if (price <= 0) return 0;   // no price loaded → quote nothing, never Infinity
+    return (payAmount * usdPrice) / price;
   }
 
   const RAMP_ASSETS = ['BTC', 'ETH', 'USDT', 'USDC', 'BNB', 'SOL', 'ADA', 'TRX', 'LTC', 'DOGE'];
@@ -1643,23 +1670,34 @@ const WalletPage: React.FC = () => {
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
                     <h3 className="text-base font-bold">EGOC Pre-Sale</h3>
-                    <span className="text-[9px] font-bold bg-yellow-400/20 text-yellow-300 px-1.5 py-px rounded border border-yellow-400/30 shrink-0">TIER {ACTIVE_TIER_IDX + 1} / {PRESALE_TIERS.length}</span>
-                    <span className="text-[9px] font-bold bg-red-500/20 text-red-400 px-1.5 py-px rounded border border-red-500/30 shrink-0 animate-pulse">⏳ {ACTIVE_TIER.label.toUpperCase()}</span>
+                    <span className="text-[9px] font-bold bg-yellow-400/20 text-yellow-300 px-1.5 py-px rounded border border-yellow-400/30 shrink-0">TIER {((presaleCfg?.tier_index ?? 0) + 1)} / {(presaleCfg?.tier_count ?? 3)}</span>
+                    <span className="text-[9px] font-bold bg-red-500/20 text-red-400 px-1.5 py-px rounded border border-red-500/30 shrink-0 animate-pulse">⏳ {(presaleCfg?.tier_label ?? '').toUpperCase()}</span>
                   </div>
-                  <p className="text-xs text-gray-400">Before Genesis Block · Encrypted IOU · <span className="text-green-400 font-semibold">{ACTIVE_TIER.discount}% off launch — price rises each round</span></p>
+                  <p className="text-xs text-gray-400">Before Genesis Block · Encrypted IOU · <span className="text-green-400 font-semibold">{(presaleCfg?.discount_pct ?? PRESALE_FALLBACK_DISCOUNT)}% off launch — price rises each round</span></p>
                 </div>
               </div>
               {/* Price + tier ladder */}
               <div className="flex items-center gap-4 shrink-0">
                 <div className="text-right">
                   <div className="text-xs text-gray-400">Your price</div>
-                  <div className="text-xl font-black text-green-400">${ACTIVE_TIER.price.toFixed(2)}<span className="text-xs font-normal text-gray-400 ml-1">/ EGOC</span></div>
-                  <div className="text-[10px] text-green-400 font-bold">↓{ACTIVE_TIER.discount}% off launch (${PRESALE_LAUNCH_PRICE.toFixed(2)})</div>
+                  {/* Live price when we have it. Until then show the published
+                      tier price greyed out, clearly marked as unconfirmed —
+                      never as a figure anyone can buy against. */}
+                  <div className={`text-xl font-black ${presaleCfg ? 'text-green-400' : 'text-gray-500'}`}>
+                    ${(presaleCfg?.price_usd ?? PRESALE_TIER_LADDER[0].price).toFixed(2)}
+                    <span className="text-xs font-normal text-gray-400 ml-1">/ EGOC</span>
+                  </div>
+                  {!presaleCfg && (
+                    <div className="text-[10px] text-yellow-400 font-semibold">
+                      {presaleCfgErr ? 'price unconfirmed — buying paused' : 'confirming price…'}
+                    </div>
+                  )}
+                  <div className="text-[10px] text-green-400 font-bold">↓{(presaleCfg?.discount_pct ?? PRESALE_FALLBACK_DISCOUNT)}% off launch (${(presaleCfg?.launch_usd ?? PRESALE_LAUNCH_USD).toFixed(2)})</div>
                 </div>
                 <div className="hidden sm:flex flex-col gap-0.5">
-                  {PRESALE_TIERS.map((t, i) => (
-                    <div key={t.label} className={`flex items-center gap-1.5 text-[10px] rounded px-1.5 py-0.5 ${i === ACTIVE_TIER_IDX ? 'bg-green-500/20 text-green-300 font-bold' : i < ACTIVE_TIER_IDX ? 'text-gray-600 line-through' : 'text-gray-500'}`}>
-                      <span>{i === ACTIVE_TIER_IDX ? '▶' : i < ACTIVE_TIER_IDX ? '✓' : '○'}</span>
+                  {(presaleCfg?.tiers ?? PRESALE_TIER_LADDER).map((t, i) => (
+                    <div key={t.label} className={`flex items-center gap-1.5 text-[10px] rounded px-1.5 py-0.5 ${i === (presaleCfg?.tier_index ?? 0) ? 'bg-green-500/20 text-green-300 font-bold' : i < (presaleCfg?.tier_index ?? 0) ? 'text-gray-600 line-through' : 'text-gray-500'}`}>
+                      <span>{i === (presaleCfg?.tier_index ?? 0) ? '▶' : i < (presaleCfg?.tier_index ?? 0) ? '✓' : '○'}</span>
                       <span>{t.label}</span>
                       <span className="font-semibold">${t.price.toFixed(2)}</span>
                       <span className="text-[9px] opacity-70">({(t.cap / 1_000_000).toFixed(0)}M)</span>
@@ -1793,14 +1831,24 @@ const WalletPage: React.FC = () => {
                               onChange={e => {
                                 setPresaleCardUsd(e.target.value);
                                 const usd = parseFloat(e.target.value) || 0;
-                                setPresaleOutput(usd > 0 ? Math.floor((usd / ACTIVE_TIER.price) * 100) / 100 : 0);
+                                // Guard the divisor: a missing price would make
+                                // this Infinity and quote an absurd allocation.
+                                const price = presaleCfg?.price_usd ?? 0;
+                                setPresaleOutput(usd > 0 && price > 0 ? Math.floor((usd / price) * 100) / 100 : 0);
                               }}
                               placeholder="100"
                               className="flex-1 bg-transparent text-xl font-bold outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
                             />
                             <span className="text-xs text-gray-500">USD</span>
                           </div>
-                          <div className="text-xs text-gray-500">Minimum $10 · ${ACTIVE_TIER.price.toFixed(2)} / EGOC · {ACTIVE_TIER.discount}% off launch</div>
+                          {presaleCfgErr ? (
+                            <div className="text-xs text-red-400 bg-red-500/10 rounded-lg px-3 py-2">
+                              Pre-sale price unavailable — {presaleCfgErr}. Purchases are paused
+                              until the current price can be confirmed.
+                            </div>
+                          ) : (
+                            <div className="text-xs text-gray-500">Minimum $10 · ${(presaleCfg?.price_usd ?? PRESALE_TIER_LADDER[0].price).toFixed(2)} / EGOC · {(presaleCfg?.discount_pct ?? PRESALE_FALLBACK_DISCOUNT)}% off launch</div>
+                          )}
                         </div>
 
                         <div className="bg-gray-900 rounded-xl p-3">
@@ -1828,7 +1876,7 @@ const WalletPage: React.FC = () => {
                               } catch (e: any) { setStripeError(String(e).replace(/^Error: /, '')); }
                               finally { setPresaleLoading(false); }
                             }}
-                            disabled={!presaleCardUsd || (parseFloat(presaleCardUsd) || 0) < 10 || presaleLoading}
+                            disabled={!presaleCfg || !presaleCardUsd || (parseFloat(presaleCardUsd) || 0) < 10 || presaleLoading}
                             className="w-full py-2.5 rounded-xl font-semibold text-sm bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed transition"
                           >
                             {presaleLoading ? 'Opening Stripe…' : 'Checkout with Stripe →'}
@@ -2078,7 +2126,7 @@ const WalletPage: React.FC = () => {
                       {presalePayMethod === 'card'
                         ? <div className="flex justify-between"><span className="text-gray-400">Paid with</span><span>Card / Apple Pay (${presaleCardUsd} USD)</span></div>
                         : <div className="flex justify-between"><span className="text-gray-400">Paid with</span><span>{presalePayAmount} {presalePayAsset.symbol}</span></div>}
-                      <div className="flex justify-between"><span className="text-gray-400">Price</span><span>${ACTIVE_TIER.price.toFixed(2)} / EGOC <span className="text-green-400 text-xs">({ACTIVE_TIER.label} — {ACTIVE_TIER.discount}% off)</span></span></div>
+                      <div className="flex justify-between"><span className="text-gray-400">Price</span><span>${(presaleCfg?.price_usd ?? PRESALE_TIER_LADDER[0].price).toFixed(2)} / EGOC <span className="text-green-400 text-xs">({presaleCfg?.tier_label ?? PRESALE_TIER_LADDER[0].label} — {(presaleCfg?.discount_pct ?? PRESALE_FALLBACK_DISCOUNT)}% off)</span></span></div>
                       <div className="flex justify-between"><span className="text-gray-400">Status</span><span className={presalePayMethod === 'card' ? 'text-green-400 font-semibold' : 'text-yellow-400 font-semibold'}>{presalePayMethod === 'card' ? 'Paid' : 'Pending'}</span></div>
                     </div>
                     <div className="grid grid-cols-2 gap-2">

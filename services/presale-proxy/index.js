@@ -9,7 +9,23 @@ const qs    = require('querystring');
 const STRIPE_KEY     = process.env.STRIPE_SECRET_KEY || '';
 const CHANGENOW_KEY  = process.env.CHANGENOW_API_KEY || '';
 const PORT           = parseInt(process.env.PORT || '3031', 10);
-const EGOC_PRICE_USD = parseFloat(process.env.EGOC_PRICE_USD || '2.00');
+// SINGLE SOURCE OF TRUTH for the pre-sale price.
+//
+// This value alone decides both what the app quotes to a buyer and what the
+// IOU is written for. They used to be separate numbers in separate places and
+// drifted apart — the app advertised $0.50/EGOC while allocations were
+// computed at $2.00, so buyers received a quarter of what they were shown.
+// Nothing may hardcode a price again: the app reads it from /presale/config.
+const EGOC_PRICE_USD = parseFloat(process.env.EGOC_PRICE_USD || '0.50');
+
+// Advancing a tier is a restart of this service, not an app release.
+const PRESALE_TIER_INDEX = parseInt(process.env.PRESALE_TIER_INDEX || '0', 10);
+const PRESALE_LAUNCH_USD = parseFloat(process.env.PRESALE_LAUNCH_USD || '2.00');
+const PRESALE_TIERS = [
+  { label: 'Early Bird', price: 0.50, cap: 20_000_000 },
+  { label: 'Pre-Sale A', price: 1.00, cap: 50_000_000 },
+  { label: 'Pre-Sale B', price: 1.50, cap: 100_000_000 },
+];
 // These must match the routes the website actually serves — /success and
 // /cancel in src/App.js. A URL with no matching route renders a blank SPA
 // shell, which looks exactly like a broken payment to the buyer.
@@ -326,6 +342,30 @@ const server = http.createServer(async (req, res) => {
         status:       session.payment_status,
         amount_total: session.amount_total,
         egoc_amount,
+      }));
+      return;
+    }
+
+    // GET /presale/config — the price the app must quote and allocate at.
+    // Served from the same constant /presale/checkout prices against, so the
+    // two cannot disagree.
+    if (req.method === 'GET' && url === '/presale/config') {
+      const idx  = Math.min(Math.max(PRESALE_TIER_INDEX, 0), PRESALE_TIERS.length - 1);
+      const tier = PRESALE_TIERS[idx];
+      // The env price wins over the tier table — the checkout endpoint uses it,
+      // so reporting anything else here would recreate the mismatch.
+      const price = EGOC_PRICE_USD;
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        price_usd:    price,
+        launch_usd:   PRESALE_LAUNCH_USD,
+        discount_pct: PRESALE_LAUNCH_USD > 0
+          ? Math.round((1 - price / PRESALE_LAUNCH_USD) * 100)
+          : 0,
+        tier_label:   tier.label,
+        tier_index:   idx,
+        tier_count:   PRESALE_TIERS.length,
+        tiers:        PRESALE_TIERS,
       }));
       return;
     }
