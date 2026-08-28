@@ -2863,7 +2863,7 @@ const WalletPage: React.FC = () => {
                   </div>
                   <div className="border-t border-gray-700/50" />
                   <div className="flex justify-between text-xs">
-                    <div><span className="text-gray-500">Signature</span> <span className="text-gray-300">Ed25519 + Dilithium-3</span></div>
+                    <div><span className="text-gray-500">Signature</span> <span className="text-gray-300">Ed25519 + Dilithium-2</span></div>
                     <div><span className="text-gray-500">Network</span> <span className="text-blue-300">Testnet (chain_id=1)</span></div>
                   </div>
                 </div>
@@ -2999,7 +2999,7 @@ const WalletPage: React.FC = () => {
                     </div>
                     <div className="flex justify-between">
                       <span className="text-gray-400">Signature</span>
-                      <span className="text-gray-300">Ed25519 + Dilithium-3</span>
+                      <span className="text-gray-300">Ed25519 + Dilithium-2</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-gray-400">Network</span>
