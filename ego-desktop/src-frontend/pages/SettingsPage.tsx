@@ -376,7 +376,7 @@ const SettingsPage: React.FC = () => {
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="px-5 py-4 border-b border-gray-700">
           <h3 className="font-semibold">Security & Keys</h3>
-          <div className="text-xs text-gray-400 mt-0.5">Quantum-safe cryptography — Dilithium-3 + Ed25519 + Kyber ML-KEM-768</div>
+          <div className="text-xs text-gray-400 mt-0.5">Quantum-safe cryptography — Dilithium-2 + Ed25519 + Kyber ML-KEM-768</div>
         </div>
 
         {}
@@ -467,7 +467,7 @@ const SettingsPage: React.FC = () => {
             { label: 'Version', val: 'v0.3.34' },
             { label: 'Network', val: 'Ego Network' },
             { label: 'Node ID', val: wallet?.address ? wallet.address.slice(0, 26) + '…' : '—' },
-            { label: 'Crypto',  val: 'Dilithium-3 + Ed25519 + Kyber + AES-256-GCM' },
+            { label: 'Crypto',  val: 'Dilithium-2 + Ed25519 + Kyber + AES-256-GCM' },
           ].map(row => (
             <div key={row.label} className="flex justify-between">
               <span className="text-gray-400">{row.label}</span>
