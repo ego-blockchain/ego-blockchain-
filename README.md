@@ -2,6 +2,10 @@
 
 A post-quantum Layer-1 blockchain that pays node operators for contributing real infrastructure — storage, wireless coverage, retrieval and compute — rather than for burning electricity on proof-of-work.
 
+<p align="center">
+  <img src="assets/ego.gif" alt="Sending EGOC in Ego Desktop, showing the shielded-transaction toggle and an Ed25519 + Dilithium-2 signature" width="800">
+</p>
+
 > **Status: public testnet.** The chain is live and producing blocks, but EGOC has no mainnet and is not tradeable. Mainnet launch follows an independent security audit. Testnet addresses use the `egot` prefix (`chain_id = 1`).
 
 ## What it does
