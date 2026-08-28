@@ -16,6 +16,12 @@ pub const ECOSYSTEM_EGOC: u64 = 200_000_000;
 
 pub const FOUNDATION_EGOC: u64 = 150_000_000;
 
+pub const CHAIN_ID: u8 = 1;
+
+pub const FAUCET_EGOC: u64 = 10_000_000;
+
+pub fn is_testnet() -> bool { CHAIN_ID == 1 }
+
 // Block reward halving — designed for a 120-year emission schedule.
 //
 // At 0.1 s/block there are 315,360,000 blocks/year.

@@ -172,13 +172,15 @@ pub fn get_db() -> DbWrapper {
                 if let Some(cf_balances) = db.cf_handle(CF_BALANCES) {
                     let faucet_addr = get_faucet_address();
                     use crate::tokenomics::*;
-                    let allocs = vec![
+                    let mut allocs = vec![
                         (ECOSYSTEM_ADDR.to_string(),    ECOSYSTEM_EGOC  * UEGOC_PER_EGOC),
                         (FOUNDATION_ADDR.to_string(),   FOUNDATION_EGOC * UEGOC_PER_EGOC),
                         (NODE_POOL_ADDR.to_string(),    NODE_POOL_UEGOC),
                         (STAKING_POOL_ADDR.to_string(), STAKING_POOL_UEGOC),
-                        (faucet_addr,                   10_000_000 * UEGOC_PER_EGOC),
                     ];
+                    if is_testnet() {
+                        allocs.push((faucet_addr, FAUCET_EGOC * UEGOC_PER_EGOC));
+                    }
                     for (addr, amount) in allocs {
                         let cur = db.get_cf(cf_balances, addr.as_bytes())
                             .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
@@ -654,13 +656,15 @@ fn seed_genesis(db: &DB) {
     let mut batch = WriteBatch::default();
 
     let faucet_addr = get_faucet_address();
-    let allocs = vec![
+    let mut allocs = vec![
         (ECOSYSTEM_ADDR.to_string(),    ECOSYSTEM_EGOC  * UEGOC_PER_EGOC),
         (FOUNDATION_ADDR.to_string(),   FOUNDATION_EGOC * UEGOC_PER_EGOC),
         (NODE_POOL_ADDR.to_string(),    NODE_POOL_UEGOC),
         (STAKING_POOL_ADDR.to_string(), STAKING_POOL_UEGOC),
-        (faucet_addr,                   10_000_000 * UEGOC_PER_EGOC),
     ];
+    if is_testnet() {
+        allocs.push((faucet_addr, FAUCET_EGOC * UEGOC_PER_EGOC));
+    }
     for (addr, amount) in allocs {
         batch.put_cf(cf_balances, addr.as_bytes(), u64_le(amount));
     }
@@ -687,8 +691,9 @@ fn seed_genesis(db: &DB) {
     };
     write_block_batch(db, &genesis, &[]);
 
-    tracing::info!("Seeded supply pools: ecosystem={} EGOC, foundation={} EGOC, node_pool={} EGOC, staking_pool={} EGOC, faucet=10M EGOC",
-        ECOSYSTEM_EGOC, FOUNDATION_EGOC, NODE_POOL_EGOC, STAKING_POOL_EGOC);
+    tracing::info!("Seeded supply pools: ecosystem={} EGOC, foundation={} EGOC, node_pool={} EGOC, staking_pool={} EGOC, faucet={}",
+        ECOSYSTEM_EGOC, FOUNDATION_EGOC, NODE_POOL_EGOC, STAKING_POOL_EGOC,
+        if is_testnet() { format!("{} EGOC (testnet only)", FAUCET_EGOC) } else { "none (mainnet)".to_string() });
 }
 
 fn migrate_from_sqlite(db: &DB, path: &std::path::Path) -> bool {
