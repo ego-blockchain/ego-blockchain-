@@ -11,7 +11,7 @@ A quantum-safe blockchain desktop application — wallet, encrypted file sharing
 ### Quantum-Safe Wallet
 - Ed25519 + Dilithium-2 (post-quantum) keypair generation
 - Kyber-768 key encapsulation for secure key exchange
-- Send and receive EGOC with feeless transactions and memo support
+- Send and receive EGOC with memo support; fees are priced in USD via oracle and burned
 - Transaction history with full block explorer integration
 - Bech32 address format (`egot1...`) with QR code display
 - 24-word recovery phrase backed by BIP39 wordlist
@@ -33,6 +33,27 @@ A quantum-safe blockchain desktop application — wallet, encrypted file sharing
 - Works across different networks, NATs, and firewalls
 - Contact pairing via copy-paste bundle (`egocontact1:...`) — no central server required
 - Messages encrypted with AES-256-GCM per contact pair
+
+### Storage
+- Allocate disk space and earn 0.5 EGOC per GB per day
+- Files are split, encrypted and distributed — an operator never holds a complete file
+- Replication and per-period escrow with a grace window for offline replicas
+
+### Coverage
+- Prove real wireless signal at your location and earn 8 EGOC per day
+- H3 geohashing with a live coverage map
+
+### Compute
+- Rent out CPU and GPU capacity; each reservation runs isolated in its own Docker container
+- Jobs without Docker isolation are labelled "Shared Host"
+
+### Contracts & dApp IDE
+- Write, compile and deploy Urego smart contracts without leaving the app
+- Monaco editor with contract templates
+- Deployed-contract browser with call and query interfaces
+
+### Market
+- Browse and trade storage, compute and bandwidth capacity offered by other nodes
 
 ### Block Explorer
 - Browse real blocks, transactions, and file events from the local ledger
@@ -57,7 +78,7 @@ A quantum-safe blockchain desktop application — wallet, encrypted file sharing
 
 ## P2P Network
 
-Every Ego Desktop installation gets a unique **Peer ID** — a cryptographic identity (Ed25519 keypair) stored locally at `%LOCALAPPDATA%/EgoDesktop/p2p_identity.bin`.
+Every Ego Desktop installation gets a unique **Peer ID** — a cryptographic identity (Ed25519 keypair) stored locally at `%APPDATA%/EgoDesktop/p2p_identity.bin` (Roaming, not Local; override the whole data directory with `EGO_DATA_DIR`).
 
 The app uses **[libp2p](https://libp2p.io/)** (Rust) with three connectivity layers:
 
@@ -89,7 +110,7 @@ Installers are attached to each [GitHub Release](../../releases).
 
 ## Build from Source
 
-**Prerequisites**: Rust (stable), Node.js 18+
+**Prerequisites**: Rust 1.85+ (the workspace uses edition 2024), Node.js 20+
 
 ```bash
 git clone https://github.com/ego-blockchain/ego-blockchain-
