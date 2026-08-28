@@ -11766,12 +11766,15 @@ pub async fn run_view_change_monitor() {
         {
             let vs = eligible_validators_sorted();
             if !vs.is_empty() {
-                let idx = (chain_next as usize).wrapping_rem(vs.len());
+                let round = current_view().saturating_sub(chain_next);
+                let idx = (chain_next as usize)
+                    .wrapping_add(round as usize)
+                    .wrapping_rem(vs.len());
                 let leader = vs.get(idx).cloned().unwrap_or_default();
                 let vs_short: Vec<String> = vs.iter().map(|a| a.chars().take(14).collect()).collect();
                 eprintln!(
-                    "[LeaderDbg] height={} vs(len={})=[{}] idx={} leader={} me={} i_am_leader={}",
-                    chain_next, vs.len(), vs_short.join(", "), idx,
+                    "[LeaderDbg] height={} round={} vs(len={})=[{}] idx={} leader={} me={} i_am_leader={}",
+                    chain_next, round, vs.len(), vs_short.join(", "), idx,
                     leader.chars().take(14).collect::<String>(),
                     my_addr.chars().take(14).collect::<String>(),
                     leader == my_addr,
