@@ -117,8 +117,9 @@ A 10,000,000 EGOC faucet is minted **on testnet only** and is excluded from main
 
 ## Documentation
 
+- Website - <https://egoblockchain.com>
 - Protocol documentation — <https://egoblockchain.com/docs>
-- Block explorer — <https://egoblockchain.com/explorer>
+- Block explorer — <https://egoblockchain.com/egoscan>
 - Desktop downloads — <https://egoblockchain.com/download>
 
 ## Contributing
