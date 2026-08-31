@@ -99,6 +99,7 @@ keyring = "2"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["dpapi", "wincrypt", "winbase", "dwmapi", "windef"] }
+winreg = "0.52"
 
 
 [features]
