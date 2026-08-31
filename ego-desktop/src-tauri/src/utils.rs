@@ -44,6 +44,17 @@ mod windows_dpapi {
     use winapi::um::dpapi::{CryptProtectData, CryptUnprotectData};
     use winapi::um::wincrypt::DATA_BLOB;
     use winapi::um::winbase::LocalFree;
+    use winapi::um::errhandlingapi::GetLastError;
+
+    pub fn describe(code: u32) -> String {
+        match code {
+            0x8009_000B => "the Windows credential that encrypted it is no longer usable                             (NTE_BAD_KEY_STATE). This normally means the Windows password was                             reset rather than changed, which permanently invalidates the old                             encryption key".to_string(),
+            0x8009_0005 => "the stored data failed its integrity check (NTE_BAD_DATA), so the                             file is damaged".to_string(),
+            0x8007_000D => "the stored data is not a valid Windows-encrypted blob".to_string(),
+            0x8009_0016 => "no encryption key exists for this Windows account (NTE_BAD_KEYSET)".to_string(),
+            other => format!("Windows could not decrypt it (DPAPI error 0x{other:08X})"),
+        }
+    }
 
     pub fn protect(data: &[u8]) -> Result<Vec<u8>, ()> {
         unsafe {
@@ -72,7 +83,7 @@ mod windows_dpapi {
         }
     }
 
-    pub fn unprotect(data: &[u8]) -> Result<Vec<u8>, ()> {
+    pub fn unprotect(data: &[u8]) -> Result<Vec<u8>, u32> {
         unsafe {
             let mut input = DATA_BLOB {
                 cbData: data.len() as u32,
@@ -88,7 +99,7 @@ mod windows_dpapi {
                 0,
                 &mut output,
             );
-            if ok == 0 { return Err(()); }
+            if ok == 0 { return Err(GetLastError()); }
             let result = if !output.pbData.is_null() && output.cbData > 0 {
                 std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec()
             } else {
@@ -97,6 +108,21 @@ mod windows_dpapi {
             LocalFree(output.pbData as *mut _);
             Ok(result)
         }
+    }
+}
+
+pub fn os_unprotect_checked(data: &[u8]) -> Result<Vec<u8>, String> {
+    #[cfg(windows)]
+    {
+        windows_dpapi::unprotect(data).map_err(windows_dpapi::describe)
+    }
+    #[cfg(not(windows))]
+    {
+        let out = os_unprotect(data);
+        if out.is_empty() {
+            return Err("the OS keyring returned no data".to_string());
+        }
+        Ok(out)
     }
 }
 
