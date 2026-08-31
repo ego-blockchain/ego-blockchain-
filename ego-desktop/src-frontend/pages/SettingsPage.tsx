@@ -36,7 +36,8 @@ const SettingsPage: React.FC = () => {
   const avatarInputRef                        = useRef<HTMLInputElement>(null);
 
   const [notifications, setNotifications]     = useState(true);
-  const [autoStart, setAutoStart]             = useState(true);
+  const [autoStart, setAutoStart]             = useState(false);
+  const [autoStartBusy, setAutoStartBusy]     = useState(false);
   const [minimizeToTray, setMinimizeToTray]   = useState(true);
   const [saved, setSaved]                     = useState(false);
 
@@ -69,6 +70,27 @@ const SettingsPage: React.FC = () => {
   const [backupError, setBackupError]         = useState('');
 
   const addressQR = useMemo(() => makeQR(wallet?.address ?? ''), [wallet?.address]);
+
+  useEffect(() => {
+    invoke<boolean>('get_autostart_enabled')
+      .then(setAutoStart)
+      .catch(() => setAutoStart(false));
+  }, []);
+
+  const handleAutoStart = async (next: boolean) => {
+    if (autoStartBusy) return;
+    setAutoStartBusy(true);
+    const previous = autoStart;
+    setAutoStart(next);
+    try {
+      const applied = await invoke<boolean>('set_autostart_enabled', { enabled: next });
+      setAutoStart(applied);
+    } catch {
+      setAutoStart(previous);
+    } finally {
+      setAutoStartBusy(false);
+    }
+  };
 
   useEffect(() => {
     console.log('[Settings] wallet address:', wallet?.address);
@@ -357,7 +379,7 @@ const SettingsPage: React.FC = () => {
         <div className="px-5 py-4 border-b border-gray-700"><h3 className="font-semibold">General</h3></div>
         <div className="divide-y divide-gray-700/50">
           {[
-            { label: 'Auto-start on login',  desc: 'Launch Ego Wallet on system startup', val: autoStart,       set: setAutoStart      },
+            { label: 'Auto-start on login',  desc: 'Start Ego Desktop hidden in the tray at login', val: autoStart,       set: handleAutoStart   },
             { label: 'Minimize to tray',      desc: 'Keep running in system tray on close', val: minimizeToTray, set: setMinimizeToTray },
             { label: 'Notifications',         desc: 'Earnings, file transfers, alerts',     val: notifications,  set: setNotifications  },
           ].map(row => (

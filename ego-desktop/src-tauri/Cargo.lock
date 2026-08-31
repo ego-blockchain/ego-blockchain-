@@ -2338,6 +2338,7 @@ dependencies = [
  "urego-compiler",
  "uuid",
  "winapi",
+ "winreg 0.52.0",
  "x25519-dalek",
  "zeroize",
 ]

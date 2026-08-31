@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod autostart;
 mod bft_committee;
 mod bls_agg;
 mod blocks;
@@ -736,6 +737,8 @@ fn main() {
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
+            autostart::get_autostart_enabled,
+            autostart::set_autostart_enabled,
             commands::auth::init_wallet,
             commands::auth::generate_keypair,
             commands::auth::import_keypair,
@@ -1024,10 +1027,13 @@ fn main() {
                 }
             }
 
+            let start_hidden = crate::autostart::launched_hidden();
             app.listen_global("frontend-ready", move |_| {
                 let _ = window.emit("ego://app-locked", ());
-                window.show().unwrap();
-                window.set_focus().unwrap();
+                if !start_hidden {
+                    window.show().unwrap();
+                    window.set_focus().unwrap();
+                }
             });
 
             // When another launch connects to our lock port, bring the window to front.
