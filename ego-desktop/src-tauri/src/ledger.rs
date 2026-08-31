@@ -241,12 +241,29 @@ pub fn load_seed() -> Result<Option<Vec<u8>>, String> {
     #[cfg(windows)]
     {
     let raw = fs::read(&path).map_err(|e| format!("Failed to read seed file: {}", e))?;
-    let bytes = crate::utils::os_unprotect(&raw);
-    if bytes.is_empty() {
-        return Err("DPAPI decryption failed".into());
-    }
+    let bytes = match crate::utils::os_unprotect_checked(&raw) {
+        Ok(b) => b,
+        Err(reason) => {
+            let kept = path.with_extension("seed.unreadable");
+            let _ = fs::rename(&path, &kept);
+            return Err(format!(
+                "Your wallet seed could not be decrypted because {reason}.
+
+                 The encrypted file has been kept at:
+{}
+
+                 To restore this wallet, re-import your 24-word recovery phrase.                  The phrase does not depend on Windows and will rebuild the same address.",
+                kept.display()
+            ));
+        }
+    };
     if bytes.len() != 32 {
-        return Err("Decrypted seed has invalid length".into());
+        return Err(format!(
+            "Your wallet seed decrypted successfully but is {} bytes instead of 32,              which means the file is damaged.
+
+             To restore this wallet, re-import your 24-word recovery phrase.",
+            bytes.len()
+        ));
     }
     Ok(Some(bytes))
     }
