@@ -16,15 +16,14 @@ const PORT           = parseInt(process.env.PORT || '3031', 10);
 // drifted apart — the app advertised $0.50/EGOC while allocations were
 // computed at $2.00, so buyers received a quarter of what they were shown.
 // Nothing may hardcode a price again: the app reads it from /presale/config.
-const EGOC_PRICE_USD = parseFloat(process.env.EGOC_PRICE_USD || '0.50');
+const EGOC_PRICE_USD = parseFloat(process.env.EGOC_PRICE_USD || '0.008');
 
 // Advancing a tier is a restart of this service, not an app release.
 const PRESALE_TIER_INDEX = parseInt(process.env.PRESALE_TIER_INDEX || '0', 10);
-const PRESALE_LAUNCH_USD = parseFloat(process.env.PRESALE_LAUNCH_USD || '2.00');
+const PRESALE_LAUNCH_USD = parseFloat(process.env.PRESALE_LAUNCH_USD || '0.02');
 const PRESALE_TIERS = [
-  { label: 'Early Bird', price: 0.50, cap: 20_000_000 },
-  { label: 'Pre-Sale A', price: 1.00, cap: 50_000_000 },
-  { label: 'Pre-Sale B', price: 1.50, cap: 100_000_000 },
+  { label: 'Seed',    price: 0.008, cap: 40_000_000 },
+  { label: 'Private', price: 0.012, cap: 40_000_000 },
 ];
 // These must match the routes the website actually serves — /success and
 // /cancel in src/App.js. A URL with no matching route renders a blank SPA
