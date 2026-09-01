@@ -191,6 +191,9 @@ interface PresaleConfig {
 // it is never used to price a purchase — the live price comes from the server
 // and overrides these for display the moment it loads. Without this the panel
 // renders empty whenever the price service is unreachable.
+const fmtPrice = (v: number): string =>
+  Number(v.toFixed(6)).toString();
+
 const PRESALE_TIER_LADDER = [
   { label: 'Seed',    price: 0.008, cap: 40_000_000 },
   { label: 'Private', price: 0.012, cap: 40_000_000 },
@@ -1685,7 +1688,7 @@ const WalletPage: React.FC = () => {
                       tier price greyed out, clearly marked as unconfirmed —
                       never as a figure anyone can buy against. */}
                   <div className={`text-xl font-black ${presaleCfg ? 'text-green-400' : 'text-gray-500'}`}>
-                    ${(presaleCfg?.price_usd ?? PRESALE_TIER_LADDER[0].price).toFixed(2)}
+                    ${fmtPrice(presaleCfg?.price_usd ?? PRESALE_TIER_LADDER[0].price)}
                     <span className="text-xs font-normal text-gray-400 ml-1">/ EGOC</span>
                   </div>
                   {!presaleCfg && (
@@ -1693,14 +1696,14 @@ const WalletPage: React.FC = () => {
                       {presaleCfgErr ? 'price unconfirmed — buying paused' : 'confirming price…'}
                     </div>
                   )}
-                  <div className="text-[10px] text-green-400 font-bold">↓{(presaleCfg?.discount_pct ?? PRESALE_FALLBACK_DISCOUNT)}% off launch (${(presaleCfg?.launch_usd ?? PRESALE_LAUNCH_USD).toFixed(2)})</div>
+                  <div className="text-[10px] text-green-400 font-bold">↓{(presaleCfg?.discount_pct ?? PRESALE_FALLBACK_DISCOUNT)}% off launch (${fmtPrice(presaleCfg?.launch_usd ?? PRESALE_LAUNCH_USD)})</div>
                 </div>
                 <div className="hidden sm:flex flex-col gap-0.5">
                   {(presaleCfg?.tiers ?? PRESALE_TIER_LADDER).map((t, i) => (
                     <div key={t.label} className={`flex items-center gap-1.5 text-[10px] rounded px-1.5 py-0.5 ${i === (presaleCfg?.tier_index ?? 0) ? 'bg-green-500/20 text-green-300 font-bold' : i < (presaleCfg?.tier_index ?? 0) ? 'text-gray-600 line-through' : 'text-gray-500'}`}>
                       <span>{i === (presaleCfg?.tier_index ?? 0) ? '▶' : i < (presaleCfg?.tier_index ?? 0) ? '✓' : '○'}</span>
                       <span>{t.label}</span>
-                      <span className="font-semibold">${t.price.toFixed(2)}</span>
+                      <span className="font-semibold">${fmtPrice(t.price)}</span>
                       <span className="text-[9px] opacity-70">({(t.cap / 1_000_000).toFixed(0)}M)</span>
                     </div>
                   ))}
@@ -1848,7 +1851,7 @@ const WalletPage: React.FC = () => {
                               until the current price can be confirmed.
                             </div>
                           ) : (
-                            <div className="text-xs text-gray-500">Minimum $10 · ${(presaleCfg?.price_usd ?? PRESALE_TIER_LADDER[0].price).toFixed(2)} / EGOC · {(presaleCfg?.discount_pct ?? PRESALE_FALLBACK_DISCOUNT)}% off launch</div>
+                            <div className="text-xs text-gray-500">Minimum $10 · ${fmtPrice(presaleCfg?.price_usd ?? PRESALE_TIER_LADDER[0].price)} / EGOC · {(presaleCfg?.discount_pct ?? PRESALE_FALLBACK_DISCOUNT)}% off launch</div>
                           )}
                         </div>
 
@@ -2127,7 +2130,7 @@ const WalletPage: React.FC = () => {
                       {presalePayMethod === 'card'
                         ? <div className="flex justify-between"><span className="text-gray-400">Paid with</span><span>Card / Apple Pay (${presaleCardUsd} USD)</span></div>
                         : <div className="flex justify-between"><span className="text-gray-400">Paid with</span><span>{presalePayAmount} {presalePayAsset.symbol}</span></div>}
-                      <div className="flex justify-between"><span className="text-gray-400">Price</span><span>${(presaleCfg?.price_usd ?? PRESALE_TIER_LADDER[0].price).toFixed(2)} / EGOC <span className="text-green-400 text-xs">({presaleCfg?.tier_label ?? PRESALE_TIER_LADDER[0].label} — {(presaleCfg?.discount_pct ?? PRESALE_FALLBACK_DISCOUNT)}% off)</span></span></div>
+                      <div className="flex justify-between"><span className="text-gray-400">Price</span><span>${fmtPrice(presaleCfg?.price_usd ?? PRESALE_TIER_LADDER[0].price)} / EGOC <span className="text-green-400 text-xs">({presaleCfg?.tier_label ?? PRESALE_TIER_LADDER[0].label} — {(presaleCfg?.discount_pct ?? PRESALE_FALLBACK_DISCOUNT)}% off)</span></span></div>
                       <div className="flex justify-between"><span className="text-gray-400">Status</span><span className={presalePayMethod === 'card' ? 'text-green-400 font-semibold' : 'text-yellow-400 font-semibold'}>{presalePayMethod === 'card' ? 'Paid' : 'Pending'}</span></div>
                     </div>
                     <div className="grid grid-cols-2 gap-2">
@@ -2742,7 +2745,7 @@ const WalletPage: React.FC = () => {
               {creditsBal && parseFloat(creditsAmt) > 0 && (
                 <div className="text-xs text-gray-400">
                   ≈ {(Math.floor(parseFloat(creditsAmt) * creditsBal.egoc_price_usd * 100) / 100).toFixed(2)} EGUSD
-                  at ${creditsBal.egoc_price_usd.toFixed(2)}/EGOC
+                  at ${fmtPrice(creditsBal.egoc_price_usd)}/EGOC
                 </div>
               )}
               {creditsMsg && (
