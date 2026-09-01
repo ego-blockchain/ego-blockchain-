@@ -1122,7 +1122,7 @@ const WalletPage: React.FC = () => {
               {isLiveMode ? '🟢 Mainnet' : '🟡 Testnet'}
             </button>
             <div className={`text-xs text-right ${isLiveMode ? 'text-gray-500' : 'text-blue-300'}`}>
-              {isLiveMode ? 'Coming soon' : 'Ego Chain · v0.3.34'}
+              {isLiveMode ? 'Coming soon' : 'Ego Chain · v0.3.35'}
             </div>
           </div>
         </div>
