@@ -2426,17 +2426,17 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
         stamped.push(coinbase);
     }
 
-    let staking_fee = crate::tokenomics::staking_fee_share(tx_fees_sum);
-    if staking_fee > 0 {
+    let contributor_fee = crate::tokenomics::contributor_fee_share(tx_fees_sum);
+    if contributor_fee > 0 {
         let sf_hash = format!("0x{}", blake3::hash(
-            format!("stakingfee:{height}:{staking_fee}:{timestamp}").as_bytes()
+            format!("contributorfee:{height}:{contributor_fee}:{timestamp}").as_bytes()
         ).to_hex());
         stamped.push(LedgerTx {
             hash:         sf_hash,
-            from:         NODE_POOL_ADDR.to_string(),
-            to:           STAKING_POOL_ADDR.to_string(),
-            amount:       staking_fee,
-            memo:         Some(format!("Block #{height} staking fee share")),
+            from:         String::new(),
+            to:           NODE_POOL_ADDR.to_string(),
+            amount:       contributor_fee,
+            memo:         Some(format!("Block #{height} contributor fee share")),
             timestamp,
             status:       "Confirmed".to_string(),
             block_height: Some(height),
@@ -2708,17 +2708,17 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         stamped.push(coinbase);
     }
 
-    let staking_fee = crate::tokenomics::staking_fee_share(tx_fees_sum);
-    if staking_fee > 0 {
+    let contributor_fee = crate::tokenomics::contributor_fee_share(tx_fees_sum);
+    if contributor_fee > 0 {
         let sf_hash = format!("0x{}", blake3::hash(
-            format!("stakingfee:{height}:{staking_fee}:{timestamp}").as_bytes()
+            format!("contributorfee:{height}:{contributor_fee}:{timestamp}").as_bytes()
         ).to_hex());
         stamped.push(LedgerTx {
             hash:         sf_hash,
-            from:         NODE_POOL_ADDR.to_string(),
-            to:           STAKING_POOL_ADDR.to_string(),
-            amount:       staking_fee,
-            memo:         Some(format!("Block #{height} staking fee share")),
+            from:         String::new(),
+            to:           NODE_POOL_ADDR.to_string(),
+            amount:       contributor_fee,
+            memo:         Some(format!("Block #{height} contributor fee share")),
             timestamp,
             status:       "Confirmed".to_string(),
             block_height: Some(height),
@@ -3001,7 +3001,7 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
         tx_fees_sum,
         &block.prev_hash,
     ).min(remaining);
-    let expected_staking_fee = crate::tokenomics::staking_fee_share(tx_fees_sum);
+    let expected_contributor_fee = crate::tokenomics::contributor_fee_share(tx_fees_sum);
 
     // Tolerate reward=0 from nodes that missed the genesis pool seeding.
     // v2: the reward is an upper bound (registry growth must not invalidate
@@ -3048,24 +3048,24 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
     let fee_txs: Vec<&LedgerTx> = sorted_txs.iter()
         .filter(|t| t.tx_type == "fee_distribution")
         .collect();
-    if expected_staking_fee > 0 {
+    if expected_contributor_fee > 0 {
         if fee_txs.len() != 1 {
-            return Err(format!("expected exactly one staking fee tx, got {}", fee_txs.len()));
+            return Err(format!("expected exactly one contributor fee tx, got {}", fee_txs.len()));
         }
         let sf = fee_txs[0];
         let expected_hash = format!("0x{}", blake3::hash(
-            format!("stakingfee:{}:{}:{}", block.height, expected_staking_fee, block.timestamp).as_bytes()
+            format!("contributorfee:{}:{}:{}", block.height, expected_contributor_fee, block.timestamp).as_bytes()
         ).to_hex());
-        if sf.from != NODE_POOL_ADDR
-            || sf.to != STAKING_POOL_ADDR
-            || sf.amount != expected_staking_fee
+        if !sf.from.is_empty()
+            || sf.to != NODE_POOL_ADDR
+            || sf.amount != expected_contributor_fee
             || sf.signature != "coinbase"
             || sf.hash != expected_hash
         {
-            return Err("invalid staking fee tx".to_string());
+            return Err("invalid contributor fee tx".to_string());
         }
     } else if !fee_txs.is_empty() {
-        return Err("unexpected staking fee tx".to_string());
+        return Err("unexpected contributor fee tx".to_string());
     }
 
     for tx in &sorted_txs {

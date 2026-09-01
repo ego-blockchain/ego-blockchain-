@@ -10191,7 +10191,7 @@ async fn handle_block_proposal(
     let expected_reward = crate::chain_db::expected_block_reward(
         block.height, block.timestamp, tx_fees_sum, &block.prev_hash,
     );
-    let expected_staking_fee = crate::tokenomics::staking_fee_share(tx_fees_sum);
+    let expected_contributor_fee = crate::tokenomics::contributor_fee_share(tx_fees_sum);
 
     if let Some(ref cb_hash) = block.coinbase_tx {
         match transactions.iter().find(|t| &t.hash == cb_hash) {
@@ -10219,23 +10219,23 @@ async fn handle_block_proposal(
         }
     }
 
-    if expected_staking_fee > 0 {
+    if expected_contributor_fee > 0 {
         let sf_tx = transactions.iter().find(|t| t.tx_type == "fee_distribution");
         match sf_tx {
-            Some(sf) if sf.amount == expected_staking_fee
-                     && sf.to == crate::chain_db::STAKING_POOL_ADDR => {}
+            Some(sf) if sf.amount == expected_contributor_fee
+                     && sf.to == crate::chain_db::NODE_POOL_ADDR => {}
             Some(sf) => {
                 eprintln!(
-                    "[BFT] Committee: rejected proposal #{} — invalid staking fee tx \
+                    "[BFT] Committee: rejected proposal #{} — invalid contributor fee tx \
                      (amount={} expected={}, to={})",
-                    block.height, sf.amount, expected_staking_fee, sf.to
+                    block.height, sf.amount, expected_contributor_fee, sf.to
                 );
                 return;
             }
             None => {
                 eprintln!(
-                    "[BFT] Committee: rejected proposal #{} — staking fee tx missing (expected {})",
-                    block.height, expected_staking_fee
+                    "[BFT] Committee: rejected proposal #{} — contributor fee tx missing (expected {})",
+                    block.height, expected_contributor_fee
                 );
                 return;
             }
