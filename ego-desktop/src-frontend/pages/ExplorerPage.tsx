@@ -100,11 +100,11 @@ interface Tokenomics {
   circulating_pct:            number;
   block_rewards_issued_uegoc: number;
   emission_pools: {
-    genesis:       EmissionPool;
+    node_rewards:  EmissionPool;
     block_rewards: EmissionPool;
-    storage:       EmissionPool;
-    coverage:      EmissionPool;
     ecosystem:     EmissionPool;
+    foundation:    EmissionPool;
+    staking:       EmissionPool;
   };
   halving: {
     era:                    number;
@@ -464,11 +464,11 @@ const ExplorerPage: React.FC = () => {
                 <div className="text-xs text-gray-400 mb-3 font-semibold uppercase tracking-wide">Emission Pools</div>
                 <div className="space-y-2">
                   {Object.entries({
-                    'Genesis Allocation': { ...tokenomics.emission_pools.genesis,       color: 'bg-purple-500' },
-                    'Block Rewards':      { ...tokenomics.emission_pools.block_rewards,  color: 'bg-blue-500'   },
-                    'Storage (PoST)':     { ...tokenomics.emission_pools.storage,        color: 'bg-green-500'  },
-                    'Coverage (PoC)':     { ...tokenomics.emission_pools.coverage,       color: 'bg-yellow-500' },
-                    'Ecosystem':          { ...tokenomics.emission_pools.ecosystem,      color: 'bg-orange-500' },
+                    'Node Rewards':    { ...tokenomics.emission_pools.node_rewards,  color: 'bg-green-500'  },
+                    'Block Emissions': { ...tokenomics.emission_pools.block_rewards, color: 'bg-blue-500'   },
+                    'Ecosystem':       { ...tokenomics.emission_pools.ecosystem,    color: 'bg-purple-500' },
+                    'Foundation':      { ...tokenomics.emission_pools.foundation,   color: 'bg-yellow-500' },
+                    'Staking Rewards': { ...tokenomics.emission_pools.staking,      color: 'bg-pink-500'   },
                   }).map(([name, pool]) => (
                     <div key={name} className="flex items-center gap-3">
                       <div className="w-32 text-xs text-gray-400 shrink-0">{name}</div>
