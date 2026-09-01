@@ -191,6 +191,9 @@ interface PresaleConfig {
 // it is never used to price a purchase — the live price comes from the server
 // and overrides these for display the moment it loads. Without this the panel
 // renders empty whenever the price service is unreachable.
+const isPresalePaid = (status: string): boolean =>
+  ['paid', 'confirmed', 'completed'].includes((status || '').toLowerCase());
+
 const fmtPrice = (v: number): string =>
   Number(v.toFixed(6)).toString();
 
@@ -1645,12 +1648,12 @@ const WalletPage: React.FC = () => {
                   </div>
                   <div className="shrink-0 text-right">
                     <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold ${
-                      r.status === 'confirmed'
+                      isPresalePaid(r.status)
                         ? 'bg-green-500/15 text-green-400'
                         : 'bg-yellow-500/15 text-yellow-400'
                     }`}>
-                      <span className={`w-1.5 h-1.5 rounded-full ${r.status === 'confirmed' ? 'bg-green-400' : 'bg-yellow-400'}`}></span>
-                      {r.status === 'confirmed' ? 'Confirmed' : 'Pending'}
+                      <span className={`w-1.5 h-1.5 rounded-full ${isPresalePaid(r.status) ? 'bg-green-400' : 'bg-yellow-400'}`}></span>
+                      {isPresalePaid(r.status) ? 'Paid' : 'Awaiting payment'}
                     </span>
                     <div className="text-xs text-gray-600 mt-1">
                       {new Date(r.timestamp * 1000).toLocaleDateString()}
