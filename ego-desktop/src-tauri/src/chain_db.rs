@@ -4042,14 +4042,19 @@ fn circulating_supply_inner(db: &DB) -> u64 {
         Some(c) => c,
         None => return 0,
     };
-    let node_pool = db.get_cf(cf_bal, NODE_POOL_ADDR.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-    let ecosystem = db.get_cf(cf_bal, ECOSYSTEM_ADDR.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-    let foundation = db.get_cf(cf_bal, FOUNDATION_ADDR.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
-    
+    let read = |addr: &str| db.get_cf(cf_bal, addr.as_bytes())
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+
+    let node_pool    = read(NODE_POOL_ADDR);
+    let ecosystem    = read(ECOSYSTEM_ADDR);
+    let foundation   = read(FOUNDATION_ADDR);
+    let staking_pool = read(STAKING_POOL_ADDR);
+
     crate::tokenomics::TOTAL_SUPPLY_UEGOC
         .saturating_sub(node_pool)
         .saturating_sub(ecosystem)
         .saturating_sub(foundation)
+        .saturating_sub(staking_pool)
 }
 
 pub fn get_total_circulating_supply() -> u64 {
