@@ -136,6 +136,20 @@ mod imp {
     }
 }
 
+pub fn ensure_enabled_once() {
+    let marker = crate::ledger::base_data_dir().join(".autostart_configured");
+    if marker.exists() {
+        return;
+    }
+    match imp::enable() {
+        Ok(()) => {
+            let _ = std::fs::write(&marker, b"1");
+            eprintln!("[Autostart] registered to launch at login (hidden)");
+        }
+        Err(e) => eprintln!("[Autostart] could not register: {e}"),
+    }
+}
+
 #[tauri::command]
 pub fn get_autostart_enabled() -> bool {
     imp::is_enabled()

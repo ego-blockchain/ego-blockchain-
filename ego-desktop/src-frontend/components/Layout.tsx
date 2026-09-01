@@ -348,13 +348,29 @@ const UpdateBanner: React.FC = () => {
   const [info, setInfo] = useState<UpdateInfo | null>(null);
 
   useEffect(() => {
-    invoke<UpdateInfo>('check_for_update')
-      .then(res => {
-        if (!res.update_available) return;
-        if (localStorage.getItem('ego-update-dismissed') === res.latest) return;
-        setInfo(res);
-      })
-      .catch(() => {});
+    let alive = true;
+
+    const check = () => {
+      invoke<UpdateInfo>('check_for_update')
+        .then(res => {
+          if (!alive) return;
+          if (!res.update_available) return;
+          if (localStorage.getItem('ego-update-dismissed') === res.latest) return;
+          setInfo(res);
+        })
+        .catch(() => {});
+    };
+
+    check();
+    const timer = setInterval(check, 6 * 60 * 60 * 1000);
+    const onWake = () => { if (document.visibilityState === 'visible') check(); };
+    document.addEventListener('visibilitychange', onWake);
+
+    return () => {
+      alive = false;
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onWake);
+    };
   }, []);
 
   if (!info) return null;
