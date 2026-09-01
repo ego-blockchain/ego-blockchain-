@@ -6,6 +6,7 @@ import { save as saveDialog, open as openDialog } from '@tauri-apps/api/dialog';
 import { writeBinaryFile, readBinaryFile } from '@tauri-apps/api/fs';
 import { useWallet } from '../App';
 import qrcode from 'qrcode-generator';
+import { useAppVersion, formatVersion } from '../lib/version';
 
 function makeQR(text: string): string {
   if (!text) return '';
@@ -25,6 +26,7 @@ interface RecoveryInfo {
 }
 
 const SettingsPage: React.FC = () => {
+  const appVersion = useAppVersion();
   const { wallet } = useWallet();
   const [displayName, setDisplayName]         = useState('');
   const [savedName, setSavedName]             = useState('');
@@ -486,7 +488,7 @@ const SettingsPage: React.FC = () => {
         <h3 className="font-semibold mb-4">About</h3>
         <div className="space-y-2 text-sm">
           {[
-            { label: 'Version', val: 'v0.3.36' },
+            { label: 'Version', val: formatVersion(appVersion) },
             { label: 'Network', val: 'Ego Network' },
             { label: 'Node ID', val: wallet?.address ? wallet.address.slice(0, 26) + '…' : '—' },
             { label: 'Crypto',  val: 'Dilithium-2 + Ed25519 + Kyber + AES-256-GCM' },

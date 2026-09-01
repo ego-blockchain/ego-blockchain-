@@ -5,6 +5,7 @@ import { listen } from '@tauri-apps/api/event';
 import { open as openUrl } from '@tauri-apps/api/shell';
 import { useWallet, useTheme } from '../App';
 import TitleBar from './TitleBar';
+import { useAppVersion, formatVersion } from '../lib/version';
 
 const NAV_ITEMS = [
   { path: '/wallet',    label: 'Wallet',    icon: '💰', desc: 'Send & receive' },
@@ -390,6 +391,7 @@ const UpdateBanner: React.FC = () => {
 };
 
 const Layout: React.FC = () => {
+  const appVersion = useAppVersion();
   const { theme, toggleTheme } = useTheme();
   const navigate = useNavigate();
   const [unreadCount, setUnreadCount] = useState(0);
@@ -423,7 +425,7 @@ const Layout: React.FC = () => {
             <img src="/ego_logo.png" alt="Ego" className="w-9 h-9 rounded-full object-cover" />
             <div>
               <div className="font-bold text-sm leading-tight">Ego Wallet</div>
-              <div className="text-xs text-gray-400">v0.3.36</div>
+              <div className="text-xs text-gray-400">{formatVersion(appVersion)}</div>
             </div>
           </div>
         </div>

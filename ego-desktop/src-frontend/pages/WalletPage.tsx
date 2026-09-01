@@ -8,6 +8,7 @@ import Pagination from '../components/Pagination';
 import { txDisplayAmount } from '../constants';
 
 import { RELAY_HTTP as RELAY, RPC_URL } from '../config';
+import { useAppVersion, formatVersion } from '../lib/version';
 
 function makeQR(text: string): string {
   if (!text) return '';
@@ -312,6 +313,7 @@ function isRewardTx(tx: LedgerTx): boolean {
 }
 
 const WalletPage: React.FC = () => {
+  const appVersion = useAppVersion();
   const { wallet, reload: reloadWallet } = useWallet();
   const myAddress = wallet?.address ?? '';
   const addressQR = useMemo(() => makeQR(myAddress), [myAddress]);
@@ -1122,7 +1124,7 @@ const WalletPage: React.FC = () => {
               {isLiveMode ? '🟢 Mainnet' : '🟡 Testnet'}
             </button>
             <div className={`text-xs text-right ${isLiveMode ? 'text-gray-500' : 'text-blue-300'}`}>
-              {isLiveMode ? 'Coming soon' : 'Ego Chain · v0.3.36'}
+              {isLiveMode ? 'Coming soon' : `Ego Chain · ${formatVersion(appVersion)}`}
             </div>
           </div>
         </div>
