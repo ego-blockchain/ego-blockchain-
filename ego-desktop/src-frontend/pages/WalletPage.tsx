@@ -192,11 +192,10 @@ interface PresaleConfig {
 // and overrides these for display the moment it loads. Without this the panel
 // renders empty whenever the price service is unreachable.
 const PRESALE_TIER_LADDER = [
-  { label: 'Early Bird', price: 0.50, cap: 20_000_000 },
-  { label: 'Pre-Sale A', price: 1.00, cap: 50_000_000 },
-  { label: 'Pre-Sale B', price: 1.50, cap: 100_000_000 },
+  { label: 'Seed',    price: 0.008, cap: 40_000_000 },
+  { label: 'Private', price: 0.012, cap: 40_000_000 },
 ];
-const PRESALE_LAUNCH_USD = 2.00;
+const PRESALE_LAUNCH_USD = 0.02;
 const PRESALE_FALLBACK_DISCOUNT = Math.round((1 - PRESALE_TIER_LADDER[0].price / PRESALE_LAUNCH_USD) * 100);
 
 const BRIDGE_DEPOSIT_ADDRS: Record<string, string> = {
