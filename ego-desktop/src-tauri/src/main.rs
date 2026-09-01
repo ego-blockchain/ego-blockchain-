@@ -985,6 +985,10 @@ fn main() {
             eprintln!("[Startup] setup() called — spawning background init threads");
 
             std::thread::spawn(|| {
+                crate::autostart::ensure_enabled_once();
+            });
+
+            std::thread::spawn(|| {
                 eprintln!("[Startup] RocksDB pre-warm thread started");
                 let _ = crate::chain_db::get_db();
                 eprintln!("[Startup] RocksDB pre-warm thread done");
