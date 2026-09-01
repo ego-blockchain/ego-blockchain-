@@ -334,11 +334,11 @@ pub async fn get_tokenomics() -> Result<serde_json::Value, EgoDesktopError> {
             "block_rewards_issued_uegoc": circulating_uegoc,
 
             "emission_pools": {
-                "genesis":       { "cap_uegoc": foundation_uegoc,  "pct": 15 },
+                "node_rewards":  { "cap_uegoc": node_pool_uegoc,   "pct": 30 },
                 "block_rewards": { "cap_uegoc": emission_uegoc,    "pct": 21 },
-                "storage":       { "cap_uegoc": node_pool_uegoc,   "pct": 30 },
-                "coverage":      { "cap_uegoc": staking_uegoc,     "pct": 14 },
                 "ecosystem":     { "cap_uegoc": ecosystem_uegoc,   "pct": 20 },
+                "foundation":    { "cap_uegoc": foundation_uegoc,  "pct": 15 },
+                "staking":       { "cap_uegoc": staking_uegoc,     "pct": 14 },
             },
 
             "pools": {
