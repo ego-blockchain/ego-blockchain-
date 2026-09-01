@@ -90,6 +90,44 @@ pub async fn check_for_update() -> Result<UpdateInfo, EgoDesktopError> {
     })
 }
 
+const NOTIFY_MARKER: &str = ".update_notified";
+const FIRST_CHECK_SECS: u64 = 90;
+const RECHECK_SECS: u64 = 6 * 60 * 60;
+
+fn already_notified(version: &str) -> bool {
+    let p = crate::ledger::base_data_dir().join(NOTIFY_MARKER);
+    std::fs::read_to_string(p).map(|v| v.trim() == version).unwrap_or(false)
+}
+
+fn remember_notified(version: &str) {
+    let p = crate::ledger::base_data_dir().join(NOTIFY_MARKER);
+    let _ = std::fs::write(p, version);
+}
+
+pub fn spawn_update_notifier(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(FIRST_CHECK_SECS)).await;
+        loop {
+            if let Ok(info) = check_for_update().await {
+                if info.update_available && !already_notified(&info.latest) {
+                    let body = if info.notes.is_empty() {
+                        format!("Version {} is ready to download.", info.latest)
+                    } else {
+                        info.notes.clone()
+                    };
+                    crate::commands::notifications::notify(
+                        &app,
+                        &format!("Ego Desktop {} available", info.latest),
+                        &body,
+                    );
+                    remember_notified(&info.latest);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(RECHECK_SECS)).await;
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

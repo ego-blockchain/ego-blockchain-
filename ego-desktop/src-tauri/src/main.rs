@@ -988,6 +988,8 @@ fn main() {
                 crate::autostart::ensure_enabled_once();
             });
 
+            crate::commands::updates::spawn_update_notifier(app.handle());
+
             std::thread::spawn(|| {
                 eprintln!("[Startup] RocksDB pre-warm thread started");
                 let _ = crate::chain_db::get_db();
