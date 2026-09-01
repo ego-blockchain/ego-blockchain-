@@ -50,11 +50,11 @@ pub fn block_reward_at(height: u64) -> u64 {
     (reward_f as u64).max(1)
 }
 
-pub const MINER_FEE_PCT:   u64 = 60;
-pub const STAKING_FEE_PCT: u64 = 40;
+pub const MINER_FEE_PCT:       u64 = 60;
+pub const CONTRIBUTOR_FEE_PCT: u64 = 40;
 
-pub fn miner_fee_share(tx_fees: u64)   -> u64 { tx_fees * MINER_FEE_PCT   / 100 }
-pub fn staking_fee_share(tx_fees: u64) -> u64 { tx_fees - miner_fee_share(tx_fees) }
+pub fn miner_fee_share(tx_fees: u64)       -> u64 { tx_fees * MINER_FEE_PCT / 100 }
+pub fn contributor_fee_share(tx_fees: u64) -> u64 { tx_fees - miner_fee_share(tx_fees) }
 
 pub fn compute_block_reward(height: u64, tx_fees_uegoc: u64, prev_hash: &str) -> u64 {
     let base = block_reward_at(height);
