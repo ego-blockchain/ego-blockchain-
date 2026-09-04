@@ -486,7 +486,7 @@ const SettingsPage: React.FC = () => {
           <div className="flex justify-between pt-1 border-t border-gray-700/50">
             <span className="text-gray-400">Discord</span>
             <button
-              onClick={() => openUrl('https://discord.gg/D2bEHUYz').catch(() => {})}
+              onClick={() => openUrl('https://discord.gg/FKAbxM4Enf').catch(() => {})}
               className="text-indigo-400 hover:text-indigo-300 text-xs transition"
             >
               Join our community ↗
