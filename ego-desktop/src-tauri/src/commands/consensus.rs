@@ -328,6 +328,7 @@ pub async fn get_tokenomics() -> Result<serde_json::Value, EgoDesktopError> {
         let ecosystem_uegoc = ECOSYSTEM_EGOC * UEGOC_PER_EGOC;
 
         Ok::<_, EgoDesktopError>(serde_json::json!({
+            "is_testnet":                 crate::tokenomics::is_testnet(),
             "total_supply_egoc":          TOTAL_SUPPLY_EGOC,
             "circulating_egoc":           circulating_egoc,
             "circulating_pct":            circulating_pct,

@@ -96,6 +96,7 @@ function sfTime(ts: number) {
 interface EmissionPool { cap_uegoc: number; pct: number; }
 interface Tokenomics {
   total_supply_egoc:          number;
+  is_testnet:                 boolean;
   circulating_egoc:           number;
   circulating_pct:            number;
   block_rewards_issued_uegoc: number;
@@ -446,11 +447,13 @@ const ExplorerPage: React.FC = () => {
           ) : (
             <div className="p-5 space-y-5">
               {}
-              <div className="grid grid-cols-3 gap-3">
+              <div className={`grid gap-3 ${tokenomics.is_testnet ? 'grid-cols-1' : 'grid-cols-3'}`}>
                 {[
                   { label: 'Total Supply',   val: `${tokenomics.total_supply_egoc.toLocaleString()} EGOC`, color: 'text-white' },
+                  ...(tokenomics.is_testnet ? [] : [
                   { label: 'Circulating',    val: `${tokenomics.circulating_egoc.toLocaleString(undefined,{maximumFractionDigits:0})} EGOC`, color: 'text-green-400' },
                   { label: 'Circulating %',  val: `${tokenomics.circulating_pct}%`, color: 'text-blue-400' },
+                  ]),
                 ].map(c => (
                   <div key={c.label} className="bg-gray-900 rounded-xl p-4 border border-gray-700/50">
                     <div className="text-xs text-gray-400 mb-1">{c.label}</div>

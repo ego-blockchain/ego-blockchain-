@@ -4050,11 +4050,25 @@ fn circulating_supply_inner(db: &DB) -> u64 {
     let foundation   = read(FOUNDATION_ADDR);
     let staking_pool = read(STAKING_POOL_ADDR);
 
-    crate::tokenomics::TOTAL_SUPPLY_UEGOC
+    // Testnet mints a faucet on top of the five pools. Whatever it still holds has
+    // not been handed to anyone, so it is no more circulating than an unspent pool
+    // balance. Coins the faucet has already paid out leave this balance and are
+    // counted, which is correct. On mainnet the faucet is never minted and this
+    // reads zero.
+    let base = crate::tokenomics::TOTAL_SUPPLY_UEGOC
+        .saturating_add(if crate::tokenomics::is_testnet() {
+            crate::tokenomics::FAUCET_EGOC * crate::tokenomics::UEGOC_PER_EGOC
+        } else {
+            0
+        });
+    let faucet = read(&get_faucet_address());
+
+    base
         .saturating_sub(node_pool)
         .saturating_sub(ecosystem)
         .saturating_sub(foundation)
         .saturating_sub(staking_pool)
+        .saturating_sub(faucet)
 }
 
 pub fn get_total_circulating_supply() -> u64 {
