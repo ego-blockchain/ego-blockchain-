@@ -128,4 +128,10 @@ Issues and pull requests are welcome. Consensus, cryptography and tokenomics cha
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Unless you state otherwise, any contribution you intentionally
+submit for inclusion shall be dual-licensed as above, with no additional terms.
