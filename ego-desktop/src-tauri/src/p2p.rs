@@ -260,6 +260,28 @@ pub fn https_port() -> u16 {
 }
 pub const P2P_PORT: u16 = 47393;
 
+/// Local mesh only: never reach for the internet.
+///
+/// A node on a cut-off or censored network has nothing to gain by dialling the
+/// public relay, the bootstrap anchor or the price oracle. Worse, on a censored
+/// connection those requests are what identify the machine as running Ego at
+/// all, before any transaction is sent. In this mode peers are found only by
+/// mDNS on the local network or named explicitly in EGO_DIRECT_PEERS, and a
+/// cluster of machines on one WiFi network forms a committee among themselves.
+pub fn offline_mode() -> bool {
+    static OFFLINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFFLINE.get_or_init(|| {
+        let on = matches!(
+            std::env::var("EGO_OFFLINE").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        );
+        if on {
+            eprintln!("[Offline] EGO_OFFLINE=1 — no relay, no bootstrap, no oracle. LAN peers only.");
+        }
+        on
+    })
+}
+
 pub const RELAY_NODES: &[&str] = &[
     "/dns4/rpc.egoblockchain.com/tcp/4001/p2p/12D3KooWJ2t1k3nhpsXKxa44eUsggQ9rAzELeVv34Eav8qA5t9y",
     "/dns4/egorelay.egoblockchain.com/tcp/4001/p2p/12D3KooWFFjZdk4nhpsXKxa44eUsggQ9rAzELeVv34Eav8qA5t9y",
@@ -286,6 +308,9 @@ fn shuffled_relay_nodes() -> Vec<&'static str> {
         .subsec_nanos()
         .hash(&mut hasher);
     std::process::id().hash(&mut hasher);
+    if offline_mode() {
+        return Vec::new();
+    }
     let seed = hasher.finish() as usize;
     let mut nodes: Vec<&'static str> = RELAY_NODES.to_vec();
     let n = nodes.len();
@@ -380,6 +405,9 @@ pub const RELAY_RPC: &str = "https://relay.egoblockchain.com:4002";
 
 
 async fn oracle_get(client: &reqwest::Client, path: &str) -> Option<reqwest::Response> {
+    if offline_mode() {
+        return None;
+    }
     for base in ORACLE_RPCS {
         match client.get(format!("{}{}", base, path)).send().await {
             Ok(r) if r.status().is_success() => return Some(r),
@@ -410,6 +438,9 @@ pub fn oracle_push_enabled() -> bool {
 }
 
 async fn oracle_post(client: &reqwest::Client, path: &str, body: &serde_json::Value) {
+    if offline_mode() {
+        return;
+    }
     let token = oracle_submit_token();
     for base in ORACLE_RPCS {
         let mut req = client.post(format!("{}{}", base, path)).json(body);
@@ -6886,9 +6917,11 @@ async fn handle_event(
                             .timeout(std::time::Duration::from_secs(5))
                             .build()
                             .unwrap_or_default();
-                        for oracle in ORACLE_RPCS {
-                            let url = format!("{}/hosting/announce", oracle);
-                            let _ = client.post(&url).json(&record).send().await;
+                        if !offline_mode() {
+                            for oracle in ORACLE_RPCS {
+                                let url = format!("{}/hosting/announce", oracle);
+                                let _ = client.post(&url).json(&record).send().await;
+                            }
                         }
                     });
                 }
@@ -9810,6 +9843,9 @@ async fn merge_remote_chain_inner(
 /// libp2p ignores a dial to an already-connected peer and self-rejects our own
 /// address, so it's safe to call on startup and on every discovery tick.
 pub async fn dial_bootstrap_peers() {
+    if offline_mode() {
+        return;
+    }
     let Some(tx) = SWARM_TX.get() else { return };
     let mut dialed = 0usize;
     for ep in BOOTSTRAP_PEERS {
@@ -12265,6 +12301,9 @@ pub async fn dht_find_cid(cid: &str) {
 }
 
 pub async fn fetch_peers_from_relay(_app: Option<&tauri::AppHandle<tauri::Wry>>) {
+    if offline_mode() {
+        return;
+    }
     dht_discover_peers().await;
 }
 

@@ -1,15 +1,50 @@
-# Offline transaction transport
+# Running without the internet
 
-Ego transactions normally travel over libp2p gossip. Where the internet is
-throttled, filtered or absent, they can travel over something else instead: a
+There are two separate things here, and most people need the first one.
+
+## 1. Local mesh, on hardware you already own
+
+Your laptop has a radio in it: WiFi. Two or more machines on the same WiFi
+network find each other over mDNS and dial each other directly, with no router
+uplink, no relay and no internet at all. One machine can create the network as a
+hotspot; nobody needs an ISP.
+
+Two nodes are enough to finalise blocks. The BFT floor is exactly two, so a pair
+of laptops in the same room is a working chain, while a single machine on its
+own deliberately halts rather than producing a fork nobody else can reconcile.
+
+By default a node still reaches for the public relay, the bootstrap anchor and
+the price oracle. On a cut-off network that is pointless, and on a censored one
+it is worse than pointless: those requests identify the machine as running Ego
+before it has sent anything. To stop all of it:
+
+```
+EGO_OFFLINE=1
+```
+
+Peers are then found only by mDNS on the local network, or named explicitly in
+`EGO_DIRECT_PEERS`. Nothing is dialled outside it.
+
+The limit is range. WiFi reaches tens of metres indoors and a few hundred
+outdoors, so this is a building or a street, not a city. That is a property of
+the radio in a laptop, not of the software.
+
+## 2. Sideband transports, for when nothing is in WiFi range
+
+Where even a local mesh has nobody to talk to, a transaction can travel over a
 LoRa mesh, an HF radio link, a satellite downlink, or a USB stick carried
-between two machines.
-
-This is off by default.
+between two machines. This needs hardware, and it is off by default.
 
 ```
 EGO_SIDEBAND_SPOOL=1
 ```
+
+Note what this does and does not do. It carries a **signed transaction** to
+somebody who can reach the network. It does not carry consensus: an isolated
+node cannot mine, because it cannot reach quorum alone. So a transaction sent
+this way waits in a mempool until it arrives somewhere connected. Two people who
+are both cut off cannot settle between themselves over radio, but they can over
+the local mesh in part 1.
 
 ## Why this is safe to accept from a stranger
 

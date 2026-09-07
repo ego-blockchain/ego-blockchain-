@@ -53,6 +53,13 @@ pub async fn check_for_update() -> Result<UpdateInfo, EgoDesktopError> {
         notes: String::new(),
     };
 
+    // An update check is a request to a known host. On a censored connection
+    // that is enough to identify the machine as running Ego, so a node told to
+    // stay local does not make it.
+    if crate::p2p::offline_mode() {
+        return Ok(fallback);
+    }
+
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
