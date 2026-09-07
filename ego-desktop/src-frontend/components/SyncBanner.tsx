@@ -37,7 +37,7 @@ export default function SyncBanner() {
 
   if (showSynced) {
     return (
-      <div className="fixed top-10 left-1/2 -translate-x-1/2 z-[9999] flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-600/95 text-white text-sm font-semibold shadow-lg shadow-black/40">
+      <div className="pointer-events-none fixed top-10 left-1/2 -translate-x-1/2 z-[9999] flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-600/95 text-white text-sm font-semibold shadow-lg shadow-black/40">
         <span>✓</span>
         <span>Back in sync — your node is creating blocks again</span>
       </div>
@@ -52,14 +52,14 @@ export default function SyncBanner() {
       : null;
 
   return (
-    <div className="fixed top-10 left-1/2 -translate-x-1/2 z-[9999] flex items-center gap-3 px-4 py-2 rounded-xl bg-amber-500/95 text-black text-sm font-semibold shadow-lg shadow-black/40 whitespace-nowrap">
+    <div className="pointer-events-none fixed top-10 left-1/2 -translate-x-1/2 z-[9999] flex max-w-[92vw] items-center gap-3 overflow-hidden px-4 py-2 rounded-xl bg-amber-500/95 text-black text-sm font-semibold shadow-lg shadow-black/40 whitespace-nowrap">
       <span className="w-3.5 h-3.5 rounded-full border-2 border-black/30 border-t-black animate-spin" />
       {status.state === 'checking' ? (
         <span>Woke from sleep — reconnecting to the network…</span>
       ) : (
         <span>
           Catching up — block {status.local.toLocaleString()} of {status.target.toLocaleString()}
-          {pct !== null ? ` (${pct}%)` : ''} · block creation paused
+          {pct !== null ? ` (${pct}%)` : ''} · you can keep using the app
         </span>
       )}
     </div>
