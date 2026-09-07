@@ -126,8 +126,11 @@ mod tests {
 
     #[test]
     fn an_empty_transport_is_not_recorded() {
-        let before = all().len();
-        record("some-hash-that-does-not-matter", "");
-        assert_eq!(all().len(), before, "an empty label must never be stored");
+        // Asserts about this hash only. Counting the whole map raced the other
+        // tests in this module, which write to the same global store while
+        // cargo runs them in parallel, and passed or failed by timing.
+        let h = unique("empty");
+        record(&h, "");
+        assert!(get(&h).is_none(), "an empty label must never be stored");
     }
 }
