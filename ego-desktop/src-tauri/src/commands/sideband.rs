@@ -103,5 +103,11 @@ pub async fn sideband_queue_tx(tx_hash: String) -> Result<String, String> {
     if sent == 0 {
         return Err("Every configured transport is receive-only.".into());
     }
+
+    // Record the hop. Without this the transaction keeps whichever label it got
+    // when it first went out, so a payment deliberately pushed over the air
+    // still read as "Internet" in the record.
+    crate::commands::tx_transport::record(&tx_hash, "radio");
+
     Ok(format!("Queued for {sent} offline transport(s)."))
 }

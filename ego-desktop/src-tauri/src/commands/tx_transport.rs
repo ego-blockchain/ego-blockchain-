@@ -47,9 +47,19 @@ pub fn get(hash: &str) -> Option<String> {
     all().get(hash).cloned()
 }
 
-/// Record how a transaction travelled. First observation wins: a transaction
-/// handed to a radio link and then also seen over gossip was still sent by
-/// radio, and the later sighting should not overwrite that.
+pub const INTERNET: &str = "internet";
+
+/// Record how a transaction travelled.
+///
+/// Crossing a radio link wins over the internet, whichever is seen first. A
+/// payment can legitimately go out both ways: sent over gossip, then pushed
+/// over the air by hand because the sender suspects the connection is
+/// filtered. Both happened, but the notable one is the radio hop, and it stays
+/// true afterwards. The internet is the unremarkable default and must never
+/// overwrite a radio label.
+///
+/// Between two radio links the first is kept, since there is nothing to choose
+/// between them.
 pub fn record(hash: &str, transport: &str) {
     if hash.is_empty() || transport.is_empty() {
         return;
@@ -62,10 +72,15 @@ pub fn record(hash: &str, transport: &str) {
         *guard = Some(load_from_disk());
     }
     let map = guard.as_mut().expect("cache initialised above");
-    if map.contains_key(hash) {
-        return;
+    if let Some(existing) = map.get(hash) {
+        let existing_is_radio = existing != INTERNET;
+        let incoming_is_radio = transport != INTERNET;
+        // Keep what we have unless this is a radio hop displacing the default.
+        if existing_is_radio || !incoming_is_radio {
+            return;
+        }
     }
-    if map.len() >= MAX_TRACKED {
+    if map.len() >= MAX_TRACKED && !map.contains_key(hash) {
         map.clear();
     }
     map.insert(hash.to_string(), transport.to_string());
@@ -79,16 +94,34 @@ pub fn record(hash: &str, transport: &str) {
 mod tests {
     use super::*;
 
+    fn unique(tag: &str) -> String {
+        format!("tx-{tag}-{}-{:?}", std::process::id(), std::time::SystemTime::now())
+    }
+
     #[test]
-    fn the_first_observation_is_kept() {
-        let mut map: HashMap<String, String> = HashMap::new();
-        map.insert("a".into(), "radio".into());
-        // Simulates record() refusing to overwrite.
-        if !map.contains_key("a") {
-            map.insert("a".into(), "internet".into());
-        }
-        assert_eq!(map.get("a").map(String::as_str), Some("radio"),
-            "a later gossip sighting must not erase that it went by radio");
+    fn a_radio_hop_displaces_the_internet_default() {
+        let h = unique("displace");
+        record(&h, INTERNET);
+        record(&h, "radio");
+        assert_eq!(get(&h).as_deref(), Some("radio"),
+            "pushing a sent transaction over the air must show as radio");
+    }
+
+    #[test]
+    fn the_internet_never_overwrites_a_radio_hop() {
+        let h = unique("keep");
+        record(&h, "radio");
+        record(&h, INTERNET);
+        assert_eq!(get(&h).as_deref(), Some("radio"),
+            "seeing it later on gossip must not erase the radio hop");
+    }
+
+    #[test]
+    fn between_two_radio_links_the_first_is_kept() {
+        let h = unique("two");
+        record(&h, "spool");
+        record(&h, "lora");
+        assert_eq!(get(&h).as_deref(), Some("spool"));
     }
 
     #[test]
