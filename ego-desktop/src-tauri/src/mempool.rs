@@ -48,7 +48,20 @@ pub const MAX_MEMPOOL_SIZE: usize = 2_000_000;
 
 pub const MAX_TX_AGE_SECS: i64 = 1800;
 
+pub const MAX_SIDEBAND_TX_AGE_SECS: i64 = 86_400;
+pub const MAX_SIDEBAND_TRACKED: usize = 4_096;
+
 pub const MIN_FEE_UEGOC: u64 = 1_000;
+
+/// How long a transaction may sit before it is evicted, by how it reached us.
+///
+/// The fee-market default assumes a transaction that cannot be mined within
+/// half an hour is not going to be. That assumption does not hold for a
+/// transaction that crossed an HF radio hop or a satellite pass, which is
+/// legitimately hours old on arrival and was signed before it left.
+pub fn tx_max_age(is_sideband: bool) -> i64 {
+    if is_sideband { MAX_SIDEBAND_TX_AGE_SECS } else { MAX_TX_AGE_SECS }
+}
 
 pub fn shard_for_address(addr: &str) -> u32 {
     let mut h: u32 = 0xcbf29ce4;
@@ -67,6 +80,8 @@ pub struct ShardedMempool {
     submitted:     AtomicU64,
     confirmed:     AtomicU64,
 
+    sideband_hashes: Mutex<std::collections::HashSet<String>>,
+
     pub tx_notify: Arc<Notify>,
 }
 
@@ -84,10 +99,35 @@ impl ShardedMempool {
             pending_total: AtomicU64::new(0),
             submitted:     AtomicU64::new(0),
             confirmed:     AtomicU64::new(0),
+            sideband_hashes: Mutex::new(std::collections::HashSet::new()),
             tx_notify:     Arc::new(Notify::new()),
         })
     }
 
+
+    /// Record that a transaction reached us over a sideband transport rather
+    /// than the internet. Such a transaction may legitimately be hours old by
+    /// the time it lands, so it is held to a longer TTL than the fee-market
+    /// default. Replay is still bounded by nonce sequencing, not by this.
+    pub fn mark_sideband(&self, hash: &str) {
+        if let Ok(mut set) = self.sideband_hashes.lock() {
+            if set.len() >= MAX_SIDEBAND_TRACKED {
+                set.clear();
+            }
+            set.insert(hash.to_string());
+        }
+    }
+
+    pub fn is_sideband(&self, hash: &str) -> bool {
+        self.sideband_hashes.lock().map(|s| s.contains(hash)).unwrap_or(false)
+    }
+
+    fn forget_sideband(&self, hashes: &[String]) {
+        if hashes.is_empty() { return; }
+        if let Ok(mut set) = self.sideband_hashes.lock() {
+            for h in hashes { set.remove(h); }
+        }
+    }
 
     pub fn push(&self, tx: LedgerTx) -> Result<(), String> {
         let is_pool_faucet = tx.tx_type == "faucet"
@@ -350,7 +390,8 @@ impl ShardedMempool {
             let now = chrono::Utc::now().timestamp();
             s.retain(|tx| {
                 let is_pool_faucet = tx.tx_type == "faucet" && tx.from == crate::chain_db::NODE_POOL_ADDR;
-                let stale = !is_pool_faucet && tx.timestamp > 0 && (now - tx.timestamp) >= MAX_TX_AGE_SECS;
+                let max_age = tx_max_age(self.is_sideband(&tx.hash));
+                let stale = !is_pool_faucet && tx.timestamp > 0 && (now - tx.timestamp) >= max_age;
                 if stale {
                     expired_hashes.push(tx.hash.clone());
                     if tx.from == my_addr || tx.to == my_addr { my_expired_txs.push(tx.clone()); }
@@ -361,9 +402,10 @@ impl ShardedMempool {
                 let n = expired_hashes.len() as u64;
                 self.pending_total.fetch_sub(n, Ordering::Relaxed);
                 eprintln!(
-                    "[Mempool] Evicted {} stale txs (>{}s old) from shard {}",
-                    n, MAX_TX_AGE_SECS, shard_id
+                    "[Mempool] Evicted {} stale txs from shard {} (ttl {}s, {}s for sideband)",
+                    n, shard_id, MAX_TX_AGE_SECS, MAX_SIDEBAND_TX_AGE_SECS
                 );
+                self.forget_sideband(&expired_hashes);
             }
 
             if s.is_empty() { return vec![]; }
@@ -913,5 +955,43 @@ pub async fn run_batch_loop() {
 
         last_block_at    = Instant::now();
         batch_started_at = None;
+    }
+}
+
+#[cfg(test)]
+mod sideband_ttl_tests {
+    use super::*;
+
+    #[test]
+    fn a_transaction_that_spent_hours_on_radio_is_not_treated_as_stale() {
+        let three_hours = 3 * 3600;
+        assert!(three_hours >= tx_max_age(false), "internet ttl must reject a 3h old tx");
+        assert!(three_hours < tx_max_age(true), "sideband ttl must still accept it");
+    }
+
+    #[test]
+    fn the_sideband_window_is_bounded_rather_than_infinite() {
+        let two_days = 2 * 86_400;
+        assert!(two_days >= tx_max_age(true), "a two day old tx must still expire");
+    }
+
+    #[test]
+    fn origin_tracking_survives_lookup_and_clears_on_eviction() {
+        let m = ShardedMempool::new();
+        assert!(!m.is_sideband("abc"));
+        m.mark_sideband("abc");
+        assert!(m.is_sideband("abc"));
+        m.forget_sideband(&["abc".to_string()]);
+        assert!(!m.is_sideband("abc"), "an evicted hash must stop being tracked");
+    }
+
+    #[test]
+    fn origin_tracking_cannot_grow_without_bound() {
+        let m = ShardedMempool::new();
+        for i in 0..(MAX_SIDEBAND_TRACKED + 10) {
+            m.mark_sideband(&format!("hash{i}"));
+        }
+        let len = m.sideband_hashes.lock().unwrap().len();
+        assert!(len <= MAX_SIDEBAND_TRACKED, "tracked set grew to {len}");
     }
 }

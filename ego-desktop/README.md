@@ -138,6 +138,17 @@ Output: `src-tauri/target/release/bundle/`
 
 ---
 
+## Running without the internet
+
+Transactions can be carried over a LoRa mesh, an HF radio link, a satellite
+downlink or a USB stick, for places where the internet is throttled, filtered or
+absent. It is off unless `EGO_SIDEBAND_SPOOL=1` is set.
+
+See [SIDEBAND.md](SIDEBAND.md), including the section on transmitting, which is
+locatable by direction finding in a way that receiving is not.
+
+---
+
 ## License
 
 MIT — see [LICENSE](../LICENSE) for details.

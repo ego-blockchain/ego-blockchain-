@@ -787,6 +787,8 @@ fn main() {
             commands::storage::configure_storage,
             commands::storage::get_available_drives,
             commands::storage::reset_storage,
+            commands::sideband::sideband_status,
+            commands::sideband::sideband_queue_tx,
             commands::storage::unlock_storage_early,
             commands::storage::create_public_share,
             commands::storage::create_secure_share,

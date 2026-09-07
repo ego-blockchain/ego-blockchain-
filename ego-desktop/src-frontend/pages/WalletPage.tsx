@@ -67,6 +67,16 @@ interface SendForm {
   isPrivate: boolean;
 }
 
+interface SidebandStatus {
+  enabled: boolean;
+  online: boolean;
+  transports: { name: string; can_send: boolean }[];
+  spool_root: string;
+  inbox_frames: number;
+  outbox_frames: number;
+  max_age_hours: number;
+}
+
 interface TxResult {
   hash: string;
   success: boolean;
@@ -345,6 +355,8 @@ const WalletPage: React.FC = () => {
   const [sendForm, setSendForm]     = useState<SendForm>({ to: '', amount: '', memo: '', isPrivate: false });
   const [sending, setSending]       = useState(false);
   const [txResult, setTxResult]         = useState<TxResult | null>(null);
+  const [sideband, setSideband]         = useState<SidebandStatus | null>(null);
+  const [sidebandMsg, setSidebandMsg]   = useState<string>('');
   const [txConfirmedHeight, setTxConfirmedHeight] = useState<number | null>(null);
   const [txFee, setTxFee]           = useState<{ fee_uegoc: number; fee_usd: number } | null>(null);
   const [copied, setCopied]         = useState(false);
@@ -577,6 +589,18 @@ const WalletPage: React.FC = () => {
     }
   }
 
+  useEffect(() => {
+    let alive = true;
+    const tick = () => {
+      invoke<SidebandStatus>('sideband_status')
+        .then(st => { if (alive) setSideband(st); })
+        .catch(() => {});
+    };
+    tick();
+    const id = setInterval(tick, 10_000);
+    return () => { alive = false; clearInterval(id); };
+  }, []);
+
   async function submitTx() {
     if (!sendForm.to || !sendForm.amount) return;
     const amount  = Math.floor(parseFloat(sendForm.amount) * 1_000_000);
@@ -612,7 +636,18 @@ const WalletPage: React.FC = () => {
   }
 
 
+  async function queueOverSideband(hash: string) {
+    setSidebandMsg('Queueing...');
+    try {
+      setSidebandMsg(await invoke<string>('sideband_queue_tx', { txHash: hash }));
+    } catch (e: any) {
+      setSidebandMsg(String(e).replace(/^.*Error:/, '').trim());
+    }
+    invoke<SidebandStatus>('sideband_status').then(setSideband).catch(() => {});
+  }
+
   function resetSend() {
+    setSidebandMsg('');
     setShowSend(false);
     setSending(false);
     setSendForm({ to: '', amount: '', memo: '', isPrivate: false });
@@ -2911,6 +2946,31 @@ const WalletPage: React.FC = () => {
                     </div>
                   </div>
                 )}
+                {sideband?.enabled && txResult.success && txResult.hash && txConfirmedHeight == null && (
+                  <div className="bg-gray-900 border border-amber-500/30 rounded-xl p-4 text-left space-y-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-amber-400">SAT</span>
+                      <span className="text-sm font-semibold text-amber-300">Offline transport</span>
+                    </div>
+                    <p className="text-xs text-gray-400 leading-relaxed">
+                      {sideband.online
+                        ? 'Your connection is working, so this went out over the internet. Send it over radio as well only if you believe the network is being filtered.'
+                        : `No internet peers were reachable, so this was written to the outbox automatically. It stays valid for ${sideband.max_age_hours} hours while it travels.`}
+                    </p>
+                    <div className="text-xs text-gray-500">
+                      Outbox holds {sideband.outbox_frames} frame{sideband.outbox_frames === 1 ? '' : 's'}
+                    </div>
+                    {sideband.online && (
+                      <button
+                        onClick={() => queueOverSideband(txResult.hash)}
+                        className="w-full bg-amber-600/80 hover:bg-amber-500 py-2 rounded-lg text-xs font-semibold transition"
+                      >
+                        Also send over radio
+                      </button>
+                    )}
+                    {sidebandMsg && <div className="text-xs text-amber-300">{sidebandMsg}</div>}
+                  </div>
+                )}
                 <button onClick={resetSend} className="w-full bg-blue-600 hover:bg-blue-500 py-3 rounded-xl font-semibold transition">
                   Done
                 </button>
@@ -2921,6 +2981,13 @@ const WalletPage: React.FC = () => {
                   <h3 className="text-lg font-bold">Send EGOC</h3>
                   <button onClick={resetSend} className="text-gray-400 hover:text-white text-xl">✕</button>
                 </div>
+                {sideband?.enabled && !sideband.online && (
+                  <div className="mb-4 bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 text-xs text-amber-200 leading-relaxed">
+                    No internet peers reachable. This transaction will be signed here and
+                    handed to your offline transport instead. It stays valid for {sideband.max_age_hours} hours,
+                    which is enough for a slow radio or satellite hop.
+                  </div>
+                )}
                 <div className="space-y-4">
                   <div>
                     <label className="text-xs text-gray-400 block mb-1.5">Recipient Address</label>

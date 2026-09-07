@@ -4125,6 +4125,40 @@ async fn handle_poc_witness(
     }
 }
 
+fn sideband_msg_id(hash: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in hash.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// Hand a transaction to the radio, satellite or sneakernet path.
+///
+/// Only when gossip has nowhere to go. A sideband link carries a few hundred
+/// bytes per second at best, so mirroring every transaction onto it while the
+/// internet works would saturate it for no gain.
+pub async fn offer_to_sideband(msg: &P2PMessage, tx_hash: &str) {
+    if has_connectivity() || !crate::sideband::has_transport() {
+        return;
+    }
+    let data = match serde_json::to_vec(msg) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[Sideband] could not serialise tx {tx_hash}: {e}");
+            return;
+        }
+    };
+    let id = sideband_msg_id(tx_hash);
+    let hash = tx_hash.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        if crate::sideband::broadcast(&data, id) == 0 {
+            eprintln!("[Sideband] tx {hash} had no transport able to transmit");
+        }
+    }).await;
+}
+
 pub async fn broadcast_tx(tx: LedgerTx, block: LedgerBlock) {
     // This is an async function, so all blocking calls must be wrapped.
     let msg = P2PMessage::TxBroadcast { tx: tx.clone(), block: block.clone() };
@@ -4132,6 +4166,7 @@ pub async fn broadcast_tx(tx: LedgerTx, block: LedgerBlock) {
     if let Ok(data) = serde_json::to_vec(&msg) {
         publish_gossip("ego-txs-v1", data).await;
     }
+    offer_to_sideband(&msg, &tx.hash).await;
 
     let my_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
         .await.unwrap_or_default();
@@ -4200,6 +4235,7 @@ pub async fn broadcast_pending_tx(tx: LedgerTx) {
     if let Ok(data) = serde_json::to_vec(&msg) {
         publish_gossip("ego-txs-v1", data).await;
     }
+    offer_to_sideband(&msg, &tx.hash).await;
     
     // Direct send to cached peers ensures delivery before gossip mesh connects
     for p in load_peer_cache().iter().filter(|p| !p.endpoint.is_empty()) {
@@ -9157,6 +9193,7 @@ pub async fn ingest_sideband_bytes(
             if let Err(e) = crate::ledger::verify_incoming_tx(&tx) {
                 return Err(format!("sideband tx {hash} from {source} rejected: {e}"));
             }
+            crate::mempool::get_mempool().mark_sideband(&hash);
             eprintln!("[Sideband] accepted tx {hash} via {source}");
             apply_incoming_tx(tx, block, app).await;
             Ok(())

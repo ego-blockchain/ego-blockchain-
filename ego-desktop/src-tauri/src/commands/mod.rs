@@ -23,3 +23,4 @@ pub mod storage_deals;
 pub mod cluster;
 pub mod credits;
 pub mod l2;
+pub mod sideband;

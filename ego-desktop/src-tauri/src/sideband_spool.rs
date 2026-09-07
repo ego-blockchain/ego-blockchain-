@@ -1,5 +1,30 @@
 use crate::sideband::{Frame, SidebandTransport};
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+static SPOOL_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn spool_root() -> Option<&'static PathBuf> {
+    SPOOL_ROOT.get()
+}
+
+fn count_frames(dir: &PathBuf) -> usize {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("frame"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Frames waiting in the inbox and the outbox of the default spool.
+pub fn queue_depths() -> (usize, usize) {
+    match SPOOL_ROOT.get() {
+        Some(root) => (count_frames(&root.join("inbox")), count_frames(&root.join("outbox"))),
+        None => (0, 0),
+    }
+}
 
 /// A transport that moves frames through a directory rather than a socket.
 ///
@@ -29,9 +54,11 @@ impl SpoolTransport {
     }
 
     /// Default spool under the node's data directory, so an operator can find it
-    /// without configuration.
+    /// without configuration. The root is remembered so the UI can show the
+    /// operator where to point their radio bridge.
     pub fn default_spool() -> Self {
         let root = crate::ledger::base_data_dir().join("sideband");
+        let _ = SPOOL_ROOT.set(root.clone());
         Self::new("spool", root, true, 200)
     }
 

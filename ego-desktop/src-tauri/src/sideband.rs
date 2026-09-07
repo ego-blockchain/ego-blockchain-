@@ -170,6 +170,21 @@ fn registry() -> &'static Mutex<Vec<Box<dyn SidebandTransport>>> {
     T.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// True once at least one transport is registered. The send path checks this
+/// before serialising anything, so a node with no sideband configured pays
+/// nothing for the feature existing.
+pub fn has_transport() -> bool {
+    registry().lock().map(|r| !r.is_empty()).unwrap_or(false)
+}
+
+/// Names of the registered transports and whether each can transmit.
+pub fn transports() -> Vec<(String, bool)> {
+    match registry().lock() {
+        Ok(r) => r.iter().map(|t| (t.name().to_string(), t.can_send())).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 pub fn register(transport: Box<dyn SidebandTransport>) {
     if let Ok(mut v) = registry().lock() {
         eprintln!("[Sideband] registered transport: {}", transport.name());
@@ -212,22 +227,32 @@ pub async fn poll_once(app: Option<&tauri::AppHandle<tauri::Wry>>) {
 
 /// Send a message out over every transport that can transmit. Receive-only
 /// links, such as a satellite downlink, report can_send() false and are skipped.
-pub fn broadcast(message: &[u8], msg_id: u32) {
+pub fn broadcast(message: &[u8], msg_id: u32) -> usize {
     let reg = match registry().lock() {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => return 0,
     };
+    let mut sent = 0usize;
     for t in reg.iter() {
         if !t.can_send() {
             continue;
         }
-        for frame in split(message, t.max_payload(), msg_id) {
+        let frames = split(message, t.max_payload(), msg_id);
+        let total = frames.len();
+        let mut ok = true;
+        for frame in frames {
             if let Err(e) = t.send_frame(&frame) {
                 eprintln!("[Sideband] {} send failed: {e}", t.name());
+                ok = false;
                 break;
             }
         }
+        if ok {
+            eprintln!("[Sideband] {} queued {total} frames for msg {msg_id:08x}", t.name());
+            sent += 1;
+        }
     }
+    sent
 }
 
 #[cfg(test)]
