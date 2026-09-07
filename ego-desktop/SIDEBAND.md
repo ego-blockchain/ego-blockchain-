@@ -40,6 +40,43 @@ Missing frames are tracked so a peer can be asked for just the gaps.
 Anything that can move files between two `sideband` directories is a valid
 transport. A USB stick needs no code at all.
 
+## Losing frames
+
+A transaction is 21 frames. If any one of them is lost the whole thing silently
+never reassembles, which on a link bad enough to need a sync word is not a rare
+event.
+
+So the receiver notices. A partial message that has heard nothing for two
+minutes is assumed to be missing frames rather than merely slow, and the
+receiver sends back a repeat request naming exactly the sequence numbers it
+lacks. The sender keeps its frames for an hour and serves only those, so a
+transaction that lost three frames costs three frames to repair rather than
+another 21.
+
+It gives up after three attempts. A message that cannot be completed expires on
+its own rather than being chased forever.
+
+The answering side is capped too, and for a reason that matters more than
+bandwidth. A repeat request is a few bytes; the answer can be twenty frames.
+Answering means keying the transmitter, and on these links transmitting is what
+gets a person located. An unbounded responder would let anyone within earshot
+make your radio transmit on demand. So a given message is repaired at most six
+times, after which further requests for it are ignored.
+
+Two minutes is deliberately patient. Asking sooner spends the little bandwidth
+there is on frames that were already on their way.
+
+**This needs a link you can transmit on.** A receive-only station cannot ask for
+anything. Where the far side cannot answer, the sending bridge should transmit
+each frame more than once instead:
+
+```
+python sideband-bridge.py --port COM3 --repeat 3
+```
+
+That is the only defence against loss a one-way link has. Duplicates cost the
+receiver nothing, since a frame it already holds simply overwrites itself.
+
 ## Bridging to real hardware
 
 `sideband-bridge.py` reads and writes the spool over a serial port, for a LoRa
@@ -81,6 +118,10 @@ the tests can tell you.
 ## Before you transmit
 
 Receiving is passive and undetectable. **Transmitting is not.**
+
+Note that repair makes a receiving node transmit: asking for a lost frame is
+itself a transmission. If you are running receive-only this never happens, and
+lost frames simply cost you the transaction.
 
 A transmitter can be located by direction finding, usually to a building and
 sometimes to a room. If you are in a place where using this at all is the reason

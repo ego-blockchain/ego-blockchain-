@@ -17,6 +17,10 @@ For a receive-only satellite downlink, pass --receive-only so nothing is
 transmitted. On an HF link where transmitting is a physical risk, that flag is
 the difference between listening and being locatable.
 
+On a two-way link the node asks for frames it lost, so no repetition is needed.
+Where the far side cannot answer, --repeat N sends each frame N times instead,
+which is the only defence against loss a one-way link has.
+
 To exercise the framing without any hardware:
 
     python sideband-bridge.py --self-test
@@ -233,6 +237,11 @@ def main() -> int:
     ap.add_argument("--baud", type=int, default=9600)
     ap.add_argument("--receive-only", action="store_true",
                     help="never transmit; for satellite downlink or when TX is unsafe")
+    ap.add_argument("--repeat", type=int, default=1, metavar="N",
+                    help="transmit each frame N times. The node asks for lost frames "
+                         "back on a two-way link, so leave this at 1 there. Raise it "
+                         "when the far side cannot answer, such as a one-way "
+                         "broadcast into a receive-only station.")
     ap.add_argument("--self-test", action="store_true",
                     help="check the framing against dropped and corrupted bytes, then exit")
     ap.add_argument("--loopback", action="store_true",
@@ -259,6 +268,10 @@ def main() -> int:
     print("radio: %s @ %d%s" % (args.port, args.baud,
                                 "  (receive only)" if args.receive_only else ""))
 
+    repeats = max(1, min(args.repeat, 10))
+    if repeats > 1:
+        print("each frame will be sent %d times" % repeats)
+
     link = serial.Serial(args.port, args.baud, timeout=0.2)
     reader = FrameReader()
     seq = 0
@@ -269,7 +282,9 @@ def main() -> int:
             for path in sorted(outbox.glob("*" + FRAME_SUFFIX)):
                 try:
                     body = path.read_bytes()
-                    link.write(encode_frame(body))
+                    wire = encode_frame(body)
+                    for _ in range(repeats):
+                        link.write(wire)
                     link.flush()
                 except Exception as exc:
                     print("tx failed %s: %s" % (path.name, exc), file=sys.stderr)
@@ -277,7 +292,8 @@ def main() -> int:
                 # Only after the bytes are out, so a write that throws leaves the
                 # frame in the outbox to be retried.
                 path.unlink()
-                print("tx %s (%d bytes)" % (path.name, len(body)))
+                print("tx %s (%d bytes%s)" % (
+                    path.name, len(body), " x%d" % repeats if repeats > 1 else ""))
 
         try:
             chunk = link.read(link.in_waiting or 1)
