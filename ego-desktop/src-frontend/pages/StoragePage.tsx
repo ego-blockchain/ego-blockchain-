@@ -526,7 +526,10 @@ const StoragePage: React.FC = () => {
   }
 
   async function endStorageDeal(dealId: string) {
-    if (!confirm('End this storage deal and get your unused payment back?')) return;
+    if (!await confirm('End this storage deal?', {
+      detail: 'Your unused payment is returned. This cannot be undone.',
+      confirmLabel: 'End deal',
+    })) return;
     setDealBusy(dealId);
     try { await invoke('terminate_storage_deal', { dealId }); await loadData(); }
     catch (err: any) { alert(String(err)); }
@@ -607,11 +610,47 @@ const StoragePage: React.FC = () => {
                   <button onClick={openProvConfig} className="text-xs text-gray-500 hover:text-gray-300 mt-1 block">change</button>
                 )}
                 {locked ? (
-                  <span className="text-xs text-gray-600 mt-1 block cursor-not-allowed" title="Cannot reset while storage lock is active">reset locked</span>
+                  <button
+                    onClick={async () => {
+                      const ok = await confirm(
+                        `Release the storage lock early?`,
+                        {
+                          detail:
+                            `${d} day${d === 1 ? '' : 's'} remain on your commitment. Subscribers rely on the ` +
+                            `space you pledged, so leaving early costs you: rewards suspended for 30 days, and ` +
+                            `one slash strike recorded against your node. Your stored data stays in place so it ` +
+                            `can be re-replicated elsewhere.`,
+                          confirmLabel: 'Unlock anyway',
+                        },
+                      );
+                      if (!ok) return;
+                      try {
+                        const r: any = await invoke('unlock_storage_early');
+                        await confirm(
+                          `Storage unlocked.`,
+                          {
+                            detail:
+                              `${r.days_forfeited} day${r.days_forfeited === 1 ? '' : 's'} forfeited. ` +
+                              `Rewards resume ${new Date(r.rewards_suspended_until * 1000).toLocaleDateString()}. ` +
+                              `Slash strikes: ${r.slash_strikes}.`,
+                            confirmLabel: 'OK',
+                          },
+                        );
+                        await loadData();
+                      } catch (e: any) { alert(String(e)); }
+                    }}
+                    className="text-xs text-amber-500 hover:text-amber-400 mt-1 block"
+                    title="Release the lock early and accept the penalty"
+                  >
+                    unlock early
+                  </button>
                 ) : (
                 <button
                   onClick={async () => {
-                    if (!confirm('Reset all storage? This deletes all stored files and block data from your drive and cannot be undone.')) return;
+                    if (!await confirm('Reset all storage?', {
+                      detail: 'This deletes every stored file and all block data from your drive. It cannot be undone.',
+                      confirmLabel: 'Delete everything',
+                    })) return;
                     try {
                       await invoke('reset_storage');
                       await loadData();

@@ -1312,6 +1312,60 @@ pub async fn import_secure_share(
 
 // ── reset_storage ─────────────────────────────────────────────────────────────
 
+/// Release the 60-day storage lock early.
+///
+/// The lock exists so subscribers keep the availability guarantee they paid for,
+/// so leaving before it expires is a broken commitment rather than a free choice.
+/// It is allowed, but it carries the same class of penalty as reducing allocation
+/// after the lock, only longer: rewards are suspended and a slash strike is
+/// recorded. Stored data is left in place so it can be re-replicated elsewhere
+/// before the operator reclaims the space.
+#[tauri::command]
+pub async fn unlock_storage_early(_state: State<'_, AppState>) -> Result<UnlockResult, EgoDesktopError> {
+    const LOCK_SECS: i64 = 60 * 24 * 3600;
+    const EARLY_EXIT_PENALTY_SECS: i64 = 30 * 86_400;
+
+    let mut ledger = Ledger::load();
+    let now = chrono::Utc::now().timestamp();
+
+    let cfg_at = ledger.storage_configured_at.ok_or_else(|| {
+        EgoDesktopError::InvalidInput("Storage has not been configured, nothing to unlock.".into())
+    })?;
+
+    let unlock_at = cfg_at + LOCK_SECS;
+    if now >= unlock_at {
+        return Err(EgoDesktopError::InvalidInput(
+            "Storage is not locked. You can change or reset your allocation directly.".into(),
+        ));
+    }
+
+    let days_remaining = ((unlock_at - now) as f64 / 86400.0).ceil() as i64;
+
+    ledger.storage_configured_at   = None;
+    ledger.reward_suspended_until  = Some(now + EARLY_EXIT_PENALTY_SECS);
+    ledger.slash_strikes           = ledger.slash_strikes.saturating_add(1);
+    ledger.last_slash_ts           = Some(now);
+    ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save: {e}")))?;
+
+    eprintln!(
+        "[Storage] Early unlock: {days_remaining} days remained; rewards suspended for 30 days; strikes={}",
+        ledger.slash_strikes
+    );
+
+    Ok(UnlockResult {
+        days_forfeited: days_remaining,
+        rewards_suspended_until: now + EARLY_EXIT_PENALTY_SECS,
+        slash_strikes: ledger.slash_strikes,
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub struct UnlockResult {
+    pub days_forfeited: i64,
+    pub rewards_suspended_until: i64,
+    pub slash_strikes: u32,
+}
+
 #[tauri::command]
 pub async fn reset_storage(_state: State<'_, AppState>) -> Result<(), EgoDesktopError> {
     // Block reset while the 60-day lock is active.
