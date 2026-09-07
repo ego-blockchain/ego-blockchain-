@@ -3192,7 +3192,7 @@ const WalletPage: React.FC = () => {
       {}
       {selectedTx && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm" onClick={e => { if (e.target === e.currentTarget) setSelectedTx(null); }}>
-          <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-md border border-gray-700 shadow-2xl">
+          <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-2xl max-h-[88vh] overflow-y-auto border border-gray-700 shadow-2xl">
             <div className="flex justify-between items-center mb-5">
               <h3 className="text-lg font-bold">Transaction Details</h3>
               <button onClick={() => setSelectedTx(null)} className="text-gray-400 hover:text-white text-xl">✕</button>
@@ -3248,9 +3248,9 @@ const WalletPage: React.FC = () => {
                        { label: 'Link', val: selectedTx.transport, mono: true }]
                     : []),
               ].map(({ label, val, mono }) => (
-                <div key={label} className="flex justify-between items-start gap-4 py-1 border-b border-gray-700/50 last:border-0">
+                <div key={label} className="flex justify-between items-start gap-6 py-1.5 border-b border-gray-700/50 last:border-0">
                   <span className="text-gray-400 text-sm shrink-0">{label}</span>
-                  <span className={`text-right text-sm break-all ${mono ? 'font-mono text-xs text-gray-300' : 'text-white'}`}>
+                  <span className={`text-right text-sm break-all min-w-0 ${mono ? 'font-mono text-xs text-gray-300' : 'text-white'}`}>
                     {val}
                   </span>
                 </div>
