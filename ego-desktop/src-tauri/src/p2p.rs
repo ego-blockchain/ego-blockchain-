@@ -545,6 +545,62 @@ const MIN_DIRECT_PEERS_RELAY_OPTIONAL: usize = 10;
 /// spends the whole budget before a LAN peer is even discovered.
 const MAX_STARTUP_REMOTE_DIALS: usize = 8;
 
+/// How far back to look for validators that actually produced a block.
+///
+/// Long enough that a validator taking its turn in a large committee still
+/// counts, short enough that a machine switched off yesterday does not.
+const PROPOSER_LIVENESS_LOOKBACK: u64 = 200;
+
+/// The round at which leader election stops trusting recent activity and walks
+/// the whole registered set again.
+///
+/// This is the escape hatch, and it is why electing only from recent producers
+/// is safe. If every recently active validator went away at once, the lookback
+/// window would freeze — no blocks means no new producers means no way to
+/// notice anyone else — and the chain would never recover. Rounds are agreed by
+/// every node, so widening the set at a fixed round keeps that agreement while
+/// guaranteeing anyone registered is eventually reachable.
+const PROPOSER_ESCAPE_ROUND: u64 = 8;
+
+/// The validators leader election may choose from at a given round.
+///
+/// Early rounds draw only from validators that have recently produced a block,
+/// so the first proposer of each height is somebody who exists. A registry that
+/// only grows is mostly switched-off machines after a while, and round-robin
+/// over all of them elects a ghost nearly every time: the round times out, and
+/// the chain crawls or stops.
+///
+/// Both inputs come from committed data — blocks for who produced, the on-chain
+/// registry for who may — so every node derives the same list and still agrees
+/// on one proposer per (height, round).
+fn proposer_candidates(round: u64) -> Vec<String> {
+    let all = eligible_validators_sorted();
+    if round >= PROPOSER_ESCAPE_ROUND || all.is_empty() {
+        return all;
+    }
+    let recent = crate::chain_db::recently_active_validators(PROPOSER_LIVENESS_LOOKBACK);
+    narrow_to_live(all, &recent, round, crate::mempool::min_validators_for_finality())
+}
+
+/// The decision proposer_candidates makes, separated from where its inputs come
+/// from so the rules can be tested directly.
+fn narrow_to_live(
+    all: Vec<String>,
+    recent: &std::collections::HashSet<String>,
+    round: u64,
+    min_validators: usize,
+) -> Vec<String> {
+    if round >= PROPOSER_ESCAPE_ROUND || all.is_empty() {
+        return all;
+    }
+    let live: Vec<String> = all.iter().filter(|a| recent.contains(*a)).cloned().collect();
+    if live.len() >= min_validators {
+        live
+    } else {
+        all
+    }
+}
+
 
 const MIN_CACHED_PEERS_FOR_DIRECT_BOOT: usize = 5;
 
@@ -2097,9 +2153,33 @@ fn eligible_validators_sorted() -> Vec<String> {
         .filter(|a| !slashed.contains(a))
         .collect();
     if !registered.is_empty() {
-        let mut vs = registered;
-        vs.sort();
-        return vs;
+        // Order the set so validators that recently produced a block come first,
+        // and keep everyone else behind them rather than dropping them.
+        //
+        // The registry only ever grows, so on a chain that has been running a
+        // while most entries are machines that were switched off long ago. Plain
+        // round-robin over all of them elects a ghost almost every height: no
+        // proposal arrives, the round times out, and the chain crawls or stops.
+        // Putting the recently active first means round 0 elects somebody who
+        // exists.
+        //
+        // Keeping the rest reachable at higher rounds is what makes this safe.
+        // If the recent set were used alone and every one of them died, the
+        // window would freeze — no blocks means no new miners means no way back
+        // — and the chain would deadlock permanently. View changes can still
+        // walk into the wider set, so recovery is always possible.
+        //
+        // The ordering is computed from committed blocks plus the on-chain
+        // registry, both identical on every node, so all nodes still agree on
+        // one proposer per (height, round).
+        let recent = crate::chain_db::recently_active_validators(PROPOSER_LIVENESS_LOOKBACK);
+        let (mut live, mut rest): (Vec<String>, Vec<String>) = registered
+            .into_iter()
+            .partition(|a| recent.contains(a));
+        live.sort();
+        rest.sort();
+        live.extend(rest);
+        return live;
     }
     // Pure-genesis bootstrap: nobody has a committed validator_register yet, so fall
     // back to the live set (self + recently-seen peers, excluding DB ghosts).
@@ -12108,9 +12188,9 @@ pub async fn run_view_change_monitor() {
         let next_view = chain_next.max(current_view() + 1);
 
         {
-            let vs = eligible_validators_sorted();
+            let round = current_view().saturating_sub(chain_next);
+            let vs = proposer_candidates(round);
             if !vs.is_empty() {
-                let round = current_view().saturating_sub(chain_next);
                 let idx = (chain_next as usize)
                     .wrapping_add(round as usize)
                     .wrapping_rem(vs.len());
@@ -13285,5 +13365,83 @@ mod replica_policy_tests {
         // which is the flat-24h behaviour this replaced.
         assert!(REPLACE_AFTER_SECS <= REPLICA_SLOT_MIN_SECS);
         assert!(REPLACE_AFTER_SECS < REPLICA_SLOT_PERMANENT_SECS);
+    }
+}
+
+#[cfg(test)]
+mod proposer_election_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn registry(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("egot1validator{i:04}")).collect()
+    }
+
+    fn alive(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The case that stalled a real testnet: 37 registered, 2 still running.
+    #[test]
+    fn a_registry_full_of_ghosts_still_elects_someone_who_exists() {
+        let all = registry(37);
+        let recent = alive(&["egot1validator0005", "egot1validator0021"]);
+        let vs = narrow_to_live(all, &recent, 0, 2);
+        assert_eq!(vs.len(), 2, "round 0 must choose between live validators only");
+
+        // Whatever the height, the elected proposer is one of the living.
+        for height in 0..200usize {
+            let idx = height.wrapping_add(0).wrapping_rem(vs.len());
+            assert!(recent.contains(&vs[idx]), "height {height} elected a dead validator");
+        }
+    }
+
+    /// Without the escape round a chain whose live set all vanished could never
+    /// recover: no blocks means no new producers means nobody is ever seen again.
+    #[test]
+    fn a_high_round_can_still_reach_every_registered_validator() {
+        let all = registry(37);
+        let recent = alive(&["egot1validator0005"]);
+        let vs = narrow_to_live(all.clone(), &recent, PROPOSER_ESCAPE_ROUND, 2);
+        assert_eq!(vs.len(), all.len(), "the escape round must widen the set again");
+    }
+
+    #[test]
+    fn a_fresh_chain_with_nobody_seen_yet_uses_the_whole_registry() {
+        let all = registry(4);
+        let vs = narrow_to_live(all.clone(), &HashSet::new(), 0, 2);
+        assert_eq!(vs.len(), all.len(), "nothing produced yet must not empty the set");
+    }
+
+    #[test]
+    fn one_live_validator_is_not_enough_to_narrow_to() {
+        // Narrowing to a single proposer would make the chain depend on one
+        // machine until the escape round; the full set is the safer choice.
+        let all = registry(10);
+        let recent = alive(&["egot1validator0003"]);
+        let vs = narrow_to_live(all.clone(), &recent, 0, 2);
+        assert_eq!(vs.len(), all.len());
+    }
+
+    #[test]
+    fn every_node_derives_the_same_list() {
+        // Determinism is the property that stops two nodes proposing against
+        // each other, so the ordering must not depend on iteration order.
+        let all = registry(20);
+        let recent = alive(&["egot1validator0011", "egot1validator0002", "egot1validator0007"]);
+        let a = narrow_to_live(all.clone(), &recent, 0, 2);
+        let b = narrow_to_live(all, &recent, 0, 2);
+        assert_eq!(a, b);
+        let mut sorted = a.clone();
+        sorted.sort();
+        assert_eq!(a, sorted, "the candidate list must be in a fixed order");
+    }
+
+    #[test]
+    fn the_escape_round_is_reachable_before_the_liveness_window_matters() {
+        // A view change every few seconds must reach the wider set in a sensible
+        // time rather than after hundreds of rounds.
+        assert!(PROPOSER_ESCAPE_ROUND <= 16, "escape takes too long to reach");
+        assert!(PROPOSER_ESCAPE_ROUND >= 2, "escaping immediately defeats the narrowing");
     }
 }

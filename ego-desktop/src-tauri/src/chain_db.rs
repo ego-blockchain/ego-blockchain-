@@ -1592,6 +1592,29 @@ pub fn latest_block_info() -> (u64, String) {
     (height, hash)
 }
 
+/// Validators that actually produced a block in the recent past.
+///
+/// Derived only from committed blocks, so every node computes the same set
+/// from the same chain. That matters: filtering by each node's own opinion of
+/// who is online would have nodes disagree about the leader and propose
+/// against each other, which is the duelling-proposer failure the registered
+/// set exists to avoid.
+///
+/// Returns addresses in no particular order; the caller sorts.
+pub fn recently_active_validators(lookback: u64) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let (tip, _) = latest_block_info();
+    let start = tip.saturating_sub(lookback);
+    for h in start..=tip {
+        if let Some(b) = get_block_by_height(h) {
+            if !b.miner.is_empty() {
+                out.insert(b.miner);
+            }
+        }
+    }
+    out
+}
+
 pub fn block_count() -> u64 {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let cf_meta = db.cf_handle(CF_META).unwrap();
