@@ -3,7 +3,20 @@ import { invoke } from '@tauri-apps/api/tauri';
 import { useWallet } from '../App';
 import { useConfirm } from '../hooks/useConfirm';
 
+interface StakePosition {
+  id:         string;
+  amount:     number;
+  staked_at:  number;
+  lock_days:  number;
+  unstake_at: number;
+  is_locked:  boolean;
+  apr:        number;
+  accrued:    number;
+  early_fee:  number;
+}
+
 interface StakingInfo {
+  positions:  StakePosition[];
   staked_amount:      number;
   lock_period_days:   number;
   apr:                number;
@@ -29,6 +42,7 @@ interface CombinedDrs {
 
 interface Tokenomics {
   total_supply_egoc:  number;
+  is_testnet:         boolean;
   circulating_egoc:   number;
   circulating_pct:    number;
   halving: {
@@ -125,15 +139,17 @@ const StakingPage: React.FC = () => {
     }
   }
 
-  async function handleUnstake(earlyUnstake: boolean = false) {
+  async function handleUnstake(earlyUnstake: boolean = false, positionId?: string) {
     if (earlyUnstake) {
-      const fee = info ? (info.early_unstake_fee / 1_000_000).toFixed(4) : '0';
-      if (!await confirm(`Early unstake will deduct ${fee} EGOC as a 10% fee.`, { detail: 'This fee goes to network nodes. Are you sure you want to proceed?', confirmLabel: 'Unstake Early' })) return;
+      const pos = positionId ? info?.positions.find(p => p.id === positionId) : undefined;
+      const feeUegoc = pos ? pos.early_fee : (info?.early_unstake_fee ?? 0);
+      const fee = (feeUegoc / 1_000_000).toFixed(4);
+      if (!await confirm(`Early unstake will deduct ${fee} EGOC as a 10% fee.`, { detail: 'This fee goes to network nodes. Only this position is unstaked; your other positions are unaffected.', confirmLabel: 'Unstake Early' })) return;
     }
     setSubmitting(true);
     setResult(null);
     try {
-      await invoke('unstake_coins', { early: earlyUnstake });
+      await invoke('unstake_coins', { early: earlyUnstake, positionId: positionId ?? null });
       await load();
       setResult({ ok: true, msg: earlyUnstake ? 'Early unstake complete (10% fee applied).' : 'Stake returned to your wallet.' });
     } catch (e: any) {
@@ -286,17 +302,19 @@ const StakingPage: React.FC = () => {
                   )}
 
                   {hasStake && (
-                    <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-3 text-xs text-yellow-300">
-                      ⚠️ You already have {fmtEgoc(info!.staked_amount)} EGOC staked. Unstake first before staking again.
+                    <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl p-3 text-xs text-blue-300">
+                      You have {fmtEgoc(info!.staked_amount)} EGOC staked. Adding more merges into that
+                      position. Interest on the new amount starts today, and your unlock date only moves
+                      later, never earlier.
                     </div>
                   )}
 
                   <button
                     onClick={handleStake}
-                    disabled={!stakeAmount || submitting || hasStake}
+                    disabled={!stakeAmount || submitting}
                     className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-40 py-3 rounded-xl font-semibold transition"
                   >
-                    {submitting ? '⏳ Processing...' : '🔒 Stake EGOC'}
+                    {submitting ? 'Processing...' : hasStake ? 'Add to Stake' : 'Stake EGOC'}
                   </button>
                 </div>
               ) : (
@@ -304,63 +322,83 @@ const StakingPage: React.FC = () => {
                 <div className="space-y-4">
                   {hasStake ? (
                     <>
-                      {}
-                      <div className="bg-gray-900 rounded-xl p-4 space-y-3">
-                        <div className="text-sm font-semibold text-gray-200 mb-1">Current Stake</div>
-                        <div className="grid grid-cols-2 gap-3 text-sm">
-                          <div>
-                            <div className="text-xs text-gray-400 mb-0.5">Amount Staked</div>
-                            <div className="text-blue-400 font-bold">{fmtEgoc(info!.staked_amount)} EGOC</div>
-                          </div>
-                          <div>
-                            <div className="text-xs text-gray-400 mb-0.5">Lock Period</div>
-                            <div className="text-white font-medium">{info!.lock_period_days} days</div>
-                          </div>
-                          <div>
-                            <div className="text-xs text-gray-400 mb-0.5">Staked On</div>
-                            <div className="text-white font-medium">{fmtDate(info!.staked_at)}</div>
-                          </div>
-                          <div>
-                            <div className="text-xs text-gray-400 mb-0.5">Unlocks On</div>
-                            <div className={`font-medium ${info!.is_locked ? 'text-yellow-400' : 'text-green-400'}`}>
-                              {fmtDate(info!.unlock_date)}
-                            </div>
-                          </div>
-                        </div>
-                        {info!.is_locked && (
-                          <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3 text-xs text-yellow-300 mt-1">
-                            🔒 Lock period ends on {fmtDate(info!.unlock_date)}. Early unstake fee: {((info!.early_unstake_fee) / 1_000_000).toFixed(4)} EGOC (10%)
-                          </div>
-                        )}
-                        {canUnstake && (
-                          <div className="bg-green-500/10 border border-green-500/30 rounded-lg p-3 text-xs text-green-300 mt-1">
-                            ✅ Lock period has ended. Ready to unstake — no fee.
-                          </div>
-                        )}
+                      <div className="text-xs text-gray-400 mb-1">
+                        {info!.positions.length} position{info!.positions.length === 1 ? '' : 's'} ·
+                        {' '}{fmtEgoc(info!.staked_amount)} EGOC total
                       </div>
 
-                      {info!.is_locked ? (
-                        <div className="space-y-2">
-                          <button
-                            onClick={() => handleUnstake(true)}
-                            disabled={submitting}
-                            className="w-full bg-yellow-600 hover:bg-yellow-500 disabled:opacity-40 py-3 rounded-xl font-semibold transition"
-                          >
-                            {submitting ? '⏳ Processing...' : `⚡ Unstake Early (10% fee)`}
-                          </button>
-                          <div className="text-center text-xs text-gray-500 py-1">
-                            — or — wait until {fmtDate(info!.unlock_date)} for no fee
-                          </div>
-                        </div>
-                      ) : (
-                        <button
-                          onClick={() => handleUnstake(false)}
-                          disabled={!canUnstake || submitting}
-                          className="w-full bg-green-600 hover:bg-green-500 disabled:opacity-40 py-3 rounded-xl font-semibold transition"
+                      {info!.positions
+                        .slice()
+                        .sort((a, b) => a.unstake_at - b.unstake_at)
+                        .map(pos => (
+                        <div
+                          key={pos.id}
+                          className={`bg-gray-900 rounded-xl p-4 space-y-3 border ${
+                            pos.is_locked ? 'border-yellow-500/25' : 'border-green-500/30'
+                          }`}
                         >
-                          {submitting ? '⏳ Processing...' : '🔓 Unstake Now (no fee)'}
-                        </button>
-                      )}
+                          <div className="flex items-center justify-between">
+                            <div className="text-blue-400 font-bold text-lg">
+                              {fmtEgoc(pos.amount)} EGOC
+                            </div>
+                            <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full ${
+                              pos.is_locked
+                                ? 'bg-yellow-500/15 text-yellow-400'
+                                : 'bg-green-500/15 text-green-400'
+                            }`}>
+                              {pos.is_locked ? 'Locked' : 'Unlocked'}
+                            </span>
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-3 text-sm">
+                            <div>
+                              <div className="text-xs text-gray-400 mb-0.5">Lock Period</div>
+                              <div className="text-white font-medium">{pos.lock_days} days</div>
+                            </div>
+                            <div>
+                              <div className="text-xs text-gray-400 mb-0.5">APR</div>
+                              <div className="text-white font-medium">{pos.apr.toFixed(2)}%</div>
+                            </div>
+                            <div>
+                              <div className="text-xs text-gray-400 mb-0.5">Staked On</div>
+                              <div className="text-white font-medium">{fmtDate(pos.staked_at)}</div>
+                            </div>
+                            <div>
+                              <div className="text-xs text-gray-400 mb-0.5">Unlocks On</div>
+                              <div className={`font-medium ${pos.is_locked ? 'text-yellow-400' : 'text-green-400'}`}>
+                                {fmtDate(pos.unstake_at)}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center justify-between text-xs pt-1 border-t border-gray-800">
+                            <span className="text-gray-400">Interest accrued</span>
+                            <span className="text-cyan-400 font-mono">
+                              {(pos.accrued / 1_000_000).toFixed(6)} EGOC
+                            </span>
+                          </div>
+
+                          {pos.is_locked ? (
+                            <button
+                              onClick={() => handleUnstake(true, pos.id)}
+                              disabled={submitting}
+                              className="w-full bg-yellow-600 hover:bg-yellow-500 disabled:opacity-40 py-2 rounded-lg text-sm font-semibold transition"
+                            >
+                              {submitting
+                                ? 'Processing...'
+                                : `Unstake early (fee ${(pos.early_fee / 1_000_000).toFixed(4)} EGOC)`}
+                            </button>
+                          ) : (
+                            <button
+                              onClick={() => handleUnstake(false, pos.id)}
+                              disabled={submitting}
+                              className="w-full bg-green-600 hover:bg-green-500 disabled:opacity-40 py-2 rounded-lg text-sm font-semibold transition"
+                            >
+                              {submitting ? 'Processing...' : 'Unstake now (no fee)'}
+                            </button>
+                          )}
+                        </div>
+                      ))}
                     </>
                   ) : (
                     <div className="text-center py-8 text-gray-500">
@@ -440,6 +478,7 @@ const StakingPage: React.FC = () => {
                   <span className="text-gray-400">Total supply</span>
                   <span className="font-mono">{tokenomics.total_supply_egoc.toLocaleString()} EGOC</span>
                 </div>
+                {!tokenomics.is_testnet && (
                 <div className="flex justify-between">
                   <span className="text-gray-400">Circulating</span>
                   <span className="font-mono text-green-400">
@@ -447,6 +486,7 @@ const StakingPage: React.FC = () => {
                     <span className="text-gray-500 ml-1">({tokenomics.circulating_pct}%)</span>
                   </span>
                 </div>
+                )}
                 <div className="flex justify-between">
                   <span className="text-gray-400">Block reward</span>
                   <span className="font-mono text-yellow-400">

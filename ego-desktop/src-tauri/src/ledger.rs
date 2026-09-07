@@ -586,6 +586,15 @@ pub struct LedgerBlock {
     pub bls_pubkeys: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StakePosition {
+    pub id: String,
+    pub amount_uegoc: u64,
+    pub staked_at: i64,
+    pub lock_days: u32,
+    pub unstake_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StoredFile {
     pub cid: String,
@@ -738,6 +747,16 @@ pub struct Ledger {
     pub security_pin_hash: String,
     #[serde(default)]
     pub security_pin_salt: String,
+    /// Individual stake positions. Each keeps its own start date and lock so a
+    /// top-up never inherits interest the earlier coins earned, and an old
+    /// position's unlock date is not moved by adding a new one.
+    #[serde(default)]
+    pub stake_positions: Vec<StakePosition>,
+
+    /// Aggregate of `stake_positions`, kept in sync by `sync_stake_aggregates`.
+    /// Retained because DRS, validator registration and the quorum gate all read
+    /// a single total, and because ledgers written before positions existed carry
+    /// their stake here.
     #[serde(default)]
     pub staked_amount: u64,
     #[serde(default)]
@@ -871,6 +890,39 @@ pub struct PresaleIouRecord {
 }
 
 impl Ledger {
+    /// Ledgers written before positions existed carry their stake in the flat
+    /// fields. Fold that into a single position so every code path can assume
+    /// `stake_positions` is authoritative.
+    pub fn migrate_stake_positions(&mut self) {
+        if !self.stake_positions.is_empty() || self.staked_amount == 0 {
+            return;
+        }
+        let staked_at = self.staked_at.unwrap_or_else(|| chrono::Utc::now().timestamp());
+        let unstake_at = self.unstake_at
+            .unwrap_or(staked_at + (self.stake_lock_days as i64 * 24 * 3600));
+        self.stake_positions.push(StakePosition {
+            id: format!("legacy-{staked_at}"),
+            amount_uegoc: self.staked_amount,
+            staked_at,
+            lock_days: self.stake_lock_days,
+            unstake_at,
+        });
+    }
+
+    /// Recompute the flat fields from `stake_positions`. The total is the sum;
+    /// `staked_at` is the earliest position and `unstake_at` the latest, so the
+    /// legacy "is locked" check stays conservative and reports locked while any
+    /// position is still locked.
+    pub fn sync_stake_aggregates(&mut self) {
+        self.staked_amount = self.stake_positions.iter().map(|p| p.amount_uegoc).sum();
+        self.staked_at = self.stake_positions.iter().map(|p| p.staked_at).min();
+        self.unstake_at = self.stake_positions.iter().map(|p| p.unstake_at).max();
+        self.stake_lock_days = self.stake_positions.iter()
+            .max_by_key(|p| p.unstake_at)
+            .map(|p| p.lock_days)
+            .unwrap_or(0);
+    }
+
     pub fn load() -> Self {
         let _guard = ledger_io_mutex().lock().unwrap_or_else(|e| e.into_inner());
         let path = ledger_path();

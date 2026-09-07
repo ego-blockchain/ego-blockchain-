@@ -29,12 +29,30 @@ pub struct StakingInfo {
     pub is_locked:         bool,
     pub projected_interest: u64,
     pub early_unstake_fee:  u64,
+    pub positions:          Vec<StakePositionView>,
+}
+
+/// One stake position as the UI sees it, with its own accrued interest so each
+/// row can be judged on its own terms rather than against a blended average.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StakePositionView {
+    pub id:            String,
+    pub amount:        u64,
+    pub staked_at:     i64,
+    pub lock_days:     u32,
+    pub unstake_at:    i64,
+    pub is_locked:     bool,
+    pub apr:           f64,
+    pub accrued:       u64,
+    pub early_fee:     u64,
 }
 
 #[tauri::command]
 pub async fn get_staking_info() -> Result<StakingInfo, EgoDesktopError> {
     tokio::task::spawn_blocking(|| {
-        let ledger = Ledger::load();
+        let mut ledger = Ledger::load();
+        ledger.migrate_stake_positions();
+        ledger.sync_stake_aggregates();
         let now    = chrono::Utc::now().timestamp();
         let is_locked = ledger.staked_amount > 0
             && ledger.unstake_at.map(|u| u > now).unwrap_or(false);
@@ -70,7 +88,30 @@ pub async fn get_staking_info() -> Result<StakingInfo, EgoDesktopError> {
         };
         let early_unstake_fee = ledger.staked_amount / 10;
 
+        // Each position accrues on its own start date and its own lock, which is
+        // the whole point of keeping them separate.
+        let pool_left = staking_pool_remaining_uegoc(&load_chain());
+        let positions: Vec<StakePositionView> = ledger.stake_positions.iter().map(|p| {
+            let bps  = effective_apr_bps(p.lock_days);
+            let held = (now - p.staked_at).max(0) as u128;
+            let accrued = if pool_left > 0 {
+                (p.amount_uegoc as u128 * bps as u128 * held / (10_000 * 31_536_000)) as u64
+            } else { 0 };
+            StakePositionView {
+                id:         p.id.clone(),
+                amount:     p.amount_uegoc,
+                staked_at:  p.staked_at,
+                lock_days:  p.lock_days,
+                unstake_at: p.unstake_at,
+                is_locked:  p.unstake_at > now,
+                apr:        bps as f64 / 100.0,
+                accrued,
+                early_fee:  p.amount_uegoc / 10,
+            }
+        }).collect();
+
         Ok::<_, EgoDesktopError>(StakingInfo {
+            positions,
             staked_amount:     ledger.staked_amount,
             lock_period_days:  ledger.stake_lock_days,
             apr:               apr_bps as f64 / 100.0,
@@ -110,11 +151,9 @@ pub async fn stake_coins(
     if from.is_empty() {
         return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
     }
-    if ledger.staked_amount > 0 {
-        return Err(EgoDesktopError::InvalidInput(
-            "Already have an active stake. Unstake first.".into(),
-        ));
-    }
+    // Each stake is an independent position. Adding coins never alters an existing
+    // one: its start date, lock and accrued interest stay exactly as they were.
+    ledger.migrate_stake_positions();
 
     let chain   = load_chain();
     let balance = chain.balance_of(&from);
@@ -207,10 +246,14 @@ pub async fn stake_coins(
         ..LedgerTx::default()
     });
 
-    ledger.staked_amount         = amount_uegoc;
-    ledger.staked_at             = Some(ts);
-    ledger.stake_lock_days       = lock_days;
-    ledger.unstake_at            = Some(ts + (lock_days as i64 * 24 * 3600));
+    ledger.stake_positions.push(crate::ledger::StakePosition {
+        id: tx_hash.clone(),
+        amount_uegoc: amount_uegoc,
+        staked_at: ts,
+        lock_days,
+        unstake_at: ts + (lock_days as i64 * 24 * 3600),
+    });
+    ledger.sync_stake_aggregates();
     ledger.nonce                 = nonce;
     // Record the TX hash so startup reconciliation can verify it was actually mined.
     ledger.pending_stake_tx_hash = tx_hash.clone();
@@ -223,7 +266,11 @@ pub async fn stake_coins(
 }
 
 #[tauri::command]
-pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<(), EgoDesktopError> {
+pub async fn unstake_coins(
+    early: bool,
+    position_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), EgoDesktopError> {
     let mut ledger = Ledger::load();
     let from = ledger.address.clone();
     if from.is_empty() {
@@ -245,12 +292,36 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
         )));
     }
 
-    let staked_amount = ledger.staked_amount;
+    ledger.migrate_stake_positions();
+
+    // Without an id, unstake the position that unlocked earliest, which is the
+    // one a user almost always means. With an id, unstake exactly that position
+    // and leave the others untouched.
+    let idx = match &position_id {
+        Some(id) => ledger.stake_positions.iter().position(|p| &p.id == id)
+            .ok_or_else(|| EgoDesktopError::InvalidInput("No such stake position.".into()))?,
+        None => ledger.stake_positions.iter()
+            .enumerate()
+            .min_by_key(|(_, p)| p.unstake_at)
+            .map(|(i, _)| i)
+            .ok_or_else(|| EgoDesktopError::InvalidInput("Nothing staked.".into()))?,
+    };
+    let position = ledger.stake_positions[idx].clone();
+
+    if position.unstake_at > now && !early {
+        let days_left = ((position.unstake_at - now) as f64 / 86400.0).ceil() as i64;
+        return Err(EgoDesktopError::InvalidInput(format!(
+            "This position is locked for {days_left} more day{}. Use early unstake to pay the fee and exit now.",
+            if days_left == 1 { "" } else { "s" }
+        )));
+    }
+
+    let staked_amount = position.amount_uegoc;
     let ts            = now;
 
-    // Accrue rewards up to now (same formula as get_staking_info).
-    let staked_since_secs = ledger.staked_at.map(|t| (now - t).max(0) as u64).unwrap_or(0);
-    let apr_bps = effective_apr_bps(ledger.stake_lock_days);
+    // Accrue on this position's own start date and lock, not a blended average.
+    let staked_since_secs = (now - position.staked_at).max(0) as u64;
+    let apr_bps = effective_apr_bps(position.lock_days);
     let accrued_rewards: u64 = {
         let chain     = load_chain();
         let pool_left = staking_pool_remaining_uegoc(&chain);
@@ -313,11 +384,11 @@ pub async fn unstake_coins(early: bool, state: State<'_, AppState>) -> Result<()
     // and no mint surface. `accrued_rewards` here is only for the optimistic UI
     // estimate — the authoritative figure is recomputed on-chain.
     let _ = accrued_rewards;
-    ledger.staked_amount         = 0;
-    ledger.staked_at             = None;
-    ledger.stake_lock_days       = 0;
-    ledger.unstake_at            = None;
-    ledger.pending_stake_tx_hash = String::new();
+    ledger.stake_positions.retain(|p| p.id != position.id);
+    ledger.sync_stake_aggregates();
+    if ledger.stake_positions.is_empty() {
+        ledger.pending_stake_tx_hash = String::new();
+    }
     ledger.nonce                 = unstake_nonce;
     ledger.save().map_err(EgoDesktopError::FileSystemError)?;
     Ok(())
