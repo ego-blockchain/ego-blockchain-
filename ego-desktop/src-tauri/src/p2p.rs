@@ -4234,6 +4234,40 @@ fn sideband_msg_id(hash: &str) -> u32 {
     h
 }
 
+/// Send a transaction over the offline link because the sender asked for it,
+/// rather than because gossip had nowhere to go.
+///
+/// Used when the route was chosen before signing. Unlike offer_to_sideband this
+/// does not check connectivity: someone who picks the radio while apparently
+/// online is usually saying they do not believe the internet path is reaching
+/// anyone, and that judgement is theirs to make.
+pub async fn send_over_sideband(tx: &LedgerTx) -> bool {
+    if !crate::sideband::has_transport() {
+        eprintln!("[Sideband] no transport configured, tx {} not sent", tx.hash);
+        return false;
+    }
+    let msg = P2PMessage::TxBroadcast { tx: tx.clone(), block: LedgerBlock::default() };
+    let data = match serde_json::to_vec(&msg) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[Sideband] could not serialise tx {}: {e}", tx.hash);
+            return false;
+        }
+    };
+    let id = sideband_msg_id(&tx.hash);
+    let hash = tx.hash.clone();
+    tokio::task::spawn_blocking(move || {
+        if crate::sideband::broadcast(&data, id) == 0 {
+            eprintln!("[Sideband] tx {hash} had no transport able to transmit");
+            return false;
+        }
+        crate::commands::tx_transport::record(&hash, "radio");
+        true
+    })
+    .await
+    .unwrap_or(false)
+}
+
 /// Hand a transaction to the radio, satellite or sneakernet path.
 ///
 /// Only when gossip has nowhere to go. A sideband link carries a few hundred

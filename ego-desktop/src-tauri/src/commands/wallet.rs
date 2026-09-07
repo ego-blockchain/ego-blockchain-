@@ -71,6 +71,13 @@ pub struct SendTransactionRequest {
     pub amount: u64,
     pub memo: Option<String>,
     pub is_private: Option<bool>,
+    /// Send over the offline link instead of the internet, chosen before signing.
+    ///
+    /// The route has to be picked up front. Offering it afterwards meant a
+    /// payment that had already gone out over gossip was transmitted a second
+    /// time, which wastes a link measured in hundreds of bytes per second.
+    #[serde(default)]
+    pub via_radio: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -240,7 +247,15 @@ pub async fn send_transaction(
     ledger.nonce = nonce;
     let _ = ledger.save();
 
-    {
+    if request.via_radio.unwrap_or(false) {
+        // Deliberately not gossiped. The sender chose the radio because they do
+        // not trust the internet path, so putting it on both defeats the point
+        // and sends the same transaction twice.
+        let tx_radio = tx.clone();
+        tauri::async_runtime::spawn(async move {
+            crate::p2p::send_over_sideband(&tx_radio).await;
+        });
+    } else {
         let tx_gossip = tx.clone();
         tauri::async_runtime::spawn(async move {
             crate::p2p::broadcast_pending_tx(tx_gossip).await;

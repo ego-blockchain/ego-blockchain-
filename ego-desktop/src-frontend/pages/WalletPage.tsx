@@ -66,6 +66,7 @@ interface SendForm {
   amount: string;
   memo: string;
   isPrivate: boolean;
+  viaRadio: boolean;
 }
 
 interface SidebandStatus {
@@ -361,7 +362,7 @@ const WalletPage: React.FC = () => {
   const [selectedTx, setSelectedTx] = useState<LedgerTx | null>(null);
   const [showSend, setShowSend]     = useState(false);
   const [showReceive, setShowReceive] = useState(false);
-  const [sendForm, setSendForm]     = useState<SendForm>({ to: '', amount: '', memo: '', isPrivate: false });
+  const [sendForm, setSendForm]     = useState<SendForm>({ to: '', amount: '', memo: '', isPrivate: false, viaRadio: false });
   const [sending, setSending]       = useState(false);
   const [txResult, setTxResult]         = useState<TxResult | null>(null);
   const [sideband, setSideband]         = useState<SidebandStatus | null>(null);
@@ -613,7 +614,13 @@ const WalletPage: React.FC = () => {
   async function submitTx() {
     if (!sendForm.to || !sendForm.amount) return;
     const amount  = Math.floor(parseFloat(sendForm.amount) * 1_000_000);
-    const request = { to_address: sendForm.to, amount, memo: sendForm.memo || null, is_private: sendForm.isPrivate };
+    const request = {
+      to_address: sendForm.to,
+      amount,
+      memo: sendForm.memo || null,
+      is_private: sendForm.isPrivate,
+      via_radio: sendForm.viaRadio,
+    };
     try {
       const res = await invoke<TxResult>('send_transaction', { request });
       setEmailStep('idle');
@@ -659,7 +666,7 @@ const WalletPage: React.FC = () => {
     setSidebandMsg('');
     setShowSend(false);
     setSending(false);
-    setSendForm({ to: '', amount: '', memo: '', isPrivate: false });
+    setSendForm({ to: '', amount: '', memo: '', isPrivate: false, viaRadio: false });
     setTxResult(null);
     setTxConfirmedHeight(null);
     setEmailStep('idle');
@@ -2978,21 +2985,12 @@ const WalletPage: React.FC = () => {
                     </div>
                     <p className="text-xs text-gray-400 leading-relaxed">
                       {sideband.online
-                        ? 'Your connection is working, so this went out over the internet. Send it over radio as well only if you believe the network is being filtered.'
-                        : `No internet peers were reachable, so this left over your offline transport instead. It stays valid for ${sideband.max_age_hours} hours while it travels, and both you and the recipient will see it marked as delivered by radio.`}
+                        ? 'Your connection was working, so this went out over the internet.'
+                        : `No internet peers were reachable, so this left over your offline transport instead. It stays valid for ${sideband.max_age_hours} hours while it travels.`}
                     </p>
                     <div className="text-xs text-gray-500">
                       Outbox holds {sideband.outbox_frames} frame{sideband.outbox_frames === 1 ? '' : 's'}
                     </div>
-                    {sideband.online && (
-                      <button
-                        onClick={() => queueOverSideband(txResult.hash)}
-                        className="w-full bg-amber-600/80 hover:bg-amber-500 py-2 rounded-lg text-xs font-semibold transition"
-                      >
-                        Also send over radio
-                      </button>
-                    )}
-                    {sidebandMsg && <div className="text-xs text-amber-300">{sidebandMsg}</div>}
                   </div>
                 )}
                 <button onClick={resetSend} className="w-full bg-blue-600 hover:bg-blue-500 py-3 rounded-xl font-semibold transition">
@@ -3081,6 +3079,32 @@ const WalletPage: React.FC = () => {
                       <div className={`absolute top-1 w-3 h-3 rounded-full bg-white transition-all ${sendForm.isPrivate ? 'left-6' : 'left-1'}`} />
                     </button>
                   </div>
+                  {sideband?.enabled && (
+                    <div className="flex items-center justify-between bg-gray-900/50 p-3 rounded-xl border border-gray-700/50">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 rounded-lg bg-amber-500/10 flex items-center justify-center text-amber-400 font-bold text-xs">RF</div>
+                        <div>
+                          <div className="text-sm font-semibold">Send via Radio Frequency</div>
+                          <div className="text-[10px] text-gray-500 uppercase font-bold tracking-wider">
+                            {sideband.online ? 'Bypass the internet' : 'No internet — will be used automatically'}
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => setSendForm(f => ({ ...f, viaRadio: !f.viaRadio }))}
+                        className={`w-10 h-5 rounded-full transition-colors relative ${sendForm.viaRadio ? 'bg-amber-500' : 'bg-gray-700'}`}
+                      >
+                        <div className={`absolute top-1 w-3 h-3 rounded-full bg-white transition-all ${sendForm.viaRadio ? 'left-6' : 'left-1'}`} />
+                      </button>
+                    </div>
+                  )}
+                  {sendForm.viaRadio && (
+                    <div className="bg-amber-500/5 border border-amber-500/20 rounded-xl p-3 text-[11px] text-amber-200/70 leading-relaxed">
+                      This will be written to your offline link and not sent over the
+                      internet, so it travels once by the route you chose. It stays valid
+                      for {sideband?.max_age_hours ?? 24} hours while it crosses.
+                    </div>
+                  )}
                   {(sendForm.isPrivate || (parseFloat(sendForm.amount) >= 50000)) && (
                     <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-xl p-3 text-[11px] text-yellow-200/70 leading-relaxed">
                       {parseFloat(sendForm.amount) >= 50000 
