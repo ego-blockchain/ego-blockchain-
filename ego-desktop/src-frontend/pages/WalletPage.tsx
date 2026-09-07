@@ -1627,7 +1627,7 @@ const WalletPage: React.FC = () => {
                           ? `Block #${tx.block_height ?? '—'}` : tx.is_private ? 'On-chain identities hidden'
                           : isSent ? `To: ${shortAddr(tx.to)}` : `From: ${shortAddr(tx.from)}`}
                         {tx.memo && <span className="ml-2 text-gray-600">• {tx.memo}</span>}
-                        {tx.transport && (
+                        {tx.transport && tx.transport !== 'internet' && (
                           <span
                             title="This payment travelled over an offline link rather than the internet"
                             className="ml-2 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 text-[10px] font-semibold uppercase tracking-wide"
@@ -3189,7 +3189,7 @@ const WalletPage: React.FC = () => {
                 {selectedTx.status}
               </div>
             </div>
-            {selectedTx.transport && (
+            {selectedTx.transport && selectedTx.transport !== 'internet' && (
               <div className="rounded-xl p-3 mb-5 bg-amber-500/10 border border-amber-500/30 text-center">
                 <div className="text-sm font-bold text-amber-300">Sent via Radio Frequency</div>
                 <div className="text-xs text-amber-200/70 mt-0.5">
@@ -3217,10 +3217,12 @@ const WalletPage: React.FC = () => {
                 { label: 'Timestamp', val: sfTime(selectedTx.timestamp) },
                 { label: 'Signature', val: selectedTx.signature.slice(0, 32) + '…', mono: true },
                 ...(selectedTx.memo ? [{ label: 'Memo', val: selectedTx.memo }] : []),
-                ...(selectedTx.transport
-                  ? [{ label: 'Sent via', val: 'Radio Frequency' },
-                     { label: 'Link', val: selectedTx.transport, mono: true }]
-                  : [{ label: 'Sent via', val: 'Internet' }]),
+                ...(selectedTx.transport === 'internet'
+                  ? [{ label: 'Sent via', val: 'Internet' }]
+                  : selectedTx.transport
+                    ? [{ label: 'Sent via', val: 'Radio Frequency' },
+                       { label: 'Link', val: selectedTx.transport, mono: true }]
+                    : []),
               ].map(({ label, val, mono }) => (
                 <div key={label} className="flex justify-between items-start gap-4 py-1 border-b border-gray-700/50 last:border-0">
                   <span className="text-gray-400 text-sm shrink-0">{label}</span>
@@ -3229,7 +3231,7 @@ const WalletPage: React.FC = () => {
                   </span>
                 </div>
               ))}
-              {selectedTx.transport && (
+              {selectedTx.transport && selectedTx.transport !== 'internet' && (
                 <p className="text-xs text-amber-300/80 leading-relaxed pt-2">
                   This payment crossed an offline link rather than the internet. The
                   amount, sender and receiver are signed and cannot be altered; the

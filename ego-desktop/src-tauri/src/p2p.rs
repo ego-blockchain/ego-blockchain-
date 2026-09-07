@@ -4240,7 +4240,20 @@ fn sideband_msg_id(hash: &str) -> u32 {
 /// bytes per second at best, so mirroring every transaction onto it while the
 /// internet works would saturate it for no gain.
 pub async fn offer_to_sideband(msg: &P2PMessage, tx_hash: &str) {
-    if has_connectivity() || !crate::sideband::has_transport() {
+    if has_connectivity() {
+        // Record that we reached the network the ordinary way, at the moment we
+        // did it. The wallet must never infer "internet" from the absence of a
+        // label: a transaction from before this field existed, or one whose
+        // label a relay stripped, is unknown, not proof of anything.
+        let hash = tx_hash.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            mark_local_tx_transport(&hash, "internet")
+        }).await;
+        return;
+    }
+    if !crate::sideband::has_transport() {
+        // Offline with nowhere to hand it. It waits in the mempool and we do
+        // not yet know how it will eventually travel, so we claim nothing.
         return;
     }
     let data = match serde_json::to_vec(msg) {
