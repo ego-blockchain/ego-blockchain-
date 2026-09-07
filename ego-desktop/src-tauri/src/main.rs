@@ -388,8 +388,19 @@ fn main() {
         // `libp2p_gossipsub=error` silences the noisy "Send Queue full" WARN that dumps
         // the entire message payload as a raw byte array — it's backpressure to a slow
         // (relayed) peer, not corruption, and gossip resends, so it's safe to quiet.
-        let filter = EnvFilter::try_from_env("EGO_LOG")
-            .unwrap_or_else(|_| EnvFilter::new("ego_desktop=info,warn,libp2p_gossipsub=error"));
+        // dcutr and the relay client warn on every hole-punch attempt they drop,
+        // and a node connected to a few dozen peers through a relay drops them
+        // constantly: "Dropping in-flight connect request because we are at
+        // capacity". It is libp2p managing its own concurrency, the peers stay
+        // reachable over the relay, and nothing is lost. But it emits faster
+        // than anything else in the log, and a real consensus stall was sitting
+        // underneath thousands of those lines, unreadable. Kept at error so a
+        // genuine failure still surfaces.
+        let filter = EnvFilter::try_from_env("EGO_LOG").unwrap_or_else(|_| {
+            EnvFilter::new(
+                "ego_desktop=info,warn,                 libp2p_gossipsub=error,                 libp2p_dcutr=error,                 libp2p_relay=error",
+            )
+        });
         tracing_subscriber::registry()
             .with(fmt::layer().with_target(false))
             .with(filter)
