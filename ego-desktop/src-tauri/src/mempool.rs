@@ -904,11 +904,24 @@ pub async fn run_batch_loop() {
             }
         }
         if !allow_pre_bft_solo() {
-            tracing::warn!(
-                "BFT quorum not ready: {} known validator(s), need {}; leaving txs in mempool",
-                known_count,
-                needed
-            );
+            // Two different situations reach here and they need different words.
+            // Saying "quorum not ready" when the quorum is met sent a real
+            // investigation down the wrong path for a long time: the operator
+            // reads it, counts their validators, sees the number matches, and
+            // has no idea what the node is actually complaining about.
+            if known_count >= needed {
+                tracing::warn!(
+                    "Chain has not finalized for {}s with {} validator(s) — the elected                      proposer is not producing. Quorum is met; solo mining is refused, so                      transactions wait for a proposer that answers.",
+                    stuck_secs,
+                    known_count
+                );
+            } else {
+                tracing::warn!(
+                    "Not enough validators to finalize: {} known, need {}; leaving txs in mempool",
+                    known_count,
+                    needed
+                );
+            }
             last_block_at    = Instant::now();
             batch_started_at = None;
             continue;

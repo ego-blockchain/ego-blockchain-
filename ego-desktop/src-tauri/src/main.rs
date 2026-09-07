@@ -382,6 +382,15 @@ fn headless_main() {
     });
 }
 
+/// Default log filter, used when EGO_LOG is unset.
+///
+/// Must be one line with no whitespace between directives. EnvFilter discards a
+/// directive it cannot parse without saying so, so a stray space silently turns
+/// the rule off and the noise it was meant to suppress carries on. That is not a
+/// hypothetical: it shipped that way once, and looked like a stale build.
+const DEFAULT_LOG_FILTER: &str =
+    "ego_desktop=info,warn,libp2p_gossipsub=error,libp2p_dcutr=error,libp2p_relay=error";
+
 fn main() {
     {
         use tracing_subscriber::{fmt, EnvFilter, prelude::*};
@@ -396,11 +405,8 @@ fn main() {
         // than anything else in the log, and a real consensus stall was sitting
         // underneath thousands of those lines, unreadable. Kept at error so a
         // genuine failure still surfaces.
-        let filter = EnvFilter::try_from_env("EGO_LOG").unwrap_or_else(|_| {
-            EnvFilter::new(
-                "ego_desktop=info,warn,                 libp2p_gossipsub=error,                 libp2p_dcutr=error,                 libp2p_relay=error",
-            )
-        });
+        let filter = EnvFilter::try_from_env("EGO_LOG")
+            .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
         tracing_subscriber::registry()
             .with(fmt::layer().with_target(false))
             .with(filter)
@@ -1373,4 +1379,45 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::DEFAULT_LOG_FILTER;
+
+    /// EnvFilter drops directives it cannot parse and reports nothing, so a
+    /// malformed default disables itself quietly. Parse it strictly instead.
+    #[test]
+    fn the_default_filter_parses_without_losing_directives() {
+        let parsed = tracing_subscriber::filter::EnvFilter::builder()
+            .parse(DEFAULT_LOG_FILTER)
+            .expect("default log filter must be valid");
+        let rendered = parsed.to_string();
+        for directive in DEFAULT_LOG_FILTER.split(',') {
+            let target = directive.split('=').next().unwrap_or_default();
+            assert!(
+                rendered.contains(target),
+                "directive {directive} was dropped; filter parsed as {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_filter_carries_no_stray_whitespace() {
+        assert!(
+            !DEFAULT_LOG_FILTER.contains(' '),
+            "a space between directives makes EnvFilter discard the rest"
+        );
+    }
+
+    #[test]
+    fn the_noisy_relay_targets_are_actually_covered() {
+        // These are the ones that bury a real failure under thousands of lines.
+        for target in ["libp2p_relay", "libp2p_dcutr", "libp2p_gossipsub"] {
+            assert!(
+                DEFAULT_LOG_FILTER.contains(&format!("{target}=error")),
+                "{target} is not quieted"
+            );
+        }
+    }
 }

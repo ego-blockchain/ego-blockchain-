@@ -1609,25 +1609,19 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
         return Ok(());
     }
 
-    // ── Large-transfer gate ──────────────────────────────────────────────
-    // WARNING: this is not a compliance control and must not be presented as
-    // one. compliance_proof is never verified anywhere in this codebase, so
-    // any non-empty string satisfies it. It deters nothing and proves nothing.
+    // A large-transfer gate used to sit here and it was removed, deliberately.
     //
-    // Either check it against something real or delete it. Leaving it gives
-    // reviewers the impression of an AML control that does not exist.
+    // It rejected an is_private transfer over 50,000 EGOC unless compliance_proof
+    // was non-empty. Two things were wrong with that. compliance_proof is never
+    // set anywhere in this codebase and never verified anywhere either, so it
+    // proved nothing and any string would have satisfied it. And is_private is
+    // set automatically once an amount reaches the same 50,000 threshold, so the
+    // two rules met and rejected every transfer above it, telling the sender to
+    // turn off a "hide option" the code had switched on for them.
     //
-    // Note also that is_private is display masking only: it blanks fields on
-    // the way out to our own UI and hides nothing from anyone reading the
-    // chain, so "private" here does not mean confidential.
-    if tx.is_private && tx.amount > 50_000 * 1_000_000 {
-        if tx.compliance_proof.is_empty() {
-            return Err(format!(
-                "Hidden transfer of {} uEGOC is over the 50,000 EGOC threshold.                  Send it without the hide option.",
-                tx.amount
-            ));
-        }
-    }
+    // Anyone wanting a real threshold control should build one that is actually
+    // checked. A rule that enforces nothing while quietly capping transfers is
+    // worse than no rule.
 
     // ── Fee floor ─────────────────────────────────────────────────────────
     // Reject zero-fee transactions from accounts that haven't staked.
