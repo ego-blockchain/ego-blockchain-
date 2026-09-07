@@ -76,7 +76,7 @@ pub fn compute_block_reward(height: u64, tx_fees_uegoc: u64, prev_hash: &str) ->
 //   emission = era_rate/sec × seconds_since_parent × min(1, validators/864,000)
 //
 // Which is equivalent to "every registered validator earns ~0.0832 EGOC/day"
-// (≈ the documented $0.20/day consensus target at the $2.45 launch price) until
+// (≈ the documented $0.20/day consensus target at the launch price) until
 // the network reaches 864k validators, where the era curve (72,000 EGOC/day,
 // halving every 4 years) becomes the cap. Fees ride on top per block, so busy
 // blocks still pay their proposer more — demand rewards without demand MINTING.
@@ -139,11 +139,64 @@ pub const NODE_REWARD_CEILING_UEGOC: u64 = 50 * UEGOC_PER_EGOC; // 50 EGOC per e
 // that credits an arbitrary address an arbitrary amount (the C1 free-mint vector).
 pub const REWARD_CAP_PER_TX_UEGOC: u64 = 10_000 * UEGOC_PER_EGOC;
 
+// Early-node bootstrap multiplier.
+//
+// Supply-side networks are worth nothing until operators show up, and the first
+// operators take the most risk for the least network. The multiplier pays them
+// for that and decays as the network no longer needs the subsidy.
+//
+//   < 100 nodes        10x
+//   100 to 1,000       7x tapering to 1.5x
+//   1,000 to 10,000    1.5x tapering to 1x
+//   10,000+            1x
+//
+// Monotonic by construction: each tier begins where the previous one ended, so
+// crossing a boundary never increases an operator's reward and there is nothing
+// to gain by inflating the node count.
+//
+// The count comes from the on-chain validator registry, the same source emission
+// v2 scales against, so every node computes an identical multiplier. A local peer
+// view would differ per node and could not be validated.
+pub const BOOTSTRAP_T1_NODES: u64 = 100;
+pub const BOOTSTRAP_T2_NODES: u64 = 1_000;
+pub const BOOTSTRAP_T3_NODES: u64 = 10_000;
+
+pub const BOOTSTRAP_T1_MULT: f64 = 10.0;
+pub const BOOTSTRAP_T2_MULT: f64 = 7.0;
+pub const BOOTSTRAP_T3_MULT: f64 = 1.5;
+pub const BOOTSTRAP_BASE_MULT: f64 = 1.0;
+
+pub fn early_node_multiplier(node_count: u64) -> f64 {
+    if node_count < BOOTSTRAP_T1_NODES {
+        return BOOTSTRAP_T1_MULT;
+    }
+    if node_count < BOOTSTRAP_T2_NODES {
+        let span = (BOOTSTRAP_T2_NODES - BOOTSTRAP_T1_NODES) as f64;
+        let t = (node_count - BOOTSTRAP_T1_NODES) as f64 / span;
+        return BOOTSTRAP_T2_MULT + (BOOTSTRAP_T3_MULT - BOOTSTRAP_T2_MULT) * t;
+    }
+    if node_count < BOOTSTRAP_T3_NODES {
+        let span = (BOOTSTRAP_T3_NODES - BOOTSTRAP_T2_NODES) as f64;
+        let t = (node_count - BOOTSTRAP_T2_NODES) as f64 / span;
+        return BOOTSTRAP_T3_MULT + (BOOTSTRAP_BASE_MULT - BOOTSTRAP_T3_MULT) * t;
+    }
+    BOOTSTRAP_BASE_MULT
+}
+
+pub fn current_early_multiplier() -> f64 {
+    let n = crate::chain_db::registered_validators_sorted().len() as u64;
+    early_node_multiplier(n)
+}
+
 /// Convert a USD reward target to uEGOC at the live price,
 /// clamped to [FEE_FLOOR_UEGOC, NODE_REWARD_CEILING_UEGOC].
+///
+/// The bootstrap multiplier is applied before the ceiling, so the ceiling still
+/// caps what any single event can pay out.
 pub fn reward_usd_to_uegoc(target_usd: f64) -> u64 {
     let price = crate::p2p::get_egoc_price_usd().max(1e-9);
-    let uegoc = (target_usd / price * UEGOC_PER_EGOC as f64).round() as u64;
+    let scaled = target_usd * current_early_multiplier();
+    let uegoc = (scaled / price * UEGOC_PER_EGOC as f64).round() as u64;
     uegoc.clamp(FEE_FLOOR_UEGOC, NODE_REWARD_CEILING_UEGOC)
 }
 
@@ -357,5 +410,48 @@ pub fn slash_outcome(strikes: u32) -> SlashOutcome {
         0 => SlashOutcome::Warning,
         1 => SlashOutcome::EjectAndLock { lock_days: SLASH_LOCK_DAYS },
         _ => SlashOutcome::PermanentBan { burn_bps: SLASH_BURN_BPS },
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+
+    #[test]
+    fn tier_boundaries_match_the_published_curve() {
+        assert_eq!(early_node_multiplier(1),      10.0);
+        assert_eq!(early_node_multiplier(99),     10.0);
+        assert_eq!(early_node_multiplier(100),     7.0);
+        assert_eq!(early_node_multiplier(1_000),   1.5);
+        assert_eq!(early_node_multiplier(10_000),  1.0);
+        assert_eq!(early_node_multiplier(500_000), 1.0);
+    }
+
+    #[test]
+    fn multiplier_never_increases_as_the_network_grows() {
+        let mut prev = f64::INFINITY;
+        for n in (0..12_000).step_by(7) {
+            let m = early_node_multiplier(n);
+            assert!(m <= prev + 1e-9, "multiplier rose at {n}: {prev} -> {m}");
+            prev = m;
+        }
+    }
+
+    #[test]
+    fn tapers_are_continuous_at_the_joins() {
+        let below = early_node_multiplier(999);
+        let at    = early_node_multiplier(1_000);
+        assert!((below - at).abs() < 0.01, "discontinuity at 1000: {below} vs {at}");
+
+        let below = early_node_multiplier(9_999);
+        let at    = early_node_multiplier(10_000);
+        assert!((below - at).abs() < 0.01, "discontinuity at 10000: {below} vs {at}");
+    }
+
+    #[test]
+    fn never_falls_below_the_base_rate() {
+        for n in [0u64, 1, 100, 999, 1_000, 9_999, 10_000, u64::MAX] {
+            assert!(early_node_multiplier(n) >= BOOTSTRAP_BASE_MULT);
+        }
     }
 }
