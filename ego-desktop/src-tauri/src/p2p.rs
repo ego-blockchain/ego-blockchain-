@@ -4247,7 +4247,7 @@ pub async fn offer_to_sideband(msg: &P2PMessage, tx_hash: &str) {
         // label a relay stripped, is unknown, not proof of anything.
         let hash = tx_hash.to_string();
         let _ = tokio::task::spawn_blocking(move || {
-            mark_local_tx_transport(&hash, "internet")
+            crate::commands::tx_transport::record(&hash, "internet")
         }).await;
         return;
     }
@@ -4270,25 +4270,10 @@ pub async fn offer_to_sideband(msg: &P2PMessage, tx_hash: &str) {
             eprintln!("[Sideband] tx {hash} had no transport able to transmit");
             return;
         }
-        mark_local_tx_transport(&hash, "radio");
+        crate::commands::tx_transport::record(&hash, "radio");
     }).await;
 }
 
-/// Record on our own copy of a transaction that it left over a sideband link,
-/// so the sender's history shows it was not sent over the internet.
-pub fn mark_local_tx_transport(tx_hash: &str, transport: &str) {
-    let mut ledger = crate::ledger::Ledger::load();
-    let mut changed = false;
-    for tx in ledger.transactions.iter_mut() {
-        if tx.hash == tx_hash && tx.transport != transport {
-            tx.transport = transport.to_string();
-            changed = true;
-        }
-    }
-    if changed {
-        let _ = ledger.save();
-    }
-}
 
 pub async fn broadcast_tx(tx: LedgerTx, block: LedgerBlock) {
     // This is an async function, so all blocking calls must be wrapped.
@@ -9396,8 +9381,7 @@ pub async fn ingest_sideband_bytes(
             crate::mempool::get_mempool().mark_sideband(&hash);
             // Stamp how it reached us. Outside the signature, so this changes
             // neither the hash nor the merkle root.
-            let mut tx = tx;
-            tx.transport = source.to_string();
+            crate::commands::tx_transport::record(&hash, source);
             eprintln!("[Sideband] accepted tx {hash} via {source}");
             apply_incoming_tx(tx, block, app).await;
             Ok(())

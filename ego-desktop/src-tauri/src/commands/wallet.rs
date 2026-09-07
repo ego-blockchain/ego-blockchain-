@@ -504,6 +504,11 @@ pub async fn get_transaction_history(
         }
 
         let txs: Vec<LedgerTx> = crate::chain_db::get_tx_history_for_addr(&my_addr);
+
+        // How each of these actually travelled, as this node observed it. The
+        // chain does not carry the route and should not: it is local knowledge,
+        // so it is merged in here rather than stored in a block.
+        let routes = crate::commands::tx_transport::all();
         
         let tip_height = crate::chain_db::latest_block_info().0;
         let finalized_h = crate::chain_db::finalized_height();
@@ -511,6 +516,9 @@ pub async fn get_transaction_history(
         let mut final_txs = Vec::with_capacity(txs.len());
 
         for mut tx in txs.into_iter() {
+            if let Some(route) = routes.get(&tx.hash) {
+                tx.transport = route.clone();
+            }
             // Filter out system spam to prevent burying real user transfers
             let is_spammy = tx.from == crate::chain_db::NODE_POOL_ADDR 
                 && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward");

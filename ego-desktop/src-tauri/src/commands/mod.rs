@@ -11,6 +11,7 @@ pub mod notifications;
 pub mod messenger;
 pub mod outbox;
 pub mod tx_pending;
+pub mod tx_transport;
 pub mod consensus;
 pub mod contracts;
 pub mod rollup;
