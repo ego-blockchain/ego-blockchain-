@@ -75,6 +75,8 @@ interface SidebandStatus {
   inbox_frames: number;
   outbox_frames: number;
   max_age_hours: number;
+  chain_view_age_secs: number;
+  next_nonce: number;
 }
 
 interface TxResult {
@@ -325,6 +327,12 @@ function isRewardTx(tx: LedgerTx): boolean {
     ['reward', 'coinbase', 'fee_distribution', 'post_reward', 'faucet'].includes(tx.tx_type || '') ||
     systemPrefixes.some(p => tx.from.startsWith(p))
   );
+}
+
+function formatAge(secs: number): string {
+  if (secs < 3600) return `${Math.round(secs / 60)} minutes`;
+  if (secs < 86400) return `${Math.round(secs / 3600)} hours`;
+  return `${Math.round(secs / 86400)} days`;
 }
 
 const WalletPage: React.FC = () => {
@@ -2982,10 +2990,20 @@ const WalletPage: React.FC = () => {
                   <button onClick={resetSend} className="text-gray-400 hover:text-white text-xl">✕</button>
                 </div>
                 {sideband?.enabled && !sideband.online && (
-                  <div className="mb-4 bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 text-xs text-amber-200 leading-relaxed">
-                    No internet peers reachable. This transaction will be signed here and
-                    handed to your offline transport instead. It stays valid for {sideband.max_age_hours} hours,
-                    which is enough for a slow radio or satellite hop.
+                  <div className="mb-4 bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 text-xs text-amber-200 leading-relaxed space-y-2">
+                    <div>
+                      No internet peers reachable. This transaction will be signed here and
+                      handed to your offline transport instead. It stays valid for {sideband.max_age_hours} hours,
+                      which is enough for a slow radio or satellite hop.
+                    </div>
+                    {sideband.chain_view_age_secs > 3600 && (
+                      <div className="text-amber-300/90 border-t border-amber-500/20 pt-2">
+                        Your view of the chain is {formatAge(sideband.chain_view_age_secs)} old. This will be
+                        signed as transaction #{sideband.next_nonce} for your account. If this wallet was
+                        used on another device since then, that number is already taken and the
+                        transaction will be rejected when it arrives, with no way to tell you.
+                      </div>
+                    )}
                   </div>
                 )}
                 <div className="space-y-4">

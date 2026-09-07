@@ -9191,6 +9191,16 @@ pub async fn ingest_sideband_bytes(
         P2PMessage::TxBroadcast { tx, block } => {
             let hash = tx.hash.clone();
             if let Err(e) = crate::ledger::verify_incoming_tx(&tx) {
+                // A sender who was offline while their account moved on will
+                // fail here and never learn why: there is no return path over
+                // a one-way link. Name the cause so whoever is running the
+                // receiving node can tell them.
+                let stale_view = e.contains("nonce") || e.contains("Nonce");
+                if stale_view {
+                    return Err(format!(
+                        "sideband tx {hash} from {source} rejected: {e}.                          The sender signed against an out of date view of the chain;                          they must resync and sign again."
+                    ));
+                }
                 return Err(format!("sideband tx {hash} from {source} rejected: {e}"));
             }
             crate::mempool::get_mempool().mark_sideband(&hash);

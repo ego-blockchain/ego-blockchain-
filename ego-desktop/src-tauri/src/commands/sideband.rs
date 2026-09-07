@@ -15,6 +15,8 @@ pub struct SidebandStatus {
     pub inbox_frames: usize,
     pub outbox_frames: usize,
     pub max_age_hours: i64,
+    pub chain_view_age_secs: i64,
+    pub next_nonce: u64,
 }
 
 /// What the offline transaction path is doing, if anything.
@@ -31,6 +33,17 @@ pub fn sideband_status() -> SidebandStatus {
 
     let (inbox_frames, outbox_frames) = crate::sideband_spool::queue_depths();
 
+    let (height, _) = crate::chain_db::latest_block_info();
+    let chain_view_age_secs = crate::chain_db::get_block_by_height(height)
+        .map(|b| (chrono::Utc::now().timestamp() - b.timestamp).max(0))
+        .unwrap_or(0);
+
+    let ledger = crate::ledger::Ledger::load();
+    let next_nonce = ledger
+        .nonce
+        .max(crate::ledger::last_confirmed_nonce(&ledger.address))
+        + 1;
+
     SidebandStatus {
         enabled: !transports.is_empty(),
         online: crate::p2p::has_connectivity(),
@@ -41,6 +54,8 @@ pub fn sideband_status() -> SidebandStatus {
         inbox_frames,
         outbox_frames,
         max_age_hours: crate::mempool::MAX_SIDEBAND_TX_AGE_SECS / 3600,
+        chain_view_age_secs,
+        next_nonce,
     }
 }
 

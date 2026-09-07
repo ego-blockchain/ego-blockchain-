@@ -53,8 +53,30 @@ python sideband-bridge.py --port /dev/ttyUSB0 --receive-only
 `--receive-only` never transmits. Use it for a satellite downlink, and read the
 next section before using anything else.
 
-**This script has not been tested against real radio hardware.** The framing,
-reassembly and ingest path are covered by tests; the serial layer is not.
+On the wire each frame is a sync word, a length, a CRC32, then the payload. The
+sync word exists because a radio link drops bytes and a bare length prefix
+cannot recover from that: one lost byte shifts every length field after it and
+the stream never recovers. The receiver hunts for the sync word instead, and the
+CRC throws away anything that survives a false match.
+
+Check the framing without any hardware:
+
+```
+python sideband-bridge.py --self-test
+```
+
+That covers frames split across reads, leading noise, a dropped byte mid-stream,
+a corrupted payload, a sync word occurring inside a payload, and buffer growth
+under pure noise.
+
+`--loopback` goes further and feeds your own outbox back into your own inbox
+through the real wire format, which exercises the spool plumbing end to end. It
+is not a network; frames return to the node that sent them.
+
+**No part of this has been tested against real radio hardware.** The framing,
+reassembly and ingest are covered by tests. Whether a given LoRa module or TNC
+passes these bytes through unmodified at your chosen baud rate is not something
+the tests can tell you.
 
 ## Before you transmit
 
@@ -82,6 +104,14 @@ gets. Nonce sequencing, not the clock, is what prevents replay.
 If your wallet has been offline long enough that the account nonce has moved on
 without you, the transaction will be rejected on arrival as invalid. Sending
 from one wallet on two devices at once will do this.
+
+There is no way for the far end to tell you, because a one-way link has no
+return path. The wallet therefore warns you **before** signing, once its view of
+the chain is more than an hour old, and names the transaction number it is about
+to use. If you have been genuinely offline and this is your only device, that
+number is correct and you can send. A node that rejects a transaction for this
+reason logs it as a stale view rather than as a bad transaction, so whoever
+operates the receiving end can tell the difference and pass word back.
 
 ## When it is used
 
