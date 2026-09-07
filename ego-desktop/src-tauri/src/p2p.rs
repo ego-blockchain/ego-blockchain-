@@ -9417,6 +9417,13 @@ pub async fn ingest_sideband_bytes(
             // neither the hash nor the merkle root.
             crate::commands::tx_transport::record(&hash, source);
             eprintln!("[Sideband] accepted tx {hash} via {source}");
+            // Carry the route onward. This node took it off a radio link and is
+            // the only one holding it, so its copy is the one that gets proposed
+            // and everyone downstream sees where it came from.
+            let mut tx = tx;
+            if tx.transport.is_empty() {
+                tx.transport = source.to_string();
+            }
             apply_incoming_tx(tx, block, app).await;
             Ok(())
         }

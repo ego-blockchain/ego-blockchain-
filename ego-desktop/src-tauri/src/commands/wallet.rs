@@ -236,6 +236,19 @@ pub async fn send_transaction(
         chain_id:            CHAIN_ID,
         is_private:          request.is_private.unwrap_or(false) || request.amount >= SHIELD_THRESHOLD_UEGOC,
         signed_summary:      summary.clone(),
+        // Carried along so the recipient can see the route too. Set before the
+        // mempool push so it is part of the copy that gets proposed. A radio
+        // send is never gossiped, so this node is the only one holding the
+        // transaction and therefore the only one that can propose it, which
+        // makes its labelled copy the one that lands in the block.
+        //
+        // Outside the signature, so it is a courtesy rather than a proof, and
+        // the detail view says as much.
+        transport:           if request.via_radio.unwrap_or(false) {
+                                 "radio".to_string()
+                             } else {
+                                 String::new()
+                             },
         ..LedgerTx::default()
     };
 
