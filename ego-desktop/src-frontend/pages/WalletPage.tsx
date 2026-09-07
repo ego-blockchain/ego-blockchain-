@@ -3189,6 +3189,14 @@ const WalletPage: React.FC = () => {
                 {selectedTx.status}
               </div>
             </div>
+            {selectedTx.transport && (
+              <div className="rounded-xl p-3 mb-5 bg-amber-500/10 border border-amber-500/30 text-center">
+                <div className="text-sm font-bold text-amber-300">Sent via Radio Frequency</div>
+                <div className="text-xs text-amber-200/70 mt-0.5">
+                  This payment did not travel over the internet
+                </div>
+              </div>
+            )}
             <div className="space-y-3">
               {[
                 { label: 'Hash',      val: selectedTx.hash,       mono: true },
@@ -3210,8 +3218,9 @@ const WalletPage: React.FC = () => {
                 { label: 'Signature', val: selectedTx.signature.slice(0, 32) + '…', mono: true },
                 ...(selectedTx.memo ? [{ label: 'Memo', val: selectedTx.memo }] : []),
                 ...(selectedTx.transport
-                  ? [{ label: 'Delivered by', val: `Radio / offline link (${selectedTx.transport})` }]
-                  : []),
+                  ? [{ label: 'Sent via', val: 'Radio Frequency' },
+                     { label: 'Link', val: selectedTx.transport, mono: true }]
+                  : [{ label: 'Sent via', val: 'Internet' }]),
               ].map(({ label, val, mono }) => (
                 <div key={label} className="flex justify-between items-start gap-4 py-1 border-b border-gray-700/50 last:border-0">
                   <span className="text-gray-400 text-sm shrink-0">{label}</span>
