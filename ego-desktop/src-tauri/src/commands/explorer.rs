@@ -131,6 +131,11 @@ pub async fn get_all_transactions(offset: Option<u32>, limit: Option<u32>) -> Re
         .await
         .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
 
+    // Display masking, not privacy. The chain holds the real sender, recipient
+    // and amount in plaintext; this only blanks them on the way out to our own
+    // UI. Anyone reading the chain by another route — a peer, the JSON-RPC, a
+    // third-party explorer, or this client with these lines removed — sees
+    // everything. Do not describe it to users as encryption or shielding.
     for tx in txs.iter_mut() {
         if tx.is_private || tx.amount >= SHIELD_THRESHOLD_UEGOC || tx.from == "Shielded" || tx.to == "Shielded" {
             tx.from = "Shielded".to_string();

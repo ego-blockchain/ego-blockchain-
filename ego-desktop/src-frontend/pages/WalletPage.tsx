@@ -1627,11 +1627,11 @@ const WalletPage: React.FC = () => {
                     </div>
                     <div className="min-w-0">
                       <div className="text-sm font-mono text-gray-300 truncate">
-                        {tx.is_private ? <span className="text-yellow-400 font-bold">Shielded · {isSent ? 'Sent' : 'Received'}</span> : (isReward ? rewardLabel : shortHash(tx.hash))}
+                        {tx.is_private ? <span className="text-yellow-400 font-bold">Hidden · {isSent ? 'Sent' : 'Received'}</span> : (isReward ? rewardLabel : shortHash(tx.hash))}
                       </div>
                       <div className="text-xs text-gray-500">
                         {isReward
-                          ? `Block #${tx.block_height ?? '—'}` : tx.is_private ? 'On-chain identities hidden'
+                          ? `Block #${tx.block_height ?? '—'}` : tx.is_private ? 'Hidden in Ego apps, not on the chain'
                           : isSent ? `To: ${shortAddr(tx.to)}` : `From: ${shortAddr(tx.from)}`}
                         {tx.memo && <span className="ml-2 text-gray-600">• {tx.memo}</span>}
                         {tx.transport && tx.transport !== 'internet' && (
@@ -3068,8 +3068,8 @@ const WalletPage: React.FC = () => {
                     <div className="flex items-center gap-3">
                       <div className="w-8 h-8 rounded-lg bg-yellow-500/10 flex items-center justify-center text-yellow-500">🛡</div>
                       <div>
-                        <div className="text-sm font-semibold">Private Transaction</div>
-                        <div className="text-[10px] text-gray-500 uppercase font-bold tracking-wider">Shielded with ZK-Proofs</div>
+                        <div className="text-sm font-semibold">Hide in Ego apps</div>
+                        <div className="text-[10px] text-gray-500 uppercase font-bold tracking-wider">Not encryption</div>
                       </div>
                     </div>
                     <button
@@ -3107,9 +3107,14 @@ const WalletPage: React.FC = () => {
                   )}
                   {(sendForm.isPrivate || (parseFloat(sendForm.amount) >= 50000)) && (
                     <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-xl p-3 text-[11px] text-yellow-200/70 leading-relaxed">
-                      {parseFloat(sendForm.amount) >= 50000 
-                        ? "High-value transaction detected. Automatic shielding enabled for Whale Protection (≥ 50,000 EGOC)."
-                        : "Shielded transactions hide your address and the recipient's address from the public ledger."}
+                      {parseFloat(sendForm.amount) >= 50000
+                        ? "Amounts over 50,000 EGOC are hidden in Ego apps automatically."
+                        : "This hides the addresses and amount in Ego Desktop and the Ego explorer."}
+                      <div className="mt-2 text-amber-300/80">
+                        It is not encryption. The sender, recipient and amount are stored on
+                        the chain in the clear, and anyone reading the chain another way can
+                        still see them. Do not rely on this to protect you.
+                      </div>
                     </div>
                   )}
                   <div className="bg-gray-900 rounded-xl p-3 space-y-2 text-sm">

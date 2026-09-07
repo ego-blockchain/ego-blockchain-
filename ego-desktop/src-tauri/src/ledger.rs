@@ -1609,15 +1609,21 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
         return Ok(());
     }
 
-    // ── Privacy Compliance (AML Protection) ──────────────────────────────
-    // Shielded transactions are allowed for standard users, but to prevent
-    // illegal activities, large transfers (> 50k EGOC) must be transparent
-    // unless they carry a cryptographic compliance proof.
+    // ── Large-transfer gate ──────────────────────────────────────────────
+    // WARNING: this is not a compliance control and must not be presented as
+    // one. compliance_proof is never verified anywhere in this codebase, so
+    // any non-empty string satisfies it. It deters nothing and proves nothing.
+    //
+    // Either check it against something real or delete it. Leaving it gives
+    // reviewers the impression of an AML control that does not exist.
+    //
+    // Note also that is_private is display masking only: it blanks fields on
+    // the way out to our own UI and hides nothing from anyone reading the
+    // chain, so "private" here does not mean confidential.
     if tx.is_private && tx.amount > 50_000 * 1_000_000 {
         if tx.compliance_proof.is_empty() {
             return Err(format!(
-                "Large private transfer rejected: {} uEGOC exceeds privacy threshold. \
-                Please use a transparent transaction for amounts over 50,000 EGOC.",
+                "Hidden transfer of {} uEGOC is over the 50,000 EGOC threshold.                  Send it without the hide option.",
                 tx.amount
             ));
         }

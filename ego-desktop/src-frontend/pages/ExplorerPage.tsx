@@ -386,7 +386,7 @@ const ExplorerPage: React.FC = () => {
                       </tr>
                     ) : (
                       txs.map(tx => {
-                        const txTypeLabel = tx.is_private                  ? '🛡 Shielded'
+                        const txTypeLabel = tx.is_private                  ? '🛡 Hidden'
                                           : tx.tx_type === 'reward'        ? '🏆 Reward'
                                           : tx.tx_type === 'store_data'    ? '📦 Store'
                                           : tx.tx_type === 'store_file'    ? '📦 Store'
@@ -400,8 +400,8 @@ const ExplorerPage: React.FC = () => {
                         const fromLabel = tx.from.startsWith('egot1rewards') ? 'Rewards Pool'
                                         : tx.from.startsWith('egot1faucet')  ? 'Test Coins Faucet'
                                         : shortAddr(tx.from);
-                        const fromFinal = tx.from === 'Shielded' ? <span className="text-yellow-500/70">🛡 Shielded</span> : fromLabel;
-                        const toFinal   = tx.to   === 'Shielded' ? <span className="text-yellow-500/70">🛡 Shielded</span> : shortAddr(tx.to);
+                        const fromFinal = tx.from === 'Shielded' ? <span className="text-yellow-500/70">🛡 Hidden</span> : fromLabel;
+                        const toFinal   = tx.to   === 'Shielded' ? <span className="text-yellow-500/70">🛡 Hidden</span> : shortAddr(tx.to);
                         return (
                         <tr
                           key={tx.hash}
