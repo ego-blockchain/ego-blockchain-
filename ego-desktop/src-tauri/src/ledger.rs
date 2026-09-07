@@ -534,6 +534,19 @@ pub struct LedgerTx {
     #[serde(default)]
     pub signed_summary: String,
 
+    /// How this transaction travelled: "" for the internet, otherwise the name of
+    /// the sideband transport that carried it, such as "spool" or a radio bridge.
+    ///
+    /// Deliberately outside the signature. tx_signing_bytes_v2 commits to named
+    /// fields and the block merkle root commits to tx hashes, so this can never
+    /// affect a hash, a signature or consensus. That also means it is advisory
+    /// rather than proof: it says how the transaction reached the node that
+    /// recorded it, and a dishonest relay could set or clear it. It exists so a
+    /// sender and receiver can see that a payment crossed a radio link rather
+    /// than the internet, not as evidence anyone should rely on.
+    #[serde(default)]
+    pub transport: String,
+
     #[serde(default)]
     pub is_private: bool,
 

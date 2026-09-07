@@ -771,6 +771,7 @@ fn migrate_from_sqlite(db: &DB, path: &std::path::Path) -> bool {
             signed_summary:      String::new(),
             is_private:          false,
             compliance_proof:    String::new(),
+            transport:           String::new(),
         })
     }).unwrap().filter_map(|r| r.ok()).collect();
 

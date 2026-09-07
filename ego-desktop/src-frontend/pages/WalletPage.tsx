@@ -58,6 +58,7 @@ interface LedgerTx {
   nonce: number;
   tx_type?: string;
   is_private?: boolean;
+  transport?: string;
 }
 
 interface SendForm {
@@ -1626,6 +1627,14 @@ const WalletPage: React.FC = () => {
                           ? `Block #${tx.block_height ?? '—'}` : tx.is_private ? 'On-chain identities hidden'
                           : isSent ? `To: ${shortAddr(tx.to)}` : `From: ${shortAddr(tx.from)}`}
                         {tx.memo && <span className="ml-2 text-gray-600">• {tx.memo}</span>}
+                        {tx.transport && (
+                          <span
+                            title="This payment travelled over an offline link rather than the internet"
+                            className="ml-2 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 text-[10px] font-semibold uppercase tracking-wide"
+                          >
+                            Radio
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -2939,8 +2948,15 @@ const WalletPage: React.FC = () => {
               <div className="text-center space-y-4">
                 <div className="text-5xl">{txResult.success ? (txConfirmedHeight != null ? '✅' : '⏳') : '❌'}</div>
                 <div className="text-xl font-bold">
-                  {txResult.success ? (txConfirmedHeight != null ? 'Transaction Confirmed!' : 'Transaction Submitted') : 'Transaction Failed'}
+                  {txResult.success
+                    ? (txConfirmedHeight != null ? 'Transaction Confirmed!' : 'Transaction Submitted')
+                    : 'Transaction Failed'}
                 </div>
+                {txResult.success && sideband?.enabled && !sideband.online && (
+                  <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-300 text-xs font-semibold">
+                    Sent over radio, not the internet
+                  </div>
+                )}
                 <p className="text-sm text-gray-400">{txResult.message}</p>
                 {txResult.hash && (
                   <div className="bg-gray-900 rounded-xl p-4 text-left">
@@ -2963,7 +2979,7 @@ const WalletPage: React.FC = () => {
                     <p className="text-xs text-gray-400 leading-relaxed">
                       {sideband.online
                         ? 'Your connection is working, so this went out over the internet. Send it over radio as well only if you believe the network is being filtered.'
-                        : `No internet peers were reachable, so this was written to the outbox automatically. It stays valid for ${sideband.max_age_hours} hours while it travels.`}
+                        : `No internet peers were reachable, so this left over your offline transport instead. It stays valid for ${sideband.max_age_hours} hours while it travels, and both you and the recipient will see it marked as delivered by radio.`}
                     </p>
                     <div className="text-xs text-gray-500">
                       Outbox holds {sideband.outbox_frames} frame{sideband.outbox_frames === 1 ? '' : 's'}
@@ -3193,6 +3209,9 @@ const WalletPage: React.FC = () => {
                 { label: 'Timestamp', val: sfTime(selectedTx.timestamp) },
                 { label: 'Signature', val: selectedTx.signature.slice(0, 32) + '…', mono: true },
                 ...(selectedTx.memo ? [{ label: 'Memo', val: selectedTx.memo }] : []),
+                ...(selectedTx.transport
+                  ? [{ label: 'Delivered by', val: `Radio / offline link (${selectedTx.transport})` }]
+                  : []),
               ].map(({ label, val, mono }) => (
                 <div key={label} className="flex justify-between items-start gap-4 py-1 border-b border-gray-700/50 last:border-0">
                   <span className="text-gray-400 text-sm shrink-0">{label}</span>
@@ -3201,6 +3220,13 @@ const WalletPage: React.FC = () => {
                   </span>
                 </div>
               ))}
+              {selectedTx.transport && (
+                <p className="text-xs text-amber-300/80 leading-relaxed pt-2">
+                  This payment crossed an offline link rather than the internet. The
+                  amount, sender and receiver are signed and cannot be altered; the
+                  route is recorded for your reference and is not itself proven.
+                </p>
+              )}
             </div>
           </div>
         </div>
