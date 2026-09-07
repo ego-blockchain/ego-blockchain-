@@ -2,6 +2,7 @@
 
 mod app;
 mod autostart;
+mod offline_guard;
 mod sideband;
 mod sideband_spool;
 mod bft_committee;

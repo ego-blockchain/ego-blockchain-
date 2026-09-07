@@ -25,6 +25,22 @@ EGO_OFFLINE=1
 Peers are then found only by mDNS on the local network, or named explicitly in
 `EGO_DIRECT_PEERS`. Nothing is dialled outside it.
 
+The rule is enforced where packets leave, not at each place that builds a peer
+list. Every send and every dial checks the address, and anything that is not a
+private range is refused: `127.x`, `10.x`, `192.168.x`, `172.16-31.x`,
+`169.254.x` and IPv6 loopback are allowed, while any DNS name and any relay
+circuit address is not.
+
+That distinction matters. The first version of this gated the relay and oracle
+call sites, and nodes still dialled the public relay, because endpoints also
+arrive from peer announcements and cached contacts. One stale circuit address
+learned from a peer was enough. A check at the egress point cannot be bypassed
+by a path nobody remembered to gate.
+
+Note the corollary: in this mode a node cannot reach the wider network even if
+the connection comes back. It is for a machine that should stay local, not a
+machine that is temporarily offline.
+
 The limit is range. WiFi reaches tens of metres indoors and a few hundred
 outdoors, so this is a building or a street, not a city. That is a property of
 the radio in a laptop, not of the software.

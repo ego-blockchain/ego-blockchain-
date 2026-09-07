@@ -3239,6 +3239,9 @@ impl request_response::Codec for ExecCodec {
 
 #[derive(NetworkBehaviour)]
 struct EgoBehaviour {
+    /// Denies any connection leaving the local network while EGO_OFFLINE=1.
+    /// First field so its veto runs before the others get a say.
+    offline_guard:    crate::offline_guard::OfflineGuard,
     relay_client:     relay::client::Behaviour,
     /// Relay server — any node with a public IP automatically serves as a circuit
     /// relay for NAT'd peers.  Fully decentralised: no dedicated relay servers needed.
@@ -3899,7 +3902,37 @@ pub async fn open_app_tunnel(
     Ok(format!("127.0.0.1:{local_port}"))
 }
 
+/// Whether a multiaddr stays on this machine or the local network.
+///
+/// Offline mode is enforced here rather than at each caller. Endpoints reach
+/// the swarm from many directions, including peer announcements and cached
+/// contacts, so gating the places that build a relay list is not enough: one
+/// stale circuit address learned from a peer is all it takes to reveal the
+/// machine. A single egress check cannot be bypassed by a path nobody
+/// remembered to gate.
+pub fn endpoint_is_local(ep: &str) -> bool {
+    if ep.contains("/p2p-circuit") || ep.contains("/dns4/") || ep.contains("/dns6/") || ep.contains("/dns/") {
+        return false;
+    }
+    if ep.contains("/ip4/127.") || ep.contains("/ip6/::1") || ep.contains("/ip4/10.") {
+        return true;
+    }
+    if ep.contains("/ip4/192.168.") || ep.contains("/ip4/169.254.") {
+        return true;
+    }
+    // 172.16.0.0/12 is 172.16 through 172.31, not the whole 172.
+    for octet in 16..32 {
+        if ep.contains(&format!("/ip4/172.{octet}.")) {
+            return true;
+        }
+    }
+    false
+}
+
 pub async fn send_message(endpoint: &str, msg: &P2PMessage) -> Result<(), String> {
+    if offline_mode() && !endpoint_is_local(endpoint) {
+        return Err(format!("offline mode: refusing to send beyond the local network ({endpoint})"));
+    }
     let tx = SWARM_TX.get().ok_or_else(|| "P2P not started".to_string())?;
     let peer_addr: Multiaddr = endpoint
         .parse()
@@ -5568,6 +5601,10 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                             &mut pending_exec_sends, &mut exec_in_flight);
                     }
                     SwarmCmd::Dial { peer_addr, reply } => {
+                        if offline_mode() && !endpoint_is_local(&peer_addr.to_string()) {
+                            let _ = reply.send(Err("offline mode: not dialling beyond the local network".into()));
+                            continue;
+                        }
                         match peer_id_from_multiaddr(&peer_addr) {
                             Some(pid) if pid == *swarm.local_peer_id() => {
                                 let _ = reply.send(Err("Refusing self-dial".into()));
@@ -5856,10 +5893,12 @@ async fn build_swarm(
             let store = kad::store::MemoryStore::with_config(peer_id, kad_store_cfg);
             let mut kad_behaviour = kad::Behaviour::new(peer_id, store);
 
-            for relay_str in RELAY_NODES {
-                if let Ok(addr) = relay_str.parse::<Multiaddr>() {
-                    if let Some(relay_pid) = peer_id_from_multiaddr(&addr) {
-                        kad_behaviour.add_address(&relay_pid, strip_p2p_suffix(&addr));
+            if !offline_mode() {
+                for relay_str in RELAY_NODES {
+                    if let Ok(addr) = relay_str.parse::<Multiaddr>() {
+                        if let Some(relay_pid) = peer_id_from_multiaddr(&addr) {
+                            kad_behaviour.add_address(&relay_pid, strip_p2p_suffix(&addr));
+                        }
                     }
                 }
             }
@@ -5889,6 +5928,7 @@ async fn build_swarm(
             kad_behaviour.set_mode(Some(kad::Mode::Server));
 
             EgoBehaviour {
+                offline_guard: crate::offline_guard::OfflineGuard,
                 relay_client,
                 relay_server: relay::Behaviour::new(peer_id, relay::Config {
                     max_reservations:          4096,
