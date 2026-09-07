@@ -49,11 +49,21 @@ the radio in a laptop, not of the software.
 
 Where even a local mesh has nobody to talk to, a transaction can travel over a
 LoRa mesh, an HF radio link, a satellite downlink, or a USB stick carried
-between two machines. This needs hardware, and it is off by default.
+between two machines.
+
+**This is on by default and needs no configuration.** Someone whose connection
+has just been cut is the last person in a position to set an environment
+variable and restart, so the node arms the spool at startup and waits. A
+transaction is only ever handed to it when gossip has nowhere to go, so a
+working connection never touches it, and arming it costs a directory and a two
+second poll of an empty folder.
 
 ```
-EGO_SIDEBAND_SPOOL=1
+EGO_SIDEBAND_SPOOL=0    # turn it off
 ```
+
+Radio hardware is still a deliberate act: the spool does nothing on its own
+until somebody runs the bridge against it, or carries the files by hand.
 
 Note what this does and does not do. It carries a **signed transaction** to
 somebody who can reach the network. It does not carry consensus: an isolated

@@ -312,6 +312,21 @@ fn headless_main() {
             crate::mempool::run_batch_loop().await;
         });
 
+        // Same offline transport the desktop app arms. A headless node is often
+        // the one relaying for people whose connection is cut, so it should be
+        // listening on the spool without being told.
+        if std::env::var("EGO_SIDEBAND_SPOOL").as_deref() != Ok("0") {
+            let spool = crate::sideband_spool::SpoolTransport::default_spool();
+            eprintln!("[Sideband] spool at {}", spool.inbox().display());
+            crate::sideband::register(Box::new(spool));
+            tokio::spawn(async {
+                loop {
+                    crate::sideband::poll_once(None).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            });
+        }
+
         tokio::spawn(async {
             crate::rpc::start_rpc_server().await;
         });
@@ -994,11 +1009,22 @@ fn main() {
                 crate::autostart::ensure_enabled_once();
             });
 
-            // Offline transaction transports. Off unless asked for: this opens an
-            // input path that does not exist otherwise, and an operator should turn
-            // it on deliberately. Payloads are validated exactly as gossip is, so a
-            // relay can drop or delay a transaction but never forge one.
-            if std::env::var("EGO_SIDEBAND_SPOOL").as_deref() == Ok("1") {
+            // Offline transaction transport, always available.
+            //
+            // Someone whose connection has just been cut is the last person able
+            // to set an environment variable and restart, so this arms itself and
+            // waits. Registering costs a directory and a two second poll of an
+            // empty folder; a transaction is only ever handed to it when gossip
+            // has nowhere to go, so a working connection never touches it.
+            //
+            // The spool is a directory inside the node's own data folder, so it
+            // opens no path that a process could not already reach by writing to
+            // the wallet directly, and everything arriving through it is validated
+            // exactly as gossip is. Radio hardware still takes a deliberate act:
+            // somebody has to run the bridge against the spool.
+            //
+            // EGO_SIDEBAND_SPOOL=0 turns it off.
+            if std::env::var("EGO_SIDEBAND_SPOOL").as_deref() != Ok("0") {
                 let spool = crate::sideband_spool::SpoolTransport::default_spool();
                 eprintln!("[Sideband] spool at {}", spool.inbox().display());
                 crate::sideband::register(Box::new(spool));
