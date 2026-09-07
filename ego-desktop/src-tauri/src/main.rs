@@ -2,6 +2,8 @@
 
 mod app;
 mod autostart;
+mod sideband;
+mod sideband_spool;
 mod bft_committee;
 mod bls_agg;
 mod blocks;
@@ -785,6 +787,7 @@ fn main() {
             commands::storage::configure_storage,
             commands::storage::get_available_drives,
             commands::storage::reset_storage,
+            commands::storage::unlock_storage_early,
             commands::storage::create_public_share,
             commands::storage::create_secure_share,
             commands::storage::import_secure_share,
@@ -987,6 +990,24 @@ fn main() {
             std::thread::spawn(|| {
                 crate::autostart::ensure_enabled_once();
             });
+
+            // Offline transaction transports. Off unless asked for: this opens an
+            // input path that does not exist otherwise, and an operator should turn
+            // it on deliberately. Payloads are validated exactly as gossip is, so a
+            // relay can drop or delay a transaction but never forge one.
+            if std::env::var("EGO_SIDEBAND_SPOOL").as_deref() == Ok("1") {
+                let spool = crate::sideband_spool::SpoolTransport::default_spool();
+                eprintln!("[Sideband] spool at {}", spool.inbox().display());
+                crate::sideband::register(Box::new(spool));
+
+                let handle = app.handle();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        crate::sideband::poll_once(Some(&handle)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                });
+            }
 
             crate::commands::updates::spawn_update_notifier(app.handle());
 
