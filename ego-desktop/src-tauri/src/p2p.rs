@@ -1673,21 +1673,57 @@ fn porep_rejoin_on_pass(prover: &str, manifest_cid: &str) {
         if file.cid != manifest_cid || file.replication_role != "master" { continue; }
         if file.replica_grace.remove(prover).is_none() { continue; }
         changed = true;
-        if file.replica_peers.len() < MIN_REPLICAS && !file.replica_peers.iter().any(|p| p == prover) {
-            file.replica_peers.push(prover.to_string());
-            file.replica_last_ack.insert(prover.to_string(), now);
+        if file.replica_peers.iter().any(|p| p == prover) {
             eprintln!(
-                "[Replication] {} proved possession within the 24h grace — rejoined {} as replica ({}/{}), zero bytes re-transferred",
-                &prover[..prover.len().min(20)],
-                &file.cid[..file.cid.len().min(16)],
-                file.replica_peers.len(), MIN_REPLICAS
-            );
-        } else {
-            eprintln!(
-                "[Replication] {} proved possession for {} but the replica set is already full — released from grace",
+                "[Replication] {} proved possession for {} and is already in the set",
                 &prover[..prover.len().min(20)],
                 &file.cid[..file.cid.len().min(16)]
             );
+        } else {
+            // The set may be full because a stand-in took this slot while the
+            // holder was dark. The original owns the slot, so the stand-in steps
+            // aside and the set returns to master plus MIN_REPLICAS rather than
+            // growing. Neither side re-transfers anything.
+            if file.replica_peers.len() >= MIN_REPLICAS {
+                let stand_in = file.replica_provisional.iter()
+                    .find(|(addr, covers)| covers.as_str() == prover && file.replica_peers.contains(addr))
+                    .map(|(addr, _)| addr.clone())
+                    .or_else(|| {
+                        // No stand-in was recorded against this holder specifically,
+                        // so release any provisional rather than turning the original away.
+                        file.replica_provisional.keys()
+                            .find(|addr| file.replica_peers.contains(addr))
+                            .cloned()
+                    });
+                if let Some(addr) = stand_in {
+                    file.replica_peers.retain(|p| p != &addr);
+                    file.replica_last_ack.remove(&addr);
+                    file.replica_provisional.remove(&addr);
+                    eprintln!(
+                        "[Replication] {} stood down from {} — the original holder is back",
+                        &addr[..addr.len().min(20)],
+                        &file.cid[..file.cid.len().min(16)]
+                    );
+                }
+            }
+
+            if file.replica_peers.len() < MIN_REPLICAS {
+                file.replica_peers.push(prover.to_string());
+                file.replica_last_ack.insert(prover.to_string(), now);
+                file.replica_provisional.remove(prover);
+                eprintln!(
+                    "[Replication] {} proved possession within its slot window — rejoined {} as replica ({}/{}), zero bytes re-transferred",
+                    &prover[..prover.len().min(20)],
+                    &file.cid[..file.cid.len().min(16)],
+                    file.replica_peers.len(), MIN_REPLICAS
+                );
+            } else {
+                eprintln!(
+                    "[Replication] {} proved possession for {} but the replica set is full with no stand-in to release",
+                    &prover[..prover.len().min(20)],
+                    &file.cid[..file.cid.len().min(16)]
+                );
+            }
         }
     }
     if changed {
@@ -4856,9 +4892,38 @@ pub async fn request_file_pinning(cids: Vec<String>) {
 /// How long (seconds) without a heartbeat before a slave declares the master dead.
 const MASTER_TIMEOUT_SECS: i64 = 5 * 60; // 5 minutes
 const MIN_REPLICAS: usize = 2;            // 1 master + 2 slaves
-/// Rejoin window for a dark holder: within it the holder re-proves possession and
-/// rejoins with zero re-transfer; past it, it's evicted and a new replica recruited.
-const REPLICA_GRACE_SECS: i64 = 24 * 3600;
+/// How long a dark holder still counts toward the copy target before a stand-in
+/// is recruited in its place.
+///
+/// This is the anti-churn window. A laptop that is closed overnight, or carried
+/// somewhere without WiFi for a day, comes back with its copy intact, and moving
+/// gigabytes to cover an absence that short costs bandwidth for nothing. Past a
+/// day the absence is no longer plausibly a sleep cycle and the file should not
+/// keep sitting below its target.
+const REPLACE_AFTER_SECS: i64 = 24 * 3600;
+
+/// Floor and ceiling for how long a dark holder keeps its slot, and the window
+/// for a deal with no expiry.
+///
+/// Keeping the slot is separate from covering the copy target: a stand-in may
+/// already be serving, while the original can still return, re-prove possession
+/// and take its place back with nothing re-transferred. That is worth being
+/// generous about, because the bytes are still on the original's disk. A month
+/// long deal should tolerate a week away; losing a permanent deal over a few
+/// days offline would be absurd.
+const REPLICA_SLOT_MIN_SECS: i64 = 24 * 3600;
+const REPLICA_SLOT_MAX_SECS: i64 = 7 * 86_400;
+const REPLICA_SLOT_PERMANENT_SECS: i64 = 30 * 86_400;
+
+/// How long `holder` keeps its slot on a file, scaled to how long the data was
+/// paid to live there.
+pub fn replica_slot_secs(stored_at: i64, expiry: i64) -> i64 {
+    if expiry == i64::MAX || expiry <= stored_at {
+        return REPLICA_SLOT_PERMANENT_SECS;
+    }
+    let deal = expiry - stored_at;
+    (deal / 8).clamp(REPLICA_SLOT_MIN_SECS, REPLICA_SLOT_MAX_SECS)
+}
 /// Escrow is never streamed for wall-clock time that predates this process epoch —
 /// a master returning from sleep must not pay (or pay itself) for the dark gap.
 static PAYOUT_FLOOR_TS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
@@ -4936,16 +5001,21 @@ pub async fn check_file_replication() {
                         &file.cid[..16.min(file.cid.len())]
                     );
                 }
+                let slot_secs = replica_slot_secs(file.stored_at, file.expiry);
                 let expired: Vec<String> = file.replica_grace.iter()
-                    .filter(|(_, &since)| now - since > REPLICA_GRACE_SECS)
+                    .filter(|(_, &since)| now - since > slot_secs)
                     .map(|(a, _)| a.clone())
                     .collect();
                 for addr in expired {
                     file.replica_grace.remove(&addr);
+                    // Whoever stood in for it stops being provisional: the slot is
+                    // now theirs outright.
+                    file.replica_provisional.retain(|_, covers| covers != &addr);
                     need_save = true;
                     tracing::warn!(
-                        "Replication: {} did not return within the 24h grace for {} — evicted permanently",
+                        "Replication: {} did not return within {}h for {} — evicted, its stand-in keeps the slot",
                         &addr[..20.min(addr.len())],
+                        slot_secs / 3600,
                         &file.cid[..16.min(file.cid.len())]
                     );
                 }
@@ -5031,9 +5101,16 @@ pub async fn check_file_replication() {
                 // copy intact) — UNLESS redundancy is critical: with zero live
                 // replicas the master is the only copy, and a fresh replica is
                 // recruited immediately regardless of grace.
-                let live    = file.replica_peers.len();
+                let live = file.replica_peers.len();
+                // Only a recently dark holder counts toward the target. Past
+                // REPLACE_AFTER_SECS it keeps its slot but stops covering the hole,
+                // so a stand-in is recruited and the file returns to full redundancy
+                // while the original still has time to come back.
+                let covering = file.replica_grace.values()
+                    .filter(|&&since| now - since <= REPLACE_AFTER_SECS)
+                    .count();
                 let in_grace = file.replica_grace.len();
-                let recruit = live == 0 || live + in_grace < MIN_REPLICAS;
+                let recruit = live == 0 || live + covering < MIN_REPLICAS;
 
                 if live == 0 {
                     if file.under_replicated_since == 0 {
@@ -5072,9 +5149,9 @@ pub async fn check_file_replication() {
                     pin_needed.push(file.cid.clone());
                 } else if live < MIN_REPLICAS {
                     tracing::debug!(
-                        "Replication: {} at {}/{} live — hole covered by {} grace holder(s), not recruiting",
+                        "Replication: {} at {}/{} live — hole covered by {} recently dark holder(s) of {} in grace, not recruiting yet",
                         &file.cid[..16.min(file.cid.len())],
-                        live, MIN_REPLICAS, in_grace);
+                        live, MIN_REPLICAS, covering, in_grace);
                 }
             }
 
@@ -7711,6 +7788,12 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                 let now = chrono::Utc::now().timestamp();
                 for f in ledger.stored_files.iter_mut() {
                     if f.cid == cid && !f.replica_peers.contains(&ack_from) {
+                        // If this pin is covering for a holder that is dark but still
+                        // inside its slot window, record who it stands in for so it
+                        // can step aside when they come back.
+                        let covers = f.replica_grace.keys()
+                            .find(|a| !f.replica_provisional.values().any(|c| c == *a))
+                            .cloned();
                         f.replica_peers.push(ack_from.clone());
                         if f.replica_peers.len() > MIN_REPLICAS {
                             f.replica_peers.truncate(MIN_REPLICAS);
@@ -7718,6 +7801,9 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                         if f.replica_peers.contains(&ack_from) {
                             f.replica_last_ack.insert(ack_from.clone(), now);
                             f.replica_grace.remove(&ack_from);
+                            if let Some(original) = covers {
+                                f.replica_provisional.insert(ack_from.clone(), original);
+                            }
                         }
                         changed = true;
                         eprintln!("[Replication] {} pinned by {} ({}/{} replicas)",
@@ -13015,5 +13101,84 @@ pub async fn run_porep_challenge_loop() {
             }
       
         }
+    }
+}
+
+#[cfg(test)]
+mod replica_policy_tests {
+    use super::*;
+
+    const DAY: i64 = 86_400;
+
+    #[test]
+    fn a_permanent_deal_keeps_the_slot_for_a_month() {
+        assert_eq!(replica_slot_secs(0, i64::MAX), REPLICA_SLOT_PERMANENT_SECS);
+    }
+
+    #[test]
+    fn a_month_long_deal_tolerates_a_few_days_away() {
+        let slot = replica_slot_secs(0, 30 * DAY);
+        assert!(slot >= 3 * DAY, "a month deal gave only {}h", slot / 3600);
+        assert!(slot <= REPLICA_SLOT_MAX_SECS);
+    }
+
+    #[test]
+    fn a_short_deal_still_gets_a_full_day() {
+        // An hour long deal must not produce a grace window of minutes.
+        assert_eq!(replica_slot_secs(0, 3600), REPLICA_SLOT_MIN_SECS);
+    }
+
+    #[test]
+    fn the_slot_window_is_never_unbounded() {
+        for expiry in [DAY, 30 * DAY, 365 * DAY, 100 * 365 * DAY] {
+            let slot = replica_slot_secs(0, expiry);
+            assert!(slot >= REPLICA_SLOT_MIN_SECS && slot <= REPLICA_SLOT_MAX_SECS,
+                "expiry {expiry} produced {slot}");
+        }
+    }
+
+    /// The anti-churn case: a laptop closed overnight must not cost a re-transfer.
+    #[test]
+    fn a_holder_dark_for_an_hour_still_covers_the_target() {
+        let now = 10 * DAY;
+        let dark_since = now - 3600;
+        let covering = [dark_since].iter()
+            .filter(|&&since| now - since <= REPLACE_AFTER_SECS)
+            .count();
+        let live = 1usize;
+        assert!(!(live == 0 || live + covering < MIN_REPLICAS),
+            "an hour of sleep must not trigger a stand-in");
+    }
+
+    /// The data-safety case: past a day the file must not keep sitting short.
+    #[test]
+    fn a_holder_dark_for_two_days_stops_covering_the_target() {
+        let now = 10 * DAY;
+        let dark_since = now - 2 * DAY;
+        let covering = [dark_since].iter()
+            .filter(|&&since| now - since <= REPLACE_AFTER_SECS)
+            .count();
+        let live = 1usize;
+        assert!(live == 0 || live + covering < MIN_REPLICAS,
+            "two days dark must trigger a stand-in");
+    }
+
+    #[test]
+    fn a_file_down_to_its_last_copy_recruits_regardless_of_grace() {
+        let now = 10 * DAY;
+        let covering = [now - 60].iter()
+            .filter(|&&since| now - since <= REPLACE_AFTER_SECS)
+            .count();
+        let live = 0usize;
+        assert!(live == 0 || live + covering < MIN_REPLICAS,
+            "zero live copies must always recruit, however recent the absence");
+    }
+
+    #[test]
+    fn the_replacement_threshold_is_shorter_than_the_slot_window() {
+        // Otherwise a holder would lose its slot before a stand-in was ever sought,
+        // which is the flat-24h behaviour this replaced.
+        assert!(REPLACE_AFTER_SECS <= REPLICA_SLOT_MIN_SECS);
+        assert!(REPLACE_AFTER_SECS < REPLICA_SLOT_PERMANENT_SECS);
     }
 }

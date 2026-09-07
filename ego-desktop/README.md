@@ -37,7 +37,27 @@ A quantum-safe blockchain desktop application — wallet, encrypted file sharing
 ### Storage
 - Allocate disk space and earn 0.5 EGOC per GB per day
 - Files are split, encrypted and distributed — an operator never holds a complete file
-- Replication and per-period escrow with a grace window for offline replicas
+- Every file is held by a master and two replicas, with the uploader's fee streamed
+  hourly to whoever is currently proving they hold it
+
+**If a provider goes offline.** The target hardware is a laptop, so being away is
+expected rather than exceptional, and the rules are built around that:
+
+| Elapsed | What happens |
+|---|---|
+| 5 min | stops earning, but keeps its slot |
+| under 24 h | still counts toward the copy target — nothing is moved |
+| past 24 h | a stand-in is recruited so the file is back to three copies |
+| returns in time | proves it still has the data, the stand-in steps down, nothing re-transferred |
+| past the slot window | evicted, and the stand-in keeps the slot |
+
+The slot window scales with the deal: 24 hours minimum, up to a week for a month
+long deal, 30 days for permanent storage. Losing a permanent deal because a
+laptop spent a weekend in a bag would be absurd.
+
+Keeping your slot and covering the copy target are deliberately separate. A
+closed lid costs nobody a re-transfer, and a file still never sits below three
+copies for more than a day.
 
 ### Coverage
 - Prove real wireless signal at your location and earn 8 EGOC per day

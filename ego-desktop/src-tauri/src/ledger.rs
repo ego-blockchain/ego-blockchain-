@@ -725,6 +725,17 @@ pub struct StoredFile {
     /// promotion). Split-brain resolution prefers the LATER master_since.
     #[serde(default)]
     pub master_since: i64,
+
+    /// Master bookkeeping: replicas recruited to cover for a holder that went dark,
+    /// mapped to the address they stand in for.
+    ///
+    /// A laptop that is closed overnight should not lose its slot, but the file
+    /// must not sit below its copy target for days either. So after the absence
+    /// passes REPLACE_AFTER_SECS a stand-in is recruited, and when the original
+    /// comes back and re-proves possession the stand-in steps aside and the set
+    /// returns to master plus MIN_REPLICAS. Nobody re-transfers anything.
+    #[serde(default)]
+    pub replica_provisional: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
