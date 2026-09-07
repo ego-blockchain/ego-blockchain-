@@ -329,26 +329,51 @@ const EarningsPage: React.FC = () => {
         </div>
       )}
 
-      {/* ── Session earned counter ─────────────────────────────────────────── */}
-      <div className="bg-slate-950 border border-slate-800 rounded-2xl p-7 shadow-2xl relative overflow-hidden group">
+      {/* ── Session / daily / lifetime counters ────────────────────────────── */}
+      <div className="bg-slate-950 border border-slate-800 rounded-2xl p-7 shadow-2xl relative overflow-hidden">
         <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-emerald-500 via-cyan-500 to-indigo-500 opacity-50"></div>
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div className="space-y-1">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 md:gap-0">
+
+          <div className="space-y-1 md:pr-8">
             <div className="text-[10px] font-black text-slate-500 uppercase tracking-[0.25em] mb-2 flex items-center gap-2">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.8)]"></span>
-              Live Session Accrual
+              This Session
             </div>
-            <div className="text-5xl font-mono font-black text-emerald-400 tabular-nums tracking-tighter drop-shadow-[0_0_15px_rgba(16,185,129,0.3)]">
-              {fmtEgoc(sessionEarned, 6)} <span className="text-xl text-emerald-700/60 ml-1">EGOC</span>
+            <div className="text-4xl font-mono font-black text-emerald-400 tabular-nums tracking-tighter drop-shadow-[0_0_15px_rgba(16,185,129,0.3)]">
+              {fmtEgoc(sessionEarned, 6)}
+            </div>
+            <div className="text-[9px] font-bold text-slate-600 uppercase tracking-widest pt-1">
+              EGOC since app start
             </div>
           </div>
-          <div className="text-left md:text-right space-y-1 border-t md:border-t-0 md:border-l border-slate-800 pt-4 md:pt-0 md:pl-8">
-            <div className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Network Throughput</div>
-            <div className="text-sm font-mono font-bold text-slate-300">
-              {fmtEgoc(earnings?.daily_rewards ?? 0, 2)} <span className="text-[10px] text-slate-500">EGOC / DAY</span>
+
+          <div className="space-y-1 border-t md:border-t-0 md:border-l border-slate-800 pt-5 md:pt-0 md:px-8">
+            <div className="text-[10px] font-black text-slate-500 uppercase tracking-[0.25em] mb-2">
+              Per Day
             </div>
-            <div className="text-[9px] text-slate-600 leading-tight uppercase font-medium">Actual payout subject to <br/>DRS eligibility and uptime</div>
+            <div className="text-4xl font-mono font-black text-cyan-400 tabular-nums tracking-tighter">
+              {fmtEgoc(earnings?.daily_rewards ?? 0, 4)}
+            </div>
+            <div className="text-[9px] font-bold text-slate-600 uppercase tracking-widest pt-1">
+              EGOC / 24h at current rate
+            </div>
           </div>
+
+          <div className="space-y-1 border-t md:border-t-0 md:border-l border-slate-800 pt-5 md:pt-0 md:pl-8">
+            <div className="text-[10px] font-black text-slate-500 uppercase tracking-[0.25em] mb-2">
+              All Time
+            </div>
+            <div className="text-4xl font-mono font-black text-indigo-400 tabular-nums tracking-tighter">
+              {fmtEgoc(earnings?.total_earned ?? 0, 4)}
+            </div>
+            <div className="text-[9px] font-bold text-slate-600 uppercase tracking-widest pt-1">
+              EGOC settled, all sessions
+            </div>
+          </div>
+
+        </div>
+        <div className="text-[9px] text-slate-600 uppercase font-medium tracking-wide mt-5 pt-4 border-t border-slate-800/60">
+          Session accrual is a live projection from your current rate. All-time reflects rewards settled on chain and persists across restarts.
         </div>
       </div>
 
@@ -358,7 +383,7 @@ const EarningsPage: React.FC = () => {
           { label: 'Settlement Rate', val: earnings ? fmtEgoc(earnings.daily_rewards) : '—',    unit: 'EGOC / 24H', color: 'text-emerald-400', bg: 'bg-emerald-500/5 border-emerald-500/10' },
           { label: 'Epoch Target',   val: earnings ? fmtEgoc(earnings.epoch_rewards)  : '—',    unit: 'EGOC / 7D',  color: 'text-cyan-400',    bg: 'bg-cyan-500/5 border-cyan-500/10'    },
           { label: 'Pending Payout', val: earnings ? fmtEgoc(earnings.pending_rewards): '—',    unit: 'UEGOC UNCONFIRMED', color: 'text-amber-400',   bg: 'bg-amber-500/5 border-amber-500/10'   },
-          { label: 'Lifetime Earnings', val: earnings ? fmtEgoc(earnings.total_earned)   : '—',    unit: 'TOTAL EGOC · ALL TIME', color: 'text-indigo-400',  bg: 'bg-indigo-500/5 border-indigo-500/10' },
+          { label: 'Uptime This Session', val: fmtDuration(uptime), unit: 'NODE ACTIVE', color: 'text-indigo-400',  bg: 'bg-indigo-500/5 border-indigo-500/10' },
         ].map(c => (
           <div key={c.label} className={`${c.bg} rounded-xl p-5 border relative overflow-hidden group hover:bg-opacity-10 transition-all`}>
             <div className="text-[10px] font-black text-slate-500 uppercase tracking-[0.15em] mb-3">{c.label}</div>
@@ -507,8 +532,10 @@ const EarningsPage: React.FC = () => {
           <div className="bg-gray-800 rounded-2xl p-5 border border-gray-700">
             <h3 className="font-semibold mb-2">Stake Your Rewards</h3>
             <p className="text-xs text-gray-400 mb-4">
-              Lock earned EGOC to boost your DRS multiplier, earn staking APR, and gain governance
-              rights — as described in the Ego whitepaper.
+              Lock earned EGOC to earn staking APR and gain governance rights. Stake also gates
+              whether your validator vote counts toward consensus quorum, and gives a new node a
+              small starting reward score. It does not raise your DRS multiplier once you are
+              earning: that is measured from coverage and storage proofs.
             </p>
             <div className="space-y-2 text-sm mb-4">
               <div className="flex justify-between">

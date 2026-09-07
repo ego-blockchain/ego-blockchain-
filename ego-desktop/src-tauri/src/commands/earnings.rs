@@ -25,24 +25,30 @@ pub async fn get_earnings_data(
     .await
     .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
 
-    let provable_bytes: u64 = ledger.stored_files.iter()
+    // Storage pays for peer data actually held, not for capacity offered. A file
+    // hosted for someone else carries the uploader's address as its owner, so the
+    // node's own files are excluded: storing your own data is not a service to the
+    // network and must not earn. Capacity still caps the payout, so a node cannot
+    // be paid for more than it pledged.
+    let hosted_bytes: u64 = ledger.stored_files.iter()
         .filter(|f| {
             f.status == "Active"
-                && (f.owner.is_empty() || f.owner == ledger.address)
+                && !f.owner.is_empty()
+                && f.owner != ledger.address
                 && f.proof_suspended_until <= now
                 && !f.local_path.is_empty()
                 && !f.local_path.starts_with("sender:")
         })
         .map(|f| f.encrypted_size)
         .sum();
-    let allocated_gb = (ledger.storage_allocated_bytes as f64 / 1_000_000_000.0)
-        .min(provable_bytes as f64 / 1_000_000_000.0 + 0.001);
+    let billable_gb = (hosted_bytes as f64 / 1_000_000_000.0)
+        .min(ledger.storage_allocated_bytes as f64 / 1_000_000_000.0);
 
     let reward_suspended = ledger.reward_suspended_until
         .map(|until| now < until)
         .unwrap_or(false);
 
-    let daily_storage  = if reward_suspended { 0 } else { (storage_reward_uegoc(allocated_gb) as f64 * scale) as u64 };
+    let daily_storage  = if reward_suspended { 0 } else { (storage_reward_uegoc(billable_gb) as f64 * scale) as u64 };
     let consensus_rate = if reward_suspended { 0 } else { (consensus_daily_uegoc() as f64 * scale) as u64 };
     let retrieval_rate = if reward_suspended { 0 } else { (retrieval_reward_uegoc(1.0) as f64 * scale) as u64 };
 
