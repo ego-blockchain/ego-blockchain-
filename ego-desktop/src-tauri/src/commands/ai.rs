@@ -122,7 +122,7 @@ Advanced: EGO-50 MEV Protection, EGO-51 Fee Market, EGO-52 Governance, EGO-53 DI
 - Ego Desktop shows balances for: Bitcoin, Ethereum, BNB Chain, Solana, Cardano, XRP, Tron, Polkadot, Litecoin, Dogecoin — plus native EGOC and EGUSD.
 - Addresses derived from the same seed. Per-chain explorer links. Users can hide/show individual chains.
 - Custom ERC-20/BEP-20 tokens: add by contract address, auto-fetches name/symbol/decimals from CoinGecko.
-- Live USD prices fetched via CoinGecko. EGOC price: ~$2.45 (from on-chain oracle). EGUSD: always $1.00.
+- Live USD prices fetched via CoinGecko. EGOC price comes from the on-chain oracle. EGUSD: always $1.00.
 
 ## Swap / Bridge
 - Swap between EGOC, EGUSD, BTC, ETH, BNB, ADA, USDT, USDC and other listed assets directly in the Wallet page.
@@ -169,7 +169,7 @@ Advanced: EGO-50 MEV Protection, EGO-51 Fee Market, EGO-52 Governance, EGO-53 DI
 
 ## Pre-Sale (Seed Round) — CURRENTLY LIVE
 - The Ego Blockchain pre-sale IS running right now. Seed Round is open. Never say "no presale is running" — it is active.
-- **Price**: $2.00 per EGOC (seed round, ~18% discount vs. $2.45 launch price).
+- **Price**: $0.008 per EGOC (seed round), $0.012 private, $0.02 at launch.
 - **Payment methods**: BTC, ETH, USDT, USDC, BNB, ADA, SOL, TRX — or credit/debit card via Stripe.
 - **Crypto flow**: user picks coin and amount → app shows the exact deposit address (Ego team treasury wallet) + EGOC allocation → user sends crypto manually → receives an encrypted IOU file as proof of purchase.
 - **Card flow (Stripe)**: Stripe Checkout session created via a secure server-side proxy (STRIPE_SECRET_KEY never in the app) → user pays on Stripe hosted page → payment verified → encrypted IOU file issued.
@@ -1005,7 +1005,7 @@ Just open any of the tabs above to configure your node. Your **Deterministic Rew
     } else if q.contains("quantum") || q.contains("crypto") || q.contains("signature") || q.contains("dilithium") {
         "Ego is quantum-safe. It uses a hybrid cryptography system: Ed25519 for classical signing, Dilithium2 (ML-DSA-44) for post-quantum signing, and Kyber768 for post-quantum key encapsulation."
     } else if q.contains("price") || q.contains("usd") || q.contains("egusd") {
-        "The estimated launch price of EGOC is $2.45. Ego also features EGUSD, a native stablecoin strictly pegged to 1 USD."
+        "The estimated launch price of EGOC is $0.02. Ego also features EGUSD, a native stablecoin strictly pegged to 1 USD."
     } else if q.contains("storage") || q.contains("post") || q.contains("files") || q.contains("save") {
         "Ego offers decentralized storage using Proof-of-Storage (PoST). Files are encrypted locally with AES-256-GCM before upload, split into chunks via DHT manifests, and the network enforces a minimum of 2 distributed replicas.\n\nStorage nodes must cryptographically prove they hold your data using a unique replica commitment (`comm_r`) every 6 hours. If they fail, their collateral is slashed!"
     } else if q.contains("stake") || q.contains("staking") || q.contains("apr") {

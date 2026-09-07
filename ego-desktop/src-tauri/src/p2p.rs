@@ -312,7 +312,7 @@ fn price_samples() -> std::sync::MutexGuard<'static, std::collections::VecDeque<
         .unwrap()
 }
 
-pub const EGOC_DEFAULT_PRICE_USD: f64 = 2.45;
+pub const EGOC_DEFAULT_PRICE_USD: f64 = 0.02;
 
 pub fn get_egoc_price_usd() -> f64 {
     let samples = price_samples();
@@ -9133,6 +9133,36 @@ fn validate_block(block: &crate::ledger::LedgerBlock, _chain: &crate::ledger::Sh
     }
 
     true
+}
+
+/// Entry point for a transaction that arrived over a non-internet transport:
+/// radio, LoRa mesh, satellite downlink, or a file carried on a USB stick.
+///
+/// The bytes are fully untrusted and are treated exactly like gossip. That is
+/// safe because a transaction authenticates itself: verify_incoming_tx checks
+/// the Ed25519 signature, the Dilithium signature, the body-to-hash binding and
+/// the nonce before anything reaches the mempool. A hostile relay can drop or
+/// delay a transaction, but cannot forge, alter or replay one.
+pub async fn ingest_sideband_bytes(
+    source: &str,
+    bytes: &[u8],
+    app: Option<&tauri::AppHandle<tauri::Wry>>,
+) -> Result<(), String> {
+    let msg: P2PMessage = serde_json::from_slice(bytes)
+        .map_err(|e| format!("sideband payload from {source} is not a P2P message: {e}"))?;
+
+    match msg {
+        P2PMessage::TxBroadcast { tx, block } => {
+            let hash = tx.hash.clone();
+            if let Err(e) = crate::ledger::verify_incoming_tx(&tx) {
+                return Err(format!("sideband tx {hash} from {source} rejected: {e}"));
+            }
+            eprintln!("[Sideband] accepted tx {hash} via {source}");
+            apply_incoming_tx(tx, block, app).await;
+            Ok(())
+        }
+        _ => Err(format!("sideband from {source}: only transactions are accepted")),
+    }
 }
 
 async fn apply_incoming_tx(tx: LedgerTx, block: LedgerBlock, app: Option<&tauri::AppHandle<tauri::Wry>>) {

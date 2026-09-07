@@ -1606,7 +1606,7 @@ pub async fn presale_info() -> Result<serde_json::Value, EgoDesktopError> {
         "egoc_price_usd": cached_presale_price().unwrap_or(0.0),
         "round":          1,
         "round_name":     "Seed Round",
-        "market_price":   2.45,
+        "market_price":   0.02,
         "discount_pct":   18,
     }))
 }
