@@ -538,6 +538,13 @@ static DIRECT_PEER_COUNT: std::sync::atomic::AtomicUsize =
 
 const MIN_DIRECT_PEERS_RELAY_OPTIONAL: usize = 10;
 
+/// How many non-local cached peers are dialled in the startup burst.
+///
+/// Kept low on purpose. libp2p drops dials once its in-flight limit is reached,
+/// and a dead cache entry costs the same slot as a live peer, so a large burst
+/// spends the whole budget before a LAN peer is even discovered.
+const MAX_STARTUP_REMOTE_DIALS: usize = 8;
+
 
 const MIN_CACHED_PEERS_FOR_DIRECT_BOOT: usize = 5;
 
@@ -5435,15 +5442,53 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
             .filter_map(|m| peer_id_from_multiaddr(&m))
             .map(|pid| pid.to_string())
             .collect();
-        for peer in cached.iter().filter(|p| !p.endpoint.is_empty()).take(30) {
-            let ep = &peer.endpoint;
-            let is_old_relay = ep.contains("egorelay2.") || ep.contains("egorelay3.")
-                || ep.contains("egorelay4.") || ep.contains("egorelay5.");
-            let is_active_relay = active_relay_ids.iter().any(|id| ep.contains(id.as_str()));
-            if is_old_relay || is_active_relay { continue; }
-            if let Ok(addr) = ep.parse::<Multiaddr>() {
+        // Dial the local network first, and only a handful of the rest.
+        //
+        // Dialling thirty cached peers at once saturates libp2p's dial capacity,
+        // and every dial past that point is dropped with "Dropping in-flight
+        // connect request because we are at capacity". Most of a long-lived
+        // cache is dead machines, so the casualties were the peers that matter:
+        // a laptop on the same WiFi, discovered by mDNS a moment later, lost its
+        // dial to a queue full of nodes that no longer exist.
+        //
+        // A peer on the same network is the one worth reaching. It is reachable
+        // without the internet, it is a stable direct link rather than a relay
+        // circuit, and on a network that has been cut off it is the only peer
+        // there is.
+        let dialable: Vec<&PeerEntry> = cached.iter()
+            .filter(|p| !p.endpoint.is_empty())
+            .filter(|p| {
+                let ep = &p.endpoint;
+                let is_old_relay = ep.contains("egorelay2.") || ep.contains("egorelay3.")
+                    || ep.contains("egorelay4.") || ep.contains("egorelay5.");
+                let is_active_relay = active_relay_ids.iter().any(|id| ep.contains(id.as_str()));
+                !is_old_relay && !is_active_relay
+            })
+            .collect();
+
+        let (lan, remote): (Vec<&PeerEntry>, Vec<&PeerEntry>) = dialable
+            .into_iter()
+            .partition(|p| endpoint_is_local(&p.endpoint));
+
+        for peer in &lan {
+            if let Ok(addr) = peer.endpoint.parse::<Multiaddr>() {
+                tracing::info!("Dialling LAN peer from cache: {}", peer.endpoint);
                 let _ = swarm.dial(addr);
             }
+        }
+
+        // The rest go out in a small first wave; the periodic peer loop picks up
+        // the others rather than firing them all into a full queue.
+        for peer in remote.iter().take(MAX_STARTUP_REMOTE_DIALS) {
+            if let Ok(addr) = peer.endpoint.parse::<Multiaddr>() {
+                let _ = swarm.dial(addr);
+            }
+        }
+        if remote.len() > MAX_STARTUP_REMOTE_DIALS {
+            tracing::info!(
+                "{} cached peers held back from the startup burst so LAN and mDNS dials are not starved",
+                remote.len() - MAX_STARTUP_REMOTE_DIALS
+            );
         }
     }
 
