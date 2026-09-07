@@ -2889,7 +2889,7 @@ const WalletPage: React.FC = () => {
       {}
       {showSend && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
-          <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-md border border-gray-700 shadow-2xl">
+          <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-2xl max-h-[88vh] overflow-y-auto border border-gray-700 shadow-2xl">
             {emailStep === 'review' ? (
               <div className="space-y-4">
                 <div className="flex justify-between items-center">
@@ -3064,7 +3064,8 @@ const WalletPage: React.FC = () => {
                       placeholder="Payment for..."
                     />
                   </div>
-                  <div className="flex items-center justify-between bg-gray-900/50 p-3 rounded-xl border border-gray-700/50">
+                  <div className="flex flex-wrap gap-3">
+                  <div className="flex items-center justify-between bg-gray-900/50 p-3 rounded-xl border border-gray-700/50 flex-1 min-w-[240px]">
                     <div className="flex items-center gap-3">
                       <div className="w-8 h-8 rounded-lg bg-yellow-500/10 flex items-center justify-center text-yellow-500">🛡</div>
                       <div>
@@ -3080,7 +3081,7 @@ const WalletPage: React.FC = () => {
                     </button>
                   </div>
                   {sideband?.enabled && (
-                    <div className="flex items-center justify-between bg-gray-900/50 p-3 rounded-xl border border-gray-700/50">
+                    <div className="flex items-center justify-between bg-gray-900/50 p-3 rounded-xl border border-gray-700/50 flex-1 min-w-[240px]">
                       <div className="flex items-center gap-3">
                         <div className="w-8 h-8 rounded-lg bg-amber-500/10 flex items-center justify-center text-amber-400 font-bold text-xs">RF</div>
                         <div>
@@ -3098,6 +3099,7 @@ const WalletPage: React.FC = () => {
                       </button>
                     </div>
                   )}
+                  </div>
                   {sendForm.viaRadio && (
                     <div className="bg-amber-500/5 border border-amber-500/20 rounded-xl p-3 text-[11px] text-amber-200/70 leading-relaxed">
                       This will be written to your offline link and not sent over the
