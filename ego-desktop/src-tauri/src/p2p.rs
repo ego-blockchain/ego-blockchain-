@@ -794,6 +794,16 @@ fn self_vote_lock() -> std::sync::MutexGuard<'static, HashMap<u64, (u64, String)
 // second QC at a height needs this node's own vote, and finalization is recorded
 // synchronously, so a node always observes "decided" before it could re-lock.
 fn try_lock_self_vote(height: u64, hash: &str, view: u64) -> bool {
+    // Every vote this node casts passes through here, which makes it the one
+    // place a dishonest build needs to touch.
+    if crate::adversary::should_withhold_vote() {
+        eprintln!("[Adversary] withholding a vote for #{height}");
+        return false;
+    }
+    if crate::adversary::should_double_vote() {
+        eprintln!("[Adversary] voting again at #{height} for a second block");
+        return true;
+    }
     let decided = finalized_at_height().contains_key(&height)
         || hard_finalized_heights().contains(&height);
     let mut lock = self_vote_lock();
@@ -11645,6 +11655,16 @@ pub async fn propose_block_as_leader() {
         Err(_) => return,
     };
 
+    // A node told to misbehave breaks its own proposal here, after it has been
+    // built honestly, so the corruption is exactly the thing under test and
+    // nothing upstream has to know about it.
+    let (block, stamped) = {
+        let mut b = block;
+        let mut t = stamped;
+        crate::adversary::corrupt_proposal(&mut b, &mut t);
+        (b, t)
+    };
+
     {
         let mut staged = staged_block();
         *staged = Some((block.clone(), stamped.clone()));
@@ -12001,6 +12021,16 @@ pub async fn propose_block_as_leader_forced() {
     }).await {
         Ok(v)  => v,
         Err(_) => return,
+    };
+
+    // A node told to misbehave breaks its own proposal here, after it has been
+    // built honestly, so the corruption is exactly the thing under test and
+    // nothing upstream has to know about it.
+    let (block, stamped) = {
+        let mut b = block;
+        let mut t = stamped;
+        crate::adversary::corrupt_proposal(&mut b, &mut t);
+        (b, t)
     };
 
     {

@@ -13,7 +13,7 @@ const CF_BLOCKS:     &str = "blocks";
 const CF_TXS:        &str = "txs";
 const CF_BLOCK_TXS:  &str = "block_txs";
 const CF_ADDR_TXS:   &str = "addr_txs";
-const CF_BALANCES:   &str = "balances";
+pub(crate) const CF_BALANCES: &str = "balances";
 const CF_RECENT_TXS: &str = "recent_txs";
 pub(crate) const CF_META: &str = "meta";
 const CF_HEADERS:    &str = "headers";    // light block headers — kept longer than full blocks
@@ -974,6 +974,12 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     }
 
     let mut balance_delta: std::collections::HashMap<String, i128> = Default::default();
+    // What this block claims to create and destroy. Every branch below that
+    // credits without debiting, or debits without crediting, records it here,
+    // and the totals are checked against the balance changes once the loop
+    // ends. A value-moving branch that forgets to declare itself fails on its
+    // first block.
+    let mut supply = crate::invariants::SupplyLedger::new();
     let mut new_tx_count: u64 = 0;
     let mut stake_sim: std::collections::HashMap<String, u64> = Default::default();
     let mut slashed_seen = load_slashed_set_inner(db);
@@ -1048,10 +1054,12 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
                 .entry(tx.from.clone())
                 .or_insert_with(|| crate::ledger::get_validator_stake(&tx.from));
             *stake = stake.saturating_sub(tx.amount);
+            supply.burn(tx.fee_uegoc);
         } else if tx.tx_type == "equivocation_proof" {
             match slash_from_equivocation_tx(db, tx, &mut stake_sim, &mut slashed_seen) {
                 Ok((accused, slash_amount)) => {
                     *balance_delta.entry(STAKING_ADDR.to_string()).or_insert(0) -= slash_amount as i128;
+                    supply.burn(slash_amount);
                     newly_slashed.push((accused, slash_amount));
                 }
                 Err(e) => tracing::warn!("Skipping invalid equivocation proof {} during block write: {}", tx.hash, e),
@@ -1062,10 +1070,12 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             *balance_delta.entry(tx.to.clone()).or_insert(0) +=
                 credited_amount.saturating_sub(tx.fee_uegoc) as i128;
             *balance_delta.entry(tx.from.clone()).or_insert(0) -= credited_amount as i128;
+            supply.burn(tx.fee_uegoc.min(credited_amount));
         } else {
             *balance_delta.entry(tx.to.clone()).or_insert(0) += credited_amount as i128;
         if tx.from.is_empty() {
             // Genesis/coinbase mint — no source pool to debit (bounded by genesis rules).
+            supply.mint(credited_amount);
         } else if crate::ledger::is_reserved_system_source(&tx.from) {
             // Every system pool (node pool, staking pool, collateral, escrow, …) is
             // debited by exactly what it emitted — capped above to its own balance,
@@ -1075,6 +1085,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         } else {
             let total_out = tx.amount as i128 + tx.fee_uegoc as i128;
             *balance_delta.entry(tx.from.clone()).or_insert(0) -= total_out;
+            supply.burn(tx.fee_uegoc);
             if is_stake_tx(tx) {
                 let stake = stake_sim
                     .entry(tx.from.clone())
@@ -1095,9 +1106,13 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             .unwrap_or(0);
         new_balances.insert(addr.clone(), cur);
     }
+    crate::invariants::check_supply(block.height, &supply, &balance_delta);
     for (addr, delta) in &balance_delta {
-        let cur = *new_balances.get(addr).unwrap_or(&0) as i128;
-        new_balances.insert(addr.clone(), (cur + delta).max(0) as u64);
+        let cur = *new_balances.get(addr).unwrap_or(&0);
+        // Reported before the clamp below, which keeps the database consistent
+        // by throwing away the evidence that anything was wrong.
+        crate::invariants::check_balance(block.height, addr, cur, *delta);
+        new_balances.insert(addr.clone(), (cur as i128 + delta).max(0) as u64);
     }
 
     // Build atomic WriteBatch.
@@ -1267,6 +1282,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         return false;
     }
     tracing::debug!("[ChainDB] db.write(batch) done — block #{}", block.height);
+    crate::shielded_chain::check_invariants(db, block.height);
 
     let block_height = block.height;
     let addr = crate::ledger::Ledger::load().address;
@@ -3518,7 +3534,16 @@ fn reorg_reverse_balance_delta(tx: &LedgerTx, out: &mut std::collections::HashMa
     }
 }
 
-fn recompute_max_nonce_for_addr(db: &DB, addr: &str) -> u64 {
+/// The highest nonce `addr` still has in a committed block, ignoring
+/// transactions that are on their way out.
+///
+/// `ignoring` is what lets this run before the reorg's write rather than
+/// after it, which is what allows the whole reorg to be one atomic batch.
+fn recompute_max_nonce_for_addr(
+    db: &DB,
+    addr: &str,
+    ignoring: &std::collections::HashSet<String>,
+) -> u64 {
     let cf_txs = match db.cf_handle(CF_TXS) { Some(c) => c, None => return 0 };
     let cf_addr_txs = match db.cf_handle(CF_ADDR_TXS) { Some(c) => c, None => return 0 };
     let mut prefix = addr.as_bytes().to_vec();
@@ -3530,6 +3555,7 @@ fn recompute_max_nonce_for_addr(db: &DB, addr: &str) -> u64 {
         if !k.starts_with(&prefix) { break; }
         if k.len() <= prefix.len() + 8 { continue; }
         let tx_hash = match std::str::from_utf8(&k[prefix.len() + 8..]) { Ok(s) => s, Err(_) => continue };
+        if ignoring.contains(tx_hash) { continue; }
         if let Some(tx) = db.get_cf(cf_txs, tx_hash.as_bytes()).ok().flatten()
             .and_then(|v| decode::<LedgerTx>(&v))
         {
@@ -3573,6 +3599,7 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
     let mut affected_senders: std::collections::HashSet<String> = Default::default();
     let mut balance_reverse: std::collections::HashMap<String, i128> = Default::default();
     let mut pool_txs: Vec<crate::ledger::LedgerTx> = Vec::new();
+    let mut removed_hashes: std::collections::HashSet<String> = Default::default();
     let mut batch = WriteBatch::default();
 
     for h in height..=tip {
@@ -3631,6 +3658,7 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
                         if !tx.from.is_empty() && tx.nonce > 0 {
                             affected_senders.insert(tx.from.clone());
                         }
+                        removed_hashes.insert(tx.hash.clone());
                         if tx.tx_type == "transfer" || tx.tx_type == "stake" || tx.tx_type == "unstake" {
                     tx.status = "Pending".to_string();
                     tx.block_height = None;
@@ -3666,22 +3694,34 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
         }
     }
     crate::shielded_chain::rollback(&db, &mut batch, height, &pool_txs);
+
+    // Nonce repair goes into the same batch as the truncation it depends on.
+    //
+    // It used to be a second write issued after the first had landed, which
+    // left a window where a crash produced a chain that had been truncated and
+    // nonces that still counted the transactions the truncation removed. Every
+    // later send from those accounts would then be refused as a replay, for
+    // good, with nothing to undo it. Computing the surviving maximum while
+    // ignoring the departing transactions removes the ordering dependency, so
+    // the whole reorg is one write that either happens or does not.
+    let mut nonce_updates: Vec<(String, u64)> = Vec::new();
+    for addr in &affected_senders {
+        let max_nonce = recompute_max_nonce_for_addr(&db, addr, &removed_hashes);
+        let mut nonce_key = NONCE_KEY_PREFIX.to_vec();
+        nonce_key.extend_from_slice(addr.as_bytes());
+        if max_nonce == 0 {
+            batch.delete_cf(cf_meta, &nonce_key);
+        } else {
+            batch.put_cf(cf_meta, &nonce_key, u64_le(max_nonce));
+        }
+        nonce_updates.push((addr.clone(), max_nonce));
+    }
+
     db.write(batch).expect("truncate write");
 
-    if !affected_senders.is_empty() {
-        let mut nonce_batch = WriteBatch::default();
-        for addr in &affected_senders {
-            let max_nonce = recompute_max_nonce_for_addr(&db, addr);
-            let mut nonce_key = NONCE_KEY_PREFIX.to_vec();
-            nonce_key.extend_from_slice(addr.as_bytes());
-            if max_nonce == 0 {
-                nonce_batch.delete_cf(cf_meta, &nonce_key);
-            } else {
-                nonce_batch.put_cf(cf_meta, &nonce_key, u64_le(max_nonce));
-            }
-            crate::ledger::set_confirmed_nonce(addr, max_nonce);
-        }
-        db.write(nonce_batch).ok();
+    // In-memory state follows the durable write, never precedes it.
+    for (addr, max_nonce) in nonce_updates {
+        crate::ledger::set_confirmed_nonce(&addr, max_nonce);
     }
 
     tracing::warn!("Reorg: truncated heights {}..={} (new tip: {}, removed {} txs, {} orphaned user txs)",
@@ -6209,6 +6249,128 @@ pub fn remove_pending_otptx(tx_id: &str) {
     let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return };
     let key = format!("{}{}", META_OTP_TX_PREFIX, tx_id);
     let _ = db.delete_cf(cf, key.as_bytes());
+}
+
+#[cfg(test)]
+mod reorg_atomicity_tests {
+    use super::*;
+
+    /// These share one database, so they take a lock and use their own
+    /// addresses.
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn put_tx(db: &DB, addr: &str, nonce: u64, hash: &str) {
+        let cf_txs = db.cf_handle(CF_TXS).unwrap();
+        let cf_addr_txs = db.cf_handle(CF_ADDR_TXS).unwrap();
+        let tx = LedgerTx {
+            hash: hash.into(),
+            from: addr.into(),
+            to: "egot1somebody".into(),
+            amount: 1,
+            nonce,
+            timestamp: 1_700_000_000 + nonce as i64,
+            ..LedgerTx::default()
+        };
+        let mut batch = WriteBatch::default();
+        batch.put_cf(cf_txs, hash.as_bytes(), encode(&tx));
+        batch.put_cf(cf_addr_txs, addr_txs_key(addr, tx.timestamp, hash), 0i64.to_le_bytes());
+        db.write(batch).unwrap();
+    }
+
+    fn clear_tx(db: &DB, addr: &str, nonce: u64, hash: &str) {
+        let cf_txs = db.cf_handle(CF_TXS).unwrap();
+        let cf_addr_txs = db.cf_handle(CF_ADDR_TXS).unwrap();
+        let ts = 1_700_000_000 + nonce as i64;
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(cf_txs, hash.as_bytes());
+        batch.delete_cf(cf_addr_txs, addr_txs_key(addr, ts, hash));
+        db.write(batch).unwrap();
+    }
+
+    /// The reorg fix rests on this: the surviving maximum nonce can be
+    /// computed before the departing transactions are deleted, by naming them.
+    /// If it could not, the nonce repair would have to be a second write after
+    /// the truncation, and a crash between the two would leave an account
+    /// permanently unable to send.
+    #[test]
+    fn the_surviving_nonce_is_computable_before_the_deletion_lands() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let addr = "egot1reorgnoncetest0000000000000000000000000";
+        let hashes: Vec<String> = (1..=5).map(|n| format!("0xreorgnonce{n:02}")).collect();
+        for (i, h) in hashes.iter().enumerate() {
+            put_tx(db, addr, (i + 1) as u64, h);
+        }
+
+        let none: std::collections::HashSet<String> = Default::default();
+        assert_eq!(recompute_max_nonce_for_addr(db, addr, &none), 5);
+
+        // Removing the top two blocks leaves nonce 3 as the highest, and that
+        // has to be knowable while they are all still in the database.
+        let departing: std::collections::HashSet<String> =
+            hashes[3..].iter().cloned().collect();
+        assert_eq!(recompute_max_nonce_for_addr(db, addr, &departing), 3);
+
+        // Removing everything takes the account back to no confirmed nonce,
+        // which is what lets it start again from one.
+        let all: std::collections::HashSet<String> = hashes.iter().cloned().collect();
+        assert_eq!(recompute_max_nonce_for_addr(db, addr, &all), 0);
+
+        // And the answer computed in advance is the answer the deletion
+        // actually produces, which is the whole claim.
+        for (i, h) in hashes.iter().enumerate().skip(3) {
+            clear_tx(db, addr, (i + 1) as u64, h);
+        }
+        assert_eq!(recompute_max_nonce_for_addr(db, addr, &none), 3);
+
+        for (i, h) in hashes.iter().enumerate().take(3) {
+            clear_tx(db, addr, (i + 1) as u64, h);
+        }
+        assert_eq!(recompute_max_nonce_for_addr(db, addr, &none), 0);
+    }
+
+    /// A transaction that merely mentions the address must not count as one it
+    /// sent, or a recipient would inherit somebody else's nonce.
+    #[test]
+    fn only_the_senders_own_transactions_count() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let addr = "egot1reorgnoncetest1111111111111111111111111";
+        let other = "egot1reorgnoncetest2222222222222222222222222";
+        let none: std::collections::HashSet<String> = Default::default();
+
+        // Somebody else's transaction, indexed under our address the way a
+        // received payment is.
+        let cf_txs = db.cf_handle(CF_TXS).unwrap();
+        let cf_addr_txs = db.cf_handle(CF_ADDR_TXS).unwrap();
+        let incoming = LedgerTx {
+            hash: "0xreorgincoming".into(),
+            from: other.into(),
+            to: addr.into(),
+            nonce: 99,
+            timestamp: 1_700_000_500,
+            ..LedgerTx::default()
+        };
+        let mut batch = WriteBatch::default();
+        batch.put_cf(cf_txs, incoming.hash.as_bytes(), encode(&incoming));
+        batch.put_cf(
+            cf_addr_txs,
+            addr_txs_key(addr, incoming.timestamp, &incoming.hash),
+            0i64.to_le_bytes(),
+        );
+        db.write(batch).unwrap();
+
+        assert_eq!(
+            recompute_max_nonce_for_addr(db, addr, &none),
+            0,
+            "a payment received must not raise the recipient's nonce"
+        );
+
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(cf_txs, incoming.hash.as_bytes());
+        batch.delete_cf(cf_addr_txs, addr_txs_key(addr, incoming.timestamp, &incoming.hash));
+        db.write(batch).unwrap();
+    }
 }
 
 #[cfg(test)]

@@ -4,6 +4,10 @@ mod app;
 mod autostart;
 mod offline_guard;
 mod onetime;
+mod adversary;
+mod invariants;
+mod robustness;
+mod scale;
 mod shielded;
 mod shielded_chain;
 mod sideband;
@@ -828,6 +832,7 @@ fn main() {
             commands::shielded::shielded_status,
             commands::shielded::shield_deposit,
             commands::shielded::shield_withdraw,
+            commands::shielded::invariant_report,
             commands::storage::unlock_storage_early,
             commands::storage::create_public_share,
             commands::storage::create_secure_share,

@@ -505,3 +505,30 @@ pub async fn shield_withdraw(
         recipient,
     })
 }
+
+/// What the node has recorded about its own accounting.
+///
+/// A healthy chain reports nothing here. Anything at all means a block was
+/// written whose balance changes did not add up, or whose shielded note counts
+/// were impossible, and the detail says which. Surfaced as a command so an
+/// operator can see it without reading logs, since by default a violation is
+/// recorded rather than fatal.
+#[derive(Debug, Clone, Serialize)]
+pub struct InvariantReport {
+    pub healthy: bool,
+    pub strict: bool,
+    pub violations: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn invariant_report() -> Result<InvariantReport, EgoDesktopError> {
+    let violations: Vec<String> = crate::invariants::violations()
+        .iter()
+        .map(|v| v.describe())
+        .collect();
+    Ok(InvariantReport {
+        healthy: violations.is_empty(),
+        strict: crate::invariants::strict(),
+        violations,
+    })
+}
