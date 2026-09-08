@@ -1,5 +1,5 @@
 use ark_bn254::{Bn254, Fr};
-use ark_ff::{BigInteger, PrimeField};
+use ark_ff::PrimeField;
 use ark_groth16::{Groth16, ProvingKey, VerifyingKey};
 use ark_relations::r1cs::{
     ConstraintSynthesizer, ConstraintSystemRef, SynthesisError, Variable,

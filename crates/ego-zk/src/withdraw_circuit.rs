@@ -44,7 +44,10 @@ use crate::merkle::merkle_root_gadget;
 use crate::poseidon_gadget::{commitment_gadget, nullifier_gadget};
 use ark_bn254::{Bn254, Fr};
 use ark_ff::{BigInteger, PrimeField};
-use ark_groth16::{Groth16, Proof, ProvingKey, VerifyingKey};
+use ark_groth16::Groth16;
+// Re-exported so the pool can name proof and key types without depending on
+// ark-groth16 itself and having to keep a second copy of the version pin.
+pub use ark_groth16::{Proof, ProvingKey, VerifyingKey};
 use ark_r1cs_std::boolean::Boolean;
 use ark_r1cs_std::fields::fp::FpVar;
 use ark_r1cs_std::prelude::*;
