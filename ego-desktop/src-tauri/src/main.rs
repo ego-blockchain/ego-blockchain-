@@ -5,6 +5,7 @@ mod autostart;
 mod offline_guard;
 mod onetime;
 mod shielded;
+mod shielded_chain;
 mod sideband;
 mod sideband_spool;
 mod bft_committee;
@@ -824,6 +825,9 @@ fn main() {
             commands::storage::reset_storage,
             commands::sideband::sideband_status,
             commands::sideband::sideband_queue_tx,
+            commands::shielded::shielded_status,
+            commands::shielded::shield_deposit,
+            commands::shielded::shield_withdraw,
             commands::storage::unlock_storage_early,
             commands::storage::create_public_share,
             commands::storage::create_secure_share,

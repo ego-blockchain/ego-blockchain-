@@ -23,7 +23,7 @@ static PENDING_TXS: Lazy<Mutex<HashMap<String, (LedgerTx, i64)>>> =
     });
 
 
-fn validate_ego_address(addr: &str) -> Result<(), EgoDesktopError> {
+pub(crate) fn validate_ego_address(addr: &str) -> Result<(), EgoDesktopError> {
     let addr = addr.trim();
     if addr.is_empty() {
         return Err(EgoDesktopError::InvalidInput("Recipient address is empty".into()));

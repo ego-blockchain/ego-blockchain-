@@ -53,6 +53,10 @@ use light_poseidon::parameters::bn254_x5::get_poseidon_parameters;
 /// a hash the pool never computed.
 pub const SHIELDED_COMMITMENT_DOMAIN: u64 = 1;
 pub const SHIELDED_NULLIFIER_DOMAIN: u64 = 2;
+/// Binds a withdrawal's recipient and fee into the circuit's one public
+/// binding slot: `Poseidon(BINDING, recipient, fee)`. Not used in-circuit,
+/// but it lives in this table so no other hash can share its tag.
+pub const SHIELDED_BINDING_DOMAIN: u64 = 4;
 
 /// The Poseidon parameters for a given input count, in the layout the gadget
 /// consumes. Read from `light-poseidon`'s table, never constructed here.

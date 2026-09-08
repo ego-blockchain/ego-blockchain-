@@ -61,6 +61,43 @@ interface LedgerTx {
   transport?: string;
 }
 
+interface ShieldedNote {
+  commitment: string;
+  value_uegoc: number;
+  leaf_index: number | null;
+  status: 'pending' | 'ready' | 'spending' | 'spent';
+  deposit_tx: string;
+  spent_tx: string | null;
+  created_at: number;
+}
+
+interface ShieldedStatus {
+  enabled: boolean;
+  active: boolean;
+  pool_address: string;
+  pool_balance_uegoc: number;
+  leaf_count: number;
+  denominations_uegoc: number[];
+  min_fee_uegoc: number;
+  current_fee_uegoc: number;
+  verifying_key_digest: string;
+  notes: ShieldedNote[];
+  ready_balance_uegoc: number;
+  pending_balance_uegoc: number;
+}
+
+const SHIELD_DENOMINATIONS_EGOC = [10000, 1000, 100, 10, 1];
+
+function splitIntoNotes(egoc: number): { notes: number[]; remainder: number } {
+  const notes: number[] = [];
+  let left = Math.floor(egoc * 1_000_000);
+  for (const d of SHIELD_DENOMINATIONS_EGOC) {
+    const du = d * 1_000_000;
+    while (left >= du) { notes.push(d); left -= du; }
+  }
+  return { notes, remainder: left / 1_000_000 };
+}
+
 interface SendForm {
   to: string;
   amount: string;
@@ -366,6 +403,13 @@ const WalletPage: React.FC = () => {
   const [sending, setSending]       = useState(false);
   const [txResult, setTxResult]         = useState<TxResult | null>(null);
   const [sideband, setSideband]         = useState<SidebandStatus | null>(null);
+  const [shielded, setShielded]         = useState<ShieldedStatus | null>(null);
+  const [showShield, setShowShield]     = useState(false);
+  const [shieldAmt, setShieldAmt]       = useState('');
+  const [shieldTo, setShieldTo]         = useState('');
+  const [shieldNote, setShieldNote]     = useState('');
+  const [shieldBusy, setShieldBusy]     = useState(false);
+  const [shieldMsg, setShieldMsg]       = useState<string | null>(null);
   const [sidebandMsg, setSidebandMsg]   = useState<string>('');
   const [txConfirmedHeight, setTxConfirmedHeight] = useState<number | null>(null);
   const [txFee, setTxFee]           = useState<{ fee_uegoc: number; fee_usd: number } | null>(null);
@@ -605,6 +649,9 @@ const WalletPage: React.FC = () => {
       invoke<SidebandStatus>('sideband_status')
         .then(st => { if (alive) setSideband(st); })
         .catch(() => {});
+      invoke<ShieldedStatus>('shielded_status')
+        .then(st => { if (alive) setShielded(st); })
+        .catch(() => {});
     };
     tick();
     const id = setInterval(tick, 10_000);
@@ -660,6 +707,10 @@ const WalletPage: React.FC = () => {
       setSidebandMsg(String(e).replace(/^.*Error:/, '').trim());
     }
     invoke<SidebandStatus>('sideband_status').then(setSideband).catch(() => {});
+  }
+
+  function refreshShielded() {
+    invoke<ShieldedStatus>('shielded_status').then(setShielded).catch(() => {});
   }
 
   function resetSend() {
@@ -1192,7 +1243,11 @@ const WalletPage: React.FC = () => {
         )}
         {isLiveMode && <div className="mb-5" />}
 
-        <div className={`grid gap-2 ${RAMP_ENABLED ? 'grid-cols-5' : 'grid-cols-4'}`}>
+        <div className={`grid gap-2 ${
+          ({ 4: 'grid-cols-4', 5: 'grid-cols-5', 6: 'grid-cols-6' } as Record<number, string>)[
+            (RAMP_ENABLED ? 5 : 4) + (shielded?.enabled && shielded?.active ? 1 : 0)
+          ]
+        }`}>
           {[
             {
               label: '↑ Send',
@@ -1200,6 +1255,11 @@ const WalletPage: React.FC = () => {
               action: () => { setShowSend(true); setTxResult(null); invoke<{ fee_uegoc: number; fee_usd: number }>('get_tx_fee', { txType: 'transfer' }).then(setTxFee).catch(() => {}); }
             },
             { label: '↓ Receive', live: false, action: () => setShowReceive(true) },
+            ...(shielded?.enabled && shielded?.active ? [{
+              label: '🛡 Shield',
+              live: false,
+              action: () => { setShieldMsg(null); setShowShield(true); refreshShielded(); },
+            }] : []),
             { label: '⇄ Swap',   live: true,  action: openSwap },
             ...(RAMP_ENABLED ? [{
               label: '$ Buy',
@@ -1627,7 +1687,9 @@ const WalletPage: React.FC = () => {
                     </div>
                     <div className="min-w-0">
                       <div className="text-sm font-mono text-gray-300 truncate">
-                        {tx.is_private ? <span className="text-yellow-400 font-bold">Hidden · {isSent ? 'Sent' : 'Received'}</span> : (isReward ? rewardLabel : shortHash(tx.hash))}
+                        {tx.tx_type === 'shield' ? <span className="text-amber-300 font-bold">🛡 Shielded deposit</span>
+                          : tx.tx_type === 'unshield' ? <span className="text-amber-300 font-bold">🛡 Unshielded payout</span>
+                          : tx.is_private ? <span className="text-yellow-400 font-bold">Hidden · {isSent ? 'Sent' : 'Received'}</span> : (isReward ? rewardLabel : shortHash(tx.hash))}
                       </div>
                       <div className="text-xs text-gray-500">
                         {isReward
@@ -2780,6 +2842,163 @@ const WalletPage: React.FC = () => {
         </div>
       )}
 
+      {showShield && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm" onClick={e => { if (e.target === e.currentTarget) setShowShield(false); }}>
+          <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-2xl border border-gray-700 shadow-2xl max-h-[90vh] overflow-y-auto">
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="text-lg font-bold">🛡 Shielded Pool <span className="ml-2 text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded bg-amber-500/20 text-amber-300">Testnet preview</span></h3>
+              <button onClick={() => setShowShield(false)} className="text-gray-400 hover:text-white text-xl">✕</button>
+            </div>
+            <div className="grid grid-cols-3 gap-3 mb-4">
+              <div className="rounded-xl bg-gray-900 border border-gray-700 p-3">
+                <div className="text-[10px] uppercase tracking-wider text-gray-500">Ready to unshield</div>
+                <div className="text-lg font-black">{((shielded?.ready_balance_uegoc ?? 0) / 1_000_000).toLocaleString()} EGOC</div>
+              </div>
+              <div className="rounded-xl bg-gray-900 border border-gray-700 p-3">
+                <div className="text-[10px] uppercase tracking-wider text-gray-500">Waiting for a block</div>
+                <div className="text-lg font-black">{((shielded?.pending_balance_uegoc ?? 0) / 1_000_000).toLocaleString()} EGOC</div>
+              </div>
+              <div className="rounded-xl bg-gray-900 border border-gray-700 p-3">
+                <div className="text-[10px] uppercase tracking-wider text-gray-500">Pool · notes</div>
+                <div className="text-lg font-black">{((shielded?.pool_balance_uegoc ?? 0) / 1_000_000).toLocaleString()} <span className="text-xs text-gray-500">EGOC · {shielded?.leaf_count ?? 0}</span></div>
+              </div>
+            </div>
+            <div className="text-[11px] text-gray-400 leading-relaxed mb-4">
+              Shielding moves coins into a pool where they are recorded only as a commitment. Unshielding
+              later pays a note out to any address with a zero-knowledge proof, and nothing on the chain links
+              the two. Notes come in fixed sizes of {SHIELD_DENOMINATIONS_EGOC.slice().reverse().join(', ')} EGOC so
+              amounts cannot identify them. The circuit is unaudited and the keys come from a single-party
+              setup; use it on the testnet only.
+            </div>
+            {shieldMsg && (
+              <div className="text-xs px-3 py-2 mb-3 rounded-lg bg-amber-500/15 text-amber-200 break-words">{shieldMsg}</div>
+            )}
+            <div className="grid md:grid-cols-2 gap-4">
+              <div className="rounded-xl bg-gray-900 border border-gray-700 p-4 space-y-3">
+                <div className="text-sm font-semibold">Shield</div>
+                <input
+                  type="number"
+                  min="0"
+                  value={shieldAmt}
+                  onChange={e => setShieldAmt(e.target.value)}
+                  placeholder="EGOC amount"
+                  className="w-full bg-gray-800 border border-gray-700 focus:border-amber-500 rounded-xl px-4 py-3 text-sm outline-none transition"
+                />
+                {parseFloat(shieldAmt) > 0 && (() => {
+                  const { notes, remainder } = splitIntoNotes(parseFloat(shieldAmt));
+                  const feeEach = (txFee?.fee_uegoc ?? 0) / 1_000_000;
+                  return (
+                    <div className="text-xs text-gray-400 space-y-1">
+                      <div>{notes.length === 0 ? 'Below the smallest note (1 EGOC).' : `${notes.length} note${notes.length === 1 ? '' : 's'}: ${notes.join(' + ')} EGOC`}</div>
+                      {remainder > 0 && <div>{remainder.toFixed(6)} EGOC stays transparent.</div>}
+                      {notes.length > 0 && txFee && <div>Fees: {notes.length} × {feeEach.toFixed(4)} EGOC</div>}
+                    </div>
+                  );
+                })()}
+                <button
+                  disabled={shieldBusy || splitIntoNotes(parseFloat(shieldAmt) || 0).notes.length === 0}
+                  onClick={async () => {
+                    setShieldBusy(true);
+                    setShieldMsg(null);
+                    try {
+                      const res = await invoke<{ tx_hashes: string[]; notes: number[]; shielded_uegoc: number; remainder_uegoc: number; fee_total_uegoc: number }>('shield_deposit', {
+                        amountUegoc: Math.round(parseFloat(shieldAmt) * 1_000_000),
+                      });
+                      setShieldMsg(`Shielded ${(res.shielded_uegoc / 1_000_000).toLocaleString()} EGOC as ${res.notes.length} note${res.notes.length === 1 ? '' : 's'}. They become spendable once their deposits are in a block.`);
+                      setShieldAmt('');
+                      refreshShielded();
+                    } catch (err) {
+                      setShieldMsg(String(err).replace(/^.*Error:/, '').trim());
+                    } finally {
+                      setShieldBusy(false);
+                    }
+                  }}
+                  className="w-full py-3 bg-amber-600 hover:bg-amber-500 disabled:opacity-40 rounded-xl font-semibold text-sm transition"
+                >
+                  {shieldBusy ? 'Working…' : 'Shield'}
+                </button>
+              </div>
+              <div className="rounded-xl bg-gray-900 border border-gray-700 p-4 space-y-3">
+                <div className="text-sm font-semibold">Unshield one note</div>
+                <select
+                  value={shieldNote}
+                  onChange={e => setShieldNote(e.target.value)}
+                  className="w-full bg-gray-800 border border-gray-700 focus:border-amber-500 rounded-xl px-4 py-3 text-sm outline-none transition"
+                >
+                  <option value="">Choose a note…</option>
+                  {(shielded?.notes ?? []).filter(n => n.status === 'ready').map(n => (
+                    <option key={n.commitment} value={n.commitment}>
+                      {(n.value_uegoc / 1_000_000).toLocaleString()} EGOC · {n.commitment.slice(0, 10)}…
+                    </option>
+                  ))}
+                </select>
+                <input
+                  type="text"
+                  value={shieldTo}
+                  onChange={e => setShieldTo(e.target.value)}
+                  placeholder="Recipient address (egot1…)"
+                  className="w-full bg-gray-800 border border-gray-700 focus:border-amber-500 rounded-xl px-4 py-3 text-sm outline-none transition font-mono"
+                />
+                {shieldNote && shielded && (() => {
+                  const n = shielded.notes.find(x => x.commitment === shieldNote);
+                  if (!n) return null;
+                  return (
+                    <div className="text-xs text-gray-400">
+                      Pays {((n.value_uegoc - shielded.current_fee_uegoc) / 1_000_000).toFixed(4)} EGOC after a {(shielded.current_fee_uegoc / 1_000_000).toFixed(4)} EGOC fee.
+                      Building the proof takes a few seconds.
+                    </div>
+                  );
+                })()}
+                <button
+                  disabled={shieldBusy || !shieldNote || !shieldTo.trim().startsWith('egot1')}
+                  onClick={async () => {
+                    setShieldBusy(true);
+                    setShieldMsg(null);
+                    try {
+                      const res = await invoke<{ hash: string; amount_uegoc: number; fee_uegoc: number; payout_uegoc: number; recipient: string }>('shield_withdraw', {
+                        commitment: shieldNote,
+                        recipient: shieldTo.trim(),
+                      });
+                      setShieldMsg(`Unshielding ${(res.payout_uegoc / 1_000_000).toFixed(4)} EGOC to ${res.recipient.slice(0, 14)}… (${res.hash.slice(0, 12)}…). It lands with the next block.`);
+                      setShieldNote('');
+                      refreshShielded();
+                    } catch (err) {
+                      setShieldMsg(String(err).replace(/^.*Error:/, '').trim());
+                    } finally {
+                      setShieldBusy(false);
+                    }
+                  }}
+                  className="w-full py-3 bg-amber-600 hover:bg-amber-500 disabled:opacity-40 rounded-xl font-semibold text-sm transition"
+                >
+                  {shieldBusy ? 'Working…' : 'Unshield'}
+                </button>
+              </div>
+            </div>
+            {(shielded?.notes.length ?? 0) > 0 && (
+              <div className="mt-4">
+                <div className="text-xs uppercase tracking-wider text-gray-500 mb-2">Your notes</div>
+                <div className="divide-y divide-gray-700/60 rounded-xl border border-gray-700 overflow-hidden">
+                  {shielded!.notes.map(n => (
+                    <div key={n.commitment} className="flex items-center justify-between px-3 py-2 text-xs bg-gray-900/60">
+                      <span className="font-mono text-gray-400">{n.commitment.slice(0, 16)}…</span>
+                      <span className="font-semibold">{(n.value_uegoc / 1_000_000).toLocaleString()} EGOC</span>
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
+                        n.status === 'ready' ? 'bg-emerald-500/15 text-emerald-300'
+                        : n.status === 'spent' ? 'bg-gray-600/30 text-gray-400'
+                        : 'bg-amber-500/15 text-amber-300'
+                      }`}>{n.status}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            <div className="mt-3 text-[10px] text-gray-600 font-mono break-all">
+              Verifying key {shielded?.verifying_key_digest?.slice(0, 16)}… · notes live in shielded_notes.bin, encrypted under your seed
+            </div>
+          </div>
+        </div>
+      )}
+
       {showCredits && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4 backdrop-blur-sm" onClick={e => { if (e.target === e.currentTarget) setShowCredits(false); }}>
           <div className="bg-gray-800 rounded-2xl p-6 w-full max-w-md border border-gray-700 shadow-2xl">
@@ -3246,6 +3465,11 @@ const WalletPage: React.FC = () => {
                 { label: 'Timestamp', val: sfTime(selectedTx.timestamp) },
                 { label: 'Signature', val: selectedTx.signature.slice(0, 32) + '…', mono: true },
                 ...(selectedTx.memo ? [{ label: 'Memo', val: selectedTx.memo }] : []),
+                ...(selectedTx.tx_type === 'shield'
+                  ? [{ label: 'Type', val: 'Shielded deposit: the memo holds the note commitment' }]
+                  : selectedTx.tx_type === 'unshield'
+                    ? [{ label: 'Type', val: 'Unshielded payout: authorised by a zero-knowledge proof, not a signature' }]
+                    : []),
                 ...(selectedTx.transport === 'internet'
                   ? [{ label: 'Sent via', val: 'Internet' }]
                   : selectedTx.transport

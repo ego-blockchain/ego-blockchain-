@@ -1481,6 +1481,7 @@ pub fn is_reserved_system_source(addr: &str) -> bool {
         || addr.starts_with("egot1burn")
         || addr.starts_with("egot1nodepool")
         || addr.starts_with("egot1rewards")
+        || addr.starts_with("egot1shielded")
 }
 
 fn expected_standard_tx_hash(tx: &LedgerTx) -> String {
@@ -1504,7 +1505,7 @@ fn tx_hash_must_match_standard_signing(tx: &LedgerTx) -> bool {
     matches!(
         tx.tx_type.as_str(),
         "transfer" | "stake" | "unstake" | "governance" | "cluster_escrow" | "storage_escrow" | "hosting_plan"
-            | "credits_mint" | "credits_pay"
+            | "credits_mint" | "credits_pay" | "shield"
     )
 }
 
@@ -1558,6 +1559,17 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
     let dilithium_required = crate::chain_db::is_feature_enabled(
         crate::chain_db::FEATURE_DILITHIUM_REQUIRED,
     );
+
+    // A withdrawal from the shielded pool is authorised by its proof, not a
+    // signature, so it is checked in full here and nowhere below applies.
+    if tx.from == crate::shielded_chain::SHIELDED_POOL_ADDR {
+        return crate::shielded_chain::verify_incoming_unshield(tx);
+    }
+    // A deposit is an ordinary signed transfer with a commitment in the memo;
+    // the memo is checked here and the signature by the rules below.
+    if tx.to == crate::shielded_chain::SHIELDED_POOL_ADDR {
+        crate::shielded_chain::verify_incoming_deposit(tx)?;
+    }
 
     if is_reserved_system_source(&tx.from) {
         if tx.tx_type == "faucet" && tx.from == crate::chain_db::NODE_POOL_ADDR {

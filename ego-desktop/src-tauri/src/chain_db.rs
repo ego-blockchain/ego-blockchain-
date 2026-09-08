@@ -15,7 +15,7 @@ const CF_BLOCK_TXS:  &str = "block_txs";
 const CF_ADDR_TXS:   &str = "addr_txs";
 const CF_BALANCES:   &str = "balances";
 const CF_RECENT_TXS: &str = "recent_txs";
-const CF_META:       &str = "meta";
+pub(crate) const CF_META: &str = "meta";
 const CF_HEADERS:    &str = "headers";    // light block headers — kept longer than full blocks
 const CF_GOVERNANCE: &str = "governance"; // on-chain feature flag votes
 const CF_DAO:        &str = "dao";        // DAO proposals (stake + knowledge voting)
@@ -54,18 +54,18 @@ const HEADER_CAP: u64 = 100_000;
 const META_PRUNE_BELOW:         &[u8] = b"prune_below";
 const META_PRUNE_HEADERS_BELOW: &[u8] = b"prune_headers_below";
 
-fn encode<T: serde::Serialize>(val: &T) -> Vec<u8> {
+pub(crate) fn encode<T: serde::Serialize>(val: &T) -> Vec<u8> {
     serde_json::to_vec(val).expect("json encode")
 }
 
-fn decode<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8]) -> Option<T> {
+pub(crate) fn decode<T: for<'de> serde::Deserialize<'de>>(bytes: &[u8]) -> Option<T> {
     serde_json::from_slice(bytes).ok()
 }
 
 #[inline] fn height_key(h: u64)  -> [u8; 8] { h.to_be_bytes() }
 #[inline] fn ts_key(ts: i64)     -> [u8; 8] { (ts as u64).to_be_bytes() }
-#[inline] fn u64_le(v: u64)      -> [u8; 8] { v.to_le_bytes() }
-#[inline] fn read_u64_le(b: &[u8]) -> u64   { u64::from_le_bytes(b.try_into().unwrap_or([0u8; 8])) }
+#[inline] pub(crate) fn u64_le(v: u64) -> [u8; 8] { v.to_le_bytes() }
+#[inline] pub(crate) fn read_u64_le(b: &[u8]) -> u64 { u64::from_le_bytes(b.try_into().unwrap_or([0u8; 8])) }
 #[inline] fn read_i64_le(b: &[u8]) -> i64   { i64::from_le_bytes(b.try_into().unwrap_or([0u8; 8])) }
 
 fn block_txs_key(height: u64, tx_hash: &str) -> Vec<u8> {
@@ -1056,6 +1056,12 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
                 }
                 Err(e) => tracing::warn!("Skipping invalid equivocation proof {} during block write: {}", tx.hash, e),
             }
+        } else if crate::shielded_chain::is_unshield(tx) {
+            // The whole note leaves the pool; the fee is what the recipient
+            // does not receive, exactly as a sender's fee is what leaves them.
+            *balance_delta.entry(tx.to.clone()).or_insert(0) +=
+                credited_amount.saturating_sub(tx.fee_uegoc) as i128;
+            *balance_delta.entry(tx.from.clone()).or_insert(0) -= credited_amount as i128;
         } else {
             *balance_delta.entry(tx.to.clone()).or_insert(0) += credited_amount as i128;
         if tx.from.is_empty() {
@@ -1252,6 +1258,8 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             crate::p2p::mark_validator_slashed_local(addr);
         }
     }
+
+    crate::shielded_chain::apply_block(db, &mut batch, block.height, &confirmed_txs);
 
     tracing::debug!("[ChainDB] db.write(batch) starting — block #{}", block.height);
     if let Err(e) = db.write(batch) {
@@ -3117,9 +3125,13 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
                     && tx.to == block.miner
                     && tx.amount <= crate::tokenomics::REWARD_CAP_PER_TX_UEGOC
                     && operational_reward_rate_ok(&tx.to, tx.timestamp);
+                // A shielded withdrawal is a system-source tx authorised by a
+                // proof; validate_peer_block_impl has already verified it.
+                let is_unshield = tx.tx_type == crate::shielded_chain::TX_UNSHIELD
+                    && tx.from == crate::shielded_chain::SHIELDED_POOL_ADDR;
                 // H3: every other system-source tx must carry a recognized emission
                 // type (no magic-string signatures).
-                if !is_reward && !is_system_emission_type(&tx.tx_type) {
+                if !is_reward && !is_unshield && !is_system_emission_type(&tx.tx_type) {
                     return Err(format!("forbidden system-source tx {} (type: '{}')", tx.hash, tx.tx_type));
                 }
         } else {
@@ -3163,7 +3175,7 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
                         .map(|v| read_u64_le(&v))
                         .unwrap_or(0)
                 });
-                *credit = credit.saturating_add(tx.amount);
+                *credit = credit.saturating_add(crate::shielded_chain::credited_to_recipient(tx));
             }
             continue;
         }
@@ -3270,6 +3282,7 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
             validate_credits_escrow_tx(tx, block.timestamp)?;
         }
     }
+    crate::shielded_chain::validate_block_shielded_txs(block.height, txs)?;
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let mut parent_vote_count: u32 = 0;
     if block.height > 1 {
@@ -3483,6 +3496,7 @@ pub fn delete_full_blocks_for_shard(shard_id: u32, shard_count: u32) {
 
 fn reorg_reverse_balance_delta(tx: &LedgerTx, out: &mut std::collections::HashMap<String, i128>) {
     if tx.tx_type == "equivocation_proof" { return; }
+    if crate::shielded_chain::reverse_balance_delta(tx, out) { return; }
     let is_system = tx.from == NODE_POOL_ADDR || tx.from.is_empty();
     if is_unstake_tx(tx) {
         let credit = unstake_credit_amount(tx) as i128;
@@ -3552,6 +3566,7 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
     let mut orphaned: Vec<crate::ledger::LedgerTx> = Vec::new();
     let mut affected_senders: std::collections::HashSet<String> = Default::default();
     let mut balance_reverse: std::collections::HashMap<String, i128> = Default::default();
+    let mut pool_txs: Vec<crate::ledger::LedgerTx> = Vec::new();
     let mut batch = WriteBatch::default();
 
     for h in height..=tip {
@@ -3604,6 +3619,9 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
                             }
                         }
                         reorg_reverse_balance_delta(&tx, &mut balance_reverse);
+                        if crate::shielded_chain::touches_pool(&tx) {
+                            pool_txs.push(tx.clone());
+                        }
                         if !tx.from.is_empty() && tx.nonce > 0 {
                             affected_senders.insert(tx.from.clone());
                         }
@@ -3641,6 +3659,7 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
             batch.put_cf(cf_balances, addr.as_bytes(), u64_le(new_bal));
         }
     }
+    crate::shielded_chain::rollback(&db, &mut batch, height, &pool_txs);
     db.write(batch).expect("truncate write");
 
     if !affected_senders.is_empty() {

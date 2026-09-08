@@ -296,6 +296,16 @@ impl ShardedMempool {
             }
         }
 
+        // Two withdrawals of one note cannot both land, and a block holding
+        // both is invalid, so admit only the first and let its proposer skip
+        // the question entirely.
+        if let Some(nf) = crate::shielded_chain::unshield_nullifier(&tx) {
+            if s.iter().any(|t| crate::shielded_chain::unshield_nullifier(t) == Some(nf)) {
+                self.seen_hashes[shard].lock().expect("lock poisoned").remove(&tx.hash);
+                return Err("a withdrawal for this note is already pending".into());
+            }
+        }
+
         // Localized O(K) eviction instead of O(N) global scan
         let max_per_shard = MAX_MEMPOOL_SIZE / SHARD_COUNT as usize;
         if s.len() >= max_per_shard {

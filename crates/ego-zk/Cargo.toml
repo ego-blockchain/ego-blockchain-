@@ -22,3 +22,7 @@ rand_chacha = "0.3"
 blake2 = "0.10"
 ark-crypto-primitives = { version = "0.5", features = ["sponge", "merkle_tree", "crh", "r1cs"] }
 light-poseidon = "0.4"
+
+[features]
+default = ["embedded-params"]
+embedded-params = []

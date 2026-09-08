@@ -22,14 +22,20 @@
 //! hashed; its root is `zeros[level]`. That is what lets a depth-20 tree
 //! (a million slots) with three leaves in it be built in a few dozen hashes.
 //!
-//! # This is the reference implementation
+//! # Two native trees, one answer
 //!
-//! `root()` and `path()` recompute from the leaf vector each call, O(n) hashes.
-//! That is exactly what the circuit is tested against and it is correct, but
-//! a pool with a million notes wants an incremental tree that caches filled
-//! subtrees, the way Tornado's contract does. That is an optimisation to be
-//! built against this and checked for equality with it, not a replacement for
-//! it.
+//! `MerkleTree` keeps every level and is what a prover uses: it needs every
+//! leaf anyway to compute a path, and with the levels cached an insert costs
+//! one hash per level, a root nothing, and a path one lookup per level.
+//!
+//! `IncrementalTree` keeps only the frontier, one node per level, the way
+//! Tornado's contract does. That is what consensus persists: an insert is
+//! one hash per level and the entire state is a few hundred bytes, so a
+//! million-note pool costs a validator the same per deposit as an empty one.
+//! It cannot produce paths, which is fine, because validators never need one.
+//!
+//! The two are checked against each other after every insert, and both are
+//! checked against a plain recursive definition of the root.
 
 use crate::poseidon_gadget::{poseidon_hash_gadget, PoseidonGadgetParams};
 use ark_bn254::Fr;
@@ -53,16 +59,27 @@ pub fn hash_node(left: Fr, right: Fr) -> Fr {
     p.hash(&[left, right]).expect("two inputs for width 3")
 }
 
+/// `zeros[i]` is the root of an all-empty subtree of height `i`, so
+/// `zeros[0]` is an empty leaf and `zeros[depth]` the root of an empty tree.
+pub fn empty_subtree_roots(depth: usize) -> Vec<Fr> {
+    let mut zeros = Vec::with_capacity(depth + 1);
+    zeros.push(Fr::zero());
+    for i in 1..=depth {
+        let below = zeros[i - 1];
+        zeros.push(hash_node(below, below));
+    }
+    zeros
+}
+
+/// The siblings from a leaf up to the root, and on which side the leaf's
+/// ancestor sits at each level.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MerklePath {
-    /// Sibling at each level, leaf level first.
     pub siblings: Vec<Fr>,
-    /// Whether our node is the right child at each level, leaf level first.
     pub is_right: Vec<bool>,
 }
 
 impl MerklePath {
-    /// The root this path claims, for `leaf`. Compare against the tree's root.
     pub fn compute_root(&self, leaf: Fr) -> Fr {
         self.siblings
             .iter()
@@ -77,22 +94,20 @@ impl MerklePath {
     }
 }
 
+/// The full tree, every level cached. Append-only.
 #[derive(Debug, Clone)]
 pub struct MerkleTree {
     depth: usize,
-    leaves: Vec<Fr>,
+    /// `levels[0]` holds the leaves; `levels[h]` holds every node of height
+    /// `h` with at least one real leaf beneath it. Nodes beyond the end of a
+    /// level are empty subtrees, whose roots are `zeros[h]`.
+    levels: Vec<Vec<Fr>>,
     zeros: Vec<Fr>,
 }
 
 impl MerkleTree {
     pub fn new(depth: usize) -> Self {
-        let mut zeros = Vec::with_capacity(depth + 1);
-        zeros.push(Fr::zero());
-        for i in 1..=depth {
-            let below = zeros[i - 1];
-            zeros.push(hash_node(below, below));
-        }
-        Self { depth, leaves: Vec::new(), zeros }
+        Self { depth, levels: vec![Vec::new(); depth + 1], zeros: empty_subtree_roots(depth) }
     }
 
     pub fn depth(&self) -> usize {
@@ -100,39 +115,45 @@ impl MerkleTree {
     }
 
     pub fn len(&self) -> usize {
-        self.leaves.len()
+        self.levels[0].len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.leaves.is_empty()
+        self.levels[0].is_empty()
     }
 
     pub fn capacity(&self) -> usize {
         1usize << self.depth
     }
 
-    /// Append a leaf and return its index. Append-only, like the pool's
-    /// commitment list: a leaf is never removed, because removing one would
-    /// reveal which note was spent.
-    pub fn insert(&mut self, leaf: Fr) -> Result<usize, String> {
-        if self.leaves.len() >= self.capacity() {
-            return Err(format!("tree of depth {} is full", self.depth));
-        }
-        self.leaves.push(leaf);
-        Ok(self.leaves.len() - 1)
+    pub fn leaves(&self) -> &[Fr] {
+        &self.levels[0]
     }
 
-    /// Node `idx` at `level`; level 0 is the leaves, level `depth` is the root.
     fn node(&self, level: usize, idx: usize) -> Fr {
-        if level == 0 {
-            return self.leaves.get(idx).copied().unwrap_or(self.zeros[0]);
+        self.levels[level].get(idx).copied().unwrap_or(self.zeros[level])
+    }
+
+    /// Append a leaf and rehash its ancestors: one hash per level.
+    pub fn insert(&mut self, leaf: Fr) -> Result<usize, String> {
+        if self.len() >= self.capacity() {
+            return Err(format!("tree of depth {} is full", self.depth));
         }
-        // Everything under this node is beyond the filled leaves: it is the
-        // all-empty subtree, whose root is precomputed.
-        if (idx << level) >= self.leaves.len() {
-            return self.zeros[level];
+        let index = self.len();
+        self.levels[0].push(leaf);
+        let mut idx = index;
+        for level in 0..self.depth {
+            let parent = idx >> 1;
+            let h = hash_node(self.node(level, parent * 2), self.node(level, parent * 2 + 1));
+            let above = &mut self.levels[level + 1];
+            if parent < above.len() {
+                above[parent] = h;
+            } else {
+                above.push(h);
+            }
+            idx = parent;
         }
-        hash_node(self.node(level - 1, 2 * idx), self.node(level - 1, 2 * idx + 1))
+        Ok(index)
     }
 
     pub fn root(&self) -> Fr {
@@ -140,8 +161,8 @@ impl MerkleTree {
     }
 
     pub fn path(&self, index: usize) -> Result<MerklePath, String> {
-        if index >= self.leaves.len() {
-            return Err(format!("no leaf at index {index}; tree has {}", self.leaves.len()));
+        if index >= self.len() {
+            return Err(format!("no leaf at index {index}; tree has {}", self.len()));
         }
         let mut siblings = Vec::with_capacity(self.depth);
         let mut is_right = Vec::with_capacity(self.depth);
@@ -157,14 +178,90 @@ impl MerkleTree {
     }
 }
 
-/// Recompute the root in-circuit from a leaf and its path. The caller enforces
-/// equality with the public root; this only computes.
-///
-/// At each level the prover's bit decides which side the current node sits
-/// on. Both orderings are selected with `conditionally_select` rather than
-/// branching, because a circuit cannot branch: both candidates are computed
-/// and the bit picks one, and the bit is itself constrained to be 0 or 1 by
-/// its allocation as a `Boolean`.
+/// The frontier of the same tree: for each level, the most recent node that
+/// still needs a right-hand sibling. Enough to append and to know the root,
+/// and nothing more, so it is what gets persisted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IncrementalTree {
+    depth: usize,
+    next_index: usize,
+    frontier: Vec<Fr>,
+    root: Fr,
+    zeros: Vec<Fr>,
+}
+
+impl IncrementalTree {
+    pub fn new(depth: usize) -> Self {
+        let zeros = empty_subtree_roots(depth);
+        Self { depth, next_index: 0, frontier: zeros[..depth].to_vec(), root: zeros[depth], zeros }
+    }
+
+    /// Rebuild from persisted parts. The parts are trusted to have come from
+    /// `parts()`; only their shape is checked here.
+    pub fn from_parts(depth: usize, next_index: usize, frontier: Vec<Fr>, root: Fr) -> Result<Self, String> {
+        if frontier.len() != depth {
+            return Err(format!("frontier has {} entries for depth {depth}", frontier.len()));
+        }
+        if next_index > (1usize << depth) {
+            return Err(format!("next index {next_index} exceeds a depth-{depth} tree"));
+        }
+        Ok(Self { depth, next_index, frontier, root, zeros: empty_subtree_roots(depth) })
+    }
+
+    pub fn parts(&self) -> (usize, usize, &[Fr], Fr) {
+        (self.depth, self.next_index, &self.frontier, self.root)
+    }
+
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    pub fn len(&self) -> usize {
+        self.next_index
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.next_index == 0
+    }
+
+    pub fn capacity(&self) -> usize {
+        1usize << self.depth
+    }
+
+    pub fn root(&self) -> Fr {
+        self.root
+    }
+
+    pub fn frontier(&self) -> &[Fr] {
+        &self.frontier
+    }
+
+    /// Append a leaf: one hash per level. At each level the new node is either
+    /// a left child, in which case it is remembered as the frontier and hashed
+    /// against an empty right sibling, or a right child, hashed against the
+    /// frontier node its left sibling left behind.
+    pub fn insert(&mut self, leaf: Fr) -> Result<usize, String> {
+        if self.next_index >= self.capacity() {
+            return Err(format!("tree of depth {} is full", self.depth));
+        }
+        let index = self.next_index;
+        let mut cur = leaf;
+        let mut idx = index;
+        for level in 0..self.depth {
+            if idx & 1 == 0 {
+                self.frontier[level] = cur;
+                cur = hash_node(cur, self.zeros[level]);
+            } else {
+                cur = hash_node(self.frontier[level], cur);
+            }
+            idx >>= 1;
+        }
+        self.root = cur;
+        self.next_index += 1;
+        Ok(index)
+    }
+}
+
 pub fn merkle_root_gadget(
     leaf: &FpVar<Fr>,
     siblings: &[FpVar<Fr>],
@@ -348,5 +445,77 @@ mod tests {
         let l = FpVar::new_witness(cs.clone(), || Ok(leaf(0))).unwrap();
         let s = FpVar::new_witness(cs.clone(), || Ok(leaf(1))).unwrap();
         assert!(merkle_root_gadget(&l, &[s], &[]).is_err());
+    }
+    /// The plain definition, with nothing cached: the root of a subtree is the
+    /// hash of its children, and an empty subtree is `zeros[height]`.
+    fn reference_node(leaves: &[Fr], zeros: &[Fr], level: usize, idx: usize) -> Fr {
+        if level == 0 {
+            return leaves.get(idx).copied().unwrap_or(zeros[0]);
+        }
+        if (idx << level) >= leaves.len() {
+            return zeros[level];
+        }
+        hash_node(
+            reference_node(leaves, zeros, level - 1, 2 * idx),
+            reference_node(leaves, zeros, level - 1, 2 * idx + 1),
+        )
+    }
+
+    #[test]
+    fn the_cached_tree_matches_the_recursive_definition_at_every_size() {
+        let zeros = empty_subtree_roots(DEPTH);
+        let mut t = MerkleTree::new(DEPTH);
+        for n in 0..=(1usize << DEPTH) {
+            assert_eq!(t.root(), reference_node(t.leaves(), &zeros, DEPTH, 0), "{n} leaves");
+            if n < (1usize << DEPTH) {
+                t.insert(leaf(n as u64)).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn the_incremental_tree_matches_the_full_tree_after_every_insert() {
+        let depth = 5;
+        let mut rng = test_rng();
+        let mut full = MerkleTree::new(depth);
+        let mut inc = IncrementalTree::new(depth);
+        assert_eq!(inc.root(), full.root(), "empty");
+        for i in 0..(1usize << depth) {
+            let l = Fr::rand(&mut rng);
+            assert_eq!(full.insert(l).unwrap(), i);
+            assert_eq!(inc.insert(l).unwrap(), i);
+            assert_eq!(inc.root(), full.root(), "after leaf {i}");
+        }
+        assert!(full.insert(Fr::rand(&mut rng)).is_err());
+        assert!(inc.insert(Fr::rand(&mut rng)).is_err());
+        assert_eq!(inc.len(), full.len());
+    }
+
+    #[test]
+    fn an_incremental_tree_starts_at_the_empty_root() {
+        assert_eq!(IncrementalTree::new(DEPTH).root(), MerkleTree::new(DEPTH).root());
+    }
+
+    #[test]
+    fn an_incremental_tree_round_trips_through_its_parts() {
+        let mut inc = IncrementalTree::new(DEPTH);
+        for i in 0..7 {
+            inc.insert(leaf(i)).unwrap();
+        }
+        let (depth, next, frontier, root) = inc.parts();
+        let mut restored = IncrementalTree::from_parts(depth, next, frontier.to_vec(), root).unwrap();
+        assert_eq!(restored, inc);
+        restored.insert(leaf(7)).unwrap();
+        inc.insert(leaf(7)).unwrap();
+        assert_eq!(restored.root(), inc.root());
+        assert_eq!(restored.root(), tree_with(8).root());
+    }
+
+    #[test]
+    fn parts_of_the_wrong_shape_are_refused() {
+        let zeros = empty_subtree_roots(DEPTH);
+        assert!(IncrementalTree::from_parts(DEPTH, 0, zeros[..DEPTH - 1].to_vec(), zeros[DEPTH]).is_err());
+        assert!(IncrementalTree::from_parts(DEPTH, (1 << DEPTH) + 1, zeros[..DEPTH].to_vec(), zeros[DEPTH]).is_err());
+        assert!(IncrementalTree::from_parts(DEPTH, 1 << DEPTH, zeros[..DEPTH].to_vec(), zeros[DEPTH]).is_ok());
     }
 }

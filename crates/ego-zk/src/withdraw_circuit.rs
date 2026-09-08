@@ -12,14 +12,24 @@
 //!    secret and rho. This is what stops one note being spent twice: the pool
 //!    records nullifiers, and a second spend of the same note would have to
 //!    publish the same one.
-//! 3. `amount <= value`, established as a range constraint rather than a
-//!    comparison. Circuits work over a field, where `value - amount` never
-//!    goes negative but wraps to something enormous. So `value`, `amount` and
-//!    their difference are each constrained to fit in 64 bits, and a wrapped
-//!    difference cannot.
-//! 4. The recipient is bound into the proof. A relayer who submits the
-//!    transaction on the prover's behalf cannot redirect the payout, because
-//!    changing the recipient changes a public input and invalidates the proof.
+//! 3. `amount == value`. A note is spent whole. The verifier builds the public
+//!    amount from the transaction's `u64`, so the note's value is pinned to a
+//!    64-bit quantity without any range proof, and there is no field
+//!    arithmetic to wrap.
+//! 4. A public binding value is tied into the proof. The chain sets it to a
+//!    hash of the recipient and the fee, so a relayer who submits the
+//!    transaction on the prover's behalf can neither redirect the payout nor
+//!    raise the fee: changing either changes a public input and invalidates
+//!    the proof.
+//!
+//! # Why a note is spent whole
+//!
+//! An earlier version allowed `amount <= value`. Without a change output, the
+//! difference was not returned to the spender; it stayed in the pool with no
+//! nullifier that could ever release it. Equality removes that trap at the
+//! protocol level rather than trusting every wallet to avoid it. Fixed
+//! denominations, enforced by the chain on deposit and withdrawal, are what
+//! keep the amount from identifying the note.
 //!
 //! # What the accounting layer still checks
 //!
@@ -43,20 +53,17 @@
 use crate::merkle::merkle_root_gadget;
 use crate::poseidon_gadget::{commitment_gadget, nullifier_gadget};
 use ark_bn254::{Bn254, Fr};
-use ark_ff::{BigInteger, PrimeField};
 use ark_groth16::Groth16;
 // Re-exported so the pool can name proof and key types without depending on
 // ark-groth16 itself and having to keep a second copy of the version pin.
 pub use ark_groth16::{Proof, ProvingKey, VerifyingKey};
+pub use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_r1cs_std::boolean::Boolean;
 use ark_r1cs_std::fields::fp::FpVar;
 use ark_r1cs_std::prelude::*;
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 use ark_snark::SNARK;
 use ark_std::rand::{CryptoRng, RngCore};
-
-/// Note values are `u64` micro-EGOC natively; the circuit bounds them to match.
-pub const VALUE_BITS: usize = 64;
 
 /// One withdrawal. Every field is `Option` because the same struct serves for
 /// setup, where no values exist and only the shape matters, and for proving.
@@ -95,44 +102,11 @@ impl WithdrawCircuit {
 
     /// The public inputs in allocation order. The verifier must be given
     /// exactly this, so it is defined once here rather than assembled by hand
-    /// at each call site, where the order would drift.
+    /// at each call site, where the order would drift. `recipient` is the
+    /// binding slot; what it binds is the chain's decision, not the circuit's.
     pub fn public_inputs(root: Fr, nullifier: Fr, amount: Fr, recipient: Fr) -> Vec<Fr> {
         vec![root, nullifier, amount, recipient]
     }
-}
-
-/// The low `n` bits of `v`, little-endian.
-fn low_bits_le(v: Fr, n: usize) -> Vec<bool> {
-    let bits = v.into_bigint().to_bits_le();
-    (0..n).map(|i| bits.get(i).copied().unwrap_or(false)).collect()
-}
-
-/// Constrain `x` to `[0, 2^n)`.
-///
-/// Allocates `n` boolean witnesses and requires that they reconstruct `x`.
-/// Each `Boolean` allocation constrains its bit to be 0 or 1, so the prover
-/// cannot smuggle a non-bit in. A value at or above `2^n` has no `n`-bit
-/// representation, so no choice of bits satisfies the equality.
-fn enforce_bounded(
-    cs: &ConstraintSystemRef<Fr>,
-    x: &FpVar<Fr>,
-    n: usize,
-) -> Result<(), SynthesisError> {
-    // Compute the honest bits once, outside the closures. In setup mode there
-    // is no value and the closures are never invoked, so this is simply None.
-    let honest: Option<Vec<bool>> = x.value().ok().map(|v| low_bits_le(v, n));
-    let bits: Vec<Boolean<Fr>> = (0..n)
-        .map(|i| {
-            Boolean::new_witness(cs.clone(), || {
-                honest
-                    .as_ref()
-                    .map(|b| b[i])
-                    .ok_or(SynthesisError::AssignmentMissing)
-            })
-        })
-        .collect::<Result<_, _>>()?;
-    let rebuilt = Boolean::le_bits_to_fp(&bits)?;
-    rebuilt.enforce_equal(x)
 }
 
 impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
@@ -195,18 +169,13 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
         let computed_nullifier = nullifier_gadget(&secret_w, &rho_w)?;
         computed_nullifier.enforce_equal(&nullifier_in)?;
 
-        // 3. amount <= value, as three range constraints. All three are needed:
-        // bounding only the difference would let a huge amount wrap the
-        // difference back into range, and bounding only value and amount would
-        // let a negative difference wrap to something enormous.
-        enforce_bounded(&cs, &value_w, VALUE_BITS)?;
-        enforce_bounded(&cs, &amount_in, VALUE_BITS)?;
-        let difference = &value_w - &amount_in;
-        enforce_bounded(&cs, &difference, VALUE_BITS)?;
+        // 3. The note is spent whole: its value is the public amount.
+        value_w.enforce_equal(&amount_in)?;
 
-        // 4. Bind the recipient. Multiplying it by itself emits one constraint
-        // that mentions it, so it is a genuine part of the statement being
-        // proved rather than a public input the circuit never touches.
+        // 4. Bind the public binding value. Multiplying it by itself emits one
+        // constraint that mentions it, so it is a genuine part of the
+        // statement being proved rather than a public input the circuit never
+        // touches.
         let _bound = &recipient_in * &recipient_in;
 
         Ok(())
@@ -323,7 +292,7 @@ mod tests {
     #[test]
     fn an_honest_withdrawal_satisfies_the_constraints_and_verifies() {
         let f = fixture(1_000);
-        let c = circuit(&f, 400);
+        let c = circuit(&f, 1_000);
         assert!(satisfied(c.clone()));
 
         let mut rng = crypto_rng();
@@ -332,24 +301,26 @@ mod tests {
         assert!(verify(&vk, &inputs_of(&c), &proof).unwrap());
     }
 
-    #[test]
-    fn withdrawing_exactly_the_full_value_is_allowed() {
-        let f = fixture(1_000);
-        assert!(satisfied(circuit(&f, 1_000)));
-    }
-
-    /// The inflation case. A field never goes negative, so this must be caught
-    /// by the range constraints, not by any comparison.
+    /// The inflation case.
     #[test]
     fn withdrawing_more_than_the_note_holds_is_refused() {
         let f = fixture(1_000);
         assert!(!satisfied(circuit(&f, 1_001)));
     }
 
+    /// The stuck-change case: a partial spend is refused rather than quietly
+    /// abandoning the remainder in the pool.
+    #[test]
+    fn withdrawing_less_than_the_note_holds_is_refused() {
+        let f = fixture(1_000);
+        assert!(!satisfied(circuit(&f, 999)));
+        assert!(!satisfied(circuit(&f, 0)));
+    }
+
     #[test]
     fn a_note_that_is_not_in_the_tree_is_refused() {
         let f = fixture(1_000);
-        let mut c = circuit(&f, 100);
+        let mut c = circuit(&f, 1_000);
         // A real path, but for somebody else's leaf.
         let other = f.tree.path(0).unwrap();
         c.siblings = Some(other.siblings);
@@ -360,7 +331,7 @@ mod tests {
     #[test]
     fn the_wrong_secret_is_refused() {
         let f = fixture(1_000);
-        let mut c = circuit(&f, 100);
+        let mut c = circuit(&f, 1_000);
         c.secret = Some(Fr::rand(&mut test_rng()) + Fr::one());
         assert!(!satisfied(c));
     }
@@ -370,7 +341,7 @@ mod tests {
     #[test]
     fn a_nullifier_for_a_different_note_is_refused() {
         let f = fixture(1_000);
-        let mut c = circuit(&f, 100);
+        let mut c = circuit(&f, 1_000);
         c.nullifier = Some(Fr::rand(&mut test_rng()));
         assert!(!satisfied(c));
     }
@@ -378,27 +349,29 @@ mod tests {
     #[test]
     fn a_root_the_note_is_not_under_is_refused() {
         let f = fixture(1_000);
-        let mut c = circuit(&f, 100);
+        let mut c = circuit(&f, 1_000);
         c.root = Some(Fr::rand(&mut test_rng()));
         assert!(!satisfied(c));
     }
 
-    /// The circuit takes its value as a field element, so the 64-bit bound is
-    /// its own responsibility, not something the `u64` type provides for it.
-    /// A prover supplying `2^64` directly must be refused.
+    /// A note whose value is not a `u64` can never be spent, because the
+    /// verifier only ever supplies amounts built from one. Such a note cannot
+    /// be deposited either, since deposits carry a `u64`; this pins the
+    /// circuit's side of that agreement.
     #[test]
-    fn a_value_beyond_64_bits_is_refused_even_when_supplied_directly() {
+    fn a_value_beyond_64_bits_can_never_match_a_u64_amount() {
         let too_big = Fr::from(u64::MAX) + Fr::one();
         let f = fixture_fr(too_big);
-        assert!(!satisfied(circuit(&f, 1)));
+        assert!(!satisfied(circuit(&f, u64::MAX)));
+        assert!(!satisfied(circuit(&f, 0)));
     }
 
     /// Without this, a relayer submitting the transaction could send the money
-    /// to themselves.
+    /// to themselves, or keep most of it as the fee.
     #[test]
     fn the_proof_is_bound_to_the_recipient() {
         let f = fixture(1_000);
-        let c = circuit(&f, 250);
+        let c = circuit(&f, 1_000);
         let mut rng = crypto_rng();
         let (pk, vk) = setup(DEPTH, &mut rng).unwrap();
         let proof = prove(&pk, c.clone(), &mut rng).unwrap();
@@ -416,7 +389,7 @@ mod tests {
     #[test]
     fn a_proof_does_not_verify_for_a_different_amount() {
         let f = fixture(1_000);
-        let c = circuit(&f, 250);
+        let c = circuit(&f, 1_000);
         let mut rng = crypto_rng();
         let (pk, vk) = setup(DEPTH, &mut rng).unwrap();
         let proof = prove(&pk, c.clone(), &mut rng).unwrap();
@@ -435,7 +408,7 @@ mod tests {
     fn the_constraint_count_stays_small() {
         let f = fixture(1_000);
         let cs = ConstraintSystem::<Fr>::new_ref();
-        circuit(&f, 100).generate_constraints(cs.clone()).unwrap();
+        circuit(&f, 1_000).generate_constraints(cs.clone()).unwrap();
         let n = cs.num_constraints();
         assert!(n < 5_000, "{n} constraints at depth {DEPTH}; something is being recomputed");
         assert!(n > 500, "{n} constraints is too few to be enforcing what this claims");
