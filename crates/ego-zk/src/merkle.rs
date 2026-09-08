@@ -1,42 +1,3 @@
-//! Merkle tree over note commitments, native and in-circuit.
-//!
-//! The pool records every commitment ever deposited. A withdrawal has to prove
-//! its note is one of them without saying which, and a Merkle tree is what
-//! makes that cheap: the prover shows a path from a leaf to the root that
-//! everybody already knows, and the path reveals nothing about the leaf's
-//! position beyond what the prover chooses to reveal, which is nothing.
-//!
-//! # Node hashing
-//!
-//! Nodes are `Poseidon(MERKLE_NODE_DOMAIN, left, right)`. The domain tag is
-//! distinct from the commitment and nullifier tags on purpose. Without it, a
-//! two-input node hash and a two-input nullifier hash would be the same
-//! function, and a value that is a valid leaf could be reinterpreted as a
-//! valid interior node or the reverse. Structural confusion of that kind is a
-//! classic way a Merkle proof is forged.
-//!
-//! # Empty leaves
-//!
-//! An empty slot is `Fr::zero()`, and `zeros[i]` is the root of an all-empty
-//! subtree of height `i`. A subtree entirely beyond the filled leaves is never
-//! hashed; its root is `zeros[level]`. That is what lets a depth-20 tree
-//! (a million slots) with three leaves in it be built in a few dozen hashes.
-//!
-//! # Two native trees, one answer
-//!
-//! `MerkleTree` keeps every level and is what a prover uses: it needs every
-//! leaf anyway to compute a path, and with the levels cached an insert costs
-//! one hash per level, a root nothing, and a path one lookup per level.
-//!
-//! `IncrementalTree` keeps only the frontier, one node per level, the way
-//! Tornado's contract does. That is what consensus persists: an insert is
-//! one hash per level and the entire state is a few hundred bytes, so a
-//! million-note pool costs a validator the same per deposit as an empty one.
-//! It cannot produce paths, which is fine, because validators never need one.
-//!
-//! The two are checked against each other after every insert, and both are
-//! checked against a plain recursive definition of the root.
-
 use crate::poseidon_gadget::{poseidon_hash_gadget, PoseidonGadgetParams};
 use ark_bn254::Fr;
 use ark_ff::Zero;
@@ -46,11 +7,8 @@ use ark_r1cs_std::prelude::*;
 use ark_relations::r1cs::SynthesisError;
 use light_poseidon::{Poseidon, PoseidonHasher};
 
-/// Distinct from `SHIELDED_COMMITMENT_DOMAIN` (1) and `SHIELDED_NULLIFIER_DOMAIN` (2).
 pub const MERKLE_NODE_DOMAIN: u64 = 3;
 
-/// Depth the pool will use: 2^20 = 1,048,576 notes. Tests use a small depth
-/// so they run in milliseconds; nothing here depends on the value.
 pub const POOL_TREE_DEPTH: usize = 20;
 
 pub fn hash_node(left: Fr, right: Fr) -> Fr {
@@ -59,8 +17,6 @@ pub fn hash_node(left: Fr, right: Fr) -> Fr {
     p.hash(&[left, right]).expect("two inputs for width 3")
 }
 
-/// `zeros[i]` is the root of an all-empty subtree of height `i`, so
-/// `zeros[0]` is an empty leaf and `zeros[depth]` the root of an empty tree.
 pub fn empty_subtree_roots(depth: usize) -> Vec<Fr> {
     let mut zeros = Vec::with_capacity(depth + 1);
     zeros.push(Fr::zero());
@@ -71,8 +27,6 @@ pub fn empty_subtree_roots(depth: usize) -> Vec<Fr> {
     zeros
 }
 
-/// The siblings from a leaf up to the root, and on which side the leaf's
-/// ancestor sits at each level.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MerklePath {
     pub siblings: Vec<Fr>,
@@ -94,13 +48,9 @@ impl MerklePath {
     }
 }
 
-/// The full tree, every level cached. Append-only.
 #[derive(Debug, Clone)]
 pub struct MerkleTree {
     depth: usize,
-    /// `levels[0]` holds the leaves; `levels[h]` holds every node of height
-    /// `h` with at least one real leaf beneath it. Nodes beyond the end of a
-    /// level are empty subtrees, whose roots are `zeros[h]`.
     levels: Vec<Vec<Fr>>,
     zeros: Vec<Fr>,
 }
@@ -134,7 +84,6 @@ impl MerkleTree {
         self.levels[level].get(idx).copied().unwrap_or(self.zeros[level])
     }
 
-    /// Append a leaf and rehash its ancestors: one hash per level.
     pub fn insert(&mut self, leaf: Fr) -> Result<usize, String> {
         if self.len() >= self.capacity() {
             return Err(format!("tree of depth {} is full", self.depth));
@@ -178,9 +127,6 @@ impl MerkleTree {
     }
 }
 
-/// The frontier of the same tree: for each level, the most recent node that
-/// still needs a right-hand sibling. Enough to append and to know the root,
-/// and nothing more, so it is what gets persisted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IncrementalTree {
     depth: usize,
@@ -196,8 +142,6 @@ impl IncrementalTree {
         Self { depth, next_index: 0, frontier: zeros[..depth].to_vec(), root: zeros[depth], zeros }
     }
 
-    /// Rebuild from persisted parts. The parts are trusted to have come from
-    /// `parts()`; only their shape is checked here.
     pub fn from_parts(depth: usize, next_index: usize, frontier: Vec<Fr>, root: Fr) -> Result<Self, String> {
         if frontier.len() != depth {
             return Err(format!("frontier has {} entries for depth {depth}", frontier.len()));
@@ -236,10 +180,6 @@ impl IncrementalTree {
         &self.frontier
     }
 
-    /// Append a leaf: one hash per level. At each level the new node is either
-    /// a left child, in which case it is remembered as the frontier and hashed
-    /// against an empty right sibling, or a right child, hashed against the
-    /// frontier node its left sibling left behind.
     pub fn insert(&mut self, leaf: Fr) -> Result<usize, String> {
         if self.next_index >= self.capacity() {
             return Err(format!("tree of depth {} is full", self.depth));
@@ -304,8 +244,6 @@ mod tests {
 
     #[test]
     fn the_node_domain_is_distinct_from_the_note_domains() {
-        // Structural confusion between a leaf and an interior node is how a
-        // Merkle proof gets forged. These must never coincide.
         assert_ne!(MERKLE_NODE_DOMAIN, SHIELDED_COMMITMENT_DOMAIN);
         assert_ne!(MERKLE_NODE_DOMAIN, SHIELDED_NULLIFIER_DOMAIN);
     }
@@ -328,8 +266,6 @@ mod tests {
 
     #[test]
     fn every_leaf_has_a_path_that_reproduces_the_root() {
-        // Seven leaves in a sixteen-slot tree: an odd count, so some nodes have
-        // a real left child and an empty right one.
         let t = tree_with(7);
         let root = t.root();
         for i in 0..7 {
@@ -370,8 +306,6 @@ mod tests {
         assert!(t.path(3).is_err());
     }
 
-    /// The in-circuit root must equal the native one for every leaf, or a
-    /// legitimate withdrawal would fail to verify.
     #[test]
     fn the_gadget_reproduces_the_native_root_for_every_leaf() {
         let t = tree_with(7);
@@ -446,8 +380,6 @@ mod tests {
         let s = FpVar::new_witness(cs.clone(), || Ok(leaf(1))).unwrap();
         assert!(merkle_root_gadget(&l, &[s], &[]).is_err());
     }
-    /// The plain definition, with nothing cached: the root of a subtree is the
-    /// hash of its children, and an empty subtree is `zeros[height]`.
     fn reference_node(leaves: &[Fr], zeros: &[Fr], level: usize, idx: usize) -> Fr {
         if level == 0 {
             return leaves.get(idx).copied().unwrap_or(zeros[0]);

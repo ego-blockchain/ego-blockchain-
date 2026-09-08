@@ -26,16 +26,6 @@ pub fn queue_depths() -> (usize, usize) {
     }
 }
 
-/// A transport that moves frames through a directory rather than a socket.
-///
-/// Frames written to `inbox/` are read and deleted; frames to transmit are
-/// written to `outbox/`. Nothing here knows what carries them, which is the
-/// point: a twenty-line script can bridge a LoRa module, a KISS TNC, an SDR or
-/// a satellite receiver without any Rust, and a USB stick physically carried
-/// between two machines is a valid transport with no code at all.
-///
-/// It is also the transport used to test the pipeline end to end without radio
-/// hardware present.
 pub struct SpoolTransport {
     name: &'static str,
     inbox: PathBuf,
@@ -53,9 +43,6 @@ impl SpoolTransport {
         Self { name, inbox, outbox, send_enabled, max_payload }
     }
 
-    /// Default spool under the node's data directory, so an operator can find it
-    /// without configuration. The root is remembered so the UI can show the
-    /// operator where to point their radio bridge.
     pub fn default_spool() -> Self {
         let root = crate::ledger::base_data_dir().join("sideband");
         let _ = SPOOL_ROOT.set(root.clone());

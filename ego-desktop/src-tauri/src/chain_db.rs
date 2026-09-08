@@ -46,7 +46,6 @@ pub const FEATURE_DILITHIUM_DISABLED: &str = "dilithium_disabled";
 /// Enforce ML-DSA-44 on every transaction (migration complete).
 pub const FEATURE_DILITHIUM_REQUIRED: &str = "dilithium_required";
 
-
 const FULL_BLOCK_CAP: u64 = 2_000_000_000; // Act as an Archive Node (keep all history)
 
 const HEADER_CAP: u64 = 100_000;
@@ -974,11 +973,6 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     }
 
     let mut balance_delta: std::collections::HashMap<String, i128> = Default::default();
-    // What this block claims to create and destroy. Every branch below that
-    // credits without debiting, or debits without crediting, records it here,
-    // and the totals are checked against the balance changes once the loop
-    // ends. A value-moving branch that forgets to declare itself fails on its
-    // first block.
     let mut supply = crate::invariants::SupplyLedger::new();
     let mut new_tx_count: u64 = 0;
     let mut stake_sim: std::collections::HashMap<String, u64> = Default::default();
@@ -993,7 +987,6 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         if db.get_cf(cf_txs, tx.hash.as_bytes()).ok().flatten().is_some() {
             continue;
         }
-
 
         if tx.from == FOUNDATION_ADDR && tx.amount > 0 {
             let now = chrono::Utc::now().timestamp();
@@ -1015,7 +1008,6 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
                 continue;
             }
         }
-
 
         let credited_amount = if !tx.from.is_empty()
             && crate::ledger::is_reserved_system_source(&tx.from)
@@ -1065,8 +1057,6 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
                 Err(e) => tracing::warn!("Skipping invalid equivocation proof {} during block write: {}", tx.hash, e),
             }
         } else if crate::shielded_chain::is_unshield(tx) {
-            // The whole note leaves the pool; the fee is what the recipient
-            // does not receive, exactly as a sender's fee is what leaves them.
             *balance_delta.entry(tx.to.clone()).or_insert(0) +=
                 credited_amount.saturating_sub(tx.fee_uegoc) as i128;
             *balance_delta.entry(tx.from.clone()).or_insert(0) -= credited_amount as i128;
@@ -1109,8 +1099,6 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     crate::invariants::check_supply(block.height, &supply, &balance_delta);
     for (addr, delta) in &balance_delta {
         let cur = *new_balances.get(addr).unwrap_or(&0);
-        // Reported before the clamp below, which keeps the database consistent
-        // by throwing away the evidence that anything was wrong.
         crate::invariants::check_balance(block.height, addr, cur, *delta);
         new_balances.insert(addr.clone(), (cur as i128 + delta).max(0) as u64);
     }
@@ -1171,7 +1159,6 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             }
             _ => {}
         }
-
 
         let is_spammy = tx.from == NODE_POOL_ADDR 
             && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward");
@@ -1337,7 +1324,6 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     // Prune old data to keep disk bounded.
     prune_if_needed(db);
 
-
     let mut hashes_to_remove = Vec::with_capacity(confirmed_txs.len());
     for tx in &confirmed_txs {
         hashes_to_remove.push(tx.hash.clone());
@@ -1484,8 +1470,6 @@ fn notify_wallet_activity(my_addr: &str, block: &LedgerBlock, txs: &[&LedgerTx])
         }
     });
 }
-
-
 
 fn prune_zero_balance_accounts(db: &DB) -> u64 {
     let cf = match db.cf_handle(CF_BALANCES) { Some(c) => c, None => return 0 };
@@ -2250,7 +2234,6 @@ pub fn mine_batch_db(txs: &[LedgerTx], miner: &str) -> LedgerBlock {
     mine_batch_db_with_ticket(txs, miner, &combined_ticket, poc_slot)
 }
 
-
 pub fn block_hash_for(
     prev_hash:       &str,
     height:          u64,
@@ -2265,7 +2248,6 @@ pub fn block_hash_for(
     );
     blake3::hash(input.as_bytes()).to_hex().to_string()
 }
-
 
 pub fn block_hash_v3(
     prev_hash:       &str,
@@ -3141,8 +3123,6 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
                     && tx.to == block.miner
                     && tx.amount <= crate::tokenomics::REWARD_CAP_PER_TX_UEGOC
                     && operational_reward_rate_ok(&tx.to, tx.timestamp);
-                // A shielded withdrawal is a system-source tx authorised by a
-                // proof; validate_peer_block_impl has already verified it.
                 let is_unshield = tx.tx_type == crate::shielded_chain::TX_UNSHIELD
                     && tx.from == crate::shielded_chain::SHIELDED_POOL_ADDR;
                 // H3: every other system-source tx must carry a recognized emission
@@ -3242,9 +3222,6 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
             ));
         }
         *balance = balance.saturating_sub(required);
-        // The shielded pool is a reserved address but a deposit really does
-        // credit it, so the simulation has to say so too or it under-counts
-        // what the pool can pay out later in the same block.
         if !tx.to.is_empty()
             && (!crate::ledger::is_reserved_system_source(&tx.to)
                 || crate::shielded_chain::is_deposit(tx))
@@ -3361,7 +3338,6 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
         let sig_bytes = hex::decode(&block.agg_bls_sig).unwrap_or_default();
         let pubkeys: Vec<Vec<u8>> = block.bls_pubkeys.iter().filter_map(|pk| hex::decode(pk).ok()).collect();
 
-
         let active_validators = crate::p2p::get_known_validators_snapshot();
         let total_weight = crate::bft_committee::total_drs_weight(&active_validators) as f64;
         let mut voter_weight = 0f64;
@@ -3410,7 +3386,6 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
         }
     }
 
-
     let local_tip = db.cf_handle(CF_META)
         .and_then(|cf| db.get_cf(cf, META_LATEST_HEIGHT).ok().flatten())
         .map(|v| read_u64_le(&v))
@@ -3426,7 +3401,6 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
     }
     Ok(())
 }
-
 
 pub fn append_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     if let Some(existing) = get_block_by_height(block.height) {
@@ -3534,11 +3508,6 @@ fn reorg_reverse_balance_delta(tx: &LedgerTx, out: &mut std::collections::HashMa
     }
 }
 
-/// The highest nonce `addr` still has in a committed block, ignoring
-/// transactions that are on their way out.
-///
-/// `ignoring` is what lets this run before the reorg's write rather than
-/// after it, which is what allows the whole reorg to be one atomic batch.
 fn recompute_max_nonce_for_addr(
     db: &DB,
     addr: &str,
@@ -3695,15 +3664,6 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
     }
     crate::shielded_chain::rollback(&db, &mut batch, height, &pool_txs);
 
-    // Nonce repair goes into the same batch as the truncation it depends on.
-    //
-    // It used to be a second write issued after the first had landed, which
-    // left a window where a crash produced a chain that had been truncated and
-    // nonces that still counted the transactions the truncation removed. Every
-    // later send from those accounts would then be refused as a replay, for
-    // good, with nothing to undo it. Computing the surviving maximum while
-    // ignoring the departing transactions removes the ordering dependency, so
-    // the whole reorg is one write that either happens or does not.
     let mut nonce_updates: Vec<(String, u64)> = Vec::new();
     for addr in &affected_senders {
         let max_nonce = recompute_max_nonce_for_addr(&db, addr, &removed_hashes);
@@ -3719,7 +3679,6 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
 
     db.write(batch).expect("truncate write");
 
-    // In-memory state follows the durable write, never precedes it.
     for (addr, max_nonce) in nonce_updates {
         crate::ledger::set_confirmed_nonce(&addr, max_nonce);
     }
@@ -3737,7 +3696,6 @@ pub fn append_peer_block_with_votes(block: &LedgerBlock, txs: &[LedgerTx], votes
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     write_block_batch(&db, &b, txs);
 }
-
 
 pub fn apply_missing_tx(block_height: u64, tx: &LedgerTx) {
     if tx.hash.is_empty() { return; }
@@ -3823,11 +3781,9 @@ pub fn apply_missing_tx(block_height: u64, tx: &LedgerTx) {
     }
 }
 
-
 fn blake3_hex(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
 }
-
 
 pub fn compute_merkle_root(tx_hashes: &[&str]) -> String {
     if tx_hashes.is_empty() {
@@ -4191,7 +4147,6 @@ pub fn get_network_stats_db() -> NetworkStats {
         .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
     NetworkStats { block_count, tx_count }
 }
-
 
 pub fn restore_in_memory_state_from_db() {
     {
@@ -6255,8 +6210,6 @@ pub fn remove_pending_otptx(tx_id: &str) {
 mod reorg_atomicity_tests {
     use super::*;
 
-    /// These share one database, so they take a lock and use their own
-    /// addresses.
     static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn put_tx(db: &DB, addr: &str, nonce: u64, hash: &str) {
@@ -6287,11 +6240,6 @@ mod reorg_atomicity_tests {
         db.write(batch).unwrap();
     }
 
-    /// The reorg fix rests on this: the surviving maximum nonce can be
-    /// computed before the departing transactions are deleted, by naming them.
-    /// If it could not, the nonce repair would have to be a second write after
-    /// the truncation, and a crash between the two would leave an account
-    /// permanently unable to send.
     #[test]
     fn the_surviving_nonce_is_computable_before_the_deletion_lands() {
         let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -6305,19 +6253,13 @@ mod reorg_atomicity_tests {
         let none: std::collections::HashSet<String> = Default::default();
         assert_eq!(recompute_max_nonce_for_addr(db, addr, &none), 5);
 
-        // Removing the top two blocks leaves nonce 3 as the highest, and that
-        // has to be knowable while they are all still in the database.
         let departing: std::collections::HashSet<String> =
             hashes[3..].iter().cloned().collect();
         assert_eq!(recompute_max_nonce_for_addr(db, addr, &departing), 3);
 
-        // Removing everything takes the account back to no confirmed nonce,
-        // which is what lets it start again from one.
         let all: std::collections::HashSet<String> = hashes.iter().cloned().collect();
         assert_eq!(recompute_max_nonce_for_addr(db, addr, &all), 0);
 
-        // And the answer computed in advance is the answer the deletion
-        // actually produces, which is the whole claim.
         for (i, h) in hashes.iter().enumerate().skip(3) {
             clear_tx(db, addr, (i + 1) as u64, h);
         }
@@ -6329,8 +6271,6 @@ mod reorg_atomicity_tests {
         assert_eq!(recompute_max_nonce_for_addr(db, addr, &none), 0);
     }
 
-    /// A transaction that merely mentions the address must not count as one it
-    /// sent, or a recipient would inherit somebody else's nonce.
     #[test]
     fn only_the_senders_own_transactions_count() {
         let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -6339,8 +6279,6 @@ mod reorg_atomicity_tests {
         let other = "egot1reorgnoncetest2222222222222222222222222";
         let none: std::collections::HashSet<String> = Default::default();
 
-        // Somebody else's transaction, indexed under our address the way a
-        // received payment is.
         let cf_txs = db.cf_handle(CF_TXS).unwrap();
         let cf_addr_txs = db.cf_handle(CF_ADDR_TXS).unwrap();
         let incoming = LedgerTx {

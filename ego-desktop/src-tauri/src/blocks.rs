@@ -10,8 +10,7 @@ use std::io::{Read, Write};
 
 pub const BLOCK_SIZE: usize = 256 * 1024;
 
-/// Blake3 hash over all block CIDs in order — used as the on-chain storage commitment.
-/// Anyone with the manifest can recompute this and verify it matches the chain record.
+
 pub fn compute_commitment(blocks: &[BlockEntry]) -> String {
     let mut hasher = blake3::Hasher::new();
     for b in blocks {
@@ -25,17 +24,11 @@ pub struct BlockEntry {
     pub block_cid: String,
     pub nonce_hex: String,
     pub size: u64,
-    /// PoRep replica commitment: blake3(POREP_TAG || enc_bytes || prover_addr || block_cid).
-    /// Binds the encrypted content to a specific prover — different nodes produce different
-    /// comm_r for the same data, so you can't fake storage by fetching on demand.
+
     #[serde(default)]
     pub comm_r: String,
 }
 
-/// Compute the per-block replica commitment.
-/// `enc_bytes`   = the encrypted block as stored on disk.
-/// `prover_addr` = the storing node's address (makes it replica-unique).
-/// `block_cid`   = the block's content CID (prevents cross-block substitution).
 pub fn compute_block_comm_r(enc_bytes: &[u8], prover_addr: &str, block_cid: &str) -> String {
     let mut h = blake3::Hasher::new();
     h.update(crate::proof::POREP_TAG);

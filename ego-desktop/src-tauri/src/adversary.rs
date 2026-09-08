@@ -1,63 +1,15 @@
-//! A validator that misbehaves on purpose.
-//!
-//! # Why a node has to be able to attack
-//!
-//! Every defence in consensus is written against an attacker nobody has ever
-//! run. A network of honest nodes exercises none of it: the anti-equivocation
-//! lock never fires, the slashing path never executes, and the block checks
-//! only ever see blocks built by the same code that checks them. Months of
-//! uptime among cooperating peers is evidence about liveness and says nothing
-//! about safety, because nothing was trying.
-//!
-//! So this build can be told to cheat. `EGO_ADVERSARY` names one or more
-//! behaviours, and the node then does that thing to its own proposals and
-//! votes while remaining a normal participant in every other respect. Point it
-//! at a testnet of honest nodes and the honest ones must reject everything it
-//! sends, keep making progress without it, and slash it where the protocol
-//! says they should.
-//!
-//! # Why the corruptions live here rather than in the tests
-//!
-//! Each one is a function from a valid object to an invalid one, so the same
-//! definition serves both purposes: the running node uses it to attack, and
-//! the tests below use it to check that the corresponding defence actually
-//! rejects the result. A corruption the checker fails to catch is a finding
-//! whether it is discovered on a testnet or in the suite.
-//!
-//! # Safety
-//!
-//! Off unless the variable is set, and it is read once. There is no command,
-//! no setting and no message that can turn it on, so a node that was started
-//! honest stays honest for its whole life.
-
 use crate::ledger::{LedgerBlock, LedgerTx};
 use std::sync::OnceLock;
 
-/// One way to misbehave.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Misbehaviour {
-    /// Propose a block whose transaction set does not match the merkle root it
-    /// commits to. The block hash covers that root, so this is the plainest
-    /// possible tampering and every peer must refuse it.
     TamperMerkleRoot,
-    /// Pay the block reward to somebody other than the miner, or pay more than
-    /// the schedule allows. This is the free-mint attempt.
     InflateCoinbase,
-    /// Include a transfer from a reserved system address, which is the other
-    /// way to mint from nothing.
     ForgeSystemTransfer,
-    /// Include a transaction whose signature does not match its contents.
     ForgeSignature,
-    /// Sign and send two different blocks at the same height. This is the
-    /// offence the slashing rules exist for.
     Equivocate,
-    /// Vote for a block and then vote for a different one at the same height.
     DoubleVote,
-    /// Take part in gossip but never vote, which tests whether the rest of the
-    /// committee still reaches a quorum without this node.
     WithholdVotes,
-    /// Emit structurally broken gossip, to exercise the decoders in the way
-    /// the robustness tests do but over a real socket.
     MalformedGossip,
 }
 
@@ -89,8 +41,6 @@ impl Misbehaviour {
         }
     }
 
-    /// Every behaviour, so a harness can sweep them without a list of its own
-    /// that drifts out of date.
     pub fn all() -> &'static [Misbehaviour] {
         &[
             Self::TamperMerkleRoot,
@@ -105,7 +55,6 @@ impl Misbehaviour {
     }
 }
 
-/// What this node was told to do, read once at first use.
 fn configured() -> &'static Vec<Misbehaviour> {
     static CONFIG: OnceLock<Vec<Misbehaviour>> = OnceLock::new();
     CONFIG.get_or_init(|| {
@@ -131,35 +80,22 @@ pub fn is_active(m: Misbehaviour) -> bool {
     configured().contains(&m)
 }
 
-// ── Corruptions ──────────────────────────────────────────────────────────
-//
-// Each takes something valid and returns it broken in one specific way. They
-// are deliberately small and total, so the tests can apply them to a known
-// good object and require the matching checker to notice.
-
-/// Swap the merkle root for a different one, leaving the hash committing to
-/// the old value.
 pub fn tamper_merkle_root(block: &mut LedgerBlock) {
     let mut root = block.tx_merkle_root.clone();
     if root.is_empty() {
         root = "0".repeat(64);
     }
-    // Flip the last character so the value is still well-formed hex.
     let mut chars: Vec<char> = root.chars().collect();
     let last = chars.len() - 1;
     chars[last] = if chars[last] == 'a' { 'b' } else { 'a' };
     block.tx_merkle_root = chars.into_iter().collect();
 }
 
-/// Pay the coinbase to an address of the attacker's choosing, for an amount of
-/// their choosing.
 pub fn inflate_coinbase(coinbase: &mut LedgerTx, to: &str, amount_uegoc: u64) {
     coinbase.to = to.to_string();
     coinbase.amount = amount_uegoc;
 }
 
-/// A transfer that claims to come from a reserved system address. Nothing can
-/// sign for those, so the only defence is the rule that refuses them.
 pub fn forged_system_transfer(to: &str, amount_uegoc: u64) -> LedgerTx {
     LedgerTx {
         hash: format!("0x{}", "ad".repeat(32)),
@@ -173,13 +109,10 @@ pub fn forged_system_transfer(to: &str, amount_uegoc: u64) -> LedgerTx {
     }
 }
 
-/// Change what a transaction says after it was signed.
 pub fn forge_signature(tx: &mut LedgerTx, new_amount: u64) {
     tx.amount = new_amount;
 }
 
-/// The second of two blocks at one height, differing only in a field that
-/// changes the hash. Sending both is equivocation.
 pub fn equivocating_twin(block: &LedgerBlock) -> LedgerBlock {
     let mut twin = block.clone();
     twin.timestamp = block.timestamp.wrapping_add(1);
@@ -187,7 +120,6 @@ pub fn equivocating_twin(block: &LedgerBlock) -> LedgerBlock {
     twin
 }
 
-/// Bytes that are not a message this network speaks.
 pub fn malformed_gossip() -> Vec<u8> {
     let mut v = b"{\"TxBroadcast\":{\"tx\":".to_vec();
     v.extend_from_slice(&[0xff, 0xfe, 0x00, 0x01]);
@@ -195,8 +127,6 @@ pub fn malformed_gossip() -> Vec<u8> {
     v
 }
 
-/// Called where the node is about to propose. Returns true when the proposal
-/// was deliberately corrupted, so the caller can log it.
 pub fn corrupt_proposal(block: &mut LedgerBlock, txs: &mut Vec<LedgerTx>) -> bool {
     if !enabled() {
         return false;
@@ -233,12 +163,10 @@ pub fn corrupt_proposal(block: &mut LedgerBlock, txs: &mut Vec<LedgerTx>) -> boo
     touched
 }
 
-/// Whether this node should refuse to vote at all.
 pub fn should_withhold_vote() -> bool {
     enabled() && is_active(Misbehaviour::WithholdVotes)
 }
 
-/// Whether this node should try to vote twice at one height.
 pub fn should_double_vote() -> bool {
     enabled() && is_active(Misbehaviour::DoubleVote)
 }
@@ -246,9 +174,6 @@ pub fn should_double_vote() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The whole point of the module: the defences must reject what it
-    /// produces. A corruption that survives its checker is a hole.
 
     #[test]
     fn it_is_off_unless_the_environment_asks_for_it() {
@@ -269,8 +194,6 @@ mod tests {
         assert_eq!(Misbehaviour::parse(""), None);
     }
 
-    /// A tampered merkle root must break the block hash, because the hash is
-    /// what commits to it. If this ever passes, block contents are unbound.
     #[test]
     fn a_tampered_merkle_root_fails_block_hash_verification() {
         let mut block = LedgerBlock {
@@ -300,8 +223,6 @@ mod tests {
         );
     }
 
-    /// A transfer claiming a reserved system source is the free-mint attempt.
-    /// Nothing holds a key for those addresses, so the rule is the only defence.
     #[test]
     fn a_forged_system_transfer_is_refused() {
         let tx = forged_system_transfer("egot1attacker", 1_000_000_000_000);
@@ -317,8 +238,6 @@ mod tests {
         );
     }
 
-    /// Changing the amount after signing must invalidate the signature, which
-    /// here shows up as the transaction hash no longer matching its contents.
     #[test]
     fn a_transaction_altered_after_signing_is_refused() {
         let mut tx = LedgerTx {
@@ -341,8 +260,6 @@ mod tests {
         );
     }
 
-    /// Two blocks at one height must be distinguishable, or equivocation
-    /// cannot be evidenced and slashing has nothing to point at.
     #[test]
     fn an_equivocating_twin_is_a_different_block_at_the_same_height() {
         let block = LedgerBlock {
@@ -372,9 +289,6 @@ mod tests {
         inflate_coinbase(&mut cb, "egot1attacker", u64::MAX / 2);
         assert_eq!(cb.to, "egot1attacker");
         assert!(cb.amount > 50_000);
-        // The block-context reward rule is what refuses this, and it is
-        // exercised against a real chain in the consensus tests. What matters
-        // here is that the coinbase really was altered.
         assert!(crate::ledger::is_protocol_system_tx(&cb));
     }
 
@@ -384,9 +298,6 @@ mod tests {
         assert!(serde_json::from_slice::<crate::p2p::P2PMessage>(&bytes).is_err());
     }
 
-    /// With nothing configured, the proposal must come back untouched. An
-    /// adversary that corrupts an honest node's blocks would be a bug of its
-    /// own, and a much worse one.
     #[test]
     fn an_honest_node_proposes_exactly_what_it_built() {
         let mut block = LedgerBlock { height: 3, ..LedgerBlock::default() };

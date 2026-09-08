@@ -1,70 +1,3 @@
-//! Shielded pool: notes, commitments, nullifiers, and proof-checked withdrawals.
-//!
-//! # How value moves
-//!
-//! Value enters the pool as a *note* and is recorded only as a commitment, a
-//! Poseidon hash that reveals nothing about who owns it or how much it holds.
-//! The tree holds that commitment wrapped with the amount actually deposited
-//! for it, `Poseidon(LEAF, commitment, amount)`, which is the one half of the
-//! leaf the chain can build for itself. Spending publishes a *nullifier* derived
-//! from the note's secret, marking it spent without revealing which commitment
-//! it came from, together with a zero-knowledge proof that the note is in the
-//! tree, that the nullifier is that note's, and that the amount withdrawn is
-//! the note's value.
-//!
-//! The pool never sees the note. It sees a root, a nullifier, an amount, a
-//! recipient, a fee and a proof, and it checks four things: the root is one it
-//! has had recently, the nullifier is new, the proof verifies against those
-//! public values, and it holds enough to pay.
-//!
-//! # Why the leaf carries the amount
-//!
-//! The value that decides a payout is inside the commitment, chosen by the
-//! depositor, and the chain cannot read it. If the bare commitment were the
-//! leaf, nothing would tie that value to the amount transferred, and a note
-//! committed for 10,000 EGOC could be deposited by sending 1. The proof would
-//! be entirely honest and the pool would pay out the difference from other
-//! people's deposits. Hashing the amount into the leaf removes the question:
-//! the chain fixes half the leaf from a number it saw itself.
-//!
-//! # Denominations
-//!
-//! A note is spent whole, so the amount going out equals the amount that came
-//! in, and an amount that appears once on each side of the pool would link the
-//! two. Notes therefore come only in fixed denominations. A deposit of 1,234
-//! EGOC becomes one note of 1,000, two of 100, three of 10 and four of 1, and
-//! each of them is indistinguishable from every other note of its size. The
-//! chain enforces this on both deposit and withdrawal; `denominate` is how a
-//! wallet splits an amount to fit.
-//!
-//! # Why the accounting still checks anything
-//!
-//! The proof decides what a spender may *claim*. The accounting still decides
-//! what may be *paid*. Solvency and the nullifier set are enforced here
-//! independently of the circuit, so a flaw in the proof system does not on its
-//! own turn into coins leaving the pool. The Liquid incident began with a range
-//! proof accepting a value it should have rejected, but the loss happened
-//! because the accounting downstream then let unbacked value be redeemed. Two
-//! layers, each assuming the other might be wrong.
-//!
-//! # Root history
-//!
-//! A proof is built against the root at proving time. If a deposit lands before
-//! the withdrawal is applied, the root moves and the proof would be refused for
-//! a reason that has nothing to do with the spender. So the pool keeps the last
-//! `ROOT_HISTORY` roots and accepts any of them, the way Tornado's contract does.
-//!
-//! # What is and is not established
-//!
-//! The circuit rejects every dishonest witness its author could construct, and
-//! that is what the tests in `ego-zk` show. It is not an audit, and a green
-//! suite must not be read as one: soundness is the claim that *no* dishonest
-//! witness passes, which enumeration cannot reach. The proving and verifying
-//! keys also come from a circuit-specific trusted setup, and whoever runs it
-//! holds material that would let them forge proofs. A single-party setup is
-//! fine for a testnet and unacceptable for mainnet, which needs a multi-party
-//! ceremony. Both of those are why `is_enabled` stays off by default.
-
 use ark_bn254::{Bn254, Fr};
 use ark_ff::{BigInteger, PrimeField};
 use ego_zk::merkle::{MerklePath, MerkleTree, POOL_TREE_DEPTH};
@@ -74,23 +7,13 @@ use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-/// Domain tags, taken from the circuit crate so the pool and the proof cannot
-/// disagree about them. A commitment must never be reinterpretable as a
-/// nullifier or the reverse: if one hash could serve as both, a note could be
-/// made to nullify itself, or a nullifier forged from public data.
 const COMMITMENT_DOMAIN: u64 = ego_zk::poseidon_gadget::SHIELDED_COMMITMENT_DOMAIN;
 const NULLIFIER_DOMAIN: u64 = ego_zk::poseidon_gadget::SHIELDED_NULLIFIER_DOMAIN;
 const BINDING_DOMAIN: u64 = ego_zk::poseidon_gadget::SHIELDED_BINDING_DOMAIN;
 const LEAF_DOMAIN: u64 = ego_zk::poseidon_gadget::SHIELDED_LEAF_DOMAIN;
 
-/// How many recent roots a withdrawal may be proven against.
-///
-/// A withdrawal proven against the root at height h stays valid until this
-/// many deposits have landed after it. Tornado shipped with 30 and later
-/// raised it; 100 costs three kilobytes of state and buys a busy chain room.
 pub const ROOT_HISTORY: usize = 100;
 
-/// Note sizes, in micro-EGOC: 1, 10, 100, 1,000 and 10,000 EGOC.
 pub const DENOMINATIONS_UEGOC: [u64; 5] = [
     1_000_000,
     10_000_000,
@@ -99,22 +22,12 @@ pub const DENOMINATIONS_UEGOC: [u64; 5] = [
     10_000_000_000,
 ];
 
-/// Bits of randomness in a secret or rho.
-///
-/// Deliberately below the 254-bit BN254 scalar field. Converting bytes to a
-/// field element reduces them modulo the field order, so a full 32-byte value
-/// and that value minus the order collapse to the same element — two different
-/// secrets producing one commitment and one nullifier. Keeping the material
-/// under the modulus makes the mapping injective and removes the question.
 pub const SECRET_BITS: usize = 248;
 
 pub fn is_denomination(value_uegoc: u64) -> bool {
     DENOMINATIONS_UEGOC.contains(&value_uegoc)
 }
 
-/// Split an amount into notes, largest first. Whatever is left below the
-/// smallest denomination stays transparent; it is returned separately so the
-/// caller can say so.
 pub fn denominate(amount_uegoc: u64) -> (Vec<u64>, u64) {
     let mut notes = Vec::new();
     let mut left = amount_uegoc;
@@ -127,26 +40,14 @@ pub fn denominate(amount_uegoc: u64) -> (Vec<u64>, u64) {
     (notes, left)
 }
 
-/// Reduce a secret's 32 bytes to a field element, having first ensured they fit.
 fn to_field(bytes: &[u8; 32]) -> Fr {
     let mut masked = *bytes;
-    // Clear the high bytes so the value is always below the field order.
-    //
-    // from_le_bytes_mod_order reads little-endian, so the most significant byte
-    // is the LAST one. Clearing from the front instead throws away the low bits
-    // and makes any two secrets that differ only in their first byte collide,
-    // which is a forged note rather than a lost bit of entropy.
     for b in masked.iter_mut().skip(SECRET_BITS / 8) {
         *b = 0;
     }
     Fr::from_le_bytes_mod_order(&masked)
 }
 
-/// Bytes of a public value (a commitment, root, nullifier, or recipient digest)
-/// as a field element. No masking: commitments, roots and nullifiers are
-/// canonical field elements already and round-trip exactly, and a recipient
-/// digest is reduced modulo the field order identically on the proving and
-/// verifying sides, which is all binding needs.
 pub fn public_to_field(bytes: &[u8; 32]) -> Fr {
     Fr::from_le_bytes_mod_order(bytes)
 }
@@ -159,20 +60,12 @@ pub fn field_to_bytes(f: Fr) -> [u8; 32] {
     out
 }
 
-/// Poseidon over BN254 with circom-compatible parameters — the same
-/// construction Tornado Cash uses, and the same one `ego-zk` replicates
-/// in-circuit and proves equal to this.
 fn poseidon(domain: u64, inputs: &[Fr]) -> Result<Fr, String> {
     let mut h = Poseidon::<Fr>::with_domain_tag_circom(inputs.len(), Fr::from(domain))
         .map_err(|e| format!("poseidon config: {e}"))?;
     h.hash(inputs).map_err(|e| format!("poseidon hash: {e}"))
 }
 
-/// The tree leaf for `commitment` deposited at `amount_uegoc`.
-///
-/// The chain computes this from the commitment in the deposit's memo and the
-/// amount the deposit actually transferred, so the two are bound together
-/// before the leaf ever reaches the tree.
 pub fn leaf_for(commitment: &[u8; 32], amount_uegoc: u64) -> [u8; 32] {
     field_to_bytes(
         poseidon(LEAF_DOMAIN, &[public_to_field(commitment), Fr::from(amount_uegoc)])
@@ -180,35 +73,23 @@ pub fn leaf_for(commitment: &[u8; 32], amount_uegoc: u64) -> [u8; 32] {
     )
 }
 
-/// The 32-byte form of a recipient address, for binding.
 pub fn recipient_digest(address: &str) -> [u8; 32] {
     *ego_core::hash_data(address.as_bytes()).as_bytes()
 }
 
-/// The circuit has one public slot for binding, and it holds
-/// `Poseidon(BINDING, recipient, fee)`. A relayer who changes either the
-/// payee or the fee changes this value, and the proof no longer verifies.
 pub fn withdrawal_binding(recipient: &[u8; 32], fee_uegoc: u64) -> Fr {
     poseidon(BINDING_DOMAIN, &[public_to_field(recipient), Fr::from(fee_uegoc)])
         .expect("two inputs for width 3")
 }
 
-/// A note is value held inside the pool.
-///
-/// `rho` makes two notes of the same value, owned by the same person, produce
-/// different commitments. Without it, paying somebody 10 EGOC twice would write
-/// the same commitment twice and link the payments.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Note {
     pub value_uegoc: u64,
-    /// Owner's spending secret. Whoever knows this can spend the note.
     pub owner_secret: [u8; 32],
-    /// Per-note randomness.
     pub rho: [u8; 32],
 }
 
 impl Note {
-    /// A fresh note of `value` with secrets drawn from `rng`.
     pub fn random<R: RngCore + CryptoRng>(value_uegoc: u64, rng: &mut R) -> Self {
         let mut owner_secret = [0u8; 32];
         let mut rho = [0u8; 32];
@@ -217,36 +98,19 @@ impl Note {
         Self { value_uegoc, owner_secret, rho }
     }
 
-    /// The field elements this note hashes over: `(value, secret, rho)`.
-    ///
-    /// The single source of that encoding. `commitment()` uses it and so does
-    /// the prover, so the masked secret the pool hashed is by construction the
-    /// one the circuit is given. If they were derived separately and drifted,
-    /// every honest proof would fail to verify with nothing to say why.
     pub fn as_witness(&self) -> (Fr, Fr, Fr) {
         (Fr::from(self.value_uegoc), to_field(&self.owner_secret), to_field(&self.rho))
     }
 
-    /// The public record of this note. Reveals neither value nor owner.
     pub fn commitment(&self) -> [u8; 32] {
         let (value, secret, rho) = self.as_witness();
-        // The inputs are fixed in number and range, so failure here is a bug
-        // rather than a condition a caller can act on.
         field_to_bytes(poseidon(COMMITMENT_DOMAIN, &[value, secret, rho]).expect("poseidon commitment"))
     }
 
-    /// Where this note sits in the tree when deposited honestly, meaning at
-    /// its own value. A note deposited for anything else has a different leaf
-    /// and no proof can spend it.
     pub fn leaf(&self) -> [u8; 32] {
         leaf_for(&self.commitment(), self.value_uegoc)
     }
 
-    /// The marker published when this note is spent.
-    ///
-    /// Derived from the secret and rho but not the value, so it is unlinkable to
-    /// the commitment without knowing the secret. Deterministic, so the same
-    /// note can never be spent twice under two different markers.
     pub fn nullifier(&self) -> [u8; 32] {
         let (_, secret, rho) = self.as_witness();
         field_to_bytes(poseidon(NULLIFIER_DOMAIN, &[secret, rho]).expect("poseidon nullifier"))
@@ -255,48 +119,23 @@ impl Note {
 
 #[derive(Debug, PartialEq)]
 pub enum PoolError {
-    /// This note has already been spent, or this exact withdrawal is being
-    /// replayed. Either way the nullifier is known.
     NullifierAlreadySeen,
-    /// The proof was built against a root the pool has never had, or one that
-    /// has aged out of the history window.
     UnknownRoot,
-    /// The proof does not verify against the public inputs supplied.
     InvalidProof,
-    /// The pool does not hold enough to honour this, which should be
-    /// unreachable if the other rules hold and is treated as corruption.
     PoolUnderfunded { balance: u64, requested: u64 },
-    /// A deposit or withdrawal of nothing, or a deposit that would overflow.
     InvalidAmount,
-    /// Two deposits produced the same commitment, so one would be unspendable.
     DuplicateCommitment,
-    /// The commitment tree has no free leaves.
     TreeFull,
 }
 
-/// The pool's public state, held in memory.
-///
-/// Everything here is visible on-chain. Privacy comes from what is absent: no
-/// value, no owner, and no link between a commitment and the nullifier that
-/// eventually spends it. Consensus keeps its own persisted copy of the same
-/// rules in `chain_db`; this is the model those are checked against, and what
-/// a wallet builds from the chain's leaves to prove with.
 #[derive(Debug, Clone)]
 pub struct ShieldedPool {
     depth: usize,
-    /// Every leaf ever written, in order. Append-only: a leaf is never
-    /// removed, because removing one would reveal which note was spent.
     leaves: Vec<[u8; 32]>,
-    /// The commitments those leaves were built from, so a second deposit of
-    /// the same commitment can be refused. Not the same thing as the leaves:
-    /// one commitment is only ever valid at one amount.
     commitment_set: HashSet<[u8; 32]>,
     tree: MerkleTree,
-    /// Spent markers. Grows forever, by design.
     nullifiers: HashSet<[u8; 32]>,
-    /// Total value the pool holds and must be able to pay out.
     balance_uegoc: u64,
-    /// The last `ROOT_HISTORY` roots, oldest first.
     recent_roots: Vec<[u8; 32]>,
 }
 
@@ -319,13 +158,10 @@ impl ShieldedPool {
             balance_uegoc: 0,
             recent_roots: Vec::new(),
         };
-        // The empty tree's root counts as known, as it does in Tornado.
         pool.remember_root(empty_root);
         pool
     }
 
-    /// A pool rebuilt from the chain's leaves, for proving against. Values,
-    /// commitments and nullifiers are not needed for that and are left empty.
     pub fn from_leaves(depth: usize, leaves: &[[u8; 32]]) -> Result<Self, String> {
         let mut pool = Self::new(depth);
         for leaf in leaves {
@@ -385,9 +221,6 @@ impl ShieldedPool {
         Ok(index)
     }
 
-    /// Extend a proving pool with leaves the chain has appended since it was
-    /// built. The pool is append-only, so an existing leaf that has changed
-    /// means this pool belongs to an abandoned fork and must be rebuilt.
     pub fn extend_from_leaves(&mut self, leaves: &[[u8; 32]]) -> Result<(), String> {
         if leaves.len() < self.leaves.len() || leaves[..self.leaves.len()] != self.leaves[..] {
             return Err("leaf history diverged from this pool".into());
@@ -398,23 +231,14 @@ impl ShieldedPool {
         Ok(())
     }
 
-    /// The Merkle path for the leaf at `index`, for building a proof.
     pub fn merkle_path(&self, index: usize) -> Result<MerklePath, String> {
         self.tree.path(index)
     }
 
-    /// Move value into the pool. The caller must already have taken the same
-    /// amount from the depositor's transparent balance; this only records it.
-    /// Returns the leaf index, which the depositor needs to prove a withdrawal.
-    ///
-    /// `value_uegoc` is the amount transferred, and it is hashed into the leaf
-    /// rather than trusted, so a commitment made for some other value simply
-    /// has no leaf here.
     pub fn deposit(&mut self, commitment: [u8; 32], value_uegoc: u64) -> Result<usize, PoolError> {
         if value_uegoc == 0 {
             return Err(PoolError::InvalidAmount);
         }
-        // A pool that can overflow is a pool that can be emptied.
         let new_balance = self
             .balance_uegoc
             .checked_add(value_uegoc)
@@ -433,12 +257,6 @@ impl ShieldedPool {
         Ok(index)
     }
 
-    /// Take value out of the pool on the strength of a proof.
-    ///
-    /// Every check precedes every mutation, so a refused withdrawal leaves the
-    /// pool exactly as it was. The fee is not the pool's concern beyond the
-    /// binding: the whole amount leaves the pool, and the chain decides how
-    /// much of it the recipient keeps.
     pub fn withdraw(
         &mut self,
         vk: &VerifyingKey<Bn254>,
@@ -464,16 +282,10 @@ impl ShieldedPool {
             Fr::from(amount_uegoc),
             withdrawal_binding(&recipient, fee_uegoc),
         );
-        // A malformed proof and a false one are refused alike. Neither is a
-        // condition the pool should try to distinguish.
         match withdraw_circuit::verify(vk, &public_inputs, proof) {
             Ok(true) => {}
             _ => return Err(PoolError::InvalidProof),
         }
-        // Belt and braces. A verifying proof already bounds the amount by the
-        // note's value and the note's value by what was deposited, so if this
-        // fires the pool is already corrupt, and paying out would turn an
-        // accounting bug into stolen coins.
         if amount_uegoc > self.balance_uegoc {
             return Err(PoolError::PoolUnderfunded {
                 balance: self.balance_uegoc,
@@ -495,8 +307,6 @@ impl ShieldedPool {
     }
 }
 
-/// Everything a withdrawal submits. The proof is bound to all of it, so
-/// changing any field after proving invalidates it.
 #[derive(Debug, Clone)]
 pub struct Withdrawal {
     pub proof: Proof<Bn254>,
@@ -507,12 +317,6 @@ pub struct Withdrawal {
     pub fee_uegoc: u64,
 }
 
-/// Build a withdrawal proof for `note`, which sits at `leaf_index` among
-/// `leaves`, paying `note.value_uegoc` less `fee_uegoc` to `recipient`.
-///
-/// Prover side: this is the only place the private note meets the circuit.
-/// The witness encoding comes from `Note::as_witness`, the same function the
-/// pool hashed with, so the two cannot disagree.
 pub fn prove_withdrawal<R: RngCore + CryptoRng>(
     pk: &ProvingKey<Bn254>,
     pool: &ShieldedPool,
@@ -522,9 +326,6 @@ pub fn prove_withdrawal<R: RngCore + CryptoRng>(
     fee_uegoc: u64,
     rng: &mut R,
 ) -> Result<Withdrawal, String> {
-    // Refuse to build a proof that could not verify. A wrong index is far
-    // likelier to be a bookkeeping mistake than an attack, and a clear error
-    // here beats an opaque InvalidProof later.
     if pool.leaves().get(leaf_index) != Some(&note.leaf()) {
         return Err(format!(
             "leaf {leaf_index} does not hold this note; it was not deposited at its own value"
@@ -565,17 +366,6 @@ pub fn prove_withdrawal<R: RngCore + CryptoRng>(
     })
 }
 
-/// Whether this wallet will offer the shielded pool.
-///
-/// Off, and it stays off until two things are true that are not yet. The
-/// circuit has been reviewed by somebody who does this for a living; it
-/// rejects every dishonest witness its author could think of, which is not the
-/// same thing. And the proving keys come from a multi-party setup rather than
-/// a single machine, because whoever runs a single-party setup can forge
-/// proofs. Shipping it enabled before then would invite people to trust it.
-///
-/// This is the local opt-in. Whether the chain accepts shielded transactions
-/// at all is a separate, consensus-wide switch in `chain_db`.
 pub fn is_enabled() -> bool {
     std::env::var("EGO_SHIELDED_POOL").as_deref() == Ok("unaudited-testnet-only")
 }
@@ -590,8 +380,6 @@ mod tests {
     const DEPTH: usize = 4;
     const FEE: u64 = 7;
 
-    /// Groth16 keys are circuit-specific and take a moment to generate, so the
-    /// tests share one pair.
     fn keys() -> &'static (ProvingKey<Bn254>, VerifyingKey<Bn254>) {
         static KEYS: OnceLock<(ProvingKey<Bn254>, VerifyingKey<Bn254>)> = OnceLock::new();
         KEYS.get_or_init(|| withdraw_circuit::setup(DEPTH, &mut StdRng::seed_from_u64(1)).unwrap())
@@ -609,7 +397,6 @@ mod tests {
         [0xAB; 32]
     }
 
-    /// A pool holding two other people's notes and then ours.
     fn funded(value: u64) -> (ShieldedPool, Note, usize) {
         let mut pool = ShieldedPool::new(DEPTH);
         pool.deposit(note(50, 0x11, 0x11).commitment(), 50).unwrap();
@@ -622,8 +409,6 @@ mod tests {
     fn withdrawal(pool: &ShieldedPool, n: &Note, index: usize) -> Withdrawal {
         prove_withdrawal(&keys().0, pool, n, index, recipient(), FEE, &mut rng()).unwrap()
     }
-
-    // ── Hash properties ──────────────────────────────────────────────────
 
     #[test]
     fn a_commitment_reveals_neither_value_nor_owner() {
@@ -687,8 +472,6 @@ mod tests {
 
     #[test]
     fn public_values_round_trip_through_bytes_exactly() {
-        // Roots, nullifiers and commitments cross the byte boundary and back.
-        // Any loss here would make the pool reject its own roots.
         for f in [Fr::from(0u64), Fr::from(1u64), Fr::from(u64::MAX), public_to_field(&note(7, 7, 7).commitment())] {
             assert_eq!(public_to_field(&field_to_bytes(f)), f);
         }
@@ -707,8 +490,6 @@ mod tests {
         assert_eq!(recipient_digest("egot1abc"), recipient_digest("egot1abc"));
         assert_ne!(recipient_digest("egot1abc"), recipient_digest("egot1abd"));
     }
-
-    // ── Denominations ────────────────────────────────────────────────────
 
     #[test]
     fn denominations_are_recognised_exactly() {
@@ -739,8 +520,6 @@ mod tests {
         assert_eq!(big, vec![10_000_000_000, 10_000_000_000, 1_000_000_000, 1_000_000_000, 1_000_000_000, 1_000_000_000, 1_000_000_000]);
         assert_eq!(left, 0);
     }
-
-    // ── Deposits ─────────────────────────────────────────────────────────
 
     #[test]
     fn a_new_pool_knows_its_empty_root() {
@@ -800,8 +579,6 @@ mod tests {
         assert_eq!(pool.balance(), 4);
     }
 
-    // ── Withdrawals ──────────────────────────────────────────────────────
-
     #[test]
     fn an_honest_withdrawal_verifies_and_pays_out_the_whole_note() {
         let (mut pool, n, i) = funded(1_000);
@@ -814,8 +591,6 @@ mod tests {
         assert_eq!(w.nullifier, n.nullifier(), "the proof's nullifier is the note's");
     }
 
-    /// The double-spend guard. Replaying the very same proof is the simplest
-    /// attack there is, and the nullifier set is what stops it.
     #[test]
     fn the_same_proof_cannot_be_replayed() {
         let (mut pool, n, i) = funded(1_000);
@@ -825,8 +600,6 @@ mod tests {
         assert_eq!(pool.balance(), 110, "deducted exactly once");
     }
 
-    /// A fresh proof for an already-spent note carries the same nullifier, so
-    /// it is refused the same way.
     #[test]
     fn a_second_proof_for_the_same_note_is_refused() {
         let (mut pool, n, i) = funded(1_000);
@@ -837,8 +610,6 @@ mod tests {
         assert_eq!(pool.balance(), 110);
     }
 
-    /// The reason for the root window: a deposit between proving and applying
-    /// must not invalidate an honest withdrawal.
     #[test]
     fn a_proof_against_a_recent_root_survives_a_later_deposit() {
         let (mut pool, n, i) = funded(1_000);
@@ -859,7 +630,6 @@ mod tests {
 
     #[test]
     fn a_root_that_has_aged_out_of_the_window_is_refused() {
-        // Deep enough to take more deposits than the window keeps.
         let depth = 8;
         let (pk, vk) = withdraw_circuit::setup(depth, &mut StdRng::seed_from_u64(2)).unwrap();
         let mut pool = ShieldedPool::new(depth);
@@ -874,7 +644,6 @@ mod tests {
         assert_eq!(pool.apply_withdrawal(&vk, &w), Err(PoolError::UnknownRoot));
     }
 
-    /// The proof is bound to the amount: no taking more, or less, than proved.
     #[test]
     fn changing_the_amount_after_proving_is_refused() {
         let (mut pool, n, i) = funded(1_000);
@@ -885,7 +654,6 @@ mod tests {
         assert!(!pool.is_spent(&w.nullifier), "a refused withdrawal marks nothing");
     }
 
-    /// The proof is bound to the recipient: a relayer cannot redirect it.
     #[test]
     fn changing_the_recipient_after_proving_is_refused() {
         let (mut pool, n, i) = funded(1_000);
@@ -895,7 +663,6 @@ mod tests {
         assert_eq!(pool.balance(), 1_110);
     }
 
-    /// The proof is bound to the fee: a relayer cannot keep more of the note.
     #[test]
     fn changing_the_fee_after_proving_is_refused() {
         let (mut pool, n, i) = funded(1_000);
@@ -923,9 +690,6 @@ mod tests {
         assert!(!pool.is_spent(&w.nullifier));
     }
 
-    /// The prover refuses to build a proof for a leaf that is not this note.
-    /// The circuit would refuse it too, which `ego-zk`'s tests establish; this
-    /// is the clearer error the honest path gets first.
     #[test]
     fn the_prover_refuses_a_leaf_that_does_not_hold_the_note() {
         let (pool, n, _) = funded(1_000);
@@ -940,9 +704,6 @@ mod tests {
         assert!(err.is_err());
     }
 
-    /// The bug this leaf shape exists to close: a note committed for 10,000
-    /// but deposited by transferring 1. The chain writes the leaf for what it
-    /// received, so the note simply is not in the tree.
     #[test]
     fn a_note_deposited_for_less_than_it_claims_cannot_be_proven() {
         let mut pool = ShieldedPool::new(DEPTH);
@@ -969,7 +730,6 @@ mod tests {
         partial.extend_from_leaves(full.leaves()).unwrap();
         assert_eq!(partial.current_root(), full.current_root());
         assert_eq!(partial.commitment_count(), full.commitment_count());
-        // Extending is idempotent, and a diverged history is refused.
         partial.extend_from_leaves(full.leaves()).unwrap();
         assert_eq!(partial.current_root(), full.current_root());
         assert!(partial.extend_from_leaves(&full.leaves()[..1]).is_err());

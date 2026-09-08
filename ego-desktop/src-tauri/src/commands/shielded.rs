@@ -1,15 +1,3 @@
-//! Wallet side of the shielded pool: keeping notes, shielding, unshielding.
-//!
-//! A note's secret is the money. Anyone holding it can withdraw the note, and
-//! nobody without it ever can, the wallet included. So notes are written to
-//! disk before the deposit is broadcast, never after, and the file is
-//! encrypted under a key derived from the wallet seed: a seed backup restores
-//! the ability to read it, and nothing else does.
-//!
-//! Shielding splits the amount into fixed denominations and sends one deposit
-//! per note. Unshielding spends one whole note to one recipient, less the
-//! network fee, and takes a second or two because the proof is built here.
-
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
 use crate::ledger::{data_dir, tx_human_summary, tx_signing_bytes_v2, Ledger, LedgerTx};
@@ -31,16 +19,8 @@ const CHAIN_ID: u8 = 1;
 
 static NOTES_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-/// The tree a proof is built against, kept between withdrawals.
-///
-/// Building it costs one Poseidon hash per level per leaf, so rebuilding from
-/// scratch every time would make a withdrawal from a pool with a million notes
-/// take tens of seconds. The pool is append-only, so the tree is extended with
-/// whatever arrived since it was last used, and only a reorg that rewrote an
-/// existing leaf forces a rebuild.
 static PROVER_POOL: Lazy<Mutex<Option<ShieldedPool>>> = Lazy::new(|| Mutex::new(None));
 
-/// The current commitment tree, reusing the cached one where possible.
 fn prover_pool() -> Result<ShieldedPool, String> {
     let leaves = shielded_chain::leaves();
     let mut cached = PROVER_POOL.lock().unwrap_or_else(|e| e.into_inner());
@@ -72,8 +52,6 @@ pub struct NoteView {
     pub commitment: String,
     pub value_uegoc: u64,
     pub leaf_index: Option<u64>,
-    /// `pending` (deposit not yet in a block), `ready`, `spending`
-    /// (withdrawal sent, not yet in a block) or `spent`.
     pub status: String,
     pub deposit_tx: String,
     pub spent_tx: Option<String>,
@@ -82,9 +60,7 @@ pub struct NoteView {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ShieldedStatus {
-    /// This wallet has opted in (`EGO_SHIELDED_POOL=unaudited-testnet-only`).
     pub enabled: bool,
-    /// The chain accepts shielded transactions at the next height.
     pub active: bool,
     pub pool_address: String,
     pub pool_balance_uegoc: u64,
@@ -115,8 +91,6 @@ pub struct UnshieldResult {
     pub payout_uegoc: u64,
     pub recipient: String,
 }
-
-// ── Note storage ──────────────────────────────────────────────────────────
 
 fn notes_path() -> std::path::PathBuf {
     data_dir().join(NOTES_FILE)
@@ -194,8 +168,6 @@ fn current_fee() -> u64 {
     crate::chain_db::get_current_base_fee().max(crate::mempool::MIN_FEE_UEGOC)
 }
 
-// ── Commands ──────────────────────────────────────────────────────────────
-
 #[tauri::command]
 pub async fn shielded_status() -> Result<ShieldedStatus, EgoDesktopError> {
     tokio::task::spawn_blocking(|| {
@@ -244,8 +216,6 @@ pub async fn shielded_status() -> Result<ShieldedStatus, EgoDesktopError> {
     .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
-/// Move `amount_uegoc` into the pool as fixed-denomination notes, one signed
-/// deposit each. The part below the smallest denomination stays transparent.
 #[tauri::command]
 pub async fn shield_deposit(
     amount_uegoc: u64,
@@ -339,8 +309,6 @@ pub async fn shield_deposit(
         });
     }
 
-    // The notes are the money. They go to disk before anything leaves this
-    // machine, so a crash between here and the broadcast loses nothing.
     {
         let _g = NOTES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut all = load_notes()?;
@@ -348,9 +316,6 @@ pub async fn shield_deposit(
         save_notes(&all)?;
     }
 
-    // Reserve the nonces now rather than after the broadcast. They are already
-    // signed into the transactions above, so if one push fails partway the
-    // rest are still in flight and the next send must not reuse their numbers.
     ledger.nonce = nonce;
     let _ = ledger.save();
 
@@ -376,8 +341,6 @@ pub async fn shield_deposit(
     })
 }
 
-/// Spend one whole note to `recipient`. The recipient receives the note's
-/// value less the current network fee.
 #[tauri::command]
 pub async fn shield_withdraw(
     commitment: String,
@@ -469,8 +432,6 @@ pub async fn shield_withdraw(
         ..LedgerTx::default()
     };
 
-    // Mark the note spent before the withdrawal can leave, so a crash cannot
-    // leave a note that looks fresh while its nullifier is in flight.
     {
         let _g = NOTES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut notes = load_notes()?;
@@ -506,13 +467,6 @@ pub async fn shield_withdraw(
     })
 }
 
-/// What the node has recorded about its own accounting.
-///
-/// A healthy chain reports nothing here. Anything at all means a block was
-/// written whose balance changes did not add up, or whose shielded note counts
-/// were impossible, and the detail says which. Surfaced as a command so an
-/// operator can see it without reading logs, since by default a violation is
-/// recorded rather than fatal.
 #[derive(Debug, Clone, Serialize)]
 pub struct InvariantReport {
     pub healthy: bool,

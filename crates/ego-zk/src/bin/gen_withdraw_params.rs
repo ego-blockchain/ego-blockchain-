@@ -1,17 +1,3 @@
-//! Runs the withdrawal circuit's trusted setup once and writes the keys that
-//! `withdraw_params` embeds.
-//!
-//!     cargo run -p ego-zk --release --no-default-features --bin gen_withdraw_params -- crates/ego-zk/params
-//!
-//! `--no-default-features` matters: the library's default build embeds the
-//! params, which do not exist yet the first time this runs.
-//!
-//! The randomness comes from the operating system and the toxic waste is
-//! never written anywhere; it dies with this process. That is a single-party
-//! setup, acceptable for a testnet and not for mainnet, which needs a
-//! multi-party ceremony. Regenerating changes the verifying key, which is a
-//! consensus parameter: every validator must ship the same one.
-
 use ark_serialize::CanonicalSerialize;
 use blake2::{Blake2s256, Digest};
 use ego_zk::merkle::POOL_TREE_DEPTH;

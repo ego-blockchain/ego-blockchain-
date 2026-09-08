@@ -1,60 +1,3 @@
-//! The shielded pool as consensus state.
-//!
-//! `shielded.rs` is the model: an in-memory pool that every rule is written
-//! against and tested on. This module is the same rules applied to the chain:
-//! how a deposit and a withdrawal look as transactions, what a validator
-//! checks before a block is accepted, what gets written when it is, and how
-//! that is undone in a reorg. Every validator runs exactly this, so the pool's
-//! state is identical on all of them.
-//!
-//! # The two transactions
-//!
-//! A deposit is an ordinary signed transfer to `SHIELDED_POOL_ADDR` whose memo
-//! is `shield:<commitment>`. The memo is under the sender's signature, so a
-//! relayer cannot swap the commitment for their own and take the deposit. The
-//! amount must be one of the fixed denominations.
-//!
-//! What goes in the tree is not that commitment but
-//! `Poseidon(LEAF, commitment, amount)`, built here from the amount the
-//! transfer actually moved. The value that decides the payout is sealed inside
-//! the commitment where this code cannot read it, so without that wrapper
-//! nothing would stop a one-EGOC deposit carrying a commitment made for ten
-//! thousand and being withdrawn for the difference. The circuit rebuilds the
-//! same wrapper from its public amount, so the two have to agree.
-//!
-//! A withdrawal is a transaction *from* the pool address, authorised by a
-//! Groth16 proof rather than a signature. Its body, in `call_args`, carries the
-//! root, nullifier, amount, recipient, fee and proof; the transaction hash is
-//! a hash of that body, and the proof is bound to every field a relayer could
-//! want to change. The whole note leaves the pool: the recipient receives the
-//! amount less the fee, and the fee is treated like any other fee.
-//!
-//! # What is persisted
-//!
-//! Only the frontier of the commitment tree, the root history, the balance
-//! and a counter, together with one key per leaf, one per commitment (for
-//! duplicate checks and so a wallet can find its leaf), and one per spent
-//! nullifier. The frontier means a deposit costs a validator one Poseidon
-//! hash per tree level however many notes the pool holds. A copy of the state
-//! is kept per block that changed it, so a reorg restores the state from just
-//! before the first removed block in one read instead of replaying. Those
-//! copies are pruned behind the finality floor, which `truncate_from` already
-//! refuses to reorg past, so the history cannot grow without bound; the newest
-//! copy at or below the floor is always kept, because that is the one a
-//! deepest-allowed reorg would restore from.
-//!
-//! All of it lives in the meta column family, which the checkpoint snapshot
-//! already ships, so a fast-synced node validates withdrawals like any other.
-//!
-//! # Activation
-//!
-//! Nothing here is accepted until `rule_active` says so for the block's
-//! height: a governance vote on `FEATURE_SHIELDED_POOL`, or the
-//! `EGO_SHIELDED_POOL_HEIGHT` override for a testnet. A block carrying shielded
-//! transactions before then is invalid, so nodes that predate this code and
-//! nodes that have it agree on every block until the switch is thrown, and by
-//! then every validator must be running it.
-
 use crate::chain_db::{self, decode, encode, read_u64_le, u64_le, CF_BALANCES, CF_META};
 use crate::ledger::LedgerTx;
 use crate::shielded::{
@@ -68,8 +11,6 @@ use rocksdb::{Direction, IteratorMode, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-/// Where deposits go and withdrawals come from. A reserved system address:
-/// nothing can sign for it, so nothing but a verified proof moves value out.
 pub const SHIELDED_POOL_ADDR: &str = "egot1shieldedpool000000000000000000000000000";
 pub const FEATURE_SHIELDED_POOL: &str = "shielded_pool";
 pub const TX_SHIELD: &str = "shield";
@@ -96,31 +37,18 @@ pub fn rule_active_at_tip() -> bool {
     rule_active(chain_db::local_chain_height().saturating_add(1))
 }
 
-// ── Persisted state ───────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PoolState {
     pub depth: u8,
     pub next_index: u64,
     pub frontier: Vec<[u8; 32]>,
     pub root: [u8; 32],
-    /// Oldest first, at most `ROOT_HISTORY`.
     pub recent_roots: Vec<[u8; 32]>,
     pub balance_uegoc: u64,
-    /// Unspent notes at each denomination, in `DENOMINATIONS_UEGOC` order.
-    ///
-    /// The chain cannot see what a note is worth, so it counts them instead.
-    /// A withdrawal names its size publicly, and if nobody ever deposited a
-    /// note that size then there is nothing to withdraw, whatever the proof
-    /// says. This is the accounting layer's own answer to the question the
-    /// circuit is trusted for, which is why it exists: the pool shipped once
-    /// with a hole that let a one-EGOC deposit be spent as ten thousand, and
-    /// this count would have refused it.
     #[serde(default)]
     pub outstanding: Vec<u64>,
 }
 
-/// Which denomination an amount is, if it is one at all.
 pub fn denomination_index(amount_uegoc: u64) -> Option<usize> {
     DENOMINATIONS_UEGOC.iter().position(|d| *d == amount_uegoc)
 }
@@ -140,15 +68,12 @@ impl PoolState {
         }
     }
 
-    /// Older states were written before note counts existed, and serde fills
-    /// the field with an empty vector. Give it its real length before use.
     fn normalise(&mut self) {
         if self.outstanding.len() != DENOMINATIONS_UEGOC.len() {
             self.outstanding.resize(DENOMINATIONS_UEGOC.len(), 0);
         }
     }
 
-    /// Record a note of `amount` entering the pool.
     pub fn note_added(&mut self, amount_uegoc: u64) {
         self.normalise();
         if let Some(i) = denomination_index(amount_uegoc) {
@@ -156,8 +81,6 @@ impl PoolState {
         }
     }
 
-    /// Record a note of `amount` leaving. False when there was none to spend,
-    /// which is a withdrawal claiming a size nobody deposited.
     pub fn note_spent(&mut self, amount_uegoc: u64) -> bool {
         self.normalise();
         match denomination_index(amount_uegoc) {
@@ -169,14 +92,12 @@ impl PoolState {
         }
     }
 
-    /// Whether a note of this size exists to be spent at all.
     pub fn has_note(&self, amount_uegoc: u64) -> bool {
         denomination_index(amount_uegoc)
             .and_then(|i| self.outstanding.get(i))
             .is_some_and(|n| *n > 0)
     }
 
-    /// What the counted notes are worth. Must equal the pool's balance.
     pub fn counted_uegoc(&self) -> u128 {
         self.outstanding
             .iter()
@@ -206,7 +127,6 @@ impl PoolState {
         )
     }
 
-    /// Append a leaf: one hash per level. Returns its index.
     pub fn insert(&mut self, leaf: [u8; 32]) -> Result<u64, String> {
         let mut t = self.tree()?;
         let index = t.insert(public_to_field(&leaf))?;
@@ -283,8 +203,6 @@ pub fn is_nullifier_spent(nullifier: &[u8; 32]) -> bool {
     nullifier_spent_in(db, nullifier)
 }
 
-/// Every commitment in leaf order. The big-endian index key makes the
-/// column family's own ordering the leaf ordering.
 pub fn leaves() -> Vec<[u8; 32]> {
     let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
     let Some(cf) = db.cf_handle(CF_META) else { return vec![] };
@@ -301,8 +219,6 @@ pub fn leaves() -> Vec<[u8; 32]> {
     out
 }
 
-// ── Transaction shapes ────────────────────────────────────────────────────
-
 pub fn is_deposit(tx: &LedgerTx) -> bool {
     tx.to == SHIELDED_POOL_ADDR
 }
@@ -315,8 +231,6 @@ pub fn touches_pool(tx: &LedgerTx) -> bool {
     is_deposit(tx) || is_unshield(tx)
 }
 
-/// What the recipient's balance gains: the whole note for a deposit's pool
-/// credit, the note less the fee for a withdrawal.
 pub fn credited_to_recipient(tx: &LedgerTx) -> u64 {
     if is_unshield(tx) {
         tx.amount.saturating_sub(tx.fee_uegoc)
@@ -337,9 +251,6 @@ pub fn parse_shield_memo(memo: &Option<String>) -> Option<[u8; 32]> {
     hex::decode(hex_part).ok()?.try_into().ok()
 }
 
-/// The body of a withdrawal, carried in `call_args` as JSON in this field
-/// order. The hash is over the re-serialised struct, not the bytes received,
-/// so two encodings of the same body are the same transaction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnshieldBody {
     pub root: String,
@@ -410,8 +321,6 @@ fn recipient_is_acceptable(addr: &str) -> Result<(), String> {
     Ok(())
 }
 
-// ── Validation ────────────────────────────────────────────────────────────
-
 fn validate_deposit_in(
     db: &DB,
     state: &PoolState,
@@ -466,19 +375,12 @@ fn validate_unshield_in(
     if nullifier_spent_in(db, &nullifier) || !seen_nullifiers.insert(nullifier) {
         return Err(format!("unshield {} spends a note that is already spent", tx.hash));
     }
-    // The accounting layer's own answer, independent of the proof. A note of
-    // this size has to have been deposited and still be unspent. If the
-    // circuit were ever wrong about what a note is worth, this is what stands
-    // between that and the pool.
     if !state.has_note(tx.amount) {
         return Err(format!(
             "unshield {} claims a {} uEGOC note but the pool holds none of that size",
             tx.hash, tx.amount
         ));
     }
-    // Belt and braces. A verifying proof already means this note was
-    // deposited, so the pool holds it; if this fires the state is corrupt and
-    // paying out would compound it.
     if tx.amount > state.balance_uegoc {
         return Err(format!(
             "unshield {} of {} uEGOC exceeds the pool's {} uEGOC",
@@ -498,8 +400,6 @@ fn validate_unshield_in(
     }
 }
 
-/// Mempool and proposal entry for a deposit: no block context, so only the
-/// current state is consulted.
 pub fn verify_incoming_deposit(tx: &LedgerTx) -> Result<(), String> {
     if !rule_active_at_tip() {
         return Err("the shielded pool is not active on this chain".into());
@@ -509,7 +409,6 @@ pub fn verify_incoming_deposit(tx: &LedgerTx) -> Result<(), String> {
     validate_deposit_in(db, &state, tx, &mut HashSet::new())
 }
 
-/// Mempool and proposal entry for a withdrawal.
 pub fn verify_incoming_unshield(tx: &LedgerTx) -> Result<(), String> {
     if !rule_active_at_tip() {
         return Err("the shielded pool is not active on this chain".into());
@@ -519,9 +418,6 @@ pub fn verify_incoming_unshield(tx: &LedgerTx) -> Result<(), String> {
     validate_unshield_in(db, &state, tx, &mut HashSet::new())
 }
 
-/// Block-context validation: the same checks, plus no two transactions in
-/// one block may share a commitment or a nullifier, and the pool's capacity
-/// and balance are tracked across the block.
 pub fn validate_block_shielded_txs(height: u64, txs: &[LedgerTx]) -> Result<(), String> {
     if !txs.iter().any(touches_pool) {
         return Ok(());
@@ -544,26 +440,16 @@ pub fn validate_block_shielded_txs(height: u64, txs: &[LedgerTx]) -> Result<(), 
         } else if is_unshield(tx) {
             validate_unshield_in(db, &state, tx, &mut seen_nullifiers)?;
             state.balance_uegoc = state.balance_uegoc.saturating_sub(tx.amount);
-            // Two withdrawals of one denomination in a block need two notes.
             state.note_spent(tx.amount);
         }
     }
     Ok(())
 }
 
-// ── Application and reorg ─────────────────────────────────────────────────
-
-/// Record a block's shielded transactions in the same batch as its balances.
-/// The block has already been validated; anything malformed here is skipped
-/// rather than trusted.
 pub fn apply_block(db: &DB, batch: &mut WriteBatch, height: u64, txs: &[&LedgerTx]) {
     let Some(cf) = db.cf_handle(CF_META) else { return };
     let mut state = read_state(db);
     let mut changed = false;
-    // The block was validated before it got here. These guards are for the
-    // paths that do not validate — a legacy migration, or a proposer applying
-    // its own block — where writing twice would subtract the same note from
-    // the pool balance twice.
     let mut seen_commitments: HashSet<[u8; 32]> = HashSet::new();
     let mut seen_nullifiers: HashSet<[u8; 32]> = HashSet::new();
     for tx in txs {
@@ -576,9 +462,6 @@ pub fn apply_block(db: &DB, batch: &mut WriteBatch, height: u64, txs: &[&LedgerT
                 );
                 continue;
             }
-            // The leaf binds the commitment to the amount this transfer moved.
-            // Everything the depositor chose is on one side of that hash and
-            // everything the chain saw is on the other.
             match state.insert(leaf_for(&commitment, tx.amount)) {
                 Ok(index) => {
                     batch.put_cf(cf, leaf_key(index), leaf_for(&commitment, tx.amount));
@@ -620,12 +503,6 @@ pub fn apply_block(db: &DB, batch: &mut WriteBatch, height: u64, txs: &[&LedgerT
     }
 }
 
-/// Drop state copies a reorg can never reach.
-///
-/// `truncate_from` refuses to rewind at or below the finality floor, so a
-/// rollback only ever restores from the newest copy at or below it. That one
-/// is kept and everything older is deleted, which bounds the history at the
-/// distance between the floor and the tip rather than the age of the chain.
 fn prune_history(db: &DB, batch: &mut WriteBatch, floor: u64) {
     if floor == 0 {
         return;
@@ -648,14 +525,6 @@ fn prune_history(db: &DB, batch: &mut WriteBatch, floor: u64) {
     }
 }
 
-/// Check the pool against itself once the block is durable.
-///
-/// Two things must hold. The balance the pool records for itself has to equal
-/// the balance the chain records for its address, because a deposit and a
-/// withdrawal move both by the same amount and nothing else touches either.
-/// And the notes counted at each denomination have to be worth exactly that
-/// balance, which is the statement that no note was created or destroyed
-/// outside a deposit or a withdrawal.
 pub fn check_invariants(db: &DB, height: u64) {
     let state = read_state(db);
     if state.next_index == 0 && state.balance_uegoc == 0 {
@@ -686,9 +555,6 @@ pub fn check_invariants(db: &DB, height: u64) {
     }
 }
 
-/// Undo every block from `from_height` up: restore the state saved by the
-/// last surviving block that touched the pool, drop the leaves those blocks
-/// appended and the nullifiers they spent.
 pub fn rollback(db: &DB, batch: &mut WriteBatch, from_height: u64, removed: &[LedgerTx]) {
     let Some(cf) = db.cf_handle(CF_META) else { return };
     let current = read_state(db);
@@ -719,10 +585,6 @@ pub fn rollback(db: &DB, batch: &mut WriteBatch, from_height: u64, removed: &[Le
         batch.delete_cf(cf, leaf_key(index));
     }
 
-    // The commitment index cannot be derived from the leaf, because the leaf
-    // is the commitment hashed with the amount. It comes from the deposits in
-    // the blocks being removed, which is where the commitments were read from
-    // in the first place.
     for tx in removed {
         if is_deposit(tx) {
             if let Some(commitment) = parse_shield_memo(&tx.memo) {
@@ -739,8 +601,6 @@ pub fn rollback(db: &DB, batch: &mut WriteBatch, from_height: u64, removed: &[Le
     }
 }
 
-/// Undo a block's balance movements for the pool's transactions, the mirror
-/// of the credit and debit `write_block_batch` applied.
 pub fn reverse_balance_delta(tx: &LedgerTx, out: &mut std::collections::HashMap<String, i128>) -> bool {
     if !is_unshield(tx) {
         return false;
@@ -810,7 +670,6 @@ mod tests {
         assert_eq!(again, state);
     }
 
-    /// The accounting layer's independent answer to "is this note real".
     #[test]
     fn note_counts_track_deposits_and_refuse_to_go_negative() {
         let mut st = PoolState::empty();
@@ -831,15 +690,12 @@ mod tests {
         assert!(!st.has_note(1_000_000));
         assert_eq!(st.counted_uegoc(), 10_000_000_000);
 
-        // An amount that is not a denomination is never countable.
         assert!(!st.note_spent(12_345));
         assert!(!st.has_note(12_345));
     }
 
     #[test]
     fn note_counts_survive_a_state_written_before_they_existed() {
-        // serde fills a missing field with an empty vector; reading must give
-        // it its real length rather than panicking on an index.
         let mut st = PoolState::empty();
         st.outstanding.clear();
         st.note_added(1_000_000);
@@ -847,9 +703,6 @@ mod tests {
         assert_eq!(st.outstanding.len(), DENOMINATIONS_UEGOC.len());
     }
 
-    /// The original bug, stopped by the accounting rather than the circuit: a
-    /// withdrawal naming a size the pool has never held is refused before its
-    /// proof is even looked at.
     #[test]
     fn a_withdrawal_of_a_size_nobody_deposited_is_refused() {
         let _g = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -859,8 +712,6 @@ mod tests {
         let fee = 1_000u64;
         let state = state();
 
-        // A body that passes every structural check. The proof is nonsense,
-        // which is the point: the note count refuses it first.
         let mut nullifier = [0u8; 32];
         rng.fill_bytes(&mut nullifier);
         let body = UnshieldBody {
@@ -888,15 +739,6 @@ mod tests {
         );
         std::env::remove_var("EGO_SHIELDED_POOL_HEIGHT");
     }
-
-    // ── Differential tests ───────────────────────────────────────────────
-    //
-    // There are two implementations of the same state machine: the in-memory
-    // model in `shielded.rs`, which keeps every leaf and is what proofs are
-    // built against, and the persisted one here, which keeps only a frontier
-    // and is what consensus runs. They are written differently on purpose, so
-    // a bug in either shows up as a disagreement rather than as two copies of
-    // the same mistake.
 
     fn random_denomination(rng: &mut StdRng) -> u64 {
         DENOMINATIONS_UEGOC[(rng.next_u64() % DENOMINATIONS_UEGOC.len() as u64) as usize]
@@ -933,13 +775,9 @@ mod tests {
         assert_eq!(state.next_index, 64);
     }
 
-    /// The root history has to age identically in both, or a proof one accepts
-    /// the other refuses and the chain splits.
     #[test]
     fn the_root_windows_age_identically() {
         let mut rng = StdRng::from_entropy();
-        // Both at the pool's real depth: a different depth is a different
-        // tree, so the roots would not be comparable.
         let mut model = ShieldedPool::new(POOL_TREE_DEPTH);
         let mut state = PoolState::empty();
         let mut roots = Vec::new();
@@ -961,10 +799,6 @@ mod tests {
         }
     }
 
-    /// A reorg has to land exactly where a node that had never seen the
-    /// removed blocks would be. Rebuilding from the surviving leaves is an
-    /// independent way to compute that, so it catches a frontier or a counter
-    /// that was restored wrongly.
     #[test]
     fn a_rollback_lands_where_a_fresh_pool_would() {
         let _g = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -975,7 +809,6 @@ mod tests {
         let before_leaves = leaves();
         let before_state = state();
 
-        // Three blocks of deposits, remembered so they can be rolled back.
         let mut blocks: Vec<Vec<LedgerTx>> = Vec::new();
         for b in 0..3u64 {
             let mut txs = Vec::new();
@@ -994,11 +827,9 @@ mod tests {
 
         let grown = state();
         assert!(grown.next_index > before_state.next_index);
-        // The frontier's root must match a tree built from every leaf.
         let rebuilt = ShieldedPool::from_leaves(POOL_TREE_DEPTH, &leaves()).unwrap();
         assert_eq!(grown.root, rebuilt.current_root(), "frontier disagrees with the full tree");
 
-        // Roll the last two blocks back.
         let removed: Vec<LedgerTx> = blocks[1..].iter().flatten().cloned().collect();
         {
             let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
@@ -1020,7 +851,6 @@ mod tests {
         let expected_balance: u64 = before_state.balance_uegoc
             + blocks[0].iter().map(|t| t.amount).sum::<u64>();
         assert_eq!(after.balance_uegoc, expected_balance, "rollback balance");
-        // The commitments of rolled-back deposits are gone, the kept one stays.
         for tx in &removed {
             let c = parse_shield_memo(&tx.memo).unwrap();
             assert_eq!(leaf_index_of(&c), None, "a rolled-back commitment must be forgotten");
@@ -1030,7 +860,6 @@ mod tests {
             assert!(leaf_index_of(&c).is_some(), "a surviving commitment must stay indexed");
         }
 
-        // Roll the rest back so the shared database ends where it started.
         {
             let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
             let mut batch = WriteBatch::default();
@@ -1106,9 +935,6 @@ mod tests {
     fn deposits_are_validated_applied_and_rolled_back() {
         let _g = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("EGO_SHIELDED_POOL_HEIGHT", "0");
-        // Fresh notes and a fresh height per run. These tests share the real
-        // chain database, so a fixed seed would make a second run collide with
-        // the commitments the first one wrote.
         let mut rng = StdRng::from_entropy();
         let a = Note::random(1_000_000, &mut rng);
         let b = Note::random(10_000_000, &mut rng);

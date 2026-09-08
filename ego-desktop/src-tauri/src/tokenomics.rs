@@ -22,16 +22,7 @@ pub const FAUCET_EGOC: u64 = 10_000_000;
 
 pub fn is_testnet() -> bool { CHAIN_ID == 1 }
 
-// Block reward halving — designed for a 120-year emission schedule.
-//
-// At 0.1 s/block there are 315,360,000 blocks/year.
-// We want ~30 halvings over 120 years → one halving every ~4 years.
-// 4 years × 315,360,000 blocks/year ≈ 1,261,440,000 blocks per era.
-//
-// Initial reward is sized so that era-0 emits exactly half the block pool
-// (the geometric series 1 + 1/2 + 1/4 + … sums to 2, so era-0 = pool/2):
-//   era-0 total = 210,000,000 / 2 = 105,000,000 EGOC
-//   per-block   = 105,000,000 EGOC / 1,261,440,000 blocks ≈ 0.0832 EGOC = 83,220 uEGOC
+
 pub const INITIAL_BLOCK_REWARD_UEGOC: u64 = 83_220;
 
 // 4-year halving — one era every ~1.26 billion blocks.
@@ -43,9 +34,7 @@ pub const TARGET_BLOCK_SECS: f64 = 0.1;
 
 pub fn block_reward_at(height: u64) -> u64 {
     let era = height / HALVING_INTERVAL;
-    // Float division so reward never hits zero via integer truncation.
-    // Minimum 1 uEGOC keeps miners incentivised past era 16 (year 68)
-    // while eras 17-29 (years 68-120) each add only ~1,261 EGOC total — negligible vs the 210M pool.
+
     let reward_f = INITIAL_BLOCK_REWARD_UEGOC as f64 / 2f64.powi(era.min(63) as i32);
     (reward_f as u64).max(1)
 }
@@ -66,20 +55,6 @@ pub fn compute_block_reward(height: u64, tx_fees_uegoc: u64, prev_hash: &str) ->
     surprise.saturating_add(miner_fee_share(tx_fees_uegoc))
 }
 
-// ── Emission v2: time-based, adoption-scaled ─────────────────────────────────
-//
-// v1 minted per BLOCK while the block rate is demand-elastic, so tx volume (or
-// an idle-loop bug) directly printed money, and the 105M/era curve only held at
-// exactly 10 blocks/s. v2 accrues the coinbase per SECOND of chain time and
-// scales it by network adoption:
-//
-//   emission = era_rate/sec × seconds_since_parent × min(1, validators/864,000)
-//
-// Which is equivalent to "every registered validator earns ~0.0832 EGOC/day"
-// (≈ the documented $0.20/day consensus target at the launch price) until
-// the network reaches 864k validators, where the era curve (72,000 EGOC/day,
-// halving every 4 years) becomes the cap. Fees ride on top per block, so busy
-// blocks still pay their proposer more — demand rewards without demand MINTING.
 pub const VALIDATOR_TARGET_FOR_FULL_EMISSION: u64 = 864_000;
 pub const ERA_WALL_SECS: i64 = 126_144_000;
 pub const ERA0_RATE_UEGOC_PER_SEC: u64 = 10 * INITIAL_BLOCK_REWARD_UEGOC;
@@ -107,56 +82,15 @@ pub fn compute_block_reward_v2(base_emission: u64, tx_fees_uegoc: u64) -> u64 {
     base_emission.saturating_add(miner_fee_share(tx_fees_uegoc))
 }
 
-// ── Node reward targets (USD) ─────────────────────────────────────────────────
-//
-// Node rewards are defined in USD and converted to EGOC at the live price.
-// This keeps real income stable for operators whether EGOC is $0.001 or $1,000,
-// while naturally adjusting how many EGOC are emitted from the node pool.
-//
-// USD targets are competitive with market rates but not so high that a rising
-// EGOC price depletes the node pool quickly:
-//   Storage : $0.002 / GB / day  → $0.06/GB/month  (below Filecoin ~$0.30)
-//   Consensus: $0.20  / node / day → ~$73/year per validator
-//   Coverage : $0.15  / node / day → ~$55/year per coverage node
-//   Retrieval: $0.003 / GB served  → incentivises fast serving
-//
-// The EGOC reward is always clamped: at least FEE_FLOOR_UEGOC (never zero),
-// at most NODE_REWARD_CEILING_UEGOC (prevents pool drain if price crashes).
 pub const STORAGE_REWARD_USD_PER_GB_DAY:  f64 = 0.002;
 pub const CONSENSUS_REWARD_USD_PER_DAY:   f64 = 0.20;
 pub const COVERAGE_REWARD_USD_PER_DAY:    f64 = 0.15;
 pub const RETRIEVAL_REWARD_USD_PER_GB:    f64 = 0.003;
 
-// Hard ceiling per reward event — prevents pool exhaustion if EGOC price collapses
-// to near zero (e.g. at $0.000001 the USD target would require trillions of EGOC).
-pub const NODE_REWARD_CEILING_UEGOC: u64 = 50 * UEGOC_PER_EGOC; // 50 EGOC per event max
+pub const NODE_REWARD_CEILING_UEGOC: u64 = 50 * UEGOC_PER_EGOC; 
 
-// Hard cap on a single operational `reward` tx accepted into a block. Operational
-// rewards (storage/coverage/consensus/retrieval) are still self-asserted by the
-// node (see audit M2 — trustless sizing requires consensus-validated entitlement),
-// so block validation additionally requires reward.to == block.miner and bounds
-// each reward tx to this ceiling. This stops a peer from gossiping a reward tx
-// that credits an arbitrary address an arbitrary amount (the C1 free-mint vector).
 pub const REWARD_CAP_PER_TX_UEGOC: u64 = 10_000 * UEGOC_PER_EGOC;
 
-// Early-node bootstrap multiplier.
-//
-// Supply-side networks are worth nothing until operators show up, and the first
-// operators take the most risk for the least network. The multiplier pays them
-// for that and decays as the network no longer needs the subsidy.
-//
-//   < 100 nodes        10x
-//   100 to 1,000       7x tapering to 1.5x
-//   1,000 to 10,000    1.5x tapering to 1x
-//   10,000+            1x
-//
-// Monotonic by construction: each tier begins where the previous one ended, so
-// crossing a boundary never increases an operator's reward and there is nothing
-// to gain by inflating the node count.
-//
-// The count comes from the on-chain validator registry, the same source emission
-// v2 scales against, so every node computes an identical multiplier. A local peer
-// view would differ per node and could not be validated.
 pub const BOOTSTRAP_T1_NODES: u64 = 100;
 pub const BOOTSTRAP_T2_NODES: u64 = 1_000;
 pub const BOOTSTRAP_T3_NODES: u64 = 10_000;
@@ -188,11 +122,6 @@ pub fn current_early_multiplier() -> f64 {
     early_node_multiplier(n)
 }
 
-/// Convert a USD reward target to uEGOC at the live price,
-/// clamped to [FEE_FLOOR_UEGOC, NODE_REWARD_CEILING_UEGOC].
-///
-/// The bootstrap multiplier is applied before the ceiling, so the ceiling still
-/// caps what any single event can pay out.
 pub fn reward_usd_to_uegoc(target_usd: f64) -> u64 {
     let price = crate::p2p::get_egoc_price_usd().max(1e-9);
     let scaled = target_usd * current_early_multiplier();
@@ -242,9 +171,6 @@ pub fn retrieval_reward_uegoc(gb: f64) -> u64 {
     reward_usd_to_uegoc(RETRIEVAL_REWARD_USD_PER_GB * gb)
 }
 
-/// Extra block-reward bonus (in basis points, 100 bps = 1%) earned by stakers.
-/// Returns 0 for unstaked nodes, up to 5000 bps (+50%) for large stakers.
-/// Applied on top of the consensus-agreed coinbase so all validators agree on base reward.
 pub fn staking_mining_bonus_bps(staked_uegoc: u64) -> u64 {
     if staked_uegoc == 0 { return 0; }
     let egoc = staked_uegoc as f64 / UEGOC_PER_EGOC as f64;
@@ -257,8 +183,6 @@ pub const STAKING_APR_BPS: u64 = 1_250;
 
 pub const SECONDS_PER_YEAR: u64 = 31_536_000;
 
-/// Effective staking APR in basis points including the lock-period bonus.
-///   30d → +0, 90d → +200, 180d → +500, 365d+ → +1000
 pub fn effective_apr_bps(lock_days: u32) -> u64 {
     let bonus: u64 = match lock_days {
         d if d >= 365 => 1_000,
@@ -269,9 +193,6 @@ pub fn effective_apr_bps(lock_days: u32) -> u64 {
     STAKING_APR_BPS + bonus
 }
 
-/// Deterministic accrued staking reward for `principal` staked for `secs`
-/// seconds at the APR implied by `lock_days`. Pure integer math so every node
-/// computes an identical value when validating an unstake.
 pub fn staking_reward_uegoc(principal_uegoc: u64, lock_days: u32, secs: u64) -> u64 {
     if principal_uegoc == 0 || secs == 0 { return 0; }
     let apr_bps = effective_apr_bps(lock_days);
@@ -316,24 +237,7 @@ pub fn foundation_vested_egoc(now_secs: i64) -> u64 {
     (FOUNDATION_EGOC as f64 * vested_frac) as u64
 }
 
-// Storage pricing — cheapest in the market:
-//   Google Drive ~$0.020/GB/mo, iCloud ~$0.015/GB/mo,
-//   AWS S3 ~$0.023/GB/mo, Azure ~$0.018/GB/mo,
-//   Backblaze B2 ~$0.006/GB/mo, Wasabi ~$0.0069/GB/mo
-//   Ego target: $0.005/GB/mo = $0.000005/MB/mo  (beats all of them)
 pub const STORAGE_USD_PER_MB_MONTH: f64 = 0.000_005;
-
-// ── Transaction fee model ─────────────────────────────────────────────────────
-//
-// Base fees are fixed in EGOC so they always look small to the user.
-// When EGOC price rises the USD cost could exceed $0.80, so we cap it:
-//   fee = min(base_uegoc, USD_MAX / price)
-//
-// Examples at various prices (transfer base = 0.5 EGOC):
-//   $0.001 /EGOC →  0.5 EGOC = $0.0005  (cheap, fixed EGOC)
-//   $1.00  /EGOC →  0.5 EGOC = $0.50    (normal range)
-//   $2.00  /EGOC →  0.4 EGOC = $0.80    (USD cap kicks in)
-//   $10.00 /EGOC →  0.08 EGOC = $0.80   (USD cap, fewer EGOC)
 
 pub const TRANSFER_FEE_UEGOC: u64 = 500_000;   // 0.5 EGOC
 pub const CALL_FEE_BASE_UEGOC: u64 = 600_000;  // 0.6 EGOC
@@ -376,8 +280,7 @@ pub fn storage_cost_with_staking(size_mb: f64, months: u32, is_staker: bool) -> 
     let egoc_price = crate::p2p::get_egoc_price_usd();
 
     let target_usd = if months == 0 {
-        // Permanent storage: equivalent to 10 years at 50% discount
-        // = size_mb × rate × 120 months × 0.50
+
         STORAGE_USD_PER_MB_MONTH * size_mb * 120.0 * 0.50
     } else {
         STORAGE_USD_PER_MB_MONTH * size_mb * months as f64

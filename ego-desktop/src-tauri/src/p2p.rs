@@ -260,14 +260,6 @@ pub fn https_port() -> u16 {
 }
 pub const P2P_PORT: u16 = 47393;
 
-/// Local mesh only: never reach for the internet.
-///
-/// A node on a cut-off or censored network has nothing to gain by dialling the
-/// public relay, the bootstrap anchor or the price oracle. Worse, on a censored
-/// connection those requests are what identify the machine as running Ego at
-/// all, before any transaction is sent. In this mode peers are found only by
-/// mDNS on the local network or named explicitly in EGO_DIRECT_PEERS, and a
-/// cluster of machines on one WiFi network forms a committee among themselves.
 pub fn offline_mode() -> bool {
     static OFFLINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFFLINE.get_or_init(|| {
@@ -290,10 +282,6 @@ pub const RELAY_NODES: &[&str] = &[
     "/dns4/relay4.egoblockchain.com/tcp/4001/p2p/12D3KooWL4v3k3nhpsXKxa44eUsggQ9rAzELeVv34Eav8qA5t9y",
 ];
 
-/// Always-on, publicly-reachable validator anchors. Unlike RELAY_NODES (circuit
-/// relays), these are dialed DIRECTLY — a stable connection that doesn't depend on
-/// relay NAT-traversal, so nodes reliably exchange validator announcements + gossip
-/// and form a quorum. A node dialing its own address here is harmlessly self-rejected.
 pub const BOOTSTRAP_PEERS: &[&str] = &[
     "/ip4/40.233.82.42/tcp/47393/p2p/12D3KooWBJthxzWdKk4FgwKWn98oytdzr9BDnrb6MJ1LynnU3Spz",
 ];
@@ -379,7 +367,6 @@ pub fn record_gossip_price(price: f64, stake_weight: u64) {
     if samples.len() > PRICE_WINDOW { samples.pop_front(); }
 }
 
-
 // CoinGecko coin IDs to try in order.
 const COINGECKO_IDS: &[&str] = &["ego-coin", "egocoin", "egoc"];
 
@@ -390,19 +377,16 @@ pub async fn fetch_and_cache_egoc_price() {
     tracing::debug!("[Price] Network median price: ${:.6}", price);
 }
 
-
 pub const ORACLE_RPCS: &[&str] = &[
     "https://rpc.egoblockchain.com",
     "https://rpc2.egoblockchain.com",
     "https://rpc3.egoblockchain.com",
 ];
 
-
 pub const ORACLE_RPC: &str = ORACLE_RPCS[0];
 
 /// Ego Relay HTTP endpoint — alert system (port 4002)
 pub const RELAY_RPC: &str = "https://relay.egoblockchain.com:4002";
-
 
 async fn oracle_get(client: &reqwest::Client, path: &str) -> Option<reqwest::Response> {
     if offline_mode() {
@@ -417,22 +401,14 @@ async fn oracle_get(client: &reqwest::Client, path: &str) -> Option<reqwest::Res
     None
 }
 
-
 fn oracle_submit_token() -> Option<String> {
     std::env::var("EGO_ORACLE_SUBMIT_TOKEN").ok().filter(|s| !s.trim().is_empty())
 }
 
-/// A designated ARCHIVE writer holds the submit token and pushes EVERY block
-/// (belt-and-suspenders indexer). Ordinary nodes don't hold the token and don't
-/// need it — see push_block_to_oracle: every node pushes the blocks IT produced,
-/// which the oracle accepts on the block's quorum certificate (no shared secret).
 pub fn is_oracle_writer() -> bool {
     oracle_submit_token().is_some()
 }
 
-/// Feeding the public explorer is on by default. A node contributes exactly the
-/// blocks it produced, so total oracle load is ~1 push per block regardless of
-/// network size. Set EGO_ORACLE_NO_PUSH=1 to opt a node out entirely.
 pub fn oracle_push_enabled() -> bool {
     !std::env::var("EGO_ORACLE_NO_PUSH").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
 }
@@ -469,17 +445,11 @@ async fn oracle_post(client: &reqwest::Client, path: &str, body: &serde_json::Va
     }
 }
 
-
 pub async fn oracle_post_pub(client: &reqwest::Client, path: &str, body: &serde_json::Value) {
     oracle_post(client, path, body).await;
 }
 
 pub async fn push_block_to_oracle(block: &crate::ledger::LedgerBlock, txs: &[crate::ledger::LedgerTx]) {
-    // Two ways to be allowed to feed the oracle, NEITHER needing a shipped secret:
-    //  1. I produced this block (block.miner == my address) — one push per block
-    //     across the whole network, and the oracle accepts it on its quorum
-    //     certificate (a forged block can't fake the BFT signatures).
-    //  2. I'm a designated archive node holding the submit token — pushes all.
     if !oracle_push_enabled() {
         eprintln!("[Oracle] push skipped for block #{}: EGO_ORACLE_NO_PUSH is set", block.height);
         return;
@@ -502,9 +472,7 @@ pub async fn push_block_to_oracle(block: &crate::ledger::LedgerBlock, txs: &[cra
         Ok(c) => c,
         Err(_) => return,
     };
-    // Re-push the last few ancestors alongside the new block, so a transient
-    // submit failure for any of them is backfilled by the very next block —
-    // keeps the oracle feed gap-free without waiting for the next snapshot.
+
     let mut extra_blocks: Vec<serde_json::Value> = Vec::new();
     for back in 1..=4u64 {
         if block.height > back {
@@ -531,48 +499,17 @@ static IS_RELAY_SERVER: AtomicBool = AtomicBool::new(false);
 
 pub fn relay_mode_active() -> bool { IS_RELAY_SERVER.load(Ordering::Relaxed) }
 
-
 static DIRECT_PEER_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-
 const MIN_DIRECT_PEERS_RELAY_OPTIONAL: usize = 10;
 
-/// How many non-local cached peers are dialled in the startup burst.
-///
-/// Kept low on purpose. libp2p drops dials once its in-flight limit is reached,
-/// and a dead cache entry costs the same slot as a live peer, so a large burst
-/// spends the whole budget before a LAN peer is even discovered.
 const MAX_STARTUP_REMOTE_DIALS: usize = 8;
 
-/// How far back to look for validators that actually produced a block.
-///
-/// Long enough that a validator taking its turn in a large committee still
-/// counts, short enough that a machine switched off yesterday does not.
 const PROPOSER_LIVENESS_LOOKBACK: u64 = 200;
 
-/// The round at which leader election stops trusting recent activity and walks
-/// the whole registered set again.
-///
-/// This is the escape hatch, and it is why electing only from recent producers
-/// is safe. If every recently active validator went away at once, the lookback
-/// window would freeze — no blocks means no new producers means no way to
-/// notice anyone else — and the chain would never recover. Rounds are agreed by
-/// every node, so widening the set at a fixed round keeps that agreement while
-/// guaranteeing anyone registered is eventually reachable.
 const PROPOSER_ESCAPE_ROUND: u64 = 8;
 
-/// The validators leader election may choose from at a given round.
-///
-/// Early rounds draw only from validators that have recently produced a block,
-/// so the first proposer of each height is somebody who exists. A registry that
-/// only grows is mostly switched-off machines after a while, and round-robin
-/// over all of them elects a ghost nearly every time: the round times out, and
-/// the chain crawls or stops.
-///
-/// Both inputs come from committed data — blocks for who produced, the on-chain
-/// registry for who may — so every node derives the same list and still agrees
-/// on one proposer per (height, round).
 fn proposer_candidates(round: u64) -> Vec<String> {
     let all = eligible_validators_sorted();
     if round >= PROPOSER_ESCAPE_ROUND || all.is_empty() {
@@ -582,8 +519,6 @@ fn proposer_candidates(round: u64) -> Vec<String> {
     narrow_to_live(all, &recent, round, crate::mempool::min_validators_for_finality())
 }
 
-/// The decision proposer_candidates makes, separated from where its inputs come
-/// from so the rules can be tested directly.
 fn narrow_to_live(
     all: Vec<String>,
     recent: &std::collections::HashSet<String>,
@@ -601,16 +536,13 @@ fn narrow_to_live(
     }
 }
 
-
 const MIN_CACHED_PEERS_FOR_DIRECT_BOOT: usize = 5;
-
 
 static PEER_SEED_VOTES: OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> =
     OnceLock::new();
 static PEER_SEED_MSG_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 const SEED_VOTE_WINDOW: usize = 20;
-
 
 static PENDING_VOTES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Vec<String>>>> =
     std::sync::OnceLock::new();
@@ -703,10 +635,7 @@ fn known_validators() -> std::sync::MutexGuard<'static, std::collections::HashSe
         .expect("known_validators lock poisoned")
 }
 
-
-
 const MAX_VALIDATORS: usize = 1_000_000;
-
 
 static SLASHED_VALIDATORS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::OnceLock::new();
@@ -728,7 +657,6 @@ fn wrong_vote_counts() -> std::sync::MutexGuard<'static, HashMap<String, u32>> {
         .unwrap()
 }
 
-
 static FINALIZED_AT_HEIGHT: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, String>>> =
     std::sync::OnceLock::new();
 
@@ -749,8 +677,6 @@ fn hard_finalized_heights() -> std::sync::MutexGuard<'static, std::collections::
         .unwrap()
 }
 
-// Maps (validator_address, block_height) → (first_block_hash, first_signature).
-// If they vote a different hash at the same height = equivocation → slash + on-chain proof.
 static VOTES_CAST: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, u64), (String, String)>>> =
     std::sync::OnceLock::new();
 
@@ -761,13 +687,6 @@ fn votes_cast() -> std::sync::MutexGuard<'static, HashMap<(String, u64), (String
         .unwrap()
 }
 
-// Persistent anti-equivocation lock for THIS node's OWN votes: height → the block
-// hash this node committed its vote to. Unlike VOTES_CAST (which is wiped per view
-// change for liveness), this lock survives view changes and is only released once the
-// height is decided (finalized) or pruned as ancient. It guarantees the node casts at
-// most ONE effective vote per height, so two conflicting blocks can never each gather
-// a quorum — closing the safety hole where the per-view vote-lock wipe let a node vote
-// for competing blocks across views and fork the chain at a single height.
 static SELF_VOTE_LOCK: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, (u64, String)>>> =
     std::sync::OnceLock::new();
 
@@ -778,24 +697,7 @@ fn self_vote_lock() -> std::sync::MutexGuard<'static, HashMap<u64, (u64, String)
         .unwrap()
 }
 
-// Atomically reserve this node's single vote for `height` on `hash`, as seen in
-// `view`. Returns true if the node may vote/broadcast for this block; false if it is
-// locked on a DIFFERENT block that it must not abandon.
-//
-// Equivocation safety vs. liveness: the lock is permanent ONCE the height is decided
-// (a block there reached a QC — recorded in finalized_at_height / hard_finalized_heights);
-// after that no competing block may ever be voted, so two QCs can never form at one
-// height. But while the height is still UNDECIDED, a lock on a block that never reached
-// a quorum may be abandoned in favour of a strictly higher view's proposal. This is
-// HotStuff's "unlock in a higher view that carries no committed block": without it, two
-// nodes that locked different blocks at one height during a transient dueling-proposal
-// burst deadlock forever — no QC ever forms, so the old (permanent) lock never frees and
-// the chain livelocks in endless view changes. Safe for the small-committee regime: a
-// second QC at a height needs this node's own vote, and finalization is recorded
-// synchronously, so a node always observes "decided" before it could re-lock.
 fn try_lock_self_vote(height: u64, hash: &str, view: u64) -> bool {
-    // Every vote this node casts passes through here, which makes it the one
-    // place a dishonest build needs to touch.
     if crate::adversary::should_withhold_vote() {
         eprintln!("[Adversary] withholding a vote for #{height}");
         return false;
@@ -901,11 +803,6 @@ pub fn build_shadow_consensus_host() -> Option<crate::consensus_host::ConsensusH
     Some(host)
 }
 
-// ── Consensus-v2 driver (DEFAULT live engine) ────────────────────────────────────
-// Runs the ego-consensus-core BftEngine over a dedicated gossip topic. By default it is
-// LIVE: it proposes real LedgerBlocks, persists them on QC, and the inline BFT is gated
-// off. With EGO_CONSENSUS_LEGACY=1 the inline BFT drives instead; with LEGACY+SHADOW the
-// engine runs alongside inline writing nothing to disk (parity logging only).
 const V2_TOPIC: &str = "ego-bftv2-v1";
 
 static SHADOW_HOST: std::sync::OnceLock<std::sync::Mutex<Option<crate::consensus_host::ConsensusHost>>> =
@@ -913,10 +810,7 @@ static SHADOW_HOST: std::sync::OnceLock<std::sync::Mutex<Option<crate::consensus
 fn shadow_host_lock() -> std::sync::MutexGuard<'static, Option<crate::consensus_host::ConsensusHost>> {
     SHADOW_HOST.get_or_init(|| std::sync::Mutex::new(None)).lock().unwrap()
 }
-/// v2 is the DEFAULT consensus — it drives the real chain and the inline BFT is gated
-/// off. No configuration required; ordinary users get this automatically. The ONLY knob
-/// is an emergency escape hatch: set `EGO_CONSENSUS_LEGACY=1` to fall back to the inline
-/// BFT (e.g. if a v2 issue is found in the field, before a fix ships).
+
 pub(crate) fn consensus_v2_live_enabled() -> bool { std::env::var("EGO_CONSENSUS_LEGACY").is_err() }
 /// The v2 engine runs (live by default, or shadow-alongside-inline when LEGACY+SHADOW).
 fn consensus_v2_active() -> bool { consensus_v2_live_enabled() || std::env::var("EGO_CONSENSUS_V2_SHADOW").is_ok() }
@@ -936,10 +830,6 @@ fn v2_pending_blocks() -> std::sync::MutexGuard<'static, HashMap<ego_core::Hash,
     V2_PENDING_BLOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap()
 }
 
-// Out-of-order buffers: a proposal or vote for height N can arrive BEFORE we finalize N-1
-// (gossip race). We keep these by height and replay them once the engine reaches N, rather
-// than dropping them — dropping strands the chain (observed live: reject #60 then finalize
-// #59 → permanent stall, because the proposer had already moved past #60).
 type V2Proposal = (ego_consensus_core::bft::BlockHeader, crate::ledger::LedgerBlock, Vec<LedgerTx>);
 static V2_FUTURE_PROPOSALS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, V2Proposal>>> = std::sync::OnceLock::new();
 static V2_FUTURE_VOTES: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, Vec<ego_consensus_core::bft::Vote>>>> = std::sync::OnceLock::new();
@@ -1012,8 +902,6 @@ async fn maybe_reconfigure_committee() {
     }
 }
 
-/// Build the stored shadow host once we have a quorum-sized validator set. Returns true
-/// if a host is available. The build (DPAPI seed load) runs off the async executor.
 async fn ensure_shadow_host() -> bool {
     if shadow_host_lock().is_some() { return true; }
     let built = tokio::task::spawn_blocking(build_shadow_consensus_host).await.ok().flatten();
@@ -1241,13 +1129,6 @@ pub async fn shadow_v2_tick() {
         }
     }
 
-    // ── Idle gate ─────────────────────────────────────────────────────────────
-    // Block production is DEMAND-driven, not tick-driven. With an empty mempool,
-    // no proposal in flight and a young tip there is nothing to decide: don't
-    // propose (each empty block mints a coinbase — observed live at 1.35 empty
-    // blocks/sec ≈ 9,600 EGOC/day for nothing) and don't fire the pacemaker
-    // (idle view-changes would storm every timeout). One empty heartbeat block
-    // per EMPTY_BLOCK_INTERVAL_S keeps the chain demonstrably alive.
     {
         let inflight = {
             let guard = shadow_host_lock();
@@ -1375,9 +1256,6 @@ fn my_ed25519_pubkey_hex() -> String {
     }
 }
 
-/// If `pubkey_hex` derives `address`, cache it for future verifications and
-/// return true. Lets a node learn a voter's key directly from the vote that
-/// carries it, instead of waiting for the voter's announce to propagate.
 fn learn_voter_pubkey(address: &str, pubkey_hex: &str) -> bool {
     if address.is_empty() || pubkey_hex.len() != 64 { return false; }
     let Ok(bytes) = hex::decode(pubkey_hex) else { return false; };
@@ -1389,9 +1267,6 @@ fn learn_voter_pubkey(address: &str, pubkey_hex: &str) -> bool {
     true
 }
 
-/// Verify a BFT signature, accepting an inline pubkey carried with the vote.
-/// The inline key is only trusted after `learn_voter_pubkey` confirms it derives
-/// the claimed address, so it cannot be used to vote as someone else.
 fn verify_bft_sig_with_key(address: &str, data: &str, sig_hex: &str, pubkey_hex: &str) -> bool {
     if !pubkey_hex.is_empty() {
         learn_voter_pubkey(address, pubkey_hex);
@@ -1424,9 +1299,6 @@ fn verify_bft_sig(address: &str, data: &str, sig_hex: &str) -> bool {
     vk.verify(data.as_bytes(), &sig).is_ok()
 }
 
-// ── Per-peer gossip rate limiter ───────────────────────────────────────────────
-// Counts messages per peer per second. Peers exceeding the cap are ignored.
-// This prevents a single peer from flooding the network (DDoS layer 1).
 const MAX_MSGS_PER_SEC: u32 = 500;
 
 #[derive(Clone, Copy)]
@@ -1503,10 +1375,8 @@ static CURRENT_VIEW: std::sync::atomic::AtomicU64 =
 static LAST_PROPOSAL_TS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 
-
 static CONSECUTIVE_EMPTY_VIEWS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
-
 
 const SOLO_DEADLOCK_VIEWS: u32 = 3;
 
@@ -1521,12 +1391,6 @@ static LIVENESS_STALLED: std::sync::atomic::AtomicBool =
 const SOLO_STALL_SECS: i64 = 15;
 const SOLO_ALONE_STALL_SECS: i64 = 4;
 
-/// Validators recently evicted via the deadlock-eviction path. Each entry
-/// holds the wall-clock timestamp until which the address should NOT be
-/// re-registered, regardless of incoming gossip echoes. Without this, a
-/// disconnected peer's stale gossip messages keep re-adding it to the
-/// committee within milliseconds of every eviction, causing an infinite
-/// 1↔2 oscillation that prevents view advancement.
 const EVICTION_COOLDOWN_SECS: i64 = 90;
 static EVICTION_COOLDOWN: std::sync::OnceLock<std::sync::Mutex<HashMap<String, i64>>> =
     std::sync::OnceLock::new();
@@ -1567,7 +1431,6 @@ pub static LAST_BLOCK_FINALIZED_TS: std::sync::atomic::AtomicI64 =
 static LAST_FORK_SYNC_TS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 
-
 static PENDING_PROPOSALS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, String>>> =
     std::sync::OnceLock::new();
 
@@ -1597,7 +1460,6 @@ pub fn current_view() -> u64 { CURRENT_VIEW.load(Ordering::Relaxed) }
 
 fn advance_view(v: u64) { CURRENT_VIEW.store(v, Ordering::Relaxed); }
 
-
 // ── PoRep outstanding challenge tracker ───────────────────────────────────────
 
 #[derive(Debug)]
@@ -1612,8 +1474,6 @@ struct OutstandingChallenge {
     manifest_cid:  String,
 }
 
-/// Consecutive PoRep failures per prover address. Resets on any pass.
-/// Key: prover address. Value: consecutive fail count.
 static POREP_CONSECUTIVE_FAILS: std::sync::OnceLock<
     std::sync::Mutex<HashMap<String, u32>>
 > = std::sync::OnceLock::new();
@@ -1868,12 +1728,10 @@ fn record_peer_invalid_block(peer_id: &str) {
     }
 }
 
-
 pub fn elect_proposer_for_next_slot() -> Option<String> {
     // This is called from sync code, so blocking is fine.
     let my_addr = crate::ledger::Ledger::load().address;
     if my_addr.is_empty() { return None; }
-
 
     let mut vs = crate::chain_db::registered_validators_sorted();
     if vs.is_empty() {
@@ -1929,7 +1787,6 @@ fn _elect_proposer_legacy() -> Option<String> {
 pub fn leader_for_view(_view: u64) -> Option<String> {
     elect_proposer_for_next_slot()
 }
-
 
 pub fn slash_validator(address: &str, reason: &str) {
     tracing::warn!("Slashing validator {} — {}", address, reason);
@@ -1994,8 +1851,6 @@ pub async fn broadcast_equivocation_tx(
     broadcast_pending_tx(tx).await;
 }
 
-
-
 static PEER_ED25519_KEYS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, [u8; 32]>>> =
     std::sync::OnceLock::new();
 
@@ -2004,7 +1859,6 @@ fn peer_ed25519_keys() -> std::sync::MutexGuard<'static, std::collections::HashM
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
         .lock().unwrap()
 }
-
 
 fn record_peer_ed25519(address: &str, pubkey_hex: &str) {
     if address.is_empty() || pubkey_hex.len() != 64 { return; }
@@ -2015,7 +1869,6 @@ fn record_peer_ed25519(address: &str, pubkey_hex: &str) {
         }
     }
 }
-
 
 pub fn get_peer_ed25519_pubkey(address: &str) -> Option<[u8; 32]> {
     if let Some(pk) = peer_ed25519_keys().get(address).copied() {
@@ -2031,7 +1884,6 @@ pub fn get_peer_ed25519_pubkey(address: &str) -> Option<[u8; 32]> {
     }
     None
 }
-
 
 static VALIDATOR_LAST_SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, i64>>> =
     std::sync::OnceLock::new();
@@ -2133,8 +1985,6 @@ fn network_has_staked_validator() -> bool {
     let min = min_validator_stake_uegoc();
     known_validators().iter().any(|a| crate::ledger::get_validator_stake(a) >= min)
 }
-
-
 
 pub fn is_eligible_validator(addr: &str) -> bool {
     // If the network is small (dev mode), allow unstaked nodes to participate
@@ -2314,7 +2164,6 @@ pub fn ensure_local_validator_identity() -> bool {
     true
 }
 
-
 const VALIDATOR_WARMUP_SECS: i64 = 10;
 
 fn warmed_validator_count() -> usize {
@@ -2407,10 +2256,8 @@ fn stake_quorum_reached(voters: &[String]) -> bool {
     ok
 }
 
-
 static PEER_RELAY_NODES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
     std::sync::OnceLock::new();
-
 
 static DHT_SEEN_MSGS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::OnceLock::new();
@@ -3150,8 +2997,6 @@ pub struct PeerEntry {
     #[serde(default)]
     pub lon: Option<f64>,
 }
-
-
 
 #[derive(Debug, Clone, Default)]
 struct EgoCodec;
@@ -4084,7 +3929,6 @@ pub async fn send_message(endpoint: &str, msg: &P2PMessage) -> Result<(), String
         .map_err(|_| "Swarm dropped reply".to_string())?
 }
 
-
 pub async fn send_message_any(endpoints: &[String], msg: &P2PMessage) -> Result<(), String> {
     if endpoints.is_empty() {
         return Err("No endpoints available".to_string());
@@ -4142,7 +3986,6 @@ pub async fn get_public_endpoint() -> String {
         .unwrap_or_default()
 }
 
-
 pub async fn wait_for_public_endpoint(timeout_secs: u64) -> String {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     loop {
@@ -4174,11 +4017,9 @@ pub fn get_local_endpoint() -> String {
     format!("/ip4/{}/tcp/{}", get_local_ip(), p2p_port())
 }
 
-
 pub async fn start_udp_discovery(_app: tauri::AppHandle) {}
 pub async fn broadcast_udp_announce() {}
 pub async fn gossip_peer_list() {}
-
 
 pub async fn publish_gossip(topic: &str, data: Vec<u8>) {
     if let Some(tx) = GOSSIP_TX.get() {
@@ -4404,7 +4245,6 @@ pub async fn offer_to_sideband(msg: &P2PMessage, tx_hash: &str) {
         crate::commands::tx_transport::record(&hash, "radio");
     }).await;
 }
-
 
 pub async fn broadcast_tx(tx: LedgerTx, block: LedgerBlock) {
     // This is an async function, so all blocking calls must be wrapped.
@@ -4701,11 +4541,9 @@ pub async fn broadcast_peer_announce(app: Option<&tauri::AppHandle<tauri::Wry>>)
         machine_id,
     };
 
-
     if let Ok(data) = serde_json::to_vec(&msg) {
         publish_gossip("ego-peers-v1", data).await;
     }
-
 
     let contacts = tokio::task::spawn_blocking(load_contacts).await.unwrap_or_default();
     for contact in contacts.iter().filter(|c| c.status == "approved" && !c.endpoint.is_empty()) {
@@ -4734,7 +4572,6 @@ pub async fn broadcast_peer_announce(app: Option<&tauri::AppHandle<tauri::Wry>>)
         });
     }
 }
-
 
 pub async fn broadcast_data_manifest() {
     let ledger = tokio::task::spawn_blocking(crate::ledger::Ledger::load)
@@ -4974,7 +4811,6 @@ pub async fn push_shard_data_to_slaves() {
     }
 }
 
-
 pub async fn request_file_pinning(cids: Vec<String>) {
     if cids.is_empty() { return; }
     let ledger = tokio::task::spawn_blocking(crate::ledger::Ledger::load)
@@ -5034,7 +4870,6 @@ pub async fn request_file_pinning(cids: Vec<String>) {
         });
     }
 }
-
 
 /// How long (seconds) without a heartbeat before a slave declares the master dead.
 const MASTER_TIMEOUT_SECS: i64 = 5 * 60; // 5 minutes
@@ -5119,7 +4954,6 @@ pub async fn check_file_replication() {
         }
 
         match file.replication_role.as_str() {
-
             // ── MASTER duties ─────────────────────────────────────────────
             "master" => {
                 // ── Replica liveness → 24h rejoin grace ───────────────────
@@ -5390,8 +5224,6 @@ pub async fn check_file_replication() {
     }
 }
 
-
-
 fn peer_cache_path() -> std::path::PathBuf { base_data_dir().join("peers.json") }
 
 pub fn load_peer_cache() -> Vec<PeerEntry> {
@@ -5520,7 +5352,6 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
             relay_connected_count += 1;
         }
     }
-
 
     {
         let cached = load_peer_cache();
@@ -5657,11 +5488,9 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
 
     let _ = swarm.behaviour_mut().kad.bootstrap();
 
-
     let (gossip_unbounded_tx, mut gossip_rx) =
         mpsc::channel::<(String, Vec<u8>)>(GOSSIP_CHANNEL_CAPACITY);
     let _ = GOSSIP_TX.set(gossip_unbounded_tx);
-
 
     let (dht_cmd_tx, mut dht_cmd_rx) = mpsc::channel::<DhtCommand>(10_000);
     let _ = DHT_CMD_TX.set(dht_cmd_tx);
@@ -5703,16 +5532,13 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     kad_discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     kad_discovery.tick().await;
 
-
     let mut peer_seed_bcast = tokio::time::interval(Duration::from_secs(300));
     peer_seed_bcast.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     peer_seed_bcast.tick().await;
 
-
     let mut dht_inbox_poll = tokio::time::interval(Duration::from_secs(30));
     dht_inbox_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     dht_inbox_poll.tick().await; // skip first immediate tick
-
 
     let mut announce_tick = tokio::time::interval(Duration::from_secs(45));
     announce_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -5761,7 +5587,6 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
 
         crate::ledger::reconcile_stake_state();
 
-
         crate::chain_db::restore_nonces_from_db();
 
         {
@@ -5794,7 +5619,6 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                 tracing::info!("Restored in-flight BFT votes from DB");
             }
         }
-
 
         {
             let slashed = crate::chain_db::load_slashed_validators()
@@ -5929,7 +5753,6 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
 
             // ── Relay circuit retry ───────────────────────────────────────────
             _ = peer_seed_bcast.tick() => {
-
                 let peers = load_peer_cache();
                 let multiaddrs: Vec<String> = peers.iter()
                     .filter(|p| !p.endpoint.is_empty())
@@ -5964,7 +5787,6 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                 if DIRECT_PEER_COUNT.load(Ordering::Relaxed) >= MIN_DIRECT_PEERS_RELAY_OPTIONAL
                     && has_circuit_addr(&external_addrs)
                 {
-
                     continue;
                 }
                 if !has_circuit_addr(&external_addrs) {
@@ -5996,7 +5818,6 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                             }
                         }
                     }
-
 
                     for endpoint in get_discovered_relay_nodes() {
                         if let Ok(addr) = endpoint.parse::<Multiaddr>() {
@@ -6149,7 +5970,6 @@ async fn build_swarm(
             )
             .expect("gossipsub::Behaviour");
 
-
             let mut kad_store_cfg = kad::store::MemoryStoreConfig::default();
             kad_store_cfg.max_value_bytes = 4 * 1024 * 1024; // 4 MB
             let store = kad::store::MemoryStore::with_config(peer_id, kad_store_cfg);
@@ -6179,7 +5999,6 @@ async fn build_swarm(
                     if let Some(pid) = peer_id_from_multiaddr(&addr) {
                         kad_behaviour.add_address(&pid, strip_p2p_suffix(&addr));
                     } else {
-
                         if let Ok(pid) = entry.address.parse::<PeerId>() {
                             kad_behaviour.add_address(&pid, addr);
                         }
@@ -6243,7 +6062,6 @@ async fn build_swarm(
         .build();
     Ok(swarm)
 }
-
 
 fn handle_send(
     swarm:         &mut libp2p::Swarm<EgoBehaviour>,
@@ -6313,7 +6131,6 @@ fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
     }).last()
 }
 
-
 fn best_endpoint(external_addrs: &[Multiaddr], peer_id: &PeerId) -> String {
     let pid_str = peer_id.to_string();
 
@@ -6349,7 +6166,6 @@ fn has_circuit_addr(addrs: &[Multiaddr]) -> bool {
     addrs.iter().any(|a| a.to_string().contains("/p2p-circuit"))
 }
 
-
 fn build_circuit_addr(
     relay_base:    &Multiaddr,
     relay_peer_id: &PeerId,
@@ -6359,7 +6175,6 @@ fn build_circuit_addr(
         .parse()
         .ok()
 }
-
 
 fn inject_circuit(
     circuit:        Multiaddr,
@@ -6382,7 +6197,6 @@ fn inject_circuit(
 
     let app_clone = app.cloned();
     tokio::spawn(async move {
-
         tokio::time::sleep(Duration::from_millis(300)).await;
         broadcast_peer_announce(app_clone.as_ref()).await;
         eprintln!("[P2P] Re-announced after relay circuit confirmed");
@@ -6409,7 +6223,6 @@ async fn handle_event(
     pending_dials:      &mut HashMap<PeerId, Vec<oneshot::Sender<Result<PeerId, String>>>>,
 ) {
     match event {
-
         SwarmEvent::ListenerClosed { listener_id, reason, .. } => {
             let is_circuit = circuit_listener.as_ref()
                 .map(|id| *id == listener_id)
@@ -6462,7 +6275,6 @@ async fn handle_event(
                 let circuit_str_clone = circuit_str.clone();
                 match circuit_str_clone.parse::<Multiaddr>() {
                     Ok(circuit_addr) => {
-
                         if circuit_listener.is_some() {
                             eprintln!("[P2P] Relay already reserved — skipping duplicate ConnectionEstablished for {}", peer_id);
                         } else {
@@ -6944,7 +6756,6 @@ async fn handle_event(
                     });
                 }
             } else if topic == "ego-txs-v1" {
-
                 match serde_json::from_slice::<P2PMessage>(&message.data) {
                     Ok(P2PMessage::TxBroadcast { tx, block }) => {
                         let app2 = app.cloned();
@@ -7095,7 +6906,6 @@ async fn handle_event(
                     }
                 }
             } else if topic == "ego-price-v1" {
-
                 if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&message.data) {
                     if let Some(price) = json["price"].as_f64() {
                         let stake = json["stake_weight_uegoc"].as_u64().unwrap_or(0);
@@ -7122,11 +6932,9 @@ async fn handle_event(
                     _ => {}
                 }
             } else if topic == "ego-viewchange-v1" {
-
                 if let Ok(P2PMessage::ViewChange { view, voter, signature, timestamp: _ }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
-
                     if !slashed_validators().contains(&voter) {
                         let app2 = app.cloned();
                         tokio::spawn(async move {
@@ -7154,7 +6962,6 @@ async fn handle_event(
                     }
                 }
             } else if topic == "ego-peers-v1" {
-
                 match serde_json::from_slice::<P2PMessage>(&message.data) {
                     Ok(msg @ P2PMessage::PeerAnnounce { .. }) => {
                         let app2 = app.cloned();
@@ -7164,7 +6971,6 @@ async fn handle_event(
                         handle_validator_leaving(&address, timestamp, &signature);
                     }
                     Ok(P2PMessage::PeerSeedGossip { multiaddrs, known_count }) => {
-
                         let msg_n = PEER_SEED_MSG_COUNT
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         let reset = msg_n % SEED_VOTE_WINDOW == 0;
@@ -7197,7 +7003,6 @@ async fn handle_event(
                             }
                         }
                         if known_count >= 100 {
-
                             static MATURITY_LOGGED: AtomicBool = AtomicBool::new(false);
                             if !MATURITY_LOGGED.swap(true, Ordering::Relaxed) {
                                 tracing::info!("Network maturity reached ({} known peers) — relay is fully optional", known_count);
@@ -7661,10 +7466,8 @@ async fn handle_event(
                     let key_str = String::from_utf8_lossy(rec.record.key.as_ref()).to_string();
 
                     if key_str.starts_with("ego-manifest:") {
-
                         let manifest_cid = key_str.trim_start_matches("ego-manifest:").to_string();
                         if let Ok(manifest) = serde_json::from_slice::<crate::blocks::FileManifest>(&rec.record.value) {
-
                             let _ = crate::blocks::save_manifest(&manifest);
                             eprintln!("[DHT] Manifest {} received from DHT ({} blocks)", &manifest_cid[..16.min(manifest_cid.len())], manifest.blocks.len());
 
@@ -7675,7 +7478,6 @@ async fn handle_event(
                             });
                         }
                     } else if key_str.starts_with("ego-block:") {
-
                         let block_cid = key_str.trim_start_matches("ego-block:").to_string();
                         if !crate::blocks::have_block(&block_cid) {
                             let _ = crate::blocks::save_block(&block_cid, &rec.record.value);
@@ -7687,7 +7489,6 @@ async fn handle_event(
                             });
                         }
                     } else if key_str.starts_with("ego-relay:") {
-
                         let relay_ma = String::from_utf8_lossy(&rec.record.value).to_string();
                         if !relay_ma.is_empty() && relay_ma.contains("/p2p/") {
                             save_dht_record_to_cache(&key_str, &rec.record.value);
@@ -7701,7 +7502,6 @@ async fn handle_event(
                             }
                         }
                     } else if key_str.starts_with("ego-inbox:") {
-
                         let value = rec.record.value.clone();
                         if !value.is_empty() {
                             if let Ok(msg) = serde_json::from_slice::<P2PMessage>(&value) {
@@ -7719,7 +7519,6 @@ async fn handle_event(
                             }
                         }
                     } else {
-
                         if let Ok(peer_info) = serde_json::from_slice::<serde_json::Value>(&rec.record.value) {
                             let endpoint = peer_info["endpoint"].as_str().unwrap_or("");
                             if !endpoint.is_empty() {
@@ -7877,7 +7676,6 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                     }).await;
                 });
             } else if capacity > 0 && used + 10_000_000 < capacity && can_collateral {
-
             let _guard = crate::ledger::TX_MUTEX.lock().await; // This is fine, it's a tokio mutex
             let mut ledger2 = crate::ledger::Ledger::load();
                 // ── Lock collateral on-chain ──────────────────────────────
@@ -8304,7 +8102,6 @@ P2PMessage::ChatMessage { bundle, seq } => {
     match crate::commands::messenger::receive_message_inner(&bundle, seq) {
         Ok((msg, is_new)) => {
             if !is_new {
-
                 return;
             }
             if msg.message_type == "file_bundle" {
@@ -8326,7 +8123,6 @@ P2PMessage::ChatMessage { bundle, seq } => {
                     });
                 }
             } else {
-
                 {
                     let now = chrono::Utc::now().timestamp();
                     crate::app::global_app_state().pending_chat_address.lock().unwrap().replace((msg.from.clone(), now));
@@ -8424,7 +8220,6 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
             handle_block_vote(block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, app.cloned()).await;
         }
 
-
         P2PMessage::BlockFinalized { mut block, transactions, votes, agg_bls_sig, bls_pubkeys } => {
             let block_hash = block.hash.clone();
             let height     = block.height;
@@ -8436,7 +8231,6 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
                 merge_remote_chain_trusted(vec![block], transactions, app).await;
             }
         }
-
 
         P2PMessage::ChainSyncRequest { requester_endpoint, from_height } => {
             if !requester_endpoint.is_empty() && sync_reply_allowed(&requester_endpoint) {
@@ -8490,7 +8284,6 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
         }
 
         P2PMessage::HeaderSyncRequest { from_height, limit } => {
-
             let headers  = crate::chain_db::get_block_headers(from_height, limit.min(10_000));
             let response = P2PMessage::HeaderSyncResponse { headers };
             let ep = get_public_endpoint().await;
@@ -8529,7 +8322,6 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
             merge_remote_chain(blocks, transactions, app).await;
         }
 
-
         P2PMessage::ShardBlockQuery { block_height, requester_address: _, requester_endpoint } => {
             let chain = load_chain();
             let map   = crate::sharding::load_shard_map();
@@ -8545,9 +8337,7 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
             merge_remote_chain(blocks, transactions, app).await;
         }
 
-
         P2PMessage::ShardVacancyNotice { shard_id, current_holders } => {
-
             if current_holders < crate::sharding::REPLICATION_FACTOR {
                 let my_addr = crate::ledger::Ledger::load().address;
                 if my_addr.is_empty() { return; }
@@ -8567,7 +8357,6 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
         }
 
         P2PMessage::ShardVolunteer { shard_id, volunteer_address, volunteer_endpoint } => {
-
             let my_addr = crate::ledger::Ledger::load().address;
             if my_addr.is_empty() { return; }
             let map = crate::sharding::load_shard_map();
@@ -8815,7 +8604,6 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
                     f.status = "Received".to_string();
                 }
             } else {
-
                 let now = chrono::Utc::now().timestamp();
                 let my_addr = ledger.address.clone();
                 ledger.stored_files.push(crate::ledger::StoredFile {
@@ -8881,7 +8669,6 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
             match serde_json::from_str::<crate::blocks::FileManifest>(&manifest_json) {
                 Err(e) => eprintln!("[Blocks] ManifestData parse error: {}", e),
                 Ok(manifest) => {
-
                     let _ = crate::blocks::save_manifest(&manifest);
                     let blocks_total = manifest.blocks.len() as u32;
 
@@ -8965,7 +8752,6 @@ P2PMessage::FileData { cid, enc_data_b64, file_name, key_nonce_hex } => {
                 match crate::blocks::load_block(&block_cid) {
                     Err(e) => eprintln!("[Blocks] BlockRequest: load failed: {}", e),
                     Ok(enc_bytes) => {
-
                         let enc_b64    = base64::engine::general_purpose::STANDARD.encode(&enc_bytes);
                         let my_addr    = crate::ledger::Ledger::load().address;
                         let ep         = requester_endpoint.clone();
@@ -9416,7 +9202,6 @@ async fn process_received_manifest(manifest_cid: &str, app: Option<&tauri::AppHa
     let my_ep   = get_public_endpoint().await;
     
     for block_cid in crate::blocks::missing_blocks(&manifest) {
-
         if let Some(tx) = DHT_CMD_TX.get() {
             let _ = tx.send(DhtCommand::GetPeers { key: format!("ego-block:{}", block_cid) });
         }
@@ -9621,7 +9406,6 @@ fn execute_contract_txs(chain: &crate::ledger::SharedChain, txs: &[crate::ledger
                 }
             }
             "governance" => {
-
                 handle_governance_tx(&tx);
             }
             _ => {}
@@ -10153,7 +9937,6 @@ async fn merge_remote_chain_inner(
     }
 }
 
-
 /// Oracle-backed peer rendezvous. Registers THIS node's dialable relayed
 /// endpoint with the oracle and dials every other registered node, so two
 /// NAT'd machines behind the same relay actually find and connect to each
@@ -10229,7 +10012,6 @@ pub async fn oracle_peer_discovery_tick() {
         eprintln!("[Oracle] peer discovery: dialed {} peer(s) from oracle registry", dialed);
     }
 }
-
 
 pub(crate) fn get_ed25519_seed() -> Option<[u8; 32]> {
     if let Ok(cache) = SEED_CACHE.read() {
@@ -10508,7 +10290,6 @@ async fn handle_block_proposal(
         return;
     }
 
-
     let auth = verify_block_proposal_auth(&block, &proposer, &signature, &vrf_ticket);
     if auth != ProposalAuth::Valid {
         // Only ban on cryptographic / structural failure. VRF disqualification
@@ -10520,7 +10301,6 @@ async fn handle_block_proposal(
         }
         return;
     }
-
 
     let vrf_in  = crate::bft_committee::vrf_input(&block.prev_hash, block.height, crate::bft_committee::VRF_ROLE_COMMITTEE);
     let ticket  = crate::bft_committee::sign_vrf_ticket(&seed_arr, &vrf_in);
@@ -10592,7 +10372,6 @@ async fn handle_block_proposal(
         }
     }
 
-
     if let Err(reason) = crate::chain_db::validate_proposal_block(&block, &transactions) {
         eprintln!(
             "[BFT] Committee: rejected proposal #{} from {} - block/tx integrity failed: {}",
@@ -10614,7 +10393,6 @@ async fn handle_block_proposal(
             return;
         }
     }
-
 
     let tx_fees_sum: u64 = transactions.iter()
         .filter(|t| Some(&t.hash) != block.coinbase_tx.as_ref()
@@ -10696,7 +10474,6 @@ async fn handle_block_proposal(
         eprintln!("[BFT] Not voting proposal #{} — locked on a decided/higher-view block (anti-equivocation)", block.height);
         return;
     }
-
 
     pending_proposals().insert(block.height, proposer.clone());
 
@@ -11139,7 +10916,6 @@ async fn handle_block_vote(
         let _ = h.emit_all("ego://chain-updated", ());
     }
 }
-
 
 fn process_inbound_qc_finalization(
     block_hash:  &str,
@@ -11655,9 +11431,6 @@ pub async fn propose_block_as_leader() {
         Err(_) => return,
     };
 
-    // A node told to misbehave breaks its own proposal here, after it has been
-    // built honestly, so the corruption is exactly the thing under test and
-    // nothing upstream has to know about it.
     let (block, stamped) = {
         let mut b = block;
         let mut t = stamped;
@@ -11854,7 +11627,6 @@ pub fn try_proactive_proposal() -> std::pin::Pin<Box<dyn std::future::Future<Out
         }
     })
 }
-
 
 /// Like `propose_block_as_leader` but skips the VRF qualification check.
 /// Called by the deterministic liveness fallback after FALLBACK_AFTER_EMPTY_VIEWS
@@ -12151,7 +11923,6 @@ pub fn request_pipeline_next() {
 }
 
 pub async fn run_view_change_monitor() {
-
     tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 
     touch_proposal_timestamp();
@@ -13189,7 +12960,6 @@ fn ensure_firewall_rule() {
 #[cfg(not(target_os = "windows"))]
 fn ensure_firewall_rule() {}
 
-
 pub async fn run_porep_challenge_loop() {
     // Wait for p2p to fully start before issuing challenges.
     tokio::time::sleep(Duration::from_secs(60)).await;
@@ -13247,7 +13017,6 @@ pub async fn run_porep_challenge_loop() {
             }
         }
 
-
         let ledger = crate::ledger::Ledger::load();
         let mut challenged = 0usize;
 
@@ -13261,7 +13030,6 @@ pub async fn run_porep_challenge_loop() {
                 Err(_) => continue,
             };
             if manifest.blocks.is_empty() { continue; }
-
 
             let prover_idx  = round_counter as usize % file.replica_peers.len();
             let prover       = &file.replica_peers[prover_idx];
@@ -13277,17 +13045,14 @@ pub async fn run_porep_challenge_loop() {
                 Err(_) => continue,
             };
 
-
             let nonce_input = format!("porep-challenge:{}:{}:{}:{}", prover, block_cid, now_ms, round_counter);
             let nonce_bytes = *blake3::hash(nonce_input.as_bytes()).as_bytes();
             let nonce_hex   = hex::encode(&nonce_bytes);
-
 
             let mut hasher = blake3::Hasher::new();
             hasher.update(&nonce_bytes);
             hasher.update(&enc_block);
             let expected_hash = hasher.finalize().to_hex().to_string();
-
 
             let challenge_key = format!("{}:{}", block_cid, nonce_hex);
             outstanding_challenges().insert(challenge_key, OutstandingChallenge {

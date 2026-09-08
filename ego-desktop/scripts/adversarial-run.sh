@@ -1,27 +1,4 @@
 #!/usr/bin/env bash
-#
-# Run a small testnet with one deliberately dishonest validator in it.
-#
-# Every defence in consensus is written against an attacker nobody has ever
-# run. This starts N honest nodes and one that cheats in a named way, then
-# checks the two things that matter: the honest nodes refuse what the attacker
-# sends, and they keep making blocks without it.
-#
-#   ./adversarial-run.sh                        # sweep every behaviour
-#   ./adversarial-run.sh tamper-merkle-root     # just one
-#   HONEST=4 SECONDS=180 ./adversarial-run.sh   # bigger, longer
-#
-# Behaviours: tamper-merkle-root, inflate-coinbase, forge-system-transfer,
-# forge-signature, equivocate, double-vote, withhold-votes, malformed-gossip.
-#
-# Each node gets its own data directory under a scratch root, so this never
-# touches a real wallet or chain. The scratch root is wiped at the start of
-# every run.
-#
-# What a pass means: the honest nodes logged a rejection of the attacker's
-# work, and their chain height rose while the attacker was running. What a
-# failure means: either they accepted something they should not have, or they
-# stopped making progress because of it. Both are findings.
 
 set -uo pipefail
 
@@ -75,14 +52,13 @@ stop_all() {
 }
 trap 'stop_all; exit 130' INT TERM
 
-# Start one node. $1 is its name, $2 its EGO_ADVERSARY value (empty = honest).
 start_node() {
   local name="$1" adversary="${2:-}" dir="$SCRATCH/$name"
   mkdir -p "$dir"
   (
     export EGO_DATA_DIR="$dir"
-    export EGO_INVARIANTS=strict      # a violation must stop the node loudly
-    export EGO_SHIELDED_POOL_HEIGHT=0 # exercise the shielded rules too
+    export EGO_INVARIANTS=strict
+    export EGO_SHIELDED_POOL_HEIGHT=0
     export RUST_LOG="${RUST_LOG:-ego_desktop=info,warn}"
     [ -n "$adversary" ] && export EGO_ADVERSARY="$adversary"
     exec "$BIN" >"$dir/node.log" 2>&1
@@ -90,7 +66,6 @@ start_node() {
   PIDS+=($!)
 }
 
-# The height an honest node reached, read back from its log.
 height_of() {
   grep -oE 'block #[0-9]+' "$1" 2>/dev/null | grep -oE '[0-9]+' | sort -n | tail -1
 }
@@ -107,7 +82,6 @@ for behaviour in "${BEHAVIOURS[@]}"; do
   done
   start_node "attacker" "$behaviour"
 
-  # Let them find each other and produce blocks.
   for _ in $(seq 1 "$SECONDS_PER_CASE"); do sleep 1; done
 
   before_stop_heights=()
@@ -116,7 +90,6 @@ for behaviour in "${BEHAVIOURS[@]}"; do
   done
   stop_all
 
-  # 1. Did any honest node accept something it should not have?
   violated=0
   for i in $(seq 1 "$HONEST"); do
     if grep -q "Invariant. VIOLATED" "$SCRATCH/honest$i/node.log" 2>/dev/null; then
@@ -126,9 +99,6 @@ for behaviour in "${BEHAVIOURS[@]}"; do
     fi
   done
 
-  # 2. Did they refuse the attacker's work? Withholding votes and malformed
-  #    gossip produce no rejection line by design, so only the behaviours that
-  #    actually send something invalid are required to be logged.
   rejected=0
   case "$behaviour" in
     withhold-votes|malformed-gossip) rejected=1 ;;
@@ -143,7 +113,6 @@ for behaviour in "${BEHAVIOURS[@]}"; do
   esac
   [ "$rejected" -eq 1 ] || echo "  FAIL  no honest node logged a rejection of the attacker's work"
 
-  # 3. Did the honest majority keep making progress?
   progressed=0
   for h in "${before_stop_heights[@]}"; do
     if [ -n "$h" ] && [ "$h" -gt 0 ] 2>/dev/null; then

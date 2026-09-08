@@ -7,17 +7,6 @@ use libp2p::swarm::{
 use libp2p::PeerId;
 use std::task::{Context, Poll};
 
-/// Refuses every connection that leaves the local network while offline mode is on.
-///
-/// This lives in the behaviour rather than at the call sites because libp2p dials
-/// on its own account. Kademlia dials peers it learns from identify, AutoNAT
-/// probes, DCUtR punches holes, the relay client makes reservations. None of
-/// those go through our own send or dial paths, so gating those paths left the
-/// node holding live connections to public addresses with EGO_OFFLINE=1 set.
-///
-/// `handle_pending_outbound_connection` is the hook libp2p's own allow/block list
-/// uses. Denying here stops the dial before a packet is sent, which matters:
-/// on a monitored connection the SYN alone names the destination.
 #[derive(Default)]
 pub struct OfflineGuard;
 

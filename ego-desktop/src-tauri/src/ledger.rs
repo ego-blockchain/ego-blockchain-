@@ -68,7 +68,6 @@ pub fn storage_dir() -> PathBuf {
     base
 }
 
-
 pub fn seed_path() -> PathBuf {
     data_dir().join("wallet.seed")
 }
@@ -534,16 +533,6 @@ pub struct LedgerTx {
     #[serde(default)]
     pub signed_summary: String,
 
-    /// How this transaction travelled: "" for the internet, otherwise the name of
-    /// the sideband transport that carried it, such as "spool" or a radio bridge.
-    ///
-    /// Deliberately outside the signature. tx_signing_bytes_v2 commits to named
-    /// fields and the block merkle root commits to tx hashes, so this can never
-    /// affect a hash, a signature or consensus. That also means it is advisory
-    /// rather than proof: it says how the transaction reached the node that
-    /// recorded it, and a dishonest relay could set or clear it. It exists so a
-    /// sender and receiver can see that a payment crossed a radio link rather
-    /// than the internet, not as evidence anyone should rely on.
     #[serde(default)]
     pub transport: String,
 
@@ -1124,7 +1113,6 @@ pub fn save_chain(chain: &SharedChain) -> Result<(), String> {
 }
 
 impl SharedChain {
-
     pub fn balance_of(&self, address: &str) -> u64 {
         crate::chain_db::balance_of(address)
     }
@@ -1206,7 +1194,6 @@ impl SharedChain {
 
         let tx_count = txs.len() as u32;
         for tx in txs {
-
             if let Some(existing) = self.transactions.iter_mut().find(|t| t.hash == tx.hash) {
                 existing.status       = "Confirmed".to_string();
                 existing.block_height = Some(height);
@@ -1560,13 +1547,9 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
         crate::chain_db::FEATURE_DILITHIUM_REQUIRED,
     );
 
-    // A withdrawal from the shielded pool is authorised by its proof, not a
-    // signature, so it is checked in full here and nowhere below applies.
     if tx.from == crate::shielded_chain::SHIELDED_POOL_ADDR {
         return crate::shielded_chain::verify_incoming_unshield(tx);
     }
-    // A deposit is an ordinary signed transfer with a commitment in the memo;
-    // the memo is checked here and the signature by the rules below.
     if tx.to == crate::shielded_chain::SHIELDED_POOL_ADDR {
         crate::shielded_chain::verify_incoming_deposit(tx)?;
     }
@@ -1620,20 +1603,6 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
             .map_err(|_| "equivocation_proof: Ed25519 sig invalid".to_string())?;
         return Ok(());
     }
-
-    // A large-transfer gate used to sit here and it was removed, deliberately.
-    //
-    // It rejected an is_private transfer over 50,000 EGOC unless compliance_proof
-    // was non-empty. Two things were wrong with that. compliance_proof is never
-    // set anywhere in this codebase and never verified anywhere either, so it
-    // proved nothing and any string would have satisfied it. And is_private is
-    // set automatically once an amount reaches the same 50,000 threshold, so the
-    // two rules met and rejected every transfer above it, telling the sender to
-    // turn off a "hide option" the code had switched on for them.
-    //
-    // Anyone wanting a real threshold control should build one that is actually
-    // checked. A rule that enforces nothing while quietly capping transfers is
-    // worse than no rule.
 
     // ── Fee floor ─────────────────────────────────────────────────────────
     // Reject zero-fee transactions from accounts that haven't staked.

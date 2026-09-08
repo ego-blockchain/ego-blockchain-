@@ -12,8 +12,6 @@ pub const SHARD_COUNT: u32   = 256;
 pub const BATCH_SIZE:  usize = 100_000;
 pub const MAX_BLOCK_TXS: usize = 500_000;
 
-
-
 pub fn min_validators_for_finality() -> usize {
     std::env::var("EGO_MIN_VALIDATORS")
         .ok()
@@ -29,9 +27,7 @@ fn allow_pre_bft_solo() -> bool {
         .unwrap_or(false)
 }
 
-
 pub const BATCH_WINDOW_MS: u64 = 1_000;
-
 
 pub const BATCH_INTERVAL_MS: u64 = BATCH_WINDOW_MS;
 
@@ -39,12 +35,9 @@ pub const TX_THRESHOLD: u64 = 50;
 
 pub const MAX_BLOCK_INTERVAL_S: u64 = 5;
 
-
 pub const EMPTY_BLOCK_INTERVAL_S: u64 = 60;
 
-
 pub const MAX_MEMPOOL_SIZE: usize = 2_000_000;
-
 
 pub const MAX_TX_AGE_SECS: i64 = 1800;
 
@@ -103,7 +96,6 @@ impl ShardedMempool {
             tx_notify:     Arc::new(Notify::new()),
         })
     }
-
 
     /// Record that a transaction reached us over a sideband transport rather
     /// than the internet. Such a transaction may legitimately be hours old by
@@ -275,11 +267,6 @@ impl ShardedMempool {
                     return Err("invalid unstake request".to_string());
                 }
             } else {
-            // What each pending tx actually takes out of this address. A
-            // shielded withdrawal takes the note and nothing more: its fee is
-            // withheld from the recipient rather than added to the amount, so
-            // counting it again would refuse the last honest withdrawal from a
-            // nearly empty pool.
             fn outflow_of(t: &LedgerTx) -> u64 {
                 if t.tx_type == "unstake" && t.to == crate::chain_db::STAKING_ADDR {
                     t.fee_uegoc
@@ -304,9 +291,6 @@ impl ShardedMempool {
             }
         }
 
-        // Two withdrawals of one note cannot both land, and a block holding
-        // both is invalid, so admit only the first and let its proposer skip
-        // the question entirely.
         if let Some(nf) = crate::shielded_chain::unshield_nullifier(&tx) {
             if s.iter().any(|t| crate::shielded_chain::unshield_nullifier(t) == Some(nf)) {
                 self.seen_hashes[shard].lock().expect("lock poisoned").remove(&tx.hash);
@@ -384,7 +368,6 @@ impl ShardedMempool {
         
         Ok(())
     }
-
 
     pub fn drain_shard(&self, shard_id: u32) -> Vec<LedgerTx> {
         let mut expired_hashes: Vec<String> = Vec::new();

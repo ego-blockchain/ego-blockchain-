@@ -1,46 +1,10 @@
-//! Randomised robustness testing of everything that parses bytes a stranger
-//! chose.
-//!
-//! # The bar
-//!
-//! Not "produces the right answer". Malformed input has no right answer, and
-//! every decoder here is expected to reject most of what it is given. The bar
-//! is that it must **reject rather than panic**. A validator is the whole
-//! security model, and a panic on attacker-controlled bytes takes it off the
-//! network, which is a denial of service that anyone can perform for the cost
-//! of one message. Every one of these paths is reachable from a peer or a
-//! radio before any signature has been checked.
-//!
-//! # What this is and is not
-//!
-//! This is randomised testing with structure-aware mutation, not a
-//! coverage-guided fuzzer. A real fuzzer watches which branches an input
-//! reaches and steers towards new ones, and would find things this does not.
-//! What this does have is that it runs on stable Rust as part of the ordinary
-//! test suite, on every machine, forever, rather than only when somebody
-//! remembers to start a fuzzing job. The generators below deliberately mix
-//! pure noise, near-miss valid encodings and mutated valid values, because
-//! pure noise is rejected at the first byte and never reaches the interesting
-//! code.
-//!
-//! Each case runs inside `catch_unwind`, so a panic is reported as a failure
-//! with the input that caused it rather than taking the test binary down.
-
 #![cfg(test)]
 
 use rand::rngs::StdRng;
 use rand::{Rng, RngCore, SeedableRng};
 
-/// Cases per target. Enough to be worth running on every build and quick
-/// enough that nobody is tempted to skip it.
 const CASES: usize = 4_000;
 
-/// Silences panic output for as long as it lives, and puts the previous hook
-/// back however the scope ends.
-///
-/// Restoring by hand is a trap: if anything panics before the restore line,
-/// the silent hook survives and the real failure prints nothing at all, which
-/// is exactly what happened the first time this file was written.
 struct QuietPanics(Option<Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>>);
 
 impl QuietPanics {
@@ -59,11 +23,6 @@ impl Drop for QuietPanics {
     }
 }
 
-/// Run `f` over many generated inputs and fail with the offending bytes.
-///
-/// The panic hook is silenced for the duration: a decoder that panics is the
-/// finding, and the default hook would bury it in backtraces from thousands of
-/// deliberately malformed cases.
 fn hammer<F>(name: &str, mut gen: impl FnMut(&mut StdRng) -> Vec<u8>, f: F)
 where
     F: Fn(&[u8]) + std::panic::RefUnwindSafe,
@@ -89,8 +48,6 @@ where
     }
 }
 
-/// Pure noise. Rejected early, but it is the case that catches a length field
-/// read before it is bounds-checked.
 fn noise(rng: &mut StdRng) -> Vec<u8> {
     let len = rng.gen_range(0..512);
     let mut v = vec![0u8; len];
@@ -98,13 +55,9 @@ fn noise(rng: &mut StdRng) -> Vec<u8> {
     v
 }
 
-/// Flip bytes in something that was valid. This is where the interesting
-/// cases are: the input gets far enough in to reach real logic.
 fn mutate(rng: &mut StdRng, valid: &[u8]) -> Vec<u8> {
     let mut v = valid.to_vec();
     for _ in 0..rng.gen_range(1..=4) {
-        // An earlier operation can have truncated the buffer to nothing, and
-        // every operation below indexes into it.
         if v.is_empty() {
             v.push(rng.gen());
             continue;
@@ -131,8 +84,6 @@ fn mutate(rng: &mut StdRng, valid: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Text that looks like JSON without being any particular message. Exercises
-/// the serde layer past its first character.
 fn junk_json(rng: &mut StdRng) -> Vec<u8> {
     const PIECES: [&str; 14] = [
         "{", "}", "[", "]", ":", ",", "\"a\"", "null", "true", "-1",
@@ -154,16 +105,12 @@ fn mixed(rng: &mut StdRng, valid: &[u8]) -> Vec<u8> {
     }
 }
 
-/// A harness that cannot fail is worse than no harness, because it reads as
-/// evidence. This feeds it a target that always panics and requires it to say
-/// so.
 #[test]
 #[should_panic(expected = "panicked on")]
 fn the_harness_reports_a_panic_in_the_target() {
     hammer("canary", noise, |_| panic!("deliberate"));
 }
 
-/// And the reverse: a target that never panics must not be reported.
 #[test]
 fn the_harness_stays_quiet_when_nothing_panics() {
     hammer("canary", noise, |bytes| {
@@ -171,10 +118,6 @@ fn the_harness_stays_quiet_when_nothing_panics() {
     });
 }
 
-// ── Targets ──────────────────────────────────────────────────────────────
-
-/// Gossip messages. Reachable from any peer on the network, decoded before
-/// anything about the sender has been established.
 #[test]
 fn the_gossip_decoder_rejects_hostile_bytes_without_panicking() {
     let sample = serde_json::to_vec(&crate::ledger::LedgerTx {
@@ -190,10 +133,6 @@ fn the_gossip_decoder_rejects_hostile_bytes_without_panicking() {
     });
 }
 
-/// A transaction as it arrives from a peer, decoded and then put through the
-/// full verification path. Verification touches hex decoding, address
-/// derivation, signature parsing and the fee and nonce rules, all on values
-/// the sender chose.
 #[test]
 fn transaction_verification_rejects_hostile_bytes_without_panicking() {
     let sample = serde_json::to_vec(&crate::ledger::LedgerTx {
@@ -217,10 +156,6 @@ fn transaction_verification_rejects_hostile_bytes_without_panicking() {
     });
 }
 
-/// A shielded withdrawal body, including the compressed Groth16 proof. The
-/// proof decoder is arkworks reading attacker-supplied curve points, which is
-/// exactly the kind of parser that historically panics on a malformed field
-/// element rather than returning an error.
 #[test]
 fn the_unshield_body_and_proof_reject_hostile_bytes_without_panicking() {
     let sample = crate::shielded_chain::UnshieldBody {
@@ -244,9 +179,6 @@ fn the_unshield_body_and_proof_reject_hostile_bytes_without_panicking() {
     });
 }
 
-/// The proof decoder on its own, fed raw bytes rather than reaching it through
-/// the JSON. Compressed points carry a sign bit and an x coordinate that may
-/// not be on the curve, and that path must return an error.
 #[test]
 fn the_proof_decoder_rejects_hostile_bytes_without_panicking() {
     hammer("proof decoder", noise, |bytes| {
@@ -255,8 +187,6 @@ fn the_proof_decoder_rejects_hostile_bytes_without_panicking() {
     });
 }
 
-/// A shield memo, which is the one place a deposit lets the sender choose
-/// bytes that become part of consensus state.
 #[test]
 fn the_shield_memo_parser_rejects_hostile_text_without_panicking() {
     hammer("shield memo", |rng| {
@@ -272,9 +202,6 @@ fn the_shield_memo_parser_rejects_hostile_text_without_panicking() {
     });
 }
 
-/// Sideband frames arrive over a radio with no authentication whatsoever.
-/// Anyone within range can transmit these, so reassembly has to survive
-/// nonsense sequence numbers, totals and payload lengths.
 #[test]
 fn sideband_frame_reassembly_rejects_hostile_frames_without_panicking() {
     let sample = serde_json::to_vec(&crate::sideband::Frame {
@@ -295,10 +222,6 @@ fn sideband_frame_reassembly_rejects_hostile_frames_without_panicking() {
     });
 }
 
-/// Frames whose header fields are hostile in a targeted way rather than
-/// randomly: a total of zero, a sequence past the total, a payload far larger
-/// than any transport allows. These are the shapes that turn into an
-/// allocation or an index if reassembly trusts them.
 #[test]
 fn sideband_reassembly_survives_impossible_headers() {
     let mut rng = StdRng::from_entropy();
@@ -335,7 +258,6 @@ fn sideband_reassembly_survives_impossible_headers() {
     }
 }
 
-/// The contact card and message formats the messenger accepts from strangers.
 #[test]
 fn the_share_formats_reject_hostile_text_without_panicking() {
     hammer("share formats", |rng| {
@@ -348,8 +270,6 @@ fn the_share_formats_reject_hostile_text_without_panicking() {
         s.into_bytes()
     }, |bytes| {
         let Ok(text) = std::str::from_utf8(bytes) else { return };
-        // Splitting and base64/hex decoding are what these formats do; the
-        // fields are attacker-chosen and of attacker-chosen count.
         let parts: Vec<&str> = text.split(':').collect();
         for p in &parts {
             let _ = hex::decode(p);
