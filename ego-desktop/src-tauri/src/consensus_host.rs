@@ -291,4 +291,70 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn peer_discovery_order_cannot_change_the_committee() {
+        let kps: Vec<KeyPair> = (0..5).map(|_| KeyPair::generate()).collect();
+        let pairs: Vec<(String, Address)> = kps.iter().enumerate()
+            .map(|(i, k)| (format!("egot1node{i:02}"), consensus_address(&k.dilithium_public_key())))
+            .collect();
+
+        let (baseline, _) = build_validator_set(&pairs);
+
+        let mut rotated = pairs.clone();
+        rotated.rotate_left(3);
+        let (from_rotated, _) = build_validator_set(&rotated);
+
+        let mut reversed = pairs.clone();
+        reversed.reverse();
+        let (from_reversed, _) = build_validator_set(&reversed);
+
+        assert_eq!(baseline, from_rotated, "discovery order must not reorder the committee");
+        assert_eq!(baseline, from_reversed, "discovery order must not reorder the committee");
+    }
+
+    fn leader_at(set: &[Address], height: u64, round: u64) -> Address {
+        set[((height + round) as usize) % set.len()].clone()
+    }
+
+    #[test]
+    fn a_view_change_moves_the_leader() {
+        let kps: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate()).collect();
+        let set: Vec<Address> = kps.iter().map(|k| consensus_address(&k.dilithium_public_key())).collect();
+
+        let height = 29_124u64;
+        let first = leader_at(&set, height, 0);
+        for round in 1..set.len() as u64 {
+            assert_ne!(
+                leader_at(&set, height, round), first,
+                "round {round} re-elected the leader that just failed — view changes cannot recover",
+            );
+        }
+        assert_eq!(leader_at(&set, height, set.len() as u64), first, "the schedule must wrap");
+    }
+
+    #[test]
+    fn every_round_is_reachable_by_some_validator() {
+        let kps: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate()).collect();
+        let set: Vec<Address> = kps.iter().map(|k| consensus_address(&k.dilithium_public_key())).collect();
+        let height = 100u64;
+        let elected: std::collections::HashSet<Address> =
+            (0..set.len() as u64).map(|r| leader_at(&set, height, r)).collect();
+        assert_eq!(elected.len(), set.len(), "consecutive rounds must reach every validator exactly once");
+    }
+
+    #[test]
+    fn a_committee_that_differs_by_one_member_desynchronises_the_schedule() {
+        let kps: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate()).collect();
+        let full: Vec<Address> = kps.iter().map(|k| consensus_address(&k.dilithium_public_key())).collect();
+        let short: Vec<Address> = full.iter().take(3).cloned().collect();
+
+        let disagreements = (0..40u64)
+            .filter(|h| leader_at(&full, *h, 0) != leader_at(&short, *h, 0))
+            .count();
+        assert!(
+            disagreements > 0,
+            "this test documents WHY the committee must come from committed chain state:              a set that differs by one member elects a different proposer and every              proposal is rejected as an unexpected proposer",
+        );
+    }
 }

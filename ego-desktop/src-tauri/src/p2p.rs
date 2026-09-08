@@ -13354,6 +13354,42 @@ mod proposer_election_tests {
         assert!(PROPOSER_ESCAPE_ROUND <= 16, "escape takes too long to reach");
         assert!(PROPOSER_ESCAPE_ROUND >= 2, "escaping immediately defeats the narrowing");
     }
+
+    fn quorum_of(n: usize) -> usize { (2 * n) / 3 + 1 }
+
+    #[test]
+    fn a_committee_drawn_from_the_whole_registry_would_be_unreachable() {
+        let all = registry(9);
+        assert!(quorum_of(9) > 2, "this test is meaningless if quorum were already reachable");
+
+        let recent = alive(&["egot1validator0000", "egot1validator0001"]);
+        let seated = narrow_to_live(all, &recent, 0, 2);
+
+        assert_eq!(seated.len(), 2, "the committee must seat only validators the chain has seen produce");
+        assert!(
+            quorum_of(seated.len()) <= seated.len(),
+            "quorum {} exceeds the seated committee of {}",
+            quorum_of(seated.len()), seated.len(),
+        );
+    }
+
+    #[test]
+    fn narrowing_is_computed_only_from_committed_state() {
+        let all = registry(12);
+        let recent = alive(&["egot1validator0003", "egot1validator0008"]);
+        let node_a = narrow_to_live(all.clone(), &recent, 0, 2);
+        let node_b = narrow_to_live(all, &recent, 0, 2);
+        assert_eq!(node_a, node_b);
+        assert_eq!(node_a.len(), 2);
+    }
+
+    #[test]
+    fn an_empty_recent_set_falls_back_rather_than_seating_nobody() {
+        let all = registry(5);
+        let seated = narrow_to_live(all, &alive(&[]), 0, 2);
+        assert!(!seated.is_empty(), "an empty committee has no proposer schedule at all");
+        assert_eq!(seated.len(), 5, "with nobody proven alive the full registry is the safe fallback");
+    }
 }
 
 #[cfg(test)]
