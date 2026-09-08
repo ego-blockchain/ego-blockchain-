@@ -22,7 +22,7 @@ pub const DOMAIN_NULLIFIER: u64 = 2;
 pub const DOMAIN_LEAF: u64 = 3;
 pub const DOMAIN_BINDING: u64 = 4;
 
-pub const SECRET_ELEMS: usize = 4;
+pub const SECRET_ELEMS: usize = 3;
 pub const SECRET_BITS_PER_ELEM: u32 = 63;
 
 pub fn digest_to_bytes(d: &Digest) -> [u8; DIGEST_BYTES] {
@@ -46,6 +46,8 @@ pub fn digest_from_bytes(bytes: &[u8; DIGEST_BYTES]) -> Option<Digest> {
     }
     Some(Digest::new(elems))
 }
+
+pub const SECRET_BYTES_USED: usize = SECRET_ELEMS * 8;
 
 pub fn secret_to_elems(bytes: &[u8; 32]) -> [Elem; SECRET_ELEMS] {
     let mut out = [BaseElement::ZERO; SECRET_ELEMS];

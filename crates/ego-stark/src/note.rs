@@ -33,27 +33,23 @@ impl Note {
         value_to_elem(self.value_uegoc)
     }
 
-    pub fn witness(&self) -> Result<(Elem, [Elem; 4], [Elem; 4]), NoteError> {
-        Ok((
-            self.value_elem()?,
-            secret_to_elems(&self.owner_secret),
-            secret_to_elems(&self.rho),
-        ))
+    pub fn witness(&self) -> ([Elem; crate::SECRET_ELEMS], [Elem; crate::SECRET_ELEMS]) {
+        (secret_to_elems(&self.owner_secret), secret_to_elems(&self.rho))
     }
 
     pub fn commitment(&self) -> Result<Digest, NoteError> {
-        let (value, secret, rho) = self.witness()?;
-        let mut inputs = Vec::with_capacity(9);
-        inputs.push(value);
+        let (secret, rho) = self.witness();
+        let mut inputs = Vec::with_capacity(2 * crate::SECRET_ELEMS);
         inputs.extend_from_slice(&secret);
         inputs.extend_from_slice(&rho);
         Ok(hash_with_domain(DOMAIN_COMMITMENT, &inputs))
     }
 
     pub fn nullifier(&self) -> Digest {
-        let mut inputs = Vec::with_capacity(8);
-        inputs.extend_from_slice(&secret_to_elems(&self.owner_secret));
-        inputs.extend_from_slice(&secret_to_elems(&self.rho));
+        let (secret, rho) = self.witness();
+        let mut inputs = Vec::with_capacity(2 * crate::SECRET_ELEMS);
+        inputs.extend_from_slice(&secret);
+        inputs.extend_from_slice(&rho);
         hash_with_domain(DOMAIN_NULLIFIER, &inputs)
     }
 
@@ -100,10 +96,23 @@ mod tests {
     }
 
     #[test]
-    fn a_commitment_reveals_neither_value_nor_owner() {
+    fn a_commitment_hides_its_owner() {
         assert_ne!(note(100, 1, 1).commitment(), note(100, 2, 1).commitment());
         assert_ne!(note(100, 1, 1).commitment(), note(100, 1, 2).commitment());
-        assert_ne!(note(100, 1, 1).commitment(), note(200, 1, 1).commitment());
+    }
+
+    #[test]
+    fn the_commitment_does_not_carry_the_value_but_the_leaf_does() {
+        assert_eq!(
+            note(100, 1, 1).commitment(),
+            note(200, 1, 1).commitment(),
+            "the depositor publishes this before the chain knows the amount"
+        );
+        assert_ne!(
+            note(100, 1, 1).leaf(),
+            note(200, 1, 1).leaf(),
+            "the amount is bound where the chain can build it: in the leaf"
+        );
     }
 
     #[test]
@@ -141,7 +150,28 @@ mod tests {
         assert_eq!(value_to_elem(MAX_NOTE_VALUE + 1), Err(NoteError::ValueOutOfRange));
         assert_eq!(value_to_elem(u64::MAX), Err(NoteError::ValueOutOfRange));
         let big = Note { value_uegoc: u64::MAX, owner_secret: [1; 32], rho: [1; 32] };
-        assert_eq!(big.commitment(), Err(NoteError::ValueOutOfRange));
+        assert_eq!(big.leaf(), Err(NoteError::ValueOutOfRange));
+        assert_eq!(leaf_for(&big.commitment().unwrap(), u64::MAX), Err(NoteError::ValueOutOfRange));
+    }
+
+    /// Every hash the note layer performs must avoid an input length of eight,
+    /// because Rescue's merge is exactly hash_elements over eight and a node
+    /// hash would then be indistinguishable from a note hash.
+    #[test]
+    fn no_note_hash_absorbs_exactly_eight_elements() {
+        let commitment_inputs = 1 + 2 * crate::SECRET_ELEMS;
+        let nullifier_inputs = 1 + 2 * crate::SECRET_ELEMS;
+        let leaf_inputs = 1 + crate::DIGEST_ELEMS + 1;
+        let binding_inputs = 1 + crate::SECRET_ELEMS + 1;
+        for (what, n) in [
+            ("commitment", commitment_inputs),
+            ("nullifier", nullifier_inputs),
+            ("leaf", leaf_inputs),
+            ("binding", binding_inputs),
+        ] {
+            assert_ne!(n, 8, "{what} absorbs eight elements, which is a node hash");
+            assert!(n <= 8, "{what} absorbs {n}, which costs a second permutation");
+        }
     }
 
     #[test]
