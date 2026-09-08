@@ -664,6 +664,8 @@ const WalletPage: React.FC = () => {
     return ready.find(n => n.value_uegoc === amountUegoc) ?? null;
   }
 
+  const shieldReady = Boolean(shielded?.enabled && shielded?.active);
+
   async function submitTx() {
     if (!sendForm.to || !sendForm.amount) return;
     const amount  = Math.floor(parseFloat(sendForm.amount) * 1_000_000);
@@ -3345,7 +3347,7 @@ const WalletPage: React.FC = () => {
                       for {sideband?.max_age_hours ?? 24} hours while it crosses.
                     </div>
                   )}
-                  {shielded?.enabled && shielded?.active && (
+                  {(
                     <div className="grid grid-cols-2 gap-2">
                       <button
                         onClick={() => setSendForm(f => ({ ...f, shielded: false }))}
@@ -3361,16 +3363,23 @@ const WalletPage: React.FC = () => {
                         </div>
                       </button>
                       <button
+                        disabled={!shieldReady}
                         onClick={() => setSendForm(f => ({ ...f, shielded: true }))}
                         className={`p-3 rounded-xl border text-left transition ${
-                          sendForm.shielded
-                            ? 'border-amber-400/60 bg-amber-500/10'
-                            : 'border-gray-700/50 bg-gray-900/50 hover:bg-gray-800/50'
+                          !shieldReady
+                            ? 'border-gray-800 bg-gray-900/30 opacity-50 cursor-not-allowed'
+                            : sendForm.shielded
+                              ? 'border-amber-400/60 bg-amber-500/10'
+                              : 'border-gray-700/50 bg-gray-900/50 hover:bg-gray-800/50'
                         }`}
                       >
                         <div className="text-sm font-semibold">Shielded</div>
                         <div className="text-[10px] text-gray-500 mt-0.5">
-                          {((shielded?.ready_balance_uegoc ?? 0) / 1_000_000).toLocaleString()} EGOC ready
+                          {!shielded?.enabled
+                            ? 'Unavailable in this build'
+                            : !shielded?.active
+                              ? 'Not yet active on this network'
+                              : `${((shielded?.ready_balance_uegoc ?? 0) / 1_000_000).toLocaleString()} EGOC ready`}
                         </div>
                       </button>
                     </div>
@@ -3397,12 +3406,11 @@ const WalletPage: React.FC = () => {
                     <div className="bg-gray-500/5 border border-gray-600/30 rounded-xl p-3 text-[11px] text-gray-400 leading-relaxed">
                       This payment is public. Your address, the recipient and the amount are
                       recorded on the chain and readable by anyone.
-                      {shielded?.enabled && shielded?.active && (
-                        <div className="mt-1.5 text-gray-300">
-                          Choose <span className="font-semibold">Shielded</span> above to send without
-                          revealing who paid whom.
-                        </div>
-                      )}
+                      <div className="mt-1.5 text-gray-300">
+                        {shieldReady
+                          ? 'Choose Shielded above to send without revealing who paid whom.'
+                          : 'Shielded sending is built but not yet switched on for this network.'}
+                      </div>
                     </div>
                   )}
                   <div className="bg-gray-900 rounded-xl p-3 space-y-2 text-sm">
