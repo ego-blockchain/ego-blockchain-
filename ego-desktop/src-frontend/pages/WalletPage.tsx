@@ -3110,12 +3110,10 @@ const WalletPage: React.FC = () => {
                   {(sendForm.isPrivate || (parseFloat(sendForm.amount) >= 50000)) && (
                     <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-xl p-3 text-[11px] text-yellow-200/70 leading-relaxed">
                       {parseFloat(sendForm.amount) >= 50000
-                        ? "Amounts over 50,000 EGOC are hidden in Ego apps automatically."
-                        : "This hides the addresses and amount in Ego Desktop and the Ego explorer."}
-                      <div className="mt-2 text-amber-300/80">
-                        It is not encryption. The sender, recipient and amount are stored on
-                        the chain in the clear, and anyone reading the chain another way can
-                        still see them. Do not rely on this to protect you.
+                        ? "Amounts over 50,000 EGOC are hidden automatically."
+                        : "Hides this payment in Ego Desktop and the Ego Explorer."}
+                      <div className="mt-1.5 text-amber-300/80">
+                        Not encryption — anyone reading the chain directly still sees it.
                       </div>
                     </div>
                   )}

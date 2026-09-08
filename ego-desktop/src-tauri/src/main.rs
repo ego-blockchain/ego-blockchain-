@@ -4,6 +4,7 @@ mod app;
 mod autostart;
 mod offline_guard;
 mod onetime;
+mod shielded;
 mod sideband;
 mod sideband_spool;
 mod bft_committee;

@@ -1,0 +1,375 @@
+//! Shielded pool accounting: notes, commitments and nullifiers.
+//!
+//! # What this is, and what it is not yet
+//!
+//! This is the bookkeeping half of a Zcash-style shielded pool. Value enters the
+//! pool as a *note* and is recorded only as a commitment, a hash that reveals
+//! nothing about who owns it or how much it holds. Spending publishes a
+//! *nullifier* derived from the note's secret, which marks it spent without
+//! revealing which commitment it came from.
+//!
+//! The zero-knowledge proof that ties the two together is **not here**. Until it
+//! exists, spending requires presenting the note openly, so the pool provides no
+//! privacy at all and must not be enabled anywhere that holds real value. There
+//! is a deliberate switch for that at the bottom of this file, defaulting to off.
+//!
+//! # Why the accounting comes first
+//!
+//! It is tempting to start with the cryptography, because that is the
+//! interesting part. It is also how pools get drained. The Liquid incident began
+//! with a range proof accepting a value it should have rejected, but the loss
+//! happened because the accounting downstream then allowed unbacked value to be
+//! redeemed for real coins. A proof system guards the door; the accounting is
+//! what decides how much anyone may carry out.
+//!
+//! So the invariants that prevent inflation are established and tested here,
+//! against an adversary assumed to control every input, before any proof exists
+//! to constrain them. When the circuit lands it narrows what a spender can
+//! claim; it does not become the only thing standing between the pool and zero.
+
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+
+/// Domain separators. A commitment must never be reinterpretable as a nullifier
+/// or vice versa: if one hash could serve as both, a note could be made to
+/// nullify itself, or a nullifier forged from public data.
+const COMMITMENT_DOMAIN: &[u8] = b"ego/shielded/commitment/v1";
+const NULLIFIER_DOMAIN: &[u8] = b"ego/shielded/nullifier/v1";
+
+/// A note is value held inside the pool.
+///
+/// `rho` makes two notes of the same value, owned by the same person, produce
+/// different commitments. Without it, paying somebody 10 EGOC twice would write
+/// the same commitment twice and link the payments.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Note {
+    pub value_uegoc: u64,
+    /// Owner's spending secret. Whoever knows this can spend the note.
+    pub owner_secret: [u8; 32],
+    /// Per-note randomness.
+    pub rho: [u8; 32],
+}
+
+impl Note {
+    /// The public record of this note. Reveals neither value nor owner.
+    pub fn commitment(&self) -> [u8; 32] {
+        let mut input = Vec::with_capacity(COMMITMENT_DOMAIN.len() + 8 + 64);
+        input.extend_from_slice(COMMITMENT_DOMAIN);
+        input.extend_from_slice(&self.value_uegoc.to_le_bytes());
+        input.extend_from_slice(&self.owner_secret);
+        input.extend_from_slice(&self.rho);
+        let d = ego_core::hash_data(&input);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&d.as_bytes()[..32]);
+        out
+    }
+
+    /// The marker published when this note is spent.
+    ///
+    /// Derived from the secret and rho but not the value, so it is unlinkable to
+    /// the commitment without knowing the secret. Deterministic, so the same
+    /// note can never be spent twice under two different markers.
+    pub fn nullifier(&self) -> [u8; 32] {
+        let mut input = Vec::with_capacity(NULLIFIER_DOMAIN.len() + 64);
+        input.extend_from_slice(NULLIFIER_DOMAIN);
+        input.extend_from_slice(&self.owner_secret);
+        input.extend_from_slice(&self.rho);
+        let d = ego_core::hash_data(&input);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&d.as_bytes()[..32]);
+        out
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum PoolError {
+    /// The note being spent was never deposited.
+    UnknownCommitment,
+    /// This note has already been spent.
+    NullifierAlreadySeen,
+    /// Withdrawing more than the note holds. The inflation case.
+    ValueExceedsNote { note: u64, requested: u64 },
+    /// The pool does not hold enough to honour this, which should be
+    /// unreachable if the other rules hold and is treated as corruption.
+    PoolUnderfunded { balance: u64, requested: u64 },
+    /// A deposit of nothing, or one that would overflow the pool.
+    InvalidAmount,
+    /// Two deposits produced the same commitment, so one would be unspendable.
+    DuplicateCommitment,
+}
+
+/// The pool's public state.
+///
+/// Everything here is visible on-chain. Privacy comes from what is absent: no
+/// value, no owner, and no link between a commitment and the nullifier that
+/// eventually spends it.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ShieldedPool {
+    /// Every commitment ever deposited, in order. Append-only: a commitment is
+    /// never removed, because removing one would reveal which note was spent.
+    commitments: Vec<[u8; 32]>,
+    /// Spent markers. Grows forever, by design.
+    nullifiers: HashSet<[u8; 32]>,
+    /// Total value the pool holds and must be able to pay out.
+    balance_uegoc: u64,
+    /// Deposited value per commitment.
+    ///
+    /// Present only because the proof does not exist yet. A real pool never
+    /// learns this: the circuit proves the withdrawal matches the committed
+    /// value without anyone revealing it. Delete this when the circuit lands.
+    #[serde(default)]
+    plaintext_values: HashMap<[u8; 32], u64>,
+}
+
+impl ShieldedPool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn balance(&self) -> u64 {
+        self.balance_uegoc
+    }
+
+    pub fn commitment_count(&self) -> usize {
+        self.commitments.len()
+    }
+
+    pub fn nullifier_count(&self) -> usize {
+        self.nullifiers.len()
+    }
+
+    pub fn contains_commitment(&self, c: &[u8; 32]) -> bool {
+        self.commitments.contains(c)
+    }
+
+    pub fn is_spent(&self, nf: &[u8; 32]) -> bool {
+        self.nullifiers.contains(nf)
+    }
+
+    /// Move value into the pool. The caller must already have taken the same
+    /// amount from the depositor's transparent balance; this only records it.
+    pub fn deposit(&mut self, commitment: [u8; 32], value_uegoc: u64) -> Result<(), PoolError> {
+        if value_uegoc == 0 {
+            return Err(PoolError::InvalidAmount);
+        }
+        // A pool that can overflow is a pool that can be emptied.
+        let new_balance = self
+            .balance_uegoc
+            .checked_add(value_uegoc)
+            .ok_or(PoolError::InvalidAmount)?;
+        if self.commitments.contains(&commitment) {
+            return Err(PoolError::DuplicateCommitment);
+        }
+        self.commitments.push(commitment);
+        self.plaintext_values.insert(commitment, value_uegoc);
+        self.balance_uegoc = new_balance;
+        Ok(())
+    }
+
+    /// Take value out of the pool by spending a note.
+    ///
+    /// Every rule that keeps the pool solvent is enforced here. When the circuit
+    /// exists it will establish the first two facts in zero knowledge rather
+    /// than by inspecting the note, and the checks below stay exactly as they
+    /// are: the proof will decide *what may be claimed*, and these will still
+    /// decide *what may be paid*.
+    pub fn withdraw(&mut self, note: &Note, amount_uegoc: u64) -> Result<[u8; 32], PoolError> {
+        let commitment = note.commitment();
+        if !self.commitments.contains(&commitment) {
+            return Err(PoolError::UnknownCommitment);
+        }
+        let nullifier = note.nullifier();
+        if self.nullifiers.contains(&nullifier) {
+            return Err(PoolError::NullifierAlreadySeen);
+        }
+        if amount_uegoc == 0 {
+            return Err(PoolError::InvalidAmount);
+        }
+        // The inflation check. A note is worth what was deposited for it and
+        // never more, whatever the spender asserts.
+        let deposited = *self
+            .plaintext_values
+            .get(&commitment)
+            .ok_or(PoolError::UnknownCommitment)?;
+        if amount_uegoc > deposited {
+            return Err(PoolError::ValueExceedsNote { note: deposited, requested: amount_uegoc });
+        }
+        // Belt and braces. If this ever fires the pool is already corrupt, and
+        // paying out would turn an accounting bug into stolen coins.
+        if amount_uegoc > self.balance_uegoc {
+            return Err(PoolError::PoolUnderfunded {
+                balance: self.balance_uegoc,
+                requested: amount_uegoc,
+            });
+        }
+
+        self.nullifiers.insert(nullifier);
+        self.balance_uegoc -= amount_uegoc;
+        Ok(nullifier)
+    }
+}
+
+/// Whether the shielded pool may be used.
+///
+/// Off, and it must stay off until the circuit exists and has been audited by
+/// somebody who does this for a living. Spending currently requires presenting
+/// the note in the open, so the pool offers no privacy whatsoever, and shipping
+/// it enabled would be worse than shipping nothing: it would invite people to
+/// trust it.
+pub fn is_enabled() -> bool {
+    std::env::var("EGO_SHIELDED_POOL").as_deref() == Ok("unaudited-testnet-only")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn note(value: u64, secret: u8, rho: u8) -> Note {
+        Note { value_uegoc: value, owner_secret: [secret; 32], rho: [rho; 32] }
+    }
+
+    fn funded_pool(value: u64) -> (ShieldedPool, Note) {
+        let mut pool = ShieldedPool::new();
+        let n = note(value, 1, 1);
+        pool.deposit(n.commitment(), value).unwrap();
+        (pool, n)
+    }
+
+    #[test]
+    fn a_commitment_reveals_neither_value_nor_owner() {
+        // Same value, different owners, must not look alike.
+        assert_ne!(note(100, 1, 1).commitment(), note(100, 2, 1).commitment());
+        // Same owner, same value, different notes, must not look alike either,
+        // or paying somebody the same amount twice would link the payments.
+        assert_ne!(note(100, 1, 1).commitment(), note(100, 1, 2).commitment());
+    }
+
+    #[test]
+    fn a_nullifier_cannot_be_derived_from_the_commitment() {
+        let n = note(100, 1, 1);
+        assert_ne!(n.commitment(), n.nullifier());
+    }
+
+    #[test]
+    fn the_same_note_always_nullifies_the_same_way() {
+        // Otherwise one note could be spent repeatedly under fresh markers.
+        assert_eq!(note(100, 1, 1).nullifier(), note(100, 1, 1).nullifier());
+        // The value is deliberately not part of it, so a spender cannot dodge
+        // the spent-marker by claiming a different amount.
+        assert_eq!(note(100, 1, 1).nullifier(), note(999, 1, 1).nullifier());
+    }
+
+    #[test]
+    fn value_deposited_is_value_withdrawable() {
+        let (mut pool, n) = funded_pool(1_000);
+        assert_eq!(pool.balance(), 1_000);
+        pool.withdraw(&n, 1_000).unwrap();
+        assert_eq!(pool.balance(), 0);
+    }
+
+    /// The inflation case, and the reason this layer exists before the circuit.
+    #[test]
+    fn a_note_cannot_be_spent_for_more_than_it_holds() {
+        let (mut pool, n) = funded_pool(1_000);
+        assert_eq!(
+            pool.withdraw(&n, 1_001),
+            Err(PoolError::ValueExceedsNote { note: 1_000, requested: 1_001 })
+        );
+        assert_eq!(pool.balance(), 1_000, "a rejected withdrawal must not move value");
+    }
+
+    #[test]
+    fn a_note_cannot_be_spent_twice() {
+        let (mut pool, n) = funded_pool(1_000);
+        pool.withdraw(&n, 400).unwrap();
+        assert_eq!(pool.withdraw(&n, 400), Err(PoolError::NullifierAlreadySeen));
+        assert_eq!(pool.balance(), 600, "the second attempt must not pay out");
+    }
+
+    #[test]
+    fn a_note_that_was_never_deposited_cannot_be_spent() {
+        let mut pool = ShieldedPool::new();
+        pool.deposit(note(1_000, 1, 1).commitment(), 1_000).unwrap();
+        // A note invented out of thin air, of the same shape as a real one.
+        let forged = note(1_000, 9, 9);
+        assert_eq!(pool.withdraw(&forged, 1_000), Err(PoolError::UnknownCommitment));
+        assert_eq!(pool.balance(), 1_000);
+    }
+
+    #[test]
+    fn the_pool_never_pays_out_more_than_it_holds() {
+        // Whatever sequence of operations, balance is deposits minus withdrawals.
+        let mut pool = ShieldedPool::new();
+        let a = note(500, 1, 1);
+        let b = note(300, 2, 2);
+        pool.deposit(a.commitment(), 500).unwrap();
+        pool.deposit(b.commitment(), 300).unwrap();
+        assert_eq!(pool.balance(), 800);
+        pool.withdraw(&a, 500).unwrap();
+        pool.withdraw(&b, 300).unwrap();
+        assert_eq!(pool.balance(), 0);
+        // Nothing remains to take.
+        let c = note(1, 3, 3);
+        pool.deposit(c.commitment(), 1).unwrap();
+        assert_eq!(pool.withdraw(&c, 2), Err(PoolError::ValueExceedsNote { note: 1, requested: 2 }));
+    }
+
+    #[test]
+    fn a_partial_spend_does_not_release_the_remainder() {
+        // Spending part of a note burns the rest until change notes exist. Losing
+        // value is survivable; releasing it twice is not.
+        let (mut pool, n) = funded_pool(1_000);
+        pool.withdraw(&n, 100).unwrap();
+        assert_eq!(pool.balance(), 900);
+        assert_eq!(
+            pool.withdraw(&n, 900),
+            Err(PoolError::NullifierAlreadySeen),
+            "the remainder must not be reachable by respending the same note"
+        );
+    }
+
+    #[test]
+    fn a_deposit_cannot_overflow_the_pool() {
+        let mut pool = ShieldedPool::new();
+        pool.deposit(note(u64::MAX, 1, 1).commitment(), u64::MAX).unwrap();
+        assert_eq!(pool.deposit(note(1, 2, 2).commitment(), 1), Err(PoolError::InvalidAmount));
+        assert_eq!(pool.balance(), u64::MAX, "a rejected deposit must not alter the balance");
+    }
+
+    #[test]
+    fn zero_is_not_a_deposit_or_a_withdrawal() {
+        let mut pool = ShieldedPool::new();
+        assert_eq!(pool.deposit([1u8; 32], 0), Err(PoolError::InvalidAmount));
+        let (mut pool2, n) = funded_pool(100);
+        assert_eq!(pool2.withdraw(&n, 0), Err(PoolError::InvalidAmount));
+        assert!(!pool2.is_spent(&n.nullifier()), "a rejected spend must not mark the note");
+    }
+
+    #[test]
+    fn the_same_commitment_cannot_be_deposited_twice() {
+        // The second note would share a nullifier and be permanently unspendable.
+        let mut pool = ShieldedPool::new();
+        let n = note(100, 1, 1);
+        pool.deposit(n.commitment(), 100).unwrap();
+        assert_eq!(pool.deposit(n.commitment(), 100), Err(PoolError::DuplicateCommitment));
+        assert_eq!(pool.balance(), 100);
+    }
+
+    #[test]
+    fn spending_leaves_the_commitment_in_place() {
+        // Removing it would reveal which note was spent and undo the privacy the
+        // pool exists to provide.
+        let (mut pool, n) = funded_pool(100);
+        let before = pool.commitment_count();
+        pool.withdraw(&n, 100).unwrap();
+        assert_eq!(pool.commitment_count(), before);
+        assert!(pool.contains_commitment(&n.commitment()));
+    }
+
+    #[test]
+    fn the_pool_is_off_unless_deliberately_and_explicitly_enabled() {
+        // It provides no privacy until the circuit exists, so it must never be
+        // reachable by accident.
+        assert!(!is_enabled());
+    }
+}

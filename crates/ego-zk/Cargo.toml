@@ -20,3 +20,4 @@ hex = "0.4"
 rand = "0.8"
 rand_chacha = "0.3"
 blake2 = "0.10"
+ark-crypto-primitives = { version = "0.4", features = ["sponge", "merkle_tree", "crh", "r1cs"] }
