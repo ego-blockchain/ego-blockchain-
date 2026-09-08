@@ -944,9 +944,44 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         if let Some(existing_bytes) = db.get_cf(cf_blocks_check, height_key(block.height)).ok().flatten() {
             if let Some(existing) = decode::<LedgerBlock>(&existing_bytes) {
                 if existing.hash == block.hash {
+                    let had = existing.vote_count;
+                    if block.vote_count > had {
+                        let mut upgraded = existing;
+                        upgraded.vote_count = block.vote_count;
+                        if !block.agg_bls_sig.is_empty() {
+                            upgraded.agg_bls_sig = block.agg_bls_sig.clone();
+                            upgraded.bls_pubkeys = block.bls_pubkeys.clone();
+                        }
+                        let now_final =
+                            (upgraded.vote_count as usize) >= crate::mempool::MIN_VALIDATORS_FOR_FINALITY;
+                        let mut batch = WriteBatch::default();
+                        batch.put_cf(cf_blocks_check, height_key(block.height), encode(&upgraded));
+                        if now_final {
+                            if let Some(cf_meta) = db.cf_handle(CF_META) {
+                                let cur = db.get_cf(cf_meta, META_FINALIZED)
+                                    .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+                                if block.height > cur {
+                                    batch.put_cf(cf_meta, META_FINALIZED, u64_le(block.height));
+                                }
+                            }
+                        }
+                        if db.write(batch).is_ok() {
+                            tracing::info!(
+                                "[ChainDB] block #{} certificate upgraded {} -> {} votes{}",
+                                block.height,
+                                had,
+                                upgraded.vote_count,
+                                if now_final { ", now final" } else { "" }
+                            );
+                            if now_final {
+                                if let Some(h) = crate::p2p::APP_HANDLE.get() {
+                                    let _ = h.emit_all("ego://chain-updated", ());
+                                }
+                            }
+                        }
+                    }
                     return true;
                 } else {
-                    // Never overwrite in place! Caller must use truncate_from to handle reorgs safely.
                     return false;
                 }
             }
@@ -3940,6 +3975,38 @@ pub fn pipeline_commit(commit_height: u64) {
 }
 
 /// Returns the highest finalized block height.
+/// Advance the finality marker over blocks already on disk that carry a
+/// quorum certificate. Returns the height it settled on.
+pub fn repair_finality_marker() -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf_meta) = db.cf_handle(CF_META) else { return 0 };
+    let Some(cf_blocks) = db.cf_handle(CF_BLOCKS) else { return 0 };
+    let tip = db.get_cf(cf_meta, META_LATEST_HEIGHT)
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    let started = db.get_cf(cf_meta, META_FINALIZED)
+        .ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0);
+    let mut settled = started;
+    let mut h = started.saturating_add(1);
+    while h <= tip {
+        let Some(block) = db.get_cf(cf_blocks, height_key(h)).ok().flatten()
+            .and_then(|v| decode::<LedgerBlock>(&v))
+        else { break };
+        if (block.vote_count as usize) < crate::mempool::MIN_VALIDATORS_FOR_FINALITY {
+            break;
+        }
+        settled = h;
+        h += 1;
+    }
+    if settled > started {
+        let _ = db.put_cf(cf_meta, META_FINALIZED, u64_le(settled));
+        tracing::info!(
+            "[ChainDB] finality marker repaired {} -> {} ({} certified block(s) that had been left unfinalized)",
+            started, settled, settled - started
+        );
+    }
+    settled
+}
+
 pub fn finalized_height() -> u64 {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let cf = db.cf_handle(CF_META).unwrap();
@@ -6204,6 +6271,140 @@ pub fn remove_pending_otptx(tx_id: &str) {
     let cf = match db.cf_handle(CF_META) { Some(c) => c, None => return };
     let key = format!("{}{}", META_OTP_TX_PREFIX, tx_id);
     let _ = db.delete_cf(cf, key.as_bytes());
+}
+
+#[cfg(test)]
+mod finality_tests {
+    use super::*;
+
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn block_at(height: u64, hash: &str, votes: u32) -> LedgerBlock {
+        LedgerBlock {
+            height,
+            hash: hash.into(),
+            prev_hash: "aa".repeat(32),
+            miner: "egot1miner".into(),
+            timestamp: 1_700_000_000 + height as i64,
+            vote_count: votes,
+            ..LedgerBlock::default()
+        }
+    }
+
+    fn put_block(db: &DB, b: &LedgerBlock) {
+        let cf = db.cf_handle(CF_BLOCKS).unwrap();
+        db.put_cf(cf, height_key(b.height), encode(b)).unwrap();
+    }
+
+    fn set_meta(db: &DB, key: &[u8], v: u64) {
+        let cf = db.cf_handle(CF_META).unwrap();
+        db.put_cf(cf, key, u64_le(v)).unwrap();
+    }
+
+    fn get_meta(db: &DB, key: &[u8]) -> u64 {
+        let cf = db.cf_handle(CF_META).unwrap();
+        db.get_cf(cf, key).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
+    }
+
+    #[test]
+    fn a_certified_copy_of_a_block_already_held_advances_finality() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let saved_tip = get_meta(db, META_LATEST_HEIGHT);
+        let saved_final = get_meta(db, META_FINALIZED);
+
+        let h = 880_000_001;
+        let hash = "0xfinalityupgrade";
+        put_block(db, &block_at(h, hash, 1));
+        set_meta(db, META_LATEST_HEIGHT, h);
+        set_meta(db, META_FINALIZED, h - 1);
+
+        assert!(write_block_batch(db, &block_at(h, hash, 1), &[]));
+        assert_eq!(get_meta(db, META_FINALIZED), h - 1, "one vote is not a quorum");
+
+        assert!(write_block_batch(db, &block_at(h, hash, 2), &[]));
+        assert_eq!(
+            get_meta(db, META_FINALIZED),
+            h,
+            "the certified copy of a block already held must finalize it"
+        );
+        let stored = get_block_by_height(h).unwrap();
+        assert_eq!(stored.vote_count, 2, "the stored certificate must be kept");
+
+        assert!(write_block_batch(db, &block_at(h, hash, 1), &[]));
+        assert_eq!(get_block_by_height(h).unwrap().vote_count, 2, "a weaker copy never downgrades it");
+
+        let cf = db.cf_handle(CF_BLOCKS).unwrap();
+        db.delete_cf(cf, height_key(h)).unwrap();
+        set_meta(db, META_LATEST_HEIGHT, saved_tip);
+        set_meta(db, META_FINALIZED, saved_final);
+    }
+
+    #[test]
+    fn a_different_block_at_the_same_height_is_still_refused() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let h = 880_000_002;
+        put_block(db, &block_at(h, "0xoriginal", 2));
+        assert!(
+            !write_block_batch(db, &block_at(h, "0xrival", 99), &[]),
+            "a rival block must never overwrite in place, however many votes it claims"
+        );
+        assert_eq!(get_block_by_height(h).unwrap().hash, "0xoriginal");
+        let cf = db.cf_handle(CF_BLOCKS).unwrap();
+        db.delete_cf(cf, height_key(h)).unwrap();
+    }
+
+    #[test]
+    fn the_repair_walks_certified_blocks_and_stops_at_the_first_gap() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let base = 890_000_000;
+        {
+            let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+            put_block(db, &block_at(base + 1, "0xr1", 2));
+            put_block(db, &block_at(base + 2, "0xr2", 3));
+            put_block(db, &block_at(base + 3, "0xr3", 1));
+            put_block(db, &block_at(base + 4, "0xr4", 5));
+            set_meta(db, META_LATEST_HEIGHT, base + 4);
+            set_meta(db, META_FINALIZED, base);
+        }
+
+        assert_eq!(
+            repair_finality_marker(),
+            base + 2,
+            "it must stop at the uncertified block rather than skipping it"
+        );
+
+        {
+            let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(get_meta(db, META_FINALIZED), base + 2);
+            put_block(db, &block_at(base + 3, "0xr3", 2));
+        }
+        assert_eq!(repair_finality_marker(), base + 4, "once the gap is certified the rest follows");
+
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let cf = db.cf_handle(CF_BLOCKS).unwrap();
+        for i in 1..=4 {
+            db.delete_cf(cf, height_key(base + i)).unwrap();
+        }
+        set_meta(db, META_LATEST_HEIGHT, 0);
+        set_meta(db, META_FINALIZED, 0);
+    }
+
+    #[test]
+    fn the_repair_never_moves_the_marker_backwards() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+            set_meta(db, META_LATEST_HEIGHT, 5);
+            set_meta(db, META_FINALIZED, 900_000_000);
+        }
+        assert_eq!(repair_finality_marker(), 900_000_000);
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(get_meta(db, META_FINALIZED), 900_000_000);
+        set_meta(db, META_LATEST_HEIGHT, 0);
+        set_meta(db, META_FINALIZED, 0);
+    }
 }
 
 #[cfg(test)]
