@@ -1275,7 +1275,7 @@ const WalletPage: React.FC = () => {
 
         <div className={`grid gap-2 ${
           ({ 4: 'grid-cols-4', 5: 'grid-cols-5', 6: 'grid-cols-6' } as Record<number, string>)[
-            (RAMP_ENABLED ? 5 : 4) + (shielded?.enabled && shielded?.active ? 1 : 0)
+            (RAMP_ENABLED ? 5 : 4)
           ]
         }`}>
           {[
@@ -1285,11 +1285,6 @@ const WalletPage: React.FC = () => {
               action: () => { setShowSend(true); setTxResult(null); invoke<{ fee_uegoc: number; fee_usd: number }>('get_tx_fee', { txType: 'transfer' }).then(setTxFee).catch(() => {}); }
             },
             { label: '↓ Receive', live: false, action: () => setShowReceive(true) },
-            ...(shielded?.enabled && shielded?.active ? [{
-              label: '🛡 Shield',
-              live: false,
-              action: () => { setShieldMsg(null); setShowShield(true); refreshShielded(); },
-            }] : []),
             { label: '⇄ Swap',   live: true,  action: openSwap },
             ...(RAMP_ENABLED ? [{
               label: '$ Buy',
@@ -3367,8 +3362,14 @@ const WalletPage: React.FC = () => {
                         One whole note is spent, so the amount must match one you hold:{' '}
                         {[...new Set((shielded?.notes ?? []).filter(n => n.status === 'ready').map(n => n.value_uegoc))]
                           .sort((a, b) => a - b).map(v => (v / 1_000_000).toLocaleString()).join(', ')
-                          || 'none ready, shield some funds first'} EGOC.
+                          || 'none yet'} EGOC.
                       </div>
+                      <button
+                        onClick={() => { setShieldMsg(null); setShowShield(true); refreshShielded(); }}
+                        className="mt-2 px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-200 text-[11px] font-semibold transition"
+                      >
+                        Move funds into the pool
+                      </button>
                     </div>
                   )}
                   {sendForm.viaRadio && (
