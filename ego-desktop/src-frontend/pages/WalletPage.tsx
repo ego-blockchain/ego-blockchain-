@@ -1681,19 +1681,19 @@ const WalletPage: React.FC = () => {
                 >
                   <div className="flex items-center gap-3 min-w-0">
                     <div className={`w-10 h-10 rounded-xl flex items-center justify-center text-lg shrink-0 ${
-                      tx.is_private ? 'bg-yellow-500/20 text-yellow-500' : isReward ? 'bg-yellow-500/15' : isSent ? 'bg-red-500/15' : 'bg-green-500/15'
+                      tx.is_private ? 'bg-gray-500/20 text-gray-400' : isReward ? 'bg-yellow-500/15' : isSent ? 'bg-red-500/15' : 'bg-green-500/15'
                     }`}>
-                      {tx.is_private ? '🛡' : isReward ? '⚡' : isSent ? '↑' : '↓'}
+                      {tx.is_private ? (isSent ? '↑' : '↓') : isReward ? '⚡' : isSent ? '↑' : '↓'}
                     </div>
                     <div className="min-w-0">
                       <div className="text-sm font-mono text-gray-300 truncate">
                         {tx.tx_type === 'shield' ? <span className="text-amber-300 font-bold">🛡 Shielded deposit</span>
                           : tx.tx_type === 'unshield' ? <span className="text-amber-300 font-bold">🛡 Unshielded payout</span>
-                          : tx.is_private ? <span className="text-yellow-400 font-bold">Hidden · {isSent ? 'Sent' : 'Received'}</span> : (isReward ? rewardLabel : shortHash(tx.hash))}
+                          : tx.is_private ? <span className="text-gray-300 font-semibold">{isSent ? 'Sent' : 'Received'} · not listed</span> : (isReward ? rewardLabel : shortHash(tx.hash))}
                       </div>
                       <div className="text-xs text-gray-500">
                         {isReward
-                          ? `Block #${tx.block_height ?? '—'}` : tx.is_private ? 'Hidden in Ego apps, not on the chain'
+                          ? `Block #${tx.block_height ?? '—'}` : tx.is_private ? 'Kept out of lists in Ego apps'
                           : isSent ? `To: ${shortAddr(tx.to)}` : `From: ${shortAddr(tx.from)}`}
                         {tx.memo && <span className="ml-2 text-gray-600">• {tx.memo}</span>}
                         {tx.transport && tx.transport !== 'internet' && (
@@ -3286,10 +3286,10 @@ const WalletPage: React.FC = () => {
                   <div className="flex flex-wrap gap-3">
                   <div className="flex items-center justify-between bg-gray-900/50 p-3 rounded-xl border border-gray-700/50 flex-1 min-w-[240px]">
                     <div className="flex items-center gap-3">
-                      <div className="w-8 h-8 rounded-lg bg-yellow-500/10 flex items-center justify-center text-yellow-500">🛡</div>
+                      <div className="w-8 h-8 rounded-lg bg-gray-500/10 flex items-center justify-center text-gray-400">☰</div>
                       <div>
-                        <div className="text-sm font-semibold">Hide in Ego apps</div>
-                        <div className="text-[10px] text-gray-500 uppercase font-bold tracking-wider">Not encryption</div>
+                        <div className="text-sm font-semibold">Hide from my activity</div>
+                        <div className="text-[10px] text-gray-500 uppercase font-bold tracking-wider">Display setting</div>
                       </div>
                     </div>
                     <button
@@ -3327,13 +3327,15 @@ const WalletPage: React.FC = () => {
                     </div>
                   )}
                   {(sendForm.isPrivate || (parseFloat(sendForm.amount) >= 50000)) && (
-                    <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-xl p-3 text-[11px] text-yellow-200/70 leading-relaxed">
+                    <div className="bg-gray-500/5 border border-gray-600/30 rounded-xl p-3 text-[11px] text-gray-400 leading-relaxed">
                       {parseFloat(sendForm.amount) >= 50000
-                        ? "Amounts over 50,000 EGOC are hidden automatically."
-                        : "Hides this payment in Ego Desktop and the Ego Explorer."}
-                      <div className="mt-1.5 text-amber-300/80">
-                        Not encryption — anyone reading the chain directly still sees it.
-                      </div>
+                        ? "Payments of 50,000 EGOC or more are kept out of these lists automatically."
+                        : "Keeps this payment out of the lists in Ego Desktop and the Ego Explorer."}
+                      {shielded?.enabled && shielded?.active && (
+                        <div className="mt-1.5 text-gray-500">
+                          To make a payment unlinkable, use Shield instead.
+                        </div>
+                      )}
                     </div>
                   )}
                   <div className="bg-gray-900 rounded-xl p-3 space-y-2 text-sm">
