@@ -380,6 +380,25 @@ fn headless_main() {
             crate::p2p::run_porep_challenge_loop().await;
         });
 
+        tokio::spawn(async {
+            let mut tick: u32 = 0;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                tick = tick.wrapping_add(1);
+                crate::p2p::oracle_archive_tick().await;
+                if tick % 20 == 3 {
+                    crate::p2p::push_snapshot_to_oracle().await;
+                }
+            }
+        });
+
+        tokio::spawn(async {
+            loop {
+                crate::p2p::oracle_peer_discovery_tick().await;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+
         let rpc_port: u16 = std::env::var("EGO_RPC_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(47395);
         tracing::info!("All services started. RPC on port {}. P2P on port {}", rpc_port, crate::p2p::p2p_port());
         tracing::info!("Chain data: {:?}", crate::ledger::base_data_dir());
