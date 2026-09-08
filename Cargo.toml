@@ -12,6 +12,7 @@ members = [
   "crates/urego-compiler",
   "bins/urego",
   "crates/ego-zk",
+  "crates/ego-stark",
   "bins/ego-cli",
   "bins/ego-relay",
   "crates/ego-typed-signing",

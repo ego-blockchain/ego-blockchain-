@@ -1,0 +1,10 @@
+[package]
+name = "ego-stark"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winterfell = "0.10"
+serde = { version = "1", features = ["derive"] }
+rand = "0.8"
+hex = "0.4"
