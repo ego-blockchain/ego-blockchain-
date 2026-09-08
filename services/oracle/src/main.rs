@@ -173,6 +173,16 @@ fn normalize_block_schema(block: &mut Value) {
     if !obj.contains_key("reward")         { obj.insert("reward".into(),         json!(0u64)); }
 }
 
+pub const OFFCHAIN_DISPLAY_FIELDS: [&str; 2] = ["signed_summary", "is_private"];
+
+fn strip_offchain_display_fields(tx: &mut Value) {
+    if let Some(obj) = tx.as_object_mut() {
+        for f in OFFCHAIN_DISPLAY_FIELDS {
+            obj.remove(f);
+        }
+    }
+}
+
 impl ChainState {
     fn merge_block(&mut self, mut block: Value) {
         normalize_block_schema(&mut block);
@@ -326,9 +336,10 @@ impl ChainState {
     }
 
     fn merge_txs(&mut self, txs: Vec<Value>) {
-        for tx in txs {
+        for mut tx in txs {
             let hash = tx["hash"].as_str().unwrap_or("").to_string();
             if hash.is_empty() { continue; }
+            strip_offchain_display_fields(&mut tx);
             if !self.transactions.iter().any(|t| t["hash"].as_str() == Some(&hash)) {
                 self.transactions.push(tx);
             }
@@ -1411,5 +1422,46 @@ mod gap_range_tests {
     fn an_inverted_range_yields_nothing_rather_than_an_error() {
         let (from, to) = gap_range(Some(500), Some(100), 1_000).unwrap();
         assert!(to < from);
+    }
+}
+
+#[cfg(test)]
+mod display_field_tests {
+    use super::{strip_offchain_display_fields, ChainState, OFFCHAIN_DISPLAY_FIELDS};
+    use serde_json::json;
+
+    #[test]
+    fn a_private_transfer_does_not_reach_the_public_api_in_plain_english() {
+        let mut chain = ChainState { blocks: vec![], transactions: vec![] };
+        chain.merge_txs(vec![json!({
+            "hash": "0xb015ce80af141be898caba4ef46142904e5bbd564781f9aecb7c3802867fa170",
+            "from": "egot1yqm8qe4p6u3qctjxwm2qwc6fdry54gdmzgalupur",
+            "to":   "egot1yqfeneexd8d72jtz0uk0w77u8vpn3ksusv5gdy67",
+            "amount": 37000000u64,
+            "is_private": true,
+            "signed_summary": "Transfer 37.000000 EGOC
+  From: egot1yqm8...
+  To: egot1yqfe...",
+        })]);
+
+        let served = serde_json::to_string(&chain.transactions).unwrap();
+        assert!(!served.contains("signed_summary"), "the plain-English summary was republished");
+        assert!(!served.contains("is_private"), "the privacy flag marks which transfers are sensitive");
+        assert!(!served.contains("Transfer 37.000000 EGOC"), "summary content leaked");
+    }
+
+    #[test]
+    fn stripping_leaves_consensus_fields_untouched() {
+        let mut tx = json!({
+            "hash": "0xabc", "from": "a", "to": "b", "amount": 1u64,
+            "nonce": 3u64, "signature": "sig", "signed_summary": "x", "is_private": true,
+        });
+        strip_offchain_display_fields(&mut tx);
+        for kept in ["hash", "from", "to", "amount", "nonce", "signature"] {
+            assert!(tx.get(kept).is_some(), "{kept} must survive: it is consensus data");
+        }
+        for dropped in OFFCHAIN_DISPLAY_FIELDS {
+            assert!(tx.get(dropped).is_none(), "{dropped} must not be republished");
+        }
     }
 }
