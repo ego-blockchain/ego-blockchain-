@@ -977,19 +977,30 @@ struct GapQuery {
 
 const MAX_GAP_SCAN: u64 = 5_000;
 
+fn gap_range(from: Option<u64>, to: Option<u64>, tip: u64) -> Result<(u64, u64), String> {
+    let to   = to.unwrap_or(tip);
+    let from = from.unwrap_or_else(|| to.saturating_sub(MAX_GAP_SCAN.saturating_sub(1))).max(1);
+    if to < from {
+        return Ok((from, from.saturating_sub(1)));
+    }
+    if to - from + 1 > MAX_GAP_SCAN {
+        return Err(format!("range wider than {} heights", MAX_GAP_SCAN));
+    }
+    Ok((from, to))
+}
+
 async fn handle_chain_gaps(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<GapQuery>,
 ) -> impl IntoResponse {
     use std::sync::atomic::Ordering;
-    let tip  = state.stat_tip.load(Ordering::Relaxed);
-    let to   = q.to.unwrap_or(tip);
-    let from = q.from.unwrap_or_else(|| to.saturating_sub(MAX_GAP_SCAN)).max(1);
+    let tip = state.stat_tip.load(Ordering::Relaxed);
+    let (from, to) = match gap_range(q.from, q.to, tip) {
+        Ok(r)  => r,
+        Err(e) => return Json(json!({ "error": e })),
+    };
     if to < from {
         return Json(json!({ "from": from, "to": to, "tip": tip, "missing": Vec::<u64>::new() }));
-    }
-    if to - from + 1 > MAX_GAP_SCAN {
-        return Json(json!({ "error": format!("range wider than {} heights", MAX_GAP_SCAN) }));
     }
     let have: std::collections::HashSet<u64> = {
         let chain = state.chain.read().await;
@@ -1363,4 +1374,42 @@ async fn main() {
 
     info!("Listening on http://0.0.0.0:{}", port);
     axum::serve(listener, app).await.expect("server error");
+}
+
+#[cfg(test)]
+mod gap_range_tests {
+    use super::{gap_range, MAX_GAP_SCAN};
+
+    #[test]
+    fn the_default_range_at_a_real_tip_is_accepted() {
+        let (from, to) = gap_range(None, None, 29_103).expect("default range must not be rejected");
+        assert_eq!(to, 29_103);
+        assert_eq!(to - from + 1, MAX_GAP_SCAN);
+    }
+
+    #[test]
+    fn the_default_range_is_exactly_the_scan_limit_at_any_tip() {
+        for tip in [5_000u64, 5_001, 10_000, 29_103, 1_000_000] {
+            let (from, to) = gap_range(None, None, tip).expect("default must be accepted");
+            assert!(to - from + 1 <= MAX_GAP_SCAN, "tip {} produced {} heights", tip, to - from + 1);
+        }
+    }
+
+    #[test]
+    fn a_low_tip_clamps_to_height_one() {
+        let (from, to) = gap_range(None, None, 20).unwrap();
+        assert_eq!((from, to), (1, 20));
+    }
+
+    #[test]
+    fn an_over_wide_explicit_range_is_refused() {
+        assert!(gap_range(Some(1), Some(MAX_GAP_SCAN + 1), 99_999).is_err());
+        assert!(gap_range(Some(1), Some(MAX_GAP_SCAN), 99_999).is_ok());
+    }
+
+    #[test]
+    fn an_inverted_range_yields_nothing_rather_than_an_error() {
+        let (from, to) = gap_range(Some(500), Some(100), 1_000).unwrap();
+        assert!(to < from);
+    }
 }
