@@ -1,12 +1,10 @@
 use crate::chain_db::{self, decode, encode, read_u64_le, u64_le, CF_BALANCES, CF_META};
 use crate::ledger::LedgerTx;
 use crate::shielded::{
-    field_to_bytes, is_denomination, leaf_for, public_to_field, recipient_digest,
-    withdrawal_binding, DENOMINATIONS_UEGOC, ROOT_HISTORY,
+    from_digest, is_denomination, leaf_for, recipient_digest, to_digest, verify_proof_bytes,
+    DENOMINATIONS_UEGOC, POOL_TREE_DEPTH, ROOT_HISTORY,
 };
-use ark_bn254::{Bn254, Fr};
-use ego_zk::merkle::{IncrementalTree, POOL_TREE_DEPTH};
-use ego_zk::withdraw_circuit::{self, CanonicalDeserialize, Proof, WithdrawCircuit};
+use ego_stark::merkle::IncrementalTree;
 use rocksdb::{Direction, IteratorMode, WriteBatch, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -56,11 +54,11 @@ pub fn denomination_index(amount_uegoc: u64) -> Option<usize> {
 impl PoolState {
     pub fn empty() -> Self {
         let t = IncrementalTree::new(POOL_TREE_DEPTH);
-        let root = field_to_bytes(t.root());
+        let root = from_digest(&t.root());
         Self {
             depth: POOL_TREE_DEPTH as u8,
             next_index: 0,
-            frontier: t.frontier().iter().map(|f| field_to_bytes(*f)).collect(),
+            frontier: t.frontier().iter().map(from_digest).collect(),
             root,
             recent_roots: vec![root],
             balance_uegoc: 0,
@@ -122,18 +120,18 @@ impl PoolState {
         IncrementalTree::from_parts(
             self.depth as usize,
             self.next_index as usize,
-            self.frontier.iter().map(public_to_field).collect(),
-            public_to_field(&self.root),
+            self.frontier.iter().map(|f| to_digest(f)).collect::<Result<Vec<_>, _>>()?,
+            to_digest(&self.root)?,
         )
     }
 
     pub fn insert(&mut self, leaf: [u8; 32]) -> Result<u64, String> {
         let mut t = self.tree()?;
-        let index = t.insert(public_to_field(&leaf))?;
+        let index = t.insert(to_digest(&leaf)?)?;
         let (_, next, frontier, root) = t.parts();
         self.next_index = next as u64;
-        self.frontier = frontier.iter().map(|f| field_to_bytes(*f)).collect();
-        self.root = field_to_bytes(root);
+        self.frontier = frontier.iter().map(from_digest).collect();
+        self.root = from_digest(&root);
         self.recent_roots.push(self.root);
         if self.recent_roots.len() > ROOT_HISTORY {
             self.recent_roots.remove(0);
@@ -287,10 +285,8 @@ impl UnshieldBody {
         Self::bytes32("nullifier", &self.nullifier)
     }
 
-    pub fn proof(&self) -> Result<Proof<Bn254>, String> {
-        let bytes = hex::decode(&self.proof).map_err(|_| "unshield proof is not hex".to_string())?;
-        Proof::<Bn254>::deserialize_compressed(bytes.as_slice())
-            .map_err(|e| format!("unshield proof does not decode: {e}"))
+    pub fn proof_bytes(&self) -> Result<Vec<u8>, String> {
+        hex::decode(&self.proof).map_err(|_| "unshield proof is not hex".to_string())
     }
 }
 
@@ -387,16 +383,18 @@ fn validate_unshield_in(
             tx.hash, tx.amount, state.balance_uegoc
         ));
     }
-    let proof = body.proof()?;
-    let inputs = WithdrawCircuit::public_inputs(
-        public_to_field(&root),
-        public_to_field(&nullifier),
-        Fr::from(tx.amount),
-        withdrawal_binding(&recipient_digest(&tx.to), tx.fee_uegoc),
-    );
-    match withdraw_circuit::verify(ego_zk::withdraw_params::verifying_key(), &inputs, &proof) {
-        Ok(true) => Ok(()),
-        _ => Err(format!("unshield {} proof does not verify", tx.hash)),
+    let proof = body.proof_bytes()?;
+    if verify_proof_bytes(
+        &proof,
+        root,
+        nullifier,
+        tx.amount,
+        recipient_digest(&tx.to),
+        tx.fee_uegoc,
+    ) {
+        Ok(())
+    } else {
+        Err(format!("unshield {} proof does not verify", tx.hash))
     }
 }
 
@@ -627,7 +625,7 @@ mod tests {
     static DB_TESTS: Mutex<()> = Mutex::new(());
 
     fn note(value: u64, tag: u8) -> Note {
-        Note { value_uegoc: value, owner_secret: [tag; 32], rho: [tag.wrapping_add(1); 32] }
+        Note::new(value, [tag; 32], [tag.wrapping_add(1); 32])
     }
 
     fn deposit_tx(n: &Note) -> LedgerTx {
@@ -635,7 +633,7 @@ mod tests {
             hash: format!("0x{}", hex::encode(n.commitment())),
             from: "egot1depositor".into(),
             to: SHIELDED_POOL_ADDR.into(),
-            amount: n.value_uegoc,
+            amount: n.value_uegoc(),
             memo: Some(shield_memo(&n.commitment())),
             tx_type: TX_SHIELD.into(),
             fee_uegoc: 1_000,
@@ -999,17 +997,14 @@ mod tests {
         let index = leaf_index_of(&n.commitment()).unwrap() as usize;
         let pool = ShieldedPool::from_leaves(POOL_TREE_DEPTH, &leaves()).unwrap();
         let w = crate::shielded::prove_withdrawal(
-            ego_zk::withdraw_params::proving_key(),
             &pool,
             &n,
             index,
             recipient_digest(&recipient),
             fee,
-            &mut rng,
         )
         .unwrap();
-        let mut proof_bytes = Vec::new();
-        ego_zk::withdraw_circuit::CanonicalSerialize::serialize_compressed(&w.proof, &mut proof_bytes).unwrap();
+        let proof_bytes = w.proof.clone();
         let body = UnshieldBody {
             root: hex::encode(w.root),
             nullifier: hex::encode(w.nullifier),

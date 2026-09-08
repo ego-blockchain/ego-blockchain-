@@ -5,7 +5,6 @@ use crate::shielded::{self, denominate, Note, ShieldedPool, DENOMINATIONS_UEGOC}
 use crate::shielded_chain::{self, UnshieldBody, SHIELDED_POOL_ADDR, TX_SHIELD, TX_UNSHIELD};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
-use ego_zk::withdraw_circuit::CanonicalSerialize;
 use once_cell::sync::Lazy;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -19,6 +18,8 @@ const CHAIN_ID: u8 = 1;
 
 static NOTES_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
+pub const PROOF_SYSTEM: &str = "winterfell-stark/rescue-goldilocks, no trusted setup";
+
 static PROVER_POOL: Lazy<Mutex<Option<ShieldedPool>>> = Lazy::new(|| Mutex::new(None));
 
 fn prover_pool() -> Result<ShieldedPool, String> {
@@ -30,7 +31,7 @@ fn prover_pool() -> Result<ShieldedPool, String> {
         }
         tracing::warn!("[Shielded] the commitment tree diverged, rebuilding it from the chain");
     }
-    let pool = ShieldedPool::from_leaves(ego_zk::withdraw_params::DEPTH, &leaves)?;
+    let pool = ShieldedPool::from_leaves(crate::shielded::POOL_TREE_DEPTH, &leaves)?;
     *cached = Some(pool.clone());
     Ok(pool)
 }
@@ -68,7 +69,7 @@ pub struct ShieldedStatus {
     pub denominations_uegoc: Vec<u64>,
     pub min_fee_uegoc: u64,
     pub current_fee_uegoc: u64,
-    pub verifying_key_digest: String,
+    pub proof_system: String,
     pub notes: Vec<NoteView>,
     pub ready_balance_uegoc: u64,
     pub pending_balance_uegoc: u64,
@@ -182,13 +183,13 @@ pub async fn shielded_status() -> Result<ShieldedStatus, EgoDesktopError> {
         for n in &notes {
             let (status, leaf_index) = note_status(n);
             match status.as_str() {
-                "ready" => ready = ready.saturating_add(n.note.value_uegoc),
-                "pending" => pending = pending.saturating_add(n.note.value_uegoc),
+                "ready" => ready = ready.saturating_add(n.note.value_uegoc()),
+                "pending" => pending = pending.saturating_add(n.note.value_uegoc()),
                 _ => {}
             }
             views.push(NoteView {
                 commitment: n.commitment.clone(),
-                value_uegoc: n.note.value_uegoc,
+                value_uegoc: n.note.value_uegoc(),
                 leaf_index,
                 status,
                 deposit_tx: n.deposit_tx.clone(),
@@ -206,7 +207,7 @@ pub async fn shielded_status() -> Result<ShieldedStatus, EgoDesktopError> {
             denominations_uegoc: DENOMINATIONS_UEGOC.to_vec(),
             min_fee_uegoc: crate::mempool::MIN_FEE_UEGOC,
             current_fee_uegoc: current_fee(),
-            verifying_key_digest: ego_zk::withdraw_params::verifying_key_digest(),
+            proof_system: PROOF_SYSTEM.to_string(),
             notes: views,
             ready_balance_uegoc: ready,
             pending_balance_uegoc: pending,
@@ -384,24 +385,18 @@ pub async fn shield_withdraw(
     let withdrawal = tokio::task::spawn_blocking(move || {
         let pool = prover_pool()?;
         shielded::prove_withdrawal(
-            ego_zk::withdraw_params::proving_key(),
             &pool,
             &note,
             leaf_index as usize,
             shielded::recipient_digest(&recipient_for_proof),
             fee,
-            &mut OsRng,
         )
     })
     .await
     .map_err(|e| EgoDesktopError::CryptoError(format!("proving task: {e}")))?
     .map_err(EgoDesktopError::CryptoError)?;
 
-    let mut proof_bytes = Vec::new();
-    withdrawal
-        .proof
-        .serialize_compressed(&mut proof_bytes)
-        .map_err(|e| EgoDesktopError::CryptoError(format!("proof encoding: {e}")))?;
+    let proof_bytes = withdrawal.proof.clone();
     let body = UnshieldBody {
         root: hex::encode(withdrawal.root),
         nullifier: hex::encode(withdrawal.nullifier),

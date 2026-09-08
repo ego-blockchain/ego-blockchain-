@@ -43,7 +43,7 @@ where
         panic!(
             "{name} panicked on {} bytes of hostile input: {}",
             bytes.len(),
-            hex::encode(&bytes[..bytes.len().min(256)])
+            hex::encode(&bytes[..bytes.len().min(8192)])
         );
     }
 }
@@ -173,7 +173,7 @@ fn the_unshield_body_and_proof_reject_hostile_bytes_without_panicking() {
         if let Ok(body) = crate::shielded_chain::parse_unshield_body(text) {
             let _ = body.root_bytes();
             let _ = body.nullifier_bytes();
-            let _ = body.proof();
+            let _ = body.proof_bytes();
             let _ = body.tx_hash();
         }
     });
@@ -182,9 +182,64 @@ fn the_unshield_body_and_proof_reject_hostile_bytes_without_panicking() {
 #[test]
 fn the_proof_decoder_rejects_hostile_bytes_without_panicking() {
     hammer("proof decoder", noise, |bytes| {
-        use ego_zk::withdraw_circuit::CanonicalDeserialize;
-        let _ = ego_zk::withdraw_circuit::Proof::<ark_bn254::Bn254>::deserialize_compressed(bytes);
+        let _ = crate::shielded::verify_proof_bytes(
+            bytes,
+            [1u8; 32],
+            [2u8; 32],
+            1_000_000,
+            [3u8; 32],
+            1_000,
+        );
     });
+}
+
+/// Winterfell's own `Proof::from_bytes` has been observed failing unsafely on
+/// malformed input rather than returning an error, and those bytes arrive in a
+/// transaction from anyone. Nothing may reach it except through the guarded
+/// wrapper. These two inputs are the ones the fuzzer found.
+#[test]
+fn the_inputs_that_broke_the_raw_decoder_are_refused_by_the_guard() {
+    const FOUND: [&str; 2] = [
+        "7b4c3285875ca67532df6bffd84ac95c9d12e99aa734fb2b5d7df2a780f738aa6f79dca2e9bb7668c0c7aebbb0c68ccddb38500962e5d8a963d8718d15e0092bdffdfbb644402e",
+        "ee0c7da088618b17100c6bb10717374487a47b8c81fada3280712cec5683fcb40fe7f327a1efc8776f96c3fda716131adbbd0d8f4d74a06f0be710e4e0802878adebc25889a08f740e53dfaf294d3c805011a2c0442a1edb2d26709dfd9294879f23d453b78077c9fb0814e5bfb136c2af678da52433c405c9140b2c263e13b18ae7b13257cc1545cf74a00f9ceb234aedf4450e4b4775509bd8efc12aef8a233432b46e71948ba180ecbf6ac4a04ee7c37ed1178417453e5cdb1f0f7c054e6df79d602a5f82ec9c32de1c9255bcec6704f6e7f20d0118dc598d2b9a4858a493710f9130eb9eea699e6fc10011a8df4cdc760ae36559b9f3c1b5c39bf53b77e6",
+    ];
+    for (i, h) in FOUND.iter().enumerate() {
+        let bytes = hex::decode(h).expect("test vector is hex");
+        assert!(
+            !crate::shielded::verify_proof_bytes(
+                &bytes,
+                [1u8; 32],
+                [2u8; 32],
+                1_000_000,
+                [3u8; 32],
+                1_000,
+            ),
+            "known-bad input {i} must be refused, not accepted"
+        );
+    }
+}
+
+/// A proof larger than any this chain produces is refused before it reaches
+/// the decoder at all, so a length prefix cannot be used to make it allocate.
+#[test]
+fn an_oversized_proof_is_refused_before_it_is_decoded() {
+    let huge = vec![0u8; crate::shielded::MAX_PROOF_BYTES + 1];
+    assert!(!crate::shielded::verify_proof_bytes(
+        &huge,
+        [1u8; 32],
+        [2u8; 32],
+        1_000_000,
+        [3u8; 32],
+        1_000
+    ));
+    assert!(!crate::shielded::verify_proof_bytes(
+        &[],
+        [1u8; 32],
+        [2u8; 32],
+        1_000_000,
+        [3u8; 32],
+        1_000
+    ));
 }
 
 #[test]
