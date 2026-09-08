@@ -2920,20 +2920,52 @@ const WalletPage: React.FC = () => {
                 </button>
               </div>
               <div className="rounded-xl bg-gray-900 border border-gray-700 p-4 space-y-3">
-                <div className="text-sm font-semibold">Unshield one note</div>
-                <select
-                  multiple
-                  size={6}
-                  value={shieldNotes}
-                  onChange={e => setShieldNotes(Array.from(e.target.selectedOptions, o => o.value))}
-                  className="w-full bg-gray-800 border border-gray-700 focus:border-amber-500 rounded-xl px-4 py-3 text-sm outline-none transition"
-                >
-                  {(shielded?.notes ?? []).filter(n => n.status === 'ready').map(n => (
-                    <option key={n.commitment} value={n.commitment}>
-                      {(n.value_uegoc / 1_000_000).toLocaleString()} EGOC · {n.commitment.slice(0, 10)}…
-                    </option>
-                  ))}
-                </select>
+                <div className="flex items-center justify-between">
+                  <div className="text-sm font-semibold">Send from the pool</div>
+                  {shieldNotes.length > 0 && (
+                    <button
+                      onClick={() => setShieldNotes([])}
+                      className="text-[11px] text-gray-400 hover:text-gray-200 underline"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+                <div className="max-h-52 overflow-y-auto rounded-xl border border-gray-700 divide-y divide-gray-700/60">
+                  {(shielded?.notes ?? []).filter(n => n.status === 'ready').length === 0 && (
+                    <div className="px-3 py-4 text-xs text-gray-500 text-center">
+                      No notes ready yet. Move funds into the pool first.
+                    </div>
+                  )}
+                  {(shielded?.notes ?? []).filter(n => n.status === 'ready').map(n => {
+                    const picked = shieldNotes.includes(n.commitment);
+                    return (
+                      <label
+                        key={n.commitment}
+                        className={`flex items-center gap-3 px-3 py-2.5 cursor-pointer transition ${
+                          picked ? 'bg-amber-500/10' : 'bg-gray-900/60 hover:bg-gray-800/60'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={picked}
+                          onChange={() => setShieldNotes(prev =>
+                            prev.includes(n.commitment)
+                              ? prev.filter(c => c !== n.commitment)
+                              : [...prev, n.commitment]
+                          )}
+                          className="w-4 h-4 accent-amber-500 shrink-0"
+                        />
+                        <span className="text-sm font-semibold shrink-0">
+                          {(n.value_uegoc / 1_000_000).toLocaleString()} EGOC
+                        </span>
+                        <span className="font-mono text-[11px] text-gray-500 truncate">
+                          {n.commitment.slice(0, 12)}…
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
                 <input
                   type="text"
                   value={shieldTo}

@@ -203,12 +203,15 @@ Advanced: EGO-50 MEV Protection, EGO-51 Fee Market, EGO-52 Governance, EGO-53 DI
 - Governance page: proposal list (Active/All/Passed/Failed/Expired tabs), create proposal modal, proposal detail modal with stake vote + knowledge test + results bars.
 
 ### Shielded Transactions (Privacy)
-- **Identity Masking**: Transactions can be marked as private, replacing public keys with a **🛡 Shielded** badge on the ledger.
-- **Tracking Prevention**: The Explorer blocks address history searches and 'Holders' lists to prevent profiling of wealthy users.
-- **Public Balance**: Only transparent funds contribute to the public balance view; shielded funds are hidden.
-- **Macro-Transparency**: Uses Supply Distribution metrics to prove decentralization without exposing individual identities.
-- **Whale Protection**: Any transaction $\ge$ 50,000 EGOC is automatically masked as **🛡 Shielded** in the Explorer to prevent tracking of large holders.
-- **ZK-Proofs**: Validity verified via zero-knowledge proofs at the protocol level.
+- **How it works**: Move EGOC into the shielded pool with a `shield` deposit; the wallet keeps a secret note. Later `unshield` to any address. The withdrawal's `from` is the pool address, identical on every withdrawal, so the sender is not on the chain and nothing links the withdrawal to the deposit that funded it.
+- **Proof system**: Winterfell STARKs over Goldilocks with Rescue Prime hashing. Hash-based, so **no trusted setup** and no toxic waste, and it stays post-quantum like the signatures. A withdrawal proof is ~22 KB and verifies in ~4 ms.
+- **Double-spend guard**: Spending publishes a **nullifier**, a one-way fingerprint of the note. The chain records it and refuses any repeat, but it reveals nothing about which deposit it came from.
+- **Denominations**: Notes are 1, 10, 100, 1,000 or 10,000 EGOC. Amounts must be public for the ledger to balance, so identical sizes are what stop the amount itself identifying you.
+- **Multiple notes**: One withdrawal spends up to 16 notes, so an amount like 350 EGOC is a single transaction (3x100 + 5x10) rather than eight.
+- **What is NOT hidden**: Amounts are visible on both the deposit and the withdrawal. Only the link between them is hidden.
+- **Anonymity set**: Privacy comes from how many others hold notes of the size being spent. A near-empty pool gives little cover, and withdrawing straight after depositing is linkable by timing. Waiting, splitting across addresses and dates, and using common denominations all help. Large holders are the most exposed.
+- **Not audited**: The pool has had no external review. Testnet only; treat as experimental.
+- **Not implemented**: Shielded-to-shielded transfers, which would hide amounts too and remove the need for denominations.
 
 ## App pages
 Wallet (send/receive/QR), Storage (AES-256-GCM upload/download), EgoSafe (encrypt+share egoshare1 bundles), Explorer (live blocks/txs from RocksDB), Earnings (rewards + session counter), Messenger (P2P E2E encrypted chat via DHT inbox), Settings (PIN/recovery/QR keys), Contracts (deploy/call Urego with testnet/mainnet selector + dry run), Coverage, Staking, Market (live prices & charts), Governance (DAO proposals + two-type voting), Compute (GPU/CPU rental marketplace, AI Workspace, GPU clusters).
@@ -1057,7 +1060,27 @@ Just open any of the tabs above to configure your node. Your **Deterministic Rew
     } else if q.contains("coverage") || q.contains("poc") || q.contains("beacon") {
         "Proof-of-Coverage (PoC) rewards nodes for maintaining high network uptime and reachability. Nodes ping the network, mapping their location to H3 cells, to build a resilient decentralized mesh."
     } else if q.contains("privacy") || q.contains("shielded") || q.contains("private") || q.contains("mask") {
-        "Ego uses **Shielded Transactions** to ensure financial privacy. When a transaction is private, the sender and receiver addresses are masked with a **🛡 Shielded** badge on the public ledger.\n\n### Privacy Protections\n- **Identity Masking**: Hides public keys from the Explorer and trackers.\n- **Whale Protection**: Any transaction over **50,000 EGOC** is automatically shielded to prevent profiling.\n- **Tracking Prevention**: No address history search or 'Rich Lists' (Holders) to prevent profiling.\n- **Macro-Transparency**: Shows supply distribution audits instead of individual balances.\n- **ZK-Enforced**: Uses Zero-Knowledge logic to verify validity without exposing metadata."
+        r#"Ego has a **shielded pool** — real transaction privacy, not a display setting.
+
+### How it works
+1. **Shield** — move EGOC into the pool. Your wallet keeps a secret *note*. This deposit is public: everyone sees you put funds in.
+2. **Unshield** — later, withdraw to any address. The withdrawal's sender is the **pool's own address**, identical on every withdrawal, and it carries a zero-knowledge proof instead of a signature.
+
+Nothing on the chain connects the two. An observer sees a deposit, and separately a withdrawal, and cannot tell which paid for which.
+
+### The cryptography
+- **STARK proofs** (Winterfell over Goldilocks, Rescue Prime hashing). Hash-based, so there is **no trusted setup** — no ceremony, no toxic waste — and it stays post-quantum like the signatures.
+- A withdrawal proof is about **22 KB** and verifies in roughly **4 ms**.
+- **Nullifiers** stop double spends: spending publishes a one-way fingerprint of the note, which the chain records and refuses twice, while revealing nothing about which deposit it came from.
+
+### Using it
+Press **Shield** in the wallet, move funds in, then send from the pool. Notes come in fixed sizes — **1, 10, 100, 1,000, 10,000 EGOC** — and one withdrawal spends up to **16** of them, so 350 EGOC is a single transaction (3x100 + 5x10).
+
+### Be realistic about the limits
+- **Amounts stay public.** They must be, or nodes could not check the pool balances. Only the *link* is hidden.
+- **Privacy comes from the crowd.** Your cover is everyone else holding notes of the size you spend. A near-empty pool gives little, and withdrawing right after depositing is linkable by timing. Wait, split across addresses and dates, and prefer denominations others hold. Large holders are the most exposed.
+- **Not audited.** No external review yet — testnet only, treat it as experimental.
+- **Shielded-to-shielded transfers**, which would hide amounts too, are not built yet."#
     } else {
         r#"I am Ego AI. Ask me anything about Ego Blockchain — here's what I cover.
 
