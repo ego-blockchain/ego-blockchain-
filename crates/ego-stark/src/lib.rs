@@ -1,5 +1,7 @@
+pub mod air;
 pub mod merkle;
 pub mod note;
+pub mod prove;
 
 pub use note::{Note, NoteError};
 
