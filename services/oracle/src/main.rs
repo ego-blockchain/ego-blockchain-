@@ -969,6 +969,39 @@ async fn handle_snapshot_submit(
     (StatusCode::OK, Json(json!({ "ok": true, "height": new_h.max(cur_h) })))
 }
 
+#[derive(serde::Deserialize)]
+struct GapQuery {
+    from: Option<u64>,
+    to:   Option<u64>,
+}
+
+const MAX_GAP_SCAN: u64 = 5_000;
+
+async fn handle_chain_gaps(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<GapQuery>,
+) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
+    let tip  = state.stat_tip.load(Ordering::Relaxed);
+    let to   = q.to.unwrap_or(tip);
+    let from = q.from.unwrap_or_else(|| to.saturating_sub(MAX_GAP_SCAN)).max(1);
+    if to < from {
+        return Json(json!({ "from": from, "to": to, "tip": tip, "missing": Vec::<u64>::new() }));
+    }
+    if to - from + 1 > MAX_GAP_SCAN {
+        return Json(json!({ "error": format!("range wider than {} heights", MAX_GAP_SCAN) }));
+    }
+    let have: std::collections::HashSet<u64> = {
+        let chain = state.chain.read().await;
+        chain.blocks.iter()
+            .filter_map(|b| b["height"].as_u64())
+            .filter(|h| *h >= from && *h <= to)
+            .collect()
+    };
+    let missing: Vec<u64> = (from..=to).filter(|h| !have.contains(h)).collect();
+    Json(json!({ "from": from, "to": to, "tip": tip, "missing": missing }))
+}
+
 async fn handle_snapshot_get(State(state): State<AppState>) -> impl IntoResponse {
     let snap = state.snapshot.read().await;
     match snap.as_ref() {
@@ -1306,6 +1339,8 @@ async fn main() {
         .route("/chain/blocks",             get(handle_chain_blocks))
         .route("/chain/transactions",       get(handle_chain_transactions))
         .route("/chain/submit",             post(handle_chain_submit))
+        .route("/chain/gaps",               get(handle_chain_gaps))
+        .route("/chain/snapshot",           post(handle_snapshot_submit).get(handle_snapshot_get))
         .route("/prices",                   get(handle_prices))
         .route("/price/:symbol",            get(handle_price))
         .route("/egoc",                     get(handle_egoc))

@@ -491,6 +491,105 @@ pub async fn push_block_to_oracle(block: &crate::ledger::LedgerBlock, txs: &[cra
     oracle_post(&client, "/chain/submit", &body).await;
 }
 
+pub const ARCHIVE_BACKFILL_WINDOW: u64 = 5_000;
+const ARCHIVE_BATCH: usize = 25;
+const ARCHIVE_MAX_PER_TICK: usize = 250;
+
+pub async fn oracle_archive_tick() {
+    if offline_mode() || !oracle_push_enabled() || !is_oracle_writer() {
+        return;
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let tip = tokio::task::spawn_blocking(|| crate::chain_db::latest_block_info().0)
+        .await
+        .unwrap_or(0);
+    if tip == 0 {
+        return;
+    }
+    let from = tip.saturating_sub(ARCHIVE_BACKFILL_WINDOW).max(1);
+
+    #[derive(serde::Deserialize, Default)]
+    struct GapsResp {
+        #[serde(default)]
+        missing: Vec<u64>,
+    }
+    let gaps = match oracle_get(&client, &format!("/chain/gaps?from={}&to={}", from, tip)).await {
+        Some(r) => r.json::<GapsResp>().await.unwrap_or_default(),
+        None => return,
+    };
+    if gaps.missing.is_empty() {
+        return;
+    }
+    eprintln!("[Archive] oracle missing {} block(s) in {}..={} — backfilling",
+        gaps.missing.len(), from, tip);
+
+    let mut sent = 0usize;
+    for chunk in gaps.missing.chunks(ARCHIVE_BATCH) {
+        if sent >= ARCHIVE_MAX_PER_TICK {
+            eprintln!("[Archive] per-tick cap reached ({}) — resuming next tick", ARCHIVE_MAX_PER_TICK);
+            break;
+        }
+        let heights: Vec<u64> = chunk.to_vec();
+        let (blocks, txs) = tokio::task::spawn_blocking(move || {
+            let mut blocks: Vec<crate::ledger::LedgerBlock> = Vec::new();
+            let mut txs: Vec<crate::ledger::LedgerTx> = Vec::new();
+            for h in heights {
+                if let Some(b) = crate::chain_db::get_block_by_height(h) {
+                    txs.extend(crate::chain_db::get_txs_for_block(h));
+                    blocks.push(b);
+                }
+            }
+            (blocks, txs)
+        })
+        .await
+        .unwrap_or_default();
+        if blocks.is_empty() {
+            continue;
+        }
+        let n = blocks.len();
+        let body = serde_json::json!({ "blocks": blocks, "transactions": txs });
+        oracle_post(&client, "/chain/submit", &body).await;
+        sent += n;
+    }
+    if sent > 0 {
+        eprintln!("[Archive] backfilled {} block(s) to the oracle", sent);
+    }
+}
+
+pub async fn push_snapshot_to_oracle() {
+    if offline_mode() || !oracle_push_enabled() || !is_oracle_writer() {
+        return;
+    }
+    let snap = match tokio::task::spawn_blocking(crate::chain_db::export_state_snapshot).await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if snap.height == 0 || snap.blocks.is_empty() {
+        return;
+    }
+    let body = match serde_json::to_value(&snap) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    eprintln!("[Archive] pushing state snapshot at height {} ({} blocks)",
+        snap.height, snap.blocks.len());
+    oracle_post(&client, "/chain/snapshot", &body).await;
+}
+
 pub static RELAY_CIRCUIT_READY: AtomicBool = AtomicBool::new(false);
 
 pub static IS_PUBLIC_REACHABLE: AtomicBool = AtomicBool::new(false);

@@ -1231,6 +1231,7 @@ fn main() {
                 crate::p2p::register_with_relay_as_ego_node().await;
 
                 // PoSt check runs every 6 h — track iteration count (30s × 720 = 6h).
+                const SNAPSHOT_EVERY_N_TICKS: u32 = 20;
                 let mut loop_tick: u32 = 0;
                 const POST_EVERY_N_TICKS: u32 = 720;  // 720 × 30s = 6 h
                 // Once the network has enough independent nodes the RPC oracle
@@ -1317,6 +1318,12 @@ fn main() {
 
                     if loop_tick % POST_EVERY_N_TICKS == 1 {
                         bounded!(30, crate::proof::run_post_checks(Some(&handle_startup)));
+                    }
+
+                    bounded!(30, crate::p2p::oracle_archive_tick());
+
+                    if loop_tick % SNAPSHOT_EVERY_N_TICKS == 3 {
+                        bounded!(90, crate::p2p::push_snapshot_to_oracle());
                     }
 
                     let shard_peers = crate::p2p::get_known_peers();
