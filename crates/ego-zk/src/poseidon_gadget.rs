@@ -45,7 +45,6 @@
 use ark_bn254::Fr;
 use ark_ff::Zero;
 use ark_r1cs_std::fields::fp::FpVar;
-use ark_r1cs_std::prelude::*;
 use ark_relations::r1cs::SynthesisError;
 use light_poseidon::parameters::bn254_x5::get_poseidon_parameters;
 
@@ -194,6 +193,7 @@ pub fn nullifier_gadget(secret: &FpVar<Fr>, rho: &FpVar<Fr>) -> Result<FpVar<Fr>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ark_r1cs_std::prelude::*;
     use ark_relations::r1cs::{ConstraintSystem, ConstraintSystemRef};
     use ark_std::{test_rng, UniformRand};
     use light_poseidon::{Poseidon, PoseidonBytesHasher, PoseidonHasher};
