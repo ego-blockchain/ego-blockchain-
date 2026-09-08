@@ -96,6 +96,16 @@ libp2p-stream = { version = "0.4.0-alpha" }
 tokio-util = { version = "0.7", features = ["compat"] }
 
 keyring = "2"
+light-poseidon = "0.4"
+# Pinned to match light-poseidon, which is on arkworks 0.5. The Fr types across
+# arkworks major versions are distinct, so a mismatch here does not fail at
+# runtime, it fails to compile with a trait bound that looks unrelated.
+#
+# ego-zk is still on 0.4. That is fine while nothing shares field elements
+# across the two, and it has to be resolved before the circuit is written,
+# because the circuit and the hash must agree on one field type.
+ark-bn254 = { version = "0.5", default-features = false, features = ["std", "curve"] }
+ark-ff = { version = "0.5", default-features = false, features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["dpapi", "wincrypt", "winbase", "dwmapi", "windef"] }
