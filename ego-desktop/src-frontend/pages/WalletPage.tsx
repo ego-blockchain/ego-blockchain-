@@ -103,7 +103,6 @@ interface SendForm {
   amount: string;
   memo: string;
   isPrivate: boolean;
-  shielded: boolean;
   viaRadio: boolean;
 }
 
@@ -400,7 +399,7 @@ const WalletPage: React.FC = () => {
   const [selectedTx, setSelectedTx] = useState<LedgerTx | null>(null);
   const [showSend, setShowSend]     = useState(false);
   const [showReceive, setShowReceive] = useState(false);
-  const [sendForm, setSendForm]     = useState<SendForm>({ to: '', amount: '', memo: '', isPrivate: false, viaRadio: false, shielded: false });
+  const [sendForm, setSendForm]     = useState<SendForm>({ to: '', amount: '', memo: '', isPrivate: false, viaRadio: false });
   const [sending, setSending]       = useState(false);
   const [txResult, setTxResult]         = useState<TxResult | null>(null);
   const [sideband, setSideband]         = useState<SidebandStatus | null>(null);
@@ -659,37 +658,9 @@ const WalletPage: React.FC = () => {
     return () => { alive = false; clearInterval(id); };
   }, []);
 
-  const shieldReady = Boolean(shielded?.enabled && shielded?.active);
-
   async function submitTx() {
     if (!sendForm.to || !sendForm.amount) return;
     const amount  = Math.floor(parseFloat(sendForm.amount) * 1_000_000);
-
-    if (sendForm.shielded) {
-      const note = (shielded?.notes ?? []).find(n => n.status === 'ready' && n.value_uegoc === amount);
-      if (!note) {
-        setTxResult({
-          hash: '', success: false,
-          message: `No shielded note of exactly ${(amount / 1_000_000).toLocaleString()} EGOC is ready. `
-                 + `A shielded send spends one whole note, so the amount must match one you hold.`,
-        });
-        return;
-      }
-      try {
-        const res = await invoke<{ hash: string }>('shield_withdraw', {
-          commitment: note.commitment, recipient: sendForm.to,
-        });
-        setEmailStep('idle');
-        setTxResult({ hash: res.hash, success: true, message: 'Sent from your shielded balance' });
-        load().catch(() => {});
-        refreshShielded();
-        reloadWallet();
-      } catch (e: any) {
-        setEmailStep('idle');
-        setTxResult({ hash: '', success: false, message: String(e).replace(/^.*Error:/, '').trim() });
-      }
-      return;
-    }
 
     const request = {
       to_address: sendForm.to,
@@ -747,7 +718,7 @@ const WalletPage: React.FC = () => {
     setSidebandMsg('');
     setShowSend(false);
     setSending(false);
-    setSendForm({ to: '', amount: '', memo: '', isPrivate: false, viaRadio: false, shielded: false });
+    setSendForm({ to: '', amount: '', memo: '', isPrivate: false, viaRadio: false });
     setTxResult(null);
     setTxConfirmedHeight(null);
     setEmailStep('idle');
@@ -1275,7 +1246,7 @@ const WalletPage: React.FC = () => {
 
         <div className={`grid gap-2 ${
           ({ 4: 'grid-cols-4', 5: 'grid-cols-5', 6: 'grid-cols-6' } as Record<number, string>)[
-            (RAMP_ENABLED ? 5 : 4)
+            (RAMP_ENABLED ? 5 : 4) + (shielded?.enabled && shielded?.active ? 1 : 0)
           ]
         }`}>
           {[
@@ -1285,6 +1256,11 @@ const WalletPage: React.FC = () => {
               action: () => { setShowSend(true); setTxResult(null); invoke<{ fee_uegoc: number; fee_usd: number }>('get_tx_fee', { txType: 'transfer' }).then(setTxFee).catch(() => {}); }
             },
             { label: '↓ Receive', live: false, action: () => setShowReceive(true) },
+            ...(shielded?.enabled && shielded?.active ? [{
+              label: '🛡 Shield',
+              live: false,
+              action: () => { setShieldMsg(null); setShowShield(true); refreshShielded(); },
+            }] : []),
             { label: '⇄ Swap',   live: true,  action: openSwap },
             ...(RAMP_ENABLED ? [{
               label: '$ Buy',
@@ -3309,31 +3285,6 @@ const WalletPage: React.FC = () => {
                     />
                   </div>
                   <div className="flex flex-wrap gap-3">
-                  <div className={`flex items-center justify-between p-3 rounded-xl border flex-1 min-w-[240px] ${
-                    sendForm.shielded ? 'bg-amber-500/10 border-amber-500/40' : 'bg-gray-900/50 border-gray-700/50'
-                  }`}>
-                    <div className="flex items-center gap-3">
-                      <div className="w-8 h-8 rounded-lg bg-amber-500/10 flex items-center justify-center text-amber-400">&#128737;</div>
-                      <div>
-                        <div className="text-sm font-semibold">Send shielded</div>
-                        <div className="text-[10px] text-gray-500 uppercase font-bold tracking-wider">
-                          {!shieldReady
-                            ? 'Unavailable on this network'
-                            : `${(( shielded?.ready_balance_uegoc ?? 0) / 1_000_000).toLocaleString()} EGOC ready`}
-                        </div>
-                      </div>
-                    </div>
-                    <button
-                      disabled={!shieldReady}
-                      onClick={() => setSendForm(f => ({ ...f, shielded: !f.shielded }))}
-                      className={`w-10 h-5 rounded-full transition-colors relative ${
-                        !shieldReady ? 'bg-gray-800 opacity-50 cursor-not-allowed'
-                          : sendForm.shielded ? 'bg-amber-500' : 'bg-gray-700'
-                      }`}
-                    >
-                      <div className={`absolute top-1 w-3 h-3 rounded-full bg-white transition-all ${sendForm.shielded ? 'left-6' : 'left-1'}`} />
-                    </button>
-                  </div>
                   {sideband?.enabled && (
                     <div className="flex items-center justify-between bg-gray-900/50 p-3 rounded-xl border border-gray-700/50 flex-1 min-w-[240px]">
                       <div className="flex items-center gap-3">
@@ -3354,24 +3305,6 @@ const WalletPage: React.FC = () => {
                     </div>
                   )}
                   </div>
-                  {sendForm.shielded && (
-                    <div className="bg-amber-500/5 border border-amber-500/20 rounded-xl p-3 text-[11px] text-amber-200/70 leading-relaxed">
-                      The chain records a withdrawal from the shielded pool to the recipient.
-                      Your address is not on it, and nothing links it to the deposit it came from.
-                      <div className="mt-1.5 text-amber-200/50">
-                        One whole note is spent, so the amount must match one you hold:{' '}
-                        {[...new Set((shielded?.notes ?? []).filter(n => n.status === 'ready').map(n => n.value_uegoc))]
-                          .sort((a, b) => a - b).map(v => (v / 1_000_000).toLocaleString()).join(', ')
-                          || 'none yet'} EGOC.
-                      </div>
-                      <button
-                        onClick={() => { setShieldMsg(null); setShowShield(true); refreshShielded(); }}
-                        className="mt-2 px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-200 text-[11px] font-semibold transition"
-                      >
-                        Move funds into the pool
-                      </button>
-                    </div>
-                  )}
                   {sendForm.viaRadio && (
                     <div className="bg-amber-500/5 border border-amber-500/20 rounded-xl p-3 text-[11px] text-amber-200/70 leading-relaxed">
                       This will be written to your offline link and not sent over the
