@@ -77,3 +77,14 @@ services/bridge-relayer/target/
 ego-desktop-mvp/src-tauri/.cargo/config.toml
 ego-desktop/src-tauri/.cargo/config.toml
 .claude/
+
+*.key
+*.pem
+oracle-chain.json
+oracle-snapshot.json
+*.db/
+alerts.db
+mailbox.db
+ego-node-chain.db
+testnet/data/
+ego-relay/
