@@ -353,7 +353,13 @@ pub fn prove_withdrawal(
 }
 
 pub fn is_enabled() -> bool {
-    std::env::var("EGO_SHIELDED_POOL").as_deref() == Ok("unaudited-testnet-only")
+    match std::env::var("EGO_SHIELDED_POOL") {
+        Ok(v) => {
+            let v = v.trim();
+            !(v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => true,
+    }
 }
 
 #[cfg(test)]
@@ -597,8 +603,30 @@ mod tests {
     }
 
     #[test]
-    fn the_pool_is_off_unless_deliberately_and_explicitly_enabled() {
-        assert!(!is_enabled());
+    fn the_client_pool_is_available_by_default_and_can_be_switched_off() {
+        std::env::remove_var("EGO_SHIELDED_POOL");
+        assert!(is_enabled(), "shielding must be reachable without setting an env var");
+
+        for off in ["0", "off", "OFF", "false", "False", " off "] {
+            std::env::set_var("EGO_SHIELDED_POOL", off);
+            assert!(!is_enabled(), "{off:?} must switch the pool off");
+        }
+        for on in ["1", "on", "yes", "unaudited-testnet-only"] {
+            std::env::set_var("EGO_SHIELDED_POOL", on);
+            assert!(is_enabled(), "{on:?} must leave the pool on");
+        }
+        std::env::remove_var("EGO_SHIELDED_POOL");
+    }
+
+    #[test]
+    fn the_consensus_rule_is_not_switched_on_by_the_client_flag() {
+        std::env::remove_var("EGO_SHIELDED_POOL");
+        std::env::remove_var("EGO_SHIELDED_POOL_HEIGHT");
+        assert!(is_enabled(), "client gate is on");
+        assert!(
+            !crate::shielded_chain::rule_active(u64::MAX),
+            "the consensus rule must stay off until activated network-wide: a node that              accepts shield transactions while its peers reject them forks the chain",
+        );
     }
 
     #[test]
