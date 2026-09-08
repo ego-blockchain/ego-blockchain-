@@ -1,7 +1,7 @@
 use crate::{merge_nodes, Digest, Hash};
 use winterfell::crypto::Hasher;
 
-pub const POOL_TREE_DEPTH: usize = 32;
+pub const POOL_TREE_DEPTH: usize = 29;
 
 pub fn empty_subtree_roots(depth: usize) -> Vec<Digest> {
     let mut zeros = Vec::with_capacity(depth + 1);
