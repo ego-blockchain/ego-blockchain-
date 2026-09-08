@@ -291,8 +291,14 @@ impl ShardedMempool {
             }
         }
 
-        if let Some(nf) = crate::shielded_chain::unshield_nullifier(&tx) {
-            if s.iter().any(|t| crate::shielded_chain::unshield_nullifier(t) == Some(nf)) {
+        let incoming_nfs = crate::shielded_chain::unshield_nullifiers(&tx);
+        if !incoming_nfs.is_empty() {
+            let clashes = s.iter().any(|t| {
+                crate::shielded_chain::unshield_nullifiers(t)
+                    .iter()
+                    .any(|n| incoming_nfs.contains(n))
+            });
+            if clashes {
                 self.seen_hashes[shard].lock().expect("lock poisoned").remove(&tx.hash);
                 return Err("a withdrawal for this note is already pending".into());
             }

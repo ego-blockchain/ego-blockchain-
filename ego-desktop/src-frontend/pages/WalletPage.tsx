@@ -407,7 +407,7 @@ const WalletPage: React.FC = () => {
   const [showShield, setShowShield]     = useState(false);
   const [shieldAmt, setShieldAmt]       = useState('');
   const [shieldTo, setShieldTo]         = useState('');
-  const [shieldNote, setShieldNote]     = useState('');
+  const [shieldNotes, setShieldNotes]   = useState<string[]>([]);
   const [shieldBusy, setShieldBusy]     = useState(false);
   const [shieldMsg, setShieldMsg]       = useState<string | null>(null);
   const [sidebandMsg, setSidebandMsg]   = useState<string>('');
@@ -2922,11 +2922,12 @@ const WalletPage: React.FC = () => {
               <div className="rounded-xl bg-gray-900 border border-gray-700 p-4 space-y-3">
                 <div className="text-sm font-semibold">Unshield one note</div>
                 <select
-                  value={shieldNote}
-                  onChange={e => setShieldNote(e.target.value)}
+                  multiple
+                  size={6}
+                  value={shieldNotes}
+                  onChange={e => setShieldNotes(Array.from(e.target.selectedOptions, o => o.value))}
                   className="w-full bg-gray-800 border border-gray-700 focus:border-amber-500 rounded-xl px-4 py-3 text-sm outline-none transition"
                 >
-                  <option value="">Choose a note…</option>
                   {(shielded?.notes ?? []).filter(n => n.status === 'ready').map(n => (
                     <option key={n.commitment} value={n.commitment}>
                       {(n.value_uegoc / 1_000_000).toLocaleString()} EGOC · {n.commitment.slice(0, 10)}…
@@ -2940,28 +2941,31 @@ const WalletPage: React.FC = () => {
                   placeholder="Recipient address (egot1…)"
                   className="w-full bg-gray-800 border border-gray-700 focus:border-amber-500 rounded-xl px-4 py-3 text-sm outline-none transition font-mono"
                 />
-                {shieldNote && shielded && (() => {
-                  const n = shielded.notes.find(x => x.commitment === shieldNote);
-                  if (!n) return null;
+                {shieldNotes.length > 0 && shielded && (() => {
+                  const picked = shielded.notes.filter(x => shieldNotes.includes(x.commitment));
+                  const total  = picked.reduce((a, n) => a + n.value_uegoc, 0);
                   return (
                     <div className="text-xs text-gray-400">
-                      Pays {((n.value_uegoc - shielded.current_fee_uegoc) / 1_000_000).toFixed(4)} EGOC after a {(shielded.current_fee_uegoc / 1_000_000).toFixed(4)} EGOC fee.
-                      Building the proof takes a few seconds.
+                      Spending {picked.length} note{picked.length === 1 ? '' : 's'} totalling{' '}
+                      {(total / 1_000_000).toLocaleString()} EGOC. Pays{' '}
+                      {((total - shielded.current_fee_uegoc) / 1_000_000).toFixed(4)} EGOC after a{' '}
+                      {(shielded.current_fee_uegoc / 1_000_000).toFixed(4)} EGOC fee.
+                      Each note needs its own proof, so this takes a few seconds per note.
                     </div>
                   );
                 })()}
                 <button
-                  disabled={shieldBusy || !shieldNote || !shieldTo.trim().startsWith('egot1')}
+                  disabled={shieldBusy || shieldNotes.length === 0 || !shieldTo.trim().startsWith('egot1')}
                   onClick={async () => {
                     setShieldBusy(true);
                     setShieldMsg(null);
                     try {
                       const res = await invoke<{ hash: string; amount_uegoc: number; fee_uegoc: number; payout_uegoc: number; recipient: string }>('shield_withdraw', {
-                        commitment: shieldNote,
+                        commitments: shieldNotes,
                         recipient: shieldTo.trim(),
                       });
                       setShieldMsg(`Unshielding ${(res.payout_uegoc / 1_000_000).toFixed(4)} EGOC to ${res.recipient.slice(0, 14)}… (${res.hash.slice(0, 12)}…). It lands with the next block.`);
-                      setShieldNote('');
+                      setShieldNotes([]);
                       refreshShielded();
                     } catch (err) {
                       setShieldMsg(String(err).replace(/^.*Error:/, '').trim());

@@ -256,13 +256,34 @@ pub fn parse_shield_memo(memo: &Option<String>) -> Option<[u8; 32]> {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct UnshieldBody {
+pub struct UnshieldSpend {
     pub root: String,
     pub nullifier: String,
     pub amount_uegoc: u64,
-    pub recipient: String,
     pub fee_uegoc: u64,
     pub proof: String,
+}
+
+impl UnshieldSpend {
+    pub fn root_bytes(&self) -> Result<[u8; 32], String> {
+        UnshieldBody::bytes32("root", &self.root)
+    }
+    pub fn nullifier_bytes(&self) -> Result<[u8; 32], String> {
+        UnshieldBody::bytes32("nullifier", &self.nullifier)
+    }
+    pub fn proof_bytes(&self) -> Result<Vec<u8>, String> {
+        hex::decode(&self.proof).map_err(|_| "unshield proof is not hex".to_string())
+    }
+}
+
+pub const MAX_UNSHIELD_SPENDS: usize = 16;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnshieldBody {
+    pub spends: Vec<UnshieldSpend>,
+    pub recipient: String,
+    pub amount_uegoc: u64,
+    pub fee_uegoc: u64,
 }
 
 impl UnshieldBody {
@@ -276,23 +297,17 @@ impl UnshieldBody {
         format!("0x{}", ego_core::hash_data(&m).to_hex())
     }
 
-    fn bytes32(field: &str, value: &str) -> Result<[u8; 32], String> {
+    pub(crate) fn bytes32(field: &str, value: &str) -> Result<[u8; 32], String> {
         hex::decode(value)
             .ok()
             .and_then(|v| v.try_into().ok())
             .ok_or_else(|| format!("unshield {field} is not 32 hex bytes"))
     }
 
-    pub fn root_bytes(&self) -> Result<[u8; 32], String> {
-        Self::bytes32("root", &self.root)
-    }
-
-    pub fn nullifier_bytes(&self) -> Result<[u8; 32], String> {
-        Self::bytes32("nullifier", &self.nullifier)
-    }
-
-    pub fn proof_bytes(&self) -> Result<Vec<u8>, String> {
-        hex::decode(&self.proof).map_err(|_| "unshield proof is not hex".to_string())
+    pub fn totals(&self) -> (u64, u64) {
+        self.spends.iter().fold((0u64, 0u64), |(a, f), sp| {
+            (a.saturating_add(sp.amount_uegoc), f.saturating_add(sp.fee_uegoc))
+        })
     }
 }
 
@@ -300,11 +315,12 @@ pub fn parse_unshield_body(call_args: &str) -> Result<UnshieldBody, String> {
     serde_json::from_str::<UnshieldBody>(call_args).map_err(|e| format!("unshield body: {e}"))
 }
 
-pub fn unshield_nullifier(tx: &LedgerTx) -> Option<[u8; 32]> {
+pub fn unshield_nullifiers(tx: &LedgerTx) -> Vec<[u8; 32]> {
     if !is_unshield(tx) {
-        return None;
+        return Vec::new();
     }
-    parse_unshield_body(&tx.call_args).ok()?.nullifier_bytes().ok()
+    let Ok(body) = parse_unshield_body(&tx.call_args) else { return Vec::new() };
+    body.spends.iter().filter_map(|sp| sp.nullifier_bytes().ok()).collect()
 }
 
 fn recipient_is_acceptable(addr: &str) -> Result<(), String> {
@@ -362,26 +378,71 @@ fn validate_unshield_in(
     if !tx.signature.is_empty() || !tx.public_key_ed25519.is_empty() || tx.nonce != 0 {
         return Err(format!("unshield {} must carry no signature and no nonce", tx.hash));
     }
-    if !is_denomination(tx.amount) {
-        return Err(format!("unshield {} of {} uEGOC is not a denomination", tx.hash, tx.amount));
+    if body.spends.is_empty() {
+        return Err(format!("unshield {} spends nothing", tx.hash));
+    }
+    if body.spends.len() > MAX_UNSHIELD_SPENDS {
+        return Err(format!(
+            "unshield {} spends {} notes, over the {} limit",
+            tx.hash, body.spends.len(), MAX_UNSHIELD_SPENDS
+        ));
+    }
+    let (total_amount, total_fee) = body.totals();
+    if total_amount != tx.amount {
+        return Err(format!(
+            "unshield {} spends {} uEGOC but claims {}",
+            tx.hash, total_amount, tx.amount
+        ));
+    }
+    if total_fee != tx.fee_uegoc {
+        return Err(format!(
+            "unshield {} fee shares total {} uEGOC but the tx charges {}",
+            tx.hash, total_fee, tx.fee_uegoc
+        ));
     }
     if tx.fee_uegoc < crate::mempool::MIN_FEE_UEGOC || tx.fee_uegoc >= tx.amount {
         return Err(format!("unshield {} fee {} uEGOC is out of range", tx.hash, tx.fee_uegoc));
     }
     recipient_is_acceptable(&tx.to)?;
-    let root = body.root_bytes()?;
-    if !state.is_known_root(&root) {
-        return Err(format!("unshield {} proves against a root the pool does not have", tx.hash));
-    }
-    let nullifier = body.nullifier_bytes()?;
-    if nullifier_spent_in(db, &nullifier) || !seen_nullifiers.insert(nullifier) {
-        return Err(format!("unshield {} spends a note that is already spent", tx.hash));
-    }
-    if !state.has_note(tx.amount) {
-        return Err(format!(
-            "unshield {} claims a {} uEGOC note but the pool holds none of that size",
-            tx.hash, tx.amount
-        ));
+    let mut wanted: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let recipient = recipient_digest(&tx.to);
+    for sp in &body.spends {
+        if !is_denomination(sp.amount_uegoc) {
+            return Err(format!(
+                "unshield {} spends {} uEGOC, which is not a denomination",
+                tx.hash, sp.amount_uegoc
+            ));
+        }
+        let root = sp.root_bytes()?;
+        if !state.is_known_root(&root) {
+            return Err(format!("unshield {} proves against a root the pool does not have", tx.hash));
+        }
+        let nullifier = sp.nullifier_bytes()?;
+        if nullifier_spent_in(db, &nullifier) || !seen_nullifiers.insert(nullifier) {
+            return Err(format!("unshield {} spends a note that is already spent", tx.hash));
+        }
+        let held = denomination_index(sp.amount_uegoc)
+            .and_then(|i| state.outstanding.get(i).copied())
+            .unwrap_or(0);
+        let want = wanted.entry(sp.amount_uegoc).or_insert(0);
+        *want += 1;
+        if *want > held {
+            return Err(if held == 0 {
+                format!(
+                    "unshield {} claims a {} uEGOC note but the pool holds none of that size",
+                    tx.hash, sp.amount_uegoc
+                )
+            } else {
+                format!(
+                    "unshield {} spends {} notes of {} uEGOC but the pool holds only {}",
+                    tx.hash, want, sp.amount_uegoc, held
+                )
+            });
+        }
+        let proof = sp.proof_bytes()?;
+        if !verify_proof_bytes(&proof, root, nullifier, sp.amount_uegoc, recipient, sp.fee_uegoc) {
+            return Err(format!("unshield {} proof does not verify", tx.hash));
+        }
     }
     if tx.amount > state.balance_uegoc {
         return Err(format!(
@@ -389,19 +450,7 @@ fn validate_unshield_in(
             tx.hash, tx.amount, state.balance_uegoc
         ));
     }
-    let proof = body.proof_bytes()?;
-    if verify_proof_bytes(
-        &proof,
-        root,
-        nullifier,
-        tx.amount,
-        recipient_digest(&tx.to),
-        tx.fee_uegoc,
-    ) {
-        Ok(())
-    } else {
-        Err(format!("unshield {} proof does not verify", tx.hash))
-    }
+    Ok(())
 }
 
 pub fn verify_incoming_deposit(tx: &LedgerTx) -> Result<(), String> {
@@ -444,7 +493,11 @@ pub fn validate_block_shielded_txs(height: u64, txs: &[LedgerTx]) -> Result<(), 
         } else if is_unshield(tx) {
             validate_unshield_in(db, &state, tx, &mut seen_nullifiers)?;
             state.balance_uegoc = state.balance_uegoc.saturating_sub(tx.amount);
-            state.note_spent(tx.amount);
+            if let Ok(body) = parse_unshield_body(&tx.call_args) {
+                for sp in &body.spends {
+                    state.note_spent(sp.amount_uegoc);
+                }
+            }
         }
     }
     Ok(())
@@ -477,24 +530,37 @@ pub fn apply_block(db: &DB, batch: &mut WriteBatch, height: u64, txs: &[&LedgerT
                 Err(e) => tracing::error!("[Shielded] block #{height}: deposit {} not recorded: {e}", tx.hash),
             }
         } else if is_unshield(tx) {
-            let Some(nullifier) = unshield_nullifier(tx) else { continue };
-            if nullifier_spent_in(db, &nullifier) || !seen_nullifiers.insert(nullifier) {
+            let Ok(body) = parse_unshield_body(&tx.call_args) else { continue };
+            let nullifiers = unshield_nullifiers(tx);
+            if nullifiers.len() != body.spends.len() {
+                tracing::error!(
+                    "[Shielded] block #{height}: withdrawal {} has unreadable nullifiers, not recorded",
+                    tx.hash
+                );
+                continue;
+            }
+            if nullifiers.iter().any(|n| nullifier_spent_in(db, n) || seen_nullifiers.contains(n)) {
                 tracing::error!(
                     "[Shielded] block #{height}: withdrawal {} spends a spent note, not recorded",
                     tx.hash
                 );
                 continue;
             }
-            batch.put_cf(cf, nf_key(&nullifier), u64_le(height));
+            for n in &nullifiers {
+                seen_nullifiers.insert(*n);
+                batch.put_cf(cf, nf_key(n), u64_le(height));
+            }
             state.balance_uegoc = state.balance_uegoc.saturating_sub(tx.amount);
-            if !state.note_spent(tx.amount) {
-                crate::invariants::report(crate::invariants::Violation::OutstandingNotes {
-                    height,
-                    detail: format!(
-                        "withdrawal {} spent a {} uEGOC note the pool never held",
-                        tx.hash, tx.amount
-                    ),
-                });
+            for sp in &body.spends {
+                if !state.note_spent(sp.amount_uegoc) {
+                    crate::invariants::report(crate::invariants::Violation::OutstandingNotes {
+                        height,
+                        detail: format!(
+                            "withdrawal {} spent a {} uEGOC note the pool never held",
+                            tx.hash, sp.amount_uegoc
+                        ),
+                    });
+                }
             }
             changed = true;
         }
@@ -595,7 +661,7 @@ pub fn rollback(db: &DB, batch: &mut WriteBatch, from_height: u64, removed: &[Le
                 batch.delete_cf(cf, cidx_key(&commitment));
             }
         }
-        if let Some(nullifier) = unshield_nullifier(tx) {
+        for nullifier in unshield_nullifiers(tx) {
             batch.delete_cf(cf, nf_key(&nullifier));
         }
     }
@@ -719,12 +785,16 @@ mod tests {
         let mut nullifier = [0u8; 32];
         rng.fill_bytes(&mut nullifier);
         let body = UnshieldBody {
-            root: hex::encode(state.root),
-            nullifier: hex::encode(nullifier),
-            amount_uegoc: 10_000_000_000,
+            spends: vec![UnshieldSpend {
+                root: hex::encode(state.root),
+                nullifier: hex::encode(nullifier),
+                amount_uegoc: 10_000_000_000,
+                fee_uegoc: fee,
+                proof: hex::encode([0u8; 128]),
+            }],
             recipient: recipient.clone(),
+            amount_uegoc: 10_000_000_000,
             fee_uegoc: fee,
-            proof: hex::encode([0u8; 128]),
         };
         let tx = LedgerTx {
             hash: body.tx_hash(),
@@ -878,14 +948,18 @@ mod tests {
     #[test]
     fn the_unshield_hash_is_over_the_canonical_body() {
         let body = UnshieldBody {
-            root: "00".repeat(32),
-            nullifier: "11".repeat(32),
-            amount_uegoc: 1_000_000,
+            spends: vec![UnshieldSpend {
+                root: "00".repeat(32),
+                nullifier: "11".repeat(32),
+                amount_uegoc: 1_000_000,
+                fee_uegoc: 1_000,
+                proof: "22".repeat(8),
+            }],
             recipient: "egot1someone".into(),
+            amount_uegoc: 1_000_000,
             fee_uegoc: 1_000,
-            proof: "22".repeat(8),
         };
-        let reordered = r#"{"proof":"2222222222222222","fee_uegoc":1000,"recipient":"egot1someone","amount_uegoc":1000000,"nullifier":"1111111111111111111111111111111111111111111111111111111111111111","root":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+        let reordered = r#"{"fee_uegoc":1000,"recipient":"egot1someone","amount_uegoc":1000000,"spends":[{"proof":"2222222222222222","fee_uegoc":1000,"amount_uegoc":1000000,"nullifier":"1111111111111111111111111111111111111111111111111111111111111111","root":"0000000000000000000000000000000000000000000000000000000000000000"}]}"#;
         let parsed = parse_unshield_body(reordered).unwrap();
         assert_eq!(parsed, body);
         assert_eq!(parsed.tx_hash(), body.tx_hash());
@@ -983,6 +1057,108 @@ mod tests {
     }
 
     #[test]
+    fn one_withdrawal_can_spend_several_notes_at_once() {
+        let _g = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("EGO_SHIELDED_POOL_HEIGHT", "0");
+        let mut rng = StdRng::from_entropy();
+        let recipient = "egot1qw508d6qejxtdg4y5r3zarvary0c5xw7k".to_string();
+        let height = 950_000_000 + (rng.next_u64() % 1_000_000);
+
+        let notes: Vec<Note> = vec![
+            Note::random(100_000_000, &mut rng),
+            Note::random(100_000_000, &mut rng),
+            Note::random(10_000_000, &mut rng),
+        ];
+        {
+            let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
+            let mut batch = WriteBatch::default();
+            let txs: Vec<LedgerTx> = notes.iter().map(deposit_tx).collect();
+            apply_block(db, &mut batch, height, &txs.iter().collect::<Vec<_>>());
+            db.write(batch).unwrap();
+        }
+
+        let pool = ShieldedPool::from_leaves(POOL_TREE_DEPTH, &leaves()).unwrap();
+        let shares = [400u64, 400, 200];
+        let total_fee: u64 = shares.iter().sum();
+        let spends: Vec<UnshieldSpend> = notes
+            .iter()
+            .zip(shares.iter())
+            .map(|(n, share)| {
+                let index = leaf_index_of(&n.commitment()).unwrap() as usize;
+                let w = crate::shielded::prove_withdrawal(
+                    &pool, n, index, recipient_digest(&recipient), *share,
+                ).unwrap();
+                UnshieldSpend {
+                    root: hex::encode(w.root),
+                    nullifier: hex::encode(w.nullifier),
+                    amount_uegoc: w.amount_uegoc,
+                    fee_uegoc: *share,
+                    proof: hex::encode(&w.proof),
+                }
+            })
+            .collect();
+        let total: u64 = spends.iter().map(|sp| sp.amount_uegoc).sum();
+        assert_eq!(total, 210_000_000, "three notes make an amount no single note could");
+
+        let body = UnshieldBody {
+            spends,
+            recipient: recipient.clone(),
+            amount_uegoc: total,
+            fee_uegoc: total_fee,
+        };
+        let tx = LedgerTx {
+            hash: body.tx_hash(),
+            from: SHIELDED_POOL_ADDR.into(),
+            to: recipient.clone(),
+            amount: total,
+            fee_uegoc: total_fee,
+            tx_type: TX_UNSHIELD.into(),
+            call_args: body.canonical_json(),
+            ..LedgerTx::default()
+        };
+        assert!(verify_incoming_unshield(&tx).is_ok(), "a three-note withdrawal must verify");
+
+        let mut repeated = body.clone();
+        repeated.spends[1] = repeated.spends[0].clone();
+        let repeated_tx = LedgerTx {
+            hash: repeated.tx_hash(),
+            call_args: repeated.canonical_json(),
+            ..tx.clone()
+        };
+        assert!(
+            verify_incoming_unshield(&repeated_tx).unwrap_err().contains("already spent"),
+            "spending the same note twice inside one withdrawal must be refused",
+        );
+
+        let mut skimmed = body.clone();
+        skimmed.spends.pop();
+        let skimmed_tx = LedgerTx {
+            hash: skimmed.tx_hash(),
+            call_args: skimmed.canonical_json(),
+            ..tx.clone()
+        };
+        assert!(
+            verify_incoming_unshield(&skimmed_tx).unwrap_err().contains("claims"),
+            "the spends must add up to the amount the transaction moves",
+        );
+
+        {
+            let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
+            let mut batch = WriteBatch::default();
+            apply_block(db, &mut batch, height + 1, &[&tx]);
+            db.write(batch).unwrap();
+        }
+        for n in &notes {
+            assert!(is_nullifier_spent(&n.nullifier()), "every note in the withdrawal is spent");
+        }
+        assert!(
+            verify_incoming_unshield(&tx).unwrap_err().contains("already spent"),
+            "the withdrawal cannot be replayed",
+        );
+        std::env::remove_var("EGO_SHIELDED_POOL_HEIGHT");
+    }
+
+    #[test]
     fn a_withdrawal_needs_a_real_proof_and_spends_once() {
         let _g = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("EGO_SHIELDED_POOL_HEIGHT", "0");
@@ -1012,12 +1188,16 @@ mod tests {
         .unwrap();
         let proof_bytes = w.proof.clone();
         let body = UnshieldBody {
-            root: hex::encode(w.root),
-            nullifier: hex::encode(w.nullifier),
-            amount_uegoc: w.amount_uegoc,
+            spends: vec![UnshieldSpend {
+                root: hex::encode(w.root),
+                nullifier: hex::encode(w.nullifier),
+                amount_uegoc: w.amount_uegoc,
+                fee_uegoc: fee,
+                proof: hex::encode(&proof_bytes),
+            }],
             recipient: recipient.clone(),
+            amount_uegoc: w.amount_uegoc,
             fee_uegoc: fee,
-            proof: hex::encode(&proof_bytes),
         };
         let tx = LedgerTx {
             hash: body.tx_hash(),
@@ -1045,6 +1225,7 @@ mod tests {
         assert!(verify_incoming_unshield(&redirected).unwrap_err().contains("does not verify"));
         let mut pricier = body.clone();
         pricier.fee_uegoc = fee + 1;
+        pricier.spends[0].fee_uegoc = fee + 1;
         let pricier_tx = LedgerTx {
             hash: pricier.tx_hash(),
             fee_uegoc: fee + 1,

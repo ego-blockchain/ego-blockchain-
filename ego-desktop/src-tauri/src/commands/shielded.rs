@@ -344,7 +344,7 @@ pub async fn shield_deposit(
 
 #[tauri::command]
 pub async fn shield_withdraw(
-    commitment: String,
+    commitments: Vec<String>,
     recipient: String,
 ) -> Result<UnshieldResult, EgoDesktopError> {
     require_open()?;
@@ -353,76 +353,121 @@ pub async fn shield_withdraw(
     if crate::ledger::is_reserved_system_source(&recipient) {
         return Err(EgoDesktopError::InvalidInput("Cannot unshield to a system address".into()));
     }
+    if commitments.is_empty() {
+        return Err(EgoDesktopError::InvalidInput("Select at least one note to spend".into()));
+    }
+    if commitments.len() > shielded_chain::MAX_UNSHIELD_SPENDS {
+        return Err(EgoDesktopError::InvalidInput(format!(
+            "A withdrawal can spend at most {} notes at once",
+            shielded_chain::MAX_UNSHIELD_SPENDS
+        )));
+    }
+    {
+        let mut seen = std::collections::HashSet::new();
+        if !commitments.iter().all(|c| seen.insert(c.clone())) {
+            return Err(EgoDesktopError::InvalidInput("The same note is listed twice".into()));
+        }
+    }
     let _guard = crate::ledger::TX_MUTEX.lock().await;
 
-    let (stored, leaf_index) = {
+    let selected: Vec<(StoredNote, u64)> = {
         let _g = NOTES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let notes = load_notes()?;
-        let n = notes
-            .iter()
-            .find(|n| n.commitment == commitment)
-            .cloned()
-            .ok_or_else(|| EgoDesktopError::InvalidInput("No such note in this wallet".into()))?;
-        if n.spent_tx.is_some() {
-            return Err(EgoDesktopError::InvalidInput("This note has already been spent".into()));
+        let mut out = Vec::with_capacity(commitments.len());
+        for commitment in &commitments {
+            let n = notes
+                .iter()
+                .find(|n| &n.commitment == commitment)
+                .cloned()
+                .ok_or_else(|| EgoDesktopError::InvalidInput("No such note in this wallet".into()))?;
+            if n.spent_tx.is_some() {
+                return Err(EgoDesktopError::InvalidInput("A selected note has already been spent".into()));
+            }
+            let c: [u8; 32] = hex::decode(&n.commitment)
+                .ok()
+                .and_then(|v| v.try_into().ok())
+                .ok_or_else(|| EgoDesktopError::DatabaseError("stored commitment is malformed".into()))?;
+            let index = shielded_chain::leaf_index_of(&c).ok_or_else(|| {
+                EgoDesktopError::InvalidInput("A selected note's deposit has not been confirmed yet".into())
+            })?;
+            out.push((n, index));
         }
-        let c: [u8; 32] = hex::decode(&n.commitment)
-            .ok()
-            .and_then(|v| v.try_into().ok())
-            .ok_or_else(|| EgoDesktopError::DatabaseError("stored commitment is malformed".into()))?;
-        let index = shielded_chain::leaf_index_of(&c).ok_or_else(|| {
-            EgoDesktopError::InvalidInput("This note's deposit has not been confirmed yet".into())
-        })?;
-        (n, index)
+        out
     };
-    if shielded_chain::is_nullifier_spent(&stored.note.nullifier()) {
-        return Err(EgoDesktopError::InvalidInput("This note has already been spent on-chain".into()));
+    for (n, _) in &selected {
+        if shielded_chain::is_nullifier_spent(&n.note.nullifier()) {
+            return Err(EgoDesktopError::InvalidInput("A selected note has already been spent on-chain".into()));
+        }
     }
 
-    let fee = current_fee();
-    let note = stored.note.clone();
+    let total_fee = current_fee();
+    let n_spends = selected.len() as u64;
+    let base_fee = total_fee / n_spends;
+    let remainder = total_fee % n_spends;
+
     let recipient_for_proof = recipient.clone();
-    let withdrawal = tokio::task::spawn_blocking(move || {
+    let jobs: Vec<(shielded::Note, u64, u64)> = selected
+        .iter()
+        .enumerate()
+        .map(|(i, (n, idx))| {
+            let share = base_fee + if (i as u64) < remainder { 1 } else { 0 };
+            (n.note.clone(), *idx, share)
+        })
+        .collect();
+
+    let withdrawals = tokio::task::spawn_blocking(move || {
         let pool = prover_pool()?;
-        shielded::prove_withdrawal(
-            &pool,
-            &note,
-            leaf_index as usize,
-            shielded::recipient_digest(&recipient_for_proof),
-            fee,
-        )
+        let rd = shielded::recipient_digest(&recipient_for_proof);
+        jobs.into_iter()
+            .map(|(note, idx, share)| {
+                shielded::prove_withdrawal(&pool, &note, idx as usize, rd, share)
+            })
+            .collect::<Result<Vec<_>, String>>()
     })
     .await
     .map_err(|e| EgoDesktopError::CryptoError(format!("proving task: {e}")))?
     .map_err(EgoDesktopError::CryptoError)?;
 
-    let proof_bytes = withdrawal.proof.clone();
+    let spends: Vec<shielded_chain::UnshieldSpend> = withdrawals
+        .iter()
+        .map(|w| shielded_chain::UnshieldSpend {
+            root: hex::encode(w.root),
+            nullifier: hex::encode(w.nullifier),
+            amount_uegoc: w.amount_uegoc,
+            fee_uegoc: w.fee_uegoc,
+            proof: hex::encode(&w.proof),
+        })
+        .collect();
+    let total_amount: u64 = spends.iter().map(|sp| sp.amount_uegoc).sum();
+
     let body = UnshieldBody {
-        root: hex::encode(withdrawal.root),
-        nullifier: hex::encode(withdrawal.nullifier),
-        amount_uegoc: withdrawal.amount_uegoc,
+        spends,
         recipient: recipient.clone(),
-        fee_uegoc: fee,
-        proof: hex::encode(&proof_bytes),
+        amount_uegoc: total_amount,
+        fee_uegoc: total_fee,
     };
     let now = chrono::Utc::now().timestamp();
     let tx = LedgerTx {
         hash: body.tx_hash(),
         from: SHIELDED_POOL_ADDR.to_string(),
         to: recipient.clone(),
-        amount: withdrawal.amount_uegoc,
+        amount: total_amount,
         memo: None,
         timestamp: now,
         status: "Pending".into(),
         tx_type: TX_UNSHIELD.to_string(),
-        fee_uegoc: fee,
+        fee_uegoc: total_fee,
         call_args: body.canonical_json(),
         signed_summary: format!(
-            "Unshield {:.6} EGOC\n  To:      {}\n  Fee:     {:.6} EGOC\n  Payout:  {:.6} EGOC",
-            withdrawal.amount_uegoc as f64 / 1_000_000.0,
+            "Unshield {:.6} EGOC from {} note(s)
+  To:      {}
+  Fee:     {:.6} EGOC
+  Payout:  {:.6} EGOC",
+            total_amount as f64 / 1_000_000.0,
+            withdrawals.len(),
             recipient,
-            fee as f64 / 1_000_000.0,
-            withdrawal.amount_uegoc.saturating_sub(fee) as f64 / 1_000_000.0,
+            total_fee as f64 / 1_000_000.0,
+            total_amount.saturating_sub(total_fee) as f64 / 1_000_000.0,
         ),
         ..LedgerTx::default()
     };
@@ -430,18 +475,22 @@ pub async fn shield_withdraw(
     {
         let _g = NOTES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut notes = load_notes()?;
-        if let Some(n) = notes.iter_mut().find(|n| n.commitment == commitment) {
-            n.spent_tx = Some(tx.hash.clone());
-            n.spent_at = Some(now);
+        for c in &commitments {
+            if let Some(n) = notes.iter_mut().find(|n| &n.commitment == c) {
+                n.spent_tx = Some(tx.hash.clone());
+                n.spent_at = Some(now);
+            }
         }
         save_notes(&notes)?;
     }
     if let Err(e) = crate::mempool::get_mempool().push(tx.clone()) {
         let _g = NOTES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if let Ok(mut notes) = load_notes() {
-            if let Some(n) = notes.iter_mut().find(|n| n.commitment == commitment) {
-                n.spent_tx = None;
-                n.spent_at = None;
+            for c in &commitments {
+                if let Some(n) = notes.iter_mut().find(|n| &n.commitment == c) {
+                    n.spent_tx = None;
+                    n.spent_at = None;
+                }
             }
             let _ = save_notes(&notes);
         }
@@ -455,9 +504,9 @@ pub async fn shield_withdraw(
 
     Ok(UnshieldResult {
         hash: tx.hash,
-        amount_uegoc: withdrawal.amount_uegoc,
-        fee_uegoc: fee,
-        payout_uegoc: withdrawal.amount_uegoc.saturating_sub(fee),
+        amount_uegoc: total_amount,
+        fee_uegoc: total_fee,
+        payout_uegoc: total_amount.saturating_sub(total_fee),
         recipient,
     })
 }

@@ -159,21 +159,28 @@ fn transaction_verification_rejects_hostile_bytes_without_panicking() {
 #[test]
 fn the_unshield_body_and_proof_reject_hostile_bytes_without_panicking() {
     let sample = crate::shielded_chain::UnshieldBody {
-        root: "11".repeat(32),
-        nullifier: "22".repeat(32),
-        amount_uegoc: 1_000_000,
+        spends: vec![crate::shielded_chain::UnshieldSpend {
+            root: "11".repeat(32),
+            nullifier: "22".repeat(32),
+            amount_uegoc: 1_000_000,
+            fee_uegoc: 1_000,
+            proof: "33".repeat(128),
+        }],
         recipient: "egot1qw508d6qejxtdg4y5r3zarvary0c5xw7k".into(),
+        amount_uegoc: 1_000_000,
         fee_uegoc: 1_000,
-        proof: "33".repeat(128),
     }
     .canonical_json()
     .into_bytes();
     hammer("unshield body", move |rng| mixed(rng, &sample), |bytes| {
         let Ok(text) = std::str::from_utf8(bytes) else { return };
         if let Ok(body) = crate::shielded_chain::parse_unshield_body(text) {
-            let _ = body.root_bytes();
-            let _ = body.nullifier_bytes();
-            let _ = body.proof_bytes();
+            for sp in &body.spends {
+                let _ = sp.root_bytes();
+                let _ = sp.nullifier_bytes();
+                let _ = sp.proof_bytes();
+            }
+            let _ = body.totals();
             let _ = body.tx_hash();
         }
     });
