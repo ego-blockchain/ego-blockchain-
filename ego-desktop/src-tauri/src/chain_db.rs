@@ -873,7 +873,7 @@ pub fn get_dynamic_checkpoint(height: u64) -> Option<String> {
 /// far back; refusing any truncation at or below this height makes a checkpointed
 /// prefix immutable, so neither a synced node nor a freshly-syncing one can be
 /// fed a fork that diverges before the last checkpoint.
-fn finality_floor_height(db: &DB) -> u64 {
+pub(crate) fn finality_floor_height(db: &DB) -> u64 {
     let mut floor = CHECKPOINTS.iter().map(|(h, _)| *h).max().unwrap_or(0);
     if let Some(cf) = db.cf_handle(CF_META) {
         // Checkpoint keys are big-endian, so the iterator yields ascending
@@ -3226,7 +3226,13 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
             ));
         }
         *balance = balance.saturating_sub(required);
-        if !tx.to.is_empty() && !crate::ledger::is_reserved_system_source(&tx.to) {
+        // The shielded pool is a reserved address but a deposit really does
+        // credit it, so the simulation has to say so too or it under-counts
+        // what the pool can pay out later in the same block.
+        if !tx.to.is_empty()
+            && (!crate::ledger::is_reserved_system_source(&tx.to)
+                || crate::shielded_chain::is_deposit(tx))
+        {
             let to_bal = simulated_balances.entry(tx.to.clone()).or_insert_with(|| {
                 db.get_cf(cf_bal, tx.to.as_bytes())
                     .ok().flatten()

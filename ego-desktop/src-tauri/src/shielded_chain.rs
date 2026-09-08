@@ -14,6 +14,14 @@
 //! relayer cannot swap the commitment for their own and take the deposit. The
 //! amount must be one of the fixed denominations.
 //!
+//! What goes in the tree is not that commitment but
+//! `Poseidon(LEAF, commitment, amount)`, built here from the amount the
+//! transfer actually moved. The value that decides the payout is sealed inside
+//! the commitment where this code cannot read it, so without that wrapper
+//! nothing would stop a one-EGOC deposit carrying a commitment made for ten
+//! thousand and being withdrawn for the difference. The circuit rebuilds the
+//! same wrapper from its public amount, so the two have to agree.
+//!
 //! A withdrawal is a transaction *from* the pool address, authorised by a
 //! Groth16 proof rather than a signature. Its body, in `call_args`, carries the
 //! root, nullifier, amount, recipient, fee and proof; the transaction hash is
@@ -29,7 +37,11 @@
 //! nullifier. The frontier means a deposit costs a validator one Poseidon
 //! hash per tree level however many notes the pool holds. A copy of the state
 //! is kept per block that changed it, so a reorg restores the state from just
-//! before the first removed block in one read instead of replaying.
+//! before the first removed block in one read instead of replaying. Those
+//! copies are pruned behind the finality floor, which `truncate_from` already
+//! refuses to reorg past, so the history cannot grow without bound; the newest
+//! copy at or below the floor is always kept, because that is the one a
+//! deepest-allowed reorg would restore from.
 //!
 //! All of it lives in the meta column family, which the checkpoint snapshot
 //! already ships, so a fast-synced node validates withdrawals like any other.
@@ -46,8 +58,8 @@
 use crate::chain_db::{self, decode, encode, read_u64_le, u64_le, CF_META};
 use crate::ledger::LedgerTx;
 use crate::shielded::{
-    field_to_bytes, is_denomination, public_to_field, recipient_digest, withdrawal_binding,
-    ROOT_HISTORY,
+    field_to_bytes, is_denomination, leaf_for, public_to_field, recipient_digest,
+    withdrawal_binding, ROOT_HISTORY,
 };
 use ark_bn254::{Bn254, Fr};
 use ego_zk::merkle::{IncrementalTree, POOL_TREE_DEPTH};
@@ -132,10 +144,10 @@ impl PoolState {
         )
     }
 
-    /// Append a commitment: one hash per level. Returns its leaf index.
-    pub fn insert(&mut self, commitment: [u8; 32]) -> Result<u64, String> {
+    /// Append a leaf: one hash per level. Returns its index.
+    pub fn insert(&mut self, leaf: [u8; 32]) -> Result<u64, String> {
         let mut t = self.tree()?;
-        let index = t.insert(public_to_field(&commitment))?;
+        let index = t.insert(public_to_field(&leaf))?;
         let (_, next, frontier, root) = t.parts();
         self.next_index = next as u64;
         self.frontier = frontier.iter().map(|f| field_to_bytes(*f)).collect();
@@ -470,12 +482,28 @@ pub fn apply_block(db: &DB, batch: &mut WriteBatch, height: u64, txs: &[&LedgerT
     let Some(cf) = db.cf_handle(CF_META) else { return };
     let mut state = read_state(db);
     let mut changed = false;
+    // The block was validated before it got here. These guards are for the
+    // paths that do not validate — a legacy migration, or a proposer applying
+    // its own block — where writing twice would subtract the same note from
+    // the pool balance twice.
+    let mut seen_commitments: HashSet<[u8; 32]> = HashSet::new();
+    let mut seen_nullifiers: HashSet<[u8; 32]> = HashSet::new();
     for tx in txs {
         if is_deposit(tx) {
             let Some(commitment) = parse_shield_memo(&tx.memo) else { continue };
-            match state.insert(commitment) {
+            if leaf_index_in(db, &commitment).is_some() || !seen_commitments.insert(commitment) {
+                tracing::error!(
+                    "[Shielded] block #{height}: deposit {} repeats a commitment, not recorded",
+                    tx.hash
+                );
+                continue;
+            }
+            // The leaf binds the commitment to the amount this transfer moved.
+            // Everything the depositor chose is on one side of that hash and
+            // everything the chain saw is on the other.
+            match state.insert(leaf_for(&commitment, tx.amount)) {
                 Ok(index) => {
-                    batch.put_cf(cf, leaf_key(index), commitment);
+                    batch.put_cf(cf, leaf_key(index), leaf_for(&commitment, tx.amount));
                     batch.put_cf(cf, cidx_key(&commitment), index.to_be_bytes());
                     state.balance_uegoc = state.balance_uegoc.saturating_add(tx.amount);
                     changed = true;
@@ -484,6 +512,13 @@ pub fn apply_block(db: &DB, batch: &mut WriteBatch, height: u64, txs: &[&LedgerT
             }
         } else if is_unshield(tx) {
             let Some(nullifier) = unshield_nullifier(tx) else { continue };
+            if nullifier_spent_in(db, &nullifier) || !seen_nullifiers.insert(nullifier) {
+                tracing::error!(
+                    "[Shielded] block #{height}: withdrawal {} spends a spent note, not recorded",
+                    tx.hash
+                );
+                continue;
+            }
             batch.put_cf(cf, nf_key(&nullifier), u64_le(height));
             state.balance_uegoc = state.balance_uegoc.saturating_sub(tx.amount);
             changed = true;
@@ -493,6 +528,35 @@ pub fn apply_block(db: &DB, batch: &mut WriteBatch, height: u64, txs: &[&LedgerT
         let encoded = encode(&state);
         batch.put_cf(cf, KEY_STATE, &encoded);
         batch.put_cf(cf, hist_key(height), &encoded);
+        prune_history(db, batch, crate::chain_db::finality_floor_height(db));
+    }
+}
+
+/// Drop state copies a reorg can never reach.
+///
+/// `truncate_from` refuses to rewind at or below the finality floor, so a
+/// rollback only ever restores from the newest copy at or below it. That one
+/// is kept and everything older is deleted, which bounds the history at the
+/// distance between the floor and the tip rather than the age of the chain.
+fn prune_history(db: &DB, batch: &mut WriteBatch, floor: u64) {
+    if floor == 0 {
+        return;
+    }
+    let Some(cf) = db.cf_handle(CF_META) else { return };
+    let mut newest_below: Option<Box<[u8]>> = None;
+    for item in db.iterator_cf(cf, IteratorMode::From(KEY_HIST, Direction::Forward)) {
+        let Ok((k, _)) = item else { break };
+        if !k.starts_with(KEY_HIST) || k.len() < KEY_HIST.len() + 8 {
+            break;
+        }
+        let mut hb = [0u8; 8];
+        hb.copy_from_slice(&k[KEY_HIST.len()..KEY_HIST.len() + 8]);
+        if u64::from_be_bytes(hb) > floor {
+            break;
+        }
+        if let Some(older) = newest_below.replace(k) {
+            batch.delete_cf(cf, older.as_ref());
+        }
     }
 }
 
@@ -526,15 +590,19 @@ pub fn rollback(db: &DB, batch: &mut WriteBatch, from_height: u64, removed: &[Le
     }
 
     for index in restored.next_index..current.next_index {
-        if let Some(v) = db.get_cf(cf, leaf_key(index)).ok().flatten() {
-            if let Ok(c) = <[u8; 32]>::try_from(v.as_slice()) {
-                batch.delete_cf(cf, cidx_key(&c));
-            }
-        }
         batch.delete_cf(cf, leaf_key(index));
     }
 
+    // The commitment index cannot be derived from the leaf, because the leaf
+    // is the commitment hashed with the amount. It comes from the deposits in
+    // the blocks being removed, which is where the commitments were read from
+    // in the first place.
     for tx in removed {
+        if is_deposit(tx) {
+            if let Some(commitment) = parse_shield_memo(&tx.memo) {
+                batch.delete_cf(cf, cidx_key(&commitment));
+            }
+        }
         if let Some(nullifier) = unshield_nullifier(tx) {
             batch.delete_cf(cf, nf_key(&nullifier));
         }
@@ -606,7 +674,7 @@ mod tests {
         assert_eq!(state.root, model.current_root());
         for i in 1..=5u8 {
             let c = note(1_000_000, i).commitment();
-            let index = state.insert(c).unwrap();
+            let index = state.insert(leaf_for(&c, 1_000_000)).unwrap();
             assert_eq!(index, model.deposit(c, 1_000_000).unwrap() as u64);
             assert_eq!(state.root, model.current_root(), "leaf {i}");
             assert!(state.is_known_root(&state.root));
@@ -680,7 +748,10 @@ mod tests {
     fn deposits_are_validated_applied_and_rolled_back() {
         let _g = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("EGO_SHIELDED_POOL_HEIGHT", "0");
-        let mut rng = StdRng::seed_from_u64(0xB10C);
+        // Fresh notes and a fresh height per run. These tests share the real
+        // chain database, so a fixed seed would make a second run collide with
+        // the commitments the first one wrote.
+        let mut rng = StdRng::from_entropy();
         let a = Note::random(1_000_000, &mut rng);
         let b = Note::random(10_000_000, &mut rng);
         let bad_amount = LedgerTx { amount: 1_500_000, ..deposit_tx(&a) };
@@ -727,7 +798,7 @@ mod tests {
     fn a_withdrawal_needs_a_real_proof_and_spends_once() {
         let _g = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("EGO_SHIELDED_POOL_HEIGHT", "0");
-        let mut rng = StdRng::seed_from_u64(0x5EED);
+        let mut rng = StdRng::from_entropy();
         let n = Note::random(1_000_000, &mut rng);
         let height = 950_000_000 + (rng.next_u64() % 1_000_000);
         let recipient = "egot1qw508d6qejxtdg4y5r3zarvary0c5xw7k".to_string();
@@ -742,11 +813,10 @@ mod tests {
             db.write(batch).unwrap();
         }
         let index = leaf_index_of(&n.commitment()).unwrap() as usize;
-        let all = leaves();
+        let pool = ShieldedPool::from_leaves(POOL_TREE_DEPTH, &leaves()).unwrap();
         let w = crate::shielded::prove_withdrawal(
             ego_zk::withdraw_params::proving_key(),
-            POOL_TREE_DEPTH,
-            &all,
+            &pool,
             &n,
             index,
             recipient_digest(&recipient),

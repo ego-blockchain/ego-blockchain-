@@ -7,7 +7,11 @@
 //!
 //! The proof establishes, without revealing the note or its position:
 //!
-//! 1. `Poseidon(COMMITMENT, value, secret, rho)` is a leaf under the public root.
+//! 1. `Poseidon(LEAF, Poseidon(COMMITMENT, value, secret, rho), amount)` is a
+//!    leaf under the public root. The outer hash is the important half: the
+//!    chain builds the same one at deposit time from the commitment in the
+//!    memo and the amount it actually received, so a commitment made for one
+//!    value has no leaf under any other amount.
 //! 2. The public nullifier is `Poseidon(NULLIFIER, secret, rho)` for that same
 //!    secret and rho. This is what stops one note being spent twice: the pool
 //!    records nullifiers, and a second spend of the same note would have to
@@ -21,6 +25,16 @@
 //!    transaction on the prover's behalf can neither redirect the payout nor
 //!    raise the fee: changing either changes a public input and invalidates
 //!    the proof.
+//!
+//! # Why the leaf carries the amount
+//!
+//! The value a withdrawal pays out lives inside the commitment, chosen by the
+//! depositor, and the chain cannot see it: it has neither the secret nor rho.
+//! An earlier version put the bare commitment in the tree, so nothing related
+//! the value proved here to the amount actually deposited, and a one-EGOC
+//! deposit could be withdrawn as ten thousand with an entirely honest proof.
+//! Hashing the amount into the leaf closes that: the chain fixes one half of
+//! the leaf from a number it saw for itself.
 //!
 //! # Why a note is spent whole
 //!
@@ -51,7 +65,7 @@
 //! review.
 
 use crate::merkle::merkle_root_gadget;
-use crate::poseidon_gadget::{commitment_gadget, nullifier_gadget};
+use crate::poseidon_gadget::{commitment_gadget, leaf_gadget, nullifier_gadget};
 use ark_bn254::{Bn254, Fr};
 use ark_groth16::Groth16;
 // Re-exported so the pool can name proof and key types without depending on
@@ -160,9 +174,10 @@ impl ConstraintSynthesizer<Fr> for WithdrawCircuit {
             })
             .collect::<Result<_, _>>()?;
 
-        // 1. The note is in the tree.
+        // 1. The note is in the tree, under the amount it was deposited for.
         let commitment = commitment_gadget(&value_w, &secret_w, &rho_w)?;
-        let computed_root = merkle_root_gadget(&commitment, &sibling_vars, &direction_vars)?;
+        let leaf = leaf_gadget(&commitment, &amount_in)?;
+        let computed_root = merkle_root_gadget(&leaf, &sibling_vars, &direction_vars)?;
         computed_root.enforce_equal(&root_in)?;
 
         // 2. The nullifier is this note's, not one for some other note.
@@ -210,7 +225,9 @@ pub fn verify(
 mod tests {
     use super::*;
     use crate::merkle::MerkleTree;
-    use crate::poseidon_gadget::{SHIELDED_COMMITMENT_DOMAIN, SHIELDED_NULLIFIER_DOMAIN};
+    use crate::poseidon_gadget::{
+        SHIELDED_COMMITMENT_DOMAIN, SHIELDED_LEAF_DOMAIN, SHIELDED_NULLIFIER_DOMAIN,
+    };
     use ark_ff::One;
     use ark_relations::r1cs::ConstraintSystem;
     use ark_std::rand::{rngs::StdRng, SeedableRng};
@@ -239,8 +256,24 @@ mod tests {
         recipient: Fr,
     }
 
-    /// A tree with other people's notes around ours, so the path is not trivial.
+    /// The tree leaf for a note deposited at `amount`, exactly as the chain
+    /// builds it: the commitment wrapped with the amount it received.
+    fn leaf_of(value: Fr, secret: Fr, rho: Fr, amount: Fr) -> Fr {
+        let commitment = native(SHIELDED_COMMITMENT_DOMAIN, &[value, secret, rho]);
+        native(SHIELDED_LEAF_DOMAIN, &[commitment, amount])
+    }
+
+    /// A tree with other people's notes around ours, so the path is not
+    /// trivial. The note is deposited at its own value, which is the honest
+    /// case; `deposited_at` builds the dishonest one.
     fn fixture_fr(value: Fr) -> Fixture {
+        deposited_at(value, value)
+    }
+
+    /// A note whose commitment says `value` but which was deposited for
+    /// `amount`. The chain allows this to be *written*, because it cannot see
+    /// the value; the circuit is what must refuse to spend it.
+    fn deposited_at(value: Fr, amount: Fr) -> Fixture {
         let mut rng = test_rng();
         let mut tree = MerkleTree::new(DEPTH);
         for i in 0..3u64 {
@@ -248,8 +281,7 @@ mod tests {
         }
         let secret = Fr::rand(&mut rng);
         let rho = Fr::rand(&mut rng);
-        let commitment = native(SHIELDED_COMMITMENT_DOMAIN, &[value, secret, rho]);
-        let index = tree.insert(commitment).unwrap();
+        let index = tree.insert(leaf_of(value, secret, rho, amount)).unwrap();
         tree.insert(Fr::from(999u64)).unwrap();
         Fixture { tree, index, value, secret, rho, recipient: Fr::rand(&mut rng) }
     }
@@ -315,6 +347,36 @@ mod tests {
         let f = fixture(1_000);
         assert!(!satisfied(circuit(&f, 999)));
         assert!(!satisfied(circuit(&f, 0)));
+    }
+
+    /// The inflation case that matters most, because the chain cannot catch
+    /// it: a commitment made for 10,000 deposited by transferring 1. The leaf
+    /// the chain wrote binds the 1, so no proof for 10,000 has a path to it.
+    #[test]
+    fn a_note_committed_for_more_than_was_deposited_cannot_be_spent() {
+        let f = deposited_at(Fr::from(10_000u64), Fr::from(1u64));
+        assert!(!satisfied(circuit(&f, 10_000)), "cannot withdraw the committed value");
+        assert!(!satisfied(circuit(&f, 1)), "nor the deposited one, the commitment disagrees");
+    }
+
+    /// And the reverse, so the binding is an equality rather than a bound.
+    #[test]
+    fn a_note_committed_for_less_than_was_deposited_cannot_be_spent() {
+        let f = deposited_at(Fr::from(1u64), Fr::from(10_000u64));
+        assert!(!satisfied(circuit(&f, 1)));
+        assert!(!satisfied(circuit(&f, 10_000)));
+    }
+
+    /// The leaf is the commitment wrapped with the amount, so the bare
+    /// commitment must not itself be a spendable leaf.
+    #[test]
+    fn a_bare_commitment_in_the_tree_is_not_spendable() {
+        let mut rng = test_rng();
+        let (value, secret, rho) = (Fr::from(1_000u64), Fr::rand(&mut rng), Fr::rand(&mut rng));
+        let mut tree = MerkleTree::new(DEPTH);
+        let index = tree.insert(native(SHIELDED_COMMITMENT_DOMAIN, &[value, secret, rho])).unwrap();
+        let f = Fixture { tree, index, value, secret, rho, recipient: Fr::rand(&mut rng) };
+        assert!(!satisfied(circuit(&f, 1_000)));
     }
 
     #[test]

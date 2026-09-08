@@ -275,17 +275,25 @@ impl ShardedMempool {
                     return Err("invalid unstake request".to_string());
                 }
             } else {
+            // What each pending tx actually takes out of this address. A
+            // shielded withdrawal takes the note and nothing more: its fee is
+            // withheld from the recipient rather than added to the amount, so
+            // counting it again would refuse the last honest withdrawal from a
+            // nearly empty pool.
+            fn outflow_of(t: &LedgerTx) -> u64 {
+                if t.tx_type == "unstake" && t.to == crate::chain_db::STAKING_ADDR {
+                    t.fee_uegoc
+                } else if crate::shielded_chain::is_unshield(t) {
+                    t.amount
+                } else {
+                    t.amount.saturating_add(t.fee_uegoc)
+                }
+            }
             let pending_outflow: u64 = s.iter()
                 .filter(|t| t.from == tx.from)
-                .map(|t| {
-                    if t.tx_type == "unstake" && t.to == crate::chain_db::STAKING_ADDR {
-                        t.fee_uegoc
-                    } else {
-                        t.amount.saturating_add(t.fee_uegoc)
-                    }
-                })
+                .map(outflow_of)
                 .fold(0u64, |acc, v| acc.saturating_add(v));
-            let required = tx.amount.saturating_add(tx.fee_uegoc).saturating_add(pending_outflow);
+            let required = outflow_of(&tx).saturating_add(pending_outflow);
             if !is_validator_reg && balance < required {
                 let err = format!("insufficient balance: has {} uEGOC, needs {} (amount {} + fee {} + pending_outflow {})",
                     balance, required, tx.amount, tx.fee_uegoc, pending_outflow);

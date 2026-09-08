@@ -13,7 +13,7 @@
 use crate::app::AppState;
 use crate::error::EgoDesktopError;
 use crate::ledger::{data_dir, tx_human_summary, tx_signing_bytes_v2, Ledger, LedgerTx};
-use crate::shielded::{self, denominate, Note, DENOMINATIONS_UEGOC};
+use crate::shielded::{self, denominate, Note, ShieldedPool, DENOMINATIONS_UEGOC};
 use crate::shielded_chain::{self, UnshieldBody, SHIELDED_POOL_ADDR, TX_SHIELD, TX_UNSHIELD};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -30,6 +30,30 @@ const NOTES_KEY_LABEL: &[u8] = b"ego/shielded-notes/v1:";
 const CHAIN_ID: u8 = 1;
 
 static NOTES_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+/// The tree a proof is built against, kept between withdrawals.
+///
+/// Building it costs one Poseidon hash per level per leaf, so rebuilding from
+/// scratch every time would make a withdrawal from a pool with a million notes
+/// take tens of seconds. The pool is append-only, so the tree is extended with
+/// whatever arrived since it was last used, and only a reorg that rewrote an
+/// existing leaf forces a rebuild.
+static PROVER_POOL: Lazy<Mutex<Option<ShieldedPool>>> = Lazy::new(|| Mutex::new(None));
+
+/// The current commitment tree, reusing the cached one where possible.
+fn prover_pool() -> Result<ShieldedPool, String> {
+    let leaves = shielded_chain::leaves();
+    let mut cached = PROVER_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pool) = cached.as_mut() {
+        if pool.extend_from_leaves(&leaves).is_ok() {
+            return Ok(pool.clone());
+        }
+        tracing::warn!("[Shielded] the commitment tree diverged, rebuilding it from the chain");
+    }
+    let pool = ShieldedPool::from_leaves(ego_zk::withdraw_params::DEPTH, &leaves)?;
+    *cached = Some(pool.clone());
+    Ok(pool)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredNote {
@@ -324,6 +348,12 @@ pub async fn shield_deposit(
         save_notes(&all)?;
     }
 
+    // Reserve the nonces now rather than after the broadcast. They are already
+    // signed into the transactions above, so if one push fails partway the
+    // rest are still in flight and the next send must not reuse their numbers.
+    ledger.nonce = nonce;
+    let _ = ledger.save();
+
     let mut hashes = Vec::with_capacity(txs.len());
     for tx in txs {
         crate::mempool::get_mempool()
@@ -336,8 +366,6 @@ pub async fn shield_deposit(
             crate::p2p::broadcast_pending_tx(gossip).await;
         });
     }
-    ledger.nonce = nonce;
-    let _ = ledger.save();
 
     Ok(ShieldResult {
         tx_hashes: hashes,
@@ -391,11 +419,10 @@ pub async fn shield_withdraw(
     let note = stored.note.clone();
     let recipient_for_proof = recipient.clone();
     let withdrawal = tokio::task::spawn_blocking(move || {
-        let leaves = shielded_chain::leaves();
+        let pool = prover_pool()?;
         shielded::prove_withdrawal(
             ego_zk::withdraw_params::proving_key(),
-            ego_zk::withdraw_params::DEPTH,
-            &leaves,
+            &pool,
             &note,
             leaf_index as usize,
             shielded::recipient_digest(&recipient_for_proof),

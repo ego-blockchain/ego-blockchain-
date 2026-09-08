@@ -4,7 +4,9 @@
 //!
 //! Value enters the pool as a *note* and is recorded only as a commitment, a
 //! Poseidon hash that reveals nothing about who owns it or how much it holds.
-//! Commitments live in a Merkle tree. Spending publishes a *nullifier* derived
+//! The tree holds that commitment wrapped with the amount actually deposited
+//! for it, `Poseidon(LEAF, commitment, amount)`, which is the one half of the
+//! leaf the chain can build for itself. Spending publishes a *nullifier* derived
 //! from the note's secret, marking it spent without revealing which commitment
 //! it came from, together with a zero-knowledge proof that the note is in the
 //! tree, that the nullifier is that note's, and that the amount withdrawn is
@@ -14,6 +16,16 @@
 //! recipient, a fee and a proof, and it checks four things: the root is one it
 //! has had recently, the nullifier is new, the proof verifies against those
 //! public values, and it holds enough to pay.
+//!
+//! # Why the leaf carries the amount
+//!
+//! The value that decides a payout is inside the commitment, chosen by the
+//! depositor, and the chain cannot read it. If the bare commitment were the
+//! leaf, nothing would tie that value to the amount transferred, and a note
+//! committed for 10,000 EGOC could be deposited by sending 1. The proof would
+//! be entirely honest and the pool would pay out the difference from other
+//! people's deposits. Hashing the amount into the leaf removes the question:
+//! the chain fixes half the leaf from a number it saw itself.
 //!
 //! # Denominations
 //!
@@ -69,6 +81,7 @@ use std::collections::HashSet;
 const COMMITMENT_DOMAIN: u64 = ego_zk::poseidon_gadget::SHIELDED_COMMITMENT_DOMAIN;
 const NULLIFIER_DOMAIN: u64 = ego_zk::poseidon_gadget::SHIELDED_NULLIFIER_DOMAIN;
 const BINDING_DOMAIN: u64 = ego_zk::poseidon_gadget::SHIELDED_BINDING_DOMAIN;
+const LEAF_DOMAIN: u64 = ego_zk::poseidon_gadget::SHIELDED_LEAF_DOMAIN;
 
 /// How many recent roots a withdrawal may be proven against.
 ///
@@ -155,6 +168,18 @@ fn poseidon(domain: u64, inputs: &[Fr]) -> Result<Fr, String> {
     h.hash(inputs).map_err(|e| format!("poseidon hash: {e}"))
 }
 
+/// The tree leaf for `commitment` deposited at `amount_uegoc`.
+///
+/// The chain computes this from the commitment in the deposit's memo and the
+/// amount the deposit actually transferred, so the two are bound together
+/// before the leaf ever reaches the tree.
+pub fn leaf_for(commitment: &[u8; 32], amount_uegoc: u64) -> [u8; 32] {
+    field_to_bytes(
+        poseidon(LEAF_DOMAIN, &[public_to_field(commitment), Fr::from(amount_uegoc)])
+            .expect("two inputs for width 3"),
+    )
+}
+
 /// The 32-byte form of a recipient address, for binding.
 pub fn recipient_digest(address: &str) -> [u8; 32] {
     *ego_core::hash_data(address.as_bytes()).as_bytes()
@@ -210,6 +235,13 @@ impl Note {
         field_to_bytes(poseidon(COMMITMENT_DOMAIN, &[value, secret, rho]).expect("poseidon commitment"))
     }
 
+    /// Where this note sits in the tree when deposited honestly, meaning at
+    /// its own value. A note deposited for anything else has a different leaf
+    /// and no proof can spend it.
+    pub fn leaf(&self) -> [u8; 32] {
+        leaf_for(&self.commitment(), self.value_uegoc)
+    }
+
     /// The marker published when this note is spent.
     ///
     /// Derived from the secret and rho but not the value, so it is unlinkable to
@@ -252,9 +284,12 @@ pub enum PoolError {
 #[derive(Debug, Clone)]
 pub struct ShieldedPool {
     depth: usize,
-    /// Every commitment ever deposited, in leaf order. Append-only: a leaf is
-    /// never removed, because removing one would reveal which note was spent.
-    commitments: Vec<[u8; 32]>,
+    /// Every leaf ever written, in order. Append-only: a leaf is never
+    /// removed, because removing one would reveal which note was spent.
+    leaves: Vec<[u8; 32]>,
+    /// The commitments those leaves were built from, so a second deposit of
+    /// the same commitment can be refused. Not the same thing as the leaves:
+    /// one commitment is only ever valid at one amount.
     commitment_set: HashSet<[u8; 32]>,
     tree: MerkleTree,
     /// Spent markers. Grows forever, by design.
@@ -277,7 +312,7 @@ impl ShieldedPool {
         let empty_root = field_to_bytes(tree.root());
         let mut pool = Self {
             depth,
-            commitments: Vec::new(),
+            leaves: Vec::new(),
             commitment_set: HashSet::new(),
             tree,
             nullifiers: HashSet::new(),
@@ -289,8 +324,8 @@ impl ShieldedPool {
         pool
     }
 
-    /// A pool rebuilt from the chain's leaves, for proving against. Values and
-    /// nullifiers are not needed for that and are left empty.
+    /// A pool rebuilt from the chain's leaves, for proving against. Values,
+    /// commitments and nullifiers are not needed for that and are left empty.
     pub fn from_leaves(depth: usize, leaves: &[[u8; 32]]) -> Result<Self, String> {
         let mut pool = Self::new(depth);
         for leaf in leaves {
@@ -308,7 +343,7 @@ impl ShieldedPool {
     }
 
     pub fn commitment_count(&self) -> usize {
-        self.commitments.len()
+        self.leaves.len()
     }
 
     pub fn nullifier_count(&self) -> usize {
@@ -316,7 +351,7 @@ impl ShieldedPool {
     }
 
     pub fn leaves(&self) -> &[[u8; 32]] {
-        &self.commitments
+        &self.leaves
     }
 
     pub fn contains_commitment(&self, c: &[u8; 32]) -> bool {
@@ -342,16 +377,25 @@ impl ShieldedPool {
         }
     }
 
-    fn append_leaf(&mut self, commitment: [u8; 32]) -> Result<usize, String> {
-        if self.commitment_set.contains(&commitment) {
-            return Err("duplicate commitment".into());
-        }
-        let index = self.tree.insert(public_to_field(&commitment))?;
-        self.commitments.push(commitment);
-        self.commitment_set.insert(commitment);
+    fn append_leaf(&mut self, leaf: [u8; 32]) -> Result<usize, String> {
+        let index = self.tree.insert(public_to_field(&leaf))?;
+        self.leaves.push(leaf);
         let root = field_to_bytes(self.tree.root());
         self.remember_root(root);
         Ok(index)
+    }
+
+    /// Extend a proving pool with leaves the chain has appended since it was
+    /// built. The pool is append-only, so an existing leaf that has changed
+    /// means this pool belongs to an abandoned fork and must be rebuilt.
+    pub fn extend_from_leaves(&mut self, leaves: &[[u8; 32]]) -> Result<(), String> {
+        if leaves.len() < self.leaves.len() || leaves[..self.leaves.len()] != self.leaves[..] {
+            return Err("leaf history diverged from this pool".into());
+        }
+        for leaf in &leaves[self.leaves.len()..] {
+            self.append_leaf(*leaf)?;
+        }
+        Ok(())
     }
 
     /// The Merkle path for the leaf at `index`, for building a proof.
@@ -362,6 +406,10 @@ impl ShieldedPool {
     /// Move value into the pool. The caller must already have taken the same
     /// amount from the depositor's transparent balance; this only records it.
     /// Returns the leaf index, which the depositor needs to prove a withdrawal.
+    ///
+    /// `value_uegoc` is the amount transferred, and it is hashed into the leaf
+    /// rather than trusted, so a commitment made for some other value simply
+    /// has no leaf here.
     pub fn deposit(&mut self, commitment: [u8; 32], value_uegoc: u64) -> Result<usize, PoolError> {
         if value_uegoc == 0 {
             return Err(PoolError::InvalidAmount);
@@ -374,10 +422,13 @@ impl ShieldedPool {
         if self.commitment_set.contains(&commitment) {
             return Err(PoolError::DuplicateCommitment);
         }
-        if self.commitments.len() >= (1usize << self.depth) {
+        if self.leaves.len() >= (1usize << self.depth) {
             return Err(PoolError::TreeFull);
         }
-        let index = self.append_leaf(commitment).map_err(|_| PoolError::TreeFull)?;
+        let index = self
+            .append_leaf(leaf_for(&commitment, value_uegoc))
+            .map_err(|_| PoolError::TreeFull)?;
+        self.commitment_set.insert(commitment);
         self.balance_uegoc = new_balance;
         Ok(index)
     }
@@ -464,8 +515,7 @@ pub struct Withdrawal {
 /// pool hashed with, so the two cannot disagree.
 pub fn prove_withdrawal<R: RngCore + CryptoRng>(
     pk: &ProvingKey<Bn254>,
-    depth: usize,
-    leaves: &[[u8; 32]],
+    pool: &ShieldedPool,
     note: &Note,
     leaf_index: usize,
     recipient: [u8; 32],
@@ -475,8 +525,10 @@ pub fn prove_withdrawal<R: RngCore + CryptoRng>(
     // Refuse to build a proof that could not verify. A wrong index is far
     // likelier to be a bookkeeping mistake than an attack, and a clear error
     // here beats an opaque InvalidProof later.
-    if leaves.get(leaf_index) != Some(&note.commitment()) {
-        return Err(format!("leaf {leaf_index} does not hold this note's commitment"));
+    if pool.leaves().get(leaf_index) != Some(&note.leaf()) {
+        return Err(format!(
+            "leaf {leaf_index} does not hold this note; it was not deposited at its own value"
+        ));
     }
     if fee_uegoc >= note.value_uegoc {
         return Err(format!(
@@ -484,9 +536,9 @@ pub fn prove_withdrawal<R: RngCore + CryptoRng>(
             note.value_uegoc
         ));
     }
-    let pool = ShieldedPool::from_leaves(depth, leaves)?;
+    let depth = pool.depth();
     let path = pool.merkle_path(leaf_index)?;
-    let root = pool.tree.root();
+    let root = public_to_field(&pool.current_root());
     let (value, secret, rho) = note.as_witness();
     let nullifier = poseidon(NULLIFIER_DOMAIN, &[secret, rho])?;
 
@@ -568,7 +620,7 @@ mod tests {
     }
 
     fn withdrawal(pool: &ShieldedPool, n: &Note, index: usize) -> Withdrawal {
-        prove_withdrawal(&keys().0, DEPTH, pool.leaves(), n, index, recipient(), FEE, &mut rng()).unwrap()
+        prove_withdrawal(&keys().0, pool, n, index, recipient(), FEE, &mut rng()).unwrap()
     }
 
     // ── Hash properties ──────────────────────────────────────────────────
@@ -813,7 +865,7 @@ mod tests {
         let mut pool = ShieldedPool::new(depth);
         let n = note(1_000, 1, 1);
         let i = pool.deposit(n.commitment(), 1_000).unwrap();
-        let w = prove_withdrawal(&pk, depth, pool.leaves(), &n, i, recipient(), FEE, &mut rng()).unwrap();
+        let w = prove_withdrawal(&pk, &pool, &n, i, recipient(), FEE, &mut rng()).unwrap();
         let mut r = rng();
         for _ in 0..ROOT_HISTORY {
             pool.deposit(Note::random(1, &mut r).commitment(), 1).unwrap();
@@ -877,15 +929,53 @@ mod tests {
     #[test]
     fn the_prover_refuses_a_leaf_that_does_not_hold_the_note() {
         let (pool, n, _) = funded(1_000);
-        let err = prove_withdrawal(&keys().0, DEPTH, pool.leaves(), &n, 0, recipient(), FEE, &mut rng());
+        let err = prove_withdrawal(&keys().0, &pool, &n, 0, recipient(), FEE, &mut rng());
         assert!(err.is_err());
     }
 
     #[test]
     fn the_prover_refuses_a_fee_that_eats_the_note() {
         let (pool, n, i) = funded(1_000);
-        let err = prove_withdrawal(&keys().0, DEPTH, pool.leaves(), &n, i, recipient(), 1_000, &mut rng());
+        let err = prove_withdrawal(&keys().0, &pool, &n, i, recipient(), 1_000, &mut rng());
         assert!(err.is_err());
+    }
+
+    /// The bug this leaf shape exists to close: a note committed for 10,000
+    /// but deposited by transferring 1. The chain writes the leaf for what it
+    /// received, so the note simply is not in the tree.
+    #[test]
+    fn a_note_deposited_for_less_than_it_claims_cannot_be_proven() {
+        let mut pool = ShieldedPool::new(DEPTH);
+        let n = note(10_000, 5, 5);
+        let index = pool.deposit(n.commitment(), 1).unwrap();
+        assert_eq!(pool.balance(), 1, "the pool only ever credited what arrived");
+        assert_ne!(pool.leaves()[index], n.leaf(), "the leaf binds the amount received");
+        let err = prove_withdrawal(&keys().0, &pool, &n, index, recipient(), FEE, &mut rng());
+        assert!(err.is_err(), "no proof can be built for a note that is not in the tree");
+    }
+
+    #[test]
+    fn the_leaf_binds_the_commitment_to_one_amount_only() {
+        let c = note(1_000, 7, 7).commitment();
+        assert_ne!(leaf_for(&c, 1_000), leaf_for(&c, 1_001));
+        assert_ne!(leaf_for(&c, 1_000), c, "the leaf is never the bare commitment");
+        assert_eq!(leaf_for(&c, 1_000), note(1_000, 7, 7).leaf());
+    }
+
+    #[test]
+    fn a_proving_pool_extends_instead_of_rebuilding() {
+        let (full, _, _) = funded(1_000);
+        let mut partial = ShieldedPool::from_leaves(DEPTH, &full.leaves()[..1]).unwrap();
+        partial.extend_from_leaves(full.leaves()).unwrap();
+        assert_eq!(partial.current_root(), full.current_root());
+        assert_eq!(partial.commitment_count(), full.commitment_count());
+        // Extending is idempotent, and a diverged history is refused.
+        partial.extend_from_leaves(full.leaves()).unwrap();
+        assert_eq!(partial.current_root(), full.current_root());
+        assert!(partial.extend_from_leaves(&full.leaves()[..1]).is_err());
+        let mut forked = full.leaves().to_vec();
+        forked[0] = [0x99; 32];
+        assert!(partial.extend_from_leaves(&forked).is_err());
     }
 
     #[test]

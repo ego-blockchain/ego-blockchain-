@@ -57,6 +57,10 @@ pub const SHIELDED_NULLIFIER_DOMAIN: u64 = 2;
 /// binding slot: `Poseidon(BINDING, recipient, fee)`. Not used in-circuit,
 /// but it lives in this table so no other hash can share its tag.
 pub const SHIELDED_BINDING_DOMAIN: u64 = 4;
+/// Wraps a commitment with the amount that was actually deposited for it:
+/// `Poseidon(LEAF, commitment, amount)`. This, and not the commitment, is
+/// what goes in the tree.
+pub const SHIELDED_LEAF_DOMAIN: u64 = 5;
 
 /// The Poseidon parameters for a given input count, in the layout the gadget
 /// consumes. Read from `light-poseidon`'s table, never constructed here.
@@ -181,6 +185,24 @@ pub fn commitment_gadget(
         &params,
         Fr::from(SHIELDED_COMMITMENT_DOMAIN),
         &[value.clone(), secret.clone(), rho.clone()],
+    )
+}
+
+/// In-circuit tree leaf: `Poseidon(LEAF_DOMAIN, commitment, amount)`.
+///
+/// The chain builds the same hash at deposit time from the commitment in the
+/// memo and the amount actually transferred. A note whose commitment was made
+/// for one value therefore has no leaf under any other amount, which is what
+/// stops a small deposit being withdrawn as a large one.
+pub fn leaf_gadget(
+    commitment: &FpVar<Fr>,
+    amount: &FpVar<Fr>,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    let params = PoseidonGadgetParams::circom(2).map_err(|_| SynthesisError::Unsatisfiable)?;
+    poseidon_hash_gadget(
+        &params,
+        Fr::from(SHIELDED_LEAF_DOMAIN),
+        &[commitment.clone(), amount.clone()],
     )
 }
 

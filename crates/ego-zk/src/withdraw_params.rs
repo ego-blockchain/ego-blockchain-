@@ -66,7 +66,9 @@ pub fn verifying_key_digest() -> String {
 mod tests {
     use super::*;
     use crate::merkle::MerkleTree;
-    use crate::poseidon_gadget::{SHIELDED_COMMITMENT_DOMAIN, SHIELDED_NULLIFIER_DOMAIN};
+    use crate::poseidon_gadget::{
+        SHIELDED_COMMITMENT_DOMAIN, SHIELDED_LEAF_DOMAIN, SHIELDED_NULLIFIER_DOMAIN,
+    };
     use crate::withdraw_circuit::{prove, verify, WithdrawCircuit};
     use ark_bn254::Fr;
     use ark_std::rand::{rngs::StdRng, SeedableRng};
@@ -90,7 +92,10 @@ mod tests {
         let mut tree = MerkleTree::new(DEPTH);
         tree.insert(Fr::from(77u64)).unwrap();
         let (value, secret, rho) = (Fr::from(1_000_000u64), Fr::rand(&mut rng), Fr::rand(&mut rng));
-        let index = tree.insert(native(SHIELDED_COMMITMENT_DOMAIN, &[value, secret, rho])).unwrap();
+        // The chain's leaf: the commitment wrapped with the deposited amount,
+        // which for an honest deposit is the note's own value.
+        let commitment = native(SHIELDED_COMMITMENT_DOMAIN, &[value, secret, rho]);
+        let index = tree.insert(native(SHIELDED_LEAF_DOMAIN, &[commitment, value])).unwrap();
         let path = tree.path(index).unwrap();
         let binding = Fr::rand(&mut rng);
         let c = WithdrawCircuit {
