@@ -619,14 +619,28 @@ mod tests {
     }
 
     #[test]
-    fn the_consensus_rule_is_not_switched_on_by_the_client_flag() {
+    fn the_pool_is_active_by_default_and_shares_one_off_switch() {
         std::env::remove_var("EGO_SHIELDED_POOL");
         std::env::remove_var("EGO_SHIELDED_POOL_HEIGHT");
-        assert!(is_enabled(), "client gate is on");
+        assert!(is_enabled());
+        assert!(crate::shielded_chain::rule_active(1));
+
+        std::env::set_var("EGO_SHIELDED_POOL", "off");
+        assert!(!is_enabled());
         assert!(
             !crate::shielded_chain::rule_active(u64::MAX),
-            "the consensus rule must stay off until activated network-wide: a node that              accepts shield transactions while its peers reject them forks the chain",
+            "the client gate and the consensus rule must agree: a node that accepts shield              transactions while its peers reject them forks the chain",
         );
+        std::env::remove_var("EGO_SHIELDED_POOL");
+    }
+
+    #[test]
+    fn an_activation_height_still_overrides_everything() {
+        std::env::set_var("EGO_SHIELDED_POOL_HEIGHT", "29300");
+        assert!(!crate::shielded_chain::rule_active(29_299), "below the activation height");
+        assert!(crate::shielded_chain::rule_active(29_300), "at the activation height");
+        assert!(crate::shielded_chain::rule_active(29_301), "above it");
+        std::env::remove_var("EGO_SHIELDED_POOL_HEIGHT");
     }
 
     #[test]

@@ -659,11 +659,6 @@ const WalletPage: React.FC = () => {
     return () => { alive = false; clearInterval(id); };
   }, []);
 
-  function readyNoteFor(amountUegoc: number): ShieldedNote | null {
-    const ready = (shielded?.notes ?? []).filter(n => n.status === 'ready');
-    return ready.find(n => n.value_uegoc === amountUegoc) ?? null;
-  }
-
   const shieldReady = Boolean(shielded?.enabled && shielded?.active);
 
   async function submitTx() {
@@ -671,19 +666,18 @@ const WalletPage: React.FC = () => {
     const amount  = Math.floor(parseFloat(sendForm.amount) * 1_000_000);
 
     if (sendForm.shielded) {
-      const note = readyNoteFor(amount);
+      const note = (shielded?.notes ?? []).find(n => n.status === 'ready' && n.value_uegoc === amount);
       if (!note) {
         setTxResult({
           hash: '', success: false,
           message: `No shielded note of exactly ${(amount / 1_000_000).toLocaleString()} EGOC is ready. `
-                 + `Shielded sends spend one whole note, so the amount must match a note you hold.`,
+                 + `A shielded send spends one whole note, so the amount must match one you hold.`,
         });
         return;
       }
       try {
         const res = await invoke<{ hash: string }>('shield_withdraw', {
-          commitment: note.commitment,
-          recipient: sendForm.to,
+          commitment: note.commitment, recipient: sendForm.to,
         });
         setEmailStep('idle');
         setTxResult({ hash: res.hash, success: true, message: 'Sent from your shielded balance' });
@@ -3320,6 +3314,31 @@ const WalletPage: React.FC = () => {
                     />
                   </div>
                   <div className="flex flex-wrap gap-3">
+                  <div className={`flex items-center justify-between p-3 rounded-xl border flex-1 min-w-[240px] ${
+                    sendForm.shielded ? 'bg-amber-500/10 border-amber-500/40' : 'bg-gray-900/50 border-gray-700/50'
+                  }`}>
+                    <div className="flex items-center gap-3">
+                      <div className="w-8 h-8 rounded-lg bg-amber-500/10 flex items-center justify-center text-amber-400">&#128737;</div>
+                      <div>
+                        <div className="text-sm font-semibold">Send shielded</div>
+                        <div className="text-[10px] text-gray-500 uppercase font-bold tracking-wider">
+                          {!shieldReady
+                            ? 'Unavailable on this network'
+                            : `${(( shielded?.ready_balance_uegoc ?? 0) / 1_000_000).toLocaleString()} EGOC ready`}
+                        </div>
+                      </div>
+                    </div>
+                    <button
+                      disabled={!shieldReady}
+                      onClick={() => setSendForm(f => ({ ...f, shielded: !f.shielded }))}
+                      className={`w-10 h-5 rounded-full transition-colors relative ${
+                        !shieldReady ? 'bg-gray-800 opacity-50 cursor-not-allowed'
+                          : sendForm.shielded ? 'bg-amber-500' : 'bg-gray-700'
+                      }`}
+                    >
+                      <div className={`absolute top-1 w-3 h-3 rounded-full bg-white transition-all ${sendForm.shielded ? 'left-6' : 'left-1'}`} />
+                    </button>
+                  </div>
                   {sideband?.enabled && (
                     <div className="flex items-center justify-between bg-gray-900/50 p-3 rounded-xl border border-gray-700/50 flex-1 min-w-[240px]">
                       <div className="flex items-center gap-3">
@@ -3340,6 +3359,18 @@ const WalletPage: React.FC = () => {
                     </div>
                   )}
                   </div>
+                  {sendForm.shielded && (
+                    <div className="bg-amber-500/5 border border-amber-500/20 rounded-xl p-3 text-[11px] text-amber-200/70 leading-relaxed">
+                      The chain records a withdrawal from the shielded pool to the recipient.
+                      Your address is not on it, and nothing links it to the deposit it came from.
+                      <div className="mt-1.5 text-amber-200/50">
+                        One whole note is spent, so the amount must match one you hold:{' '}
+                        {[...new Set((shielded?.notes ?? []).filter(n => n.status === 'ready').map(n => n.value_uegoc))]
+                          .sort((a, b) => a - b).map(v => (v / 1_000_000).toLocaleString()).join(', ')
+                          || 'none ready, shield some funds first'} EGOC.
+                      </div>
+                    </div>
+                  )}
                   {sendForm.viaRadio && (
                     <div className="bg-amber-500/5 border border-amber-500/20 rounded-xl p-3 text-[11px] text-amber-200/70 leading-relaxed">
                       This will be written to your offline link and not sent over the
@@ -3347,72 +3378,15 @@ const WalletPage: React.FC = () => {
                       for {sideband?.max_age_hours ?? 24} hours while it crosses.
                     </div>
                   )}
-                  {(
-                    <div className="grid grid-cols-2 gap-2">
-                      <button
-                        onClick={() => setSendForm(f => ({ ...f, shielded: false }))}
-                        className={`p-3 rounded-xl border text-left transition ${
-                          !sendForm.shielded
-                            ? 'border-yellow-500/60 bg-yellow-500/10'
-                            : 'border-gray-700/50 bg-gray-900/50 hover:bg-gray-800/50'
-                        }`}
-                      >
-                        <div className="text-sm font-semibold">Public</div>
-                        <div className="text-[10px] text-gray-500 mt-0.5">
-                          {egocBal.toLocaleString()} EGOC available
-                        </div>
-                      </button>
-                      <button
-                        disabled={!shieldReady}
-                        onClick={() => setSendForm(f => ({ ...f, shielded: true }))}
-                        className={`p-3 rounded-xl border text-left transition ${
-                          !shieldReady
-                            ? 'border-gray-800 bg-gray-900/30 opacity-50 cursor-not-allowed'
-                            : sendForm.shielded
-                              ? 'border-amber-400/60 bg-amber-500/10'
-                              : 'border-gray-700/50 bg-gray-900/50 hover:bg-gray-800/50'
-                        }`}
-                      >
-                        <div className="text-sm font-semibold">Shielded</div>
-                        <div className="text-[10px] text-gray-500 mt-0.5">
-                          {!shielded?.enabled
-                            ? 'Unavailable in this build'
-                            : !shielded?.active
-                              ? 'Not yet active on this network'
-                              : `${((shielded?.ready_balance_uegoc ?? 0) / 1_000_000).toLocaleString()} EGOC ready`}
-                        </div>
-                      </button>
-                    </div>
-                  )}
-                  {sendForm.shielded ? (
-                    <div className="bg-amber-500/5 border border-amber-500/20 rounded-xl p-3 text-[11px] text-amber-200/70 leading-relaxed">
-                      The chain will record a withdrawal from the shielded pool to the recipient.
-                      Your address does not appear on it, and nothing links it to the deposit it
-                      came from.
-                      <div className="mt-1.5 text-amber-200/50">
-                        One whole note is spent, so the amount must match a note you hold:{' '}
-                        {[...new Set((shielded?.notes ?? []).filter(n => n.status === 'ready').map(n => n.value_uegoc))]
-                          .sort((a, b) => a - b)
-                          .map(v => (v / 1_000_000).toLocaleString())
-                          .join(', ') || 'none ready, use Shield first'}
-                        {' '}EGOC.
-                      </div>
-                      <div className="mt-1.5 text-amber-200/50">
-                        Privacy comes from the crowd in the pool. Withdrawing straight after
-                        depositing can still be linked by timing; waiting is stronger.
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="bg-gray-500/5 border border-gray-600/30 rounded-xl p-3 text-[11px] text-gray-400 leading-relaxed">
-                      This payment is public. Your address, the recipient and the amount are
-                      recorded on the chain and readable by anyone.
+                  <div className="bg-gray-500/5 border border-gray-600/30 rounded-xl p-3 text-[11px] text-gray-400 leading-relaxed">
+                    This payment is public. Your address, the recipient and the amount are
+                    recorded on the chain and readable by anyone.
+                    {shielded?.enabled && shielded?.active && (
                       <div className="mt-1.5 text-gray-300">
-                        {shieldReady
-                          ? 'Choose Shielded above to send without revealing who paid whom.'
-                          : 'Shielded sending is built but not yet switched on for this network.'}
+                        To send without revealing who paid whom, use <span className="font-semibold">Shield</span> instead.
                       </div>
-                    </div>
-                  )}
+                    )}
+                  </div>
                   <div className="bg-gray-900 rounded-xl p-3 space-y-2 text-sm">
                     <div className="flex justify-between">
                       <span className="text-gray-400">Transfer fee</span>

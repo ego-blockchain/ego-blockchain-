@@ -28,7 +28,13 @@ pub fn rule_active(height: u64) -> bool {
             return height >= h;
         }
     }
-    chain_db::is_feature_enabled(FEATURE_SHIELDED_POOL)
+    if chain_db::is_feature_enabled(FEATURE_SHIELDED_POOL) {
+        return true;
+    }
+    !matches!(
+        std::env::var("EGO_SHIELDED_POOL").as_deref().map(str::trim),
+        Ok("0") | Ok("off") | Ok("OFF") | Ok("false") | Ok("False")
+    )
 }
 
 pub fn rule_active_at_tip() -> bool {
