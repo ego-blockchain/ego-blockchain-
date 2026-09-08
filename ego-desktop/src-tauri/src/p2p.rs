@@ -495,6 +495,10 @@ pub const ARCHIVE_BACKFILL_WINDOW: u64 = 5_000;
 const ARCHIVE_BATCH: usize = 25;
 const ARCHIVE_MAX_PER_TICK: usize = 250;
 
+fn archive_scan_start(tip: u64) -> u64 {
+    tip.saturating_sub(ARCHIVE_BACKFILL_WINDOW.saturating_sub(1)).max(1)
+}
+
 pub async fn oracle_archive_tick() {
     if offline_mode() || !oracle_push_enabled() || !is_oracle_writer() {
         return;
@@ -513,17 +517,29 @@ pub async fn oracle_archive_tick() {
     if tip == 0 {
         return;
     }
-    let from = tip.saturating_sub(ARCHIVE_BACKFILL_WINDOW).max(1);
+    let from = archive_scan_start(tip);
 
     #[derive(serde::Deserialize, Default)]
     struct GapsResp {
         #[serde(default)]
         missing: Vec<u64>,
+        #[serde(default)]
+        error: Option<String>,
     }
     let gaps = match oracle_get(&client, &format!("/chain/gaps?from={}&to={}", from, tip)).await {
-        Some(r) => r.json::<GapsResp>().await.unwrap_or_default(),
+        Some(r) => match r.json::<GapsResp>().await {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[Archive] /chain/gaps returned an unreadable body: {}", e);
+                return;
+            }
+        },
         None => return,
     };
+    if let Some(err) = gaps.error {
+        eprintln!("[Archive] /chain/gaps refused {}..={}: {}", from, tip, err);
+        return;
+    }
     if gaps.missing.is_empty() {
         return;
     }
@@ -13337,5 +13353,34 @@ mod proposer_election_tests {
         // time rather than after hundreds of rounds.
         assert!(PROPOSER_ESCAPE_ROUND <= 16, "escape takes too long to reach");
         assert!(PROPOSER_ESCAPE_ROUND >= 2, "escaping immediately defeats the narrowing");
+    }
+}
+
+#[cfg(test)]
+mod archive_scan_tests {
+    use super::{archive_scan_start, ARCHIVE_BACKFILL_WINDOW};
+
+    #[test]
+    fn the_scan_never_exceeds_the_oracle_width_limit() {
+        for tip in [1u64, 2, 4_999, 5_000, 5_001, 29_124, 1_000_000] {
+            let from = archive_scan_start(tip);
+            assert!(from >= 1, "tip {} produced from {}", tip, from);
+            assert!(
+                tip + 1 - from <= ARCHIVE_BACKFILL_WINDOW,
+                "tip {} spans {} heights, over the {} limit",
+                tip, tip + 1 - from, ARCHIVE_BACKFILL_WINDOW,
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_window_is_exactly_the_limit() {
+        let tip = 29_124;
+        assert_eq!(tip + 1 - archive_scan_start(tip), ARCHIVE_BACKFILL_WINDOW);
+    }
+
+    #[test]
+    fn a_short_chain_starts_at_height_one() {
+        assert_eq!(archive_scan_start(20), 1);
     }
 }
