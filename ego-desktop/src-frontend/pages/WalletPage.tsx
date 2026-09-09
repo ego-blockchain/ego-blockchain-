@@ -714,6 +714,17 @@ const WalletPage: React.FC = () => {
     invoke<ShieldedStatus>('shielded_status').then(setShielded).catch(() => {});
   }
 
+  useEffect(() => {
+    if (!showShield) return;
+    let alive = true;
+    const id = setInterval(() => {
+      invoke<ShieldedStatus>('shielded_status')
+        .then(st => { if (alive) setShielded(st); })
+        .catch(() => {});
+    }, 3_000);
+    return () => { alive = false; clearInterval(id); };
+  }, [showShield]);
+
   function resetSend() {
     setSidebandMsg('');
     setShowSend(false);
@@ -2932,39 +2943,50 @@ const WalletPage: React.FC = () => {
                   )}
                 </div>
                 <div className="max-h-52 overflow-y-auto rounded-xl border border-gray-700 divide-y divide-gray-700/60">
-                  {(shielded?.notes ?? []).filter(n => n.status === 'ready').length === 0 && (
+                  {(shielded?.notes ?? []).filter(n => n.status !== 'spent').length === 0 && (
                     <div className="px-3 py-4 text-xs text-gray-500 text-center">
-                      No notes ready yet. Move funds into the pool first.
+                      No notes yet. Move funds into the pool first.
                     </div>
                   )}
-                  {(shielded?.notes ?? []).filter(n => n.status === 'ready').map(n => {
-                    const picked = shieldNotes.includes(n.commitment);
-                    return (
-                      <label
-                        key={n.commitment}
-                        className={`flex items-center gap-3 px-3 py-2.5 cursor-pointer transition ${
-                          picked ? 'bg-amber-500/10' : 'bg-gray-900/60 hover:bg-gray-800/60'
-                        }`}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={picked}
-                          onChange={() => setShieldNotes(prev =>
-                            prev.includes(n.commitment)
-                              ? prev.filter(c => c !== n.commitment)
-                              : [...prev, n.commitment]
+                  {(shielded?.notes ?? [])
+                    .filter(n => n.status !== 'spent')
+                    .map(n => {
+                      const ready  = n.status === 'ready';
+                      const picked = shieldNotes.includes(n.commitment);
+                      return (
+                        <label
+                          key={n.commitment}
+                          className={`flex items-center gap-3 px-3 py-2.5 transition ${
+                            !ready ? 'bg-gray-900/40 opacity-60 cursor-default'
+                              : picked ? 'bg-amber-500/10 cursor-pointer'
+                              : 'bg-gray-900/60 hover:bg-gray-800/60 cursor-pointer'
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            disabled={!ready}
+                            checked={picked}
+                            onChange={() => setShieldNotes(prev =>
+                              prev.includes(n.commitment)
+                                ? prev.filter(c => c !== n.commitment)
+                                : [...prev, n.commitment]
+                            )}
+                            className="w-4 h-4 accent-amber-500 shrink-0"
+                          />
+                          <span className="text-sm font-semibold shrink-0">
+                            {(n.value_uegoc / 1_000_000).toLocaleString()} EGOC
+                          </span>
+                          <span className="font-mono text-[11px] text-gray-500 truncate flex-1">
+                            {n.commitment.slice(0, 12)}…
+                          </span>
+                          {!ready && (
+                            <span className="text-[10px] uppercase font-bold tracking-wider text-amber-300/70 shrink-0">
+                              {n.status === 'pending' ? 'confirming' : n.status}
+                            </span>
                           )}
-                          className="w-4 h-4 accent-amber-500 shrink-0"
-                        />
-                        <span className="text-sm font-semibold shrink-0">
-                          {(n.value_uegoc / 1_000_000).toLocaleString()} EGOC
-                        </span>
-                        <span className="font-mono text-[11px] text-gray-500 truncate">
-                          {n.commitment.slice(0, 12)}…
-                        </span>
-                      </label>
-                    );
-                  })}
+                        </label>
+                      );
+                    })}
                 </div>
                 <input
                   type="text"
