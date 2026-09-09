@@ -9695,6 +9695,10 @@ async fn merge_remote_chain_trusted(
     merge_remote_chain_inner(blocks, transactions, app, true).await;
 }
 
+pub fn peer_chain_is_better(peer_tip: u64, local_tip: u64) -> bool {
+    peer_tip > local_tip
+}
+
 fn merge_remote_chain_blocking(
     mut blocks: Vec<LedgerBlock>,
     transactions: Vec<LedgerTx>,
@@ -9740,6 +9744,15 @@ fn merge_remote_chain_blocking(
             .map(|b| b.height);
 
         if let Some(dh) = diverge_height {
+            let peer_tip = blocks.iter().map(|b| b.height).max().unwrap_or(0);
+            let local_tip = crate::chain_db::latest_block_info().0;
+            if !peer_chain_is_better(peer_tip, local_tip) {
+                eprintln!(
+                    "[Fork] refusing to rewind: peer offers a chain ending at {} but ours reaches {} —                      a node arriving with older blocks must not drag the network back",
+                    peer_tip, local_tip
+                );
+                return (false, false);
+            }
             let last_hard = {
                 let hard_final = hard_finalized_heights();
                 hard_final.iter().max().copied().unwrap_or(0)
@@ -13725,5 +13738,32 @@ mod pool_blame_tests {
                 "{reason} is not stale pool state, and rebuilding on it would replay the whole                  chain for nothing",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fork_choice_tests {
+    use super::peer_chain_is_better;
+
+    #[test]
+    fn a_node_arriving_with_older_blocks_cannot_rewind_the_network() {
+        assert!(
+            !peer_chain_is_better(29_100, 29_406),
+            "a peer three hundred blocks behind must never cause a truncation: one node              restarting with stale history would otherwise take the whole network back with it",
+        );
+    }
+
+    #[test]
+    fn an_equal_chain_is_not_worth_reorganising_onto() {
+        assert!(
+            !peer_chain_is_better(29_406, 29_406),
+            "same height is no improvement, and swapping between equal chains would flap",
+        );
+    }
+
+    #[test]
+    fn a_genuinely_longer_chain_is_still_adopted() {
+        assert!(peer_chain_is_better(29_407, 29_406), "one block ahead is a real advance");
+        assert!(peer_chain_is_better(30_000, 29_406));
     }
 }
