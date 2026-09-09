@@ -903,7 +903,11 @@ pub fn build_shadow_consensus_host() -> Option<crate::consensus_host::ConsensusH
     // needing on-chain registration first, and never drops an active peer (the cause of
     // the inline `vs(len=1)` stalls). For an isolated pair this is {self, peer} identically
     // on both nodes; the engine derives the SAME Address from kp.dilithium_public_key().
-    let source = live_validators();
+    let (source, from_chain) = committee_source();
+    if from_chain && !source.iter().any(|a| a == &my_addr) {
+        eprintln!("[ConsensusV2] not in the on-chain validator set — observing, not joining the committee");
+        return None;
+    }
     let mut pairs: Vec<(String, ego_core::Address)> = Vec::new();
     {
         let pubkeys = validator_pubkeys();
@@ -913,14 +917,19 @@ pub fn build_shadow_consensus_host() -> Option<crate::consensus_host::ConsensusH
             } else {
                 match pubkeys.get(addr).and_then(|h| hex::decode(h).ok()) {
                     Some(b) if !b.is_empty() => b,
-                    _ => continue, // peer's Dilithium key not yet known — skip
+                    _ => {
+                        eprintln!(
+                            "[ConsensusV2] committee not built: Dilithium key for {} is unknown — refusing a partial committee",
+                            &addr[..addr.len().min(20)],
+                        );
+                        return None;
+                    }
                 }
             };
             pairs.push((addr.clone(), address_from_dilithium(dil_raw)));
         }
     }
-    // Include self even before our own validator_register is committed on-chain.
-    if !pairs.iter().any(|(a, _)| a == &my_addr) {
+    if !from_chain && !pairs.iter().any(|(a, _)| a == &my_addr) {
         pairs.push((my_addr.clone(), address_from_dilithium(my_dil_raw)));
     }
     if pairs.len() < crate::mempool::min_validators_for_finality() {
@@ -988,10 +997,25 @@ fn v2_committee_sig() -> std::sync::MutexGuard<'static, String> {
 fn v2_pending_sig() -> std::sync::MutexGuard<'static, String> {
     V2_PENDING_SIG.get_or_init(|| std::sync::Mutex::new(String::new())).lock().unwrap()
 }
+pub fn committee_source() -> (Vec<String>, bool) {
+    let slashed = slashed_validators();
+    let on_chain: Vec<String> = crate::chain_db::registered_validators_sorted()
+        .into_iter()
+        .filter(|a| !slashed.contains(a))
+        .collect();
+    let min_live = crate::mempool::min_validators_for_finality();
+    if on_chain.len() >= min_live {
+        let recent = crate::chain_db::recently_active_validators(PROPOSER_LIVENESS_LOOKBACK);
+        return (narrow_to_live(on_chain, &recent, 0, min_live), true);
+    }
+    let mut live = live_validators();
+    live.sort();
+    (live, false)
+}
+
 fn live_committee_sig() -> String {
-    let mut v = live_validators();
-    v.sort();
-    v.join(",")
+    let (members, from_chain) = committee_source();
+    format!("{}|{}", if from_chain { "chain" } else { "live" }, members.join(","))
 }
 
 async fn maybe_reconfigure_committee() {
