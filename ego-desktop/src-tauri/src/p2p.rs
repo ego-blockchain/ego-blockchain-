@@ -12246,7 +12246,15 @@ pub async fn run_view_change_monitor() {
         let pipeline = PIPELINE_NEXT.swap(false, Ordering::Relaxed);
         let now  = chrono::Utc::now().timestamp();
         let last = LAST_PROPOSAL_TS.load(Ordering::Relaxed);
-        if !pipeline && (last == 0 || now - last < VIEW_CHANGE_TIMEOUT_SECS) { continue; }
+        if last == 0 {
+            // Nothing has been proposed or synced since this node started. Start the
+            // clock rather than waiting for an event that cannot happen: a node that
+            // restarts already at the tip never proposes and never syncs, so treating
+            // "never" as "not yet due" leaves the election unreachable forever.
+            LAST_PROPOSAL_TS.store(now, Ordering::Relaxed);
+            continue;
+        }
+        if !pipeline && now - last < VIEW_CHANGE_TIMEOUT_SECS { continue; }
 
         let view_init = tokio::task::spawn_blocking(|| {
             let chain_next = crate::chain_db::latest_block_info().0 + 1;
@@ -13789,5 +13797,43 @@ mod fork_choice_tests {
     fn a_genuinely_longer_chain_is_still_adopted() {
         assert!(peer_chain_is_better(29_407, 29_406), "one block ahead is a real advance");
         assert!(peer_chain_is_better(30_000, 29_406));
+    }
+}
+
+#[cfg(test)]
+mod proposal_clock_tests {
+    use super::VIEW_CHANGE_TIMEOUT_SECS;
+
+    fn election_runs(pipeline: bool, now: i64, last: i64) -> bool {
+        if last == 0 {
+            return false;
+        }
+        pipeline || now - last >= VIEW_CHANGE_TIMEOUT_SECS
+    }
+
+    #[test]
+    fn a_node_that_has_never_proposed_starts_the_clock_instead_of_waiting_forever() {
+        let now = 1_000_000i64;
+        assert!(
+            !election_runs(false, now, 0),
+            "the first pass only starts the clock",
+        );
+        assert!(
+            election_runs(false, now + VIEW_CHANGE_TIMEOUT_SECS, now),
+            "once the clock is running the election becomes reachable — without this a node              restarted at the tip never proposes and never syncs, so the timestamp stays zero              and the leader election is never entered at all",
+        );
+    }
+
+    #[test]
+    fn a_recent_proposal_still_holds_the_election_back() {
+        let now = 2_000_000i64;
+        assert!(!election_runs(false, now, now), "just proposed, nothing to recover");
+        assert!(!election_runs(false, now, now - 1), "well inside the timeout");
+    }
+
+    #[test]
+    fn pipelining_fires_immediately_after_a_commit() {
+        let now = 3_000_000i64;
+        assert!(election_runs(true, now, now), "a commit asks for the next height at once");
     }
 }
