@@ -20,10 +20,23 @@ fn count_frames(dir: &PathBuf) -> usize {
 
 /// Frames waiting in the inbox and the outbox of the default spool.
 pub fn queue_depths() -> (usize, usize) {
-    match SPOOL_ROOT.get() {
-        Some(root) => (count_frames(&root.join("inbox")), count_frames(&root.join("outbox"))),
-        None => (0, 0),
+    let Some(root) = SPOOL_ROOT.get() else { return (0, 0) };
+    let mine = format!("{}-", node_tag());
+    let (mut waiting, mut sent) = (0usize, 0usize);
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("frame") {
+                continue;
+            }
+            match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) if n.starts_with(&mine) => sent += 1,
+                Some(_) => waiting += 1,
+                None => {}
+            }
+        }
     }
+    (waiting, sent)
 }
 
 pub struct SpoolTransport {
@@ -43,6 +56,26 @@ fn spool_dir_override(var: &str) -> Option<PathBuf> {
     Some(PathBuf::from(trimmed))
 }
 
+pub fn shared_spool_dir() -> PathBuf {
+    if let Some(dir) = spool_dir_override("EGO_SIDEBAND_DIR") {
+        return dir;
+    }
+    let base = std::env::var("PROGRAMDATA")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("Ego").join("sideband")
+}
+
+pub fn node_tag() -> &'static str {
+    static TAG: OnceLock<String> = OnceLock::new();
+    TAG.get_or_init(|| {
+        let dir = crate::ledger::base_data_dir();
+        let digest = ego_core::hash_data(dir.to_string_lossy().as_bytes()).to_hex();
+        digest.chars().take(8).collect()
+    })
+}
+
 impl SpoolTransport {
     pub fn new(name: &'static str, root: PathBuf, send_enabled: bool, max_payload: usize) -> Self {
         let inbox = root.join("inbox");
@@ -53,19 +86,11 @@ impl SpoolTransport {
     }
 
     pub fn default_spool() -> Self {
-        let root = crate::ledger::base_data_dir().join("sideband");
+        let root = shared_spool_dir();
+        let _ = std::fs::create_dir_all(&root);
         let _ = SPOOL_ROOT.set(root.clone());
-        let inbox = spool_dir_override("EGO_SIDEBAND_INBOX").unwrap_or_else(|| root.join("inbox"));
-        let outbox = spool_dir_override("EGO_SIDEBAND_OUTBOX").unwrap_or_else(|| root.join("outbox"));
-        let _ = std::fs::create_dir_all(&inbox);
-        let _ = std::fs::create_dir_all(&outbox);
-        if inbox != root.join("inbox") || outbox != root.join("outbox") {
-            eprintln!(
-                "[Sideband] carrying frames through {} -> {}",
-                outbox.display(), inbox.display()
-            );
-        }
-        Self { name: "spool", inbox, outbox, send_enabled: true, max_payload: 200 }
+        eprintln!("[Sideband] offline link at {} (node {})", root.display(), node_tag());
+        Self { name: "spool", inbox: root.clone(), outbox: root, send_enabled: true, max_payload: 200 }
     }
 
     pub fn inbox(&self) -> &PathBuf {
@@ -95,7 +120,7 @@ impl SidebandTransport for SpoolTransport {
             return Err("transport is receive-only".into());
         }
         let body = serde_json::to_vec(frame).map_err(|e| e.to_string())?;
-        let name = format!("{:08x}-{:05}.frame", frame.msg_id, frame.seq);
+        let name = format!("{}-{:08x}-{:05}.frame", node_tag(), frame.msg_id, frame.seq);
         // Write beside the target then rename, so a bridge script never reads a
         // half-written frame.
         let tmp = self.outbox.join(format!("{name}.tmp"));
@@ -105,9 +130,13 @@ impl SidebandTransport for SpoolTransport {
 
     fn recv_frame(&self) -> Option<Frame> {
         let entries = std::fs::read_dir(&self.inbox).ok()?;
+        let mine = format!("{}-", node_tag());
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("frame") {
+                continue;
+            }
+            if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&mine)) {
                 continue;
             }
             let bytes = match std::fs::read(&path) {
@@ -156,7 +185,10 @@ mod tests {
         let receiver = SpoolTransport::new("spool", receiver_root, true, 200);
         for entry in std::fs::read_dir(sender.outbox()).unwrap().flatten() {
             let name = entry.file_name();
-            std::fs::copy(entry.path(), receiver.inbox().join(name)).unwrap();
+            let as_seen_from_elsewhere = name
+                .to_string_lossy()
+                .replacen(node_tag(), "beefcafe", 1);
+            std::fs::copy(entry.path(), receiver.inbox().join(as_seen_from_elsewhere)).unwrap();
         }
 
         let mut reassembled = None;
@@ -193,26 +225,30 @@ mod carrier_tests {
     use super::*;
 
     #[test]
-    fn a_frame_written_to_one_spool_is_read_by_the_other() {
-        let base = std::env::temp_dir().join(format!("ego-sideband-{}", std::process::id()));
-        let shared = base.join("shared");
-        let a_out = shared.clone();
-        let b_in = shared.clone();
-        std::fs::create_dir_all(&shared).unwrap();
+    fn a_node_reads_frames_from_others_and_skips_its_own() {
+        let dir = std::env::temp_dir().join(format!("ego-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
 
-        let sender = SpoolTransport::new("a", base.join("a"), true, 200);
-        let sender = SpoolTransport { outbox: a_out, ..sender };
-        let receiver = SpoolTransport::new("b", base.join("b"), true, 200);
-        let receiver = SpoolTransport { inbox: b_in, ..receiver };
+        let me = SpoolTransport {
+            name: "spool", inbox: dir.clone(), outbox: dir.clone(),
+            send_enabled: true, max_payload: 200,
+        };
+        let frame = Frame { v: 1, kind: 1, msg_id: 0xABCD, seq: 1, total: 1, crc: 0, payload: b"mine".to_vec() };
+        me.send_frame(&frame).unwrap();
+        assert!(
+            me.recv_frame().is_none(),
+            "a node must not read back its own frame from the shared folder, or every payment              would be delivered to the sender",
+        );
 
-        let frame = Frame { v: 1, kind: 1, msg_id: 0xABCD, seq: 1, total: 1, crc: 0, payload: b"hello".to_vec() };
-        sender.send_frame(&frame).expect("write to the shared folder");
+        let theirs = dir.join("beefcafe-0000abcd-00001.frame");
+        let other = Frame { v: 1, kind: 1, msg_id: 0xBEEF, seq: 1, total: 1, crc: 0, payload: b"yours".to_vec() };
+        std::fs::write(&theirs, serde_json::to_vec(&other).unwrap()).unwrap();
 
-        let got = receiver.recv_frame().expect("the other node must see it");
-        assert_eq!(got.msg_id, frame.msg_id);
-        assert_eq!(got.payload, frame.payload);
+        let got = me.recv_frame().expect("a frame from another node must be picked up");
+        assert_eq!(got.payload, b"yours".to_vec());
 
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

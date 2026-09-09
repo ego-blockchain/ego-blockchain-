@@ -3439,10 +3439,10 @@ const WalletPage: React.FC = () => {
                   {sendForm.viaRadio && (
                     <div className="bg-amber-500/5 border border-amber-500/20 rounded-xl p-3 text-[11px] text-amber-200/70 leading-relaxed">
                       This is written to your offline link instead of being sent over the
-                      internet, and it travels once by whatever route you have set up to carry
-                      it. Nothing moves it for you: point EGO_SIDEBAND_OUTBOX at a shared
-                      folder, a USB stick, or a radio bridge, or the payment waits in the
-                      outbox. It stays valid for {sideband?.max_age_hours ?? 24} hours.
+                      internet. Any Ego node sharing that folder picks it up, so nodes on one
+                      machine reach each other with nothing to set up; to cross machines, put
+                      the folder on a shared drive or a USB stick and carry it. It stays valid
+                      for {sideband?.max_age_hours ?? 24} hours.
                     </div>
                   )}
                   <div className="bg-gray-500/5 border border-gray-600/30 rounded-xl p-3 text-[11px] text-gray-400 leading-relaxed">
