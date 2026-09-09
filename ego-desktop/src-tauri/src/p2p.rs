@@ -6943,12 +6943,16 @@ async fn handle_event(
             } else if topic == "ego-blocks-v1" {
                 match serde_json::from_slice::<P2PMessage>(&message.data) {
                     Ok(P2PMessage::ChainSyncResponse { blocks, transactions }) => {
+                        if let Some(h) = blocks.iter().map(|b| b.height).max() {
+                            note_network_height(h);
+                        }
                         let app2 = app.cloned();
                         tokio::spawn(async move { merge_remote_chain(blocks, transactions, app2.as_ref()).await; });
                     }
                     Ok(P2PMessage::BlockFinalized { mut block, transactions, votes, agg_bls_sig, bls_pubkeys }) => {
                         let block_hash = block.hash.clone();
                         let height     = block.height;
+                        note_network_height(height);
                         let app2 = app.cloned();
                         let source_pid = propagation_source.to_string();
                         // If the producer's block arrived without a QC, build one from the
@@ -10259,10 +10263,36 @@ fn attach_local_qc_if_missing(block: &mut crate::ledger::LedgerBlock) {
 /// is the Ed25519 signature over the BLS pubkey bytes). The oracle and other
 /// nodes use this to know which validator a QC's BLS key belongs to, and thus
 /// its stake weight. Skips if an identical registration is already on-chain.
+pub const OBSERVER_LAG_BLOCKS: u64 = 50;
+
+pub fn network_tip() -> u64 {
+    NETWORK_BEST_HEIGHT.load(Ordering::Relaxed)
+}
+
+pub fn observer_by_lag(local_height: u64, network_tip: u64) -> bool {
+    network_tip > local_height.saturating_add(OBSERVER_LAG_BLOCKS)
+}
+
 pub fn is_observer() -> bool {
-    std::env::var("EGO_OBSERVER")
+    if std::env::var("EGO_OBSERVER")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+    {
+        return true;
+    }
+    let local = crate::chain_db::latest_block_info().0;
+    let tip = network_tip();
+    if observer_by_lag(local, tip) {
+        static TOLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if TOLD.swap(tip, Ordering::Relaxed) != tip {
+            eprintln!(
+                "[BFT] observing only: at height {} with the network at {} — catching up before taking part",
+                local, tip
+            );
+        }
+        return true;
+    }
+    false
 }
 
 pub fn maybe_emit_validator_registration() {
@@ -13557,6 +13587,42 @@ mod view_runaway_tests {
         assert!(
             MAX_ROUND_BEHIND_TIP > PROPOSER_ESCAPE_ROUND * 4,
             "resetting too eagerly would stop a stalled height ever reaching the wider              candidate set that lets it recover",
+        );
+    }
+}
+
+#[cfg(test)]
+mod observer_lag_tests {
+    use super::{observer_by_lag, OBSERVER_LAG_BLOCKS};
+
+    #[test]
+    fn a_node_far_behind_only_observes() {
+        assert!(
+            observer_by_lag(4, 29_340),
+            "a node with four blocks must not vote on a chain at twenty-nine thousand: it would              be proposing at height five while everyone else is at the tip",
+        );
+    }
+
+    #[test]
+    fn a_node_at_the_tip_takes_part() {
+        assert!(!observer_by_lag(29_340, 29_340));
+        assert!(!observer_by_lag(29_341, 29_340), "briefly ahead is still a participant");
+    }
+
+    #[test]
+    fn ordinary_lag_does_not_bench_a_validator() {
+        assert!(
+            !observer_by_lag(29_330, 29_340),
+            "ten blocks behind is normal propagation delay, not a node that needs to catch up",
+        );
+        assert!(!observer_by_lag(29_340 - OBSERVER_LAG_BLOCKS, 29_340), "exactly at the limit still takes part");
+    }
+
+    #[test]
+    fn an_unknown_network_tip_never_benches_anyone() {
+        assert!(
+            !observer_by_lag(0, 0),
+            "before hearing from any peer the tip reads zero, and that must not silence a node              that is genuinely at the tip of a young chain",
         );
     }
 }
