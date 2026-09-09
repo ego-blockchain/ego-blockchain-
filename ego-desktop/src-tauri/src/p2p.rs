@@ -606,6 +606,24 @@ pub async fn push_snapshot_to_oracle() {
     oracle_post(&client, "/chain/snapshot", &body).await;
 }
 
+fn evict_poison_txs(reason: &str, txs: &[crate::ledger::LedgerTx]) {
+    let blamed: Vec<String> = txs
+        .iter()
+        .filter(|t| !t.hash.is_empty() && reason.contains(&t.hash))
+        .map(|t| t.hash.clone())
+        .collect();
+    if blamed.is_empty() {
+        return;
+    }
+    crate::mempool::get_mempool().remove_txs(&blamed);
+    for h in &blamed {
+        eprintln!(
+            "[Mempool] dropped {:.14} — it makes every block carrying it invalid: {}",
+            h, reason
+        );
+    }
+}
+
 pub static RELAY_CIRCUIT_READY: AtomicBool = AtomicBool::new(false);
 
 pub static IS_PUBLIC_REACHABLE: AtomicBool = AtomicBool::new(false);
@@ -1086,6 +1104,7 @@ pub async fn shadow_on_proposal(
             .await.unwrap_or_else(|_| Err("validation task panicked".into()));
         if let Err(e) = valid {
             eprintln!("[ConsensusV2/LIVE] reject #{} — invalid block: {}", header.height, e);
+            evict_poison_txs(&e, &txs);
             return;
         }
         v2_pending_blocks().insert(header.block_hash(), (block, txs));
@@ -13418,5 +13437,46 @@ mod archive_scan_tests {
     #[test]
     fn a_short_chain_starts_at_height_one() {
         assert_eq!(archive_scan_start(20), 1);
+    }
+}
+
+#[cfg(test)]
+mod poison_tx_tests {
+    use crate::ledger::LedgerTx;
+
+    fn blamed_in(reason: &str, txs: &[LedgerTx]) -> Vec<String> {
+        txs.iter()
+            .filter(|t| !t.hash.is_empty() && reason.contains(&t.hash))
+            .map(|t| t.hash.clone())
+            .collect()
+    }
+
+    fn tx(hash: &str) -> LedgerTx {
+        LedgerTx { hash: hash.into(), ..LedgerTx::default() }
+    }
+
+    #[test]
+    fn the_transaction_named_in_the_rejection_is_the_one_dropped() {
+        let bad = "0xdeadbeef00000000000000000000000000000000000000000000000000000001";
+        let ok = "0xfeedface00000000000000000000000000000000000000000000000000000002";
+        let reason = format!("unshield {bad} proves against a root the pool does not have");
+        let blamed = blamed_in(&reason, &[tx(ok), tx(bad)]);
+        assert_eq!(blamed, vec![bad.to_string()], "only the offending transaction may be dropped");
+    }
+
+    #[test]
+    fn a_rejection_naming_nothing_drops_nothing() {
+        let reason = "block 42 header roots do not commit to the block";
+        let txs = [tx("0xaaaa"), tx("0xbbbb")];
+        assert!(
+            blamed_in(reason, &txs).is_empty(),
+            "a whole-block failure must not evict the transactions that happened to be in it",
+        );
+    }
+
+    #[test]
+    fn empty_hashes_never_match() {
+        let reason = "something went wrong";
+        assert!(blamed_in(reason, &[tx("")]).is_empty(), "an empty hash matches every string");
     }
 }
