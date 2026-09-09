@@ -223,6 +223,21 @@ pub fn leaves() -> Vec<[u8; 32]> {
     out
 }
 
+pub struct ShieldedPoolRootProbe;
+
+impl ShieldedPoolRootProbe {
+    pub fn current_root_of(leaves: &[[u8; 32]]) -> [u8; 32] {
+        let mut t = IncrementalTree::new(POOL_TREE_DEPTH);
+        for l in leaves {
+            let Ok(d) = to_digest(l) else { return [0u8; 32] };
+            if t.insert(d).is_err() {
+                return [0u8; 32];
+            }
+        }
+        from_digest(&t.root())
+    }
+}
+
 pub fn is_deposit(tx: &LedgerTx) -> bool {
     tx.to == SHIELDED_POOL_ADDR
 }

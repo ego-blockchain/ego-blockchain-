@@ -461,6 +461,27 @@ pub async fn shield_withdraw(
         })
         .collect();
 
+    {
+        let st = shielded_chain::state();
+        let all = shielded_chain::leaves();
+        let pool_root = shielded_chain::ShieldedPoolRootProbe::current_root_of(&all);
+        eprintln!(
+            "[Shielded] proving against root {} | leaves={} state.next_index={} state.root={} known={} history={}",
+            hex::encode(&pool_root[..8]),
+            all.len(),
+            st.next_index,
+            hex::encode(&st.root[..8]),
+            st.is_known_root(&pool_root),
+            st.recent_roots.len(),
+        );
+        if !st.is_known_root(&pool_root) {
+            return Err(EgoDesktopError::InvalidInput(format!(
+                "The pool moved while this was being prepared. leaves={} next_index={}                  -- try again in a moment.",
+                all.len(), st.next_index
+            )));
+        }
+    }
+
     let withdrawals = tokio::task::spawn_blocking(move || {
         let pool = prover_pool()?;
         let rd = shielded::recipient_digest(&recipient_for_proof);
