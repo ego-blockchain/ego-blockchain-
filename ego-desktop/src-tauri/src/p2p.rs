@@ -4530,11 +4530,12 @@ pub async fn sync_chain_from_peers() {
     if LAST_FROM_HEIGHT.swap(from_height, std::sync::atomic::Ordering::Relaxed) == from_height {
         let stuck = STUCK_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if stuck >= 5 && stuck % 5 == 0 {
+            let ask_from = snapshot_request_height(my_height);
             tracing::warn!(
-                "[Sync] Block sync stuck at height {} for {} rounds — falling back to state snapshot",
-                my_height, stuck
+                "[Sync] Block sync stuck at height {} for {} rounds — asking peers for a state                  snapshot newer than {}",
+                my_height, stuck, ask_from
             );
-            request_snapshot_from_peers(my_height).await;
+            request_snapshot_from_peers(ask_from).await;
         }
     } else {
         STUCK_ROUNDS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -9641,6 +9642,10 @@ async fn request_gap_backfill(from_height: u64, source_peer_id: &str) {
     }
 }
 
+pub fn snapshot_request_height(my_height: u64) -> u64 {
+    my_height.saturating_sub(SNAPSHOT_SERVE_MIN_LAG + 1)
+}
+
 pub async fn request_snapshot_from_peers(have_height: u64) {
     let my_endpoint = get_public_endpoint().await;
     if my_endpoint.is_empty() { return; }
@@ -13623,6 +13628,43 @@ mod observer_lag_tests {
         assert!(
             !observer_by_lag(0, 0),
             "before hearing from any peer the tip reads zero, and that must not silence a node              that is genuinely at the tip of a young chain",
+        );
+    }
+}
+
+#[cfg(test)]
+mod stuck_recovery_tests {
+    use super::{snapshot_request_height, SNAPSHOT_SERVE_MIN_LAG};
+
+    fn peer_would_serve(local_tip: u64, have_height: u64) -> bool {
+        local_tip > have_height + SNAPSHOT_SERVE_MIN_LAG
+    }
+
+    #[test]
+    fn a_node_stuck_one_block_short_can_still_be_served() {
+        let stuck_at = 29_396;
+        let peer_tip = 29_397;
+        assert!(
+            !peer_would_serve(peer_tip, stuck_at),
+            "asking with the true height is refused: one block behind does not look like a node              that needs a snapshot, which is why it looped fifty times unanswered",
+        );
+        assert!(
+            peer_would_serve(peer_tip, snapshot_request_height(stuck_at)),
+            "a node that cannot get past a block its peers accepted must be able to jump the gap",
+        );
+    }
+
+    #[test]
+    fn the_request_never_underflows_on_a_young_chain() {
+        assert_eq!(snapshot_request_height(0), 0);
+        assert_eq!(snapshot_request_height(3), 0);
+    }
+
+    #[test]
+    fn a_node_genuinely_far_behind_is_unaffected() {
+        assert!(
+            peer_would_serve(29_397, snapshot_request_height(4)),
+            "the usual far-behind case must keep working",
         );
     }
 }
