@@ -2421,6 +2421,7 @@ pub fn import_state_snapshot(snap: &StateSnapshot) -> Result<(), String> {
         db.write(batch).map_err(|e| format!("snapshot write: {e}"))?;
     }
     restore_in_memory_state_from_db();
+    crate::shielded_chain::repair_pool_state_after_reorg(snap.height);
     tracing::info!("[FastSync] Installed state snapshot at height {} ({} balances, {} meta)", snap.height, snap.balances.len(), snap.meta.len());
     Ok(())
 }
@@ -3720,6 +3721,7 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
 
     tracing::warn!("Reorg: truncated heights {}..={} (new tip: {}, removed {} txs, {} orphaned user txs)",
         height, tip, new_tip, removed_txs, orphaned.len());
+    crate::shielded_chain::repair_pool_state_after_reorg(height);
     orphaned
 }
 

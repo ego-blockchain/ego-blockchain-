@@ -289,11 +289,18 @@ pub fn rebuild_from_chain() -> Result<PoolState, String> {
     Ok(state)
 }
 
-pub fn repair_pool_state() {
+pub struct PoolRepair {
+    pub leaves_before: u64,
+    pub leaves_after: u64,
+    pub changed: bool,
+}
+
+pub fn repair_pool_state() -> Option<PoolRepair> {
     let before = state();
     match rebuild_from_chain() {
         Ok(after) => {
-            if after.root != before.root || after.next_index != before.next_index {
+            let changed = after.root != before.root || after.next_index != before.next_index;
+            if changed {
                 tracing::warn!(
                     "[Shielded] pool state rebuilt from the chain: leaves {} -> {}, root {} -> {}",
                     before.next_index, after.next_index,
@@ -302,8 +309,43 @@ pub fn repair_pool_state() {
             } else {
                 tracing::info!("[Shielded] pool state agrees with the chain ({} leaves)", after.next_index);
             }
+            Some(PoolRepair {
+                leaves_before: before.next_index,
+                leaves_after: after.next_index,
+                changed,
+            })
         }
-        Err(e) => tracing::error!("[Shielded] could not rebuild the pool from the chain: {e}"),
+        Err(e) => {
+            tracing::error!("[Shielded] could not rebuild the pool from the chain: {e}");
+            None
+        }
+    }
+}
+
+pub fn repair_pool_state_after_reorg(height: u64) {
+    let Some(repair) = repair_pool_state() else { return };
+    if !repair.changed {
+        return;
+    }
+    tracing::warn!(
+        "[Shielded] the pool was out of step with the chain after a reorg at height {} —          rebuilt from {} leaves to {}",
+        height, repair.leaves_before, repair.leaves_after,
+    );
+    let lost = repair.leaves_before.saturating_sub(repair.leaves_after);
+    if let Some(app) = crate::p2p::APP_HANDLE.get() {
+        crate::commands::notifications::notify(
+            app,
+            "Shielded balance rebuilt",
+            &format!(
+                "This node moved onto a different chain, so {lost} shielded deposit(s) it was                  tracking are no longer in the history. Those coins are back in your ordinary                  balance; shielded notes from them can no longer be spent."
+            ),
+        );
+        use tauri::Manager;
+        let _ = app.emit_all("ego://shielded-rebuilt", serde_json::json!({
+            "leaves_before": repair.leaves_before,
+            "leaves_after": repair.leaves_after,
+            "height": height,
+        }));
     }
 }
 
