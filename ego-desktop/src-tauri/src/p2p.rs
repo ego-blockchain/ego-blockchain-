@@ -606,6 +606,33 @@ pub async fn push_snapshot_to_oracle() {
     oracle_post(&client, "/chain/snapshot", &body).await;
 }
 
+pub fn rejection_blames_the_pool(reason: &str) -> bool {
+    reason.contains("root the pool does not have")
+        || reason.contains("repeats a commitment already in the tree")
+        || reason.contains("the pool holds none of that size")
+        || reason.contains("exceeds the pool's")
+}
+
+const POOL_REPAIR_COOLDOWN_SECS: i64 = 60;
+static LAST_POOL_REPAIR: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+async fn repair_pool_if_blamed(reason: &str) {
+    if !rejection_blames_the_pool(reason) {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let last = LAST_POOL_REPAIR.load(Ordering::Relaxed);
+    if now - last < POOL_REPAIR_COOLDOWN_SECS {
+        return;
+    }
+    LAST_POOL_REPAIR.store(now, Ordering::Relaxed);
+    eprintln!("[Shielded] a block was refused over pool state — rechecking the pool against the chain");
+    let _ = tokio::task::spawn_blocking(|| {
+        crate::shielded_chain::repair_pool_state_after_reorg(crate::chain_db::local_chain_height())
+    })
+    .await;
+}
+
 fn evict_poison_txs(reason: &str, txs: &[crate::ledger::LedgerTx]) {
     let blamed: Vec<String> = txs
         .iter()
@@ -1129,6 +1156,7 @@ pub async fn shadow_on_proposal(
         if let Err(e) = valid {
             eprintln!("[ConsensusV2/LIVE] reject #{} — invalid block: {}", header.height, e);
             evict_poison_txs(&e, &txs);
+            repair_pool_if_blamed(&e).await;
             return;
         }
         v2_pending_blocks().insert(header.block_hash(), (block, txs));
@@ -13666,5 +13694,36 @@ mod stuck_recovery_tests {
             peer_would_serve(29_397, snapshot_request_height(4)),
             "the usual far-behind case must keep working",
         );
+    }
+}
+
+#[cfg(test)]
+mod pool_blame_tests {
+    use super::rejection_blames_the_pool;
+
+    #[test]
+    fn the_failures_a_stale_pool_causes_trigger_a_recheck() {
+        for reason in [
+            "unshield 0xabc proves against a root the pool does not have",
+            "shield 0xdef repeats a commitment already in the tree",
+            "unshield 0xabc claims a 100 uEGOC note but the pool holds none of that size",
+            "unshield 0xabc of 100 uEGOC exceeds the pool's 0 uEGOC",
+        ] {
+            assert!(rejection_blames_the_pool(reason), "{reason} should recheck the pool");
+        }
+    }
+
+    #[test]
+    fn unrelated_failures_do_not_rebuild_the_pool() {
+        for reason in [
+            "block 42 header roots do not commit to the block",
+            "tx 0xabc has an invalid signature",
+            "unshield 0xabc proof does not verify",
+        ] {
+            assert!(
+                !rejection_blames_the_pool(reason),
+                "{reason} is not stale pool state, and rebuilding on it would replay the whole                  chain for nothing",
+            );
+        }
     }
 }

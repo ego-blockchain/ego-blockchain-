@@ -12,6 +12,44 @@ pub const SHARD_COUNT: u32   = 256;
 pub const BATCH_SIZE:  usize = 100_000;
 pub const MAX_BLOCK_TXS: usize = 500_000;
 
+const STALL_WARN_AFTER_SECS: u64 = 180;
+const STALL_WARN_REPEAT_SECS: u64 = 900;
+
+static STALL_WARNED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn stall_warning_due(stuck_secs: u64, last_warned_at: u64) -> bool {
+    if stuck_secs < STALL_WARN_AFTER_SECS {
+        return false;
+    }
+    last_warned_at == 0 || stuck_secs.saturating_sub(last_warned_at) >= STALL_WARN_REPEAT_SECS
+}
+
+fn warn_operator_chain_stalled(stuck_secs: u64, known_count: usize) {
+    use std::sync::atomic::Ordering;
+    let last = STALL_WARNED_AT.load(Ordering::Relaxed);
+    if !stall_warning_due(stuck_secs, last) {
+        return;
+    }
+    STALL_WARNED_AT.store(stuck_secs, Ordering::Relaxed);
+    let minutes = stuck_secs / 60;
+    let body = format!(
+        "No block has been agreed for {minutes} minute(s) with {known_count} validator(s)          connected. Your transactions are waiting, not lost. This usually means the nodes          disagree about the chain after a network change. Restarting every node is the first          thing to try."
+    );
+    tracing::error!("[Stalled] {}", body);
+    if let Some(app) = crate::p2p::APP_HANDLE.get() {
+        crate::commands::notifications::notify(app, "Chain is not producing blocks", &body);
+        use tauri::Manager;
+        let _ = app.emit_all("ego://chain-stalled", serde_json::json!({
+            "stuck_secs": stuck_secs,
+            "validators": known_count,
+        }));
+    }
+}
+
+pub fn note_block_finalized() {
+    STALL_WARNED_AT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn min_validators_for_finality() -> usize {
     std::env::var("EGO_MIN_VALIDATORS")
         .ok()
@@ -922,6 +960,7 @@ pub async fn run_batch_loop() {
                     stuck_secs,
                     known_count
                 );
+                warn_operator_chain_stalled(stuck_secs.max(0) as u64, known_count);
             } else {
                 tracing::warn!(
                     "Not enough validators to finalize: {} known, need {}; leaving txs in mempool",
@@ -1013,5 +1052,37 @@ mod sideband_ttl_tests {
         }
         let len = m.sideband_hashes.lock().unwrap().len();
         assert!(len <= MAX_SIDEBAND_TRACKED, "tracked set grew to {len}");
+    }
+}
+
+#[cfg(test)]
+mod stall_warning_tests {
+    use super::{stall_warning_due, STALL_WARN_AFTER_SECS, STALL_WARN_REPEAT_SECS};
+
+    #[test]
+    fn a_brief_pause_never_alarms_anyone() {
+        assert!(!stall_warning_due(5, 0));
+        assert!(
+            !stall_warning_due(STALL_WARN_AFTER_SECS - 1, 0),
+            "blocks take seconds; warning before three minutes would cry wolf constantly",
+        );
+    }
+
+    #[test]
+    fn a_real_stall_is_reported_once() {
+        assert!(stall_warning_due(STALL_WARN_AFTER_SECS, 0), "first crossing warns");
+        assert!(
+            !stall_warning_due(STALL_WARN_AFTER_SECS + 60, STALL_WARN_AFTER_SECS),
+            "a minute later must not warn again, or a stuck chain buries the user in popups",
+        );
+    }
+
+    #[test]
+    fn a_stall_that_drags_on_reminds_the_user() {
+        let first = STALL_WARN_AFTER_SECS;
+        assert!(
+            stall_warning_due(first + STALL_WARN_REPEAT_SECS, first),
+            "still stuck a quarter of an hour later is worth saying again",
+        );
     }
 }
