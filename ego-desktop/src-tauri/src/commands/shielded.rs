@@ -139,11 +139,15 @@ fn save_notes(notes: &[StoredNote]) -> Result<(), EgoDesktopError> {
 }
 
 const WITHDRAWAL_GRACE_SECS: i64 = 300;
+const WITHDRAWAL_DEAD_SECS: i64 = 1_800;
 
 fn withdrawal_abandoned(spent_tx: &str, spent_at: Option<i64>) -> bool {
     let waited = spent_at
         .map(|t| chrono::Utc::now().timestamp().saturating_sub(t))
         .unwrap_or(i64::MAX);
+    if waited >= WITHDRAWAL_DEAD_SECS {
+        return true;
+    }
     if waited < WITHDRAWAL_GRACE_SECS {
         return false;
     }
