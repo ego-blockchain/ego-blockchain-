@@ -138,6 +138,21 @@ fn save_notes(notes: &[StoredNote]) -> Result<(), EgoDesktopError> {
     crate::utils::atomic_write(&notes_path(), &out).map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))
 }
 
+const WITHDRAWAL_GRACE_SECS: i64 = 300;
+
+fn withdrawal_abandoned(spent_tx: &str, spent_at: Option<i64>) -> bool {
+    let waited = spent_at
+        .map(|t| chrono::Utc::now().timestamp().saturating_sub(t))
+        .unwrap_or(i64::MAX);
+    if waited < WITHDRAWAL_GRACE_SECS {
+        return false;
+    }
+    !crate::mempool::get_mempool()
+        .peek_all()
+        .iter()
+        .any(|t| t.hash == spent_tx)
+}
+
 fn note_status(n: &StoredNote) -> (String, Option<u64>) {
     let commitment: Option<[u8; 32]> = hex::decode(&n.commitment).ok().and_then(|v| v.try_into().ok());
     let leaf_index = commitment.and_then(|c| shielded_chain::leaf_index_of(&c));
@@ -147,6 +162,8 @@ fn note_status(n: &StoredNote) -> (String, Option<u64>) {
             .unwrap_or(false);
         if confirmed || shielded_chain::is_nullifier_spent(&n.note.nullifier()) {
             "spent"
+        } else if withdrawal_abandoned(spent_tx, n.spent_at) {
+            "ready"
         } else {
             "spending"
         }
@@ -183,7 +200,25 @@ pub async fn shielded_status() -> Result<ShieldedStatus, EgoDesktopError> {
         let enabled = shielded::is_enabled();
         let active = shielded_chain::rule_active_at_tip();
         let state = shielded_chain::state();
-        let notes = if enabled { load_notes().unwrap_or_default() } else { Vec::new() };
+        let mut notes = if enabled { load_notes().unwrap_or_default() } else { Vec::new() };
+        let mut recovered = false;
+        for n in notes.iter_mut() {
+            if let Some(tx) = n.spent_tx.clone() {
+                let gone = crate::chain_db::get_tx_by_hash(&tx)
+                    .map(|t| t.block_height.is_some())
+                    .unwrap_or(false)
+                    || shielded_chain::is_nullifier_spent(&n.note.nullifier());
+                if !gone && withdrawal_abandoned(&tx, n.spent_at) {
+                    n.spent_tx = None;
+                    n.spent_at = None;
+                    recovered = true;
+                }
+            }
+        }
+        if recovered {
+            let _ = save_notes(&notes);
+        }
+        let notes = notes;
         let mut views = Vec::with_capacity(notes.len());
         let mut ready = 0u64;
         let mut pending = 0u64;

@@ -2879,8 +2879,8 @@ const WalletPage: React.FC = () => {
               Shielding moves coins into a pool where they are recorded only as a commitment. Unshielding
               later pays a note out to any address with a zero-knowledge proof, and nothing on the chain links
               the two. Notes come in fixed sizes of {SHIELD_DENOMINATIONS_EGOC.slice().reverse().join(', ')} EGOC so
-              amounts cannot identify them. The circuit is unaudited and the keys come from a single-party
-              setup; use it on the testnet only.
+              amounts cannot identify them. Proofs are hash-based STARKs, so there is no trusted setup and no
+              ceremony keys to trust. The circuit is unaudited; use it on the testnet only.
             </div>
             {shieldMsg && (
               <div className="text-xs px-3 py-2 mb-3 rounded-lg bg-amber-500/15 text-amber-200 break-words">{shieldMsg}</div>
