@@ -1375,6 +1375,26 @@ pub async fn shadow_v2_tick() {
     };
     if !my_turn { return; }
 
+    emit_v2_proposal().await;
+}
+
+pub async fn force_v2_proposal_as_elected_leader() {
+    if !consensus_v2_live_enabled() {
+        return;
+    }
+    {
+        let guard = shadow_host_lock();
+        let Some(h) = guard.as_ref() else { return };
+        let key = (h.current_height() << 16) | (h.current_round() as u64 & 0xFFFF);
+        if SHADOW_LAST_PROPOSED.swap(key, std::sync::atomic::Ordering::Relaxed) == key {
+            return;
+        }
+    }
+    eprintln!("[ConsensusV2/LIVE] elected by the committee while the engine had not rotated — proposing");
+    emit_v2_proposal().await;
+}
+
+async fn emit_v2_proposal() {
     // Build the candidate (real txs in LIVE, empty otherwise) OFF the lock.
     let (candidate, stamped) = if consensus_v2_live_enabled() {
         match build_live_candidate().await { Some(v) => v, None => return }
@@ -12259,7 +12279,11 @@ pub async fn run_view_change_monitor() {
                 );
                 if leader == my_addr {
                     eprintln!("[HotStuff] Stall timeout — round-robin leader for height {} — proposing directly", chain_next);
-                    tokio::spawn(async move { propose_block_as_leader().await; });
+                    if consensus_v2_live_enabled() {
+                        force_v2_proposal_as_elected_leader().await;
+                    } else {
+                        tokio::spawn(async move { propose_block_as_leader().await; });
+                    }
                     touch_proposal_timestamp();
                     STUCK_VIEWCHANGE_CYCLES.store(0, Ordering::Relaxed);
                     continue;
