@@ -141,8 +141,15 @@ fn save_notes(notes: &[StoredNote]) -> Result<(), EgoDesktopError> {
 fn note_status(n: &StoredNote) -> (String, Option<u64>) {
     let commitment: Option<[u8; 32]> = hex::decode(&n.commitment).ok().and_then(|v| v.try_into().ok());
     let leaf_index = commitment.and_then(|c| shielded_chain::leaf_index_of(&c));
-    let status = if n.spent_tx.is_some() {
-        if shielded_chain::is_nullifier_spent(&n.note.nullifier()) { "spent" } else { "spending" }
+    let status = if let Some(spent_tx) = n.spent_tx.as_deref() {
+        let confirmed = crate::chain_db::get_tx_by_hash(spent_tx)
+            .map(|t| t.block_height.is_some())
+            .unwrap_or(false);
+        if confirmed || shielded_chain::is_nullifier_spent(&n.note.nullifier()) {
+            "spent"
+        } else {
+            "spending"
+        }
     } else if leaf_index.is_some() {
         "ready"
     } else {
