@@ -2942,57 +2942,62 @@ const WalletPage: React.FC = () => {
                     </button>
                   )}
                 </div>
-                <div className="max-h-52 overflow-y-auto rounded-xl border border-gray-700 divide-y divide-gray-700/60">
-                  {(shielded?.notes ?? []).filter(n => n.status === 'ready').length === 0 && (
-                    <div className="px-3 py-4 text-xs text-center text-gray-400 bg-gray-900/80">
-                      <div className="font-semibold text-gray-300">Nothing ready to send</div>
-                      <div className="mt-1 text-gray-500">
-                        {(shielded?.notes ?? []).some(n => n.status === 'pending')
-                          ? 'Your deposit is still confirming. It becomes spendable in a moment.'
-                          : 'Move funds into the pool first.'}
+                {(() => {
+                  const all      = shielded?.notes ?? [];
+                  const ready    = all.filter(n => n.status === 'ready');
+                  const settling = all.filter(n => n.status === 'pending' || n.status === 'spending');
+                  if (ready.length === 0) {
+                    return (
+                      <div className="rounded-xl border border-gray-700 bg-gray-900/60 px-3 py-5 text-xs text-center">
+                        <div className="font-semibold text-gray-300">Nothing ready to send</div>
+                        <div className="mt-1 text-gray-500">
+                          {settling.length > 0
+                            ? `${settling.length} note${settling.length === 1 ? '' : 's'} still confirming — they become spendable shortly.`
+                            : 'Move funds into the pool first.'}
+                        </div>
                       </div>
-                    </div>
-                  )}
-                  {(shielded?.notes ?? [])
-                    .filter(n => n.status !== 'spent')
-                    .map(n => {
-                      const ready  = n.status === 'ready';
-                      const picked = shieldNotes.includes(n.commitment);
-                      return (
-                        <label
-                          key={n.commitment}
-                          className={`flex items-center gap-3 px-3 py-2.5 transition ${
-                            !ready ? 'bg-gray-900/40 opacity-60 cursor-default'
-                              : picked ? 'bg-amber-500/10 cursor-pointer'
-                              : 'bg-gray-900/60 hover:bg-gray-800/60 cursor-pointer'
-                          }`}
-                        >
-                          <input
-                            type="checkbox"
-                            disabled={!ready}
-                            checked={picked}
-                            onChange={() => setShieldNotes(prev =>
-                              prev.includes(n.commitment)
-                                ? prev.filter(c => c !== n.commitment)
-                                : [...prev, n.commitment]
-                            )}
-                            className="w-4 h-4 accent-amber-500 shrink-0"
-                          />
-                          <span className="text-sm font-semibold shrink-0">
-                            {(n.value_uegoc / 1_000_000).toLocaleString()} EGOC
-                          </span>
-                          <span className="font-mono text-[11px] text-gray-500 truncate flex-1">
-                            {n.commitment.slice(0, 12)}…
-                          </span>
-                          {!ready && (
-                            <span className="text-[10px] uppercase font-bold tracking-wider text-amber-300/70 shrink-0">
-                              {n.status === 'pending' ? 'confirming' : n.status}
-                            </span>
-                          )}
-                        </label>
-                      );
-                    })}
-                </div>
+                    );
+                  }
+                  return (
+                    <>
+                      <div className="max-h-52 overflow-y-auto rounded-xl border border-gray-700 divide-y divide-gray-700/60">
+                        {ready.map(n => {
+                          const picked = shieldNotes.includes(n.commitment);
+                          return (
+                            <label
+                              key={n.commitment}
+                              className={`flex items-center gap-3 px-3 py-2.5 cursor-pointer transition ${
+                                picked ? 'bg-amber-500/10' : 'bg-gray-900/60 hover:bg-gray-800/60'
+                              }`}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={picked}
+                                onChange={() => setShieldNotes(prev =>
+                                  prev.includes(n.commitment)
+                                    ? prev.filter(c => c !== n.commitment)
+                                    : [...prev, n.commitment]
+                                )}
+                                className="w-4 h-4 accent-amber-500 shrink-0"
+                              />
+                              <span className="text-sm font-semibold shrink-0">
+                                {(n.value_uegoc / 1_000_000).toLocaleString()} EGOC
+                              </span>
+                              <span className="font-mono text-[11px] text-gray-500 truncate flex-1">
+                                {n.commitment.slice(0, 12)}…
+                              </span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                      {settling.length > 0 && (
+                        <div className="text-[11px] text-gray-500 mt-1.5">
+                          {settling.length} more note{settling.length === 1 ? '' : 's'} still confirming.
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
                 <input
                   type="text"
                   value={shieldTo}
