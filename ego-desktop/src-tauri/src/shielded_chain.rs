@@ -487,7 +487,11 @@ pub fn validate_block_shielded_txs(height: u64, txs: &[LedgerTx]) -> Result<(), 
     for tx in txs {
         if is_deposit(tx) {
             validate_deposit_in(db, &state, tx, &mut seen_commitments)?;
-            state.next_index += 1;
+            let commitment = parse_shield_memo(&tx.memo)
+                .ok_or_else(|| format!("shield {} lost its commitment", tx.hash))?;
+            state
+                .insert(leaf_for(&commitment, tx.amount))
+                .map_err(|e| format!("shield {} could not enter the tree: {e}", tx.hash))?;
             state.balance_uegoc = state.balance_uegoc.saturating_add(tx.amount);
             state.note_added(tx.amount);
         } else if is_unshield(tx) {
@@ -1053,6 +1057,73 @@ mod tests {
         assert_eq!(restored.balance_uegoc, before.balance_uegoc);
         assert_eq!(leaf_index_of(&a.commitment()), None);
         assert_eq!(leaves().len() as u64, before.next_index);
+        std::env::remove_var("EGO_SHIELDED_POOL_HEIGHT");
+    }
+
+    #[test]
+    fn a_deposit_and_a_spend_of_it_can_share_one_block() {
+        let _g = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("EGO_SHIELDED_POOL_HEIGHT", "0");
+        let mut rng = StdRng::from_entropy();
+        let recipient = "egot1qw508d6qejxtdg4y5r3zarvary0c5xw7k".to_string();
+        let height = 950_000_000 + (rng.next_u64() % 1_000_000);
+        let fee = 1_000u64;
+
+        let old = Note::random(100_000_000, &mut rng);
+        {
+            let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
+            let mut batch = WriteBatch::default();
+            apply_block(db, &mut batch, height, &[&deposit_tx(&old)]);
+            db.write(batch).unwrap();
+        }
+
+        let fresh = Note::random(100_000_000, &mut rng);
+        let fresh_deposit = deposit_tx(&fresh);
+
+        let mut all = leaves();
+        all.push(leaf_for(&fresh.commitment(), 100_000_000));
+        let pool = ShieldedPool::from_leaves(POOL_TREE_DEPTH, &all).unwrap();
+        let index = leaf_index_of(&old.commitment()).unwrap() as usize;
+        let w = crate::shielded::prove_withdrawal(
+            &pool, &old, index, recipient_digest(&recipient), fee,
+        ).unwrap();
+
+        let body = UnshieldBody {
+            spends: vec![UnshieldSpend {
+                root: hex::encode(w.root),
+                nullifier: hex::encode(w.nullifier),
+                amount_uegoc: w.amount_uegoc,
+                fee_uegoc: fee,
+                proof: hex::encode(&w.proof),
+            }],
+            recipient: recipient.clone(),
+            amount_uegoc: w.amount_uegoc,
+            fee_uegoc: fee,
+        };
+        let withdrawal = LedgerTx {
+            hash: body.tx_hash(),
+            from: SHIELDED_POOL_ADDR.into(),
+            to: recipient.clone(),
+            amount: w.amount_uegoc,
+            fee_uegoc: fee,
+            tx_type: TX_UNSHIELD.into(),
+            call_args: body.canonical_json(),
+            ..LedgerTx::default()
+        };
+
+        let block = vec![fresh_deposit.clone(), withdrawal];
+        let verdict = validate_block_shielded_txs(height + 1, &block);
+        {
+            let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
+            let mut batch = WriteBatch::default();
+            rollback(db, &mut batch, height, &[deposit_tx(&old)]);
+            db.write(batch).unwrap();
+        }
+        assert!(
+            verdict.is_ok(),
+            "a withdrawal proved against a root that includes a deposit in the same block must              validate: the dry run has to advance the root history as apply_block does: {:?}",
+            verdict.err(),
+        );
         std::env::remove_var("EGO_SHIELDED_POOL_HEIGHT");
     }
 

@@ -2943,9 +2943,14 @@ const WalletPage: React.FC = () => {
                   )}
                 </div>
                 <div className="max-h-52 overflow-y-auto rounded-xl border border-gray-700 divide-y divide-gray-700/60">
-                  {(shielded?.notes ?? []).filter(n => n.status !== 'spent').length === 0 && (
-                    <div className="px-3 py-4 text-xs text-gray-500 text-center">
-                      No notes yet. Move funds into the pool first.
+                  {(shielded?.notes ?? []).filter(n => n.status === 'ready').length === 0 && (
+                    <div className="px-3 py-4 text-xs text-center text-gray-400 bg-gray-900/80">
+                      <div className="font-semibold text-gray-300">Nothing ready to send</div>
+                      <div className="mt-1 text-gray-500">
+                        {(shielded?.notes ?? []).some(n => n.status === 'pending')
+                          ? 'Your deposit is still confirming. It becomes spendable in a moment.'
+                          : 'Move funds into the pool first.'}
+                      </div>
                     </div>
                   )}
                   {(shielded?.notes ?? [])

@@ -334,3 +334,33 @@ mod tests {
         assert_ne!(t.root(), empty_subtree_roots(POOL_TREE_DEPTH)[POOL_TREE_DEPTH]);
     }
 }
+
+#[cfg(test)]
+mod tree_agreement {
+    use super::*;
+    use crate::{hash_with_domain, Elem};
+
+    fn leaf(i: u64) -> Digest {
+        hash_with_domain(99, &[Elem::new(i)])
+    }
+
+    #[test]
+    fn the_two_trees_agree_on_the_root_after_every_insertion() {
+        const DEPTH: usize = 12;
+        let mut cached = MerkleTree::new(DEPTH);
+        let mut frontier = IncrementalTree::new(DEPTH);
+        assert_eq!(cached.root(), frontier.root(), "empty roots differ");
+
+        for i in 0..600u64 {
+            let l = leaf(i);
+            let a = cached.insert(l).expect("cached insert");
+            let b = frontier.insert(l).expect("frontier insert");
+            assert_eq!(a, b, "index disagreement at {i}");
+            assert_eq!(
+                cached.root(), frontier.root(),
+                "roots diverge after {} leaves — the prover and consensus would disagree",
+                i + 1
+            );
+        }
+    }
+}
