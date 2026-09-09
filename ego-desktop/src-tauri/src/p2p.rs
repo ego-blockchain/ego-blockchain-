@@ -1618,6 +1618,25 @@ pub fn current_view() -> u64 { CURRENT_VIEW.load(Ordering::Relaxed) }
 
 fn advance_view(v: u64) { CURRENT_VIEW.store(v, Ordering::Relaxed); }
 
+pub const MAX_ROUND_BEHIND_TIP: u64 = 64;
+
+pub fn round_at_height(chain_next: u64) -> u64 {
+    let view = current_view();
+    if view <= chain_next {
+        return 0;
+    }
+    let round = view - chain_next;
+    if round > MAX_ROUND_BEHIND_TIP {
+        CURRENT_VIEW.store(chain_next, Ordering::Relaxed);
+        eprintln!(
+            "[HotStuff] view {} ran {} rounds past height {} — resetting to round 0",
+            view, round, chain_next
+        );
+        return 0;
+    }
+    round
+}
+
 // ── PoRep outstanding challenge tracker ───────────────────────────────────────
 
 #[derive(Debug)]
@@ -12147,7 +12166,7 @@ pub async fn run_view_change_monitor() {
         let next_view = chain_next.max(current_view() + 1);
 
         {
-            let round = current_view().saturating_sub(chain_next);
+            let round = round_at_height(chain_next);
             let vs = proposer_candidates(round);
             if !vs.is_empty() {
                 let idx = (chain_next as usize)
@@ -13502,5 +13521,42 @@ mod poison_tx_tests {
     fn empty_hashes_never_match() {
         let reason = "something went wrong";
         assert!(blamed_in(reason, &[tx("")]).is_empty(), "an empty hash matches every string");
+    }
+}
+
+#[cfg(test)]
+mod view_runaway_tests {
+    use super::*;
+
+    #[test]
+    fn a_view_at_or_behind_the_tip_is_round_zero() {
+        CURRENT_VIEW.store(29_319, Ordering::Relaxed);
+        assert_eq!(round_at_height(29_319), 0);
+        CURRENT_VIEW.store(100, Ordering::Relaxed);
+        assert_eq!(round_at_height(29_319), 0, "a view behind the tip is not a huge round");
+    }
+
+    #[test]
+    fn ordinary_view_changes_still_count_as_rounds() {
+        CURRENT_VIEW.store(29_322, Ordering::Relaxed);
+        assert_eq!(round_at_height(29_319), 3, "three view changes is round three");
+    }
+
+    #[test]
+    fn a_runaway_view_snaps_back_to_round_zero() {
+        CURRENT_VIEW.store(129_131, Ordering::Relaxed);
+        assert_eq!(
+            round_at_height(29_319), 0,
+            "a view 99,812 rounds past the tip must reset: past PROPOSER_ESCAPE_ROUND the              candidate list stops narrowing, so one node seats the whole registry while a              node at round 0 seats only the live few, and they never agree on a proposer",
+        );
+        assert_eq!(current_view(), 29_319, "the reset must persist, not just be reported");
+    }
+
+    #[test]
+    fn the_reset_threshold_is_well_past_the_escape_round() {
+        assert!(
+            MAX_ROUND_BEHIND_TIP > PROPOSER_ESCAPE_ROUND * 4,
+            "resetting too eagerly would stop a stalled height ever reaching the wider              candidate set that lets it recover",
+        );
     }
 }
