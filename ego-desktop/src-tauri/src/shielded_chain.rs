@@ -223,6 +223,90 @@ pub fn leaves() -> Vec<[u8; 32]> {
     out
 }
 
+pub fn rebuild_from_chain() -> Result<PoolState, String> {
+    let tip = chain_db::local_chain_height();
+    let mut state = PoolState::empty();
+    let mut leaves: Vec<(u64, [u8; 32])> = Vec::new();
+    let mut nullifiers: Vec<[u8; 32]> = Vec::new();
+
+    for height in 1..=tip {
+        let txs = chain_db::get_txs_for_block(height);
+        for tx in &txs {
+            if is_deposit(tx) {
+                let Some(commitment) = parse_shield_memo(&tx.memo) else { continue };
+                if !is_denomination(tx.amount) {
+                    continue;
+                }
+                let index = state.insert(leaf_for(&commitment, tx.amount))?;
+                leaves.push((index, leaf_for(&commitment, tx.amount)));
+                state.balance_uegoc = state.balance_uegoc.saturating_add(tx.amount);
+                state.note_added(tx.amount);
+            } else if is_unshield(tx) {
+                let Ok(body) = parse_unshield_body(&tx.call_args) else { continue };
+                for sp in &body.spends {
+                    if let Ok(n) = sp.nullifier_bytes() {
+                        nullifiers.push(n);
+                    }
+                    state.note_spent(sp.amount_uegoc);
+                }
+                state.balance_uegoc = state.balance_uegoc.saturating_sub(tx.amount);
+            }
+        }
+    }
+
+    let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf) = db.cf_handle(CF_META) else { return Err("no meta column family".into()) };
+    let mut batch = WriteBatch::default();
+    for item in db.iterator_cf(cf, IteratorMode::From(KEY_LEAF, Direction::Forward)) {
+        let Ok((k, _)) = item else { break };
+        if !k.starts_with(KEY_LEAF) { break; }
+        batch.delete_cf(cf, k.as_ref());
+    }
+    for item in db.iterator_cf(cf, IteratorMode::From(KEY_CIDX, Direction::Forward)) {
+        let Ok((k, _)) = item else { break };
+        if !k.starts_with(KEY_CIDX) { break; }
+        batch.delete_cf(cf, k.as_ref());
+    }
+    for (index, leaf) in &leaves {
+        batch.put_cf(cf, leaf_key(*index), leaf);
+    }
+    for height in 1..=tip {
+        for tx in chain_db::get_txs_for_block(height) {
+            if is_deposit(&tx) {
+                if let Some(c) = parse_shield_memo(&tx.memo) {
+                    if let Some((i, _)) = leaves.iter().find(|(_, l)| *l == leaf_for(&c, tx.amount)) {
+                        batch.put_cf(cf, cidx_key(&c), i.to_be_bytes());
+                    }
+                }
+            }
+        }
+    }
+    for n in &nullifiers {
+        batch.put_cf(cf, nf_key(n), u64_le(0));
+    }
+    batch.put_cf(cf, KEY_STATE, &encode(&state));
+    db.write(batch).map_err(|e| format!("pool rebuild write: {e}"))?;
+    Ok(state)
+}
+
+pub fn repair_pool_state() {
+    let before = state();
+    match rebuild_from_chain() {
+        Ok(after) => {
+            if after.root != before.root || after.next_index != before.next_index {
+                tracing::warn!(
+                    "[Shielded] pool state rebuilt from the chain: leaves {} -> {}, root {} -> {}",
+                    before.next_index, after.next_index,
+                    hex::encode(&before.root[..8]), hex::encode(&after.root[..8]),
+                );
+            } else {
+                tracing::info!("[Shielded] pool state agrees with the chain ({} leaves)", after.next_index);
+            }
+        }
+        Err(e) => tracing::error!("[Shielded] could not rebuild the pool from the chain: {e}"),
+    }
+}
+
 pub struct ShieldedPoolRootProbe;
 
 impl ShieldedPoolRootProbe {

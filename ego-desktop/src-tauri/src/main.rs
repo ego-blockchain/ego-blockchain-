@@ -310,6 +310,7 @@ fn headless_main() {
         crate::ledger::reconcile_stake_state();
         crate::chain_db::restore_in_memory_state_from_db();
         crate::chain_db::repair_finality_marker();
+        crate::shielded_chain::repair_pool_state();
         crate::sharding::load_agreed_shard_count_from_db();
 
         tokio::spawn(async {
@@ -1180,6 +1181,7 @@ fn main() {
 
                 tokio::task::spawn_blocking(|| {
                     crate::chain_db::restore_in_memory_state_from_db();
+                    crate::shielded_chain::repair_pool_state();
                     crate::sharding::load_agreed_shard_count_from_db();
 
                     let my_addr = crate::ledger::Ledger::load().address;
