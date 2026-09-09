@@ -391,12 +391,18 @@ pub async fn poll_once(app: Option<&tauri::AppHandle<tauri::Wry>>) {
         };
         let mut out = Vec::new();
         for t in reg.iter() {
-            while let Some(frame) = t.recv_frame() {
+            loop {
                 if !rate_limit_ok(t.name(), now) {
-                    eprintln!("[Sideband] {} exceeded frame rate limit, dropping", t.name());
+                    eprintln!(
+                        "[Sideband] {} hit the frame rate limit — the rest stay queued for the next poll",
+                        t.name()
+                    );
                     break;
                 }
-                out.push((t.name(), frame));
+                match t.recv_frame() {
+                    Some(frame) => out.push((t.name(), frame)),
+                    None => break,
+                }
             }
         }
         out
@@ -743,5 +749,42 @@ mod repair_tests {
             out = accept(f, REPAIR_IDLE_SECS + 2);
         }
         assert_eq!(out, Some(payload), "the transaction must survive the loss");
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::{rate_limit_ok, MAX_FRAMES_PER_MINUTE};
+
+    #[test]
+    fn the_limit_is_checked_before_a_frame_is_taken_off_the_wire() {
+        let now = 1_000_000i64;
+        let t = "ratetest-order";
+        for i in 0..MAX_FRAMES_PER_MINUTE {
+            assert!(rate_limit_ok(t, now), "frame {i} is within the limit");
+        }
+        assert!(
+            !rate_limit_ok(t, now),
+            "the call that refuses must happen before recv_frame deletes the file, or the frame              is destroyed rather than deferred and its message can never be reassembled",
+        );
+    }
+
+    #[test]
+    fn the_window_reopens_after_a_minute() {
+        let t = "ratetest-window";
+        let start = 2_000_000i64;
+        for _ in 0..MAX_FRAMES_PER_MINUTE {
+            assert!(rate_limit_ok(t, start));
+        }
+        assert!(!rate_limit_ok(t, start));
+        assert!(rate_limit_ok(t, start + 60), "a new minute starts a new budget");
+    }
+
+    #[test]
+    fn a_whole_transaction_fits_in_one_window() {
+        assert!(
+            MAX_FRAMES_PER_MINUTE >= 100,
+            "one signed transaction splits into about 45 frames, so a budget under a hundred              would stall an ordinary offline payment",
+        );
     }
 }

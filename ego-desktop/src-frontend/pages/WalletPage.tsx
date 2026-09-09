@@ -3422,8 +3422,10 @@ const WalletPage: React.FC = () => {
                         <div className="w-8 h-8 rounded-lg bg-amber-500/10 flex items-center justify-center text-amber-400 font-bold text-xs">RF</div>
                         <div>
                           <div className="text-sm font-semibold">Send without the internet</div>
-                          <div className="text-[10px] text-gray-500 uppercase font-bold tracking-wider">
-                            {sideband.online ? 'Written to your offline link' : 'No internet — will be used automatically'}
+                          <div className="text-[10px] uppercase font-bold tracking-wider text-gray-500">
+                            {(sideband.outbox_frames ?? 0) > 0
+                              ? `${sideband.outbox_frames} frames awaiting collection`
+                              : sideband.online ? 'Written to your offline link' : 'No internet — will be used automatically'}
                           </div>
                         </div>
                       </div>
@@ -3439,10 +3441,17 @@ const WalletPage: React.FC = () => {
                   {sendForm.viaRadio && (
                     <div className="bg-amber-500/5 border border-amber-500/20 rounded-xl p-3 text-[11px] text-amber-200/70 leading-relaxed">
                       This is written to your offline link instead of being sent over the
-                      internet. Any Ego node sharing that folder picks it up, so nodes on one
-                      machine reach each other with nothing to set up; to cross machines, put
-                      the folder on a shared drive or a USB stick and carry it. It stays valid
-                      for {sideband?.max_age_hours ?? 24} hours.
+                      internet. Another Ego node has to be running and sharing that folder to
+                      collect it — nodes on one machine find each other with nothing to set up;
+                      to cross machines, put the folder on a shared drive or a USB stick and
+                      carry it. It stays valid for {sideband?.max_age_hours ?? 24} hours.
+                      {(sideband?.outbox_frames ?? 0) > 0 && (
+                        <div className="mt-1.5 text-amber-200/60">
+                          {sideband!.outbox_frames} frames from earlier sends are still waiting.
+                          Nothing has collected them yet, so those payments have not reached the
+                          network.
+                        </div>
+                      )}
                     </div>
                   )}
                   <div className="bg-gray-500/5 border border-gray-600/30 rounded-xl p-3 text-[11px] text-gray-400 leading-relaxed">
