@@ -1226,6 +1226,22 @@ const WalletPage: React.FC = () => {
                 {(balance.pending_out_uegoc / 1_000_000).toFixed(2)} EGOC pending · available {((balance.uegoc - balance.pending_out_uegoc) / 1_000_000).toFixed(2)} EGOC
               </div>
             )}
+            {!isLiveMode && (() => {
+              const ready    = shielded?.ready_balance_uegoc ?? 0;
+              const settling = shielded?.pending_balance_uegoc ?? 0;
+              const total    = ready + settling;
+              if (total === 0) return null;
+              return (
+                <div className="text-xs mt-1 text-amber-300 font-medium">
+                  {(total / 1_000_000).toLocaleString()} EGOC in the shielded pool
+                  {settling > 0 && (
+                    <span className="text-amber-300/60">
+                      {' '}· {(ready / 1_000_000).toLocaleString()} ready to send
+                    </span>
+                  )}
+                </div>
+              );
+            })()}
             {!isLiveMode && creditsBal && (
               <div className="text-xs mt-1 text-emerald-300 font-medium">
                 {creditsBal.usd_value.toFixed(2)} EGUSD · stable ≡ ${creditsBal.usd_value.toFixed(2)}
