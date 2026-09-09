@@ -851,6 +851,8 @@ fn main() {
             commands::sideband::sideband_status,
             commands::sideband::sideband_queue_tx,
             commands::shielded::shielded_status,
+            commands::shielded::shielded_forget_note,
+            commands::shielded::shielded_forget_spent,
             commands::shielded::shield_deposit,
             commands::shielded::shield_withdraw,
             commands::shielded::invariant_report,

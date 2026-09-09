@@ -3033,6 +3033,81 @@ const WalletPage: React.FC = () => {
                 </button>
               </div>
             </div>
+            {(() => {
+              const notes = shielded?.notes ?? [];
+              const spent = notes.filter(n => n.status === 'spent')
+                                 .sort((a, b) => b.created_at - a.created_at);
+              const live  = notes.filter(n => n.status !== 'spent');
+              if (notes.length === 0) return null;
+              return (
+                <div className="mt-5">
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="text-xs uppercase tracking-wider text-gray-500">Shielded history</div>
+                    {spent.length > 1 && (
+                      <button
+                        onClick={async () => {
+                          try {
+                            const n = await invoke<number>('shielded_forget_spent');
+                            setShieldMsg(`Removed ${n} finished entr${n === 1 ? 'y' : 'ies'} from this wallet.`);
+                            refreshShielded();
+                          } catch (err) {
+                            setShieldMsg(String(err).replace(/^.*Error:/, '').trim());
+                          }
+                        }}
+                        className="text-[11px] text-gray-400 hover:text-gray-200 underline"
+                      >
+                        Clear finished
+                      </button>
+                    )}
+                  </div>
+                  <div className="divide-y divide-gray-700/60 rounded-xl border border-gray-700 overflow-hidden max-h-56 overflow-y-auto">
+                    {live.map(n => (
+                      <div key={n.commitment} className="flex items-center gap-3 px-3 py-2.5 text-xs bg-gray-900/60">
+                        <span className="text-amber-300">↓</span>
+                        <span className="font-semibold">{(n.value_uegoc / 1_000_000).toLocaleString()} EGOC</span>
+                        <span className="text-gray-500 flex-1">
+                          in the pool{n.status === 'ready' ? '' : ' · settling'}
+                        </span>
+                        <span className="text-gray-600">
+                          {new Date(n.created_at * 1000).toLocaleDateString()}
+                        </span>
+                      </div>
+                    ))}
+                    {spent.map(n => (
+                      <div key={n.commitment} className="flex items-center gap-3 px-3 py-2.5 text-xs bg-gray-900/40">
+                        <span className="text-gray-500">↑</span>
+                        <span className="font-semibold text-gray-400">
+                          {(n.value_uegoc / 1_000_000).toLocaleString()} EGOC
+                        </span>
+                        <span className="text-gray-600 flex-1">sent from the pool</span>
+                        <span className="text-gray-600">
+                          {new Date(n.created_at * 1000).toLocaleDateString()}
+                        </span>
+                        <button
+                          title="Remove from this wallet's history"
+                          onClick={async () => {
+                            try {
+                              await invoke('shielded_forget_note', { commitment: n.commitment });
+                              refreshShielded();
+                            } catch (err) {
+                              setShieldMsg(String(err).replace(/^.*Error:/, '').trim());
+                            }
+                          }}
+                          className="text-gray-600 hover:text-red-400 px-1 transition"
+                        >
+                          ×
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="mt-2 text-[10px] text-gray-600 leading-relaxed">
+                    Removing an entry clears it from this wallet only. The chain keeps its own record,
+                    and coins still in the pool can never be removed here — deleting them would destroy
+                    the only copy of their secret.
+                  </div>
+                </div>
+              );
+            })()}
             <div className="mt-3 text-[10px] text-gray-600 font-mono break-all">
               Verifying key {shielded?.verifying_key_digest?.slice(0, 16)}… · notes live in shielded_notes.bin, encrypted under your seed
             </div>

@@ -198,6 +198,47 @@ fn current_fee() -> u64 {
 }
 
 #[tauri::command]
+pub async fn shielded_forget_note(commitment: String) -> Result<(), EgoDesktopError> {
+    tokio::task::spawn_blocking(move || {
+        let _g = NOTES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut notes = load_notes()?;
+        let Some(pos) = notes.iter().position(|n| n.commitment == commitment) else {
+            return Err(EgoDesktopError::InvalidInput("No such note in this wallet".into()));
+        };
+        let (status, _) = note_status(&notes[pos]);
+        if status != "spent" {
+            return Err(EgoDesktopError::InvalidInput(format!(
+                "This note is {status}, not spent. Removing it would destroy the only copy of its                  secret and the coins behind it could never be recovered."
+            )));
+        }
+        notes.remove(pos);
+        save_notes(&notes)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
+}
+
+#[tauri::command]
+pub async fn shielded_forget_spent() -> Result<usize, EgoDesktopError> {
+    tokio::task::spawn_blocking(|| {
+        let _g = NOTES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let notes = load_notes()?;
+        let before = notes.len();
+        let kept: Vec<StoredNote> = notes
+            .into_iter()
+            .filter(|n| note_status(n).0 != "spent")
+            .collect();
+        let removed = before - kept.len();
+        if removed > 0 {
+            save_notes(&kept)?;
+        }
+        Ok(removed)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
+}
+
+#[tauri::command]
 pub async fn shielded_status() -> Result<ShieldedStatus, EgoDesktopError> {
     tokio::task::spawn_blocking(|| {
         let _g = NOTES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
