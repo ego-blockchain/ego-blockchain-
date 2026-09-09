@@ -3421,9 +3421,9 @@ const WalletPage: React.FC = () => {
                       <div className="flex items-center gap-3">
                         <div className="w-8 h-8 rounded-lg bg-amber-500/10 flex items-center justify-center text-amber-400 font-bold text-xs">RF</div>
                         <div>
-                          <div className="text-sm font-semibold">Send via Radio Frequency</div>
+                          <div className="text-sm font-semibold">Send without the internet</div>
                           <div className="text-[10px] text-gray-500 uppercase font-bold tracking-wider">
-                            {sideband.online ? 'Bypass the internet' : 'No internet — will be used automatically'}
+                            {sideband.online ? 'Written to your offline link' : 'No internet — will be used automatically'}
                           </div>
                         </div>
                       </div>
@@ -3438,9 +3438,11 @@ const WalletPage: React.FC = () => {
                   </div>
                   {sendForm.viaRadio && (
                     <div className="bg-amber-500/5 border border-amber-500/20 rounded-xl p-3 text-[11px] text-amber-200/70 leading-relaxed">
-                      This will be written to your offline link and not sent over the
-                      internet, so it travels once by the route you chose. It stays valid
-                      for {sideband?.max_age_hours ?? 24} hours while it crosses.
+                      This is written to your offline link instead of being sent over the
+                      internet, and it travels once by whatever route you have set up to carry
+                      it. Nothing moves it for you: point EGO_SIDEBAND_OUTBOX at a shared
+                      folder, a USB stick, or a radio bridge, or the payment waits in the
+                      outbox. It stays valid for {sideband?.max_age_hours ?? 24} hours.
                     </div>
                   )}
                   <div className="bg-gray-500/5 border border-gray-600/30 rounded-xl p-3 text-[11px] text-gray-400 leading-relaxed">

@@ -34,6 +34,15 @@ pub struct SpoolTransport {
     max_payload: usize,
 }
 
+fn spool_dir_override(var: &str) -> Option<PathBuf> {
+    let raw = std::env::var(var).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
 impl SpoolTransport {
     pub fn new(name: &'static str, root: PathBuf, send_enabled: bool, max_payload: usize) -> Self {
         let inbox = root.join("inbox");
@@ -46,7 +55,17 @@ impl SpoolTransport {
     pub fn default_spool() -> Self {
         let root = crate::ledger::base_data_dir().join("sideband");
         let _ = SPOOL_ROOT.set(root.clone());
-        Self::new("spool", root, true, 200)
+        let inbox = spool_dir_override("EGO_SIDEBAND_INBOX").unwrap_or_else(|| root.join("inbox"));
+        let outbox = spool_dir_override("EGO_SIDEBAND_OUTBOX").unwrap_or_else(|| root.join("outbox"));
+        let _ = std::fs::create_dir_all(&inbox);
+        let _ = std::fs::create_dir_all(&outbox);
+        if inbox != root.join("inbox") || outbox != root.join("outbox") {
+            eprintln!(
+                "[Sideband] carrying frames through {} -> {}",
+                outbox.display(), inbox.display()
+            );
+        }
+        Self { name: "spool", inbox, outbox, send_enabled: true, max_payload: 200 }
     }
 
     pub fn inbox(&self) -> &PathBuf {
@@ -166,5 +185,45 @@ mod tests {
         assert!(t.recv_frame().is_none());
         assert!(t.recv_frame().is_none(), "the bad frame must not still be there");
         assert_eq!(std::fs::read_dir(t.inbox()).unwrap().count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod carrier_tests {
+    use super::*;
+
+    #[test]
+    fn a_frame_written_to_one_spool_is_read_by_the_other() {
+        let base = std::env::temp_dir().join(format!("ego-sideband-{}", std::process::id()));
+        let shared = base.join("shared");
+        let a_out = shared.clone();
+        let b_in = shared.clone();
+        std::fs::create_dir_all(&shared).unwrap();
+
+        let sender = SpoolTransport::new("a", base.join("a"), true, 200);
+        let sender = SpoolTransport { outbox: a_out, ..sender };
+        let receiver = SpoolTransport::new("b", base.join("b"), true, 200);
+        let receiver = SpoolTransport { inbox: b_in, ..receiver };
+
+        let frame = Frame { v: 1, kind: 1, msg_id: 0xABCD, seq: 1, total: 1, crc: 0, payload: b"hello".to_vec() };
+        sender.send_frame(&frame).expect("write to the shared folder");
+
+        let got = receiver.recv_frame().expect("the other node must see it");
+        assert_eq!(got.msg_id, frame.msg_id);
+        assert_eq!(got.payload, frame.payload);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_unset_or_blank_override_keeps_the_default_spool() {
+        std::env::remove_var("EGO_SIDEBAND_INBOX");
+        assert!(spool_dir_override("EGO_SIDEBAND_INBOX").is_none());
+        std::env::set_var("EGO_SIDEBAND_INBOX", "   ");
+        assert!(
+            spool_dir_override("EGO_SIDEBAND_INBOX").is_none(),
+            "a blank value must not redirect the spool to the working directory",
+        );
+        std::env::remove_var("EGO_SIDEBAND_INBOX");
     }
 }
