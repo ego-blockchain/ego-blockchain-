@@ -407,7 +407,7 @@ const WalletPage: React.FC = () => {
   const [showShield, setShowShield]     = useState(false);
   const [shieldAmt, setShieldAmt]       = useState('');
   const [shieldTo, setShieldTo]         = useState('');
-  const [shieldNotes, setShieldNotes]   = useState<string[]>([]);
+  const [shieldSend, setShieldSend]     = useState('');
   const [shieldBusy, setShieldBusy]     = useState(false);
   const [shieldMsg, setShieldMsg]       = useState<string | null>(null);
   const [sidebandMsg, setSidebandMsg]   = useState<string>('');
@@ -708,6 +708,22 @@ const WalletPage: React.FC = () => {
       setSidebandMsg(String(e).replace(/^.*Error:/, '').trim());
     }
     invoke<SidebandStatus>('sideband_status').then(setSideband).catch(() => {});
+  }
+
+  function pickNotesFor(amountUegoc: number): string[] | null {
+    const ready = (shielded?.notes ?? [])
+      .filter(n => n.status === 'ready')
+      .sort((a, b) => b.value_uegoc - a.value_uegoc);
+    const chosen: string[] = [];
+    let left = amountUegoc;
+    for (const n of ready) {
+      if (n.value_uegoc <= left) {
+        chosen.push(n.commitment);
+        left -= n.value_uegoc;
+        if (left === 0) break;
+      }
+    }
+    return left === 0 && chosen.length > 0 ? chosen : null;
   }
 
   function refreshShielded() {
@@ -2931,136 +2947,92 @@ const WalletPage: React.FC = () => {
                 </button>
               </div>
               <div className="rounded-xl bg-gray-900 border border-gray-700 p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="text-sm font-semibold">Send from the pool</div>
-                  {shieldNotes.length > 0 && (
-                    <button
-                      onClick={() => setShieldNotes([])}
-                      className="text-[11px] text-gray-400 hover:text-gray-200 underline"
-                    >
-                      Clear
-                    </button>
-                  )}
-                </div>
-                {(() => {
-                  const all      = shielded?.notes ?? [];
-                  const ready    = all.filter(n => n.status === 'ready');
-                  const settling = all.filter(n => n.status === 'pending' || n.status === 'spending');
-                  if (ready.length === 0) {
+                <div className="text-sm font-semibold">Send from the pool</div>
+                  {(() => {
+                    const ready = (shielded?.notes ?? []).filter(n => n.status === 'ready');
+                    const settling = (shielded?.notes ?? []).filter(n => n.status === 'pending' || n.status === 'spending');
+                    const avail = ready.reduce((a, n) => a + n.value_uegoc, 0);
                     return (
-                      <div className="rounded-xl border border-gray-700 bg-gray-900/60 px-3 py-5 text-xs text-center">
-                        <div className="font-semibold text-gray-300">Nothing ready to send</div>
-                        <div className="mt-1 text-gray-500">
-                          {settling.length > 0
-                            ? `${settling.length} note${settling.length === 1 ? '' : 's'} still confirming — they become spendable shortly.`
-                            : 'Move funds into the pool first.'}
-                        </div>
+                      <div className="rounded-xl bg-gray-800/60 border border-gray-700 px-4 py-3">
+                        <div className="text-[10px] uppercase tracking-wider text-gray-500 font-bold">Available to send</div>
+                        <div className="text-xl font-bold">{(avail / 1_000_000).toLocaleString()} EGOC</div>
+                        {settling.length > 0 && (
+                          <div className="text-[11px] text-gray-500 mt-0.5">
+                            plus {(settling.reduce((a, n) => a + n.value_uegoc, 0) / 1_000_000).toLocaleString()} EGOC still confirming
+                          </div>
+                        )}
                       </div>
                     );
-                  }
-                  return (
-                    <>
-                      <div className="max-h-52 overflow-y-auto rounded-xl border border-gray-700 divide-y divide-gray-700/60">
-                        {ready.map(n => {
-                          const picked = shieldNotes.includes(n.commitment);
-                          return (
-                            <label
-                              key={n.commitment}
-                              className={`flex items-center gap-3 px-3 py-2.5 cursor-pointer transition ${
-                                picked ? 'bg-amber-500/10' : 'bg-gray-900/60 hover:bg-gray-800/60'
-                              }`}
-                            >
-                              <input
-                                type="checkbox"
-                                checked={picked}
-                                onChange={() => setShieldNotes(prev =>
-                                  prev.includes(n.commitment)
-                                    ? prev.filter(c => c !== n.commitment)
-                                    : [...prev, n.commitment]
-                                )}
-                                className="w-4 h-4 accent-amber-500 shrink-0"
-                              />
-                              <span className="text-sm font-semibold shrink-0">
-                                {(n.value_uegoc / 1_000_000).toLocaleString()} EGOC
-                              </span>
-                              <span className="font-mono text-[11px] text-gray-500 truncate flex-1">
-                                {n.commitment.slice(0, 12)}…
-                              </span>
-                            </label>
-                          );
-                        })}
-                      </div>
-                      {settling.length > 0 && (
-                        <div className="text-[11px] text-gray-500 mt-1.5">
-                          {settling.length} more note{settling.length === 1 ? '' : 's'} still confirming.
+                  })()}
+                  <input
+                    type="number"
+                    value={shieldSend}
+                    onChange={e => setShieldSend(e.target.value)}
+                    placeholder="Amount to send"
+                    className="w-full bg-gray-800 border border-gray-700 focus:border-amber-500 rounded-xl px-4 py-3 text-sm outline-none transition"
+                  />
+                  <input
+                    type="text"
+                    value={shieldTo}
+                    onChange={e => setShieldTo(e.target.value)}
+                    placeholder="Recipient address (egot1…)"
+                    className="w-full bg-gray-800 border border-gray-700 focus:border-amber-500 rounded-xl px-4 py-3 text-sm outline-none transition font-mono"
+                  />
+                  {parseFloat(shieldSend) > 0 && (() => {
+                    const want = Math.round(parseFloat(shieldSend) * 1_000_000);
+                    const picked = pickNotesFor(want);
+                    const fee = shielded?.current_fee_uegoc ?? 0;
+                    if (!picked) {
+                      const sizes = [...new Set((shielded?.notes ?? [])
+                        .filter(n => n.status === 'ready')
+                        .map(n => n.value_uegoc / 1_000_000))].sort((a, b) => a - b);
+                      return (
+                        <div className="text-[11px] text-amber-300/80 leading-relaxed">
+                          That amount cannot be made from what you hold. Shielded coins move in fixed
+                          sizes{sizes.length > 0 ? ` of ${sizes.join(', ')} EGOC` : ''}, so pick a total you
+                          can build from them.
                         </div>
-                      )}
-                    </>
-                  );
-                })()}
-                <input
-                  type="text"
-                  value={shieldTo}
-                  onChange={e => setShieldTo(e.target.value)}
-                  placeholder="Recipient address (egot1…)"
-                  className="w-full bg-gray-800 border border-gray-700 focus:border-amber-500 rounded-xl px-4 py-3 text-sm outline-none transition font-mono"
-                />
-                {shieldNotes.length > 0 && shielded && (() => {
-                  const picked = shielded.notes.filter(x => shieldNotes.includes(x.commitment));
-                  const total  = picked.reduce((a, n) => a + n.value_uegoc, 0);
-                  return (
-                    <div className="text-xs text-gray-400">
-                      Spending {picked.length} note{picked.length === 1 ? '' : 's'} totalling{' '}
-                      {(total / 1_000_000).toLocaleString()} EGOC. Pays{' '}
-                      {((total - shielded.current_fee_uegoc) / 1_000_000).toFixed(4)} EGOC after a{' '}
-                      {(shielded.current_fee_uegoc / 1_000_000).toFixed(4)} EGOC fee.
-                      Each note needs its own proof, so this takes a few seconds per note.
-                    </div>
-                  );
-                })()}
-                <button
-                  disabled={shieldBusy || shieldNotes.length === 0 || !shieldTo.trim().startsWith('egot1')}
-                  onClick={async () => {
-                    setShieldBusy(true);
-                    setShieldMsg(null);
-                    try {
-                      const res = await invoke<{ hash: string; amount_uegoc: number; fee_uegoc: number; payout_uegoc: number; recipient: string }>('shield_withdraw', {
-                        commitments: shieldNotes,
-                        recipient: shieldTo.trim(),
-                      });
-                      setShieldMsg(`Unshielding ${(res.payout_uegoc / 1_000_000).toFixed(4)} EGOC to ${res.recipient.slice(0, 14)}… (${res.hash.slice(0, 12)}…). It lands with the next block.`);
-                      setShieldNotes([]);
-                      refreshShielded();
-                    } catch (err) {
-                      setShieldMsg(String(err).replace(/^.*Error:/, '').trim());
-                    } finally {
-                      setShieldBusy(false);
+                      );
                     }
-                  }}
-                  className="w-full py-3 bg-amber-600 hover:bg-amber-500 disabled:opacity-40 rounded-xl font-semibold text-sm transition"
-                >
-                  {shieldBusy ? 'Working…' : 'Unshield'}
+                    return (
+                      <div className="text-[11px] text-gray-400 leading-relaxed">
+                        Pays {((want - fee) / 1_000_000).toFixed(4)} EGOC after a {(fee / 1_000_000).toFixed(4)} EGOC fee.
+                        Proving takes a few seconds.
+                      </div>
+                    );
+                  })()}
+                  <button
+                    disabled={
+                      shieldBusy
+                      || !pickNotesFor(Math.round((parseFloat(shieldSend) || 0) * 1_000_000))
+                      || !shieldTo.trim().startsWith('egot1')
+                    }
+                    onClick={async () => {
+                      const want = Math.round(parseFloat(shieldSend) * 1_000_000);
+                      const picked = pickNotesFor(want);
+                      if (!picked) return;
+                      setShieldBusy(true);
+                      setShieldMsg(null);
+                      try {
+                        const res = await invoke<{ hash: string; amount_uegoc: number; fee_uegoc: number; payout_uegoc: number; recipient: string }>('shield_withdraw', {
+                          commitments: picked,
+                          recipient: shieldTo.trim(),
+                        });
+                        setShieldMsg(`Sending ${(res.payout_uegoc / 1_000_000).toFixed(4)} EGOC to ${res.recipient.slice(0, 14)}… It lands with the next block.`);
+                        setShieldSend('');
+                        refreshShielded();
+                      } catch (err) {
+                        setShieldMsg(String(err).replace(/^.*Error:/, '').trim());
+                      } finally {
+                        setShieldBusy(false);
+                      }
+                    }}
+                    className="w-full py-3 bg-amber-600 hover:bg-amber-500 disabled:opacity-40 rounded-xl font-semibold text-sm transition"
+                  >
+                  {shieldBusy ? 'Working…' : 'Send'}
                 </button>
               </div>
             </div>
-            {(shielded?.notes.length ?? 0) > 0 && (
-              <div className="mt-4">
-                <div className="text-xs uppercase tracking-wider text-gray-500 mb-2">Your notes</div>
-                <div className="divide-y divide-gray-700/60 rounded-xl border border-gray-700 overflow-hidden">
-                  {shielded!.notes.map(n => (
-                    <div key={n.commitment} className="flex items-center justify-between px-3 py-2 text-xs bg-gray-900/60">
-                      <span className="font-mono text-gray-400">{n.commitment.slice(0, 16)}…</span>
-                      <span className="font-semibold">{(n.value_uegoc / 1_000_000).toLocaleString()} EGOC</span>
-                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
-                        n.status === 'ready' ? 'bg-emerald-500/15 text-emerald-300'
-                        : n.status === 'spent' ? 'bg-gray-600/30 text-gray-400'
-                        : 'bg-amber-500/15 text-amber-300'
-                      }`}>{n.status}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
             <div className="mt-3 text-[10px] text-gray-600 font-mono break-all">
               Verifying key {shielded?.verifying_key_digest?.slice(0, 16)}… · notes live in shielded_notes.bin, encrypted under your seed
             </div>
