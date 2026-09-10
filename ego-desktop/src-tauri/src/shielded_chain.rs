@@ -252,6 +252,14 @@ pub fn rebuild_from_chain() -> Result<PoolState, String> {
     let tip = chain_db::local_chain_height();
     let mut state = PoolState::empty();
     let _guard = pool_write_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // Replaying a history with holes in it produces a confident wrong answer: the deposits
+    // that were pruned away simply do not appear, so the pool concludes it holds nothing
+    // and overwrites a state that was correct. Refusing leaves the existing state alone.
+    if let Some(missing) = chain_db::first_missing_height(tip) {
+        return Err(format!(
+            "block {missing} is not on this node, so replaying the chain would undercount the pool"
+        ));
+    }
     let mut leaves: Vec<(u64, [u8; 32])> = Vec::new();
     let mut nullifiers: Vec<[u8; 32]> = Vec::new();
     let mut seen_commitments: HashSet<[u8; 32]> = HashSet::new();

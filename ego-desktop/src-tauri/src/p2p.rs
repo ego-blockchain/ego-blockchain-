@@ -2408,6 +2408,19 @@ pub fn min_validator_storage_bytes() -> u64 {
 /// Whether `addr` has earned a seat by contributing. Proven storage is the primary route;
 /// stake remains an alternative so a node that puts capital at risk instead of disk is not
 /// shut out. Either is a cost; the point is that a seat is never free.
+/// Whether this node is one of the validators deciding the chain. Such a node must keep
+/// its full history, because it has to be able to replay it.
+pub fn is_seated_validator() -> bool {
+    let me = crate::ledger::Ledger::load().address;
+    if me.is_empty() {
+        return false;
+    }
+    if crate::genesis::is_member(&me) {
+        return true;
+    }
+    committee_source().0.iter().any(|a| a == &me)
+}
+
 pub fn qualifies_for_seat(addr: &str) -> bool {
     let storage_floor = min_validator_storage_bytes();
     if storage_floor > 0 && crate::chain_db::proven_storage_bytes(addr) >= storage_floor {

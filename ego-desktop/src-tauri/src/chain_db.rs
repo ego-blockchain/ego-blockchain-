@@ -3979,6 +3979,13 @@ pub fn append_trusted_block(block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
 
 pub fn delete_full_blocks_for_shard(shard_id: u32, shard_count: u32) {
     if shard_count <= 1 { return; }
+    // A validator has to be able to replay its own chain: block validation, the shielded
+    // pool rebuild and the transaction count all read history this would delete. Keeping a
+    // fraction of the blocks is for a node serving storage, not for one deciding what the
+    // chain says.
+    if crate::p2p::is_seated_validator() {
+        return;
+    }
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let cf_blocks    = db.cf_handle(CF_BLOCKS).unwrap();
     let cf_block_txs = db.cf_handle(CF_BLOCK_TXS).unwrap();
@@ -4570,6 +4577,24 @@ pub fn get_blocks_range(from_height: u64, limit: u32) -> Vec<LedgerBlock> {
         }
     }
     out
+}
+
+/// The first height at or below `tip` this node no longer holds a full block for, if any.
+/// Several things replay the chain — the shielded pool, the transaction count — and a hole
+/// makes them all quietly undercount rather than fail, so they need to be able to ask.
+pub fn first_missing_height(tip: u64) -> Option<u64> {
+    if tip == 0 {
+        return None;
+    }
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_BLOCKS)?;
+    let floor = db
+        .cf_handle(CF_META)
+        .and_then(|m| db.get_cf(m, META_PRUNE_BELOW).ok().flatten())
+        .map(|v| read_u64_le(&v))
+        .unwrap_or(1)
+        .max(1);
+    (floor..=tip).find(|h| db.get_cf(cf, height_key(*h)).ok().flatten().is_none())
 }
 
 pub fn get_block_hash_at(height: u64) -> Option<String> {
