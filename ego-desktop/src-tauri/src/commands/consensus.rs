@@ -57,6 +57,128 @@ pub async fn get_porep_status() -> Result<Vec<SectorStatus>, EgoDesktopError> {
     .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
+/// Prove the files this node holds, on-chain.
+///
+/// The challenge is taken from a recent committed block rather than fetched from anyone:
+/// every node derives the same question from the same block hash, so a proof can be checked
+/// by whoever receives it and nobody has to be trusted to hand out challenges. The answer
+/// goes into a transaction, so what a node has proven becomes chain state that consensus
+/// can read, instead of gossip that every receiver discards.
+#[tauri::command]
+pub async fn prove_stored_files() -> Result<PostChallengeResult, EgoDesktopError> {
+    let ledger = Ledger::load();
+    let prover_addr = ledger.address.clone();
+    if prover_addr.is_empty() {
+        return Ok(PostChallengeResult { challenges_found: 0, proofs_submitted: 0, failures: 0, details: vec![] });
+    }
+
+    let tip = crate::chain_db::local_chain_height();
+    let challenge_height = tip.saturating_sub(crate::storage_proof::CHALLENGE_MIN_AGE.max(1));
+    if challenge_height == 0 {
+        return Ok(PostChallengeResult {
+            challenges_found: 0, proofs_submitted: 0, failures: 0,
+            details: vec!["The chain has no blocks to draw a challenge from yet".into()],
+        });
+    }
+    let Some(block_hash) = crate::chain_db::get_block_hash_at(challenge_height) else {
+        return Ok(PostChallengeResult {
+            challenges_found: 0, proofs_submitted: 0, failures: 0,
+            details: vec![format!("Block {challenge_height} is not on this node yet")],
+        });
+    };
+
+    let provable: Vec<_> = ledger.stored_files.iter()
+        .filter(|f| f.status == "Active" && !f.comm_d.is_empty() && f.n_real_leaves > 0)
+        .filter(|f| f.key_nonce_hex != "public")
+        .cloned()
+        .collect();
+
+    let mut submitted = 0usize;
+    let mut failures = 0usize;
+    let mut details = Vec::new();
+
+    for f in &provable {
+        let seed = crate::storage_proof::challenge_seed(&block_hash, &f.cid, &prover_addr);
+        let n_real = f.n_real_leaves as usize;
+        let proofs = match crate::proof::generate_post_proofs_from_path(
+            std::path::Path::new(&f.local_path), &seed, n_real,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                failures += 1;
+                details.push(format!("Cannot read {}: {e}", f.name));
+                continue;
+            }
+        };
+
+        let body = crate::storage_proof::PostProofBody {
+            cid: f.cid.clone(),
+            comm_d: f.comm_d.clone(),
+            n_real_leaves: f.n_real_leaves as u64,
+            n_padded_leaves: n_real.next_power_of_two() as u64,
+            challenge_height,
+            proofs: proofs.iter().map(|p| crate::storage_proof::ProofLeaf {
+                leaf_index: p.leaf_index,
+                leaf: hex::encode(p.leaf),
+                path: p.path.iter().map(hex::encode).collect(),
+            }).collect(),
+        };
+
+        match submit_storage_proof(&prover_addr, &body).await {
+            Ok(()) => {
+                submitted += 1;
+                details.push(format!("Proved {} ({} GB)", f.name, body.bytes_proven() / 1_000_000_000));
+                update_post_status(&f.cid, "proved", Some(chrono::Utc::now().timestamp()));
+            }
+            Err(e) => {
+                failures += 1;
+                details.push(format!("{}: {e}", f.name));
+            }
+        }
+    }
+
+    Ok(PostChallengeResult {
+        challenges_found: provable.len(),
+        proofs_submitted: submitted,
+        failures,
+        details,
+    })
+}
+
+async fn submit_storage_proof(
+    prover: &str,
+    body: &crate::storage_proof::PostProofBody,
+) -> Result<(), String> {
+    let call_args = serde_json::to_string(body).map_err(|e| e.to_string())?;
+    let timestamp = chrono::Utc::now().timestamp();
+    let nonce = crate::ledger::last_confirmed_nonce(prover).saturating_add(1);
+    let sign_bytes = format!("{}:{}:{}:{}", prover, body.cid, body.challenge_height, timestamp).into_bytes();
+    let (signature, public_key_ed25519) = sign_payload(&sign_bytes).ok_or("signing key unavailable")?;
+
+    let mut tx = crate::ledger::LedgerTx {
+        from: prover.to_string(),
+        to: prover.to_string(),
+        amount: 0,
+        fee_uegoc: 0,
+        tx_type: crate::storage_proof::POST_PROOF_TX.to_string(),
+        call_args,
+        timestamp,
+        nonce,
+        signature,
+        public_key_ed25519,
+        status: "Pending".to_string(),
+        ..Default::default()
+    };
+    tx.hash = format!("0x{}", ego_core::hash_data(
+        format!("{}:{}:{}:{}", tx.from, body.cid, body.challenge_height, timestamp).as_bytes()
+    ).to_hex());
+
+    crate::mempool::get_mempool().push(tx.clone()).map_err(|e| e.to_string())?;
+    crate::commands::tx_pending::add(&tx);
+    crate::p2p::broadcast_pending_tx(tx).await;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn respond_to_challenges() -> Result<PostChallengeResult, EgoDesktopError> {
     let ledger     = Ledger::load();

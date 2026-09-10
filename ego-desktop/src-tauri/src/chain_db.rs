@@ -518,6 +518,170 @@ pub fn any_registered_bls(db: &DB) -> bool {
     matches!(iter.next(), Some(Ok((k, _))) if k.starts_with(b"bls_reg:"))
 }
 
+/// How many heights a registered validator may go without producing a block before the
+/// chain stops seating it. The registry only ever grows, so without this an address that
+/// registered once and walked away raises the quorum bar for good and the remaining
+/// validators eventually cannot finalize anything.
+///
+/// Eviction is applied as a state change while a block is written, from committed data
+/// only, so every node that applies the same blocks reaches the same seated set. Deciding
+/// it from whichever peers a node has recently heard from is what makes two nodes seat
+/// different committees and reject each other's proposals.
+pub const VALIDATOR_LIVENESS_WINDOW: u64 = 500;
+const JAIL_SWEEP_EVERY: u64 = 50;
+
+fn val_active_key(addr: &str) -> Vec<u8> {
+    format!("val_active:{addr}").into_bytes()
+}
+
+fn val_jailed_key(addr: &str) -> Vec<u8> {
+    format!("val_jailed:{addr}").into_bytes()
+}
+
+fn registered_validators_in(db: &DB) -> Vec<String> {
+    let Some(cf) = db.cf_handle(CF_META) else { return Vec::new() };
+    let mut set = std::collections::BTreeSet::new();
+    for item in db.prefix_iterator_cf(cf, b"bls_reg:") {
+        let Ok((k, v)) = item else { break };
+        if !k.starts_with(b"bls_reg:") { break; }
+        if let Ok(addr) = String::from_utf8(v.to_vec()) {
+            if !addr.is_empty() { set.insert(addr); }
+        }
+    }
+    set.into_iter().collect()
+}
+
+fn jailed_validators_in(db: &DB) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let Some(cf) = db.cf_handle(CF_META) else { return out };
+    for item in db.prefix_iterator_cf(cf, b"val_jailed:") {
+        let Ok((k, _)) = item else { break };
+        if !k.starts_with(b"val_jailed:") { break; }
+        if let Ok(s) = std::str::from_utf8(&k[b"val_jailed:".len()..]) {
+            if !s.is_empty() { out.insert(s.to_string()); }
+        }
+    }
+    out
+}
+
+/// Validators the chain has stopped seating for going quiet. Re-registering rejoins.
+pub fn jailed_validators() -> std::collections::HashSet<String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    jailed_validators_in(db)
+}
+
+fn validator_last_active_in(db: &DB, addr: &str) -> u64 {
+    db.cf_handle(CF_META)
+        .and_then(|cf| db.get_cf(cf, val_active_key(addr)).ok().flatten())
+        .map(|v| read_u64_le(&v))
+        .unwrap_or(0)
+}
+
+pub fn validator_last_active(addr: &str) -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    validator_last_active_in(db, addr)
+}
+
+/// Which of `registered` have gone quiet long enough to unseat at `height`, never taking
+/// the seated set below `floor` — an empty committee cannot restart itself.
+pub fn stale_validators(
+    registered: &[String],
+    jailed: &std::collections::HashSet<String>,
+    last_active: impl Fn(&str) -> u64,
+    height: u64,
+    window: u64,
+    floor: usize,
+) -> Vec<String> {
+    if height <= window {
+        return Vec::new();
+    }
+    let cutoff = height - window;
+    let seated: Vec<&String> = registered.iter().filter(|a| !jailed.contains(*a)).collect();
+    let mut stale: Vec<String> = seated
+        .iter()
+        .filter(|a| last_active(a) < cutoff)
+        .map(|a| (*a).clone())
+        .collect();
+    stale.sort();
+    let removable = seated.len().saturating_sub(floor.max(1));
+    stale.truncate(removable);
+    stale
+}
+
+fn sweep_inactive_validators(db: &DB, batch: &mut WriteBatch, height: u64) {
+    if height % JAIL_SWEEP_EVERY != 0 || height <= VALIDATOR_LIVENESS_WINDOW {
+        return;
+    }
+    let Some(cf) = db.cf_handle(CF_META) else { return };
+    let slashed = load_slashed_set_inner(db);
+    let registered: Vec<String> = registered_validators_in(db)
+        .into_iter()
+        .filter(|a| !slashed.contains(a))
+        .collect();
+    let jailed = jailed_validators_in(db);
+    let floor = crate::mempool::min_validators_for_finality();
+    for addr in stale_validators(
+        &registered,
+        &jailed,
+        |a| validator_last_active_in(db, a),
+        height,
+        VALIDATOR_LIVENESS_WINDOW,
+        floor,
+    ) {
+        batch.put_cf(cf, val_jailed_key(&addr), u64_le(height));
+        tracing::warn!(
+            "[Validators] {addr} has produced no block for {VALIDATOR_LIVENESS_WINDOW} heights — unseated at #{height}. It rejoins by registering again."
+        );
+    }
+}
+
+fn storage_proof_key(addr: &str, cid: &str) -> Vec<u8> {
+    format!("storage_proven:{addr}:{cid}").into_bytes()
+}
+
+fn storage_proof_prefix(addr: &str) -> Vec<u8> {
+    format!("storage_proven:{addr}:").into_bytes()
+}
+
+fn record_storage_proof(batch: &mut WriteBatch, db: &DB, addr: &str, cid: &str, bytes: u64, height: u64) {
+    let Some(cf) = db.cf_handle(CF_META) else { return };
+    let mut v = Vec::with_capacity(16);
+    v.extend_from_slice(&bytes.to_le_bytes());
+    v.extend_from_slice(&height.to_le_bytes());
+    batch.put_cf(cf, storage_proof_key(addr, cid), v);
+}
+
+fn proven_storage_bytes_in(db: &DB, addr: &str, tip: u64) -> u64 {
+    let Some(cf) = db.cf_handle(CF_META) else { return 0 };
+    let prefix = storage_proof_prefix(addr);
+    let mut total: u64 = 0;
+    for item in db.prefix_iterator_cf(cf, &prefix) {
+        let Ok((k, v)) = item else { break };
+        if !k.starts_with(&prefix) { break; }
+        if v.len() < 16 { continue; }
+        let bytes = u64::from_le_bytes(v[..8].try_into().unwrap_or([0; 8]));
+        let height = u64::from_le_bytes(v[8..16].try_into().unwrap_or([0; 8]));
+        // A proof speaks for the moment it was made. Letting an old one keep counting would
+        // mean a node could store data once, prove it, delete it, and hold a seat for ever.
+        if tip.saturating_sub(height) <= crate::storage_proof::PROOF_VALID_FOR {
+            total = total.saturating_add(bytes);
+        }
+    }
+    total
+}
+
+/// How much storage `addr` has proven it still holds, summed over the files it proved and
+/// counting only proofs recent enough to mean anything.
+pub fn proven_storage_bytes(addr: &str) -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let tip = db
+        .cf_handle(CF_META)
+        .and_then(|cf| db.get_cf(cf, META_LATEST_HEIGHT).ok().flatten())
+        .map(|v| read_u64_le(&v))
+        .unwrap_or(0);
+    proven_storage_bytes_in(db, addr, tip)
+}
+
 pub fn registered_validators_sorted() -> Vec<String> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     backfill_bls_registry(&db);
@@ -532,6 +696,195 @@ pub fn registered_validators_sorted() -> Vec<String> {
         }
     }
     set.into_iter().collect()
+}
+
+#[cfg(test)]
+mod block_producer_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn keyed_block(seed_byte: u8, height: u64, hash: &str) -> (SigningKey, LedgerBlock) {
+        let sk = SigningKey::from_bytes(&[seed_byte; 32]);
+        let pk = sk.verifying_key();
+        let miner = ego_core::EgoAddress::from_public_key_bytes(
+            pk.as_bytes(),
+            crate::tokenomics::CHAIN_ID as u32,
+            ego_core::AddressType::EOA,
+        )
+        .to_bech32(hrp_for_chain())
+        .unwrap();
+        let mut b = LedgerBlock { height, hash: hash.into(), miner, ..LedgerBlock::default() };
+        b.producer_pubkey = hex::encode(pk.as_bytes());
+        b.producer_sig = hex::encode(sk.sign(&block_signing_message(hash)).to_bytes());
+        (sk, b)
+    }
+
+    #[test]
+    fn a_block_proves_who_produced_it() {
+        let (_, b) = keyed_block(1, 10, "0xabc");
+        assert!(verify_block_producer(&b).is_ok());
+        assert!(check_block_producer(&b).is_ok());
+    }
+
+    #[test]
+    fn putting_someone_elses_name_on_your_block_is_refused() {
+        let (_, mut b) = keyed_block(1, 10, "0xabc");
+        b.miner = "egot1someoneelse".into();
+        let err = verify_block_producer(&b).unwrap_err();
+        assert!(err.contains("names"), "{err}");
+    }
+
+    #[test]
+    fn a_signature_does_not_carry_to_another_block() {
+        let (_, first) = keyed_block(1, 10, "0xaaa");
+        let (_, mut second) = keyed_block(1, 11, "0xbbb");
+        second.producer_sig = first.producer_sig.clone();
+        assert!(verify_block_producer(&second).is_err(), "signatures are bound to one hash");
+    }
+
+    #[test]
+    fn tampering_with_the_hash_breaks_the_proof() {
+        let (_, mut b) = keyed_block(1, 10, "0xabc");
+        b.hash = "0xdef".into();
+        assert!(verify_block_producer(&b).is_err());
+    }
+
+    #[test]
+    fn a_malformed_proof_is_refused_rather_than_panicking() {
+        let (_, base) = keyed_block(1, 10, "0xabc");
+        for (pk, sig) in [("", "aa"), ("zz", "bb"), (&"ab".repeat(31), &"cd".repeat(64)[..])] {
+            let b = LedgerBlock {
+                producer_pubkey: pk.into(),
+                producer_sig: sig.into(),
+                ..base.clone()
+            };
+            assert!(verify_block_producer(&b).is_err(), "pk={pk:.8} sig={sig:.8}");
+        }
+    }
+
+    #[test]
+    fn an_older_chain_keeps_working_but_a_forged_proof_never_does() {
+        let unsigned = LedgerBlock { height: 5, hash: "0xabc".into(), miner: "egot1old".into(), ..LedgerBlock::default() };
+        std::env::set_var("EGO_BLOCK_SIG_HEIGHT", "1000");
+        assert!(check_block_producer(&unsigned).is_ok(), "blocks built before the rule stay valid");
+        let mut forged = unsigned.clone();
+        forged.producer_pubkey = "ab".repeat(32);
+        forged.producer_sig = "cd".repeat(64);
+        assert!(
+            check_block_producer(&forged).is_err(),
+            "a signature that is present must verify even below the activation height",
+        );
+        std::env::set_var("EGO_BLOCK_SIG_HEIGHT", "1");
+        assert!(check_block_producer(&unsigned).is_err(), "once active, authorship is required");
+        std::env::remove_var("EGO_BLOCK_SIG_HEIGHT");
+    }
+
+    #[test]
+    fn genesis_needs_no_producer() {
+        let g = LedgerBlock { height: 0, ..LedgerBlock::default() };
+        assert!(check_block_producer(&g).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod validator_liveness_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    fn set(addrs: &[&str]) -> HashSet<String> {
+        addrs.iter().map(|a| a.to_string()).collect()
+    }
+
+    fn registry(addrs: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+        v.sort();
+        v
+    }
+
+    fn seen(pairs: &[(&str, u64)]) -> HashMap<String, u64> {
+        pairs.iter().map(|(a, h)| (a.to_string(), *h)).collect()
+    }
+
+    fn stale(
+        registered: &[&str],
+        jailed: &[&str],
+        active: &[(&str, u64)],
+        height: u64,
+        floor: usize,
+    ) -> Vec<String> {
+        let last = seen(active);
+        stale_validators(
+            &registry(registered),
+            &set(jailed),
+            |a| last.get(a).copied().unwrap_or(0),
+            height,
+            VALIDATOR_LIVENESS_WINDOW,
+            floor,
+        )
+    }
+
+    #[test]
+    fn a_young_chain_never_unseats_anyone() {
+        let out = stale(&["a", "b", "c", "d"], &[], &[], VALIDATOR_LIVENESS_WINDOW, 2);
+        assert!(out.is_empty(), "before the window has even elapsed nobody is late");
+    }
+
+    #[test]
+    fn a_validator_that_stopped_producing_is_unseated() {
+        let h = VALIDATOR_LIVENESS_WINDOW + 1_000;
+        let out = stale(
+            &["a", "b", "c", "d"],
+            &[],
+            &[("a", h - 10), ("b", h - 20), ("c", h - 30), ("d", 5)],
+            h,
+            2,
+        );
+        assert_eq!(out, vec!["d".to_string()]);
+    }
+
+    #[test]
+    fn a_validator_that_is_still_producing_keeps_its_seat() {
+        let h = VALIDATOR_LIVENESS_WINDOW + 1_000;
+        let out = stale(
+            &["a", "b"],
+            &[],
+            &[("a", h - 1), ("b", h - VALIDATOR_LIVENESS_WINDOW)],
+            h,
+            2,
+        );
+        assert!(out.is_empty(), "producing inside the window is enough to stay seated");
+    }
+
+    #[test]
+    fn the_committee_is_never_emptied_however_quiet_the_chain_goes() {
+        let h = VALIDATOR_LIVENESS_WINDOW + 5_000;
+        let out = stale(&["a", "b", "c", "d"], &[], &[], h, 2);
+        assert_eq!(out.len(), 2, "a floor of 2 must survive even when nobody has produced");
+        let out = stale(&["a", "b"], &[], &[], h, 2);
+        assert!(out.is_empty(), "at the floor nobody can be unseated");
+        let out = stale(&["a"], &[], &[], h, 0);
+        assert!(out.is_empty(), "the last validator is never unseated");
+    }
+
+    #[test]
+    fn someone_already_unseated_is_not_counted_twice() {
+        let h = VALIDATOR_LIVENESS_WINDOW + 5_000;
+        let out = stale(&["a", "b", "c", "d"], &["d"], &[("a", h - 1), ("b", h - 2)], h, 2);
+        assert_eq!(out, vec!["c".to_string()], "d is already out; c is the only one left to unseat");
+    }
+
+    #[test]
+    fn every_node_unseats_the_same_validators_in_the_same_order() {
+        let h = VALIDATOR_LIVENESS_WINDOW + 5_000;
+        let one = stale(&["d", "b", "a", "c"], &[], &[("a", h - 1)], h, 1);
+        let two = stale(&["a", "c", "d", "b"], &[], &[("a", h - 1)], h, 1);
+        assert_eq!(one, two, "the seated set cannot depend on registry iteration order");
+        assert_eq!(
+            one,
+            vec!["b".to_string(), "c".to_string(), "d".to_string()],
+            "only the one still producing keeps its seat when the floor is 1",
+        );
+    }
 }
 
 fn load_slashed_set_inner(db: &DB) -> std::collections::HashSet<String> {
@@ -670,6 +1023,8 @@ fn seed_genesis(db: &DB) {
     db.write(batch).expect("genesis balance batch");
 
     let genesis = LedgerBlock {
+        producer_pubkey: String::new(),
+        producer_sig: String::new(),
         height:     0,
         hash:       GENESIS_HASH.to_string(),
         prev_hash:  "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
@@ -712,6 +1067,8 @@ fn migrate_from_sqlite(db: &DB, path: &std::path::Path) -> bool {
     };
     let blocks: Vec<LedgerBlock> = stmt.query_map([], |r| {
         Ok(LedgerBlock {
+            producer_pubkey: String::new(),
+            producer_sig: String::new(),
             height:     r.get::<_, i64>(0)? as u64,
             hash:       r.get(1)?,
             prev_hash:  r.get(2)?,
@@ -1156,8 +1513,18 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         // On-chain BLS validator registry: bind (address ↔ BLS key) the moment a
         // verified validator_register tx commits, atomically with the block, so
         // the QC verifier can reject signers using unregistered keys.
+        if tx.tx_type == crate::storage_proof::POST_PROOF_TX {
+            if let Ok(body) = crate::storage_proof::parse_body(&tx.call_args) {
+                record_storage_proof(&mut batch, &db, &tx.from, &body.cid, body.bytes_proven(), block.height);
+            }
+        }
+
         if let Some((addr, bls_hex)) = parse_validator_registration(tx) {
             batch.put_cf(cf_meta, bls_reg_key(&bls_hex), addr.as_bytes());
+            // Registering again is how a validator that went quiet rejoins: it clears the
+            // jail mark and restarts its liveness clock.
+            batch.delete_cf(cf_meta, val_jailed_key(&addr));
+            batch.put_cf(cf_meta, val_active_key(&addr), u64_le(block.height));
         }
 
         // On-chain deal records. A storage_deal / compute_reservation tx carries the
@@ -1295,6 +1662,14 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             crate::p2p::mark_validator_slashed_local(addr);
         }
     }
+
+    // Producing a block is the only liveness signal that lives in committed state, so it
+    // is what the seated set is decided from.
+    if !block.miner.is_empty() {
+        batch.put_cf(cf_meta, val_active_key(&block.miner), u64_le(block.height));
+        batch.delete_cf(cf_meta, val_jailed_key(&block.miner));
+    }
+    sweep_inactive_validators(db, &mut batch, block.height);
 
     crate::shielded_chain::apply_block(db, &mut batch, block.height, &confirmed_txs);
 
@@ -1984,6 +2359,16 @@ pub fn local_tx_count() -> usize {
     n
 }
 
+pub fn pruned_below() -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf) = db.cf_handle(CF_META) else { return 1 };
+    db.get_cf(cf, META_PRUNE_BELOW)
+        .ok()
+        .flatten()
+        .map(|v| read_u64_le(&v))
+        .unwrap_or(1)
+}
+
 pub fn local_chain_height() -> u64 {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let Some(cf) = db.cf_handle(CF_BLOCKS) else { return 0; };
@@ -2421,7 +2806,6 @@ pub fn import_state_snapshot(snap: &StateSnapshot) -> Result<(), String> {
         db.write(batch).map_err(|e| format!("snapshot write: {e}"))?;
     }
     restore_in_memory_state_from_db();
-    crate::shielded_chain::repair_pool_state_after_reorg(snap.height);
     tracing::info!("[FastSync] Installed state snapshot at height {} ({} balances, {} meta)", snap.height, snap.balances.len(), snap.meta.len());
     Ok(())
 }
@@ -2577,6 +2961,8 @@ pub fn mine_batch_db_with_ticket(txs: &[LedgerTx], miner: &str, poc_ticket: &str
     let hash = block_hash_v3(&prev_hash, height, miner, timestamp, &tx_merkle_root, poc_ticket, &state_root);
 
     let block = LedgerBlock {
+        producer_pubkey: String::new(),
+        producer_sig: String::new(),
         height,
         hash,
         prev_hash,
@@ -2853,11 +3239,95 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         poc_slot,
         state_root,
         base_fee_uegoc: new_base_fee,
+        producer_pubkey: String::new(),
+        producer_sig: String::new(),
         agg_bls_sig: String::new(),
         bls_pubkeys: Vec::new(),
     };
 
-    (block, stamped)
+    (sign_block_as_producer(block), stamped)
+}
+
+const BLOCK_SIG_DOMAIN: &[u8] = b"ego/block-producer/v1:";
+
+fn block_signing_message(block_hash: &str) -> Vec<u8> {
+    let mut m = BLOCK_SIG_DOMAIN.to_vec();
+    m.extend_from_slice(block_hash.as_bytes());
+    m
+}
+
+fn hrp_for_chain() -> &'static str {
+    if crate::tokenomics::CHAIN_ID == 1 { "egot" } else { "ego" }
+}
+
+/// Every path that produces a block goes through `build_block_proposal`, so this is the one
+/// place authorship has to be stamped.
+pub fn sign_block_as_producer(mut block: LedgerBlock) -> LedgerBlock {
+    use ed25519_dalek::{Signer, SigningKey};
+    let Some(seed) = crate::p2p::get_ed25519_seed() else { return block };
+    let sk = SigningKey::from_bytes(&seed);
+    block.producer_pubkey = hex::encode(sk.verifying_key().as_bytes());
+    block.producer_sig = hex::encode(sk.sign(&block_signing_message(&block.hash)).to_bytes());
+    block
+}
+
+/// Whether `block` proves who produced it. The key is carried by the block rather than
+/// looked up, so the check needs nothing but the block: the address must derive from the
+/// key, and the signature must cover the hash.
+/// Height from which a block must prove who produced it. Chains that already exist were
+/// built before blocks carried authorship, so requiring it everywhere would orphan them;
+/// a network starting fresh should demand it from its first block.
+pub fn block_signature_required_from() -> u64 {
+    std::env::var("EGO_BLOCK_SIG_HEIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
+/// A block must be signed once the rule is active, and a signature that IS present must
+/// verify whether the rule is active or not — an unverifiable one is a forgery attempt,
+/// not a legacy block.
+pub fn check_block_producer(block: &LedgerBlock) -> Result<(), String> {
+    if block.height == 0 {
+        return Ok(());
+    }
+    let required = block.height >= block_signature_required_from();
+    let present = !block.producer_sig.is_empty() || !block.producer_pubkey.is_empty();
+    if !required && !present {
+        return Ok(());
+    }
+    verify_block_producer(block)
+}
+
+pub fn verify_block_producer(block: &LedgerBlock) -> Result<(), String> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    if block.producer_pubkey.is_empty() || block.producer_sig.is_empty() {
+        return Err("block carries no producer signature".into());
+    }
+    let pk = hex::decode(block.producer_pubkey.trim())
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        .ok_or("producer public key is not 32 bytes of hex")?;
+    let sig = hex::decode(block.producer_sig.trim())
+        .ok()
+        .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
+        .ok_or("producer signature is not 64 bytes of hex")?;
+    let derived = ego_core::EgoAddress::from_public_key_bytes(
+        &pk,
+        crate::tokenomics::CHAIN_ID as u32,
+        ego_core::AddressType::EOA,
+    )
+    .to_bech32(hrp_for_chain())
+    .map_err(|e| format!("producer key does not form an address: {e}"))?;
+    if derived != block.miner {
+        return Err(format!(
+            "block names {} as its producer but its key belongs to {}",
+            block.miner, derived
+        ));
+    }
+    let vk = VerifyingKey::from_bytes(&pk).map_err(|e| format!("producer key is not valid: {e}"))?;
+    vk.verify(&block_signing_message(&block.hash), &Signature::from_bytes(&sig))
+        .map_err(|_| "producer signature does not cover this block".to_string())
 }
 
 pub fn commit_staged_block(block: &LedgerBlock, stamped: &[LedgerTx], vote_count: u32) -> bool {
@@ -3303,6 +3773,7 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
     if !verify_block_hash(block, txs) {
         return Err("block hash/merkle verification failed".into());
     }
+    check_block_producer(block)?;
     if escrow_rule_active(block.height) {
         for tx in txs {
             if is_escrow_source(&tx.from) {
@@ -3316,6 +3787,13 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
         } else if tx.tx_type == "credits_escrow" {
             validate_credits_escrow_tx(tx, block.timestamp)?;
         }
+    }
+    // A storage proof is checked against the chain that carries it: the challenge comes
+    // from a committed block hash, so every node asks the same question and gets the same
+    // answer without anyone handing out challenges.
+    for tx in txs.iter().filter(|t| t.tx_type == crate::storage_proof::POST_PROOF_TX) {
+        crate::storage_proof::validate_against_chain(tx, block.height.saturating_sub(1), get_block_hash_at)
+            .map_err(|e| format!("storage proof {} rejected: {e}", tx.hash))?;
     }
     crate::shielded_chain::validate_block_shielded_txs(block.height, txs)?;
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());

@@ -51,6 +51,8 @@ pub struct PoolState {
     pub balance_uegoc: u64,
     #[serde(default)]
     pub outstanding: Vec<u64>,
+    #[serde(default)]
+    pub stray_uegoc: u64,
 }
 
 pub fn denomination_index(amount_uegoc: u64) -> Option<usize> {
@@ -69,6 +71,7 @@ impl PoolState {
             recent_roots: vec![root],
             balance_uegoc: 0,
             outstanding: vec![0; DENOMINATIONS_UEGOC.len()],
+            stray_uegoc: 0,
         }
     }
 
@@ -100,6 +103,14 @@ impl PoolState {
         denomination_index(amount_uegoc)
             .and_then(|i| self.outstanding.get(i))
             .is_some_and(|n| *n > 0)
+    }
+
+    pub fn strand(&mut self, amount_uegoc: u64) {
+        self.stray_uegoc = self.stray_uegoc.saturating_add(amount_uegoc);
+    }
+
+    pub fn accounted_uegoc(&self) -> u64 {
+        self.balance_uegoc.saturating_add(self.stray_uegoc)
     }
 
     pub fn counted_uegoc(&self) -> u128 {
@@ -223,22 +234,43 @@ pub fn leaves() -> Vec<[u8; 32]> {
     out
 }
 
+/// Serialises every write to the pool. `chain_db`'s `lock()` hands out a shared `&DB`
+/// rather than taking a mutex, so a background rebuild would otherwise interleave with a
+/// block being applied and leave the tree and the balance describing different histories.
+fn pool_write_lock() -> &'static std::sync::Mutex<()> {
+    static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 pub fn rebuild_from_chain() -> Result<PoolState, String> {
+    let floor = chain_db::pruned_below();
+    if floor > 1 {
+        return Err(format!(
+            "this node holds no blocks below {floor}, so the pool cannot be rebuilt from its own history"
+        ));
+    }
     let tip = chain_db::local_chain_height();
     let mut state = PoolState::empty();
+    let _guard = pool_write_lock().lock().unwrap_or_else(|e| e.into_inner());
     let mut leaves: Vec<(u64, [u8; 32])> = Vec::new();
     let mut nullifiers: Vec<[u8; 32]> = Vec::new();
+    let mut seen_commitments: HashSet<[u8; 32]> = HashSet::new();
 
     for height in 1..=tip {
         let txs = chain_db::get_txs_for_block(height);
         for tx in &txs {
             if is_deposit(tx) {
-                let Some(commitment) = parse_shield_memo(&tx.memo) else { continue };
-                if !is_denomination(tx.amount) {
+                let Some(commitment) = parse_shield_memo(&tx.memo) else {
+                    state.strand(tx.amount);
+                    continue;
+                };
+                if !is_denomination(tx.amount) || !seen_commitments.insert(commitment) {
+                    state.strand(tx.amount);
                     continue;
                 }
-                let index = state.insert(leaf_for(&commitment, tx.amount))?;
-                leaves.push((index, leaf_for(&commitment, tx.amount)));
+                let leaf = leaf_for(&commitment, tx.amount);
+                let index = state.insert(leaf)?;
+                leaves.push((index, leaf));
                 state.balance_uegoc = state.balance_uegoc.saturating_add(tx.amount);
                 state.note_added(tx.amount);
             } else if is_unshield(tx) {
@@ -309,6 +341,7 @@ pub fn repair_pool_state() -> Option<PoolRepair> {
             } else {
                 tracing::info!("[Shielded] pool state agrees with the chain ({} leaves)", after.next_index);
             }
+            report_reconciliation();
             Some(PoolRepair {
                 leaves_before: before.next_index,
                 leaves_after: after.next_index,
@@ -319,6 +352,119 @@ pub fn repair_pool_state() -> Option<PoolRepair> {
             tracing::error!("[Shielded] could not rebuild the pool from the chain: {e}");
             None
         }
+    }
+}
+
+const REPAIR_COOLDOWN_SECS: i64 = 300;
+static REPAIR_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LAST_REPAIR_TS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub fn request_pool_repair() {
+    use std::sync::atomic::Ordering;
+    // Under the test harness this would rewrite pool state from another thread at an
+    // arbitrary moment, which no test asserting a before/after pair can survive. The
+    // repair itself is covered by calling `repair_pool_state` directly.
+    if cfg!(test) {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let last = LAST_REPAIR_TS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < REPAIR_COOLDOWN_SECS {
+        return;
+    }
+    let floor = chain_db::pruned_below();
+    if floor > 1 {
+        LAST_REPAIR_TS.store(now, Ordering::Relaxed);
+        tracing::error!(
+            "[Shielded] this node fast-synced and holds no blocks below {floor}, so it cannot verify the pool from its own history. Asking peers for a fresh state snapshot."
+        );
+        // The pool state travels inside a snapshot, so a node that cannot rebuild from its
+        // own blocks can still be repaired by one that has the history. Ask rather than
+        // waiting for someone to notice the log line.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async {
+                let tip = chain_db::local_chain_height();
+                crate::p2p::request_snapshot_from_peers(crate::p2p::snapshot_request_height(tip)).await;
+            });
+        }
+        warn_operator_pool_unverifiable(floor);
+        return;
+    }
+    if REPAIR_PENDING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(run_pool_repair);
+        }
+        Err(_) => {
+            if std::thread::Builder::new()
+                .name("shielded-repair".into())
+                .spawn(run_pool_repair)
+                .is_err()
+            {
+                REPAIR_PENDING.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+fn run_pool_repair() {
+    use std::sync::atomic::Ordering;
+    LAST_REPAIR_TS.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+    tracing::warn!("[Shielded] the pool ledger disagrees with its address balance, replaying the chain");
+    repair_pool_state();
+    REPAIR_PENDING.store(false, Ordering::SeqCst);
+}
+
+fn warn_operator_pool_unverifiable(floor: u64) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    if let Some(app) = crate::p2p::APP_HANDLE.get() {
+        crate::commands::notifications::notify(
+            app,
+            "Shielded pool cannot be verified here",
+            &format!(
+                "This node fast-synced and has no blocks below {floor}, so it cannot check the shielded pool against its own history. Sync it from a node that holds the full chain before shielding more coins."
+            ),
+        );
+    }
+}
+
+fn report_reconciliation() {
+    let (recorded, stray, on_chain) = {
+        let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let state = read_state(db);
+        (state.accounted_uegoc(), state.stray_uegoc, pool_address_balance(db))
+    };
+    if recorded == on_chain {
+        tracing::info!(
+            "[Shielded] pool accounting agrees with the chain at {recorded} uEGOC ({stray} stranded)"
+        );
+        return;
+    }
+    if recorded > on_chain {
+        tracing::error!(
+            "[Shielded] the pool ledger claims {recorded} uEGOC but its address holds only {on_chain}, so {} uEGOC of notes are backed by nothing",
+            recorded - on_chain
+        );
+        return;
+    }
+    let short = on_chain - recorded;
+    tracing::error!(
+        "[Shielded] the pool address holds {on_chain} uEGOC but replaying this node's history accounts for only {recorded}, so {short} uEGOC of history is missing here"
+    );
+    if let Some(app) = crate::p2p::APP_HANDLE.get() {
+        crate::commands::notifications::notify(
+            app,
+            "Shielded pool needs a full history",
+            &format!(
+                "This node is missing the blocks that explain {} EGOC in the shielded pool, so it cannot verify pool balances. Let it finish syncing from the network before shielding more coins.",
+                short / 1_000_000
+            ),
+        );
     }
 }
 
@@ -648,7 +794,29 @@ pub fn validate_block_shielded_txs(height: u64, txs: &[LedgerTx]) -> Result<(), 
     Ok(())
 }
 
+fn record_deposit(
+    db: &DB,
+    state: &mut PoolState,
+    seen: &mut HashSet<[u8; 32]>,
+    tx: &LedgerTx,
+) -> Result<(u64, [u8; 32], [u8; 32]), String> {
+    let commitment = parse_shield_memo(&tx.memo)
+        .ok_or_else(|| "the memo carries no readable commitment".to_string())?;
+    if !is_denomination(tx.amount) {
+        return Err(format!("{} uEGOC is not a note denomination", tx.amount));
+    }
+    if leaf_index_in(db, &commitment).is_some() || !seen.insert(commitment) {
+        return Err("the commitment is already in the tree".to_string());
+    }
+    let leaf = leaf_for(&commitment, tx.amount);
+    let index = state.insert(leaf)?;
+    state.balance_uegoc = state.balance_uegoc.saturating_add(tx.amount);
+    state.note_added(tx.amount);
+    Ok((index, commitment, leaf))
+}
+
 pub fn apply_block(db: &DB, batch: &mut WriteBatch, height: u64, txs: &[&LedgerTx]) {
+    let _guard = pool_write_lock().lock().unwrap_or_else(|e| e.into_inner());
     let Some(cf) = db.cf_handle(CF_META) else { return };
     let mut state = read_state(db);
     let mut changed = false;
@@ -656,23 +824,24 @@ pub fn apply_block(db: &DB, batch: &mut WriteBatch, height: u64, txs: &[&LedgerT
     let mut seen_nullifiers: HashSet<[u8; 32]> = HashSet::new();
     for tx in txs {
         if is_deposit(tx) {
-            let Some(commitment) = parse_shield_memo(&tx.memo) else { continue };
-            if leaf_index_in(db, &commitment).is_some() || !seen_commitments.insert(commitment) {
-                tracing::error!(
-                    "[Shielded] block #{height}: deposit {} repeats a commitment, not recorded",
-                    tx.hash
-                );
-                continue;
-            }
-            match state.insert(leaf_for(&commitment, tx.amount)) {
-                Ok(index) => {
-                    batch.put_cf(cf, leaf_key(index), leaf_for(&commitment, tx.amount));
+            match record_deposit(db, &mut state, &mut seen_commitments, tx) {
+                Ok((index, commitment, leaf)) => {
+                    batch.put_cf(cf, leaf_key(index), leaf);
                     batch.put_cf(cf, cidx_key(&commitment), index.to_be_bytes());
-                    state.balance_uegoc = state.balance_uegoc.saturating_add(tx.amount);
-                    state.note_added(tx.amount);
                     changed = true;
                 }
-                Err(e) => tracing::error!("[Shielded] block #{height}: deposit {} not recorded: {e}", tx.hash),
+                Err(reason) => {
+                    if tx.amount > 0 {
+                        state.strand(tx.amount);
+                        changed = true;
+                        crate::invariants::report(crate::invariants::Violation::StrandedDeposit {
+                            height,
+                            hash: tx.hash.clone(),
+                            amount_uegoc: tx.amount,
+                            reason,
+                        });
+                    }
+                }
             }
         } else if is_unshield(tx) {
             let Ok(body) = parse_unshield_body(&tx.call_args) else { continue };
@@ -694,6 +863,15 @@ pub fn apply_block(db: &DB, batch: &mut WriteBatch, height: u64, txs: &[&LedgerT
             for n in &nullifiers {
                 seen_nullifiers.insert(*n);
                 batch.put_cf(cf, nf_key(n), u64_le(height));
+            }
+            if tx.amount > state.balance_uegoc {
+                crate::invariants::report(crate::invariants::Violation::OutstandingNotes {
+                    height,
+                    detail: format!(
+                        "withdrawal {} takes {} uEGOC but the pool only records {}",
+                        tx.hash, tx.amount, state.balance_uegoc
+                    ),
+                });
             }
             state.balance_uegoc = state.balance_uegoc.saturating_sub(tx.amount);
             for sp in &body.spends {
@@ -740,22 +918,26 @@ fn prune_history(db: &DB, batch: &mut WriteBatch, floor: u64) {
     }
 }
 
-pub fn check_invariants(db: &DB, height: u64) {
-    let state = read_state(db);
-    if state.next_index == 0 && state.balance_uegoc == 0 {
-        return;
-    }
-    let on_chain = db
-        .cf_handle(CF_BALANCES)
+fn pool_address_balance(db: &DB) -> u64 {
+    db.cf_handle(CF_BALANCES)
         .and_then(|cf| db.get_cf(cf, SHIELDED_POOL_ADDR.as_bytes()).ok().flatten())
         .map(|v| read_u64_le(&v))
-        .unwrap_or(0);
-    if on_chain != state.balance_uegoc {
+        .unwrap_or(0)
+}
+
+pub fn check_invariants(db: &DB, height: u64) {
+    let state = read_state(db);
+    if state.next_index == 0 && state.accounted_uegoc() == 0 {
+        return;
+    }
+    let on_chain = pool_address_balance(db);
+    if on_chain != state.accounted_uegoc() {
         crate::invariants::report(crate::invariants::Violation::ShieldedPoolMismatch {
             height,
-            recorded_uegoc: state.balance_uegoc,
+            recorded_uegoc: state.accounted_uegoc(),
             on_chain_uegoc: on_chain,
         });
+        request_pool_repair();
     }
     let counted = state.counted_uegoc();
     if counted != state.balance_uegoc as u128 {
@@ -771,6 +953,7 @@ pub fn check_invariants(db: &DB, height: u64) {
 }
 
 pub fn rollback(db: &DB, batch: &mut WriteBatch, from_height: u64, removed: &[LedgerTx]) {
+    let _guard = pool_write_lock().lock().unwrap_or_else(|e| e.into_inner());
     let Some(cf) = db.cf_handle(CF_META) else { return };
     let current = read_state(db);
 
@@ -1198,6 +1381,85 @@ mod tests {
         assert_eq!(restored.balance_uegoc, before.balance_uegoc);
         assert_eq!(leaf_index_of(&a.commitment()), None);
         assert_eq!(leaves().len() as u64, before.next_index);
+        std::env::remove_var("EGO_SHIELDED_POOL_HEIGHT");
+    }
+
+    #[test]
+    fn a_fast_synced_node_refuses_to_rebuild_the_pool_from_blocks_it_lacks() {
+        let _g = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let before = state();
+        {
+            let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
+            let cf = db.cf_handle(CF_META).unwrap();
+            db.put_cf(cf, b"prune_below", u64_le(28_874)).unwrap();
+        }
+        let err = rebuild_from_chain().unwrap_err();
+        assert!(err.contains("28874"), "the refusal names the floor: {err}");
+        assert!(repair_pool_state().is_none(), "a refused rebuild is not a repair");
+        assert_eq!(state(), before, "a node that cannot rebuild must not overwrite the pool");
+        {
+            let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
+            let cf = db.cf_handle(CF_META).unwrap();
+            db.delete_cf(cf, b"prune_below").unwrap();
+        }
+        assert_eq!(chain_db::pruned_below(), 1);
+    }
+
+    #[test]
+    fn stranded_money_keeps_the_pool_and_its_address_in_step() {
+        let mut st = PoolState::empty();
+        st.balance_uegoc = 5_000_000;
+        assert_eq!(st.accounted_uegoc(), 5_000_000);
+        st.strand(2_000_000);
+        assert_eq!(st.balance_uegoc, 5_000_000, "no note was created for it");
+        assert_eq!(st.accounted_uegoc(), 7_000_000, "the coins are still at the address");
+        st.strand(u64::MAX);
+        assert_eq!(st.accounted_uegoc(), u64::MAX, "the total never wraps");
+        let again: PoolState = decode(&encode(&st)).unwrap();
+        assert_eq!(again, st);
+    }
+
+    #[test]
+    fn a_state_written_before_stranding_existed_reads_back_as_none() {
+        let mut raw = serde_json::to_value(PoolState::empty()).unwrap();
+        raw.as_object_mut().unwrap().remove("stray_uegoc");
+        let st: PoolState = serde_json::from_value(raw).unwrap();
+        assert_eq!(st.stray_uegoc, 0);
+        assert_eq!(st.accounted_uegoc(), 0);
+    }
+
+    #[test]
+    fn a_deposit_with_no_commitment_is_stranded_not_dropped() {
+        let _g = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("EGO_SHIELDED_POOL_HEIGHT", "0");
+        let mut rng = StdRng::from_entropy();
+        let a = Note::random(1_000_000, &mut rng);
+        let height = 900_000_000 + (rng.next_u64() % 1_000_000);
+        let no_memo = LedgerTx { memo: None, ..deposit_tx(&a) };
+
+        let before = state();
+        {
+            let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
+            let mut batch = WriteBatch::default();
+            apply_block(db, &mut batch, height, &[&no_memo]);
+            db.write(batch).unwrap();
+        }
+        let after = state();
+        assert_eq!(after.next_index, before.next_index, "no leaf can be built without a commitment");
+        assert_eq!(after.balance_uegoc, before.balance_uegoc, "no note was recorded");
+        assert_eq!(
+            after.accounted_uegoc(),
+            before.accounted_uegoc() + 1_000_000,
+            "the coins reached the pool address, so the pool has to account for them"
+        );
+
+        {
+            let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
+            let mut batch = WriteBatch::default();
+            rollback(db, &mut batch, height, &[no_memo]);
+            db.write(batch).unwrap();
+        }
+        assert_eq!(state().accounted_uegoc(), before.accounted_uegoc());
         std::env::remove_var("EGO_SHIELDED_POOL_HEIGHT");
     }
 

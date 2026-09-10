@@ -143,6 +143,21 @@ impl ConsensusHost {
         self.engine.seed_height(height);
     }
 
+    /// Tell the engine what each validator's vote is worth, in the order of its own set.
+    pub fn set_weights(&self, weights: Vec<u64>) {
+        self.engine.set_weights(weights);
+    }
+
+    /// Seed at `height` while keeping the view counter the committee already agreed on.
+    pub fn seed_height_round(&self, height: u64, round: u32) {
+        self.engine.seed_height_round(height, round);
+    }
+
+    /// The round in the next `span` at which `proposer` is the elected leader, if any.
+    pub fn round_electing(&self, proposer: &Address, span: u32) -> Option<u32> {
+        self.engine.round_electing(proposer, span)
+    }
+
     pub fn validator_set(&self) -> &[Address] {
         &self.validator_set
     }

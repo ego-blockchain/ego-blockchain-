@@ -36,6 +36,7 @@ fn warn_operator_chain_stalled(stuck_secs: u64, known_count: usize) {
         "No block has been agreed for {minutes} minute(s) with {known_count} validator(s)          connected. Your transactions are waiting, not lost. This usually means the nodes          disagree about the chain after a network change. Restarting every node is the first          thing to try."
     );
     tracing::error!("[Stalled] {}", body);
+    tracing::error!("[Stalled] this node: {}", crate::p2p::consensus_state_summary());
     if let Some(app) = crate::p2p::APP_HANDLE.get() {
         crate::commands::notifications::notify(app, "Chain is not producing blocks", &body);
         use tauri::Manager;

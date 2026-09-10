@@ -5,11 +5,13 @@ mod autostart;
 mod offline_guard;
 mod onetime;
 mod adversary;
+mod genesis;
 mod invariants;
 mod robustness;
 mod scale;
 mod shielded;
 mod shielded_chain;
+mod storage_proof;
 mod sideband;
 mod sideband_spool;
 mod bft_committee;
@@ -310,6 +312,7 @@ fn headless_main() {
         crate::ledger::reconcile_stake_state();
         crate::chain_db::restore_in_memory_state_from_db();
         crate::chain_db::repair_finality_marker();
+        crate::genesis::announce_on_start();
         crate::shielded_chain::repair_pool_state();
         crate::sharding::load_agreed_shard_count_from_db();
 
@@ -853,6 +856,7 @@ fn main() {
             commands::shielded::shielded_status,
             commands::shielded::shielded_forget_note,
             commands::shielded::shielded_forget_spent,
+            commands::shielded::shielded_cancel_withdrawal,
             commands::shielded::shield_deposit,
             commands::shielded::shield_withdraw,
             commands::shielded::invariant_report,
@@ -917,6 +921,7 @@ fn main() {
             commands::storage::open_file,
             commands::consensus::get_porep_status,
             commands::consensus::respond_to_challenges,
+            commands::consensus::prove_stored_files,
             commands::consensus::get_post_score,
             commands::consensus::get_combined_drs,
             commands::consensus::get_tokenomics,
@@ -1183,6 +1188,7 @@ fn main() {
 
                 tokio::task::spawn_blocking(|| {
                     crate::chain_db::restore_in_memory_state_from_db();
+                    crate::genesis::announce_on_start();
                     crate::shielded_chain::repair_pool_state();
                     crate::sharding::load_agreed_shard_count_from_db();
 

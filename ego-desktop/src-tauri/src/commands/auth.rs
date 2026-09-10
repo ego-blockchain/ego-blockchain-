@@ -403,6 +403,8 @@ fn create_wallet_files(address_override: Option<&str>) -> Result<String, EgoDesk
             ..LedgerTx::default()
         });
         chain.blocks.push(LedgerBlock {
+            producer_pubkey: String::new(),
+            producer_sig: String::new(),
             height:     genesis_block_height,
             hash:       genesis_hash,
             prev_hash:  chain.blocks.last().map(|b| b.hash.clone()).unwrap_or_else(|| "0".repeat(64)),

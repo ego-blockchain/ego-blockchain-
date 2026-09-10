@@ -321,6 +321,8 @@ impl RoundState {
 pub struct BftEngine {
     keypair: Arc<KeyPair>,
     address: Address,
+    /// Per-validator vote weight, parallel to `validator_set`. Empty means one vote each.
+    weights: Arc<RwLock<Vec<u64>>>,
     scheme: SigScheme,
     validator_set: Vec<Address>,
     finalized_blocks: Arc<RwLock<Vec<(BlockHeader, QuorumCertificate)>>>,
@@ -346,6 +348,7 @@ impl BftEngine {
         let address = scheme.address(&keypair);
         Self {
             keypair: Arc::new(keypair), address, scheme, validator_set,
+            weights: Arc::new(RwLock::new(Vec::new())),
             finalized_blocks: Arc::new(RwLock::new(Vec::new())),
             current_round: Arc::new(RwLock::new(RoundState::new(0, 0, 0))),
             current_epoch: Arc::new(RwLock::new(0)),
@@ -362,18 +365,121 @@ impl BftEngine {
     /// `(height + round) % n` instead of restarting from 0. MUST be called before any
     /// propose/vote (it resets the round state). No-op safety: only sets initial state.
     pub fn seed_height(&self, height: u64) {
+        self.seed_height_round(height, 0);
+    }
+
+    /// Seed the engine at `height` while KEEPING a view counter the committee already
+    /// agreed on. A committee rebuild that resets the round to 0 while peers stay at
+    /// round R makes every node elect a different proposer, which halts the chain until
+    /// they coincidentally realign.
+    pub fn seed_height_round(&self, height: u64, round: u32) {
         *self.current_height.write().unwrap() = height;
         *self.current_epoch.write().unwrap() = height;
-        *self.current_round.write().unwrap() = RoundState::new(height, height, 0);
+        *self.current_round.write().unwrap() = RoundState::new(height, height, round);
+    }
+
+    pub fn current_round_number(&self) -> u32 {
+        self.current_round.read().unwrap().round
+    }
+
+    /// The round at which `proposer` would be the elected leader for the current height,
+    /// searching the next `span` rounds. Lets a node that fell behind recognise a proposal
+    /// as legitimate-but-from-a-later-view instead of discarding it.
+    pub fn round_electing(&self, proposer: &Address, span: u32) -> Option<u32> {
+        if self.validator_set.is_empty() { return None; }
+        let (height, round) = {
+            let s = self.current_round.read().unwrap();
+            (s.height, s.round)
+        };
+        (round..=round.saturating_add(span))
+            .find(|r| self.proposer_at(height, *r) == Some(proposer))
     }
 
     pub fn quorum_size(&self) -> usize { (2 * self.validator_set.len()) / 3 + 1 }
 
+    /// Set how much each validator's vote is worth. Weights are integers because a quorum
+    /// decision must be identical on every node, and floating point is not: a value that
+    /// differs in the last bit across platforms would let one node finalize a block another
+    /// rejects. Empty weights mean one vote each, which is what an unweighted network wants.
+    pub fn set_weights(&self, weights: Vec<u64>) {
+        let mut w = self.weights.write().unwrap();
+        *w = if weights.len() == self.validator_set.len() { weights } else { Vec::new() };
+    }
+
+    fn weight_of(&self, addr: &Address) -> u64 {
+        let w = self.weights.read().unwrap();
+        if w.is_empty() {
+            return 1;
+        }
+        self.validator_set
+            .iter()
+            .position(|a| a == addr)
+            .and_then(|i| w.get(i).copied())
+            .unwrap_or(0)
+    }
+
+    fn total_weight(&self) -> u64 {
+        let w = self.weights.read().unwrap();
+        if w.is_empty() {
+            return self.validator_set.len() as u64;
+        }
+        w.iter().copied().fold(0u64, |a, b| a.saturating_add(b))
+    }
+
+    /// Whether these voters carry MORE than two thirds of the network. Strictly more, not
+    /// at least: at exactly two thirds a committee whose size divides by three can form two
+    /// conflicting quorums. With every weight at one this reproduces `quorum_size()` for
+    /// every committee size, so an unweighted network behaves exactly as before.
+    pub fn is_quorum(&self, voters: impl Iterator<Item = Address>) -> bool {
+        let total = self.total_weight();
+        if total == 0 {
+            return false;
+        }
+        let mut seen: Vec<Address> = Vec::new();
+        let mut got: u64 = 0;
+        for v in voters {
+            if seen.contains(&v) {
+                continue;
+            }
+            got = got.saturating_add(self.weight_of(&v));
+            seen.push(v);
+        }
+        (got as u128) * 3 > (total as u128) * 2
+    }
+
+    /// Who proposes at this (height, round).
+    ///
+    /// Turns are shared out in proportion to weight rather than one each, so a validator
+    /// contributing three times as much leads three times as often. The walk is over the
+    /// same ordered set every node holds, so it stays a pure function of (height, round) and
+    /// the committee: exactly one leader per round, which is what lets a view change rotate
+    /// to a known successor. With every weight at one it is the old round-robin exactly.
+    pub fn proposer_at(&self, height: u64, round: u32) -> Option<&Address> {
+        if self.validator_set.is_empty() {
+            return None;
+        }
+        let weights = self.weights.read().unwrap();
+        let turn = height.wrapping_add(round as u64);
+        if weights.len() != self.validator_set.len() {
+            return self.validator_set.get(turn as usize % self.validator_set.len());
+        }
+        let total: u64 = weights.iter().copied().fold(0u64, |a, b| a.saturating_add(b));
+        if total == 0 {
+            return self.validator_set.get(turn as usize % self.validator_set.len());
+        }
+        let mut pick = turn % total;
+        for (i, w) in weights.iter().enumerate() {
+            if pick < *w {
+                return self.validator_set.get(i);
+            }
+            pick -= *w;
+        }
+        self.validator_set.last()
+    }
+
     pub fn is_proposer(&self) -> bool {
-        if self.validator_set.is_empty() { return false; }
         let s = self.current_round.read().unwrap();
-        let idx = ((s.height + s.round as u64) as usize) % self.validator_set.len();
-        self.validator_set[idx] == self.address
+        self.proposer_at(s.height, s.round) == Some(&self.address)
     }
 
     pub fn propose_block(&self, roots: BlockRoots) -> PoCResult<BlockHeader> {
@@ -414,8 +520,7 @@ impl BftEngine {
         if header.height != height { return Ok(None); }
 
         let round = self.current_round.read().unwrap().round;
-        let idx = ((height + round as u64) as usize) % self.validator_set.len().max(1);
-        if self.validator_set.get(idx) != Some(&header.proposer) {
+        if self.proposer_at(height, round) != Some(&header.proposer) {
             warn!("Unexpected proposer {}", header.proposer);
             return Ok(None);
         }
@@ -475,7 +580,7 @@ impl BftEngine {
         };
         if s.qc.is_some() { return Ok(None); }
         let votes: Vec<Vote> = s.votes.values().filter(|v| v.block_hash == state_bh).cloned().collect();
-        if votes.len() >= self.quorum_size() {
+        if self.is_quorum(votes.iter().map(|v| v.voter)) {
             let qc = QuorumCertificate::new(state_bh, vote.height, vote.epoch, vote.round, &votes);
             s.qc = Some(qc.clone());
             s.advance_phase(RoundPhase::Commit);
@@ -491,6 +596,10 @@ impl BftEngine {
         if qc.block_hash != header.block_hash() {
             return Err(PoCError::ValidationFailed("QC block_hash mismatch".to_string()));
         }
+        // Weight is enforced where the QC is formed, in `receive_vote`, which is the only
+        // place the voters' identities are known: the certificate keeps a count and a Merkle
+        // root of signatures, not a roll call. Naming its voters would let this re-check the
+        // weight too, and is a wire-format change worth making on its own.
         if qc.voter_count() < self.quorum_size() {
             return Err(PoCError::ValidationFailed(format!("QC insufficient votes {}/{}", qc.voter_count(), self.validator_set.len())));
         }
@@ -607,6 +716,187 @@ mod tests {
     }
 
     #[test] fn test_quorum_size() { let (e, _) = make_engine(4); assert_eq!(e.quorum_size(), 3); }
+
+    #[test]
+    fn leadership_is_shared_in_proportion_to_weight() {
+        let (e, kps) = make_engine(3);
+        let vals: Vec<Address> = kps.iter().map(|kp| SigScheme::Ed25519.address(kp)).collect();
+        e.set_weights(vec![3, 1, 1]);
+
+        let mut turns = std::collections::HashMap::new();
+        for round in 0..500u32 {
+            let who = *e.proposer_at(0, round).unwrap();
+            *turns.entry(who).or_insert(0usize) += 1;
+        }
+        let big = turns[&vals[0]];
+        let small = turns[&vals[1]];
+        assert!(
+            big > small * 2 && big < small * 4,
+            "a validator worth three of the others should lead about three times as often, got {big} vs {small}",
+        );
+        assert_eq!(turns.values().sum::<usize>(), 500, "every round has exactly one leader");
+    }
+
+    #[test]
+    fn every_node_elects_the_same_leader_for_a_given_round() {
+        let (a, kps) = make_engine(4);
+        let vals: Vec<Address> = kps.iter().map(|kp| SigScheme::Ed25519.address(kp)).collect();
+        let b = BftEngine::with_scheme(kps[1].clone(), vals.clone(), SigScheme::Ed25519);
+        a.set_weights(vec![5, 2, 1, 1]);
+        b.set_weights(vec![5, 2, 1, 1]);
+        for round in 0..200u32 {
+            assert_eq!(
+                a.proposer_at(17, round), b.proposer_at(17, round),
+                "leadership must be a function of the committee, not of who is asking",
+            );
+        }
+    }
+
+    #[test]
+    fn without_weights_leadership_is_the_plain_rotation() {
+        let (e, kps) = make_engine(4);
+        let vals: Vec<Address> = kps.iter().map(|kp| SigScheme::Ed25519.address(kp)).collect();
+        for round in 0..12u32 {
+            let expected = &vals[((17 + round as u64) as usize) % 4];
+            assert_eq!(e.proposer_at(17, round), Some(expected));
+        }
+    }
+
+    #[test]
+    fn a_validator_worth_nothing_never_leads() {
+        let (e, kps) = make_engine(3);
+        let vals: Vec<Address> = kps.iter().map(|kp| SigScheme::Ed25519.address(kp)).collect();
+        e.set_weights(vec![0, 1, 1]);
+        for round in 0..200u32 {
+            assert_ne!(
+                e.proposer_at(5, round), Some(&vals[0]),
+                "a seat with no weight should not take turns others could use",
+            );
+        }
+    }
+
+    #[test]
+    fn an_unweighted_network_counts_votes_exactly_as_before() {
+        for n in 1..=12usize {
+            let (e, kps) = make_engine(n);
+            let vals: Vec<Address> = kps.iter().map(|kp| SigScheme::Ed25519.address(kp)).collect();
+            let need = e.quorum_size();
+            assert!(
+                e.is_quorum(vals[..need].iter().copied()),
+                "n={n}: {need} votes is the quorum",
+            );
+            if need > 1 {
+                assert!(
+                    !e.is_quorum(vals[..need - 1].iter().copied()),
+                    "n={n}: one short of {need} must not pass — a committee divisible by three                      is where an at-least-two-thirds rule would wrongly allow two quorums",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weight_decides_a_quorum_rather_than_headcount() {
+        let (e, kps) = make_engine(4);
+        let vals: Vec<Address> = kps.iter().map(|kp| SigScheme::Ed25519.address(kp)).collect();
+        e.set_weights(vec![10, 1, 1, 1]);
+        assert!(
+            !e.is_quorum(vals[..3].iter().skip(1).copied()),
+            "three small validators carry 3 of 13 and cannot finalize",
+        );
+        assert!(
+            e.is_quorum([vals[0], vals[1]].into_iter()),
+            "the large validator plus one carries 11 of 13",
+        );
+    }
+
+    #[test]
+    fn the_same_validator_voting_twice_counts_once() {
+        let (e, kps) = make_engine(4);
+        let vals: Vec<Address> = kps.iter().map(|kp| SigScheme::Ed25519.address(kp)).collect();
+        e.set_weights(vec![1, 1, 1, 1]);
+        assert!(
+            !e.is_quorum([vals[0], vals[0], vals[0]].into_iter()),
+            "one validator shouting three times is still one validator",
+        );
+        assert!(
+            e.is_quorum([vals[0], vals[1], vals[2]].into_iter()),
+            "three distinct validators do carry it",
+        );
+    }
+
+    #[test]
+    fn someone_outside_the_committee_carries_no_weight() {
+        let (e, kps) = make_engine(4);
+        let vals: Vec<Address> = kps.iter().map(|kp| SigScheme::Ed25519.address(kp)).collect();
+        e.set_weights(vec![1, 1, 1, 1]);
+        let stranger = SigScheme::Ed25519.address(&KeyPair::generate());
+        assert!(
+            !e.is_quorum([vals[0], vals[1], stranger].into_iter()),
+            "an outsider's vote adds nothing toward quorum",
+        );
+    }
+
+    #[test]
+    fn one_validator_can_hold_a_quorum_alone_unless_the_caller_caps_it() {
+        let (e, kps) = make_engine(4);
+        let vals: Vec<Address> = kps.iter().map(|kp| SigScheme::Ed25519.address(kp)).collect();
+        e.set_weights(vec![10, 1, 1, 1]);
+        assert!(
+            e.is_quorum([vals[0]].into_iter()),
+            "the engine weighs what it is given; capping concentration is the caller's job",
+        );
+    }
+
+    #[test]
+    fn a_weight_list_that_does_not_fit_the_committee_is_ignored() {
+        let (e, kps) = make_engine(4);
+        let vals: Vec<Address> = kps.iter().map(|kp| SigScheme::Ed25519.address(kp)).collect();
+        e.set_weights(vec![99, 1]);
+        assert!(
+            e.is_quorum(vals[..3].iter().copied()),
+            "a mismatched list falls back to one vote each rather than a wrong answer",
+        );
+    }
+
+    #[test]
+    fn a_committee_rebuild_can_keep_the_view_the_others_are_in() {
+        let (e, _) = make_engine(4);
+        e.seed_height(100);
+        assert_eq!(e.current_round_number(), 0);
+        e.seed_height_round(100, 5);
+        assert_eq!(e.current_round_number(), 5, "a rebuild must be able to stay in the agreed view");
+        e.seed_height(101);
+        assert_eq!(e.current_round_number(), 0, "a new height still starts a fresh view");
+    }
+
+    #[test]
+    fn a_node_left_behind_can_find_the_round_that_elects_the_proposer() {
+        let (e, kps) = make_engine(4);
+        let vals: Vec<Address> = kps.iter().map(|kp| SigScheme::Ed25519.address(kp)).collect();
+        e.seed_height_round(100, 0);
+
+        for offset in 0..4u32 {
+            let elected = &vals[((100 + offset as u64) as usize) % 4];
+            assert_eq!(
+                e.round_electing(elected, 8),
+                Some(offset),
+                "round {offset} is the first that elects that proposer"
+            );
+        }
+    }
+
+    #[test]
+    fn the_search_for_a_proposers_round_never_looks_backwards_or_too_far() {
+        let (e, kps) = make_engine(4);
+        let vals: Vec<Address> = kps.iter().map(|kp| SigScheme::Ed25519.address(kp)).collect();
+        e.seed_height_round(100, 3);
+        assert!(
+            e.round_electing(&vals[(100 + 1) % 4], 8).unwrap() >= 3,
+            "a node never rewinds its own view to match a laggard"
+        );
+        let stranger = SigScheme::Ed25519.address(&KeyPair::generate());
+        assert_eq!(e.round_electing(&stranger, 8), None, "someone outside the committee elects nobody");
+    }
 
     #[test] fn test_block_hash_stable() {
         let kp = KeyPair::generate();

@@ -137,6 +137,25 @@ pub fn note_network_height(height: u64) {
     NETWORK_BEST_HEIGHT.fetch_max(height, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Record how far ahead the network is, but only on the word of a validator this build
+/// recognises. A node still running an abandoned chain announces a height thousands of
+/// blocks beyond ours, and the sync path then rightly refuses its blocks — leaving the app
+/// reporting that it is catching up to something it will never reach.
+pub fn note_network_height_from(height: u64, claimant: &str) {
+    if crate::genesis::addresses().is_empty() || crate::genesis::is_member(claimant) {
+        note_network_height(height);
+    }
+}
+
+fn note_network_height_from_blocks(blocks: &[LedgerBlock]) {
+    if !blocks_are_from_our_network(blocks) {
+        return;
+    }
+    if let Some(h) = blocks.iter().map(|b| b.height).max() {
+        note_network_height(h);
+    }
+}
+
 pub static SUSPENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SUSPEND_TS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 const SUSPEND_GATE_MAX_SECS: i64 = 180;
@@ -941,6 +960,11 @@ pub fn build_shadow_consensus_host() -> Option<crate::consensus_host::ConsensusH
         for addr in &source {
             let dil_raw = if *addr == my_addr {
                 my_dil_raw.clone()
+            } else if let Some(k) = crate::genesis::dilithium_pubkey_for(addr) {
+                // The starting list carries its own keys, so the committee is complete from
+                // block zero. Waiting for each member to announce would make an offline
+                // member stop the network from ever starting.
+                k
             } else {
                 match pubkeys.get(addr).and_then(|h| hex::decode(h).ok()) {
                     Some(b) if !b.is_empty() => b,
@@ -964,7 +988,22 @@ pub fn build_shadow_consensus_host() -> Option<crate::consensus_host::ConsensusH
     }
 
     let (set, _bech32_by_addr) = build_validator_set(&pairs);
+    let ordered: Vec<String> = set
+        .iter()
+        .filter_map(|a| _bech32_by_addr.get(a).cloned())
+        .collect();
+    eprintln!(
+        "[ConsensusV2] committee ({}) from {}: {}",
+        set.len(),
+        if from_chain { "chain" } else { "live peers" },
+        set.iter()
+            .enumerate()
+            .map(|(i, a)| format!("[{i}] {a}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
     let host = ConsensusHost::new(kp, set);
+    host.set_weights(validator_weights(&ordered));
     // Align with peers at the live chain tip: the next height to produce is tip+1, so
     // two nodes that didn't start simultaneously still agree on the proposer schedule.
     let next_height = crate::chain_db::latest_block_info().0 + 1;
@@ -973,6 +1012,11 @@ pub fn build_shadow_consensus_host() -> Option<crate::consensus_host::ConsensusH
 }
 
 const V2_TOPIC: &str = "ego-bftv2-v1";
+
+/// How many rounds ahead a peer may be before we stop chasing its view. Wide enough to
+/// cross an ordinary reconfiguration gap, narrow enough that a peer claiming a wild round
+/// cannot walk the committee anywhere.
+const V2_ROUND_CATCHUP_SPAN: u32 = 8;
 
 static SHADOW_HOST: std::sync::OnceLock<std::sync::Mutex<Option<crate::consensus_host::ConsensusHost>>> =
     std::sync::OnceLock::new();
@@ -999,7 +1043,7 @@ fn v2_pending_blocks() -> std::sync::MutexGuard<'static, HashMap<ego_core::Hash,
     V2_PENDING_BLOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap()
 }
 
-type V2Proposal = (ego_consensus_core::bft::BlockHeader, crate::ledger::LedgerBlock, Vec<LedgerTx>);
+type V2Proposal = (ego_consensus_core::bft::BlockHeader, crate::ledger::LedgerBlock, Vec<LedgerTx>, u32);
 static V2_FUTURE_PROPOSALS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, V2Proposal>>> = std::sync::OnceLock::new();
 static V2_FUTURE_VOTES: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, Vec<ego_consensus_core::bft::Vote>>>> = std::sync::OnceLock::new();
 const V2_FUTURE_WINDOW: u64 = 256; // how far ahead we buffer
@@ -1011,6 +1055,45 @@ fn v2_future_votes() -> std::sync::MutexGuard<'static, HashMap<u64, Vec<ego_cons
 }
 fn v2_engine_height() -> Option<u64> {
     shadow_host_lock().as_ref().map(|h| h.current_height())
+}
+
+/// What this node believes, in one line. A stalled chain is almost always two nodes
+/// holding different views of the same facts, and the numbers that matter (engine height,
+/// round, committee, and why blocks are being turned away) are otherwise spread across
+/// three files at three log levels.
+pub fn consensus_state_summary() -> String {
+    let (tip, _) = crate::chain_db::latest_block_info();
+    let (engine_h, round, members) = {
+        let g = shadow_host_lock();
+        match g.as_ref() {
+            Some(h) => (Some(h.current_height()), Some(h.current_round()), h.validator_set().len()),
+            None => (None, None, 0),
+        }
+    };
+    let (committee, from_chain) = committee_source();
+    let last_reject = LAST_BLOCK_REJECT
+        .get_or_init(|| Mutex::new(String::new()))
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    format!(
+        "chain tip {tip}; engine height {}; round {}; committee {} of {} seated from {}; walk-back {}; last block refused: {}",
+        engine_h.map(|h| h.to_string()).unwrap_or_else(|| "none (no host)".into()),
+        round.map(|r| r.to_string()).unwrap_or_else(|| "none".into()),
+        members,
+        committee.len(),
+        if from_chain { "chain state" } else { "live peers" },
+        fork_walkback(),
+        if last_reject.is_empty() { "nothing" } else { &last_reject },
+    )
+}
+
+static LAST_BLOCK_REJECT: std::sync::OnceLock<Mutex<String>> = std::sync::OnceLock::new();
+
+fn note_block_rejected(height: u64, reason: &str) {
+    if let Ok(mut g) = LAST_BLOCK_REJECT.get_or_init(|| Mutex::new(String::new())).lock() {
+        *g = format!("#{height}: {reason}");
+    }
 }
 
 static V2_COMMITTEE_SIG: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
@@ -1026,14 +1109,49 @@ fn v2_pending_sig() -> std::sync::MutexGuard<'static, String> {
 }
 pub fn committee_source() -> (Vec<String>, bool) {
     let slashed = slashed_validators();
+    // Both filters come from committed chain state, so every node applying the same blocks
+    // seats the same committee.
+    let jailed = crate::chain_db::jailed_validators();
+    // Registering is open to anyone running the software. While a starting list exists it
+    // also names who may hold a seat: an unknown node on older rules that registers and
+    // then proposes on a chain nobody else has is enough to stop the network agreeing on
+    // anything. Everyone else still syncs, transacts and follows the chain.
+    let genesis = crate::genesis::addresses();
+    // Validation is open: anyone who registers on-chain and posts the stake holds a seat.
+    // Registering is free, so the seat cannot be — stake is the cost of an identity, and
+    // without it one person runs a hundred nodes and owns the committee, because the engine
+    // counts validators rather than weighing them. The starting committee is exempt from
+    // the floor: it is named in the build and is what brings the chain up before anyone can
+    // stake at all.
+    //
+    // Set EGO_VALIDATOR_ALLOWLIST=1 to restrict seats to the starting committee again.
+    let allowlist_only = std::env::var("EGO_VALIDATOR_ALLOWLIST")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let on_chain: Vec<String> = crate::chain_db::registered_validators_sorted()
         .into_iter()
-        .filter(|a| !slashed.contains(a))
+        .filter(|a| !slashed.contains(a) && !jailed.contains(a))
+        .filter(|a| !allowlist_only || genesis.is_empty() || genesis.contains(a))
+        .filter(|a| genesis.contains(a) || qualifies_for_seat(a))
         .collect();
     let min_live = crate::mempool::min_validators_for_finality();
     if on_chain.len() >= min_live {
-        let recent = crate::chain_db::recently_active_validators(PROPOSER_LIVENESS_LOOKBACK);
-        return (narrow_to_live(on_chain, &recent, 0, min_live), true);
+        // The committee MUST be a function of committed chain state alone. Narrowing it by
+        // locally-observed liveness makes it depend on what this node happened to see, so
+        // two nodes with different recent history seat different committees, land at
+        // different indices, and reject each other's proposals — which keeps their history
+        // divergent. A registered validator that is offline costs one view-change timeout;
+        // a committee that differs between nodes costs the chain.
+        return (on_chain, true);
+    }
+    // Nothing is registered on-chain yet. Registering requires a block, and producing a
+    // block requires a committee, so a network with no starting list can never break out
+    // of that circle: each node seats whoever it has personally heard from, the rotas
+    // disagree, and every proposal is rejected as coming from the wrong proposer. The
+    // genesis list is the shared starting point that settles it.
+    let genesis = crate::genesis::addresses();
+    if !genesis.is_empty() {
+        return (genesis, true);
     }
     let mut live = live_validators();
     live.sort();
@@ -1075,7 +1193,18 @@ async fn maybe_reconfigure_committee() {
     let built = tokio::task::spawn_blocking(build_shadow_consensus_host).await.ok().flatten();
     if let Some(host) = built {
         let tip = crate::chain_db::latest_block_info().0 + 1;
-        host.seed_height(tip);
+        // Carry the view counter across the rebuild. Peers reconfigure on their own
+        // timers, so a node that resets to round 0 while the rest sit at round R elects a
+        // different proposer and the chain halts until they realign by chance.
+        let carry = {
+            let g = shadow_host_lock();
+            g.as_ref()
+                .filter(|h| h.current_height() == tip)
+                .map(|h| h.current_round())
+                .unwrap_or(0)
+        };
+        host.seed_height_round(tip, carry);
+        host.set_weights(validator_weights(&committee_source().0));
         let (n, q) = (host.validator_set().len(), host.quorum_size());
         *shadow_host_lock() = Some(host);
         v2_future_proposals().clear();
@@ -1116,13 +1245,46 @@ async fn shadow_publish(msg: &P2PMessage) {
 
 /// A v2 proposal arrived (or we just produced our own): in LIVE mode remember the
 /// LedgerBlock payload so we can persist it on QC; then vote, publish, and self-count.
+/// A proposal arrived from a view we are not in. The engine elects by
+/// `(height + round) % n`, so a round gap makes every proposal look like it came from the
+/// wrong proposer and both sides reject each other until they realign by chance. Nudge the
+/// committee toward the proposer's view through the ordinary quorum-gated view change
+/// rather than adopting an unsigned round on trust.
+async fn reconcile_proposal_round(peer_round: u32, proposer: &ego_core::Address) {
+    if !consensus_v2_live_enabled() { return; }
+    let (mine, electing) = {
+        let g = shadow_host_lock();
+        match g.as_ref() {
+            Some(h) => (h.current_round(), h.round_electing(proposer, V2_ROUND_CATCHUP_SPAN)),
+            None => return,
+        }
+    };
+    if peer_round <= mine && electing.is_none() { return; }
+    let target = electing.filter(|r| *r > mine).or(Some(peer_round)).filter(|r| *r > mine);
+    let Some(target) = target else { return };
+    if target - mine > V2_ROUND_CATCHUP_SPAN { return; }
+    let vc = { let g = shadow_host_lock(); g.as_ref().and_then(|h| h.trigger_view_change()) };
+    let Some(vc) = vc else { return };
+    eprintln!(
+        "[ConsensusV2/LIVE] proposal from round {peer_round} while we are at {mine} — broadcasting a view-change toward {target}"
+    );
+    shadow_publish(&P2PMessage::BftV2ViewChange { msg: vc.clone() }).await;
+    shadow_on_view_change(vc).await;
+}
+
 pub async fn shadow_on_proposal(
     header: ego_consensus_core::bft::BlockHeader,
     block: crate::ledger::LedgerBlock,
     txs: Vec<LedgerTx>,
+    peer_round: u32,
 ) {
     if !consensus_v2_active() { return; }
-    note_network_height(header.height);
+    if crate::genesis::addresses().is_empty() || crate::genesis::is_engine_member(&header.proposer) {
+        note_network_height(header.height);
+    }
+    if v2_engine_height() == Some(header.height) {
+        reconcile_proposal_round(peer_round, &header.proposer).await;
+    }
 
     // Route by height. A proposal can arrive before we finalize its parent (gossip race):
     // buffer it and replay once the engine reaches that height, rather than dropping it.
@@ -1130,7 +1292,7 @@ pub async fn shadow_on_proposal(
         if header.height < cur { return; } // stale — already past this height
         if header.height > cur {
             if header.height <= cur + V2_FUTURE_WINDOW {
-                v2_future_proposals().insert(header.height, (header, block, txs));
+                v2_future_proposals().insert(header.height, (header, block, txs, peer_round));
             }
             return;
         }
@@ -1291,8 +1453,8 @@ pub async fn shadow_v2_tick() {
             b.retain(|&h, _| h >= cur);
             b.remove(&cur)
         };
-        if let Some((header, block, txs)) = prop {
-            Box::pin(shadow_on_proposal(header, block, txs)).await;
+        if let Some((header, block, txs, peer_round)) = prop {
+            Box::pin(shadow_on_proposal(header, block, txs, peer_round)).await;
         }
         if let Some(vs) = votes {
             for v in vs { Box::pin(shadow_on_vote(v)).await; }
@@ -1412,10 +1574,11 @@ async fn emit_v2_proposal() {
     };
     let tag = if consensus_v2_live_enabled() { "LIVE" } else { "shadow" };
     eprintln!("[ConsensusV2/{}] proposed h={} txs={}", tag, header.height, stamped.len());
+    let round = { let g = shadow_host_lock(); g.as_ref().map_or(0, |h| h.current_round()) };
     shadow_publish(&P2PMessage::BftV2Proposal {
-        header: header.clone(), block: candidate.clone(), transactions: stamped.clone(),
+        header: header.clone(), block: candidate.clone(), transactions: stamped.clone(), round,
     }).await;
-    shadow_on_proposal(header, candidate, stamped).await; // our own self-vote
+    shadow_on_proposal(header, candidate, stamped, round).await; // our own self-vote
 }
 
 /// Build a real LedgerBlock candidate from the mempool for the v2 LIVE proposer,
@@ -2198,6 +2361,62 @@ pub fn active_node_count() -> usize {
     peers + 1
 }
 
+/// Storage a node must have proven to hold a seat. Contribution is what this network asks
+/// of a validator — the reputation score already weighs coverage at three times stake — so
+/// the entry price is data actually stored and proven, not coins locked up.
+/// What one validator's vote is worth, from committed chain state only.
+///
+/// Mirrors the reputation score's ratios — contribution counts three times what capital
+/// does — but in whole numbers. Floating point cannot be used here: `ln()` can differ in the
+/// last bit between platforms, and a weight that differs by one bit lets one node finalize a
+/// block another rejects. Storage and stake are both read from the chain, so every node
+/// computes the same number from the same blocks.
+pub fn validator_weight(addr: &str) -> u64 {
+    let gb = crate::chain_db::proven_storage_bytes(addr) / 1_000_000_000;
+    let staked = crate::ledger::get_validator_stake(addr) / crate::tokenomics::UEGOC_PER_EGOC;
+    gb.saturating_mul(3).saturating_add(staked / 2).max(1)
+}
+
+/// Vote weights for `members`, in their order, with no single validator allowed more than a
+/// third of the total. Without the cap the largest contributor eventually decides everything
+/// alone, which is the concentration the reputation score already caps at the same fraction.
+pub fn validator_weights(members: &[String]) -> Vec<u64> {
+    let raw: Vec<u64> = members.iter().map(|a| validator_weight(a)).collect();
+    let total: u64 = raw.iter().copied().fold(0u64, |a, b| a.saturating_add(b));
+    if total == 0 || members.len() < 3 {
+        return raw;
+    }
+    let cap = (total / 3).max(1);
+    raw.into_iter().map(|w| w.min(cap)).collect()
+}
+
+/// Storage a node must have PROVEN to hold a seat. Contribution is what this network asks
+/// of a validator, so the entry price is data actually stored and answered a challenge
+/// about, not coins locked up.
+///
+/// Deliberately low. This is not disk space a node claims: it is files it holds and has
+/// proved. A high bar here does not make the network safer, it only means nobody but the
+/// founders can ever validate. Weight is what scales with contribution; this is just the
+/// door.
+pub fn min_validator_storage_bytes() -> u64 {
+    std::env::var("EGO_MIN_VALIDATOR_STORAGE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000_000)
+}
+
+/// Whether `addr` has earned a seat by contributing. Proven storage is the primary route;
+/// stake remains an alternative so a node that puts capital at risk instead of disk is not
+/// shut out. Either is a cost; the point is that a seat is never free.
+pub fn qualifies_for_seat(addr: &str) -> bool {
+    let storage_floor = min_validator_storage_bytes();
+    if storage_floor > 0 && crate::chain_db::proven_storage_bytes(addr) >= storage_floor {
+        return true;
+    }
+    let stake_floor = min_validator_stake_uegoc();
+    stake_floor == 0 || crate::ledger::get_validator_stake(addr) >= stake_floor
+}
+
 pub fn min_validator_stake_uegoc() -> u64 {
     std::env::var("EGO_MIN_VALIDATOR_STAKE")
         .ok().and_then(|v| v.parse().ok())
@@ -2911,6 +3130,10 @@ pub enum P2PMessage {
         header:       ego_consensus_core::bft::BlockHeader,
         block:        LedgerBlock,
         transactions: Vec<LedgerTx>,
+        /// View the proposer was in. Absent from builds before this field existed, which
+        /// deserialise as 0 — the same round those builds always assumed.
+        #[serde(default)]
+        round:        u32,
     },
     /// Engine vote (ed25519 or Dilithium per the active `SigScheme`).
     BftV2Vote {
@@ -4573,7 +4796,10 @@ pub async fn sync_chain_from_peers() {
     let my_endpoint = get_public_endpoint().await;
     let my_height = tokio::task::spawn_blocking(|| crate::chain_db::latest_block_info().0)
         .await.unwrap_or(0);
-    let from_height = my_height.saturating_sub(1);
+    let from_height = my_height
+        .saturating_sub(1)
+        .saturating_sub(fork_walkback())
+        .max(1);
 
     if LAST_FROM_HEIGHT.swap(from_height, std::sync::atomic::Ordering::Relaxed) == from_height {
         let stuck = STUCK_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -6992,16 +7218,14 @@ async fn handle_event(
             } else if topic == "ego-blocks-v1" {
                 match serde_json::from_slice::<P2PMessage>(&message.data) {
                     Ok(P2PMessage::ChainSyncResponse { blocks, transactions }) => {
-                        if let Some(h) = blocks.iter().map(|b| b.height).max() {
-                            note_network_height(h);
-                        }
+                        note_network_height_from_blocks(&blocks);
                         let app2 = app.cloned();
                         tokio::spawn(async move { merge_remote_chain(blocks, transactions, app2.as_ref()).await; });
                     }
                     Ok(P2PMessage::BlockFinalized { mut block, transactions, votes, agg_bls_sig, bls_pubkeys }) => {
                         let block_hash = block.hash.clone();
                         let height     = block.height;
-                        note_network_height(height);
+                        note_network_height_from(height, &block.miner);
                         let app2 = app.cloned();
                         let source_pid = propagation_source.to_string();
                         // If the producer's block arrived without a QC, build one from the
@@ -7050,7 +7274,7 @@ async fn handle_event(
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
                     learn_voter_pubkey(&proposer, &proposer_pubkey);
-                    note_network_height(block.height);
+                    note_network_height_from(block.height, &proposer);
                     // Only count validators building on our chain.
                     // A stranger on a different fork has a prev_hash we don't know.
                     let our_tip = crate::chain_db::latest_block_info().0;
@@ -7073,7 +7297,7 @@ async fn handle_event(
                     // their address) so signature verification doesn't depend on the
                     // announce having arrived first.
                     learn_voter_pubkey(&voter, &voter_pubkey);
-                    note_network_height(height);
+                    note_network_height_from(height, &voter);
                     // Only register voter if they're voting on a block on our chain.
                     let our_height = crate::chain_db::latest_block_info().0;
                     let vote_on_our_chain = height == our_height + 1
@@ -7777,8 +8001,8 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
         // Feed the engine that drives the real chain: validate + vote on proposals,
         // tally votes, persist the agreed LedgerBlock on QC. Inline runs instead only
         // under EGO_CONSENSUS_LEGACY=1.
-        P2PMessage::BftV2Proposal { header, block, transactions } => {
-            shadow_on_proposal(header, block, transactions).await;
+        P2PMessage::BftV2Proposal { header, block, transactions, round } => {
+            shadow_on_proposal(header, block, transactions, round).await;
         }
         P2PMessage::BftV2Vote { vote } => {
             shadow_on_vote(vote).await;
@@ -8427,7 +8651,7 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
 
         P2PMessage::BlockProposal { block, transactions, proposer, signature, vrf_ticket, view, proposer_pubkey } => {
             learn_voter_pubkey(&proposer, &proposer_pubkey);
-            note_network_height(block.height);
+            note_network_height_from(block.height, &proposer);
             let our_tip = crate::chain_db::latest_block_info().0;
             let prev_known = block.height <= 1
                 || block.height == our_tip + 1
@@ -8440,7 +8664,7 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
 
         P2PMessage::BlockVote { block_hash, height, voter, signature, timestamp, vrf_ticket, prev_hash, bls_sig, bls_pubkey, voter_pubkey } => {
             learn_voter_pubkey(&voter, &voter_pubkey);
-            note_network_height(height);
+            note_network_height_from(height, &voter);
             let our_height = crate::chain_db::latest_block_info().0;
             let vote_on_our_chain = height == our_height + 1
                 || crate::chain_db::get_block_hash_at(height.saturating_sub(1))
@@ -8503,6 +8727,13 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
 
         P2PMessage::SnapshotResponse { snapshot } => {
             let local_tip = crate::chain_db::latest_block_info().0;
+            if !snapshot_is_from_our_network(&snapshot) {
+                eprintln!(
+                    "[P2PSnapshot] refused a snapshot at height {} — none of its recent blocks were produced by this network's starting committee",
+                    snapshot.height
+                );
+                return;
+            }
             if snapshot.height > local_tip {
                 let h = snapshot.height;
                 let ok = tokio::task::spawn_blocking(move || crate::chain_db::import_state_snapshot(&snapshot))
@@ -9694,6 +9925,42 @@ pub fn snapshot_request_height(my_height: u64) -> u64 {
     my_height.saturating_sub(SNAPSHOT_SERVE_MIN_LAG + 1)
 }
 
+/// Whether a snapshot describes the chain this build belongs to. A node that wipes its
+/// database and restarts is, for a few seconds, far behind every chain on the network,
+/// and will happily adopt whichever one answers first — including one left running by
+/// nodes on older rules. The starting committee is the only thing a fresh node knows
+/// about its own network, so it is what the offer is measured against.
+///
+/// This stops a node joining the wrong chain by accident. It is not a defence against a
+/// deliberate attacker: `LedgerBlock` carries no producer signature, so `miner` is a claim
+/// rather than proof. Signing blocks is what would make this a real boundary.
+fn snapshot_is_from_our_network(snap: &crate::chain_db::StateSnapshot) -> bool {
+    if crate::genesis::addresses().is_empty() {
+        return true;
+    }
+    if snap.blocks.is_empty() {
+        return false;
+    }
+    snap.blocks.iter().any(|b| crate::genesis::is_member(&b.miner))
+}
+
+/// Whether a batch of blocks belongs to the chain this build is part of. Fork choice is
+/// length alone, so a longer chain always wins — and a network left running on older rules
+/// is thousands of blocks ahead of one that just started. Without this, every fresh node
+/// abandons its own chain for whichever stranger answers first, which is how the old
+/// history and its damaged shielded pool keep coming back.
+///
+/// Judged against the starting committee rather than the current one, because the current
+/// one is read from whichever chain we are looking at, and that is the thing in question.
+fn blocks_are_from_our_network(blocks: &[LedgerBlock]) -> bool {
+    if blocks.is_empty() || crate::genesis::addresses().is_empty() {
+        return true;
+    }
+    blocks
+        .iter()
+        .any(|b| b.height == 0 || crate::genesis::is_member(&b.miner))
+}
+
 pub async fn request_snapshot_from_peers(have_height: u64) {
     let my_endpoint = get_public_endpoint().await;
     if my_endpoint.is_empty() { return; }
@@ -9719,6 +9986,32 @@ pub fn peer_chain_is_better(peer_tip: u64, local_tip: u64) -> bool {
     peer_tip > local_tip
 }
 
+/// How far below our tip the next sync request reaches. A fork is only discovered at the
+/// boundary of the batch we asked for, so asking again from the same height returns the
+/// same unusable blocks for as long as the fork lasts. Each failure doubles the reach
+/// until the common ancestor falls inside the window and the chains can rejoin.
+static FORK_WALKBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const FORK_WALKBACK_MAX: u64 = 4_096;
+
+fn widen_fork_walkback() -> u64 {
+    let next = match FORK_WALKBACK.load(Ordering::Relaxed) {
+        0 => 1,
+        cur => cur.saturating_mul(2).min(FORK_WALKBACK_MAX),
+    };
+    FORK_WALKBACK.store(next, Ordering::Relaxed);
+    next
+}
+
+fn clear_fork_walkback() {
+    if FORK_WALKBACK.swap(0, Ordering::Relaxed) != 0 {
+        tracing::info!("[Sync] the chains rejoined; sync is back to following the tip");
+    }
+}
+
+pub fn fork_walkback() -> u64 {
+    FORK_WALKBACK.load(Ordering::Relaxed)
+}
+
 fn merge_remote_chain_blocking(
     mut blocks: Vec<LedgerBlock>,
     transactions: Vec<LedgerTx>,
@@ -9729,10 +10022,14 @@ fn merge_remote_chain_blocking(
         if first.height > 1 {
             if let Some(lph) = crate::chain_db::get_block_hash_at(first.height - 1) {
                 if lph != first.prev_hash {
-                    // We diverged somewhere BEFORE the first block in this set.
-                    // Trigger a deeper sync to find the common ancestor.
-                    tracing::debug!("[P2P] Fork detected at boundary: block #{} prev_hash {} != local #{} hash {}. Syncing...", 
-                        first.height, first.prev_hash, first.height - 1, lph);
+                    // We diverged somewhere BEFORE the first block in this set, so nothing
+                    // here can be applied. Widen the next request instead of asking for the
+                    // same unusable range again.
+                    let reach = widen_fork_walkback();
+                    tracing::warn!(
+                        "[Sync] block #{} does not join our history (its parent is {:.12}, our #{} is {:.12}) — reaching {} block(s) further back to find where the chains split",
+                        first.height, first.prev_hash, first.height - 1, lph, reach
+                    );
                     return (false, true);
                 }
             }
@@ -10026,6 +10323,7 @@ fn merge_remote_chain_blocking(
                 block_txs.truncate(claimed);
             }
             if let Err(reason) = crate::chain_db::validate_peer_block(&block, &block_txs) {
+                note_block_rejected(block.height, &reason);
                 let now = Utc::now().timestamp();
                 let key = (block.height, reason[..reason.len().min(40)].to_string());
                 let mut last_map = BLOCK_REJECT_LAST.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
@@ -10121,9 +10419,19 @@ async fn merge_remote_chain_inner(
     blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: Option<&tauri::AppHandle<tauri::Wry>>,
     trusted: bool,
 ) {
-    if let Some(max_h) = blocks.iter().map(|b| b.height).max() {
-        note_network_height(max_h);
+    if !blocks_are_from_our_network(&blocks) {
+        static LAST_FOREIGN_LOG: AtomicI64 = AtomicI64::new(0);
+        let now = Utc::now().timestamp();
+        if now - LAST_FOREIGN_LOG.swap(now, Ordering::Relaxed) > 30 {
+            let tip = blocks.iter().map(|b| b.height).max().unwrap_or(0);
+            tracing::warn!(
+                "[Sync] ignoring {} block(s) up to height {} — none were produced by this network's starting committee",
+                blocks.len(), tip
+            );
+        }
+        return;
     }
+    note_network_height_from_blocks(&blocks);
     let received_full_chunk = blocks.len() >= 500;
 
     let (any_new, peer_ahead) = tokio::task::spawn_blocking(move || {
@@ -10131,6 +10439,7 @@ async fn merge_remote_chain_inner(
     }).await.unwrap_or((false, false));
 
     if any_new {
+        clear_fork_walkback();
         // If the remote chain advanced past our staged block's height, that block
         // lost fork-choice. Return its TXs to the mempool before it gets discarded.
         let new_tip = crate::chain_db::latest_block_info().0;
@@ -13366,6 +13675,198 @@ pub async fn run_porep_challenge_loop() {
             }
       
         }
+    }
+}
+
+#[cfg(test)]
+mod foreign_chain_tests {
+    fn accepts(committee: &[&str], miners: &[&str], heights: &[u64]) -> bool {
+        if miners.is_empty() || committee.is_empty() {
+            return true;
+        }
+        miners
+            .iter()
+            .zip(heights)
+            .any(|(m, h)| *h == 0 || committee.contains(m))
+    }
+
+    #[test]
+    fn a_build_with_no_starting_committee_accepts_any_chain() {
+        assert!(accepts(&[], &["stranger"], &[29_000]));
+    }
+
+    #[test]
+    fn a_longer_chain_from_strangers_is_still_refused() {
+        assert!(
+            !accepts(&["a", "b", "c"], &["stranger", "stranger"], &[29_000, 29_001]),
+            "length is not identity: a chain our committee never touched is not ours",
+        );
+    }
+
+    #[test]
+    fn our_own_chain_is_accepted_however_short() {
+        assert!(accepts(&["a", "b", "c"], &["a"], &[1]));
+        assert!(accepts(&["a", "b", "c"], &["stranger", "b"], &[40, 41]));
+    }
+
+    #[test]
+    fn genesis_is_accepted_even_though_nobody_mined_it() {
+        assert!(accepts(&["a", "b", "c"], &["system"], &[0]));
+    }
+
+    #[test]
+    fn an_empty_batch_is_not_treated_as_foreign() {
+        assert!(accepts(&["a", "b", "c"], &[], &[]));
+    }
+}
+
+#[cfg(test)]
+mod foreign_snapshot_tests {
+    fn accepts(committee: &[&str], miners: &[&str]) -> bool {
+        if committee.is_empty() {
+            return true;
+        }
+        if miners.is_empty() {
+            return false;
+        }
+        miners.iter().any(|m| committee.contains(m))
+    }
+
+    #[test]
+    fn without_a_starting_committee_any_snapshot_is_allowed() {
+        assert!(accepts(&[], &["stranger"]), "a build with no list has nothing to compare against");
+        assert!(accepts(&[], &[]));
+    }
+
+    #[test]
+    fn a_snapshot_from_another_network_is_refused() {
+        assert!(
+            !accepts(&["a", "b", "c"], &["stranger", "someone_else"]),
+            "a chain none of our committee ever produced is not our chain",
+        );
+    }
+
+    #[test]
+    fn a_snapshot_our_committee_produced_is_accepted() {
+        assert!(accepts(&["a", "b", "c"], &["b"]));
+        assert!(accepts(&["a", "b", "c"], &["stranger", "c", "stranger"]),
+            "one block from our committee is enough to identify the chain");
+    }
+
+    #[test]
+    fn a_snapshot_carrying_no_blocks_proves_nothing_so_it_is_refused() {
+        assert!(!accepts(&["a", "b", "c"], &[]));
+    }
+}
+
+#[cfg(test)]
+mod committee_seating_tests {
+    use std::collections::HashMap;
+
+    fn seated(
+        registered: &[&str],
+        slashed: &[&str],
+        jailed: &[&str],
+        genesis: &[&str],
+        stakes: &[(&str, u64)],
+        floor: u64,
+        allowlist_only: bool,
+    ) -> Vec<String> {
+        let stake: HashMap<&str, u64> = stakes.iter().copied().collect();
+        registered
+            .iter()
+            .filter(|a| !slashed.contains(*a) && !jailed.contains(*a))
+            .filter(|a| !allowlist_only || genesis.is_empty() || genesis.contains(*a))
+            .filter(|a| {
+                genesis.contains(*a) || floor == 0 || stake.get(*a).copied().unwrap_or(0) >= floor
+            })
+            .map(|a| a.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn validation_is_open_to_anyone_who_posts_the_stake() {
+        assert_eq!(
+            seated(&["a", "newcomer"], &[], &[], &["a"], &[("newcomer", 100)], 100, false),
+            vec!["a", "newcomer"],
+            "a stranger who registered and staked holds a seat",
+        );
+    }
+
+    #[test]
+    fn registering_without_stake_earns_no_seat() {
+        assert_eq!(
+            seated(&["a", "freeloader"], &[], &[], &["a"], &[("freeloader", 99)], 100, false),
+            vec!["a"],
+            "the stake floor is what makes an identity cost something",
+        );
+    }
+
+    #[test]
+    fn the_starting_committee_is_seated_before_anyone_can_stake() {
+        assert_eq!(
+            seated(&["a", "b"], &[], &[], &["a", "b"], &[], 100, false),
+            vec!["a", "b"],
+            "the chain has to start before stake can exist",
+        );
+    }
+
+    #[test]
+    fn slashing_and_going_quiet_still_remove_a_seat() {
+        assert_eq!(seated(&["a", "b", "c"], &["b"], &[], &["a", "b", "c"], &[], 0, false), vec!["a", "c"]);
+        assert_eq!(seated(&["a", "b", "c"], &[], &["c"], &["a", "b", "c"], &[], 0, false), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn the_allowlist_can_be_switched_back_on() {
+        assert_eq!(
+            seated(&["a", "newcomer"], &[], &[], &["a"], &[("newcomer", 1_000)], 100, true),
+            vec!["a"],
+            "with the switch on, stake alone no longer buys a seat",
+        );
+    }
+}
+
+#[cfg(test)]
+mod fork_walkback_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn request_height(tip: u64) -> u64 {
+        tip.saturating_sub(1).saturating_sub(fork_walkback()).max(1)
+    }
+
+    #[test]
+    fn a_failed_merge_reaches_further_back_each_time() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fork_walkback();
+        assert_eq!(fork_walkback(), 0, "a healthy node follows the tip");
+        assert_eq!(request_height(100), 99);
+
+        assert_eq!(widen_fork_walkback(), 1);
+        assert_eq!(request_height(100), 98, "the same range is never requested twice");
+        assert_eq!(widen_fork_walkback(), 2);
+        assert_eq!(widen_fork_walkback(), 4);
+        assert_eq!(widen_fork_walkback(), 8);
+        assert_eq!(request_height(100), 91);
+
+        clear_fork_walkback();
+        assert_eq!(request_height(100), 99, "a successful merge goes back to following the tip");
+    }
+
+    #[test]
+    fn the_reach_is_bounded_and_never_asks_below_the_first_block() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        clear_fork_walkback();
+        for _ in 0..64 {
+            widen_fork_walkback();
+        }
+        assert_eq!(fork_walkback(), FORK_WALKBACK_MAX, "the reach stops widening");
+        assert_eq!(request_height(10), 1, "a short chain still asks for a real height");
+        assert_eq!(request_height(0), 1);
+        clear_fork_walkback();
     }
 }
 

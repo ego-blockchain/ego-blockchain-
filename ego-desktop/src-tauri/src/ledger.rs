@@ -581,6 +581,17 @@ pub struct LedgerBlock {
     #[serde(default)]
     pub base_fee_uegoc: u64,
 
+    /// The producer's Ed25519 public key and its signature over `hash`. Without them
+    /// `miner` is only a claim: a `LedgerBlock` arriving over sync carries no proof of who
+    /// built it, so anyone can put another validator's name on their own block. Both sit
+    /// outside `block_hash_for`, which commits to the block's contents rather than its
+    /// authorship, so adding them leaves every existing hash unchanged.
+    #[serde(default)]
+    pub producer_pubkey: String,
+
+    #[serde(default)]
+    pub producer_sig: String,
+
     #[serde(default)]
     pub agg_bls_sig: String,
 
@@ -1021,6 +1032,8 @@ impl Ledger {
             .unwrap_or(0);
         let reward = crate::tokenomics::compute_block_reward(height, tx_fee, &prev_hash);
         self.blocks.push(LedgerBlock {
+            producer_pubkey: String::new(),
+            producer_sig: String::new(),
             height,
             hash,
             prev_hash,
@@ -1071,6 +1084,8 @@ pub const GENESIS_TS: i64     = 1_744_588_800;
 
 pub fn genesis_block() -> LedgerBlock {
     LedgerBlock {
+        producer_pubkey: String::new(),
+        producer_sig: String::new(),
         height:     0,
         hash:       GENESIS_HASH.into(),
         prev_hash:  "0000000000000000000000000000000000000000000000000000000000000000".into(),
@@ -1140,6 +1155,8 @@ impl SharedChain {
         }
 
         self.blocks.push(LedgerBlock {
+            producer_pubkey: String::new(),
+            producer_sig: String::new(),
             height,
             hash,
             prev_hash,
@@ -1206,6 +1223,8 @@ impl SharedChain {
         }
 
         let block = LedgerBlock {
+            producer_pubkey: String::new(),
+            producer_sig: String::new(),
             height,
             hash,
             prev_hash,

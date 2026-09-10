@@ -3087,6 +3087,25 @@ const WalletPage: React.FC = () => {
                         <span className="text-gray-600">
                           {new Date(n.created_at * 1000).toLocaleDateString()}
                         </span>
+                        {n.status === 'spending' && n.spent_tx && (
+                          <button
+                            title="Stop waiting on this send and make the coins spendable again"
+                            onClick={async () => {
+                              try {
+                                const freed = await invoke<number>('shielded_cancel_withdrawal', {
+                                  spentTx: n.spent_tx,
+                                });
+                                setShieldMsg(`Send cancelled — ${freed} note(s) spendable again.`);
+                                refreshShielded();
+                              } catch (err) {
+                                setShieldMsg(String(err).replace(/^.*Error:/, '').trim());
+                              }
+                            }}
+                            className="text-[10px] text-amber-400 hover:text-amber-300 border border-amber-400/40 rounded px-2 py-0.5 transition"
+                          >
+                            Cancel
+                          </button>
+                        )}
                       </div>
                     ))}
                     {spent.map(n => (

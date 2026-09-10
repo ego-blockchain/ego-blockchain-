@@ -218,6 +218,52 @@ pub async fn shielded_forget_note(commitment: String) -> Result<(), EgoDesktopEr
     .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
 }
 
+/// Release notes held by a withdrawal that never reached a block, without waiting out the
+/// abandonment timer. Safe because the chain, not this wallet, decides whether a note is
+/// spent: the nullifier is what forbids spending it twice. If the stuck transaction does
+/// land later, the note returns to "spent" on its own and a retry is simply refused.
+#[tauri::command]
+pub async fn shielded_cancel_withdrawal(spent_tx: String) -> Result<usize, EgoDesktopError> {
+    tokio::task::spawn_blocking(move || {
+        let _g = NOTES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut notes = load_notes()?;
+        if !notes.iter().any(|n| n.spent_tx.as_deref() == Some(spent_tx.as_str())) {
+            return Err(EgoDesktopError::InvalidInput(
+                "No note in this wallet is waiting on that transaction".into(),
+            ));
+        }
+        if crate::chain_db::get_tx_by_hash(&spent_tx).map(|t| t.block_height.is_some()).unwrap_or(false) {
+            return Err(EgoDesktopError::InvalidInput(
+                "That withdrawal is already in a block, so it cannot be cancelled.".into(),
+            ));
+        }
+        let mut released = 0usize;
+        for n in notes.iter_mut() {
+            if n.spent_tx.as_deref() != Some(spent_tx.as_str()) {
+                continue;
+            }
+            if shielded_chain::is_nullifier_spent(&n.note.nullifier()) {
+                return Err(EgoDesktopError::InvalidInput(
+                    "The chain has already recorded that note as spent, so it cannot be cancelled."
+                        .into(),
+                ));
+            }
+            n.spent_tx = None;
+            n.spent_at = None;
+            released += 1;
+        }
+        save_notes(&notes)?;
+        crate::mempool::get_mempool().remove_txs(std::slice::from_ref(&spent_tx));
+        crate::commands::tx_pending::remove(&spent_tx);
+        tracing::warn!(
+            "[Shielded] withdrawal {spent_tx} cancelled by the wallet owner; {released} note(s) are spendable again"
+        );
+        Ok(released)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
+}
+
 #[tauri::command]
 pub async fn shielded_forget_spent() -> Result<usize, EgoDesktopError> {
     tokio::task::spawn_blocking(|| {

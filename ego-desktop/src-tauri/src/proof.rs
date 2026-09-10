@@ -239,8 +239,34 @@ pub const POST_SUSPEND_SECS:        i64 = 7 * 24 * 3600;
 
 /// Called from the background 30-second loop; runs the full check every 6 h.
 /// Pass in the Tauri app handle so we can fire a desktop notification on slash.
+/// How often a node re-proves its storage to the chain. Proofs expire, so a validator that
+/// stops proving loses its seat; this keeps an honest node's evidence current without
+/// filling blocks with proofs.
+const ONCHAIN_PROOF_INTERVAL_SECS: i64 = 3_600;
+static LAST_ONCHAIN_PROOF: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+async fn publish_storage_proofs_if_due() {
+    use std::sync::atomic::Ordering;
+    let now = chrono::Utc::now().timestamp();
+    let last = LAST_ONCHAIN_PROOF.load(Ordering::Relaxed);
+    if last != 0 && now - last < ONCHAIN_PROOF_INTERVAL_SECS {
+        return;
+    }
+    LAST_ONCHAIN_PROOF.store(now, Ordering::Relaxed);
+    match crate::commands::consensus::prove_stored_files().await {
+        Ok(r) if r.proofs_submitted > 0 => {
+            eprintln!("[PoSt] published {} storage proof(s) on-chain", r.proofs_submitted);
+        }
+        Ok(r) if r.failures > 0 => {
+            eprintln!("[PoSt] {} file(s) could not be proved: {}", r.failures, r.details.join("; "));
+        }
+        _ => {}
+    }
+}
+
 pub async fn run_post_checks(app: Option<&tauri::AppHandle<tauri::Wry>>) {
     let now = chrono::Utc::now().timestamp();
+    publish_storage_proofs_if_due().await;
     let mut ledger = crate::ledger::Ledger::load();
     let my_addr = ledger.address.clone();
     if my_addr.is_empty() { return; }

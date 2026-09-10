@@ -62,6 +62,13 @@ pub enum Violation {
         height: u64,
         detail: String,
     },
+
+    StrandedDeposit {
+        height: u64,
+        hash: String,
+        amount_uegoc: u64,
+        reason: String,
+    },
 }
 
 impl Violation {
@@ -70,7 +77,8 @@ impl Violation {
             Violation::SupplyDrift { height, .. }
             | Violation::NegativeBalance { height, .. }
             | Violation::ShieldedPoolMismatch { height, .. }
-            | Violation::OutstandingNotes { height, .. } => *height,
+            | Violation::OutstandingNotes { height, .. }
+            | Violation::StrandedDeposit { height, .. } => *height,
         }
     }
 
@@ -87,6 +95,9 @@ impl Violation {
             ),
             Violation::OutstandingNotes { height, detail } => format!(
                 "block #{height}: shielded note counts are impossible: {detail}"
+            ),
+            Violation::StrandedDeposit { height, hash, amount_uegoc, reason } => format!(
+                "block #{height}: {amount_uegoc} uEGOC reached the shielded pool in {hash} but no note was recorded for it because {reason}"
             ),
         }
     }
