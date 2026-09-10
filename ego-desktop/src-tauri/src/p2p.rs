@@ -1128,12 +1128,24 @@ pub fn committee_source() -> (Vec<String>, bool) {
     let allowlist_only = std::env::var("EGO_VALIDATOR_ALLOWLIST")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let on_chain: Vec<String> = crate::chain_db::registered_validators_sorted()
+    let mut on_chain: Vec<String> = crate::chain_db::registered_validators_sorted()
         .into_iter()
         .filter(|a| !slashed.contains(a) && !jailed.contains(a))
         .filter(|a| !allowlist_only || genesis.is_empty() || genesis.contains(a))
         .filter(|a| genesis.contains(a) || qualifies_for_seat(a))
         .collect();
+    // The starting committee keeps its seats until it is slashed or unseated for going
+    // quiet — registering on-chain is how OTHERS join, not a hurdle the founding members
+    // have to clear again. Without this the committee collapsed to whichever one or two
+    // members happened to register first, every other node seated a different pair, and no
+    // two nodes could agree on whose turn it was to propose.
+    for a in &genesis {
+        if !slashed.contains(a) && !jailed.contains(a) && !on_chain.contains(a) {
+            on_chain.push(a.clone());
+        }
+    }
+    on_chain.sort();
+    on_chain.dedup();
     let min_live = crate::mempool::min_validators_for_finality();
     if on_chain.len() >= min_live {
         // The committee MUST be a function of committed chain state alone. Narrowing it by
@@ -13778,6 +13790,78 @@ mod foreign_snapshot_tests {
     #[test]
     fn a_snapshot_carrying_no_blocks_proves_nothing_so_it_is_refused() {
         assert!(!accepts(&["a", "b", "c"], &[]));
+    }
+}
+
+#[cfg(test)]
+mod committee_membership_tests {
+    use std::collections::HashMap;
+
+    fn seated(
+        registered: &[&str],
+        genesis: &[&str],
+        slashed: &[&str],
+        jailed: &[&str],
+        stakes: &[(&str, u64)],
+        floor: u64,
+    ) -> Vec<String> {
+        let stake: HashMap<&str, u64> = stakes.iter().copied().collect();
+        let mut out: Vec<String> = registered
+            .iter()
+            .filter(|a| !slashed.contains(*a) && !jailed.contains(*a))
+            .filter(|a| {
+                genesis.contains(*a) || floor == 0 || stake.get(*a).copied().unwrap_or(0) >= floor
+            })
+            .map(|a| a.to_string())
+            .collect();
+        for a in genesis {
+            let a = a.to_string();
+            if !slashed.contains(&a.as_str()) && !jailed.contains(&a.as_str()) && !out.contains(&a) {
+                out.push(a);
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn the_committee_never_shrinks_to_whoever_registered_first() {
+        // The bug this pins: with five in the starting committee and two registered, the
+        // seated set became those two. Every node picked a different pair, so none agreed
+        // on whose turn it was and the chain stopped.
+        let five = ["a", "b", "c", "d", "e"];
+        assert_eq!(
+            seated(&["a", "b"], &five, &[], &[], &[], 100).len(),
+            5,
+            "registering is how others join, not a hurdle the founders re-clear",
+        );
+    }
+
+    #[test]
+    fn a_qualified_newcomer_joins_the_starting_committee() {
+        let out = seated(&["a", "newcomer"], &["a", "b"], &[], &[], &[("newcomer", 500)], 100);
+        assert_eq!(out, vec!["a", "b", "newcomer"]);
+    }
+
+    #[test]
+    fn a_newcomer_without_contribution_takes_no_seat() {
+        let out = seated(&["a", "freeloader"], &["a", "b"], &[], &[], &[("freeloader", 1)], 100);
+        assert_eq!(out, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_founding_member_still_loses_its_seat_for_misbehaving_or_going_quiet() {
+        assert_eq!(seated(&[], &["a", "b", "c"], &["b"], &[], &[], 0), vec!["a", "c"]);
+        assert_eq!(seated(&[], &["a", "b", "c"], &[], &["c"], &[], 0), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn every_node_seats_the_same_committee_in_the_same_order() {
+        let one = seated(&["b", "a"], &["c", "a"], &[], &[], &[], 0);
+        let two = seated(&["a", "b"], &["a", "c"], &[], &[], &[], 0);
+        assert_eq!(one, two, "the rota cannot depend on registry or file ordering");
+        assert_eq!(one, vec!["a", "b", "c"]);
     }
 }
 
