@@ -699,6 +699,65 @@ pub fn registered_validators_sorted() -> Vec<String> {
 }
 
 #[cfg(test)]
+mod withdrawal_inclusion_tests {
+    use super::*;
+
+    fn cost_charged(tx: &LedgerTx) -> u64 {
+        if crate::shielded_chain::is_unshield(tx) {
+            tx.amount
+        } else {
+            tx.amount.saturating_add(tx.fee_uegoc)
+        }
+    }
+
+    fn unshield(amount: u64, fee: u64) -> LedgerTx {
+        LedgerTx {
+            from: crate::shielded_chain::SHIELDED_POOL_ADDR.into(),
+            to: "egot1recipient".into(),
+            amount,
+            fee_uegoc: fee,
+            tx_type: crate::shielded_chain::TX_UNSHIELD.into(),
+            ..LedgerTx::default()
+        }
+    }
+
+    #[test]
+    fn a_note_spent_in_full_fits_in_a_block() {
+        // The pool holds exactly what was deposited. A withdrawal takes its fee out of the
+        // note, so asking the pool for amount + fee would leave every full-value spend one
+        // fee short of includable while being perfectly valid.
+        let tx = unshield(1_000_000, 1_000);
+        let pool_balance = 1_000_000u64;
+        assert_eq!(cost_charged(&tx), 1_000_000);
+        assert!(pool_balance >= cost_charged(&tx), "a full note must be spendable");
+    }
+
+    #[test]
+    fn an_ordinary_transfer_still_pays_its_fee_on_top() {
+        let tx = LedgerTx {
+            from: "egot1sender".into(),
+            to: "egot1recipient".into(),
+            amount: 1_000_000,
+            fee_uegoc: 1_000,
+            tx_type: "transfer".into(),
+            ..LedgerTx::default()
+        };
+        assert_eq!(cost_charged(&tx), 1_001_000);
+    }
+
+    #[test]
+    fn a_withdrawal_delivers_the_note_less_its_fee() {
+        let tx = unshield(1_000_000, 1_000);
+        assert_eq!(crate::shielded_chain::credited_to_recipient(&tx), 999_000);
+        assert_eq!(
+            cost_charged(&tx) - crate::shielded_chain::credited_to_recipient(&tx),
+            tx.fee_uegoc,
+            "what leaves the pool minus what reaches the recipient is exactly the fee",
+        );
+    }
+}
+
+#[cfg(test)]
 mod block_producer_tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
@@ -3102,7 +3161,16 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
             let from_bal = sim_balances.get(&tx.from).copied().unwrap_or_else(|| {
                 db.get_cf(cf_bal, tx.from.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
             });
-            let cost = tx.amount.saturating_add(tx.fee_uegoc);
+            // A withdrawal pays its fee out of the note rather than on top of it: the pool
+            // is debited `amount` and the recipient receives `amount - fee`. Charging it
+            // `amount + fee` asks the pool for money no deposit ever put there, so a note
+            // spent in full always came up exactly one fee short and was dropped from the
+            // block without ever being invalid.
+            let cost = if crate::shielded_chain::is_unshield(tx) {
+                tx.amount
+            } else {
+                tx.amount.saturating_add(tx.fee_uegoc)
+            };
             if from_bal < cost {
                 eprintln!("[TX] {:.12} Rejected — insufficient balance for multi-tx batch", tx.hash);
                 return false;
@@ -3113,7 +3181,8 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
                 let to_bal = sim_balances.get(&tx.to).copied().unwrap_or_else(|| {
                     db.get_cf(cf_bal, tx.to.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
                 });
-                sim_balances.insert(tx.to.clone(), to_bal.saturating_add(tx.amount));
+                let credited = crate::shielded_chain::credited_to_recipient(tx);
+                sim_balances.insert(tx.to.clone(), to_bal.saturating_add(credited));
             }
         }
 

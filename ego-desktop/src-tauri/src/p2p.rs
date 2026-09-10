@@ -8739,7 +8739,6 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
         }
 
         P2PMessage::SnapshotResponse { snapshot } => {
-            let local_tip = crate::chain_db::latest_block_info().0;
             if !snapshot_is_from_our_network(&snapshot) {
                 eprintln!(
                     "[P2PSnapshot] refused a snapshot at height {} — none of its recent blocks were produced by this network's starting committee",
@@ -8747,13 +8746,23 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
                 );
                 return;
             }
-            if snapshot.height > local_tip {
-                let h = snapshot.height;
-                let ok = tokio::task::spawn_blocking(move || crate::chain_db::import_state_snapshot(&snapshot))
-                    .await.map(|r| r.is_ok()).unwrap_or(false);
-                if ok {
-                    eprintln!("[P2PSnapshot] checkpoint-synced to height {} from peer (local was {})", h, local_tip);
-                }
+            // One request draws a reply from every peer that has one. Installing them
+            // concurrently writes several different heights' state over each other, and the
+            // shielded pool lives in that state — so the commitment tree ends up a mixture
+            // of three chains and no withdrawal can prove itself against it. Take them one
+            // at a time, and re-check against the tip each time: by the time a reply reaches
+            // the front of the queue, an earlier one has usually made it redundant.
+            static INSTALLING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+            let _guard = INSTALLING.lock().await;
+            let local_tip = crate::chain_db::latest_block_info().0;
+            if snapshot.height <= local_tip {
+                return;
+            }
+            let h = snapshot.height;
+            let ok = tokio::task::spawn_blocking(move || crate::chain_db::import_state_snapshot(&snapshot))
+                .await.map(|r| r.is_ok()).unwrap_or(false);
+            if ok {
+                eprintln!("[P2PSnapshot] checkpoint-synced to height {} from peer (local was {})", h, local_tip);
             }
         }
 
