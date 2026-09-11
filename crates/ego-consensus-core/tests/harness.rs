@@ -581,3 +581,100 @@ fn byzantine_equivocating_proposer_no_fork() {
         finals.len(),
     );
 }
+
+#[test]
+fn a_proposal_is_judged_by_the_round_it_was_made_in() {
+    let net = Net::new(4);
+    let height = 1u64;
+    let ahead = 2u32;
+
+    for e in &net.engines {
+        e.seed_height_round(height, ahead);
+    }
+    let p = (0..net.n())
+        .find(|i| net.engines[*i].is_proposer())
+        .expect("some engine leads round 2");
+
+    let header = net.engines[p]
+        .propose_block(BlockRoots::empty())
+        .expect("propose_block");
+    assert_eq!(header.round, ahead, "the header must record the round it was made in");
+
+    for (i, e) in net.engines.iter().enumerate() {
+        if i != p {
+            e.seed_height_round(height, 0);
+        }
+    }
+    assert_ne!(
+        net.engines[p].proposer_at(height, 0),
+        net.engines[p].proposer_at(height, ahead),
+        "the test is only meaningful if the two rounds elect different leaders",
+    );
+
+    for (i, e) in net.engines.iter().enumerate() {
+        if i == p {
+            continue;
+        }
+        let vote = e.receive_proposal(&header).expect("receive_proposal");
+        assert!(
+            vote.is_some(),
+            "engine {i} sat at round 0 and discarded a valid round-{ahead} proposal; judging the \
+             proposer by the receiver's own round is what stalled the chain",
+        );
+    }
+}
+
+#[test]
+fn a_proposal_from_the_wrong_leader_for_its_own_round_is_still_refused() {
+    let net = Net::new(4);
+    let height = 1u64;
+
+    for e in &net.engines {
+        e.seed_height_round(height, 0);
+    }
+    let p = (0..net.n())
+        .find(|i| net.engines[*i].is_proposer())
+        .expect("some engine leads round 0");
+
+    let mut header = net.engines[p]
+        .propose_block(BlockRoots::empty())
+        .expect("propose_block");
+    header.round = 1;
+
+    for (i, e) in net.engines.iter().enumerate() {
+        if i == p {
+            continue;
+        }
+        assert!(
+            e.receive_proposal(&header).expect("receive_proposal").is_none(),
+            "engine {i} accepted a block claiming a round its author does not lead",
+        );
+    }
+}
+
+#[test]
+fn a_proposal_from_a_round_already_left_behind_is_refused() {
+    let net = Net::new(4);
+    let height = 1u64;
+
+    for e in &net.engines {
+        e.seed_height_round(height, 0);
+    }
+    let p = (0..net.n())
+        .find(|i| net.engines[*i].is_proposer())
+        .expect("some engine leads round 0");
+    let header = net.engines[p]
+        .propose_block(BlockRoots::empty())
+        .expect("propose_block");
+
+    for (i, e) in net.engines.iter().enumerate() {
+        if i == p {
+            continue;
+        }
+        e.seed_height_round(height, 5);
+        assert!(
+            e.receive_proposal(&header).expect("receive_proposal").is_none(),
+            "engine {i} voted on a proposal from a round it had already timed out of",
+        );
+    }
+}

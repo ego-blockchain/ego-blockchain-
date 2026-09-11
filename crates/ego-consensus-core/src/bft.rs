@@ -59,6 +59,7 @@ pub struct BlockHeader {
     pub height: u64,
     pub epoch: u64,
     pub slot: u64,
+    pub round: u32,
     pub prev_hash: Hash,
     pub proposer: Address,
     pub tx_root: Hash,
@@ -99,7 +100,7 @@ impl BlockRoots {
 impl BlockHeader {
     pub fn new(height: u64, epoch: u64, slot: u64, prev_hash: Hash, proposer: Address, r: BlockRoots, vrf_output: Hash, vrf_proof: Vec<u8>) -> Self {
         Self {
-            height, epoch, slot, prev_hash, proposer,
+            height, epoch, slot, round: 0, prev_hash, proposer,
             tx_root: r.tx_root, state_root: r.state_root, receipts_root: r.receipts_root,
             events_root_post: r.events_root_post, events_root_poc: r.events_root_poc,
             rollup_root: r.rollup_root, da_root: r.da_root,
@@ -113,6 +114,7 @@ impl BlockHeader {
     pub fn block_hash(&self) -> Hash {
         hash_multiple(&[
             &self.height.to_le_bytes(), &self.epoch.to_le_bytes(), &self.slot.to_le_bytes(),
+            &self.round.to_le_bytes(),
             self.prev_hash.as_bytes(), self.proposer.as_bytes(),
             self.tx_root.as_bytes(), self.state_root.as_bytes(), self.receipts_root.as_bytes(),
             self.events_root_post.as_bytes(), self.events_root_poc.as_bytes(),
@@ -502,6 +504,7 @@ impl BftEngine {
         let (vrf_output, vrf_proof) = BlockHeader::compute_vrf_output(&self.keypair, epoch, slot);
         self.vrf_outputs.write().unwrap().insert(epoch, vrf_output);
         let mut header = BlockHeader::new(height, epoch, slot, prev_hash, self.address, roots, vrf_output, vrf_proof);
+        header.round = self.current_round.read().unwrap().round;
         header.sign(&self.keypair, self.scheme)?;
 
         self.fork_choice.write().unwrap().add_block(header.clone());
@@ -520,9 +523,22 @@ impl BftEngine {
         if header.height != height { return Ok(None); }
 
         let round = self.current_round.read().unwrap().round;
-        if self.proposer_at(height, round) != Some(&header.proposer) {
-            warn!("Unexpected proposer {}", header.proposer);
+        if header.round < round {
             return Ok(None);
+        }
+        if self.proposer_at(height, header.round) != Some(&header.proposer) {
+            warn!(
+                "Unexpected proposer {} for h={} round={}",
+                header.proposer, header.height, header.round
+            );
+            return Ok(None);
+        }
+        if header.round > round {
+            let mut s = self.current_round.write().unwrap();
+            if s.height == height && s.round < header.round {
+                s.round = header.round;
+                s.advance_phase(RoundPhase::Propose);
+            }
         }
         if !header.verify_signature()? { return Ok(None); }
         if Timestamp::now().as_millis().saturating_sub(header.timestamp.as_millis()) > 30_000 { return Ok(None); }
