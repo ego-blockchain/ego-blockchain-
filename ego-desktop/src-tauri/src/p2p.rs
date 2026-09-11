@@ -10490,6 +10490,12 @@ fn merge_remote_chain_blocking(
     if let Some(max_height) = new_blocks.iter().map(|b| b.height).max() {
         tracing::info!("[Sync] Synced to block #{} — touching proposal timestamp", max_height);
         touch_proposal_timestamp();
+        // A block arriving over sync is the chain making progress just as much as one this
+        // node helped finalize. Only the BFT paths used to say so, so a node that follows
+        // rather than votes reported the chain stalled for as long as it had been running,
+        // and the batch loop reads the same clock: it kept leaving that node's transactions
+        // in the mempool while the chain it was watching moved on without them.
+        LAST_BLOCK_FINALIZED_TS.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
     }
 
     let pool = crate::mempool::get_mempool();
