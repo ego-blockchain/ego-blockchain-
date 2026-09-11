@@ -1302,7 +1302,7 @@ const WalletPage: React.FC = () => {
             ...(shielded?.enabled && shielded?.active ? [{
               label: '🛡 Shield',
               live: false,
-              action: () => { setShieldMsg(null); setShowShield(true); refreshShielded(); },
+              action: () => { setShieldMsg(null); setShowShield(true); refreshShielded(); invoke<{ fee_uegoc: number; fee_usd: number }>('get_tx_fee', { txType: 'transfer' }).then(setTxFee).catch(() => {}); },
             }] : []),
             { label: '⇄ Swap',   live: true,  action: openSwap },
             ...(RAMP_ENABLED ? [{
@@ -2928,9 +2928,16 @@ const WalletPage: React.FC = () => {
                   placeholder="EGOC amount"
                   className="w-full bg-gray-800 border border-gray-700 focus:border-amber-500 rounded-xl px-4 py-3 text-sm outline-none transition"
                 />
-                {parseFloat(shieldAmt) > 0 && (() => {
-                  const { notes, remainder } = splitIntoNotes(parseFloat(shieldAmt));
+                {(() => {
                   const feeEach = (txFee?.fee_uegoc ?? 0) / 1_000_000;
+                  if (!(parseFloat(shieldAmt) > 0)) {
+                    return txFee ? (
+                      <div className="text-xs text-gray-400">
+                        Fee {feeEach.toFixed(4)} EGOC per note, charged on top of the amount.
+                      </div>
+                    ) : null;
+                  }
+                  const { notes, remainder } = splitIntoNotes(parseFloat(shieldAmt));
                   return (
                     <div className="text-xs text-gray-400 space-y-1">
                       <div>{notes.length === 0 ? 'Below the smallest note (1 EGOC).' : `${notes.length} note${notes.length === 1 ? '' : 's'}: ${notes.join(' + ')} EGOC`}</div>
@@ -2994,10 +3001,18 @@ const WalletPage: React.FC = () => {
                     placeholder="Recipient address (egot1…)"
                     className="w-full bg-gray-800 border border-gray-700 focus:border-amber-500 rounded-xl px-4 py-3 text-sm outline-none transition font-mono"
                   />
-                  {parseFloat(shieldSend) > 0 && (() => {
+                  {(() => {
+                    const fee = shielded?.current_fee_uegoc ?? 0;
+                    if (!(parseFloat(shieldSend) > 0)) {
+                      return (
+                        <div className="text-[11px] text-gray-400 leading-relaxed">
+                          Fee {(fee / 1_000_000).toFixed(4)} EGOC, taken out of the amount you send,
+                          so the recipient receives that much less.
+                        </div>
+                      );
+                    }
                     const want = Math.round(parseFloat(shieldSend) * 1_000_000);
                     const picked = pickNotesFor(want);
-                    const fee = shielded?.current_fee_uegoc ?? 0;
                     if (!picked) {
                       const sizes = [...new Set((shielded?.notes ?? [])
                         .filter(n => n.status === 'ready')
