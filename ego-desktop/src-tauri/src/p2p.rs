@@ -1232,7 +1232,12 @@ async fn maybe_reconfigure_committee() {
                 .unwrap_or(0)
         };
         host.seed_height_round(tip, carry);
-        host.set_weights(validator_weights(&committee_source().0));
+        // build_shadow_consensus_host already set these, in the engine's own order. Setting
+        // them again from committee_source gets the order wrong: that list is sorted by
+        // bech32 address while the engine's set is sorted by the Address it derives from a
+        // Dilithium key, and the two orders do not agree. The weights then land on the wrong
+        // members, every node walks the rota differently, and each rejects the others'
+        // proposals as coming from the wrong proposer.
         let (n, q) = (host.validator_set().len(), host.quorum_size());
         *shadow_host_lock() = Some(host);
         v2_future_proposals().clear();

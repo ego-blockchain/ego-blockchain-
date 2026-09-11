@@ -678,3 +678,45 @@ fn a_proposal_from_a_round_already_left_behind_is_refused() {
         );
     }
 }
+
+#[test]
+fn weights_given_in_the_wrong_order_move_the_rota() {
+    let net = Net::new(4);
+    let height = 1u64;
+
+    for e in &net.engines {
+        e.seed_height_round(height, 0);
+    }
+    // Equal weights hide the problem entirely, which is why it survived: the rota only
+    // diverges once contribution actually differs between members.
+    net.engines[0].set_weights(vec![1, 1, 3, 1]);
+    let with_correct_order: Vec<_> = (0..8)
+        .map(|r| net.engines[0].proposer_at(height, r).cloned())
+        .collect();
+
+    // The same weights, two members swapped, which is exactly what handing the engine a
+    // list sorted by wallet address instead of by consensus address does.
+    net.engines[0].set_weights(vec![1, 1, 1, 3]);
+    let with_swapped_order: Vec<_> = (0..8)
+        .map(|r| net.engines[0].proposer_at(height, r).cloned())
+        .collect();
+
+    assert_ne!(
+        with_correct_order, with_swapped_order,
+        "if these agreed, the order weights arrive in would not matter and two nodes could \
+         not disagree about whose turn it is",
+    );
+}
+
+#[test]
+fn equal_weights_elect_the_same_leader_whatever_the_order() {
+    let net = Net::new(4);
+    for e in &net.engines {
+        e.seed_height_round(1, 0);
+    }
+    net.engines[0].set_weights(vec![1, 1, 1, 1]);
+    let a: Vec<_> = (0..8).map(|r| net.engines[0].proposer_at(1, r).cloned()).collect();
+    net.engines[0].set_weights(vec![1, 1, 1, 1]);
+    let b: Vec<_> = (0..8).map(|r| net.engines[0].proposer_at(1, r).cloned()).collect();
+    assert_eq!(a, b, "with nothing to tell members apart the rota is order-independent");
+}
