@@ -142,6 +142,14 @@ const WITHDRAWAL_GRACE_SECS: i64 = 300;
 const WITHDRAWAL_DEAD_SECS: i64 = 1_800;
 
 fn withdrawal_abandoned(spent_tx: &str, spent_at: Option<i64>) -> bool {
+    // Abandonment is decided by a clock, but whether the withdrawal landed is decided by the
+    // chain. A node behind the network has not seen the block that carries it, so letting the
+    // clock win here releases notes the chain has already spent: the owner watches the coins
+    // come back, spends them again, and is told they are gone. While this node is behind, the
+    // honest answer is that it does not know yet.
+    if crate::p2p::network_tip() > crate::chain_db::local_chain_height() {
+        return false;
+    }
     let waited = spent_at
         .map(|t| chrono::Utc::now().timestamp().saturating_sub(t))
         .unwrap_or(i64::MAX);
@@ -236,6 +244,17 @@ pub async fn shielded_cancel_withdrawal(spent_tx: String) -> Result<usize, EgoDe
             return Err(EgoDesktopError::InvalidInput(
                 "That withdrawal is already in a block, so it cannot be cancelled.".into(),
             ));
+        }
+        // Both checks below read this node's own chain, so they only answer "has it landed
+        // here". A node behind the network has not seen the block that carries the
+        // withdrawal, reads both as no, and releases notes the chain has already spent. The
+        // owner then sees the coins returned, sends them again, and is told they are gone.
+        let local = crate::chain_db::local_chain_height();
+        let network = crate::p2p::network_tip();
+        if network > local {
+            return Err(EgoDesktopError::InvalidInput(format!(
+                "This node is at block {local} and the network is at {network}, so it cannot                  yet tell whether that withdrawal was included. Wait for it to catch up before                  cancelling."
+            )));
         }
         let mut released = 0usize;
         for n in notes.iter_mut() {
