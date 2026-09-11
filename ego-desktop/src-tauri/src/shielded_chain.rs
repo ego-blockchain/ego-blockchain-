@@ -771,13 +771,40 @@ pub fn verify_incoming_deposit(tx: &LedgerTx) -> Result<(), String> {
     validate_deposit_in(db, &state, tx, &mut HashSet::new())
 }
 
-pub fn verify_incoming_unshield(tx: &LedgerTx) -> Result<(), String> {
+/// Can this node validate the withdrawal against the pool exactly as it stands now? This
+/// is the question to ask before putting one in a block, because a block is judged by the
+/// pool the committee holds, not by the one the sender held.
+pub fn unshield_is_valid_now(tx: &LedgerTx) -> Result<(), String> {
     if !rule_active_at_tip() {
         return Err("the shielded pool is not active on this chain".into());
     }
     let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
     let state = read_state(db);
     validate_unshield_in(db, &state, tx, &mut HashSet::new())
+}
+
+/// Whether to take a withdrawal off the wire and pass it on.
+///
+/// A root this node has not got is not a bad proof, it is a node that has not finished
+/// reading the chain: the deposit that produced that root is in a block it has yet to
+/// apply. Refusing here does not merely skip the transaction, it stops this node relaying
+/// it, so a withdrawal built on one machine never reaches another sitting a few blocks
+/// behind. From the outside it looks as though shielded transactions do not travel between
+/// machines at all, while working perfectly between nodes that share one.
+///
+/// Passing it on is safe because nothing here decides a block: a proposer asks
+/// `unshield_is_valid_now` and leaves out what it cannot verify.
+pub fn verify_incoming_unshield(tx: &LedgerTx) -> Result<(), String> {
+    match unshield_is_valid_now(tx) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let behind = crate::p2p::network_tip() > chain_db::local_chain_height();
+            if behind && e.contains("a root the pool does not have") {
+                return Ok(());
+            }
+            Err(e)
+        }
+    }
 }
 
 pub fn validate_block_shielded_txs(height: u64, txs: &[LedgerTx]) -> Result<(), String> {

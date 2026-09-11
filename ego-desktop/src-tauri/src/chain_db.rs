@@ -3296,6 +3296,16 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
             // TX was already confirmed by a peer's block, silently drop from mempool
                 return false;
             }
+        // A withdrawal is judged against the pool the committee holds. Relaying one this
+        // node cannot yet check is right; putting it in a block is not, because the block
+        // would be refused and take every transaction beside it down with it. Leave it in
+        // the mempool and propose it once this node has the history to stand behind it.
+        if crate::shielded_chain::is_unshield(tx) {
+            if let Err(e) = crate::shielded_chain::unshield_is_valid_now(tx) {
+                eprintln!("[TX] {:.12} held back from this proposal — {e}", tx.hash);
+                return false;
+            }
+        }
         if tx.nonce == 0 { return true; }
         let last = *sim_nonces.entry(tx.from.clone())
             .or_insert_with(|| crate::ledger::last_confirmed_nonce(&tx.from));
