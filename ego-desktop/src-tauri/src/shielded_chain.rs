@@ -263,6 +263,7 @@ pub fn rebuild_from_chain() -> Result<PoolState, String> {
     let mut leaves: Vec<(u64, [u8; 32])> = Vec::new();
     let mut nullifiers: Vec<[u8; 32]> = Vec::new();
     let mut seen_commitments: HashSet<[u8; 32]> = HashSet::new();
+    let mut seen_nullifiers: HashSet<[u8; 32]> = HashSet::new();
 
     for height in 1..=tip {
         let txs = chain_db::get_txs_for_block(height);
@@ -283,8 +284,21 @@ pub fn rebuild_from_chain() -> Result<PoolState, String> {
                 state.note_added(tx.amount);
             } else if is_unshield(tx) {
                 let Ok(body) = parse_unshield_body(&tx.call_args) else { continue };
+                // A note is spent once, and its nullifier is what says so. Deposits have
+                // been guarded against being replayed twice since the commitment check went
+                // in; withdrawals were not, so a transaction appearing twice in the history
+                // — which a reorg re-including it produces — was subtracted twice while the
+                // pool's address had only been debited once. The pool then reported less
+                // than it held, and every later block re-reported the same gap.
+                let already = body.spends.iter().any(|sp| {
+                    sp.nullifier_bytes().map(|n| seen_nullifiers.contains(&n)).unwrap_or(false)
+                });
+                if already {
+                    continue;
+                }
                 for sp in &body.spends {
                     if let Ok(n) = sp.nullifier_bytes() {
+                        seen_nullifiers.insert(n);
                         nullifiers.push(n);
                     }
                     state.note_spent(sp.amount_uegoc);
