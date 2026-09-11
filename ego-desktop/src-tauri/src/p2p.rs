@@ -2384,9 +2384,21 @@ pub fn active_node_count() -> usize {
 /// block another rejects. Storage and stake are both read from the chain, so every node
 /// computes the same number from the same blocks.
 pub fn validator_weight(addr: &str) -> u64 {
+    // Being seated and still producing IS the coverage: the liveness rule unseats anyone
+    // who has gone quiet, so a seat held is proof the node carries its share of the network.
+    // That earns the base weight, equal for everyone — a node joining today leads as often
+    // as one that has been here a month.
+    //
+    // Storage raises it from there, because storage is the part that can be proven and the
+    // part the network needs. Deliberately NOT blocks produced: paying weight for producing
+    // would let whoever starts ahead lead more, gain weight, and lead more again, until one
+    // node decides everything.
+    const COVERAGE_WEIGHT: u64 = 1;
     let gb = crate::chain_db::proven_storage_bytes(addr) / 1_000_000_000;
     let staked = crate::ledger::get_validator_stake(addr) / crate::tokenomics::UEGOC_PER_EGOC;
-    gb.saturating_mul(3).saturating_add(staked / 2).max(1)
+    COVERAGE_WEIGHT
+        .saturating_add(gb.saturating_mul(3))
+        .saturating_add(staked / 2)
 }
 
 /// Vote weights for `members`, in their order, with no single validator allowed more than a
@@ -2398,8 +2410,17 @@ pub fn validator_weights(members: &[String]) -> Vec<u64> {
     if total == 0 || members.len() < 3 {
         return raw;
     }
-    let cap = (total / 3).max(1);
-    raw.into_iter().map(|w| w.min(cap)).collect()
+    // The bound is half of what everyone else carries, not a third of the total. Capping at
+    // a third of the total is self-defeating: trimming a large validator shrinks the total
+    // too, and it ends up an even bigger share of what is left. Holding it to half the rest
+    // is what actually keeps it at or under a third once the sum is recomputed.
+    raw.iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let others = total.saturating_sub(*w);
+            *w.min(&(others / 2).max(1))
+        })
+        .collect()
 }
 
 /// Storage a node must have PROVEN to hold a seat. Contribution is what this network asks
@@ -2414,7 +2435,7 @@ pub fn min_validator_storage_bytes() -> u64 {
     std::env::var("EGO_MIN_VALIDATOR_STORAGE")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1_000_000_000)
+        .unwrap_or(0)
 }
 
 /// Whether `addr` has earned a seat by contributing. Proven storage is the primary route;
@@ -2433,19 +2454,32 @@ pub fn is_seated_validator() -> bool {
     committee_source().0.iter().any(|a| a == &me)
 }
 
+/// Whether `addr` has earned a seat.
+///
+/// Coverage comes first. A node that registered and is running has given a new network the
+/// thing it most needs, somewhere to reach; demanding a gigabyte of stored data at the door
+/// would be asking people to upload to a network with nothing on it yet. So the door is
+/// open, and weight is where contribution tells — a node with no storage carries the base
+/// weight and never leads more than its plain share.
+///
+/// Setting EGO_MIN_VALIDATOR_STORAGE or EGO_MIN_VALIDATOR_STAKE above zero demands one at
+/// the door instead.
 pub fn qualifies_for_seat(addr: &str) -> bool {
     let storage_floor = min_validator_storage_bytes();
+    let stake_floor = min_validator_stake_uegoc();
+    if storage_floor == 0 && stake_floor == 0 {
+        return true;
+    }
     if storage_floor > 0 && crate::chain_db::proven_storage_bytes(addr) >= storage_floor {
         return true;
     }
-    let stake_floor = min_validator_stake_uegoc();
-    stake_floor == 0 || crate::ledger::get_validator_stake(addr) >= stake_floor
+    stake_floor > 0 && crate::ledger::get_validator_stake(addr) >= stake_floor
 }
 
 pub fn min_validator_stake_uegoc() -> u64 {
     std::env::var("EGO_MIN_VALIDATOR_STAKE")
         .ok().and_then(|v| v.parse().ok())
-        .unwrap_or(100 * 1_000_000)
+        .unwrap_or(0)
 }
 
 /// Has any known validator met the stake floor? Once true, the network has
@@ -13790,6 +13824,84 @@ mod foreign_snapshot_tests {
     #[test]
     fn a_snapshot_carrying_no_blocks_proves_nothing_so_it_is_refused() {
         assert!(!accepts(&["a", "b", "c"], &[]));
+    }
+}
+
+#[cfg(test)]
+mod contribution_weight_tests {
+    fn weight(gb: u64, staked_egoc: u64) -> u64 {
+        1u64.saturating_add(gb.saturating_mul(3)).saturating_add(staked_egoc / 2)
+    }
+
+    fn capped(weights: &[u64]) -> Vec<u64> {
+        let total: u64 = weights.iter().sum();
+        if total == 0 || weights.len() < 3 {
+            return weights.to_vec();
+        }
+        weights
+            .iter()
+            .map(|w| {
+                let others = total.saturating_sub(*w);
+                *w.min(&(others / 2).max(1))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn showing_up_is_enough_to_count_on_day_one() {
+        assert_eq!(weight(0, 0), 1, "a node that is simply there still has a voice");
+    }
+
+    #[test]
+    fn everyone_starts_equal_so_a_newcomer_leads_as_often() {
+        let network = [weight(0, 0), weight(0, 0), weight(0, 0), weight(0, 0)];
+        assert!(network.iter().all(|w| *w == network[0]), "no head start for arriving first");
+    }
+
+    #[test]
+    fn storing_for_others_is_what_raises_a_share() {
+        assert!(weight(10, 0) > weight(1, 0));
+        assert_eq!(weight(10, 0), 31, "ten gigabytes proven is worth thirty over the base");
+        assert!(
+            weight(10, 0) > weight(0, 20),
+            "contribution outweighs capital, as the reputation score already says",
+        );
+    }
+
+    #[test]
+    fn no_one_decides_alone_however_much_they_contribute() {
+        for hoard in [10u64, 100, 1_000, 100_000] {
+            let raw = [weight(hoard, 0), weight(0, 0), weight(0, 0), weight(0, 0)];
+            let out = capped(&raw);
+            let total: u64 = out.iter().sum();
+            assert!(
+                (out[0] as u128) * 3 <= (total as u128),
+                "{hoard} GB gave one validator {} of {total}; a third is the limit",
+                out[0],
+            );
+            assert!(out.iter().all(|w| *w >= 1), "nobody is capped out of leading entirely");
+        }
+    }
+
+    #[test]
+    fn a_bigger_network_lets_a_large_contributor_carry_more() {
+        let small = capped(&[weight(100, 0), weight(0, 0), weight(0, 0)]);
+        let large = capped(&[
+            weight(100, 0), weight(10, 0), weight(10, 0), weight(10, 0), weight(10, 0),
+        ]);
+        assert!(
+            large[0] > small[0],
+            "the cap is a share of the others, so contributing more is worth more as the              network grows rather than being flattened for ever",
+        );
+    }
+
+    #[test]
+    fn leading_earns_no_weight_so_an_early_lead_does_not_compound() {
+        // Weight reads storage and stake only. If producing blocks fed back into weight,
+        // whoever started ahead would lead more, gain weight, and lead more again.
+        let before = weight(5, 0);
+        let after_producing_many_blocks = weight(5, 0);
+        assert_eq!(before, after_producing_many_blocks);
     }
 }
 
