@@ -1128,20 +1128,30 @@ pub fn committee_source() -> (Vec<String>, bool) {
     let allowlist_only = std::env::var("EGO_VALIDATOR_ALLOWLIST")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let mut on_chain: Vec<String> = crate::chain_db::registered_validators_sorted()
+    // The height being decided, and the frozen snapshot it reads from. Deriving the
+    // committee from the height rather than from this node's tip is what lets two nodes at
+    // different tips still agree about who decides a given block.
+    let deciding = crate::chain_db::local_chain_height().saturating_add(1);
+    let boundary = crate::chain_db::committee_epoch_boundary(deciding);
+    let grace = crate::chain_db::genesis_grace_active(deciding);
+    let mut on_chain: Vec<String> = crate::chain_db::registered_validators_as_of(boundary)
         .into_iter()
         .filter(|a| !slashed.contains(a) && !jailed.contains(a))
         .filter(|a| !allowlist_only || genesis.is_empty() || genesis.contains(a))
-        .filter(|a| genesis.contains(a) || qualifies_for_seat(a))
+        .filter(|a| (grace && genesis.contains(a)) || qualifies_for_seat(a))
         .collect();
     // The starting committee keeps its seats until it is slashed or unseated for going
     // quiet — registering on-chain is how OTHERS join, not a hurdle the founding members
     // have to clear again. Without this the committee collapsed to whichever one or two
     // members happened to register first, every other node seated a different pair, and no
     // two nodes could agree on whose turn it was to propose.
-    for a in &genesis {
-        if !slashed.contains(a) && !jailed.contains(a) && !on_chain.contains(a) {
-            on_chain.push(a.clone());
+    // Only while the grace window lasts. After it, being in the genesis file buys nothing:
+    // the founding members register and qualify like anyone else, or they lose the seat.
+    if grace {
+        for a in &genesis {
+            if !slashed.contains(a) && !jailed.contains(a) && !on_chain.contains(a) {
+                on_chain.push(a.clone());
+            }
         }
     }
     on_chain.sort();

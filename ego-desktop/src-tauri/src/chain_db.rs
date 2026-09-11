@@ -534,6 +534,34 @@ fn val_active_key(addr: &str) -> Vec<u8> {
     format!("val_active:{addr}").into_bytes()
 }
 
+fn val_seated_key(addr: &str) -> Vec<u8> {
+    format!("val_seated:{addr}").into_bytes()
+}
+
+/// How long a committee stays fixed. The set that votes on a height is read from a
+/// snapshot taken at an earlier boundary, never from whatever a node happens to hold
+/// right now: two nodes at different tips hold different state, so a committee derived
+/// from "now" differs between them, they elect different proposers and reject each
+/// other's blocks. Freezing the input is how Solana's leader schedule, Filecoin's power
+/// table and Helium's epochs all avoid the same failure.
+pub const COMMITTEE_EPOCH: u64 = 100;
+
+/// How long being named in the genesis file is worth anything. After this the founding
+/// members register and qualify on the same terms as everyone else, so the bootstrap
+/// committee cannot quietly become a permanent authority.
+pub const GENESIS_GRACE_BLOCKS: u64 = 10_000;
+
+/// The snapshot a decision at `height` reads from. A node deciding `height` has applied
+/// every block below it, so it necessarily holds this snapshot, which is what makes the
+/// committee a pure function of the height rather than of local progress.
+pub fn committee_epoch_boundary(height: u64) -> u64 {
+    (height.saturating_sub(1) / COMMITTEE_EPOCH) * COMMITTEE_EPOCH
+}
+
+pub fn genesis_grace_active(height: u64) -> bool {
+    height <= GENESIS_GRACE_BLOCKS
+}
+
 fn val_jailed_key(addr: &str) -> Vec<u8> {
     format!("val_jailed:{addr}").into_bytes()
 }
@@ -680,6 +708,34 @@ pub fn proven_storage_bytes(addr: &str) -> u64 {
         .map(|v| read_u64_le(&v))
         .unwrap_or(0);
     proven_storage_bytes_in(db, addr, tip)
+}
+
+/// Validators seated at or before `boundary`. Anyone who registered after it waits for
+/// the next epoch, so a node that has just seen a registration cannot start using a
+/// committee its peers have not reached yet.
+pub fn registered_validators_as_of(boundary: u64) -> Vec<String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    backfill_bls_registry(&db);
+    let Some(cf) = db.cf_handle(CF_META) else { return Vec::new(); };
+    let mut set = std::collections::BTreeSet::new();
+    for item in db.prefix_iterator_cf(cf, b"bls_reg:") {
+        let Ok((k, v)) = item else { break };
+        if !k.starts_with(b"bls_reg:") { break; }
+        let Ok(addr) = String::from_utf8(v.to_vec()) else { continue };
+        if addr.is_empty() { continue; }
+        // A registration from a build that predates seating heights reads as height 0, so
+        // it counts everywhere rather than vanishing from committees that already had it.
+        let seated = db
+            .get_cf(cf, val_seated_key(&addr))
+            .ok()
+            .flatten()
+            .and_then(|b| b.get(..8).map(|x| u64::from_le_bytes(x.try_into().unwrap())))
+            .unwrap_or(0);
+        if seated <= boundary {
+            set.insert(addr);
+        }
+    }
+    set.into_iter().collect()
 }
 
 pub fn registered_validators_sorted() -> Vec<String> {
@@ -1580,6 +1636,12 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
 
         if let Some((addr, bls_hex)) = parse_validator_registration(tx) {
             batch.put_cf(cf_meta, bls_reg_key(&bls_hex), addr.as_bytes());
+            // First seating only. Re-registering to leave jail must not move a validator
+            // forward into a later epoch, or it would drop out of the snapshot that the
+            // committee deciding this height already agreed on.
+            if db.get_cf(cf_meta, val_seated_key(&addr)).ok().flatten().is_none() {
+                batch.put_cf(cf_meta, val_seated_key(&addr), u64_le(block.height));
+            }
             // Registering again is how a validator that went quiet rejoins: it clears the
             // jail mark and restarts its liveness clock.
             batch.delete_cf(cf_meta, val_jailed_key(&addr));
@@ -7136,5 +7198,65 @@ mod wallet_notification_tests {
     fn long_addresses_are_shortened_for_the_toast() {
         assert_eq!(short_addr(ME), "egot1me000…0000");
         assert_eq!(short_addr("egot1short"), "egot1short");
+    }
+}
+
+#[cfg(test)]
+mod committee_epoch_tests {
+    use super::*;
+
+    #[test]
+    fn a_height_reads_a_snapshot_it_has_already_applied() {
+        for height in 1..=(COMMITTEE_EPOCH * 3 + 7) {
+            let boundary = committee_epoch_boundary(height);
+            assert!(
+                boundary < height,
+                "height {height} would read a snapshot at {boundary} that it has not applied yet",
+            );
+            assert_eq!(boundary % COMMITTEE_EPOCH, 0, "snapshots are only taken on boundaries");
+        }
+    }
+
+    #[test]
+    fn every_height_in_one_epoch_reads_the_same_snapshot() {
+        let first = COMMITTEE_EPOCH + 1;
+        let last = COMMITTEE_EPOCH * 2;
+        let boundary = committee_epoch_boundary(first);
+        for h in first..=last {
+            assert_eq!(
+                committee_epoch_boundary(h),
+                boundary,
+                "the committee must not change inside an epoch, or nodes switch at different heights",
+            );
+        }
+        assert_ne!(
+            committee_epoch_boundary(last + 1),
+            boundary,
+            "and it must change at the boundary, or newcomers could never take a seat",
+        );
+    }
+
+    #[test]
+    fn two_nodes_deciding_the_same_height_agree_whatever_their_tips() {
+        let deciding = COMMITTEE_EPOCH * 2 + 43;
+        assert_eq!(
+            committee_epoch_boundary(deciding),
+            committee_epoch_boundary(deciding),
+            "the snapshot is a function of the height alone, never of local progress",
+        );
+        assert_ne!(
+            committee_epoch_boundary(deciding),
+            committee_epoch_boundary(deciding + COMMITTEE_EPOCH),
+        );
+    }
+
+    #[test]
+    fn the_genesis_seat_expires() {
+        assert!(genesis_grace_active(1));
+        assert!(genesis_grace_active(GENESIS_GRACE_BLOCKS));
+        assert!(
+            !genesis_grace_active(GENESIS_GRACE_BLOCKS + 1),
+            "past the window the founding members hold seats by contribution or not at all",
+        );
     }
 }
