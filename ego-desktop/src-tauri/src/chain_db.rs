@@ -4188,6 +4188,15 @@ pub fn delete_full_blocks_for_shard(shard_id: u32, shard_count: u32) {
     if crate::p2p::is_seated_validator() {
         return;
     }
+    // A node holding shielded state needs the blocks that state was built from. The rebuild
+    // that checks the pool against the chain refuses to run on a history with holes, and it
+    // is right to: replaying a pruned history silently undercounts the pool. But refusing
+    // leaves the pool unverifiable for ever, its withdrawals never validate, and the coins
+    // look sent while reaching nobody. Storage sharding is for nodes serving files, not for
+    // one that is also a shielded wallet.
+    if crate::shielded_chain::state().next_index > 0 {
+        return;
+    }
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let cf_blocks    = db.cf_handle(CF_BLOCKS).unwrap();
     let cf_block_txs = db.cf_handle(CF_BLOCK_TXS).unwrap();
