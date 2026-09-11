@@ -177,6 +177,36 @@ mod tests {
     }
 
     #[test]
+    fn every_shipped_seat_is_one_a_real_node_can_fill() {
+        let list = parse(BAKED_IN);
+        if list.is_empty() {
+            return;
+        }
+        const DILITHIUM2_PUBKEY_BYTES: usize = 1312;
+        let mut engine = Vec::new();
+        for v in &list {
+            let key = hex::decode(&v.dilithium_pubkey).expect("checked by parse");
+            assert_eq!(
+                key.len(),
+                DILITHIUM2_PUBKEY_BYTES,
+                "seat {} carries a {}-byte key, so no node can ever prove it owns that seat and                  the committee is permanently one vote short of quorum",
+                v.address,
+                key.len(),
+            );
+            assert!(v.address.starts_with("egot1") || v.address.starts_with("ego1"), "{}", v.address);
+            engine.push(format!("{}", crate::consensus_host::address_from_dilithium(key)));
+        }
+        let mut distinct = engine.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            engine.len(),
+            "two seats resolve to the same engine identity, so the committee is smaller than it              counts itself and quorum is unreachable",
+        );
+    }
+
+    #[test]
     fn an_empty_list_means_no_starting_committee() {
         assert!(parse("").is_empty());
         assert!(parse("[]").is_empty());
@@ -230,3 +260,5 @@ mod tests {
         assert_eq!(list[0].dilithium_pubkey, "aabb");
     }
 }
+
+
