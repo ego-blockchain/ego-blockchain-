@@ -1672,13 +1672,21 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     batch.put_cf(cf_blocks, height_k, encode(block));
 
     // Transactions + all secondary indices.
-    for tx in &confirmed_txs {
+    for (ordinal, tx) in confirmed_txs.iter().enumerate() {
         let already_exists = db.get_cf(cf_txs, tx.hash.as_bytes()).ok().flatten().is_some();
         if already_exists {
             continue;
         }
         batch.put_cf(cf_txs,        tx.hash.as_bytes(), encode(tx));
-        batch.put_cf(cf_block_txs,  block_txs_key(block.height, &tx.hash), b"");
+        // The position this transaction held in the block. The index is keyed by hash, so
+        // reading it back gives hash order, not block order — and anything that replays a
+        // block to rebuild ordered state, the shielded commitment tree above all, then
+        // builds a different tree from the same leaves and lands on a different root.
+        batch.put_cf(
+            cf_block_txs,
+            block_txs_key(block.height, &tx.hash),
+            (ordinal as u32).to_be_bytes(),
+        );
 
         // On-chain BLS validator registry: bind (address ↔ BLS key) the moment a
         // verified validator_register tx commits, atomically with the block, so
@@ -2710,22 +2718,30 @@ pub fn get_txs_for_block(height: u64) -> Vec<LedgerTx> {
     let cf_txs       = db.cf_handle(CF_TXS).unwrap();
     let prefix       = height_key(height);
 
-    let mut out = Vec::new();
+    let mut out: Vec<(u32, LedgerTx)> = Vec::new();
     let iter = db.prefix_iterator_cf(cf_block_txs, prefix);
     for item in iter {
-        let Ok((key, _)) = item else { continue };
+        let Ok((key, val)) = item else { continue };
         if !key.starts_with(&prefix) { break; }
         if key.len() <= 8 { continue; }
         let tx_hash = std::str::from_utf8(&key[8..]).unwrap_or("");
         if tx_hash.is_empty() { continue; }
+        // Blocks written before positions were recorded read as 0 and keep the order the
+        // index gives them, which is what they have always had.
+        let ordinal = val
+            .get(..4)
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            .map(u32::from_be_bytes)
+            .unwrap_or(0);
         if let Some(mut tx) = db.get_cf(cf_txs, tx_hash.as_bytes()).ok().flatten()
             .and_then(|v| decode::<LedgerTx>(&v))
         {
             tx.status = "Confirmed".to_string();
-            out.push(tx);
+            out.push((ordinal, tx));
         }
     }
-    out
+    out.sort_by_key(|(ordinal, _)| *ordinal);
+    out.into_iter().map(|(_, tx)| tx).collect()
 }
 
 /// Full transaction history for an address, ordered by timestamp ascending.
@@ -4478,7 +4494,7 @@ pub fn apply_missing_tx(block_height: u64, tx: &LedgerTx) {
     let mut batch = WriteBatch::default();
 
     batch.put_cf(cf_txs,        tx.hash.as_bytes(), encode(tx));
-    batch.put_cf(cf_block_txs,  block_txs_key(block_height, &tx.hash), b"");
+    batch.put_cf(cf_block_txs,  block_txs_key(block_height, &tx.hash), 0u32.to_be_bytes());
     
     let is_spammy = tx.from == NODE_POOL_ADDR 
         && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward");

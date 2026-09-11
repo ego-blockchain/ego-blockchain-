@@ -1755,3 +1755,68 @@ mod tests {
         std::env::remove_var("EGO_SHIELDED_POOL_HEIGHT");
     }
 }
+
+#[cfg(test)]
+mod replay_order_tests {
+    use super::*;
+
+    /// The commitment tree is ordered, so replaying a block's deposits in a different order
+    /// than they were applied yields the same leaves under a different root. A withdrawal is
+    /// anchored to the root the wallet saw, so once a rebuild moves the root the spend can
+    /// never be validated again and sits pending for ever. This is the property that broke:
+    /// the block index is keyed by transaction hash, and reading it back gave hash order
+    /// while the live pool had used block order.
+    #[test]
+    fn the_same_deposits_in_another_order_do_not_rebuild_the_same_root() {
+        // Deliberately not in sorted order, because that is the whole point: the index the
+        // rebuild reads is keyed by hash, so it hands them back sorted.
+        let commitments: Vec<[u8; 32]> = [5u8, 3, 6, 1, 4, 2].iter().map(|i| [*i; 32]).collect();
+
+        let mut applied = PoolState::empty();
+        for c in &commitments {
+            applied.insert(leaf_for(c, 1_000_000)).unwrap();
+        }
+
+        let mut by_hash = commitments.clone();
+        by_hash.sort();
+        assert_ne!(by_hash, commitments, "the test needs the two orders to differ");
+
+        let mut replayed = PoolState::empty();
+        for c in &by_hash {
+            replayed.insert(leaf_for(c, 1_000_000)).unwrap();
+        }
+
+        assert_eq!(
+            applied.next_index, replayed.next_index,
+            "the same deposits are the same count either way, which is why the leaf count \
+             looked healthy while the root had moved",
+        );
+        assert_ne!(
+            applied.root, replayed.root,
+            "if these matched, order would not matter and there would be nothing to fix",
+        );
+        assert!(
+            !replayed.is_known_root(&applied.root),
+            "a withdrawal anchored to the applied root is unspendable against the replayed tree",
+        );
+    }
+
+    #[test]
+    fn replaying_in_the_applied_order_lands_on_the_same_root() {
+        let commitments: Vec<[u8; 32]> = [5u8, 3, 6, 1, 4, 2].iter().map(|i| [*i; 32]).collect();
+        let build = |order: &[[u8; 32]]| {
+            let mut s = PoolState::empty();
+            for c in order {
+                s.insert(leaf_for(c, 1_000_000)).unwrap();
+            }
+            s
+        };
+        let applied = build(&commitments);
+        let replayed = build(&commitments);
+        assert_eq!(applied.root, replayed.root);
+        assert!(
+            replayed.is_known_root(&applied.root),
+            "a withdrawal anchored before the rebuild still validates after it",
+        );
+    }
+}
