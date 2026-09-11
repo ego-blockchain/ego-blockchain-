@@ -1246,7 +1246,7 @@ fn main() {
 
                 crate::p2p::dht_discover_relays().await;
 
-                let peers = crate::p2p::get_known_peers();
+                let peers = crate::p2p::get_live_peers();
                 let ledger_addr = { let l = crate::ledger::Ledger::load(); l.address };
                 crate::sharding::run_shard_startup(&ledger_addr, &my_endpoint, &peers, 0).await;
                 crate::p2p::broadcast_shard_announce().await;
@@ -1356,7 +1356,7 @@ fn main() {
                         bounded!(90, crate::p2p::push_snapshot_to_oracle());
                     }
 
-                    let shard_peers = crate::p2p::get_known_peers();
+                    let shard_peers = crate::p2p::get_live_peers();
                     let ledger_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
                         .await.unwrap_or_default();
                     let endpoint = crate::p2p::get_public_endpoint().await;

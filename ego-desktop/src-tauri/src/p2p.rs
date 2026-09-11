@@ -5179,6 +5179,26 @@ pub fn get_known_peers() -> Vec<String> {
         .collect()
 }
 
+/// How recently a peer must have been heard from to count as part of the network right now.
+/// Matches the window the shard map already uses to keep an assignment.
+pub const PEER_LIVENESS_SECS: i64 = 600;
+
+/// Peers actually present, rather than every peer this node remembers.
+///
+/// The cache holds a month of addresses so a node can find its way back after a break, which
+/// is the right memory for dialling and the wrong one for counting. Sizing the network by it
+/// meant a handful of live nodes were measured as dozens, and anything that scales with the
+/// network scaled to a crowd that had long since gone.
+pub fn get_live_peers() -> Vec<String> {
+    let cutoff = Utc::now().timestamp() - PEER_LIVENESS_SECS;
+    load_peer_cache()
+        .into_iter()
+        .filter(|p| p.last_seen >= cutoff)
+        .map(|p| p.address)
+        .filter(|a| !a.is_empty())
+        .collect()
+}
+
 static KNOWN_NODE_URLS: std::sync::OnceLock<std::sync::RwLock<Vec<String>>> =
     std::sync::OnceLock::new();
 

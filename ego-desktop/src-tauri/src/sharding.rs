@@ -454,3 +454,28 @@ pub fn get_shard_status() -> serde_json::Value {
         "updated_at":          map.updated_at,
     })
 }
+
+#[cfg(test)]
+mod node_count_tests {
+    use super::*;
+
+    /// The shard count steps from one to two hundred and fifty six in a single move, so the
+    /// number fed to it decides everything. Counting every peer a node remembers rather than
+    /// the ones present tips a handful of live nodes over the threshold and splits their
+    /// transactions two hundred and fifty six ways.
+    #[test]
+    fn the_threshold_is_a_cliff_so_the_count_has_to_be_the_live_one() {
+        assert_eq!(compute_shard_count(4), 1, "four live nodes need no sharding at all");
+        assert_eq!(compute_shard_count(50), 1);
+        assert_eq!(
+            compute_shard_count(51),
+            256,
+            "one peer past the line and every sender's transactions are split 256 ways",
+        );
+        assert_eq!(
+            compute_shard_count(63),
+            256,
+            "which is what a month of remembered addresses added up to while four nodes ran",
+        );
+    }
+}
