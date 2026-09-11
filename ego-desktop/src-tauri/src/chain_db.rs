@@ -1701,10 +1701,13 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
 
     // Transactions + all secondary indices.
     for (ordinal, tx) in confirmed_txs.iter().enumerate() {
-        let already_exists = db.get_cf(cf_txs, tx.hash.as_bytes()).ok().flatten().is_some();
-        if already_exists {
-            continue;
-        }
+        // A block has to appear in its own transaction index, whatever else is true of the
+        // transactions in it. One already in the store — which is what a reorg re-including
+        // it produces — used to skip this entirely, so the block was committed while its
+        // index named fewer transactions than the block claims. get_txs_for_block then
+        // served an incomplete set and every peer refused the block as a tx_count mismatch,
+        // permanently, because the shortfall is recomputed from the same index every time.
+        // Rewriting the record also moves block_height onto the block it now belongs to.
         batch.put_cf(cf_txs,        tx.hash.as_bytes(), encode(tx));
         // The position this transaction held in the block. The index is keyed by hash, so
         // reading it back gives hash order, not block order — and anything that replays a
@@ -1715,6 +1718,10 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
             block_txs_key(block.height, &tx.hash),
             (ordinal as u32).to_be_bytes(),
         );
+        // Everything below is applied once per transaction, not once per inclusion.
+        if already_committed.contains(tx.hash.as_str()) {
+            continue;
+        }
 
         // On-chain BLS validator registry: bind (address ↔ BLS key) the moment a
         // verified validator_register tx commits, atomically with the block, so
@@ -7385,3 +7392,51 @@ mod committee_epoch_tests {
     }
 }
 
+
+#[cfg(test)]
+mod block_index_tests {
+    use super::*;
+
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A block must appear in its own transaction index even when it carries a transaction
+    /// the store has already seen, which is what a reorg re-including one produces. If it
+    /// does not, get_txs_for_block serves fewer transactions than the block claims and every
+    /// peer refuses it as a tx_count mismatch, for ever.
+    #[test]
+    fn a_reincluded_transaction_still_indexes_under_its_new_block() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let base = 700_000_000 + (std::process::id() as u64 % 997) * 100;
+
+        let tx = LedgerTx {
+            hash: format!("0xreinclude{base}"),
+            from: "egot1sender".into(),
+            to: "egot1recipient".into(),
+            amount: 1_000,
+            tx_type: "transfer".into(),
+            ..LedgerTx::default()
+        };
+        let mk = |height: u64, tag: &str| LedgerBlock {
+            height,
+            hash: format!("{tag}{height:0>56}"),
+            prev_hash: "cc".repeat(32),
+            miner: "egot1miner".into(),
+            timestamp: 1_700_000_000 + height as i64,
+            tx_count: 1,
+            ..LedgerBlock::default()
+        };
+
+        write_block_batch(db, &mk(base, "aa"), std::slice::from_ref(&tx));
+        assert_eq!(get_txs_for_block(base).len(), 1, "the first inclusion indexes normally");
+
+        // The same transaction turns up again in a later block.
+        write_block_batch(db, &mk(base + 1, "bb"), std::slice::from_ref(&tx));
+        assert_eq!(
+            get_txs_for_block(base + 1).len(),
+            1,
+            "a block that claims one transaction must serve one, or peers reject it as a \
+             tx_count mismatch and the chain cannot move past it",
+        );
+    }
+}
