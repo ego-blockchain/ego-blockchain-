@@ -2394,19 +2394,23 @@ pub fn active_node_count() -> usize {
 /// block another rejects. Storage and stake are both read from the chain, so every node
 /// computes the same number from the same blocks.
 pub fn validator_weight(addr: &str) -> u64 {
-    // Being seated and still producing IS the coverage: the liveness rule unseats anyone
-    // who has gone quiet, so a seat held is proof the node carries its share of the network.
-    // That earns the base weight, equal for everyone — a node joining today leads as often
-    // as one that has been here a month.
+    // Holding a seat earns the base weight, equal for everyone, so a node joining today
+    // leads as often as one that has been here a month.
     //
     // Storage raises it from there, because storage is the part that can be proven and the
     // part the network needs. Deliberately NOT blocks produced: paying weight for producing
     // would let whoever starts ahead lead more, gain weight, and lead more again, until one
     // node decides everything.
-    const COVERAGE_WEIGHT: u64 = 1;
+    const SEATED_WEIGHT: u64 = 1;
+    // Coverage is what a node can prove on day one, before anybody has uploaded a byte:
+    // peers witness its beacon and those receipts are committed on-chain. This is the part
+    // that lets a network with no storage customers still weigh its validators by
+    // contribution rather than by who arrived first.
+    let witnesses = crate::chain_db::proven_witnesses(addr);
     let gb = crate::chain_db::proven_storage_bytes(addr) / 1_000_000_000;
     let staked = crate::ledger::get_validator_stake(addr) / crate::tokenomics::UEGOC_PER_EGOC;
-    COVERAGE_WEIGHT
+    SEATED_WEIGHT
+        .saturating_add(witnesses)
         .saturating_add(gb.saturating_mul(3))
         .saturating_add(staked / 2)
 }

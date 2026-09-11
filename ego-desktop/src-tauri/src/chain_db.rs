@@ -700,6 +700,45 @@ fn proven_storage_bytes_in(db: &DB, addr: &str, tip: u64) -> u64 {
 
 /// How much storage `addr` has proven it still holds, summed over the files it proved and
 /// counting only proofs recent enough to mean anything.
+fn coverage_proof_key(addr: &str) -> Vec<u8> {
+    format!("poc_proof:{addr}").into_bytes()
+}
+
+fn record_coverage_proof(batch: &mut WriteBatch, db: &DB, addr: &str, witnesses: u64, height: u64) {
+    let Some(cf) = db.cf_handle(CF_META) else { return };
+    let mut v = Vec::with_capacity(16);
+    v.extend_from_slice(&witnesses.to_le_bytes());
+    v.extend_from_slice(&height.to_le_bytes());
+    batch.put_cf(cf, coverage_proof_key(addr), v);
+}
+
+fn proven_witnesses_in(db: &DB, addr: &str, tip: u64) -> u64 {
+    let Some(cf) = db.cf_handle(CF_META) else { return 0 };
+    let Some(v) = db.get_cf(cf, coverage_proof_key(addr)).ok().flatten() else { return 0 };
+    if v.len() < 16 { return 0; }
+    let witnesses = u64::from_le_bytes(v[..8].try_into().unwrap_or([0; 8]));
+    let height = u64::from_le_bytes(v[8..16].try_into().unwrap_or([0; 8]));
+    // Coverage is a claim about being reachable now, so an old proof stops counting for the
+    // same reason a stale storage proof does: otherwise a node proves once and coasts.
+    if tip.saturating_sub(height) <= crate::coverage_proof::PROOF_VALID_FOR {
+        witnesses
+    } else {
+        0
+    }
+}
+
+/// How many distinct peers have lately witnessed this node's beacon, from committed chain
+/// state rather than gossip, so every node scores it identically.
+pub fn proven_witnesses(addr: &str) -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let tip = db
+        .cf_handle(CF_META)
+        .and_then(|cf| db.get_cf(cf, META_LATEST_HEIGHT).ok().flatten())
+        .map(|v| read_u64_le(&v))
+        .unwrap_or(0);
+    proven_witnesses_in(db, addr, tip)
+}
+
 pub fn proven_storage_bytes(addr: &str) -> u64 {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let tip = db
@@ -1631,6 +1670,15 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         if tx.tx_type == crate::storage_proof::POST_PROOF_TX {
             if let Ok(body) = crate::storage_proof::parse_body(&tx.call_args) {
                 record_storage_proof(&mut batch, &db, &tx.from, &body.cid, body.bytes_proven(), block.height);
+            }
+        }
+
+        if tx.tx_type == crate::coverage_proof::POC_PROOF_TX {
+            let tip = block.height.saturating_sub(1);
+            if let Ok(witnesses) =
+                crate::coverage_proof::validate_against_chain(tx, tip, get_block_hash_at)
+            {
+                record_coverage_proof(&mut batch, &db, &tx.from, witnesses, block.height);
             }
         }
 
@@ -3925,6 +3973,13 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
     for tx in txs.iter().filter(|t| t.tx_type == crate::storage_proof::POST_PROOF_TX) {
         crate::storage_proof::validate_against_chain(tx, block.height.saturating_sub(1), get_block_hash_at)
             .map_err(|e| format!("storage proof {} rejected: {e}", tx.hash))?;
+    }
+    // A coverage proof is checked the same way, and for the same reason: the beacon is
+    // derived from a committed block hash, so a prover cannot answer a question it set
+    // itself, and every node reaches the same verdict without an oracle.
+    for tx in txs.iter().filter(|t| t.tx_type == crate::coverage_proof::POC_PROOF_TX) {
+        crate::coverage_proof::validate_against_chain(tx, block.height.saturating_sub(1), get_block_hash_at)
+            .map_err(|e| format!("coverage proof {} rejected: {e}", tx.hash))?;
     }
     crate::shielded_chain::validate_block_shielded_txs(block.height, txs)?;
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());

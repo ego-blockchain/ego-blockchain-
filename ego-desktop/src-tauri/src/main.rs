@@ -12,6 +12,7 @@ mod scale;
 mod shielded;
 mod shielded_chain;
 mod storage_proof;
+mod coverage_proof;
 mod sideband;
 mod sideband_spool;
 mod bft_committee;
