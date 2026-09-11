@@ -593,6 +593,34 @@ fn jailed_validators_in(db: &DB) -> std::collections::HashSet<String> {
 }
 
 /// Validators the chain has stopped seating for going quiet. Re-registering rejoins.
+/// Who was jailed at or before `boundary`. A jail mark records the height it was made at,
+/// and the committee for a height has to be a function of that height alone: if one node
+/// unseats a validator the moment it notices and its peers have not yet, their committees
+/// differ in length, every index after the gap shifts, and each rejects the other's
+/// proposals as coming from the wrong proposer.
+pub fn jailed_validators_as_of(boundary: u64) -> std::collections::HashSet<String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = std::collections::HashSet::new();
+    let Some(cf) = db.cf_handle(CF_META) else { return out };
+    for item in db.prefix_iterator_cf(cf, b"val_jailed:") {
+        let Ok((k, v)) = item else { break };
+        if !k.starts_with(b"val_jailed:") { break; }
+        let Ok(addr) = std::str::from_utf8(&k[b"val_jailed:".len()..]) else { continue };
+        if addr.is_empty() { continue; }
+        // A mark from a build that did not record heights reads as 0, so it counts
+        // everywhere rather than appearing at different heights on different nodes.
+        let at = v
+            .get(..8)
+            .and_then(|b| <[u8; 8]>::try_from(b).ok())
+            .map(u64::from_le_bytes)
+            .unwrap_or(0);
+        if at <= boundary {
+            out.insert(addr.to_string());
+        }
+    }
+    out
+}
+
 pub fn jailed_validators() -> std::collections::HashSet<String> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     jailed_validators_in(db)

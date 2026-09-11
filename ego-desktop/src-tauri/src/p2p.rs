@@ -1111,7 +1111,13 @@ pub fn committee_source() -> (Vec<String>, bool) {
     let slashed = slashed_validators();
     // Both filters come from committed chain state, so every node applying the same blocks
     // seats the same committee.
-    let jailed = crate::chain_db::jailed_validators();
+    // Read as of the boundary, not as of now, for the same reason the registered set is:
+    // the committee deciding a height must not depend on when this node noticed something.
+    let jailed = crate::chain_db::jailed_validators_as_of(
+        crate::chain_db::committee_epoch_boundary(
+            crate::chain_db::local_chain_height().saturating_add(1),
+        ),
+    );
     // Registering is open to anyone running the software. While a starting list exists it
     // also names who may hold a seat: an unknown node on older rules that registers and
     // then proposes on a chain nobody else has is enough to stop the network agreeing on
