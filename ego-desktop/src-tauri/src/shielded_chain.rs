@@ -267,6 +267,20 @@ pub fn rebuild_from_chain() -> Result<PoolState, String> {
 
     for height in 1..=tip {
         let txs = chain_db::get_txs_for_block(height);
+        // Having the block is not the same as having everything in it. A block whose index
+        // lists fewer transactions than the block itself claims replays as a block that
+        // never carried them: the deposits are all found, the withdrawals that spent them
+        // are not, and the pool concludes it holds far more than its address does. Refusing
+        // leaves the existing state alone, which is the only honest answer when the history
+        // this node can read is not the history that was applied.
+        if let Some(claimed) = chain_db::block_tx_count_at(height) {
+            if (txs.len() as u64) < claimed {
+                return Err(format!(
+                    "block {height} says it carries {claimed} transaction(s) but this node can                      read {}, so replaying the chain would miss what they did to the pool",
+                    txs.len()
+                ));
+            }
+        }
         for tx in &txs {
             if is_deposit(tx) {
                 let Some(commitment) = parse_shield_memo(&tx.memo) else {

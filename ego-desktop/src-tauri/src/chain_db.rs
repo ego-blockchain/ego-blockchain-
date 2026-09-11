@@ -2727,6 +2727,18 @@ pub fn load_shared_chain() -> SharedChain {
 
 // ── Direct lookup helpers (new, additive) ─────────────────────────────────────
 
+/// How many transactions the block at `height` says it carries. Anything replaying a block
+/// needs this to tell "the block was empty" apart from "this node cannot read all of it".
+pub fn block_tx_count_at(height: u64) -> Option<u64> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_BLOCKS)?;
+    db.get_cf(cf, height_key(height))
+        .ok()
+        .flatten()
+        .and_then(|v| decode::<LedgerBlock>(&v))
+        .map(|b| b.tx_count as u64)
+}
+
 pub fn get_block_by_height(height: u64) -> Option<LedgerBlock> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let cf = db.cf_handle(CF_BLOCKS).unwrap();
