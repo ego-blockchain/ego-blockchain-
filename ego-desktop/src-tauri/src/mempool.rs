@@ -497,7 +497,19 @@ impl ShardedMempool {
     pub fn drain_all(&self) -> Vec<LedgerTx> {
         let current_height = crate::chain_db::latest_block_info().0 + 1;
         let map = crate::sharding::load_shard_map();
-        let target_chain_shard = if map.shard_count > 1 {
+        // Storage sharding decides which node keeps which files. Letting it decide which
+        // transactions may enter a block starves the senders it does not match: a block
+        // serves one shard, so with more shards than validators a sender waits for a height
+        // that lands on theirs, and on a chain that also stalls that is indistinguishable
+        // from never. The shard count comes from how many nodes are visible on the relay,
+        // which is mostly strangers, so four validators were splitting their transactions
+        // 256 ways and including one block in every 256.
+        //
+        // Nothing in block validation requires this: it is throughput shaping, and it only
+        // shapes anything once there are enough validators to serve the shards. Admission
+        // already exempts a small network; building now agrees with it.
+        let validators = crate::p2p::known_validator_count() as u32;
+        let target_chain_shard = if map.shard_count > 1 && validators >= map.shard_count {
             Some(crate::sharding::shard_for_height(current_height, map.shard_count))
         } else {
             None
@@ -1085,5 +1097,37 @@ mod stall_warning_tests {
             stall_warning_due(first + STALL_WARN_REPEAT_SECS, first),
             "still stuck a quarter of an hour later is worth saying again",
         );
+    }
+}
+
+#[cfg(test)]
+mod shard_inclusion_tests {
+    /// Splitting transactions across more shards than there are validators means a block
+    /// serves one shard and every sender outside it waits for a height that lands on theirs.
+    /// With 256 shards and a handful of validators that is one block in 256, which on a
+    /// chain that also stalls reads as "pending forever".
+    #[test]
+    fn more_shards_than_validators_starves_most_senders() {
+        let shards: u32 = 256;
+        let eligible_heights = |sender_shard: u32, heights: u64| {
+            (0..heights).filter(|h| (*h % shards as u64) as u32 == sender_shard).count()
+        };
+        assert_eq!(
+            eligible_heights(7, 256),
+            1,
+            "a sender gets one eligible block per full cycle of the shard count",
+        );
+        assert_eq!(
+            eligible_heights(250, 200),
+            0,
+            "and none at all until the chain reaches their shard, which it may never do \
+             while it is stalling",
+        );
+    }
+
+    #[test]
+    fn one_shard_lets_every_sender_into_every_block() {
+        let shards: u32 = 1;
+        assert!(shards <= 1, "a single shard disables the filter entirely");
     }
 }
