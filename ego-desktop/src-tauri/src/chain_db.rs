@@ -1528,9 +1528,25 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
  
     let confirmed_txs: Vec<&LedgerTx> = txs.iter().collect();
 
+    // A transaction already committed here must not be applied a second time. The balance
+    // loop has always skipped those, but every later pass was handed the whole block
+    // regardless, so a replayed unshield debited the pool's recorded total again while its
+    // balance moved only once. The pool then holds more than it admits to and the
+    // withdrawal it believes it paid never reaches anyone.
+    let already_committed: std::collections::HashSet<&str> = confirmed_txs
+        .iter()
+        .filter(|tx| db.get_cf(cf_txs, tx.hash.as_bytes()).ok().flatten().is_some())
+        .map(|tx| tx.hash.as_str())
+        .collect();
+    let fresh_txs: Vec<&LedgerTx> = confirmed_txs
+        .iter()
+        .copied()
+        .filter(|tx| !already_committed.contains(tx.hash.as_str()))
+        .collect();
+
     for tx in &confirmed_txs {
         // Skip if tx already exists.
-        if db.get_cf(cf_txs, tx.hash.as_bytes()).ok().flatten().is_some() {
+        if already_committed.contains(tx.hash.as_str()) {
             continue;
         }
 
@@ -1778,7 +1794,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     // Only count non-system/non-reward transactions for the global counter
     // so the Explorer pagination matches the visible user transactions.
     let mut real_user_txs = 0u64;
-    for tx in &confirmed_txs {
+    for tx in &fresh_txs {
         if !is_protocol_tx(tx) {
             real_user_txs += 1;
         }
@@ -1840,7 +1856,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     }
     sweep_inactive_validators(db, &mut batch, block.height);
 
-    crate::shielded_chain::apply_block(db, &mut batch, block.height, &confirmed_txs);
+    crate::shielded_chain::apply_block(db, &mut batch, block.height, &fresh_txs);
 
     tracing::debug!("[ChainDB] db.write(batch) starting — block #{}", block.height);
     if let Err(e) = db.write(batch) {
@@ -7315,3 +7331,4 @@ mod committee_epoch_tests {
         );
     }
 }
+
