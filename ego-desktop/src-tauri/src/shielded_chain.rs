@@ -994,14 +994,39 @@ pub fn check_invariants(db: &DB, height: u64) {
         return;
     }
     let on_chain = pool_address_balance(db);
+    // One mismatch, not one per block. Nothing here recomputes the pool: it reads the same
+    // two numbers back and finds them still unequal, so applying a run of blocks reported
+    // the identical violation once for each. Every report writes to the console
+    // synchronously, and a few thousand of those during a resync is enough to stop the
+    // process answering at all. Report when the pair changes, say so when it is put right,
+    // and stay quiet in between.
+    static REPORTED: std::sync::Mutex<Option<(u64, u64)>> = std::sync::Mutex::new(None);
+    let pair = (state.accounted_uegoc(), on_chain);
     if on_chain != state.accounted_uegoc() {
-        crate::invariants::report(crate::invariants::Violation::ShieldedPoolMismatch {
-            height,
-            recorded_uegoc: state.accounted_uegoc(),
-            on_chain_uegoc: on_chain,
-        });
+        let fresh = {
+            let mut r = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+            let fresh = *r != Some(pair);
+            *r = Some(pair);
+            fresh
+        };
+        if fresh {
+            crate::invariants::report(crate::invariants::Violation::ShieldedPoolMismatch {
+                height,
+                recorded_uegoc: pair.0,
+                on_chain_uegoc: pair.1,
+            });
+        }
         request_pool_repair();
+    } else {
+        let was = {
+            let mut r = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+            r.take()
+        };
+        if was.is_some() {
+            tracing::info!("[Shielded] the pool and its address agree again at {on_chain} uEGOC");
+        }
     }
+
     let counted = state.counted_uegoc();
     if counted != state.balance_uegoc as u128 {
         crate::invariants::report(crate::invariants::Violation::OutstandingNotes {
