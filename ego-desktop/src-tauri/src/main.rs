@@ -858,6 +858,7 @@ fn main() {
             commands::shielded::shielded_forget_note,
             commands::shielded::shielded_forget_spent,
             commands::shielded::shielded_cancel_withdrawal,
+            commands::shielded::shielded_cancel_deposit,
             commands::shielded::shield_deposit,
             commands::shielded::shield_withdraw,
             commands::shielded::invariant_report,

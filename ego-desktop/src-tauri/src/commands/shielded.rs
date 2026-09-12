@@ -13,6 +13,11 @@ use std::sync::Mutex;
 use tauri::State;
 
 const NOTES_FILE: &str = "shielded_notes.bin";
+
+/// How far behind the network's best known height this node may sit and still be trusted to
+/// say whether something was included. The watermark counts the block currently being
+/// proposed, so a node keeping up is normally a block or two below it.
+const SYNC_LAG_TOLERANCE: u64 = 3;
 const NOTES_KEY_LABEL: &[u8] = b"ego/shielded-notes/v1:";
 const CHAIN_ID: u8 = 1;
 
@@ -46,6 +51,13 @@ pub struct StoredNote {
     pub spent_tx: Option<String>,
     #[serde(default)]
     pub spent_at: Option<i64>,
+    /// When the owner took this deposit back. The note's secret is kept: if the deposit
+    /// turns out to have landed after all, the commitment appears in the tree and the note
+    /// becomes spendable again. Destroying the secret here is the one mistake that cannot
+    /// be undone, because the coins would then sit in the pool with nothing able to spend
+    /// them.
+    #[serde(default)]
+    pub cancelled_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -180,7 +192,11 @@ fn note_status(n: &StoredNote) -> (String, Option<u64>) {
             "spending"
         }
     } else if leaf_index.is_some() {
+        // In the tree, so it is spendable whatever the owner meant to do: a deposit that was
+        // cancelled while already travelling still arrived, and the note is real money.
         "ready"
+    } else if n.cancelled_at.is_some() {
+        "cancelled"
     } else {
         "pending"
     };
@@ -251,7 +267,11 @@ pub async fn shielded_cancel_withdrawal(spent_tx: String) -> Result<usize, EgoDe
         // owner then sees the coins returned, sends them again, and is told they are gone.
         let local = crate::chain_db::local_chain_height();
         let network = crate::p2p::network_tip();
-        if network > local {
+        // The watermark counts the block being proposed, so a healthy node sits a block or
+        // two below it and demanding parity refuses the button in normal operation. What
+        // matters is a node genuinely behind, with blocks it has not read that could carry
+        // this withdrawal.
+        if network.saturating_sub(local) > SYNC_LAG_TOLERANCE {
             return Err(EgoDesktopError::InvalidInput(format!(
                 "This node is at block {local} and the network is at {network}, so it cannot                  yet tell whether that withdrawal was included. Wait for it to catch up before                  cancelling."
             )));
@@ -278,6 +298,59 @@ pub async fn shielded_cancel_withdrawal(spent_tx: String) -> Result<usize, EgoDe
             "[Shielded] withdrawal {spent_tx} cancelled by the wallet owner; {released} note(s) are spendable again"
         );
         Ok(released)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
+}
+
+/// Withdraw a deposit that has not landed yet, returning the coins to the transparent
+/// balance and dropping the note it would have become.
+///
+/// The coins come back by themselves: a deposit that never enters a block never moves
+/// anything, so all this does is stop it being proposed and forget a note that would
+/// otherwise sit unspendable for ever, waiting on a commitment the tree will never hold.
+#[tauri::command]
+pub async fn shielded_cancel_deposit(commitment: String) -> Result<u64, EgoDesktopError> {
+    tokio::task::spawn_blocking(move || {
+        let _g = NOTES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut notes = load_notes()?;
+        let Some(pos) = notes.iter().position(|n| n.commitment == commitment) else {
+            return Err(EgoDesktopError::InvalidInput("No such note in this wallet".into()));
+        };
+
+        let n = &notes[pos];
+        let raw: Option<[u8; 32]> = hex::decode(&n.commitment).ok().and_then(|v| v.try_into().ok());
+        if raw.and_then(|c| shielded_chain::leaf_index_of(&c)).is_some() {
+            return Err(EgoDesktopError::InvalidInput(
+                "That deposit is already in the pool, so it cannot be cancelled. It is a note                  you can spend."
+                    .into(),
+            ));
+        }
+        if n.spent_tx.is_some() {
+            return Err(EgoDesktopError::InvalidInput(
+                "That note is already being spent. Cancel the withdrawal first.".into(),
+            ));
+        }
+        if n.cancelled_at.is_some() {
+            return Err(EgoDesktopError::InvalidInput(
+                "That deposit has already been cancelled.".into(),
+            ));
+        }
+
+        let deposit_tx = n.deposit_tx.clone();
+        let value = n.note.value_uegoc();
+        // The note stays, marked. Nothing else in the wallet counts a cancelled note, but if
+        // the deposit was already travelling and lands anyway, its commitment turns up in the
+        // tree and the note is spendable again — which is why this does not need to know
+        // whether this node has caught up.
+        notes[pos].cancelled_at = Some(chrono::Utc::now().timestamp());
+        save_notes(&notes)?;
+        crate::mempool::get_mempool().remove_txs(std::slice::from_ref(&deposit_tx));
+        crate::commands::tx_pending::remove(&deposit_tx);
+        tracing::warn!(
+            "[Shielded] deposit {deposit_tx} cancelled by the wallet owner; {value} uEGOC stays transparent"
+        );
+        Ok(value)
     })
     .await
     .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
@@ -459,6 +532,7 @@ pub async fn shield_deposit(
             deposit_tx: hash,
             spent_tx: None,
             spent_at: None,
+            cancelled_at: None,
         });
     }
 

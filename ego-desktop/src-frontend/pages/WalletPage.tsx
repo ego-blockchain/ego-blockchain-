@@ -65,7 +65,7 @@ interface ShieldedNote {
   commitment: string;
   value_uegoc: number;
   leaf_index: number | null;
-  status: 'pending' | 'ready' | 'spending' | 'spent';
+  status: 'pending' | 'ready' | 'spending' | 'spent' | 'cancelled';
   deposit_tx: string;
   spent_tx: string | null;
   created_at: number;
@@ -3097,11 +3097,32 @@ const WalletPage: React.FC = () => {
                         <span className="text-amber-300">↓</span>
                         <span className="font-semibold">{(n.value_uegoc / 1_000_000).toLocaleString()} EGOC</span>
                         <span className="text-gray-500 flex-1">
-                          in the pool{n.status === 'ready' ? '' : ' · settling'}
+                          {n.status === 'cancelled'
+                            ? 'cancelled · the coins stayed transparent'
+                            : `in the pool${n.status === 'ready' ? '' : ' · settling'}`}
                         </span>
                         <span className="text-gray-600">
                           {new Date(n.created_at * 1000).toLocaleDateString()}
                         </span>
+                        {n.status === 'pending' && (
+                          <button
+                            title="Take back this deposit before it reaches the pool"
+                            onClick={async () => {
+                              try {
+                                const back = await invoke<number>('shielded_cancel_deposit', {
+                                  commitment: n.commitment,
+                                });
+                                setShieldMsg(`Deposit cancelled — ${(back / 1_000_000).toLocaleString()} EGOC stays transparent.`);
+                                refreshShielded();
+                              } catch (err) {
+                                setShieldMsg(String(err).replace(/^.*Error:/, '').trim());
+                              }
+                            }}
+                            className="text-[10px] text-amber-400 hover:text-amber-300 border border-amber-400/40 rounded px-2 py-0.5 transition"
+                          >
+                            Cancel
+                          </button>
+                        )}
                         {n.status === 'spending' && n.spent_tx && (
                           <button
                             title="Stop waiting on this send and make the coins spendable again"
