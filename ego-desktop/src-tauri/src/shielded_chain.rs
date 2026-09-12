@@ -386,6 +386,21 @@ pub fn repair_pool_state() -> Option<PoolRepair> {
         }
         Err(e) => {
             tracing::error!("[Shielded] could not rebuild the pool from the chain: {e}");
+            // Refusing is right — a replay over a history this node cannot read in full
+            // invents a number rather than finding one — but refusing alone leaves the pool
+            // wrong for ever, because nothing else ever revisits it. The pool state travels
+            // inside a state snapshot, so a node that cannot verify its own history can still
+            // be put right by one that has it. Ask, the same way a node that pruned its
+            // blocks already does.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async {
+                    let tip = chain_db::local_chain_height();
+                    crate::p2p::request_snapshot_from_peers(
+                        crate::p2p::snapshot_request_height(tip),
+                    )
+                    .await;
+                });
+            }
             None
         }
     }
