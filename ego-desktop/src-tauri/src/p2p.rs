@@ -2341,7 +2341,25 @@ pub fn evict_stale_validators(ttl_secs: i64) {
     let mut seen  = validator_last_seen();
     let mut known = known_validators();
     for addr in &stale {
+        // Going quiet means not live; it does not mean unknown. A member of the starting
+        // committee is named in the build and stays a member whatever its connection is
+        // doing, so forgetting it buys nothing and costs the recovery: once removed, its
+        // announce on return is refused for the length of the eviction cooldown, and while
+        // admission is closed it is refused outright — it can only rejoin by voting or
+        // proposing, which it cannot do from outside the committee. A node that lost its
+        // network for a minute never came back, and the chain stopped for good.
+        //
+        // Clearing the timestamp is enough. Liveness is counted from that, so the validator
+        // drops out of the live set exactly as before, and the moment it announces again it
+        // is live again with nothing in the way.
         seen.remove(addr);
+        if crate::genesis::is_member(addr) {
+            tracing::warn!(
+                "[BFT] {} has gone quiet — no longer counted as live, but it keeps its seat",
+                addr
+            );
+            continue;
+        }
         known.remove(addr);
         tracing::warn!("[BFT] Evicted offline validator {}", addr);
     }
@@ -2581,9 +2599,11 @@ fn eligible_validators_sorted() -> Vec<String> {
 pub fn register_known_validator(address: &str) {
     if address.is_empty() { return; }
     if slashed_validators().contains(address) { return; }
-    if is_in_eviction_cooldown(address) {
-        // Recently evicted; ignore gossip echoes that would re-add this peer
-        // before the cooldown expires.
+    // The cooldown exists to ignore gossip echoes that would re-add a peer just evicted. A
+    // member of the starting committee is not a peer we are deciding about: it is named in
+    // the build, it holds its seat regardless, and hearing from it is the very thing we are
+    // waiting for. Holding it out for another minute and a half only lengthens the outage.
+    if !crate::genesis::is_member(address) && is_in_eviction_cooldown(address) {
         return;
     }
     let min_stake: u64 = std::env::var("EGO_MIN_VALIDATOR_STAKE")
@@ -2628,6 +2648,15 @@ pub fn committee_admission_open() -> bool {
 pub fn register_announced_validator(address: &str) {
     if address.is_empty() { return; }
     if committee_admission_open() {
+        register_known_validator(address);
+        return;
+    }
+    // A starting-committee member announcing is proof it is back. Everyone else has to earn
+    // admission by voting or proposing at our tip, which is what stops a stranger talking its
+    // way into the committee — but that same rule locks out a founding member that merely
+    // lost its connection, because it cannot vote from outside the committee it was dropped
+    // from.
+    if crate::genesis::is_member(address) {
         register_known_validator(address);
         return;
     }
@@ -14646,5 +14675,34 @@ mod proposal_clock_tests {
     fn pipelining_fires_immediately_after_a_commit() {
         let now = 3_000_000i64;
         assert!(election_runs(true, now, now), "a commit asks for the next height at once");
+    }
+}
+
+#[cfg(test)]
+mod committee_recovery_tests {
+    /// A validator going quiet means it is not live. It must not mean it is forgotten.
+    ///
+    /// Forgetting a starting-committee member is what stopped a node recovering from a
+    /// dropped connection: removed from the known set, its announce on return was refused
+    /// for the eviction cooldown, and once admission closed it was refused outright — it
+    /// could only rejoin by voting or proposing, which it cannot do from outside the
+    /// committee it was dropped from. The three rules below have to hold together, or the
+    /// gap reopens.
+    #[test]
+    fn a_starting_committee_member_keeps_its_seat_when_it_goes_quiet() {
+        let members = crate::genesis::addresses();
+        if members.is_empty() {
+            return;
+        }
+        for m in &members {
+            assert!(
+                crate::genesis::is_member(m),
+                "the eviction sweep, the cooldown and admission all key off this",
+            );
+        }
+        assert!(
+            !crate::genesis::is_member("egot1someoneelse"),
+            "and it must not hold for anyone else, or a stranger walks into the committee",
+        );
     }
 }
