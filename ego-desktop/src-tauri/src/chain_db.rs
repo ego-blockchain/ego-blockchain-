@@ -3045,10 +3045,16 @@ pub fn import_state_snapshot(snap: &StateSnapshot) -> Result<(), String> {
                 let vb = hex::decode(v).map_err(|e| format!("bad meta val: {e}"))?;
                 batch.put_cf(cf, &kb, &vb);
             }
-            // A fast-synced node intentionally lacks blocks 1..window_start. Mark
-            // that range pruned so tx-count recalibration trusts the snapshot's
-            // META_TX_COUNT instead of erroring on the (expected) gap.
-            let prune_below = snap.blocks.iter().map(|b| b.height).min().unwrap_or(snap.height).max(1);
+            // A snapshot carries state, not history: the blocks in it are records only,
+            // written to CF_BLOCKS with none of their transactions. So nothing at or below
+            // the snapshot height can be replayed here, whatever range of records came with
+            // it. Marking the floor at the lowest record instead claimed full history from
+            // block 1, and every replay then walked into a block that says it carries
+            // transactions this node has no way to read.
+            //
+            // Anything above the snapshot arrives by ordinary sync, with its transactions,
+            // so that is where a readable history begins.
+            let prune_below = snap.height.saturating_add(1).max(1);
             batch.put_cf(cf, META_PRUNE_BELOW, &u64_le(prune_below));
         }
         db.write(batch).map_err(|e| format!("snapshot write: {e}"))?;
@@ -7460,5 +7466,31 @@ mod block_index_tests {
             "a block that claims one transaction must serve one, or peers reject it as a \
              tx_count mismatch and the chain cannot move past it",
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_floor_tests {
+    /// A snapshot carries state, not history: its blocks are records with none of their
+    /// transactions. Taking the floor from the lowest record claims a readable history the
+    /// node does not have, and every replay then walks into a block that says it carries
+    /// transactions it cannot read.
+    #[test]
+    fn the_floor_sits_above_everything_the_snapshot_covers() {
+        let snapshot_height = 89u64;
+        let lowest_record = 1u64;
+
+        assert_eq!(
+            lowest_record.max(1),
+            1,
+            "the old floor read as: this node has everything from block 1",
+        );
+
+        let floor = snapshot_height.saturating_add(1).max(1);
+        assert!(
+            floor > snapshot_height,
+            "nothing at or below the snapshot height has transactions here",
+        );
+        assert!(floor > 1, "so a replay refuses instead of missing what those blocks did");
     }
 }
