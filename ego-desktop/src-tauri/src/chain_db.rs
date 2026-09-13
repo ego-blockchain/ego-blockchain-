@@ -4254,6 +4254,23 @@ pub fn append_peer_block(block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
 
 pub fn append_trusted_block(block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     if block.height == 0 { return false; }
+    // Trusted means the signatures and proofs need not be re-checked. It does not mean a
+    // block may be written with fewer transactions than it says it carries. Writing one
+    // leaves its index permanently short: every replay over it refuses, the pool can never
+    // be checked against the chain again, and no amount of syncing repairs it because the
+    // node believes it already holds the block.
+    //
+    // Refusing leaves the height unwritten, so it is asked for again — which is recoverable,
+    // and a silently incomplete block is not.
+    if (txs.len() as u32) < block.tx_count {
+        tracing::warn!(
+            "[ChainDB] refusing block #{}: it says it carries {} transaction(s) and only {} arrived",
+            block.height,
+            block.tx_count,
+            txs.len()
+        );
+        return false;
+    }
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     write_block_batch(&db, block, txs)
 }
@@ -7492,5 +7509,56 @@ mod snapshot_floor_tests {
             "nothing at or below the snapshot height has transactions here",
         );
         assert!(floor > 1, "so a replay refuses instead of missing what those blocks did");
+    }
+}
+
+#[cfg(test)]
+mod trusted_block_tests {
+    use super::*;
+
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Trusted skips re-verifying signatures and proofs. It must not skip noticing that the
+    /// block arrived incomplete. A block written with fewer transactions than it claims has
+    /// a permanently short index: every replay over it refuses, the pool can never be
+    /// checked again, and syncing cannot repair it because the node believes it already has
+    /// the block. Refusing leaves the height unwritten, so it gets asked for again.
+    #[test]
+    fn a_block_that_arrived_short_is_refused_rather_than_stored() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let base = 600_000_000 + (std::process::id() as u64 % 977) * 100;
+        let tx = LedgerTx {
+            hash: format!("0xtrusted{base}"),
+            from: "egot1sender".into(),
+            to: "egot1recipient".into(),
+            amount: 1_000,
+            tx_type: "transfer".into(),
+            ..LedgerTx::default()
+        };
+        let mut block = LedgerBlock {
+            height: base,
+            hash: format!("dd{base:0>62}"),
+            prev_hash: "ee".repeat(32),
+            miner: "egot1miner".into(),
+            timestamp: 1_700_000_000 + base as i64,
+            tx_count: 7,
+            ..LedgerBlock::default()
+        };
+
+        assert!(
+            !append_trusted_block(&block, std::slice::from_ref(&tx)),
+            "one transaction arrived against a claim of seven and it must be refused",
+        );
+        assert!(
+            get_block_by_height(base).is_none(),
+            "and nothing may be left behind at that height",
+        );
+
+        block.tx_count = 1;
+        assert!(
+            append_trusted_block(&block, std::slice::from_ref(&tx)),
+            "a complete block is still written",
+        );
+        assert_eq!(get_txs_for_block(base).len(), 1);
     }
 }
