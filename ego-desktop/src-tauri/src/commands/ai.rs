@@ -27,7 +27,7 @@ Formatting: use `###` for section/category headers in responses. Use `-` bullet 
 
 ## Ego Blockchain
 - Quantum-safe Layer-1 in Rust. Tokens: EGOC (native, 1 EGOC = 1,000,000 uEGOC) and EGUSD (native USD-pegged stablecoin, 1 EGUSD = 1 USD). Target: 100k+ TPS, 16 shards.
-- Consensus: HotStuff BFT with pipelined view-change (2f+1 quorum, 10s timeout, automatic leader rotation).
+- Consensus: HotStuff-style BFT, weighted. A block is final once signing weight × 3 > total weight × 2 (strictly more than two thirds of committee WEIGHT, not headcount). Turn to propose is proportional to contribution.
 - Crypto: Ed25519 (classical signing) + Dilithium2 (post-quantum signing, NIST PQC standard) + Kyber768 (post-quantum key encapsulation). Address prefix: `egot` (testnet, bech32).
 - **Key generation**: 32-byte seed from OS secure RNG → Ed25519 signing key derived from seed; Dilithium2 and Kyber768 key pairs derived from the same seed. Address = bech32(blake2(dilithium_public_key)).
 - **Transaction signing**: Dilithium2 by default (quantum-safe). Ed25519 available for legacy/compat. All signatures verified on-chain before a TX is accepted.
@@ -50,12 +50,25 @@ Formatting: use `###` for section/category headers in responses. Use `-` bullet 
 - **BFT validator cap**: MAX_VALIDATORS=10,000. Evicts one on overflow.
 - **Shard map**: Kademlia-published shard assignments. Master/Slave roles with health checks and vacancy healing.
 
-## Validator Stake Gating
-- Minimum stake to register as validator: 1,000 EGOC (1,000,000 uEGOC). Any node sending PeerAnnounce without this stake is rejected.
-- Bootstrap exemption: if fewer than 3 validators are known, the stake requirement is bypassed so the network can bootstrap.
-- Stake tracked in `STAKE_STORE` (in-memory, seeded from ledger at startup and updated from on-chain staking TXs).
-- Slashing burns 10% of the validator's actual staked amount from the RocksDB staking pool. Slash amount = `get_validator_stake(addr) / 10`.
+## Validators, Committee and Quorum
+- **Validation is open.** There is no minimum stake by default and no allowlist. Anyone running the software registers on-chain and takes a seat. `EGO_VALIDATOR_ALLOWLIST=1` restores a closed set for a private deployment.
+- **Quorum is weight, not headcount**: `signed_weight * 3 > total_weight * 2`. Strictly greater — two thirds exactly is NOT a quorum, because with three equal validators that would accept two signatures.
+- **Whose turn**: `turn = height + round`, then walk the committee in weight order until `turn % total_weight` falls inside a member's share. A validator with three times the weight leads three times as often. It is a pure function of (height, round), so no two nodes elect different proposers for the same block.
+- **The committee is frozen per epoch** (`COMMITTEE_EPOCH = 100` blocks). The set deciding a height is read from the snapshot at the last boundary below it, never from whatever a node holds right now. Nodes sit at different heights, so a committee derived from "now" differs between them and they reject each other's blocks. Jail and slash marks are read at the same boundary for the same reason.
+- **Joining**: register on-chain, seated at the next 100-block boundary — and every node seats you at the same height.
+- **Leaving**: `VALIDATOR_LIVENESS_WINDOW = 500` blocks of producing nothing and you are unseated. Register again to rejoin.
+- **Concentration cap**: no validator may hold more than half of what all other validators hold combined, which keeps it under a third of the total once the sum is recomputed.
+- **Blocks are signed by their producer** (Ed25519 key + signature over the block hash). Without it the `miner` field is only a claim and anyone could put another validator's name on their own block.
+- Slashing burns 10% of the validator's staked amount from the RocksDB staking pool.
 - Staking address: `egot1staking000000000000000000000000000000000`. TXs to this address stake; TXs from it unstake.
+
+## The Genesis Committee (4 nodes)
+- Before block 1 there is no chain to read a validator set from, so the first set ships with the build: a list of **four** validators, each with address AND Dilithium public key.
+- The key must travel with the address because the engine identifies a validator by `blake3(dilithium_pubkey)`, which cannot be recovered from a bech32 address. A list of addresses alone would be incomplete until every member announced itself, and an offline member would stop the chain starting at all.
+- **Four seats, quorum of three** — tolerates one member offline or restarting. The four are deliberately split across separate machines: with every seat on one machine, that machine could finalize alone and any fault appearing only between machines would be invisible to consensus.
+- **It is a bootstrap, not an authority.** It buys exactly two things: a seat at block 1 without registering first, and exemption from the contribution floor for `GENESIS_GRACE_BLOCKS = 10,000` blocks. After that the founding members register and qualify like anyone else or lose their seats.
+- Founders' share dilutes by arithmetic as others join: 4 of 10 is 40% (can still block), 4 of 13 is 31% (cannot block anything). No vote or fork needed.
+- If asked "do the 4 stay in charge?" — no. They bootstrap the chain and then compete on the same terms.
 
 ## HotStuff BFT View-Change
 - `CURRENT_VIEW` atomic u64. `leader_for_view(v)` = sorted validators[v % n].
@@ -132,7 +145,7 @@ Advanced: EGO-50 MEV Protection, EGO-51 Fee Market, EGO-52 Governance, EGO-53 DI
 - Bridge fee: 0.5% on swap output for external pairs. Rates shown before confirmation.
 
 ## Staking
-- Stake EGOC to earn rewards and boost DRS. Minimum stake to register as validator: 1,000 EGOC.
+- Stake EGOC to earn rewards and add to DRS. Staking is NOT required to validate — validation is open and there is no minimum stake by default. Stake is the smallest term in the weight formula on purpose.
 - APR: Node staking ~40%, General staking ~20% (DAO-tunable). New block rewards locked 30 days, earn 20% simple interest over the lock period (~0.0548%/day on the locked tranche).
 - Lock bonuses: 30d = 0%, 90d = +2%, 180d = +5%, 365d = +10%.
 - Early unstake penalty: 10% of staked amount (distributed to active nodes).
@@ -140,11 +153,13 @@ Advanced: EGO-50 MEV Protection, EGO-51 Fee Market, EGO-52 Governance, EGO-53 DI
 - Market tax: 1% buy/sell tax on AMM/CEX trades — 50% to Staking Rewards Pool, 50% to Treasury/Liquidity (DAO-tunable). Wallet-to-wallet transfers are fee-free.
 - Staking address: `egot1staking000000000000000000000000000000000`.
 
-## Deterministic Reward Scoring (DRS)
-- DRS is a combined score determining validator eligibility and reward share.
-- Components: PoC Coverage 40% (`events_24h / 360`), PoST Storage 40% (sectors proved, no faults), Stake Weight 20% (≥1,000 EGOC to mine).
-- Thresholds: DRS ≥ 0.5 → partial validator; DRS ≥ 2.0 → full mining eligible.
-- Faults, VPN/proxy detection, or offline status all reduce DRS.
+## Dynamic Reputation Score (DRS) — coverage first, then storage
+- DRS decides how often a validator leads and what share of rewards it earns. Every input is committed on-chain, so every node computes the same score from the same blocks.
+- **The weight the engine actually uses**: `1 (seat held) + proven_witnesses + 3 x proven_GB + staked_EGOC / 2`.
+- **Reputation view (Earn tab)**: `raw = coverage*3 + stake*0.5`, then `drs = max(ln(1 + raw), 0.01)`, tripled while a node is new to the network.
+- **Why this order**: coverage is what a node can prove on day one, before anyone has uploaded a byte — it is what lets a network with no storage customers still weigh validators by contribution instead of by who arrived first. Storage raises the share from there. Stake counts LEAST (divided by two) because it is the one input a wealthy newcomer can simply buy.
+- **Blocks produced are deliberately NOT an input.** Paying weight for producing would let whoever starts ahead lead more, gain weight, and lead more again, until one node decides everything.
+- **Concentration cap**: no validator may exceed half of what all others hold combined.
 
 ## Proof-of-Coverage (PoC)
 - Beacon fires every ~4 minutes when coverage is online. Records location via IP geolocation + H3 cell (resolution 8).
@@ -211,6 +226,11 @@ Advanced: EGO-50 MEV Protection, EGO-51 Fee Market, EGO-52 Governance, EGO-53 DI
 - **What is NOT hidden**: Amounts are visible on both the deposit and the withdrawal. Only the link between them is hidden.
 - **Anonymity set**: Privacy comes from how many others hold notes of the size being spent. A near-empty pool gives little cover, and withdrawing straight after depositing is linkable by timing. Waiting, splitting across addresses and dates, and using common denominations all help. Large holders are the most exposed.
 - **Not audited**: The pool has had no external review. Testnet only; treat as experimental.
+- **Cancelling**: a deposit or withdrawal that has not reached a block can be cancelled from the wallet. A transaction that never executes never moved anything, so the coins stay where they were. Cancelling a deposit does NOT destroy the note's secret — a deposit already travelling may land anyway, and without the secret those coins would sit in the pool unspendable for ever. The note is kept and marked, so a late arrival becomes spendable again.
+- **Neither cancel acts while the node is behind the network.** A node that has not applied the block carrying your transaction cannot tell "not included" from "not seen yet", and guessing would release notes the chain has already spent.
+- **Fees**: shielding charges a fee PER NOTE on top of the amount (4 notes = 4 fees). Withdrawing charges ONE fee taken OUT of the amount, so the recipient receives that much less. Both are burned — no validator collects them.
+- **Pool accounting**: the pool's recorded total and the balance at its address are two views of the same coins, checked against each other as blocks apply. On a disagreement the node rebuilds the pool from the chain — and REFUSES to if it cannot read that history in full (fast-synced from a snapshot, blocks pruned, or a block listing fewer transactions than it claims). Replaying a partial history would find the deposits and miss what spent them. Such a node asks a peer for the pool state instead, which travels inside a state snapshot.
+- **Root history**: a withdrawal proves against any of the last 100 tree roots, not only the current one, so a deposit landing between building and submitting a proof does not invalidate it.
 - **Not implemented**: Shielded-to-shielded transfers, which would hide amounts too and remove the need for denominations.
 
 ## App pages
@@ -683,7 +703,7 @@ cargo build -p ego-node --release
 ```
 
 ### The four node types
-- **Validator** — casts Dilithium-2 votes and forms QCs. Needs staked EGOC (1,000 EGOC minimum) plus uptime. Earns the **consensus bucket (25%)**.
+- **Validator** — casts Dilithium-2 votes and forms QCs. No minimum stake by default: register on-chain and you are seated at the next 100-block epoch boundary. Weight, and so how often you lead, comes from coverage and storage. Earns the **consensus bucket (25%)**.
 - **Storage Provider** — seals sectors, passes WindowPoSt, serves retrievals. Needs locked collateral. Earns the **storage bucket (55%)**.
 - **Beacon / Witness** — records 5G RF metrics and submits PoC reports. Needs Ego-certified hardware. Earns the **coverage bucket (20%)**.
 - **Light Client** — verifies headers, QCs and state proofs. No staking, read-only. This is what wallets and dApps use.
@@ -1001,8 +1021,41 @@ Just open any of the tabs above to configure your node. Your **Deterministic Rew
         "The Seed Round pre-sale is currently LIVE at $2.00 per EGOC (~18% discount vs. launch price). You can purchase using crypto (BTC, ETH, SOL, etc.) or card via Stripe. You'll receive an encrypted IOU file that will be credited at the Genesis Block."
     } else if q.contains("tokenomics") || q.contains("supply") || q.contains("distribution") {
         "Ego has a maximum supply of 100,000,000 EGOC.\n\nDistribution:\n- 40M Block emissions\n- 20M Liquidity & Treasury\n- 20M Investors / Seed\n- 10M Team\n- 10M Ecosystem\n\nBlock rewards halve every 2 years."
+    } else if q.contains("genesis committee") || q.contains("committee") || q.contains("quorum")
+        || q.contains("4 genesis") || q.contains("four genesis") {
+        "Before block 1 there is no chain to read a validator set from, so the first set ships with the build: a list of four validators, each carrying an address AND a Dilithium public key.
+
+The key has to travel with the address because the engine identifies a validator by blake3(dilithium_pubkey), which cannot be recovered from a bech32 address. A list of addresses alone would be incomplete until every member announced itself, and one offline member would stop the chain starting at all.
+
+Four seats, quorum of three — that tolerates one being offline or restarting. The four are deliberately split across separate machines, because with every seat on one machine that machine could finalize alone and any fault appearing only between machines would be invisible to consensus.
+
+**They do not stay in charge.** The list is a bootstrap. It buys exactly two things: a seat at block 1 without registering first, and exemption from the contribution floor for 10,000 blocks. After that the founding members register and qualify like anyone else or lose their seats. Their share dilutes by arithmetic as others join — 4 of 13 is 31%, below the third needed to block anything, with no vote or fork required."
+    } else if (q.contains("become") || q.contains("run") || q.contains("join")) && q.contains("validator") {
+        "Validation is open: no allowlist, no approval, and no minimum stake by default.
+
+1. Run Ego Desktop and let it register on-chain.
+2. You are seated at the next 100-block epoch boundary — and every node seats you at the same height, so nobody disagrees about when you joined.
+3. Your weight, and so how often you lead, is `1 + proven_witnesses + 3 x proven_GB + staked_EGOC / 2`.
+
+Coverage is the part you can prove on day one, before storing anything for anyone — peers witness your beacon and those receipts are committed on-chain. Storage raises your share from there. Stake counts least on purpose, because it is the one input a newcomer can simply buy.
+
+Going quiet for 500 blocks unseats you; registering again brings you back."
+    } else if q.contains("stark") || q.contains("zero-knowledge") || q.contains("zk proof") {
+        "Withdrawals from the shielded pool are proved with Winterfell STARKs over the Goldilocks field, hashed with Rescue Prime.
+
+STARKs are hash-based, which buys two things a pairing-based SNARK cannot: there is **no trusted setup**, so no ceremony and no toxic waste that could forge proofs if it leaked, and the security rests on hash functions, so it stays post-quantum like the Dilithium signatures everywhere else in Ego.
+
+A withdrawal proof is about 22 KB and verifies in roughly 4 ms. It stands in place of a signature: the withdrawal's sender field is the pool's own address, identical on every withdrawal, and the proof is what shows the spender owned a note without revealing which one.
+
+The circuit has had no external audit. Testnet only."
     } else if q.contains("consensus") || q.contains("bft") || q.contains("hotstuff") {
-        "Ego uses HotStuff BFT (Byzantine Fault Tolerance) with pipelined view-changes. Instead of energy-heavy mining, a Verifiable Random Function (VRF) secretly and fairly elects a 21-node committee for each block.\n\nTo reach absolute mathematical finality, it requires a 2/3rds supermajority (2f+1 quorum). Because of pipelining, blocks are finalized in exactly 3 steps, meaning transactions are permanently confirmed in seconds."
+        "Ego uses HotStuff-style BFT, weighted by contribution rather than by headcount.
+
+Whose turn it is to propose is `turn = height + round`, walked across the committee in proportion to each member's weight, so a validator contributing three times as much leads three times as often. It is a pure function of the height and round over a set every node derives identically, so no two nodes elect different proposers for the same block.
+
+A block is final once signing weight x 3 exceeds total weight x 2 — strictly more than two thirds of committee WEIGHT. Strictly: two thirds exactly is not a quorum, because with three equal validators that would accept two signatures.
+
+The committee is frozen for 100-block epochs, read from the snapshot at the last boundary, so nodes at different heights still agree on who decides a given block."
     } else if q.contains("smart contract") || q.contains("urego") || q.contains("vm") {
         "Ego uses `ego-vm` powered by wasmtime. Smart contracts are written in **Urego**, a custom Rust-inspired language that compiles down to WebAssembly (WASM).\n\n**How it works:**\n1. You write a contract in Urego (e.g., a token, NFT, or AMM).\n2. You compile it to WASM bytecode via the built-in compiler.\n3. You deploy it on-chain with a `deploy` transaction.\n4. Users interact with it using `call` transactions.\n\nContracts run in a highly secure, sandboxed environment with strict fuel metering (gas limits) to prevent infinite loops. Their state is permanently stored in the ledger and secured by BFT consensus."
     } else if q.contains("quantum") || q.contains("crypto") || q.contains("signature") || q.contains("dilithium") {
@@ -1014,7 +1067,11 @@ Just open any of the tabs above to configure your node. Your **Deterministic Rew
     } else if q.contains("stake") || q.contains("staking") || q.contains("apr") {
         "You can stake EGOC to earn rewards and boost your DRS score. The minimum stake to register as a validator is 1,000 EGOC. Base APR is ~20%, with lock bonuses up to +10% for a 365-day lock."
     } else if q.contains("vrf") || q.contains("random") || q.contains("election") {
-        "Ego uses a Verifiable Random Function (VRF) for block proposer and committee election. This cryptographically ensures that the 21-node voting committee is selected randomly and fairly, preventing predictability and DDoS attacks."
+        "The proposer for a block is chosen by weight, not by lottery. `turn = height + round`, then the committee is walked in weight order until `turn % total_weight` falls inside a member's share.
+
+Weight is `1 + proven_witnesses + 3 × proven_GB + staked_EGOC / 2` — coverage and storage count for far more than stake, because stake is the one input a newcomer can simply buy. Blocks produced are deliberately not an input: paying weight for producing would let whoever starts ahead lead more, gain weight, and lead more again.
+
+No validator may hold more than half of what every other validator holds combined, which keeps any single one under a third of the total."
     } else if q.contains("shard") || q.contains("scale") || q.contains("tps") {
         "Ego scales dynamically up to 256 shards based on the active network size. Using consistent hashing, nodes are assigned to specific shards as Masters or Slaves, parallelizing transaction processing.\n\nThis allows the network to seamlessly grow to handle 100k+ TPS, with automatic cross-shard routing and vacancy healing when nodes drop offline."
     } else if q.contains("compute") || q.contains("gpu") || q.contains("cpu") || q.contains("rent") || q.contains("ai workspace") || q.contains("cluster") || q.contains("train") || q.contains("jupyter") || q.contains("llm chat") {
@@ -1227,6 +1284,12 @@ mod ai_routing_tests {
             "How does the messenger stay private?",
             "How do I earn EGOC?",
             "How do I create a dApp?",
+            "How does the shielded pool work?",
+            "What is a STARK proof?",
+            "How does consensus work?",
+            "What is the genesis committee?",
+            "Do the 4 genesis nodes stay in charge?",
+            "How do I become a validator?",
         ];
         for question in follow_ups {
             let answer = ask(question).await;
