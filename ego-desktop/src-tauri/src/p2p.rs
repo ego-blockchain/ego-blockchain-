@@ -9991,7 +9991,38 @@ pub async fn ingest_sideband_bytes(
             });
             Ok(())
         }
-        _ => Err(format!("sideband from {source}: only transactions are accepted")),
+        // A sealed envelope is opaque to everyone but the person it is addressed to, so any
+        // node can carry one without being able to read it. That is exactly what an offline
+        // link needs: whoever hears the broadcast takes it, and if it is not theirs they pass
+        // it on until it reaches somebody with a connection.
+        P2PMessage::SealedDm { to, eph_pub, nonce, ct, id } => {
+            if dm_already_seen(&id) {
+                return Ok(());
+            }
+            let my_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
+                .await
+                .unwrap_or_default();
+            if !my_addr.is_empty() && to == my_addr {
+                let Some(inner) = open_dm(&eph_pub, &nonce, &ct) else {
+                    return Err(format!(
+                        "sideband from {source}: an envelope addressed to us would not open"
+                    ));
+                };
+                eprintln!("[Sideband] message for us arrived via {source}");
+                handle_incoming(inner, app).await;
+                return Ok(());
+            }
+            // Not ours. Carry it: the sender had no connection, so this node is how it
+            // reaches the network, and nothing here can read what it is passing on.
+            let onward = P2PMessage::SealedDm { to, eph_pub, nonce, ct, id };
+            if let Ok(data) = serde_json::to_vec(&onward) {
+                publish_gossip(DM_TOPIC, data).await;
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "sideband from {source}: only transactions and sealed messages are accepted"
+        )),
     }
 }
 
@@ -13481,6 +13512,27 @@ fn open_dm_with(
     serde_json::from_slice::<P2PMessage>(&pt).ok()
 }
 
+/// Seal `inner` to `to_addr` and hand it to the offline link rather than the mesh.
+///
+/// For somebody with no connection at all. The envelope is opaque to every node but the
+/// addressee, so whoever picks it up off the link either opens it because it is theirs or
+/// passes it on without being able to read it.
+pub async fn sideband_sealed_dm(to_addr: &str, to_ed25519: &str, inner: &P2PMessage) -> bool {
+    let Some(sealed) = seal_dm(to_addr, to_ed25519, inner) else {
+        return false;
+    };
+    let Ok(data) = serde_json::to_vec(&sealed) else {
+        return false;
+    };
+    if !crate::sideband::has_transport() {
+        return false;
+    }
+    let id = sideband_msg_id(&format!("dm:{to_addr}:{}", data.len()));
+    tokio::task::spawn_blocking(move || crate::sideband::broadcast(&data, id) > 0)
+        .await
+        .unwrap_or(false)
+}
+
 /// Seal `inner` to `to_addr` and broadcast it on the mesh. Returns false only
 /// when the contact's identity key is unusable, so callers can log it.
 pub async fn gossip_sealed_dm(to_addr: &str, to_ed25519: &str, inner: &P2PMessage) -> bool {
@@ -14704,5 +14756,36 @@ mod committee_recovery_tests {
             !crate::genesis::is_member("egot1someoneelse"),
             "and it must not hold for anyone else, or a stranger walks into the committee",
         );
+    }
+}
+
+#[cfg(test)]
+mod sideband_dm_tests {
+    use super::*;
+
+    /// A sealed envelope is opaque to everyone but its addressee, which is what makes it
+    /// safe to carry over a link anyone can hear. A node that picks one up off the local
+    /// segment either opens it because it is theirs, or passes it on without being able to
+    /// read a word — so a message from somebody with no connection still reaches the network
+    /// through whoever is nearby.
+    #[test]
+    fn a_sealed_envelope_reveals_only_its_recipient() {
+        let inner = P2PMessage::ChatMessage { bundle: "hello".into(), seq: 1 };
+        let kp = ego_core::KeyPair::generate();
+        let to_ed = hex::encode(kp.ed25519_public_key().key_data);
+        let to_addr = "egot1recipient";
+
+        let Some(sealed) = seal_dm(to_addr, &to_ed, &inner) else { return };
+        let P2PMessage::SealedDm { to, ct, .. } = &sealed else {
+            panic!("sealing must produce a sealed envelope");
+        };
+        assert_eq!(to, to_addr, "a carrier has to know who to hand it to");
+        let wire = serde_json::to_vec(&sealed).unwrap();
+        let text = String::from_utf8_lossy(&wire);
+        assert!(
+            !text.contains("hello"),
+            "the contents must not be legible to whoever carries it",
+        );
+        assert!(!ct.is_empty(), "and there must actually be a ciphertext");
     }
 }

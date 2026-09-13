@@ -943,10 +943,15 @@ pub async fn send_message(
 
         let p2p_msg = p2p::P2PMessage::ChatMessage { bundle, seq: send_seq };
         if stored_endpoint.is_empty() {
-            eprintln!("[Messenger] No endpoint for {} — queued in outbox + DHT inbox + gossip", contact_addr_key);
+            eprintln!("[Messenger] No endpoint for {} — queued in outbox + DHT inbox + gossip + local link", contact_addr_key);
             crate::commands::outbox::enqueue(&contact_addr_key, "", &p2p_msg);
             deposit_in_relay_inbox(&my_addr, &contact_addr_key, &p2p_msg).await;
             p2p::gossip_sealed_dm(&contact_addr_key, &contact_ed25519, &p2p_msg).await;
+            // Every route above needs the internet. This one does not: the envelope goes out
+            // on the local segment, where the person may simply be sitting in the same room.
+            // It is sealed, so anyone who picks it up and is not the addressee carries it
+            // without being able to read it.
+            p2p::sideband_sealed_dm(&contact_addr_key, &contact_ed25519, &p2p_msg).await;
             return;
         }
         let endpoint = resolve_endpoint(&contact_addr_key, &stored_endpoint).await;
@@ -956,6 +961,7 @@ pub async fn send_message(
 
             deposit_in_relay_inbox(&my_addr, &contact_addr_key, &p2p_msg).await;
             p2p::gossip_sealed_dm(&contact_addr_key, &contact_ed25519, &p2p_msg).await;
+            p2p::sideband_sealed_dm(&contact_addr_key, &contact_ed25519, &p2p_msg).await;
         }
 
         if is_file_bundle {
