@@ -385,7 +385,17 @@ pub fn repair_pool_state() -> Option<PoolRepair> {
             })
         }
         Err(e) => {
-            tracing::error!("[Shielded] could not rebuild the pool from the chain: {e}");
+            // A node that fast-synced has no history below its snapshot and never will. That
+            // is how fast sync works, not a fault, and saying ERROR every time a reorg asks
+            // it to check made a healthy node look broken. A node whose blocks are present
+            // but unreadable is a different matter and still worth the louder line.
+            if e.contains("holds no blocks below") {
+                tracing::info!(
+                    "[Shielded] this node fast-synced, so it cannot check the pool against its own history ({e}). Asking a peer for the pool state instead."
+                );
+            } else {
+                tracing::error!("[Shielded] could not rebuild the pool from the chain: {e}");
+            }
             // Refusing is right — a replay over a history this node cannot read in full
             // invents a number rather than finding one — but refusing alone leaves the pool
             // wrong for ever, because nothing else ever revisits it. The pool state travels
