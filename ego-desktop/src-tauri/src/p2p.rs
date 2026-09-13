@@ -6340,6 +6340,37 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                         }
                     }
                 }
+                // Cached peers are dialled once at startup and never again, so a node that
+                // loses its network keeps none of them: every connection dies, and when the
+                // network returns it waits for peers to dial it while they wait for it to
+                // dial them. Nobody moves, and the committee never re-forms — the chain
+                // reports quorum met, then one validator known, for ever.
+                //
+                // Re-dial only while direct connections are short, and only peers heard from
+                // recently, so a healthy node does nothing and a returning one does not
+                // hammer a month of stale addresses.
+                if DIRECT_PEER_COUNT.load(Ordering::Relaxed) < MIN_DIRECT_PEERS_RELAY_OPTIONAL {
+                    let cutoff = Utc::now().timestamp() - PEER_LIVENESS_SECS;
+                    let mut redialled = 0usize;
+                    for p in load_peer_cache() {
+                        if redialled >= 12 { break; }
+                        if p.last_seen < cutoff || p.endpoint.is_empty() { continue; }
+                        let Ok(addr) = p.endpoint.parse::<Multiaddr>() else { continue };
+                        match peer_id_from_multiaddr(&addr) {
+                            Some(pid) if swarm.is_connected(&pid) => continue,
+                            _ => {}
+                        }
+                        if swarm.dial(addr).is_ok() {
+                            redialled += 1;
+                        }
+                    }
+                    if redialled > 0 {
+                        tracing::info!(
+                            "[P2P] {redialled} peer(s) re-dialled after losing connectivity"
+                        );
+                    }
+                }
+
                 if DIRECT_PEER_COUNT.load(Ordering::Relaxed) >= MIN_DIRECT_PEERS_RELAY_OPTIONAL
                     && has_circuit_addr(&external_addrs)
                 {
