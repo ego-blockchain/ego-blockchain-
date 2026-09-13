@@ -2418,6 +2418,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sha3",
+ "socket2 0.5.10",
  "sysinfo",
  "tauri",
  "tauri-build",

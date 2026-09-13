@@ -15,6 +15,7 @@ mod storage_proof;
 mod coverage_proof;
 mod sideband;
 mod sideband_spool;
+mod sideband_lan;
 mod bft_committee;
 mod bls_agg;
 mod blocks;
@@ -332,6 +333,16 @@ fn headless_main() {
             let spool = crate::sideband_spool::SpoolTransport::default_spool();
             eprintln!("[Sideband] spool at {}", spool.inbox().display());
             crate::sideband::register(Box::new(spool));
+
+            // A headless node is often the one with the connection, relaying for people who
+            // have lost theirs, so it listens on the local link without being asked.
+            match crate::sideband_lan::LanTransport::bind() {
+                Ok(lan) => {
+                    eprintln!("[Sideband] local link on UDP {}", lan.port());
+                    crate::sideband::register(Box::new(lan));
+                }
+                Err(e) => eprintln!("[Sideband] local link unavailable: {e}"),
+            }
             tokio::spawn(async {
                 loop {
                     crate::sideband::poll_once(None).await;
@@ -1086,6 +1097,18 @@ fn main() {
                 let spool = crate::sideband_spool::SpoolTransport::default_spool();
                 eprintln!("[Sideband] spool at {}", spool.inbox().display());
                 crate::sideband::register(Box::new(spool));
+
+                // The link that needs nobody to set it up. Being cut off usually means the
+                // router is up and the internet behind it is not, or everyone is on one
+                // hotspot with no data — the machines can still reach each other, and a
+                // broadcast needs no relay, no discovery and no configuration to arrive.
+                match crate::sideband_lan::LanTransport::bind() {
+                    Ok(lan) => {
+                        eprintln!("[Sideband] local link on UDP {}", lan.port());
+                        crate::sideband::register(Box::new(lan));
+                    }
+                    Err(e) => eprintln!("[Sideband] local link unavailable: {e}"),
+                }
 
                 let handle = app.handle();
                 tauri::async_runtime::spawn(async move {
