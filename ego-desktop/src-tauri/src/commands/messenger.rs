@@ -79,6 +79,13 @@ pub struct Message {
     // false for incoming messages (unused there).
     #[serde(default)]
     pub read_by_recipient: bool,
+    // Only meaningful on outgoing messages: whether the recipient's node has actually taken
+    // delivery and said so. The tick used to appear the moment a message was handed to the
+    // network, which says nothing about whether anyone received it — and offline it was
+    // simply wrong. Messages stored before this field existed default to delivered, so
+    // upgrading does not strip ticks off history that has plainly arrived.
+    #[serde(default = "default_true")]
+    pub delivered: bool,
 }
 
 fn default_true() -> bool { true }
@@ -355,6 +362,7 @@ pub(crate) fn receive_message_inner(bundle: &str, seq: u64) -> Result<(Message, 
         outgoing:     false,
         read:         false,
         read_by_recipient: false,
+        delivered:    false,
     };
 
     let mut msgs = load_messages();
@@ -877,6 +885,7 @@ pub async fn send_message(
         outgoing:     true,
         read:         true,
         read_by_recipient: false,
+        delivered:    false,
     });
     save_messages(&msgs).map_err(EgoDesktopError::FileSystemError)?;
 
@@ -1078,6 +1087,24 @@ async fn send_read_receipt(contact_addr: &str, message_ids: Vec<String>) {
     }
 }
 
+/// Called when a DeliveryReceipt arrives — flips our own sent messages to that contact from
+/// "sent" to "delivered". Separate from reading: delivery says their node has it, which is
+/// the part a sender can be told over a one-way link without the recipient lifting a finger.
+pub fn mark_messages_delivered(contact_addr: &str, message_ids: &[String]) -> usize {
+    let mut msgs = load_messages();
+    let mut changed = 0usize;
+    for m in msgs.iter_mut() {
+        if m.outgoing && m.to == contact_addr && !m.delivered && message_ids.contains(&m.id) {
+            m.delivered = true;
+            changed += 1;
+        }
+    }
+    if changed > 0 {
+        let _ = save_messages(&msgs);
+    }
+    changed
+}
+
 /// Called when a ReadReceipt arrives from a contact — flips our own sent
 /// messages to that contact from "Delivered" to "Read". Returns how many
 /// changed, so the caller only bothers notifying the frontend when needed.
@@ -1248,6 +1275,16 @@ pub async fn set_display_name(name: String) -> Result<String, EgoDesktopError> {
 /// Read live from contacts.json on every call and never cached, so a rename
 /// shows up on the very next notification without anything to invalidate.
 /// Falls back to a shortened address for someone who isn't a contact yet.
+/// A contact's identity key, for sealing something back to them. Empty when they are not a
+/// contact, in which case there is nobody to seal to and nothing is sent.
+pub fn contact_ed25519(addr: &str) -> String {
+    load_contacts()
+        .iter()
+        .find(|c| c.address == addr)
+        .map(|c| c.ed25519_pubkey.trim().to_string())
+        .unwrap_or_default()
+}
+
 pub fn contact_display_name(addr: &str) -> String {
     load_contacts()
         .iter()

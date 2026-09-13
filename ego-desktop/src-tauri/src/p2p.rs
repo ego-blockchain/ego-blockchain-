@@ -3104,6 +3104,15 @@ pub enum P2PMessage {
         to:          String,
         message_ids: Vec<String>,
     },
+    // Sent the moment a message is stored, before anyone has looked at it. Delivery is what
+    // a sender can be told over a link with no return path to the person, and it is the
+    // honest version of the tick that used to appear simply because a message had been
+    // handed to the network.
+    DeliveryReceipt {
+        from:        String,
+        to:          String,
+        message_ids: Vec<String>,
+    },
     TxBroadcast {
         tx:    LedgerTx,
         block: LedgerBlock,
@@ -8722,6 +8731,27 @@ P2PMessage::ChatMessage { bundle, seq } => {
             if !is_new {
                 return;
             }
+            // Tell them it arrived, before anyone has read it. Delivery is the part that can
+            // be confirmed without the recipient doing anything, and it goes back the way it
+            // came as well as over the mesh — so a sender with no connection still learns
+            // their message landed.
+            {
+                let to = msg.from.clone();
+                let me = msg.to.clone();
+                let ids = vec![msg.id.clone()];
+                tokio::spawn(async move {
+                    let receipt = P2PMessage::DeliveryReceipt {
+                        from: me,
+                        to: to.clone(),
+                        message_ids: ids,
+                    };
+                    let ed = crate::commands::messenger::contact_ed25519(&to);
+                    if !ed.is_empty() {
+                        gossip_sealed_dm(&to, &ed, &receipt).await;
+                        sideband_sealed_dm(&to, &ed, &receipt).await;
+                    }
+                });
+            }
             if msg.message_type == "file_bundle" {
                 use base64::Engine as _;
                 let parts: Vec<&str> = msg.content.splitn(5, ':').collect();
@@ -8789,6 +8819,18 @@ P2PMessage::ProfileUpdate { from_addr, avatar } => {
     if updated {
         if let Some(h) = app {
             let _ = h.emit_all("ego://contact-updated", &from_addr);
+        }
+    }
+}
+
+P2PMessage::DeliveryReceipt { from, to, message_ids } => {
+    let my_addr = tokio::task::spawn_blocking(|| crate::ledger::Ledger::load().address)
+        .await.unwrap_or_default();
+    if my_addr.is_empty() || to != my_addr || message_ids.is_empty() { return; }
+    let updated = crate::commands::messenger::mark_messages_delivered(&from, &message_ids);
+    if updated > 0 {
+        if let Some(h) = app {
+            let _ = h.emit_all("ego://messages-delivered", serde_json::json!({ "contact": from }));
         }
     }
 }

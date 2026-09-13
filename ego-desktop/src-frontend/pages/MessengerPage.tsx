@@ -62,6 +62,7 @@ interface Message {
   outgoing: boolean;
   read: boolean;
   read_by_recipient: boolean;
+  delivered: boolean;
 }
 
 function fmtTime(ts: number): string {
@@ -1288,10 +1289,10 @@ useEffect(() => {
                       {fmtTime(m.timestamp)}
                       {m.outgoing && (
                         <span
-                          className={m.read_by_recipient ? 'text-blue-400' : 'text-gray-500'}
-                          title={m.read_by_recipient ? 'Read' : 'Delivered'}
+                          className={m.read_by_recipient ? 'text-blue-400' : m.delivered ? 'text-gray-400' : 'text-gray-600'}
+                          title={m.read_by_recipient ? 'Read' : m.delivered ? 'Delivered to their device' : 'Sent — not yet delivered'}
                         >
-                          {m.read_by_recipient ? '✓✓' : '✓'}
+                          {m.read_by_recipient ? '✓✓' : m.delivered ? '✓' : '·'}
                         </span>
                       )}
                     </p>
