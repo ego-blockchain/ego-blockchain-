@@ -65,7 +65,7 @@ interface ShieldedNote {
   commitment: string;
   value_uegoc: number;
   leaf_index: number | null;
-  status: 'pending' | 'ready' | 'spending' | 'spent' | 'cancelled';
+  status: 'pending' | 'ready' | 'spending' | 'settling' | 'spent' | 'cancelled';
   deposit_tx: string;
   spent_tx: string | null;
   created_at: number;
@@ -2973,7 +2973,7 @@ const WalletPage: React.FC = () => {
                 <div className="text-sm font-semibold">Send from the pool</div>
                   {(() => {
                     const ready = (shielded?.notes ?? []).filter(n => n.status === 'ready');
-                    const settling = (shielded?.notes ?? []).filter(n => n.status === 'pending' || n.status === 'spending');
+                    const settling = (shielded?.notes ?? []).filter(n => n.status === 'pending');
                     const avail = ready.reduce((a, n) => a + n.value_uegoc, 0);
                     return (
                       <div className="rounded-xl bg-gray-800/60 border border-gray-700 px-4 py-3">
@@ -3099,6 +3099,10 @@ const WalletPage: React.FC = () => {
                         <span className="text-gray-500 flex-1">
                           {n.status === 'cancelled'
                             ? 'cancelled · the coins stayed transparent'
+                            : n.status === 'settling'
+                            ? 'sent · waiting for the network to agree'
+                            : n.status === 'spending'
+                            ? 'sending…'
                             : `in the pool${n.status === 'ready' ? '' : ' · settling'}`}
                         </span>
                         <span className="text-gray-600">

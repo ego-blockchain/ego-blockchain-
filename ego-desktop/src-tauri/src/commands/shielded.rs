@@ -181,11 +181,26 @@ fn note_status(n: &StoredNote) -> (String, Option<u64>) {
     let commitment: Option<[u8; 32]> = hex::decode(&n.commitment).ok().and_then(|v| v.try_into().ok());
     let leaf_index = commitment.and_then(|c| shielded_chain::leaf_index_of(&c));
     let status = if let Some(spent_tx) = n.spent_tx.as_deref() {
+        // Delivered means the committee agreed, not that this node happens to hold a block
+        // containing it. A block sitting below the finalized height can still be reorged
+        // away, and telling the owner their coins arrived while the recipient's node has
+        // never seen them is the worst thing this screen can do — they believe they have
+        // paid, and they have not.
+        let finalized = crate::chain_db::finalized_height();
         let confirmed = crate::chain_db::get_tx_by_hash(spent_tx)
-            .map(|t| t.block_height.is_some())
+            .and_then(|t| t.block_height)
+            .map(|h| h > 0 && h <= finalized)
             .unwrap_or(false);
-        if confirmed || shielded_chain::is_nullifier_spent(&n.note.nullifier()) {
+        if confirmed {
             "spent"
+        } else if crate::chain_db::get_tx_by_hash(spent_tx)
+            .map(|t| t.block_height.is_some())
+            .unwrap_or(false)
+            || shielded_chain::is_nullifier_spent(&n.note.nullifier())
+        {
+            // In a block this node holds, but not yet one the committee has settled. The
+            // note is gone either way, so it must not read as spendable.
+            "settling"
         } else if withdrawal_abandoned(spent_tx, n.spent_at) {
             "ready"
         } else {
