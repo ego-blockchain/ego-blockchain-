@@ -9949,7 +9949,17 @@ pub async fn ingest_sideband_bytes(
             if tx.transport.is_empty() {
                 tx.transport = source.to_string();
             }
+            let onward = tx.clone();
             apply_incoming_tx(tx, block, app).await;
+            // Carry it onto the network. The sender deliberately did not gossip — they chose
+            // the radio because the internet path was not available to them — so this node is
+            // the bridge, and without it the transaction reaches only whoever else reads the
+            // same spool. It would then land in a block only if one of those few happened to
+            // be the elected proposer, and never at all if the rest of the committee sits on
+            // another machine.
+            tokio::spawn(async move {
+                broadcast_pending_tx(onward).await;
+            });
             Ok(())
         }
         _ => Err(format!("sideband from {source}: only transactions are accepted")),
