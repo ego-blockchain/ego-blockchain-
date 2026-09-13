@@ -285,10 +285,21 @@ pub async fn send_transaction(
         }
     }
 
+    // A radio send has not been handed to the network, only to the link. Saying it confirms
+    // within the next batch window is the one thing it certainly does not do: it waits until
+    // a node with a connection reads it off the link and passes it on, and if nobody is
+    // listening it waits for ever. Say so, rather than let it look like an ordinary send
+    // that has gone quiet.
+    let message = if request.via_radio.unwrap_or(false) {
+        "Handed to the offline link. It stays pending until a node with a connection picks          it up and passes it on."
+    } else {
+        "Transaction queued — confirms within the next batch window"
+    };
+
     Ok(TransactionResponse {
         hash:           tx_hash,
         success:        true,
-        message:        "Transaction queued — confirms within the next batch window".into(),
+        message:        message.into(),
         block_height:   None,
         signed_summary: Some(summary),
     })
