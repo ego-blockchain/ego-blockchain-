@@ -65,7 +65,7 @@ interface ShieldedNote {
   commitment: string;
   value_uegoc: number;
   leaf_index: number | null;
-  status: 'pending' | 'ready' | 'spending' | 'settling' | 'spent' | 'cancelled';
+  status: 'pending' | 'ready' | 'spending' | 'settling' | 'spent' | 'cancelled' | 'returned';
   deposit_tx: string;
   spent_tx: string | null;
   created_at: number;
@@ -3097,7 +3097,9 @@ const WalletPage: React.FC = () => {
                         <span className="text-amber-300">↓</span>
                         <span className="font-semibold">{(n.value_uegoc / 1_000_000).toLocaleString()} EGOC</span>
                         <span className="text-gray-500 flex-1">
-                          {n.status === 'cancelled'
+                          {n.status === 'returned'
+                            ? 'never reached a block · the coins were returned'
+                            : n.status === 'cancelled'
                             ? 'cancelled · the coins stayed transparent'
                             : n.status === 'settling'
                             ? 'sent · waiting for the network to agree'

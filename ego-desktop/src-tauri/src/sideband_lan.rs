@@ -47,7 +47,10 @@ impl LanTransport {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(LAN_SIDEBAND_PORT);
+        Self::bind_on(port)
+    }
 
+    pub fn bind_on(port: u16) -> Result<Self, String> {
         let socket = bind_shared(port)?;
         socket.set_broadcast(true).map_err(|e| format!("broadcast: {e}"))?;
         socket
@@ -132,9 +135,8 @@ mod tests {
     #[test]
     fn a_frame_broadcast_on_the_segment_comes_back_to_a_listener() {
         let port = 47_500 + (std::process::id() % 200) as u16;
-        std::env::set_var("EGO_SIDEBAND_LAN_PORT", port.to_string());
-        let Ok(sender) = LanTransport::bind() else { return };
-        let Ok(mut listener) = LanTransport::bind() else { return };
+        let Ok(sender) = LanTransport::bind_on(port) else { return };
+        let Ok(mut listener) = LanTransport::bind_on(port) else { return };
         // A second node on the same machine has its own tag, or it would discard everything
         // the first one says as its own echo.
         listener.tag = b"otherpc\0".to_vec();
@@ -158,8 +160,7 @@ mod tests {
     #[test]
     fn a_node_ignores_its_own_broadcast() {
         let port = 47_800 + (std::process::id() % 150) as u16;
-        std::env::set_var("EGO_SIDEBAND_LAN_PORT", port.to_string());
-        let Ok(node) = LanTransport::bind() else { return };
+        let Ok(node) = LanTransport::bind_on(port) else { return };
         let frames = split(b"mine", node.max_payload(), 3);
         if node.send_frame(&frames[0]).is_err() {
             return;

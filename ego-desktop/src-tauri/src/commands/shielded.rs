@@ -177,6 +177,37 @@ fn withdrawal_abandoned(spent_tx: &str, spent_at: Option<i64>) -> bool {
         .any(|t| t.hash == spent_tx)
 }
 
+/// A deposit that never reached a block moved nothing: the coins are still in the ordinary
+/// balance, because a transaction that does not execute does not spend anything. What was
+/// missing is anything to say so. The note sat waiting on a commitment the tree would never
+/// hold, and the owner saw coins that were neither transparent nor in the pool — which reads
+/// exactly like losing them.
+///
+/// Same rule as an abandoned withdrawal, and the same refusal to guess while this node is
+/// behind: a deposit may well have landed in a block not read yet.
+fn deposit_abandoned(deposit_tx: &str, created_at: i64) -> bool {
+    if crate::p2p::network_tip() > crate::chain_db::local_chain_height() {
+        return false;
+    }
+    if crate::chain_db::get_tx_by_hash(deposit_tx)
+        .map(|t| t.block_height.is_some())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let waited = chrono::Utc::now().timestamp().saturating_sub(created_at);
+    if waited >= WITHDRAWAL_DEAD_SECS {
+        return true;
+    }
+    if waited < WITHDRAWAL_GRACE_SECS {
+        return false;
+    }
+    !crate::mempool::get_mempool()
+        .peek_all()
+        .iter()
+        .any(|t| t.hash == deposit_tx)
+}
+
 fn note_status(n: &StoredNote) -> (String, Option<u64>) {
     let commitment: Option<[u8; 32]> = hex::decode(&n.commitment).ok().and_then(|v| v.try_into().ok());
     let leaf_index = commitment.and_then(|c| shielded_chain::leaf_index_of(&c));
@@ -212,6 +243,10 @@ fn note_status(n: &StoredNote) -> (String, Option<u64>) {
         "ready"
     } else if n.cancelled_at.is_some() {
         "cancelled"
+    } else if deposit_abandoned(&n.deposit_tx, n.created_at) {
+        // Never landed, and long enough ago that it will not. The coins were never taken, so
+        // say so instead of leaving them looking lost.
+        "returned"
     } else {
         "pending"
     };
@@ -409,8 +444,26 @@ pub async fn shielded_status() -> Result<ShieldedStatus, EgoDesktopError> {
                 if !gone && withdrawal_abandoned(&tx, n.spent_at) {
                     n.spent_tx = None;
                     n.spent_at = None;
+                    crate::mempool::get_mempool().remove_txs(std::slice::from_ref(&tx));
+                    crate::commands::tx_pending::remove(&tx);
                     recovered = true;
                 }
+                continue;
+            }
+            // A deposit that will not arrive. Clearing the pending record is the part that
+            // gives the coins back on screen: until it goes they are counted as already on
+            // their way out, so the balance stays short by an amount that was never actually
+            // spent. The note is marked rather than deleted, exactly as a cancelled deposit
+            // is, so a late arrival still becomes spendable.
+            if n.cancelled_at.is_none() && deposit_abandoned(&n.deposit_tx, n.created_at) {
+                let tx = n.deposit_tx.clone();
+                n.cancelled_at = Some(chrono::Utc::now().timestamp());
+                crate::mempool::get_mempool().remove_txs(std::slice::from_ref(&tx));
+                crate::commands::tx_pending::remove(&tx);
+                tracing::warn!(
+                    "[Shielded] deposit {tx} never reached a block — the coins were never taken and stay in the ordinary balance"
+                );
+                recovered = true;
             }
         }
         if recovered {
