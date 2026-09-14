@@ -6180,6 +6180,11 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     termination_rebcast.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     termination_rebcast.tick().await;
 
+    let mut mdns_recheck = tokio::time::interval(Duration::from_secs(5));
+    mdns_recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    mdns_recheck.tick().await;
+    let mut mdns_watch = crate::mdns_reset::Watch::starting_at(&get_local_ip());
+
     if std::env::var("EGO_DATA_DIR").is_ok() && crate::ledger::load_seed().ok().flatten().is_none() {
         let _ = std::fs::create_dir_all(crate::ledger::data_dir());
         let mut seed = [0u8; 32];
@@ -6519,6 +6524,23 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
                             eprintln!("[Relay] Dialling community relay: {}", ma);
                             let _ = swarm.dial(ma);
                         }
+                    }
+                }
+            }
+
+            _ = mdns_recheck.tick() => {
+                let ip = get_local_ip();
+                if mdns_watch.tick(&ip) {
+                    let me = *swarm.local_peer_id();
+                    match mdns::tokio::Behaviour::new(mdns::Config::default(), me) {
+                        Ok(fresh) => {
+                            swarm.behaviour_mut().mdns = fresh;
+                            tracing::info!(
+                                "[P2P] this machine is now {} — rebuilt local peer discovery, which stays bound to the address it started on and would otherwise never find anyone on the new network",
+                                ip
+                            );
+                        }
+                        Err(e) => tracing::warn!("[P2P] could not rebuild local peer discovery on {}: {}", ip, e),
                     }
                 }
             }

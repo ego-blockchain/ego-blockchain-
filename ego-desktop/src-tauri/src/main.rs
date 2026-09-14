@@ -30,6 +30,7 @@ mod error;
 mod l2;
 mod ledger;
 mod maintenance;
+mod mdns_reset;
 mod mempool;
 mod p2p;
 mod poc;
