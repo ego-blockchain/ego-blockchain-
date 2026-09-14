@@ -757,6 +757,15 @@ fn proven_witnesses_in(db: &DB, addr: &str, tip: u64) -> u64 {
 
 /// How many distinct peers have lately witnessed this node's beacon, from committed chain
 /// state rather than gossip, so every node scores it identically.
+/// Witnesses counted as of `at` rather than as of now. The committee for a height is read
+/// from a snapshot, and the weights that decide whose turn it is have to come from the same
+/// snapshot: two nodes at different tips otherwise compute different weights for the same
+/// height, walk the rota differently, and reject each other's proposals.
+pub fn proven_witnesses_as_of(addr: &str, at: u64) -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    proven_witnesses_in(db, addr, at)
+}
+
 pub fn proven_witnesses(addr: &str) -> u64 {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let tip = db
@@ -765,6 +774,12 @@ pub fn proven_witnesses(addr: &str) -> u64 {
         .map(|v| read_u64_le(&v))
         .unwrap_or(0);
     proven_witnesses_in(db, addr, tip)
+}
+
+/// Storage counted as of `at`, for the same reason the witnesses are.
+pub fn proven_storage_bytes_as_of(addr: &str, at: u64) -> u64 {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    proven_storage_bytes_in(db, addr, at)
 }
 
 pub fn proven_storage_bytes(addr: &str) -> u64 {
@@ -7560,5 +7575,33 @@ mod trusted_block_tests {
             "a complete block is still written",
         );
         assert_eq!(get_txs_for_block(base).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod weight_snapshot_tests {
+    use super::*;
+
+    /// Everything that decides whose turn it is to propose has to come from one snapshot.
+    /// Freezing the membership while letting the weights move with local progress leaves the
+    /// same disagreement it was meant to prevent: two nodes at different tips walk different
+    /// rotas for the same height, and each rejects the other's proposal.
+    #[test]
+    fn two_nodes_deciding_one_height_read_their_weights_from_the_same_place() {
+        let height = 33u64;
+        // Whatever either node's own tip is, the height being decided fixes the snapshot.
+        let boundary = committee_epoch_boundary(height);
+        assert_eq!(committee_epoch_boundary(height), boundary);
+        assert!(boundary < height, "a node deciding a height has already applied the snapshot");
+
+        // And it only moves on a boundary, so the rota is stable for a whole epoch rather
+        // than shifting under a node every time it applies a block.
+        for h in (boundary + 1)..=(boundary + COMMITTEE_EPOCH) {
+            assert_eq!(
+                committee_epoch_boundary(h),
+                boundary,
+                "height {h} must read the same weights as every other height in its epoch",
+            );
+        }
     }
 }

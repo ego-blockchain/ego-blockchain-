@@ -2435,8 +2435,16 @@ pub fn validator_weight(addr: &str) -> u64 {
     // peers witness its beacon and those receipts are committed on-chain. This is the part
     // that lets a network with no storage customers still weigh its validators by
     // contribution rather than by who arrived first.
-    let witnesses = crate::chain_db::proven_witnesses(addr);
-    let gb = crate::chain_db::proven_storage_bytes(addr) / 1_000_000_000;
+    // Read at the epoch boundary, not at this node's tip. Freezing who is on the committee
+    // was only half of it: the weights decide whose turn it is, so if they move with local
+    // progress then two nodes at different heights walk different rotas for the same block
+    // and each rejects the other's proposal as coming from the wrong proposer. Equal weights
+    // hid this until contribution began to differ between members.
+    let boundary = crate::chain_db::committee_epoch_boundary(
+        crate::chain_db::local_chain_height().saturating_add(1),
+    );
+    let witnesses = crate::chain_db::proven_witnesses_as_of(addr, boundary);
+    let gb = crate::chain_db::proven_storage_bytes_as_of(addr, boundary) / 1_000_000_000;
     let staked = crate::ledger::get_validator_stake(addr) / crate::tokenomics::UEGOC_PER_EGOC;
     SEATED_WEIGHT
         .saturating_add(witnesses)
