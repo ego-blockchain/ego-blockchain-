@@ -4954,6 +4954,8 @@ pub async fn sync_chain_from_peers() {
         STUCK_ROUNDS.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
+    heal_unservable_heights().await;
+
     let msg = P2PMessage::ChainSyncRequest { requester_endpoint: my_endpoint.clone(), from_height };
 
     // Broadcast request over gossip to reach NAT-traversing peers
@@ -10285,6 +10287,83 @@ pub async fn request_snapshot_from_peers(have_height: u64) {
     }
 }
 
+/// A height nobody can serve in full must not stop the chain.
+///
+/// A block is refused when fewer transactions arrive than it says it carries, because
+/// writing it short leaves an index that can never be replayed. Refusing alone is not
+/// enough: the height is then asked for again, from the same peers, with the same result,
+/// for ever. This is what does something about it once the waiting is over.
+pub async fn heal_unservable_heights() {
+    let waiting = crate::block_heal::pending();
+    if waiting.is_empty() {
+        return;
+    }
+    let local_tip = tokio::task::spawn_blocking(|| crate::chain_db::latest_block_info().0)
+        .await
+        .unwrap_or(0);
+    crate::block_heal::forget_below(local_tip.saturating_add(1));
+    let network_tip = NETWORK_BEST_HEIGHT.load(Ordering::Relaxed);
+    let now = Utc::now().timestamp();
+
+    for (height, s) in waiting {
+        if height <= local_tip {
+            crate::block_heal::clear(height);
+            continue;
+        }
+        match crate::block_heal::verdict(height, local_tip, network_tip, &s, now) {
+            crate::block_heal::Verdict::KeepAsking => {}
+            crate::block_heal::Verdict::RedoHeight => redo_height(height, &s),
+            crate::block_heal::Verdict::SkipWithSnapshot => {
+                tracing::warn!(
+                    "[Heal] block #{} never arrived whole ({} of {} transactions, {} attempt(s)) and the network is already at #{} — taking a state snapshot rather than producing a different block at a height others have built on",
+                    height, s.best_got, s.claimed, s.tries, network_tip
+                );
+                crate::block_heal::clear(height);
+                request_snapshot_from_peers(snapshot_request_height(local_tip)).await;
+            }
+        }
+    }
+}
+
+/// Throw the frontier height away and produce it again.
+///
+/// Safe only because nothing is built on it: no node has a block whose parent is the one
+/// being discarded, so a different block at this height replaces nothing. Its transactions
+/// were never confirmed by anyone, so they go back to the mempool as pending rather than
+/// being lost, and the next proposer picks them up.
+fn redo_height(height: u64, s: &crate::block_heal::Short) {
+    let mut returned = 0usize;
+    {
+        let mut staged = staged_block();
+        if staged.as_ref().map(|(b, _)| b.height == height).unwrap_or(false) {
+            if let Some((_, stamped)) = staged.take() {
+                let pool = crate::mempool::get_mempool();
+                for tx in stamped
+                    .iter()
+                    .filter(|t| !t.from.is_empty() && t.from != crate::chain_db::NODE_POOL_ADDR)
+                {
+                    if crate::chain_db::get_tx_by_hash(&tx.hash).is_none() {
+                        let mut pending_tx = tx.clone();
+                        pending_tx.status = "Pending".to_string();
+                        pending_tx.block_height = None;
+                        returned += 1;
+                        let _ = pool.push(pending_tx);
+                    }
+                }
+            }
+        }
+    }
+    pending_proposals().remove(&height);
+    view_change_votes().remove(&height);
+    crate::block_heal::clear(height);
+    let next_round = round_at_height(height).saturating_add(1);
+    advance_view(height.saturating_add(next_round));
+    tracing::warn!(
+        "[Heal] no peer served block #{} whole after {}s and {} attempt(s) — the fullest any of them managed was {} of {} transactions. Discarding that block and asking for the height to be produced again at round {}; {} transaction(s) went back to the mempool and none were confirmed.",
+        height, crate::block_heal::GRACE_SECS, s.tries, s.best_got, s.claimed, next_round, returned
+    );
+}
+
 async fn merge_remote_chain(
     blocks: Vec<LedgerBlock>, transactions: Vec<LedgerTx>, app: Option<&tauri::AppHandle<tauri::Wry>>,
 ) {
@@ -10637,6 +10716,19 @@ fn merge_remote_chain_blocking(
                 });
                 block_txs.truncate(claimed);
             }
+            if block_txs.len() < claimed {
+                let s = crate::block_heal::note_short_serve(
+                    block.height, block_txs.len() as u32, block.tx_count, Utc::now().timestamp(),
+                );
+                if s.tries == 1 {
+                    tracing::warn!(
+                        "[Sync] block #{} arrived with {} of the {} transaction(s) it claims — waiting up to {}s for a peer that can serve it whole",
+                        block.height, block_txs.len(), block.tx_count, crate::block_heal::GRACE_SECS
+                    );
+                }
+                continue;
+            }
+            crate::block_heal::clear(block.height);
             if let Err(reason) = crate::chain_db::validate_peer_block(&block, &block_txs) {
                 note_block_rejected(block.height, &reason);
                 let now = Utc::now().timestamp();
@@ -10812,6 +10904,7 @@ async fn merge_remote_chain_inner(
     if peer_ahead {
         ORACLE_GAP_FILL_NEEDED.store(true, Ordering::Relaxed);
     }
+    heal_unservable_heights().await;
 }
 
 /// Oracle-backed peer rendezvous. Registers THIS node's dialable relayed

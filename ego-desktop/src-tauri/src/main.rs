@@ -18,6 +18,7 @@ mod sideband_spool;
 mod sideband_lan;
 mod bft_committee;
 mod bls_agg;
+mod block_heal;
 mod blocks;
 mod ecvrf;
 mod chain_db;
