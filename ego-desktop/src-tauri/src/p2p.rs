@@ -2890,6 +2890,15 @@ fn current_wallet_keypair_for_announce() -> Option<ego_core::KeyPair> {
     ego_core::KeyPair::from_pq_cache(&pq, &seed).ok()
 }
 
+/// A stable id for an announce, so repeats of the same one are recognised as repeats rather
+/// than treated as a stream of new messages by the reassembler.
+fn msg_address_for_id(msg: &P2PMessage) -> String {
+    match msg {
+        P2PMessage::PeerAnnounce { address, .. } => address.clone(),
+        _ => String::new(),
+    }
+}
+
 fn peer_announce_signing_data(
     address: &str,
     endpoint: &str,
@@ -5124,6 +5133,25 @@ pub async fn broadcast_peer_announce(app: Option<&tauri::AppHandle<tauri::Wry>>)
     };
 
     if let Ok(data) = serde_json::to_vec(&msg) {
+        // Also shout it on the local segment. Gossip needs a working mesh and the direct
+        // sends below need addresses that are still valid — a change of network takes both
+        // away at once, which is how a node ends up with plenty of peers while every
+        // committee member quietly goes stale. A broadcast depends on neither, so the
+        // committee finds itself again on whatever segment it has landed on, every time.
+        if crate::sideband::has_transport() {
+            // Varies per announce. The reassembler keys partial messages by id and clears
+            // one once it completes, so repeats are fine — but two announces in flight at
+            // once under a single id would interleave their frames into nonsense.
+            let id = sideband_msg_id(&format!(
+                "announce:{}:{}",
+                msg_address_for_id(&msg),
+                chrono::Utc::now().timestamp()
+            ));
+            let payload = data.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::sideband::broadcast(&payload, id);
+            });
+        }
         publish_gossip("ego-peers-v1", data).await;
     }
 
@@ -10081,8 +10109,20 @@ pub async fn ingest_sideband_bytes(
             }
             Ok(())
         }
+        // Finding each other again after the network changes cannot depend on knowing where
+        // anyone is, because that is exactly the knowledge a network change invalidates.
+        // Every cached endpoint is on the old subnet, and an announce sent to those reaches
+        // nobody. A broadcast needs no address, so it works on whatever segment the machines
+        // have just landed on, however many times that happens.
+        //
+        // An announce carries its own signature and is put through the same identity check
+        // as one arriving over gossip, so nothing is trusted for having been shouted.
+        ann @ P2PMessage::PeerAnnounce { .. } => {
+            handle_incoming(ann, app).await;
+            Ok(())
+        }
         _ => Err(format!(
-            "sideband from {source}: only transactions and sealed messages are accepted"
+            "sideband from {source}: only transactions, sealed messages and announces are accepted"
         )),
     }
 }
