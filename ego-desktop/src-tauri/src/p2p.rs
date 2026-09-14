@@ -1186,9 +1186,22 @@ pub fn committee_source() -> (Vec<String>, bool) {
     (live, false)
 }
 
+/// What the committee is, for noticing when it changes.
+///
+/// Membership alone was not enough. Weight decides whose turn it is to propose just as
+/// much as membership decides who may, and the engine is only ever handed weights when it
+/// is built. So a member's contribution could change, every node would agree the
+/// membership was identical, nothing would be rebuilt, and the node would keep walking a
+/// rota its peers had left behind — with no event, no timeout, and no way back.
 fn live_committee_sig() -> String {
     let (members, from_chain) = committee_source();
-    format!("{}|{}", if from_chain { "chain" } else { "live" }, members.join(","))
+    // Each member carries its own weight, so this says nothing about order — which matters,
+    // because this list is sorted by bech32 address and the engine's is not.
+    let parts: Vec<String> = members
+        .iter()
+        .map(|a| format!("{a}:{}", validator_weight(a)))
+        .collect();
+    format!("{}|{}", if from_chain { "chain" } else { "live" }, parts.join(","))
 }
 
 async fn maybe_reconfigure_committee() {
@@ -2445,7 +2458,10 @@ pub fn validator_weight(addr: &str) -> u64 {
     );
     let witnesses = crate::chain_db::proven_witnesses_as_of(addr, boundary);
     let gb = crate::chain_db::proven_storage_bytes_as_of(addr, boundary) / 1_000_000_000;
-    let staked = crate::ledger::get_validator_stake(addr) / crate::tokenomics::UEGOC_PER_EGOC;
+    // Replayed from the blocks up to the boundary, not read from the running total. The
+    // running total is whatever this node happens to have applied, so two nodes holding
+    // the same committee still weighed it differently and elected different proposers.
+    let staked = crate::chain_db::stake_as_of(addr, boundary) / crate::tokenomics::UEGOC_PER_EGOC;
     SEATED_WEIGHT
         .saturating_add(witnesses)
         .saturating_add(gb.saturating_mul(3))

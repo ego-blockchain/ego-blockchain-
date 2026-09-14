@@ -998,7 +998,7 @@ mod validator_liveness_tests {
         v
     }
 
-    fn seen(pairs: &[(&str, u64)]) -> HashMap<String, u64> {
+    fn seen(pairs: &[(&str, u64)]) -> std::collections::HashMap<String, u64> {
         pairs.iter().map(|(a, h)| (a.to_string(), *h)).collect()
     }
 
@@ -2775,7 +2775,11 @@ pub fn get_tx_by_hash(hash: &str) -> Option<LedgerTx> {
 /// Return all transactions confirmed in block `height`, in insertion order.
 /// Used by the light-client Merkle proof generator.
 pub fn get_txs_for_block(height: u64) -> Vec<LedgerTx> {
-    let db           = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    txs_for_block_in(&db, height)
+}
+
+fn txs_for_block_in(db: &DB, height: u64) -> Vec<LedgerTx> {
     let cf_block_txs = db.cf_handle(CF_BLOCK_TXS).unwrap();
     let cf_txs       = db.cf_handle(CF_TXS).unwrap();
     let prefix       = height_key(height);
@@ -2804,6 +2808,65 @@ pub fn get_txs_for_block(height: u64) -> Vec<LedgerTx> {
     }
     out.sort_by_key(|(ordinal, _)| *ordinal);
     out.into_iter().map(|(_, tx)| tx).collect()
+}
+
+/// Stake as it stood at `boundary`, replayed from the blocks rather than read from the
+/// running total.
+///
+/// The running total is the only input to a validator's weight that has no height on it.
+/// Everything else the weight is built from is read as of the epoch boundary, so every
+/// node computes the same number for the same block. Stake was read live, from a map that
+/// each node fills in as it applies transactions — so a node that had applied one more
+/// block, or restarted, or simply started later, carried a different number. The weights
+/// then differ, `proposer_at` walks a different rota, and each node rejects the other's
+/// block as coming from the wrong proposer. Nothing recovers from that: it is not a
+/// timeout, so waiting does not help, and every round elects a proposer the others also
+/// refuse.
+///
+/// Slashing is not replayed here. A slashed validator is jailed, and the jail list is
+/// already read as of the same boundary, so it has no seat whose weight could matter.
+pub fn stake_as_of(addr: &str, boundary: u64) -> u64 {
+    if boundary == 0 || addr.is_empty() {
+        return 0;
+    }
+    {
+        let cache = stake_as_of_cache();
+        if cache.0 == boundary {
+            return cache.1.get(addr).copied().unwrap_or(0);
+        }
+    }
+    let table = {
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let mut table: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for h in 1..=boundary {
+            apply_stake_txs(&mut table, &txs_for_block_in(&db, h));
+        }
+        table
+    };
+    let got = table.get(addr).copied().unwrap_or(0);
+    *stake_as_of_cache() = (boundary, table);
+    got
+}
+
+static STAKE_AS_OF: OnceLock<std::sync::Mutex<(u64, std::collections::HashMap<String, u64>)>> = OnceLock::new();
+
+fn stake_as_of_cache() -> std::sync::MutexGuard<'static, (u64, std::collections::HashMap<String, u64>)> {
+    STAKE_AS_OF
+        .get_or_init(|| std::sync::Mutex::new((0, std::collections::HashMap::new())))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn apply_stake_txs(table: &mut std::collections::HashMap<String, u64>, txs: &[LedgerTx]) {
+    for tx in txs {
+        if is_stake_tx(tx) {
+            let e = table.entry(tx.from.clone()).or_insert(0);
+            *e = e.saturating_add(tx.amount);
+        } else if is_unstake_tx(tx) {
+            let e = table.entry(tx.from.clone()).or_insert(0);
+            *e = e.saturating_sub(tx.amount);
+        }
+    }
 }
 
 /// Full transaction history for an address, ordered by timestamp ascending.
@@ -2843,7 +2906,7 @@ pub fn parallel_apply_txs(txs: &[LedgerTx], db: &DB) -> Vec<(String, u64)> {
     use rayon::prelude::*;
     use std::collections::HashMap;
 
-    let mut by_sender: HashMap<&str, Vec<&LedgerTx>> = HashMap::new();
+    let mut by_sender: HashMap<&str, Vec<&LedgerTx>> = std::collections::HashMap::new();
     for tx in txs {
         by_sender.entry(tx.from.as_str()).or_default().push(tx);
     }
@@ -2874,7 +2937,7 @@ pub fn parallel_apply_txs(txs: &[LedgerTx], db: &DB) -> Vec<(String, u64)> {
         })
         .collect();
 
-    let mut deltas: HashMap<String, i128> = HashMap::new();
+    let mut deltas: HashMap<String, i128> = std::collections::HashMap::new();
     for (addr, delta) in delta_pairs {
         *deltas.entry(addr).or_insert(0) += delta;
     }
@@ -7603,5 +7666,73 @@ mod weight_snapshot_tests {
                 "height {h} must read the same weights as every other height in its epoch",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod stake_snapshot_tests {
+    use super::*;
+
+    const STAKING: &str = STAKING_ADDR;
+
+    fn tx(kind: &str, from: &str, amount: u64) -> LedgerTx {
+        let mut t = LedgerTx::default();
+        t.tx_type = kind.to_string();
+        t.from = from.to_string();
+        t.to = STAKING.to_string();
+        t.amount = amount;
+        t.hash = format!("{kind}-{from}-{amount}");
+        t
+    }
+
+    #[test]
+    fn staking_adds_and_unstaking_takes_back() {
+        let mut table = std::collections::HashMap::new();
+        apply_stake_txs(&mut table, &[tx("stake", "a", 500), tx("stake", "b", 200)]);
+        apply_stake_txs(&mut table, &[tx("unstake", "a", 300)]);
+        assert_eq!(table.get("a").copied(), Some(200));
+        assert_eq!(table.get("b").copied(), Some(200));
+    }
+
+    #[test]
+    fn unstaking_more_than_was_staked_cannot_wrap_into_an_enormous_weight() {
+        let mut table = std::collections::HashMap::new();
+        apply_stake_txs(&mut table, &[tx("stake", "a", 10)]);
+        apply_stake_txs(&mut table, &[tx("unstake", "a", 999_999)]);
+        assert_eq!(
+            table.get("a").copied(),
+            Some(0),
+            "an underflow here would hand one validator every proposer slot",
+        );
+    }
+
+    #[test]
+    fn the_order_blocks_are_replayed_in_does_not_change_the_total() {
+        let forward = {
+            let mut t = std::collections::HashMap::new();
+            apply_stake_txs(&mut t, &[tx("stake", "a", 100)]);
+            apply_stake_txs(&mut t, &[tx("stake", "a", 250)]);
+            t
+        };
+        let mut swapped = std::collections::HashMap::new();
+        apply_stake_txs(&mut swapped, &[tx("stake", "a", 250)]);
+        apply_stake_txs(&mut swapped, &[tx("stake", "a", 100)]);
+        assert_eq!(forward.get("a"), swapped.get("a"));
+    }
+
+    #[test]
+    fn a_transfer_to_the_staking_address_is_not_stake() {
+        let mut table = std::collections::HashMap::new();
+        apply_stake_txs(&mut table, &[tx("transfer", "a", 1_000)]);
+        assert!(table.get("a").is_none(), "only a stake transaction stakes");
+    }
+
+    #[test]
+    fn nothing_is_staked_before_the_first_epoch_boundary() {
+        assert_eq!(
+            stake_as_of("egot1anyone", 0),
+            0,
+            "a chain that has not reached a boundary has no snapshot to weigh anyone by",
+        );
     }
 }
