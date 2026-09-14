@@ -8223,6 +8223,17 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
             let _cg = crate::commands::messenger::CONTACTS_LOCK.lock().unwrap();
             let mut contacts = load_contacts();
             if let Some(existing) = contacts.iter_mut().find(|c| c.address == from_addr) {
+                // They are asking again for somebody we already hold, which means their side
+                // has lost us: deleted, reinstalled, or on a new device. Answering costs
+                // nothing and is the only thing that lets the pair re-form — otherwise they
+                // wait on "pending" for a reply we never send, and the only way back is for
+                // this side to delete the contact too.
+                if existing.status == "approved" {
+                    let who = from_addr.clone();
+                    tokio::spawn(async move {
+                        crate::commands::messenger::reconfirm_contact(&who).await;
+                    });
+                }
                 if !from_endpoint.is_empty() && existing.endpoint != from_endpoint {
                     existing.endpoint = from_endpoint.clone();
                     let _ = save_contacts(&contacts);

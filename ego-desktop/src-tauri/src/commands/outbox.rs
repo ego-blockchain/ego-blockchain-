@@ -62,12 +62,31 @@ pub async fn flush_for(addr: &str, fresh_endpoint: Option<&str>) {
         let ep = fresh_endpoint
             .filter(|e| !e.is_empty())
             .unwrap_or(&entry.endpoint);
-        if ep.is_empty() { continue; }
 
         let Ok(msg) = serde_json::from_str::<crate::p2p::P2PMessage>(&entry.msg_json) else {
             to_remove.push(i);
             continue;
         };
+
+        // Every retry used to be aimed at one stored address, and skipped entirely when
+        // there wasn't one. Change network and that address is a house nobody lives in any
+        // more: the retries go nowhere for ever, and the queued messages never arrive.
+        //
+        // These routes do not depend on knowing where anyone is. The receiver drops a
+        // duplicate by message id, so sending on all of them costs nothing when direct
+        // delivery is about to work anyway.
+        let ed = crate::commands::messenger::contact_ed25519(addr);
+        if !ed.is_empty() {
+            crate::p2p::gossip_sealed_dm(addr, &ed, &msg).await;
+            crate::p2p::sideband_sealed_dm(addr, &ed, &msg).await;
+        }
+
+        if ep.is_empty() {
+            entry.retry_count += 1;
+            let delay = (30u64 * (1u64 << entry.retry_count.min(9))) as i64;
+            entry.retry_at = now + delay;
+            continue;
+        }
 
         match crate::p2p::send_message(ep, &msg).await {
             Ok(_) => {

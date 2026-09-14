@@ -691,6 +691,50 @@ pub async fn approve_contact_request(
     Ok(contact)
 }
 
+/// Answer a contact request from somebody this wallet already has approved.
+///
+/// The two sides can fall out of step: they delete the contact, or reinstall, or move to a
+/// new device, and then ask again. Their side sits on "pending" waiting for an answer, while
+/// this side sees a contact it already has and says nothing — so the pair can never be
+/// re-established without this wallet also deleting and starting over.
+///
+/// Nothing new is granted here. The contact was already approved, the shared key is the one
+/// already agreed, and the reply only tells them what this side already believed.
+pub async fn reconfirm_contact(contact_addr: &str) {
+    let Some(keypair) = crate::app::global_app_state().get_keypair() else { return };
+    let my_addr = Ledger::load().address;
+    if my_addr.is_empty() {
+        return;
+    }
+
+    let (shared_key_hex, peer_ed25519) = {
+        let _cg = CONTACTS_LOCK.lock().unwrap();
+        let contacts = load_contacts();
+        let Some(c) = contacts.iter().find(|c| c.address == contact_addr && c.status == "approved")
+        else {
+            return;
+        };
+        (c.shared_key_hex.clone(), c.ed25519_pubkey.clone())
+    };
+
+    let response = p2p::P2PMessage::ContactResponse {
+        from_addr:     my_addr.clone(),
+        from_name:     my_display_name(),
+        from_ed25519:  hex::encode(keypair.ed25519_public_key().key_data),
+        from_kyber:    hex::encode(keypair.kyber_public_key().as_bytes()),
+        approved:      true,
+        shared_key:    shared_key_hex,
+        from_endpoint: p2p::get_public_endpoint().await,
+    };
+
+    eprintln!("[Messenger] {contact_addr} asked again — re-confirming a contact we already hold");
+    deposit_in_relay_inbox(&my_addr, contact_addr, &response).await;
+    if !peer_ed25519.is_empty() {
+        p2p::gossip_sealed_dm(contact_addr, &peer_ed25519, &response).await;
+        p2p::sideband_sealed_dm(contact_addr, &peer_ed25519, &response).await;
+    }
+}
+
 #[tauri::command]
 pub async fn decline_contact_request(
     state: State<'_, AppState>,
