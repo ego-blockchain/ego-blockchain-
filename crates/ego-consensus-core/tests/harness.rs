@@ -720,3 +720,55 @@ fn equal_weights_elect_the_same_leader_whatever_the_order() {
     let b: Vec<_> = (0..8).map(|r| net.engines[0].proposer_at(1, r).cloned()).collect();
     assert_eq!(a, b, "with nothing to tell members apart the rota is order-independent");
 }
+
+#[test]
+fn asking_for_a_round_is_not_entering_one() {
+    let net = Net::new(4);
+    for e in &net.engines {
+        e.seed_height_round(1, 0);
+    }
+
+    // One node times out and asks to move on. Nothing has agreed yet, so its round must not
+    // move: a single validator cannot rotate the committee by itself, and a log line saying
+    // "round 0 → 1" while the round is still 0 is what made a stuck node look like a
+    // rotating one for a very long time.
+    let _ = net.engines[0].trigger_view_change().expect("trigger");
+    assert_eq!(
+        net.engines[0].current_round_number(),
+        0,
+        "asking must not advance the round on its own",
+    );
+
+    // Repeating the ask changes nothing either. This is the state a committee sits in when
+    // it cannot agree on a height, and it is indistinguishable from progress unless the
+    // round itself is checked.
+    for _ in 0..5 {
+        let _ = net.engines[0].trigger_view_change().expect("trigger");
+    }
+    assert_eq!(net.engines[0].current_round_number(), 0);
+}
+
+#[test]
+fn a_view_change_for_another_height_cannot_move_this_one() {
+    let net = Net::new(4);
+    net.engines[0].seed_height_round(5, 0);
+    for e in net.engines.iter().skip(1) {
+        // The others are behind, which is the ordinary state while a node catches up.
+        e.seed_height_round(4, 0);
+    }
+
+    let mut accepted = 0usize;
+    for e in net.engines.iter().skip(1) {
+        let msg = e.trigger_view_change().expect("trigger");
+        if net.engines[0].receive_view_change(msg).expect("receive").is_some() {
+            accepted += 1;
+        }
+    }
+    assert_eq!(
+        accepted, 0,
+        "view changes from another height are discarded, so a committee split across heights \
+         can never rotate past a proposer that is not producing — which is the deadlock, and \
+         it is silent",
+    );
+    assert_eq!(net.engines[0].current_round_number(), 0);
+}

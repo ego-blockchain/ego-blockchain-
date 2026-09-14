@@ -4,6 +4,7 @@ use ego_core::{Address, Hash, KeyPair, PublicKey, Signature, Timestamp};
 use ego_core::crypto::{hash_data, hash_multiple};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info, warn};
 
@@ -334,6 +335,10 @@ pub struct BftEngine {
     vrf_outputs: Arc<RwLock<HashMap<u64, Hash>>>,
 
     fork_choice: Arc<RwLock<ForkChoiceStore>>,
+    /// How many times running this node has asked to move round without the round moving.
+    /// Non-zero for long means the committee is not agreeing on a round, which looks nothing
+    /// like rotating through rounds even though it used to log the same way.
+    view_change_asks: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl BftEngine {
@@ -357,6 +362,7 @@ impl BftEngine {
             current_height: Arc::new(RwLock::new(0)),
             vrf_outputs: Arc::new(RwLock::new(HashMap::new())),
             fork_choice: Arc::new(RwLock::new(ForkChoiceStore::new())),
+            view_change_asks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -650,7 +656,17 @@ impl BftEngine {
             (joined, s.height, s.epoch, fc.high_qc.clone())
         };
         let msg = ViewChangeMsg::new(new_round, height, epoch, high_qc, &self.keypair, self.scheme)?;
-        warn!("⏱️  View change triggered: round {} → {}", new_round.saturating_sub(1), new_round);
+        // This asks for a round; it does not enter one. The round only moves in
+        // receive_view_change, and only once a quorum of peers has asked for the same round
+        // at the same height. Logging it as though it had already moved made a node stuck
+        // asking for round 2 look like a node rotating through rounds — the same line, over
+        // and over, reading as progress when nothing was happening at all.
+        let asked = self.view_change_asks.fetch_add(1, Ordering::Relaxed) + 1;
+        if asked == 1 || asked % 10 == 0 {
+            warn!(
+                "⏱️  asking the committee to move to round {new_round} at height {height} (asked {asked}x; the round only moves when a quorum asks for the same one)"
+            );
+        }
         Ok(msg)
     }
 
@@ -677,6 +693,7 @@ impl BftEngine {
             if let Some(qc) = best_high_qc {
                 self.fork_choice.write().unwrap().add_qc(qc);
             }
+            self.view_change_asks.store(0, Ordering::Relaxed);
             info!("🚀 Starting new round {} after view change", new_round);
             return Ok(Some(new_round));
         }
