@@ -142,6 +142,21 @@ mod tests {
     }
 
     #[test]
+    fn a_height_offered_short_over_and_over_still_times_out() {
+        clear(303);
+        let mut last = note_short_serve(303, 6, 7, 1_000);
+        for t in 1..40 {
+            last = note_short_serve(303, 6, 7, 1_000 + t);
+        }
+        assert!(
+            waited_out(&last, 1_039),
+            "the clock runs from the first sighting; restarting it on every offer is how              the healing was silently prevented from ever firing",
+        );
+        assert_eq!(last.first_seen, 1_000);
+        clear(303);
+    }
+
+    #[test]
     fn a_healed_height_stops_being_tracked() {
         clear(77);
         note_short_serve(77, 6, 7, 100);

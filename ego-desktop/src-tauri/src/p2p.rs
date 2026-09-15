@@ -10797,7 +10797,13 @@ fn merge_remote_chain_blocking(
                 }
                 continue;
             }
-            crate::block_heal::clear(block.height);
+            // Deliberately not clearing the height here. Arriving whole is not the same as
+            // being written whole: transactions are dropped between the two when a
+            // signature does not verify, and that is where the shortfall appears. Clearing
+            // on arrival wiped the record the append had just made, so the eight second
+            // clock restarted on every pass and the healing could never fire. The append
+            // is the only place that knows the block actually landed, so it is the only
+            // place that clears.
             if let Err(reason) = crate::chain_db::validate_peer_block(&block, &block_txs) {
                 note_block_rejected(block.height, &reason);
                 let now = Utc::now().timestamp();
@@ -10844,7 +10850,27 @@ fn merge_remote_chain_blocking(
         };
         match verify_result {
             Ok(())      => new_txs.push(tx),
-            Err(reason) => eprintln!("[P2P] Sync TX {} rejected — {}", tx.hash, reason),
+            Err(reason) => {
+                // Why a block cannot be assembled. This was on stderr, so the operator saw
+                // the block being refused over and over with no way to learn which
+                // transaction was at fault or why.
+                static LAST_TX_REJECT_LOG: std::sync::OnceLock<Mutex<HashMap<String, i64>>> =
+                    std::sync::OnceLock::new();
+                let now = Utc::now().timestamp();
+                let mut seen = LAST_TX_REJECT_LOG
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if now - seen.get(&reason).copied().unwrap_or(0) >= 30 {
+                    seen.insert(reason.clone(), now);
+                    tracing::warn!(
+                        "[Sync] transaction {:.12} in block #{} refused: {} — the block cannot be assembled without it",
+                        tx.hash,
+                        tx.block_height.unwrap_or(0),
+                        reason
+                    );
+                }
+            }
         }
     }
 
