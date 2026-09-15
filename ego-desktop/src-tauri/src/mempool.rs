@@ -967,11 +967,19 @@ pub async fn run_batch_loop() {
             // investigation down the wrong path for a long time: the operator
             // reads it, counts their validators, sees the number matches, and
             // has no idea what the node is actually complaining about.
-            if known_count >= needed {
+            // The engine's own requirement, not a floor from configuration. A committee of
+            // four needs three to agree; comparing against a minimum of two said quorum was
+            // met while the chain was short of it, every five seconds, for hours.
+            let (seats, must_agree) = crate::p2p::committee_quorum().unwrap_or((known_count, needed));
+            if known_count < must_agree {
                 tracing::warn!(
-                    "Chain has not finalized for {}s with {} validator(s) — the elected                      proposer is not producing. Quorum is met; solo mining is refused, so                      transactions wait for a proposer that answers.",
-                    stuck_secs,
-                    known_count
+                    "Chain has not finalized for {}s: {} of the {} committee node(s) are answering, and {} must agree before a block is final. Transactions are waiting, not lost. Start another committee node.",
+                    stuck_secs, known_count, seats, must_agree
+                );
+            } else if known_count >= needed {
+                tracing::warn!(
+                    "Chain has not finalized for {}s with {} of {} committee node(s) answering and {} needed — enough are here, so the elected proposer is not producing. Solo mining is refused, so transactions wait for a proposer that answers.",
+                    stuck_secs, known_count, seats, must_agree
                 );
                 warn_operator_chain_stalled(stuck_secs.max(0) as u64, known_count);
             } else {

@@ -1107,6 +1107,18 @@ fn v2_committee_sig() -> std::sync::MutexGuard<'static, String> {
 fn v2_pending_sig() -> std::sync::MutexGuard<'static, String> {
     V2_PENDING_SIG.get_or_init(|| std::sync::Mutex::new(String::new())).lock().unwrap()
 }
+/// Seats on the committee and how many of them must agree, straight from the engine that
+/// enforces it.
+///
+/// Nothing else knows this number. The batch loop was comparing the count of answering
+/// validators against a floor of two and announcing that quorum was met, while a
+/// four-seat committee was waiting for three. So the one line an operator reads when the
+/// chain stops told them to look for a broken proposer, when what was missing was a node.
+pub fn committee_quorum() -> Option<(usize, usize)> {
+    let g = shadow_host_lock();
+    g.as_ref().map(|h| (h.validator_set().len(), h.quorum_size()))
+}
+
 pub fn committee_source() -> (Vec<String>, bool) {
     let slashed = slashed_validators();
     // Both filters come from committed chain state, so every node applying the same blocks
