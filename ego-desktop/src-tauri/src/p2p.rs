@@ -3175,6 +3175,13 @@ pub enum P2PMessage {
         requester_endpoint: String,
         #[serde(default)]
         have_height: u64,
+        /// The requester cannot move forward by ordinary sync: the next block cannot be
+        /// assembled from anything any peer will serve. Without this a server applies the
+        /// lag rule and stays silent, and a node nine blocks behind an unreadable height
+        /// asks for ever and is never answered. Absent on older peers, which means false
+        /// and the old behaviour.
+        #[serde(default)]
+        stuck: bool,
     },
     SnapshotResponse {
         snapshot: crate::chain_db::StateSnapshot,
@@ -7598,11 +7605,11 @@ async fn handle_event(
                     }
                 }
             } else if topic == "ego-snapshot-v1" {
-                if let Ok(P2PMessage::SnapshotRequest { requester_endpoint, have_height }) =
+                if let Ok(P2PMessage::SnapshotRequest { requester_endpoint, have_height, stuck }) =
                     serde_json::from_slice::<P2PMessage>(&message.data)
                 {
                     let local_tip = crate::chain_db::latest_block_info().0;
-                    if local_tip > have_height + SNAPSHOT_SERVE_MIN_LAG
+                    if snapshot_serve_allowed(local_tip, have_height, stuck)
                         && !requester_endpoint.is_empty()
                         && sync_reply_allowed(&requester_endpoint)
                     {
@@ -9003,9 +9010,9 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
             }
         }
 
-        P2PMessage::SnapshotRequest { requester_endpoint, have_height } => {
+        P2PMessage::SnapshotRequest { requester_endpoint, have_height, stuck } => {
             let local_tip = crate::chain_db::latest_block_info().0;
-            if local_tip > have_height + SNAPSHOT_SERVE_MIN_LAG
+            if snapshot_serve_allowed(local_tip, have_height, stuck)
                 && !requester_endpoint.is_empty()
                 && sync_reply_allowed(&requester_endpoint)
             {
@@ -10283,6 +10290,20 @@ pub fn snapshot_request_height(my_height: u64) -> u64 {
     my_height.saturating_sub(SNAPSHOT_SERVE_MIN_LAG + 1)
 }
 
+/// Whether to answer a snapshot request.
+///
+/// The lag rule exists so a node one or two blocks behind pulls those blocks rather than a
+/// whole snapshot. It assumes ordinary sync can close the gap. When the requester says it
+/// is stuck that assumption is wrong: it is blocked on a height nobody can serve whole, and
+/// no number of block requests will ever move it. Then the only measure that matters is
+/// whether this node actually holds something newer.
+pub fn snapshot_serve_allowed(local_tip: u64, have_height: u64, stuck: bool) -> bool {
+    if stuck {
+        return local_tip > have_height;
+    }
+    local_tip > have_height + SNAPSHOT_SERVE_MIN_LAG
+}
+
 /// Whether a snapshot describes the chain this build belongs to. A node that wipes its
 /// database and restarts is, for a few seconds, far behind every chain on the network,
 /// and will happily adopt whichever one answers first — including one left running by
@@ -10320,9 +10341,19 @@ fn blocks_are_from_our_network(blocks: &[LedgerBlock]) -> bool {
 }
 
 pub async fn request_snapshot_from_peers(have_height: u64) {
+    ask_peers_for_snapshot(have_height, false).await;
+}
+
+/// Ask for a snapshot as a node that cannot proceed without one, so the lag rule is not
+/// applied to the answer.
+pub async fn request_snapshot_because_stuck(have_height: u64) {
+    ask_peers_for_snapshot(have_height, true).await;
+}
+
+async fn ask_peers_for_snapshot(have_height: u64, stuck: bool) {
     let my_endpoint = get_public_endpoint().await;
     if my_endpoint.is_empty() { return; }
-    let msg = P2PMessage::SnapshotRequest { requester_endpoint: my_endpoint, have_height };
+    let msg = P2PMessage::SnapshotRequest { requester_endpoint: my_endpoint, have_height, stuck };
     if let Ok(data) = serde_json::to_vec(&msg) {
         publish_gossip("ego-snapshot-v1", data).await;
     }
@@ -10388,7 +10419,7 @@ pub async fn heal_unservable_heights() {
                     height, s.best_got, s.claimed, s.tries, network_tip
                 );
                 crate::block_heal::clear(height);
-                request_snapshot_from_peers(snapshot_request_height(local_tip)).await;
+                request_snapshot_because_stuck(snapshot_request_height(local_tip)).await;
             }
         }
     }
@@ -15076,5 +15107,45 @@ mod sideband_dm_tests {
             "the contents must not be legible to whoever carries it",
         );
         assert!(!ct.is_empty(), "and there must actually be a ciphertext");
+    }
+}
+
+#[cfg(test)]
+mod snapshot_serve_tests {
+    use super::{snapshot_request_height, snapshot_serve_allowed, SNAPSHOT_SERVE_MIN_LAG};
+
+    #[test]
+    fn a_node_a_block_or_two_behind_is_told_to_use_ordinary_sync() {
+        assert!(
+            !snapshot_serve_allowed(12, 10, false),
+            "pulling a whole snapshot to close a two block gap is waste",
+        );
+    }
+
+    #[test]
+    fn a_stuck_node_is_answered_even_when_the_gap_is_small() {
+        let have = snapshot_request_height(3);
+        assert_eq!(have, 0, "a tip of 3 cannot ask for anything above 0");
+        assert!(
+            !snapshot_serve_allowed(12, have, false),
+            "this is the deadlock: at tip 3 with the network at 12, no peer clears the lag rule",
+        );
+        assert!(
+            snapshot_serve_allowed(12, have, true),
+            "a node blocked on a height nobody can serve will never close the gap by asking \
+             for blocks, so the lag rule must not silence the one thing that would help",
+        );
+    }
+
+    #[test]
+    fn nothing_is_served_to_a_node_that_is_not_behind_at_all() {
+        assert!(!snapshot_serve_allowed(12, 12, true));
+        assert!(!snapshot_serve_allowed(12, 30, true));
+    }
+
+    #[test]
+    fn the_lag_rule_is_unchanged_for_a_node_that_is_merely_behind() {
+        assert!(!snapshot_serve_allowed(10 + SNAPSHOT_SERVE_MIN_LAG, 10, false));
+        assert!(snapshot_serve_allowed(11 + SNAPSHOT_SERVE_MIN_LAG, 10, false));
     }
 }
