@@ -3142,6 +3142,36 @@ pub fn import_state_snapshot(snap: &StateSnapshot) -> Result<(), String> {
     Ok(())
 }
 
+/// Blocks this node can hand over whole, with their transactions, stopping at the first
+/// one it cannot.
+///
+/// A state snapshot writes recent blocks as records with none of their transactions, on
+/// purpose: it carries state, not history. But nothing stopped a node from then serving
+/// those records to peers. The block says it carries three transactions, none can be read,
+/// and every peer refuses it — correctly, since writing it short would leave an index that
+/// can never be replayed. The peer then falls behind, asks for a snapshot, installs one,
+/// and starts serving the same unreadable blocks to somebody else.
+///
+/// Truncating rather than skipping, because a gap breaks the parent links of everything
+/// after it. Fewer blocks that all apply beats more blocks that cannot.
+pub fn servable_blocks_with_txs(blocks: Vec<LedgerBlock>) -> (Vec<LedgerBlock>, Vec<LedgerTx>) {
+    let mut out_blocks = Vec::with_capacity(blocks.len());
+    let mut out_txs = Vec::new();
+    for b in blocks {
+        let txs = get_txs_for_block(b.height);
+        if (txs.len() as u32) < b.tx_count {
+            tracing::debug!(
+                "[Sync] not serving block #{} onwards: it says it carries {} transaction(s) and this node can read {}",
+                b.height, b.tx_count, txs.len()
+            );
+            break;
+        }
+        out_blocks.push(b);
+        out_txs.extend(txs);
+    }
+    (out_blocks, out_txs)
+}
+
 pub fn get_state_merkle_proof(address: &str) -> Vec<String> {
     // O(N) full state proofs are deprecated in favor of delta roots.
     vec![]
@@ -4341,12 +4371,26 @@ pub fn append_trusted_block(block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     // Refusing leaves the height unwritten, so it is asked for again — which is recoverable,
     // and a silently incomplete block is not.
     if (txs.len() as u32) < block.tx_count {
-        tracing::warn!(
-            "[ChainDB] refusing block #{}: it says it carries {} transaction(s) and only {} arrived",
-            block.height,
-            block.tx_count,
-            txs.len()
-        );
+        // Sync retries this many times a second, and an unservable height is refused on
+        // every one of them. Logging each refusal buried everything else that was wrong,
+        // which is how this went unread for so long.
+        static LAST_SHORT_LOG: OnceLock<std::sync::Mutex<std::collections::HashMap<u64, i64>>> =
+            OnceLock::new();
+        let now = chrono::Utc::now().timestamp();
+        let mut seen = LAST_SHORT_LOG
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let last = seen.get(&block.height).copied().unwrap_or(0);
+        if now - last >= 30 {
+            seen.insert(block.height, now);
+            tracing::warn!(
+                "[ChainDB] refusing block #{}: it says it carries {} transaction(s) and only {} arrived",
+                block.height,
+                block.tx_count,
+                txs.len()
+            );
+        }
         return false;
     }
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
@@ -7733,6 +7777,47 @@ mod stake_snapshot_tests {
             stake_as_of("egot1anyone", 0),
             0,
             "a chain that has not reached a boundary has no snapshot to weigh anyone by",
+        );
+    }
+}
+
+#[cfg(test)]
+mod servable_blocks_tests {
+    use super::*;
+
+    fn blk(height: u64, tx_count: u32) -> LedgerBlock {
+        let mut b = LedgerBlock::default();
+        b.height = height;
+        b.tx_count = tx_count;
+        b.hash = format!("h{height}");
+        b
+    }
+
+    #[test]
+    fn blocks_with_no_transactions_to_read_are_servable() {
+        let (blocks, txs) = servable_blocks_with_txs(vec![blk(1, 0), blk(2, 0)]);
+        assert_eq!(blocks.len(), 2, "an empty block is complete at zero transactions");
+        assert!(txs.is_empty());
+    }
+
+    #[test]
+    fn serving_stops_at_the_first_block_that_cannot_be_read_whole() {
+        let (blocks, _) = servable_blocks_with_txs(vec![blk(1, 0), blk(2, 3), blk(3, 0)]);
+        assert_eq!(
+            blocks.len(),
+            1,
+            "height 3 must not be served over the hole at height 2: its parent link would \
+             point at a block the receiver never got",
+        );
+        assert_eq!(blocks[0].height, 1);
+    }
+
+    #[test]
+    fn nothing_is_served_when_the_very_first_block_is_short() {
+        let (blocks, txs) = servable_blocks_with_txs(vec![blk(9, 3), blk(10, 0)]);
+        assert!(
+            blocks.is_empty() && txs.is_empty(),
+            "serving a block every peer must refuse is what spread the stall between nodes",
         );
     }
 }

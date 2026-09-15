@@ -7570,10 +7570,7 @@ async fn handle_event(
                                 if crate::chain_db::block_count() == 0 { return (vec![], vec![]); }
                                 let start = from_height.max(1);
                                 let blocks = crate::chain_db::get_blocks_range(start, 500);
-                                let transactions: Vec<crate::ledger::LedgerTx> = blocks.iter()
-                                    .flat_map(|b| crate::chain_db::get_txs_for_block(b.height))
-                                    .collect();
-                                (blocks, transactions)
+                                crate::chain_db::servable_blocks_with_txs(blocks)
                             }).await.unwrap_or_default();
                             if blocks.is_empty() { return; }
                             tracing::info!("sync-v1: sending {} blocks ({} txs) from height {} to {}",
@@ -8788,10 +8785,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                         if tip == 0 { return (vec![], vec![]); }
                         let start = tip.saturating_sub(200).max(1);
                         let blocks = crate::chain_db::get_blocks_range(start, 200);
-                            let transactions: Vec<crate::ledger::LedgerTx> = blocks.iter()
-                                .flat_map(|b| crate::chain_db::get_txs_for_block(b.height))
-                                .collect();
-                            (blocks, transactions)
+                            crate::chain_db::servable_blocks_with_txs(blocks)
                         }).await.unwrap_or_default();
                         if blocks.is_empty() { return; }
                         let response = P2PMessage::ChainSyncResponse { blocks, transactions };
@@ -8984,11 +8978,8 @@ P2PMessage::ReadReceipt { from, to, message_ids } => {
                 tokio::spawn(async move {
                     let (blocks, transactions) = tokio::task::spawn_blocking(move || {
                     let start = from_height.max(1);
-                    let blocks = crate::chain_db::get_blocks_range(start, 500); // 500 blocks per jump
-                        let transactions: Vec<crate::ledger::LedgerTx> = blocks.iter()
-                            .flat_map(|b| crate::chain_db::get_txs_for_block(b.height))
-                            .collect();
-                        (blocks, transactions)
+                    let blocks = crate::chain_db::get_blocks_range(start, 500);
+                        crate::chain_db::servable_blocks_with_txs(blocks)
                     }).await.unwrap_or_default();
                     tracing::debug!("[P2P] sync reply: {} blocks ({} txs) from height {}",
                         blocks.len(), transactions.len(), from_height + 1);
@@ -10325,6 +10316,30 @@ pub async fn request_snapshot_from_peers(have_height: u64) {
     }
 }
 
+/// Append a synced block, or record that nobody could serve it whole.
+///
+/// The shortfall is only knowable here. Transactions are dropped between arriving and
+/// being written — a signature that does not verify is discarded — so counting them as
+/// they arrive says a block is complete when what actually reaches the store is not. That
+/// is the count the refusal is made on, so it has to be the count the healing watches, or
+/// the height is refused for ever and nothing ever notices it is stuck.
+fn append_synced_block(block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
+    if (txs.len() as u32) < block.tx_count {
+        let s = crate::block_heal::note_short_serve(
+            block.height, txs.len() as u32, block.tx_count, Utc::now().timestamp(),
+        );
+        if s.tries == 1 {
+            tracing::warn!(
+                "[Sync] block #{} can only be assembled with {} of the {} transaction(s) it claims — waiting up to {}s for a peer that can serve it whole",
+                block.height, txs.len(), block.tx_count, crate::block_heal::GRACE_SECS
+            );
+        }
+        return false;
+    }
+    crate::block_heal::clear(block.height);
+    crate::chain_db::append_trusted_block(block, txs)
+}
+
 /// A height nobody can serve in full must not stop the chain.
 ///
 /// A block is refused when fewer transactions arrive than it says it carries, because
@@ -10342,13 +10357,17 @@ pub async fn heal_unservable_heights() {
     crate::block_heal::forget_below(local_tip.saturating_add(1));
     let network_tip = NETWORK_BEST_HEIGHT.load(Ordering::Relaxed);
     let now = Utc::now().timestamp();
+    // A node that follows the chain without proposing cannot produce a replacement block,
+    // so for it the only way past an unservable height is a snapshot. Telling it to redo
+    // the height would clear the tracking and leave it asking for the same block again.
+    let can_redo = shadow_host_lock().is_some();
 
     for (height, s) in waiting {
         if height <= local_tip {
             crate::block_heal::clear(height);
             continue;
         }
-        match crate::block_heal::verdict(height, local_tip, network_tip, &s, now) {
+        match crate::block_heal::verdict(height, local_tip, network_tip, can_redo, &s, now) {
             crate::block_heal::Verdict::KeepAsking => {}
             crate::block_heal::Verdict::RedoHeight => redo_height(height, &s),
             crate::block_heal::Verdict::SkipWithSnapshot => {
@@ -10790,7 +10809,7 @@ fn merge_remote_chain_blocking(
                     .filter(|tx| crate::ledger::verify_confirmed_tx_sig(tx).is_ok())
                     .cloned()
                     .collect();
-                if !crate::chain_db::append_trusted_block(&block, &block_txs_now) {
+                if !append_synced_block(&block, &block_txs_now) {
                     continue;
                 }
             }
@@ -10825,7 +10844,7 @@ fn merge_remote_chain_blocking(
             .cloned()
             .collect();
         if trusted {
-            if !crate::chain_db::append_trusted_block(block, &block_txs) {
+            if !append_synced_block(block, &block_txs) {
                 continue;
             }
         }

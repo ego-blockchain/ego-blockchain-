@@ -58,14 +58,21 @@ pub fn waited_out(s: &Short, now: i64) -> bool {
 /// snapshot instead: the node skips over the block it cannot read and rejoins the chain
 /// everyone else has. Only the frontier, the one height nothing is built on yet, may be
 /// thrown away and produced again.
-pub fn verdict(height: u64, local_tip: u64, network_tip: u64, s: &Short, now: i64) -> Verdict {
+pub fn verdict(
+    height: u64,
+    local_tip: u64,
+    network_tip: u64,
+    can_propose: bool,
+    s: &Short,
+    now: i64,
+) -> Verdict {
     if !waited_out(s, now) {
         return Verdict::KeepAsking;
     }
     if network_tip > height {
         return Verdict::SkipWithSnapshot;
     }
-    if height == local_tip.saturating_add(1) {
+    if can_propose && height == local_tip.saturating_add(1) {
         return Verdict::RedoHeight;
     }
     Verdict::SkipWithSnapshot
@@ -82,15 +89,15 @@ mod tests {
     #[test]
     fn a_height_is_given_seconds_before_anything_is_thrown_away() {
         let st = s(1_000);
-        assert_eq!(verdict(5, 4, 5, &st, 1_000), Verdict::KeepAsking);
-        assert_eq!(verdict(5, 4, 5, &st, 1_000 + GRACE_SECS - 1), Verdict::KeepAsking);
+        assert_eq!(verdict(5, 4, 5, true, &st, 1_000), Verdict::KeepAsking);
+        assert_eq!(verdict(5, 4, 5, true, &st, 1_000 + GRACE_SECS - 1), Verdict::KeepAsking);
     }
 
     #[test]
     fn the_frontier_is_redone_once_the_wait_is_over() {
         let st = s(1_000);
         assert_eq!(
-            verdict(5, 4, 5, &st, 1_000 + GRACE_SECS),
+            verdict(5, 4, 5, true, &st, 1_000 + GRACE_SECS),
             Verdict::RedoHeight,
             "nothing is built on height 5 yet, so producing it again forks nothing",
         );
@@ -100,7 +107,7 @@ mod tests {
     fn a_height_the_network_has_moved_past_is_never_redone() {
         let st = s(1_000);
         assert_eq!(
-            verdict(5, 4, 9, &st, 1_000 + 600),
+            verdict(5, 4, 9, true, &st, 1_000 + 600),
             Verdict::SkipWithSnapshot,
             "four blocks are already built on height 5; producing a different one is a fork",
         );
@@ -109,7 +116,17 @@ mod tests {
     #[test]
     fn a_hole_in_the_middle_is_filled_by_snapshot_not_by_redoing_it() {
         let st = s(1_000);
-        assert_eq!(verdict(5, 8, 8, &st, 1_000 + 600), Verdict::SkipWithSnapshot);
+        assert_eq!(verdict(5, 8, 8, true, &st, 1_000 + 600), Verdict::SkipWithSnapshot);
+    }
+
+    #[test]
+    fn a_node_that_cannot_propose_takes_a_snapshot_instead_of_redoing_the_height() {
+        let st = s(1_000);
+        assert_eq!(
+            verdict(5, 4, 5, false, &st, 1_000 + GRACE_SECS),
+            Verdict::SkipWithSnapshot,
+            "a follower producing no replacement would clear the tracking and ask for the              same unservable block again, for ever",
+        );
     }
 
     #[test]
