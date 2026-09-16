@@ -6119,6 +6119,8 @@ pub struct ComputeNodeRecord {
     #[serde(default)]
     pub locked_ram_gb:        u32,
     #[serde(default)]
+    pub locked_gpu_count:     u32,
+    #[serde(default)]
     pub slash_count:          u32,
 }
 
@@ -6726,6 +6728,102 @@ pub struct ComputeReservation {
     /// ($0.01 units) and settle over the credits ledger via `credits_escrow`
     /// system txs. The provider SLA collateral stays in EGOC either way.
     #[serde(default)] pub paid_in_egusd: bool,
+}
+
+/// Whether a machine has the hardware an offer promises still free.
+///
+/// Named separately from the claim so the arithmetic can be tested without a database, and
+/// so the renter is told which part is short rather than just "unavailable".
+pub fn compute_offer_fits(
+    free_cores: u32, free_ram_gb: u32, free_gpus: u32,
+    want_cores: u32, want_ram_gb: u32, want_gpus: u32,
+) -> Result<(), String> {
+    if want_cores > free_cores {
+        return Err(format!("only {free_cores} of {want_cores} CPU core(s) are free on this machine"));
+    }
+    if want_ram_gb > free_ram_gb {
+        return Err(format!("only {free_ram_gb} GB of the {want_ram_gb} GB asked for is free on this machine"));
+    }
+    if want_gpus > free_gpus {
+        return Err(format!("only {free_gpus} of {want_gpus} GPU(s) are free on this machine"));
+    }
+    Ok(())
+}
+
+/// Take an offer off the market and reserve its hardware, in one step.
+///
+/// Booking used to read the offer, run the whole payment, and only then mark it booked. The
+/// payment is the slow part, so two renters could both read the same open offer, both pay,
+/// and both be given the same GPU — and because the second wrote back a copy of the offer
+/// taken before the first paid, the first booking vanished. Nothing anywhere checked that
+/// the machine still had the hardware free, so a provider could also sell the same card
+/// through two offers.
+///
+/// Reading, checking and marking now happen under one lock, so the second renter is turned
+/// away before paying rather than after.
+pub fn claim_compute_offer(offer_id: &str, claimer: &str) -> Result<ComputeCapacityOffer, String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf_o = db.cf_handle(CF_COMPUTE_OFFERS).ok_or("compute offers unavailable")?;
+    let mut offer: ComputeCapacityOffer = db
+        .get_cf(&cf_o, offer_id.as_bytes()).ok().flatten()
+        .and_then(|b| decode(&b))
+        .ok_or_else(|| "Offer not found".to_string())?;
+
+    if offer.status != "open" {
+        return Err("Someone else has already rented this machine. Pick another offer.".into());
+    }
+    if offer.provider_address == claimer {
+        return Err("Cannot book your own offer".into());
+    }
+
+    let cf_n = db.cf_handle(CF_COMPUTE_NODES).ok_or("compute nodes unavailable")?;
+    let node: Option<ComputeNodeRecord> = db
+        .get_cf(&cf_n, offer.provider_address.as_bytes()).ok().flatten()
+        .and_then(|b| decode(&b));
+
+    if let Some(mut n) = node {
+        // Measured against the hardware the machine actually has, not against an
+        // advertised figure: a provider listing the same card in two offers is exactly
+        // the case this has to refuse.
+        compute_offer_fits(
+            n.cpu_cores.saturating_sub(n.locked_cores),
+            n.ram_gb.saturating_sub(n.locked_ram_gb),
+            n.gpu_count.saturating_sub(n.locked_gpu_count),
+            offer.cpu_cores, offer.ram_gb, offer.gpu_count,
+        )?;
+        n.locked_cores     = n.locked_cores.saturating_add(offer.cpu_cores);
+        n.locked_ram_gb    = n.locked_ram_gb.saturating_add(offer.ram_gb);
+        n.locked_gpu_count = n.locked_gpu_count.saturating_add(offer.gpu_count);
+        let _ = db.put_cf(&cf_n, n.address.as_bytes(), encode(&n));
+    }
+
+    offer.status = "booked".to_string();
+    let _ = db.put_cf(&cf_o, offer.offer_id.as_bytes(), encode(&offer));
+    Ok(offer)
+}
+
+/// Put an offer back on the market and hand its hardware back.
+///
+/// Every path that abandons a booking after claiming has to reach this, or the machine is
+/// advertised as rented for ever and the provider silently stops earning.
+pub fn release_compute_offer(offer_id: &str) {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let (Some(cf_o), Some(cf_n)) = (db.cf_handle(CF_COMPUTE_OFFERS), db.cf_handle(CF_COMPUTE_NODES))
+        else { return };
+    let Some(mut offer) = db.get_cf(&cf_o, offer_id.as_bytes()).ok().flatten()
+        .and_then(|b| decode::<ComputeCapacityOffer>(&b)) else { return };
+    if offer.status != "booked" { return; }
+
+    if let Some(mut n) = db.get_cf(&cf_n, offer.provider_address.as_bytes()).ok().flatten()
+        .and_then(|b| decode::<ComputeNodeRecord>(&b))
+    {
+        n.locked_cores     = n.locked_cores.saturating_sub(offer.cpu_cores);
+        n.locked_ram_gb    = n.locked_ram_gb.saturating_sub(offer.ram_gb);
+        n.locked_gpu_count = n.locked_gpu_count.saturating_sub(offer.gpu_count);
+        let _ = db.put_cf(&cf_n, n.address.as_bytes(), encode(&n));
+    }
+    offer.status = "open".to_string();
+    let _ = db.put_cf(&cf_o, offer.offer_id.as_bytes(), encode(&offer));
 }
 
 pub fn upsert_compute_offer(offer: &ComputeCapacityOffer) {
@@ -7819,5 +7917,39 @@ mod servable_blocks_tests {
             blocks.is_empty() && txs.is_empty(),
             "serving a block every peer must refuse is what spread the stall between nodes",
         );
+    }
+}
+
+#[cfg(test)]
+mod compute_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn a_machine_with_room_takes_the_booking() {
+        assert!(compute_offer_fits(16, 64, 2, 8, 32, 1).is_ok());
+    }
+
+    #[test]
+    fn the_last_gpu_cannot_be_sold_twice() {
+        // one card, already rented out
+        let e = compute_offer_fits(4, 16, 0, 2, 8, 1).unwrap_err();
+        assert!(e.contains("GPU"), "the renter has to be told it is the GPU that is gone: {e}");
+    }
+
+    #[test]
+    fn renting_every_core_leaves_nothing_for_the_next_booking() {
+        assert!(compute_offer_fits(8, 64, 1, 8, 32, 1).is_ok(), "exactly enough is enough");
+        assert!(compute_offer_fits(0, 32, 1, 8, 16, 0).is_err(), "and none is not");
+    }
+
+    #[test]
+    fn memory_is_checked_as_well_as_the_card() {
+        let e = compute_offer_fits(32, 4, 4, 2, 64, 1).unwrap_err();
+        assert!(e.contains("GB"), "{e}");
+    }
+
+    #[test]
+    fn an_offer_asking_for_nothing_always_fits() {
+        assert!(compute_offer_fits(0, 0, 0, 0, 0, 0).is_ok());
     }
 }

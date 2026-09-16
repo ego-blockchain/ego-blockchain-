@@ -292,6 +292,7 @@ pub async fn compute_node_heartbeat() {
                     status:               "online".to_string(),
                     locked_cores:         ledger.compute_locked_cores,
                     locked_ram_gb:        ledger.compute_locked_ram_gb,
+                    locked_gpu_count:     0,
                     slash_count:          0,
                 }
             } else {
@@ -500,6 +501,7 @@ pub async fn configure_compute_node(
             status:               "online".to_string(),
             locked_cores:         ledger.compute_locked_cores,
             locked_ram_gb:        ledger.compute_locked_ram_gb,
+            locked_gpu_count:     0,
             slash_count:          0,
         };
         crate::chain_db::upsert_compute_node(&node);
@@ -1231,13 +1233,6 @@ pub async fn book_reservation(
     let offer = crate::chain_db::get_compute_offer(&offer_id)
         .ok_or_else(|| EgoDesktopError::NotFound("Offer not found".into()))?;
 
-    if offer.status != "open" {
-        return Err(EgoDesktopError::InvalidInput("Offer is not open".into()));
-    }
-    if offer.provider_address == my_addr {
-        return Err(EgoDesktopError::InvalidInput("Cannot book your own offer".into()));
-    }
-
     let min_mins = offer.min_duration_hours * 60;
     let max_mins = offer.max_duration_hours * 60;
     if duration_minutes < min_mins || duration_minutes > max_mins {
@@ -1245,6 +1240,13 @@ pub async fn book_reservation(
             format!("Duration must be between {} and {} minutes", min_mins, max_mins)
         ));
     }
+
+    // Take the machine off the market before taking any money. Checking availability and
+    // then paying leaves the entire payment as a window for a second renter to buy the same
+    // hardware, and both of them end up holding it.
+    let offer = crate::chain_db::claim_compute_offer(&offer_id, &my_addr)
+        .map_err(EgoDesktopError::InvalidInput)?;
+    let claim = OfferClaim::held(&offer_id);
 
     let hourly_rate = offer.price_per_gpu_hour_uegoc  * offer.gpu_count as u64
                     + offer.price_per_core_hour_uegoc * offer.cpu_cores  as u64;
@@ -1437,15 +1439,8 @@ pub async fn book_reservation(
     }
     crate::chain_db::upsert_compute_reservation(&reservation);
 
-    let mut updated_offer = offer.clone();
-    updated_offer.status = "booked".to_string();
-    crate::chain_db::upsert_compute_offer(&updated_offer);
-
-    if let Some(mut node) = crate::chain_db::get_compute_node(&offer.provider_address) {
-        node.locked_cores  += offer.cpu_cores;
-        node.locked_ram_gb += offer.ram_gb;
-        crate::chain_db::upsert_compute_node(&node);    
-    }
+    // Paid, escrowed and recorded: the machine stays claimed.
+    claim.keep();
 
     let ssh_pub = get_or_create_ssh_key().await.unwrap_or_default();
 
@@ -1466,6 +1461,36 @@ pub async fn book_reservation(
     }
 
     Ok(reservation.reservation_id)
+}
+
+/// Holds a claimed offer until the booking is complete.
+///
+/// A booking can fail after the claim for a dozen reasons — no balance, no keypair, the
+/// provider cannot post its bond — and every one of those is an early return. Releasing by
+/// hand at each of them is the kind of thing that is correct the day it is written and
+/// wrong a month later, so the release rides on the scope instead.
+struct OfferClaim {
+    offer_id: String,
+    kept:     bool,
+}
+
+impl OfferClaim {
+    fn held(offer_id: &str) -> Self {
+        Self { offer_id: offer_id.to_string(), kept: false }
+    }
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for OfferClaim {
+    fn drop(&mut self) {
+        if !self.kept {
+            crate::chain_db::release_compute_offer(&self.offer_id);
+            eprintln!("[Compute] booking of {} did not complete — machine back on the market",
+                self.offer_id);
+        }
+    }
 }
 
 #[tauri::command]
