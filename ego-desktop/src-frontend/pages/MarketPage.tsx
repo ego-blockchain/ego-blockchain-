@@ -3,7 +3,9 @@ import { invoke } from '@tauri-apps/api/tauri';
 import { EGOC_PRICE_USD, EGOC_SUPPLY } from '../constants';
 import { useWallet } from '../App';
 
-const EGOC_PRICE = EGOC_PRICE_USD;
+// Replaced by the node's own price on mount. A market screen showing a figure the rest
+// of the app does not charge at is worse than showing nothing.
+let EGOC_PRICE = EGOC_PRICE_USD;
 
 function generateEgocHistory(n: number): number[] {
   const seed = [0.3,0.7,0.2,0.9,0.4,0.6,0.1,0.8,0.5,0.3,0.7,0.9,0.2,0.6,0.4,
@@ -288,6 +290,12 @@ function fmtUsd(v: number): string {
 
 // ── Main page ─────────────────────────────────────────────────────────────────
 const MarketPage: React.FC = () => {
+  const [egocPrice, setEgocPrice] = useState<number>(EGOC_PRICE);
+  useEffect(() => {
+    invoke<{ price_usd: number; source: string }>('get_egoc_price_usd')
+      .then(p => { if (p.price_usd > 0) { EGOC_PRICE = p.price_usd; setEgocPrice(p.price_usd); } })
+      .catch(() => {});
+  }, []);
   const { wallet }                        = useWallet();
   const [rates, setRates]                 = useState<Record<string, number>>({});
   const [ratesLoading, setRatesLoading]   = useState(true);
@@ -436,7 +444,7 @@ const MarketPage: React.FC = () => {
 
   const currentRange = RANGES.find(r => r.key === rangeKey)!;
   const activeColor  = selected ? selected.color : '#3b82f6';
-  const activePrice  = selected ? (rates[selected.cgId] ?? 0) : EGOC_PRICE;
+  const activePrice  = selected ? (rates[selected.cgId] ?? 0) : egocPrice;
   const pctBase = chartType === 'line' ? lineData : candleData.map(c => c[3]);
   const pct = pctBase.length > 1
     ? (pctBase[pctBase.length-1] - pctBase[0]) / (pctBase[0] || 1) * 100 : 0;
@@ -495,7 +503,7 @@ const MarketPage: React.FC = () => {
                   {pct>=0?'▲':'▼'} {Math.abs(pct).toFixed(2)}%
                 </div>
               )}
-              {!selected && <div className="text-xs text-gray-500">Mkt Cap: {fmtCap(EGOC_PRICE*EGOC_SUPPLY)}</div>}
+              {!selected && <div className="text-xs text-gray-500">Mkt Cap: {fmtCap(egocPrice*EGOC_SUPPLY)}</div>}
 
               {/* Chart type toggle */}
               <div className="flex items-center gap-1 bg-gray-900 rounded-lg p-0.5">
@@ -531,9 +539,9 @@ const MarketPage: React.FC = () => {
       {/* Portfolio Card */}
       {(() => {
         const egocBalance  = (wallet?.balance_uegoc ?? 0) / 1_000_000;
-        const egocValueUsd = egocBalance * EGOC_PRICE;
+        const egocValueUsd = egocBalance * egocPrice;
         const egocStart    = chartStartPrices['egoc'];
-        const egocPl       = egocStart ? (EGOC_PRICE - egocStart) / egocStart * 100 : null;
+        const egocPl       = egocStart ? (egocPrice - egocStart) / egocStart * 100 : null;
 
         const heldCoins    = COIN_MAP.filter(c => (autoBalances[c.cgId] ?? 0) > 0);
         const heldTotal    = heldCoins.reduce((s, c) => s + (autoBalances[c.cgId] ?? 0) * (rates[c.cgId] ?? 0), 0);
@@ -641,8 +649,8 @@ const MarketPage: React.FC = () => {
             </div>
           </div>
           <div className="text-right">
-            <div className="text-sm font-semibold">{fmtPrice(EGOC_PRICE)}</div>
-            {eurUsd > 0 && <div className="text-[11px] text-gray-500">{fmtEur(usdToEur(EGOC_PRICE))}</div>}
+            <div className="text-sm font-semibold">{fmtPrice(egocPrice)}</div>
+            {eurUsd > 0 && <div className="text-[11px] text-gray-500">{fmtEur(usdToEur(egocPrice))}</div>}
             <div className="text-xs text-green-400">▲ simulated</div>
           </div>
         </button>

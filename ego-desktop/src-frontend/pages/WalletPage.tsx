@@ -219,7 +219,10 @@ const CHAIN_ICONS: Record<string, string> = {
   'USDC':      `${CG}/6319/small/usdc.png`,
 };
 
-const EGOC_USD   = 2.45;
+// Opening value only: the node is asked for the live price on mount. Shared with the
+// other pages so there is one figure to change, and it tracks EGOC_DEFAULT_PRICE_USD
+// in p2p.rs, which is what the node charges against until an oracle reports.
+let EGOC_USD = EGOC_PRICE_USD;
 const EGUSD_USD  = 1.00;
 const BRIDGE_FEE = 0.005;
 
@@ -330,7 +333,7 @@ function sfTime(ts: number) {
   }
 }
 
-const FIAT_RATE = EGOC_USD;
+
 
 function shortHash(h: string) {
   return h.length > 16 ? h.slice(0, 10) + '...' + h.slice(-6) : h;
@@ -1192,6 +1195,15 @@ const WalletPage: React.FC = () => {
     if (showAddresses && extAddresses.length === 0) loadExternalAddresses();
   }, [showAddresses]);
 
+  // A balance shown in dollars has to use the price the rest of the app charges at, or
+  // the wallet quietly disagrees with every fee and invoice the node produces.
+  const [egocUsd, setEgocUsd] = useState<number>(EGOC_USD);
+  useEffect(() => {
+    invoke<{ price_usd: number; source: string }>('get_egoc_price_usd')
+      .then(p => { if (p.price_usd > 0) { EGOC_USD = p.price_usd; setEgocUsd(p.price_usd); } })
+      .catch(() => {});
+  }, []);
+
   const filteredTxs = txs.filter(tx => {
     // Hide internal protocol txs (e.g. validator BLS-key registration) — they're
     // not user transfers and only confuse the wallet history.
@@ -1204,7 +1216,7 @@ const WalletPage: React.FC = () => {
 
   const egocBal  = balance ? balance.egoc : (wallet ? wallet.balance_uegoc / 1_000_000 : 0);
   const formatted = balance?.formatted ?? wallet?.balance_formatted ?? '—';
-  const fiatBal   = (egocBal * FIAT_RATE).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+  const fiatBal   = (egocBal * egocUsd).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
 
   return (
     <div className="p-6 max-w-3xl mx-auto space-y-5">
@@ -3463,7 +3475,7 @@ const WalletPage: React.FC = () => {
                     <div className="flex justify-between text-xs text-gray-500 mt-1">
                       <span>Available: {formatted}</span>
                       {sendForm.amount && (
-                        <span>≈ ${(parseFloat(sendForm.amount || '0') * FIAT_RATE).toFixed(2)}</span>
+                        <span>≈ ${(parseFloat(sendForm.amount || '0') * egocUsd).toFixed(2)}</span>
                       )}
                     </div>
                   </div>
