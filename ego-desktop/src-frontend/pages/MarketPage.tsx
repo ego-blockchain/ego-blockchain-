@@ -69,7 +69,18 @@ function fmtPrice(p: number): string {
   if (p >= 1000) return '$' + p.toLocaleString(undefined, { maximumFractionDigits: 0 });
   if (p >= 1)    return '$' + p.toFixed(2);
   if (p >= 0.01) return '$' + p.toFixed(4);
-  return '$' + p.toFixed(8);
+  // A sub-cent price padded to eight places reads as noise. Trim the zeros the
+  // number does not actually carry, so $0.008 shows as $0.008.
+  return '$' + p.toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+// A billion-denominated cap was fine at $2.45 and reads as $0.01B at the real
+// price. Pick the unit from the number instead of assuming the number.
+function fmtCap(usd: number): string {
+  if (usd >= 1e9) return '$' + (usd / 1e9).toFixed(2) + 'B';
+  if (usd >= 1e6) return '$' + (usd / 1e6).toFixed(2) + 'M';
+  if (usd >= 1e3) return '$' + (usd / 1e3).toFixed(2) + 'K';
+  return '$' + usd.toFixed(2);
 }
 
 function fmtEur(p: number): string {
@@ -77,7 +88,7 @@ function fmtEur(p: number): string {
   if (p >= 1000) return '€' + p.toLocaleString(undefined, { maximumFractionDigits: 0 });
   if (p >= 1)    return '€' + p.toFixed(2);
   if (p >= 0.01) return '€' + p.toFixed(4);
-  return '€' + p.toFixed(8);
+  return '€' + p.toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
 }
 
 function fmtTooltipDate(idx: number, totalBars: number, minPerBar: number, isLive: boolean): string {
@@ -484,7 +495,7 @@ const MarketPage: React.FC = () => {
                   {pct>=0?'▲':'▼'} {Math.abs(pct).toFixed(2)}%
                 </div>
               )}
-              {!selected && <div className="text-xs text-gray-500">Mkt Cap: ${(EGOC_PRICE*EGOC_SUPPLY/1e9).toFixed(2)}B</div>}
+              {!selected && <div className="text-xs text-gray-500">Mkt Cap: {fmtCap(EGOC_PRICE*EGOC_SUPPLY)}</div>}
 
               {/* Chart type toggle */}
               <div className="flex items-center gap-1 bg-gray-900 rounded-lg p-0.5">

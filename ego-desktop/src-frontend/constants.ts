@@ -1,5 +1,8 @@
-/** Current EGOC market price in USD. Update when the oracle goes live. */
-export const EGOC_PRICE_USD = 2.45;
+/** Current EGOC price in USD: the seed round figure, which is what a coin has
+ *  actually been sold for. Kept equal to EGOC_DEFAULT_PRICE_USD in p2p.rs, which
+ *  is what the node charges against until oracles report. Pages that can reach the
+ *  node should prefer its live price and use this only as the starting value. */
+export const EGOC_PRICE_USD = 0.008;
 export const EGOC_SUPPLY    = 1_000_000_000;
 
 /** Human-readable amount for a transaction: EGUSD transfers/releases carry their
