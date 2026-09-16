@@ -228,6 +228,10 @@ Advanced: EGO-50 MEV Protection, EGO-51 Fee Market, EGO-52 Governance, EGO-53 DI
 - **Not audited**: The pool has had no external review. Testnet only; treat as experimental.
 - **Cancelling**: a deposit or withdrawal that has not reached a block can be cancelled from the wallet. A transaction that never executes never moved anything, so the coins stay where they were. Cancelling a deposit does NOT destroy the note's secret — a deposit already travelling may land anyway, and without the secret those coins would sit in the pool unspendable for ever. The note is kept and marked, so a late arrival becomes spendable again.
 - **Neither cancel acts while the node is behind the network.** A node that has not applied the block carrying your transaction cannot tell "not included" from "not seen yet", and guessing would release notes the chain has already spent.
+- **What each status means**: `pending` submitted, not in a block yet · `ready` in the tree and spendable · `spending` withdrawal submitted, not in a block · `settling` in a block this node holds but not yet finalized, so the note is gone while the money has not provably arrived · `spent` in a finalized block, genuinely delivered · `cancelled` cancelled before it landed · `returned` never landed and never will.
+- **Delivered means the committee agreed, not that your node holds a block**: a note reads `spent` only once its block is at or below the finalized height. A block below that can still be reorged away, and telling an owner their coins arrived while the recipient has never seen them is the worst error this screen can make — they believe they have paid, and they have not.
+- **Coins are never lost to a transaction that did not execute**: a deposit that never reaches a block becomes `returned` and the balance is untouched, because the transfer never happened. There is nothing to recover — the coins were never taken. The same holds for a withdrawal: the note goes back to `ready` and can be spent again.
+- **Nothing is judged while the node is behind**: a node that has not caught up cannot tell "never included" from "in a block I have not read", so it waits rather than guessing, in either direction.
 - **Fees**: shielding charges a fee PER NOTE on top of the amount (4 notes = 4 fees). Withdrawing charges ONE fee taken OUT of the amount, so the recipient receives that much less. Both are burned — no validator collects them.
 - **Pool accounting**: the pool's recorded total and the balance at its address are two views of the same coins, checked against each other as blocks apply. On a disagreement the node rebuilds the pool from the chain — and REFUSES to if it cannot read that history in full (fast-synced from a snapshot, blocks pruned, or a block listing fewer transactions than it claims). Replaying a partial history would find the deposits and miss what spent them. Such a node asks a peer for the pool state instead, which travels inside a state snapshot.
 - **Root history**: a withdrawal proves against any of the last 100 tree roots, not only the current one, so a deposit landing between building and submitting a proof does not invalidate it.
@@ -1132,6 +1136,21 @@ Nothing on the chain connects the two. An observer sees a deposit, and separatel
 
 ### Using it
 Press **Shield** in the wallet, move funds in, then send from the pool. Notes come in fixed sizes — **1, 10, 100, 1,000, 10,000 EGOC** — and one withdrawal spends up to **16** of them, so 350 EGOC is a single transaction (3x100 + 5x10).
+
+### What the wallet is telling you
+Every note carries a status, and they mean different things:
+
+| Status | What it means |
+|---|---|
+| `pending` | Submitted, not in a block yet |
+| `ready` | In the tree and spendable |
+| `spending` | Withdrawal sent, not in a block yet |
+| `settling` | In a block this node holds, but the committee has not finalized it |
+| `spent` | In a finalized block — genuinely delivered |
+| `cancelled` | Cancelled before it landed |
+| `returned` | Never landed and never will |
+
+Two rules matter more than the rest. **`spent` means the committee agreed**, not that your node happens to hold a block — a block below the finalized height can still be reorged away, and telling you the coins arrived when the recipient has never seen them is the worst mistake this screen could make. And **coins are never lost to a transaction that did not execute**: a deposit that never reaches a block becomes `returned` with your balance untouched, because the transfer never happened. Nothing needs recovering — it was never taken.
 
 ### Be realistic about the limits
 - **Amounts stay public.** They must be, or nodes could not check the pool balances. Only the *link* is hidden.
