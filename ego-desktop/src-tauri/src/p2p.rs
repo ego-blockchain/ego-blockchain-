@@ -344,7 +344,17 @@ fn price_samples() -> std::sync::MutexGuard<'static, std::collections::VecDeque<
         .unwrap()
 }
 
-pub const EGOC_DEFAULT_PRICE_USD: f64 = 0.02;
+/// What a coin is worth when no oracle has said otherwise.
+///
+/// Fewer than three oracle samples and this is the number every USD-denominated price
+/// converts through: storage, hosting, the reward targets, the fee ceiling. On a network
+/// that has just started there are never three samples, so for the whole early life of the
+/// chain this IS the price, not a fallback.
+///
+/// It is the seed price, which is what a coin has actually been sold for. The launch price
+/// of $0.02 lives in the presale ladder as a target and is not what anyone has paid, so
+/// pricing against it charged every user a fraction of what the constants intend.
+pub const EGOC_DEFAULT_PRICE_USD: f64 = 0.008;
 
 pub fn get_egoc_price_usd() -> f64 {
     let samples = price_samples();

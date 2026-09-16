@@ -358,3 +358,48 @@ mod bootstrap_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod pricing_reference_tests {
+    use super::*;
+    use crate::p2p::EGOC_DEFAULT_PRICE_USD;
+
+    #[test]
+    fn the_reference_price_is_what_a_coin_has_been_sold_for() {
+        assert_eq!(
+            EGOC_DEFAULT_PRICE_USD, 0.008,
+            "the seed price, not the launch target — every USD price on a young chain \
+             converts through this, and no oracle is reporting yet",
+        );
+    }
+
+    #[test]
+    fn a_month_of_storage_costs_what_it_is_meant_to_cost() {
+        let gb_month_usd = STORAGE_USD_PER_MB_MONTH * 1_000.0;
+        assert!((gb_month_usd - 0.005).abs() < 1e-9);
+        let egoc = usd_to_uegoc(gb_month_usd, EGOC_DEFAULT_PRICE_USD) as f64 / UEGOC_PER_EGOC as f64;
+        assert!(
+            (egoc - 0.625).abs() < 1e-6,
+            "a gigabyte-month is 0.625 EGOC at the seed price, was 0.25 at the launch target",
+        );
+    }
+
+    #[test]
+    fn a_transfer_stays_far_under_the_dollar_cap() {
+        let usd = TRANSFER_FEE_UEGOC as f64 / UEGOC_PER_EGOC as f64 * EGOC_DEFAULT_PRICE_USD;
+        assert!((usd - 0.004).abs() < 1e-9, "half a coin is four tenths of a cent here");
+        assert!(usd < FEE_USD_MAX, "the cap is for a high price and must not bite at the seed price");
+    }
+
+    #[test]
+    fn the_reward_ceiling_still_swallows_the_daily_targets() {
+        let consensus_egoc = CONSENSUS_REWARD_USD_PER_DAY * BOOTSTRAP_T1_MULT / EGOC_DEFAULT_PRICE_USD;
+        assert!(
+            consensus_egoc > (NODE_REWARD_CEILING_UEGOC / UEGOC_PER_EGOC) as f64,
+            "unresolved by design, not by accident: under a hundred nodes the ten times \
+             bootstrap multiplier puts every reward target above the fifty coin ceiling, so \
+             the targets and the multiplier both have no effect. Left alone deliberately \
+             until the ceiling is decided.",
+        );
+    }
+}
