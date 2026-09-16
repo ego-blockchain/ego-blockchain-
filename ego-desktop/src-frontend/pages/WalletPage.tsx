@@ -5,7 +5,7 @@ import { fetch as tauriFetch, Body } from '@tauri-apps/api/http';
 import { useWallet } from '../App';
 import qrcode from 'qrcode-generator';
 import Pagination from '../components/Pagination';
-import { txDisplayAmount } from '../constants';
+import { txDisplayAmount, EGOC_PRICE_USD } from '../constants';
 
 import { RELAY_HTTP as RELAY, RPC_URL } from '../config';
 import { useAppVersion, formatVersion } from '../lib/version';

@@ -7,7 +7,42 @@
     <title>Ego Desktop</title>
   </head>
   <body>
-    <div id="root"></div>
+    <!-- Painted before any script runs and replaced the moment React mounts. The window
+         is transparent so it can have rounded corners, which means a frontend that fails
+         to start leaves nothing on screen at all: the app looks shut while the node runs
+         behind it. This is what stands there instead, and what stays if the script dies. -->
+    <style>
+      #boot { position: fixed; inset: 0; background: #111827; border-radius: 10px;
+              display: flex; align-items: center; justify-content: center;
+              font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color: #e5e7eb; }
+      #boot .in { text-align: center; }
+      #boot .sp { font-size: 42px; animation: bp 1.6s ease-in-out infinite; }
+      #boot .er { display: none; color: #fca5a5; font-size: 12.5px; max-width: 46ch;
+                  margin: 14px auto 0; white-space: pre-wrap; text-align: left; }
+      @keyframes bp { 50% { opacity: .35 } }
+      @media (prefers-reduced-motion: reduce) { #boot .sp { animation: none } }
+    </style>
+    <div id="root">
+      <div id="boot"><div class="in">
+        <div class="sp">&#9889;</div>
+        <div style="font-weight:600;margin-top:10px">Starting Ego Desktop&#8230;</div>
+        <div id="boot-err" class="er"></div>
+      </div></div>
+    </div>
+    <script>
+      // A blank window tells the operator nothing. If the app cannot start, say so here.
+      window.addEventListener('error', function (e) {
+        var el = document.getElementById('boot-err');
+        if (!el) return;
+        el.style.display = 'block';
+        el.textContent = 'The interface could not start.
+
+' + (e && e.message ? e.message : e) +
+          '
+
+Your node is unaffected and still running. Please report this.';
+      });
+    </script>
     <script type="module" src="/src-frontend/main.tsx"></script>
   </body>
 </html>
