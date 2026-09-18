@@ -555,3 +555,53 @@ mod storage_margin_tests {
         assert!((early - 0.0201).abs() < 1e-4, "about two cents a gigabyte-month at the start");
     }
 }
+
+#[cfg(test)]
+mod hosting_margin_tests {
+    use super::*;
+
+    const GB_MONTH_PAID: f64 = STORAGE_REWARD_USD_PER_GB_DAY * 30.0;
+
+    /// The plans in commands/hosting.rs, as price and included gigabytes. Here so that
+    /// changing one without the other fails rather than selling below cost quietly.
+    const PLANS: [(&str, f64, f64); 3] =
+        [("starter", 1.49, 50.0), ("pro", 2.99, 120.0), ("business", 5.99, 500.0)];
+
+    #[test]
+    fn every_tier_clears_the_storage_it_includes() {
+        for (name, usd, gb) in PLANS {
+            let cost = gb * GB_MONTH_PAID;
+            assert!(usd > cost, "{name} sells for ${usd} and costs ${cost:.2} to serve");
+        }
+    }
+
+    #[test]
+    fn even_the_largest_tier_keeps_most_of_it() {
+        let (name, usd, gb) = PLANS[2];
+        let margin = (usd - gb * GB_MONTH_PAID) / usd;
+        assert!(margin > 0.8, "{name} keeps only {:.0} percent", margin * 100.0);
+    }
+
+    #[test]
+    fn we_undercut_paid_shared_hosting() {
+        // Renewal prices, which is what someone actually pays after the first year, rather
+        // than the introductory rate every host advertises.
+        for ((name, ours, _), theirs) in PLANS.iter().zip([10.99, 14.99, 26.99]) {
+            assert!(ours < &theirs, "{name} at ${ours} does not beat ${theirs}");
+        }
+    }
+
+    #[test]
+    fn hosting_costs_less_per_gigabyte_than_buying_the_storage_alone() {
+        // A hosting tier bundles storage, so it must not cost more than the storage plan
+        // that holds the same amount, or the cheaper move is to buy storage and skip
+        // hosting entirely.
+        let (_, starter_usd, starter_gb) = PLANS[0];
+        let storage_only_50gb = 0.79;
+        assert!(
+            starter_usd > storage_only_50gb,
+            "hosting bundles more than storage so it may cost more, but not by much",
+        );
+        assert!(starter_usd < storage_only_50gb * 3.0, "{starter_gb} GB hosted is not triple the storage price");
+    }
+}

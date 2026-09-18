@@ -525,7 +525,7 @@ const HostingPage: React.FC = () => {
 
           <div className="grid grid-cols-3 gap-3">
             {plans.map(plan => {
-              const marketRate: Record<string, number> = { starter: 19.95, pro: 24.95, business: 54.95 };
+              const marketRate: Record<string, number> = { starter: 10.99, pro: 14.99, business: 26.99 };
               const isActive   = myPlan?.tier === plan.tier;
               const isCurrent  = !!myPlan && myPlan.tier !== plan.tier;
               const totalEgoc  = (plan.egoc_per_month * planMonths).toFixed(4);

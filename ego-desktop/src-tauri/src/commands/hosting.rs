@@ -109,11 +109,20 @@ pub struct HostingPlanOption {
     pub uegoc_per_month:  u64,
 }
 
+/// tier, label, dollars a month, site limit, gigabytes.
+///
+/// Priced to undercut paid shared hosting, which runs ten to thirty dollars a month once
+/// the introductory rate lapses. Not priced against Cloudflare Pages or Netlify, which are
+/// free and cannot be beaten on price by anybody: against those the argument is that a site
+/// here has no single owner who can take it down, which is a different sale.
+///
+/// The storage each tier includes costs about $0.002 a gigabyte-month to serve, so even the
+/// largest keeps over eighty percent. There was room to halve these and there still is.
 fn plan_options() -> Vec<(String, String, f64, u32, f64)> {
     vec![
-        ("starter".into(),  "Starter".into(),  3.99,  20,  50.0),
-        ("pro".into(),      "Pro".into(),       7.99,  60, 120.0),
-        ("business".into(), "Business".into(), 14.99,   0, 500.0),
+        ("starter".into(),  "Starter".into(),   1.49,  20,  50.0),
+        ("pro".into(),      "Pro".into(),       2.99,  60, 120.0),
+        ("business".into(), "Business".into(),  5.99,   0, 500.0),
     ]
 }
 
