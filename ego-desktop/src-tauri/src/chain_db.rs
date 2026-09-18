@@ -6174,6 +6174,18 @@ pub fn credits_mint_amount(amount_uegoc: u64, price_micro_usd: u64) -> u64 {
         / (1_000_000u128 * MICRO_USD_PER_CREDIT as u128)) as u64
 }
 
+/// A dollar price in credits.
+///
+/// Services that already know what they cost in dollars, storage and hosting and compute,
+/// should charge that rather than converting through a coin price and back. One credit is
+/// one cent, so this is the whole conversion.
+pub fn usd_to_credits(usd: f64) -> u64 {
+    if usd <= 0.0 {
+        return 0;
+    }
+    ((usd * 1_000_000.0) / MICRO_USD_PER_CREDIT as f64).round() as u64
+}
+
 pub fn parse_credits_mint_memo(memo: &Option<String>) -> Option<u64> {
     memo.as_deref()?.strip_prefix("credits_mint:")?.parse::<u64>().ok()
 }
@@ -7951,5 +7963,43 @@ mod compute_capacity_tests {
     #[test]
     fn an_offer_asking_for_nothing_always_fits() {
         assert!(compute_offer_fits(0, 0, 0, 0, 0, 0).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod credits_pricing_tests {
+    use super::*;
+
+    #[test]
+    fn a_dollar_is_a_hundred_credits() {
+        assert_eq!(usd_to_credits(1.0), 100);
+        assert_eq!(usd_to_credits(3.99), 399);
+        assert_eq!(usd_to_credits(14.99), 1499);
+    }
+
+    #[test]
+    fn a_price_in_credits_does_not_move_when_the_coin_does() {
+        // The point of charging in EGUSD. The same plan costs the same whatever EGOC did
+        // overnight, where a coin price converted from dollars would not.
+        let plan_usd = 7.99;
+        let months = 12.0;
+        let first = usd_to_credits(plan_usd * months);
+        let later = usd_to_credits(plan_usd * months);
+        assert_eq!(first, later);
+        assert_eq!(first, 9588, "twelve months of Pro is $95.88, so 9,588 credits");
+    }
+
+    #[test]
+    fn a_free_service_costs_nothing_rather_than_one_cent() {
+        assert_eq!(usd_to_credits(0.0), 0);
+        assert_eq!(usd_to_credits(-1.0), 0, "a negative price must not wrap into a huge bill");
+    }
+
+    #[test]
+    fn a_bill_under_a_cent_rounds_to_the_nearest_cent() {
+        // Storage of a small file for one month lands here. Callers take max(1) so a real
+        // charge is never rounded away to free.
+        assert_eq!(usd_to_credits(0.004), 0);
+        assert_eq!(usd_to_credits(0.006), 1);
     }
 }

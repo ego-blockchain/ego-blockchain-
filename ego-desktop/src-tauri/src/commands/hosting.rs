@@ -671,9 +671,10 @@ pub fn get_my_hosting_plan() -> Option<crate::chain_db::ActiveHostingPlan> {
 
 #[tauri::command]
 pub async fn purchase_hosting_plan(
-    tier:   String,
-    months: u32,
-    state:  tauri::State<'_, crate::app::AppState>,
+    tier:            String,
+    months:          u32,
+    pay_with_egusd:  Option<bool>,
+    state:           tauri::State<'_, crate::app::AppState>,
 ) -> Result<crate::chain_db::ActiveHostingPlan, EgoDesktopError> {
     if months == 0 || months > 24 {
         return Err(EgoDesktopError::InvalidInput("months must be 1–24".into()));
@@ -683,8 +684,12 @@ pub async fn purchase_hosting_plan(
         .find(|(t, ..)| t == tier.trim())
         .ok_or_else(|| EgoDesktopError::InvalidInput(format!("Unknown tier: {}", tier)))?;
 
+    let pay_egusd       = pay_with_egusd.unwrap_or(false);
     let uegoc_per_month = usd_to_uegoc(usd_per_month);
     let total_uegoc     = uegoc_per_month.saturating_mul(months as u64);
+    // The plan has a dollar price, so in credits it is simply that price. No trip through
+    // a coin rate, which means the bill cannot move between quoting it and paying it.
+    let total_credits   = crate::chain_db::usd_to_credits(usd_per_month * months as f64);
 
     let mut ledger = Ledger::load();
     let owner = ledger.address.clone();
@@ -692,20 +697,35 @@ pub async fn purchase_hosting_plan(
         return Err(EgoDesktopError::WalletError("Wallet not initialized".into()));
     }
 
-    let chain   = crate::ledger::load_chain();
-    let balance = chain.balance_of(&owner);
-    if balance < total_uegoc {
-        let needed_egoc = total_uegoc as f64 / 1_000_000.0;
-        let have_egoc   = balance as f64 / 1_000_000.0;
-        return Err(EgoDesktopError::InvalidInput(format!(
-            "Insufficient balance: need {:.4} EGOC, have {:.4} EGOC",
-            needed_egoc, have_egoc
-        )));
+    if pay_egusd {
+        let have = crate::chain_db::credits_balance(&owner);
+        if have < total_credits {
+            return Err(EgoDesktopError::InvalidInput(format!(
+                "Insufficient EGUSD: need ${:.2}, have ${:.2}",
+                total_credits as f64 / 100.0,
+                have as f64 / 100.0
+            )));
+        }
+    } else {
+        let chain   = crate::ledger::load_chain();
+        let balance = chain.balance_of(&owner);
+        if balance < total_uegoc {
+            let needed_egoc = total_uegoc as f64 / 1_000_000.0;
+            let have_egoc   = balance as f64 / 1_000_000.0;
+            return Err(EgoDesktopError::InvalidInput(format!(
+                "Insufficient balance: need {:.4} EGOC, have {:.4} EGOC",
+                needed_egoc, have_egoc
+            )));
+        }
     }
 
     let now   = chrono::Utc::now().timestamp();
     let nonce = ledger.nonce + 1;
-    let memo  = format!("hosting_plan:{}:{}", tier.trim(), months);
+    let memo  = if pay_egusd {
+        format!("credits_pay:{}:hosting:{}:{}", total_credits, tier.trim(), months)
+    } else {
+        format!("hosting_plan:{}:{}", tier.trim(), months)
+    };
     let sign_bytes = crate::ledger::tx_signing_bytes_v2(
         &owner, HOSTING_FEE_SINK, 0, nonce, now, 1, &memo,
     );
@@ -737,8 +757,8 @@ pub async fn purchase_hosting_plan(
         nonce,
         tx_version:          2,
         chain_id:            1,
-        fee_uegoc:           total_uegoc,
-        tx_type:             "hosting_plan".into(),
+        fee_uegoc:           if pay_egusd { 0 } else { total_uegoc },
+        tx_type:             if pay_egusd { "credits_pay".into() } else { "hosting_plan".into() },
         signed_summary:      memo.clone(),
         ..crate::ledger::LedgerTx::default()
     };
@@ -772,7 +792,7 @@ pub async fn purchase_hosting_plan(
         months,
         started_at: now,
         expires_at,
-        paid_uegoc: total_uegoc,
+        paid_uegoc: if pay_egusd { 0 } else { total_uegoc },
         tx_hash:    tx_hash.clone(),
     };
     crate::chain_db::upsert_hosting_plan(&plan);

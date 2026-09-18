@@ -68,6 +68,11 @@ pub struct StoreFileRequest {
     /// When true the file was sent/received via EgoSafe — excluded from Storage tab.
     #[serde(default)]
     pub from_egosafe: bool,
+    /// Pay the storage bill in EGUSD rather than EGOC. A month of storage has a dollar
+    /// price, so paying it in a dollar-stable unit means the bill cannot move between
+    /// being quoted and being paid.
+    #[serde(default)]
+    pub pay_with_egusd: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -296,6 +301,17 @@ pub async fn store_file(
     let mb         = (original_size as f64) / 1_000_000.0;
     let cost_uegoc = if request.free { 0 }
                      else { crate::tokenomics::storage_cost_with_staking(mb, request.duration_months, is_staker) };
+    // Charged straight from the dollar target rather than converted back out of coins, so
+    // the two prices cannot drift apart as the coin moves.
+    let pay_egusd = request.pay_with_egusd && !request.free && !is_staker;
+    let cost_credits = if pay_egusd {
+        let months = if request.duration_months == 0 { 120 } else { request.duration_months };
+        let usd = crate::tokenomics::STORAGE_USD_PER_MB_MONTH * mb * months as f64
+            * if request.duration_months == 0 { 0.50 } else { 1.0 };
+        crate::chain_db::usd_to_credits(usd).max(1)
+    } else {
+        0
+    };
 
     let mut stored = StoredFile {
         cid:             cid.clone(),
@@ -321,12 +337,23 @@ pub async fn store_file(
     // Deduct storage cost and record a verifiable store_data commitment on-chain.
     let chain = load_chain();
     {
-        let balance = chain.balance_of(&ledger.address);
-        if cost_uegoc > balance {
-            return Err(EgoDesktopError::InvalidInput(format!(
-                "Insufficient balance: have {} uEGOC, need {} uEGOC for storage",
-                balance, cost_uegoc
-            )));
+        if pay_egusd {
+            let have = crate::chain_db::credits_balance(&ledger.address);
+            if cost_credits > have {
+                return Err(EgoDesktopError::InvalidInput(format!(
+                    "Insufficient EGUSD: need ${:.2}, have ${:.2}",
+                    cost_credits as f64 / 100.0,
+                    have as f64 / 100.0
+                )));
+            }
+        } else {
+            let balance = chain.balance_of(&ledger.address);
+            if cost_uegoc > balance {
+                return Err(EgoDesktopError::InvalidInput(format!(
+                    "Insufficient balance: have {} uEGOC, need {} uEGOC for storage",
+                    balance, cost_uegoc
+                )));
+            }
         }
 
         // Compute the storage commitment — blake3 over all block CIDs in order.
@@ -349,15 +376,19 @@ pub async fn store_file(
             hash:               tx_hash.clone(),
             from:               ledger.address.clone(),
             to:                 "egot1storagefees000000000000000000000000000000".into(),
-            amount:             cost_uegoc,
-            memo:               Some(format!("{} | {} blocks | {} months",
-                                    file_name, blocks_total, request.duration_months)),
+            amount:             if pay_egusd { 0 } else { cost_uegoc },
+            memo:               Some(if pay_egusd {
+                                    format!("credits_pay:{}:storage:{}", cost_credits, cid)
+                                } else {
+                                    format!("{} | {} blocks | {} months",
+                                        file_name, blocks_total, request.duration_months)
+                                }),
             timestamp:          now,
             signature:          signature_hex,
             status:             "Pending".into(),
             block_height:       None,
             nonce,
-            tx_type:            "store_data".into(),
+            tx_type:            if pay_egusd { "credits_pay".into() } else { "store_data".into() },
             cid:                cid.clone(),
             commitment_hash:    commitment_hash.clone(),
             ..LedgerTx::default()
@@ -367,7 +398,7 @@ pub async fn store_file(
         eprintln!("[Storage] store_data tx {} | cid={} | commitment={} | fee={} uEGOC",
             &tx_hash[..18], &cid[..16], &commitment_hash[..16], cost_uegoc);
     }
-    stored.storage_fee_uegoc = cost_uegoc;
+    stored.storage_fee_uegoc = if pay_egusd { 0 } else { cost_uegoc };
 
     ledger.stored_files.insert(0, stored);
     ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save ledger: {e}")))?;
