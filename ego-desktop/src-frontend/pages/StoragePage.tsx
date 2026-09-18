@@ -904,7 +904,7 @@ const StoragePage: React.FC = () => {
                   <div className="flex justify-between"><span className="text-gray-400">Encrypted size</span><span>{fmtBytes(storeResult.encrypted_size)}</span></div>
                   <div className="flex justify-between"><span className="text-gray-400">Duration</span><span>{storeResult.duration_months === 0 ? '♾ Permanent' : `${storeResult.duration_months} month${storeResult.duration_months > 1 ? 's' : ''}`}</span></div>
                   <div className="flex justify-between"><span className="text-gray-400">Expires</span><span>{storeResult.expiry_timestamp > 1e14 ? 'Never' : new Date(storeResult.expiry_timestamp * 1000).toLocaleDateString()}</span></div>
-                  <div className="flex justify-between"><span className="text-gray-400">Storage fee (to providers)</span><span className="text-yellow-400">{(storeResult.cost_uegoc / 1_000_000).toFixed(4)} EGOC</span></div>
+                  <div className="flex justify-between"><span className="text-gray-400">Storage fee (to providers)</span><span className="text-yellow-400">{storeResult.cost_uegoc === 0 && payEgusd ? 'paid in EGUSD' : `${(storeResult.cost_uegoc / 1_000_000).toFixed(4)} EGOC`}</span></div>
                   <div className="flex justify-between"><span className="text-gray-400">Commitment</span><span className="text-green-400">Ledger anchored ✓</span></div>
                 </div>
               </div>

@@ -538,7 +538,6 @@ const HostingPage: React.FC = () => {
               const isActive   = myPlan?.tier === plan.tier;
               const isCurrent  = !!myPlan && myPlan.tier !== plan.tier;
               const totalEgoc  = (plan.egoc_per_month * planMonths).toFixed(4);
-              const totalCredits = (plan.usd_per_month * planMonths).toFixed(2);
               const totalUsd   = (plan.usd_per_month * planMonths).toFixed(2);
               const market     = ((marketRate[plan.tier] ?? 25) * planMonths).toFixed(2);
               const btnLabel   = purchasing === plan.tier
@@ -576,12 +575,16 @@ const HostingPage: React.FC = () => {
                     </div>
                   </div>
                   <div>
+                    {/* The plan costs dollars. The coin figure is what that converts to
+                        today, so it is the approximation and belongs underneath. */}
                     <div className="text-lg font-bold">
-                      {totalEgoc}
-                      <span className="text-xs font-normal text-gray-400 ml-1">EGOC</span>
+                      ${totalUsd}
+                      {payEgusd && <span className="text-xs font-normal text-emerald-400 ml-1">EGUSD</span>}
                     </div>
                     <div className="text-xs text-gray-500">
-                      ≈ ${totalUsd} · resellers pay ${market}
+                      {payEgusd
+                        ? `fixed · resellers pay $${market}`
+                        : `≈ ${totalEgoc} EGOC · resellers pay $${market}`}
                     </div>
                   </div>
                   <button
