@@ -266,6 +266,7 @@ const HostingPage: React.FC = () => {
   const [plans, setPlans]             = useState<HostingPlanOption[]>([]);
   const [myPlan, setMyPlan]           = useState<ActiveHostingPlan | null>(null);
   const [planMonths, setPlanMonths]   = useState(1);
+  const [payEgusd, setPayEgusd]       = useState(false);
   const [purchasing, setPurchasing]   = useState('');
   const [planError, setPlanError]     = useState('');
   const [confirmCancel, setConfirmCancel] = useState(false);
@@ -411,7 +412,7 @@ const HostingPage: React.FC = () => {
     setPurchasing(tier);
     setPlanError('');
     try {
-      const plan = await invoke<ActiveHostingPlan>('purchase_hosting_plan', { tier, months: planMonths });
+      const plan = await invoke<ActiveHostingPlan>('purchase_hosting_plan', { tier, months: planMonths, payWithEgusd: payEgusd });
       setMyPlan(plan);
       invoke<HostingPlanOption[]>('get_hosting_plans').then(setPlans).catch(() => {});
       invoke<HostingAccess>('get_hosting_access').then(setAccess).catch(() => {});
@@ -494,6 +495,15 @@ const HostingPage: React.FC = () => {
                 </button>
               ))}
             </div>
+            <label className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={payEgusd}
+                onChange={e => setPayEgusd(e.target.checked)}
+                className="accent-emerald-500"
+              />
+              <span>Pay with EGUSD <span className="text-gray-500">(the price is in dollars, so it will not move before you pay)</span></span>
+            </label>
           </div>
 
           {myPlan && (
@@ -528,6 +538,7 @@ const HostingPage: React.FC = () => {
               const isActive   = myPlan?.tier === plan.tier;
               const isCurrent  = !!myPlan && myPlan.tier !== plan.tier;
               const totalEgoc  = (plan.egoc_per_month * planMonths).toFixed(4);
+              const totalCredits = (plan.usd_per_month * planMonths).toFixed(2);
               const totalUsd   = (plan.usd_per_month * planMonths).toFixed(2);
               const market     = ((marketRate[plan.tier] ?? 25) * planMonths).toFixed(2);
               const btnLabel   = purchasing === plan.tier
