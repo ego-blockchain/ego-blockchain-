@@ -172,7 +172,6 @@ const StoragePage: React.FC = () => {
   const [filePath, setFilePath] = useState('');
   const [fileName, setFileName] = useState('');
   const [duration, setDuration] = useState(3);
-  const [payEgusd, setPayEgusd] = useState(false);
   const [processStage, setProcessStage] = useState<ProcessStage>('encrypting');
   const [stageProgress, setStageProgress] = useState(0);
   const [completedStages, setCompletedStages] = useState<Set<ProcessStage>>(new Set());
@@ -441,7 +440,7 @@ const StoragePage: React.FC = () => {
     storeErrorRef.current  = '';
 
     invoke<StoreFileResult>('store_file', {
-      request: { file_path: filePath, duration_months: duration, pay_with_egusd: payEgusd },
+      request: { file_path: filePath, duration_months: duration, pay_with_egusd: true },
     })
       .then(result => {
         storeResultRef.current = result;
@@ -490,7 +489,7 @@ const StoragePage: React.FC = () => {
 
   function resetUpload() {
     if (timerRef.current) clearTimeout(timerRef.current);
-    setStep('idle'); setFilePath(''); setFileName(''); setDuration(3); setPayEgusd(false);
+    setStep('idle'); setFilePath(''); setFileName(''); setDuration(3);
     setStoreResult(null); setStoreError('');
     storeResultRef.current = null; storeErrorRef.current = '';
   }
@@ -828,15 +827,6 @@ const StoragePage: React.FC = () => {
                     ♾ Permanent storage — 50% discount vs 10-year equivalent. File never expires.
                   </div>
                 )}
-                <label className="flex items-center gap-2 mt-3 text-xs text-gray-300 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={payEgusd}
-                    onChange={e => setPayEgusd(e.target.checked)}
-                    className="accent-emerald-500"
-                  />
-                  <span>Pay with EGUSD <span className="text-gray-500">(storage is priced in dollars, so the bill will not move before you pay)</span></span>
-                </label>
               </div>
               <div className="bg-gray-900 rounded-xl p-4 text-sm space-y-2">
                 <div className="flex justify-between"><span className="text-gray-400">Encryption</span><span>AES-256-GCM</span></div>
@@ -904,7 +894,7 @@ const StoragePage: React.FC = () => {
                   <div className="flex justify-between"><span className="text-gray-400">Encrypted size</span><span>{fmtBytes(storeResult.encrypted_size)}</span></div>
                   <div className="flex justify-between"><span className="text-gray-400">Duration</span><span>{storeResult.duration_months === 0 ? '♾ Permanent' : `${storeResult.duration_months} month${storeResult.duration_months > 1 ? 's' : ''}`}</span></div>
                   <div className="flex justify-between"><span className="text-gray-400">Expires</span><span>{storeResult.expiry_timestamp > 1e14 ? 'Never' : new Date(storeResult.expiry_timestamp * 1000).toLocaleDateString()}</span></div>
-                  <div className="flex justify-between"><span className="text-gray-400">Storage fee (to providers)</span><span className="text-yellow-400">{storeResult.cost_uegoc === 0 && payEgusd ? 'paid in EGUSD' : `${(storeResult.cost_uegoc / 1_000_000).toFixed(4)} EGOC`}</span></div>
+                  <div className="flex justify-between"><span className="text-gray-400">Storage fee (to providers)</span><span className="text-yellow-400">{storeResult.cost_uegoc === 0 ? 'paid in EGUSD' : `${(storeResult.cost_uegoc / 1_000_000).toFixed(4)} EGOC`}</span></div>
                   <div className="flex justify-between"><span className="text-gray-400">Commitment</span><span className="text-green-400">Ledger anchored ✓</span></div>
                 </div>
               </div>
