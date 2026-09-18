@@ -1374,9 +1374,9 @@ const StoragePage: React.FC = () => {
                           <div className="text-lg font-bold text-green-400">Free</div>
                         ) : (
                           <>
-                            <div className="text-lg font-bold">${priceUsd.toFixed(2)} <span className="text-xs font-normal text-gray-400">{subBilling === 'monthly' ? '/mo' : '/yr'}</span></div>
+                            <div className="text-lg font-bold">{priceUsd.toFixed(2)} <span className="text-xs font-normal text-emerald-400">EGUSD</span><span className="text-xs font-normal text-gray-400">{subBilling === 'monthly' ? ' /mo' : ' /yr'}</span></div>
                             {perMonthUsd && (
-                              <div className="text-xs text-gray-500">${perMonthUsd}/mo</div>
+                              <div className="text-xs text-gray-500">{perMonthUsd} EGUSD/mo</div>
                             )}
                             <div className="text-xs text-blue-400">≈ {egocAmt} EGOC</div>
                           </>

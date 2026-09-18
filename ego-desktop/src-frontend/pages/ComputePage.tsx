@@ -1428,9 +1428,9 @@ export default function ComputePage() {
                         <button key={t.label} onClick={() => { setOfferGpuHourEgoc(t.gpu); setOfferCoreHourEgoc(t.core); }}
                           className={`border rounded-lg p-2 text-left space-y-0.5 transition-colors ${active ? 'bg-purple-900/40 ' + t.cls : t.cls + ' bg-gray-750 hover:bg-gray-700'}`}>
                           <p className={`text-xs font-semibold ${t.label === 'Premium' ? 'text-yellow-400' : t.label === 'Standard' ? 'text-purple-300' : 'text-gray-300'}`}>{t.label}</p>
-                          {hasGpu && <p className="text-white text-xs">{t.gpu} EGOC/GPU/hr <span className="text-gray-500">(${t.gpuUsd.toFixed(2)})</span></p>}
-                          <p className="text-gray-400 text-xs">{t.core} EGOC/core/hr</p>
-                          <p className="text-green-400 text-xs font-medium">{fmt(dailyU)} EGOC/day <span className="text-gray-500">≈ ${dailyUsd.toFixed(2)}</span></p>
+                          {hasGpu && <p className="text-white text-xs">{t.gpuUsd.toFixed(2)} EGUSD/GPU/hr</p>}
+                          <p className="text-gray-400 text-xs">{t.coreUsd.toFixed(3)} EGUSD/core/hr</p>
+                          <p className="text-green-400 text-xs font-medium">{dailyUsd.toFixed(2)} EGUSD/day <span className="text-gray-500">≈ {fmt(dailyU)} EGOC</span></p>
                           <p className="text-gray-500 text-xs leading-tight">{t.desc}</p>
                         </button>
                       );
@@ -1442,13 +1442,13 @@ export default function ComputePage() {
 
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="text-gray-400 text-xs block mb-1">Price per GPU · per hour (EGOC)</label>
+                <label className="text-gray-400 text-xs block mb-1">Price per GPU · per hour (EGOC · ≈ {(offerGpuHourEgoc * egocPrice).toFixed(2)} EGUSD)</label>
                 <input type="number" min={0} step={0.01} value={offerGpuHourEgoc}
                   onChange={ev => setOfferGpuHourEgoc(Number(ev.target.value))}
                   className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white text-sm" />
               </div>
               <div>
-                <label className="text-gray-400 text-xs block mb-1">Price per CPU core · per hour (EGOC)</label>
+                <label className="text-gray-400 text-xs block mb-1">Price per CPU core · per hour (EGOC · ≈ {(offerCoreHourEgoc * egocPrice).toFixed(3)} EGUSD)</label>
                 <input type="number" min={0} step={0.001} value={offerCoreHourEgoc}
                   onChange={ev => setOfferCoreHourEgoc(Number(ev.target.value))}
                   className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-white text-sm" />
@@ -1496,9 +1496,9 @@ export default function ComputePage() {
             <div className="bg-gray-750 border border-gray-600 rounded-lg p-3 text-xs space-y-1">
               <p className="text-gray-300">Earnings estimate:</p>
               <p className="text-yellow-400 text-base font-bold">
-                {fmt(u(offerGpuHourEgoc * offerGpuCount + offerCoreHourEgoc * offerCores))} EGOC/hr
+                {((offerGpuHourEgoc * offerGpuCount + offerCoreHourEgoc * offerCores) * egocPrice).toFixed(2)} EGUSD/hr
               </p>
-              <p className="text-gray-500">= {fmt(u((offerGpuHourEgoc * offerGpuCount + offerCoreHourEgoc * offerCores) * 24))} EGOC/day</p>
+              <p className="text-gray-500">= {((offerGpuHourEgoc * offerGpuCount + offerCoreHourEgoc * offerCores) * 24 * egocPrice).toFixed(2)} EGUSD/day · {fmt(u((offerGpuHourEgoc * offerGpuCount + offerCoreHourEgoc * offerCores) * 24))} EGOC</p>
               <p className="text-gray-500">= {fmt(u((offerGpuHourEgoc * offerGpuCount + offerCoreHourEgoc * offerCores) * 24 * 30))} EGOC/month (if fully booked)</p>
             </div>
 

@@ -578,8 +578,8 @@ const HostingPage: React.FC = () => {
                     {/* The plan costs dollars. The coin figure is what that converts to
                         today, so it is the approximation and belongs underneath. */}
                     <div className="text-lg font-bold">
-                      ${totalUsd}
-                      {payEgusd && <span className="text-xs font-normal text-emerald-400 ml-1">EGUSD</span>}
+                      {totalUsd}
+                      <span className="text-xs font-normal text-emerald-400 ml-1">EGUSD</span>
                     </div>
                     <div className="text-xs text-gray-500">
                       {payEgusd

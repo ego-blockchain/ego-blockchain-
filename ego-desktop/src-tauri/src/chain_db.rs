@@ -6687,6 +6687,15 @@ pub struct ComputeCapacityOffer {
     pub price_per_gpu_hour_uegoc:  u64,
     #[serde(default)]
     pub price_per_core_hour_uegoc: u64,
+    /// The same rate held in credits, one credit to the cent, set when the offer is
+    /// listed. A coin figure alone goes stale the moment the market moves: an operator
+    /// picks a number once and is charging a different real price by the week's end
+    /// without touching anything. Renters are billed from this and the coin field is
+    /// kept for nodes on older builds.
+    #[serde(default)]
+    pub price_per_gpu_hour_credits:  u64,
+    #[serde(default)]
+    pub price_per_core_hour_credits: u64,
     #[serde(default)]
     pub price_per_gpu_day_uegoc:   u64,
     #[serde(default)]

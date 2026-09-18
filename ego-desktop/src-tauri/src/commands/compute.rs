@@ -1171,6 +1171,13 @@ pub async fn post_capacity_offer(
         cpu_cores, ram_gb, gpu_count, gpu_vram_gb, gpu_name,
         price_per_gpu_hour_uegoc,
         price_per_core_hour_uegoc,
+        // The rate as a dollar figure, fixed at listing. What a renter is actually billed,
+        // so the price an operator chose does not quietly become a different real price as
+        // the market moves under it.
+        price_per_gpu_hour_credits:  crate::chain_db::usd_to_credits(
+            price_per_gpu_hour_uegoc as f64 / 1_000_000.0 * crate::p2p::get_egoc_price_usd()),
+        price_per_core_hour_credits: crate::chain_db::usd_to_credits(
+            price_per_core_hour_uegoc as f64 / 1_000_000.0 * crate::p2p::get_egoc_price_usd()),
         price_per_gpu_day_uegoc:  price_per_gpu_hour_uegoc * 24,
         price_per_core_day_uegoc: price_per_core_hour_uegoc * 24,
         min_duration_hours,
@@ -1264,11 +1271,22 @@ pub async fn book_reservation(
     let pay_egusd = pay_with_egusd.unwrap_or(false);
     let egoc_total_cost = total_cost;
     let (total_cost, period_rate) = if pay_egusd {
-        let price_micro = (crate::p2p::get_egoc_price_usd() * 1_000_000.0) as u64;
-        if price_micro == 0 {
-            return Err(EgoDesktopError::WalletError("No EGOC price available for EGUSD conversion".into()));
-        }
-        let credits_cost = crate::chain_db::credits_mint_amount(total_cost, price_micro).max(1);
+        // Bill from the rate the operator listed, not from converting their coin figure at
+        // this moment. The offer said what it costs in dollars; that is the price, and it
+        // does not move between reading the listing and paying for it.
+        let credit_hourly = offer.price_per_gpu_hour_credits * offer.gpu_count as u64
+                          + offer.price_per_core_hour_credits * offer.cpu_cores as u64;
+        let credits_cost = if credit_hourly > 0 {
+            (credit_hourly * duration_minutes / 60).max(1)
+        } else {
+            // An offer listed by a node on an older build carries no credit rate, so fall
+            // back to converting. Worse, and better than refusing the booking.
+            let price_micro = (crate::p2p::get_egoc_price_usd() * 1_000_000.0) as u64;
+            if price_micro == 0 {
+                return Err(EgoDesktopError::WalletError("No EGOC price available for EGUSD conversion".into()));
+            }
+            crate::chain_db::credits_mint_amount(total_cost, price_micro).max(1)
+        };
         let period_credits = (credits_cost.saturating_mul(period_minutes) / duration_minutes.max(1)).max(1);
         (credits_cost, period_credits)
     } else {
@@ -2244,7 +2262,9 @@ pub async fn terminate_reservation(
             sla_uptime_pct: 99,
             available_from: now, status: "booked".to_string(), created_at: now,
             bonded: false,
-        });
+                    price_per_gpu_hour_credits:  0,
+            price_per_core_hour_credits: 0,
+});
     offer.status = "open".to_string();
     crate::chain_db::upsert_compute_offer(&offer);
 
