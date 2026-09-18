@@ -164,6 +164,14 @@ export default function ComputePage() {
   const [offerRam,          setOfferRam]          = useState(16);
   const [offerGpuCount,     setOfferGpuCount]     = useState(1);
   const [offerGpuVram,      setOfferGpuVram]      = useState(8);
+  // The suggested rates are calibrated against competitors priced in dollars, so they have
+  // to know what a coin is worth to stay calibrated.
+  const [egocPrice, setEgocPrice] = useState(0.008);
+  useEffect(() => {
+    invoke<{ price_usd: number; source: string }>('get_egoc_price_usd')
+      .then(p => { if (p.price_usd > 0) setEgocPrice(p.price_usd); })
+      .catch(() => {});
+  }, []);
   const [offerGpuName,      setOfferGpuName]      = useState('');
   const [offerGpuHourEgoc,  setOfferGpuHourEgoc]  = useState(0.50);
   const [offerCoreHourEgoc, setOfferCoreHourEgoc] = useState(0.02);
@@ -1378,38 +1386,51 @@ export default function ComputePage() {
             {(() => {
               const v = offerGpuVram;
               const hasGpu = offerGpuCount > 0;
-              const tiers: { label: string; desc: string; cls: string; gpu: number; core: number }[] =
+              // Held in dollars per hour, because every one of these is calibrated against a
+              // competitor whose price is in dollars. They used to be coin figures written
+              // when a coin was worth about a dollar, so at the real price "matches RunPod"
+              // applied a rate a hundred and twenty five times under it, and anyone who
+              // clicked a suggestion gave their hardware away.
+              const usdTiers: { label: string; desc: string; cls: string; gpuUsd: number; coreUsd: number }[] =
                 !hasGpu ? [
-                  { label: 'Budget',   desc: 'High volume, beat Hetzner',         cls: 'border-gray-600',   gpu: 0,    core: 0.006 },
-                  { label: 'Standard', desc: '40% below AWS, still profitable',   cls: 'border-purple-700', gpu: 0,    core: 0.014 },
-                  { label: 'Premium',  desc: 'High-perf CPU, below AWS on-demand',cls: 'border-yellow-700', gpu: 0,    core: 0.028 },
+                  { label: 'Budget',   desc: 'High volume, beat Hetzner',          cls: 'border-gray-600',   gpuUsd: 0,    coreUsd: 0.006 },
+                  { label: 'Standard', desc: '40% below AWS, still profitable',    cls: 'border-purple-700', gpuUsd: 0,    coreUsd: 0.014 },
+                  { label: 'Premium',  desc: 'High-perf CPU, below AWS on-demand', cls: 'border-yellow-700', gpuUsd: 0,    coreUsd: 0.028 },
                 ] : v <= 8 ? [
-                  { label: 'Budget',   desc: 'Undercut Vast.ai entry GPUs',       cls: 'border-gray-600',   gpu: 0.06, core: 0.006 },
-                  { label: 'Standard', desc: 'At Vast.ai floor, 40% below RunPod',cls: 'border-purple-700', gpu: 0.12, core: 0.010 },
-                  { label: 'Premium',  desc: 'Fair rate for 8GB inference',       cls: 'border-yellow-700', gpu: 0.20, core: 0.018 },
+                  { label: 'Budget',   desc: 'Undercut Vast.ai entry GPUs',        cls: 'border-gray-600',   gpuUsd: 0.06, coreUsd: 0.006 },
+                  { label: 'Standard', desc: 'At Vast.ai floor, 40% below RunPod', cls: 'border-purple-700', gpuUsd: 0.12, coreUsd: 0.010 },
+                  { label: 'Premium',  desc: 'Fair rate for 8GB inference',        cls: 'border-yellow-700', gpuUsd: 0.20, coreUsd: 0.018 },
                 ] : v <= 16 ? [
-                  { label: 'Budget',   desc: '40% below RunPod RTX 3080',         cls: 'border-gray-600',   gpu: 0.12, core: 0.008 },
-                  { label: 'Standard', desc: 'Matches Vast.ai RTX 3080 floor',    cls: 'border-purple-700', gpu: 0.22, core: 0.014 },
-                  { label: 'Premium',  desc: '25% below Lambda RTX 6000',         cls: 'border-yellow-700', gpu: 0.38, core: 0.022 },
+                  { label: 'Budget',   desc: '40% below RunPod RTX 3080',          cls: 'border-gray-600',   gpuUsd: 0.12, coreUsd: 0.008 },
+                  { label: 'Standard', desc: 'Matches Vast.ai RTX 3080 floor',     cls: 'border-purple-700', gpuUsd: 0.22, coreUsd: 0.014 },
+                  { label: 'Premium',  desc: '25% below Lambda RTX 6000',          cls: 'border-yellow-700', gpuUsd: 0.38, coreUsd: 0.022 },
                 ] : [
-                  { label: 'Budget',   desc: '20% below Vast.ai RTX 3090',        cls: 'border-gray-600',   gpu: 0.20, core: 0.010 },
-                  { label: 'Standard', desc: 'Matches RunPod 4090, 70% below AWS',cls: 'border-purple-700', gpu: 0.40, core: 0.020 },
-                  { label: 'Premium',  desc: '40% below Lambda A100 ($1.29/hr)',  cls: 'border-yellow-700', gpu: 0.75, core: 0.035 },
+                  { label: 'Budget',   desc: '20% below Vast.ai RTX 3090',         cls: 'border-gray-600',   gpuUsd: 0.20, coreUsd: 0.010 },
+                  { label: 'Standard', desc: 'Matches RunPod 4090, 70% below AWS', cls: 'border-purple-700', gpuUsd: 0.40, coreUsd: 0.020 },
+                  { label: 'Premium',  desc: '40% below Lambda A100 ($1.29/hr)',   cls: 'border-yellow-700', gpuUsd: 0.75, coreUsd: 0.035 },
                 ];
+              const price = egocPrice > 0 ? egocPrice : 0.008;
+              const toCoin = (usd: number) => Math.round((usd / price) * 10000) / 10000;
+              const tiers = usdTiers.map(t => ({
+                ...t, gpu: toCoin(t.gpuUsd), core: toCoin(t.coreUsd),
+              }));
               return (
                 <div className="space-y-1.5">
-                  <p className="text-gray-400 text-xs">Suggested prices <span className="text-gray-500">(click to apply)</span></p>
+                  <p className="text-gray-400 text-xs">
+                    Suggested prices <span className="text-gray-500">(click to apply · tracks the live EGOC price)</span>
+                  </p>
                   <div className="grid grid-cols-3 gap-2">
                     {tiers.map(t => {
                       const dailyU = u((t.gpu * offerGpuCount + t.core * offerCores) * 24);
+                      const dailyUsd = (t.gpuUsd * offerGpuCount + t.coreUsd * offerCores) * 24;
                       const active = Math.abs(offerGpuHourEgoc - t.gpu) < 0.001 && Math.abs(offerCoreHourEgoc - t.core) < 0.0001;
                       return (
                         <button key={t.label} onClick={() => { setOfferGpuHourEgoc(t.gpu); setOfferCoreHourEgoc(t.core); }}
                           className={`border rounded-lg p-2 text-left space-y-0.5 transition-colors ${active ? 'bg-purple-900/40 ' + t.cls : t.cls + ' bg-gray-750 hover:bg-gray-700'}`}>
                           <p className={`text-xs font-semibold ${t.label === 'Premium' ? 'text-yellow-400' : t.label === 'Standard' ? 'text-purple-300' : 'text-gray-300'}`}>{t.label}</p>
-                          {hasGpu && <p className="text-white text-xs">{t.gpu} EGOC/GPU/hr</p>}
+                          {hasGpu && <p className="text-white text-xs">{t.gpu} EGOC/GPU/hr <span className="text-gray-500">(${t.gpuUsd.toFixed(2)})</span></p>}
                           <p className="text-gray-400 text-xs">{t.core} EGOC/core/hr</p>
-                          <p className="text-green-400 text-xs font-medium">{fmt(dailyU)}/day</p>
+                          <p className="text-green-400 text-xs font-medium">{fmt(dailyU)} EGOC/day <span className="text-gray-500">≈ ${dailyUsd.toFixed(2)}</span></p>
                           <p className="text-gray-500 text-xs leading-tight">{t.desc}</p>
                         </button>
                       );
