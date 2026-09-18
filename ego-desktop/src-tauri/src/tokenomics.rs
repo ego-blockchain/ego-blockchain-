@@ -82,10 +82,25 @@ pub fn compute_block_reward_v2(base_emission: u64, tx_fees_uegoc: u64) -> u64 {
     base_emission.saturating_add(miner_fee_share(tx_fees_uegoc))
 }
 
-pub const STORAGE_REWARD_USD_PER_GB_DAY:  f64 = 0.002;
+/// Paid to a provider per gigabyte held for a day, so $0.005 a gigabyte-month.
+///
+/// It was 0.002, which is $0.06 a gigabyte-month: three times what iCloud charges a
+/// customer at retail and ten times Backblaze. With the early multiplier on top it reached
+/// $0.60, so a subscriber paying $4.99 for fifty gigabytes was served by a provider earning
+/// thirty dollars. No price list can be cheapest in the market while supply costs thirty
+/// times what the market sells for.
+///
+/// About $0.002 a gigabyte-month, set below what a gigabyte SELLS for rather than at it.
+/// The first attempt used $0.005, which is exactly Google One's retail rate at two
+/// terabytes, and a supply cost equal to a competitor's shelf price leaves no room to
+/// undercut them: the terabyte tier came out losing money. A test catches that now.
+pub const STORAGE_REWARD_USD_PER_GB_DAY:  f64 = 0.000_067;
 pub const CONSENSUS_REWARD_USD_PER_DAY:   f64 = 0.20;
 pub const COVERAGE_REWARD_USD_PER_DAY:    f64 = 0.15;
-pub const RETRIEVAL_REWARD_USD_PER_GB:    f64 = 0.003;
+/// Serving a gigabyte to whoever asks for it. Cut alongside the holding reward, but by
+/// less: bandwidth costs a provider something at the moment it is used, where disk that is
+/// already spinning does not.
+pub const RETRIEVAL_REWARD_USD_PER_GB:    f64 = 0.000_50;
 
 /// The most a single daily reward may pay, in coins.
 ///
@@ -482,4 +497,61 @@ mod pricing_reference_tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod storage_margin_tests {
+    use super::*;
+
+    const GB_MONTH_PAID: f64 = STORAGE_REWARD_USD_PER_GB_DAY * 30.0;
+
+    /// The plan prices in StoragePage.tsx. Kept here so a change to one without the other
+    /// shows up as a failing test rather than as a business losing money per subscriber.
+    const PLANS: [(f64, f64); 3] = [(50.0, 0.79), (200.0, 1.99), (1024.0, 4.99)];
+
+    #[test]
+    fn every_plan_earns_more_than_it_costs_to_serve() {
+        for (gb, usd) in PLANS {
+            let cost = gb * GB_MONTH_PAID;
+            assert!(
+                usd > cost,
+                "{gb} GB sells for ${usd} and costs ${cost:.2} a month to serve",
+            );
+        }
+    }
+
+    #[test]
+    fn the_biggest_plan_still_keeps_half() {
+        let (gb, usd) = PLANS[2];
+        let margin = (usd - gb * GB_MONTH_PAID) / usd;
+        assert!(margin > 0.5, "the tier with the thinnest margin keeps {:.0} percent", margin * 100.0);
+    }
+
+    #[test]
+    fn we_undercut_the_clouds_we_are_competing_with() {
+        // iCloud+ 50 GB at $0.99, Google One 200 GB at $2.99, Google One 2 TB at $9.99.
+        for ((gb, ours), theirs) in PLANS.iter().zip([0.99, 2.99, 9.99 / 2.0]) {
+            assert!(ours < &theirs, "{gb} GB at ${ours} does not beat ${theirs}");
+        }
+    }
+
+    #[test]
+    fn a_file_is_charged_more_than_the_provider_holding_it_is_paid() {
+        // These disagreed by twelve times in the wrong direction: every file stored by the
+        // byte lost money. The gap is the business, so it has to point this way.
+        let per_file_gb_month = STORAGE_USD_PER_MB_MONTH * 1_000.0;
+        assert!(
+            per_file_gb_month > GB_MONTH_PAID,
+            "per-file charges ${per_file_gb_month} a gigabyte-month and pays out ${GB_MONTH_PAID}",
+        );
+        let margin = (per_file_gb_month - GB_MONTH_PAID) / per_file_gb_month;
+        assert!(margin > 0.5, "per-file keeps {:.0} percent", margin * 100.0);
+    }
+
+    #[test]
+    fn early_providers_still_earn_far_more_than_the_end_state() {
+        let early = GB_MONTH_PAID * BOOTSTRAP_T1_MULT;
+        assert!(early > GB_MONTH_PAID * 5.0, "being early has to be worth something");
+        assert!((early - 0.0201).abs() < 1e-4, "about two cents a gigabyte-month at the start");
+    }
 }

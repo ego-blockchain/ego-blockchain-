@@ -113,9 +113,12 @@ interface ActiveSubscription {
 
 const PLANS: SubscriptionPlan[] = [
   { id: 'free',  name: 'Free',  gb: 5,    priceMonthlyUsd: 0,     priceAnnualUsd: 0      },
-  { id: 'basic', name: 'Basic', gb: 50,   priceMonthlyUsd: 4.99,  priceAnnualUsd: 47.88  },
-  { id: 'pro',   name: 'Pro',   gb: 200,  priceMonthlyUsd: 9.99,  priceAnnualUsd: 95.88, highlight: true },
-  { id: 'max',   name: 'Max',   gb: 1024, priceMonthlyUsd: 24.99, priceAnnualUsd: 239.88 },
+  // Set to undercut the cheapest consumer clouds rather than to match them: iCloud+ is
+  // $0.99 for 50 GB, Google One $2.99 for 200 GB, and Backblaze B2 works out near $0.006
+  // a gigabyte-month. Annual is two months free.
+  { id: 'basic', name: 'Basic', gb: 50,   priceMonthlyUsd: 0.79,  priceAnnualUsd: 7.90   },
+  { id: 'pro',   name: 'Pro',   gb: 200,  priceMonthlyUsd: 1.99,  priceAnnualUsd: 19.90, highlight: true },
+  { id: 'max',   name: 'Max',   gb: 1024, priceMonthlyUsd: 4.99,  priceAnnualUsd: 49.90  },
 ];
 
 const FREE_GB = 5;
