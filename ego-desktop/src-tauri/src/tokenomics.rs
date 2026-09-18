@@ -87,7 +87,23 @@ pub const CONSENSUS_REWARD_USD_PER_DAY:   f64 = 0.20;
 pub const COVERAGE_REWARD_USD_PER_DAY:    f64 = 0.15;
 pub const RETRIEVAL_REWARD_USD_PER_GB:    f64 = 0.003;
 
-pub const NODE_REWARD_CEILING_UEGOC: u64 = 50 * UEGOC_PER_EGOC; 
+/// The most a single daily reward may pay, in coins.
+///
+/// Deliberately denominated in coins, unlike the targets above, and the reason is the
+/// thing it protects. The targets are in dollars because an operator's income should not
+/// move with the market. This guards the node pool, which is three hundred million COINS,
+/// so a dollar-denominated cap would scale with the price exactly like the reward it is
+/// bounding and could never fire at all.
+///
+/// It was 50, which fired on every ordinary payout and silently became the rate: the
+/// dollar targets and the whole bootstrap multiplier had no effect on what anyone earned.
+/// At the seed price a day's consensus reward is about 250 coins, so this sits clear of
+/// normal operation and only bites if the price falls far enough that paying the dollar
+/// target would drain the pool in years rather than decades.
+pub const NODE_REWARD_CEILING_UEGOC: u64 = 1_000 * UEGOC_PER_EGOC;
+
+/// Only a dust floor. The economic minimum for fees lives in FEE_USD_MIN.
+pub const NODE_REWARD_FLOOR_UEGOC: u64 = 10;
 
 pub const REWARD_CAP_PER_TX_UEGOC: u64 = 10_000 * UEGOC_PER_EGOC;
 
@@ -126,7 +142,7 @@ pub fn reward_usd_to_uegoc(target_usd: f64) -> u64 {
     let price = crate::p2p::get_egoc_price_usd().max(1e-9);
     let scaled = target_usd * current_early_multiplier();
     let uegoc = (scaled / price * UEGOC_PER_EGOC as f64).round() as u64;
-    uegoc.clamp(FEE_FLOOR_UEGOC, NODE_REWARD_CEILING_UEGOC)
+    uegoc.clamp(NODE_REWARD_FLOOR_UEGOC, NODE_REWARD_CEILING_UEGOC)
 }
 
 /// Storage hosting reward for `gb` GB of peer data stored for one day.
@@ -243,7 +259,16 @@ pub const TRANSFER_FEE_UEGOC: u64 = 500_000;   // 0.5 EGOC
 pub const CALL_FEE_BASE_UEGOC: u64 = 600_000;  // 0.6 EGOC
 pub const DEPLOY_FEE_BASE_UEGOC: u64 = 800_000; // 0.8 EGOC
 
-pub const FEE_USD_MAX: f64 = 0.80; // never charge more than $0.80 when price is high
+/// Never charge more than this when the coin is expensive. Protects the user.
+pub const FEE_USD_MAX: f64 = 0.80;
+
+/// Never charge less than this when the coin is cheap. Protects the network.
+///
+/// The cap above existed on its own, which guarded one direction only. A fee fixed in
+/// coins costs whatever the coin costs: at a tenth of the seed price a transfer is four
+/// hundredths of a cent, and a chain nobody has to pay to write to is a chain anybody can
+/// fill. Spam does not care that the coin fell.
+pub const FEE_USD_MIN: f64 = 0.001;
 
 pub const FEE_FLOOR_UEGOC: u64 = 10;
 pub const FEE_CEILING_UEGOC: u64 = 5_000_000; // kept for legacy references
@@ -265,9 +290,14 @@ pub fn fee_for_tx_with_staking(tx_type: &str, is_staker: bool) -> u64 {
         "call"   => CALL_FEE_BASE_UEGOC,
         _        => TRANSFER_FEE_UEGOC,
     };
-    // Cap at $0.80 USD when EGOC price is high
-    let usd_cap_uegoc = (FEE_USD_MAX / price * 1_000_000.0) as u64;
-    let base = base_uegoc.min(usd_cap_uegoc).max(FEE_FLOOR_UEGOC);
+    let usd_cap_uegoc   = (FEE_USD_MAX / price * 1_000_000.0) as u64;
+    let usd_floor_uegoc = (FEE_USD_MIN / price * 1_000_000.0) as u64;
+    let base = base_uegoc
+        .min(usd_cap_uegoc.max(FEE_FLOOR_UEGOC))
+        .max(usd_floor_uegoc)
+        .max(FEE_FLOOR_UEGOC);
+    // The staker discount applies after both bounds, so staking keeps its value at any
+    // price. Locked capital is its own answer to spam, which is what the floor guards.
     if is_staker { (base / 10).max(FEE_FLOOR_UEGOC) } else { base }
 }
 
@@ -391,15 +421,65 @@ mod pricing_reference_tests {
         assert!(usd < FEE_USD_MAX, "the cap is for a high price and must not bite at the seed price");
     }
 
+    fn ceiling_egoc() -> f64 {
+        (NODE_REWARD_CEILING_UEGOC / UEGOC_PER_EGOC) as f64
+    }
+
     #[test]
-    fn the_reward_ceiling_still_swallows_the_daily_targets() {
-        let consensus_egoc = CONSENSUS_REWARD_USD_PER_DAY * BOOTSTRAP_T1_MULT / EGOC_DEFAULT_PRICE_USD;
+    fn a_days_reward_now_fits_under_the_ceiling() {
+        let price = EGOC_DEFAULT_PRICE_USD;
+        let day_usd = (CONSENSUS_REWARD_USD_PER_DAY + COVERAGE_REWARD_USD_PER_DAY)
+            * BOOTSTRAP_T1_MULT;
+        assert!((day_usd - 3.50).abs() < 1e-9, "the targets mean $3.50 a day early on");
+        for target in [CONSENSUS_REWARD_USD_PER_DAY, COVERAGE_REWARD_USD_PER_DAY] {
+            let want = target * BOOTSTRAP_T1_MULT / price;
+            assert!(
+                want < ceiling_egoc(),
+                "a bound that fires on an ordinary payout is not a bound, it is the rate",
+            );
+        }
+    }
+
+    #[test]
+    fn the_ceiling_catches_a_collapse() {
+        // The point of a coin bound: the pool holds coins, so a price crash must not be
+        // allowed to pay out a decade of it in a month chasing a dollar figure.
+        let price = 0.00008_f64; // a hundredth of the seed price
+        let want = CONSENSUS_REWARD_USD_PER_DAY * BOOTSTRAP_T1_MULT / price;
         assert!(
-            consensus_egoc > (NODE_REWARD_CEILING_UEGOC / UEGOC_PER_EGOC) as f64,
-            "unresolved by design, not by accident: under a hundred nodes the ten times \
-             bootstrap multiplier puts every reward target above the fifty coin ceiling, so \
-             the targets and the multiplier both have no effect. Left alone deliberately \
-             until the ceiling is decided.",
+            want > ceiling_egoc(),
+            "a hundredfold crash asks for {want} coins a day and something has to refuse it",
         );
     }
+
+    #[test]
+    fn a_dollar_ceiling_could_never_have_fired() {
+        // Kept as a record of a wrong turn. A dollar cap scales with price exactly like the
+        // reward it bounds, so their ratio is fixed and the bound is decorative.
+        let usd_ceiling = 25.0_f64;
+        let target = CONSENSUS_REWARD_USD_PER_DAY * BOOTSTRAP_T1_MULT;
+        for price in [0.0000001_f64, 0.008, 100.0] {
+            let ratio = (usd_ceiling / price) / (target / price);
+            assert!((ratio - usd_ceiling / target).abs() < 1e-9, "the ratio never moves");
+        }
+    }
+
+    #[test]
+    fn a_fee_has_a_floor_as_well_as_a_ceiling() {
+        assert!(FEE_USD_MIN > 0.0 && FEE_USD_MIN < FEE_USD_MAX);
+        let coins = TRANSFER_FEE_UEGOC as f64 / UEGOC_PER_EGOC as f64;
+        assert!(coins * EGOC_DEFAULT_PRICE_USD > FEE_USD_MIN, "no floor needed at the seed price");
+        assert!(
+            coins * 0.0001 < FEE_USD_MIN,
+            "at a hundredth of the seed price the fee is dust, and a chain nobody pays to              write to is one anybody can fill",
+        );
+    }
+
+    #[test]
+    fn the_floor_never_overtakes_the_cap() {
+        for price in [0.0000001_f64, 0.0001, 0.008, 0.08, 2.45, 100.0] {
+            assert!(FEE_USD_MIN / price < FEE_USD_MAX / price, "inverted at price {price}");
+        }
+    }
+
 }
