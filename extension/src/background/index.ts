@@ -9,6 +9,7 @@ import {
   seedToMnemonic,
   signMessage,
   buildSignedEgoTx,
+  buildSignedContractCallTx,
 } from '../shared/crypto';
 import {
   getBalance,
@@ -230,6 +231,45 @@ async function sendTransaction(
       info.next,
       info.fee_uegoc,
       params.memo ?? '',
+    );
+
+    const result = await submitTx(tx, rpcUrl);
+    return { success: true, data: { tx_hash: result.tx_hash ?? tx.hash } };
+  } catch (e: unknown) {
+    return { success: false, error: (e as Error).message };
+  }
+}
+
+async function callContract(
+  contractAddr: string,
+  entrypoint: string,
+  callArgs: string,
+): Promise<ExtResponse<{ tx_hash: string }>> {
+  if (!unlockedSeed) return { success: false, error: 'Wallet is locked' };
+  if (!contractAddr || !entrypoint) {
+    return { success: false, error: 'A contract call needs a contract address and an entrypoint' };
+  }
+  if (callArgs && !/^[0-9a-fA-F]*$/.test(callArgs)) {
+    return { success: false, error: 'callArgs must be hex' };
+  }
+
+  const walletData = await loadWalletData();
+  if (!walletData) return { success: false, error: 'No wallet' };
+
+  try {
+    const rpcUrl = getRpcUrl(walletData.network);
+    // Same rule as a transfer: the nonce comes from the chain, never a local
+    // counter, so the same wallet can be used here and in Ego Desktop at once.
+    const info = await getNonceInfo(walletData.address, rpcUrl);
+
+    const tx = buildSignedContractCallTx(
+      unlockedSeed,
+      walletData.address,
+      contractAddr,
+      entrypoint,
+      (callArgs ?? '').toLowerCase(),
+      info.next,
+      info.fee_uegoc,
     );
 
     const result = await submitTx(tx, rpcUrl);
@@ -495,6 +535,13 @@ chrome.runtime.onMessage.addListener(
 
         case 'EGO_SEND_TX':
           return sendTransaction(payload as unknown as SendTxParams);
+
+        case 'EGO_CALL_CONTRACT':
+          return callContract(
+            payload.contractAddr as string,
+            payload.entrypoint as string,
+            payload.callArgs as string,
+          );
 
         case 'EGO_SIGN_MESSAGE':
           return handleSignMessage(payload.message as string);

@@ -1,7 +1,86 @@
+use crate::app::AppState;
 use crate::error::EgoDesktopError;
-use crate::ledger::{contracts_dir, load_chain, save_chain, Ledger, LedgerTx};
+use crate::ledger::{
+    contract_commit_memo, contracts_dir, load_chain, save_chain, tx_signing_bytes_v2,
+    Ledger, LedgerTx,
+};
 use ego_vm::{CallResult, DeployResult, Executor};
 use serde::{Deserialize, Serialize};
+use tauri::State;
+
+const CHAIN_ID: u8 = 1;
+
+/// Sign a contract transaction and hand it to the network.
+///
+/// Everything a contract transaction says beyond the plain transfer fields lives
+/// outside the signed bytes, so the memo carries a commitment to the entrypoint and
+/// the arguments and the verifier checks it. Until this existed the dApp IDE ran
+/// contracts on the machine that typed them and told nobody, which is why a contract
+/// deployed on one node was invisible everywhere else.
+fn sign_and_queue_contract_tx(
+    state: &State<'_, AppState>,
+    ledger: &mut Ledger,
+    tx_type: &str,
+    contract_addr: &str,
+    entrypoint: &str,
+    args_hex: &str,
+    wasm_hex: &str,
+    code_hash: &str,
+    fee: u64,
+) -> Result<LedgerTx, EgoDesktopError> {
+    let from = ledger.address.clone();
+    let confirmed = crate::ledger::last_confirmed_nonce(&from);
+    let nonce = ledger.nonce.max(confirmed) + 1;
+    let ts = chrono::Utc::now().timestamp();
+    let memo = contract_commit_memo(tx_type, entrypoint, args_hex, code_hash);
+
+    let sign_bytes = tx_signing_bytes_v2(&from, contract_addr, 0, nonce, ts, CHAIN_ID, &memo);
+    let kp = state.get_keypair().ok_or_else(|| {
+        EgoDesktopError::WalletError("Wallet not initialized - call init_wallet first".into())
+    })?;
+    let ed_sig  = kp.sign_ed25519(&sign_bytes);
+    let dil_sig = kp.sign_dilithium(&sign_bytes);
+
+    let tx = LedgerTx {
+        hash: format!("0x{}", ego_core::hash_data(&sign_bytes).to_hex()),
+        from,
+        to: contract_addr.to_string(),
+        amount: 0,
+        memo: Some(memo),
+        timestamp: ts,
+        signature: hex::encode(ed_sig.as_bytes()),
+        status: "Pending".into(),
+        block_height: None,
+        nonce,
+        public_key_ed25519: hex::encode(kp.ed25519_public_key().as_bytes()),
+        dilithium_pubkey: hex::encode(&kp.dilithium_public_key().key_data),
+        dilithium_signature: hex::encode(&dil_sig.signature_data),
+        fee_uegoc: fee,
+        tx_version: 2,
+        chain_id: CHAIN_ID,
+        tx_type: tx_type.to_string(),
+        contract_addr: contract_addr.to_string(),
+        entrypoint: entrypoint.to_string(),
+        call_args: args_hex.to_string(),
+        wasm_code: wasm_hex.to_string(),
+        ..LedgerTx::default()
+    };
+
+    ledger.nonce = nonce;
+    let _ = ledger.save();
+
+    crate::mempool::get_mempool()
+        .push(tx.clone())
+        .map_err(EgoDesktopError::WalletError)?;
+    crate::commands::tx_pending::add(&tx);
+
+    let gossip = tx.clone();
+    tauri::async_runtime::spawn(async move {
+        crate::p2p::broadcast_pending_tx(gossip).await;
+    });
+
+    Ok(tx)
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CompileResult {
@@ -37,8 +116,11 @@ pub struct DeployContractArgs {
 }
 
 #[tauri::command]
-pub async fn deploy_contract(args: DeployContractArgs) -> Result<DeployResult, EgoDesktopError> {
-    let ledger = Ledger::load();
+pub async fn deploy_contract(
+    state: State<'_, AppState>,
+    args: DeployContractArgs,
+) -> Result<DeployResult, EgoDesktopError> {
+    let mut ledger = Ledger::load();
     if ledger.address.is_empty() {
         return Err(EgoDesktopError::WalletError("No wallet".into()));
     }
@@ -94,49 +176,29 @@ pub async fn deploy_contract(args: DeployContractArgs) -> Result<DeployResult, E
     let tx_data     = format!("deploy:{}:{}:{}", ledger.address, result.contract_address, nonce);
     let tx_hash     = hex::encode(ego_core::hash_data(tx_data.as_bytes()).as_bytes());
 
+    // The fee rides on the deploy transaction itself and is burned by the network
+    // when the block applies it. Checked here only so the user is told now rather
+    // than discovering it when the transaction is dropped.
     if deploy_fee > 0 {
-        let bal = chain.balance_of(&ledger.address);
+        let bal = crate::chain_db::balance_of(&ledger.address);
         if deploy_fee > bal {
             return Err(EgoDesktopError::WalletError(format!(
                 "Insufficient balance for deploy fee: need {} uEGOC, have {}",
                 deploy_fee, bal
             )));
         }
-        let fee_hash = format!("0x{}", ego_core::hash_data(
-            format!("deployfee:{}:{}:{}", ledger.address, result.contract_address, nonce).as_bytes()
-        ).to_hex());
-        chain.transactions.push(LedgerTx {
-            hash:      fee_hash,
-            from:      ledger.address.clone(),
-            to:        "egot1burn000000000000000000000000000000000000000".into(),
-            amount:    deploy_fee,
-            memo:      Some(format!("Deploy fee: {} [burned]", result.contract_address)),
-            timestamp: ts,
-            status:    "Confirmed".into(),
-            fee_uegoc: deploy_fee,
-            ..LedgerTx::default()
-        });
     }
 
-    let tx = LedgerTx {
-        hash:          tx_hash,
-        from:          ledger.address.clone(),
-        to:            result.contract_address.clone(),
-        amount:        0,
-        memo:          Some(format!("deploy:{}", result.code_hash)),
-        timestamp:     ts,
-        status:        "Confirmed".to_string(),
-        nonce,
-        tx_type:       "deploy".to_string(),
-        wasm_code:     args.wasm_hex.clone(),
-        contract_addr: result.contract_address.clone(),
-        entrypoint:    "init".to_string(),
-        call_args:     args.init_args_hex.clone(),
-        ..LedgerTx::default()
-    };
+    let _ = (tx_hash, nonce, ts);
+    save_chain(&chain).ok();
 
-    chain.transactions.push(tx.clone());
-    let _ = save_chain(&chain);
+    // The local run above is a preview so the IDE can show a result immediately.
+    // This is the authoritative one: every node deploys it when the block lands.
+    sign_and_queue_contract_tx(
+        &state, &mut ledger, "deploy",
+        &result.contract_address, "init", &args.init_args_hex,
+        &args.wasm_hex, &result.code_hash, deploy_fee,
+    )?;
 
     Ok(result)
 }
@@ -149,7 +211,10 @@ pub struct CallContractArgs {
 }
 
 #[tauri::command]
-pub async fn call_contract(args: CallContractArgs) -> Result<CallResult, EgoDesktopError> {
+pub async fn call_contract(
+    state: State<'_, AppState>,
+    args: CallContractArgs,
+) -> Result<CallResult, EgoDesktopError> {
     if !args.contract_addr.starts_with("egot1") || args.contract_addr.len() > 100 {
         return Err(EgoDesktopError::WalletError("Invalid contract address".into()));
     }
@@ -218,25 +283,15 @@ pub async fn call_contract(args: CallContractArgs) -> Result<CallResult, EgoDesk
                               args.contract_addr, args.entrypoint, nonce);
         let tx_hash = hex::encode(ego_core::hash_data(tx_data.as_bytes()).as_bytes());
 
-        let tx = LedgerTx {
-            hash:          tx_hash,
-            from:          ledger.address.clone(),
-            to:            args.contract_addr.clone(),
-            amount:        0,
-            memo:          Some(format!("call:{}", args.entrypoint)),
-            timestamp:     ts,
-            status:        "Confirmed".to_string(),
-            nonce,
-            tx_type:       "call".to_string(),
-            contract_addr: args.contract_addr.clone(),
-            entrypoint:    args.entrypoint.clone(),
-            call_args:     args.args_hex.clone(),
-            ..LedgerTx::default()
-        };
-
-        chain.transactions.push(tx.clone());
-        let _ = save_chain(&chain);
+        let _ = (tx_data, tx_hash, ts, nonce);
     }
+
+    let mut ledger = Ledger::load();
+    let fee = crate::tokenomics::CALL_FEE_BASE_UEGOC;
+    sign_and_queue_contract_tx(
+        &state, &mut ledger, "call",
+        &args.contract_addr, &args.entrypoint, &args.args_hex, "", "", fee,
+    )?;
 
     Ok(result)
 }

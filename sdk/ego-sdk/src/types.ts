@@ -56,3 +56,11 @@ export interface EgoClientOptions {
 
   timeout?: number;
 }
+
+export interface DeployedContract {
+  address:    string;
+  name:       string;
+  deployer:   string;
+  deployedAt: number;
+  codeHash:   string;
+}

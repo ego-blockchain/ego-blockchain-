@@ -1,5 +1,6 @@
 import nacl from 'tweetnacl';
 import { blake2s } from 'blakejs';
+import { blake3 } from '@noble/hashes/blake3';
 import { bech32m } from 'bech32';
 
 import { WORDLIST } from './wordlist';
@@ -225,6 +226,58 @@ export function buildSignedEgoTx(
     tx_type: 'transfer',
     tx_version: 2,
     chain_id: chainId,
+  };
+}
+
+// The memo a contract transaction has to carry.
+//
+// txSigningBytesV2 covers the memo but not entrypoint or call_args, so those two
+// travel outside the signature. Committing to them in the memo is what stops a
+// relaying node repointing the call at a different function or rewriting its
+// arguments. Must match ledger::contract_commit_memo on the node exactly.
+export function contractCommitMemo(entrypoint: string, argsHex: string): string {
+  const digest = toHex(blake3(new TextEncoder().encode(argsHex)));
+  return `call:${entrypoint}:${digest.slice(0, 16)}`;
+}
+
+// A contract call, signed the same way a transfer is. Amount is always zero:
+// value moves through the contract, not alongside the call.
+export function buildSignedContractCallTx(
+  seed: Uint8Array,
+  from: string,
+  contractAddr: string,
+  entrypoint: string,
+  argsHex: string,
+  nonce: number,
+  feeUegoc: number,
+): SignedEgoTx & { contract_addr: string; entrypoint: string; call_args: string } {
+  const chainId = 1;
+  const timestamp = Math.floor(Date.now() / 1000);
+  const memo = contractCommitMemo(entrypoint, argsHex);
+  const signBytes = txSigningBytesV2(
+    from, contractAddr, BigInt(0), BigInt(nonce), BigInt(timestamp), chainId, memo,
+  );
+  const keypair = nacl.sign.keyPair.fromSeed(seed);
+  const sig = nacl.sign.detached(signBytes, keypair.secretKey);
+
+  return {
+    hash: '0x' + toHex(blake2s(signBytes, undefined, 32)),
+    from,
+    to: contractAddr,
+    amount: 0,
+    memo,
+    timestamp,
+    signature: toHex(sig),
+    status: 'Pending',
+    nonce,
+    public_key_ed25519: toHex(keypair.publicKey),
+    fee_uegoc: feeUegoc,
+    tx_type: 'call',
+    tx_version: 2,
+    chain_id: chainId,
+    contract_addr: contractAddr,
+    entrypoint,
+    call_args: argsHex,
   };
 }
 

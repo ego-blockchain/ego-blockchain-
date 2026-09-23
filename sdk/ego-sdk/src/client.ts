@@ -1,5 +1,6 @@
 import type {
   BalanceResult,
+  DeployedContract,
   BlockSummary,
   EgoClientOptions,
   HealthResult,
@@ -73,8 +74,49 @@ export class EgoClient {
     return this.get<BalanceResult>(`/balance/${addr}`);
   }
 
+  /**
+   * Call a JSON-RPC method. The node serves JSON-RPC at POST / — the REST
+   * paths only cover blocks, transactions, health and nodes.
+   */
+  private async rpc<T>(method: string, params: unknown = {}): Promise<T> {
+    const body = { jsonrpc: "2.0", id: Date.now(), method, params };
+    const res = await this.post<{ result?: T; error?: { code: number; message: string } }>("/", body);
+    if (res.error) throw new Error(`${method} failed (${res.error.code}): ${res.error.message}`);
+    return res.result as T;
+  }
+
   async submitTx(tx: TxEnvelope): Promise<TxSubmitResult> {
-    return this.post<TxSubmitResult>("/tx/submit", { tx });
+    return this.rpc<TxSubmitResult>("tx.submit", { tx });
+  }
+
+  /**
+   * Read one value out of a deployed contract's state.
+   *
+   * Returns the raw hex the contract stored, or null when the key is unset.
+   * Decoding it is the caller's job: the chain does not know what the bytes mean.
+   */
+  async getContractState(
+    contractAddr: string,
+    prefix: string,
+    key: string,
+  ): Promise<string | null> {
+    const r = await this.rpc<{ value: string | null }>("contract.getState", {
+      contractAddr,
+      prefix,
+      key,
+    });
+    return r.value ?? null;
+  }
+
+  /** Every contract this node has seen deployed. */
+  async listDeployedContracts(): Promise<DeployedContract[]> {
+    return this.rpc<DeployedContract[]>("contract.listDeployed", {});
+  }
+
+  /** Confirmed nonce for an address, which a contract call must be built on top of. */
+  async getNonce(address: string): Promise<number> {
+    const r = await this.rpc<{ nonce: number }>("wallet.getNonce", { address });
+    return r.nonce ?? 0;
   }
 
   async getPendingTxs(): Promise<PendingTx[]> {

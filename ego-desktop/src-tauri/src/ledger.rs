@@ -1451,6 +1451,96 @@ pub fn verify_incoming_tx(tx: &LedgerTx) -> Result<(), String> {
     verify_incoming_tx_with_miner(tx, "")
 }
 
+/// The memo a contract transaction must carry.
+///
+/// `tx_signing_bytes_v2` covers the memo but not `entrypoint`, `call_args` or
+/// `wasm_code`, so on their own those fields travel unsigned: any node relaying a
+/// call could point it at a different entrypoint, or swap the arguments, and the
+/// signature would still check out. Committing to them here puts them inside the
+/// bytes the sender actually signed.
+pub fn contract_commit_memo(tx_type: &str, entrypoint: &str, args_hex: &str, code_hash: &str) -> String {
+    let args_digest = blake3::hash(args_hex.as_bytes()).to_hex();
+    match tx_type {
+        "deploy" => format!("deploy:{}:{}", code_hash, &args_digest[..16]),
+        _        => format!("call:{}:{}", entrypoint, &args_digest[..16]),
+    }
+}
+
+#[cfg(test)]
+mod contract_commitment_tests {
+    use super::*;
+
+    fn call_tx(entrypoint: &str, args_hex: &str, memo: &str) -> LedgerTx {
+        LedgerTx {
+            tx_type: "call".into(),
+            contract_addr: "egot1contract".into(),
+            entrypoint: entrypoint.into(),
+            call_args: args_hex.into(),
+            memo: Some(memo.into()),
+            ..LedgerTx::default()
+        }
+    }
+
+    #[test]
+    fn a_matching_call_is_accepted() {
+        let memo = contract_commit_memo("call", "transfer", "deadbeef", "");
+        assert!(check_contract_commitment(&call_tx("transfer", "deadbeef", &memo)).is_ok());
+    }
+
+    #[test]
+    fn swapping_the_entrypoint_is_refused() {
+        // The memo was signed for transfer(); a relay repoints it at withdraw().
+        let memo = contract_commit_memo("call", "transfer", "deadbeef", "");
+        assert!(check_contract_commitment(&call_tx("withdraw", "deadbeef", &memo)).is_err(),
+            "an entrypoint outside the signed bytes must not be swappable");
+    }
+
+    #[test]
+    fn rewriting_the_arguments_is_refused() {
+        let memo = contract_commit_memo("call", "transfer", "deadbeef", "");
+        assert!(check_contract_commitment(&call_tx("transfer", "c0ffee", &memo)).is_err(),
+            "call args outside the signed bytes must not be rewritable");
+    }
+
+    #[test]
+    fn a_contract_tx_with_no_memo_is_refused() {
+        let mut tx = call_tx("transfer", "deadbeef", "");
+        tx.memo = None;
+        assert!(check_contract_commitment(&tx).is_err());
+    }
+
+    #[test]
+    fn plain_transfers_are_untouched() {
+        let tx = LedgerTx { tx_type: "transfer".into(), memo: None, ..LedgerTx::default() };
+        assert!(check_contract_commitment(&tx).is_ok(),
+            "the rule must only bind contract transactions");
+    }
+}
+
+/// Reject a contract transaction whose payload does not match the memo its sender
+/// signed. Without this the commitment above is decoration.
+fn check_contract_commitment(tx: &LedgerTx) -> Result<(), String> {
+    if tx.tx_type != "deploy" && tx.tx_type != "call" {
+        return Ok(());
+    }
+    if tx.contract_addr.is_empty() || tx.entrypoint.is_empty() {
+        return Err("contract transaction is missing its target".into());
+    }
+    let code_hash = if tx.tx_type == "deploy" {
+        let input = format!("{}{}", tx.from, tx.wasm_code);
+        hex::encode(blake3::hash(input.as_bytes()).as_bytes())
+    } else {
+        String::new()
+    };
+    let expected = contract_commit_memo(&tx.tx_type, &tx.entrypoint, &tx.call_args, &code_hash);
+    match tx.memo.as_deref() {
+        Some(m) if m == expected => Ok(()),
+        _ => Err(format!(
+            "contract payload does not match the signed memo (expected {expected})"
+        )),
+    }
+}
+
 pub fn is_protocol_system_tx(tx: &LedgerTx) -> bool {
     if tx.tx_type == "faucet" && tx.from == crate::chain_db::NODE_POOL_ADDR {
         return true;
@@ -1558,6 +1648,8 @@ pub fn verify_confirmed_tx_sig(tx: &LedgerTx) -> Result<(), String> {
 /// This closes the free-mint exploit where any node crafts `from=faucet → to=self`.
 pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result<(), String> {
     let _ = block_miner;
+
+    check_contract_commitment(tx)?;
 
     let dilithium_disabled = crate::chain_db::is_feature_disabled(
         crate::chain_db::FEATURE_DILITHIUM_DISABLED,

@@ -35,6 +35,17 @@ window.addEventListener('EGO_REQUEST', async (event: Event) => {
       break;
     }
 
+    case 'ego_callContract': {
+      msgType = 'EGO_CALL_CONTRACT';
+      const p0 = (params[0] ?? {}) as Record<string, unknown>;
+      payload = {
+        contractAddr: p0.contractAddr ?? p0.to ?? '',
+        entrypoint:   p0.entrypoint ?? '',
+        callArgs:     p0.callArgs ?? p0.args ?? '',
+      };
+      break;
+    }
+
     case 'personal_sign':
     case 'ego_sign': {
       msgType = 'EGO_SIGN_MESSAGE';
