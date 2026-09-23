@@ -86,7 +86,38 @@ pub struct Message {
     // upgrading does not strip ticks off history that has plainly arrived.
     #[serde(default = "default_true")]
     pub delivered: bool,
+    #[serde(default)]
+    pub reply_to: Option<String>,
+    #[serde(default)]
+    pub reactions: Vec<Reaction>,
+    #[serde(default)]
+    pub edited_at: Option<i64>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Reaction {
+    pub emoji: String,
+    pub from:  String,
+}
+
+pub const MSG_REPLY:    &str = "reply";
+pub const MSG_REACTION: &str = "reaction";
+pub const MSG_EDIT:     &str = "edit";
+
+/// How long a sender may still edit a message they sent.
+pub const EDIT_WINDOW_SECS: i64 = 60 * 60;
+/// Slack on the receiving side so an honest edit sent at 59 minutes is not
+/// refused because the two machines disagree about the time.
+const EDIT_CLOCK_SLACK_SECS: i64 = 5 * 60;
+
+pub const REACTIONS: [&str; 4] = ["like", "dislike", "thanks", "heart"];
+
+#[derive(Deserialize)]
+struct ReplyBody  { reply_to: String, text: String }
+#[derive(Deserialize)]
+struct ReactBody  { target: String, emoji: String, #[serde(default)] remove: bool }
+#[derive(Deserialize)]
+struct EditBody   { target: String, text: String }
 
 fn default_true() -> bool { true }
 
@@ -288,6 +319,51 @@ async fn resolve_endpoint(contact_addr: &str, stored_endpoint: &str) -> String {
     stored_endpoint.to_string()
 }
 
+pub fn is_control_type(t: &str) -> bool {
+    t == MSG_REACTION || t == MSG_EDIT
+}
+
+/// Toggle one person's reaction on one message. Returns whether anything changed,
+/// so a repeated delivery of the same reaction does not redraw the conversation.
+fn apply_reaction(target: &str, who: &str, emoji: &str, remove: bool) -> Result<bool, String> {
+    if !REACTIONS.contains(&emoji) {
+        return Err(format!("Unknown reaction {emoji}"));
+    }
+    let mut msgs = load_messages();
+    let m = msgs.iter_mut().find(|m| m.id == target)
+        .ok_or_else(|| "No such message".to_string())?;
+    let at = m.reactions.iter().position(|r| r.from == who && r.emoji == emoji);
+    match (at, remove) {
+        (Some(i), true)  => { m.reactions.remove(i); }
+        (None,    false) => { m.reactions.push(Reaction { emoji: emoji.to_string(), from: who.to_string() }); }
+        _ => return Ok(false),
+    }
+    save_messages(&msgs).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Replace the text of a message its sender already sent. Only the sender may edit
+/// it, and only inside the window: without that check on this side, anyone could
+/// rewrite what the other person has already read, at any point in the future.
+fn apply_edit(target: &str, who: &str, text: &str, now: i64) -> Result<bool, String> {
+    let mut msgs = load_messages();
+    let m = msgs.iter_mut().find(|m| m.id == target)
+        .ok_or_else(|| "No such message".to_string())?;
+    if m.from != who {
+        return Err("Only the sender can edit a message".into());
+    }
+    if now - m.timestamp > EDIT_WINDOW_SECS + EDIT_CLOCK_SLACK_SECS {
+        return Err("Edit window has closed".into());
+    }
+    if m.content == text {
+        return Ok(false);
+    }
+    m.content   = text.to_string();
+    m.edited_at = Some(now);
+    save_messages(&msgs).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 pub(crate) fn receive_message_inner(bundle: &str, seq: u64) -> Result<(Message, bool), String> {
     let (from, to, ts, mtype, nonce_hex, ct_hex) = parse_msg_bundle(bundle)
         .ok_or_else(|| "Invalid message bundle — must start with egomsg1:".to_string())?;
@@ -352,8 +428,43 @@ pub(crate) fn receive_message_inner(bundle: &str, seq: u64) -> Result<(Message, 
         let _ = save_contacts(&contacts);
     }
 
+    let id = format!("{}-{}", ts, &nonce_hex[..8]);
+
+    // A reaction or an edit is not a message in its own right: it changes one that
+    // already arrived. Apply it to the stored conversation and hand the caller a
+    // marker it can recognise, so no receipt and no notification are raised for it.
+    if mtype == MSG_REACTION || mtype == MSG_EDIT {
+        let applied = if mtype == MSG_REACTION {
+            serde_json::from_str::<ReactBody>(&content)
+                .map_err(|_| "Malformed reaction".to_string())
+                .and_then(|b| apply_reaction(&b.target, &from, &b.emoji, b.remove))
+        } else {
+            serde_json::from_str::<EditBody>(&content)
+                .map_err(|_| "Malformed edit".to_string())
+                .and_then(|b| apply_edit(&b.target, &from, &b.text, ts))
+        }?;
+        let marker = Message {
+            id, from: from.clone(), to, content: String::new(),
+            message_type: mtype, timestamp: ts, outgoing: false,
+            read: true, read_by_recipient: false, delivered: true,
+            reply_to: None, reactions: Vec::new(), edited_at: None,
+        };
+        return Ok((marker, applied));
+    }
+
+    // A reply carries the id it answers alongside its text. Unwrap it into an
+    // ordinary text message so nothing downstream has to know the wire shape.
+    let (content, reply_to, mtype) = if mtype == MSG_REPLY {
+        match serde_json::from_str::<ReplyBody>(&content) {
+            Ok(b)  => (b.text, Some(b.reply_to), "text".to_string()),
+            Err(_) => (content, None, "text".to_string()),
+        }
+    } else {
+        (content, None, mtype)
+    };
+
     let msg = Message {
-        id:           format!("{}-{}", ts, &nonce_hex[..8]),
+        id,
         from:         from.clone(),
         to,
         content,
@@ -363,6 +474,9 @@ pub(crate) fn receive_message_inner(bundle: &str, seq: u64) -> Result<(Message, 
         read:         false,
         read_by_recipient: false,
         delivered:    false,
+        reply_to,
+        reactions:    Vec::new(),
+        edited_at:    None,
     };
 
     let mut msgs = load_messages();
@@ -875,6 +989,7 @@ pub async fn send_message(
     contact_addr: String,
     content: String,
     message_type: String,
+    reply_to: Option<String>,
 ) -> Result<(), EgoDesktopError> {
     let ledger   = Ledger::load();
     let my_addr  = ledger.address.clone();
@@ -897,7 +1012,18 @@ pub async fn send_message(
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ct = cipher.encrypt(nonce, content.as_bytes())
+    // A reply travels as its own wire type carrying the id it answers. Locally it
+    // is stored as ordinary text with that id beside it, so only the wire knows
+    // about the wrapper.
+    let (wire_content, wire_type) = match reply_to.as_deref() {
+        Some(target) => (
+            serde_json::json!({ "reply_to": target, "text": content }).to_string(),
+            MSG_REPLY.to_string(),
+        ),
+        None => (content.clone(), message_type.clone()),
+    };
+
+    let ct = cipher.encrypt(nonce, wire_content.as_bytes())
         .map_err(|e| EgoDesktopError::CryptoError(e.to_string()))?;
 
     let ts        = chrono::Utc::now().timestamp();
@@ -905,7 +1031,7 @@ pub async fn send_message(
     let ct_hex    = hex::encode(&ct);
     let bundle    = format!(
         "egomsg1:{}:{}:{}:{}:{}:{}",
-        my_addr, contact_addr, ts, message_type, nonce_hex, ct_hex
+        my_addr, contact_addr, ts, wire_type, nonce_hex, ct_hex
     );
 
     let stored_endpoint = contacts[contact_pos].endpoint.clone();
@@ -919,6 +1045,7 @@ pub async fn send_message(
     let raw_content     = content.clone();
 
     let mut msgs = load_messages();
+    if !is_control_type(&message_type) {
     msgs.push(Message {
         id:           format!("{}-{}", ts, &nonce_hex[..8]),
         from:         my_addr.clone(),
@@ -930,8 +1057,12 @@ pub async fn send_message(
         read:         true,
         read_by_recipient: false,
         delivered:    false,
+        reply_to,
+        reactions:    Vec::new(),
+        edited_at:    None,
     });
     save_messages(&msgs).map_err(EgoDesktopError::FileSystemError)?;
+    }
 
     let _ = app.emit_all("ego://message-sent", serde_json::json!({ "to": contact_addr }));
     let contact_addr_key = contact_addr.clone();
@@ -1176,6 +1307,53 @@ pub async fn get_unread_count() -> Result<u32, EgoDesktopError> {
 pub async fn clear_messages() -> Result<(), EgoDesktopError> {
     crate::utils::atomic_write(&messages_path(), b"[]")
         .map_err(|e| EgoDesktopError::FileSystemError(e.to_string()))
+}
+
+#[tauri::command]
+pub async fn react_to_message(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    contact_addr: String,
+    message_id: String,
+    emoji: String,
+) -> Result<(), EgoDesktopError> {
+    if !REACTIONS.contains(&emoji.as_str()) {
+        return Err(EgoDesktopError::InvalidInput(format!("Unknown reaction {emoji}")));
+    }
+    let me = Ledger::load().address;
+    let had = load_messages().iter()
+        .find(|m| m.id == message_id)
+        .map(|m| m.reactions.iter().any(|r| r.from == me && r.emoji == emoji))
+        .unwrap_or(false);
+    apply_reaction(&message_id, &me, &emoji, had).map_err(EgoDesktopError::InvalidInput)?;
+    let body = serde_json::json!({ "target": message_id, "emoji": emoji, "remove": had }).to_string();
+    send_message(app, state, contact_addr, body, MSG_REACTION.to_string(), None).await
+}
+
+#[tauri::command]
+pub async fn edit_message(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    contact_addr: String,
+    message_id: String,
+    new_content: String,
+) -> Result<(), EgoDesktopError> {
+    if new_content.trim().is_empty() {
+        return Err(EgoDesktopError::InvalidInput("An edit cannot be empty".into()));
+    }
+    let me  = Ledger::load().address;
+    let now = chrono::Utc::now().timestamp();
+    // The sender is held to the window exactly; only the receiving side allows
+    // slack, and only for clock drift.
+    let sent_at = load_messages().iter().find(|m| m.id == message_id).map(|m| m.timestamp)
+        .ok_or_else(|| EgoDesktopError::NotFound("No such message".into()))?;
+    if now - sent_at > EDIT_WINDOW_SECS {
+        return Err(EgoDesktopError::InvalidInput(
+            "That message is more than an hour old and can no longer be edited".into()));
+    }
+    apply_edit(&message_id, &me, &new_content, now).map_err(EgoDesktopError::InvalidInput)?;
+    let body = serde_json::json!({ "target": message_id, "text": new_content }).to_string();
+    send_message(app, state, contact_addr, body, MSG_EDIT.to_string(), None).await
 }
 
 #[tauri::command]

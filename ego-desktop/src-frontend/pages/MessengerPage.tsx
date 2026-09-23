@@ -6,6 +6,7 @@ import { emit, listen } from '@tauri-apps/api/event';
 import { useLocation } from 'react-router-dom';
 import { writeText } from '@tauri-apps/api/clipboard';
 import { useConfirm } from '../hooks/useConfirm';
+import { useWallet } from '../App';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
@@ -63,7 +64,19 @@ interface Message {
   read: boolean;
   read_by_recipient: boolean;
   delivered: boolean;
+  reply_to?: string | null;
+  reactions?: { emoji: string; from: string }[];
+  edited_at?: number | null;
 }
+
+const REACTIONS: { key: string; glyph: string; label: string }[] = [
+  { key: 'like',    glyph: '\u{1F44D}', label: 'Like' },
+  { key: 'dislike', glyph: '\u{1F44E}', label: 'Dislike' },
+  { key: 'thanks',  glyph: '\u{1F64F}', label: 'Thanks' },
+  { key: 'heart',   glyph: '\u2764\uFE0F', label: 'Heart' },
+];
+
+const EDIT_WINDOW_SECS = 60 * 60;
 
 function fmtTime(ts: number): string {
   return new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -98,6 +111,11 @@ function msgTypeLabel(t: string): string {
 }
 
 const URL_RE = /(https?:\/\/[^\s<]+[^\s<.,:;!?)'"\]])/g;
+
+function truncate(text: string, max: number): string {
+  const one = text.replace(/\s+/g, ' ').trim();
+  return one.length <= max ? one : one.slice(0, max - 1) + '…';
+}
 
 function linkifyContent(text: string): React.ReactNode {
   // URL_RE has a single capturing group, so String.split interleaves
@@ -443,6 +461,37 @@ const MessengerPage: React.FC = () => {
   const [selected, setSelected]     = useState<Contact | null>(null);
   const [messages, setMessages]     = useState<Message[]>([]);
   const [msgInput, setMsgInput]     = useState('');
+  const { wallet }                  = useWallet();
+  const myAddress                   = wallet?.address ?? '';
+  const [replyTo, setReplyTo]       = useState<Message | null>(null);
+  const [editing, setEditing]       = useState<{ id: string; text: string } | null>(null);
+  const [menuFor, setMenuFor]       = useState<string | null>(null);
+  const pressTimer                  = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function startPress(id: string) {
+    if (pressTimer.current) clearTimeout(pressTimer.current);
+    pressTimer.current = setTimeout(() => { setMenuFor(id); pressTimer.current = null; }, 450);
+  }
+  function cancelPress() {
+    if (pressTimer.current) { clearTimeout(pressTimer.current); pressTimer.current = null; }
+  }
+
+  useEffect(() => {
+    if (!menuFor) return;
+    const close = (e: MouseEvent | TouchEvent) => {
+      if (!(e.target as HTMLElement)?.closest?.('[data-msg-menu]')) setMenuFor(null);
+    };
+    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') setMenuFor(null); };
+    document.addEventListener('mousedown', close);
+    document.addEventListener('touchstart', close);
+    document.addEventListener('keydown', esc);
+    return () => {
+      document.removeEventListener('mousedown', close);
+      document.removeEventListener('touchstart', close);
+      document.removeEventListener('keydown', esc);
+    };
+  }, [menuFor]);
+  const [msgError, setMsgError]     = useState('');
   const [sending, setSending]       = useState(false);
   const [sendError, setSendError]   = useState('');
   const [showAttachMenu, setShowAttachMenu] = useState(false);
@@ -666,6 +715,7 @@ useEffect(() => {
   }, [messages, aiMessages, aiThinking]);
 
   async function handleRevokeBundle() {
+    if (!await confirm('Revoke your contact card?', { detail: 'Anyone holding your current card will no longer be able to add you with it. You can share a new one afterwards.', confirmLabel: 'Revoke' })) return;
     setRevoking(true);
     try {
       await invoke('revoke_contact_bundle');
@@ -763,7 +813,9 @@ useEffect(() => {
         contactAddr: selected.address,
         content:     text,
         messageType: msgType,
+        replyTo:     replyTo?.id ?? null,
       });
+      setReplyTo(null);
 
       await loadMessages(selected.address);
     } catch (e: any) {
@@ -801,6 +853,7 @@ useEffect(() => {
         contactAddr: selected.address,
         content:     bundle,
         messageType: 'file_bundle',
+        replyTo:     null,
       });
       await loadMessages(selected.address);
     } catch (e: any) {
@@ -860,7 +913,43 @@ useEffect(() => {
     setEditingName(false);
   }
 
+  async function handleReact(m: Message, emoji: string) {
+    if (!selected) return;
+    setMsgError('');
+    try {
+      await invoke('react_to_message', {
+        contactAddr: selected.address,
+        messageId:   m.id,
+        emoji,
+      });
+      await loadMessages(selected.address);
+    } catch (e: any) { setMsgError(String(e)); }
+  }
+
+  async function handleSaveEdit() {
+    if (!selected || !editing) return;
+    const text = editing.text.trim();
+    if (!text) return;
+    setMsgError('');
+    try {
+      await invoke('edit_message', {
+        contactAddr: selected.address,
+        messageId:   editing.id,
+        newContent:  text,
+      });
+      setEditing(null);
+      await loadMessages(selected.address);
+    } catch (e: any) { setMsgError(String(e)); }
+  }
+
+  function canStillEdit(m: Message): boolean {
+    return m.outgoing
+      && m.message_type !== 'file_bundle'
+      && (Date.now() / 1000) - m.timestamp <= EDIT_WINDOW_SECS;
+  }
+
   async function handleDeleteMessage(msgId: string) {
+    if (!await confirm('Delete this message?', { detail: 'It is removed from this device only. The other person keeps their copy.', confirmLabel: 'Delete' })) return;
     try {
       await invoke('delete_message', { messageId: msgId });
       if (selected) await loadMessages(selected.address);
@@ -1071,6 +1160,7 @@ useEffect(() => {
               </div>
               <button
                 onClick={async () => {
+                  if (!await confirm('Cancel this contact request?', { detail: `${c.name} will not be added unless you send a new request.`, confirmLabel: 'Cancel request' })) return;
                   try {
                     await invoke('delete_contact', { contactAddr: c.address });
                     await loadContacts();
@@ -1108,7 +1198,10 @@ useEffect(() => {
                 </div>
                 {aiMessages.length > 0 && (
                   <button
-                    onClick={() => setAiMessages([])}
+                    onClick={async () => {
+                      if (!await confirm('Clear this conversation?', { detail: 'Your chat with Ego AI will be removed.', confirmLabel: 'Clear' })) return;
+                      setAiMessages([]);
+                    }}
                     title="Clear conversation"
                     className="shrink-0 px-2.5 py-1.5 text-xs text-gray-400 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
                   >
@@ -1287,6 +1380,7 @@ useEffect(() => {
                   <div className={`flex flex-col ${m.outgoing ? 'items-end' : 'items-start'} group`}>
                     <p className="text-xs text-gray-500 mb-0.5 px-2 flex items-center gap-1">
                       {fmtTime(m.timestamp)}
+                      {m.edited_at ? <span className="italic text-gray-600">edited</span> : null}
                       {m.outgoing && (
                         <span
                           className={m.read_by_recipient ? 'text-blue-400' : m.delivered ? 'text-gray-400' : 'text-gray-600'}
@@ -1296,7 +1390,7 @@ useEffect(() => {
                         </span>
                       )}
                     </p>
-                  <div className={`flex items-end gap-1 ${m.outgoing ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`relative flex items-end gap-1 ${m.outgoing ? 'justify-end' : 'justify-start'}`}>
                     {m.outgoing && (
                       <button
                         onClick={() => handleDeleteMessage(m.id)}
@@ -1313,12 +1407,89 @@ useEffect(() => {
                     )}
 
                     <div
-                      className={`max-w-xs lg:max-w-md xl:max-w-lg px-4 py-2.5 rounded-2xl ${
+                      onDoubleClick={() => {
+                        if (isFileBundle) return;
+                        window.getSelection()?.removeAllRanges();
+                        setReplyTo(m); setEditing(null);
+                      }}
+                      onMouseDown={e => { if (e.button === 0 && !isFileBundle) startPress(m.id); }}
+                      onMouseUp={cancelPress}
+                      onMouseLeave={cancelPress}
+                      onTouchStart={() => { if (!isFileBundle) startPress(m.id); }}
+                      onTouchEnd={cancelPress}
+                      onTouchMove={cancelPress}
+                      onContextMenu={e => { if (isFileBundle) return; e.preventDefault(); setMenuFor(m.id); }}
+                      className={`relative max-w-xs lg:max-w-md xl:max-w-lg px-4 py-2.5 rounded-2xl ${isFileBundle ? '' : 'cursor-pointer'} ${
+                        m.reactions && m.reactions.length > 0 ? 'mt-3' : ''
+                      } ${
                         m.outgoing
                           ? 'bg-blue-600 rounded-br-sm'
                           : 'bg-gray-700 rounded-bl-sm'
                       }`}
                     >
+                      {m.reactions && m.reactions.length > 0 && (
+                        <div className={`absolute -top-3 ${m.outgoing ? '-left-2' : '-right-2'} z-10 flex gap-0.5`}>
+                          {REACTIONS.filter(r => m.reactions!.some(x => x.emoji === r.key)).map(r => {
+                            const who = m.reactions!.filter(x => x.emoji === r.key);
+                            const mine = who.some(x => x.from === myAddress);
+                            return (
+                              <button
+                                key={r.key}
+                                onClick={() => handleReact(m, r.key)}
+                                title={r.label}
+                                className={`text-xs leading-none rounded-full px-1.5 py-1 border shadow cursor-pointer ${mine ? 'border-blue-400/70 bg-gray-900' : 'border-gray-600 bg-gray-900'}`}
+                              >
+                                {r.glyph}{who.length > 1 ? ` ${who.length}` : ''}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    {!isFileBundle && menuFor === m.id && (
+                      <div
+                        data-msg-menu
+                        onMouseDown={e => e.stopPropagation()}
+                        onTouchStart={e => e.stopPropagation()}
+                        onDoubleClick={e => e.stopPropagation()}
+                        onContextMenu={e => { e.preventDefault(); e.stopPropagation(); }}
+                        className={`absolute top-full mt-1.5 ${m.outgoing ? 'right-0' : 'left-0'} z-20 flex flex-col gap-1 rounded-xl bg-gray-900 border border-gray-700 p-1.5 shadow-xl`}
+                      >
+                        <div className="flex items-center gap-1 px-1">
+                          {REACTIONS.map(r => (
+                            <button
+                              key={r.key}
+                              onClick={() => { handleReact(m, r.key); setMenuFor(null); }}
+                              title={r.label}
+                              className="text-lg leading-none p-1 rounded-lg hover:bg-gray-800 hover:scale-110 transition cursor-pointer"
+                            >
+                              {r.glyph}
+                            </button>
+                          ))}
+                        </div>
+                        <div className="h-px bg-gray-800" />
+                        <button
+                          onClick={() => { setReplyTo(m); setEditing(null); setMenuFor(null); }}
+                          className="text-left text-sm px-3 py-1.5 rounded-lg hover:bg-gray-800 text-gray-200 cursor-pointer"
+                        >
+                          Reply
+                        </button>
+                        <button
+                          onClick={() => { writeText(m.content).catch(() => {}); setMenuFor(null); }}
+                          className="text-left text-sm px-3 py-1.5 rounded-lg hover:bg-gray-800 text-gray-200 cursor-pointer"
+                        >
+                          Copy
+                        </button>
+                        {canStillEdit(m) && (
+                          <button
+                            onClick={() => { setEditing({ id: m.id, text: m.content }); setReplyTo(null); setMenuFor(null); }}
+                            className="text-left text-sm px-3 py-1.5 rounded-lg hover:bg-gray-800 text-gray-200 cursor-pointer"
+                            title="Editable for one hour after sending"
+                          >
+                            Edit
+                          </button>
+                        )}
+                      </div>
+                    )}
                       {m.message_type !== 'text' && (
                         <div className="text-xs font-semibold mb-1 opacity-80">
                           {msgTypeLabel(m.message_type)}
@@ -1395,8 +1566,41 @@ useEffect(() => {
                             )}
                           </div>
                         );
-                      })() : (
-                        <p className="text-sm whitespace-pre-wrap break-words">{linkifyContent(m.content)}</p>
+                      })() : editing && editing.id === m.id ? (
+                        <div className="flex flex-col gap-1.5 min-w-[14rem]">
+                          <textarea
+                            autoFocus
+                            value={editing.text}
+                            onChange={e => setEditing({ id: m.id, text: e.target.value })}
+                            onKeyDown={e => {
+                              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSaveEdit(); }
+                              if (e.key === 'Escape') setEditing(null);
+                            }}
+                            rows={2}
+                            className="w-full bg-black/30 rounded px-2 py-1 text-sm resize-none outline-none"
+                          />
+                          <div className="flex gap-2 text-xs">
+                            <button onClick={handleSaveEdit} className="text-blue-300 hover:text-blue-200">Save</button>
+                            <button onClick={() => setEditing(null)} className="text-gray-400 hover:text-gray-300">Cancel</button>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          {m.reply_to ? (() => {
+                            const src = messages.find(x => x.id === m.reply_to);
+                            return (
+                              <div className="mb-1.5 pl-2 border-l-2 border-white/30 text-xs opacity-70">
+                                <div className="font-semibold">
+                                  {src ? (src.outgoing ? 'You' : (selected?.name || 'Them')) : 'Message'}
+                                </div>
+                                <div className="truncate max-w-[16rem]">
+                                  {src ? truncate(src.content, 60) : 'no longer available'}
+                                </div>
+                              </div>
+                            );
+                          })() : null}
+                          <p className="text-sm whitespace-pre-wrap break-words">{linkifyContent(m.content)}</p>
+                        </>
                       )}
                     </div>
 
@@ -1410,6 +1614,8 @@ useEffect(() => {
                       </button>
                     )}
                   </div>
+
+
                   </div>
                   </React.Fragment>
                 );
@@ -1433,6 +1639,29 @@ useEffect(() => {
 
             {/* Input area */}
             <div className="px-5 py-4 border-t border-gray-700 shrink-0 space-y-2">
+              {msgError && (
+                <div className="flex items-center justify-between text-xs text-red-400">
+                  <span>{msgError}</span>
+                  <button onClick={() => setMsgError('')} className="text-gray-500 hover:text-gray-300">dismiss</button>
+                </div>
+              )}
+              {replyTo && (
+                <div className="flex items-start gap-2 bg-gray-800/70 border-l-2 border-blue-400 rounded px-3 py-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs text-blue-300 font-semibold">
+                      Replying to {replyTo.outgoing ? 'yourself' : (selected.name || 'them')}
+                    </div>
+                    <div className="text-xs text-gray-400 truncate">{truncate(replyTo.content, 80)}</div>
+                  </div>
+                  <button
+                    onClick={() => setReplyTo(null)}
+                    className="text-gray-500 hover:text-gray-300 text-sm shrink-0"
+                    title="Cancel reply"
+                  >
+                    &times;
+                  </button>
+                </div>
+              )}
               <div className="flex gap-2 items-end">
                 <button
                   onClick={() => setShowAttachMenu(v => !v)}
