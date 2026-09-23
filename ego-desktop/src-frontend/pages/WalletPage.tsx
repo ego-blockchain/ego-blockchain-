@@ -377,13 +377,22 @@ function formatAge(secs: number): string {
   return `${Math.round(secs / 86400)} days`;
 }
 
+// Survives navigation. React Router unmounts this page every time you leave the
+// tab, so without these the wallet starts each visit from null and shows an empty
+// balance, an empty transaction list and no Shield button until the round trips
+// finish. Holding the last known values means a revisit paints immediately and the
+// fresh data replaces it when it lands.
+let cachedBalance:  Balance | null        = null;
+let cachedTxs:      LedgerTx[]            = [];
+let cachedShielded: ShieldedStatus | null = null;
+
 const WalletPage: React.FC = () => {
   const appVersion = useAppVersion();
   const { wallet, reload: reloadWallet } = useWallet();
   const myAddress = wallet?.address ?? '';
   const addressQR = useMemo(() => makeQR(myAddress), [myAddress]);
 
-  const [balance, setBalance]       = useState<Balance | null>(null);
+  const [balance, setBalance]       = useState<Balance | null>(cachedBalance);
   const [faucet, setFaucet]         = useState<{ claimed_uegoc: number; cap_uegoc: number; step_uegoc: number } | null>(null);
   const [faucetClaiming, setFaucetClaiming] = useState(false);
   const [faucetMsg, setFaucetMsg]   = useState<string | null>(null);
@@ -394,7 +403,12 @@ const WalletPage: React.FC = () => {
   const [creditsMsg, setCreditsMsg]   = useState<string | null>(null);
   const [egusdSendTo, setEgusdSendTo]   = useState('');
   const [egusdSendAmt, setEgusdSendAmt] = useState('');
-  const [txs, setTxs]               = useState<LedgerTx[]>([]);
+  const [txs, setTxs]               = useState<LedgerTx[]>(cachedTxs);
+
+  // Mirror into the cache wherever the state is set, rather than at each call
+  // site, so no future setter can quietly forget to do it.
+  useEffect(() => { cachedBalance  = balance;  }, [balance]);
+  useEffect(() => { cachedTxs      = txs;      }, [txs]);
   const [tab, setTab]               = useState<'all' | 'sent' | 'received' | 'rewards'>('all');
   const [txPage, setTxPage]         = useState(1);
   const [txPageSize, setTxPageSize] = useState(25);
@@ -406,7 +420,8 @@ const WalletPage: React.FC = () => {
   const [sending, setSending]       = useState(false);
   const [txResult, setTxResult]         = useState<TxResult | null>(null);
   const [sideband, setSideband]         = useState<SidebandStatus | null>(null);
-  const [shielded, setShielded]         = useState<ShieldedStatus | null>(null);
+  const [shielded, setShielded]         = useState<ShieldedStatus | null>(cachedShielded);
+  useEffect(() => { cachedShielded = shielded; }, [shielded]);
   const [showShield, setShowShield]     = useState(false);
   const [shieldAmt, setShieldAmt]       = useState('');
   const [shieldTo, setShieldTo]         = useState('');
@@ -614,16 +629,26 @@ const WalletPage: React.FC = () => {
     if (loadingRef.current) return;
     loadingRef.current = true;
     try {
-      const bal = await invoke<Balance>('get_balance');
-      const history = await invoke<LedgerTx[]>('get_transaction_history');
-      setBalance(prev =>
-        prev && prev.uegoc === bal.uegoc && prev.uegusd === bal.uegusd ? prev : bal
-      );
-      const sig = `${history.length}|${history[0]?.hash ?? ''}|${history[0]?.status ?? ''}`;
-      if (sig !== lastTxSigRef.current) {
-        lastTxSigRef.current = sig;
-        setTxs(history);
-      }
+      // Independent calls: the balance is one lookup, the history walks an index
+      // and reads every transaction it finds. Awaiting them in series made the
+      // number on screen wait for the list underneath it.
+      const balance$ = invoke<Balance>('get_balance')
+        .then(bal => setBalance(prev =>
+          prev && prev.uegoc === bal.uegoc && prev.uegusd === bal.uegusd ? prev : bal
+        ))
+        .catch(e => console.error('get_balance', e));
+
+      const history$ = invoke<LedgerTx[]>('get_transaction_history')
+        .then(history => {
+          const sig = `${history.length}|${history[0]?.hash ?? ''}|${history[0]?.status ?? ''}`;
+          if (sig !== lastTxSigRef.current) {
+            lastTxSigRef.current = sig;
+            setTxs(history);
+          }
+        })
+        .catch(e => console.error('get_transaction_history', e));
+
+      await Promise.all([balance$, history$]);
     } catch (e) {
       console.error(e);
     } finally {

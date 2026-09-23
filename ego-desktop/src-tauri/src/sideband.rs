@@ -384,10 +384,12 @@ fn answer_repeat_request(frame: &Frame) {
 pub async fn poll_once(app: Option<&tauri::AppHandle<tauri::Wry>>) {
     let now = chrono::Utc::now().timestamp();
 
-    let drained: Vec<(&'static str, Frame)> = {
+    // Reading transports is file and socket I/O, so it runs off the async runtime. On
+    // the runtime a large spool froze every other task, the window included.
+    let drained: Vec<(&'static str, Frame)> = tokio::task::spawn_blocking(move || {
         let reg = match registry().lock() {
             Ok(r) => r,
-            Err(_) => return,
+            Err(_) => return Vec::new(),
         };
         let mut out = Vec::new();
         for t in reg.iter() {
@@ -406,7 +408,9 @@ pub async fn poll_once(app: Option<&tauri::AppHandle<tauri::Wry>>) {
             }
         }
         out
-    };
+    })
+    .await
+    .unwrap_or_default();
 
     for (name, frame) in drained {
         if frame.kind == KIND_REPEAT_REQUEST {

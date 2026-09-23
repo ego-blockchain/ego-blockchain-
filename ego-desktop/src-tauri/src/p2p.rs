@@ -4968,6 +4968,91 @@ pub async fn broadcast_pending_tx(tx: LedgerTx) {
     tokio::spawn(try_proactive_proposal());
 }
 
+/// Catch up from the oracle's block archive when peers cannot serve the history.
+///
+/// Nodes fast-sync, so most peers hold only the recent tip, and a fresh node replaying
+/// from genesis stalls at the first height nobody holds. The oracle archives every block
+/// with its transactions. It is used here as a source of data, not as an authority:
+/// everything fetched goes through merge_remote_chain, the same path a peer's sync
+/// response takes, so the oracle cannot make this node accept anything a peer could not.
+/// Raised by the sync when this node is too far behind for peers to serve, and acted on
+/// by the sync-status watcher. The sync cannot start the catch-up itself: the catch-up
+/// merges blocks, a merge can trigger a sync, and that loop has no finite type.
+static ORACLE_CATCH_UP_WANTED: AtomicBool = AtomicBool::new(false);
+
+async fn oracle_catch_up() {
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    if offline_mode() || RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    const CHUNK: u64 = 200;
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => { RUNNING.store(false, Ordering::SeqCst); return; }
+    };
+
+    loop {
+        let local = tokio::task::spawn_blocking(|| crate::chain_db::latest_block_info().0)
+            .await
+            .unwrap_or(0);
+        let target = NETWORK_BEST_HEIGHT.load(Ordering::Relaxed);
+        if target <= local.saturating_add(1) {
+            break;
+        }
+        let from = local.saturating_add(1);
+        let end  = from.saturating_add(CHUNK - 1);
+
+        let mut fetched: Option<(Vec<LedgerBlock>, Vec<LedgerTx>)> = None;
+        for base in ORACLE_RPCS {
+            let blocks: Vec<LedgerBlock> = match client
+                .get(format!("{base}/chain/blocks?fromHeight={from}&limit={CHUNK}"))
+                .send().await
+            {
+                Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+                _ => continue,
+            };
+            let blocks: Vec<LedgerBlock> = blocks.into_iter().filter(|b| b.height >= from && b.height <= end).collect();
+            if blocks.is_empty() {
+                continue;
+            }
+            let last = blocks.iter().map(|b| b.height).max().unwrap_or(end);
+            let wanted: u64 = blocks.iter().map(|b| b.tx_count as u64).sum();
+            let txs: Vec<LedgerTx> = match client
+                .get(format!("{base}/chain/transactions?fromHeight={from}&limit={}", wanted + 64))
+                .send().await
+            {
+                Ok(r) if r.status().is_success() => r.json().await.unwrap_or_default(),
+                _ => continue,
+            };
+            let txs: Vec<LedgerTx> = txs.into_iter()
+                .filter(|t| t.block_height.map_or(false, |h| h >= from && h <= last))
+                .collect();
+            fetched = Some((blocks, txs));
+            break;
+        }
+
+        let Some((blocks, txs)) = fetched else {
+            tracing::warn!("[Sync] oracle archive unreachable — will retry on the next sync round");
+            break;
+        };
+        let top = blocks.iter().map(|b| b.height).max().unwrap_or(from);
+        tracing::info!("[Sync] oracle archive: blocks #{}..#{} ({} txs)", from, top, txs.len());
+        merge_remote_chain_inner(blocks, txs, APP_HANDLE.get(), false).await;
+
+        let after = tokio::task::spawn_blocking(|| crate::chain_db::latest_block_info().0)
+            .await
+            .unwrap_or(0);
+        if after <= local {
+            tracing::warn!("[Sync] oracle blocks from #{} were not accepted — stopping archive catch-up", from);
+            break;
+        }
+    }
+    RUNNING.store(false, Ordering::SeqCst);
+}
+
 pub async fn sync_chain_from_peers() {
     static LAST_SYNC_REQ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
     static LAST_FROM_HEIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
@@ -4984,6 +5069,25 @@ pub async fn sync_chain_from_peers() {
         .saturating_sub(1)
         .saturating_sub(fork_walkback())
         .max(1);
+
+    // Far behind, go straight to a snapshot. Nodes fast-sync, so most peers hold only
+    // recent history, and a height nobody holds is never sent at all: no short block is
+    // recorded, block healing never sees it, and the node replays towards a wall. The
+    // stuck-rounds fallback below does get there, but only after five sync rounds at the
+    // same height, which is minutes, and as a request peers may turn down.
+    static LAST_FAR_SNAPSHOT_ASK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let network_best = NETWORK_BEST_HEIGHT.load(Ordering::Relaxed);
+    if network_best > my_height.saturating_add(crate::chain_db::SNAPSHOT_BLOCK_WINDOW as u64)
+        && now - LAST_FAR_SNAPSHOT_ASK.load(Ordering::Relaxed) >= 30_000
+    {
+        LAST_FAR_SNAPSHOT_ASK.store(now, Ordering::Relaxed);
+        tracing::warn!(
+            "[Sync] {} blocks behind (local #{}, network #{}) — asking for a state snapshot instead of replaying history",
+            network_best - my_height, my_height, network_best
+        );
+        request_snapshot_because_stuck(snapshot_request_height(my_height)).await;
+        ORACLE_CATCH_UP_WANTED.store(true, Ordering::Relaxed);
+    }
 
     if LAST_FROM_HEIGHT.swap(from_height, std::sync::atomic::Ordering::Relaxed) == from_height {
         let stuck = STUCK_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -8839,6 +8943,15 @@ P2PMessage::ChatMessage { bundle, seq } => {
     match crate::commands::messenger::receive_message_inner(&bundle, seq) {
         Ok((msg, is_new)) => {
             if !is_new {
+                return;
+            }
+            // A reaction or an edit has already been folded into the conversation it
+            // refers to. Refresh whatever is open and stop: it earns no delivery
+            // receipt of its own and must not raise a notification.
+            if crate::commands::messenger::is_control_type(&msg.message_type) {
+                if let Some(h) = app {
+                    let _ = h.emit_all("ego://message-received", None::<()>);
+                }
                 return;
             }
             // Tell them it arrived, before anyone has read it. Delivery is the part that can
@@ -13312,6 +13425,10 @@ pub async fn run_sync_status_watcher() {
         let best = NETWORK_BEST_HEIGHT.load(Ordering::Relaxed).max(local);
         let behind = best.saturating_sub(local);
 
+        if ORACLE_CATCH_UP_WANTED.swap(false, Ordering::Relaxed) {
+            tokio::spawn(oracle_catch_up());
+        }
+
         if woke {
             eprintln!("[SyncStatus] Wake from sleep detected — reconnecting and checking the chain tip");
             SUSPENDING.store(false, Ordering::Relaxed);
@@ -13854,7 +13971,11 @@ pub async fn sideband_sealed_dm(to_addr: &str, to_ed25519: &str, inner: &P2PMess
     let Ok(data) = serde_json::to_vec(&sealed) else {
         return false;
     };
-    if !crate::sideband::has_transport() {
+    // The offline link is for when there is no connection. Transactions already follow
+    // this rule; direct messages did not, so every delivery and read receipt was also
+    // written to the spool as dozens of frame files while fully online, and the spool
+    // grew past a million files that every poll then read.
+    if has_connectivity() || !crate::sideband::has_transport() {
         return false;
     }
     let id = sideband_msg_id(&format!("dm:{to_addr}:{}", data.len()));

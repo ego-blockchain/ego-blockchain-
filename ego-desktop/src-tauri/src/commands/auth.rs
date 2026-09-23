@@ -1216,12 +1216,17 @@ pub struct FaucetStatus {
 
 #[tauri::command]
 pub async fn get_faucet_status() -> Result<FaucetStatus, EgoDesktopError> {
-    let addr = Ledger::load().address;
-    let claimed_uegoc = if addr.is_empty() {
-        0
-    } else {
-        crate::chain_db::get_faucet_total_uegoc(&addr) + crate::chain_db::get_faucet_pending_uegoc(&addr)
-    };
+    // Off the async runtime: summing faucet claims walks this address's history.
+    let claimed_uegoc = tokio::task::spawn_blocking(|| {
+        let addr = Ledger::load().address;
+        if addr.is_empty() {
+            0
+        } else {
+            crate::chain_db::get_faucet_total_uegoc(&addr) + crate::chain_db::get_faucet_pending_uegoc(&addr)
+        }
+    })
+    .await
+    .unwrap_or(0);
     Ok(FaucetStatus {
         claimed_uegoc,
         cap_uegoc: crate::chain_db::FAUCET_CAP_UEGOC,

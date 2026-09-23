@@ -39,6 +39,18 @@ pub fn queue_depths() -> (usize, usize) {
     (waiting, sent)
 }
 
+/// How long our own outgoing frames stay in the spool for a nearby reader.
+const OWN_FRAME_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+fn frame_is_stale(entry: &std::fs::DirEntry) -> bool {
+    entry
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age > OWN_FRAME_TTL)
+}
+
 pub struct SpoolTransport {
     name: &'static str,
     inbox: PathBuf,
@@ -137,6 +149,12 @@ impl SidebandTransport for SpoolTransport {
                 continue;
             }
             if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&mine)) {
+                // Our own frames are skipped here, so nothing else ever removes them
+                // when no bridge or neighbouring node is consuming the spool. They are
+                // only worth anything while a nearby reader can still pick them up.
+                if frame_is_stale(&entry) {
+                    let _ = std::fs::remove_file(&path);
+                }
                 continue;
             }
             let bytes = match std::fs::read(&path) {

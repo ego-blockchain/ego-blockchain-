@@ -1014,8 +1014,21 @@ async fn send_ada_tx(seed: &[u8], to_address: &str, lovelace: u64) -> Result<Str
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Returns the 9 built-in chain addresses derived from the Ego seed.
+/// Derives an address on every supported external chain.
+///
+/// This runs off the UI thread deliberately. Tauri v1 runs a non-async command on
+/// the main thread, and this one loads the seed and then does elliptic-curve work
+/// for Bitcoin, Ethereum, BNB, Solana, Cardano and Tron. On the wallet page, which
+/// is the first screen, that was enough to stop the window pumping its message
+/// queue and have Windows mark it Not Responding before anything had rendered.
 #[tauri::command]
-pub fn get_external_addresses() -> Result<Vec<ExternalAddress>, EgoDesktopError> {
+pub async fn get_external_addresses() -> Result<Vec<ExternalAddress>, EgoDesktopError> {
+    tokio::task::spawn_blocking(derive_external_addresses)
+        .await
+        .map_err(|e| EgoDesktopError::WalletError(format!("address derivation failed: {e}")))?
+}
+
+pub(crate) fn derive_external_addresses() -> Result<Vec<ExternalAddress>, EgoDesktopError> {
     let seed = crate::ledger::load_seed()
         .map_err(|e| EgoDesktopError::FileSystemError(format!("Seed load error: {}", e)))?
         .ok_or_else(|| EgoDesktopError::FileSystemError("Wallet not initialised".into()))?;
@@ -1250,7 +1263,7 @@ pub fn add_custom_token(
 
 /// Load all saved custom tokens.
 #[tauri::command]
-pub fn get_custom_tokens() -> Result<Vec<CustomToken>, EgoDesktopError> {
+pub async fn get_custom_tokens() -> Result<Vec<CustomToken>, EgoDesktopError> {
     Ok(load_tokens())
 }
 
@@ -2563,7 +2576,7 @@ mod address_consistency_tests {
             eprintln!("no wallet seed in this environment — skipping");
             return;
         }
-        let addrs = get_external_addresses().expect("derive addresses");
+        let addrs = derive_external_addresses().expect("derive addresses");
 
         for ticker in ["BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "TRX", "LTC", "DOGE", "USDT", "USDC"] {
             let hit = addrs.iter().find(|a| a.asset.eq_ignore_ascii_case(ticker));
@@ -2582,7 +2595,7 @@ mod address_consistency_tests {
             eprintln!("no wallet seed in this environment — skipping");
             return;
         }
-        let addrs = get_external_addresses().expect("derive addresses");
+        let addrs = derive_external_addresses().expect("derive addresses");
         let by = |t: &str| addrs.iter()
             .find(|a| a.asset.eq_ignore_ascii_case(t))
             .map(|a| a.address.clone())
@@ -2602,7 +2615,7 @@ mod address_consistency_tests {
             eprintln!("no wallet seed in this environment — skipping");
             return;
         }
-        for a in get_external_addresses().expect("derive addresses") {
+        for a in derive_external_addresses().expect("derive addresses") {
             assert!(!a.asset.trim().is_empty(), "entry {:?} has no asset ticker", a.chain);
         }
     }

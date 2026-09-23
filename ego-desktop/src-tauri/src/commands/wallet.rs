@@ -809,7 +809,7 @@ pub struct TxFeeInfo {
 }
 
 #[tauri::command]
-pub fn get_tx_fee(tx_type: Option<String>) -> TxFeeInfo {
+pub async fn get_tx_fee(tx_type: Option<String>) -> TxFeeInfo {
     let ledger    = Ledger::load();
     let is_staker = ledger.staked_amount > 0;
     let fee_uegoc = crate::tokenomics::fee_for_tx_with_staking(
@@ -1730,7 +1730,7 @@ pub async fn create_ramp_session(
 
     // Match on `asset` — the only field that means the same thing for native
     // coins and ERC-20 stablecoins alike.
-    let addresses = crate::commands::multichain::get_external_addresses()?;
+    let addresses = crate::commands::multichain::derive_external_addresses()?;
     let entry = addresses.iter()
         .find(|a| a.asset.eq_ignore_ascii_case(&symbol_uc))
         .ok_or_else(|| EgoDesktopError::InvalidInput(

@@ -25,7 +25,7 @@ pub struct SidebandStatus {
 /// sideband transport when gossip has nowhere to go, so a user with working
 /// internet will see a configured transport sitting idle, which is correct.
 #[tauri::command]
-pub fn sideband_status() -> SidebandStatus {
+pub async fn sideband_status() -> SidebandStatus {
     let transports: Vec<SidebandTransportInfo> = crate::sideband::transports()
         .into_iter()
         .map(|(name, can_send)| SidebandTransportInfo { name, can_send })

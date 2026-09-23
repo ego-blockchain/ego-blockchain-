@@ -759,7 +759,7 @@ fn main() {
                     let win = event.window();
                     let app_handle = win.app_handle();
                     let state = app_handle.state::<app::AppState>();
-                    let pending = state.pending_chat_address.lock().unwrap().take();
+                    let pending = state.pending_chat_address.lock().unwrap().clone();
                     if let Some((addr, set_at)) = pending {
                         // Only treat this focus as "the user clicked the toast" if it
                         // happened within a few seconds of the message arriving — a
@@ -769,6 +769,7 @@ fn main() {
                         const NOTIFICATION_CLICK_WINDOW_SECS: i64 = 15;
                         let now = chrono::Utc::now().timestamp();
                         if now - set_at <= NOTIFICATION_CLICK_WINDOW_SECS {
+                            state.pending_chat_address.lock().unwrap().take();
                             // Ensure window is visible (may have been hidden to tray)
                             if !win.is_visible().unwrap_or(true) {
                                 let _ = win.show();
@@ -933,6 +934,8 @@ fn main() {
             commands::wallet::get_presale_config,
             commands::messenger::clear_messages,
             commands::messenger::delete_message,
+            commands::messenger::react_to_message,
+            commands::messenger::edit_message,
             commands::storage::open_file,
             commands::consensus::get_porep_status,
             commands::consensus::respond_to_challenges,
@@ -1123,6 +1126,41 @@ fn main() {
 
             crate::commands::updates::spawn_update_notifier(app.handle());
 
+            // Runtime freeze detector. A task on the async runtime bumps a counter every
+            // second; this plain OS thread, which a frozen runtime cannot stop, reports when
+            // the counter stops moving. Paired with the [Stall] slow step lines it names
+            // whatever is holding the runtime.
+            {
+                use std::sync::atomic::{AtomicI64, Ordering};
+                static HEARTBEAT: AtomicI64 = AtomicI64::new(0);
+                let now_ms = || chrono::Utc::now().timestamp_millis();
+                HEARTBEAT.store(now_ms(), Ordering::Relaxed);
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        HEARTBEAT.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                });
+                std::thread::spawn(move || {
+                    let mut frozen_since: Option<i64> = None;
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        let lag = now_ms() - HEARTBEAT.load(Ordering::Relaxed);
+                        match (lag >= 5_000, frozen_since) {
+                            (true, None) => {
+                                frozen_since = Some(now_ms() - lag);
+                                eprintln!("[Stall] async runtime not responding ({} ms so far)", lag);
+                            }
+                            (false, Some(start)) => {
+                                eprintln!("[Stall] async runtime was frozen for {:.1}s", (now_ms() - start) as f64 / 1000.0);
+                                frozen_since = None;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+
             std::thread::spawn(|| {
                 eprintln!("[Startup] RocksDB pre-warm thread started");
                 let _ = crate::chain_db::get_db();
@@ -1168,6 +1206,7 @@ fn main() {
 
             let start_hidden = crate::autostart::launched_hidden();
             app.listen_global("frontend-ready", move |_| {
+                eprintln!("[Startup] frontend-ready received, showing window (hidden={start_hidden})");
                 let _ = window.emit("ego://app-locked", ());
                 if !start_hidden {
                     window.show().unwrap();
@@ -1182,9 +1221,21 @@ fn main() {
                     if let Some(listener) = INSTANCE_LOCK.get() {
                         loop {
                             if listener.accept().is_ok() {
+                                // Clicking a message notification relaunches the app, and the
+                                // relaunch lands here. That is a far surer sign than a window
+                                // focus, so it opens the chat even if the notification sat in
+                                // the notification centre for a while.
+                                const NOTIFICATION_KEEP_SECS: i64 = 30 * 60;
+                                let pending = crate::app::global_app_state()
+                                    .pending_chat_address.lock().unwrap().take();
                                 let _ = win.show();
                                 let _ = win.unminimize();
                                 let _ = win.set_focus();
+                                if let Some((addr, set_at)) = pending {
+                                    if chrono::Utc::now().timestamp() - set_at <= NOTIFICATION_KEEP_SECS {
+                                        let _ = win.emit("ego://open-chat", serde_json::json!({ "address": addr }));
+                                    }
+                                }
                             }
                         }
                     }
@@ -1309,8 +1360,14 @@ fn main() {
                 // that left the node solo-forking instead of following the chain.
                 macro_rules! bounded {
                     ($secs:expr, $fut:expr) => {
-                        if tokio::time::timeout(std::time::Duration::from_secs($secs), $fut).await.is_err() {
-                            tracing::warn!("loop step timed out after {}s (skipping, will retry next tick)", $secs);
+                        let step_started = std::time::Instant::now();
+                        let timed_out = tokio::time::timeout(std::time::Duration::from_secs($secs), $fut).await.is_err();
+                        let took = step_started.elapsed();
+                        if timed_out {
+                            tracing::warn!("loop step timed out after {}s (skipping, will retry next tick): {}", $secs, stringify!($fut));
+                        }
+                        if took.as_millis() >= 2_000 {
+                            eprintln!("[Stall] slow step ({:.1}s): {}", took.as_secs_f64(), stringify!($fut));
                         }
                     };
                 }

@@ -2870,6 +2870,44 @@ pub fn apply_stake_txs(table: &mut std::collections::HashMap<String, u64>, txs: 
 }
 
 /// Full transaction history for an address, ordered by timestamp ascending.
+/// The newest transactions touching `address`, newest first, keeping only those `keep`
+/// accepts and stopping once `max` are found.
+///
+/// A validator is paid on nearly every block, so its index holds one entry per block it
+/// was rewarded for. Reading all of them to show a page of transfers decoded tens of
+/// thousands of transactions per call. The index is keyed by big-endian timestamp, so it
+/// can be walked backwards from the newest entry and abandoned as soon as there is enough.
+pub fn recent_tx_history_for_addr(
+    address: &str,
+    max: usize,
+    keep: impl Fn(&LedgerTx) -> bool,
+) -> Vec<LedgerTx> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf_addr = db.cf_handle(CF_ADDR_TXS).unwrap();
+    let cf_txs  = db.cf_handle(CF_TXS).unwrap();
+
+    let mut prefix = address.as_bytes().to_vec();
+    prefix.push(b':');
+    let mut seek = prefix.clone();
+    seek.extend_from_slice(&[0xFF; 9]);
+
+    let mut out = Vec::new();
+    let iter = db.iterator_cf(cf_addr, rocksdb::IteratorMode::From(&seek, rocksdb::Direction::Reverse));
+    for item in iter {
+        let (k, _) = match item { Ok(v) => v, Err(_) => break };
+        if !k.starts_with(&prefix) { break; }
+        let hash_start = prefix.len() + 8;
+        if k.len() <= hash_start { continue; }
+        let Some(mut tx) = db.get_cf(cf_txs, &k[hash_start..]).ok().flatten()
+            .and_then(|v| decode::<LedgerTx>(&v)) else { continue };
+        if !keep(&tx) { continue; }
+        tx.status = "Confirmed".to_string();
+        out.push(tx);
+        if out.len() >= max { break; }
+    }
+    out
+}
+
 pub fn get_tx_history_for_addr(address: &str) -> Vec<LedgerTx> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let cf_addr = db.cf_handle(CF_ADDR_TXS).unwrap();

@@ -238,17 +238,18 @@ pub async fn get_transaction_history(
         return Ok(vec![]);
     }
 
-    let txs: Vec<LedgerTx> = crate::chain_db::get_tx_history_for_addr(&my_addr);
-    let mut filtered_txs = Vec::with_capacity(txs.len());
-
-    for tx in txs {
-        // Filter out system spam to prevent burying real user transfers
-        let is_spammy = tx.from == crate::chain_db::NODE_POOL_ADDR 
-            && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward");
-        if !is_spammy {
-            filtered_txs.push(tx);
-        }
-    }
+    // Off the async runtime: this reads RocksDB, and on the runtime a slow read stops
+    // every other task, the window included. Newest first, and only as many as the
+    // wallet can show, rather than decoding every reward this validator ever received.
+    const MAX_SHOWN: usize = 1_000;
+    let mut filtered_txs = tokio::task::spawn_blocking(move || {
+        crate::chain_db::recent_tx_history_for_addr(&my_addr, MAX_SHOWN, |tx| {
+            !(tx.from == crate::chain_db::NODE_POOL_ADDR
+                && matches!(tx.tx_type.as_str(), "reward" | "coinbase" | "fee_distribution" | "post_reward"))
+        })
+    })
+    .await
+    .unwrap_or_default();
 
     filtered_txs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     Ok(filtered_txs)
