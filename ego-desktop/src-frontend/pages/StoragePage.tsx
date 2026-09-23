@@ -1089,6 +1089,11 @@ const StoragePage: React.FC = () => {
               const overLimit    = allocGb > maxUsableGb;
               const currentAllocGb = (metrics?.storage_allocated_bytes ?? 0) / 1e9;
               const isReducing   = currentAllocGb > 0 && allocGb < currentAllocGb;
+              const LOCK_SECS    = 60 * 86400;
+              const cfgAtSec     = metrics?.storage_configured_at;
+              const unlockAt     = currentAllocGb > 0 && cfgAtSec ? cfgAtSec + LOCK_SECS : 0;
+              const isLocked     = unlockAt > Date.now() / 1000;
+              const daysLeft     = isLocked ? Math.ceil((unlockAt - Date.now() / 1000) / 86400) : 0;
               return (
                 <div className="space-y-3">
                   <div className="text-sm text-gray-400">
@@ -1164,9 +1169,15 @@ const StoragePage: React.FC = () => {
                     Data is stored in your local app data directory.
                   </div>
 
-                  <div className="bg-orange-500/10 border border-orange-500/30 rounded-xl px-4 py-3 text-sm text-orange-300">
-                    🔒 <span className="font-semibold">60-day lock:</span> Once you allocate storage, this setting cannot be changed or reset for <span className="font-semibold">60 days</span>. Choose carefully.
-                  </div>
+                  {isLocked ? (
+                    <div className="bg-orange-500/10 border border-orange-500/30 rounded-xl px-4 py-3 text-sm text-orange-300">
+                      🔒 <span className="font-semibold">Locked for {daysLeft} more day{daysLeft === 1 ? '' : 's'}.</span> Your {currentAllocGb.toFixed(0)} GB allocation can be changed on <span className="font-semibold">{new Date(unlockAt * 1000).toLocaleDateString()}</span>.
+                    </div>
+                  ) : (
+                    <div className="bg-orange-500/10 border border-orange-500/30 rounded-xl px-4 py-3 text-sm text-orange-300">
+                      🔒 <span className="font-semibold">60-day lock:</span> Once you allocate storage, this setting cannot be changed or reset for <span className="font-semibold">60 days</span>. Choose carefully.
+                    </div>
+                  )}
 
                   {isReducing && (
                     <div className="bg-red-500/10 border border-red-500/40 rounded-xl px-4 py-3 text-sm text-red-300">
@@ -1176,8 +1187,8 @@ const StoragePage: React.FC = () => {
 
                   <div className="grid grid-cols-2 gap-3">
                     <button onClick={() => setShowProvConfig(false)} className="bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition">Cancel</button>
-                    <button onClick={handleConfigureStorage} disabled={configuring || overLimit} className={`${isReducing ? 'bg-red-600 hover:bg-red-500' : 'bg-blue-600 hover:bg-blue-500'} disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition`}>
-                      {configuring ? 'Saving…' : isReducing ? `Reduce to ${allocGb} GB (penalty)` : `Allocate ${allocGb} GB`}
+                    <button onClick={handleConfigureStorage} disabled={configuring || overLimit || isLocked} className={`${isReducing ? 'bg-red-600 hover:bg-red-500' : 'bg-blue-600 hover:bg-blue-500'} disabled:opacity-40 py-3 rounded-xl font-semibold text-sm transition`}>
+                      {configuring ? 'Saving…' : isLocked ? 'Locked' : isReducing ? `Reduce to ${allocGb} GB (penalty)` : `Allocate ${allocGb} GB`}
                     </button>
                   </div>
                 </div>

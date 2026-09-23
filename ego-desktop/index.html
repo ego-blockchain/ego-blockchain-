@@ -12,6 +12,7 @@
          to start leaves nothing on screen at all: the app looks shut while the node runs
          behind it. This is what stands there instead, and what stays if the script dies. -->
     <style>
+      html, body { margin: 0; background: #111827; }
       #boot { position: fixed; inset: 0; background: #111827; border-radius: 10px;
               display: flex; align-items: center; justify-content: center;
               font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color: #e5e7eb; }
@@ -35,12 +36,8 @@
         var el = document.getElementById('boot-err');
         if (!el) return;
         el.style.display = 'block';
-        el.textContent = 'The interface could not start.
-
-' + (e && e.message ? e.message : e) +
-          '
-
-Your node is unaffected and still running. Please report this.';
+        el.textContent = 'The interface could not start.\n\n' + (e && e.message ? e.message : e) +
+          '\n\nYour node is unaffected and still running. Please report this.';
       });
     </script>
     <script type="module" src="/src-frontend/main.tsx"></script>

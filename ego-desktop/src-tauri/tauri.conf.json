@@ -30,7 +30,9 @@
       },
       "fs": {
         "all": true,
-        "scope": ["**"]
+        "scope": [
+          "**"
+        ]
       },
       "dialog": {
         "all": false,
@@ -120,7 +122,9 @@
           "dialogImagePath": "installer/dialog.bmp"
         },
         "nsis": {
-          "languages": ["English"],
+          "languages": [
+            "English"
+          ],
           "displayLanguageSelector": false
         }
       }
@@ -142,10 +146,11 @@
         "minHeight": 605,
         "center": true,
         "decorations": false,
-        "transparent": true,
+        "transparent": false,
         "alwaysOnTop": false,
         "skipTaskbar": false,
-        "visible": false
+        "visible": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion"
       }
     ],
     "systemTray": {
