@@ -113,13 +113,71 @@ fn register_windows_notifications() {
 static INSTANCE_LOCK: once_cell::sync::OnceCell<std::net::TcpListener> =
     once_cell::sync::OnceCell::new();
 
+/// End copies of this app left running from before an install.
+///
+/// Closing the window only hides the app to the tray, so an installer cannot shut it
+/// down. After an update the old process keeps the single-instance lock, the new launch
+/// asks it to show itself and exits, and the stale process, its files replaced beneath
+/// it, never comes back: the app will not open until it is ended in Task Manager.
+///
+/// A copy counts as stale when it runs under this program's name but from a path that
+/// is gone or differs (Windows cannot overwrite a running exe, so installers move it
+/// aside), or when it started before this exe was written. A copy started after the
+/// install is simply a second launch, and is left alone to be brought forward.
+fn retire_stale_instances() -> usize {
+    use sysinfo::System;
+    let Ok(me) = std::env::current_exe() else { return 0 };
+    let Some(my_name) = me.file_name().map(|n| n.to_string_lossy().to_lowercase()) else { return 0 };
+    let my_path = std::fs::canonicalize(&me).unwrap_or_else(|_| me.clone());
+    let written = std::fs::metadata(&me)
+        .ok()
+        .map(|m| {
+            let at = |t: std::io::Result<std::time::SystemTime>| t.ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            at(m.modified()).max(at(m.created()))
+        })
+        .unwrap_or(0);
+    let my_pid = sysinfo::get_current_pid().ok();
+
+    let mut sys = System::new();
+    sys.refresh_processes();
+    let mut ended = 0;
+    for (pid, proc_) in sys.processes() {
+        if Some(*pid) == my_pid || proc_.name().to_lowercase() != my_name {
+            continue;
+        }
+        let stale = match proc_.exe() {
+            None => true,
+            Some(path) => {
+                let theirs = std::fs::canonicalize(path).ok();
+                theirs.as_deref() != Some(my_path.as_path())
+                    || proc_.start_time().saturating_add(2) < written
+            }
+        };
+        if stale && proc_.kill() {
+            eprintln!("[Startup] ended an older copy still running from before the install (pid {pid})");
+            ended += 1;
+        }
+    }
+    ended
+}
+
 fn acquire_single_instance_lock() -> bool {
     let port: u16 = std::env::var("EGO_LOCK_PORT")
         .ok().and_then(|v| v.parse().ok())
         .unwrap_or(47391);
+    let mut retired = false;
     // Retry for a few seconds: during a maintenance self-restart the new process
     // starts while the old one is still releasing the port.
     for attempt in 0..8 {
+        if attempt == 1 && !retired {
+            retired = true;
+            if retire_stale_instances() > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(800));
+            }
+        }
         match std::net::TcpListener::bind(format!("127.0.0.1:{}", port)) {
             Ok(l) => {
                 let _ = INSTANCE_LOCK.set(l);
