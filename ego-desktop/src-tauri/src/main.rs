@@ -784,13 +784,19 @@ fn main() {
         .on_system_tray_event(|app, event| match event {
             SystemTrayEvent::LeftClick { .. } => {
                 let window = app.get_window("main").unwrap();
-                if window.is_visible().unwrap() {
-                    window.hide().unwrap();
+                // A minimized window still reports itself visible, so checking only
+                // is_visible hid a minimized app instead of bringing it back, and the
+                // next click showed it without restoring it: nothing appeared at all.
+                let on_screen = window.is_visible().unwrap_or(false)
+                    && !window.is_minimized().unwrap_or(false);
+                if on_screen {
+                    let _ = window.hide();
                     crate::commands::auth::invalidate_pin_cache();
                     let _ = window.emit("ego://app-locked", ());
                 } else {
-                    window.show().unwrap();
-                    window.set_focus().unwrap();
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
                 }
             }
             SystemTrayEvent::MenuItemClick { id, .. } => match id.as_str() {
@@ -811,7 +817,9 @@ fn main() {
                 }
                 "show" => {
                     let w = app.get_window("main").unwrap();
-                    w.show().unwrap(); w.set_focus().unwrap();
+                    let _ = w.show();
+                    let _ = w.unminimize();
+                    let _ = w.set_focus();
                 }
                 _ => {}
             },
