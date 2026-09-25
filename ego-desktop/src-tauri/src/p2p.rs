@@ -10318,50 +10318,7 @@ async fn apply_incoming_tx(tx: LedgerTx, block: LedgerBlock, app: Option<&tauri:
     }
 }
 
-fn execute_contract_txs(chain: &crate::ledger::SharedChain, txs: &[crate::ledger::LedgerTx]) {
-    let height    = chain.blocks.last().map(|b| b.height).unwrap_or(0);
-    let timestamp = chrono::Utc::now().timestamp();
-    let contracts_dir = crate::ledger::contracts_dir();
-
-    let exec = match ego_vm::Executor::new(contracts_dir) {
-        Ok(e)  => e,
-        Err(e) => { eprintln!("[VM] Executor init failed: {}", e); return; }
-    };
-
-    for tx in txs {
-        match tx.tx_type.as_str() {
-            "deploy" => {
-                if tx.wasm_code.is_empty() { continue; }
-                let wasm_bytes = match hex::decode(&tx.wasm_code) {
-                    Ok(b)  => b,
-                    Err(_) => continue,
-                };
-                let init_args = hex::decode(&tx.call_args).unwrap_or_default();
-                match exec.deploy(&wasm_bytes, &tx.from, &init_args, height, timestamp,
-                                  ego_vm::types::DEFAULT_DEPLOY_FUEL) {
-                    Ok(r)  => eprintln!("[VM] Deployed contract {} (RU={})", r.contract_address, r.ru_used),
-                    Err(e) => eprintln!("[VM] Deploy failed for tx {}: {}", tx.hash, e),
-                }
-            }
-            "call" => {
-                if tx.contract_addr.is_empty() || tx.entrypoint.is_empty() { continue; }
-                let call_args = hex::decode(&tx.call_args).unwrap_or_default();
-                match exec.call(&tx.contract_addr, &tx.from, &tx.entrypoint,
-                                &call_args, height, timestamp,
-                                ego_vm::types::DEFAULT_CALL_FUEL) {
-                    Ok(r)  => eprintln!("[VM] Called {}.{}() — success={} RU={}",
-                                        tx.contract_addr, tx.entrypoint, r.success, r.ru_used),
-                    Err(e) => eprintln!("[VM] Call failed for tx {}: {}", tx.hash, e),
-                }
-            }
-            "governance" => {
-                handle_governance_tx(&tx);
-            }
-            _ => {}
-        }
-    }
-}
-
+#[allow(dead_code)]
 fn handle_governance_tx(tx: &LedgerTx) {
     // Only registered validators may vote.
     if !known_validators().contains(&tx.from) {

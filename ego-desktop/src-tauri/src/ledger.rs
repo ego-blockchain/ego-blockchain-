@@ -1519,7 +1519,7 @@ mod contract_commitment_tests {
 
 /// Reject a contract transaction whose payload does not match the memo its sender
 /// signed. Without this the commitment above is decoration.
-fn check_contract_commitment(tx: &LedgerTx) -> Result<(), String> {
+pub(crate) fn check_contract_commitment(tx: &LedgerTx) -> Result<(), String> {
     if tx.tx_type != "deploy" && tx.tx_type != "call" {
         return Ok(());
     }
@@ -1580,7 +1580,7 @@ pub fn is_reserved_system_source(addr: &str) -> bool {
         || addr.starts_with("egot1shielded")
 }
 
-fn expected_standard_tx_hash(tx: &LedgerTx) -> String {
+pub(crate) fn expected_standard_tx_hash(tx: &LedgerTx) -> String {
     let msg = if tx.tx_version >= 2 {
         tx_signing_bytes_v2(
             &tx.from,

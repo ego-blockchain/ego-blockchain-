@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useTheme } from '../App';
+import { useTheme, useWallet } from '../App';
 import { RPC_URL } from '../config';
 import Editor, { loader } from '@monaco-editor/react';
 import * as monaco from 'monaco-editor';
@@ -34,6 +34,13 @@ interface CompileResult {
 
 interface DeployResult {
   contract_address: string;
+  tx_hash?: string;
+}
+
+interface DryRunResult {
+  contract_address: string;
+  ru_used: number;
+  already_deployed: boolean;
 }
 
 interface ConsoleLog {
@@ -45,7 +52,142 @@ interface ConsoleLog {
 type RightTab = 'build' | 'deploy' | 'abi' | 'preview';
 type DeployNetwork = 'testnet' | 'mainnet';
 
+const GUESTBOOK_CONTRACT = `contract Guestbook {
+    pub fn init() {
+        storage.set("entries", 0);
+    }
+
+    pub fn sign(message: String) {
+        let n: u64 = storage.get_u64("entries");
+        storage.set("entries", n + 1);
+        events.emit("signed", n + 1);
+    }
+
+    pub fn entries() -> u64 {
+        return storage.get_u64("entries");
+    }
+}
+`;
+
+const GUESTBOOK_FRONTEND = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Guestbook</title>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:560px;margin:32px auto;padding:0 16px;background:#0f1117;color:#e7e9ee}
+  h1{font-size:22px;margin:0 0 4px}
+  .sub{color:#8b93a7;font-size:13px;margin:0 0 20px}
+  textarea{width:100%;box-sizing:border-box;min-height:70px;padding:10px;border-radius:10px;border:1px solid #2a3040;background:#161a24;color:#e7e9ee;font:inherit;resize:vertical}
+  button{padding:9px 16px;border:0;border-radius:10px;background:#3b82f6;color:#fff;font-weight:600;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  .row{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;color:#8b93a7;margin-top:8px}
+  .entry{border:1px solid #232838;border-radius:12px;padding:10px 12px;margin-top:10px;background:#131722}
+  .entry .row{margin-top:0}
+  .msg{white-space:pre-wrap;word-break:break-word;margin-top:4px}
+  .pending{border-style:dashed;opacity:.7}
+  .note{font-size:12px;color:#f59e0b;margin-top:8px;min-height:16px}
+</style>
+</head>
+<body>
+<h1>Guestbook</h1>
+<p class="sub"><span id="count">…</span> entries. Every message is a signed transaction that every node keeps.</p>
+<textarea id="msg" maxlength="280" placeholder="Leave a message"></textarea>
+<div class="row"><span id="left">280 left</span><button id="sign">Sign the guestbook</button></div>
+<div class="note" id="note"></div>
+<div id="list"></div>
+<script>
+const $ = id => document.getElementById(id);
+const pending = [];
+
+function text(hex) {
+  const bytes = new Uint8Array((hex.match(/.{2}/g) || []).map(b => parseInt(b, 16)));
+  return new TextDecoder().decode(bytes);
+}
+
+function short(a) {
+  return a.length > 16 ? a.slice(0, 10) + '…' + a.slice(-4) : a;
+}
+
+function card(from, when, message, waiting) {
+  const d = document.createElement('div');
+  d.className = 'entry' + (waiting ? ' pending' : '');
+  const row = document.createElement('div');
+  row.className = 'row';
+  const who = document.createElement('span');
+  who.textContent = short(from);
+  const at = document.createElement('span');
+  at.textContent = waiting ? 'waiting for its block to be final…' : new Date(when * 1000).toLocaleString();
+  row.append(who, at);
+  const m = document.createElement('div');
+  m.className = 'msg';
+  m.textContent = message;
+  d.append(row, m);
+  return d;
+}
+
+async function refresh() {
+  if (!window.ego) {
+    $('note').textContent = 'Open this page in the Ego Desktop dApp IDE preview.';
+    return;
+  }
+  try {
+    const [count, activity] = await Promise.all([ego.read('entries'), ego.activity(100)]);
+    $('count').textContent = count.value;
+    const signed = activity.filter(a => a.ok && a.entrypoint === 'sign');
+    const landed = new Set(signed.map(a => a.tx_hash));
+    for (let i = pending.length - 1; i >= 0; i--) {
+      if (landed.has(pending[i].tx)) pending.splice(i, 1);
+    }
+    const list = $('list');
+    list.replaceChildren();
+    pending.forEach(p => list.append(card(p.from, 0, p.message, true)));
+    signed.forEach(a => list.append(card(a.from, a.timestamp, text(a.args_hex), false)));
+    $('note').textContent = '';
+  } catch (e) {
+    $('note').textContent = e.message;
+  }
+}
+
+$('msg').addEventListener('input', () => {
+  $('left').textContent = (280 - $('msg').value.length) + ' left';
+});
+
+$('sign').addEventListener('click', async () => {
+  const message = $('msg').value.trim();
+  if (!message) return;
+  $('sign').disabled = true;
+  try {
+    const sent = await ego.send('sign', message);
+    pending.unshift({ tx: sent.txHash, message, from: await ego.account() });
+    $('msg').value = '';
+    $('left').textContent = '280 left';
+    refresh();
+  } catch (e) {
+    $('note').textContent = e.message;
+  } finally {
+    $('sign').disabled = false;
+  }
+});
+
+refresh();
+setInterval(refresh, 8000);
+</script>
+</body>
+</html>
+`;
+
 const TEMPLATES = [
+  {
+    name: 'Guestbook',
+    icon: '📖',
+    description: 'A working dApp: anyone can sign, every node keeps the messages. Includes a frontend.',
+    files: {
+      'src/main.urego': GUESTBOOK_CONTRACT,
+      'frontend/index.html': GUESTBOOK_FRONTEND,
+      'ego.toml': `[project]\nname = "guestbook"\nversion = "0.1.0"\n\n[network]\ntestnet = "https://rpc.egoblockchain.com"\n`,
+    },
+  },
   {
     name: 'EGO-20 Token',
     icon: '🪙',
@@ -740,13 +882,86 @@ function FileTree({ project, activeFile, onSelect, onDelete, onDeleteFolder, onN
   );
 }
 
+function utf8Hex(s: string): string {
+  return Array.from(new TextEncoder().encode(s)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function u64Hex(n: bigint): string {
+  if (n < 0n || n > 0xffffffffffffffffn) throw new Error('Numbers must be whole and between 0 and 18446744073709551615');
+  let v = n;
+  let out = '';
+  for (let i = 0; i < 8; i++) { out += Number(v & 0xffn).toString(16).padStart(2, '0'); v >>= 8n; }
+  return out;
+}
+
+function bridgeArgsHex(args: unknown): string {
+  if (args === undefined || args === null || args === '') return '';
+  if (typeof args === 'string') return utf8Hex(args);
+  if (typeof args === 'number' || typeof args === 'bigint') return u64Hex(BigInt(args));
+  if (Array.isArray(args)) return args.map(a => u64Hex(BigInt(a))).join('');
+  if (typeof args === 'object' && typeof (args as { hex?: unknown }).hex === 'string') {
+    return (args as { hex: string }).hex.replace(/^0x/i, '');
+  }
+  throw new Error('Arguments must be text, a number, a list of numbers, or { hex: "…" }');
+}
+
+function describeBridgeArgs(args: unknown): string {
+  if (args === undefined || args === null || args === '') return '';
+  if (typeof args === 'string') return args.length > 300 ? args.slice(0, 300) + '…' : args;
+  if (Array.isArray(args)) return args.join(', ');
+  if (typeof args === 'object') return 'hex ' + String((args as { hex?: string }).hex ?? '');
+  return String(args);
+}
+
+function u64FromBytes(bytes: number[]): string {
+  let n = 0n;
+  for (let i = Math.min(bytes.length, 8) - 1; i >= 0; i--) n = (n << 8n) | BigInt(bytes[i]);
+  return n.toString();
+}
+
+function plainError(err: unknown): string {
+  const msg = String((err as { message?: string })?.message ?? err);
+  return msg.replace(/^(Wallet error|Invalid input|Resource not found): /, '');
+}
+
+function withEgoBridge(html: string, contract: string): string {
+  const safe = JSON.stringify(contract.replace(/[^0-9a-zA-Z]/g, ''));
+  const script =
+    `<script>(function(){var seq=0,waiting={};` +
+    `window.addEventListener('message',function(e){var m=e.data;if(!m||m.egoBridge!=='reply'||!waiting[m.id])return;` +
+    `var w=waiting[m.id];delete waiting[m.id];if(m.ok)w.resolve(m.result);else w.reject(new Error(m.error));});` +
+    `function ask(method,params){return new Promise(function(resolve,reject){var id=++seq;waiting[id]={resolve:resolve,reject:reject};` +
+    `parent.postMessage({egoBridge:'ask',id:id,method:method,params:params||{}},'*');});}` +
+    `window.ego={contract:${safe},` +
+    `account:function(){return ask('account');},` +
+    `read:function(fn,args){return ask('read',{entrypoint:fn,args:args});},` +
+    `send:function(fn,args){return ask('send',{entrypoint:fn,args:args});},` +
+    `activity:function(limit){return ask('activity',{limit:limit});},` +
+    `state:function(key,prefix){return ask('state',{key:key,prefix:prefix});}};})();</script>`;
+  const head = html.match(/<head[^>]*>/i);
+  if (head && head.index !== undefined) {
+    const at = head.index + head[0].length;
+    return html.slice(0, at) + script + html.slice(at);
+  }
+  return script + html;
+}
+
+interface PendingSend {
+  entrypoint: string;
+  args: string;
+  decide: (ok: boolean) => void;
+}
+
 interface RightPanelProps {
   tab: RightTab;
   onTabChange: (t: RightTab) => void;
   compiling: boolean;
   compileResult: CompileResult | null;
   deployResult: DeployResult | null;
-  dryRunResult: string | null;
+  deployLive: boolean;
+  dryRunResult: DryRunResult | null;
+  previewContract: string;
+  onPreviewContractChange: (v: string) => void;
   deploying: boolean;
   deployNetwork: DeployNetwork;
   nodeUrl: string;
@@ -765,12 +980,72 @@ interface RightPanelProps {
 const TESTNET_RPC = 'https://rpc.egoblockchain.com';
 
 function RightPanel({
-  tab, onTabChange, compiling, compileResult, deployResult, dryRunResult, deploying,
+  tab, onTabChange, compiling, compileResult, deployResult, deployLive, dryRunResult,
+  previewContract, onPreviewContractChange, deploying,
   deployNetwork, nodeUrl, initArgs, activeFile, currentContent,
   onCompile, onDeploy, onDryRun, onNetworkChange, onNodeUrlChange, onInitArgsChange, onNavigate,
 }: RightPanelProps) {
   const { theme } = useTheme();
+  const { wallet } = useWallet();
   const L = theme === 'light';
+  const previewFrame = useRef<HTMLIFrameElement>(null);
+  const [pendingSend, setPendingSend] = useState<PendingSend | null>(null);
+
+  useEffect(() => {
+    const contract = previewContract.trim();
+
+    async function answer(method: string, params: Record<string, unknown>): Promise<unknown> {
+      if (method === 'account') return wallet?.address ?? '';
+      if (!contract) throw new Error('No contract yet. Deploy one, or paste its address above the preview.');
+      const entrypoint = String(params.entrypoint ?? '');
+      if (method === 'read') {
+        const r = await invoke<{ success: boolean; return_val: number[]; error: string | null }>('query_contract', {
+          args: { contract_addr: contract, entrypoint, args_hex: bridgeArgsHex(params.args) },
+        });
+        if (!r.success) throw new Error(r.error ?? 'The read failed');
+        return {
+          value: u64FromBytes(r.return_val),
+          raw: r.return_val.map(b => b.toString(16).padStart(2, '0')).join(''),
+        };
+      }
+      if (method === 'send') {
+        const argsHex = bridgeArgsHex(params.args);
+        const ok = await new Promise<boolean>(decide =>
+          setPendingSend({ entrypoint, args: describeBridgeArgs(params.args), decide }));
+        if (!ok) throw new Error('You declined the transaction');
+        const r = await invoke<{ tx_hash: string }>('call_contract', {
+          args: { contract_addr: contract, entrypoint, args_hex: argsHex },
+        });
+        return { txHash: r.tx_hash, status: 'pending' };
+      }
+      if (method === 'activity') {
+        const limit = Math.min(Math.max(Number(params.limit ?? 50) || 50, 1), 1000);
+        return await invoke('get_contract_activity', { contractAddr: contract, limit });
+      }
+      if (method === 'state') {
+        return await invoke('get_contract_state', {
+          contractAddr: contract,
+          prefix: String(params.prefix ?? ''),
+          key: String(params.key ?? ''),
+        });
+      }
+      throw new Error(`Unknown request: ${method}`);
+    }
+
+    function onMessage(e: MessageEvent) {
+      const frame = previewFrame.current;
+      const m = e.data;
+      if (!frame || e.source !== frame.contentWindow || !m || m.egoBridge !== 'ask') return;
+      const reply = (payload: Record<string, unknown>) =>
+        frame.contentWindow?.postMessage({ egoBridge: 'reply', id: m.id, ...payload }, '*');
+      answer(String(m.method), (m.params ?? {}) as Record<string, unknown>)
+        .then(result => reply({ ok: true, result }))
+        .catch(err => reply({ ok: false, error: plainError(err) }));
+    }
+
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [previewContract, wallet?.address]);
   const tabs: { key: RightTab; label: string }[] = [
     { key: 'build', label: 'Build' },
     { key: 'deploy', label: 'Deploy' },
@@ -874,31 +1149,23 @@ function RightPanel({
                   🧪 Testnet
                 </button>
                 <button
-                  onClick={() => onNetworkChange('mainnet')}
-                  className={`flex-1 py-2 text-xs font-semibold transition-colors ${
-                    deployNetwork === 'mainnet'
-                      ? 'bg-purple-700/60 text-purple-200'
-                      : 'bg-gray-700/40 text-gray-400 hover:text-gray-200'
-                  }`}
+                  disabled
+                  title="Mainnet is not live yet"
+                  className="flex-1 py-2 text-xs font-semibold bg-gray-700/40 text-gray-600 cursor-not-allowed"
                 >
-                  🌐 Mainnet
+                  🌐 Mainnet (not live yet)
                 </button>
               </div>
             </div>
 
             {}
-            {deployNetwork === 'testnet' ? (
-              <div className="bg-green-900/20 border border-green-700/50 rounded-lg px-3 py-2 space-y-0.5">
-                <div className="text-xs text-green-400 font-semibold">✓ Testnet — Free deployment</div>
-                <div className="text-[11px] text-green-700">No EGOC spent. Use this to test your contract before going live.</div>
-                <div className="text-[10px] text-gray-500 font-mono mt-0.5">{TESTNET_RPC}</div>
+            <div className="bg-green-900/20 border border-green-700/50 rounded-lg px-3 py-2 space-y-0.5">
+              <div className="text-xs text-green-400 font-semibold">Testnet</div>
+              <div className="text-[11px] text-green-600">
+                Deploy fee about 0.8 EGOC in testnet coins (stakers pay a tiny fraction). init() runs here first as a free check, so a contract that fails never costs the fee.
               </div>
-            ) : (
-              <div className="bg-yellow-900/20 border border-yellow-700/50 rounded-lg px-3 py-2 space-y-0.5">
-                <div className="text-xs text-yellow-400 font-semibold">⚠ Mainnet — Costs EGOC</div>
-                <div className="text-[11px] text-yellow-700">Estimated fee: ~0.01 EGOC. This deploys a real contract on-chain.</div>
-              </div>
-            )}
+              <div className="text-[10px] text-gray-500 font-mono mt-0.5">{TESTNET_RPC}</div>
+            </div>
 
             {}
             <div className={`text-xs rounded px-2 py-1.5 ${compileResult?.success ? 'text-green-400 bg-green-900/20' : 'text-gray-500 bg-gray-700/30'}`}>
@@ -936,7 +1203,7 @@ function RightPanel({
               disabled={!compileResult?.success}
               className="w-full py-2 bg-gray-700 hover:bg-gray-600 disabled:bg-gray-700/40 disabled:text-gray-600 text-gray-300 rounded-lg text-xs font-medium flex items-center justify-center gap-2 transition-colors border border-gray-600"
             >
-              🔬 Dry Run <span className="text-gray-500">(local simulation, no network)</span>
+              🔬 Dry Run <span className="text-gray-500">(runs init() here, sends nothing)</span>
             </button>
 
             {}
@@ -951,39 +1218,47 @@ function RightPanel({
             >
               {deploying ? (
                 <><span className="animate-spin">🚀</span> Deploying...</>
-              ) : deployNetwork === 'testnet' ? (
-                '🧪 Deploy to Testnet (Free)'
               ) : (
-                '🚀 Deploy to Mainnet'
+                '🧪 Deploy to Testnet'
               )}
             </button>
 
             {}
             {dryRunResult && (
               <div className="bg-blue-900/20 border border-blue-700/50 rounded-lg p-3 space-y-1">
-                <div className="text-xs text-blue-400 font-semibold">🔬 Dry Run — Simulated</div>
-                <div className="text-[11px] text-gray-400">Simulated address (no real deployment):</div>
+                <div className="text-xs text-blue-400 font-semibold">🔬 Dry run: init() succeeded</div>
+                <div className="text-[11px] text-gray-400">
+                  {dryRunResult.already_deployed
+                    ? 'You already deployed this exact code. It lives at:'
+                    : 'If you deploy, the contract will live at:'}
+                </div>
                 <button
-                  onClick={() => copyToClipboard(dryRunResult)}
+                  onClick={() => copyToClipboard(dryRunResult.contract_address)}
                   className="w-full text-left font-mono text-xs bg-gray-900 rounded px-2 py-1 text-blue-300 hover:bg-gray-700 transition-colors break-all"
                   title="Click to copy"
                 >
-                  {dryRunResult}
+                  {dryRunResult.contract_address}
                 </button>
-                <div className="text-[10px] text-gray-500">No EGOC spent · No on-chain state · Click to copy</div>
+                <div className="text-[10px] text-gray-500">
+                  {dryRunResult.ru_used.toLocaleString()} RU · nothing sent · click to copy
+                </div>
               </div>
             )}
 
             {}
             {deployResult && (
-              <div className={`border rounded-xl p-3 space-y-3 ${deployNetwork === 'testnet' ? 'bg-green-900/20 border-green-700/60' : 'bg-purple-900/20 border-purple-700/60'}`}>
-                {/* Header */}
+              <div className="border rounded-xl p-3 space-y-3 bg-green-900/20 border-green-700/60">
                 <div className="flex items-center gap-2">
-                  <div className={`text-xs font-semibold ${deployNetwork === 'testnet' ? 'text-green-400' : 'text-purple-300'}`}>✓ Deployed!</div>
-                  {deployNetwork === 'testnet' && (
-                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-green-800/60 text-green-300 border border-green-700/50">TESTNET</span>
-                  )}
+                  <div className="text-xs font-semibold text-green-400">
+                    {deployLive ? '✓ Live on chain' : 'Deploy sent, waiting for its block…'}
+                  </div>
+                  <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-green-800/60 text-green-300 border border-green-700/50">TESTNET</span>
                 </div>
+                {!deployLive && (
+                  <div className="text-[10px] text-gray-400">
+                    Every node runs init() once the block is final, usually within a minute.
+                  </div>
+                )}
 
                 {/* Address */}
                 <div>
@@ -1080,9 +1355,21 @@ function RightPanel({
           <div className="h-full flex flex-col">
             {isHtml ? (
               <>
-                <div className="text-xs text-gray-400 px-3 py-2 shrink-0 border-b border-gray-700">Live Preview</div>
+                <div className="px-3 py-2 shrink-0 border-b border-gray-700 space-y-1">
+                  <div className="text-xs text-gray-400">Live Preview</div>
+                  <input
+                    value={previewContract}
+                    onChange={(e) => onPreviewContractChange(e.target.value.trim())}
+                    placeholder="Contract this page talks to"
+                    className="w-full bg-gray-900 text-white text-[11px] font-mono px-2 py-1 rounded border border-gray-600 focus:outline-none focus:border-blue-500"
+                  />
+                  <div className="text-[10px] text-gray-500">
+                    The page gets window.ego: read, send, activity, state, account
+                  </div>
+                </div>
                 <iframe
-                  srcDoc={currentContent}
+                  ref={previewFrame}
+                  srcDoc={withEgoBridge(currentContent, previewContract)}
                   sandbox="allow-scripts"
                   className="flex-1 bg-white w-full"
                   title="dApp Preview"
@@ -1096,6 +1383,41 @@ function RightPanel({
           </div>
         )}
       </div>
+
+      {pendingSend && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+          <div className="bg-gray-800 border border-gray-600 rounded-xl shadow-2xl p-5 w-96 space-y-3">
+            <div className="text-white font-semibold text-sm">Send a transaction?</div>
+            <div className="text-gray-300 text-xs">
+              The page in the preview wants to call{' '}
+              <span className="font-mono text-purple-300">{pendingSend.entrypoint}()</span> on{' '}
+              <span className="font-mono">{previewContract.slice(0, 10)}…{previewContract.slice(-6)}</span>.
+            </div>
+            {pendingSend.args && (
+              <div className="text-xs font-mono bg-gray-900 rounded px-2 py-1.5 break-all text-gray-200 max-h-32 overflow-y-auto">
+                {pendingSend.args}
+              </div>
+            )}
+            <div className="text-gray-400 text-xs">
+              Fee 0.6 EGOC. Every node applies it once its block is final.
+            </div>
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => { pendingSend.decide(false); setPendingSend(null); }}
+                className="px-4 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs rounded-lg transition-colors cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => { pendingSend.decide(true); setPendingSend(null); }}
+                className="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs rounded-lg transition-colors cursor-pointer"
+              >
+                Send
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1207,7 +1529,10 @@ export default function IDEPage() {
   const [compiling, setCompiling] = useState(false);
   const [compileResult, setCompileResult] = useState<CompileResult | null>(null);
   const [deployResult, setDeployResult] = useState<DeployResult | null>(null);
-  const [dryRunResult, setDryRunResult] = useState<string | null>(null);
+  const [deployLive, setDeployLive] = useState(false);
+  const [dryRunResult, setDryRunResult] = useState<DryRunResult | null>(null);
+  const [previewContract, setPreviewContract] = useState('');
+  const livePoll = useRef<number | null>(null);
   const [deploying, setDeploying] = useState(false);
   const [deployNetwork, setDeployNetwork] = useState<DeployNetwork>('testnet');
   const [consoleLogs, setConsoleLogs] = useState<ConsoleLog[]>([]);
@@ -1604,21 +1929,68 @@ export default function IDEPage() {
     }
   }
 
-  function dryRun() {
+  useEffect(() => {
+    let saved = '';
+    try { saved = localStorage.getItem(`ego-ide-contract:${activeProject ?? ''}`) ?? ''; } catch { }
+    setPreviewContract(saved);
+  }, [activeProject]);
+
+  useEffect(() => () => { if (livePoll.current) window.clearInterval(livePoll.current); }, []);
+
+  function rememberContract(addr: string) {
+    setPreviewContract(addr);
+    try { localStorage.setItem(`ego-ide-contract:${activeProject ?? ''}`, addr); } catch { }
+  }
+
+  function watchUntilLive(addr: string) {
+    if (livePoll.current) window.clearInterval(livePoll.current);
+    const started = Date.now();
+    livePoll.current = window.setInterval(async () => {
+      try {
+        const info = await invoke<{ address: string } | null>('get_contract', { contractAddr: addr });
+        if (info) {
+          setDeployLive(true);
+          addLog('success', `✓ ${addr} is live on chain. Every node now runs it, and the preview can use it.`);
+        } else if (Date.now() - started < 5 * 60_000) {
+          return;
+        } else {
+          addLog('info', `Still waiting for ${addr} to go live. The chain may be catching up; check the Contracts page later.`);
+        }
+      } catch {
+        return;
+      }
+      if (livePoll.current) window.clearInterval(livePoll.current);
+      livePoll.current = null;
+    }, 4000);
+  }
+
+  function mainSource(): string {
+    if (!activeFile?.endsWith('.urego') && currentProject) {
+      const mainFile = currentProject.files['src/main.urego'];
+      if (mainFile) return mainFile.content;
+    }
+    return currentContent;
+  }
+
+  async function dryRun() {
     if (!compileResult?.success || !compileResult.wasm_hex) {
       addLog('error', 'Compile successfully before dry run');
       return;
     }
-
-    const seed = (compileResult.wasm_hex.slice(0, 32) + (activeProject ?? '')).split('').reduce(
-      (acc, c) => (acc * 31 + c.charCodeAt(0)) >>> 0, 0x5EED
-    );
-    const hex = seed.toString(16).padStart(8, '0') + compileResult.wasm_hex.slice(-24);
-    const simAddr = `egot1sim${hex}`;
-    setDryRunResult(simAddr);
+    setDryRunResult(null);
     setDeployResult(null);
-    addLog('info', `🔬 Dry run complete — simulated address: ${simAddr}`);
-    addLog('info', `   No network call made, no EGOC spent.`);
+    try {
+      const result = await invoke<DryRunResult>('preview_contract_deploy', {
+        args: { wasm_hex: compileResult.wasm_hex, init_args_hex: encodeInitArgs(initArgs) },
+      });
+      setDryRunResult(result);
+      addLog('info', `🔬 Dry run: init() ran here in ${result.ru_used.toLocaleString()} RU. Nothing was sent.`);
+      addLog('info', result.already_deployed
+        ? `   You already deployed this exact code at ${result.contract_address}.`
+        : `   If you deploy, the contract will live at ${result.contract_address}.`);
+    } catch (e: unknown) {
+      addLog('error', `✗ Dry run failed: ${plainError(e)}`);
+    }
   }
 
   async function deploy() {
@@ -1626,29 +1998,26 @@ export default function IDEPage() {
       addLog('error', 'Compile successfully before deploying');
       return;
     }
-    const targetUrl = deployNetwork === 'testnet' ? TESTNET_RPC : nodeUrl;
     setDeploying(true);
     setDryRunResult(null);
-    addLog('info', `Deploying to ${deployNetwork === 'testnet' ? 'Testnet' : 'Mainnet'} (${targetUrl})...`);
+    setDeployLive(false);
+    addLog('info', 'Checking init() here, then sending the deploy…');
     try {
-      let abiSource = currentContent;
-      if (!activeFile?.endsWith('.urego') && currentProject) {
-        const mainFile = currentProject.files['src/main.urego'];
-        if (mainFile) abiSource = mainFile.content;
-      }
-      const result = await invoke<{ contract_address: string }>('deploy_contract', {
+      const result = await invoke<DeployResult>('deploy_contract', {
         args: {
           wasm_hex:      compileResult.wasm_hex,
           init_args_hex: encodeInitArgs(initArgs),
           name:          activeProject || '',
-          abi:           extractABI(abiSource),
-          node_url:      targetUrl,
+          abi:           extractABI(mainSource()),
         },
       });
       setDeployResult(result);
-      addLog('success', `✓ Deployed on ${deployNetwork === 'testnet' ? 'Testnet (free)' : 'Mainnet'}: ${result.contract_address}`);
+      rememberContract(result.contract_address);
+      addLog('success', `✓ Deploy sent for ${result.contract_address}`);
+      addLog('info', '   Every node runs init() once the block is final, usually within a minute.');
+      watchUntilLive(result.contract_address);
     } catch (e: unknown) {
-      addLog('error', `✗ Deploy failed: ${String(e)}`);
+      addLog('error', `✗ Deploy failed: ${plainError(e)}`);
     } finally {
       setDeploying(false);
     }
@@ -1978,7 +2347,10 @@ export default function IDEPage() {
           compiling={compiling}
           compileResult={compileResult}
           deployResult={deployResult}
+          deployLive={deployLive}
           dryRunResult={dryRunResult}
+          previewContract={previewContract}
+          onPreviewContractChange={rememberContract}
           deploying={deploying}
           deployNetwork={deployNetwork}
           nodeUrl={nodeUrl}

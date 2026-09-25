@@ -2026,6 +2026,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     }
 
     notify_wallet_activity(&my_addr, block, &confirmed_txs);
+    crate::contract_exec::wake();
     true
 }
 
@@ -3094,6 +3095,12 @@ pub struct StateSnapshot {
     /// a fast-synced node trusts the snapshot state and only keeps recent blocks.
     #[serde(default)]
     pub blocks:     Vec<LedgerBlock>,
+    #[serde(default)]
+    pub contract_height: Option<u64>,
+    #[serde(default)]
+    pub contracts:  Vec<(String, String)>,
+    #[serde(default)]
+    pub contract_txs: Vec<(u64, LedgerTx)>,
 }
 
 /// How many recent block headers to ship in a snapshot.
@@ -3128,7 +3135,11 @@ pub fn export_state_snapshot() -> StateSnapshot {
         let cf_blocks = db.cf_handle(CF_BLOCKS).unwrap();
         (from..=height).filter_map(|h| db.get_cf(cf_blocks, height_key(h)).ok().flatten().and_then(|v| decode::<LedgerBlock>(&v))).collect()
     };
-    StateSnapshot { height, tip_hash, state_root, balances: dump(CF_BALANCES), meta: dump(CF_META), blocks }
+    let (contract_height, contracts, contract_txs) = crate::contract_exec::export_for_snapshot(height);
+    StateSnapshot {
+        height, tip_hash, state_root, balances: dump(CF_BALANCES), meta: dump(CF_META), blocks,
+        contract_height, contracts, contract_txs,
+    }
 }
 
 /// Install a trusted checkpoint snapshot. Writes the balances + meta verbatim (which
@@ -3136,6 +3147,7 @@ pub fn export_state_snapshot() -> StateSnapshot {
 /// Callers MUST first write the recent block window (so the tip block exists in
 /// CF_BLOCKS) before relying on the new tip.
 pub fn import_state_snapshot(snap: &StateSnapshot) -> Result<(), String> {
+    let _contracts_paused = crate::contract_exec::exclusive();
     {
         let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
         let mut batch = rocksdb::WriteBatch::default();
@@ -3158,6 +3170,9 @@ pub fn import_state_snapshot(snap: &StateSnapshot) -> Result<(), String> {
         if let Some(cf) = db.cf_handle(CF_META) {
             for (k, v) in &snap.meta {
                 let kb = hex::decode(k).map_err(|e| format!("bad meta key: {e}"))?;
+                if kb == crate::contract_exec::WATERMARK_KEY {
+                    continue;
+                }
                 let vb = hex::decode(v).map_err(|e| format!("bad meta val: {e}"))?;
                 batch.put_cf(cf, &kb, &vb);
             }
@@ -3176,6 +3191,7 @@ pub fn import_state_snapshot(snap: &StateSnapshot) -> Result<(), String> {
         db.write(batch).map_err(|e| format!("snapshot write: {e}"))?;
     }
     restore_in_memory_state_from_db();
+    crate::contract_exec::install_from_snapshot(snap);
     tracing::info!("[FastSync] Installed state snapshot at height {} ({} balances, {} meta)", snap.height, snap.balances.len(), snap.meta.len());
     Ok(())
 }
@@ -4616,7 +4632,7 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
                             affected_senders.insert(tx.from.clone());
                         }
                         removed_hashes.insert(tx.hash.clone());
-                        if tx.tx_type == "transfer" || tx.tx_type == "stake" || tx.tx_type == "unstake" {
+                        if matches!(tx.tx_type.as_str(), "transfer" | "stake" | "unstake" | "deploy" | "call") {
                     tx.status = "Pending".to_string();
                     tx.block_height = None;
                             orphaned.push(tx);
@@ -4674,6 +4690,7 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
     tracing::warn!("Reorg: truncated heights {}..={} (new tip: {}, removed {} txs, {} orphaned user txs)",
         height, tip, new_tip, removed_txs, orphaned.len());
     crate::shielded_chain::repair_pool_state_after_reorg(height);
+    crate::contract_exec::wake();
     orphaned
 }
 
@@ -7117,17 +7134,113 @@ pub fn list_cluster_bookings() -> Vec<ClusterBooking> {
 
 // ── Contract State (RocksDB mirror of ego-vm filesystem state) ────────────────
 
-pub fn save_contract_state(addr: &str, state_json: &str) {
-    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let cf = match db.cf_handle(CF_CONTRACT_STATE) { Some(c) => c, None => return };
-    let _ = db.put_cf(&cf, addr.as_bytes(), state_json.as_bytes());
+pub struct ContractDb;
+
+impl crate::contract_exec::Kv for ContractDb {
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let cf = db.cf_handle(CF_CONTRACT_STATE)?;
+        db.get_cf(cf, key).ok().flatten()
+    }
 }
 
-pub fn load_contract_state(addr: &str) -> Option<String> {
+pub fn contract_exec_height() -> Option<u64> {
+    get_meta_u64(crate::contract_exec::WATERMARK_KEY)
+}
+
+pub fn set_contract_exec_height(height: u64) {
+    set_meta_u64(crate::contract_exec::WATERMARK_KEY, height);
+}
+
+pub fn commit_contract_block(
+    height: u64,
+    writes: &std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    undo: &[u8],
+    forget_undo_at: Option<u64>,
+) -> Result<(), String> {
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
-    let cf = db.cf_handle(CF_CONTRACT_STATE)?;
-    db.get_cf(&cf, addr.as_bytes()).ok().flatten()
-        .and_then(|v| String::from_utf8(v.to_vec()).ok())
+    let cf = db.cf_handle(CF_CONTRACT_STATE).ok_or("contract state column is missing")?;
+    let cf_meta = db.cf_handle(CF_META).ok_or("meta column is missing")?;
+    let mut batch = WriteBatch::default();
+    for (k, v) in writes {
+        match v {
+            Some(v) => batch.put_cf(cf, k, v),
+            None => batch.delete_cf(cf, k),
+        }
+    }
+    batch.put_cf(cf, crate::contract_exec::undo_key(height), undo);
+    if let Some(old) = forget_undo_at {
+        batch.delete_cf(cf, crate::contract_exec::undo_key(old));
+    }
+    batch.put_cf(cf_meta, crate::contract_exec::WATERMARK_KEY, u64_le(height));
+    db.write(batch).map_err(|e| e.to_string())
+}
+
+pub fn unwind_contract_block(height: u64, prev: &[(Vec<u8>, Option<Vec<u8>>)]) -> Result<(), String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_CONTRACT_STATE).ok_or("contract state column is missing")?;
+    let cf_meta = db.cf_handle(CF_META).ok_or("meta column is missing")?;
+    let mut batch = WriteBatch::default();
+    for (k, v) in prev {
+        match v {
+            Some(v) => batch.put_cf(cf, k, v),
+            None => batch.delete_cf(cf, k),
+        }
+    }
+    batch.delete_cf(cf, crate::contract_exec::undo_key(height));
+    batch.put_cf(cf_meta, crate::contract_exec::WATERMARK_KEY, u64_le(height.saturating_sub(1)));
+    db.write(batch).map_err(|e| e.to_string())
+}
+
+pub fn contract_scan(prefix: &[u8], limit: usize, newest_first: bool) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf) = db.cf_handle(CF_CONTRACT_STATE) else { return vec![] };
+    let mut seek = prefix.to_vec();
+    let mode = if newest_first {
+        seek.extend_from_slice(&[0xFF; 9]);
+        rocksdb::IteratorMode::From(&seek, rocksdb::Direction::Reverse)
+    } else {
+        rocksdb::IteratorMode::From(&seek, rocksdb::Direction::Forward)
+    };
+    let mut out = Vec::new();
+    for item in db.iterator_cf(cf, mode) {
+        let Ok((k, v)) = item else { break };
+        if !k.starts_with(prefix) { break; }
+        out.push((k.to_vec(), v.to_vec()));
+        if out.len() >= limit { break; }
+    }
+    out
+}
+
+pub fn replace_contract_entries(entries: &[(Vec<u8>, Vec<u8>)], height: u64) -> Result<(), String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_CONTRACT_STATE).ok_or("contract state column is missing")?;
+    let cf_meta = db.cf_handle(CF_META).ok_or("meta column is missing")?;
+    let mut batch = WriteBatch::default();
+    batch.delete_range_cf(cf, [0u8].as_slice(), [0xFFu8; 16].as_slice());
+    for (k, v) in entries {
+        batch.put_cf(cf, k, v);
+    }
+    batch.put_cf(cf_meta, crate::contract_exec::WATERMARK_KEY, u64_le(height));
+    db.write(batch).map_err(|e| e.to_string())
+}
+
+pub fn purge_legacy_contract_entries() -> usize {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf) = db.cf_handle(CF_CONTRACT_STATE) else { return 0 };
+    let mut batch = WriteBatch::default();
+    let mut n = 0;
+    for item in db.iterator_cf(cf, rocksdb::IteratorMode::Start) {
+        let Ok((k, _)) = item else { break };
+        if k.get(1) != Some(&b':') {
+            batch.delete_cf(cf, &k);
+            n += 1;
+        }
+    }
+    if n > 0 {
+        let _ = db.write(batch);
+    }
+    n
 }
 
 pub fn apply_balance_delta(addr: &str, delta: i64) {

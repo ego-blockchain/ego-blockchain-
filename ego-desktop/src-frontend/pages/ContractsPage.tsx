@@ -16,6 +16,7 @@ interface DeployResult {
   contract_address: string;
   code_hash:        string;
   ru_used:          number;
+  tx_hash?:         string;
 }
 
 interface CallResult {
@@ -24,15 +25,48 @@ interface CallResult {
   ru_used:    number;
   events:     { contract: string; topic: string; payload: number[]; height: number; timestamp: number }[];
   error:      string | null;
+  tx_hash?:   string;
 }
 
-interface StoredEvent {
-  topic:        string;
-  payload_hex:  string;
-  timestamp:    number;
-  block_height: number;
-  entrypoint:   string;
+interface ActivityEntry {
+  seq:            number;
+  height:         number;
+  timestamp:      number;
+  tx_hash:        string;
+  from:           string;
+  kind:           string;
+  entrypoint:     string;
+  args_hex:       string;
+  args_truncated: boolean;
+  ok:             boolean;
+  error:          string | null;
+  ru_used:        number;
+  events:         { topic: string; payload_hex: string }[];
 }
+
+type ArgMode = 'text' | 'numbers' | 'hex';
+
+function encodeArgs(raw: string, mode: ArgMode): string {
+  const s = raw.trim();
+  if (!s) return '';
+  if (mode === 'hex') return s.replace(/^0x/i, '');
+  if (mode === 'text') return textToHex(raw);
+  return s.split(/[\s,]+/).map(p => {
+    let n = BigInt(p);
+    const bytes: string[] = [];
+    for (let i = 0; i < 8; i++) { bytes.push(Number(n & 0xffn).toString(16).padStart(2, '0')); n >>= 8n; }
+    return bytes.join('');
+  }).join('');
+}
+
+function readU64(bytes: number[]): string {
+  if (bytes.length !== 8) return hexToDisplay(bytesToHex(bytes));
+  let n = 0n;
+  for (let i = 7; i >= 0; i--) n = (n << 8n) | BigInt(bytes[i]);
+  return n.toString();
+}
+
+const ADDR_PLACEHOLDER = '40-character contract address';
 
 function fmtDate(ts: number): string {
   return new Date(ts * 1000).toLocaleDateString(undefined, {
@@ -131,7 +165,11 @@ const DeployTab: React.FC<{ onDeployed: () => void }> = ({ onDeployed }) => {
     return (
       <div className="space-y-4 max-w-lg">
         <div className="bg-green-500/10 border border-green-500/30 rounded-2xl p-6 space-y-3">
-          <div className="text-lg font-bold text-green-400">Contract Deployed</div>
+          <div className="text-lg font-bold text-green-400">Deploy sent</div>
+          <p className="text-xs text-gray-300">
+            Every node runs this contract's init() once its block is final, usually within a minute.
+            It then shows up under Contracts on every machine, not just this one.
+          </p>
           <div className="space-y-2 text-sm">
             <div>
               <span className="text-gray-400">Contract address</span>
@@ -149,6 +187,12 @@ const DeployTab: React.FC<{ onDeployed: () => void }> = ({ onDeployed }) => {
                 <div className="text-yellow-400 font-mono text-xs mt-0.5">{result.ru_used.toLocaleString()}</div>
               </div>
             </div>
+            {result.tx_hash && (
+              <div>
+                <span className="text-gray-400">Transaction</span>
+                <div className="font-mono text-xs text-gray-300 mt-0.5 break-all">{result.tx_hash}</div>
+              </div>
+            )}
           </div>
         </div>
         <button
@@ -225,7 +269,7 @@ const DeployTab: React.FC<{ onDeployed: () => void }> = ({ onDeployed }) => {
       </button>
 
       <p className="text-xs text-gray-500">
-        Deployment broadcasts a Deploy TX to all network peers. The contract state persists locally and is replicated when peers sync blocks.
+        Deploying runs init() here first as a free preview. If it succeeds, a deploy transaction goes to the network and every node creates the contract when the block is final.
       </p>
     </div>
   );
@@ -242,31 +286,35 @@ const InteractTab: React.FC<{ contracts: ContractInfo[]; initialAddr?: string }>
   const [addr,       setAddr]       = useState(initialAddr ?? '');
   const [entrypoint, setEntrypoint] = useState('');
   const [callArgs,   setCallArgs]   = useState('');
-  const [rawHex,     setRawHex]     = useState(false);
-  const [busy,       setBusy]       = useState(false);
+  const [argMode,    setArgMode]    = useState<ArgMode>('text');
+  const [busy,       setBusy]       = useState<'' | 'read' | 'send'>('');
   const [result,     setResult]     = useState<CallResult | null>(null);
+  const [sent,       setSent]       = useState(false);
   const [error,      setError]      = useState('');
 
   const selectedAbi = contracts.find(c => c.address === addr)?.abi ?? [];
 
   const callableFns = selectedAbi.filter(s => !s.startsWith('init'));
 
-  async function handleCall() {
+  async function run(kind: 'read' | 'send') {
     if (!addr)       { setError('Enter a contract address.'); return; }
     if (!entrypoint) { setError('Enter an entrypoint function name.'); return; }
-    setBusy(true);
+    let argsHex = '';
+    try { argsHex = encodeArgs(callArgs, argMode); }
+    catch { setError('Numbers mode takes whole numbers separated by spaces.'); return; }
+    setBusy(kind);
     setError('');
     setResult(null);
     try {
-      const argsHex = rawHex ? callArgs : (callArgs ? textToHex(callArgs) : '');
-      const res = await invoke<CallResult>('call_contract', {
+      const res = await invoke<CallResult>(kind === 'read' ? 'query_contract' : 'call_contract', {
         args: { contract_addr: addr, entrypoint, args_hex: argsHex },
       });
       setResult(res);
+      setSent(kind === 'send');
     } catch (e: any) {
       setError(String(e));
     } finally {
-      setBusy(false);
+      setBusy('');
     }
   }
 
@@ -303,7 +351,7 @@ const InteractTab: React.FC<{ contracts: ContractInfo[]; initialAddr?: string }>
           type="text"
           value={addr}
           onChange={e => setAddr(e.target.value.trim())}
-          placeholder="egot1…"
+          placeholder={ADDR_PLACEHOLDER}
           className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none font-mono transition"
         />
         {}
@@ -368,22 +416,35 @@ const InteractTab: React.FC<{ contracts: ContractInfo[]; initialAddr?: string }>
       <div>
         <div className="flex items-center justify-between mb-1.5">
           <label className="text-xs text-gray-400">Arguments (optional)</label>
-          <button
-            onClick={() => setRawHex(r => !r)}
-            className="text-xs text-blue-400 hover:text-blue-300"
-          >
-            {rawHex ? 'Switch to text' : 'Switch to hex'}
-          </button>
+          <div className="flex gap-1">
+            {(['text', 'numbers', 'hex'] as ArgMode[]).map(m => (
+              <button
+                key={m}
+                onClick={() => setArgMode(m)}
+                className={`text-xs px-2 py-0.5 rounded-md cursor-pointer transition ${
+                  argMode === m ? 'bg-blue-600 text-white' : 'text-blue-400 hover:text-blue-300'
+                }`}
+              >
+                {m === 'text' ? 'Text' : m === 'numbers' ? 'Numbers' : 'Hex'}
+              </button>
+            ))}
+          </div>
         </div>
         <input
           type="text"
           value={callArgs}
           onChange={e => setCallArgs(e.target.value)}
-          placeholder={rawHex ? 'hex-encoded ABI arguments' : 'plain text (auto-encoded to hex)'}
+          placeholder={
+            argMode === 'hex' ? 'hex-encoded arguments'
+              : argMode === 'numbers' ? 'whole numbers, e.g. 1000 or 5 20'
+              : 'plain text, e.g. a guestbook message'
+          }
           className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none font-mono transition"
         />
-        {!rawHex && callArgs && (
-          <div className="text-xs text-gray-500 mt-1 font-mono">hex: {textToHex(callArgs)}</div>
+        {argMode !== 'hex' && callArgs && (
+          <div className="text-xs text-gray-500 mt-1 font-mono break-all">
+            hex: {(() => { try { return encodeArgs(callArgs, argMode); } catch { return 'not a number'; } })()}
+          </div>
         )}
       </div>
 
@@ -393,13 +454,27 @@ const InteractTab: React.FC<{ contracts: ContractInfo[]; initialAddr?: string }>
         </div>
       )}
 
-      <button
-        onClick={handleCall}
-        disabled={!addr || !entrypoint || busy}
-        className="w-full bg-purple-600 hover:bg-purple-500 disabled:opacity-40 py-3 rounded-xl font-semibold transition"
-      >
-        {busy ? '⏳ Calling…' : '⚡ Call Contract'}
-      </button>
+      <div className="grid grid-cols-2 gap-3">
+        <button
+          onClick={() => run('read')}
+          disabled={!addr || !entrypoint || busy !== ''}
+          className="bg-gray-700 hover:bg-gray-600 disabled:opacity-40 py-3 rounded-xl font-semibold transition cursor-pointer"
+          title="Runs the function on this node only. Free, changes nothing."
+        >
+          {busy === 'read' ? 'Reading…' : 'Read (free)'}
+        </button>
+        <button
+          onClick={() => run('send')}
+          disabled={!addr || !entrypoint || busy !== ''}
+          className="bg-purple-600 hover:bg-purple-500 disabled:opacity-40 py-3 rounded-xl font-semibold transition cursor-pointer"
+          title="Sends a transaction. Every node applies it once its block is final."
+        >
+          {busy === 'send' ? 'Sending…' : 'Send transaction'}
+        </button>
+      </div>
+      <p className="text-xs text-gray-500">
+        Read runs the function here and changes nothing. Send signs a transaction (fee 0.6 EGOC) that every node applies once its block is final.
+      </p>
 
       {}
       {result && (
@@ -409,8 +484,13 @@ const InteractTab: React.FC<{ contracts: ContractInfo[]; initialAddr?: string }>
             : 'bg-red-500/10 border-red-500/30'
         }`}>
           <div className={`font-bold text-base ${result.success ? 'text-green-400' : 'text-red-400'}`}>
-            {result.success ? '✅ Call succeeded' : '❌ Call failed'}
+            {!result.success ? 'Call failed' : sent ? 'Sent' : 'Read succeeded'}
           </div>
+          {sent && result.success && (
+            <div className="text-xs text-gray-300">
+              The preview below ran on this node. The real change happens on every node once the block is final; check Activity to see it land.
+            </div>
+          )}
           {result.error && (
             <div className="text-red-300 text-xs">{result.error}</div>
           )}
@@ -419,7 +499,7 @@ const InteractTab: React.FC<{ contracts: ContractInfo[]; initialAddr?: string }>
               <div className="text-xs text-gray-400">Return value</div>
               <div className="font-mono text-xs text-white mt-0.5 break-all">
                 {(result.return_val?.length ?? 0) > 0
-                  ? hexToDisplay(bytesToHex(result.return_val))
+                  ? readU64(result.return_val)
                   : '(empty)'}
               </div>
             </div>
@@ -485,7 +565,7 @@ const StateTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => {
           type="text"
           value={addr}
           onChange={e => setAddr(e.target.value.trim())}
-          placeholder="egot1…"
+          placeholder={ADDR_PLACEHOLDER}
           className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none font-mono transition"
         />
         {contracts.length > 0 && (
@@ -561,28 +641,34 @@ const StateTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => {
   );
 };
 
-const EventsTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => {
-  const [addr,   setAddr]   = useState('');
-  const [events, setEvents] = useState<StoredEvent[]>([]);
-  const [busy,   setBusy]   = useState(false);
+const ActivityTab: React.FC<{ contracts: ContractInfo[]; initialAddr?: string }> = ({ contracts, initialAddr }) => {
+  const [addr,    setAddr]    = useState(initialAddr ?? '');
+  const [entries, setEntries] = useState<ActivityEntry[]>([]);
+  const [loaded,  setLoaded]  = useState(false);
+  const [error,   setError]   = useState('');
 
-  const loadEvents = useCallback(async (a: string) => {
+  const load = useCallback(async (a: string) => {
     if (!a) return;
-    setBusy(true);
     try {
-      const res = await invoke<StoredEvent[]>('get_contract_events', {
-        contractAddr: a,
-        limit: 50,
-      });
-      setEvents(res);
-    } catch {
-      setEvents([]);
+      const res = await invoke<ActivityEntry[]>('get_contract_activity', { contractAddr: a, limit: 100 });
+      setEntries(res);
+      setError('');
+    } catch (e: any) {
+      setEntries([]);
+      setError(String(e));
     } finally {
-      setBusy(false);
+      setLoaded(true);
     }
   }, []);
 
-  useEffect(() => { loadEvents(addr); }, [addr, loadEvents]);
+  useEffect(() => {
+    setLoaded(false);
+    setEntries([]);
+    if (!addr) return;
+    load(addr);
+    const t = setInterval(() => load(addr), 8000);
+    return () => clearInterval(t);
+  }, [addr, load]);
 
   return (
     <div className="space-y-5 max-w-lg">
@@ -592,7 +678,7 @@ const EventsTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => {
           type="text"
           value={addr}
           onChange={e => setAddr(e.target.value.trim())}
-          placeholder="egot1… or hex address"
+          placeholder={ADDR_PLACEHOLDER}
           className="w-full bg-gray-900 border border-gray-700 focus:border-blue-500 rounded-xl px-4 py-3 text-sm outline-none font-mono transition"
         />
         {contracts.length > 0 && (
@@ -601,7 +687,7 @@ const EventsTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => {
               <button
                 key={c.address}
                 onClick={() => setAddr(c.address)}
-                className={`text-xs px-2.5 py-1 rounded-lg transition ${
+                className={`text-xs px-2.5 py-1 rounded-lg transition cursor-pointer ${
                   addr === c.address
                     ? 'bg-blue-600 text-white'
                     : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
@@ -614,38 +700,57 @@ const EventsTab: React.FC<{ contracts: ContractInfo[] }> = ({ contracts }) => {
         )}
       </div>
 
+      {error && (
+        <div className="bg-red-500/10 border border-red-500/30 rounded-xl px-4 py-3 text-sm text-red-400">{error}</div>
+      )}
+
       {!addr ? (
         <div className="text-center py-10 text-gray-500">
           <div className="text-4xl mb-3">📋</div>
-          <div className="text-sm">Select a contract to view its event log</div>
+          <div className="text-sm">Pick a contract to see every transaction the network ran on it</div>
         </div>
-      ) : busy ? (
-        <div className="text-center py-8 text-gray-500 animate-pulse text-sm">Loading events…</div>
-      ) : events.length === 0 ? (
+      ) : !loaded ? (
+        <div className="text-center py-8 text-gray-500 animate-pulse text-sm">Loading activity…</div>
+      ) : entries.length === 0 ? (
         <div className="text-center py-10 text-gray-500">
           <div className="text-3xl mb-2">🔇</div>
-          <div className="text-sm">No events recorded yet</div>
-          <div className="text-xs mt-1">Events are captured when you call contract functions</div>
+          <div className="text-sm">Nothing has run on this contract yet</div>
+          <div className="text-xs mt-1">Transactions appear here once their block is final. This refreshes on its own.</div>
         </div>
       ) : (
         <div className="space-y-2">
-          <div className="text-xs text-gray-500 font-medium">{events.length} event{events.length !== 1 ? 's' : ''} (newest first)</div>
-          {events.map((ev, i) => (
-            <div key={i} className="bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-xs">
-              <div className="flex items-center justify-between mb-1.5">
-                <span className="text-blue-400 font-mono font-semibold">{ev.topic}</span>
-                <span className="text-gray-500">{new Date(ev.timestamp * 1000).toLocaleTimeString()}</span>
+          <div className="text-xs text-gray-500 font-medium">
+            {entries.length} transaction{entries.length !== 1 ? 's' : ''} (newest first), the same on every node
+          </div>
+          {entries.map(a => (
+            <div
+              key={a.seq}
+              className={`bg-gray-800 border rounded-xl px-4 py-3 text-xs ${a.ok ? 'border-gray-700' : 'border-red-500/30'}`}
+            >
+              <div className="flex items-center justify-between mb-1.5 gap-2">
+                <span className="font-mono font-semibold text-purple-400">
+                  {a.kind === 'deploy' ? 'deployed · init()' : `${a.entrypoint}()`}
+                </span>
+                <span className="text-gray-500 shrink-0">
+                  block {a.height.toLocaleString()} · {new Date(a.timestamp * 1000).toLocaleString()}
+                </span>
               </div>
-              <div className="text-gray-400 mb-1">
-                via <span className="text-purple-400 font-mono">{ev.entrypoint}()</span>
-                {' · '}block <span className="text-gray-300">{ev.block_height}</span>
-              </div>
-              {ev.payload_hex && (
-                <div className="font-mono text-gray-300 break-all bg-gray-900/60 rounded-lg px-2 py-1 mt-1">
-                  {hexToDisplay(ev.payload_hex)}
-                  {hexToDisplay(ev.payload_hex) !== ev.payload_hex && (
-                    <span className="text-gray-600 ml-2">(hex: {ev.payload_hex})</span>
-                  )}
+              <div className="text-gray-400 font-mono truncate" title={a.from}>from {a.from}</div>
+              {a.args_hex && a.kind === 'call' && (
+                <div className="font-mono text-gray-200 break-all bg-gray-900/60 rounded-lg px-2 py-1 mt-1.5">
+                  {hexToDisplay(a.args_hex)}{a.args_truncated ? '…' : ''}
+                </div>
+              )}
+              {!a.ok && a.error && (
+                <div className="text-red-300 mt-1.5">Refused: {a.error}</div>
+              )}
+              {a.events.length > 0 && (
+                <div className="mt-1.5 flex flex-wrap gap-1.5">
+                  {a.events.map((ev, i) => (
+                    <span key={i} className="font-mono bg-blue-500/10 text-blue-300 rounded-md px-1.5 py-0.5">
+                      {ev.topic}{ev.payload_hex ? ` ${readU64((ev.payload_hex.match(/.{1,2}/g) ?? []).map(b => parseInt(b, 16)))}` : ''}
+                    </span>
+                  ))}
                 </div>
               )}
             </div>
@@ -975,7 +1080,7 @@ const RollupBar: React.FC = () => {
   );
 };
 
-type Tab = 'contracts' | 'deploy' | 'interact' | 'state' | 'events';
+type Tab = 'contracts' | 'deploy' | 'interact' | 'state' | 'activity';
 
 const ContractsPage: React.FC = () => {
   const { wallet }                     = useWallet();
@@ -986,7 +1091,6 @@ const ContractsPage: React.FC = () => {
   const [loadingList, setLoadingList]  = useState(true);
 
   const loadContracts = useCallback(async () => {
-    setLoadingList(true);
     try {
       const list = await invoke<ContractInfo[]>('list_deployed_contracts');
       setContracts(list);
@@ -994,14 +1098,18 @@ const ContractsPage: React.FC = () => {
     finally { setLoadingList(false); }
   }, []);
 
-  useEffect(() => { loadContracts(); }, [loadContracts, wallet?.address]);
+  useEffect(() => {
+    loadContracts();
+    const t = setInterval(loadContracts, 15000);
+    return () => clearInterval(t);
+  }, [loadContracts, wallet?.address]);
 
   const TABS: { id: Tab; label: string; icon: string }[] = [
     { id: 'contracts', label: 'Contracts',  icon: '📜' },
     { id: 'deploy',    label: 'Deploy',     icon: '🚀' },
     { id: 'interact',  label: 'Interact',   icon: '⚡' },
     { id: 'state',     label: 'Read State', icon: '🔎' },
-    { id: 'events',    label: 'Events',     icon: '📋' },
+    { id: 'activity',  label: 'Activity',   icon: '📋' },
   ];
 
   return (
@@ -1041,7 +1149,7 @@ const ContractsPage: React.FC = () => {
         <ContractsList contracts={contracts} loading={loadingList} />
       )}
       {tab === 'deploy' && (
-        <DeployTab onDeployed={() => { loadContracts(); setTab('contracts'); }} />
+        <DeployTab onDeployed={() => { setTimeout(loadContracts, 20000); }} />
       )}
       {tab === 'interact' && (
         <InteractTab contracts={contracts} initialAddr={fromIDE?.address} />
@@ -1049,8 +1157,8 @@ const ContractsPage: React.FC = () => {
       {tab === 'state' && (
         <StateTab contracts={contracts} />
       )}
-      {tab === 'events' && (
-        <EventsTab contracts={contracts} />
+      {tab === 'activity' && (
+        <ActivityTab contracts={contracts} initialAddr={fromIDE?.address} />
       )}
     </div>
   );

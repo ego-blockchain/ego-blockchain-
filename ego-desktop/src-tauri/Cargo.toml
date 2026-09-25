@@ -143,6 +143,7 @@ opt-level = 3
 # Prevent src-tauri from joining the parent ego-blockchain workspace.
 [dev-dependencies]
 tempfile = "3"
+wat = "1.219"
 
 # Patched wry 0.24.11 — adds the missing `use webkit2gtk::SettingsExt;` so the
 # Linux (webkit2gtk) webview backend compiles. Without this the GUI/webview layer

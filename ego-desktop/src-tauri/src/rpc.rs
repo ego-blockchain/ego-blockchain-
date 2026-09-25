@@ -499,34 +499,50 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
             let addr   = p["contractAddr"].as_str().unwrap_or_default();
             let prefix = p["prefix"].as_str().unwrap_or_default();
             let key    = p["key"].as_str().unwrap_or_default();
-            let exec   = ego_vm::Executor::new(crate::ledger::contracts_dir());
-            let val    = exec.ok().and_then(|e| {
-                let state = e.store.load_state(addr);
-                state.get(prefix, key).map(hex::encode)
-            });
+            let val    = crate::contract_exec::state(addr)
+                .and_then(|state| state.get(prefix, key).map(hex::encode));
             RpcResponse::ok(req.id, json!({ "value": val }))
         }
 
         "contract.listDeployed" => {
-            let contracts_path = crate::ledger::contracts_dir().join("contracts");
-            let mut out = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(&contracts_path) {
-                for entry in entries.flatten() {
-                    let addr = entry.file_name().to_string_lossy().to_string();
-                    if let Ok(exec) = ego_vm::Executor::new(crate::ledger::contracts_dir()) {
-                        if let Some(m) = exec.store.load_manifest(&addr) {
-                            out.push(json!({
-                                "address":    addr,
-                                "name":       m.name,
-                                "deployer":   m.deployer,
-                                "deployedAt": m.deployed_at,
-                                "codeHash":   m.code_hash,
-                            }));
-                        }
-                    }
-                }
-            }
+            let out: Vec<_> = crate::contract_exec::list(500)
+                .into_iter()
+                .map(|(addr, m)| json!({
+                    "address":    addr,
+                    "name":       m.name,
+                    "deployer":   m.deployer,
+                    "deployedAt": m.deployed_at,
+                    "codeHash":   m.code_hash,
+                }))
+                .collect();
             RpcResponse::ok(req.id, json!(out))
+        }
+
+        "contract.getActivity" => {
+            let addr  = p["contractAddr"].as_str().unwrap_or_default();
+            let limit = p["limit"].as_u64().unwrap_or(100).clamp(1, 1_000) as usize;
+            RpcResponse::ok(req.id, json!(crate::contract_exec::activity(addr, limit)))
+        }
+
+        "contract.query" => {
+            let addr       = p["contractAddr"].as_str().unwrap_or_default().to_string();
+            let entrypoint = p["entrypoint"].as_str().unwrap_or_default().to_string();
+            let caller     = p["caller"].as_str().unwrap_or_default().to_string();
+            let Ok(args) = hex::decode(p["argsHex"].as_str().unwrap_or_default()) else {
+                return RpcResponse::err(req.id, -32602, "argsHex must be hex");
+            };
+            let run = tokio::task::block_in_place(|| {
+                crate::contract_exec::preview_call(&addr, &caller, &entrypoint, &args)
+            });
+            match run {
+                Ok(fx) => RpcResponse::ok(req.id, json!({
+                    "success":   fx.result.success,
+                    "returnHex": hex::encode(&fx.result.return_val),
+                    "error":     fx.result.error,
+                    "ruUsed":    fx.result.ru_used,
+                })),
+                Err(e) => RpcResponse::err(req.id, -32000, &e.to_string()),
+            }
         }
 
         "p2p.getPeers" => {
@@ -609,11 +625,8 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
             if to.is_empty() {
                 return RpcResponse::err(req.id, -32602, "Missing 'to' field");
             }
-            let exec = ego_vm::Executor::new(crate::ledger::contracts_dir());
-            let val  = exec.ok().and_then(|e| {
-                let state = e.store.load_state(to);
-                state.get(prefix, "value").map(hex::encode)
-            });
+            let val  = crate::contract_exec::state(to)
+                .and_then(|state| state.get(prefix, "value").map(hex::encode));
             RpcResponse::ok(req.id, json!(val.unwrap_or_else(|| "0x".into())))
         }
 
@@ -709,10 +722,7 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
             if addr.starts_with("egot1") || addr.is_empty() {
                 return RpcResponse::ok(req.id, json!("0x"));
             }
-            let exec = ego_vm::Executor::new(crate::ledger::contracts_dir());
-            let has_code = exec.ok()
-                .and_then(|e| e.store.load_manifest(addr))
-                .is_some();
+            let has_code = crate::contract_exec::manifest(addr).is_some();
             RpcResponse::ok(req.id, json!(if has_code { "0x01" } else { "0x" }))
         }
 

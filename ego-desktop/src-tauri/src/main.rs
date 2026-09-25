@@ -22,6 +22,7 @@ mod block_heal;
 mod blocks;
 mod ecvrf;
 mod chain_db;
+mod contract_exec;
 mod commands;
 mod config;
 mod consensus_host;
@@ -486,6 +487,8 @@ fn headless_main() {
         tokio::spawn(async {
             crate::p2p::run_sync_status_watcher().await;
         });
+
+        crate::contract_exec::start();
 
         tokio::spawn(async {
             crate::p2p::run_power_event_loop().await;
@@ -1058,9 +1061,13 @@ fn main() {
             commands::consensus::get_tokenomics,
             commands::contracts::compile_urego,
             commands::contracts::deploy_contract,
+            commands::contracts::preview_contract_deploy,
             commands::contracts::call_contract,
+            commands::contracts::query_contract,
             commands::contracts::get_contract_state,
+            commands::contracts::get_contract,
             commands::contracts::list_deployed_contracts,
+            commands::contracts::get_contract_activity,
             commands::contracts::get_contract_events,
             commands::rollup::get_rollup_status,
             commands::rollup::get_shard_stats,
@@ -1611,6 +1618,8 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 crate::p2p::run_sync_status_watcher().await;
             });
+
+            crate::contract_exec::start();
 
             tauri::async_runtime::spawn(async move {
                 crate::p2p::run_power_event_loop().await;
