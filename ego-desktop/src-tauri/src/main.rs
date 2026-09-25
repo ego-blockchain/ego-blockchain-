@@ -110,6 +110,53 @@ fn register_windows_notifications() {
     }
 }
 
+/// Let Windows close the app when it needs to.
+///
+/// Installers close running programs through the Restart Manager, which asks each top
+/// level window whether the session may end and then tells it that it is ending. The
+/// only close path this app had hides the window to the tray, so the request was
+/// ignored: the installer gave up with "unable to automatically close all requested
+/// applications", and Windows shutdown and sign-out were held up the same way. The main
+/// window now agrees to the question and exits cleanly when told the session is ending.
+#[cfg(target_os = "windows")]
+mod session_end {
+    const WM_QUERYENDSESSION: u32 = 0x0011;
+    const WM_ENDSESSION: u32 = 0x0016;
+    const SUBCLASS_ID: usize = 0x4547_4F31;
+
+    type SubclassProc = unsafe extern "system" fn(isize, u32, usize, isize, usize, usize) -> isize;
+
+    #[link(name = "comctl32")]
+    extern "system" {
+        fn SetWindowSubclass(hwnd: isize, proc_: SubclassProc, id: usize, data: usize) -> i32;
+        fn DefSubclassProc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+    }
+
+    unsafe extern "system" fn on_message(
+        hwnd: isize, msg: u32, wparam: usize, lparam: isize, _id: usize, _data: usize,
+    ) -> isize {
+        match msg {
+            WM_QUERYENDSESSION => 1,
+            WM_ENDSESSION if wparam != 0 => {
+                eprintln!("[Shutdown] Windows asked the app to close (installer or sign-out) — exiting");
+                crate::python_host::stop_all();
+                extern "system" { fn SetThreadExecutionState(es_flags: u32) -> u32; }
+                SetThreadExecutionState(0x8000_0000);
+                std::process::exit(0);
+            }
+            _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    /// Must run on the thread that owns the window.
+    pub fn install(hwnd: isize) {
+        let ok = unsafe { SetWindowSubclass(hwnd, on_message, SUBCLASS_ID, 0) };
+        if ok == 0 {
+            eprintln!("[Shutdown] could not listen for session end; installers may not be able to close the app");
+        }
+    }
+}
+
 static INSTANCE_LOCK: once_cell::sync::OnceCell<std::net::TcpListener> =
     once_cell::sync::OnceCell::new();
 
@@ -1268,6 +1315,11 @@ fn main() {
                         std::mem::size_of::<DWORD>() as DWORD,
                     );
                 }
+            }
+
+            #[cfg(target_os = "windows")]
+            if let Ok(hwnd) = window.hwnd() {
+                session_end::install(hwnd.0);
             }
 
             let start_hidden = crate::autostart::launched_hidden();
