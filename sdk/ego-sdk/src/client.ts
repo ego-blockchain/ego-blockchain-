@@ -1,5 +1,7 @@
 import type {
   BalanceResult,
+  ContractActivity,
+  ContractQueryResult,
   DeployedContract,
   BlockSummary,
   EgoClientOptions,
@@ -10,7 +12,7 @@ import type {
   TxSubmitResult,
 } from "./types";
 
-const DEFAULT_RPC_URL = "http://localhost:8545";
+const DEFAULT_RPC_URL = "http://localhost:47395";
 const DEFAULT_TIMEOUT  = 10_000;
 
 export class EgoClient {
@@ -113,10 +115,23 @@ export class EgoClient {
     return this.rpc<DeployedContract[]>("contract.listDeployed", {});
   }
 
+  async getContractActivity(contractAddr: string, limit = 100): Promise<ContractActivity[]> {
+    return this.rpc<ContractActivity[]>("contract.getActivity", { contractAddr, limit });
+  }
+
+  async queryContract(
+    contractAddr: string,
+    entrypoint: string,
+    argsHex = "",
+    caller = "",
+  ): Promise<ContractQueryResult> {
+    return this.rpc<ContractQueryResult>("contract.query", { contractAddr, entrypoint, argsHex, caller });
+  }
+
   /** Confirmed nonce for an address, which a contract call must be built on top of. */
   async getNonce(address: string): Promise<number> {
-    const r = await this.rpc<{ nonce: number }>("wallet.getNonce", { address });
-    return r.nonce ?? 0;
+    const r = await this.rpc<{ last_confirmed: number; next: number }>("wallet.getNonce", { address });
+    return r.last_confirmed ?? 0;
   }
 
   async getPendingTxs(): Promise<PendingTx[]> {

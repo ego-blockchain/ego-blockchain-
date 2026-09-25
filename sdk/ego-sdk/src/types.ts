@@ -64,3 +64,26 @@ export interface DeployedContract {
   deployedAt: number;
   codeHash:   string;
 }
+
+export interface ContractActivity {
+  seq:            number;
+  height:         number;
+  timestamp:      number;
+  tx_hash:        string;
+  from:           string;
+  kind:           "deploy" | "call";
+  entrypoint:     string;
+  args_hex:       string;
+  args_truncated: boolean;
+  ok:             boolean;
+  error:          string | null;
+  ru_used:        number;
+  events:         { topic: string; payload_hex: string }[];
+}
+
+export interface ContractQueryResult {
+  success:   boolean;
+  returnHex: string;
+  error:     string | null;
+  ruUsed:    number;
+}
