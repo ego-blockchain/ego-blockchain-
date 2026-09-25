@@ -1,7 +1,8 @@
+use std::collections::BTreeMap;
 use wasmtime::{Caller, Config, Engine, Linker, Module, Store, Trap};
 use crate::error::VmError;
 use crate::host::{HostCtx, ru_cost};
-use crate::state::{ContractState, StateStore};
+use crate::state::{ContractSource, ContractState, StateStore};
 use crate::types::*;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -29,6 +30,7 @@ fn get_engine() -> &'static Engine {
     WASM_ENGINE.get_or_init(|| {
         let mut config = Config::new();
         config.consume_fuel(true);
+        config.cranelift_nan_canonicalization(true);
         config.max_wasm_stack(512 * 1024);
         Engine::new(&config).expect("Wasmtime engine init failed")
     })
@@ -49,6 +51,234 @@ fn get_or_compile(wasm_bytes: &[u8]) -> Result<Module, VmError> {
         .map_err(|e| VmError::CompileError(e.to_string()))?;
     cache.lock().unwrap().insert(code_hash, module.clone());
     Ok(module)
+}
+
+pub const TRANSFERS_DISABLED: &str =
+    "this contract tried to move EGOC, which contracts cannot do yet";
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExecEnv {
+    pub block_height:    u64,
+    pub timestamp:       i64,
+    pub fuel:            u64,
+    pub allow_transfers: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeployEffects {
+    pub result:   DeployResult,
+    pub existed:  bool,
+    pub code:     Vec<u8>,
+    pub state:    ContractState,
+    pub manifest: Option<ContractManifest>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallEffects {
+    pub result: CallResult,
+    pub states: BTreeMap<String, ContractState>,
+}
+
+pub fn contract_address_for(deployer_addr: &str, wasm_bytes: &[u8]) -> (String, String) {
+    let hash_input = format!("{}{}", deployer_addr, hex::encode(wasm_bytes));
+    let code_hash_bytes = blake3::hash(hash_input.as_bytes());
+    let code_hash = hex::encode(code_hash_bytes.as_bytes());
+    let contract_addr = hex::encode(&code_hash_bytes.as_bytes()[..20]);
+    (contract_addr, code_hash)
+}
+
+pub fn deploy_on(
+    src:           &dyn ContractSource,
+    wasm_bytes:    &[u8],
+    deployer_addr: &str,
+    init_args:     &[u8],
+    env:           ExecEnv,
+) -> Result<DeployEffects, VmError> {
+    if wasm_bytes.len() > MAX_CODE_SIZE {
+        return Err(VmError::InvalidAbi(format!(
+            "Code too large: {} bytes (max {})", wasm_bytes.len(), MAX_CODE_SIZE
+        )));
+    }
+
+    let (contract_addr, code_hash) = contract_address_for(deployer_addr, wasm_bytes);
+
+    if src.code(&contract_addr).is_some() {
+        return Ok(DeployEffects {
+            result: DeployResult {
+                contract_address: contract_addr,
+                code_hash,
+                ru_used: 0,
+                events: vec![],
+                transfers: vec![],
+            },
+            existed:  true,
+            code:     vec![],
+            state:    ContractState::default(),
+            manifest: None,
+        });
+    }
+
+    let module = get_or_compile(wasm_bytes)?;
+    let ctx = HostCtx::new(
+        contract_addr.clone(),
+        deployer_addr.to_string(),
+        env.block_height,
+        env.timestamp,
+        ContractState::default(),
+    );
+    let (ctx_out, ru_used, _) = run_entrypoint(&module, ctx, "init", init_args, env.fuel)?;
+
+    if !env.allow_transfers && !ctx_out.transfers.is_empty() {
+        return Err(VmError::ExecutionError(TRANSFERS_DISABLED.into()));
+    }
+
+    let manifest = ContractManifest {
+        name:           format!("contract_{}", &contract_addr[..8]),
+        version:        "0.1.0".into(),
+        code_hash:      code_hash.clone(),
+        deployer:       deployer_addr.to_string(),
+        deployed_at:    env.timestamp,
+        upgrade_policy: UpgradePolicy::Immutable,
+    };
+
+    Ok(DeployEffects {
+        result: DeployResult {
+            contract_address: contract_addr,
+            code_hash,
+            ru_used,
+            events: ctx_out.events,
+            transfers: ctx_out.transfers,
+        },
+        existed:  false,
+        code:     wasm_bytes.to_vec(),
+        state:    ctx_out.state,
+        manifest: Some(manifest),
+    })
+}
+
+fn failed_call(ru_used: u64, error: String) -> CallEffects {
+    CallEffects {
+        result: CallResult {
+            success:    false,
+            return_val: vec![],
+            ru_used,
+            events:     vec![],
+            error:      Some(error),
+            transfers:  vec![],
+        },
+        states: BTreeMap::new(),
+    }
+}
+
+pub fn call_on(
+    src:           &dyn ContractSource,
+    contract_addr: &str,
+    caller_addr:   &str,
+    entrypoint:    &str,
+    args:          &[u8],
+    env:           ExecEnv,
+) -> Result<CallEffects, VmError> {
+    let wasm_bytes = src.code(contract_addr)
+        .ok_or_else(|| VmError::StorageError(format!("Code not found for {}", contract_addr)))?;
+    let module = get_or_compile(&wasm_bytes)?;
+
+    let ctx = HostCtx::new(
+        contract_addr.to_string(),
+        caller_addr.to_string(),
+        env.block_height,
+        env.timestamp,
+        src.state(contract_addr),
+    );
+
+    let (ctx_out, ru_used, return_val) = match run_entrypoint(&module, ctx, entrypoint, args, env.fuel) {
+        Ok(out) => out,
+        Err(VmError::FuelExhausted) => return Ok(failed_call(env.fuel, "Fuel exhausted".into())),
+        Err(e) => return Ok(failed_call(0, e.to_string())),
+    };
+
+    let mut touched: BTreeMap<String, ContractState> = BTreeMap::new();
+    touched.insert(contract_addr.to_string(), ctx_out.state);
+    let mut all_events = ctx_out.events;
+    let mut all_transfers = ctx_out.transfers;
+    let mut all_ru = ru_used;
+    let mut pending = ctx_out.pending_cross_calls;
+    let mut depth = 1u32;
+
+    while !pending.is_empty() && depth < 8 {
+        let current_pending = std::mem::take(&mut pending);
+        for cross_req in current_pending {
+            let Some(cross_wasm) = src.code(&cross_req.contract_addr) else { continue };
+            let Ok(cross_module) = get_or_compile(&cross_wasm) else { continue };
+            let cross_state = touched.get(&cross_req.contract_addr).cloned()
+                .unwrap_or_else(|| src.state(&cross_req.contract_addr));
+            let mut cross_ctx = HostCtx::new(
+                cross_req.contract_addr.clone(),
+                contract_addr.to_string(),
+                env.block_height,
+                env.timestamp,
+                cross_state,
+            );
+            cross_ctx.call_depth = depth;
+            let cross_fuel = cross_req.fuel.min(MAX_CROSS_CALL_FUEL);
+
+            if let Ok((cross_out, cross_ru, _)) = run_entrypoint(
+                &cross_module,
+                cross_ctx,
+                &cross_req.entrypoint,
+                &cross_req.args,
+                cross_fuel,
+            ) {
+                all_events.extend(cross_out.events);
+                all_transfers.extend(cross_out.transfers);
+                all_ru += cross_ru;
+                touched.insert(cross_req.contract_addr.clone(), cross_out.state);
+                pending.extend(cross_out.pending_cross_calls);
+            }
+        }
+        depth += 1;
+    }
+
+    if !env.allow_transfers && !all_transfers.is_empty() {
+        return Ok(failed_call(all_ru, TRANSFERS_DISABLED.into()));
+    }
+
+    Ok(CallEffects {
+        result: CallResult {
+            success:    true,
+            return_val,
+            ru_used:    all_ru,
+            events:     all_events,
+            error:      None,
+            transfers:  all_transfers,
+        },
+        states: touched,
+    })
+}
+
+fn val_type_name(vt: &wasmtime::ValType) -> &'static str {
+    if vt.is_i64()      { "u64" }
+    else if vt.is_i32() { "u32" }
+    else if vt.is_f32() { "f32" }
+    else if vt.is_f64() { "f64" }
+    else                { "?" }
+}
+
+pub fn exported_functions(wasm_bytes: &[u8]) -> Result<Vec<String>, VmError> {
+    let module = get_or_compile(wasm_bytes)?;
+    let mut out = Vec::new();
+    for export in module.exports() {
+        let wasmtime::ExternType::Func(ft) = export.ty() else { continue };
+        let name = export.name();
+        if name.starts_with("__") { continue; }
+        let params: Vec<&str> = ft.params().map(|t| val_type_name(&t)).collect();
+        let results: Vec<&str> = ft.results().map(|t| val_type_name(&t)).collect();
+        out.push(if results.is_empty() {
+            format!("{}({})", name, params.join(", "))
+        } else {
+            format!("{}({}) \u{2192} {}", name, params.join(", "), results.join(", "))
+        });
+    }
+    Ok(out)
 }
 
 pub struct Executor {
@@ -72,61 +302,17 @@ impl Executor {
         timestamp:     i64,
         fuel:          u64,
     ) -> Result<DeployResult, VmError> {
-
-        if wasm_bytes.len() > MAX_CODE_SIZE {
-            return Err(VmError::InvalidAbi(format!(
-                "Code too large: {} bytes (max {})", wasm_bytes.len(), MAX_CODE_SIZE
-            )));
+        let env = ExecEnv { block_height, timestamp, fuel, allow_transfers: true };
+        let fx = deploy_on(&self.store, wasm_bytes, deployer_addr, init_args, env)?;
+        if !fx.existed {
+            let addr = &fx.result.contract_address;
+            self.store.store_code(addr, &fx.code)?;
+            self.store.save_state(addr, &fx.state)?;
+            if let Some(manifest) = &fx.manifest {
+                self.store.store_manifest(addr, manifest)?;
+            }
         }
-
-        let hash_input = format!("{}{}", deployer_addr, hex::encode(wasm_bytes));
-        let code_hash_bytes = blake3::hash(hash_input.as_bytes());
-        let code_hash = hex::encode(code_hash_bytes.as_bytes());
-        let contract_addr = hex::encode(&code_hash_bytes.as_bytes()[..20]);
-
-        if self.store.contract_exists(&contract_addr) {
-
-            return Ok(DeployResult {
-                contract_address: contract_addr,
-                code_hash,
-                ru_used: 0,
-                events: vec![],
-                transfers: vec![],
-            });
-        }
-
-        let module = get_or_compile(wasm_bytes)?;
-
-        let ctx = HostCtx::new(
-            contract_addr.clone(),
-            deployer_addr.to_string(),
-            block_height,
-            timestamp,
-            ContractState::default(),
-        );
-
-        let (ctx_out, ru_used) = self.run_entrypoint(
-            &module, ctx, "init", init_args, fuel
-        )?;
-
-        self.store.store_code(&contract_addr, wasm_bytes)?;
-        self.store.save_state(&contract_addr, &ctx_out.state)?;
-        self.store.store_manifest(&contract_addr, &ContractManifest {
-            name:           format!("contract_{}", &contract_addr[..8]),
-            version:        "0.1.0".into(),
-            code_hash:      code_hash.clone(),
-            deployer:       deployer_addr.to_string(),
-            deployed_at:    timestamp,
-            upgrade_policy: UpgradePolicy::Immutable,
-        })?;
-
-        Ok(DeployResult {
-            contract_address: contract_addr,
-            code_hash,
-            ru_used,
-            events: ctx_out.events,
-            transfers: ctx_out.transfers,
-        })
+        Ok(fx.result)
     }
 
     pub fn call(
@@ -139,194 +325,114 @@ impl Executor {
         timestamp:     i64,
         fuel:          u64,
     ) -> Result<CallResult, VmError> {
-
-        let wasm_bytes = self.store.load_code(contract_addr)?;
-        let module = get_or_compile(&wasm_bytes)?;
-
-        let state = self.store.load_state(contract_addr);
-        let ctx = HostCtx::new(
-            contract_addr.to_string(),
-            caller_addr.to_string(),
-            block_height,
-            timestamp,
-            state,
-        );
-
-        match self.run_entrypoint(&module, ctx, entrypoint, args, fuel) {
-            Ok((ctx_out, ru_used)) => {
-                // Collect primary state — do NOT commit yet (prevents reentrancy window).
-                let primary_state = ctx_out.state.clone();
-
-                let mut all_events = ctx_out.events.clone();
-                let mut all_transfers = ctx_out.transfers.clone();
-                let mut all_ru = ru_used;
-                let mut pending = ctx_out.pending_cross_calls.clone();
-                let mut depth = 1u32;
-
-                while !pending.is_empty() && depth < 8 {
-                    let current_pending = std::mem::take(&mut pending);
-                    for cross_req in current_pending {
-                        if self.store.contract_exists(&cross_req.contract_addr) {
-                            let cross_wasm = match self.store.load_code(&cross_req.contract_addr) {
-                                Ok(w) => w, Err(_) => continue,
-                            };
-                            let cross_module = match get_or_compile(&cross_wasm) {
-                                Ok(m) => m, Err(_) => continue,
-                            };
-                            let cross_state = self.store.load_state(&cross_req.contract_addr);
-                            let mut cross_ctx = HostCtx::new(
-                                cross_req.contract_addr.clone(),
-                                contract_addr.to_string(),
-                                block_height,
-                                timestamp,
-                                cross_state,
-                            );
-                            cross_ctx.call_depth = depth;
-                            // Cap cross-call fuel to prevent unbounded resource use.
-                            let cross_fuel = cross_req.fuel.min(MAX_CROSS_CALL_FUEL);
-
-                            if let Ok((cross_out, cross_ru)) = self.run_entrypoint(
-                                &cross_module,
-                                cross_ctx,
-                                &cross_req.entrypoint,
-                                &cross_req.args,
-                                cross_fuel,
-                            ) {
-                                all_events.extend(cross_out.events);
-                                all_transfers.extend(cross_out.transfers.clone());
-                                all_ru += cross_ru;
-                                let _ = self.store.save_state(&cross_req.contract_addr, &cross_out.state);
-                                pending.extend(cross_out.pending_cross_calls);
-                            }
-                        }
-                    }
-                    depth += 1;
-                }
-
-                // Commit primary contract state only after all cross-calls complete,
-                // eliminating the reentrancy window where a cross-call could read
-                // a partially-written primary state.
-                self.store.save_state(contract_addr, &primary_state)?;
-
-                Ok(CallResult {
-                    success:    true,
-                    return_val: vec![],
-                    ru_used:    all_ru,
-                    events:     all_events,
-                    error:      None,
-                    transfers:  all_transfers,
-                })
-            }
-            Err(VmError::FuelExhausted) => Ok(CallResult {
-                success:    false,
-                return_val: vec![],
-                ru_used:    fuel,
-                events:     vec![],
-                error:      Some("Fuel exhausted".into()),
-                transfers:  vec![],
-            }),
-            Err(e) => Ok(CallResult {
-                success:    false,
-                return_val: vec![],
-                ru_used:    0,
-                events:     vec![],
-                error:      Some(e.to_string()),
-                transfers:  vec![],
-            }),
+        let env = ExecEnv { block_height, timestamp, fuel, allow_transfers: true };
+        let fx = call_on(&self.store, contract_addr, caller_addr, entrypoint, args, env)?;
+        for (addr, state) in &fx.states {
+            self.store.save_state(addr, state)?;
         }
+        Ok(fx.result)
+    }
+}
+
+fn result_bytes(results: &[wasmtime::Val]) -> Vec<u8> {
+    match results.first() {
+        Some(wasmtime::Val::I64(v)) => v.to_le_bytes().to_vec(),
+        Some(wasmtime::Val::I32(v)) => v.to_le_bytes().to_vec(),
+        Some(wasmtime::Val::F32(bits)) => bits.to_le_bytes().to_vec(),
+        Some(wasmtime::Val::F64(bits)) => bits.to_le_bytes().to_vec(),
+        _ => vec![],
+    }
+}
+
+fn run_entrypoint(
+    module:     &Module,
+    ctx:        HostCtx,
+    entrypoint: &str,
+    args:       &[u8],
+    fuel:       u64,
+) -> Result<(HostCtx, u64, Vec<u8>), VmError> {
+    let mut store = Store::new(get_engine(), ctx);
+    store.set_fuel(fuel)
+        .map_err(|e| VmError::ExecutionError(e.to_string()))?;
+
+    store.limiter(|ctx| &mut ctx.limiter);
+
+    let linker = build_linker(get_engine())?;
+
+    let instance = linker.instantiate(&mut store, module)
+        .map_err(|e| VmError::InstantiationError(e.to_string()))?;
+
+    if let Ok(set_args) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "__set_args") {
+        let mem = instance.get_memory(&mut store, "memory")
+            .ok_or_else(|| VmError::ExecutionError("No memory export".into()))?;
+        let offset = 0i32;
+        let args_len = args.len() as i32;
+        mem.write(&mut store, offset as usize, args)
+            .map_err(|e| VmError::ExecutionError(e.to_string()))?;
+        set_args.call(&mut store, (offset, args_len))
+            .map_err(|e| VmError::ExecutionError(e.to_string()))?;
     }
 
-    fn run_entrypoint(
-        &self,
-        module:     &Module,
-        ctx:        HostCtx,
-        entrypoint: &str,
-        args:       &[u8],
-        fuel:       u64,
-    ) -> Result<(HostCtx, u64), VmError> {
-        let mut store = Store::new(get_engine(), ctx);
-        store.set_fuel(fuel)
-            .map_err(|e| VmError::ExecutionError(e.to_string()))?;
+    let func = instance.get_func(&mut store, entrypoint)
+        .ok_or_else(|| VmError::InvalidAbi(format!("Entrypoint '{}' not found", entrypoint)))?;
 
-        store.limiter(|ctx| &mut ctx.limiter);
-
-        let linker = build_linker(get_engine())?;
-
-        let instance = linker.instantiate(&mut store, module)
-            .map_err(|e| VmError::InstantiationError(e.to_string()))?;
-
-        if let Ok(set_args) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "__set_args") {
-            let mem = instance.get_memory(&mut store, "memory")
-                .ok_or_else(|| VmError::ExecutionError("No memory export".into()))?;
-            let offset = 0i32;
-            let args_len = args.len() as i32;
-            mem.write(&mut store, offset as usize, args)
-                .map_err(|e| VmError::ExecutionError(e.to_string()))?;
-            set_args.call(&mut store, (offset, args_len))
-                .map_err(|e| VmError::ExecutionError(e.to_string()))?;
+    let param_types: Vec<wasmtime::ValType> = func.ty(&store).params().collect();
+    let wasm_args: Vec<wasmtime::Val> = if param_types.is_empty() {
+        vec![]
+    } else {
+        let mut decoded = Vec::with_capacity(param_types.len());
+        let mut off = 0usize;
+        for vt in &param_types {
+            if vt.is_i32() {
+                if off + 4 > args.len() { break; }
+                let v = i32::from_le_bytes(args[off..off+4].try_into().unwrap());
+                decoded.push(wasmtime::Val::I32(v));
+                off += 4;
+            } else if vt.is_i64() {
+                if off + 8 > args.len() { break; }
+                let v = i64::from_le_bytes(args[off..off+8].try_into().unwrap());
+                decoded.push(wasmtime::Val::I64(v));
+                off += 8;
+            } else if vt.is_f32() {
+                if off + 4 > args.len() { break; }
+                let bits = u32::from_le_bytes(args[off..off+4].try_into().unwrap());
+                decoded.push(wasmtime::Val::F32(bits));
+                off += 4;
+            } else if vt.is_f64() {
+                if off + 8 > args.len() { break; }
+                let bits = u64::from_le_bytes(args[off..off+8].try_into().unwrap());
+                decoded.push(wasmtime::Val::F64(bits));
+                off += 8;
+            } else {
+                decoded.push(default_val(vt));
+            }
         }
 
-        let func = instance.get_func(&mut store, entrypoint)
-            .ok_or_else(|| VmError::InvalidAbi(format!("Entrypoint '{}' not found", entrypoint)))?;
+        while decoded.len() < param_types.len() {
+            decoded.push(default_val(&param_types[decoded.len()]));
+        }
+        decoded
+    };
 
-        let param_types: Vec<wasmtime::ValType> = func.ty(&store).params().collect();
-        let wasm_args: Vec<wasmtime::Val> = if param_types.is_empty() {
-            vec![]
-        } else {
-            let mut decoded = Vec::with_capacity(param_types.len());
-            let mut off = 0usize;
-            for vt in &param_types {
-                if vt.is_i32() {
-                    if off + 4 > args.len() { break; }
-                    let v = i32::from_le_bytes(args[off..off+4].try_into().unwrap());
-                    decoded.push(wasmtime::Val::I32(v));
-                    off += 4;
-                } else if vt.is_i64() {
-                    if off + 8 > args.len() { break; }
-                    let v = i64::from_le_bytes(args[off..off+8].try_into().unwrap());
-                    decoded.push(wasmtime::Val::I64(v));
-                    off += 8;
-                } else if vt.is_f32() {
-                    if off + 4 > args.len() { break; }
-                    let bits = u32::from_le_bytes(args[off..off+4].try_into().unwrap());
-                    decoded.push(wasmtime::Val::F32(bits));
-                    off += 4;
-                } else if vt.is_f64() {
-                    if off + 8 > args.len() { break; }
-                    let bits = u64::from_le_bytes(args[off..off+8].try_into().unwrap());
-                    decoded.push(wasmtime::Val::F64(bits));
-                    off += 8;
-                } else {
-                    decoded.push(default_val(vt));
-                }
+    let result_types: Vec<wasmtime::ValType> = func.ty(&store).results().collect();
+    let mut results: Vec<wasmtime::Val> = result_types.iter().map(default_val).collect();
+
+    let result = func.call(&mut store, &wasm_args, &mut results);
+
+    let fuel_remaining = store.get_fuel().unwrap_or(0);
+    let ru_used = fuel.saturating_sub(fuel_remaining);
+
+    match result {
+        Ok(_) => {
+            let ctx_out = store.into_data();
+            Ok((ctx_out, ru_used, result_bytes(&results)))
+        }
+        Err(ref e) => {
+
+            if e.downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
+                return Err(VmError::FuelExhausted);
             }
-
-            while decoded.len() < param_types.len() {
-                decoded.push(default_val(&param_types[decoded.len()]));
-            }
-            decoded
-        };
-
-        let result_count = func.ty(&store).results().count();
-        let mut results = vec![wasmtime::Val::I32(0); result_count];
-
-        let result = func.call(&mut store, &wasm_args, &mut results);
-
-        let fuel_remaining = store.get_fuel().unwrap_or(0);
-        let ru_used = fuel.saturating_sub(fuel_remaining);
-
-        match result {
-            Ok(_) => {
-                let ctx_out = store.into_data();
-                Ok((ctx_out, ru_used))
-            }
-            Err(ref e) => {
-
-                if e.downcast_ref::<Trap>() == Some(&Trap::OutOfFuel) {
-                    return Err(VmError::FuelExhausted);
-                }
-                Err(VmError::ExecutionError(e.to_string()))
-            }
+            Err(VmError::ExecutionError(e.to_string()))
         }
     }
 }

@@ -1,12 +1,12 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use crate::error::VmError;
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContractState {
 
-    pub data: HashMap<String, HashMap<String, String>>,
+    pub data: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl ContractState {
@@ -25,8 +25,16 @@ impl ContractState {
     pub fn del(&mut self, prefix: &str, key: &str) {
         if let Some(map) = self.data.get_mut(prefix) {
             map.remove(key);
+            if map.is_empty() {
+                self.data.remove(prefix);
+            }
         }
     }
+}
+
+pub trait ContractSource {
+    fn code(&self, addr: &str) -> Option<Vec<u8>>;
+    fn state(&self, addr: &str) -> ContractState;
 }
 
 pub struct StateStore {
@@ -96,5 +104,15 @@ impl StateStore {
 
     pub fn contract_exists(&self, addr: &str) -> bool {
         self.contract_dir(addr).join("code.wasm").exists()
+    }
+}
+
+impl ContractSource for StateStore {
+    fn code(&self, addr: &str) -> Option<Vec<u8>> {
+        self.load_code(addr).ok()
+    }
+
+    fn state(&self, addr: &str) -> ContractState {
+        self.load_state(addr)
     }
 }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wasmtime   = { version = "25", features = ["cranelift"] }
+wasmtime   = { version = "40", features = ["cranelift"] }
 anyhow     = "1"
 thiserror  = "1"
 serde      = { version = "1", features = ["derive"] }
@@ -21,3 +21,4 @@ revm       = { version = "8.0.0", default-features = false, features = ["std", "
 
 [dev-dependencies]
 urego-compiler = { path = "../urego-compiler" }
+wat            = "1.219"

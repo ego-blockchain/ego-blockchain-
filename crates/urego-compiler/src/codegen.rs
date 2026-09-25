@@ -205,6 +205,7 @@ impl Codegen {
 
         wat.push_str("  ;; Helper: read u64 from storage\n");
         wat.push_str("  (func $__get_u64 (param $kp i32) (param $kl i32) (result i64)\n");
+        wat.push_str(&format!("    (i64.store (i32.const {SCRATCH_U64}) (i64.const 0))\n"));
         wat.push_str(&format!("    (drop (call $storage_get (i32.const 0) (i32.const 0) (local.get $kp) (local.get $kl) (i32.const {SCRATCH_U64})))\n"));
         wat.push_str(&format!("    (i64.load (i32.const {SCRATCH_U64}))\n"));
         wat.push_str("  )\n\n");
