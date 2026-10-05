@@ -5,12 +5,9 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use ego_core::{AccountType, Address, AlgorithmId, Balance, Block, KeyPair, PublicKey, Signature, StateManager, Transaction};
+use ego_core::{AccountType, Address, AlgorithmId, Balance, Block, KeyPair, PublicKey, StateManager, Transaction};
 use ego_core::state::{MIN_VALIDATOR_STAKE, ValidatorStatus};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use sysinfo::{System, CpuRefreshKind};
-use chrono;
 use hex;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -53,9 +50,6 @@ pub struct RpcState {
 
     /// Channel for sending tx bytes to the daemon gossip loop (mempool propagation).
     pub mempool_gossip_tx: mpsc::UnboundedSender<Vec<u8>>,
-
-    /// Authorized renters: reservation_id -> buyer_address
-    pub active_renters: Mutex<HashMap<String, String>>,
 
     /// Known peer HTTP RPC addresses: peer_id_hex → "http://ip:port"
     pub peer_rpc_addrs: Mutex<HashMap<String, String>>,
@@ -122,8 +116,6 @@ pub fn make_router(state: Arc<RpcState>) -> Router {
         .route("/node/identity",      get(node_identity))
         .route("/faucet",             get(faucet))
         .route("/tx/broadcast",       post(tx_broadcast))
-        .route("/node/usage",         post(handle_usage))
-        .route("/exec",               post(handle_exec))
         .route("/block/broadcast",    post(block_broadcast))
         .route("/compute/offers",     get(list_offers))
         .route("/compute/reservations", get(list_reservations))
@@ -780,254 +772,6 @@ async fn faucet(
         "amount_uegoc": FAUCET_AMOUNT_UEGOC,
         "tx_hash": format!("faucet_{:x}", now),
     }))).into_response()
-}
-
-/// Self-attesting reservation payload included by the buyer in /exec and
-/// /node/usage requests. Lets the provider authenticate the request without
-/// relying on the ego-compute-v1 gossip topic having reached this node.
-///
-/// Extra fields on the buyer side (period_minutes, breach_count, etc.) are
-/// accepted and ignored thanks to serde's default behaviour.
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct ReservationAttestation {
-    reservation_id:   String,
-    #[serde(default)] offer_id: String,
-    buyer_address:    String,
-    provider_address: String,
-    status:           String,
-    expires_at:       i64,
-}
-
-#[derive(Deserialize)]
-#[allow(dead_code)]
-struct ExecRequest {
-    reservation_id: String,
-    command: String,
-    timestamp: i64,
-    /// Hex-encoded Ed25519 signature (kept for back-compat; not the
-    /// authoritative auth signal — wallet addresses are Dilithium-derived).
-    signature: String,
-    /// Hex-encoded Ed25519 public key (back-compat only).
-    public_key: String,
-
-    /// Hex-encoded Dilithium-2 public key. Authoritative for buyer-address
-    /// derivation: `EgoAddress::from_dilithium_pk(pk, 1, EOA)` must equal the
-    /// wallet bech32 address.
-    #[serde(default)]
-    dilithium_public_key: String,
-    /// Hex-encoded Dilithium-2 signature over `{reservation_id}:{command}:{timestamp}`.
-    #[serde(default)]
-    dilithium_signature: String,
-
-    /// Optional self-attesting reservation payload. Lets the request
-    /// authenticate via the chain-derived path when active_renters has not
-    /// been hydrated by gossip.
-    #[serde(default)]
-    reservation: Option<ReservationAttestation>,
-}
-
-/// Hex-encoded lowercase 20-byte address. Returns `None` if the input is not a
-/// recognisable bech32 ego address.
-fn ego_addr_to_hex(addr: &str) -> Option<String> {
-    let hrp = if addr.starts_with("egot") { "egot" }
-              else if addr.starts_with("ego1") || addr.starts_with("ego") { "ego" }
-              else { return None; };
-    ego_core::EgoAddress::from_bech32(addr, hrp)
-        .ok()
-        .map(|a| hex::encode(a.payload()))
-}
-
-/// Normalised equality check across bech32 and hex address formats.
-fn addresses_match(a: &str, b: &str) -> bool {
-    if a.eq_ignore_ascii_case(b) {
-        return true;
-    }
-    let norm = |s: &str| {
-        ego_addr_to_hex(s).unwrap_or_else(|| s.trim_start_matches("0x").to_lowercase())
-    };
-    norm(a) == norm(b)
-}
-
-/// Resolves and verifies the buyer address authorised for a /exec or
-/// /node/usage request. Tries the in-memory cache and persistent store first,
-/// then falls back to chain-derived verification using the attestation
-/// embedded in the request itself.
-///
-/// `derived_bech32` is the Dilithium-derived bech32 address from the request's
-/// Dilithium public key (used for the attestation buyer-match check).
-fn resolve_buyer_addr(
-    s: &Arc<RpcState>,
-    req: &ExecRequest,
-    derived_bech32: &str,
-) -> Result<String, (StatusCode, String)> {
-    if let Some(addr) = s.active_renters.lock().unwrap().get(&req.reservation_id).cloned() {
-        return Ok(addr);
-    }
-    if let Some(addr) = crate::store::get_compute_auth(&req.reservation_id) {
-        s.active_renters.lock().unwrap().insert(req.reservation_id.clone(), addr.clone());
-        return Ok(addr);
-    }
-
-    let att = req.reservation.as_ref().ok_or_else(|| (
-        StatusCode::UNAUTHORIZED,
-        format!("Unauthorized: reservation {} not cached and no attestation provided", req.reservation_id),
-    ))?;
-
-    if att.reservation_id != req.reservation_id {
-        return Err((StatusCode::BAD_REQUEST,
-            "Attestation reservation_id does not match request".to_string()));
-    }
-    if !addresses_match(&att.provider_address, &s.node_bech32_address) {
-        return Err((StatusCode::FORBIDDEN, format!(
-            "Attestation provider_address {} does not match this node {}",
-            att.provider_address, s.node_bech32_address)));
-    }
-    if !addresses_match(&att.buyer_address, derived_bech32) {
-        return Err((StatusCode::FORBIDDEN, format!(
-            "Dilithium key derives {}, but attestation claims buyer {}",
-            derived_bech32, att.buyer_address)));
-    }
-    if att.status != "active" {
-        return Err((StatusCode::FORBIDDEN, format!("Reservation status is '{}', not active", att.status)));
-    }
-    let now = chrono::Utc::now().timestamp();
-    if att.expires_at <= now {
-        return Err((StatusCode::FORBIDDEN, "Reservation expired".to_string()));
-    }
-
-    crate::store::insert_compute_auth(&req.reservation_id, &att.buyer_address);
-    s.active_renters.lock().unwrap().insert(req.reservation_id.clone(), att.buyer_address.clone());
-    tracing::info!("✅ Hydrated reservation {} from buyer-presented attestation (provider={})",
-        req.reservation_id, s.node_address);
-    Ok(att.buyer_address.clone())
-}
-
-/// Derives the wallet's bech32 address (`egot1...`) from a Dilithium-2 public
-/// key. The HRP is derived from the local node's address so testnet/mainnet
-/// builds work without extra wiring.
-fn derive_bech32_from_dilithium(dil_pk: &[u8], node_address: &str) -> Option<String> {
-    let hrp = if node_address.starts_with("egot") { "egot" } else { "ego" };
-    let chain_id: u32 = if hrp == "egot" { 1 } else { 0 };
-    ego_core::EgoAddress::from_dilithium_pk(dil_pk, chain_id, ego_core::AddressType::EOA)
-        .to_bech32(hrp)
-        .ok()
-}
-
-/// Shared timestamp + signature verification for /exec and /node/usage.
-/// Returns the authorised buyer address on success.
-///
-/// The Dilithium signature is the authoritative auth signal — the wallet
-/// address is derived from the Dilithium public key, so a valid signature +
-/// matching address proves the request comes from the wallet owner. Ed25519
-/// fields are accepted but not verified (kept for back-compat).
-fn verify_request_auth(
-    s: &Arc<RpcState>,
-    req: &ExecRequest,
-    signed_msg: &str,
-) -> Result<String, (StatusCode, String)> {
-    let now = chrono::Utc::now().timestamp();
-    if (now - req.timestamp).abs() > 30 {
-        return Err((StatusCode::BAD_REQUEST, "Request expired (timestamp mismatch)".to_string()));
-    }
-
-    let dil_pk_bytes = hex::decode(&req.dilithium_public_key)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid Dilithium public key encoding".to_string()))?;
-    if dil_pk_bytes.is_empty() {
-        return Err((StatusCode::BAD_REQUEST,
-            "Missing dilithium_public_key (required for wallet auth)".to_string()));
-    }
-
-    let derived_bech32 = derive_bech32_from_dilithium(&dil_pk_bytes, &s.node_bech32_address)
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to derive bech32 address".to_string()))?;
-
-    let buyer_addr = resolve_buyer_addr(s, req, &derived_bech32)?;
-    if !addresses_match(&buyer_addr, &derived_bech32) {
-        return Err((StatusCode::FORBIDDEN, format!(
-            "Dilithium key derives {}, but reservation belongs to {}", derived_bech32, buyer_addr)));
-    }
-
-    let dil_sig_bytes = hex::decode(&req.dilithium_signature)
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid Dilithium signature encoding".to_string()))?;
-    if dil_sig_bytes.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Missing dilithium_signature".to_string()));
-    }
-    let dil_pk = PublicKey::new(ego_core::AlgorithmId::MlDsa2, dil_pk_bytes);
-    let dil_sig = Signature::dilithium2(dil_sig_bytes);
-
-    match ego_core::verify_signature(&dil_pk, signed_msg.as_bytes(), &dil_sig) {
-        Ok(true)  => Ok(buyer_addr),
-        Ok(false) => Err((StatusCode::UNAUTHORIZED, "Invalid Dilithium signature".to_string())),
-        Err(e)    => Err((StatusCode::UNAUTHORIZED, format!("Signature verify error: {e}"))),
-    }
-}
-
-async fn handle_usage(
-    State(s): State<Arc<RpcState>>,
-    Json(req): Json<ExecRequest>,
-) -> impl IntoResponse {
-    let signed = format!("{}:{}:{}", req.reservation_id, req.command, req.timestamp);
-    if let Err((status, msg)) = verify_request_auth(&s, &req, &signed) {
-        tracing::warn!("❌ Usage Auth Failed for {}: {}", req.reservation_id, msg);
-        return (status, msg).into_response();
-    }
-
-    let mut sys = System::new();
-    sys.refresh_cpu_specifics(CpuRefreshKind::new().with_cpu_usage());
-    sys.refresh_memory();
-
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    sys.refresh_cpu_usage();
-
-    let cpu_usage = sys.global_cpu_usage();
-    let ram_used = sys.used_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
-
-    let gpu_usage = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i32>().ok())
-        .unwrap_or(0);
-
-    (StatusCode::OK, Json(json!({
-        "cpu": cpu_usage,
-        "ram_used_gb": ram_used,
-        "gpu": gpu_usage
-    }))).into_response()
-}
-
-async fn handle_exec(
-    State(s): State<Arc<RpcState>>,
-    Json(req): Json<ExecRequest>,
-) -> impl IntoResponse {
-    let signed = format!("{}:{}:{}", req.reservation_id, req.command, req.timestamp);
-    let buyer_addr = match verify_request_auth(&s, &req, &signed) {
-        Ok(addr) => addr,
-        Err((status, msg)) => {
-            tracing::warn!("❌ Exec Auth Failed for {}: {}", req.reservation_id, msg);
-            return (status, msg).into_response();
-        }
-    };
-
-    tracing::info!("📡 Remote Exec [Auth: {}]: {}", buyer_addr, req.command);
-
-    let output = if cfg!(target_os = "windows") {
-        std::process::Command::new("powershell").args(["-Command", &req.command]).output()
-    } else {
-        std::process::Command::new("sh").args(["-c", &req.command]).output()
-    };
-
-    match output {
-        Ok(o) => {
-            let combined = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
-            if o.status.success() {
-                (StatusCode::OK, combined).into_response()
-            } else {
-                (StatusCode::BAD_REQUEST, combined).into_response()
-            }
-        },
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("System Error: {e}")).into_response(),
-    }
 }
 
 #[derive(Deserialize)]

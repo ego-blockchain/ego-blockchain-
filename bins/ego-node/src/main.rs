@@ -149,9 +149,6 @@ async fn main() -> anyhow::Result<()> {
     let _engine = EgoExecutionEngine::new();
     let (supervisor, _heartbeat) = NodeSupervisor::new();
 
-    let active_renters_map = crate::store::list_compute_auths();
-    let active_renters_count = active_renters_map.len();
-
     let (mempool_gossip_tx, mempool_gossip_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
     let rpc_state = Arc::new(RpcState {
@@ -170,13 +167,8 @@ async fn main() -> anyhow::Result<()> {
         faucet_claims:  Mutex::new(std::collections::HashMap::new()),
         write_rate:     Mutex::new(std::collections::HashMap::new()),
         mempool_gossip_tx,
-        active_renters: Mutex::new(active_renters_map),
         peer_rpc_addrs: Mutex::new(std::collections::HashMap::new()),
     });
-
-    if active_renters_count > 0 {
-        info!("🖥️ Restored {} active compute authorizations from database", active_renters_count);
-    }
 
     let rpc_addr = format!("0.0.0.0:{}", config.rpc_port);
     let rpc_state_clone = Arc::clone(&rpc_state);
@@ -946,17 +938,8 @@ async fn run_daemon_mode(
                                         continue;
                                     }
                                     
-                                    info!("✅ Compute Auth Received: Res {} -> Buyer {}", res_id, buyer);
+                                    info!("Compute booking seen: Res {} -> Buyer {}", res_id, buyer);
                                     crate::store::insert_compute_auth(&res_id, &buyer);
-                                    rpc_state.active_renters.lock().unwrap().insert(res_id.clone(), buyer);
-
-                                    let ssh_key = payload["ssh_public_key"].as_str()
-                                        .or_else(|| payload.as_object().and_then(|o| o.values().next().and_then(|v| v["ssh_public_key"].as_str())));
-                                    
-                                    if let Some(pubkey) = ssh_key {
-                                        info!("🔑 Authorizing SSH key for this reservation...");
-                                        let _ = authorize_ssh_key(pubkey);
-                                    }
                                 } else {
                                     debug!("📡 [Compute] Forwarding booking for other provider: {}", provider);
                                 }
@@ -1064,42 +1047,6 @@ async fn run_daemon_mode(
 
     info!("👋 Ego blockchain node shutting down gracefully");
     print_final_stats(&node);
-    Ok(())
-}
-
-fn authorize_ssh_key(key: &str) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        let ssh_dir = format!("{}/.ssh", home);
-        let auth_keys = format!("{}/authorized_keys", ssh_dir);
-        
-        std::fs::create_dir_all(&ssh_dir)?;
-        
-        // Skip if key already present
-        if let Ok(content) = std::fs::read_to_string(&auth_keys) {
-            if content.contains(key.trim()) {
-                return Ok(());
-            }
-        }
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&auth_keys)?;
-            
-        writeln!(file, "{}", key.trim())?;
-        
-        #[cfg(target_family = "unix")]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&ssh_dir, std::fs::Permissions::from_mode(0o700));
-            let _ = std::fs::set_permissions(&auth_keys, std::fs::Permissions::from_mode(0o600));
-        }
-    }
     Ok(())
 }
 

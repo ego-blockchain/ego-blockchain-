@@ -289,13 +289,6 @@ pub fn delete_compute_offer(offer_id: &str) {
     }
 }
 
-pub fn get_compute_auth(res_id: &str) -> Option<String> {
-    let db = store();
-    let cf = db.cf_handle(CF_COMPUTE_RESERVATIONS)?;
-    db.get_cf(cf, res_id.as_bytes()).ok().flatten()
-        .and_then(|v| String::from_utf8(v).ok())
-}
-
 /// Returns Map of reservation_id -> buyer_address
 pub fn list_compute_auths() -> std::collections::HashMap<String, String> {
     let db = store();
