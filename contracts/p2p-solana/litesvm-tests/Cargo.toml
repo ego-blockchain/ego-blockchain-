@@ -1,0 +1,24 @@
+[package]
+name = "ego-escrow-tests"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.90"
+publish = false
+
+[dependencies]
+litesvm = { version = "=0.12.0", features = ["precompiles"] }
+bincode = "1"
+solana-account = "3.2"
+solana-address = "2.6"
+solana-clock = "3.0"
+solana-transaction = "3.0"
+tiny_http = "0.12"
+serde_json = "1"
+base64 = "0.22"
+ed25519-dalek = "2"
+curve25519-dalek = "4"
+sha2 = "0.10"
+bs58 = "0.5"
+
+[workspace]
+resolver = "3"

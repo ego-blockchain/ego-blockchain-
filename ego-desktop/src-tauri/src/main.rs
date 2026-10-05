@@ -11,6 +11,8 @@ mod robustness;
 mod scale;
 mod shielded;
 mod shielded_chain;
+mod market_chain;
+mod escrow;
 mod storage_proof;
 mod coverage_proof;
 mod sideband;
@@ -990,6 +992,34 @@ fn main() {
             commands::shielded::shielded_forget_note,
             commands::shielded::shielded_forget_spent,
             commands::shielded::shielded_scan_notes,
+            commands::market::market_params,
+            commands::market::market_offers,
+            commands::market::market_offer,
+            commands::market::market_quote,
+            commands::market::market_trade,
+            commands::market::market_my_trades,
+            commands::market::market_my_cases,
+            commands::market::market_my_offers,
+            commands::market::market_profile,
+            commands::market::market_leaderboard,
+            commands::market::market_post_offer,
+            commands::market::market_close_offer,
+            commands::market::market_open_trade,
+            commands::market::market_fund,
+            commands::market::market_cancel,
+            commands::market::market_mark_paid,
+            commands::market::market_dispute,
+            commands::market::market_feedback,
+            commands::market::market_settle,
+            commands::market::market_chat,
+            commands::market::market_chat_read,
+            commands::market::market_chat_unread,
+            commands::market::market_chat_send,
+            commands::market::market_escrow_status,
+            commands::market::market_chain_address,
+            commands::market::market_networks,
+            commands::market::market_save_networks,
+            commands::market::market_publish_arbiter,
             commands::shielded::shielded_cancel_withdrawal,
             commands::shielded::shielded_cancel_deposit,
             commands::shielded::shield_deposit,
@@ -1590,6 +1620,11 @@ fn main() {
 
             tauri::async_runtime::spawn(async move {
                 crate::mempool::run_batch_loop().await;
+            });
+
+            let handle_market = app.handle();
+            tauri::async_runtime::spawn(async move {
+                crate::commands::market::run_market_loop(handle_market).await;
             });
 
             let handle_coverage = app.handle();

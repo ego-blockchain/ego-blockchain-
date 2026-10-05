@@ -1578,6 +1578,19 @@ pub fn is_reserved_system_source(addr: &str) -> bool {
         || addr.starts_with("egot1nodepool")
         || addr.starts_with("egot1rewards")
         || addr.starts_with("egot1shielded")
+        || addr.starts_with("egot1marketescrow")
+}
+
+pub fn pays_fee_from_amount(tx: &LedgerTx) -> bool {
+    crate::shielded_chain::is_unshield(tx) || crate::market_chain::is_settle(tx)
+}
+
+pub fn credited_to_recipient(tx: &LedgerTx) -> u64 {
+    if pays_fee_from_amount(tx) {
+        tx.amount.saturating_sub(tx.fee_uegoc)
+    } else {
+        tx.amount
+    }
 }
 
 pub(crate) fn expected_standard_tx_hash(tx: &LedgerTx) -> String {
@@ -1602,6 +1615,8 @@ fn tx_hash_must_match_standard_signing(tx: &LedgerTx) -> bool {
         tx.tx_type.as_str(),
         "transfer" | "stake" | "unstake" | "governance" | "cluster_escrow" | "storage_escrow" | "hosting_plan"
             | "credits_mint" | "credits_pay" | "shield"
+            | "market_offer" | "market_offer_close" | "market_trade_open" | "market_lock"
+            | "market_trade_cancel" | "market_paid" | "market_dispute" | "market_feedback"
     )
 }
 
@@ -1609,7 +1624,7 @@ pub fn verify_confirmed_tx_sig(tx: &LedgerTx) -> Result<(), String> {
     if is_protocol_system_tx(tx) {
         return Ok(());
     }
-    if crate::shielded_chain::unshield_is_well_formed(tx) {
+    if crate::shielded_chain::unshield_is_well_formed(tx) || crate::market_chain::settle_is_well_formed(tx) {
         return Ok(());
     }
     if tx.public_key_ed25519.is_empty() || tx.signature.is_empty() {
@@ -1666,6 +1681,12 @@ pub fn verify_incoming_tx_with_miner(tx: &LedgerTx, block_miner: &str) -> Result
     }
     if tx.to == crate::shielded_chain::SHIELDED_POOL_ADDR {
         crate::shielded_chain::verify_incoming_deposit(tx)?;
+    }
+    if tx.from == crate::market_chain::MARKET_ESCROW_ADDR {
+        return crate::market_chain::verify_incoming_settle(tx);
+    }
+    if tx.to == crate::market_chain::MARKET_ESCROW_ADDR {
+        crate::market_chain::verify_incoming_op(tx)?;
     }
 
     if is_reserved_system_source(&tx.from) {

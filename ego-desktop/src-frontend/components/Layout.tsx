@@ -10,6 +10,7 @@ import { useAppVersion, formatVersion } from '../lib/version';
 
 const NAV_ITEMS = [
   { path: '/wallet',    label: 'Wallet',    icon: '💰', desc: 'Send & receive' },
+  { path: '/p2p',       label: 'P2P Trade', icon: '🤝', desc: 'Buy & sell with escrow' },
   { path: '/storage',   label: 'Storage',   icon: '🗄️', desc: 'Decentralized files' },
   { path: '/earnings',  label: 'Earn',      icon: '📈', desc: 'Rewards & DRS' },
   { path: '/staking',   label: 'Stake',     icon: '🔒', desc: 'Lock & earn' },

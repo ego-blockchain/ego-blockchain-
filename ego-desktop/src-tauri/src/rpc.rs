@@ -330,7 +330,7 @@ async fn faucet_handler(Query(q): Query<FaucetQuery>) -> Response {
             "success":      true,
             "to":           address,
             "amount_egoc":  req_amount,
-            "amount_uegoc": faucet_amount,
+            "amount_micro": faucet_amount,
             "drops_used":   drops_used_now,
             "message":      "Faucet request queued. Coins will arrive shortly."
         })).into_response()
@@ -423,6 +423,91 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
                     }
                 }
                 Err(e) => RpcResponse::err(req.id, -32602, &format!("invalid tx object: {e}")),
+            }
+        }
+
+        "market.params" => RpcResponse::ok(req.id, crate::market_chain::params_view()),
+
+        "market.offers" => {
+            let asset = p["asset"].as_str().unwrap_or(crate::market_chain::EGOC).trim().to_ascii_uppercase();
+            let fiat = p["fiat"].as_str().unwrap_or("USD").trim().to_ascii_uppercase();
+            let side = crate::market_chain::Side::parse(p["side"].as_str().unwrap_or("sell"))
+                .unwrap_or(crate::market_chain::Side::Sell);
+            let limit = p["limit"].as_u64().unwrap_or(50).clamp(1, 100) as usize;
+            let filter = crate::market_chain::OfferFilter {
+                method: p["method"].as_str(),
+                country: p["country"].as_str(),
+                amount_micro: p["amount_micro"].as_u64(),
+            };
+            RpcResponse::ok(
+                req.id,
+                crate::market_chain::offers_view(&asset, &fiat, side, limit, p["cursor"].as_str(), &filter),
+            )
+        }
+
+        "market.offer" => match crate::market_chain::offer_by_id_view(p["id"].as_str().unwrap_or_default()) {
+            Some(v) => RpcResponse::ok(req.id, v),
+            None => RpcResponse::err(req.id, -32004, "offer not found"),
+        },
+
+        "market.trade" => match crate::market_chain::trade_by_id_view(p["id"].as_str().unwrap_or_default()) {
+            Some(v) => RpcResponse::ok(req.id, v),
+            None => RpcResponse::err(req.id, -32004, "trade not found"),
+        },
+
+        "market.trades" => {
+            let addr = p["address"].as_str().unwrap_or_default().trim().to_string();
+            let limit = p["limit"].as_u64().unwrap_or(50).clamp(1, 100) as usize;
+            RpcResponse::ok(req.id, crate::market_chain::trades_of_view(&addr, limit, p["cursor"].as_str()))
+        }
+
+        "market.profile" => {
+            let addr = p["address"].as_str().unwrap_or_default().trim().to_string();
+            RpcResponse::ok(req.id, crate::market_chain::profile_view(&addr))
+        }
+
+        "market.leaderboard" => {
+            let limit = p["limit"].as_u64().unwrap_or(25).clamp(1, 100) as usize;
+            RpcResponse::ok(req.id, crate::market_chain::leaderboard_view(limit))
+        }
+
+        "market.opMemo" => {
+            let tx_type = p["tx_type"].as_str().unwrap_or_default();
+            let call_args = p["call_args"].as_str().unwrap_or_default();
+            match crate::market_chain::op_memo(tx_type, call_args) {
+                Some(memo) => RpcResponse::ok(req.id, json!({ "memo": memo })),
+                None => RpcResponse::err(req.id, -32602, "not a signed market operation"),
+            }
+        }
+
+        "market.settleMessage" => {
+            let trade_id = p["trade_id"].as_str().unwrap_or_default();
+            let outcome = crate::market_chain::Outcome::parse(p["outcome"].as_str().unwrap_or_default());
+            let by = crate::market_chain::Role::parse(p["by"].as_str().unwrap_or_default());
+            match (outcome, by) {
+                (Some(outcome), Some(by)) => {
+                    let message = crate::market_chain::settle_message(trade_id, outcome, by);
+                    RpcResponse::ok(req.id, json!({ "message": message, "message_hex": hex::encode(&message) }))
+                }
+                _ => RpcResponse::err(req.id, -32602, "outcome is release|refund and by is buyer|seller|arbiter"),
+            }
+        }
+
+        "market.buildSettle" => {
+            let outcome = crate::market_chain::Outcome::parse(p["outcome"].as_str().unwrap_or_default());
+            let by = crate::market_chain::Role::parse(p["by"].as_str().unwrap_or_default());
+            match (outcome, by) {
+                (Some(outcome), Some(by)) => match crate::market_chain::build_settle_view(
+                    p["trade_id"].as_str().unwrap_or_default(),
+                    outcome,
+                    by,
+                    p["pubkey"].as_str().unwrap_or_default(),
+                    p["signature"].as_str().unwrap_or_default(),
+                ) {
+                    Ok(v) => RpcResponse::ok(req.id, v),
+                    Err(e) => RpcResponse::err(req.id, -32000, &e),
+                },
+                _ => RpcResponse::err(req.id, -32602, "outcome is release|refund and by is buyer|seller|arbiter"),
             }
         }
 
@@ -1828,5 +1913,74 @@ mod shielded_rpc_tests {
         let txs = chk["txs"].as_array().unwrap();
         assert_eq!(txs.len(), 3);
         assert!(txs.iter().all(|t| t["block_height"].is_null() && t["in_mempool"] == false && t["finalized"] == false));
+    }
+}
+
+#[cfg(test)]
+mod market_rpc_tests {
+    use super::*;
+
+    fn ask(method: &str, params: Value) -> RpcResponse {
+        handle_method(RpcRequest { jsonrpc: "2.0".into(), method: method.into(), params, id: Some(json!(1)) })
+    }
+
+    fn call(method: &str, params: Value) -> Value {
+        let resp = ask(method, params);
+        assert!(resp.error.is_none(), "{method}: {:?}", resp.error);
+        resp.result.expect("a result")
+    }
+
+    #[test]
+    fn the_parameters_tell_a_wallet_everything_it_needs_to_build_a_trade() {
+        let p = call("market.params", json!({}));
+        for k in [
+            "active", "escrow_address", "chain_id", "chain_time", "wall_time", "maker_fee_bps",
+            "min_trade_uegoc", "max_trade_uegoc", "accept_window_secs", "buyer_dispute_delay_secs",
+            "payment_window_secs", "arbiters", "ops", "escrow_held_uegoc",
+        ] {
+            assert!(!p[k].is_null(), "missing {k}");
+        }
+        assert_eq!(p["escrow_address"], crate::market_chain::MARKET_ESCROW_ADDR);
+        assert_eq!(p["maker_fee_bps"], 100);
+        assert_eq!(p["ops"].as_array().unwrap().len(), 9);
+        let usdt = p["assets"].as_array().unwrap().iter().find(|a| a["id"] == "USDT-TRC20").cloned().unwrap();
+        assert_eq!(usdt["family"], "tron");
+        assert!(!p["arbiters"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn empty_books_and_strangers_answer_with_empty_lists() {
+        let book = call("market.offers", json!({ "fiat": "qqz", "side": "buy" }));
+        assert_eq!(book["offers"].as_array().unwrap().len(), 0);
+        assert!(book["next"].is_null());
+        let trades = call("market.trades", json!({ "address": "egot1nobodytradeshere" }));
+        assert_eq!(trades["trades"].as_array().unwrap().len(), 0);
+        let profile = call("market.profile", json!({ "address": "egot1nobodytradeshere" }));
+        assert_eq!(profile["profile"]["completed"], 0);
+        assert!(call("market.leaderboard", json!({ "limit": 3 }))["leaders"].is_array());
+    }
+
+    #[test]
+    fn helpers_build_exactly_what_the_chain_checks() {
+        let args = r#"{"trade_id":"0x00"}"#;
+        let memo = call("market.opMemo", json!({ "tx_type": "market_paid", "call_args": args }));
+        assert_eq!(
+            memo["memo"].as_str().unwrap(),
+            crate::market_chain::op_memo("market_paid", args).unwrap()
+        );
+        assert!(ask("market.opMemo", json!({ "tx_type": "transfer", "call_args": args })).error.is_some());
+
+        let id = format!("0x{}", "ef".repeat(32));
+        let m = call("market.settleMessage", json!({ "trade_id": id, "outcome": "release", "by": "seller" }));
+        assert_eq!(m["message"], format!("ego/market/auth/v1:1:{id}:release:seller"));
+        assert_eq!(m["message_hex"], hex::encode(m["message"].as_str().unwrap()));
+        assert!(ask("market.settleMessage", json!({ "trade_id": id, "outcome": "keep", "by": "seller" })).error.is_some());
+
+        assert!(ask("market.trade", json!({ "id": id })).error.is_some());
+        assert!(ask("market.offer", json!({ "id": id })).error.is_some());
+        let built = ask("market.buildSettle", json!({
+            "trade_id": id, "outcome": "refund", "by": "buyer", "pubkey": "00", "signature": "00"
+        }));
+        assert!(built.error.is_some());
     }
 }

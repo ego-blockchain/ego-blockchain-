@@ -69,6 +69,12 @@ pub enum Violation {
         amount_uegoc: u64,
         reason: String,
     },
+
+    MarketEscrowMismatch {
+        height: u64,
+        held_uegoc: u64,
+        on_chain_uegoc: u64,
+    },
 }
 
 impl Violation {
@@ -78,7 +84,8 @@ impl Violation {
             | Violation::NegativeBalance { height, .. }
             | Violation::ShieldedPoolMismatch { height, .. }
             | Violation::OutstandingNotes { height, .. }
-            | Violation::StrandedDeposit { height, .. } => *height,
+            | Violation::StrandedDeposit { height, .. }
+            | Violation::MarketEscrowMismatch { height, .. } => *height,
         }
     }
 
@@ -98,6 +105,9 @@ impl Violation {
             ),
             Violation::StrandedDeposit { height, hash, amount_uegoc, reason } => format!(
                 "block #{height}: {amount_uegoc} uEGOC reached the shielded pool in {hash} but no note was recorded for it because {reason}"
+            ),
+            Violation::MarketEscrowMismatch { height, held_uegoc, on_chain_uegoc } => format!(
+                "block #{height}: the market escrow holds {on_chain_uegoc} uEGOC but its open trades account for {held_uegoc}"
             ),
         }
     }

@@ -3116,6 +3116,16 @@ pub enum P2PMessage {
         ct:      String,
         id:      String,
     },
+    MarketChat {
+        trade_id: String,
+        from:     String,
+        kind:     String,
+        body:     String,
+        ts:       i64,
+        id:       String,
+        pubkey:   String,
+        sig:      String,
+    },
     PeerAnnounce {
         address:  String,
         name:     String,
@@ -8287,6 +8297,14 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
         // inner message here. Keeping the unseal out of this function is what
         // stops handle_incoming from having to call itself.
         P2PMessage::SealedDm { .. } => {}
+
+        P2PMessage::MarketChat { trade_id, from, kind, body, ts, id, pubkey, sig } => {
+            crate::commands::market::receive_chat(
+                crate::commands::market::WireChat { trade_id, from, kind, body, ts, id, pubkey, sig },
+                app,
+            )
+            .await;
+        }
 
         P2PMessage::ContactRequest {
             from_addr, from_name, from_ed25519, from_kyber, from_shared_key, from_endpoint, bundle_token,

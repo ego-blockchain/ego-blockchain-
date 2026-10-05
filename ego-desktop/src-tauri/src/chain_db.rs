@@ -1427,6 +1427,21 @@ pub fn get_dynamic_checkpoint(height: u64) -> Option<String> {
 /// far back; refusing any truncation at or below this height makes a checkpointed
 /// prefix immutable, so neither a synced node nor a freshly-syncing one can be
 /// fed a fork that diverges before the last checkpoint.
+pub(crate) fn block_timestamp(db: &DB, height: u64) -> Option<i64> {
+    let cf = db.cf_handle(CF_BLOCKS)?;
+    db.get_cf(cf, height_key(height))
+        .ok()
+        .flatten()
+        .and_then(|v| decode::<LedgerBlock>(&v))
+        .map(|b| b.timestamp)
+}
+
+pub(crate) fn tx_is_committed(db: &DB, hash: &str) -> bool {
+    db.cf_handle(CF_TXS)
+        .and_then(|cf| db.get_cf(cf, hash.as_bytes()).ok().flatten())
+        .is_some()
+}
+
 pub(crate) fn finality_floor_height(db: &DB) -> u64 {
     let mut floor = CHECKPOINTS.iter().map(|(h, _)| *h).max().unwrap_or(0);
     if let Some(cf) = db.cf_handle(CF_META) {
@@ -1587,10 +1602,15 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
         .copied()
         .filter(|tx| !already_committed.contains(tx.hash.as_str()))
         .collect();
+    let market_plan = crate::market_chain::plan_block(db, block.height, &fresh_txs);
 
     for tx in &confirmed_txs {
         // Skip if tx already exists.
         if already_committed.contains(tx.hash.as_str()) {
+            continue;
+        }
+        if !market_plan.takes_effect(&tx.hash) {
+            new_tx_count += 1;
             continue;
         }
 
@@ -1662,7 +1682,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
                 }
                 Err(e) => tracing::warn!("Skipping invalid equivocation proof {} during block write: {}", tx.hash, e),
             }
-        } else if crate::shielded_chain::is_unshield(tx) {
+        } else if crate::ledger::pays_fee_from_amount(tx) {
             *balance_delta.entry(tx.to.clone()).or_insert(0) +=
                 credited_amount.saturating_sub(tx.fee_uegoc) as i128;
             *balance_delta.entry(tx.from.clone()).or_insert(0) -= credited_amount as i128;
@@ -1916,6 +1936,7 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     sweep_inactive_validators(db, &mut batch, block.height);
 
     crate::shielded_chain::apply_block(db, &mut batch, block.height, &fresh_txs);
+    crate::market_chain::apply_plan(db, &mut batch, block.height, &market_plan);
 
     tracing::debug!("[ChainDB] db.write(batch) starting — block #{}", block.height);
     if let Err(e) = db.write(batch) {
@@ -1924,6 +1945,9 @@ fn write_block_batch(db: &DB, block: &LedgerBlock, txs: &[LedgerTx]) -> bool {
     }
     tracing::debug!("[ChainDB] db.write(batch) done — block #{}", block.height);
     crate::shielded_chain::check_invariants(db, block.height);
+    if !market_plan.is_empty() {
+        crate::market_chain::check_invariants(db, block.height);
+    }
 
     let block_height = block.height;
     let addr = crate::ledger::Ledger::load().address;
@@ -3465,6 +3489,16 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
 
     let mut seen_tx_hashes = std::collections::HashSet::new();
     let mut seen_commitments = std::collections::HashSet::new();
+    let (market_reader, market_now) = crate::market_chain::proposal_planner(db, height);
+    let mut market = crate::market_chain::Planner::new(&market_reader, height, market_now);
+    for tx in sorted_txs.iter().filter(|t| {
+        t.tx_type == crate::market_chain::TX_PAID && crate::market_chain::is_escrow_deposit(t)
+    }) {
+        if get_tx_by_hash(&tx.hash).is_none() {
+            let _ = market.admit(tx);
+        }
+    }
+    let mut blocked_senders: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut held_back: Vec<LedgerTx> = Vec::new();
     let valid_txs: Vec<&LedgerTx> = sorted_txs.iter().filter(|tx| {
         if tx.hash.is_empty() {
@@ -3479,6 +3513,22 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
             // TX was already confirmed by a peer's block, silently drop from mempool
                 return false;
             }
+        if tx.nonce > 0 && blocked_senders.contains(&tx.from) {
+            held_back.push((*tx).clone());
+            return false;
+        }
+        if crate::market_chain::touches_market(tx) && !market.was_admitted(tx) {
+            if let Err(refusal) = market.admit(tx) {
+                eprintln!("[TX] {:.12} held back from this proposal — {refusal}", tx.hash);
+                if refusal.is_transient() {
+                    if tx.nonce > 0 {
+                        blocked_senders.insert(tx.from.clone());
+                    }
+                    held_back.push((*tx).clone());
+                }
+                return false;
+            }
+        }
         // A withdrawal is judged against the pool the committee holds. Relaying one this
         // node cannot yet check is right; putting it in a block is not, because the block
         // would be refused and take every transaction beside it down with it. Leave it in
@@ -3543,7 +3593,7 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
             // `amount + fee` asks the pool for money no deposit ever put there, so a note
             // spent in full always came up exactly one fee short and was dropped from the
             // block without ever being invalid.
-            let cost = if crate::shielded_chain::is_unshield(tx) {
+            let cost = if crate::ledger::pays_fee_from_amount(tx) {
                 tx.amount
             } else {
                 tx.amount.saturating_add(tx.fee_uegoc)
@@ -3558,7 +3608,7 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
                 let to_bal = sim_balances.get(&tx.to).copied().unwrap_or_else(|| {
                     db.get_cf(cf_bal, tx.to.as_bytes()).ok().flatten().map(|v| read_u64_le(&v)).unwrap_or(0)
                 });
-                let credited = crate::shielded_chain::credited_to_recipient(tx);
+                let credited = crate::ledger::credited_to_recipient(tx);
                 sim_balances.insert(tx.to.clone(), to_bal.saturating_add(credited));
             }
         }
@@ -4080,9 +4130,11 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
                     && operational_reward_rate_ok(&tx.to, tx.timestamp);
                 let is_unshield = tx.tx_type == crate::shielded_chain::TX_UNSHIELD
                     && tx.from == crate::shielded_chain::SHIELDED_POOL_ADDR;
+                let is_settle = tx.tx_type == crate::market_chain::TX_SETTLE
+                    && tx.from == crate::market_chain::MARKET_ESCROW_ADDR;
                 // H3: every other system-source tx must carry a recognized emission
                 // type (no magic-string signatures).
-                if !is_reward && !is_unshield && !is_system_emission_type(&tx.tx_type) {
+                if !is_reward && !is_unshield && !is_settle && !is_system_emission_type(&tx.tx_type) {
                     return Err(format!("forbidden system-source tx {} (type: '{}')", tx.hash, tx.tx_type));
                 }
         } else {
@@ -4126,7 +4178,7 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
                         .map(|v| read_u64_le(&v))
                         .unwrap_or(0)
                 });
-                *credit = credit.saturating_add(crate::shielded_chain::credited_to_recipient(tx));
+                *credit = credit.saturating_add(crate::ledger::credited_to_recipient(tx));
             }
             continue;
         }
@@ -4179,7 +4231,8 @@ fn validate_block_protocol_txs_inner(db: &DB, block: &LedgerBlock, txs: &[Ledger
         *balance = balance.saturating_sub(required);
         if !tx.to.is_empty()
             && (!crate::ledger::is_reserved_system_source(&tx.to)
-                || crate::shielded_chain::is_deposit(tx))
+                || crate::shielded_chain::is_deposit(tx)
+                || crate::market_chain::is_escrow_deposit(tx))
         {
             let to_bal = simulated_balances.entry(tx.to.clone()).or_insert_with(|| {
                 db.get_cf(cf_bal, tx.to.as_bytes())
@@ -4252,6 +4305,7 @@ fn validate_peer_block_impl(block: &LedgerBlock, txs: &[LedgerTx], is_proposal: 
             .map_err(|e| format!("coverage proof {} rejected: {e}", tx.hash))?;
     }
     crate::shielded_chain::validate_block_shielded_txs(block.height, txs)?;
+    crate::market_chain::validate_block_market_txs(block.height, txs)?;
     let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
     let mut parent_vote_count: u32 = 0;
     if block.height > 1 {
@@ -4510,6 +4564,7 @@ pub fn delete_full_blocks_for_shard(shard_id: u32, shard_count: u32) {
 fn reorg_reverse_balance_delta(tx: &LedgerTx, out: &mut std::collections::HashMap<String, i128>) {
     if tx.tx_type == "equivocation_proof" { return; }
     if crate::shielded_chain::reverse_balance_delta(tx, out) { return; }
+    if crate::market_chain::reverse_balance_delta(tx, out) { return; }
     let is_system = tx.from == NODE_POOL_ADDR || tx.from.is_empty();
     if is_unstake_tx(tx) {
         let credit = unstake_credit_amount(tx) as i128;
@@ -4587,6 +4642,7 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
     let mut pool_txs: Vec<crate::ledger::LedgerTx> = Vec::new();
     let mut removed_hashes: std::collections::HashSet<String> = Default::default();
     let mut batch = WriteBatch::default();
+    let market_rejected = crate::market_chain::rejected_since(&db, height);
 
     for h in height..=tip {
         if let Ok(Some(bytes)) = db.get_cf(cf_blocks, height_key(h)) {
@@ -4637,7 +4693,9 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
                         batch.delete_cf(cf_addr_txs, old_addr_txs_key(&tx.from, tx.timestamp, &tx.hash));
                             }
                         }
-                        reorg_reverse_balance_delta(&tx, &mut balance_reverse);
+                        if !market_rejected.contains(&tx.hash) {
+                            reorg_reverse_balance_delta(&tx, &mut balance_reverse);
+                        }
                         if crate::shielded_chain::touches_pool(&tx) {
                             pool_txs.push(tx.clone());
                         }
@@ -4645,7 +4703,9 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
                             affected_senders.insert(tx.from.clone());
                         }
                         removed_hashes.insert(tx.hash.clone());
-                        if matches!(tx.tx_type.as_str(), "transfer" | "stake" | "unstake" | "deploy" | "call") {
+                        if matches!(tx.tx_type.as_str(), "transfer" | "stake" | "unstake" | "deploy" | "call")
+                            || tx.tx_type.starts_with("market_")
+                        {
                     tx.status = "Pending".to_string();
                     tx.block_height = None;
                             orphaned.push(tx);
@@ -4680,6 +4740,7 @@ pub fn truncate_from(height: u64) -> Vec<crate::ledger::LedgerTx> {
         }
     }
     crate::shielded_chain::rollback(&db, &mut batch, height, &pool_txs);
+    crate::market_chain::rollback(&db, &mut batch, height);
 
     let mut nonce_updates: Vec<(String, u64)> = Vec::new();
     for addr in &affected_senders {

@@ -21,6 +21,8 @@ import IDEPage from './pages/IDEPage';
 import GovernancePage from './pages/GovernancePage';
 import HostingPage from './pages/HostingPage';
 import ComputePage from './pages/ComputePage';
+import P2PPage from './pages/P2PPage';
+import TradeRoom from './pages/p2p/TradeRoom';
 import RegistrationFlow from './components/RegistrationFlow';
 import SyncBanner from './components/SyncBanner';
 import { GlobalLockScreen } from './components/GlobalLockScreen';
@@ -376,6 +378,8 @@ function App() {
                   <Route path="governance" element={<GovernancePage />} />
                   <Route path="hosting"    element={<HostingPage />} />
                   <Route path="compute"    element={<ComputePage />} />
+                  <Route path="p2p"        element={<P2PPage />} />
+                  <Route path="p2p/trade/:id" element={<TradeRoom />} />
                 </Route>
               </Routes>
             </div>

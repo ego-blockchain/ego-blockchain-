@@ -130,7 +130,7 @@ fn is_evm(chain_symbol: &str) -> bool {
 // HTTP client helper
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn http_client() -> reqwest::Client {
+pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -737,12 +737,12 @@ fn hmac_sha512(seed: &[u8], path: &str) -> [u8; 64] {
     mac.finalize().into_bytes().into()
 }
 
-fn secp_privkey(seed: &[u8], path: &str) -> [u8; 32] {
+pub(crate) fn secp_privkey(seed: &[u8], path: &str) -> [u8; 32] {
     let full = hmac_sha512(seed, path);
     let mut k = [0u8; 32]; k.copy_from_slice(&full[..32]); k
 }
 
-fn ed25519_seed32(seed: &[u8], path: &str) -> [u8; 32] {
+pub(crate) fn ed25519_seed32(seed: &[u8], path: &str) -> [u8; 32] {
     let full = hmac_sha512(seed, path);
     let mut k = [0u8; 32]; k.copy_from_slice(&full[..32]); k
 }
@@ -755,7 +755,7 @@ fn hash160(data: &[u8]) -> [u8; 20] {
     let mut out = [0u8; 20]; out.copy_from_slice(&rmd); out
 }
 
-fn base58check(version: u8, payload: &[u8]) -> String {
+pub(crate) fn base58check(version: u8, payload: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut data = vec![version];
     data.extend_from_slice(payload);
@@ -764,7 +764,7 @@ fn base58check(version: u8, payload: &[u8]) -> String {
     bs58::encode(data).into_string()
 }
 
-fn eip55_checksum(addr: &[u8]) -> String {
+pub(crate) fn eip55_checksum(addr: &[u8]) -> String {
     use sha3::{Digest, Keccak256};
     let hex_lower = hex::encode(addr);
     let hash_hex  = hex::encode(Keccak256::digest(hex_lower.as_bytes()));
@@ -1363,7 +1363,7 @@ fn uint_to_be_bytes_nonempty(n: u128) -> Vec<u8> {
     b[start..].to_vec()
 }
 
-fn rlp_item(data: &[u8]) -> Vec<u8> {
+pub(crate) fn rlp_item(data: &[u8]) -> Vec<u8> {
     if data.len() == 1 && data[0] < 0x80 { return data.to_vec(); }
     let mut out = Vec::new();
     if data.len() < 56 {
@@ -1377,9 +1377,9 @@ fn rlp_item(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn rlp_uint(n: u128) -> Vec<u8> { rlp_item(&uint_to_be_bytes_nonempty(n)) }
+pub(crate) fn rlp_uint(n: u128) -> Vec<u8> { rlp_item(&uint_to_be_bytes_nonempty(n)) }
 
-fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
     let payload: Vec<u8> = items.iter().flat_map(|i| i.iter().copied()).collect();
     let mut out = Vec::new();
     if payload.len() < 56 {

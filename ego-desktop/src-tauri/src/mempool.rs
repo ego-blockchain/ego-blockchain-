@@ -235,7 +235,7 @@ impl ShardedMempool {
         }
 
         if !is_system {
-            if !is_validator_reg {
+            if !is_validator_reg && !crate::market_chain::is_settle(&tx) {
                 if tx.fee_uegoc < MIN_FEE_UEGOC {
                     let err = format!("fee {} uEGOC below floor {}", tx.fee_uegoc, MIN_FEE_UEGOC);
                     eprintln!("[Mempool] REJECTED {:.12} — {}", &tx.hash[..12.min(tx.hash.len())], err);
@@ -309,7 +309,7 @@ impl ShardedMempool {
             fn outflow_of(t: &LedgerTx) -> u64 {
                 if t.tx_type == "unstake" && t.to == crate::chain_db::STAKING_ADDR {
                     t.fee_uegoc
-                } else if crate::shielded_chain::is_unshield(t) {
+                } else if crate::ledger::pays_fee_from_amount(t) {
                     t.amount
                 } else {
                     t.amount.saturating_add(t.fee_uegoc)
