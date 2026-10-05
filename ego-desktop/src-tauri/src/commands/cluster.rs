@@ -49,59 +49,6 @@ async fn get_public_ip() -> String {
         .unwrap_or_else(|_| "0.0.0.0".to_string())
 }
 
-fn apply_wg_conf(path: &std::path::Path) -> Result<(), String> {
-    let path_str = path.to_string_lossy().to_string();
-
-    #[cfg(target_os = "windows")]
-    {
-        let r = std::process::Command::new("wireguard")
-            .args(["/installtunnelservice", &path_str])
-            .output();
-        match r {
-            Ok(o) if o.status.success() => return Ok(()),
-            _ => return Err(format!(
-                "Run as Administrator: wireguard.exe /installtunnelservice \"{}\"",
-                path_str
-            )),
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        if let Ok(o) = std::process::Command::new("wg-quick")
-            .args(["up", &path_str]).output()
-        {
-            if o.status.success() { return Ok(()); }
-        }
-        if let Ok(o) = std::process::Command::new("pkexec")
-            .args(["wg-quick", "up", &path_str]).output()
-        {
-            if o.status.success() { return Ok(()); }
-        }
-        Err(format!("Run as root: sudo wg-quick up \"{}\"", path_str))
-    }
-}
-
-fn try_start_ray(is_head: bool, head_ip: &str) -> Result<(), String> {
-    let args: Vec<String> = if is_head {
-        vec![
-            "start".into(), "--head".into(),
-            "--port=6379".into(),
-            "--object-manager-port=8076".into(),
-            "--dashboard-host=0.0.0.0".into(),
-        ]
-    } else {
-        vec!["start".into(), format!("--address={}:6379", head_ip)]
-    };
-
-    match std::process::Command::new("ray").args(&args).spawn() {
-        Ok(_)  => Ok(()),
-        Err(e) => Err(format!(
-            "ray not in PATH ({}). Install: pip install 'ray[default]', then run: ray {}",
-            e, args.join(" ")
-        )),
-    }
-}
-
 fn write_node_wg_config(booking: &ClusterBooking, my_addr: &str, priv_key: &str)
     -> Result<std::path::PathBuf, String>
 {
@@ -382,7 +329,9 @@ pub async fn create_cluster_booking(
 }
 
 pub async fn auto_join_cluster(cluster_id: String, app: tauri::AppHandle) {
-    let my_addr = crate::ledger::Ledger::load().address;
+    let ledger = crate::ledger::Ledger::load();
+    if !ledger.compute_enabled { return; }
+    let my_addr = ledger.address;
     let mut booking = match crate::chain_db::get_cluster_booking(&cluster_id) {
         Some(b) => b,
         None    => return,
@@ -401,7 +350,6 @@ pub async fn auto_join_cluster(cluster_id: String, app: tauri::AppHandle) {
     save_wg_privkey(&cluster_id, "provider", &priv_key);
     let endpoint  = format!("{}:{}", get_public_ip().await, WG_PORT);
     let now       = chrono::Utc::now().timestamp();
-    let mut is_head = false;
 
     for node in booking.nodes.iter_mut() {
         if node.provider_address == my_addr {
@@ -410,7 +358,6 @@ pub async fn auto_join_cluster(cluster_id: String, app: tauri::AppHandle) {
             node.status            = "active".to_string();
             node.joined_at         = now;
             node.last_heartbeat_at = now;
-            is_head                = node.is_head;
             break;
         }
     }
@@ -425,22 +372,13 @@ pub async fn auto_join_cluster(cluster_id: String, app: tauri::AppHandle) {
     } else {
         booking.name.clone()
     };
-    let head_ip      = booking.head_wg_ip.clone();
-    let framework    = booking.framework.clone();
-
-    let wg_result = write_node_wg_config(&booking, &my_addr, &priv_key)
-        .and_then(|p| apply_wg_conf(&p).map(|_| p));
-
-    let ray_result = if framework == "ray" {
-        try_start_ray(is_head, &head_ip)
-    } else {
-        Ok(())
-    };
-
-    let body = match (&wg_result, &ray_result) {
-        (Ok(_),  Ok(_))  => format!("Joined cluster '{}'. WireGuard and Ray are running.", cluster_name),
-        (Ok(_),  Err(e)) => format!("Joined cluster '{}'. WireGuard up. Ray: {}", cluster_name, e),
-        (Err(e), _)      => format!("Joined cluster '{}'. WG config saved. Manual step needed: {}", cluster_name, e),
+    let body = match write_node_wg_config(&booking, &my_addr, &priv_key) {
+        Ok(path) => format!(
+            "A renter added this machine to cluster '{}'. The tunnel and Ray are not started for them, \
+             because both would reach this computer outside the Docker sandbox. Tunnel settings: {}",
+            cluster_name, path.display()),
+        Err(e) => format!("A renter added this machine to cluster '{}', but its tunnel settings could not be saved: {}",
+            cluster_name, e),
     };
     crate::commands::notifications::notify(&app, "Cluster Node Joined", &body);
 

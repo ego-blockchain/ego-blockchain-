@@ -4014,44 +4014,6 @@ async fn serve_compute_exec(req: ComputeExecRequest) -> ComputeExecResponse {
         Err(_) => return ComputeExecResponse { ok: false, status: 500, body: "Failed to derive bech32 address".into() },
     };
 
-    // Trust order: locally stored reservation > buyer-supplied attestation.
-    let reservation = crate::chain_db::get_compute_reservation(&req.reservation_id)
-        .or_else(|| req.reservation.clone());
-    let reservation = match reservation {
-        Some(r) => r,
-        None    => return ComputeExecResponse {
-            ok: false, status: 401,
-            body: format!("Unknown reservation {} and no attestation provided", req.reservation_id),
-        },
-    };
-
-    if reservation.reservation_id != req.reservation_id {
-        return ComputeExecResponse { ok: false, status: 400, body: "Reservation id mismatch".into() };
-    }
-    if !exec_addrs_match(&reservation.provider_address, &my_addr) {
-        return ComputeExecResponse {
-            ok: false, status: 403,
-            body: format!("Reservation provider {} does not match this node {}",
-                reservation.provider_address, my_addr),
-        };
-    }
-    if !exec_addrs_match(&reservation.buyer_address, &derived_bech32) {
-        return ComputeExecResponse {
-            ok: false, status: 403,
-            body: format!("Dilithium key derives {}, but reservation buyer is {}",
-                derived_bech32, reservation.buyer_address),
-        };
-    }
-    if reservation.status != "active" {
-        return ComputeExecResponse {
-            ok: false, status: 403,
-            body: format!("Reservation status is '{}', not active", reservation.status),
-        };
-    }
-    if reservation.expires_at <= now {
-        return ComputeExecResponse { ok: false, status: 403, body: "Reservation expired".into() };
-    }
-
     let dil_sig_bytes = match hex::decode(&req.dilithium_signature) {
         Ok(b) if !b.is_empty() => b,
         _ => return ComputeExecResponse { ok: false, status: 400, body: "Missing/invalid dilithium_signature".into() },
@@ -4065,42 +4027,32 @@ async fn serve_compute_exec(req: ComputeExecRequest) -> ComputeExecResponse {
         Err(e)    => return ComputeExecResponse { ok: false, status: 401, body: format!("Signature verify error: {e}") },
     }
 
+    let reservation = {
+        let id      = req.reservation_id.clone();
+        let claimed = req.reservation.clone();
+        let renter  = derived_bech32.clone();
+        let me      = my_addr.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::compute_admission::admit(&id, claimed.as_ref(), &renter, &me, now)
+        }).await {
+            Ok(Ok(r))  => r,
+            Ok(Err(e)) => return ComputeExecResponse { ok: false, status: 403, body: e },
+            Err(e)     => return ComputeExecResponse { ok: false, status: 500, body: e.to_string() },
+        }
+    };
+
+    let docker = tokio::task::spawn_blocking(crate::sandbox::docker_available).await.unwrap_or(false);
+    let no_sandbox = || ComputeExecResponse { ok: false, status: 503, body: NO_SANDBOX.into() };
+
     match req.kind.as_str() {
         "METRICS" => {
-            // Prefer real per-rental stats from the Docker sandbox. These reflect
-            // only the renter's own workload, capped to what they paid for.
             let res_probe = reservation.clone();
             let sandboxed = tokio::task::spawn_blocking(move || crate::sandbox::metrics(&res_probe))
                 .await.ok().flatten();
-
-            let (cpu, ram_used_gb, gpu, os, is_sandbox): (f32, f64, i32, &str, bool) =
-                if let Some((c, r, g)) = sandboxed {
-                    (c, r, g, "linux", true)
-                } else {
-                    // Fallback: no sandbox runtime — report the host machine, honestly.
-                    use sysinfo::{System, CpuRefreshKind};
-                    let mut sys = System::new();
-                    sys.refresh_cpu_specifics(CpuRefreshKind::new().with_cpu_usage());
-                    sys.refresh_memory();
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    sys.refresh_cpu();
-                    let cpu = sys.global_cpu_info().cpu_usage();
-                    let ram_used_gb = (sys.used_memory() as f64 / 1_073_741_824.0)
-                        .min(reservation.ram_gb as f64);
-                    let gpu = std::process::Command::new("nvidia-smi")
-                        .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
-                        .output()
-                        .ok()
-                        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i32>().ok())
-                        .unwrap_or(0);
-                    let host_os = if cfg!(target_os = "windows") { "windows" }
-                                  else if cfg!(target_os = "macos") { "macos" }
-                                  else { "linux" };
-                    (cpu, ram_used_gb, gpu, host_os, false)
-                };
+            let (cpu, ram_used_gb, gpu) = sandboxed.unwrap_or((0.0, 0.0, 0));
             let body = serde_json::json!({
                 "cpu": cpu, "ram_used_gb": ram_used_gb, "gpu": gpu,
-                "os": os, "sandboxed": is_sandbox,
+                "os": "linux", "sandboxed": sandboxed.is_some(),
             }).to_string();
             ComputeExecResponse { ok: true, status: 200, body }
         }
@@ -4126,12 +4078,12 @@ async fn serve_compute_exec(req: ComputeExecRequest) -> ComputeExecResponse {
                     .lines().map(|l| l.trim()).collect::<Vec<_>>().join(", "))
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "No CUDA GPU detected".into());
-            let isolation = if tokio::task::spawn_blocking(crate::sandbox::docker_available).await.unwrap_or(false) {
+            let isolation = if docker {
                 format!("Docker sandbox — your commands run isolated, capped to {} core(s) / {} GB RAM{}",
                     reservation.cpu_cores, reservation.ram_gb,
                     if reservation.gpu_count > 0 { format!(" / {} GPU", reservation.gpu_count) } else { String::new() })
             } else {
-                "none — provider has no Docker runtime; commands share the host (no resource cap)".to_string()
+                "unavailable: the provider has no Docker sandbox running, so commands are refused".to_string()
             };
             let body = format!(
                 "Remote host hardware (the provider machine you rented)\n\
@@ -4148,7 +4100,9 @@ async fn serve_compute_exec(req: ComputeExecRequest) -> ComputeExecResponse {
         }
         "PUT" | "APPEND" | "GET" | "GETR" | "LIST" => {
             use base64::{engine::general_purpose::STANDARD, Engine as _};
-            let docker = tokio::task::spawn_blocking(crate::sandbox::docker_available).await.unwrap_or(false);
+            if !docker {
+                return no_sandbox();
+            }
             match req.kind.as_str() {
                 "PUT" | "APPEND" => {
                     let bytes = match req.payload.as_ref().and_then(|b| STANDARD.decode(b).ok()) {
@@ -4159,13 +4113,8 @@ async fn serve_compute_exec(req: ComputeExecRequest) -> ComputeExecResponse {
                     let path = req.command.clone();
                     let append = req.kind == "APPEND";
                     let r = tokio::task::spawn_blocking(move || {
-                        if docker {
-                            if append { crate::sandbox::append_file(&res2, &path, &bytes) }
-                            else      { crate::sandbox::put_file(&res2, &path, &bytes) }
-                        } else {
-                            if append { crate::sandbox::append_file_host(&res2, &path, &bytes) }
-                            else      { crate::sandbox::put_file_host(&res2, &path, &bytes) }
-                        }
+                        if append { crate::sandbox::append_file(&res2, &path, &bytes) }
+                        else      { crate::sandbox::put_file(&res2, &path, &bytes) }
                     }).await.unwrap_or_else(|e| Err(e.to_string()));
                     match r {
                         Ok(())  => ComputeExecResponse { ok: true,  status: 200, body: "ok".into() },
@@ -4175,10 +4124,8 @@ async fn serve_compute_exec(req: ComputeExecRequest) -> ComputeExecResponse {
                 "GET" => {
                     let res2 = reservation.clone();
                     let path = req.command.clone();
-                    let r = tokio::task::spawn_blocking(move || {
-                        if docker { crate::sandbox::get_file(&res2, &path) }
-                        else      { crate::sandbox::get_file_host(&res2, &path) }
-                    }).await.unwrap_or_else(|e| Err(e.to_string()));
+                    let r = tokio::task::spawn_blocking(move || crate::sandbox::get_file(&res2, &path))
+                        .await.unwrap_or_else(|e| Err(e.to_string()));
                     match r {
                         Ok(bytes) => ComputeExecResponse { ok: true, status: 200, body: STANDARD.encode(bytes) },
                         Err(e)    => ComputeExecResponse { ok: false, status: 400, body: e },
@@ -4194,10 +4141,8 @@ async fn serve_compute_exec(req: ComputeExecRequest) -> ComputeExecResponse {
                         _ => return ComputeExecResponse { ok: false, status: 400, body: "Bad range request".into() },
                     };
                     let res2 = reservation.clone();
-                    let r = tokio::task::spawn_blocking(move || {
-                        if docker { crate::sandbox::read_range(&res2, &name, offset, len) }
-                        else      { crate::sandbox::read_range_host(&res2, &name, offset, len) }
-                    }).await.unwrap_or_else(|e| Err(e.to_string()));
+                    let r = tokio::task::spawn_blocking(move || crate::sandbox::read_range(&res2, &name, offset, len))
+                        .await.unwrap_or_else(|e| Err(e.to_string()));
                     match r {
                         Ok(bytes) => ComputeExecResponse { ok: true, status: 200, body: STANDARD.encode(bytes) },
                         Err(e)    => ComputeExecResponse { ok: false, status: 400, body: e },
@@ -4205,10 +4150,8 @@ async fn serve_compute_exec(req: ComputeExecRequest) -> ComputeExecResponse {
                 }
                 _ => {
                     let res2 = reservation.clone();
-                    let r = tokio::task::spawn_blocking(move || {
-                        if docker { crate::sandbox::list_files(&res2) }
-                        else      { crate::sandbox::list_files_host(&res2) }
-                    }).await.unwrap_or_else(|e| Err(e.to_string()));
+                    let r = tokio::task::spawn_blocking(move || crate::sandbox::list_files(&res2))
+                        .await.unwrap_or_else(|e| Err(e.to_string()));
                     match r {
                         Ok(files) => {
                             let arr: Vec<_> = files.into_iter()
@@ -4239,19 +4182,13 @@ async fn serve_compute_exec(req: ComputeExecRequest) -> ComputeExecResponse {
             ComputeExecResponse { ok: true, status: 200, body }
         }
         _ => {
-            // Run inside the reservation's Docker sandbox when available; this
-            // enforces the rented CPU/RAM/GPU caps and isolates the renter from
-            // the host. Fall back to host shell when Docker isn't installed.
-            let docker = tokio::task::spawn_blocking(crate::sandbox::docker_available)
-                .await.unwrap_or(false);
-            let result: Result<std::process::Output, String> = if docker {
-                let res2 = reservation.clone();
-                let cmd2 = req.command.clone();
-                tokio::task::spawn_blocking(move || crate::sandbox::exec_in(&res2, &cmd2))
-                    .await.unwrap_or_else(|e| Err(format!("sandbox join error: {e}")))
-            } else {
-                run_shell_command(&req.command).await.map_err(|e| format!("System error: {e}"))
-            };
+            if !docker {
+                return no_sandbox();
+            }
+            let res2 = reservation.clone();
+            let cmd2 = req.command.clone();
+            let result = tokio::task::spawn_blocking(move || crate::sandbox::exec_in(&res2, &cmd2))
+                .await.unwrap_or_else(|e| Err(format!("sandbox join error: {e}")));
             match result {
                 Ok(o) => {
                     let combined = String::from_utf8_lossy(&o.stdout).to_string()
@@ -4268,51 +4205,11 @@ async fn serve_compute_exec(req: ComputeExecRequest) -> ComputeExecResponse {
     }
 }
 
-/// Runs a shell command, hunting for a usable shell binary because Tauri's
-/// child-process environment on Windows doesn't always include the
-/// WindowsPowerShell directory in PATH. Falls through PowerShell → pwsh → cmd.
-async fn run_shell_command(command: &str) -> std::io::Result<std::process::Output> {
-    if cfg!(target_os = "windows") {
-        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
-        let candidates: Vec<(String, Vec<&'static str>)> = vec![
-            (format!("{}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", system_root),
-                vec!["-NoProfile", "-Command"]),
-            ("powershell.exe".to_string(),
-                vec!["-NoProfile", "-Command"]),
-            ("pwsh.exe".to_string(),
-                vec!["-NoProfile", "-Command"]),
-            (format!("{}\\System32\\cmd.exe", system_root),
-                vec!["/C"]),
-            ("cmd.exe".to_string(),
-                vec!["/C"]),
-        ];
-        let mut last_err: Option<std::io::Error> = None;
-        for (prog, args) in candidates {
-            let mut cmd = tokio::process::Command::new(&prog);
-            for a in &args { cmd.arg(a); }
-            cmd.arg(command);
-            match cmd.output().await {
-                Ok(o) => return Ok(o),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    last_err = Some(e);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(last_err.unwrap_or_else(|| std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "No usable shell found (tried powershell, pwsh, cmd)",
-        )))
-    } else {
-        tokio::process::Command::new("sh")
-            .args(["-c", command])
-            .output().await
-    }
-}
+const NO_SANDBOX: &str = "This provider has no Docker sandbox running, so it cannot run anything for you. \
+    Ask the provider to start Docker, or rent another machine.";
 
 /// Address-equality check tolerant of bech32 vs hex representations.
-fn exec_addrs_match(a: &str, b: &str) -> bool {
+pub(crate) fn exec_addrs_match(a: &str, b: &str) -> bool {
     if a.eq_ignore_ascii_case(b) { return true; }
     let to_hex = |s: &str| {
         let hrp = if s.starts_with("egot") { "egot" }
@@ -4364,23 +4261,15 @@ fn validate_tunnel_handshake(hs: &TunnelHandshake) -> Result<crate::chain_db::Co
     let derived  = ego_core::EgoAddress::from_dilithium_pk(&dil_pk_bytes, chain_id, ego_core::AddressType::EOA)
         .to_bech32(hrp).map_err(|_| "failed to derive bech32 address")?;
 
-    let reservation = crate::chain_db::get_compute_reservation(&hs.reservation_id)
-        .or_else(|| hs.reservation.clone())
-        .ok_or_else(|| format!("unknown reservation {}", hs.reservation_id))?;
-    if reservation.reservation_id != hs.reservation_id { return Err("reservation id mismatch".into()); }
-    if !exec_addrs_match(&reservation.provider_address, &my_addr) { return Err("not this node's reservation".into()); }
-    if !exec_addrs_match(&reservation.buyer_address, &derived)    { return Err("key does not match reservation buyer".into()); }
-    if reservation.status != "active" { return Err(format!("reservation status is '{}'", reservation.status)); }
-    if reservation.expires_at <= now  { return Err("reservation expired".into()); }
-
     let dil_pk  = ego_core::PublicKey::new(ego_core::AlgorithmId::MlDsa2, dil_pk_bytes);
     let sig_raw = hex::decode(&hs.dilithium_signature).map_err(|_| "bad dilithium_signature")?;
     let dil_sig = ego_core::Signature::dilithium2(sig_raw);
     let signed  = format!("TUNNEL:{}:{}:{}", hs.reservation_id, hs.container_port, hs.timestamp);
-    match ego_core::verify_signature(&dil_pk, signed.as_bytes(), &dil_sig) {
-        Ok(true) => Ok(reservation),
-        _        => Err("invalid Dilithium signature".into()),
+    if !matches!(ego_core::verify_signature(&dil_pk, signed.as_bytes(), &dil_sig), Ok(true)) {
+        return Err("invalid Dilithium signature".into());
     }
+
+    crate::compute_admission::admit(&hs.reservation_id, hs.reservation.as_ref(), &derived, &my_addr, now)
 }
 
 /// Provider side: handle one inbound tunnel stream — read+verify the handshake,
@@ -4409,9 +4298,17 @@ where
 
     let res_id = reservation.reservation_id.clone();
     let cport  = hs.container_port;
-    let host_port = tokio::task::spawn_blocking(move || crate::sandbox::mapped_port(&res_id, cport))
-        .await.map_err(|e| e.to_string())?
-        .unwrap_or(cport);
+    let host_port = if crate::sandbox::APP_PORTS.contains(&cport) {
+        tokio::task::spawn_blocking(move || crate::sandbox::mapped_port(&res_id, cport))
+            .await.map_err(|e| e.to_string())?
+    } else {
+        None
+    };
+    let Some(host_port) = host_port else {
+        let _ = AsyncWriteExt::write_all(&mut stream, &[0u8]).await;
+        let _ = AsyncWriteExt::flush(&mut stream).await;
+        return Err(format!("port {cport} is not an app port of this rental's sandbox"));
+    };
 
     let tcp = match tokio::net::TcpStream::connect(("127.0.0.1", host_port)).await {
         Ok(t)  => t,
@@ -8034,33 +7931,14 @@ async fn handle_event(
                             }).await.ok();
                         });
                     }
-                    Ok(P2PMessage::ReservationBooked { reservation, ssh_public_key }) => {
-                        let my_addr = crate::ledger::Ledger::load().address;
-                        // Robust comparison supporting hex (0x) vs bech32 (egot1)
-                        let is_for_me = if reservation.provider_address == my_addr {
-                            true
-                        } else {
-                            let my_hex = ego_core::EgoAddress::from_bech32(&my_addr, "egot").map(|a| hex::encode(a.as_bytes())).unwrap_or_default();
-                            reservation.provider_address.to_lowercase().trim_start_matches("0x") == my_hex
-                        };
-                        let key_to_auth = ssh_public_key.clone();
-
+                    Ok(P2PMessage::ReservationBooked { reservation, .. }) => {
                         tokio::spawn(async move {
-                            if is_for_me {
-                                if let Some(key) = key_to_auth {
-                                    let _ = crate::commands::compute::authorize_ssh_key(&key);
-                                }
-                                // Pre-build the isolated sandbox so the renter's
-                                // first console command doesn't wait on an image pull.
-                                let res_warm = reservation.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    if res_warm.status == "active" {
-                                        crate::sandbox::prewarm_image();
-                                        let _ = crate::sandbox::ensure_container(&res_warm);
-                                    }
-                                }).await.ok();
-                            }
                             tokio::task::spawn_blocking(move || {
+                                if reservation.status == "active"
+                                    && crate::compute_admission::is_own_offer(&reservation.offer_id)
+                                {
+                                    crate::sandbox::prewarm_image();
+                                }
                                 if crate::chain_db::get_compute_reservation(&reservation.reservation_id).is_none() {
                                     crate::chain_db::upsert_compute_reservation(&reservation);
                                 }
@@ -15235,5 +15113,119 @@ mod snapshot_serve_tests {
     fn the_lag_rule_is_unchanged_for_a_node_that_is_merely_behind() {
         assert!(!snapshot_serve_allowed(10 + SNAPSHOT_SERVE_MIN_LAG, 10, false));
         assert!(snapshot_serve_allowed(11 + SNAPSHOT_SERVE_MIN_LAG, 10, false));
+    }
+}
+
+#[cfg(test)]
+mod compute_exec_tests {
+    use super::{serve_compute_exec, ComputeExecRequest, NO_SANDBOX};
+    use crate::chain_db::{ComputeCapacityOffer, ComputeReservation};
+
+    fn renter_address(kp: &ego_core::KeyPair, me: &str) -> String {
+        let hrp = if me.starts_with("egot") { "egot" } else { "ego" };
+        let chain_id = if hrp == "egot" { 1 } else { 0 };
+        ego_core::EgoAddress::from_dilithium_pk(&kp.dilithium_public_key().key_data, chain_id, ego_core::AddressType::EOA)
+            .to_bech32(hrp)
+            .unwrap()
+    }
+
+    fn request(kp: &ego_core::KeyPair, res: &ComputeReservation, kind: &str, command: &str) -> ComputeExecRequest {
+        let ts = chrono::Utc::now().timestamp();
+        let signed = format!("{}:{}:{}", res.reservation_id, command, ts);
+        ComputeExecRequest {
+            reservation_id:       res.reservation_id.clone(),
+            command:              command.to_string(),
+            timestamp:            ts,
+            dilithium_signature:  hex::encode(&kp.sign_dilithium(signed.as_bytes()).signature_data),
+            dilithium_public_key: hex::encode(&kp.dilithium_public_key().key_data),
+            kind:                 kind.to_string(),
+            reservation:          Some(res.clone()),
+            payload:              None,
+        }
+    }
+
+    fn offer(me: &str) -> ComputeCapacityOffer {
+        let now = chrono::Utc::now().timestamp();
+        ComputeCapacityOffer {
+            offer_id: uuid::Uuid::new_v4().to_string(),
+            provider_address: me.to_string(),
+            cpu_cores: 2, ram_gb: 4, gpu_count: 0, gpu_vram_gb: 0, gpu_name: String::new(),
+            price_per_gpu_hour_uegoc: 0, price_per_core_hour_uegoc: 1_000,
+            price_per_gpu_hour_credits: 0, price_per_core_hour_credits: 0,
+            price_per_gpu_day_uegoc: 0, price_per_core_day_uegoc: 0,
+            min_duration_hours: 1, max_duration_hours: 2, sla_uptime_pct: 99,
+            available_from: now - 60, status: "open".into(), created_at: now - 60, bonded: false,
+        }
+    }
+
+    fn rental(offer_id: &str, renter: &str, me: &str) -> ComputeReservation {
+        let now = chrono::Utc::now().timestamp();
+        ComputeReservation {
+            reservation_id: uuid::Uuid::new_v4().to_string(),
+            offer_id: offer_id.to_string(),
+            buyer_address: renter.to_string(),
+            provider_address: me.to_string(),
+            cpu_cores: 2, ram_gb: 4, gpu_count: 0,
+            duration_minutes: 60, period_minutes: 60, period_rate_uegoc: 2_000,
+            total_cost_uegoc: 2_000, collateral_uegoc: 0,
+            status: "active".into(),
+            created_at: now, expires_at: now + 3_600, last_heartbeat_at: now,
+            periods_paid: 0, breach_count: 0, escrow_remaining: 2_000,
+            days: 0, days_paid: 0, daily_rate_uegoc: 0, started_at: None, paid_in_egusd: false,
+        }
+    }
+
+    fn marker_command() -> (std::path::PathBuf, String) {
+        let marker = std::env::temp_dir().join(format!("ego-exec-{}", uuid::Uuid::new_v4()));
+        let command = format!("echo reached > \"{}\"", marker.display());
+        (marker, command)
+    }
+
+    #[tokio::test]
+    async fn a_stranger_with_a_self_made_rental_runs_nothing() {
+        let me = crate::ledger::Ledger::load().address;
+        let attacker = ego_core::KeyPair::generate();
+        let forged = rental(&uuid::Uuid::new_v4().to_string(), &renter_address(&attacker, &me), &me);
+        let (marker, command) = marker_command();
+        for kind in ["EXEC", "PUT", "LIST", "SPECS", "METRICS"] {
+            let resp = serve_compute_exec(request(&attacker, &forged, kind, &command)).await;
+            assert!(!resp.ok, "{kind}: {}", resp.body);
+            assert_eq!(resp.status, 403, "{kind}: {}", resp.body);
+            assert!(resp.body.contains("never listed"), "{kind}: {}", resp.body);
+        }
+        assert!(!marker.exists(), "a forged rental reached the host");
+    }
+
+    #[tokio::test]
+    async fn a_real_renter_never_reaches_the_host_shell() {
+        let me = crate::ledger::Ledger::load().address;
+        let listed = offer(&me);
+        crate::compute_admission::list_offer(&listed).unwrap();
+        let renter = ego_core::KeyPair::generate();
+        let booked = rental(&listed.offer_id, &renter_address(&renter, &me), &me);
+
+        let stranger = ego_core::KeyPair::generate();
+        let resp = serve_compute_exec(request(&stranger, &booked, "SPECS", "")).await;
+        assert_eq!(resp.status, 403, "{}", resp.body);
+
+        let resp = serve_compute_exec(request(&renter, &booked, "METRICS", "")).await;
+        assert!(resp.ok, "{}", resp.body);
+
+        if !crate::sandbox::docker_available() {
+            let (marker, command) = marker_command();
+            let resp = serve_compute_exec(request(&renter, &booked, "EXEC", &command)).await;
+            assert_eq!(resp.status, 503, "{}", resp.body);
+            assert_eq!(resp.body, NO_SANDBOX);
+            assert!(!marker.exists(), "a renter reached the host shell");
+
+            let resp = serve_compute_exec(request(&renter, &booked, "SPECS", "")).await;
+            assert!(resp.ok, "{}", resp.body);
+            assert!(resp.body.contains("commands are refused"), "{}", resp.body);
+        }
+
+        let second = rental(&listed.offer_id, &renter_address(&stranger, &me), &me);
+        let resp = serve_compute_exec(request(&stranger, &second, "METRICS", "")).await;
+        assert_eq!(resp.status, 403, "{}", resp.body);
+        assert!(resp.body.contains("Someone else"), "{}", resp.body);
     }
 }

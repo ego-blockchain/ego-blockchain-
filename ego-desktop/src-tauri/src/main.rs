@@ -24,6 +24,7 @@ mod ecvrf;
 mod chain_db;
 mod contract_exec;
 mod commands;
+mod compute_admission;
 mod config;
 mod consensus_host;
 mod email;

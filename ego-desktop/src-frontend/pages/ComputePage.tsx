@@ -1793,7 +1793,7 @@ export default function ComputePage() {
                 {usageStats && (
                   usageStats.sandboxed
                     ? <span className="text-[9px] bg-cyan-900/50 text-cyan-300 px-2 py-0.5 rounded border border-cyan-700/50 uppercase font-bold tracking-widest">🔒 Isolated</span>
-                    : <span className="text-[9px] bg-orange-900/50 text-orange-300 px-2 py-0.5 rounded border border-orange-700/50 uppercase font-bold tracking-widest">⚠ Shared Host</span>
+                    : <span className="text-[9px] bg-gray-800/60 text-gray-300 px-2 py-0.5 rounded border border-gray-700/50 uppercase font-bold tracking-widest">Sandbox starting</span>
                 )}
               </div>
               <div className="flex items-center gap-3">
@@ -1809,7 +1809,7 @@ export default function ComputePage() {
               const totalCores = activeRentals.reduce((s, r) => s + r.cpu_cores, 0);
               const totalRam   = activeRentals.reduce((s, r) => s + r.ram_gb, 0);
               const totalGpu   = activeRentals.reduce((s, r) => s + r.gpu_count, 0);
-              const nodeLabel  = activeRentals.length > 1 ? `Node ${activeRentals.findIndex(r => r.reservation_id === showConsole) + 1} load` : (usageStats?.sandboxed ? 'Your usage' : 'Host load');
+              const nodeLabel  = activeRentals.length > 1 ? `Node ${activeRentals.findIndex(r => r.reservation_id === showConsole) + 1} load` : 'Your usage';
               return (
                 <div className="bg-gray-850 px-6 py-3 border-b border-gray-800 grid grid-cols-3 gap-4 shrink-0">
                   <div className="space-y-1">

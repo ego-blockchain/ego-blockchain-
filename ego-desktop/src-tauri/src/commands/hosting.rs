@@ -857,13 +857,24 @@ pub async fn check_domain_status(domain: String) -> String {
 }
 
 #[tauri::command]
-pub fn open_in_browser(url: String) {
+pub fn open_in_browser(url: String) -> Result<(), EgoDesktopError> {
+    let url = web_address(&url)?;
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd").args(["/c", "start", "", &url]).spawn();
+    let _ = std::process::Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", &url]).spawn();
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(&url).spawn();
     #[cfg(target_os = "linux")]
     let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+    Ok(())
+}
+
+fn web_address(raw: &str) -> Result<String, EgoDesktopError> {
+    let parsed = reqwest::Url::parse(raw.trim())
+        .map_err(|_| EgoDesktopError::InvalidInput("That is not a web address.".into()))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(EgoDesktopError::InvalidInput("Only http and https addresses can be opened.".into()));
+    }
+    Ok(parsed.to_string())
 }
 
 #[tauri::command]

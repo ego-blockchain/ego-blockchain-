@@ -1152,6 +1152,10 @@ pub async fn post_capacity_offer(
         return Err(EgoDesktopError::InvalidInput("At least one rate must be > 0".into()));
     }
 
+    if !tokio::task::spawn_blocking(crate::sandbox::docker_available).await.unwrap_or(false) {
+        return Err(EgoDesktopError::InvalidInput(crate::sandbox::NO_DOCKER.into()));
+    }
+
     // Refuse to list GPU capacity this machine can't actually deliver, so a
     // renter never books a GPU that fails the moment they run a command.
     if gpu_count > 0 {
@@ -1189,6 +1193,11 @@ pub async fn post_capacity_offer(
         bonded,
     };
 
+    let listed = offer.clone();
+    tokio::task::spawn_blocking(move || crate::compute_admission::list_offer(&listed))
+        .await
+        .map_err(|e| EgoDesktopError::FileSystemError(e.to_string()))?
+        .map_err(EgoDesktopError::FileSystemError)?;
     crate::chain_db::upsert_compute_offer(&offer);
     let msg = crate::p2p::P2PMessage::CapacityOfferBroadcast { offer: offer.clone() };
     crate::p2p::broadcast_compute_msg(msg).await;
@@ -1208,6 +1217,8 @@ pub async fn cancel_capacity_offer(offer_id: String) -> Result<(), EgoDesktopErr
     }
     offer.status = "cancelled".to_string();
     crate::chain_db::upsert_compute_offer(&offer);
+    let withdrawn = offer_id.clone();
+    tokio::task::spawn_blocking(move || crate::compute_admission::withdraw_offer(&withdrawn)).await.ok();
     let msg = crate::p2p::P2PMessage::CapacityOfferCancelled { offer_id };
     crate::p2p::broadcast_compute_msg(msg).await;
     Ok(())
@@ -2329,6 +2340,7 @@ pub async fn provider_terminate_reservation(
     res.status           = "terminated".to_string();
     res.escrow_remaining = 0;
     crate::chain_db::upsert_compute_reservation(&res);
+    crate::compute_admission::end(&reservation_id, now);
 
     if let Some(mut node) = crate::chain_db::get_compute_node(&res.provider_address) {
         node.locked_cores  = node.locked_cores.saturating_sub(res.cpu_cores);
@@ -2396,6 +2408,7 @@ pub async fn get_compute_earnings() -> Result<ComputeEarnings, EgoDesktopError> 
 /// This allows non-technical users to connect to their rented machine with one click.
 #[tauri::command]
 pub async fn open_ssh_terminal(ssh_command: String) -> Result<(), EgoDesktopError> {
+    let ssh_command = format!("ssh {}", ssh_destination(&ssh_command)?);
     // We append a command to show hardware info immediately upon login
     // This script runs on the REMOTE Linux machine.
     let verify_cmd = "echo '--- RENTED HARDWARE REPORT ---'; echo -n 'CPU Cores: '; nproc; echo -n 'RAM: '; awk '/MemTotal/ {print $2/1024/1024}' /proc/meminfo; echo ' GB'; nvidia-smi --query-gpu=name,memory.total --format=csv,noheader; exec bash";
@@ -2547,44 +2560,15 @@ pub async fn open_ssh_terminal(ssh_command: String) -> Result<(), EgoDesktopErro
     Ok(())
 }
 
-/// Internal helper to add a public key to the local authorized_keys file.
-/// This allows automated SSH access for renters.
-pub fn authorize_ssh_key(pub_key: &str) -> Result<(), EgoDesktopError> {
-    let pub_key = pub_key.trim();
-    if pub_key.is_empty() { return Ok(()); }
-
-    let home = dirs::home_dir()
-        .ok_or_else(|| EgoDesktopError::NotFound("Could not find home directory".into()))?;
-    let ssh_dir = home.join(".ssh");
-    if !ssh_dir.exists() {
-        std::fs::create_dir_all(&ssh_dir)
-            .map_err(|e| EgoDesktopError::FileSystemError(format!("Failed to create .ssh dir: {e}")))?;
+fn ssh_destination(raw: &str) -> Result<String, EgoDesktopError> {
+    let raw = raw.trim();
+    let target = raw.strip_prefix("ssh ").unwrap_or(raw).trim();
+    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | ':');
+    if target.is_empty() || target.len() > 255 || target.starts_with('-') || !target.chars().all(allowed) {
+        return Err(EgoDesktopError::InvalidInput(
+            "That is not an SSH address. Use user@host or a host name.".into()));
     }
-
-    let auth_keys_path = ssh_dir.join("authorized_keys");
-    let mut content = if auth_keys_path.exists() {
-        std::fs::read_to_string(&auth_keys_path).unwrap_or_default()
-    } else {
-        String::new()
-    };
-
-    if !content.contains(pub_key) {
-        if !content.is_empty() && !content.ends_with('\n') {
-            content.push('\n');
-        }
-        content.push_str(pub_key);
-        content.push('\n');
-        std::fs::write(&auth_keys_path, content)
-            .map_err(|e| EgoDesktopError::FileSystemError(format!("Failed to write authorized_keys: {e}")))?;
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&auth_keys_path, std::fs::Permissions::from_mode(0o600));
-        }
-        eprintln!("[SSH] Authorized new key: {}...", &pub_key[..pub_key.len().min(30)]);
-    }
-    Ok(())
+    Ok(target.to_string())
 }
 
 /// Internal helper to ensure the identity key exists, or generate it.

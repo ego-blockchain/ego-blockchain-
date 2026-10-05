@@ -8,12 +8,15 @@
 //!     not the whole machine.
 //!
 //! On Linux this is backed by kernel cgroups directly; on Windows/macOS Docker
-//! Desktop provides the same limits through its Linux VM. When Docker is not
-//! installed the caller falls back to host-shell execution (honestly labelled).
+//! Desktop provides the same limits through its Linux VM.
 
 use crate::chain_db::ComputeReservation;
 use std::process::Output;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+pub const APP_PORTS: [u16; 3] = [8888, 7860, 8000];
+
+static IMAGE_PULLED: AtomicBool = AtomicBool::new(false);
 
 /// Linux base image every sandbox runs. Override with `EGO_SANDBOX_IMAGE`.
 /// Defaults to a slim Python so the built-in "AI workspace" actions work.
@@ -73,28 +76,23 @@ fn docker_gpu_runtime() -> bool {
 
 /// Returns Ok(()) only if this machine can genuinely serve a GPU rental, so a
 /// provider is never allowed to list GPU capacity it can't actually deliver.
-///
-///   * Sandbox mode (Docker present): needs an NVIDIA GPU *and* Docker's NVIDIA
-///     runtime, so `--gpus` works inside the Linux container. macOS can never
-///     pass a GPU into a container, so it fails here.
-///   * Fallback mode (no Docker): the GPU is the host's own, used directly, so
-///     a working nvidia-smi is sufficient.
+/// Needs an NVIDIA GPU *and* Docker's NVIDIA runtime, so `--gpus` works inside
+/// the Linux container. macOS can never pass a GPU into a container.
 pub fn gpu_deliverable() -> Result<(), String> {
-    let host_gpu = nvidia_smi_works();
-    if docker_available() {
-        if !host_gpu {
-            return Err("no NVIDIA GPU detected (nvidia-smi unavailable). Docker can only pass through NVIDIA GPUs.".into());
-        }
-        if !docker_gpu_runtime() {
-            return Err("Docker has no GPU runtime. Install the NVIDIA Container Toolkit (Linux) or enable WSL2 GPU support (Windows). macOS cannot pass a GPU into containers.".into());
-        }
-        Ok(())
-    } else if host_gpu {
-        Ok(())
-    } else {
-        Err("no NVIDIA GPU detected (nvidia-smi unavailable).".into())
+    if !docker_available() {
+        return Err(NO_DOCKER.into());
     }
+    if !nvidia_smi_works() {
+        return Err("no NVIDIA GPU detected (nvidia-smi unavailable). Docker can only pass through NVIDIA GPUs.".into());
+    }
+    if !docker_gpu_runtime() {
+        return Err("Docker has no GPU runtime. Install the NVIDIA Container Toolkit (Linux) or enable WSL2 GPU support (Windows). macOS cannot pass a GPU into containers.".into());
+    }
+    Ok(())
 }
+
+pub const NO_DOCKER: &str = "Docker is not running on this machine. Renters' commands only ever run inside a Docker sandbox, \
+    so install Docker Desktop (or Docker Engine on Linux), start it, and try again.";
 
 fn container_running(name: &str) -> bool {
     std::process::Command::new("docker")
@@ -107,8 +105,13 @@ fn container_running(name: &str) -> bool {
 /// Pull the base image ahead of first use so the initial `EXEC` doesn't block on
 /// a multi-second image download. Safe to call repeatedly (no-op if cached).
 pub fn prewarm_image() {
-    if !docker_available() { return; }
-    let _ = std::process::Command::new("docker").args(["pull", &image()]).output();
+    if !docker_available() || IMAGE_PULLED.swap(true, Ordering::SeqCst) { return; }
+    let pulled = std::process::Command::new("docker").args(["pull", &image()]).output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !pulled {
+        IMAGE_PULLED.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Create the reservation's container if it isn't already running, capped to the
@@ -134,15 +137,17 @@ pub fn ensure_container(res: &ComputeReservation) -> Result<String, String> {
         "--memory-swap".into(), format!("{}g", res.ram_gb.max(1)), // no extra swap beyond rented RAM
         "--pids-limit".into(), "2048".into(),                       // fork-bomb guard
         "--security-opt".into(), "no-new-privileges".into(),
+        "--cap-drop".into(), "NET_RAW".into(),
         "-w".into(), "/workspace".into(),
         "-v".into(), vol,
-        // Publish common web-app ports to a random localhost host port so the
-        // (forthcoming) browser tunnel can reach Jupyter/Gradio/generic apps.
-        // 127.0.0.1-only: never exposed off the provider machine directly.
-        "-p".into(), "127.0.0.1::8888".into(),
-        "-p".into(), "127.0.0.1::7860".into(),
-        "-p".into(), "127.0.0.1::8000".into(),
     ];
+    // Publish common web-app ports to a random localhost host port so the
+    // browser tunnel can reach Jupyter/Gradio/generic apps.
+    // 127.0.0.1-only: never exposed off the provider machine directly.
+    for port in APP_PORTS {
+        args.push("-p".into());
+        args.push(format!("127.0.0.1::{port}"));
+    }
     if res.gpu_count > 0 {
         args.push("--gpus".into());
         args.push(format!("{}", res.gpu_count));
@@ -355,58 +360,6 @@ pub fn list_files(res: &ComputeReservation) -> Result<Vec<(String, u64)>, String
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         if let Some((size, fname)) = line.split_once('\t') {
             files.push((fname.to_string(), size.trim().parse::<u64>().unwrap_or(0)));
-        }
-    }
-    Ok(files)
-}
-
-fn host_workspace_dir(res: &ComputeReservation) -> std::path::PathBuf {
-    let short = &res.reservation_id[..8.min(res.reservation_id.len())];
-    #[cfg(windows)]
-    let base = std::path::PathBuf::from(std::env::var("TEMP").unwrap_or_else(|_| "C:\\Temp".into()));
-    #[cfg(not(windows))]
-    let base = std::path::PathBuf::from("/tmp");
-    base.join("ego_ws").join(short)
-}
-
-pub fn put_file_host(res: &ComputeReservation, rel: &str, bytes: &[u8]) -> Result<(), String> {
-    let dir = host_workspace_dir(res);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join(safe_filename(rel)), bytes).map_err(|e| e.to_string())
-}
-
-pub fn append_file_host(res: &ComputeReservation, rel: &str, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    let dir = host_workspace_dir(res);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let mut f = std::fs::OpenOptions::new().append(true).create(true)
-        .open(dir.join(safe_filename(rel))).map_err(|e| e.to_string())?;
-    f.write_all(bytes).map_err(|e| e.to_string())
-}
-
-pub fn get_file_host(res: &ComputeReservation, rel: &str) -> Result<Vec<u8>, String> {
-    std::fs::read(host_workspace_dir(res).join(safe_filename(rel))).map_err(|e| e.to_string())
-}
-
-pub fn read_range_host(res: &ComputeReservation, rel: &str, offset: u64, len: u64) -> Result<Vec<u8>, String> {
-    let bytes = get_file_host(res, rel)?;
-    let start = offset as usize;
-    let end = (offset + len).min(bytes.len() as u64) as usize;
-    if start >= bytes.len() { return Ok(vec![]); }
-    Ok(bytes[start..end].to_vec())
-}
-
-pub fn list_files_host(res: &ComputeReservation) -> Result<Vec<(String, u64)>, String> {
-    let dir = host_workspace_dir(res);
-    if !dir.exists() { return Ok(vec![]); }
-    let mut files = vec![];
-    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
-        if let Ok(entry) = entry {
-            if let Ok(meta) = entry.metadata() {
-                if meta.is_file() {
-                    files.push((entry.file_name().to_string_lossy().into_owned(), meta.len()));
-                }
-            }
         }
     }
     Ok(files)
