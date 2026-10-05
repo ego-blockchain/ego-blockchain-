@@ -2044,7 +2044,7 @@ export default function IDEPage() {
   }
 
   async function handleOpenProjectFromDisk() {
-    const chosen = await dialogOpen({ directory: true, multiple: false, title: 'Open Project Folder' });
+    const chosen = await dialogOpen({ directory: true, recursive: true, multiple: false, title: 'Open Project Folder' });
     if (!chosen || typeof chosen !== 'string') return;
 
     const projectName = chosen.replace(/\\/g, '/').split('/').pop() || 'Imported Project';
@@ -2095,7 +2095,7 @@ export default function IDEPage() {
   async function handleSaveProjectToDisk() {
     if (!currentProject) return;
 
-    const destDir = await dialogOpen({ directory: true, multiple: false, title: 'Choose Save Location' });
+    const destDir = await dialogOpen({ directory: true, recursive: true, multiple: false, title: 'Choose Save Location' });
     if (!destDir || typeof destDir !== 'string') return;
 
     const sep   = destDir.includes('\\') ? '\\' : '/';

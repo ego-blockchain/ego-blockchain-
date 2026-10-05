@@ -29,10 +29,12 @@
         "startDragging": true
       },
       "fs": {
-        "all": true,
-        "scope": [
-          "**"
-        ]
+        "all": false,
+        "readFile": true,
+        "writeFile": true,
+        "readDir": true,
+        "createDir": true,
+        "scope": []
       },
       "dialog": {
         "all": false,
@@ -61,11 +63,7 @@
       },
       "http": {
         "all": false,
-        "request": true,
-        "scope": [
-          "http://EgoRelay.egoblockchain.com:8080/**",
-          "https://api.coingecko.com/**"
-        ]
+        "request": false
       },
       "process": {
         "all": false,
@@ -130,7 +128,7 @@
       }
     },
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' http://localhost:* ws://localhost:* http://EgoRelay.egoblockchain.com:8080 ws://EgoRelay.egoblockchain.com:8080 https://api.coingecko.com; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' http://localhost:*; img-src 'self' data: blob: http://localhost:* https://assets.coingecko.com https://coin-images.coingecko.com; frame-src http://localhost:*"
+      "csp": "default-src 'self'; connect-src 'self' http://localhost:* ws://localhost:* https://api.coingecko.com; script-src 'self'; style-src 'self' 'unsafe-inline' http://localhost:*; img-src 'self' data: blob: http://localhost:* https://assets.coingecko.com https://coin-images.coingecko.com; frame-src http://localhost:*"
     },
     "updater": {
       "active": false

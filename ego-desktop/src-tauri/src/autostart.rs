@@ -136,23 +136,29 @@ mod imp {
     }
 }
 
-pub fn ensure_enabled_once() {
-    let marker = crate::ledger::base_data_dir().join(".autostart_configured");
-    if marker.exists() {
-        return;
-    }
-    match imp::enable() {
-        Ok(()) => {
-            let _ = std::fs::write(&marker, b"1");
-            eprintln!("[Autostart] registered to launch at login (hidden)");
-        }
-        Err(e) => eprintln!("[Autostart] could not register: {e}"),
-    }
+const ENABLED_BY_OLD_VERSION: &str = ".autostart_configured";
+const USER_CHOICE: &str = ".autostart_choice";
+
+fn marker(name: &str) -> PathBuf {
+    crate::ledger::base_data_dir().join(name)
+}
+
+#[derive(serde::Serialize)]
+pub struct AutostartState {
+    pub enabled: bool,
+    pub asked: bool,
+    pub enabled_without_asking: bool,
 }
 
 #[tauri::command]
-pub fn get_autostart_enabled() -> bool {
-    imp::is_enabled()
+pub fn get_autostart_state() -> AutostartState {
+    let enabled = imp::is_enabled();
+    let asked = marker(USER_CHOICE).exists();
+    AutostartState {
+        enabled,
+        asked,
+        enabled_without_asking: enabled && !asked && marker(ENABLED_BY_OLD_VERSION).exists(),
+    }
 }
 
 #[tauri::command]
@@ -162,5 +168,7 @@ pub fn set_autostart_enabled(enabled: bool) -> Result<bool, String> {
     } else {
         imp::disable()?;
     }
+    let choice: &[u8] = if enabled { b"on" } else { b"off" };
+    std::fs::write(marker(USER_CHOICE), choice).map_err(|e| format!("cannot record the choice: {e}"))?;
     Ok(imp::is_enabled())
 }

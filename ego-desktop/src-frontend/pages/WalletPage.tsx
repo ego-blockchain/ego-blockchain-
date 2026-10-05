@@ -1,13 +1,12 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { listen } from '@tauri-apps/api/event';
-import { fetch as tauriFetch, Body } from '@tauri-apps/api/http';
 import { useWallet } from '../App';
 import qrcode from 'qrcode-generator';
 import Pagination from '../components/Pagination';
 import { txDisplayAmount, EGOC_PRICE_USD } from '../constants';
 
-import { RELAY_HTTP as RELAY, RPC_URL } from '../config';
+import { RPC_URL } from '../config';
 import { useAppVersion, formatVersion } from '../lib/version';
 
 function makeQR(text: string): string {

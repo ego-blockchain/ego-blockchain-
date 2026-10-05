@@ -935,7 +935,7 @@ fn main() {
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
-            autostart::get_autostart_enabled,
+            autostart::get_autostart_state,
             autostart::set_autostart_enabled,
             commands::auth::init_wallet,
             commands::auth::generate_keypair,
@@ -1199,10 +1199,6 @@ fn main() {
         ])
         .setup(|app| {
             eprintln!("[Startup] setup() called — spawning background init threads");
-
-            std::thread::spawn(|| {
-                crate::autostart::ensure_enabled_once();
-            });
 
             // Offline transaction transport, always available.
             //

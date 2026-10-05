@@ -37,9 +37,8 @@ const SettingsPage: React.FC = () => {
   const [avatarMsg, setAvatarMsg]             = useState('');
   const avatarInputRef                        = useRef<HTMLInputElement>(null);
 
-  const [notifications, setNotifications]     = useState(true);
-  const [minimizeToTray, setMinimizeToTray]   = useState(true);
-  const [saved, setSaved]                     = useState(false);
+  const [startAtLogin, setStartAtLogin]       = useState<boolean | null>(null);
+  const [startAtLoginError, setStartAtLoginError] = useState('');
 
   const [hasPin, setHasPin]                   = useState(false);
   const [showSetPin, setShowSetPin]           = useState(false);
@@ -83,6 +82,7 @@ const SettingsPage: React.FC = () => {
       .then(n => { setDisplayName(n); setSavedName(n); })
       .catch(() => {});
     invoke<string>('get_my_avatar').then(setAvatar).catch(() => {});
+    invoke<{ enabled: boolean }>('get_autostart_state').then(s => setStartAtLogin(s.enabled)).catch(() => {});
   }, []);
 
   // Downscale to a 128px square here rather than shipping a multi-megabyte
@@ -253,7 +253,14 @@ const SettingsPage: React.FC = () => {
     finally { setLoadingRecovery(false); }
   }
 
-  function save() { setSaved(true); setTimeout(() => setSaved(false), 2000); }
+  async function changeStartAtLogin(enabled: boolean) {
+    setStartAtLoginError('');
+    try {
+      setStartAtLogin(await invoke<boolean>('set_autostart_enabled', { enabled }));
+    } catch (e) {
+      setStartAtLoginError(String(e));
+    }
+  }
 
   const handlePastePhrase = (e: React.ClipboardEvent<HTMLInputElement>) => {
     const pastedText = e.clipboardData.getData('text');
@@ -356,19 +363,13 @@ const SettingsPage: React.FC = () => {
       {}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">
         <div className="px-5 py-4 border-b border-gray-700"><h3 className="font-semibold">General</h3></div>
-        <div className="divide-y divide-gray-700/50">
-          {[
-            { label: 'Minimize to tray',      desc: 'Keep running in system tray on close', val: minimizeToTray, set: setMinimizeToTray },
-            { label: 'Notifications',         desc: 'Earnings, file transfers, alerts',     val: notifications,  set: setNotifications  },
-          ].map(row => (
-            <div key={row.label} className="flex items-center justify-between px-5 py-4">
-              <div>
-                <div className="text-sm font-medium">{row.label}</div>
-                <div className="text-xs text-gray-400">{row.desc}</div>
-              </div>
-              <Toggle value={row.val} onChange={row.set} />
-            </div>
-          ))}
+        <div className="flex items-center justify-between px-5 py-4">
+          <div>
+            <div className="text-sm font-medium">Start at login</div>
+            <div className="text-xs text-gray-400">Open Ego Desktop in the background when you log in, so your node keeps earning</div>
+            {startAtLoginError && <div className="text-xs text-red-400 mt-1">{startAtLoginError}</div>}
+          </div>
+          {startAtLogin !== null && <Toggle value={startAtLogin} onChange={changeStartAtLogin} />}
         </div>
       </div>
 
@@ -494,13 +495,6 @@ const SettingsPage: React.FC = () => {
           </div>
         </div>
       </div>
-
-      <button
-        onClick={save}
-        className={`w-full py-3 rounded-xl font-semibold transition ${saved ? 'bg-green-600' : 'bg-blue-600 hover:bg-blue-500'}`}
-      >
-        {saved ? '✓ Saved' : 'Save Settings'}
-      </button>
 
       <div className="bg-gray-800/60 rounded-2xl p-5 border border-gray-700/50 space-y-4">
         <div>

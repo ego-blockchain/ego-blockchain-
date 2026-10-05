@@ -308,7 +308,7 @@ const HostingPage: React.FC = () => {
 
   async function pickFolder() {
     try {
-      const result = await dialogOpen({ directory: true, multiple: false, title: 'Select website folder' });
+      const result = await dialogOpen({ directory: true, recursive: true, multiple: false, title: 'Select website folder' });
       if (!result || Array.isArray(result)) return;
       const folder = result as string;
       setSelectedFolder(folder);
