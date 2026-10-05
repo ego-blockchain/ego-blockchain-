@@ -3938,6 +3938,110 @@ const TUNNEL_PROTOCOL: StreamProtocol = StreamProtocol::new("/ego/tunnel/1");
 /// is built; cloned per connection (cheap) so opens don't serialise.
 static TUNNEL_CONTROL: OnceLock<libp2p_stream::Control> = OnceLock::new();
 
+const DAO_CHAT_PROTOCOL: StreamProtocol = StreamProtocol::new("/ego/dao-chat/1");
+const DAO_CHAT_SYNC_PEERS: usize = 3;
+const DAO_CHAT_SERVE_GAP_SECS: i64 = 10;
+const DAO_CHAT_FIRST_SYNC_DAYS: i64 = 7;
+
+static DAO_CHAT_CONTROL: OnceLock<libp2p_stream::Control> = OnceLock::new();
+static LIVE_PEERS: OnceLock<Mutex<std::collections::HashSet<PeerId>>> = OnceLock::new();
+static DAO_CHAT_SERVED: OnceLock<Mutex<HashMap<PeerId, i64>>> = OnceLock::new();
+
+fn live_peers() -> &'static Mutex<std::collections::HashSet<PeerId>> {
+    LIVE_PEERS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+async fn read_frame<S: futures::AsyncRead + Unpin>(stream: &mut S, max: usize) -> Result<Vec<u8>, String> {
+    let mut len_buf = [0u8; 4];
+    AsyncReadExt::read_exact(stream, &mut len_buf).await.map_err(|e| e.to_string())?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > max {
+        return Err(format!("frame of {len} bytes is over the {max} limit"));
+    }
+    let mut buf = vec![0u8; len];
+    AsyncReadExt::read_exact(stream, &mut buf).await.map_err(|e| e.to_string())?;
+    Ok(buf)
+}
+
+async fn write_frame<S: futures::AsyncWrite + Unpin>(stream: &mut S, data: &[u8]) -> Result<(), String> {
+    AsyncWriteExt::write_all(stream, &(data.len() as u32).to_be_bytes()).await.map_err(|e| e.to_string())?;
+    AsyncWriteExt::write_all(stream, data).await.map_err(|e| e.to_string())?;
+    AsyncWriteExt::flush(stream).await.map_err(|e| e.to_string())
+}
+
+async fn serve_dao_chat_stream<S>(peer: PeerId, mut stream: S) -> Result<(), String>
+where
+    S: futures::AsyncRead + futures::AsyncWrite + Unpin,
+{
+    let now = chrono::Utc::now().timestamp();
+    {
+        let mut served = DAO_CHAT_SERVED.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|e| e.into_inner());
+        if served.len() > 10_000 {
+            served.retain(|_, t| now - *t < DAO_CHAT_SERVE_GAP_SECS);
+        }
+        if served.get(&peer).map(|t| now - *t < DAO_CHAT_SERVE_GAP_SECS).unwrap_or(false) {
+            return Err("asked again too soon".into());
+        }
+        served.insert(peer, now);
+    }
+    let req: crate::dao_chat::SyncRequest = serde_json::from_slice(
+        &read_frame(&mut stream, crate::dao_chat::SYNC_MAX_REQUEST_BYTES).await?,
+    ).map_err(|e| e.to_string())?;
+    let resp = tokio::task::spawn_blocking(move || crate::dao_chat::sync_response(&req, now))
+        .await.map_err(|e| e.to_string())?;
+    let data = serde_json::to_vec(&resp).map_err(|e| e.to_string())?;
+    if data.len() > crate::dao_chat::SYNC_MAX_RESPONSE_BYTES {
+        return Err("response too large".into());
+    }
+    write_frame(&mut stream, &data).await
+}
+
+async fn dao_chat_sync_from(peer: PeerId, since: i64) -> Result<crate::dao_chat::SyncResponse, String> {
+    let mut control = DAO_CHAT_CONTROL.get().ok_or("P2P not started")?.clone();
+    let exchange = async {
+        let mut stream = control.open_stream(peer, DAO_CHAT_PROTOCOL).await.map_err(|e| e.to_string())?;
+        let req = serde_json::to_vec(&crate::dao_chat::SyncRequest { since }).map_err(|e| e.to_string())?;
+        write_frame(&mut stream, &req).await?;
+        let body = read_frame(&mut stream, crate::dao_chat::SYNC_MAX_RESPONSE_BYTES).await?;
+        serde_json::from_slice(&body).map_err(|e| e.to_string())
+    };
+    tokio::time::timeout(Duration::from_secs(20), exchange)
+        .await
+        .map_err(|_| "chat sync timed out".to_string())?
+}
+
+pub async fn dao_chat_sync_now(app: Option<tauri::AppHandle>) -> usize {
+    let mut peers: Vec<PeerId> = live_peers().lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+    {
+        use rand::seq::SliceRandom;
+        peers.shuffle(&mut rand::thread_rng());
+    }
+    let now = chrono::Utc::now().timestamp();
+    let since = tokio::task::spawn_blocking(crate::dao_chat::latest_post_ts)
+        .await.ok().flatten()
+        .map(|t| t - 600)
+        .unwrap_or(now - DAO_CHAT_FIRST_SYNC_DAYS * 86_400);
+    let mut fresh = 0usize;
+    let mut answered = 0usize;
+    for peer in peers {
+        if answered >= DAO_CHAT_SYNC_PEERS {
+            break;
+        }
+        match dao_chat_sync_from(peer, since).await {
+            Ok(resp) => {
+                answered += 1;
+                let now = chrono::Utc::now().timestamp();
+                fresh += tokio::task::spawn_blocking(move || crate::dao_chat::ingest(resp, now)).await.unwrap_or(0);
+            }
+            Err(e) => tracing::debug!("[dao-chat] sync from {peer} failed: {e}"),
+        }
+    }
+    if fresh > 0 {
+        crate::dao_chat::notify(app.as_ref());
+    }
+    fresh
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelHandshake {
     pub reservation_id:       String,
@@ -6025,6 +6129,33 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
         }
     }
 
+    {
+        let mut control = swarm.behaviour().stream.new_control();
+        let _ = DAO_CHAT_CONTROL.set(control.clone());
+        match control.accept(DAO_CHAT_PROTOCOL) {
+            Ok(mut incoming) => {
+                tokio::spawn(async move {
+                    while let Some((peer, stream)) = incoming.next().await {
+                        tokio::spawn(async move {
+                            if let Err(e) = serve_dao_chat_stream(peer, stream).await {
+                                tracing::debug!("[dao-chat] sync for {peer} ended: {e}");
+                            }
+                        });
+                    }
+                });
+            }
+            Err(e) => tracing::error!("[dao-chat] failed to register accept handler: {e}"),
+        }
+        let sync_app = app.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            loop {
+                dao_chat_sync_now(sync_app.clone()).await;
+                tokio::time::sleep(Duration::from_secs(300)).await;
+            }
+        });
+    }
+
     // relay PeerId → base transport addr (no /p2p/<id> suffix)
     // e.g.  12D3KooWPj6m... → /ip4/40.233.82.42/tcp/4001
     let mut relay_addrs: HashMap<PeerId, Multiaddr> = HashMap::new();
@@ -6174,6 +6305,9 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
 
     let dm_topic = gossipsub::IdentTopic::new(DM_TOPIC);
     swarm.behaviour_mut().gossipsub.subscribe(&dm_topic).ok();
+
+    let dao_chat_topic = gossipsub::IdentTopic::new(crate::dao_chat::TOPIC);
+    swarm.behaviour_mut().gossipsub.subscribe(&dao_chat_topic).ok();
 
     let _ = swarm.behaviour_mut().kad.bootstrap();
 
@@ -7013,6 +7147,7 @@ async fn handle_event(
 
         SwarmEvent::ConnectionEstablished { peer_id, endpoint: conn_endpoint, .. } => {
             eprintln!("[P2P] Connected to {}", peer_id);
+            live_peers().lock().unwrap_or_else(|e| e.into_inner()).insert(peer_id);
 
             if let Some(waiters) = pending_dials.remove(&peer_id) {
                 for w in waiters { let _ = w.send(Ok(peer_id)); }
@@ -7121,6 +7256,9 @@ async fn handle_event(
         }
 
         SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+            if num_established == 0 {
+                live_peers().lock().unwrap_or_else(|e| e.into_inner()).remove(&peer_id);
+            }
             if !relay_addrs.contains_key(&peer_id) && num_established == 0 {
                 let _ = DIRECT_PEER_COUNT.fetch_update(
                     Ordering::Relaxed, Ordering::Relaxed,
@@ -7479,7 +7617,11 @@ async fn handle_event(
                 return;
             }
             let topic = message.topic.to_string();
-            if topic == V2_TOPIC {
+            if topic == crate::dao_chat::TOPIC {
+                let data = message.data.clone();
+                let app2 = app.cloned();
+                tokio::spawn(async move { crate::dao_chat::receive_gossip(data, app2).await; });
+            } else if topic == V2_TOPIC {
                 // Consensus-v2 messages → handle_incoming. The BftV2* arms feed the live
                 // engine that drives the chain by default (inline only with LEGACY=1).
                 if let Ok(msg) = serde_json::from_slice::<P2PMessage>(&message.data) {
@@ -15260,5 +15402,59 @@ mod compute_exec_tests {
         let resp = serve_compute_exec(request(&stranger, &second, "METRICS", "")).await;
         assert_eq!(resp.status, 403, "{}", resp.body);
         assert!(resp.body.contains("Someone else"), "{}", resp.body);
+    }
+}
+
+#[cfg(test)]
+mod dao_chat_wire_tests {
+    use super::{read_frame, serve_dao_chat_stream, write_frame};
+    use crate::dao_chat::{self, SyncRequest, SyncResponse, Wire};
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+
+    #[tokio::test]
+    async fn a_peer_gets_recent_chat_over_the_sync_stream_and_cannot_hammer_it() {
+        let now = chrono::Utc::now().timestamp();
+        let kp = ego_core::KeyPair::generate();
+        let post = dao_chat::sign_post(&kp, "Wire", "over the stream", now - 3);
+        dao_chat::accept(&Wire::Post(post.clone()), now, dao_chat::Source::Local).unwrap();
+
+        let peer = libp2p::PeerId::random();
+        let (server, client) = tokio::io::duplex(1 << 20);
+        let serving = tokio::spawn(serve_dao_chat_stream(peer, server.compat()));
+        let mut client = client.compat();
+        write_frame(&mut client, &serde_json::to_vec(&SyncRequest { since: now - 60 }).unwrap()).await.unwrap();
+        let body = read_frame(&mut client, dao_chat::SYNC_MAX_RESPONSE_BYTES).await.unwrap();
+        serving.await.unwrap().unwrap();
+        let resp: SyncResponse = serde_json::from_slice(&body).unwrap();
+        assert!(resp.posts.contains(&post));
+
+        let (server, client) = tokio::io::duplex(1 << 20);
+        let again = tokio::spawn(serve_dao_chat_stream(peer, server.compat()));
+        let mut client = client.compat();
+        let _ = write_frame(&mut client, &serde_json::to_vec(&SyncRequest { since: now - 60 }).unwrap()).await;
+        assert!(again.await.unwrap().is_err(), "a second ask within seconds is refused");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_sync_request_is_refused() {
+        let (server, client) = tokio::io::duplex(1 << 16);
+        let serving = tokio::spawn(serve_dao_chat_stream(libp2p::PeerId::random(), server.compat()));
+        let mut client = client.compat();
+        let _ = write_frame(&mut client, &vec![b'x'; dao_chat::SYNC_MAX_REQUEST_BYTES + 1]).await;
+        assert!(serving.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn gossip_from_the_topic_lands_in_the_chat() {
+        let now = chrono::Utc::now().timestamp();
+        let kp = ego_core::KeyPair::generate();
+        let post = dao_chat::sign_post(&kp, "Gossip", "arrived by gossip", now);
+        dao_chat::receive_gossip(serde_json::to_vec(&Wire::Post(post.clone())).unwrap(), None).await;
+        assert!(dao_chat::recent_posts(None, 2_000).contains(&post));
+
+        let mut forged = dao_chat::sign_post(&kp, "Gossip", "forged", now);
+        forged.from = dao_chat::address_of_key(&ego_core::KeyPair::generate());
+        dao_chat::receive_gossip(serde_json::to_vec(&Wire::Post(forged.clone())).unwrap(), None).await;
+        assert!(!dao_chat::recent_posts(None, 2_000).contains(&forged));
     }
 }

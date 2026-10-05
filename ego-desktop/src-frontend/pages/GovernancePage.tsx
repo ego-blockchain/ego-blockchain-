@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/tauri';
 import { useWallet } from '../App';
+import CommunityChat from './governance/CommunityChat';
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -780,40 +781,47 @@ export default function GovernancePage() {
         </div>
       </div>
 
-      {/* Tabs */}
-      <div className="px-6 flex items-center gap-1 border-b border-gray-800 py-2">
-        {TABS.map(t => (
-          <button key={t.key} onClick={() => setTab(t.key)}
-            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-              tab === t.key
-                ? 'bg-purple-600/20 text-purple-300 border border-purple-500/30'
-                : 'text-gray-400 hover:text-white'
-            }`}>
-            {t.label}
-          </button>
-        ))}
-      </div>
-
-      {/* Proposals */}
-      <div className="flex-1 overflow-y-auto px-6 py-5">
-        {loading ? (
-          <div className="flex items-center justify-center h-40 text-gray-500 text-sm">Loading proposals…</div>
-        ) : proposals.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-40 text-center space-y-3">
-            <span className="text-4xl">🗳️</span>
-            <p className="text-gray-400 text-sm">No {tab === 'all' ? '' : tab + ' '}proposals yet.</p>
-            <button onClick={() => setShowCreate(true)}
-              className="text-xs text-purple-400 hover:text-purple-300 underline underline-offset-2">
-              Submit the first proposal
-            </button>
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 gap-4">
-            {proposals.map(p => (
-              <ProposalCard key={p.id} proposal={p} onClick={() => setSelected(p)} />
+      <div className="flex-1 min-h-0 flex">
+        <div className="flex-1 min-w-0 min-h-0 flex flex-col">
+          {/* Tabs */}
+          <div className="px-6 flex items-center gap-1 border-b border-gray-800 py-2">
+            {TABS.map(t => (
+              <button key={t.key} onClick={() => setTab(t.key)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                  tab === t.key
+                    ? 'bg-purple-600/20 text-purple-300 border border-purple-500/30'
+                    : 'text-gray-400 hover:text-white'
+                }`}>
+                {t.label}
+              </button>
             ))}
           </div>
-        )}
+
+          <div className="flex-1 overflow-y-auto px-6 py-5">
+            {loading ? (
+              <div className="flex items-center justify-center h-40 text-gray-500 text-sm">Loading proposals…</div>
+            ) : proposals.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-40 text-center space-y-3">
+                <span className="text-4xl">🗳️</span>
+                <p className="text-gray-400 text-sm">No {tab === 'all' ? '' : tab + ' '}proposals yet.</p>
+                <button onClick={() => setShowCreate(true)}
+                  className="text-xs text-purple-400 hover:text-purple-300 underline underline-offset-2">
+                  Submit the first proposal
+                </button>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 gap-4">
+                {proposals.map(p => (
+                  <ProposalCard key={p.id} proposal={p} onClick={() => setSelected(p)} />
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        <aside className="w-[300px] lg:w-[360px] xl:w-[400px] shrink-0 flex flex-col border-l border-gray-800 bg-black/20">
+          <CommunityChat />
+        </aside>
       </div>
 
       {/* Modals */}

@@ -5939,6 +5939,45 @@ pub fn is_proposer_banned(address: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub fn dao_put(key: &[u8], value: &[u8]) -> Result<(), String> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_DAO).ok_or("CF_DAO missing")?;
+    db.put_cf(cf, key, value).map_err(|e| e.to_string())
+}
+
+pub fn dao_get(key: &[u8]) -> Option<Vec<u8>> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_DAO)?;
+    db.get_cf(cf, key).ok().flatten()
+}
+
+pub fn dao_delete(keys: &[Vec<u8>]) {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf) = db.cf_handle(CF_DAO) else { return };
+    let mut batch = WriteBatch::default();
+    for k in keys {
+        batch.delete_cf(cf, k);
+    }
+    let _ = db.write(batch);
+}
+
+pub fn dao_scan(prefix: &[u8], from: &[u8], reverse: bool, limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let db = get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf) = db.cf_handle(CF_DAO) else { return Vec::new() };
+    let direction = if reverse { rocksdb::Direction::Reverse } else { rocksdb::Direction::Forward };
+    let mut out = Vec::new();
+    for item in db.iterator_cf(cf, rocksdb::IteratorMode::From(from, direction)) {
+        let Ok((k, v)) = item else { break };
+        if !k.starts_with(prefix) {
+            if reverse && k.as_ref() > prefix { continue; }
+            break;
+        }
+        out.push((k.to_vec(), v.to_vec()));
+        if out.len() >= limit { break; }
+    }
+    out
+}
+
 // ── Slashing persistence ───────────────────────────────────────────────────────
 // Slashed-validator records survive node restarts via the CF_META column family.
 

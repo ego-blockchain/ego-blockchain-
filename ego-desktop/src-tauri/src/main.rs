@@ -25,6 +25,7 @@ mod blocks;
 mod ecvrf;
 mod chain_db;
 mod contract_exec;
+mod dao_chat;
 mod commands;
 mod compute_admission;
 mod config;
@@ -1154,6 +1155,13 @@ fn main() {
             commands::governance::get_proposal_results,
             commands::governance::vote_ban_proposer,
             commands::governance::get_ban_status,
+            commands::dao_chat::dao_chat_feed,
+            commands::dao_chat::dao_chat_post,
+            commands::dao_chat::dao_chat_set_name,
+            commands::dao_chat::dao_chat_vote,
+            commands::dao_chat::dao_chat_edit,
+            commands::dao_chat::dao_chat_delete,
+            commands::dao_chat::dao_chat_sync,
             commands::governance::get_proposal_rate_limit,
             commands::hosting::deploy_site,
             commands::hosting::deploy_site_begin,

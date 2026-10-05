@@ -17,6 +17,7 @@ pub mod contracts;
 pub mod rollup;
 pub mod multichain;
 pub mod light_client;
+pub mod dao_chat;
 pub mod governance;
 pub mod hosting;
 pub mod compute;
