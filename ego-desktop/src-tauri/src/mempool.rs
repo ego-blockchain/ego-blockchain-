@@ -600,6 +600,21 @@ impl ShardedMempool {
         }
     }
 
+    pub fn requeue(&self, txs: Vec<LedgerTx>) {
+        for tx in txs {
+            if tx.hash.is_empty() {
+                continue;
+            }
+            let shard = shard_for_address(&tx.from) as usize;
+            if !self.seen_hashes[shard].lock().expect("lock poisoned").insert(tx.hash.clone()) {
+                continue;
+            }
+            self.shards[shard].lock().expect("lock poisoned").push(tx);
+            self.pending_total.fetch_add(1, Ordering::Relaxed);
+            let _ = self.confirmed.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
+        }
+    }
+
     pub fn pending_outflow_for_address(&self, addr: &str) -> u64 {
         let shard = shard_for_address(addr) as usize;
         let s = self.shards[shard].lock().expect("lock poisoned");
@@ -752,6 +767,23 @@ mod tests {
         let got = pool.drain_all();
         assert_eq!(got.len(), 4);
         assert_eq!(pool.pending_count(), 0);
+    }
+
+    #[test]
+    fn requeued_transactions_return_to_the_pool_once() {
+        let pool = ShardedMempool::new();
+        for i in 0..3u64 {
+            let _ = pool.push(pool_faucet_tx(&format!("0xrq{i}")));
+        }
+        let drained = pool.drain_all();
+        assert_eq!(pool.pending_count(), 0);
+        pool.requeue(drained.clone());
+        assert_eq!(pool.pending_count(), 3);
+        pool.requeue(drained);
+        assert_eq!(pool.pending_count(), 3, "a requeue never duplicates what is already waiting");
+        let mut again: Vec<String> = pool.drain_all().into_iter().map(|t| t.hash).collect();
+        again.sort();
+        assert_eq!(again, vec!["0xrq0", "0xrq1", "0xrq2"]);
     }
 
     #[test]

@@ -91,6 +91,34 @@ impl MerkleTree {
         Ok(index)
     }
 
+    pub fn extend(&mut self, leaves: &[Digest]) -> Result<(), String> {
+        if leaves.is_empty() {
+            return Ok(());
+        }
+        if self.len() + leaves.len() > self.capacity() {
+            return Err(format!("tree of depth {} is full", self.depth));
+        }
+        let mut first = self.len();
+        self.levels[0].extend_from_slice(leaves);
+        let mut count = self.levels[0].len();
+        for level in 0..self.depth {
+            let first_parent = first >> 1;
+            let parents = (count + 1) >> 1;
+            for parent in first_parent..parents {
+                let h = merge_nodes(&self.node(level, parent * 2), &self.node(level, parent * 2 + 1));
+                let above = &mut self.levels[level + 1];
+                if parent < above.len() {
+                    above[parent] = h;
+                } else {
+                    above.push(h);
+                }
+            }
+            first = first_parent;
+            count = parents;
+        }
+        Ok(())
+    }
+
     pub fn root(&self) -> Digest {
         self.node(self.depth, 0)
     }
@@ -229,6 +257,32 @@ mod tests {
             &reference_node(leaves, zeros, level - 1, 2 * idx),
             &reference_node(leaves, zeros, level - 1, 2 * idx + 1),
         )
+    }
+
+    #[test]
+    fn extending_in_batches_builds_the_same_tree_as_inserting_one_by_one() {
+        let all: Vec<Digest> = (0..16).map(leaf).collect();
+        for split in [vec![16], vec![1, 15], vec![3, 5, 8], vec![7, 0, 9], vec![2, 2, 2, 10], vec![15, 1]] {
+            let mut t = MerkleTree::new(DEPTH);
+            let mut at = 0;
+            for n in split.iter().copied() {
+                t.extend(&all[at..at + n]).unwrap();
+                at += n;
+                let reference = tree_with(at);
+                assert_eq!(t.root(), reference.root(), "split {split:?} after {at}");
+                assert_eq!(t.levels, reference.levels, "split {split:?} after {at}");
+            }
+        }
+    }
+
+    #[test]
+    fn extending_past_capacity_is_refused_and_changes_nothing() {
+        let mut t = tree_with(15);
+        let before = t.clone();
+        assert!(t.extend(&[leaf(100), leaf(101)]).is_err());
+        assert_eq!(t.levels, before.levels);
+        assert!(t.extend(&[leaf(100)]).is_ok());
+        assert_eq!(t.len(), 16);
     }
 
     #[test]

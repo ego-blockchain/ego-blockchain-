@@ -213,6 +213,13 @@ pub fn leaf_index_of(commitment: &[u8; 32]) -> Option<u64> {
     leaf_index_in(db, commitment)
 }
 
+pub fn leaf_at(index: u64) -> Option<[u8; 32]> {
+    let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let cf = db.cf_handle(CF_META)?;
+    let v = db.get_cf(cf, leaf_key(index)).ok().flatten()?;
+    v.as_slice().try_into().ok()
+}
+
 pub fn is_nullifier_spent(nullifier: &[u8; 32]) -> bool {
     let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
     nullifier_spent_in(db, nullifier)
@@ -232,6 +239,39 @@ pub fn leaves() -> Vec<[u8; 32]> {
         }
     }
     out
+}
+
+pub fn leaves_from(from: u64, limit: usize) -> Vec<[u8; 32]> {
+    let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cf) = db.cf_handle(CF_META) else { return vec![] };
+    let mut out = Vec::new();
+    let mut expected = from;
+    for item in db.iterator_cf(cf, IteratorMode::From(&leaf_key(from), Direction::Forward)) {
+        if out.len() >= limit {
+            break;
+        }
+        let Ok((k, v)) = item else { break };
+        if k.as_ref() != leaf_key(expected).as_slice() {
+            break;
+        }
+        let Ok(leaf) = <[u8; 32]>::try_from(v.as_ref()) else { break };
+        out.push(leaf);
+        expected += 1;
+    }
+    out
+}
+
+pub fn deposit_is_proposable(
+    height: u64,
+    tx: &LedgerTx,
+    seen_commitments: &mut HashSet<[u8; 32]>,
+) -> Result<(), String> {
+    if !rule_active(height) {
+        return Err("the shielded pool is not active at this height".into());
+    }
+    let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
+    let state = read_state(db);
+    validate_deposit_in(db, &state, tx, seen_commitments)
 }
 
 /// Serialises every write to the pool. `chain_db`'s `lock()` hands out a shared `&DB`
@@ -581,6 +621,14 @@ pub fn is_unshield(tx: &LedgerTx) -> bool {
 
 pub fn touches_pool(tx: &LedgerTx) -> bool {
     is_deposit(tx) || is_unshield(tx)
+}
+
+pub fn unshield_is_well_formed(tx: &LedgerTx) -> bool {
+    is_unshield(tx)
+        && tx.tx_type == TX_UNSHIELD
+        && tx.signature.is_empty()
+        && tx.public_key_ed25519.is_empty()
+        && parse_unshield_body(&tx.call_args).is_ok_and(|b| b.tx_hash() == tx.hash)
 }
 
 pub fn credited_to_recipient(tx: &LedgerTx) -> u64 {
@@ -1133,9 +1181,7 @@ mod tests {
     use crate::shielded::{Note, ShieldedPool};
     use rand::rngs::StdRng;
     use rand::{RngCore, SeedableRng};
-    use std::sync::Mutex;
-
-    static DB_TESTS: Mutex<()> = Mutex::new(());
+    use crate::shielded::TEST_ENV_LOCK as DB_TESTS;
 
     fn note(value: u64, tag: u8) -> Note {
         Note::new(value, [tag; 32], [tag.wrapping_add(1); 32])
@@ -1253,6 +1299,43 @@ mod tests {
             "expected the note count to refuse it, got: {err}"
         );
         std::env::remove_var("EGO_SHIELDED_POOL_HEIGHT");
+    }
+
+    #[test]
+    fn a_synced_block_keeps_its_withdrawals() {
+        let body = UnshieldBody {
+            spends: vec![UnshieldSpend {
+                root: hex::encode([1u8; 32]),
+                nullifier: hex::encode([2u8; 32]),
+                amount_uegoc: 1_000_000,
+                fee_uegoc: 1_000,
+                proof: hex::encode([0u8; 64]),
+            }],
+            recipient: "egot1qw508d6qejxtdg4y5r3zarvary0c5xw7k".into(),
+            amount_uegoc: 1_000_000,
+            fee_uegoc: 1_000,
+        };
+        let tx = LedgerTx {
+            hash: body.tx_hash(),
+            from: SHIELDED_POOL_ADDR.into(),
+            to: body.recipient.clone(),
+            amount: body.amount_uegoc,
+            fee_uegoc: body.fee_uegoc,
+            tx_type: TX_UNSHIELD.into(),
+            call_args: body.canonical_json(),
+            block_height: Some(7),
+            ..LedgerTx::default()
+        };
+        assert!(
+            crate::ledger::verify_confirmed_tx_sig(&tx).is_ok(),
+            "sync filters block transactions through this check; refusing the unsigned              withdrawal left every block that carried one short of its tx_count for ever",
+        );
+        let mut tampered = tx.clone();
+        tampered.call_args = tampered.call_args.replace("1000000", "2000000");
+        assert!(crate::ledger::verify_confirmed_tx_sig(&tampered).is_err());
+        let mut signed = tx.clone();
+        signed.signature = "ab".into();
+        assert!(crate::ledger::verify_confirmed_tx_sig(&signed).is_err());
     }
 
     fn random_denomination(rng: &mut StdRng) -> u64 {
@@ -1844,6 +1927,218 @@ mod tests {
         assert!(!is_nullifier_spent(&w.nullifier));
         assert_eq!(state(), before);
         std::env::remove_var("EGO_SHIELDED_POOL_HEIGHT");
+    }
+
+    fn apply(height: u64, txs: &[LedgerTx]) {
+        let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let mut batch = WriteBatch::default();
+        apply_block(db, &mut batch, height, &txs.iter().collect::<Vec<_>>());
+        db.write(batch).unwrap();
+    }
+
+    fn unapply(height: u64, txs: &[LedgerTx]) {
+        let db = chain_db::get_db().lock().unwrap_or_else(|e| e.into_inner());
+        let mut batch = WriteBatch::default();
+        rollback(db, &mut batch, height, txs);
+        db.write(batch).unwrap();
+    }
+
+    #[test]
+    fn leaves_page_in_tree_order_and_stop_at_the_end() {
+        let _g = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("EGO_SHIELDED_POOL_HEIGHT", "0");
+        let mut rng = StdRng::from_entropy();
+        let notes: Vec<Note> = (0..3).map(|_| Note::random(1_000_000, &mut rng)).collect();
+        let txs: Vec<LedgerTx> = notes.iter().map(deposit_tx).collect();
+        let height = 910_000_000 + (rng.next_u64() % 1_000_000);
+        let start = state().next_index;
+
+        apply(height, &txs);
+        assert_eq!(leaves_from(0, usize::MAX), leaves());
+        assert_eq!(leaves_from(start, 2), vec![notes[0].leaf(), notes[1].leaf()]);
+        assert_eq!(leaves_from(start + 2, 10), vec![notes[2].leaf()]);
+        assert!(leaves_from(start + 3, 10).is_empty());
+        assert!(leaves_from(start, 0).is_empty());
+
+        unapply(height, &txs);
+        assert!(leaves_from(start, 10).is_empty());
+        std::env::remove_var("EGO_SHIELDED_POOL_HEIGHT");
+    }
+
+    #[test]
+    fn a_proposal_takes_one_deposit_per_commitment_and_none_already_in_the_tree() {
+        let _g = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("EGO_SHIELDED_POOL_HEIGHT", "0");
+        let mut rng = StdRng::from_entropy();
+        let a = Note::random(1_000_000, &mut rng);
+        let b = Note::random(10_000_000, &mut rng);
+        let twin = LedgerTx { hash: "0xtwin".into(), from: "egot1someoneelse".into(), ..deposit_tx(&a) };
+        let height = 920_000_000 + (rng.next_u64() % 1_000_000);
+
+        let mut seen = HashSet::new();
+        assert!(deposit_is_proposable(height, &deposit_tx(&a), &mut seen).is_ok());
+        assert!(deposit_is_proposable(height, &twin, &mut seen).is_err(), "twice in one proposal");
+        assert!(deposit_is_proposable(height, &deposit_tx(&b), &mut seen).is_ok());
+        assert!(
+            validate_block_shielded_txs(height, &[deposit_tx(&a), twin.clone()]).is_err(),
+            "the block the guard keeps out is one validators refuse",
+        );
+
+        apply(height, &[deposit_tx(&a)]);
+        assert!(
+            deposit_is_proposable(height + 1, &twin, &mut HashSet::new()).is_err(),
+            "a twin left in the mempool after the first landed",
+        );
+        assert!(deposit_is_proposable(height + 1, &deposit_tx(&b), &mut HashSet::new()).is_ok());
+        let bad = LedgerTx { amount: 1_500_000, ..deposit_tx(&b) };
+        assert!(deposit_is_proposable(height + 1, &bad, &mut HashSet::new()).is_err());
+
+        unapply(height, &[deposit_tx(&a)]);
+        std::env::remove_var("EGO_SHIELDED_POOL_HEIGHT");
+        std::env::set_var("EGO_SHIELDED_POOL_HEIGHT", "999999999999");
+        assert!(deposit_is_proposable(height, &deposit_tx(&a), &mut HashSet::new()).is_err());
+        std::env::remove_var("EGO_SHIELDED_POOL_HEIGHT");
+    }
+    fn extension_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(std::env::var("EGO_EXT_E2E").expect("EGO_EXT_E2E names the exchange folder"))
+    }
+
+    #[test]
+    #[ignore]
+    fn extension_phase_one_deposits_the_note_and_exports_the_pool() {
+        let _g = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = extension_dir();
+        let note: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("note.json")).unwrap()).unwrap();
+        let commitment: [u8; 32] = hex::decode(note["commitment"].as_str().unwrap()).unwrap().try_into().unwrap();
+        let value = note["value_uegoc"].as_u64().unwrap();
+        let height = 940_000_000 + (StdRng::from_entropy().next_u64() % 1_000_000);
+        let deposit = LedgerTx {
+            hash: format!("0x{}", hex::encode(commitment)),
+            from: "egot1extensiondepositor".into(),
+            to: SHIELDED_POOL_ADDR.into(),
+            amount: value,
+            memo: Some(shield_memo(&commitment)),
+            tx_type: TX_SHIELD.into(),
+            fee_uegoc: 1_000,
+            ..LedgerTx::default()
+        };
+        assert!(validate_block_shielded_txs(height, &[deposit.clone()]).is_ok());
+        apply(height, &[deposit.clone()]);
+        let st = state();
+        assert_eq!(leaf_index_of(&commitment), Some(st.next_index - 1));
+        let pool = serde_json::json!({
+            "height": height,
+            "deposit": deposit,
+            "leaves": leaves().iter().map(hex::encode).collect::<Vec<_>>(),
+            "root": hex::encode(st.root),
+            "recent_roots": st.recent_roots.iter().map(hex::encode).collect::<Vec<_>>(),
+            "leaf_count": st.next_index,
+            "balance_uegoc": st.balance_uegoc,
+        });
+        std::fs::write(dir.join("pool.json"), serde_json::to_vec_pretty(&pool).unwrap()).unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn extension_phase_two_the_node_accepts_the_extensions_withdrawal() {
+        let _g = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = extension_dir();
+        let pool: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("pool.json")).unwrap()).unwrap();
+        let height = pool["height"].as_u64().unwrap();
+        let deposit: LedgerTx = serde_json::from_value(pool["deposit"].clone()).unwrap();
+        let submitted: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("unshield.json")).unwrap()).unwrap();
+        let tx: LedgerTx = serde_json::from_value(submitted["params"]["tx"].clone())
+            .expect("the node parses the transaction exactly as the extension submitted it");
+
+        let before = state();
+        let result = crate::ledger::verify_incoming_tx(&tx);
+        let applied = result.is_ok();
+        if applied {
+            assert!(validate_block_shielded_txs(height + 1, &[tx.clone()]).is_ok());
+            apply(height + 1, &[tx.clone()]);
+            for n in unshield_nullifiers(&tx) {
+                assert!(is_nullifier_spent(&n));
+            }
+            assert_eq!(state().balance_uegoc, before.balance_uegoc - tx.amount);
+            assert!(crate::ledger::verify_incoming_tx(&tx).is_err(), "the same withdrawal cannot be replayed");
+            assert_eq!(credited_to_recipient(&tx), tx.amount - tx.fee_uegoc);
+            unapply(height + 1, &[tx.clone()]);
+        }
+        unapply(height, &[deposit]);
+        assert!(applied, "the node refused the extension's withdrawal: {result:?}");
+    }
+    #[test]
+    #[ignore]
+    fn desktop_import_phase_one_seals_old_and_new_desktop_notes() {
+        let _g = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = extension_dir();
+        let mut rng = StdRng::from_entropy();
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        let legacy = Note::random(10_000_000, &mut rng);
+        let derived = crate::shielded::derive_note(&seed, crate::shielded::NOTE_DOMAIN_DESKTOP, 2, 1_000_000);
+        let height = 950_000_000 + (rng.next_u64() % 1_000_000);
+        let deposits: Vec<LedgerTx> = [&legacy, &derived].iter().map(|n| deposit_tx(n)).collect();
+        assert!(validate_block_shielded_txs(height, &deposits).is_ok());
+        apply(height, &deposits);
+
+        let stored = vec![crate::commands::shielded::StoredNote {
+            note: legacy.clone(),
+            commitment: hex::encode(legacy.commitment()),
+            created_at: 1_790_000_000,
+            deposit_tx: deposits[0].hash.clone(),
+            spent_tx: None,
+            spent_at: None,
+            cancelled_at: None,
+            index: None,
+            domain: None,
+        }];
+        let sealed = crate::commands::shielded::seal_notes(&seed, &stored).unwrap();
+        let address = ego_core::KeyPair::from_bytes(&seed)
+            .unwrap()
+            .derive_address(1, ego_core::AddressType::EOA)
+            .to_bech32("egot")
+            .unwrap();
+        let st = state();
+        let pool = serde_json::json!({
+            "seed": hex::encode(seed),
+            "address": address,
+            "sealed_hex": hex::encode(&sealed),
+            "legacy_commitment": hex::encode(legacy.commitment()),
+            "derived_commitment": hex::encode(derived.commitment()),
+            "height": height,
+            "deposits": deposits,
+            "leaves": leaves().iter().map(hex::encode).collect::<Vec<_>>(),
+            "root": hex::encode(st.root),
+            "recent_roots": st.recent_roots.iter().map(hex::encode).collect::<Vec<_>>(),
+            "leaf_count": st.next_index,
+            "balance_uegoc": st.balance_uegoc,
+        });
+        std::fs::write(dir.join("pool.json"), serde_json::to_vec_pretty(&pool).unwrap()).unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn desktop_import_phase_two_the_node_accepts_spending_both() {
+        let _g = DB_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = extension_dir();
+        let pool: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("pool.json")).unwrap()).unwrap();
+        let height = pool["height"].as_u64().unwrap();
+        let deposits: Vec<LedgerTx> = serde_json::from_value(pool["deposits"].clone()).unwrap();
+        let submitted: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("unshield.json")).unwrap()).unwrap();
+        let tx: LedgerTx = serde_json::from_value(submitted["params"]["tx"].clone()).unwrap();
+        let body = parse_unshield_body(&tx.call_args).unwrap();
+        let result = crate::ledger::verify_incoming_tx(&tx);
+        let accepted = result.is_ok();
+        if accepted {
+            apply(height + 1, &[tx.clone()]);
+            assert_eq!(unshield_nullifiers(&tx).len(), 2);
+            assert!(unshield_nullifiers(&tx).iter().all(is_nullifier_spent));
+            unapply(height + 1, &[tx.clone()]);
+        }
+        unapply(height, &deposits);
+        assert!(accepted, "the node refused the withdrawal of both desktop notes: {result:?}");
+        assert_eq!(body.spends.len(), 2);
     }
 }
 

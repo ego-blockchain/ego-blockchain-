@@ -1609,6 +1609,9 @@ pub fn verify_confirmed_tx_sig(tx: &LedgerTx) -> Result<(), String> {
     if is_protocol_system_tx(tx) {
         return Ok(());
     }
+    if crate::shielded_chain::unshield_is_well_formed(tx) {
+        return Ok(());
+    }
     if tx.public_key_ed25519.is_empty() || tx.signature.is_empty() {
         return Err(format!("confirmed tx {} missing Ed25519 pubkey/signature", tx.hash));
     }

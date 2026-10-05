@@ -13,6 +13,9 @@ use std::sync::Mutex;
 use tauri::State;
 
 const NOTES_FILE: &str = "shielded_notes.bin";
+const DERIVED_SCAN_EVERY_SECS: u64 = 60;
+pub const NOTES_EXPORT_LABEL: &str = "ego/shielded-notes-export/v1:";
+const NOTES_EXPORT_WINDOW_SECS: i64 = 300;
 
 /// How far behind the network's best known height this node may sit and still be trusted to
 /// say whether something was included. The watermark counts the block currently being
@@ -22,6 +25,8 @@ const NOTES_KEY_LABEL: &[u8] = b"ego/shielded-notes/v1:";
 const CHAIN_ID: u8 = 1;
 
 static NOTES_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static LAST_DERIVED_SCAN: Lazy<Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
 pub const PROOF_SYSTEM: &str = "winterfell-stark/rescue-goldilocks, no trusted setup";
 
@@ -58,6 +63,10 @@ pub struct StoredNote {
     /// them.
     #[serde(default)]
     pub cancelled_at: Option<i64>,
+    #[serde(default)]
+    pub index: Option<u32>,
+    #[serde(default)]
+    pub domain: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,13 +118,41 @@ fn notes_path() -> std::path::PathBuf {
     data_dir().join(NOTES_FILE)
 }
 
-fn notes_key() -> Result<[u8; 32], EgoDesktopError> {
-    let seed = crate::ledger::load_seed()
+fn wallet_seed() -> Result<Vec<u8>, EgoDesktopError> {
+    crate::ledger::load_seed()
         .map_err(EgoDesktopError::WalletError)?
-        .ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))?;
+        .ok_or_else(|| EgoDesktopError::WalletError("Wallet not initialized".into()))
+}
+
+fn notes_key_for(seed: &[u8]) -> [u8; 32] {
     let mut material = NOTES_KEY_LABEL.to_vec();
-    material.extend_from_slice(&seed);
-    Ok(*ego_core::hash_data(&material).as_bytes())
+    material.extend_from_slice(seed);
+    *ego_core::hash_data(&material).as_bytes()
+}
+
+pub(crate) fn open_notes(seed: &[u8], data: &[u8]) -> Result<Vec<StoredNote>, EgoDesktopError> {
+    if data.len() < 28 {
+        return Err(EgoDesktopError::DatabaseError("shielded notes file is truncated".into()));
+    }
+    let (nonce, ct) = data.split_at(12);
+    let cipher = Aes256Gcm::new_from_slice(&notes_key_for(seed)).expect("32-byte key");
+    let plain = cipher
+        .decrypt(Nonce::from_slice(nonce), ct)
+        .map_err(|_| EgoDesktopError::CryptoError("shielded notes do not decrypt under this seed".into()))?;
+    serde_json::from_slice(&plain).map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))
+}
+
+pub(crate) fn seal_notes(seed: &[u8], notes: &[StoredNote]) -> Result<Vec<u8>, EgoDesktopError> {
+    let plain = serde_json::to_vec(notes).map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let cipher = Aes256Gcm::new_from_slice(&notes_key_for(seed)).expect("32-byte key");
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce), plain.as_slice())
+        .map_err(|_| EgoDesktopError::CryptoError("could not encrypt shielded notes".into()))?;
+    let mut out = nonce.to_vec();
+    out.extend(ct);
+    Ok(out)
 }
 
 fn load_notes() -> Result<Vec<StoredNote>, EgoDesktopError> {
@@ -124,29 +161,11 @@ fn load_notes() -> Result<Vec<StoredNote>, EgoDesktopError> {
         return Ok(Vec::new());
     }
     let data = std::fs::read(&path).map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
-    if data.len() < 28 {
-        return Err(EgoDesktopError::DatabaseError("shielded notes file is truncated".into()));
-    }
-    let key = notes_key()?;
-    let (nonce, ct) = data.split_at(12);
-    let cipher = Aes256Gcm::new_from_slice(&key).expect("32-byte key");
-    let plain = cipher
-        .decrypt(Nonce::from_slice(nonce), ct)
-        .map_err(|_| EgoDesktopError::CryptoError("shielded notes do not decrypt under this seed".into()))?;
-    serde_json::from_slice(&plain).map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))
+    open_notes(&wallet_seed()?, &data)
 }
 
 fn save_notes(notes: &[StoredNote]) -> Result<(), EgoDesktopError> {
-    let key = notes_key()?;
-    let plain = serde_json::to_vec(notes).map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?;
-    let mut nonce = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce);
-    let cipher = Aes256Gcm::new_from_slice(&key).expect("32-byte key");
-    let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce), plain.as_slice())
-        .map_err(|_| EgoDesktopError::CryptoError("could not encrypt shielded notes".into()))?;
-    let mut out = nonce.to_vec();
-    out.extend(ct);
+    let out = seal_notes(&wallet_seed()?, notes)?;
     crate::utils::atomic_write(&notes_path(), &out).map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))
 }
 
@@ -237,6 +256,8 @@ fn note_status(n: &StoredNote) -> (String, Option<u64>) {
         } else {
             "spending"
         }
+    } else if shielded_chain::is_nullifier_spent(&n.note.nullifier()) {
+        "spent"
     } else if leaf_index.is_some() {
         // In the tree, so it is spendable whatever the owner meant to do: a deposit that was
         // cancelled while already travelling still arrived, and the note is real money.
@@ -253,6 +274,125 @@ fn note_status(n: &StoredNote) -> (String, Option<u64>) {
     (status.to_string(), leaf_index)
 }
 
+fn merge_derived_notes(notes: &mut Vec<StoredNote>, seed: &[u8]) -> usize {
+    let have: std::collections::HashSet<String> = notes.iter().map(|n| n.commitment.clone()).collect();
+    let now = chrono::Utc::now().timestamp();
+    let mut added = 0;
+    let found = shielded::scan_derived_notes(
+        seed,
+        shielded::NOTE_RECOVERY_GAP,
+        |c| shielded_chain::leaf_index_of(c),
+        shielded_chain::leaf_at,
+    );
+    for f in found {
+        let commitment = hex::encode(f.note.commitment());
+        if have.contains(&commitment) || shielded_chain::is_nullifier_spent(&f.note.nullifier()) {
+            continue;
+        }
+        notes.push(StoredNote {
+            note: f.note,
+            commitment,
+            created_at: now,
+            deposit_tx: String::new(),
+            spent_tx: None,
+            spent_at: None,
+            cancelled_at: None,
+            index: Some(f.index),
+            domain: Some(f.domain.to_string()),
+        });
+        added += 1;
+    }
+    added
+}
+
+fn derived_scan_due(force: bool) -> bool {
+    let wallet = crate::ledger::get_active_wallet_id();
+    let mut last = LAST_DERIVED_SCAN.lock().unwrap_or_else(|e| e.into_inner());
+    let due = force
+        || last
+            .get(&wallet)
+            .map_or(true, |at| at.elapsed().as_secs() >= DERIVED_SCAN_EVERY_SECS);
+    if due {
+        last.insert(wallet, std::time::Instant::now());
+    }
+    due
+}
+
+pub(crate) fn verify_notes_export_request(
+    address: &str,
+    public_key_hex: &str,
+    timestamp: i64,
+    signature_hex: &str,
+    now: i64,
+) -> Result<(), String> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    if (now - timestamp).abs() > NOTES_EXPORT_WINDOW_SECS {
+        return Err("the request is too old or from the future; check the computer clock".into());
+    }
+    let pk: [u8; 32] = hex::decode(public_key_hex)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or("public_key must be 32 hex bytes")?;
+    let sig: [u8; 64] = hex::decode(signature_hex)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or("signature must be 64 hex bytes")?;
+    let owner = ego_core::EgoAddress::from_public_key_bytes(&pk, 1, ego_core::AddressType::EOA)
+        .to_bech32("egot")
+        .unwrap_or_default();
+    if owner != address {
+        return Err("that key does not own this address".into());
+    }
+    let message = format!("{NOTES_EXPORT_LABEL}{address}:{timestamp}");
+    VerifyingKey::from_bytes(&pk)
+        .map_err(|_| "public_key is not a valid Ed25519 key".to_string())?
+        .verify(message.as_bytes(), &Signature::from_bytes(&sig))
+        .map_err(|_| "the signature does not verify".to_string())
+}
+
+pub(crate) fn export_sealed_notes(p: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use base64::Engine as _;
+    let address = p["address"].as_str().unwrap_or_default().trim().to_string();
+    verify_notes_export_request(
+        &address,
+        p["public_key"].as_str().unwrap_or_default(),
+        p["timestamp"].as_i64().unwrap_or(0),
+        p["signature"].as_str().unwrap_or_default(),
+        chrono::Utc::now().timestamp(),
+    )?;
+    let registry = crate::ledger::load_registry();
+    let Some(entry) = registry.wallets.iter().find(|w| w.address == address) else {
+        return Ok(serde_json::json!({ "found": false }));
+    };
+    let path = crate::ledger::base_data_dir().join(&entry.id).join(NOTES_FILE);
+    let bytes = {
+        let _g = NOTES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::fs::read(&path).ok()
+    };
+    Ok(serde_json::json!({
+        "found": true,
+        "wallet": entry.id,
+        "sealed": bytes.map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
+    }))
+}
+
+#[tauri::command]
+pub async fn shielded_scan_notes() -> Result<usize, EgoDesktopError> {
+    tokio::task::spawn_blocking(|| {
+        let seed = wallet_seed()?;
+        let _g = NOTES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut notes = load_notes()?;
+        derived_scan_due(true);
+        let added = merge_derived_notes(&mut notes, &seed);
+        if added > 0 {
+            save_notes(&notes)?;
+        }
+        Ok(added)
+    })
+    .await
+    .map_err(|e| EgoDesktopError::DatabaseError(e.to_string()))?
+}
+
 fn require_open() -> Result<(), EgoDesktopError> {
     if !shielded::is_enabled() {
         return Err(EgoDesktopError::InvalidInput(
@@ -267,7 +407,7 @@ fn require_open() -> Result<(), EgoDesktopError> {
     Ok(())
 }
 
-fn current_fee() -> u64 {
+pub(crate) fn current_fee() -> u64 {
     crate::chain_db::get_current_base_fee().max(crate::mempool::MIN_FEE_UEGOC)
 }
 
@@ -435,6 +575,13 @@ pub async fn shielded_status() -> Result<ShieldedStatus, EgoDesktopError> {
         let state = shielded_chain::state();
         let mut notes = if enabled { load_notes().unwrap_or_default() } else { Vec::new() };
         let mut recovered = false;
+        if enabled && derived_scan_due(false) {
+            if let Ok(seed) = wallet_seed() {
+                if merge_derived_notes(&mut notes, &seed) > 0 {
+                    recovered = true;
+                }
+            }
+        }
         for n in notes.iter_mut() {
             if let Some(tx) = n.spent_tx.clone() {
                 let gone = crate::chain_db::get_tx_by_hash(&tx)
@@ -560,12 +707,42 @@ pub async fn shield_deposit(
     let ed_pk = hex::encode(kp.ed25519_public_key().as_bytes());
     let dil_pk = hex::encode(&kp.dilithium_public_key().key_data);
 
+    let seed = wallet_seed()?;
+    let existing = {
+        let _g = NOTES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        load_notes()?
+    };
+    let mut taken: std::collections::HashSet<[u8; 32]> = existing
+        .iter()
+        .filter_map(|n| hex::decode(&n.commitment).ok().and_then(|v| v.try_into().ok()))
+        .collect();
+    taken.extend(
+        crate::mempool::get_mempool()
+            .peek_all()
+            .iter()
+            .filter(|t| shielded_chain::is_deposit(t))
+            .filter_map(|t| shielded_chain::parse_shield_memo(&t.memo)),
+    );
+    let mut next_index = existing
+        .iter()
+        .filter(|n| n.domain.as_deref() == Some(shielded::NOTE_DOMAIN_DESKTOP))
+        .filter_map(|n| n.index)
+        .map(|i| i.saturating_add(1))
+        .max()
+        .unwrap_or(0);
+
     let mut txs = Vec::with_capacity(values.len());
     let mut stored = Vec::with_capacity(values.len());
     for value in &values {
         nonce += 1;
-        let note = Note::random(*value, &mut OsRng);
+        let index = shielded::next_free_note_index(&seed, shielded::NOTE_DOMAIN_DESKTOP, next_index, |c| {
+            taken.contains(c) || shielded_chain::leaf_index_of(c).is_some()
+        })
+        .ok_or_else(|| EgoDesktopError::WalletError("No note index is left for this wallet".into()))?;
+        next_index = index.saturating_add(1);
+        let note = shielded::derive_note(&seed, shielded::NOTE_DOMAIN_DESKTOP, index, *value);
         let commitment = note.commitment();
+        taken.insert(commitment);
         let memo = shielded_chain::shield_memo(&commitment);
         let sign_bytes = tx_signing_bytes_v2(&from, SHIELDED_POOL_ADDR, *value, nonce, now, CHAIN_ID, &memo);
         let ed_sig = kp.sign_ed25519(&sign_bytes);
@@ -601,6 +778,8 @@ pub async fn shield_deposit(
             spent_tx: None,
             spent_at: None,
             cancelled_at: None,
+            index: Some(index),
+            domain: Some(shielded::NOTE_DOMAIN_DESKTOP.to_string()),
         });
     }
 
@@ -844,4 +1023,58 @@ pub async fn invariant_report() -> Result<InvariantReport, EgoDesktopError> {
         strict: crate::invariants::strict(),
         violations,
     })
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    const ADDRESS: &str = "egot1yrq6njsqspzne63vz2z3293htk53hyks2g9755kq";
+    const PUBLIC_KEY: &str = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c";
+    const TS: i64 = 1_790_000_000;
+    const SIGNATURE: &str = "d410548702cc620d9b32e1dbaebcd09811b95a43ca4295789aaf7ba8c024ce883f5356e9ea0590ce92d987e26e22b27b4147626e25869c448d349be9ebc7e50d";
+
+    #[test]
+    fn notes_sealed_under_one_seed_open_only_under_it() {
+        let notes = vec![StoredNote {
+            note: Note::new(1_000_000, [3u8; 32], [4u8; 32]),
+            commitment: "c".into(),
+            created_at: 1,
+            deposit_tx: "0xd".into(),
+            spent_tx: None,
+            spent_at: None,
+            cancelled_at: None,
+            index: Some(2),
+            domain: Some(shielded::NOTE_DOMAIN_DESKTOP.into()),
+        }];
+        let sealed = seal_notes(&[5u8; 32], &notes).unwrap();
+        let opened = open_notes(&[5u8; 32], &sealed).unwrap();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].note, notes[0].note);
+        assert_eq!(opened[0].index, Some(2));
+        assert!(open_notes(&[6u8; 32], &sealed).is_err());
+        let legacy: Vec<StoredNote> = serde_json::from_str(
+            r#"[{"note":{"inner":{"value_uegoc":1000000,"owner_secret":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"rho":[2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2]}},"commitment":"c","created_at":1,"deposit_tx":"0xd"}]"#,
+        )
+        .unwrap();
+        assert_eq!(legacy[0].index, None, "a notes file written before derivation still reads");
+    }
+
+    #[test]
+    fn a_request_signed_by_the_extension_is_accepted() {
+        assert_eq!(verify_notes_export_request(ADDRESS, PUBLIC_KEY, TS, SIGNATURE, TS + 10), Ok(()));
+    }
+
+    #[test]
+    fn a_forged_stale_or_foreign_request_is_refused() {
+        let mut bad = hex::decode(SIGNATURE).unwrap();
+        bad[0] ^= 1;
+        assert!(verify_notes_export_request(ADDRESS, PUBLIC_KEY, TS, &hex::encode(bad), TS).is_err());
+        assert!(verify_notes_export_request(ADDRESS, PUBLIC_KEY, TS, SIGNATURE, TS + NOTES_EXPORT_WINDOW_SECS + 1).is_err());
+        assert!(verify_notes_export_request(ADDRESS, PUBLIC_KEY, TS + 1, SIGNATURE, TS).is_err());
+        let other = ego_core::KeyPair::from_bytes(&[8u8; 32]).unwrap();
+        let other_pk = hex::encode(other.ed25519_public_key().as_bytes());
+        assert!(verify_notes_export_request(ADDRESS, &other_pk, TS, SIGNATURE, TS).is_err());
+        assert!(verify_notes_export_request("egot1someoneelse", PUBLIC_KEY, TS, SIGNATURE, TS).is_err());
+    }
 }

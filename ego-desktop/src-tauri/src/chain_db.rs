@@ -3464,6 +3464,8 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
     sorted_txs.sort_by_key(|t| t.nonce);
 
     let mut seen_tx_hashes = std::collections::HashSet::new();
+    let mut seen_commitments = std::collections::HashSet::new();
+    let mut held_back: Vec<LedgerTx> = Vec::new();
     let valid_txs: Vec<&LedgerTx> = sorted_txs.iter().filter(|tx| {
         if tx.hash.is_empty() {
             eprintln!("[TX] Rejected — empty hash (from={:.16})", tx.from);
@@ -3483,6 +3485,13 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
         // the mempool and propose it once this node has the history to stand behind it.
         if crate::shielded_chain::is_unshield(tx) {
             if let Err(e) = crate::shielded_chain::unshield_is_valid_now(tx) {
+                eprintln!("[TX] {:.12} held back from this proposal — {e}", tx.hash);
+                held_back.push((*tx).clone());
+                return false;
+            }
+        }
+        if crate::shielded_chain::is_deposit(tx) {
+            if let Err(e) = crate::shielded_chain::deposit_is_proposable(height, tx, &mut seen_commitments) {
                 eprintln!("[TX] {:.12} held back from this proposal — {e}", tx.hash);
                 return false;
             }
@@ -3556,6 +3565,9 @@ pub fn build_block_proposal(txs: &[LedgerTx], miner: &str, poc_ticket: &str, poc
 
         true
     }).collect();
+    if !held_back.is_empty() {
+        crate::mempool::get_mempool().requeue(held_back);
+    }
 
     let user_tx_count = valid_txs.iter().filter(|t| {
         !t.from.is_empty() && t.tx_type != "reward" && t.tx_type != "coinbase" && t.tx_type != "post_reward"

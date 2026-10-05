@@ -989,6 +989,7 @@ fn main() {
             commands::shielded::shielded_status,
             commands::shielded::shielded_forget_note,
             commands::shielded::shielded_forget_spent,
+            commands::shielded::shielded_scan_notes,
             commands::shielded::shielded_cancel_withdrawal,
             commands::shielded::shielded_cancel_deposit,
             commands::shielded::shield_deposit,

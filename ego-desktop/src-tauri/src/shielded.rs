@@ -2,6 +2,7 @@ use ego_stark::merkle::{MerklePath, MerkleTree};
 use ego_stark::note::leaf_for as stark_leaf_for;
 use ego_stark::prove::{default_options, prove_withdrawal as stark_prove, verify_withdrawal};
 use ego_stark::{digest_from_bytes, digest_to_bytes, Digest};
+#[cfg(test)]
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -52,6 +53,81 @@ pub fn recipient_digest(address: &str) -> [u8; 32] {
     *ego_core::hash_data(address.as_bytes()).as_bytes()
 }
 
+pub const NOTE_DOMAIN_DESKTOP: &str = "desktop";
+pub const NOTE_DOMAIN_EXTENSION: &str = "ext";
+pub const NOTE_DOMAINS: [&str; 2] = [NOTE_DOMAIN_DESKTOP, NOTE_DOMAIN_EXTENSION];
+pub const NOTE_RECOVERY_GAP: u32 = 20;
+
+pub fn derive_note(seed: &[u8], domain: &str, index: u32, value_uegoc: u64) -> Note {
+    let part = |role: &str| -> [u8; 32] {
+        let mut material = format!("ego/shielded-note/v1/{domain}/{role}:").into_bytes();
+        material.extend_from_slice(seed);
+        material.extend_from_slice(&index.to_le_bytes());
+        *ego_core::hash_data(&material).as_bytes()
+    };
+    Note::new(value_uegoc, part("secret"), part("rho"))
+}
+
+#[derive(Debug, Clone)]
+pub struct FoundNote {
+    pub note: Note,
+    pub domain: &'static str,
+    pub index: u32,
+}
+
+pub fn scan_derived_notes(
+    seed: &[u8],
+    gap: u32,
+    leaf_index_of: impl Fn(&[u8; 32]) -> Option<u64>,
+    leaf_at: impl Fn(u64) -> Option<[u8; 32]>,
+) -> Vec<FoundNote> {
+    let mut found = Vec::new();
+    for domain in NOTE_DOMAINS {
+        let mut misses = 0u32;
+        let mut index = 0u32;
+        while misses < gap {
+            let commitment = derive_note(seed, domain, index, DENOMINATIONS_UEGOC[0]).commitment();
+            match leaf_index_of(&commitment).and_then(&leaf_at) {
+                Some(leaf) => {
+                    let value = DENOMINATIONS_UEGOC
+                        .iter()
+                        .copied()
+                        .find(|v| leaf_for(&commitment, *v) == leaf);
+                    if let Some(value) = value {
+                        found.push(FoundNote {
+                            note: derive_note(seed, domain, index, value),
+                            domain,
+                            index,
+                        });
+                    }
+                    misses = 0;
+                }
+                None => misses += 1,
+            }
+            match index.checked_add(1) {
+                Some(next) => index = next,
+                None => break,
+            }
+        }
+    }
+    found
+}
+
+pub fn next_free_note_index(
+    seed: &[u8],
+    domain: &str,
+    from: u32,
+    taken: impl Fn(&[u8; 32]) -> bool,
+) -> Option<u32> {
+    let mut index = from;
+    loop {
+        if !taken(&derive_note(seed, domain, index, DENOMINATIONS_UEGOC[0]).commitment()) {
+            return Some(index);
+        }
+        index = index.checked_add(1)?;
+    }
+}
+
 pub fn withdrawal_binding(recipient: &[u8; 32], fee_uegoc: u64) -> [u8; 32] {
     from_digest(
         &ego_stark::note::withdrawal_binding(recipient, fee_uegoc)
@@ -69,6 +145,7 @@ impl Note {
         Self { inner: ego_stark::Note { value_uegoc, owner_secret, rho } }
     }
 
+    #[cfg(test)]
     pub fn random<R: RngCore + CryptoRng>(value_uegoc: u64, rng: &mut R) -> Self {
         Self { inner: ego_stark::Note::random(value_uegoc, rng) }
     }
@@ -363,6 +440,9 @@ pub fn is_enabled() -> bool {
 }
 
 #[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rand::rngs::StdRng;
@@ -395,6 +475,87 @@ mod tests {
 
     fn withdrawal(pool: &ShieldedPool, n: &Note, index: usize) -> Withdrawal {
         prove_withdrawal(pool, n, index, recipient(), FEE).unwrap()
+    }
+
+    #[test]
+    fn derived_notes_match_what_the_extension_derives() {
+        let seed = [7u8; 32];
+        let ext0 = derive_note(&seed, NOTE_DOMAIN_EXTENSION, 0, AMOUNT);
+        assert_eq!(hex::encode(ext0.inner().owner_secret), "f2eb2d9295edda0875a442008807e608e7ca4c6ca25a98513ca81bfbca6e087c");
+        assert_eq!(hex::encode(ext0.inner().rho), "5c4fe8453ffe638f51e51b34de595cd16abc820d88df5359d168fd24ebde3601");
+        let ext5 = derive_note(&seed, NOTE_DOMAIN_EXTENSION, 5, AMOUNT);
+        assert_eq!(hex::encode(ext5.inner().owner_secret), "e9fa6ee563e9573c4be98abf2ab7abbf0b379182212ca771fb73833a6e3aa780");
+        assert_eq!(hex::encode(ext5.inner().rho), "4bd27c804c5418bd05c621c384e056a70366e336fd29f4490faedd013192bb35");
+        let desk0 = derive_note(&seed, NOTE_DOMAIN_DESKTOP, 0, AMOUNT);
+        assert_eq!(hex::encode(desk0.inner().owner_secret), "c77383b0866283767e839826b528b94bb259a13e28dcc8cfaee8ee8b46940d10");
+        assert_eq!(hex::encode(desk0.inner().rho), "f3a7046172fb09886b7b076e8f3e5d58565ad12f79d0362357acd410a4a3891e");
+        assert_eq!(
+            derive_note(&seed, NOTE_DOMAIN_DESKTOP, 0, AMOUNT).commitment(),
+            derive_note(&seed, NOTE_DOMAIN_DESKTOP, 0, 10 * AMOUNT).commitment(),
+            "the commitment does not depend on the value, so one probe covers every size",
+        );
+    }
+
+    #[test]
+    fn the_wallet_address_matches_the_extension_for_the_same_seed() {
+        let kp = ego_core::KeyPair::from_bytes(&[7u8; 32]).unwrap();
+        let address = kp
+            .derive_address(1, ego_core::AddressType::EOA)
+            .to_bech32("egot")
+            .unwrap();
+        assert_eq!(address, "egot1yrq6njsqspzne63vz2z3293htk53hyks2g9755kq");
+    }
+
+    #[test]
+    fn a_scan_finds_notes_from_both_apps_and_stops_after_the_gap() {
+        let seed = [9u8; 32];
+        let mut pool = ShieldedPool::new(DEPTH);
+        let mut index_of = std::collections::HashMap::new();
+        let deposit = |pool: &mut ShieldedPool, index_of: &mut std::collections::HashMap<[u8; 32], u64>, n: &Note| {
+            let at = pool.deposit(n.commitment(), n.value_uegoc()).unwrap() as u64;
+            index_of.insert(n.commitment(), at);
+        };
+        let stranger = note(AMOUNT, 200, 201);
+        deposit(&mut pool, &mut index_of, &stranger);
+        let wanted = [
+            derive_note(&seed, NOTE_DOMAIN_DESKTOP, 0, 10 * AMOUNT),
+            derive_note(&seed, NOTE_DOMAIN_DESKTOP, 3, AMOUNT),
+            derive_note(&seed, NOTE_DOMAIN_EXTENSION, 1, 100 * AMOUNT),
+        ];
+        for n in &wanted {
+            deposit(&mut pool, &mut index_of, n);
+        }
+        let beyond_gap = derive_note(&seed, NOTE_DOMAIN_DESKTOP, 3 + NOTE_RECOVERY_GAP + 1, AMOUNT);
+        deposit(&mut pool, &mut index_of, &beyond_gap);
+
+        let leaves = pool.leaves().to_vec();
+        let found = scan_derived_notes(
+            &seed,
+            NOTE_RECOVERY_GAP,
+            |c| index_of.get(c).copied(),
+            |i| leaves.get(i as usize).copied(),
+        );
+        let got: Vec<(&str, u32, u64)> = found.iter().map(|f| (f.domain, f.index, f.note.value_uegoc())).collect();
+        assert_eq!(
+            got,
+            vec![
+                (NOTE_DOMAIN_DESKTOP, 0, 10 * AMOUNT),
+                (NOTE_DOMAIN_DESKTOP, 3, AMOUNT),
+                (NOTE_DOMAIN_EXTENSION, 1, 100 * AMOUNT),
+            ],
+        );
+        for (f, n) in found.iter().zip(&wanted) {
+            assert_eq!(f.note, *n);
+        }
+    }
+
+    #[test]
+    fn a_new_desktop_note_skips_indices_already_in_use() {
+        let seed = [11u8; 32];
+        let used: Vec<[u8; 32]> = (0..3).map(|i| derive_note(&seed, NOTE_DOMAIN_DESKTOP, i, AMOUNT).commitment()).collect();
+        let next = next_free_note_index(&seed, NOTE_DOMAIN_DESKTOP, 0, |c| used.contains(c));
+        assert_eq!(next, Some(3));
+        assert_eq!(next_free_note_index(&seed, NOTE_DOMAIN_DESKTOP, 5, |c| used.contains(c)), Some(5));
     }
 
     #[test]
@@ -604,6 +765,7 @@ mod tests {
 
     #[test]
     fn the_client_pool_is_available_by_default_and_can_be_switched_off() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("EGO_SHIELDED_POOL");
         assert!(is_enabled(), "shielding must be reachable without setting an env var");
 
@@ -620,6 +782,7 @@ mod tests {
 
     #[test]
     fn the_pool_is_active_by_default_and_shares_one_off_switch() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("EGO_SHIELDED_POOL");
         std::env::remove_var("EGO_SHIELDED_POOL_HEIGHT");
         assert!(is_enabled());
@@ -636,6 +799,7 @@ mod tests {
 
     #[test]
     fn an_activation_height_still_overrides_everything() {
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("EGO_SHIELDED_POOL_HEIGHT", "29300");
         assert!(!crate::shielded_chain::rule_active(29_299), "below the activation height");
         assert!(crate::shielded_chain::rule_active(29_300), "at the activation height");

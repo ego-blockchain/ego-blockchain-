@@ -3221,8 +3221,31 @@ const WalletPage: React.FC = () => {
                 </div>
               );
             })()}
-            <div className="mt-3 text-[10px] text-gray-600 font-mono break-all">
-              Verifying key {shielded?.verifying_key_digest?.slice(0, 16)}… · notes live in shielded_notes.bin, encrypted under your seed
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+              <div className="text-[10px] text-gray-600 font-mono break-all">
+                Verifying key {shielded?.verifying_key_digest?.slice(0, 16)}… · notes live in shielded_notes.bin, encrypted under your seed
+              </div>
+              <button
+                disabled={shieldBusy}
+                onClick={async () => {
+                  setShieldBusy(true);
+                  setShieldMsg(null);
+                  try {
+                    const found = await invoke<number>('shielded_scan_notes');
+                    setShieldMsg(found > 0
+                      ? `Found ${found} note${found === 1 ? '' : 's'} from your recovery phrase.`
+                      : 'No other notes from your recovery phrase are in the pool.');
+                    refreshShielded();
+                  } catch (err) {
+                    setShieldMsg(String(err).replace(/^.*Error:/, '').trim());
+                  } finally {
+                    setShieldBusy(false);
+                  }
+                }}
+                className="text-[11px] text-gray-400 hover:text-gray-200 underline disabled:opacity-40"
+              >
+                Scan for notes from your recovery phrase
+              </button>
             </div>
           </div>
         </div>

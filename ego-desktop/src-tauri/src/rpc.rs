@@ -426,6 +426,101 @@ fn handle_method(req: RpcRequest) -> RpcResponse {
             }
         }
 
+        "shielded.state" => {
+            let addr = p["address"].as_str().unwrap_or_default().trim().to_string();
+            let st = crate::shielded_chain::state();
+            let spendable = if addr.is_empty() {
+                0
+            } else {
+                let pending_out: u64 = crate::mempool::get_mempool()
+                    .peek_all()
+                    .iter()
+                    .filter(|t| t.from.trim() == addr)
+                    .map(|t| t.amount.saturating_add(t.fee_uegoc))
+                    .fold(0u64, |a, v| a.saturating_add(v));
+                crate::chain_db::balance_of(&addr).saturating_sub(pending_out)
+            };
+            RpcResponse::ok(req.id, json!({
+                "enabled":             crate::shielded::is_enabled(),
+                "active":              crate::shielded_chain::rule_active_at_tip(),
+                "pool_address":        crate::shielded_chain::SHIELDED_POOL_ADDR,
+                "pool_balance_uegoc":  st.balance_uegoc,
+                "leaf_count":          st.next_index,
+                "root":                hex::encode(st.root),
+                "recent_roots":        st.recent_roots.iter().map(hex::encode).collect::<Vec<_>>(),
+                "denominations_uegoc": crate::shielded::DENOMINATIONS_UEGOC,
+                "max_spends":          crate::shielded_chain::MAX_UNSHIELD_SPENDS,
+                "min_fee_uegoc":       crate::mempool::MIN_FEE_UEGOC,
+                "current_fee_uegoc":   crate::commands::shielded::current_fee(),
+                "proof_system":        crate::commands::shielded::PROOF_SYSTEM,
+                "local_height":        crate::chain_db::local_chain_height(),
+                "network_tip":         crate::p2p::network_tip(),
+                "finalized_height":    crate::chain_db::finalized_height(),
+                "spendable_uegoc":     spendable,
+            }))
+        }
+
+        "shielded.leaves" => {
+            let from  = p["from"].as_u64().unwrap_or(0);
+            let limit = p["limit"].as_u64().unwrap_or(4_096).clamp(1, 16_384) as usize;
+            let leaves = crate::shielded_chain::leaves_from(from, limit);
+            RpcResponse::ok(req.id, json!({
+                "from":       from,
+                "leaves":     leaves.iter().map(hex::encode).collect::<Vec<_>>(),
+                "leaf_count": crate::shielded_chain::state().next_index,
+            }))
+        }
+
+        "shielded.exportNotes" => {
+            match crate::commands::shielded::export_sealed_notes(&p) {
+                Ok(v) => RpcResponse::ok(req.id, v),
+                Err(e) => RpcResponse::err(req.id, -32000, &e),
+            }
+        }
+
+        "shielded.check" => {
+            let finalized = crate::chain_db::finalized_height();
+            let nullifiers: Vec<bool> = p["nullifiers"]
+                .as_array()
+                .map(|a| a.iter().take(1_024).map(|v| {
+                    v.as_str()
+                        .and_then(|s| hex::decode(s).ok())
+                        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                        .map(|n| crate::shielded_chain::is_nullifier_spent(&n))
+                        .unwrap_or(false)
+                }).collect())
+                .unwrap_or_default();
+            let wanted: Vec<String> = p["txs"]
+                .as_array()
+                .map(|a| a.iter().take(1_024).map(|v| v.as_str().unwrap_or_default().to_string()).collect())
+                .unwrap_or_default();
+            let pending: std::collections::HashSet<String> = if wanted.is_empty() {
+                Default::default()
+            } else {
+                crate::mempool::get_mempool().peek_all().into_iter().map(|t| t.hash).collect()
+            };
+            let txs: Vec<Value> = wanted.iter().map(|h| {
+                let height = if h.is_empty() {
+                    None
+                } else {
+                    crate::chain_db::get_tx_by_hash(h).and_then(|t| t.block_height)
+                };
+                json!({
+                    "hash":         h,
+                    "block_height": height,
+                    "finalized":    height.map(|x| x > 0 && x <= finalized).unwrap_or(false),
+                    "in_mempool":   pending.contains(h),
+                })
+            }).collect();
+            RpcResponse::ok(req.id, json!({
+                "nullifiers":       nullifiers,
+                "txs":              txs,
+                "local_height":     crate::chain_db::local_chain_height(),
+                "network_tip":      crate::p2p::network_tip(),
+                "finalized_height": finalized,
+            }))
+        }
+
         "wallet.getTransactionHistory" => {
             let addr  = p["address"].as_str().unwrap_or_default();
             let limit = p["limit"].as_u64().unwrap_or(50) as usize;
@@ -1691,4 +1786,47 @@ fn gen_sub_id() -> String {
     let raw = format!("{}:{}", t.as_nanos(), seq);
     let hash = blake3::hash(raw.as_bytes());
     format!("0x{}", &hash.to_hex()[..16])
+}
+
+#[cfg(test)]
+mod shielded_rpc_tests {
+    use super::*;
+
+    fn call(method: &str, params: Value) -> Value {
+        let req = RpcRequest { jsonrpc: "2.0".into(), method: method.into(), params, id: Some(json!(1)) };
+        let resp = handle_method(req);
+        assert!(resp.error.is_none(), "{method}: {:?}", resp.error);
+        resp.result.expect("a result")
+    }
+
+    #[test]
+    fn the_pool_state_carries_what_a_light_wallet_needs() {
+        let st = call("shielded.state", json!({ "address": "egot1nobody" }));
+        for k in [
+            "enabled", "active", "pool_address", "pool_balance_uegoc", "leaf_count", "root",
+            "recent_roots", "denominations_uegoc", "max_spends", "min_fee_uegoc",
+            "current_fee_uegoc", "local_height", "network_tip", "finalized_height", "spendable_uegoc",
+        ] {
+            assert!(!st[k].is_null(), "missing {k}");
+        }
+        assert_eq!(st["pool_address"], crate::shielded_chain::SHIELDED_POOL_ADDR);
+        assert_eq!(st["root"].as_str().unwrap().len(), 64);
+        assert!(st["recent_roots"].as_array().unwrap().iter().any(|r| r == &st["root"]));
+        assert_eq!(st["spendable_uegoc"], 0);
+    }
+
+    #[test]
+    fn leaves_page_and_checks_answer_entry_for_entry() {
+        let page = call("shielded.leaves", json!({ "from": 0, "limit": 5 }));
+        assert!(page["leaves"].as_array().unwrap().len() <= 5);
+        assert!(page["leaves"].as_array().unwrap().iter().all(|l| l.as_str().unwrap().len() == 64));
+        let chk = call("shielded.check", json!({
+            "nullifiers": ["00".repeat(32), "zz", 7],
+            "txs": ["0xnotreal", "", 3],
+        }));
+        assert_eq!(chk["nullifiers"], json!([false, false, false]));
+        let txs = chk["txs"].as_array().unwrap();
+        assert_eq!(txs.len(), 3);
+        assert!(txs.iter().all(|t| t["block_height"].is_null() && t["in_mempool"] == false && t["finalized"] == false));
+    }
 }
