@@ -1,9 +1,12 @@
 {
   "manifest_version": 3,
   "name": "Ego Wallet",
-  "version": "1.0.0",
-  "description": "Quantum-safe wallet for Ego Blockchain",
-  "permissions": ["storage", "activeTab"],
+  "version": "1.2.0",
+  "description": "Non-custodial wallet for the Ego Blockchain. Send, receive and privately shield EGOC. Works with Ego Desktop.",
+  "permissions": ["storage"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js",
@@ -27,7 +30,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["content.js", "inject.js"],
+      "resources": ["inject.js"],
       "matches": ["<all_urls>"]
     }
   ],

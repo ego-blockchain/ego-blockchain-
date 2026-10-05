@@ -69,6 +69,7 @@ deploy/ego-validator.service
 # Node artifacts
 extension/node_modules/
 extension/dist/
+extension/*-store.zip
 mobile/node_modules/
 dex/node_modules/
 governance/node_modules/

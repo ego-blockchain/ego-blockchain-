@@ -12,25 +12,25 @@ import {
   buildSignedContractCallTx,
 } from '../shared/crypto';
 import {
+  getAddressHistory,
   getBalance,
   getBlocks,
   getHealth,
   getNonceInfo,
-  getTransactions,
-  requestFaucet,
   submitTx,
   DEFAULT_RPC_URL,
 } from '../shared/rpc';
 import type {
   ExtMessage,
   ExtResponse,
-  PendingConnection,
+  MessageType,
+  PendingRequest,
   SendTxParams,
   TrackedAsset,
   AssetBalance,
   WalletData,
 } from '../shared/types';
-import { NETWORKS } from '../shared/types';
+import { DAPP_MESSAGES, NETWORKS } from '../shared/types';
 import {
   CHAINS,
   fetchAssetBalance,
@@ -44,13 +44,35 @@ import {
   sendBtc,
   sendEvm,
 } from '../shared/signers';
+import {
+  cancelDeposit,
+  cancelWithdrawal,
+  forgetNote,
+  forgetSpent,
+  scanForNotes,
+  shieldDeposit,
+  shieldWithdraw,
+  shieldedStatus,
+  type ShieldedContext,
+} from './shieldedService';
 
 let unlockedSeed: Uint8Array | null = null;
 
-const pendingConnections: Map<string, {
-  resolve: (approved: boolean) => void;
-  info: PendingConnection;
-}> = new Map();
+const APPROVAL_TIMEOUT_MS = 5 * 60_000;
+const MAX_PENDING = 20;
+const MAX_PENDING_PER_SITE = 3;
+const MAX_SIGN_BYTES = 16 * 1024;
+const MAX_CALL_ARGS_HEX = 128 * 1024;
+const EGO_ADDRESS = /^egot?1[02-9ac-hj-np-z]{20,90}$/;
+
+interface Pending {
+  info: PendingRequest;
+  settle: (result: ExtResponse) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+const pendingRequests = new Map<string, Pending>();
+let approvalWindowId: number | null = null;
 
 async function loadWalletData(): Promise<WalletData | null> {
   return new Promise(resolve => {
@@ -176,13 +198,14 @@ async function getWalletState(): Promise<ExtResponse<{
   address?: string;
   publicKeyHex?: string;
   network?: string;
-  pendingConnection?: PendingConnection;
+  pendingRequest?: PendingRequest;
+  pendingCount: number;
 }>> {
   const walletData = await loadWalletData();
-  const pending = [...pendingConnections.values()][0];
+  const pending = [...pendingRequests.values()][0];
 
   if (!walletData) {
-    return { success: true, data: { hasWallet: false, locked: true } };
+    return { success: true, data: { hasWallet: false, locked: true, pendingCount: 0 } };
   }
 
   return {
@@ -193,7 +216,8 @@ async function getWalletState(): Promise<ExtResponse<{
       address: walletData.address,
       publicKeyHex: walletData.publicKeyHex,
       network: walletData.network,
-      pendingConnection: pending?.info,
+      pendingRequest: pending?.info,
+      pendingCount: pendingRequests.size,
     },
   };
 }
@@ -292,62 +316,214 @@ async function getWalletBalance(): Promise<ExtResponse<{ balance_egoc: number; b
   }
 }
 
+function hexToBytes(hex: string): Uint8Array {
+  return Uint8Array.from(hex.match(/.{2}/g) ?? [], b => parseInt(b, 16));
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function messageBytes(raw: unknown): Uint8Array | null {
+  if (typeof raw !== 'string') return null;
+  if (/^0x([0-9a-fA-F]{2})*$/.test(raw)) return hexToBytes(raw.slice(2));
+  return new TextEncoder().encode(raw);
+}
+
+function readableText(bytes: Uint8Array): string | undefined {
+  try {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text) ? undefined : text;
+  } catch {
+    return undefined;
+  }
+}
+
 async function handleSignMessage(
   messageHex: string,
 ): Promise<ExtResponse<{ signature: string }>> {
   if (!unlockedSeed) return { success: false, error: 'Wallet is locked' };
-
-  const messageBytes = Uint8Array.from(
-    messageHex.replace(/^0x/, '').match(/.{1,2}/g)!.map(b => parseInt(b, 16)),
-  );
-  const signature = signMessage(messageBytes, unlockedSeed);
+  if (!/^([0-9a-f]{2})+$/.test(messageHex)) return { success: false, error: 'Nothing to sign' };
+  const signature = signMessage(hexToBytes(messageHex), unlockedSeed);
   return { success: true, data: { signature } };
 }
 
-async function handleConnectDapp(info: PendingConnection): Promise<ExtResponse<{ approved: boolean }>> {
+function siteOrigin(sender: chrome.runtime.MessageSender): string | null {
+  const raw = sender.origin ?? sender.url;
+  if (!raw) return null;
+  try {
+    const url = new URL(raw);
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.origin : null;
+  } catch {
+    return null;
+  }
+}
+
+async function isConnected(origin: string): Promise<boolean> {
   const walletData = await loadWalletData();
-  if (!walletData) return { success: false, error: 'No wallet' };
-  if (!unlockedSeed) return { success: false, error: 'Wallet is locked' };
+  return !!walletData && walletData.approvedOrigins.includes(origin);
+}
 
+async function openApprovalWindow(): Promise<void> {
+  if (approvalWindowId !== null) {
+    try {
+      await chrome.windows.update(approvalWindowId, { focused: true });
+      return;
+    } catch {
+      approvalWindowId = null;
+    }
+  }
+  const win = await chrome.windows.create({
+    url: chrome.runtime.getURL('popup/index.html?approval=1'),
+    type: 'popup',
+    width: 376,
+    height: 640,
+    focused: true,
+  });
+  approvalWindowId = win?.id ?? null;
+}
+
+function finish(requestId: string, result: ExtResponse): void {
+  const pending = pendingRequests.get(requestId);
+  if (!pending) return;
+  pendingRequests.delete(requestId);
+  clearTimeout(pending.timer);
+  pending.settle(result);
+}
+
+function askUser(request: Omit<PendingRequest, 'requestId'>): Promise<ExtResponse> {
+  if (pendingRequests.size >= MAX_PENDING) {
+    return Promise.resolve({ success: false, error: 'Too many requests are already waiting for approval.' });
+  }
+  const fromSite = [...pendingRequests.values()].filter(p => p.info.origin === request.origin).length;
+  if (fromSite >= MAX_PENDING_PER_SITE) {
+    return Promise.resolve({ success: false, error: 'This site already has requests waiting for approval.' });
+  }
+  const requestId = crypto.randomUUID();
   return new Promise(resolve => {
-    pendingConnections.set(info.requestId, {
-      resolve: (approved: boolean) => {
-        pendingConnections.delete(info.requestId);
-        resolve({ success: true, data: { approved } });
-      },
-      info,
-    });
-
-    chrome.action.openPopup?.();
+    const timer = setTimeout(
+      () => finish(requestId, { success: false, error: 'The request was not approved in time.' }),
+      APPROVAL_TIMEOUT_MS,
+    );
+    pendingRequests.set(requestId, { info: { ...request, requestId }, settle: resolve, timer });
+    openApprovalWindow().catch(() => undefined);
   });
 }
 
-async function approveConnection(requestId: string): Promise<ExtResponse> {
-  const walletData = await loadWalletData();
-  const pending = pendingConnections.get(requestId);
-  if (!pending) return { success: false, error: 'No pending connection' };
-
-  if (walletData && !walletData.approvedOrigins.includes(pending.info.origin)) {
-    walletData.approvedOrigins.push(pending.info.origin);
-    await saveWalletData(walletData);
+async function perform(request: PendingRequest): Promise<ExtResponse> {
+  if (request.kind === 'connect') {
+    const walletData = await loadWalletData();
+    if (!walletData) return { success: false, error: 'No wallet' };
+    if (!walletData.approvedOrigins.includes(request.origin)) {
+      walletData.approvedOrigins.push(request.origin);
+      await saveWalletData(walletData);
+    }
+    return { success: true, data: { accounts: [walletData.address] } };
   }
+  if (!(await isConnected(request.origin))) {
+    return { success: false, error: 'This site was disconnected from Ego Wallet.' };
+  }
+  switch (request.kind) {
+    case 'send':
+      return sendTransaction({ to: request.to ?? '', amount_egoc: request.amount_egoc ?? 0, memo: request.memo });
+    case 'call':
+      return callContract(request.contractAddr ?? '', request.entrypoint ?? '', request.callArgs ?? '');
+    case 'sign':
+      return handleSignMessage(request.message ?? '');
+  }
+}
 
-  pending.resolve(true);
+async function approveRequest(requestId: string): Promise<ExtResponse> {
+  const pending = pendingRequests.get(requestId);
+  if (!pending) return { success: false, error: 'This request is no longer waiting.' };
+  if (!unlockedSeed) return { success: false, error: 'Unlock the wallet first.' };
+  pendingRequests.delete(requestId);
+  clearTimeout(pending.timer);
+  const result = await perform(pending.info);
+  pending.settle(result);
+  return result;
+}
+
+function rejectRequest(requestId: string): ExtResponse {
+  if (!pendingRequests.has(requestId)) return { success: false, error: 'This request is no longer waiting.' };
+  finish(requestId, { success: false, error: 'The user rejected the request.' });
   return { success: true };
 }
 
-async function rejectConnection(requestId: string): Promise<ExtResponse> {
-  const pending = pendingConnections.get(requestId);
-  if (!pending) return { success: false, error: 'No pending connection' };
-  pending.resolve(false);
-  return { success: true };
-}
-
-async function getAccounts(origin: string): Promise<ExtResponse<{ accounts: string[] }>> {
+async function dappAccounts(origin: string): Promise<ExtResponse<{ accounts: string[] }>> {
   const walletData = await loadWalletData();
-  if (!walletData || !unlockedSeed) return { success: true, data: { accounts: [] } };
-  if (!walletData.approvedOrigins.includes(origin)) return { success: true, data: { accounts: [] } };
-  return { success: true, data: { accounts: [walletData.address] } };
+  const connected = !!walletData && !!unlockedSeed && walletData.approvedOrigins.includes(origin);
+  return { success: true, data: { accounts: connected && walletData ? [walletData.address] : [] } };
+}
+
+async function dappConnect(origin: string): Promise<ExtResponse> {
+  const walletData = await loadWalletData();
+  if (!walletData) return { success: false, error: 'Set up Ego Wallet first.' };
+  if (unlockedSeed && walletData.approvedOrigins.includes(origin)) {
+    return { success: true, data: { accounts: [walletData.address] } };
+  }
+  return askUser({ origin, kind: 'connect' });
+}
+
+async function dappRequest(
+  origin: string,
+  type: MessageType,
+  payload: Record<string, unknown>,
+): Promise<ExtResponse> {
+  if (!(await loadWalletData())) return { success: false, error: 'Set up Ego Wallet first.' };
+  if (!(await isConnected(origin))) {
+    return { success: false, error: 'Connect this site to Ego Wallet first (eth_requestAccounts).' };
+  }
+  switch (type) {
+    case 'EGO_DAPP_SEND_TX': {
+      const to = String(payload.to ?? '').trim();
+      const amount = Number(payload.amount_egoc);
+      const memo = typeof payload.memo === 'string' ? payload.memo : '';
+      if (!EGO_ADDRESS.test(to)) return { success: false, error: 'The recipient is not an Ego address.' };
+      if (!Number.isFinite(amount) || Math.round(amount * 1_000_000) < 1 || amount * 1_000_000 > Number.MAX_SAFE_INTEGER) {
+        return { success: false, error: 'The amount is not valid.' };
+      }
+      if (memo.length > 256) return { success: false, error: 'The memo is longer than 256 characters.' };
+      return askUser({ origin, kind: 'send', to, amount_egoc: amount, memo });
+    }
+    case 'EGO_DAPP_CALL_CONTRACT': {
+      const contractAddr = String(payload.contractAddr ?? '').trim();
+      const entrypoint = String(payload.entrypoint ?? '').trim();
+      const callArgs = String(payload.callArgs ?? '').replace(/^0x/, '').toLowerCase();
+      if (!/^[0-9a-zA-Z]{8,128}$/.test(contractAddr)) return { success: false, error: 'The contract address is not valid.' };
+      if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(entrypoint)) return { success: false, error: 'The entrypoint name is not valid.' };
+      if (!/^([0-9a-f]{2})*$/.test(callArgs) || callArgs.length > MAX_CALL_ARGS_HEX) {
+        return { success: false, error: 'callArgs must be hex.' };
+      }
+      return askUser({ origin, kind: 'call', contractAddr, entrypoint, callArgs });
+    }
+    case 'EGO_DAPP_SIGN': {
+      const bytes = messageBytes(payload.message);
+      if (!bytes || bytes.length === 0) return { success: false, error: 'Nothing to sign.' };
+      if (bytes.length > MAX_SIGN_BYTES) return { success: false, error: 'The message is too long to sign.' };
+      return askUser({ origin, kind: 'sign', message: bytesToHex(bytes), messageText: readableText(bytes) });
+    }
+    default:
+      return { success: false, error: `Unsupported request: ${type}` };
+  }
+}
+
+async function listSites(): Promise<ExtResponse<{ sites: string[] }>> {
+  const walletData = await loadWalletData();
+  return { success: true, data: { sites: walletData?.approvedOrigins ?? [] } };
+}
+
+async function disconnectSite(origin: string): Promise<ExtResponse> {
+  const walletData = await loadWalletData();
+  if (!walletData) return { success: false, error: 'No wallet' };
+  walletData.approvedOrigins = walletData.approvedOrigins.filter(o => o !== origin);
+  await saveWalletData(walletData);
+  for (const pending of [...pendingRequests.values()]) {
+    if (pending.info.origin === origin) {
+      finish(pending.info.requestId, { success: false, error: 'This site was disconnected from Ego Wallet.' });
+    }
+  }
+  return { success: true };
 }
 
 async function setNetwork(network: 'testnet' | 'mainnet'): Promise<ExtResponse> {
@@ -500,12 +676,79 @@ async function sendExternal(payload: {
   }
 }
 
+async function shielded<T>(fn: (ctx: ShieldedContext) => Promise<T>): Promise<ExtResponse<T>> {
+  if (!unlockedSeed) return { success: false, error: 'Wallet is locked' };
+  const walletData = await loadWalletData();
+  if (!walletData) return { success: false, error: 'No wallet' };
+  try {
+    const data = await fn({
+      seed: unlockedSeed,
+      address: walletData.address,
+      rpcUrl: getRpcUrl(walletData.network),
+    });
+    return { success: true, data };
+  } catch (e: unknown) {
+    return { success: false, error: (e as Error).message ?? String(e) };
+  }
+}
+
+function fromWalletPage(sender: chrome.runtime.MessageSender): boolean {
+  return sender.id === chrome.runtime.id
+    && (sender.url ?? '').startsWith(chrome.runtime.getURL(''));
+}
+
+function stringList(v: unknown): string[] | null {
+  return Array.isArray(v) && v.every(x => typeof x === 'string') ? (v as string[]) : null;
+}
+
 chrome.runtime.onMessage.addListener(
   (message: ExtMessage, sender, sendResponse) => {
     const { type, payload = {} } = message;
 
     const handle = async (): Promise<ExtResponse> => {
+      if (DAPP_MESSAGES.has(type)) {
+        const origin = siteOrigin(sender);
+        if (!origin || !sender.tab) return { success: false, error: 'Requests must come from a web page.' };
+        if (type === 'EGO_DAPP_ACCOUNTS') return dappAccounts(origin);
+        if (type === 'EGO_DAPP_CONNECT') return dappConnect(origin);
+        return dappRequest(origin, type, payload);
+      }
+      if (!fromWalletPage(sender)) {
+        return { success: false, error: 'Only the Ego Wallet window can do that.' };
+      }
       switch (type) {
+        case 'EGO_SHIELDED_STATUS':
+          return shielded(ctx => shieldedStatus(ctx));
+
+        case 'EGO_SHIELD_DEPOSIT': {
+          const amount = Number(payload.amount_uegoc);
+          if (!Number.isSafeInteger(amount) || amount <= 0) return { success: false, error: 'Enter an amount to shield' };
+          return shielded(ctx => shieldDeposit(ctx, amount));
+        }
+
+        case 'EGO_SHIELD_WITHDRAW': {
+          const commitments = stringList(payload.commitments);
+          if (!commitments || typeof payload.recipient !== 'string') {
+            return { success: false, error: 'Choose the notes to spend and a recipient' };
+          }
+          return shielded(ctx => shieldWithdraw(ctx, commitments, payload.recipient as string));
+        }
+
+        case 'EGO_SHIELD_CANCEL_DEPOSIT':
+          return shielded(ctx => cancelDeposit(ctx, String(payload.commitment ?? '')));
+
+        case 'EGO_SHIELD_CANCEL_WITHDRAWAL':
+          return shielded(ctx => cancelWithdrawal(ctx, String(payload.spent_tx ?? '')));
+
+        case 'EGO_SHIELD_FORGET':
+          return shielded(ctx => forgetNote(ctx, String(payload.commitment ?? '')));
+
+        case 'EGO_SHIELD_FORGET_SPENT':
+          return shielded(ctx => forgetSpent(ctx));
+
+        case 'EGO_SHIELD_SCAN':
+          return shielded(ctx => scanForNotes(ctx));
+
         case 'EGO_HAS_WALLET':
           return hasWallet();
 
@@ -536,30 +779,20 @@ chrome.runtime.onMessage.addListener(
         case 'EGO_SEND_TX':
           return sendTransaction(payload as unknown as SendTxParams);
 
-        case 'EGO_CALL_CONTRACT':
-          return callContract(
-            payload.contractAddr as string,
-            payload.entrypoint as string,
-            payload.callArgs as string,
-          );
-
-        case 'EGO_SIGN_MESSAGE':
-          return handleSignMessage(payload.message as string);
-
         case 'EGO_GET_MNEMONIC':
           return getMnemonic(payload.password as string);
 
-        case 'EGO_CONNECT_DAPP':
-          return handleConnectDapp(payload as unknown as PendingConnection);
+        case 'EGO_APPROVE_REQUEST':
+          return approveRequest(String(payload.requestId ?? ''));
 
-        case 'EGO_APPROVE_CONNECTION':
-          return approveConnection(payload.requestId as string);
+        case 'EGO_REJECT_REQUEST':
+          return rejectRequest(String(payload.requestId ?? ''));
 
-        case 'EGO_REJECT_CONNECTION':
-          return rejectConnection(payload.requestId as string);
+        case 'EGO_LIST_SITES':
+          return listSites();
 
-        case 'EGO_GET_ACCOUNTS':
-          return getAccounts((sender.origin ?? sender.url ?? '') as string);
+        case 'EGO_DISCONNECT_SITE':
+          return disconnectSite(String(payload.origin ?? ''));
 
         case 'EGO_SET_NETWORK':
           return setNetwork(payload.network as 'testnet' | 'mainnet');
@@ -588,22 +821,22 @@ chrome.runtime.onMessage.addListener(
 
         case 'EGO_GET_TXS': {
           const wd = await loadWalletData();
-          const rpcUrl = getRpcUrl(wd?.network);
-          try {
-            const txs = await getTransactions(rpcUrl);
-            return { success: true, data: txs };
-          } catch (e: unknown) {
-            return { success: false, error: (e as Error).message };
-          }
-        }
-
-        case 'EGO_FAUCET': {
-          const wd = await loadWalletData();
           if (!wd) return { success: false, error: 'No wallet' };
           const rpcUrl = getRpcUrl(wd.network);
           try {
-            const result = await requestFaucet(wd.address, rpcUrl);
-            return { success: true, data: result };
+            const txs = await getAddressHistory(wd.address, 50, rpcUrl);
+            return {
+              success: true,
+              data: txs.map(t => ({
+                hash: t.hash,
+                from: t.from,
+                to: t.to,
+                amount_egoc: (t.amount ?? 0) / 1_000_000,
+                timestamp: t.timestamp,
+                type: t.tx_type ?? 'transfer',
+                pending: t.block_height == null,
+              })),
+            };
           } catch (e: unknown) {
             return { success: false, error: (e as Error).message };
           }
@@ -641,6 +874,14 @@ chrome.runtime.onMessage.addListener(
     return true;
   },
 );
+
+chrome.windows.onRemoved.addListener(windowId => {
+  if (windowId !== approvalWindowId) return;
+  approvalWindowId = null;
+  for (const pending of [...pendingRequests.values()]) {
+    finish(pending.info.requestId, { success: false, error: 'The user rejected the request.' });
+  }
+});
 
 chrome.runtime.onInstalled.addListener(() => {
   console.log('[Ego Wallet] Extension installed.');

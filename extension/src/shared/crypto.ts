@@ -201,6 +201,7 @@ export function buildSignedEgoTx(
   nonce: number,
   feeUegoc: number,
   memo: string,
+  txType = 'transfer',
 ): SignedEgoTx {
   const chainId = 1;
   const timestamp = Math.floor(Date.now() / 1000);
@@ -223,7 +224,7 @@ export function buildSignedEgoTx(
     nonce,
     public_key_ed25519: toHex(keypair.publicKey),
     fee_uegoc: feeUegoc,
-    tx_type: 'transfer',
+    tx_type: txType,
     tx_version: 2,
     chain_id: chainId,
   };
@@ -281,9 +282,19 @@ export function buildSignedContractCallTx(
   };
 }
 
+export const SIGNED_MESSAGE_PREFIX = '\x19Ego Signed Message:\n';
+
+export function signedMessageBytes(message: Uint8Array): Uint8Array {
+  const head = new TextEncoder().encode(`${SIGNED_MESSAGE_PREFIX}${message.length}\n`);
+  const out = new Uint8Array(head.length + message.length);
+  out.set(head);
+  out.set(message, head.length);
+  return out;
+}
+
 export function signMessage(message: Uint8Array, privateKey: Uint8Array): string {
   const keypair = nacl.sign.keyPair.fromSeed(privateKey);
-  const sig = nacl.sign.detached(message, keypair.secretKey);
+  const sig = nacl.sign.detached(signedMessageBytes(message), keypair.secretKey);
   return Array.from(sig).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 

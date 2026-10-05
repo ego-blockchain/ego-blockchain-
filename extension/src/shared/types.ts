@@ -54,25 +54,21 @@ export interface SubmitTxResponse {
   tx_hash: string;
 }
 
-export interface FaucetResponse {
-  success: boolean;
-  to: string;
-  amount_egoc: number;
-  amount_uegoc: number;
-  tx_hash: string;
-}
-
 export type MessageType =
   | 'EGO_GENERATE_WALLET'
   | 'EGO_IMPORT_WALLET'
   | 'EGO_GET_ADDRESS'
   | 'EGO_GET_BALANCE'
   | 'EGO_SEND_TX'
-  | 'EGO_SIGN_MESSAGE'
-  | 'EGO_CONNECT_DAPP'
-  | 'EGO_GET_ACCOUNTS'
-  | 'EGO_APPROVE_CONNECTION'
-  | 'EGO_REJECT_CONNECTION'
+  | 'EGO_DAPP_ACCOUNTS'
+  | 'EGO_DAPP_CONNECT'
+  | 'EGO_DAPP_SEND_TX'
+  | 'EGO_DAPP_CALL_CONTRACT'
+  | 'EGO_DAPP_SIGN'
+  | 'EGO_APPROVE_REQUEST'
+  | 'EGO_REJECT_REQUEST'
+  | 'EGO_LIST_SITES'
+  | 'EGO_DISCONNECT_SITE'
   | 'EGO_LOCK'
   | 'EGO_UNLOCK'
   | 'EGO_GET_STATE'
@@ -81,14 +77,29 @@ export type MessageType =
   | 'EGO_GET_HEALTH'
   | 'EGO_GET_BLOCKS'
   | 'EGO_GET_TXS'
-  | 'EGO_FAUCET'
   | 'EGO_HAS_WALLET'
   | 'EGO_GET_ASSETS'
   | 'EGO_ADD_ASSET'
   | 'EGO_REMOVE_ASSET'
   | 'EGO_REFRESH_ASSETS'
   | 'EGO_GET_CHAIN_ADDRESSES'
-  | 'EGO_SEND_EXTERNAL';
+  | 'EGO_SEND_EXTERNAL'
+  | 'EGO_SHIELDED_STATUS'
+  | 'EGO_SHIELD_DEPOSIT'
+  | 'EGO_SHIELD_WITHDRAW'
+  | 'EGO_SHIELD_CANCEL_DEPOSIT'
+  | 'EGO_SHIELD_CANCEL_WITHDRAWAL'
+  | 'EGO_SHIELD_FORGET'
+  | 'EGO_SHIELD_FORGET_SPENT'
+  | 'EGO_SHIELD_SCAN';
+
+export const DAPP_MESSAGES: ReadonlySet<MessageType> = new Set<MessageType>([
+  'EGO_DAPP_ACCOUNTS',
+  'EGO_DAPP_CONNECT',
+  'EGO_DAPP_SEND_TX',
+  'EGO_DAPP_CALL_CONTRACT',
+  'EGO_DAPP_SIGN',
+]);
 
 export interface ExtMessage {
   type: MessageType;
@@ -101,11 +112,20 @@ export interface ExtResponse<T = unknown> {
   error?: string;
 }
 
-export interface PendingConnection {
-  origin: string;
-  favicon?: string;
-  title?: string;
+export type DappRequestKind = 'connect' | 'send' | 'call' | 'sign';
+
+export interface PendingRequest {
   requestId: string;
+  origin: string;
+  kind: DappRequestKind;
+  to?: string;
+  amount_egoc?: number;
+  memo?: string;
+  contractAddr?: string;
+  entrypoint?: string;
+  callArgs?: string;
+  message?: string;
+  messageText?: string;
 }
 
 export interface SendTxParams {
@@ -116,7 +136,7 @@ export interface SendTxParams {
 
 export interface TrackedAsset {
   id: string;
-  chain: 'BTC' | 'ETH' | 'BNB' | 'SOL' | 'DOGE' | 'LTC';
+  chain: 'BTC' | 'ETH' | 'BNB' | 'POL' | 'SOL' | 'XRP' | 'DOGE' | 'LTC';
   symbol: string;
   name: string;
   address: string;

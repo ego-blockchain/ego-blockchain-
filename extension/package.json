@@ -1,11 +1,12 @@
 {
   "name": "ego-wallet-extension",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "private": true,
   "scripts": {
     "dev": "vite build --watch",
     "build": "vite build",
-    "build:dev": "vite build --mode development"
+    "build:dev": "vite build --mode development",
+    "build:wasm": "cargo build --release --lib --target wasm32-unknown-unknown --manifest-path ../crates/ego-stark-wasm/Cargo.toml && node -e \"require('fs').copyFileSync('../crates/ego-stark-wasm/target/wasm32-unknown-unknown/release/ego_stark_wasm.wasm','wasm/ego_stark.wasm')\""
   },
   "dependencies": {
     "@noble/curves": "^1.6.0",

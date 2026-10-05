@@ -13,6 +13,11 @@ const copyStaticPlugin = {
       resolve(distDir, 'manifest.json'),
     );
 
+    copyFileSync(
+      resolve(__dirname, 'wasm/ego_stark.wasm'),
+      resolve(distDir, 'ego_stark.wasm'),
+    );
+
     const iconsDir = resolve(distDir, 'icons');
     if (!existsSync(iconsDir)) mkdirSync(iconsDir, { recursive: true });
     for (const size of [16, 48, 128]) {

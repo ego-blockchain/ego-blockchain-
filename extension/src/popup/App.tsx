@@ -2,7 +2,15 @@ import React, { useCallback, useEffect, useReducer, useRef, useState } from 'rea
 import qrcode from 'qrcode-generator';
 import { generateSeed, seedToMnemonic } from '../shared/crypto';
 import { CHAINS, type ChainId } from '../shared/assets';
-import type { ExtMessage, ExtResponse, PendingConnection, TrackedAsset, AssetBalance } from '../shared/types';
+import type { DappRequestKind, ExtMessage, ExtResponse, PendingRequest, TrackedAsset, AssetBalance } from '../shared/types';
+import {
+  DENOMINATIONS_UEGOC,
+  MAX_SPENDS,
+  denominate,
+  pickNotesFor,
+  type NoteStatus,
+  type NoteView,
+} from '../shared/shielded';
 
 function sendMsg<T = unknown>(
   type: ExtMessage['type'],
@@ -42,67 +50,146 @@ const S = {
 
 const LOGO_URL = chrome.runtime.getURL('icons/icon128.png');
 
+const IS_APPROVAL_WINDOW = new URLSearchParams(window.location.search).get('approval') === '1';
+
 const STYLES = `
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@600;700;800&family=Lato:wght@400;700&family=JetBrains+Mono:wght@500&display=swap');
 
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
   :root {
-    --bg:        #07070d;
-    --bg-1:      #0c0c16;
-    --bg-2:      #12121f;
-    --bg-3:      #1a1a2c;
-    --line:      rgba(148,163,255,0.10);
-    --line-2:    rgba(148,163,255,0.18);
-    --txt:       #f4f5fb;
-    --txt-2:     #9aa1c0;
-    --txt-3:     #5d6485;
-    --indigo:    #6366f1;
-    --violet:    #8b5cf6;
-    --blue:      #3b82f6;
-    --green:     #34d399;
-    --red:       #f87171;
-    --amber:     #fbbf24;
-    --grad:      linear-gradient(135deg, #6366f1, #8b5cf6 55%, #3b82f6);
+    --font-display: 'Montserrat', 'Segoe UI', system-ui, sans-serif;
+    --font-body:    'Lato', 'Segoe UI', system-ui, sans-serif;
+    --font-mono:    'JetBrains Mono', 'SF Mono', ui-monospace, monospace;
+
+    --bg:     #05070c;
+    --bg-1:   #0a0e16;
+    --bg-2:   #10161f;
+    --bg-3:   #182130;
+    --line:   rgba(201,212,227,0.12);
+    --line-2: rgba(201,212,227,0.22);
+    --txt:    #f5f8fc;
+    --txt-1:  #e3e9f2;
+    --txt-2:  #c9d4e3;
+    --txt-3:  #9aa6ba;
+    --txt-4:  #7f8ca3;
+
+    --lime:   #d2eb2b;
+    --mint:   #00e5b0;
+    --amber:  #ffb547;
+    --sky:    #8fd3ff;
+    --green:  #2ef2c2;
+    --red:    #ff7a93;
+    --blue:   #8fd3ff;
+
+    --accent:      #d2eb2b;
+    --accent-2:    #00e5b0;
+    --accent-fill: #d2eb2b;
+    --accent-hover:#e0f74a;
+    --accent-ink:  #0b0f02;
+    --accent-text: #d8f03c;
+    --brand-text:  #2ef2c2;
+    --accent-tint: rgba(210,235,43,0.13);
+    --accent-line: rgba(210,235,43,0.45);
+    --accent-glow: rgba(210,235,43,0.55);
+    --mint-tint:   rgba(0,229,176,0.13);
+    --mint-line:   rgba(0,229,176,0.42);
+    --pos-tint:    rgba(46,242,194,0.13);
+    --neg-tint:    rgba(255,122,147,0.13);
+    --grad:        linear-gradient(120deg, #d2eb2b 0%, #00e5b0 100%);
+
+    --qa-send:     #d2eb2b;
+    --qa-receive:  #2ef2c2;
+    --qa-shield:   #ffb547;
+    --qa-activity: #ff9ec4;
+
+    --alert-error-txt:   #ffc2cd;
+    --alert-success-txt: #a8f7e1;
+    --alert-info-txt:    #cdeeff;
+    --alert-warn-txt:    #ffe0a8;
+
+    --hero-bg:   linear-gradient(160deg, #111a17 0%, #0e141d 52%, #09121a 100%);
+    --hero-line: rgba(210,235,43,0.24);
+    --glow-a:    rgba(196,240,58,0.20);
+    --glow-b:    rgba(0,229,176,0.30);
+    --cube:      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='48' viewBox='0 0 28 48'%3E%3Cpath d='M14 0 L28 8 L28 24 L14 32 L0 24 L0 8 Z M14 16 L0 8 M14 16 L28 8 M14 16 L14 32 M0 24 L14 32 L14 48 L0 56 L-14 48 L-14 32 Z M0 40 L-14 32 M0 40 L14 32 M0 40 L0 56 M28 24 L42 32 L42 48 L28 56 L14 48 L14 32 Z M28 40 L14 32 M28 40 L42 32 M28 40 L28 56 M0 -24 L14 -16 L14 0 L0 8 L-14 0 L-14 -16 Z M0 -8 L-14 -16 M0 -8 L14 -16 M0 -8 L0 8 M28 -24 L42 -16 L42 0 L28 8 L14 0 L14 -16 Z M28 -8 L14 -16 M28 -8 L42 -16 M28 -8 L28 8' fill='none' stroke='%23ffffff' stroke-width='0.8'/%3E%3C/svg%3E");
+    --cube-opacity: 0.10;
+    --topbar-bg: rgba(5,7,12,0.84);
+    --scroll:    #2a3446;
+    --qr-ring:   rgba(210,235,43,0.35);
+    color-scheme: dark;
   }
 
-  /* ── Light theme ─────────────────────────────────────────────── */
   :root[data-theme="light"] {
-    --bg:     #f6f7fb;
+    --bg:     #f2f4ee;
     --bg-1:   #ffffff;
-    --bg-2:   #f0f1f8;
-    --bg-3:   #e6e8f2;
-    --line:   rgba(40,46,99,0.12);
-    --line-2: rgba(40,46,99,0.20);
-    --txt:    #15172b;
-    --txt-2:  #4c5374;
-    --txt-3:  #737a98;
-  }
-  /* Hardcoded grays that would be invisible on a light background */
-  :root[data-theme="light"] .text-gray-300 { color: #2a3047; }
-  :root[data-theme="light"] .text-gray-600 { color: #737a98; }
-  :root[data-theme="light"] .text-blue-300 { color: #4f46e5; }
-  :root[data-theme="light"] .text-blue-400 { color: #4f46e5; }
-  :root[data-theme="light"] .topbar { background: rgba(255,255,255,0.85); }
+    --bg-2:   #ffffff;
+    --bg-3:   #eaeee7;
+    --line:   rgba(16,24,20,0.11);
+    --line-2: rgba(16,24,20,0.19);
+    --txt:    #0d1310;
+    --txt-1:  #1c2621;
+    --txt-2:  #39443e;
+    --txt-3:  #55615b;
+    --txt-4:  #69756f;
 
-  /* ── Inline text-link button ─────────────────────────────────── */
+    --green:  #007a5c;
+    --red:    #c42d4c;
+    --amber:  #9a5600;
+    --sky:    #0a6aa6;
+    --blue:   #0a6aa6;
+
+    --accent-text: #536500;
+    --brand-text:  #00775f;
+    --accent-tint: rgba(150,175,0,0.14);
+    --accent-line: rgba(115,140,0,0.45);
+    --accent-glow: rgba(150,175,0,0.45);
+    --mint-tint:   rgba(0,140,110,0.10);
+    --mint-line:   rgba(0,140,110,0.38);
+    --pos-tint:    rgba(0,122,92,0.10);
+    --neg-tint:    rgba(196,45,76,0.10);
+    --grad:        linear-gradient(120deg, #5a6d00 0%, #007a62 100%);
+
+    --qa-send:     #5a6d00;
+    --qa-receive:  #00775f;
+    --qa-shield:   #9a5600;
+    --qa-activity: #b02f68;
+
+    --alert-error-txt:   #8f1730;
+    --alert-success-txt: #005c45;
+    --alert-info-txt:    #0b4d78;
+    --alert-warn-txt:    #6e3c00;
+
+    --hero-bg:   linear-gradient(160deg, #fbfdf0 0%, #f2f9f4 58%, #edf6f6 100%);
+    --hero-line: rgba(95,115,0,0.24);
+    --glow-a:    rgba(210,235,43,0.55);
+    --glow-b:    rgba(0,229,176,0.30);
+    --cube:      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='48' viewBox='0 0 28 48'%3E%3Cpath d='M14 0 L28 8 L28 24 L14 32 L0 24 L0 8 Z M14 16 L0 8 M14 16 L28 8 M14 16 L14 32 M0 24 L14 32 L14 48 L0 56 L-14 48 L-14 32 Z M0 40 L-14 32 M0 40 L14 32 M0 40 L0 56 M28 24 L42 32 L42 48 L28 56 L14 48 L14 32 Z M28 40 L14 32 M28 40 L42 32 M28 40 L28 56 M0 -24 L14 -16 L14 0 L0 8 L-14 0 L-14 -16 Z M0 -8 L-14 -16 M0 -8 L14 -16 M0 -8 L0 8 M28 -24 L42 -16 L42 0 L28 8 L14 0 L14 -16 Z M28 -8 L14 -16 M28 -8 L42 -16 M28 -8 L28 8' fill='none' stroke='%23203020' stroke-width='0.8'/%3E%3C/svg%3E");
+    --cube-opacity: 0.08;
+    --topbar-bg: rgba(255,255,255,0.88);
+    --scroll:    #c3c9cf;
+    --qr-ring:   rgba(95,115,0,0.30);
+    color-scheme: light;
+  }
+
+  html, body { background: var(--bg); }
+  body {
+    font-family: var(--font-body);
+    color: var(--txt);
+    -webkit-font-smoothing: antialiased;
+  }
+  h1, h2, h3, .font-display, .text-2xl, .text-3xl, .font-extrabold { font-family: var(--font-display); letter-spacing: -0.01em; }
+
   .link-btn {
     background: none; border: none; cursor: pointer;
-    color: var(--txt-3); font-size: 0.74rem; font-weight: 500;
+    color: var(--txt-3); font-family: inherit; font-size: 0.76rem; font-weight: 700;
     margin: 6px auto 0; display: block; padding: 4px;
     text-decoration: underline; text-underline-offset: 3px;
     transition: color 0.15s ease;
   }
-  .link-btn:hover { color: var(--indigo); }
+  .link-btn:hover:not(:disabled) { color: var(--accent-text); }
+  .link-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
-  body {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-    background: var(--bg);
-    color: var(--txt);
-    -webkit-font-smoothing: antialiased;
-  }
-
-  /* ── Utility classes ─────────────────────────────────────────── */
   .flex { display: flex; }
   .flex-col { flex-direction: column; }
   .flex-1 { flex: 1 1 0%; }
@@ -123,6 +210,9 @@ const STYLES = `
   .h-full { height: 100%; }
   .w-full { width: 100%; }
   .min-h-0 { min-height: 0; }
+  .relative { position: relative; }
+  .absolute { position: absolute; }
+  .inline-block { display: inline-block; }
   .overflow-hidden { overflow: hidden; }
   .overflow-y-auto { overflow-y: auto; }
   .rounded-lg { border-radius: 0.5rem; }
@@ -130,33 +220,33 @@ const STYLES = `
   .rounded-2xl { border-radius: 1rem; }
   .rounded-full { border-radius: 9999px; }
   .text-white { color: var(--txt); }
-  .text-gray-300 { color: #c7cce6; }
+  .text-gray-300 { color: var(--txt-1); }
   .text-gray-400 { color: var(--txt-2); }
   .text-gray-500 { color: var(--txt-3); }
-  .text-gray-600 { color: #494f6b; }
-  .text-blue-400 { color: #818cf8; }
-  .text-blue-300 { color: #a5b4fc; }
+  .text-gray-600 { color: var(--txt-4); }
+  .text-blue-400 { color: var(--brand-text); }
+  .text-blue-300 { color: var(--brand-text); }
   .text-green-400 { color: var(--green); }
   .text-red-400 { color: var(--red); }
-  .text-xs { font-size: 0.72rem; line-height: 1rem; }
-  .text-sm { font-size: 0.84rem; line-height: 1.25rem; }
+  .text-xs { font-size: 0.74rem; line-height: 1.05rem; }
+  .text-sm { font-size: 0.86rem; line-height: 1.3rem; }
   .text-base { font-size: 1rem; line-height: 1.5rem; }
   .text-lg { font-size: 1.125rem; line-height: 1.75rem; }
   .text-xl { font-size: 1.25rem; line-height: 1.75rem; }
   .text-2xl { font-size: 1.5rem; line-height: 2rem; }
-  .text-3xl { font-size: 1.95rem; line-height: 2.3rem; }
+  .text-3xl { font-size: 2rem; line-height: 2.4rem; }
   .font-medium { font-weight: 500; }
-  .font-semibold { font-weight: 600; }
+  .font-semibold { font-weight: 700; }
   .font-bold { font-weight: 700; }
   .font-extrabold { font-weight: 800; }
-  .font-mono { font-family: 'SF Mono', ui-monospace, SFMono-Regular, monospace; }
-  .tracking-wide { letter-spacing: 0.04em; }
-  .uppercase { text-transform: uppercase; }
+  .font-mono { font-family: var(--font-mono); letter-spacing: -0.01em; }
+  .tracking-wide { letter-spacing: 0.06em; }
+  .uppercase { text-transform: uppercase; font-family: var(--font-display); letter-spacing: 0.1em; }
   .break-all { word-break: break-all; }
   .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .text-center { text-align: center; }
   .text-right { text-align: right; }
-  .leading-relaxed { line-height: 1.625; }
+  .leading-relaxed { line-height: 1.6; }
   .cursor-pointer { cursor: pointer; }
   .p-3 { padding: 0.75rem; }
   .p-4 { padding: 1rem; }
@@ -166,6 +256,7 @@ const STYLES = `
   .py-2 { padding-top: 0.5rem; padding-bottom: 0.5rem; }
   .py-3 { padding-top: 0.75rem; padding-bottom: 0.75rem; }
   .py-6 { padding-top: 1.5rem; padding-bottom: 1.5rem; }
+  .pt-3 { padding-top: 0.75rem; }
   .mt-1 { margin-top: 0.25rem; }
   .mt-2 { margin-top: 0.5rem; }
   .mt-3 { margin-top: 0.75rem; }
@@ -176,26 +267,30 @@ const STYLES = `
   .mx-4 { margin-left: 1rem; margin-right: 1rem; }
   .mr-2 { margin-right: 0.5rem; }
 
-  /* ── Animations ──────────────────────────────────────────────── */
   @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
   @keyframes fadeUp {
-    from { opacity: 0; transform: translateY(8px); }
+    from { opacity: 0.4; transform: translateY(6px); }
     to   { opacity: 1; transform: translateY(0); }
   }
-  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes fadeIn { from { opacity: 0.4; } to { opacity: 1; } }
   @keyframes shimmer {
     0%   { background-position: -200% 0; }
     100% { background-position: 200% 0; }
   }
   @keyframes pulseDot {
-    0%, 100% { opacity: 1; transform: scale(1); }
-    50%      { opacity: 0.55; transform: scale(0.85); }
+    0%   { box-shadow: 0 0 0 0 rgba(46,242,194,0.55); }
+    70%  { box-shadow: 0 0 0 7px rgba(46,242,194,0); }
+    100% { box-shadow: 0 0 0 0 rgba(46,242,194,0); }
   }
   @keyframes floaty {
     0%, 100% { transform: translateY(0); }
     50%      { transform: translateY(-6px); }
   }
   @keyframes orbit { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  @keyframes drift {
+    from { transform: translate3d(-7%, -5%, 0) rotate(0deg) scale(1); }
+    to   { transform: translate3d(7%, 5%, 0) rotate(10deg) scale(1.08); }
+  }
 
   .animate-spin { animation: spin 1s linear infinite; }
   .screen-enter { animation: fadeUp 0.22s ease both; }
@@ -208,75 +303,121 @@ const STYLES = `
     border-radius: 8px;
   }
 
-  /* ── Cards ───────────────────────────────────────────────────── */
   .card {
     background: var(--bg-2);
     border: 1px solid var(--line);
-    border-radius: 14px;
+    border-radius: 16px;
     padding: 14px;
   }
   .card-hover { transition: border-color 0.15s, transform 0.15s, background 0.15s; }
-  .card-hover:hover { border-color: var(--line-2); background: var(--bg-3); }
+  .card-hover:hover { border-color: var(--accent-line); background: var(--bg-3); }
 
   .hero-card {
     position: relative;
-    border-radius: 18px;
-    padding: 22px 18px 18px;
-    text-align: center;
+    isolation: isolate;
     overflow: hidden;
-    background:
-      radial-gradient(120% 140% at 50% 0%, rgba(99,102,241,0.28) 0%, rgba(139,92,246,0.10) 45%, transparent 75%),
-      var(--bg-2);
-    border: 1px solid rgba(129,140,248,0.28);
-    box-shadow: 0 12px 40px -16px rgba(99,102,241,0.45), inset 0 1px 0 rgba(255,255,255,0.06);
+    border-radius: 22px;
+    padding: 18px 16px 16px;
+    text-align: center;
+    background: var(--hero-bg);
+    border: 1px solid var(--hero-line);
+    box-shadow: 0 22px 44px -28px var(--accent-glow);
   }
   .hero-card::before {
     content: '';
     position: absolute;
-    inset: 0;
-    background: radial-gradient(60% 50% at 50% -10%, rgba(165,180,252,0.18), transparent 70%);
-    pointer-events: none;
+    inset: -45%;
+    z-index: -2;
+    background:
+      radial-gradient(32% 28% at 28% 30%, var(--glow-a), transparent 72%),
+      radial-gradient(36% 32% at 76% 72%, var(--glow-b), transparent 72%);
+    animation: drift 16s ease-in-out infinite alternate;
   }
+  .hero-card::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    background-image: var(--cube);
+    background-size: 28px 48px;
+    opacity: var(--cube-opacity);
+    -webkit-mask-image: radial-gradient(120% 90% at 50% 0%, #000 30%, transparent 85%);
+    mask-image: radial-gradient(120% 90% at 50% 0%, #000 30%, transparent 85%);
+  }
+  .hero-head { display: flex; align-items: center; justify-content: center; gap: 8px; margin-bottom: 6px; }
+  .hero-label {
+    font-family: var(--font-display); font-weight: 700; font-size: 0.68rem;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--txt-2);
+  }
+  .block-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-family: var(--font-display); font-weight: 700; font-size: 0.64rem; letter-spacing: 0.04em;
+    padding: 3px 8px; border-radius: 999px;
+    color: var(--brand-text); background: var(--mint-tint); border: 1px solid var(--mint-line);
+    font-variant-numeric: tabular-nums;
+  }
+  .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: pulseDot 2s ease-out infinite; }
+  .hero-amount {
+    font-family: var(--font-display); font-weight: 800; font-size: 1.9rem; line-height: 2.3rem;
+    letter-spacing: -0.03em; color: var(--txt); font-variant-numeric: tabular-nums;
+  }
+  .hero-amount-md { font-size: 1.6rem; line-height: 2rem; }
+  .hero-amount-sm { font-size: 1.3rem; line-height: 1.7rem; }
+  .hero-number { white-space: nowrap; }
+  .hero-unit {
+    white-space: nowrap;
+    font-size: 0.9rem; font-weight: 800; letter-spacing: 0.04em; margin-left: 7px;
+    background: var(--grad); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .hero-sub { font-size: 0.74rem; color: var(--txt-3); margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .qa-row { display: flex; gap: 4px; margin-top: 16px; }
 
-  /* ── Buttons ─────────────────────────────────────────────────── */
   .btn {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     gap: 6px;
-    font-family: inherit;
-    font-weight: 600;
-    font-size: 0.875rem;
-    border-radius: 12px;
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 0.86rem;
+    letter-spacing: 0.01em;
+    border-radius: 14px;
     border: none;
     cursor: pointer;
-    padding: 11px 16px;
-    transition: transform 0.12s, box-shadow 0.15s, background 0.15s, opacity 0.15s, border-color 0.15s;
+    padding: 12px 16px;
+    transition: transform 0.12s, box-shadow 0.15s, background 0.15s, opacity 0.15s, border-color 0.15s, color 0.15s;
     user-select: none;
   }
-  .btn:active { transform: scale(0.97); }
+  .btn:active:not(:disabled) { transform: scale(0.97); }
   .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .btn-primary:disabled {
+    opacity: 1; background: var(--bg-3); color: var(--txt-4);
+    box-shadow: none; border: 1px solid var(--line);
+  }
+  .btn:focus-visible, .icon-btn:focus-visible, .qa-btn:focus-visible, .nav-btn:focus-visible, .link-btn:focus-visible {
+    outline: 2px solid var(--accent-text); outline-offset: 2px;
+  }
 
   .btn-primary {
-    background: var(--grad);
-    color: white;
-    box-shadow: 0 6px 20px -8px rgba(99,102,241,0.7);
+    background: var(--accent-fill);
+    color: var(--accent-ink);
+    box-shadow: 0 12px 26px -16px var(--accent-glow), inset 0 -2px 0 rgba(0,0,0,0.12);
   }
-  .btn-primary:hover:not(:disabled) { box-shadow: 0 8px 26px -8px rgba(99,102,241,0.9); filter: brightness(1.08); }
+  .btn-primary:hover:not(:disabled) { background: var(--accent-hover); box-shadow: 0 14px 30px -14px var(--accent-glow), inset 0 -2px 0 rgba(0,0,0,0.12); }
 
   .btn-secondary {
     background: var(--bg-3);
     color: var(--txt);
     border: 1px solid var(--line-2);
   }
-  .btn-secondary:hover:not(:disabled) { background: #222238; }
+  .btn-secondary:hover:not(:disabled) { border-color: var(--mint-line); color: var(--txt); }
 
   .btn-danger {
-    background: rgba(248,113,113,0.12);
+    background: var(--neg-tint);
     color: var(--red);
-    border: 1px solid rgba(248,113,113,0.35);
+    border: 1px solid color-mix(in srgb, var(--red) 45%, transparent);
   }
-  .btn-danger:hover:not(:disabled) { background: rgba(248,113,113,0.2); }
+  .btn-danger:hover:not(:disabled) { background: color-mix(in srgb, var(--red) 20%, transparent); }
 
   .btn-ghost { background: transparent; color: var(--txt-2); padding: 8px 12px; }
   .btn-ghost:hover:not(:disabled) { color: var(--txt); background: var(--bg-3); }
@@ -284,7 +425,7 @@ const STYLES = `
   .icon-btn {
     display: flex; align-items: center; justify-content: center;
     width: 34px; height: 34px;
-    border-radius: 10px;
+    border-radius: 11px;
     background: transparent;
     border: none;
     color: var(--txt-2);
@@ -293,67 +434,74 @@ const STYLES = `
   }
   .icon-btn:hover { background: var(--bg-3); color: var(--txt); }
 
-  /* Quick actions on home */
   .qa-btn {
-    display: flex; flex-direction: column; align-items: center; gap: 6px;
+    --qa: var(--qa-send);
+    display: flex; flex-direction: column; align-items: center; gap: 7px;
     background: transparent; border: none; cursor: pointer;
-    color: var(--txt-2); font-family: inherit; font-size: 0.7rem; font-weight: 600;
+    color: var(--txt-1); font-family: var(--font-display); font-size: 0.7rem; font-weight: 700;
+    letter-spacing: 0.02em;
     flex: 1;
   }
+  .qa-send     { --qa: var(--qa-send); }
+  .qa-receive  { --qa: var(--qa-receive); }
+  .qa-shield   { --qa: var(--qa-shield); }
+  .qa-activity { --qa: var(--qa-activity); }
   .qa-circle {
-    width: 46px; height: 46px;
-    border-radius: 50%;
+    width: 48px; height: 48px;
+    border-radius: 16px;
     display: flex; align-items: center; justify-content: center;
-    background: var(--bg-3);
-    border: 1px solid var(--line-2);
-    color: #a5b4fc;
-    transition: transform 0.15s, box-shadow 0.2s, border-color 0.15s, background 0.15s;
+    color: var(--qa);
+    background: color-mix(in srgb, var(--qa) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--qa) 40%, transparent);
+    transition: transform 0.15s, box-shadow 0.2s, background 0.15s;
   }
   .qa-btn:hover .qa-circle {
     transform: translateY(-2px);
-    border-color: rgba(129,140,248,0.55);
-    box-shadow: 0 8px 22px -10px rgba(99,102,241,0.8);
-    background: rgba(99,102,241,0.14);
+    background: color-mix(in srgb, var(--qa) 26%, transparent);
+    box-shadow: 0 10px 22px -12px var(--qa);
   }
-  .qa-btn:hover { color: var(--txt); }
-  .qa-circle svg { width: 19px; height: 19px; }
+  .qa-btn:disabled { opacity: 0.6; cursor: wait; }
+  .qa-circle svg { width: 20px; height: 20px; }
 
-  /* ── Inputs ──────────────────────────────────────────────────── */
   .ego-label {
     display: block;
-    font-size: 0.72rem;
-    font-weight: 600;
-    letter-spacing: 0.05em;
+    font-family: var(--font-display);
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
     text-transform: uppercase;
     color: var(--txt-3);
     margin-bottom: 6px;
   }
   .ego-input {
     width: 100%;
-    border-radius: 12px;
+    border-radius: 13px;
     background: var(--bg-2);
     border: 1px solid var(--line-2);
     color: var(--txt);
-    padding: 11px 13px;
-    font-size: 0.875rem;
-    font-family: inherit;
+    padding: 12px 13px;
+    font-size: 0.9rem;
+    font-family: var(--font-body);
     outline: none;
     transition: border-color 0.15s, box-shadow 0.15s;
   }
-  .ego-input::placeholder { color: var(--txt-3); }
+  .ego-input::placeholder { color: var(--txt-4); }
   .ego-input:focus {
-    border-color: var(--indigo);
-    box-shadow: 0 0 0 3px rgba(99,102,241,0.18);
+    border-color: var(--accent-line);
+    box-shadow: 0 0 0 3px var(--accent-tint);
   }
 
-  /* ── Header ──────────────────────────────────────────────────── */
   .topbar {
     display: flex; align-items: center; gap: 10px;
-    padding: 12px 16px;
-    background: rgba(12,12,22,0.85);
-    backdrop-filter: blur(10px);
+    padding: 12px 14px 12px 16px;
+    background: var(--topbar-bg);
+    backdrop-filter: blur(12px);
     border-bottom: 1px solid var(--line);
-    min-height: 54px;
+    min-height: 56px;
+  }
+  .topbar-title {
+    font-family: var(--font-display); font-weight: 800; font-size: 1.02rem;
+    letter-spacing: -0.01em; color: var(--txt);
   }
   .grad-text {
     background: var(--grad);
@@ -362,143 +510,207 @@ const STYLES = `
     background-clip: text;
   }
   .net-pill {
-    display: inline-flex; align-items: center; gap: 5px;
-    font-size: 0.68rem; font-weight: 600;
-    padding: 4px 9px;
+    display: inline-flex; align-items: center; gap: 6px;
+    font-family: var(--font-display);
+    font-size: 0.66rem; font-weight: 700; letter-spacing: 0.04em;
+    padding: 5px 10px;
     border-radius: 999px;
     border: 1px solid var(--line-2);
     background: var(--bg-2);
-    color: var(--txt-2);
+    color: var(--txt-1);
     white-space: nowrap;
   }
-  .net-dot { width: 6px; height: 6px; border-radius: 50%; animation: pulseDot 2s ease infinite; }
+  .net-dot { width: 7px; height: 7px; border-radius: 50%; }
 
-  /* ── Tx rows ─────────────────────────────────────────────────── */
   .tx-row {
     display: flex; align-items: center; gap: 11px;
     padding: 11px 12px;
-    border-radius: 13px;
+    border-radius: 14px;
     background: var(--bg-2);
     border: 1px solid var(--line);
     transition: border-color 0.15s, background 0.15s;
   }
   .tx-row:hover { border-color: var(--line-2); background: var(--bg-3); }
   .tx-icon {
-    width: 34px; height: 34px; border-radius: 50%;
+    width: 36px; height: 36px; border-radius: 12px;
     display: flex; align-items: center; justify-content: center;
     flex-shrink: 0;
   }
-  .tx-in  { background: rgba(52,211,153,0.12); color: var(--green); }
-  .tx-out { background: rgba(248,113,113,0.12); color: var(--red); }
-  .tx-icon svg { width: 15px; height: 15px; }
+  .tx-in  { background: var(--pos-tint); color: var(--green); }
+  .tx-out { background: var(--neg-tint); color: var(--red); }
+  .tx-shield { background: color-mix(in srgb, var(--amber) 14%, transparent); color: var(--amber); }
+  .tx-pending {
+    font-family: var(--font-display); font-size: 0.6rem; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase;
+    padding: 2px 6px; border-radius: 999px; color: var(--amber);
+    background: color-mix(in srgb, var(--amber) 14%, transparent);
+  }
+  .tx-icon svg { width: 16px; height: 16px; }
 
-  /* ── Word badges (mnemonic) ──────────────────────────────────── */
   .word-badge {
     display: inline-flex;
     align-items: center;
-    background: rgba(99,102,241,0.10);
-    border: 1px solid rgba(99,102,241,0.30);
-    border-radius: 8px;
-    padding: 5px 8px;
-    font-size: 0.76rem;
-    font-family: 'SF Mono', ui-monospace, monospace;
-    color: #c7d2fe;
+    background: var(--accent-tint);
+    border: 1px solid var(--accent-line);
+    border-radius: 9px;
+    padding: 6px 8px;
+    font-size: 0.78rem;
+    font-family: var(--font-mono);
+    color: var(--txt);
   }
-  .word-badge span.num { color: var(--txt-3); margin-right: 5px; font-size: 0.65rem; }
+  .word-badge span.num { color: var(--txt-3); margin-right: 6px; font-size: 0.66rem; }
 
-  /* ── Logo treatments ─────────────────────────────────────────── */
-  .logo-glow { filter: drop-shadow(0 0 14px rgba(99,102,241,0.65)); }
+  .logo-glow { filter: drop-shadow(0 0 14px var(--accent-glow)); }
   .logo-orbit {
     position: absolute; inset: -10px;
     border-radius: 50%;
-    background: conic-gradient(from 0deg, transparent 10%, #6366f1 30%, #8b5cf6 50%, #3b82f6 70%, transparent 90%);
+    background: conic-gradient(from 0deg, transparent 10%, #d2eb2b 32%, #00e5b0 58%, transparent 88%);
     animation: orbit 4s linear infinite;
-    opacity: 0.7;
+    opacity: 0.85;
     -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2px));
     mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2px));
   }
   .float { animation: floaty 4.5s ease-in-out infinite; }
+  .splash-glow {
+    background:
+      radial-gradient(70% 45% at 30% 0%, var(--glow-a) 0%, transparent 70%),
+      radial-gradient(60% 40% at 85% 15%, var(--glow-b) 0%, transparent 70%);
+  }
 
-  /* ── Navbar ──────────────────────────────────────────────────── */
   .navbar {
     display: flex;
-    background: rgba(10,10,18,0.92);
-    backdrop-filter: blur(12px);
+    background: var(--bg-1);
     border-top: 1px solid var(--line);
-    padding: 4px 6px 6px;
+    padding: 5px 6px 7px;
   }
   .nav-btn {
     flex: 1;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
     gap: 3px;
-    padding: 7px 2px 5px;
+    padding: 8px 2px 6px;
     cursor: pointer;
     border: none;
     background: transparent;
     color: var(--txt-3);
-    font-family: inherit;
-    font-size: 0.62rem;
-    font-weight: 600;
-    border-radius: 11px;
+    font-family: var(--font-display);
+    font-size: 0.64rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    border-radius: 12px;
     transition: color 0.15s, background 0.15s;
     position: relative;
   }
-  .nav-btn:hover { color: var(--txt-2); }
-  .nav-btn.active { color: #a5b4fc; background: rgba(99,102,241,0.10); }
+  .nav-btn:hover { color: var(--txt-1); }
+  .nav-btn.active { color: var(--accent-text); background: var(--accent-tint); }
   .nav-btn.active::after {
     content: '';
-    position: absolute; top: 0; left: 50%; transform: translateX(-50%);
-    width: 18px; height: 2.5px; border-radius: 2px;
+    position: absolute; top: -5px; left: 50%; transform: translateX(-50%);
+    width: 22px; height: 3px; border-radius: 0 0 3px 3px;
     background: var(--grad);
   }
-  .nav-btn svg { width: 19px; height: 19px; }
+  .nav-btn svg { width: 20px; height: 20px; }
 
-  /* ── Toast ───────────────────────────────────────────────────── */
   .toast {
     position: fixed;
-    bottom: 70px; left: 50%; transform: translateX(-50%);
+    bottom: 76px; left: 50%; transform: translateX(-50%);
     background: var(--bg-3);
-    border: 1px solid var(--line-2);
+    border: 1px solid var(--accent-line);
     color: var(--txt);
-    font-size: 0.78rem;
-    font-weight: 500;
+    font-size: 0.8rem;
+    font-weight: 700;
     border-radius: 999px;
-    padding: 8px 16px;
-    box-shadow: 0 10px 30px -10px rgba(0,0,0,0.8);
+    padding: 9px 16px;
+    box-shadow: 0 12px 30px -12px rgba(0,0,0,0.7);
     animation: fadeUp 0.2s ease both;
     z-index: 9999;
     white-space: nowrap;
   }
 
-  /* ── Misc ────────────────────────────────────────────────────── */
-  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar { width: 5px; }
   ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: #262640; border-radius: 2px; }
+  ::-webkit-scrollbar-thumb { background: var(--scroll); border-radius: 3px; }
 
   .divider { height: 1px; background: var(--line); border: none; }
 
   .alert {
-    border-radius: 12px;
+    border-radius: 13px;
     padding: 11px 13px;
-    font-size: 0.8rem;
-    line-height: 1.45;
+    font-size: 0.82rem;
+    line-height: 1.5;
     animation: fadeUp 0.18s ease both;
   }
-  .alert-error   { background: rgba(248,113,113,0.10); border: 1px solid rgba(248,113,113,0.35); color: #fca5a5; }
-  .alert-success { background: rgba(52,211,153,0.10);  border: 1px solid rgba(52,211,153,0.35);  color: #6ee7b7; }
-  .alert-info    { background: rgba(99,102,241,0.10);  border: 1px solid rgba(99,102,241,0.35);  color: #c7d2fe; }
-  .alert-warn    { background: rgba(251,191,36,0.08);  border: 1px solid rgba(251,191,36,0.30);  color: #fcd34d; }
+  .alert-error   { background: var(--neg-tint);  border: 1px solid color-mix(in srgb, var(--red) 45%, transparent);   color: var(--alert-error-txt); }
+  .alert-success { background: var(--pos-tint);  border: 1px solid color-mix(in srgb, var(--green) 45%, transparent); color: var(--alert-success-txt); }
+  .alert-info    { background: color-mix(in srgb, var(--sky) 12%, transparent); border: 1px solid color-mix(in srgb, var(--sky) 40%, transparent); color: var(--alert-info-txt); }
+  .alert-warn    { background: color-mix(in srgb, var(--amber) 12%, transparent); border: 1px solid color-mix(in srgb, var(--amber) 42%, transparent); color: var(--alert-warn-txt); }
 
   .checkbox-row {
-    display: flex; align-items: flex-start; gap: 9px;
+    display: flex; align-items: flex-start; gap: 10px;
     cursor: pointer;
-    padding: 11px 13px;
-    border-radius: 12px;
+    padding: 12px 13px;
+    border-radius: 13px;
     background: var(--bg-2);
     border: 1px solid var(--line);
     transition: border-color 0.15s;
   }
-  .checkbox-row:hover { border-color: var(--line-2); }
+  .checkbox-row:hover { border-color: var(--accent-line); }
+  .checkbox-row input { accent-color: var(--accent-fill); }
+
+  .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .section-label {
+    font-family: var(--font-display); font-weight: 700; font-size: 0.7rem;
+    letter-spacing: 0.12em; text-transform: uppercase; color: var(--txt-2);
+  }
+  .text-link { color: var(--brand-text); font-weight: 700; }
+
+  .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .stat-tile { background: var(--bg-2); border: 1px solid var(--line); border-radius: 13px; padding: 9px 10px; min-width: 0; }
+  .stat-tile .k { font-family: var(--font-display); font-size: 0.6rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--txt-3); }
+  .stat-tile .v { font-family: var(--font-display); font-size: 0.98rem; font-weight: 800; margin-top: 2px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--txt); }
+  .stat-tile .u { font-size: 0.6rem; font-weight: 700; color: var(--txt-3); margin-left: 3px; }
+  .segmented { display: flex; gap: 4px; padding: 3px; background: var(--bg-2); border: 1px solid var(--line); border-radius: 13px; }
+  .segmented button {
+    flex: 1; border: none; background: transparent; color: var(--txt-2);
+    font-family: var(--font-display); font-size: 0.78rem; font-weight: 700;
+    padding: 8px; border-radius: 10px; cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .segmented button.on { background: var(--accent-fill); color: var(--accent-ink); }
+  .segmented button:focus-visible, .chip-btn:focus-visible, .shielded-line:focus-visible { outline: 2px solid var(--accent-text); outline-offset: 1px; }
+  .preview-pill {
+    font-family: var(--font-display);
+    font-size: 0.58rem; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase;
+    padding: 3px 8px; border-radius: 999px; white-space: nowrap;
+    background: color-mix(in srgb, var(--amber) 16%, transparent); color: var(--amber);
+    border: 1px solid color-mix(in srgb, var(--amber) 40%, transparent);
+  }
+  .note-list { border: 1px solid var(--line); border-radius: 13px; overflow: hidden; }
+  .note-row { display: flex; align-items: center; gap: 8px; padding: 10px 11px; font-size: 0.76rem; background: var(--bg-2); }
+  .note-row + .note-row { border-top: 1px solid var(--line); }
+  .note-amt { font-family: var(--font-display); font-weight: 800; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--txt); }
+  .note-state { flex: 1; min-width: 0; color: var(--txt-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .note-date { color: var(--txt-3); font-size: 0.68rem; white-space: nowrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .chip-btn {
+    font-family: var(--font-display); font-size: 0.66rem; font-weight: 700;
+    padding: 4px 9px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--line-2); background: transparent; color: var(--txt-1);
+  }
+  .chip-btn:hover:not(:disabled) { color: var(--txt); border-color: var(--accent-line); background: var(--accent-tint); }
+  .chip-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .hint { font-size: 0.76rem; line-height: 1.5; color: var(--txt-2); }
+  .hint-warn { color: var(--amber); }
+  .shielded-line {
+    position: relative; display: inline-flex; align-items: center; gap: 6px;
+    margin-top: 10px; padding: 4px 10px; border-radius: 999px; cursor: pointer;
+    font-family: var(--font-display); font-size: 0.7rem; font-weight: 700;
+    background: color-mix(in srgb, var(--amber) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--amber) 40%, transparent);
+    color: var(--amber);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .hero-card::before, .live-dot, .net-dot, .logo-orbit, .float, .skeleton, .screen-enter, .fade-in, .toast, .alert { animation: none; }
+  }
 `;
 
 function StyleTag() {
@@ -515,10 +727,11 @@ type Screen =
   | 'send'
   | 'receive'
   | 'settings'
-  | 'dappConnect'
+  | 'dappRequest'
   | 'activity'
   | 'addAsset'
-  | 'sendAsset';
+  | 'sendAsset'
+  | 'shield';
 
 interface AppState {
   screen: Screen;
@@ -528,10 +741,10 @@ interface AppState {
   network: 'testnet' | 'mainnet';
   loading: boolean;
   error: string;
-  pendingConnection: PendingConnection | null;
+  pendingRequest: PendingRequest | null;
   nodeStatus: string;
   blockHeight: number;
-  recentTxs: Array<{ hash: string; from?: string; to?: string; amount_egoc?: number; timestamp?: number }>;
+  recentTxs: Array<{ hash: string; from?: string; to?: string; amount_egoc?: number; timestamp?: number; type?: string; pending?: boolean }>;
 }
 
 type Action =
@@ -542,7 +755,7 @@ type Action =
   | { type: 'SET_ERROR'; error: string }
   | { type: 'SET_NODE'; status: string; blockHeight: number }
   | { type: 'SET_TXS'; txs: AppState['recentTxs'] }
-  | { type: 'SET_PENDING_CONN'; conn: PendingConnection | null };
+  | { type: 'SET_PENDING_REQ'; request: PendingRequest | null };
 
 function reducer(state: AppState, action: Action): AppState {
   switch (action.type) {
@@ -553,7 +766,7 @@ function reducer(state: AppState, action: Action): AppState {
     case 'SET_ERROR': return { ...state, error: action.error };
     case 'SET_NODE': return { ...state, nodeStatus: action.status, blockHeight: action.blockHeight };
     case 'SET_TXS': return { ...state, recentTxs: action.txs };
-    case 'SET_PENDING_CONN': return { ...state, pendingConnection: action.conn };
+    case 'SET_PENDING_REQ': return { ...state, pendingRequest: action.request };
     default: return state;
   }
 }
@@ -566,7 +779,7 @@ const INIT: AppState = {
   network: 'testnet',
   loading: true,
   error: '',
-  pendingConnection: null,
+  pendingRequest: null,
   nodeStatus: 'unknown',
   blockHeight: 0,
   recentTxs: [],
@@ -646,14 +859,15 @@ const Icons = {
       <path d="M4 12a8 8 0 018-8" stroke="currentColor" strokeWidth="4" strokeLinecap="round" style={{ opacity: 0.8 }} />
     </svg>
   ),
-  Faucet: () => (
-    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" />
-    </svg>
-  ),
   Shield: () => (
     <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} style={{ width: 14, height: 14 }}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+    </svg>
+  ),
+  ShieldLg: () => (
+    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016A11.955 11.955 0 0112 2.944z" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M9.5 11.5V10a2.5 2.5 0 015 0v1.5m-6 0h7v4h-7z" />
     </svg>
   ),
   Check: () => (
@@ -694,7 +908,7 @@ function QRCode({ data, size = 200 }: { data: string; size?: number }) {
         padding: 10,
         borderRadius: 14,
         display: 'inline-block',
-        boxShadow: '0 0 0 1px rgba(148,163,255,0.25), 0 14px 40px -14px rgba(99,102,241,0.5)',
+        boxShadow: '0 0 0 1px var(--qr-ring), 0 14px 40px -16px var(--accent-glow)',
       }}
     />
   );
@@ -829,7 +1043,7 @@ function Header({
       ) : (
         <img src={LOGO_URL} alt="Ego" className="logo-glow" style={{ width: 28, height: 28, borderRadius: '50%' }} />
       )}
-      <span className="text-base font-bold grad-text flex-1" style={{ letterSpacing: '0.01em' }}>{title}</span>
+      <span className="topbar-title flex-1">{title}</span>
       {network && (
         <span className="net-pill">
           <span className="net-dot" style={{ background: nodeOnline ? 'var(--green)' : 'var(--red)' }} />
@@ -896,8 +1110,7 @@ function WelcomeScreen({ onNavigate }: { onNavigate: (s: Screen) => void }) {
   return (
     <div className="flex flex-col h-full screen-enter">
       <div
-        className="flex-1 flex flex-col items-center justify-center p-6 gap-5"
-        style={{ background: 'radial-gradient(85% 55% at 50% 0%, rgba(99,102,241,0.16) 0%, transparent 70%)' }}
+        className="flex-1 flex flex-col items-center justify-center p-6 gap-5 splash-glow"
       >
         <div className="float" style={{ position: 'relative' }}>
           <div className="logo-orbit" />
@@ -915,7 +1128,7 @@ function WelcomeScreen({ onNavigate }: { onNavigate: (s: Screen) => void }) {
         </div>
         <div className="flex items-center gap-2 text-xs text-gray-500">
           <Icons.Shield />
-          <span>Ed25519 · Dilithium-2 · AES-256-GCM</span>
+          <span>Non-custodial · Ed25519 · AES-256-GCM</span>
         </div>
       </div>
     </div>
@@ -975,7 +1188,7 @@ function CreateScreen({
             type="checkbox"
             checked={confirmed}
             onChange={e => setConfirmed(e.target.checked)}
-            style={{ marginTop: 2, accentColor: '#6366f1' }}
+            style={{ marginTop: 2, accentColor: 'var(--accent-fill)' }}
           />
           <span className="text-sm text-gray-300">
             I have safely backed up my recovery phrase
@@ -1045,7 +1258,7 @@ function SetPasswordScreen({
 
   const strength = password.length >= 16 ? 3 : password.length >= 12 ? 2 : password.length >= 8 ? 1 : 0;
   const strengthLabel = ['Too short', 'Okay', 'Good', 'Strong'][strength];
-  const strengthColor = ['var(--red)', 'var(--amber)', '#a3e635', 'var(--green)'][strength];
+  const strengthColor = ['var(--red)', 'var(--amber)', 'var(--accent-text)', 'var(--green)'][strength];
 
   async function handleSubmit() {
     if (password.length < 8) { setError('Password must be at least 8 characters'); return; }
@@ -1142,8 +1355,7 @@ function UnlockScreen({ onUnlocked, onForgot }: { onUnlocked: () => void; onForg
         <ThemeToggle />
       </div>
       <div
-        className="flex-1 flex flex-col items-center justify-center p-6 gap-5"
-        style={{ background: 'radial-gradient(85% 55% at 50% 0%, rgba(99,102,241,0.14) 0%, transparent 70%)' }}
+        className="flex-1 flex flex-col items-center justify-center p-6 gap-5 splash-glow"
       >
         <div className="float" style={{ position: 'relative' }}>
           <div className="logo-orbit" />
@@ -1175,15 +1387,29 @@ function UnlockScreen({ onUnlocked, onForgot }: { onUnlocked: () => void; onForg
   );
 }
 
+function txLabel(type: string | undefined, isOut: boolean): string {
+  switch (type) {
+    case 'faucet': return 'Testnet faucet';
+    case 'shield': return 'Shielded';
+    case 'unshield': return isOut ? 'Private send' : 'Private payout';
+    case 'stake': return 'Staked';
+    case 'unstake': return 'Unstaked';
+    case 'call': return 'Contract call';
+    case 'deploy': return 'Contract deployed';
+    default: return isOut ? 'Sent' : 'Received';
+  }
+}
+
 function TxRow({ tx, address }: { tx: AppState['recentTxs'][number]; address: string }) {
   const isOut = !!tx.from && tx.from === address;
+  const isShield = tx.type === 'shield';
   return (
     <div className="tx-row">
-      <div className={cls('tx-icon', isOut ? 'tx-out' : 'tx-in')}>
-        {isOut ? <Icons.Send /> : <Icons.Receive />}
+      <div className={cls('tx-icon', isShield ? 'tx-shield' : isOut ? 'tx-out' : 'tx-in')}>
+        {isShield ? <Icons.ShieldLg /> : isOut ? <Icons.Send /> : <Icons.Receive />}
       </div>
       <div className="flex-1 min-h-0" style={{ minWidth: 0 }}>
-        <p className="text-sm font-semibold">{isOut ? 'Sent' : 'Received'}</p>
+        <p className="text-sm font-semibold">{txLabel(tx.type, isOut)}</p>
         <p className="text-xs text-gray-500 font-mono truncate">
           {isOut
             ? (tx.to ? `To ${shortAddress(tx.to)}` : tx.hash?.slice(0, 18) + '…')
@@ -1196,7 +1422,9 @@ function TxRow({ tx, address }: { tx: AppState['recentTxs'][number]; address: st
             {isOut ? '−' : '+'}{tx.amount_egoc.toLocaleString(undefined, { maximumFractionDigits: 6 })}
           </p>
         )}
-        <p className="text-xs text-gray-600">{tx.timestamp ? timeAgo(tx.timestamp) : 'EGOC'}</p>
+        {tx.pending
+          ? <span className="tx-pending">Pending</span>
+          : <p className="text-xs text-gray-600">{tx.timestamp ? timeAgo(tx.timestamp) : 'EGOC'}</p>}
       </div>
     </div>
   );
@@ -1255,7 +1483,7 @@ function AssetRow({
           className="icon-btn"
           onClick={() => onSend(asset)}
           title={`Send ${asset.symbol}`}
-          style={{ width: 26, height: 26, color: '#818cf8' }}
+          style={{ width: 26, height: 26, color: 'var(--brand-text)' }}
         >
           <span style={{ display: 'flex', width: 15, height: 15 }}><Icons.Send /></span>
         </button>
@@ -1277,6 +1505,346 @@ function isMyAsset(asset: TrackedAsset, chainAddrs: Record<string, string>): boo
   return !!mine && mine.toLowerCase() === asset.address.toLowerCase();
 }
 
+interface ShieldedStatusView {
+  enabled: boolean;
+  active: boolean;
+  pool_address: string;
+  pool_balance_uegoc: number;
+  leaf_count: number;
+  denominations_uegoc: number[];
+  min_fee_uegoc: number;
+  current_fee_uegoc: number;
+  deposit_fee_uegoc: number;
+  spendable_uegoc: number;
+  max_spends: number;
+  proof_system: string;
+  behind: boolean;
+  notes: NoteView[];
+  ready_balance_uegoc: number;
+  pending_balance_uegoc: number;
+}
+
+function egoc(uegoc: number): string {
+  return (uegoc / 1_000_000).toLocaleString(undefined, { maximumFractionDigits: 6 });
+}
+
+function parseEgoc(input: string): number | null {
+  const t = input.trim();
+  if (!/^\d+(\.\d{0,6})?$/.test(t)) return null;
+  const [whole, frac = ''] = t.split('.');
+  const v = Number(whole) * 1_000_000 + Number((frac + '000000').slice(0, 6));
+  return Number.isSafeInteger(v) && v > 0 ? v : null;
+}
+
+const NOTE_STATE: Record<NoteStatus, { label: string; color: string }> = {
+  pending:   { label: 'Confirming · waiting for a block', color: 'var(--amber)' },
+  ready:     { label: 'In the pool', color: 'var(--green)' },
+  spending:  { label: 'Sending…', color: 'var(--amber)' },
+  settling:  { label: 'Sent · waiting for the network to agree', color: 'var(--amber)' },
+  spent:     { label: 'Sent from the pool', color: 'var(--txt-3)' },
+  cancelled: { label: 'Cancelled · stayed in your balance', color: 'var(--txt-3)' },
+  returned:  { label: 'Never reached a block · returned', color: 'var(--txt-3)' },
+};
+
+function ShieldScreen({ onBack }: { onBack: () => void }) {
+  const [st, setSt] = useState<ShieldedStatusView | null>(null);
+  const [loadError, setLoadError] = useState('');
+  const [tab, setTab] = useState<'shield' | 'send'>('shield');
+  const [amount, setAmount] = useState('');
+  const [sendAmount, setSendAmount] = useState('');
+  const [recipient, setRecipient] = useState('');
+  const [busy, setBusy] = useState('');
+  const [msg, setMsg] = useState<{ kind: 'success' | 'error' | 'info'; text: string } | null>(null);
+  const inFlight = useRef(false);
+
+  const refresh = useCallback(async () => {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    const r = await sendMsg<ShieldedStatusView>('EGO_SHIELDED_STATUS');
+    inFlight.current = false;
+    if (r.success && r.data) {
+      setSt(r.data);
+      setLoadError('');
+    } else {
+      setLoadError(r.error ?? 'Could not reach your Ego node.');
+    }
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    const id = setInterval(refresh, 4_000);
+    return () => clearInterval(id);
+  }, [refresh]);
+
+  async function run<T>(
+    key: string,
+    type: ExtMessage['type'],
+    payload: Record<string, unknown>,
+    done: (d: T) => string,
+  ): Promise<boolean> {
+    setBusy(key);
+    setMsg(null);
+    const r = await sendMsg<T>(type, payload);
+    setBusy('');
+    if (r.success) setMsg({ kind: 'success', text: done(r.data as T) });
+    else setMsg({ kind: 'error', text: r.error ?? 'Something went wrong.' });
+    refresh();
+    return r.success;
+  }
+
+  const notes = st?.notes ?? [];
+  const ready = notes.filter(n => n.status === 'ready');
+  const open = !!st && st.enabled && st.active;
+  const depositFee = st?.deposit_fee_uegoc ?? 0;
+  const withdrawFee = st?.current_fee_uegoc ?? 0;
+
+  const shieldUegoc = parseEgoc(amount);
+  const split = shieldUegoc ? denominate(shieldUegoc) : { notes: [] as number[], remainder: 0 };
+  const shieldCost = split.notes.reduce((a, v) => a + v, 0) + depositFee * split.notes.length;
+
+  const sendUegoc = parseEgoc(sendAmount);
+  const picked = sendUegoc ? pickNotesFor(sendUegoc, ready) : null;
+  const reachable = sendUegoc ? pickNotesFor(sendUegoc, ready, Number.POSITIVE_INFINITY) : null;
+  const readySizes = [...new Set(ready.map(n => n.value_uegoc))].sort((a, b) => a - b).map(egoc).join(', ');
+  const recipientOk = /^egot1[02-9ac-hj-np-z]{20,}$/.test(recipient.trim());
+
+  const live = notes.filter(n => n.status !== 'spent');
+  const spent = notes.filter(n => n.status === 'spent');
+
+  function shieldHint(): React.ReactNode {
+    if (!amount.trim()) {
+      return `Notes come in fixed sizes of ${DENOMINATIONS_UEGOC.map(egoc).join(', ')} EGOC so amounts cannot identify them. Each note costs a ${egoc(depositFee)} EGOC fee.`;
+    }
+    if (!shieldUegoc) return <span className="hint-warn">Enter an amount in EGOC, up to 6 decimals.</span>;
+    if (split.notes.length === 0) return <span className="hint-warn">Below the smallest note (1 EGOC).</span>;
+    return (
+      <>
+        {split.notes.length} note{split.notes.length === 1 ? '' : 's'}: {split.notes.map(egoc).join(' + ')} EGOC.
+        {split.remainder > 0 && <> {egoc(split.remainder)} EGOC stays in your balance.</>}
+        {' '}Fees {split.notes.length} × {egoc(depositFee)} EGOC.
+        {st && shieldCost > st.spendable_uegoc && (
+          <span className="hint-warn"> You have {egoc(st.spendable_uegoc)} EGOC free.</span>
+        )}
+      </>
+    );
+  }
+
+  function sendHint(): React.ReactNode {
+    if (!sendAmount.trim()) {
+      return `The ${egoc(withdrawFee)} EGOC fee comes out of the amount, so the recipient gets that much less.`;
+    }
+    if (!sendUegoc) return <span className="hint-warn">Enter an amount in EGOC, up to 6 decimals.</span>;
+    if (!reachable) {
+      return (
+        <span className="hint-warn">
+          That amount cannot be made from your notes. Shielded coins move in fixed sizes
+          {readySizes ? ` of ${readySizes} EGOC` : ''}, so pick a total you can build from them.
+        </span>
+      );
+    }
+    if (!picked) return <span className="hint-warn">That needs more than {MAX_SPENDS} notes. Send it in two parts.</span>;
+    if (sendUegoc <= withdrawFee) return <span className="hint-warn">The amount must be larger than the fee.</span>;
+    return `The recipient gets ${egoc(sendUegoc - withdrawFee)} EGOC after the ${egoc(withdrawFee)} EGOC fee. Proving takes a few seconds per note.`;
+  }
+
+  function rowAction(n: NoteView): React.ReactNode {
+    if (n.status === 'pending' && n.deposit_tx) {
+      return (
+        <button
+          className="chip-btn"
+          disabled={!!busy}
+          title="Take this deposit back before it reaches the pool"
+          onClick={() => run<number>('row:' + n.commitment, 'EGO_SHIELD_CANCEL_DEPOSIT', { commitment: n.commitment },
+            v => `Deposit cancelled. ${egoc(v)} EGOC stays in your balance.`)}
+        >
+          Cancel
+        </button>
+      );
+    }
+    if (n.status === 'spending' && n.spent_tx) {
+      return (
+        <button
+          className="chip-btn"
+          disabled={!!busy}
+          title="Stop waiting on this send and make the note spendable again"
+          onClick={() => run<number>('row:' + n.commitment, 'EGO_SHIELD_CANCEL_WITHDRAWAL', { spent_tx: n.spent_tx },
+            k => `Send cancelled. ${k} note${k === 1 ? ' is' : 's are'} spendable again.`)}
+        >
+          Cancel
+        </button>
+      );
+    }
+    if (n.status === 'spent') {
+      return (
+        <button
+          className="chip-btn"
+          disabled={!!busy}
+          title="Remove from this wallet's history"
+          aria-label="Remove from history"
+          onClick={() => run<void>('row:' + n.commitment, 'EGO_SHIELD_FORGET', { commitment: n.commitment }, () => 'Removed from this wallet.')}
+        >
+          ×
+        </button>
+      );
+    }
+    return null;
+  }
+
+  return (
+    <div className="flex flex-col h-full screen-enter">
+      <Header title="Shielded Pool" onBack={onBack} />
+      <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3">
+        {!st && !loadError && (
+          <div className="flex items-center justify-center py-6 text-blue-400"><Icons.Spinner /></div>
+        )}
+        {loadError && (
+          <div className="alert alert-error">
+            {loadError}
+            <button className="link-btn" style={{ margin: '6px 0 0', color: 'inherit' }} onClick={refresh}>Try again</button>
+          </div>
+        )}
+        {st && (
+          <>
+            <div className="flex items-center gap-2">
+              <span className="preview-pill">Testnet preview</span>
+              <span className="text-xs text-gray-500">{st.leaf_count.toLocaleString()} notes deposited so far</span>
+            </div>
+
+            <div className="stat-grid">
+              <div className="stat-tile">
+                <div className="k">Ready</div>
+                <div className="v">{egoc(st.ready_balance_uegoc)}<span className="u">EGOC</span></div>
+              </div>
+              <div className="stat-tile">
+                <div className="k">Confirming</div>
+                <div className="v">{egoc(st.pending_balance_uegoc)}<span className="u">EGOC</span></div>
+              </div>
+              <div className="stat-tile">
+                <div className="k">Whole pool</div>
+                <div className="v">{egoc(st.pool_balance_uegoc)}<span className="u">EGOC</span></div>
+              </div>
+            </div>
+
+            {!open && (
+              <div className="alert alert-warn">
+                {!st.enabled
+                  ? 'Your node has shielded transactions switched off.'
+                  : 'This chain has not activated the shielded pool yet.'}
+              </div>
+            )}
+            {st.behind && (
+              <div className="alert alert-info">Your node is still catching up with the network. Statuses settle once it has.</div>
+            )}
+            {msg && <div className={`alert alert-${msg.kind}`}>{msg.text}</div>}
+
+            <div className="segmented" role="tablist" aria-label="Shielded actions">
+              <button id="shield-tab-in" role="tab" aria-selected={tab === 'shield'} className={tab === 'shield' ? 'on' : ''} onClick={() => setTab('shield')}>
+                Shield
+              </button>
+              <button id="shield-tab-out" role="tab" aria-selected={tab === 'send'} className={tab === 'send' ? 'on' : ''} onClick={() => setTab('send')}>
+                Send privately
+              </button>
+            </div>
+
+            {tab === 'shield' ? (
+              <div className="card flex flex-col gap-3">
+                <Input label="Amount to shield (EGOC)" value={amount} onChange={setAmount} placeholder="e.g. 25" />
+                <p className="hint">{shieldHint()}</p>
+                <Button
+                  disabled={!open || !!busy || split.notes.length === 0}
+                  onClick={async () => {
+                    const ok = await run<{ notes: number[]; shielded_uegoc: number }>(
+                      'shield', 'EGO_SHIELD_DEPOSIT', { amount_uegoc: shieldUegoc },
+                      d => `Shielded ${egoc(d.shielded_uegoc)} EGOC as ${d.notes.length} note${d.notes.length === 1 ? '' : 's'}. They become spendable once their deposits are in a block.`,
+                    );
+                    if (ok) setAmount('');
+                  }}
+                >
+                  {busy === 'shield' ? 'Shielding…' : 'Shield'}
+                </Button>
+              </div>
+            ) : (
+              <div className="card flex flex-col gap-3">
+                <div className="flex items-center justify-between">
+                  <span className="ego-label" style={{ marginBottom: 0 }}>Available to send</span>
+                  <span className="text-sm font-bold">{egoc(st.ready_balance_uegoc)} EGOC</span>
+                </div>
+                <Input label="Amount (EGOC)" value={sendAmount} onChange={setSendAmount} placeholder="e.g. 10" />
+                <Input label="Recipient" value={recipient} onChange={setRecipient} placeholder="egot1…" />
+                <p className="hint">{sendHint()}</p>
+                <Button
+                  disabled={!open || !!busy || !picked || !recipientOk || !sendUegoc || sendUegoc <= withdrawFee}
+                  onClick={async () => {
+                    if (!picked) return;
+                    const ok = await run<{ payout_uegoc: number; recipient: string }>(
+                      'send', 'EGO_SHIELD_WITHDRAW', { commitments: picked, recipient: recipient.trim() },
+                      d => `Sending ${egoc(d.payout_uegoc)} EGOC to ${shortAddress(d.recipient)}. It lands with the next block.`,
+                    );
+                    if (ok) setSendAmount('');
+                  }}
+                >
+                  {busy === 'send' ? 'Proving…' : 'Prove & send'}
+                </Button>
+              </div>
+            )}
+
+            {notes.length > 0 && (
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center justify-between">
+                  <p className="section-label">Shielded history</p>
+                  {spent.length > 1 && (
+                    <button
+                      className="chip-btn"
+                      disabled={!!busy}
+                      onClick={() => run<number>('forget', 'EGO_SHIELD_FORGET_SPENT', {},
+                        k => `Removed ${k} finished entr${k === 1 ? 'y' : 'ies'} from this wallet.`)}
+                    >
+                      Clear finished
+                    </button>
+                  )}
+                </div>
+                <div className="note-list">
+                  {[...live, ...spent].map(n => (
+                    <div key={n.commitment} className="note-row">
+                      <span className="dot" style={{ background: NOTE_STATE[n.status].color }} />
+                      <span className="note-amt" style={n.status === 'spent' ? { color: 'var(--txt-3)' } : undefined}>
+                        {egoc(n.value_uegoc)}
+                      </span>
+                      <span className="note-state" title={NOTE_STATE[n.status].label}>
+                        {NOTE_STATE[n.status].label}{n.source === 'desktop' ? ' · from Ego Desktop' : ''}
+                      </span>
+                      <span className="note-date">
+                        {new Date(n.created_at * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                      </span>
+                      {busy === 'row:' + n.commitment ? <span className="text-xs text-gray-500">…</span> : rowAction(n)}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <p className="text-xs text-gray-500 leading-relaxed">
+              Shielding records your coins in the pool only as a commitment. Sending from the pool pays any
+              address with a zero-knowledge proof, and nothing on the chain links the two. Notes this wallet
+              holds in Ego Desktop on this computer appear here too, and notes made here or in an updated Ego
+              Desktop come back when you import your recovery phrase. The circuit is unaudited, so use it on
+              the testnet only.
+            </p>
+            <button
+              className="link-btn"
+              disabled={!open || !!busy}
+              onClick={() => run<number>('scan', 'EGO_SHIELD_SCAN', {},
+                k => (k > 0 ? `Found ${k} note${k === 1 ? '' : 's'} from your recovery phrase.` : 'No other notes from your recovery phrase are in the pool.'))}
+            >
+              {busy === 'scan' ? 'Scanning…' : 'Scan the pool for notes from your recovery phrase'}
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function HomeScreen({
   state,
   onRefresh,
@@ -1289,11 +1857,19 @@ function HomeScreen({
   onSendAsset: (a: TrackedAsset) => void;
 }) {
   const [toast, setToast] = useState('');
-  const [faucetLoading, setFaucetLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [assets, setAssets] = useState<TrackedAsset[]>([]);
   const [assetBals, setAssetBals] = useState<Record<string, AssetBalance>>({});
   const [chainAddrs, setChainAddrs] = useState<Record<string, string>>({});
+  const [shieldedTotal, setShieldedTotal] = useState(0);
+  const balanceText = (Math.floor(state.balanceUegoc / 10_000) / 100)
+    .toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  useEffect(() => {
+    sendMsg<ShieldedStatusView>('EGO_SHIELDED_STATUS').then(r => {
+      if (r.success && r.data) setShieldedTotal(r.data.ready_balance_uegoc + r.data.pending_balance_uegoc);
+    });
+  }, []);
 
   useEffect(() => {
     sendMsg<{ addresses: Record<string, string> }>('EGO_GET_CHAIN_ADDRESSES')
@@ -1333,18 +1909,6 @@ function HomeScreen({
     flash('Address copied');
   }
 
-  async function handleFaucet() {
-    setFaucetLoading(true);
-    const resp = await sendMsg('EGO_FAUCET', {});
-    setFaucetLoading(false);
-    if (resp.success) {
-      flash('100 EGOC requested from faucet');
-      onRefresh();
-    } else {
-      flash(resp.error ?? 'Faucet unavailable');
-    }
-  }
-
   function handleRefresh() {
     setRefreshing(true);
     onRefresh();
@@ -1355,43 +1919,42 @@ function HomeScreen({
   return (
     <div className="flex flex-col h-full min-h-0 screen-enter">
       <div className="flex-1 overflow-y-auto" style={{ paddingBottom: 8 }}>
-        {/* Balance hero */}
         <div className="mx-4 mt-4 hero-card">
-          <div className="flex items-center justify-center gap-2 mb-1">
-            <p className="text-xs font-semibold uppercase tracking-wide" style={{ color: 'var(--txt-3)' }}>Total Balance</p>
+          <div className="hero-head">
+            <p className="hero-label">Total balance</p>
             {state.blockHeight > 0 && (
-              <span className="text-xs" style={{ color: 'var(--txt-3)' }}>· #{state.blockHeight.toLocaleString()}</span>
+              <span className="block-pill" title="Latest block on your Ego node">
+                <span className="live-dot" />
+                Block {state.blockHeight.toLocaleString()}
+              </span>
             )}
           </div>
-          <p className="text-3xl font-extrabold" style={{ letterSpacing: '-0.02em', position: 'relative' }}>
-            {state.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })}
-            <span className="text-base font-semibold grad-text" style={{ marginLeft: 7 }}>EGOC</span>
+          <p className={cls('hero-amount', balanceText.length > 12 ? 'hero-amount-sm' : balanceText.length > 9 && 'hero-amount-md')}>
+            <span className="hero-number">{balanceText}</span>
+            <span className="hero-unit">EGOC</span>
           </p>
-          <p className="text-xs mt-1" style={{ color: 'var(--txt-3)', position: 'relative' }}>
-            {state.balanceUegoc.toLocaleString()} uEGOC
-          </p>
+          <p className="hero-sub">{state.balanceUegoc.toLocaleString()} uEGOC</p>
+          {shieldedTotal > 0 && (
+            <button className="shielded-line" onClick={() => onNavigate('shield')}>
+              <Icons.Shield />
+              {egoc(shieldedTotal)} EGOC shielded
+            </button>
+          )}
 
-          {/* Quick actions */}
-          <div className="flex mt-4" style={{ position: 'relative', gap: 4 }}>
-            <button className="qa-btn" onClick={() => onNavigate('send')}>
+          <div className="qa-row">
+            <button className="qa-btn qa-send" onClick={() => onNavigate('send')}>
               <span className="qa-circle"><Icons.Send /></span>
               Send
             </button>
-            <button className="qa-btn" onClick={() => onNavigate('receive')}>
+            <button className="qa-btn qa-receive" onClick={() => onNavigate('receive')}>
               <span className="qa-circle"><Icons.Receive /></span>
               Receive
             </button>
-            {state.network === 'testnet' && (
-              <button className="qa-btn" onClick={handleFaucet} disabled={faucetLoading}>
-                <span className="qa-circle" style={faucetLoading ? { opacity: 0.6 } : undefined}>
-                  {faucetLoading
-                    ? <span className="animate-spin" style={{ display: 'flex' }}><Icons.Refresh /></span>
-                    : <span style={{ display: 'flex', width: 19, height: 19 }}><Icons.Faucet /></span>}
-                </span>
-                Faucet
-              </button>
-            )}
-            <button className="qa-btn" onClick={() => onNavigate('activity')}>
+            <button className="qa-btn qa-shield" onClick={() => onNavigate('shield')}>
+              <span className="qa-circle"><Icons.ShieldLg /></span>
+              Shield
+            </button>
+            <button className="qa-btn qa-activity" onClick={() => onNavigate('activity')}>
               <span className="qa-circle"><Icons.Activity /></span>
               Activity
             </button>
@@ -1414,11 +1977,11 @@ function HomeScreen({
         {/* Tracked assets */}
         <div className="mx-4 mt-4">
           <div className="flex items-center justify-between mb-2">
-            <p className="text-xs font-semibold uppercase tracking-wide" style={{ color: 'var(--txt-3)' }}>Assets</p>
+            <p className="section-label">Assets</p>
             <button
               className="btn btn-ghost"
               onClick={() => onNavigate('addAsset')}
-              style={{ padding: '3px 9px', fontSize: '0.72rem', color: '#818cf8' }}
+              style={{ padding: '3px 9px', fontSize: '0.72rem', color: 'var(--brand-text)' }}
             >
               + Add coin / token
             </button>
@@ -1430,7 +1993,7 @@ function HomeScreen({
               style={{ fontFamily: 'inherit', padding: '14px' }}
             >
               <p className="text-sm text-gray-400">Track other coins &amp; tokens</p>
-              <p className="text-xs text-gray-600 mt-1">BTC · ETH · BNB · SOL · DOGE · LTC · ERC-20 · BEP-20</p>
+              <p className="text-xs text-gray-600 mt-1">Watch balances you hold on other networks</p>
             </button>
           ) : (
             <div className="flex flex-col gap-2">
@@ -1451,7 +2014,7 @@ function HomeScreen({
         {/* Recent transactions */}
         <div className="mx-4 mt-4 mb-3">
           <div className="flex items-center justify-between mb-2">
-            <p className="text-xs font-semibold uppercase tracking-wide" style={{ color: 'var(--txt-3)' }}>Recent Activity</p>
+            <p className="section-label">Recent Activity</p>
             <button className="icon-btn" onClick={handleRefresh} title="Refresh" style={{ width: 28, height: 28 }}>
               <span className={refreshing ? 'animate-spin' : ''} style={{ display: 'flex' }}><Icons.Refresh /></span>
             </button>
@@ -1517,10 +2080,10 @@ function SendScreen({
             className="flex items-center justify-center fade-in"
             style={{
               width: 72, height: 72, borderRadius: '50%',
-              background: 'rgba(52,211,153,0.12)',
-              border: '1px solid rgba(52,211,153,0.4)',
+              background: 'var(--pos-tint)',
+              border: '1px solid color-mix(in srgb, var(--green) 45%, transparent)',
               color: 'var(--green)',
-              boxShadow: '0 0 40px -8px rgba(52,211,153,0.5)',
+              boxShadow: '0 0 40px -10px var(--green)',
             }}
           >
             <Icons.Check />
@@ -1610,7 +2173,7 @@ function ActivityScreen({
   return (
     <div className="flex flex-col h-full screen-enter">
       <div className="topbar">
-        <span className="text-base font-bold grad-text flex-1">Activity</span>
+        <span className="topbar-title flex-1">Activity</span>
         <button className="icon-btn" onClick={handleRefresh} title="Refresh">
           <span className={refreshing ? 'animate-spin' : ''} style={{ display: 'flex' }}><Icons.Refresh /></span>
         </button>
@@ -1689,9 +2252,9 @@ function AddAssetScreen({ onBack }: { onBack: () => void }) {
                   flex: 1,
                   padding: '9px 0',
                   fontSize: '0.8rem',
-                  background: active ? 'rgba(99,102,241,0.16)' : 'var(--bg-3)',
-                  border: `1px solid ${active ? 'rgba(129,140,248,0.55)' : 'var(--line-2)'}`,
-                  color: active ? '#c7d2fe' : 'var(--txt-2)',
+                  background: active ? 'var(--accent-tint)' : 'var(--bg-3)',
+                  border: `1px solid ${active ? 'var(--accent-line)' : 'var(--line-2)'}`,
+                  color: active ? 'var(--accent-text)' : 'var(--txt-2)',
                 }}
               >
                 {m === 'coin' ? 'Coin' : 'Token (ERC-20 / BEP-20)'}
@@ -1744,7 +2307,7 @@ function AddAssetScreen({ onBack }: { onBack: () => void }) {
               <button
                 className="btn btn-ghost"
                 onClick={() => setAddress(chainAddrs[activeChain])}
-                style={{ padding: '2px 8px', fontSize: '0.7rem', color: '#818cf8', marginBottom: 6 }}
+                style={{ padding: '2px 8px', fontSize: '0.7rem', color: 'var(--brand-text)', marginBottom: 6 }}
               >
                 Use my wallet address
               </button>
@@ -1808,10 +2371,10 @@ function SendAssetScreen({ asset, onBack }: { asset: TrackedAsset; onBack: () =>
             className="flex items-center justify-center fade-in"
             style={{
               width: 72, height: 72, borderRadius: '50%',
-              background: 'rgba(52,211,153,0.12)',
-              border: '1px solid rgba(52,211,153,0.4)',
+              background: 'var(--pos-tint)',
+              border: '1px solid color-mix(in srgb, var(--green) 45%, transparent)',
               color: 'var(--green)',
-              boxShadow: '0 0 40px -8px rgba(52,211,153,0.5)',
+              boxShadow: '0 0 40px -10px var(--green)',
             }}
           >
             <Icons.Check />
@@ -1920,7 +2483,7 @@ function SettingsScreen({
   return (
     <div className="flex flex-col h-full screen-enter">
       <div className="topbar">
-        <span className="text-base font-bold grad-text flex-1">Settings</span>
+        <span className="topbar-title flex-1">Settings</span>
       </div>
       <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3">
         {/* Network */}
@@ -1938,9 +2501,9 @@ function SettingsScreen({
                     flex: 1,
                     padding: '9px 0',
                     fontSize: '0.8rem',
-                    background: active ? 'rgba(99,102,241,0.16)' : 'var(--bg-3)',
-                    border: `1px solid ${active ? 'rgba(129,140,248,0.55)' : 'var(--line-2)'}`,
-                    color: active ? '#c7d2fe' : 'var(--txt-2)',
+                    background: active ? 'var(--accent-tint)' : 'var(--bg-3)',
+                    border: `1px solid ${active ? 'var(--accent-line)' : 'var(--line-2)'}`,
+                    color: active ? 'var(--accent-text)' : 'var(--txt-2)',
                   }}
                 >
                   {active && <span className="net-dot" style={{ background: 'var(--green)' }} />}
@@ -1958,13 +2521,15 @@ function SettingsScreen({
             <button
               className="btn btn-ghost"
               onClick={() => copyItem(state.address, 'address')}
-              style={{ padding: '3px 8px', fontSize: '0.72rem', color: copied === 'address' ? 'var(--green)' : '#818cf8' }}
+              style={{ padding: '3px 8px', fontSize: '0.72rem', color: copied === 'address' ? 'var(--green)' : 'var(--brand-text)' }}
             >
               {copied === 'address' ? '✓ Copied' : 'Copy'}
             </button>
           </div>
           <p className="font-mono text-xs text-gray-400 break-all">{state.address}</p>
         </div>
+
+        <ConnectedSites />
 
         {/* Recovery phrase */}
         <div className="card">
@@ -2015,59 +2580,170 @@ function SettingsScreen({
           <Icons.Lock /> Lock Wallet
         </Button>
 
-        <p className="text-xs text-gray-600 text-center mt-1">Ego Wallet v1.0.0 · Manifest V3</p>
+        <p className="text-xs text-gray-600 text-center mt-1">Ego Wallet v{chrome.runtime.getManifest().version}</p>
       </div>
     </div>
   );
 }
 
-function DAppConnectScreen({
-  conn,
+const REQUEST_TEXT: Record<DappRequestKind, { title: string; ask: string; approve: string }> = {
+  connect: { title: 'Connection Request', ask: 'wants to connect to your wallet', approve: 'Connect' },
+  send:    { title: 'Payment Request',    ask: 'asks you to send a payment',      approve: 'Approve & Send' },
+  call:    { title: 'Contract Call',      ask: 'asks you to call a contract',     approve: 'Approve Call' },
+  sign:    { title: 'Signature Request',  ask: 'asks you to sign a message',      approve: 'Sign' },
+};
+
+function clip(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max)}… (${text.length.toLocaleString()} characters)` : text;
+}
+
+function DAppRequestScreen({
+  request,
+  address,
+  network,
   onApprove,
   onReject,
+  onDone,
 }: {
-  conn: PendingConnection;
-  onApprove: () => void;
+  request: PendingRequest;
+  address: string;
+  network: 'testnet' | 'mainnet';
+  onApprove: () => Promise<string | null>;
   onReject: () => void;
+  onDone: () => void;
 }) {
+  const [busy, setBusy] = useState(false);
+  const [failed, setFailed] = useState('');
+  const text = REQUEST_TEXT[request.kind];
+  const insecure = request.origin.startsWith('http://');
+
+  async function approve() {
+    setBusy(true);
+    const error = await onApprove();
+    if (error) setFailed(error);
+    setBusy(false);
+  }
+
   return (
     <div className="flex flex-col h-full screen-enter">
-      <Header title="Connection Request" />
-      <div className="flex-1 flex flex-col items-center justify-center p-6 gap-5">
-        <div
-          className="flex items-center justify-center float"
-          style={{
-            width: 64, height: 64, borderRadius: '50%',
-            background: 'rgba(99,102,241,0.12)',
-            border: '1px solid rgba(129,140,248,0.4)',
-            color: '#a5b4fc',
-            boxShadow: '0 0 40px -8px rgba(99,102,241,0.6)',
-          }}
-        >
-          <Icons.Link />
-        </div>
-        <div className="text-center">
-          <h2 className="text-lg font-bold text-white mb-1">Connect to dApp</h2>
-          <p className="text-sm text-gray-400">This site wants to connect to your wallet</p>
-        </div>
-        <div className="card w-full">
-          <p className="ego-label">Origin</p>
-          <p className="font-semibold text-blue-400 break-all">{conn.origin}</p>
-          {conn.title && (
-            <>
-              <p className="ego-label mt-3">Site</p>
-              <p className="text-sm text-gray-300">{conn.title}</p>
-            </>
+      <Header title={text.title} />
+      <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-3">
+        <div className="card">
+          <p className="ego-label">Site</p>
+          <p className="font-semibold text-blue-400 break-all">{request.origin}</p>
+          <p className="text-xs text-gray-400 mt-1">{text.ask}</p>
+          {insecure && (
+            <p className="text-xs mt-1" style={{ color: 'var(--amber)' }}>
+              This site does not use https, so anyone on your network could change what it asks for.
+            </p>
           )}
         </div>
-        <div className="alert alert-info w-full" style={{ textAlign: 'center' }}>
-          Connecting shares your wallet address with this site.
-        </div>
-        <div className="flex gap-3 w-full">
-          <Button variant="secondary" onClick={onReject} fullWidth>Reject</Button>
-          <Button variant="primary" onClick={onApprove} fullWidth>Connect</Button>
-        </div>
+
+        {request.kind === 'connect' && (
+          <div className="alert alert-info">
+            The site will see your address {shortAddress(address)} and can ask you to approve payments.
+            It cannot move anything without your approval here.
+          </div>
+        )}
+
+        {request.kind === 'send' && (
+          <>
+            <div className="card">
+              <p className="ego-label">Amount</p>
+              <p className="text-xl font-bold text-white">{(request.amount_egoc ?? 0).toLocaleString(undefined, { maximumFractionDigits: 6 })} EGOC</p>
+              <p className="ego-label mt-3">To</p>
+              <p className="font-mono text-xs text-gray-300 break-all">{request.to}</p>
+              {request.memo && (
+                <>
+                  <p className="ego-label mt-3">Memo</p>
+                  <p className="font-mono text-xs text-gray-300 break-all">{clip(request.memo, 256)}</p>
+                </>
+              )}
+              <p className="ego-label mt-3">From</p>
+              <p className="font-mono text-xs text-gray-400">{shortAddress(address)} · {network === 'testnet' ? 'Testnet' : 'Mainnet'}</p>
+            </div>
+            <div className="alert alert-warn">Check the address and the amount. A sent payment cannot be reversed.</div>
+          </>
+        )}
+
+        {request.kind === 'call' && (
+          <>
+            <div className="card">
+              <p className="ego-label">Contract</p>
+              <p className="font-mono text-xs text-gray-300 break-all">{request.contractAddr}</p>
+              <p className="ego-label mt-3">Function</p>
+              <p className="font-mono text-sm text-white">{request.entrypoint}</p>
+              <p className="ego-label mt-3">Arguments</p>
+              <p className="font-mono text-xs text-gray-400 break-all">{request.callArgs ? clip(request.callArgs, 400) : 'none'}</p>
+            </div>
+            <div className="alert alert-warn">A contract call can move your coins. Approve only calls you expected from this site.</div>
+          </>
+        )}
+
+        {request.kind === 'sign' && (
+          <>
+            <div className="card">
+              <p className="ego-label">Message</p>
+              {request.messageText !== undefined ? (
+                <p className="text-sm text-gray-200" style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{clip(request.messageText, 2000)}</p>
+              ) : (
+                <p className="font-mono text-xs text-gray-400 break-all">0x{clip(request.message ?? '', 600)}</p>
+              )}
+            </div>
+            <div className="alert alert-info">
+              Signing proves you own this address. Ego Wallet marks the message as a signed message, so the signature
+              cannot be reused as a payment.
+            </div>
+          </>
+        )}
+
+        {failed ? (
+          <>
+            <div className="alert alert-error">{failed}</div>
+            <Button onClick={onDone}>Continue</Button>
+          </>
+        ) : (
+          <div className="flex gap-3 w-full mt-auto">
+            <Button variant="secondary" onClick={onReject} disabled={busy}>Reject</Button>
+            <Button variant="primary" onClick={approve} disabled={busy}>{busy ? 'Working…' : text.approve}</Button>
+          </div>
+        )}
       </div>
+    </div>
+  );
+}
+
+function ConnectedSites() {
+  const [sites, setSites] = useState<string[] | null>(null);
+
+  const load = useCallback(async () => {
+    const resp = await sendMsg<{ sites: string[] }>('EGO_LIST_SITES');
+    setSites(resp.success && resp.data ? resp.data.sites : []);
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function disconnect(origin: string) {
+    await sendMsg('EGO_DISCONNECT_SITE', { origin });
+    load();
+  }
+
+  return (
+    <div className="card">
+      <p className="ego-label">Connected Sites</p>
+      {sites !== null && sites.length === 0 && (
+        <p className="text-xs text-gray-500">No site is connected. A site has to ask, and you approve each payment it requests.</p>
+      )}
+      {sites !== null && sites.length > 0 && (
+        <div className="flex flex-col gap-2 mt-1">
+          {sites.map(site => (
+            <div key={site} className="flex items-center gap-2">
+              <span className="text-xs text-gray-300 break-all flex-1">{site}</span>
+              <Button variant="ghost" small fullWidth={false} onClick={() => disconnect(site)}>Disconnect</Button>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -2080,6 +2756,9 @@ export default function App() {
   const [wizardMode, setWizardMode] = useState<'create' | 'import'>('create');
   const [sendAssetTarget, setSendAssetTarget] = useState<TrackedAsset | null>(null);
 
+  const screenRef = useRef(state.screen);
+  useEffect(() => { screenRef.current = state.screen; }, [state.screen]);
+
   const loadState = useCallback(async () => {
     const resp = await sendMsg<{
       hasWallet: boolean;
@@ -2087,17 +2766,15 @@ export default function App() {
       address?: string;
       publicKeyHex?: string;
       network?: string;
-      pendingConnection?: PendingConnection;
+      pendingRequest?: PendingRequest;
     }>('EGO_GET_STATE');
 
     dispatch({ type: 'SET_LOADING', loading: false });
 
     if (!resp.success || !resp.data) return;
-    const { hasWallet, locked, address, network, pendingConnection } = resp.data;
+    const { hasWallet, locked, address, network, pendingRequest } = resp.data;
 
-    if (pendingConnection) {
-      dispatch({ type: 'SET_PENDING_CONN', conn: pendingConnection });
-    }
+    dispatch({ type: 'SET_PENDING_REQ', request: pendingRequest ?? null });
 
     if (!hasWallet) {
       dispatch({ type: 'SET_SCREEN', screen: 'welcome' });
@@ -2111,7 +2788,15 @@ export default function App() {
 
     if (address) {
       dispatch({ type: 'SET_WALLET', address, network: (network ?? 'testnet') as 'testnet' | 'mainnet' });
-      dispatch({ type: 'SET_SCREEN', screen: pendingConnection ? 'dappConnect' : 'home' });
+      if (pendingRequest) {
+        dispatch({ type: 'SET_SCREEN', screen: 'dappRequest' });
+        return;
+      }
+      if (IS_APPROVAL_WINDOW) {
+        window.close();
+        return;
+      }
+      dispatch({ type: 'SET_SCREEN', screen: 'home' });
       loadBalance(address, (network ?? 'testnet') as 'testnet' | 'mainnet');
       loadTxs();
       loadNodeHealth();
@@ -2119,6 +2804,18 @@ export default function App() {
   }, []);
 
   useEffect(() => { loadState(); }, [loadState]);
+
+  useEffect(() => {
+    const timer = setInterval(async () => {
+      const screen = screenRef.current;
+      if (screen !== 'home' && !(IS_APPROVAL_WINDOW && screen !== 'dappRequest' && screen !== 'unlock')) return;
+      const resp = await sendMsg<{ locked: boolean; pendingRequest?: PendingRequest }>('EGO_GET_STATE');
+      if (!resp.success || !resp.data || resp.data.locked || !resp.data.pendingRequest) return;
+      dispatch({ type: 'SET_PENDING_REQ', request: resp.data.pendingRequest });
+      dispatch({ type: 'SET_SCREEN', screen: 'dappRequest' });
+    }, 1500);
+    return () => clearInterval(timer);
+  }, []);
 
   async function loadBalance(addr?: string, net?: 'testnet' | 'mainnet') {
     const resp = await sendMsg<{ balance_egoc: number; balance_uegoc: number }>('EGO_GET_BALANCE');
@@ -2166,18 +2863,24 @@ export default function App() {
     dispatch({ type: 'SET_WALLET', address: state.address, network });
   }
 
-  async function handleApproveConn() {
-    if (!state.pendingConnection) return;
-    await sendMsg('EGO_APPROVE_CONNECTION', { requestId: state.pendingConnection.requestId });
-    dispatch({ type: 'SET_PENDING_CONN', conn: null });
-    navigate('home');
+  async function nextRequest() {
+    dispatch({ type: 'SET_PENDING_REQ', request: null });
+    await loadState();
   }
 
-  async function handleRejectConn() {
-    if (!state.pendingConnection) return;
-    await sendMsg('EGO_REJECT_CONNECTION', { requestId: state.pendingConnection.requestId });
-    dispatch({ type: 'SET_PENDING_CONN', conn: null });
-    navigate('home');
+  async function handleApproveRequest(): Promise<string | null> {
+    if (!state.pendingRequest) return null;
+    const resp = await sendMsg('EGO_APPROVE_REQUEST', { requestId: state.pendingRequest.requestId });
+    if (!resp.success) return resp.error ?? 'The request failed.';
+    await nextRequest();
+    return null;
+  }
+
+  async function handleRejectRequest() {
+    if (state.pendingRequest) {
+      await sendMsg('EGO_REJECT_REQUEST', { requestId: state.pendingRequest.requestId });
+    }
+    await nextRequest();
   }
 
   function handleWizardDone() {
@@ -2286,6 +2989,10 @@ export default function App() {
             <SendAssetScreen asset={sendAssetTarget} onBack={() => navigate('home')} />
           )}
 
+          {state.screen === 'shield' && (
+            <ShieldScreen onBack={() => navigate('home')} />
+          )}
+
           {state.screen === 'settings' && (
             <SettingsScreen
               state={state}
@@ -2294,11 +3001,15 @@ export default function App() {
             />
           )}
 
-          {state.screen === 'dappConnect' && state.pendingConnection && (
-            <DAppConnectScreen
-              conn={state.pendingConnection}
-              onApprove={handleApproveConn}
-              onReject={handleRejectConn}
+          {state.screen === 'dappRequest' && state.pendingRequest && (
+            <DAppRequestScreen
+              key={state.pendingRequest.requestId}
+              request={state.pendingRequest}
+              address={state.address}
+              network={state.network}
+              onApprove={handleApproveRequest}
+              onReject={handleRejectRequest}
+              onDone={nextRequest}
             />
           )}
         </div>

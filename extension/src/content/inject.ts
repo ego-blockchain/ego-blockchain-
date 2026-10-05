@@ -1,42 +1,64 @@
+type Shape = (data: Record<string, unknown>) => unknown;
+
+const accountsOf: Shape = data => (data.accounts as string[]) ?? [];
+const txHashOf: Shape = data => data.tx_hash;
+const signatureOf: Shape = data => data.signature;
+
+function reply(_reqId: string, detail: { result?: unknown; error?: string }) {
+  window.dispatchEvent(new CustomEvent('EGO_RESPONSE', { detail: { ...detail, _reqId } }));
+}
+
 window.addEventListener('EGO_REQUEST', async (event: Event) => {
   const e = event as CustomEvent<{
     method: string;
     params?: unknown[];
     _reqId: string;
   }>;
-  const { method, params = [], _reqId } = e.detail;
+  const { method, params = [], _reqId } = e.detail ?? ({} as { method: string; params?: unknown[]; _reqId: string });
+  if (typeof method !== 'string' || typeof _reqId !== 'string') return;
 
   let msgType: string;
   let payload: Record<string, unknown> = {};
+  let shape: Shape;
 
   switch (method) {
     case 'ego_requestAccounts':
     case 'eth_requestAccounts':
+      msgType = 'EGO_DAPP_CONNECT';
+      shape = accountsOf;
+      break;
+
     case 'eth_accounts':
-      msgType = 'EGO_GET_ACCOUNTS';
+    case 'ego_accounts':
+    case 'ego_getAccounts':
+      msgType = 'EGO_DAPP_ACCOUNTS';
+      shape = accountsOf;
       break;
 
     case 'eth_chainId':
     case 'ego_chainId':
-      window.dispatchEvent(new CustomEvent('EGO_RESPONSE', {
-        detail: { result: '0x1', _reqId },
-      }));
+      reply(_reqId, { result: '0x1' });
       return;
 
     case 'eth_sendTransaction':
     case 'ego_sendTransaction': {
-      msgType = 'EGO_SEND_TX';
+      msgType = 'EGO_DAPP_SEND_TX';
+      shape = txHashOf;
       const txParam = (params[0] ?? {}) as Record<string, unknown>;
+      const amount = method === 'ego_sendTransaction' && txParam.amount_egoc !== undefined
+        ? Number(txParam.amount_egoc)
+        : Number(txParam.value ?? 0) / 1e18;
       payload = {
-        to: txParam.to ?? '',
-        amount_egoc: Number(txParam.value ?? 0) / 1e18,
-        memo: (txParam.data as string) ?? '',
+        to: typeof txParam.to === 'string' ? txParam.to : '',
+        amount_egoc: amount,
+        memo: typeof txParam.memo === 'string' ? txParam.memo : typeof txParam.data === 'string' ? txParam.data : '',
       };
       break;
     }
 
     case 'ego_callContract': {
-      msgType = 'EGO_CALL_CONTRACT';
+      msgType = 'EGO_DAPP_CALL_CONTRACT';
+      shape = txHashOf;
       const p0 = (params[0] ?? {}) as Record<string, unknown>;
       payload = {
         contractAddr: p0.contractAddr ?? p0.to ?? '',
@@ -47,40 +69,32 @@ window.addEventListener('EGO_REQUEST', async (event: Event) => {
     }
 
     case 'personal_sign':
-    case 'ego_sign': {
-      msgType = 'EGO_SIGN_MESSAGE';
-      payload = { message: params[0] ?? '' };
+    case 'ego_sign':
+    case 'ego_signMessage': {
+      msgType = 'EGO_DAPP_SIGN';
+      shape = signatureOf;
+      payload = { message: typeof params[0] === 'string' ? params[0] : '' };
       break;
     }
 
     case 'wallet_switchEthereumChain':
-      window.dispatchEvent(new CustomEvent('EGO_RESPONSE', {
-        detail: { result: null, _reqId },
-      }));
+      reply(_reqId, { result: null });
       return;
 
     default:
-      window.dispatchEvent(new CustomEvent('EGO_RESPONSE', {
-        detail: { error: `Unsupported method: ${method}`, _reqId },
-      }));
+      reply(_reqId, { error: `Unsupported method: ${method}` });
       return;
   }
 
   try {
     const response = await chrome.runtime.sendMessage({ type: msgType, payload });
     if (response?.success) {
-      window.dispatchEvent(new CustomEvent('EGO_RESPONSE', {
-        detail: { result: response.data, _reqId },
-      }));
+      reply(_reqId, { result: shape((response.data ?? {}) as Record<string, unknown>) });
     } else {
-      window.dispatchEvent(new CustomEvent('EGO_RESPONSE', {
-        detail: { error: response?.error ?? 'Unknown error', _reqId },
-      }));
+      reply(_reqId, { error: response?.error ?? 'Unknown error' });
     }
   } catch (err: unknown) {
-    window.dispatchEvent(new CustomEvent('EGO_RESPONSE', {
-      detail: { error: (err as Error).message, _reqId },
-    }));
+    reply(_reqId, { error: (err as Error).message });
   }
 });
 
