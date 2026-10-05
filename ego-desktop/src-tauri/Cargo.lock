@@ -2424,6 +2424,7 @@ dependencies = [
  "k256",
  "keyring",
  "lettre",
+ "libc",
  "libp2p 0.56.0",
  "libp2p-core 0.43.2",
  "libp2p-stream",

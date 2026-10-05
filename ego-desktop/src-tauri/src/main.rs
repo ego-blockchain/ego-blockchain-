@@ -546,6 +546,7 @@ const DEFAULT_LOG_FILTER: &str =
     "ego_desktop=info,warn,libp2p_gossipsub=error,libp2p_dcutr=error,libp2p_relay=error";
 
 fn main() {
+    crate::utils::open_file_limit();
     {
         use tracing_subscriber::{fmt, EnvFilter, prelude::*};
         // `libp2p_gossipsub=error` silences the noisy "Send Queue full" WARN that dumps

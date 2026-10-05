@@ -3852,6 +3852,7 @@ struct EgoBehaviour {
     /// Denies any connection leaving the local network while EGO_OFFLINE=1.
     /// First field so its veto runs before the others get a say.
     offline_guard:    crate::offline_guard::OfflineGuard,
+    limits:           libp2p::connection_limits::Behaviour,
     relay_client:     relay::client::Behaviour,
     /// Relay server — any node with a public IP automatically serves as a circuit
     /// relay for NAT'd peers.  Fully decentralised: no dedicated relay servers needed.
@@ -6741,6 +6742,13 @@ async fn build_swarm(
 
             EgoBehaviour {
                 offline_guard: crate::offline_guard::OfflineGuard,
+                limits: libp2p::connection_limits::Behaviour::new(
+                    libp2p::connection_limits::ConnectionLimits::default()
+                        .with_max_established(Some(max_peer_connections()))
+                        .with_max_established_per_peer(Some(4))
+                        .with_max_pending_incoming(Some(64))
+                        .with_max_pending_outgoing(Some(128)),
+                ),
                 relay_client,
                 relay_server: relay::Behaviour::new(peer_id, relay::Config {
                     max_reservations:          4096,
@@ -6786,12 +6794,19 @@ async fn build_swarm(
         })?
         .with_swarm_config(|c| {
             c.with_max_negotiating_inbound_streams(2048)
-             .with_idle_connection_timeout(Duration::from_secs(86400))
+             .with_idle_connection_timeout(Duration::from_secs(3_600))
              .with_per_connection_event_buffer_size(128)
              .with_notify_handler_buffer_size(std::num::NonZeroUsize::new(2048).unwrap())
         })
         .build();
     Ok(swarm)
+}
+
+fn max_peer_connections() -> u32 {
+    std::env::var("EGO_MAX_PEERS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| crate::utils::open_file_budget(4, 48, 512) as u32)
 }
 
 fn handle_send(

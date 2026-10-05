@@ -123,6 +123,7 @@ pub fn get_db() -> DbWrapper {
         db_opts.set_write_buffer_size(64 * 1024 * 1024);       // 64 MB memtable
         db_opts.set_max_write_buffer_number(3);
         db_opts.set_max_background_jobs(4);
+        db_opts.set_max_open_files(crate::utils::open_file_budget(4, 64, 1_024) as i32);
         db_opts.set_compression_type(DBCompressionType::Lz4);
         db_opts.set_bottommost_compression_type(DBCompressionType::Lz4);
 

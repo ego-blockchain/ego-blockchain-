@@ -85,6 +85,7 @@ tower       = "0.4"
 rcgen       = "0.12"
 futures = "0.3"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1", "tokio1-rustls-tls", "builder"] }
+libc = "0.2"
 libp2p-core = "0.43"
 libp2p = { version = "0.56", features = [
     "tokio", "tcp", "quic", "dns", "noise", "yamux",

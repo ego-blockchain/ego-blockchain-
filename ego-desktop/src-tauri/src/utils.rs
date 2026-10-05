@@ -126,6 +126,45 @@ pub fn os_unprotect_checked(data: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
+pub fn open_file_limit() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(raise_open_file_limit)
+}
+
+pub fn open_file_budget(share: u64, floor: u64, ceiling: u64) -> u64 {
+    (open_file_limit() / share).clamp(floor, ceiling)
+}
+
+#[cfg(unix)]
+fn raise_open_file_limit() -> u64 {
+    let mut current = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) } != 0 {
+        return 256;
+    }
+    let wanted: libc::rlim_t = if cfg!(target_os = "macos") { 10_240 } else { 65_536 };
+    let target = wanted.min(current.rlim_max);
+    if current.rlim_cur >= target {
+        return current.rlim_cur as u64;
+    }
+    let raised = libc::rlimit { rlim_cur: target, rlim_max: current.rlim_max };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+        eprintln!("[Startup] open-file limit raised from {} to {}", current.rlim_cur, target);
+        target as u64
+    } else {
+        eprintln!(
+            "[Startup] could not raise the open-file limit above {} ({})",
+            current.rlim_cur,
+            std::io::Error::last_os_error()
+        );
+        current.rlim_cur as u64
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_open_file_limit() -> u64 {
+    16_384
+}
+
 pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, data)?;
