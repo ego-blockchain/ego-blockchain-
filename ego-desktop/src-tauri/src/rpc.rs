@@ -370,6 +370,14 @@ async fn rpc_handler(
     }
 }
 
+pub(crate) fn dispatch_value(body: Value) -> Value {
+    let response = match serde_json::from_value::<RpcRequest>(body) {
+        Ok(req) => handle_method(req),
+        Err(e) => RpcResponse::err(None, -32700, &format!("parse error: {e}")),
+    };
+    serde_json::to_value(response).unwrap_or(Value::Null)
+}
+
 fn handle_method(req: RpcRequest) -> RpcResponse {
     if req.jsonrpc != "2.0" {
         return RpcResponse::err(req.id, -32600, "Only JSON-RPC 2.0 is supported");

@@ -26,6 +26,7 @@ mod ecvrf;
 mod chain_db;
 mod contract_exec;
 mod dao_chat;
+mod gateway;
 mod commands;
 mod compute_admission;
 mod config;
@@ -471,6 +472,8 @@ fn headless_main() {
             let _ = crate::tls::ensure_tls_certs();
             crate::rpc::start_https_server().await;
         });
+
+        tokio::spawn(crate::gateway::supervise());
 
         tokio::spawn(async {
             crate::commands::consensus::run_post_loop().await;
@@ -1162,6 +1165,8 @@ fn main() {
             commands::dao_chat::dao_chat_edit,
             commands::dao_chat::dao_chat_delete,
             commands::dao_chat::dao_chat_sync,
+            commands::gateway::gateway_status,
+            commands::gateway::set_gateway_enabled,
             commands::governance::get_proposal_rate_limit,
             commands::hosting::deploy_site,
             commands::hosting::deploy_site_begin,
@@ -1648,6 +1653,8 @@ fn main() {
                 let _ = crate::tls::ensure_tls_certs();
                 crate::rpc::start_https_server().await;
             });
+
+            tauri::async_runtime::spawn(crate::gateway::supervise());
 
             tauri::async_runtime::spawn(async move {
                 crate::p2p::run_view_change_monitor().await;

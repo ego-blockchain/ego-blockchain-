@@ -786,14 +786,32 @@ pub fn push_protocol_tx(tx: LedgerTx) {
 }
 
 // Per-peer available storage advertised via DataManifest gossip.
-static PEER_STORAGE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, f64>>> =
+static PEER_STORAGE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (f64, i64)>>> =
     std::sync::OnceLock::new();
 
-fn peer_storage() -> std::sync::MutexGuard<'static, HashMap<String, f64>> {
+const PEER_STORAGE_FRESH_SECS: i64 = 30 * 60;
+const MAX_ADVERTISED_GB: f64 = 1_000_000.0;
+
+fn peer_storage() -> std::sync::MutexGuard<'static, HashMap<String, (f64, i64)>> {
     PEER_STORAGE
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn fresh_peer_storage(now: i64) -> (f64, usize) {
+    let mut peers = peer_storage();
+    peers.retain(|_, (_, seen)| now - *seen < PEER_STORAGE_FRESH_SECS);
+    (peers.values().map(|(gb, _)| *gb).sum(), peers.len())
+}
+
+pub fn live_storage(now: i64) -> (usize, u64) {
+    let ledger = crate::ledger::Ledger::load();
+    let self_used = ledger.stored_files.iter().map(|f| f.encrypted_size).sum::<u64>();
+    let self_free = ledger.storage_allocated_bytes.saturating_sub(self_used);
+    let (peer_gb, peer_count) = fresh_peer_storage(now);
+    let providers = peer_count + usize::from(!ledger.address.is_empty() && ledger.storage_allocated_bytes > 0);
+    (providers, self_free.saturating_add((peer_gb * 1_000_000_000.0) as u64))
 }
 
 /// Returns (total_allocated_gb, total_available_gb, node_count) across all known peers + self.
@@ -804,9 +822,7 @@ pub fn get_network_capacity() -> (f64, f64, usize) {
     let self_alloc = ledger.storage_allocated_bytes as f64 / 1_000_000_000.0;
     let self_avail = (self_alloc - self_used).max(0.0);
 
-    let peers      = peer_storage();
-    let peer_avail: f64 = peers.values().sum();
-    let peer_count = peers.len();
+    let (peer_avail, peer_count) = fresh_peer_storage(chrono::Utc::now().timestamp());
 
     let total_avail = self_avail + peer_avail;
     let total_alloc = (total_avail / 0.85).max(self_alloc); // 85% headroom assumption
@@ -6309,6 +6325,9 @@ pub async fn start_p2p_server(app: Option<tauri::AppHandle<tauri::Wry>>) {
     let dao_chat_topic = gossipsub::IdentTopic::new(crate::dao_chat::TOPIC);
     swarm.behaviour_mut().gossipsub.subscribe(&dao_chat_topic).ok();
 
+    let gateways_topic = gossipsub::IdentTopic::new(crate::gateway::GOSSIP_TOPIC);
+    swarm.behaviour_mut().gossipsub.subscribe(&gateways_topic).ok();
+
     let _ = swarm.behaviour_mut().kad.bootstrap();
 
     let (gossip_unbounded_tx, mut gossip_rx) =
@@ -7621,6 +7640,9 @@ async fn handle_event(
                 let data = message.data.clone();
                 let app2 = app.cloned();
                 tokio::spawn(async move { crate::dao_chat::receive_gossip(data, app2).await; });
+            } else if topic == crate::gateway::GOSSIP_TOPIC {
+                let data = message.data.clone();
+                tokio::spawn(crate::gateway::receive_gossip(data));
             } else if topic == V2_TOPIC {
                 // Consensus-v2 messages → handle_incoming. The BftV2* arms feed the live
                 // engine that drives the chain by default (inline only with LEGACY=1).
@@ -8530,8 +8552,11 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
                 from_addr, cids.len(), available_gb, is_relay);
 
             // Track per-peer available storage for network capacity calculation.
-            if !from_addr.is_empty() {
-                peer_storage().insert(from_addr.clone(), available_gb);
+            if !from_addr.is_empty() && available_gb.is_finite() {
+                peer_storage().insert(
+                    from_addr.clone(),
+                    (available_gb.clamp(0.0, MAX_ADVERTISED_GB), chrono::Utc::now().timestamp()),
+                );
             }
 
             if is_relay && !endpoint.is_empty() {
