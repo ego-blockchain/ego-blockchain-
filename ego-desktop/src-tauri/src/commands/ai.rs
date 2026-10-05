@@ -451,8 +451,8 @@ Init arguments take plain decimal numbers (`1000000`) or raw hex.
 
 ### Route B — urego CLI (for source control and CI)
 ```
-git clone https://github.com/ego-blockchain/ego-blockchain
-cd ego-blockchain
+git clone https://github.com/ego-blockchain/ego-blockchain-
+cd ego-blockchain-
 cargo build -p urego --release
 
 urego new MyToken        # scaffolds mytoken.uro
@@ -692,8 +692,8 @@ Heavy uploads are routed to Wi-Fi or Ethernet while control messages use cellula
 
 ### Start one
 ```
-git clone https://github.com/ego-blockchain/ego-blockchain
-cd ego-blockchain
+git clone https://github.com/ego-blockchain/ego-blockchain-
+cd ego-blockchain-
 cargo build -p ego-node --release
 
 # Full node (P2P 9000, HTTP RPC 8545)
@@ -940,16 +940,19 @@ Status: active development. TestFlight and Play Store open beta are planned once
     } else if q.contains("testnet deploy") || q.contains("run testnet") || q.contains("deploy testnet") || has_any_word(&q, &["docker", "vps"]) {
         r#"The testnet ships as a self-contained **Docker Compose** stack: a relay/seed node, four validators covering all 16 shards, and an nginx reverse proxy load-balancing across them.
 
-### One-command install (Ubuntu 22.04)
+### Install script (Ubuntu 22.04)
+Download the script, read it, then run it. Never pipe a script from the internet straight into a shell.
 ```
-curl -sSL https://raw.githubusercontent.com/ego-blockchain/ego-blockchain/main/testnet/deploy-vps.sh | bash
+curl -fsSLO https://raw.githubusercontent.com/ego-blockchain/ego-blockchain-/main/testnet/deploy-vps.sh
+less deploy-vps.sh
+bash deploy-vps.sh
 ```
 That installs docker-compose, git and rustup, builds `ego-node --release`, writes the `ego-testnet` systemd unit, and opens ports 4001, 9000–9004, 8540–8545 and 80.
 
 ### Manual
 ```
-git clone https://github.com/ego-blockchain/ego-blockchain
-cd ego-blockchain/testnet
+git clone https://github.com/ego-blockchain/ego-blockchain-
+cd ego-blockchain-/testnet
 ./scripts/init.sh      # create data dirs
 ./scripts/start.sh     # docker compose up -d
 ./scripts/health.sh    # check all 4 validators

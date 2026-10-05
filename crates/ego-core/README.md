@@ -83,8 +83,8 @@ The core blockchain infrastructure for the Ego distributed network. This library
 
 1. **Clone the Repository**
 ```bash
-git clone https://github.com/ego-blockchain/ego-blockchain.git
-cd ego-blockchain
+git clone https://github.com/ego-blockchain/ego-blockchain-.git
+cd ego-blockchain-
 ```
 
 2. **Add to Your Project**
@@ -1268,8 +1268,8 @@ We welcome contributions! Please follow these steps:
 
 1. **Fork the Repository**
 ```bash
-git clone https://github.com/ego-blockchain/ego-blockchain.git
-cd ego-blockchain
+git clone https://github.com/ego-blockchain/ego-blockchain-.git
+cd ego-blockchain-
 ```
 
 2. **Set Up Development Environment**
@@ -1309,8 +1309,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 🆘 Support and Community
 
 - **Documentation**: [docs.ego-blockchain.io](https://docs.ego-blockchain.io)
-- **GitHub Issues**: [Report bugs and request features](https://github.com/ego-blockchain/ego-blockchain/issues)
-- **GitHub Discussions**: [Community discussions](https://github.com/ego-blockchain/ego-blockchain/discussions)
+- **GitHub Issues**: [Report bugs and request features](https://github.com/ego-blockchain/ego-blockchain-/issues)
+- **GitHub Discussions**: [Community discussions](https://github.com/ego-blockchain/ego-blockchain-/discussions)
 - **Discord**: [Join our community](https://discord.gg/ego-blockchain)
 - **Twitter**: [@EgoBlockchain](https://twitter.com/EgoBlockchain)
 
