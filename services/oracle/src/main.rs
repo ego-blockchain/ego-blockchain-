@@ -1,5 +1,6 @@
 mod acme;
 mod dns;
+mod gateways;
 
 use axum::{
     extract::{Path, State},
@@ -1370,6 +1371,8 @@ async fn main() {
         .route("/hosting/nodes/:domain",    get(handle_hosting_nodes))
         .route("/nodes/register",           post(handle_nodes_register))
         .route("/nodes",                    get(handle_nodes_list))
+        .route("/gateways",                 get(gateways::handle_list))
+        .route("/gateways/register",        post(gateways::handle_register))
         .route("/cert/request",             post(handle_cert_request))
         .route("/cert/status/:domain",      get(handle_cert_status))
         .route("/post/proof",               post(handle_post_proof))
