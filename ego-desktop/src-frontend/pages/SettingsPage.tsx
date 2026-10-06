@@ -7,7 +7,6 @@ import { writeBinaryFile, readBinaryFile } from '@tauri-apps/api/fs';
 import { useWallet } from '../App';
 import qrcode from 'qrcode-generator';
 import { useAppVersion, formatVersion } from '../lib/version';
-import ServePhones from './settings/ServePhones';
 
 function makeQR(text: string): string {
   if (!text) return '';
@@ -373,8 +372,6 @@ const SettingsPage: React.FC = () => {
           {startAtLogin !== null && <Toggle value={startAtLogin} onChange={changeStartAtLogin} />}
         </div>
       </div>
-
-      <ServePhones />
 
       {}
       <div className="bg-gray-800 rounded-2xl border border-gray-700 overflow-hidden">

@@ -868,9 +868,6 @@ pub struct Ledger {
     pub compute_enabled: bool,
 
     #[serde(default)]
-    pub gateway_opt_out: bool,
-
-    #[serde(default)]
     pub compute_allocated_cores: u32,
 
     #[serde(default)]

@@ -102,11 +102,7 @@ pub fn port() -> u16 {
 }
 
 pub fn enabled() -> bool {
-    match std::env::var("EGO_GATEWAY").as_deref() {
-        Ok("0") => false,
-        Ok("1") => true,
-        _ => !crate::ledger::Ledger::load().gateway_opt_out,
-    }
+    std::env::var("EGO_GATEWAY").as_deref() != Ok("0")
 }
 
 pub fn status() -> GatewayStatus {

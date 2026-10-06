@@ -1166,7 +1166,6 @@ fn main() {
             commands::dao_chat::dao_chat_delete,
             commands::dao_chat::dao_chat_sync,
             commands::gateway::gateway_status,
-            commands::gateway::set_gateway_enabled,
             commands::governance::get_proposal_rate_limit,
             commands::hosting::deploy_site,
             commands::hosting::deploy_site_begin,
