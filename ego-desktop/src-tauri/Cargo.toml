@@ -83,6 +83,7 @@ axum        = { version = "0.6", features = ["ws"] }
 axum-server = { version = "0.5", features = ["tls-rustls"] }
 tower       = "0.4"
 rcgen       = "0.12"
+mdns-sd     = "0.21"
 futures = "0.3"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1", "tokio1-rustls-tls", "builder"] }
 libc = "0.2"

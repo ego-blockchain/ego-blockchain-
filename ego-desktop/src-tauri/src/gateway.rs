@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_PORT: u16 = 47398;
 pub const ANNOUNCE_DOMAIN: &str = "ego/gateway/v1";
 pub const GOSSIP_TOPIC: &str = "ego-gateways-v1";
+pub const LOCAL_SERVICE: &str = "_ego-gateway._tcp.local.";
 
 const ANNOUNCE_EVERY: Duration = Duration::from_secs(30 * 60);
 const SUPERVISE_EVERY: Duration = Duration::from_secs(10);
@@ -79,6 +80,8 @@ pub struct GatewayStatus {
     pub bootstrap_listed: bool,
     pub last_announce: Option<i64>,
     pub reached_from_internet_at: Option<i64>,
+    pub local_advertised: bool,
+    pub reached_locally_at: Option<i64>,
     pub known_gateways: usize,
     pub problem: Option<String>,
 }
@@ -365,8 +368,11 @@ async fn rpc(ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(body): Json<Value>
 
 async fn health(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Json<Value> {
     if let IpAddr::V4(ip) = peer.ip() {
+        let now = chrono::Utc::now().timestamp();
         if is_public(&ip) {
-            update(|s| s.reached_from_internet_at = Some(chrono::Utc::now().timestamp()));
+            update(|s| s.reached_from_internet_at = Some(now));
+        } else if ip.is_private() {
+            update(|s| s.reached_locally_at = Some(now));
         }
     }
     Json(json!({ "ok": true, "service": "ego-gateway", "version": env!("CARGO_PKG_VERSION") }))
@@ -398,6 +404,50 @@ async fn serve(cert_pem: String, key_pem: String) {
             s.problem = Some(format!("The gateway couldn't listen on port {}: {e}", port()));
         }
     });
+}
+
+/// Phones on the same network can't reach this computer through the router's
+/// public address (most routers don't loop it back), so the gateway also
+/// advertises itself over Bonjour. Phones pin the certificate from the TXT
+/// record, the same way they pin it from a signed announcement.
+struct LocalAdvert {
+    daemon: mdns_sd::ServiceDaemon,
+    fullname: String,
+}
+
+impl Drop for LocalAdvert {
+    fn drop(&mut self) {
+        let _ = self.daemon.unregister(&self.fullname);
+        let _ = self.daemon.shutdown();
+    }
+}
+
+fn advertise_locally(cert_sha256: &str) -> Result<LocalAdvert, String> {
+    let daemon = mdns_sd::ServiceDaemon::new().map_err(|e| e.to_string())?;
+    let name = format!("ego-gateway-{}", &cert_sha256[..12]);
+    let txt = HashMap::from([
+        ("v".to_string(), "1".to_string()),
+        ("cert".to_string(), cert_sha256.to_string()),
+    ]);
+    let info = mdns_sd::ServiceInfo::new(LOCAL_SERVICE, &name, &format!("{name}.local."), (), port(), txt)
+        .map_err(|e| e.to_string())?
+        .enable_addr_auto();
+    let fullname = info.get_fullname().to_string();
+    daemon.register(info).map_err(|e| e.to_string())?;
+    Ok(LocalAdvert { daemon, fullname })
+}
+
+async fn advertise_loop(cert_sha256: String) {
+    match advertise_locally(&cert_sha256) {
+        Ok(_advert) => {
+            update(|s| s.local_advertised = true);
+            std::future::pending::<()>().await;
+        }
+        Err(e) => {
+            tracing::warn!("gateway: couldn't advertise on the local network: {e}");
+            update(|s| s.local_advertised = false);
+        }
+    }
 }
 
 async fn public_ipv4(client: &reqwest::Client) -> Option<Ipv4Addr> {
@@ -565,6 +615,7 @@ pub async fn supervise() {
                         s.problem = None;
                     });
                     tasks.push(tokio::spawn(serve(cert, key)));
+                    tasks.push(tokio::spawn(advertise_loop(fingerprint.clone())));
                     tasks.push(tokio::spawn(announce_loop(fingerprint)));
                     tasks.push(tokio::spawn(probe_loop()));
                 }
@@ -579,6 +630,7 @@ pub async fn supervise() {
             update(|s| {
                 s.running = false;
                 s.bootstrap_listed = false;
+                s.local_advertised = false;
                 s.problem = None;
             });
         }

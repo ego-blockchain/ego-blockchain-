@@ -10,6 +10,8 @@ interface GatewayStatus {
   bootstrap_listed: boolean;
   last_announce: number | null;
   reached_from_internet_at: number | null;
+  local_advertised: boolean;
+  reached_locally_at: number | null;
   known_gateways: number;
   problem: string | null;
 }
@@ -100,6 +102,15 @@ export default function ServePhones() {
                     ? `Last reached ${ago(reached)}`
                     : 'Not reached yet'}
                 tone={reachable ? 'good' : 'warn'}
+              />
+              <Row
+                label="On this Wi-Fi"
+                value={!status.local_advertised
+                  ? 'Not visible to nearby phones'
+                  : status.reached_locally_at !== null
+                    ? `Phone connected ${ago(status.reached_locally_at)}`
+                    : 'Nearby phones can find it'}
+                tone={status.local_advertised ? 'good' : 'warn'}
               />
               <Row label="Public address" value={status.endpoint ?? 'Looking up…'} mono />
               <Row
