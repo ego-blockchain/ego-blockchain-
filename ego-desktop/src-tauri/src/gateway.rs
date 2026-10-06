@@ -18,6 +18,12 @@ pub const ANNOUNCE_DOMAIN: &str = "ego/gateway/v1";
 pub const GOSSIP_TOPIC: &str = "ego-gateways-v1";
 
 const ANNOUNCE_EVERY: Duration = Duration::from_secs(30 * 60);
+const RETRY_UNREACHABLE: Duration = Duration::from_secs(2 * 60);
+const ROUTER_LEASE_SECS: u32 = 60 * 60;
+const ROUTER_RENEW: Duration = Duration::from_secs(20 * 60);
+const REACHED_FOR_SECS: i64 = 60 * 60;
+const BOOTSTRAP_SAMPLE: usize = 200;
+const GOSSIP_SAMPLE: usize = 1_000;
 const SUPERVISE_EVERY: Duration = Duration::from_secs(10);
 const PROBE_EVERY: Duration = Duration::from_secs(5 * 60);
 const PROBES_PER_ROUND: usize = 3;
@@ -79,6 +85,9 @@ pub struct GatewayStatus {
     pub bootstrap_listed: bool,
     pub last_announce: Option<i64>,
     pub reached_from_internet_at: Option<i64>,
+    pub router_port_open: Option<bool>,
+    pub router_public_ip: Option<String>,
+    pub reachable: bool,
     pub known_gateways: usize,
     pub problem: Option<String>,
 }
@@ -93,7 +102,11 @@ pub fn port() -> u16 {
 }
 
 pub fn enabled() -> bool {
-    std::env::var("EGO_GATEWAY").as_deref() == Ok("1") || crate::ledger::Ledger::load().gateway_enabled
+    match std::env::var("EGO_GATEWAY").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => !crate::ledger::Ledger::load().gateway_opt_out,
+    }
 }
 
 pub fn status() -> GatewayStatus {
@@ -451,34 +464,146 @@ async fn tell_bootstrap(client: &reqwest::Client, a: &Announcement) -> Result<bo
     Ok(reply["listed"].as_bool().unwrap_or(false))
 }
 
+fn should_announce(router_open: Option<bool>, router_ip: Option<&str>, public_ip: &str, reached_at: Option<i64>, now: i64) -> bool {
+    let mapped = router_open == Some(true) && router_ip == Some(public_ip);
+    let reached = reached_at.map(|t| now - t < REACHED_FOR_SECS).unwrap_or(false);
+    mapped || reached
+}
+
+fn sampled(node: &str, known: usize, target: usize) -> bool {
+    let spread = if known < target {
+        return true;
+    } else if known >= TABLE_MAX {
+        16
+    } else {
+        known / target + 1
+    };
+    let digest = Sha256::digest(node.as_bytes());
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(first) % spread as u64 == 0
+}
+
+async fn announce_once(client: &reqwest::Client, cert_sha256: &str) -> bool {
+    let a = match make_announcement(client, cert_sha256).await {
+        Ok(a) => a,
+        Err(e) => {
+            update(|s| s.problem = Some(e));
+            return false;
+        }
+    };
+    let now = chrono::Utc::now().timestamp();
+    let public_ip = parse_endpoint(&a.endpoint).map(|(ip, _)| ip.to_string()).unwrap_or_default();
+    let snapshot = status();
+    let reachable = should_announce(
+        snapshot.router_port_open,
+        snapshot.router_public_ip.as_deref(),
+        &public_ip,
+        snapshot.reached_from_internet_at,
+        now,
+    );
+    update(|s| {
+        s.endpoint = Some(a.endpoint.clone());
+        s.reachable = reachable;
+        s.problem = None;
+    });
+    if !reachable {
+        *OWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        update(|s| s.bootstrap_listed = false);
+        return false;
+    }
+    *OWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.clone());
+    if sampled(&a.node, snapshot.known_gateways, GOSSIP_SAMPLE) {
+        if let Ok(data) = serde_json::to_vec(&a) {
+            crate::p2p::publish_gossip(GOSSIP_TOPIC, data).await;
+        }
+    }
+    let listed = if sampled(&a.node, snapshot.known_gateways, BOOTSTRAP_SAMPLE) {
+        tell_bootstrap(client, &a).await
+    } else {
+        Ok(false)
+    };
+    update(|s| {
+        s.last_announce = Some(chrono::Utc::now().timestamp());
+        match listed {
+            Ok(l) => s.bootstrap_listed = l,
+            Err(e) => s.problem = Some(e),
+        }
+    });
+    true
+}
+
 async fn announce_loop(cert_sha256: String) {
     let client = match reqwest::Client::builder().timeout(Duration::from_secs(20)).build() {
         Ok(c) => c,
         Err(_) => return,
     };
     loop {
-        match make_announcement(&client, &cert_sha256).await {
-            Ok(a) => {
-                update(|s| s.endpoint = Some(a.endpoint.clone()));
-                *OWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.clone());
-                if let Ok(data) = serde_json::to_vec(&a) {
-                    crate::p2p::publish_gossip(GOSSIP_TOPIC, data).await;
-                }
-                let listed = tell_bootstrap(&client, &a).await;
+        let wait = if announce_once(&client, &cert_sha256).await { ANNOUNCE_EVERY } else { RETRY_UNREACHABLE };
+        tokio::time::sleep(wait).await;
+    }
+}
+
+async fn find_router() -> Result<igd_next::aio::Gateway<igd_next::aio::tokio::Tokio>, String> {
+    igd_next::aio::tokio::search_gateway(igd_next::SearchOptions {
+        timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    })
+    .await
+    .map_err(|e| format!("no UPnP router answered: {e}"))
+}
+
+async fn local_ipv4_toward(router: SocketAddr) -> Option<Ipv4Addr> {
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    socket.connect(router).await.ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if !ip.is_unspecified() => Some(ip),
+        _ => None,
+    }
+}
+
+async fn open_router_port() -> Result<Ipv4Addr, String> {
+    let router = find_router().await?;
+    let local = local_ipv4_toward(router.addr).await.ok_or("couldn't find this computer's local address")?;
+    router
+        .add_port(
+            igd_next::PortMappingProtocol::TCP,
+            port(),
+            SocketAddr::from((local, port())),
+            ROUTER_LEASE_SECS,
+            "Ego Desktop phone gateway",
+        )
+        .await
+        .map_err(|e| format!("the router refused to open port {}: {e}", port()))?;
+    match router.get_external_ip().await {
+        Ok(IpAddr::V4(ip)) => Ok(ip),
+        Ok(_) => Err("the router has no IPv4 address".into()),
+        Err(e) => Err(format!("the router didn't give its public address: {e}")),
+    }
+}
+
+async fn close_router_port() {
+    if let Ok(router) = find_router().await {
+        let _ = router.remove_port(igd_next::PortMappingProtocol::TCP, port()).await;
+    }
+}
+
+async fn router_loop() {
+    loop {
+        match open_router_port().await {
+            Ok(ip) => update(|s| {
+                s.router_port_open = Some(is_public(&ip));
+                s.router_public_ip = Some(ip.to_string());
+            }),
+            Err(e) => {
+                tracing::debug!("[gateway] {e}");
                 update(|s| {
-                    s.last_announce = Some(chrono::Utc::now().timestamp());
-                    match listed {
-                        Ok(l) => {
-                            s.bootstrap_listed = l;
-                            s.problem = None;
-                        }
-                        Err(e) => s.problem = Some(e),
-                    }
+                    s.router_port_open = Some(false);
+                    s.router_public_ip = None;
                 });
             }
-            Err(e) => update(|s| s.problem = Some(e)),
         }
-        tokio::time::sleep(ANNOUNCE_EVERY).await;
+        tokio::time::sleep(ROUTER_RENEW).await;
     }
 }
 
@@ -565,6 +690,7 @@ pub async fn supervise() {
                         s.problem = None;
                     });
                     tasks.push(tokio::spawn(serve(cert, key)));
+                    tasks.push(tokio::spawn(router_loop()));
                     tasks.push(tokio::spawn(announce_loop(fingerprint)));
                     tasks.push(tokio::spawn(probe_loop()));
                 }
@@ -576,9 +702,13 @@ pub async fn supervise() {
                 t.abort();
             }
             *OWN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            tokio::spawn(close_router_port());
             update(|s| {
                 s.running = false;
                 s.bootstrap_listed = false;
+                s.reachable = false;
+                s.router_port_open = None;
+                s.router_public_ip = None;
                 s.problem = None;
             });
         }
@@ -666,6 +796,28 @@ mod tests {
         record_probe("https://203.0.114.1:47398/rpc", false, now);
         record_probe("https://203.0.114.1:47398/rpc", false, now);
         assert!(!share(now).iter().any(|a| a.endpoint == "https://203.0.114.1:47398/rpc"), "two failed checks drop a gateway");
+    }
+
+    #[test]
+    fn only_a_reachable_computer_is_announced() {
+        let now = 1_800_000_000;
+        assert!(should_announce(Some(true), Some("8.8.8.8"), "8.8.8.8", None, now));
+        assert!(!should_announce(Some(true), Some("100.64.0.9"), "8.8.8.8", None, now), "a router behind the provider's shared address is not enough");
+        assert!(!should_announce(Some(false), None, "8.8.8.8", None, now));
+        assert!(!should_announce(None, None, "8.8.8.8", None, now));
+        assert!(should_announce(Some(false), None, "8.8.8.8", Some(now - 60), now), "a manual port forward counts once someone reached it");
+        assert!(!should_announce(Some(false), None, "8.8.8.8", Some(now - 2 * 3_600), now));
+    }
+
+    #[test]
+    fn a_large_network_only_sends_a_sample_to_the_bootstrap_list() {
+        let nodes: Vec<String> = (0..4_000).map(|i| format!("egot1node{i}")).collect();
+        assert!(nodes.iter().all(|n| sampled(n, 50, BOOTSTRAP_SAMPLE)), "a small network registers everyone");
+        let some = nodes.iter().filter(|n| sampled(n, 1_000, BOOTSTRAP_SAMPLE)).count();
+        assert!((500..1_000).contains(&some), "{some}");
+        let few = nodes.iter().filter(|n| sampled(n, TABLE_MAX, BOOTSTRAP_SAMPLE)).count();
+        assert!((150..350).contains(&few), "{few}");
+        assert_eq!(sampled("egot1same", 1_500, GOSSIP_SAMPLE), sampled("egot1same", 1_500, GOSSIP_SAMPLE));
     }
 
     #[test]

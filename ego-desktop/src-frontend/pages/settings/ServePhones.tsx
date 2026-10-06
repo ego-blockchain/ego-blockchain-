@@ -10,6 +10,9 @@ interface GatewayStatus {
   bootstrap_listed: boolean;
   last_announce: number | null;
   reached_from_internet_at: number | null;
+  router_port_open: boolean | null;
+  router_public_ip: string | null;
+  reachable: boolean;
   known_gateways: number;
   problem: string | null;
 }
@@ -56,7 +59,7 @@ export default function ServePhones() {
 
   const now = Math.floor(Date.now() / 1000);
   const reached = status?.reached_from_internet_at ?? null;
-  const reachable = reached !== null && now - reached < REACHED_RECENTLY_SECS;
+  const reachable = !!status?.reachable || (reached !== null && now - reached < REACHED_RECENTLY_SECS);
   const on = !!status?.enabled;
 
   return (
@@ -65,8 +68,8 @@ export default function ServePhones() {
         <div>
           <h3 className="font-semibold">Serve phones</h3>
           <div className="text-xs text-gray-400 mt-0.5 max-w-xl">
-            Ego Wallet on iPhone reaches the network through computers like this one. Phones sign everything
-            themselves, so this computer never sees their keys. Each phone is rate limited.
+            On by default. Ego Wallet on iPhone reaches the network through computers like this one. Phones sign
+            everything themselves, so this computer never sees their keys, and each phone is rate limited.
           </div>
         </div>
         <button
@@ -94,12 +97,17 @@ export default function ServePhones() {
               <Row label="Status" value={`Serving on port ${status.port}`} tone="good" />
               <Row
                 label="From the internet"
-                value={reachable
-                  ? `Reached ${ago(reached!)}`
-                  : reached !== null
-                    ? `Last reached ${ago(reached)}`
+                value={reached !== null
+                  ? `${now - reached < REACHED_RECENTLY_SECS ? 'Reached' : 'Last reached'} ${ago(reached)}`
+                  : status.reachable
+                    ? 'Open through the router'
                     : 'Not reached yet'}
                 tone={reachable ? 'good' : 'warn'}
+              />
+              <Row
+                label="Router port"
+                value={status.router_port_open === null ? 'Checking…' : status.router_port_open ? 'Opened automatically' : 'Router did not open it'}
+                tone={status.router_port_open ? 'good' : status.router_port_open === false ? 'warn' : undefined}
               />
               <Row label="Public address" value={status.endpoint ?? 'Looking up…'} mono />
               <Row
@@ -113,9 +121,9 @@ export default function ServePhones() {
               )}
               {!reachable && (
                 <div className="text-xs text-gray-400 leading-relaxed bg-gray-900 rounded-xl p-3">
-                  Phones can only use this computer if it can be reached from the internet. If no phone or gateway
-                  has reached it after a few minutes, forward TCP port {status.port} on your router to this computer
-                  and allow it through the firewall.
+                  Phones can only use this computer if it can be reached from the internet. Ego Desktop asks the router
+                  to open the port by itself. If the router doesn't allow that, forward TCP port {status.port} to this
+                  computer by hand. Until then it is not announced, so no phone tries it.
                 </div>
               )}
             </>

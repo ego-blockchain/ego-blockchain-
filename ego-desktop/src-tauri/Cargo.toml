@@ -81,6 +81,7 @@ hyper   = { version = "0.14", features = ["http1", "http2", "server"] }
 # JSON-RPC + WebSocket server — external devs / JS SDK connect here
 axum        = { version = "0.6", features = ["ws"] }
 axum-server = { version = "0.5", features = ["tls-rustls"] }
+igd-next = { version = "0.16", features = ["aio_tokio"] }
 tower       = "0.4"
 rcgen       = "0.12"
 futures = "0.3"
