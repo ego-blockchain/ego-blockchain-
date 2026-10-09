@@ -53,7 +53,7 @@ jobs:
 
       - name: Test gateway
         working-directory: ego-desktop/src-tauri
-        run: cargo test --release --bin ego-desktop gateway::
+        run: cargo test --release --bin ego-desktop "gateway::"
 
       - name: Build ego-desktop
         working-directory: ego-desktop/src-tauri
