@@ -38,6 +38,8 @@ const BUCKET_SIZE: f64 = 120.0;
 const REFILL_PER_SEC: f64 = 6.0;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const NOT_HERE: &str = "That method isn't available on this gateway.";
+const NOT_OWNER: &str = "Only the owner of this computer can see its earnings.";
+pub const EARNINGS_DOMAIN: &str = "ego/node-earnings/v1";
 
 const PASSTHROUGH: &[&str] = &[
     "wallet.getBalance",
@@ -269,7 +271,8 @@ pub async fn receive_gossip(data: Vec<u8>) {
 fn cost(method: &str) -> f64 {
     match method {
         "tx.submit" | "chat.submit" => 20.0,
-        "chat.feed" => 4.0,
+        "chat.feed" | "node.earnings" => 4.0,
+        "wallet.getRewards" => 2.0,
         _ => 1.0,
     }
 }
@@ -350,6 +353,118 @@ async fn storage_capacity() -> Result<Value, (i32, String)> {
     Ok(json!({ "providers": providers, "free_bytes": free, "updated_at": now }))
 }
 
+fn is_reward(tx: &crate::ledger::LedgerTx) -> bool {
+    tx.status == "Confirmed"
+        && (tx.tx_type == "reward" || tx.tx_type == "coinbase")
+        && (tx.from == crate::chain_db::NODE_POOL_ADDR || tx.from.starts_with("egot1rewards"))
+}
+
+/// Rewards paid to an address, read from the chain. Anyone may ask: the same
+/// transactions are public in the explorer.
+async fn wallet_rewards(params: &Value) -> Result<Value, (i32, String)> {
+    let address = params["address"].as_str().unwrap_or_default().trim().to_string();
+    if !crate::dao_chat::is_address(&address) {
+        return Err((-32602, "That isn't an Ego address.".to_string()));
+    }
+    let now = chrono::Utc::now().timestamp();
+    let summary = tokio::task::spawn_blocking(move || {
+        let (mut total, mut day, mut week, mut count, mut last) = (0u64, 0u64, 0u64, 0u64, None::<i64>);
+        for tx in crate::chain_db::get_tx_history_for_addr(&address) {
+            if !is_reward(&tx) {
+                continue;
+            }
+            total = total.saturating_add(tx.amount);
+            count += 1;
+            if now - tx.timestamp < 86_400 {
+                day = day.saturating_add(tx.amount);
+            }
+            if now - tx.timestamp < 7 * 86_400 {
+                week = week.saturating_add(tx.amount);
+            }
+            last = Some(last.map_or(tx.timestamp, |l: i64| l.max(tx.timestamp)));
+        }
+        json!({
+            "total_uegoc": total,
+            "last_24h_uegoc": day,
+            "last_7d_uegoc": week,
+            "count": count,
+            "last_at": last,
+            "now": now,
+        })
+    })
+    .await
+    .map_err(|e| (-32603, e.to_string()))?;
+    Ok(summary)
+}
+
+pub fn earnings_request_bytes(address: &str, ts: i64) -> Vec<u8> {
+    format!("{EARNINGS_DOMAIN}\n{address}\n{ts}").into_bytes()
+}
+
+/// Checks that a request for this node's earnings is signed by the address it
+/// names, recently. Whether that address owns this node is checked separately.
+fn signed_by(params: &Value, now: i64) -> Result<String, &'static str> {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let address = params["address"].as_str().unwrap_or_default();
+    let ts = params["ts"].as_i64().ok_or("time")?;
+    if (ts - now).abs() > CLOCK_SKEW_SECS {
+        return Err("time");
+    }
+    let pk: [u8; 32] = hex::decode(params["pubkey"].as_str().unwrap_or_default())
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or("sig")?;
+    let sig: [u8; 64] = hex::decode(params["sig"].as_str().unwrap_or_default())
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or("sig")?;
+    let key = VerifyingKey::from_bytes(&pk).map_err(|_| "sig")?;
+    key.verify_strict(&earnings_request_bytes(address, ts), &Signature::from_bytes(&sig))
+        .map_err(|_| "sig")?;
+    if crate::market_chain::address_of(&pk) != address {
+        return Err("sig");
+    }
+    Ok(address.to_string())
+}
+
+/// The Earnings page of this computer, for its owner only.
+async fn node_earnings(params: &Value) -> Result<Value, (i32, String)> {
+    let now = chrono::Utc::now().timestamp();
+    let address = signed_by(params, now).map_err(|reason| match reason {
+        "time" => (-32003, "The request's time is off. Check your phone's date and time.".to_string()),
+        _ => (-32003, NOT_OWNER.to_string()),
+    })?;
+    let ledger = tokio::task::spawn_blocking(crate::ledger::Ledger::load)
+        .await
+        .map_err(|e| (-32603, e.to_string()))?;
+    let state = crate::app::global_app_state();
+    let owner = (!ledger.address.is_empty() && ledger.address == address)
+        || state.get_keypair().map(|kp| crate::dao_chat::address_of_key(&kp) == address).unwrap_or(false);
+    if !owner {
+        return Err((-32003, NOT_OWNER.to_string()));
+    }
+    let earnings = crate::commands::earnings::compute_earnings(&state)
+        .await
+        .map_err(|e| (-32603, e.to_string()))?;
+    let compute = crate::commands::compute::get_compute_earnings().await.ok();
+    let who = address.clone();
+    let (drs_score, is_validator) = tokio::task::spawn_blocking(move || {
+        (crate::poc::get_peer_score(&who) as f64, crate::ledger::get_validator_stake(&who) > 0)
+    })
+    .await
+    .map_err(|e| (-32603, e.to_string()))?;
+    Ok(json!({
+        "address": address,
+        "earnings": earnings,
+        "storage_allocated_bytes": ledger.storage_allocated_bytes,
+        "drs_score": drs_score,
+        "is_validator": is_validator,
+        "compute_enabled": ledger.compute_enabled,
+        "compute": compute,
+        "now": now,
+    }))
+}
+
 async fn rpc(ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(body): Json<Value>) -> Response {
     let id = body.get("id").cloned().unwrap_or(Value::Null);
     let method = body.get("method").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -365,6 +480,8 @@ async fn rpc(ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(body): Json<Value>
         "chat.feed" => chat_feed(&params).await,
         "chat.submit" => chat_submit(&params).await,
         "storage.capacity" => storage_capacity().await,
+        "wallet.getRewards" => wallet_rewards(&params).await,
+        "node.earnings" => node_earnings(&params).await,
         "gateway.list" => Ok(json!({ "gateways": share(chrono::Utc::now().timestamp()) })),
         _ => Err((-32601, NOT_HERE.to_string())),
     };
@@ -433,6 +550,7 @@ fn advertise_locally(cert_sha256: &str) -> Result<LocalAdvert, String> {
     let txt = HashMap::from([
         ("v".to_string(), "1".to_string()),
         ("cert".to_string(), cert_sha256.to_string()),
+        ("node".to_string(), crate::ledger::Ledger::load().address),
     ]);
     let info = mdns_sd::ServiceInfo::new(LOCAL_SERVICE, &name, &format!("{name}.local."), (), port(), txt)
         .map_err(|e| e.to_string())?
@@ -862,6 +980,48 @@ mod tests {
         let few = nodes.iter().filter(|n| sampled(n, TABLE_MAX, BOOTSTRAP_SAMPLE)).count();
         assert!((150..350).contains(&few), "{few}");
         assert_eq!(sampled("egot1same", 1_500, GOSSIP_SAMPLE), sampled("egot1same", 1_500, GOSSIP_SAMPLE));
+    }
+
+    #[test]
+    fn an_earnings_request_must_be_signed_recently_by_the_address_it_names() {
+        let now = 1_800_000_000;
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let pk = key.verifying_key().to_bytes();
+        let address = crate::market_chain::address_of(&pk);
+        let request = |address: &str, ts: i64, signer: &SigningKey| {
+            json!({
+                "address": address,
+                "ts": ts,
+                "pubkey": hex::encode(signer.verifying_key().to_bytes()),
+                "sig": hex::encode(signer.sign(&earnings_request_bytes(address, ts)).to_bytes()),
+            })
+        };
+        assert_eq!(signed_by(&request(&address, now, &key), now), Ok(address.clone()));
+        assert_eq!(signed_by(&request(&address, now - CLOCK_SKEW_SECS - 1, &key), now), Err("time"));
+        let stranger = SigningKey::from_bytes(&[8u8; 32]);
+        assert_eq!(signed_by(&request(&address, now, &stranger), now), Err("sig"), "someone else's key can't ask for this address");
+        let mut swapped = request(&address, now, &key);
+        swapped["ts"] = json!(now + 1);
+        assert_eq!(signed_by(&swapped, now), Err("sig"));
+        assert_eq!(
+            earnings_request_bytes("egot1abc", 5),
+            b"ego/node-earnings/v1\negot1abc\n5".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn strangers_cannot_read_this_nodes_earnings() {
+        let now = chrono::Utc::now().timestamp();
+        let stranger = SigningKey::from_bytes(&[9u8; 32]);
+        let address = crate::market_chain::address_of(&stranger.verifying_key().to_bytes());
+        let params = json!({
+            "address": address,
+            "ts": now,
+            "pubkey": hex::encode(stranger.verifying_key().to_bytes()),
+            "sig": hex::encode(stranger.sign(&earnings_request_bytes(&address, now)).to_bytes()),
+        });
+        assert_eq!(node_earnings(&params).await.unwrap_err().1, NOT_OWNER);
+        assert_eq!(wallet_rewards(&json!({ "address": "nope" })).await.unwrap_err().0, -32602);
     }
 
     #[test]

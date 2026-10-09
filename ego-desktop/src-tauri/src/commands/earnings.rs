@@ -13,6 +13,12 @@ use crate::tokenomics::{
 pub async fn get_earnings_data(
     state: State<'_, AppState>,
 ) -> Result<EarningsData, EgoDesktopError> {
+    compute_earnings(&state).await
+}
+
+/// The numbers on the Earnings page. The phone gateway calls this too, so the
+/// owner's iPhone shows exactly what this computer shows.
+pub async fn compute_earnings(state: &AppState) -> Result<EarningsData, EgoDesktopError> {
     let now = chrono::Utc::now().timestamp();
 
     // All blocking I/O in one spawn_blocking call.
