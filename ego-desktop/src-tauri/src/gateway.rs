@@ -598,8 +598,11 @@ async fn public_ipv4(client: &reqwest::Client) -> Option<Ipv4Addr> {
 async fn make_announcement(client: &reqwest::Client, cert_sha256: &str) -> Result<Announcement, String> {
     let ip = public_ipv4(client).await.ok_or("Couldn't find this computer's public internet address.")?;
     let endpoint = format!("https://{ip}:{}/rpc", port());
+    // A headless node never unlocks a wallet, so it signs with the saved seed
+    // the way its P2P announcements do.
     let kp = crate::app::global_app_state()
         .get_keypair()
+        .or_else(crate::p2p::current_wallet_keypair_for_announce)
         .ok_or("Unlock your wallet so the gateway can sign its announcement.")?;
     let ts = chrono::Utc::now().timestamp();
     let pubkey: [u8; 32] = kp.ed25519_public_key().as_bytes()[..32].try_into().map_err(|_| "bad key")?;

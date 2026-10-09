@@ -2932,7 +2932,7 @@ pub(crate) fn current_wallet_announce_keys() -> (String, String) {
     (dilithium_hex, vrf_hex)
 }
 
-fn current_wallet_keypair_for_announce() -> Option<ego_core::KeyPair> {
+pub(crate) fn current_wallet_keypair_for_announce() -> Option<ego_core::KeyPair> {
     if let Some(kp) = crate::app::global_app_state().get_keypair() {
         return Some(kp);
     }
