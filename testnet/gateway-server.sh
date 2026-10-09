@@ -31,6 +31,12 @@ MISSING=$(ldd "$NEW_BIN" | grep 'not found' || true)
 $MISSING"
 
 # ── Swap the binary and set the gateway switches ─────────────────────────────
+# .original is the build from before this script ever ran and is never
+# overwritten; .previous is the last build, put back if this one fails.
+# (The first version of this script only kept .previous, so that's the original.)
+if [ ! -e "$EXE.original" ]; then
+  if [ -e "$EXE.previous" ]; then cp -p "$EXE.previous" "$EXE.original"; else cp -p "$EXE" "$EXE.original"; fi
+fi
 cp -p "$EXE" "$EXE.previous"
 install -m 755 "$NEW_BIN" "$EXE"
 mkdir -p "/etc/systemd/system/$UNIT.d"
@@ -63,7 +69,6 @@ for _ in $(seq 1 30); do
 done
 echo "The gateway didn't answer within two minutes; restoring the previous build." >&2
 install -m 755 "$EXE.previous" "$EXE"
-rm -f "/etc/systemd/system/$UNIT.d/gateway.conf"
 systemctl daemon-reload
 systemctl restart "$UNIT"
 exit 1
