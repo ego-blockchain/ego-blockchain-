@@ -980,7 +980,7 @@ mod tests {
         assert!(!should_announce(false, None, None, "8.8.8.8", None, now));
         assert!(should_announce(false, Some(false), None, "8.8.8.8", Some(now - 60), now), "a manual port forward counts once someone reached it");
         assert!(!should_announce(false, Some(false), None, "8.8.8.8", Some(now - 2 * 3_600), now));
-        assert!(should_announce(true, None, "8.8.8.8", None, now), "a server that says it has a public address is announced");
+        assert!(should_announce(true, None, None, "8.8.8.8", None, now), "a server that says it has a public address is announced");
     }
 
     #[test]
