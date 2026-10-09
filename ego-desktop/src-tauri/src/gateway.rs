@@ -110,6 +110,13 @@ pub fn enabled() -> bool {
     std::env::var("EGO_GATEWAY").as_deref() != Ok("0")
 }
 
+/// Set on a server with its own public address (EGO_GATEWAY_PUBLIC=1). It has
+/// no home router to open a port on, and while it's the only gateway no one
+/// else checks it, so it would otherwise never announce itself.
+fn declared_public() -> bool {
+    std::env::var("EGO_GATEWAY_PUBLIC").as_deref() == Ok("1")
+}
+
 pub fn status() -> GatewayStatus {
     let mut s = STATUS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
     s.enabled = enabled();
@@ -624,7 +631,10 @@ async fn tell_bootstrap(client: &reqwest::Client, a: &Announcement) -> Result<bo
     Ok(reply["listed"].as_bool().unwrap_or(false))
 }
 
-fn should_announce(router_open: Option<bool>, router_ip: Option<&str>, public_ip: &str, reached_at: Option<i64>, now: i64) -> bool {
+fn should_announce(declared: bool, router_open: Option<bool>, router_ip: Option<&str>, public_ip: &str, reached_at: Option<i64>, now: i64) -> bool {
+    if declared {
+        return true;
+    }
     let mapped = router_open == Some(true) && router_ip == Some(public_ip);
     let reached = reached_at.map(|t| now - t < REACHED_FOR_SECS).unwrap_or(false);
     mapped || reached
@@ -656,6 +666,7 @@ async fn announce_once(client: &reqwest::Client, cert_sha256: &str) -> bool {
     let public_ip = parse_endpoint(&a.endpoint).map(|(ip, _)| ip.to_string()).unwrap_or_default();
     let snapshot = status();
     let reachable = should_announce(
+        declared_public(),
         snapshot.router_port_open,
         snapshot.router_public_ip.as_deref(),
         &public_ip,
@@ -963,12 +974,13 @@ mod tests {
     #[test]
     fn only_a_reachable_computer_is_announced() {
         let now = 1_800_000_000;
-        assert!(should_announce(Some(true), Some("8.8.8.8"), "8.8.8.8", None, now));
-        assert!(!should_announce(Some(true), Some("100.64.0.9"), "8.8.8.8", None, now), "a router behind the provider's shared address is not enough");
-        assert!(!should_announce(Some(false), None, "8.8.8.8", None, now));
-        assert!(!should_announce(None, None, "8.8.8.8", None, now));
-        assert!(should_announce(Some(false), None, "8.8.8.8", Some(now - 60), now), "a manual port forward counts once someone reached it");
-        assert!(!should_announce(Some(false), None, "8.8.8.8", Some(now - 2 * 3_600), now));
+        assert!(should_announce(false, Some(true), Some("8.8.8.8"), "8.8.8.8", None, now));
+        assert!(!should_announce(false, Some(true), Some("100.64.0.9"), "8.8.8.8", None, now), "a router behind the provider's shared address is not enough");
+        assert!(!should_announce(false, Some(false), None, "8.8.8.8", None, now));
+        assert!(!should_announce(false, None, None, "8.8.8.8", None, now));
+        assert!(should_announce(false, Some(false), None, "8.8.8.8", Some(now - 60), now), "a manual port forward counts once someone reached it");
+        assert!(!should_announce(false, Some(false), None, "8.8.8.8", Some(now - 2 * 3_600), now));
+        assert!(should_announce(true, None, "8.8.8.8", None, now), "a server that says it has a public address is announced");
     }
 
     #[test]
