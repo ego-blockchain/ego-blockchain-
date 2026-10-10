@@ -156,7 +156,8 @@ mod tests {
         let seed = [7u8; 32];
         let key = crate::derive::secp_privkey(&seed, KEY_PATH);
         let block = BlockRef { ref_block_bytes: [1, 2], ref_block_hash: [3; 8], expiration: 10, timestamp: 5 };
-        let signed = sign_transfer(&key, "TY6pvrSqsNM4cR5vpqvoTW4DPCob4krzip", 2_000_000, &block).unwrap();
+        // TY6pvrSq… is this seed's own address; pay someone else.
+        let signed = sign_transfer(&key, "TNXoiAJ3dct8Fjg4M9fkLFh9S2v9TXc32G", 2_000_000, &block).unwrap();
         let tx = hex::decode(&signed.raw).unwrap();
         let ours = address_bytes(&crate::derive::addr_trx(&seed).unwrap()).unwrap();
         assert!(tx.windows(21).any(|w| w == ours), "owner is our address");

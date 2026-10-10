@@ -341,7 +341,7 @@ mod tests {
         let xrp = sign_transfer(&seed, r#"{"chain":"XRP","to":"rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh","amount":"2","sequence":3,"last_ledger":100,"destination_tag":42}"#).unwrap();
         assert_eq!(xrp["amount_units"], "2000000");
         assert_eq!(xrp["fee"], "12");
-        let trx = sign_transfer(&seed, r#"{"chain":"TRX","to":"TY6pvrSqsNM4cR5vpqvoTW4DPCob4krzip","amount":"1.5","block_number":86976223,"block_id":"00000000052f26df25a3ef2c7e9b9e3a653218ed512e731e280370ebd5bea240","block_time":1791601473000,"now_ms":1791601474000}"#).unwrap();
+        let trx = sign_transfer(&seed, r#"{"chain":"TRX","to":"TNXoiAJ3dct8Fjg4M9fkLFh9S2v9TXc32G","amount":"1.5","block_number":86976223,"block_id":"00000000052f26df25a3ef2c7e9b9e3a653218ed512e731e280370ebd5bea240","block_time":1791601473000,"now_ms":1791601474000}"#).unwrap();
         assert_eq!(trx["amount_units"], "1500000");
         let ada_to = crate::derive::addr_ada(&[8u8; 32]).unwrap();
         let ada = sign_transfer(&seed, &format!(r#"{{"chain":"ADA","to":"{ada_to}","amount":"2","ttl":5,"utxos":[{{"tx_hash":"{}","tx_index":0,"value":9000000}}]}}"#, "cc".repeat(32))).unwrap();
