@@ -339,8 +339,11 @@ async fn fetch_trx_balance(address: &str) -> Result<BalanceResult, String> {
 }
 
 async fn fetch_ada_balance(address: &str) -> Result<BalanceResult, String> {
-    let url = format!("https://api.koios.rest/api/v1/address_info?_address={address}");
-    let json: serde_json::Value = http_client().get(&url).send().await
+    // Koios takes these queries only as POSTs now; the GET form answers 404.
+    let json: serde_json::Value = http_client()
+        .post("https://api.koios.rest/api/v1/address_info")
+        .json(&serde_json::json!({ "_addresses": [address] }))
+        .send().await
         .map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
 
     let lovelace: u64 = json.as_array()
@@ -360,11 +363,9 @@ async fn fetch_ada_balance(address: &str) -> Result<BalanceResult, String> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn fetch_ada_txs(address: &str) -> Result<Vec<ExternalTx>, String> {
-    let url = format!(
-        "https://api.koios.rest/api/v1/address_txs?_address={address}&_after_block_height=0"
-    );
     let json: serde_json::Value = http_client()
-        .get(&url)
+        .post("https://api.koios.rest/api/v1/address_txs")
+        .json(&serde_json::json!({ "_addresses": [address], "_after_block_height": 0 }))
         .header("accept", "application/json")
         .send().await
         .map_err(|e| e.to_string())?
@@ -916,11 +917,17 @@ async fn send_ada_tx(seed: &[u8], to_address: &str, lovelace: u64) -> Result<Str
     let ttl = current_slot + 7_200; // ~2 hours
 
     // Fetch UTxOs
-    let utxo_url = format!("https://api.koios.rest/api/v1/address_utxos?_address={from_addr}");
-    let utxos_json: serde_json::Value = http_client().get(&utxo_url)
+    let utxos_json: serde_json::Value = http_client()
+        .post("https://api.koios.rest/api/v1/address_utxos")
+        .json(&serde_json::json!({ "_addresses": [&from_addr] }))
         .send().await.map_err(|e| e.to_string())?
         .json().await.map_err(|e| e.to_string())?;
-    let utxos = utxos_json.as_array().cloned().unwrap_or_default();
+    // A coin carrying native tokens can't be spent without passing them on,
+    // which this transfer doesn't do, so leave those coins alone.
+    let utxos: Vec<serde_json::Value> = utxos_json.as_array().cloned().unwrap_or_default()
+        .into_iter()
+        .filter(|u| u["asset_list"].as_array().map_or(true, |a| a.is_empty()))
+        .collect();
     if utxos.is_empty() {
         return Err("No UTxOs found — make sure ADA has been sent to your address first".into());
     }

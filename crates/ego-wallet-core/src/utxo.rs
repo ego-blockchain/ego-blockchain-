@@ -35,10 +35,20 @@ pub const LITECOIN: Network = Network {
     p2sh_versions: &[0x32, 0x05],
 };
 
+/// Dogecoin has no segwit: the wallet's address is P2PKH and spends are legacy.
+pub const DOGECOIN: Network = Network {
+    symbol: "DOGE",
+    key_path: "ego:dogecoin:0",
+    hrp: "",
+    p2pkh_versions: &[0x1e],
+    p2sh_versions: &[0x16],
+};
+
 pub fn network(symbol: &str) -> Option<Network> {
     match symbol {
         "BTC" => Some(BITCOIN),
         "LTC" => Some(LITECOIN),
+        "DOGE" => Some(DOGECOIN),
         _ => None,
     }
 }
@@ -81,8 +91,9 @@ fn varint(n: u64) -> Vec<u8> {
 /// The locking script for an address of `net`: P2WPKH, P2WSH, P2TR, P2PKH or P2SH.
 pub fn output_script(address: &str, net: Network) -> Result<Vec<u8>, String> {
     let address = address.trim();
-    let wrong = || format!("That isn't a {} address.", if net.symbol == "BTC" { "Bitcoin" } else { "Litecoin" });
-    if address.to_lowercase().starts_with(&format!("{}1", net.hrp)) {
+    let name = match net.symbol { "BTC" => "Bitcoin", "LTC" => "Litecoin", _ => "Dogecoin" };
+    let wrong = || format!("That isn't a {name} address.");
+    if !net.hrp.is_empty() && address.to_lowercase().starts_with(&format!("{}1", net.hrp)) {
         let (hrp, data, variant) = bech32::decode(address).map_err(|_| wrong())?;
         if hrp != net.hrp || data.is_empty() {
             return Err(wrong());
@@ -254,6 +265,111 @@ pub fn sign_p2wpkh(privkey: &[u8; 32], net: Network, to: &str, amount: u64, utxo
     Ok(Signed { raw: hex::encode(raw), txid: hex::encode(txid), fee, change, inputs: chosen.len() })
 }
 
+/// Dogecoin's dust and minimum fee: 0.01 DOGE, and 0.01 DOGE per started kilobyte.
+pub const DOGE_DUST: u64 = 1_000_000;
+
+/// Bytes of a legacy transaction with `inputs` P2PKH inputs and two outputs.
+pub fn legacy_size(inputs: usize) -> u64 {
+    inputs as u64 * 148 + 2 * 34 + 10
+}
+
+pub fn doge_fee(inputs: usize) -> u64 {
+    legacy_size(inputs).div_ceil(1000) * DOGE_DUST
+}
+
+/// Signs a Dogecoin transfer from the wallet's P2PKH address (legacy sighash),
+/// as Ego Desktop's send_doge_tx does, with the fee scaled to the size.
+pub fn sign_doge(privkey: &[u8; 32], to: &str, amount: u64, utxos: &[Utxo]) -> Result<Signed, String> {
+    if amount < DOGE_DUST {
+        return Err("The smallest amount Dogecoin relays is 0.01 DOGE.".into());
+    }
+    let to_script = output_script(to, DOGECOIN)?;
+    let key = SigningKey::from_slice(privkey).map_err(|e| e.to_string())?;
+    let pubkey = key.verifying_key().to_encoded_point(true);
+    let mut own_script = vec![0x76, 0xa9, 0x14];
+    own_script.extend_from_slice(&crate::derive::hash160(pubkey.as_bytes()));
+    own_script.extend_from_slice(&[0x88, 0xac]);
+
+    let mut sorted: Vec<&Utxo> = utxos.iter().collect();
+    sorted.sort_by(|a, b| b.value.cmp(&a.value).then(a.txid.cmp(&b.txid)).then(a.vout.cmp(&b.vout)));
+    let mut chosen = Vec::new();
+    let mut total = 0u64;
+    let mut fee = doge_fee(1);
+    for u in sorted {
+        chosen.push(u);
+        total = total.saturating_add(u.value);
+        fee = doge_fee(chosen.len());
+        if total >= amount.saturating_add(fee) {
+            break;
+        }
+    }
+    if total < amount.saturating_add(fee) {
+        return Err(format!("Not enough to cover this and the network fee of {} DOGE.", fee as f64 / 1e8));
+    }
+    let mut change = total - amount - fee;
+    if change < DOGE_DUST {
+        fee += change;
+        change = 0;
+    }
+
+    let mut outpoints = Vec::new();
+    for u in &chosen {
+        let mut txid = hex::decode(&u.txid).map_err(|_| "A coin's txid isn't hex.")?;
+        if txid.len() != 32 {
+            return Err("A coin's txid isn't 32 bytes.".into());
+        }
+        txid.reverse();
+        txid.extend_from_slice(&u.vout.to_le_bytes());
+        outpoints.push(txid);
+    }
+    let mut outputs = Vec::new();
+    for (value, script) in [(amount, &to_script), (change, &own_script)] {
+        if value == 0 {
+            continue;
+        }
+        outputs.extend_from_slice(&value.to_le_bytes());
+        outputs.extend(varint(script.len() as u64));
+        outputs.extend_from_slice(script);
+    }
+    let output_count: u64 = if change > 0 { 2 } else { 1 };
+    let serialize = |script_sigs: &[Vec<u8>]| {
+        let mut t = Vec::new();
+        t.extend_from_slice(&1u32.to_le_bytes());
+        t.extend(varint(outpoints.len() as u64));
+        for (outpoint, script) in outpoints.iter().zip(script_sigs) {
+            t.extend_from_slice(outpoint);
+            t.extend(varint(script.len() as u64));
+            t.extend_from_slice(script);
+            t.extend_from_slice(&[0xff; 4]);
+        }
+        t.extend(varint(output_count));
+        t.extend_from_slice(&outputs);
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t
+    };
+
+    let mut script_sigs = Vec::new();
+    for i in 0..outpoints.len() {
+        let template: Vec<Vec<u8>> = (0..outpoints.len()).map(|j| if i == j { own_script.clone() } else { Vec::new() }).collect();
+        let mut preimage = serialize(&template);
+        preimage.extend_from_slice(&1u32.to_le_bytes());
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        let sig: k256::ecdsa::Signature = key.sign_prehash(&sha256d(&preimage)).map_err(|e| e.to_string())?;
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let mut der = sig.to_der().as_bytes().to_vec();
+        der.push(0x01);
+        let mut script_sig = vec![der.len() as u8];
+        script_sig.extend_from_slice(&der);
+        script_sig.push(pubkey.as_bytes().len() as u8);
+        script_sig.extend_from_slice(pubkey.as_bytes());
+        script_sigs.push(script_sig);
+    }
+    let raw = serialize(&script_sigs);
+    let mut txid = sha256d(&raw);
+    txid.reverse();
+    Ok(Signed { raw: hex::encode(raw), txid: hex::encode(txid), fee, change, inputs: chosen.len() })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +487,50 @@ mod tests {
         let pubkey = SigningKey::from_slice(&key).unwrap().verifying_key().to_encoded_point(true);
         let expected = [&[0x00, 0x14][..], &crate::derive::hash160(pubkey.as_bytes())].concat();
         assert_eq!(output_script(&ours, BITCOIN).unwrap(), expected);
+    }
+
+    #[test]
+    fn a_dogecoin_send_verifies_with_the_legacy_sighash() {
+        let key = [9u8; 32];
+        let doge_coins = vec![
+            Utxo { txid: "aa".repeat(32), vout: 0, value: 5_000_000_000 },
+            Utxo { txid: "bb".repeat(32), vout: 2, value: 300_000_000 },
+        ];
+        let to = crate::derive::base58check(0x1e, &[4u8; 20]);
+        let signed = sign_doge(&key, &to, 5_200_000_000, &doge_coins).unwrap();
+        let tx: Transaction = deserialize(&hex::decode(&signed.raw).unwrap()).unwrap();
+        assert_eq!(tx.input.len(), 2);
+        assert_eq!(signed.fee, doge_fee(2));
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(&key).unwrap();
+        let pk = bitcoin::PublicKey::new(bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &sk));
+        let spk = ScriptBuf::new_p2pkh(&pk.pubkey_hash());
+        let cache = SighashCache::new(&tx);
+        for (i, input) in tx.input.iter().enumerate() {
+            let hash = cache.legacy_signature_hash(i, &spk, 1).unwrap();
+            let pushes: Vec<_> = input.script_sig.instructions().map(|i| i.unwrap().push_bytes().unwrap().as_bytes().to_vec()).collect();
+            let der = &pushes[0][..pushes[0].len() - 1];
+            let sig = bitcoin::secp256k1::ecdsa::Signature::from_der(der).unwrap();
+            secp.verify_ecdsa(&bitcoin::secp256k1::Message::from_digest(hash.to_byte_array()), &sig, &pk.inner).expect("signature verifies");
+            assert_eq!(pushes[1], pk.to_bytes());
+        }
+        assert_eq!(tx.compute_txid().to_string(), signed.txid);
+        assert_eq!(tx.output[0].script_pubkey.as_bytes(), output_script(&to, DOGECOIN).unwrap().as_slice());
+    }
+
+    #[test]
+    fn dogecoin_addresses_are_checked() {
+        let p2pkh = crate::derive::base58check(0x1e, &[4u8; 20]);
+        let p2sh = crate::derive::base58check(0x16, &[5u8; 20]);
+        assert!(output_script(&p2pkh, DOGECOIN).is_ok());
+        assert_eq!(output_script(&p2sh, DOGECOIN).unwrap()[0], 0xa9);
+        assert_eq!(crate::derive::addr_doge(&[7u8; 32]).map(|a| output_script(&a, DOGECOIN).is_ok()), Ok(true));
+        let mut typo = p2pkh.clone().into_bytes();
+        typo[5] = if typo[5] == b'a' { b'b' } else { b'a' };
+        assert!(output_script(std::str::from_utf8(&typo).unwrap(), DOGECOIN).is_err(), "checksum");
+        assert!(output_script("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", DOGECOIN).is_err());
+        assert!(output_script("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", DOGECOIN).is_err());
+        assert!(sign_doge(&[9u8; 32], &p2pkh, 999_999, &[]).is_err(), "below dust");
     }
 
     use std::str::FromStr;

@@ -25,6 +25,14 @@ char *ego_wallet_sign_evm(const uint8_t *seed, size_t seed_len, const char *requ
    "change", "inputs", "amount_units"}. Nothing is sent. */
 char *ego_wallet_sign_utxo(const uint8_t *seed, size_t seed_len, const char *request);
 
+/* Signs a Solana, XRP, Tron or Cardano transfer. request is JSON with "chain",
+   "to", "amount" and what that chain needs: SOL {"recent_blockhash"}; XRP
+   {"sequence", "last_ledger", "destination_tag"?}; TRX {"block_number",
+   "block_id", "block_time", "now_ms"}; ADA {"utxos": [{"tx_hash", "tx_index",
+   "value"}], "ttl"}. Returns {"raw", "hash", "from", "fee", "change",
+   "amount_units"}. Nothing is sent. Dogecoin goes through ego_wallet_sign_utxo. */
+char *ego_wallet_sign_transfer(const uint8_t *seed, size_t seed_len, const char *request);
+
 void ego_wallet_string_free(char *s);
 
 #endif
