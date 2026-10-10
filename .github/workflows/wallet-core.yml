@@ -69,6 +69,13 @@ jobs:
     env:
       IPHONEOS_DEPLOYMENT_TARGET: '17.0'
       MACOSX_DEPLOYMENT_TARGET: '14.0'
+      # Small enough to keep in the app's repository: one optimised object per
+      # slice instead of every crate's code and debug info.
+      CARGO_PROFILE_RELEASE_LTO: 'true'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '1'
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: 'z'
+      CARGO_PROFILE_RELEASE_DEBUG: 'false'
+      CARGO_PROFILE_RELEASE_PANIC: 'abort'
     steps:
       - uses: actions/checkout@v4
 
@@ -88,6 +95,9 @@ jobs:
         run: |
           set -e
           lib=libego_wallet_core.a
+          for t in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin x86_64-apple-darwin; do
+            strip -S -x target/$t/release/$lib
+          done
           mkdir -p out/ios-sim out/macos
           lipo -create target/aarch64-apple-ios-sim/release/$lib target/x86_64-apple-ios/release/$lib -output out/ios-sim/$lib
           lipo -create target/aarch64-apple-darwin/release/$lib target/x86_64-apple-darwin/release/$lib -output out/macos/$lib
@@ -98,6 +108,7 @@ jobs:
             -output out/EgoWalletCore.xcframework
           cd out && zip -qry EgoWalletCore.xcframework.zip EgoWalletCore.xcframework
           ls -la EgoWalletCore.xcframework.zip
+          du -sh EgoWalletCore.xcframework
 
       - uses: actions/upload-artifact@v4
         with:
