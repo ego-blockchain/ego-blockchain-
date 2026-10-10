@@ -280,6 +280,7 @@ fn cost(method: &str) -> f64 {
         "tx.submit" | "chat.submit" => 20.0,
         "chat.feed" | "node.earnings" => 4.0,
         "wallet.getRewards" => 2.0,
+        "wallet.getCredits" => 1.0,
         _ => 1.0,
     }
 }
@@ -404,6 +405,24 @@ async fn wallet_rewards(params: &Value) -> Result<Value, (i32, String)> {
     Ok(summary)
 }
 
+/// EGUSD credits held by an address. One credit is one cent. Anyone may ask:
+/// the mints and payments behind it are public transactions.
+async fn wallet_credits(params: &Value) -> Result<Value, (i32, String)> {
+    let address = params["address"].as_str().unwrap_or_default().trim().to_string();
+    if !crate::dao_chat::is_address(&address) {
+        return Err((-32602, "That isn't an Ego address.".to_string()));
+    }
+    let credits = tokio::task::spawn_blocking(move || crate::chain_db::credits_balance(&address))
+        .await
+        .map_err(|e| (-32603, e.to_string()))?;
+    Ok(json!({
+        "credits": credits,
+        "micro_usd_per_credit": crate::chain_db::MICRO_USD_PER_CREDIT,
+        "burn_address": crate::chain_db::CREDITS_BURN_ADDR,
+        "price_tolerance_pct": crate::chain_db::CREDITS_PRICE_TOLERANCE_PCT,
+    }))
+}
+
 pub fn earnings_request_bytes(address: &str, ts: i64) -> Vec<u8> {
     format!("{EARNINGS_DOMAIN}\n{address}\n{ts}").into_bytes()
 }
@@ -488,6 +507,7 @@ async fn rpc(ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(body): Json<Value>
         "chat.submit" => chat_submit(&params).await,
         "storage.capacity" => storage_capacity().await,
         "wallet.getRewards" => wallet_rewards(&params).await,
+        "wallet.getCredits" => wallet_credits(&params).await,
         "node.earnings" => node_earnings(&params).await,
         "gateway.list" => Ok(json!({ "gateways": share(chrono::Utc::now().timestamp()) })),
         _ => Err((-32601, NOT_HERE.to_string())),
@@ -1037,6 +1057,7 @@ mod tests {
         });
         assert_eq!(node_earnings(&params).await.unwrap_err().1, NOT_OWNER);
         assert_eq!(wallet_rewards(&json!({ "address": "nope" })).await.unwrap_err().0, -32602);
+        assert_eq!(wallet_credits(&json!({ "address": "nope" })).await.unwrap_err().0, -32602);
     }
 
     #[test]
