@@ -33,6 +33,21 @@ char *ego_wallet_sign_utxo(const uint8_t *seed, size_t seed_len, const char *req
    "amount_units"}. Nothing is sent. Dogecoin goes through ego_wallet_sign_utxo. */
 char *ego_wallet_sign_transfer(const uint8_t *seed, size_t seed_len, const char *request);
 
+/* Writes a pre-sale IOU file exactly as Ego Desktop does. request is JSON:
+   {"kind": "crypto"|"stripe", "mainnet_address", "testnet_address", "password",
+   "now", and for crypto "pay_symbol", "pay_amount", "pay_usd_price",
+   "presale_price", for stripe "session_id", "egoc_amount", "usd_amount"}.
+   Returns the IOU file's JSON. */
+char *ego_wallet_presale_iou(const char *request);
+
+/* The allocation record inside an IOU file, given its password. */
+char *ego_wallet_presale_open(const char *iou, const char *password);
+
+/* Shielded EGOC as in Ego Desktop. kind is "notes", "values", "deposit" or
+   "unshield"; see ego_wallet_shielded in src/ffi.rs for each request and
+   answer. Proving a withdrawal takes a second or more. Nothing is sent. */
+char *ego_wallet_shielded(const char *kind, const uint8_t *seed, size_t seed_len, const char *request);
+
 void ego_wallet_string_free(char *s);
 
 #endif

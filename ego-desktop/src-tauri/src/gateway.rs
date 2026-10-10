@@ -281,6 +281,8 @@ fn cost(method: &str) -> f64 {
         "chat.feed" | "node.earnings" => 4.0,
         "wallet.getRewards" => 2.0,
         "wallet.getCredits" => 1.0,
+        "shielded.lookup" => 2.0,
+        "shielded.leaves" => 4.0,
         _ => 1.0,
     }
 }
@@ -405,6 +407,57 @@ async fn wallet_rewards(params: &Value) -> Result<Value, (i32, String)> {
     Ok(summary)
 }
 
+const SHIELDED_LOOKUP_MAX: usize = 500;
+const SHIELDED_LEAVES_MAX: usize = 5_000;
+
+fn hex32_list(params: &Value, field: &str) -> Result<Vec<[u8; 32]>, (i32, String)> {
+    let list = params[field].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if list.len() > SHIELDED_LOOKUP_MAX {
+        return Err((-32602, format!("At most {SHIELDED_LOOKUP_MAX} {field} per request.")));
+    }
+    list.iter()
+        .map(|v| {
+            hex::decode(v.as_str().unwrap_or_default())
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .ok_or((-32602, format!("{field} must be 32 hex bytes each.")))
+        })
+        .collect()
+}
+
+/// For the phone's shielded notes: where each commitment sits in the pool, and
+/// whether each nullifier has been spent. Both are public chain state.
+async fn shielded_lookup(params: &Value) -> Result<Value, (i32, String)> {
+    let commitments = hex32_list(params, "commitments")?;
+    let nullifiers = hex32_list(params, "nullifiers")?;
+    tokio::task::spawn_blocking(move || {
+        json!({
+            "leaf_indexes": commitments.iter().map(|c| crate::shielded_chain::leaf_index_of(c)).collect::<Vec<_>>(),
+            "spent": nullifiers.iter().map(|n| crate::shielded_chain::is_nullifier_spent(n)).collect::<Vec<_>>(),
+        })
+    })
+    .await
+    .map_err(|e| (-32603, e.to_string()))
+}
+
+/// A page of the shielded pool's leaves, which a withdrawal proves against,
+/// with the fee a withdrawal pays now.
+async fn shielded_leaves(params: &Value) -> Result<Value, (i32, String)> {
+    let from = params["from"].as_u64().unwrap_or(0);
+    let limit = (params["limit"].as_u64().unwrap_or(SHIELDED_LEAVES_MAX as u64) as usize).min(SHIELDED_LEAVES_MAX);
+    tokio::task::spawn_blocking(move || {
+        let leaves = crate::shielded_chain::leaves_from(from, limit);
+        json!({
+            "from": from,
+            "leaves": leaves.iter().map(hex::encode).collect::<Vec<_>>(),
+            "next_index": crate::shielded_chain::state().next_index,
+            "fee_uegoc": crate::commands::shielded::current_fee(),
+        })
+    })
+    .await
+    .map_err(|e| (-32603, e.to_string()))
+}
+
 /// EGUSD credits held by an address. One credit is one cent. Anyone may ask:
 /// the mints and payments behind it are public transactions.
 async fn wallet_credits(params: &Value) -> Result<Value, (i32, String)> {
@@ -508,6 +561,8 @@ async fn rpc(ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(body): Json<Value>
         "storage.capacity" => storage_capacity().await,
         "wallet.getRewards" => wallet_rewards(&params).await,
         "wallet.getCredits" => wallet_credits(&params).await,
+        "shielded.lookup" => shielded_lookup(&params).await,
+        "shielded.leaves" => shielded_leaves(&params).await,
         "node.earnings" => node_earnings(&params).await,
         "gateway.list" => Ok(json!({ "gateways": share(chrono::Utc::now().timestamp()) })),
         _ => Err((-32601, NOT_HERE.to_string())),
@@ -1058,6 +1113,9 @@ mod tests {
         assert_eq!(node_earnings(&params).await.unwrap_err().1, NOT_OWNER);
         assert_eq!(wallet_rewards(&json!({ "address": "nope" })).await.unwrap_err().0, -32602);
         assert_eq!(wallet_credits(&json!({ "address": "nope" })).await.unwrap_err().0, -32602);
+        let too_many: Vec<String> = (0..SHIELDED_LOOKUP_MAX + 1).map(|_| "00".repeat(32)).collect();
+        assert_eq!(shielded_lookup(&json!({ "commitments": too_many })).await.unwrap_err().0, -32602);
+        assert_eq!(shielded_lookup(&json!({ "nullifiers": ["zz"] })).await.unwrap_err().0, -32602);
     }
 
     #[test]

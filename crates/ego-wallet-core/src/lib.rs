@@ -8,6 +8,8 @@ pub mod cardano;
 pub mod derive;
 pub mod evm;
 pub mod ffi;
+pub mod presale;
+pub mod shielded;
 pub mod solana;
 pub mod tron;
 pub mod utxo;

@@ -55,7 +55,9 @@ pub fn recipient_digest(address: &str) -> [u8; 32] {
 
 pub const NOTE_DOMAIN_DESKTOP: &str = "desktop";
 pub const NOTE_DOMAIN_EXTENSION: &str = "ext";
-pub const NOTE_DOMAINS: [&str; 2] = [NOTE_DOMAIN_DESKTOP, NOTE_DOMAIN_EXTENSION];
+/// The iPhone wallet's notes (ego-wallet-core), so a restored desktop finds them too.
+pub const NOTE_DOMAIN_IOS: &str = "ios";
+pub const NOTE_DOMAINS: [&str; 3] = [NOTE_DOMAIN_DESKTOP, NOTE_DOMAIN_EXTENSION, NOTE_DOMAIN_IOS];
 pub const NOTE_RECOVERY_GAP: u32 = 20;
 
 pub fn derive_note(seed: &[u8], domain: &str, index: u32, value_uegoc: u64) -> Note {
@@ -824,5 +826,50 @@ mod tests {
             verify_proof_bytes(&w.proof, w.root, w.nullifier, w.amount_uegoc, w.recipient, w.fee_uegoc),
             "proving and verifying take no key material at all"
         );
+    }
+}
+
+#[cfg(test)]
+mod wallet_core_agreement {
+    use super::*;
+
+    /// The iPhone derives notes, reads their values and hashes withdrawals with
+    /// ego-wallet-core; it must match this file or the phone can't find or
+    /// spend notes made here, and the other way round.
+    #[test]
+    fn ego_wallet_core_derives_the_same_notes() {
+        for seed in [[0u8; 32], [7u8; 32], [0xa5u8; 32]] {
+            for domain in NOTE_DOMAINS {
+                for index in [0u32, 1, 19, 1000] {
+                    let ours = derive_note(&seed, domain, index, DENOMINATIONS_UEGOC[2]);
+                    let (c, nf) = ego_wallet_core::shielded::note_ids(&seed, domain, index).unwrap();
+                    assert_eq!(c, ours.commitment());
+                    assert_eq!(nf, ours.nullifier());
+                    assert_eq!(ego_wallet_core::shielded::value_of(&c, &ours.leaf()), Some(DENOMINATIONS_UEGOC[2]));
+                }
+            }
+        }
+        assert_eq!(ego_wallet_core::shielded::recipient_digest("egot1abc"), recipient_digest("egot1abc"));
+        assert_eq!(ego_wallet_core::shielded::denominate(12_345_678), denominate(12_345_678));
+        let body = crate::shielded_chain::UnshieldBody {
+            spends: vec![crate::shielded_chain::UnshieldSpend {
+                root: "aa".repeat(32), nullifier: "bb".repeat(32), amount_uegoc: 10_000_000, fee_uegoc: 1_000, proof: "cc".into(),
+            }],
+            recipient: "egot1abc".into(),
+            amount_uegoc: 10_000_000,
+            fee_uegoc: 1_000,
+        };
+        let theirs = ego_wallet_core::shielded::UnshieldBody {
+            spends: vec![ego_wallet_core::shielded::UnshieldSpend {
+                root: "aa".repeat(32), nullifier: "bb".repeat(32), amount_uegoc: 10_000_000, fee_uegoc: 1_000, proof: "cc".into(),
+            }],
+            recipient: "egot1abc".into(),
+            amount_uegoc: 10_000_000,
+            fee_uegoc: 1_000,
+        };
+        assert_eq!(theirs.canonical_json(), body.canonical_json());
+        assert_eq!(theirs.tx_hash(), body.tx_hash());
+        assert_eq!(ego_wallet_core::shielded::shield_memo(&[1u8; 32]), crate::shielded_chain::shield_memo(&[1u8; 32]));
+        assert_eq!(ego_wallet_core::shielded::POOL_ADDRESS, crate::shielded_chain::SHIELDED_POOL_ADDR);
     }
 }

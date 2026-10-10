@@ -253,6 +253,199 @@ pub unsafe extern "C" fn ego_wallet_sign_transfer(seed: *const u8, seed_len: usi
     }
 }
 
+#[derive(serde::Deserialize)]
+struct IouRequest {
+    kind: String,
+    mainnet_address: String,
+    testnet_address: String,
+    password: String,
+    now: i64,
+    pay_symbol: Option<String>,
+    pay_amount: Option<f64>,
+    pay_usd_price: Option<f64>,
+    presale_price: Option<f64>,
+    session_id: Option<String>,
+    egoc_amount: Option<f64>,
+    usd_amount: Option<f64>,
+}
+
+fn presale_iou(request: &str) -> Result<serde_json::Value, String> {
+    use crate::presale;
+    let r: IouRequest = serde_json::from_str(request).map_err(|e| format!("Bad request: {e}"))?;
+    let buyer = presale::Buyer { mainnet_address: &r.mainnet_address, testnet_address: &r.testnet_address };
+    let need = |v: Option<f64>, what: &str| v.ok_or_else(|| format!("Missing {what}."));
+    match r.kind.as_str() {
+        "crypto" => presale::crypto_iou(
+            &buyer,
+            r.pay_symbol.as_deref().ok_or("Missing coin.")?,
+            need(r.pay_amount, "amount")?,
+            need(r.pay_usd_price, "coin price")?,
+            need(r.presale_price, "pre-sale price")?,
+            &r.password,
+            r.now,
+        ),
+        "stripe" => presale::stripe_iou(
+            &buyer,
+            r.session_id.as_deref().ok_or("Missing session.")?,
+            need(r.egoc_amount, "EGOC amount")?,
+            need(r.usd_amount, "USD amount")?,
+            &r.password,
+            r.now,
+        ),
+        _ => Err("Unknown kind.".into()),
+    }
+}
+
+/// Writes a pre-sale IOU exactly as Ego Desktop does. `request` is JSON:
+/// {kind: "crypto"|"stripe", mainnet_address, testnet_address, password, now,
+/// crypto: pay_symbol, pay_amount, pay_usd_price, presale_price; stripe:
+/// session_id, egoc_amount, usd_amount}. Returns the IOU file's JSON.
+///
+/// # Safety
+/// `request` must be a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn ego_wallet_presale_iou(request: *const c_char) -> *mut c_char {
+    if request.is_null() {
+        return error("No request.");
+    }
+    match presale_iou(&std::ffi::CStr::from_ptr(request).to_string_lossy()) {
+        Ok(v) => to_c(v),
+        Err(e) => error(&e),
+    }
+}
+
+/// The allocation record inside an IOU file, given its password.
+///
+/// # Safety
+/// Both arguments must be NUL-terminated strings.
+#[no_mangle]
+pub unsafe extern "C" fn ego_wallet_presale_open(iou: *const c_char, password: *const c_char) -> *mut c_char {
+    if iou.is_null() || password.is_null() {
+        return error("No IOU.");
+    }
+    let iou = std::ffi::CStr::from_ptr(iou).to_string_lossy();
+    let password = std::ffi::CStr::from_ptr(password).to_string_lossy();
+    let parsed: serde_json::Value = match serde_json::from_str(&iou) {
+        Ok(v) => v,
+        Err(e) => return error(&format!("Invalid IOU file: {e}")),
+    };
+    match crate::presale::open_iou(&parsed, &password) {
+        Ok(v) => to_c(v),
+        Err(e) => error(&e),
+    }
+}
+
+fn bytes32(hex_str: &str) -> Result<[u8; 32], String> {
+    hex::decode(hex_str).ok().and_then(|v| v.try_into().ok()).ok_or_else(|| "Not 32 hex bytes.".to_string())
+}
+
+#[derive(serde::Deserialize)]
+struct NotesRequest {
+    domain: String,
+    from: u32,
+    count: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct ValuesRequest {
+    /// [commitment, leaf] pairs, hex.
+    pairs: Vec<(String, String)>,
+}
+
+#[derive(serde::Deserialize)]
+struct DepositRequest {
+    amount_uegoc: u64,
+    start_index: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct UnshieldRequest {
+    leaves: Vec<String>,
+    spends: Vec<crate::shielded::Spend>,
+    recipient: String,
+    fee_uegoc: u64,
+}
+
+fn shielded_call(kind: &str, seed: &[u8], request: &str) -> Result<serde_json::Value, String> {
+    use crate::shielded;
+    let bad = |e: serde_json::Error| format!("Bad request: {e}");
+    match kind {
+        "notes" => {
+            let r: NotesRequest = serde_json::from_str(request).map_err(bad)?;
+            if !shielded::DOMAINS.contains(&r.domain.as_str()) || r.count > 500 {
+                return Err("Bad note range.".into());
+            }
+            let mut out = Vec::new();
+            for index in r.from..r.from.saturating_add(r.count) {
+                let (c, nf) = shielded::note_ids(seed, &r.domain, index)?;
+                out.push(serde_json::json!({ "index": index, "commitment": hex::encode(c), "nullifier": hex::encode(nf) }));
+            }
+            Ok(serde_json::Value::Array(out))
+        }
+        "values" => {
+            let r: ValuesRequest = serde_json::from_str(request).map_err(bad)?;
+            let mut out = Vec::new();
+            for (c, l) in &r.pairs {
+                out.push(serde_json::json!(shielded::value_of(&bytes32(c)?, &bytes32(l)?)));
+            }
+            Ok(serde_json::Value::Array(out))
+        }
+        "deposit" => {
+            let r: DepositRequest = serde_json::from_str(request).map_err(bad)?;
+            let (values, remainder) = shielded::denominate(r.amount_uegoc);
+            if values.is_empty() {
+                return Err("Shield at least 1 EGOC; notes come in fixed sizes.".into());
+            }
+            let mut notes = Vec::new();
+            for (i, value) in values.iter().enumerate() {
+                let index = r.start_index.checked_add(i as u32).ok_or("No note index is left.")?;
+                let (c, _) = shielded::note_ids(seed, shielded::PHONE_DOMAIN, index)?;
+                notes.push(serde_json::json!({
+                    "value_uegoc": value, "index": index, "commitment": hex::encode(c), "memo": shielded::shield_memo(&c),
+                }));
+            }
+            Ok(serde_json::json!({ "notes": notes, "remainder_uegoc": remainder, "to": shielded::POOL_ADDRESS, "tx_type": shielded::TX_SHIELD }))
+        }
+        "unshield" => {
+            let r: UnshieldRequest = serde_json::from_str(request).map_err(bad)?;
+            let leaves = r.leaves.iter().map(|l| bytes32(l)).collect::<Result<Vec<_>, _>>()?;
+            let body = shielded::unshield(seed, &leaves, &r.spends, &r.recipient, r.fee_uegoc)?;
+            Ok(serde_json::json!({
+                "hash": body.tx_hash(), "call_args": body.canonical_json(), "from": shielded::POOL_ADDRESS,
+                "to": r.recipient, "amount_uegoc": body.amount_uegoc, "fee_uegoc": body.fee_uegoc, "tx_type": shielded::TX_UNSHIELD,
+            }))
+        }
+        _ => Err("Unknown call.".into()),
+    }
+}
+
+/// Shielded EGOC as in Ego Desktop. `kind` is "notes" ({domain, from, count}
+/// → [{index, commitment, nullifier}]), "values" ({pairs: [[commitment,
+/// leaf]]} → [value or null]), "deposit" ({amount_uegoc, start_index} →
+/// {notes: [{value_uegoc, index, commitment, memo}], remainder_uegoc, to,
+/// tx_type}, phone domain) or "unshield" ({leaves, spends: [{domain, index,
+/// value_uegoc, leaf_index}], recipient, fee_uegoc} → {hash, call_args, from,
+/// to, amount_uegoc, fee_uegoc, tx_type}, with STARK proofs). Nothing is sent.
+///
+/// # Safety
+/// `seed` must point to `seed_len` readable bytes; `kind` and `request` must be
+/// NUL-terminated strings.
+#[no_mangle]
+pub unsafe extern "C" fn ego_wallet_shielded(kind: *const c_char, seed: *const u8, seed_len: usize, request: *const c_char) -> *mut c_char {
+    let Some(seed) = seed_from(seed, seed_len) else {
+        return error("The seed must be 32 bytes.");
+    };
+    if kind.is_null() || request.is_null() {
+        return error("No request.");
+    }
+    let kind = std::ffi::CStr::from_ptr(kind).to_string_lossy();
+    let request = std::ffi::CStr::from_ptr(request).to_string_lossy();
+    match shielded_call(&kind, seed, &request) {
+        Ok(v) => to_c(v),
+        Err(e) => error(&e),
+    }
+}
+
 /// Frees a string returned by this library.
 ///
 /// # Safety
@@ -352,6 +545,20 @@ mod tests {
         let doge = sign_utxo(&seed, &format!(r#"{{"chain":"DOGE","to":"{doge_to}","amount":"5","fee_rate":1,"utxos":[{{"txid":"{}","vout":0,"value":2000000000}}]}}"#, "dd".repeat(32))).unwrap();
         assert_eq!(doge["from"], crate::derive::addr_doge(&seed).unwrap());
         assert_eq!(doge["fee"], "1000000");
+    }
+
+    #[test]
+    fn shielded_calls_round_trip() {
+        let seed = [7u8; 32];
+        let notes = shielded_call("notes", &seed, r#"{"domain":"ios","from":0,"count":3}"#).unwrap();
+        assert_eq!(notes.as_array().unwrap().len(), 3);
+        let deposit = shielded_call("deposit", &seed, r#"{"amount_uegoc":11500000,"start_index":4}"#).unwrap();
+        assert_eq!(deposit["notes"][0]["value_uegoc"], 10_000_000);
+        assert_eq!(deposit["notes"][1]["index"], 5);
+        assert_eq!(deposit["remainder_uegoc"], 500_000);
+        assert!(deposit["notes"][0]["memo"].as_str().unwrap().starts_with("shield:"));
+        assert!(shielded_call("deposit", &seed, r#"{"amount_uegoc":5,"start_index":0}"#).is_err());
+        assert!(shielded_call("notes", &seed, r#"{"domain":"other","from":0,"count":1}"#).is_err());
     }
 
     #[test]
