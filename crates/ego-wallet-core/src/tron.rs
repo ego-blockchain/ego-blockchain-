@@ -95,7 +95,6 @@ pub struct Signed {
 pub fn sign_transfer(privkey: &[u8; 32], to: &str, sun: u64, block: &BlockRef) -> Result<Signed, String> {
     let key = SigningKey::from_slice(privkey).map_err(|e| e.to_string())?;
     let owner = {
-        use k256::elliptic_curve::sec1::ToEncodedPoint;
         let point = key.verifying_key().to_encoded_point(false);
         let h = sha3::Keccak256::digest(&point.as_bytes()[1..]);
         let mut a = [0u8; 21];
