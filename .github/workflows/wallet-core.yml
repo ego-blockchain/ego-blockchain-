@@ -3,11 +3,9 @@ name: Wallet Core
 # Tests ego-wallet-core, checks it derives exactly what Ego Desktop derives,
 # and builds EgoWalletCore.xcframework for the iPhone wallet.
 
+# Manual only: the library is built and tested locally (see crates/ego-wallet-core)
+# and this runs only when someone starts it.
 on:
-  push:
-    paths:
-      - 'crates/ego-wallet-core/**'
-      - '.github/workflows/wallet-core.yml'
   workflow_dispatch:
 
 env:
