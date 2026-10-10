@@ -35,6 +35,7 @@ bech32 = "0.9"
 
 # Ego Blockchain dependencies
 ego-core            = { path = "../../crates/ego-core" }
+ego-wallet-core     = { path = "../../crates/ego-wallet-core" }
 ego-consensus-core  = { path = "../../crates/ego-consensus-core" }
 ego-vm          = { path = "../../crates/ego-vm" }
 ego-rollup      = { path = "../../crates/ego-rollup" }

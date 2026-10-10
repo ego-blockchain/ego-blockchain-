@@ -2620,3 +2620,43 @@ mod address_consistency_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod wallet_core_agreement {
+    use super::*;
+
+    /// The iPhone derives these addresses with ego-wallet-core. It must give
+    /// exactly what this file gives, or a restored wallet shows other coins
+    /// at addresses its owner has never used.
+    #[test]
+    fn ego_wallet_core_derives_the_same_addresses() {
+        let mut seeds: Vec<[u8; 32]> = vec![[0u8; 32], [1u8; 32], [7u8; 32], [0xffu8; 32]];
+        seeds.extend((0u8..60).map(|i| {
+            let mut s = [0u8; 32];
+            for (j, b) in s.iter_mut().enumerate() {
+                *b = i.wrapping_mul(37).wrapping_add(j as u8).wrapping_mul(101);
+            }
+            s
+        }));
+        for seed in seeds {
+            let ours = [
+                addr_btc_like(&seed, "ego:bitcoin:0", "bc"),
+                addr_evm(&seed, "ego:ethereum:0"),
+                addr_evm(&seed, "ego:bnb:0"),
+                addr_sol(&seed),
+                addr_ada(&seed),
+                addr_xrp(&seed),
+                addr_trx(&seed),
+                addr_btc_like(&seed, "ego:litecoin:0", "ltc"),
+                addr_doge(&seed),
+            ]
+            .map(|a| a.expect("derive"));
+            let theirs: Vec<String> = ego_wallet_core::external_addresses(&seed)
+                .expect("derive")
+                .into_iter()
+                .map(|a| a.address)
+                .collect();
+            assert_eq!(theirs, ours.to_vec(), "seed {}", hex::encode(seed));
+        }
+    }
+}

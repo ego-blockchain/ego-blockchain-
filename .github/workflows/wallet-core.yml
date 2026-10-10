@@ -1,0 +1,105 @@
+name: Wallet Core
+
+# Tests ego-wallet-core, checks it derives exactly what Ego Desktop derives,
+# and builds EgoWalletCore.xcframework for the iPhone wallet.
+
+on:
+  push:
+    paths:
+      - 'crates/ego-wallet-core/**'
+      - '.github/workflows/wallet-core.yml'
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  agree-with-desktop:
+    name: Tests + agreement with Ego Desktop
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/ego-desktop/src-tauri/target
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ego-desktop/src-tauri -> target
+
+      - name: Test ego-wallet-core
+        run: cargo test -p ego-wallet-core
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.0-dev libssl-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev clang lld llvm
+
+      - name: Install frontend dependencies
+        working-directory: ego-desktop
+        run: npm install
+
+      - name: Fetch Rust deps + patch wry for webkit2gtk 0.18.2
+        working-directory: ego-desktop/src-tauri
+        run: |
+          cargo fetch
+          WRY=$(find ~/.cargo/registry/src -path "*/wry-*/src/webview/webkitgtk/mod.rs" 2>/dev/null | head -1)
+          if [ -n "$WRY" ]; then
+            sed -i 's/use webkit2gtk::{/use webkit2gtk::{SettingsExt, /' "$WRY"
+          fi
+
+      - name: Build frontend
+        working-directory: ego-desktop
+        run: npm run build
+
+      - name: Ego Desktop derives the same addresses
+        working-directory: ego-desktop/src-tauri
+        run: cargo test --release --bin ego-desktop "wallet_core_agreement"
+
+  xcframework:
+    name: Build EgoWalletCore.xcframework
+    needs: agree-with-desktop
+    runs-on: macos-14
+    env:
+      IPHONEOS_DEPLOYMENT_TARGET: '17.0'
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Build every slice
+        run: |
+          for t in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release -p ego-wallet-core --target "$t"
+          done
+
+      - name: Make the xcframework
+        run: |
+          set -e
+          lib=libego_wallet_core.a
+          mkdir -p out/ios-sim out/macos
+          lipo -create target/aarch64-apple-ios-sim/release/$lib target/x86_64-apple-ios/release/$lib -output out/ios-sim/$lib
+          lipo -create target/aarch64-apple-darwin/release/$lib target/x86_64-apple-darwin/release/$lib -output out/macos/$lib
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/$lib -headers crates/ego-wallet-core/include \
+            -library out/ios-sim/$lib -headers crates/ego-wallet-core/include \
+            -library out/macos/$lib -headers crates/ego-wallet-core/include \
+            -output out/EgoWalletCore.xcframework
+          cd out && zip -qry EgoWalletCore.xcframework.zip EgoWalletCore.xcframework
+          ls -la EgoWalletCore.xcframework.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EgoWalletCore.xcframework
+          path: out/EgoWalletCore.xcframework.zip

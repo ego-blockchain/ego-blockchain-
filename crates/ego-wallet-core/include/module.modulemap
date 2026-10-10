@@ -1,0 +1,4 @@
+module EgoWalletCore {
+    header "ego_wallet_core.h"
+    export *
+}

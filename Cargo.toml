@@ -16,6 +16,7 @@ members = [
   "bins/ego-cli",
   "bins/ego-relay",
   "crates/ego-typed-signing",
+  "crates/ego-wallet-core",
 ]
 
 exclude = [
