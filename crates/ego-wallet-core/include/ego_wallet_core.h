@@ -19,6 +19,12 @@ char *ego_wallet_addresses(const uint8_t *seed, size_t seed_len);
    "fee", "amount_units"}. Nothing is sent. */
 char *ego_wallet_sign_evm(const uint8_t *seed, size_t seed_len, const char *request);
 
+/* Signs a Bitcoin or Litecoin transfer from the wallet's P2WPKH address. request
+   is JSON: {"chain": "BTC"|"LTC", "to", "amount", "fee_rate" (sat/vB),
+   "utxos": [{"txid", "vout", "value"}]}. Returns {"raw", "hash", "from", "fee",
+   "change", "inputs", "amount_units"}. Nothing is sent. */
+char *ego_wallet_sign_utxo(const uint8_t *seed, size_t seed_len, const char *request);
+
 void ego_wallet_string_free(char *s);
 
 #endif

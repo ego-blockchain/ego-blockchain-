@@ -1319,12 +1319,6 @@ fn varint(n: u64) -> Vec<u8> {
     }
 }
 
-fn p2wpkh_script(pubkey_hash: &[u8]) -> Vec<u8> {
-    let mut s = vec![0x00u8, 0x14];
-    s.extend_from_slice(pubkey_hash);
-    s
-}
-
 fn p2pkh_script_from_hash(pubkey_hash: &[u8]) -> Vec<u8> {
     let mut s = vec![0x76u8, 0xa9, 0x14];
     s.extend_from_slice(pubkey_hash);
@@ -1511,124 +1505,21 @@ async fn send_p2wpkh(
     utxos: Vec<Utxo>,
     broadcast_fn: impl AsyncBroadcast,
 ) -> Result<String, String> {
-    use k256::ecdsa::SigningKey;
-    use k256::elliptic_curve::sec1::ToEncodedPoint;
-    use k256::ecdsa::signature::hazmat::PrehashSigner;
-
-    let privkey = secp_privkey(seed, deriv_path);
-    let signing_key = SigningKey::from_slice(&privkey).map_err(|e| e.to_string())?;
-    let compressed_pub = signing_key.verifying_key().to_encoded_point(true);
-    let compressed_pub_bytes = compressed_pub.as_bytes();
-    let pubkey_hash = hash160(compressed_pub_bytes);
-
-    // Decode recipient bech32
-    let (_, to_data, _) = bech32::decode(to_address).map_err(|e| e.to_string())?;
-    let to_hash = bech32::convert_bits(&to_data[1..], 5, 8, false)
-        .map_err(|e| e.to_string())?;
-    let to_script = p2wpkh_script(&to_hash);
-    let change_script = p2wpkh_script(&pubkey_hash);
-
+    // Built and signed by ego-wallet-core, the same code the iPhone wallet uses.
+    // It also checks the recipient is a standard address of this network.
     const FEE_SAT_VB: u64 = 15; // conservative
-    // Estimate: n_inputs*68 + 2_outputs*31 + 10 overhead (segwit discount applied)
-    let fee_est = |n: usize| -> u64 { (n as u64 * 68 + 2 * 31 + 10) * FEE_SAT_VB };
-    let fee_rough = fee_est(3); // generous initial estimate
-    let needed = amount_sats + fee_rough;
-    let selected_idxs = select_utxos(&utxos, needed)?;
-    let selected: Vec<&Utxo> = selected_idxs.iter().map(|&i| &utxos[i]).collect();
-    let fee = fee_est(selected.len());
-    let total_in: u64 = selected.iter().map(|u| u.value).sum();
-    if total_in < amount_sats + fee {
-        return Err(format!("Insufficient funds after fee: {} < {}", total_in, amount_sats + fee));
-    }
-    let change = total_in - amount_sats - fee;
-    let has_change = change > 546;
-
-    // hashPrevouts
-    let mut prevouts_buf = Vec::new();
-    for u in &selected {
-        let txid = hex::decode(&u.txid).map_err(|e| e.to_string())?;
-        prevouts_buf.extend(txid.iter().rev());
-        prevouts_buf.extend_from_slice(&u.vout.to_le_bytes());
-    }
-    let hash_prevouts = sha256d(&prevouts_buf);
-
-    // hashSequence
-    let seq_buf: Vec<u8> = selected.iter()
-        .flat_map(|_| 0xffffffffu32.to_le_bytes()) .collect();
-    let hash_sequence = sha256d(&seq_buf);
-
-    // hashOutputs
-    let mut out_buf = Vec::new();
-    out_buf.extend_from_slice(&amount_sats.to_le_bytes());
-    out_buf.extend(varint(to_script.len() as u64));
-    out_buf.extend_from_slice(&to_script);
-    if has_change {
-        out_buf.extend_from_slice(&change.to_le_bytes());
-        out_buf.extend(varint(change_script.len() as u64));
-        out_buf.extend_from_slice(&change_script);
-    }
-    let hash_outputs = sha256d(&out_buf);
-
-    // Sign each input (BIP143)
-    let mut witnesses: Vec<Vec<Vec<u8>>> = Vec::new();
-    for u in &selected {
-        let txid = hex::decode(&u.txid).map_err(|e| e.to_string())?;
-        let script_code = p2pkh_script_from_hash(&pubkey_hash);
-        let mut preimage = Vec::new();
-        preimage.extend_from_slice(&1u32.to_le_bytes()); // nVersion
-        preimage.extend_from_slice(&hash_prevouts);
-        preimage.extend_from_slice(&hash_sequence);
-        preimage.extend(txid.iter().rev());
-        preimage.extend_from_slice(&u.vout.to_le_bytes());
-        preimage.push(script_code.len() as u8); // scriptCode length (single byte for P2WPKH)
-        preimage.extend_from_slice(&script_code);
-        preimage.extend_from_slice(&u.value.to_le_bytes());
-        preimage.extend_from_slice(&0xffffffffu32.to_le_bytes());
-        preimage.extend_from_slice(&hash_outputs);
-        preimage.extend_from_slice(&0u32.to_le_bytes()); // locktime
-        preimage.extend_from_slice(&1u32.to_le_bytes()); // SIGHASH_ALL
-
-        let sighash = sha256d(&preimage);
-        let (sig, _) = signing_key.sign_prehash_recoverable(&sighash)
-            .map_err(|e| e.to_string())?;
-
-        let mut der_sig = encode_der_sig(sig.r().to_bytes().as_slice(), sig.s().to_bytes().as_slice());
-        der_sig.push(0x01); // SIGHASH_ALL
-        witnesses.push(vec![der_sig, compressed_pub_bytes.to_vec()]);
-    }
-
-    // Serialize
-    let mut raw = Vec::new();
-    raw.extend_from_slice(&1u32.to_le_bytes()); // version
-    raw.push(0x00); raw.push(0x01);              // marker + flag (segwit)
-    raw.extend(varint(selected.len() as u64));
-    for u in &selected {
-        let txid = hex::decode(&u.txid).map_err(|e| e.to_string())?;
-        raw.extend(txid.iter().rev());
-        raw.extend_from_slice(&u.vout.to_le_bytes());
-        raw.push(0x00); // empty scriptSig
-        raw.extend_from_slice(&0xffffffffu32.to_le_bytes());
-    }
-    let num_outs: u64 = if has_change { 2 } else { 1 };
-    raw.extend(varint(num_outs));
-    raw.extend_from_slice(&amount_sats.to_le_bytes());
-    raw.extend(varint(to_script.len() as u64));
-    raw.extend_from_slice(&to_script);
-    if has_change {
-        raw.extend_from_slice(&change.to_le_bytes());
-        raw.extend(varint(change_script.len() as u64));
-        raw.extend_from_slice(&change_script);
-    }
-    for witness in &witnesses {
-        raw.extend(varint(witness.len() as u64));
-        for item in witness {
-            raw.extend(varint(item.len() as u64));
-            raw.extend_from_slice(item);
-        }
-    }
-    raw.extend_from_slice(&0u32.to_le_bytes()); // locktime
-
-    broadcast_fn.broadcast(hex::encode(&raw)).await
+    let net = if deriv_path == ego_wallet_core::utxo::LITECOIN.key_path {
+        ego_wallet_core::utxo::LITECOIN
+    } else {
+        ego_wallet_core::utxo::BITCOIN
+    };
+    let privkey = secp_privkey(seed, deriv_path);
+    let coins: Vec<ego_wallet_core::utxo::Utxo> = utxos
+        .iter()
+        .map(|u| ego_wallet_core::utxo::Utxo { txid: u.txid.clone(), vout: u.vout, value: u.value })
+        .collect();
+    let signed = ego_wallet_core::utxo::sign_p2wpkh(&privkey, net, to_address, amount_sats, &coins, FEE_SAT_VB)?;
+    broadcast_fn.broadcast(signed.raw).await
 }
 
 // Trait workaround so we can pass different broadcast functions

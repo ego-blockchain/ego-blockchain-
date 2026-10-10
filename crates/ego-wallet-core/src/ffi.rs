@@ -100,6 +100,61 @@ pub unsafe extern "C" fn ego_wallet_sign_evm(seed: *const u8, seed_len: usize, r
     }
 }
 
+#[derive(serde::Deserialize)]
+struct UtxoRequest {
+    chain: String,
+    to: String,
+    amount: String,
+    /// Satoshis per virtual byte.
+    fee_rate: u64,
+    utxos: Vec<crate::utxo::Utxo>,
+}
+
+fn sign_utxo(seed: &[u8], request: &str) -> Result<serde_json::Value, String> {
+    use crate::utxo;
+    let r: UtxoRequest = serde_json::from_str(request).map_err(|e| format!("Bad request: {e}"))?;
+    let net = utxo::network(&r.chain).ok_or("That chain isn't supported.")?;
+    if r.fee_rate == 0 || r.fee_rate > 1_000 {
+        return Err("Bad fee rate.".into());
+    }
+    let amount = crate::evm::parse_amount(&r.amount, 8)?;
+    let amount = u64::try_from(amount).map_err(|_| "That amount is too large.")?;
+    let key = crate::derive::secp_privkey(seed, net.key_path);
+    let signed = utxo::sign_p2wpkh(&key, net, &r.to, amount, &r.utxos, r.fee_rate)?;
+    Ok(serde_json::json!({
+        "raw": signed.raw,
+        "hash": signed.txid,
+        "from": crate::derive::addr_btc_like(seed, net.key_path, net.hrp)?,
+        "fee": signed.fee.to_string(),
+        "change": signed.change.to_string(),
+        "inputs": signed.inputs,
+        "amount_units": amount.to_string(),
+    }))
+}
+
+/// Signs a Bitcoin or Litecoin transfer from the wallet's P2WPKH address.
+/// `request` is JSON: {chain, to, amount, fee_rate, utxos: [{txid, vout, value}]}.
+/// Returns {raw, hash, from, fee, change, inputs, amount_units}; sats as
+/// decimal strings. Nothing is sent.
+///
+/// # Safety
+/// `seed` must point to `seed_len` readable bytes; `request` must be a
+/// NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn ego_wallet_sign_utxo(seed: *const u8, seed_len: usize, request: *const c_char) -> *mut c_char {
+    let Some(seed) = seed_from(seed, seed_len) else {
+        return error("The seed must be 32 bytes.");
+    };
+    if request.is_null() {
+        return error("No request.");
+    }
+    let request = std::ffi::CStr::from_ptr(request).to_string_lossy();
+    match sign_utxo(seed, &request) {
+        Ok(v) => to_c(v),
+        Err(e) => error(&e),
+    }
+}
+
 /// Frees a string returned by this library.
 ///
 /// # Safety
@@ -160,6 +215,21 @@ mod tests {
         ] {
             assert!(sign_evm(&seed, &bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn bitcoin_and_litecoin_transfers_are_signed_from_the_seed() {
+        let seed = [7u8; 32];
+        let utxos = r#"[{"txid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","vout":0,"value":120000}]"#;
+        let btc = sign_utxo(&seed, &format!(r#"{{"chain":"BTC","to":"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4","amount":"0.001","fee_rate":2,"utxos":{utxos}}}"#)).unwrap();
+        assert_eq!(btc["from"], crate::derive::addr_btc_like(&seed, "ego:bitcoin:0", "bc").unwrap());
+        assert_eq!(btc["amount_units"], "100000");
+        assert_eq!(btc["fee"], (crate::utxo::estimated_vsize(1) * 2).to_string());
+        assert_eq!(btc["inputs"], 1);
+        let ltc = sign_utxo(&seed, &format!(r#"{{"chain":"LTC","to":"ltc1qr07zu594qf63xm7l7x6pu3a2v39m2z6hh5pp4t","amount":"0.001","fee_rate":2,"utxos":{utxos}}}"#)).unwrap();
+        assert_eq!(ltc["from"], crate::derive::addr_btc_like(&seed, "ego:litecoin:0", "ltc").unwrap());
+        assert!(sign_utxo(&seed, &format!(r#"{{"chain":"BTC","to":"ltc1qr07zu594qf63xm7l7x6pu3a2v39m2z6hh5pp4t","amount":"0.001","fee_rate":2,"utxos":{utxos}}}"#)).is_err());
+        assert!(sign_utxo(&seed, &format!(r#"{{"chain":"BTC","to":"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4","amount":"0.000000001","fee_rate":2,"utxos":{utxos}}}"#)).is_err());
     }
 
     #[test]
