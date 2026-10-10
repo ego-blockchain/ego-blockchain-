@@ -799,6 +799,21 @@ fn peer_storage() -> std::sync::MutexGuard<'static, HashMap<String, (f64, i64)>>
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// Notes a peer's advertised free space (and relay endpoint) from its DataManifest,
+/// whether it arrived directly or over the ego-shards-v1 gossip topic.
+fn record_data_manifest(from_addr: &str, available_gb: f64, is_relay: bool, endpoint: &str) {
+    if !from_addr.is_empty() && available_gb.is_finite() {
+        peer_storage().insert(
+            from_addr.to_string(),
+            (available_gb.clamp(0.0, MAX_ADVERTISED_GB), chrono::Utc::now().timestamp()),
+        );
+    }
+    if is_relay && !endpoint.is_empty() {
+        peer_relay_nodes().insert(from_addr.to_string(), endpoint.to_string());
+        eprintln!("[relay-server] Discovered community relay node at {}", endpoint);
+    }
+}
+
 fn fresh_peer_storage(now: i64) -> (f64, usize) {
     let mut peers = peer_storage();
     peers.retain(|_, (_, seen)| now - *seen < PEER_STORAGE_FRESH_SECS);
@@ -8230,6 +8245,9 @@ async fn handle_event(
                 }
             } else if topic == "ego-shards-v1" {
                 match serde_json::from_slice::<P2PMessage>(&message.data) {
+                    Ok(P2PMessage::DataManifest { from_addr, available_gb, is_relay, endpoint, .. }) => {
+                        record_data_manifest(&from_addr, available_gb, is_relay, &endpoint);
+                    }
                     Ok(P2PMessage::ShardAnnounce { from_addr, from_endpoint, held_shards, uptime_secs, network_node_count, shard_count }) => {
                         crate::sharding::handle_shard_announce_update(&from_addr, &from_endpoint, &held_shards, uptime_secs, network_node_count, shard_count);
                     }
@@ -8551,18 +8569,7 @@ pub async fn handle_incoming(msg: P2PMessage, app: Option<&tauri::AppHandle<taur
             eprintln!("[P2P] DataManifest from {} — {} CIDs, {:.1}GB free, relay={}",
                 from_addr, cids.len(), available_gb, is_relay);
 
-            // Track per-peer available storage for network capacity calculation.
-            if !from_addr.is_empty() && available_gb.is_finite() {
-                peer_storage().insert(
-                    from_addr.clone(),
-                    (available_gb.clamp(0.0, MAX_ADVERTISED_GB), chrono::Utc::now().timestamp()),
-                );
-            }
-
-            if is_relay && !endpoint.is_empty() {
-                peer_relay_nodes().insert(from_addr.clone(), endpoint.clone());
-                eprintln!("[relay-server] Discovered community relay node at {}", endpoint);
-            }
+            record_data_manifest(&from_addr, available_gb, is_relay, &endpoint);
             if let Some(h) = app {
                 let _ = h.emit_all("ego://data-manifest", serde_json::json!({
                     "from_addr":    from_addr,
@@ -15481,5 +15488,35 @@ mod dao_chat_wire_tests {
         forged.from = dao_chat::address_of_key(&ego_core::KeyPair::generate());
         dao_chat::receive_gossip(serde_json::to_vec(&Wire::Post(forged.clone())).unwrap(), None).await;
         assert!(!dao_chat::recent_posts(None, 2_000).contains(&forged));
+    }
+}
+
+#[cfg(test)]
+mod peer_storage_tests {
+    use super::{fresh_peer_storage, record_data_manifest, P2PMessage};
+
+    #[test]
+    fn gossiped_manifests_add_up_across_peers() {
+        let now = chrono::Utc::now().timestamp();
+        let (before_gb, before_n) = fresh_peer_storage(now);
+        for (addr, gb) in [("egot1storagetestpeera", 12.5), ("egot1storagetestpeerb", 7.5)] {
+            let wire = serde_json::to_vec(&P2PMessage::DataManifest {
+                from_addr: addr.into(),
+                cids: vec![],
+                available_gb: gb,
+                is_relay: false,
+                endpoint: String::new(),
+            }).unwrap();
+            match serde_json::from_slice::<P2PMessage>(&wire).unwrap() {
+                P2PMessage::DataManifest { from_addr, available_gb, is_relay, endpoint, .. } =>
+                    record_data_manifest(&from_addr, available_gb, is_relay, &endpoint),
+                _ => unreachable!(),
+            }
+        }
+        // A repeat report replaces the peer's figure instead of adding to it.
+        record_data_manifest("egot1storagetestpeera", 12.5, false, "");
+        let (gb, n) = fresh_peer_storage(now);
+        assert_eq!(n, before_n + 2);
+        assert!((gb - before_gb - 20.0).abs() < 1e-9);
     }
 }

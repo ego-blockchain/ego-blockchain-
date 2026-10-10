@@ -1452,6 +1452,9 @@ fn main() {
 
                 crate::p2p::broadcast_peer_announce(Some(&handle_startup)).await;
                 tracing::info!("Peer announce sent (endpoint: {})", my_endpoint);
+                // Tell the network how much space we share, so every node's
+                // "Network Storage Available" adds ours in.
+                crate::p2p::broadcast_data_manifest().await;
 
                 // Oracle-backed peer rendezvous: register our relayed endpoint and
                 // dial peers the oracle knows about, so two NAT'd nodes behind one
@@ -1566,6 +1569,11 @@ fn main() {
 
                     let _ = crate::p2p::ORACLE_GAP_FILL_NEEDED.swap(false, std::sync::atomic::Ordering::Relaxed);
                     bounded!(15, crate::p2p::broadcast_peer_announce(Some(&handle_startup)));
+                    // Re-announce our free space every ~2.5 min; peers drop
+                    // reports older than 30 min from the network total.
+                    if loop_tick % 5 == 0 {
+                        bounded!(15, crate::p2p::broadcast_data_manifest());
+                    }
                     bounded!(15, crate::p2p::sync_chain_from_peers());
                     bounded!(15, crate::p2p::dht_discover_relays());
 
