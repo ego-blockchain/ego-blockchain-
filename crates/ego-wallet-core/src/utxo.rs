@@ -8,7 +8,6 @@
 //! a taproot or legacy address would have produced an output nobody can spend.
 
 use k256::ecdsa::SigningKey;
-use k256::elliptic_curve::sec1::ToEncodedPoint;
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,10 +101,11 @@ pub fn output_script(address: &str, net: Network) -> Result<Vec<u8>, String> {
         script.extend_from_slice(&program);
         return Ok(script);
     }
-    let decoded = bs58::decode(address).with_check(None).into_vec().map_err(|_| wrong())?;
-    if decoded.len() != 21 {
+    let full = bs58::decode(address).into_vec().map_err(|_| wrong())?;
+    if full.len() != 25 || sha256d(&full[..21])[..4] != full[21..] {
         return Err(wrong());
     }
+    let decoded = &full[..21];
     let (version, hash) = (decoded[0], &decoded[1..]);
     if net.p2pkh_versions.contains(&version) {
         let mut s = vec![0x76, 0xa9, 0x14];

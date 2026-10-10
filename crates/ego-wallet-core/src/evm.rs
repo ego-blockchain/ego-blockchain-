@@ -121,7 +121,6 @@ pub fn sign_legacy(
     value: u128,
     data: &[u8],
 ) -> Result<Signed, String> {
-    use k256::ecdsa::signature::hazmat::PrehashSigner;
     let signing_key = SigningKey::from_slice(privkey).map_err(|e| e.to_string())?;
     let pre_tx = rlp_list(&[
         rlp_uint(nonce as u128),
