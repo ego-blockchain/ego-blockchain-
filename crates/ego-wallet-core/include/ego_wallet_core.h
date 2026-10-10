@@ -12,6 +12,13 @@
    [{"chain", "symbol", "address", "address_type", "explorer_prefix"}, ...] */
 char *ego_wallet_addresses(const uint8_t *seed, size_t seed_len);
 
+/* Signs an Ethereum or BNB Chain transfer as Ego Desktop would. request is JSON:
+   {"chain", "nonce", "gas_price", "to", "amount", "decimals", "contract"?}
+   where gas_price is the node's price in wei (20% is added) and amount is what
+   the person typed. Returns {"raw", "hash", "from", "gas_price", "gas_limit",
+   "fee", "amount_units"}. Nothing is sent. */
+char *ego_wallet_sign_evm(const uint8_t *seed, size_t seed_len, const char *request);
+
 void ego_wallet_string_free(char *s);
 
 #endif

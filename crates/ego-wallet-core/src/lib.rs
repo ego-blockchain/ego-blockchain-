@@ -5,6 +5,7 @@
 //! C functions in [`ffi`].
 
 pub mod derive;
+pub mod evm;
 pub mod ffi;
 
 pub use derive::{external_addresses, ChainAddress};

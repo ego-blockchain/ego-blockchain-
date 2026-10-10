@@ -1450,41 +1450,12 @@ async fn send_evm_tx(
 
     let gas_limit: u128 = if data.is_empty() { 21_000 } else { 120_000 };
 
-    let to_bytes = hex::decode(to.trim_start_matches("0x"))
-        .map_err(|_| format!("Invalid address: {to}"))?;
-
-    // Pre-sign RLP (EIP-155)
-    let pre_tx = rlp_list(&[
-        rlp_uint(nonce as u128),
-        rlp_uint(gas_price),
-        rlp_uint(gas_limit),
-        rlp_item(&to_bytes),
-        rlp_uint(value_wei),
-        rlp_item(&data),
-        rlp_uint(chain_id as u128),
-        rlp_item(&[]),
-        rlp_item(&[]),
-    ]);
-    let hash = Keccak256::digest(&pre_tx);
-
-    use k256::ecdsa::signature::hazmat::PrehashSigner;
-    let (sig, recid) = signing_key.sign_prehash_recoverable(hash.as_ref())
-        .map_err(|e| e.to_string())?;
-
-    let v = chain_id * 2 + 35 + recid.to_byte() as u64;
-    let signed_tx = rlp_list(&[
-        rlp_uint(nonce as u128),
-        rlp_uint(gas_price),
-        rlp_uint(gas_limit),
-        rlp_item(&to_bytes),
-        rlp_uint(value_wei),
-        rlp_item(&data),
-        rlp_uint(v as u128),
-        rlp_item(sig.r().to_bytes().as_slice()),
-        rlp_item(sig.s().to_bytes().as_slice()),
-    ]);
-
-    let raw_hex = format!("0x{}", hex::encode(&signed_tx));
+    // Built and signed by ego-wallet-core, the same code the iPhone wallet uses.
+    let to_bytes = ego_wallet_core::evm::parse_address(to)?;
+    let privkey: [u8; 32] = privkey_bytes.try_into().map_err(|_| "bad key length".to_string())?;
+    let raw_hex = ego_wallet_core::evm::sign_legacy(
+        &privkey, chain_id, nonce, gas_price, gas_limit, &to_bytes, value_wei, &data,
+    )?.raw;
     let result = evm_call_multi(chain, "eth_sendRawTransaction", serde_json::json!([raw_hex])).await?;
     Ok(result.as_str().map(|s| s.to_string())
         .unwrap_or_else(|| result.to_string()))
