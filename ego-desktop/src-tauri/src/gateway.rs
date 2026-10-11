@@ -37,6 +37,8 @@ const MAX_FAILURES: u8 = 2;
 const BUCKET_SIZE: f64 = 120.0;
 const REFILL_PER_SEC: f64 = 6.0;
 const MAX_BODY_BYTES: usize = 64 * 1024;
+/// /storage takes a whole encrypted block, base64-encoded, in one request.
+const MAX_STORAGE_BODY_BYTES: usize = 512 * 1024;
 const NOT_HERE: &str = "That method isn't available on this gateway.";
 const NOT_OWNER: &str = "Only the owner of this computer can see its earnings.";
 pub const EARNINGS_DOMAIN: &str = "ego/node-earnings/v1";
@@ -283,6 +285,7 @@ fn cost(method: &str) -> f64 {
         "wallet.getCredits" => 1.0,
         "shielded.lookup" => 2.0,
         "shielded.leaves" => 4.0,
+        "storage.putManifest" | "storage.delete" => 4.0,
         _ => 1.0,
     }
 }
@@ -565,6 +568,9 @@ async fn rpc(ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(body): Json<Value>
         "shielded.leaves" => shielded_leaves(&params).await,
         "node.earnings" => node_earnings(&params).await,
         "gateway.list" => Ok(json!({ "gateways": share(chrono::Utc::now().timestamp()) })),
+        m if crate::phone_storage::METHODS.contains(&m) => crate::phone_storage::dispatch(m, &params)
+            .await
+            .unwrap_or_else(|| Err((-32601, NOT_HERE.to_string()))),
         _ => Err((-32601, NOT_HERE.to_string())),
     };
     Json(match result {
@@ -587,10 +593,14 @@ async fn health(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> Json<Value> {
 }
 
 pub fn router() -> Router {
+    let storage = Router::new()
+        .route("/storage", post(rpc))
+        .layer(DefaultBodyLimit::max(MAX_STORAGE_BODY_BYTES));
     Router::new()
         .route("/rpc", post(rpc))
         .route("/health", get(health))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .merge(storage)
 }
 
 async fn serve(cert_pem: String, key_pem: String) {

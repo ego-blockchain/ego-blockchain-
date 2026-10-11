@@ -203,6 +203,35 @@ pub(crate) fn paid_plan(memo: &str, amount_uegoc: u64, egoc_usd: f64) -> Option<
     (paid_usd >= price_usd * PLAN_PRICE_TOLERANCE).then_some((*gb, period_secs))
 }
 
+/// The storage space `address` has paid for: its newest valid plan payment on
+/// chain (EGUSD, or EGOC worth enough at today's price), kept for 30 days
+/// after the plan ends. Without one it's the free 5 GB.
+pub fn storage_quota_bytes(address: &str, now: i64) -> u64 {
+    const FREE_BYTES: u64 = 5 * 1_000_000_000;
+    const GRACE_SECS: i64 = 30 * 86_400;
+    let chain = load_chain();
+    let egoc_usd = crate::p2p::get_egoc_price_usd();
+    let plan = chain.transactions.iter()
+        .filter(|tx| tx.from == address && tx.status == "Confirmed")
+        .filter_map(|tx| {
+            let memo = tx.memo.as_deref().unwrap_or("");
+            let plan = if tx.tx_type == "credits_pay" && tx.to == STORAGE_FEE_SINK {
+                plan_paid_in_egusd(memo)
+            } else if tx.tx_type == "transfer" && tx.to == "egot1storagefees000000000000000000000000000000" {
+                paid_plan(memo, tx.amount, egoc_usd)
+            } else {
+                None
+            };
+            plan.map(|plan| (tx, plan))
+        })
+        .max_by_key(|(tx, _)| tx.timestamp);
+    let quota = match plan {
+        Some((tx, (gb, period_secs))) if now < tx.timestamp + period_secs + GRACE_SECS => gb * 1_000_000_000,
+        _ => FREE_BYTES,
+    };
+    quota.max(FREE_BYTES)
+}
+
 #[tauri::command]
 pub async fn store_file(
     request: StoreFileRequest,
@@ -242,7 +271,6 @@ pub async fn store_file(
     let covered_by_plan = {
         let now_quota           = chrono::Utc::now().timestamp();
         const FREE_BYTES:       u64 = 5  * 1_000_000_000;
-        const GRACE_SECS:       i64 = 30 * 86_400;
 
         let ledger_quota = Ledger::load();
         // Sum all active/pending-sync files owned by this user.
@@ -252,33 +280,7 @@ pub async fn store_file(
             .map(|f| f.original_size)
             .sum();
 
-        // Derive quota from the most recent valid subscription tx on chain.
-        let chain_quota_bytes: u64 = {
-            let chain = load_chain();
-            let egoc_usd = crate::p2p::get_egoc_price_usd();
-            let plan = chain.transactions.iter()
-                .filter(|tx| tx.from == ledger_quota.address && tx.status == "Confirmed")
-                .filter_map(|tx| {
-                    let memo = tx.memo.as_deref().unwrap_or("");
-                    let plan = if tx.tx_type == "credits_pay" && tx.to == STORAGE_FEE_SINK {
-                        plan_paid_in_egusd(memo)
-                    } else if tx.tx_type == "transfer" && tx.to == "egot1storagefees000000000000000000000000000000" {
-                        paid_plan(memo, tx.amount, egoc_usd)
-                    } else {
-                        None
-                    };
-                    plan.map(|plan| (tx, plan))
-                })
-                .max_by_key(|(tx, _)| tx.timestamp);
-
-            match plan {
-                Some((tx, (gb, period_secs))) => {
-                    let expires_at = tx.timestamp + period_secs;
-                    if now_quota < expires_at + GRACE_SECS { gb * 1_000_000_000 } else { FREE_BYTES }
-                }
-                None => FREE_BYTES,
-            }
-        };
+        let chain_quota_bytes = storage_quota_bytes(&ledger_quota.address, now_quota);
 
         let quota = chain_quota_bytes.max(FREE_BYTES);
         if used_bytes + original_size > quota {

@@ -27,6 +27,7 @@ mod chain_db;
 mod contract_exec;
 mod dao_chat;
 mod gateway;
+mod phone_storage;
 mod commands;
 mod compute_admission;
 mod config;
