@@ -80,6 +80,7 @@ interface StoreFileResult {
   expiry_timestamp: number;
   cost_uegoc: number;
   key_nonce_hex: string;
+  included_in_plan?: boolean;
 }
 
 interface FilePreview {
@@ -834,7 +835,7 @@ const StoragePage: React.FC = () => {
               <div className="bg-gray-900 rounded-xl p-4 text-sm space-y-2">
                 <div className="flex justify-between"><span className="text-gray-400">Encryption</span><span>AES-256-GCM</span></div>
                 <div className="flex justify-between"><span className="text-gray-400">Content ID</span><span>BLAKE2s-256</span></div>
-                <div className="flex justify-between"><span className="text-gray-400">Cost rate</span><span>$0.005 / GB / month — paid to providers</span></div>
+                <div className="flex justify-between"><span className="text-gray-400">Cost rate</span><span>$0.005 / GB / month, or free with a Basic, Pro or Max plan</span></div>
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <button onClick={resetUpload} className="bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-semibold text-sm transition">← Back</button>
@@ -897,7 +898,7 @@ const StoragePage: React.FC = () => {
                   <div className="flex justify-between"><span className="text-gray-400">Encrypted size</span><span>{fmtBytes(storeResult.encrypted_size)}</span></div>
                   <div className="flex justify-between"><span className="text-gray-400">Duration</span><span>{storeResult.duration_months === 0 ? '♾ Permanent' : `${storeResult.duration_months} month${storeResult.duration_months > 1 ? 's' : ''}`}</span></div>
                   <div className="flex justify-between"><span className="text-gray-400">Expires</span><span>{storeResult.expiry_timestamp > 1e14 ? 'Never' : new Date(storeResult.expiry_timestamp * 1000).toLocaleDateString()}</span></div>
-                  <div className="flex justify-between"><span className="text-gray-400">Storage fee (to providers)</span><span className="text-yellow-400">{storeResult.cost_uegoc === 0 ? 'paid in EGUSD' : `${(storeResult.cost_uegoc / 1_000_000).toFixed(4)} EGOC`}</span></div>
+                  <div className="flex justify-between"><span className="text-gray-400">Storage fee (to providers)</span><span className="text-yellow-400">{storeResult.included_in_plan ? 'Included in your plan' : storeResult.cost_uegoc === 0 ? 'paid in EGUSD' : `${(storeResult.cost_uegoc / 1_000_000).toFixed(4)} EGOC`}</span></div>
                   <div className="flex justify-between"><span className="text-gray-400">Commitment</span><span className="text-green-400">Ledger anchored ✓</span></div>
                 </div>
               </div>

@@ -85,6 +85,7 @@ pub struct StoreFileResult {
     pub expiry_timestamp: i64,
     pub cost_uegoc: u64,
     pub key_nonce_hex: String,
+    pub included_in_plan: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -151,7 +152,7 @@ pub async fn store_file(
     // Reads the on-chain subscription tx to determine the user's quota.
     // Falls back to FREE_GB (5 GB) if no valid subscription exists.
     // Grace period: 30 days after expiry, the quota is still honoured.
-    {
+    let covered_by_plan = {
         let now_quota           = chrono::Utc::now().timestamp();
         const FREE_BYTES:       u64 = 5  * 1_000_000_000;
         const GRACE_SECS:       i64 = 30 * 86_400;
@@ -202,7 +203,8 @@ pub async fn store_file(
                  This file is {file_mb:.1} MB. Upgrade your plan to store more files."
             )));
         }
-    }
+        chain_quota_bytes > FREE_BYTES
+    };
 
     // ── Streaming block storage (one 256 KB chunk at a time) ──────────────────
     let mut key_bytes = [0u8; 32];
@@ -299,11 +301,12 @@ pub async fn store_file(
     let mut ledger = Ledger::load();
     let is_staker  = ledger.staked_amount > 0;
     let mb         = (original_size as f64) / 1_000_000.0;
-    let cost_uegoc = if request.free { 0 }
+    let free = request.free || covered_by_plan;
+    let cost_uegoc = if free { 0 }
                      else { crate::tokenomics::storage_cost_with_staking(mb, request.duration_months, is_staker) };
     // Charged straight from the dollar target rather than converted back out of coins, so
     // the two prices cannot drift apart as the coin moves.
-    let pay_egusd = request.pay_with_egusd && !request.free && !is_staker;
+    let pay_egusd = request.pay_with_egusd && !free && !is_staker;
     let cost_credits = if pay_egusd {
         let months = if request.duration_months == 0 { 120 } else { request.duration_months };
         let usd = crate::tokenomics::STORAGE_USD_PER_MB_MONTH * mb * months as f64
@@ -460,6 +463,7 @@ pub async fn store_file(
         expiry_timestamp: expiry,
         cost_uegoc,
         key_nonce_hex,
+        included_in_plan: covered_by_plan,
     })
 }
 
