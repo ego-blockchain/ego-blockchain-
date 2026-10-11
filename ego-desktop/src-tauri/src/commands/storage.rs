@@ -116,6 +116,30 @@ pub struct FilePreview {
     pub previewable: bool,
 }
 
+const STORAGE_PLANS: [(&str, u64, f64, f64); 3] = [
+    ("Basic", 50, 0.79, 7.90),
+    ("Pro", 200, 1.99, 19.90),
+    ("Max", 1024, 4.99, 49.90),
+];
+const PLAN_PRICE_TOLERANCE: f64 = 0.5;
+
+pub(crate) fn paid_plan(memo: &str, amount_uegoc: u64, egoc_usd: f64) -> Option<(u64, i64)> {
+    let rest = memo.strip_prefix("Ego Storage ")?;
+    let (name, rest) = rest.split_once(' ')?;
+    let billing = rest.trim_start_matches(|c: char| c == '–' || c == '-' || c == ' ').split_whitespace().next()?;
+    let (_, gb, monthly, annual) = STORAGE_PLANS.iter().find(|(n, ..)| *n == name)?;
+    let (price_usd, period_secs) = match billing {
+        "monthly" => (*monthly, 30 * 86_400),
+        "annual" => (*annual, 365 * 86_400),
+        _ => return None,
+    };
+    if !(egoc_usd.is_finite() && egoc_usd > 0.0) {
+        return None;
+    }
+    let paid_usd = amount_uegoc as f64 / 1_000_000.0 * egoc_usd;
+    (paid_usd >= price_usd * PLAN_PRICE_TOLERANCE).then_some((*gb, period_secs))
+}
+
 #[tauri::command]
 pub async fn store_file(
     request: StoreFileRequest,
@@ -168,26 +192,19 @@ pub async fn store_file(
         // Derive quota from the most recent valid subscription tx on chain.
         let chain_quota_bytes: u64 = {
             let chain = load_chain();
-            let sub_tx = chain.transactions.iter()
+            let egoc_usd = crate::p2p::get_egoc_price_usd();
+            let plan = chain.transactions.iter()
                 .filter(|tx| tx.from == ledger_quota.address
                     && tx.tx_type == "transfer"
                     && tx.to == "egot1storagefees000000000000000000000000000000"
                     && tx.status == "Confirmed")
-                .max_by_key(|tx| tx.timestamp);
+                .filter_map(|tx| paid_plan(tx.memo.as_deref().unwrap_or(""), tx.amount, egoc_usd).map(|plan| (tx, plan)))
+                .max_by_key(|(tx, _)| tx.timestamp);
 
-            // Map memo to GB — memo format: "Ego Storage <Plan> – <billing> ($<usd>)"
-            match sub_tx {
-                Some(tx) => {
-                    let memo = tx.memo.as_deref().unwrap_or("");
-                    let gb: u64 = if memo.contains("Max")   { 1024 }
-                               else if memo.contains("Pro")   {  200 }
-                               else if memo.contains("Basic") {   50 }
-                               else                            {    5 };
-                    // Check expiry: monthly = 30 days, annual = 365 days from tx timestamp.
-                    let period_secs: i64 = if memo.contains("annual") { 365 * 86_400 } else { 30 * 86_400 };
-                    let expires_at  = tx.timestamp + period_secs;
-                    let in_grace    = now_quota < expires_at + GRACE_SECS;
-                    if in_grace { gb * 1_000_000_000 } else { FREE_BYTES }
+            match plan {
+                Some((tx, (gb, period_secs))) => {
+                    let expires_at = tx.timestamp + period_secs;
+                    if now_quota < expires_at + GRACE_SECS { gb * 1_000_000_000 } else { FREE_BYTES }
                 }
                 None => FREE_BYTES,
             }
@@ -1443,4 +1460,44 @@ pub async fn reset_storage(_state: State<'_, AppState>) -> Result<(), EgoDesktop
     ledger.save().map_err(|e| EgoDesktopError::WalletError(format!("Save: {e}")))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod plan_payment_tests {
+    use super::paid_plan;
+
+    const PRICE: f64 = 0.01;
+
+    fn uegoc(usd: f64) -> u64 {
+        (usd / PRICE * 1_000_000.0) as u64
+    }
+
+    #[test]
+    fn a_full_payment_buys_the_named_plan() {
+        assert_eq!(paid_plan("Ego Storage Pro – monthly ($1.99)", uegoc(1.99), PRICE), Some((200, 30 * 86_400)));
+        assert_eq!(paid_plan("Ego Storage Max – annual ($49.90)", uegoc(49.90), PRICE), Some((1024, 365 * 86_400)));
+        assert_eq!(paid_plan("Ego Storage Basic – monthly ($0.79)", uegoc(0.79), PRICE), Some((50, 30 * 86_400)));
+    }
+
+    #[test]
+    fn a_token_payment_with_a_plan_name_buys_nothing() {
+        assert_eq!(paid_plan("Ego Storage Max – annual ($49.90)", 1, PRICE), None);
+        assert_eq!(paid_plan("Ego Storage Max – annual ($0.01)", uegoc(0.01), PRICE), None);
+        assert_eq!(paid_plan("Ego Storage Max – monthly ($4.99)", uegoc(1.0), PRICE), None);
+    }
+
+    #[test]
+    fn the_note_must_name_a_real_plan_exactly() {
+        assert_eq!(paid_plan("Max storage please", uegoc(100.0), PRICE), None);
+        assert_eq!(paid_plan("Ego Storage Maximum – annual ($49.90)", uegoc(100.0), PRICE), None);
+        assert_eq!(paid_plan("Ego Storage Pro – weekly ($1.99)", uegoc(100.0), PRICE), None);
+        assert_eq!(paid_plan("Ego Storage Pro – monthly ($1.99)", uegoc(100.0), 0.0), None);
+    }
+
+    #[test]
+    fn a_price_drop_after_paying_does_not_cancel_the_plan() {
+        let paid = uegoc(1.99);
+        assert!(paid_plan("Ego Storage Pro – monthly ($1.99)", paid, PRICE * 0.6).is_some());
+        assert!(paid_plan("Ego Storage Pro – monthly ($1.99)", paid, PRICE * 0.4).is_none());
+    }
 }
